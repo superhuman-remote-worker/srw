@@ -14,7 +14,7 @@ unless explicitly fetched, and are never inlined.
 
 The connection object is an ``EmailConnection``
 (src/agent/tools/email/connection.py) injected via
-``ToolContext.get_datasource("email")``.
+``ToolContext.connection_for("email")``.
 """
 
 import logging
@@ -289,7 +289,7 @@ def create_email_tools(context: ToolContext) -> List[Any]:
     Returns:
         List of LangChain tool functions
     """
-    conn = context.get_datasource("email")
+    conn = context.connection_for("email")
     if not conn:
         raise ValueError("Email connector not available in context")
 
@@ -305,7 +305,7 @@ def create_email_tools(context: ToolContext) -> List[Any]:
     def _binding_refusal() -> Optional[str]:
         """Reject a closure whose captured datasource is no longer current."""
 
-        if context.get_datasource("email") is conn:
+        if context.connection_for("email") is conn:
             return None
         return (
             "Error: the email connector binding changed or was detached after "

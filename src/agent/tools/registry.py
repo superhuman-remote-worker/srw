@@ -37,6 +37,7 @@ from agent.tools.git import create_git_tools
 from agent.tools.graph import create_graph_tools
 from agent.tools.knowledge import create_knowledge_tools
 from agent.tools.loop import create_loop_tools
+from agent.tools.memory import create_memory_tools
 from agent.tools.mongodb import create_mongodb_tools
 from agent.tools.orchestrator import create_orchestrator_tools
 from agent.tools.orchestrator.catalog import create_catalog_tools
@@ -242,7 +243,8 @@ _OFFICER_DENIED_CATEGORIES = frozenset(
 )
 
 # Denied individual names:
-# - request_workspace_upgrade: the lite-session escape hatch into a sandbox —
+# - request_workspace_upgrade: the lite-session escape hatch into a shell
+#   workspace (asks for an upgrade: a VM in a Session, a container in a Job) —
 #   the one workspace-acquisition path a shell-less session has.
 # - checkout_project_repository: acquires a repo checkout in the workspace.
 # - list_project_repositories / get_default_project_repository: repository
@@ -560,7 +562,7 @@ def load_tools(tool_names: List[str], context: ToolContext) -> List[Any]:
 
     # Graph tools
     if "graph" in tools_by_category:
-        if not context.has_datasource("neo4j"):
+        if not context.has_connection_for("graph"):
             logger.warning("Graph tools require a neo4j datasource in ToolContext")
         else:
             try:
@@ -575,7 +577,7 @@ def load_tools(tool_names: List[str], context: ToolContext) -> List[Any]:
 
     # SQL tools
     if "sql" in tools_by_category:
-        if not context.has_datasource("postgresql"):
+        if not context.has_connection_for("sql"):
             logger.warning("SQL tools require a postgresql datasource in ToolContext")
         else:
             try:
@@ -590,7 +592,7 @@ def load_tools(tool_names: List[str], context: ToolContext) -> List[Any]:
 
     # MongoDB tools
     if "mongodb" in tools_by_category:
-        if not context.has_datasource("mongodb"):
+        if not context.has_connection_for("mongodb"):
             logger.warning("MongoDB tools require a mongodb datasource in ToolContext")
         else:
             try:
@@ -605,7 +607,7 @@ def load_tools(tool_names: List[str], context: ToolContext) -> List[Any]:
 
     # WebDAV datasource tools
     if "webdav" in tools_by_category:
-        if not context.has_datasource("webdav"):
+        if not context.has_connection_for("webdav"):
             logger.warning("WebDAV tools require a webdav datasource in ToolContext")
         else:
             try:
@@ -619,9 +621,9 @@ def load_tools(tool_names: List[str], context: ToolContext) -> List[Any]:
                 logger.warning(f"Could not load webdav tools: {e}")
 
     # Repository datasource write tools. NOTE: unlike the other datasource
-    # toolkits this cannot use context.has_datasource() — repository
-    # datasources never enter context.datasources (process_datasources skips
-    # them); the clones live on workspace_manager instead.
+    # toolkits this cannot use context.has_connection_for() — repository
+    # datasources never enter context.datasources (they deliver a checkout, not
+    # a managed connection); the clones live on workspace_manager instead.
     if "repo" in tools_by_category:
         ws = context.workspace_manager
         if not getattr(ws, "source_repos", None):
@@ -640,13 +642,13 @@ def load_tools(tool_names: List[str], context: ToolContext) -> List[Any]:
     # MCP datasource tools are already-live LangChain tools owned by the
     # per-job/session MCPManager. Missing or failed servers degrade cleanly.
     if "mcp" in tools_by_category:
-        if not context.has_datasource("mcp"):
+        if not context.has_connection_for("mcp"):
             logger.warning(
                 "MCP tools require an mcp datasource connection in ToolContext"
             )
         else:
             try:
-                manager = context.get_datasource("mcp")
+                manager = context.connection_for("mcp")
                 requested = set(tools_by_category["mcp"])
                 for tool in manager.get_langchain_tools():
                     if tool.name in requested:
@@ -657,7 +659,7 @@ def load_tools(tool_names: List[str], context: ToolContext) -> List[Any]:
 
     # Email datasource tools
     if "email" in tools_by_category:
-        if not context.has_datasource("email"):
+        if not context.has_connection_for("email"):
             logger.warning("Email tools require an email datasource in ToolContext")
         else:
             try:
@@ -693,8 +695,10 @@ def load_tools(tool_names: List[str], context: ToolContext) -> List[Any]:
             logger.warning("Shell tools require workspace_manager in ToolContext")
         else:
             try:
-                shell_tools = create_shell_tools(context)
                 requested = set(tools_by_category["shell"])
+                # The resolved names already chose the shell mode; the factory
+                # must not re-derive it from a second config read.
+                shell_tools = create_shell_tools(context, requested)
                 for tool in shell_tools:
                     if tool.name in requested:
                         all_tools.append(tool)
@@ -731,6 +735,19 @@ def load_tools(tool_names: List[str], context: ToolContext) -> List[Any]:
                         logger.debug(f"Loaded knowledge tool: {tool.name}")
             except Exception as e:
                 logger.warning(f"Could not load knowledge tools: {e}")
+
+    # Memory tools (memory_search). Bound by config name; at call time each one
+    # delegates to the same-named extension of the MemoryManager the graph
+    # publishes on ``context.memory_service``. Whether memory can serve it is
+    # decided before this point (get_all_tool_names), because a session binds
+    # its tools before its memory stores exist.
+    if "memory" in tools_by_category:
+        memory_tools = create_memory_tools(context)
+        requested = set(tools_by_category["memory"])
+        for tool in memory_tools:
+            if tool.name in requested:
+                all_tools.append(tool)
+                logger.debug(f"Loaded memory tool: {tool.name}")
 
     # Communication tools
     if "communication" in tools_by_category:

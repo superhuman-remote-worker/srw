@@ -78,6 +78,275 @@ CREATE TYPE public.sudo_request_status AS ENUM (
 
 
 --
+-- Name: acknowledge_abrupt_pinned_actor_exit(uuid, uuid, uuid, uuid, uuid, text); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.acknowledge_abrupt_pinned_actor_exit(owner_id uuid, generation_id uuid, retirement_id uuid, actor_id uuid, attach_id uuid, stopped_pod_uid text) RETURNS jsonb
+    LANGUAGE plpgsql
+    AS $_$
+DECLARE
+    owner_row public.threads%ROWTYPE;
+    actor_row public.agents%ROWTYPE;
+    context jsonb;
+    marker jsonb;
+    binding jsonb;
+    backend text;
+    dedicated_authorized boolean;
+    warm_authorized boolean;
+    receipt jsonb;
+    input_count bigint;
+    input_digest text;
+    claim jsonb;
+    stranded_count bigint;
+    partial_count bigint;
+BEGIN
+    SELECT * INTO owner_row FROM public.threads
+     WHERE id = owner_id FOR UPDATE;
+    IF NOT FOUND OR owner_row.kind IS DISTINCT FROM 'session'
+       OR owner_row.execution_lane IS DISTINCT FROM 'pinned'
+       OR owner_row.runtime_generation IS DISTINCT FROM generation_id
+       OR owner_row.runtime_retirement_token IS DISTINCT FROM retirement_id
+       OR owner_row.runtime_retirement_authorized_at IS NULL
+       OR owner_row.agent_id IS DISTINCT FROM actor_id
+       OR owner_row.runtime_attach_token IS DISTINCT FROM attach_id
+       OR (owner_row.control_admission_agent_id IS NOT NULL
+           AND owner_row.control_admission_agent_id IS DISTINCT FROM actor_id)
+       OR owner_row.runtime_authority_exposed IS DISTINCT FROM true
+       OR actor_id IS NULL OR attach_id IS NULL
+       OR NULLIF(stopped_pod_uid, '') IS NULL THEN
+        RETURN NULL;
+    END IF;
+    context := owner_row.runtime_retirement_context;
+    marker := context->'agent_pod';
+    binding := context->'workspace_binding';
+    backend := context->>'workspace_backend';
+    claim := context->'agent_workspace_claim';
+    IF backend IS DISTINCT FROM 'virtual' AND backend IS DISTINCT FROM 'none' THEN
+        RETURN NULL;
+    END IF;
+    -- Virtual without backing and none both own only their exact agent Pod.
+    -- Absence must agree in captured and current authority; a partial or
+    -- physical binding is never inferred away from a terminal agent Pod.
+    IF COALESCE(binding, 'null'::jsonb) IN ('null'::jsonb, '{}'::jsonb) THEN
+        IF COALESCE(owner_row.metadata->'_workspace_binding', 'null'::jsonb)
+           NOT IN ('null'::jsonb, '{}'::jsonb) THEN
+            RETURN NULL;
+        END IF;
+    ELSIF backend IS DISTINCT FROM 'virtual'
+       OR jsonb_typeof(binding) IS DISTINCT FROM 'object'
+       OR binding->>'kind' IS DISTINCT FROM 'virtual'
+       OR COALESCE(binding->>'backing_id', '') !~ '^rclone:[0-9a-f]{64}$'
+       OR COALESCE(binding->>'generation', '') !~
+          '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+       OR binding->'ssh_host_key_fingerprint' IS DISTINCT FROM 'null'::jsonb
+       OR binding - ARRAY['generation','kind','backing_id','ssh_host_key_fingerprint']
+          IS DISTINCT FROM '{}'::jsonb
+       OR owner_row.metadata->'_workspace_binding' IS DISTINCT FROM binding THEN
+        RETURN NULL;
+    END IF;
+    IF context->>'generation' IS DISTINCT FROM generation_id::text
+       OR context->>'agent_id' IS DISTINCT FROM actor_id::text
+       OR context->>'runtime_attach_token' IS DISTINCT FROM attach_id::text
+       OR context->>'settle_status' IS DISTINCT FROM 'ended'
+       OR owner_row.metadata->'agent_pod' IS DISTINCT FROM marker
+       OR COALESCE(owner_row.metadata->'protected_cloud', 'false'::jsonb)
+          IS DISTINCT FROM 'false'::jsonb
+       OR EXISTS (
+           SELECT 1 FROM unnest(ARRAY[
+               'workspace_container','vm','workspace_provision_intent',
+               'agent_pod_provision_intent','protected_ro'
+           ]) AS field
+           WHERE COALESCE(context->field, 'null'::jsonb)
+                 NOT IN ('null'::jsonb, '{}'::jsonb)
+       )
+       OR marker->>'pod_uid' IS DISTINCT FROM stopped_pod_uid
+       OR marker->>'protection_protocol' IS DISTINCT FROM 'finalizer_v1'
+       OR NULLIF(marker->>'namespace', '') IS NULL
+       OR NULLIF(marker->>'pod_name', '') IS NULL
+       OR context->'agent'->>'hostname' IS DISTINCT FROM marker->>'pod_name'
+       OR context->'agent'->>'pod_uid' IS DISTINCT FROM stopped_pod_uid THEN
+        RETURN NULL;
+    END IF;
+    -- The same two Pod authorities enforce_pinned_warm_binding_publication
+    -- accepts at bind time. A dedicated Pod carries its provision attempt; a
+    -- warm-pool Pod carries the protection that was bound to this exact
+    -- thread, generation, attach token and actor. Exactly one must vouch.
+    dedicated_authorized := EXISTS (
+        SELECT 1 FROM public.thread_agent_pod_provision_intents intent
+         WHERE intent.thread_id = owner_id
+           AND intent.runtime_generation = generation_id
+           AND intent.attempt_id::text = marker->>'provision_attempt'
+           AND intent.pod_name = marker->>'pod_name'
+           AND intent.pod_uid = stopped_pod_uid
+           AND intent.namespace = marker->>'namespace'
+           AND intent.protection_protocol = 'finalizer_v1'
+           AND intent.status = 'published'
+           AND intent.workspace_claim_id::text IS NOT DISTINCT FROM claim->>'claim_id' 
+    );
+    warm_authorized := EXISTS (
+        SELECT 1 FROM public.thread_agent_warm_binding_protections warm
+         WHERE warm.protection_id::text = marker->>'warm_binding_protection'
+           AND warm.thread_id = owner_id
+           AND warm.runtime_generation = generation_id
+           AND warm.runtime_attach_token = attach_id
+           AND warm.agent_id = actor_id
+           AND warm.status = 'bound'
+           AND warm.namespace = marker->>'namespace'
+           AND warm.pod_name = marker->>'pod_name'
+           AND warm.pod_uid = stopped_pod_uid
+    );
+    IF NOT (dedicated_authorized OR warm_authorized) THEN
+        RETURN NULL;
+    END IF;
+    SELECT * INTO actor_row FROM public.agents
+     WHERE id = actor_id FOR SHARE;
+    IF NOT FOUND OR actor_row.thread_id IS DISTINCT FROM owner_id
+       OR actor_row.pod_uid IS DISTINCT FROM stopped_pod_uid
+       OR actor_row.hostname IS DISTINCT FROM marker->>'pod_name'
+       OR actor_row.current_job_id IS NOT NULL
+       OR EXISTS (SELECT 1 FROM public.agents other
+                   WHERE other.id <> actor_id
+                     AND (other.thread_id = owner_id OR other.pod_uid = stopped_pod_uid))
+    THEN
+        RETURN NULL;
+    END IF;
+
+    -- Storage debt is not another process. Accept only the same protected
+    -- PVC publication captured at Begin; End still owes exact reclaim/fencing.
+    IF COALESCE(claim,'null'::jsonb) <> 'null'::jsonb AND NOT EXISTS (
+        SELECT 1 FROM public.thread_agent_workspace_claims c
+         WHERE c.thread_id=owner_id AND c.claim_id::text=claim->>'claim_id'
+           AND c.created_runtime_generation::text=claim->>'created_runtime_generation'
+           AND c.create_attempt::text=claim->>'create_attempt'
+           AND c.provisioner=claim->>'provisioner'
+           AND c.pvc_name=claim->>'pvc_name' AND c.pvc_uid=claim->>'pvc_uid'
+           AND c.namespace=claim->>'namespace'
+           AND c.protection_protocol='finalizer_v1' AND c.status='ready'
+           AND claim->>'protection_protocol'='finalizer_v1'
+           AND claim->>'status'='ready'
+    ) THEN RETURN NULL; END IF;
+
+    -- All supported input/child/control admission locks the owner first and
+    -- rejects its retirement token. These reads run after that durable fence,
+    -- not before a still-open producer can commit an admission.
+    -- A non-terminal input claimed by another agent or Pod refuses, except a
+    -- leftover of an earlier life of this thread: its owner is another agent
+    -- row that was the actor of an earlier generation whose retirement
+    -- settled (every outcome row requires that life's own exit receipt) after
+    -- the claim, on the Pod that outcome recorded when it recorded one.
+    -- Invariants relied on: a claim locks the thread and is refused once the
+    -- retirement token is set (lock_runtime_authority), so every claim of a
+    -- life precedes its Begin and therefore its settle transaction, and
+    -- owned_at < settled_at is strict; a later claim needs a new life (only
+    -- Resume, a suspend or an attach abort rotates the generation). Agent
+    -- rows recur: a warm-pool agent returns to the pool and a same-hostname
+    -- registration can reuse an agent id, so an outcome naming the owner
+    -- agent proves nothing about a claim made after it, nor about another
+    -- Pod. Hence a claim after that settlement, the same agent on another
+    -- Pod, a Pod the outcome did not retire, and an actor this life replaced
+    -- without a retirement all still refuse.
+    IF EXISTS (SELECT 1 FROM public.thread_input_deliveries delivery
+                WHERE delivery.thread_id = owner_id
+                  AND delivery.state NOT IN ('settled','cancelled')
+                  AND (delivery.execution_lane IS DISTINCT FROM 'pinned'
+                       OR (delivery.owner_agent_id IS NOT NULL
+                           AND (delivery.owner_agent_id IS DISTINCT FROM actor_id
+                                OR delivery.owner_pod_uid IS DISTINCT FROM stopped_pod_uid)
+                           AND NOT (
+                               delivery.owner_agent_id IS DISTINCT FROM actor_id
+                               AND EXISTS (
+                                   SELECT 1
+                                     FROM public.thread_runtime_retirement_outcomes prior
+                                    WHERE prior.thread_id = owner_id
+                                      AND prior.agent_id = delivery.owner_agent_id
+                                      AND prior.runtime_generation
+                                          IS DISTINCT FROM generation_id
+                                      AND prior.settled_at >= delivery.owned_at
+                                      AND (prior.retired_agent_pod IS NULL
+                                           OR prior.retired_agent_pod->>'pod_uid'
+                                              IS NOT DISTINCT FROM
+                                              delivery.owner_pod_uid))))))
+       -- In-process session children died with the proven-stopped Pod; their
+       -- queued/running rows stay as the crash left them for the settle.
+       OR EXISTS (SELECT 1 FROM public.threads child
+                   WHERE child.parent_thread_id = owner_id
+                     AND public.pinned_session_child_may_produce(child.id))
+       OR EXISTS (SELECT 1 FROM public.thread_control_requests
+                   WHERE thread_id = owner_id AND runtime_generation = generation_id)
+       OR EXISTS (SELECT 1 FROM public.thread_permission_requests
+                   WHERE thread_id = owner_id AND status = 'pending')
+       OR EXISTS (SELECT 1 FROM public.thread_interrupt_requests
+                   WHERE thread_id = owner_id AND
+                     (outcome IS NULL OR (outcome = 'applied' AND
+                      NOT (COALESCE(result, '{}'::jsonb) ? 'consumed_input_seq'))))
+       OR EXISTS (SELECT 1 FROM public.run_queue
+                   WHERE unit_id = owner_id AND (state <> 'done' OR leased_by IS NOT NULL))
+       OR EXISTS (SELECT 1 FROM public.completion_effects
+                   WHERE (scope_id = owner_id OR producer_id = owner_id)
+                     AND (state <> 'done' OR claimed_by IS NOT NULL))
+       OR EXISTS (SELECT 1 FROM public.thread_agent_workspace_claims
+                   WHERE thread_id = owner_id AND status <> 'reclaimed'
+                     AND claim_id::text IS DISTINCT FROM claim->>'claim_id')
+       OR EXISTS (SELECT 1 FROM public.thread_workspace_provision_intents
+                   WHERE thread_id = owner_id)
+       OR EXISTS (SELECT 1 FROM public.managed_repository_workspace_creation_reservations
+                   WHERE owner_kind = 'thread' AND
+                         managed_repository_workspace_creation_reservations.owner_id =
+                         acknowledge_abrupt_pinned_actor_exit.owner_id)
+       OR EXISTS (SELECT 1 FROM public.cloud_ro_mounts
+                   WHERE thread_id = owner_id AND status IN ('engaging','active','revoking'))
+    THEN
+        RETURN NULL;
+    END IF;
+
+    -- No delivery mutation: queued/owned input is reclaimed once by a successor;
+    -- admitted partial turns remain immutable receipts and are never replayed.
+    -- owner_runtime_generation is a process UUID, not the thread generation.
+    -- The current published Pod/actor join above owns these completed inputs
+    -- across container process restarts inside that same Kubernetes UID.
+    SELECT count(*), md5(string_agg(delivery_id::text || ':' || state, ',' ORDER BY delivery_id)),
+           count(*) FILTER (WHERE state IN ('owned','queued')),
+           count(*) FILTER (WHERE state='admitted')
+      INTO input_count, input_digest, stranded_count, partial_count
+      FROM public.thread_input_deliveries
+     WHERE thread_id = owner_id AND owner_agent_id = actor_id
+       AND owner_pod_uid = stopped_pod_uid
+       AND execution_lane = 'pinned';
+    IF input_count = 0 THEN
+        RETURN NULL;
+    END IF;
+    receipt := jsonb_build_object(
+        'version', 1,
+        'runtime_generation', generation_id,
+        'retirement_token', retirement_id,
+        'agent_id', actor_id,
+        'runtime_attach_token', attach_id,
+        'settle_status', 'ended',
+        'quiescence_protocol', 'agent_runtime_zero_v1',
+        'quiescence_actor', 'orchestrator',
+        'workspace_generation', NULL,
+        'workspace_runtime_incarnation', NULL,
+        'recovery_protocol', CASE WHEN backend = 'virtual'
+                                  THEN 'abrupt_virtual_actor_exit_v1'
+                                  ELSE 'abrupt_lite_actor_exit_v1' END,
+        'agent_pod_uid', stopped_pod_uid,
+        'captured_input_count', input_count,
+        'captured_input_ids_digest', input_digest,
+        'stranded_input_count', stranded_count,
+        'partial_admission_count', partial_count
+    );
+    IF owner_row.runtime_retirement_local_quiescence IS NOT NULL THEN
+        RETURN CASE WHEN owner_row.runtime_retirement_local_quiescence = receipt
+                    THEN receipt ELSE NULL END;
+    END IF;
+    UPDATE public.threads SET runtime_retirement_local_quiescence = receipt
+     WHERE id = owner_id;
+    RETURN receipt;
+END;
+$_$;
+
+
+--
 -- Name: acknowledge_settled_virtual_actor_exit(uuid, uuid, uuid, uuid, uuid, text); Type: FUNCTION; Schema: public; Owner: -
 --
 
@@ -338,6 +607,23 @@ $$;
 --
 
 COMMENT ON FUNCTION public.audit_officer_ticket_claim_job_delete() IS '0162 deletion audit extended by 0182 to retain the server-owned terminal outcome used by breaker and claim inspection.';
+
+
+--
+-- Name: cancel_vm_creation_retry_on_job_control(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.cancel_vm_creation_retry_on_job_control() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+BEGIN
+    IF NEW.status::text IN ('cancelled','completed') OR
+       NEW.context ?| ARRAY['_stateless_delete_pending','_stateless_cancel_cleanup_pending'] THEN
+        PERFORM request_vm_creation_retry_cancel(NEW.id);
+    END IF;
+    RETURN NEW;
+END;
+$$;
 
 
 --
@@ -631,6 +917,20 @@ BEGIN
                AND intent.scope = scope_name
                AND intent.runtime_incarnation::TEXT = runtime_uid
                AND intent.result_kind IS NULL
+        ) AND NOT (
+            -- A settled deleted Job runtime already reached process zero.
+            -- Admit its new terminal storage intent above, but retain the
+            -- immutable retired projection instead of reactivating its UID.
+            source_kind = 'job'
+            AND scope_name = 'workspace_container'
+            AND runtime_state ->> 'status' = 'deleted'
+            AND public.managed_repository_workspace_has_process_zero_receipt(
+                source_kind, NEW.id, scope_name, runtime_uid
+            )
+            AND public.managed_repository_workspace_cleanup_projection_is_settled(
+                source_kind, NEW.id, scope_name, runtime_uid,
+                runtime_uid, 'deleted'
+            )
         ) THEN
             runtime_state := jsonb_set(
                 runtime_state, ARRAY['status'],
@@ -744,6 +1044,29 @@ $$;
 
 
 --
+-- Name: capture_pinned_vm_actuator_request(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.capture_pinned_vm_actuator_request() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+DECLARE owner_row public.threads%ROWTYPE;
+BEGIN
+    IF NEW.actuator_request IS NOT NULL THEN
+        RAISE EXCEPTION 'archived VM actuator request is server-owned' USING ERRCODE='23514';
+    END IF;
+    -- Existing insert-authority guard proves physical zero and exact settlement.
+    SELECT * INTO owner_row FROM public.threads WHERE id=NEW.thread_id FOR SHARE;
+    IF owner_row.runtime_generation=NEW.runtime_generation
+       AND owner_row.runtime_retirement_token=NEW.retirement_token THEN
+        NEW.actuator_request := owner_row.runtime_retirement_actuator_request;
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+
+--
 -- Name: capture_retired_pinned_agent_pod(); Type: FUNCTION; Schema: public; Owner: -
 --
 
@@ -757,6 +1080,7 @@ DECLARE
     claim_row public.thread_agent_workspace_claims%ROWTYPE;
     marker jsonb;
     captured_agent jsonb;
+    receipt jsonb;
 BEGIN
     IF NEW.retired_agent_pod IS NOT NULL THEN
         RAISE EXCEPTION 'retired Pod identity is server-owned'
@@ -764,20 +1088,132 @@ BEGIN
                   CONSTRAINT = 'retired_agent_pod_identity_authority';
     END IF;
     -- The existing insert-authority trigger first validates the exact live
-    -- retirement and local-quiescence receipt. Only soft, claim-bearing actors
-    -- leave a reusable workspace whose historical Pod needs this relation.
-    IF NEW.permanent OR NEW.agent_id IS NULL THEN
+    -- retirement and local-quiescence receipt.
+    IF NEW.permanent THEN
+        RETURN NEW;
+    END IF;
+    IF NEW.agent_id IS NULL THEN
+        -- A Pod that never registered settles on the orchestrator's exact
+        -- pre-registration receipt. A claim-bearing one must be named here:
+        -- a later permanent End retires it before fencing the claim and has
+        -- no agent to join on. Anything less exact records nothing.
+        IF NEW.runtime_attach_token IS NOT NULL THEN
+            RETURN NEW;
+        END IF;
+        SELECT * INTO owner_row FROM public.threads
+         WHERE id = NEW.thread_id FOR SHARE;
+        marker := owner_row.runtime_retirement_context->'agent_pod';
+        receipt := owner_row.runtime_retirement_local_quiescence;
+        IF jsonb_typeof(marker) IS DISTINCT FROM 'object'
+           OR marker->>'protection_protocol' IS DISTINCT FROM 'finalizer_v1'
+           OR jsonb_typeof(
+                owner_row.runtime_retirement_context->'agent_workspace_claim'
+              ) IS DISTINCT FROM 'object'
+           OR owner_row.runtime_retirement_context->'agent_workspace_claim'
+              = '{}'::jsonb
+           OR owner_row.runtime_retirement_context->>'agent_id' IS NOT NULL
+           OR owner_row.runtime_retirement_context->>'runtime_attach_token'
+              IS NOT NULL
+           OR jsonb_typeof(owner_row.runtime_retirement_context->'agent')
+              = 'object'
+              AND owner_row.runtime_retirement_context->'agent' <> '{}'::jsonb
+           OR jsonb_typeof(receipt) IS DISTINCT FROM 'object'
+           OR receipt->>'quiescence_actor' IS DISTINCT FROM 'orchestrator'
+           OR receipt->>'agent_id' IS NOT NULL
+           OR receipt->>'runtime_generation'
+              IS DISTINCT FROM NEW.runtime_generation::text
+           OR receipt->>'retirement_token'
+              IS DISTINCT FROM owner_row.runtime_retirement_token::text
+           OR receipt->>'agent_pod_name' IS DISTINCT FROM marker->>'pod_name'
+           OR receipt->>'agent_pod_uid' IS DISTINCT FROM marker->>'pod_uid' THEN
+            RETURN NEW;
+        END IF;
+        SELECT * INTO intent_row FROM public.thread_agent_pod_provision_intents
+         WHERE attempt_id::text = marker->>'provision_attempt'
+           AND thread_id = NEW.thread_id FOR SHARE;
+        SELECT * INTO claim_row FROM public.thread_agent_workspace_claims
+         WHERE claim_id = intent_row.workspace_claim_id FOR SHARE;
+        IF intent_row.attempt_id IS NULL
+           OR claim_row.claim_id IS NULL
+           OR intent_row.runtime_generation IS DISTINCT FROM NEW.runtime_generation
+           OR intent_row.status IS DISTINCT FROM 'published'
+           OR intent_row.pod_name IS DISTINCT FROM marker->>'pod_name'
+           OR intent_row.pod_uid IS DISTINCT FROM marker->>'pod_uid'
+           OR intent_row.namespace IS DISTINCT FROM marker->>'namespace'
+           OR intent_row.protection_protocol IS DISTINCT FROM 'finalizer_v1'
+           OR claim_row.thread_id IS DISTINCT FROM NEW.thread_id
+           OR claim_row.claim_id::text IS DISTINCT FROM
+              owner_row.runtime_retirement_context->'agent_workspace_claim'->>'claim_id'
+           OR claim_row.namespace IS DISTINCT FROM intent_row.namespace
+           OR claim_row.provisioner IS DISTINCT FROM intent_row.provisioner
+           OR claim_row.status IS DISTINCT FROM 'ready'
+           OR NULLIF(claim_row.pvc_uid, '') IS NULL
+           OR claim_row.protection_protocol IS DISTINCT FROM 'finalizer_v1'
+           OR EXISTS (SELECT 1 FROM public.agents
+                       WHERE thread_id = NEW.thread_id
+                          OR hostname = intent_row.pod_name
+                          OR pod_uid = intent_row.pod_uid) THEN
+            RETURN NEW;
+        END IF;
+        NEW.retired_agent_pod := jsonb_build_object(
+            'version', 1,
+            'pod_name', intent_row.pod_name,
+            'pod_uid', intent_row.pod_uid,
+            'namespace', intent_row.namespace,
+            'provisioner', intent_row.provisioner,
+            'provision_attempt', intent_row.attempt_id,
+            'protection_protocol', intent_row.protection_protocol,
+            'workspace_claim_id', claim_row.claim_id,
+            'workspace_create_attempt', claim_row.create_attempt,
+            'workspace_created_runtime_generation', claim_row.created_runtime_generation,
+            'pvc_name', claim_row.pvc_name,
+            'pvc_uid', claim_row.pvc_uid
+        );
         RETURN NEW;
     END IF;
     SELECT * INTO owner_row FROM public.threads
      WHERE id = NEW.thread_id FOR SHARE;
     marker := owner_row.runtime_retirement_context->'agent_pod';
     captured_agent := owner_row.runtime_retirement_context->'agent';
-    IF marker->>'protection_protocol' IS DISTINCT FROM 'finalizer_v1'
-       OR owner_row.runtime_retirement_context->'agent_workspace_claim'
-          IS NULL
+    IF marker->>'protection_protocol' IS DISTINCT FROM 'finalizer_v1' THEN
+        RETURN NEW;
+    END IF;
+
+    IF owner_row.runtime_retirement_context->'agent_workspace_claim' IS NULL
        OR owner_row.runtime_retirement_context->'agent_workspace_claim'
           IN ('null'::jsonb, '{}'::jsonb) THEN
+        SELECT * INTO actor_row FROM public.agents
+         WHERE id = NEW.agent_id FOR SHARE;
+        SELECT * INTO intent_row FROM public.thread_agent_pod_provision_intents
+         WHERE attempt_id::text = marker->>'provision_attempt'
+           AND thread_id = NEW.thread_id FOR SHARE;
+        IF actor_row.id IS NULL OR intent_row.attempt_id IS NULL
+           OR marker ? 'warm_binding_protection'
+           OR intent_row.workspace_claim_id IS NOT NULL
+           OR owner_row.agent_id IS DISTINCT FROM NEW.agent_id
+           OR owner_row.runtime_attach_token IS DISTINCT FROM NEW.runtime_attach_token
+           OR actor_row.thread_id IS DISTINCT FROM NEW.thread_id
+           OR actor_row.hostname IS DISTINCT FROM marker->>'pod_name'
+           OR actor_row.pod_uid IS DISTINCT FROM marker->>'pod_uid'
+           OR actor_row.hostname IS DISTINCT FROM captured_agent->>'hostname'
+           OR actor_row.pod_uid IS DISTINCT FROM captured_agent->>'pod_uid'
+           OR intent_row.runtime_generation IS DISTINCT FROM NEW.runtime_generation
+           OR intent_row.status IS DISTINCT FROM 'published'
+           OR intent_row.pod_name IS DISTINCT FROM actor_row.hostname
+           OR intent_row.pod_uid IS DISTINCT FROM actor_row.pod_uid
+           OR intent_row.namespace IS DISTINCT FROM marker->>'namespace'
+           OR intent_row.protection_protocol IS DISTINCT FROM 'finalizer_v1' THEN
+            RETURN NEW;
+        END IF;
+        NEW.retired_agent_pod := jsonb_build_object(
+            'version', 1,
+            'pod_name', intent_row.pod_name,
+            'pod_uid', intent_row.pod_uid,
+            'namespace', intent_row.namespace,
+            'provisioner', intent_row.provisioner,
+            'provision_attempt', intent_row.attempt_id,
+            'protection_protocol', intent_row.protection_protocol
+        );
         RETURN NEW;
     END IF;
 
@@ -830,6 +1266,223 @@ BEGIN
         'pvc_uid', claim_row.pvc_uid
     );
     RETURN NEW;
+END;
+$$;
+
+
+--
+-- Name: capture_vm_thread_creation_settlement(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.capture_vm_thread_creation_settlement() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+DECLARE owner_row public.threads%ROWTYPE;
+        retry public.vm_creation_retries%ROWTYPE;
+BEGIN
+    SELECT * INTO owner_row FROM public.threads WHERE id=NEW.thread_id FOR UPDATE;
+    IF NEW.disposition='ended' AND owner_row.runtime_retirement_context->'vm_creation_source'
+       NOT IN ('null'::jsonb,'{}'::jsonb)
+       AND NOT EXISTS (SELECT 1 FROM public.vm_creation_retries retained WHERE retained.request_id::text=owner_row.runtime_retirement_context->'vm_creation_source'->>'request_id' AND retained.thread_retained_resume_id IS NOT NULL)
+       AND public.pinned_vm_creation_agent_zero_source(NEW.thread_id,NEW.runtime_generation,NEW.retirement_token) THEN
+        PERFORM 1 FROM public.vm_thread_creation_owners WHERE thread_id=NEW.thread_id FOR UPDATE;
+        SELECT * INTO retry FROM public.vm_creation_retries
+            WHERE request_id::text=owner_row.runtime_retirement_context->'vm_creation_source'->>'request_id'
+              AND owner_kind='thread' AND thread_id=NEW.thread_id FOR UPDATE;
+        PERFORM public.lock_vm_thread_creation_terminal_ledger(NEW.thread_id,retry.request_id);
+        INSERT INTO public.vm_thread_creation_settlements(
+            request_id,thread_id,runtime_generation,retirement_token,terminal_evidence,local_quiescence)
+        VALUES (retry.request_id,NEW.thread_id,NEW.runtime_generation,NEW.retirement_token,
+            public.vm_thread_creation_terminal_evidence(retry),owner_row.runtime_retirement_local_quiescence);
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+
+--
+-- Name: capture_vm_thread_retained_resume_terminal(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.capture_vm_thread_retained_resume_terminal() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+DECLARE op public.vm_thread_retained_resumes%ROWTYPE;
+        source public.vm_creation_retries%ROWTYPE;
+        cleanup_id uuid;
+        context jsonb;
+        retained_vm jsonb;
+BEGIN
+    IF NEW.disposition<>'ended' THEN RETURN NEW; END IF;
+    SELECT candidate.* INTO op FROM public.vm_thread_retained_resumes candidate JOIN public.threads t ON t.id=candidate.thread_id
+        WHERE candidate.thread_id=NEW.thread_id AND public.valid_vm_thread_retained_runtime(candidate,t);
+    IF op.id IS NULL THEN RETURN NEW; END IF;
+    SELECT * INTO source FROM public.vm_creation_retries WHERE request_id=op.request_id;
+    IF source.state='succeeded' THEN RETURN NEW; END IF;
+    SELECT runtime_retirement_context INTO context FROM public.threads WHERE id=NEW.thread_id;
+    cleanup_id := op.compute_cleanup_admission_id;
+    retained_vm := op.retained_vm;
+    IF source.observed_vm_uid IS NOT NULL THEN
+        SELECT cleanup_admission_id INTO cleanup_id FROM public.vm_resource_thread_cleanup_authorities
+            WHERE request_id=source.request_id AND runtime_generation=NEW.runtime_generation AND retirement_token=NEW.retirement_token;
+        retained_vm := jsonb_build_object('status','deleted','creation_request_id',source.request_id,
+            'provision_generation',source.provision_generation,'identity_provision_generation',source.provision_generation,
+            'identity_authenticated',true,'vm_uid',source.observed_vm_uid,'rootdisk_pvc_uid',source.observed_pvc_uid);
+    END IF;
+    INSERT INTO public.vm_thread_retained_resume_terminals
+        (id,operation_id,runtime_generation,retirement_token,compute_cleanup_admission_id,
+         source_request_id,source_terminal_evidence,retained_vm,retirement_context)
+        VALUES(public.uuid_generate_v5(op.id,'terminal:'||NEW.retirement_token),op.id,
+            NEW.runtime_generation,NEW.retirement_token,cleanup_id,source.request_id,
+            CASE WHEN source.request_id IS NOT NULL THEN public.vm_thread_retained_source_terminal_evidence(source) END,retained_vm,context);
+    RETURN NEW;
+END;
+$$;
+
+
+--
+-- Name: check_vm_job_cancel_retention_transaction(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.check_vm_job_cancel_retention_transaction() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+DECLARE parent_id uuid;
+        c public.vm_workspace_cleanup_admissions%ROWTYPE;
+        a public.vm_job_cancel_retention_authorities%ROWTYPE;
+BEGIN
+    IF TG_TABLE_NAME='vm_job_cancel_retention_authorities' THEN
+        PERFORM public.validate_vm_job_cancel_retention(NEW.cleanup_admission_id,true);
+        RETURN NEW;
+    END IF;
+    SELECT * INTO c FROM public.vm_workspace_cleanup_admissions WHERE id=NEW.id;
+    SELECT * INTO a FROM public.vm_job_cancel_retention_authorities
+     WHERE cleanup_admission_id=c.id OR superseded_admission_id=c.id;
+    IF c.source='job_terminal_vm_release' AND c.parent_admission_id IS NULL
+       AND public.vm_job_pinned_cancel_retention_pending(c.owner_kind,c.owner_id,c.pvc_uid)
+       AND c.outcome IS DISTINCT FROM 'superseded_by_retention'
+       AND NOT EXISTS(SELECT 1 FROM public.vm_job_cancel_retention_authorities exact
+           WHERE exact.cleanup_admission_id=c.id AND exact.policy_version=4) THEN
+        RAISE EXCEPTION 'Pinned Ready retention bootstrap is incomplete' USING ERRCODE='23514';
+    END IF;
+    IF c.outcome='superseded_by_retention' AND
+       (a.cleanup_admission_id IS NULL OR a.superseded_admission_id IS DISTINCT FROM c.id) THEN
+        RAISE EXCEPTION 'Superseded purge has no immutable retention successor' USING ERRCODE='23514';
+    END IF;
+    IF a.cleanup_admission_id IS NOT NULL THEN
+        PERFORM public.validate_vm_job_cancel_retention(a.cleanup_admission_id,false);
+        IF c.id=a.cleanup_admission_id AND c.completed_at IS NOT NULL
+           AND public.vm_job_cancel_retention_settled(c.id) IS DISTINCT FROM true THEN
+            RAISE EXCEPTION 'Cancel retention completion lacks exact retained stop and released charge' USING ERRCODE='23514';
+        END IF;
+    END IF;
+    IF c.source='public_vm_delete' AND c.parent_admission_id IS NULL THEN
+        IF NOT public.vm_job_cancel_retention_cleanup_allowed(
+            c.owner_kind,c.owner_id,c.pvc_uid,c.source,c.request_id,c.intent_digest,NULL,false) THEN
+            RAISE EXCEPTION 'Retained disk purge bootstrap is incomplete' USING ERRCODE='23514';
+        END IF;
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+
+--
+-- Name: check_vm_job_initial_ready_stop_parent(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.check_vm_job_initial_ready_stop_parent() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+BEGIN
+    IF NEW.owner_kind='job' AND NEW.source='job_terminal_vm_release'
+       AND NEW.parent_admission_id IS NULL AND EXISTS (
+           SELECT 1 FROM public.jobs j JOIN public.vm_creation_retries r
+             ON r.owner_kind='job' AND r.job_id=j.id
+            AND r.provision_generation::text=j.context->'vm'->>'provision_generation'
+           WHERE j.id=NEW.owner_id AND j.status='cancelled'
+             AND ((j.execution_lane='stateless'
+                 AND j.context->'_stateless_cancel_cleanup_pending'='true'::jsonb)
+               OR (j.execution_lane='pinned'
+                 AND j.context->'_job_terminal_vm_cleanup'->>'retention_policy'='4'))
+             AND r.ready_at IS NOT NULL AND r.job_retained_resume_id IS NULL
+             AND NOT j.context ? '_vm_job_retained_resume'
+             AND r.observed_pvc_uid=NEW.pvc_uid)
+       AND NOT EXISTS(SELECT 1 FROM public.vm_job_cancel_retention_authorities a
+           WHERE (a.cleanup_admission_id=NEW.id OR a.superseded_admission_id=NEW.id)
+             AND a.policy_version=CASE
+                 WHEN EXISTS(SELECT 1 FROM public.jobs j
+                     WHERE j.id=NEW.owner_id AND j.execution_lane='pinned'
+                       AND j.context->'_job_terminal_vm_cleanup'->>'retention_policy'='4')
+                 THEN 4 ELSE 3 END) THEN
+        RAISE EXCEPTION 'Initial Ready stop bootstrap is incomplete' USING ERRCODE='23514';
+    END IF;
+    RETURN NULL;
+END;
+$$;
+
+
+--
+-- Name: check_vm_job_retained_creation_parent(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.check_vm_job_retained_creation_parent() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+BEGIN
+    IF NEW.retained_resume_admitted_xact_id IS NOT NULL AND NEW.source='controller_vm_create'
+       AND NOT EXISTS(SELECT 1 FROM public.vm_creation_retries r
+           JOIN public.vm_job_retained_resumes op ON op.id=r.job_retained_resume_id
+           WHERE r.creation_admission_id=NEW.id AND r.owner_kind='job' AND r.job_id=NEW.owner_id
+             AND op.job_id=NEW.owner_id AND r.request_id=op.request_id
+             AND r.provision_generation=op.provision_generation AND r.expected_pvc_uid=NEW.pvc_uid
+             AND NEW.request_id=public.uuid_generate_v5(public.uuid_ns_url(),'vm-create:'||r.request_id)
+             AND NEW.intent_digest=public.vm_job_retained_creation_digest(r)) THEN
+        RAISE EXCEPTION 'Retained creation parent source link is incomplete' USING ERRCODE='23514';
+    END IF;
+    RETURN NULL;
+END;
+$$;
+
+
+--
+-- Name: check_vm_job_retained_resume_owner(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.check_vm_job_retained_resume_owner() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+DECLARE j public.jobs%ROWTYPE;
+BEGIN
+    SELECT * INTO j FROM public.jobs WHERE id=NEW.job_id;
+    IF j.context->>'_vm_job_retained_resume' IS DISTINCT FROM NEW.id::text
+       OR j.context->>'worker_resume_id' IS DISTINCT FROM NEW.explicit_resume_id::text
+       OR j.status NOT IN ('created','paused') OR j.assigned_agent_id IS NOT NULL THEN
+        RAISE EXCEPTION 'Retained Job Resume owner CAS is incomplete' USING ERRCODE='23514';
+    END IF;
+    RETURN NULL;
+END;
+$$;
+
+
+--
+-- Name: check_vm_job_retained_stop_parent(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.check_vm_job_retained_stop_parent() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+BEGIN
+    IF NEW.owner_kind='job' AND NEW.source='job_terminal_vm_release' AND NEW.parent_admission_id IS NULL
+       AND EXISTS(SELECT 1 FROM public.vm_job_retained_resumes op JOIN public.vm_creation_retries r
+           ON r.job_retained_resume_id=op.id WHERE op.job_id=NEW.owner_id AND op.pvc_uid=NEW.pvc_uid
+             AND NEW.request_id=public.uuid_generate_v5(public.uuid_ns_url(),
+               'vm-workspace-cleanup:job_terminal_vm_release:job:'||op.job_id||':'||op.provision_generation||':'||r.observed_vm_uid||':'||op.pvc_uid))
+       AND NOT EXISTS(SELECT 1 FROM public.vm_job_cancel_retention_authorities a
+           WHERE a.cleanup_admission_id=NEW.id AND a.policy_version=2) THEN
+        RAISE EXCEPTION 'Retained continuation stop bootstrap is incomplete' USING ERRCODE='23514';
+    END IF;
+    RETURN NULL;
 END;
 $$;
 
@@ -1990,13 +2643,30 @@ BEGIN
         );
     END IF;
     IF NEW.status = 'engaging' AND validate_selected THEN
-        SELECT mount.mount_kind, mount.target_path, mount.source_kind,
-               mount.source_ref, mount.backend_id,
-               mount.backend_instance_id, mount.cloud_handle
+        -- 0524: the protected folder a session selected is its
+        -- thread_protected_sources row.
+        -- 0525: both lookups yield one row type (text, not thread_mounts'
+        -- varchar), so a backend that runs both keeps one cached plan.
+        SELECT source.mount_kind::text, source.target_path::text,
+               source.source_kind::text, source.source_ref::uuid,
+               source.backend_id::text, source.backend_instance_id::uuid,
+               source.cloud_handle::text
           INTO selected
-          FROM public.thread_mounts AS mount
-         WHERE mount.id = NEW.selected_mount_id
-           AND mount.thread_id = NEW.thread_id;
+          FROM public.thread_protected_sources AS source
+         WHERE source.id = NEW.selected_mount_id
+           AND source.thread_id = NEW.thread_id;
+        IF NOT FOUND THEN
+            -- For one release: a session an older orchestrator selected from
+            -- its thread_mounts row, before the startup pass copied it.
+            SELECT mount.mount_kind::text, mount.target_path::text,
+                   mount.source_kind::text, mount.source_ref::uuid,
+                   mount.backend_id::text, mount.backend_instance_id::uuid,
+                   mount.cloud_handle::text
+              INTO selected
+              FROM public.thread_mounts AS mount
+             WHERE mount.id = NEW.selected_mount_id
+               AND mount.thread_id = NEW.thread_id;
+        END IF;
         IF NOT FOUND THEN
             RAISE EXCEPTION 'protected reader selected mount no longer exists'
                 USING ERRCODE = '23514',
@@ -2024,6 +2694,235 @@ BEGIN
     RETURN NEW;
 END;
 $_$;
+
+
+--
+-- Name: enforce_container_startup_owner_ready(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.enforce_container_startup_owner_ready() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+DECLARE
+    receipt public.managed_repository_workspace_creation_reservations%ROWTYPE;
+    projection jsonb;
+    prior_status text;
+    hard_deadline timestamptz;
+BEGIN
+    IF TG_TABLE_NAME = 'jobs' THEN
+        projection := NEW.context->'workspace_container';
+        prior_status := OLD.context #>> '{workspace_container,status}';
+        SELECT * INTO receipt
+          FROM public.managed_repository_workspace_creation_reservations
+         WHERE owner_kind = 'job' AND owner_id = NEW.id
+           AND scope = 'workspace_container' AND startup_protocol_version = 1
+           AND settled_at IS NULL
+         LIMIT 1;
+    ELSE
+        projection := NEW.metadata->'workspace_container';
+        prior_status := OLD.metadata #>> '{workspace_container,status}';
+        SELECT * INTO receipt
+          FROM public.managed_repository_workspace_creation_reservations
+         WHERE owner_kind = 'thread' AND owner_id = NEW.id
+           AND scope = 'workspace_container' AND startup_protocol_version = 1
+           AND settled_at IS NULL
+         LIMIT 1;
+    END IF;
+    IF receipt.id IS NULL OR projection->>'status' IS DISTINCT FROM 'ready'
+       OR prior_status = 'ready' THEN
+        RETURN NEW;
+    END IF;
+    hard_deadline := receipt.scheduled_at + make_interval(
+        secs => GREATEST(receipt.ready_budget_seconds,
+                         COALESCE(receipt.pull_budget_seconds, 0)));
+    IF current_setting('srw.container_startup_ready_receipt', true)
+          IS DISTINCT FROM receipt.id::text
+       OR receipt.operation_kind <> 'create'
+       OR receipt.phase <> 'runtime_bound' OR receipt.cancel_requested_at IS NOT NULL
+       OR receipt.expires_at <= clock_timestamp()
+       OR receipt.startup_stage IS DISTINCT FROM 'readiness'
+       OR receipt.startup_state IS DISTINCT FROM 'starting'
+       OR receipt.startup_first_ready_at IS NULL
+       OR clock_timestamp() >= LEAST(
+           receipt.startup_first_ready_at + make_interval(secs => receipt.ssh_budget_seconds),
+           hard_deadline + make_interval(secs => receipt.ssh_budget_seconds))
+       OR projection->>'_runtime_incarnation' IS DISTINCT FROM receipt.pod_uid::text
+       OR projection->>'_creation_reservation_id' IS DISTINCT FROM receipt.id::text
+       OR projection->>'_creation_claim_token' IS DISTINCT FROM receipt.claim_token::text THEN
+        RAISE EXCEPTION 'container startup Ready lacks current stage authority'
+            USING ERRCODE = '23514',
+                  CONSTRAINT = 'managed_workspace_startup_owner_ready';
+    END IF;
+    IF TG_TABLE_NAME = 'threads' THEN
+        IF NEW.runtime_generation IS DISTINCT FROM
+           receipt.thread_runtime_generation THEN
+            RAISE EXCEPTION 'container startup Ready generation changed'
+                USING ERRCODE = '23514',
+                      CONSTRAINT = 'managed_workspace_startup_owner_ready';
+        END IF;
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+
+--
+-- Name: enforce_container_startup_stage_receipt(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.enforce_container_startup_stage_receipt() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+DECLARE
+    owner_runtime jsonb;
+    owner_status text;
+    owner_generation uuid;
+    hard_deadline timestamptz;
+    ssh_deadline timestamptz;
+BEGIN
+    IF TG_OP = 'UPDATE' THEN
+        IF OLD.startup_protocol_version = 1 AND (
+            NEW.startup_protocol_version IS DISTINCT FROM 1
+            OR NEW.scheduled_at IS DISTINCT FROM OLD.scheduled_at
+               AND OLD.scheduled_at IS NOT NULL
+            OR NEW.startup_first_ready_at IS DISTINCT FROM OLD.startup_first_ready_at
+               AND OLD.startup_first_ready_at IS NOT NULL
+            OR NEW.ready_budget_seconds IS DISTINCT FROM OLD.ready_budget_seconds
+               AND OLD.ready_budget_seconds IS NOT NULL
+            OR NEW.pull_budget_seconds IS DISTINCT FROM OLD.pull_budget_seconds
+               AND OLD.scheduled_at IS NOT NULL
+            OR NEW.ssh_budget_seconds IS DISTINCT FROM OLD.ssh_budget_seconds
+               AND OLD.ssh_budget_seconds IS NOT NULL
+            OR OLD.startup_state = 'attention' AND
+               (NEW.startup_state IS DISTINCT FROM OLD.startup_state
+                OR NEW.startup_reason_code IS DISTINCT FROM OLD.startup_reason_code
+                OR NEW.startup_attention_at IS DISTINCT FROM OLD.startup_attention_at)
+            OR NEW.scope IS DISTINCT FROM OLD.scope
+            OR NEW.operation_kind IS DISTINCT FROM OLD.operation_kind
+            OR NEW.pod_uid IS DISTINCT FROM OLD.pod_uid
+            OR NEW.runtime_incarnation IS DISTINCT FROM OLD.runtime_incarnation
+        ) THEN
+            RAISE EXCEPTION 'container startup authority is immutable'
+                USING ERRCODE = '23514',
+                      CONSTRAINT = 'managed_workspace_startup_stage_authority';
+        END IF;
+    END IF;
+    IF NEW.startup_protocol_version IS DISTINCT FROM 1 THEN
+        RETURN NEW;
+    END IF;
+    IF NEW.phase NOT IN ('runtime_bound', 'settled', 'aborted')
+       OR (TG_OP = 'INSERT' OR OLD.startup_protocol_version IS DISTINCT FROM 1)
+          AND (NEW.phase <> 'runtime_bound' OR NEW.settled_at IS NOT NULL
+               OR NEW.cancel_requested_at IS NOT NULL) THEN
+        RAISE EXCEPTION 'container startup requires an open bound receipt'
+            USING ERRCODE = '23514',
+                  CONSTRAINT = 'managed_workspace_startup_stage_authority';
+    END IF;
+    IF NEW.cancel_requested_at IS NOT NULL THEN
+        -- Native Cancel rotates the claim, then updates the owner projection
+        -- in its owner-ordered transaction. Its physical cleanup/abort path
+        -- must retain the receipt and does not grant a later Ready or a
+        -- successful creation settlement. Do not let this branch bypass the
+        -- Ready marker check below by writing settled after cancellation.
+        IF NEW.phase = 'settled' OR NEW.result_kind = 'settled' THEN
+            RAISE EXCEPTION 'cancelled container startup cannot settle Ready'
+                USING ERRCODE = '23514',
+                      CONSTRAINT = 'managed_workspace_startup_stage_authority';
+        END IF;
+        RETURN NEW;
+    END IF;
+    IF TG_OP = 'UPDATE' AND OLD.startup_protocol_version = 1
+       AND NEW.startup_stage IS NOT DISTINCT FROM OLD.startup_stage
+       AND NEW.startup_state IS NOT DISTINCT FROM OLD.startup_state
+       AND NEW.startup_reason_code IS NOT DISTINCT FROM OLD.startup_reason_code
+       AND NEW.scheduled_at IS NOT DISTINCT FROM OLD.scheduled_at
+       AND NEW.startup_first_ready_at IS NOT DISTINCT FROM OLD.startup_first_ready_at
+       AND NEW.ready_budget_seconds IS NOT DISTINCT FROM OLD.ready_budget_seconds
+       AND NEW.pull_budget_seconds IS NOT DISTINCT FROM OLD.pull_budget_seconds
+       AND NEW.ssh_budget_seconds IS NOT DISTINCT FROM OLD.ssh_budget_seconds
+       AND NEW.startup_attention_at IS NOT DISTINCT FROM OLD.startup_attention_at
+       AND NEW.phase = 'runtime_bound' THEN
+        -- An existing same-generation claim rotates the receipt token before
+        -- updating the owner's token. Check the final pair at commit instead.
+        RETURN NEW;
+    END IF;
+
+    IF NEW.owner_kind = 'job' THEN
+        SELECT context->'workspace_container', status::text
+          INTO owner_runtime, owner_status
+          FROM public.jobs WHERE id = NEW.owner_id;
+        IF owner_status IN ('completed', 'failed', 'cancelled') THEN
+            RAISE EXCEPTION 'container startup owner is terminal'
+                USING ERRCODE = '23514',
+                      CONSTRAINT = 'managed_workspace_startup_stage_authority';
+        END IF;
+    ELSE
+        SELECT metadata->'workspace_container', status::text, runtime_generation
+          INTO owner_runtime, owner_status, owner_generation
+          FROM public.threads WHERE id = NEW.owner_id;
+        IF owner_status = 'ended'
+           OR owner_generation IS DISTINCT FROM NEW.thread_runtime_generation THEN
+            RAISE EXCEPTION 'container startup owner generation changed'
+                USING ERRCODE = '23514',
+                      CONSTRAINT = 'managed_workspace_startup_stage_authority';
+        END IF;
+    END IF;
+    IF owner_runtime IS NULL
+       OR owner_runtime->>'_runtime_incarnation' IS DISTINCT FROM NEW.pod_uid::text
+       OR owner_runtime->>'_creation_reservation_id' IS DISTINCT FROM NEW.id::text
+       OR owner_runtime->>'_creation_claim_token' IS DISTINCT FROM NEW.claim_token::text THEN
+        RAISE EXCEPTION 'container startup owner binding changed'
+            USING ERRCODE = '23514',
+                  CONSTRAINT = 'managed_workspace_startup_stage_authority';
+    END IF;
+    IF NEW.startup_state = 'attention' AND
+       NEW.startup_reason_code IN ('pull_deadline', 'readiness_deadline') THEN
+        hard_deadline := NEW.scheduled_at + make_interval(
+            secs => GREATEST(NEW.ready_budget_seconds,
+                             COALESCE(NEW.pull_budget_seconds, 0)));
+        IF clock_timestamp() <= hard_deadline THEN
+            RAISE EXCEPTION 'startup deadline has not elapsed'
+                USING ERRCODE = '23514',
+                      CONSTRAINT = 'managed_workspace_startup_stage_authority';
+        END IF;
+    ELSIF NEW.startup_state = 'attention'
+          AND NEW.startup_reason_code = 'ssh_deadline' THEN
+        hard_deadline := NEW.scheduled_at + make_interval(
+            secs => GREATEST(NEW.ready_budget_seconds,
+                             COALESCE(NEW.pull_budget_seconds, 0)));
+        ssh_deadline := LEAST(
+            NEW.startup_first_ready_at + make_interval(secs => NEW.ssh_budget_seconds),
+            hard_deadline + make_interval(secs => NEW.ssh_budget_seconds));
+        IF NEW.startup_first_ready_at IS NULL
+           OR clock_timestamp() <= ssh_deadline THEN
+            RAISE EXCEPTION 'startup SSH deadline has not elapsed'
+                USING ERRCODE = '23514',
+                      CONSTRAINT = 'managed_workspace_startup_stage_authority';
+        END IF;
+    END IF;
+    IF NEW.phase = 'settled' AND OLD.phase IS DISTINCT FROM 'settled' THEN
+        hard_deadline := NEW.scheduled_at + make_interval(
+            secs => GREATEST(NEW.ready_budget_seconds,
+                             COALESCE(NEW.pull_budget_seconds, 0)));
+        ssh_deadline := LEAST(
+            NEW.startup_first_ready_at + make_interval(secs => NEW.ssh_budget_seconds),
+            hard_deadline + make_interval(secs => NEW.ssh_budget_seconds));
+        IF current_setting('srw.container_startup_ready_receipt', true)
+              IS DISTINCT FROM NEW.id::text
+           OR NEW.result_kind IS DISTINCT FROM 'settled'
+           OR NEW.startup_stage IS DISTINCT FROM 'readiness'
+           OR NEW.startup_state IS DISTINCT FROM 'starting'
+           OR NEW.startup_first_ready_at IS NULL
+           OR clock_timestamp() >= ssh_deadline
+           OR owner_runtime->>'status' IS DISTINCT FROM 'ready' THEN
+            RAISE EXCEPTION 'container startup cannot settle before authenticated Ready'
+                USING ERRCODE = '23514',
+                      CONSTRAINT = 'managed_workspace_startup_stage_authority';
+        END IF;
+    END IF;
+    RETURN NEW;
+END;
+$$;
 
 
 --
@@ -2864,6 +3763,13 @@ BEGIN
     THEN
         old_workspace := '{}'::JSONB;
     END IF;
+    IF TG_OP = 'DELETE' AND source_kind = 'thread'
+       AND public.stateless_virtual_permanent_delete_is_authority_free(
+           source_id, old_state
+       )
+    THEN
+        old_workspace := '{}'::JSONB;
+    END IF;
 
     -- Origin migration 0185/0200 is the authority for a *pinned* thread's
     -- Kubernetes agent runtime, so that scope is handed over here.  It does
@@ -3075,6 +3981,18 @@ BEGIN
                 MESSAGE = 'Docker workspace process-zero authority is required';
         END IF;
     ELSIF old_workspace <> '{}'::JSONB
+       AND NOT (
+           TG_OP = 'UPDATE' AND NEW.id = OLD.id
+           AND source_kind = 'job'
+           AND NEW.status::TEXT = 'cancelled' AND OLD.status::TEXT = 'cancelled'
+           AND to_jsonb(NEW) ->> 'execution_lane' = 'stateless'
+           AND to_jsonb(OLD) ->> 'execution_lane' = 'stateless'
+           AND to_jsonb(NEW) ->> 'assigned_agent_id' IS NULL
+           AND to_jsonb(OLD) ->> 'assigned_agent_id' IS NULL
+           AND public.managed_repo_cancelled_creation_retirement_is_authorized_now(
+               source_kind, source_id, 'workspace_container', old_state, new_state
+           )
+       )
        -- A status-only placeholder has no process, endpoint, lease, or
        -- repository authority to retire.  Sanitized untrusted creation paths
        -- legitimately move that placeholder between pending/ready states.
@@ -3303,7 +4221,14 @@ BEGIN
                     MESSAGE = 'Local IDE process-zero authority is required';
             END IF;
         ELSIF destructive_transition AND runtime_id IS NULL
-           AND old_ide <> '{}'::JSONB THEN
+           AND old_ide <> '{}'::JSONB
+           AND (
+               TG_OP = 'UPDATE'
+               AND source_kind = 'job'
+               AND public.managed_repo_uidless_ide_abort_authorized_now(
+                   source_id, old_state, new_state
+               )
+           ) IS NOT TRUE THEN
             RAISE EXCEPTION USING
                 ERRCODE = '23514',
                 CONSTRAINT = 'managed_repository_ide_runtime_identity_required',
@@ -4660,6 +5585,19 @@ BEGIN
             END IF;
         ELSIF workspace_backend IN ('virtual', 'none') THEN
             expected_protocol := 'agent_runtime_zero_v1';
+        ELSIF public.pinned_vm_pre_registration_no_vm_source(
+            OLD.id,OLD.runtime_generation,OLD.runtime_retirement_token) THEN
+            expected_protocol := CASE
+                WHEN local_quiescence->>'vm_creation_request_id' IS NULL
+                 AND local_quiescence->>'vm_creation_provision_generation' IS NULL
+                THEN 'agent_runtime_zero_v1' ELSE NULL END;
+            expected_workspace_generation := '';
+            expected_workspace_runtime := '';
+        ELSIF public.pinned_vm_creation_agent_zero_source(
+            OLD.id,OLD.runtime_generation,OLD.runtime_retirement_token) THEN
+            expected_protocol := 'agent_runtime_zero_v1';
+            expected_workspace_generation := '';
+            expected_workspace_runtime := '';
         ELSIF workspace_backend IN ('vm', 'remote') THEN
             expected_protocol := 'workspace_actuator_zero_v1';
             expected_workspace_generation := COALESCE(
@@ -4781,11 +5719,19 @@ BEGIN
     IF EXISTS (
         SELECT 1 FROM public.thread_agent_warm_binding_protections warm
          WHERE warm.agent_id = NEW.id
-           AND warm.status IN ('planned', 'protecting', 'protected', 'releasing')
-    ) AND (
-        NEW.thread_id IS NOT NULL
-        OR NEW.current_job_id IS NOT NULL
-        OR NEW.status::text <> 'draining'
+           AND warm.status IN ('planned', 'protecting', 'protected',
+                               'releasing', 'terminal_release')
+           AND (
+               NEW.thread_id IS NOT NULL
+               OR NEW.current_job_id IS NOT NULL
+               OR (warm.status = 'terminal_release' AND (
+                   NEW.status::text NOT IN ('draining', 'offline')
+                   OR NEW.hostname IS DISTINCT FROM warm.pod_name
+                   OR NEW.pod_uid IS DISTINCT FROM warm.pod_uid
+               ))
+               OR (warm.status <> 'terminal_release'
+                   AND NEW.status::text <> 'draining')
+           )
     ) THEN
         RAISE EXCEPTION 'warm Pod has unresolved protection authority'
             USING ERRCODE = '23514',
@@ -4867,11 +5813,293 @@ BEGIN
         SELECT 1 FROM public.thread_agent_warm_binding_protections warm
          WHERE warm.thread_id = NEW.thread_id
            AND warm.runtime_generation = NEW.runtime_generation
-           AND warm.status IN ('planned', 'protecting', 'protected', 'releasing')
+           AND warm.status IN ('planned', 'protecting', 'protected',
+                               'releasing', 'terminal_release')
     ) THEN
         RAISE EXCEPTION 'pinned Pod create races warm binding protection'
             USING ERRCODE = '23514',
                   CONSTRAINT = 'thread_agent_warm_binding_create_exclusion';
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+
+--
+-- Name: enforce_pinned_workspace_create_receipt(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.enforce_pinned_workspace_create_receipt() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+DECLARE source public.thread_workspace_provision_intents%ROWTYPE;
+BEGIN
+ IF TG_OP<>'INSERT' THEN
+  RAISE EXCEPTION 'workspace CREATE receipt is immutable' USING ERRCODE='23514',CONSTRAINT='pinned_workspace_create_receipt_authority';
+ END IF;
+ SELECT * INTO source FROM public.thread_workspace_provision_intents WHERE attempt_id=NEW.attempt_id FOR SHARE;
+ IF source.attempt_id IS NULL OR source.thread_id<>NEW.thread_id
+   OR source.runtime_generation<>NEW.runtime_generation OR source.namespace<>NEW.namespace
+   OR source.pvc_name IS DISTINCT FROM NEW.resource_name
+   OR source.status NOT IN ('planned','revoking') OR source.retained_source_attempt_id IS NOT NULL
+   OR (source.pvc_uid IS NOT NULL AND source.pvc_uid<>NEW.resource_uid)
+   OR NEW.observed_at IS DISTINCT FROM transaction_timestamp() THEN
+  RAISE EXCEPTION 'PVC CREATE receipt lacks exact source intent' USING ERRCODE='23514',CONSTRAINT='pinned_workspace_create_receipt_authority';
+ END IF;
+ RETURN NEW;
+END;
+$$;
+
+
+--
+-- Name: enforce_pinned_workspace_inert_fence_receipt(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.enforce_pinned_workspace_inert_fence_receipt() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+DECLARE t public.threads%ROWTYPE; intent public.thread_workspace_provision_intents%ROWTYPE;
+BEGIN
+ IF TG_OP<>'INSERT' THEN
+   RAISE EXCEPTION 'partial workspace inert fence receipt is immutable'
+    USING ERRCODE='23514',CONSTRAINT='pinned_workspace_inert_fence_authority';
+ END IF;
+ SELECT * INTO t FROM public.threads WHERE id=NEW.thread_id FOR UPDATE;
+ SELECT * INTO intent FROM public.thread_workspace_provision_intents WHERE attempt_id=NEW.attempt_id FOR SHARE;
+ IF t.id IS NULL OR intent.attempt_id IS NULL OR intent.thread_id<>t.id
+   OR t.execution_lane<>'pinned' OR t.runtime_generation<>NEW.retirement_runtime_generation
+   OR t.runtime_retirement_token IS DISTINCT FROM NEW.retirement_token
+   OR t.runtime_retirement_authorized_at IS NULL
+   OR intent.cleanup_retirement_token IS DISTINCT FROM NEW.retirement_token
+   OR intent.runtime_generation<>NEW.source_runtime_generation
+   OR intent.status<>'revoking' OR intent.pod_uid IS NOT NULL
+   OR intent.namespace<>NEW.namespace OR intent.pod_name<>NEW.pod_name
+   OR NOT public.pinned_workspace_provision_capture_is_current(t.id,t.runtime_generation,
+          t.runtime_retirement_context->'workspace_provision_intent')
+   OR t.runtime_retirement_context->'workspace_provision_intent'->>'attempt_id'<>NEW.attempt_id::text
+   OR NEW.observed_at IS DISTINCT FROM transaction_timestamp() THEN
+   RAISE EXCEPTION 'partial workspace fence lacks exact retirement authority'
+    USING ERRCODE='23514',CONSTRAINT='pinned_workspace_inert_fence_authority';
+ END IF;
+ RETURN NEW;
+END;
+$$;
+
+
+--
+-- Name: enforce_pinned_workspace_provision_stop_receipt(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.enforce_pinned_workspace_provision_stop_receipt() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+DECLARE
+    t public.threads%ROWTYPE;
+    i public.thread_workspace_provision_intents%ROWTYPE;
+BEGIN
+    IF TG_OP <> 'INSERT' THEN
+        RAISE EXCEPTION 'workspace provision stop receipt is immutable'
+          USING ERRCODE='23514', CONSTRAINT='pinned_workspace_provision_stop_authority';
+    END IF;
+    SELECT * INTO t FROM public.threads WHERE id=NEW.thread_id FOR UPDATE;
+    SELECT * INTO i FROM public.thread_workspace_provision_intents
+      WHERE attempt_id=NEW.attempt_id FOR UPDATE;
+    IF t.id IS NULL OR i.attempt_id IS NULL
+       OR t.execution_lane <> 'pinned'
+       OR t.runtime_generation IS DISTINCT FROM NEW.runtime_generation
+       OR t.runtime_retirement_token IS DISTINCT FROM NEW.retirement_token
+       OR t.runtime_retirement_authorized_at IS NULL
+       OR i.thread_id IS DISTINCT FROM NEW.thread_id
+       OR i.runtime_generation IS DISTINCT FROM NEW.runtime_generation
+       OR i.cleanup_retirement_token IS DISTINCT FROM NEW.retirement_token
+       OR i.status <> 'revoking'
+       OR i.namespace IS DISTINCT FROM NEW.namespace
+       OR i.pod_name IS DISTINCT FROM NEW.pod_name
+       OR i.pod_uid IS DISTINCT FROM NEW.pod_uid
+       OR t.runtime_retirement_context->'workspace_provision_intent'->>'attempt_id'
+           IS DISTINCT FROM NEW.attempt_id::text
+       OR t.runtime_retirement_context->'workspace_provision_intent'->>'pod_uid'
+           IS DISTINCT FROM NEW.pod_uid
+       OR NEW.observed_at IS DISTINCT FROM transaction_timestamp() THEN
+        RAISE EXCEPTION 'workspace provision stop lacks exact retirement authority'
+          USING ERRCODE='23514', CONSTRAINT='pinned_workspace_provision_stop_authority';
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+
+--
+-- Name: enforce_pinned_workspace_retained_creation(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.enforce_pinned_workspace_retained_creation() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+DECLARE
+    t public.threads%ROWTYPE;
+    source public.thread_workspace_provision_intents%ROWTYPE;
+    successor public.thread_workspace_provision_intents%ROWTYPE;
+    captured jsonb;
+BEGIN
+    SELECT * INTO t FROM public.threads WHERE id=NEW.thread_id FOR UPDATE;
+    IF TG_OP='INSERT' THEN
+        IF NEW.cleanup_disposition IS NOT NULL OR NEW.cleanup_retirement_token IS NOT NULL
+           OR NEW.purge_completed_at IS NOT NULL
+           OR NEW.creation_effects_admitted_at IS NOT NULL
+           OR NEW.retained_resume_generation IS NOT NULL
+           OR NEW.retained_successor_attempt_id IS NOT NULL THEN
+            RAISE EXCEPTION 'new workspace intent cannot preclaim retirement'
+              USING ERRCODE='23514', CONSTRAINT='pinned_workspace_retention_authority';
+        END IF;
+        IF NEW.retained_source_attempt_id IS NOT NULL THEN
+            SELECT * INTO source FROM public.thread_workspace_provision_intents
+              WHERE attempt_id=NEW.retained_source_attempt_id FOR UPDATE;
+            IF source.attempt_id IS NULL OR source.thread_id IS DISTINCT FROM NEW.thread_id
+               OR source.status <> 'retired' OR source.cleanup_disposition <> 'retain'
+               OR source.retained_resume_generation IS DISTINCT FROM NEW.runtime_generation
+               OR source.retained_successor_attempt_id IS NOT NULL
+               OR source.purge_completed_at IS NOT NULL
+               OR source.namespace IS DISTINCT FROM NEW.namespace
+               OR source.pvc_name IS DISTINCT FROM NEW.pvc_name
+               OR source.service_name IS DISTINCT FROM NEW.service_name
+               OR COALESCE(source.pvc_uid,source.retained_pvc_uid) IS NULL
+               OR COALESCE(source.service_uid,source.retained_service_uid) IS NULL
+               OR NEW.retained_pvc_uid IS DISTINCT FROM COALESCE(source.pvc_uid,source.retained_pvc_uid)
+               OR NEW.retained_service_uid IS DISTINCT FROM COALESCE(source.service_uid,source.retained_service_uid)
+               OR NEW.retained_binding_generation IS DISTINCT FROM source.retained_binding_generation
+               OR NEW.previous_binding IS DISTINCT FROM source.previous_binding
+               OR COALESCE(NULLIF(t.metadata->'_workspace_binding','null'::jsonb),'{}'::jsonb)
+                   IS DISTINCT FROM source.previous_binding
+               OR t.metadata->>'_pinned_retained_creation_attempt'
+                   IS DISTINCT FROM source.attempt_id::text THEN
+                RAISE EXCEPTION 'workspace retained source is not claimable'
+                  USING ERRCODE='23514', CONSTRAINT='pinned_workspace_retention_authority';
+            END IF;
+        END IF;
+        RETURN NEW;
+    END IF;
+    IF NEW.creation_effects_admitted_at IS DISTINCT FROM OLD.creation_effects_admitted_at THEN
+        IF OLD.creation_effects_admitted_at IS NOT NULL
+           OR NEW.creation_effects_admitted_at IS DISTINCT FROM transaction_timestamp()
+           OR OLD.retained_source_attempt_id IS NULL OR OLD.status <> 'planned'
+           OR NEW.status <> 'planned' OR t.id IS NULL
+           OR t.runtime_generation IS DISTINCT FROM NEW.runtime_generation
+           OR t.runtime_retirement_token IS NOT NULL
+           OR t.status NOT IN ('created','active','awaiting_user','suspended')
+           OR t.metadata->'workspace_container'->>'_workspace_provision_attempt'
+               IS DISTINCT FROM NEW.attempt_id::text
+           OR t.metadata->'workspace_container'->>'_workspace_provision_generation'
+               IS DISTINCT FROM NEW.runtime_generation::text THEN
+            RAISE EXCEPTION 'workspace effects admission is not current or is immutable'
+              USING ERRCODE='23514', CONSTRAINT='pinned_workspace_retention_authority';
+        END IF;
+    END IF;
+    IF NEW.retained_source_attempt_id IS DISTINCT FROM OLD.retained_source_attempt_id
+       OR (OLD.retained_resume_generation IS NOT NULL
+           AND NEW.retained_resume_generation IS DISTINCT FROM OLD.retained_resume_generation)
+       OR (OLD.retained_successor_attempt_id IS NOT NULL
+           AND NEW.retained_successor_attempt_id IS DISTINCT FROM OLD.retained_successor_attempt_id)
+       OR (OLD.purge_completed_at IS NOT NULL
+           AND NEW.purge_completed_at IS DISTINCT FROM OLD.purge_completed_at) THEN
+        RAISE EXCEPTION 'workspace retained lineage is immutable'
+          USING ERRCODE='23514', CONSTRAINT='pinned_workspace_retention_authority';
+    END IF;
+    IF NEW.cleanup_disposition IS DISTINCT FROM OLD.cleanup_disposition
+       OR NEW.cleanup_retirement_token IS DISTINCT FROM OLD.cleanup_retirement_token
+       OR NEW.purge_completed_at IS DISTINCT FROM OLD.purge_completed_at THEN
+        captured := t.runtime_retirement_context->'workspace_provision_intent';
+        IF t.id IS NULL OR t.execution_lane <> 'pinned'
+           OR NOT public.pinned_workspace_provision_capture_is_current(t.id,t.runtime_generation,captured)
+           OR captured->>'runtime_generation' IS DISTINCT FROM NEW.runtime_generation::text
+           OR t.runtime_retirement_token IS DISTINCT FROM NEW.cleanup_retirement_token
+           OR t.runtime_retirement_authorized_at IS NULL
+           OR captured->>'attempt_id' IS DISTINCT FROM NEW.attempt_id::text
+           OR NEW.retained_resume_generation IS NOT NULL
+           OR NEW.retained_successor_attempt_id IS NOT NULL
+           OR NEW.cleanup_disposition IS DISTINCT FROM
+               (CASE WHEN t.runtime_retirement_permanent THEN 'purge' ELSE 'retain' END)
+           OR NOT (
+               (OLD.cleanup_disposition IS NULL AND OLD.status IN ('planned','revoking')
+                AND NEW.status='revoking' AND NEW.purge_completed_at IS NULL)
+               OR (OLD.cleanup_disposition='retain' AND NEW.cleanup_disposition='purge'
+                   AND OLD.status IN ('fenced','retired') AND NEW.status=OLD.status
+                   AND t.status='ended' AND NEW.purge_completed_at IS NULL)
+               OR (OLD.cleanup_disposition='purge' AND NEW.cleanup_disposition='purge'
+                   AND NEW.cleanup_retirement_token=OLD.cleanup_retirement_token
+                   AND OLD.purge_completed_at IS NULL
+                   AND NEW.purge_completed_at=transaction_timestamp()
+                   AND NEW.status IN ('fenced','retired'))
+           ) THEN
+            RAISE EXCEPTION 'workspace cleanup disposition lacks exact retirement'
+              USING ERRCODE='23514', CONSTRAINT='pinned_workspace_retention_authority';
+        END IF;
+    END IF;
+    IF NEW.retained_resume_generation IS DISTINCT FROM OLD.retained_resume_generation THEN
+        -- This edge is issued only by the AFTER thread Resume trigger below.
+        IF pg_trigger_depth() < 2 OR t.id IS NULL OR t.status <> 'created'
+           OR t.runtime_retirement_token IS NOT NULL
+           OR t.runtime_generation IS DISTINCT FROM NEW.retained_resume_generation
+           OR OLD.cleanup_disposition <> 'retain' OR OLD.status NOT IN ('fenced','retired')
+           OR OLD.retained_successor_attempt_id IS NOT NULL THEN
+            RAISE EXCEPTION 'workspace retained generation requires Resume'
+              USING ERRCODE='23514', CONSTRAINT='pinned_workspace_retention_authority';
+        END IF;
+    END IF;
+    IF NEW.retained_successor_attempt_id IS DISTINCT FROM OLD.retained_successor_attempt_id THEN
+        SELECT * INTO successor FROM public.thread_workspace_provision_intents
+          WHERE attempt_id=NEW.retained_successor_attempt_id FOR SHARE;
+        IF successor.attempt_id IS NULL OR successor.thread_id <> NEW.thread_id
+           OR successor.retained_source_attempt_id IS DISTINCT FROM NEW.attempt_id
+           OR successor.runtime_generation IS DISTINCT FROM NEW.retained_resume_generation
+           OR successor.status <> 'planned' OR NEW.cleanup_disposition <> 'retain'
+           OR NEW.status <> 'retired' OR t.runtime_retirement_token IS NOT NULL
+           OR t.runtime_generation IS DISTINCT FROM successor.runtime_generation THEN
+            RAISE EXCEPTION 'workspace retained successor claim is not exact'
+              USING ERRCODE='23514', CONSTRAINT='pinned_workspace_retention_authority';
+        END IF;
+    END IF;
+    IF NEW.retained_source_attempt_id IS NOT NULL
+       AND (NEW.pod_uid IS DISTINCT FROM OLD.pod_uid
+            OR NEW.pvc_uid IS DISTINCT FROM OLD.pvc_uid
+            OR NEW.service_uid IS DISTINCT FROM OLD.service_uid
+            OR NEW.seed_configmap_uid IS DISTINCT FROM OLD.seed_configmap_uid)
+       AND (NEW.creation_effects_admitted_at IS NULL OR t.id IS NULL
+            OR t.runtime_generation IS DISTINCT FROM NEW.runtime_generation
+            OR t.runtime_retirement_token IS NOT NULL
+            OR t.status NOT IN ('created','active','awaiting_user','suspended')
+            OR t.metadata->'workspace_container'->>'_workspace_provision_attempt'
+                IS DISTINCT FROM NEW.attempt_id::text
+            OR t.metadata->'workspace_container'->>'_workspace_provision_generation'
+                IS DISTINCT FROM NEW.runtime_generation::text) THEN
+        RAISE EXCEPTION 'retained workspace effects lack current admitted authority'
+          USING ERRCODE='23514', CONSTRAINT='pinned_workspace_retention_authority';
+    END IF;
+    IF OLD.status='revoking' AND NEW.status='fenced'
+       AND NEW.cleanup_disposition IS NOT NULL AND NEW.pod_uid IS NULL
+       AND NOT (NEW.retained_source_attempt_id IS NOT NULL
+                AND NEW.creation_effects_admitted_at IS NULL)
+       AND NOT EXISTS (SELECT 1 FROM public.thread_workspace_provision_inert_fence_receipts proof
+         WHERE proof.attempt_id=NEW.attempt_id AND proof.thread_id=NEW.thread_id
+           AND proof.source_runtime_generation=NEW.runtime_generation
+           AND proof.retirement_runtime_generation=t.runtime_generation
+           AND proof.retirement_token=NEW.cleanup_retirement_token
+           AND proof.namespace=NEW.namespace AND proof.pod_name=NEW.pod_name
+           AND proof.fence_pod_uid=NEW.fence_pod_uid) THEN
+        RAISE EXCEPTION 'workspace issued Pod identity is unresolved'
+          USING ERRCODE='23514', CONSTRAINT='pinned_workspace_retention_authority';
+    END IF;
+    IF OLD.status='revoking' AND NEW.status='fenced'
+       AND NEW.cleanup_disposition IS NOT NULL AND NEW.pod_uid IS NOT NULL
+       AND NOT EXISTS (
+           SELECT 1 FROM public.thread_workspace_provision_stop_receipts proof
+           WHERE proof.attempt_id=NEW.attempt_id AND proof.thread_id=NEW.thread_id
+             AND proof.runtime_generation=NEW.runtime_generation
+             AND proof.namespace=NEW.namespace AND proof.pod_name=NEW.pod_name
+             AND proof.pod_uid=NEW.pod_uid
+       ) THEN
+        RAISE EXCEPTION 'workspace original Pod process stop is unproven'
+          USING ERRCODE='23514', CONSTRAINT='pinned_workspace_retention_authority';
     END IF;
     RETURN NEW;
 END;
@@ -5517,6 +6745,12 @@ BEGIN
     END IF;
 
     IF TG_OP = 'UPDATE' THEN
+        IF OLD.status = 'terminal_release' AND NEW.status = 'released'
+           AND NEW.release_outcome IS DISTINCT FROM 'exact_absent_v1' THEN
+            RAISE EXCEPTION 'terminal warm release requires absent Pod receipt'
+                USING ERRCODE = '23514',
+                      CONSTRAINT = 'thread_agent_warm_binding_authority';
+        END IF;
         IF NEW.protection_id IS DISTINCT FROM OLD.protection_id
            OR NEW.thread_id IS DISTINCT FROM OLD.thread_id
            OR NEW.runtime_generation IS DISTINCT FROM OLD.runtime_generation
@@ -5635,8 +6869,10 @@ BEGIN
                     AND NEW.abort_fence_resource_version IS NULL
                     AND NEW.abort_fence_value IS NULL
                     AND NEW.released_at IS NULL)
-                OR (OLD.status IN ('protected', 'bound')
-                    AND NEW.status = 'releasing'
+                OR (((OLD.status IN ('protected', 'bound')
+                    AND NEW.status = 'releasing')
+                    OR (OLD.status = 'bound'
+                    AND NEW.status = 'terminal_release'))
                     AND NEW.effect_token IS NOT DISTINCT FROM OLD.effect_token
                     AND NEW.effect_started_at
                         IS NOT DISTINCT FROM OLD.effect_started_at
@@ -5655,7 +6891,7 @@ BEGIN
                     AND NEW.abort_fence_resource_version IS NULL
                     AND NEW.abort_fence_value IS NULL
                     AND NEW.released_at IS NULL)
-                OR (OLD.status = 'releasing' AND NEW.status = 'released'
+                OR (OLD.status IN ('releasing', 'terminal_release') AND NEW.status = 'released'
                     AND NEW.effect_token IS NOT DISTINCT FROM OLD.effect_token
                     AND NEW.effect_started_at
                         IS NOT DISTINCT FROM OLD.effect_started_at
@@ -6479,6 +7715,22 @@ BEGIN
                              IS NULL
                          AND NEW.runtime_retirement_local_quiescence->>'workspace_runtime_incarnation'
                              IS NULL
+                    WHEN public.pinned_vm_pre_registration_no_vm_source(
+                        NEW.id,NEW.runtime_generation,NEW.runtime_retirement_token)
+                    THEN NEW.runtime_retirement_local_quiescence->>'quiescence_protocol'='agent_runtime_zero_v1'
+                         AND NEW.runtime_retirement_local_quiescence->>'workspace_generation' IS NULL
+                         AND NEW.runtime_retirement_local_quiescence->>'workspace_runtime_incarnation' IS NULL
+                         AND NEW.runtime_retirement_local_quiescence->>'vm_creation_request_id' IS NULL
+                         AND NEW.runtime_retirement_local_quiescence->>'vm_creation_provision_generation' IS NULL
+                    WHEN public.pinned_vm_creation_agent_zero_source(
+                        NEW.id,NEW.runtime_generation,NEW.runtime_retirement_token)
+                    THEN NEW.runtime_retirement_local_quiescence->>'quiescence_protocol'='agent_runtime_zero_v1'
+                         AND NEW.runtime_retirement_local_quiescence->>'workspace_generation' IS NULL
+                         AND NEW.runtime_retirement_local_quiescence->>'workspace_runtime_incarnation' IS NULL
+                         AND NEW.runtime_retirement_local_quiescence->>'vm_creation_request_id'=
+                             NEW.runtime_retirement_context->'vm_creation_source'->>'request_id'
+                         AND NEW.runtime_retirement_local_quiescence->>'vm_creation_provision_generation'=
+                             NEW.runtime_retirement_context->'vm_creation_source'->>'provision_generation'
                     WHEN NEW.runtime_retirement_context->>'workspace_backend'
                          IN ('vm', 'remote')
                     THEN NEW.runtime_retirement_local_quiescence->>'quiescence_protocol'
@@ -6978,6 +8230,21 @@ COMMENT ON FUNCTION public.enforce_thread_ended_transition() IS 'Mixed-version l
 
 
 --
+-- Name: enforce_thread_protected_source_immutable(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.enforce_thread_protected_source_immutable() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+BEGIN
+    RAISE EXCEPTION 'a protected session''s source is immutable'
+        USING ERRCODE = '23514',
+              CONSTRAINT = 'thread_protected_sources_immutable';
+END;
+$$;
+
+
+--
 -- Name: enforce_thread_runtime_attach_abort_outcome_insert(); Type: FUNCTION; Schema: public; Owner: -
 --
 
@@ -7200,6 +8467,33 @@ $$;
 
 
 --
+-- Name: enforce_thread_vm_creation_source_end_delete(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.enforce_thread_vm_creation_source_end_delete() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+BEGIN
+    IF OLD.runtime_retirement_context->'vm_creation_source'
+       NOT IN ('null'::jsonb, '{}'::jsonb)
+       AND (
+           OLD.metadata ? 'vm'
+           OR NOT public.thread_vm_creation_never_issued_source(
+               OLD.id,
+               OLD.runtime_retirement_context->'vm_creation_source'
+                   ->>'provision_generation'
+           )
+       ) THEN
+        RAISE EXCEPTION 'thread VM creation source remains unresolved'
+            USING ERRCODE='23514',
+                  CONSTRAINT='thread_vm_creation_source_end_delete';
+    END IF;
+    RETURN OLD;
+END;
+$$;
+
+
+--
 -- Name: enforce_thread_workspace_provision_intent(); Type: FUNCTION; Schema: public; Owner: -
 --
 
@@ -7218,6 +8512,16 @@ BEGIN
     END IF;
 
     IF TG_OP = 'UPDATE' THEN
+        -- The companion retention trigger validates these additive fields.
+        -- No change to the original immutable protocol is implied.
+        IF (to_jsonb(NEW) - ARRAY['cleanup_disposition','cleanup_retirement_token',
+             'purge_completed_at','retained_source_attempt_id','creation_effects_admitted_at',
+             'retained_resume_generation','retained_successor_attempt_id'])
+           = (to_jsonb(OLD) - ARRAY['cleanup_disposition','cleanup_retirement_token',
+             'purge_completed_at','retained_source_attempt_id','creation_effects_admitted_at',
+             'retained_resume_generation','retained_successor_attempt_id']) THEN
+            RETURN NEW;
+        END IF;
         IF NEW.attempt_id IS DISTINCT FROM OLD.attempt_id
            OR NEW.thread_id IS DISTINCT FROM OLD.thread_id
            OR NEW.runtime_generation IS DISTINCT FROM OLD.runtime_generation
@@ -7287,11 +8591,13 @@ BEGIN
                     AND NEW.service_uid IS NOT DISTINCT FROM OLD.service_uid
                     AND NULLIF(NEW.fence_pod_uid, '') IS NOT NULL
                     AND (NEW.pvc_name IS NULL OR NEW.retained_pvc_uid IS NOT NULL
+                         OR (NEW.cleanup_disposition='retain' AND NEW.pvc_uid IS NOT NULL)
                          OR NULLIF(NEW.fence_pvc_uid, '') IS NOT NULL)
                     AND (NEW.seed_configmap_name IS NULL
                          OR NULLIF(NEW.fence_configmap_uid, '') IS NOT NULL)
                     AND (NEW.service_name IS NULL
                          OR NEW.retained_service_uid IS NOT NULL
+                         OR (NEW.cleanup_disposition='retain' AND NEW.service_uid IS NOT NULL)
                          OR NULLIF(NEW.fence_service_uid, '') IS NOT NULL)
                     AND NEW.fenced_at
                         IS NOT DISTINCT FROM transaction_timestamp()
@@ -7417,6 +8723,4109 @@ $$;
 
 
 --
+-- Name: enforce_vm_creation_source_terminal_settlement(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.enforce_vm_creation_source_terminal_settlement() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+BEGIN
+    IF OLD.runtime_retirement_context->'vm_creation_source' NOT IN ('null'::jsonb,'{}'::jsonb)
+       AND OLD.runtime_retirement_authorized_at IS NOT NULL
+       AND (TG_OP='DELETE' OR (NEW.runtime_retirement_token IS NULL AND NEW.status IN ('ended','suspended')))
+       AND (NOT public.thread_vm_creation_never_issued_source(OLD.id,
+                OLD.runtime_retirement_context->'vm_creation_source'->>'provision_generation')
+            OR ((OLD.runtime_retirement_local_quiescence->>'vm_creation_request_id' IS NOT NULL
+                 OR OLD.runtime_retirement_context->'vm_creation_source'->>'cleanup_protocol'='initial_attach_abort_v1')
+                AND (NOT public.pinned_vm_creation_agent_zero_source(
+                        OLD.id,OLD.runtime_generation,OLD.runtime_retirement_token)
+                    OR (OLD.runtime_authority_exposed AND (
+                        OLD.runtime_retirement_local_quiescence->>'vm_creation_request_id' IS DISTINCT FROM
+                            OLD.runtime_retirement_context->'vm_creation_source'->>'request_id'
+                        OR OLD.runtime_retirement_local_quiescence->>'vm_creation_provision_generation' IS DISTINCT FROM
+                            OLD.runtime_retirement_context->'vm_creation_source'->>'provision_generation'))))) THEN
+        RAISE EXCEPTION 'initial VM End lacks settled source and independent current actor zero'
+            USING ERRCODE='23514', CONSTRAINT='thread_vm_creation_source_terminal_settlement';
+    END IF;
+    IF TG_OP='DELETE' THEN RETURN OLD; END IF;
+    RETURN NEW;
+END;
+$$;
+
+
+--
+-- Name: ensure_vm_job_creation_owner(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.ensure_vm_job_creation_owner() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+BEGIN
+    IF NEW.owner_kind<>'job' THEN RETURN NEW; END IF;
+    PERFORM 1 FROM public.jobs WHERE id=NEW.job_id FOR SHARE;
+    IF NOT FOUND THEN RAISE EXCEPTION 'Job VM source needs live Job' USING ERRCODE='23514'; END IF;
+    INSERT INTO public.vm_job_creation_owners(job_id,live_job_id)
+        VALUES(NEW.job_id,NEW.job_id) ON CONFLICT(job_id) DO NOTHING;
+    PERFORM 1 FROM public.vm_job_creation_owners
+      WHERE job_id=NEW.job_id AND live_job_id=NEW.job_id AND deleted_at IS NULL FOR SHARE;
+    IF NOT FOUND THEN RAISE EXCEPTION 'retired Job VM owner cannot be relinked' USING ERRCODE='23514'; END IF;
+    RETURN NEW;
+END;
+$$;
+
+
+--
+-- Name: ensure_vm_thread_creation_owner(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.ensure_vm_thread_creation_owner() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+DECLARE owner_row public.threads%ROWTYPE;
+BEGIN
+    IF NEW.owner_kind<>'thread' THEN RETURN NEW; END IF;
+    SELECT * INTO owner_row FROM public.threads WHERE id=NEW.thread_id FOR SHARE;
+    IF NOT FOUND OR owner_row.runtime_retirement_token IS NOT NULL THEN
+        RAISE EXCEPTION 'VM audit source requires a live nonretiring thread' USING ERRCODE='23514';
+    END IF;
+    INSERT INTO public.vm_thread_creation_owners(thread_id,live_thread_id)
+        VALUES (NEW.thread_id,NEW.thread_id) ON CONFLICT(thread_id) DO NOTHING;
+    PERFORM 1 FROM public.vm_thread_creation_owners
+        WHERE thread_id=NEW.thread_id AND live_thread_id=NEW.thread_id AND deleted_at IS NULL FOR SHARE;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'retired VM audit owner cannot be relinked' USING ERRCODE='23514';
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+
+--
+-- Name: grant_pinned_retained_creation_resume(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.grant_pinned_retained_creation_resume() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+DECLARE
+    source public.thread_workspace_provision_intents%ROWTYPE;
+    successor_id uuid := public.uuid_generate_v4();
+    pending jsonb;
+BEGIN
+    IF OLD.execution_lane <> 'pinned' OR OLD.status <> 'ended' OR NEW.status <> 'created'
+       OR OLD.metadata->>'_pinned_retained_creation_attempt' IS NULL THEN
+        RETURN NEW;
+    END IF;
+    SELECT * INTO source FROM public.thread_workspace_provision_intents
+      WHERE attempt_id::text=OLD.metadata->>'_pinned_retained_creation_attempt' FOR UPDATE;
+    IF source.attempt_id IS NULL OR source.thread_id <> OLD.id
+       OR source.runtime_generation IS DISTINCT FROM OLD.runtime_generation
+       OR source.cleanup_disposition <> 'retain' OR source.status <> 'retired'
+       OR source.retained_resume_generation IS NOT NULL
+       OR source.retained_successor_attempt_id IS NOT NULL
+       OR COALESCE(source.pvc_uid,source.retained_pvc_uid) IS NULL
+       OR COALESCE(source.service_uid,source.retained_service_uid) IS NULL
+       OR OLD.runtime_retirement_token IS NOT NULL OR NEW.runtime_retirement_token IS NOT NULL
+       OR NEW.runtime_generation=OLD.runtime_generation
+       OR NEW.metadata->>'_pinned_retained_creation_attempt'
+           IS DISTINCT FROM source.attempt_id::text
+       OR COALESCE(NULLIF(OLD.metadata->'_workspace_binding','null'::jsonb),'{}'::jsonb)
+           IS DISTINCT FROM source.previous_binding
+       OR COALESCE(NULLIF(NEW.metadata->'_workspace_binding','null'::jsonb),'{}'::jsonb)
+           IS DISTINCT FROM source.previous_binding
+       OR NOT EXISTS (
+           SELECT 1 FROM public.thread_runtime_retirement_outcomes outcome
+           WHERE outcome.thread_id=OLD.id AND outcome.runtime_generation=OLD.runtime_generation
+             AND outcome.retirement_token=source.cleanup_retirement_token
+             AND outcome.outcome='settled' AND outcome.disposition='ended'
+             AND outcome.permanent=false
+       ) THEN
+        RAISE EXCEPTION 'workspace retained Resume source is not exact'
+          USING ERRCODE='23514', CONSTRAINT='pinned_workspace_retention_authority';
+    END IF;
+    UPDATE public.thread_workspace_provision_intents
+      SET retained_resume_generation=NEW.runtime_generation
+      WHERE attempt_id=source.attempt_id;
+    INSERT INTO public.thread_workspace_provision_intents (
+        attempt_id,thread_id,runtime_generation,namespace,pod_name,pvc_name,
+        seed_configmap_name,service_name,network_tier,manifest_fingerprint,
+        previous_binding,retained_binding_generation,retained_pvc_uid,
+        retained_service_uid,retained_source_attempt_id
+    ) VALUES (
+        successor_id,NEW.id,NEW.runtime_generation,source.namespace,source.pod_name,
+        source.pvc_name,source.seed_configmap_name,source.service_name,source.network_tier,
+        source.manifest_fingerprint,source.previous_binding,source.retained_binding_generation,
+        COALESCE(source.pvc_uid,source.retained_pvc_uid),
+        COALESCE(source.service_uid,source.retained_service_uid),source.attempt_id
+    );
+    UPDATE public.thread_workspace_provision_intents
+      SET retained_successor_attempt_id=successor_id WHERE attempt_id=source.attempt_id;
+    pending := COALESCE(NEW.metadata->'workspace_container','{}'::jsonb)
+        || jsonb_build_object('status','pending','provisioner','k8s',
+            '_workspace_provision_attempt',successor_id::text,
+            '_workspace_provision_generation',NEW.runtime_generation::text,
+            '_runtime_incarnation',NULL,'_canvas_workspace_generation',NULL,
+            'pod_ip',NULL,'pod_name',NULL,'host',NULL,'port',NULL,'ide_host',NULL,'ide_port',NULL);
+    UPDATE public.threads SET metadata=jsonb_set(metadata,'{workspace_container}',pending,true)
+      WHERE id=NEW.id AND runtime_generation=NEW.runtime_generation;
+    RETURN NEW;
+END;
+$$;
+
+
+--
+-- Name: guard_open_pinned_job_idle(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.guard_open_pinned_job_idle() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+BEGIN
+    IF EXISTS (
+        SELECT 1 FROM public.vm_idle_operations idle
+        WHERE idle.owner_kind='job' AND idle.owner_id=NEW.id
+          AND idle.release_kind='pinned_job' AND idle.closed_at IS NULL
+    ) AND (
+        NEW.status::text IN ('processing','paused')
+        OR (NEW.assigned_agent_id IS DISTINCT FROM OLD.assigned_agent_id
+            AND NEW.status::text NOT IN ('completed','failed','cancelled'))
+    ) THEN
+        RAISE EXCEPTION 'Pinned Job idle operation owns dispatch'
+            USING ERRCODE='23514';
+    END IF;
+    RETURN NEW;
+END $$;
+
+
+--
+-- Name: guard_pinned_idle_terminal_thread(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.guard_pinned_idle_terminal_thread() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+BEGIN
+    IF OLD.pinned_idle_terminal_intent_at IS NOT NULL AND
+       NEW.pinned_idle_terminal_intent_at
+           IS DISTINCT FROM OLD.pinned_idle_terminal_intent_at THEN
+        RAISE EXCEPTION 'Pinned idle End intent is immutable' USING ERRCODE='23514';
+    END IF;
+    IF OLD.pinned_idle_terminal_intent_at IS NULL AND
+       NEW.pinned_idle_terminal_intent_at IS NOT NULL AND NOT EXISTS (
+           SELECT 1 FROM public.vm_idle_operations o
+           WHERE o.owner_kind='thread' AND o.owner_id=NEW.id
+             AND o.release_kind='pinned_thread' AND o.closed_at IS NULL
+             AND o.thread_terminal_intent_at=NEW.pinned_idle_terminal_intent_at
+             AND o.thread_terminal_intent_generation=NEW.runtime_generation
+       ) THEN
+        RAISE EXCEPTION 'Pinned idle End intent lacks operation' USING ERRCODE='23514';
+    END IF;
+    IF NEW.pinned_idle_terminal_intent_at IS NOT NULL AND (
+        (NEW.agent_id IS NOT NULL AND NEW.agent_id IS DISTINCT FROM OLD.agent_id)
+        OR (NEW.runtime_attach_token IS NOT NULL AND
+            NEW.runtime_attach_token IS DISTINCT FROM OLD.runtime_attach_token)
+        OR (OLD.pinned_idle_terminal_intent_at IS NOT NULL AND
+            NEW.status NOT IN (OLD.status,'suspended','ended'))
+    ) THEN
+        RAISE EXCEPTION 'Pinned idle End fences new execution' USING ERRCODE='23514';
+    END IF;
+    RETURN NEW;
+END $$;
+
+
+--
+-- Name: guard_pinned_job_delivery(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.guard_pinned_job_delivery() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+BEGIN
+    IF TG_OP='DELETE' THEN
+        RAISE EXCEPTION 'Pinned delivery history is retained' USING ERRCODE='23514';
+    END IF;
+    IF ROW(NEW.id,NEW.job_id,NEW.agent_id,NEW.original_dispatch_marker,
+           NEW.marker_digest,NEW.projection_digest,NEW.consumed_context_digests,
+           NEW.runtime_authority_digest,
+           NEW.identity_digest,NEW.original_lease_expires_at,
+           NEW.intent_lease_expires_at,NEW.process_generation,NEW.pod_name,
+           NEW.pod_namespace,NEW.pod_uid,NEW.provision_generation,NEW.vm_uid,
+           NEW.vmi_uid,NEW.launcher_uid,NEW.pvc_uid,NEW.intent_at)
+       IS DISTINCT FROM
+       ROW(OLD.id,OLD.job_id,OLD.agent_id,OLD.original_dispatch_marker,
+           OLD.marker_digest,OLD.projection_digest,OLD.consumed_context_digests,
+           OLD.runtime_authority_digest,
+           OLD.identity_digest,OLD.original_lease_expires_at,
+           OLD.intent_lease_expires_at,OLD.process_generation,OLD.pod_name,
+           OLD.pod_namespace,OLD.pod_uid,OLD.provision_generation,OLD.vm_uid,
+           OLD.vmi_uid,OLD.launcher_uid,OLD.pvc_uid,OLD.intent_at)
+       OR (OLD.accepted_at IS NOT NULL AND
+           ROW(NEW.accepted_at,NEW.accepted_via,NEW.accepted_lease_expires_at)
+           IS DISTINCT FROM
+           ROW(OLD.accepted_at,OLD.accepted_via,OLD.accepted_lease_expires_at)) THEN
+        RAISE EXCEPTION 'Pinned delivery identity is immutable' USING ERRCODE='23514';
+    END IF;
+    RETURN NEW;
+END $$;
+
+
+--
+-- Name: guard_pinned_job_wait_receipt(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.guard_pinned_job_wait_receipt() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+BEGIN
+    RAISE EXCEPTION 'Pinned wait source is immutable' USING ERRCODE='23514';
+END $$;
+
+
+--
+-- Name: guard_pinned_vm_actuator_request(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.guard_pinned_vm_actuator_request() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+BEGIN
+    IF TG_OP='INSERT' THEN
+        IF NEW.runtime_retirement_actuator_request IS NOT NULL THEN
+            RAISE EXCEPTION 'VM actuator request requires existing retirement' USING ERRCODE='23514';
+        END IF;
+        RETURN NEW;
+    END IF;
+    IF OLD.runtime_retirement_actuator_request IS NOT NULL THEN
+        IF NEW.runtime_retirement_token IS DISTINCT FROM OLD.runtime_retirement_token THEN
+            IF NEW.runtime_retirement_token IS NOT NULL OR NEW.status IS DISTINCT FROM 'ended'
+               OR NEW.agent_id IS NOT NULL OR NEW.runtime_attach_token IS NOT NULL
+               OR NOT EXISTS (
+                   SELECT 1 FROM public.thread_runtime_retirement_outcomes o
+                    WHERE o.thread_id=OLD.id AND o.runtime_generation=OLD.runtime_generation
+                      AND o.retirement_token=OLD.runtime_retirement_token
+                      AND o.actuator_request=OLD.runtime_retirement_actuator_request
+               ) THEN
+                RAISE EXCEPTION 'VM actuator request may clear only at exact settlement' USING ERRCODE='23514';
+            END IF;
+            NEW.runtime_retirement_actuator_request := NULL;
+        ELSIF NEW.runtime_retirement_actuator_request IS DISTINCT FROM OLD.runtime_retirement_actuator_request THEN
+            RAISE EXCEPTION 'VM actuator request is immutable while pending' USING ERRCODE='23514';
+        END IF;
+    ELSIF NEW.runtime_retirement_actuator_request IS NOT NULL THEN
+        IF NEW.runtime_retirement_token IS DISTINCT FROM OLD.runtime_retirement_token
+           OR NOT public.pinned_vm_actuator_request_valid(NEW,NEW.runtime_retirement_actuator_request,true) THEN
+            RAISE EXCEPTION 'VM actuator request lacks exact current authority' USING ERRCODE='23514';
+        END IF;
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+
+--
+-- Name: guard_retained_vm_network_profile(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.guard_retained_vm_network_profile() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+DECLARE profile jsonb;
+BEGIN
+    profile := NEW.backend_state->'network_profile';
+    IF profile IS NOT NULL AND profile IS DISTINCT FROM jsonb_build_object(
+        'version', 1,
+        'kind', 'nocloud-dhcp-by-interface-name',
+        'interface', 'enp1s0',
+        'network_data_sha256', 'sha256:dcad9787224fe834481f60286fbca4dd66eecc9fe05ec6db2acae0bbf22b2e6a'
+    ) THEN
+        RAISE EXCEPTION 'Unsupported retained VM network profile' USING ERRCODE='23514';
+    END IF;
+    IF TG_OP='UPDATE' AND profile IS DISTINCT FROM OLD.backend_state->'network_profile' THEN
+        RAISE EXCEPTION 'Retained VM network profile is immutable' USING ERRCODE='23514';
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+
+--
+-- Name: guard_vm_creation_carrier_identity(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.guard_vm_creation_carrier_identity() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+BEGIN
+    IF NEW.controller_configuration IS DISTINCT FROM OLD.controller_configuration OR
+       (OLD.creation_carrier_uid IS NOT NULL AND
+        ROW(NEW.creation_carrier_uid,NEW.creation_carrier_namespace) IS DISTINCT FROM
+        ROW(OLD.creation_carrier_uid,OLD.creation_carrier_namespace)) THEN
+        RAISE EXCEPTION 'VM creation carrier identity is immutable' USING ERRCODE='23514';
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+
+--
+-- Name: guard_vm_creation_completion(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.guard_vm_creation_completion() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+DECLARE evidence jsonb; stage text;
+BEGIN
+    IF TG_OP='INSERT' AND NEW.cancellation_completion<>'{}'::jsonb THEN
+        RAISE EXCEPTION 'Creation completion requires locked disposition' USING ERRCODE='23514';
+    END IF;
+    IF NOT (jsonb_typeof(NEW.cancellation_completion)='object'
+        AND NEW.cancellation_completion-ARRAY['source','cloud_init','rootdisk','workspace_attachment']='{}'::jsonb) IS TRUE THEN
+        RAISE EXCEPTION 'Creation completion evidence is invalid' USING ERRCODE='23514';
+    END IF;
+    IF TG_OP='UPDATE' AND EXISTS(SELECT 1 FROM jsonb_each(OLD.cancellation_completion) p
+        WHERE NEW.cancellation_completion->p.key IS DISTINCT FROM p.value) THEN
+        RAISE EXCEPTION 'Creation completion evidence is immutable' USING ERRCODE='23514';
+    END IF;
+    IF NEW.cancellation_completion ? 'source' THEN
+        evidence := NEW.cancellation_completion->'source';
+        IF NEW.cancellation_disposition IS NULL OR NOT (
+            public.valid_vm_creation_source_authority(NEW)
+        ) IS TRUE THEN
+            RAISE EXCEPTION 'Creation source completion is unproven' USING ERRCODE='23514';
+        END IF;
+    END IF;
+    FOREACH stage IN ARRAY ARRAY['cloud_init','rootdisk'] LOOP
+        IF NEW.cancellation_completion ? stage AND NOT
+            public.valid_vm_creation_resource_completion(NEW,stage,NEW.cancellation_completion->stage) THEN
+            RAISE EXCEPTION 'Creation resource completion is unproven' USING ERRCODE='23514';
+        END IF;
+    END LOOP;
+    IF NEW.cancellation_completion ? 'workspace_attachment' AND NOT
+        public.valid_vm_creation_attachment_completion(NEW,NEW.cancellation_completion->'workspace_attachment') THEN
+        RAISE EXCEPTION 'Creation attachment completion is unproven' USING ERRCODE='23514';
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+
+--
+-- Name: guard_vm_creation_disposition(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.guard_vm_creation_disposition() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+BEGIN
+    IF TG_OP='INSERT' THEN
+        IF NEW.cancellation_disposition IS NOT NULL OR NEW.cancellation_progress<>'{}'::jsonb
+           OR NEW.disposition_carrier_uid IS NOT NULL THEN
+            RAISE EXCEPTION 'Creation disposition requires locked cancellation' USING ERRCODE='23514';
+        END IF;
+        RETURN NEW;
+    END IF;
+    IF OLD.disposition_carrier_uid IS NOT NULL AND (
+       NEW.disposition_carrier_uid IS DISTINCT FROM OLD.disposition_carrier_uid OR
+       NEW.disposition_carrier_namespace IS DISTINCT FROM OLD.disposition_carrier_namespace) THEN
+        RAISE EXCEPTION 'Cancellation carrier is immutable' USING ERRCODE='23514';
+    END IF;
+    IF NEW.disposition_carrier_uid IS NOT NULL AND NOT ((
+       NEW.creation_carrier_uid IS NULL AND
+       NEW.cancellation_disposition IS NOT NULL AND
+       NEW.cancellation_disposition->>'carrier_uid' IS NOT DISTINCT FROM NEW.disposition_carrier_uid::text AND
+       NEW.cancellation_disposition->>'namespace' IS NOT DISTINCT FROM NEW.disposition_carrier_namespace AND
+       ((NEW.owner_kind='thread' AND
+         NEW.cancellation_disposition->>'carrier_kind'='thread_creation_cancel' AND
+         NOT EXISTS(SELECT 1 FROM public.vm_creation_effects WHERE request_id=NEW.request_id))
+        OR (NEW.owner_kind='job' AND public.valid_vm_creation_job_cancel_identity(NEW)))
+    ) IS TRUE) THEN
+        RAISE EXCEPTION 'Cancellation carrier cannot create' USING ERRCODE='23514';
+    END IF;
+    IF OLD.cancellation_disposition IS NOT NULL AND
+       NEW.cancellation_disposition IS DISTINCT FROM OLD.cancellation_disposition THEN
+        RAISE EXCEPTION 'Creation cancellation disposition is immutable' USING ERRCODE='23514';
+    END IF;
+    IF NEW.cancellation_disposition IS NOT NULL AND OLD.cancellation_disposition IS NULL THEN
+        IF OLD.state<>'cancel_requested' OR NEW.state<>'cancel_requested' OR
+           NEW.creation_admission_id IS NULL OR
+           (NEW.creation_carrier_uid IS NULL AND NEW.disposition_carrier_uid IS NULL) OR
+           (NEW.owner_kind='thread' AND NOT public.valid_vm_creation_thread_disposition_identity(NEW,true)) OR
+           EXISTS(SELECT 1 FROM public.vm_creation_effects WHERE request_id=NEW.request_id
+                  AND (state='issued' OR (effect_kind='vm' AND state<>'rejected'))) THEN
+            RAISE EXCEPTION 'Creation disposition requires no possible VM issuance' USING ERRCODE='23514';
+        END IF;
+    END IF;
+    IF NEW.cancellation_disposition IS NOT NULL AND NEW.state<>'cancel_requested' AND
+       NOT (OLD.state='cancel_requested' AND NEW.state='settled'
+            AND NEW.reason='creation_disposed' AND NEW.resolved_at IS NOT NULL
+            AND NEW.claim_token IS NULL AND NEW.claim_expires_at IS NULL
+            AND public.valid_vm_creation_disposition_evidence(NEW)) THEN
+        RAISE EXCEPTION 'Creation disposition has not completed' USING ERRCODE='23514';
+    END IF;
+    IF EXISTS(SELECT 1 FROM jsonb_each(OLD.cancellation_progress) AS p
+              WHERE NEW.cancellation_progress->p.key IS DISTINCT FROM p.value) OR
+       (NEW.cancellation_progress - ARRAY['cloud_init','rootdisk','workspace_attachment','source'])<>'{}'::jsonb THEN
+        RAISE EXCEPTION 'Creation cancellation progress is monotonic' USING ERRCODE='23514';
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+
+--
+-- Name: guard_vm_creation_disposition_instance(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.guard_vm_creation_disposition_instance() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+DECLARE current_instance public.srw_workspace_instances%ROWTYPE;
+        retry public.vm_creation_retries%ROWTYPE;
+        completion jsonb;
+        receipt jsonb;
+BEGIN
+    SELECT * INTO current_instance FROM public.srw_workspace_instances WHERE id=NEW.id;
+    SELECT * INTO retry FROM public.vm_creation_retries r
+        WHERE r.cancellation_disposition->>'workspace_instance_id'=NEW.id::text;
+    IF ROW(current_instance.status,current_instance.execution_id,current_instance.generation,
+           current_instance.pvc_name,current_instance.pvc_uid,current_instance.backend_state->'storage',
+           current_instance.backend_state->'network_profile')
+       IS DISTINCT FROM ROW(OLD.status,OLD.execution_id,OLD.generation,OLD.pvc_name,OLD.pvc_uid,
+                            OLD.backend_state->'storage',OLD.backend_state->'network_profile')
+       AND FOUND AND retry.state='cancel_requested' THEN
+        RAISE EXCEPTION 'Creation disposition instance remains held' USING ERRCODE='23514';
+    END IF;
+    IF FOUND AND retry.state='settled' AND retry.reason='creation_disposed' THEN
+        completion := retry.cancellation_completion;
+        receipt := current_instance.backend_state->'retained_creation_disposition';
+        IF NOT (
+            public.valid_vm_creation_disposition_evidence(retry)
+            AND current_instance.execution_id IS NULL
+            AND current_instance.generation=(retry.canonical_request->'workspace_storage'->>'generation')::bigint
+            AND current_instance.pvc_uid IS NOT DISTINCT FROM completion->'rootdisk'->>'pvc_uid'
+            AND current_instance.status=CASE WHEN completion->'workspace_attachment'->>'outcome'='detached'
+                THEN 'Detached' ELSE 'Released' END
+            AND receipt->>'request_id'=retry.request_id::text
+            AND receipt->>'disposition_id'=retry.cancellation_disposition->>'disposition_id'
+            AND receipt->>'provision_generation'=retry.provision_generation::text
+            AND receipt->>'execution_id'=retry.execution_id::text
+            AND receipt->'attachment'=completion->'workspace_attachment'
+            AND receipt->'rootdisk'=completion->'rootdisk'
+        ) IS TRUE THEN
+            RAISE EXCEPTION 'Creation disposition instance is incomplete' USING ERRCODE='23514';
+        END IF;
+    END IF;
+    RETURN NULL;
+END;
+$$;
+
+
+--
+-- Name: guard_vm_creation_disposition_parent(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.guard_vm_creation_disposition_parent() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+DECLARE retry public.vm_creation_retries%ROWTYPE;
+BEGIN
+    SELECT * INTO retry FROM public.vm_creation_retries r
+        WHERE r.creation_admission_id=NEW.id AND r.cancellation_disposition IS NOT NULL;
+    IF FOUND AND (retry.state='settled' OR NEW.completed_at IS NOT NULL) AND NOT (
+        retry.state='settled' AND retry.reason='creation_disposed'
+        AND NEW.completed_at IS NOT NULL
+        AND NEW.outcome='creation_disposed'
+        AND public.valid_vm_creation_disposition_parent_identity(retry,NEW)
+        AND public.valid_vm_creation_disposition_evidence(retry)
+    ) IS TRUE THEN
+        RAISE EXCEPTION 'Creation disposition parent remains held' USING ERRCODE='23514';
+    END IF;
+    RETURN NULL;
+END;
+$$;
+
+
+--
+-- Name: guard_vm_creation_disposition_terminal(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.guard_vm_creation_disposition_terminal() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+DECLARE retry public.vm_creation_retries%ROWTYPE;
+        parent public.vm_workspace_cleanup_admissions%ROWTYPE;
+        instance public.srw_workspace_instances%ROWTYPE;
+BEGIN
+    SELECT * INTO retry FROM public.vm_creation_retries WHERE request_id=NEW.request_id;
+    IF retry.cancellation_disposition IS NULL OR retry.state<>'settled'
+       OR retry.reason<>'creation_disposed' THEN RETURN NULL; END IF;
+    SELECT * INTO parent FROM public.vm_workspace_cleanup_admissions
+        WHERE id=retry.creation_admission_id;
+    IF NOT (public.valid_vm_creation_disposition_evidence(retry)
+        AND parent.completed_at IS NOT NULL AND parent.outcome='creation_disposed'
+        AND public.valid_vm_creation_disposition_parent_identity(retry,parent)) IS TRUE THEN
+        RAISE EXCEPTION 'Creation disposition terminal parent is incomplete' USING ERRCODE='23514';
+    END IF;
+    IF retry.cancellation_disposition->>'workspace_instance_id' IS NOT NULL THEN
+        SELECT * INTO instance FROM public.srw_workspace_instances
+            WHERE id=(retry.cancellation_disposition->>'workspace_instance_id')::uuid;
+        IF NOT (FOUND AND instance.execution_id IS NULL
+            AND instance.status=CASE
+                WHEN retry.cancellation_completion->'workspace_attachment'->>'outcome'='detached'
+                THEN 'Detached' ELSE 'Released' END
+            AND instance.pvc_uid IS NOT DISTINCT FROM retry.cancellation_completion->'rootdisk'->>'pvc_uid'
+            AND instance.backend_state->'retained_creation_disposition'->>'request_id'=retry.request_id::text
+            AND instance.backend_state->'retained_creation_disposition'->'attachment'=retry.cancellation_completion->'workspace_attachment'
+            AND instance.backend_state->'retained_creation_disposition'->'rootdisk'=retry.cancellation_completion->'rootdisk') IS TRUE THEN
+            RAISE EXCEPTION 'Creation disposition terminal instance is incomplete' USING ERRCODE='23514';
+        END IF;
+    END IF;
+    IF retry.owner_kind='thread' AND NOT EXISTS (
+        SELECT 1 FROM public.threads t WHERE t.id=retry.thread_id
+          AND NOT t.metadata ? 'vm'
+          AND public.valid_vm_creation_thread_disposition_identity(retry,false)
+          AND NOT EXISTS (SELECT 1 FROM public.vm_resource_reservations v
+              WHERE v.request_id=retry.request_id AND v.state<>'released')
+    ) THEN RAISE EXCEPTION 'Thread creation disposition remains held' USING ERRCODE='23514'; END IF;
+    RETURN NULL;
+END;
+$$;
+
+
+--
+-- Name: guard_vm_creation_effect_disposition(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.guard_vm_creation_effect_disposition() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+DECLARE
+    disposition jsonb;
+BEGIN
+    SELECT cancellation_disposition INTO disposition FROM public.vm_creation_retries
+        WHERE request_id=NEW.request_id FOR UPDATE;
+    IF disposition IS NOT NULL THEN
+        RAISE EXCEPTION 'Creation disposition forbids further create effects' USING ERRCODE='23514';
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+
+--
+-- Name: guard_vm_creation_effect_identity(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.guard_vm_creation_effect_identity() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+BEGIN
+    IF ROW(NEW.effect_nonce,NEW.request_id,NEW.effect_number,NEW.effect_kind,
+           NEW.carrier_uid,NEW.carrier_namespace,NEW.carrier_intent,NEW.issued_at,
+           NEW.issuer_receipt_sha256)
+       IS DISTINCT FROM
+       ROW(OLD.effect_nonce,OLD.request_id,OLD.effect_number,OLD.effect_kind,
+           OLD.carrier_uid,OLD.carrier_namespace,OLD.carrier_intent,OLD.issued_at,
+           OLD.issuer_receipt_sha256)
+       OR (OLD.state<>'issued' AND NEW IS DISTINCT FROM OLD) THEN
+        RAISE EXCEPTION 'VM creation effect identity or resolved evidence is immutable' USING ERRCODE='23514';
+    END IF;
+    IF NEW.evidence->>'outcome'='not_attempted' AND (
+        NEW.state='rejected'
+        AND NEW.issuer_receipt_sha256 IS NOT NULL
+        AND NEW.evidence=jsonb_build_object(
+            'outcome','not_attempted','reason',NEW.evidence->>'reason')
+        AND NEW.evidence->>'reason' IN (
+            'resource_inventory_unavailable','resource_node_changed',
+            'creation_carrier_changed','creation_observed_object_missing',
+            'creation_observed_object_changed','retained_disk_changed',
+            'workspace_recovery_held','workspace_attachment_unproven',
+            'creation_existing_vm_unproven',
+            'creation_rootdisk_source_unproven')
+    ) IS NOT TRUE THEN
+        RAISE EXCEPTION 'Invalid unused creation grant evidence'
+            USING ERRCODE='23514';
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+
+--
+-- Name: guard_vm_creation_ready_release(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.guard_vm_creation_ready_release() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+BEGIN
+    IF (OLD.ready_at IS NOT NULL AND NEW.ready_at IS DISTINCT FROM OLD.ready_at)
+       OR (NEW.ready_at IS NOT NULL AND NOT (
+           NEW.state='succeeded' AND NEW.boot_counted
+           AND NEW.observed_vm_uid IS NOT NULL AND NEW.observed_pvc_uid IS NOT NULL
+       )) THEN
+        RAISE EXCEPTION 'VM creation Ready release is immutable and requires adoption' USING ERRCODE='23514';
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+
+--
+-- Name: guard_vm_creation_retry_identity(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.guard_vm_creation_retry_identity() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+BEGIN
+    IF ROW(NEW.request_id,NEW.job_id,NEW.provision_generation,NEW.origin,
+           NEW.request_digest,NEW.canonical_request,NEW.controller_configuration_digest,
+           NEW.execution_id,NEW.execution_revision,NEW.execution_generation,NEW.admission_deadline,
+           NEW.expected_pvc_uid,NEW.predecessor_evidence,NEW.predecessor_cleanup_admission_id,NEW.created_at)
+       IS DISTINCT FROM
+       ROW(OLD.request_id,OLD.job_id,OLD.provision_generation,OLD.origin,
+           OLD.request_digest,OLD.canonical_request,OLD.controller_configuration_digest,
+           OLD.execution_id,OLD.execution_revision,OLD.execution_generation,OLD.admission_deadline,
+           OLD.expected_pvc_uid,OLD.predecessor_evidence,OLD.predecessor_cleanup_admission_id,OLD.created_at)
+       OR (OLD.creation_admission_id IS NOT NULL AND NEW.creation_admission_id IS DISTINCT FROM OLD.creation_admission_id)
+       OR (OLD.observed_vm_uid IS NOT NULL AND NEW.observed_vm_uid IS DISTINCT FROM OLD.observed_vm_uid)
+       OR (OLD.observed_pvc_uid IS NOT NULL AND NEW.observed_pvc_uid IS DISTINCT FROM OLD.observed_pvc_uid)
+       OR (OLD.boot_counted AND NOT NEW.boot_counted)
+       OR NEW.revision < OLD.revision THEN
+        RAISE EXCEPTION 'VM creation retry identity is immutable' USING ERRCODE='23514';
+    END IF;
+    IF NEW.state <> OLD.state AND NOT (
+        (OLD.state='queued' AND NEW.state IN ('reconciling','cancel_requested','succeeded')) OR
+        (OLD.state='queued' AND NEW.state='attention'
+         AND NEW.reason='vm_creation_retry_blocked'
+         AND NEW.claim_token IS NULL AND NEW.claim_expires_at IS NULL
+         AND NEW.revision=OLD.revision+1
+         AND public.valid_vm_creation_unused_grant_attention(NEW)) OR
+        (OLD.state='reconciling' AND NEW.state IN ('queued','attention','succeeded','cancel_requested')) OR
+        (OLD.state='attention' AND NEW.state IN ('queued','cancel_requested','succeeded')) OR
+        (OLD.state='cancel_requested' AND NEW.state='settled')
+    ) THEN
+        RAISE EXCEPTION 'Invalid VM creation retry transition' USING ERRCODE='23514';
+    END IF;
+    IF NEW.state='succeeded' AND OLD.state IN ('queued','attention') AND NOT (
+        NEW.boot_counted AND NEW.reason='creation_adopted' AND EXISTS (
+            SELECT 1 FROM vm_creation_effects e
+            WHERE e.request_id=NEW.request_id AND e.effect_kind='vm' AND e.state='observed'
+              AND e.evidence->>'uid'=NEW.observed_vm_uid::text
+              AND e.evidence->>'pvc_uid'=NEW.observed_pvc_uid::text
+        )
+    ) THEN
+        RAISE EXCEPTION 'Late VM adoption requires observed issuance' USING ERRCODE='23514';
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+
+--
+-- Name: guard_vm_creation_thread_source(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.guard_vm_creation_thread_source() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+DECLARE
+    current_thread public.threads%ROWTYPE;
+    current_vm jsonb;
+    current_wake public.vm_idle_operations%ROWTYPE;
+BEGIN
+    IF TG_OP='UPDATE' THEN
+        IF ROW(NEW.owner_kind,NEW.thread_id,NEW.thread_runtime_generation,
+               NEW.thread_agent_id,NEW.thread_attach_token,
+               NEW.thread_wake_operation_id,NEW.thread_retained_resume_id,NEW.thread_owner_user_id,
+               NEW.thread_owner_project_id)
+           IS DISTINCT FROM
+           ROW(OLD.owner_kind,OLD.thread_id,OLD.thread_runtime_generation,
+               OLD.thread_agent_id,OLD.thread_attach_token,
+               OLD.thread_wake_operation_id,OLD.thread_retained_resume_id,OLD.thread_owner_user_id,
+               OLD.thread_owner_project_id) THEN
+            RAISE EXCEPTION 'VM creation source identity is immutable' USING ERRCODE='23514';
+        END IF;
+        RETURN NEW;
+    END IF;
+    IF NEW.owner_kind='job' THEN
+        RETURN NEW;
+    END IF;
+    IF jsonb_typeof(NEW.canonical_request) IS DISTINCT FROM 'object'
+       OR NEW.canonical_request->>'entity_type' IS DISTINCT FROM 'thread'
+       OR NEW.canonical_request->>'job_id' IS DISTINCT FROM NEW.thread_id::text
+       OR NEW.canonical_request->>'provision_generation' IS DISTINCT FROM NEW.provision_generation::text
+       OR jsonb_typeof(NEW.controller_configuration) IS DISTINCT FROM 'object'
+       OR (
+           NEW.controller_configuration->'version' IS DISTINCT FROM '3'::jsonb
+           AND (
+               NEW.controller_configuration->'version' IS DISTINCT FROM '1'::jsonb
+               OR NEW.controller_configuration->'persistent_rootdisk' IS DISTINCT FROM 'true'::jsonb
+               OR COALESCE(NEW.controller_configuration->'resource_admission','null'::jsonb) IS DISTINCT FROM 'null'::jsonb
+               OR COALESCE(NEW.controller_configuration->'network_profile_policy','null'::jsonb) IS DISTINCT FROM 'null'::jsonb
+               OR COALESCE(NEW.canonical_request->'network_profile','null'::jsonb) IS DISTINCT FROM 'null'::jsonb
+           )
+       ) THEN
+        RAISE EXCEPTION 'VM thread creation request identity mismatch' USING ERRCODE='23514';
+    END IF;
+    SELECT * INTO current_thread FROM public.threads
+      WHERE id=NEW.thread_id FOR SHARE;
+    current_vm := current_thread.metadata->'vm';
+    IF NOT FOUND OR current_thread.execution_lane IS DISTINCT FROM 'pinned'
+       OR current_thread.runtime_generation IS DISTINCT FROM NEW.thread_runtime_generation
+       OR current_thread.runtime_retirement_token IS NOT NULL
+       OR current_thread.pinned_idle_terminal_intent_at IS NOT NULL
+       OR current_thread.agent_id IS DISTINCT FROM NEW.thread_agent_id
+       OR current_thread.runtime_attach_token IS DISTINCT FROM NEW.thread_attach_token
+       OR jsonb_typeof(current_vm) IS DISTINCT FROM 'object'
+       OR current_vm->>'provision_generation' IS DISTINCT FROM NEW.provision_generation::text
+       OR current_vm->>'creation_request_id' IS DISTINCT FROM NEW.request_id::text
+       OR current_vm->>'status' IS DISTINCT FROM 'provisioning' THEN
+        RAISE EXCEPTION 'VM thread creation owner changed' USING ERRCODE='23514';
+    END IF;
+    IF NEW.thread_agent_id IS NULL THEN
+        IF EXISTS(SELECT 1 FROM public.agents WHERE thread_id=NEW.thread_id) THEN
+            RAISE EXCEPTION 'VM thread creation agent mismatch' USING ERRCODE='23514';
+        END IF;
+    ELSE
+        -- The actor UUID is immutable historical provenance. Replace the old
+        -- FK's live-row key lock with exact reciprocal tuple protection under
+        -- the already-held thread lock, before accepting a new source.
+        PERFORM 1 FROM public.agents
+            WHERE id=NEW.thread_agent_id AND thread_id=NEW.thread_id FOR SHARE;
+        IF NOT FOUND THEN
+            RAISE EXCEPTION 'VM thread creation agent mismatch' USING ERRCODE='23514';
+        END IF;
+    END IF;
+    IF NEW.thread_retained_resume_id IS NOT NULL THEN
+        IF NOT public.valid_vm_thread_retained_resume_source(NEW) THEN
+            RAISE EXCEPTION 'VM retained Resume source changed' USING ERRCODE='23514';
+        END IF;
+    ELSIF NEW.thread_wake_operation_id IS NOT NULL THEN
+        SELECT * INTO current_wake FROM public.vm_idle_operations
+          WHERE id=NEW.thread_wake_operation_id FOR SHARE;
+        IF NOT FOUND OR current_wake.owner_kind IS DISTINCT FROM 'thread'
+           OR current_wake.owner_id IS DISTINCT FROM NEW.thread_id
+           OR current_wake.release_kind IS DISTINCT FROM 'pinned_thread'
+           OR current_wake.phase IS NULL
+           OR current_wake.phase NOT IN ('waking','wake_held')
+           OR current_wake.closed_at IS NOT NULL
+           OR current_wake.stop_verified_at IS NULL
+           OR current_wake.thread_terminal_intent_at IS NOT NULL
+           OR current_wake.wake_request_id IS DISTINCT FROM NEW.request_id
+           OR current_wake.wake_generation IS DISTINCT FROM NEW.provision_generation
+           OR current_wake.pvc_uid IS DISTINCT FROM NEW.expected_pvc_uid THEN
+            RAISE EXCEPTION 'VM thread wake source changed' USING ERRCODE='23514';
+        END IF;
+    ELSIF NEW.expected_pvc_uid IS NOT NULL OR EXISTS (
+        SELECT 1 FROM public.vm_resource_thread_cleanup_authorities a
+        JOIN public.vm_resource_thread_cleanup_stops s USING(cleanup_admission_id)
+        WHERE a.thread_id=NEW.thread_id AND NOT a.purge_disk
+          AND a.runtime_generation<>NEW.thread_runtime_generation) THEN
+        RAISE EXCEPTION 'VM thread retained disk requires Resume or wake source' USING ERRCODE='23514';
+    END IF;
+    NEW.thread_owner_user_id := current_thread.user_id;
+    NEW.thread_owner_project_id := current_thread.project_id;
+    RETURN NEW;
+END;
+$$;
+
+
+--
+-- Name: guard_vm_idle_access_rebind(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.guard_vm_idle_access_rebind() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+DECLARE
+    proof jsonb;
+    current_job public.jobs%ROWTYPE;
+    prior public.vm_idle_operations%ROWTYPE;
+    root public.vm_idle_operations%ROWTYPE;
+BEGIN
+    IF TG_OP='DELETE' THEN
+        -- An old unproven row must remain visible: otherwise a later wake
+        -- could appear to be the first link of a forged complete history.
+        RAISE EXCEPTION 'VM idle operation history is retained' USING ERRCODE='23514';
+    END IF;
+    IF TG_OP='UPDATE' AND
+       ROW(NEW.owner_kind,NEW.owner_id,NEW.episode_id,NEW.episode_revision,
+           NEW.provision_generation,NEW.vm_uid,NEW.vmi_uid,NEW.launcher_uid,
+           NEW.pvc_uid,NEW.retained_kind)
+       IS DISTINCT FROM
+       ROW(OLD.owner_kind,OLD.owner_id,OLD.episode_id,OLD.episode_revision,
+           OLD.provision_generation,OLD.vm_uid,OLD.vmi_uid,OLD.launcher_uid,
+           OLD.pvc_uid,OLD.retained_kind) THEN
+        RAISE EXCEPTION 'VM idle operation source identity is immutable' USING ERRCODE='23514';
+    END IF;
+    IF TG_OP='UPDATE' AND OLD.access_rebind_proof IS NOT NULL THEN
+        IF NEW.access_rebind_proof IS DISTINCT FROM OLD.access_rebind_proof
+           OR ROW(NEW.owner_kind,NEW.owner_id,NEW.episode_id,NEW.episode_revision,
+                  NEW.provision_generation,NEW.vm_uid,NEW.vmi_uid,NEW.launcher_uid,
+                  NEW.pvc_uid,NEW.retained_kind,NEW.stop_evidence,NEW.stop_verified_at,
+                  NEW.wake_id,NEW.wake_generation,NEW.wake_request_id,NEW.wake_ready_at,
+                  NEW.wake_execution_requested)
+              IS DISTINCT FROM
+              ROW(OLD.owner_kind,OLD.owner_id,OLD.episode_id,OLD.episode_revision,
+                  OLD.provision_generation,OLD.vm_uid,OLD.vmi_uid,OLD.launcher_uid,
+                  OLD.pvc_uid,OLD.retained_kind,OLD.stop_evidence,OLD.stop_verified_at,
+                  OLD.wake_id,OLD.wake_generation,OLD.wake_request_id,OLD.wake_ready_at,
+                  OLD.wake_execution_requested) THEN
+            RAISE EXCEPTION 'Access wake lineage identity is immutable' USING ERRCODE='23514';
+        END IF;
+        IF OLD.closed_at IS NOT NULL THEN
+            IF NEW.phase IS DISTINCT FROM OLD.phase
+               OR NEW.closed_at IS DISTINCT FROM OLD.closed_at THEN
+                RAISE EXCEPTION 'Closed access wake status is immutable' USING ERRCODE='23514';
+            END IF;
+        ELSIF NEW.closed_at IS NOT NULL OR NEW.phase IS DISTINCT FROM OLD.phase THEN
+            IF NOT (NEW.closed_at IS NULL AND NEW.phase IN ('waking','wake_held'))
+               AND NOT (NEW.closed_at IS NOT NULL AND NEW.phase='ready'
+                        AND OLD.phase IN ('waking','wake_held')) THEN
+                RAISE EXCEPTION 'Access wake may only close ready' USING ERRCODE='23514';
+            END IF;
+        END IF;
+        IF NEW.post_ready_resume_requested IS DISTINCT FROM OLD.post_ready_resume_requested THEN
+            IF OLD.post_ready_resume_requested OR NOT NEW.post_ready_resume_requested
+               OR OLD.closed_at IS NOT NULL OR NEW.closed_at IS NOT NULL
+               OR OLD.phase NOT IN ('waking','wake_held')
+               OR NEW.wake_execution_requested
+               OR NEW.wake_ready_at IS NULL THEN
+                RAISE EXCEPTION 'Post-ready Resume has no open access authority' USING ERRCODE='23514';
+            END IF;
+            SELECT * INTO current_job FROM public.jobs WHERE id=OLD.owner_id FOR SHARE;
+            IF current_job.id IS NULL
+               OR current_job.status IN ('completed','failed','cancelled')
+               OR current_job.workspace_idle_revision<>OLD.episode_revision+1
+               OR current_job.workspace_idle_episode->>'episode_id'<>OLD.episode_id::text
+               OR current_job.context->'vm'->>'idle_wake_operation_id' IS DISTINCT FROM OLD.id::text
+               OR current_job.context->'vm'->>'status'<>'ready'
+               OR current_job.context->'vm'->>'provision_generation' IS DISTINCT FROM OLD.wake_generation::text
+               OR current_job.context->'vm'->>'vm_uid' IS DISTINCT FROM OLD.access_rebind_proof->'successor'->>'vm_uid'
+               OR current_job.context->'vm'->>'vmi_uid' IS DISTINCT FROM OLD.access_rebind_proof->'successor'->>'vmi_uid'
+               OR current_job.context->'vm'->>'active_pod_uid' IS DISTINCT FROM OLD.access_rebind_proof->'successor'->>'launcher_uid'
+               OR current_job.context->'vm'->>'rootdisk_pvc_uid' IS DISTINCT FROM OLD.pvc_uid::text THEN
+                RAISE EXCEPTION 'Post-ready Resume successor is unproven' USING ERRCODE='23514';
+            END IF;
+        END IF;
+        RETURN NEW;
+    END IF;
+    proof := NEW.access_rebind_proof;
+    IF proof IS NULL THEN
+        RETURN NEW;
+    END IF;
+    IF jsonb_typeof(proof) IS DISTINCT FROM 'object'
+       OR proof->'version' IS DISTINCT FROM '1'::jsonb
+       OR NEW.owner_kind<>'job' OR NEW.retained_kind<>'rootdisk'
+       OR NEW.stop_verified_at IS NULL OR NEW.stop_evidence IS NULL
+       OR NEW.wake_ready_at IS NULL OR NEW.wake_id IS NULL
+       OR NEW.wake_generation IS NULL OR NEW.wake_request_id IS NULL
+       OR NEW.wake_execution_requested OR NEW.post_ready_resume_requested
+       OR NEW.terminal_source_command_id IS NOT NULL
+       OR proof->>'operation_id' IS DISTINCT FROM NEW.id::text
+       OR proof->>'episode_id' IS DISTINCT FROM NEW.episode_id::text
+       OR proof->>'from_revision' IS DISTINCT FROM NEW.episode_revision::text
+       OR proof->>'to_revision' IS DISTINCT FROM (NEW.episode_revision+1)::text
+       OR proof->>'root_operation_id' IS NULL
+       OR proof->>'root_revision' IS NULL
+       OR proof->>'chain_length' IS NULL
+       OR proof->>'wake_id' IS DISTINCT FROM NEW.wake_id::text
+       OR (proof->>'stop_verified_at')::timestamptz IS DISTINCT FROM NEW.stop_verified_at
+       OR (proof->>'ready_at')::timestamptz IS DISTINCT FROM NEW.wake_ready_at
+       OR proof->'predecessor' IS DISTINCT FROM jsonb_build_object(
+            'generation',NEW.provision_generation::text,'vm_uid',NEW.vm_uid::text,
+            'vmi_uid',NEW.vmi_uid::text,'launcher_uid',NEW.launcher_uid::text,
+            'pvc_uid',NEW.pvc_uid::text)
+       OR jsonb_typeof(proof->'successor') IS DISTINCT FROM 'object'
+       OR proof->'successor' IS DISTINCT FROM jsonb_build_object(
+            'generation',proof->'successor'->>'generation',
+            'vm_uid',proof->'successor'->>'vm_uid',
+            'vmi_uid',proof->'successor'->>'vmi_uid',
+            'launcher_uid',proof->'successor'->>'launcher_uid',
+            'pvc_uid',proof->'successor'->>'pvc_uid')
+       OR proof->'successor'->>'generation' IS DISTINCT FROM NEW.wake_generation::text
+       OR proof->'successor'->>'pvc_uid' IS DISTINCT FROM NEW.pvc_uid::text
+       OR proof->'successor'->>'vm_uid' IS NULL
+       OR proof->'successor'->>'vmi_uid' IS NULL
+       OR proof->'successor'->>'launcher_uid' IS NULL
+       OR proof->'successor'->>'vm_uid'=NEW.vm_uid::text
+       OR proof->'successor'->>'vmi_uid'=NEW.vmi_uid::text
+       OR proof->'successor'->>'launcher_uid'=NEW.launcher_uid::text THEN
+        RAISE EXCEPTION 'Access wake lineage shape is unproven' USING ERRCODE='23514';
+    END IF;
+    SELECT * INTO prior FROM public.vm_idle_operations
+    WHERE owner_kind='job' AND owner_id=NEW.owner_id
+      AND episode_id=NEW.episode_id AND id<>NEW.id
+      AND episode_revision<=NEW.episode_revision
+    ORDER BY episode_revision DESC,id DESC LIMIT 1;
+    IF prior.id IS NULL THEN
+        IF proof->>'root_operation_id' IS DISTINCT FROM NEW.id::text
+           OR proof->>'root_revision' IS DISTINCT FROM NEW.episode_revision::text
+           OR proof->>'chain_length' IS DISTINCT FROM '1' THEN
+            RAISE EXCEPTION 'Access wake first link is unproven' USING ERRCODE='23514';
+        END IF;
+        root := NEW;
+    ELSE
+        IF prior.episode_revision<>NEW.episode_revision-1
+           OR prior.phase<>'ready' OR prior.closed_at IS NULL
+           OR prior.post_ready_resume_requested
+           OR prior.access_rebind_proof IS NULL
+           OR prior.access_rebind_proof->>'to_revision' IS DISTINCT FROM NEW.episode_revision::text
+           OR prior.access_rebind_proof->>'episode_id' IS DISTINCT FROM NEW.episode_id::text
+           OR prior.access_rebind_proof->>'wait_key' IS DISTINCT FROM proof->>'wait_key'
+           OR prior.access_rebind_proof->>'wait_kind' IS DISTINCT FROM proof->>'wait_kind'
+           OR prior.access_rebind_proof->>'entered_at' IS DISTINCT FROM proof->>'entered_at'
+           OR prior.access_rebind_proof->'successor' IS DISTINCT FROM proof->'predecessor'
+           OR proof->>'root_operation_id' IS DISTINCT FROM prior.access_rebind_proof->>'root_operation_id'
+           OR proof->>'root_revision' IS DISTINCT FROM prior.access_rebind_proof->>'root_revision'
+           OR (proof->>'chain_length')::bigint
+                IS DISTINCT FROM (prior.access_rebind_proof->>'chain_length')::bigint+1 THEN
+            RAISE EXCEPTION 'Access wake prior link is unproven' USING ERRCODE='23514';
+        END IF;
+        SELECT * INTO root FROM public.vm_idle_operations
+        WHERE id=(proof->>'root_operation_id')::uuid;
+        IF root.id IS NULL OR root.owner_id<>NEW.owner_id OR root.episode_id<>NEW.episode_id
+           OR root.access_rebind_proof->>'root_operation_id' IS DISTINCT FROM root.id::text
+           OR root.access_rebind_proof->>'chain_length' IS DISTINCT FROM '1'
+           OR root.episode_revision::text IS DISTINCT FROM proof->>'root_revision' THEN
+            RAISE EXCEPTION 'Access wake root link is unproven' USING ERRCODE='23514';
+        END IF;
+    END IF;
+    IF NEW.wake_generation=root.provision_generation
+       OR (proof->>'chain_length')::bigint<>NEW.episode_revision-root.episode_revision+1 THEN
+        RAISE EXCEPTION 'Access wake lineage cycle or gap' USING ERRCODE='23514';
+    END IF;
+    SELECT * INTO current_job FROM public.jobs WHERE id=NEW.owner_id FOR SHARE;
+    IF current_job.id IS NULL
+       OR current_job.workspace_idle_revision<>NEW.episode_revision+1
+       OR current_job.workspace_idle_episode->>'episode_id'<>NEW.episode_id::text
+       OR current_job.workspace_idle_episode->>'wait_key' IS DISTINCT FROM proof->>'wait_key'
+       OR current_job.workspace_idle_episode->>'wait_kind' IS DISTINCT FROM proof->>'wait_kind'
+       OR current_job.workspace_idle_episode->>'entered_at' IS DISTINCT FROM proof->>'entered_at'
+       OR current_job.workspace_idle_episode->'runtime_identity'->>'runtime_generation'
+            IS DISTINCT FROM proof->'successor'->>'generation'
+       OR current_job.workspace_idle_episode->'runtime_identity'->>'runtime_uid'
+            IS DISTINCT FROM proof->'successor'->>'vm_uid'
+       OR current_job.context->'vm'->>'vm_uid' IS DISTINCT FROM proof->'successor'->>'vm_uid'
+       OR current_job.context->'vm'->>'vmi_uid' IS DISTINCT FROM proof->'successor'->>'vmi_uid'
+       OR current_job.context->'vm'->>'active_pod_uid' IS DISTINCT FROM proof->'successor'->>'launcher_uid'
+       OR current_job.context->'vm'->>'rootdisk_pvc_uid' IS DISTINCT FROM NEW.pvc_uid::text
+       OR current_job.context->'vm'->>'idle_wake_operation_id' IS DISTINCT FROM NEW.id::text
+       OR current_job.context->'vm'->>'status'<>'ready' THEN
+        RAISE EXCEPTION 'Access wake lineage successor is unproven' USING ERRCODE='23514';
+    END IF;
+    RETURN NEW;
+END $$;
+
+
+--
+-- Name: guard_vm_idle_pinned_job(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.guard_vm_idle_pinned_job() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+BEGIN
+    IF TG_OP='DELETE' THEN
+        IF OLD.release_kind='pinned_job' THEN
+            RAISE EXCEPTION 'Pinned idle operation is retained' USING ERRCODE='23514';
+        END IF;
+        RETURN OLD;
+    END IF;
+    IF TG_OP='UPDATE' THEN
+        IF ROW(NEW.release_kind,NEW.pinned_delivery_id,NEW.pinned_wait_receipt_id,
+               NEW.pinned_agent_id,NEW.pinned_process_generation,
+               NEW.pinned_agent_pod_name,NEW.pinned_agent_pod_namespace,
+               NEW.pinned_agent_pod_uid,NEW.pinned_original_dispatch_marker,
+               NEW.pinned_lease_observed_at,NEW.pinned_lease_expires_at)
+           IS DISTINCT FROM
+           ROW(OLD.release_kind,OLD.pinned_delivery_id,OLD.pinned_wait_receipt_id,
+               OLD.pinned_agent_id,OLD.pinned_process_generation,
+               OLD.pinned_agent_pod_name,OLD.pinned_agent_pod_namespace,
+               OLD.pinned_agent_pod_uid,OLD.pinned_original_dispatch_marker,
+               OLD.pinned_lease_observed_at,OLD.pinned_lease_expires_at)
+           OR (OLD.pinned_stop_verified_at IS NOT NULL AND
+               ROW(NEW.pinned_stop_evidence,NEW.pinned_stop_verified_at)
+               IS DISTINCT FROM ROW(OLD.pinned_stop_evidence,OLD.pinned_stop_verified_at))
+           OR (OLD.pinned_terminal_observed_at IS NOT NULL AND
+               NEW.pinned_terminal_observed_at IS DISTINCT FROM
+               OLD.pinned_terminal_observed_at) THEN
+            RAISE EXCEPTION 'Pinned idle authority is immutable' USING ERRCODE='23514';
+        END IF;
+    END IF;
+    RETURN NEW;
+END $$;
+
+
+--
+-- Name: guard_vm_idle_pinned_thread(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.guard_vm_idle_pinned_thread() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+DECLARE
+    source_thread public.threads%ROWTYPE;
+    source_context jsonb;
+    source_vm jsonb;
+BEGIN
+    IF TG_OP='DELETE' THEN
+        IF OLD.release_kind='pinned_thread' THEN
+            RAISE EXCEPTION 'Pinned thread idle operation is retained' USING ERRCODE='23514';
+        END IF;
+        RETURN OLD;
+    END IF;
+    IF TG_OP='UPDATE' THEN
+        IF OLD.release_kind='pinned_thread' AND (
+            ROW(NEW.release_kind,NEW.owner_kind,NEW.owner_id,NEW.episode_id,
+                NEW.episode_revision,NEW.provision_generation,NEW.vm_uid,
+                NEW.vmi_uid,NEW.launcher_uid,NEW.pvc_uid,NEW.retained_kind,
+                NEW.thread_runtime_generation,NEW.thread_retirement_token)
+            IS DISTINCT FROM
+            ROW(OLD.release_kind,OLD.owner_kind,OLD.owner_id,OLD.episode_id,
+                OLD.episode_revision,OLD.provision_generation,OLD.vm_uid,
+                OLD.vmi_uid,OLD.launcher_uid,OLD.pvc_uid,OLD.retained_kind,
+                OLD.thread_runtime_generation,OLD.thread_retirement_token)
+            OR NEW.thread_agent_pod_identity IS DISTINCT FROM OLD.thread_agent_pod_identity
+            OR (OLD.stop_verified_at IS NOT NULL AND
+                ROW(NEW.stop_evidence,NEW.stop_verified_at)
+                IS DISTINCT FROM ROW(OLD.stop_evidence,OLD.stop_verified_at))
+            OR (OLD.thread_agent_stop_verified_at IS NOT NULL AND
+                ROW(NEW.thread_agent_stop_evidence,NEW.thread_agent_stop_verified_at)
+                IS DISTINCT FROM ROW(OLD.thread_agent_stop_evidence,
+                                     OLD.thread_agent_stop_verified_at))
+            OR (OLD.thread_terminal_intent_at IS NOT NULL AND
+                ROW(NEW.thread_terminal_intent_at,
+                    NEW.thread_terminal_intent_generation,
+                    NEW.wake_requested,NEW.wake_execution_requested,
+                    NEW.wake_id,NEW.wake_generation,NEW.wake_request_id,
+                    NEW.wake_ready_at,NEW.thread_wake_ready_identity)
+                IS DISTINCT FROM ROW(OLD.thread_terminal_intent_at,
+                                     OLD.thread_terminal_intent_generation,
+                                     OLD.wake_requested,OLD.wake_execution_requested,
+                                     OLD.wake_id,OLD.wake_generation,OLD.wake_request_id,
+                                     OLD.wake_ready_at,OLD.thread_wake_ready_identity))
+            OR (OLD.thread_terminal_intent_at IS NOT NULL
+                AND NEW.phase='ready')
+            OR (OLD.thread_wake_ready_identity IS NOT NULL AND
+                NEW.thread_wake_ready_identity IS DISTINCT FROM OLD.thread_wake_ready_identity)
+            OR (OLD.closed_at IS NOT NULL AND
+                ROW(NEW.phase,NEW.closed_at) IS DISTINCT FROM
+                ROW(OLD.phase,OLD.closed_at))
+        ) THEN
+            RAISE EXCEPTION 'Pinned thread idle authority is immutable' USING ERRCODE='23514';
+        END IF;
+        IF OLD.release_kind='pinned_thread'
+           AND OLD.thread_terminal_intent_at IS NULL
+           AND NEW.thread_terminal_intent_at IS NOT NULL THEN
+            SELECT * INTO source_thread FROM public.threads
+                WHERE id=NEW.owner_id FOR SHARE;
+            source_vm := source_thread.metadata->'vm';
+            IF source_thread.id IS NULL
+               OR source_thread.runtime_generation
+                  IS DISTINCT FROM NEW.thread_terminal_intent_generation
+               OR NOT COALESCE((
+                   (OLD.phase IN ('releasing','release_held')
+                    AND source_thread.status='awaiting_user'
+                    AND source_thread.runtime_retirement_token=OLD.thread_retirement_token)
+                   OR (OLD.phase IN ('suspended','waking','wake_held')
+                       AND source_thread.status IN ('suspended','created')
+                       AND OLD.stop_verified_at IS NOT NULL
+                       AND OLD.thread_agent_stop_verified_at IS NOT NULL
+                       AND source_thread.runtime_retirement_token IS NULL
+                       AND (
+                           (source_vm->>'provision_generation'=OLD.provision_generation::text
+                            AND source_vm->>'rootdisk_pvc_uid'=OLD.pvc_uid::text)
+                           OR (OLD.wake_generation IS NOT NULL
+                               AND source_vm->>'provision_generation'=OLD.wake_generation::text
+                               AND source_vm->>'idle_wake_operation_id'=OLD.id::text
+                               AND source_vm->>'idle_predecessor_pvc_uid'=OLD.pvc_uid::text)
+                       ))
+               ),false)
+            THEN
+                RAISE EXCEPTION 'Pinned thread terminal join lost wake race' USING ERRCODE='23514';
+            END IF;
+        END IF;
+        IF OLD.release_kind='pinned_thread'
+           AND OLD.thread_agent_stop_verified_at IS NULL
+           AND NEW.thread_agent_stop_verified_at IS NOT NULL THEN
+            SELECT * INTO source_thread FROM public.threads
+                WHERE id=NEW.owner_id FOR SHARE;
+            IF source_thread.id IS NULL OR source_thread.status<>'suspended'
+               OR source_thread.runtime_generation=NEW.thread_runtime_generation
+               OR source_thread.agent_id IS NOT NULL
+               OR source_thread.runtime_attach_token IS NOT NULL
+               OR NOT EXISTS (
+                   SELECT 1 FROM public.thread_runtime_retirement_outcomes o
+                   WHERE o.thread_id=NEW.owner_id
+                     AND o.runtime_generation=NEW.thread_runtime_generation
+                     AND o.retirement_token=NEW.thread_retirement_token
+                     AND o.disposition='suspended' AND o.permanent=false
+                     AND o.outcome='settled'
+               )
+               OR NEW.thread_agent_stop_evidence IS DISTINCT FROM jsonb_build_object(
+                   'version',1,'pod',NEW.thread_agent_pod_identity,
+                   'disposition',NEW.thread_agent_stop_evidence->>'disposition',
+                   'retirement_token',NEW.thread_retirement_token::text,
+                   'controller_authenticated',true)
+               OR NEW.thread_agent_stop_evidence->>'disposition' IS NULL
+               OR NEW.thread_agent_stop_evidence->>'disposition'
+                  NOT IN ('exact_absent','replacement')
+            THEN
+                RAISE EXCEPTION 'Pinned thread agent stop is unproven' USING ERRCODE='23514';
+            END IF;
+        END IF;
+        IF OLD.release_kind='pinned_thread'
+           AND OLD.thread_wake_ready_identity IS NULL
+           AND NEW.thread_wake_ready_identity IS NOT NULL THEN
+            SELECT * INTO source_thread FROM public.threads
+                WHERE id=NEW.owner_id FOR SHARE;
+            source_vm := source_thread.metadata->'vm';
+            IF NEW.wake_ready_at IS NULL OR NEW.stop_verified_at IS NULL
+               OR NEW.wake_generation IS NULL OR NEW.wake_request_id IS NULL
+               OR source_thread.status<>'suspended'
+               OR source_vm->>'status' IS DISTINCT FROM 'ready'
+               OR source_vm->>'identity_authenticated' IS DISTINCT FROM 'true'
+               OR source_vm->>'identity_provision_generation'
+                  IS DISTINCT FROM NEW.wake_generation::text
+               OR source_vm->>'idle_wake_operation_id' IS DISTINCT FROM NEW.id::text
+               OR source_vm->>'idle_wake_request_id'
+                  IS DISTINCT FROM NEW.wake_request_id::text
+               OR source_vm->>'idle_predecessor_pvc_uid'
+                  IS DISTINCT FROM NEW.pvc_uid::text
+               OR NEW.thread_wake_ready_identity IS DISTINCT FROM jsonb_build_object(
+                    'generation',NEW.wake_generation::text,
+                    'vm_uid',source_vm->>'vm_uid',
+                    'vmi_uid',source_vm->>'vmi_uid',
+                    'launcher_uid',source_vm->>'active_pod_uid',
+                    'pvc_uid',NEW.pvc_uid::text)
+               OR source_vm->>'vm_uid' IS NULL
+               OR source_vm->>'vmi_uid' IS NULL
+               OR source_vm->>'active_pod_uid' IS NULL
+               OR source_vm->>'rootdisk_pvc_uid' IS DISTINCT FROM NEW.pvc_uid::text
+            THEN
+                RAISE EXCEPTION 'Pinned thread wake identity is unproven' USING ERRCODE='23514';
+            END IF;
+        END IF;
+        RETURN NEW;
+    END IF;
+    IF NEW.release_kind<>'pinned_thread' THEN
+        RETURN NEW;
+    END IF;
+    SELECT * INTO source_thread FROM public.threads
+        WHERE id=NEW.owner_id FOR SHARE;
+    source_context := source_thread.runtime_retirement_context;
+    source_vm := source_context->'vm';
+    IF source_thread.id IS NULL
+       OR source_thread.execution_lane<>'pinned'
+       OR source_thread.status<>'awaiting_user'
+       OR source_thread.runtime_generation IS DISTINCT FROM NEW.thread_runtime_generation
+       OR source_thread.runtime_retirement_token IS DISTINCT FROM NEW.thread_retirement_token
+       OR source_thread.runtime_retirement_authorized_at IS NULL
+       OR source_thread.runtime_retirement_permanent IS DISTINCT FROM false
+       OR source_context->>'generation' IS DISTINCT FROM NEW.thread_runtime_generation::text
+       OR source_context->>'settle_status' IS DISTINCT FROM 'suspended'
+       OR source_context->>'initiator' IS DISTINCT FROM 'system'
+       OR source_context->>'agent_id' IS DISTINCT FROM source_thread.agent_id::text
+       OR source_context->>'runtime_attach_token'
+          IS DISTINCT FROM source_thread.runtime_attach_token::text
+       OR source_context->'agent_pod'->>'pod_uid' IS DISTINCT FROM
+          source_thread.metadata->'agent_pod'->>'pod_uid'
+       OR source_context->'agent_pod' IS DISTINCT FROM NEW.thread_agent_pod_identity
+       OR NEW.thread_agent_pod_identity->>'pod_name' IS NULL
+       OR NEW.thread_agent_pod_identity->>'pod_uid' IS NULL
+       OR NEW.thread_agent_pod_identity->>'namespace' IS NULL
+       OR NEW.thread_agent_pod_identity->>'protection_protocol'
+          IS DISTINCT FROM 'finalizer_v1'
+       OR source_vm->>'provision_generation' IS DISTINCT FROM NEW.provision_generation::text
+       OR source_vm->>'vm_uid' IS DISTINCT FROM NEW.vm_uid::text
+       OR source_vm->>'vmi_uid' IS DISTINCT FROM NEW.vmi_uid::text
+       OR source_vm->>'active_pod_uid' IS DISTINCT FROM NEW.launcher_uid::text
+       OR source_vm->>'rootdisk_pvc_uid' IS DISTINCT FROM NEW.pvc_uid::text
+       OR source_vm->>'status' IS DISTINCT FROM 'ready'
+       OR source_thread.workspace_idle_revision IS DISTINCT FROM NEW.episode_revision
+       OR source_thread.workspace_idle_episode->>'episode_id'
+          IS DISTINCT FROM NEW.episode_id::text
+       OR source_thread.workspace_idle_episode->>'wait_kind'
+          IS DISTINCT FROM 'natural_pause'
+       OR source_thread.workspace_idle_episode->'runtime_identity'->>'runtime_generation'
+          IS DISTINCT FROM NEW.provision_generation::text
+       OR source_thread.workspace_idle_episode->'runtime_identity'->>'runtime_uid'
+          IS DISTINCT FROM NEW.vm_uid::text
+    THEN
+        RAISE EXCEPTION 'Pinned thread idle source is unproven' USING ERRCODE='23514';
+    END IF;
+    RETURN NEW;
+END $$;
+
+
+--
+-- Name: guard_vm_idle_retained_cleanup(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.guard_vm_idle_retained_cleanup() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+BEGIN
+    IF NEW.owner_kind='job' AND NEW.source IN
+       ('completion_workspace_teardown','kept_disk') THEN
+        PERFORM 1 FROM public.jobs WHERE id=NEW.owner_id FOR SHARE;
+        IF EXISTS (
+            SELECT 1 FROM public.vm_idle_operations o
+            WHERE o.owner_kind='job' AND o.owner_id=NEW.owner_id
+              AND (NEW.pvc_uid IS NULL OR o.pvc_uid=NEW.pvc_uid)
+              AND o.storage_disposition='retention_unknown'
+        ) THEN
+            RAISE EXCEPTION 'Terminal idle retained rootdisk is held' USING ERRCODE='23514';
+        END IF;
+    END IF;
+    RETURN NEW;
+END $$;
+
+
+--
+-- Name: guard_vm_idle_terminal_decision(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.guard_vm_idle_terminal_decision() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+DECLARE
+    source_job public.jobs%ROWTYPE;
+BEGIN
+    IF TG_OP='DELETE' THEN
+        IF OLD.terminal_source_command_id IS NOT NULL THEN
+            RAISE EXCEPTION 'Terminal idle retention decision is immutable' USING ERRCODE='23514';
+        END IF;
+        RETURN OLD;
+    END IF;
+    IF TG_OP='UPDATE' AND OLD.terminal_source_command_id IS NOT NULL THEN
+        IF NEW.terminal_source_command_id IS DISTINCT FROM OLD.terminal_source_command_id
+           OR NEW.terminal_decided_at IS DISTINCT FROM OLD.terminal_decided_at
+           OR NEW.storage_disposition IS DISTINCT FROM OLD.storage_disposition
+           OR NEW.terminal_publication IS DISTINCT FROM OLD.terminal_publication
+           OR (OLD.terminal_published_at IS NOT NULL
+               AND NEW.terminal_published_at IS DISTINCT FROM OLD.terminal_published_at)
+           OR ROW(NEW.owner_kind,NEW.owner_id,NEW.episode_id,NEW.episode_revision,
+                  NEW.provision_generation,NEW.vm_uid,NEW.vmi_uid,NEW.launcher_uid,
+                  NEW.pvc_uid,NEW.retained_kind)
+              IS DISTINCT FROM
+              ROW(OLD.owner_kind,OLD.owner_id,OLD.episode_id,OLD.episode_revision,
+                  OLD.provision_generation,OLD.vm_uid,OLD.vmi_uid,OLD.launcher_uid,
+                  OLD.pvc_uid,OLD.retained_kind) THEN
+            RAISE EXCEPTION 'Terminal idle retention identity is immutable' USING ERRCODE='23514';
+        END IF;
+    ELSIF NEW.terminal_source_command_id IS NOT NULL THEN
+        SELECT * INTO source_job FROM public.jobs WHERE id=NEW.owner_id FOR SHARE;
+        IF source_job.id IS NULL OR source_job.status::text<>'pending_review'
+           OR source_job.execution_lane NOT IN ('stateless','pinned')
+           OR source_job.workspace_idle_revision<>NEW.episode_revision
+           OR source_job.workspace_idle_episode->>'episode_id'<>NEW.episode_id::text
+           OR source_job.workspace_idle_episode->>'wait_kind'<>'human_review'
+           OR source_job.workspace_idle_episode->>'wait_key'<>NEW.terminal_source_command_id::text
+           OR (source_job.execution_lane='pinned' AND NOT EXISTS (
+               SELECT 1 FROM public.pinned_job_wait_receipts r
+               JOIN public.pinned_job_deliveries d ON d.id=r.delivery_id
+               WHERE r.job_id=NEW.owner_id AND r.source_kind='completion'
+                 AND r.source_id=NEW.terminal_source_command_id
+                 AND d.job_id=NEW.owner_id AND d.accepted_at IS NOT NULL
+                 AND NEW.pinned_wait_receipt_id=r.id
+                 AND NEW.pinned_delivery_id=d.id
+           ))
+           OR NOT EXISTS (
+               SELECT 1 FROM public.job_completion_commands c
+               JOIN public.completion_effects e
+                 ON e.producer_kind='job_completion' AND e.producer_id=c.id
+                AND e.scope_id=NEW.owner_id AND e.effect_name='main_status_write'
+                AND e.state='done' AND e.completed_at IS NOT NULL
+               WHERE c.id=NEW.terminal_source_command_id AND c.job_id=NEW.owner_id
+                 AND c.state='done' AND c.finalized_at IS NOT NULL
+                 AND c.report_seq=source_job.completion_seq_hwm
+                 AND c.payload->'_accepted_idle_wait_source'->>'rootdisk_pvc_uid'
+                     =NEW.pvc_uid::text
+           ) THEN
+            RAISE EXCEPTION 'Terminal idle review source is not finalized' USING ERRCODE='23514';
+        END IF;
+    END IF;
+    RETURN NEW;
+END $$;
+
+
+--
+-- Name: guard_vm_idle_thread_access_continuation(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.guard_vm_idle_thread_access_continuation() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+DECLARE
+    source_operation public.vm_idle_operations%ROWTYPE;
+    source_thread public.threads%ROWTYPE;
+    current_agent public.agents%ROWTYPE;
+    source_vm jsonb;
+    source_pod jsonb;
+BEGIN
+    IF TG_OP='DELETE' THEN
+        RAISE EXCEPTION 'Pinned access execution receipt is retained' USING ERRCODE='23514';
+    END IF;
+    IF TG_OP='UPDATE' AND (
+        NEW.operation_id IS DISTINCT FROM OLD.operation_id OR
+        NEW.thread_id IS DISTINCT FROM OLD.thread_id OR
+        NEW.requested_at IS DISTINCT FROM OLD.requested_at OR
+        OLD.prepared_at IS NOT NULL OR NEW.prepared_at IS NULL
+    ) THEN
+        RAISE EXCEPTION 'Pinned access execution source is immutable' USING ERRCODE='23514';
+    END IF;
+    SELECT * INTO source_operation FROM public.vm_idle_operations
+        WHERE id=NEW.operation_id FOR SHARE;
+    SELECT * INTO source_thread FROM public.threads
+        WHERE id=NEW.thread_id FOR SHARE;
+    source_vm := source_thread.metadata->'vm';
+    IF source_operation.id IS NULL OR source_thread.id IS NULL
+       OR source_operation.owner_kind<>'thread'
+       OR source_operation.owner_id IS DISTINCT FROM NEW.thread_id
+       OR source_operation.release_kind<>'pinned_thread'
+       OR source_operation.phase<>'ready' OR source_operation.closed_at IS NULL
+       OR source_operation.wake_ready_at IS NULL
+       OR source_operation.wake_execution_requested
+       OR source_operation.thread_terminal_intent_at IS NOT NULL
+       OR source_thread.status<>'created'
+       OR source_thread.runtime_retirement_token IS NOT NULL
+       OR source_thread.pinned_idle_terminal_intent_at IS NOT NULL
+       OR source_vm->>'status' IS DISTINCT FROM 'ready'
+       OR source_vm->>'identity_authenticated' IS DISTINCT FROM 'true'
+       OR source_vm->>'provision_generation' IS DISTINCT FROM
+          source_operation.wake_generation::text
+       OR source_vm->>'idle_wake_operation_id' IS DISTINCT FROM
+          source_operation.id::text
+       OR source_vm->>'rootdisk_pvc_uid' IS DISTINCT FROM
+          source_operation.pvc_uid::text
+       OR source_operation.thread_wake_ready_identity IS DISTINCT FROM
+          jsonb_build_object(
+              'generation',source_operation.wake_generation::text,
+              'vm_uid',source_vm->>'vm_uid','vmi_uid',source_vm->>'vmi_uid',
+              'launcher_uid',source_vm->>'active_pod_uid',
+              'pvc_uid',source_operation.pvc_uid::text)
+    THEN
+        RAISE EXCEPTION 'Pinned access execution successor is unproven' USING ERRCODE='23514';
+    END IF;
+    IF TG_OP='INSERT' AND (
+        NEW.prepared_at IS NOT NULL OR source_thread.agent_id IS NOT NULL OR
+        source_thread.runtime_attach_token IS NOT NULL
+    ) THEN
+        RAISE EXCEPTION 'Pinned access execution was already bound' USING ERRCODE='23514';
+    END IF;
+    IF TG_OP='UPDATE' THEN
+        SELECT * INTO current_agent FROM public.agents
+            WHERE id=source_thread.agent_id FOR SHARE;
+        source_pod := source_thread.metadata->'agent_pod';
+        IF source_thread.runtime_attach_token IS NULL
+           OR current_agent.id IS NULL
+           OR current_agent.thread_id IS DISTINCT FROM source_thread.id
+           OR current_agent.status NOT IN ('ready','working','session')
+           OR source_pod->>'pod_name' IS DISTINCT FROM current_agent.hostname
+           OR source_pod->>'pod_uid' IS DISTINCT FROM current_agent.pod_uid
+           OR source_pod->>'protection_protocol' IS DISTINCT FROM 'finalizer_v1'
+           OR source_pod->>'pod_uid' IS NULL
+           OR source_pod->>'pod_uid' IS NOT DISTINCT FROM
+              source_operation.thread_agent_pod_identity->>'pod_uid'
+        THEN
+            RAISE EXCEPTION 'Pinned access execution fresh binding is unproven'
+                USING ERRCODE='23514';
+        END IF;
+    END IF;
+    RETURN NEW;
+END $$;
+
+
+--
+-- Name: guard_vm_job_cancel_retention_cleanup(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.guard_vm_job_cancel_retention_cleanup() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+DECLARE row public.vm_workspace_cleanup_admissions%ROWTYPE;
+        protected boolean;
+BEGIN
+    row := CASE WHEN TG_OP='DELETE' THEN OLD ELSE NEW END;
+    PERFORM pg_advisory_xact_lock(hashtextextended('workspace-recovery:'||row.owner_kind||':'||row.owner_id,0));
+    IF row.pvc_uid IS NOT NULL THEN
+        PERFORM pg_advisory_xact_lock(hashtextextended('workspace-recovery-pvc:'||row.pvc_uid,0));
+    END IF;
+    SELECT EXISTS(SELECT 1 FROM public.vm_job_cancel_retention_authorities
+        WHERE cleanup_admission_id=row.id OR superseded_admission_id=row.id) INTO protected;
+    IF TG_OP='DELETE' THEN
+        IF protected THEN RAISE EXCEPTION 'Cancel retention parent is immutable' USING ERRCODE='23514'; END IF;
+        RETURN OLD;
+    END IF;
+    IF TG_OP='UPDATE' AND (protected OR OLD.outcome='superseded_by_retention'
+        OR NEW.outcome='superseded_by_retention') AND (
+        (to_jsonb(NEW)-'completed_at'-'outcome') IS DISTINCT FROM (to_jsonb(OLD)-'completed_at'-'outcome')
+        OR (OLD.completed_at IS NOT NULL AND NEW IS DISTINCT FROM OLD)) THEN
+        RAISE EXCEPTION 'Cancel retention parent identity is immutable' USING ERRCODE='23514';
+    END IF;
+    IF NOT public.vm_job_cancel_retention_cleanup_allowed(
+        row.owner_kind,row.owner_id,row.pvc_uid,row.source,row.request_id,row.intent_digest,row.parent_admission_id,
+        (TG_OP='INSERT' AND row.source IN ('public_vm_delete','job_terminal_vm_release') AND row.parent_admission_id IS NULL)
+        OR (TG_OP='UPDATE' AND row.outcome='superseded_by_retention')) THEN
+        -- Exact retaining/superseded row completion is checked at commit below.
+        IF NOT (TG_OP='UPDATE' AND protected AND row.parent_admission_id IS NULL) THEN
+            RAISE EXCEPTION 'Cancelled Job disk is protected by retention' USING ERRCODE='23514';
+        END IF;
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+
+--
+-- Name: guard_vm_job_cancel_retention_preflight(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.guard_vm_job_cancel_retention_preflight() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $_$
+DECLARE a public.vm_job_cancel_retention_authorities%ROWTYPE;
+        p jsonb := NEW.retention_preflight;
+BEGIN
+    SELECT * INTO a FROM public.vm_job_cancel_retention_authorities WHERE cleanup_admission_id=NEW.cleanup_admission_id;
+    IF a.cleanup_admission_id IS NULL THEN RETURN NEW; END IF;
+    IF a.policy_version IN (3,4) THEN
+        IF NOT public.vm_initial_ready_stop_authorized(NEW) THEN
+            RAISE EXCEPTION 'Initial Ready stop requires committed exact custody authority' USING ERRCODE='23514';
+        END IF;
+        RETURN NEW;
+    END IF;
+    IF p IS NULL OR p->>'dv_uid' IS NULL OR p->>'dv_uid' !~ '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+       OR p->>'pvc_name' IS NULL OR length(p->>'pvc_name') NOT BETWEEN 1 AND 253
+       OR p->>'pvc_name' !~ '^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$'
+       OR p IS DISTINCT FROM jsonb_build_object('version',1,'kind','vm_cancel_retention_preflight_v1',
+           'stop_policy','cancel_retention_v1','frozen',NEW.frozen,'namespace',a.namespace,
+           'owner_id',a.job_id,'pvc_name',p->>'pvc_name','pvc_uid',a.pvc_uid,'dv_uid',p->>'dv_uid',
+           'ownership','standalone_dv','deleting',false,'consumer_scope','exact_frozen_runtime_only')
+       OR NEW.job_id IS DISTINCT FROM a.job_id OR NEW.provision_generation IS DISTINCT FROM a.provision_generation
+       OR NEW.creation_request_id IS DISTINCT FROM a.creation_request_id
+       OR NEW.reservation_id IS DISTINCT FROM a.reservation_id OR NEW.reservation_revision IS DISTINCT FROM a.reservation_revision
+       OR NEW.vm_uid IS DISTINCT FROM a.vm_uid OR NEW.vmi_uid IS DISTINCT FROM a.vmi_uid
+       OR NEW.launcher_uid IS DISTINCT FROM a.launcher_uid OR NEW.pvc_uid IS DISTINCT FROM a.pvc_uid
+       OR NEW.node_uid IS DISTINCT FROM a.node_uid OR NEW.cleanup_intent_digest IS DISTINCT FROM a.intent_digest
+       OR NEW.frozen->>'namespace' IS DISTINCT FROM a.namespace THEN
+        RAISE EXCEPTION 'Cancel retention requires exact pre-stop ownership proof' USING ERRCODE='23514';
+    END IF;
+    RETURN NEW;
+END;
+$_$;
+
+
+--
+-- Name: guard_vm_job_creation_owner(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.guard_vm_job_creation_owner() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+DECLARE expected_generations jsonb;
+        expected_attempts jsonb;
+        expected_deliveries jsonb;
+        expected_recoveries jsonb;
+BEGIN
+    IF TG_OP='DELETE' THEN
+        RAISE EXCEPTION 'Job VM audit owner is durable' USING ERRCODE='23514';
+    END IF;
+    IF TG_OP='INSERT' THEN
+        PERFORM 1 FROM public.jobs WHERE id=NEW.job_id FOR SHARE;
+        IF NOT FOUND OR NEW.live_job_id IS DISTINCT FROM NEW.job_id
+           OR NEW.deleted_at IS NOT NULL OR NEW.deletion_receipt IS NOT NULL THEN
+            RAISE EXCEPTION 'Job VM audit owner requires live Job' USING ERRCODE='23514';
+        END IF;
+        RETURN NEW;
+    END IF;
+    IF ROW(NEW.job_id,NEW.created_at) IS DISTINCT FROM ROW(OLD.job_id,OLD.created_at)
+       OR (OLD.live_job_id IS NULL AND NEW.live_job_id IS NOT NULL)
+       OR (NEW.live_job_id IS NOT NULL AND NEW.live_job_id IS DISTINCT FROM OLD.live_job_id)
+       OR (OLD.deleted_at IS NOT NULL AND
+           ROW(NEW.deleted_at,NEW.deletion_receipt) IS DISTINCT FROM
+           ROW(OLD.deleted_at,OLD.deletion_receipt))
+       OR (OLD.deleted_at IS NULL AND NEW.deleted_at IS NULL AND
+           NEW.deletion_receipt IS DISTINCT FROM OLD.deletion_receipt) THEN
+        RAISE EXCEPTION 'Job VM audit owner identity or tombstone changed' USING ERRCODE='23514';
+    END IF;
+    IF OLD.deleted_at IS NULL AND NEW.deleted_at IS NOT NULL THEN
+        SELECT COALESCE(jsonb_agg(evidence ORDER BY request_id),'[]'::jsonb)
+          INTO expected_generations FROM public.vm_job_creation_terminal_packets
+          WHERE job_id=NEW.job_id;
+        SELECT COALESCE(jsonb_agg(to_jsonb(attempt) ORDER BY lease_token),'[]'::jsonb)
+          INTO expected_attempts FROM public.worker_batch_attempts attempt
+          WHERE job_id=NEW.job_id;
+        SELECT COALESCE(jsonb_agg(to_jsonb(delivery) ORDER BY lease_token),'[]'::jsonb)
+          INTO expected_deliveries FROM public.vm_job_worker_delivery_bindings delivery
+          WHERE job_id=NEW.job_id;
+        SELECT COALESCE(jsonb_agg(to_jsonb(recovery) - 'prior_control_reference'
+            - 'prior_freeze_reference' ORDER BY recovery_id),'[]'::jsonb)
+          INTO expected_recoveries FROM public.vm_workspace_recovery_jobs recovery
+          WHERE job_id=NEW.job_id;
+        IF NEW.live_job_id IS DISTINCT FROM NEW.job_id
+           OR NEW.deletion_receipt->>'job_id' IS DISTINCT FROM NEW.job_id::text
+           OR NEW.deletion_receipt->'generations' IS DISTINCT FROM expected_generations
+           OR NEW.deletion_receipt->'worker_attempts' IS DISTINCT FROM expected_attempts
+           OR NEW.deletion_receipt->'worker_delivery_bindings' IS DISTINCT FROM expected_deliveries
+           OR NEW.deletion_receipt->'workspace_recoveries' IS DISTINCT FROM expected_recoveries THEN
+            RAISE EXCEPTION 'Job VM audit tombstone lacks exact live owner' USING ERRCODE='23514';
+        END IF;
+    END IF;
+    IF OLD.live_job_id IS NOT NULL AND NEW.live_job_id IS NULL
+       AND OLD.deleted_at IS NULL THEN
+        RAISE EXCEPTION 'Job VM audit owner cannot detach before tombstone' USING ERRCODE='23514';
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+
+--
+-- Name: guard_vm_job_pinned_cancel_retention(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.guard_vm_job_pinned_cancel_retention() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+DECLARE pending boolean;
+        held boolean;
+        settled boolean;
+BEGIN
+    pending := COALESCE(OLD.context->'_job_terminal_vm_cleanup'->>'retention_policy'='4',false);
+    SELECT EXISTS(SELECT 1 FROM public.vm_job_cancel_retention_authorities a
+        WHERE a.job_id=OLD.id AND a.policy_version=4
+          AND NOT public.vm_job_cancel_retention_discharged(a.cleanup_admission_id))
+      INTO held;
+    IF TG_OP='DELETE' THEN
+        IF pending OR held THEN
+            RAISE EXCEPTION 'Pinned Ready rootdisk requires completed typed Delete before Job deletion'
+                USING ERRCODE='23514';
+        END IF;
+        RETURN OLD;
+    END IF;
+    IF NOT pending AND NOT held THEN RETURN NEW; END IF;
+    IF NEW.execution_lane IS DISTINCT FROM 'pinned'
+       OR NEW.status IS DISTINCT FROM 'cancelled'
+       OR NEW.assigned_agent_id IS NOT NULL
+       OR NEW.user_id IS DISTINCT FROM OLD.user_id
+       OR NEW.project_id IS DISTINCT FROM OLD.project_id
+       OR NEW.parent_job_id IS DISTINCT FROM OLD.parent_job_id
+       OR NEW.context->'vm'->>'provision_generation' IS DISTINCT FROM OLD.context->'vm'->>'provision_generation'
+       OR NEW.context->'vm'->>'creation_request_id' IS DISTINCT FROM OLD.context->'vm'->>'creation_request_id'
+       OR NEW.context->'vm'->>'vm_uid' IS DISTINCT FROM OLD.context->'vm'->>'vm_uid'
+       OR NEW.context->'vm'->>'vmi_uid' IS DISTINCT FROM OLD.context->'vm'->>'vmi_uid'
+       OR NEW.context->'vm'->>'rootdisk_pvc_uid' IS DISTINCT FROM OLD.context->'vm'->>'rootdisk_pvc_uid'
+       OR NEW.context->'vm'->>'identity_authenticated' IS DISTINCT FROM OLD.context->'vm'->>'identity_authenticated'
+       OR NEW.context->'vm'->>'identity_provision_generation' IS DISTINCT FROM OLD.context->'vm'->>'identity_provision_generation'
+       OR NEW.context ? '_vm_job_retained_resume'
+       OR NEW.context ? 'worker_resume_id' THEN
+        RAISE EXCEPTION 'Pinned Ready retention owner or runtime identity changed'
+            USING ERRCODE='23514';
+    END IF;
+    IF pending THEN
+        IF NEW.context ? '_job_terminal_vm_cleanup' THEN
+            IF ((NEW.context->'_job_terminal_vm_cleanup')-'admission_id')
+                 IS DISTINCT FROM ((OLD.context->'_job_terminal_vm_cleanup')-'admission_id')
+               OR (NEW.context->'_job_terminal_vm_cleanup'->>'admission_id' IS NOT NULL
+                   AND NOT EXISTS(SELECT 1 FROM public.vm_job_cancel_retention_authorities a
+                       WHERE a.job_id=OLD.id AND a.policy_version=4
+                         AND a.cleanup_admission_id::text=
+                             NEW.context->'_job_terminal_vm_cleanup'->>'admission_id')) THEN
+                RAISE EXCEPTION 'Pinned Ready Cancel decision is immutable'
+                    USING ERRCODE='23514';
+            END IF;
+        ELSE
+            SELECT bool_and(public.vm_job_cancel_retention_settled(a.cleanup_admission_id))
+              INTO settled FROM public.vm_job_cancel_retention_authorities a
+             WHERE a.job_id=OLD.id AND a.policy_version=4;
+            IF settled IS DISTINCT FROM true
+               OR NEW.context->'vm'->>'status' IS DISTINCT FROM 'deleted'
+               OR NEW.context->'vm'->'compute_released' IS DISTINCT FROM 'true'::jsonb
+               OR NEW.context->'vm'->'disk_kept' IS DISTINCT FROM 'true'::jsonb THEN
+                RAISE EXCEPTION 'Pinned Ready marker removal lacks retained stop'
+                    USING ERRCODE='23514';
+            END IF;
+        END IF;
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+
+--
+-- Name: guard_vm_job_repository_settlement_receipt(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.guard_vm_job_repository_settlement_receipt() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+DECLARE parent public.vm_workspace_cleanup_admissions%ROWTYPE;
+        source public.vm_creation_retries%ROWTYPE;
+BEGIN
+    IF TG_OP='UPDATE' OR TG_OP='DELETE' THEN
+        RAISE EXCEPTION 'Job VM repository settlement receipt is immutable'
+            USING ERRCODE='23514';
+    END IF;
+    -- Parent-first is the settlement lock order. Final Delete holds a SHARE
+    -- lock on the parent, compatible with this reader, before its Job DELETE.
+    SELECT * INTO parent FROM public.vm_workspace_cleanup_admissions
+        WHERE id=NEW.cleanup_admission_id FOR SHARE;
+    PERFORM 1 FROM public.jobs WHERE id=NEW.job_id FOR SHARE;
+    SELECT * INTO source FROM public.vm_creation_retries
+        WHERE request_id=NEW.request_id;
+    IF parent.id IS NULL OR parent.owner_kind<>'job'
+       OR parent.owner_id IS DISTINCT FROM NEW.job_id
+       OR parent.source<>'job_terminal_vm_release'
+       OR parent.parent_admission_id IS NOT NULL OR parent.pvc_uid IS NOT NULL
+       OR parent.request_id IS DISTINCT FROM public.uuid_generate_v5(
+           public.uuid_ns_url(),
+           'vm-workspace-cleanup:job_terminal_vm_release:job:' ||
+           NEW.job_id::text || ':' || NEW.provision_generation::text || ':None:')
+       OR parent.completed_at IS NOT NULL
+       OR source.request_id IS NULL OR source.owner_kind<>'job'
+       OR source.job_id IS DISTINCT FROM NEW.job_id
+       OR source.provision_generation IS DISTINCT FROM NEW.provision_generation
+       OR source.state<>'settled' OR source.resolved_at IS NULL
+       OR NOT EXISTS (SELECT 1 FROM public.vm_job_creation_owners o
+           WHERE o.job_id=NEW.job_id AND o.live_job_id=NEW.job_id
+             AND o.deleted_at IS NULL)
+       OR NOT public.job_vm_never_issued_repository_safe(NEW.job_id)
+       OR public.vm_job_repository_receipt_pair(NEW)
+          IS DISTINCT FROM public.job_vm_repository_pair_evidence(NEW.job_id) THEN
+        RAISE EXCEPTION 'Job VM repository settlement receipt lacks exact live source'
+            USING ERRCODE='23514';
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+
+--
+-- Name: guard_vm_job_retained_create_effect(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.guard_vm_job_retained_create_effect() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+DECLARE r public.vm_creation_retries%ROWTYPE;
+        parent public.vm_workspace_cleanup_admissions%ROWTYPE;
+BEGIN
+    SELECT * INTO r FROM public.vm_creation_retries WHERE request_id=NEW.request_id;
+    IF r.job_retained_resume_id IS NULL THEN RETURN NEW; END IF;
+    PERFORM pg_advisory_xact_lock(hashtextextended('workspace-recovery:job:'||r.job_id,0));
+    PERFORM pg_advisory_xact_lock(hashtextextended('workspace-recovery-pvc:'||r.expected_pvc_uid,0));
+    PERFORM 1 FROM public.run_queue WHERE unit_id=r.job_id FOR UPDATE;
+    PERFORM 1 FROM public.jobs WHERE id=r.job_id FOR UPDATE;
+    SELECT * INTO r FROM public.vm_creation_retries WHERE request_id=NEW.request_id FOR UPDATE;
+    SELECT * INTO parent FROM public.vm_workspace_cleanup_admissions WHERE id=r.creation_admission_id;
+    IF NOT EXISTS(SELECT 1 FROM public.jobs j WHERE j.id=r.job_id
+        AND j.status IN ('created','paused','failed') AND j.assigned_agent_id IS NULL
+        AND NOT j.context ?| ARRAY['_stateless_cancel_cleanup_pending','_stateless_delete_pending','_completion_control_claim']) THEN
+        RAISE EXCEPTION 'Retained Resume effect requires committed live authority' USING ERRCODE='23514';
+    END IF;
+    IF r.state IS DISTINCT FROM 'reconciling' OR r.claim_token IS NULL OR r.claim_expires_at<=clock_timestamp()
+       OR parent.id IS NULL OR parent.completed_at IS NOT NULL
+       OR parent.retained_resume_admitted_xact_id IS NULL OR parent.retained_resume_admitted_xact_id=pg_current_xact_id()
+       OR NOT public.vm_job_retained_creation_allowed(r.job_id,r.expected_pvc_uid,parent.request_id,parent.intent_digest) THEN
+        RAISE EXCEPTION 'Retained Resume effect requires committed live authority' USING ERRCODE='23514';
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+
+--
+-- Name: guard_vm_job_retained_disk_purge_parent(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.guard_vm_job_retained_disk_purge_parent() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+DECLARE retained boolean;
+BEGIN
+    IF TG_OP='UPDATE' AND (
+        (NEW.id,NEW.owner_kind,NEW.owner_id,NEW.pvc_uid,NEW.source,NEW.request_id,
+         NEW.intent_digest,NEW.parent_admission_id,NEW.admitted_at) IS DISTINCT FROM
+        (OLD.id,OLD.owner_kind,OLD.owner_id,OLD.pvc_uid,OLD.source,OLD.request_id,
+         OLD.intent_digest,OLD.parent_admission_id,OLD.admitted_at)
+        OR (OLD.completed_at IS NOT NULL AND NEW IS DISTINCT FROM OLD)) THEN
+        RAISE EXCEPTION 'Job retained disk purge parent identity is immutable'
+            USING ERRCODE='23514';
+    END IF;
+    IF NEW.owner_kind<>'job' OR NEW.source<>'public_vm_delete'
+       OR NEW.pvc_uid IS NULL OR NEW.completed_at IS NULL THEN
+        RETURN NEW;
+    END IF;
+    SELECT EXISTS (
+        SELECT 1 FROM public.vm_resource_cleanup_stop_receipts s
+        JOIN public.vm_workspace_cleanup_admissions predecessor_parent
+          ON predecessor_parent.id=s.cleanup_admission_id
+        JOIN public.vm_resource_reservations charge ON charge.id=s.reservation_id
+        WHERE s.job_id=NEW.owner_id AND s.pvc_uid=NEW.pvc_uid
+          AND predecessor_parent.owner_kind='job'
+          AND predecessor_parent.owner_id=NEW.owner_id
+          AND predecessor_parent.completed_at IS NOT NULL
+          AND predecessor_parent.outcome='completed'
+          AND charge.state='released'
+          AND s.stop_evidence->>'pvc_disposition'='retained'
+    ) INTO retained;
+    IF retained THEN
+        IF NEW.outcome IS DISTINCT FROM 'completed' THEN
+            RAISE EXCEPTION 'Job retained disk purge cannot settle without proof'
+                USING ERRCODE='23514';
+        END IF;
+        PERFORM public.validate_vm_job_retained_disk_purge(NEW.id,true);
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+
+--
+-- Name: guard_vm_job_retained_disk_purge_receipt_insert(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.guard_vm_job_retained_disk_purge_receipt_insert() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+DECLARE d public.vm_job_retained_disk_purge_authorities%ROWTYPE;
+        r public.vm_creation_retries%ROWTYPE;
+BEGIN
+    PERFORM public.validate_vm_job_retained_disk_purge(NEW.cleanup_admission_id,false);
+    SELECT * INTO d FROM public.vm_job_retained_disk_purge_authorities
+      WHERE cleanup_admission_id=NEW.cleanup_admission_id;
+    SELECT * INTO r FROM public.vm_creation_retries
+      WHERE request_id=d.final_request_id;
+    IF NEW.chain_digest IS DISTINCT FROM public.vm_job_retained_disk_purge_chain_digest(NEW.cleanup_admission_id)
+       OR NEW.purge_evidence IS DISTINCT FROM (jsonb_build_object(
+           'version',1,'kind','vm_cleanup_physical_stop','job_id',d.job_id,
+           'provision_generation',d.provision_generation,'vm_uid',d.vm_uid,
+           'vmi_uid',d.vmi_uid,'launcher_uid',d.launcher_uid,'pvc_uid',d.pvc_uid,
+           'vm_absent',true,'vmi_absent',true,'launcher_absent',true,
+           'same_generation_replacement',false,'controller_authenticated',true,
+           'pvc_disposition','purged',
+           'controller_scope',jsonb_build_object(
+               'version',1,'namespace',r.controller_configuration->>'namespace',
+               'cluster_id',r.controller_configuration->'resource_admission'->>'cluster_id')) ||
+           CASE WHEN d.binding_kind='bound'
+               THEN jsonb_build_object('captured_workspace_storage',
+                   jsonb_set(r.canonical_request->'workspace_storage',
+                       '{pvc_uid}',to_jsonb(d.pvc_uid::text),true))
+               ELSE '{}'::jsonb END) THEN
+        RAISE EXCEPTION 'Job retained disk purge receipt lacks exact authority'
+            USING ERRCODE='23514',CONSTRAINT='vm_job_retained_purge_receipt';
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+
+--
+-- Name: guard_vm_job_retained_disk_purge_row(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.guard_vm_job_retained_disk_purge_row() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+BEGIN
+    IF TG_OP<>'INSERT' THEN
+        RAISE EXCEPTION 'Job retained disk purge evidence is append-only'
+            USING ERRCODE='23514';
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+
+--
+-- Name: guard_vm_job_retained_execution(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.guard_vm_job_retained_execution() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+DECLARE old_execution uuid;
+        new_execution uuid;
+        old_job uuid;
+        new_job uuid;
+BEGIN
+    IF TG_TABLE_NAME='srw_execution_specs' THEN
+        IF OLD.work_kind='Job' THEN old_job := OLD.work_id; END IF;
+        IF TG_OP='UPDATE' AND NEW.work_kind='Job' THEN new_job := NEW.work_id; END IF;
+    ELSIF TG_TABLE_NAME='srw_workspace_instances' THEN
+        old_execution := OLD.execution_id;
+        IF TG_OP='UPDATE' THEN new_execution := NEW.execution_id; END IF;
+        SELECT x.work_id INTO old_job FROM public.srw_execution_workspace_bindings b
+          JOIN public.srw_execution_specs x ON x.id=b.execution_id
+          WHERE b.instance_id=OLD.id AND x.work_kind='Job' LIMIT 1;
+        IF old_job IS NULL AND EXISTS (
+            SELECT 1 FROM public.vm_job_creation_owners WHERE job_id=OLD.owner_id
+        ) THEN
+            old_job := OLD.owner_id;
+        END IF;
+        IF TG_OP='UPDATE' AND EXISTS (
+            SELECT 1 FROM public.vm_job_creation_owners WHERE job_id=NEW.owner_id
+        ) THEN
+            new_job := NEW.owner_id;
+        END IF;
+    ELSE
+        old_execution := OLD.execution_id;
+        IF TG_OP='UPDATE' THEN new_execution := NEW.execution_id; END IF;
+    END IF;
+    IF old_job IS NULL AND old_execution IS NOT NULL THEN
+        SELECT work_id INTO old_job FROM public.srw_execution_specs
+          WHERE id=old_execution AND work_kind='Job';
+    END IF;
+    IF new_execution IS NOT NULL THEN
+        SELECT work_id INTO new_job FROM public.srw_execution_specs
+          WHERE id=new_execution AND work_kind='Job';
+    END IF;
+    IF (TG_OP='DELETE' OR NEW IS DISTINCT FROM OLD)
+       AND (EXISTS (SELECT 1 FROM public.vm_job_creation_owners
+               WHERE job_id=old_job AND live_job_id IS NULL)
+            OR EXISTS (SELECT 1 FROM public.vm_job_creation_owners
+               WHERE job_id=new_job AND live_job_id IS NULL)) THEN
+        RAISE EXCEPTION 'retired Job VM execution evidence is immutable'
+            USING ERRCODE='23514';
+    END IF;
+    IF TG_OP='DELETE' THEN RETURN OLD; END IF;
+    RETURN NEW;
+END;
+$$;
+
+
+--
+-- Name: guard_vm_job_retained_ledger(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.guard_vm_job_retained_ledger() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $_$
+DECLARE candidate jsonb;
+        old_candidate jsonb;
+        owned_job uuid;
+        old_owned_job uuid;
+        source_request uuid;
+        owner_live uuid;
+        owner_deleted timestamptz;
+        checkpoint_keep text;
+        checkpoint_digest text;
+BEGIN
+    IF TG_OP='UPDATE' THEN
+        old_candidate := to_jsonb(OLD);
+        IF TG_TABLE_NAME='vm_workspace_cleanup_admissions'
+           OR TG_TABLE_NAME='managed_repository_process_zero_receipts' THEN
+            IF old_candidate->>'owner_kind'='job' THEN
+                old_owned_job := (old_candidate->>'owner_id')::uuid;
+            END IF;
+        ELSIF TG_TABLE_NAME='vm_resource_cleanup_stop_receipts' THEN
+            old_owned_job := (old_candidate->>'job_id')::uuid;
+        ELSIF TG_TABLE_NAME='vm_resource_recovery_successors' THEN
+            old_owned_job := (old_candidate->>'owner_id')::uuid;
+        ELSIF TG_TABLE_NAME='vm_creation_retries'
+           OR TG_TABLE_NAME='vm_resource_waiters' THEN
+            IF old_candidate->>'owner_kind'='job' THEN
+                old_owned_job := (old_candidate->>'job_id')::uuid;
+            END IF;
+        ELSE
+            SELECT r.job_id INTO old_owned_job FROM public.vm_creation_retries r
+            WHERE r.request_id=(old_candidate->>'request_id')::uuid
+              AND r.owner_kind='job';
+        END IF;
+        IF NEW IS DISTINCT FROM OLD AND old_owned_job IS NOT NULL
+           AND EXISTS (SELECT 1 FROM public.vm_job_creation_owners
+               WHERE job_id=old_owned_job AND live_job_id IS NULL) THEN
+            RAISE EXCEPTION 'retired Job VM evidence is immutable'
+                USING ERRCODE='23514';
+        END IF;
+    END IF;
+    candidate := CASE WHEN TG_OP='DELETE' THEN to_jsonb(OLD) ELSE to_jsonb(NEW) END;
+    IF TG_TABLE_NAME='vm_workspace_cleanup_admissions'
+       OR TG_TABLE_NAME='managed_repository_process_zero_receipts' THEN
+        IF candidate->>'owner_kind'='job' THEN owned_job := (candidate->>'owner_id')::uuid; END IF;
+    ELSIF TG_TABLE_NAME='vm_resource_cleanup_stop_receipts' THEN
+        owned_job := (candidate->>'job_id')::uuid;
+    ELSIF TG_TABLE_NAME='vm_resource_recovery_successors' THEN
+        owned_job := (candidate->>'owner_id')::uuid;
+    ELSIF TG_TABLE_NAME='vm_creation_retries' OR TG_TABLE_NAME='vm_resource_waiters' THEN
+        IF candidate->>'owner_kind'='job' THEN owned_job := (candidate->>'job_id')::uuid; END IF;
+    ELSE
+        source_request := (candidate->>'request_id')::uuid;
+        SELECT r.job_id INTO owned_job FROM public.vm_creation_retries r
+            WHERE r.request_id=source_request AND r.owner_kind='job';
+    END IF;
+    IF owned_job IS NULL THEN
+        IF TG_OP='DELETE' THEN RETURN OLD; END IF;
+        RETURN NEW;
+    END IF;
+    IF TG_OP='INSERT' THEN
+        -- An existing stable owner serializes with final Delete's tombstone.
+        -- Avoid locking the foreign Job while a waiter writer holds its policy
+        -- row: admission may need that policy before it can inspect the Job.
+        SELECT live_job_id,deleted_at INTO owner_live,owner_deleted
+          FROM public.vm_job_creation_owners WHERE job_id=owned_job FOR SHARE;
+        IF FOUND THEN
+            IF owner_live IS DISTINCT FROM owned_job OR owner_deleted IS NOT NULL THEN
+                RAISE EXCEPTION 'retired Job VM owner cannot acquire obligations' USING ERRCODE='23514';
+            END IF;
+            RETURN NEW;
+        END IF;
+        -- A UUID checkpoint thread can outlive its Job without carrying any
+        -- VM/PVC obligation. Only the exact checkpoint producer's source and
+        -- digest qualify, and prior VM/recovery/cleanup history excludes it.
+        IF TG_TABLE_NAME='vm_workspace_cleanup_admissions'
+           AND candidate->>'owner_kind'='job'
+           AND candidate->>'pvc_uid' IS NULL
+           AND candidate->>'parent_admission_id' IS NULL THEN
+            IF candidate->>'source'='terminal_checkpoint_prune' THEN
+                checkpoint_digest := 'sha256:' || encode(sha256(convert_to(
+                    format('{"mode":"delete_thread","resource":"checkpoint_thread","thread_id":"%s"}',owned_job),
+                    'UTF8')),'hex');
+            ELSIF candidate->>'source' ~
+                ('^checkpoint_retention_prune:v1:thread:' || owned_job::text || ':keep:[1-9][0-9]*$') THEN
+                checkpoint_keep := split_part(candidate->>'source',':',6);
+                checkpoint_digest := 'sha256:' || encode(sha256(convert_to(
+                    format('{"keep_n":%s,"mode":"keep_last","resource":"checkpoint_thread","thread_id":"%s"}',
+                        checkpoint_keep,owned_job),'UTF8')),'hex');
+            END IF;
+            IF checkpoint_digest IS NOT NULL
+               AND candidate->>'intent_digest'=checkpoint_digest
+               AND NOT EXISTS (SELECT 1 FROM public.vm_creation_retries
+                   WHERE owner_kind='job' AND job_id=owned_job)
+               AND NOT EXISTS (SELECT 1 FROM public.vm_workspace_recoveries
+                   WHERE owner_kind='job' AND owner_id=owned_job)
+               AND NOT EXISTS (SELECT 1 FROM public.vm_workspace_recovery_jobs
+                   WHERE job_id=owned_job)
+               AND NOT EXISTS (SELECT 1 FROM public.vm_workspace_cleanup_admissions prior
+                   WHERE prior.owner_kind='job' AND prior.owner_id=owned_job
+                     AND (prior.pvc_uid IS NOT NULL OR prior.parent_admission_id IS NOT NULL
+                       OR prior.intent_digest IS DISTINCT FROM CASE
+                           WHEN prior.source='terminal_checkpoint_prune' THEN
+                               'sha256:' || encode(sha256(convert_to(
+                                   format('{"mode":"delete_thread","resource":"checkpoint_thread","thread_id":"%s"}',
+                                       owned_job),'UTF8')),'hex')
+                           WHEN prior.source ~ ('^checkpoint_retention_prune:v1:thread:' ||
+                               owned_job::text || ':keep:[1-9][0-9]*$') THEN
+                               'sha256:' || encode(sha256(convert_to(
+                                   format('{"keep_n":%s,"mode":"keep_last","resource":"checkpoint_thread","thread_id":"%s"}',
+                                       split_part(prior.source,':',6),owned_job),'UTF8')),'hex')
+                           ELSE NULL
+                       END))
+               AND NOT EXISTS (SELECT 1 FROM public.jobs WHERE id=owned_job) THEN
+                RETURN NEW;
+            END IF;
+        END IF;
+        -- The first ordinary cleanup permit may precede its VM retry. Lock
+        -- the live Job, then recheck for an owner created during that wait.
+        PERFORM 1 FROM public.jobs WHERE id=owned_job FOR SHARE;
+        IF NOT FOUND THEN RAISE EXCEPTION 'retired Job VM owner cannot acquire obligations' USING ERRCODE='23514'; END IF;
+        SELECT live_job_id,deleted_at INTO owner_live,owner_deleted
+          FROM public.vm_job_creation_owners WHERE job_id=owned_job FOR SHARE;
+        IF FOUND AND (owner_live IS DISTINCT FROM owned_job OR owner_deleted IS NOT NULL) THEN
+            RAISE EXCEPTION 'retired Job VM owner cannot acquire obligations' USING ERRCODE='23514';
+        END IF;
+    ELSIF (TG_OP='DELETE' OR NEW IS DISTINCT FROM OLD)
+      AND EXISTS (SELECT 1 FROM public.vm_job_creation_owners
+          WHERE job_id=owned_job AND live_job_id IS NULL) THEN
+        RAISE EXCEPTION 'retired Job VM evidence is immutable' USING ERRCODE='23514';
+    END IF;
+    IF TG_OP='DELETE' THEN RETURN OLD; END IF;
+    RETURN NEW;
+END;
+$_$;
+
+
+--
+-- Name: guard_vm_job_retained_resume(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.guard_vm_job_retained_resume() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+DECLARE j public.jobs%ROWTYPE;
+        a public.vm_job_cancel_retention_authorities%ROWTYPE;
+        root public.vm_job_cancel_retention_authorities%ROWTYPE;
+        r public.vm_creation_retries%ROWTYPE;
+        q public.run_queue%ROWTYPE;
+        previous public.vm_job_retained_resumes%ROWTYPE;
+        terminal public.vm_job_retained_resume_terminals%ROWTYPE;
+BEGIN
+    IF TG_OP<>'INSERT' THEN
+        RAISE EXCEPTION 'Retained Job Resume is append-only' USING ERRCODE='23514';
+    END IF;
+    NEW.admitted_xact_id := pg_current_xact_id();
+    PERFORM pg_advisory_xact_lock(hashtextextended('workspace-recovery:job:'||NEW.job_id,0));
+    PERFORM pg_advisory_xact_lock(hashtextextended('workspace-recovery-pvc:'||NEW.pvc_uid,0));
+    SELECT * INTO q FROM public.run_queue WHERE unit_id=NEW.job_id FOR UPDATE;
+    SELECT * INTO j FROM public.jobs WHERE id=NEW.job_id FOR UPDATE;
+    SELECT * INTO a FROM public.vm_job_cancel_retention_authorities WHERE cleanup_admission_id=NEW.physical_cleanup_admission_id;
+    SELECT * INTO root FROM public.vm_job_cancel_retention_authorities WHERE cleanup_admission_id=NEW.root_retention_admission_id;
+    SELECT * INTO r FROM public.vm_creation_retries WHERE request_id=a.creation_request_id FOR SHARE;
+    IF j.id IS NULL OR j.user_id IS DISTINCT FROM NEW.requested_by
+       OR j.status NOT IN ('cancelled','failed','paused') OR j.execution_lane IS DISTINCT FROM 'stateless'
+       OR j.assigned_agent_id IS NOT NULL OR j.parent_job_id IS NOT NULL
+       OR COALESCE(j.context->'inherits_parent_workspace','false'::jsonb)<>'false'::jsonb
+       OR j.context ?| ARRAY['_stateless_cancel_cleanup_pending','_stateless_delete_pending','_completion_control_claim','_worker_execution_hold']
+       OR a.cleanup_admission_id IS NULL OR a.job_id IS DISTINCT FROM NEW.job_id
+       OR a.pvc_uid IS DISTINCT FROM NEW.pvc_uid OR root.job_id IS DISTINCT FROM NEW.job_id
+       OR root.pvc_uid IS DISTINCT FROM NEW.pvc_uid
+       OR public.vm_job_cancel_retention_discharged(root.cleanup_admission_id)
+       OR NOT public.vm_job_cancel_retention_settled(a.cleanup_admission_id)
+       OR NEW.predecessor_request_id IS DISTINCT FROM a.creation_request_id
+       OR NEW.predecessor_generation IS DISTINCT FROM a.provision_generation
+       OR NEW.source_revision IS DISTINCT FROM r.revision
+       OR r.request_id IS NULL OR (r.state IS DISTINCT FROM 'succeeded'
+           AND NOT (r.state='settled' AND a.policy_version=1
+               AND public.vm_cancel_late_adopted_retained_terminal(a.cleanup_admission_id)))
+       OR COALESCE(r.canonical_request->'workspace_storage','null'::jsonb)<>'null'::jsonb
+       OR q.unit_id IS NULL OR q.unit_kind IS DISTINCT FROM 'worker_batch' OR q.state IS DISTINCT FROM 'done'
+       OR q.leased_by IS NOT NULL OR q.leased_until IS NOT NULL
+       OR NEW.retained_vm->>'status' IS DISTINCT FROM 'deleted'
+       OR NEW.retained_vm->'identity_authenticated' IS DISTINCT FROM 'true'::jsonb
+       OR NEW.retained_vm->>'provision_generation' IS DISTINCT FROM a.provision_generation::text
+       OR NEW.retained_vm->>'identity_provision_generation' IS DISTINCT FROM a.provision_generation::text
+       OR NEW.retained_vm->>'vm_uid' IS DISTINCT FROM a.vm_uid::text
+       OR NEW.retained_vm->>'rootdisk_pvc_uid' IS DISTINCT FROM a.pvc_uid::text
+       OR COALESCE(NEW.retained_vm->'workspace_storage','null'::jsonb)<>'null'::jsonb
+       OR EXISTS (SELECT 1 FROM public.vm_creation_retries source WHERE source.request_id=NEW.request_id OR source.provision_generation=NEW.provision_generation)
+       OR EXISTS (SELECT 1 FROM public.vm_workspace_cleanup_admissions c WHERE c.completed_at IS NULL
+           AND ((c.owner_kind='job' AND c.owner_id=NEW.job_id) OR c.pvc_uid=NEW.pvc_uid))
+       OR EXISTS (SELECT 1 FROM public.vm_workspace_recoveries recovery WHERE recovery.resolved_at IS NULL
+           AND ((recovery.owner_kind='job' AND recovery.owner_id=NEW.job_id) OR recovery.root_pvc_uid=NEW.pvc_uid))
+       OR EXISTS (SELECT 1 FROM public.vm_workspace_recovery_retention_pins pin WHERE pin.pvc_uid=NEW.pvc_uid AND pin.released_at IS NULL)
+       OR EXISTS (SELECT 1 FROM public.vm_idle_access_leases lease WHERE lease.owner_kind='job' AND lease.owner_id=NEW.job_id
+           AND lease.closed_at IS NULL AND lease.expires_at>clock_timestamp())
+       OR EXISTS (SELECT 1 FROM public.vm_idle_operations idle WHERE idle.owner_kind='job' AND idle.owner_id=NEW.job_id AND idle.closed_at IS NULL)
+       OR EXISTS (SELECT 1 FROM public.vm_resource_reservations charge JOIN public.vm_creation_retries source USING(request_id)
+           WHERE source.owner_kind='job' AND source.job_id=NEW.job_id AND charge.state<>'released')
+       OR EXISTS (SELECT 1 FROM public.vm_creation_effects effect JOIN public.vm_creation_retries source USING(request_id)
+           WHERE source.owner_kind='job' AND source.job_id=NEW.job_id AND effect.state='issued') THEN
+        RAISE EXCEPTION 'Retained Job Resume authority is unproven' USING ERRCODE='23514';
+    END IF;
+    IF NEW.predecessor_terminal_id IS NULL THEN
+        IF NEW.physical_cleanup_admission_id IS DISTINCT FROM NEW.root_retention_admission_id
+           OR NEW.retained_vm IS DISTINCT FROM j.context->'vm'
+           OR j.context ? '_vm_job_retained_resume'
+           OR EXISTS (SELECT 1 FROM public.vm_creation_retries later WHERE later.owner_kind='job' AND later.job_id=NEW.job_id
+               AND (later.created_at,later.request_id)>(r.created_at,r.request_id)) THEN
+            RAISE EXCEPTION 'Retained Job Resume predecessor changed' USING ERRCODE='23514';
+        END IF;
+    ELSE
+        SELECT * INTO terminal FROM public.vm_job_retained_resume_terminals WHERE id=NEW.predecessor_terminal_id;
+        SELECT * INTO previous FROM public.vm_job_retained_resumes WHERE id=terminal.resume_id;
+        IF terminal.id IS NULL OR previous.job_id IS DISTINCT FROM NEW.job_id
+           OR previous.root_retention_admission_id IS DISTINCT FROM NEW.root_retention_admission_id
+           OR previous.pvc_uid IS DISTINCT FROM NEW.pvc_uid
+           OR terminal.physical_cleanup_admission_id IS DISTINCT FROM NEW.physical_cleanup_admission_id
+           OR j.context->>'_vm_job_retained_resume' IS DISTINCT FROM previous.id::text
+           OR (terminal.terminal_kind<>'kept_compute' AND NEW.retained_vm IS DISTINCT FROM previous.retained_vm) THEN
+            RAISE EXCEPTION 'Retained Job Resume terminal changed' USING ERRCODE='23514';
+        END IF;
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+
+--
+-- Name: guard_vm_job_retained_resume_source(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.guard_vm_job_retained_resume_source() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+DECLARE op public.vm_job_retained_resumes%ROWTYPE;
+        predecessor public.vm_creation_retries%ROWTYPE;
+        j public.jobs%ROWTYPE;
+        protected boolean;
+BEGIN
+    IF TG_OP='UPDATE' THEN
+        IF ROW(NEW.job_retained_resume_id,NEW.job_retained_resume_admitted_xact_id)
+           IS DISTINCT FROM ROW(OLD.job_retained_resume_id,OLD.job_retained_resume_admitted_xact_id) THEN
+            RAISE EXCEPTION 'Retained Job source link is immutable' USING ERRCODE='23514';
+        END IF;
+        RETURN NEW;
+    END IF;
+    IF NEW.owner_kind='job' THEN
+        PERFORM pg_advisory_xact_lock(hashtextextended('workspace-recovery:job:'||NEW.job_id,0));
+    END IF;
+    IF NEW.expected_pvc_uid IS NOT NULL THEN
+        PERFORM pg_advisory_xact_lock(hashtextextended('workspace-recovery-pvc:'||NEW.expected_pvc_uid,0));
+    END IF;
+    SELECT EXISTS(SELECT 1 FROM public.vm_job_cancel_retention_authorities a
+        WHERE ((NEW.owner_kind='job' AND a.job_id=NEW.job_id) OR a.pvc_uid=NEW.expected_pvc_uid)
+          AND NOT public.vm_job_cancel_retention_discharged(a.cleanup_admission_id)) INTO protected;
+    IF NEW.job_retained_resume_id IS NULL AND NOT protected THEN RETURN NEW; END IF;
+    SELECT * INTO op FROM public.vm_job_retained_resumes WHERE id=NEW.job_retained_resume_id;
+    SELECT * INTO j FROM public.jobs WHERE id=NEW.job_id;
+    SELECT * INTO predecessor FROM public.vm_creation_retries WHERE request_id=op.predecessor_request_id;
+    IF NEW.owner_kind IS DISTINCT FROM 'job' OR NEW.origin IS DISTINCT FROM 'resume'
+       OR op.id IS NULL OR op.job_id IS DISTINCT FROM NEW.job_id
+       OR op.request_id IS DISTINCT FROM NEW.request_id OR op.provision_generation IS DISTINCT FROM NEW.provision_generation
+       OR op.pvc_uid IS DISTINCT FROM NEW.expected_pvc_uid
+       OR op.physical_cleanup_admission_id IS DISTINCT FROM NEW.predecessor_cleanup_admission_id
+       OR j.id IS NULL OR j.context->>'_vm_job_retained_resume' IS DISTINCT FROM op.id::text
+       OR j.context->'vm'->>'provision_generation' IS DISTINCT FROM op.provision_generation::text
+       OR j.context->>'_vm_creation_pending' IS DISTINCT FROM op.request_id::text
+       OR j.status NOT IN ('created','paused','failed') OR j.assigned_agent_id IS NOT NULL
+       OR j.context ?| ARRAY['_stateless_cancel_cleanup_pending','_stateless_delete_pending','_completion_control_claim']
+       OR NEW.canonical_request-'provision_generation' IS DISTINCT FROM predecessor.canonical_request-'provision_generation'
+       OR COALESCE(NEW.canonical_request->'workspace_storage','null'::jsonb)<>'null'::jsonb
+       OR EXISTS(SELECT 1 FROM public.vm_job_retained_resume_terminals WHERE resume_id=op.id)
+       OR NOT public.vm_job_cancel_retention_settled(op.physical_cleanup_admission_id)
+       OR public.vm_job_cancel_retention_discharged(op.root_retention_admission_id) THEN
+        RAISE EXCEPTION 'Retained Job creation requires its live explicit Resume' USING ERRCODE='23514';
+    END IF;
+    NEW.job_retained_resume_admitted_xact_id := pg_current_xact_id();
+    RETURN NEW;
+END;
+$$;
+
+
+--
+-- Name: guard_vm_job_retained_resume_terminal(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.guard_vm_job_retained_resume_terminal() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+DECLARE op public.vm_job_retained_resumes%ROWTYPE;
+        proof jsonb;
+BEGIN
+    IF TG_OP<>'INSERT' THEN
+        RAISE EXCEPTION 'Retained Job terminal is append-only' USING ERRCODE='23514';
+    END IF;
+    NEW.admitted_xact_id := pg_current_xact_id();
+    SELECT * INTO op FROM public.vm_job_retained_resumes WHERE id=NEW.resume_id;
+    PERFORM pg_advisory_xact_lock(hashtextextended('workspace-recovery:job:'||op.job_id,0));
+    PERFORM pg_advisory_xact_lock(hashtextextended('workspace-recovery-pvc:'||op.pvc_uid,0));
+    PERFORM 1 FROM public.run_queue WHERE unit_id=op.job_id FOR UPDATE;
+    PERFORM 1 FROM public.jobs WHERE id=op.job_id FOR UPDATE;
+    IF NEW.terminal_kind='source_absent' THEN
+        proof := public.vm_job_retained_source_absent_evidence(op.id);
+    ELSIF NEW.terminal_kind='kept_compute' THEN
+        proof := public.vm_job_retained_kept_evidence(op.id);
+    ELSE
+        proof := public.vm_job_retained_noeffect_evidence(op.id);
+        IF proof->>'terminal_kind' IS DISTINCT FROM NEW.terminal_kind THEN proof := NULL; END IF;
+    END IF;
+    IF op.id IS NULL OR proof IS NULL OR NEW.evidence IS DISTINCT FROM proof
+       OR NEW.allocated_request_id IS DISTINCT FROM op.request_id
+       OR NEW.physical_cleanup_admission_id::text IS DISTINCT FROM proof->>'physical_cleanup_admission_id'
+       OR (NEW.terminal_kind<>'source_absent' AND NEW.source_request_id IS DISTINCT FROM op.request_id)
+       OR public.vm_job_cancel_retention_discharged(op.root_retention_admission_id)
+       OR NOT public.vm_job_retained_terminal_authorized(op.job_id) THEN
+        RAISE EXCEPTION 'Retained Job terminal source is unproven' USING ERRCODE='23514';
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+
+--
+-- Name: guard_vm_job_retained_stop_authority(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.guard_vm_job_retained_stop_authority() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $_$
+DECLARE r public.vm_creation_retries%ROWTYPE;
+        op public.vm_job_retained_resumes%ROWTYPE;
+        p jsonb := NEW.ready_retention_preflight;
+BEGIN
+    NEW.admitted_xact_id := pg_current_xact_id();
+    IF NEW.policy_version=1 THEN RETURN NEW; END IF;
+    SELECT * INTO r FROM public.vm_creation_retries WHERE request_id=NEW.creation_request_id;
+    IF NEW.policy_version IN (3,4) THEN
+        IF NEW.job_retained_resume_id IS NOT NULL OR r.job_retained_resume_id IS NOT NULL
+           OR r.ready_at IS NULL OR r.request_id IS NULL
+           OR r.job_id IS DISTINCT FROM NEW.job_id
+           OR r.provision_generation IS DISTINCT FROM NEW.provision_generation
+           OR r.observed_vm_uid IS DISTINCT FROM NEW.vm_uid
+           OR r.observed_pvc_uid IS DISTINCT FROM NEW.pvc_uid
+           OR p IS NULL OR p->>'dv_uid' IS NULL
+           OR p->>'dv_uid' !~ '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+           OR p->>'pvc_name' IS DISTINCT FROM 'agent-vm-'||NEW.job_id||'-rootdisk'
+           OR p IS DISTINCT FROM jsonb_build_object('version',1,'kind','vm_job_initial_ready_preflight_v1',
+               'stop_policy','initial_ready_cancel_v1','frozen',public.vm_job_retained_ready_candidate(NEW),
+               'namespace',NEW.namespace,'owner_id',NEW.job_id,'pvc_name',p->>'pvc_name','pvc_uid',NEW.pvc_uid,
+               'dv_uid',p->>'dv_uid','ownership','standalone_dv','deleting',false,
+               'consumer_scope','exact_frozen_runtime_only') THEN
+            RAISE EXCEPTION 'Initial Ready retention requires exact immutable preflight' USING ERRCODE='23514';
+        END IF;
+        RETURN NEW;
+    END IF;
+    SELECT * INTO op FROM public.vm_job_retained_resumes WHERE id=NEW.job_retained_resume_id;
+    IF op.id IS NULL OR r.job_retained_resume_id IS DISTINCT FROM op.id
+       OR r.request_id IS DISTINCT FROM op.request_id OR r.job_id IS DISTINCT FROM NEW.job_id
+       OR op.provision_generation IS DISTINCT FROM NEW.provision_generation
+       OR op.pvc_uid IS DISTINCT FROM NEW.pvc_uid
+       OR (r.ready_at IS NULL AND p IS NOT NULL)
+       OR (r.ready_at IS NOT NULL AND (
+           p IS NULL OR p->>'dv_uid' IS NULL
+           OR p->>'dv_uid' !~ '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+           OR p->>'pvc_name' IS NULL OR length(p->>'pvc_name') NOT BETWEEN 1 AND 253
+           OR p->>'pvc_name' !~ '^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$'
+           OR p IS DISTINCT FROM jsonb_build_object('version',1,'kind','vm_job_retained_ready_preflight_v1',
+               'stop_policy','retained_ready_continuation_v1','frozen',public.vm_job_retained_ready_candidate(NEW),
+               'namespace',NEW.namespace,'owner_id',NEW.job_id,'pvc_name',p->>'pvc_name','pvc_uid',NEW.pvc_uid,
+               'dv_uid',p->>'dv_uid','ownership','standalone_dv','deleting',false,
+               'consumer_scope','exact_frozen_runtime_only'))) THEN
+        RAISE EXCEPTION 'Retained continuation requires exact immutable stop preflight' USING ERRCODE='23514';
+    END IF;
+    RETURN NEW;
+END;
+$_$;
+
+
+--
+-- Name: guard_vm_job_terminal_packet(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.guard_vm_job_terminal_packet() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+DECLARE exact jsonb;
+BEGIN
+    IF TG_OP='UPDATE' OR TG_OP='DELETE' THEN
+        RAISE EXCEPTION 'Job VM terminal packet is immutable' USING ERRCODE='23514';
+    END IF;
+    PERFORM 1 FROM public.jobs WHERE id=NEW.job_id FOR SHARE;
+    IF NOT FOUND THEN RAISE EXCEPTION 'Job VM terminal packet needs live Job' USING ERRCODE='23514'; END IF;
+    PERFORM 1 FROM public.vm_job_creation_owners
+      WHERE job_id=NEW.job_id AND live_job_id=NEW.job_id AND deleted_at IS NULL FOR SHARE;
+    IF NOT FOUND THEN RAISE EXCEPTION 'Job VM audit owner is retired' USING ERRCODE='23514'; END IF;
+    exact := public.vm_job_terminal_packet_evidence(NEW.request_id);
+    IF exact IS NULL OR NEW.evidence IS DISTINCT FROM exact
+       OR NEW.job_id::text IS DISTINCT FROM exact->>'job_id'
+       OR NEW.provision_generation::text IS DISTINCT FROM exact->>'provision_generation'
+       OR NEW.terminal_kind IS DISTINCT FROM exact->>'kind'
+       OR NEW.cleanup_admission_id::text IS DISTINCT FROM exact->>'cleanup_admission_id' THEN
+        RAISE EXCEPTION 'Job VM terminal packet lacks exact source' USING ERRCODE='23514';
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+
+--
+-- Name: guard_vm_job_worker_delivery_binding(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.guard_vm_job_worker_delivery_binding() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+BEGIN
+    IF TG_OP IN ('UPDATE','DELETE') THEN
+        RAISE EXCEPTION 'VM Job worker delivery binding is immutable' USING ERRCODE='23514';
+    END IF;
+    -- The application already holds the exact queue lease, then the Job and
+    -- retry. Do not acquire a queue lock after the Job in this trigger.
+    PERFORM 1 FROM public.jobs j WHERE j.id=NEW.job_id
+        AND j.context->'vm'->>'status'='ready'
+        AND j.context->'vm'->>'provision_generation'=NEW.provision_generation::text
+        AND j.context->'vm'->>'identity_provision_generation'=NEW.provision_generation::text
+        AND j.context->'vm'->>'vm_uid'=NEW.vm_uid::text
+        AND j.context->'vm'->>'rootdisk_pvc_uid'=NEW.pvc_uid::text
+        FOR SHARE;
+    IF NOT FOUND OR NOT EXISTS (
+        SELECT 1 FROM public.vm_job_creation_owners o
+        WHERE o.job_id=NEW.job_id AND o.live_job_id=NEW.job_id AND o.deleted_at IS NULL
+    ) OR NOT EXISTS (
+        SELECT 1 FROM public.run_queue q WHERE q.unit_id=NEW.job_id
+          AND q.unit_kind='worker_batch' AND q.state='leased'
+          AND q.lease_token=NEW.lease_token
+    ) OR NOT EXISTS (
+        SELECT 1 FROM public.worker_batch_attempts b
+        WHERE b.job_id=NEW.job_id AND b.lease_token=NEW.lease_token
+          AND b.bundle_authorized_at IS NULL AND b.authority_digest IS NULL
+          AND b.refunded_at IS NULL AND b.recovery_id IS NULL
+    ) OR NOT EXISTS (
+        SELECT 1 FROM public.vm_creation_retries r WHERE r.request_id=NEW.request_id
+          AND r.owner_kind='job' AND r.job_id=NEW.job_id
+          AND r.provision_generation=NEW.provision_generation AND r.state='succeeded'
+          AND r.observed_vm_uid=NEW.vm_uid AND r.observed_pvc_uid=NEW.pvc_uid
+          AND r.creation_admission_id IS NOT NULL
+    ) THEN
+        RAISE EXCEPTION 'VM Job worker delivery lacks exact live physical source'
+            USING ERRCODE='23514';
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+
+--
+-- Name: guard_vm_pre_ssh_stop_intent(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.guard_vm_pre_ssh_stop_intent() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $_$
+DECLARE
+    admission public.vm_workspace_cleanup_admissions%ROWTYPE;
+    retry public.vm_creation_retries%ROWTYPE;
+    reservation public.vm_resource_reservations%ROWTYPE;
+    owner_vm jsonb;
+BEGIN
+    IF TG_OP <> 'INSERT' THEN
+        RAISE EXCEPTION 'VM pre-SSH stop intent is append-only' USING ERRCODE='23514';
+    END IF;
+    IF NEW.frozen->>'kind' IN ('vm_initial_ready_positive_stop_candidate_v1','vm_job_never_app_ready_retained_stop_candidate_v1') THEN
+    IF NEW.frozen->>'kind'='vm_initial_ready_positive_stop_candidate_v1' THEN
+        NEW.initial_ready_xact_id := pg_current_xact_id();
+    ELSE
+        NEW.held_stop_xact_id := pg_current_xact_id();
+    END IF;
+    PERFORM pg_advisory_xact_lock(hashtextextended('workspace-recovery:job:'||NEW.job_id,0));
+    PERFORM pg_advisory_xact_lock(hashtextextended('workspace-recovery-pvc:'||(SELECT pvc_uid::text FROM public.vm_workspace_cleanup_admissions WHERE id=NEW.cleanup_admission_id),0));
+    PERFORM 1 FROM public.run_queue WHERE unit_id=NEW.job_id FOR UPDATE;
+    END IF;
+    SELECT context->'vm' INTO owner_vm FROM public.jobs
+     WHERE id=NEW.job_id FOR UPDATE;
+    SELECT * INTO admission FROM public.vm_workspace_cleanup_admissions
+     WHERE id=NEW.cleanup_admission_id FOR UPDATE;
+    SELECT * INTO retry FROM public.vm_creation_retries
+     WHERE request_id=NEW.creation_request_id FOR UPDATE;
+    SELECT * INTO reservation FROM public.vm_resource_reservations
+     WHERE id=NEW.reservation_id FOR UPDATE;
+    IF admission.id IS NULL OR admission.owner_kind IS DISTINCT FROM 'job'
+       OR admission.owner_id IS DISTINCT FROM NEW.job_id
+       OR admission.completed_at IS NOT NULL
+       OR admission.pvc_uid IS DISTINCT FROM NEW.pvc_uid
+       OR admission.intent_digest IS DISTINCT FROM NEW.cleanup_intent_digest
+       OR retry.request_id IS NULL OR retry.job_id IS DISTINCT FROM NEW.job_id
+       OR retry.provision_generation IS DISTINCT FROM NEW.provision_generation
+       OR (retry.state IS DISTINCT FROM 'succeeded'
+           AND NOT (retry.state='settled'
+               AND NEW.frozen->>'kind'='vm_job_never_app_ready_retained_stop_candidate_v1'
+               AND public.vm_cancel_late_adopted_source(
+                   NEW.job_id,NEW.provision_generation,
+                   NEW.vm_uid,NEW.pvc_uid,
+                   NEW.creation_request_id)))
+       OR retry.observed_vm_uid IS DISTINCT FROM NEW.vm_uid
+       OR retry.observed_pvc_uid IS DISTINCT FROM NEW.pvc_uid
+       OR (CASE WHEN NEW.frozen->>'kind'='vm_initial_ready_positive_stop_candidate_v1'
+           THEN retry.ready_at IS NULL OR NOT public.vm_initial_ready_stop_authorized(NEW)
+           WHEN NEW.frozen->>'kind'='vm_job_never_app_ready_retained_stop_candidate_v1'
+           THEN retry.ready_at IS NOT NULL OR NOT public.vm_never_app_ready_stop_authorized(NEW)
+           ELSE retry.ready_at IS NOT NULL OR NEW.frozen->>'kind' IS DISTINCT FROM 'vm_pre_ssh_stop_candidate_v1' END)
+       OR reservation.id IS NULL OR reservation.request_id IS DISTINCT FROM retry.request_id
+       OR reservation.revision IS DISTINCT FROM NEW.reservation_revision
+       OR reservation.state IS DISTINCT FROM 'teardown'
+       OR reservation.vm_uid IS DISTINCT FROM NEW.vm_uid
+       OR reservation.vmi_uid IS DISTINCT FROM NEW.vmi_uid
+       OR reservation.launcher_uid IS DISTINCT FROM NEW.launcher_uid
+       OR reservation.node_uid IS DISTINCT FROM NEW.node_uid
+       OR owner_vm->>'provision_generation' IS DISTINCT FROM NEW.provision_generation::text
+       OR owner_vm->>'vm_uid' IS DISTINCT FROM NEW.vm_uid::text
+       OR owner_vm->>'rootdisk_pvc_uid' IS DISTINCT FROM NEW.pvc_uid::text
+       OR owner_vm->>'status' IS DISTINCT FROM 'retiring_process_zero'
+       OR (NEW.frozen->>'kind'<>'vm_job_never_app_ready_retained_stop_candidate_v1'
+           AND NEW.prior_zero_receipt_id IS NOT NULL)
+       OR (NEW.frozen->>'kind'<>'vm_job_never_app_ready_retained_stop_candidate_v1' AND EXISTS (
+           SELECT 1 FROM public.managed_repository_process_zero_receipts z
+           WHERE z.owner_kind='job' AND z.owner_id=NEW.job_id
+             AND z.scope='vm' AND z.provisioner='vm'
+             AND z.runtime_incarnation=NEW.provision_generation::text))
+       OR EXISTS (SELECT 1 FROM public.vm_resource_recovery_successors s
+                   WHERE s.reservation_id=reservation.id)
+       OR NEW.frozen->>'job_id' IS DISTINCT FROM NEW.job_id::text
+       OR NEW.frozen->>'provision_generation' IS DISTINCT FROM NEW.provision_generation::text
+       OR NEW.frozen->>'vm_uid' IS DISTINCT FROM NEW.vm_uid::text
+       OR NEW.frozen->>'vmi_uid' IS DISTINCT FROM NEW.vmi_uid::text
+       OR NEW.frozen->>'launcher_uid' IS DISTINCT FROM NEW.launcher_uid::text
+       OR NEW.frozen->>'pvc_uid' IS DISTINCT FROM NEW.pvc_uid::text
+       OR NEW.frozen->>'node_uid' IS DISTINCT FROM NEW.node_uid::text
+       OR jsonb_typeof(NEW.frozen->'vm_generation') IS DISTINCT FROM 'number'
+       OR NEW.frozen->>'vm_generation' !~ '^[1-9][0-9]*$'
+       OR NEW.frozen_digest IS DISTINCT FROM
+          'sha256:'||encode(sha256(convert_to(NEW.frozen::text,'UTF8')),'hex') THEN
+        RAISE EXCEPTION 'VM pre-SSH stop intent lacks exact retirement authority'
+            USING ERRCODE='23514', CONSTRAINT='vm_pre_ssh_stop_intent_authority';
+    END IF;
+    RETURN NEW;
+END;
+$_$;
+
+
+--
+-- Name: guard_vm_pre_ssh_stop_proof(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.guard_vm_pre_ssh_stop_proof() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+DECLARE
+    intent public.vm_pre_ssh_stop_intents%ROWTYPE;
+    admission public.vm_workspace_cleanup_admissions%ROWTYPE;
+    retry public.vm_creation_retries%ROWTYPE;
+    reservation public.vm_resource_reservations%ROWTYPE;
+    owner_vm jsonb;
+BEGIN
+    IF TG_OP <> 'INSERT' THEN
+        RAISE EXCEPTION 'VM pre-SSH stop proof is append-only' USING ERRCODE='23514';
+    END IF;
+    IF EXISTS(SELECT 1 FROM public.vm_pre_ssh_stop_intents i WHERE i.cleanup_admission_id=NEW.cleanup_admission_id AND i.frozen->>'kind' IN ('vm_initial_ready_positive_stop_candidate_v1','vm_job_never_app_ready_retained_stop_candidate_v1')) THEN
+    PERFORM pg_advisory_xact_lock(hashtextextended('workspace-recovery:job:'||NEW.job_id,0));
+    PERFORM pg_advisory_xact_lock(hashtextextended('workspace-recovery-pvc:'||(SELECT pvc_uid::text FROM public.vm_workspace_cleanup_admissions WHERE id=NEW.cleanup_admission_id),0));
+    PERFORM 1 FROM public.run_queue WHERE unit_id=NEW.job_id FOR UPDATE;
+    END IF;
+    SELECT context->'vm' INTO owner_vm FROM public.jobs
+     WHERE id=NEW.job_id FOR UPDATE;
+    SELECT * INTO admission FROM public.vm_workspace_cleanup_admissions
+     WHERE id=NEW.cleanup_admission_id FOR UPDATE;
+    -- The intent is immutable. Read it before taking the same retry/charge
+    -- lock order as the application store; no intent row lock is needed.
+    SELECT * INTO intent FROM public.vm_pre_ssh_stop_intents
+     WHERE cleanup_admission_id=NEW.cleanup_admission_id;
+    SELECT * INTO retry FROM public.vm_creation_retries
+     WHERE request_id=intent.creation_request_id FOR UPDATE;
+    SELECT * INTO reservation FROM public.vm_resource_reservations
+     WHERE id=intent.reservation_id FOR UPDATE;
+    IF intent.frozen->>'kind'='vm_initial_ready_positive_stop_candidate_v1' THEN
+        IF intent.initial_ready_xact_id IS NULL OR intent.initial_ready_xact_id=pg_current_xact_id() THEN
+            RAISE EXCEPTION 'Initial Ready proof requires committed stop intent' USING ERRCODE='23514';
+        END IF;
+        NEW.initial_ready_xact_id := pg_current_xact_id();
+    ELSIF intent.frozen->>'kind'='vm_job_never_app_ready_retained_stop_candidate_v1' THEN
+        IF intent.held_stop_xact_id IS NULL OR intent.held_stop_xact_id=pg_current_xact_id() THEN
+            RAISE EXCEPTION 'Held stop proof requires committed stop intent' USING ERRCODE='23514';
+        END IF;
+        NEW.held_stop_xact_id := pg_current_xact_id();
+    END IF;
+    IF intent.cleanup_admission_id IS NULL
+       OR intent.job_id IS DISTINCT FROM NEW.job_id
+       OR intent.provision_generation IS DISTINCT FROM NEW.provision_generation
+       OR intent.frozen_digest IS DISTINCT FROM NEW.frozen_digest
+       OR admission.id IS NULL OR admission.completed_at IS NOT NULL
+       OR admission.owner_kind IS DISTINCT FROM 'job'
+       OR admission.owner_id IS DISTINCT FROM intent.job_id
+       OR admission.pvc_uid IS DISTINCT FROM intent.pvc_uid
+       OR admission.intent_digest IS DISTINCT FROM intent.cleanup_intent_digest
+       OR retry.request_id IS NULL
+       OR retry.job_id IS DISTINCT FROM intent.job_id
+       OR retry.provision_generation IS DISTINCT FROM intent.provision_generation
+       OR (retry.state IS DISTINCT FROM 'succeeded'
+           AND NOT (retry.state='settled'
+               AND intent.frozen->>'kind'='vm_job_never_app_ready_retained_stop_candidate_v1'
+               AND public.vm_cancel_late_adopted_source(
+                   intent.job_id,intent.provision_generation,
+                   intent.vm_uid,intent.pvc_uid,
+                   intent.creation_request_id)))
+       OR (CASE WHEN intent.frozen->>'kind'='vm_initial_ready_positive_stop_candidate_v1'
+           THEN retry.ready_at IS NULL OR NOT public.vm_initial_ready_stop_authorized(intent)
+               OR NOT public.valid_vm_initial_ready_positive_stop(intent.frozen,NEW.terminal_evidence,NEW.frozen_digest)
+           WHEN intent.frozen->>'kind'='vm_job_never_app_ready_retained_stop_candidate_v1'
+           THEN retry.ready_at IS NOT NULL OR NOT public.vm_never_app_ready_stop_authorized(intent)
+               OR NOT public.valid_vm_initial_ready_positive_stop(intent.frozen,
+                   jsonb_set(NEW.terminal_evidence,'{kind}','"vm_initial_ready_positive_stop_v1"'::jsonb),NEW.frozen_digest)
+           ELSE retry.ready_at IS NOT NULL OR intent.frozen->>'kind' IS DISTINCT FROM 'vm_pre_ssh_stop_candidate_v1' END)
+       OR retry.observed_vm_uid IS DISTINCT FROM intent.vm_uid
+       OR retry.observed_pvc_uid IS DISTINCT FROM intent.pvc_uid
+       OR reservation.id IS NULL OR reservation.state IS DISTINCT FROM 'teardown'
+       OR reservation.request_id IS DISTINCT FROM intent.creation_request_id
+       OR reservation.revision IS DISTINCT FROM intent.reservation_revision
+       OR reservation.vm_uid IS DISTINCT FROM intent.vm_uid
+       OR reservation.vmi_uid IS DISTINCT FROM intent.vmi_uid
+       OR reservation.launcher_uid IS DISTINCT FROM intent.launcher_uid
+       OR reservation.node_uid IS DISTINCT FROM intent.node_uid
+       OR owner_vm->>'status' IS DISTINCT FROM 'retiring_process_zero'
+       OR owner_vm->>'provision_generation' IS DISTINCT FROM NEW.provision_generation::text
+       OR NEW.terminal_evidence->>'kind' IS DISTINCT FROM (CASE WHEN intent.frozen->>'kind'='vm_initial_ready_positive_stop_candidate_v1'
+           THEN 'vm_initial_ready_positive_stop_v1'
+           WHEN intent.frozen->>'kind'='vm_job_never_app_ready_retained_stop_candidate_v1'
+           THEN 'vm_job_never_app_ready_retained_positive_stop_v1'
+           ELSE 'vm_pre_ssh_positive_stop_v1' END)
+       OR NEW.terminal_evidence->>'frozen_digest' IS DISTINCT FROM NEW.frozen_digest
+       OR NEW.terminal_evidence->>'vm_run_strategy' IS DISTINCT FROM 'Halted'
+       OR NEW.terminal_evidence->>'vm_generation' IS DISTINCT FROM
+          ((intent.frozen->>'vm_generation')::bigint+1)::text
+       OR NEW.terminal_evidence->>'node_ready' IS DISTINCT FROM 'true'
+       OR NEW.terminal_evidence->>'same_generation_replacement' IS DISTINCT FROM 'false'
+       OR NEW.terminal_evidence->>'pod_finalizer' IS DISTINCT FROM 'srw.io/vm-pre-ssh-positive-stop'
+       OR NEW.terminal_evidence->>'pod_intent_digest' IS DISTINCT FROM NEW.frozen_digest
+       OR NEW.terminal_evidence->>'vm_uid' IS DISTINCT FROM intent.vm_uid::text
+       OR NEW.terminal_evidence->>'launcher_uid' IS DISTINCT FROM intent.launcher_uid::text
+       OR NEW.terminal_evidence->>'node_uid' IS DISTINCT FROM intent.node_uid::text
+       OR NEW.terminal_evidence->>'controller_authenticated' IS DISTINCT FROM 'true'
+       OR NEW.evidence_digest IS DISTINCT FROM
+          'sha256:'||encode(sha256(convert_to(NEW.terminal_evidence::text,'UTF8')),'hex') THEN
+        RAISE EXCEPTION 'VM pre-SSH stop proof lacks exact current authority'
+            USING ERRCODE='23514', CONSTRAINT='vm_pre_ssh_stop_proof_authority';
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+
+--
+-- Name: guard_vm_pre_ssh_zero_insert(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.guard_vm_pre_ssh_zero_insert() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+BEGIN
+    IF NEW.owner_kind='job' AND NEW.scope='vm' AND NEW.provisioner='vm'
+       AND EXISTS (SELECT 1 FROM public.vm_pre_ssh_stop_intents i
+                    WHERE i.job_id=NEW.owner_id
+                      AND i.provision_generation::text=NEW.runtime_incarnation)
+       AND NOT EXISTS (
+           SELECT 1 FROM public.vm_pre_ssh_stop_proofs p
+           JOIN public.vm_pre_ssh_stop_intents i USING (cleanup_admission_id)
+           WHERE i.job_id=NEW.owner_id
+             AND i.provision_generation::text=NEW.runtime_incarnation
+             AND p.job_id=i.job_id
+             AND p.provision_generation=i.provision_generation
+       ) THEN
+        RAISE EXCEPTION 'VM pre-SSH process zero requires positive terminal proof'
+            USING ERRCODE='23514', CONSTRAINT='vm_pre_ssh_zero_requires_proof';
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+
+--
+-- Name: guard_vm_resource_cleanup_stop_receipt(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.guard_vm_resource_cleanup_stop_receipt() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+DECLARE
+    cleanup RECORD;
+    charge RECORD;
+    successor RECORD;
+    source RECORD;
+    owner_vm JSONB;
+    proof JSONB;
+BEGIN
+    IF TG_OP<>'INSERT' THEN
+        RAISE EXCEPTION 'VM resource cleanup stop receipt is append-only' USING ERRCODE='23514';
+    END IF;
+    SELECT * INTO cleanup FROM public.vm_workspace_cleanup_admissions
+     WHERE id=NEW.cleanup_admission_id FOR UPDATE;
+    SELECT * INTO charge FROM public.vm_resource_reservations
+     WHERE id=NEW.reservation_id FOR UPDATE;
+    SELECT w.job_id,w.provision_generation,r.state AS retry_state,
+           r.observed_vm_uid,r.observed_pvc_uid,r.ready_at,r.reason
+      INTO source FROM public.vm_resource_waiters w
+      JOIN public.vm_creation_retries r ON r.request_id=w.request_id
+     WHERE w.request_id=NEW.request_id;
+    SELECT successor_vmi_uid,successor_launcher_uid INTO successor
+      FROM public.vm_resource_recovery_successors
+     WHERE reservation_id=NEW.reservation_id ORDER BY ordinal DESC LIMIT 1;
+    SELECT context->'vm' INTO owner_vm FROM public.jobs WHERE id=NEW.job_id;
+    proof := NEW.stop_evidence;
+    IF cleanup.id IS NULL OR cleanup.owner_kind<>'job'
+       OR cleanup.owner_id<>NEW.job_id OR cleanup.pvc_uid<>NEW.pvc_uid
+       OR cleanup.intent_digest<>NEW.intent_digest
+       OR cleanup.source='vm_idle_release'
+       OR cleanup.completed_at IS NULL OR cleanup.outcome<>'completed'
+       OR charge.id IS NULL OR charge.request_id<>NEW.request_id
+       OR charge.resource_version<>2 OR charge.state<>'teardown'
+       OR charge.vm_uid IS DISTINCT FROM NEW.vm_uid
+       OR COALESCE(successor.successor_vmi_uid,charge.vmi_uid) IS DISTINCT FROM NEW.vmi_uid
+       OR COALESCE(successor.successor_launcher_uid,charge.launcher_uid) IS DISTINCT FROM NEW.launcher_uid
+       OR source.job_id IS DISTINCT FROM NEW.job_id
+       OR source.provision_generation IS DISTINCT FROM NEW.provision_generation
+       OR (source.retry_state<>'succeeded' AND NOT (source.retry_state='settled'
+           AND cleanup.source='job_terminal_vm_release'
+           AND public.vm_cancel_late_adopted_source(NEW.job_id,NEW.provision_generation,
+               NEW.vm_uid,NEW.pvc_uid,NEW.request_id,NEW.cleanup_admission_id,true,true)))
+       OR source.observed_vm_uid IS DISTINCT FROM NEW.vm_uid
+       OR source.observed_pvc_uid IS DISTINCT FROM NEW.pvc_uid
+       OR owner_vm->>'provision_generation' IS DISTINCT FROM NEW.provision_generation::text
+       OR owner_vm->>'vm_uid' IS DISTINCT FROM NEW.vm_uid::text
+       OR owner_vm->>'rootdisk_pvc_uid' IS DISTINCT FROM NEW.pvc_uid::text
+       OR owner_vm->>'vmi_uid' IS DISTINCT FROM NEW.vmi_uid::text
+       OR (
+           owner_vm->>'active_pod_uid' IS DISTINCT FROM NEW.launcher_uid::text
+           AND NOT (
+               owner_vm->>'active_pod_uid' IS NULL
+               AND source.ready_at IS NULL
+               AND source.reason IS NOT DISTINCT FROM 'creation_adopted'
+               AND NOT EXISTS (
+                   SELECT 1 FROM public.vm_resource_recovery_successors
+                    WHERE reservation_id=NEW.reservation_id
+               )
+           )
+       )
+       OR proof->>'version' IS DISTINCT FROM '1'
+       OR proof->>'kind' IS DISTINCT FROM 'vm_cleanup_physical_stop'
+       OR proof->>'job_id' IS DISTINCT FROM NEW.job_id::text
+       OR proof->>'provision_generation' IS DISTINCT FROM NEW.provision_generation::text
+       OR proof->>'vm_uid' IS DISTINCT FROM NEW.vm_uid::text
+       OR proof->>'vmi_uid' IS DISTINCT FROM NEW.vmi_uid::text
+       OR proof->>'launcher_uid' IS DISTINCT FROM NEW.launcher_uid::text
+       OR proof->>'pvc_uid' IS DISTINCT FROM NEW.pvc_uid::text
+       OR proof->>'vm_absent' IS DISTINCT FROM 'true'
+       OR proof->>'vmi_absent' IS DISTINCT FROM 'true'
+       OR proof->>'launcher_absent' IS DISTINCT FROM 'true'
+       OR proof->>'controller_authenticated' IS DISTINCT FROM 'true'
+       OR proof->>'same_generation_replacement' IS DISTINCT FROM 'false'
+       OR proof->>'pvc_disposition' IS NULL
+       OR proof->>'pvc_disposition' NOT IN ('retained','purged')
+       OR NOT EXISTS (SELECT 1 FROM public.managed_repository_process_zero_receipts p
+                      WHERE p.owner_kind='job' AND p.owner_id=NEW.job_id
+                        AND p.scope='vm' AND p.provisioner='vm'
+                        AND p.runtime_incarnation=NEW.provision_generation::text) THEN
+        RAISE EXCEPTION 'VM resource cleanup stop proof changed' USING ERRCODE='23514';
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+
+--
+-- Name: guard_vm_resource_recovery_successor(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.guard_vm_resource_recovery_successor() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+DECLARE
+    charge RECORD;
+    recovery RECORD;
+    prior RECORD;
+    owner_vm JSONB;
+BEGIN
+    IF TG_OP <> 'INSERT' THEN
+        RAISE EXCEPTION 'VM resource successor receipt is append-only' USING ERRCODE='23514';
+    END IF;
+    -- The parent lock serializes the ordinal and predecessor chain even when
+    -- two recovered operations race to report the same VM generation.
+    SELECT r.*, w.job_id, w.provision_generation AS waiter_generation,
+           retry.observed_vm_uid, retry.observed_pvc_uid
+      INTO charge
+      FROM public.vm_resource_reservations r
+      JOIN public.vm_resource_waiters w ON w.request_id=r.request_id
+     JOIN public.vm_creation_retries retry ON retry.request_id=r.request_id
+     WHERE r.id=NEW.reservation_id FOR UPDATE OF r;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'VM resource successor reservation missing' USING ERRCODE='23514';
+    END IF;
+    IF charge.resource_version<>2
+       OR charge.state NOT IN ('active','warm')
+       OR charge.vm_uid IS DISTINCT FROM NEW.vm_uid
+       OR charge.job_id<>NEW.owner_id
+       OR charge.waiter_generation<>NEW.provision_generation
+       OR charge.observed_vm_uid IS DISTINCT FROM NEW.vm_uid
+       OR charge.observed_pvc_uid IS DISTINCT FROM NEW.root_pvc_uid THEN
+        RAISE EXCEPTION 'VM resource successor reservation changed' USING ERRCODE='23514';
+    END IF;
+    SELECT * INTO recovery FROM public.vm_workspace_recoveries
+     WHERE id=NEW.recovery_id;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'VM resource successor recovery missing' USING ERRCODE='23514';
+    END IF;
+    IF recovery.owner_kind<>'job'
+       OR recovery.owner_id<>NEW.owner_id
+       OR recovery.provision_generation<>NEW.provision_generation
+       OR recovery.vm_uid<>NEW.vm_uid
+       OR recovery.root_pvc_uid<>NEW.root_pvc_uid
+       OR recovery.prior_vmi_uid IS DISTINCT FROM NEW.prior_vmi_uid
+       OR recovery.prior_launcher_uid IS DISTINCT FROM NEW.prior_launcher_uid
+       OR recovery.phase<>'recovered' OR recovery.resolved_at IS NULL
+       OR NOT EXISTS (
+            SELECT 1 FROM public.vm_workspace_recovery_stop_receipts receipt
+             WHERE receipt.recovery_id=NEW.recovery_id
+               AND receipt.accepted_claim_token<=recovery.claim_token
+               AND receipt.vm_uid=NEW.vm_uid
+               AND receipt.vmi_uid=NEW.prior_vmi_uid
+               AND receipt.launcher_uid=NEW.prior_launcher_uid
+               AND receipt.root_pvc_uid=NEW.root_pvc_uid
+               AND receipt.evidence_digest=NEW.stop_receipt_digest
+       ) THEN
+        RAISE EXCEPTION 'VM resource successor recovery proof changed' USING ERRCODE='23514';
+    END IF;
+    SELECT * INTO prior FROM public.vm_resource_recovery_successors
+     WHERE reservation_id=NEW.reservation_id ORDER BY ordinal DESC LIMIT 1;
+    IF prior IS NULL THEN
+        IF NEW.ordinal<>1
+           OR charge.vmi_uid IS DISTINCT FROM NEW.prior_vmi_uid
+           OR charge.launcher_uid IS DISTINCT FROM NEW.prior_launcher_uid THEN
+            RAISE EXCEPTION 'VM resource successor predecessor changed' USING ERRCODE='23514';
+        END IF;
+    ELSIF NEW.ordinal<>prior.ordinal+1
+          OR prior.successor_vmi_uid<>NEW.prior_vmi_uid
+          OR prior.successor_launcher_uid<>NEW.prior_launcher_uid THEN
+        RAISE EXCEPTION 'VM resource successor predecessor changed' USING ERRCODE='23514';
+    END IF;
+    SELECT context->'vm' INTO owner_vm FROM public.jobs WHERE id=NEW.owner_id;
+    IF owner_vm IS NULL
+       OR owner_vm->>'provision_generation' IS DISTINCT FROM NEW.provision_generation::text
+       OR owner_vm->>'vm_uid' IS DISTINCT FROM NEW.vm_uid::text
+       OR owner_vm->>'rootdisk_pvc_uid' IS DISTINCT FROM NEW.root_pvc_uid::text
+       OR owner_vm->>'vmi_uid' IS DISTINCT FROM NEW.successor_vmi_uid::text
+       OR owner_vm->>'active_pod_uid' IS DISTINCT FROM NEW.successor_launcher_uid::text THEN
+        RAISE EXCEPTION 'VM resource successor owner projection changed' USING ERRCODE='23514';
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+
+--
+-- Name: guard_vm_resource_release_v2(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.guard_vm_resource_release_v2() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+DECLARE
+    source RECORD;
+    idle RECORD;
+    successor RECORD;
+    owner_context JSONB;
+    proof JSONB;
+    current_vmi UUID;
+    current_launcher UUID;
+    cleanup_stop RECORD;
+    thread_row RECORD;
+BEGIN
+    IF TG_OP<>'UPDATE' OR NEW.resource_version<>2 OR NEW.state<>'released'
+       OR OLD.state='released' THEN
+        RETURN NEW;
+    END IF;
+    SELECT w.owner_kind,w.job_id,w.thread_id,w.provision_generation,retry.state AS retry_state,
+           retry.observed_vm_uid,retry.observed_pvc_uid,
+           retry.cancellation_disposition,retry.creation_admission_id,
+           retry.canonical_request,retry.controller_configuration
+      INTO source
+      FROM public.vm_resource_waiters w
+      JOIN public.vm_creation_retries retry ON retry.request_id=w.request_id
+     WHERE w.request_id=NEW.request_id;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'VM resource release source missing' USING ERRCODE='23514';
+    END IF;
+    proof := NEW.release_evidence;
+    IF source.owner_kind='thread' THEN
+        IF proof->>'kind'='never_vm_issued' THEN
+            IF OLD.state<>'reserved' OR OLD.vm_uid IS NOT NULL
+               OR source.retry_state<>'cancel_requested'
+               OR proof->>'request_id' IS DISTINCT FROM NEW.request_id::text
+               OR proof->>'thread_id' IS DISTINCT FROM source.thread_id::text
+               OR proof->>'provision_generation' IS DISTINCT FROM source.provision_generation::text
+               OR NOT (
+                   (source.controller_configuration->>'golden_enabled' IS NOT DISTINCT FROM 'false'
+                    AND source.canonical_request->'preparation' IS NULL
+                    AND NOT EXISTS(SELECT 1 FROM public.vm_creation_effects e
+                        WHERE e.request_id=NEW.request_id AND e.state<>'rejected'))
+                   OR (proof->>'disposition_id' IS NOT NULL
+                       AND proof->>'disposition_id' IS NOT DISTINCT FROM
+                           source.cancellation_disposition->>'disposition_id'
+                       AND proof->>'creation_admission_id' IS NOT DISTINCT FROM
+                           source.creation_admission_id::text
+                       AND EXISTS(SELECT 1 FROM public.vm_creation_retries r
+                           WHERE r.request_id=NEW.request_id
+                             AND public.valid_vm_creation_disposition_evidence(r))
+                       AND EXISTS(SELECT 1 FROM public.vm_workspace_cleanup_admissions a
+                           WHERE a.id=source.creation_admission_id
+                             AND a.owner_kind='thread' AND a.owner_id=source.thread_id
+                             AND a.completed_at IS NOT NULL AND a.outcome='creation_disposed')
+                       AND NOT EXISTS(SELECT 1 FROM public.vm_creation_effects e
+                           WHERE e.request_id=NEW.request_id
+                             AND e.effect_kind='vm' AND e.state<>'rejected'))
+               ) THEN
+                RAISE EXCEPTION 'VM thread never-issued release unproven' USING ERRCODE='23514';
+            END IF;
+            RETURN NEW;
+        END IF;
+        IF proof->>'kind'<>'exact_compute_absent' OR OLD.state<>'teardown' THEN
+            RAISE EXCEPTION 'VM thread physical release unproven' USING ERRCODE='23514';
+        END IF;
+        SELECT * INTO idle FROM public.vm_idle_operations
+         WHERE id=(proof->>'operation_id')::uuid;
+        SELECT id,status,metadata,runtime_generation,agent_id,runtime_attach_token
+          INTO thread_row FROM public.threads WHERE id=source.thread_id;
+        SELECT successor_vmi_uid,successor_launcher_uid INTO successor
+          FROM public.vm_resource_recovery_successors
+         WHERE reservation_id=NEW.id ORDER BY ordinal DESC LIMIT 1;
+        current_vmi := COALESCE(successor.successor_vmi_uid,OLD.vmi_uid);
+        current_launcher := COALESCE(successor.successor_launcher_uid,OLD.launcher_uid);
+        owner_context := thread_row.metadata->'vm';
+        IF idle.id IS NULL OR thread_row.id IS NULL
+           OR thread_row.status<>'suspended'
+           OR thread_row.runtime_generation=(SELECT thread_runtime_generation
+                  FROM public.vm_creation_retries WHERE request_id=NEW.request_id)
+           OR thread_row.agent_id IS NOT NULL OR thread_row.runtime_attach_token IS NOT NULL
+           OR idle.owner_kind<>'thread' OR idle.release_kind<>'pinned_thread'
+           OR idle.owner_id<>source.thread_id
+           OR idle.provision_generation<>source.provision_generation
+           OR idle.vm_uid IS DISTINCT FROM OLD.vm_uid
+           OR idle.vm_uid IS DISTINCT FROM source.observed_vm_uid
+           OR idle.pvc_uid IS DISTINCT FROM source.observed_pvc_uid
+           OR idle.vmi_uid IS DISTINCT FROM current_vmi
+           OR idle.launcher_uid IS DISTINCT FROM current_launcher
+           OR idle.phase<>'suspended' OR idle.stop_verified_at IS NULL
+           OR idle.thread_agent_stop_verified_at IS NULL
+           OR idle.thread_agent_stop_evidence->>'version' IS DISTINCT FROM '1'
+           OR idle.thread_agent_stop_evidence->>'retirement_token'
+                  IS DISTINCT FROM idle.thread_retirement_token::text
+           OR idle.thread_agent_stop_evidence->>'controller_authenticated'
+                  IS DISTINCT FROM 'true'
+           OR idle.thread_agent_stop_evidence->'pod'
+                  IS DISTINCT FROM idle.thread_agent_pod_identity
+           OR idle.stop_evidence->>'version' IS DISTINCT FROM '1'
+           OR idle.stop_evidence->>'kind' IS DISTINCT FROM 'vm_idle_physical_stop'
+           OR owner_context->>'status' IS DISTINCT FROM 'suspended'
+           OR owner_context->>'rootdisk' IS DISTINCT FROM 'kept'
+           OR owner_context->>'_suspend_remote_io_closed' IS DISTINCT FROM idle.id::text
+           OR owner_context->>'provision_generation' IS DISTINCT FROM idle.provision_generation::text
+           OR owner_context->>'vm_uid' IS DISTINCT FROM idle.vm_uid::text
+           OR owner_context->>'rootdisk_pvc_uid' IS DISTINCT FROM idle.pvc_uid::text
+           OR proof->>'thread_id' IS DISTINCT FROM source.thread_id::text
+           OR proof->>'provision_generation' IS DISTINCT FROM source.provision_generation::text
+           OR proof->>'vm_uid' IS DISTINCT FROM idle.vm_uid::text
+           OR proof->>'vmi_uid' IS DISTINCT FROM idle.vmi_uid::text
+           OR proof->>'launcher_uid' IS DISTINCT FROM idle.launcher_uid::text
+           OR proof->>'pvc_uid' IS DISTINCT FROM idle.pvc_uid::text
+           OR proof->>'stop_evidence_digest' IS DISTINCT FROM
+              ('sha256:' || encode(sha256(convert_to(idle.stop_evidence::text,'UTF8')),'hex'))
+           OR idle.stop_evidence->>'operation_id' IS DISTINCT FROM idle.id::text
+           OR idle.stop_evidence->>'generation' IS DISTINCT FROM idle.provision_generation::text
+           OR idle.stop_evidence->>'vm_uid' IS DISTINCT FROM idle.vm_uid::text
+           OR idle.stop_evidence->>'vmi_uid' IS DISTINCT FROM idle.vmi_uid::text
+           OR idle.stop_evidence->>'launcher_uid' IS DISTINCT FROM idle.launcher_uid::text
+           OR idle.stop_evidence->>'pvc_uid' IS DISTINCT FROM idle.pvc_uid::text
+           OR idle.stop_evidence->>'vm_absent' IS DISTINCT FROM 'true'
+           OR idle.stop_evidence->>'vmi_absent' IS DISTINCT FROM 'true'
+           OR idle.stop_evidence->>'launcher_absent' IS DISTINCT FROM 'true'
+           OR idle.stop_evidence->>'retained_pvc' IS DISTINCT FROM 'true'
+           OR idle.stop_evidence->>'controller_authenticated' IS DISTINCT FROM 'true'
+           OR idle.stop_evidence->>'same_generation_replacement' IS DISTINCT FROM 'false'
+           OR NOT EXISTS(
+               SELECT 1 FROM public.managed_repository_process_zero_receipts p
+                WHERE p.owner_kind='thread' AND p.owner_id=source.thread_id
+                  AND p.scope='vm' AND p.provisioner='vm'
+                  AND p.runtime_incarnation=source.provision_generation::text
+           ) THEN
+            RAISE EXCEPTION 'VM thread physical release proof changed' USING ERRCODE='23514';
+        END IF;
+        RETURN NEW;
+    END IF;
+    IF proof->>'kind'='never_vm_issued' THEN
+        IF OLD.state<>'reserved' OR OLD.vm_uid IS NOT NULL
+           OR source.retry_state<>'cancel_requested'
+           OR proof->>'request_id' IS DISTINCT FROM NEW.request_id::text
+           OR proof->>'job_id' IS DISTINCT FROM source.job_id::text
+           OR proof->>'provision_generation' IS DISTINCT FROM source.provision_generation::text
+           OR (
+               EXISTS (SELECT 1 FROM public.vm_creation_effects e
+                       WHERE e.request_id=NEW.request_id)
+               AND NOT (
+                   proof->>'disposition_id' IS NOT DISTINCT FROM
+                       source.cancellation_disposition->>'disposition_id'
+                   AND proof->>'disposition_id' IS NOT NULL
+                   AND proof->>'creation_admission_id' IS NOT DISTINCT FROM
+                       source.creation_admission_id::text
+                   AND EXISTS (
+                       SELECT 1 FROM public.vm_creation_retries r
+                        WHERE r.request_id=NEW.request_id
+                          AND public.valid_vm_creation_disposition_evidence(r)
+                   )
+                   AND EXISTS (
+                       SELECT 1 FROM public.vm_workspace_cleanup_admissions c
+                        WHERE c.id=source.creation_admission_id
+                          AND c.completed_at IS NOT NULL
+                          AND c.outcome='creation_disposed'
+                   )
+                   AND NOT EXISTS (
+                       SELECT 1 FROM public.vm_creation_effects e
+                        WHERE e.request_id=NEW.request_id
+                          AND e.effect_kind='vm' AND e.state<>'rejected'
+                   )
+               )
+           ) THEN
+            RAISE EXCEPTION 'VM resource never-issued release unproven' USING ERRCODE='23514';
+        END IF;
+        RETURN NEW;
+    END IF;
+    IF proof->>'kind'='exact_cleanup_compute_absent' THEN
+        SELECT * INTO cleanup_stop FROM public.vm_resource_cleanup_stop_receipts
+         WHERE cleanup_admission_id=(proof->>'cleanup_admission_id')::uuid;
+        IF OLD.state<>'teardown' OR cleanup_stop.cleanup_admission_id IS NULL
+           OR cleanup_stop.reservation_id<>NEW.id
+           OR cleanup_stop.request_id<>NEW.request_id
+           OR cleanup_stop.job_id<>source.job_id
+           OR cleanup_stop.provision_generation<>source.provision_generation
+           OR cleanup_stop.vm_uid IS DISTINCT FROM OLD.vm_uid
+           OR proof->>'job_id' IS DISTINCT FROM cleanup_stop.job_id::text
+           OR proof->>'provision_generation' IS DISTINCT FROM cleanup_stop.provision_generation::text
+           OR proof->>'vm_uid' IS DISTINCT FROM cleanup_stop.vm_uid::text
+           OR proof->>'vmi_uid' IS DISTINCT FROM cleanup_stop.vmi_uid::text
+           OR proof->>'launcher_uid' IS DISTINCT FROM cleanup_stop.launcher_uid::text
+           OR proof->>'pvc_uid' IS DISTINCT FROM cleanup_stop.pvc_uid::text
+           OR proof->>'stop_evidence_digest' IS DISTINCT FROM
+              ('sha256:' || encode(sha256(convert_to(cleanup_stop.stop_evidence::text,'UTF8')),'hex')) THEN
+            RAISE EXCEPTION 'VM resource cleanup release proof changed' USING ERRCODE='23514';
+        END IF;
+        RETURN NEW;
+    END IF;
+    IF proof->>'kind'<>'exact_compute_absent' OR OLD.state<>'teardown' THEN
+        RAISE EXCEPTION 'VM resource physical release unproven' USING ERRCODE='23514';
+    END IF;
+    SELECT * INTO idle FROM public.vm_idle_operations
+     WHERE id=(proof->>'operation_id')::uuid;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'VM resource idle release missing' USING ERRCODE='23514';
+    END IF;
+    SELECT successor_vmi_uid,successor_launcher_uid INTO successor
+      FROM public.vm_resource_recovery_successors
+     WHERE reservation_id=NEW.id ORDER BY ordinal DESC LIMIT 1;
+    current_vmi := COALESCE(successor.successor_vmi_uid, OLD.vmi_uid);
+    current_launcher := COALESCE(successor.successor_launcher_uid, OLD.launcher_uid);
+    SELECT context->'vm' INTO owner_context FROM public.jobs WHERE id=source.job_id;
+    IF idle.owner_kind<>'job' OR idle.owner_id<>source.job_id
+       OR idle.provision_generation<>source.provision_generation
+       OR idle.vm_uid IS DISTINCT FROM OLD.vm_uid
+       OR idle.vm_uid IS DISTINCT FROM source.observed_vm_uid
+       OR idle.pvc_uid IS DISTINCT FROM source.observed_pvc_uid
+       OR idle.vmi_uid IS DISTINCT FROM current_vmi
+       OR idle.launcher_uid IS DISTINCT FROM current_launcher
+       OR idle.phase<>'suspended' OR idle.stop_verified_at IS NULL
+       OR idle.stop_evidence->>'version' IS DISTINCT FROM '1'
+       OR idle.stop_evidence->>'kind' IS DISTINCT FROM 'vm_idle_physical_stop'
+       OR owner_context->>'status' IS DISTINCT FROM 'suspended'
+       OR owner_context->>'_suspend_remote_io_closed' IS DISTINCT FROM idle.id::text
+       OR owner_context->>'provision_generation' IS DISTINCT FROM idle.provision_generation::text
+       OR owner_context->>'vm_uid' IS DISTINCT FROM idle.vm_uid::text
+       OR owner_context->>'rootdisk_pvc_uid' IS DISTINCT FROM idle.pvc_uid::text
+       OR proof->>'job_id' IS DISTINCT FROM source.job_id::text
+       OR proof->>'provision_generation' IS DISTINCT FROM source.provision_generation::text
+       OR proof->>'vm_uid' IS DISTINCT FROM idle.vm_uid::text
+       OR proof->>'vmi_uid' IS DISTINCT FROM idle.vmi_uid::text
+       OR proof->>'launcher_uid' IS DISTINCT FROM idle.launcher_uid::text
+       OR proof->>'pvc_uid' IS DISTINCT FROM idle.pvc_uid::text
+       OR proof->>'stop_evidence_digest' IS DISTINCT FROM
+          ('sha256:' || encode(sha256(convert_to(idle.stop_evidence::text,'UTF8')),'hex'))
+       OR idle.stop_evidence->>'operation_id' IS DISTINCT FROM idle.id::text
+       OR idle.stop_evidence->>'generation' IS DISTINCT FROM idle.provision_generation::text
+       OR idle.stop_evidence->>'vm_uid' IS DISTINCT FROM idle.vm_uid::text
+       OR idle.stop_evidence->>'vmi_uid' IS DISTINCT FROM idle.vmi_uid::text
+       OR idle.stop_evidence->>'launcher_uid' IS DISTINCT FROM idle.launcher_uid::text
+       OR idle.stop_evidence->>'pvc_uid' IS DISTINCT FROM idle.pvc_uid::text
+       OR idle.stop_evidence->>'vm_absent' IS DISTINCT FROM 'true'
+       OR idle.stop_evidence->>'vmi_absent' IS DISTINCT FROM 'true'
+       OR idle.stop_evidence->>'launcher_absent' IS DISTINCT FROM 'true'
+       OR idle.stop_evidence->>'retained_pvc' IS DISTINCT FROM 'true'
+       OR idle.stop_evidence->>'controller_authenticated' IS DISTINCT FROM 'true'
+       OR idle.stop_evidence->>'same_generation_replacement' IS DISTINCT FROM 'false'
+       OR NOT EXISTS(
+           SELECT 1 FROM public.managed_repository_process_zero_receipts p
+            WHERE p.owner_kind='job' AND p.owner_id=source.job_id
+              AND p.scope='vm' AND p.provisioner='vm'
+              AND p.runtime_incarnation=source.provision_generation::text
+       ) THEN
+        RAISE EXCEPTION 'VM resource physical release proof changed' USING ERRCODE='23514';
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+
+--
+-- Name: guard_vm_resource_reservation(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.guard_vm_resource_reservation() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+BEGIN
+    IF TG_OP='DELETE' THEN
+        IF OLD.state<>'released' THEN
+            RAISE EXCEPTION 'Held VM resource reservation cannot be deleted' USING ERRCODE='23514';
+        END IF;
+        RETURN OLD;
+    END IF;
+    IF TG_OP='INSERT' THEN
+        IF NOT EXISTS (SELECT 1 FROM public.vm_resource_inventory_snapshots s
+            WHERE s.snapshot_id=NEW.snapshot_id AND s.digest=NEW.snapshot_digest) THEN
+            RAISE EXCEPTION 'VM resource snapshot identity mismatch' USING ERRCODE='23503';
+        END IF;
+        IF NOT EXISTS (SELECT 1 FROM public.vm_resource_waiters w
+            WHERE w.request_id=NEW.request_id AND w.cpu_millicores=NEW.cpu_millicores
+            AND w.memory_bytes=NEW.memory_bytes AND w.kvm_devices=NEW.kvm_devices)
+            OR NEW.state<>'reserved' THEN
+            RAISE EXCEPTION 'VM resource reservation must preserve initial demand' USING ERRCODE='23514';
+        END IF;
+        RETURN NEW;
+    END IF;
+    IF ROW(NEW.id,NEW.request_id,NEW.revision,NEW.cluster_id,NEW.policy_digest,NEW.node_uid,NEW.node_name,
+           NEW.cpu_millicores,NEW.memory_bytes,NEW.kvm_devices,NEW.snapshot_id,NEW.snapshot_digest,NEW.created_at)
+       IS DISTINCT FROM
+       ROW(OLD.id,OLD.request_id,OLD.revision,OLD.cluster_id,OLD.policy_digest,OLD.node_uid,OLD.node_name,
+           OLD.cpu_millicores,OLD.memory_bytes,OLD.kvm_devices,OLD.snapshot_id,OLD.snapshot_digest,OLD.created_at)
+       OR (OLD.vm_uid IS NOT NULL AND NEW.vm_uid IS DISTINCT FROM OLD.vm_uid)
+       OR (OLD.vmi_uid IS NOT NULL AND NEW.vmi_uid IS DISTINCT FROM OLD.vmi_uid)
+       OR (OLD.launcher_uid IS NOT NULL AND NEW.launcher_uid IS DISTINCT FROM OLD.launcher_uid)
+       OR (OLD.state='released' AND NEW IS DISTINCT FROM OLD) THEN
+        RAISE EXCEPTION 'VM resource reservation identity is immutable' USING ERRCODE='23514';
+    END IF;
+    IF NEW.state <> OLD.state AND NOT (
+        (OLD.state='reserved' AND NEW.state IN ('active','teardown','released')) OR
+        (OLD.state='active' AND NEW.state IN ('warm','teardown')) OR
+        (OLD.state='warm' AND NEW.state IN ('active','teardown')) OR
+        (OLD.state='teardown' AND NEW.state='released')
+    ) THEN
+        RAISE EXCEPTION 'Invalid VM resource reservation transition' USING ERRCODE='23514';
+    END IF;
+    IF NEW.state='released' AND (
+        (NEW.release_evidence->>'kind') IS NULL OR
+        NEW.release_evidence->>'kind' NOT IN (
+            'never_vm_issued','exact_compute_absent','exact_cleanup_compute_absent'
+        ) OR
+        (NEW.release_evidence->>'kind'='never_vm_issued' AND NEW.vm_uid IS NOT NULL) OR
+        (OLD.state='reserved' AND NEW.release_evidence->>'kind'<>'never_vm_issued')
+    ) THEN
+        RAISE EXCEPTION 'VM resource release evidence is required' USING ERRCODE='23514';
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+
+--
+-- Name: guard_vm_resource_reservation_v2(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.guard_vm_resource_reservation_v2() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+BEGIN
+    IF TG_OP='DELETE' THEN
+        RETURN OLD;
+    END IF;
+    IF TG_OP='INSERT' THEN
+        IF NOT EXISTS (SELECT 1 FROM public.vm_resource_waiters w
+            WHERE w.request_id=NEW.request_id AND w.resource_version=NEW.resource_version
+            AND w.ephemeral_storage_bytes IS NOT DISTINCT FROM NEW.ephemeral_storage_bytes
+            AND w.tun_devices IS NOT DISTINCT FROM NEW.tun_devices
+            AND w.vhost_net_devices IS NOT DISTINCT FROM NEW.vhost_net_devices) THEN
+            RAISE EXCEPTION 'VM resource reservation six-field demand changed' USING ERRCODE='23514';
+        END IF;
+        RETURN NEW;
+    END IF;
+    IF ROW(NEW.resource_version,NEW.ephemeral_storage_bytes,NEW.tun_devices,NEW.vhost_net_devices)
+       IS DISTINCT FROM
+       ROW(OLD.resource_version,OLD.ephemeral_storage_bytes,OLD.tun_devices,OLD.vhost_net_devices) THEN
+        RAISE EXCEPTION 'VM resource reservation six-field identity is immutable' USING ERRCODE='23514';
+    END IF;
+    IF OLD.observed_cpu_millicores IS NOT NULL AND (
+        NEW.observed_cpu_millicores IS NULL OR NEW.observed_cpu_millicores<OLD.observed_cpu_millicores
+        OR NEW.observed_memory_bytes<OLD.observed_memory_bytes
+        OR NEW.observed_ephemeral_storage_bytes<OLD.observed_ephemeral_storage_bytes
+        OR NEW.observed_kvm_devices<OLD.observed_kvm_devices
+        OR NEW.observed_tun_devices<OLD.observed_tun_devices
+        OR NEW.observed_vhost_net_devices<OLD.observed_vhost_net_devices
+    ) THEN
+        RAISE EXCEPTION 'VM observed launcher charge cannot decrease' USING ERRCODE='23514';
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+
+--
+-- Name: guard_vm_resource_waiter(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.guard_vm_resource_waiter() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+DECLARE source public.vm_creation_retries%ROWTYPE;
+BEGIN
+    IF TG_OP='INSERT' THEN
+        SELECT * INTO source FROM public.vm_creation_retries r
+          WHERE r.request_id=NEW.request_id;
+        IF NOT FOUND OR source.owner_kind<>NEW.owner_kind
+           OR source.job_id IS DISTINCT FROM NEW.job_id
+           OR source.thread_id IS DISTINCT FROM NEW.thread_id
+           OR source.provision_generation<>NEW.provision_generation
+           OR source.request_digest<>NEW.request_digest THEN
+            RAISE EXCEPTION 'VM resource waiter source identity mismatch' USING ERRCODE='23503';
+        END IF;
+        IF NEW.owner_kind='thread' AND (
+            NEW.owner_key IS DISTINCT FROM CASE
+                WHEN source.thread_owner_user_id IS NULL THEN 'system'
+                ELSE 'user:'||source.thread_owner_user_id::text END
+            OR NEW.project_id IS DISTINCT FROM source.thread_owner_project_id
+            OR NEW.priority<>0
+        ) THEN
+            RAISE EXCEPTION 'VM resource thread waiter owner mismatch' USING ERRCODE='23514';
+        END IF;
+        IF NEW.state<>'waiting' OR NEW.bypasses<>0
+           OR NEW.protected_order IS NOT NULL THEN
+            RAISE EXCEPTION 'VM resource waiter must start waiting' USING ERRCODE='23514';
+        END IF;
+        RETURN NEW;
+    END IF;
+    IF ROW(NEW.request_id,NEW.owner_kind,NEW.job_id,NEW.thread_id,
+           NEW.provision_generation,NEW.cluster_id,NEW.policy_digest,
+           NEW.owner_key,NEW.project_id,NEW.priority,NEW.request_digest,
+           NEW.guest_vcpus,NEW.guest_memory_bytes,NEW.cpu_millicores,
+           NEW.memory_bytes,NEW.kvm_devices,NEW.placement,NEW.enqueued_at)
+       IS DISTINCT FROM
+       ROW(OLD.request_id,OLD.owner_kind,OLD.job_id,OLD.thread_id,
+           OLD.provision_generation,OLD.cluster_id,OLD.policy_digest,
+           OLD.owner_key,OLD.project_id,OLD.priority,OLD.request_digest,
+           OLD.guest_vcpus,OLD.guest_memory_bytes,OLD.cpu_millicores,
+           OLD.memory_bytes,OLD.kvm_devices,OLD.placement,OLD.enqueued_at)
+       OR NEW.revision < OLD.revision OR NEW.bypasses < OLD.bypasses
+       OR (OLD.protected_order IS NOT NULL
+           AND NEW.protected_order IS DISTINCT FROM OLD.protected_order) THEN
+        RAISE EXCEPTION 'VM resource waiter identity is immutable' USING ERRCODE='23514';
+    END IF;
+    IF NEW.state <> OLD.state AND NOT (
+        (OLD.state='waiting' AND NEW.state IN ('nonfit','admitted','cancelled','parked')) OR
+        (OLD.state='nonfit' AND NEW.state IN ('waiting','cancelled','parked')) OR
+        (OLD.state='parked' AND NEW.state IN ('waiting','cancelled')) OR
+        (OLD.state='admitted' AND NEW.state='released')
+    ) THEN
+        RAISE EXCEPTION 'Invalid VM resource waiter transition' USING ERRCODE='23514';
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+
+--
+-- Name: guard_vm_resource_waiter_v2(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.guard_vm_resource_waiter_v2() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+BEGIN
+    IF TG_OP='INSERT' THEN
+        RETURN NEW;
+    END IF;
+    IF ROW(NEW.resource_version,NEW.ephemeral_storage_bytes,NEW.tun_devices,NEW.vhost_net_devices)
+       IS DISTINCT FROM
+       ROW(OLD.resource_version,OLD.ephemeral_storage_bytes,OLD.tun_devices,OLD.vhost_net_devices) THEN
+        RAISE EXCEPTION 'VM resource waiter six-field identity is immutable' USING ERRCODE='23514';
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+
+--
+-- Name: guard_vm_thread_cleanup_authority(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.guard_vm_thread_cleanup_authority() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+BEGIN
+    IF TG_OP<>'INSERT' THEN
+        RAISE EXCEPTION 'VM thread cleanup authority is append-only' USING ERRCODE='23514';
+    END IF;
+    PERFORM public.validate_vm_thread_cleanup_authority(NEW);
+    RETURN NEW;
+END;
+$$;
+
+
+--
+-- Name: guard_vm_thread_cleanup_refusal_recovery(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.guard_vm_thread_cleanup_refusal_recovery() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+BEGIN
+    IF TG_OP<>'INSERT' THEN
+        RAISE EXCEPTION 'VM cleanup refusal recovery evidence is immutable' USING ERRCODE='23514';
+    END IF;
+    PERFORM public.validate_vm_thread_cleanup_refusal_recovery(NEW);
+    RETURN NEW;
+END;
+$$;
+
+
+--
+-- Name: guard_vm_thread_cleanup_stop(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.guard_vm_thread_cleanup_stop() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+DECLARE authority public.vm_resource_thread_cleanup_authorities%ROWTYPE;
+BEGIN
+    IF TG_OP<>'INSERT' THEN
+        RAISE EXCEPTION 'VM thread cleanup stop is append-only' USING ERRCODE='23514';
+    END IF;
+    SELECT * INTO authority FROM public.vm_resource_thread_cleanup_authorities
+        WHERE cleanup_admission_id=NEW.cleanup_admission_id;
+    IF authority.cleanup_admission_id IS NULL THEN
+        RAISE EXCEPTION 'VM thread cleanup authority missing' USING ERRCODE='23514';
+    END IF;
+    PERFORM public.validate_vm_thread_cleanup_stop(authority,NEW);
+    RETURN NEW;
+END;
+$$;
+
+
+--
+-- Name: guard_vm_thread_creation_owner(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.guard_vm_thread_creation_owner() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+DECLARE owner_row public.threads%ROWTYPE;
+BEGIN
+    IF TG_OP='DELETE' THEN
+        RAISE EXCEPTION 'VM thread audit owner is permanent' USING ERRCODE='23514';
+    END IF;
+    IF TG_OP='INSERT' THEN
+        SELECT * INTO owner_row FROM public.threads WHERE id=NEW.thread_id FOR SHARE;
+        IF NOT FOUND OR NEW.live_thread_id IS DISTINCT FROM NEW.thread_id
+           OR NEW.deleted_runtime_generation IS NOT NULL OR NEW.deleted_retirement_token IS NOT NULL
+           OR NEW.deletion_receipt IS NOT NULL OR NEW.deleted_at IS NOT NULL THEN
+            RAISE EXCEPTION 'VM audit owner requires its exact live thread' USING ERRCODE='23514';
+        END IF;
+        RETURN NEW;
+    END IF;
+    IF ROW(NEW.thread_id,NEW.created_at) IS DISTINCT FROM ROW(OLD.thread_id,OLD.created_at)
+       OR (OLD.live_thread_id IS NULL AND NEW.live_thread_id IS NOT NULL)
+       OR (NEW.live_thread_id IS NOT NULL AND NEW.live_thread_id IS DISTINCT FROM OLD.live_thread_id)
+       OR (OLD.deleted_at IS NOT NULL AND ROW(NEW.deleted_runtime_generation,NEW.deleted_retirement_token,
+            NEW.deletion_receipt,NEW.deleted_at) IS DISTINCT FROM
+            ROW(OLD.deleted_runtime_generation,OLD.deleted_retirement_token,OLD.deletion_receipt,OLD.deleted_at)) THEN
+        RAISE EXCEPTION 'VM audit owner identity and tombstone are immutable' USING ERRCODE='23514';
+    END IF;
+    IF OLD.deleted_at IS NULL AND NEW.deleted_at IS NOT NULL THEN
+        SELECT * INTO owner_row FROM public.threads WHERE id=NEW.thread_id FOR UPDATE;
+        IF NOT FOUND OR NEW.live_thread_id IS DISTINCT FROM NEW.thread_id
+           OR NEW.deleted_runtime_generation IS DISTINCT FROM owner_row.runtime_generation
+           OR NEW.deleted_retirement_token IS DISTINCT FROM owner_row.runtime_retirement_token
+           OR NEW.deletion_receipt IS NULL
+           OR NEW.deletion_receipt IS DISTINCT FROM public.vm_thread_creation_delete_evidence(owner_row) THEN
+            RAISE EXCEPTION 'VM audit tombstone lacks exact current permanent End' USING ERRCODE='23514';
+        END IF;
+    ELSIF OLD.deleted_at IS NULL AND ROW(NEW.deleted_runtime_generation,NEW.deleted_retirement_token,NEW.deletion_receipt)
+          IS DISTINCT FROM ROW(OLD.deleted_runtime_generation,OLD.deleted_retirement_token,OLD.deletion_receipt) THEN
+        RAISE EXCEPTION 'VM audit tombstone is incomplete' USING ERRCODE='23514';
+    END IF;
+    IF OLD.live_thread_id IS NOT NULL AND NEW.live_thread_id IS NULL AND (
+        OLD.deleted_at IS NULL OR EXISTS (SELECT 1 FROM public.threads WHERE id=NEW.thread_id)) THEN
+        RAISE EXCEPTION 'VM audit owner can detach only with exact thread deletion' USING ERRCODE='23514';
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+
+--
+-- Name: guard_vm_thread_creation_settlement(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.guard_vm_thread_creation_settlement() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+DECLARE owner_row public.threads%ROWTYPE;
+        retry public.vm_creation_retries%ROWTYPE;
+BEGIN
+    IF TG_OP<>'INSERT' THEN
+        RAISE EXCEPTION 'VM thread source settlement is append-only' USING ERRCODE='23514';
+    END IF;
+    SELECT * INTO owner_row FROM public.threads WHERE id=NEW.thread_id FOR UPDATE;
+    PERFORM 1 FROM public.vm_thread_creation_owners WHERE thread_id=NEW.thread_id FOR UPDATE;
+    SELECT * INTO retry FROM public.vm_creation_retries WHERE request_id=NEW.request_id FOR UPDATE;
+    PERFORM public.lock_vm_thread_creation_terminal_ledger(NEW.thread_id,NEW.request_id);
+    IF owner_row.id IS NULL OR retry.thread_id IS DISTINCT FROM NEW.thread_id
+       OR owner_row.runtime_generation IS DISTINCT FROM NEW.runtime_generation
+       OR owner_row.runtime_retirement_token IS DISTINCT FROM NEW.retirement_token
+       OR NOT public.pinned_vm_creation_agent_zero_source(
+            NEW.thread_id,NEW.runtime_generation,NEW.retirement_token)
+       OR NOT EXISTS (SELECT 1 FROM public.thread_runtime_retirement_outcomes o
+           WHERE o.thread_id=NEW.thread_id AND o.runtime_generation=NEW.runtime_generation
+             AND o.retirement_token=NEW.retirement_token AND o.disposition='ended'
+             AND ((o.outcome='settled' AND NOT o.permanent) OR (o.outcome='deleted' AND o.permanent)))
+       OR NEW.terminal_evidence IS DISTINCT FROM public.vm_thread_creation_terminal_evidence(retry)
+       OR NEW.terminal_evidence IS NULL
+       OR NEW.local_quiescence IS DISTINCT FROM owner_row.runtime_retirement_local_quiescence THEN
+        RAISE EXCEPTION 'VM thread source settlement lacks exact positive End proof' USING ERRCODE='23514';
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+
+--
+-- Name: guard_vm_thread_creation_terminal_ledger(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.guard_vm_thread_creation_terminal_ledger() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+DECLARE candidate jsonb;
+        owned_thread uuid;
+        source_request uuid;
+        retry public.vm_creation_retries%ROWTYPE;
+BEGIN
+    candidate := CASE WHEN TG_OP='DELETE' THEN to_jsonb(OLD) ELSE to_jsonb(NEW) END;
+    IF TG_TABLE_NAME='vm_workspace_cleanup_admissions' THEN
+        IF candidate->>'owner_kind'<>'thread' THEN
+            IF TG_OP='DELETE' THEN RETURN OLD; END IF;
+            RETURN NEW;
+        END IF;
+        owned_thread := (candidate->>'owner_id')::uuid;
+        IF NOT EXISTS (SELECT 1 FROM public.vm_thread_creation_owners WHERE thread_id=owned_thread) THEN
+            IF TG_OP='DELETE' THEN RETURN OLD; END IF;
+            RETURN NEW;
+        END IF;
+    ELSE
+        source_request := (candidate->>'request_id')::uuid;
+        SELECT * INTO retry FROM public.vm_creation_retries WHERE request_id=source_request;
+        IF retry.owner_kind IS DISTINCT FROM 'thread' THEN
+            IF TG_OP='DELETE' THEN RETURN OLD; END IF;
+            RETURN NEW;
+        END IF;
+        owned_thread := retry.thread_id;
+    END IF;
+    IF TG_OP='INSERT' THEN
+        PERFORM 1 FROM public.threads WHERE id=owned_thread FOR SHARE;
+        IF NOT FOUND THEN
+            RAISE EXCEPTION 'retired VM audit owner cannot acquire new obligations' USING ERRCODE='23514';
+        END IF;
+        PERFORM 1 FROM public.vm_thread_creation_owners
+            WHERE thread_id=owned_thread AND live_thread_id=owned_thread AND deleted_at IS NULL FOR SHARE;
+        IF NOT FOUND THEN
+            RAISE EXCEPTION 'retired VM audit owner cannot acquire new obligations' USING ERRCODE='23514';
+        END IF;
+        IF source_request IS NOT NULL THEN
+            SELECT * INTO retry FROM public.vm_creation_retries WHERE request_id=source_request FOR SHARE;
+            IF retry.state='settled' THEN
+                RAISE EXCEPTION 'settled VM source cannot acquire new obligations' USING ERRCODE='23514';
+            END IF;
+        END IF;
+    ELSIF (TG_OP='DELETE' OR NEW IS DISTINCT FROM OLD)
+       AND EXISTS (SELECT 1 FROM public.vm_thread_creation_owners
+           WHERE thread_id=owned_thread AND live_thread_id IS NULL) THEN
+        RAISE EXCEPTION 'retired VM audit evidence is immutable' USING ERRCODE='23514';
+    END IF;
+    IF TG_OP='DELETE' THEN RETURN OLD; END IF;
+    RETURN NEW;
+END;
+$$;
+
+
+--
+-- Name: guard_vm_thread_recovered_cleanup_admission(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.guard_vm_thread_recovered_cleanup_admission() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+DECLARE r public.vm_thread_cleanup_refusal_recoveries%ROWTYPE;
+BEGIN
+    SELECT * INTO r FROM public.vm_thread_cleanup_refusal_recoveries
+        WHERE OLD.id IN (refused_admission_id,successor_admission_id,child_admission_id);
+    IF FOUND AND (TG_OP='DELETE' OR NEW IS DISTINCT FROM OLD) THEN
+        IF TG_OP='UPDATE' AND OLD.id=r.successor_admission_id AND OLD.completed_at IS NULL
+           AND NEW.completed_at IS NOT NULL AND NEW.outcome='completed'
+           AND (to_jsonb(NEW)-'completed_at'-'outcome')=(to_jsonb(OLD)-'completed_at'-'outcome') THEN
+            PERFORM public.validate_vm_thread_cleanup_refusal_recovery(r);
+            RETURN NEW;
+        END IF;
+        RAISE EXCEPTION 'Recovered VM cleanup admissions are immutable' USING ERRCODE='23514';
+    END IF;
+    IF TG_OP='DELETE' THEN RETURN OLD; END IF;
+    RETURN NEW;
+END;
+$$;
+
+
+--
+-- Name: guard_vm_thread_retained_disk_purge_authority(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.guard_vm_thread_retained_disk_purge_authority() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+BEGIN
+    IF TG_OP<>'INSERT' THEN
+        RAISE EXCEPTION 'VM retained disk authority is append-only' USING ERRCODE='23514';
+    END IF;
+    PERFORM public.validate_vm_thread_retained_disk_purge(NEW);
+    RETURN NEW;
+END;
+$$;
+
+
+--
+-- Name: guard_vm_thread_retained_disk_purge_completion(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.guard_vm_thread_retained_disk_purge_completion() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+DECLARE d public.vm_thread_retained_disk_purge_authorities%ROWTYPE;
+        proof jsonb;
+BEGIN
+    -- Keep this parent's identity immutable while its live owner still exists.
+    -- In particular a source rewrite must not evade the completion trigger.
+    IF TG_OP='UPDATE' AND (
+       (NEW.id,NEW.owner_kind,NEW.owner_id,NEW.pvc_uid,NEW.source,NEW.request_id,
+        NEW.intent_digest,NEW.parent_admission_id,NEW.admitted_at) IS DISTINCT FROM
+       (OLD.id,OLD.owner_kind,OLD.owner_id,OLD.pvc_uid,OLD.source,OLD.request_id,
+        OLD.intent_digest,OLD.parent_admission_id,OLD.admitted_at)
+       OR (OLD.completed_at IS NOT NULL AND NEW IS DISTINCT FROM OLD)) THEN
+        RAISE EXCEPTION 'VM retained disk cleanup identity is immutable' USING ERRCODE='23514';
+    END IF;
+    IF NEW.completed_at IS NOT NULL THEN
+        SELECT * INTO d FROM public.vm_thread_retained_disk_purge_authorities WHERE cleanup_admission_id=NEW.id;
+        SELECT purge_evidence INTO proof FROM public.vm_thread_retained_disk_purge_receipts WHERE cleanup_admission_id=NEW.id;
+        IF NEW.outcome IS DISTINCT FROM 'completed' OR d.cleanup_admission_id IS NULL OR proof IS NULL THEN
+            RAISE EXCEPTION 'VM retained disk completion lacks purge receipt' USING ERRCODE='23514';
+        END IF;
+        PERFORM public.validate_vm_thread_retained_disk_purge_receipt(d,proof);
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+
+--
+-- Name: guard_vm_thread_retained_disk_purge_receipt(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.guard_vm_thread_retained_disk_purge_receipt() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+DECLARE d public.vm_thread_retained_disk_purge_authorities%ROWTYPE;
+BEGIN
+    IF TG_OP<>'INSERT' THEN
+        RAISE EXCEPTION 'VM retained disk receipt is append-only' USING ERRCODE='23514';
+    END IF;
+    SELECT * INTO d FROM public.vm_thread_retained_disk_purge_authorities WHERE cleanup_admission_id=NEW.cleanup_admission_id;
+    IF d.cleanup_admission_id IS NULL THEN
+        RAISE EXCEPTION 'VM retained disk authority missing' USING ERRCODE='23514';
+    END IF;
+    PERFORM public.validate_vm_thread_retained_disk_purge_receipt(d,NEW.purge_evidence);
+    RETURN NEW;
+END;
+$$;
+
+
+--
+-- Name: guard_vm_thread_retained_resume(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.guard_vm_thread_retained_resume() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+DECLARE owner_row public.threads%ROWTYPE;
+        a public.vm_resource_thread_cleanup_authorities%ROWTYPE;
+        source public.vm_creation_retries%ROWTYPE;
+        soft public.thread_runtime_retirement_outcomes%ROWTYPE;
+        terminal public.vm_thread_retained_resume_terminals%ROWTYPE;
+BEGIN
+    IF TG_OP<>'INSERT' THEN
+        RAISE EXCEPTION 'VM retained Resume operation is append-only' USING ERRCODE='23514';
+    END IF;
+    SELECT * INTO owner_row FROM public.threads WHERE id=NEW.thread_id FOR SHARE;
+    SELECT * INTO a FROM public.vm_resource_thread_cleanup_authorities WHERE cleanup_admission_id=NEW.compute_cleanup_admission_id;
+    SELECT * INTO source FROM public.vm_creation_retries WHERE request_id=a.request_id FOR SHARE;
+    PERFORM public.validate_vm_thread_retained_compute(a.cleanup_admission_id);
+    SELECT * INTO soft FROM public.thread_runtime_retirement_outcomes
+        WHERE thread_id=NEW.thread_id AND runtime_generation=NEW.predecessor_runtime_generation
+          AND retirement_token=NEW.predecessor_retirement_token;
+    IF NEW.predecessor_terminal_id IS NOT NULL THEN
+        SELECT * INTO terminal FROM public.vm_thread_retained_resume_terminals WHERE id=NEW.predecessor_terminal_id;
+        IF terminal.id IS NULL OR terminal.runtime_generation IS DISTINCT FROM NEW.predecessor_runtime_generation
+           OR terminal.retirement_token IS DISTINCT FROM NEW.predecessor_retirement_token
+           OR terminal.compute_cleanup_admission_id IS DISTINCT FROM a.cleanup_admission_id
+           OR NOT EXISTS (SELECT 1 FROM public.vm_thread_retained_resumes previous
+               WHERE previous.id=terminal.operation_id AND previous.thread_id=NEW.thread_id) THEN
+            RAISE EXCEPTION 'VM retained Resume terminal predecessor changed' USING ERRCODE='23514';
+        END IF;
+    ELSIF NEW.predecessor_runtime_generation IS DISTINCT FROM a.runtime_generation
+       OR NEW.predecessor_retirement_token IS DISTINCT FROM a.retirement_token THEN
+        RAISE EXCEPTION 'VM retained Resume predecessor changed' USING ERRCODE='23514';
+    END IF;
+    IF owner_row.id IS NULL OR owner_row.execution_lane IS DISTINCT FROM 'pinned'
+       OR owner_row.status IS DISTINCT FROM 'created' OR owner_row.runtime_retirement_token IS NOT NULL
+       OR owner_row.runtime_generation IS DISTINCT FROM NEW.runtime_generation
+       OR owner_row.runtime_generation=NEW.predecessor_runtime_generation
+       OR owner_row.agent_id IS NOT NULL OR owner_row.runtime_attach_token IS NOT NULL
+       OR soft.thread_id IS NULL OR soft.permanent OR soft.outcome IS DISTINCT FROM 'settled'
+       OR soft.disposition IS DISTINCT FROM 'ended' OR soft.settled_at>NEW.created_at
+       OR a.thread_id IS DISTINCT FROM NEW.thread_id OR source.revision IS DISTINCT FROM NEW.source_revision
+       OR NEW.retained_vm IS DISTINCT FROM owner_row.metadata->'vm'
+       OR NEW.retained_vm->>'creation_request_id' IS DISTINCT FROM a.request_id::text
+       OR NEW.retained_vm->>'provision_generation' IS DISTINCT FROM a.provision_generation::text
+       OR NEW.retained_vm->>'identity_provision_generation' IS DISTINCT FROM a.provision_generation::text
+       OR NEW.retained_vm->'identity_authenticated' IS DISTINCT FROM 'true'::jsonb
+       OR NEW.retained_vm->>'vm_uid' IS DISTINCT FROM a.vm_uid::text
+       OR NEW.retained_vm->>'rootdisk_pvc_uid' IS DISTINCT FROM a.pvc_uid::text
+       OR NEW.retained_vm->>'status' IS DISTINCT FROM 'deleted'
+       OR EXISTS (SELECT 1 FROM public.vm_workspace_cleanup_admissions c
+           WHERE ((c.owner_kind='thread' AND c.owner_id=NEW.thread_id) OR c.pvc_uid=a.pvc_uid) AND c.completed_at IS NULL)
+       OR EXISTS (SELECT 1 FROM public.vm_workspace_recoveries r
+           WHERE r.owner_kind='thread' AND r.owner_id=NEW.thread_id AND r.resolved_at IS NULL)
+       OR EXISTS (SELECT 1 FROM public.vm_workspace_recovery_retention_pins pin WHERE pin.pvc_uid=a.pvc_uid AND pin.released_at IS NULL)
+       OR EXISTS (SELECT 1 FROM public.vm_idle_access_leases l WHERE l.owner_kind='thread' AND l.owner_id=NEW.thread_id
+           AND l.closed_at IS NULL AND l.expires_at>clock_timestamp())
+       OR EXISTS (SELECT 1 FROM public.vm_idle_operations idle WHERE idle.owner_kind='thread' AND idle.owner_id=NEW.thread_id AND idle.closed_at IS NULL)
+       OR EXISTS (SELECT 1 FROM public.vm_creation_retries r WHERE r.request_id=NEW.request_id OR r.provision_generation=NEW.provision_generation) THEN
+        RAISE EXCEPTION 'VM retained Resume authority unproven' USING ERRCODE='23514';
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+
+--
+-- Name: guard_vm_thread_retained_resume_terminal(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.guard_vm_thread_retained_resume_terminal() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+DECLARE op public.vm_thread_retained_resumes%ROWTYPE;
+        owner_row public.threads%ROWTYPE;
+        source public.vm_creation_retries%ROWTYPE;
+        a public.vm_resource_thread_cleanup_authorities%ROWTYPE;
+        evidence jsonb;
+BEGIN
+    IF TG_OP<>'INSERT' THEN
+        RAISE EXCEPTION 'VM retained terminal is append-only' USING ERRCODE='23514';
+    END IF;
+    SELECT * INTO op FROM public.vm_thread_retained_resumes WHERE id=NEW.operation_id;
+    SELECT * INTO owner_row FROM public.threads WHERE id=op.thread_id FOR SHARE;
+    SELECT * INTO source FROM public.vm_creation_retries WHERE request_id=op.request_id FOR SHARE;
+    SELECT * INTO a FROM public.vm_resource_thread_cleanup_authorities WHERE cleanup_admission_id=NEW.compute_cleanup_admission_id;
+    IF op.id IS NULL OR owner_row.id IS NULL OR owner_row.runtime_generation IS DISTINCT FROM NEW.runtime_generation
+       OR NOT public.valid_vm_thread_retained_runtime(op,owner_row)
+       OR owner_row.runtime_retirement_token IS DISTINCT FROM NEW.retirement_token
+       OR owner_row.runtime_retirement_authorized_at IS NULL
+       OR owner_row.runtime_retirement_context IS DISTINCT FROM NEW.retirement_context
+       OR a.thread_id IS DISTINCT FROM op.thread_id
+       OR NOT EXISTS (SELECT 1 FROM public.thread_runtime_retirement_outcomes o
+           WHERE o.thread_id=op.thread_id AND o.runtime_generation=NEW.runtime_generation
+             AND o.retirement_token=NEW.retirement_token AND o.disposition='ended'
+             AND o.outcome=CASE WHEN o.permanent THEN 'deleted' ELSE 'settled' END
+             AND o.agent_id IS NOT DISTINCT FROM owner_row.agent_id
+             AND o.runtime_attach_token IS NOT DISTINCT FROM owner_row.runtime_attach_token) THEN
+        RAISE EXCEPTION 'VM retained terminal retirement unproven' USING ERRCODE='23514';
+    END IF;
+    IF NEW.retained_vm->>'creation_request_id' IS DISTINCT FROM a.request_id::text
+       OR NEW.retained_vm->>'provision_generation' IS DISTINCT FROM a.provision_generation::text
+       OR NEW.retained_vm->>'identity_provision_generation' IS DISTINCT FROM a.provision_generation::text
+       OR NEW.retained_vm->'identity_authenticated' IS DISTINCT FROM 'true'::jsonb
+       OR NEW.retained_vm->>'vm_uid' IS DISTINCT FROM a.vm_uid::text
+       OR NEW.retained_vm->>'rootdisk_pvc_uid' IS DISTINCT FROM a.pvc_uid::text
+       OR NEW.retained_vm->>'status' IS DISTINCT FROM 'deleted'
+       OR (source.observed_vm_uid IS NULL AND NEW.retained_vm IS DISTINCT FROM op.retained_vm) THEN
+        RAISE EXCEPTION 'VM retained terminal backing unproven' USING ERRCODE='23514';
+    END IF;
+    IF source.request_id IS NULL THEN
+        IF NEW.source_request_id IS NOT NULL OR NEW.source_terminal_evidence IS NOT NULL
+           OR NEW.compute_cleanup_admission_id IS DISTINCT FROM op.compute_cleanup_admission_id THEN
+            RAISE EXCEPTION 'VM retained terminal absent source changed' USING ERRCODE='23514';
+        END IF;
+    ELSE
+        evidence := public.vm_thread_retained_source_terminal_evidence(source);
+        IF NEW.source_request_id IS DISTINCT FROM source.request_id OR evidence IS NULL
+           OR NEW.source_terminal_evidence IS DISTINCT FROM evidence
+           OR (source.observed_vm_uid IS NULL AND NEW.compute_cleanup_admission_id IS DISTINCT FROM op.compute_cleanup_admission_id)
+           OR (source.observed_vm_uid IS NOT NULL AND a.request_id IS DISTINCT FROM source.request_id) THEN
+            RAISE EXCEPTION 'VM retained terminal source unproven' USING ERRCODE='23514';
+        END IF;
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+
+--
+-- Name: guard_workspace_idle_episode(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.guard_workspace_idle_episode() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+DECLARE
+    previous JSONB;
+    current_episode JSONB;
+    owner_kind TEXT;
+BEGIN
+    IF TG_OP='INSERT' THEN
+        IF NEW.workspace_idle_revision<>0 OR NEW.workspace_idle_episode IS NOT NULL THEN
+            RAISE EXCEPTION 'Idle episodes require an authorized owner transition' USING ERRCODE='23514';
+        END IF;
+        RETURN NEW;
+    END IF;
+    -- Status authorization belongs to the original writer and its other
+    -- guards. Normalize only an unchanged prior episode, inside that exact
+    -- terminal statement. Never hide an explicit invalid metadata mutation.
+    IF TG_TABLE_NAME='jobs' AND NEW.status::text IN ('completed','failed','cancelled') THEN
+        IF NEW.workspace_idle_episode IS NOT NULL THEN
+            IF OLD.workspace_idle_episode IS NULL
+               OR NEW.workspace_idle_episode IS DISTINCT FROM OLD.workspace_idle_episode
+               OR NEW.workspace_idle_revision<>OLD.workspace_idle_revision THEN
+                RAISE EXCEPTION 'Terminal Jobs cannot publish an idle episode' USING ERRCODE='23514';
+            END IF;
+            NEW.workspace_idle_episode := NULL;
+            NEW.workspace_idle_revision := OLD.workspace_idle_revision+1;
+        ELSIF OLD.workspace_idle_episode IS NOT NULL THEN
+            IF NEW.workspace_idle_revision<>OLD.workspace_idle_revision+1 THEN
+                RAISE EXCEPTION 'Terminal idle exit revision must advance exactly once' USING ERRCODE='23514';
+            END IF;
+        ELSIF NEW.workspace_idle_revision<>OLD.workspace_idle_revision THEN
+            RAISE EXCEPTION 'Terminal replay cannot advance idle revision' USING ERRCODE='23514';
+        END IF;
+    END IF;
+    previous := OLD.workspace_idle_episode;
+    current_episode := NEW.workspace_idle_episode;
+    IF NEW.workspace_idle_revision=OLD.workspace_idle_revision AND current_episode IS NOT DISTINCT FROM previous THEN
+        RETURN NEW;
+    END IF;
+    IF NEW.workspace_idle_revision<>OLD.workspace_idle_revision+1 THEN
+        RAISE EXCEPTION 'Idle episode revision must advance exactly once' USING ERRCODE='23514';
+    END IF;
+    IF current_episode IS NULL THEN
+        RETURN NEW;
+    END IF;
+    owner_kind := CASE WHEN TG_TABLE_NAME='jobs' THEN 'job' ELSE 'thread' END;
+    IF current_episode ? 'revision' OR current_episode->'version' IS DISTINCT FROM '1'::jsonb
+        OR current_episode->'runtime_identity'->>'owner_kind' IS DISTINCT FROM owner_kind
+        OR current_episode->'runtime_identity'->>'owner_id' IS DISTINCT FROM NEW.id::text THEN
+        RAISE EXCEPTION 'Idle episode owner identity changed' USING ERRCODE='23514';
+    END IF;
+    IF previous IS NOT NULL AND previous->'episode_id'=current_episode->'episode_id' THEN
+        IF ROW(previous->'wait_kind',previous->'wait_key',previous->'entered_at') IS DISTINCT FROM
+           ROW(current_episode->'wait_kind',current_episode->'wait_key',current_episode->'entered_at')
+           OR (current_episode->>'extend_count')::bigint < (previous->>'extend_count')::bigint
+           OR (previous->>'override_until' IS NOT NULL AND
+               (current_episode->>'override_until' IS NULL OR
+                (current_episode->>'override_until')::timestamptz < (previous->>'override_until')::timestamptz)) THEN
+            RAISE EXCEPTION 'Idle wait identity and age are immutable' USING ERRCODE='23514';
+        END IF;
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+
+--
+-- Name: job_vm_creation_never_issued_evidence(uuid, text); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.job_vm_creation_never_issued_evidence(requested_job uuid, requested_generation text) RETURNS boolean
+    LANGUAGE sql STABLE
+    AS $$
+    SELECT EXISTS (
+        SELECT 1 FROM public.jobs j
+        JOIN public.vm_creation_retries r ON r.job_id=j.id
+            AND r.owner_kind='job' AND r.provision_generation::text=requested_generation
+        JOIN public.vm_resource_waiters w ON w.request_id=r.request_id
+        WHERE j.id=requested_job
+          AND r.origin='initial' AND r.state='settled'
+          AND r.reason='creation_never_issued' AND r.resolved_at IS NOT NULL
+          AND r.expected_pvc_uid IS NULL AND r.observed_pvc_uid IS NULL
+          AND r.observed_vm_uid IS NULL AND r.ready_at IS NULL
+          AND r.boot_counted IS FALSE AND r.claim_token IS NULL
+          AND r.creation_admission_id IS NULL
+          AND r.creation_carrier_uid IS NULL AND r.creation_carrier_namespace IS NULL
+          AND r.disposition_carrier_uid IS NULL AND r.disposition_carrier_namespace IS NULL
+          AND r.cancellation_disposition IS NULL
+          AND r.cancellation_progress='{}'::jsonb
+          AND r.cancellation_completion='{}'::jsonb
+          AND r.predecessor_cleanup_admission_id IS NULL
+          AND r.predecessor_evidence='{}'::jsonb
+          AND jsonb_typeof(r.canonical_request)='object'
+          AND r.canonical_request->>'entity_type'='job'
+          AND r.canonical_request->>'job_id'=j.id::text
+          AND r.canonical_request->>'provision_generation'=requested_generation
+          AND COALESCE(r.canonical_request->'preparation','null'::jsonb)='null'::jsonb
+          AND COALESCE(r.canonical_request->'workspace_storage','null'::jsonb)='null'::jsonb
+          AND jsonb_typeof(r.controller_configuration)='object'
+          AND r.controller_configuration->'version'='3'::jsonb
+          AND w.owner_kind='job' AND w.job_id=j.id AND w.thread_id IS NULL
+          AND w.provision_generation=r.provision_generation
+          AND w.request_digest=r.request_digest AND w.state='cancelled'
+          AND w.reason='job_cancelled'
+          AND NOT EXISTS (SELECT 1 FROM public.vm_creation_effects e
+              WHERE e.request_id=r.request_id)
+          AND NOT EXISTS (SELECT 1 FROM public.vm_resource_reservations v
+              WHERE v.request_id=r.request_id)
+    );
+$$;
+
+
+--
+-- Name: job_vm_creation_never_issued_predecessors(uuid, text); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.job_vm_creation_never_issued_predecessors(requested_job uuid, requested_generation text) RETURNS boolean
+    LANGUAGE sql STABLE
+    AS $$
+    SELECT EXISTS (
+        SELECT 1 FROM public.jobs j
+        JOIN public.vm_creation_retries current_retry
+          ON current_retry.job_id=j.id
+         AND current_retry.owner_kind='job'
+         AND current_retry.provision_generation::text=requested_generation
+        WHERE j.id=requested_job
+          AND (
+            (COALESCE(j.context->'last_vm','null'::jsonb)
+                IN ('null'::jsonb,'{}'::jsonb)
+             AND NOT EXISTS (
+                 SELECT 1 FROM public.vm_creation_retries prior
+                 WHERE prior.job_id=j.id
+                   AND prior.provision_generation<>current_retry.provision_generation
+             ))
+            OR
+            (jsonb_typeof(j.context->'last_vm')='object'
+             AND j.context->'last_vm'->>'provision_generation' IS NOT NULL
+             AND j.context->'last_vm'->>'provision_generation'<>requested_generation
+             AND j.context->'last_vm'->>'status'='deleted'
+             AND j.context->'last_vm'->'identity_authenticated'='false'::jsonb
+             AND j.context->'last_vm'->'provision_attempts'='0'::jsonb
+             AND j.context->'last_vm'->>'identity_provision_generation' IS NULL
+             AND j.context->'last_vm'->>'vm_uid' IS NULL
+             AND j.context->'last_vm'->>'vmi_uid' IS NULL
+             AND j.context->'last_vm'->>'active_pod_uid' IS NULL
+             AND j.context->'last_vm'->>'_runtime_incarnation' IS NULL
+             AND j.context->'last_vm'->>'rootdisk_pvc_uid' IS NULL
+             AND j.context->'last_vm'->>'cloud_init_secret_uid' IS NULL
+             AND j.context->'last_vm'->>'ssh_host' IS NULL
+             AND j.context->'last_vm'->>'ssh_port' IS NULL
+             AND COALESCE(j.context->'last_vm'->'preparation_request','null'::jsonb)='null'::jsonb
+             AND COALESCE(j.context->'last_vm'->'preparation','null'::jsonb)='null'::jsonb
+             AND COALESCE(j.context->'last_vm'->'workspace_storage','null'::jsonb)='null'::jsonb
+             AND EXISTS (
+                 SELECT 1 FROM public.vm_creation_retries previous_retry
+                 WHERE previous_retry.job_id=j.id
+                   AND previous_retry.owner_kind='job'
+                   AND previous_retry.provision_generation::text=
+                       j.context->'last_vm'->>'provision_generation'
+                   AND previous_retry.provision_generation<>current_retry.provision_generation
+                   AND previous_retry.created_at<current_retry.created_at
+                   AND previous_retry.request_id=(
+                       SELECT latest.request_id FROM public.vm_creation_retries latest
+                       WHERE latest.job_id=j.id
+                         AND latest.provision_generation<>current_retry.provision_generation
+                       ORDER BY latest.created_at DESC,latest.request_id DESC LIMIT 1
+                   )
+                   AND j.context->'last_vm'->'creation_preflight'->>'request_id'=
+                       previous_retry.request_id::text
+                   AND j.context->'last_vm'->'creation_request'->>'provision_generation'=
+                       previous_retry.provision_generation::text
+                   AND j.context->'last_vm'->'creation_request'->'request'=
+                       previous_retry.canonical_request
+                   AND j.context->'last_vm'->'creation_request'->>'request_digest'=
+                       previous_retry.request_digest
+                   AND j.context->'last_vm'->'creation_request'->'controller_configuration'=
+                       previous_retry.controller_configuration
+                   AND j.context->'last_vm'->'creation_request'->>'controller_configuration_digest'=
+                       previous_retry.controller_configuration_digest
+                   AND public.job_vm_creation_never_issued_terminal_source(
+                       j.id,previous_retry.provision_generation::text)
+             )
+             AND NOT EXISTS (
+                 SELECT 1 FROM public.vm_creation_retries other
+                 WHERE other.job_id=j.id
+                   AND other.provision_generation<>current_retry.provision_generation
+                   AND NOT public.job_vm_creation_never_issued_terminal_source(
+                       j.id,other.provision_generation::text)
+             )
+             AND NOT EXISTS (
+                 SELECT 1 FROM public.vm_workspace_cleanup_admissions other_parent
+                 WHERE other_parent.owner_kind='job' AND other_parent.owner_id=j.id
+                   AND other_parent.source='job_terminal_vm_release'
+                   AND other_parent.request_id<>public.uuid_generate_v5(
+                       '6ba7b811-9dad-11d1-80b4-00c04fd430c8'::uuid,
+                       'vm-workspace-cleanup:job_terminal_vm_release:job:' ||
+                       j.id::text || ':' || requested_generation || ':None:'
+                   )
+                   AND NOT EXISTS (
+                       SELECT 1 FROM public.vm_creation_retries known
+                       WHERE known.job_id=j.id
+                         AND known.provision_generation<>
+                             current_retry.provision_generation
+                         AND other_parent.request_id=public.uuid_generate_v5(
+                             '6ba7b811-9dad-11d1-80b4-00c04fd430c8'::uuid,
+                             'vm-workspace-cleanup:job_terminal_vm_release:job:' ||
+                             j.id::text || ':' ||
+                             known.provision_generation::text || ':None:'
+                         )
+                         AND public.job_vm_creation_never_issued_terminal_source(
+                             j.id,known.provision_generation::text)
+                   )
+             ))
+          )
+    );
+$$;
+
+
+--
+-- Name: job_vm_creation_never_issued_source(uuid, text); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.job_vm_creation_never_issued_source(requested_job uuid, requested_generation text) RETURNS boolean
+    LANGUAGE sql STABLE
+    AS $_$
+    SELECT public.job_vm_creation_never_issued_evidence(
+        requested_job, requested_generation
+    ) AND EXISTS (
+        SELECT 1 FROM public.jobs j
+        JOIN public.vm_creation_retries r ON r.job_id=j.id
+            AND r.owner_kind='job' AND r.provision_generation::text=requested_generation
+        WHERE j.id=requested_job AND j.status::text='cancelled'
+          AND j.execution_lane='stateless' AND j.parent_job_id IS NULL
+          AND j.assigned_agent_id IS NULL
+          AND j.context->'_stateless_cancel_cleanup_pending'='true'::jsonb
+          AND j.context->>'_vm_creation_pending'=r.request_id::text
+          AND j.context->'vm'->>'provision_generation'=requested_generation
+          AND j.context->'vm'->>'status'='waiting_creation_configuration'
+          AND j.context->'vm'->'provision_attempts'='0'::jsonb
+          AND j.context->'vm'->'identity_authenticated'='false'::jsonb
+          AND j.context->'vm'->>'identity_provision_generation' IS NULL
+          AND j.context->'vm'->>'vm_uid' IS NULL
+          AND j.context->'vm'->>'vmi_uid' IS NULL
+          AND j.context->'vm'->>'active_pod_uid' IS NULL
+          AND j.context->'vm'->>'_runtime_incarnation' IS NULL
+          AND j.context->'vm'->>'rootdisk_pvc_uid' IS NULL
+          AND j.context->'vm'->>'cloud_init_secret_uid' IS NULL
+          AND j.context->'vm'->>'ssh_host' IS NULL
+          AND j.context->'vm'->>'ssh_port' IS NULL
+          AND COALESCE(j.context->'vm'->'preparation_request','null'::jsonb)='null'::jsonb
+          AND COALESCE(j.context->'vm'->'preparation','null'::jsonb)='null'::jsonb
+          AND COALESCE(j.context->'vm'->'workspace_storage','null'::jsonb)='null'::jsonb
+          AND jsonb_typeof(j.context->'vm'->'creation_preflight')='object'
+          AND j.context->'vm'->'creation_preflight'->>'state'='admitted'
+          AND j.context->'vm'->'creation_preflight'->>'request_id'=r.request_id::text
+          AND j.context->'vm'->'creation_preflight'->>'job_id'=j.id::text
+          AND COALESCE(j.context->'vm'->'creation_preflight'->'expected_pvc_uid',
+              'null'::jsonb)='null'::jsonb
+          AND COALESCE(j.context->'vm'->'creation_preflight'->'predecessor_cleanup_admission_id',
+              'null'::jsonb)='null'::jsonb
+          AND COALESCE(j.context->'vm'->'creation_preflight'->'predecessor_evidence',
+              '{}'::jsonb)='{}'::jsonb
+          AND j.context->'vm'->'creation_preflight'->'request'->>'entity_type'='job'
+          AND j.context->'vm'->'creation_preflight'->'request'->>'job_id'=j.id::text
+          AND j.context->'vm'->'creation_preflight'->'request'->>'provision_generation'=requested_generation
+          AND COALESCE(j.context->'vm'->'creation_preflight'->'request'->'preparation',
+              'null'::jsonb)='null'::jsonb
+          AND COALESCE(j.context->'vm'->'creation_preflight'->'request'->'workspace_storage',
+              'null'::jsonb)='null'::jsonb
+          AND j.context->'vm'->'creation_preflight'->>'request_digest' ~ '^sha256:[0-9a-f]{64}$'
+          AND j.context->'vm'->'creation_preflight'->>'execution_id'=r.execution_id::text
+          AND j.context->'vm'->'creation_preflight'->>'execution_revision'=r.execution_revision
+          AND j.context->'vm'->'creation_preflight'->>'execution_generation'=r.execution_generation::text
+          AND jsonb_typeof(j.context->'vm'->'creation_request')='object'
+          AND j.context->'vm'->'creation_request'->'version'='1'::jsonb
+          AND j.context->'vm'->'creation_request'->>'provision_generation'=requested_generation
+          AND j.context->'vm'->'creation_request'->'initial_request'='true'::jsonb
+          AND j.context->'vm'->'creation_request'->'issuance_authority_bound'='false'::jsonb
+          AND j.context->'vm'->'creation_request'->'controller_configuration_authenticated'='true'::jsonb
+          AND j.context->'vm'->'creation_request'->'request'=r.canonical_request
+          AND j.context->'vm'->'creation_request'->>'request_digest'=r.request_digest
+          AND j.context->'vm'->'creation_request'->'controller_configuration'=r.controller_configuration
+          AND j.context->'vm'->'creation_request'->>'controller_configuration_digest'=r.controller_configuration_digest
+          AND public.job_vm_creation_never_issued_predecessors(j.id,requested_generation)
+          AND COALESCE(j.context->'workspace_container','null'::jsonb)='null'::jsonb
+          AND COALESCE(j.context->'ide_session','null'::jsonb)='null'::jsonb
+          AND NOT EXISTS (SELECT 1 FROM public.srw_execution_workspace_bindings binding
+              JOIN public.vm_creation_retries r ON r.execution_id=binding.execution_id
+              WHERE r.job_id=j.id AND r.provision_generation::text=requested_generation)
+          AND NOT EXISTS (SELECT 1 FROM public.vm_idle_operations idle
+              WHERE idle.owner_kind='job' AND idle.owner_id=j.id
+                AND idle.provision_generation::text=requested_generation)
+          AND NOT EXISTS (SELECT 1 FROM public.vm_idle_access_leases lease
+              WHERE lease.owner_kind='job' AND lease.owner_id=j.id
+                AND lease.closed_at IS NULL)
+          AND NOT EXISTS (SELECT 1 FROM public.vm_workspace_recoveries recovery
+              WHERE recovery.owner_kind='job' AND recovery.owner_id=j.id
+                AND recovery.resolved_at IS NULL)
+          AND NOT EXISTS (SELECT 1 FROM public.vm_workspace_recovery_jobs recovery_job
+              WHERE recovery_job.job_id=j.id AND recovery_job.resolved_at IS NULL)
+          AND public.job_vm_never_issued_repository_safe(j.id)
+          AND NOT EXISTS (SELECT 1 FROM public.managed_repository_workspace_creation_reservations creation
+              WHERE creation.owner_kind='job' AND creation.owner_id=j.id)
+          AND NOT EXISTS (SELECT 1 FROM public.managed_repository_workspace_cleanup_intents cleanup
+              WHERE cleanup.owner_kind='job' AND cleanup.owner_id=j.id)
+    );
+$_$;
+
+
+--
+-- Name: job_vm_creation_never_issued_terminal_source(uuid, text); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.job_vm_creation_never_issued_terminal_source(requested_job uuid, requested_generation text) RETURNS boolean
+    LANGUAGE sql STABLE
+    AS $$
+    SELECT public.job_vm_unprotected_creation_never_issued_terminal_source(requested_job,requested_generation)
+      OR EXISTS(SELECT 1 FROM public.vm_job_retained_resumes op
+          JOIN public.vm_job_retained_resume_terminals t ON t.resume_id=op.id
+          WHERE op.job_id=requested_job AND op.provision_generation::text=requested_generation
+            AND t.terminal_kind IN ('source_absent','never_issued','creation_disposed')
+            AND public.vm_job_retained_terminal_valid(t.id));
+$$;
+
+
+--
+-- Name: job_vm_never_issued_history_safe(uuid); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.job_vm_never_issued_history_safe(requested_job uuid) RETURNS boolean
+    LANGUAGE sql STABLE
+    AS $$
+    SELECT EXISTS (
+        SELECT 1 FROM public.jobs j
+        WHERE j.id=requested_job AND j.parent_job_id IS NULL
+          AND j.assigned_agent_id IS NULL
+          AND NOT EXISTS (SELECT 1 FROM public.worker_batch_attempts batch
+              WHERE batch.job_id=j.id AND (batch.bundle_authorized_at IS NOT NULL
+                  OR batch.authority_digest IS NOT NULL))
+          AND NOT EXISTS (SELECT 1 FROM public.srw_execution_workspace_bindings b
+              JOIN public.srw_execution_specs x ON x.id=b.execution_id
+              WHERE x.work_kind='Job' AND x.work_id=j.id)
+          AND NOT EXISTS (SELECT 1 FROM public.srw_execution_attempts attempt
+              JOIN public.srw_execution_specs x ON x.id=attempt.execution_id
+              WHERE x.work_kind='Job' AND x.work_id=j.id)
+          AND NOT EXISTS (SELECT 1 FROM public.srw_workspace_instances instance
+              WHERE instance.owner_id=j.id OR instance.execution_id IN (
+                  SELECT x.id FROM public.srw_execution_specs x
+                  WHERE x.work_kind='Job' AND x.work_id=j.id))
+          AND NOT EXISTS (SELECT 1 FROM public.managed_repository_workspace_creation_reservations reservation
+              WHERE reservation.owner_kind='job' AND reservation.owner_id=j.id)
+          AND NOT EXISTS (SELECT 1 FROM public.managed_repository_workspace_cleanup_intents cleanup
+              WHERE cleanup.owner_kind='job' AND cleanup.owner_id=j.id)
+          AND NOT EXISTS (SELECT 1 FROM public.managed_repository_process_zero_receipts receipt
+              WHERE receipt.owner_kind='job' AND receipt.owner_id=j.id)
+          AND NOT EXISTS (SELECT 1 FROM public.vm_creation_retries r
+              WHERE r.job_id=j.id AND (
+                  r.owner_kind<>'job' OR r.state<>'settled' OR r.ready_at IS NOT NULL
+                  OR r.expected_pvc_uid IS NOT NULL OR r.observed_pvc_uid IS NOT NULL
+                  OR r.observed_vm_uid IS NOT NULL OR r.creation_admission_id IS NOT NULL
+                  OR r.creation_carrier_uid IS NOT NULL OR r.disposition_carrier_uid IS NOT NULL
+                  OR COALESCE(r.canonical_request->'preparation','null'::jsonb) <> 'null'::jsonb
+                  OR COALESCE(r.canonical_request->'workspace_storage','null'::jsonb) <> 'null'::jsonb))
+    );
+$$;
+
+
+--
+-- Name: job_vm_never_issued_repository_safe(uuid); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.job_vm_never_issued_repository_safe(requested_job uuid) RETURNS boolean
+    LANGUAGE sql STABLE
+    AS $$
+    SELECT EXISTS (
+        SELECT 1 FROM public.jobs j
+        WHERE j.id=requested_job
+          AND public.job_vm_never_issued_history_safe(j.id)
+          AND (
+              (j.repo_name IS NULL AND j.context->>'git_remote_url' IS NULL
+               AND NOT EXISTS (SELECT 1 FROM public.managed_repository_authorities a
+                   WHERE a.authority_kind='job' AND a.authority_id=j.id
+                     AND a.status IN ('provisioning','active','revoking'))
+               AND NOT EXISTS (SELECT 1 FROM public.managed_repository_creation_intents i
+                   WHERE i.authority_kind='job' AND i.authority_id=j.id
+                     AND i.status<>'deleted'))
+              OR public.job_vm_repository_pair_evidence(j.id) IS NOT NULL
+          )
+    );
+$$;
+
+
+--
+-- Name: job_vm_repository_pair_evidence(uuid); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.job_vm_repository_pair_evidence(requested_job uuid) RETURNS jsonb
+    LANGUAGE sql STABLE
+    AS $$
+    SELECT jsonb_build_object(
+        'authority_id',a.id,'creation_intent_id',i.id,
+        'repository_owner',a.repository_owner,'repo_name',a.repo_name,
+        'project_id',a.project_id,'forge_key_id',a.forge_key_id,
+        'key_generation',a.generation,'intent_generation',i.generation,
+        'clean_repo_url',a.clean_repo_url)
+    FROM public.jobs j
+    JOIN public.managed_repository_authorities a
+      ON a.authority_kind='job' AND a.authority_id=j.id
+    JOIN public.managed_repository_creation_intents i
+      ON i.id=a.creation_intent_id
+    WHERE j.id=requested_job
+      AND i.authority_kind='job' AND i.authority_id=j.id
+      AND a.status='active' AND i.status='created'
+      AND a.forge_key_id>0 AND a.activated_at IS NOT NULL
+      AND i.repository_created_at IS NOT NULL
+      AND a.access_mode='write' AND i.access_mode='write'
+      AND a.generation>0 AND i.generation>0
+      AND a.repository_owner=i.repository_owner AND a.repo_name=i.repo_name
+      AND a.project_id IS NOT DISTINCT FROM i.project_id
+      AND a.project_id IS NOT DISTINCT FROM j.project_id
+      AND a.repo_name=j.repo_name
+      AND a.repo_name='job-' || left(j.id::text,8)
+      AND a.clean_repo_url=j.context->>'git_remote_url'
+      AND NOT public.managed_repository_url_has_userinfo(a.clean_repo_url)
+      AND right(a.clean_repo_url,length('/' || a.repository_owner ||
+          '/' || a.repo_name || '.git'))='/' || a.repository_owner ||
+          '/' || a.repo_name || '.git'
+      AND (SELECT count(*) FROM public.managed_repository_authorities other
+           WHERE other.authority_kind='job' AND other.authority_id=j.id
+             AND other.status IN ('provisioning','active','revoking'))=1
+      AND (SELECT count(*) FROM public.managed_repository_creation_intents other
+           WHERE other.authority_kind='job' AND other.authority_id=j.id
+             AND other.status<>'deleted')=1;
+$$;
+
+
+--
+-- Name: job_vm_unprotected_creation_never_issued_terminal_source(uuid, text); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.job_vm_unprotected_creation_never_issued_terminal_source(requested_job uuid, requested_generation text) RETURNS boolean
+    LANGUAGE sql STABLE
+    AS $$
+    SELECT public.job_vm_creation_never_issued_evidence(
+        requested_job, requested_generation
+    ) AND EXISTS (
+        SELECT 1 FROM public.vm_workspace_cleanup_admissions parent
+        WHERE parent.owner_kind='job' AND parent.owner_id=requested_job
+          AND parent.source='job_terminal_vm_release'
+          AND parent.parent_admission_id IS NULL AND parent.pvc_uid IS NULL
+          AND parent.completed_at IS NOT NULL AND parent.outcome='completed'
+          AND parent.request_id=public.uuid_generate_v5(
+              '6ba7b811-9dad-11d1-80b4-00c04fd430c8'::uuid,
+              'vm-workspace-cleanup:job_terminal_vm_release:job:' ||
+              requested_job::text || ':' || requested_generation || ':None:'
+          )
+          AND parent.intent_digest='sha256:' || pg_catalog.encode(
+              pg_catalog.sha256(pg_catalog.convert_to(
+                  '{"owner_id":"' || requested_job::text ||
+                  '","owner_kind":"job","provision_generation":"' ||
+                  requested_generation ||
+                  '","purge_disk":true,"pvc_uid":"","resource":"vm_workspace",' ||
+                  '"source":"job_terminal_vm_release","vm_uid":""}',
+                  'UTF8'
+              )), 'hex'
+          )
+    );
+$$;
+
+
+--
 -- Name: lock_inventory_epoch_boundary_statement(); Type: FUNCTION; Schema: public; Owner: -
 --
 
@@ -7437,6 +12846,63 @@ BEGIN
             USING ERRCODE = '55000';
     END IF;
     RETURN NULL;
+END;
+$$;
+
+
+--
+-- Name: lock_job_repository_source_insert(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.lock_job_repository_source_insert() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+BEGIN
+    IF NEW.authority_kind='job' THEN
+        PERFORM 1 FROM public.jobs WHERE id=NEW.authority_id FOR SHARE;
+        IF NOT FOUND THEN
+            RAISE EXCEPTION 'managed repository Job owner is absent'
+                USING ERRCODE='23514';
+        END IF;
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+
+--
+-- Name: lock_job_vm_nondelivery_insert(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.lock_job_vm_nondelivery_insert() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+DECLARE owned_job uuid;
+BEGIN
+    IF TG_TABLE_NAME='managed_repository_process_zero_receipts'
+       OR TG_TABLE_NAME='managed_repository_workspace_creation_reservations'
+       OR TG_TABLE_NAME='managed_repository_workspace_cleanup_intents' THEN
+        IF NEW.owner_kind='job' THEN owned_job := NEW.owner_id; END IF;
+    ELSIF TG_TABLE_NAME='srw_execution_specs' THEN
+        IF NEW.work_kind='Job' THEN owned_job := NEW.work_id; END IF;
+    ELSIF TG_TABLE_NAME='srw_workspace_instances' THEN
+        SELECT work_id INTO owned_job FROM public.srw_execution_specs
+        WHERE id=NEW.execution_id AND work_kind='Job';
+        IF owned_job IS NULL THEN
+            SELECT id INTO owned_job FROM public.jobs WHERE id=NEW.owner_id;
+        END IF;
+    ELSE
+        SELECT work_id INTO owned_job FROM public.srw_execution_specs
+        WHERE id=NEW.execution_id AND work_kind='Job';
+    END IF;
+    IF owned_job IS NOT NULL THEN
+        PERFORM 1 FROM public.jobs WHERE id=owned_job FOR SHARE;
+        IF NOT FOUND THEN
+            RAISE EXCEPTION 'VM Job non-delivery source requires live owner'
+                USING ERRCODE='23514';
+        END IF;
+    END IF;
+    RETURN NEW;
 END;
 $$;
 
@@ -7526,6 +12992,23 @@ BEGIN
         END IF;
     END IF;
     RETURN NEW;
+END;
+$$;
+
+
+--
+-- Name: lock_vm_thread_creation_terminal_ledger(uuid, uuid); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.lock_vm_thread_creation_terminal_ledger(owned_thread uuid, source_request uuid) RETURNS void
+    LANGUAGE plpgsql
+    AS $$
+BEGIN
+    PERFORM 1 FROM public.vm_creation_effects WHERE request_id=source_request ORDER BY effect_nonce FOR SHARE;
+    PERFORM 1 FROM public.vm_workspace_cleanup_admissions
+        WHERE owner_kind='thread' AND owner_id=owned_thread ORDER BY id FOR SHARE;
+    PERFORM 1 FROM public.vm_resource_reservations WHERE request_id=source_request ORDER BY id FOR SHARE;
+    PERFORM 1 FROM public.vm_resource_waiters WHERE request_id=source_request FOR SHARE;
 END;
 $$;
 
@@ -7724,6 +13207,161 @@ $$;
 
 
 --
+-- Name: managed_repo_cancelled_creation_retirement_is_authorized_now(text, uuid, text, jsonb, jsonb); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.managed_repo_cancelled_creation_retirement_is_authorized_now(requested_owner_kind text, requested_owner_id uuid, requested_scope text, old_state jsonb, new_state jsonb) RETURNS boolean
+    LANGUAGE plpgsql
+    AS $_$
+DECLARE
+    owner_row RECORD;
+    reservation RECORD;
+    old_workspace JSONB;
+    new_workspace JSONB;
+    effect JSONB;
+    resource_kind TEXT;
+    resource_uid TEXT;
+BEGIN
+    -- This is retirement authority, never creator or Session authority.
+    IF requested_owner_kind IS DISTINCT FROM 'job'
+       OR requested_scope IS DISTINCT FROM 'workspace_container'
+       OR jsonb_typeof(old_state) IS DISTINCT FROM 'object'
+       OR jsonb_typeof(new_state) IS DISTINCT FROM 'object' THEN
+       RETURN FALSE;
+    END IF;
+    IF EXISTS (
+        SELECT 1 FROM jsonb_each(
+            public.managed_repository_workspace_authority_envelope(
+                old_state, 'workspace_container'
+            )
+        ) AS authority
+        WHERE authority.value IS DISTINCT FROM 'null'::JSONB
+    ) THEN
+        -- Preserve diagnostics, never stale physical or connection authority.
+        RETURN FALSE;
+    END IF;
+    old_workspace := old_state -> 'workspace_container';
+    IF old_workspace IS NULL THEN
+        old_workspace := '{}'::JSONB;
+    END IF;
+    new_workspace := new_state -> 'workspace_container';
+    IF jsonb_typeof(old_workspace) IS DISTINCT FROM 'object'
+       OR jsonb_typeof(new_workspace) IS DISTINCT FROM 'object'
+       OR old_workspace ?| ARRAY[
+           'status', 'provisioner', '_runtime_incarnation',
+           '_creation_reservation_id', '_creation_claim_token', 'container_id'
+       ]
+       OR old_state ? '_workspace_binding'
+       OR (new_workspace ->> 'status') IS DISTINCT FROM 'retiring_process_zero'
+       OR (new_workspace ->> 'provisioner') IS DISTINCT FROM 'k8s'
+       OR (old_state - 'workspace_container') IS DISTINCT FROM
+          (new_state - 'workspace_container') THEN
+        RETURN FALSE;
+    END IF;
+    SELECT status::TEXT AS status, execution_lane, assigned_agent_id, context
+      INTO owner_row FROM public.jobs
+     WHERE id = requested_owner_id FOR UPDATE;
+    IF NOT FOUND OR owner_row.status IS DISTINCT FROM 'cancelled'
+       OR owner_row.execution_lane IS DISTINCT FROM 'stateless'
+       OR owner_row.assigned_agent_id IS NOT NULL
+       OR owner_row.context IS DISTINCT FROM old_state THEN
+        RETURN FALSE;
+    END IF;
+    SELECT * INTO reservation
+      FROM public.managed_repository_workspace_creation_reservations
+     WHERE owner_kind = 'job' AND owner_id = requested_owner_id
+       AND scope = 'workspace_container'
+       AND id::TEXT = new_workspace ->> '_creation_reservation_id'
+       AND claim_token::TEXT = new_workspace ->> '_creation_claim_token'
+       AND runtime_incarnation::TEXT = new_workspace ->> '_runtime_incarnation'
+     FOR UPDATE;
+    IF NOT FOUND OR reservation.operation_kind IS DISTINCT FROM 'create'
+       OR reservation.phase IS DISTINCT FROM 'runtime_bound'
+       OR reservation.settled_at IS NOT NULL
+       OR reservation.cancel_requested_at IS NULL
+       OR reservation.expires_at <= clock_timestamp()
+       OR reservation.claimed_by IS NULL
+       OR reservation.claim_token <= 0
+       OR reservation.runtime_incarnation IS NULL
+       OR reservation.pod_uid IS DISTINCT FROM reservation.runtime_incarnation
+       OR reservation.cancel_target_disposition IS DISTINCT FROM 'deleted'
+       OR reservation.cancel_resource_policy IS DISTINCT FROM 'terminal_reclaim'
+       OR reservation.cancel_suspended_at IS NOT NULL
+       OR reservation.cancel_snapshot_restore_required IS DISTINCT FROM FALSE
+       OR jsonb_typeof(reservation.external_effects) IS DISTINCT FROM 'object'
+       OR new_state IS DISTINCT FROM jsonb_set(
+           old_state, '{workspace_container}', old_workspace || jsonb_build_object(
+               'status', 'retiring_process_zero', 'provisioner', 'k8s',
+               '_runtime_incarnation', reservation.runtime_incarnation::TEXT,
+               '_creation_reservation_id', reservation.id::TEXT,
+               '_creation_claim_token', reservation.claim_token::TEXT
+           ), TRUE
+       ) THEN
+        RETURN FALSE;
+    END IF;
+    IF (SELECT count(*) FROM public.managed_repository_workspace_creation_reservations
+         WHERE owner_kind = 'job' AND owner_id = requested_owner_id
+           AND scope = 'workspace_container' AND settled_at IS NULL) <> 1
+       OR EXISTS (SELECT 1 FROM public.managed_repository_workspace_cleanup_intents
+           WHERE owner_kind = 'job' AND owner_id = requested_owner_id
+             AND scope = 'workspace_container'
+             AND (settled_at IS NULL
+                  OR runtime_incarnation = reservation.runtime_incarnation))
+       OR public.managed_repository_workspace_has_process_zero_receipt(
+           'job', requested_owner_id, 'workspace_container',
+           reservation.runtime_incarnation::TEXT
+       ) THEN
+        RETURN FALSE;
+    END IF;
+    IF EXISTS (SELECT 1 FROM jsonb_object_keys(reservation.external_effects) AS key
+               WHERE key NOT IN ('pod', 'pvc', 'seed', 'service')) THEN
+        RETURN FALSE;
+    END IF;
+    FOR resource_kind, resource_uid IN
+        SELECT * FROM (VALUES
+            ('pod'::TEXT, reservation.pod_uid::TEXT),
+            ('pvc'::TEXT, reservation.pvc_uid::TEXT),
+            ('seed'::TEXT, reservation.seed_configmap_uid::TEXT),
+            ('service'::TEXT, reservation.service_uid::TEXT)
+        ) AS resources(kind, uid)
+    LOOP
+        effect := reservation.external_effects -> resource_kind;
+        IF effect IS NULL AND resource_uid IS NULL THEN
+            CONTINUE;
+        END IF;
+        IF jsonb_typeof(effect) IS DISTINCT FROM 'object'
+           OR jsonb_typeof(effect -> 'issued_at') IS DISTINCT FROM 'string'
+           OR jsonb_typeof(effect -> 'claim_token') IS DISTINCT FROM 'number'
+           OR (effect ->> 'claim_token') !~ '^[1-9][0-9]*$'
+           OR (effect ->> 'claim_token')::BIGINT > reservation.claim_token
+           OR (effect ->> 'issued_at')::TIMESTAMPTZ > now() THEN
+            RETURN FALSE;
+        END IF;
+        IF resource_uid IS NOT NULL THEN
+            IF (effect ->> 'observed_uid') IS DISTINCT FROM resource_uid
+               OR jsonb_typeof(effect -> 'observed_at') IS DISTINCT FROM 'string'
+               OR (effect ->> 'observed_at')::TIMESTAMPTZ > now()
+               OR (effect ->> 'issued_at')::TIMESTAMPTZ >
+                  (effect ->> 'observed_at')::TIMESTAMPTZ THEN
+                RETURN FALSE;
+            END IF;
+        ELSIF effect ->> 'observed_uid' IS NOT NULL
+           OR jsonb_typeof(effect -> 'ambiguity_until') IS DISTINCT FROM 'string'
+           OR (effect ->> 'ambiguity_until')::TIMESTAMPTZ > now() THEN
+            -- The existing quiescence rule: no unobserved accepted request
+            -- may still land. Observing a UID after its deadline is valid.
+            RETURN FALSE;
+        END IF;
+    END LOOP;
+    RETURN TRUE;
+EXCEPTION WHEN invalid_text_representation OR invalid_datetime_format
+    OR datetime_field_overflow OR numeric_value_out_of_range THEN
+    RETURN FALSE;
+END;
+$_$;
+
+
+--
 -- Name: managed_repo_terminal_cancel_projection_authorized_now(text, uuid, text, text, text, text, jsonb, jsonb); Type: FUNCTION; Schema: public; Owner: -
 --
 
@@ -7798,6 +13436,48 @@ BEGIN
             new_runtime_state - '_creation_claim_token' - 'status'
         );
 END;
+$$;
+
+
+--
+-- Name: managed_repo_uidless_ide_abort_authorized_now(uuid, jsonb, jsonb); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.managed_repo_uidless_ide_abort_authorized_now(requested_owner_id uuid, old_state jsonb, new_state jsonb) RETURNS boolean
+    LANGUAGE sql
+    AS $$
+    SELECT old_state #>> '{ide_session,status}' = 'restoring'
+       AND old_state #>> '{ide_session,restore_type}' = 'k8s_container'
+       AND old_state #>> '{ide_session,_runtime_incarnation}' IS NULL
+       AND old_state #>> '{ide_session,container_id}' IS NULL
+       AND old_state #>> '{ide_session,_restore_attempt_id}' IS NOT NULL
+       AND EXISTS (
+           SELECT 1
+             FROM public.managed_repository_workspace_creation_reservations r
+            WHERE r.owner_kind = 'job'
+              AND r.owner_id = requested_owner_id
+              AND r.scope = 'ide'
+              AND r.operation_kind = 'restore'
+              AND r.id::TEXT = old_state #>> '{ide_session,_creation_reservation_id}'
+              AND r.claim_token::TEXT = old_state #>> '{ide_session,_creation_claim_token}'
+              AND r.lifecycle_fingerprint->>'restore_attempt_id' =
+                  old_state #>> '{ide_session,_restore_attempt_id}'
+              AND r.lifecycle_fingerprint->>'restore_source' =
+                  old_state #>> '{ide_session,source}'
+              AND r.lifecycle_fingerprint->>'restore_snapshot_type' =
+                  old_state #>> '{ide_session,snapshot_type}'
+              AND r.phase = 'aborted' AND r.result_kind = 'aborted'
+              AND r.cancel_target_disposition = 'expired'
+              AND r.cancel_requested_at IS NOT NULL
+              AND r.cancel_cleanup_completed_at IS NOT NULL
+              AND r.cancel_projection_transaction_id = txid_current()
+              AND r.settled_at IS NOT NULL
+              AND r.external_mutation_started_at IS NULL
+              AND r.runtime_incarnation IS NULL AND r.pod_uid IS NULL
+       )
+       AND public.managed_repo_cancelled_creation_projection_authorized_now(
+           'job', requested_owner_id, 'ide', old_state, new_state
+       );
 $$;
 
 
@@ -8010,26 +13690,33 @@ CREATE FUNCTION public.managed_repository_process_zero_receipt_exists(requested_
     AS $_$
 BEGIN
     IF requested_runtime IS NULL
-       OR (
-           requested_scope = 'ide_local'
-           AND requested_runtime !~ '^[0-9a-f]{64}$'
-       )
-       OR (
-           requested_scope <> 'ide_local'
+       OR (requested_scope = 'ide_local'
+           AND requested_runtime !~ '^[0-9a-f]{64}$')
+       OR (requested_scope <> 'ide_local'
            AND requested_runtime !~
-              '^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$'
-       ) THEN
-        RETURN FALSE;
+           '^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$')
+    THEN
+        RETURN false;
     END IF;
-    RETURN EXISTS (
-        SELECT 1
-          FROM public.managed_repository_process_zero_receipts AS receipt
+    IF EXISTS (
+        SELECT 1 FROM public.managed_repository_process_zero_receipts receipt
          WHERE receipt.owner_kind = requested_owner_kind
            AND receipt.owner_id = requested_owner_id
            AND receipt.scope = requested_scope
            AND receipt.provisioner = requested_provisioner
            AND receipt.runtime_incarnation = requested_runtime
-    );
+    ) THEN
+        RETURN true;
+    END IF;
+    RETURN requested_scope = 'vm' AND requested_provisioner = 'vm'
+       AND (
+           (requested_owner_kind = 'thread'
+            AND public.thread_vm_creation_never_issued_source(
+                requested_owner_id, requested_runtime))
+           OR (requested_owner_kind = 'job'
+            AND public.job_vm_creation_never_issued_terminal_source(
+                requested_owner_id, requested_runtime))
+       );
 END;
 $_$;
 
@@ -8573,6 +14260,469 @@ $$;
 
 
 --
+-- Name: thread_agent_warm_binding_protections; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.thread_agent_warm_binding_protections (
+    protection_id uuid NOT NULL,
+    thread_id uuid NOT NULL,
+    runtime_generation uuid NOT NULL,
+    runtime_attach_token uuid NOT NULL,
+    agent_id uuid NOT NULL,
+    source character varying(24) NOT NULL,
+    provisioner character varying(16) NOT NULL,
+    namespace character varying(253) NOT NULL,
+    pod_name character varying(253) NOT NULL,
+    pod_uid text NOT NULL,
+    discovered_resource_version text NOT NULL,
+    status character varying(16) DEFAULT 'planned'::character varying NOT NULL,
+    lease_expires_at timestamp with time zone NOT NULL,
+    effect_token uuid,
+    effect_started_at timestamp with time zone,
+    effect_expires_at timestamp with time zone,
+    protection_resource_version text,
+    evidence_protocol character varying(48),
+    protected_at timestamp with time zone,
+    bound_at timestamp with time zone,
+    release_started_at timestamp with time zone,
+    release_outcome character varying(32),
+    abort_fence_protocol character varying(48),
+    abort_fence_resource_version text,
+    abort_fence_value text,
+    released_at timestamp with time zone,
+    created_at timestamp with time zone DEFAULT transaction_timestamp() NOT NULL,
+    CONSTRAINT thread_agent_warm_binding_pro_discovered_resource_version_check CHECK ((discovered_resource_version <> ''::text)),
+    CONSTRAINT thread_agent_warm_binding_protection_abort_fence_protocol_check CHECK (((abort_fence_protocol)::text = ANY ((ARRAY['unclaimed_plan_v1'::character varying, 'exact_rv_annotation_fence_v1'::character varying, 'exact_object_gone_v1'::character varying])::text[]))),
+    CONSTRAINT thread_agent_warm_binding_protections_check CHECK ((((pod_name)::text <> ''::text) AND (pod_uid <> ''::text))),
+    CONSTRAINT thread_agent_warm_binding_protections_check1 CHECK ((lease_expires_at > created_at)),
+    CONSTRAINT thread_agent_warm_binding_protections_check2 CHECK (((((status)::text = 'planned'::text) AND (effect_token IS NULL) AND (effect_started_at IS NULL) AND (effect_expires_at IS NULL) AND (protection_resource_version IS NULL) AND (evidence_protocol IS NULL) AND (protected_at IS NULL) AND (bound_at IS NULL) AND (release_started_at IS NULL) AND (abort_fence_protocol IS NULL) AND (abort_fence_resource_version IS NULL) AND (abort_fence_value IS NULL) AND (release_outcome IS NULL) AND (released_at IS NULL)) OR (((status)::text = 'protecting'::text) AND (effect_token IS NOT NULL) AND (effect_started_at IS NOT NULL) AND (effect_expires_at > effect_started_at) AND (effect_expires_at <= (effect_started_at + '00:03:00'::interval)) AND (protection_resource_version IS NULL) AND (evidence_protocol IS NULL) AND (protected_at IS NULL) AND (bound_at IS NULL) AND (release_started_at IS NULL) AND (abort_fence_protocol IS NULL) AND (abort_fence_resource_version IS NULL) AND (abort_fence_value IS NULL) AND (release_outcome IS NULL) AND (released_at IS NULL)) OR (((status)::text = 'protected'::text) AND (effect_token IS NOT NULL) AND (effect_started_at IS NOT NULL) AND (effect_expires_at IS NOT NULL) AND (NULLIF(protection_resource_version, ''::text) IS NOT NULL) AND ((evidence_protocol)::text = 'exact_live_finalizer_v1'::text) AND (protected_at IS NOT NULL) AND (bound_at IS NULL) AND (release_started_at IS NULL) AND (abort_fence_protocol IS NULL) AND (abort_fence_resource_version IS NULL) AND (abort_fence_value IS NULL) AND (release_outcome IS NULL) AND (released_at IS NULL)) OR (((status)::text = 'bound'::text) AND (effect_token IS NOT NULL) AND (effect_started_at IS NOT NULL) AND (effect_expires_at IS NOT NULL) AND (NULLIF(protection_resource_version, ''::text) IS NOT NULL) AND ((evidence_protocol)::text = 'exact_live_finalizer_v1'::text) AND (protected_at IS NOT NULL) AND (bound_at IS NOT NULL) AND (release_started_at IS NULL) AND (abort_fence_protocol IS NULL) AND (abort_fence_resource_version IS NULL) AND (abort_fence_value IS NULL) AND (release_outcome IS NULL) AND (released_at IS NULL)) OR (((status)::text = ANY (ARRAY[('releasing'::character varying)::text, ('terminal_release'::character varying)::text])) AND (effect_token IS NOT NULL) AND (effect_started_at IS NOT NULL) AND (effect_expires_at IS NOT NULL) AND (NULLIF(protection_resource_version, ''::text) IS NOT NULL) AND ((evidence_protocol)::text = 'exact_live_finalizer_v1'::text) AND (protected_at IS NOT NULL) AND (release_started_at IS NOT NULL) AND (abort_fence_protocol IS NULL) AND (abort_fence_resource_version IS NULL) AND (abort_fence_value IS NULL) AND (release_outcome IS NULL) AND (released_at IS NULL)) OR (((status)::text = 'released'::text) AND (effect_token IS NOT NULL) AND (effect_started_at IS NOT NULL) AND (effect_expires_at IS NOT NULL) AND (NULLIF(protection_resource_version, ''::text) IS NOT NULL) AND ((evidence_protocol)::text = 'exact_live_finalizer_v1'::text) AND (protected_at IS NOT NULL) AND (release_started_at IS NOT NULL) AND (abort_fence_protocol IS NULL) AND (abort_fence_resource_version IS NULL) AND (abort_fence_value IS NULL) AND (release_outcome IS NOT NULL) AND (released_at IS NOT NULL)) OR (((status)::text = 'aborted'::text) AND (protection_resource_version IS NULL) AND (evidence_protocol IS NULL) AND (protected_at IS NULL) AND (bound_at IS NULL) AND (release_started_at IS NULL) AND (((effect_token IS NULL) AND (effect_started_at IS NULL) AND (effect_expires_at IS NULL) AND ((abort_fence_protocol)::text = 'unclaimed_plan_v1'::text) AND (abort_fence_resource_version IS NULL) AND (abort_fence_value IS NULL)) OR ((effect_token IS NOT NULL) AND (effect_started_at IS NOT NULL) AND (effect_expires_at IS NOT NULL) AND ((((release_outcome)::text = 'exact_live_unprotected_v1'::text) AND ((abort_fence_protocol)::text = 'exact_rv_annotation_fence_v1'::text) AND (NULLIF(abort_fence_resource_version, ''::text) IS NOT NULL) AND (abort_fence_value = (((protection_id)::text || ':'::text) || (effect_token)::text))) OR (((release_outcome)::text = ANY (ARRAY[('exact_absent_v1'::character varying)::text, ('exact_replacement_v1'::character varying)::text])) AND ((abort_fence_protocol)::text = 'exact_object_gone_v1'::text) AND (abort_fence_resource_version IS NULL) AND (abort_fence_value IS NULL))))) AND (release_outcome IS NOT NULL) AND (released_at IS NOT NULL)))),
+    CONSTRAINT thread_agent_warm_binding_protections_namespace_check CHECK ((((length((namespace)::text) >= 1) AND (length((namespace)::text) <= 63)) AND ((namespace)::text ~ '^[a-z0-9]([-a-z0-9]*[a-z0-9])?$'::text))),
+    CONSTRAINT thread_agent_warm_binding_protections_provisioner_check CHECK (((provisioner)::text = ANY ((ARRAY['agent'::character varying, 'persistent'::character varying])::text[]))),
+    CONSTRAINT thread_agent_warm_binding_protections_release_outcome_check CHECK (((release_outcome)::text = ANY ((ARRAY['exact_live_unprotected_v1'::character varying, 'exact_absent_v1'::character varying, 'exact_replacement_v1'::character varying])::text[]))),
+    CONSTRAINT thread_agent_warm_binding_protections_source_check CHECK (((source)::text = ANY ((ARRAY['attach'::character varying, 'legacy_binding'::character varying])::text[]))),
+    CONSTRAINT thread_agent_warm_binding_protections_status_check CHECK (((status)::text = ANY ((ARRAY['planned'::character varying, 'protecting'::character varying, 'protected'::character varying, 'bound'::character varying, 'releasing'::character varying, 'terminal_release'::character varying, 'released'::character varying, 'aborted'::character varying])::text[])))
+);
+
+
+--
+-- Name: pinned_deleted_owner_warm_release_authorized(public.thread_agent_warm_binding_protections); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.pinned_deleted_owner_warm_release_authorized(warm public.thread_agent_warm_binding_protections) RETURNS boolean
+    LANGUAGE sql
+    AS $$
+    SELECT NOT EXISTS (
+               SELECT 1 FROM public.threads thread_row
+                WHERE thread_row.id = warm.thread_id
+           )
+       AND EXISTS (
+               SELECT 1 FROM public.thread_runtime_retirement_outcomes outcome
+                WHERE outcome.thread_id = warm.thread_id
+                  AND outcome.runtime_generation = warm.runtime_generation
+                  AND outcome.agent_id = warm.agent_id
+                  AND outcome.runtime_attach_token = warm.runtime_attach_token
+                  AND outcome.disposition = 'ended'
+                  AND outcome.permanent = true
+                  AND outcome.outcome = 'deleted'
+           )
+       AND NOT EXISTS (
+               SELECT 1 FROM public.agents actor
+                WHERE actor.id = warm.agent_id
+                  AND (actor.thread_id IS NOT NULL
+                       OR actor.current_job_id IS NOT NULL
+                       OR actor.status::text NOT IN ('draining', 'offline')
+                       OR actor.hostname IS DISTINCT FROM warm.pod_name
+                       OR actor.pod_uid IS DISTINCT FROM warm.pod_uid)
+           );
+$$;
+
+
+--
+-- Name: threads; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.threads (
+    id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
+    title text DEFAULT 'Untitled Session'::text,
+    user_id uuid,
+    project_id uuid,
+    agent_id uuid,
+    status character varying(20) DEFAULT 'created'::character varying NOT NULL,
+    permission_mode character varying(20) DEFAULT 'supervised'::character varying NOT NULL,
+    config_name character varying(100),
+    created_at timestamp with time zone DEFAULT CURRENT_TIMESTAMP,
+    last_activity timestamp with time zone DEFAULT CURRENT_TIMESTAMP,
+    ended_at timestamp with time zone,
+    metadata jsonb DEFAULT '{}'::jsonb,
+    total_turns integer DEFAULT 0,
+    total_tokens integer DEFAULT 0,
+    nc_session_folder text,
+    nc_share_id integer,
+    main_cloud_backend text,
+    main_cloud_session_handle text,
+    main_cloud_share_handle text,
+    events_epoch integer DEFAULT 0 NOT NULL,
+    awaiting_user_since timestamp with time zone,
+    extend_count integer DEFAULT 0 NOT NULL,
+    execution_lane text DEFAULT 'pinned'::text NOT NULL,
+    events_seq_hwm bigint DEFAULT 0 NOT NULL,
+    control_seq_hwm bigint DEFAULT 0 NOT NULL,
+    control_admission_agent_id uuid,
+    narration_mode text,
+    runtime_generation uuid DEFAULT public.uuid_generate_v4() NOT NULL,
+    runtime_retirement_token uuid,
+    runtime_retirement_permanent boolean,
+    runtime_retirement_started_at timestamp with time zone,
+    runtime_retirement_authorized_at timestamp with time zone,
+    runtime_retirement_context jsonb,
+    runtime_retirement_stage_receipt jsonb,
+    runtime_retirement_local_quiescence jsonb,
+    runtime_retirement_external_cleanup jsonb,
+    runtime_authority_exposed boolean DEFAULT false NOT NULL,
+    runtime_attach_token uuid,
+    runtime_attach_abort_receipt jsonb,
+    main_cloud_backend_instance_id uuid,
+    ssh_handle text,
+    kind text DEFAULT 'session'::text NOT NULL,
+    parent_job_id uuid,
+    parent_thread_id uuid,
+    parent_tool_call_id text,
+    subagent_handle text,
+    subagent_type text,
+    subagent_status text,
+    subagent_outcome text,
+    subagent_error text,
+    report_path text,
+    conversation_revision bigint DEFAULT 0 NOT NULL,
+    workspace_idle_revision bigint DEFAULT 0 NOT NULL,
+    workspace_idle_episode jsonb,
+    pinned_idle_terminal_intent_at timestamp with time zone,
+    runtime_retirement_actuator_request jsonb,
+    CONSTRAINT threads_conversation_revision_nonnegative CHECK ((conversation_revision >= 0)),
+    CONSTRAINT threads_kind_check CHECK ((kind = ANY (ARRAY['session'::text, 'subagent'::text]))),
+    CONSTRAINT threads_parent_shape_check CHECK ((((kind = 'session'::text) AND (parent_job_id IS NULL) AND (parent_thread_id IS NULL)) OR ((kind = 'subagent'::text) AND (num_nonnulls(parent_job_id, parent_thread_id) = 1)))),
+    CONSTRAINT threads_runtime_retirement_external_cleanup_shape CHECK (((runtime_retirement_external_cleanup IS NULL) OR ((runtime_retirement_token IS NOT NULL) AND (runtime_retirement_permanent = true) AND (jsonb_typeof(runtime_retirement_external_cleanup) = 'object'::text)))),
+    CONSTRAINT threads_runtime_retirement_local_quiescence_shape CHECK (((runtime_retirement_local_quiescence IS NULL) OR ((runtime_retirement_token IS NOT NULL) AND (jsonb_typeof(runtime_retirement_local_quiescence) = 'object'::text)))),
+    CONSTRAINT threads_runtime_retirement_shape CHECK ((((runtime_retirement_token IS NULL) AND (runtime_retirement_permanent IS NULL) AND (runtime_retirement_started_at IS NULL) AND (runtime_retirement_authorized_at IS NULL) AND (runtime_retirement_context IS NULL)) OR ((runtime_retirement_token IS NOT NULL) AND (runtime_retirement_permanent IS NOT NULL) AND (runtime_retirement_started_at IS NOT NULL) AND (jsonb_typeof(runtime_retirement_context) = 'object'::text)))),
+    CONSTRAINT threads_runtime_retirement_stage_receipt_shape CHECK (((runtime_retirement_stage_receipt IS NULL) OR ((runtime_retirement_token IS NOT NULL) AND (jsonb_typeof(runtime_retirement_stage_receipt) = 'object'::text)))),
+    CONSTRAINT valid_narration_mode CHECK ((narration_mode = ANY (ARRAY['silent'::text, 'verbose'::text, 'auto'::text]))),
+    CONSTRAINT valid_permission_mode CHECK (((permission_mode)::text = ANY ((ARRAY['supervised'::character varying, 'auto_accept'::character varying, 'autonomous'::character varying])::text[]))),
+    CONSTRAINT valid_thread_status CHECK (((status)::text = ANY ((ARRAY['created'::character varying, 'active'::character varying, 'idle'::character varying, 'awaiting_user'::character varying, 'suspended'::character varying, 'ended'::character varying])::text[])))
+);
+
+
+--
+-- Name: COLUMN threads.events_epoch; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.threads.events_epoch IS 'Current event-log writer generation (client-visible). Bumped only deliberately: rewind, a reaper/steal takeover, or an attach that finds the previous session life terminal (terminal thread status, a terminal lifecycle frame in the epoch, or the epoch wholly beyond retention). Clean reattaches REUSE the epoch so cached client cursors stay valid; an older-epoch cursor triggers authoritative re-sync (gone_beyond_horizon). See docs/features/stateless_agents.md §5.3.2.';
+
+
+--
+-- Name: COLUMN threads.awaiting_user_since; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.threads.awaiting_user_since IS 'Set by the agent when it reaches a natural pause untethered. The attention_sleep_sweeper suspends the workspace when this exceeds headless_attention_sleep_minutes. Cleared on reattach.';
+
+
+--
+-- Name: COLUMN threads.extend_count; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.threads.extend_count IS 'Number of magic-link extend-window clicks since this awaiting_user session began. Capped at 4 (= 4h ceiling at default 60min/extend).';
+
+
+--
+-- Name: COLUMN threads.execution_lane; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.threads.execution_lane IS 'Which execution plane serves this thread: ''pinned'' (registered-agent pod, the default) or ''stateless'' (run_queue claim by any pod). App-validated by design — no CHECK. See docs/features/stateless_agents.md §5.4.4.';
+
+
+--
+-- Name: COLUMN threads.events_seq_hwm; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.threads.events_seq_hwm IS 'Highest seq ever allocated in the CURRENT events_epoch. Survives retention pruning of the thread_events rows themselves; reset to 0 atomically on every epoch bump. Maintained by the agent journal writer''s fenced flush (GREATEST over the batch in the same statement) and pre-incremented by the system-frame allocator (src/shared/event_journal). Attach seeds its in-process counter from GREATEST(events_seq_hwm, MAX(seq) of the epoch). See docs/features/stateless_agents.md §5.3.2.';
+
+
+--
+-- Name: COLUMN threads.control_seq_hwm; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.threads.control_seq_hwm IS 'Highest commit-ordered thread_control_requests.request_seq allocated for this thread. Admission increments it while holding the threads row lock; never allocate request order from an IDENTITY/sequence.';
+
+
+--
+-- Name: COLUMN threads.control_admission_agent_id; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.threads.control_admission_agent_id IS 'Exact pinned-owner capability and teardown fence. NULL is closed. An inbox-capable reciprocal owner writes its own agent UUID after attach and clears it before its final drain. A stale credential never transfers to a different owner generation.';
+
+
+--
+-- Name: COLUMN threads.narration_mode; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.threads.narration_mode IS 'Durable interactive narration mode (silent | verbose | auto). NULL means the thread still inherits its resolved config; creation and the serving control owner materialize an explicit value.';
+
+
+--
+-- Name: COLUMN threads.runtime_generation; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.threads.runtime_generation IS 'Immutable authority for one pinned/stateless session runtime life. The database rotates it on the sole ended->created Resume edge.';
+
+
+--
+-- Name: COLUMN threads.runtime_retirement_token; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.threads.runtime_retirement_token IS 'Non-NULL closes pinned runtime admission while exact external cleanup is retryable.';
+
+
+--
+-- Name: COLUMN threads.runtime_retirement_authorized_at; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.threads.runtime_retirement_authorized_at IS 'Append-once preflight authorization for the pending retirement. Exact agents do not begin local teardown and reconcilers do not actuate before it is set.';
+
+
+--
+-- Name: COLUMN threads.runtime_retirement_context; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.threads.runtime_retirement_context IS 'Immutable identities captured when pinned retirement closes admission; cleanup must target these identities, never names alone.';
+
+
+--
+-- Name: COLUMN threads.runtime_retirement_stage_receipt; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.threads.runtime_retirement_stage_receipt IS 'Append-once exact staging publication receipt for retrying a soft retirement after workspace/reader cleanup; cleared only by settlement.';
+
+
+--
+-- Name: COLUMN threads.runtime_retirement_local_quiescence; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.threads.runtime_retirement_local_quiescence IS 'Append-once exact agent acknowledgement that shell, overlay, mounts, and ordinary event writers are quiesced for the pending runtime retirement.';
+
+
+--
+-- Name: COLUMN threads.runtime_authority_exposed; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.threads.runtime_authority_exposed IS 'Monotonic within one runtime_generation: true once any pinned process authority was delivered; reset only by the database generation-rotation edge.';
+
+
+--
+-- Name: COLUMN threads.runtime_attach_token; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.threads.runtime_attach_token IS 'Exact physical pinned-process attach identity; register/bind rotates it and every maintenance or credential request must match it with runtime_generation.';
+
+
+--
+-- Name: COLUMN threads.runtime_attach_abort_receipt; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.threads.runtime_attach_abort_receipt IS 'Last exact pre-input attach-abort rotation receipt. Internal authority only; browser thread payloads must redact it.';
+
+
+--
+-- Name: COLUMN threads.kind; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.threads.kind IS 'What this row is: ''session'' (an interactive thread, the default) or ''subagent'' (a child session a worker job or a session spawned through delegate_agent; U3). Session listings filter on kind so child rows never reach the sessions page; the subagent_* / parent_* columns are NULL for sessions.';
+
+
+--
+-- Name: COLUMN threads.parent_job_id; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.threads.parent_job_id IS 'kind=subagent only: the worker job that spawned this child. ON DELETE CASCADE — a job takes its children with it (delete_job ends live children first, because the pinned delete authority only lets an ended, authority-free row go).';
+
+
+--
+-- Name: COLUMN threads.parent_thread_id; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.threads.parent_thread_id IS 'kind=subagent only: the session thread that spawned this child (U5 session parents). NULL for a worker-job parent. ON DELETE CASCADE.';
+
+
+--
+-- Name: COLUMN threads.parent_tool_call_id; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.threads.parent_tool_call_id IS 'kind=subagent only: the parent''s delegate_agent tool call this child answered. The non-NULL parent plus parent_tool_call_id is the idempotency key: a parent re-running its tools node after a hard kill replays the stored report instead of spawning again; both parent forms are unique in the database.';
+
+
+--
+-- Name: COLUMN threads.subagent_handle; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.threads.subagent_handle IS 'kind=subagent only: the short handle the parent sees (<type>-<4 hex>, e.g. implementer-7f3a) — unique per parent, not globally; the durable identity is the thread id.';
+
+
+--
+-- Name: COLUMN threads.subagent_type; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.threads.subagent_type IS 'kind=subagent only: the roster entry name the child ran as (explorer, implementer, reviewer, ...).';
+
+
+--
+-- Name: COLUMN threads.subagent_status; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.threads.subagent_status IS 'kind=subagent only: the bare lifecycle kind, written by the agent-side ledger. Open set by design — app-validated, no CHECK, so a new kind never needs a migration. Today: running | completed | parked | interrupted | capped | error | cancelled (src/subagents/ledger.py SUBAGENT_STATUSES). Anything other than running is terminal, and a terminal write also moves status to ended and stamps ended_at.';
+
+
+--
+-- Name: COLUMN threads.subagent_outcome; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.threads.subagent_outcome IS 'kind=subagent only: the driver''s full classification behind subagent_status (capped:turns, interrupted:drain, interrupted:stale, cancelled:parent_deleted, ...). Free text; the cockpit shows it as the outcome badge detail.';
+
+
+--
+-- Name: COLUMN threads.subagent_error; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.threads.subagent_error IS 'kind=subagent only: the error text of an error / cancelled child, NULL otherwise.';
+
+
+--
+-- Name: COLUMN threads.report_path; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.threads.report_path IS 'kind=subagent only: workspace-relative path of the child''s full spilled report in the PARENT tree (.subagents/<handle>/report.md); NULL when the spill failed. The replay path re-renders the envelope from this file.';
+
+
+--
+-- Name: COLUMN threads.conversation_revision; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.threads.conversation_revision IS 'Monotonic transcript-view revision. Incremented only by an applied conversation rewind; clients fence delayed human input and cached history against it.';
+
+
+--
+-- Name: COLUMN threads.runtime_retirement_actuator_request; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.threads.runtime_retirement_actuator_request IS 'Exact authenticated local VM drain handoff; permits existing actuator only, never process zero or End completion.';
+
+
+--
+-- Name: pinned_pre_setup_retirement_request_valid(public.threads, jsonb, boolean); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.pinned_pre_setup_retirement_request_valid(owner_row public.threads, marker jsonb, require_actor boolean DEFAULT false) RETURNS boolean
+    LANGUAGE plpgsql STABLE
+    AS $$
+DECLARE
+    context jsonb := owner_row.runtime_retirement_context;
+    pod jsonb := context->'agent_pod';
+    actor public.agents%ROWTYPE;
+    expected jsonb;
+    source jsonb := context->'vm_creation_source';
+    physical jsonb := context->'vm';
+BEGIN
+    IF owner_row.execution_lane IS DISTINCT FROM 'pinned'
+       OR owner_row.runtime_retirement_token IS NULL
+       OR owner_row.runtime_retirement_authorized_at IS NULL
+       OR owner_row.agent_id IS NULL OR owner_row.runtime_attach_token IS NULL
+       OR context->>'thread_id' IS DISTINCT FROM owner_row.id::text
+       OR context->>'generation' IS DISTINCT FROM owner_row.runtime_generation::text
+       OR context->>'agent_id' IS DISTINCT FROM owner_row.agent_id::text
+       OR context->>'runtime_attach_token' IS DISTINCT FROM owner_row.runtime_attach_token::text
+       OR context->>'settle_status' IS DISTINCT FROM 'ended'
+       OR owner_row.status NOT IN ('created','active')
+       OR owner_row.runtime_authority_exposed IS DISTINCT FROM true
+       OR COALESCE(context->>'workspace_backend','') NOT IN ('vm','remote')
+       OR pod->>'protection_protocol' IS DISTINCT FROM 'finalizer_v1'
+       OR NULLIF(pod->>'namespace','') IS NULL OR NULLIF(pod->>'pod_name','') IS NULL
+       OR NULLIF(pod->>'pod_uid','') IS NULL
+       OR context->'agent'->>'hostname' IS DISTINCT FROM pod->>'pod_name'
+       OR context->'agent'->>'pod_uid' IS DISTINCT FROM pod->>'pod_uid'
+       OR owner_row.metadata->'agent_pod' IS DISTINCT FROM pod THEN
+        RETURN false;
+    END IF;
+    -- Physical identity is captured by Begin, never supplied or fabricated by
+    -- a booting actor. An uncreated VM requires its immutable creation source.
+    IF COALESCE(physical,'null'::jsonb) = 'null'::jsonb THEN
+        IF context->>'workspace_backend' IS DISTINCT FROM 'vm'
+           OR jsonb_typeof(source) IS DISTINCT FROM 'object'
+           OR source->'captured_vm'->>'vm_uid' IS NOT NULL
+           OR (
+               owner_row.metadata->'vm' IS DISTINCT FROM source->'captured_vm'
+               AND NOT public.thread_vm_creation_never_issued_source(
+                   owner_row.id,source->>'provision_generation')
+           )
+           OR NOT EXISTS (
+               SELECT 1 FROM public.vm_creation_retries c
+                WHERE c.request_id::text=source->>'request_id'
+                  AND c.owner_kind='thread' AND c.thread_id=owner_row.id
+                  AND c.provision_generation::text=source->>'provision_generation'
+                  AND c.thread_runtime_generation::text=source->>'thread_runtime_generation'
+                  AND c.request_digest=source->>'request_digest'
+           ) THEN RETURN false; END IF;
+    ELSIF jsonb_typeof(physical) IS DISTINCT FROM 'object'
+       OR physical->'identity_authenticated' IS DISTINCT FROM 'true'::jsonb
+       OR physical->>'identity_provision_generation' IS DISTINCT FROM physical->>'provision_generation'
+       OR NULLIF(physical->>'vm_uid','') IS NULL
+       OR (owner_row.runtime_retirement_permanent AND NULLIF(physical->>'rootdisk_pvc_uid','') IS NULL)
+       OR public.pinned_retirement_external_cleanup_expected(context,owner_row.runtime_generation,
+            owner_row.runtime_retirement_token)->>'workspace_cleanup_protocol'
+            IS DISTINCT FROM 'workspace_actuator_zero_v1' THEN
+        RETURN false;
+    END IF;
+    expected := jsonb_build_object(
+        'kind','agent_pre_setup_retirement_v1','thread_id',owner_row.id::text,
+        'agent_id',owner_row.agent_id::text,'pod_uid',pod->>'pod_uid',
+        'runtime_generation',owner_row.runtime_generation::text,
+        'runtime_attach_token',owner_row.runtime_attach_token::text,
+        'retirement_token',owner_row.runtime_retirement_token::text,
+        'disposition','ended','permanent',owner_row.runtime_retirement_permanent
+    );
+    IF marker IS DISTINCT FROM expected THEN RETURN false; END IF;
+    IF NOT EXISTS (
+        SELECT 1 FROM public.thread_agent_pod_provision_intents i
+         WHERE i.attempt_id::text=pod->>'provision_attempt' AND i.thread_id=owner_row.id
+           AND i.runtime_generation=owner_row.runtime_generation AND i.status='published'
+           AND i.provisioner IN ('agent','persistent') AND i.namespace=pod->>'namespace'
+           AND i.pod_name=pod->>'pod_name' AND i.pod_uid=pod->>'pod_uid'
+           AND i.protection_protocol='finalizer_v1'
+    ) THEN RETURN false; END IF;
+    SELECT * INTO actor FROM public.agents WHERE id=owner_row.agent_id;
+    IF actor.id IS NULL THEN
+        IF require_actor THEN RETURN false; END IF;
+    ELSIF actor.thread_id IS DISTINCT FROM owner_row.id
+       OR actor.pod_uid IS DISTINCT FROM pod->>'pod_uid'
+       OR actor.hostname IS DISTINCT FROM pod->>'pod_name'
+       OR actor.agent_mode IS DISTINCT FROM 'persistent'
+       OR actor.current_job_id IS NOT NULL THEN RETURN false;
+    END IF;
+    -- Supported producers lock the owner and refuse T. Process input generation
+    -- is distinct from G, so work is checked by the captured actor/Pod tuple.
+    IF EXISTS (SELECT 1 FROM public.thread_input_deliveries
+                WHERE thread_id=owner_row.id AND owner_agent_id=owner_row.agent_id
+                  AND owner_pod_uid=pod->>'pod_uid'
+                  AND state IN ('owned','queued','admitted','settled'))
+       OR EXISTS (SELECT 1 FROM public.thread_control_requests
+                   WHERE thread_id=owner_row.id AND runtime_generation=owner_row.runtime_generation)
+       OR EXISTS (SELECT 1 FROM public.thread_permission_requests
+                   WHERE thread_id=owner_row.id AND status='pending')
+       OR EXISTS (SELECT 1 FROM public.threads WHERE parent_thread_id=owner_row.id) THEN
+        RETURN false;
+    END IF;
+    RETURN true;
+END;
+$$;
+
+
+--
 -- Name: pinned_retirement_external_cleanup_expected(jsonb, uuid, uuid); Type: FUNCTION; Schema: public; Owner: -
 --
 
@@ -8696,8 +14846,8 @@ BEGIN
             '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
         OR workspace_intent->>'thread_id'
             IS DISTINCT FROM retirement_context->>'thread_id'
-        OR workspace_intent->>'runtime_generation'
-            IS DISTINCT FROM runtime_generation::text
+        OR NOT public.pinned_workspace_provision_capture_shape_is_current(
+            (retirement_context->>'thread_id')::uuid,runtime_generation,workspace_intent)
         OR NULLIF(workspace_intent->>'namespace', '') IS NULL
         OR NULLIF(workspace_intent->>'pod_name', '') IS NULL
         OR NULLIF(workspace_intent->>'network_tier', '') IS NULL
@@ -8910,7 +15060,7 @@ CREATE FUNCTION public.pinned_retirement_workspace_provision_intent_retired(subj
              AND COALESCE(captured_intent->>'attempt_id', '') ~
                 '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
              AND captured_intent->>'thread_id' = subject_thread_id::text
-             AND captured_intent->>'runtime_generation' = runtime_generation::text
+             AND public.pinned_workspace_provision_capture_is_current(subject_thread_id,runtime_generation,captured_intent)
              AND NULLIF(captured_intent->>'namespace', '') IS NOT NULL
              AND NULLIF(captured_intent->>'pod_name', '') IS NOT NULL
              AND NULLIF(captured_intent->>'network_tier', '') IS NOT NULL
@@ -8934,8 +15084,12 @@ CREATE FUNCTION public.pinned_retirement_workspace_provision_intent_retired(subj
                   FROM public.thread_workspace_provision_intents intent
                  WHERE intent.attempt_id::text = captured_intent->>'attempt_id'
                    AND intent.thread_id = subject_thread_id
-                   AND intent.runtime_generation = runtime_generation
+                   AND intent.runtime_generation::text = captured_intent->>'runtime_generation'
                    AND intent.status IN ('fenced', 'retired')
+                   AND (NOT require_all_resource_fences
+                        OR intent.cleanup_disposition IS NULL
+                        OR (intent.cleanup_disposition='purge'
+                            AND intent.purge_completed_at IS NOT NULL))
                    AND (
                        NOT require_all_resource_fences
                        OR intent.status = 'retired'
@@ -8999,6 +15153,422 @@ CREATE FUNCTION public.pinned_retirement_workspace_provision_intent_retired(subj
         ELSE false
     END, false);
 $_$;
+
+
+--
+-- Name: pinned_session_child_may_produce(uuid); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.pinned_session_child_may_produce(child_id uuid) RETURNS boolean
+    LANGUAGE sql STABLE
+    AS $$
+    SELECT EXISTS (
+               SELECT 1 FROM public.threads child
+                WHERE child.id = child_id
+                  AND (child.agent_id IS NOT NULL
+                       OR child.control_admission_agent_id IS NOT NULL
+                       OR child.runtime_attach_token IS NOT NULL
+                       OR child.runtime_authority_exposed
+                       OR child.runtime_retirement_token IS NOT NULL
+                       OR COALESCE(child.metadata->'agent_pod', 'null'::jsonb)
+                          NOT IN ('null'::jsonb, '{}'::jsonb)
+                       OR COALESCE(child.metadata->'vm', 'null'::jsonb)
+                          NOT IN ('null'::jsonb, '{}'::jsonb)
+                       OR COALESCE(child.metadata->'_workspace_binding', 'null'::jsonb)
+                          NOT IN ('null'::jsonb, '{}'::jsonb)))
+        OR EXISTS (SELECT 1 FROM public.agents WHERE thread_id = child_id)
+        OR EXISTS (SELECT 1 FROM public.threads WHERE parent_thread_id = child_id)
+        OR EXISTS (SELECT 1 FROM public.thread_input_deliveries
+                    WHERE thread_id = child_id AND state NOT IN ('settled','cancelled'))
+        OR EXISTS (SELECT 1 FROM public.thread_control_requests
+                    WHERE thread_id = child_id AND outcome IS NULL)
+        OR EXISTS (SELECT 1 FROM public.thread_permission_requests
+                    WHERE thread_id = child_id AND status = 'pending')
+        OR EXISTS (SELECT 1 FROM public.thread_interrupt_requests
+                    WHERE thread_id = child_id AND
+                      (outcome IS NULL OR (outcome = 'applied' AND
+                       NOT (COALESCE(result, '{}'::jsonb) ? 'consumed_input_seq'))))
+        OR EXISTS (SELECT 1 FROM public.run_queue
+                    WHERE unit_id = child_id AND (state <> 'done' OR leased_by IS NOT NULL))
+        OR EXISTS (SELECT 1 FROM public.completion_effects
+                    WHERE (scope_id = child_id OR producer_id = child_id)
+                      AND (state <> 'done' OR claimed_by IS NOT NULL))
+        OR EXISTS (SELECT 1 FROM public.thread_agent_workspace_claims
+                    WHERE thread_id = child_id AND status <> 'reclaimed')
+        OR EXISTS (SELECT 1 FROM public.thread_workspace_provision_intents
+                    WHERE thread_id = child_id)
+        OR EXISTS (SELECT 1 FROM public.managed_repository_workspace_creation_reservations
+                    WHERE owner_kind = 'thread' AND owner_id = child_id)
+        OR EXISTS (SELECT 1 FROM public.cloud_ro_mounts
+                    WHERE thread_id = child_id AND status IN ('engaging','active','revoking'))
+$$;
+
+
+--
+-- Name: pinned_vm_actuator_request_valid(public.threads, jsonb, boolean); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.pinned_vm_actuator_request_valid(owner_row public.threads, marker jsonb, require_actor boolean DEFAULT false) RETURNS boolean
+    LANGUAGE plpgsql STABLE
+    AS $_$
+DECLARE
+    context jsonb := owner_row.runtime_retirement_context;
+    vm jsonb := context->'vm';
+    pod jsonb := context->'agent_pod';
+    actor public.agents%ROWTYPE;
+    expected jsonb;
+    workspace_incarnation text := vm->>'active_pod_uid';
+    legacy_durable_marker boolean := NOT require_actor
+        AND marker IS NOT NULL
+        AND marker = owner_row.runtime_retirement_actuator_request
+        AND marker->>'workspace_runtime_incarnation' = vm->>'vm_uid';
+BEGIN
+    IF marker->>'kind' = 'agent_pre_setup_retirement_v1' THEN
+        RETURN public.pinned_pre_setup_retirement_request_valid(owner_row,marker,require_actor);
+    END IF;
+    IF owner_row.execution_lane IS DISTINCT FROM 'pinned'
+       OR owner_row.runtime_retirement_token IS NULL
+       OR owner_row.runtime_retirement_authorized_at IS NULL
+       OR owner_row.agent_id IS NULL OR owner_row.runtime_attach_token IS NULL
+       OR context->>'thread_id' IS DISTINCT FROM owner_row.id::text
+       OR context->>'generation' IS DISTINCT FROM owner_row.runtime_generation::text
+       OR context->>'agent_id' IS DISTINCT FROM owner_row.agent_id::text
+       OR context->>'runtime_attach_token' IS DISTINCT FROM owner_row.runtime_attach_token::text
+       OR context->>'settle_status' IS DISTINCT FROM 'ended'
+       OR COALESCE(context->>'workspace_backend','') NOT IN ('vm','remote')
+       OR jsonb_typeof(vm) IS DISTINCT FROM 'object'
+       OR vm->'identity_authenticated' IS DISTINCT FROM 'true'::jsonb
+       OR vm->>'identity_provision_generation' IS DISTINCT FROM vm->>'provision_generation'
+       OR COALESCE(vm->>'provision_generation','') !~ '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+       OR NULLIF(vm->>'vm_uid','') IS NULL
+       OR (vm->>'_runtime_incarnation' IS NOT NULL AND vm->>'_runtime_incarnation' IS DISTINCT FROM vm->>'vm_uid')
+       OR (owner_row.runtime_retirement_permanent AND NULLIF(vm->>'rootdisk_pvc_uid','') IS NULL)
+       OR COALESCE(context->'workspace_binding','null'::jsonb) NOT IN ('null'::jsonb,'{}'::jsonb)
+       OR COALESCE(context->'workspace_provision_intent','null'::jsonb) NOT IN ('null'::jsonb,'{}'::jsonb)
+       OR public.pinned_retirement_external_cleanup_expected(context, owner_row.runtime_generation,
+            owner_row.runtime_retirement_token)->>'workspace_cleanup_protocol' IS DISTINCT FROM 'workspace_actuator_zero_v1'
+       OR pod->>'protection_protocol' IS DISTINCT FROM 'finalizer_v1'
+       OR NULLIF(pod->>'namespace','') IS NULL OR NULLIF(pod->>'pod_name','') IS NULL
+       OR NULLIF(pod->>'pod_uid','') IS NULL
+       OR context->'agent'->>'hostname' IS DISTINCT FROM pod->>'pod_name'
+       OR context->'agent'->>'pod_uid' IS DISTINCT FROM pod->>'pod_uid'
+       OR NULLIF(btrim(marker->>'process_generation'),'') IS NULL THEN
+        RETURN false;
+    END IF;
+    -- Delivery attests the launcher Pod UID, independently of the VM UID
+    -- used by the unchanged teardown/process-zero protocol. New requests must
+    -- carry that exact captured launcher; no alternate VM/VMI identity admits.
+    IF legacy_durable_marker THEN
+        -- 0298 could admit a VM-UID marker without a launcher field. Preserve
+        -- only continuation of that immutable, already stored full tuple.
+        workspace_incarnation := vm->>'vm_uid';
+    ELSIF COALESCE(workspace_incarnation,'') !~ '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$' THEN
+        RETURN false;
+    END IF;
+    expected := jsonb_build_object(
+        'kind','vm_local_drain_complete_v1', 'thread_id',owner_row.id::text,
+        'agent_id',owner_row.agent_id::text, 'pod_uid',pod->>'pod_uid',
+        'process_generation',marker->>'process_generation',
+        'runtime_generation',owner_row.runtime_generation::text,
+        'runtime_attach_token',owner_row.runtime_attach_token::text,
+        'retirement_token',owner_row.runtime_retirement_token::text,
+        'disposition','ended', 'permanent',owner_row.runtime_retirement_permanent,
+        'workspace_generation',vm->>'provision_generation',
+        'workspace_runtime_incarnation',workspace_incarnation
+    );
+    IF marker IS DISTINCT FROM expected THEN RETURN false; END IF;
+    SELECT * INTO actor FROM public.agents WHERE id=owner_row.agent_id;
+    -- A vanished actor is allowed only for continuation of a durable marker.
+    IF actor.id IS NULL THEN RETURN NOT require_actor; END IF;
+    RETURN actor.thread_id IS NOT DISTINCT FROM owner_row.id
+       AND actor.pod_uid IS NOT DISTINCT FROM pod->>'pod_uid'
+       AND actor.hostname IS NOT DISTINCT FROM pod->>'pod_name'
+       AND actor.metadata->>'dispatch_process_generation' IS NOT DISTINCT FROM marker->>'process_generation';
+END;
+$_$;
+
+
+--
+-- Name: pinned_vm_creation_agent_zero_source(uuid, uuid, uuid); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.pinned_vm_creation_agent_zero_source(requested_thread uuid, requested_runtime uuid, requested_token uuid) RETURNS boolean
+    LANGUAGE sql STABLE
+    AS $$
+    SELECT public.pinned_vm_initial_creation_agent_zero_source(requested_thread,requested_runtime,requested_token)
+       OR EXISTS (SELECT 1 FROM public.threads t JOIN public.vm_creation_retries r ON r.thread_id=t.id
+           WHERE t.id=requested_thread AND t.runtime_generation=requested_runtime AND t.runtime_retirement_token=requested_token
+             AND public.valid_vm_thread_retained_resume_source(r)
+             AND public.valid_thread_vm_creation_retirement_source(r,false)
+             AND t.runtime_retirement_context->>'workspace_backend'='vm'
+             AND t.runtime_retirement_context->'vm'='null'::jsonb
+             AND COALESCE(t.runtime_retirement_context->'workspace_binding','null'::jsonb) IN ('null'::jsonb,'{}'::jsonb)
+             AND (COALESCE(t.runtime_retirement_context->'workspace_container','null'::jsonb)='null'::jsonb
+                  OR (jsonb_typeof(t.runtime_retirement_context->'workspace_container')='object'
+                      AND (t.runtime_retirement_context->'workspace_container')-'repo_name'-'git_remote_url'='{}'::jsonb))
+             AND public.vm_thread_retained_source_terminal_evidence(r) IS NOT NULL);
+$$;
+
+
+--
+-- Name: pinned_vm_initial_creation_agent_zero_source(uuid, uuid, uuid); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.pinned_vm_initial_creation_agent_zero_source(requested_thread uuid, requested_runtime uuid, requested_token uuid) RETURNS boolean
+    LANGUAGE sql STABLE
+    AS $$
+    SELECT EXISTS (SELECT 1 FROM public.threads t
+        JOIN public.vm_creation_retries r ON r.thread_id=t.id
+          AND r.request_id::text=t.runtime_retirement_context->'vm_creation_source'->>'request_id'
+        WHERE t.id=requested_thread AND t.runtime_generation=requested_runtime
+          AND t.runtime_retirement_token=requested_token
+          AND r.origin='initial' AND r.expected_pvc_uid IS NULL
+          AND r.thread_wake_operation_id IS NULL
+          AND public.thread_vm_creation_cleanup_lineage(t,r,true) IS NOT NULL
+          AND t.runtime_retirement_context->>'workspace_backend'='vm'
+          AND t.runtime_retirement_context->'vm'='null'::jsonb
+          AND COALESCE(t.runtime_retirement_context->'workspace_binding','null'::jsonb) IN ('null'::jsonb,'{}'::jsonb)
+          AND (COALESCE(t.runtime_retirement_context->'workspace_container','null'::jsonb)='null'::jsonb
+               OR (jsonb_typeof(t.runtime_retirement_context->'workspace_container')='object'
+                   AND (t.runtime_retirement_context->'workspace_container')-'repo_name'-'git_remote_url'='{}'::jsonb))
+          AND public.thread_vm_creation_never_issued_source(t.id,
+              t.runtime_retirement_context->'vm_creation_source'->>'provision_generation'));
+$$;
+
+
+--
+-- Name: pinned_vm_pre_registration_no_vm_source(uuid, uuid, uuid); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.pinned_vm_pre_registration_no_vm_source(p_thread uuid, p_runtime uuid, p_token uuid) RETURNS boolean
+    LANGUAGE sql STABLE
+    AS $$
+    SELECT EXISTS (
+        SELECT 1 FROM public.threads t
+         WHERE t.id=p_thread AND t.runtime_generation=p_runtime
+           AND t.runtime_retirement_token=p_token
+           AND t.execution_lane='pinned' AND t.status='created'
+           AND t.runtime_authority_exposed IS TRUE
+           AND t.runtime_retirement_authorized_at IS NOT NULL
+           AND t.agent_id IS NULL AND t.control_admission_agent_id IS NULL
+           AND t.runtime_attach_token IS NULL
+           AND t.runtime_retirement_context->>'entry_status'='created'
+           AND t.runtime_retirement_context->>'workspace_backend'='vm'
+           AND t.runtime_retirement_context->>'agent_id' IS NULL
+           AND t.runtime_retirement_context->>'control_admission_agent_id' IS NULL
+           AND t.runtime_retirement_context->>'runtime_attach_token' IS NULL
+           AND t.runtime_retirement_context->'agent' IN ('null'::jsonb,'{}'::jsonb)
+           AND t.runtime_retirement_context->'agent_pod_provision_intent'='null'::jsonb
+           AND jsonb_typeof(t.runtime_retirement_context->'agent_pod')='object'
+           AND NULLIF(t.runtime_retirement_context->'agent_pod'->>'pod_name','') IS NOT NULL
+           AND NULLIF(t.runtime_retirement_context->'agent_pod'->>'pod_uid','') IS NOT NULL
+           AND t.runtime_retirement_context->'vm'='null'::jsonb
+           AND t.runtime_retirement_context->'vm_creation_source'='null'::jsonb
+           AND NOT (t.metadata ? 'vm')
+           AND t.runtime_retirement_context->'workspace_binding' IN ('null'::jsonb,'{}'::jsonb)
+           AND (t.runtime_retirement_context->'workspace_container'='null'::jsonb
+                OR (jsonb_typeof(t.runtime_retirement_context->'workspace_container')='object'
+                    AND (t.runtime_retirement_context->'workspace_container')
+                        - 'repo_name' - 'git_remote_url'='{}'::jsonb))
+           AND t.runtime_retirement_context->'workspace_provision_intent'='null'::jsonb
+           AND (
+               (t.runtime_retirement_context->'agent_workspace_claim'='null'::jsonb
+                AND NOT EXISTS (
+                    SELECT 1 FROM public.thread_agent_workspace_claims c
+                     WHERE c.thread_id=t.id AND c.status IN ('planned','ready','revoking')))
+               OR
+               (jsonb_typeof(t.runtime_retirement_context->'agent_workspace_claim')='object'
+                AND t.runtime_retirement_context->'agent_workspace_claim'->>'status'='ready'
+                AND t.runtime_retirement_context->'agent_workspace_claim'->>'thread_id'=t.id::text
+                AND t.runtime_retirement_context->'agent_pod'->>'runtime_generation'=t.runtime_generation::text
+                AND EXISTS (
+                    SELECT 1 FROM public.thread_agent_workspace_claims c
+                    JOIN public.thread_agent_pod_provision_intents p
+                      ON p.workspace_claim_id=c.claim_id
+                     WHERE c.thread_id=t.id
+                       AND c.claim_id::text=t.runtime_retirement_context->'agent_workspace_claim'->>'claim_id'
+                       AND c.created_runtime_generation::text=
+                           t.runtime_retirement_context->'agent_workspace_claim'->>'created_runtime_generation'
+                       AND c.create_attempt::text=t.runtime_retirement_context->'agent_workspace_claim'->>'create_attempt'
+                       AND c.provisioner::text=t.runtime_retirement_context->'agent_workspace_claim'->>'provisioner'
+                       AND c.provisioner IN ('agent','persistent')
+                       AND c.pvc_name=t.runtime_retirement_context->'agent_workspace_claim'->>'pvc_name'
+                       AND (
+                           (c.status='ready'
+                            AND c.pvc_uid=t.runtime_retirement_context->'agent_workspace_claim'->>'pvc_uid'
+                            AND c.fenced_at IS NULL AND c.gc_after IS NULL)
+                           OR
+                           (t.runtime_retirement_permanent IS TRUE
+                            AND c.status IN ('fenced','reclaimed')
+                            AND c.fenced_at IS NOT NULL
+                            AND c.pvc_uid IS DISTINCT FROM
+                                t.runtime_retirement_context->'agent_workspace_claim'->>'pvc_uid'
+                            AND t.runtime_retirement_local_quiescence->>'quiescence_protocol'='agent_runtime_zero_v1'
+                            AND t.runtime_retirement_local_quiescence->>'agent_pod_uid'=
+                                t.runtime_retirement_context->'agent_pod'->>'pod_uid')
+                       )
+                       AND NULLIF(c.pvc_uid,'') IS NOT NULL
+                       AND c.namespace=t.runtime_retirement_context->'agent_workspace_claim'->>'namespace'
+                       AND c.namespace=t.runtime_retirement_context->'agent_pod'->>'namespace'
+                       AND c.protection_protocol='finalizer_v1'
+                       AND c.protection_protocol=t.runtime_retirement_context->'agent_workspace_claim'->>'protection_protocol'
+                       AND c.protection_protocol=t.runtime_retirement_context->'agent_pod'->>'protection_protocol'
+                       AND p.thread_id=t.id
+                       AND p.runtime_generation=t.runtime_generation
+                       AND p.attempt_id::text=t.runtime_retirement_context->'agent_pod'->>'provision_attempt'
+                       AND p.status='published'
+                       AND p.pod_name=t.runtime_retirement_context->'agent_pod'->>'pod_name'
+                       AND p.pod_uid=t.runtime_retirement_context->'agent_pod'->>'pod_uid'
+                       AND p.namespace=c.namespace
+                       AND p.provisioner=c.provisioner
+                       AND p.protection_protocol='finalizer_v1'
+                )
+                AND NOT EXISTS (
+                    SELECT 1 FROM public.thread_agent_workspace_claims other
+                     WHERE other.thread_id=t.id
+                       AND other.status IN ('planned','ready','revoking')
+                       AND other.claim_id::text IS DISTINCT FROM
+                           t.runtime_retirement_context->'agent_workspace_claim'->>'claim_id'))
+           )
+           AND NOT EXISTS (SELECT 1 FROM public.agents a
+                            WHERE a.thread_id=t.id
+                               OR a.hostname=t.runtime_retirement_context->'agent_pod'->>'pod_name'
+                               OR a.pod_uid=t.runtime_retirement_context->'agent_pod'->>'pod_uid')
+           AND NOT EXISTS (SELECT 1 FROM public.thread_agent_pod_provision_intents p
+                            WHERE p.thread_id=t.id AND p.status IN ('planned','revoking'))
+           AND NOT EXISTS (SELECT 1 FROM public.thread_workspace_provision_intents p
+                            WHERE p.thread_id=t.id AND p.status IN ('planned','revoking'))
+           AND NOT EXISTS (SELECT 1 FROM public.vm_creation_retries r
+                            WHERE r.owner_kind='thread' AND r.thread_id=t.id)
+           AND NOT EXISTS (SELECT 1 FROM public.vm_resource_waiters w
+                            WHERE w.owner_kind='thread' AND w.thread_id=t.id)
+           AND NOT EXISTS (SELECT 1 FROM public.vm_thread_creation_owners o
+                            WHERE o.thread_id=t.id)
+           AND NOT EXISTS (SELECT 1 FROM public.vm_thread_retained_resumes r
+                            WHERE r.thread_id=t.id)
+           AND NOT EXISTS (SELECT 1 FROM public.vm_idle_operations i
+                            WHERE i.owner_kind='thread' AND i.owner_id=t.id)
+           AND NOT EXISTS (SELECT 1 FROM public.vm_idle_access_leases l
+                            WHERE l.owner_kind='thread' AND l.owner_id=t.id)
+           AND NOT EXISTS (SELECT 1 FROM public.vm_workspace_recoveries r
+                            WHERE r.owner_kind='thread' AND r.owner_id=t.id)
+           AND NOT EXISTS (SELECT 1 FROM public.vm_resource_thread_cleanup_authorities a
+                            WHERE a.thread_id=t.id)
+           AND NOT EXISTS (SELECT 1 FROM public.srw_execution_specs e
+                            JOIN public.srw_execution_workspace_bindings b
+                              ON b.execution_id=e.id
+                            WHERE e.work_kind='Session' AND e.work_id=t.id)
+    );
+$$;
+
+
+--
+-- Name: pinned_workspace_provision_abort_path(uuid, uuid, uuid); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.pinned_workspace_provision_abort_path(subject uuid, current_generation uuid, source_attempt uuid) RETURNS uuid[]
+    LANGUAGE sql STABLE
+    AS $$
+ WITH RECURSIVE path AS (
+   SELECT intent.runtime_generation AS generation,
+          ARRAY[intent.runtime_generation] AS generations, 0 AS depth
+     FROM public.thread_workspace_provision_intents intent
+    WHERE intent.thread_id=subject AND intent.attempt_id=source_attempt
+      AND intent.created_agent_id IS NOT NULL AND intent.created_attach_token IS NOT NULL
+      AND intent.pod_uid IS NULL AND intent.retained_source_attempt_id IS NULL
+   UNION ALL
+   SELECT abort.successor_generation, path.generations||abort.successor_generation, path.depth+1
+     FROM path JOIN public.thread_runtime_attach_abort_outcomes abort
+       ON abort.thread_id=subject AND abort.runtime_generation=path.generation
+    WHERE path.depth<16 AND abort.successor_generation<>ALL(path.generations)
+      AND abort.release_kind='process_zero'
+      AND abort.quiescence_protocol='agent_attach_not_started_v1'
+      AND abort.workspace_generation IS NULL AND abort.workspace_runtime_incarnation IS NULL
+      AND (path.depth>0 OR EXISTS (
+         SELECT 1 FROM public.thread_workspace_provision_intents intent
+          WHERE intent.attempt_id=source_attempt AND intent.created_agent_id=abort.agent_id
+            AND intent.created_attach_token=abort.runtime_attach_token))
+ ) SELECT generations FROM path WHERE generation=current_generation AND depth>0;
+$$;
+
+
+--
+-- Name: pinned_workspace_provision_capture_is_current(uuid, uuid, jsonb); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.pinned_workspace_provision_capture_is_current(subject uuid, current_generation uuid, captured jsonb) RETURNS boolean
+    LANGUAGE sql STABLE
+    AS $_$
+ SELECT COALESCE(
+   captured->>'thread_id'=subject::text AND (
+     (captured->>'runtime_generation'=current_generation::text
+       AND NOT (captured ? 'retirement_runtime_generation') AND NOT (captured ? 'attach_abort_path'))
+     OR (captured->>'runtime_generation'<>current_generation::text
+       AND captured->>'retirement_runtime_generation'=current_generation::text
+       AND captured->>'attempt_id' ~ '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+       AND captured->'attach_abort_path'=to_jsonb(public.pinned_workspace_provision_abort_path(
+           subject,current_generation,(captured->>'attempt_id')::uuid))
+       AND (captured->'attach_abort_path'->>0)=captured->>'runtime_generation'
+       AND jsonb_array_length(captured->'attach_abort_path') BETWEEN 2 AND 17
+       AND captured->>'pod_uid' IS NULL
+       AND EXISTS (SELECT 1 FROM public.threads t WHERE t.id=subject
+         AND t.runtime_generation=current_generation AND t.agent_id IS NULL
+         AND t.runtime_attach_token IS NULL AND t.control_admission_agent_id IS NULL
+         AND t.runtime_retirement_permanent=true)
+     )
+   ), false);
+$_$;
+
+
+--
+-- Name: pinned_workspace_provision_capture_shape_is_current(uuid, uuid, jsonb); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.pinned_workspace_provision_capture_shape_is_current(subject uuid, current_generation uuid, captured jsonb) RETURNS boolean
+    LANGUAGE sql IMMUTABLE
+    AS $_$
+ SELECT COALESCE(captured->>'thread_id'=subject::text AND (
+  (captured->>'runtime_generation'=current_generation::text
+   AND NOT (captured ? 'retirement_runtime_generation') AND NOT (captured ? 'attach_abort_path'))
+  OR (captured->>'runtime_generation'<>current_generation::text
+   AND captured->>'retirement_runtime_generation'=current_generation::text
+   AND captured->>'pod_uid' IS NULL
+   AND CASE WHEN jsonb_typeof(captured->'attach_abort_path')='array' THEN
+     jsonb_array_length(captured->'attach_abort_path') BETWEEN 2 AND 17
+     AND captured->'attach_abort_path'->>0=captured->>'runtime_generation'
+     AND captured->'attach_abort_path'->>-1=current_generation::text
+     AND NOT EXISTS (SELECT 1 FROM jsonb_array_elements_text(captured->'attach_abort_path') value
+       WHERE value !~ '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$')
+   ELSE false END
+  )),false);
+$_$;
+
+
+--
+-- Name: preserve_job_worker_execution_hold(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.preserve_job_worker_execution_hold() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+BEGIN
+    IF COALESCE(OLD.context, '{}'::jsonb) ? '_worker_execution_hold'
+       AND (NOT (COALESCE(NEW.context, '{}'::jsonb) ? '_worker_execution_hold')
+            OR NEW.context->'_worker_execution_hold'
+               IS DISTINCT FROM OLD.context->'_worker_execution_hold') THEN
+        RAISE EXCEPTION 'A pending worker execution hold is immutable'
+            USING ERRCODE = '23514';
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+
+--
+-- Name: FUNCTION preserve_job_worker_execution_hold(); Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON FUNCTION public.preserve_job_worker_execution_hold() IS 'Restriction only: no process-zero, cleanup, replay or settlement authority. Phase A has no clearing writer; malformed presence remains restrictive.';
 
 
 --
@@ -9137,6 +15707,7 @@ DECLARE
     old_identity_envelope JSONB;
     new_identity_envelope JSONB;
     creation_authorized BOOLEAN;
+    cancelled_creation_retirement_authorized BOOLEAN;
     uidless_creation_authorized BOOLEAN;
     cleanup_projection_authorized BOOLEAN;
     restore_projection_authorized BOOLEAN;
@@ -9145,6 +15716,7 @@ DECLARE
     adoption_reversal_authorized BOOLEAN;
     terminal_cancel_projection_authorized BOOLEAN;
     safe_retirement_projection BOOLEAN;
+    terminal_snapshot_projection_authorized BOOLEAN;
     managed_k8s_envelope BOOLEAN;
     uidless_k8s_candidate BOOLEAN;
     initial_uidless_precreate BOOLEAN;
@@ -9284,6 +15856,17 @@ BEGIN
                 source_kind, source_id, scope_name, new_runtime,
                 new_reservation, new_claim_token
             );
+        cancelled_creation_retirement_authorized :=
+            TG_OP = 'UPDATE' AND NEW.id = OLD.id
+            AND source_kind = 'job'
+            AND NEW.status::TEXT = 'cancelled' AND OLD.status::TEXT = 'cancelled'
+            AND to_jsonb(NEW) ->> 'execution_lane' = 'stateless'
+            AND to_jsonb(OLD) ->> 'execution_lane' = 'stateless'
+            AND to_jsonb(NEW) ->> 'assigned_agent_id' IS NULL
+            AND to_jsonb(OLD) ->> 'assigned_agent_id' IS NULL
+            AND public.managed_repo_cancelled_creation_retirement_is_authorized_now(
+                source_kind, source_id, scope_name, old_state, new_state
+            );
         uidless_creation_authorized := new_runtime IS NULL AND
             public.managed_repository_workspace_uidless_creation_is_authorized(
                 source_kind, source_id, scope_name,
@@ -9323,6 +15906,19 @@ BEGIN
             AND new_runtime = old_runtime
             AND new_status = 'retiring_process_zero'
             AND (old_envelope - 'status') = (new_envelope - 'status');
+        terminal_snapshot_projection_authorized := FALSE;
+        IF source_kind = 'thread' AND scope_name = 'workspace_container'
+           AND TG_OP = 'UPDATE'
+           AND to_jsonb(OLD) ->> 'status' = 'ended'
+           AND to_jsonb(NEW) ->> 'status' = 'ended'
+           AND to_jsonb(OLD) ->> 'execution_lane' = 'stateless'
+           AND to_jsonb(NEW) ->> 'execution_lane' = 'stateless'
+           AND old_envelope IS DISTINCT FROM new_envelope THEN
+            terminal_snapshot_projection_authorized :=
+                public.stateless_terminal_snapshot_flag_projection_authorized(
+                    source_id, old_state, new_state
+                );
+        END IF;
         initial_uidless_precreate := new_runtime IS NULL
             AND new_status IN ('pending', 'creating', 'restoring')
             AND (
@@ -9356,6 +15952,7 @@ BEGIN
                )
            )
            AND NOT creation_authorized
+           AND NOT cancelled_creation_retirement_authorized
            AND NOT uidless_creation_authorized
            AND NOT cleanup_projection_authorized
            AND NOT restore_projection_authorized
@@ -9489,7 +16086,8 @@ BEGIN
                         ELSE 'managed_repository_retired_workspace_runtime_rebind' END,
                     MESSAGE = 'A retired Kubernetes runtime may not be rebound';
             END IF;
-            IF NOT creation_authorized THEN
+            IF NOT creation_authorized
+               AND NOT cancelled_creation_retirement_authorized THEN
                 RAISE EXCEPTION USING
                     ERRCODE = '23514',
                     CONSTRAINT = CASE WHEN scope_name = 'ide'
@@ -9502,6 +16100,7 @@ BEGIN
         IF managed_k8s_envelope
            AND old_envelope IS DISTINCT FROM new_envelope
            AND NOT creation_authorized
+           AND NOT cancelled_creation_retirement_authorized
            AND NOT uidless_creation_authorized
            AND NOT cleanup_projection_authorized
            AND NOT restore_projection_authorized
@@ -9509,6 +16108,7 @@ BEGIN
            AND NOT cancel_claim_projection_authorized
            AND NOT terminal_cancel_projection_authorized
            AND NOT safe_retirement_projection
+           AND NOT terminal_snapshot_projection_authorized
            AND NOT adoption_reversal_authorized
            AND NOT initial_uidless_precreate
            AND NOT uidless_precreate_progress THEN
@@ -9563,6 +16163,21 @@ $$;
 
 
 --
+-- Name: prevent_vm_job_creation_owner_reuse(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.prevent_vm_job_creation_owner_reuse() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+BEGIN
+    PERFORM 1 FROM public.vm_job_creation_owners WHERE job_id=NEW.id FOR SHARE;
+    IF FOUND THEN RAISE EXCEPTION 'Job VM audit owner UUID cannot be reused' USING ERRCODE='23514'; END IF;
+    RETURN NEW;
+END;
+$$;
+
+
+--
 -- Name: prevent_vm_remote_operation_protocol_rollback(); Type: FUNCTION; Schema: public; Owner: -
 --
 
@@ -9590,6 +16205,23 @@ BEGIN
             ERRCODE = '55006',
             CONSTRAINT = 'vm_remote_operation_protocol_is_forward_only',
             MESSAGE = 'VM remote-operation protocol authority is forward-only';
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+
+--
+-- Name: prevent_vm_thread_creation_owner_reuse(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.prevent_vm_thread_creation_owner_reuse() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+BEGIN
+    PERFORM 1 FROM public.vm_thread_creation_owners WHERE thread_id=NEW.id FOR SHARE;
+    IF FOUND THEN
+        RAISE EXCEPTION 'VM audit owner thread UUID cannot be reused' USING ERRCODE='23514';
     END IF;
     RETURN NEW;
 END;
@@ -9709,6 +16341,14 @@ BEGIN
            AND scope_name = 'workspace_container'
            AND public.stateless_none_workspace_outcome_is_authority_free(
                source_state
+           )
+        THEN
+            CONTINUE;
+        END IF;
+        IF source_kind = 'thread'
+           AND scope_name = 'workspace_container'
+           AND public.stateless_virtual_permanent_delete_is_authority_free(
+               OLD.id, source_state
            )
         THEN
             CONTINUE;
@@ -9875,6 +16515,31 @@ BEGIN
     RETURN OLD;
 END;
 $_$;
+
+
+--
+-- Name: project_vm_thread_retained_terminal(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.project_vm_thread_retained_terminal() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+DECLARE backing jsonb;
+BEGIN
+    IF OLD.runtime_retirement_token IS NOT NULL AND NOT OLD.runtime_retirement_permanent
+       AND NEW.runtime_retirement_token IS NULL AND NEW.status='ended'
+       AND NEW.runtime_generation=OLD.runtime_generation THEN
+        SELECT terminal.retained_vm INTO backing FROM public.vm_thread_retained_resume_terminals terminal
+            JOIN public.vm_thread_retained_resumes op ON op.id=terminal.operation_id
+            WHERE op.thread_id=OLD.id AND terminal.runtime_generation=OLD.runtime_generation
+              AND terminal.retirement_token=OLD.runtime_retirement_token;
+        IF backing IS NOT NULL THEN
+            NEW.metadata := jsonb_set(COALESCE(NEW.metadata,'{}'::jsonb),'{vm}',backing);
+        END IF;
+    END IF;
+    RETURN NEW;
+END;
+$$;
 
 
 --
@@ -12468,6 +19133,26 @@ $$;
 
 
 --
+-- Name: request_vm_creation_retry_cancel(uuid, text); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.request_vm_creation_retry_cancel(p_job_id uuid, p_generation text DEFAULT NULL::text) RETURNS boolean
+    LANGUAGE plpgsql
+    AS $$
+DECLARE touched integer;
+BEGIN
+    UPDATE vm_creation_retries SET state='cancel_requested',revision=revision+1,
+        claim_token=NULL,claim_expires_at=NULL,next_probe_at=clock_timestamp(),
+        reason='job_cancelled',updated_at=clock_timestamp()
+    WHERE job_id=p_job_id AND (p_generation IS NULL OR provision_generation::text=p_generation)
+      AND state IN ('queued','reconciling','attention');
+    GET DIAGNOSTICS touched = ROW_COUNT;
+    RETURN touched > 0;
+END;
+$$;
+
+
+--
 -- Name: require_executed_persistent_wake(); Type: FUNCTION; Schema: public; Owner: -
 --
 
@@ -12735,6 +19420,30 @@ COMMENT ON FUNCTION public.require_thread_lane_without_pending_input() IS 'Seria
 
 
 --
+-- Name: require_vm_job_audit_before_delete(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.require_vm_job_audit_before_delete() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+BEGIN
+    IF EXISTS (SELECT 1 FROM public.vm_job_creation_owners o WHERE o.job_id=OLD.id)
+       AND NOT EXISTS (SELECT 1 FROM public.vm_job_creation_owners o
+           WHERE o.job_id=OLD.id AND o.live_job_id=OLD.id
+             AND o.deleted_at IS NOT NULL AND o.deletion_receipt IS NOT NULL
+             AND (SELECT count(*) FROM public.vm_job_creation_terminal_packets p
+                  WHERE p.job_id=OLD.id)=
+                 (SELECT count(*) FROM public.vm_creation_retries r
+                  WHERE r.owner_kind='job' AND r.job_id=OLD.id)) THEN
+        RAISE EXCEPTION 'Job VM audit owner lacks exact terminal disposition'
+            USING ERRCODE='23514';
+    END IF;
+    RETURN OLD;
+END;
+$$;
+
+
+--
 -- Name: resource_inventory_snapshot_item_size_bytes(text, text, text, jsonb, jsonb); Type: FUNCTION; Schema: public; Owner: -
 --
 
@@ -12799,6 +19508,35 @@ BEGIN
          WHERE id=requested_owner;
     END IF;
     RETURN TRUE;
+END;
+$$;
+
+
+--
+-- Name: retire_vm_thread_creation_owner(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.retire_vm_thread_creation_owner() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+DECLARE evidence jsonb;
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM public.vm_thread_creation_owners WHERE thread_id=OLD.id) THEN
+        RETURN OLD;
+    END IF;
+    evidence := public.vm_thread_creation_delete_evidence(OLD);
+    IF evidence IS NULL THEN
+        RAISE EXCEPTION 'VM audit owner deletion lacks settled failed-initial source evidence' USING ERRCODE='23514';
+    END IF;
+    UPDATE public.vm_thread_creation_owners SET
+        deleted_runtime_generation=OLD.runtime_generation,
+        deleted_retirement_token=OLD.runtime_retirement_token,
+        deletion_receipt=evidence,deleted_at=transaction_timestamp()
+    WHERE thread_id=OLD.id AND live_thread_id=OLD.id AND deleted_at IS NULL;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'VM audit owner retirement lost exact identity' USING ERRCODE='23514';
+    END IF;
+    RETURN OLD;
 END;
 $$;
 
@@ -13073,6 +19811,46 @@ $$;
 
 
 --
+-- Name: stamp_vm_job_retained_parent(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.stamp_vm_job_retained_parent() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+BEGIN
+    IF TG_OP='UPDATE' THEN
+        IF NEW.retained_resume_admitted_xact_id IS DISTINCT FROM OLD.retained_resume_admitted_xact_id THEN
+            RAISE EXCEPTION 'Retained Resume parent stamp is immutable' USING ERRCODE='23514';
+        END IF;
+    ELSE
+        NEW.retained_resume_admitted_xact_id := NULL;
+        IF NEW.owner_kind='job' AND NEW.source IN ('controller_vm_create','job_terminal_vm_release')
+           AND EXISTS(SELECT 1 FROM public.vm_job_retained_resumes op WHERE op.job_id=NEW.owner_id
+               AND (NEW.source='job_terminal_vm_release' OR NEW.request_id=public.uuid_generate_v5(public.uuid_ns_url(),'vm-create:'||op.request_id))) THEN
+            NEW.retained_resume_admitted_xact_id := pg_current_xact_id();
+        END IF;
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+
+--
+-- Name: stamp_vm_job_retained_purge_transaction(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.stamp_vm_job_retained_purge_transaction() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+BEGIN
+    -- Always overwrite caller input, including an explicitly supplied old ID.
+    NEW.admitted_xact_id := pg_current_xact_id();
+    RETURN NEW;
+END;
+$$;
+
+
+--
 -- Name: stateless_none_workspace_outcome_is_authority_free(jsonb); Type: FUNCTION; Schema: public; Owner: -
 --
 
@@ -13288,6 +20066,695 @@ $_$;
 
 
 --
+-- Name: stateless_terminal_snapshot_flag_projection_authorized(uuid, jsonb, jsonb); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.stateless_terminal_snapshot_flag_projection_authorized(requested_owner uuid, old_state jsonb, new_state jsonb) RETURNS boolean
+    LANGUAGE plpgsql
+    AS $_$
+DECLARE
+    queue_row RECORD;
+    old_marker JSONB;
+    new_marker JSONB;
+    old_workspace JSONB;
+    new_workspace JSONB;
+    binding JSONB;
+    resident_ack JSONB;
+    shell_ack JSONB;
+    old_runtime TEXT;
+    new_runtime TEXT;
+    token BIGINT;
+    replacement_has_receipt BOOLEAN;
+    expected_marker JSONB;
+    expected_state JSONB;
+    replacement_ack JSONB;
+    proof JSONB;
+    proof_kind TEXT;
+BEGIN
+    IF jsonb_typeof(old_state) IS DISTINCT FROM 'object'
+       OR jsonb_typeof(new_state) IS DISTINCT FROM 'object'
+       OR old_state -> '_stateless_workspace_retirement_pending'
+            IS DISTINCT FROM 'true'::JSONB
+       OR old_state ?| ARRAY[
+           '_stateless_workspace_retirement_settled',
+           '_stateless_claim_losses', '_stateless_claim_loss_hold',
+           '_stateless_active_claim'
+       ]
+       OR jsonb_typeof(old_state -> '_stateless_claim_retirement')
+            IS DISTINCT FROM 'object'
+       OR jsonb_typeof(old_state -> 'workspace_container')
+            IS DISTINCT FROM 'object'
+       OR jsonb_typeof(old_state -> '_workspace_binding')
+            IS DISTINCT FROM 'object' THEN
+        RETURN FALSE;
+    END IF;
+    old_marker := old_state -> '_stateless_claim_retirement';
+    old_workspace := old_state -> 'workspace_container';
+    new_workspace := new_state -> 'workspace_container';
+    binding := old_state -> '_workspace_binding';
+    resident_ack := old_state -> '_stateless_resident_retirement_ack';
+    shell_ack := old_state -> '_stateless_shell_retirement_ack';
+    old_runtime := old_marker ->> 'runtime_incarnation';
+    IF (
+        old_marker -> 'terminal_token' IS NOT NULL
+        AND jsonb_typeof(old_marker -> 'terminal_token') = 'number'
+        AND old_marker ->> 'terminal_token' ~ '^[1-9][0-9]*$'
+        AND old_marker -> 'permanent' = 'false'::JSONB
+        AND old_marker -> 'claimant_quiesced' = 'true'::JSONB
+        AND old_marker -> 'resident_cleanup_required' = 'true'::JSONB
+        AND old_marker -> 'shell_retirement_required' = 'true'::JSONB
+        AND old_marker -> 'residents_retired' = 'true'::JSONB
+        AND old_marker -> 'remote_retired' = 'true'::JSONB
+        AND old_marker -> 'workspace_absence_proven' = 'false'::JSONB
+        AND old_runtime ~ '^[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$'
+        AND jsonb_typeof(resident_ack) = 'object'
+        AND jsonb_typeof(shell_ack) = 'object'
+    ) IS NOT TRUE THEN
+        RETURN FALSE;
+    END IF;
+    token := (old_marker ->> 'terminal_token')::BIGINT;
+    SELECT * INTO queue_row FROM public.run_queue
+     WHERE unit_id=requested_owner FOR UPDATE;
+    IF NOT FOUND OR queue_row.unit_kind <> 'session_turn'
+       OR queue_row.state <> 'done' OR queue_row.leased_by IS NOT NULL
+       OR queue_row.lease_token <> token THEN
+        RETURN FALSE;
+    END IF;
+    -- Match the authoritative parser's exact ACK tuple for both protocol and
+    -- terminal-runtime proof. An explicitly null retired_by never defaults.
+    FOREACH proof IN ARRAY ARRAY[resident_ack, shell_ack] LOOP
+        proof_kind := proof ->> 'kind';
+        IF proof_kind IS NULL
+           OR proof_kind NOT IN ('protocol', 'workspace_runtime_terminal')
+           OR proof -> 'terminal_token' IS DISTINCT FROM to_jsonb(token)
+           OR proof ->> 'runtime_incarnation' IS DISTINCT FROM old_runtime
+           OR (
+               proof = resident_ack AND old_marker ? 'residents_retired_by'
+               AND old_marker ->> 'residents_retired_by' IS DISTINCT FROM proof_kind
+           ) OR (
+               proof = shell_ack AND old_marker ? 'remote_retired_by'
+               AND old_marker ->> 'remote_retired_by' IS DISTINCT FROM proof_kind
+           ) OR (
+               proof_kind = 'protocol' AND (
+                   proof ->> 'workspace_generation' IS DISTINCT FROM
+                       old_marker ->> 'workspace_generation'
+                   OR proof ->> 'endpoint_generation' IS DISTINCT FROM
+                       old_marker ->> 'endpoint_generation'
+                   OR proof ->> 'host_key_fingerprint' IS DISTINCT FROM
+                       old_marker ->> 'host_key_fingerprint'
+               )
+           ) THEN
+            RETURN FALSE;
+        END IF;
+    END LOOP;
+    IF old_marker ->> 'workspace_generation' IS DISTINCT FROM
+           old_marker ->> 'endpoint_generation'
+       OR (old_marker ->> 'workspace_generation' ~
+           '^[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$') IS NOT TRUE
+       OR (old_marker ->> 'host_key_fingerprint' ~
+           '^SHA256:[^[:space:]]+$') IS NOT TRUE
+       OR (length(old_marker ->> 'host_key_fingerprint') <= 128) IS NOT TRUE THEN
+        RETURN FALSE;
+    END IF;
+
+    -- A capture ACK changes precisely one flag on the same live runtime.
+    IF COALESCE(old_workspace -> '_snapshot_restore_required', 'false'::JSONB)
+            = 'false'::JSONB
+       AND new_state = jsonb_set(
+           old_state, '{workspace_container,_snapshot_restore_required}',
+           'true'::JSONB, TRUE
+       ) THEN
+        RETURN (
+            old_workspace ->> 'provisioner' = 'k8s'
+            AND old_workspace ->> 'status' IN ('ready', 'retiring_process_zero')
+            AND old_workspace ->> '_runtime_incarnation' = old_runtime
+            AND old_workspace ->> '_canvas_workspace_generation' =
+                old_marker ->> 'endpoint_generation'
+            AND binding ->> 'kind' = 'remote'
+            AND binding ->> 'generation' =
+                old_marker ->> 'workspace_generation'
+            AND binding ->> 'ssh_host_key_fingerprint' =
+                old_marker ->> 'host_key_fingerprint'
+            AND binding ->> 'backing_id' =
+                'k8s-pod:' || (old_workspace ->> 'namespace') || ':' || old_runtime
+            AND old_workspace ->> 'namespace' IS NOT NULL
+            AND old_workspace ->> 'namespace' <> ''
+            AND resident_ack ->> 'kind' = 'protocol'
+            AND shell_ack ->> 'kind' = 'protocol'
+        ) IS TRUE;
+    END IF;
+
+    -- Rebase replaces a retired runtime's marker/ACK tuple. The predecessor's
+    -- flag cannot remain authority for the successor, even at the same token.
+    IF COALESCE(old_workspace -> '_snapshot_restore_required', 'false'::JSONB)
+            NOT IN ('false'::JSONB, 'true'::JSONB)
+       OR jsonb_typeof(new_workspace) IS DISTINCT FROM 'object'
+       OR new_workspace IS DISTINCT FROM jsonb_set(
+           old_workspace, '{_snapshot_restore_required}', 'false'::JSONB, TRUE
+       )
+       OR jsonb_typeof(new_state -> '_stateless_claim_retirement')
+            IS DISTINCT FROM 'object' THEN
+        RETURN FALSE;
+    END IF;
+    new_marker := new_state -> '_stateless_claim_retirement';
+    new_runtime := new_workspace ->> '_runtime_incarnation';
+    replacement_has_receipt := EXISTS (
+        SELECT 1 FROM public.managed_repository_process_zero_receipts
+         WHERE owner_kind='thread' AND owner_id=requested_owner
+           AND scope='workspace_container' AND provisioner='k8s'
+           AND runtime_incarnation=new_runtime
+    );
+    IF (
+        old_runtime <> new_runtime
+        AND new_runtime ~ '^[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$'
+        AND new_workspace ->> 'provisioner' = 'k8s'
+        AND binding ->> 'kind' = 'remote'
+        AND binding ->> 'backing_id' =
+            'k8s-pod:' || (new_workspace ->> 'namespace') || ':' || new_runtime
+        AND new_workspace ->> 'namespace' IS NOT NULL
+        AND new_workspace ->> 'namespace' <> ''
+        AND binding ->> 'generation' =
+            new_workspace ->> '_canvas_workspace_generation'
+        AND binding ->> 'generation' ~
+            '^[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$'
+        AND binding ->> 'ssh_host_key_fingerprint' ~ '^SHA256:[^[:space:]]+$'
+        AND length(binding ->> 'ssh_host_key_fingerprint') <= 128
+        AND (
+            (new_workspace ->> 'status' = 'ready' AND NOT replacement_has_receipt)
+            OR (new_workspace ->> 'status' IN ('retiring_process_zero', 'deleted')
+                AND replacement_has_receipt)
+        )
+        AND EXISTS (
+            SELECT 1 FROM public.managed_repository_process_zero_receipts
+             WHERE owner_kind='thread' AND owner_id=requested_owner
+               AND scope='workspace_container' AND provisioner='k8s'
+               AND runtime_incarnation=old_runtime
+        )
+    ) IS NOT TRUE THEN
+        RETURN FALSE;
+    END IF;
+    expected_marker := (old_marker - 'residents_retired_by' - 'remote_retired_by')
+        || jsonb_build_object(
+            'shell_retirement_required', TRUE,
+            'resident_cleanup_required', TRUE,
+            'residents_retired', replacement_has_receipt,
+            'remote_retired', replacement_has_receipt,
+            'workspace_absence_proven', FALSE,
+            'workspace_generation', binding -> 'generation',
+            'endpoint_generation', new_workspace -> '_canvas_workspace_generation',
+            'runtime_incarnation', new_runtime,
+            'host_key_fingerprint', binding -> 'ssh_host_key_fingerprint'
+        );
+    expected_state := jsonb_set(old_state,
+        '{workspace_container,_snapshot_restore_required}', 'false'::JSONB, TRUE
+    );
+    expected_state := jsonb_set(expected_state,
+        '{_stateless_claim_retirement}', expected_marker, TRUE
+    ) - '_stateless_resident_retirement_ack'
+      - '_stateless_shell_retirement_ack';
+    IF replacement_has_receipt THEN
+        expected_marker := expected_marker || jsonb_build_object(
+            'residents_retired_by', 'workspace_runtime_terminal',
+            'remote_retired_by', 'workspace_runtime_terminal'
+        );
+        replacement_ack := jsonb_build_object(
+            'kind', 'workspace_runtime_terminal',
+            'terminal_token', token,
+            'runtime_incarnation', new_runtime
+        );
+        expected_state := jsonb_set(expected_state,
+            '{_stateless_claim_retirement}', expected_marker, TRUE
+        ) || jsonb_build_object(
+            '_stateless_resident_retirement_ack', replacement_ack,
+            '_stateless_shell_retirement_ack', replacement_ack
+        );
+    END IF;
+    RETURN new_state = expected_state;
+EXCEPTION WHEN invalid_text_representation OR numeric_value_out_of_range THEN
+    RETURN FALSE;
+END;
+$_$;
+
+
+--
+-- Name: stateless_virtual_permanent_delete_is_authority_free(uuid, jsonb); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.stateless_virtual_permanent_delete_is_authority_free(requested_owner uuid, requested_state jsonb) RETURNS boolean
+    LANGUAGE plpgsql STABLE
+    AS $_$
+DECLARE
+    owner_row public.threads%ROWTYPE;
+    workspace JSONB;
+    binding JSONB;
+    settled JSONB;
+BEGIN
+    SELECT * INTO owner_row FROM public.threads WHERE id = requested_owner;
+    IF NOT FOUND OR owner_row.execution_lane <> 'stateless'
+       OR owner_row.status::TEXT <> 'ended'
+       OR owner_row.metadata IS DISTINCT FROM requested_state
+       OR owner_row.agent_id IS NOT NULL
+       OR owner_row.control_admission_agent_id IS NOT NULL
+       OR owner_row.runtime_attach_token IS NOT NULL
+       OR owner_row.runtime_retirement_token IS NOT NULL
+       OR owner_row.runtime_retirement_permanent IS NOT NULL
+       OR owner_row.runtime_retirement_started_at IS NOT NULL
+       OR owner_row.runtime_retirement_authorized_at IS NOT NULL
+       OR owner_row.runtime_retirement_context IS NOT NULL
+       OR owner_row.runtime_retirement_stage_receipt IS NOT NULL
+       OR owner_row.runtime_retirement_local_quiescence IS NOT NULL
+       OR owner_row.runtime_retirement_external_cleanup IS NOT NULL
+       OR owner_row.runtime_authority_exposed
+    THEN
+        RETURN FALSE;
+    END IF;
+
+    workspace := requested_state->'workspace_container';
+    binding := requested_state->'_workspace_binding';
+    settled := requested_state->'_stateless_workspace_retirement_settled';
+    IF (
+        jsonb_typeof(requested_state) = 'object'
+        AND requested_state #>> '{config_override,workspace,backend}' = 'virtual'
+        AND workspace = '{"volume_reclaimed":false}'::JSONB
+        AND jsonb_typeof(binding) = 'object'
+        AND binding - ARRAY[
+            'generation', 'kind', 'backing_id', 'ssh_host_key_fingerprint'
+        ] = '{}'::JSONB
+        AND binding->>'kind' = 'virtual'
+        AND binding->>'generation'
+            ~* '^[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$'
+        AND binding->>'backing_id' ~ '^rclone:[0-9a-f]{64}$'
+        AND binding->'ssh_host_key_fingerprint' = 'null'::JSONB
+        AND jsonb_typeof(settled) = 'object'
+        AND settled - ARRAY[
+            'terminal_token', 'cleanup_complete', 'permanent', 'backing_id',
+            'runtime_incarnation', 'snapshot_restore_required',
+            'workspace_absence_proven'
+        ] = '{}'::JSONB
+        AND jsonb_typeof(settled->'terminal_token') = 'number'
+        AND settled->>'terminal_token' ~ '^(0|[1-9][0-9]*)$'
+        AND settled->'cleanup_complete' = 'true'::JSONB
+        AND settled->'permanent' = 'true'::JSONB
+        AND settled->'backing_id' = binding->'backing_id'
+        AND settled->'runtime_incarnation' = 'null'::JSONB
+        AND settled->'snapshot_restore_required' = 'false'::JSONB
+        AND settled->'workspace_absence_proven' = 'false'::JSONB
+        AND COALESCE(requested_state->'vm', '{}'::JSONB) = '{}'::JSONB
+        AND COALESCE(requested_state->'ide_session', '{}'::JSONB) = '{}'::JSONB
+        AND COALESCE(requested_state->'agent_pod', '{}'::JSONB) = '{}'::JSONB
+        AND NOT requested_state ?| ARRAY[
+            '_stateless_workspace_retirement_pending',
+            '_stateless_claim_retirement',
+            '_stateless_resident_retirement_ack',
+            '_stateless_shell_retirement_ack',
+            '_stateless_claim_losses',
+            '_stateless_claim_loss_hold',
+            '_stateless_active_claim'
+        ]
+    ) IS NOT TRUE THEN
+        RETURN FALSE;
+    END IF;
+
+    -- A normal permanent delete removes its exact closed queue inside the
+    -- same transaction. Any remaining queue or live physical claim prevents
+    -- classifying this as purely virtual, even if metadata looks harmless.
+    IF EXISTS (SELECT 1 FROM public.run_queue WHERE unit_id = requested_owner)
+       OR EXISTS (SELECT 1 FROM public.docker_workspace_leases
+           WHERE owner_kind = 'thread' AND owner_id = requested_owner
+             AND status <> 'released')
+       OR EXISTS (SELECT 1 FROM public.thread_agent_workspace_claims
+           WHERE thread_id = requested_owner
+             AND status IN ('planned', 'ready', 'revoking', 'fenced'))
+       OR EXISTS (SELECT 1 FROM public.thread_agent_pod_provision_intents
+           WHERE thread_id = requested_owner
+             AND status IN ('planned', 'revoking'))
+       OR EXISTS (SELECT 1 FROM public.thread_workspace_provision_intents
+           WHERE thread_id = requested_owner
+             AND status IN ('planned', 'revoking', 'fenced'))
+       OR EXISTS (SELECT 1 FROM public.managed_repository_workspace_creation_reservations
+           WHERE owner_kind = 'thread' AND owner_id = requested_owner
+             AND settled_at IS NULL)
+       OR EXISTS (
+           SELECT 1 FROM public.managed_repository_workspace_creation_reservations creation
+           WHERE creation.owner_kind = 'thread'
+             AND creation.owner_id = requested_owner
+             AND creation.runtime_incarnation IS NOT NULL
+             AND NOT EXISTS (
+                 SELECT 1 FROM public.managed_repository_workspace_cleanup_intents intent
+                 WHERE intent.owner_kind = 'thread' AND intent.owner_id = requested_owner
+                   AND intent.scope = 'workspace_container'
+                   AND intent.runtime_incarnation = creation.runtime_incarnation
+                   AND intent.resource_policy = 'terminal_reclaim'
+                   AND intent.target_disposition = 'deleted'
+                   AND intent.result_kind = 'settled'
+                   AND intent.cleanup_completed_at IS NOT NULL
+                   AND intent.settled_at IS NOT NULL
+             )
+       )
+       OR EXISTS (SELECT 1 FROM public.managed_repository_workspace_cleanup_intents
+           WHERE owner_kind = 'thread' AND owner_id = requested_owner
+             AND settled_at IS NULL)
+       OR EXISTS (
+           SELECT 1 FROM public.managed_repository_process_zero_receipts receipt
+           WHERE receipt.owner_kind = 'thread' AND receipt.owner_id = requested_owner
+             AND receipt.provisioner = 'k8s'
+             AND receipt.scope IN ('workspace_container', 'stateless_workspace')
+             AND NOT EXISTS (
+                 SELECT 1 FROM public.managed_repository_workspace_cleanup_intents intent
+                 WHERE intent.owner_kind = 'thread' AND intent.owner_id = requested_owner
+                   AND intent.scope = 'workspace_container'
+                   AND intent.runtime_incarnation::TEXT = receipt.runtime_incarnation
+                   AND intent.resource_policy = 'terminal_reclaim'
+                   AND intent.target_disposition = 'deleted'
+                   AND intent.result_kind = 'settled'
+                   AND intent.cleanup_completed_at IS NOT NULL
+                   AND intent.settled_at IS NOT NULL
+             )
+       )
+    THEN
+        RETURN FALSE;
+    END IF;
+    RETURN TRUE;
+END;
+$_$;
+
+
+--
+-- Name: vm_creation_retries; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.vm_creation_retries (
+    request_id uuid NOT NULL,
+    job_id uuid,
+    provision_generation uuid NOT NULL,
+    origin text NOT NULL,
+    request_digest text NOT NULL,
+    canonical_request jsonb NOT NULL,
+    controller_configuration_digest text NOT NULL,
+    execution_id uuid,
+    execution_revision text,
+    execution_generation bigint,
+    admission_deadline timestamp with time zone,
+    expected_pvc_uid uuid,
+    predecessor_evidence jsonb DEFAULT '{}'::jsonb NOT NULL,
+    predecessor_cleanup_admission_id uuid,
+    creation_admission_id uuid,
+    state text DEFAULT 'queued'::text NOT NULL,
+    revision bigint DEFAULT 0 NOT NULL,
+    claim_token uuid,
+    claim_expires_at timestamp with time zone,
+    next_probe_at timestamp with time zone DEFAULT clock_timestamp() NOT NULL,
+    backoff_attempt integer DEFAULT 0 NOT NULL,
+    transport_outage_started_at timestamp with time zone,
+    reason text,
+    boot_counted boolean DEFAULT false NOT NULL,
+    observed_vm_uid uuid,
+    observed_pvc_uid uuid,
+    ready_at timestamp with time zone,
+    resolved_at timestamp with time zone,
+    created_at timestamp with time zone DEFAULT clock_timestamp() NOT NULL,
+    updated_at timestamp with time zone DEFAULT clock_timestamp() NOT NULL,
+    controller_configuration jsonb,
+    creation_carrier_uid uuid,
+    creation_carrier_namespace text,
+    cancellation_disposition jsonb,
+    cancellation_progress jsonb DEFAULT '{}'::jsonb NOT NULL,
+    cancellation_completion jsonb DEFAULT '{}'::jsonb NOT NULL,
+    owner_kind text DEFAULT 'job'::text NOT NULL,
+    thread_id uuid,
+    thread_runtime_generation uuid,
+    thread_agent_id uuid,
+    thread_attach_token uuid,
+    thread_wake_operation_id uuid,
+    thread_owner_user_id uuid,
+    thread_owner_project_id uuid,
+    disposition_carrier_uid uuid,
+    disposition_carrier_namespace text,
+    thread_retained_resume_id uuid,
+    job_retained_resume_id uuid,
+    job_retained_resume_admitted_xact_id xid8,
+    CONSTRAINT vm_cancel_carrier_exclusive CHECK (((disposition_carrier_uid IS NULL) OR ((owner_kind = ANY (ARRAY['thread'::text, 'job'::text])) AND (creation_carrier_uid IS NULL)))),
+    CONSTRAINT vm_creation_carrier_pair CHECK ((((creation_carrier_uid IS NULL) = (creation_carrier_namespace IS NULL)) AND ((creation_carrier_namespace IS NULL) OR (creation_carrier_namespace <> ''::text)))),
+    CONSTRAINT vm_creation_retries_backoff_attempt_check CHECK ((backoff_attempt >= 0)),
+    CONSTRAINT vm_creation_retries_canonical_request_check CHECK ((jsonb_typeof(canonical_request) = 'object'::text)),
+    CONSTRAINT vm_creation_retries_check CHECK (((claim_token IS NULL) = (claim_expires_at IS NULL))),
+    CONSTRAINT vm_creation_retries_check1 CHECK (((claim_token IS NULL) OR (state = ANY (ARRAY['reconciling'::text, 'cancel_requested'::text])))),
+    CONSTRAINT vm_creation_retries_check2 CHECK (((resolved_at IS NOT NULL) = (state = ANY (ARRAY['succeeded'::text, 'settled'::text])))),
+    CONSTRAINT vm_creation_retries_check3 CHECK (((state <> 'succeeded'::text) OR ((observed_vm_uid IS NOT NULL) AND (observed_pvc_uid IS NOT NULL) AND (creation_admission_id IS NOT NULL)))),
+    CONSTRAINT vm_creation_retries_check4 CHECK (((ready_at IS NULL) OR (state = 'succeeded'::text))),
+    CONSTRAINT vm_creation_retries_check5 CHECK (((expected_pvc_uid IS NULL) OR (observed_pvc_uid IS NULL) OR (expected_pvc_uid = observed_pvc_uid))),
+    CONSTRAINT vm_creation_retries_check6 CHECK (((predecessor_cleanup_admission_id IS NULL) OR (expected_pvc_uid IS NOT NULL))),
+    CONSTRAINT vm_creation_retries_controller_configuration_check CHECK (((controller_configuration IS NULL) OR (jsonb_typeof(controller_configuration) = 'object'::text))),
+    CONSTRAINT vm_creation_retries_controller_configuration_digest_check CHECK ((controller_configuration_digest ~ '^sha256:[0-9a-f]{64}$'::text)),
+    CONSTRAINT vm_creation_retries_origin_check CHECK ((origin = ANY (ARRAY['initial'::text, 'resume'::text]))),
+    CONSTRAINT vm_creation_retries_predecessor_evidence_check CHECK ((jsonb_typeof(predecessor_evidence) = 'object'::text)),
+    CONSTRAINT vm_creation_retries_request_digest_check CHECK ((request_digest ~ '^sha256:[0-9a-f]{64}$'::text)),
+    CONSTRAINT vm_creation_retries_revision_check CHECK ((revision >= 0)),
+    CONSTRAINT vm_creation_retries_state_check CHECK ((state = ANY (ARRAY['queued'::text, 'reconciling'::text, 'succeeded'::text, 'attention'::text, 'cancel_requested'::text, 'settled'::text]))),
+    CONSTRAINT vm_creation_retry_exact_owner CHECK ((((owner_kind = 'job'::text) AND (job_id IS NOT NULL) AND (thread_id IS NULL) AND (thread_runtime_generation IS NULL) AND (thread_agent_id IS NULL) AND (thread_attach_token IS NULL) AND (thread_wake_operation_id IS NULL) AND (thread_owner_user_id IS NULL) AND (thread_owner_project_id IS NULL) AND (execution_id IS NOT NULL) AND (execution_revision IS NOT NULL) AND (execution_generation IS NOT NULL)) OR ((owner_kind = 'thread'::text) AND (job_id IS NULL) AND (thread_id IS NOT NULL) AND (thread_runtime_generation IS NOT NULL) AND ((thread_agent_id IS NULL) = (thread_attach_token IS NULL)) AND (execution_id IS NULL) AND (execution_revision IS NULL) AND (execution_generation IS NULL) AND (admission_deadline IS NULL) AND (predecessor_cleanup_admission_id IS NULL) AND (controller_configuration IS NOT NULL)))),
+    CONSTRAINT vm_thread_cancel_carrier_pair CHECK ((((disposition_carrier_uid IS NULL) = (disposition_carrier_namespace IS NULL)) AND ((disposition_carrier_namespace IS NULL) OR (disposition_carrier_namespace <> ''::text))))
+);
+
+
+--
+-- Name: COLUMN vm_creation_retries.thread_agent_id; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.vm_creation_retries.thread_agent_id IS 'Immutable original pinned-thread actor UUID provenance. New sources require an exact live reciprocal actor locked under the current thread; historical sources retain this UUID after protected detach and operational agent GC.';
+
+
+--
+-- Name: thread_vm_creation_cleanup_lineage(public.threads, public.vm_creation_retries, boolean); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.thread_vm_creation_cleanup_lineage(owner_row public.threads, retry public.vm_creation_retries, require_initial boolean DEFAULT false) RETURNS text
+    LANGUAGE plpgsql STABLE
+    AS $$
+DECLARE prior text;
+BEGIN
+    prior := public.thread_vm_initial_creation_cleanup_lineage(owner_row,retry,require_initial);
+    IF prior IS NOT NULL THEN RETURN prior; END IF;
+    IF NOT require_initial AND public.valid_vm_thread_retained_resume_source(retry)
+       AND retry.ready_at IS NULL AND (
+           (NOT retry.boot_counted AND retry.state IN ('queued','reconciling','attention','cancel_requested'))
+           OR (retry.observed_vm_uid IS NULL AND NOT retry.boot_counted AND retry.state='settled')
+           OR public.valid_vm_thread_retained_handoff(retry))
+       AND EXISTS (SELECT 1 FROM public.vm_thread_retained_resumes op
+           WHERE op.id=retry.thread_retained_resume_id AND op.runtime_generation<>owner_row.runtime_generation
+             AND public.valid_vm_thread_retained_runtime(op,owner_row)) THEN
+        RETURN 'retained_attach_abort_v1';
+    END IF;
+    RETURN NULL;
+END;
+$$;
+
+
+--
+-- Name: thread_vm_creation_never_issued_source(uuid, text); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.thread_vm_creation_never_issued_source(requested_thread uuid, requested_generation text) RETURNS boolean
+    LANGUAGE sql STABLE
+    AS $$
+    SELECT public.thread_vm_initial_creation_never_issued_source(requested_thread,requested_generation)
+       OR EXISTS (SELECT 1 FROM public.threads t JOIN public.vm_creation_retries r ON r.thread_id=t.id
+           WHERE t.id=requested_thread AND r.provision_generation::text=requested_generation
+             AND public.valid_vm_thread_retained_resume_source(r)
+             AND public.valid_thread_vm_creation_retirement_source(r,false)
+             AND public.vm_thread_retained_source_terminal_evidence(r) IS NOT NULL);
+$$;
+
+
+--
+-- Name: thread_vm_initial_creation_cleanup_lineage(public.threads, public.vm_creation_retries, boolean); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.thread_vm_initial_creation_cleanup_lineage(owner_row public.threads, retry public.vm_creation_retries, require_initial boolean DEFAULT false) RETURNS text
+    LANGUAGE plpgsql STABLE
+    AS $$
+DECLARE
+    cursor_generation uuid := retry.thread_runtime_generation;
+    visited uuid[] := ARRAY[]::uuid[];
+    edge public.thread_runtime_attach_abort_outcomes%ROWTYPE;
+    edge_count integer;
+    hops integer := 0;
+    vm jsonb;
+    workspace jsonb;
+BEGIN
+    IF retry.owner_kind IS DISTINCT FROM 'thread'
+       OR retry.thread_id IS DISTINCT FROM owner_row.id
+       OR retry.job_id IS NOT NULL
+       OR owner_row.execution_lane IS DISTINCT FROM 'pinned'
+       OR retry.thread_runtime_generation IS NULL THEN
+        RETURN NULL;
+    END IF;
+    IF NOT require_initial
+       AND retry.thread_runtime_generation = owner_row.runtime_generation
+       AND retry.thread_agent_id IS NOT DISTINCT FROM owner_row.agent_id
+       AND retry.thread_attach_token IS NOT DISTINCT FROM owner_row.runtime_attach_token THEN
+        RETURN 'exact';
+    END IF;
+
+    vm := COALESCE(owner_row.metadata->'vm',
+                   owner_row.runtime_retirement_context->'vm_creation_source'->'captured_vm');
+    workspace := owner_row.metadata->'workspace_container';
+    IF owner_row.runtime_retirement_external_cleanup IS NOT NULL
+       AND owner_row.runtime_retirement_external_cleanup=
+           public.pinned_retirement_external_cleanup_expected(
+               owner_row.runtime_retirement_context,owner_row.runtime_generation,
+               owner_row.runtime_retirement_token)
+       AND public.pinned_retirement_external_resources_absent(owner_row.id,owner_row.metadata) THEN
+        -- Permanent endpoint clearing publishes a full deleted-workspace
+        -- tombstone even for an initially absent workspace. Use the original
+        -- captured shape only through that exact cleanup receipt.
+        workspace := owner_row.runtime_retirement_context->'workspace_container';
+    END IF;
+    IF owner_row.status IS DISTINCT FROM 'created'
+       OR retry.origin IS DISTINCT FROM 'initial'
+       OR retry.expected_pvc_uid IS NOT NULL
+       OR retry.thread_wake_operation_id IS NOT NULL
+       OR retry.observed_vm_uid IS NOT NULL
+       OR COALESCE(retry.canonical_request->'workspace_storage','null'::jsonb) <> 'null'::jsonb
+       OR jsonb_typeof(vm) IS DISTINCT FROM 'object'
+       OR vm->>'creation_request_id' IS DISTINCT FROM retry.request_id::text
+       OR vm->>'provision_generation' IS DISTINCT FROM retry.provision_generation::text
+       OR vm->>'vm_uid' IS NOT NULL
+       OR vm->>'rootdisk' = 'kept'
+       OR vm->>'idle_wake_operation_id' IS NOT NULL
+       OR vm->>'idle_predecessor_pvc_uid' IS NOT NULL
+       OR COALESCE(owner_row.metadata->'_workspace_binding','null'::jsonb) <> 'null'::jsonb
+       OR (workspace IS NOT NULL AND workspace <> 'null'::jsonb
+           AND (jsonb_typeof(workspace) IS DISTINCT FROM 'object'
+                OR workspace - 'repo_name' - 'git_remote_url' <> '{}'::jsonb))
+       OR EXISTS (SELECT 1 FROM public.vm_creation_retries r
+           WHERE r.thread_id=retry.thread_id AND r.request_id<>retry.request_id)
+       OR EXISTS (SELECT 1 FROM public.vm_creation_effects e
+           WHERE e.request_id=retry.request_id AND e.effect_kind='vm' AND e.state='observed')
+       OR EXISTS (SELECT 1 FROM public.vm_idle_operations i
+           WHERE i.owner_kind='thread' AND i.owner_id=retry.thread_id)
+       OR EXISTS (SELECT 1 FROM public.thread_runtime_retirement_outcomes o
+           WHERE o.thread_id=retry.thread_id AND o.outcome='settled'
+             -- Soft End appends this exact outcome before its guarded row
+             -- transition. It is completion of this End, not prior history.
+             AND ROW(o.runtime_generation,o.retirement_token) IS DISTINCT FROM
+                 ROW(owner_row.runtime_generation,owner_row.runtime_retirement_token))
+       OR EXISTS (SELECT 1 FROM public.thread_workspace_provision_intents p
+           WHERE p.thread_id=retry.thread_id)
+       OR EXISTS (SELECT 1 FROM public.vm_workspace_recoveries r
+           WHERE r.owner_kind='thread' AND r.owner_id=retry.thread_id)
+       OR EXISTS (SELECT 1 FROM public.srw_execution_specs e
+           JOIN public.srw_execution_workspace_bindings b ON b.execution_id=e.id
+           WHERE e.work_kind='Session' AND e.work_id=retry.thread_id) THEN
+        RETURN NULL;
+    END IF;
+    -- Exact-source cleanup remains compatible with retained wake. The new
+    -- no-VM final actor protocol must independently pass all fresh guards.
+    IF retry.thread_runtime_generation = owner_row.runtime_generation
+       AND retry.thread_agent_id IS NOT DISTINCT FROM owner_row.agent_id
+       AND retry.thread_attach_token IS NOT DISTINCT FROM owner_row.runtime_attach_token THEN
+        RETURN 'exact';
+    END IF;
+    -- NULL/NULL is the immutable legacy prebind source, admitted while both
+    -- owner and inverse agent were unbound. It cannot authorize creation now.
+    IF cursor_generation = owner_row.runtime_generation THEN
+        IF retry.thread_agent_id IS NULL AND retry.thread_attach_token IS NULL THEN
+            RETURN 'initial_attach_abort_v1';
+        END IF;
+        RETURN NULL;
+    END IF;
+    LOOP
+        -- Explicit bound also covers damaged history; no recursive unbounded
+        -- scan, cycle, or arbitrarily chosen branch can authorize cleanup.
+        IF hops >= 4096 OR cursor_generation = ANY(visited) THEN
+            RETURN NULL;
+        END IF;
+        visited := array_append(visited,cursor_generation);
+        SELECT count(*) INTO edge_count FROM (
+            SELECT 1 FROM public.thread_runtime_attach_abort_outcomes o
+             WHERE o.thread_id=retry.thread_id AND o.runtime_generation=cursor_generation
+             LIMIT 2
+        ) candidates;
+        IF edge_count <> 1 THEN
+            RETURN NULL;
+        END IF;
+        SELECT o.* INTO edge FROM public.thread_runtime_attach_abort_outcomes o
+         WHERE o.thread_id=retry.thread_id AND o.runtime_generation=cursor_generation;
+        IF edge.release_kind IS DISTINCT FROM 'process_zero'
+           OR edge.quiescence_protocol IS DISTINCT FROM 'agent_attach_not_started_v1'
+           OR edge.workspace_generation IS NOT NULL
+           OR edge.workspace_runtime_incarnation IS NOT NULL
+           OR edge.agent_id IS NULL OR edge.runtime_attach_token IS NULL
+           OR NULLIF(btrim(edge.agent_pod_uid),'') IS NULL
+           OR (hops=0 AND retry.thread_agent_id IS NOT NULL
+               AND (edge.agent_id IS DISTINCT FROM retry.thread_agent_id
+                    OR edge.runtime_attach_token IS DISTINCT FROM retry.thread_attach_token)) THEN
+            RETURN NULL;
+        END IF;
+        cursor_generation := edge.successor_generation;
+        hops := hops+1;
+        IF cursor_generation = owner_row.runtime_generation THEN
+            RETURN 'initial_attach_abort_v1';
+        END IF;
+    END LOOP;
+END;
+$$;
+
+
+--
+-- Name: thread_vm_initial_creation_never_issued_source(uuid, text); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.thread_vm_initial_creation_never_issued_source(requested_thread uuid, requested_generation text) RETURNS boolean
+    LANGUAGE sql STABLE
+    AS $_$
+    SELECT EXISTS (
+        SELECT 1 FROM public.threads t
+        JOIN public.vm_creation_retries r
+          ON r.request_id = (t.runtime_retirement_context
+                             ->'vm_creation_source'->>'request_id')::uuid
+        LEFT JOIN public.vm_workspace_cleanup_admissions a
+          ON a.id = r.creation_admission_id
+        WHERE t.id = requested_thread
+          AND t.execution_lane = 'pinned'
+          AND t.runtime_retirement_token IS NOT NULL
+          AND t.runtime_retirement_authorized_at IS NOT NULL
+          AND t.runtime_retirement_context->'vm_creation_source'->>'request_id'
+              ~ '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+          AND public.valid_thread_vm_creation_retirement_source(r,false)
+          AND t.runtime_retirement_context->'vm_creation_source'
+              ->>'provision_generation' = requested_generation
+          AND r.owner_kind = 'thread' AND r.thread_id = t.id
+          AND r.job_id IS NULL
+          AND r.provision_generation::text = requested_generation
+          AND r.request_digest = t.runtime_retirement_context
+              ->'vm_creation_source'->>'request_digest'
+          AND r.controller_configuration_digest = t.runtime_retirement_context
+              ->'vm_creation_source'->>'controller_configuration_digest'
+          AND r.state = 'settled' AND (
+              (r.reason = 'creation_never_issued'
+               AND r.observed_vm_uid IS NULL AND r.observed_pvc_uid IS NULL
+               AND (a.id IS NULL OR (a.completed_at IS NOT NULL
+                     AND a.outcome = 'never_issued' AND a.owner_kind = 'thread'
+                     AND a.owner_id = t.id))
+               AND NOT EXISTS (SELECT 1 FROM public.vm_creation_effects e
+                   WHERE e.request_id = r.request_id
+                     AND e.state IN ('issued','observed')))
+              OR (r.reason = 'creation_disposed'
+                  AND r.observed_vm_uid IS NULL
+                  AND a.completed_at IS NOT NULL
+                  AND a.outcome = 'creation_disposed'
+                  AND a.owner_kind = 'thread' AND a.owner_id = t.id
+                  AND public.valid_vm_creation_disposition_evidence(r))
+          )
+          AND NOT EXISTS (
+              SELECT 1 FROM public.vm_resource_reservations v
+               WHERE v.request_id = r.request_id AND v.state <> 'released'
+          )
+    );
+$_$;
+
+
+--
 -- Name: transition_storage_asset_for_destruction(); Type: FUNCTION; Schema: public; Owner: -
 --
 
@@ -13359,6 +20826,1065 @@ CREATE FUNCTION public.update_updated_at_column() RETURNS trigger
 BEGIN
     NEW.updated_at = CURRENT_TIMESTAMP;
     RETURN NEW;
+END;
+$$;
+
+
+--
+-- Name: valid_thread_vm_creation_retirement_source(public.vm_creation_retries, boolean); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.valid_thread_vm_creation_retirement_source(retry public.vm_creation_retries, require_captured boolean) RETURNS boolean
+    LANGUAGE sql STABLE
+    AS $$
+    SELECT EXISTS (SELECT 1 FROM public.threads t
+        WHERE t.id=retry.thread_id AND t.execution_lane='pinned'
+          AND t.runtime_retirement_token IS NOT NULL
+          AND t.runtime_retirement_authorized_at IS NOT NULL
+          AND t.runtime_retirement_context->>'settle_status'='ended'
+          AND t.runtime_retirement_context->>'generation'=t.runtime_generation::text
+          AND t.runtime_retirement_context->>'agent_id' IS NOT DISTINCT FROM t.agent_id::text
+          AND t.runtime_retirement_context->>'runtime_attach_token' IS NOT DISTINCT FROM t.runtime_attach_token::text
+          AND (retry.thread_retained_resume_id IS NULL OR public.valid_vm_thread_retained_source_capture(
+              retry,t.runtime_retirement_context,t.runtime_generation))
+          AND public.thread_vm_creation_cleanup_lineage(t,retry)=COALESCE(
+              t.runtime_retirement_context->'vm_creation_source'->>'cleanup_protocol','exact')
+          AND t.runtime_retirement_context->'vm_creation_source'->>'request_id'=retry.request_id::text
+          AND t.runtime_retirement_context->'vm_creation_source'->>'provision_generation'=retry.provision_generation::text
+          AND t.runtime_retirement_context->'vm_creation_source'->>'thread_runtime_generation'=retry.thread_runtime_generation::text
+          AND t.runtime_retirement_context->'vm_creation_source'->>'thread_agent_id' IS NOT DISTINCT FROM retry.thread_agent_id::text
+          AND t.runtime_retirement_context->'vm_creation_source'->>'thread_attach_token' IS NOT DISTINCT FROM retry.thread_attach_token::text
+          AND t.runtime_retirement_context->'vm_creation_source'->>'request_digest'=retry.request_digest
+          AND t.runtime_retirement_context->'vm_creation_source'->>'controller_configuration_digest'=retry.controller_configuration_digest
+          AND t.runtime_retirement_context->'vm_creation_source'->'captured_vm'->>'creation_request_id'=retry.request_id::text
+          AND t.runtime_retirement_context->'vm_creation_source'->'captured_vm'->>'provision_generation'=retry.provision_generation::text
+          AND COALESCE(t.runtime_retirement_context->'vm_creation_source'->'captured_vm'->'vm_uid','null'::jsonb)='null'::jsonb
+          AND (COALESCE(t.runtime_retirement_context->'vm_creation_source'->'captured_vm'->'rootdisk_pvc_uid','null'::jsonb)='null'::jsonb
+               OR t.runtime_retirement_context->'vm_creation_source'->'captured_vm'->>'rootdisk_pvc_uid'=retry.observed_pvc_uid::text)
+          AND (t.metadata->'vm'=t.runtime_retirement_context->'vm_creation_source'->'captured_vm'
+               OR (NOT require_captured AND retry.state='settled' AND (
+                   NOT t.metadata ? 'vm' OR EXISTS (
+                       SELECT 1 FROM public.vm_thread_retained_resumes op
+                       WHERE op.id=retry.thread_retained_resume_id AND op.retained_vm=t.metadata->'vm'
+                         AND public.valid_vm_thread_retained_resume_source(retry)
+                         AND retry.observed_vm_uid IS NULL AND NOT retry.boot_counted
+                         AND retry.reason IN ('creation_never_issued','creation_disposed')) OR (
+                       public.valid_vm_thread_retained_resume_source(retry)
+                       AND retry.reason='retained_creation_handoff'
+                       AND t.metadata->'vm'->>'creation_request_id'=retry.request_id::text
+                       AND t.metadata->'vm'->>'provision_generation'=retry.provision_generation::text
+                       AND (t.metadata->'vm'->>'vm_uid' IS NULL OR t.metadata->'vm'->>'vm_uid'=retry.observed_vm_uid::text)
+                       AND (t.metadata->'vm'->>'rootdisk_pvc_uid' IS NULL OR t.metadata->'vm'->>'rootdisk_pvc_uid'=retry.observed_pvc_uid::text)
+                       AND EXISTS (SELECT 1 FROM public.vm_resource_thread_cleanup_authorities a
+                           WHERE a.request_id=retry.request_id AND a.runtime_generation=t.runtime_generation
+                             AND a.retirement_token=t.runtime_retirement_token)) OR EXISTS (
+                       SELECT 1 FROM public.vm_thread_retained_resume_terminals terminal
+                       WHERE terminal.operation_id=retry.thread_retained_resume_id
+                         AND terminal.runtime_generation=t.runtime_generation AND terminal.retirement_token=t.runtime_retirement_token
+                         AND terminal.source_request_id=retry.request_id AND terminal.retained_vm=t.metadata->'vm')))));
+$$;
+
+
+--
+-- Name: valid_vm_creation_attachment_completion(public.vm_creation_retries, jsonb); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.valid_vm_creation_attachment_completion(retry public.vm_creation_retries, evidence jsonb) RETURNS boolean
+    LANGUAGE plpgsql IMMUTABLE
+    AS $_$
+DECLARE plan jsonb; binding jsonb; prior jsonb; lease jsonb; observed jsonb; labels jsonb; ann jsonb;
+BEGIN
+    plan := retry.cancellation_progress->'workspace_attachment';
+    binding := COALESCE(retry.canonical_request->'workspace_storage','null'::jsonb);
+    IF NOT (jsonb_typeof(plan)='object'
+        AND plan ?& ARRAY['version','kind','disposition_id','request_id','job_id','provision_generation','binding','name','namespace','outcome','prior']
+        AND plan-ARRAY['version','kind','disposition_id','request_id','job_id','provision_generation','binding','name','namespace','outcome','prior']='{}'::jsonb
+        AND plan->'version'='1'::jsonb AND plan->>'kind'='attachment_disposition_planned'
+        AND plan->'disposition_id'=retry.cancellation_disposition->'disposition_id'
+        AND plan->>'request_id'=retry.request_id::text AND plan->>'job_id'=COALESCE(retry.job_id,retry.thread_id)::text
+        AND plan->>'provision_generation'=retry.provision_generation::text
+        AND plan->'namespace'=retry.cancellation_disposition->'namespace'
+        AND plan->'binding'=binding
+        AND jsonb_typeof(evidence)='object' AND evidence ?& ARRAY['version','kind','plan','outcome','lease']
+        AND evidence-ARRAY['version','kind','plan','outcome','lease']='{}'::jsonb
+        AND evidence->'version'='1'::jsonb AND evidence->>'kind'='attachment_disposition_completed'
+        AND evidence->'plan'=plan AND evidence->'outcome'=plan->'outcome'
+        AND retry.cancellation_completion ?& ARRAY['cloud_init','rootdisk','source']) IS TRUE THEN RETURN false; END IF;
+    IF binding='null'::jsonb THEN
+        RETURN (plan->>'outcome'='not_applicable' AND plan->'prior'='null'::jsonb
+            AND plan->'name'='null'::jsonb AND evidence->'lease'='null'::jsonb) IS TRUE;
+    END IF;
+    IF NOT (plan->>'name'='srw-ws-' || replace(binding->>'uid','-','') AND (
+        (plan->>'outcome'='released' AND binding->'pvc_uid'='null'::jsonb
+            AND retry.cancellation_completion->'rootdisk'->>'kind'='rootdisk_never_issued') OR
+        (plan->>'outcome'='detached' AND retry.cancellation_completion->'rootdisk'->>'kind'='rootdisk_retained')
+    )) IS TRUE THEN RETURN false; END IF;
+    labels := jsonb_build_object('srw.io/workspace-instance',binding->'uid',
+        'srw.io/workspace-generation',binding->>'generation','srw.io/workspace-execution',COALESCE(retry.job_id,retry.thread_id)::text);
+    prior := plan->'prior'; lease := evidence->'lease';
+    observed := retry.cancellation_disposition->'objects'->'workspace_attach';
+    IF prior='null'::jsonb THEN
+        IF NOT (observed IS NULL AND binding->'generation'='1'::jsonb
+            AND plan->>'outcome'='released') IS TRUE THEN RETURN false; END IF;
+    ELSE
+        IF NOT (jsonb_typeof(prior)='object' AND prior ?& ARRAY['uid','resource_version','labels','annotations']
+            AND prior-ARRAY['uid','resource_version','labels','annotations']='{}'::jsonb
+            AND prior->'uid'=observed->'uid' AND prior->'resource_version'=observed->'resource_version'
+            AND prior->'labels'=labels AND prior->'uid'=lease->'uid'
+            AND prior->'resource_version'<>lease->'resource_version') IS TRUE THEN RETURN false; END IF;
+    END IF;
+    ann := lease->'annotations';
+    RETURN (jsonb_typeof(lease)='object' AND lease ?& ARRAY['uid','resource_version','labels','annotations']
+        AND lease-ARRAY['uid','resource_version','labels','annotations']='{}'::jsonb
+        AND jsonb_typeof(lease->'uid')='string' AND lease->>'uid' ~ '^[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$'
+        AND jsonb_typeof(lease->'resource_version')='string' AND length(lease->>'resource_version') BETWEEN 1 AND 256
+        AND lease->'labels'=labels AND jsonb_typeof(ann)='object'
+        AND ann ?& ARRAY['srw.io/vm-create-request-id','srw.io/vm-create-effect-nonce','srw.io/provision-generation','srw.io/detached','srw.io/released','srw.io/vm-create-disposition']
+        AND ann-ARRAY['srw.io/vm-create-request-id','srw.io/vm-create-effect-nonce','srw.io/provision-generation','srw.io/detached','srw.io/released','srw.io/vm-create-disposition']='{}'::jsonb
+        AND ann->>'srw.io/vm-create-request-id'=retry.request_id::text
+        AND ann->>'srw.io/provision-generation'=retry.provision_generation::text
+        AND ann->'srw.io/vm-create-effect-nonce'=COALESCE(prior->'annotations'->'srw.io/vm-create-effect-nonce','null'::jsonb)
+        AND ann->>'srw.io/detached'=CASE WHEN plan->>'outcome'='detached' THEN 'true' ELSE 'false' END
+        AND ann->>'srw.io/released'=CASE WHEN plan->>'outcome'='released' THEN 'true' ELSE 'false' END
+        AND (ann->>'srw.io/vm-create-disposition')::jsonb=plan) IS TRUE;
+END;
+$_$;
+
+
+--
+-- Name: valid_vm_creation_disposition_evidence(public.vm_creation_retries); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.valid_vm_creation_disposition_evidence(retry public.vm_creation_retries) RETURNS boolean
+    LANGUAGE plpgsql STABLE
+    AS $$
+DECLARE stage text;
+BEGIN
+    IF NOT (
+        retry.cancellation_disposition IS NOT NULL
+        AND retry.state IN ('cancel_requested','settled')
+        AND retry.cancellation_disposition->>'request_id'=retry.request_id::text
+        AND retry.cancellation_disposition->>'admission_id'=retry.creation_admission_id::text
+        AND retry.cancellation_disposition->>'job_id'=COALESCE(retry.job_id,retry.thread_id)::text
+        AND retry.cancellation_disposition->>'provision_generation'=retry.provision_generation::text
+        AND retry.observed_vm_uid IS NULL
+        AND (retry.owner_kind='job' OR (retry.owner_kind='thread'
+             AND public.valid_vm_creation_thread_disposition_identity(retry,false)))
+        AND retry.boot_counted=false
+        AND jsonb_typeof(retry.cancellation_completion)='object'
+        AND retry.cancellation_completion ?& ARRAY['source','cloud_init','rootdisk','workspace_attachment']
+        AND retry.cancellation_completion-ARRAY['source','cloud_init','rootdisk','workspace_attachment']='{}'::jsonb
+        AND NOT EXISTS(SELECT 1 FROM public.vm_creation_effects e
+            WHERE e.request_id=retry.request_id
+              AND (e.state='issued' OR (e.effect_kind='vm' AND e.state<>'rejected')))
+        AND public.valid_vm_creation_source_authority(retry)
+        AND public.valid_vm_creation_attachment_completion(
+            retry,retry.cancellation_completion->'workspace_attachment')
+    ) IS TRUE THEN RETURN false; END IF;
+    FOREACH stage IN ARRAY ARRAY['cloud_init','rootdisk'] LOOP
+        IF NOT public.valid_vm_creation_resource_completion(
+            retry,stage,retry.cancellation_completion->stage) THEN RETURN false; END IF;
+    END LOOP;
+    RETURN true;
+END;
+$$;
+
+
+--
+-- Name: vm_workspace_cleanup_admissions; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.vm_workspace_cleanup_admissions (
+    id uuid NOT NULL,
+    owner_kind text NOT NULL,
+    owner_id uuid NOT NULL,
+    pvc_uid uuid,
+    source text NOT NULL,
+    request_id uuid NOT NULL,
+    admitted_at timestamp with time zone DEFAULT clock_timestamp() NOT NULL,
+    completed_at timestamp with time zone,
+    outcome text,
+    intent_digest text NOT NULL,
+    parent_admission_id uuid,
+    retained_resume_admitted_xact_id xid8,
+    CONSTRAINT vm_workspace_cleanup_admissions_check CHECK ((((completed_at IS NULL) AND (outcome IS NULL)) OR ((completed_at IS NOT NULL) AND (outcome IS NOT NULL) AND (outcome <> ''::text)))),
+    CONSTRAINT vm_workspace_cleanup_admissions_intent_digest_check CHECK ((intent_digest <> ''::text)),
+    CONSTRAINT vm_workspace_cleanup_admissions_not_self_parent CHECK ((parent_admission_id IS DISTINCT FROM id)),
+    CONSTRAINT vm_workspace_cleanup_admissions_owner_kind_check CHECK ((owner_kind = ANY (ARRAY['job'::text, 'thread'::text]))),
+    CONSTRAINT vm_workspace_cleanup_admissions_source_check CHECK ((source <> ''::text))
+);
+
+
+--
+-- Name: valid_vm_creation_disposition_parent_identity(public.vm_creation_retries, public.vm_workspace_cleanup_admissions); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.valid_vm_creation_disposition_parent_identity(retry public.vm_creation_retries, parent public.vm_workspace_cleanup_admissions) RETURNS boolean
+    LANGUAGE sql STABLE
+    AS $$
+    SELECT (parent.id=retry.creation_admission_id
+        AND parent.owner_kind=retry.owner_kind AND parent.owner_id=COALESCE(retry.job_id,retry.thread_id)
+        AND parent.source='controller_vm_create' AND parent.parent_admission_id IS NULL
+        AND parent.pvc_uid IS NOT DISTINCT FROM COALESCE(retry.expected_pvc_uid,retry.observed_pvc_uid)
+        AND parent.request_id=uuid_generate_v5(uuid_ns_url(),'vm-create:' || retry.request_id::text)
+    ) IS TRUE;
+$$;
+
+
+--
+-- Name: valid_vm_creation_job_cancel_identity(public.vm_creation_retries); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.valid_vm_creation_job_cancel_identity(retry public.vm_creation_retries) RETURNS boolean
+    LANGUAGE sql STABLE
+    AS $$
+    SELECT (retry.owner_kind='job' AND retry.job_id IS NOT NULL
+       AND retry.thread_id IS NULL
+       AND retry.creation_carrier_uid IS NULL
+       AND retry.expected_pvc_uid IS NULL
+       AND retry.observed_pvc_uid IS NULL
+       AND retry.observed_vm_uid IS NULL
+       AND retry.controller_configuration->>'version'='3'
+       AND jsonb_typeof(retry.controller_configuration->'resource_admission')='object'
+       AND retry.canonical_request->>'entity_type'='job'
+       AND retry.canonical_request->>'job_id'=retry.job_id::text
+       AND retry.canonical_request->>'provision_generation'=retry.provision_generation::text
+       AND retry.cancellation_disposition->>'carrier_kind'='job_creation_cancel'
+       AND retry.cancellation_disposition->>'request_id'=retry.request_id::text
+       AND retry.cancellation_disposition->>'admission_id'=retry.creation_admission_id::text
+       AND retry.cancellation_disposition->>'job_id'=retry.job_id::text
+       AND retry.cancellation_disposition->>'provision_generation'=retry.provision_generation::text
+       AND retry.cancellation_disposition->>'carrier_uid'=retry.disposition_carrier_uid::text
+       AND retry.cancellation_disposition->>'namespace'=retry.disposition_carrier_namespace
+       AND retry.disposition_carrier_namespace=retry.controller_configuration->>'namespace'
+       AND retry.cancellation_disposition->'effects'='[]'::jsonb
+       AND retry.cancellation_disposition->'objects'='{}'::jsonb
+       AND retry.cancellation_disposition->'source'='null'::jsonb
+       AND retry.cancellation_disposition->>'source_resolution'=(CASE
+           WHEN COALESCE(retry.canonical_request->'preparation','null'::jsonb)<>'null'::jsonb
+             OR retry.controller_configuration->'golden_enabled' IS DISTINCT FROM 'false'::jsonb
+           THEN 'unknown' ELSE 'not_required' END)
+       AND NOT EXISTS (SELECT 1 FROM public.vm_creation_effects e
+           WHERE e.request_id=retry.request_id)
+       AND EXISTS (SELECT 1 FROM public.jobs j
+           WHERE j.id=retry.job_id AND j.status::text='cancelled'
+             AND j.context->'vm'->>'provision_generation'=retry.provision_generation::text)
+       AND EXISTS (SELECT 1 FROM public.vm_workspace_cleanup_admissions a
+           WHERE a.id=retry.creation_admission_id
+             AND a.source='controller_vm_create'
+             AND a.owner_kind='job' AND a.owner_id=retry.job_id
+             AND a.request_id=uuid_generate_v5(uuid_ns_url(),
+                 'vm-create:' || retry.request_id::text)
+             AND a.pvc_uid IS NULL)
+       AND EXISTS (SELECT 1 FROM public.vm_resource_reservations r
+           JOIN public.vm_resource_waiters w ON w.request_id=r.request_id
+           WHERE r.request_id=retry.request_id
+             AND r.resource_version=2 AND r.vm_uid IS NULL
+             AND w.owner_kind='job' AND w.job_id=retry.job_id
+             AND w.provision_generation=retry.provision_generation
+             AND r.cluster_id=w.cluster_id
+             AND r.policy_digest=w.policy_digest
+             AND r.cluster_id=retry.controller_configuration->'resource_admission'->>'cluster_id'
+             AND r.policy_digest=retry.controller_configuration->'resource_admission'->>'policy_digest'
+             AND ((retry.state='cancel_requested'
+                   AND r.state='reserved' AND w.state='admitted')
+                  OR (retry.state='settled'
+                   AND r.state='released' AND w.state='released'
+                   AND r.release_evidence->>'disposition_id'=retry.cancellation_disposition->>'disposition_id')))
+    ) IS TRUE;
+$$;
+
+
+--
+-- Name: valid_vm_creation_resource_completion(public.vm_creation_retries, text, jsonb); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.valid_vm_creation_resource_completion(retry public.vm_creation_retries, stage text, evidence jsonb) RETURNS boolean
+    LANGUAGE plpgsql STABLE
+    AS $$
+DECLARE resource jsonb;
+BEGIN
+    IF stage='rootdisk' AND retry.job_retained_resume_id IS NOT NULL
+       AND retry.cancellation_disposition->'objects'->'rootdisk' IS NULL
+       AND retry.cancellation_disposition->>'disk_policy'='retain' THEN
+        resource := public.vm_job_retained_inherited_rootdisk(retry);
+        RETURN COALESCE(resource IS NOT NULL AND evidence=retry.cancellation_progress->stage
+          AND evidence=jsonb_build_object('version',1,'disposition_id',retry.cancellation_disposition->>'disposition_id',
+              'kind','rootdisk_retained')||resource,false);
+    END IF;
+    RETURN public.valid_vm_creation_resource_without_job_inheritance(retry,stage,evidence);
+END;
+$$;
+
+
+--
+-- Name: valid_vm_creation_resource_without_job_inheritance(public.vm_creation_retries, text, jsonb); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.valid_vm_creation_resource_without_job_inheritance(retry public.vm_creation_retries, stage text, evidence jsonb) RETURNS boolean
+    LANGUAGE plpgsql STABLE
+    AS $$
+DECLARE resource jsonb; expected_name text; keys text[];
+BEGIN
+    IF NOT (stage IN ('cloud_init','rootdisk') AND jsonb_typeof(evidence)='object'
+        AND evidence->'version'='1'::jsonb
+        AND evidence->'disposition_id'=retry.cancellation_disposition->'disposition_id'
+        AND evidence=retry.cancellation_progress->stage) IS TRUE THEN RETURN false; END IF;
+    resource := retry.cancellation_disposition->'objects'->stage;
+    IF resource IS NULL THEN
+        expected_name := CASE WHEN stage='rootdisk' AND retry.canonical_request->'workspace_storage'<>'null'::jsonb
+            THEN 'srw-ws-' || replace(retry.canonical_request->'workspace_storage'->>'uid','-','')
+            ELSE 'agent-vm-' || COALESCE(retry.job_id,retry.thread_id)::text || CASE WHEN stage='rootdisk' THEN '-rootdisk' ELSE '-cloudinit' END END;
+        keys := ARRAY['version','kind','disposition_id','name','namespace'];
+        RETURN (evidence ?& keys AND evidence-keys='{}'::jsonb
+            AND evidence->>'kind'=CASE WHEN stage='rootdisk' THEN 'rootdisk_never_issued' ELSE 'secret_never_issued' END
+            AND evidence->>'name'=expected_name
+            AND evidence->'namespace'=retry.cancellation_disposition->'namespace'
+            AND (stage<>'rootdisk' OR (retry.expected_pvc_uid IS NULL AND retry.observed_pvc_uid IS NULL))
+            AND NOT EXISTS(SELECT 1 FROM public.vm_creation_effects e
+                WHERE e.request_id=retry.request_id AND e.effect_kind=stage AND e.state<>'rejected')) IS TRUE;
+    END IF;
+    IF NOT (evidence->'name'=resource->'name' AND evidence->'namespace'=resource->'namespace'
+        AND evidence->'uid'=resource->'uid') IS TRUE THEN RETURN false; END IF;
+    IF stage='cloud_init' THEN
+        keys := ARRAY['version','kind','disposition_id','name','namespace','uid'];
+        RETURN (evidence ?& keys AND evidence-keys='{}'::jsonb AND evidence->>'kind'='secret_absent') IS TRUE;
+    END IF;
+    IF retry.cancellation_disposition->>'disk_policy'='retain' THEN
+        keys := ARRAY['version','kind','disposition_id','name','namespace','uid','pvc_uid'];
+        RETURN (evidence ?& keys AND evidence-keys='{}'::jsonb
+            AND evidence->>'kind'='rootdisk_retained' AND evidence->'pvc_uid'=resource->'pvc_uid'
+            AND evidence->>'pvc_uid'=COALESCE(retry.expected_pvc_uid,retry.observed_pvc_uid)::text) IS TRUE;
+    END IF;
+    keys := ARRAY['version','kind','disposition_id','name','namespace','uid','pvc_uid','admission_id','request_id','intent_digest'];
+    RETURN (evidence ?& keys AND evidence-keys='{}'::jsonb
+        AND evidence->>'kind'='rootdisk_purged' AND evidence->'pvc_uid'=resource->'pvc_uid'
+        AND retry.cancellation_disposition->>'disk_policy'=CASE WHEN retry.owner_kind='thread' THEN 'purge_new_thread_disk' ELSE 'purge_new_job_disk' END
+        AND EXISTS(SELECT 1 FROM public.vm_workspace_cleanup_admissions a
+            WHERE a.id::text=evidence->>'admission_id' AND a.parent_admission_id=retry.creation_admission_id
+              AND a.request_id::text=evidence->>'request_id' AND a.intent_digest=evidence->>'intent_digest'
+              AND a.owner_kind=retry.owner_kind AND a.owner_id=COALESCE(retry.job_id,retry.thread_id) AND a.pvc_uid::text=evidence->>'pvc_uid'
+              AND a.source='controller_creation_rootdisk_delete' AND a.completed_at IS NOT NULL AND a.outcome='deleted')) IS TRUE;
+END;
+$$;
+
+
+--
+-- Name: valid_vm_creation_source_authority(public.vm_creation_retries); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.valid_vm_creation_source_authority(retry public.vm_creation_retries) RETURNS boolean
+    LANGUAGE plpgsql STABLE
+    AS $$
+DECLARE
+    disposition jsonb := retry.cancellation_disposition;
+    plan jsonb := retry.cancellation_progress->'source';
+    completion jsonb := retry.cancellation_completion->'source';
+    source jsonb := retry.cancellation_progress->'source'->'source';
+    frozen_source jsonb := retry.cancellation_disposition->'source';
+    root jsonb := retry.cancellation_disposition->'objects'->'rootdisk';
+    root_completion jsonb := retry.cancellation_completion->'rootdisk';
+    target jsonb := retry.cancellation_progress->'source'->'target';
+    resolution text := retry.cancellation_disposition->>'source_resolution';
+    expected_name text;
+BEGIN
+    IF NOT (public.valid_vm_creation_source_completion(plan,completion)
+        AND resolution IN ('required','unknown','not_required')
+        AND plan->>'request_id'=retry.request_id::text
+        AND plan->>'job_id'=COALESCE(retry.job_id,retry.thread_id)::text
+        AND plan->>'provision_generation'=retry.provision_generation::text
+        AND plan->>'request_digest'=retry.request_digest
+        AND plan->>'controller_configuration_digest'=retry.controller_configuration_digest
+        AND plan->'disposition_id'=disposition->'disposition_id'
+        AND (frozen_source='null'::jsonb OR source=frozen_source)
+        AND (resolution<>'required' OR
+            (frozen_source<>'null'::jsonb AND frozen_source->>'kind' IN ('golden','prepared')))
+        AND (resolution<>'unknown' OR
+            (frozen_source='null'::jsonb AND source<>'null'::jsonb))
+        AND (resolution<>'not_required' OR
+            (source=frozen_source AND (frozen_source='null'::jsonb OR
+                frozen_source->>'kind' IN ('registry','retained'))))
+    ) IS TRUE THEN RETURN false; END IF;
+    -- An unresolved source may have published a hold before the first create
+    -- effect. Only the frozen no-source decision can prove no disposition is
+    -- needed; a subsequently supplied source must still prove its own result.
+    IF completion->>'outcome'='not_required' AND NOT (
+        resolution='not_required' OR
+        (resolution='required' AND source=frozen_source
+            AND source->>'kind'='prepared' AND source->>'mode'='retained')
+    ) IS TRUE THEN RETURN false; END IF;
+    IF resolution='unknown' AND NOT (
+        (COALESCE(retry.canonical_request->'preparation','null'::jsonb)='null'::jsonb
+            AND source->>'kind'='golden') OR
+        (COALESCE(retry.canonical_request->'preparation','null'::jsonb)<>'null'::jsonb
+            AND source->>'kind' IN ('prepared','preparation_never_delivered'))
+    ) IS TRUE THEN RETURN false; END IF;
+    IF source='null'::jsonb OR source->>'kind' IN ('registry','retained') OR
+       (source->>'kind'='prepared' AND source->>'mode'='retained') THEN
+        RETURN (target='null'::jsonb AND plan->'tombstone'='null'::jsonb) IS TRUE;
+    END IF;
+    IF root IS NULL THEN
+        expected_name := CASE WHEN retry.canonical_request->'workspace_storage'<>'null'::jsonb
+            THEN 'srw-ws-' || replace(retry.canonical_request->'workspace_storage'->>'uid','-','')
+            ELSE 'agent-vm-' || COALESCE(retry.job_id,retry.thread_id)::text || '-rootdisk' END;
+        RETURN (target=jsonb_build_object('kind','rootdisk_never_issued',
+                'name',expected_name,'namespace',disposition->>'namespace')
+            AND retry.expected_pvc_uid IS NULL AND retry.observed_pvc_uid IS NULL
+            AND NOT EXISTS(SELECT 1 FROM jsonb_array_elements(disposition->'effects') effect
+                WHERE effect->>'effect_kind'='rootdisk' AND effect->>'state'<>'rejected')) IS TRUE;
+    END IF;
+    IF disposition->>'disk_policy'='retain' THEN
+        RETURN (target=jsonb_build_object('kind','rootdisk_completed',
+                'name',root->>'name','namespace',root->>'namespace',
+                'uid',root->>'uid','pvc_uid',root->>'pvc_uid')) IS TRUE;
+    END IF;
+    RETURN (root_completion->>'kind'='rootdisk_purged'
+        AND target=root_completion) IS TRUE;
+END;
+$$;
+
+
+--
+-- Name: valid_vm_creation_source_completion(jsonb, jsonb); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.valid_vm_creation_source_completion(plan jsonb, evidence jsonb) RETURNS boolean
+    LANGUAGE plpgsql IMMUTABLE
+    AS $$
+DECLARE
+    source jsonb;
+    observation jsonb;
+    allocation jsonb;
+    receipt jsonb;
+BEGIN
+    IF NOT (jsonb_typeof(plan)='object' AND plan->'version'='1'::jsonb
+        AND plan->>'kind'='source_disposition_planned'
+        AND jsonb_typeof(evidence)='object' AND evidence->'version'='1'::jsonb
+        AND evidence->>'kind'='source_disposition_completed' AND evidence->'plan'=plan
+        AND evidence ?& ARRAY['version','kind','outcome','plan','source_observation','allocation']
+        AND evidence - ARRAY['version','kind','outcome','plan','source_observation','allocation']='{}'::jsonb
+        AND octet_length(evidence::text)<=1048576) IS TRUE THEN RETURN false; END IF;
+    source := plan->'source';
+    observation := evidence->'source_observation';
+    allocation := evidence->'allocation';
+    IF plan->'tombstone'<>'null'::jsonb THEN
+        IF NOT (source->>'kind' IN ('golden','prepared')
+            AND plan->'tombstone'->>'state'='disposed'
+            AND plan->'tombstone'->'dv_uid'=source->'dv_uid'
+            AND plan->'tombstone'->'pvc_uid'=source->'pvc_uid'
+            AND plan->'tombstone'->'target'=plan->'target'
+            AND public.valid_vm_creation_source_readback(source,plan->'tombstone',observation,evidence->>'outcome')) IS TRUE THEN RETURN false; END IF;
+    ELSIF source->>'kind'='preparation_never_delivered' THEN
+        IF NOT (evidence->>'outcome'='allocation_never_delivered' AND observation='null'::jsonb) IS TRUE THEN RETURN false; END IF;
+    ELSIF NOT (evidence->>'outcome'='not_required' AND observation='null'::jsonb
+        AND plan->'target'='null'::jsonb AND
+        (source='null'::jsonb OR source->>'kind' IN ('registry','retained')
+         OR (source->>'kind'='prepared' AND source->>'mode'='retained'))) IS TRUE THEN
+        RETURN false;
+    END IF;
+    IF source->>'kind'='preparation_never_delivered' OR
+       (source->>'kind'='prepared' AND source->>'mode'='clone') THEN
+        IF NOT (jsonb_typeof(allocation)='object'
+            AND allocation ?& ARRAY['name','uid','resource_version','request','phase','creation_binding','workspace_source_issued','receipt']
+            AND allocation-ARRAY['name','uid','resource_version','request','phase','creation_binding','workspace_source_issued','receipt']='{}'::jsonb
+            AND allocation->'name'=source->'allocation'->'name'
+            AND allocation->'uid'=source->'allocation'->'uid'
+            AND allocation->'request'=source->'allocation'->'request'
+            AND allocation->>'phase'='Cancelled'
+            AND jsonb_typeof(allocation->'resource_version')='string'
+            AND length(allocation->>'resource_version') BETWEEN 1 AND 256) IS TRUE THEN RETURN false; END IF;
+        receipt := allocation->'receipt';
+        IF NOT (jsonb_typeof(receipt)='object' AND receipt->'version'='1'::jsonb AND receipt->'plan'=plan) IS TRUE THEN RETURN false; END IF;
+        IF source->>'kind'='preparation_never_delivered' THEN
+            IF NOT (allocation->'workspace_source_issued'='false'::jsonb
+                AND allocation->'creation_binding'=COALESCE(source->'allocation'->'state'->'creation_binding','null'::jsonb)
+                AND receipt->>'kind'='prepared_source_never_delivered'
+                AND receipt-ARRAY['version','kind','plan']='{}'::jsonb) IS TRUE THEN RETURN false; END IF;
+        ELSE
+            IF NOT (allocation->'workspace_source_issued'='true'::jsonb
+                AND allocation->'creation_binding'->'request_id'=plan->'request_id'
+                AND allocation->'creation_binding'->'provision_generation'=plan->'provision_generation'
+                AND allocation->'creation_binding'->'request_digest'=plan->'request_digest') IS TRUE THEN RETURN false; END IF;
+            IF receipt->>'kind'='prepared_source_disposed' THEN
+                IF NOT (receipt-ARRAY['version','kind','plan','source_resource_version']='{}'::jsonb
+                    AND jsonb_typeof(receipt->'source_resource_version')='string'
+                    AND length(receipt->>'source_resource_version')>0) IS TRUE THEN RETURN false; END IF;
+            ELSIF receipt->>'kind'='prepared_source_identity_gone' THEN
+                IF NOT (receipt-ARRAY['version','kind','plan','source_observation']='{}'::jsonb
+                    AND public.valid_vm_creation_source_readback(source,plan->'tombstone',
+                        receipt->'source_observation','source_identity_gone')) IS TRUE THEN RETURN false; END IF;
+            ELSE RETURN false;
+            END IF;
+        END IF;
+    ELSIF allocation<>'null'::jsonb THEN RETURN false;
+    END IF;
+    RETURN true;
+END;
+$$;
+
+
+--
+-- Name: valid_vm_creation_source_readback(jsonb, jsonb, jsonb, text); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.valid_vm_creation_source_readback(source jsonb, tombstone jsonb, observation jsonb, outcome text) RETURNS boolean
+    LANGUAGE plpgsql IMMUTABLE
+    AS $_$
+DECLARE field text; fact jsonb; source_gone boolean;
+BEGIN
+    IF NOT (jsonb_typeof(observation)='object'
+        AND observation ?& ARRAY['dv','pvc','pin']
+        AND observation-ARRAY['dv','pvc','pin']='{}'::jsonb) IS TRUE THEN RETURN false; END IF;
+    FOREACH field IN ARRAY ARRAY['dv','pvc'] LOOP
+        fact := observation->field;
+        IF fact<>'null'::jsonb AND NOT (
+            jsonb_typeof(fact)='object' AND fact ?& ARRAY['uid','resource_version']
+            AND fact-ARRAY['uid','resource_version']='{}'::jsonb
+            AND jsonb_typeof(fact->'uid')='string'
+            AND fact->>'uid' ~ '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+            AND jsonb_typeof(fact->'resource_version')='string'
+            AND length(fact->>'resource_version') BETWEEN 1 AND 256
+        ) IS TRUE THEN RETURN false; END IF;
+    END LOOP;
+    source_gone := observation->'dv'='null'::jsonb OR observation->'dv'->'uid'<>source->'dv_uid';
+    RETURN (CASE WHEN source_gone THEN
+        outcome='source_identity_gone' AND observation->'pin'='null'::jsonb
+        ELSE outcome='pin_disposed' AND observation->'pin'=tombstone
+    END) IS TRUE;
+END;
+$_$;
+
+
+--
+-- Name: valid_vm_creation_thread_disposition_identity(public.vm_creation_retries, boolean); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.valid_vm_creation_thread_disposition_identity(retry public.vm_creation_retries, require_captured boolean) RETURNS boolean
+    LANGUAGE sql STABLE
+    AS $$
+    SELECT (retry.owner_kind='thread' AND retry.job_id IS NULL
+       AND retry.thread_id IS NOT NULL
+       AND retry.canonical_request->>'entity_type'='thread'
+       AND retry.canonical_request->>'job_id'=retry.thread_id::text
+       AND retry.canonical_request->>'provision_generation'=retry.provision_generation::text
+       AND COALESCE(retry.canonical_request->'workspace_storage','null'::jsonb)='null'::jsonb
+       AND retry.cancellation_disposition->>'owner_kind'='thread'
+       AND retry.cancellation_disposition->>'thread_id'=retry.thread_id::text
+       AND retry.cancellation_disposition->>'job_id'=retry.thread_id::text
+       AND retry.cancellation_disposition->>'thread_runtime_generation'=retry.thread_runtime_generation::text
+       AND retry.cancellation_disposition->>'thread_agent_id' IS NOT DISTINCT FROM retry.thread_agent_id::text
+       AND retry.cancellation_disposition->>'thread_attach_token' IS NOT DISTINCT FROM retry.thread_attach_token::text
+       AND retry.cancellation_disposition->>'thread_wake_operation_id' IS NOT DISTINCT FROM retry.thread_wake_operation_id::text
+       AND ((retry.disposition_carrier_uid IS NULL
+             AND retry.creation_carrier_uid IS NOT NULL
+             AND retry.cancellation_disposition->>'carrier_uid'=retry.creation_carrier_uid::text
+             AND retry.cancellation_disposition->>'namespace'=retry.creation_carrier_namespace)
+            OR (retry.disposition_carrier_uid IS NOT NULL
+             AND retry.creation_carrier_uid IS NULL
+             AND retry.cancellation_disposition->>'carrier_kind'='thread_creation_cancel'
+             AND retry.cancellation_disposition->>'carrier_uid'=retry.disposition_carrier_uid::text
+             AND retry.cancellation_disposition->>'namespace'=retry.disposition_carrier_namespace))
+       AND ((retry.cancellation_disposition->>'disk_policy'='purge_new_thread_disk'
+             AND retry.expected_pvc_uid IS NULL)
+            OR (retry.cancellation_disposition->>'disk_policy'='retain'
+             AND retry.creation_carrier_uid IS NOT NULL
+             AND retry.disposition_carrier_uid IS NULL
+             AND retry.expected_pvc_uid IS NOT NULL
+             AND retry.observed_pvc_uid=retry.expected_pvc_uid
+             AND (retry.thread_wake_operation_id IS NOT NULL OR public.valid_vm_thread_retained_resume_source(retry))
+             AND retry.cancellation_disposition->'objects'->'rootdisk'->>'pvc_uid'=retry.expected_pvc_uid::text
+             AND retry.cancellation_disposition->'source'=jsonb_build_object(
+                 'kind','retained','pvc_uid',retry.expected_pvc_uid::text)
+             AND EXISTS (SELECT 1 FROM public.vm_creation_effects root
+                 WHERE root.request_id=retry.request_id
+                   AND root.effect_kind='rootdisk' AND root.state='observed'
+                   AND root.evidence->>'pvc_uid'=retry.expected_pvc_uid::text
+                   AND root.evidence->>'uid'=retry.cancellation_disposition->'objects'->'rootdisk'->>'uid'
+                   AND root.carrier_intent->>'thread_wake_operation_id' IS NOT DISTINCT FROM retry.thread_wake_operation_id::text
+                   AND root.carrier_intent->'rootdisk_source'=retry.cancellation_disposition->'source')
+             AND NOT EXISTS (SELECT 1 FROM public.vm_creation_effects e
+                 WHERE e.request_id=retry.request_id AND e.effect_kind='workspace_attach'
+                   AND e.state<>'rejected')
+             AND (public.valid_vm_thread_retained_resume_source(retry) OR EXISTS (SELECT 1 FROM public.vm_idle_operations idle
+                 WHERE idle.id=retry.thread_wake_operation_id
+                   AND idle.owner_kind='thread' AND idle.owner_id=retry.thread_id
+                   AND idle.release_kind='pinned_thread'
+                   AND idle.wake_request_id=retry.request_id
+                   AND idle.wake_generation=retry.provision_generation
+                   AND idle.pvc_uid=retry.expected_pvc_uid
+                   AND idle.stop_verified_at IS NOT NULL
+                   AND idle.stop_evidence->>'retained_pvc'='true'
+                   AND idle.stop_evidence->>'pvc_uid'=retry.expected_pvc_uid::text
+                   AND idle.phase IN ('waking','wake_held')
+                   AND idle.closed_at IS NULL))))
+       AND retry.cancellation_disposition->'workspace_storage'='null'::jsonb
+       AND retry.cancellation_disposition->'workspace_instance_id'='null'::jsonb
+       AND public.valid_thread_vm_creation_retirement_source(retry,require_captured)
+       AND EXISTS (SELECT 1 FROM public.threads t WHERE t.id=retry.thread_id
+           AND retry.cancellation_disposition->>'retirement_token'=t.runtime_retirement_token::text)) IS TRUE;
+$$;
+
+
+--
+-- Name: valid_vm_creation_unused_grant_attention(public.vm_creation_retries); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.valid_vm_creation_unused_grant_attention(retry public.vm_creation_retries) RETURNS boolean
+    LANGUAGE sql STABLE
+    AS $$
+    SELECT EXISTS(
+        SELECT 1 FROM public.vm_creation_effects e
+        WHERE e.request_id=retry.request_id
+          AND e.effect_number=(
+              SELECT max(effect_number) FROM public.vm_creation_effects
+              WHERE request_id=retry.request_id)
+          AND e.state='rejected'
+          AND e.issuer_receipt_sha256 IS NOT NULL
+          AND e.evidence=jsonb_build_object(
+              'outcome','not_attempted','reason',e.evidence->>'reason')
+          AND e.evidence->>'reason' IN (
+              'resource_node_changed','creation_carrier_changed',
+              'creation_observed_object_missing',
+              'creation_observed_object_changed','retained_disk_changed',
+              'workspace_recovery_held','workspace_attachment_unproven',
+              'creation_existing_vm_unproven',
+              'creation_rootdisk_source_unproven')
+    );
+$$;
+
+
+--
+-- Name: valid_vm_initial_ready_positive_stop(jsonb, jsonb, text); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.valid_vm_initial_ready_positive_stop(f jsonb, p jsonb, digest text) RETURNS boolean
+    LANGUAGE plpgsql IMMUTABLE
+    AS $_$
+DECLARE item jsonb;
+        expected jsonb;
+BEGIN
+    IF jsonb_typeof(p) IS DISTINCT FROM 'object'
+       OR (SELECT array_agg(k ORDER BY k COLLATE "C") FROM jsonb_object_keys(p) k) IS DISTINCT FROM
+          ARRAY['containers','controller_authenticated','frozen_digest','kind','launcher_uid','node_ready','node_uid','pod_finalizer','pod_intent_digest','pod_terminal','same_generation_replacement','vm_generation','vm_run_strategy','vm_uid','vmi_disposition','vmi_uid']
+       OR p->>'kind' IS DISTINCT FROM 'vm_initial_ready_positive_stop_v1'
+       OR p->>'frozen_digest' IS DISTINCT FROM digest OR p->>'pod_intent_digest' IS DISTINCT FROM digest
+       OR p->>'pod_finalizer' IS DISTINCT FROM 'srw.io/vm-pre-ssh-positive-stop'
+       OR p->>'vm_run_strategy' IS DISTINCT FROM 'Halted'
+       OR p->'vm_generation' IS DISTINCT FROM to_jsonb((f->>'vm_generation')::bigint+1)
+       OR p->'node_ready' IS DISTINCT FROM 'true'::jsonb OR p->'same_generation_replacement' IS DISTINCT FROM 'false'::jsonb
+       OR p->'controller_authenticated' IS DISTINCT FROM 'true'::jsonb
+       OR p->>'vmi_disposition' IS NULL OR p->>'vmi_disposition' NOT IN ('absent','terminal')
+       OR p->'vm_uid' IS DISTINCT FROM f->'vm_uid' OR p->'vmi_uid' IS DISTINCT FROM f->'vmi_uid'
+       OR p->'launcher_uid' IS DISTINCT FROM f->'launcher_uid' OR p->'node_uid' IS DISTINCT FROM f->'node_uid'
+       OR p->'pod_terminal' NOT IN ('{"phase":"Failed","restart_policy":"Never"}'::jsonb,'{"phase":"Succeeded","restart_policy":"Never"}'::jsonb)
+       OR p->'pod_terminal' IS NULL OR jsonb_typeof(p->'containers') IS DISTINCT FROM 'array'
+       OR jsonb_array_length(p->'containers')<>jsonb_array_length(f->'containers')
+       OR (SELECT count(*)<>count(DISTINCT c->>'name') FROM jsonb_array_elements(p->'containers') c) THEN
+        RETURN false;
+    END IF;
+    FOR item IN SELECT value FROM jsonb_array_elements(p->'containers') LOOP
+        SELECT c INTO expected FROM jsonb_array_elements(f->'containers') c WHERE c->'kind'=item->'kind' AND c->'name'=item->'name';
+        IF expected IS NULL OR (SELECT array_agg(k ORDER BY k COLLATE "C") FROM jsonb_object_keys(item) k) IS DISTINCT FROM
+           ARRAY['container_id','finished_at','kind','last_state','name','reason','restart_count','state','terminated_container_id']
+           OR item->'container_id' IS DISTINCT FROM expected->'container_id'
+           OR item->'terminated_container_id' IS DISTINCT FROM expected->'container_id'
+           OR item->'restart_count' IS DISTINCT FROM '0'::jsonb OR item->>'state' IS DISTINCT FROM 'terminated'
+           OR item->'last_state' IS DISTINCT FROM 'null'::jsonb
+           OR jsonb_typeof(item->'reason') IS DISTINCT FROM 'string' OR item->>'reason' !~ '^[^[:space:]]+$'
+           OR item->>'reason'='ContainerStatusUnknown'
+           OR jsonb_typeof(item->'finished_at') IS DISTINCT FROM 'string'
+           OR item->>'finished_at' !~ '(Z|[+-][0-9]{2}:[0-9]{2})$' THEN RETURN false; END IF;
+        PERFORM (item->>'finished_at')::timestamptz;
+    END LOOP;
+    RETURN true;
+EXCEPTION WHEN invalid_datetime_format OR datetime_field_overflow OR invalid_text_representation THEN RETURN false;
+END;
+$_$;
+
+
+--
+-- Name: vm_resource_reservations; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.vm_resource_reservations (
+    id uuid NOT NULL,
+    request_id uuid NOT NULL,
+    revision bigint NOT NULL,
+    cluster_id text NOT NULL,
+    policy_digest text NOT NULL,
+    node_uid uuid NOT NULL,
+    node_name text NOT NULL,
+    cpu_millicores bigint NOT NULL,
+    memory_bytes bigint NOT NULL,
+    kvm_devices bigint NOT NULL,
+    snapshot_id uuid NOT NULL,
+    snapshot_digest text NOT NULL,
+    state text DEFAULT 'reserved'::text NOT NULL,
+    vm_uid uuid,
+    vmi_uid uuid,
+    launcher_uid uuid,
+    created_at timestamp with time zone DEFAULT clock_timestamp() NOT NULL,
+    released_at timestamp with time zone,
+    release_evidence jsonb,
+    resource_version smallint DEFAULT 1 NOT NULL,
+    ephemeral_storage_bytes bigint,
+    tun_devices bigint,
+    vhost_net_devices bigint,
+    observed_cpu_millicores bigint,
+    observed_memory_bytes bigint,
+    observed_ephemeral_storage_bytes bigint,
+    observed_kvm_devices bigint,
+    observed_tun_devices bigint,
+    observed_vhost_net_devices bigint,
+    CONSTRAINT vm_resource_reservation_observed_complete CHECK ((((observed_cpu_millicores IS NULL) AND (observed_memory_bytes IS NULL) AND (observed_ephemeral_storage_bytes IS NULL) AND (observed_kvm_devices IS NULL) AND (observed_tun_devices IS NULL) AND (observed_vhost_net_devices IS NULL)) OR ((resource_version = 2) AND (observed_cpu_millicores IS NOT NULL) AND (observed_memory_bytes IS NOT NULL) AND (observed_ephemeral_storage_bytes IS NOT NULL) AND (observed_kvm_devices IS NOT NULL) AND (observed_tun_devices IS NOT NULL) AND (observed_vhost_net_devices IS NOT NULL) AND (observed_cpu_millicores >= 0) AND (observed_memory_bytes >= 0) AND (observed_ephemeral_storage_bytes >= 0) AND (observed_kvm_devices >= 0) AND (observed_tun_devices >= 0) AND (observed_vhost_net_devices >= 0)))),
+    CONSTRAINT vm_resource_reservation_vector_version CHECK ((((resource_version = 1) AND (ephemeral_storage_bytes IS NULL) AND (tun_devices IS NULL) AND (vhost_net_devices IS NULL)) OR ((resource_version = 2) AND (ephemeral_storage_bytes IS NOT NULL) AND (tun_devices IS NOT NULL) AND (vhost_net_devices IS NOT NULL) AND (ephemeral_storage_bytes > 0) AND (tun_devices > 0) AND (vhost_net_devices > 0)))),
+    CONSTRAINT vm_resource_reservations_check CHECK (((state = 'released'::text) = ((released_at IS NOT NULL) AND (release_evidence IS NOT NULL)))),
+    CONSTRAINT vm_resource_reservations_check1 CHECK (((state = 'released'::text) OR ((released_at IS NULL) AND (release_evidence IS NULL)))),
+    CONSTRAINT vm_resource_reservations_check2 CHECK (((state <> ALL (ARRAY['active'::text, 'warm'::text])) OR ((vm_uid IS NOT NULL) AND (vmi_uid IS NOT NULL) AND (launcher_uid IS NOT NULL)))),
+    CONSTRAINT vm_resource_reservations_cpu_millicores_check CHECK ((cpu_millicores > 0)),
+    CONSTRAINT vm_resource_reservations_kvm_devices_check CHECK ((kvm_devices > 0)),
+    CONSTRAINT vm_resource_reservations_memory_bytes_check CHECK ((memory_bytes > 0)),
+    CONSTRAINT vm_resource_reservations_policy_digest_check CHECK ((policy_digest ~ '^sha256:[0-9a-f]{64}$'::text)),
+    CONSTRAINT vm_resource_reservations_release_evidence_check CHECK ((jsonb_typeof(release_evidence) = 'object'::text)),
+    CONSTRAINT vm_resource_reservations_revision_check CHECK ((revision > 0)),
+    CONSTRAINT vm_resource_reservations_snapshot_digest_check CHECK ((snapshot_digest ~ '^sha256:[0-9a-f]{64}$'::text)),
+    CONSTRAINT vm_resource_reservations_state_check CHECK ((state = ANY (ARRAY['reserved'::text, 'active'::text, 'warm'::text, 'teardown'::text, 'released'::text])))
+);
+
+
+--
+-- Name: valid_vm_thread_cleanup_release(public.vm_resource_reservations, public.vm_resource_reservations); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.valid_vm_thread_cleanup_release(old_row public.vm_resource_reservations, new_row public.vm_resource_reservations) RETURNS boolean
+    LANGUAGE plpgsql
+    AS $$
+DECLARE a public.vm_resource_thread_cleanup_authorities%ROWTYPE;
+        s public.vm_resource_thread_cleanup_stops%ROWTYPE;
+BEGIN
+    IF new_row.resource_version<>2 OR new_row.state<>'released' OR old_row.state='released'
+       OR new_row.release_evidence->>'kind' IS DISTINCT FROM 'exact_cleanup_compute_absent'
+       OR NOT EXISTS (SELECT 1 FROM public.vm_resource_waiters w
+           WHERE w.request_id=new_row.request_id AND w.owner_kind='thread') THEN
+        RETURN false;
+    END IF;
+    SELECT * INTO a FROM public.vm_resource_thread_cleanup_authorities
+        WHERE cleanup_admission_id::text=new_row.release_evidence->>'cleanup_admission_id';
+    SELECT * INTO s FROM public.vm_resource_thread_cleanup_stops WHERE cleanup_admission_id=a.cleanup_admission_id;
+    IF a.cleanup_admission_id IS NULL OR s.cleanup_admission_id IS NULL OR old_row.state<>'teardown'
+       OR a.reservation_id IS DISTINCT FROM new_row.id OR a.reservation_revision IS DISTINCT FROM new_row.revision
+       OR a.request_id IS DISTINCT FROM new_row.request_id
+       OR new_row.release_evidence IS DISTINCT FROM jsonb_build_object(
+           'kind','exact_cleanup_compute_absent','owner_kind','thread','thread_id',a.thread_id,
+           'cleanup_admission_id',a.cleanup_admission_id,'reservation_revision',a.reservation_revision,
+           'stop_evidence_digest','sha256:'||encode(sha256(convert_to(s.stop_evidence::text,'UTF8')),'hex')) THEN
+        RAISE EXCEPTION 'VM thread cleanup release unproven' USING ERRCODE='23514';
+    END IF;
+    PERFORM public.validate_vm_thread_cleanup_stop(a,s);
+    RETURN true;
+END;
+$$;
+
+
+--
+-- Name: vm_resource_thread_cleanup_authorities; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.vm_resource_thread_cleanup_authorities (
+    cleanup_admission_id uuid NOT NULL,
+    reservation_id uuid,
+    reservation_revision bigint,
+    request_id uuid NOT NULL,
+    thread_id uuid NOT NULL,
+    runtime_generation uuid NOT NULL,
+    retirement_token uuid NOT NULL,
+    agent_id uuid,
+    attach_token uuid,
+    provision_generation uuid NOT NULL,
+    vm_uid uuid NOT NULL,
+    pvc_uid uuid NOT NULL,
+    vmi_uid uuid,
+    launcher_uid uuid,
+    purge_disk boolean NOT NULL,
+    intent_digest text NOT NULL,
+    cleanup_request_id uuid NOT NULL,
+    retirement_context jsonb,
+    created_at timestamp with time zone DEFAULT clock_timestamp() NOT NULL,
+    CONSTRAINT vm_resource_thread_cleanup_authorities_check CHECK (((vmi_uid IS NULL) = (launcher_uid IS NULL))),
+    CONSTRAINT vm_thread_cleanup_optional_reservation_pair CHECK (((reservation_id IS NULL) = (reservation_revision IS NULL)))
+);
+
+
+--
+-- Name: valid_vm_thread_nonquota_cleanup_source(public.vm_resource_thread_cleanup_authorities, public.vm_creation_retries); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.valid_vm_thread_nonquota_cleanup_source(a public.vm_resource_thread_cleanup_authorities, source public.vm_creation_retries) RETURNS boolean
+    LANGUAGE sql STABLE
+    AS $$
+    SELECT (public.valid_vm_thread_nonquota_creation(source)
+       AND a.reservation_id IS NULL AND a.reservation_revision IS NULL
+       AND source.thread_id=a.thread_id
+       AND ((source.thread_runtime_generation=a.runtime_generation
+             AND source.thread_agent_id IS NOT DISTINCT FROM a.agent_id
+             AND source.thread_attach_token IS NOT DISTINCT FROM a.attach_token)
+            OR public.vm_thread_creation_pre_setup_abort_path_evidence(
+                json_populate_record(NULL::public.threads,json_build_object(
+                    'id',a.thread_id,'runtime_generation',a.runtime_generation,
+                    'runtime_retirement_started_at',a.created_at)),source) IS NOT NULL)
+       AND source.provision_generation=a.provision_generation
+       AND source.observed_vm_uid=a.vm_uid AND source.observed_pvc_uid=a.pvc_uid
+       AND a.vmi_uid::text IS NOT DISTINCT FROM a.retirement_context->'vm'->>'vmi_uid'
+       AND a.launcher_uid::text IS NOT DISTINCT FROM a.retirement_context->'vm'->>'active_pod_uid'
+       AND (source.state='succeeded' AND source.reason='creation_adopted'
+            OR public.valid_vm_thread_retained_cleanup_source(a,source))
+       AND source.boot_counted
+       AND (source.origin='initial' AND source.expected_pvc_uid IS NULL
+            OR public.valid_vm_thread_retained_resume_source(source))
+       AND NOT EXISTS (SELECT 1 FROM public.vm_creation_effects e
+           WHERE e.request_id=source.request_id AND e.state='issued')
+       AND EXISTS (SELECT 1 FROM public.vm_workspace_cleanup_admissions c
+           WHERE c.id=source.creation_admission_id AND c.owner_kind='thread'
+             AND c.owner_id=a.thread_id AND c.source='controller_vm_create'
+             AND c.completed_at IS NOT NULL AND c.outcome='adopted')
+    ) IS TRUE;
+$$;
+
+
+--
+-- Name: valid_vm_thread_nonquota_creation(public.vm_creation_retries); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.valid_vm_thread_nonquota_creation(source public.vm_creation_retries) RETURNS boolean
+    LANGUAGE sql STABLE
+    AS $$
+    SELECT (source.owner_kind='thread'
+       AND source.controller_configuration->'version'='1'::jsonb
+       AND source.controller_configuration->'persistent_rootdisk'='true'::jsonb
+       AND COALESCE(source.controller_configuration->'resource_admission','null'::jsonb)='null'::jsonb
+       AND COALESCE(source.controller_configuration->'network_profile_policy','null'::jsonb)='null'::jsonb
+       AND COALESCE(source.canonical_request->'network_profile','null'::jsonb)='null'::jsonb
+       AND source.canonical_request->>'entity_type'='thread'
+       AND source.canonical_request->>'job_id'=source.thread_id::text
+       AND source.canonical_request->>'provision_generation'=source.provision_generation::text
+       AND NOT EXISTS (SELECT 1 FROM public.vm_resource_reservations r WHERE r.request_id=source.request_id)
+       AND NOT EXISTS (SELECT 1 FROM public.vm_resource_waiters w WHERE w.request_id=source.request_id)
+    ) IS TRUE;
+$$;
+
+
+--
+-- Name: valid_vm_thread_retained_cleanup_source(public.vm_resource_thread_cleanup_authorities, public.vm_creation_retries); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.valid_vm_thread_retained_cleanup_source(a public.vm_resource_thread_cleanup_authorities, source public.vm_creation_retries) RETURNS boolean
+    LANGUAGE sql STABLE
+    AS $$
+    SELECT public.valid_vm_thread_retained_handoff(source)
+       AND a.thread_id=source.thread_id AND a.request_id=source.request_id
+       AND a.provision_generation=source.provision_generation
+       AND a.vm_uid=source.observed_vm_uid AND a.pvc_uid=source.observed_pvc_uid
+       AND a.vmi_uid IS NULL AND a.launcher_uid IS NULL
+       AND a.retirement_context->>'thread_id'=a.thread_id::text
+       AND a.retirement_context->>'generation'=a.runtime_generation::text
+       AND a.retirement_context->>'settle_status'='ended'
+       AND a.retirement_context->>'agent_id' IS NOT DISTINCT FROM a.agent_id::text
+       AND a.retirement_context->>'runtime_attach_token' IS NOT DISTINCT FROM a.attach_token::text
+       AND a.retirement_context->'vm'='null'::jsonb
+       AND public.valid_vm_thread_retained_source_capture(source,a.retirement_context,a.runtime_generation);
+$$;
+
+
+--
+-- Name: vm_thread_retained_resumes; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.vm_thread_retained_resumes (
+    id uuid NOT NULL,
+    thread_id uuid NOT NULL,
+    runtime_generation uuid NOT NULL,
+    predecessor_runtime_generation uuid NOT NULL,
+    predecessor_retirement_token uuid NOT NULL,
+    compute_cleanup_admission_id uuid NOT NULL,
+    predecessor_terminal_id uuid,
+    source_revision bigint NOT NULL,
+    retained_vm jsonb NOT NULL,
+    request_id uuid NOT NULL,
+    provision_generation uuid NOT NULL,
+    created_at timestamp with time zone DEFAULT clock_timestamp() NOT NULL
+);
+
+
+--
+-- Name: valid_vm_thread_retained_early_end(public.threads, public.vm_thread_retained_resumes); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.valid_vm_thread_retained_early_end(owner_row public.threads, op public.vm_thread_retained_resumes) RETURNS boolean
+    LANGUAGE sql STABLE
+    AS $$
+    SELECT (op.id IS NOT NULL AND owner_row.id=op.thread_id
+        AND owner_row.execution_lane='pinned' AND public.valid_vm_thread_retained_runtime(op,owner_row)
+        AND owner_row.runtime_retirement_token IS NOT NULL
+        AND owner_row.runtime_retirement_authorized_at IS NOT NULL
+        AND owner_row.runtime_retirement_permanent
+        AND owner_row.runtime_retirement_context->>'generation'=owner_row.runtime_generation::text
+        AND owner_row.runtime_retirement_context->>'thread_id'=op.thread_id::text
+        AND owner_row.runtime_retirement_context->>'settle_status'='ended'
+        AND owner_row.runtime_retirement_context->>'agent_id' IS NOT DISTINCT FROM owner_row.agent_id::text
+        AND owner_row.runtime_retirement_context->>'runtime_attach_token' IS NOT DISTINCT FROM owner_row.runtime_attach_token::text
+        AND ((NOT EXISTS (SELECT 1 FROM public.vm_creation_retries r WHERE r.request_id=op.request_id)
+              AND NOT EXISTS (SELECT 1 FROM public.vm_resource_waiters w WHERE w.request_id=op.request_id)
+              AND NOT EXISTS (SELECT 1 FROM public.vm_resource_reservations r WHERE r.request_id=op.request_id)
+              AND NOT EXISTS (SELECT 1 FROM public.vm_creation_effects e WHERE e.request_id=op.request_id)
+              AND owner_row.runtime_retirement_context->'vm'=op.retained_vm)
+             OR EXISTS (SELECT 1 FROM public.vm_creation_retries r
+                 WHERE r.request_id=op.request_id AND public.valid_vm_thread_retained_resume_source(r)
+                   AND r.observed_vm_uid IS NULL AND NOT r.boot_counted
+                   AND public.valid_thread_vm_creation_retirement_source(r,false)
+                   AND public.vm_thread_retained_source_terminal_evidence(r) IS NOT NULL))) IS TRUE;
+$$;
+
+
+--
+-- Name: valid_vm_thread_retained_handoff(public.vm_creation_retries); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.valid_vm_thread_retained_handoff(source public.vm_creation_retries) RETURNS boolean
+    LANGUAGE sql STABLE
+    AS $$
+    SELECT public.valid_vm_thread_retained_resume_source(source)
+       AND source.state='settled' AND source.reason='retained_creation_handoff'
+       AND source.boot_counted AND source.ready_at IS NULL AND source.resolved_at IS NOT NULL
+       AND source.observed_vm_uid IS NOT NULL AND source.observed_pvc_uid=source.expected_pvc_uid
+       AND source.cancellation_disposition IS NULL
+       AND EXISTS (SELECT 1 FROM public.vm_workspace_cleanup_admissions c
+           WHERE c.id=source.creation_admission_id AND c.owner_kind='thread' AND c.owner_id=source.thread_id
+             AND c.source='controller_vm_create' AND c.pvc_uid=source.expected_pvc_uid
+             AND c.completed_at IS NOT NULL AND c.outcome='adopted')
+       AND (SELECT count(*)=3 AND count(DISTINCT e.effect_kind)=3
+                   AND bool_and(e.state='observed' AND e.effect_kind IN ('rootdisk','cloud_init','vm')
+                       AND e.carrier_uid=source.creation_carrier_uid AND e.carrier_namespace=source.creation_carrier_namespace)
+            FROM public.vm_creation_effects e WHERE e.request_id=source.request_id AND e.state<>'rejected')
+       AND EXISTS (SELECT 1 FROM public.vm_creation_effects vm
+           JOIN public.vm_creation_effects root ON root.request_id=vm.request_id AND root.effect_kind='rootdisk' AND root.state='observed'
+           JOIN public.vm_creation_effects secret ON secret.request_id=vm.request_id AND secret.effect_kind='cloud_init' AND secret.state='observed'
+           WHERE vm.request_id=source.request_id AND vm.effect_kind='vm' AND vm.state='observed'
+             AND vm.evidence->>'uid'=source.observed_vm_uid::text
+             AND vm.evidence->>'pvc_uid'=source.observed_pvc_uid::text
+             AND root.evidence->>'pvc_uid'=source.observed_pvc_uid::text
+             AND vm.evidence->>'cloud_init_uid'=secret.evidence->>'uid');
+$$;
+
+
+--
+-- Name: valid_vm_thread_retained_resume_source(public.vm_creation_retries); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.valid_vm_thread_retained_resume_source(source public.vm_creation_retries) RETURNS boolean
+    LANGUAGE sql
+    AS $$
+    SELECT source.owner_kind='thread' AND source.origin='resume'
+       AND source.thread_wake_operation_id IS NULL AND source.thread_agent_id IS NOT NULL AND source.thread_attach_token IS NOT NULL
+       AND EXISTS (SELECT 1 FROM public.vm_thread_retained_resumes op
+           JOIN public.vm_resource_thread_cleanup_authorities a ON a.cleanup_admission_id=op.compute_cleanup_admission_id
+           WHERE op.id=source.thread_retained_resume_id AND op.thread_id=source.thread_id
+             AND op.runtime_generation=source.thread_runtime_generation
+             AND op.request_id=source.request_id AND op.provision_generation=source.provision_generation
+             AND a.pvc_uid=source.expected_pvc_uid);
+$$;
+
+
+--
+-- Name: valid_vm_thread_retained_runtime(public.vm_thread_retained_resumes, public.threads); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.valid_vm_thread_retained_runtime(op public.vm_thread_retained_resumes, owner_row public.threads) RETURNS boolean
+    LANGUAGE sql STABLE
+    AS $$
+    SELECT op.id IS NOT NULL AND op.thread_id=owner_row.id AND owner_row.execution_lane='pinned'
+       AND (op.runtime_generation=owner_row.runtime_generation OR owner_row.status='created')
+       AND public.vm_thread_retained_abort_path(op,owner_row.runtime_generation) IS NOT NULL;
+$$;
+
+
+--
+-- Name: valid_vm_thread_retained_source_capture(public.vm_creation_retries, jsonb, uuid); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.valid_vm_thread_retained_source_capture(source public.vm_creation_retries, context jsonb, target_generation uuid) RETURNS boolean
+    LANGUAGE sql STABLE
+    AS $$
+    SELECT public.valid_vm_thread_retained_resume_source(source)
+       AND context->'vm_creation_source'->>'request_id'=source.request_id::text
+       AND context->'vm_creation_source'->>'provision_generation'=source.provision_generation::text
+       AND context->'vm_creation_source'->>'thread_runtime_generation'=source.thread_runtime_generation::text
+       AND context->'vm_creation_source'->>'thread_agent_id'=source.thread_agent_id::text
+       AND context->'vm_creation_source'->>'thread_attach_token'=source.thread_attach_token::text
+       AND context->'vm_creation_source'->>'request_digest'=source.request_digest
+       AND context->'vm_creation_source'->>'controller_configuration_digest'=source.controller_configuration_digest
+       AND context->'vm_creation_source'->>'retained_resume_id'=source.thread_retained_resume_id::text
+       AND context->'vm_creation_source'->'captured_vm'->>'creation_request_id'=source.request_id::text
+       AND context->'vm_creation_source'->'captured_vm'->>'provision_generation'=source.provision_generation::text
+       AND COALESCE(context->'vm_creation_source'->'captured_vm'->'vm_uid','null'::jsonb)='null'::jsonb
+       AND (COALESCE(context->'vm_creation_source'->'captured_vm'->'rootdisk_pvc_uid','null'::jsonb)='null'::jsonb
+            OR context->'vm_creation_source'->'captured_vm'->>'rootdisk_pvc_uid'=source.observed_pvc_uid::text)
+       AND EXISTS (SELECT 1 FROM public.vm_thread_retained_resumes op
+           WHERE op.id=source.thread_retained_resume_id
+             AND context->'vm_creation_source'->'abort_lineage'=public.vm_thread_retained_abort_path(op,target_generation)
+             AND context->'vm_creation_source'->>'cleanup_protocol'=CASE WHEN op.runtime_generation=target_generation THEN 'exact' ELSE 'retained_attach_abort_v1' END
+             AND (op.runtime_generation<>target_generation OR (
+                 context->>'agent_id'=source.thread_agent_id::text
+                 AND context->>'runtime_attach_token'=source.thread_attach_token::text)));
+$$;
+
+
+--
+-- Name: validate_container_startup_current_binding(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.validate_container_startup_current_binding() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+DECLARE
+    current_receipt public.managed_repository_workspace_creation_reservations%ROWTYPE;
+    owner_runtime jsonb;
+    owner_generation uuid;
+BEGIN
+    SELECT * INTO current_receipt
+      FROM public.managed_repository_workspace_creation_reservations
+     WHERE id = NEW.id;
+    IF current_receipt.startup_protocol_version IS DISTINCT FROM 1
+       OR current_receipt.phase <> 'runtime_bound'
+       OR current_receipt.cancel_requested_at IS NOT NULL
+       OR current_receipt.settled_at IS NOT NULL THEN
+        RETURN NULL;
+    END IF;
+    IF current_receipt.owner_kind = 'job' THEN
+        SELECT context->'workspace_container' INTO owner_runtime
+          FROM public.jobs WHERE id = current_receipt.owner_id;
+    ELSE
+        SELECT metadata->'workspace_container', runtime_generation
+          INTO owner_runtime, owner_generation
+          FROM public.threads WHERE id = current_receipt.owner_id;
+        IF owner_generation IS DISTINCT FROM
+           current_receipt.thread_runtime_generation THEN
+            RAISE EXCEPTION 'startup thread generation changed at commit'
+                USING ERRCODE = '23514',
+                      CONSTRAINT = 'managed_workspace_startup_current_binding';
+        END IF;
+    END IF;
+    IF owner_runtime IS NULL
+       OR owner_runtime->>'_runtime_incarnation' IS DISTINCT FROM
+          current_receipt.pod_uid::text
+       OR owner_runtime->>'_creation_reservation_id' IS DISTINCT FROM
+          current_receipt.id::text
+       OR owner_runtime->>'_creation_claim_token' IS DISTINCT FROM
+          current_receipt.claim_token::text THEN
+        RAISE EXCEPTION 'container startup owner binding changed at commit'
+            USING ERRCODE = '23514',
+                  CONSTRAINT = 'managed_workspace_startup_current_binding';
+    END IF;
+    RETURN NULL;
 END;
 $$;
 
@@ -13841,6 +22367,13 @@ BEGIN
                 USING ERRCODE = '23514',
                       CONSTRAINT = 'thread_agent_warm_binding_reciprocity';
         END IF;
+    ELSIF NEW.status = 'terminal_release' THEN
+        IF public.pinned_deleted_owner_warm_release_authorized(NEW)
+               IS NOT TRUE THEN
+            RAISE EXCEPTION 'terminal warm release lacks deleted-owner authority'
+                USING ERRCODE = '23514',
+                      CONSTRAINT = 'thread_agent_warm_binding_reciprocity';
+        END IF;
     ELSIF NEW.status IN ('released', 'aborted') THEN
         IF thread_row.id IS NOT NULL
            AND thread_row.agent_id IS NOT DISTINCT FROM NEW.agent_id THEN
@@ -13903,6 +22436,1327 @@ $$;
 
 
 --
+-- Name: validate_vm_job_cancel_retention(uuid, boolean); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.validate_vm_job_cancel_retention(parent_id uuid, fresh boolean DEFAULT false) RETURNS boolean
+    LANGUAGE plpgsql
+    AS $$
+DECLARE a public.vm_job_cancel_retention_authorities%ROWTYPE;
+        c public.vm_workspace_cleanup_admissions%ROWTYPE;
+        old public.vm_workspace_cleanup_admissions%ROWTYPE;
+        expected jsonb;
+        digest text;
+        old_digest text;
+        original_request uuid;
+        expected_request uuid;
+        candidate jsonb;
+BEGIN
+    SELECT * INTO a FROM public.vm_job_cancel_retention_authorities WHERE cleanup_admission_id=parent_id;
+    IF a.cleanup_admission_id IS NULL THEN RETURN false; END IF;
+    SELECT * INTO c FROM public.vm_workspace_cleanup_admissions WHERE id=parent_id FOR SHARE;
+    expected := jsonb_build_object('owner_id',a.job_id,'owner_kind','job',
+        'provision_generation',a.provision_generation,'purge_disk',false,'pvc_uid',a.pvc_uid,
+        'resource','vm_workspace','source','job_terminal_vm_release','vm_uid',a.vm_uid);
+    digest := 'sha256:'||encode(sha256(convert_to(format(
+        '{"owner_id":"%s","owner_kind":"job","provision_generation":"%s","purge_disk":false,"pvc_uid":"%s","resource":"vm_workspace","source":"job_terminal_vm_release","vm_uid":"%s"}',
+        a.job_id,a.provision_generation,a.pvc_uid,a.vm_uid),'UTF8')),'hex');
+    old_digest := 'sha256:'||encode(sha256(convert_to(format(
+        '{"owner_id":"%s","owner_kind":"job","provision_generation":"%s","purge_disk":true,"pvc_uid":"%s","resource":"vm_workspace","source":"job_terminal_vm_release","vm_uid":"%s"}',
+        a.job_id,a.provision_generation,a.pvc_uid,a.vm_uid),'UTF8')),'hex');
+    original_request := public.uuid_generate_v5(public.uuid_ns_url(),
+        'vm-workspace-cleanup:job_terminal_vm_release:job:'||a.job_id||':'||
+        a.provision_generation||':'||a.vm_uid||':'||a.pvc_uid);
+    expected_request := CASE WHEN a.superseded_admission_id IS NULL THEN original_request
+        ELSE public.uuid_generate_v5(public.uuid_ns_url(),
+            'vm-job-cancel-retain-v1:'||a.superseded_admission_id||':'||digest) END;
+    IF c.id IS NULL OR c.owner_kind IS DISTINCT FROM 'job' OR c.owner_id IS DISTINCT FROM a.job_id
+       OR c.pvc_uid IS DISTINCT FROM a.pvc_uid OR c.source IS DISTINCT FROM 'job_terminal_vm_release'
+       OR c.parent_admission_id IS NOT NULL OR c.request_id IS DISTINCT FROM expected_request
+       OR a.cleanup_request_id IS DISTINCT FROM expected_request
+       OR c.intent_digest IS DISTINCT FROM digest OR a.intent_digest IS DISTINCT FROM digest
+       OR a.retaining_intent IS DISTINCT FROM expected
+       OR (fresh AND c.completed_at IS NOT NULL)
+       OR (c.completed_at IS NOT NULL AND c.outcome IS DISTINCT FROM 'completed') THEN
+        RAISE EXCEPTION 'Cancel retention immutable identity changed' USING ERRCODE='23514';
+    END IF;
+    IF a.superseded_admission_id IS NOT NULL THEN
+        SELECT * INTO old FROM public.vm_workspace_cleanup_admissions WHERE id=a.superseded_admission_id FOR SHARE;
+        IF old.id IS NULL OR old.owner_kind IS DISTINCT FROM 'job' OR old.owner_id IS DISTINCT FROM a.job_id
+           OR old.pvc_uid IS DISTINCT FROM a.pvc_uid OR old.source IS DISTINCT FROM c.source
+           OR old.parent_admission_id IS NOT NULL OR old.request_id IS DISTINCT FROM original_request
+           OR a.superseded_request_id IS DISTINCT FROM original_request
+           OR old.intent_digest IS DISTINCT FROM old_digest OR a.superseded_intent_digest IS DISTINCT FROM old_digest
+           OR old.completed_at IS NULL OR old.outcome IS DISTINCT FROM 'superseded_by_retention'
+           OR EXISTS (SELECT 1 FROM public.vm_workspace_cleanup_admissions child WHERE child.parent_admission_id=old.id) THEN
+            RAISE EXCEPTION 'Cancel retention supersession lacks unissued exact parent' USING ERRCODE='23514';
+        END IF;
+    END IF;
+    IF c.completed_at IS NULL THEN
+        IF a.policy_version=4 THEN
+            candidate := public.vm_job_pinned_ready_retention_candidate(
+                a.job_id,a.provision_generation,a.vm_uid,a.pvc_uid,a.superseded_admission_id,a.cleanup_admission_id,NOT fresh);
+        ELSIF a.policy_version=3 THEN
+            candidate := public.vm_job_initial_ready_retention_candidate(
+                a.job_id,a.provision_generation,a.vm_uid,a.pvc_uid,a.superseded_admission_id,a.cleanup_admission_id,NOT fresh);
+        ELSIF a.policy_version=2 THEN
+            candidate := public.vm_job_retained_stop_candidate(
+                a.job_id,a.provision_generation,a.vm_uid,a.pvc_uid,a.superseded_admission_id,a.cleanup_admission_id,NOT fresh);
+        ELSE
+            candidate := public.vm_job_cancel_retention_candidate(
+                a.job_id,a.provision_generation,a.vm_uid,a.pvc_uid,a.superseded_admission_id,a.cleanup_admission_id,NOT fresh);
+        END IF;
+        IF candidate IS DISTINCT FROM jsonb_build_object('creation_request_id',a.creation_request_id,
+            'reservation_id',a.reservation_id,'reservation_revision',a.reservation_revision,
+            'vmi_uid',a.vmi_uid,'launcher_uid',a.launcher_uid,'node_uid',a.node_uid,
+            'namespace',a.namespace,'cluster_id',a.cluster_id) THEN
+            RAISE EXCEPTION 'Cancel retention current authority changed' USING ERRCODE='23514';
+        END IF;
+    END IF;
+    RETURN true;
+END;
+$$;
+
+
+--
+-- Name: validate_vm_job_creation_owner_terminal(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.validate_vm_job_creation_owner_terminal() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+DECLARE owner_row public.vm_job_creation_owners%ROWTYPE;
+BEGIN
+    SELECT * INTO owner_row FROM public.vm_job_creation_owners WHERE job_id=NEW.job_id;
+    IF owner_row.live_job_id IS NULL THEN
+        IF owner_row.deleted_at IS NULL OR owner_row.deletion_receipt IS NULL
+           OR EXISTS (SELECT 1 FROM public.jobs WHERE id=owner_row.job_id)
+           OR (SELECT count(*) FROM public.vm_job_creation_terminal_packets p
+               WHERE p.job_id=owner_row.job_id)<>
+              (SELECT count(*) FROM public.vm_creation_retries r
+               WHERE r.owner_kind='job' AND r.job_id=owner_row.job_id) THEN
+            RAISE EXCEPTION 'Job VM audit deletion must retain every terminal source'
+                USING ERRCODE='23514';
+        END IF;
+    ELSIF owner_row.deleted_at IS NOT NULL OR owner_row.deletion_receipt IS NOT NULL THEN
+        RAISE EXCEPTION 'Job VM audit tombstone and deletion must commit together'
+            USING ERRCODE='23514';
+    END IF;
+    RETURN NULL;
+END;
+$$;
+
+
+--
+-- Name: validate_vm_job_retained_disk_purge(uuid, boolean); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.validate_vm_job_retained_disk_purge(parent_id uuid, require_receipt boolean DEFAULT false) RETURNS boolean
+    LANGUAGE plpgsql
+    AS $_$
+DECLARE
+    d public.vm_job_retained_disk_purge_authorities%ROWTYPE;
+    parent public.vm_workspace_cleanup_admissions%ROWTYPE;
+    owner_row public.jobs%ROWTYPE;
+    retry public.vm_creation_retries%ROWTYPE;
+    old_retry public.vm_creation_retries%ROWTYPE;
+    old_parent public.vm_workspace_cleanup_admissions%ROWTYPE;
+    old_stop public.vm_resource_cleanup_stop_receipts%ROWTYPE;
+    charge public.vm_resource_reservations%ROWTYPE;
+    final_charge public.vm_resource_reservations%ROWTYPE;
+    link public.vm_job_retained_disk_purge_predecessors%ROWTYPE;
+    receipt public.vm_job_retained_disk_purge_receipts%ROWTYPE;
+    instance public.srw_workspace_instances%ROWTYPE;
+    binding jsonb;
+    expected_digest text;
+    expected_request uuid;
+    link_count bigint := 0;
+    retry_count bigint := 0;
+    previous_generation bigint := 0;
+    previous_execution_id uuid;
+    previous_execution_revision text;
+    previous_execution_generation bigint;
+    scope_namespace text;
+    scope_cluster_id text;
+    terminal_tail jsonb;
+BEGIN
+    -- The public path already holds owner/PVC advisory locks. These row locks
+    -- also make a direct/generic completion trigger re-read the actual current
+    -- owner, parent and Released workspace rather than trusting a prior API
+    -- response or a stale candidate projection.
+    SELECT * INTO d FROM public.vm_job_retained_disk_purge_authorities
+     WHERE cleanup_admission_id=parent_id FOR SHARE;
+    SELECT * INTO owner_row FROM public.jobs WHERE id=d.job_id FOR UPDATE;
+    PERFORM 1 FROM public.vm_job_creation_owners
+     WHERE job_id=d.job_id FOR SHARE;
+    SELECT * INTO parent FROM public.vm_workspace_cleanup_admissions
+     WHERE id=parent_id FOR SHARE;
+    SELECT * INTO retry FROM public.vm_creation_retries
+     WHERE request_id=d.final_request_id FOR SHARE;
+    SELECT * INTO final_charge FROM public.vm_resource_reservations
+     WHERE request_id=d.final_request_id FOR SHARE;
+    terminal_tail := public.vm_job_retained_purge_tail(parent_id);
+    scope_namespace := retry.controller_configuration->>'namespace';
+    scope_cluster_id := final_charge.cluster_id;
+    expected_request := public.uuid_generate_v5(public.uuid_ns_url(),
+        'vm-workspace-cleanup:public_vm_delete:job:'||d.job_id::text||':'||
+        d.provision_generation::text||':'||d.vm_uid::text||':'||d.pvc_uid::text);
+    expected_digest := 'sha256:'||encode(sha256(convert_to(format(
+        '{"owner_id":"%s","owner_kind":"job","provision_generation":"%s",' ||
+        '"purge_disk":true,"pvc_uid":"%s","resource":"vm_workspace",' ||
+        '"source":"public_vm_delete","vm_uid":"%s"}',
+        d.job_id,d.provision_generation,d.pvc_uid,d.vm_uid),'UTF8')),'hex');
+    IF d.cleanup_admission_id IS NULL OR parent.id IS NULL
+       OR parent.owner_kind IS DISTINCT FROM 'job'
+       OR parent.owner_id IS DISTINCT FROM d.job_id
+       OR parent.source IS DISTINCT FROM 'public_vm_delete'
+       OR parent.parent_admission_id IS NOT NULL
+       OR parent.pvc_uid IS DISTINCT FROM d.pvc_uid
+       OR parent.request_id IS DISTINCT FROM expected_request
+       OR d.cleanup_request_id IS DISTINCT FROM expected_request
+       OR parent.intent_digest IS DISTINCT FROM expected_digest
+       OR d.intent_digest IS DISTINCT FROM expected_digest
+       OR (parent.completed_at IS NOT NULL AND parent.outcome IS DISTINCT FROM 'completed')
+       OR owner_row.id IS NULL OR owner_row.parent_job_id IS NOT NULL
+       OR owner_row.status NOT IN ('completed','failed','cancelled')
+       OR NOT EXISTS (SELECT 1 FROM public.vm_job_creation_owners o
+           WHERE o.job_id=d.job_id AND o.live_job_id=d.job_id AND o.deleted_at IS NULL)
+       OR retry.request_id IS NULL OR retry.owner_kind IS DISTINCT FROM 'job'
+       OR retry.job_id IS DISTINCT FROM d.job_id
+       OR retry.provision_generation IS DISTINCT FROM d.provision_generation
+       OR (retry.state IS DISTINCT FROM 'succeeded' AND NOT (retry.state='settled'
+           AND EXISTS (SELECT 1 FROM public.vm_job_cancel_retention_authorities a
+               WHERE a.creation_request_id=retry.request_id AND a.job_id=d.job_id
+                 AND a.provision_generation=d.provision_generation
+                 AND a.vm_uid=d.vm_uid AND a.pvc_uid=d.pvc_uid
+                 AND public.vm_cancel_late_adopted_retained_terminal(a.cleanup_admission_id))))
+       OR retry.resolved_at IS NULL
+       OR retry.observed_vm_uid IS DISTINCT FROM d.vm_uid
+       OR retry.observed_pvc_uid IS DISTINCT FROM d.pvc_uid
+       OR retry.creation_admission_id IS NULL
+       OR final_charge.id IS NULL OR final_charge.state IS DISTINCT FROM 'released'
+       OR scope_namespace IS NULL OR length(scope_namespace) NOT BETWEEN 1 AND 63
+       OR scope_namespace !~ '^[a-z0-9]([-a-z0-9]*[a-z0-9])?$'
+       OR scope_cluster_id IS NULL OR length(scope_cluster_id)=0
+       OR retry.controller_configuration->'resource_admission'->>'cluster_id'
+           IS DISTINCT FROM scope_cluster_id
+       OR (d.retained_terminal_id IS NULL AND EXISTS(SELECT 1 FROM public.vm_job_retained_resumes typed WHERE typed.job_id=d.job_id))
+       OR (d.retained_terminal_id IS NOT NULL AND terminal_tail IS NULL)
+       OR (d.retained_terminal_id IS NULL AND (false
+       OR owner_row.context->'vm'->>'provision_generation' IS DISTINCT FROM d.provision_generation::text
+       OR owner_row.context->'vm'->>'vm_uid' IS DISTINCT FROM d.vm_uid::text
+       OR owner_row.context->'vm'->>'rootdisk_pvc_uid' IS DISTINCT FROM d.pvc_uid::text
+       OR EXISTS (SELECT 1 FROM public.vm_creation_retries later
+           WHERE later.owner_kind='job' AND later.job_id=d.job_id
+             AND (later.created_at,later.request_id)>(retry.created_at,retry.request_id))
+       ))
+       OR EXISTS (SELECT 1 FROM public.vm_resource_reservations held
+           JOIN public.vm_creation_retries source USING (request_id)
+           WHERE source.owner_kind='job' AND source.job_id=d.job_id
+             AND held.state<>'released')
+       OR EXISTS (SELECT 1 FROM public.vm_creation_effects effect
+           JOIN public.vm_creation_retries source USING (request_id)
+           WHERE source.owner_kind='job' AND source.job_id=d.job_id
+             AND effect.state='issued')
+       OR EXISTS (SELECT 1 FROM public.vm_resource_waiters waiter
+           WHERE waiter.owner_kind='job' AND waiter.job_id=d.job_id
+             AND waiter.state NOT IN ('released','cancelled'))
+       OR EXISTS (SELECT 1 FROM public.vm_workspace_recoveries recovery
+           WHERE recovery.resolved_at IS NULL AND
+             ((recovery.owner_kind='job' AND recovery.owner_id=d.job_id)
+              OR recovery.root_pvc_uid=d.pvc_uid))
+       OR EXISTS (SELECT 1 FROM public.vm_workspace_recovery_retention_pins pin
+           WHERE pin.pvc_uid=d.pvc_uid AND pin.released_at IS NULL)
+       OR EXISTS (SELECT 1 FROM public.vm_idle_access_leases lease
+           WHERE lease.owner_kind='job' AND lease.owner_id=d.job_id
+             AND lease.closed_at IS NULL AND lease.expires_at>clock_timestamp())
+       OR EXISTS (SELECT 1 FROM public.vm_workspace_cleanup_admissions other
+           WHERE other.owner_kind='job' AND other.owner_id=d.job_id
+             AND other.completed_at IS NULL AND other.id<>parent_id
+             AND other.source<>'terminal_checkpoint_prune'
+             AND NOT (other.source='controller_rootdisk_delete'
+               AND other.parent_admission_id=parent_id
+               AND other.pvc_uid=d.pvc_uid
+               AND NOT require_receipt
+               AND other.request_id IS NOT NULL
+               AND other.intent_digest ~ '^sha256:[0-9a-f]{64}$')) THEN
+        RAISE EXCEPTION 'Job retained disk purge current authority changed'
+            USING ERRCODE='23514',CONSTRAINT='vm_job_retained_purge_authority';
+    END IF;
+    IF d.binding_kind='bound' THEN
+        binding := retry.canonical_request->'workspace_storage';
+        IF jsonb_typeof(binding) IS DISTINCT FROM 'object'
+           OR jsonb_typeof(binding->'generation') IS DISTINCT FROM 'number'
+           OR (binding->>'generation') !~ '^[1-9][0-9]*$' THEN
+            RAISE EXCEPTION 'Job retained disk workspace generation unproven'
+                USING ERRCODE='23514',CONSTRAINT='vm_job_retained_purge_binding';
+        END IF;
+        SELECT * INTO instance FROM public.srw_workspace_instances
+         WHERE id=d.workspace_instance_id FOR UPDATE;
+        IF jsonb_typeof(binding) IS DISTINCT FROM 'object'
+           OR binding->>'uid' IS DISTINCT FROM d.workspace_instance_id::text
+           OR binding->>'generation' IS DISTINCT FROM d.workspace_generation::text
+           OR (d.workspace_generation>1 AND
+               binding->>'pvc_uid' IS DISTINCT FROM d.pvc_uid::text)
+           OR (binding->>'pvc_uid' IS NOT NULL AND
+               binding->>'pvc_uid' IS DISTINCT FROM d.pvc_uid::text)
+           OR binding->>'owner_kind' IS DISTINCT FROM 'job'
+           OR binding->>'owner_id' IS DISTINCT FROM d.job_id::text
+           OR instance.id IS NULL OR instance.generation IS DISTINCT FROM d.workspace_generation
+           OR instance.pvc_uid IS DISTINCT FROM d.pvc_uid::text
+           OR instance.status IS DISTINCT FROM 'Released'
+           OR instance.execution_id IS NOT NULL OR instance.pod_uid IS NOT NULL
+           OR NOT EXISTS (SELECT 1 FROM public.srw_execution_workspace_bindings b
+                WHERE b.execution_id=retry.execution_id
+                  AND b.instance_id=d.workspace_instance_id)
+           OR EXISTS (SELECT 1 FROM public.srw_workspace_instances other
+                WHERE other.id<>d.workspace_instance_id AND other.pvc_uid=d.pvc_uid::text)
+           OR EXISTS (SELECT 1 FROM public.srw_workspace_instances other
+                WHERE other.id=d.workspace_instance_id AND other.status<>'Released') THEN
+            RAISE EXCEPTION 'Job retained disk workspace release unproven'
+                USING ERRCODE='23514',CONSTRAINT='vm_job_retained_purge_binding';
+        END IF;
+    ELSE
+        IF d.binding_kind IS DISTINCT FROM 'unbound'
+           OR d.workspace_instance_id IS NOT NULL OR d.workspace_generation IS NOT NULL
+           OR COALESCE(retry.canonical_request->'workspace_storage','null'::jsonb)<>'null'::jsonb
+           OR EXISTS (SELECT 1 FROM public.srw_workspace_instances foreign_workspace
+                WHERE foreign_workspace.pvc_uid=d.pvc_uid::text)
+           OR EXISTS (SELECT 1 FROM public.srw_execution_workspace_bindings b
+                WHERE b.execution_id=retry.execution_id)
+           OR EXISTS (SELECT 1 FROM public.vm_workspace_recovery_jobs r
+                WHERE r.job_id=d.job_id AND r.resolved_at IS NULL) THEN
+            RAISE EXCEPTION 'Job retained rootdisk has another owner'
+                USING ERRCODE='23514',CONSTRAINT='vm_job_retained_purge_unbound';
+        END IF;
+    END IF;
+
+    FOR link IN SELECT p.* FROM public.vm_job_retained_disk_purge_predecessors p
+        JOIN public.vm_creation_retries source ON source.request_id=p.source_request_id
+        WHERE p.cleanup_admission_id=parent_id
+        ORDER BY source.created_at,source.request_id
+        FOR SHARE OF p
+    LOOP
+        link_count := link_count+1;
+        SELECT * INTO old_retry FROM public.vm_creation_retries
+         WHERE request_id=link.source_request_id FOR SHARE;
+        SELECT * INTO old_parent FROM public.vm_workspace_cleanup_admissions
+         WHERE id=link.old_cleanup_admission_id FOR SHARE;
+        SELECT * INTO old_stop FROM public.vm_resource_cleanup_stop_receipts
+         WHERE cleanup_admission_id=link.old_cleanup_admission_id FOR SHARE;
+        SELECT * INTO charge FROM public.vm_resource_reservations
+         WHERE id=link.reservation_id FOR SHARE;
+        IF old_retry.request_id IS NULL OR old_retry.owner_kind IS DISTINCT FROM 'job'
+           OR old_retry.job_id IS DISTINCT FROM d.job_id
+           OR (old_retry.state IS DISTINCT FROM 'succeeded'
+               AND NOT (old_retry.state='settled'
+                   AND public.vm_cancel_late_adopted_retained_terminal(old_parent.id)))
+           OR old_retry.resolved_at IS NULL
+           OR old_retry.observed_pvc_uid IS DISTINCT FROM d.pvc_uid
+           OR old_retry.observed_vm_uid IS DISTINCT FROM old_stop.vm_uid
+           OR old_retry.creation_admission_id IS NULL
+           OR old_stop.cleanup_admission_id IS NULL
+           OR old_stop.request_id IS DISTINCT FROM old_retry.request_id
+           OR old_stop.job_id IS DISTINCT FROM d.job_id
+           OR old_stop.provision_generation IS DISTINCT FROM old_retry.provision_generation
+           OR old_stop.pvc_uid IS DISTINCT FROM d.pvc_uid
+           OR old_stop.reservation_id IS DISTINCT FROM link.reservation_id
+           OR old_stop.intent_digest IS DISTINCT FROM old_parent.intent_digest
+           OR old_stop.stop_evidence->>'pvc_disposition' IS DISTINCT FROM 'retained'
+           OR old_stop.stop_evidence->>'vm_absent' IS DISTINCT FROM 'true'
+           OR old_stop.stop_evidence->>'vmi_absent' IS DISTINCT FROM 'true'
+           OR old_stop.stop_evidence->>'launcher_absent' IS DISTINCT FROM 'true'
+           OR old_stop.stop_evidence->>'controller_authenticated' IS DISTINCT FROM 'true'
+           OR old_stop.stop_evidence->>'same_generation_replacement' IS DISTINCT FROM 'false'
+           OR link.stop_evidence_digest IS DISTINCT FROM
+               'sha256:'||encode(sha256(convert_to(old_stop.stop_evidence::text,'UTF8')),'hex')
+           OR old_parent.id IS NULL OR old_parent.owner_kind IS DISTINCT FROM 'job'
+           OR old_parent.owner_id IS DISTINCT FROM d.job_id
+           OR old_parent.pvc_uid IS DISTINCT FROM d.pvc_uid
+           OR old_parent.parent_admission_id IS NOT NULL
+           OR old_parent.completed_at IS NULL OR old_parent.outcome IS DISTINCT FROM 'completed'
+           OR old_parent.source NOT IN (
+               'dispatcher_vm_recycle','lifecycle_vm_reap',
+               'job_terminal_vm_release','public_vm_delete')
+           OR charge.id IS NULL OR charge.request_id IS DISTINCT FROM old_retry.request_id
+           OR charge.revision IS DISTINCT FROM link.reservation_revision
+           OR charge.state IS DISTINCT FROM 'released'
+           OR charge.cluster_id IS DISTINCT FROM scope_cluster_id
+           OR old_retry.controller_configuration->>'namespace' IS DISTINCT FROM scope_namespace
+           OR old_retry.controller_configuration->'resource_admission'->>'cluster_id'
+               IS DISTINCT FROM scope_cluster_id
+           OR charge.vm_uid IS DISTINCT FROM old_stop.vm_uid
+           OR charge.release_evidence->>'kind' IS DISTINCT FROM 'exact_cleanup_compute_absent'
+           OR charge.release_evidence->>'cleanup_admission_id' IS DISTINCT FROM old_parent.id::text
+           OR charge.release_evidence->>'stop_evidence_digest' IS DISTINCT FROM link.stop_evidence_digest
+           OR NOT EXISTS (SELECT 1 FROM public.managed_repository_process_zero_receipts z
+               WHERE z.owner_kind='job' AND z.owner_id=d.job_id
+                 AND z.scope='vm' AND z.provisioner='vm'
+                 AND z.runtime_incarnation=old_retry.provision_generation::text)
+           OR EXISTS (SELECT 1 FROM public.vm_pre_ssh_stop_intents i
+               WHERE i.job_id=d.job_id AND i.provision_generation=old_retry.provision_generation
+                 AND (i.cleanup_admission_id<>old_parent.id OR
+                 NOT EXISTS (SELECT 1 FROM public.vm_pre_ssh_stop_proofs proof
+                     WHERE proof.cleanup_admission_id=i.cleanup_admission_id
+                       AND proof.job_id=d.job_id
+                       AND proof.provision_generation=old_retry.provision_generation
+                       AND proof.terminal_evidence->>'vm_uid'=old_stop.vm_uid::text
+                       AND proof.terminal_evidence->>'launcher_uid'=old_stop.launcher_uid::text)))
+           OR EXISTS (SELECT 1 FROM public.vm_resource_recovery_successors successor
+               WHERE successor.reservation_id=charge.id
+                 AND (successor.owner_id<>d.job_id
+                      OR successor.provision_generation<>old_retry.provision_generation
+                      OR successor.vm_uid<>old_stop.vm_uid
+                      OR successor.root_pvc_uid<>d.pvc_uid)) THEN
+            RAISE EXCEPTION 'Job retained disk predecessor changed'
+                USING ERRCODE='23514',CONSTRAINT='vm_job_retained_purge_predecessor';
+        END IF;
+        IF d.binding_kind='bound' THEN
+            binding := old_retry.canonical_request->'workspace_storage';
+            IF jsonb_typeof(binding) IS DISTINCT FROM 'object'
+               OR jsonb_typeof(binding->'generation') IS DISTINCT FROM 'number'
+               OR (binding->>'generation') !~ '^[1-9][0-9]*$' THEN
+                RAISE EXCEPTION 'Job retained disk predecessor generation unproven'
+                    USING ERRCODE='23514',CONSTRAINT='vm_job_retained_purge_predecessor_binding';
+            END IF;
+            IF jsonb_typeof(binding) IS DISTINCT FROM 'object'
+               OR binding->>'uid' IS DISTINCT FROM d.workspace_instance_id::text
+               OR binding->>'owner_id' IS DISTINCT FROM d.job_id::text
+               OR binding->>'owner_kind' IS DISTINCT FROM 'job'
+               OR (binding->>'pvc_uid' IS NOT NULL AND
+                   binding->>'pvc_uid' IS DISTINCT FROM d.pvc_uid::text)
+               OR ((binding->>'generation')::bigint>1 AND
+                   binding->>'pvc_uid' IS DISTINCT FROM d.pvc_uid::text)
+               OR (binding->>'generation')::bigint<previous_generation
+               OR (binding->>'generation')::bigint>d.workspace_generation
+               OR ((binding->>'generation')::bigint=previous_generation
+                   AND (old_retry.execution_id IS DISTINCT FROM previous_execution_id
+                     OR old_retry.execution_revision IS DISTINCT FROM previous_execution_revision
+                     OR old_retry.execution_generation IS DISTINCT FROM previous_execution_generation))
+               OR NOT EXISTS (SELECT 1 FROM public.srw_execution_workspace_bindings b
+                    WHERE b.execution_id=old_retry.execution_id
+                      AND b.instance_id=d.workspace_instance_id) THEN
+                RAISE EXCEPTION 'Job retained disk predecessor binding changed'
+                    USING ERRCODE='23514',CONSTRAINT='vm_job_retained_purge_predecessor_binding';
+            END IF;
+            previous_generation := (binding->>'generation')::bigint;
+            previous_execution_id := old_retry.execution_id;
+            previous_execution_revision := old_retry.execution_revision;
+            previous_execution_generation := old_retry.execution_generation;
+        ELSE
+            IF COALESCE(old_retry.canonical_request->'workspace_storage','null'::jsonb)<>'null'::jsonb THEN
+                RAISE EXCEPTION 'Job retained rootdisk predecessor changed'
+                    USING ERRCODE='23514';
+            END IF;
+        END IF;
+    END LOOP;
+    IF NOT EXISTS (SELECT 1 FROM public.vm_job_retained_disk_purge_predecessors final_link
+        JOIN public.vm_resource_cleanup_stop_receipts final_stop
+          ON final_stop.cleanup_admission_id=final_link.old_cleanup_admission_id
+        WHERE final_link.cleanup_admission_id=parent_id
+          AND final_link.source_request_id=d.final_request_id
+          AND final_stop.vmi_uid=d.vmi_uid
+          AND final_stop.launcher_uid=d.launcher_uid) THEN
+        RAISE EXCEPTION 'Job retained disk final runtime identity changed'
+            USING ERRCODE='23514',CONSTRAINT='vm_job_retained_purge_predecessor';
+    END IF;
+    SELECT count(*) INTO retry_count FROM public.vm_creation_retries r
+     WHERE r.owner_kind='job' AND r.job_id=d.job_id;
+    IF link_count=0 OR retry_count<link_count
+       OR NOT EXISTS (SELECT 1 FROM public.vm_job_retained_disk_purge_predecessors p
+           WHERE p.cleanup_admission_id=parent_id AND p.source_request_id=d.final_request_id)
+       OR EXISTS (SELECT 1 FROM public.vm_resource_cleanup_stop_receipts s
+           WHERE s.job_id=d.job_id AND s.stop_evidence->>'pvc_disposition'='retained'
+             AND NOT EXISTS (SELECT 1 FROM public.vm_job_retained_disk_purge_predecessors p
+                 WHERE p.cleanup_admission_id=parent_id AND p.source_request_id=s.request_id)) THEN
+        RAISE EXCEPTION 'Job retained disk predecessor chain incomplete'
+            USING ERRCODE='23514',CONSTRAINT='vm_job_retained_purge_chain';
+    END IF;
+    -- An earlier retry outside this same-PVC retained chain still needs its
+    -- own already-completed ordinary purged or never-issued terminal packet.
+    -- The 0326 logical predecessor guard continues to reject physical A then
+    -- never-issued B; this branch does not fabricate an attestor for B.
+    FOR old_retry IN SELECT r.* FROM public.vm_creation_retries r
+      WHERE r.owner_kind='job' AND r.job_id=d.job_id
+        AND NOT EXISTS (SELECT 1 FROM public.vm_job_retained_disk_purge_predecessors p
+            WHERE p.cleanup_admission_id=parent_id AND p.source_request_id=r.request_id)
+      ORDER BY r.created_at,r.request_id
+    LOOP
+        IF terminal_tail IS NOT NULL AND EXISTS(SELECT 1 FROM jsonb_array_elements(terminal_tail) item
+            JOIN public.vm_job_retained_resume_terminals t ON t.id::text=item->>'terminal_id'
+            WHERE t.source_request_id=old_retry.request_id AND t.terminal_kind IN ('never_issued','creation_disposed')) THEN
+            CONTINUE;
+        END IF;
+        IF (old_retry.created_at,old_retry.request_id)>=(retry.created_at,retry.request_id)
+           OR COALESCE(public.vm_job_terminal_prior_packet_evidence(old_retry.request_id)->>'kind','')
+              NOT IN ('never_issued','physical_stop') THEN
+            RAISE EXCEPTION 'Job retained disk has unclassified retry history'
+                USING ERRCODE='23514',CONSTRAINT='vm_job_retained_purge_chain';
+        END IF;
+    END LOOP;
+    SELECT * INTO receipt FROM public.vm_job_retained_disk_purge_receipts
+     WHERE cleanup_admission_id=parent_id;
+    IF require_receipt AND receipt.cleanup_admission_id IS NULL THEN
+        RAISE EXCEPTION 'Job retained disk purge lacks signed receipt'
+            USING ERRCODE='23514',CONSTRAINT='vm_job_retained_purge_receipt';
+    END IF;
+    IF receipt.cleanup_admission_id IS NOT NULL AND (
+       receipt.chain_digest IS DISTINCT FROM public.vm_job_retained_disk_purge_chain_digest(parent_id)
+       OR receipt.purge_evidence IS DISTINCT FROM (jsonb_build_object(
+           'version',1,'kind','vm_cleanup_physical_stop','job_id',d.job_id,
+           'provision_generation',d.provision_generation,'vm_uid',d.vm_uid,
+           'vmi_uid',d.vmi_uid,'launcher_uid',d.launcher_uid,'pvc_uid',d.pvc_uid,
+           'vm_absent',true,'vmi_absent',true,'launcher_absent',true,
+           'same_generation_replacement',false,'controller_authenticated',true,
+           'pvc_disposition','purged',
+           'controller_scope',jsonb_build_object(
+               'version',1,'namespace',scope_namespace,'cluster_id',scope_cluster_id)) ||
+           CASE WHEN d.binding_kind='bound'
+               THEN jsonb_build_object('captured_workspace_storage',
+                   jsonb_set(retry.canonical_request->'workspace_storage',
+                       '{pvc_uid}',to_jsonb(d.pvc_uid::text),true))
+               ELSE '{}'::jsonb END)) THEN
+        RAISE EXCEPTION 'Job retained disk purge receipt changed'
+            USING ERRCODE='23514',CONSTRAINT='vm_job_retained_purge_receipt';
+    END IF;
+    RETURN true;
+END;
+$_$;
+
+
+--
+-- Name: validate_vm_thread_cleanup_authority(public.vm_resource_thread_cleanup_authorities, boolean); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.validate_vm_thread_cleanup_authority(a public.vm_resource_thread_cleanup_authorities, allow_released boolean DEFAULT false) RETURNS boolean
+    LANGUAGE plpgsql
+    AS $$
+DECLARE
+    owner_row public.threads%ROWTYPE;
+    source public.vm_creation_retries%ROWTYPE;
+    charge public.vm_resource_reservations%ROWTYPE;
+    cleanup public.vm_workspace_cleanup_admissions%ROWTYPE;
+    outcome public.thread_runtime_retirement_outcomes%ROWTYPE;
+    vm jsonb;
+    expected_digest text;
+    terminal_handoff boolean;
+BEGIN
+    SELECT * INTO owner_row FROM public.threads WHERE id=a.thread_id FOR UPDATE;
+    SELECT * INTO source FROM public.vm_creation_retries WHERE request_id=a.request_id FOR UPDATE;
+    SELECT * INTO cleanup FROM public.vm_workspace_cleanup_admissions WHERE id=a.cleanup_admission_id FOR UPDATE;
+    SELECT * INTO charge FROM public.vm_resource_reservations WHERE id=a.reservation_id FOR UPDATE;
+    terminal_handoff := COALESCE(public.valid_vm_thread_retained_handoff(source),false);
+    vm := owner_row.metadata->'vm';
+    IF terminal_handoff THEN
+        IF NOT public.valid_thread_vm_creation_retirement_source(source,false)
+           OR a.retirement_context IS DISTINCT FROM owner_row.runtime_retirement_context THEN
+            RAISE EXCEPTION 'VM retained handoff retirement changed' USING ERRCODE='23514';
+        END IF;
+        -- Identity comes from the sealed observed source, never a rewritten Begin.
+        vm := jsonb_build_object('creation_request_id',source.request_id,
+            'provision_generation',source.provision_generation,'identity_provision_generation',source.provision_generation,
+            'identity_authenticated',true,'vm_uid',source.observed_vm_uid,'rootdisk_pvc_uid',source.observed_pvc_uid);
+    END IF;
+    -- Permanent endpoint cleanup deliberately removes metadata.vm after this
+    -- authority's purge and debit. Its existing exact external receipt then
+    -- authorizes reading the immutable Begin snapshot for final deletion.
+    IF NOT terminal_handoff AND allow_released AND a.purge_disk AND NOT (owner_row.metadata ? 'vm')
+       AND owner_row.runtime_retirement_external_cleanup IS NOT NULL
+       AND owner_row.runtime_retirement_external_cleanup =
+           public.pinned_retirement_external_cleanup_expected(owner_row.runtime_retirement_context,
+               owner_row.runtime_generation,owner_row.runtime_retirement_token) THEN
+        vm := a.retirement_context->'vm';
+    END IF;
+    expected_digest := 'sha256:' || encode(sha256(convert_to(format(
+        '{"owner_id":"%s","owner_kind":"thread","provision_generation":"%s","purge_disk":%s,"pvc_uid":"%s","resource":"vm_workspace","source":"pinned_thread_retirement","vm_uid":"%s"}',
+        a.thread_id,a.provision_generation,a.purge_disk::text,a.pvc_uid,a.vm_uid), 'UTF8')),'hex');
+    IF owner_row.id IS NULL OR owner_row.execution_lane IS DISTINCT FROM 'pinned'
+       OR owner_row.runtime_generation IS DISTINCT FROM a.runtime_generation
+       OR source.request_id IS NULL OR source.owner_kind IS DISTINCT FROM 'thread'
+       OR source.thread_id IS DISTINCT FROM a.thread_id OR (source.state IS DISTINCT FROM 'succeeded' AND NOT terminal_handoff)
+       OR (terminal_handoff AND NOT COALESCE(public.valid_vm_thread_retained_cleanup_source(a,source),false))
+       OR (NOT terminal_handoff AND NOT public.valid_vm_thread_nonquota_cleanup_source(a,source) AND (
+           source.thread_runtime_generation IS DISTINCT FROM a.runtime_generation
+           OR source.thread_agent_id IS DISTINCT FROM a.agent_id
+           OR source.thread_attach_token IS DISTINCT FROM a.attach_token))
+       OR source.provision_generation IS DISTINCT FROM a.provision_generation
+       OR source.observed_vm_uid IS DISTINCT FROM a.vm_uid
+       OR source.observed_pvc_uid IS DISTINCT FROM a.pvc_uid
+       OR source.controller_configuration->>'version' IS DISTINCT FROM '3' AND NOT public.valid_vm_thread_nonquota_cleanup_source(a,source)
+       OR (NOT public.valid_vm_thread_nonquota_cleanup_source(a,source) AND (charge.id IS NULL OR charge.request_id IS DISTINCT FROM a.request_id
+       OR charge.revision IS DISTINCT FROM a.reservation_revision OR charge.resource_version<>2
+       OR (charge.state NOT IN ('reserved','active','warm','teardown')
+           AND NOT (allow_released AND charge.state='released'))
+       OR charge.vmi_uid IS DISTINCT FROM a.vmi_uid
+       OR charge.launcher_uid IS DISTINCT FROM a.launcher_uid
+       OR (charge.vm_uid IS NOT NULL AND charge.vm_uid IS DISTINCT FROM a.vm_uid)
+       OR (a.vmi_uid IS NULL AND (source.ready_at IS NOT NULL OR charge.vm_uid IS NOT NULL))
+       OR (a.vmi_uid IS NOT NULL AND (source.ready_at IS NULL OR charge.vm_uid IS DISTINCT FROM a.vm_uid))
+       OR EXISTS (SELECT 1 FROM public.vm_resource_reservations newer
+           WHERE newer.request_id=a.request_id AND newer.revision>a.reservation_revision)
+       OR EXISTS (SELECT 1 FROM public.vm_resource_recovery_successors successor
+           WHERE successor.reservation_id=a.reservation_id
+             AND (successor.successor_vmi_uid IS DISTINCT FROM a.vmi_uid
+                  OR successor.successor_launcher_uid IS DISTINCT FROM a.launcher_uid))
+       OR NOT EXISTS (SELECT 1 FROM public.vm_resource_waiters w
+           WHERE w.request_id=a.request_id AND w.owner_kind='thread' AND w.thread_id=a.thread_id
+             AND w.provision_generation=a.provision_generation
+             AND (w.state='admitted' OR (allow_released AND w.state='released')))
+))
+       OR cleanup.id IS NULL OR cleanup.owner_kind IS DISTINCT FROM 'thread'
+       OR cleanup.owner_id IS DISTINCT FROM a.thread_id OR cleanup.pvc_uid IS DISTINCT FROM a.pvc_uid
+       OR cleanup.source IS DISTINCT FROM 'pinned_thread_retirement'
+       OR cleanup.request_id IS DISTINCT FROM a.cleanup_request_id
+       OR cleanup.intent_digest IS DISTINCT FROM a.intent_digest OR a.intent_digest<>expected_digest
+       OR (cleanup.completed_at IS NOT NULL AND cleanup.outcome IS DISTINCT FROM 'completed')
+       OR vm->>'creation_request_id' IS DISTINCT FROM a.request_id::text
+       OR vm->>'provision_generation' IS DISTINCT FROM a.provision_generation::text
+       OR vm->>'identity_provision_generation' IS DISTINCT FROM a.provision_generation::text
+       OR vm->'identity_authenticated' IS DISTINCT FROM 'true'::jsonb
+       OR vm->>'vm_uid' IS DISTINCT FROM a.vm_uid::text
+       OR vm->>'rootdisk_pvc_uid' IS DISTINCT FROM a.pvc_uid::text
+       OR (vm->>'_runtime_incarnation' IS NOT NULL AND vm->>'_runtime_incarnation'<>a.vm_uid::text)
+       OR (a.vmi_uid IS NOT NULL AND (
+           vm->>'vmi_uid' IS DISTINCT FROM a.vmi_uid::text
+           OR vm->>'active_pod_uid' IS DISTINCT FROM a.launcher_uid::text)) THEN
+        RAISE EXCEPTION 'VM thread cleanup source identity changed' USING ERRCODE='23514';
+    END IF;
+    IF owner_row.runtime_retirement_token IS NOT NULL THEN
+        IF owner_row.runtime_retirement_token IS DISTINCT FROM a.retirement_token
+           OR owner_row.runtime_retirement_authorized_at IS NULL
+           OR owner_row.runtime_retirement_permanent IS DISTINCT FROM a.purge_disk
+           OR owner_row.agent_id IS DISTINCT FROM a.agent_id
+           OR owner_row.runtime_attach_token IS DISTINCT FROM a.attach_token
+           OR a.retirement_context IS NULL
+           OR a.retirement_context IS DISTINCT FROM owner_row.runtime_retirement_context
+           OR a.retirement_context->>'thread_id' IS DISTINCT FROM a.thread_id::text
+           OR a.retirement_context->>'generation' IS DISTINCT FROM a.runtime_generation::text
+           OR a.retirement_context->>'settle_status' IS DISTINCT FROM 'ended'
+           OR (NOT terminal_handoff AND (
+               a.retirement_context->'vm'->>'provision_generation' IS DISTINCT FROM a.provision_generation::text
+               OR a.retirement_context->'vm'->>'vm_uid' IS DISTINCT FROM a.vm_uid::text
+               OR a.retirement_context->'vm'->>'rootdisk_pvc_uid' IS DISTINCT FROM a.pvc_uid::text)) THEN
+            RAISE EXCEPTION 'VM thread cleanup retirement changed' USING ERRCODE='23514';
+        END IF;
+    ELSE
+        SELECT * INTO outcome FROM public.thread_runtime_retirement_outcomes
+         WHERE thread_id=a.thread_id AND runtime_generation=a.runtime_generation
+           AND retirement_token=a.retirement_token;
+        IF owner_row.status IS DISTINCT FROM 'ended' OR owner_row.agent_id IS NOT NULL
+           OR owner_row.runtime_attach_token IS NOT NULL OR a.purge_disk
+           OR outcome.thread_id IS NULL OR outcome.disposition IS DISTINCT FROM 'ended'
+           OR outcome.permanent OR outcome.outcome IS DISTINCT FROM 'settled'
+           OR outcome.agent_id IS DISTINCT FROM a.agent_id
+           OR outcome.runtime_attach_token IS DISTINCT FROM a.attach_token
+           OR owner_row.ended_at IS DISTINCT FROM outcome.settled_at
+           OR vm->>'status' IS DISTINCT FROM 'deleted'
+           OR cleanup.completed_at IS NULL OR cleanup.completed_at>outcome.settled_at
+           OR source.resolved_at IS NULL OR source.resolved_at>cleanup.admitted_at
+           OR NOT EXISTS (SELECT 1 FROM public.managed_repository_process_zero_receipts p
+               WHERE p.owner_kind='thread' AND p.owner_id=a.thread_id AND p.scope='vm'
+                 AND p.provisioner='vm' AND p.runtime_incarnation=a.provision_generation::text
+                 AND p.observed_at<=outcome.settled_at) THEN
+            RAISE EXCEPTION 'VM thread cleanup settled lineage unproven' USING ERRCODE='23514';
+        END IF;
+    END IF;
+    RETURN true;
+END;
+$$;
+
+
+--
+-- Name: vm_thread_cleanup_refusal_recoveries; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.vm_thread_cleanup_refusal_recoveries (
+    refused_admission_id uuid NOT NULL,
+    successor_admission_id uuid NOT NULL,
+    child_admission_id uuid NOT NULL,
+    creation_request_id uuid NOT NULL,
+    thread_id uuid NOT NULL,
+    runtime_generation uuid NOT NULL,
+    retirement_token uuid NOT NULL,
+    provision_generation uuid NOT NULL,
+    vm_uid uuid NOT NULL,
+    pvc_uid uuid NOT NULL,
+    physical_stop jsonb NOT NULL,
+    recorded_at timestamp with time zone DEFAULT clock_timestamp() NOT NULL,
+    CONSTRAINT vm_thread_cleanup_refusal_recoveries_check CHECK (((refused_admission_id <> successor_admission_id) AND (refused_admission_id <> child_admission_id) AND (successor_admission_id <> child_admission_id)))
+);
+
+
+--
+-- Name: validate_vm_thread_cleanup_refusal_recovery(public.vm_thread_cleanup_refusal_recoveries); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.validate_vm_thread_cleanup_refusal_recovery(r public.vm_thread_cleanup_refusal_recoveries) RETURNS boolean
+    LANGUAGE plpgsql
+    AS $$
+DECLARE
+    owner_row public.threads%ROWTYPE;
+    source public.vm_creation_retries%ROWTYPE;
+    refused public.vm_workspace_cleanup_admissions%ROWTYPE;
+    successor public.vm_workspace_cleanup_admissions%ROWTYPE;
+    child public.vm_workspace_cleanup_admissions%ROWTYPE;
+    vm jsonb;
+    current_vm jsonb;
+    expected_digest text;
+BEGIN
+    SELECT * INTO owner_row FROM public.threads WHERE id=r.thread_id FOR UPDATE;
+    SELECT * INTO source FROM public.vm_creation_retries WHERE request_id=r.creation_request_id FOR UPDATE;
+    SELECT * INTO refused FROM public.vm_workspace_cleanup_admissions WHERE id=r.refused_admission_id FOR UPDATE;
+    SELECT * INTO successor FROM public.vm_workspace_cleanup_admissions WHERE id=r.successor_admission_id FOR UPDATE;
+    SELECT * INTO child FROM public.vm_workspace_cleanup_admissions WHERE id=r.child_admission_id FOR UPDATE;
+    vm := owner_row.runtime_retirement_context->'vm';
+    current_vm := owner_row.metadata->'vm';
+    expected_digest := 'sha256:' || encode(sha256(convert_to(format(
+        '{"owner_id":"%s","owner_kind":"thread","provision_generation":"%s","purge_disk":true,"pvc_uid":"%s","resource":"vm_workspace","source":"pinned_thread_retirement","vm_uid":"%s"}',
+        r.thread_id,r.provision_generation,r.pvc_uid,r.vm_uid),'UTF8')),'hex');
+    IF owner_row.id IS NULL OR owner_row.execution_lane IS DISTINCT FROM 'pinned'
+       OR owner_row.runtime_generation IS DISTINCT FROM r.runtime_generation
+       OR owner_row.runtime_retirement_token IS DISTINCT FROM r.retirement_token
+       OR owner_row.runtime_retirement_authorized_at IS NULL
+       OR owner_row.runtime_retirement_permanent IS DISTINCT FROM true
+       OR owner_row.runtime_retirement_context->>'thread_id' IS DISTINCT FROM r.thread_id::text
+       OR owner_row.runtime_retirement_context->>'generation' IS DISTINCT FROM r.runtime_generation::text
+       OR owner_row.runtime_retirement_context->>'settle_status' IS DISTINCT FROM 'ended'
+       OR owner_row.runtime_retirement_context->>'workspace_backend' IS DISTINCT FROM 'vm'
+       OR vm->'identity_authenticated' IS DISTINCT FROM 'true'::jsonb
+       OR vm->>'identity_provision_generation' IS DISTINCT FROM r.provision_generation::text
+       OR vm->>'provision_generation' IS DISTINCT FROM r.provision_generation::text
+       OR vm->>'vm_uid' IS DISTINCT FROM r.vm_uid::text
+       OR vm->>'rootdisk_pvc_uid' IS DISTINCT FROM r.pvc_uid::text
+       OR current_vm->>'provision_generation' IS DISTINCT FROM r.provision_generation::text
+       OR current_vm->>'vm_uid' IS DISTINCT FROM r.vm_uid::text
+       OR current_vm->>'rootdisk_pvc_uid' IS DISTINCT FROM r.pvc_uid::text
+       OR vm->>'creation_request_id' IS DISTINCT FROM r.creation_request_id::text
+       OR current_vm->>'creation_request_id' IS DISTINCT FROM r.creation_request_id::text
+       OR COALESCE(current_vm->>'status','') NOT IN ('retiring_process_zero','deleting','deleted')
+       OR source.owner_kind IS DISTINCT FROM 'thread' OR source.thread_id IS DISTINCT FROM r.thread_id
+       OR source.thread_runtime_generation IS DISTINCT FROM r.runtime_generation
+       OR source.thread_agent_id IS DISTINCT FROM owner_row.agent_id
+       OR source.thread_attach_token IS DISTINCT FROM owner_row.runtime_attach_token
+       OR source.provision_generation IS DISTINCT FROM r.provision_generation
+       OR source.observed_vm_uid::text IS DISTINCT FROM r.vm_uid::text
+       OR source.observed_pvc_uid::text IS DISTINCT FROM r.pvc_uid::text
+       OR source.state IS DISTINCT FROM 'succeeded' OR source.reason IS DISTINCT FROM 'creation_adopted'
+       OR source.canonical_request->>'entity_type' IS DISTINCT FROM 'thread'
+       OR source.canonical_request->>'job_id' IS DISTINCT FROM r.thread_id::text
+       OR source.canonical_request->>'provision_generation' IS DISTINCT FROM r.provision_generation::text
+       OR source.controller_configuration->>'version' IS DISTINCT FROM '1'
+       OR COALESCE(source.controller_configuration->'resource_admission','null'::jsonb)<>'null'::jsonb
+       OR NOT EXISTS (SELECT 1 FROM public.vm_workspace_cleanup_admissions c
+           WHERE c.id=source.creation_admission_id AND c.owner_kind='thread' AND c.owner_id=r.thread_id
+             AND c.source='controller_vm_create' AND c.completed_at IS NOT NULL AND c.outcome='adopted')
+       OR EXISTS (SELECT 1 FROM public.vm_resource_reservations c WHERE c.request_id=source.request_id)
+       OR EXISTS (SELECT 1 FROM public.vm_resource_waiters c WHERE c.request_id=source.request_id)
+       OR EXISTS (SELECT 1 FROM public.vm_creation_effects e WHERE e.request_id=source.request_id AND e.state='issued')
+       OR NOT EXISTS (SELECT 1 FROM public.vm_thread_creation_owners a
+           WHERE a.thread_id=r.thread_id AND a.live_thread_id=r.thread_id AND a.deleted_at IS NULL)
+       OR refused.owner_kind IS DISTINCT FROM 'thread' OR refused.owner_id IS DISTINCT FROM r.thread_id
+       OR refused.pvc_uid IS DISTINCT FROM r.pvc_uid OR refused.source IS DISTINCT FROM 'pinned_thread_retirement'
+       OR refused.parent_admission_id IS NOT NULL OR refused.intent_digest IS DISTINCT FROM expected_digest
+       OR refused.completed_at IS NULL OR refused.outcome IS DISTINCT FROM 'identity_superseded'
+       OR successor.owner_kind IS DISTINCT FROM refused.owner_kind OR successor.owner_id IS DISTINCT FROM refused.owner_id
+       OR successor.pvc_uid IS DISTINCT FROM refused.pvc_uid OR successor.source IS DISTINCT FROM refused.source
+       OR successor.intent_digest IS DISTINCT FROM refused.intent_digest OR successor.parent_admission_id IS NOT NULL
+       OR successor.request_id IS NOT DISTINCT FROM refused.request_id
+       OR (successor.completed_at IS NOT NULL AND successor.outcome IS DISTINCT FROM 'completed')
+       OR child.owner_kind IS DISTINCT FROM refused.owner_kind OR child.owner_id IS DISTINCT FROM refused.owner_id
+       OR child.pvc_uid IS DISTINCT FROM refused.pvc_uid OR child.parent_admission_id IS DISTINCT FROM refused.id
+       OR child.source IS DISTINCT FROM 'controller_rootdisk_delete' OR child.completed_at IS NULL
+       OR child.outcome IS DISTINCT FROM 'deleted'
+       OR EXISTS (SELECT 1 FROM public.vm_workspace_cleanup_admissions c
+           WHERE c.completed_at IS NULL AND c.id<>r.successor_admission_id
+             AND (c.owner_kind='thread' AND c.owner_id=r.thread_id OR c.pvc_uid=r.pvc_uid))
+       OR EXISTS (SELECT 1 FROM public.vm_workspace_recoveries recovery
+           LEFT JOIN public.vm_workspace_recovery_retention_pins pin
+             ON pin.recovery_id=recovery.id AND pin.released_at IS NULL
+           WHERE recovery.resolved_at IS NULL
+             AND (recovery.owner_kind='thread' AND recovery.owner_id=r.thread_id OR pin.pvc_uid=r.pvc_uid))
+       OR EXISTS (SELECT 1 FROM public.vm_idle_access_leases a
+           WHERE a.owner_kind='thread' AND a.owner_id=r.thread_id AND a.closed_at IS NULL
+             AND a.expires_at>clock_timestamp())
+       OR NOT EXISTS (SELECT 1 FROM public.managed_repository_process_zero_receipts p
+           WHERE p.owner_kind='thread' AND p.owner_id=r.thread_id AND p.scope='vm' AND p.provisioner='vm'
+             AND p.runtime_incarnation=r.provision_generation::text)
+       OR r.physical_stop->'version' IS DISTINCT FROM '1'::jsonb
+       OR r.physical_stop->>'kind' IS DISTINCT FROM 'vm_cleanup_physical_stop'
+       OR r.physical_stop->>'owner_kind' IS DISTINCT FROM 'thread'
+       OR r.physical_stop->>'owner_id' IS DISTINCT FROM r.thread_id::text
+       OR r.physical_stop->>'provision_generation' IS DISTINCT FROM r.provision_generation::text
+       OR r.physical_stop->>'vm_uid' IS DISTINCT FROM r.vm_uid::text
+       OR r.physical_stop->>'pvc_uid' IS DISTINCT FROM r.pvc_uid::text
+       OR r.physical_stop->>'vmi_uid' IS DISTINCT FROM vm->>'vmi_uid'
+       OR r.physical_stop->>'launcher_uid' IS DISTINCT FROM vm->>'active_pod_uid'
+       OR r.physical_stop->'vm_absent' IS DISTINCT FROM 'true'::jsonb
+       OR r.physical_stop->'vmi_absent' IS DISTINCT FROM 'true'::jsonb
+       OR r.physical_stop->'launcher_absent' IS DISTINCT FROM 'true'::jsonb
+       OR r.physical_stop->'same_generation_replacement' IS DISTINCT FROM 'false'::jsonb
+       OR r.physical_stop->'controller_authenticated' IS DISTINCT FROM 'true'::jsonb
+       OR r.physical_stop->>'pvc_disposition' IS DISTINCT FROM 'purged' THEN
+        RAISE EXCEPTION 'VM cleanup refusal recovery authority unproven' USING ERRCODE='23514';
+    END IF;
+    RETURN true;
+END;
+$$;
+
+
+--
+-- Name: vm_resource_thread_cleanup_stops; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.vm_resource_thread_cleanup_stops (
+    cleanup_admission_id uuid NOT NULL,
+    process_zero_receipt_id uuid NOT NULL,
+    stop_evidence jsonb NOT NULL,
+    accepted_at timestamp with time zone DEFAULT clock_timestamp() NOT NULL
+);
+
+
+--
+-- Name: validate_vm_thread_cleanup_stop(public.vm_resource_thread_cleanup_authorities, public.vm_resource_thread_cleanup_stops, boolean); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.validate_vm_thread_cleanup_stop(a public.vm_resource_thread_cleanup_authorities, s public.vm_resource_thread_cleanup_stops, allow_released boolean DEFAULT false) RETURNS boolean
+    LANGUAGE plpgsql
+    AS $$
+DECLARE expected jsonb;
+BEGIN
+    PERFORM public.validate_vm_thread_cleanup_authority(a,allow_released);
+    expected := jsonb_build_object(
+        'version',1,'kind','vm_cleanup_physical_stop','owner_kind','thread','owner_id',a.thread_id,
+        'provision_generation',a.provision_generation,'vm_uid',a.vm_uid,'vmi_uid',a.vmi_uid,
+        'launcher_uid',a.launcher_uid,'pvc_uid',a.pvc_uid,
+        'vm_absent',true,'vmi_absent',true,'launcher_absent',true,
+        'same_generation_replacement',false,'controller_authenticated',true,
+        'pvc_disposition',CASE WHEN a.purge_disk THEN 'purged' ELSE 'retained' END);
+    IF s.stop_evidence IS DISTINCT FROM expected
+       OR (NOT EXISTS (SELECT 1 FROM public.vm_resource_reservations r
+           WHERE r.id=a.reservation_id AND (r.state='teardown' OR (allow_released AND r.state='released')))
+           AND NOT EXISTS (SELECT 1 FROM public.vm_creation_retries source WHERE source.request_id=a.request_id
+               AND public.valid_vm_thread_nonquota_cleanup_source(a,source)))
+       OR NOT EXISTS (SELECT 1 FROM public.vm_workspace_cleanup_admissions c
+           WHERE c.id=a.cleanup_admission_id AND c.completed_at IS NOT NULL AND c.outcome='completed')
+       OR NOT EXISTS (SELECT 1 FROM public.managed_repository_process_zero_receipts p
+           WHERE p.id=s.process_zero_receipt_id AND p.owner_kind='thread' AND p.owner_id=a.thread_id
+             AND p.scope='vm' AND p.provisioner='vm' AND p.runtime_incarnation=a.provision_generation::text) THEN
+        RAISE EXCEPTION 'VM thread cleanup stop unproven' USING ERRCODE='23514';
+    END IF;
+    RETURN true;
+END;
+$$;
+
+
+--
+-- Name: validate_vm_thread_creation_owner_terminal(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.validate_vm_thread_creation_owner_terminal() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+DECLARE owner_row public.vm_thread_creation_owners%ROWTYPE;
+BEGIN
+    SELECT * INTO owner_row FROM public.vm_thread_creation_owners WHERE thread_id=NEW.thread_id;
+    IF (owner_row.live_thread_id IS NOT NULL AND (
+            owner_row.deleted_at IS NOT NULL OR owner_row.deleted_runtime_generation IS NOT NULL
+            OR owner_row.deleted_retirement_token IS NOT NULL OR owner_row.deletion_receipt IS NOT NULL))
+       OR (owner_row.live_thread_id IS NULL AND (
+            owner_row.deleted_at IS NULL OR owner_row.deleted_runtime_generation IS NULL
+            OR owner_row.deleted_retirement_token IS NULL OR owner_row.deletion_receipt IS NULL
+            OR EXISTS (SELECT 1 FROM public.threads WHERE id=owner_row.thread_id)
+            OR NOT EXISTS (SELECT 1 FROM public.thread_runtime_retirement_outcomes o
+                WHERE o.thread_id=owner_row.thread_id AND o.runtime_generation=owner_row.deleted_runtime_generation
+                  AND o.retirement_token=owner_row.deleted_retirement_token
+                  AND o.permanent AND o.outcome='deleted' AND o.disposition='ended'))) THEN
+        RAISE EXCEPTION 'VM audit owner detach and exact permanent deletion must commit together' USING ERRCODE='23514';
+    END IF;
+    RETURN NULL;
+END;
+$$;
+
+
+--
+-- Name: validate_vm_thread_retained_compute(uuid); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.validate_vm_thread_retained_compute(cleanup_id uuid) RETURNS boolean
+    LANGUAGE plpgsql
+    AS $$
+DECLARE
+    a public.vm_resource_thread_cleanup_authorities%ROWTYPE;
+    s public.vm_resource_thread_cleanup_stops%ROWTYPE;
+    source public.vm_creation_retries%ROWTYPE;
+    charge public.vm_resource_reservations%ROWTYPE;
+    old_cleanup public.vm_workspace_cleanup_admissions%ROWTYPE;
+    soft public.thread_runtime_retirement_outcomes%ROWTYPE;
+    expected_stop jsonb;
+    old_digest text;
+BEGIN
+    SELECT * INTO a FROM public.vm_resource_thread_cleanup_authorities WHERE cleanup_admission_id=cleanup_id;
+    SELECT * INTO source FROM public.vm_creation_retries WHERE request_id=a.request_id FOR SHARE;
+    SELECT * INTO old_cleanup FROM public.vm_workspace_cleanup_admissions WHERE id=a.cleanup_admission_id FOR SHARE;
+    SELECT * INTO charge FROM public.vm_resource_reservations WHERE id=a.reservation_id FOR SHARE;
+    SELECT * INTO s FROM public.vm_resource_thread_cleanup_stops WHERE cleanup_admission_id=a.cleanup_admission_id;
+    SELECT * INTO soft FROM public.thread_runtime_retirement_outcomes
+        WHERE thread_id=a.thread_id AND runtime_generation=a.runtime_generation AND retirement_token=a.retirement_token;
+    expected_stop := jsonb_build_object(
+        'version',1,'kind','vm_cleanup_physical_stop','owner_kind','thread','owner_id',a.thread_id,
+        'provision_generation',a.provision_generation,'vm_uid',a.vm_uid,'vmi_uid',a.vmi_uid,
+        'launcher_uid',a.launcher_uid,'pvc_uid',a.pvc_uid,
+        'vm_absent',true,'vmi_absent',true,'launcher_absent',true,
+        'same_generation_replacement',false,'controller_authenticated',true,'pvc_disposition','retained');
+    -- These keys/values are fixed ASCII UUIDs and literals, sorted exactly as
+    -- cleanup_intent_digest's compact JSON. jsonb::text is NOT its encoding.
+    old_digest := 'sha256:' || encode(sha256(convert_to(format(
+        '{"owner_id":"%s","owner_kind":"thread","provision_generation":"%s","purge_disk":false,"pvc_uid":"%s","resource":"vm_workspace","source":"pinned_thread_retirement","vm_uid":"%s"}',
+        a.thread_id,a.provision_generation,a.pvc_uid,a.vm_uid),'UTF8')),'hex');
+    IF a.cleanup_admission_id IS NULL OR a.purge_disk IS DISTINCT FROM false
+       OR s.cleanup_admission_id IS NULL OR s.stop_evidence IS DISTINCT FROM expected_stop
+       OR old_cleanup.id IS NULL OR old_cleanup.owner_kind IS DISTINCT FROM 'thread'
+       OR old_cleanup.owner_id IS DISTINCT FROM a.thread_id OR old_cleanup.pvc_uid IS DISTINCT FROM a.pvc_uid
+       OR old_cleanup.parent_admission_id IS NOT NULL
+       OR old_cleanup.source IS DISTINCT FROM 'pinned_thread_retirement'
+       OR old_cleanup.request_id IS DISTINCT FROM a.cleanup_request_id
+       OR old_cleanup.intent_digest IS DISTINCT FROM old_digest OR a.intent_digest IS DISTINCT FROM old_digest
+       OR old_cleanup.completed_at IS NULL OR old_cleanup.outcome IS DISTINCT FROM 'completed'
+       OR soft.thread_id IS NULL OR soft.permanent IS DISTINCT FROM false
+       OR soft.outcome IS DISTINCT FROM 'settled' OR soft.disposition IS DISTINCT FROM 'ended'
+       OR soft.agent_id IS DISTINCT FROM a.agent_id OR soft.runtime_attach_token IS DISTINCT FROM a.attach_token
+       OR old_cleanup.completed_at>soft.settled_at
+       OR source.resolved_at IS NULL OR source.resolved_at>old_cleanup.admitted_at
+       OR NOT EXISTS (SELECT 1 FROM public.managed_repository_process_zero_receipts p
+           WHERE p.id=s.process_zero_receipt_id AND p.owner_kind='thread' AND p.owner_id=a.thread_id
+             AND p.scope='vm' AND p.provisioner='vm' AND p.runtime_incarnation=a.provision_generation::text
+             AND p.observed_at<=soft.settled_at)
+       OR (NOT public.valid_vm_thread_nonquota_cleanup_source(a,source) AND (charge.id IS NULL OR charge.state IS DISTINCT FROM 'released'
+       OR charge.resource_version IS DISTINCT FROM 2 OR charge.request_id IS DISTINCT FROM a.request_id
+       OR charge.revision IS DISTINCT FROM a.reservation_revision
+       OR charge.released_at IS NULL OR charge.released_at<s.accepted_at
+       OR charge.release_evidence IS DISTINCT FROM jsonb_build_object(
+           'kind','exact_cleanup_compute_absent','owner_kind','thread','thread_id',a.thread_id,
+           'cleanup_admission_id',a.cleanup_admission_id,'reservation_revision',a.reservation_revision,
+           'stop_evidence_digest','sha256:'||encode(sha256(convert_to(s.stop_evidence::text,'UTF8')),'hex'))
+       OR charge.vmi_uid IS DISTINCT FROM a.vmi_uid OR charge.launcher_uid IS DISTINCT FROM a.launcher_uid
+       OR (charge.vm_uid IS NOT NULL AND charge.vm_uid IS DISTINCT FROM a.vm_uid)
+       OR (a.vmi_uid IS NULL AND (source.ready_at IS NOT NULL OR charge.vm_uid IS NOT NULL OR a.launcher_uid IS NOT NULL))
+       OR (a.vmi_uid IS NOT NULL AND (source.ready_at IS NULL OR charge.vm_uid IS DISTINCT FROM a.vm_uid OR a.launcher_uid IS NULL))
+       OR EXISTS (SELECT 1 FROM public.vm_resource_reservations r WHERE r.request_id=a.request_id AND r.revision>a.reservation_revision)
+       OR EXISTS (SELECT 1 FROM public.vm_resource_recovery_successors r WHERE r.reservation_id=a.reservation_id
+           AND (r.successor_vmi_uid IS DISTINCT FROM a.vmi_uid OR r.successor_launcher_uid IS DISTINCT FROM a.launcher_uid))
+       OR NOT EXISTS (SELECT 1 FROM public.vm_resource_waiters w WHERE w.request_id=a.request_id
+           AND w.owner_kind='thread' AND w.thread_id=a.thread_id AND w.provision_generation=a.provision_generation AND w.state='released')))
+ THEN
+        RAISE EXCEPTION 'VM retained disk predecessor unproven' USING ERRCODE='23514';
+    END IF;
+    IF source.request_id IS NULL OR source.owner_kind IS DISTINCT FROM 'thread'
+       OR source.thread_id IS DISTINCT FROM a.thread_id OR (source.state IS DISTINCT FROM 'succeeded' AND NOT COALESCE(public.valid_vm_thread_retained_cleanup_source(a,source),false))
+       OR source.thread_wake_operation_id IS NOT NULL
+       OR NOT (source.origin='initial' AND source.expected_pvc_uid IS NULL
+           OR source.origin='resume' AND EXISTS (
+               SELECT 1 FROM public.vm_thread_retained_resumes op
+               JOIN public.vm_resource_thread_cleanup_authorities prior ON prior.cleanup_admission_id=op.compute_cleanup_admission_id
+               WHERE op.id=source.thread_retained_resume_id AND op.thread_id=a.thread_id
+                 AND op.runtime_generation=source.thread_runtime_generation
+                 AND op.request_id=source.request_id AND op.provision_generation=source.provision_generation
+                 AND prior.pvc_uid=source.expected_pvc_uid AND prior.pvc_uid=a.pvc_uid))
+       OR (NOT COALESCE(public.valid_vm_thread_retained_cleanup_source(a,source),false) AND NOT public.valid_vm_thread_nonquota_cleanup_source(a,source) AND (
+           source.thread_runtime_generation IS DISTINCT FROM a.runtime_generation
+           OR source.thread_agent_id IS DISTINCT FROM a.agent_id OR source.thread_attach_token IS DISTINCT FROM a.attach_token))
+       OR source.provision_generation IS DISTINCT FROM a.provision_generation
+       OR source.observed_vm_uid IS DISTINCT FROM a.vm_uid OR source.observed_pvc_uid IS DISTINCT FROM a.pvc_uid
+       OR source.controller_configuration->>'version' IS DISTINCT FROM '3' AND NOT public.valid_vm_thread_nonquota_cleanup_source(a,source) THEN
+        RAISE EXCEPTION 'VM retained compute source unproven' USING ERRCODE='23514';
+    END IF;
+    RETURN true;
+END;
+$$;
+
+
+--
+-- Name: vm_thread_retained_disk_purge_authorities; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.vm_thread_retained_disk_purge_authorities (
+    cleanup_admission_id uuid NOT NULL,
+    compute_cleanup_admission_id uuid NOT NULL,
+    runtime_generation uuid NOT NULL,
+    retirement_token uuid NOT NULL,
+    source_revision bigint NOT NULL,
+    cleanup_request_id uuid NOT NULL,
+    intent_digest text NOT NULL,
+    retirement_context jsonb NOT NULL,
+    created_at timestamp with time zone DEFAULT clock_timestamp() NOT NULL
+);
+
+
+--
+-- Name: validate_vm_thread_retained_disk_purge(public.vm_thread_retained_disk_purge_authorities, boolean); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.validate_vm_thread_retained_disk_purge(d public.vm_thread_retained_disk_purge_authorities, after_endpoint_cleanup boolean DEFAULT false) RETURNS boolean
+    LANGUAGE plpgsql
+    AS $$
+DECLARE
+    a public.vm_resource_thread_cleanup_authorities%ROWTYPE;
+    s public.vm_resource_thread_cleanup_stops%ROWTYPE;
+    owner_row public.threads%ROWTYPE;
+    source public.vm_creation_retries%ROWTYPE;
+    charge public.vm_resource_reservations%ROWTYPE;
+    old_cleanup public.vm_workspace_cleanup_admissions%ROWTYPE;
+    cleanup public.vm_workspace_cleanup_admissions%ROWTYPE;
+    soft public.thread_runtime_retirement_outcomes%ROWTYPE;
+    vm jsonb;
+    captured jsonb;
+    terminal public.vm_thread_retained_resume_terminals%ROWTYPE;
+    early_op public.vm_thread_retained_resumes%ROWTYPE;
+    early_end boolean := false;
+    expected_stop jsonb;
+    old_digest text;
+    new_digest text;
+BEGIN
+    SELECT * INTO a FROM public.vm_resource_thread_cleanup_authorities
+        WHERE cleanup_admission_id=d.compute_cleanup_admission_id;
+    SELECT * INTO owner_row FROM public.threads WHERE id=a.thread_id FOR UPDATE;
+    SELECT * INTO source FROM public.vm_creation_retries WHERE request_id=a.request_id FOR UPDATE;
+    PERFORM id FROM public.vm_workspace_cleanup_admissions
+        WHERE id IN (a.cleanup_admission_id,d.cleanup_admission_id) ORDER BY id FOR UPDATE;
+    SELECT * INTO old_cleanup FROM public.vm_workspace_cleanup_admissions WHERE id=a.cleanup_admission_id;
+    SELECT * INTO cleanup FROM public.vm_workspace_cleanup_admissions WHERE id=d.cleanup_admission_id;
+    SELECT * INTO charge FROM public.vm_resource_reservations WHERE id=a.reservation_id FOR UPDATE;
+    SELECT * INTO s FROM public.vm_resource_thread_cleanup_stops WHERE cleanup_admission_id=a.cleanup_admission_id;
+    SELECT * INTO soft FROM public.thread_runtime_retirement_outcomes
+        WHERE thread_id=a.thread_id AND runtime_generation=a.runtime_generation AND retirement_token=a.retirement_token;
+    expected_stop := jsonb_build_object(
+        'version',1,'kind','vm_cleanup_physical_stop','owner_kind','thread','owner_id',a.thread_id,
+        'provision_generation',a.provision_generation,'vm_uid',a.vm_uid,'vmi_uid',a.vmi_uid,
+        'launcher_uid',a.launcher_uid,'pvc_uid',a.pvc_uid,
+        'vm_absent',true,'vmi_absent',true,'launcher_absent',true,
+        'same_generation_replacement',false,'controller_authenticated',true,'pvc_disposition','retained');
+    -- These keys/values are fixed ASCII UUIDs and literals, sorted exactly as
+    -- cleanup_intent_digest's compact JSON. jsonb::text is NOT its encoding.
+    old_digest := 'sha256:' || encode(sha256(convert_to(format(
+        '{"owner_id":"%s","owner_kind":"thread","provision_generation":"%s","purge_disk":false,"pvc_uid":"%s","resource":"vm_workspace","source":"pinned_thread_retirement","vm_uid":"%s"}',
+        a.thread_id,a.provision_generation,a.pvc_uid,a.vm_uid),'UTF8')),'hex');
+    new_digest := 'sha256:' || encode(sha256(convert_to(format(
+        '{"compute_cleanup_admission_id":"%s","owner_id":"%s","owner_kind":"thread","provision_generation":"%s","purge_disk":true,"pvc_uid":"%s","resource":"vm_workspace","retirement_token":"%s","runtime_generation":"%s","source":"pinned_thread_retained_disk_purge","vm_uid":"%s"}',
+        a.cleanup_admission_id,a.thread_id,a.provision_generation,a.pvc_uid,d.retirement_token,d.runtime_generation,a.vm_uid),'UTF8')),'hex');
+    IF a.cleanup_admission_id IS NULL OR a.purge_disk IS DISTINCT FROM false
+       OR s.cleanup_admission_id IS NULL OR s.stop_evidence IS DISTINCT FROM expected_stop
+       OR old_cleanup.id IS NULL OR old_cleanup.owner_kind IS DISTINCT FROM 'thread'
+       OR old_cleanup.owner_id IS DISTINCT FROM a.thread_id OR old_cleanup.pvc_uid IS DISTINCT FROM a.pvc_uid
+       OR old_cleanup.parent_admission_id IS NOT NULL
+       OR old_cleanup.source IS DISTINCT FROM 'pinned_thread_retirement'
+       OR old_cleanup.request_id IS DISTINCT FROM a.cleanup_request_id
+       OR old_cleanup.intent_digest IS DISTINCT FROM old_digest OR a.intent_digest IS DISTINCT FROM old_digest
+       OR old_cleanup.completed_at IS NULL OR old_cleanup.outcome IS DISTINCT FROM 'completed'
+       OR soft.thread_id IS NULL OR soft.permanent IS DISTINCT FROM false
+       OR soft.outcome IS DISTINCT FROM 'settled' OR soft.disposition IS DISTINCT FROM 'ended'
+       OR soft.agent_id IS DISTINCT FROM a.agent_id OR soft.runtime_attach_token IS DISTINCT FROM a.attach_token
+       OR old_cleanup.completed_at>soft.settled_at
+       OR source.resolved_at IS NULL OR source.resolved_at>old_cleanup.admitted_at
+       OR NOT EXISTS (SELECT 1 FROM public.managed_repository_process_zero_receipts p
+           WHERE p.id=s.process_zero_receipt_id AND p.owner_kind='thread' AND p.owner_id=a.thread_id
+             AND p.scope='vm' AND p.provisioner='vm' AND p.runtime_incarnation=a.provision_generation::text
+             AND p.observed_at<=soft.settled_at)
+       OR (NOT public.valid_vm_thread_nonquota_cleanup_source(a,source) AND (charge.id IS NULL OR charge.state IS DISTINCT FROM 'released'
+       OR charge.resource_version IS DISTINCT FROM 2 OR charge.request_id IS DISTINCT FROM a.request_id
+       OR charge.revision IS DISTINCT FROM a.reservation_revision
+       OR charge.released_at IS NULL OR charge.released_at<s.accepted_at
+       OR charge.release_evidence IS DISTINCT FROM jsonb_build_object(
+           'kind','exact_cleanup_compute_absent','owner_kind','thread','thread_id',a.thread_id,
+           'cleanup_admission_id',a.cleanup_admission_id,'reservation_revision',a.reservation_revision,
+           'stop_evidence_digest','sha256:'||encode(sha256(convert_to(s.stop_evidence::text,'UTF8')),'hex'))
+       OR charge.vmi_uid IS DISTINCT FROM a.vmi_uid OR charge.launcher_uid IS DISTINCT FROM a.launcher_uid
+       OR (charge.vm_uid IS NOT NULL AND charge.vm_uid IS DISTINCT FROM a.vm_uid)
+       OR (a.vmi_uid IS NULL AND (source.ready_at IS NOT NULL OR charge.vm_uid IS NOT NULL OR a.launcher_uid IS NOT NULL))
+       OR (a.vmi_uid IS NOT NULL AND (source.ready_at IS NULL OR charge.vm_uid IS DISTINCT FROM a.vm_uid OR a.launcher_uid IS NULL))
+       OR EXISTS (SELECT 1 FROM public.vm_resource_reservations r WHERE r.request_id=a.request_id AND r.revision>a.reservation_revision)
+       OR EXISTS (SELECT 1 FROM public.vm_resource_recovery_successors r WHERE r.reservation_id=a.reservation_id
+           AND (r.successor_vmi_uid IS DISTINCT FROM a.vmi_uid OR r.successor_launcher_uid IS DISTINCT FROM a.launcher_uid))
+       OR NOT EXISTS (SELECT 1 FROM public.vm_resource_waiters w WHERE w.request_id=a.request_id
+           AND w.owner_kind='thread' AND w.thread_id=a.thread_id AND w.provision_generation=a.provision_generation AND w.state='released')))
+ THEN
+        RAISE EXCEPTION 'VM retained disk predecessor unproven' USING ERRCODE='23514';
+    END IF;
+    SELECT terminal_row.* INTO terminal FROM public.vm_thread_retained_resume_terminals terminal_row
+        JOIN public.vm_thread_retained_resumes op ON op.id=terminal_row.operation_id
+        WHERE op.thread_id=a.thread_id AND terminal_row.runtime_generation=d.runtime_generation
+          AND terminal_row.compute_cleanup_admission_id=a.cleanup_admission_id
+          AND EXISTS (SELECT 1 FROM public.thread_runtime_retirement_outcomes o
+              WHERE o.thread_id=a.thread_id AND o.runtime_generation=terminal_row.runtime_generation
+                AND o.retirement_token=terminal_row.retirement_token AND NOT o.permanent AND o.outcome='settled'
+                AND o.disposition='ended' AND o.settled_at=owner_row.ended_at);
+    IF terminal.id IS NOT NULL THEN
+        SELECT * INTO soft FROM public.thread_runtime_retirement_outcomes
+            WHERE thread_id=a.thread_id AND runtime_generation=terminal.runtime_generation AND retirement_token=terminal.retirement_token;
+    END IF;
+    SELECT * INTO early_op FROM public.vm_thread_retained_resumes
+        WHERE thread_id=a.thread_id AND public.valid_vm_thread_retained_runtime(vm_thread_retained_resumes,owner_row)
+          AND compute_cleanup_admission_id=a.cleanup_admission_id;
+    early_end := COALESCE(public.valid_vm_thread_retained_early_end(owner_row,early_op),false);
+    IF owner_row.id IS NULL OR owner_row.execution_lane IS DISTINCT FROM 'pinned'
+       OR (NOT early_end AND (owner_row.status IS DISTINCT FROM 'ended' OR owner_row.ended_at IS DISTINCT FROM soft.settled_at))
+       OR owner_row.runtime_generation IS DISTINCT FROM d.runtime_generation
+       OR (NOT early_end AND terminal.id IS NULL AND d.runtime_generation IS DISTINCT FROM a.runtime_generation)
+       OR source.request_id IS NULL OR source.owner_kind IS DISTINCT FROM 'thread'
+       OR source.thread_id IS DISTINCT FROM a.thread_id OR (source.state IS DISTINCT FROM 'succeeded' AND NOT COALESCE(public.valid_vm_thread_retained_cleanup_source(a,source),false))
+       OR NOT (source.origin='initial' OR public.valid_vm_thread_retained_resume_source(source)) OR source.thread_wake_operation_id IS NOT NULL
+       OR (NOT COALESCE(public.valid_vm_thread_retained_cleanup_source(a,source),false) AND NOT public.valid_vm_thread_nonquota_cleanup_source(a,source) AND (
+           source.thread_runtime_generation IS DISTINCT FROM a.runtime_generation
+           OR source.thread_agent_id IS DISTINCT FROM a.agent_id OR source.thread_attach_token IS DISTINCT FROM a.attach_token))
+       OR source.provision_generation IS DISTINCT FROM a.provision_generation
+       OR source.observed_vm_uid IS DISTINCT FROM a.vm_uid OR source.observed_pvc_uid IS DISTINCT FROM a.pvc_uid
+       OR source.controller_configuration->>'version' IS DISTINCT FROM '3' AND NOT public.valid_vm_thread_nonquota_cleanup_source(a,source)
+       OR source.revision IS DISTINCT FROM d.source_revision
+       OR owner_row.runtime_retirement_token IS DISTINCT FROM d.retirement_token
+       OR d.retirement_token=a.retirement_token OR owner_row.runtime_retirement_permanent IS DISTINCT FROM true
+       OR owner_row.runtime_retirement_authorized_at IS NULL
+       OR (NOT early_end AND (owner_row.agent_id IS NOT NULL OR owner_row.runtime_attach_token IS NOT NULL
+       OR owner_row.control_admission_agent_id IS NOT NULL
+       OR EXISTS (SELECT 1 FROM public.agents agent WHERE agent.thread_id=a.thread_id)))
+       OR owner_row.runtime_retirement_context IS DISTINCT FROM d.retirement_context
+       OR d.retirement_context->>'thread_id' IS DISTINCT FROM a.thread_id::text
+       OR d.retirement_context->>'generation' IS DISTINCT FROM d.runtime_generation::text
+       OR (NOT early_end AND d.retirement_context->>'entry_status' IS DISTINCT FROM 'ended')
+       OR d.retirement_context->>'settle_status' IS DISTINCT FROM 'ended'
+       OR (NOT early_end AND (d.retirement_context->'agent_id' IS DISTINCT FROM 'null'::jsonb
+       OR d.retirement_context->'runtime_attach_token' IS DISTINCT FROM 'null'::jsonb
+       OR d.retirement_context->'control_admission_agent_id' IS DISTINCT FROM 'null'::jsonb))
+       OR cleanup.id IS NULL OR cleanup.owner_kind IS DISTINCT FROM 'thread'
+       OR cleanup.owner_id IS DISTINCT FROM a.thread_id OR cleanup.pvc_uid IS DISTINCT FROM a.pvc_uid
+       OR cleanup.parent_admission_id IS NOT NULL
+       OR cleanup.source IS DISTINCT FROM 'pinned_thread_retained_disk_purge'
+       OR cleanup.request_id IS DISTINCT FROM d.cleanup_request_id
+       OR cleanup.intent_digest IS DISTINCT FROM new_digest OR d.intent_digest IS DISTINCT FROM new_digest
+       OR (cleanup.completed_at IS NOT NULL AND (cleanup.outcome IS DISTINCT FROM 'completed'
+           OR NOT EXISTS (SELECT 1 FROM public.vm_thread_retained_disk_purge_receipts p WHERE p.cleanup_admission_id=d.cleanup_admission_id))) THEN
+        RAISE EXCEPTION 'VM retained disk current authority changed' USING ERRCODE='23514';
+    END IF;
+    captured := CASE WHEN early_end THEN early_op.retained_vm ELSE d.retirement_context->'vm' END;
+    vm := owner_row.metadata->'vm';
+    IF after_endpoint_cleanup AND NOT (owner_row.metadata ? 'vm')
+       AND owner_row.runtime_retirement_external_cleanup IS NOT NULL
+       AND owner_row.runtime_retirement_external_cleanup =
+           public.pinned_retirement_external_cleanup_expected(d.retirement_context,d.runtime_generation,d.retirement_token)
+       AND EXISTS (SELECT 1 FROM public.vm_thread_retained_disk_purge_receipts p WHERE p.cleanup_admission_id=d.cleanup_admission_id) THEN
+        vm := captured;
+    END IF;
+    -- A never-Ready charge stays unbound even if metadata recorded an observed
+    -- VMI/launcher before Ready. As in 0295, only an actual reservation binding
+    -- constrains those fields; its physical proof still requires whole-runtime absence.
+    IF vm->>'creation_request_id' IS DISTINCT FROM a.request_id::text
+       OR vm->>'provision_generation' IS DISTINCT FROM a.provision_generation::text
+       OR vm->>'identity_provision_generation' IS DISTINCT FROM a.provision_generation::text
+       OR vm->'identity_authenticated' IS DISTINCT FROM 'true'::jsonb
+       OR vm->>'vm_uid' IS DISTINCT FROM a.vm_uid::text OR vm->>'rootdisk_pvc_uid' IS DISTINCT FROM a.pvc_uid::text
+       OR vm->>'status' IS DISTINCT FROM 'deleted'
+       OR (vm->>'_runtime_incarnation' IS NOT NULL AND vm->>'_runtime_incarnation'<>a.vm_uid::text)
+       OR (a.vmi_uid IS NOT NULL AND (vm->>'vmi_uid' IS DISTINCT FROM a.vmi_uid::text OR vm->>'active_pod_uid' IS DISTINCT FROM a.launcher_uid::text))
+       OR captured->>'creation_request_id' IS DISTINCT FROM a.request_id::text
+       OR captured->>'provision_generation' IS DISTINCT FROM a.provision_generation::text
+       OR captured->>'identity_provision_generation' IS DISTINCT FROM a.provision_generation::text
+       OR captured->'identity_authenticated' IS DISTINCT FROM 'true'::jsonb
+       OR captured->>'vm_uid' IS DISTINCT FROM a.vm_uid::text OR captured->>'rootdisk_pvc_uid' IS DISTINCT FROM a.pvc_uid::text
+       OR captured->>'status' IS DISTINCT FROM 'deleted'
+       OR (captured->>'_runtime_incarnation' IS NOT NULL AND captured->>'_runtime_incarnation'<>a.vm_uid::text)
+       OR (a.vmi_uid IS NOT NULL AND (captured->>'vmi_uid' IS DISTINCT FROM a.vmi_uid::text OR captured->>'active_pod_uid' IS DISTINCT FROM a.launcher_uid::text))
+       OR EXISTS (SELECT 1 FROM public.vm_idle_access_leases l WHERE l.owner_kind='thread' AND l.owner_id=a.thread_id
+           AND l.closed_at IS NULL AND l.expires_at>clock_timestamp())
+       OR EXISTS (SELECT 1 FROM public.vm_workspace_recoveries r
+           LEFT JOIN public.vm_workspace_recovery_retention_pins pin ON pin.recovery_id=r.id AND pin.released_at IS NULL
+           WHERE r.resolved_at IS NULL AND ((r.owner_kind='thread' AND r.owner_id=a.thread_id) OR pin.pvc_uid=a.pvc_uid))
+       OR EXISTS (SELECT 1 FROM public.vm_workspace_recovery_retention_pins pin WHERE pin.pvc_uid=a.pvc_uid AND pin.released_at IS NULL)
+       OR EXISTS (SELECT 1 FROM public.vm_workspace_cleanup_admissions c
+           WHERE ((c.owner_kind='thread' AND c.owner_id=a.thread_id) OR c.pvc_uid=a.pvc_uid)
+             AND c.completed_at IS NULL AND c.id<>d.cleanup_admission_id AND c.parent_admission_id IS DISTINCT FROM d.cleanup_admission_id) THEN
+        RAISE EXCEPTION 'VM retained disk backing or access changed' USING ERRCODE='23514';
+    END IF;
+    RETURN true;
+END;
+$$;
+
+
+--
+-- Name: validate_vm_thread_retained_disk_purge_receipt(public.vm_thread_retained_disk_purge_authorities, jsonb, boolean); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.validate_vm_thread_retained_disk_purge_receipt(d public.vm_thread_retained_disk_purge_authorities, proof jsonb, after_endpoint_cleanup boolean DEFAULT false) RETURNS boolean
+    LANGUAGE plpgsql
+    AS $$
+DECLARE a public.vm_resource_thread_cleanup_authorities%ROWTYPE;
+BEGIN
+    PERFORM public.validate_vm_thread_retained_disk_purge(d,after_endpoint_cleanup);
+    SELECT * INTO a FROM public.vm_resource_thread_cleanup_authorities WHERE cleanup_admission_id=d.compute_cleanup_admission_id;
+    IF proof IS DISTINCT FROM jsonb_build_object(
+        'version',1,'kind','vm_cleanup_physical_stop','owner_kind','thread','owner_id',a.thread_id,
+        'provision_generation',a.provision_generation,'vm_uid',a.vm_uid,'vmi_uid',a.vmi_uid,
+        'launcher_uid',a.launcher_uid,'pvc_uid',a.pvc_uid,
+        'vm_absent',true,'vmi_absent',true,'launcher_absent',true,
+        'same_generation_replacement',false,'controller_authenticated',true,'pvc_disposition','purged') THEN
+        RAISE EXCEPTION 'VM retained disk purge unproven' USING ERRCODE='23514';
+    END IF;
+    RETURN true;
+END;
+$$;
+
+
+--
+-- Name: vm_cancel_late_adopted_retained_terminal(uuid); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.vm_cancel_late_adopted_retained_terminal(parent_id uuid) RETURNS boolean
+    LANGUAGE sql
+    AS $$
+    SELECT EXISTS (
+        SELECT 1 FROM public.vm_job_cancel_retention_authorities a
+        JOIN public.vm_creation_retries r ON r.request_id=a.creation_request_id
+        JOIN public.vm_workspace_cleanup_admissions c ON c.id=r.creation_admission_id
+        JOIN public.vm_resource_reservations v ON v.id=a.reservation_id
+        JOIN public.vm_pre_ssh_stop_intents i ON i.cleanup_admission_id=a.cleanup_admission_id
+        JOIN public.vm_pre_ssh_stop_proofs p ON p.cleanup_admission_id=a.cleanup_admission_id
+        WHERE a.cleanup_admission_id=parent_id AND a.policy_version=1
+          AND a.job_retained_resume_id IS NULL
+          AND r.owner_kind='job' AND r.job_id=a.job_id
+          AND r.provision_generation=a.provision_generation
+          AND r.state='settled' AND r.reason='creation_adopted'
+          AND r.resolved_at IS NOT NULL AND r.boot_counted
+          AND r.ready_at IS NULL AND r.claim_token IS NULL AND r.claim_expires_at IS NULL
+          AND r.observed_vm_uid=a.vm_uid AND r.observed_pvc_uid=a.pvc_uid
+          AND c.owner_kind='job' AND c.owner_id=a.job_id
+          AND c.completed_at IS NOT NULL AND c.outcome='adopted'
+          AND v.request_id=r.request_id AND v.state='released'
+          AND v.revision=a.reservation_revision
+          AND i.job_id=a.job_id AND i.provision_generation=a.provision_generation
+          AND i.creation_request_id=r.request_id
+          AND i.frozen->>'kind'='vm_job_never_app_ready_retained_stop_candidate_v1'
+          AND p.job_id=a.job_id AND p.provision_generation=a.provision_generation
+          AND p.frozen_digest=i.frozen_digest
+          AND p.terminal_evidence->>'kind'='vm_job_never_app_ready_retained_positive_stop_v1'
+          AND (SELECT count(*) FROM public.vm_creation_effects e
+              WHERE e.request_id=r.request_id)=3
+          AND (SELECT count(DISTINCT e.effect_kind) FROM public.vm_creation_effects e
+              WHERE e.request_id=r.request_id AND e.effect_kind IN ('rootdisk','cloud_init','vm')
+                AND e.state='observed' AND e.resolved_at IS NOT NULL
+                AND e.evidence<>'{}'::jsonb)=3
+          AND NOT EXISTS (SELECT 1 FROM public.vm_creation_effects e
+              WHERE e.request_id=r.request_id AND e.state='issued')
+          AND public.vm_job_cancel_retention_settled(parent_id)
+    );
+$$;
+
+
+--
+-- Name: vm_cancel_late_adopted_source(uuid, uuid, uuid, uuid, uuid, uuid, boolean, boolean); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.vm_cancel_late_adopted_source(owner uuid, generation uuid, expected_vm uuid, pvc uuid, expected_request uuid, retaining_parent uuid DEFAULT NULL::uuid, existing_stop boolean DEFAULT false, receipt_completion boolean DEFAULT false) RETURNS boolean
+    LANGUAGE sql STABLE
+    AS $$
+    SELECT EXISTS (
+        SELECT 1 FROM public.jobs j
+        JOIN public.run_queue q ON q.unit_id=j.id
+        JOIN public.vm_creation_retries r ON r.owner_kind='job' AND r.job_id=j.id
+        JOIN public.vm_resource_reservations v ON v.request_id=r.request_id
+        JOIN public.vm_workspace_cleanup_admissions c ON c.id=r.creation_admission_id
+        WHERE j.id=owner AND j.status='cancelled' AND j.execution_lane='stateless'
+          AND j.parent_job_id IS NULL AND j.assigned_agent_id IS NULL
+          AND COALESCE(j.context->'inherits_parent_workspace','false'::jsonb)='false'::jsonb
+          AND j.context->'_stateless_cancel_cleanup_pending'='true'::jsonb
+          AND j.context->'_vm_job_retained_resume' IS NULL
+          AND j.context->>'_vm_creation_pending'=expected_request::text
+          AND j.context->'vm'->>'creation_request_id'=expected_request::text
+          AND (j.context->'vm'->>'status' IN ('waiting_creation_configuration','retiring_process_zero')
+            OR (j.context->'vm'->>'status'='deleted'
+              AND retaining_parent IS NOT NULL AND existing_stop IS TRUE
+              AND EXISTS (
+                SELECT 1 FROM public.vm_job_cancel_retention_authorities a
+                JOIN public.vm_workspace_cleanup_admissions held
+                  ON held.id=a.cleanup_admission_id
+                JOIN public.vm_pre_ssh_stop_intents i
+                  ON i.cleanup_admission_id=a.cleanup_admission_id
+                JOIN public.vm_pre_ssh_stop_proofs p
+                  ON p.cleanup_admission_id=i.cleanup_admission_id
+                JOIN public.managed_repository_process_zero_receipts z
+                  ON z.owner_kind='job' AND z.owner_id=a.job_id
+                 AND z.scope='vm' AND z.provisioner='vm'
+                 AND z.runtime_incarnation=a.provision_generation::text
+                WHERE a.cleanup_admission_id=retaining_parent
+                  AND a.policy_version=1 AND a.admitted_xact_id<>pg_current_xact_id()
+                  AND a.job_id=owner AND a.provision_generation=generation
+                  AND a.creation_request_id=expected_request
+                  AND a.reservation_id=v.id AND a.reservation_revision=v.revision
+                  AND a.vm_uid=expected_vm AND a.vmi_uid=v.vmi_uid
+                  AND a.launcher_uid=v.launcher_uid AND a.node_uid=v.node_uid
+                  AND a.pvc_uid=pvc
+                  AND held.owner_kind='job' AND held.owner_id=owner
+                  AND held.pvc_uid=pvc AND held.source='job_terminal_vm_release'
+                  AND held.parent_admission_id IS NULL
+                  AND held.request_id=a.cleanup_request_id
+                  AND held.intent_digest=a.intent_digest
+                  AND i.job_id=owner AND i.provision_generation=generation
+                  AND i.creation_request_id=expected_request
+                  AND i.reservation_id=v.id AND i.reservation_revision=v.revision
+                  AND i.vm_uid=expected_vm AND i.vmi_uid=v.vmi_uid
+                  AND i.launcher_uid=v.launcher_uid AND i.pvc_uid=pvc
+                  AND i.node_uid=v.node_uid
+                  AND i.frozen->>'kind'='vm_job_never_app_ready_retained_stop_candidate_v1'
+                  AND i.held_stop_xact_id IS NOT NULL
+                  AND i.held_stop_xact_id<>pg_current_xact_id()
+                  AND p.job_id=owner AND p.provision_generation=generation
+                  AND p.frozen_digest=i.frozen_digest
+                  AND p.terminal_evidence->>'kind'='vm_job_never_app_ready_retained_positive_stop_v1'
+                  AND p.held_stop_xact_id IS NOT NULL
+                  AND p.held_stop_xact_id<>i.held_stop_xact_id
+                  AND p.held_stop_xact_id<>pg_current_xact_id()
+                  AND ((NOT receipt_completion AND
+                    public.vm_job_deleted_retention_replay_allowed(
+                      1,owner,generation,expected_vm,pvc,retaining_parent,
+                      existing_stop,expected_request,v.id,v.revision,
+                      v.vmi_uid,v.launcher_uid,v.node_uid))
+                    OR (receipt_completion AND held.completed_at IS NOT NULL
+                      AND held.outcome='completed'))
+              )))
+          AND j.context->'vm'->>'provision_generation'=generation::text
+          AND j.context->'vm'->>'identity_provision_generation'=generation::text
+          AND j.context->'vm'->'identity_authenticated'='true'::jsonb
+          AND j.context->'vm'->>'vm_uid'=expected_vm::text
+          AND j.context->'vm'->>'rootdisk_pvc_uid'=pvc::text
+          AND COALESCE(j.context->'vm'->'workspace_storage','null'::jsonb)='null'::jsonb
+          AND q.unit_kind='worker_batch' AND q.state='done'
+          AND q.leased_by IS NULL AND q.leased_until IS NULL
+          AND r.request_id=expected_request AND r.provision_generation=generation
+          AND r.state='settled' AND r.reason='creation_adopted'
+          AND r.resolved_at IS NOT NULL AND r.boot_counted
+          AND r.ready_at IS NULL AND r.claim_token IS NULL AND r.claim_expires_at IS NULL
+          AND r.observed_vm_uid=expected_vm AND r.observed_pvc_uid=pvc
+          AND COALESCE(r.canonical_request->'workspace_storage','null'::jsonb)='null'::jsonb
+          AND c.owner_kind='job' AND c.owner_id=owner
+          AND c.completed_at IS NOT NULL AND c.outcome='adopted'
+          AND v.state IN ('reserved','active','warm','teardown')
+          AND NOT EXISTS (SELECT 1 FROM public.vm_creation_retries later
+              WHERE later.owner_kind='job' AND later.job_id=owner
+                AND (later.created_at,later.request_id)>(r.created_at,r.request_id))
+          AND (SELECT count(*) FROM public.vm_creation_effects e
+               WHERE e.request_id=r.request_id)=3
+          AND (SELECT count(DISTINCT e.effect_kind) FROM public.vm_creation_effects e
+               WHERE e.request_id=r.request_id AND e.effect_kind IN ('rootdisk','cloud_init','vm')
+                 AND e.state='observed' AND e.resolved_at IS NOT NULL
+                 AND e.evidence<>'{}'::jsonb)=3
+          AND EXISTS (SELECT 1 FROM public.vm_creation_effects e
+              WHERE e.request_id=r.request_id AND e.effect_kind='rootdisk'
+                AND e.evidence->>'pvc_uid'=pvc::text)
+          AND EXISTS (SELECT 1 FROM public.vm_creation_effects e
+              WHERE e.request_id=r.request_id AND e.effect_kind='vm'
+                AND e.evidence->>'uid'=expected_vm::text
+                AND e.evidence->>'pvc_uid'=pvc::text)
+          AND NOT EXISTS (SELECT 1 FROM public.vm_creation_effects e
+              WHERE e.request_id=r.request_id AND e.state='issued')
+    );
+$$;
+
+
+--
 -- Name: vm_ide_heartbeat_cleanup_is_authorized(text, uuid, jsonb, jsonb); Type: FUNCTION; Schema: public; Owner: -
 --
 
@@ -13944,6 +23798,1805 @@ CREATE FUNCTION public.vm_ide_heartbeat_cleanup_is_authorized(requested_owner_ki
             AND receipt.owner_id = requested_owner_id AND receipt.scope = 'ide'
       )
     , FALSE);
+$_$;
+
+
+--
+-- Name: vm_pre_ssh_stop_intents; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.vm_pre_ssh_stop_intents (
+    cleanup_admission_id uuid NOT NULL,
+    job_id uuid NOT NULL,
+    provision_generation uuid NOT NULL,
+    creation_request_id uuid NOT NULL,
+    reservation_id uuid NOT NULL,
+    reservation_revision bigint NOT NULL,
+    vm_uid uuid NOT NULL,
+    vmi_uid uuid NOT NULL,
+    launcher_uid uuid NOT NULL,
+    pvc_uid uuid NOT NULL,
+    node_uid uuid NOT NULL,
+    cleanup_intent_digest text NOT NULL,
+    frozen jsonb NOT NULL,
+    frozen_digest text NOT NULL,
+    admitted_at timestamp with time zone DEFAULT clock_timestamp() NOT NULL,
+    retention_preflight jsonb,
+    initial_ready_xact_id xid8,
+    prior_zero_receipt_id uuid,
+    held_stop_xact_id xid8,
+    CONSTRAINT vm_pre_ssh_stop_intents_cleanup_intent_digest_check CHECK ((cleanup_intent_digest ~ '^sha256:[0-9a-f]{64}$'::text)),
+    CONSTRAINT vm_pre_ssh_stop_intents_frozen_check CHECK ((jsonb_typeof(frozen) = 'object'::text)),
+    CONSTRAINT vm_pre_ssh_stop_intents_frozen_digest_check CHECK ((frozen_digest ~ '^sha256:[0-9a-f]{64}$'::text)),
+    CONSTRAINT vm_pre_ssh_stop_intents_reservation_revision_check CHECK ((reservation_revision > 0))
+);
+
+
+--
+-- Name: vm_initial_ready_stop_authorized(public.vm_pre_ssh_stop_intents); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.vm_initial_ready_stop_authorized(i public.vm_pre_ssh_stop_intents) RETURNS boolean
+    LANGUAGE plpgsql
+    AS $_$
+DECLARE a public.vm_job_cancel_retention_authorities%ROWTYPE;
+        f jsonb := i.frozen;
+        item jsonb;
+BEGIN
+    PERFORM pg_advisory_xact_lock(hashtextextended('workspace-recovery:job:'||i.job_id,0));
+    PERFORM pg_advisory_xact_lock(hashtextextended('workspace-recovery-pvc:'||i.pvc_uid,0));
+    PERFORM 1 FROM public.run_queue WHERE unit_id=i.job_id FOR UPDATE;
+    PERFORM 1 FROM public.jobs WHERE id=i.job_id FOR UPDATE;
+    PERFORM 1 FROM public.vm_workspace_cleanup_admissions WHERE id=i.cleanup_admission_id FOR UPDATE;
+    SELECT * INTO a FROM public.vm_job_cancel_retention_authorities
+     WHERE cleanup_admission_id=i.cleanup_admission_id;
+    IF (a.policy_version IS NULL OR a.policy_version NOT IN (3,4)) OR a.admitted_xact_id=pg_current_xact_id()
+       OR a.job_retained_resume_id IS NOT NULL OR i.retention_preflight IS DISTINCT FROM a.ready_retention_preflight
+       OR i.job_id IS DISTINCT FROM a.job_id OR i.provision_generation IS DISTINCT FROM a.provision_generation
+       OR i.creation_request_id IS DISTINCT FROM a.creation_request_id
+       OR i.reservation_id IS DISTINCT FROM a.reservation_id OR i.reservation_revision IS DISTINCT FROM a.reservation_revision
+       OR i.vm_uid IS DISTINCT FROM a.vm_uid OR i.vmi_uid IS DISTINCT FROM a.vmi_uid
+       OR i.launcher_uid IS DISTINCT FROM a.launcher_uid OR i.pvc_uid IS DISTINCT FROM a.pvc_uid
+       OR i.node_uid IS DISTINCT FROM a.node_uid OR i.cleanup_intent_digest IS DISTINCT FROM a.intent_digest
+       OR f->>'kind' IS DISTINCT FROM 'vm_initial_ready_positive_stop_candidate_v1'
+       OR (SELECT array_agg(k ORDER BY k COLLATE "C") FROM jsonb_object_keys(f) k) IS DISTINCT FROM ARRAY['cleanup_admission_id','cleanup_intent_digest','cleanup_request_id','containers','job_id','kind','launcher_name','launcher_resource_version','launcher_uid','namespace','node_name','node_uid','provision_generation','pvc_uid','vm_generation','vm_name','vm_resource_version','vm_uid','vmi_uid']
+       OR f->>'cleanup_admission_id' IS DISTINCT FROM a.cleanup_admission_id::text
+       OR f->>'cleanup_request_id' IS DISTINCT FROM a.cleanup_request_id::text
+       OR f->>'cleanup_intent_digest' IS DISTINCT FROM a.intent_digest
+       OR f->>'namespace' IS DISTINCT FROM a.namespace
+       OR f->>'vm_name' IS DISTINCT FROM 'agent-vm-'||a.job_id
+       OR jsonb_typeof(f->'containers') IS DISTINCT FROM 'array'
+       OR jsonb_array_length(f->'containers')=0
+       OR NOT EXISTS(SELECT 1 FROM jsonb_array_elements(f->'containers') c WHERE c->>'kind'='regular' AND c->>'name'='compute')
+       OR (SELECT count(*)<>count(DISTINCT c->>'name') FROM jsonb_array_elements(f->'containers') c) THEN
+        RETURN false;
+    END IF;
+    FOREACH item IN ARRAY ARRAY[f->'launcher_name',f->'node_name',f->'vm_resource_version',f->'launcher_resource_version'] LOOP
+        IF jsonb_typeof(item) IS DISTINCT FROM 'string' OR item#>>'{}' !~ '^[^[:space:]]+$' THEN RETURN false; END IF;
+    END LOOP;
+    FOR item IN SELECT value FROM jsonb_array_elements(f->'containers') LOOP
+        IF (SELECT array_agg(k ORDER BY k COLLATE "C") FROM jsonb_object_keys(item) k) IS DISTINCT FROM ARRAY['container_id','kind','name']
+           OR item->>'kind' NOT IN ('regular','init')
+           OR jsonb_typeof(item->'name') IS DISTINCT FROM 'string' OR item->>'name' !~ '^[^[:space:]]+$'
+           OR jsonb_typeof(item->'container_id') IS DISTINCT FROM 'string' OR item->>'container_id' !~ '^[^[:space:]]+$' THEN
+            RETURN false;
+        END IF;
+    END LOOP;
+    RETURN public.validate_vm_job_cancel_retention(i.cleanup_admission_id,false);
+END;
+$_$;
+
+
+--
+-- Name: vm_job_cancel_retention_candidate(uuid, uuid, uuid, uuid, uuid, uuid, boolean); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.vm_job_cancel_retention_candidate(owner uuid, generation uuid, expected_vm uuid, pvc uuid, old_parent uuid, retaining_parent uuid DEFAULT NULL::uuid, existing_stop boolean DEFAULT false) RETURNS jsonb
+    LANGUAGE plpgsql
+    AS $_$
+DECLARE j public.jobs%ROWTYPE;
+        r public.vm_creation_retries%ROWTYPE;
+        v public.vm_resource_reservations%ROWTYPE;
+        q public.run_queue%ROWTYPE;
+        vm jsonb;
+BEGIN
+    SELECT * INTO q FROM public.run_queue WHERE unit_id=owner FOR UPDATE;
+    SELECT * INTO j FROM public.jobs WHERE id=owner FOR UPDATE;
+    SELECT * INTO r FROM public.vm_creation_retries
+     WHERE owner_kind='job' AND job_id=owner AND provision_generation=generation FOR UPDATE;
+    SELECT * INTO v FROM public.vm_resource_reservations WHERE request_id=r.request_id FOR UPDATE;
+    vm := j.context->'vm';
+    IF j.id IS NULL OR j.status IS DISTINCT FROM 'cancelled'
+       OR j.execution_lane IS DISTINCT FROM 'stateless'
+       OR j.assigned_agent_id IS NOT NULL OR j.parent_job_id IS NOT NULL
+       OR COALESCE(j.context->'inherits_parent_workspace','false'::jsonb) IS DISTINCT FROM 'false'::jsonb
+       OR j.context->'_stateless_cancel_cleanup_pending' IS DISTINCT FROM 'true'::jsonb
+       OR jsonb_typeof(vm) IS DISTINCT FROM 'object'
+       OR vm->>'provision_generation' IS DISTINCT FROM generation::text
+       OR vm->>'vm_uid' IS DISTINCT FROM expected_vm::text
+       OR vm->>'rootdisk_pvc_uid' IS DISTINCT FROM pvc::text
+       OR vm->>'status' IS NULL OR (vm->>'status' NOT IN ('created','ssh_pending','ssh_unreachable','retiring_process_zero')
+           AND NOT (vm->>'status'='waiting_creation_configuration' AND r.state='settled'
+               AND public.vm_cancel_late_adopted_source(owner,generation,expected_vm,pvc,r.request_id))
+           AND NOT (vm->>'status'='deleted' AND v.state='teardown'
+               AND public.vm_job_deleted_retention_replay_allowed(1,owner,generation,
+                   expected_vm,pvc,retaining_parent,existing_stop,r.request_id,
+                   v.id,v.revision,v.vmi_uid,v.launcher_uid,v.node_uid)))
+       OR vm->'identity_authenticated' IS DISTINCT FROM 'true'::jsonb
+       OR vm->>'identity_provision_generation' IS DISTINCT FROM generation::text
+       OR COALESCE(vm->'workspace_storage','null'::jsonb)<>'null'::jsonb
+       OR COALESCE(r.canonical_request->'workspace_storage','null'::jsonb)<>'null'::jsonb
+       OR q.unit_id IS NULL OR q.unit_kind IS DISTINCT FROM 'worker_batch'
+       OR q.state IS DISTINCT FROM 'done' OR q.leased_by IS NOT NULL OR q.leased_until IS NOT NULL
+       OR r.request_id IS NULL OR (r.state IS DISTINCT FROM 'succeeded'
+           AND NOT (r.state='settled'
+               AND public.vm_cancel_late_adopted_source(owner,generation,expected_vm,pvc,
+                   r.request_id,retaining_parent,existing_stop)))
+       OR r.reason IS DISTINCT FROM 'creation_adopted' OR r.resolved_at IS NULL
+       OR r.ready_at IS NOT NULL OR r.claim_token IS NOT NULL OR r.claim_expires_at IS NOT NULL
+       OR r.observed_vm_uid IS DISTINCT FROM expected_vm OR r.observed_pvc_uid IS DISTINCT FROM pvc
+       OR r.controller_configuration->'version' IS DISTINCT FROM '3'::jsonb
+       OR r.controller_configuration->'persistent_rootdisk' IS DISTINCT FROM 'true'::jsonb
+       OR r.controller_configuration->'headscale_enabled' IS DISTINCT FROM 'false'::jsonb
+       OR v.id IS NULL OR v.resource_version IS DISTINCT FROM 2
+       OR v.state NOT IN ('reserved','active','warm','teardown')
+       OR v.vm_uid IS DISTINCT FROM expected_vm OR v.vmi_uid IS NULL OR v.launcher_uid IS NULL
+       OR vm->>'vmi_uid' IS DISTINCT FROM v.vmi_uid::text
+       OR (vm->>'active_pod_uid' IS NOT NULL AND vm->>'active_pod_uid'<>v.launcher_uid::text)
+       OR r.controller_configuration->'resource_admission'->>'cluster_id' IS DISTINCT FROM v.cluster_id
+       OR COALESCE(r.controller_configuration->>'namespace','') !~ '^[a-z0-9]([-a-z0-9]*[a-z0-9])?$'
+       OR length(r.controller_configuration->>'namespace')>63
+       OR EXISTS (SELECT 1 FROM public.srw_execution_specs e
+           JOIN public.srw_execution_workspace_bindings b ON b.execution_id=e.id
+           WHERE e.work_kind='Job' AND e.work_id=owner)
+       OR EXISTS (SELECT 1 FROM public.srw_workspace_instances w WHERE w.pvc_uid=pvc::text)
+       OR EXISTS (SELECT 1 FROM public.vm_resource_recovery_successors s WHERE s.reservation_id=v.id)
+       OR EXISTS (SELECT 1 FROM public.vm_creation_retries later WHERE later.owner_kind='job'
+           AND later.job_id=owner AND (later.created_at,later.request_id)>(r.created_at,r.request_id))
+       OR EXISTS (SELECT 1 FROM public.vm_creation_effects e WHERE e.request_id=r.request_id AND e.state='issued')
+       OR EXISTS (SELECT 1 FROM public.agents a WHERE a.current_job_id=owner AND a.status NOT IN ('offline','failed','completed'))
+       OR EXISTS (SELECT 1 FROM public.jobs other WHERE other.id<>owner AND
+           (other.context->'vm'->>'inherited_from_job_id'=owner::text
+            OR other.context->'vm'->>'rootdisk_pvc_uid'=pvc::text))
+       OR EXISTS (SELECT 1 FROM public.vm_idle_access_leases l WHERE l.owner_kind='job' AND l.owner_id=owner
+           AND l.closed_at IS NULL AND l.expires_at>clock_timestamp())
+       OR EXISTS (SELECT 1 FROM public.vm_remote_operation_leases l WHERE l.owner_kind='job' AND l.owner_id=owner
+           AND l.settled_at IS NULL AND l.lease_expires_at>clock_timestamp())
+       OR EXISTS (SELECT 1 FROM public.vm_idle_operations o WHERE o.owner_kind='job' AND o.owner_id=owner AND o.closed_at IS NULL)
+       OR EXISTS (SELECT 1 FROM public.vm_workspace_recoveries h WHERE h.resolved_at IS NULL
+           AND ((h.owner_kind='job' AND h.owner_id=owner) OR h.root_pvc_uid=pvc))
+       OR EXISTS (SELECT 1 FROM public.vm_workspace_recovery_retention_pins p WHERE p.pvc_uid=pvc AND p.released_at IS NULL)
+       OR EXISTS (SELECT 1 FROM public.vm_workspace_recovery_jobs h WHERE h.job_id=owner AND h.resolved_at IS NULL)
+       OR EXISTS (SELECT 1 FROM public.vm_workspace_cleanup_admissions c
+           WHERE ((c.owner_kind='job' AND c.owner_id=owner) OR c.pvc_uid=pvc)
+           AND c.completed_at IS NULL AND c.id IS DISTINCT FROM old_parent
+           AND c.id IS DISTINCT FROM retaining_parent)
+       OR EXISTS (SELECT 1 FROM public.vm_workspace_cleanup_admissions c WHERE
+           c.parent_admission_id=old_parent OR c.parent_admission_id=retaining_parent)
+       OR EXISTS (SELECT 1 FROM public.vm_pre_ssh_stop_intents i WHERE i.job_id=owner
+           AND i.provision_generation=generation
+           AND (NOT existing_stop OR i.cleanup_admission_id IS DISTINCT FROM retaining_parent))
+       OR (NOT existing_stop AND EXISTS (SELECT 1 FROM public.managed_repository_process_zero_receipts z
+           WHERE z.owner_kind='job' AND z.owner_id=owner AND z.scope='vm'
+           AND z.provisioner='vm' AND z.runtime_incarnation=generation::text))
+       OR (j.context ? '_job_terminal_vm_cleanup' AND (
+           j.context->'_job_terminal_vm_cleanup'->>'version'='1'
+           AND j.context->'_job_terminal_vm_cleanup'->>'provision_generation'=generation::text
+           AND j.context->'_job_terminal_vm_cleanup'->>'admission_id'
+               IN (old_parent::text,retaining_parent::text)) IS DISTINCT FROM true) THEN
+        RETURN NULL;
+    END IF;
+    RETURN jsonb_build_object('creation_request_id',r.request_id,'reservation_id',v.id,
+        'reservation_revision',v.revision,'vmi_uid',v.vmi_uid,'launcher_uid',v.launcher_uid,
+        'node_uid',v.node_uid,'namespace',r.controller_configuration->>'namespace','cluster_id',v.cluster_id);
+END;
+$_$;
+
+
+--
+-- Name: vm_job_cancel_retention_cleanup_allowed(text, uuid, uuid, text, uuid, text, uuid, boolean); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.vm_job_cancel_retention_cleanup_allowed(kind text, owner uuid, pvc uuid, cleanup_source text, cleanup_request uuid, digest text, parent_id uuid, provisional boolean DEFAULT false) RETURNS boolean
+    LANGUAGE plpgsql
+    AS $$
+DECLARE j public.jobs%ROWTYPE;
+        expected_digest text;
+        original_request uuid;
+BEGIN
+    IF public.vm_job_pinned_cancel_retention_pending(kind,owner,pvc) THEN
+        SELECT * INTO j FROM public.jobs WHERE id=owner;
+        IF kind='job' AND j.execution_lane='pinned' AND j.status='cancelled'
+           AND j.context->'_job_terminal_vm_cleanup'->>'retention_policy'='4'
+           AND pvc::text=j.context->'vm'->>'rootdisk_pvc_uid'
+           AND parent_id IS NULL AND cleanup_source='job_terminal_vm_release' THEN
+            expected_digest := 'sha256:'||encode(sha256(convert_to(format(
+                '{"owner_id":"%s","owner_kind":"job","provision_generation":"%s","purge_disk":false,"pvc_uid":"%s","resource":"vm_workspace","source":"job_terminal_vm_release","vm_uid":"%s"}',
+                owner,j.context->'vm'->>'provision_generation',pvc,
+                j.context->'vm'->>'vm_uid'),'UTF8')),'hex');
+            original_request := public.uuid_generate_v5(public.uuid_ns_url(),
+                'vm-workspace-cleanup:job_terminal_vm_release:job:'||owner||':'||
+                (j.context->'vm'->>'provision_generation')||':'||
+                (j.context->'vm'->>'vm_uid')||':'||pvc);
+            IF digest=expected_digest AND (cleanup_request=original_request
+                OR EXISTS(SELECT 1 FROM public.vm_workspace_cleanup_admissions old
+                    WHERE old.owner_kind='job' AND old.owner_id=owner
+                      AND old.pvc_uid=pvc AND old.source='job_terminal_vm_release'
+                      AND old.outcome='superseded_by_retention'
+                      AND cleanup_request=public.uuid_generate_v5(public.uuid_ns_url(),
+                          'vm-job-cancel-retain-v1:'||old.id||':'||digest))) THEN
+                -- Admission is provisional until the deferred parent check
+                -- sees the exact policy-4 authority in this transaction.
+                RETURN true;
+            END IF;
+            -- The exact old purge parent can be superseded in this transaction;
+            -- the deferred check requires its matching immutable successor.
+            IF provisional AND cleanup_request=original_request
+               AND EXISTS(SELECT 1 FROM public.vm_workspace_cleanup_admissions old
+                   WHERE old.owner_kind='job' AND old.owner_id=owner
+                     AND old.pvc_uid=pvc AND old.request_id=cleanup_request
+                     AND old.intent_digest=digest
+                     AND old.outcome='superseded_by_retention'
+                     AND NOT EXISTS(SELECT 1 FROM public.vm_workspace_cleanup_admissions child
+                         WHERE child.parent_admission_id=old.id)) THEN RETURN true; END IF;
+        END IF;
+        IF kind='job' AND cleanup_source='public_vm_delete' AND parent_id IS NULL
+           AND EXISTS(SELECT 1 FROM public.vm_job_cancel_retention_authorities a
+               WHERE a.job_id=owner AND a.pvc_uid=pvc
+                 AND public.vm_job_cancel_retention_settled(a.cleanup_admission_id)) THEN
+            RETURN public.vm_job_cancel_retention_cleanup_allowed_v1(
+                kind,owner,pvc,cleanup_source,cleanup_request,digest,parent_id,provisional);
+        END IF;
+        RETURN false;
+    END IF;
+    IF kind='job' AND cleanup_source='terminal_checkpoint_prune'
+       AND EXISTS(SELECT 1 FROM public.vm_job_retained_resumes WHERE job_id=owner)
+       AND NOT public.vm_job_retained_terminal_is_current(owner) THEN RETURN false; END IF;
+    IF kind='job' AND cleanup_source='job_terminal_vm_release' AND parent_id IS NULL
+       AND public.vm_job_retained_stop_allowed(owner,pvc,cleanup_request,digest) THEN RETURN true; END IF;
+    IF kind='job' AND cleanup_source='controller_vm_create' AND parent_id IS NULL
+       AND public.vm_job_retained_creation_allowed(owner,pvc,cleanup_request,digest) THEN RETURN true; END IF;
+    RETURN public.vm_job_cancel_retention_cleanup_allowed_v1(
+        kind,owner,pvc,cleanup_source,cleanup_request,digest,parent_id,provisional);
+END;
+$$;
+
+
+--
+-- Name: vm_job_cancel_retention_cleanup_allowed_v1(text, uuid, uuid, text, uuid, text, uuid, boolean); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.vm_job_cancel_retention_cleanup_allowed_v1(kind text, owner uuid, pvc uuid, cleanup_source text, cleanup_request uuid, digest text, parent_id uuid, provisional boolean DEFAULT false) RETURNS boolean
+    LANGUAGE plpgsql
+    AS $$
+DECLARE a public.vm_job_cancel_retention_authorities%ROWTYPE;
+        purge_id uuid;
+BEGIN
+    FOR a IN SELECT * FROM public.vm_job_cancel_retention_authorities r
+        WHERE ((kind='job' AND r.job_id=owner) OR r.pvc_uid=pvc)
+          AND NOT public.vm_job_cancel_retention_discharged(r.cleanup_admission_id)
+    LOOP
+        IF kind='job' AND owner=a.job_id AND pvc=a.pvc_uid AND parent_id IS NULL
+           AND cleanup_source='job_terminal_vm_release' AND cleanup_request=a.cleanup_request_id
+           AND digest=a.intent_digest THEN CONTINUE; END IF;
+        IF kind='job' AND owner=a.job_id AND pvc IS NULL AND parent_id IS NULL
+           AND cleanup_source='terminal_checkpoint_prune'
+           AND digest='sha256:'||encode(sha256(convert_to(format(
+               '{"mode":"delete_thread","resource":"checkpoint_thread","thread_id":"%s"}',owner),'UTF8')),'hex')
+           AND public.vm_job_cancel_retention_settled(a.cleanup_admission_id) THEN CONTINUE; END IF;
+        IF kind IS DISTINCT FROM 'job' OR owner IS DISTINCT FROM a.job_id OR pvc IS DISTINCT FROM a.pvc_uid THEN
+            RETURN false;
+        END IF;
+        IF cleanup_source='public_vm_delete' AND parent_id IS NULL THEN
+            SELECT id INTO purge_id FROM public.vm_workspace_cleanup_admissions
+             WHERE owner_kind=kind AND owner_id=owner AND request_id=cleanup_request AND intent_digest=digest;
+            -- Insert ordering only: the deferred trigger requires full typed
+            -- authority before commit. Python additionally requires the private bootstrap.
+            IF provisional THEN CONTINUE; END IF;
+        ELSIF cleanup_source='controller_rootdisk_delete' AND parent_id IS NOT NULL THEN
+            purge_id := parent_id;
+        ELSE RETURN false;
+        END IF;
+        IF purge_id IS NULL OR NOT EXISTS (
+            SELECT 1 FROM public.vm_job_retained_disk_purge_authorities d
+            JOIN public.vm_job_retained_disk_purge_predecessors p USING (cleanup_admission_id)
+            WHERE d.cleanup_admission_id=purge_id AND d.job_id=a.job_id AND d.pvc_uid=a.pvc_uid
+              AND p.old_cleanup_admission_id=a.cleanup_admission_id
+              -- MVCC makes a visible row from another top-level transaction
+              -- committed. Same-transaction chains never issue physical work,
+              -- even after one or more nested savepoints have been released.
+              AND (cleanup_source<>'controller_rootdisk_delete'
+                   OR (d.admitted_xact_id<>pg_current_xact_id()
+                       AND p.admitted_xact_id<>pg_current_xact_id()))
+        ) THEN RETURN false; END IF;
+        PERFORM public.validate_vm_job_retained_disk_purge(purge_id,false);
+    END LOOP;
+    RETURN true;
+END;
+$$;
+
+
+--
+-- Name: vm_job_cancel_retention_discharged(uuid); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.vm_job_cancel_retention_discharged(retention_id uuid) RETURNS boolean
+    LANGUAGE sql STABLE
+    AS $$
+    SELECT EXISTS (
+        SELECT 1 FROM public.vm_job_cancel_retention_authorities a
+        JOIN public.vm_job_retained_disk_purge_predecessors link ON link.old_cleanup_admission_id=a.cleanup_admission_id
+        JOIN public.vm_job_retained_disk_purge_authorities d ON d.cleanup_admission_id=link.cleanup_admission_id
+        JOIN public.vm_job_retained_disk_purge_receipts receipt ON receipt.cleanup_admission_id=d.cleanup_admission_id
+        JOIN public.vm_workspace_cleanup_admissions c ON c.id=d.cleanup_admission_id
+        WHERE a.cleanup_admission_id=retention_id AND d.job_id=a.job_id AND d.pvc_uid=a.pvc_uid
+          AND c.completed_at IS NOT NULL AND c.outcome='completed'
+          AND receipt.chain_digest=public.vm_job_retained_disk_purge_chain_digest(c.id)
+    );
+$$;
+
+
+--
+-- Name: vm_job_cancel_retention_settled(uuid); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.vm_job_cancel_retention_settled(parent_id uuid) RETURNS boolean
+    LANGUAGE plpgsql
+    AS $$
+DECLARE a public.vm_job_cancel_retention_authorities%ROWTYPE;
+        c public.vm_workspace_cleanup_admissions%ROWTYPE;
+        i public.vm_pre_ssh_stop_intents%ROWTYPE;
+        s public.vm_resource_cleanup_stop_receipts%ROWTYPE;
+        v public.vm_resource_reservations%ROWTYPE;
+        retained jsonb;
+        expected jsonb;
+        digest text;
+        preflight jsonb;
+BEGIN
+    SELECT * INTO a FROM public.vm_job_cancel_retention_authorities WHERE cleanup_admission_id=parent_id;
+    IF a.cleanup_admission_id IS NULL THEN RETURN false; END IF;
+    PERFORM public.validate_vm_job_cancel_retention(parent_id,false);
+    SELECT * INTO c FROM public.vm_workspace_cleanup_admissions WHERE id=parent_id;
+    SELECT * INTO i FROM public.vm_pre_ssh_stop_intents WHERE cleanup_admission_id=parent_id;
+    SELECT * INTO s FROM public.vm_resource_cleanup_stop_receipts WHERE cleanup_admission_id=parent_id;
+    SELECT * INTO v FROM public.vm_resource_reservations WHERE id=a.reservation_id;
+    preflight := COALESCE(a.ready_retention_preflight,i.retention_preflight);
+    retained := jsonb_build_object('version',1,'kind','vm_retained_rootdisk_v1',
+        'namespace',a.namespace,'owner_kind','job','owner_id',a.job_id,
+        'pvc_name',preflight->>'pvc_name','pvc_uid',a.pvc_uid,
+        'dv_uid',preflight->>'dv_uid','ownership','standalone_dv',
+        'deleting',false,'no_consumers',true);
+    expected := jsonb_build_object('version',1,'kind','vm_cleanup_physical_stop',
+        'job_id',a.job_id,'provision_generation',a.provision_generation,'vm_uid',a.vm_uid,
+        'vmi_uid',a.vmi_uid,'launcher_uid',a.launcher_uid,'pvc_uid',a.pvc_uid,
+        'vm_absent',true,'vmi_absent',true,'launcher_absent',true,'same_generation_replacement',false,
+        'pvc_disposition','retained','controller_authenticated',true,'retained_rootdisk',retained);
+    digest := 'sha256:'||encode(sha256(convert_to(expected::text,'UTF8')),'hex');
+    RETURN c.completed_at IS NOT NULL AND c.outcome='completed'
+       AND preflight IS NOT NULL AND (a.ready_retention_preflight IS NOT NULL OR i.cleanup_admission_id IS NOT NULL)
+       AND s.cleanup_admission_id IS NOT NULL AND s.stop_evidence=expected
+       AND s.reservation_id=a.reservation_id AND s.request_id=a.creation_request_id
+       AND s.intent_digest=a.intent_digest AND s.job_id=a.job_id
+       AND s.provision_generation=a.provision_generation
+       AND s.vm_uid=a.vm_uid AND s.vmi_uid=a.vmi_uid AND s.launcher_uid=a.launcher_uid AND s.pvc_uid=a.pvc_uid
+       AND v.state='released' AND v.request_id=a.creation_request_id AND v.revision=a.reservation_revision
+       AND v.release_evidence=jsonb_build_object('kind','exact_cleanup_compute_absent',
+           'cleanup_admission_id',parent_id,'job_id',a.job_id,'provision_generation',a.provision_generation,
+           'vm_uid',a.vm_uid,'vmi_uid',a.vmi_uid,'launcher_uid',a.launcher_uid,
+           'pvc_uid',a.pvc_uid,'stop_evidence_digest',digest)
+       AND (a.ready_retention_preflight IS NOT NULL OR EXISTS (SELECT 1 FROM public.vm_pre_ssh_stop_proofs p WHERE p.cleanup_admission_id=parent_id
+           AND p.job_id=a.job_id AND p.provision_generation=a.provision_generation AND p.frozen_digest=i.frozen_digest))
+       AND EXISTS (SELECT 1 FROM public.managed_repository_process_zero_receipts z
+           WHERE z.owner_kind='job' AND z.owner_id=a.job_id AND z.scope='vm' AND z.provisioner='vm'
+           AND z.runtime_incarnation=a.provision_generation::text)
+       AND (i.frozen->>'kind' IS DISTINCT FROM 'vm_job_never_app_ready_retained_stop_candidate_v1'
+           OR (i.held_stop_xact_id IS NOT NULL
+               AND EXISTS (SELECT 1 FROM public.vm_pre_ssh_stop_proofs p
+                   WHERE p.cleanup_admission_id=parent_id
+                     AND p.held_stop_xact_id IS NOT NULL
+                     AND p.held_stop_xact_id<>i.held_stop_xact_id
+                     AND p.frozen_digest=i.frozen_digest
+                     AND p.terminal_evidence->>'kind'='vm_job_never_app_ready_retained_positive_stop_v1')
+               AND EXISTS (SELECT 1 FROM public.managed_repository_process_zero_receipts z
+                   WHERE z.owner_kind='job' AND z.owner_id=a.job_id AND z.scope='vm'
+                     AND z.provisioner='vm' AND z.runtime_incarnation=a.provision_generation::text
+                     AND (i.prior_zero_receipt_id IS NULL OR z.id=i.prior_zero_receipt_id))));
+END;
+$$;
+
+
+--
+-- Name: vm_job_deleted_retention_replay_allowed(integer, uuid, uuid, uuid, uuid, uuid, boolean, uuid, uuid, bigint, uuid, uuid, uuid); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.vm_job_deleted_retention_replay_allowed(p_policy integer, p_owner uuid, p_generation uuid, p_expected_vm uuid, p_pvc uuid, p_retaining_parent uuid, p_existing_stop boolean, p_creation_request uuid, p_reservation uuid, p_reservation_revision bigint, p_vmi uuid, p_launcher uuid, p_node uuid) RETURNS boolean
+    LANGUAGE sql
+    AS $$
+    SELECT p_existing_stop IS TRUE AND p_retaining_parent IS NOT NULL
+       AND EXISTS (
+           SELECT 1 FROM public.vm_job_cancel_retention_authorities a
+           JOIN public.vm_workspace_cleanup_admissions c
+             ON c.id=a.cleanup_admission_id
+           JOIN public.managed_repository_process_zero_receipts z
+             ON z.owner_kind='job' AND z.owner_id=a.job_id
+            AND z.scope='vm' AND z.provisioner='vm'
+            AND z.runtime_incarnation=a.provision_generation::text
+           WHERE a.cleanup_admission_id=p_retaining_parent
+             AND a.admitted_xact_id<>pg_current_xact_id()
+             AND a.policy_version=p_policy AND a.job_id=p_owner
+             AND a.provision_generation=p_generation
+             AND a.creation_request_id=p_creation_request
+             AND a.reservation_id=p_reservation
+             AND a.reservation_revision=p_reservation_revision
+             AND a.vm_uid=p_expected_vm AND a.vmi_uid=p_vmi
+             AND a.launcher_uid=p_launcher AND a.node_uid=p_node
+             AND a.pvc_uid=p_pvc
+             AND c.owner_kind='job' AND c.owner_id=p_owner
+             AND c.pvc_uid=p_pvc AND c.source='job_terminal_vm_release'
+             AND c.parent_admission_id IS NULL
+             AND c.request_id=a.cleanup_request_id
+             AND c.intent_digest=a.intent_digest
+             AND c.completed_at IS NULL AND c.outcome IS NULL
+       );
+$$;
+
+
+--
+-- Name: vm_job_execution_chain_evidence(uuid); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.vm_job_execution_chain_evidence(source_execution uuid) RETURNS jsonb
+    LANGUAGE sql STABLE
+    AS $$
+    SELECT jsonb_build_object(
+        'execution_id',source_execution,
+        'revision_generations',COALESCE((
+            SELECT jsonb_agg(generation ORDER BY generation)
+            FROM public.srw_execution_spec_revisions
+            WHERE execution_id=source_execution), '[]'::jsonb),
+        'attempts',COALESCE((
+            SELECT jsonb_agg(attempt ORDER BY attempt)
+            FROM public.srw_execution_attempts
+            WHERE execution_id=source_execution), '[]'::jsonb),
+        'workspace_instance_ids',COALESCE((
+            SELECT jsonb_agg(instance_id ORDER BY instance_id)
+            FROM public.srw_execution_workspace_bindings
+            WHERE execution_id=source_execution), '[]'::jsonb)
+    );
+$$;
+
+
+--
+-- Name: vm_job_initial_ready_retention_candidate(uuid, uuid, uuid, uuid, uuid, uuid, boolean); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.vm_job_initial_ready_retention_candidate(owner uuid, generation uuid, expected_vm uuid, pvc uuid, old_parent uuid, retaining_parent uuid DEFAULT NULL::uuid, existing_stop boolean DEFAULT false) RETURNS jsonb
+    LANGUAGE plpgsql
+    AS $_$
+DECLARE j public.jobs%ROWTYPE;
+        r public.vm_creation_retries%ROWTYPE;
+        v public.vm_resource_reservations%ROWTYPE;
+        q public.run_queue%ROWTYPE;
+        vm jsonb;
+BEGIN
+    SELECT * INTO q FROM public.run_queue WHERE unit_id=owner FOR UPDATE;
+    SELECT * INTO j FROM public.jobs WHERE id=owner FOR UPDATE;
+    SELECT * INTO r FROM public.vm_creation_retries
+     WHERE owner_kind='job' AND job_id=owner AND provision_generation=generation FOR UPDATE;
+    SELECT * INTO v FROM public.vm_resource_reservations WHERE request_id=r.request_id FOR UPDATE;
+    vm := j.context->'vm';
+    IF j.id IS NULL OR j.status IS DISTINCT FROM 'cancelled'
+       OR j.context->'_stateless_cancel_cleanup_pending' IS DISTINCT FROM 'true'::jsonb
+       OR j.execution_lane IS DISTINCT FROM 'stateless'
+       OR j.assigned_agent_id IS NOT NULL OR j.parent_job_id IS NOT NULL
+       OR COALESCE(j.context->'inherits_parent_workspace','false'::jsonb) IS DISTINCT FROM 'false'::jsonb
+       OR jsonb_typeof(vm) IS DISTINCT FROM 'object'
+       OR vm->>'provision_generation' IS DISTINCT FROM generation::text
+       OR vm->>'vm_uid' IS DISTINCT FROM expected_vm::text
+       OR vm->>'rootdisk_pvc_uid' IS DISTINCT FROM pvc::text
+       OR vm->>'status' IS NULL OR (vm->>'status' NOT IN ('created','ssh_pending','ssh_unreachable','ready','retiring_process_zero')
+           AND NOT (vm->>'status'='deleted' AND v.state='teardown'
+               AND public.vm_job_deleted_retention_replay_allowed(3,owner,generation,
+                   expected_vm,pvc,retaining_parent,existing_stop,r.request_id,
+                   v.id,v.revision,v.vmi_uid,v.launcher_uid,v.node_uid)))
+       OR vm->'identity_authenticated' IS DISTINCT FROM 'true'::jsonb
+       OR vm->>'identity_provision_generation' IS DISTINCT FROM generation::text
+       OR COALESCE(vm->'workspace_storage','null'::jsonb)<>'null'::jsonb
+       OR COALESCE(r.canonical_request->'workspace_storage','null'::jsonb)<>'null'::jsonb
+       OR q.unit_id IS NULL OR q.unit_kind IS DISTINCT FROM 'worker_batch'
+       OR q.state IS DISTINCT FROM 'done' OR q.leased_by IS NOT NULL OR q.leased_until IS NOT NULL
+       OR r.request_id IS NULL OR r.state IS DISTINCT FROM 'succeeded'
+       OR vm->>'creation_request_id' IS DISTINCT FROM r.request_id::text
+       OR r.reason IS DISTINCT FROM 'creation_adopted' OR r.resolved_at IS NULL
+       OR r.claim_token IS NOT NULL OR r.claim_expires_at IS NOT NULL
+       OR r.ready_at IS NULL OR r.job_retained_resume_id IS NOT NULL
+       OR (old_parent IS NOT NULL AND NOT EXISTS (
+           SELECT 1 FROM public.vm_workspace_cleanup_admissions old
+           WHERE old.id=old_parent AND r.ready_at<=old.admitted_at))
+       OR j.context ? '_vm_job_retained_resume'
+       OR r.observed_vm_uid IS DISTINCT FROM expected_vm OR r.observed_pvc_uid IS DISTINCT FROM pvc
+       OR r.controller_configuration->'version' IS DISTINCT FROM '3'::jsonb
+       OR r.controller_configuration->'persistent_rootdisk' IS DISTINCT FROM 'true'::jsonb
+       OR r.controller_configuration->'headscale_enabled' IS DISTINCT FROM 'false'::jsonb
+       OR v.id IS NULL OR v.resource_version IS DISTINCT FROM 2
+       OR v.state NOT IN ('reserved','active','warm','teardown')
+       OR v.vm_uid IS DISTINCT FROM expected_vm OR v.vmi_uid IS NULL OR v.launcher_uid IS NULL
+       OR vm->>'vmi_uid' IS DISTINCT FROM v.vmi_uid::text
+       OR (vm->>'active_pod_uid' IS NOT NULL AND vm->>'active_pod_uid'<>v.launcher_uid::text)
+       OR r.controller_configuration->'resource_admission'->>'cluster_id' IS DISTINCT FROM v.cluster_id
+       OR COALESCE(r.controller_configuration->>'namespace','') !~ '^[a-z0-9]([-a-z0-9]*[a-z0-9])?$'
+       OR length(r.controller_configuration->>'namespace')>63
+       OR EXISTS (SELECT 1 FROM public.srw_execution_specs e
+           JOIN public.srw_execution_workspace_bindings b ON b.execution_id=e.id
+           WHERE e.work_kind='Job' AND e.work_id=owner)
+       OR EXISTS (SELECT 1 FROM public.srw_workspace_instances w WHERE w.pvc_uid=pvc::text)
+       OR EXISTS (SELECT 1 FROM public.vm_resource_recovery_successors s WHERE s.reservation_id=v.id)
+       OR EXISTS (SELECT 1 FROM public.vm_creation_retries later WHERE later.owner_kind='job'
+           AND later.job_id=owner AND (later.created_at,later.request_id)>(r.created_at,r.request_id))
+       OR EXISTS (SELECT 1 FROM public.vm_creation_effects e WHERE e.request_id=r.request_id AND e.state='issued')
+       OR EXISTS (SELECT 1 FROM public.agents a WHERE a.current_job_id=owner AND a.status NOT IN ('offline','failed','completed'))
+       OR EXISTS (SELECT 1 FROM public.jobs other WHERE other.id<>owner AND
+           (other.context->'vm'->>'inherited_from_job_id'=owner::text
+            OR other.context->'vm'->>'rootdisk_pvc_uid'=pvc::text))
+       OR EXISTS (SELECT 1 FROM public.vm_idle_access_leases l WHERE l.owner_kind='job' AND l.owner_id=owner
+           AND l.closed_at IS NULL AND l.expires_at>clock_timestamp())
+       OR EXISTS (SELECT 1 FROM public.vm_remote_operation_leases l WHERE l.owner_kind='job' AND l.owner_id=owner
+           AND l.settled_at IS NULL AND l.lease_expires_at>clock_timestamp())
+       OR EXISTS (SELECT 1 FROM public.vm_idle_operations o WHERE o.owner_kind='job' AND o.owner_id=owner AND o.closed_at IS NULL)
+       OR EXISTS (SELECT 1 FROM public.vm_workspace_recoveries h WHERE h.resolved_at IS NULL
+           AND ((h.owner_kind='job' AND h.owner_id=owner) OR h.root_pvc_uid=pvc))
+       OR EXISTS (SELECT 1 FROM public.vm_workspace_recovery_retention_pins p WHERE p.pvc_uid=pvc AND p.released_at IS NULL)
+       OR EXISTS (SELECT 1 FROM public.vm_workspace_recovery_jobs h WHERE h.job_id=owner AND h.resolved_at IS NULL)
+       OR EXISTS (SELECT 1 FROM public.vm_workspace_cleanup_admissions c
+           WHERE ((c.owner_kind='job' AND c.owner_id=owner) OR c.pvc_uid=pvc)
+           AND c.completed_at IS NULL AND c.id IS DISTINCT FROM old_parent
+           AND c.id IS DISTINCT FROM retaining_parent)
+       OR EXISTS (SELECT 1 FROM public.vm_workspace_cleanup_admissions c WHERE
+           c.parent_admission_id=old_parent OR c.parent_admission_id=retaining_parent)
+       OR EXISTS (SELECT 1 FROM public.vm_pre_ssh_stop_intents i WHERE i.job_id=owner
+           AND i.provision_generation=generation
+           AND (NOT existing_stop OR i.cleanup_admission_id IS DISTINCT FROM retaining_parent))
+       OR (NOT existing_stop AND EXISTS (SELECT 1 FROM public.managed_repository_process_zero_receipts z
+           WHERE z.owner_kind='job' AND z.owner_id=owner AND z.scope='vm'
+           AND z.provisioner='vm' AND z.runtime_incarnation=generation::text))
+       OR (j.context ? '_job_terminal_vm_cleanup' AND (
+           j.context->'_job_terminal_vm_cleanup'->>'version'='1'
+           AND j.context->'_job_terminal_vm_cleanup'->>'provision_generation'=generation::text
+           AND j.context->'_job_terminal_vm_cleanup'->>'admission_id'
+               IN (old_parent::text,retaining_parent::text)) IS DISTINCT FROM true) THEN
+        RETURN NULL;
+    END IF;
+    RETURN jsonb_build_object('creation_request_id',r.request_id,'reservation_id',v.id,
+        'reservation_revision',v.revision,'vmi_uid',v.vmi_uid,'launcher_uid',v.launcher_uid,
+        'node_uid',v.node_uid,'namespace',r.controller_configuration->>'namespace','cluster_id',v.cluster_id);
+END;
+$_$;
+
+
+--
+-- Name: vm_job_logical_final_history_safe(uuid, uuid); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.vm_job_logical_final_history_safe(requested_job uuid, requested_generation uuid) RETURNS boolean
+    LANGUAGE sql STABLE
+    AS $$
+    SELECT EXISTS (
+        SELECT 1 FROM public.jobs j
+        JOIN public.vm_creation_retries source
+          ON source.owner_kind='job' AND source.job_id=j.id
+         AND source.provision_generation=requested_generation
+        WHERE j.id=requested_job AND j.parent_job_id IS NULL
+          AND j.assigned_agent_id IS NULL
+          AND NOT EXISTS (SELECT 1 FROM public.worker_batch_attempts batch
+              WHERE batch.job_id=j.id AND (batch.bundle_authorized_at IS NOT NULL
+                  OR batch.authority_digest IS NOT NULL)
+                AND NOT EXISTS (
+                    SELECT 1 FROM public.vm_job_worker_delivery_bindings binding
+                    JOIN public.vm_creation_retries physical
+                      ON physical.request_id=binding.request_id
+                    WHERE binding.job_id=batch.job_id
+                      AND binding.lease_token=batch.lease_token
+                      AND binding.authority_digest=batch.authority_digest
+                      AND batch.bundle_authorized_at IS NOT NULL
+                      AND binding.provision_generation<>requested_generation
+                      AND physical.owner_kind='job' AND physical.job_id=j.id
+                      AND physical.provision_generation=binding.provision_generation
+                      AND physical.state='succeeded'
+                      AND physical.observed_vm_uid=binding.vm_uid
+                      AND physical.observed_pvc_uid=binding.pvc_uid
+                ))
+          AND NOT EXISTS (SELECT 1 FROM public.srw_execution_workspace_bindings b
+              JOIN public.srw_execution_specs x ON x.id=b.execution_id
+              WHERE x.work_kind='Job' AND x.work_id=j.id)
+          AND NOT EXISTS (SELECT 1 FROM public.srw_execution_attempts attempt
+              JOIN public.srw_execution_specs x ON x.id=attempt.execution_id
+              WHERE x.work_kind='Job' AND x.work_id=j.id)
+          AND NOT EXISTS (SELECT 1 FROM public.srw_workspace_instances instance
+              WHERE instance.owner_id=j.id OR instance.execution_id IN (
+                  SELECT x.id FROM public.srw_execution_specs x
+                  WHERE x.work_kind='Job' AND x.work_id=j.id))
+          AND NOT EXISTS (SELECT 1 FROM public.managed_repository_workspace_creation_reservations reservation
+              WHERE reservation.owner_kind='job' AND reservation.owner_id=j.id)
+          AND NOT EXISTS (SELECT 1 FROM public.managed_repository_workspace_cleanup_intents cleanup
+              WHERE cleanup.owner_kind='job' AND cleanup.owner_id=j.id)
+          AND NOT EXISTS (SELECT 1 FROM public.vm_creation_retries alien
+              WHERE alien.job_id=j.id AND alien.owner_kind<>'job')
+          AND NOT EXISTS (
+              SELECT 1 FROM public.managed_repository_process_zero_receipts p
+              WHERE p.owner_kind='job' AND p.owner_id=j.id
+                AND NOT (
+                    p.scope='vm' AND p.provisioner='vm'
+                    AND p.runtime_incarnation<>requested_generation::text
+                    AND EXISTS (
+                        SELECT 1 FROM public.vm_creation_retries physical
+                        WHERE physical.owner_kind='job' AND physical.job_id=j.id
+                          AND physical.provision_generation::text=p.runtime_incarnation
+                          AND physical.state='succeeded'
+                    )
+                )
+          )
+    );
+$$;
+
+
+--
+-- Name: vm_job_pinned_cancel_retention_pending(text, uuid, uuid); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.vm_job_pinned_cancel_retention_pending(kind text, owner uuid, pvc uuid) RETURNS boolean
+    LANGUAGE sql STABLE
+    AS $$
+    SELECT EXISTS(SELECT 1 FROM public.jobs j
+        WHERE j.execution_lane='pinned' AND j.status='cancelled'
+          AND j.context->'_job_terminal_vm_cleanup'->>'retention_policy'='4'
+          AND ((kind='job' AND j.id=owner)
+               OR (pvc IS NOT NULL AND j.context->'vm'->>'rootdisk_pvc_uid'=pvc::text)));
+$$;
+
+
+--
+-- Name: vm_job_pinned_ready_retention_candidate(uuid, uuid, uuid, uuid, uuid, uuid, boolean); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.vm_job_pinned_ready_retention_candidate(owner uuid, generation uuid, expected_vm uuid, pvc uuid, old_parent uuid, retaining_parent uuid DEFAULT NULL::uuid, existing_stop boolean DEFAULT false) RETURNS jsonb
+    LANGUAGE plpgsql
+    AS $_$
+DECLARE j public.jobs%ROWTYPE;
+        r public.vm_creation_retries%ROWTYPE;
+        v public.vm_resource_reservations%ROWTYPE;
+        q public.run_queue%ROWTYPE;
+        vm jsonb;
+BEGIN
+    SELECT * INTO q FROM public.run_queue WHERE unit_id=owner FOR UPDATE;
+    SELECT * INTO j FROM public.jobs WHERE id=owner FOR UPDATE;
+    SELECT * INTO r FROM public.vm_creation_retries
+     WHERE owner_kind='job' AND job_id=owner AND provision_generation=generation FOR UPDATE;
+    SELECT * INTO v FROM public.vm_resource_reservations WHERE request_id=r.request_id FOR UPDATE;
+    vm := j.context->'vm';
+    IF j.id IS NULL OR j.status IS DISTINCT FROM 'cancelled'
+       OR j.context->'_job_terminal_vm_cleanup'->>'retention_policy' IS DISTINCT FROM '4'
+       OR j.context->'_job_terminal_vm_cleanup'->>'source' IS DISTINCT FROM 'cancel'
+       OR j.context->'_job_terminal_vm_cleanup'->>'version' IS DISTINCT FROM '1'
+       OR j.execution_lane IS DISTINCT FROM 'pinned'
+       OR j.assigned_agent_id IS NOT NULL OR j.parent_job_id IS NOT NULL
+       OR COALESCE(j.context->'inherits_parent_workspace','false'::jsonb) IS DISTINCT FROM 'false'::jsonb
+       OR jsonb_typeof(vm) IS DISTINCT FROM 'object'
+       OR vm->>'provision_generation' IS DISTINCT FROM generation::text
+       OR vm->>'vm_uid' IS DISTINCT FROM expected_vm::text
+       OR vm->>'rootdisk_pvc_uid' IS DISTINCT FROM pvc::text
+       OR vm->>'status' IS NULL OR (vm->>'status' NOT IN ('created','ssh_pending','ssh_unreachable','ready','retiring_process_zero')
+           AND NOT (vm->>'status'='deleted' AND v.state='teardown'
+               AND public.vm_job_deleted_retention_replay_allowed(4,owner,generation,
+                   expected_vm,pvc,retaining_parent,existing_stop,r.request_id,
+                   v.id,v.revision,v.vmi_uid,v.launcher_uid,v.node_uid)))
+       OR vm->'identity_authenticated' IS DISTINCT FROM 'true'::jsonb
+       OR vm->>'identity_provision_generation' IS DISTINCT FROM generation::text
+       OR COALESCE(vm->'workspace_storage','null'::jsonb)<>'null'::jsonb
+       OR COALESCE(r.canonical_request->'workspace_storage','null'::jsonb)<>'null'::jsonb
+       OR (q.unit_id IS NOT NULL AND (q.state IS DISTINCT FROM 'done'
+           OR q.leased_by IS NOT NULL OR q.leased_until IS NOT NULL))
+       OR r.request_id IS NULL OR r.state IS DISTINCT FROM 'succeeded'
+       OR vm->>'creation_request_id' IS DISTINCT FROM r.request_id::text
+       OR r.reason IS DISTINCT FROM 'creation_adopted' OR r.resolved_at IS NULL
+       OR r.claim_token IS NOT NULL OR r.claim_expires_at IS NOT NULL
+       OR r.ready_at IS NULL OR r.job_retained_resume_id IS NOT NULL
+       OR (old_parent IS NOT NULL AND NOT EXISTS (
+           SELECT 1 FROM public.vm_workspace_cleanup_admissions old
+           WHERE old.id=old_parent AND r.ready_at<=old.admitted_at))
+       OR j.context ? '_vm_job_retained_resume'
+       OR r.observed_vm_uid IS DISTINCT FROM expected_vm OR r.observed_pvc_uid IS DISTINCT FROM pvc
+       OR r.controller_configuration->'version' IS DISTINCT FROM '3'::jsonb
+       OR r.controller_configuration->'persistent_rootdisk' IS DISTINCT FROM 'true'::jsonb
+       OR r.controller_configuration->'headscale_enabled' IS DISTINCT FROM 'false'::jsonb
+       OR v.id IS NULL OR v.resource_version IS DISTINCT FROM 2
+       OR v.state NOT IN ('reserved','active','warm','teardown')
+       OR v.vm_uid IS DISTINCT FROM expected_vm OR v.vmi_uid IS NULL OR v.launcher_uid IS NULL
+       OR vm->>'vmi_uid' IS DISTINCT FROM v.vmi_uid::text
+       OR (vm->>'active_pod_uid' IS NOT NULL AND vm->>'active_pod_uid'<>v.launcher_uid::text)
+       OR r.controller_configuration->'resource_admission'->>'cluster_id' IS DISTINCT FROM v.cluster_id
+       OR COALESCE(r.controller_configuration->>'namespace','') !~ '^[a-z0-9]([-a-z0-9]*[a-z0-9])?$'
+       OR length(r.controller_configuration->>'namespace')>63
+       OR EXISTS (SELECT 1 FROM public.srw_execution_specs e
+           JOIN public.srw_execution_workspace_bindings b ON b.execution_id=e.id
+           WHERE e.work_kind='Job' AND e.work_id=owner)
+       OR EXISTS (SELECT 1 FROM public.srw_workspace_instances w WHERE w.pvc_uid=pvc::text)
+       OR EXISTS (SELECT 1 FROM public.vm_resource_recovery_successors s WHERE s.reservation_id=v.id)
+       OR EXISTS (SELECT 1 FROM public.vm_creation_retries later WHERE later.owner_kind='job'
+           AND later.job_id=owner AND (later.created_at,later.request_id)>(r.created_at,r.request_id))
+       OR EXISTS (SELECT 1 FROM public.vm_creation_effects e WHERE e.request_id=r.request_id AND e.state='issued')
+       OR EXISTS (SELECT 1 FROM public.agents a WHERE a.current_job_id=owner AND a.status NOT IN ('offline','failed','completed'))
+       OR EXISTS (SELECT 1 FROM public.jobs other WHERE other.id<>owner AND
+           (other.context->'vm'->>'inherited_from_job_id'=owner::text
+            OR other.context->'vm'->>'rootdisk_pvc_uid'=pvc::text))
+       OR EXISTS (SELECT 1 FROM public.vm_idle_access_leases l WHERE l.owner_kind='job' AND l.owner_id=owner
+           AND l.closed_at IS NULL AND l.expires_at>clock_timestamp())
+       OR EXISTS (SELECT 1 FROM public.vm_remote_operation_leases l WHERE l.owner_kind='job' AND l.owner_id=owner
+           AND l.settled_at IS NULL AND l.lease_expires_at>clock_timestamp())
+       OR EXISTS (SELECT 1 FROM public.vm_idle_operations o WHERE o.owner_kind='job' AND o.owner_id=owner AND o.closed_at IS NULL)
+       OR EXISTS (SELECT 1 FROM public.vm_workspace_recoveries h WHERE h.resolved_at IS NULL
+           AND ((h.owner_kind='job' AND h.owner_id=owner) OR h.root_pvc_uid=pvc))
+       OR EXISTS (SELECT 1 FROM public.vm_workspace_recovery_retention_pins p WHERE p.pvc_uid=pvc AND p.released_at IS NULL)
+       OR EXISTS (SELECT 1 FROM public.vm_workspace_recovery_jobs h WHERE h.job_id=owner AND h.resolved_at IS NULL)
+       OR EXISTS (SELECT 1 FROM public.vm_workspace_cleanup_admissions c
+           WHERE ((c.owner_kind='job' AND c.owner_id=owner) OR c.pvc_uid=pvc)
+           AND c.completed_at IS NULL AND c.id IS DISTINCT FROM old_parent
+           AND c.id IS DISTINCT FROM retaining_parent)
+       OR EXISTS (SELECT 1 FROM public.vm_workspace_cleanup_admissions c WHERE
+           c.parent_admission_id=old_parent OR c.parent_admission_id=retaining_parent)
+       OR EXISTS (SELECT 1 FROM public.vm_pre_ssh_stop_intents i WHERE i.job_id=owner
+           AND i.provision_generation=generation
+           AND (NOT existing_stop OR i.cleanup_admission_id IS DISTINCT FROM retaining_parent))
+       OR (NOT existing_stop AND EXISTS (SELECT 1 FROM public.managed_repository_process_zero_receipts z
+           WHERE z.owner_kind='job' AND z.owner_id=owner AND z.scope='vm'
+           AND z.provisioner='vm' AND z.runtime_incarnation=generation::text))
+       OR j.context->'_job_terminal_vm_cleanup'->>'provision_generation' IS DISTINCT FROM generation::text
+       OR (j.context->'_job_terminal_vm_cleanup'->>'admission_id' IS NOT NULL
+           AND j.context->'_job_terminal_vm_cleanup'->>'admission_id' IS DISTINCT FROM old_parent::text
+           AND j.context->'_job_terminal_vm_cleanup'->>'admission_id' IS DISTINCT FROM retaining_parent::text) THEN
+        RETURN NULL;
+    END IF;
+    RETURN jsonb_build_object('creation_request_id',r.request_id,'reservation_id',v.id,
+        'reservation_revision',v.revision,'vmi_uid',v.vmi_uid,'launcher_uid',v.launcher_uid,
+        'node_uid',v.node_uid,'namespace',r.controller_configuration->>'namespace','cluster_id',v.cluster_id);
+END;
+$_$;
+
+
+--
+-- Name: vm_job_repository_settlement_receipts; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.vm_job_repository_settlement_receipts (
+    cleanup_admission_id uuid NOT NULL,
+    request_id uuid NOT NULL,
+    job_id uuid NOT NULL,
+    provision_generation uuid NOT NULL,
+    authority_id uuid,
+    creation_intent_id uuid,
+    repository_owner text,
+    repo_name text,
+    project_id uuid,
+    forge_key_id bigint,
+    key_generation bigint,
+    intent_generation bigint,
+    clean_repo_url text,
+    captured_at timestamp with time zone DEFAULT transaction_timestamp() NOT NULL,
+    CONSTRAINT vm_job_repository_settlement_receipts_check CHECK ((((authority_id IS NULL) AND (creation_intent_id IS NULL) AND (repository_owner IS NULL) AND (repo_name IS NULL) AND (project_id IS NULL) AND (forge_key_id IS NULL) AND (key_generation IS NULL) AND (intent_generation IS NULL) AND (clean_repo_url IS NULL)) OR ((authority_id IS NOT NULL) AND (creation_intent_id IS NOT NULL) AND (repository_owner IS NOT NULL) AND (repo_name IS NOT NULL) AND (forge_key_id IS NOT NULL) AND (forge_key_id > 0) AND (key_generation IS NOT NULL) AND (key_generation > 0) AND (intent_generation IS NOT NULL) AND (intent_generation > 0) AND (clean_repo_url IS NOT NULL))))
+);
+
+
+--
+-- Name: vm_job_repository_receipt_pair(public.vm_job_repository_settlement_receipts); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.vm_job_repository_receipt_pair(receipt public.vm_job_repository_settlement_receipts) RETURNS jsonb
+    LANGUAGE sql STABLE
+    AS $$
+    SELECT CASE WHEN receipt.authority_id IS NULL THEN NULL ELSE
+        jsonb_build_object(
+            'authority_id',receipt.authority_id,
+            'creation_intent_id',receipt.creation_intent_id,
+            'repository_owner',receipt.repository_owner,
+            'repo_name',receipt.repo_name,
+            'project_id',receipt.project_id,
+            'forge_key_id',receipt.forge_key_id,
+            'key_generation',receipt.key_generation,
+            'intent_generation',receipt.intent_generation,
+            'clean_repo_url',receipt.clean_repo_url)
+    END;
+$$;
+
+
+--
+-- Name: vm_job_retained_creation_allowed(uuid, uuid, uuid, text); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.vm_job_retained_creation_allowed(owner uuid, pvc uuid, request uuid, digest text) RETURNS boolean
+    LANGUAGE sql STABLE
+    AS $$
+    SELECT EXISTS(SELECT 1 FROM public.vm_creation_retries r
+        JOIN public.vm_job_retained_resumes op ON op.id=r.job_retained_resume_id
+        JOIN public.jobs j ON j.id=op.job_id
+        WHERE r.owner_kind='job' AND r.job_id=owner AND op.job_id=owner AND r.expected_pvc_uid=pvc AND op.pvc_uid=pvc
+          AND r.request_id=op.request_id AND r.provision_generation=op.provision_generation
+          AND r.origin='resume' AND r.job_retained_resume_admitted_xact_id<>pg_current_xact_id()
+          AND op.admitted_xact_id<>pg_current_xact_id()
+          AND request=public.uuid_generate_v5(public.uuid_ns_url(),'vm-create:'||r.request_id)
+          AND digest=public.vm_job_retained_creation_digest(r)
+          AND j.context->>'_vm_job_retained_resume'=op.id::text
+          AND j.context->'vm'->>'provision_generation'=op.provision_generation::text
+          AND NOT EXISTS(SELECT 1 FROM public.vm_job_retained_resume_terminals terminal WHERE terminal.resume_id=op.id)
+          AND public.vm_job_cancel_retention_settled(op.physical_cleanup_admission_id)
+          AND NOT public.vm_job_cancel_retention_discharged(op.root_retention_admission_id)
+          AND NOT EXISTS(SELECT 1 FROM public.vm_job_cancel_retention_authorities a
+              WHERE ((a.job_id=owner) OR a.pvc_uid=pvc)
+                AND NOT public.vm_job_cancel_retention_discharged(a.cleanup_admission_id)
+                AND (a.job_id<>owner OR a.pvc_uid<>pvc OR (
+                    a.cleanup_admission_id<>op.root_retention_admission_id AND NOT EXISTS(
+                        SELECT 1 FROM public.vm_job_retained_resumes ancestor
+                        WHERE ancestor.root_retention_admission_id=op.root_retention_admission_id
+                          AND ancestor.request_id=a.creation_request_id))))
+          AND ((r.state='reconciling' AND r.claim_token IS NOT NULL AND r.claim_expires_at>clock_timestamp()
+                AND j.status IN ('created','paused','failed') AND j.assigned_agent_id IS NULL
+                AND NOT j.context ?| ARRAY['_stateless_cancel_cleanup_pending','_stateless_delete_pending','_completion_control_claim'])
+              OR EXISTS(SELECT 1 FROM public.vm_workspace_cleanup_admissions c
+                  WHERE c.id=r.creation_admission_id AND c.owner_kind='job' AND c.owner_id=owner
+                    AND c.pvc_uid=pvc AND c.source='controller_vm_create'
+                    AND c.request_id=request AND c.intent_digest=digest)));
+$$;
+
+
+--
+-- Name: vm_job_retained_creation_digest(public.vm_creation_retries); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.vm_job_retained_creation_digest(source public.vm_creation_retries) RETURNS text
+    LANGUAGE sql IMMUTABLE
+    AS $$
+    SELECT 'sha256:'||encode(sha256(convert_to(format(
+        '{"controller_configuration_digest":"%s","expected_pvc_uid":"%s","job_id":"%s","provision_generation":"%s","request_digest":"%s","request_id":"%s","source":"controller_vm_create"}',
+        source.controller_configuration_digest,source.expected_pvc_uid,source.job_id,
+        source.provision_generation,source.request_digest,source.request_id),'UTF8')),'hex');
+$$;
+
+
+--
+-- Name: vm_job_retained_disk_physical_chain_digest(uuid); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.vm_job_retained_disk_physical_chain_digest(parent_id uuid) RETURNS text
+    LANGUAGE sql STABLE
+    AS $$
+    SELECT 'sha256:'||encode(sha256(convert_to(COALESCE((
+        SELECT jsonb_agg(jsonb_build_object(
+            'request_id',p.source_request_id,
+            'cleanup_admission_id',p.old_cleanup_admission_id,
+            'reservation_id',p.reservation_id,
+            'reservation_revision',p.reservation_revision,
+            'stop_evidence_digest',p.stop_evidence_digest)
+            ORDER BY p.source_request_id)::text
+        FROM public.vm_job_retained_disk_purge_predecessors p
+        WHERE p.cleanup_admission_id=parent_id),'[]'),'UTF8')),'hex');
+$$;
+
+
+--
+-- Name: vm_job_retained_disk_purge_candidate(uuid); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.vm_job_retained_disk_purge_candidate(parent_id uuid) RETURNS jsonb
+    LANGUAGE plpgsql
+    AS $$
+DECLARE d public.vm_job_retained_disk_purge_authorities%ROWTYPE;
+        r public.vm_creation_retries%ROWTYPE;
+        binding jsonb;
+BEGIN
+    PERFORM public.validate_vm_job_retained_disk_purge(parent_id,false);
+    SELECT * INTO d FROM public.vm_job_retained_disk_purge_authorities
+      WHERE cleanup_admission_id=parent_id;
+    SELECT * INTO r FROM public.vm_creation_retries
+      WHERE request_id=d.final_request_id;
+    binding := r.canonical_request->'workspace_storage';
+    RETURN jsonb_build_object(
+        'owner_kind','job','job_id',d.job_id,
+        'provision_generation',d.provision_generation,
+        'vm_uid',d.vm_uid,'vmi_uid',d.vmi_uid,'launcher_uid',d.launcher_uid,
+        'pvc_uid',d.pvc_uid,'purge_disk',true,'binding_kind',d.binding_kind,
+        'controller_scope',jsonb_build_object(
+            'version',1,'namespace',r.controller_configuration->>'namespace',
+            'cluster_id',r.controller_configuration->'resource_admission'->>'cluster_id'),
+        'workspace_storage',CASE WHEN d.binding_kind='bound' THEN binding ELSE NULL END,
+        'captured_workspace_storage',CASE WHEN d.binding_kind='bound'
+            THEN jsonb_set(binding,'{pvc_uid}',to_jsonb(d.pvc_uid::text),true)
+            ELSE NULL END,
+        'chain_digest',public.vm_job_retained_disk_purge_chain_digest(parent_id));
+END;
+$$;
+
+
+--
+-- Name: vm_job_retained_disk_purge_chain_digest(uuid); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.vm_job_retained_disk_purge_chain_digest(parent_id uuid) RETURNS text
+    LANGUAGE sql STABLE
+    AS $$
+    SELECT CASE WHEN d.retained_terminal_id IS NULL THEN public.vm_job_retained_disk_physical_chain_digest(parent_id)
+        ELSE 'sha256:'||encode(sha256(convert_to(jsonb_build_object('version',2,
+            'physical_chain_digest',public.vm_job_retained_disk_physical_chain_digest(parent_id),
+            'terminal_tail',public.vm_job_retained_purge_tail(parent_id,false))::text,'UTF8')),'hex') END
+    FROM public.vm_job_retained_disk_purge_authorities d WHERE d.cleanup_admission_id=parent_id;
+$$;
+
+
+--
+-- Name: vm_job_retained_inherited_rootdisk(public.vm_creation_retries); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.vm_job_retained_inherited_rootdisk(retry public.vm_creation_retries) RETURNS jsonb
+    LANGUAGE plpgsql STABLE
+    AS $$
+DECLARE op public.vm_job_retained_resumes%ROWTYPE;
+        a public.vm_job_cancel_retention_authorities%ROWTYPE;
+        p jsonb;
+BEGIN
+    IF retry.owner_kind IS DISTINCT FROM 'job' OR retry.job_retained_resume_id IS NULL
+       OR retry.expected_pvc_uid IS NULL OR retry.observed_vm_uid IS NOT NULL OR retry.boot_counted
+       OR retry.ready_at IS NOT NULL OR retry.state NOT IN ('cancel_requested','settled')
+       OR (retry.observed_pvc_uid IS NOT NULL AND retry.observed_pvc_uid<>retry.expected_pvc_uid)
+       OR COALESCE(retry.canonical_request->'workspace_storage','null'::jsonb)<>'null'::jsonb
+       OR EXISTS(SELECT 1 FROM public.vm_creation_effects e WHERE e.request_id=retry.request_id
+           AND (e.state='issued' OR (e.effect_kind IN ('vm','rootdisk') AND e.state<>'rejected'))) THEN RETURN NULL; END IF;
+    SELECT * INTO op FROM public.vm_job_retained_resumes WHERE id=retry.job_retained_resume_id;
+    SELECT * INTO a FROM public.vm_job_cancel_retention_authorities WHERE cleanup_admission_id=op.physical_cleanup_admission_id;
+    IF op.id IS NULL OR op.job_id IS DISTINCT FROM retry.job_id OR op.request_id IS DISTINCT FROM retry.request_id
+       OR op.provision_generation IS DISTINCT FROM retry.provision_generation OR op.pvc_uid IS DISTINCT FROM retry.expected_pvc_uid
+       OR op.admitted_xact_id=pg_current_xact_id() OR retry.job_retained_resume_admitted_xact_id=pg_current_xact_id()
+       OR a.job_id IS DISTINCT FROM op.job_id OR a.pvc_uid IS DISTINCT FROM op.pvc_uid
+       OR a.namespace IS DISTINCT FROM retry.controller_configuration->>'namespace'
+       OR a.cluster_id IS DISTINCT FROM retry.controller_configuration->'resource_admission'->>'cluster_id'
+       OR NOT public.vm_job_cancel_retention_settled(a.cleanup_admission_id) THEN RETURN NULL; END IF;
+    IF retry.state='cancel_requested' THEN
+        IF public.vm_job_cancel_retention_discharged(op.root_retention_admission_id)
+           OR EXISTS(SELECT 1 FROM public.vm_job_retained_resume_terminals t WHERE t.resume_id=op.id)
+           OR NOT EXISTS(SELECT 1 FROM public.jobs j JOIN public.run_queue q ON q.unit_id=j.id
+               WHERE j.id=op.job_id AND j.status='cancelled' AND j.assigned_agent_id IS NULL
+                 AND j.context->>'_vm_job_retained_resume'=op.id::text
+                 AND j.context->'vm'->>'provision_generation'=op.provision_generation::text
+                 AND q.state='done' AND q.leased_by IS NULL AND q.leased_until IS NULL)
+           OR EXISTS(SELECT 1 FROM public.vm_creation_retries later WHERE later.owner_kind='job' AND later.job_id=op.job_id
+               AND (later.created_at,later.request_id)>(retry.created_at,retry.request_id)) THEN RETURN NULL; END IF;
+    ELSIF retry.reason IS DISTINCT FROM 'creation_disposed' OR retry.resolved_at IS NULL THEN RETURN NULL;
+    END IF;
+    p := COALESCE(a.ready_retention_preflight,(SELECT i.retention_preflight FROM public.vm_pre_ssh_stop_intents i
+        WHERE i.cleanup_admission_id=a.cleanup_admission_id));
+    IF p IS NULL OR p->>'dv_uid' IS NULL OR p->>'pvc_name' IS NULL THEN RETURN NULL; END IF;
+    RETURN jsonb_build_object('name',p->>'pvc_name','namespace',a.namespace,'uid',p->>'dv_uid','pvc_uid',a.pvc_uid);
+END;
+$$;
+
+
+--
+-- Name: vm_job_retained_kept_evidence(uuid); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.vm_job_retained_kept_evidence(operation_id uuid) RETURNS jsonb
+    LANGUAGE plpgsql
+    AS $$
+DECLARE op public.vm_job_retained_resumes%ROWTYPE;
+        a public.vm_job_cancel_retention_authorities%ROWTYPE;
+        j public.jobs%ROWTYPE;
+BEGIN
+    SELECT * INTO op FROM public.vm_job_retained_resumes WHERE id=operation_id;
+    SELECT * INTO a FROM public.vm_job_cancel_retention_authorities WHERE job_retained_resume_id=operation_id;
+    SELECT * INTO j FROM public.jobs WHERE id=op.job_id;
+    IF op.id IS NULL OR a.cleanup_admission_id IS NULL OR a.policy_version<>2
+       OR j.status IS NULL OR j.status NOT IN ('cancelled','completed','failed') OR j.execution_lane IS DISTINCT FROM 'stateless'
+       OR j.assigned_agent_id IS NOT NULL OR j.parent_job_id IS NOT NULL
+       OR j.context->>'_vm_job_retained_resume' IS DISTINCT FROM op.id::text
+       OR j.context->'vm'->>'provision_generation' IS DISTINCT FROM op.provision_generation::text
+       OR j.context->'vm'->>'vm_uid' IS DISTINCT FROM a.vm_uid::text
+       OR j.context->'vm'->>'rootdisk_pvc_uid' IS DISTINCT FROM a.pvc_uid::text
+       OR j.context->'vm'->>'status' IS DISTINCT FROM 'deleted'
+       OR (j.context ? '_stateless_cancel_cleanup_pending'
+           AND j.context->'_stateless_cancel_cleanup_pending' IS DISTINCT FROM 'true'::jsonb)
+       OR NOT public.vm_job_cancel_retention_settled(a.cleanup_admission_id)
+       OR public.vm_job_cancel_retention_discharged(op.root_retention_admission_id)
+       OR NOT EXISTS(SELECT 1 FROM public.run_queue q WHERE q.unit_id=op.job_id
+           AND q.unit_kind='worker_batch' AND q.state='done' AND q.leased_by IS NULL AND q.leased_until IS NULL)
+       OR EXISTS(SELECT 1 FROM public.vm_creation_retries later WHERE later.owner_kind='job' AND later.job_id=op.job_id
+           AND later.request_id<>op.request_id AND later.created_at>=op.created_at)
+       OR EXISTS(SELECT 1 FROM public.vm_resource_reservations v JOIN public.vm_creation_retries r USING(request_id)
+           WHERE r.owner_kind='job' AND r.job_id=op.job_id AND v.state<>'released')
+       OR EXISTS(SELECT 1 FROM public.vm_creation_effects e JOIN public.vm_creation_retries r USING(request_id)
+           WHERE r.owner_kind='job' AND r.job_id=op.job_id AND e.state='issued') THEN RETURN NULL; END IF;
+    RETURN jsonb_build_object('version',1,'kind','vm_job_retained_resume_kept_compute',
+        'resume_id',op.id,'job_id',op.job_id,'allocated_request_id',op.request_id,
+        'source_request_id',op.request_id,'provision_generation',op.provision_generation,
+        'pvc_uid',op.pvc_uid,'physical_cleanup_admission_id',a.cleanup_admission_id);
+END;
+$$;
+
+
+--
+-- Name: vm_job_retained_noeffect_evidence(uuid); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.vm_job_retained_noeffect_evidence(operation_id uuid) RETURNS jsonb
+    LANGUAGE plpgsql
+    AS $$
+DECLARE op public.vm_job_retained_resumes%ROWTYPE;
+        r public.vm_creation_retries%ROWTYPE;
+        j public.jobs%ROWTYPE;
+BEGIN
+    SELECT * INTO op FROM public.vm_job_retained_resumes WHERE id=operation_id;
+    SELECT * INTO r FROM public.vm_creation_retries WHERE request_id=op.request_id;
+    SELECT * INTO j FROM public.jobs WHERE id=op.job_id;
+    IF op.id IS NULL OR r.job_retained_resume_id IS DISTINCT FROM op.id
+       OR r.owner_kind IS DISTINCT FROM 'job' OR r.job_id IS DISTINCT FROM op.job_id
+       OR r.provision_generation IS DISTINCT FROM op.provision_generation OR r.expected_pvc_uid IS DISTINCT FROM op.pvc_uid
+       OR r.state IS DISTINCT FROM 'settled' OR r.resolved_at IS NULL
+       OR r.reason IS NULL OR r.reason NOT IN ('creation_never_issued','creation_disposed')
+       OR r.ready_at IS NOT NULL OR r.observed_vm_uid IS NOT NULL OR r.boot_counted
+       OR r.claim_token IS NOT NULL OR r.claim_expires_at IS NOT NULL
+       OR j.status IS DISTINCT FROM 'cancelled' OR j.execution_lane IS DISTINCT FROM 'stateless'
+       OR j.assigned_agent_id IS NOT NULL OR j.parent_job_id IS NOT NULL
+       OR j.context->>'_vm_job_retained_resume' IS DISTINCT FROM op.id::text
+       OR j.context->'vm'->>'provision_generation' IS DISTINCT FROM op.provision_generation::text
+       OR j.context->'vm'->'identity_authenticated'='true'::jsonb OR j.context->'vm'->>'vm_uid' IS NOT NULL
+       OR (j.context ? '_stateless_cancel_cleanup_pending'
+           AND j.context->'_stateless_cancel_cleanup_pending' IS DISTINCT FROM 'true'::jsonb)
+       OR NOT public.vm_job_cancel_retention_settled(op.physical_cleanup_admission_id)
+       OR public.vm_job_cancel_retention_discharged(op.root_retention_admission_id)
+       OR NOT EXISTS(SELECT 1 FROM public.run_queue q WHERE q.unit_id=op.job_id
+           AND q.unit_kind='worker_batch' AND q.state='done' AND q.leased_by IS NULL AND q.leased_until IS NULL)
+       OR NOT EXISTS(SELECT 1 FROM public.vm_resource_waiters w WHERE w.request_id=r.request_id AND w.state IN ('released','cancelled'))
+       OR EXISTS(SELECT 1 FROM public.vm_creation_retries later WHERE later.owner_kind='job' AND later.job_id=op.job_id
+           AND later.request_id<>op.request_id AND later.created_at>=op.created_at)
+       OR EXISTS(SELECT 1 FROM public.vm_resource_reservations v JOIN public.vm_creation_retries source USING(request_id)
+           WHERE source.owner_kind='job' AND source.job_id=op.job_id AND v.state<>'released')
+       OR EXISTS(SELECT 1 FROM public.vm_creation_effects e JOIN public.vm_creation_retries source USING(request_id)
+           WHERE source.owner_kind='job' AND source.job_id=op.job_id AND e.state='issued')
+       OR EXISTS(SELECT 1 FROM public.vm_creation_effects e WHERE e.request_id=r.request_id AND e.effect_kind='vm' AND e.state<>'rejected')
+       OR (r.creation_admission_id IS NOT NULL AND NOT EXISTS(SELECT 1 FROM public.vm_workspace_cleanup_admissions c
+           WHERE c.id=r.creation_admission_id AND c.completed_at IS NOT NULL AND c.outcome=
+             CASE r.reason WHEN 'creation_never_issued' THEN 'never_issued' ELSE 'creation_disposed' END))
+       OR (r.reason='creation_never_issued' AND (r.observed_pvc_uid IS NOT NULL OR r.cancellation_disposition IS NOT NULL
+           OR EXISTS(SELECT 1 FROM public.vm_creation_effects e WHERE e.request_id=r.request_id AND e.state<>'rejected')))
+       OR (r.reason='creation_disposed' AND (r.cancellation_disposition->>'disk_policy' IS DISTINCT FROM 'retain'
+           OR NOT public.valid_vm_creation_disposition_evidence(r))) THEN RETURN NULL; END IF;
+    RETURN jsonb_build_object('version',1,'kind','vm_job_retained_resume_noeffect',
+        'terminal_kind',CASE r.reason WHEN 'creation_never_issued' THEN 'never_issued' ELSE 'creation_disposed' END,
+        'resume_id',op.id,'job_id',op.job_id,'allocated_request_id',op.request_id,'source_request_id',op.request_id,
+        'provision_generation',op.provision_generation,'pvc_uid',op.pvc_uid,
+        'physical_cleanup_admission_id',op.physical_cleanup_admission_id,
+        'native_source',public.vm_thread_retained_source_snapshot(r));
+END;
+$$;
+
+
+--
+-- Name: vm_job_retained_purge_tail(uuid, boolean); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.vm_job_retained_purge_tail(parent_id uuid, require_current boolean DEFAULT true) RETURNS jsonb
+    LANGUAGE plpgsql STABLE
+    AS $$
+DECLARE d public.vm_job_retained_disk_purge_authorities%ROWTYPE;
+        t public.vm_job_retained_resume_terminals%ROWTYPE;
+        op public.vm_job_retained_resumes%ROWTYPE;
+        head public.vm_job_retained_resumes%ROWTYPE;
+        a public.vm_job_cancel_retention_authorities%ROWTYPE;
+        next_id uuid;
+        visited uuid[] := '{}';
+        tail jsonb := '[]';
+BEGIN
+    SELECT * INTO d FROM public.vm_job_retained_disk_purge_authorities WHERE cleanup_admission_id=parent_id;
+    IF d.retained_terminal_id IS NULL THEN RETURN NULL; END IF;
+    SELECT source.* INTO head FROM public.vm_job_retained_resumes source
+        JOIN public.vm_job_retained_resume_terminals edge ON edge.resume_id=source.id WHERE edge.id=d.retained_terminal_id;
+    IF head.job_id IS DISTINCT FROM d.job_id OR head.pvc_uid IS DISTINCT FROM d.pvc_uid
+       OR (require_current AND (NOT public.vm_job_retained_terminal_is_current(d.job_id)
+       OR NOT EXISTS(SELECT 1 FROM public.jobs j WHERE j.id=d.job_id
+           AND j.context->>'_vm_job_retained_resume'=head.id::text
+           AND j.context->'_stateless_delete_pending'='true'::jsonb))) THEN RETURN NULL; END IF;
+    next_id := d.retained_terminal_id;
+    WHILE next_id IS NOT NULL LOOP
+        IF next_id=ANY(visited) THEN RETURN NULL; END IF;
+        visited := array_append(visited,next_id);
+        SELECT * INTO t FROM public.vm_job_retained_resume_terminals WHERE id=next_id;
+        SELECT * INTO op FROM public.vm_job_retained_resumes WHERE id=t.resume_id;
+        IF t.id IS NULL OR op.id IS NULL OR op.job_id<>d.job_id OR op.pvc_uid<>d.pvc_uid
+           OR op.root_retention_admission_id<>head.root_retention_admission_id
+           OR (require_current AND (op.admitted_xact_id=pg_current_xact_id() OR t.admitted_xact_id=pg_current_xact_id()
+           OR NOT public.vm_job_retained_terminal_valid(t.id))) THEN RETURN NULL; END IF;
+        IF next_id=d.retained_terminal_id THEN
+            SELECT * INTO a FROM public.vm_job_cancel_retention_authorities WHERE cleanup_admission_id=t.physical_cleanup_admission_id;
+            IF a.creation_request_id IS DISTINCT FROM d.final_request_id OR a.vm_uid IS DISTINCT FROM d.vm_uid
+               OR a.provision_generation IS DISTINCT FROM d.provision_generation THEN RETURN NULL; END IF;
+        END IF;
+        tail := tail||jsonb_build_array(jsonb_build_object('resume_id',op.id,'terminal_id',t.id,
+            'request_id',op.request_id,'provision_generation',op.provision_generation,
+            'predecessor_terminal_id',op.predecessor_terminal_id,'evidence',t.evidence));
+        next_id := op.predecessor_terminal_id;
+    END LOOP;
+    IF op.physical_cleanup_admission_id<>head.root_retention_admission_id
+       OR EXISTS(SELECT 1 FROM public.vm_job_retained_resumes foreign_op
+           WHERE foreign_op.job_id=d.job_id AND NOT EXISTS(SELECT 1 FROM public.vm_job_retained_resume_terminals edge
+               WHERE edge.resume_id=foreign_op.id AND edge.id=ANY(visited))) THEN RETURN NULL; END IF;
+    RETURN tail;
+END;
+$$;
+
+
+--
+-- Name: vm_job_cancel_retention_authorities; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.vm_job_cancel_retention_authorities (
+    cleanup_admission_id uuid NOT NULL,
+    superseded_admission_id uuid,
+    job_id uuid NOT NULL,
+    creation_request_id uuid NOT NULL,
+    provision_generation uuid NOT NULL,
+    reservation_id uuid NOT NULL,
+    reservation_revision bigint NOT NULL,
+    vm_uid uuid NOT NULL,
+    vmi_uid uuid NOT NULL,
+    launcher_uid uuid NOT NULL,
+    pvc_uid uuid NOT NULL,
+    node_uid uuid NOT NULL,
+    namespace text NOT NULL,
+    cluster_id text NOT NULL,
+    cleanup_request_id uuid NOT NULL,
+    intent_digest text NOT NULL,
+    retaining_intent jsonb NOT NULL,
+    superseded_request_id uuid,
+    superseded_intent_digest text,
+    policy_version integer DEFAULT 1 NOT NULL,
+    admitted_at timestamp with time zone DEFAULT clock_timestamp() NOT NULL,
+    job_retained_resume_id uuid,
+    ready_retention_preflight jsonb,
+    admitted_xact_id xid8 DEFAULT pg_current_xact_id() NOT NULL,
+    CONSTRAINT vm_job_cancel_retention_authorities_check CHECK ((((superseded_admission_id IS NULL) AND (superseded_request_id IS NULL) AND (superseded_intent_digest IS NULL)) OR ((superseded_admission_id IS NOT NULL) AND (superseded_request_id IS NOT NULL) AND (superseded_intent_digest IS NOT NULL) AND (superseded_intent_digest ~ '^sha256:[0-9a-f]{64}$'::text)))),
+    CONSTRAINT vm_job_cancel_retention_authorities_check1 CHECK ((cleanup_admission_id IS DISTINCT FROM superseded_admission_id)),
+    CONSTRAINT vm_job_cancel_retention_authorities_cluster_id_check CHECK ((length(cluster_id) > 0)),
+    CONSTRAINT vm_job_cancel_retention_authorities_intent_digest_check CHECK ((intent_digest ~ '^sha256:[0-9a-f]{64}$'::text)),
+    CONSTRAINT vm_job_cancel_retention_authorities_namespace_check CHECK (((namespace ~ '^[a-z0-9]([-a-z0-9]*[a-z0-9])?$'::text) AND (length(namespace) <= 63))),
+    CONSTRAINT vm_job_cancel_retention_authorities_reservation_revision_check CHECK ((reservation_revision > 0)),
+    CONSTRAINT vm_job_cancel_retention_authorities_retaining_intent_check CHECK ((jsonb_typeof(retaining_intent) = 'object'::text))
+);
+
+
+--
+-- Name: vm_job_retained_ready_candidate(public.vm_job_cancel_retention_authorities); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.vm_job_retained_ready_candidate(parent public.vm_job_cancel_retention_authorities) RETURNS jsonb
+    LANGUAGE sql IMMUTABLE
+    AS $$
+    SELECT (jsonb_build_object('version',1,'kind',CASE WHEN parent.policy_version IN (3,4)
+        THEN 'vm_job_initial_ready_stop_candidate_v1' ELSE 'vm_job_retained_ready_stop_candidate_v1' END,
+        'owner_kind','job','job_id',parent.job_id,'namespace',parent.namespace,'cluster_id',parent.cluster_id,
+        'continuation_id',parent.job_retained_resume_id,'request_id',parent.creation_request_id,
+        'provision_generation',parent.provision_generation,'reservation_id',parent.reservation_id,
+        'reservation_revision',parent.reservation_revision,'vm_uid',parent.vm_uid,'vmi_uid',parent.vmi_uid,
+        'launcher_uid',parent.launcher_uid,'node_uid',parent.node_uid,'pvc_uid',parent.pvc_uid,
+        'cleanup_request_id',parent.cleanup_request_id,'cleanup_intent_digest',parent.intent_digest)
+        - CASE WHEN parent.policy_version IN (3,4) THEN ARRAY['continuation_id'] ELSE ARRAY[]::text[] END);
+$$;
+
+
+--
+-- Name: vm_job_retained_source_absent_evidence(uuid); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.vm_job_retained_source_absent_evidence(operation_id uuid) RETURNS jsonb
+    LANGUAGE plpgsql
+    AS $$
+DECLARE op public.vm_job_retained_resumes%ROWTYPE;
+        j public.jobs%ROWTYPE;
+        q public.run_queue%ROWTYPE;
+BEGIN
+    SELECT * INTO op FROM public.vm_job_retained_resumes WHERE id=operation_id;
+    SELECT * INTO j FROM public.jobs WHERE id=op.job_id;
+    SELECT * INTO q FROM public.run_queue WHERE unit_id=op.job_id;
+    IF op.id IS NULL OR j.id IS NULL OR j.status IS DISTINCT FROM 'cancelled'
+       OR j.execution_lane IS DISTINCT FROM 'stateless' OR j.assigned_agent_id IS NOT NULL
+       OR j.parent_job_id IS NOT NULL
+       OR j.context->>'_vm_job_retained_resume' IS DISTINCT FROM op.id::text
+       OR (j.context ? '_stateless_cancel_cleanup_pending'
+           AND j.context->'_stateless_cancel_cleanup_pending' IS DISTINCT FROM 'true'::jsonb)
+       OR (COALESCE(j.context->'vm','null'::jsonb)<>'null'::jsonb AND (
+           jsonb_typeof(j.context->'vm') IS DISTINCT FROM 'object'
+           OR j.context->'vm'->>'provision_generation' IS DISTINCT FROM op.provision_generation::text
+           OR j.context->'vm'->'identity_authenticated'='true'::jsonb
+           OR j.context->'vm'->>'vm_uid' IS NOT NULL OR j.context->'vm'->>'vmi_uid' IS NOT NULL
+           OR j.context->'vm'->>'active_pod_uid' IS NOT NULL))
+       OR q.unit_kind IS DISTINCT FROM 'worker_batch' OR q.state IS DISTINCT FROM 'done'
+       OR q.leased_by IS NOT NULL OR q.leased_until IS NOT NULL
+       OR NOT public.vm_job_cancel_retention_settled(op.physical_cleanup_admission_id)
+       OR public.vm_job_cancel_retention_discharged(op.root_retention_admission_id)
+       OR EXISTS (SELECT 1 FROM public.vm_creation_retries r WHERE r.request_id=op.request_id
+           OR (r.owner_kind='job' AND r.job_id=op.job_id AND r.provision_generation=op.provision_generation))
+       OR EXISTS (SELECT 1 FROM public.vm_resource_waiters w WHERE w.request_id=op.request_id)
+       OR EXISTS (SELECT 1 FROM public.vm_resource_reservations r WHERE r.request_id=op.request_id)
+       OR EXISTS (SELECT 1 FROM public.vm_creation_effects e WHERE e.request_id=op.request_id)
+       OR EXISTS (SELECT 1 FROM public.vm_workspace_cleanup_admissions c WHERE c.owner_kind='job' AND c.owner_id=op.job_id
+           AND (c.completed_at IS NULL OR c.request_id=public.uuid_generate_v5(public.uuid_ns_url(),'vm-create:'||op.request_id))
+           AND NOT (c.source='terminal_checkpoint_prune' AND c.pvc_uid IS NULL AND c.parent_admission_id IS NULL
+               AND c.intent_digest='sha256:'||encode(sha256(convert_to(format(
+                   '{"mode":"delete_thread","resource":"checkpoint_thread","thread_id":"%s"}',op.job_id),'UTF8')),'hex')))
+       OR EXISTS (SELECT 1 FROM public.vm_job_retained_resumes later WHERE later.job_id=op.job_id
+           AND (later.created_at,later.id)>(op.created_at,op.id)) THEN RETURN NULL; END IF;
+    RETURN jsonb_build_object('version',1,'kind','vm_job_retained_resume_source_absent',
+        'resume_id',op.id,'job_id',op.job_id,'allocated_request_id',op.request_id,
+        'provision_generation',op.provision_generation,'pvc_uid',op.pvc_uid,
+        'physical_cleanup_admission_id',op.physical_cleanup_admission_id);
+END;
+$$;
+
+
+--
+-- Name: vm_job_retained_stop_allowed(uuid, uuid, uuid, text); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.vm_job_retained_stop_allowed(owner uuid, pvc uuid, request uuid, digest text) RETURNS boolean
+    LANGUAGE plpgsql
+    AS $$
+DECLARE op public.vm_job_retained_resumes%ROWTYPE;
+        r public.vm_creation_retries%ROWTYPE;
+        a public.vm_job_cancel_retention_authorities%ROWTYPE;
+        candidate jsonb;
+        expected_digest text;
+BEGIN
+    SELECT source.* INTO r FROM public.vm_creation_retries source JOIN public.vm_job_retained_resumes link
+      ON source.job_retained_resume_id=link.id JOIN public.jobs j ON j.id=link.job_id
+      WHERE source.owner_kind='job' AND source.job_id=owner AND link.pvc_uid=pvc
+        AND j.context->>'_vm_job_retained_resume'=link.id::text;
+    IF r.request_id IS NULL THEN RETURN false; END IF;
+    SELECT * INTO op FROM public.vm_job_retained_resumes WHERE id=r.job_retained_resume_id;
+    SELECT * INTO a FROM public.vm_job_cancel_retention_authorities WHERE job_retained_resume_id=op.id;
+    IF a.cleanup_admission_id IS NOT NULL THEN
+        IF a.cleanup_request_id IS DISTINCT FROM request OR a.intent_digest IS DISTINCT FROM digest THEN RETURN false; END IF;
+        PERFORM public.validate_vm_job_cancel_retention(a.cleanup_admission_id,false);
+        RETURN true;
+    END IF;
+    expected_digest := 'sha256:'||encode(sha256(convert_to(format(
+        '{"owner_id":"%s","owner_kind":"job","provision_generation":"%s","purge_disk":false,"pvc_uid":"%s","resource":"vm_workspace","source":"job_terminal_vm_release","vm_uid":"%s"}',
+        owner,r.provision_generation,pvc,r.observed_vm_uid),'UTF8')),'hex');
+    IF digest IS DISTINCT FROM expected_digest OR request IS DISTINCT FROM public.uuid_generate_v5(public.uuid_ns_url(),
+        'vm-workspace-cleanup:job_terminal_vm_release:job:'||owner||':'||r.provision_generation||':'||r.observed_vm_uid||':'||pvc) THEN RETURN false; END IF;
+    candidate := public.vm_job_retained_stop_candidate(owner,r.provision_generation,r.observed_vm_uid,pvc,NULL);
+    RETURN candidate IS NOT NULL;
+END;
+$$;
+
+
+--
+-- Name: vm_job_retained_stop_candidate(uuid, uuid, uuid, uuid, uuid, uuid, boolean); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.vm_job_retained_stop_candidate(owner uuid, generation uuid, expected_vm uuid, pvc uuid, old_parent uuid, retaining_parent uuid DEFAULT NULL::uuid, existing_stop boolean DEFAULT false) RETURNS jsonb
+    LANGUAGE plpgsql
+    AS $_$
+DECLARE j public.jobs%ROWTYPE;
+        r public.vm_creation_retries%ROWTYPE;
+        v public.vm_resource_reservations%ROWTYPE;
+        q public.run_queue%ROWTYPE;
+        vm jsonb;
+BEGIN
+    SELECT * INTO q FROM public.run_queue WHERE unit_id=owner FOR UPDATE;
+    SELECT * INTO j FROM public.jobs WHERE id=owner FOR UPDATE;
+    SELECT * INTO r FROM public.vm_creation_retries
+     WHERE owner_kind='job' AND job_id=owner AND provision_generation=generation FOR UPDATE;
+    SELECT * INTO v FROM public.vm_resource_reservations WHERE request_id=r.request_id FOR UPDATE;
+    vm := j.context->'vm';
+    IF j.id IS NULL OR NOT public.vm_job_retained_terminal_authorized(owner)
+       OR j.execution_lane IS DISTINCT FROM 'stateless'
+       OR j.assigned_agent_id IS NOT NULL OR j.parent_job_id IS NOT NULL
+       OR COALESCE(j.context->'inherits_parent_workspace','false'::jsonb) IS DISTINCT FROM 'false'::jsonb
+       OR jsonb_typeof(vm) IS DISTINCT FROM 'object'
+       OR vm->>'provision_generation' IS DISTINCT FROM generation::text
+       OR vm->>'vm_uid' IS DISTINCT FROM expected_vm::text
+       OR vm->>'rootdisk_pvc_uid' IS DISTINCT FROM pvc::text
+       OR vm->>'status' IS NULL OR (vm->>'status' NOT IN ('created','ssh_pending','ssh_unreachable','ready','retiring_process_zero')
+           AND NOT (vm->>'status'='deleted' AND v.state='teardown'
+               AND public.vm_job_deleted_retention_replay_allowed(2,owner,generation,
+                   expected_vm,pvc,retaining_parent,existing_stop,r.request_id,
+                   v.id,v.revision,v.vmi_uid,v.launcher_uid,v.node_uid)))
+       OR vm->'identity_authenticated' IS DISTINCT FROM 'true'::jsonb
+       OR vm->>'identity_provision_generation' IS DISTINCT FROM generation::text
+       OR COALESCE(vm->'workspace_storage','null'::jsonb)<>'null'::jsonb
+       OR COALESCE(r.canonical_request->'workspace_storage','null'::jsonb)<>'null'::jsonb
+       OR q.unit_id IS NULL OR q.unit_kind IS DISTINCT FROM 'worker_batch'
+       OR q.state IS DISTINCT FROM 'done' OR q.leased_by IS NOT NULL OR q.leased_until IS NOT NULL
+       OR r.request_id IS NULL OR r.state IS DISTINCT FROM 'succeeded'
+       OR r.reason IS DISTINCT FROM 'creation_adopted' OR r.resolved_at IS NULL
+       OR r.claim_token IS NOT NULL OR r.claim_expires_at IS NOT NULL
+       OR NOT EXISTS(SELECT 1 FROM public.vm_job_retained_resumes op
+           WHERE op.id=r.job_retained_resume_id AND op.request_id=r.request_id
+             AND op.job_id=owner AND op.provision_generation=generation AND op.pvc_uid=pvc
+             AND j.context->>'_vm_job_retained_resume'=op.id::text
+             AND op.admitted_xact_id<>pg_current_xact_id()
+             AND r.job_retained_resume_admitted_xact_id<>pg_current_xact_id()
+             AND public.vm_job_cancel_retention_settled(op.physical_cleanup_admission_id)
+             AND NOT public.vm_job_cancel_retention_discharged(op.root_retention_admission_id)
+             AND NOT EXISTS(SELECT 1 FROM public.vm_job_retained_resume_terminals t WHERE t.resume_id=op.id))
+       OR r.observed_vm_uid IS DISTINCT FROM expected_vm OR r.observed_pvc_uid IS DISTINCT FROM pvc
+       OR r.controller_configuration->'version' IS DISTINCT FROM '3'::jsonb
+       OR r.controller_configuration->'persistent_rootdisk' IS DISTINCT FROM 'true'::jsonb
+       OR r.controller_configuration->'headscale_enabled' IS DISTINCT FROM 'false'::jsonb
+       OR v.id IS NULL OR v.resource_version IS DISTINCT FROM 2
+       OR v.state NOT IN ('reserved','active','warm','teardown')
+       OR v.vm_uid IS DISTINCT FROM expected_vm OR v.vmi_uid IS NULL OR v.launcher_uid IS NULL
+       OR vm->>'vmi_uid' IS DISTINCT FROM v.vmi_uid::text
+       OR (vm->>'active_pod_uid' IS NOT NULL AND vm->>'active_pod_uid'<>v.launcher_uid::text)
+       OR r.controller_configuration->'resource_admission'->>'cluster_id' IS DISTINCT FROM v.cluster_id
+       OR COALESCE(r.controller_configuration->>'namespace','') !~ '^[a-z0-9]([-a-z0-9]*[a-z0-9])?$'
+       OR length(r.controller_configuration->>'namespace')>63
+       OR EXISTS (SELECT 1 FROM public.srw_execution_specs e
+           JOIN public.srw_execution_workspace_bindings b ON b.execution_id=e.id
+           WHERE e.work_kind='Job' AND e.work_id=owner)
+       OR EXISTS (SELECT 1 FROM public.srw_workspace_instances w WHERE w.pvc_uid=pvc::text)
+       OR EXISTS (SELECT 1 FROM public.vm_resource_recovery_successors s WHERE s.reservation_id=v.id)
+       OR EXISTS (SELECT 1 FROM public.vm_creation_retries later WHERE later.owner_kind='job'
+           AND later.job_id=owner AND (later.created_at,later.request_id)>(r.created_at,r.request_id))
+       OR EXISTS (SELECT 1 FROM public.vm_creation_effects e WHERE e.request_id=r.request_id AND e.state='issued')
+       OR EXISTS (SELECT 1 FROM public.agents a WHERE a.current_job_id=owner AND a.status NOT IN ('offline','failed','completed'))
+       OR EXISTS (SELECT 1 FROM public.jobs other WHERE other.id<>owner AND
+           (other.context->'vm'->>'inherited_from_job_id'=owner::text
+            OR other.context->'vm'->>'rootdisk_pvc_uid'=pvc::text))
+       OR EXISTS (SELECT 1 FROM public.vm_idle_access_leases l WHERE l.owner_kind='job' AND l.owner_id=owner
+           AND l.closed_at IS NULL AND l.expires_at>clock_timestamp())
+       OR EXISTS (SELECT 1 FROM public.vm_remote_operation_leases l WHERE l.owner_kind='job' AND l.owner_id=owner
+           AND l.settled_at IS NULL AND l.lease_expires_at>clock_timestamp())
+       OR EXISTS (SELECT 1 FROM public.vm_idle_operations o WHERE o.owner_kind='job' AND o.owner_id=owner AND o.closed_at IS NULL)
+       OR EXISTS (SELECT 1 FROM public.vm_workspace_recoveries h WHERE h.resolved_at IS NULL
+           AND ((h.owner_kind='job' AND h.owner_id=owner) OR h.root_pvc_uid=pvc))
+       OR EXISTS (SELECT 1 FROM public.vm_workspace_recovery_retention_pins p WHERE p.pvc_uid=pvc AND p.released_at IS NULL)
+       OR EXISTS (SELECT 1 FROM public.vm_workspace_recovery_jobs h WHERE h.job_id=owner AND h.resolved_at IS NULL)
+       OR EXISTS (SELECT 1 FROM public.vm_workspace_cleanup_admissions c
+           WHERE ((c.owner_kind='job' AND c.owner_id=owner) OR c.pvc_uid=pvc)
+           AND c.completed_at IS NULL AND c.id IS DISTINCT FROM old_parent
+           AND c.id IS DISTINCT FROM retaining_parent)
+       OR EXISTS (SELECT 1 FROM public.vm_workspace_cleanup_admissions c WHERE
+           c.parent_admission_id=old_parent OR c.parent_admission_id=retaining_parent)
+       OR EXISTS (SELECT 1 FROM public.vm_pre_ssh_stop_intents i WHERE i.job_id=owner
+           AND i.provision_generation=generation
+           AND (NOT existing_stop OR i.cleanup_admission_id IS DISTINCT FROM retaining_parent))
+       OR (NOT existing_stop AND EXISTS (SELECT 1 FROM public.managed_repository_process_zero_receipts z
+           WHERE z.owner_kind='job' AND z.owner_id=owner AND z.scope='vm'
+           AND z.provisioner='vm' AND z.runtime_incarnation=generation::text))
+       OR (j.context ? '_job_terminal_vm_cleanup' AND (
+           j.context->'_job_terminal_vm_cleanup'->>'version'='1'
+           AND j.context->'_job_terminal_vm_cleanup'->>'provision_generation'=generation::text
+           AND j.context->'_job_terminal_vm_cleanup'->>'admission_id'
+               IN (old_parent::text,retaining_parent::text)) IS DISTINCT FROM true) THEN
+        RETURN NULL;
+    END IF;
+    RETURN jsonb_build_object('creation_request_id',r.request_id,'reservation_id',v.id,
+        'reservation_revision',v.revision,'vmi_uid',v.vmi_uid,'launcher_uid',v.launcher_uid,
+        'node_uid',v.node_uid,'namespace',r.controller_configuration->>'namespace','cluster_id',v.cluster_id);
+END;
+$_$;
+
+
+--
+-- Name: vm_job_retained_terminal_authorized(uuid); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.vm_job_retained_terminal_authorized(owner uuid) RETURNS boolean
+    LANGUAGE sql STABLE
+    AS $$
+    SELECT EXISTS(SELECT 1 FROM public.jobs j WHERE j.id=owner AND (
+        (j.status='cancelled' AND j.context->'_stateless_cancel_cleanup_pending'='true'::jsonb)
+        OR (j.status IN ('cancelled','failed','completed') AND j.context->'_stateless_delete_pending'='true'::jsonb)
+        OR EXISTS(SELECT 1 FROM public.job_completion_commands command
+            JOIN public.completion_effects effect ON effect.producer_id=command.id
+            LEFT JOIN public.completion_effects disposition ON disposition.producer_kind='job_completion'
+                AND disposition.producer_id=command.id AND disposition.effect_name='main_status_write' AND disposition.state='done'
+            LEFT JOIN public.completion_effects entry ON entry.producer_kind='job_completion'
+                AND entry.producer_id=command.id AND entry.effect_name='late_callback_guard' AND entry.state='done'
+            WHERE command.job_id=j.id AND command.report_seq=j.completion_seq_hwm
+              AND command.state='finalizing' AND command.lease_expires_at>clock_timestamp()
+              AND command.deadline_at>clock_timestamp() AND effect.producer_kind='job_completion'
+              AND effect.effect_name='workspace_archive_teardown' AND effect.state='pending'
+              AND effect.complete_by>clock_timestamp()
+              AND effect.detail->'teardown_authorization'->'active'='true'::jsonb
+              AND effect.detail->'teardown_authorization'->>'report_seq'=command.report_seq::text
+              AND j.status IN ('completed','failed','cancelled')
+              AND COALESCE(NULLIF(disposition.detail#>>'{output,new_status}',''),
+                  CASE WHEN entry.detail#>>'{output,matched}'='true' THEN entry.detail#>>'{output,entry_status}' END)=j.status::text)));
+$$;
+
+
+--
+-- Name: vm_job_retained_terminal_is_current(uuid); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.vm_job_retained_terminal_is_current(owner uuid) RETURNS boolean
+    LANGUAGE sql STABLE
+    AS $$
+    SELECT EXISTS(SELECT 1 FROM public.vm_job_retained_resumes op
+        JOIN public.vm_job_retained_resume_terminals t ON t.resume_id=op.id
+        JOIN public.jobs j ON j.id=op.job_id JOIN public.run_queue q ON q.unit_id=j.id
+        JOIN public.vm_job_cancel_retention_authorities a ON a.cleanup_admission_id=t.physical_cleanup_admission_id
+        WHERE op.job_id=owner AND j.context->>'_vm_job_retained_resume'=op.id::text
+          AND j.status IN ('cancelled','completed','failed') AND j.execution_lane='stateless'
+          AND j.assigned_agent_id IS NULL AND j.parent_job_id IS NULL
+          AND q.unit_kind='worker_batch' AND q.state='done' AND q.leased_by IS NULL AND q.leased_until IS NULL
+          AND NOT EXISTS(SELECT 1 FROM public.vm_job_retained_resumes later WHERE later.job_id=owner
+              AND (later.created_at,later.id)>(op.created_at,op.id))
+          AND (CASE WHEN t.terminal_kind='kept_compute' THEN
+              j.context->'vm'->>'provision_generation'=op.provision_generation::text
+              AND j.context->'vm'->>'vm_uid'=a.vm_uid::text
+              AND j.context->'vm'->>'rootdisk_pvc_uid'=a.pvc_uid::text
+              AND j.context->'vm'->>'status'='deleted'
+            ELSE COALESCE(j.context->'vm','null'::jsonb)='null'::jsonb OR (
+              j.context->'vm'->>'provision_generation'=op.provision_generation::text
+              AND j.context->'vm'->>'vm_uid' IS NULL
+              AND COALESCE(j.context->'vm'->'identity_authenticated','false'::jsonb)<>'true'::jsonb) END)
+          AND public.vm_job_retained_terminal_valid(t.id));
+$$;
+
+
+--
+-- Name: vm_job_retained_terminal_valid(uuid); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.vm_job_retained_terminal_valid(terminal_id uuid) RETURNS boolean
+    LANGUAGE plpgsql STABLE
+    AS $$
+DECLARE t public.vm_job_retained_resume_terminals%ROWTYPE;
+        op public.vm_job_retained_resumes%ROWTYPE;
+        r public.vm_creation_retries%ROWTYPE;
+        a public.vm_job_cancel_retention_authorities%ROWTYPE;
+        expected jsonb;
+BEGIN
+    SELECT * INTO t FROM public.vm_job_retained_resume_terminals WHERE id=terminal_id;
+    SELECT * INTO op FROM public.vm_job_retained_resumes WHERE id=t.resume_id;
+    SELECT * INTO a FROM public.vm_job_cancel_retention_authorities WHERE cleanup_admission_id=t.physical_cleanup_admission_id;
+    IF t.id IS NULL OR op.id IS NULL OR t.allocated_request_id<>op.request_id
+       OR a.job_id IS DISTINCT FROM op.job_id OR a.pvc_uid IS DISTINCT FROM op.pvc_uid
+       OR NOT public.vm_job_cancel_retention_settled(a.cleanup_admission_id) THEN RETURN false; END IF;
+    expected := jsonb_build_object('version',1,'resume_id',op.id,'job_id',op.job_id,
+        'allocated_request_id',op.request_id,'provision_generation',op.provision_generation,
+        'pvc_uid',op.pvc_uid,'physical_cleanup_admission_id',a.cleanup_admission_id);
+    IF t.terminal_kind='source_absent' THEN
+        IF t.source_request_id IS NOT NULL OR a.cleanup_admission_id<>op.physical_cleanup_admission_id
+           OR EXISTS(SELECT 1 FROM public.vm_creation_retries source WHERE source.request_id=op.request_id
+               OR (source.owner_kind='job' AND source.job_id=op.job_id AND source.provision_generation=op.provision_generation))
+           OR EXISTS(SELECT 1 FROM public.vm_resource_waiters w WHERE w.request_id=op.request_id)
+           OR EXISTS(SELECT 1 FROM public.vm_resource_reservations v WHERE v.request_id=op.request_id)
+           OR EXISTS(SELECT 1 FROM public.vm_creation_effects e WHERE e.request_id=op.request_id)
+           OR EXISTS(SELECT 1 FROM public.vm_workspace_cleanup_admissions c WHERE c.owner_kind='job' AND c.owner_id=op.job_id
+               AND c.request_id=public.uuid_generate_v5(public.uuid_ns_url(),'vm-create:'||op.request_id)) THEN RETURN false; END IF;
+        expected := expected||jsonb_build_object('kind','vm_job_retained_resume_source_absent');
+    ELSE
+        SELECT * INTO r FROM public.vm_creation_retries WHERE request_id=op.request_id;
+        IF t.source_request_id IS DISTINCT FROM op.request_id OR r.job_retained_resume_id IS DISTINCT FROM op.id
+           OR r.job_id IS DISTINCT FROM op.job_id OR r.owner_kind IS DISTINCT FROM 'job'
+           OR r.provision_generation IS DISTINCT FROM op.provision_generation OR r.expected_pvc_uid IS DISTINCT FROM op.pvc_uid
+           OR r.resolved_at IS NULL OR r.claim_token IS NOT NULL OR r.claim_expires_at IS NOT NULL
+           OR EXISTS(SELECT 1 FROM public.vm_resource_reservations v WHERE v.request_id=r.request_id AND v.state<>'released')
+           OR EXISTS(SELECT 1 FROM public.vm_resource_waiters w WHERE w.request_id=r.request_id AND w.state NOT IN ('released','cancelled'))
+           OR EXISTS(SELECT 1 FROM public.vm_creation_effects e WHERE e.request_id=r.request_id AND e.state='issued') THEN RETURN false; END IF;
+        expected := expected||jsonb_build_object('source_request_id',op.request_id);
+        IF t.terminal_kind='kept_compute' THEN
+            IF a.job_retained_resume_id IS DISTINCT FROM op.id OR a.policy_version<>2
+               OR a.creation_request_id<>r.request_id OR r.state<>'succeeded'
+               OR r.observed_vm_uid IS DISTINCT FROM a.vm_uid OR r.observed_pvc_uid IS DISTINCT FROM a.pvc_uid THEN RETURN false; END IF;
+            expected := expected||jsonb_build_object('kind','vm_job_retained_resume_kept_compute');
+        ELSE
+            IF t.terminal_kind NOT IN ('never_issued','creation_disposed') OR r.state<>'settled'
+               OR r.reason IS DISTINCT FROM (CASE t.terminal_kind WHEN 'never_issued' THEN 'creation_never_issued' ELSE 'creation_disposed' END)
+               OR a.cleanup_admission_id<>op.physical_cleanup_admission_id
+               OR r.observed_vm_uid IS NOT NULL OR r.ready_at IS NOT NULL OR r.boot_counted
+               OR EXISTS(SELECT 1 FROM public.vm_creation_effects e WHERE e.request_id=r.request_id AND e.effect_kind='vm' AND e.state<>'rejected')
+               OR (t.terminal_kind='creation_disposed' AND NOT public.valid_vm_creation_disposition_evidence(r)) THEN RETURN false; END IF;
+            expected := expected||jsonb_build_object('kind','vm_job_retained_resume_noeffect',
+                'terminal_kind',t.terminal_kind,'native_source',public.vm_thread_retained_source_snapshot(r));
+        END IF;
+    END IF;
+    RETURN t.evidence=expected;
+END;
+$$;
+
+
+--
+-- Name: vm_job_terminal_packet_evidence(uuid); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.vm_job_terminal_packet_evidence(source_request uuid) RETURNS jsonb
+    LANGUAGE plpgsql
+    AS $$
+DECLARE r public.vm_creation_retries%ROWTYPE;
+        t public.vm_job_retained_resume_terminals%ROWTYPE;
+        d public.vm_job_retained_disk_purge_authorities%ROWTYPE;
+        tail jsonb;
+BEGIN
+    SELECT * INTO r FROM public.vm_creation_retries WHERE request_id=source_request;
+    SELECT * INTO t FROM public.vm_job_retained_resume_terminals WHERE source_request_id=source_request
+        AND terminal_kind IN ('never_issued','creation_disposed');
+    IF t.id IS NULL THEN RETURN public.vm_job_terminal_packet_without_retained_noeffect(source_request); END IF;
+    SELECT authority.* INTO d FROM public.vm_job_retained_disk_purge_authorities authority
+        JOIN public.vm_workspace_cleanup_admissions c ON c.id=authority.cleanup_admission_id
+        WHERE authority.job_id=r.job_id AND authority.pvc_uid=r.expected_pvc_uid
+          AND authority.retained_terminal_id IS NOT NULL AND c.completed_at IS NOT NULL AND c.outcome='completed';
+    IF d.cleanup_admission_id IS NULL THEN RETURN NULL; END IF;
+    tail := public.vm_job_retained_purge_tail(d.cleanup_admission_id);
+    IF tail IS NULL OR NOT EXISTS(SELECT 1 FROM jsonb_array_elements(tail) item WHERE item->>'terminal_id'=t.id::text) THEN RETURN NULL; END IF;
+    PERFORM public.validate_vm_job_retained_disk_purge(d.cleanup_admission_id,true);
+    RETURN jsonb_build_object('kind','retained_noeffect','job_id',r.job_id,'request_id',r.request_id,
+        'provision_generation',r.provision_generation,'cleanup_admission_id',d.cleanup_admission_id,
+        'terminal_id',t.id,'terminal_evidence',t.evidence,'chain_digest',public.vm_job_retained_disk_purge_chain_digest(d.cleanup_admission_id));
+END;
+$$;
+
+
+--
+-- Name: vm_job_terminal_packet_without_retained_noeffect(uuid); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.vm_job_terminal_packet_without_retained_noeffect(source_request uuid) RETURNS jsonb
+    LANGUAGE plpgsql
+    AS $$
+DECLARE prior jsonb;
+        r public.vm_creation_retries%ROWTYPE;
+        d public.vm_job_retained_disk_purge_authorities%ROWTYPE;
+        p public.vm_job_retained_disk_purge_predecessors%ROWTYPE;
+        old_stop public.vm_resource_cleanup_stop_receipts%ROWTYPE;
+        parent public.vm_workspace_cleanup_admissions%ROWTYPE;
+        charge public.vm_resource_reservations%ROWTYPE;
+BEGIN
+    prior := public.vm_job_terminal_prior_packet_evidence(source_request);
+    IF prior IS NOT NULL THEN RETURN prior; END IF;
+    SELECT * INTO r FROM public.vm_creation_retries WHERE request_id=source_request;
+    IF r.request_id IS NULL OR r.owner_kind IS DISTINCT FROM 'job' THEN RETURN NULL; END IF;
+    SELECT * INTO p FROM public.vm_job_retained_disk_purge_predecessors
+      WHERE source_request_id=source_request;
+    -- 0433 admits a cancelled, late-adopted policy-1 source to typed disk
+    -- purge only after its original retained physical/custody parent settles.
+    -- Keep all older succeeded paths unchanged and reject every other settled
+    -- retry before constructing a terminal packet.
+    IF r.state IS DISTINCT FROM 'succeeded'
+       AND NOT (r.state='settled' AND r.reason='creation_adopted'
+           AND p.source_request_id IS NOT DISTINCT FROM r.request_id
+           AND public.vm_cancel_late_adopted_retained_terminal(
+               p.old_cleanup_admission_id)) THEN RETURN NULL; END IF;
+    SELECT * INTO d FROM public.vm_job_retained_disk_purge_authorities
+      WHERE cleanup_admission_id=p.cleanup_admission_id;
+    SELECT * INTO parent FROM public.vm_workspace_cleanup_admissions
+      WHERE id=d.cleanup_admission_id;
+    SELECT * INTO old_stop FROM public.vm_resource_cleanup_stop_receipts
+      WHERE cleanup_admission_id=p.old_cleanup_admission_id;
+    SELECT * INTO charge FROM public.vm_resource_reservations
+      WHERE id=p.reservation_id;
+    IF p.source_request_id IS NULL OR d.cleanup_admission_id IS NULL
+       OR parent.completed_at IS NULL OR parent.outcome IS DISTINCT FROM 'completed'
+       OR d.job_id IS DISTINCT FROM r.job_id
+       OR d.pvc_uid IS DISTINCT FROM r.observed_pvc_uid
+       OR old_stop.request_id IS DISTINCT FROM r.request_id
+       OR old_stop.provision_generation IS DISTINCT FROM r.provision_generation
+       OR charge.state IS DISTINCT FROM 'released' THEN RETURN NULL; END IF;
+    PERFORM public.validate_vm_job_retained_disk_purge(d.cleanup_admission_id,true);
+    RETURN jsonb_build_object(
+        'kind','retained_late_purge','job_id',r.job_id,
+        'request_id',r.request_id,'provision_generation',r.provision_generation,
+        'vm_uid',r.observed_vm_uid,'pvc_uid',r.observed_pvc_uid,
+        'execution_id',r.execution_id,'execution_revision',r.execution_revision,
+        'execution_generation',r.execution_generation,
+        'execution_chain',public.vm_job_execution_chain_evidence(r.execution_id),
+        'cleanup_admission_id',d.cleanup_admission_id,
+        'cleanup_intent_digest',parent.intent_digest,
+        'old_cleanup_admission_id',p.old_cleanup_admission_id,
+        'old_stop_evidence_digest',p.stop_evidence_digest,
+        'old_reservation_id',p.reservation_id,
+        'old_reservation_revision',p.reservation_revision,
+        'purge_generation',d.provision_generation,
+        'binding_kind',d.binding_kind,
+        'workspace_instance_id',d.workspace_instance_id,
+        'workspace_generation',d.workspace_generation,
+        'chain_digest',public.vm_job_retained_disk_purge_chain_digest(d.cleanup_admission_id),
+        'process_zero_receipt_ids',COALESCE((
+            SELECT jsonb_agg(z.id ORDER BY z.id)
+            FROM public.managed_repository_process_zero_receipts z
+            WHERE z.owner_kind='job' AND z.owner_id=r.job_id
+              AND z.scope='vm' AND z.provisioner='vm'
+              AND z.runtime_incarnation=r.provision_generation::text),'[]'::jsonb),
+        'retry_reason',r.reason,'resolved_at',r.resolved_at);
+END;
+$$;
+
+
+--
+-- Name: vm_job_terminal_prior_packet_evidence(uuid); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.vm_job_terminal_prior_packet_evidence(source_request uuid) RETURNS jsonb
+    LANGUAGE plpgsql STABLE
+    AS $$
+DECLARE r public.vm_creation_retries%ROWTYPE;
+        a public.vm_workspace_cleanup_admissions%ROWTYPE;
+        repository_receipt public.vm_job_repository_settlement_receipts%ROWTYPE;
+        stop_row public.vm_resource_cleanup_stop_receipts%ROWTYPE;
+        reservation_count bigint;
+BEGIN
+    SELECT * INTO r FROM public.vm_creation_retries WHERE request_id=source_request;
+    IF NOT FOUND OR r.owner_kind<>'job' OR r.job_id IS NULL
+       OR r.resolved_at IS NULL THEN
+        RETURN NULL;
+    END IF;
+    IF public.job_vm_creation_never_issued_terminal_source(
+        r.job_id,r.provision_generation::text) THEN
+        -- 0326 proves this retry and logical parent. Other generations may
+        -- have their own exact physical packet; unattributed delivery history
+        -- cannot be assigned to those generations and remains a hold.
+        IF NOT public.vm_job_logical_final_history_safe(
+            r.job_id,r.provision_generation) THEN
+            RETURN NULL;
+        END IF;
+        SELECT * INTO a FROM public.vm_workspace_cleanup_admissions
+        WHERE owner_kind='job' AND owner_id=r.job_id
+          AND source='job_terminal_vm_release' AND pvc_uid IS NULL
+          AND completed_at IS NOT NULL AND outcome='completed'
+          AND request_id=public.uuid_generate_v5(public.uuid_ns_url(),
+            'vm-workspace-cleanup:job_terminal_vm_release:job:' || r.job_id::text ||
+            ':' || r.provision_generation::text || ':None:');
+        IF NOT FOUND THEN RETURN NULL; END IF;
+        SELECT * INTO repository_receipt
+        FROM public.vm_job_repository_settlement_receipts
+        WHERE cleanup_admission_id=a.id AND request_id=r.request_id
+          AND job_id=r.job_id AND provision_generation=r.provision_generation;
+        IF NOT FOUND THEN RETURN NULL; END IF;
+        RETURN jsonb_build_object(
+            'kind','never_issued','job_id',r.job_id,'request_id',r.request_id,
+            'provision_generation',r.provision_generation,
+            'execution_id',r.execution_id,'execution_revision',r.execution_revision,
+            'execution_generation',r.execution_generation,
+            'execution_chain',public.vm_job_execution_chain_evidence(r.execution_id),
+            'cleanup_admission_id',a.id,'cleanup_intent_digest',a.intent_digest,
+            'repository_pair',public.vm_job_repository_receipt_pair(repository_receipt),
+            'retry_reason',r.reason,'resolved_at',r.resolved_at);
+    END IF;
+    IF r.state<>'succeeded' OR r.observed_vm_uid IS NULL
+       OR r.observed_pvc_uid IS NULL OR r.creation_admission_id IS NULL
+       OR NOT EXISTS (SELECT 1 FROM public.managed_repository_process_zero_receipts p
+           WHERE p.owner_kind='job' AND p.owner_id=r.job_id AND p.scope='vm'
+             AND p.provisioner='vm'
+             AND p.runtime_incarnation=r.provision_generation::text)
+       OR EXISTS (SELECT 1 FROM public.vm_creation_effects e
+           WHERE e.request_id=r.request_id AND e.state='issued')
+       OR EXISTS (SELECT 1 FROM public.vm_resource_waiters w
+           WHERE w.request_id=r.request_id AND w.state<>'released')
+       OR EXISTS (SELECT 1 FROM public.vm_resource_reservations v
+           WHERE v.request_id=r.request_id AND v.state<>'released') THEN
+        RETURN NULL;
+    END IF;
+    -- A completed terminal parent is the typed physical/storage disposition;
+    -- identity includes the generation, VM, PVC and purge intent.
+    SELECT * INTO a FROM public.vm_workspace_cleanup_admissions
+    WHERE owner_kind='job' AND owner_id=r.job_id
+      AND source IN ('job_terminal_vm_release','public_vm_delete','lifecycle_vm_delete')
+      AND parent_admission_id IS NULL AND pvc_uid=r.observed_pvc_uid
+      AND request_id=public.uuid_generate_v5(public.uuid_ns_url(),
+          (CASE WHEN source='lifecycle_vm_delete'
+              THEN 'workspace-cleanup:delete:job:'
+              ELSE 'vm-workspace-cleanup:' || source || ':job:' END) ||
+          r.job_id::text || ':' || r.provision_generation::text || ':' ||
+          r.observed_vm_uid::text || ':' || r.observed_pvc_uid::text)
+      AND completed_at IS NOT NULL AND outcome='completed'
+    ORDER BY completed_at DESC LIMIT 1;
+    IF NOT FOUND THEN RETURN NULL; END IF;
+    IF a.intent_digest IS DISTINCT FROM 'sha256:' || pg_catalog.encode(
+        pg_catalog.sha256(pg_catalog.convert_to(
+            '{"owner_id":"' || r.job_id::text ||
+            '","owner_kind":"job","provision_generation":"' ||
+            r.provision_generation::text ||
+            '","purge_disk":true,"pvc_uid":"' || r.observed_pvc_uid::text ||
+            '","resource":"vm_workspace","source":"' || a.source ||
+            '","vm_uid":"' || r.observed_vm_uid::text || '"}', 'UTF8'
+        )), 'hex') THEN
+        RETURN NULL;
+    END IF;
+    SELECT count(*) INTO reservation_count FROM public.vm_resource_reservations v
+        WHERE v.request_id=r.request_id;
+    IF reservation_count>0 THEN
+        IF reservation_count<>1 THEN RETURN NULL; END IF;
+        SELECT s.* INTO stop_row FROM public.vm_resource_cleanup_stop_receipts s
+        JOIN public.vm_resource_reservations v ON v.id=s.reservation_id
+        WHERE v.request_id=r.request_id AND v.state='released'
+          AND s.job_id=r.job_id AND s.request_id=r.request_id
+          AND s.provision_generation=r.provision_generation
+          AND s.vm_uid=r.observed_vm_uid AND s.pvc_uid=r.observed_pvc_uid
+          AND s.cleanup_admission_id=a.id AND s.intent_digest=a.intent_digest
+          AND s.stop_evidence->'vm_absent'='true'::jsonb
+          AND s.stop_evidence->'vmi_absent'='true'::jsonb
+          AND s.stop_evidence->'launcher_absent'='true'::jsonb
+          AND s.stop_evidence->>'pvc_disposition'='purged';
+        IF NOT FOUND THEN RETURN NULL; END IF;
+    ELSE
+        -- A missing charge is not evidence that physical stop or storage
+        -- purge occurred. Older uncharged paths remain live until they have
+        -- their own exact typed terminal witness.
+        RETURN NULL;
+    END IF;
+    RETURN jsonb_build_object(
+        'kind','physical_stop','job_id',r.job_id,'request_id',r.request_id,
+        'provision_generation',r.provision_generation,
+        'vm_uid',r.observed_vm_uid,'pvc_uid',r.observed_pvc_uid,
+        'execution_id',r.execution_id,'execution_revision',r.execution_revision,
+        'execution_generation',r.execution_generation,
+        'execution_chain',public.vm_job_execution_chain_evidence(r.execution_id),
+        'cleanup_admission_id',a.id,'cleanup_intent_digest',a.intent_digest,
+        'reservation_count',reservation_count,
+        'effect_nonces',COALESCE((SELECT jsonb_agg(e.effect_nonce ORDER BY e.effect_nonce)
+            FROM public.vm_creation_effects e WHERE e.request_id=r.request_id),'[]'::jsonb),
+        'process_zero_receipt_ids',COALESCE((SELECT jsonb_agg(p.id ORDER BY p.id)
+            FROM public.managed_repository_process_zero_receipts p
+            WHERE p.owner_kind='job' AND p.owner_id=r.job_id
+              AND p.scope='vm' AND p.provisioner='vm'
+              AND p.runtime_incarnation=r.provision_generation::text),'[]'::jsonb),
+        'reservation_ids',COALESCE((SELECT jsonb_agg(v.id ORDER BY v.id)
+            FROM public.vm_resource_reservations v WHERE v.request_id=r.request_id),'[]'::jsonb),
+        'stop_reservation_id',stop_row.reservation_id,
+        'retry_reason',r.reason,'resolved_at',r.resolved_at);
+END;
+$$;
+
+
+--
+-- Name: vm_never_app_ready_stop_authorized(public.vm_pre_ssh_stop_intents); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.vm_never_app_ready_stop_authorized(i public.vm_pre_ssh_stop_intents) RETURNS boolean
+    LANGUAGE plpgsql
+    AS $_$
+DECLARE a public.vm_job_cancel_retention_authorities%ROWTYPE;
+        f jsonb := i.frozen;
+        receipt_id uuid;
+        item jsonb;
+BEGIN
+    SELECT * INTO a FROM public.vm_job_cancel_retention_authorities
+     WHERE cleanup_admission_id=i.cleanup_admission_id;
+    IF a.cleanup_admission_id IS NULL OR a.policy_version IS DISTINCT FROM 1
+       OR a.admitted_xact_id=pg_current_xact_id() OR a.job_retained_resume_id IS NOT NULL
+       OR i.job_id IS DISTINCT FROM a.job_id OR i.provision_generation IS DISTINCT FROM a.provision_generation
+       OR i.creation_request_id IS DISTINCT FROM a.creation_request_id
+       OR i.reservation_id IS DISTINCT FROM a.reservation_id OR i.reservation_revision IS DISTINCT FROM a.reservation_revision
+       OR i.vm_uid IS DISTINCT FROM a.vm_uid OR i.vmi_uid IS DISTINCT FROM a.vmi_uid
+       OR i.launcher_uid IS DISTINCT FROM a.launcher_uid OR i.pvc_uid IS DISTINCT FROM a.pvc_uid
+       OR i.node_uid IS DISTINCT FROM a.node_uid OR i.cleanup_intent_digest IS DISTINCT FROM a.intent_digest
+       OR f->>'kind' IS DISTINCT FROM 'vm_job_never_app_ready_retained_stop_candidate_v1'
+       OR (SELECT array_agg(k ORDER BY k COLLATE "C") FROM jsonb_object_keys(f) k) IS DISTINCT FROM ARRAY['cleanup_admission_id','cleanup_intent_digest','cleanup_request_id','containers','job_id','kind','kube_vm_ready_at_inspection','launcher_name','launcher_resource_version','launcher_uid','namespace','node_name','node_uid','provision_generation','pvc_uid','vm_generation','vm_name','vm_resource_version','vm_uid','vmi_uid']
+       OR jsonb_typeof(f->'kube_vm_ready_at_inspection') IS DISTINCT FROM 'boolean'
+       OR f->>'cleanup_admission_id' IS DISTINCT FROM a.cleanup_admission_id::text
+       OR f->>'cleanup_request_id' IS DISTINCT FROM a.cleanup_request_id::text
+       OR f->>'cleanup_intent_digest' IS DISTINCT FROM a.intent_digest
+       OR f->>'namespace' IS DISTINCT FROM a.namespace
+       OR f->>'vm_name' IS DISTINCT FROM 'agent-vm-'||a.job_id
+       OR jsonb_typeof(f->'containers') IS DISTINCT FROM 'array'
+       OR jsonb_array_length(f->'containers')=0
+       OR NOT EXISTS(SELECT 1 FROM jsonb_array_elements(f->'containers') c WHERE c->>'kind'='regular' AND c->>'name'='compute')
+       OR (SELECT count(*)<>count(DISTINCT c->>'name') FROM jsonb_array_elements(f->'containers') c) THEN
+        RETURN false;
+    END IF;
+    SELECT z.id INTO receipt_id FROM public.managed_repository_process_zero_receipts z
+     WHERE z.owner_kind='job' AND z.owner_id=i.job_id AND z.scope='vm' AND z.provisioner='vm'
+       AND z.runtime_incarnation=i.provision_generation::text;
+    IF i.prior_zero_receipt_id IS DISTINCT FROM receipt_id THEN RETURN false; END IF;
+    FOREACH item IN ARRAY ARRAY[f->'launcher_name',f->'node_name',f->'vm_resource_version',f->'launcher_resource_version'] LOOP
+        IF jsonb_typeof(item) IS DISTINCT FROM 'string' OR item#>>'{}' !~ '^[^[:space:]]+$' THEN RETURN false; END IF;
+    END LOOP;
+    FOR item IN SELECT value FROM jsonb_array_elements(f->'containers') LOOP
+        IF (SELECT array_agg(k ORDER BY k COLLATE "C") FROM jsonb_object_keys(item) k) IS DISTINCT FROM ARRAY['container_id','kind','name']
+           OR item->>'kind' NOT IN ('regular','init')
+           OR jsonb_typeof(item->'name') IS DISTINCT FROM 'string' OR item->>'name' !~ '^[^[:space:]]+$'
+           OR jsonb_typeof(item->'container_id') IS DISTINCT FROM 'string' OR item->>'container_id' !~ '^[^[:space:]]+$' THEN RETURN false; END IF;
+    END LOOP;
+    RETURN public.validate_vm_job_cancel_retention(i.cleanup_admission_id,false);
+END;
 $_$;
 
 
@@ -13991,6 +25644,724 @@ CREATE FUNCTION public.vm_remote_workspace_contract_envelope(value jsonb, config
             ELSE config_override
         END
     );
+$$;
+
+
+--
+-- Name: vm_resource_inventory_immutable(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.vm_resource_inventory_immutable() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+BEGIN
+    IF NEW IS DISTINCT FROM OLD THEN
+        RAISE EXCEPTION 'Resource inventory observations are immutable' USING ERRCODE = '23514';
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+
+--
+-- Name: vm_thread_creation_compute_delete_evidence(public.threads); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.vm_thread_creation_compute_delete_evidence(owner_row public.threads) RETURNS jsonb
+    LANGUAGE plpgsql
+    AS $$
+DECLARE evidence jsonb;
+        a public.vm_resource_thread_cleanup_authorities%ROWTYPE;
+        s public.vm_resource_thread_cleanup_stops%ROWTYPE;
+        charge public.vm_resource_reservations%ROWTYPE;
+BEGIN
+    evidence := public.vm_thread_creation_failed_initial_delete_evidence(owner_row);
+    IF evidence IS NOT NULL THEN RETURN evidence; END IF;
+    SELECT * INTO a FROM public.vm_resource_thread_cleanup_authorities
+        WHERE thread_id=owner_row.id AND runtime_generation=owner_row.runtime_generation
+          AND retirement_token=owner_row.runtime_retirement_token AND purge_disk;
+    IF NOT FOUND THEN RETURN NULL; END IF;
+    SELECT * INTO s FROM public.vm_resource_thread_cleanup_stops
+        WHERE cleanup_admission_id=a.cleanup_admission_id;
+    IF NOT FOUND THEN RETURN NULL; END IF;
+    SELECT * INTO charge FROM public.vm_resource_reservations WHERE id=a.reservation_id FOR UPDATE;
+    IF owner_row.runtime_retirement_permanent IS DISTINCT FROM true
+       OR charge.state IS DISTINCT FROM 'released'
+       OR charge.release_evidence IS DISTINCT FROM jsonb_build_object(
+           'kind','exact_cleanup_compute_absent','owner_kind','thread','thread_id',a.thread_id,
+           'cleanup_admission_id',a.cleanup_admission_id,'reservation_revision',a.reservation_revision,
+           'stop_evidence_digest','sha256:'||encode(sha256(convert_to(s.stop_evidence::text,'UTF8')),'hex'))
+       OR NOT EXISTS (SELECT 1 FROM public.thread_runtime_retirement_outcomes o
+           WHERE o.thread_id=owner_row.id AND o.runtime_generation=a.runtime_generation
+             AND o.retirement_token=a.retirement_token AND o.permanent AND o.outcome='deleted'
+             AND o.disposition='ended' AND o.agent_id IS NOT DISTINCT FROM a.agent_id
+             AND o.runtime_attach_token IS NOT DISTINCT FROM a.attach_token)
+       OR owner_row.runtime_retirement_external_cleanup IS NULL
+       OR owner_row.runtime_retirement_external_cleanup IS DISTINCT FROM
+           public.pinned_retirement_external_cleanup_expected(owner_row.runtime_retirement_context,
+               owner_row.runtime_generation,owner_row.runtime_retirement_token)
+       OR NOT public.pinned_retirement_external_resources_absent(owner_row.id,owner_row.metadata)
+       OR EXISTS (SELECT 1 FROM public.vm_creation_retries r
+           WHERE r.owner_kind='thread' AND r.thread_id=owner_row.id AND r.state<>'succeeded'
+             AND NOT EXISTS (SELECT 1 FROM public.vm_thread_retained_resume_terminals terminal
+                 WHERE terminal.operation_id=r.thread_retained_resume_id AND terminal.source_request_id=r.request_id
+                   AND terminal.source_terminal_evidence=public.vm_thread_retained_source_snapshot(r)))
+       OR EXISTS (SELECT 1 FROM public.vm_creation_effects e
+           JOIN public.vm_creation_retries r USING(request_id)
+           WHERE r.owner_kind='thread' AND r.thread_id=owner_row.id AND e.state='issued')
+       OR EXISTS (SELECT 1 FROM public.vm_resource_reservations v
+           JOIN public.vm_creation_retries r USING(request_id)
+           WHERE r.owner_kind='thread' AND r.thread_id=owner_row.id AND v.state<>'released')
+       OR EXISTS (SELECT 1 FROM public.vm_resource_waiters w
+           WHERE w.owner_kind='thread' AND w.thread_id=owner_row.id AND w.state NOT IN ('released','cancelled'))
+       OR EXISTS (SELECT 1 FROM public.vm_workspace_cleanup_admissions c
+           WHERE c.owner_kind='thread' AND c.owner_id=owner_row.id AND c.completed_at IS NULL) THEN
+        RETURN NULL;
+    END IF;
+    PERFORM public.validate_vm_thread_cleanup_stop(a,s,true);
+    RETURN jsonb_build_object('version',2,'kind','adopted_vm_cleanup',
+        'request_id',a.request_id,'cleanup_admission_id',a.cleanup_admission_id,
+        'reservation_id',a.reservation_id,'reservation_revision',a.reservation_revision,
+        'runtime_generation',a.runtime_generation,'retirement_token',a.retirement_token,
+        'local_quiescence',owner_row.runtime_retirement_local_quiescence,
+        'external_cleanup',owner_row.runtime_retirement_external_cleanup,
+        'stop_evidence',s.stop_evidence);
+END;
+$$;
+
+
+--
+-- Name: vm_thread_creation_delete_evidence(public.threads); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.vm_thread_creation_delete_evidence(owner_row public.threads) RETURNS jsonb
+    LANGUAGE plpgsql
+    AS $$
+DECLARE evidence jsonb;
+BEGIN
+    evidence := public.vm_thread_creation_quota_delete_evidence(owner_row);
+    IF evidence IS NOT NULL THEN RETURN evidence; END IF;
+    RETURN public.vm_thread_creation_nonquota_delete_evidence(owner_row);
+END;
+$$;
+
+
+--
+-- Name: vm_thread_creation_failed_initial_delete_evidence(public.threads); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.vm_thread_creation_failed_initial_delete_evidence(owner_row public.threads) RETURNS jsonb
+    LANGUAGE plpgsql
+    AS $$
+DECLARE retry public.vm_creation_retries%ROWTYPE;
+        settled public.vm_thread_creation_settlements%ROWTYPE;
+        terminal jsonb;
+        prior_soft boolean;
+BEGIN
+    PERFORM 1 FROM public.vm_thread_creation_owners
+        WHERE thread_id=owner_row.id AND live_thread_id=owner_row.id FOR UPDATE;
+    IF NOT FOUND THEN RETURN NULL; END IF;
+    SELECT * INTO retry FROM public.vm_creation_retries
+        WHERE owner_kind='thread' AND thread_id=owner_row.id ORDER BY request_id LIMIT 1 FOR UPDATE;
+    IF NOT FOUND THEN RETURN NULL; END IF;
+    SELECT * INTO settled FROM public.vm_thread_creation_settlements WHERE request_id=retry.request_id FOR SHARE;
+    IF NOT FOUND THEN RETURN NULL; END IF;
+    PERFORM public.lock_vm_thread_creation_terminal_ledger(owner_row.id,retry.request_id);
+    terminal := public.vm_thread_creation_terminal_evidence(retry);
+    prior_soft := EXISTS (SELECT 1 FROM public.thread_runtime_retirement_outcomes o
+        WHERE o.thread_id=settled.thread_id AND o.runtime_generation=settled.runtime_generation
+          AND o.retirement_token=settled.retirement_token AND o.disposition='ended'
+          AND o.outcome='settled' AND NOT o.permanent);
+    IF terminal IS NULL OR settled.terminal_evidence IS DISTINCT FROM terminal
+       OR settled.thread_id IS DISTINCT FROM owner_row.id
+       OR settled.runtime_generation IS DISTINCT FROM owner_row.runtime_generation
+       OR owner_row.execution_lane IS DISTINCT FROM 'pinned'
+       OR owner_row.runtime_retirement_token IS NULL
+       OR owner_row.runtime_retirement_authorized_at IS NULL
+       OR owner_row.runtime_retirement_permanent IS DISTINCT FROM true
+       OR owner_row.runtime_retirement_context->>'generation' IS DISTINCT FROM owner_row.runtime_generation::text
+       OR owner_row.runtime_retirement_context->>'settle_status' IS DISTINCT FROM 'ended'
+       OR NOT EXISTS (SELECT 1 FROM public.thread_runtime_retirement_outcomes o
+           WHERE o.thread_id=owner_row.id AND o.runtime_generation=owner_row.runtime_generation
+             AND o.retirement_token=owner_row.runtime_retirement_token AND o.permanent
+             AND o.outcome='deleted' AND o.disposition='ended'
+             AND o.agent_id IS NOT DISTINCT FROM owner_row.agent_id
+             AND o.runtime_attach_token IS NOT DISTINCT FROM owner_row.runtime_attach_token)
+       OR owner_row.runtime_retirement_external_cleanup IS NULL
+       OR owner_row.runtime_retirement_external_cleanup IS DISTINCT FROM
+           public.pinned_retirement_external_cleanup_expected(owner_row.runtime_retirement_context,
+               owner_row.runtime_generation,owner_row.runtime_retirement_token)
+       OR NOT public.pinned_retirement_external_resources_absent(owner_row.id,owner_row.metadata)
+       OR (settled.retirement_token IS DISTINCT FROM owner_row.runtime_retirement_token AND NOT (
+           prior_soft AND owner_row.status='ended' AND owner_row.agent_id IS NULL
+           AND owner_row.runtime_attach_token IS NULL AND owner_row.control_admission_agent_id IS NULL
+           AND NOT EXISTS (SELECT 1 FROM public.agents a WHERE a.thread_id=owner_row.id))) THEN
+        RETURN NULL;
+    END IF;
+    RETURN jsonb_build_object('version',1,'request_id',retry.request_id,
+        'source_runtime_generation',settled.runtime_generation,
+        'source_retirement_token',settled.retirement_token,
+        'runtime_generation',owner_row.runtime_generation,
+        'retirement_token',owner_row.runtime_retirement_token,
+        'local_quiescence',owner_row.runtime_retirement_local_quiescence,
+        'external_cleanup',owner_row.runtime_retirement_external_cleanup);
+END;
+$$;
+
+
+--
+-- Name: vm_thread_creation_legacy_resume_delete_lineage(public.threads, public.vm_creation_retries); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.vm_thread_creation_legacy_resume_delete_lineage(owner_row public.threads, source public.vm_creation_retries) RETURNS jsonb
+    LANGUAGE plpgsql STABLE
+    AS $$
+DECLARE
+    context jsonb := owner_row.runtime_retirement_context;
+    soft public.thread_runtime_retirement_outcomes%ROWTYPE;
+    keep public.vm_workspace_cleanup_admissions%ROWTYPE;
+    zero public.managed_repository_process_zero_receipts%ROWTYPE;
+    digest text;
+BEGIN
+    IF NOT public.valid_vm_thread_nonquota_creation(source)
+       OR source.thread_id IS DISTINCT FROM owner_row.id
+       OR source.origin IS DISTINCT FROM 'initial' OR source.expected_pvc_uid IS NOT NULL
+       OR source.thread_wake_operation_id IS NOT NULL OR source.thread_retained_resume_id IS NOT NULL
+       OR source.state IS DISTINCT FROM 'succeeded' OR source.reason IS DISTINCT FROM 'creation_adopted'
+       OR source.boot_counted IS DISTINCT FROM true
+       OR source.thread_runtime_generation IS NULL OR source.thread_agent_id IS NULL OR source.thread_attach_token IS NULL
+       OR source.observed_vm_uid IS NULL OR source.observed_pvc_uid IS NULL
+       OR source.thread_runtime_generation IS NOT DISTINCT FROM owner_row.runtime_generation
+       OR owner_row.execution_lane IS DISTINCT FROM 'pinned' OR owner_row.status IS DISTINCT FROM 'created'
+       OR owner_row.runtime_authority_exposed IS DISTINCT FROM false
+       OR owner_row.agent_id IS NOT NULL OR owner_row.runtime_attach_token IS NOT NULL
+       OR owner_row.control_admission_agent_id IS NOT NULL
+       OR owner_row.runtime_retirement_started_at IS NULL
+       OR owner_row.runtime_retirement_token IS NULL OR owner_row.runtime_retirement_authorized_at IS NULL
+       OR owner_row.runtime_retirement_permanent IS DISTINCT FROM true
+       OR context->>'thread_id' IS DISTINCT FROM owner_row.id::text
+       OR context->>'generation' IS DISTINCT FROM owner_row.runtime_generation::text
+       OR context->>'entry_status' IS DISTINCT FROM 'created'
+       OR context->>'settle_status' IS DISTINCT FROM 'ended'
+       OR context->'runtime_authority_exposed' IS DISTINCT FROM 'false'::jsonb
+       OR context->'agent_id' IS DISTINCT FROM 'null'::jsonb
+       OR context->'runtime_attach_token' IS DISTINCT FROM 'null'::jsonb
+       OR context->'control_admission_agent_id' IS DISTINCT FROM 'null'::jsonb
+       OR COALESCE(context->'agent_pod','null'::jsonb) NOT IN ('null'::jsonb,'{}'::jsonb)
+       OR COALESCE(context->'workspace_binding','null'::jsonb) NOT IN ('null'::jsonb,'{}'::jsonb)
+       OR COALESCE(context->'initial_vm_creation','null'::jsonb)<>'null'::jsonb
+       OR EXISTS (SELECT 1 FROM public.agents a WHERE a.thread_id=owner_row.id)
+       OR EXISTS (SELECT 1 FROM public.vm_thread_retained_resumes op WHERE op.thread_id=owner_row.id)
+       OR (SELECT count(*) FROM public.vm_creation_retries r WHERE r.owner_kind='thread' AND r.thread_id=owner_row.id)<>1
+       OR NOT EXISTS (SELECT 1 FROM public.vm_workspace_cleanup_admissions c
+           WHERE c.id=source.creation_admission_id AND c.owner_kind='thread' AND c.owner_id=owner_row.id
+             AND c.source='controller_vm_create' AND c.completed_at IS NOT NULL AND c.outcome='adopted') THEN
+        RETURN NULL;
+    END IF;
+    SELECT * INTO soft FROM public.thread_runtime_retirement_outcomes o
+     WHERE o.thread_id=owner_row.id AND o.runtime_generation=source.thread_runtime_generation
+       AND o.agent_id=source.thread_agent_id AND o.runtime_attach_token=source.thread_attach_token
+       AND NOT o.permanent AND o.outcome='settled' AND o.disposition='ended'
+       AND o.settled_at<owner_row.runtime_retirement_started_at
+     ORDER BY o.settled_at DESC LIMIT 1;
+    IF NOT FOUND THEN RETURN NULL; END IF;
+    digest := 'sha256:'||encode(sha256(convert_to(format(
+        '{"owner_id":"%s","owner_kind":"thread","provision_generation":"%s","purge_disk":false,"pvc_uid":"%s","resource":"vm_workspace","source":"pinned_thread_retirement","vm_uid":"%s"}',
+        owner_row.id,source.provision_generation,source.observed_pvc_uid,source.observed_vm_uid
+    ),'UTF8')),'hex');
+    SELECT * INTO keep FROM public.vm_workspace_cleanup_admissions c
+     WHERE c.owner_kind='thread' AND c.owner_id=owner_row.id AND c.pvc_uid=source.observed_pvc_uid
+       AND c.source='pinned_thread_retirement' AND c.intent_digest=digest
+       AND c.parent_admission_id IS NULL AND c.completed_at IS NOT NULL AND c.outcome='completed'
+       AND c.completed_at<=soft.settled_at AND source.resolved_at<=c.admitted_at
+     ORDER BY c.completed_at DESC LIMIT 1;
+    IF NOT FOUND THEN RETURN NULL; END IF;
+    SELECT * INTO zero FROM public.managed_repository_process_zero_receipts p
+     WHERE p.owner_kind='thread' AND p.owner_id=owner_row.id AND p.scope='vm' AND p.provisioner='vm'
+       AND p.runtime_incarnation=source.provision_generation::text AND p.observed_at<=soft.settled_at;
+    IF NOT FOUND THEN RETURN NULL; END IF;
+    RETURN jsonb_build_object('kind','legacy_nonquota_unexposed_resume_delete',
+        'soft_end',to_jsonb(soft),'keep_admission',to_jsonb(keep),'process_zero',to_jsonb(zero));
+END;
+$$;
+
+
+--
+-- Name: vm_thread_creation_nonquota_delete_evidence(public.threads); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.vm_thread_creation_nonquota_delete_evidence(owner_row public.threads) RETURNS jsonb
+    LANGUAGE plpgsql
+    AS $$
+DECLARE
+    context jsonb := owner_row.runtime_retirement_context;
+    vm jsonb := context->'vm';
+    source public.vm_creation_retries%ROWTYPE;
+    purge public.vm_workspace_cleanup_admissions%ROWTYPE;
+    request_id uuid;
+    digest text;
+BEGIN
+    IF owner_row.execution_lane IS DISTINCT FROM 'pinned'
+       OR owner_row.runtime_retirement_token IS NULL
+       OR owner_row.runtime_retirement_authorized_at IS NULL
+       OR owner_row.runtime_retirement_permanent IS DISTINCT FROM true
+       OR context->>'thread_id' IS DISTINCT FROM owner_row.id::text
+       OR context->>'generation' IS DISTINCT FROM owner_row.runtime_generation::text
+       OR context->>'settle_status' IS DISTINCT FROM 'ended'
+       OR context->>'workspace_backend' IS DISTINCT FROM 'vm'
+       OR jsonb_typeof(vm) IS DISTINCT FROM 'object'
+       OR vm->'identity_authenticated' IS DISTINCT FROM 'true'::jsonb
+       OR vm->>'identity_provision_generation' IS DISTINCT FROM vm->>'provision_generation'
+       OR NULLIF(vm->>'vm_uid','') IS NULL
+       OR NULLIF(vm->>'rootdisk_pvc_uid','') IS NULL
+       OR owner_row.runtime_retirement_external_cleanup IS NULL
+       OR owner_row.runtime_retirement_external_cleanup IS DISTINCT FROM
+           public.pinned_retirement_external_cleanup_expected(context,
+               owner_row.runtime_generation,owner_row.runtime_retirement_token)
+       OR NOT public.pinned_retirement_external_resources_absent(owner_row.id,owner_row.metadata)
+       OR NOT EXISTS (SELECT 1 FROM public.thread_runtime_retirement_outcomes o
+           WHERE o.thread_id=owner_row.id AND o.runtime_generation=owner_row.runtime_generation
+             AND o.retirement_token=owner_row.runtime_retirement_token
+             AND o.permanent AND o.disposition='ended' AND o.outcome='deleted'
+             AND o.agent_id IS NOT DISTINCT FROM owner_row.agent_id
+             AND o.runtime_attach_token IS NOT DISTINCT FROM owner_row.runtime_attach_token) THEN
+        RETURN NULL;
+    END IF;
+
+    PERFORM 1 FROM public.vm_thread_creation_owners
+        WHERE thread_id=owner_row.id AND live_thread_id=owner_row.id FOR UPDATE;
+    IF NOT FOUND THEN RETURN NULL; END IF;
+    -- Lock every source before child ledgers, as live creation does. A retired
+    -- audit owner must never hide debt belonging to another request/generation.
+    PERFORM r.request_id FROM public.vm_creation_retries r
+        WHERE r.owner_kind='thread' AND r.thread_id=owner_row.id
+        ORDER BY r.request_id FOR UPDATE;
+    FOR request_id IN SELECT r.request_id FROM public.vm_creation_retries r
+        WHERE r.owner_kind='thread' AND r.thread_id=owner_row.id ORDER BY r.request_id
+    LOOP
+        PERFORM public.lock_vm_thread_creation_terminal_ledger(owner_row.id,request_id);
+    END LOOP;
+    SELECT * INTO source FROM public.vm_creation_retries r
+        WHERE r.owner_kind='thread' AND r.thread_id=owner_row.id
+          AND r.provision_generation::text=vm->>'provision_generation';
+    IF NOT FOUND
+       OR source.state IS DISTINCT FROM 'succeeded'
+       OR source.reason IS DISTINCT FROM 'creation_adopted'
+       OR source.controller_configuration->>'version' IS DISTINCT FROM '1'
+       OR COALESCE(source.controller_configuration->'resource_admission','null'::jsonb)<>'null'::jsonb
+       OR source.observed_vm_uid::text IS DISTINCT FROM vm->>'vm_uid'
+       OR source.observed_pvc_uid::text IS DISTINCT FROM vm->>'rootdisk_pvc_uid'
+       OR (source.thread_runtime_generation IS DISTINCT FROM owner_row.runtime_generation
+           AND public.vm_thread_creation_pre_setup_abort_path_evidence(owner_row,source) IS NULL AND public.vm_thread_creation_legacy_resume_delete_lineage(owner_row,source) IS NULL)
+       OR EXISTS (SELECT 1 FROM public.vm_resource_reservations r WHERE r.request_id=source.request_id)
+       OR NOT EXISTS (SELECT 1 FROM public.vm_workspace_cleanup_admissions c
+           WHERE c.id=source.creation_admission_id AND c.owner_kind='thread'
+             AND c.owner_id=owner_row.id AND c.source='controller_vm_create'
+             AND c.completed_at IS NOT NULL AND c.outcome='adopted') THEN
+        RETURN NULL;
+    END IF;
+    IF ROW(source.thread_agent_id,source.thread_attach_token) IS DISTINCT FROM
+       ROW(owner_row.agent_id,owner_row.runtime_attach_token)
+       AND public.vm_thread_creation_pre_setup_abort_path_evidence(owner_row,source) IS NULL AND public.vm_thread_creation_legacy_resume_delete_lineage(owner_row,source) IS NULL AND NOT (
+        owner_row.status='ended' AND owner_row.agent_id IS NULL
+        AND owner_row.runtime_attach_token IS NULL AND owner_row.control_admission_agent_id IS NULL
+        AND NOT EXISTS (SELECT 1 FROM public.agents a WHERE a.thread_id=owner_row.id)
+        AND EXISTS (SELECT 1 FROM public.thread_runtime_retirement_outcomes o
+            WHERE o.thread_id=owner_row.id AND o.runtime_generation=owner_row.runtime_generation
+              AND o.disposition='ended' AND o.outcome='settled' AND NOT o.permanent
+              AND o.agent_id IS NOT DISTINCT FROM source.thread_agent_id
+              AND o.runtime_attach_token IS NOT DISTINCT FROM source.thread_attach_token)
+    ) THEN RETURN NULL; END IF;
+
+    digest := 'sha256:' || encode(sha256(convert_to(format(
+        '{"owner_id":"%s","owner_kind":"thread","provision_generation":"%s","purge_disk":true,"pvc_uid":"%s","resource":"vm_workspace","source":"pinned_thread_retirement","vm_uid":"%s"}',
+        owner_row.id,source.provision_generation,source.observed_pvc_uid,source.observed_vm_uid
+    ),'UTF8')),'hex');
+    SELECT * INTO purge FROM public.vm_workspace_cleanup_admissions c
+        WHERE c.owner_kind='thread' AND c.owner_id=owner_row.id
+          AND c.pvc_uid=source.observed_pvc_uid AND c.source='pinned_thread_retirement'
+          AND c.intent_digest=digest AND c.completed_at IS NOT NULL AND c.outcome='completed';
+    IF NOT FOUND
+       OR EXISTS (SELECT 1 FROM public.vm_creation_retries r
+           WHERE r.owner_kind='thread' AND r.thread_id=owner_row.id AND r.state<>'succeeded'
+             AND NOT EXISTS (SELECT 1 FROM public.vm_thread_retained_resume_terminals t
+                 WHERE t.operation_id=r.thread_retained_resume_id AND t.source_request_id=r.request_id
+                   AND t.source_terminal_evidence=public.vm_thread_retained_source_snapshot(r)))
+       OR EXISTS (SELECT 1 FROM public.vm_creation_effects e
+           JOIN public.vm_creation_retries r USING(request_id)
+           WHERE r.owner_kind='thread' AND r.thread_id=owner_row.id AND e.state='issued')
+       OR EXISTS (SELECT 1 FROM public.vm_resource_reservations v
+           JOIN public.vm_creation_retries r USING(request_id)
+           WHERE r.owner_kind='thread' AND r.thread_id=owner_row.id AND v.state<>'released')
+       OR EXISTS (SELECT 1 FROM public.vm_resource_waiters w
+           WHERE w.owner_kind='thread' AND w.thread_id=owner_row.id AND w.state NOT IN ('released','cancelled'))
+       OR EXISTS (SELECT 1 FROM public.vm_workspace_cleanup_admissions c
+           WHERE c.owner_kind='thread' AND c.owner_id=owner_row.id AND c.completed_at IS NULL) THEN
+        RETURN NULL;
+    END IF;
+    RETURN jsonb_build_object('version',4,'kind','nonquota_adopted_vm_cleanup',
+        'request_id',source.request_id,'cleanup_admission_id',purge.id,
+        'runtime_generation',owner_row.runtime_generation,'retirement_token',owner_row.runtime_retirement_token,
+        'source_evidence',public.vm_thread_retained_source_snapshot(source),
+        'pre_setup_abort',public.vm_thread_creation_pre_setup_abort_evidence(owner_row,source),
+        'pre_setup_abort_path',public.vm_thread_creation_pre_setup_abort_path_evidence(owner_row,source),
+        'legacy_resume_delete',public.vm_thread_creation_legacy_resume_delete_lineage(owner_row,source),
+        'purge_admission',to_jsonb(purge),
+        'local_quiescence',owner_row.runtime_retirement_local_quiescence,
+        'external_cleanup',owner_row.runtime_retirement_external_cleanup);
+END;
+$$;
+
+
+--
+-- Name: vm_thread_creation_pre_setup_abort_evidence(public.threads, public.vm_creation_retries); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.vm_thread_creation_pre_setup_abort_evidence(owner_row public.threads, source_row public.vm_creation_retries) RETURNS jsonb
+    LANGUAGE plpgsql STABLE
+    AS $$
+DECLARE evidence jsonb;
+BEGIN
+    IF source_row.owner_kind IS DISTINCT FROM 'thread'
+       OR source_row.thread_id IS DISTINCT FROM owner_row.id
+       OR source_row.state IS DISTINCT FROM 'succeeded'
+       OR source_row.reason IS DISTINCT FROM 'creation_adopted'
+       OR source_row.thread_runtime_generation IS NULL
+       OR source_row.thread_runtime_generation IS NOT DISTINCT FROM owner_row.runtime_generation
+       OR source_row.thread_agent_id IS NULL OR source_row.thread_attach_token IS NULL THEN
+        RETURN NULL;
+    END IF;
+    SELECT to_jsonb(abort) INTO evidence
+      FROM public.thread_runtime_attach_abort_outcomes abort
+      JOIN public.vm_workspace_cleanup_admissions creation
+        ON creation.id=source_row.creation_admission_id
+       AND creation.owner_kind='thread' AND creation.owner_id=owner_row.id
+       AND creation.source='controller_vm_create' AND creation.outcome='adopted'
+       AND creation.completed_at IS NOT NULL AND creation.completed_at<=abort.released_at
+     WHERE abort.thread_id=owner_row.id
+       AND abort.runtime_generation=source_row.thread_runtime_generation
+       AND abort.runtime_attach_token=source_row.thread_attach_token
+       AND abort.agent_id=source_row.thread_agent_id
+       AND NULLIF(abort.agent_pod_uid,'') IS NOT NULL
+       AND EXISTS (SELECT 1 FROM public.thread_agent_pod_provision_intents intent
+           WHERE intent.thread_id=abort.thread_id
+             AND intent.runtime_generation=abort.runtime_generation
+             AND intent.pod_uid=abort.agent_pod_uid
+             AND intent.status='published'
+             AND intent.provisioner IN ('agent','persistent')
+             AND intent.protection_protocol='finalizer_v1'
+             AND intent.resolved_at IS NOT NULL AND intent.resolved_at<=abort.released_at)
+       AND abort.successor_generation=owner_row.runtime_generation
+       AND abort.release_kind='process_zero'
+       AND abort.quiescence_protocol='agent_attach_not_started_v1'
+       AND ((abort.workspace_generation IS NULL AND abort.workspace_runtime_incarnation IS NULL)
+            OR (abort.workspace_generation=source_row.provision_generation
+                AND abort.workspace_runtime_incarnation::text=source_row.observed_vm_uid::text));
+    RETURN evidence;
+END;
+$$;
+
+
+--
+-- Name: vm_thread_creation_pre_setup_abort_path_evidence(public.threads, public.vm_creation_retries); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.vm_thread_creation_pre_setup_abort_path_evidence(owner_row public.threads, source_row public.vm_creation_retries) RETURNS jsonb
+    LANGUAGE plpgsql STABLE
+    AS $$
+DECLARE
+    cursor_generation uuid := source_row.thread_runtime_generation;
+    visited uuid[] := ARRAY[]::uuid[];
+    edge public.thread_runtime_attach_abort_outcomes%ROWTYPE;
+    edge_count integer;
+    hops integer := 0;
+    previous_release timestamptz;
+    path jsonb := '[]'::jsonb;
+BEGIN
+    IF source_row.owner_kind IS DISTINCT FROM 'thread'
+       OR source_row.thread_id IS DISTINCT FROM owner_row.id
+       OR source_row.state IS DISTINCT FROM 'succeeded'
+       OR source_row.reason IS DISTINCT FROM 'creation_adopted'
+       OR source_row.thread_runtime_generation IS NULL
+       OR owner_row.runtime_generation IS NULL
+       OR owner_row.runtime_retirement_started_at IS NULL
+       OR source_row.thread_runtime_generation IS NOT DISTINCT FROM owner_row.runtime_generation
+       OR source_row.thread_agent_id IS NULL OR source_row.thread_attach_token IS NULL THEN
+        RETURN NULL;
+    END IF;
+    SELECT creation.completed_at INTO previous_release
+      FROM public.vm_workspace_cleanup_admissions creation
+     WHERE creation.id=source_row.creation_admission_id
+       AND creation.owner_kind='thread' AND creation.owner_id=owner_row.id
+       AND creation.source='controller_vm_create' AND creation.outcome='adopted'
+       AND creation.completed_at IS NOT NULL;
+    IF NOT FOUND THEN RETURN NULL; END IF;
+    LOOP
+        IF hops>=4096 OR cursor_generation=ANY(visited) THEN RETURN NULL; END IF;
+        visited := array_append(visited,cursor_generation);
+        SELECT count(*) INTO edge_count FROM (
+            SELECT 1 FROM public.thread_runtime_attach_abort_outcomes abort
+             WHERE abort.thread_id=owner_row.id AND abort.runtime_generation=cursor_generation
+             LIMIT 2
+        ) candidates;
+        IF edge_count<>1 THEN RETURN NULL; END IF;
+        SELECT * INTO edge FROM public.thread_runtime_attach_abort_outcomes
+         WHERE thread_id=owner_row.id AND runtime_generation=cursor_generation;
+        IF edge.agent_id IS NULL OR edge.runtime_attach_token IS NULL
+           OR NULLIF(btrim(edge.agent_pod_uid),'') IS NULL
+           OR edge.successor_generation IS NULL OR edge.successor_generation=ANY(visited)
+           OR edge.release_kind IS DISTINCT FROM 'process_zero'
+           OR edge.quiescence_protocol IS DISTINCT FROM 'agent_attach_not_started_v1'
+           OR edge.released_at IS NULL OR edge.released_at<previous_release
+           OR edge.released_at>owner_row.runtime_retirement_started_at
+           OR (hops=0 AND (
+               edge.agent_id IS DISTINCT FROM source_row.thread_agent_id
+               OR edge.runtime_attach_token IS DISTINCT FROM source_row.thread_attach_token))
+           OR ((edge.workspace_generation IS NULL AND edge.workspace_runtime_incarnation IS NULL)
+               OR (edge.workspace_generation=source_row.provision_generation
+                   AND edge.workspace_runtime_incarnation::text=source_row.observed_vm_uid::text)) IS NOT TRUE
+           OR NOT EXISTS (SELECT 1 FROM public.thread_agent_pod_provision_intents intent
+               WHERE intent.thread_id=edge.thread_id AND intent.runtime_generation=edge.runtime_generation
+                 AND intent.pod_uid=edge.agent_pod_uid AND intent.status='published'
+                 AND intent.provisioner IN ('agent','persistent')
+                 AND intent.protection_protocol='finalizer_v1'
+                 AND intent.resolved_at IS NOT NULL AND intent.resolved_at<=edge.released_at) THEN
+            RETURN NULL;
+        END IF;
+        path := path || jsonb_build_array(to_jsonb(edge));
+        previous_release := edge.released_at;
+        cursor_generation := edge.successor_generation;
+        hops := hops+1;
+        IF cursor_generation=owner_row.runtime_generation THEN RETURN path; END IF;
+    END LOOP;
+END;
+$$;
+
+
+--
+-- Name: vm_thread_creation_quota_delete_evidence(public.threads); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.vm_thread_creation_quota_delete_evidence(owner_row public.threads) RETURNS jsonb
+    LANGUAGE plpgsql
+    AS $$
+DECLARE evidence jsonb;
+        d public.vm_thread_retained_disk_purge_authorities%ROWTYPE;
+        a public.vm_resource_thread_cleanup_authorities%ROWTYPE;
+        proof jsonb;
+BEGIN
+    evidence := public.vm_thread_creation_compute_delete_evidence(owner_row);
+    IF evidence IS NOT NULL THEN RETURN evidence; END IF;
+    SELECT disk.* INTO d FROM public.vm_thread_retained_disk_purge_authorities disk
+        JOIN public.vm_resource_thread_cleanup_authorities compute ON compute.cleanup_admission_id=disk.compute_cleanup_admission_id
+        WHERE compute.thread_id=owner_row.id AND disk.runtime_generation=owner_row.runtime_generation
+          AND disk.retirement_token=owner_row.runtime_retirement_token;
+    IF NOT FOUND THEN RETURN NULL; END IF;
+    SELECT * INTO a FROM public.vm_resource_thread_cleanup_authorities WHERE cleanup_admission_id=d.compute_cleanup_admission_id;
+    SELECT purge_evidence INTO proof FROM public.vm_thread_retained_disk_purge_receipts WHERE cleanup_admission_id=d.cleanup_admission_id;
+    IF proof IS NULL
+       OR NOT EXISTS (SELECT 1 FROM public.vm_workspace_cleanup_admissions c WHERE c.id=d.cleanup_admission_id AND c.completed_at IS NOT NULL AND c.outcome='completed')
+       OR NOT EXISTS (SELECT 1 FROM public.thread_runtime_retirement_outcomes o
+           WHERE o.thread_id=owner_row.id AND o.runtime_generation=d.runtime_generation AND o.retirement_token=d.retirement_token
+             AND o.permanent AND o.outcome='deleted' AND o.disposition='ended'
+             AND o.agent_id IS NOT DISTINCT FROM owner_row.agent_id
+             AND o.runtime_attach_token IS NOT DISTINCT FROM owner_row.runtime_attach_token)
+       OR owner_row.runtime_retirement_external_cleanup IS NULL
+       OR owner_row.runtime_retirement_external_cleanup IS DISTINCT FROM
+           public.pinned_retirement_external_cleanup_expected(d.retirement_context,d.runtime_generation,d.retirement_token)
+       OR NOT public.pinned_retirement_external_resources_absent(owner_row.id,owner_row.metadata)
+       OR EXISTS (SELECT 1 FROM public.vm_creation_retries r WHERE r.owner_kind='thread' AND r.thread_id=owner_row.id AND r.state<>'succeeded'
+           AND NOT EXISTS (SELECT 1 FROM public.vm_thread_retained_resume_terminals terminal
+               WHERE terminal.operation_id=r.thread_retained_resume_id AND terminal.source_request_id=r.request_id
+                 AND terminal.source_terminal_evidence=public.vm_thread_retained_source_snapshot(r)))
+       OR EXISTS (SELECT 1 FROM public.vm_creation_effects e JOIN public.vm_creation_retries r USING(request_id)
+           WHERE r.owner_kind='thread' AND r.thread_id=owner_row.id AND e.state='issued')
+       OR EXISTS (SELECT 1 FROM public.vm_resource_reservations v JOIN public.vm_creation_retries r USING(request_id)
+           WHERE r.owner_kind='thread' AND r.thread_id=owner_row.id AND v.state<>'released')
+       OR EXISTS (SELECT 1 FROM public.vm_resource_waiters w WHERE w.owner_kind='thread' AND w.thread_id=owner_row.id AND w.state NOT IN ('released','cancelled'))
+       OR EXISTS (SELECT 1 FROM public.vm_workspace_cleanup_admissions c WHERE c.owner_kind='thread' AND c.owner_id=owner_row.id AND c.completed_at IS NULL) THEN
+        RETURN NULL;
+    END IF;
+    PERFORM public.validate_vm_thread_retained_disk_purge_receipt(d,proof,true);
+    RETURN jsonb_build_object('version',3,'kind','retained_vm_disk_purge',
+        'request_id',a.request_id,'compute_cleanup_admission_id',a.cleanup_admission_id,
+        'disk_cleanup_admission_id',d.cleanup_admission_id,
+        'reservation_id',a.reservation_id,'reservation_revision',a.reservation_revision,
+        'runtime_generation',d.runtime_generation,'compute_retirement_token',a.retirement_token,
+        'retirement_token',d.retirement_token,'local_quiescence',owner_row.runtime_retirement_local_quiescence,
+        'external_cleanup',owner_row.runtime_retirement_external_cleanup,'purge_evidence',proof);
+END;
+$$;
+
+
+--
+-- Name: vm_thread_creation_terminal_evidence(public.vm_creation_retries); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.vm_thread_creation_terminal_evidence(retry public.vm_creation_retries) RETURNS jsonb
+    LANGUAGE plpgsql STABLE
+    AS $$
+DECLARE result jsonb;
+BEGIN
+    IF retry.owner_kind IS DISTINCT FROM 'thread'
+       OR retry.origin IS DISTINCT FROM 'initial'
+       OR retry.state IS DISTINCT FROM 'settled'
+       OR retry.reason IS NULL OR retry.reason NOT IN ('creation_never_issued','creation_disposed')
+       OR retry.expected_pvc_uid IS NOT NULL OR retry.thread_wake_operation_id IS NOT NULL
+       OR retry.observed_vm_uid IS NOT NULL OR retry.boot_counted
+       OR COALESCE(retry.canonical_request->'workspace_storage','null'::jsonb)<>'null'::jsonb
+       OR EXISTS (SELECT 1 FROM public.vm_creation_retries r
+           WHERE r.owner_kind='thread' AND r.thread_id=retry.thread_id AND r.request_id<>retry.request_id)
+       OR EXISTS (SELECT 1 FROM public.vm_creation_effects e WHERE e.request_id=retry.request_id
+           AND (e.state='issued' OR (e.effect_kind='vm' AND e.state<>'rejected')))
+       OR EXISTS (SELECT 1 FROM public.vm_resource_reservations v
+           WHERE v.request_id=retry.request_id AND v.state<>'released')
+       OR EXISTS (SELECT 1 FROM public.vm_resource_waiters w
+           WHERE w.owner_kind='thread' AND w.thread_id=retry.thread_id
+             AND (w.request_id<>retry.request_id OR w.state NOT IN ('released','cancelled')))
+       OR EXISTS (SELECT 1 FROM public.vm_workspace_cleanup_admissions a
+           WHERE a.owner_kind='thread' AND a.owner_id=retry.thread_id AND a.completed_at IS NULL)
+       OR (retry.reason='creation_never_issued' AND (
+           retry.observed_pvc_uid IS NOT NULL OR retry.cancellation_disposition IS NOT NULL
+           OR EXISTS (SELECT 1 FROM public.vm_creation_effects e
+               WHERE e.request_id=retry.request_id AND e.state<>'rejected')
+           OR (retry.creation_admission_id IS NOT NULL AND (
+               COALESCE(retry.canonical_request->'preparation','null'::jsonb)<>'null'::jsonb
+               OR retry.controller_configuration->'golden_enabled' IS DISTINCT FROM 'false'::jsonb)))) THEN
+        RETURN NULL;
+    END IF;
+    SELECT jsonb_build_object(
+        'version',1,
+        'source',to_jsonb(retry)-ARRAY['canonical_request','controller_configuration',
+            'revision','claim_token','claim_expires_at','next_probe_at','backoff_attempt',
+            'transport_outage_started_at','updated_at'],
+        'effects',COALESCE((SELECT jsonb_agg(to_jsonb(e) ORDER BY e.effect_nonce)
+            FROM public.vm_creation_effects e WHERE e.request_id=retry.request_id),'[]'::jsonb),
+        'admissions',COALESCE((SELECT jsonb_agg(to_jsonb(a) ORDER BY a.id)
+            FROM public.vm_workspace_cleanup_admissions a
+            WHERE a.owner_kind='thread' AND a.owner_id=retry.thread_id),'[]'::jsonb),
+        'reservations',COALESCE((SELECT jsonb_agg(to_jsonb(v) ORDER BY v.id)
+            FROM public.vm_resource_reservations v WHERE v.request_id=retry.request_id),'[]'::jsonb),
+        'waiter',(SELECT to_jsonb(w) FROM public.vm_resource_waiters w WHERE w.request_id=retry.request_id)
+    ) INTO result;
+    RETURN result;
+END;
+$$;
+
+
+--
+-- Name: vm_thread_retained_abort_path(public.vm_thread_retained_resumes, uuid); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.vm_thread_retained_abort_path(op public.vm_thread_retained_resumes, target_generation uuid) RETURNS jsonb
+    LANGUAGE plpgsql STABLE
+    AS $$
+DECLARE cursor_generation uuid := op.runtime_generation;
+        visited uuid[] := ARRAY[]::uuid[];
+        edge public.thread_runtime_attach_abort_outcomes%ROWTYPE;
+        source public.vm_creation_retries%ROWTYPE;
+        path jsonb := '[]'::jsonb;
+        edge_count integer;
+        hops integer := 0;
+BEGIN
+    IF op.id IS NULL OR target_generation IS NULL THEN RETURN NULL; END IF;
+    IF cursor_generation=target_generation THEN RETURN path; END IF;
+    SELECT * INTO source FROM public.vm_creation_retries WHERE request_id=op.request_id;
+    LOOP
+        IF hops>=4096 OR cursor_generation=ANY(visited) THEN RETURN NULL; END IF;
+        visited := array_append(visited,cursor_generation);
+        SELECT count(*) INTO edge_count FROM (SELECT 1 FROM public.thread_runtime_attach_abort_outcomes o
+            WHERE o.thread_id=op.thread_id AND o.runtime_generation=cursor_generation LIMIT 2) candidates;
+        IF edge_count<>1 THEN RETURN NULL; END IF;
+        SELECT * INTO edge FROM public.thread_runtime_attach_abort_outcomes
+            WHERE thread_id=op.thread_id AND runtime_generation=cursor_generation;
+        IF edge.release_kind IS DISTINCT FROM 'process_zero'
+           OR edge.quiescence_protocol IS DISTINCT FROM 'agent_attach_not_started_v1'
+           OR edge.workspace_generation IS NOT NULL OR edge.workspace_runtime_incarnation IS NOT NULL
+           OR edge.agent_id IS NULL OR edge.runtime_attach_token IS NULL
+           OR NULLIF(btrim(edge.agent_pod_uid),'') IS NULL
+           OR edge.successor_generation IS NULL OR edge.successor_generation=ANY(visited)
+           OR (hops=0 AND source.request_id IS NOT NULL AND (
+               edge.agent_id IS DISTINCT FROM source.thread_agent_id OR edge.runtime_attach_token IS DISTINCT FROM source.thread_attach_token))
+           OR NOT (EXISTS (SELECT 1 FROM public.thread_agent_warm_binding_protections p
+               WHERE p.thread_id=op.thread_id AND p.runtime_generation=edge.runtime_generation
+                 AND p.agent_id=edge.agent_id AND p.runtime_attach_token=edge.runtime_attach_token
+                 AND p.pod_uid=edge.agent_pod_uid AND p.bound_at IS NOT NULL
+                 AND p.evidence_protocol='exact_live_finalizer_v1')
+               OR EXISTS (SELECT 1 FROM public.thread_agent_pod_provision_intents p
+                   WHERE p.thread_id=op.thread_id AND p.runtime_generation=edge.runtime_generation
+                     AND p.pod_uid=edge.agent_pod_uid AND p.status='published'
+                     AND p.protection_protocol='finalizer_v1')) THEN
+            RETURN NULL;
+        END IF;
+        path := path || jsonb_build_array(to_jsonb(edge));
+        cursor_generation := edge.successor_generation;
+        hops := hops+1;
+        IF cursor_generation=target_generation THEN RETURN path; END IF;
+    END LOOP;
+END;
+$$;
+
+
+--
+-- Name: vm_thread_retained_source_snapshot(public.vm_creation_retries); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.vm_thread_retained_source_snapshot(retry public.vm_creation_retries) RETURNS jsonb
+    LANGUAGE sql STABLE
+    AS $$
+    SELECT jsonb_build_object('version',1,'kind','retained_vm_creation_terminal',
+        'source',to_jsonb(retry)-ARRAY['canonical_request','controller_configuration','revision',
+            'claim_token','claim_expires_at','next_probe_at','backoff_attempt','transport_outage_started_at','updated_at'],
+        'effects',COALESCE((SELECT jsonb_agg(to_jsonb(e) ORDER BY e.effect_nonce)
+            FROM public.vm_creation_effects e WHERE e.request_id=retry.request_id),'[]'::jsonb),
+        'reservations',COALESCE((SELECT jsonb_agg(to_jsonb(r) ORDER BY r.id)
+            FROM public.vm_resource_reservations r WHERE r.request_id=retry.request_id),'[]'::jsonb),
+        'waiter',(SELECT to_jsonb(w) FROM public.vm_resource_waiters w WHERE w.request_id=retry.request_id));
+$$;
+
+
+--
+-- Name: vm_thread_retained_source_terminal_evidence(public.vm_creation_retries); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.vm_thread_retained_source_terminal_evidence(retry public.vm_creation_retries) RETURNS jsonb
+    LANGUAGE plpgsql STABLE
+    AS $$
+BEGIN
+    IF NOT public.valid_vm_thread_retained_resume_source(retry)
+       OR retry.state IS DISTINCT FROM 'settled' OR retry.resolved_at IS NULL
+       OR retry.reason IS NULL OR retry.reason NOT IN ('creation_never_issued','creation_disposed','retained_creation_handoff')
+       OR EXISTS (SELECT 1 FROM public.vm_creation_effects e WHERE e.request_id=retry.request_id AND e.state='issued')
+       OR EXISTS (SELECT 1 FROM public.vm_resource_reservations r WHERE r.request_id=retry.request_id AND r.state<>'released')
+       OR (NOT EXISTS (SELECT 1 FROM public.vm_resource_waiters w WHERE w.request_id=retry.request_id AND w.state IN ('released','cancelled'))
+           AND NOT public.valid_vm_thread_nonquota_creation(retry))
+       OR (retry.creation_admission_id IS NOT NULL AND NOT EXISTS (
+           SELECT 1 FROM public.vm_workspace_cleanup_admissions a WHERE a.id=retry.creation_admission_id
+             AND a.completed_at IS NOT NULL AND a.outcome=CASE retry.reason WHEN 'creation_never_issued' THEN 'never_issued' WHEN 'creation_disposed' THEN 'creation_disposed' ELSE 'adopted' END)) THEN
+        RETURN NULL;
+    END IF;
+    IF retry.reason='retained_creation_handoff' THEN
+        IF NOT EXISTS (SELECT 1 FROM public.vm_resource_thread_cleanup_authorities a
+            JOIN public.vm_resource_thread_cleanup_stops s USING(cleanup_admission_id)
+            JOIN public.vm_workspace_cleanup_admissions c ON c.id=a.cleanup_admission_id
+            WHERE a.request_id=retry.request_id AND c.completed_at IS NOT NULL AND c.outcome='completed') THEN
+            RETURN NULL;
+        END IF;
+    ELSIF retry.observed_vm_uid IS NOT NULL OR retry.boot_counted OR EXISTS (
+        SELECT 1 FROM public.vm_creation_effects e WHERE e.request_id=retry.request_id AND e.effect_kind='vm' AND e.state<>'rejected') THEN
+        RETURN NULL;
+    ELSIF retry.reason='creation_never_issued' AND (
+        retry.observed_pvc_uid IS NOT NULL OR retry.cancellation_disposition IS NOT NULL
+        OR EXISTS (SELECT 1 FROM public.vm_creation_effects e WHERE e.request_id=retry.request_id AND e.state<>'rejected')) THEN
+        RETURN NULL;
+    ELSIF retry.reason='creation_disposed' AND (
+        retry.cancellation_disposition->>'disk_policy' IS DISTINCT FROM 'retain'
+        OR NOT public.valid_vm_creation_disposition_evidence(retry)) THEN
+        RETURN NULL;
+    END IF;
+    RETURN public.vm_thread_retained_source_snapshot(retry);
+END;
 $$;
 
 
@@ -14612,6 +26983,64 @@ COMMENT ON TABLE public.capability_grants IS 'Scoped capability entitlements (Sl
 
 
 --
+-- Name: cloud_folder_grants; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.cloud_folder_grants (
+    id uuid NOT NULL,
+    kind text NOT NULL,
+    datasource_id uuid NOT NULL,
+    project_id uuid NOT NULL,
+    user_id uuid NOT NULL,
+    backend_id text NOT NULL,
+    backend_instance_id uuid NOT NULL,
+    folder_handle_sha256 text NOT NULL,
+    principal_id text NOT NULL,
+    group_id text NOT NULL,
+    credentials text,
+    webdav_url text NOT NULL,
+    status text DEFAULT 'minting'::text NOT NULL,
+    failure_code text,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    verified_at timestamp with time zone,
+    activated_at timestamp with time zone,
+    revoke_requested_at timestamp with time zone,
+    revoke_reason text,
+    revoke_attempts integer DEFAULT 0 NOT NULL,
+    revoke_next_at timestamp with time zone,
+    revoke_error text,
+    revoked_at timestamp with time zone,
+    CONSTRAINT cloud_folder_grants_active_check CHECK (((status <> 'active'::text) OR ((activated_at IS NOT NULL) AND ((kind <> 'reader'::text) OR (verified_at IS NOT NULL))))),
+    CONSTRAINT cloud_folder_grants_attempts_check CHECK ((revoke_attempts >= 0)),
+    CONSTRAINT cloud_folder_grants_credentials_check CHECK (((status <> ALL (ARRAY['minting'::text, 'active'::text])) OR (NULLIF(credentials, ''::text) IS NOT NULL))),
+    CONSTRAINT cloud_folder_grants_done_check CHECK (((status <> ALL (ARRAY['revoked'::text, 'failed'::text, 'abandoned'::text])) OR (credentials IS NULL))),
+    CONSTRAINT cloud_folder_grants_failure_check CHECK ((((status <> 'failed'::text) OR (failure_code IS NOT NULL)) AND ((failure_code IS NULL) OR (failure_code ~ '^[a-z][a-z0-9_]{0,63}$'::text)))),
+    CONSTRAINT cloud_folder_grants_folder_check CHECK ((folder_handle_sha256 ~ '^[0-9a-f]{64}$'::text)),
+    CONSTRAINT cloud_folder_grants_group_check CHECK ((group_id = (
+CASE kind
+    WHEN 'reader'::text THEN 'srw-rog-f-'::text
+    ELSE 'srw-rwg-f-'::text
+END || replace((id)::text, '-'::text, ''::text)))),
+    CONSTRAINT cloud_folder_grants_kind_check CHECK ((kind = ANY (ARRAY['reader'::text, 'writer'::text]))),
+    CONSTRAINT cloud_folder_grants_principal_check CHECK ((principal_id = (
+CASE kind
+    WHEN 'reader'::text THEN 'srw-reader-f-'::text
+    ELSE 'srw-writer-f-'::text
+END || replace((id)::text, '-'::text, ''::text)))),
+    CONSTRAINT cloud_folder_grants_revoke_check CHECK ((((status <> ALL (ARRAY['revoking'::text, 'revoked'::text, 'failed'::text, 'abandoned'::text])) OR ((revoke_requested_at IS NOT NULL) AND (revoke_reason IS NOT NULL))) AND ((status = ANY (ARRAY['revoked'::text, 'failed'::text, 'abandoned'::text])) = (revoked_at IS NOT NULL)))),
+    CONSTRAINT cloud_folder_grants_status_check CHECK ((status = ANY (ARRAY['minting'::text, 'active'::text, 'revoking'::text, 'revoked'::text, 'failed'::text, 'abandoned'::text]))),
+    CONSTRAINT cloud_folder_grants_webdav_check CHECK ((webdav_url <> ''::text))
+);
+
+
+--
+-- Name: TABLE cloud_folder_grants; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON TABLE public.cloud_folder_grants IS 'Per-folder Nextcloud principals SRW creates for one project folder connector, member and kind (reader or writer); project mounts use them instead of agent-service. Passwords are APP_ENCRYPTION_KEY ciphertexts, dropped once revoked. No foreign keys to connector, project or user: the revoke outlives them.';
+
+
+--
 -- Name: cloud_ro_effect_intents; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -14738,6 +27167,13 @@ COMMENT ON COLUMN public.cloud_ro_mounts.engage_attempt IS 'Exact protected-enga
 --
 
 COMMENT ON COLUMN public.cloud_ro_mounts.source_binding IS 'Canonical immutable logical protected source for this engage attempt and any staged review.';
+
+
+--
+-- Name: COLUMN cloud_ro_mounts.selected_mount_id; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.cloud_ro_mounts.selected_mount_id IS 'thread_protected_sources.id of the protected folder (for one release, a thread_mounts.id selected by an older orchestrator).';
 
 
 --
@@ -14991,6 +27427,377 @@ COMMENT ON COLUMN public.config_overrides.kind IS 'Resolver subsection (MatrixRe
 
 
 --
+-- Name: connector_bind_time_bindings; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.connector_bind_time_bindings (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    owner_kind text NOT NULL,
+    owner_id uuid NOT NULL,
+    connector_id uuid NOT NULL,
+    registration_id uuid,
+    driver text NOT NULL,
+    status text DEFAULT 'pending'::text NOT NULL,
+    attempt integer DEFAULT 1 NOT NULL,
+    read_only boolean DEFAULT false NOT NULL,
+    image_reference text,
+    image_digest text,
+    image_stale boolean DEFAULT false NOT NULL,
+    resolved_at timestamp with time zone,
+    spec jsonb,
+    spec_hash text,
+    protocol_version text,
+    access text,
+    inputs_ciphertext text,
+    delivery_ciphertext text,
+    driver_state_ciphertext text,
+    error_class text,
+    error_message text,
+    retry_at timestamp with time zone,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    bound_at timestamp with time zone,
+    failed_at timestamp with time zone,
+    revoke_requested_at timestamp with time zone,
+    revoke_reason text,
+    revoke_attempts integer DEFAULT 0 NOT NULL,
+    revoke_next_at timestamp with time zone,
+    revoked_at timestamp with time zone,
+    revoke_error text,
+    error_source text,
+    revoke_error_source text,
+    access_checked_at timestamp with time zone,
+    CONSTRAINT connector_bind_time_bindings_attempt_check CHECK (((attempt >= 0) AND (revoke_attempts >= 0))),
+    CONSTRAINT connector_bind_time_bindings_bound_check CHECK (((status <> 'bound'::text) OR ((delivery_ciphertext IS NOT NULL) AND (image_digest IS NOT NULL) AND (bound_at IS NOT NULL)))),
+    CONSTRAINT connector_bind_time_bindings_digest_check CHECK (((image_digest IS NULL) OR (image_digest ~ '^sha256:[0-9a-f]{64}$'::text))),
+    CONSTRAINT connector_bind_time_bindings_driver_check CHECK ((driver <> ''::text)),
+    CONSTRAINT connector_bind_time_bindings_error_source_check CHECK ((((error_source IS NULL) OR (error_source = 'driver'::text)) AND ((revoke_error_source IS NULL) OR (revoke_error_source = 'driver'::text)))),
+    CONSTRAINT connector_bind_time_bindings_failed_check CHECK (((status <> 'failed'::text) OR ((failed_at IS NOT NULL) AND (error_message IS NOT NULL)))),
+    CONSTRAINT connector_bind_time_bindings_owner_check CHECK ((owner_kind = ANY (ARRAY['job'::text, 'thread'::text]))),
+    CONSTRAINT connector_bind_time_bindings_revoke_check CHECK ((((status <> ALL (ARRAY['revoking'::text, 'revoked'::text])) OR (revoke_requested_at IS NOT NULL)) AND ((status <> ALL (ARRAY['bound'::text, 'failed'::text])) OR (revoke_requested_at IS NULL)) AND ((status = 'revoked'::text) = (revoked_at IS NOT NULL)))),
+    CONSTRAINT connector_bind_time_bindings_spec_check CHECK (((spec IS NULL) OR (jsonb_typeof(spec) = 'object'::text))),
+    CONSTRAINT connector_bind_time_bindings_status_check CHECK ((status = ANY (ARRAY['pending'::text, 'bound'::text, 'failed'::text, 'revoking'::text, 'revoked'::text])))
+);
+
+
+--
+-- Name: TABLE connector_bind_time_bindings; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON TABLE public.connector_bind_time_bindings IS 'Bind-time image driver bindings (D6): what one bind recorded and delivered, the inputs its revoke needs (encrypted until revoked), its failure and retry, and its revocation. Owner, connector and registration are kept by value so a revoke runs after any is gone.';
+
+
+--
+-- Name: connector_credential_leases; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.connector_credential_leases (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    token_hash bytea NOT NULL,
+    token_ciphertext text NOT NULL,
+    token_last_four text NOT NULL,
+    job_id uuid,
+    thread_id uuid,
+    connector_id uuid NOT NULL,
+    driver text NOT NULL,
+    image_digest text,
+    access text NOT NULL,
+    issued_at timestamp with time zone DEFAULT now() NOT NULL,
+    expires_at timestamp with time zone NOT NULL,
+    last_renewed_at timestamp with time zone,
+    last_exchanged_at timestamp with time zone,
+    exchange_count bigint DEFAULT 0 NOT NULL,
+    revoked_at timestamp with time zone,
+    revoke_reason text,
+    CONSTRAINT connector_credential_leases_access_check CHECK ((access <> ''::text)),
+    CONSTRAINT connector_credential_leases_ciphertext_check CHECK ((token_ciphertext <> ''::text)),
+    CONSTRAINT connector_credential_leases_count_check CHECK ((exchange_count >= 0)),
+    CONSTRAINT connector_credential_leases_digest_check CHECK (((image_digest IS NULL) OR (image_digest ~ '^sha256:[0-9a-f]{64}$'::text))),
+    CONSTRAINT connector_credential_leases_driver_check CHECK ((driver <> ''::text)),
+    CONSTRAINT connector_credential_leases_hash_check CHECK ((octet_length(token_hash) = 32)),
+    CONSTRAINT connector_credential_leases_last_four_check CHECK ((char_length(token_last_four) = 4)),
+    CONSTRAINT connector_credential_leases_owner_check CHECK ((num_nonnulls(job_id, thread_id) = 1)),
+    CONSTRAINT connector_credential_leases_revoke_check CHECK (((revoked_at IS NULL) = (revoke_reason IS NULL))),
+    CONSTRAINT connector_credential_leases_window_check CHECK ((expires_at > issued_at))
+);
+
+
+--
+-- Name: TABLE connector_credential_leases; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON TABLE public.connector_credential_leases IS 'Connector credential leases (scl_ tokens). token_hash is the lookup key; token_ciphertext lets SRW deliver the same token again. Renewed only by the server-side sweeper while the owning execution is live.';
+
+
+--
+-- Name: connector_driver_assignments; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.connector_driver_assignments (
+    connector_id uuid NOT NULL,
+    registration_id uuid NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL
+);
+
+
+--
+-- Name: TABLE connector_driver_assignments; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON TABLE public.connector_driver_assignments IS 'The registration a connector of a registered image driver runs, pinned by id when the connector is created. The API deletes a registration only when no connector uses it or it is disabled, and no binding of it is unrevoked; a user or project delete cascades, and the connector then refuses to bind.';
+
+
+--
+-- Name: connector_driver_identities; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.connector_driver_identities (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    token_hash bytea NOT NULL,
+    token_last_four text NOT NULL,
+    connector_id uuid NOT NULL,
+    driver text NOT NULL,
+    image_digest text,
+    pod_namespace text,
+    pod_name text,
+    pod_uid text,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    last_used_at timestamp with time zone,
+    revoked_at timestamp with time zone,
+    revoke_reason text,
+    credential_generation text,
+    image_reference text,
+    egress jsonb,
+    egress_resolved_at timestamp with time zone,
+    ready_at timestamp with time zone,
+    last_bound_at timestamp with time zone,
+    idle_since timestamp with time zone,
+    removed_at timestamp with time zone,
+    launch_error text,
+    replaced_at timestamp with time zone,
+    CONSTRAINT connector_driver_identities_digest_check CHECK (((image_digest IS NULL) OR (image_digest ~ '^sha256:[0-9a-f]{64}$'::text))),
+    CONSTRAINT connector_driver_identities_driver_check CHECK ((driver <> ''::text)),
+    CONSTRAINT connector_driver_identities_egress_check CHECK ((((egress IS NULL) OR (jsonb_typeof(egress) = 'object'::text)) AND ((egress IS NULL) = (egress_resolved_at IS NULL)))),
+    CONSTRAINT connector_driver_identities_hash_check CHECK ((octet_length(token_hash) = 32)),
+    CONSTRAINT connector_driver_identities_last_four_check CHECK ((char_length(token_last_four) = 4)),
+    CONSTRAINT connector_driver_identities_removed_check CHECK (((removed_at IS NULL) OR (revoked_at IS NOT NULL))),
+    CONSTRAINT connector_driver_identities_revoke_check CHECK (((revoked_at IS NULL) = (revoke_reason IS NULL))),
+    CONSTRAINT connector_driver_identities_service_pod_check CHECK (((credential_generation IS NULL) OR ((credential_generation <> ''::text) AND (image_digest IS NOT NULL) AND (pod_namespace IS NOT NULL) AND (pod_name IS NOT NULL) AND (image_reference IS NOT NULL))))
+);
+
+
+--
+-- Name: TABLE connector_driver_identities; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON TABLE public.connector_driver_identities IS 'Connector driver identities (sdi_ tokens, SHA-256 only). The lease exchange authenticates a driver by one of these plus a lease token; the binding is read from the row, never from the request.';
+
+
+--
+-- Name: COLUMN connector_driver_identities.credential_generation; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.connector_driver_identities.credential_generation IS 'Service pods only: a keyed fingerprint (hmac-sha256) of what the pod''s immutable Secret holds and of its egress tier, part of the pod key with connector_id and image_digest. A change starts a new pod; the old one drains.';
+
+
+--
+-- Name: COLUMN connector_driver_identities.egress; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.connector_driver_identities.egress IS 'The pod''s pinned egress: each declared host with the addresses written into its NetworkPolicy and hostAliases, and the DNS status. egress_resolved_at is when they were resolved.';
+
+
+--
+-- Name: COLUMN connector_driver_identities.idle_since; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.connector_driver_identities.idle_since IS 'When the pod''s last binding ended (or a newer pod superseded it); the reconciler stops it after the idle timeout.';
+
+
+--
+-- Name: COLUMN connector_driver_identities.removed_at; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.connector_driver_identities.removed_at IS 'When the pod''s Kubernetes objects were seen gone, after its identity was revoked. A live row with removed_at NULL counts against the installation cap.';
+
+
+--
+-- Name: COLUMN connector_driver_identities.replaced_at; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.connector_driver_identities.replaced_at IS 'Service pods only: when the reconciler started a replacement for this pod because a pinned egress host now resolves to other addresses. The replacement holds the pod key; this pod keeps serving until the replacement is ready, then stops after a short drain (reason egress_repinned).';
+
+
+--
+-- Name: connector_driver_images; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.connector_driver_images (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    driver text NOT NULL,
+    reference text NOT NULL,
+    digest text NOT NULL,
+    entrypoint jsonb DEFAULT '[]'::jsonb NOT NULL,
+    cmd jsonb DEFAULT '[]'::jsonb NOT NULL,
+    spec jsonb,
+    spec_hash text,
+    protocol_version text NOT NULL,
+    first_resolved_at timestamp with time zone DEFAULT now() NOT NULL,
+    resolved_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT connector_driver_images_cmd_check CHECK ((jsonb_typeof(cmd) = 'array'::text)),
+    CONSTRAINT connector_driver_images_digest_check CHECK ((digest ~ '^sha256:[0-9a-f]{64}$'::text)),
+    CONSTRAINT connector_driver_images_driver_check CHECK ((driver <> ''::text)),
+    CONSTRAINT connector_driver_images_entrypoint_check CHECK ((jsonb_typeof(entrypoint) = 'array'::text)),
+    CONSTRAINT connector_driver_images_protocol_check CHECK ((protocol_version ~ '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$'::text)),
+    CONSTRAINT connector_driver_images_reference_check CHECK (((reference <> ''::text) AND (char_length(reference) <= 512))),
+    CONSTRAINT connector_driver_images_spec_check CHECK (((spec IS NULL) OR (jsonb_typeof(spec) = 'object'::text)))
+);
+
+
+--
+-- Name: TABLE connector_driver_images; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON TABLE public.connector_driver_images IS 'Connector driver image resolutions: one row per (driver, reference, digest) with the image entrypoint, command and spec label. Written at bind; read by the service-pod launch and the moved-tag check.';
+
+
+--
+-- Name: connector_driver_operations; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.connector_driver_operations (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    token_hash bytea NOT NULL,
+    token_last_four text NOT NULL,
+    operation text NOT NULL,
+    registration_id uuid,
+    connector_id uuid,
+    binding_id uuid,
+    requested_by uuid,
+    image_reference text NOT NULL,
+    image_digest text NOT NULL,
+    pod_namespace text NOT NULL,
+    pod_name text NOT NULL,
+    status text DEFAULT 'running'::text NOT NULL,
+    deadline_at timestamp with time zone NOT NULL,
+    exit_code integer,
+    outcome_ciphertext text,
+    error text,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    finished_at timestamp with time zone,
+    removed_at timestamp with time zone,
+    CONSTRAINT connector_driver_operations_digest_check CHECK ((image_digest ~ '^sha256:[0-9a-f]{64}$'::text)),
+    CONSTRAINT connector_driver_operations_finished_check CHECK (((status = 'running'::text) = (finished_at IS NULL))),
+    CONSTRAINT connector_driver_operations_hash_check CHECK ((octet_length(token_hash) = 32)),
+    CONSTRAINT connector_driver_operations_last_four_check CHECK ((char_length(token_last_four) = 4)),
+    CONSTRAINT connector_driver_operations_operation_check CHECK ((operation = ANY (ARRAY['spec'::text, 'check'::text, 'bind'::text, 'revoke'::text, 'gc'::text]))),
+    CONSTRAINT connector_driver_operations_status_check CHECK ((status = ANY (ARRAY['running'::text, 'finished'::text, 'failed'::text])))
+);
+
+
+--
+-- Name: TABLE connector_driver_operations; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON TABLE public.connector_driver_operations IS 'Short-lived connector driver pods (D6), one per operation: the pod''s sdi_ identity (SHA-256 only), the outcome its shim posted (encrypted, cleared once read) and its lifecycle.';
+
+
+--
+-- Name: connector_driver_registrations; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.connector_driver_registrations (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    name text NOT NULL,
+    scope_kind text NOT NULL,
+    owner_id uuid,
+    project_id uuid,
+    title text NOT NULL,
+    description text,
+    image_reference text NOT NULL,
+    image_digest text NOT NULL,
+    spec jsonb NOT NULL,
+    spec_hash text NOT NULL,
+    spec_source text NOT NULL,
+    protocol_version text NOT NULL,
+    plane text NOT NULL,
+    source_document jsonb,
+    created_by uuid,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    disabled_at timestamp with time zone,
+    disabled_by uuid,
+    CONSTRAINT connector_driver_registrations_digest_check CHECK ((image_digest ~ '^sha256:[0-9a-f]{64}$'::text)),
+    CONSTRAINT connector_driver_registrations_name_check CHECK (((name ~ '^[a-z][a-z0-9-]*(\.[a-z][a-z0-9-]*)+/v[1-9][0-9]*$'::text) AND (name !~~ 'srw.%'::text))),
+    CONSTRAINT connector_driver_registrations_plane_check CHECK ((plane = ANY (ARRAY['bind_time'::text, 'service'::text, 'in_pod'::text]))),
+    CONSTRAINT connector_driver_registrations_protocol_check CHECK ((protocol_version ~ '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$'::text)),
+    CONSTRAINT connector_driver_registrations_reference_check CHECK (((image_reference <> ''::text) AND (char_length(image_reference) <= 512))),
+    CONSTRAINT connector_driver_registrations_scope_check CHECK ((((scope_kind = 'Account'::text) AND (owner_id IS NOT NULL) AND (project_id IS NULL)) OR ((scope_kind = 'Project'::text) AND (project_id IS NOT NULL) AND (owner_id IS NULL)) OR ((scope_kind = 'Catalog'::text) AND (owner_id IS NULL) AND (project_id IS NULL)))),
+    CONSTRAINT connector_driver_registrations_source_check CHECK (((source_document IS NULL) OR (jsonb_typeof(source_document) = 'object'::text))),
+    CONSTRAINT connector_driver_registrations_spec_check CHECK ((jsonb_typeof(spec) = 'object'::text)),
+    CONSTRAINT connector_driver_registrations_spec_hash_check CHECK ((spec_hash ~ '^sha256:[0-9a-f]{64}$'::text)),
+    CONSTRAINT connector_driver_registrations_spec_source_check CHECK ((spec_source = ANY (ARRAY['label'::text, 'spec_operation'::text, 'server_json'::text]))),
+    CONSTRAINT connector_driver_registrations_title_check CHECK (((title <> ''::text) AND (char_length(title) <= 200)))
+);
+
+
+--
+-- Name: TABLE connector_driver_registrations; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON TABLE public.connector_driver_registrations IS 'Registered connector driver images (D6): one name per Account, Project or the shared Catalog, the spec the image declared and the digest its reference resolved to at registration. srw.* names are SRW''s own. A disabled registration binds nothing new.';
+
+
+--
+-- Name: connector_minted_credentials; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.connector_minted_credentials (
+    id uuid NOT NULL,
+    owner_kind text NOT NULL,
+    owner_id uuid NOT NULL,
+    connector_id uuid NOT NULL,
+    provider text NOT NULL,
+    provider_host text NOT NULL,
+    access text NOT NULL,
+    config_digest text NOT NULL,
+    status text DEFAULT 'minting'::text NOT NULL,
+    material_ciphertext text NOT NULL,
+    token_ciphertext text,
+    token_last_four text,
+    expires_at timestamp with time zone,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    minted_at timestamp with time zone,
+    superseded_at timestamp with time zone,
+    delivered_at timestamp with time zone,
+    revoke_requested_at timestamp with time zone,
+    revoke_reason text,
+    revoke_attempts integer DEFAULT 0 NOT NULL,
+    revoke_next_at timestamp with time zone,
+    revoked_at timestamp with time zone,
+    revoke_error text,
+    CONSTRAINT connector_minted_credentials_access_check CHECK ((access <> ''::text)),
+    CONSTRAINT connector_minted_credentials_attempts_check CHECK ((revoke_attempts >= 0)),
+    CONSTRAINT connector_minted_credentials_digest_check CHECK ((config_digest ~ '^sha256:[0-9a-f]{64}$'::text)),
+    CONSTRAINT connector_minted_credentials_done_check CHECK (((status <> ALL (ARRAY['revoked'::text, 'abandoned'::text])) OR (token_ciphertext IS NULL))),
+    CONSTRAINT connector_minted_credentials_last_four_check CHECK (((token_last_four IS NULL) OR (char_length(token_last_four) = 4))),
+    CONSTRAINT connector_minted_credentials_material_check CHECK ((material_ciphertext <> ''::text)),
+    CONSTRAINT connector_minted_credentials_minted_check CHECK (((status <> ALL (ARRAY['live'::text, 'superseded'::text])) OR ((token_ciphertext IS NOT NULL) AND (expires_at IS NOT NULL) AND (minted_at IS NOT NULL)))),
+    CONSTRAINT connector_minted_credentials_owner_check CHECK ((owner_kind = ANY (ARRAY['job'::text, 'thread'::text, 'test'::text]))),
+    CONSTRAINT connector_minted_credentials_provider_check CHECK ((provider = ANY (ARRAY['kubernetes'::text, 'github_app'::text]))),
+    CONSTRAINT connector_minted_credentials_revoke_check CHECK ((((status <> ALL (ARRAY['revoking'::text, 'revoked'::text, 'abandoned'::text])) OR ((revoke_requested_at IS NOT NULL) AND (revoke_reason IS NOT NULL))) AND ((status = ANY (ARRAY['revoked'::text, 'abandoned'::text])) = (revoked_at IS NOT NULL)))),
+    CONSTRAINT connector_minted_credentials_status_check CHECK ((status = ANY (ARRAY['minting'::text, 'live'::text, 'superseded'::text, 'revoking'::text, 'revoked'::text, 'abandoned'::text]))),
+    CONSTRAINT connector_minted_credentials_superseded_check CHECK (((status <> 'superseded'::text) OR (superseded_at IS NOT NULL)))
+);
+
+
+--
+-- Name: TABLE connector_minted_credentials; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON TABLE public.connector_minted_credentials IS 'Credentials SRW minted at a provider for one execution (or a Test) and connector (C5): a Kubernetes TokenRequest token bound to a per-row Secret, or a GitHub App installation token. Token and revoke inputs are APP_ENCRYPTION_KEY ciphertexts, dropped once revoked or abandoned. No foreign keys: the revoke outlives the execution and the connector.';
+
+
+--
 -- Name: contact_addresses; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -15109,6 +27916,9 @@ CREATE TABLE public.datasources (
     scope_mode text DEFAULT 'all'::text NOT NULL,
     auto_attach boolean DEFAULT false NOT NULL,
     policy_revision bigint DEFAULT 1 NOT NULL,
+    manifest_resource_id uuid,
+    managed_key text,
+    CONSTRAINT datasources_managed_key_shape CHECK (((managed_key IS NULL) OR (managed_key ~ '^[a-z][a-z0-9-]{0,62}:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'::text))),
     CONSTRAINT datasources_policy_revision_positive CHECK ((policy_revision > 0)),
     CONSTRAINT datasources_scope_mode_check CHECK ((scope_mode = ANY (ARRAY['all'::text, 'projects'::text])))
 );
@@ -15147,6 +27957,20 @@ COMMENT ON COLUMN public.datasources.auto_attach IS 'Creator-owned creation-time
 --
 
 COMMENT ON COLUMN public.datasources.policy_revision IS 'Optimistic concurrency token for scope/default/project-link policy.';
+
+
+--
+-- Name: COLUMN datasources.manifest_resource_id; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.datasources.manifest_resource_id IS 'The manifest Connector resource this row is written through to; its uid is the datasource id. NULL while the row stays on the legacy path (an ownerless row not linked to exactly one project, a legacy job clone, a type no driver serves); after its project was deleted it can name a retired resource.';
+
+
+--
+-- Name: COLUMN datasources.managed_key; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.datasources.managed_key IS 'Stable platform identity of a connector SRW provisions itself (project-kb:<project>, ...). Platform-owned rows refuse policy edits, deletes, links and unlinks through the API.';
 
 
 --
@@ -15793,6 +28617,8 @@ CREATE TABLE public.jobs (
     wake_delivery_id uuid,
     wake_delivery_claim_attempt integer,
     completion_outcome_kind text,
+    workspace_idle_revision bigint DEFAULT 0 NOT NULL,
+    workspace_idle_episode jsonb,
     CONSTRAINT jobs_diff_status_check CHECK (((diff_status IS NULL) OR (diff_status = ANY (ARRAY['pending'::text, 'accepted'::text, 'rejected'::text])))),
     CONSTRAINT jobs_runner_kind_check CHECK ((runner_kind = ANY (ARRAY['user'::text, 'lifecycle'::text, 'service'::text]))),
     CONSTRAINT jobs_wake_delivery_claim_attempt_check CHECK (((wake_delivery_claim_attempt IS NULL) OR (wake_delivery_claim_attempt >= 0))),
@@ -16531,6 +29357,16 @@ CREATE TABLE public.managed_repository_workspace_creation_reservations (
     restore_work_completed_at timestamp with time zone,
     restore_work_result_kind text,
     restore_work_projection_transaction_id bigint,
+    startup_protocol_version smallint,
+    startup_stage text,
+    startup_state text,
+    startup_reason_code text,
+    scheduled_at timestamp with time zone,
+    startup_first_ready_at timestamp with time zone,
+    ready_budget_seconds double precision,
+    pull_budget_seconds double precision,
+    ssh_budget_seconds double precision,
+    startup_attention_at timestamp with time zone,
     CONSTRAINT managed_repository_workspace_creation_cancel_shape_check CHECK ((((cancel_requested_at IS NULL) AND (cancel_claim_projection_transaction_id IS NULL) AND (cancel_target_disposition IS NULL) AND (cancel_resource_policy IS NULL) AND (cancel_suspended_at IS NULL) AND (cancel_snapshot_restore_required IS NULL)) OR ((cancel_requested_at IS NOT NULL) AND (cancel_claim_projection_transaction_id IS NOT NULL) AND (cancel_target_disposition IS NOT NULL) AND (cancel_resource_policy = ANY (ARRAY['preserve'::text, 'terminal_reclaim'::text])) AND (cancel_snapshot_restore_required IS NOT NULL) AND ((cancel_target_disposition = 'suspended'::text) OR (cancel_suspended_at IS NULL))))),
     CONSTRAINT managed_repository_workspace_creation_cleanup_shape_check CHECK ((((cancel_cleanup_completed_at IS NULL) AND (cancel_projection_transaction_id IS NULL)) OR ((cancel_cleanup_completed_at IS NOT NULL) AND (cancel_projection_transaction_id IS NOT NULL) AND (cancel_requested_at IS NOT NULL) AND (settled_at IS NOT NULL) AND (result_kind = 'aborted'::text) AND (phase = 'aborted'::text)))),
     CONSTRAINT managed_repository_workspace_creation_effects_check CHECK ((jsonb_typeof(external_effects) = 'object'::text)),
@@ -16543,7 +29379,8 @@ CREATE TABLE public.managed_repository_workspace_creation_reservations (
     CONSTRAINT managed_repository_workspace_creation_runtime_shape_check CHECK ((((runtime_incarnation IS NULL) AND (pod_uid IS NULL)) OR ((runtime_incarnation IS NOT NULL) AND (pod_uid = runtime_incarnation)))),
     CONSTRAINT managed_repository_workspace_creation_scope_check CHECK ((scope = ANY (ARRAY['workspace_container'::text, 'ide'::text]))),
     CONSTRAINT managed_repository_workspace_creation_thread_generation_shape CHECK ((((owner_kind = 'job'::text) AND (thread_runtime_generation IS NULL)) OR ((owner_kind = 'thread'::text) AND (thread_runtime_generation IS NOT NULL)))),
-    CONSTRAINT managed_repository_workspace_restore_work_shape_check CHECK (((restore_work_claim_token >= 0) AND (((restore_work_claimed_by IS NULL) AND (restore_work_claim_expires_at IS NULL)) OR ((restore_work_claimed_by IS NOT NULL) AND (restore_work_claim_expires_at IS NOT NULL) AND (restore_work_claim_token > 0))) AND (((restore_work_result_kind IS NULL) AND (restore_work_projection_transaction_id IS NULL)) OR ((operation_kind = 'restore'::text) AND (result_kind = 'settled'::text) AND (restore_work_completed_at IS NOT NULL) AND (restore_work_projection_transaction_id IS NOT NULL) AND (((scope = 'ide'::text) AND (restore_work_result_kind = ANY (ARRAY['active'::text, 'failed'::text]))) OR ((scope = 'workspace_container'::text) AND (restore_work_result_kind = ANY (ARRAY['ready'::text, 'failed'::text])))))) AND ((restore_work_completed_at IS NULL) OR (restore_work_result_kind IS NOT NULL))))
+    CONSTRAINT managed_repository_workspace_restore_work_shape_check CHECK (((restore_work_claim_token >= 0) AND (((restore_work_claimed_by IS NULL) AND (restore_work_claim_expires_at IS NULL)) OR ((restore_work_claimed_by IS NOT NULL) AND (restore_work_claim_expires_at IS NOT NULL) AND (restore_work_claim_token > 0))) AND (((restore_work_result_kind IS NULL) AND (restore_work_projection_transaction_id IS NULL)) OR ((operation_kind = 'restore'::text) AND (result_kind = 'settled'::text) AND (restore_work_completed_at IS NOT NULL) AND (restore_work_projection_transaction_id IS NOT NULL) AND (((scope = 'ide'::text) AND (restore_work_result_kind = ANY (ARRAY['active'::text, 'failed'::text]))) OR ((scope = 'workspace_container'::text) AND (restore_work_result_kind = ANY (ARRAY['ready'::text, 'failed'::text])))))) AND ((restore_work_completed_at IS NULL) OR (restore_work_result_kind IS NOT NULL)))),
+    CONSTRAINT managed_workspace_startup_stage_shape_check CHECK (COALESCE((((startup_protocol_version IS NULL) AND (startup_stage IS NULL) AND (startup_state IS NULL) AND (startup_reason_code IS NULL) AND (scheduled_at IS NULL) AND (startup_first_ready_at IS NULL) AND (ready_budget_seconds IS NULL) AND (pull_budget_seconds IS NULL) AND (ssh_budget_seconds IS NULL) AND (startup_attention_at IS NULL)) OR ((startup_protocol_version = 1) AND (owner_kind = ANY (ARRAY['job'::text, 'thread'::text])) AND (scope = 'workspace_container'::text) AND (operation_kind = 'create'::text) AND (runtime_incarnation IS NOT NULL) AND (pod_uid = runtime_incarnation) AND (((startup_stage = 'scheduling'::text) AND (startup_state = ANY (ARRAY['observing'::text, 'waiting_capacity'::text])) AND (((startup_state = 'observing'::text) AND (startup_reason_code = ANY (ARRAY['observation_pending'::text, 'scheduling_other'::text]))) OR ((startup_state = 'waiting_capacity'::text) AND (startup_reason_code = ANY (ARRAY['scheduler_unschedulable'::text, 'insufficient_capacity'::text])))) AND (scheduled_at IS NULL) AND (startup_first_ready_at IS NULL) AND (ready_budget_seconds IS NULL) AND (pull_budget_seconds IS NULL) AND (ssh_budget_seconds IS NULL) AND (startup_attention_at IS NULL)) OR ((startup_stage = 'readiness'::text) AND (((startup_state = 'starting'::text) AND (startup_reason_code = 'scheduled'::text) AND (startup_attention_at IS NULL)) OR ((startup_state = 'attention'::text) AND (startup_reason_code = ANY (ARRAY['invalid_image'::text, 'invalid_configuration'::text, 'pull_deadline'::text, 'readiness_deadline'::text, 'ssh_deadline'::text])) AND (startup_attention_at IS NOT NULL))) AND (scheduled_at IS NOT NULL) AND (ready_budget_seconds >= (0.000001)::double precision) AND (ready_budget_seconds < (31536000)::double precision) AND ((pull_budget_seconds IS NULL) OR ((pull_budget_seconds >= (0.000001)::double precision) AND (pull_budget_seconds < (31536000)::double precision))) AND (ssh_budget_seconds >= (0.000001)::double precision) AND (ssh_budget_seconds < (31536000)::double precision) AND ((startup_first_ready_at IS NULL) OR ((startup_first_ready_at >= scheduled_at) AND (startup_first_ready_at <= (scheduled_at + make_interval(secs => GREATEST(ready_budget_seconds, COALESCE(pull_budget_seconds, (0)::double precision))))))))))), false))
 );
 
 
@@ -16993,6 +29830,66 @@ COMMENT ON TABLE public.officer_ticket_deliverable_requirements IS 'Monotonic pe
 
 
 --
+-- Name: pinned_job_deliveries; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.pinned_job_deliveries (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    job_id uuid NOT NULL,
+    agent_id uuid NOT NULL,
+    original_dispatch_marker jsonb NOT NULL,
+    marker_digest text NOT NULL,
+    projection_digest text NOT NULL,
+    consumed_context_digests jsonb DEFAULT '{}'::jsonb NOT NULL,
+    runtime_authority_digest text NOT NULL,
+    identity_digest text NOT NULL,
+    original_lease_expires_at timestamp with time zone NOT NULL,
+    intent_lease_expires_at timestamp with time zone NOT NULL,
+    process_generation text NOT NULL,
+    pod_name text NOT NULL,
+    pod_namespace text NOT NULL,
+    pod_uid text NOT NULL,
+    provision_generation uuid NOT NULL,
+    vm_uid uuid NOT NULL,
+    vmi_uid uuid NOT NULL,
+    launcher_uid uuid NOT NULL,
+    pvc_uid uuid NOT NULL,
+    intent_at timestamp with time zone DEFAULT clock_timestamp() NOT NULL,
+    accepted_at timestamp with time zone,
+    accepted_via text,
+    accepted_lease_expires_at timestamp with time zone,
+    CONSTRAINT pinned_delivery_accept_shape CHECK ((((accepted_at IS NULL) AND (accepted_via IS NULL) AND (accepted_lease_expires_at IS NULL)) OR ((accepted_at IS NOT NULL) AND (accepted_via IS NOT NULL) AND (accepted_lease_expires_at IS NOT NULL)))),
+    CONSTRAINT pinned_delivery_marker_shape CHECK ((((original_dispatch_marker -> 'version'::text) = '1'::jsonb) AND ((original_dispatch_marker ->> 'dispatch_kind'::text) = 'pinned'::text) AND ((original_dispatch_marker ->> 'assigned_backend'::text) = 'vm'::text) AND ((original_dispatch_marker ->> 'agent_id'::text) = (agent_id)::text) AND ((original_dispatch_marker ->> 'lease_expires_at'::text) IS NOT NULL))),
+    CONSTRAINT pinned_job_deliveries_accepted_via_check CHECK ((accepted_via = ANY (ARRAY['post'::text, 'route'::text, 'completion'::text]))),
+    CONSTRAINT pinned_job_deliveries_consumed_context_digests_check CHECK (((jsonb_typeof(consumed_context_digests) = 'object'::text) AND (((consumed_context_digests - 'feedback'::text) - 'delegation'::text) = '{}'::jsonb) AND ((NOT (consumed_context_digests ? 'feedback'::text)) OR ((consumed_context_digests ->> 'feedback'::text) ~ '^sha256:[0-9a-f]{64}$'::text)) AND ((NOT (consumed_context_digests ? 'delegation'::text)) OR ((consumed_context_digests ->> 'delegation'::text) ~ '^sha256:[0-9a-f]{64}$'::text)))),
+    CONSTRAINT pinned_job_deliveries_identity_digest_check CHECK ((identity_digest ~ '^sha256:[0-9a-f]{64}$'::text)),
+    CONSTRAINT pinned_job_deliveries_marker_digest_check CHECK ((marker_digest ~ '^sha256:[0-9a-f]{64}$'::text)),
+    CONSTRAINT pinned_job_deliveries_pod_name_check CHECK (((length(pod_name) >= 1) AND (length(pod_name) <= 253))),
+    CONSTRAINT pinned_job_deliveries_pod_namespace_check CHECK (((length(pod_namespace) >= 1) AND (length(pod_namespace) <= 63))),
+    CONSTRAINT pinned_job_deliveries_pod_uid_check CHECK (((length(pod_uid) >= 1) AND (length(pod_uid) <= 128))),
+    CONSTRAINT pinned_job_deliveries_process_generation_check CHECK (((length(process_generation) >= 1) AND (length(process_generation) <= 128))),
+    CONSTRAINT pinned_job_deliveries_projection_digest_check CHECK ((projection_digest ~ '^sha256:[0-9a-f]{64}$'::text)),
+    CONSTRAINT pinned_job_deliveries_runtime_authority_digest_check CHECK ((runtime_authority_digest ~ '^sha256:[0-9a-f]{64}$'::text))
+);
+
+
+--
+-- Name: pinned_job_wait_receipts; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.pinned_job_wait_receipts (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    delivery_id uuid NOT NULL,
+    job_id uuid NOT NULL,
+    source_kind text NOT NULL,
+    source_id uuid NOT NULL,
+    lease_expires_at timestamp with time zone NOT NULL,
+    observed_at timestamp with time zone DEFAULT clock_timestamp() NOT NULL,
+    CONSTRAINT pinned_job_wait_receipts_source_kind_check CHECK ((source_kind = ANY (ARRAY['route'::text, 'completion'::text])))
+);
+
+
+--
 -- Name: processed_inbound_emails; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -17027,6 +29924,29 @@ CREATE TABLE public.project_api_keys (
 
 
 --
+-- Name: project_connector_defaults; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.project_connector_defaults (
+    project_id uuid NOT NULL,
+    connector_ids uuid[] DEFAULT '{}'::uuid[] NOT NULL,
+    source text DEFAULT 'settings'::text NOT NULL,
+    manifest_revision text,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_by uuid,
+    CONSTRAINT project_connector_defaults_revision_follows_source CHECK (((source = 'manifest'::text) = (manifest_revision IS NOT NULL))),
+    CONSTRAINT project_connector_defaults_source_check CHECK ((source = ANY (ARRAY['settings'::text, 'manifest'::text])))
+);
+
+
+--
+-- Name: TABLE project_connector_defaults; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON TABLE public.project_connector_defaults IS 'Connector defaults per Project: the linked connectors (datasource ids, which are their Connector uids) attached to new work that takes its defaults. The project knowledge base is implied, never stored.';
+
+
+--
 -- Name: project_contacts; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -17047,8 +29967,18 @@ CREATE TABLE public.project_datasources (
     datasource_id uuid NOT NULL,
     linked_at timestamp with time zone DEFAULT CURRENT_TIMESTAMP,
     read_only boolean,
-    description text
+    description text,
+    access text,
+    CONSTRAINT project_datasources_access_check CHECK (((access IS NULL) OR (access ~ '^[A-Za-z][A-Za-z0-9_]{0,62}$'::text))),
+    CONSTRAINT project_datasources_access_or_read_only_check CHECK (((access IS NULL) OR (read_only IS NULL)))
 );
+
+
+--
+-- Name: COLUMN project_datasources.access; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.project_datasources.access IS 'The project''s default level for this connector: a level id of its driver (cloud_folder: read_only, protected, read_write). NULL: the driver''s default. Only for drivers whose levels declare writes; their links keep read_only NULL. A default only, never a ceiling.';
 
 
 --
@@ -17282,6 +30212,34 @@ CREATE TABLE public.project_repositories (
 --
 
 COMMENT ON COLUMN public.project_repositories.role IS 'jobs = the per-project job/output repo (one per project); source = a working code repo; reference = read-only context; knowledge = the dedicated KB vault repo (one per project). Projects without a knowledge repo fall back to the jobs repo for KB resolution.';
+
+
+--
+-- Name: project_workspace_defaults; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.project_workspace_defaults (
+    project_id uuid NOT NULL,
+    jobs_mode text,
+    sessions_mode text,
+    container_template jsonb,
+    vm_template jsonb,
+    source text DEFAULT 'settings'::text NOT NULL,
+    manifest_revision text,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_by uuid,
+    CONSTRAINT project_workspace_defaults_jobs_mode_check CHECK ((jobs_mode = ANY (ARRAY['none'::text, 'virtual'::text, 'container'::text, 'vm'::text]))),
+    CONSTRAINT project_workspace_defaults_revision_follows_source CHECK (((source = 'manifest'::text) = (manifest_revision IS NOT NULL))),
+    CONSTRAINT project_workspace_defaults_sessions_mode_check CHECK ((sessions_mode = ANY (ARRAY['none'::text, 'virtual'::text, 'container'::text, 'vm'::text]))),
+    CONSTRAINT project_workspace_defaults_source_check CHECK ((source = ANY (ARRAY['settings'::text, 'manifest'::text])))
+);
+
+
+--
+-- Name: TABLE project_workspace_defaults; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON TABLE public.project_workspace_defaults IS 'Workspace defaults per Project: tier modes for Jobs and Sessions, and a template per tier. The resolver reads only this table for the Project layer.';
 
 
 --
@@ -18369,6 +31327,19 @@ CREATE TABLE public.srw_execution_attempts (
 
 
 --
+-- Name: srw_execution_deadline_scan; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.srw_execution_deadline_scan (
+    singleton boolean DEFAULT true NOT NULL,
+    created_at timestamp with time zone,
+    job_id uuid,
+    CONSTRAINT srw_execution_deadline_scan_position CHECK (((created_at IS NULL) = (job_id IS NULL))),
+    CONSTRAINT srw_execution_deadline_scan_singleton_check CHECK (singleton)
+);
+
+
+--
 -- Name: srw_execution_spec_revisions; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -18516,6 +31487,9 @@ CREATE TABLE public.srw_resources (
     deleted_at timestamp with time zone,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
     updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    installation_managed boolean DEFAULT false NOT NULL,
+    platform_managed text,
+    linked_updated_at timestamp with time zone,
     CONSTRAINT srw_resources_document_check CHECK ((jsonb_typeof(document) = 'object'::text)),
     CONSTRAINT srw_resources_kind_check CHECK ((kind = ANY (ARRAY['Expert'::text, 'WorkspaceTemplate'::text, 'Connector'::text, 'Project'::text, 'Job'::text]))),
     CONSTRAINT srw_resources_resolved_check CHECK ((jsonb_typeof(resolved) = 'object'::text)),
@@ -18529,6 +31503,27 @@ CREATE TABLE public.srw_resources (
 --
 
 COMMENT ON TABLE public.srw_resources IS 'Canonical SRW authored resources; definition changes never replay an existing Job execution.';
+
+
+--
+-- Name: COLUMN srw_resources.installation_managed; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.srw_resources.installation_managed IS 'TRUE for resources the installation owns. Only the startup reconciler writes them; the API refuses edits and deletes.';
+
+
+--
+-- Name: COLUMN srw_resources.platform_managed; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.srw_resources.platform_managed IS 'Managed key of the platform-owned domain row this resource mirrors (project-kb:<project>, ...). Only the platform write-through writes it; the API refuses edits and deletes.';
+
+
+--
+-- Name: COLUMN srw_resources.linked_updated_at; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.srw_resources.linked_updated_at IS 'The linked domain row''s updated_at this resource was last written from. A row whose updated_at differs needs its resource rewritten.';
 
 
 --
@@ -19019,51 +32014,6 @@ CREATE TABLE public.thread_agent_pod_recycle_handoffs (
 
 
 --
--- Name: thread_agent_warm_binding_protections; Type: TABLE; Schema: public; Owner: -
---
-
-CREATE TABLE public.thread_agent_warm_binding_protections (
-    protection_id uuid NOT NULL,
-    thread_id uuid NOT NULL,
-    runtime_generation uuid NOT NULL,
-    runtime_attach_token uuid NOT NULL,
-    agent_id uuid NOT NULL,
-    source character varying(24) NOT NULL,
-    provisioner character varying(16) NOT NULL,
-    namespace character varying(253) NOT NULL,
-    pod_name character varying(253) NOT NULL,
-    pod_uid text NOT NULL,
-    discovered_resource_version text NOT NULL,
-    status character varying(16) DEFAULT 'planned'::character varying NOT NULL,
-    lease_expires_at timestamp with time zone NOT NULL,
-    effect_token uuid,
-    effect_started_at timestamp with time zone,
-    effect_expires_at timestamp with time zone,
-    protection_resource_version text,
-    evidence_protocol character varying(48),
-    protected_at timestamp with time zone,
-    bound_at timestamp with time zone,
-    release_started_at timestamp with time zone,
-    release_outcome character varying(32),
-    abort_fence_protocol character varying(48),
-    abort_fence_resource_version text,
-    abort_fence_value text,
-    released_at timestamp with time zone,
-    created_at timestamp with time zone DEFAULT transaction_timestamp() NOT NULL,
-    CONSTRAINT thread_agent_warm_binding_pro_discovered_resource_version_check CHECK ((discovered_resource_version <> ''::text)),
-    CONSTRAINT thread_agent_warm_binding_protection_abort_fence_protocol_check CHECK (((abort_fence_protocol)::text = ANY ((ARRAY['unclaimed_plan_v1'::character varying, 'exact_rv_annotation_fence_v1'::character varying, 'exact_object_gone_v1'::character varying])::text[]))),
-    CONSTRAINT thread_agent_warm_binding_protections_check CHECK ((((pod_name)::text <> ''::text) AND (pod_uid <> ''::text))),
-    CONSTRAINT thread_agent_warm_binding_protections_check1 CHECK ((lease_expires_at > created_at)),
-    CONSTRAINT thread_agent_warm_binding_protections_check2 CHECK (((((status)::text = 'planned'::text) AND (effect_token IS NULL) AND (effect_started_at IS NULL) AND (effect_expires_at IS NULL) AND (protection_resource_version IS NULL) AND (evidence_protocol IS NULL) AND (protected_at IS NULL) AND (bound_at IS NULL) AND (release_started_at IS NULL) AND (abort_fence_protocol IS NULL) AND (abort_fence_resource_version IS NULL) AND (abort_fence_value IS NULL) AND (release_outcome IS NULL) AND (released_at IS NULL)) OR (((status)::text = 'protecting'::text) AND (effect_token IS NOT NULL) AND (effect_started_at IS NOT NULL) AND (effect_expires_at > effect_started_at) AND (effect_expires_at <= (effect_started_at + '00:03:00'::interval)) AND (protection_resource_version IS NULL) AND (evidence_protocol IS NULL) AND (protected_at IS NULL) AND (bound_at IS NULL) AND (release_started_at IS NULL) AND (abort_fence_protocol IS NULL) AND (abort_fence_resource_version IS NULL) AND (abort_fence_value IS NULL) AND (release_outcome IS NULL) AND (released_at IS NULL)) OR (((status)::text = 'protected'::text) AND (effect_token IS NOT NULL) AND (effect_started_at IS NOT NULL) AND (effect_expires_at IS NOT NULL) AND (NULLIF(protection_resource_version, ''::text) IS NOT NULL) AND ((evidence_protocol)::text = 'exact_live_finalizer_v1'::text) AND (protected_at IS NOT NULL) AND (bound_at IS NULL) AND (release_started_at IS NULL) AND (abort_fence_protocol IS NULL) AND (abort_fence_resource_version IS NULL) AND (abort_fence_value IS NULL) AND (release_outcome IS NULL) AND (released_at IS NULL)) OR (((status)::text = 'bound'::text) AND (effect_token IS NOT NULL) AND (effect_started_at IS NOT NULL) AND (effect_expires_at IS NOT NULL) AND (NULLIF(protection_resource_version, ''::text) IS NOT NULL) AND ((evidence_protocol)::text = 'exact_live_finalizer_v1'::text) AND (protected_at IS NOT NULL) AND (bound_at IS NOT NULL) AND (release_started_at IS NULL) AND (abort_fence_protocol IS NULL) AND (abort_fence_resource_version IS NULL) AND (abort_fence_value IS NULL) AND (release_outcome IS NULL) AND (released_at IS NULL)) OR (((status)::text = 'releasing'::text) AND (effect_token IS NOT NULL) AND (effect_started_at IS NOT NULL) AND (effect_expires_at IS NOT NULL) AND (NULLIF(protection_resource_version, ''::text) IS NOT NULL) AND ((evidence_protocol)::text = 'exact_live_finalizer_v1'::text) AND (protected_at IS NOT NULL) AND (release_started_at IS NOT NULL) AND (abort_fence_protocol IS NULL) AND (abort_fence_resource_version IS NULL) AND (abort_fence_value IS NULL) AND (release_outcome IS NULL) AND (released_at IS NULL)) OR (((status)::text = 'released'::text) AND (effect_token IS NOT NULL) AND (effect_started_at IS NOT NULL) AND (effect_expires_at IS NOT NULL) AND (NULLIF(protection_resource_version, ''::text) IS NOT NULL) AND ((evidence_protocol)::text = 'exact_live_finalizer_v1'::text) AND (protected_at IS NOT NULL) AND (release_started_at IS NOT NULL) AND (abort_fence_protocol IS NULL) AND (abort_fence_resource_version IS NULL) AND (abort_fence_value IS NULL) AND (release_outcome IS NOT NULL) AND (released_at IS NOT NULL)) OR (((status)::text = 'aborted'::text) AND (protection_resource_version IS NULL) AND (evidence_protocol IS NULL) AND (protected_at IS NULL) AND (bound_at IS NULL) AND (release_started_at IS NULL) AND (((effect_token IS NULL) AND (effect_started_at IS NULL) AND (effect_expires_at IS NULL) AND ((abort_fence_protocol)::text = 'unclaimed_plan_v1'::text) AND (abort_fence_resource_version IS NULL) AND (abort_fence_value IS NULL)) OR ((effect_token IS NOT NULL) AND (effect_started_at IS NOT NULL) AND (effect_expires_at IS NOT NULL) AND ((((release_outcome)::text = 'exact_live_unprotected_v1'::text) AND ((abort_fence_protocol)::text = 'exact_rv_annotation_fence_v1'::text) AND (NULLIF(abort_fence_resource_version, ''::text) IS NOT NULL) AND (abort_fence_value = (((protection_id)::text || ':'::text) || (effect_token)::text))) OR (((release_outcome)::text = ANY ((ARRAY['exact_absent_v1'::character varying, 'exact_replacement_v1'::character varying])::text[])) AND ((abort_fence_protocol)::text = 'exact_object_gone_v1'::text) AND (abort_fence_resource_version IS NULL) AND (abort_fence_value IS NULL))))) AND (release_outcome IS NOT NULL) AND (released_at IS NOT NULL)))),
-    CONSTRAINT thread_agent_warm_binding_protections_namespace_check CHECK ((((length((namespace)::text) >= 1) AND (length((namespace)::text) <= 63)) AND ((namespace)::text ~ '^[a-z0-9]([-a-z0-9]*[a-z0-9])?$'::text))),
-    CONSTRAINT thread_agent_warm_binding_protections_provisioner_check CHECK (((provisioner)::text = ANY ((ARRAY['agent'::character varying, 'persistent'::character varying])::text[]))),
-    CONSTRAINT thread_agent_warm_binding_protections_release_outcome_check CHECK (((release_outcome)::text = ANY ((ARRAY['exact_live_unprotected_v1'::character varying, 'exact_absent_v1'::character varying, 'exact_replacement_v1'::character varying])::text[]))),
-    CONSTRAINT thread_agent_warm_binding_protections_source_check CHECK (((source)::text = ANY ((ARRAY['attach'::character varying, 'legacy_binding'::character varying])::text[]))),
-    CONSTRAINT thread_agent_warm_binding_protections_status_check CHECK (((status)::text = ANY ((ARRAY['planned'::character varying, 'protecting'::character varying, 'protected'::character varying, 'bound'::character varying, 'releasing'::character varying, 'released'::character varying, 'aborted'::character varying])::text[])))
-);
-
-
---
 -- Name: thread_client_presence; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -19433,6 +32383,8 @@ CREATE TABLE public.thread_input_deliveries (
     owner_executor_pod_uid text,
     supersedes_input_seq bigint,
     conversation_revision bigint,
+    admission_count integer DEFAULT 0 NOT NULL,
+    CONSTRAINT thread_input_deliveries_admission_count_nonnegative CHECK ((admission_count >= 0)),
     CONSTRAINT thread_input_deliveries_admission_shape CHECK ((((state <> ALL (ARRAY['admitted'::text, 'settled'::text])) AND (admitted_at IS NULL) AND (admitted_turn_number IS NULL)) OR ((state = ANY (ARRAY['admitted'::text, 'settled'::text])) AND (admitted_at IS NOT NULL) AND (admitted_turn_number IS NOT NULL)))),
     CONSTRAINT thread_input_deliveries_claim_generation_check CHECK ((claim_generation >= 0)),
     CONSTRAINT thread_input_deliveries_claim_shape CHECK ((((execution_lane = 'pinned'::text) AND (((claim_generation = 0) AND (owner_agent_id IS NULL)) OR ((claim_generation > 0) AND (owner_agent_id IS NOT NULL)))) OR (execution_lane = 'stateless'::text))),
@@ -19526,6 +32478,13 @@ COMMENT ON COLUMN public.thread_input_deliveries.supersedes_input_seq IS 'For a 
 --
 
 COMMENT ON COLUMN public.thread_input_deliveries.conversation_revision IS 'Conversation revision captured when this durable input identity was first admitted. NULL identifies pre-0249 history.';
+
+
+--
+-- Name: COLUMN thread_input_deliveries.admission_count; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.thread_input_deliveries.admission_count IS 'Pinned provider admissions of this delivery since its owner last retried it. Summed along the supersedes_input_seq chain to bound repeated recovery; the stateless lane leaves it 0.';
 
 
 --
@@ -19856,6 +32815,33 @@ COMMENT ON COLUMN public.thread_permission_requests.accepted_lease_token IS 'Imm
 
 
 --
+-- Name: thread_protected_sources; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.thread_protected_sources (
+    id uuid NOT NULL,
+    thread_id uuid NOT NULL,
+    datasource_id uuid,
+    mount_kind text NOT NULL,
+    source_kind text NOT NULL,
+    source_ref uuid NOT NULL,
+    target_path text NOT NULL,
+    backend_id text NOT NULL,
+    backend_instance_id uuid NOT NULL,
+    cloud_handle text NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT thread_protected_sources_shape_check CHECK (((mount_kind = 'project'::text) AND (source_kind = 'project_folder'::text) AND (target_path <> ''::text) AND (cloud_handle <> ''::text)))
+);
+
+
+--
+-- Name: TABLE thread_protected_sources; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON TABLE public.thread_protected_sources IS 'A protected session''s folder: the project folder its cloud_folder connector binds at protected, frozen at admission. cloud_ro_mounts.selected_mount_id names its id. Immutable; rows copied from thread_mounts keep that row''s id and have no datasource_id.';
+
+
+--
 -- Name: thread_rewinds; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -19953,6 +32939,7 @@ CREATE TABLE public.thread_runtime_retirement_outcomes (
     outcome character varying(16) NOT NULL,
     settled_at timestamp with time zone DEFAULT now() NOT NULL,
     retired_agent_pod jsonb,
+    actuator_request jsonb,
     CONSTRAINT thread_runtime_retirement_outcomes_disposition_check CHECK (((disposition)::text = ANY ((ARRAY['ended'::character varying, 'suspended'::character varying])::text[]))),
     CONSTRAINT thread_runtime_retirement_outcomes_outcome_check CHECK (((outcome)::text = ANY ((ARRAY['settled'::character varying, 'deleted'::character varying])::text[])))
 );
@@ -19963,6 +32950,13 @@ CREATE TABLE public.thread_runtime_retirement_outcomes (
 --
 
 COMMENT ON TABLE public.thread_runtime_retirement_outcomes IS 'Append-only exact pinned retirement settlement proof used only for lost-final-response reconciliation; contains no successor coordinates or credentials.';
+
+
+--
+-- Name: COLUMN thread_runtime_retirement_outcomes.actuator_request; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.thread_runtime_retirement_outcomes.actuator_request IS 'Server-captured full handoff identity for exact lost-response reconciliation; historical rows stay NULL.';
 
 
 --
@@ -20033,6 +33027,46 @@ COMMENT ON TABLE public.thread_turn_commits IS 'Workspace state after transcript
 
 
 --
+-- Name: thread_workspace_provision_create_receipts; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.thread_workspace_provision_create_receipts (
+    attempt_id uuid NOT NULL,
+    resource text NOT NULL,
+    thread_id uuid NOT NULL,
+    runtime_generation uuid NOT NULL,
+    namespace text NOT NULL,
+    resource_name text NOT NULL,
+    resource_uid text NOT NULL,
+    protocol text NOT NULL,
+    observed_at timestamp with time zone DEFAULT transaction_timestamp() NOT NULL,
+    CONSTRAINT thread_workspace_provision_create_receipts_protocol_check CHECK ((protocol = 'kubernetes_create_response_v1'::text)),
+    CONSTRAINT thread_workspace_provision_create_receipts_resource_check CHECK ((resource = 'pvc'::text)),
+    CONSTRAINT thread_workspace_provision_create_receipts_resource_uid_check CHECK ((resource_uid ~ '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'::text))
+);
+
+
+--
+-- Name: thread_workspace_provision_inert_fence_receipts; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.thread_workspace_provision_inert_fence_receipts (
+    attempt_id uuid NOT NULL,
+    thread_id uuid NOT NULL,
+    source_runtime_generation uuid NOT NULL,
+    retirement_runtime_generation uuid NOT NULL,
+    retirement_token uuid NOT NULL,
+    namespace text NOT NULL,
+    pod_name text NOT NULL,
+    fence_pod_uid text NOT NULL,
+    protocol text NOT NULL,
+    observed_at timestamp with time zone DEFAULT transaction_timestamp() NOT NULL,
+    CONSTRAINT thread_workspace_provision_inert_fence_rece_fence_pod_uid_check CHECK ((length(fence_pod_uid) > 0)),
+    CONSTRAINT thread_workspace_provision_inert_fence_receipts_protocol_check CHECK ((protocol = 'inert_pod_name_fence_v1'::text))
+);
+
+
+--
 -- Name: thread_workspace_provision_intents; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -20066,6 +33100,14 @@ CREATE TABLE public.thread_workspace_provision_intents (
     fenced_at timestamp with time zone,
     gc_after timestamp with time zone,
     resolved_at timestamp with time zone,
+    cleanup_disposition text,
+    cleanup_retirement_token uuid,
+    purge_completed_at timestamp with time zone,
+    retained_source_attempt_id uuid,
+    creation_effects_admitted_at timestamp with time zone,
+    retained_resume_generation uuid,
+    retained_successor_attempt_id uuid,
+    CONSTRAINT thread_workspace_cleanup_disposition CHECK ((((cleanup_disposition IS NULL) AND (cleanup_retirement_token IS NULL) AND (purge_completed_at IS NULL)) OR ((cleanup_disposition = ANY (ARRAY['retain'::text, 'purge'::text])) AND (cleanup_retirement_token IS NOT NULL) AND ((cleanup_disposition = 'purge'::text) OR (purge_completed_at IS NULL))))),
     CONSTRAINT thread_workspace_provision_intents_check CHECK (((created_agent_id IS NULL) = (created_attach_token IS NULL))),
     CONSTRAINT thread_workspace_provision_intents_check1 CHECK ((((namespace)::text <> ''::text) AND ((pod_name)::text <> ''::text) AND ((network_tier)::text <> ''::text))),
     CONSTRAINT thread_workspace_provision_intents_check2 CHECK (((pvc_name IS NULL) = (service_name IS NULL))),
@@ -20073,279 +33115,32 @@ CREATE TABLE public.thread_workspace_provision_intents (
     CONSTRAINT thread_workspace_provision_intents_check4 CHECK (((pvc_uid IS NULL) OR (pvc_name IS NOT NULL))),
     CONSTRAINT thread_workspace_provision_intents_check5 CHECK (((seed_configmap_uid IS NULL) OR (seed_configmap_name IS NOT NULL))),
     CONSTRAINT thread_workspace_provision_intents_check6 CHECK (((service_uid IS NULL) OR (service_name IS NOT NULL))),
-    CONSTRAINT thread_workspace_provision_intents_check7 CHECK (((retained_pvc_uid IS NULL) OR ((pvc_name IS NOT NULL) AND (retained_binding_generation IS NOT NULL)))),
     CONSTRAINT thread_workspace_provision_intents_check8 CHECK (((retained_service_uid IS NULL) OR (service_name IS NOT NULL))),
-    CONSTRAINT thread_workspace_provision_intents_check9 CHECK (((((status)::text = ANY ((ARRAY['planned'::character varying, 'revoking'::character varying])::text[])) AND (fence_pod_uid IS NULL) AND (fence_pvc_uid IS NULL) AND (fence_configmap_uid IS NULL) AND (fence_service_uid IS NULL) AND (fenced_at IS NULL) AND (gc_after IS NULL) AND (resolved_at IS NULL)) OR (((status)::text = 'published'::text) AND (NULLIF(pod_uid, ''::text) IS NOT NULL) AND ((pvc_name IS NULL) OR (NULLIF(pvc_uid, ''::text) IS NOT NULL)) AND ((seed_configmap_name IS NULL) OR (NULLIF(seed_configmap_uid, ''::text) IS NOT NULL)) AND ((service_name IS NULL) OR (NULLIF(service_uid, ''::text) IS NOT NULL)) AND (fence_pod_uid IS NULL) AND (fence_pvc_uid IS NULL) AND (fence_configmap_uid IS NULL) AND (fence_service_uid IS NULL) AND (fenced_at IS NULL) AND (gc_after IS NULL) AND (resolved_at IS NOT NULL)) OR (((status)::text = 'fenced'::text) AND (NULLIF(fence_pod_uid, ''::text) IS NOT NULL) AND ((pvc_name IS NULL) OR (retained_pvc_uid IS NOT NULL) OR (NULLIF(fence_pvc_uid, ''::text) IS NOT NULL)) AND ((seed_configmap_name IS NULL) OR (NULLIF(fence_configmap_uid, ''::text) IS NOT NULL)) AND ((service_name IS NULL) OR (retained_service_uid IS NOT NULL) OR (NULLIF(fence_service_uid, ''::text) IS NOT NULL)) AND (fenced_at IS NOT NULL) AND (gc_after >= (fenced_at + '00:10:00'::interval)) AND (resolved_at IS NULL)) OR (((status)::text = 'retired'::text) AND (fenced_at IS NOT NULL) AND (gc_after IS NOT NULL) AND (resolved_at IS NOT NULL)))),
+    CONSTRAINT thread_workspace_provision_intents_check9 CHECK (((((status)::text = ANY ((ARRAY['planned'::character varying, 'revoking'::character varying])::text[])) AND (fence_pod_uid IS NULL) AND (fence_pvc_uid IS NULL) AND (fence_configmap_uid IS NULL) AND (fence_service_uid IS NULL) AND (fenced_at IS NULL) AND (gc_after IS NULL) AND (resolved_at IS NULL)) OR (((status)::text = 'published'::text) AND (NULLIF(pod_uid, ''::text) IS NOT NULL) AND ((pvc_name IS NULL) OR (NULLIF(pvc_uid, ''::text) IS NOT NULL)) AND ((seed_configmap_name IS NULL) OR (NULLIF(seed_configmap_uid, ''::text) IS NOT NULL)) AND ((service_name IS NULL) OR (NULLIF(service_uid, ''::text) IS NOT NULL)) AND (fence_pod_uid IS NULL) AND (fence_pvc_uid IS NULL) AND (fence_configmap_uid IS NULL) AND (fence_service_uid IS NULL) AND (fenced_at IS NULL) AND (gc_after IS NULL) AND (resolved_at IS NOT NULL)) OR (((status)::text = 'fenced'::text) AND (NULLIF(fence_pod_uid, ''::text) IS NOT NULL) AND ((pvc_name IS NULL) OR (retained_pvc_uid IS NOT NULL) OR ((cleanup_disposition IS NOT NULL) AND (pvc_uid IS NOT NULL)) OR (NULLIF(fence_pvc_uid, ''::text) IS NOT NULL)) AND ((seed_configmap_name IS NULL) OR (NULLIF(fence_configmap_uid, ''::text) IS NOT NULL)) AND ((service_name IS NULL) OR (retained_service_uid IS NOT NULL) OR ((cleanup_disposition IS NOT NULL) AND (service_uid IS NOT NULL)) OR (NULLIF(fence_service_uid, ''::text) IS NOT NULL)) AND (fenced_at IS NOT NULL) AND (gc_after >= (fenced_at + '00:10:00'::interval)) AND (resolved_at IS NULL)) OR (((status)::text = 'retired'::text) AND (fenced_at IS NOT NULL) AND (gc_after IS NOT NULL) AND (resolved_at IS NOT NULL)))),
     CONSTRAINT thread_workspace_provision_intents_manifest_fingerprint_check CHECK (((manifest_fingerprint)::text ~ '^[0-9a-f]{64}$'::text)),
     CONSTRAINT thread_workspace_provision_intents_previous_binding_check CHECK ((jsonb_typeof(previous_binding) = 'object'::text)),
-    CONSTRAINT thread_workspace_provision_intents_status_check CHECK (((status)::text = ANY ((ARRAY['planned'::character varying, 'published'::character varying, 'revoking'::character varying, 'fenced'::character varying, 'retired'::character varying])::text[])))
+    CONSTRAINT thread_workspace_provision_intents_status_check CHECK (((status)::text = ANY ((ARRAY['planned'::character varying, 'published'::character varying, 'revoking'::character varying, 'fenced'::character varying, 'retired'::character varying])::text[]))),
+    CONSTRAINT thread_workspace_retained_storage_source CHECK (((retained_pvc_uid IS NULL) OR ((pvc_name IS NOT NULL) AND ((retained_binding_generation IS NOT NULL) OR (retained_source_attempt_id IS NOT NULL)))))
 );
 
 
 --
--- Name: threads; Type: TABLE; Schema: public; Owner: -
+-- Name: thread_workspace_provision_stop_receipts; Type: TABLE; Schema: public; Owner: -
 --
 
-CREATE TABLE public.threads (
-    id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
-    title text DEFAULT 'Untitled Session'::text,
-    user_id uuid,
-    project_id uuid,
-    agent_id uuid,
-    status character varying(20) DEFAULT 'created'::character varying NOT NULL,
-    permission_mode character varying(20) DEFAULT 'supervised'::character varying NOT NULL,
-    config_name character varying(100),
-    created_at timestamp with time zone DEFAULT CURRENT_TIMESTAMP,
-    last_activity timestamp with time zone DEFAULT CURRENT_TIMESTAMP,
-    ended_at timestamp with time zone,
-    metadata jsonb DEFAULT '{}'::jsonb,
-    total_turns integer DEFAULT 0,
-    total_tokens integer DEFAULT 0,
-    nc_session_folder text,
-    nc_share_id integer,
-    main_cloud_backend text,
-    main_cloud_session_handle text,
-    main_cloud_share_handle text,
-    events_epoch integer DEFAULT 0 NOT NULL,
-    awaiting_user_since timestamp with time zone,
-    extend_count integer DEFAULT 0 NOT NULL,
-    execution_lane text DEFAULT 'pinned'::text NOT NULL,
-    events_seq_hwm bigint DEFAULT 0 NOT NULL,
-    control_seq_hwm bigint DEFAULT 0 NOT NULL,
-    control_admission_agent_id uuid,
-    narration_mode text,
-    runtime_generation uuid DEFAULT public.uuid_generate_v4() NOT NULL,
-    runtime_retirement_token uuid,
-    runtime_retirement_permanent boolean,
-    runtime_retirement_started_at timestamp with time zone,
-    runtime_retirement_authorized_at timestamp with time zone,
-    runtime_retirement_context jsonb,
-    runtime_retirement_stage_receipt jsonb,
-    runtime_retirement_local_quiescence jsonb,
-    runtime_retirement_external_cleanup jsonb,
-    runtime_authority_exposed boolean DEFAULT false NOT NULL,
-    runtime_attach_token uuid,
-    runtime_attach_abort_receipt jsonb,
-    main_cloud_backend_instance_id uuid,
-    ssh_handle text,
-    kind text DEFAULT 'session'::text NOT NULL,
-    parent_job_id uuid,
-    parent_thread_id uuid,
-    parent_tool_call_id text,
-    subagent_handle text,
-    subagent_type text,
-    subagent_status text,
-    subagent_outcome text,
-    subagent_error text,
-    report_path text,
-    conversation_revision bigint DEFAULT 0 NOT NULL,
-    CONSTRAINT threads_conversation_revision_nonnegative CHECK ((conversation_revision >= 0)),
-    CONSTRAINT threads_kind_check CHECK ((kind = ANY (ARRAY['session'::text, 'subagent'::text]))),
-    CONSTRAINT threads_parent_shape_check CHECK ((((kind = 'session'::text) AND (parent_job_id IS NULL) AND (parent_thread_id IS NULL)) OR ((kind = 'subagent'::text) AND (num_nonnulls(parent_job_id, parent_thread_id) = 1)))),
-    CONSTRAINT threads_runtime_retirement_external_cleanup_shape CHECK (((runtime_retirement_external_cleanup IS NULL) OR ((runtime_retirement_token IS NOT NULL) AND (runtime_retirement_permanent = true) AND (jsonb_typeof(runtime_retirement_external_cleanup) = 'object'::text)))),
-    CONSTRAINT threads_runtime_retirement_local_quiescence_shape CHECK (((runtime_retirement_local_quiescence IS NULL) OR ((runtime_retirement_token IS NOT NULL) AND (jsonb_typeof(runtime_retirement_local_quiescence) = 'object'::text)))),
-    CONSTRAINT threads_runtime_retirement_shape CHECK ((((runtime_retirement_token IS NULL) AND (runtime_retirement_permanent IS NULL) AND (runtime_retirement_started_at IS NULL) AND (runtime_retirement_authorized_at IS NULL) AND (runtime_retirement_context IS NULL)) OR ((runtime_retirement_token IS NOT NULL) AND (runtime_retirement_permanent IS NOT NULL) AND (runtime_retirement_started_at IS NOT NULL) AND (jsonb_typeof(runtime_retirement_context) = 'object'::text)))),
-    CONSTRAINT threads_runtime_retirement_stage_receipt_shape CHECK (((runtime_retirement_stage_receipt IS NULL) OR ((runtime_retirement_token IS NOT NULL) AND (jsonb_typeof(runtime_retirement_stage_receipt) = 'object'::text)))),
-    CONSTRAINT valid_narration_mode CHECK ((narration_mode = ANY (ARRAY['silent'::text, 'verbose'::text, 'auto'::text]))),
-    CONSTRAINT valid_permission_mode CHECK (((permission_mode)::text = ANY ((ARRAY['supervised'::character varying, 'auto_accept'::character varying, 'autonomous'::character varying])::text[]))),
-    CONSTRAINT valid_thread_status CHECK (((status)::text = ANY ((ARRAY['created'::character varying, 'active'::character varying, 'idle'::character varying, 'awaiting_user'::character varying, 'suspended'::character varying, 'ended'::character varying])::text[])))
+CREATE TABLE public.thread_workspace_provision_stop_receipts (
+    attempt_id uuid NOT NULL,
+    thread_id uuid NOT NULL,
+    runtime_generation uuid NOT NULL,
+    retirement_token uuid NOT NULL,
+    namespace text NOT NULL,
+    pod_name text NOT NULL,
+    pod_uid text NOT NULL,
+    observed_at timestamp with time zone DEFAULT transaction_timestamp() NOT NULL,
+    CONSTRAINT thread_workspace_provision_stop_receipts_namespace_check CHECK ((namespace <> ''::text)),
+    CONSTRAINT thread_workspace_provision_stop_receipts_pod_name_check CHECK ((pod_name <> ''::text)),
+    CONSTRAINT thread_workspace_provision_stop_receipts_pod_uid_check CHECK ((pod_uid <> ''::text))
 );
-
-
---
--- Name: COLUMN threads.events_epoch; Type: COMMENT; Schema: public; Owner: -
---
-
-COMMENT ON COLUMN public.threads.events_epoch IS 'Current event-log writer generation (client-visible). Bumped only deliberately: rewind, a reaper/steal takeover, or an attach that finds the previous session life terminal (terminal thread status, a terminal lifecycle frame in the epoch, or the epoch wholly beyond retention). Clean reattaches REUSE the epoch so cached client cursors stay valid; an older-epoch cursor triggers authoritative re-sync (gone_beyond_horizon). See docs/features/stateless_agents.md §5.3.2.';
-
-
---
--- Name: COLUMN threads.awaiting_user_since; Type: COMMENT; Schema: public; Owner: -
---
-
-COMMENT ON COLUMN public.threads.awaiting_user_since IS 'Set by the agent when it reaches a natural pause untethered. The attention_sleep_sweeper suspends the workspace when this exceeds headless_attention_sleep_minutes. Cleared on reattach.';
-
-
---
--- Name: COLUMN threads.extend_count; Type: COMMENT; Schema: public; Owner: -
---
-
-COMMENT ON COLUMN public.threads.extend_count IS 'Number of magic-link extend-window clicks since this awaiting_user session began. Capped at 4 (= 4h ceiling at default 60min/extend).';
-
-
---
--- Name: COLUMN threads.execution_lane; Type: COMMENT; Schema: public; Owner: -
---
-
-COMMENT ON COLUMN public.threads.execution_lane IS 'Which execution plane serves this thread: ''pinned'' (registered-agent pod, the default) or ''stateless'' (run_queue claim by any pod). App-validated by design — no CHECK. See docs/features/stateless_agents.md §5.4.4.';
-
-
---
--- Name: COLUMN threads.events_seq_hwm; Type: COMMENT; Schema: public; Owner: -
---
-
-COMMENT ON COLUMN public.threads.events_seq_hwm IS 'Highest seq ever allocated in the CURRENT events_epoch. Survives retention pruning of the thread_events rows themselves; reset to 0 atomically on every epoch bump. Maintained by the agent journal writer''s fenced flush (GREATEST over the batch in the same statement) and pre-incremented by the system-frame allocator (src/shared/event_journal). Attach seeds its in-process counter from GREATEST(events_seq_hwm, MAX(seq) of the epoch). See docs/features/stateless_agents.md §5.3.2.';
-
-
---
--- Name: COLUMN threads.control_seq_hwm; Type: COMMENT; Schema: public; Owner: -
---
-
-COMMENT ON COLUMN public.threads.control_seq_hwm IS 'Highest commit-ordered thread_control_requests.request_seq allocated for this thread. Admission increments it while holding the threads row lock; never allocate request order from an IDENTITY/sequence.';
-
-
---
--- Name: COLUMN threads.control_admission_agent_id; Type: COMMENT; Schema: public; Owner: -
---
-
-COMMENT ON COLUMN public.threads.control_admission_agent_id IS 'Exact pinned-owner capability and teardown fence. NULL is closed. An inbox-capable reciprocal owner writes its own agent UUID after attach and clears it before its final drain. A stale credential never transfers to a different owner generation.';
-
-
---
--- Name: COLUMN threads.narration_mode; Type: COMMENT; Schema: public; Owner: -
---
-
-COMMENT ON COLUMN public.threads.narration_mode IS 'Durable interactive narration mode (silent | verbose | auto). NULL means the thread still inherits its resolved config; creation and the serving control owner materialize an explicit value.';
-
-
---
--- Name: COLUMN threads.runtime_generation; Type: COMMENT; Schema: public; Owner: -
---
-
-COMMENT ON COLUMN public.threads.runtime_generation IS 'Immutable authority for one pinned/stateless session runtime life. The database rotates it on the sole ended->created Resume edge.';
-
-
---
--- Name: COLUMN threads.runtime_retirement_token; Type: COMMENT; Schema: public; Owner: -
---
-
-COMMENT ON COLUMN public.threads.runtime_retirement_token IS 'Non-NULL closes pinned runtime admission while exact external cleanup is retryable.';
-
-
---
--- Name: COLUMN threads.runtime_retirement_authorized_at; Type: COMMENT; Schema: public; Owner: -
---
-
-COMMENT ON COLUMN public.threads.runtime_retirement_authorized_at IS 'Append-once preflight authorization for the pending retirement. Exact agents do not begin local teardown and reconcilers do not actuate before it is set.';
-
-
---
--- Name: COLUMN threads.runtime_retirement_context; Type: COMMENT; Schema: public; Owner: -
---
-
-COMMENT ON COLUMN public.threads.runtime_retirement_context IS 'Immutable identities captured when pinned retirement closes admission; cleanup must target these identities, never names alone.';
-
-
---
--- Name: COLUMN threads.runtime_retirement_stage_receipt; Type: COMMENT; Schema: public; Owner: -
---
-
-COMMENT ON COLUMN public.threads.runtime_retirement_stage_receipt IS 'Append-once exact staging publication receipt for retrying a soft retirement after workspace/reader cleanup; cleared only by settlement.';
-
-
---
--- Name: COLUMN threads.runtime_retirement_local_quiescence; Type: COMMENT; Schema: public; Owner: -
---
-
-COMMENT ON COLUMN public.threads.runtime_retirement_local_quiescence IS 'Append-once exact agent acknowledgement that shell, overlay, mounts, and ordinary event writers are quiesced for the pending runtime retirement.';
-
-
---
--- Name: COLUMN threads.runtime_authority_exposed; Type: COMMENT; Schema: public; Owner: -
---
-
-COMMENT ON COLUMN public.threads.runtime_authority_exposed IS 'Monotonic within one runtime_generation: true once any pinned process authority was delivered; reset only by the database generation-rotation edge.';
-
-
---
--- Name: COLUMN threads.runtime_attach_token; Type: COMMENT; Schema: public; Owner: -
---
-
-COMMENT ON COLUMN public.threads.runtime_attach_token IS 'Exact physical pinned-process attach identity; register/bind rotates it and every maintenance or credential request must match it with runtime_generation.';
-
-
---
--- Name: COLUMN threads.runtime_attach_abort_receipt; Type: COMMENT; Schema: public; Owner: -
---
-
-COMMENT ON COLUMN public.threads.runtime_attach_abort_receipt IS 'Last exact pre-input attach-abort rotation receipt. Internal authority only; browser thread payloads must redact it.';
-
-
---
--- Name: COLUMN threads.kind; Type: COMMENT; Schema: public; Owner: -
---
-
-COMMENT ON COLUMN public.threads.kind IS 'What this row is: ''session'' (an interactive thread, the default) or ''subagent'' (a child session a worker job or a session spawned through delegate_agent; U3). Session listings filter on kind so child rows never reach the sessions page; the subagent_* / parent_* columns are NULL for sessions.';
-
-
---
--- Name: COLUMN threads.parent_job_id; Type: COMMENT; Schema: public; Owner: -
---
-
-COMMENT ON COLUMN public.threads.parent_job_id IS 'kind=subagent only: the worker job that spawned this child. ON DELETE CASCADE — a job takes its children with it (delete_job ends live children first, because the pinned delete authority only lets an ended, authority-free row go).';
-
-
---
--- Name: COLUMN threads.parent_thread_id; Type: COMMENT; Schema: public; Owner: -
---
-
-COMMENT ON COLUMN public.threads.parent_thread_id IS 'kind=subagent only: the session thread that spawned this child (U5 session parents). NULL for a worker-job parent. ON DELETE CASCADE.';
-
-
---
--- Name: COLUMN threads.parent_tool_call_id; Type: COMMENT; Schema: public; Owner: -
---
-
-COMMENT ON COLUMN public.threads.parent_tool_call_id IS 'kind=subagent only: the parent''s delegate_agent tool call this child answered. The non-NULL parent plus parent_tool_call_id is the idempotency key: a parent re-running its tools node after a hard kill replays the stored report instead of spawning again; both parent forms are unique in the database.';
-
-
---
--- Name: COLUMN threads.subagent_handle; Type: COMMENT; Schema: public; Owner: -
---
-
-COMMENT ON COLUMN public.threads.subagent_handle IS 'kind=subagent only: the short handle the parent sees (<type>-<4 hex>, e.g. implementer-7f3a) — unique per parent, not globally; the durable identity is the thread id.';
-
-
---
--- Name: COLUMN threads.subagent_type; Type: COMMENT; Schema: public; Owner: -
---
-
-COMMENT ON COLUMN public.threads.subagent_type IS 'kind=subagent only: the roster entry name the child ran as (explorer, implementer, reviewer, ...).';
-
-
---
--- Name: COLUMN threads.subagent_status; Type: COMMENT; Schema: public; Owner: -
---
-
-COMMENT ON COLUMN public.threads.subagent_status IS 'kind=subagent only: the bare lifecycle kind, written by the agent-side ledger. Open set by design — app-validated, no CHECK, so a new kind never needs a migration. Today: running | completed | parked | interrupted | capped | error | cancelled (src/subagents/ledger.py SUBAGENT_STATUSES). Anything other than running is terminal, and a terminal write also moves status to ended and stamps ended_at.';
-
-
---
--- Name: COLUMN threads.subagent_outcome; Type: COMMENT; Schema: public; Owner: -
---
-
-COMMENT ON COLUMN public.threads.subagent_outcome IS 'kind=subagent only: the driver''s full classification behind subagent_status (capped:turns, interrupted:drain, interrupted:stale, cancelled:parent_deleted, ...). Free text; the cockpit shows it as the outcome badge detail.';
-
-
---
--- Name: COLUMN threads.subagent_error; Type: COMMENT; Schema: public; Owner: -
---
-
-COMMENT ON COLUMN public.threads.subagent_error IS 'kind=subagent only: the error text of an error / cancelled child, NULL otherwise.';
-
-
---
--- Name: COLUMN threads.report_path; Type: COMMENT; Schema: public; Owner: -
---
-
-COMMENT ON COLUMN public.threads.report_path IS 'kind=subagent only: workspace-relative path of the child''s full spilled report in the PARENT tree (.subagents/<handle>/report.md); NULL when the spill failed. The replay path re-renders the envelope from this file.';
-
-
---
--- Name: COLUMN threads.conversation_revision; Type: COMMENT; Schema: public; Owner: -
---
-
-COMMENT ON COLUMN public.threads.conversation_revision IS 'Monotonic transcript-view revision. Incremented only by an applied conversation rewind; clients fence delayed human input and cached history against it.';
 
 
 --
@@ -20745,6 +33540,329 @@ COMMENT ON COLUMN public.users.cloud_identity IS 'Per-backend cloud identity cac
 
 
 --
+-- Name: vm_creation_effects; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.vm_creation_effects (
+    effect_nonce uuid NOT NULL,
+    request_id uuid NOT NULL,
+    effect_number integer NOT NULL,
+    effect_kind text NOT NULL,
+    carrier_uid uuid NOT NULL,
+    carrier_namespace text NOT NULL,
+    carrier_intent jsonb NOT NULL,
+    state text DEFAULT 'issued'::text NOT NULL,
+    evidence jsonb DEFAULT '{}'::jsonb NOT NULL,
+    issued_at timestamp with time zone DEFAULT clock_timestamp() NOT NULL,
+    resolved_at timestamp with time zone,
+    issuer_receipt_sha256 bytea,
+    CONSTRAINT vm_creation_effects_carrier_intent_check CHECK ((jsonb_typeof(carrier_intent) = 'object'::text)),
+    CONSTRAINT vm_creation_effects_carrier_namespace_check CHECK ((carrier_namespace <> ''::text)),
+    CONSTRAINT vm_creation_effects_check CHECK (((state = 'issued'::text) = (resolved_at IS NULL))),
+    CONSTRAINT vm_creation_effects_check1 CHECK (((state = 'issued'::text) = (evidence = '{}'::jsonb))),
+    CONSTRAINT vm_creation_effects_effect_kind_check CHECK ((effect_kind = ANY (ARRAY['workspace_attach'::text, 'rootdisk'::text, 'cloud_init'::text, 'vm'::text]))),
+    CONSTRAINT vm_creation_effects_effect_number_check CHECK ((effect_number > 0)),
+    CONSTRAINT vm_creation_effects_evidence_check CHECK ((jsonb_typeof(evidence) = 'object'::text)),
+    CONSTRAINT vm_creation_effects_state_check CHECK ((state = ANY (ARRAY['issued'::text, 'observed'::text, 'rejected'::text]))),
+    CONSTRAINT vm_creation_issuer_receipt_sha256_length CHECK (((issuer_receipt_sha256 IS NULL) OR (octet_length(issuer_receipt_sha256) = 32)))
+);
+
+
+--
+-- Name: vm_idle_access_leases; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.vm_idle_access_leases (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    owner_kind text NOT NULL,
+    owner_id uuid NOT NULL,
+    provision_generation uuid NOT NULL,
+    vm_uid uuid NOT NULL,
+    wake_id uuid,
+    kind text NOT NULL,
+    claimed_by text NOT NULL,
+    acquired_at timestamp with time zone DEFAULT clock_timestamp() NOT NULL,
+    expires_at timestamp with time zone NOT NULL,
+    max_expires_at timestamp with time zone NOT NULL,
+    closed_at timestamp with time zone,
+    CONSTRAINT vm_idle_access_leases_check CHECK (((expires_at > acquired_at) AND (max_expires_at >= expires_at))),
+    CONSTRAINT vm_idle_access_leases_claimed_by_check CHECK (((length(claimed_by) >= 1) AND (length(claimed_by) <= 256))),
+    CONSTRAINT vm_idle_access_leases_kind_check CHECK ((kind = ANY (ARRAY['ssh'::text, 'sftp'::text, 'ide'::text]))),
+    CONSTRAINT vm_idle_access_leases_owner_kind_check CHECK ((owner_kind = ANY (ARRAY['job'::text, 'thread'::text])))
+);
+
+
+--
+-- Name: vm_idle_operations; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.vm_idle_operations (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    owner_kind text NOT NULL,
+    owner_id uuid NOT NULL,
+    phase text NOT NULL,
+    episode_id uuid NOT NULL,
+    episode_revision bigint NOT NULL,
+    provision_generation uuid NOT NULL,
+    vm_uid uuid NOT NULL,
+    vmi_uid uuid NOT NULL,
+    launcher_uid uuid NOT NULL,
+    pvc_uid uuid NOT NULL,
+    retained_kind text NOT NULL,
+    admitted_at timestamp with time zone DEFAULT clock_timestamp() NOT NULL,
+    last_progress_at timestamp with time zone DEFAULT clock_timestamp() NOT NULL,
+    retry_after timestamp with time zone,
+    reason text,
+    stop_evidence jsonb,
+    stop_verified_at timestamp with time zone,
+    wake_id uuid,
+    wake_generation uuid,
+    wake_request_id uuid,
+    wake_attempt integer DEFAULT 0 NOT NULL,
+    wake_requested boolean DEFAULT false NOT NULL,
+    wake_execution_requested boolean DEFAULT false NOT NULL,
+    wake_ready_at timestamp with time zone,
+    wake_reservation_ref text,
+    claim_token bigint DEFAULT 0 NOT NULL,
+    claimed_by text,
+    claim_expires_at timestamp with time zone,
+    closed_at timestamp with time zone,
+    terminal_source_command_id uuid,
+    terminal_decided_at timestamp with time zone,
+    storage_disposition text,
+    terminal_publication jsonb,
+    terminal_published_at timestamp with time zone,
+    terminal_publication_retry_after timestamp with time zone,
+    access_rebind_proof jsonb,
+    post_ready_resume_requested boolean DEFAULT false NOT NULL,
+    release_kind text DEFAULT 'stateless'::text NOT NULL,
+    pinned_delivery_id uuid,
+    pinned_wait_receipt_id uuid,
+    pinned_agent_id uuid,
+    pinned_process_generation text,
+    pinned_agent_pod_name text,
+    pinned_agent_pod_namespace text,
+    pinned_agent_pod_uid text,
+    pinned_original_dispatch_marker jsonb,
+    pinned_lease_observed_at timestamp with time zone,
+    pinned_lease_expires_at timestamp with time zone,
+    pinned_terminal_observed_at timestamp with time zone,
+    pinned_stop_evidence jsonb,
+    pinned_stop_verified_at timestamp with time zone,
+    thread_runtime_generation uuid,
+    thread_retirement_token uuid,
+    thread_agent_pod_identity jsonb,
+    thread_agent_stop_evidence jsonb,
+    thread_agent_stop_verified_at timestamp with time zone,
+    thread_wake_ready_identity jsonb,
+    thread_terminal_intent_at timestamp with time zone,
+    thread_terminal_intent_generation uuid,
+    CONSTRAINT vm_idle_claim_shape CHECK (((claimed_by IS NULL) = (claim_expires_at IS NULL))),
+    CONSTRAINT vm_idle_closed_shape CHECK (((closed_at IS NULL) = (phase <> ALL (ARRAY['ready'::text, 'superseded'::text])))),
+    CONSTRAINT vm_idle_operations_episode_revision_check CHECK ((episode_revision > 0)),
+    CONSTRAINT vm_idle_operations_owner_kind_check CHECK ((owner_kind = ANY (ARRAY['job'::text, 'thread'::text]))),
+    CONSTRAINT vm_idle_operations_phase_check CHECK ((phase = ANY (ARRAY['releasing'::text, 'release_held'::text, 'suspended'::text, 'waking'::text, 'wake_held'::text, 'ready'::text, 'superseded'::text]))),
+    CONSTRAINT vm_idle_operations_release_kind_check CHECK ((release_kind = ANY (ARRAY['stateless'::text, 'pinned_job'::text, 'pinned_thread'::text]))),
+    CONSTRAINT vm_idle_operations_retained_kind_check CHECK ((retained_kind = ANY (ARRAY['rootdisk'::text, 'snapshot'::text]))),
+    CONSTRAINT vm_idle_operations_wake_attempt_check CHECK ((wake_attempt >= 0)),
+    CONSTRAINT vm_idle_pinned_shape CHECK ((((release_kind = ANY (ARRAY['stateless'::text, 'pinned_thread'::text])) AND (pinned_delivery_id IS NULL) AND (pinned_wait_receipt_id IS NULL) AND (pinned_agent_id IS NULL) AND (pinned_process_generation IS NULL) AND (pinned_agent_pod_name IS NULL) AND (pinned_agent_pod_namespace IS NULL) AND (pinned_agent_pod_uid IS NULL) AND (pinned_original_dispatch_marker IS NULL) AND (pinned_lease_observed_at IS NULL) AND (pinned_lease_expires_at IS NULL) AND (pinned_terminal_observed_at IS NULL) AND (pinned_stop_evidence IS NULL) AND (pinned_stop_verified_at IS NULL)) OR ((release_kind = 'pinned_job'::text) AND (owner_kind = 'job'::text) AND (pinned_delivery_id IS NOT NULL) AND (pinned_wait_receipt_id IS NOT NULL) AND (pinned_agent_id IS NOT NULL) AND (pinned_process_generation IS NOT NULL) AND (pinned_agent_pod_name IS NOT NULL) AND (pinned_agent_pod_namespace IS NOT NULL) AND (pinned_agent_pod_uid IS NOT NULL) AND (pinned_original_dispatch_marker IS NOT NULL) AND (pinned_lease_observed_at IS NOT NULL) AND (pinned_lease_expires_at IS NOT NULL) AND ((pinned_stop_verified_at IS NULL) OR (pinned_terminal_observed_at IS NOT NULL)) AND ((pinned_stop_evidence IS NULL) = (pinned_stop_verified_at IS NULL))))),
+    CONSTRAINT vm_idle_stop_shape CHECK (((stop_evidence IS NULL) = (stop_verified_at IS NULL))),
+    CONSTRAINT vm_idle_terminal_decision_shape CHECK ((((terminal_source_command_id IS NULL) AND (terminal_decided_at IS NULL) AND (storage_disposition IS NULL)) OR ((terminal_source_command_id IS NOT NULL) AND (terminal_decided_at IS NOT NULL) AND (storage_disposition = 'retention_unknown'::text) AND (owner_kind = 'job'::text) AND (retained_kind = 'rootdisk'::text) AND (wake_id IS NULL) AND (wake_generation IS NULL) AND (wake_request_id IS NULL) AND (wake_ready_at IS NULL) AND (NOT wake_requested) AND (NOT wake_execution_requested) AND (phase = ANY (ARRAY['releasing'::text, 'release_held'::text, 'suspended'::text, 'superseded'::text]))))),
+    CONSTRAINT vm_idle_terminal_publication_retry_shape CHECK (((terminal_publication_retry_after IS NULL) OR ((terminal_source_command_id IS NOT NULL) AND (terminal_published_at IS NULL)))),
+    CONSTRAINT vm_idle_terminal_publication_shape CHECK ((((terminal_publication IS NULL) AND (terminal_published_at IS NULL) AND (terminal_source_command_id IS NULL)) OR ((terminal_publication IS NOT NULL) AND (jsonb_typeof(terminal_publication) = 'object'::text) AND ((terminal_publication -> 'version'::text) = '1'::jsonb) AND (terminal_source_command_id IS NOT NULL)))),
+    CONSTRAINT vm_idle_thread_source_shape CHECK ((((release_kind = 'pinned_thread'::text) AND (owner_kind = 'thread'::text) AND (retained_kind = 'rootdisk'::text) AND (thread_runtime_generation IS NOT NULL) AND (thread_retirement_token IS NOT NULL) AND (thread_agent_pod_identity IS NOT NULL) AND ((thread_agent_stop_evidence IS NULL) = (thread_agent_stop_verified_at IS NULL)) AND ((thread_terminal_intent_at IS NULL) = (thread_terminal_intent_generation IS NULL))) OR ((release_kind <> 'pinned_thread'::text) AND (thread_runtime_generation IS NULL) AND (thread_retirement_token IS NULL) AND (thread_agent_pod_identity IS NULL) AND (thread_agent_stop_evidence IS NULL) AND (thread_agent_stop_verified_at IS NULL) AND (thread_wake_ready_identity IS NULL) AND (thread_terminal_intent_at IS NULL) AND (thread_terminal_intent_generation IS NULL)))),
+    CONSTRAINT vm_idle_wake_shape CHECK ((((wake_id IS NULL) AND (wake_generation IS NULL) AND (wake_request_id IS NULL)) OR ((wake_id IS NOT NULL) AND (wake_generation IS NOT NULL) AND (wake_request_id IS NOT NULL))))
+);
+
+
+--
+-- Name: vm_idle_thread_access_continuations; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.vm_idle_thread_access_continuations (
+    operation_id uuid NOT NULL,
+    thread_id uuid NOT NULL,
+    requested_at timestamp with time zone DEFAULT clock_timestamp() NOT NULL,
+    prepared_at timestamp with time zone
+);
+
+
+--
+-- Name: vm_job_creation_owners; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.vm_job_creation_owners (
+    job_id uuid NOT NULL,
+    live_job_id uuid,
+    deletion_receipt jsonb,
+    created_at timestamp with time zone DEFAULT transaction_timestamp() NOT NULL,
+    deleted_at timestamp with time zone,
+    CONSTRAINT vm_job_creation_owners_check CHECK (((live_job_id IS NULL) OR (live_job_id = job_id))),
+    CONSTRAINT vm_job_creation_owners_check1 CHECK (((deleted_at IS NULL) = (deletion_receipt IS NULL)))
+);
+
+
+--
+-- Name: vm_job_creation_terminal_packets; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.vm_job_creation_terminal_packets (
+    request_id uuid NOT NULL,
+    job_id uuid NOT NULL,
+    provision_generation uuid NOT NULL,
+    terminal_kind text NOT NULL,
+    cleanup_admission_id uuid NOT NULL,
+    evidence jsonb NOT NULL,
+    captured_at timestamp with time zone DEFAULT transaction_timestamp() NOT NULL,
+    CONSTRAINT vm_job_creation_terminal_packets_evidence_check CHECK ((jsonb_typeof(evidence) = 'object'::text))
+);
+
+
+--
+-- Name: vm_job_retained_disk_purge_authorities; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.vm_job_retained_disk_purge_authorities (
+    cleanup_admission_id uuid NOT NULL,
+    job_id uuid NOT NULL,
+    final_request_id uuid NOT NULL,
+    provision_generation uuid NOT NULL,
+    vm_uid uuid NOT NULL,
+    vmi_uid uuid NOT NULL,
+    launcher_uid uuid NOT NULL,
+    pvc_uid uuid NOT NULL,
+    binding_kind text NOT NULL,
+    workspace_instance_id uuid,
+    workspace_generation bigint,
+    cleanup_request_id uuid NOT NULL,
+    intent_digest text NOT NULL,
+    created_at timestamp with time zone DEFAULT clock_timestamp() NOT NULL,
+    admitted_xact_id xid8 DEFAULT pg_current_xact_id() NOT NULL,
+    retained_terminal_id uuid,
+    CONSTRAINT vm_job_retained_disk_purge_authoriti_workspace_generation_check CHECK (((workspace_generation IS NULL) OR (workspace_generation > 0))),
+    CONSTRAINT vm_job_retained_disk_purge_authorities_binding_kind_check CHECK ((binding_kind = ANY (ARRAY['bound'::text, 'unbound'::text]))),
+    CONSTRAINT vm_job_retained_disk_purge_authorities_check CHECK (((binding_kind = 'bound'::text) = ((workspace_instance_id IS NOT NULL) AND (workspace_generation IS NOT NULL)))),
+    CONSTRAINT vm_job_retained_disk_purge_authorities_intent_digest_check CHECK ((intent_digest ~ '^sha256:[0-9a-f]{64}$'::text))
+);
+
+
+--
+-- Name: vm_job_retained_disk_purge_predecessors; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.vm_job_retained_disk_purge_predecessors (
+    cleanup_admission_id uuid NOT NULL,
+    source_request_id uuid NOT NULL,
+    old_cleanup_admission_id uuid NOT NULL,
+    reservation_id uuid NOT NULL,
+    reservation_revision bigint NOT NULL,
+    stop_evidence_digest text NOT NULL,
+    created_at timestamp with time zone DEFAULT clock_timestamp() NOT NULL,
+    admitted_xact_id xid8 DEFAULT pg_current_xact_id() NOT NULL,
+    CONSTRAINT vm_job_retained_disk_purge_predecess_reservation_revision_check CHECK ((reservation_revision > 0)),
+    CONSTRAINT vm_job_retained_disk_purge_predecess_stop_evidence_digest_check CHECK ((stop_evidence_digest ~ '^sha256:[0-9a-f]{64}$'::text))
+);
+
+
+--
+-- Name: vm_job_retained_disk_purge_receipts; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.vm_job_retained_disk_purge_receipts (
+    cleanup_admission_id uuid NOT NULL,
+    purge_evidence jsonb NOT NULL,
+    chain_digest text NOT NULL,
+    accepted_at timestamp with time zone DEFAULT clock_timestamp() NOT NULL,
+    CONSTRAINT vm_job_retained_disk_purge_receipts_chain_digest_check CHECK ((chain_digest ~ '^sha256:[0-9a-f]{64}$'::text)),
+    CONSTRAINT vm_job_retained_disk_purge_receipts_purge_evidence_check CHECK ((jsonb_typeof(purge_evidence) = 'object'::text))
+);
+
+
+--
+-- Name: vm_job_retained_resume_terminals; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.vm_job_retained_resume_terminals (
+    id uuid NOT NULL,
+    resume_id uuid NOT NULL,
+    allocated_request_id uuid NOT NULL,
+    source_request_id uuid,
+    terminal_kind text NOT NULL,
+    physical_cleanup_admission_id uuid NOT NULL,
+    evidence jsonb NOT NULL,
+    admitted_xact_id xid8 DEFAULT pg_current_xact_id() NOT NULL,
+    created_at timestamp with time zone DEFAULT clock_timestamp() NOT NULL,
+    CONSTRAINT vm_job_retained_resume_terminals_check CHECK (((terminal_kind = 'source_absent'::text) = (source_request_id IS NULL))),
+    CONSTRAINT vm_job_retained_resume_terminals_evidence_check CHECK ((jsonb_typeof(evidence) = 'object'::text)),
+    CONSTRAINT vm_job_retained_resume_terminals_terminal_kind_check CHECK ((terminal_kind = ANY (ARRAY['source_absent'::text, 'never_issued'::text, 'creation_disposed'::text, 'kept_compute'::text])))
+);
+
+
+--
+-- Name: vm_job_retained_resumes; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.vm_job_retained_resumes (
+    id uuid NOT NULL,
+    job_id uuid NOT NULL,
+    root_retention_admission_id uuid NOT NULL,
+    physical_cleanup_admission_id uuid NOT NULL,
+    predecessor_terminal_id uuid,
+    predecessor_request_id uuid NOT NULL,
+    predecessor_generation uuid NOT NULL,
+    pvc_uid uuid NOT NULL,
+    request_id uuid NOT NULL,
+    provision_generation uuid NOT NULL,
+    explicit_resume_id uuid NOT NULL,
+    requested_by uuid NOT NULL,
+    source_revision bigint NOT NULL,
+    retained_vm jsonb NOT NULL,
+    admitted_xact_id xid8 DEFAULT pg_current_xact_id() NOT NULL,
+    created_at timestamp with time zone DEFAULT clock_timestamp() NOT NULL,
+    CONSTRAINT vm_job_retained_resumes_check CHECK ((provision_generation <> predecessor_generation)),
+    CONSTRAINT vm_job_retained_resumes_check1 CHECK ((request_id <> predecessor_request_id)),
+    CONSTRAINT vm_job_retained_resumes_retained_vm_check CHECK ((jsonb_typeof(retained_vm) = 'object'::text))
+);
+
+
+--
+-- Name: vm_job_worker_delivery_bindings; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.vm_job_worker_delivery_bindings (
+    job_id uuid NOT NULL,
+    lease_token bigint NOT NULL,
+    request_id uuid NOT NULL,
+    provision_generation uuid NOT NULL,
+    vm_uid uuid NOT NULL,
+    pvc_uid uuid NOT NULL,
+    authority_digest text NOT NULL,
+    captured_at timestamp with time zone DEFAULT transaction_timestamp() NOT NULL,
+    CONSTRAINT vm_job_worker_delivery_bindings_check CHECK (((lease_token > 0) AND (authority_digest <> ''::text)))
+);
+
+
+--
+-- Name: vm_pre_ssh_stop_proofs; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.vm_pre_ssh_stop_proofs (
+    cleanup_admission_id uuid NOT NULL,
+    job_id uuid NOT NULL,
+    provision_generation uuid NOT NULL,
+    frozen_digest text NOT NULL,
+    terminal_evidence jsonb NOT NULL,
+    evidence_digest text NOT NULL,
+    observed_at timestamp with time zone DEFAULT clock_timestamp() NOT NULL,
+    initial_ready_xact_id xid8,
+    held_stop_xact_id xid8,
+    CONSTRAINT vm_pre_ssh_stop_proofs_evidence_digest_check CHECK ((evidence_digest ~ '^sha256:[0-9a-f]{64}$'::text)),
+    CONSTRAINT vm_pre_ssh_stop_proofs_frozen_digest_check CHECK ((frozen_digest ~ '^sha256:[0-9a-f]{64}$'::text)),
+    CONSTRAINT vm_pre_ssh_stop_proofs_terminal_evidence_check CHECK ((jsonb_typeof(terminal_evidence) = 'object'::text))
+);
+
+
+--
 -- Name: vm_remote_operation_claim_seq; Type: SEQUENCE; Schema: public; Owner: -
 --
 
@@ -20822,26 +33940,257 @@ COMMENT ON TABLE public.vm_remote_operation_protocol_gate IS 'Default-dark, mono
 
 
 --
--- Name: vm_workspace_cleanup_admissions; Type: TABLE; Schema: public; Owner: -
+-- Name: vm_resource_admission_policy; Type: TABLE; Schema: public; Owner: -
 --
 
-CREATE TABLE public.vm_workspace_cleanup_admissions (
-    id uuid NOT NULL,
-    owner_kind text NOT NULL,
-    owner_id uuid NOT NULL,
-    pvc_uid uuid,
-    source text NOT NULL,
+CREATE TABLE public.vm_resource_admission_policy (
+    cluster_id text NOT NULL,
+    namespace text NOT NULL,
+    policy_digest text NOT NULL,
+    document jsonb NOT NULL,
+    mode text DEFAULT 'off'::text NOT NULL,
+    revision bigint DEFAULT 1 NOT NULL,
+    admission_sequence bigint DEFAULT 0 NOT NULL,
+    maintenance_enqueued_at timestamp with time zone,
+    maintenance_request_id uuid,
+    created_at timestamp with time zone DEFAULT clock_timestamp() NOT NULL,
+    CONSTRAINT vm_resource_admission_policy_admission_sequence_check CHECK ((admission_sequence >= 0)),
+    CONSTRAINT vm_resource_admission_policy_check CHECK (((maintenance_enqueued_at IS NULL) = (maintenance_request_id IS NULL))),
+    CONSTRAINT vm_resource_admission_policy_cluster_id_check CHECK (((length(cluster_id) >= 1) AND (length(cluster_id) <= 253))),
+    CONSTRAINT vm_resource_admission_policy_document_check CHECK ((jsonb_typeof(document) = 'object'::text)),
+    CONSTRAINT vm_resource_admission_policy_mode_check CHECK ((mode = ANY (ARRAY['off'::text, 'shadow'::text, 'enforce'::text, 'drain'::text]))),
+    CONSTRAINT vm_resource_admission_policy_namespace_check CHECK (((length(namespace) >= 1) AND (length(namespace) <= 63))),
+    CONSTRAINT vm_resource_admission_policy_policy_digest_check CHECK ((policy_digest ~ '^sha256:[0-9a-f]{64}$'::text)),
+    CONSTRAINT vm_resource_admission_policy_revision_check CHECK ((revision > 0))
+);
+
+
+--
+-- Name: vm_resource_cleanup_stop_receipts; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.vm_resource_cleanup_stop_receipts (
+    cleanup_admission_id uuid NOT NULL,
+    reservation_id uuid NOT NULL,
     request_id uuid NOT NULL,
-    admitted_at timestamp with time zone DEFAULT clock_timestamp() NOT NULL,
-    completed_at timestamp with time zone,
-    outcome text,
+    job_id uuid NOT NULL,
+    provision_generation uuid NOT NULL,
+    vm_uid uuid NOT NULL,
+    vmi_uid uuid NOT NULL,
+    launcher_uid uuid NOT NULL,
+    pvc_uid uuid NOT NULL,
     intent_digest text NOT NULL,
-    parent_admission_id uuid,
-    CONSTRAINT vm_workspace_cleanup_admissions_check CHECK ((((completed_at IS NULL) AND (outcome IS NULL)) OR ((completed_at IS NOT NULL) AND (outcome IS NOT NULL) AND (outcome <> ''::text)))),
-    CONSTRAINT vm_workspace_cleanup_admissions_intent_digest_check CHECK ((intent_digest <> ''::text)),
-    CONSTRAINT vm_workspace_cleanup_admissions_not_self_parent CHECK ((parent_admission_id IS DISTINCT FROM id)),
-    CONSTRAINT vm_workspace_cleanup_admissions_owner_kind_check CHECK ((owner_kind = ANY (ARRAY['job'::text, 'thread'::text]))),
-    CONSTRAINT vm_workspace_cleanup_admissions_source_check CHECK ((source <> ''::text))
+    stop_evidence jsonb NOT NULL,
+    accepted_at timestamp with time zone DEFAULT clock_timestamp() NOT NULL,
+    CONSTRAINT vm_resource_cleanup_stop_receipts_intent_digest_check CHECK ((intent_digest ~ '^sha256:[0-9a-f]{64}$'::text)),
+    CONSTRAINT vm_resource_cleanup_stop_receipts_stop_evidence_check CHECK ((jsonb_typeof(stop_evidence) = 'object'::text))
+);
+
+
+--
+-- Name: vm_resource_inventory_heads; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.vm_resource_inventory_heads (
+    cluster_id text NOT NULL,
+    policy_digest text NOT NULL,
+    namespace text NOT NULL,
+    label_keys jsonb NOT NULL,
+    current_snapshot_id uuid,
+    observed_high_water timestamp with time zone,
+    observation_conflict boolean DEFAULT false NOT NULL,
+    CONSTRAINT vm_resource_inventory_heads_check CHECK (((current_snapshot_id IS NULL) = (observed_high_water IS NULL))),
+    CONSTRAINT vm_resource_inventory_heads_cluster_id_check CHECK (((length(cluster_id) >= 1) AND (length(cluster_id) <= 253))),
+    CONSTRAINT vm_resource_inventory_heads_label_keys_check CHECK ((jsonb_typeof(label_keys) = 'array'::text)),
+    CONSTRAINT vm_resource_inventory_heads_namespace_check CHECK (((length(namespace) >= 1) AND (length(namespace) <= 253))),
+    CONSTRAINT vm_resource_inventory_heads_policy_digest_check CHECK ((policy_digest ~ '^sha256:[0-9a-f]{64}$'::text))
+);
+
+
+--
+-- Name: vm_resource_inventory_snapshots; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.vm_resource_inventory_snapshots (
+    snapshot_id uuid NOT NULL,
+    cluster_id text NOT NULL,
+    policy_digest text NOT NULL,
+    controller_id uuid NOT NULL,
+    sequence bigint NOT NULL,
+    digest text NOT NULL,
+    started_at timestamp with time zone NOT NULL,
+    finished_at timestamp with time zone NOT NULL,
+    received_at timestamp with time zone DEFAULT clock_timestamp() NOT NULL,
+    complete boolean NOT NULL,
+    document jsonb NOT NULL,
+    CONSTRAINT vm_resource_inventory_snapshots_check CHECK (((started_at <= finished_at) AND (finished_at <= received_at))),
+    CONSTRAINT vm_resource_inventory_snapshots_digest_check CHECK ((digest ~ '^sha256:[0-9a-f]{64}$'::text)),
+    CONSTRAINT vm_resource_inventory_snapshots_document_check CHECK ((jsonb_typeof(document) = 'object'::text)),
+    CONSTRAINT vm_resource_inventory_snapshots_sequence_check CHECK ((sequence > 0))
+);
+
+
+--
+-- Name: vm_resource_nodes; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.vm_resource_nodes (
+    cluster_id text NOT NULL,
+    node_uid uuid NOT NULL,
+    node_name text NOT NULL,
+    created_at timestamp with time zone DEFAULT clock_timestamp() NOT NULL,
+    CONSTRAINT vm_resource_nodes_node_name_check CHECK (((length(node_name) >= 1) AND (length(node_name) <= 253)))
+);
+
+
+--
+-- Name: vm_resource_owner_fairness; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.vm_resource_owner_fairness (
+    cluster_id text NOT NULL,
+    owner_key text NOT NULL,
+    last_admitted_sequence bigint DEFAULT 0 NOT NULL,
+    CONSTRAINT vm_resource_owner_fairness_last_admitted_sequence_check CHECK ((last_admitted_sequence >= 0)),
+    CONSTRAINT vm_resource_owner_fairness_owner_key_check CHECK (((length(owner_key) >= 1) AND (length(owner_key) <= 253)))
+);
+
+
+--
+-- Name: vm_resource_recovery_successors; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.vm_resource_recovery_successors (
+    recovery_id uuid NOT NULL,
+    reservation_id uuid NOT NULL,
+    ordinal bigint NOT NULL,
+    owner_id uuid NOT NULL,
+    provision_generation uuid NOT NULL,
+    vm_uid uuid NOT NULL,
+    root_pvc_uid uuid NOT NULL,
+    prior_vmi_uid uuid NOT NULL,
+    prior_launcher_uid uuid NOT NULL,
+    successor_vmi_uid uuid NOT NULL,
+    successor_launcher_uid uuid NOT NULL,
+    stop_receipt_digest text NOT NULL,
+    final_attestation_digest text NOT NULL,
+    committed_at timestamp with time zone DEFAULT clock_timestamp() NOT NULL,
+    CONSTRAINT vm_resource_recovery_successors_check CHECK ((prior_vmi_uid <> successor_vmi_uid)),
+    CONSTRAINT vm_resource_recovery_successors_check1 CHECK ((prior_launcher_uid <> successor_launcher_uid)),
+    CONSTRAINT vm_resource_recovery_successors_final_attestation_digest_check CHECK ((final_attestation_digest ~ '^sha256:[0-9a-f]{64}$'::text)),
+    CONSTRAINT vm_resource_recovery_successors_ordinal_check CHECK ((ordinal > 0)),
+    CONSTRAINT vm_resource_recovery_successors_stop_receipt_digest_check CHECK ((stop_receipt_digest ~ '^sha256:[0-9a-f]{64}$'::text))
+);
+
+
+--
+-- Name: vm_resource_waiters; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.vm_resource_waiters (
+    request_id uuid NOT NULL,
+    job_id uuid,
+    provision_generation uuid NOT NULL,
+    cluster_id text NOT NULL,
+    policy_digest text NOT NULL,
+    owner_key text NOT NULL,
+    project_id uuid,
+    priority integer NOT NULL,
+    request_digest text NOT NULL,
+    guest_vcpus bigint NOT NULL,
+    guest_memory_bytes bigint NOT NULL,
+    cpu_millicores bigint NOT NULL,
+    memory_bytes bigint NOT NULL,
+    kvm_devices bigint NOT NULL,
+    placement jsonb NOT NULL,
+    state text DEFAULT 'waiting'::text NOT NULL,
+    reason text,
+    bypasses bigint DEFAULT 0 NOT NULL,
+    protected_order bigint,
+    revision bigint DEFAULT 1 NOT NULL,
+    evaluated_snapshot_id uuid,
+    enqueued_at timestamp with time zone DEFAULT clock_timestamp() NOT NULL,
+    resource_version smallint DEFAULT 1 NOT NULL,
+    ephemeral_storage_bytes bigint,
+    tun_devices bigint,
+    vhost_net_devices bigint,
+    owner_kind text DEFAULT 'job'::text NOT NULL,
+    thread_id uuid,
+    CONSTRAINT vm_resource_waiter_exact_owner CHECK ((((owner_kind = 'job'::text) AND (job_id IS NOT NULL) AND (thread_id IS NULL)) OR ((owner_kind = 'thread'::text) AND (job_id IS NULL) AND (thread_id IS NOT NULL)))),
+    CONSTRAINT vm_resource_waiter_vector_version CHECK ((((resource_version = 1) AND (ephemeral_storage_bytes IS NULL) AND (tun_devices IS NULL) AND (vhost_net_devices IS NULL)) OR ((resource_version = 2) AND (ephemeral_storage_bytes IS NOT NULL) AND (tun_devices IS NOT NULL) AND (vhost_net_devices IS NOT NULL) AND (ephemeral_storage_bytes > 0) AND (tun_devices > 0) AND (vhost_net_devices > 0)))),
+    CONSTRAINT vm_resource_waiters_bypasses_check CHECK ((bypasses >= 0)),
+    CONSTRAINT vm_resource_waiters_cpu_millicores_check CHECK ((cpu_millicores > 0)),
+    CONSTRAINT vm_resource_waiters_guest_memory_bytes_check CHECK ((guest_memory_bytes > 0)),
+    CONSTRAINT vm_resource_waiters_guest_vcpus_check CHECK ((guest_vcpus > 0)),
+    CONSTRAINT vm_resource_waiters_kvm_devices_check CHECK ((kvm_devices > 0)),
+    CONSTRAINT vm_resource_waiters_memory_bytes_check CHECK ((memory_bytes > 0)),
+    CONSTRAINT vm_resource_waiters_owner_key_check CHECK (((length(owner_key) >= 1) AND (length(owner_key) <= 253))),
+    CONSTRAINT vm_resource_waiters_placement_check CHECK ((jsonb_typeof(placement) = 'object'::text)),
+    CONSTRAINT vm_resource_waiters_policy_digest_check CHECK ((policy_digest ~ '^sha256:[0-9a-f]{64}$'::text)),
+    CONSTRAINT vm_resource_waiters_protected_order_check CHECK ((protected_order >= 0)),
+    CONSTRAINT vm_resource_waiters_reason_check CHECK ((length(reason) <= 80)),
+    CONSTRAINT vm_resource_waiters_request_digest_check CHECK ((request_digest ~ '^sha256:[0-9a-f]{64}$'::text)),
+    CONSTRAINT vm_resource_waiters_revision_check CHECK ((revision > 0))
+);
+
+
+--
+-- Name: vm_thread_creation_owners; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.vm_thread_creation_owners (
+    thread_id uuid NOT NULL,
+    live_thread_id uuid,
+    deleted_runtime_generation uuid,
+    deleted_retirement_token uuid,
+    deletion_receipt jsonb,
+    created_at timestamp with time zone DEFAULT transaction_timestamp() NOT NULL,
+    deleted_at timestamp with time zone,
+    CONSTRAINT vm_thread_creation_owners_check CHECK (((live_thread_id IS NULL) OR (live_thread_id = thread_id)))
+);
+
+
+--
+-- Name: vm_thread_creation_settlements; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.vm_thread_creation_settlements (
+    request_id uuid NOT NULL,
+    thread_id uuid NOT NULL,
+    runtime_generation uuid NOT NULL,
+    retirement_token uuid NOT NULL,
+    terminal_evidence jsonb NOT NULL,
+    local_quiescence jsonb,
+    settled_at timestamp with time zone DEFAULT transaction_timestamp() NOT NULL
+);
+
+
+--
+-- Name: vm_thread_retained_disk_purge_receipts; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.vm_thread_retained_disk_purge_receipts (
+    cleanup_admission_id uuid NOT NULL,
+    purge_evidence jsonb NOT NULL,
+    accepted_at timestamp with time zone DEFAULT clock_timestamp() NOT NULL
+);
+
+
+--
+-- Name: vm_thread_retained_resume_terminals; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.vm_thread_retained_resume_terminals (
+    id uuid NOT NULL,
+    operation_id uuid NOT NULL,
+    runtime_generation uuid NOT NULL,
+    retirement_token uuid NOT NULL,
+    compute_cleanup_admission_id uuid NOT NULL,
+    source_request_id uuid,
+    source_terminal_evidence jsonb,
+    retained_vm jsonb NOT NULL,
+    retirement_context jsonb NOT NULL,
+    created_at timestamp with time zone DEFAULT clock_timestamp() NOT NULL
 );
 
 
@@ -21220,6 +34569,14 @@ ALTER TABLE ONLY public.capability_grants
 
 
 --
+-- Name: cloud_folder_grants cloud_folder_grants_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.cloud_folder_grants
+    ADD CONSTRAINT cloud_folder_grants_pkey PRIMARY KEY (id);
+
+
+--
 -- Name: cloud_ro_effect_intents cloud_ro_effect_intents_attempt_request; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -21345,6 +34702,102 @@ ALTER TABLE ONLY public.compute_shadow_observations
 
 ALTER TABLE ONLY public.compute_shadow_observations
     ADD CONSTRAINT compute_shadow_observations_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: connector_bind_time_bindings connector_bind_time_bindings_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.connector_bind_time_bindings
+    ADD CONSTRAINT connector_bind_time_bindings_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: connector_credential_leases connector_credential_leases_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.connector_credential_leases
+    ADD CONSTRAINT connector_credential_leases_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: connector_credential_leases connector_credential_leases_token_hash_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.connector_credential_leases
+    ADD CONSTRAINT connector_credential_leases_token_hash_key UNIQUE (token_hash);
+
+
+--
+-- Name: connector_driver_assignments connector_driver_assignments_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.connector_driver_assignments
+    ADD CONSTRAINT connector_driver_assignments_pkey PRIMARY KEY (connector_id);
+
+
+--
+-- Name: connector_driver_identities connector_driver_identities_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.connector_driver_identities
+    ADD CONSTRAINT connector_driver_identities_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: connector_driver_identities connector_driver_identities_token_hash_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.connector_driver_identities
+    ADD CONSTRAINT connector_driver_identities_token_hash_key UNIQUE (token_hash);
+
+
+--
+-- Name: connector_driver_images connector_driver_images_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.connector_driver_images
+    ADD CONSTRAINT connector_driver_images_key UNIQUE (driver, reference, digest);
+
+
+--
+-- Name: connector_driver_images connector_driver_images_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.connector_driver_images
+    ADD CONSTRAINT connector_driver_images_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: connector_driver_operations connector_driver_operations_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.connector_driver_operations
+    ADD CONSTRAINT connector_driver_operations_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: connector_driver_operations connector_driver_operations_token_hash_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.connector_driver_operations
+    ADD CONSTRAINT connector_driver_operations_token_hash_key UNIQUE (token_hash);
+
+
+--
+-- Name: connector_driver_registrations connector_driver_registrations_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.connector_driver_registrations
+    ADD CONSTRAINT connector_driver_registrations_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: connector_minted_credentials connector_minted_credentials_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.connector_minted_credentials
+    ADD CONSTRAINT connector_minted_credentials_pkey PRIMARY KEY (id);
 
 
 --
@@ -21545,6 +34998,14 @@ ALTER TABLE public.jobs
 
 ALTER TABLE ONLY public.jobs
     ADD CONSTRAINT jobs_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: jobs jobs_workspace_idle_shape; Type: CHECK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE public.jobs
+    ADD CONSTRAINT jobs_workspace_idle_shape CHECK (((workspace_idle_revision >= 0) AND ((workspace_idle_episode IS NULL) OR ((jsonb_typeof(workspace_idle_episode) = 'object'::text) AND (octet_length((workspace_idle_episode)::text) <= 4096))))) NOT VALID;
 
 
 --
@@ -21924,6 +35385,46 @@ ALTER TABLE ONLY public.officer_ticket_deliverable_requirements
 
 
 --
+-- Name: pinned_job_deliveries pinned_job_deliveries_job_id_marker_digest_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.pinned_job_deliveries
+    ADD CONSTRAINT pinned_job_deliveries_job_id_marker_digest_key UNIQUE (job_id, marker_digest);
+
+
+--
+-- Name: pinned_job_deliveries pinned_job_deliveries_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.pinned_job_deliveries
+    ADD CONSTRAINT pinned_job_deliveries_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: pinned_job_wait_receipts pinned_job_wait_receipts_delivery_id_source_kind_source_id_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.pinned_job_wait_receipts
+    ADD CONSTRAINT pinned_job_wait_receipts_delivery_id_source_kind_source_id_key UNIQUE (delivery_id, source_kind, source_id);
+
+
+--
+-- Name: pinned_job_wait_receipts pinned_job_wait_receipts_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.pinned_job_wait_receipts
+    ADD CONSTRAINT pinned_job_wait_receipts_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: pinned_job_wait_receipts pinned_job_wait_receipts_source_kind_source_id_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.pinned_job_wait_receipts
+    ADD CONSTRAINT pinned_job_wait_receipts_source_kind_source_id_key UNIQUE (source_kind, source_id);
+
+
+--
 -- Name: canvas_editor_awareness pk_canvas_editor_awareness; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -21953,6 +35454,14 @@ ALTER TABLE ONLY public.processed_inbound_emails
 
 ALTER TABLE ONLY public.project_api_keys
     ADD CONSTRAINT project_api_keys_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: project_connector_defaults project_connector_defaults_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.project_connector_defaults
+    ADD CONSTRAINT project_connector_defaults_pkey PRIMARY KEY (project_id);
 
 
 --
@@ -22009,6 +35518,14 @@ ALTER TABLE ONLY public.project_officers
 
 ALTER TABLE ONLY public.project_repositories
     ADD CONSTRAINT project_repositories_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: project_workspace_defaults project_workspace_defaults_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.project_workspace_defaults
+    ADD CONSTRAINT project_workspace_defaults_pkey PRIMARY KEY (project_id);
 
 
 --
@@ -22432,6 +35949,14 @@ ALTER TABLE ONLY public.srw_execution_attempts
 
 ALTER TABLE ONLY public.srw_execution_attempts
     ADD CONSTRAINT srw_execution_attempts_pod_name_key UNIQUE (pod_name);
+
+
+--
+-- Name: srw_execution_deadline_scan srw_execution_deadline_scan_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.srw_execution_deadline_scan
+    ADD CONSTRAINT srw_execution_deadline_scan_pkey PRIMARY KEY (singleton);
 
 
 --
@@ -22955,6 +36480,22 @@ ALTER TABLE ONLY public.thread_permission_requests
 
 
 --
+-- Name: thread_protected_sources thread_protected_sources_one_per_thread; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.thread_protected_sources
+    ADD CONSTRAINT thread_protected_sources_one_per_thread UNIQUE (thread_id);
+
+
+--
+-- Name: thread_protected_sources thread_protected_sources_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.thread_protected_sources
+    ADD CONSTRAINT thread_protected_sources_pkey PRIMARY KEY (id);
+
+
+--
 -- Name: thread_rewinds thread_rewinds_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -23003,11 +36544,35 @@ ALTER TABLE ONLY public.thread_turn_commits
 
 
 --
+-- Name: thread_workspace_provision_create_receipts thread_workspace_provision_create_receipts_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.thread_workspace_provision_create_receipts
+    ADD CONSTRAINT thread_workspace_provision_create_receipts_pkey PRIMARY KEY (attempt_id, resource);
+
+
+--
+-- Name: thread_workspace_provision_inert_fence_receipts thread_workspace_provision_inert_fence_receipts_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.thread_workspace_provision_inert_fence_receipts
+    ADD CONSTRAINT thread_workspace_provision_inert_fence_receipts_pkey PRIMARY KEY (attempt_id);
+
+
+--
 -- Name: thread_workspace_provision_intents thread_workspace_provision_intents_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
 ALTER TABLE ONLY public.thread_workspace_provision_intents
     ADD CONSTRAINT thread_workspace_provision_intents_pkey PRIMARY KEY (attempt_id);
+
+
+--
+-- Name: thread_workspace_provision_stop_receipts thread_workspace_provision_stop_receipts_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.thread_workspace_provision_stop_receipts
+    ADD CONSTRAINT thread_workspace_provision_stop_receipts_pkey PRIMARY KEY (attempt_id);
 
 
 --
@@ -23031,6 +36596,14 @@ COMMENT ON CONSTRAINT threads_main_cloud_instance_pairing ON public.threads IS '
 
 ALTER TABLE ONLY public.threads
     ADD CONSTRAINT threads_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: threads threads_workspace_idle_shape; Type: CHECK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE public.threads
+    ADD CONSTRAINT threads_workspace_idle_shape CHECK (((workspace_idle_revision >= 0) AND ((workspace_idle_episode IS NULL) OR ((jsonb_typeof(workspace_idle_episode) = 'object'::text) AND (octet_length((workspace_idle_episode)::text) <= 4096))))) NOT VALID;
 
 
 --
@@ -23306,6 +36879,366 @@ ALTER TABLE ONLY public.users
 
 
 --
+-- Name: vm_creation_retries vm_creation_disposition_shape; Type: CHECK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE public.vm_creation_retries
+    ADD CONSTRAINT vm_creation_disposition_shape CHECK (((((cancellation_disposition IS NULL) OR ((jsonb_typeof(cancellation_disposition) = 'object'::text) AND ((cancellation_disposition -> 'version'::text) = '1'::jsonb) AND ((cancellation_disposition ->> 'request_id'::text) = (request_id)::text))) AND (jsonb_typeof(cancellation_progress) = 'object'::text) AND ((cancellation_disposition IS NOT NULL) OR (cancellation_progress = '{}'::jsonb))) IS TRUE)) NOT VALID;
+
+
+--
+-- Name: vm_creation_effects vm_creation_effects_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.vm_creation_effects
+    ADD CONSTRAINT vm_creation_effects_pkey PRIMARY KEY (effect_nonce);
+
+
+--
+-- Name: vm_creation_effects vm_creation_effects_request_id_effect_number_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.vm_creation_effects
+    ADD CONSTRAINT vm_creation_effects_request_id_effect_number_key UNIQUE (request_id, effect_number);
+
+
+--
+-- Name: vm_creation_retries vm_creation_retained_resume_owner; Type: CHECK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE public.vm_creation_retries
+    ADD CONSTRAINT vm_creation_retained_resume_owner CHECK (((thread_retained_resume_id IS NULL) OR ((owner_kind = 'thread'::text) AND (origin = 'resume'::text) AND (thread_wake_operation_id IS NULL) AND (expected_pvc_uid IS NOT NULL)))) NOT VALID;
+
+
+--
+-- Name: vm_creation_retries vm_creation_retries_job_id_provision_generation_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.vm_creation_retries
+    ADD CONSTRAINT vm_creation_retries_job_id_provision_generation_key UNIQUE (job_id, provision_generation);
+
+
+--
+-- Name: vm_creation_retries vm_creation_retries_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.vm_creation_retries
+    ADD CONSTRAINT vm_creation_retries_pkey PRIMARY KEY (request_id);
+
+
+--
+-- Name: vm_idle_access_leases vm_idle_access_leases_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.vm_idle_access_leases
+    ADD CONSTRAINT vm_idle_access_leases_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: vm_idle_operations vm_idle_operations_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.vm_idle_operations
+    ADD CONSTRAINT vm_idle_operations_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: vm_idle_thread_access_continuations vm_idle_thread_access_continuations_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.vm_idle_thread_access_continuations
+    ADD CONSTRAINT vm_idle_thread_access_continuations_pkey PRIMARY KEY (operation_id);
+
+
+--
+-- Name: vm_job_cancel_retention_authorities vm_job_cancel_retention_authori_job_id_provision_generation_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.vm_job_cancel_retention_authorities
+    ADD CONSTRAINT vm_job_cancel_retention_authori_job_id_provision_generation_key UNIQUE (job_id, provision_generation);
+
+
+--
+-- Name: vm_job_cancel_retention_authorities vm_job_cancel_retention_authorities_cleanup_request_id_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.vm_job_cancel_retention_authorities
+    ADD CONSTRAINT vm_job_cancel_retention_authorities_cleanup_request_id_key UNIQUE (cleanup_request_id);
+
+
+--
+-- Name: vm_job_cancel_retention_authorities vm_job_cancel_retention_authorities_creation_request_id_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.vm_job_cancel_retention_authorities
+    ADD CONSTRAINT vm_job_cancel_retention_authorities_creation_request_id_key UNIQUE (creation_request_id);
+
+
+--
+-- Name: vm_job_cancel_retention_authorities vm_job_cancel_retention_authorities_job_retained_resume_id_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.vm_job_cancel_retention_authorities
+    ADD CONSTRAINT vm_job_cancel_retention_authorities_job_retained_resume_id_key UNIQUE (job_retained_resume_id);
+
+
+--
+-- Name: vm_job_cancel_retention_authorities vm_job_cancel_retention_authorities_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.vm_job_cancel_retention_authorities
+    ADD CONSTRAINT vm_job_cancel_retention_authorities_pkey PRIMARY KEY (cleanup_admission_id);
+
+
+--
+-- Name: vm_job_cancel_retention_authorities vm_job_cancel_retention_authorities_reservation_id_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.vm_job_cancel_retention_authorities
+    ADD CONSTRAINT vm_job_cancel_retention_authorities_reservation_id_key UNIQUE (reservation_id);
+
+
+--
+-- Name: vm_job_cancel_retention_authorities vm_job_cancel_retention_authorities_superseded_admission_id_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.vm_job_cancel_retention_authorities
+    ADD CONSTRAINT vm_job_cancel_retention_authorities_superseded_admission_id_key UNIQUE (superseded_admission_id);
+
+
+--
+-- Name: vm_job_cancel_retention_authorities vm_job_cancel_retention_policy; Type: CHECK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE public.vm_job_cancel_retention_authorities
+    ADD CONSTRAINT vm_job_cancel_retention_policy CHECK ((((policy_version = 1) AND (job_retained_resume_id IS NULL) AND (ready_retention_preflight IS NULL)) OR ((policy_version = 2) AND (job_retained_resume_id IS NOT NULL)) OR ((policy_version = ANY (ARRAY[3, 4])) AND (job_retained_resume_id IS NULL) AND (ready_retention_preflight IS NOT NULL)))) NOT VALID;
+
+
+--
+-- Name: vm_job_creation_owners vm_job_creation_owners_live_job_id_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.vm_job_creation_owners
+    ADD CONSTRAINT vm_job_creation_owners_live_job_id_key UNIQUE (live_job_id);
+
+
+--
+-- Name: vm_job_creation_owners vm_job_creation_owners_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.vm_job_creation_owners
+    ADD CONSTRAINT vm_job_creation_owners_pkey PRIMARY KEY (job_id);
+
+
+--
+-- Name: vm_job_creation_terminal_packets vm_job_creation_terminal_packet_job_id_provision_generation_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.vm_job_creation_terminal_packets
+    ADD CONSTRAINT vm_job_creation_terminal_packet_job_id_provision_generation_key UNIQUE (job_id, provision_generation);
+
+
+--
+-- Name: vm_job_creation_terminal_packets vm_job_creation_terminal_packets_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.vm_job_creation_terminal_packets
+    ADD CONSTRAINT vm_job_creation_terminal_packets_pkey PRIMARY KEY (request_id);
+
+
+--
+-- Name: vm_job_creation_terminal_packets vm_job_creation_terminal_packets_terminal_kind_check; Type: CHECK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE public.vm_job_creation_terminal_packets
+    ADD CONSTRAINT vm_job_creation_terminal_packets_terminal_kind_check CHECK ((terminal_kind = ANY (ARRAY['never_issued'::text, 'physical_stop'::text, 'retained_late_purge'::text, 'retained_noeffect'::text]))) NOT VALID;
+
+
+--
+-- Name: vm_job_repository_settlement_receipts vm_job_repository_settlement_re_job_id_provision_generation_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.vm_job_repository_settlement_receipts
+    ADD CONSTRAINT vm_job_repository_settlement_re_job_id_provision_generation_key UNIQUE (job_id, provision_generation);
+
+
+--
+-- Name: vm_job_repository_settlement_receipts vm_job_repository_settlement_receipts_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.vm_job_repository_settlement_receipts
+    ADD CONSTRAINT vm_job_repository_settlement_receipts_pkey PRIMARY KEY (cleanup_admission_id);
+
+
+--
+-- Name: vm_job_repository_settlement_receipts vm_job_repository_settlement_receipts_request_id_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.vm_job_repository_settlement_receipts
+    ADD CONSTRAINT vm_job_repository_settlement_receipts_request_id_key UNIQUE (request_id);
+
+
+--
+-- Name: vm_job_retained_disk_purge_authorities vm_job_retained_disk_purge_authorities_job_id_pvc_uid_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.vm_job_retained_disk_purge_authorities
+    ADD CONSTRAINT vm_job_retained_disk_purge_authorities_job_id_pvc_uid_key UNIQUE (job_id, pvc_uid);
+
+
+--
+-- Name: vm_job_retained_disk_purge_authorities vm_job_retained_disk_purge_authorities_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.vm_job_retained_disk_purge_authorities
+    ADD CONSTRAINT vm_job_retained_disk_purge_authorities_pkey PRIMARY KEY (cleanup_admission_id);
+
+
+--
+-- Name: vm_job_retained_disk_purge_predecessors vm_job_retained_disk_purge_predece_old_cleanup_admission_id_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.vm_job_retained_disk_purge_predecessors
+    ADD CONSTRAINT vm_job_retained_disk_purge_predece_old_cleanup_admission_id_key UNIQUE (old_cleanup_admission_id);
+
+
+--
+-- Name: vm_job_retained_disk_purge_predecessors vm_job_retained_disk_purge_predecessors_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.vm_job_retained_disk_purge_predecessors
+    ADD CONSTRAINT vm_job_retained_disk_purge_predecessors_pkey PRIMARY KEY (cleanup_admission_id, source_request_id);
+
+
+--
+-- Name: vm_job_retained_disk_purge_predecessors vm_job_retained_disk_purge_predecessors_reservation_id_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.vm_job_retained_disk_purge_predecessors
+    ADD CONSTRAINT vm_job_retained_disk_purge_predecessors_reservation_id_key UNIQUE (reservation_id);
+
+
+--
+-- Name: vm_job_retained_disk_purge_predecessors vm_job_retained_disk_purge_predecessors_source_request_id_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.vm_job_retained_disk_purge_predecessors
+    ADD CONSTRAINT vm_job_retained_disk_purge_predecessors_source_request_id_key UNIQUE (source_request_id);
+
+
+--
+-- Name: vm_job_retained_disk_purge_receipts vm_job_retained_disk_purge_receipts_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.vm_job_retained_disk_purge_receipts
+    ADD CONSTRAINT vm_job_retained_disk_purge_receipts_pkey PRIMARY KEY (cleanup_admission_id);
+
+
+--
+-- Name: vm_job_retained_resume_terminals vm_job_retained_resume_terminals_allocated_request_id_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.vm_job_retained_resume_terminals
+    ADD CONSTRAINT vm_job_retained_resume_terminals_allocated_request_id_key UNIQUE (allocated_request_id);
+
+
+--
+-- Name: vm_job_retained_resume_terminals vm_job_retained_resume_terminals_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.vm_job_retained_resume_terminals
+    ADD CONSTRAINT vm_job_retained_resume_terminals_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: vm_job_retained_resume_terminals vm_job_retained_resume_terminals_resume_id_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.vm_job_retained_resume_terminals
+    ADD CONSTRAINT vm_job_retained_resume_terminals_resume_id_key UNIQUE (resume_id);
+
+
+--
+-- Name: vm_job_retained_resumes vm_job_retained_resumes_explicit_resume_id_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.vm_job_retained_resumes
+    ADD CONSTRAINT vm_job_retained_resumes_explicit_resume_id_key UNIQUE (explicit_resume_id);
+
+
+--
+-- Name: vm_job_retained_resumes vm_job_retained_resumes_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.vm_job_retained_resumes
+    ADD CONSTRAINT vm_job_retained_resumes_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: vm_job_retained_resumes vm_job_retained_resumes_predecessor_terminal_id_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.vm_job_retained_resumes
+    ADD CONSTRAINT vm_job_retained_resumes_predecessor_terminal_id_key UNIQUE (predecessor_terminal_id);
+
+
+--
+-- Name: vm_job_retained_resumes vm_job_retained_resumes_provision_generation_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.vm_job_retained_resumes
+    ADD CONSTRAINT vm_job_retained_resumes_provision_generation_key UNIQUE (provision_generation);
+
+
+--
+-- Name: vm_job_retained_resumes vm_job_retained_resumes_request_id_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.vm_job_retained_resumes
+    ADD CONSTRAINT vm_job_retained_resumes_request_id_key UNIQUE (request_id);
+
+
+--
+-- Name: vm_job_worker_delivery_bindings vm_job_worker_delivery_bindings_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.vm_job_worker_delivery_bindings
+    ADD CONSTRAINT vm_job_worker_delivery_bindings_pkey PRIMARY KEY (job_id, lease_token);
+
+
+--
+-- Name: vm_pre_ssh_stop_intents vm_pre_ssh_stop_intents_job_id_provision_generation_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.vm_pre_ssh_stop_intents
+    ADD CONSTRAINT vm_pre_ssh_stop_intents_job_id_provision_generation_key UNIQUE (job_id, provision_generation);
+
+
+--
+-- Name: vm_pre_ssh_stop_intents vm_pre_ssh_stop_intents_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.vm_pre_ssh_stop_intents
+    ADD CONSTRAINT vm_pre_ssh_stop_intents_pkey PRIMARY KEY (cleanup_admission_id);
+
+
+--
+-- Name: vm_pre_ssh_stop_intents vm_pre_ssh_stop_intents_vm_uid_launcher_uid_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.vm_pre_ssh_stop_intents
+    ADD CONSTRAINT vm_pre_ssh_stop_intents_vm_uid_launcher_uid_key UNIQUE (vm_uid, launcher_uid);
+
+
+--
+-- Name: vm_pre_ssh_stop_proofs vm_pre_ssh_stop_proofs_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.vm_pre_ssh_stop_proofs
+    ADD CONSTRAINT vm_pre_ssh_stop_proofs_pkey PRIMARY KEY (cleanup_admission_id);
+
+
+--
 -- Name: vm_remote_operation_leases vm_remote_operation_leases_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -23319,6 +37252,286 @@ ALTER TABLE ONLY public.vm_remote_operation_leases
 
 ALTER TABLE ONLY public.vm_remote_operation_protocol_gate
     ADD CONSTRAINT vm_remote_operation_protocol_gate_pkey PRIMARY KEY (singleton);
+
+
+--
+-- Name: vm_resource_admission_policy vm_resource_admission_policy_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.vm_resource_admission_policy
+    ADD CONSTRAINT vm_resource_admission_policy_pkey PRIMARY KEY (cluster_id);
+
+
+--
+-- Name: vm_resource_cleanup_stop_receipts vm_resource_cleanup_stop_receipts_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.vm_resource_cleanup_stop_receipts
+    ADD CONSTRAINT vm_resource_cleanup_stop_receipts_pkey PRIMARY KEY (cleanup_admission_id);
+
+
+--
+-- Name: vm_resource_cleanup_stop_receipts vm_resource_cleanup_stop_receipts_reservation_id_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.vm_resource_cleanup_stop_receipts
+    ADD CONSTRAINT vm_resource_cleanup_stop_receipts_reservation_id_key UNIQUE (reservation_id);
+
+
+--
+-- Name: vm_resource_inventory_heads vm_resource_inventory_heads_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.vm_resource_inventory_heads
+    ADD CONSTRAINT vm_resource_inventory_heads_pkey PRIMARY KEY (cluster_id, policy_digest);
+
+
+--
+-- Name: vm_resource_inventory_snapshots vm_resource_inventory_snapsho_snapshot_id_cluster_id_policy_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.vm_resource_inventory_snapshots
+    ADD CONSTRAINT vm_resource_inventory_snapsho_snapshot_id_cluster_id_policy_key UNIQUE (snapshot_id, cluster_id, policy_digest);
+
+
+--
+-- Name: vm_resource_inventory_snapshots vm_resource_inventory_snapshots_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.vm_resource_inventory_snapshots
+    ADD CONSTRAINT vm_resource_inventory_snapshots_pkey PRIMARY KEY (snapshot_id);
+
+
+--
+-- Name: vm_resource_nodes vm_resource_nodes_cluster_id_node_uid_node_name_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.vm_resource_nodes
+    ADD CONSTRAINT vm_resource_nodes_cluster_id_node_uid_node_name_key UNIQUE (cluster_id, node_uid, node_name);
+
+
+--
+-- Name: vm_resource_nodes vm_resource_nodes_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.vm_resource_nodes
+    ADD CONSTRAINT vm_resource_nodes_pkey PRIMARY KEY (cluster_id, node_uid);
+
+
+--
+-- Name: vm_resource_owner_fairness vm_resource_owner_fairness_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.vm_resource_owner_fairness
+    ADD CONSTRAINT vm_resource_owner_fairness_pkey PRIMARY KEY (cluster_id, owner_key);
+
+
+--
+-- Name: vm_resource_recovery_successors vm_resource_recovery_successo_reservation_id_successor_laun_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.vm_resource_recovery_successors
+    ADD CONSTRAINT vm_resource_recovery_successo_reservation_id_successor_laun_key UNIQUE (reservation_id, successor_launcher_uid);
+
+
+--
+-- Name: vm_resource_recovery_successors vm_resource_recovery_successo_reservation_id_successor_vmi__key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.vm_resource_recovery_successors
+    ADD CONSTRAINT vm_resource_recovery_successo_reservation_id_successor_vmi__key UNIQUE (reservation_id, successor_vmi_uid);
+
+
+--
+-- Name: vm_resource_recovery_successors vm_resource_recovery_successors_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.vm_resource_recovery_successors
+    ADD CONSTRAINT vm_resource_recovery_successors_pkey PRIMARY KEY (recovery_id);
+
+
+--
+-- Name: vm_resource_recovery_successors vm_resource_recovery_successors_reservation_id_ordinal_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.vm_resource_recovery_successors
+    ADD CONSTRAINT vm_resource_recovery_successors_reservation_id_ordinal_key UNIQUE (reservation_id, ordinal);
+
+
+--
+-- Name: vm_resource_reservations vm_resource_reservations_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.vm_resource_reservations
+    ADD CONSTRAINT vm_resource_reservations_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: vm_resource_reservations vm_resource_reservations_request_id_revision_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.vm_resource_reservations
+    ADD CONSTRAINT vm_resource_reservations_request_id_revision_key UNIQUE (request_id, revision);
+
+
+--
+-- Name: vm_resource_thread_cleanup_authorities vm_resource_thread_cleanup_authorities_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.vm_resource_thread_cleanup_authorities
+    ADD CONSTRAINT vm_resource_thread_cleanup_authorities_pkey PRIMARY KEY (cleanup_admission_id);
+
+
+--
+-- Name: vm_resource_thread_cleanup_authorities vm_resource_thread_cleanup_authorities_reservation_id_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.vm_resource_thread_cleanup_authorities
+    ADD CONSTRAINT vm_resource_thread_cleanup_authorities_reservation_id_key UNIQUE (reservation_id);
+
+
+--
+-- Name: vm_resource_thread_cleanup_stops vm_resource_thread_cleanup_stops_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.vm_resource_thread_cleanup_stops
+    ADD CONSTRAINT vm_resource_thread_cleanup_stops_pkey PRIMARY KEY (cleanup_admission_id);
+
+
+--
+-- Name: vm_resource_waiters vm_resource_waiters_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.vm_resource_waiters
+    ADD CONSTRAINT vm_resource_waiters_pkey PRIMARY KEY (request_id);
+
+
+--
+-- Name: vm_resource_waiters vm_resource_waiters_request_id_cluster_id_policy_digest_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.vm_resource_waiters
+    ADD CONSTRAINT vm_resource_waiters_request_id_cluster_id_policy_digest_key UNIQUE (request_id, cluster_id, policy_digest);
+
+
+--
+-- Name: vm_resource_waiters vm_resource_waiters_state_check; Type: CHECK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE public.vm_resource_waiters
+    ADD CONSTRAINT vm_resource_waiters_state_check CHECK ((state = ANY (ARRAY['waiting'::text, 'nonfit'::text, 'parked'::text, 'admitted'::text, 'cancelled'::text, 'released'::text]))) NOT VALID;
+
+
+--
+-- Name: vm_thread_cleanup_refusal_recoveries vm_thread_cleanup_refusal_recoveries_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.vm_thread_cleanup_refusal_recoveries
+    ADD CONSTRAINT vm_thread_cleanup_refusal_recoveries_pkey PRIMARY KEY (refused_admission_id);
+
+
+--
+-- Name: vm_thread_cleanup_refusal_recoveries vm_thread_cleanup_refusal_recoveries_successor_admission_id_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.vm_thread_cleanup_refusal_recoveries
+    ADD CONSTRAINT vm_thread_cleanup_refusal_recoveries_successor_admission_id_key UNIQUE (successor_admission_id);
+
+
+--
+-- Name: vm_thread_creation_owners vm_thread_creation_owners_live_thread_id_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.vm_thread_creation_owners
+    ADD CONSTRAINT vm_thread_creation_owners_live_thread_id_key UNIQUE (live_thread_id);
+
+
+--
+-- Name: vm_thread_creation_owners vm_thread_creation_owners_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.vm_thread_creation_owners
+    ADD CONSTRAINT vm_thread_creation_owners_pkey PRIMARY KEY (thread_id);
+
+
+--
+-- Name: vm_thread_creation_settlements vm_thread_creation_settlements_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.vm_thread_creation_settlements
+    ADD CONSTRAINT vm_thread_creation_settlements_pkey PRIMARY KEY (request_id);
+
+
+--
+-- Name: vm_thread_retained_disk_purge_authorities vm_thread_retained_disk_purge__compute_cleanup_admission_id_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.vm_thread_retained_disk_purge_authorities
+    ADD CONSTRAINT vm_thread_retained_disk_purge__compute_cleanup_admission_id_key UNIQUE (compute_cleanup_admission_id);
+
+
+--
+-- Name: vm_thread_retained_disk_purge_authorities vm_thread_retained_disk_purge_authorities_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.vm_thread_retained_disk_purge_authorities
+    ADD CONSTRAINT vm_thread_retained_disk_purge_authorities_pkey PRIMARY KEY (cleanup_admission_id);
+
+
+--
+-- Name: vm_thread_retained_disk_purge_receipts vm_thread_retained_disk_purge_receipts_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.vm_thread_retained_disk_purge_receipts
+    ADD CONSTRAINT vm_thread_retained_disk_purge_receipts_pkey PRIMARY KEY (cleanup_admission_id);
+
+
+--
+-- Name: vm_thread_retained_resume_terminals vm_thread_retained_resume_ter_operation_id_runtime_generati_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.vm_thread_retained_resume_terminals
+    ADD CONSTRAINT vm_thread_retained_resume_ter_operation_id_runtime_generati_key UNIQUE (operation_id, runtime_generation, retirement_token);
+
+
+--
+-- Name: vm_thread_retained_resume_terminals vm_thread_retained_resume_terminals_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.vm_thread_retained_resume_terminals
+    ADD CONSTRAINT vm_thread_retained_resume_terminals_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: vm_thread_retained_resumes vm_thread_retained_resumes_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.vm_thread_retained_resumes
+    ADD CONSTRAINT vm_thread_retained_resumes_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: vm_thread_retained_resumes vm_thread_retained_resumes_provision_generation_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.vm_thread_retained_resumes
+    ADD CONSTRAINT vm_thread_retained_resumes_provision_generation_key UNIQUE (provision_generation);
+
+
+--
+-- Name: vm_thread_retained_resumes vm_thread_retained_resumes_request_id_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.vm_thread_retained_resumes
+    ADD CONSTRAINT vm_thread_retained_resumes_request_id_key UNIQUE (request_id);
+
+
+--
+-- Name: vm_thread_retained_resumes vm_thread_retained_resumes_thread_id_runtime_generation_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.vm_thread_retained_resumes
+    ADD CONSTRAINT vm_thread_retained_resumes_thread_id_runtime_generation_key UNIQUE (thread_id, runtime_generation);
 
 
 --
@@ -23706,6 +37919,27 @@ CREATE INDEX idx_canvas_view_bootstraps_pending ON public.canvas_view_bootstraps
 
 
 --
+-- Name: idx_cloud_folder_grants_pending; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_cloud_folder_grants_pending ON public.cloud_folder_grants USING btree (status, revoke_next_at) WHERE (status = ANY (ARRAY['minting'::text, 'revoking'::text]));
+
+
+--
+-- Name: idx_cloud_folder_grants_project; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_cloud_folder_grants_project ON public.cloud_folder_grants USING btree (project_id, user_id) WHERE (status = ANY (ARRAY['minting'::text, 'active'::text, 'revoking'::text]));
+
+
+--
+-- Name: idx_cloud_folder_grants_user; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_cloud_folder_grants_user ON public.cloud_folder_grants USING btree (user_id) WHERE (status = ANY (ARRAY['minting'::text, 'active'::text, 'revoking'::text]));
+
+
+--
 -- Name: idx_completion_effects_session_drain; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -23717,6 +37951,153 @@ CREATE INDEX idx_completion_effects_session_drain ON public.completion_effects U
 --
 
 CREATE INDEX idx_config_override_lookup ON public.config_overrides USING btree (family, kind, name);
+
+
+--
+-- Name: idx_connector_bind_time_bindings_connector; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_connector_bind_time_bindings_connector ON public.connector_bind_time_bindings USING btree (connector_id, created_at DESC);
+
+
+--
+-- Name: idx_connector_bind_time_bindings_open; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_connector_bind_time_bindings_open ON public.connector_bind_time_bindings USING btree (status) WHERE (status = ANY (ARRAY['pending'::text, 'bound'::text, 'revoking'::text]));
+
+
+--
+-- Name: idx_connector_bind_time_bindings_owner; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_connector_bind_time_bindings_owner ON public.connector_bind_time_bindings USING btree (owner_kind, owner_id, connector_id, created_at DESC);
+
+
+--
+-- Name: idx_connector_bind_time_bindings_registration; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_connector_bind_time_bindings_registration ON public.connector_bind_time_bindings USING btree (registration_id) WHERE (registration_id IS NOT NULL);
+
+
+--
+-- Name: idx_connector_credential_leases_connector; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_connector_credential_leases_connector ON public.connector_credential_leases USING btree (connector_id);
+
+
+--
+-- Name: idx_connector_credential_leases_job; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_connector_credential_leases_job ON public.connector_credential_leases USING btree (job_id) WHERE (job_id IS NOT NULL);
+
+
+--
+-- Name: idx_connector_credential_leases_live_expiry; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_connector_credential_leases_live_expiry ON public.connector_credential_leases USING btree (expires_at) WHERE (revoked_at IS NULL);
+
+
+--
+-- Name: idx_connector_credential_leases_thread; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_connector_credential_leases_thread ON public.connector_credential_leases USING btree (thread_id) WHERE (thread_id IS NOT NULL);
+
+
+--
+-- Name: idx_connector_driver_assignments_registration; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_connector_driver_assignments_registration ON public.connector_driver_assignments USING btree (registration_id);
+
+
+--
+-- Name: idx_connector_driver_identities_connector; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_connector_driver_identities_connector ON public.connector_driver_identities USING btree (connector_id);
+
+
+--
+-- Name: idx_connector_driver_identities_pod; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_connector_driver_identities_pod ON public.connector_driver_identities USING btree (pod_uid) WHERE ((revoked_at IS NULL) AND (pod_uid IS NOT NULL));
+
+
+--
+-- Name: idx_connector_driver_images_digest; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_connector_driver_images_digest ON public.connector_driver_images USING btree (driver, digest);
+
+
+--
+-- Name: idx_connector_driver_images_latest; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_connector_driver_images_latest ON public.connector_driver_images USING btree (driver, reference, resolved_at DESC);
+
+
+--
+-- Name: idx_connector_driver_operations_binding; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_connector_driver_operations_binding ON public.connector_driver_operations USING btree (binding_id) WHERE (binding_id IS NOT NULL);
+
+
+--
+-- Name: idx_connector_driver_operations_live; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_connector_driver_operations_live ON public.connector_driver_operations USING btree (created_at) WHERE (removed_at IS NULL);
+
+
+--
+-- Name: idx_connector_driver_operations_unread; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_connector_driver_operations_unread ON public.connector_driver_operations USING btree (finished_at) WHERE (outcome_ciphertext IS NOT NULL);
+
+
+--
+-- Name: idx_connector_minted_credentials_connector; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_connector_minted_credentials_connector ON public.connector_minted_credentials USING btree (connector_id) WHERE (status <> ALL (ARRAY['revoked'::text, 'abandoned'::text]));
+
+
+--
+-- Name: idx_connector_minted_credentials_done; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_connector_minted_credentials_done ON public.connector_minted_credentials USING btree (revoked_at) WHERE (status = ANY (ARRAY['revoked'::text, 'abandoned'::text]));
+
+
+--
+-- Name: idx_connector_minted_credentials_expiry; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_connector_minted_credentials_expiry ON public.connector_minted_credentials USING btree (expires_at) WHERE (status = ANY (ARRAY['live'::text, 'superseded'::text]));
+
+
+--
+-- Name: idx_connector_minted_credentials_owner; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_connector_minted_credentials_owner ON public.connector_minted_credentials USING btree (owner_kind, owner_id) WHERE (status <> ALL (ARRAY['revoked'::text, 'abandoned'::text]));
+
+
+--
+-- Name: idx_connector_minted_credentials_pending; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_connector_minted_credentials_pending ON public.connector_minted_credentials USING btree (status, revoke_next_at) WHERE (status = ANY (ARRAY['minting'::text, 'revoking'::text]));
 
 
 --
@@ -24434,6 +38815,13 @@ CREATE UNIQUE INDEX idx_thread_agent_warm_binding_agent_active ON public.thread_
 
 
 --
+-- Name: idx_thread_agent_warm_binding_agent_active_v2; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX idx_thread_agent_warm_binding_agent_active_v2 ON public.thread_agent_warm_binding_protections USING btree (agent_id) WHERE ((status)::text = ANY ((ARRAY['planned'::character varying, 'protecting'::character varying, 'protected'::character varying, 'bound'::character varying, 'releasing'::character varying, 'terminal_release'::character varying])::text[]));
+
+
+--
 -- Name: idx_thread_agent_warm_binding_reconcile; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -24441,10 +38829,24 @@ CREATE INDEX idx_thread_agent_warm_binding_reconcile ON public.thread_agent_warm
 
 
 --
+-- Name: idx_thread_agent_warm_binding_reconcile_v2; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_thread_agent_warm_binding_reconcile_v2 ON public.thread_agent_warm_binding_protections USING btree (status, lease_expires_at, effect_expires_at) WHERE ((status)::text = ANY ((ARRAY['planned'::character varying, 'protecting'::character varying, 'protected'::character varying, 'releasing'::character varying, 'terminal_release'::character varying])::text[]));
+
+
+--
 -- Name: idx_thread_agent_warm_binding_thread_active; Type: INDEX; Schema: public; Owner: -
 --
 
 CREATE UNIQUE INDEX idx_thread_agent_warm_binding_thread_active ON public.thread_agent_warm_binding_protections USING btree (thread_id, runtime_generation) WHERE ((status)::text = ANY ((ARRAY['planned'::character varying, 'protecting'::character varying, 'protected'::character varying, 'bound'::character varying, 'releasing'::character varying])::text[]));
+
+
+--
+-- Name: idx_thread_agent_warm_binding_thread_active_v2; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX idx_thread_agent_warm_binding_thread_active_v2 ON public.thread_agent_warm_binding_protections USING btree (thread_id, runtime_generation) WHERE ((status)::text = ANY ((ARRAY['planned'::character varying, 'protecting'::character varying, 'protected'::character varying, 'bound'::character varying, 'releasing'::character varying, 'terminal_release'::character varying])::text[]));
 
 
 --
@@ -24826,10 +39228,31 @@ CREATE UNIQUE INDEX managed_repository_workspace_creation_one_active ON public.m
 
 
 --
+-- Name: managed_repository_workspace_creation_owner_history; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX managed_repository_workspace_creation_owner_history ON public.managed_repository_workspace_creation_reservations USING btree (owner_kind, owner_id, scope, id);
+
+
+--
 -- Name: managed_repository_workspace_restore_work_claim_unique; Type: INDEX; Schema: public; Owner: -
 --
 
 CREATE UNIQUE INDEX managed_repository_workspace_restore_work_claim_unique ON public.managed_repository_workspace_creation_reservations USING btree (restore_work_claim_token) WHERE (restore_work_claim_token > 0);
+
+
+--
+-- Name: pinned_job_deliveries_job; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX pinned_job_deliveries_job ON public.pinned_job_deliveries USING btree (job_id, intent_at DESC);
+
+
+--
+-- Name: pinned_job_wait_receipts_job; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX pinned_job_wait_receipts_job ON public.pinned_job_wait_receipts USING btree (job_id, source_kind, source_id);
 
 
 --
@@ -25183,10 +39606,73 @@ CREATE UNIQUE INDEX uq_canvases_origin_generation ON public.canvases USING btree
 
 
 --
+-- Name: uq_cloud_folder_grants_live; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX uq_cloud_folder_grants_live ON public.cloud_folder_grants USING btree (datasource_id, user_id, kind) WHERE (status = ANY (ARRAY['minting'::text, 'active'::text]));
+
+
+--
 -- Name: uq_config_override; Type: INDEX; Schema: public; Owner: -
 --
 
 CREATE UNIQUE INDEX uq_config_override ON public.config_overrides USING btree (COALESCE(family, ''::character varying), kind, name);
+
+
+--
+-- Name: uq_connector_bind_time_bindings_live; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX uq_connector_bind_time_bindings_live ON public.connector_bind_time_bindings USING btree (owner_kind, owner_id, connector_id) WHERE (status = ANY (ARRAY['pending'::text, 'bound'::text]));
+
+
+--
+-- Name: uq_connector_credential_leases_live_job; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX uq_connector_credential_leases_live_job ON public.connector_credential_leases USING btree (job_id, connector_id) WHERE ((revoked_at IS NULL) AND (job_id IS NOT NULL));
+
+
+--
+-- Name: uq_connector_credential_leases_live_thread; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX uq_connector_credential_leases_live_thread ON public.connector_credential_leases USING btree (thread_id, connector_id) WHERE ((revoked_at IS NULL) AND (thread_id IS NOT NULL));
+
+
+--
+-- Name: uq_connector_driver_identities_serving_key; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX uq_connector_driver_identities_serving_key ON public.connector_driver_identities USING btree (connector_id, image_digest, credential_generation) WHERE ((revoked_at IS NULL) AND (credential_generation IS NOT NULL) AND (replaced_at IS NULL));
+
+
+--
+-- Name: uq_connector_driver_registrations_account; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX uq_connector_driver_registrations_account ON public.connector_driver_registrations USING btree (owner_id, name) WHERE (scope_kind = 'Account'::text);
+
+
+--
+-- Name: uq_connector_driver_registrations_catalog; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX uq_connector_driver_registrations_catalog ON public.connector_driver_registrations USING btree (name) WHERE (scope_kind = 'Catalog'::text);
+
+
+--
+-- Name: uq_connector_driver_registrations_project; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX uq_connector_driver_registrations_project ON public.connector_driver_registrations USING btree (project_id, name) WHERE (scope_kind = 'Project'::text);
+
+
+--
+-- Name: uq_connector_minted_credentials_live; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX uq_connector_minted_credentials_live ON public.connector_minted_credentials USING btree (owner_kind, owner_id, connector_id) WHERE (status = 'live'::text);
 
 
 --
@@ -25201,6 +39687,13 @@ CREATE UNIQUE INDEX uq_contact_primary_per_channel ON public.contact_addresses U
 --
 
 CREATE UNIQUE INDEX uq_datasource_name_type_owner ON public.datasources USING btree (name, type, COALESCE(created_by, '00000000-0000-0000-0000-000000000000'::uuid));
+
+
+--
+-- Name: uq_datasources_managed_key; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX uq_datasources_managed_key ON public.datasources USING btree (managed_key) WHERE (managed_key IS NOT NULL);
 
 
 --
@@ -25470,6 +39963,118 @@ CREATE INDEX usage_rates_v2_lookup_idx ON public.usage_rates_v2 USING btree (cos
 
 
 --
+-- Name: vm_creation_effect_one_outstanding; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX vm_creation_effect_one_outstanding ON public.vm_creation_effects USING btree (request_id) WHERE (state = 'issued'::text);
+
+
+--
+-- Name: vm_creation_retries_due; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX vm_creation_retries_due ON public.vm_creation_retries USING btree (next_probe_at, request_id) WHERE (state = ANY (ARRAY['queued'::text, 'reconciling'::text, 'cancel_requested'::text]));
+
+
+--
+-- Name: vm_creation_thread_generation; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX vm_creation_thread_generation ON public.vm_creation_retries USING btree (thread_id, provision_generation) WHERE (owner_kind = 'thread'::text);
+
+
+--
+-- Name: vm_idle_access_successor_generation; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX vm_idle_access_successor_generation ON public.vm_idle_operations USING btree (owner_id, episode_id, wake_generation) WHERE (access_rebind_proof IS NOT NULL);
+
+
+--
+-- Name: vm_idle_active_access; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX vm_idle_active_access ON public.vm_idle_access_leases USING btree (owner_kind, owner_id, expires_at) WHERE (closed_at IS NULL);
+
+
+--
+-- Name: vm_idle_due; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX vm_idle_due ON public.vm_idle_operations USING btree (phase, retry_after, admitted_at) WHERE (closed_at IS NULL);
+
+
+--
+-- Name: vm_idle_episode_history; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX vm_idle_episode_history ON public.vm_idle_operations USING btree (owner_kind, owner_id, episode_id, episode_revision DESC, id DESC);
+
+
+--
+-- Name: vm_idle_one_access_rebind_revision; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX vm_idle_one_access_rebind_revision ON public.vm_idle_operations USING btree (owner_id, episode_id, episode_revision) WHERE (access_rebind_proof IS NOT NULL);
+
+
+--
+-- Name: vm_idle_one_open_owner; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX vm_idle_one_open_owner ON public.vm_idle_operations USING btree (owner_kind, owner_id) WHERE (closed_at IS NULL);
+
+
+--
+-- Name: vm_idle_one_terminal_decision; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX vm_idle_one_terminal_decision ON public.vm_idle_operations USING btree (owner_kind, owner_id) WHERE (terminal_source_command_id IS NOT NULL);
+
+
+--
+-- Name: vm_idle_retained_rootdisk; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX vm_idle_retained_rootdisk ON public.vm_idle_operations USING btree (owner_id, pvc_uid) WHERE (storage_disposition = 'retention_unknown'::text);
+
+
+--
+-- Name: vm_idle_thread_access_one_pending; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX vm_idle_thread_access_one_pending ON public.vm_idle_thread_access_continuations USING btree (thread_id) WHERE (prepared_at IS NULL);
+
+
+--
+-- Name: vm_job_cancel_retention_owner; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX vm_job_cancel_retention_owner ON public.vm_job_cancel_retention_authorities USING btree (job_id);
+
+
+--
+-- Name: vm_job_cancel_retention_pvc; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX vm_job_cancel_retention_pvc ON public.vm_job_cancel_retention_authorities USING btree (pvc_uid);
+
+
+--
+-- Name: vm_job_retained_first_resume; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX vm_job_retained_first_resume ON public.vm_job_retained_resumes USING btree (root_retention_admission_id) WHERE (predecessor_terminal_id IS NULL);
+
+
+--
+-- Name: vm_job_retained_resume_owner; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX vm_job_retained_resume_owner ON public.vm_job_retained_resumes USING btree (job_id);
+
+
+--
 -- Name: vm_remote_operation_expiry; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -25481,6 +40086,76 @@ CREATE INDEX vm_remote_operation_expiry ON public.vm_remote_operation_leases USI
 --
 
 CREATE UNIQUE INDEX vm_remote_operation_one_active_owner ON public.vm_remote_operation_leases USING btree (owner_kind, owner_id) WHERE (settled_at IS NULL);
+
+
+--
+-- Name: vm_resource_held_node; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX vm_resource_held_node ON public.vm_resource_reservations USING btree (cluster_id, node_uid) WHERE (state <> 'released'::text);
+
+
+--
+-- Name: vm_resource_inventory_history_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX vm_resource_inventory_history_idx ON public.vm_resource_inventory_snapshots USING btree (cluster_id, policy_digest, started_at DESC);
+
+
+--
+-- Name: vm_resource_one_held_launcher; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX vm_resource_one_held_launcher ON public.vm_resource_reservations USING btree (cluster_id, launcher_uid) WHERE ((state <> 'released'::text) AND (launcher_uid IS NOT NULL));
+
+
+--
+-- Name: vm_resource_one_held_request; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX vm_resource_one_held_request ON public.vm_resource_reservations USING btree (request_id) WHERE (state <> 'released'::text);
+
+
+--
+-- Name: vm_resource_one_held_vm; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX vm_resource_one_held_vm ON public.vm_resource_reservations USING btree (cluster_id, vm_uid) WHERE ((state <> 'released'::text) AND (vm_uid IS NOT NULL));
+
+
+--
+-- Name: vm_resource_one_held_vmi; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX vm_resource_one_held_vmi ON public.vm_resource_reservations USING btree (cluster_id, vmi_uid) WHERE ((state <> 'released'::text) AND (vmi_uid IS NOT NULL));
+
+
+--
+-- Name: vm_resource_snapshot_references; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX vm_resource_snapshot_references ON public.vm_resource_reservations USING btree (snapshot_id);
+
+
+--
+-- Name: vm_resource_successor_current; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX vm_resource_successor_current ON public.vm_resource_recovery_successors USING btree (reservation_id, ordinal DESC);
+
+
+--
+-- Name: vm_resource_waiter_heads; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX vm_resource_waiter_heads ON public.vm_resource_waiters USING btree (cluster_id, state, owner_key, enqueued_at, request_id);
+
+
+--
+-- Name: vm_resource_waiter_maintenance; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX vm_resource_waiter_maintenance ON public.vm_resource_waiters USING btree (cluster_id, enqueued_at, request_id);
 
 
 --
@@ -25537,6 +40212,202 @@ CREATE UNIQUE INDEX workspace_intervals_open_uq ON public.workspace_intervals US
 --
 
 CREATE INDEX workspace_intervals_pending_idx ON public.workspace_intervals USING btree (ended_at) WHERE ((ended_at IS NOT NULL) AND (materialized_at IS NULL));
+
+
+--
+-- Name: managed_repository_authorities a_job_repository_source_insert; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER a_job_repository_source_insert BEFORE INSERT ON public.managed_repository_authorities FOR EACH ROW EXECUTE FUNCTION public.lock_job_repository_source_insert();
+
+
+--
+-- Name: managed_repository_creation_intents a_job_repository_source_insert; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER a_job_repository_source_insert BEFORE INSERT ON public.managed_repository_creation_intents FOR EACH ROW EXECUTE FUNCTION public.lock_job_repository_source_insert();
+
+
+--
+-- Name: managed_repository_process_zero_receipts a_job_vm_nondelivery_insert; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER a_job_vm_nondelivery_insert BEFORE INSERT ON public.managed_repository_process_zero_receipts FOR EACH ROW EXECUTE FUNCTION public.lock_job_vm_nondelivery_insert();
+
+
+--
+-- Name: managed_repository_workspace_cleanup_intents a_job_vm_nondelivery_insert; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER a_job_vm_nondelivery_insert BEFORE INSERT ON public.managed_repository_workspace_cleanup_intents FOR EACH ROW EXECUTE FUNCTION public.lock_job_vm_nondelivery_insert();
+
+
+--
+-- Name: managed_repository_workspace_creation_reservations a_job_vm_nondelivery_insert; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER a_job_vm_nondelivery_insert BEFORE INSERT ON public.managed_repository_workspace_creation_reservations FOR EACH ROW EXECUTE FUNCTION public.lock_job_vm_nondelivery_insert();
+
+
+--
+-- Name: srw_execution_attempts a_job_vm_nondelivery_insert; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER a_job_vm_nondelivery_insert BEFORE INSERT ON public.srw_execution_attempts FOR EACH ROW EXECUTE FUNCTION public.lock_job_vm_nondelivery_insert();
+
+
+--
+-- Name: srw_execution_spec_revisions a_job_vm_nondelivery_insert; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER a_job_vm_nondelivery_insert BEFORE INSERT ON public.srw_execution_spec_revisions FOR EACH ROW EXECUTE FUNCTION public.lock_job_vm_nondelivery_insert();
+
+
+--
+-- Name: srw_execution_specs a_job_vm_nondelivery_insert; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER a_job_vm_nondelivery_insert BEFORE INSERT ON public.srw_execution_specs FOR EACH ROW EXECUTE FUNCTION public.lock_job_vm_nondelivery_insert();
+
+
+--
+-- Name: srw_execution_workspace_bindings a_job_vm_nondelivery_insert; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER a_job_vm_nondelivery_insert BEFORE INSERT ON public.srw_execution_workspace_bindings FOR EACH ROW EXECUTE FUNCTION public.lock_job_vm_nondelivery_insert();
+
+
+--
+-- Name: srw_workspace_instances a_job_vm_nondelivery_insert; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER a_job_vm_nondelivery_insert BEFORE INSERT ON public.srw_workspace_instances FOR EACH ROW EXECUTE FUNCTION public.lock_job_vm_nondelivery_insert();
+
+
+--
+-- Name: vm_workspace_cleanup_admissions a_vm_job_cancel_retention_cleanup_guard; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER a_vm_job_cancel_retention_cleanup_guard BEFORE INSERT OR DELETE OR UPDATE ON public.vm_workspace_cleanup_admissions FOR EACH ROW EXECUTE FUNCTION public.guard_vm_job_cancel_retention_cleanup();
+
+
+--
+-- Name: vm_creation_retries a_vm_job_creation_owner; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER a_vm_job_creation_owner BEFORE INSERT ON public.vm_creation_retries FOR EACH ROW EXECUTE FUNCTION public.ensure_vm_job_creation_owner();
+
+
+--
+-- Name: jobs a_vm_job_pinned_cancel_retention_guard; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER a_vm_job_pinned_cancel_retention_guard BEFORE DELETE OR UPDATE ON public.jobs FOR EACH ROW EXECUTE FUNCTION public.guard_vm_job_pinned_cancel_retention();
+
+
+--
+-- Name: vm_creation_effects a_vm_job_retained_create_effect; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER a_vm_job_retained_create_effect BEFORE INSERT ON public.vm_creation_effects FOR EACH ROW EXECUTE FUNCTION public.guard_vm_job_retained_create_effect();
+
+
+--
+-- Name: managed_repository_process_zero_receipts a_vm_job_retained_ledger; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER a_vm_job_retained_ledger BEFORE DELETE OR UPDATE ON public.managed_repository_process_zero_receipts FOR EACH ROW EXECUTE FUNCTION public.guard_vm_job_retained_ledger();
+
+
+--
+-- Name: vm_creation_effects a_vm_job_retained_ledger; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER a_vm_job_retained_ledger BEFORE INSERT OR DELETE OR UPDATE ON public.vm_creation_effects FOR EACH ROW EXECUTE FUNCTION public.guard_vm_job_retained_ledger();
+
+
+--
+-- Name: vm_creation_retries a_vm_job_retained_ledger; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER a_vm_job_retained_ledger BEFORE DELETE OR UPDATE ON public.vm_creation_retries FOR EACH ROW EXECUTE FUNCTION public.guard_vm_job_retained_ledger();
+
+
+--
+-- Name: vm_resource_cleanup_stop_receipts a_vm_job_retained_ledger; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER a_vm_job_retained_ledger BEFORE INSERT OR DELETE OR UPDATE ON public.vm_resource_cleanup_stop_receipts FOR EACH ROW EXECUTE FUNCTION public.guard_vm_job_retained_ledger();
+
+
+--
+-- Name: vm_resource_recovery_successors a_vm_job_retained_ledger; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER a_vm_job_retained_ledger BEFORE INSERT OR DELETE OR UPDATE ON public.vm_resource_recovery_successors FOR EACH ROW EXECUTE FUNCTION public.guard_vm_job_retained_ledger();
+
+
+--
+-- Name: vm_resource_reservations a_vm_job_retained_ledger; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER a_vm_job_retained_ledger BEFORE INSERT OR DELETE OR UPDATE ON public.vm_resource_reservations FOR EACH ROW EXECUTE FUNCTION public.guard_vm_job_retained_ledger();
+
+
+--
+-- Name: vm_workspace_cleanup_admissions a_vm_job_retained_ledger; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER a_vm_job_retained_ledger BEFORE INSERT OR DELETE OR UPDATE ON public.vm_workspace_cleanup_admissions FOR EACH ROW EXECUTE FUNCTION public.guard_vm_job_retained_ledger();
+
+
+--
+-- Name: vm_creation_retries a_vm_job_retained_resume_source; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER a_vm_job_retained_resume_source BEFORE INSERT OR UPDATE ON public.vm_creation_retries FOR EACH ROW EXECUTE FUNCTION public.guard_vm_job_retained_resume_source();
+
+
+--
+-- Name: vm_creation_effects a_vm_thread_creation_terminal_ledger; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER a_vm_thread_creation_terminal_ledger BEFORE INSERT OR DELETE OR UPDATE ON public.vm_creation_effects FOR EACH ROW EXECUTE FUNCTION public.guard_vm_thread_creation_terminal_ledger();
+
+
+--
+-- Name: vm_creation_retries a_vm_thread_creation_terminal_ledger; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER a_vm_thread_creation_terminal_ledger BEFORE DELETE OR UPDATE ON public.vm_creation_retries FOR EACH ROW EXECUTE FUNCTION public.guard_vm_thread_creation_terminal_ledger();
+
+
+--
+-- Name: vm_resource_reservations a_vm_thread_creation_terminal_ledger; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER a_vm_thread_creation_terminal_ledger BEFORE INSERT OR DELETE OR UPDATE ON public.vm_resource_reservations FOR EACH ROW EXECUTE FUNCTION public.guard_vm_thread_creation_terminal_ledger();
+
+
+--
+-- Name: vm_resource_waiters a_vm_thread_creation_terminal_ledger; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER a_vm_thread_creation_terminal_ledger BEFORE INSERT OR DELETE OR UPDATE ON public.vm_resource_waiters FOR EACH ROW EXECUTE FUNCTION public.guard_vm_thread_creation_terminal_ledger();
+
+
+--
+-- Name: vm_workspace_cleanup_admissions a_vm_thread_creation_terminal_ledger; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER a_vm_thread_creation_terminal_ledger BEFORE INSERT OR DELETE OR UPDATE ON public.vm_workspace_cleanup_admissions FOR EACH ROW EXECUTE FUNCTION public.guard_vm_thread_creation_terminal_ledger();
+
+
+--
+-- Name: threads a_vm_thread_retained_terminal_projection; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER a_vm_thread_retained_terminal_projection BEFORE UPDATE ON public.threads FOR EACH ROW EXECUTE FUNCTION public.project_vm_thread_retained_terminal();
 
 
 --
@@ -25638,6 +40509,13 @@ CREATE CONSTRAINT TRIGGER agents_thread_reciprocity_fence AFTER DELETE OR UPDATE
 
 
 --
+-- Name: managed_repository_process_zero_receipts b_vm_pre_ssh_zero_insert; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER b_vm_pre_ssh_zero_insert BEFORE INSERT ON public.managed_repository_process_zero_receipts FOR EACH ROW EXECUTE FUNCTION public.guard_vm_pre_ssh_zero_insert();
+
+
+--
 -- Name: cloud_ro_effect_intents cloud_ro_effect_intents_history; Type: TRIGGER; Schema: public; Owner: -
 --
 
@@ -25715,6 +40593,167 @@ CREATE TRIGGER datasource_project_policy_change AFTER INSERT OR DELETE OR UPDATE
 
 
 --
+-- Name: threads guard_pinned_idle_terminal_thread_update; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER guard_pinned_idle_terminal_thread_update BEFORE UPDATE ON public.threads FOR EACH ROW EXECUTE FUNCTION public.guard_pinned_idle_terminal_thread();
+
+
+--
+-- Name: vm_creation_retries guard_vm_creation_thread_source; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER guard_vm_creation_thread_source BEFORE INSERT OR UPDATE ON public.vm_creation_retries FOR EACH ROW EXECUTE FUNCTION public.guard_vm_creation_thread_source();
+
+
+--
+-- Name: vm_job_retained_resumes guard_vm_job_retained_resume; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER guard_vm_job_retained_resume BEFORE INSERT OR DELETE OR UPDATE ON public.vm_job_retained_resumes FOR EACH ROW EXECUTE FUNCTION public.guard_vm_job_retained_resume();
+
+
+--
+-- Name: vm_job_retained_resume_terminals guard_vm_job_retained_resume_terminal; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER guard_vm_job_retained_resume_terminal BEFORE INSERT OR DELETE OR UPDATE ON public.vm_job_retained_resume_terminals FOR EACH ROW EXECUTE FUNCTION public.guard_vm_job_retained_resume_terminal();
+
+
+--
+-- Name: vm_resource_cleanup_stop_receipts guard_vm_resource_cleanup_stop_receipt; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER guard_vm_resource_cleanup_stop_receipt BEFORE INSERT OR DELETE OR UPDATE ON public.vm_resource_cleanup_stop_receipts FOR EACH ROW EXECUTE FUNCTION public.guard_vm_resource_cleanup_stop_receipt();
+
+
+--
+-- Name: vm_resource_recovery_successors guard_vm_resource_recovery_successor; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER guard_vm_resource_recovery_successor BEFORE INSERT OR DELETE OR UPDATE ON public.vm_resource_recovery_successors FOR EACH ROW EXECUTE FUNCTION public.guard_vm_resource_recovery_successor();
+
+
+--
+-- Name: vm_resource_reservations guard_vm_resource_release_v2; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER guard_vm_resource_release_v2 BEFORE UPDATE ON public.vm_resource_reservations FOR EACH ROW WHEN ((NOT public.valid_vm_thread_cleanup_release(old.*, new.*))) EXECUTE FUNCTION public.guard_vm_resource_release_v2();
+
+
+--
+-- Name: vm_resource_reservations guard_vm_resource_reservation; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER guard_vm_resource_reservation BEFORE INSERT OR DELETE OR UPDATE ON public.vm_resource_reservations FOR EACH ROW EXECUTE FUNCTION public.guard_vm_resource_reservation();
+
+
+--
+-- Name: vm_resource_reservations guard_vm_resource_reservation_v2; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER guard_vm_resource_reservation_v2 BEFORE INSERT OR DELETE OR UPDATE ON public.vm_resource_reservations FOR EACH ROW EXECUTE FUNCTION public.guard_vm_resource_reservation_v2();
+
+
+--
+-- Name: vm_resource_waiters guard_vm_resource_waiter; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER guard_vm_resource_waiter BEFORE INSERT OR UPDATE ON public.vm_resource_waiters FOR EACH ROW EXECUTE FUNCTION public.guard_vm_resource_waiter();
+
+
+--
+-- Name: vm_resource_waiters guard_vm_resource_waiter_v2; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER guard_vm_resource_waiter_v2 BEFORE INSERT OR UPDATE ON public.vm_resource_waiters FOR EACH ROW EXECUTE FUNCTION public.guard_vm_resource_waiter_v2();
+
+
+--
+-- Name: vm_resource_thread_cleanup_authorities guard_vm_thread_cleanup_authority; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER guard_vm_thread_cleanup_authority BEFORE INSERT OR DELETE OR UPDATE ON public.vm_resource_thread_cleanup_authorities FOR EACH ROW EXECUTE FUNCTION public.guard_vm_thread_cleanup_authority();
+
+
+--
+-- Name: vm_thread_cleanup_refusal_recoveries guard_vm_thread_cleanup_refusal_recovery; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER guard_vm_thread_cleanup_refusal_recovery BEFORE INSERT OR DELETE OR UPDATE ON public.vm_thread_cleanup_refusal_recoveries FOR EACH ROW EXECUTE FUNCTION public.guard_vm_thread_cleanup_refusal_recovery();
+
+
+--
+-- Name: vm_resource_thread_cleanup_stops guard_vm_thread_cleanup_stop; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER guard_vm_thread_cleanup_stop BEFORE INSERT OR DELETE OR UPDATE ON public.vm_resource_thread_cleanup_stops FOR EACH ROW EXECUTE FUNCTION public.guard_vm_thread_cleanup_stop();
+
+
+--
+-- Name: vm_workspace_cleanup_admissions guard_vm_thread_recovered_cleanup_admission; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER guard_vm_thread_recovered_cleanup_admission BEFORE DELETE OR UPDATE ON public.vm_workspace_cleanup_admissions FOR EACH ROW EXECUTE FUNCTION public.guard_vm_thread_recovered_cleanup_admission();
+
+
+--
+-- Name: vm_thread_retained_disk_purge_authorities guard_vm_thread_retained_disk_purge_authority; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER guard_vm_thread_retained_disk_purge_authority BEFORE INSERT OR DELETE OR UPDATE ON public.vm_thread_retained_disk_purge_authorities FOR EACH ROW EXECUTE FUNCTION public.guard_vm_thread_retained_disk_purge_authority();
+
+
+--
+-- Name: vm_workspace_cleanup_admissions guard_vm_thread_retained_disk_purge_completion_insert; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER guard_vm_thread_retained_disk_purge_completion_insert BEFORE INSERT ON public.vm_workspace_cleanup_admissions FOR EACH ROW WHEN ((new.source = 'pinned_thread_retained_disk_purge'::text)) EXECUTE FUNCTION public.guard_vm_thread_retained_disk_purge_completion();
+
+
+--
+-- Name: vm_workspace_cleanup_admissions guard_vm_thread_retained_disk_purge_completion_update; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER guard_vm_thread_retained_disk_purge_completion_update BEFORE UPDATE ON public.vm_workspace_cleanup_admissions FOR EACH ROW WHEN (((old.source = 'pinned_thread_retained_disk_purge'::text) OR (new.source = 'pinned_thread_retained_disk_purge'::text))) EXECUTE FUNCTION public.guard_vm_thread_retained_disk_purge_completion();
+
+
+--
+-- Name: vm_thread_retained_disk_purge_receipts guard_vm_thread_retained_disk_purge_receipt; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER guard_vm_thread_retained_disk_purge_receipt BEFORE INSERT OR DELETE OR UPDATE ON public.vm_thread_retained_disk_purge_receipts FOR EACH ROW EXECUTE FUNCTION public.guard_vm_thread_retained_disk_purge_receipt();
+
+
+--
+-- Name: vm_thread_retained_resumes guard_vm_thread_retained_resume; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER guard_vm_thread_retained_resume BEFORE INSERT OR DELETE OR UPDATE ON public.vm_thread_retained_resumes FOR EACH ROW EXECUTE FUNCTION public.guard_vm_thread_retained_resume();
+
+
+--
+-- Name: vm_thread_retained_resume_terminals guard_vm_thread_retained_resume_terminal; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER guard_vm_thread_retained_resume_terminal BEFORE INSERT OR DELETE OR UPDATE ON public.vm_thread_retained_resume_terminals FOR EACH ROW EXECUTE FUNCTION public.guard_vm_thread_retained_resume_terminal();
+
+
+--
+-- Name: jobs guard_workspace_idle_episode; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER guard_workspace_idle_episode BEFORE INSERT OR UPDATE ON public.jobs FOR EACH ROW EXECUTE FUNCTION public.guard_workspace_idle_episode();
+
+
+--
+-- Name: threads guard_workspace_idle_episode; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER guard_workspace_idle_episode BEFORE INSERT OR UPDATE ON public.threads FOR EACH ROW EXECUTE FUNCTION public.guard_workspace_idle_episode();
+
+
+--
 -- Name: infra_metering_control infra_metering_control_cutover_one_way; Type: TRIGGER; Schema: public; Owner: -
 --
 
@@ -25747,6 +40786,13 @@ CREATE TRIGGER infra_usage_day_state_one_way_seal BEFORE INSERT OR DELETE OR UPD
 --
 
 CREATE TRIGGER infrastructure_storage_resource_mappings_append_only BEFORE DELETE OR UPDATE ON public.infrastructure_storage_resource_mappings FOR EACH ROW EXECUTE FUNCTION public.protect_infrastructure_storage_resource_mapping();
+
+
+--
+-- Name: jobs jobs_worker_execution_hold_immutable; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER jobs_worker_execution_hold_immutable BEFORE UPDATE OF context ON public.jobs FOR EACH ROW EXECUTE FUNCTION public.preserve_job_worker_execution_hold();
 
 
 --
@@ -25817,6 +40863,27 @@ CREATE TRIGGER officer_ticket_claim_job_delete_audit BEFORE DELETE ON public.job
 --
 
 CREATE CONSTRAINT TRIGGER officer_ticket_claim_job_integrity AFTER INSERT OR UPDATE OF id, context, project_id, created_by_thread_id ON public.jobs DEFERRABLE INITIALLY IMMEDIATE FOR EACH ROW EXECUTE FUNCTION public.enforce_officer_ticket_claim_job_integrity();
+
+
+--
+-- Name: jobs open_pinned_job_idle_guard; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER open_pinned_job_idle_guard BEFORE UPDATE ON public.jobs FOR EACH ROW EXECUTE FUNCTION public.guard_open_pinned_job_idle();
+
+
+--
+-- Name: pinned_job_deliveries pinned_job_delivery_guard; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER pinned_job_delivery_guard BEFORE DELETE OR UPDATE ON public.pinned_job_deliveries FOR EACH ROW EXECUTE FUNCTION public.guard_pinned_job_delivery();
+
+
+--
+-- Name: pinned_job_wait_receipts pinned_job_wait_receipt_guard; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER pinned_job_wait_receipt_guard BEFORE DELETE OR UPDATE ON public.pinned_job_wait_receipts FOR EACH ROW EXECUTE FUNCTION public.guard_pinned_job_wait_receipt();
 
 
 --
@@ -26016,6 +41083,13 @@ CREATE CONSTRAINT TRIGGER resource_publication_plans_manifest_complete AFTER INS
 
 
 --
+-- Name: srw_workspace_instances retained_vm_network_profile; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER retained_vm_network_profile BEFORE INSERT OR UPDATE OF backend_state ON public.srw_workspace_instances FOR EACH ROW EXECUTE FUNCTION public.guard_retained_vm_network_profile();
+
+
+--
 -- Name: threads settle_job_wakes_before_thread_delete; Type: TRIGGER; Schema: public; Owner: -
 --
 
@@ -26198,6 +41272,13 @@ CREATE TRIGGER thread_permission_notify_trigger AFTER UPDATE ON public.thread_pe
 
 
 --
+-- Name: thread_protected_sources thread_protected_sources_immutable; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER thread_protected_sources_immutable BEFORE UPDATE ON public.thread_protected_sources FOR EACH ROW EXECUTE FUNCTION public.enforce_thread_protected_source_immutable();
+
+
+--
 -- Name: thread_runtime_attach_abort_outcomes thread_runtime_attach_abort_outcomes_append_only; Type: TRIGGER; Schema: public; Owner: -
 --
 
@@ -26209,6 +41290,20 @@ CREATE TRIGGER thread_runtime_attach_abort_outcomes_append_only BEFORE DELETE OR
 --
 
 CREATE TRIGGER thread_runtime_attach_abort_outcomes_insert_authority BEFORE INSERT ON public.thread_runtime_attach_abort_outcomes FOR EACH ROW EXECUTE FUNCTION public.enforce_thread_runtime_attach_abort_outcome_insert();
+
+
+--
+-- Name: thread_runtime_retirement_outcomes thread_runtime_retirement_capture_retained_resume; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER thread_runtime_retirement_capture_retained_resume AFTER INSERT ON public.thread_runtime_retirement_outcomes FOR EACH ROW EXECUTE FUNCTION public.capture_vm_thread_retained_resume_terminal();
+
+
+--
+-- Name: thread_runtime_retirement_outcomes thread_runtime_retirement_capture_vm_source; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER thread_runtime_retirement_capture_vm_source AFTER INSERT ON public.thread_runtime_retirement_outcomes FOR EACH ROW EXECUTE FUNCTION public.capture_vm_thread_creation_settlement();
 
 
 --
@@ -26230,6 +41325,41 @@ CREATE TRIGGER thread_runtime_retirement_outcomes_insert_authority BEFORE INSERT
 --
 
 CREATE TRIGGER thread_runtime_retirement_outcomes_z_capture_pod BEFORE INSERT ON public.thread_runtime_retirement_outcomes FOR EACH ROW EXECUTE FUNCTION public.capture_retired_pinned_agent_pod();
+
+
+--
+-- Name: thread_runtime_retirement_outcomes thread_runtime_retirement_outcomes_z_capture_vm_actuator; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER thread_runtime_retirement_outcomes_z_capture_vm_actuator BEFORE INSERT ON public.thread_runtime_retirement_outcomes FOR EACH ROW EXECUTE FUNCTION public.capture_pinned_vm_actuator_request();
+
+
+--
+-- Name: threads thread_vm_creation_audit_owner_retirement; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER thread_vm_creation_audit_owner_retirement BEFORE DELETE ON public.threads FOR EACH ROW EXECUTE FUNCTION public.retire_vm_thread_creation_owner();
+
+
+--
+-- Name: threads thread_vm_creation_audit_owner_reuse; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER thread_vm_creation_audit_owner_reuse BEFORE INSERT ON public.threads FOR EACH ROW EXECUTE FUNCTION public.prevent_vm_thread_creation_owner_reuse();
+
+
+--
+-- Name: threads thread_vm_creation_source_end_delete; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER thread_vm_creation_source_end_delete BEFORE DELETE ON public.threads FOR EACH ROW EXECUTE FUNCTION public.enforce_thread_vm_creation_source_end_delete();
+
+
+--
+-- Name: threads thread_vm_creation_source_terminal_settlement; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER thread_vm_creation_source_terminal_settlement BEFORE DELETE OR UPDATE OF status, runtime_retirement_token ON public.threads FOR EACH ROW EXECUTE FUNCTION public.enforce_vm_creation_source_terminal_settlement();
 
 
 --
@@ -26258,6 +41388,13 @@ CREATE TRIGGER threads_ended_transition_fence BEFORE UPDATE OF status, runtime_g
 --
 
 CREATE TRIGGER threads_pinned_delete_authority BEFORE DELETE ON public.threads FOR EACH ROW EXECUTE FUNCTION public.enforce_pinned_thread_delete_authority();
+
+
+--
+-- Name: threads threads_vm_actuator_request_guard; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER threads_vm_actuator_request_guard BEFORE INSERT OR UPDATE ON public.threads FOR EACH ROW EXECUTE FUNCTION public.guard_pinned_vm_actuator_request();
 
 
 --
@@ -26300,6 +41437,20 @@ CREATE TRIGGER trg_canvas_revoke_user_admission AFTER UPDATE OF is_approved ON p
 --
 
 CREATE TRIGGER trg_capture_job_deliverable_contract AFTER INSERT ON public.jobs FOR EACH ROW EXECUTE FUNCTION public.capture_job_deliverable_contract();
+
+
+--
+-- Name: managed_repository_workspace_creation_reservations trg_container_startup_current_binding; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE CONSTRAINT TRIGGER trg_container_startup_current_binding AFTER INSERT OR UPDATE ON public.managed_repository_workspace_creation_reservations DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION public.validate_container_startup_current_binding();
+
+
+--
+-- Name: managed_repository_workspace_creation_reservations trg_container_startup_stage_receipt; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER trg_container_startup_stage_receipt BEFORE INSERT OR UPDATE ON public.managed_repository_workspace_creation_reservations FOR EACH ROW EXECUTE FUNCTION public.enforce_container_startup_stage_receipt();
 
 
 --
@@ -26384,6 +41535,13 @@ CREATE TRIGGER trg_jobs_c_require_workspace_cleanup_before_delete BEFORE DELETE 
 --
 
 CREATE TRIGGER trg_jobs_cancel_workspace_creation_on_terminal_status BEFORE UPDATE OF status ON public.jobs FOR EACH ROW EXECUTE FUNCTION public.cancel_workspace_creation_on_terminal_owner_transition();
+
+
+--
+-- Name: jobs trg_jobs_container_startup_ready; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER trg_jobs_container_startup_ready BEFORE UPDATE OF context ON public.jobs FOR EACH ROW EXECUTE FUNCTION public.enforce_container_startup_owner_ready();
 
 
 --
@@ -26499,6 +41657,27 @@ CREATE CONSTRAINT TRIGGER trg_officer_ticket_delivery_writer AFTER INSERT ON pub
 
 
 --
+-- Name: thread_workspace_provision_create_receipts trg_pinned_workspace_create_receipt_authority; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER trg_pinned_workspace_create_receipt_authority BEFORE INSERT OR DELETE OR UPDATE ON public.thread_workspace_provision_create_receipts FOR EACH ROW EXECUTE FUNCTION public.enforce_pinned_workspace_create_receipt();
+
+
+--
+-- Name: thread_workspace_provision_inert_fence_receipts trg_pinned_workspace_inert_fence_authority; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER trg_pinned_workspace_inert_fence_authority BEFORE INSERT OR DELETE OR UPDATE ON public.thread_workspace_provision_inert_fence_receipts FOR EACH ROW EXECUTE FUNCTION public.enforce_pinned_workspace_inert_fence_receipt();
+
+
+--
+-- Name: thread_workspace_provision_stop_receipts trg_pinned_workspace_provision_stop_authority; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER trg_pinned_workspace_provision_stop_authority BEFORE INSERT OR DELETE OR UPDATE ON public.thread_workspace_provision_stop_receipts FOR EACH ROW EXECUTE FUNCTION public.enforce_pinned_workspace_provision_stop_receipt();
+
+
+--
 -- Name: runtime_actor_grants trg_runtime_actor_grants_officer_agent_binding; Type: TRIGGER; Schema: public; Owner: -
 --
 
@@ -26527,6 +41706,20 @@ CREATE TRIGGER trg_thread_lane_without_pending_input BEFORE UPDATE OF execution_
 
 
 --
+-- Name: threads trg_thread_retained_creation_resume; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER trg_thread_retained_creation_resume AFTER UPDATE OF status ON public.threads FOR EACH ROW EXECUTE FUNCTION public.grant_pinned_retained_creation_resume();
+
+
+--
+-- Name: thread_workspace_provision_intents trg_thread_workspace_retention_authority; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER trg_thread_workspace_retention_authority BEFORE INSERT OR UPDATE ON public.thread_workspace_provision_intents FOR EACH ROW EXECUTE FUNCTION public.enforce_pinned_workspace_retained_creation();
+
+
+--
 -- Name: threads trg_threads_00_prevent_active_vm_remote_operation_delete; Type: TRIGGER; Schema: public; Owner: -
 --
 
@@ -26545,6 +41738,13 @@ CREATE TRIGGER trg_threads_c_require_workspace_cleanup_before_delete BEFORE DELE
 --
 
 CREATE TRIGGER trg_threads_cancel_workspace_creation_on_terminal_status BEFORE UPDATE OF status ON public.threads FOR EACH ROW EXECUTE FUNCTION public.cancel_workspace_creation_on_terminal_owner_transition();
+
+
+--
+-- Name: threads trg_threads_container_startup_ready; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER trg_threads_container_startup_ready BEFORE UPDATE OF metadata ON public.threads FOR EACH ROW EXECUTE FUNCTION public.enforce_container_startup_owner_ready();
 
 
 --
@@ -26744,6 +41944,391 @@ CREATE TRIGGER usage_rates_v2_referenced_range_guard BEFORE UPDATE OF effective_
 
 
 --
+-- Name: vm_creation_retries vm_creation_carrier_identity; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER vm_creation_carrier_identity BEFORE UPDATE ON public.vm_creation_retries FOR EACH ROW EXECUTE FUNCTION public.guard_vm_creation_carrier_identity();
+
+
+--
+-- Name: vm_creation_retries vm_creation_completion; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER vm_creation_completion BEFORE INSERT OR UPDATE ON public.vm_creation_retries FOR EACH ROW EXECUTE FUNCTION public.guard_vm_creation_completion();
+
+
+--
+-- Name: vm_creation_retries vm_creation_disposition; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER vm_creation_disposition BEFORE INSERT OR UPDATE ON public.vm_creation_retries FOR EACH ROW EXECUTE FUNCTION public.guard_vm_creation_disposition();
+
+
+--
+-- Name: srw_workspace_instances vm_creation_disposition_instance; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE CONSTRAINT TRIGGER vm_creation_disposition_instance AFTER UPDATE ON public.srw_workspace_instances DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION public.guard_vm_creation_disposition_instance();
+
+
+--
+-- Name: vm_workspace_cleanup_admissions vm_creation_disposition_parent; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE CONSTRAINT TRIGGER vm_creation_disposition_parent AFTER UPDATE ON public.vm_workspace_cleanup_admissions DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION public.guard_vm_creation_disposition_parent();
+
+
+--
+-- Name: vm_creation_retries vm_creation_disposition_terminal; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE CONSTRAINT TRIGGER vm_creation_disposition_terminal AFTER UPDATE ON public.vm_creation_retries DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION public.guard_vm_creation_disposition_terminal();
+
+
+--
+-- Name: vm_creation_effects vm_creation_effect_disposition; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER vm_creation_effect_disposition BEFORE INSERT ON public.vm_creation_effects FOR EACH ROW EXECUTE FUNCTION public.guard_vm_creation_effect_disposition();
+
+
+--
+-- Name: vm_creation_effects vm_creation_effect_identity; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER vm_creation_effect_identity BEFORE UPDATE ON public.vm_creation_effects FOR EACH ROW EXECUTE FUNCTION public.guard_vm_creation_effect_identity();
+
+
+--
+-- Name: vm_creation_retries vm_creation_ready_release; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER vm_creation_ready_release BEFORE UPDATE ON public.vm_creation_retries FOR EACH ROW EXECUTE FUNCTION public.guard_vm_creation_ready_release();
+
+
+--
+-- Name: vm_creation_retries vm_creation_retry_identity; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER vm_creation_retry_identity BEFORE UPDATE ON public.vm_creation_retries FOR EACH ROW EXECUTE FUNCTION public.guard_vm_creation_retry_identity();
+
+
+--
+-- Name: jobs vm_creation_retry_job_control; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER vm_creation_retry_job_control AFTER UPDATE OF status, context ON public.jobs FOR EACH ROW EXECUTE FUNCTION public.cancel_vm_creation_retry_on_job_control();
+
+
+--
+-- Name: vm_idle_operations vm_idle_access_rebind_guard; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER vm_idle_access_rebind_guard BEFORE INSERT OR DELETE OR UPDATE ON public.vm_idle_operations FOR EACH ROW EXECUTE FUNCTION public.guard_vm_idle_access_rebind();
+
+
+--
+-- Name: vm_idle_operations vm_idle_pinned_job_guard; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER vm_idle_pinned_job_guard BEFORE DELETE OR UPDATE ON public.vm_idle_operations FOR EACH ROW EXECUTE FUNCTION public.guard_vm_idle_pinned_job();
+
+
+--
+-- Name: vm_idle_operations vm_idle_pinned_thread_guard; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER vm_idle_pinned_thread_guard BEFORE INSERT OR DELETE OR UPDATE ON public.vm_idle_operations FOR EACH ROW EXECUTE FUNCTION public.guard_vm_idle_pinned_thread();
+
+
+--
+-- Name: vm_workspace_cleanup_admissions vm_idle_retained_cleanup_guard; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER vm_idle_retained_cleanup_guard BEFORE INSERT OR UPDATE ON public.vm_workspace_cleanup_admissions FOR EACH ROW EXECUTE FUNCTION public.guard_vm_idle_retained_cleanup();
+
+
+--
+-- Name: vm_idle_operations vm_idle_terminal_decision_guard; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER vm_idle_terminal_decision_guard BEFORE INSERT OR DELETE OR UPDATE ON public.vm_idle_operations FOR EACH ROW EXECUTE FUNCTION public.guard_vm_idle_terminal_decision();
+
+
+--
+-- Name: vm_idle_thread_access_continuations vm_idle_thread_access_continuation_guard; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER vm_idle_thread_access_continuation_guard BEFORE INSERT OR DELETE OR UPDATE ON public.vm_idle_thread_access_continuations FOR EACH ROW EXECUTE FUNCTION public.guard_vm_idle_thread_access_continuation();
+
+
+--
+-- Name: vm_job_cancel_retention_authorities vm_job_cancel_retention_authority_transaction; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE CONSTRAINT TRIGGER vm_job_cancel_retention_authority_transaction AFTER INSERT ON public.vm_job_cancel_retention_authorities DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION public.check_vm_job_cancel_retention_transaction();
+
+
+--
+-- Name: vm_job_cancel_retention_authorities vm_job_cancel_retention_immutable; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER vm_job_cancel_retention_immutable BEFORE DELETE OR UPDATE ON public.vm_job_cancel_retention_authorities FOR EACH ROW EXECUTE FUNCTION public.guard_vm_job_retained_disk_purge_row();
+
+
+--
+-- Name: vm_workspace_cleanup_admissions vm_job_cancel_retention_parent_transaction; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE CONSTRAINT TRIGGER vm_job_cancel_retention_parent_transaction AFTER INSERT OR UPDATE ON public.vm_workspace_cleanup_admissions DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION public.check_vm_job_cancel_retention_transaction();
+
+
+--
+-- Name: vm_pre_ssh_stop_intents vm_job_cancel_retention_preflight; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER vm_job_cancel_retention_preflight BEFORE INSERT ON public.vm_pre_ssh_stop_intents FOR EACH ROW EXECUTE FUNCTION public.guard_vm_job_cancel_retention_preflight();
+
+
+--
+-- Name: jobs vm_job_creation_audit_before_delete; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER vm_job_creation_audit_before_delete BEFORE DELETE ON public.jobs FOR EACH ROW EXECUTE FUNCTION public.require_vm_job_audit_before_delete();
+
+
+--
+-- Name: vm_job_creation_owners vm_job_creation_owner_authority; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER vm_job_creation_owner_authority BEFORE INSERT OR DELETE OR UPDATE ON public.vm_job_creation_owners FOR EACH ROW EXECUTE FUNCTION public.guard_vm_job_creation_owner();
+
+
+--
+-- Name: jobs vm_job_creation_owner_reuse; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER vm_job_creation_owner_reuse BEFORE INSERT ON public.jobs FOR EACH ROW EXECUTE FUNCTION public.prevent_vm_job_creation_owner_reuse();
+
+
+--
+-- Name: vm_job_creation_owners vm_job_creation_owner_terminal; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE CONSTRAINT TRIGGER vm_job_creation_owner_terminal AFTER INSERT OR UPDATE ON public.vm_job_creation_owners DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION public.validate_vm_job_creation_owner_terminal();
+
+
+--
+-- Name: vm_workspace_cleanup_admissions vm_job_initial_ready_stop_parent_commit; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE CONSTRAINT TRIGGER vm_job_initial_ready_stop_parent_commit AFTER INSERT ON public.vm_workspace_cleanup_admissions DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION public.check_vm_job_initial_ready_stop_parent();
+
+
+--
+-- Name: vm_job_repository_settlement_receipts vm_job_repository_settlement_receipt_immutable; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER vm_job_repository_settlement_receipt_immutable BEFORE INSERT OR DELETE OR UPDATE ON public.vm_job_repository_settlement_receipts FOR EACH ROW EXECUTE FUNCTION public.guard_vm_job_repository_settlement_receipt();
+
+
+--
+-- Name: vm_workspace_cleanup_admissions vm_job_retained_creation_parent_commit; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE CONSTRAINT TRIGGER vm_job_retained_creation_parent_commit AFTER INSERT ON public.vm_workspace_cleanup_admissions DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION public.check_vm_job_retained_creation_parent();
+
+
+--
+-- Name: srw_execution_attempts vm_job_retained_execution; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER vm_job_retained_execution BEFORE DELETE OR UPDATE ON public.srw_execution_attempts FOR EACH ROW EXECUTE FUNCTION public.guard_vm_job_retained_execution();
+
+
+--
+-- Name: srw_execution_spec_revisions vm_job_retained_execution; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER vm_job_retained_execution BEFORE DELETE OR UPDATE ON public.srw_execution_spec_revisions FOR EACH ROW EXECUTE FUNCTION public.guard_vm_job_retained_execution();
+
+
+--
+-- Name: srw_execution_specs vm_job_retained_execution; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER vm_job_retained_execution BEFORE DELETE OR UPDATE ON public.srw_execution_specs FOR EACH ROW EXECUTE FUNCTION public.guard_vm_job_retained_execution();
+
+
+--
+-- Name: srw_execution_workspace_bindings vm_job_retained_execution; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER vm_job_retained_execution BEFORE DELETE OR UPDATE ON public.srw_execution_workspace_bindings FOR EACH ROW EXECUTE FUNCTION public.guard_vm_job_retained_execution();
+
+
+--
+-- Name: srw_workspace_instances vm_job_retained_execution; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER vm_job_retained_execution BEFORE DELETE OR UPDATE ON public.srw_workspace_instances FOR EACH ROW EXECUTE FUNCTION public.guard_vm_job_retained_execution();
+
+
+--
+-- Name: vm_workspace_cleanup_admissions vm_job_retained_parent_stamp; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER vm_job_retained_parent_stamp BEFORE INSERT OR UPDATE ON public.vm_workspace_cleanup_admissions FOR EACH ROW EXECUTE FUNCTION public.stamp_vm_job_retained_parent();
+
+
+--
+-- Name: vm_job_retained_disk_purge_authorities vm_job_retained_purge_authority_immutable; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER vm_job_retained_purge_authority_immutable BEFORE DELETE OR UPDATE ON public.vm_job_retained_disk_purge_authorities FOR EACH ROW EXECUTE FUNCTION public.guard_vm_job_retained_disk_purge_row();
+
+
+--
+-- Name: vm_job_retained_disk_purge_authorities vm_job_retained_purge_authority_transaction; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER vm_job_retained_purge_authority_transaction BEFORE INSERT ON public.vm_job_retained_disk_purge_authorities FOR EACH ROW EXECUTE FUNCTION public.stamp_vm_job_retained_purge_transaction();
+
+
+--
+-- Name: vm_workspace_cleanup_admissions vm_job_retained_purge_parent_insert; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER vm_job_retained_purge_parent_insert BEFORE INSERT ON public.vm_workspace_cleanup_admissions FOR EACH ROW WHEN (((new.owner_kind = 'job'::text) AND (new.source = 'public_vm_delete'::text))) EXECUTE FUNCTION public.guard_vm_job_retained_disk_purge_parent();
+
+
+--
+-- Name: vm_workspace_cleanup_admissions vm_job_retained_purge_parent_update; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER vm_job_retained_purge_parent_update BEFORE UPDATE ON public.vm_workspace_cleanup_admissions FOR EACH ROW WHEN ((((old.owner_kind = 'job'::text) AND (old.source = 'public_vm_delete'::text)) OR ((new.owner_kind = 'job'::text) AND (new.source = 'public_vm_delete'::text)))) EXECUTE FUNCTION public.guard_vm_job_retained_disk_purge_parent();
+
+
+--
+-- Name: vm_job_retained_disk_purge_predecessors vm_job_retained_purge_predecessor_immutable; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER vm_job_retained_purge_predecessor_immutable BEFORE DELETE OR UPDATE ON public.vm_job_retained_disk_purge_predecessors FOR EACH ROW EXECUTE FUNCTION public.guard_vm_job_retained_disk_purge_row();
+
+
+--
+-- Name: vm_job_retained_disk_purge_predecessors vm_job_retained_purge_predecessor_transaction; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER vm_job_retained_purge_predecessor_transaction BEFORE INSERT ON public.vm_job_retained_disk_purge_predecessors FOR EACH ROW EXECUTE FUNCTION public.stamp_vm_job_retained_purge_transaction();
+
+
+--
+-- Name: vm_job_retained_disk_purge_receipts vm_job_retained_purge_receipt_immutable; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER vm_job_retained_purge_receipt_immutable BEFORE DELETE OR UPDATE ON public.vm_job_retained_disk_purge_receipts FOR EACH ROW EXECUTE FUNCTION public.guard_vm_job_retained_disk_purge_row();
+
+
+--
+-- Name: vm_job_retained_disk_purge_receipts vm_job_retained_purge_receipt_insert; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER vm_job_retained_purge_receipt_insert BEFORE INSERT ON public.vm_job_retained_disk_purge_receipts FOR EACH ROW EXECUTE FUNCTION public.guard_vm_job_retained_disk_purge_receipt_insert();
+
+
+--
+-- Name: vm_job_retained_resumes vm_job_retained_resume_owner_commit; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE CONSTRAINT TRIGGER vm_job_retained_resume_owner_commit AFTER INSERT ON public.vm_job_retained_resumes DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION public.check_vm_job_retained_resume_owner();
+
+
+--
+-- Name: vm_job_cancel_retention_authorities vm_job_retained_stop_authority; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER vm_job_retained_stop_authority BEFORE INSERT ON public.vm_job_cancel_retention_authorities FOR EACH ROW EXECUTE FUNCTION public.guard_vm_job_retained_stop_authority();
+
+
+--
+-- Name: vm_workspace_cleanup_admissions vm_job_retained_stop_parent_commit; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE CONSTRAINT TRIGGER vm_job_retained_stop_parent_commit AFTER INSERT ON public.vm_workspace_cleanup_admissions DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION public.check_vm_job_retained_stop_parent();
+
+
+--
+-- Name: vm_job_creation_terminal_packets vm_job_terminal_packet_immutable; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER vm_job_terminal_packet_immutable BEFORE INSERT OR DELETE OR UPDATE ON public.vm_job_creation_terminal_packets FOR EACH ROW EXECUTE FUNCTION public.guard_vm_job_terminal_packet();
+
+
+--
+-- Name: vm_job_worker_delivery_bindings vm_job_worker_delivery_binding_immutable; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER vm_job_worker_delivery_binding_immutable BEFORE INSERT OR DELETE OR UPDATE ON public.vm_job_worker_delivery_bindings FOR EACH ROW EXECUTE FUNCTION public.guard_vm_job_worker_delivery_binding();
+
+
+--
+-- Name: vm_pre_ssh_stop_intents vm_pre_ssh_stop_intent_guard; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER vm_pre_ssh_stop_intent_guard BEFORE INSERT OR DELETE OR UPDATE ON public.vm_pre_ssh_stop_intents FOR EACH ROW EXECUTE FUNCTION public.guard_vm_pre_ssh_stop_intent();
+
+
+--
+-- Name: vm_pre_ssh_stop_proofs vm_pre_ssh_stop_proof_guard; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER vm_pre_ssh_stop_proof_guard BEFORE INSERT OR DELETE OR UPDATE ON public.vm_pre_ssh_stop_proofs FOR EACH ROW EXECUTE FUNCTION public.guard_vm_pre_ssh_stop_proof();
+
+
+--
+-- Name: vm_resource_inventory_snapshots vm_resource_inventory_immutable; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER vm_resource_inventory_immutable BEFORE UPDATE ON public.vm_resource_inventory_snapshots FOR EACH ROW EXECUTE FUNCTION public.vm_resource_inventory_immutable();
+
+
+--
+-- Name: vm_thread_creation_owners vm_thread_creation_owner_authority; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER vm_thread_creation_owner_authority BEFORE INSERT OR DELETE OR UPDATE ON public.vm_thread_creation_owners FOR EACH ROW EXECUTE FUNCTION public.guard_vm_thread_creation_owner();
+
+
+--
+-- Name: vm_thread_creation_owners vm_thread_creation_owner_terminal; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE CONSTRAINT TRIGGER vm_thread_creation_owner_terminal AFTER INSERT OR UPDATE ON public.vm_thread_creation_owners DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION public.validate_vm_thread_creation_owner_terminal();
+
+
+--
+-- Name: vm_thread_creation_settlements vm_thread_creation_settlement_authority; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER vm_thread_creation_settlement_authority BEFORE INSERT OR DELETE OR UPDATE ON public.vm_thread_creation_settlements FOR EACH ROW EXECUTE FUNCTION public.guard_vm_thread_creation_settlement();
+
+
+--
+-- Name: vm_creation_retries vm_thread_creation_source_audit_owner; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER vm_thread_creation_source_audit_owner BEFORE INSERT ON public.vm_creation_retries FOR EACH ROW EXECUTE FUNCTION public.ensure_vm_thread_creation_owner();
+
+
+--
+-- Name: vm_resource_waiters vm_thread_creation_waiter_audit_owner; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER vm_thread_creation_waiter_audit_owner BEFORE INSERT ON public.vm_resource_waiters FOR EACH ROW EXECUTE FUNCTION public.ensure_vm_thread_creation_owner();
+
+
+--
 -- Name: vm_workspace_recoveries vm_workspace_recoveries_immutable_identity; Type: TRIGGER; Schema: public; Owner: -
 --
 
@@ -26772,6 +42357,13 @@ CREATE TRIGGER workspace_intervals_cutover_open_barrier BEFORE INSERT OR UPDATE 
 
 
 --
+-- Name: vm_resource_waiters z_vm_job_retained_ledger; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER z_vm_job_retained_ledger BEFORE INSERT OR DELETE OR UPDATE ON public.vm_resource_waiters FOR EACH ROW EXECUTE FUNCTION public.guard_vm_job_retained_ledger();
+
+
+--
 -- Name: thread_agent_pod_provision_intents zz_thread_agent_pod_provision_coordinates; Type: TRIGGER; Schema: public; Owner: -
 --
 
@@ -26796,7 +42388,7 @@ CREATE TRIGGER zzy_thread_agent_pod_recycle_successor_authority BEFORE INSERT ON
 -- Name: agents zzz_agents_pinned_warm_binding_authority; Type: TRIGGER; Schema: public; Owner: -
 --
 
-CREATE TRIGGER zzz_agents_pinned_warm_binding_authority BEFORE UPDATE ON public.agents FOR EACH ROW EXECUTE FUNCTION public.enforce_pinned_warm_agent_reservation();
+CREATE TRIGGER zzz_agents_pinned_warm_binding_authority BEFORE INSERT OR UPDATE ON public.agents FOR EACH ROW EXECUTE FUNCTION public.enforce_pinned_warm_agent_reservation();
 
 
 --
@@ -26974,6 +42566,14 @@ ALTER TABLE ONLY public.capability_grants
 
 
 --
+-- Name: cloud_folder_grants cloud_folder_grants_backend_fk; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.cloud_folder_grants
+    ADD CONSTRAINT cloud_folder_grants_backend_fk FOREIGN KEY (backend_instance_id, backend_id) REFERENCES public.main_cloud_backend_instances(id, backend_id) ON DELETE RESTRICT;
+
+
+--
 -- Name: cloud_ro_effect_intents cloud_ro_effect_intents_backend_fk; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -27102,6 +42702,118 @@ ALTER TABLE ONLY public.compute_shadow_observations
 
 
 --
+-- Name: connector_bind_time_bindings connector_bind_time_bindings_registration_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.connector_bind_time_bindings
+    ADD CONSTRAINT connector_bind_time_bindings_registration_id_fkey FOREIGN KEY (registration_id) REFERENCES public.connector_driver_registrations(id) ON DELETE SET NULL;
+
+
+--
+-- Name: connector_credential_leases connector_credential_leases_connector_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.connector_credential_leases
+    ADD CONSTRAINT connector_credential_leases_connector_id_fkey FOREIGN KEY (connector_id) REFERENCES public.datasources(id) ON DELETE CASCADE;
+
+
+--
+-- Name: connector_credential_leases connector_credential_leases_job_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.connector_credential_leases
+    ADD CONSTRAINT connector_credential_leases_job_id_fkey FOREIGN KEY (job_id) REFERENCES public.jobs(id) ON DELETE CASCADE;
+
+
+--
+-- Name: connector_credential_leases connector_credential_leases_thread_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.connector_credential_leases
+    ADD CONSTRAINT connector_credential_leases_thread_id_fkey FOREIGN KEY (thread_id) REFERENCES public.threads(id) ON DELETE CASCADE;
+
+
+--
+-- Name: connector_driver_assignments connector_driver_assignments_connector_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.connector_driver_assignments
+    ADD CONSTRAINT connector_driver_assignments_connector_id_fkey FOREIGN KEY (connector_id) REFERENCES public.datasources(id) ON DELETE CASCADE;
+
+
+--
+-- Name: connector_driver_assignments connector_driver_assignments_registration_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.connector_driver_assignments
+    ADD CONSTRAINT connector_driver_assignments_registration_id_fkey FOREIGN KEY (registration_id) REFERENCES public.connector_driver_registrations(id) ON DELETE CASCADE;
+
+
+--
+-- Name: connector_driver_identities connector_driver_identities_connector_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.connector_driver_identities
+    ADD CONSTRAINT connector_driver_identities_connector_id_fkey FOREIGN KEY (connector_id) REFERENCES public.datasources(id) ON DELETE CASCADE;
+
+
+--
+-- Name: connector_driver_operations connector_driver_operations_binding_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.connector_driver_operations
+    ADD CONSTRAINT connector_driver_operations_binding_id_fkey FOREIGN KEY (binding_id) REFERENCES public.connector_bind_time_bindings(id) ON DELETE SET NULL;
+
+
+--
+-- Name: connector_driver_operations connector_driver_operations_registration_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.connector_driver_operations
+    ADD CONSTRAINT connector_driver_operations_registration_id_fkey FOREIGN KEY (registration_id) REFERENCES public.connector_driver_registrations(id) ON DELETE SET NULL;
+
+
+--
+-- Name: connector_driver_operations connector_driver_operations_requested_by_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.connector_driver_operations
+    ADD CONSTRAINT connector_driver_operations_requested_by_fkey FOREIGN KEY (requested_by) REFERENCES public.users(id) ON DELETE SET NULL;
+
+
+--
+-- Name: connector_driver_registrations connector_driver_registrations_created_by_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.connector_driver_registrations
+    ADD CONSTRAINT connector_driver_registrations_created_by_fkey FOREIGN KEY (created_by) REFERENCES public.users(id) ON DELETE SET NULL;
+
+
+--
+-- Name: connector_driver_registrations connector_driver_registrations_disabled_by_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.connector_driver_registrations
+    ADD CONSTRAINT connector_driver_registrations_disabled_by_fkey FOREIGN KEY (disabled_by) REFERENCES public.users(id) ON DELETE SET NULL;
+
+
+--
+-- Name: connector_driver_registrations connector_driver_registrations_owner_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.connector_driver_registrations
+    ADD CONSTRAINT connector_driver_registrations_owner_id_fkey FOREIGN KEY (owner_id) REFERENCES public.users(id) ON DELETE CASCADE;
+
+
+--
+-- Name: connector_driver_registrations connector_driver_registrations_project_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.connector_driver_registrations
+    ADD CONSTRAINT connector_driver_registrations_project_id_fkey FOREIGN KEY (project_id) REFERENCES public.projects(id) ON DELETE CASCADE;
+
+
+--
 -- Name: contact_addresses contact_addresses_contact_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -27139,6 +42851,14 @@ ALTER TABLE ONLY public.datasources
 
 ALTER TABLE ONLY public.datasources
     ADD CONSTRAINT datasources_job_id_fkey FOREIGN KEY (job_id) REFERENCES public.jobs(id) ON DELETE CASCADE;
+
+
+--
+-- Name: datasources datasources_manifest_resource_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.datasources
+    ADD CONSTRAINT datasources_manifest_resource_id_fkey FOREIGN KEY (manifest_resource_id) REFERENCES public.srw_resources(id) ON DELETE RESTRICT;
 
 
 --
@@ -27590,11 +43310,35 @@ ALTER TABLE ONLY public.officer_ticket_deliverable_requirements
 
 
 --
+-- Name: pinned_job_wait_receipts pinned_job_wait_receipts_delivery_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.pinned_job_wait_receipts
+    ADD CONSTRAINT pinned_job_wait_receipts_delivery_id_fkey FOREIGN KEY (delivery_id) REFERENCES public.pinned_job_deliveries(id);
+
+
+--
 -- Name: project_api_keys project_api_keys_project_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
 ALTER TABLE ONLY public.project_api_keys
     ADD CONSTRAINT project_api_keys_project_id_fkey FOREIGN KEY (project_id) REFERENCES public.projects(id) ON DELETE CASCADE;
+
+
+--
+-- Name: project_connector_defaults project_connector_defaults_project_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.project_connector_defaults
+    ADD CONSTRAINT project_connector_defaults_project_id_fkey FOREIGN KEY (project_id) REFERENCES public.projects(id) ON DELETE CASCADE;
+
+
+--
+-- Name: project_connector_defaults project_connector_defaults_updated_by_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.project_connector_defaults
+    ADD CONSTRAINT project_connector_defaults_updated_by_fkey FOREIGN KEY (updated_by) REFERENCES public.users(id) ON DELETE SET NULL;
 
 
 --
@@ -27715,6 +43459,22 @@ ALTER TABLE ONLY public.project_officers
 
 ALTER TABLE ONLY public.project_repositories
     ADD CONSTRAINT project_repositories_project_id_fkey FOREIGN KEY (project_id) REFERENCES public.projects(id) ON DELETE CASCADE;
+
+
+--
+-- Name: project_workspace_defaults project_workspace_defaults_project_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.project_workspace_defaults
+    ADD CONSTRAINT project_workspace_defaults_project_id_fkey FOREIGN KEY (project_id) REFERENCES public.projects(id) ON DELETE CASCADE;
+
+
+--
+-- Name: project_workspace_defaults project_workspace_defaults_updated_by_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.project_workspace_defaults
+    ADD CONSTRAINT project_workspace_defaults_updated_by_fkey FOREIGN KEY (updated_by) REFERENCES public.users(id) ON DELETE SET NULL;
 
 
 --
@@ -28486,6 +44246,22 @@ ALTER TABLE ONLY public.thread_permission_requests
 
 
 --
+-- Name: thread_protected_sources thread_protected_sources_backend_fk; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.thread_protected_sources
+    ADD CONSTRAINT thread_protected_sources_backend_fk FOREIGN KEY (backend_instance_id, backend_id) REFERENCES public.main_cloud_backend_instances(id, backend_id) ON DELETE RESTRICT;
+
+
+--
+-- Name: thread_protected_sources thread_protected_sources_thread_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.thread_protected_sources
+    ADD CONSTRAINT thread_protected_sources_thread_id_fkey FOREIGN KEY (thread_id) REFERENCES public.threads(id) ON DELETE CASCADE;
+
+
+--
 -- Name: thread_session_runtime_state thread_session_runtime_state_thread_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -28499,6 +44275,22 @@ ALTER TABLE ONLY public.thread_session_runtime_state
 
 ALTER TABLE ONLY public.thread_session_tasks
     ADD CONSTRAINT thread_session_tasks_thread_id_fkey FOREIGN KEY (thread_id) REFERENCES public.threads(id) ON DELETE CASCADE;
+
+
+--
+-- Name: thread_workspace_provision_create_receipts thread_workspace_provision_create_receipts_attempt_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.thread_workspace_provision_create_receipts
+    ADD CONSTRAINT thread_workspace_provision_create_receipts_attempt_id_fkey FOREIGN KEY (attempt_id) REFERENCES public.thread_workspace_provision_intents(attempt_id);
+
+
+--
+-- Name: thread_workspace_provision_inert_fence_receipts thread_workspace_provision_inert_fence_receipts_attempt_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.thread_workspace_provision_inert_fence_receipts
+    ADD CONSTRAINT thread_workspace_provision_inert_fence_receipts_attempt_id_fkey FOREIGN KEY (attempt_id) REFERENCES public.thread_workspace_provision_intents(attempt_id);
 
 
 --
@@ -28619,6 +44411,718 @@ ALTER TABLE ONLY public.users
 
 ALTER TABLE ONLY public.users
     ADD CONSTRAINT users_default_project_id_fkey FOREIGN KEY (default_project_id) REFERENCES public.projects(id);
+
+
+--
+-- Name: vm_job_cancel_retention_authorities vm_cancel_retained_resume_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.vm_job_cancel_retention_authorities
+    ADD CONSTRAINT vm_cancel_retained_resume_fkey FOREIGN KEY (job_retained_resume_id) REFERENCES public.vm_job_retained_resumes(id) NOT VALID;
+
+
+--
+-- Name: vm_creation_effects vm_creation_effects_request_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.vm_creation_effects
+    ADD CONSTRAINT vm_creation_effects_request_id_fkey FOREIGN KEY (request_id) REFERENCES public.vm_creation_retries(request_id);
+
+
+--
+-- Name: vm_creation_retries vm_creation_retained_resume_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.vm_creation_retries
+    ADD CONSTRAINT vm_creation_retained_resume_fkey FOREIGN KEY (job_retained_resume_id) REFERENCES public.vm_job_retained_resumes(id) NOT VALID;
+
+
+--
+-- Name: vm_creation_retries vm_creation_retained_resume_operation_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.vm_creation_retries
+    ADD CONSTRAINT vm_creation_retained_resume_operation_fkey FOREIGN KEY (thread_retained_resume_id) REFERENCES public.vm_thread_retained_resumes(id) NOT VALID;
+
+
+--
+-- Name: vm_creation_retries vm_creation_retries_audit_owner_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.vm_creation_retries
+    ADD CONSTRAINT vm_creation_retries_audit_owner_fkey FOREIGN KEY (thread_id) REFERENCES public.vm_thread_creation_owners(thread_id);
+
+
+--
+-- Name: vm_creation_retries vm_creation_retries_creation_admission_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.vm_creation_retries
+    ADD CONSTRAINT vm_creation_retries_creation_admission_id_fkey FOREIGN KEY (creation_admission_id) REFERENCES public.vm_workspace_cleanup_admissions(id);
+
+
+--
+-- Name: vm_creation_retries vm_creation_retries_execution_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.vm_creation_retries
+    ADD CONSTRAINT vm_creation_retries_execution_id_fkey FOREIGN KEY (execution_id) REFERENCES public.srw_execution_specs(id);
+
+
+--
+-- Name: vm_creation_retries vm_creation_retries_job_audit_owner_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.vm_creation_retries
+    ADD CONSTRAINT vm_creation_retries_job_audit_owner_fkey FOREIGN KEY (job_id) REFERENCES public.vm_job_creation_owners(job_id);
+
+
+--
+-- Name: vm_creation_retries vm_creation_retries_predecessor_cleanup_admission_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.vm_creation_retries
+    ADD CONSTRAINT vm_creation_retries_predecessor_cleanup_admission_id_fkey FOREIGN KEY (predecessor_cleanup_admission_id) REFERENCES public.vm_workspace_cleanup_admissions(id);
+
+
+--
+-- Name: vm_creation_retries vm_creation_retries_thread_wake_operation_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.vm_creation_retries
+    ADD CONSTRAINT vm_creation_retries_thread_wake_operation_id_fkey FOREIGN KEY (thread_wake_operation_id) REFERENCES public.vm_idle_operations(id);
+
+
+--
+-- Name: vm_idle_operations vm_idle_operations_pinned_delivery_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.vm_idle_operations
+    ADD CONSTRAINT vm_idle_operations_pinned_delivery_id_fkey FOREIGN KEY (pinned_delivery_id) REFERENCES public.pinned_job_deliveries(id);
+
+
+--
+-- Name: vm_idle_operations vm_idle_operations_pinned_wait_receipt_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.vm_idle_operations
+    ADD CONSTRAINT vm_idle_operations_pinned_wait_receipt_id_fkey FOREIGN KEY (pinned_wait_receipt_id) REFERENCES public.pinned_job_wait_receipts(id);
+
+
+--
+-- Name: vm_idle_operations vm_idle_operations_terminal_source_command_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.vm_idle_operations
+    ADD CONSTRAINT vm_idle_operations_terminal_source_command_id_fkey FOREIGN KEY (terminal_source_command_id) REFERENCES public.job_completion_commands(id);
+
+
+--
+-- Name: vm_idle_thread_access_continuations vm_idle_thread_access_continuations_operation_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.vm_idle_thread_access_continuations
+    ADD CONSTRAINT vm_idle_thread_access_continuations_operation_id_fkey FOREIGN KEY (operation_id) REFERENCES public.vm_idle_operations(id);
+
+
+--
+-- Name: vm_job_cancel_retention_authorities vm_job_cancel_retention_authoritie_superseded_admission_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.vm_job_cancel_retention_authorities
+    ADD CONSTRAINT vm_job_cancel_retention_authoritie_superseded_admission_id_fkey FOREIGN KEY (superseded_admission_id) REFERENCES public.vm_workspace_cleanup_admissions(id);
+
+
+--
+-- Name: vm_job_cancel_retention_authorities vm_job_cancel_retention_authorities_cleanup_admission_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.vm_job_cancel_retention_authorities
+    ADD CONSTRAINT vm_job_cancel_retention_authorities_cleanup_admission_id_fkey FOREIGN KEY (cleanup_admission_id) REFERENCES public.vm_workspace_cleanup_admissions(id);
+
+
+--
+-- Name: vm_job_cancel_retention_authorities vm_job_cancel_retention_authorities_creation_request_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.vm_job_cancel_retention_authorities
+    ADD CONSTRAINT vm_job_cancel_retention_authorities_creation_request_id_fkey FOREIGN KEY (creation_request_id) REFERENCES public.vm_creation_retries(request_id);
+
+
+--
+-- Name: vm_job_cancel_retention_authorities vm_job_cancel_retention_authorities_job_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.vm_job_cancel_retention_authorities
+    ADD CONSTRAINT vm_job_cancel_retention_authorities_job_id_fkey FOREIGN KEY (job_id) REFERENCES public.vm_job_creation_owners(job_id);
+
+
+--
+-- Name: vm_job_cancel_retention_authorities vm_job_cancel_retention_authorities_reservation_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.vm_job_cancel_retention_authorities
+    ADD CONSTRAINT vm_job_cancel_retention_authorities_reservation_id_fkey FOREIGN KEY (reservation_id) REFERENCES public.vm_resource_reservations(id);
+
+
+--
+-- Name: vm_job_creation_owners vm_job_creation_owners_live_job_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.vm_job_creation_owners
+    ADD CONSTRAINT vm_job_creation_owners_live_job_id_fkey FOREIGN KEY (live_job_id) REFERENCES public.jobs(id) ON DELETE SET NULL;
+
+
+--
+-- Name: vm_job_creation_terminal_packets vm_job_creation_terminal_packets_cleanup_admission_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.vm_job_creation_terminal_packets
+    ADD CONSTRAINT vm_job_creation_terminal_packets_cleanup_admission_id_fkey FOREIGN KEY (cleanup_admission_id) REFERENCES public.vm_workspace_cleanup_admissions(id);
+
+
+--
+-- Name: vm_job_creation_terminal_packets vm_job_creation_terminal_packets_job_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.vm_job_creation_terminal_packets
+    ADD CONSTRAINT vm_job_creation_terminal_packets_job_id_fkey FOREIGN KEY (job_id) REFERENCES public.vm_job_creation_owners(job_id);
+
+
+--
+-- Name: vm_job_creation_terminal_packets vm_job_creation_terminal_packets_request_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.vm_job_creation_terminal_packets
+    ADD CONSTRAINT vm_job_creation_terminal_packets_request_id_fkey FOREIGN KEY (request_id) REFERENCES public.vm_creation_retries(request_id);
+
+
+--
+-- Name: vm_job_repository_settlement_receipts vm_job_repository_settlement_receipts_cleanup_admission_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.vm_job_repository_settlement_receipts
+    ADD CONSTRAINT vm_job_repository_settlement_receipts_cleanup_admission_id_fkey FOREIGN KEY (cleanup_admission_id) REFERENCES public.vm_workspace_cleanup_admissions(id);
+
+
+--
+-- Name: vm_job_repository_settlement_receipts vm_job_repository_settlement_receipts_job_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.vm_job_repository_settlement_receipts
+    ADD CONSTRAINT vm_job_repository_settlement_receipts_job_id_fkey FOREIGN KEY (job_id) REFERENCES public.vm_job_creation_owners(job_id);
+
+
+--
+-- Name: vm_job_repository_settlement_receipts vm_job_repository_settlement_receipts_request_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.vm_job_repository_settlement_receipts
+    ADD CONSTRAINT vm_job_repository_settlement_receipts_request_id_fkey FOREIGN KEY (request_id) REFERENCES public.vm_creation_retries(request_id);
+
+
+--
+-- Name: vm_job_retained_disk_purge_authorities vm_job_retained_disk_purge_authoritie_cleanup_admission_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.vm_job_retained_disk_purge_authorities
+    ADD CONSTRAINT vm_job_retained_disk_purge_authoritie_cleanup_admission_id_fkey FOREIGN KEY (cleanup_admission_id) REFERENCES public.vm_workspace_cleanup_admissions(id);
+
+
+--
+-- Name: vm_job_retained_disk_purge_authorities vm_job_retained_disk_purge_authorities_final_request_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.vm_job_retained_disk_purge_authorities
+    ADD CONSTRAINT vm_job_retained_disk_purge_authorities_final_request_id_fkey FOREIGN KEY (final_request_id) REFERENCES public.vm_creation_retries(request_id);
+
+
+--
+-- Name: vm_job_retained_disk_purge_authorities vm_job_retained_disk_purge_authorities_job_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.vm_job_retained_disk_purge_authorities
+    ADD CONSTRAINT vm_job_retained_disk_purge_authorities_job_id_fkey FOREIGN KEY (job_id) REFERENCES public.vm_job_creation_owners(job_id);
+
+
+--
+-- Name: vm_job_retained_disk_purge_predecessors vm_job_retained_disk_purge_predec_old_cleanup_admission_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.vm_job_retained_disk_purge_predecessors
+    ADD CONSTRAINT vm_job_retained_disk_purge_predec_old_cleanup_admission_id_fkey FOREIGN KEY (old_cleanup_admission_id) REFERENCES public.vm_workspace_cleanup_admissions(id);
+
+
+--
+-- Name: vm_job_retained_disk_purge_predecessors vm_job_retained_disk_purge_predecesso_cleanup_admission_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.vm_job_retained_disk_purge_predecessors
+    ADD CONSTRAINT vm_job_retained_disk_purge_predecesso_cleanup_admission_id_fkey FOREIGN KEY (cleanup_admission_id) REFERENCES public.vm_job_retained_disk_purge_authorities(cleanup_admission_id);
+
+
+--
+-- Name: vm_job_retained_disk_purge_predecessors vm_job_retained_disk_purge_predecessors_reservation_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.vm_job_retained_disk_purge_predecessors
+    ADD CONSTRAINT vm_job_retained_disk_purge_predecessors_reservation_id_fkey FOREIGN KEY (reservation_id) REFERENCES public.vm_resource_reservations(id);
+
+
+--
+-- Name: vm_job_retained_disk_purge_predecessors vm_job_retained_disk_purge_predecessors_source_request_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.vm_job_retained_disk_purge_predecessors
+    ADD CONSTRAINT vm_job_retained_disk_purge_predecessors_source_request_id_fkey FOREIGN KEY (source_request_id) REFERENCES public.vm_creation_retries(request_id);
+
+
+--
+-- Name: vm_job_retained_disk_purge_receipts vm_job_retained_disk_purge_receipts_cleanup_admission_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.vm_job_retained_disk_purge_receipts
+    ADD CONSTRAINT vm_job_retained_disk_purge_receipts_cleanup_admission_id_fkey FOREIGN KEY (cleanup_admission_id) REFERENCES public.vm_job_retained_disk_purge_authorities(cleanup_admission_id);
+
+
+--
+-- Name: vm_job_retained_resume_terminals vm_job_retained_resume_termin_physical_cleanup_admission_i_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.vm_job_retained_resume_terminals
+    ADD CONSTRAINT vm_job_retained_resume_termin_physical_cleanup_admission_i_fkey FOREIGN KEY (physical_cleanup_admission_id) REFERENCES public.vm_job_cancel_retention_authorities(cleanup_admission_id);
+
+
+--
+-- Name: vm_job_retained_resumes vm_job_retained_resume_terminal; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.vm_job_retained_resumes
+    ADD CONSTRAINT vm_job_retained_resume_terminal FOREIGN KEY (predecessor_terminal_id) REFERENCES public.vm_job_retained_resume_terminals(id);
+
+
+--
+-- Name: vm_job_retained_resume_terminals vm_job_retained_resume_terminals_resume_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.vm_job_retained_resume_terminals
+    ADD CONSTRAINT vm_job_retained_resume_terminals_resume_id_fkey FOREIGN KEY (resume_id) REFERENCES public.vm_job_retained_resumes(id);
+
+
+--
+-- Name: vm_job_retained_resume_terminals vm_job_retained_resume_terminals_source_request_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.vm_job_retained_resume_terminals
+    ADD CONSTRAINT vm_job_retained_resume_terminals_source_request_id_fkey FOREIGN KEY (source_request_id) REFERENCES public.vm_creation_retries(request_id);
+
+
+--
+-- Name: vm_job_retained_resumes vm_job_retained_resumes_job_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.vm_job_retained_resumes
+    ADD CONSTRAINT vm_job_retained_resumes_job_id_fkey FOREIGN KEY (job_id) REFERENCES public.vm_job_creation_owners(job_id);
+
+
+--
+-- Name: vm_job_retained_resumes vm_job_retained_resumes_physical_cleanup_admission_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.vm_job_retained_resumes
+    ADD CONSTRAINT vm_job_retained_resumes_physical_cleanup_admission_id_fkey FOREIGN KEY (physical_cleanup_admission_id) REFERENCES public.vm_job_cancel_retention_authorities(cleanup_admission_id);
+
+
+--
+-- Name: vm_job_retained_resumes vm_job_retained_resumes_predecessor_request_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.vm_job_retained_resumes
+    ADD CONSTRAINT vm_job_retained_resumes_predecessor_request_id_fkey FOREIGN KEY (predecessor_request_id) REFERENCES public.vm_creation_retries(request_id);
+
+
+--
+-- Name: vm_job_retained_resumes vm_job_retained_resumes_root_retention_admission_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.vm_job_retained_resumes
+    ADD CONSTRAINT vm_job_retained_resumes_root_retention_admission_id_fkey FOREIGN KEY (root_retention_admission_id) REFERENCES public.vm_job_cancel_retention_authorities(cleanup_admission_id);
+
+
+--
+-- Name: vm_job_worker_delivery_bindings vm_job_worker_delivery_bindings_job_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.vm_job_worker_delivery_bindings
+    ADD CONSTRAINT vm_job_worker_delivery_bindings_job_id_fkey FOREIGN KEY (job_id) REFERENCES public.vm_job_creation_owners(job_id);
+
+
+--
+-- Name: vm_job_worker_delivery_bindings vm_job_worker_delivery_bindings_request_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.vm_job_worker_delivery_bindings
+    ADD CONSTRAINT vm_job_worker_delivery_bindings_request_id_fkey FOREIGN KEY (request_id) REFERENCES public.vm_creation_retries(request_id);
+
+
+--
+-- Name: vm_pre_ssh_stop_intents vm_pre_ssh_stop_intents_cleanup_admission_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.vm_pre_ssh_stop_intents
+    ADD CONSTRAINT vm_pre_ssh_stop_intents_cleanup_admission_id_fkey FOREIGN KEY (cleanup_admission_id) REFERENCES public.vm_workspace_cleanup_admissions(id);
+
+
+--
+-- Name: vm_pre_ssh_stop_intents vm_pre_ssh_stop_intents_creation_request_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.vm_pre_ssh_stop_intents
+    ADD CONSTRAINT vm_pre_ssh_stop_intents_creation_request_id_fkey FOREIGN KEY (creation_request_id) REFERENCES public.vm_creation_retries(request_id);
+
+
+--
+-- Name: vm_pre_ssh_stop_intents vm_pre_ssh_stop_intents_reservation_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.vm_pre_ssh_stop_intents
+    ADD CONSTRAINT vm_pre_ssh_stop_intents_reservation_id_fkey FOREIGN KEY (reservation_id) REFERENCES public.vm_resource_reservations(id);
+
+
+--
+-- Name: vm_pre_ssh_stop_intents vm_pre_ssh_stop_prior_zero_fk; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.vm_pre_ssh_stop_intents
+    ADD CONSTRAINT vm_pre_ssh_stop_prior_zero_fk FOREIGN KEY (prior_zero_receipt_id) REFERENCES public.managed_repository_process_zero_receipts(id);
+
+
+--
+-- Name: vm_pre_ssh_stop_proofs vm_pre_ssh_stop_proofs_cleanup_admission_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.vm_pre_ssh_stop_proofs
+    ADD CONSTRAINT vm_pre_ssh_stop_proofs_cleanup_admission_id_fkey FOREIGN KEY (cleanup_admission_id) REFERENCES public.vm_pre_ssh_stop_intents(cleanup_admission_id);
+
+
+--
+-- Name: vm_resource_cleanup_stop_receipts vm_resource_cleanup_stop_receipts_cleanup_admission_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.vm_resource_cleanup_stop_receipts
+    ADD CONSTRAINT vm_resource_cleanup_stop_receipts_cleanup_admission_id_fkey FOREIGN KEY (cleanup_admission_id) REFERENCES public.vm_workspace_cleanup_admissions(id);
+
+
+--
+-- Name: vm_resource_cleanup_stop_receipts vm_resource_cleanup_stop_receipts_reservation_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.vm_resource_cleanup_stop_receipts
+    ADD CONSTRAINT vm_resource_cleanup_stop_receipts_reservation_id_fkey FOREIGN KEY (reservation_id) REFERENCES public.vm_resource_reservations(id);
+
+
+--
+-- Name: vm_resource_inventory_heads vm_resource_inventory_current_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.vm_resource_inventory_heads
+    ADD CONSTRAINT vm_resource_inventory_current_fkey FOREIGN KEY (current_snapshot_id, cluster_id, policy_digest) REFERENCES public.vm_resource_inventory_snapshots(snapshot_id, cluster_id, policy_digest);
+
+
+--
+-- Name: vm_resource_inventory_snapshots vm_resource_inventory_snapshots_cluster_id_policy_digest_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.vm_resource_inventory_snapshots
+    ADD CONSTRAINT vm_resource_inventory_snapshots_cluster_id_policy_digest_fkey FOREIGN KEY (cluster_id, policy_digest) REFERENCES public.vm_resource_inventory_heads(cluster_id, policy_digest);
+
+
+--
+-- Name: vm_resource_nodes vm_resource_nodes_cluster_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.vm_resource_nodes
+    ADD CONSTRAINT vm_resource_nodes_cluster_id_fkey FOREIGN KEY (cluster_id) REFERENCES public.vm_resource_admission_policy(cluster_id);
+
+
+--
+-- Name: vm_resource_owner_fairness vm_resource_owner_fairness_cluster_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.vm_resource_owner_fairness
+    ADD CONSTRAINT vm_resource_owner_fairness_cluster_id_fkey FOREIGN KEY (cluster_id) REFERENCES public.vm_resource_admission_policy(cluster_id);
+
+
+--
+-- Name: vm_resource_recovery_successors vm_resource_recovery_successors_recovery_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.vm_resource_recovery_successors
+    ADD CONSTRAINT vm_resource_recovery_successors_recovery_id_fkey FOREIGN KEY (recovery_id) REFERENCES public.vm_workspace_recoveries(id);
+
+
+--
+-- Name: vm_resource_recovery_successors vm_resource_recovery_successors_reservation_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.vm_resource_recovery_successors
+    ADD CONSTRAINT vm_resource_recovery_successors_reservation_id_fkey FOREIGN KEY (reservation_id) REFERENCES public.vm_resource_reservations(id);
+
+
+--
+-- Name: vm_resource_reservations vm_resource_reservations_cluster_id_node_uid_node_name_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.vm_resource_reservations
+    ADD CONSTRAINT vm_resource_reservations_cluster_id_node_uid_node_name_fkey FOREIGN KEY (cluster_id, node_uid, node_name) REFERENCES public.vm_resource_nodes(cluster_id, node_uid, node_name);
+
+
+--
+-- Name: vm_resource_reservations vm_resource_reservations_request_id_cluster_id_policy_dige_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.vm_resource_reservations
+    ADD CONSTRAINT vm_resource_reservations_request_id_cluster_id_policy_dige_fkey FOREIGN KEY (request_id, cluster_id, policy_digest) REFERENCES public.vm_resource_waiters(request_id, cluster_id, policy_digest);
+
+
+--
+-- Name: vm_resource_reservations vm_resource_reservations_snapshot_id_cluster_id_policy_dig_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.vm_resource_reservations
+    ADD CONSTRAINT vm_resource_reservations_snapshot_id_cluster_id_policy_dig_fkey FOREIGN KEY (snapshot_id, cluster_id, policy_digest) REFERENCES public.vm_resource_inventory_snapshots(snapshot_id, cluster_id, policy_digest);
+
+
+--
+-- Name: vm_resource_thread_cleanup_authorities vm_resource_thread_cleanup_authoritie_cleanup_admission_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.vm_resource_thread_cleanup_authorities
+    ADD CONSTRAINT vm_resource_thread_cleanup_authoritie_cleanup_admission_id_fkey FOREIGN KEY (cleanup_admission_id) REFERENCES public.vm_workspace_cleanup_admissions(id);
+
+
+--
+-- Name: vm_resource_thread_cleanup_authorities vm_resource_thread_cleanup_authorities_request_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.vm_resource_thread_cleanup_authorities
+    ADD CONSTRAINT vm_resource_thread_cleanup_authorities_request_id_fkey FOREIGN KEY (request_id) REFERENCES public.vm_creation_retries(request_id);
+
+
+--
+-- Name: vm_resource_thread_cleanup_authorities vm_resource_thread_cleanup_authorities_reservation_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.vm_resource_thread_cleanup_authorities
+    ADD CONSTRAINT vm_resource_thread_cleanup_authorities_reservation_id_fkey FOREIGN KEY (reservation_id) REFERENCES public.vm_resource_reservations(id);
+
+
+--
+-- Name: vm_resource_thread_cleanup_authorities vm_resource_thread_cleanup_authorities_thread_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.vm_resource_thread_cleanup_authorities
+    ADD CONSTRAINT vm_resource_thread_cleanup_authorities_thread_id_fkey FOREIGN KEY (thread_id) REFERENCES public.vm_thread_creation_owners(thread_id);
+
+
+--
+-- Name: vm_resource_thread_cleanup_stops vm_resource_thread_cleanup_stops_cleanup_admission_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.vm_resource_thread_cleanup_stops
+    ADD CONSTRAINT vm_resource_thread_cleanup_stops_cleanup_admission_id_fkey FOREIGN KEY (cleanup_admission_id) REFERENCES public.vm_resource_thread_cleanup_authorities(cleanup_admission_id);
+
+
+--
+-- Name: vm_resource_thread_cleanup_stops vm_resource_thread_cleanup_stops_process_zero_receipt_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.vm_resource_thread_cleanup_stops
+    ADD CONSTRAINT vm_resource_thread_cleanup_stops_process_zero_receipt_id_fkey FOREIGN KEY (process_zero_receipt_id) REFERENCES public.managed_repository_process_zero_receipts(id);
+
+
+--
+-- Name: vm_resource_waiters vm_resource_waiters_audit_owner_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.vm_resource_waiters
+    ADD CONSTRAINT vm_resource_waiters_audit_owner_fkey FOREIGN KEY (thread_id) REFERENCES public.vm_thread_creation_owners(thread_id);
+
+
+--
+-- Name: vm_resource_waiters vm_resource_waiters_cluster_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.vm_resource_waiters
+    ADD CONSTRAINT vm_resource_waiters_cluster_id_fkey FOREIGN KEY (cluster_id) REFERENCES public.vm_resource_admission_policy(cluster_id);
+
+
+--
+-- Name: vm_resource_waiters vm_resource_waiters_request_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.vm_resource_waiters
+    ADD CONSTRAINT vm_resource_waiters_request_id_fkey FOREIGN KEY (request_id) REFERENCES public.vm_creation_retries(request_id);
+
+
+--
+-- Name: vm_job_retained_disk_purge_authorities vm_retained_purge_terminal_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.vm_job_retained_disk_purge_authorities
+    ADD CONSTRAINT vm_retained_purge_terminal_fkey FOREIGN KEY (retained_terminal_id) REFERENCES public.vm_job_retained_resume_terminals(id) NOT VALID;
+
+
+--
+-- Name: vm_thread_cleanup_refusal_recoveries vm_thread_cleanup_refusal_recoverie_successor_admission_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.vm_thread_cleanup_refusal_recoveries
+    ADD CONSTRAINT vm_thread_cleanup_refusal_recoverie_successor_admission_id_fkey FOREIGN KEY (successor_admission_id) REFERENCES public.vm_workspace_cleanup_admissions(id);
+
+
+--
+-- Name: vm_thread_cleanup_refusal_recoveries vm_thread_cleanup_refusal_recoveries_child_admission_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.vm_thread_cleanup_refusal_recoveries
+    ADD CONSTRAINT vm_thread_cleanup_refusal_recoveries_child_admission_id_fkey FOREIGN KEY (child_admission_id) REFERENCES public.vm_workspace_cleanup_admissions(id);
+
+
+--
+-- Name: vm_thread_cleanup_refusal_recoveries vm_thread_cleanup_refusal_recoveries_creation_request_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.vm_thread_cleanup_refusal_recoveries
+    ADD CONSTRAINT vm_thread_cleanup_refusal_recoveries_creation_request_id_fkey FOREIGN KEY (creation_request_id) REFERENCES public.vm_creation_retries(request_id);
+
+
+--
+-- Name: vm_thread_cleanup_refusal_recoveries vm_thread_cleanup_refusal_recoveries_refused_admission_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.vm_thread_cleanup_refusal_recoveries
+    ADD CONSTRAINT vm_thread_cleanup_refusal_recoveries_refused_admission_id_fkey FOREIGN KEY (refused_admission_id) REFERENCES public.vm_workspace_cleanup_admissions(id);
+
+
+--
+-- Name: vm_thread_cleanup_refusal_recoveries vm_thread_cleanup_refusal_recoveries_thread_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.vm_thread_cleanup_refusal_recoveries
+    ADD CONSTRAINT vm_thread_cleanup_refusal_recoveries_thread_id_fkey FOREIGN KEY (thread_id) REFERENCES public.vm_thread_creation_owners(thread_id);
+
+
+--
+-- Name: vm_thread_creation_owners vm_thread_creation_owners_live_thread_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.vm_thread_creation_owners
+    ADD CONSTRAINT vm_thread_creation_owners_live_thread_id_fkey FOREIGN KEY (live_thread_id) REFERENCES public.threads(id) ON DELETE SET NULL;
+
+
+--
+-- Name: vm_thread_creation_owners vm_thread_creation_owners_thread_id_deleted_runtime_genera_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.vm_thread_creation_owners
+    ADD CONSTRAINT vm_thread_creation_owners_thread_id_deleted_runtime_genera_fkey FOREIGN KEY (thread_id, deleted_runtime_generation, deleted_retirement_token) REFERENCES public.thread_runtime_retirement_outcomes(thread_id, runtime_generation, retirement_token);
+
+
+--
+-- Name: vm_thread_creation_settlements vm_thread_creation_settlement_thread_id_runtime_generation_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.vm_thread_creation_settlements
+    ADD CONSTRAINT vm_thread_creation_settlement_thread_id_runtime_generation_fkey FOREIGN KEY (thread_id, runtime_generation, retirement_token) REFERENCES public.thread_runtime_retirement_outcomes(thread_id, runtime_generation, retirement_token);
+
+
+--
+-- Name: vm_thread_creation_settlements vm_thread_creation_settlements_request_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.vm_thread_creation_settlements
+    ADD CONSTRAINT vm_thread_creation_settlements_request_id_fkey FOREIGN KEY (request_id) REFERENCES public.vm_creation_retries(request_id);
+
+
+--
+-- Name: vm_thread_creation_settlements vm_thread_creation_settlements_thread_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.vm_thread_creation_settlements
+    ADD CONSTRAINT vm_thread_creation_settlements_thread_id_fkey FOREIGN KEY (thread_id) REFERENCES public.vm_thread_creation_owners(thread_id);
+
+
+--
+-- Name: vm_thread_retained_disk_purge_authorities vm_thread_retained_disk_purge_authori_cleanup_admission_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.vm_thread_retained_disk_purge_authorities
+    ADD CONSTRAINT vm_thread_retained_disk_purge_authori_cleanup_admission_id_fkey FOREIGN KEY (cleanup_admission_id) REFERENCES public.vm_workspace_cleanup_admissions(id);
+
+
+--
+-- Name: vm_thread_retained_disk_purge_authorities vm_thread_retained_disk_purge_compute_cleanup_admission_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.vm_thread_retained_disk_purge_authorities
+    ADD CONSTRAINT vm_thread_retained_disk_purge_compute_cleanup_admission_id_fkey FOREIGN KEY (compute_cleanup_admission_id) REFERENCES public.vm_resource_thread_cleanup_authorities(cleanup_admission_id);
+
+
+--
+-- Name: vm_thread_retained_disk_purge_receipts vm_thread_retained_disk_purge_receipt_cleanup_admission_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.vm_thread_retained_disk_purge_receipts
+    ADD CONSTRAINT vm_thread_retained_disk_purge_receipt_cleanup_admission_id_fkey FOREIGN KEY (cleanup_admission_id) REFERENCES public.vm_thread_retained_disk_purge_authorities(cleanup_admission_id);
+
+
+--
+-- Name: vm_thread_retained_resume_terminals vm_thread_retained_resume_ter_compute_cleanup_admission_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.vm_thread_retained_resume_terminals
+    ADD CONSTRAINT vm_thread_retained_resume_ter_compute_cleanup_admission_id_fkey FOREIGN KEY (compute_cleanup_admission_id) REFERENCES public.vm_resource_thread_cleanup_authorities(cleanup_admission_id);
+
+
+--
+-- Name: vm_thread_retained_resumes vm_thread_retained_resume_terminal_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.vm_thread_retained_resumes
+    ADD CONSTRAINT vm_thread_retained_resume_terminal_fkey FOREIGN KEY (predecessor_terminal_id) REFERENCES public.vm_thread_retained_resume_terminals(id);
+
+
+--
+-- Name: vm_thread_retained_resume_terminals vm_thread_retained_resume_terminals_operation_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.vm_thread_retained_resume_terminals
+    ADD CONSTRAINT vm_thread_retained_resume_terminals_operation_id_fkey FOREIGN KEY (operation_id) REFERENCES public.vm_thread_retained_resumes(id);
+
+
+--
+-- Name: vm_thread_retained_resume_terminals vm_thread_retained_resume_terminals_source_request_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.vm_thread_retained_resume_terminals
+    ADD CONSTRAINT vm_thread_retained_resume_terminals_source_request_id_fkey FOREIGN KEY (source_request_id) REFERENCES public.vm_creation_retries(request_id);
+
+
+--
+-- Name: vm_thread_retained_resumes vm_thread_retained_resumes_compute_cleanup_admission_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.vm_thread_retained_resumes
+    ADD CONSTRAINT vm_thread_retained_resumes_compute_cleanup_admission_id_fkey FOREIGN KEY (compute_cleanup_admission_id) REFERENCES public.vm_resource_thread_cleanup_authorities(cleanup_admission_id);
+
+
+--
+-- Name: vm_thread_retained_resumes vm_thread_retained_resumes_thread_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.vm_thread_retained_resumes
+    ADD CONSTRAINT vm_thread_retained_resumes_thread_id_fkey FOREIGN KEY (thread_id) REFERENCES public.vm_thread_creation_owners(thread_id);
 
 
 --

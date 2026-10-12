@@ -8,6 +8,28 @@
     "global"
   ],
   "definitions": {
+    "connectorDriverResources": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["cpu", "memory", "ephemeralStorage"],
+      "properties": {
+        "cpu": {"type": ["string", "number"]},
+        "memory": {"type": "string", "pattern": "^[1-9][0-9]*(Mi|Gi)$"},
+        "ephemeralStorage": {"type": "string", "pattern": "^[1-9][0-9]*(Mi|Gi)$"}
+      }
+    },
+    "vmResourceSixBudget": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "cpuMillicores": {"type": ["integer", "null"], "minimum": 0},
+        "memoryBytes": {"type": ["integer", "null"], "minimum": 0},
+        "ephemeralStorageBytes": {"type": ["integer", "null"], "minimum": 0},
+        "kvmDevices": {"type": ["integer", "null"], "minimum": 0},
+        "tunDevices": {"type": ["integer", "null"], "minimum": 0},
+        "vhostNetDevices": {"type": ["integer", "null"], "minimum": 0}
+      }
+    },
     "labelSelector": {
       "type": "object",
       "properties": {
@@ -173,6 +195,22 @@
     }
   },
   "properties": {
+    "keycloak": {
+      "type": "object",
+      "properties": {
+        "bootstrapAdmin": {
+          "type": "object",
+          "properties": {
+            "username": {
+              "type": "string",
+              "maxLength": 64,
+              "pattern": "^$|^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$",
+              "description": "Initial bundled SRW realm administrator; empty preserves the existing identity, or defaults to test on a fresh install."
+            }
+          }
+        }
+      }
+    },
     "license": {
       "type": "object",
       "properties": {
@@ -275,6 +313,9 @@
         },
         "workspace": {
           "$ref": "#/definitions/firstPartyImage"
+        },
+        "workspaceMinimal": {
+          "$ref": "#/definitions/firstPartyImage"
         }
       }
     },
@@ -304,6 +345,21 @@
         "image": {
           "type": "string",
           "minLength": 1
+        },
+        "engines": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": [
+              "name"
+            ],
+            "properties": {
+              "name": {
+                "type": "string",
+                "minLength": 1
+              }
+            }
+          }
         },
         "service": {
           "type": "object",
@@ -1328,6 +1384,293 @@
     "orchestratorId": {
       "type": "string"
     },
+    "connectors": {
+      "type": "object",
+      "description": "Connector drivers: service-plane hosting (connector drivers D5).",
+      "properties": {
+        "servicePods": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "enabled": {"type": "boolean"},
+            "namespace": {
+              "type": "string",
+              "maxLength": 63,
+              "pattern": "^$|^[a-z0-9]([a-z0-9-]*[a-z0-9])?$"
+            },
+            "podSecurityVersion": {
+              "type": "string",
+              "pattern": "^v1\\.[0-9]+$"
+            },
+            "maxInstallation": {"type": "integer", "minimum": 1},
+            "idleSeconds": {"type": "integer", "minimum": 0},
+            "startTimeoutSeconds": {"type": "integer", "minimum": 30},
+            "reconcileIntervalSeconds": {"type": "integer", "minimum": 5},
+            "reresolveSeconds": {"type": "integer", "minimum": 0},
+            "repinDrainSeconds": {"type": "integer", "minimum": 0},
+            "clusterCidrs": {
+              "type": "array",
+              "minItems": 1,
+              "items": {"type": "string", "minLength": 3}
+            },
+            "canaryPort": {"type": "integer", "minimum": 1, "maximum": 65535},
+            "privateTiers": {"type": "array", "items": {"type": "string"}},
+            "refusedCidrs": {
+              "type": "array",
+              "items": {"type": "string", "minLength": 3}
+            },
+            "ipv6": {"type": "boolean"},
+            "networkEnforcementVerified": {"type": "boolean"},
+            "driverResources": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "requests": {"$ref": "#/definitions/connectorDriverResources"},
+                "limits": {"$ref": "#/definitions/connectorDriverResources"},
+                "max": {"$ref": "#/definitions/connectorDriverResources"}
+              }
+            },
+            "quota": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "bindTimePods": {"type": "integer", "minimum": 0},
+                "requestsCpu": {"type": ["string", "number"]},
+                "requestsMemory": {"type": "string"},
+                "limitsCpu": {"type": ["string", "number"]},
+                "limitsMemory": {"type": "string"},
+                "ephemeralStorage": {"type": "string"},
+                "secrets": {"type": "integer", "minimum": 1},
+                "services": {"type": "integer", "minimum": 1}
+              }
+            }
+          }
+        },
+        "customDrivers": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "Driver images users register (connector drivers D6).",
+          "properties": {
+            "privileged": {"type": "boolean"},
+            "bindDeadlineSeconds": {"type": "integer", "minimum": 30},
+            "bindWaitSeconds": {"type": "integer", "minimum": 0, "maximum": 25},
+            "specPodsPerUser": {"type": "integer", "minimum": 1}
+          }
+        },
+        "inPodPlane": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "The in-pod plane's cloud mount sidecars (connector drivers D7).",
+          "properties": {
+            "enabled": {"type": "boolean"},
+            "opener": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "image": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "properties": {
+                    "repository": {"type": "string"},
+                    "tag": {"type": "string"},
+                    "digest": {"type": "string", "pattern": "^$|^sha256:[0-9a-f]{64}$"}
+                  }
+                }
+              }
+            },
+            "rclone": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "image": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "properties": {
+                    "repository": {"type": "string"},
+                    "tag": {"type": "string"},
+                    "digest": {"type": "string", "pattern": "^$|^sha256:[0-9a-f]{64}$"}
+                  }
+                }
+              }
+            },
+            "cacheSize": {"type": "string", "pattern": "^[0-9]+(Ki|Mi|Gi|Ti|K|M|G|T)?$"},
+            "drainSeconds": {"type": "integer", "minimum": 0, "maximum": 90},
+            "maxMounts": {"type": "integer", "minimum": 1, "maximum": 16},
+            "supervisorMemory": {"type": "string", "pattern": "^$|^[0-9]+(Ki|Mi|Gi|K|M|G)?$"}
+          }
+        },
+        "providerMinting": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "Credentials SRW mints at a provider (connector drivers C5).",
+          "properties": {
+            "enabled": {"type": "boolean"},
+            "privateHosts": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "pattern": "^[a-z0-9]+([.-][a-z0-9]+)*(:[0-9]{1,5})?$"
+              }
+            }
+          }
+        },
+        "drivers": {
+          "type": "object",
+          "properties": {
+            "trustedRepositories": {
+              "type": "array",
+              "items": {"type": "string", "minLength": 1}
+            },
+            "echo": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "enabled": {"type": "boolean"},
+                "image": {
+                  "type": "object",
+                  "properties": {
+                    "repository": {"type": "string"},
+                    "tag": {"type": "string"},
+                    "digest": {"type": "string", "pattern": "^$|^sha256:[0-9a-f]{64}$"}
+                  }
+                }
+              }
+            },
+            "shim": {
+              "type": "object",
+              "properties": {
+                "image": {
+                  "type": "object",
+                  "properties": {
+                    "repository": {"type": "string", "minLength": 1},
+                    "tag": {"type": "string"},
+                    "digest": {"type": "string", "pattern": "^$|^sha256:[0-9a-f]{64}$"}
+                  }
+                }
+              }
+            },
+            "mcpFront": {
+              "type": "object",
+              "properties": {
+                "image": {
+                  "type": "object",
+                  "properties": {
+                    "repository": {"type": "string", "minLength": 1},
+                    "tag": {"type": "string"},
+                    "digest": {"type": "string", "pattern": "^$|^sha256:[0-9a-f]{64}$"}
+                  }
+                }
+              }
+            },
+            "managedMcp": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "gitea": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "properties": {
+                    "enabled": {"type": "boolean"},
+                    "image": {
+                      "type": "object",
+                      "additionalProperties": false,
+                      "properties": {
+                        "repository": {"type": "string"},
+                        "tag": {"type": "string"},
+                        "digest": {"type": "string", "pattern": "^$|^sha256:[0-9a-f]{64}$"}
+                      }
+                    }
+                  }
+                }
+              }
+            },
+            "mcpTest": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "enabled": {"type": "boolean"},
+                "image": {
+                  "type": "object",
+                  "properties": {
+                    "repository": {"type": "string"},
+                    "tag": {"type": "string"},
+                    "digest": {"type": "string", "pattern": "^$|^sha256:[0-9a-f]{64}$"}
+                  }
+                }
+              }
+            },
+            "gitSwap": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "enabled": {"type": "boolean"},
+                "image": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "properties": {
+                    "repository": {"type": "string"},
+                    "tag": {"type": "string"},
+                    "digest": {"type": "string", "pattern": "^$|^sha256:[0-9a-f]{64}$"}
+                  }
+                },
+                "fallback": {"type": "string", "enum": ["token-in-url", "refuse"]}
+              }
+            },
+            "ca": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "secretName": {"type": "string"},
+                "validityDays": {"type": "integer", "minimum": 30}
+              }
+            },
+            "mcpStdioTest": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "enabled": {"type": "boolean"},
+                "image": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "properties": {
+                    "repository": {"type": "string"},
+                    "tag": {"type": "string"},
+                    "digest": {"type": "string", "pattern": "^$|^sha256:[0-9a-f]{64}$"}
+                  }
+                }
+              }
+            },
+            "mcpStdioProbe": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "enabled": {"type": "boolean"}
+              }
+            },
+            "registry": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "insecureHosts": {
+                  "type": "array",
+                  "items": {"type": "string", "pattern": "^[a-z0-9]+([.-][a-z0-9]+)*(:[0-9]{1,5})?$"}
+                },
+                "privateHosts": {
+                  "type": "array",
+                  "items": {"type": "string", "pattern": "^[a-z0-9]+([.-][a-z0-9]+)*(:[0-9]{1,5})?$"}
+                },
+                "tokenHosts": {
+                  "type": "array",
+                  "items": {"type": "string", "pattern": "^[a-z0-9]+([.-][a-z0-9]+)*(:[0-9]{1,5})?$"}
+                },
+                "resolveCacheSeconds": {"type": "integer", "minimum": 1},
+                "resolveTimeoutSeconds": {"type": "integer", "minimum": 1}
+              }
+            }
+          }
+        }
+      }
+    },
     "manifestHosting": {
       "type": "object",
       "properties": {
@@ -1536,8 +1879,52 @@
         "manifestContractCutoverEnabled": {
           "type": "boolean"
         },
+        "sessionSubagentFanoutLanes": {
+          "type": "string",
+          "enum": ["", "stateless", "stateless,pinned"],
+          "description": "Session lanes whose parents may fan out delegate_agent calls. Pinned is enabled only together with stateless (parallel_subagents D5)."
+        },
         "workspaceCleanupReconciliationEnabled": {
           "type": "boolean"
+        },
+        "workspaceSshKnownHosts": {
+          "type": "string",
+          "description": "OpenSSH known_hosts lines pinning external SSH hosts for workspace connector identities (connector drivers C1)."
+        },
+        "connectorLeases": {
+          "type": "object",
+          "description": "Connector credential leases and their dedicated exchange port (connector drivers C2).",
+          "additionalProperties": false,
+          "properties": {
+            "exchangePort": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 65535,
+              "not": {"const": 8085},
+              "description": "The lease exchange's own port; 0 (the default) serves no exchange. Never the API port. A set port always renders the exchange NetworkPolicy."
+            },
+            "ttlSeconds": {"type": "integer", "minimum": 60},
+            "sweepIntervalSeconds": {"type": "integer", "minimum": 5},
+            "probeDriver": {
+              "type": "boolean",
+              "description": "Development only: install the srw.lease-probe/v1 driver."
+            },
+            "networkPolicy": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "driverNamespace": {"type": "string"}
+              }
+            }
+          }
+        },
+        "containerStartupStageAuthority": {
+          "type": "object",
+          "required": ["enabled"],
+          "properties": {
+            "enabled": {"type": "boolean"}
+          },
+          "additionalProperties": false
         },
         "workspaceLifecycleProtocolCutoverEnabled": {
           "type": "boolean"
@@ -1556,6 +1943,22 @@
             }
           },
           "additionalProperties": true
+        },
+        "vmProvisioning": {
+          "type": "object",
+          "required": ["rootdiskStallTimeoutSeconds"],
+          "properties": {
+            "creationRetryEnabled": {"type": "boolean"},
+            "rootdiskStallTimeoutSeconds": {"type": "integer", "minimum": 1}
+          },
+          "additionalProperties": false
+        },
+        "vmJobCancelRetention": {
+          "type": "object",
+          "properties": {
+            "enabled": {"type": "boolean"}
+          },
+          "additionalProperties": false
         },
         "vmWorkspaceRecovery": {
           "type": "object",
@@ -1582,6 +1985,14 @@
           "additionalProperties": false
         },
         "vmWorkspaceRecoveryAcceptanceGate": {
+          "type": "object",
+          "required": ["enabled"],
+          "properties": {
+            "enabled": {"type": "boolean"}
+          },
+          "additionalProperties": false
+        },
+        "vmRetainedResumeAcceptanceGate": {
           "type": "object",
           "required": ["enabled"],
           "properties": {
@@ -1827,6 +2238,266 @@
         "lifecycleAuthSecretKey": {
           "type": "string",
           "minLength": 1
+        },
+        "resourceAdmission": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "observerEnabled": {
+              "type": "boolean"
+            },
+            "shadowEnabled": {
+              "type": "boolean"
+            },
+            "enforcementEnabled": {
+              "type": "boolean"
+            },
+            "clusterWidePodReadAcknowledged": {
+              "type": "boolean"
+            },
+            "stableClusterId": {
+              "type": "string",
+              "maxLength": 253,
+              "pattern": "^$|^[a-z0-9]([a-z0-9.-]*[a-z0-9])?$"
+            },
+            "inventory": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "publishIntervalSeconds": {
+                  "type": [
+                    "integer",
+                    "null"
+                  ],
+                  "minimum": 1,
+                  "maximum": 9007199254740991
+                },
+                "staleAfterSeconds": {
+                  "type": [
+                    "integer",
+                    "null"
+                  ],
+                  "minimum": 1,
+                  "maximum": 9007199254740991
+                },
+                "maxItems": {
+                  "type": [
+                    "integer",
+                    "null"
+                  ],
+                  "minimum": 1,
+                  "maximum": 9007199254740991
+                },
+                "maxBytes": {
+                  "type": [
+                    "integer",
+                    "null"
+                  ],
+                  "minimum": 1,
+                  "maximum": 9007199254740991
+                },
+                "requestTimeoutSeconds": {
+                  "type": [
+                    "integer",
+                    "null"
+                  ],
+                  "minimum": 1,
+                  "maximum": 9007199254740991
+                },
+                "collectionTimeoutSeconds": {
+                  "type": [
+                    "integer",
+                    "null"
+                  ],
+                  "minimum": 1,
+                  "maximum": 9007199254740991
+                },
+                "publicationTimeoutSeconds": {
+                  "type": [
+                    "integer",
+                    "null"
+                  ],
+                  "minimum": 1,
+                  "maximum": 9007199254740991
+                },
+                "historyLimit": {
+                  "type": [
+                    "integer",
+                    "null"
+                  ],
+                  "minimum": 1,
+                  "maximum": 9007199254740991
+                },
+                "nodeLabelKeys": {
+                  "type": "array",
+                  "maxItems": 128,
+                  "uniqueItems": true,
+                  "items": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 253
+                  }
+                },
+                "kubevirtNamespace": {
+                  "type": ["string", "null"],
+                  "maxLength": 63
+                },
+                "kubevirtName": {
+                  "type": ["string", "null"],
+                  "maxLength": 253
+                }
+              }
+            },
+            "hostCost": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "cpuMillicoresPerVcpuNumerator": {
+                  "type": [
+                    "integer",
+                    "null"
+                  ],
+                  "minimum": 0,
+                  "maximum": 9007199254740991
+                },
+                "cpuMillicoresPerVcpuDenominator": {
+                  "type": [
+                    "integer",
+                    "null"
+                  ],
+                  "minimum": 0,
+                  "maximum": 9007199254740991
+                },
+                "launcherCpuOverheadMillicores": {
+                  "type": [
+                    "integer",
+                    "null"
+                  ],
+                  "minimum": 0,
+                  "maximum": 9007199254740991
+                },
+                "fixedMemoryOverheadBytes": {
+                  "type": [
+                    "integer",
+                    "null"
+                  ],
+                  "minimum": 0,
+                  "maximum": 9007199254740991
+                },
+                "perVcpuMemoryOverheadBytes": {
+                  "type": [
+                    "integer",
+                    "null"
+                  ],
+                  "minimum": 0,
+                  "maximum": 9007199254740991
+                },
+                "memoryOverheadBasisPoints": {
+                  "type": [
+                    "integer",
+                    "null"
+                  ],
+                  "minimum": 0,
+                  "maximum": 9007199254740991
+                },
+                "version": {"type": ["integer", "null"], "enum": [null, 2]},
+                "ephemeralStorageReserveBytes": {"type": ["integer", "null"], "minimum": 0},
+                "kvmDevices": {"type": ["integer", "null"], "minimum": 0},
+                "tunDevices": {"type": ["integer", "null"], "minimum": 0},
+                "vhostNetDevices": {"type": ["integer", "null"], "minimum": 0}
+              }
+            },
+            "nodeHeadroom": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "cpuMillicores": {
+                  "type": [
+                    "integer",
+                    "null"
+                  ],
+                  "minimum": 0,
+                  "maximum": 9007199254740991
+                },
+                "memoryBytes": {
+                  "type": [
+                    "integer",
+                    "null"
+                  ],
+                  "minimum": 0,
+                  "maximum": 9007199254740991
+                },
+                "kvmDevices": {
+                  "type": [
+                    "integer",
+                    "null"
+                  ],
+                  "minimum": 0,
+                  "maximum": 9007199254740991
+                },
+                "ephemeralStorageBytes": {"type": ["integer", "null"], "minimum": 0},
+                "tunDevices": {"type": ["integer", "null"], "minimum": 0},
+                "vhostNetDevices": {"type": ["integer", "null"], "minimum": 0}
+              }
+            },
+            "launcherProfile": {"type": ["object", "null"]},
+            "installationBudget": {"$ref": "#/definitions/vmResourceSixBudget"},
+            "ownerBudget": {"$ref": "#/definitions/vmResourceSixBudget"},
+            "fairness": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "maxBypasses": {
+                  "type": [
+                    "integer",
+                    "null"
+                  ],
+                  "minimum": 0,
+                  "maximum": 9007199254740991
+                },
+                "priorityAgingSeconds": {
+                  "type": [
+                    "integer",
+                    "null"
+                  ],
+                  "minimum": 0,
+                  "maximum": 9007199254740991
+                }
+              }
+            }
+          },
+          "allOf": [
+            {
+              "if": {
+                "required": ["enforcementEnabled"],
+                "properties": {"enforcementEnabled": {"const": true}}
+              },
+              "then": {
+                "required": [
+                  "observerEnabled", "shadowEnabled", "enforcementEnabled",
+                  "clusterWidePodReadAcknowledged", "stableClusterId",
+                  "inventory", "hostCost", "nodeHeadroom", "launcherProfile",
+                  "installationBudget", "ownerBudget", "fairness"
+                ],
+                "properties": {
+                  "observerEnabled": {"const": true},
+                  "shadowEnabled": {"const": true},
+                  "clusterWidePodReadAcknowledged": {"const": true},
+                  "launcherProfile": {"type": "object", "minProperties": 1}
+                }
+              }
+            },
+            {
+              "if": {
+                "required": ["shadowEnabled"],
+                "properties": {"shadowEnabled": {"const": true}}
+              },
+              "then": {
+                "required": ["enforcementEnabled"],
+                "properties": {"enforcementEnabled": {"const": true}}
+              }
+            }
+          ]
         },
         "preflight": {
           "type": "object",
@@ -2127,7 +2798,68 @@
               "minimum": 1
             }
           }
-        }
+        },
+        "images": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "trustedRepositories": {
+              "type": "array",
+              "items": {"type": "string", "minLength": 1}
+            }
+          }
+        },
+        "customImages": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {"privileged": {"type": "boolean"}}
+        },
+        "builtinTemplates": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "enabled": {"type": "boolean"},
+            "containerResources": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "cpu": {"type": "number", "exclusiveMinimum": 0},
+                "memory": {"type": "string", "pattern": "^[1-9][0-9]*(Mi|Gi|Ti)$"},
+                "requests": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "properties": {
+                    "cpu": {"type": "number", "exclusiveMinimum": 0},
+                    "memory": {
+                      "type": "string",
+                      "pattern": "^[1-9][0-9]*(Mi|Gi|Ti)$"
+                    }
+                  }
+                }
+              }
+            },
+            "vmResources": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "cpu": {"type": "integer", "minimum": 1},
+                "memory": {"type": "string", "pattern": "^[1-9][0-9]*(Mi|Gi|Ti)$"},
+                "storage": {"type": "string", "pattern": "^[1-9][0-9]*(Mi|Gi|Ti)$"}
+              }
+            }
+          }
+        },
+        "defaults": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "jobs": {"enum": ["none", "virtual", "container", "vm"]},
+            "sessions": {"enum": ["none", "virtual", "container", "vm"]},
+            "container": {"type": "string", "pattern": "^$|^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$"},
+            "vm": {"type": "string", "pattern": "^$|^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$"}
+          }
+        },
+        "imagePullTimeoutSeconds": {"type": "integer", "minimum": 60, "maximum": 3600}
       }
     }
   },

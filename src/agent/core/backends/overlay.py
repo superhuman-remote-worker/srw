@@ -291,7 +291,17 @@ class VirtualOverlayBackend:
         )
         if not self._normalize(path):
             for provider in self._providers.values():
-                if exclude_dirs and provider.prefix in exclude_dirs:
+                # exclude_dirs are directory-name globs (the tool contract, and
+                # search_excludes for real dirs); decided before any read.
+                if (
+                    exclude_dirs
+                    and provider.is_dir
+                    and any(
+                        fnmatch.fnmatchcase(part, glob)
+                        for part in provider.prefix.split("/")
+                        for glob in exclude_dirs
+                    )
+                ):
                     continue
                 results.extend(self._search_provider(provider, query, case_sensitive))
         return results[:SEARCH_RESULT_HARD_CAP]

@@ -1,0 +1,263 @@
+"""Exact child cleanup identity derived only from a frozen cancellation ledger."""
+
+import hashlib
+import json
+from collections.abc import Mapping
+from uuid import UUID, uuid5, NAMESPACE_URL
+
+
+def root_cleanup(disposition):
+    """Derive the existing controller cleanup protocol's full immutable intent."""
+    if not isinstance(disposition, Mapping):
+        raise ValueError("Cancellation does not authorize disk purge")
+    owner_kind = disposition.get("owner_kind", "job")
+    owner_id = (
+        disposition.get("thread_id")
+        if owner_kind == "thread"
+        else disposition.get("job_id")
+        if owner_kind == "job"
+        else None
+    )
+    if (
+        type(disposition.get("version")) is not int
+        or disposition["version"] != 1
+        or disposition.get("disk_policy")
+        != ("purge_new_thread_disk" if owner_kind == "thread" else "purge_new_job_disk")
+        or owner_kind not in {"job", "thread"}
+        or owner_id is None
+        or (owner_kind == "thread" and disposition.get("job_id") != owner_id)
+        or disposition.get("workspace_storage") is not None
+        or disposition.get("workspace_instance_id") is not None
+    ):
+        raise ValueError("Cancellation does not authorize disk purge")
+    root = disposition["objects"]["rootdisk"]
+    if (
+        root["outcome"] != "observed"
+        or root["name"] != f"agent-vm-{owner_id}-rootdisk"
+        or root["namespace"] != disposition["namespace"]
+    ):
+        raise ValueError("Cancellation root identity changed")
+    for value in (
+        disposition["request_id"],
+        disposition["disposition_id"],
+        owner_id,
+        disposition["provision_generation"],
+        disposition["admission_id"],
+        root["uid"],
+        root["pvc_uid"],
+    ):
+        if not isinstance(value, str) or str(UUID(value)) != value:
+            raise ValueError("Cancellation identity is invalid")
+    identity = {
+        "source": "controller_creation_rootdisk_delete",
+        "owner_kind": owner_kind,
+        "owner_id": owner_id,
+        "pvc_uid": root["pvc_uid"],
+        "dv_uid": root["uid"],
+        "provision_generation": disposition["provision_generation"],
+    }
+    canonical = json.dumps(identity, sort_keys=True, separators=(",", ":"))
+    request_id = uuid5(
+        NAMESPACE_URL,
+        "srw-controller-cleanup:"
+        + canonical
+        + ":parent:"
+        + disposition["admission_id"],
+    )
+    return {
+        **identity,
+        "request_id": str(request_id),
+        "intent_digest": "sha256:" + hashlib.sha256(canonical.encode()).hexdigest(),
+    }
+
+
+def exact_root_child(child, disposition):
+    """No arbitrary descendant is exempted from the existing cleanup hold."""
+    try:
+        expected = root_cleanup(disposition)
+        return str(child["parent_admission_id"]) == disposition["admission_id"] and all(
+            str(child[key]) == expected[key]
+            for key in (
+                "source",
+                "owner_kind",
+                "owner_id",
+                "pvc_uid",
+                "request_id",
+                "intent_digest",
+            )
+        )
+    except (KeyError, TypeError, ValueError):
+        return False
+
+
+def disposition_parent_identity(proof):
+    if (
+        not isinstance(proof, Mapping)
+        or set(proof)
+        != {
+            "version",
+            "kind",
+            "admission_id",
+            "request_id",
+            "intent_digest",
+            "retry_request_id",
+            "disposition_id",
+        }
+        or type(proof["version"]) is not int
+        or proof["version"] != 1
+        or proof["kind"] != "creation_disposition"
+    ):
+        raise ValueError("Cancellation parent is invalid")
+    for key in ("admission_id", "request_id", "retry_request_id", "disposition_id"):
+        if str(UUID(proof[key])) != proof[key]:
+            raise ValueError("Cancellation parent identity is invalid")
+    return (
+        UUID(proof["admission_id"]),
+        UUID(proof["request_id"]),
+        proof["intent_digest"],
+        "controller_vm_create",
+    )
+
+
+async def validate_disposition_child(
+    conn,
+    proof,
+    *,
+    owner_kind,
+    owner_id,
+    pvc_uid,
+    request_id,
+    source,
+    intent_digest,
+    provision_generation,
+    expected_vm_uid,
+):
+    """Caller holds owner/PVC and original parent admission locks.
+
+    The parent serializes every disposition transition. This read deliberately
+    takes no retry lock before the existing queue/Job scope.
+    """
+    try:
+        disposition_parent_identity(proof)
+        row = await conn.fetchrow(
+            "SELECT * FROM vm_creation_retries WHERE request_id=$1 AND creation_admission_id=$2",
+            UUID(proof["retry_request_id"]),
+            UUID(proof["admission_id"]),
+        )
+        if (
+            row is None
+            or row["state"] != "cancel_requested"
+            or row["expected_pvc_uid"] is not None
+        ):
+            return False
+        from orchestrator.services.vm_creation_retry_store import _creation_intent
+        from orchestrator.services.vm_workspace_recovery_store import (
+            cleanup_intent_digest,
+        )
+
+        # Supplied and stored hashes agreeing cannot replace the full immutable
+        # creation ledger, including its original request and exact new-disk mode.
+        if proof["intent_digest"] != cleanup_intent_digest(
+            _creation_intent(row)
+        ) or proof["request_id"] != str(
+            uuid5(NAMESPACE_URL, "vm-create:" + str(row["request_id"]))
+        ):
+            return False
+        disposition = row["cancellation_disposition"]
+        if isinstance(disposition, str):
+            disposition = json.loads(disposition)
+        expected = root_cleanup(disposition)
+        return (
+            expected_vm_uid is None
+            and disposition["job_id"]
+            == str(row["thread_id"] if row["owner_kind"] == "thread" else row["job_id"])
+            and disposition.get("owner_kind", "job") == row["owner_kind"]
+            and (
+                row["owner_kind"] != "thread"
+                or (
+                    disposition.get("thread_id") == str(row["thread_id"])
+                    and disposition.get("thread_runtime_generation")
+                    == str(row["thread_runtime_generation"])
+                )
+            )
+            and disposition["provision_generation"] == str(row["provision_generation"])
+            and disposition["carrier_uid"] == str(row["creation_carrier_uid"])
+            and disposition["namespace"] == row["creation_carrier_namespace"]
+            and disposition["disposition_id"] == proof["disposition_id"]
+            and disposition["request_id"] == proof["retry_request_id"]
+            and disposition["admission_id"] == proof["admission_id"]
+            and expected
+            == dict(
+                source=source,
+                owner_kind=owner_kind,
+                owner_id=str(owner_id),
+                pvc_uid=str(pvc_uid),
+                dv_uid=expected["dv_uid"],
+                provision_generation=provision_generation,
+                request_id=str(request_id),
+                intent_digest=intent_digest,
+            )
+        )
+    except (KeyError, TypeError, ValueError):
+        return False
+
+
+async def child_disposition_identity(conn, child):
+    """Classify an existing child before any generic controller resume can act."""
+    if child["parent_admission_id"] is None:
+        if child["source"] == "controller_creation_rootdisk_delete":
+            raise ValueError("Creation disposition parent is unavailable")
+        return None
+    parent = await conn.fetchrow(
+        "SELECT * FROM vm_workspace_cleanup_admissions WHERE id=$1",
+        child["parent_admission_id"],
+    )
+    if parent is None:
+        raise ValueError("Cleanup parent is unavailable")
+    if parent["source"] != "controller_vm_create":
+        if child["source"] == "controller_creation_rootdisk_delete":
+            raise ValueError("Creation disposition parent changed")
+        return None
+    row = await conn.fetchrow(
+        "SELECT * FROM vm_creation_retries WHERE creation_admission_id=$1", parent["id"]
+    )
+    if row is None:
+        raise ValueError("Creation disposition is unavailable")
+    disposition = row["cancellation_disposition"]
+    if isinstance(disposition, str):
+        disposition = json.loads(disposition)
+    if (
+        not exact_root_child(child, disposition)
+        or parent["completed_at"] is not None
+        or parent["parent_admission_id"] is not None
+        or parent["owner_kind"] != row["owner_kind"]
+        or parent["owner_id"]
+        != (row["thread_id"] if row["owner_kind"] == "thread" else row["job_id"])
+        or parent["pvc_uid"] != row["observed_pvc_uid"]
+    ):
+        raise ValueError("Creation disposition child changed")
+    proof = {
+        "version": 1,
+        "kind": "creation_disposition",
+        "admission_id": str(parent["id"]),
+        "request_id": str(parent["request_id"]),
+        "intent_digest": parent["intent_digest"],
+        "retry_request_id": str(row["request_id"]),
+        "disposition_id": disposition["disposition_id"],
+    }
+    if not await validate_disposition_child(
+        conn,
+        proof,
+        owner_kind=child["owner_kind"],
+        owner_id=child["owner_id"],
+        pvc_uid=child["pvc_uid"],
+        request_id=child["request_id"],
+        source=child["source"],
+        intent_digest=child["intent_digest"],
+        provision_generation=disposition["provision_generation"],
+        expected_vm_uid=None,
+    ):
+        raise ValueError("Creation disposition child changed")
+    from shared.vm_creation_disposition import disposition_identity
+
+    return disposition_identity(row)

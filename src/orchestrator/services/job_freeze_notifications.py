@@ -25,6 +25,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from orchestrator.services.notification_service import RecordResult
+from shared.content_redaction import sanitize_data, sanitize_text
 from shared.runtime.core.loader import canonical_config_name
 
 logger = logging.getLogger(__name__)
@@ -37,6 +38,31 @@ class JobFreezeNotificationDependencies:
     notifier: Any
 
 
+_DELIVERY_HOLD_CHARS = 600
+
+
+def delivery_hold_reason(freeze_data: dict[str, Any] | None) -> str | None:
+    """Why this completion's delivery is unproven, or None.
+
+    ``delivery_hold`` is the deliverable gate's verdict (set by the completion
+    authority); ``delivery_error`` is the agent's own report of a failed
+    job-ending commit or push. Either one means the branch may be stale.
+    """
+    fd = freeze_data or {}
+    reason = fd.get("delivery_hold")
+    if not reason and fd.get("delivery_failed"):
+        reason = fd.get("delivery_error") or "the job-ending push failed"
+    if not isinstance(reason, str) or not reason.strip():
+        return None
+    # A failed push's error echoes its credential-bearing remote (OC-05), and
+    # this string is shown AND stored in the feed payload. Redacted before
+    # the cut, so a truncation cannot strand a fragment.
+    reason = " ".join(sanitize_text(reason).split())
+    if len(reason) > _DELIVERY_HOLD_CHARS:
+        reason = reason[: _DELIVERY_HOLD_CHARS - 1] + "…"
+    return reason
+
+
 def format_freeze_notification(
     freeze_type: str,
     freeze_data: dict[str, Any],
@@ -44,8 +70,16 @@ def format_freeze_notification(
     config_name: str,
     description: str,
 ) -> tuple[str, str]:
-    """Format notification subject and body for a freeze event."""
+    """Format notification subject and body for a freeze event.
+
+    Every field of ``freeze_data`` and the description is agent- or
+    user-written (audit OC-05): a summary, a sudo command, a reason or an LLM
+    error can carry a credential. Each is redacted where it is interpolated;
+    the template around it is the server's and is left alone.
+    """
     short_id = job_id[:8]
+    freeze_data = sanitize_data(dict(freeze_data or {})).value
+    description = sanitize_text(description)
 
     if freeze_type == "vm_upgrade_required":
         command = freeze_data.get("command", "unknown")
@@ -79,6 +113,22 @@ def format_freeze_notification(
             f"**Confidence:** {confidence_str}\n\n"
             f"**Deliverables:**\n{deliverables_str}"
         )
+        hold = delivery_hold_reason(freeze_data)
+        if hold:
+            # The seal was held because the repository cannot be shown to
+            # hold the work — the reviewer must know that before reading the
+            # branch, which may be a stale revision.
+            subject = f"Job {short_id} held — delivery unproven"
+            message_md = (
+                f"**Job `{short_id}`** (`{config_name}`) finished, but its "
+                f"deliverables could not be shown to have reached the job "
+                f"repository, so it was held for review instead of sealed.\n\n"
+                f"**Delivery:** {hold}\n\n"
+                f"The workspace may hold the only copy of the latest work. "
+                f"Recover it before approving what the branch shows.\n\n"
+                f"**Summary:** {summary}\n\n"
+                f"**Deliverables:**\n{deliverables_str}"
+            )
 
     elif freeze_type == "budget_exceeded":
         phase_number = freeze_data.get("phase_number", "?")
@@ -171,7 +221,11 @@ async def notify_operator_freeze(
         return None
 
     config_name = canonical_config_name(job.get("config_name") or "worker_base")
-    description = (job.get("description") or "")[:100]
+    description = sanitize_text(job.get("description") or "")[:100]
+    # One sanitized copy feeds the body AND the payload: the payload is stored
+    # in the feed row and shipped in the SSE frame, so a raw read of the
+    # worker's fields there undoes the body's redaction.
+    freeze_data = sanitize_data(dict(freeze_data or {})).value
     subject, message_md = format_freeze_notification(
         freeze_type=freeze_type,
         freeze_data=freeze_data,
@@ -205,6 +259,7 @@ async def notify_operator_freeze(
             "freeze_type": freeze_type,
             "phase_number": (freeze_data or {}).get("phase_number"),
             "sudo_request_id": str(sudo_request_id) if sudo_request_id else None,
+            "delivery_hold": delivery_hold_reason(freeze_data),
         },
     )
     logger.info(
@@ -220,6 +275,7 @@ async def notify_operator_freeze(
 __all__ = [
     "FREEZE_CATEGORY",
     "JobFreezeNotificationDependencies",
+    "delivery_hold_reason",
     "format_freeze_notification",
     "notify_operator_freeze",
     "resolve_job_notifications",

@@ -20,6 +20,10 @@ import {
 } from '../agent-settings/resolved-toolset';
 import {deepMergeConfig} from '../agent-settings/config-merge';
 import {
+    SESSION_DELEGATION_CAP,
+    sessionDelegationCapValue,
+} from '../agent-settings/tools-group.component';
+import {
     ConfigUpdateOutcome,
     PersistentChatService,
     NarrationMode,
@@ -27,6 +31,7 @@ import {
 } from '../../core/services/persistent-chat.service';
 import {ApiService, SessionToolGroupsResponse} from '../../core/services/api.service';
 import {CapabilitiesService} from '../../core/services/capabilities.service';
+import {ConnectorDriversService} from '../../core/services/connector-drivers.service';
 import {ModelService} from '../../core/services/model.service';
 import {Datasource} from '../../core/models/api.model';
 import {AppIconComponent} from '../../ui/icon';
@@ -52,6 +57,27 @@ const TOOL_ADDITIONS_PREFIX = 'tools+';
  *  user flips in quick succession (live_session_settings.md, principle 4).
  *  Also debounces the per-tick temperature slider. */
 const APPLY_DEBOUNCE_MS = 400;
+
+/** `metadata.datasource_access`: the string levels by connector id. */
+function datasourceAccessOf(value: unknown): Record<string, string> {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) return {};
+    const out: Record<string, string> = {};
+    for (const [id, level] of Object.entries(value as Record<string, unknown>)) {
+        if (typeof level === 'string' && level) out[id] = level;
+    }
+    return out;
+}
+
+/** The connector types whose driver refuses a live attach (`live_attach:
+ *  false` in the capability matrix): a copy, used only until the matrix
+ *  loads. A knowledge base binds when the session starts; the main cloud's
+ *  folders are mounted then. */
+const LIVE_ATTACH_REFUSED_TYPES: ReadonlySet<string> = new Set([
+    'kb',
+    'cloud_folder',
+    'cloud_folder_checkout',
+    'cloud_outbox',
+]);
 
 /**
  * Live session settings pane (live_session_settings.md, Slice A).
@@ -102,18 +128,19 @@ const APPLY_DEBOUNCE_MS = 400;
             [datasourceContextKey]="'live:' + (chat.threadId() ?? '')"
             [datasourceDefaultsEnabled]="capabilities.datasourceScopeAutoAttachAvailable()"
             [initialDatasourceIds]="attachedIds()"
+            [initialDatasourceAccess]="attachedAccess()"
             [lockedDatasourceIds]="lockedDatasourceIds()"
             [liteBackend]="isLiteBackend()"
             [liveTier]="workspaceTier()"
             [tierReachability]="tierReachability()"
             [upgradeInProgress]="chat.workspaceUpgradeInProgress()"
+            [expertName]="expertLabel()"
+            [projectName]="projectLabel()"
+            [lockedConfig]="lockedConfig()"
             (change)="onSettingsChange()"
             (retryDatasources)="retryDatasourceLoad()"
             (tierChangeRequested)="onTierPicked($event)"
           />
-
-          <!-- Set-at-creation surfaces, shown for honesty (criterion 7) -->
-          <p class="fixed-note">{{ 'chat.settingsPane.fixedNote' | transloco }}</p>
         </div>
       </div>
 
@@ -169,13 +196,6 @@ const APPLY_DEBOUNCE_MS = 400;
         padding: 12px;
         min-height: 0;
       }
-      .fixed-note {
-        display: block;
-        margin-top: 16px;
-        font-size: 11px;
-        line-height: 1.4;
-        color: var(--text-muted);
-      }
       .upgrade-body {
         margin: 0 0 10px;
         font-size: 13px;
@@ -193,6 +213,7 @@ export class SettingsPaneComponent {
     readonly capabilities = inject(CapabilitiesService);
     private readonly api = inject(ApiService);
     private readonly modelService = inject(ModelService);
+    private readonly connectorDrivers = inject(ConnectorDriversService);
     private readonly destroyRef = inject(DestroyRef);
 
     /** Whether the pane is currently shown (drives the lazy thread fetch). */
@@ -218,17 +239,66 @@ export class SettingsPaneComponent {
     /** The session's currently attached datasource ids (durable selection;
      *  optimistically advanced when the pane dispatches a change). */
     readonly attachedIds = signal<string[]>([]);
-    /** Eligible datasources shown in the picker: the create-flow eligible
-     *  union, minus unattached kb entries (not addable live — v1). */
-    readonly pickerDatasources = signal<Datasource[]>([]);
+    /** The level each attached connector with access levels was bound at
+     *  (`metadata.datasource_access`), shown locked: a cloud folder's level
+     *  changes only at the next start. */
+    readonly attachedAccess = signal<Record<string, string>>({});
+    /** The last eligible answer, with the attached ids it was read against;
+     *  null while there is none. */
+    private readonly eligibleAnswer = signal<{eligible: Datasource[]; attachedIds: string[]} | null>(null);
+    /** Eligible datasources shown in the picker: the session's eligible
+     *  list, minus unattached rows whose driver refuses a live attach (a
+     *  knowledge base, a cloud folder: adding one here would only take
+     *  effect at the next start), plus a placeholder per attached id that
+     *  fell out of eligibility. */
+    readonly pickerDatasources = computed<Datasource[]>(() => {
+        const answer = this.eligibleAnswer();
+        if (!answer) return [];
+        const {eligible, attachedIds} = answer;
+        const shown = eligible.filter(
+            (ds) => !this.liveAttachRefused(ds) || attachedIds.includes(ds.id),
+        );
+        const visibleIds = new Set(shown.map((ds) => ds.id));
+        // A stored attachment that fell out of eligibility is a live
+        // fail-closed conflict, not something to silently preserve
+        // forever. Render a non-enumerating placeholder so the user
+        // can explicitly detach it without leaking its former name or
+        // project association.
+        const unavailable: Datasource[] = attachedIds
+            .filter((id) => !visibleIds.has(id))
+            .map((id) => ({
+                id,
+                name: id,
+                description: null,
+                type: 'generic',
+                connection_url: null,
+                cli_hint: null,
+                default_branch: null,
+                job_id: null,
+                created_at: '',
+                updated_at: '',
+                unavailable: true,
+            }));
+        return [...shown, ...unavailable];
+    });
     readonly loadingDatasources = signal(false);
     readonly datasourceLoadError = signal(false);
     private datasourceProjectIds: string[] = [];
     private datasourceRequestSerial = 0;
-    /** kb entries render frozen: knowledge bindings only rewire on attach. */
+    /** Rows whose driver refuses a live attach render frozen at their
+     *  current state, with a hint that they change only at the next start
+     *  (a knowledge base's bindings rewire on attach; a cloud folder is
+     *  mounted at start). */
     readonly lockedDatasourceIds = computed(() =>
-        this.pickerDatasources().filter((ds) => ds.type === 'kb').map((ds) => ds.id),
+        this.pickerDatasources().filter((ds) => this.liveAttachRefused(ds)).map((ds) => ds.id),
     );
+    /** Set-at-creation facts the pane shows locked (criterion 7): the
+     *  session's Expert and project names, and its frozen resolved config so
+     *  locked settings show the values the session really runs with. */
+    readonly expertLabel = signal('');
+    readonly projectLabel = signal('');
+    readonly lockedConfig = signal<Record<string, unknown> | null>(null);
+    private labelRequestSerial = 0;
     /** Thread id the pane last prefilled for (re-prefill on session switch). */
     private prefilledThread: string | null = null;
     /** Desired state actually dispatched last — the diff baseline. */
@@ -309,6 +379,21 @@ export class SettingsPaneComponent {
             // `none`, or a tier this build does not know: nothing reachable,
             // so the row falls back to static text.
         }
+        // A session with no upgrade transport (the stateless lane) can move
+        // nowhere, whatever the ladder allows: say so in the option instead
+        // of refusing after the confirmation dialog.
+        const upgradeTransport = this.chat.controlTransport('upgrade-to-workspace');
+        if (upgradeTransport === 'unavailable') {
+            for (const [tier, state] of Object.entries(map)) {
+                if (state === 'ok' || state === 'needsApproval') map[tier] = 'sessionUnsupported';
+            }
+        }
+        // A pinned session (socket transport) refuses container upgrades
+        // before provisioning (persistent_app.py _handle_workspace_upgrade),
+        // so the option says so instead of failing after the confirmation.
+        if (upgradeTransport === 'websocket' && map['sandbox'] === 'ok') {
+            map['sandbox'] = 'sessionUnsupported';
+        }
         return map;
     });
 
@@ -352,11 +437,16 @@ export class SettingsPaneComponent {
         });
     }
 
-    /** Scroll the model control into view (status-chip entry point). */
+    /** Scroll the model control into view (status-chip entry point). The
+     *  Expert section may be collapsed, so open it first and scroll once it
+     *  has rendered. */
     scrollToModel(): void {
-        this.paneRoot()?.nativeElement
-            .querySelector('app-model-group')
-            ?.scrollIntoView({block: 'start', behavior: 'smooth'});
+        this.settings()?.revealModel();
+        setTimeout(() => {
+            this.paneRoot()?.nativeElement
+                .querySelector('app-model-group')
+                ?.scrollIntoView({block: 'start', behavior: 'smooth'});
+        });
     }
 
     onSettingsChange(): void {
@@ -386,7 +476,11 @@ export class SettingsPaneComponent {
         this.lastApplied = null;
         this.threadOverride.set({});
         this.attachedIds.set([]);
-        this.pickerDatasources.set([]);
+        this.attachedAccess.set({});
+        this.eligibleAnswer.set(null);
+        this.expertLabel.set('');
+        this.projectLabel.set('');
+        this.lockedConfig.set(null);
         // Honest "unknown" while loading: the tools surface degrades to its
         // static list until the server answers, so nothing is shown as
         // measured that has not been measured.
@@ -417,6 +511,7 @@ export class SettingsPaneComponent {
 
             const ids = ((metadata['datasource_ids'] ?? []) as string[]).map(String);
             this.attachedIds.set(ids);
+            this.attachedAccess.set(datasourceAccessOf(metadata['datasource_access']));
 
             // Prefill the sub-groups' baselines from the effective config
             // (this also clears any pins made while the fetch was in flight —
@@ -440,6 +535,43 @@ export class SettingsPaneComponent {
             const projectIds = ((thread?.['project_ids'] ?? []) as string[]).map(String);
             this.datasourceProjectIds = projectIds;
             this.loadEligibleDatasources(threadId, ids, projectIds);
+            this.loadLockedFacts(threadId, thread, metadata, projectIds);
+        });
+    }
+
+    /** Names and frozen values for the locked rows. Display only: none of it
+     *  reaches the diff baseline, so a slow or failed read changes nothing
+     *  but what the locked rows can say. */
+    private loadLockedFacts(
+        threadId: string,
+        thread: Record<string, unknown> | null,
+        metadata: Record<string, unknown>,
+        projectIds: string[],
+    ): void {
+        const serial = ++this.labelRequestSerial;
+        const current = () => serial === this.labelRequestSerial && this.chat.threadId() === threadId;
+        const expertId = (metadata['expert_id'] as string | undefined)
+            ?? (metadata['expert_based_on'] as string | undefined)
+            ?? (thread?.['config_name'] as string | undefined)
+            ?? null;
+        if (expertId) {
+            this.expertLabel.set(expertId);
+            this.api.getExperts(undefined, {showAll: true}).subscribe((experts) => {
+                if (!current()) return;
+                const match = experts.find((e) => e.id === expertId || e.name === expertId);
+                if (match) this.expertLabel.set(match.display_name);
+            });
+        }
+        // `project_ids` is the session's authorized project scope (the
+        // `project_id` column, or a legacy multi-project session's list).
+        const projectId = projectIds[0] ?? (thread?.['project_id'] as string | undefined) ?? null;
+        if (projectId) {
+            this.api.getProject(projectId).subscribe((project) => {
+                if (current() && project) this.projectLabel.set(project.name);
+            });
+        }
+        this.api.getThreadResolvedConfig(threadId).subscribe((config) => {
+            if (current()) this.lockedConfig.set(config);
         });
     }
 
@@ -457,43 +589,31 @@ export class SettingsPaneComponent {
         const serial = ++this.datasourceRequestSerial;
         this.loadingDatasources.set(true);
         this.datasourceLoadError.set(false);
-        this.api.getEligibleDatasources(projectIds).subscribe({
+        // Which rows refuse a live attach is the matrix's answer.
+        this.connectorDrivers.load();
+        this.api.getEligibleDatasources(projectIds, 'session').subscribe({
             next: (eligible) => {
                 if (serial !== this.datasourceRequestSerial || this.chat.threadId() !== threadId) return;
-                const shown = eligible.filter(
-                    ds => ds.type !== 'kb' || attachedIds.includes(ds.id),
-                );
-                const visibleIds = new Set(shown.map(ds => ds.id));
-                // A stored attachment that fell out of eligibility is a live
-                // fail-closed conflict, not something to silently preserve
-                // forever. Render a non-enumerating placeholder so the user
-                // can explicitly detach it without leaking its former name or
-                // project association.
-                const unavailable: Datasource[] = attachedIds
-                    .filter(id => !visibleIds.has(id))
-                    .map(id => ({
-                        id,
-                        name: id,
-                        description: null,
-                        type: 'generic',
-                        connection_url: null,
-                        cli_hint: null,
-                        default_branch: null,
-                        job_id: null,
-                        created_at: '',
-                        updated_at: '',
-                        unavailable: true,
-                    }));
-                this.pickerDatasources.set([...shown, ...unavailable]);
+                this.eligibleAnswer.set({eligible, attachedIds});
                 this.loadingDatasources.set(false);
             },
             error: () => {
                 if (serial !== this.datasourceRequestSerial || this.chat.threadId() !== threadId) return;
-                this.pickerDatasources.set([]);
+                this.eligibleAnswer.set(null);
                 this.datasourceLoadError.set(true);
                 this.loadingDatasources.set(false);
             },
         });
+    }
+
+    /** Whether a row's driver refuses a live attach: the matrix's
+     *  `live_attach: false`, or, until it loads, the built-in copy. A
+     *  placeholder for an attachment that fell out of eligibility is never
+     *  frozen: it must stay detachable. */
+    private liveAttachRefused(ds: Datasource): boolean {
+        if (ds.unavailable) return false;
+        const driver = this.connectorDrivers.forType(ds.type);
+        return driver ? driver.live_attach === false : LIVE_ATTACH_REFUSED_TYPES.has(ds.type);
     }
 
     /** The full desired selection: the picker's checked set plus attached ids
@@ -559,9 +679,13 @@ export class SettingsPaneComponent {
         // The delegation concurrency knob rides beside the Delegation row and
         // is the only non-tools key the tools group writes (besides the gate,
         // which is derived at dispatch from the row's own switch position).
-        state['delegation.max_concurrent'] =
-            readConfigPath(overrides, 'delegation.max_concurrent')
-            ?? readConfigPath(config, 'delegation.max_concurrent')
+        // A session reads its OWN cap, `delegation.session_max_concurrent`
+        // (parallel_subagents.md §6.4, D2): a session allowed to fan out
+        // ignores `max_concurrent`, so writing that key asked for 2 and got 6.
+        // Unset stays null — the pane never writes the inherited value.
+        state[SESSION_DELEGATION_CAP.path] =
+            readConfigPath(overrides, SESSION_DELEGATION_CAP.path)
+            ?? readConfigPath(config, SESSION_DELEGATION_CAP.path)
             ?? null;
         // Canonical joined form so the diff is a plain string compare. The
         // picker's untouched default IS the attached set, so this holds the
@@ -633,14 +757,16 @@ export class SettingsPaneComponent {
         if ('delegation' in tools) {
             fragment['delegation'] = {enabled: !!desired['tools.delegation']};
         }
-        const maxConcurrent = desired['delegation.max_concurrent'];
+        // Only a value the orchestrator accepts (a whole number from 1 to
+        // 20) is ever sent; the tools group withholds anything else already.
+        const sessionCap = sessionDelegationCapValue(desired[SESSION_DELEGATION_CAP.path]);
         if (
-            maxConcurrent !== previous['delegation.max_concurrent']
-            && typeof maxConcurrent === 'number'
+            desired[SESSION_DELEGATION_CAP.path] !== previous[SESSION_DELEGATION_CAP.path]
+            && sessionCap !== null
         ) {
             fragment['delegation'] = {
                 ...((fragment['delegation'] as Record<string, unknown>) ?? {}),
-                max_concurrent: maxConcurrent,
+                session_max_concurrent: sessionCap,
             };
         }
 
@@ -710,6 +836,18 @@ export class SettingsPaneComponent {
                 this.threadOverride.update((current) =>
                     deepMergeConfig(current, outcome.applied),
                 );
+            } else if (outcome.transport === 'websocket') {
+                // The socket ack moves the live signals, but the session cap
+                // has none: fold the confirmed value in, or an emptied field
+                // would read "inherited" over a session that holds the value.
+                const cap = sessionDelegationCapValue(
+                    readConfigPath(outcome.applied, SESSION_DELEGATION_CAP.path),
+                );
+                if (cap !== null) {
+                    this.threadOverride.update((current) =>
+                        deepMergeConfig(current, {delegation: {session_max_concurrent: cap}}),
+                    );
+                }
             }
             return;
         }

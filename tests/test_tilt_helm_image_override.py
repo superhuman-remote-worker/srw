@@ -23,6 +23,7 @@ def test_tilt_image_replaces_a_saved_digest(tmp_path, image_key, receipt):
         + """
 import json, os, sys
 from pathlib import Path
+CTX = os.environ.get('SRW_HELM_EXPECT_CONTEXT', 'k3d-srw')
 args = sys.argv[1:]
 name = Path(sys.argv[0]).name
 receipt = os.environ['RECEIPT']
@@ -39,13 +40,23 @@ elif name == 'docker':
     if receipt == 'ambiguous': digests += ['localhost:5005/candidate@sha256:' + 'c' * 64]
     print(json.dumps([{'RepoDigests': digests}]))
 elif name == 'kubectl':
+    # Read-back runs with an explicit context even when NAMESPACE is empty:
+    # assert the targeting instead of merely discarding the flags.
+    assert args[0] == '--context' and args[1] == CTX, args
+    rest = args[2:]
+    assert '--kube-context' not in rest and '--context' not in rest, rest
     print(sys.stdin.read())
-elif args[0] == 'status':
-    print(json.dumps({'info': {'status': 'deployed'}}))
-elif args[:2] == ['get', 'manifest']:
-    print('{}')
-elif args[:2] == ['upgrade', '--install']:
-    Path(os.environ['OBSERVATION']).write_text(json.dumps(args))
+elif args[0] == '--kube-context' and args[1] == CTX:
+    rest = args[2:]
+    assert '--kube-context' not in rest and '--context' not in rest, rest
+    if rest[0] == 'status':
+        print(json.dumps({'info': {'status': 'deployed'}}))
+    elif rest[:2] == ['get', 'manifest']:
+        print('{}')
+    elif rest[:2] == ['upgrade', '--install']:
+        Path(os.environ['OBSERVATION']).write_text(json.dumps(rest))
+    else:
+        raise AssertionError(rest)
 else:
     raise AssertionError(args)
 """

@@ -1,4 +1,7 @@
 import {SidebarToggleComponent} from '../../shell/sidebar-toggle/sidebar-toggle.component';
+import {WorkspacePickerComponent} from '../agent-settings/workspace-picker.component';
+import {WorkspaceChoice} from '../../core/models/workspace-template.model';
+import {choiceBackend, choiceRequestFields} from '../workspaces/workspace-template-utils';
 import {workspaceCreationFields, workspacePreviewConfig} from "../agent-settings/workspace-selection";
 import {Component, computed, effect, ElementRef, inject, OnInit, signal, ViewChild} from '@angular/core';
 import {ActivatedRoute, Router} from '@angular/router';
@@ -9,9 +12,12 @@ import {FileHandlingService} from '../../core/services/file-handling.service';
 import {JobArtifactService} from '../../core/services/job-artifact.service';
 import {UserService} from '../../core/services/user.service';
 import {ErrorMessageService} from '../../core/services/error-message.service';
-import {EffectiveModels, EligibleDatasource, Expert, ExpertDefaultsResponse, ExpertDetail, JobCreateRequest, Project} from '../../core/models/api.model';
+import {EffectiveModels, EligibleDatasource, Expert, ExpertDefaultsResponse, ExpertDetail, ExpertTemplateSource, JobCreateRequest, Project} from '../../core/models/api.model';
 import {FilePreview, UploadStatus} from '../../core/models/file.model';
+import {hasGrant} from '../agent-settings/capability-gates';
 import {AgentSettingsComponent} from '../agent-settings/agent-settings.component';
+import {ExpertPickerComponent} from '../agent-settings/expert-picker.component';
+import {executionManifest, inlineExpertSelection, toYaml} from '../agent-settings/execution-request';
 import {PRIORITY_LEVELS, resolveEffectiveModels} from '../agent-settings/agent-settings.types';
 import {ModelService} from '../../core/services/model.service';
 import {TranslocoPipe} from '@jsverse/transloco';
@@ -20,10 +26,7 @@ import {AppIconButtonComponent} from '../../ui/icon-button';
 import {AppSelectComponent} from '../../ui/select';
 import {AppTextareaComponent} from '../../ui/textarea';
 import {AppIconComponent} from '../../ui/icon';
-import {AppSpinnerComponent} from '../../ui/spinner';
 import {AppFormFieldComponent} from '../../ui/form-field';
-import {AppSwitchComponent} from '../../ui/switch';
-import {AppTooltipDirective} from '../../ui/tooltip';
 
 /**
  * Job Create component for submitting new jobs with file upload support.
@@ -32,17 +35,14 @@ import {AppTooltipDirective} from '../../ui/tooltip';
   selector: 'app-job-create',
   standalone: true,
   imports: [
-    SidebarToggleComponent, AgentSettingsComponent,
+    SidebarToggleComponent, AgentSettingsComponent, WorkspacePickerComponent, ExpertPickerComponent,
     TranslocoPipe,
     AppButtonComponent,
     AppIconButtonComponent,
     AppSelectComponent,
     AppTextareaComponent,
     AppIconComponent,
-    AppSpinnerComponent,
     AppFormFieldComponent,
-    AppSwitchComponent,
-    AppTooltipDirective,
   ],
   template: `
     <div class="job-create-container">
@@ -75,227 +75,15 @@ import {AppTooltipDirective} from '../../ui/tooltip';
           </div>
         }
 
-        <form (submit)="$event.preventDefault(); onSubmit()">
-          <!-- Project Selector -->
-          @if (projects().length > 0) {
-            <app-form-field
-              [label]="'jobs.create.projectLabel' | transloco"
-              [hint]="'jobs.create.projectHint' | transloco"
-              [error]="selectedProjectIsArchived() ? ('jobs.create.projectArchivedWarning' | transloco) : ''"
-            >
-              <app-select
-                [value]="selectedProjectId() ?? ''"
-                (changed)="onProjectIdChange($event)"
-                [disabled]="isSubmitting()"
-              >
-                <option value="">{{ 'jobs.create.projectNone' | transloco }}</option>
-                @for (proj of projects(); track proj.id) {
-                  <option [value]="proj.id">
-                    {{ proj.name }}@if (proj.is_default) { {{ 'jobs.create.projectPersonal' | transloco }}}@if (proj.status === 'archived') { {{ 'jobs.create.projectArchived' | transloco }}}
-                  </option>
-                }
-              </app-select>
-            </app-form-field>
-          }
-
-          <!-- Description Field (Required) -->
-          <app-form-field [label]="'jobs.create.descriptionLabel' | transloco" [required]="true" [hint]="'jobs.create.descriptionHint' | transloco">
-            <app-textarea
-              [value]="formData.description"
-              (valueChange)="onDescriptionEdit($event)"
-              [required]="true"
-              [rows]="6"
-              [placeholder]="'jobs.create.descriptionPlaceholder' | transloco"
-              [disabled]="isSubmitting()"
-            />
-          </app-form-field>
-
-          <!-- Kickoff Message (optional opening prompt) -->
-          <app-form-field [label]="'jobs.create.kickoffLabel' | transloco" [hint]="'jobs.create.kickoffHint' | transloco">
-            <app-textarea
-              [value]="kickoffMessage"
-              (valueChange)="kickoffMessage = $event"
-              [rows]="3"
-              [placeholder]="'jobs.create.kickoffPlaceholder' | transloco"
-              [disabled]="isSubmitting()"
-            />
-          </app-form-field>
-
-          <!-- Expert Selector: worker experts by default (expert_type || tags);
-               "Show all experts" lists every role — the server accepts a
-               cross-role pick and resolves it on the worker overlay. -->
-          <div class="form-group">
-            <div class="form-label-row">
-              <label class="form-label">{{ 'jobs.create.expertLabel' | transloco }}</label>
-              <app-switch size="sm" [checked]="showAllExperts()" [disabled]="isSubmitting()" (changed)="setShowAllExperts($event)">
-                {{ 'experts.showAll' | transloco }}
-              </app-switch>
-            </div>
-            @if (isLoadingExperts()) {
-              <div class="expert-loading">
-                <app-spinner size="sm" />
-                {{ 'jobs.create.expertLoading' | transloco }}
-              </div>
-            } @else if (experts().length > 0) {
-              <div class="expert-grid">
-                @for (expert of experts(); track expert.id) {
-                  <button
-                    type="button"
-                    class="expert-card"
-                    [class.selected]="selectedExpert()?.id === expert.id"
-                    [appTooltip]="expert.description"
-                    tooltipPlacement="top"
-                    (click)="toggleExpert(expert)"
-                    [disabled]="isSubmitting()"
-                  >
-                    @if (selectedExpert()?.id === expert.id) {
-                      <app-icon size="lg" class="expert-check">check_circle</app-icon>
-                    }
-                    <app-icon size="inherit" class="expert-icon">{{ expert.icon }}</app-icon>
-                    <span class="expert-name">{{ expert.display_name }}</span>
-                    <span class="expert-desc">{{ expert.description }}</span>
-                    @if (pickerTags(expert).length > 0) {
-                      <div class="expert-tags">
-                        @for (tag of pickerTags(expert); track tag) {
-                          <span class="expert-tag">{{ tag }}</span>
-                        }
-                      </div>
-                    }
-                  </button>
-                }
-              </div>
-            }
-            <span class="field-hint">
-              @if (selectedExpert()) {
-                {{ 'jobs.create.expertSelectedPrefix' | transloco }} {{ selectedExpert()!.display_name }}
-                @if (selectedExpertSource()) {
-                  · {{ ('settings.expertDefaults.source.' + selectedExpertSource()) | transloco }}
-                }
-              } @else {
-                {{ 'jobs.create.expertHintUnselected' | transloco }}
-              }
-            </span>
-          </div>
-
-          <!-- File Upload Dropzone -->
-          <app-form-field [label]="'jobs.create.documentsLabel' | transloco" [hint]="'jobs.create.documentsOptional' | transloco">
-            <div
-              class="dropzone"
-              [class.dragover]="isDragOver()"
-              [class.has-files]="filePreviews().length > 0"
-              [class.disabled]="isSubmitting()"
-              (dragover)="onDragOver($event)"
-              (dragleave)="onDragLeave($event)"
-              (drop)="onDrop($event)"
-              (click)="triggerFileInput()"
-            >
-              @if (filePreviews().length === 0) {
-                <div class="dropzone-content">
-                  <app-icon size="inherit" class="dropzone-icon">upload_file</app-icon>
-                  <span class="dropzone-text">{{ 'jobs.create.dropHint' | transloco }}</span>
-                  <span class="dropzone-hint">{{ 'jobs.create.maxHint' | transloco:{ maxFiles: fileService.getJobUploadMaxFiles(), maxSizeMb: fileService.getJobUploadMaxFileSizeMB() } }}</span>
-                </div>
-              } @else {
-                <div class="file-list">
-                  @for (file of filePreviews(); track file.id) {
-                    <div class="file-item" [class.uploading]="file.uploadStatus === 'uploading'" [class.failed]="file.uploadStatus === 'failed'">
-                      @if (file.type === 'image' && file.preview) {
-                        <img [src]="file.preview" class="file-thumb" alt="">
-                      } @else {
-                        <app-icon size="lg" class="file-icon">{{ fileService.getFileIcon(file.type) }}</app-icon>
-                      }
-                      <div class="file-info">
-                        <span class="file-name">{{ file.name }}</span>
-                        <span class="file-size">{{ file.sizeFormatted }}</span>
-                        @if (file.error) {
-                          <span class="file-error">{{ file.error }}</span>
-                        }
-                      </div>
-                      @if (file.uploadStatus === 'uploading') {
-                        <div class="upload-progress">
-                          <div class="progress-bar" [style.width.%]="file.uploadProgress || 0"></div>
-                        </div>
-                      }
-                      @if (file.uploadStatus === 'completed') {
-                        <app-icon size="md" class="status-icon success">check_circle</app-icon>
-                      }
-                      @if (file.uploadStatus === 'failed') {
-                        <app-icon size="md" class="status-icon error">error</app-icon>
-                      }
-                      @if (file.uploadStatus === 'pending') {
-                        <app-icon size="md" class="status-icon pending">schedule</app-icon>
-                      }
-                      <app-icon-button
-                        variant="danger"
-                        size="sm"
-                        type="button"
-                        [ariaLabel]="'jobs.create.removeFile' | transloco"
-                        [disabled]="isSubmitting()"
-                        (clicked)="removeFile(file.id, $event)"
-                      >
-                        <app-icon size="sm">close</app-icon>
-                      </app-icon-button>
-                    </div>
-                  }
-                </div>
-                @if (!isSubmitting()) {
-                  <app-button
-                    type="button"
-                    variant="ghost"
-                    size="sm"
-                    [fullWidth]="true"
-                    class="add-more-btn"
-                    (clicked)="triggerFileInput()"
-                  >
-                    {{ 'jobs.create.addMore' | transloco }}
-                  </app-button>
-                }
-              }
-            </div>
-            <input
-              #fileInput
-              type="file"
-              multiple
-              accept=".pdf,.doc,.docx,.txt,.md,.png,.jpg,.jpeg,.gif,.webp,.zip"
-              (change)="onFilesSelected($event)"
-              style="display: none"
-            >
-          </app-form-field>
-
-          <!-- Priority -->
-          <app-form-field [label]="'jobs.create.priorityLabel' | transloco" [hint]="'jobs.create.priorityHint' | transloco">
-            <app-select
-              [value]="selectedPriority()"
-              (changed)="onPriorityChange($event)"
-              [disabled]="isSubmitting()"
-            >
-              @for (level of priorityLevels; track level.value) {
-                <option [value]="level.value">{{ getPriorityKey(level.value) | transloco }}</option>
-              }
-            </app-select>
-          </app-form-field>
-
-          <!-- Cloud Storage Access Override -->
-          @if (selectedProjectHasCloudStorage()) {
-            <app-form-field [label]="'jobs.create.cloudStorageLabel' | transloco" [hint]="'jobs.create.cloudStorageHint' | transloco">
-              <app-select
-                [value]="cloudStorageOverride()"
-                (changed)="onCloudStorageChange($event)"
-                [disabled]="isSubmitting()"
-              >
-                <option value="inherit">{{ 'jobs.create.cloudStorageInherit' | transloco }}</option>
-                <option value="readonly">{{ 'jobs.create.cloudStorageReadonly' | transloco }}</option>
-                <option value="readwrite">{{ 'jobs.create.cloudStorageReadwrite' | transloco }}</option>
-              </app-select>
-            </app-form-field>
-          }
-
-          <!-- Agent Settings (tabbed: Settings / Instructions / Advanced) -->
-        @if (expertDetail()?.workspace_preference?.backend; as preference) {
-          <p class="field-hint">{{ 'agentSettings.execution.workspaceRecommendation' | transloco:{tier: preference} }}</p>
-        }
+        <!-- novalidate: the page validates in onSubmit. Native constraint
+             validation would also judge fields in collapsed sections (Expert →
+             More renders every field, and a template value of 0 under a
+             min="1" input blocked Create with an unfocusable error). -->
+        <form novalidate (submit)="$event.preventDefault(); onSubmit()">
           <app-agent-settings
             mode="job"
+            [workspacePicker]="true"
+            [pickerBackend]="pickerBackend()"
             [config]="workspaceConfig()"
             [resolvedToolset]="toolPreview()"
             [readsResolvedToolset]="true"
@@ -311,13 +99,208 @@ import {AppTooltipDirective} from '../../ui/tooltip';
             [datasourceContextKey]="datasourceContextKey()"
             [datasourceDefaultsEnabled]="capabilities.datasourceScopeAutoAttachAvailable()"
             [loadingExpert]="isLoadingExpertDetail()"
-          (change)="loadToolPreview()"
+            [expertName]="selectedExpert()?.display_name ?? ''"
+            [expertSource]="selectedExpertSource()"
+            (change)="onSettingsChange()"
             (retryDatasources)="loadDatasources()"
             (instructionsChange)="onInstructionsChange($event)"
-          />
+          >
+            <div settingsTop class="task-fields">
+              <!-- Description Field (Required) -->
+              <app-form-field [label]="'jobs.create.descriptionLabel' | transloco" [required]="true" [hint]="'jobs.create.descriptionHint' | transloco">
+                <app-textarea
+                  [value]="formData.description"
+                  (valueChange)="onDescriptionEdit($event)"
+                  [required]="true"
+                  [rows]="5"
+                  [placeholder]="'jobs.create.descriptionPlaceholder' | transloco"
+                  [disabled]="isSubmitting()"
+                />
+              </app-form-field>
+
+              <!-- Project Selector -->
+              @if (projects().length > 0) {
+                <app-form-field
+                  [label]="'jobs.create.projectLabel' | transloco"
+                  [hint]="'jobs.create.projectHint' | transloco"
+                  [error]="selectedProjectIsArchived() ? ('jobs.create.projectArchivedWarning' | transloco) : ''"
+                >
+                  <app-select
+                    [value]="selectedProjectId() ?? ''"
+                    (changed)="onProjectIdChange($event)"
+                    [disabled]="isSubmitting()"
+                  >
+                    <option value="">{{ 'jobs.create.projectNone' | transloco }}</option>
+                    @for (proj of projects(); track proj.id) {
+                      <option [value]="proj.id">
+                        {{ proj.name }}@if (proj.is_default) { {{ 'jobs.create.projectPersonal' | transloco }}}@if (proj.status === 'archived') { {{ 'jobs.create.projectArchived' | transloco }}}
+                      </option>
+                    }
+                  </app-select>
+                </app-form-field>
+              }
+
+              <!-- Kickoff Message (optional opening prompt) -->
+              <app-form-field [label]="'jobs.create.kickoffLabel' | transloco" [hint]="'jobs.create.kickoffHint' | transloco">
+                <app-textarea
+                  [value]="kickoffMessage"
+                  (valueChange)="kickoffMessage = $event"
+                  [rows]="2"
+                  [placeholder]="'jobs.create.kickoffPlaceholder' | transloco"
+                  [disabled]="isSubmitting()"
+                />
+              </app-form-field>
+
+              <!-- File Upload Dropzone -->
+              <app-form-field [label]="'jobs.create.documentsLabel' | transloco" [hint]="'jobs.create.documentsOptional' | transloco">
+                <div
+                  class="dropzone"
+                  [class.dragover]="isDragOver()"
+                  [class.has-files]="filePreviews().length > 0"
+                  [class.disabled]="isSubmitting()"
+                  (dragover)="onDragOver($event)"
+                  (dragleave)="onDragLeave($event)"
+                  (drop)="onDrop($event)"
+                  (click)="triggerFileInput()"
+                >
+                  @if (filePreviews().length === 0) {
+                    <div class="dropzone-content">
+                      <app-icon size="inherit" class="dropzone-icon">upload_file</app-icon>
+                      <span class="dropzone-text">{{ 'jobs.create.dropHint' | transloco }}</span>
+                      <span class="dropzone-hint">{{ 'jobs.create.maxHint' | transloco:{ maxFiles: fileService.getJobUploadMaxFiles(), maxSizeMb: fileService.getJobUploadMaxFileSizeMB() } }}</span>
+                    </div>
+                  } @else {
+                    <div class="file-list">
+                      @for (file of filePreviews(); track file.id) {
+                        <div class="file-item" [class.uploading]="file.uploadStatus === 'uploading'" [class.failed]="file.uploadStatus === 'failed'">
+                          @if (file.type === 'image' && file.preview) {
+                            <img [src]="file.preview" class="file-thumb" alt="">
+                          } @else {
+                            <app-icon size="lg" class="file-icon">{{ fileService.getFileIcon(file.type) }}</app-icon>
+                          }
+                          <div class="file-info">
+                            <span class="file-name">{{ file.name }}</span>
+                            <span class="file-size">{{ file.sizeFormatted }}</span>
+                            @if (file.error) {
+                              <span class="file-error">{{ file.error }}</span>
+                            }
+                          </div>
+                          @if (file.uploadStatus === 'uploading') {
+                            <div class="upload-progress">
+                              <div class="progress-bar" [style.width.%]="file.uploadProgress || 0"></div>
+                            </div>
+                          }
+                          @if (file.uploadStatus === 'completed') {
+                            <app-icon size="md" class="status-icon success">check_circle</app-icon>
+                          }
+                          @if (file.uploadStatus === 'failed') {
+                            <app-icon size="md" class="status-icon error">error</app-icon>
+                          }
+                          @if (file.uploadStatus === 'pending') {
+                            <app-icon size="md" class="status-icon pending">schedule</app-icon>
+                          }
+                          <app-icon-button
+                            variant="danger"
+                            size="sm"
+                            type="button"
+                            [ariaLabel]="'jobs.create.removeFile' | transloco"
+                            [disabled]="isSubmitting()"
+                            (clicked)="removeFile(file.id, $event)"
+                          >
+                            <app-icon size="sm">close</app-icon>
+                          </app-icon-button>
+                        </div>
+                      }
+                    </div>
+                    @if (!isSubmitting()) {
+                      <app-button
+                        type="button"
+                        variant="ghost"
+                        size="sm"
+                        [fullWidth]="true"
+                        class="add-more-btn"
+                        (clicked)="triggerFileInput()"
+                      >
+                        {{ 'jobs.create.addMore' | transloco }}
+                      </app-button>
+                    }
+                  }
+                </div>
+                <input
+                  #fileInput
+                  type="file"
+                  multiple
+                  accept=".pdf,.doc,.docx,.txt,.md,.png,.jpg,.jpeg,.gif,.webp,.zip"
+                  (change)="onFilesSelected($event)"
+                  style="display: none"
+                >
+              </app-form-field>
+            </div>
+
+            <!-- Priority sits beside autonomy -->
+            <app-form-field settingsTopAside [label]="'jobs.create.priorityLabel' | transloco" [hint]="'jobs.create.priorityHint' | transloco">
+              <app-select
+                [value]="selectedPriority()"
+                (changed)="onPriorityChange($event)"
+                [disabled]="isSubmitting()"
+              >
+                @for (level of priorityLevels; track level.value) {
+                  <option [value]="level.value">{{ getPriorityKey(level.value) | transloco }}</option>
+                }
+              </app-select>
+            </app-form-field>
+
+            <!-- Expert templates: worker experts by default (expert_type || tags);
+                 "Show all experts" lists every role — the server accepts a
+                 cross-role pick and resolves it on the worker overlay. -->
+            <app-expert-picker
+              expertPicker
+              hideTag="worker"
+              [experts]="experts()"
+              [selectedId]="selectedExpert()?.id ?? null"
+              [loading]="isLoadingExperts()"
+              [disabled]="isSubmitting()"
+              [showAll]="showAllExperts()"
+              [defaultId]="effectiveDefaultExpertId()"
+              [defaultSource]="defaultExpertSource()"
+              (picked)="toggleExpert($event)"
+              (showAllChange)="setShowAllExperts($event)"
+            />
+
+            <app-workspace-picker
+              workspacePicker
+              role="job"
+              labelKey="agentSettings.workspacePicker.templateLabel"
+              [projectId]="selectedProjectId()"
+              [preview]="toolPreview()?.workspace ?? null"
+              [recommendation]="expertDetail()?.workspace_preference?.backend ?? null"
+              [recommendedBy]="selectedExpert()?.display_name ?? ''"
+              [disabled]="isSubmitting()"
+              [choice]="workspaceChoice()"
+              (choiceChange)="onWorkspaceChoice($event)"
+            />
+            @if (noShellNoteKey(); as noteKey) {
+              <span workspacePicker class="field-warning" data-testid="no-shell-note">{{ noteKey | transloco }}</span>
+            }
+          </app-agent-settings>
+
+          @if (manifestOpen()) {
+            <section class="manifest-view" [attr.aria-label]="'agentSettings.manifest.title' | transloco">
+              <span class="manifest-title">{{ 'agentSettings.manifest.jobTitle' | transloco }}</span>
+              <pre class="manifest-yaml">{{ manifestText() }}</pre>
+            </section>
+          }
 
           <!-- Submit Button -->
           <div class="form-actions">
+            <app-button
+              type="button"
+              variant="ghost"
+              class="manifest-toggle"
+              (clicked)="toggleManifest()"
+            >
+              {{ (manifestOpen() ? 'agentSettings.manifest.hide' : 'agentSettings.manifest.show') | transloco }}
+            </app-button>
             <app-button
               type="button"
               variant="secondary"
@@ -330,7 +313,7 @@ import {AppTooltipDirective} from '../../ui/tooltip';
               type="submit"
               variant="primary"
               [loading]="isSubmitting() || isUploading()"
-              [disabled]="!formData.description || isLoadingDatasources() || datasourceLoadError() || isLoadingExpertDetail() || loadingWorkspacePreview()"
+              [disabled]="!formData.description || isLoadingDatasources() || datasourceLoadError() || isLoadingExpertDetail() || loadingWorkspacePreview() || !vmSizingValid()"
             >
               @if (isSubmitting()) {
                 {{ 'jobs.create.creating' | transloco }}
@@ -351,6 +334,12 @@ import {AppTooltipDirective} from '../../ui/tooltip';
         display: block;
         height: 100%;
         overflow: hidden;
+      }
+
+      .task-fields {
+        display: flex;
+        flex-direction: column;
+        gap: 4px;
       }
 
       .job-create-container {
@@ -386,6 +375,46 @@ import {AppTooltipDirective} from '../../ui/tooltip';
         overflow: auto;
         padding: 16px;
         container-type: inline-size;
+      }
+
+      .manifest-view {
+        display: flex;
+        flex-direction: column;
+        gap: 6px;
+        margin-top: 12px;
+        padding: 12px 14px;
+        border-radius: var(--radius-surface);
+        background: var(--surface-0);
+        border: 1px solid var(--border-hairline);
+      }
+
+      .manifest-title {
+        font-size: 12px;
+        font-weight: 600;
+        color: var(--text-secondary);
+      }
+
+      .manifest-yaml {
+        margin: 0;
+        max-height: 28rem;
+        overflow: auto;
+        font-family: 'JetBrains Mono', monospace;
+        font-size: 12px;
+        line-height: 1.55;
+        color: var(--text-primary);
+        white-space: pre;
+      }
+
+      .manifest-toggle {
+        margin-right: auto;
+      }
+
+      .form-container > form,
+      .form-container > .success-message,
+      .form-container > .error-message {
+        max-width: 52rem;
+        margin-left: auto;
+        margin-right: auto;
       }
 
       /* Messages */
@@ -731,110 +760,6 @@ import {AppTooltipDirective} from '../../ui/tooltip';
         color: var(--ctp-yellow, var(--warning));
       }
 
-      /* Expert Selector */
-      .expert-loading {
-        display: flex;
-        align-items: center;
-        gap: 8px;
-        padding: 16px;
-        color: var(--text-muted);
-        font-size: 13px;
-      }
-
-      .expert-grid {
-        display: grid;
-        grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
-        gap: 10px;
-      }
-
-      @container (max-width: 400px) {
-        .expert-grid {
-          grid-template-columns: 1fr;
-        }
-      }
-
-      .expert-card {
-        position: relative;
-        display: flex;
-        flex-direction: column;
-        align-items: flex-start;
-        gap: 6px;
-        padding: 14px;
-        min-width: 0;
-        overflow: hidden;
-        border: 1px solid var(--border-color, var(--surface-1));
-        border-radius: var(--radius-surface);
-        background: var(--surface-0, var(--surface-0));
-        cursor: pointer;
-        text-align: left;
-        transition: all 0.15s ease;
-        font-family: inherit;
-        color: var(--text-primary, var(--text-primary));
-      }
-
-      .expert-card:hover:not(:disabled) {
-        border-color: var(--accent-color);
-        background: color-mix(in srgb, var(--accent-color) 20%, transparent);
-      }
-
-      .expert-card.selected {
-        border-color: var(--accent-color);
-        background: color-mix(in srgb, var(--accent-color) 20%, transparent);
-        box-shadow: 0 0 0 1px var(--accent-color);
-      }
-
-      .expert-card:disabled {
-        opacity: 0.6;
-        cursor: not-allowed;
-      }
-
-      .expert-check {
-        position: absolute;
-        top: 8px;
-        right: 8px;
-        color: var(--accent-color);
-      }
-
-      .expert-icon {
-        font-size: 28px;
-        color: color-mix(in srgb, var(--accent-color) 25%, var(--text-secondary) 75%);
-      }
-
-      .expert-name {
-        font-size: 13px;
-        font-weight: 600;
-        color: var(--text-primary, var(--text-primary));
-        max-width: 100%;
-        overflow-wrap: break-word;
-      }
-
-      .expert-desc {
-        font-size: 11px;
-        color: var(--text-muted);
-        line-height: 1.4;
-        display: -webkit-box;
-        -webkit-line-clamp: 2;
-        -webkit-box-orient: vertical;
-        overflow: hidden;
-        overflow-wrap: break-word;
-        max-width: 100%;
-      }
-
-      .expert-tags {
-        display: flex;
-        flex-wrap: wrap;
-        gap: 4px;
-        margin-top: 2px;
-      }
-
-      .expert-tag {
-        font-size: 10px;
-        padding: 1px 6px;
-        border-radius: var(--radius-tag);
-        background: color-mix(in srgb, var(--accent-color) 8%, transparent);
-        color: color-mix(in srgb, var(--accent-color) 35%, var(--text-secondary) 65%);
-      }
-
       /* Dropzone */
       .dropzone {
         border: 2px dashed var(--border-color, var(--surface-1));
@@ -1119,10 +1044,6 @@ import {AppTooltipDirective} from '../../ui/tooltip';
           padding: 10px;
         }
 
-        .expert-card {
-          padding: 10px;
-        }
-
         .tool-toggle {
           padding: 6px 8px;
         }
@@ -1155,6 +1076,7 @@ export class JobCreateComponent implements OnInit {
 
   @ViewChild('fileInput') fileInput!: ElementRef<HTMLInputElement>;
   @ViewChild(AgentSettingsComponent) agentSettings!: AgentSettingsComponent;
+  @ViewChild(WorkspacePickerComponent) picker?: WorkspacePickerComponent;
 
   constructor() {
     // Mirror artifact form-state (expert prefill / user edits) into the
@@ -1198,12 +1120,21 @@ export class JobCreateComponent implements OnInit {
    *  usable in every role; the picker's role is pre-selected, not enforced). */
   readonly showAllExperts = signal(false);
   readonly selectedExpert = signal<Expert | null>(null);
-  private readonly effectiveDefaultExpertId = signal<string | null>(null);
+  readonly effectiveDefaultExpertId = signal<string | null>(null);
+  /** Where the effective default came from — labels its card. Unlike
+   *  `selectedExpertSource` it does not flip to `explicit` on a pick. */
+  readonly defaultExpertSource = signal<'project' | 'user' | 'application' | 'explicit' | null>(null);
   readonly selectedExpertSource = signal<'project' | 'user' | 'application' | 'explicit' | null>(null);
   private expertSelectionTouched = false;
   private defaultRequestSerial = 0;
   readonly isLoadingExperts = signal(false);
   readonly expertDetail = signal<ExpertDetail | null>(null);
+  /** The selected Expert's authored content — what a changed template's
+   *  inline copy is built from. Null while loading, or when it cannot be read
+   *  (the form then sends selector + overrides, as before). */
+  readonly expertTemplate = signal<ExpertTemplateSource | null>(null);
+  readonly manifestOpen = signal(false);
+  readonly manifestText = signal('');
   readonly isLoadingExpertDetail = signal(false);
 
   readonly selectedPriority = signal<number>(5);
@@ -1232,29 +1163,15 @@ export class JobCreateComponent implements OnInit {
     this.loadToolPreview();
   }
 
-  onCloudStorageChange(value: string | null): void {
-    if (value === 'inherit' || value === 'readonly' || value === 'readwrite') {
-      this.cloudStorageOverride.set(value);
-    }
-  }
-
   readonly projects = signal<Project[]>([]);
   readonly selectedProjectId = signal<string | null>(null);
 
-  readonly cloudStorageOverride = signal<'inherit' | 'readonly' | 'readwrite'>('inherit');
   /** A project reachable only through a `?project=` deep link can be archived;
    *  the form says so instead of pretending the job will be accepted. */
   readonly selectedProjectIsArchived = computed(() => {
     const pid = this.selectedProjectId();
     if (!pid) return false;
     return this.projects().find((p) => p.id === pid)?.status === 'archived';
-  });
-
-  readonly selectedProjectHasCloudStorage = computed(() => {
-    const pid = this.selectedProjectId();
-    if (!pid) return false;
-    const proj = this.projects().find((p) => p.id === pid);
-    return !!proj?.cloud_storage_url;
   });
 
   readonly availableDatasources = signal<EligibleDatasource[]>([]);
@@ -1353,6 +1270,7 @@ export class JobCreateComponent implements OnInit {
       if (serial !== this.defaultRequestSerial || this.expertSelectionTouched) return;
       this.effectiveDefaultExpertId.set(response?.defaults?.worker?.effective?.id ?? null);
       this.selectedExpertSource.set(response?.defaults?.worker?.source ?? null);
+      this.defaultExpertSource.set(response?.defaults?.worker?.source ?? null);
       this.applyEffectiveDefault();
     });
   }
@@ -1387,6 +1305,33 @@ export class JobCreateComponent implements OnInit {
   readonly workspaceConfig = computed(() => workspacePreviewConfig(
     this.expertDetail()?.config ?? this.frameworkDefaults() ?? {}, this.toolPreview()?.workspace,
   ));
+  readonly workspaceChoice = signal<WorkspaceChoice>({kind: 'default'});
+  readonly pickerBackend = computed(() => choiceBackend(this.workspaceChoice(), this.toolPreview()?.workspace));
+
+  /** Why a hand-picked container/VM workspace can't run commands for this Expert, or null.
+   *  A note only: it never blocks submit. Default is skipped on purpose (Helm makes most
+   *  installations' default Job workspace a container, so it would show on every Job). */
+  readonly noShellNoteKey = computed<string | null>(() => {
+    // While a preview (or the Expert detail that triggers one) is loading, the signal still
+    // holds the previous Expert's answer; saying "no shell" about that would be false.
+    if (this.loadingWorkspacePreview() || this.isLoadingExpertDetail()) return null;
+    const kind = this.workspaceChoice().kind;
+    if (kind !== 'ref' && kind !== 'inline') return null;
+    const backend = this.pickerBackend();
+    if (backend !== 'sandbox' && backend !== 'vm') return null;
+    const shell = this.toolPreview()?.categories?.['shell'];
+    // 'request': the user switched Shell off themselves, so it isn't a property of the Expert.
+    if (!shell || shell.state === 'on' || shell.decided_by === 'request') return null;
+    return hasGrant(this.capabilities.grants() ?? null, 'shell_tools')
+      ? 'jobs.create.noShellNoteGranted'
+      : 'jobs.create.noShellNoteNoGrant';
+  });
+
+  onWorkspaceChoice(choice: WorkspaceChoice): void {
+    this.workspaceChoice.set(choice);
+    this.loadToolPreview();
+  }
+
   private toolPreviewSerial = 0;
   private expertDetailSerial = 0;
   readonly loadingWorkspacePreview = signal(false);
@@ -1420,7 +1365,7 @@ export class JobCreateComponent implements OnInit {
     this.api
       .previewToolGroups({
       config_override: this.agentSettings?.getOverrides() ?? {},
-      workspace_preference: this.expertDetail()?.workspace_preference?.backend ?? null,
+        ...choiceRequestFields(this.workspaceChoice()),
         expert_type: 'worker',
         config_name: isBundled ? expert!.id : null,
         expert_id: isDbExpert ? expert!.id : null,
@@ -1440,6 +1385,11 @@ export class JobCreateComponent implements OnInit {
   private fetchExpertDetail(expertId: string): void {
     const serial = ++this.expertDetailSerial;
     this.expertDetail.set(null);
+    this.expertTemplate.set(null);
+    const selected = this.selectedExpert();
+    this.api.getExpertTemplate(selected?.id === expertId ? selected : {id: expertId}).subscribe((template) => {
+      if (serial === this.expertDetailSerial) this.expertTemplate.set(template);
+    });
     this.isLoadingExpertDetail.set(true);
     this.api.getExpertDetail(expertId, {accountDefaults: true, role: "worker"}).subscribe({
       next: (detail) => {
@@ -1473,8 +1423,10 @@ export class JobCreateComponent implements OnInit {
     this.datasourceLoadError.set(false);
     // The server applies execution authorization and scope for this exact
     // project, then marks owner-specific defaults. Re-fetch on context change.
+    // Only what a job can attach: a project's cloud folder mounts in
+    // sessions, never in a job.
     const pid = this.selectedProjectId();
-    this.api.getEligibleDatasources(pid ? [pid] : []).subscribe({
+    this.api.getEligibleDatasources(pid ? [pid] : [], 'job').subscribe({
       next: (datasources) => {
         if (serial !== this.datasourceRequestSerial) return;
         this.availableDatasources.set(datasources);
@@ -1629,10 +1581,14 @@ export class JobCreateComponent implements OnInit {
 
   // ===== Form Submission =====
 
+  vmSizingValid(): boolean {
+    return this.agentSettings?.vmSizingValid() ?? true;
+  }
+
   async onSubmit(): Promise<void> {
     if (
       !this.formData.description || this.isSubmitting() || this.isUploading() ||
-      this.isLoadingDatasources() || this.datasourceLoadError() || this.isLoadingExpertDetail() || this.loadingWorkspacePreview()
+      this.isLoadingDatasources() || this.datasourceLoadError() || this.isLoadingExpertDetail() || this.loadingWorkspacePreview() || !this.vmSizingValid()
     ) return;
     this.clearMessages();
 
@@ -1642,54 +1598,7 @@ export class JobCreateComponent implements OnInit {
     }
 
     this.isSubmitting.set(true);
-    const request: JobCreateRequest = { description: this.formData.description };
-
-    const expert = this.selectedExpert();
-    if (expert && !['default', 'defaults', 'worker_base'].includes(expert.id)) {
-      // DB-backed experts (source user/global) go via expert_id — the
-      // orchestrator resolves them into the job config. Bundled experts keep
-      // the config_name path. Fixes the config_name=<uuid> conflation.
-      if (expert.storage_kind === 'db' || ['user', 'global', 'managed'].includes(expert.source ?? '')) {
-        request.expert_id = expert.id;
-      } else {
-        request.config_name = expert.id;
-      }
-    }
-    if (this.uploadId) request.upload_id = this.uploadId;
-
-    // Collect overrides from the settings component
-    const workspaceFields = workspaceCreationFields(this.agentSettings?.getOverrides() ?? {}, this.toolPreview()?.workspace);
-    if ("workspace" in workspaceFields) request.workspace = workspaceFields.workspace;
-    const configOverride = workspaceFields.config_override;
-    if (configOverride && Object.keys(configOverride).length > 0) {
-      request.config_override = configOverride;
-    }
-
-    const instructions = this.agentSettings?.getInstructions();
-    if (instructions) request.instructions = instructions;
-    if (this.kickoffMessage.trim()) request.kickoff_message = this.kickoffMessage.trim();
-
-    const dsIds = this.agentSettings?.getSelectedDatasourceIds() ?? [];
-    // Empty is an explicit opt-out; omission means "apply server defaults".
-    request.datasource_ids = dsIds;
-
-    const projectId = this.selectedProjectId();
-    if (projectId) request.project_id = projectId;
-
-    const priority = this.selectedPriority();
-    if (priority !== 5) request.priority = priority;
-
-    // Cloud storage override
-    const csOverride = this.cloudStorageOverride();
-    if (csOverride !== 'inherit') {
-      request.context = {
-        ...(request.context ?? {}),
-        cloud_storage_read_only: csOverride === 'readonly',
-      };
-    }
-
-    const currentUserId = this.userService.currentUserId();
-    if (currentUserId) request.user_id = currentUserId;
+    const request = this.buildRequest();
 
     this.api.createJob(request).subscribe({
       next: (job) => {
@@ -1706,6 +1615,103 @@ export class JobCreateComponent implements OnInit {
         this.errorMessage.set(this.errors.translate(err, 'errors.jobs.createFailed'));
       },
     });
+  }
+
+  /**
+   * The request Create sends: the Expert (selector, or a complete inline copy
+   * when the form changed the template), the workspace, the connectors, and
+   * the task-level settings beside them — no Expert overrides on a baseline
+   * (creation_ui_expert_workspace_connectors.md D2).
+   */
+  buildRequest(): JobCreateRequest {
+    const request: JobCreateRequest = { description: this.formData.description };
+    const settings = this.agentSettings;
+
+    const selected = this.selectedExpert();
+    const expert = selected && !['default', 'defaults', 'worker_base'].includes(selected.id) ? selected : null;
+    const template = this.expertTemplate();
+    const inline = !!(expert && template && settings?.hasExpertChanges());
+
+    let overrides: Record<string, unknown>;
+    if (inline) {
+      const instructions = settings?.instructionsTab?.isModified() ? (settings.getInstructions() ?? '') : null;
+      request.expert = inlineExpertSelection(template!, settings!.getExpertOverrides(), instructions);
+      request.expert_based_on = expert!.id;
+      overrides = settings!.getTaskOverrides();
+    } else {
+      if (expert) {
+        // DB-backed experts (source user/global) go via expert_id — the
+        // orchestrator resolves them into the job config. Bundled experts keep
+        // the config_name path. Fixes the config_name=<uuid> conflation.
+        if (expert.storage_kind === 'db' || ['user', 'global', 'managed'].includes(expert.source ?? '')) {
+          request.expert_id = expert.id;
+        } else {
+          request.config_name = expert.id;
+        }
+      }
+      // An untouched template sends nothing but its job-level settings; the
+      // legacy override path stays only where no inline copy can be built.
+      overrides = expert && template && !settings?.hasExpertChanges()
+        ? (settings?.getTaskOverrides() ?? {})
+        : (settings?.getOverrides() ?? {});
+      const instructions = settings?.getInstructions();
+      if (instructions && !(expert && template)) request.instructions = instructions;
+    }
+    if (this.uploadId) request.upload_id = this.uploadId;
+
+    const workspaceFields = workspaceCreationFields(overrides, this.workspaceChoice());
+    if ("workspace" in workspaceFields) request.workspace = workspaceFields.workspace;
+    const configOverride = workspaceFields.config_override;
+    if (configOverride && Object.keys(configOverride).length > 0) {
+      request.config_override = configOverride;
+    }
+
+    if (this.kickoffMessage.trim()) request.kickoff_message = this.kickoffMessage.trim();
+
+    // Empty is an explicit opt-out; omission means "apply server defaults".
+    request.datasource_ids = settings?.getSelectedDatasourceIds() ?? [];
+
+    const projectId = this.selectedProjectId();
+    if (projectId) request.project_id = projectId;
+
+    const priority = this.selectedPriority();
+    if (priority !== 5) request.priority = priority;
+
+    const currentUserId = this.userService.currentUserId();
+    if (currentUserId) request.user_id = currentUserId;
+    return request;
+  }
+
+  onSettingsChange(): void {
+    this.loadToolPreview();
+    this.refreshManifest();
+  }
+
+  toggleManifest(): void {
+    this.manifestOpen.set(!this.manifestOpen());
+    this.refreshManifest();
+  }
+
+  /** The read-only manifest view of exactly what Create would send. */
+  refreshManifest(): void {
+    if (!this.manifestOpen()) return;
+    const request = this.buildRequest();
+    const project = this.projects().find((p) => p.id === request.project_id);
+    const selected = new Set(request.datasource_ids ?? []);
+    const settings: Record<string, unknown> = {...(request.config_override ?? {})};
+    if (request.priority !== undefined) settings['priority'] = request.priority;
+    if (request.kickoff_message) settings['kickoff_message'] = request.kickoff_message;
+    const doc = executionManifest({
+      kind: 'job',
+      name: this.formData.description.split(/\s+/).slice(0, 6).join(' '),
+      projectName: project ? project.name : null,
+      task: request.description,
+      expert: request.expert ?? request.config_name ?? request.expert_id ?? null,
+      workspace: request.workspace,
+      connectors: this.availableDatasources().filter((d) => selected.has(d.id)).map((d) => ({id: d.id, name: d.name})),
+      settings,
+    });
+    this.manifestText.set(toYaml(doc));
   }
 
   private async uploadFiles(): Promise<boolean> {
@@ -1753,7 +1759,8 @@ export class JobCreateComponent implements OnInit {
     this.expertSelectionTouched = false;
     this.expertDetail.set(null);
     this.selectedPriority.set(5);
-    this.cloudStorageOverride.set('inherit');
+    this.workspaceChoice.set({kind: 'default'});
+    this.picker?.reset();
     this.agentSettings?.resetAll();
     this.selectDefaultProject(this.projects());
     this.afterProjectSelection();

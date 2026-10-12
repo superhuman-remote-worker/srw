@@ -201,6 +201,147 @@ def single_origin_svc(db, k8s_core_api, k8s_networking_api):
     )
 
 
+@pytest.fixture
+def rancher_svc(db, k8s_core_api, k8s_networking_api):
+    # Captured 329f route shape: deployment's only expected annotation plus
+    # Rancher's informational endpoint annotation. All actor/route identities
+    # remain the exact test fixture's current binding.
+    return SessionRouterService(
+        namespace="srw",
+        ingress_host="api.srw.works",
+        ingress_class="traefik",
+        annotations={"traefik.ingress.kubernetes.io/router.priority": "1000"},
+        db=db,
+        core_api=k8s_core_api,
+        networking_api=k8s_networking_api,
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("arrival", ["created-read", "final-read"])
+async def test_rancher_endpoint_annotation_cannot_break_exact_route_publication(
+    rancher_svc,
+    k8s_networking_api,
+    arrival,
+):
+    read = k8s_networking_api.read_namespaced_ingress.side_effect
+    observed = 0
+
+    def read_with_rancher(**kwargs):
+        nonlocal observed
+        resource = read(**kwargs)
+        observed += 1  # Excludes the initial 404 before creation.
+        if observed >= (1 if arrival == "created-read" else 2):
+            k8s_networking_api._ingresses[kwargs["name"]]["metadata"]["annotations"][
+                "field.cattle.io/publicEndpoints"
+            ] = "[]"
+            resource["metadata"]["annotations"]["field.cattle.io/publicEndpoints"] = (
+                "[]"
+            )
+        return resource
+
+    k8s_networking_api.read_namespaced_ingress.side_effect = read_with_rancher
+    assert (
+        await rancher_svc.ensure_route(
+            THREAD_ID,
+            POD_NAME,
+            POD_UID,
+            RUNTIME_GENERATION,
+        )
+        == f"/p/{THREAD_ID}"
+    )
+    assert observed == 2
+    # A second /connection sees the populated route before any Pod mutation.
+    assert (
+        await rancher_svc.ensure_route(
+            THREAD_ID,
+            POD_NAME,
+            POD_UID,
+            RUNTIME_GENERATION,
+        )
+        == f"/p/{THREAD_ID}"
+    )
+
+
+@pytest.mark.parametrize("as_model", [False, True], ids=["dict", "k8s-model"])
+@pytest.mark.parametrize(
+    "change",
+    [
+        "rancher-only",
+        "wrong-priority",
+        "missing-priority",
+        "extra-middleware",
+        "extra-class",
+        "other-extra",
+    ],
+)
+def test_only_rancher_informational_annotation_is_ignored(
+    rancher_svc,
+    as_model,
+    change,
+):
+    from kubernetes import client as k8s_client
+
+    name = f"session-{THREAD_ID}"
+    ingress = rancher_svc._ingress_body(
+        THREAD_ID,
+        name,
+        POD_NAME,
+        POD_UID,
+        RUNTIME_GENERATION,
+    )
+    annotations = ingress["metadata"]["annotations"]
+    annotations["field.cattle.io/publicEndpoints"] = "[]"
+    if change == "wrong-priority":
+        annotations["traefik.ingress.kubernetes.io/router.priority"] = "1"
+    elif change == "missing-priority":
+        del annotations["traefik.ingress.kubernetes.io/router.priority"]
+    elif change == "extra-middleware":
+        annotations["traefik.ingress.kubernetes.io/router.middlewares"] = (
+            "foreign@kubernetescrd"
+        )
+    elif change == "extra-class":
+        annotations["kubernetes.io/ingress.class"] = "nginx"
+    elif change == "other-extra":
+        annotations["unrelated.example/annotation"] = "other"
+    if as_model:
+        ingress = k8s_client.ApiClient()._ApiClient__deserialize_model(
+            ingress,
+            k8s_client.V1Ingress,
+        )
+    assert rancher_svc._ingress_matches(
+        ingress,
+        thread_id=THREAD_ID,
+        name=name,
+        pod_name=POD_NAME,
+        pod_uid=POD_UID,
+        runtime_generation=RUNTIME_GENERATION,
+        namespace="srw",
+    ) is (change == "rancher-only")
+
+
+def test_configured_rancher_annotation_still_requires_its_configured_value(rancher_svc):
+    name = f"session-{THREAD_ID}"
+    ingress = rancher_svc._ingress_body(
+        THREAD_ID,
+        name,
+        POD_NAME,
+        POD_UID,
+        RUNTIME_GENERATION,
+    )
+    rancher_svc._annotations["field.cattle.io/publicEndpoints"] = "configured"
+    ingress["metadata"]["annotations"]["field.cattle.io/publicEndpoints"] = "[]"
+    assert not rancher_svc._ingress_matches(
+        ingress,
+        thread_id=THREAD_ID,
+        name=name,
+        pod_name=POD_NAME,
+        pod_uid=POD_UID,
+        runtime_generation=RUNTIME_GENERATION,
+        namespace="srw",
+    )
+
+
 @pytest.mark.asyncio
 async def test_single_origin_route_is_hostless_and_reconciles(
     single_origin_svc, k8s_networking_api

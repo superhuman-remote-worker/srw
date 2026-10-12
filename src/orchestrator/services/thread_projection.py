@@ -1,0 +1,192 @@
+"""Owner-facing projection of persistent-thread rows (R1.B10).
+
+A thread row carries credentials, internal lifecycle capabilities and immutable
+cleanup evidence next to the fields a Cockpit renders. Every REST surface that
+returns a thread row passes it through :func:`redact_thread_metadata`; replayed
+history passes its stored tool calls through :func:`stamp_tool_categories`.
+
+Both functions are pure: no database, network or application state.
+"""
+
+from __future__ import annotations
+
+import json
+from collections.abc import Mapping
+from typing import Any
+from uuid import UUID
+
+from orchestrator.security.access import redact_config_override
+from orchestrator.services.cloud_mount_sidecar import PLAN_CONTEXT_KEY
+from orchestrator.services.container_provisioner import (
+    WORKSPACE_RUNTIME_INCARNATION_KEY,
+)
+from orchestrator.services.job_projection import redact_nested_workspace_state
+from shared.session_retirement import stateless_settled_retirement_authority
+from shared.session_pending_memory import SESSION_PENDING_MEMORY_KEY
+from shared.tool_catalog import TOOL_REGISTRY
+
+
+def redact_thread_metadata(thread: dict[str, Any]) -> dict[str, Any]:
+    """Parse and strip credential fields from a thread's ``metadata`` before
+    it leaves over REST.
+
+    ``metadata`` is a JSONB column asyncpg hands back as a JSON *string*.
+    This helper used to "re-serialize to the original representation", which
+    meant the owner-facing thread endpoints returned metadata as a string —
+    silently breaking every Cockpit consumer typed against
+    ``metadata?: Record<string, unknown>`` (settings-pane config/tools
+    prefill, the attached-datasource default, and the REST model/temperature
+    seeding — the long-standing "model shows the config name until the
+    welcome frame" oddity). The contract is now: metadata always leaves as a
+    parsed OBJECT (unparseable/absent → ``{}``).
+    """
+    original_metadata = thread.get("metadata")
+    raw_retirement_context = thread.get("runtime_retirement_context") or {}
+    if isinstance(raw_retirement_context, str):
+        try:
+            raw_retirement_context = json.loads(raw_retirement_context)
+        except (json.JSONDecodeError, TypeError):
+            raw_retirement_context = {}
+    # The token is installed before abortable turn/Officer preflight.  Only
+    # the append-only authorized edge is a public `ending` state; exposing the
+    # hidden preflight would make Cockpit retire control even when a non-force
+    # End is about to abort as an observational no-op.
+    retirement_pending = bool(
+        thread.get("runtime_retirement_token") is not None
+        and thread.get("runtime_retirement_authorized_at") is not None
+    )
+    retirement_disposition: str | None = None
+    if retirement_pending and isinstance(raw_retirement_context, Mapping):
+        candidate = str(raw_retirement_context.get("settle_status") or "")
+        if candidate in {"ended", "suspended"}:
+            retirement_disposition = candidate
+    retirement_permanent = bool(
+        retirement_pending and thread.get("runtime_retirement_permanent") is True
+    )
+    settled_permanent = False
+    if (
+        not retirement_pending
+        and thread.get("execution_lane") == "stateless"
+        and thread.get("status") == "ended"
+    ):
+        try:
+            settled = stateless_settled_retirement_authority(original_metadata)
+        except RuntimeError:
+            settled = None
+        settled_permanent = settled is not None and settled["permanent"] is True
+
+    thread = redact_nested_workspace_state(
+        thread,
+        field="metadata",
+        runtime_incarnation_key=WORKSPACE_RUNTIME_INCARNATION_KEY,
+    )
+    md = thread.get("metadata")
+    if isinstance(md, str):
+        try:
+            md = json.loads(md)
+        except (json.JSONDecodeError, TypeError):
+            md = {}
+    if not isinstance(md, dict):
+        md = {}
+    thread = dict(thread)
+    # The non-secret life identifier is already public on lifecycle events
+    # and /connection. Expose it while starting/ended too so an owner can
+    # distinguish an external Resume from a delayed pre-End status snapshot.
+    try:
+        thread["session_runtime_generation"] = str(
+            UUID(
+                str(
+                    thread.get(
+                        "runtime_generation", thread.get("session_runtime_generation")
+                    )
+                )
+            )
+        )
+    except (ValueError, TypeError, AttributeError):
+        thread["session_runtime_generation"] = None
+    md = dict(md)
+    if "config_override" in md:
+        md["config_override"] = redact_config_override(md["config_override"])
+    md.pop("_workspace_binding", None)
+    md.pop("_stateless_workspace_process_zero_observation", None)
+    # The agent's pending memory set (append-only context injection WP4):
+    # internal turn-to-turn state of up to 32 KiB, never an owner field.
+    md.pop(SESSION_PENDING_MEMORY_KEY, None)
+    workspace = md.get("workspace_container")
+    if isinstance(workspace, dict) and PLAN_CONTEXT_KEY in workspace:
+        # The Pod's recorded cloud mount plan names internal remotes and the
+        # account they use; the owner reads cloud_mount_status instead.
+        md["workspace_container"] = {
+            key: value for key, value in workspace.items() if key != PLAN_CONTEXT_KEY
+        }
+    thread["metadata"] = md
+    # A stateless End or permanent Delete holds its marker until the exact
+    # retirement settles; a retryable 503 leaves it pending until End,
+    # Delete or Resume is retried.  That is `ending`, not a settled End, and
+    # the retry the server accepts depends on its permanence.
+    if (
+        not retirement_pending
+        and thread.get("execution_lane") == "stateless"
+        and md.get("_stateless_workspace_retirement_pending") is True
+    ):
+        marker = md.get("_stateless_claim_retirement")
+        retirement_pending = True
+        retirement_disposition = "ended"
+        retirement_permanent = bool(
+            isinstance(marker, Mapping) and marker.get("permanent") is True
+        )
+    if not retirement_pending and settled_permanent:
+        # A soft End is complete, but a subsequent permanent Delete can have
+        # admitted exact disk cleanup and still own this row. Keep its card
+        # closed and polling until the durable End retry deletes the owner.
+        retirement_pending = True
+        retirement_disposition = "ended"
+        retirement_permanent = True
+    # These are internal capabilities or immutable physical cleanup evidence,
+    # not owner API fields.  Never let a broad SELECT * list/detail response
+    # leak them.  Cockpit gets only the durable, non-secret lifecycle shape.
+    for internal_key in (
+        "runtime_generation",
+        "runtime_attach_token",
+        "runtime_attach_abort_receipt",
+        "runtime_authority_exposed",
+        "runtime_retirement_token",
+        "runtime_retirement_permanent",
+        "runtime_retirement_started_at",
+        "runtime_retirement_authorized_at",
+        "runtime_retirement_context",
+        "runtime_retirement_stage_receipt",
+        "runtime_retirement_local_quiescence",
+        "runtime_retirement_actuator_request",
+        "runtime_retirement_external_cleanup",
+    ):
+        thread.pop(internal_key, None)
+    thread["runtime_retirement_pending"] = retirement_pending
+    thread["retirement_disposition"] = retirement_disposition
+    thread["retirement_permanent"] = retirement_permanent
+    return thread
+
+
+def stamp_tool_categories(messages: list[dict[str, Any]]) -> None:
+    """Annotate replayed tool calls with their registry category, in place.
+
+    The live SSE ``tool.started`` frame carries ``category`` (see graph.py's
+    ``_get_tool_category``), but the stored ``thread_messages.tool_calls`` JSONB
+    never did. Without this the cockpit's folded-chip summary buckets every
+    replayed call as "other", so one turn reads
+    "19× citations · 12× searches" while streaming and "38× steps" after a
+    reload — same turn, same data, different answer.
+
+    Derived at read time rather than persisted so that re-categorising a tool
+    doesn't need a backfill of historical rows. Unknown tools (renamed, removed,
+    or from another deployment) simply get no category and fall back to the
+    cockpit's "other" bucket, which is the honest answer.
+    """
+    for m in messages:
+        for tc in m.get("tool_calls") or []:
+            category = TOOL_REGISTRY.get(tc.get("name") or "", {}).get("category")
+            if category:
+                tc["category"] = category
+
+
+__all__ = ["redact_thread_metadata", "stamp_tool_categories"]

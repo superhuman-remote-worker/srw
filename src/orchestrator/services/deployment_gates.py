@@ -62,9 +62,12 @@ def mcp_datasources_enabled() -> bool:
 def datasource_defaults_on_omission() -> bool:
     """Temporary rollout gate for the root REST omission contract.
 
-    Cockpit always submits a reviewed explicit array and internal schedulers
-    call the default policy directly.  This gate protects older REST clients
-    that historically encoded "none" by omitting ``datasource_ids``.
+    Omitting ``datasource_ids`` always attaches the work's own platform-owned
+    connectors (the project's knowledge base and cloud folder); this gate
+    adds the owner's and the project's other defaults.  An explicit ``[]``
+    attaches nothing either way.  Cockpit always submits a reviewed explicit
+    array and internal schedulers call the default policy directly; the gate
+    protects older REST clients that encoded "none" by omission.
     """
     return os.getenv("DATASOURCE_DEFAULTS_ON_OMISSION", "false").lower().strip() in (
         "true",
@@ -83,15 +86,6 @@ def datasource_scope_auto_attach_v1_enabled() -> bool:
     return os.getenv(
         "DATASOURCE_SCOPE_AUTO_ATTACH_V1_ENABLED", "false"
     ).lower().strip() in ("true", "1", "yes")
-
-
-def mcp_stdio_enabled() -> bool:
-    """Whether MCP datasources may execute local stdio server commands."""
-    return os.getenv("MCP_STDIO_ENABLED", "").lower().strip() in (
-        "true",
-        "1",
-        "yes",
-    )
 
 
 def is_protected_cloud_mode_enabled() -> bool:
@@ -131,7 +125,6 @@ __all__ = [
     "is_protected_cloud_mode_enabled",
     "is_skills_db_enabled",
     "mcp_datasources_enabled",
-    "mcp_stdio_enabled",
     "require_pinned_status_identity",
     "stateless_idle_conversation_rewind_enabled",
 ]

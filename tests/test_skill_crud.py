@@ -16,6 +16,7 @@ from fastapi import HTTPException
 from unittest.mock import AsyncMock
 
 import orchestrator.main as orchestrator_main
+from orchestrator.services import deployment_gates as deployment_gates_module
 
 
 GOOD = "---\nname: my-helper\ndescription: Use when X.\n---\n# My Helper\n"
@@ -89,10 +90,10 @@ def test_validate_frontmatter_allows_clean():
 
 @pytest.mark.asyncio
 async def test_ordinary_resolved_catalog_excludes_managed_app_guide(monkeypatch):
-    monkeypatch.setattr(orchestrator_main, "_is_skills_db_enabled", lambda: True)
+    monkeypatch.setattr(deployment_gates_module, "is_skills_db_enabled", lambda: True)
     monkeypatch.setattr(catalogue_state(), "skills", catalogue_service().scan_skills())
     monkeypatch.setattr(
-        orchestrator_main.postgres_db,
+        orchestrator_main.app.state.resources.postgres_db,
         "list_skills_visible",
         AsyncMock(return_value=[]),
     )
@@ -130,10 +131,10 @@ def test_scan_skills_hides_catalog_hidden_skills():
 async def test_resolved_catalog_never_offers_the_phase_skills(monkeypatch):
     from shared.runtime.core.loader import PHASE_SKILL_NAMES
 
-    monkeypatch.setattr(orchestrator_main, "_is_skills_db_enabled", lambda: True)
+    monkeypatch.setattr(deployment_gates_module, "is_skills_db_enabled", lambda: True)
     monkeypatch.setattr(catalogue_state(), "skills", catalogue_service().scan_skills())
     monkeypatch.setattr(
-        orchestrator_main.postgres_db,
+        orchestrator_main.app.state.resources.postgres_db,
         "list_skills_visible",
         AsyncMock(return_value=[]),
     )

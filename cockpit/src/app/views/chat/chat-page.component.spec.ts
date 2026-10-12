@@ -65,6 +65,7 @@ function createFixture(options: {
   );
   const chat = {
     threadId: signal<string | null>(null),
+    deletedThreadId: signal<string | null>(null),
     isConnected: signal(false),
     isStartingSession: signal(false),
     sessionReady: signal(false),
@@ -230,6 +231,27 @@ describe('ChatPageComponent Canvas route selection', () => {
     params.next(convertToParamMap({threadId: 'thread-3'}));
     expect(canvas.selectThread).toHaveBeenCalledTimes(2);
     expect(chat.connect).toHaveBeenCalledTimes(2);
+  });
+
+  it('leaves only the route whose ending thread was confirmed deleted', () => {
+    const {component, params, chat, router} = createFixture({threadId: 'thread-1'});
+    component.ngOnInit();
+    chat.threadId.set('thread-1');
+    TestBed.tick();
+
+    chat.deletedThreadId.set('thread-1');
+    TestBed.tick();
+    expect(router.navigate).toHaveBeenCalledWith(['/sessions']);
+
+    router.navigate.mockClear();
+    params.next(convertToParamMap({threadId: 'thread-2'}));
+    chat.threadId.set('thread-2');
+    chat.deletedThreadId.set(null);
+    TestBed.tick();
+    // A callback for the old route arrives after the new route is active.
+    chat.deletedThreadId.set('thread-1');
+    TestBed.tick();
+    expect(router.navigate).not.toHaveBeenCalled();
   });
 
   it('keeps the root route as a Canvas-free instant draft', () => {

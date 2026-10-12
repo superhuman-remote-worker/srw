@@ -27,6 +27,7 @@ from typing import (
 )
 from urllib.parse import urlparse
 
+from shared.connectors.builtin import DATASOURCE_SPECS
 from shared.runtime.core.datasource_catalog import DATASOURCE_TYPES
 from shared.runtime.core.product_capabilities import (
     ComponentProvenance,
@@ -67,6 +68,11 @@ class SessionRuntimeFacts:
     backend_supports_canvas_live_apps: bool
     backend_supports_shared_browser: bool
     attached_datasource_types: tuple[str, ...] = ()
+    #: What the attached connectors' drivers deliver (their specs): the tool
+    #: categories they bind and whether one is a knowledge index. The
+    #: capabilities ask these, never a connector type.
+    attached_tool_categories: tuple[str, ...] = ()
+    knowledge_index_attached: bool = False
     email_access_tier: EmailAccessTier | None = None
     email_connection_failed: bool = False
     email_direct_send_enabled: bool = False
@@ -104,6 +110,10 @@ class SessionRuntimeFacts:
         if any(item not in DATASOURCE_TYPES for item in datasource_types):
             raise ValueError("SessionRuntimeFacts contains an unknown datasource type")
         object.__setattr__(self, "attached_datasource_types", datasource_types)
+        tool_categories = tuple(sorted(set(self.attached_tool_categories)))
+        if any(item not in TOOL_CATEGORIES for item in tool_categories):
+            raise ValueError("SessionRuntimeFacts contains an unknown tool category")
+        object.__setattr__(self, "attached_tool_categories", tool_categories)
 
         tool_names = tuple(sorted(set(self.loaded_tool_names)))
         if any(
@@ -144,7 +154,7 @@ class SessionRuntimeFacts:
             tuple(sorted(component_provenance.items(), key=lambda item: item[0].value)),
         )
 
-        email_attached = "email" in datasource_types
+        email_attached = EMAIL_TOOL_CATEGORY in tool_categories
         if email_attached and self.email_access_tier is None:
             raise ValueError("attached email requires an effective access tier")
         if self.email_access_tier is not None and not email_attached:
@@ -159,6 +169,14 @@ class SessionRuntimeFacts:
             )
         if self.protected_cloud_active and not self.cloud_mount_active:
             raise ValueError("protected cloud requires an active cloud mount")
+
+
+#: The tool categories a connector driver binds (from the built-in specs).
+TOOL_CATEGORIES: frozenset[str] = frozenset(
+    spec.tool_category for spec in DATASOURCE_SPECS if spec.tool_category
+)
+#: The mailbox capability's tool category.
+EMAIL_TOOL_CATEGORY = "email"
 
 
 @dataclass
@@ -223,6 +241,9 @@ class ToolContext:
     )
     datasources: Dict[str, Any] = field(default_factory=dict)
     config: Dict[str, Any] = field(default_factory=dict)
+    redaction_secrets: tuple = ()  # Credential values to withhold from this context's tool output that its
+    # own workspace does not reveal — a worktree child's fresh WorkspaceManager
+    # knows none of the parent's repository tokens (tool_output_redaction.py).
     _job_id: Optional[str] = None  # Direct job_id override
     citation_engine: Optional[Any] = None  # CitationEngine, imported lazily
     _source_registry: Dict[str, int] = field(
@@ -278,6 +299,13 @@ class ToolContext:
         default_factory=list
     )  # List[InstructionFileEntry]
     recall_store: Optional[Any] = None  # RecallStore instance (Memory Light)
+    memory_service: Optional[Any] = (
+        None  # The bound MemoryManager (agent.services.memory). Published by
+        # the worker (agent.py, after the graph build binds it) and the session
+        # (_setup_memory) once it exists, which is after tool loading; memory
+        # tools (memory_search) read it at call time and delegate to its
+        # extension_tools(). None: memory off, or not bound yet.
+    )
     shell_manager: Optional[Any] = None  # ShellManager (persistent terminal sessions)
     progress_committer: Optional[Any] = (
         None  # ProgressCommitter (src/core/progress_commit.py). Shared by the
@@ -389,6 +417,23 @@ class ToolContext:
         # set this before tool loading so lazy runtime construction can never
         # mistake their thread UUID for the legacy ``_job_id`` alias.
     )
+    _subagent_execution_lane: Optional[str] = (
+        None  # ``pinned``/``stateless`` for a session parent, fixed for the
+        # life of the session object. The delegate_agent description reads it
+        # at tool-build time, where no lease or authority may exist yet.
+    )
+    _session_subagent_batch_settle_contract: bool = (
+        False  # The attach payload advertised
+        # ``session_subagent_batch_settle_contract: 1``: the orchestrator can
+        # settle an interrupted delegation batch once. One of the three
+        # conditions of session fan-out (``agent.tools.delegation.fanout``);
+        # published with the parent kind and lane, before tools load.
+    )
+    _session_subagent_fanout: bool = (
+        False  # The orchestrator's operator switch for this session's lane
+        # (``session_subagent_fanout: true``), re-applied at every stateless
+        # claim. Another of the fan-out conditions (``fanout.py``).
+    )
     _session_parent_authority_provider: Optional[Callable[[], Any]] = (
         None  # Fresh pinned/stateless SessionParentAuthority for every child
         # persistence operation.  Stateless warm sessions repoint leases
@@ -402,7 +447,10 @@ class ToolContext:
         False  # True only while a stateless executor is feeding an orphaned
         # foreground child's evidence back through the abandoned parent turn.
         # delegate_agent fails closed for that turn: recovery evidence must
-        # not recursively create replacement child work.
+        # not recursively create replacement child work. A session allowed to
+        # fan out never sets or honours it (parallel_subagents D3): its
+        # recovery turn may delegate, and those children name the
+        # continuation event as their parent input.
     )
     parent_context_probe: Optional[Callable[[], Any]] = (
         None  # () -> ContextProbe of the parent's live ContextManager, stashed
@@ -487,27 +535,25 @@ class ToolContext:
         """Check if PostgreSQL connection is available."""
         return self.postgres_db is not None
 
-    def has_datasource(self, ds_type: str) -> bool:
-        """Check if a datasource of the given type is available.
+    def connection_for(self, category: str) -> Optional[Any]:
+        """The connection a tool category's tools use, or ``None``.
+
+        A managed connection (or the MCP manager) sits in ``datasources``
+        under the slot its driver's spec ties to the category
+        (``agent.connectors.slots``); a tool asks by its own category and
+        never names a connector type.
 
         Args:
-            ds_type: Datasource type (e.g. "neo4j", "postgresql", "mongodb")
-
-        Returns:
-            True if datasource is available
+            category: The tool category (e.g. "sql", "graph", "email")
         """
-        return ds_type in self.datasources and self.datasources[ds_type] is not None
+        from agent.connectors.slots import slot_for_category
 
-    def get_datasource(self, ds_type: str) -> Optional[Any]:
-        """Get a datasource connection by type.
+        slot = slot_for_category(category)
+        return self.datasources.get(slot) if slot else None
 
-        Args:
-            ds_type: Datasource type (e.g. "neo4j", "postgresql", "mongodb")
-
-        Returns:
-            Datasource connection object, or None if not available
-        """
-        return self.datasources.get(ds_type)
+    def has_connection_for(self, category: str) -> bool:
+        """Whether a tool category's connection is available."""
+        return self.connection_for(category) is not None
 
     def next_graph_progress(self) -> int:
         """Advance and return the graph-progress marker.
@@ -536,6 +582,19 @@ class ToolContext:
     def has_shell(self) -> bool:
         """Check if ShellManager is available for persistent terminal sessions."""
         return self.shell_manager is not None
+
+    def has_shell_tool(self) -> bool:
+        """Whether a shell-execution tool is actually bound for this agent.
+
+        Not the same as :meth:`has_shell`: a ShellManager exists whenever the
+        backend supports a shell, including for experts granted no shell tool
+        (writer, curator, ... with ``shell: []``). This reads the bound tool
+        names with the predicate that gates the prompt's ``{% if has_shell %}``
+        blocks. Empty until tool loading finishes, so it never over-claims.
+        """
+        from shared.runtime.core.loader import _has_shell_tools
+
+        return _has_shell_tools(set(self._resolved_tool_names or ()))
 
     def has_knowledge(self) -> bool:
         """Check if the knowledge base is available.

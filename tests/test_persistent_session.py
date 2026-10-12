@@ -53,7 +53,6 @@ def _make_config(**overrides):
     cfg.memory.pipeline.scorers = overrides.get("memory_scorers", [])
     cfg.memory.pipeline.retrievers = overrides.get("memory_retrievers", [])
     cfg.memory.observer_interval = 5
-    cfg.context_management.keep_recent_tool_results = 10
     cfg.context_management.keep_recent_messages = 50
     cfg.context_management.max_summary_length = 10000
     cfg.extra = overrides.get("extra", {})
@@ -394,6 +393,58 @@ class TestDeployBoundSkillWithoutDeploymentDir:
         path = "skills/cite-as-you-write/SKILL.md"
         assert session.workspace_manager.get_path(path).exists()
         assert "CITE BODY" in session.workspace_manager.read_file(path)
+
+
+class TestDeployLiteralInstructionFileWithoutDeploymentDir:
+    """A literal ``file:`` instruction reaches a session workspace from the blob.
+
+    Session 2c6d3e06 (2026-10-11): Design Studio's ``design_guide.md`` sat in
+    the frozen blob, but the session deploy only read literal files through a
+    deployment dir a session never has. The file never landed, and its
+    ``before_tool:write_file`` gate refused every write.
+    """
+
+    @staticmethod
+    def _session(tmp_path, resolved_instructions):
+        from shared.runtime.core.loader import InstructionFileEntry
+        from agent.core.workspace import WorkspaceManager
+        from tests._fs_backend import FilesystemTestBackend
+
+        cfg = _make_config(
+            extra={
+                "_resolved_skills": {},
+                "_resolved_instructions": resolved_instructions,
+            }
+        )
+        cfg._deployment_dir = None
+        cfg.instruction_files = [
+            InstructionFileEntry(
+                file="design_guide.md",
+                trigger="before_tool:write_file",
+                enforce=True,
+            )
+        ]
+        session = _make_session(config=cfg)
+        session.workspace_manager = WorkspaceManager(
+            job_id="t", backend=FilesystemTestBackend(tmp_path)
+        )
+        return session
+
+    def test_literal_file_deploys_from_the_frozen_blob(self, tmp_path):
+        session = self._session(tmp_path, {"design_guide": "GUIDE BODY"})
+
+        session._deploy_instruction_files()
+
+        assert "GUIDE BODY" in session.workspace_manager.read_file("design_guide.md")
+        assert [e.file for e in session.config.instruction_files] == ["design_guide.md"]
+
+    def test_undeliverable_file_drops_its_gate(self, tmp_path):
+        session = self._session(tmp_path, {})
+
+        session._deploy_instruction_files()
+
+        assert not session.workspace_manager.get_path("design_guide.md").exists()
+        assert session.config.instruction_files == []
 
 
 class TestSessionRegistersNoInstructionsProviders:
@@ -2562,6 +2613,40 @@ class TestSetupTools:
         assert "set_skill_bundle" in loaded_names
         assert "set_automation_bundle" in loaded_names
 
+    def test_stateless_lane_never_offers_a_workspace_upgrade(self, monkeypatch):
+        """The upgrade accept is a socket verb the stateless lane cannot carry,
+        so a lite stateless session must not be handed the tool whose offer
+        card could never be accepted (the agent would wait on a human decision
+        that cannot arrive)."""
+        monkeypatch.setenv("STATELESS_EXECUTOR", "1")
+        session = _make_session(config=_make_config())
+        session.workspace_manager = MagicMock()
+        session.workspace_manager.backend.supports_shell = False
+
+        with (
+            patch(
+                "agent.api.persistent_session.get_all_tool_names",
+                return_value=["web_search", "request_workspace_upgrade"],
+            ),
+            patch(
+                "agent.api.persistent_session.load_tools", return_value=[]
+            ) as mock_load,
+            patch(
+                "agent.api.persistent_session.apply_description_overrides",
+                side_effect=lambda x: x,
+            ),
+            patch(
+                "agent.api.persistent_session.apply_instruction_enforcement",
+                side_effect=lambda x, y: x,
+            ),
+            patch("agent.api.persistent_session.ToolContext"),
+        ):
+            session._setup_tools(None)
+
+        loaded_names = mock_load.call_args_list[0].args[0]
+        assert "web_search" in loaded_names
+        assert "request_workspace_upgrade" not in loaded_names
+
     def test_workflows_can_be_disabled(self):
         """Automations & Loops opt-out removes workflow tools."""
         cfg = _make_config(extra={"_workflows_disabled": True})
@@ -4030,6 +4115,24 @@ class TestCleanup:
 
         assert context._resolved_tool_names == []
         assert context.session_runtime_facts is None
+
+    @pytest.mark.asyncio
+    async def test_cleanup_stops_a_live_connector_change_still_cloning(self):
+        """live_connector_add_clones_on_the_event_loop: a live change's clone
+        runs in a worker thread, which no task cancel stops; cleanup sets its
+        cancel event, so it stops at its next step instead of running on
+        after the session."""
+        import threading
+
+        session = _make_session()
+        session.workspace_manager = MagicMock()
+        session.workspace_manager.backend = MagicMock(spec=[])
+        cancel = threading.Event()
+        session._live_change_cancel = cancel
+
+        await session.cleanup()
+
+        assert cancel.is_set()
 
     @pytest.mark.asyncio
     async def test_cleanup_shell_manager(self):

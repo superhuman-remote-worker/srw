@@ -17,6 +17,7 @@ Docker Compose mode is unaffected — agents use the static container pool.
 import asyncio
 import logging
 import os
+import re
 import shlex
 from datetime import datetime, timezone
 from typing import Any, Optional
@@ -48,6 +49,10 @@ from orchestrator.services.pinned_k8s_effect import (
     run_bounded_k8s_call,
     run_bounded_k8s_mutation,
 )
+from orchestrator.services.session_workspace_policy import (
+    AGENT_POD_STARTUP_ALLOWANCE_S,
+    session_pod_startup_allowance_s,
+)
 from orchestrator.services.session_runtime_admission import (
     ThreadRuntimeAuthority,
     same_thread_runtime_authority,
@@ -56,12 +61,292 @@ from orchestrator.services.session_runtime_admission import (
 
 logger = logging.getLogger(__name__)
 
+_SSH_GATEWAY_PUBLIC_HOST_KEY_DIR = "/run/secrets/ssh-gateway/host"
+_SSH_GATEWAY_PUBLIC_HOST_KEY_PATTERN = re.compile(
+    rf"{re.escape(_SSH_GATEWAY_PUBLIC_HOST_KEY_DIR)}/"
+    # Kubernetes Secret keys are at most 253 characters including the .pub suffix.
+    r"([A-Za-z0-9._-]{1,249})\.pub"
+)
+
+
+def _agent_gateway_public_key_config() -> tuple[str, tuple[str, ...], tuple[str, ...]]:
+    """Resolve the public-only gateway key projection for provisioned Pods."""
+    secret_metadata = os.environ.get("AGENT_SSH_GATEWAY_HOST_KEY_SECRET")
+    # Older gateway-enabled charts publish host-key paths for the orchestrator
+    # endpoint but do not opt provisioned agents into the public-only mount.
+    if secret_metadata is None:
+        return "", (), ()
+    path_list = os.environ.get("SSH_GATEWAY_PUBLIC_HOST_KEYS", "")
+    secret_name = secret_metadata.strip()
+    paths = tuple(path_list.split(","))
+    names: list[str] = []
+    for path in paths:
+        match = _SSH_GATEWAY_PUBLIC_HOST_KEY_PATTERN.fullmatch(path)
+        if match is None:
+            raise ValueError(
+                "SSH_GATEWAY_PUBLIC_HOST_KEYS must contain only absolute public .pub paths"
+            )
+        name = match.group(1)
+        if (
+            name == "."
+            or name.startswith("..")
+            or name.endswith(".pub")
+            or re.search(r"(?i)(rsa|ecdsa|dss|dsa)", name)
+        ):
+            raise ValueError("SSH_GATEWAY_PUBLIC_HOST_KEYS has an invalid key basename")
+        names.append(f"{name}.pub")
+    if not secret_name or not 1 <= len(names) <= 4 or len(set(names)) != len(names):
+        raise ValueError(
+            "SSH_GATEWAY_PUBLIC_HOST_KEYS requires a Secret and one to four unique .pub paths"
+        )
+    return secret_name, paths, tuple(names)
+
+
 # Must exceed the executor's 120s shutdown/abort budget plus local backend and
 # durable claimant-ACK drain. A shorter Kubernetes grace can SIGKILL the only
 # actor capable of proving SFTP quiescence and leave the loss ledger absorbing.
 STATELESS_CLAIMANT_EVICTION_GRACE_SECONDS = int(
     os.environ.get("STATELESS_CLAIMANT_EVICTION_GRACE_SECONDS", "180")
 )
+
+# Retention boundary for pooled stateless executor Pods, stamped by the chart
+# (helm/templates/agent/stateless-deployment.yaml). Claimant-loss debt settles
+# only on an observed exact UID with every container terminated; without this
+# finalizer the kubelet removes the object ~0.7 s after the containers stop and
+# the debt becomes unsettleable (a 404 is never process-zero proof). The
+# run_queue reaper releases it once the Pod is process-zero and no durable
+# claimant authority still names the UID.
+STATELESS_EXECUTOR_PROCESS_ZERO_FINALIZER = (
+    "lifecycle.srw.dev/stateless-executor-process-zero"
+)
+STATELESS_EXECUTOR_LABEL_SELECTOR = (
+    "srw/class=agent-stateless,app.kubernetes.io/component=agent-stateless"
+)
+STATELESS_EXECUTOR_READ_TIMEOUT = (5.0, 15.0)
+# The sanctioned human assertion that a node is powered off (non-graceful
+# node shutdown). PodGC force-deletes its Pods without any kubelet report.
+NODE_OUT_OF_SERVICE_TAINT = "node.kubernetes.io/out-of-service"
+
+
+class AgentPodObservationError(RuntimeError):
+    """The Kubernetes API could not answer (anything but an exact 404)."""
+
+
+def _executor_statuses(status: Any, field: str) -> list[Any] | None:
+    raw = getattr(status, field, None)
+    if raw is None:
+        return []
+    return list(raw) if isinstance(raw, (list, tuple)) else None
+
+
+def _executor_status_started(container: Any) -> bool:
+    state = getattr(container, "state", None)
+    last = getattr(container, "last_state", None)
+    return bool(
+        getattr(state, "running", None) is not None
+        or getattr(state, "terminated", None) is not None
+        or getattr(last, "running", None) is not None
+        or getattr(last, "terminated", None) is not None
+        or getattr(container, "container_id", None)
+        or getattr(container, "started", None) is True
+        or getattr(container, "ready", None) is True
+        or int(getattr(container, "restart_count", 0) or 0) != 0
+    )
+
+
+def _executor_containers_quiescent(pod: Any) -> bool:
+    """Every regular and init container terminated; no ephemeral one running.
+
+    ``pinned_k8s_effect.pod_containers_are_terminal`` also demands terminated
+    ephemeral statuses, but the kubelet's terminal rewrite never touches them:
+    a ``kubectl debug`` container whose image never pulled stays ``waiting``
+    forever and would retain the Pod indefinitely. An ephemeral container with
+    no start evidence has no process, so it is accepted; declared regular and
+    init containers must all report terminated.
+    """
+
+    spec = getattr(pod, "spec", None)
+    status = getattr(pod, "status", None)
+    for spec_field, status_field, unstarted_ok in (
+        ("containers", "container_statuses", False),
+        ("init_containers", "init_container_statuses", False),
+        ("ephemeral_containers", "ephemeral_container_statuses", True),
+    ):
+        statuses = _executor_statuses(status, status_field)
+        if statuses is None or (spec_field == "containers" and not statuses):
+            return False
+        declared = {str(c.name) for c in getattr(spec, spec_field, None) or []}
+        observed = {str(getattr(s, "name", "")) for s in statuses}
+        if not unstarted_ok and not declared.issubset(observed):
+            return False
+        for container in statuses:
+            state = getattr(container, "state", None)
+            if getattr(state, "terminated", None) is not None:
+                continue
+            if unstarted_ok and not _executor_status_started(container):
+                continue
+            return False
+    return True
+
+
+def _deleting_executor_never_scheduled(pod: Any) -> bool:
+    """A deleting Pod without ``nodeName`` never ran any process.
+
+    Mirrors the workspace rule (container_provisioner.
+    ``_deleting_pod_was_never_scheduled``; duplicated rather than imported to
+    keep this module free of a provisioner-to-provisioner import): the binding
+    subresource refuses a Pod that is being deleted, so no kubelet can ever
+    start its containers. The phase is deliberately not consulted: PodGC's
+    unscheduled-terminating sweep flips such a Pod to ``Failed`` before its
+    force delete, and a phase gate would then retain it forever. Any
+    contradictory container status is ambiguous.
+    """
+
+    spec = getattr(pod, "spec", None)
+    status = getattr(pod, "status", None)
+    if getattr(spec, "node_name", None):
+        return False
+    for field in (
+        "container_statuses",
+        "init_container_statuses",
+        "ephemeral_container_statuses",
+    ):
+        statuses = _executor_statuses(status, field)
+        if statuses is None or any(_executor_status_started(s) for s in statuses):
+            return False
+    return True
+
+
+def _terminal_pod_never_started(pod: Any) -> bool:
+    """A Pod stopped around ``wait-for-orchestrator`` never ran its main process.
+
+    A Pod deleted during init, or between its init's exit and the first
+    regular container's start, keeps that container ``waiting:
+    PodInitializing`` forever: the kubelet's terminal rewrite never marks a
+    never-created container terminated, so the strict all-terminal rule would
+    retain the Pod indefinitely. The init exit code proves nothing (k3d
+    2026-10-11: deleted 09:53:39, init ran 09:53:40 and exited 0,
+    ``Initialized=True``, the agent never started). Require the kubelet's own
+    terminal phase, written only after every container stopped and never
+    followed by a start, every init container terminated, and no start
+    evidence on any regular container.
+    """
+
+    spec = getattr(pod, "spec", None)
+    status = getattr(pod, "status", None)
+    if getattr(status, "phase", None) not in {"Failed", "Succeeded"}:
+        return False
+    # PodGC writes a terminal phase for Pods on lost/out-of-service nodes
+    # without any kubelet having stopped them; their statuses are frozen.
+    if any(
+        getattr(condition, "type", None) == "DisruptionTarget"
+        and getattr(condition, "reason", None) == "DeletionByPodGC"
+        for condition in getattr(status, "conditions", None) or []
+    ):
+        return False
+    init_statuses = _executor_statuses(status, "init_container_statuses")
+    statuses = _executor_statuses(status, "container_statuses")
+    ephemeral = _executor_statuses(status, "ephemeral_container_statuses")
+    if not init_statuses or not statuses or ephemeral is None:
+        return False
+    for declared_field, observed in (
+        ("init_containers", init_statuses),
+        ("containers", statuses),
+    ):
+        declared = {str(c.name) for c in getattr(spec, declared_field, None) or []}
+        if not declared.issubset({str(getattr(s, "name", "")) for s in observed}):
+            return False
+    if any(
+        getattr(getattr(s, "state", None), "terminated", None) is None
+        for s in init_statuses
+    ):
+        return False
+    for container in statuses:
+        state = getattr(container, "state", None)
+        if getattr(state, "terminated", None) is not None:
+            continue
+        waiting = getattr(state, "waiting", None)
+        if getattr(
+            waiting, "reason", None
+        ) != "PodInitializing" or _executor_status_started(container):
+            return False
+    return all(
+        getattr(getattr(s, "state", None), "terminated", None) is not None
+        for s in ephemeral
+    )
+
+
+def stateless_executor_process_zero(pod: Any) -> bool:
+    """Whether one deleting executor Pod can never run a process again.
+
+    The finalizer-release predicate: every declared container observed
+    terminated (the exact-terminal proof the claimant-loss reconciler settles
+    on), or the Pod provably never started its executor. Running or frozen
+    statuses on a lost node are never container evidence; the reaper's
+    separate node-lost rule (Node absent or out-of-service) and an operator
+    attestation cover that case.
+    """
+
+    if getattr(getattr(pod, "metadata", None), "deletion_timestamp", None) is None:
+        return False
+    return (
+        _executor_containers_quiescent(pod)
+        or _deleting_executor_never_scheduled(pod)
+        or _terminal_pod_never_started(pod)
+    )
+
+
+def _deleting_agent_pod_never_started(pod: Any) -> bool:
+    """A deleting dedicated agent Pod that never ran its agent process.
+
+    The executor rules above, applied to the pinned session/job agent Pod. An
+    End that races the Pod's create deletes it before the scheduler binds it
+    (the binding subresource refuses a deleting Pod), or before the kubelet
+    starts the agent container after ``wait-for-orchestrator``. Neither Pod
+    ever gains an agent status that could read terminal, so without this
+    proof its pinned-authority finalizer is never released and End retries
+    forever.
+    """
+
+    if getattr(getattr(pod, "metadata", None), "deletion_timestamp", None) is None:
+        return False
+    return _deleting_executor_never_scheduled(pod) or _terminal_pod_never_started(pod)
+
+
+def classify_agent_pod_authority(pod: Any, expected_pod_uid: str) -> str:
+    """Classify one read of a claimant Pod name against the expected UID.
+
+    ``exact_terminal`` requires the exact UID with every container observed
+    terminated, or a deleting Pod that never started its agent; ``replacement`` is
+    a same-name successor; deletion grace and phase Unknown remain ``unknown``
+    because the old process may still run.
+    """
+
+    actual_uid = str(getattr(getattr(pod, "metadata", None), "uid", "") or "")
+    if not actual_uid:
+        return "unknown"
+    if actual_uid != str(expected_pod_uid):
+        return "replacement"
+    phase = str(getattr(getattr(pod, "status", None), "phase", "") or "")
+    statuses = getattr(pod.status, "container_statuses", None) or []
+    all_containers_terminated = bool(statuses) and all(
+        getattr(getattr(status, "state", None), "terminated", None) is not None
+        for status in statuses
+    )
+    # A graceful deletion may stamp deletionTimestamp before the final
+    # terminal phase update.  Exact UID plus every container's terminated
+    # state is the process-level proof we need; deletionTimestamp alone is
+    # deliberately not proof.
+    if all_containers_terminated or _deleting_agent_pod_never_started(pod):
+        return "exact_terminal"
+    if getattr(getattr(pod, "metadata", None), "deletion_timestamp", None):
+        return "unknown"
+    if phase in {"Running", "Pending"}:
+        return "exact_live"
+    # A terminal phase with missing/partial container status is still
+    # ambiguous: the API object is authoritative only when every claimant
+    # container has an observed terminal state.
+    return "unknown"
 
 
 def _env_flag(name: str, default: bool) -> bool:
@@ -156,6 +441,11 @@ class AgentProvisioner:
         self._ssh_secret_name: str = os.environ.get(
             "WORKSPACE_SSH_SECRET", "vm-ssh-key"
         )
+        (
+            self._gateway_host_key_secret,
+            self._gateway_public_host_key_paths,
+            self._gateway_public_host_key_names,
+        ) = _agent_gateway_public_key_config()
         # Durable /workspace for SESSION agent pods. Gated on the SAME flag,
         # size and storage class as workspace PVCs (ContainerProvisioner) so a
         # cluster has one storage switch, not two. Off (the default) → the
@@ -315,6 +605,23 @@ class AgentProvisioner:
             )
             return False
 
+    async def _session_startup_allowance_s(self, thread_id: str) -> int | None:
+        """Startup allowance for a Pod that attaches ``thread_id`` in startup."""
+
+        if self._db is None:
+            return None
+        try:
+            thread = await self._db.get_thread(thread_id)
+        except Exception:
+            logger.exception(
+                "Session startup allowance read failed before provisioning: %s",
+                thread_id,
+            )
+            return None
+        if thread is None:
+            return None
+        return session_pod_startup_allowance_s(thread)
+
     async def provision_agent(
         self,
         purpose: str,
@@ -371,6 +678,12 @@ class AgentProvisioner:
                 thread_id,
             )
             return None
+        startup_allowance_s: int | None = AGENT_POD_STARTUP_ALLOWANCE_S
+        if purpose == "session" and thread_id:
+            # A thread-bound Pod attaches its session inside startup.
+            startup_allowance_s = await self._session_startup_allowance_s(thread_id)
+            if startup_allowance_s is None:
+                return None
 
         # Capacity check with reservation-aware eviction
         counts = await self.active_counts_by_purpose()
@@ -552,6 +865,7 @@ class AgentProvisioner:
             ),
             provision_attempt=provision_attempt,
             namespace=intent_namespace,
+            startup_allowance_s=startup_allowance_s,
         )
 
         if purpose == "session" and not await self._same_session_runtime_authority(
@@ -827,44 +1141,81 @@ class AgentProvisioner:
         if not self._k8s_available or not name or not expected_uid:
             return "unknown"
         try:
-            pod = await asyncio.to_thread(
+            state, _ = await self.observe_agent_pod_exact(
+                name, expected_pod_uid=expected_uid, namespace=namespace
+            )
+        except AgentPodObservationError as exc:
+            logger.debug("Agent pod authority probe failed for %s: %s", name, exc)
+            return "unknown"
+        return state
+
+    async def agent_pod_terminal_process_zero(
+        self,
+        pod_name: str,
+        *,
+        expected_pod_uid: str,
+        namespace: str,
+    ) -> bool:
+        """Read-only proof for an exact actor that cannot restart in this Pod.
+
+        A 404, offline row or terminal phase alone is insufficient. Require
+        every declared regular/init/ephemeral container's termination and the
+        production Never restart policy, or a deleting Pod that never started
+        its agent. This says nothing about remote writers.
+        """
+        try:
+            state, pod = await self.observe_agent_pod_exact(
+                pod_name, expected_pod_uid=expected_pod_uid, namespace=namespace
+            )
+        except AgentPodObservationError:
+            return False
+        if state != "exact_terminal" or pod is None:
+            return False
+        if _deleting_agent_pod_never_started(pod):
+            return True
+        if getattr(getattr(pod, "spec", None), "restart_policy", None) != "Never":
+            return False
+        if any(
+            getattr(condition, "type", None) == "DisruptionTarget"
+            and getattr(condition, "reason", None) == "DeletionByPodGC"
+            for condition in getattr(getattr(pod, "status", None), "conditions", None)
+            or []
+        ):
+            return False
+        return pod_containers_are_terminal(pod)
+
+    async def observe_agent_pod_exact(
+        self,
+        pod_name: str,
+        *,
+        expected_pod_uid: str,
+        namespace: str | None = None,
+    ) -> tuple[str, Any | None]:
+        """One bounded raw read: ``(classification, pod object or None)``.
+
+        Only an exact 404 is answered (``exact_absent``); a timeout, 403 or
+        any other failure raises ``AgentPodObservationError`` so a caller
+        that must fail closed (the operator attestation) can tell "the API
+        says gone" from "the API did not answer". No label filtering: the
+        classification binds the UID alone.
+        """
+
+        name = str(pod_name or "").strip()
+        expected_uid = str(expected_pod_uid or "").strip()
+        if not self._k8s_available or not name or not expected_uid:
+            raise AgentPodObservationError("Kubernetes client unavailable")
+        try:
+            pod = await run_bounded_k8s_call(
                 self._core_api.read_namespaced_pod,
                 name=name,
                 namespace=namespace or self._namespace,
+                request_timeout=STATELESS_EXECUTOR_READ_TIMEOUT,
             )
         except Exception as exc:
             if getattr(exc, "status", None) == 404:
-                return "exact_absent"
-            logger.debug("Agent pod authority probe failed for %s: %s", name, exc)
-            return "unknown"
-
-        actual_uid = str(getattr(getattr(pod, "metadata", None), "uid", "") or "")
-        if not actual_uid:
-            return "unknown"
-        if actual_uid != expected_uid:
-            return "replacement"
-        phase = str(getattr(getattr(pod, "status", None), "phase", "") or "")
-        statuses = getattr(pod.status, "container_statuses", None) or []
-        all_containers_terminated = bool(statuses) and all(
-            getattr(getattr(status, "state", None), "terminated", None) is not None
-            for status in statuses
-        )
-        # A graceful deletion may stamp deletionTimestamp before the final
-        # terminal phase update.  Exact UID plus every container's terminated
-        # state is the process-level proof we need; deletionTimestamp alone is
-        # deliberately not proof.
-        if all_containers_terminated:
-            return "exact_terminal"
-        if getattr(getattr(pod, "metadata", None), "deletion_timestamp", None):
-            return "unknown"
-        if phase in {"Running", "Pending"}:
-            return "exact_live"
-        if phase in {"Failed", "Succeeded"}:
-            # A terminal phase with missing/partial container status is still
-            # ambiguous: the API object is authoritative only when every
-            # claimant container has an observed terminal state.
-            return "unknown"
-        return "unknown"
+                return "exact_absent", None
+            raise AgentPodObservationError(str(exc)) from exc
+        return classify_agent_pod_authority(pod, expected_uid), pod
 
     async def attest_pinned_job_recipient(
         self,
@@ -1191,7 +1542,7 @@ class AgentProvisioner:
         )
 
     async def release_planned_pinned_warm_agent_authority(
-        self, authority: dict[str, Any]
+        self, authority: dict[str, Any], *, terminal_only: bool = False
     ) -> dict[str, Any] | None:
         if not self._k8s_available or self._core_api is None:
             return None
@@ -1201,6 +1552,7 @@ class AgentProvisioner:
             pod_name=str(authority.get("pod_name") or ""),
             expected_pod_uid=str(authority.get("pod_uid") or ""),
             expected_labels=self._warm_binding_labels(authority),
+            terminal_only=terminal_only,
         )
         if released is not None:
             return released
@@ -1216,6 +1568,7 @@ class AgentProvisioner:
             pod_name=str(authority.get("pod_name") or ""),
             expected_pod_uid=str(authority.get("pod_uid") or ""),
             expected_labels=routed_labels,
+            terminal_only=terminal_only,
         )
 
     async def fence_agent_pod_provision_intent(
@@ -1614,7 +1967,11 @@ class AgentProvisioner:
         ]
         if uid != str(expected_pod_uid) or not resource_version:
             return False
-        if terminal_required and not pod_containers_are_terminal(pod):
+        if (
+            terminal_required
+            and not pod_containers_are_terminal(pod)
+            and not _deleting_agent_pod_never_started(pod)
+        ):
             return False
         patch = finalizer_release_patch(
             uid=uid, resource_version=resource_version, finalizers=finalizers
@@ -1631,6 +1988,219 @@ class AgentProvisioner:
             return True
         except Exception as exc:
             return getattr(exc, "status", None) == 404
+
+    @staticmethod
+    def _stateless_executor_release() -> str:
+        """The Helm release whose executors this orchestrator may release.
+
+        Server-owned chart env (``AGENT_LABEL_INSTANCE`` = ``.Release.Name``),
+        never the Pod. Release names are unique per namespace, so a second
+        release sharing it can never have its executors released against this
+        orchestrator's database. The chart *name* is deliberately not part of
+        the scope: a chart rename would otherwise strand every executor the
+        previous chart created behind a selector nobody matches.
+        """
+
+        from orchestrator.services.stateless_claimant_attestation import (
+            pool_identity,
+        )
+
+        return pool_identity()[1]
+
+    @classmethod
+    def _stateless_executor_identity(cls, pod: Any) -> tuple[str, str, str] | None:
+        """``(name, uid, resourceVersion)`` of this release's executor Pod."""
+
+        from orchestrator.services.stateless_claimant_attestation import (
+            STATELESS_CLASS_VALUE,
+            STATELESS_COMPONENT_VALUE,
+        )
+
+        release = cls._stateless_executor_release()
+        metadata = getattr(pod, "metadata", None)
+        labels = dict(getattr(metadata, "labels", None) or {})
+        name = str(getattr(metadata, "name", "") or "")
+        uid = str(getattr(metadata, "uid", "") or "")
+        resource_version = str(getattr(metadata, "resource_version", "") or "")
+        if not (release and name and uid and resource_version):
+            return None
+        if (
+            labels.get("srw/class") != STATELESS_CLASS_VALUE
+            or labels.get("app.kubernetes.io/component") != STATELESS_COMPONENT_VALUE
+            or labels.get("app.kubernetes.io/instance") != release
+        ):
+            return None
+        return name, uid, resource_version
+
+    def _warn_retention_blind_once(self, reason: str) -> None:
+        warned = self.__dict__.setdefault("_retention_blind_warned", set())
+        if reason in warned:
+            return
+        warned.add(reason)
+        logger.warning(
+            "Stateless executor retention degraded (%s): Pods retained by %s "
+            "may need a manual release",
+            reason,
+            STATELESS_EXECUTOR_PROCESS_ZERO_FINALIZER,
+        )
+
+    async def list_retained_stateless_executor_pods(self) -> list[Any] | None:
+        """Deleting pool executor Pods still held by the process-zero finalizer.
+
+        ``None`` means unknown (no client, no pool identity, API failure) and
+        callers release nothing; an empty list means nothing is retained.
+        """
+
+        release = self._stateless_executor_release()
+        if not self._k8s_available:
+            self._warn_retention_blind_once("no Kubernetes client")
+            return None
+        if not release:
+            self._warn_retention_blind_once("AGENT_LABEL_INSTANCE is unset")
+            return None
+        selector = ",".join(
+            (
+                STATELESS_EXECUTOR_LABEL_SELECTOR,
+                f"app.kubernetes.io/instance={release}",
+            )
+        )
+        try:
+            # Runs on the reaper's serial loop: a slow API must not delay steals.
+            listed = await run_bounded_k8s_call(
+                self._core_api.list_namespaced_pod,
+                namespace=self._namespace,
+                label_selector=selector,
+                request_timeout=STATELESS_EXECUTOR_READ_TIMEOUT,
+            )
+        except Exception as exc:
+            logger.warning("Stateless executor retention list failed: %s", exc)
+            return None
+        retained = []
+        for pod in getattr(listed, "items", None) or []:
+            metadata = getattr(pod, "metadata", None)
+            finalizers = getattr(metadata, "finalizers", None) or []
+            if (
+                getattr(metadata, "deletion_timestamp", None) is not None
+                and STATELESS_EXECUTOR_PROCESS_ZERO_FINALIZER in finalizers
+                and self._stateless_executor_identity(pod) is not None
+            ):
+                retained.append(pod)
+        return retained
+
+    async def read_stateless_executor_pod(
+        self, pod_name: str, *, expected_pod_uid: str
+    ) -> Any | None:
+        """Read one exact pool executor Pod; ``None`` for absent/other/unknown."""
+
+        name = str(pod_name or "").strip()
+        uid = str(expected_pod_uid or "").strip()
+        if not self._k8s_available or not name or not uid:
+            return None
+        try:
+            pod = await run_bounded_k8s_call(
+                self._core_api.read_namespaced_pod,
+                name=name,
+                namespace=self._namespace,
+                request_timeout=STATELESS_EXECUTOR_READ_TIMEOUT,
+            )
+        except Exception:
+            return None
+        identity = self._stateless_executor_identity(pod)
+        if identity is None or identity[1] != uid:
+            return None
+        return pod
+
+    async def stateless_executor_node_lost(self, node_name: str) -> bool:
+        """Whether a human or the cloud has declared a Pod's node gone.
+
+        ``True`` only for an exact Node 404 (PodGC's orphan sweep acts on
+        the same fact) or the ``node.kubernetes.io/out-of-service`` taint (the
+        sanctioned non-graceful-shutdown assertion). A kubelet on such a node
+        will never report terminal container statuses, so without this the
+        executor would stay Terminating forever. Any read failure is
+        ``False``: an unanswered question is never evidence.
+        """
+
+        name = str(node_name or "").strip()
+        if not self._k8s_available or not name:
+            return False
+        try:
+            node = await run_bounded_k8s_call(
+                self._core_api.read_node,
+                name=name,
+                request_timeout=STATELESS_EXECUTOR_READ_TIMEOUT,
+            )
+        except Exception as exc:
+            status = getattr(exc, "status", None)
+            if status == 404:
+                return True
+            if status == 403:
+                self._warn_retention_blind_once(
+                    "Node reads are forbidden, so executors on lost nodes are "
+                    "never released; grant the chart's orchestrator "
+                    "node-observer ClusterRole"
+                )
+            return False
+        taints = getattr(getattr(node, "spec", None), "taints", None) or []
+        return any(
+            getattr(taint, "key", None) == NODE_OUT_OF_SERVICE_TAINT for taint in taints
+        )
+
+    async def release_stateless_executor_finalizer_exact(
+        self, pod: Any, *, require_process_zero: bool = True
+    ) -> bool:
+        """Remove only the process-zero finalizer from one observed executor.
+
+        The JSON Patch tests the UID, the observed resourceVersion and the
+        exact finalizer list, so the release applies to precisely the object
+        state the caller evaluated; any intervening write is a retryable 422.
+        A live (non-deleting) executor is never unprotected.
+        ``require_process_zero=False`` is reserved for an audited operator
+        attestation that the claimant process is gone.
+        """
+
+        if not self._k8s_available:
+            return False
+        identity = self._stateless_executor_identity(pod)
+        metadata = getattr(pod, "metadata", None)
+        if identity is None or getattr(metadata, "deletion_timestamp", None) is None:
+            return False
+        if require_process_zero and not stateless_executor_process_zero(pod):
+            return False
+        name, uid, resource_version = identity
+        patch = finalizer_release_patch(
+            uid=uid,
+            resource_version=resource_version,
+            finalizers=[
+                str(value) for value in getattr(metadata, "finalizers", None) or []
+            ],
+            finalizer=STATELESS_EXECUTOR_PROCESS_ZERO_FINALIZER,
+        )
+        if patch is None:
+            return False
+        try:
+            await run_bounded_k8s_mutation(
+                self._core_api.patch_namespaced_pod,
+                name=name,
+                namespace=self._namespace,
+                body=patch,
+            )
+        except Exception as exc:
+            if getattr(exc, "status", None) == 404:
+                return True
+            logger.info(
+                "Stateless executor finalizer release deferred for %s uid=%s: %s",
+                name,
+                uid,
+                exc,
+            )
+            return False
+        logger.info(
+            "Stateless executor process-zero finalizer released: pod=%s uid=%s",
+            name,
+            uid,
+        )
+        return True
 
     async def retire_historical_claimant_pod_exact(self, **identity: Any) -> bool:
         """Release an exact terminal Pod under historical settlement authority."""
@@ -1949,6 +2519,32 @@ class AgentProvisioner:
         for pod in pods.items:
             if self._is_completed(pod):
                 category = "completed"
+                if PINNED_AUTHORITY_FINALIZER in (pod.metadata.finalizers or []):
+                    if self._db is None:
+                        continue
+                    from orchestrator.services.historical_agent_pod_cleanup import (
+                        retire_aborted_unclaimed_agent_pod,
+                        retire_soft_ended_agent_pod,
+                    )
+
+                    try:
+                        identity = dict(
+                            pod_name=pod.metadata.name,
+                            pod_uid=str(pod.metadata.uid or ""),
+                            namespace=self._namespace,
+                            agent_provisioner=self,
+                        )
+                        if await retire_aborted_unclaimed_agent_pod(
+                            self._db, **identity
+                        ) or await retire_soft_ended_agent_pod(self._db, **identity):
+                            stats[category] += 1
+                            continue
+                    except Exception:
+                        logger.exception(
+                            "Protected claimant cleanup remains retryable for %s",
+                            pod.metadata.name,
+                        )
+                    continue
             elif self._is_crashed(pod, crashed_grace_seconds):
                 category = "crashed"
             elif self._is_tunnel_dark(pod, tunnel_dark_grace_seconds):
@@ -2362,6 +2958,7 @@ class AgentProvisioner:
         session_runtime_generation: Optional[str] = None,
         provision_attempt: Optional[str] = None,
         namespace: Optional[str] = None,
+        startup_allowance_s: int = AGENT_POD_STARTUP_ALLOWANCE_S,
     ) -> dict:
         """Build the Kubernetes Pod manifest for an agent.
 
@@ -2571,8 +3168,10 @@ class AgentProvisioner:
                     "httpGet": {"path": "/health", "port": 8001},
                     # Poll quickly so the Kubernetes Ready bit can catch up
                     # with the agent's own ready heartbeat before dispatch.
-                    # Keep the original 100s total startup allowance.
-                    "failureThreshold": 100,
+                    # 100 s for job and pool Pods; a thread-bound session Pod
+                    # attaches inside startup and also gets that session's
+                    # readiness budget (session_pod_startup_allowance_s).
+                    "failureThreshold": startup_allowance_s,
                     "periodSeconds": 1,
                 },
                 "resources": {
@@ -2587,6 +3186,39 @@ class AgentProvisioner:
                 },
             },
         ]
+
+        gateway_paths = getattr(self, "_gateway_public_host_key_paths", ())
+        if gateway_paths:
+            containers[0]["env"].append(
+                {
+                    "name": "SSH_GATEWAY_PUBLIC_HOST_KEYS",
+                    "value": ",".join(gateway_paths),
+                }
+            )
+            containers[0]["volumeMounts"].append(
+                {
+                    "name": "ssh-gateway-host-keys",
+                    "mountPath": _SSH_GATEWAY_PUBLIC_HOST_KEY_DIR,
+                    "readOnly": True,
+                }
+            )
+
+        if purpose == "session" and thread_id:
+            # Kubelet runs preStop before SIGTERM. Fence the next paid turn in
+            # the shell, even while Python/HTTP drain startup is delayed. Match
+            # the persistent pool hook and retain its image compatibility shim.
+            containers[0]["lifecycle"] = {
+                "preStop": {
+                    "exec": {
+                        "command": [
+                            "sh",
+                            "-c",
+                            ": > /tmp/srw-persistent-terminating; "
+                            "exec python -m src.api.persistent_termination",
+                        ],
+                    },
+                },
+            }
 
         volumes: list[dict] = [
             # /workspace in the AGENT pod. For `sandbox`-tier sessions and for
@@ -2622,6 +3254,20 @@ class AgentProvisioner:
             },
             {"name": "home-srw", "emptyDir": {"sizeLimit": "512Mi"}},
         ]
+        if gateway_paths:
+            volumes.append(
+                {
+                    "name": "ssh-gateway-host-keys",
+                    "secret": {
+                        "secretName": self._gateway_host_key_secret,
+                        "defaultMode": 0o444,
+                        "items": [
+                            {"key": name, "path": name}
+                            for name in self._gateway_public_host_key_names
+                        ],
+                    },
+                }
+            )
 
         if self._tailscale_enabled and self._headscale_url:
             tailscale_args = (
@@ -2998,3 +3644,34 @@ class AgentProvisioner:
 
 # Module-level singleton
 agent_provisioner = AgentProvisioner()
+
+
+async def agent_pool_reconciler(
+    shutdown_event: asyncio.Event, *, provisioner: AgentProvisioner
+) -> None:
+    """Background task that maintains the dynamic agent pool.
+
+    Runs every 60 seconds:
+    - Ensures MIN_AGENTS warm pods exist (instant dispatch)
+    - Reaps completed / stale / unstartable agent pods (single dispatcher)
+
+    Drift-based draining lives in ``lifecycle_reconciler_loop`` now —
+    this loop only owns capacity (warm pool + scale-down) and crash GC.
+    """
+    logger.info("Agent pool reconciler started")
+    while not shutdown_event.is_set():
+        try:
+            if provisioner.is_available:
+                await provisioner.ensure_warm_pool()
+                await provisioner.reap_pods()
+                await provisioner.scale_down_idle()
+        except Exception as e:
+            logger.error("Error in agent pool reconciler: %s", e)
+
+        try:
+            await asyncio.wait_for(shutdown_event.wait(), timeout=60.0)
+            break
+        except asyncio.TimeoutError:
+            pass
+
+    logger.info("Agent pool reconciler stopped")

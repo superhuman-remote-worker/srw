@@ -68,6 +68,9 @@ SOURCE_TREES = ("src", "tests")
 #: Changing any of these invalidates the whole graph or the environment the
 #: suite runs in, so selection is not safe. Matched as path prefixes.
 FULL_SUITE_TRIGGERS = (
+    "scripts/pytest_shard.py",
+    "scripts/pytest_file_timings.py",
+    "policy/pytest_file_timings.json",
     "tests/conftest.py",
     "conftest.py",
     "pytest.ini",
@@ -82,6 +85,7 @@ FULL_SUITE_TRIGGERS = (
     "src/mcp_server/requirements.txt",
     "src/vm_controller/requirements.txt",
     ".github/workflows/",
+    ".github/actions/",
     ".squawk.toml",
     "scripts/select_affected_tests.py",
     "tests/select_affected_tests_data",
@@ -116,6 +120,9 @@ ALWAYS_RUN = (
     "tests/test_endpoint_inventory.py",
     "tests/test_notification_producer_manifest.py",
     "tests/test_runtime_coordinate_inventory.py",
+    "tests/test_connector_type_branches.py",
+    # Scans every orchestrator module's imports against the orchestrator lock.
+    "tests/test_dependency_locks.py",
 )
 
 

@@ -151,9 +151,9 @@ def test_uses_no_unmanaged_colours() -> None:
 
 @pytest.mark.parametrize("bad", ["Approve", "approved", "APPROVE", "", "ghost"])
 def test_unrecognised_variant_is_rejected(bad: str) -> None:
-    """A typo must not fall through to `primary` -- that is solid porphyry.
+    """A typo must not fall through to `primary` -- that is solid Tyrian.
 
-    Rendered next to the solid laurel Approve it measures 1.24:1, the exact
+    Rendered next to the solid laurel Approve it measures 1.17:1, the exact
     WCAG 1.4.1 failure this layout exists to remove, reintroduced silently in
     the one place nobody inspects. "Approve" (capitalised) is the realistic
     case: it reads correct at the call site.

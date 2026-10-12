@@ -11,6 +11,7 @@ from fastapi import HTTPException
 from orchestrator.services.dispatch_guards import resume_lane_applies
 from orchestrator.services.job_workspace_runtime import WORKSPACE_CONTEXT_KEYS
 from orchestrator.services.manifest_runtime_ownership import require_srw_runtime
+from shared.operator_pause_hold import operator_pause_lift_token
 from shared.workspace_contract import resolve_workspace_runtime
 
 
@@ -32,6 +33,10 @@ class JobAssignmentStore(Protocol):
     async def prepare_pinned_job_for_workspace_resume(
         self, job_id: str, context_key: str, **kwargs: Any
     ) -> Any: ...
+
+
+async def _no_mint_gate(_job: Any) -> tuple[str, str | None]:
+    return "dispatch", None
 
 
 @dataclass(frozen=True, slots=True)
@@ -57,6 +62,9 @@ class JobAssignmentDependencies:
     dispatch_job_to_agent: Callable[[dict, dict], Awaitable[bool]]
     resume_job_on_agent: Callable[[dict, dict], Awaitable[bool]]
     trigger_dispatch: Callable[[], None]
+    #: A job's provider-minted credentials before its claim (connector
+    #: drivers C5, ``connector_minted_credentials.job_mint_gate``).
+    job_mint_gate: Callable[[Any], Awaitable[tuple[str, str | None]]] = _no_mint_gate
 
 
 class JobAssignmentOperations:
@@ -90,6 +98,9 @@ class JobAssignmentOperations:
                 )
 
             await dependencies.guard_completion_control(job_id, source="manual_assign")
+            # An admin assignment is an explicit resume: it may lift the
+            # operator pause hold it observed here, and only that one.
+            operator_pause_lift = operator_pause_lift_token(job)
             (
                 workspace_action,
                 job,
@@ -140,6 +151,7 @@ class JobAssignmentOperations:
                             WORKSPACE_CONTEXT_KEYS[missing_workspace],
                             expected_status=str(job["status"]),
                             completion_control_claim_id=str(control_claim.claim_id),
+                            lift_operator_pause_hold=operator_pause_lift,
                         )
                     except Exception:
                         await dependencies.abort_completion_control_claim(control_claim)
@@ -162,6 +174,7 @@ class JobAssignmentOperations:
                 ):
                     queued = await store.queue_job_for_resume(
                         job_id,
+                        lift_operator_pause_hold=operator_pause_lift,
                         **dependencies.completion_resume_guard_kwargs(),
                     )
                     if not queued:
@@ -200,11 +213,25 @@ class JobAssignmentOperations:
                 raise HTTPException(
                     status_code=409, detail="Job repository authority is not ready"
                 )
+            # A provider-minted credential exists before the claim (C5): the
+            # mint starts now, and the assignment is refused until it is live
+            # (or with the provider's reason).
+            mint_action, mint_reason = await dependencies.job_mint_gate(job)
+            if mint_action != "dispatch":
+                raise HTTPException(
+                    status_code=409,
+                    detail=mint_reason
+                    or (
+                        "A connector's credential is being minted; assign the "
+                        "job again in a moment"
+                    ),
+                )
             if not await store.claim_job_for_agent(
                 job_id,
                 agent_id,
                 completion_commands_enabled=dependencies.completion_commands_enabled(),
                 allow_failed=True,
+                lift_operator_pause_hold=operator_pause_lift,
             ):
                 raise HTTPException(
                     status_code=409, detail="Job changed while it was being assigned"

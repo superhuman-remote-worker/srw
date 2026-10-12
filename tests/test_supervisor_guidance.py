@@ -42,6 +42,12 @@ from agent.core.guidance_injection import format_supervisor_guidance  # noqa: E4
 from agent.core.workspace import WorkspaceManager  # noqa: E402
 from agent.managers import TodoManager  # noqa: E402
 from tests._fs_backend import FilesystemTestBackend  # noqa: E402
+from orchestrator.application import sessions as sessions_composition
+from orchestrator.application import workflows as workflows_composition
+from orchestrator.schemas import agent_runtime as agent_runtime_module
+from orchestrator.schemas import messaging as messaging_module
+from orchestrator.security import access as access_module
+from orchestrator.services import job_controls as job_controls_module
 
 
 # =============================================================================
@@ -116,14 +122,23 @@ def _route_inbound_reply(om, *args, **kwargs):
     steering the code under test.
     """
     return inbound_reply.route_inbound_reply(
-        *args, **kwargs, dependencies=om._inbound_reply_dependencies()
+        *args,
+        **kwargs,
+        dependencies=workflows_composition.inbound_reply_dependencies(
+            om.app.state.resources
+        ),
     )
 
 
 def _ack_job_guidance(om, request, job_id, body):
     """Same, for the guidance ack behind ``POST /api/jobs/{id}/guidance/ack``."""
     return job_guidance.ack_job_guidance(
-        request, job_id, body, dependencies=om._job_guidance_dependencies()
+        request,
+        job_id,
+        body,
+        dependencies=workflows_composition.job_guidance_dependencies(
+            om.app.state.resources
+        ),
     )
 
 
@@ -142,8 +157,10 @@ class TestUrgentReplyRoutesToGuidance:
             side_effect=HTTPException(status_code=409, detail="completion finalizing")
         )
         with (
-            patch.object(om, "postgres_db", db),
-            patch.object(om._completion_control_boundary, "guard", guard),
+            patch.object(om.app.state.resources, "postgres_db", db),
+            patch.object(
+                om.app.state.resources.completion_control_boundary, "guard", guard
+            ),
             pytest.raises(HTTPException) as exc,
         ):
             await _route_inbound_reply(
@@ -166,10 +183,12 @@ class TestUrgentReplyRoutesToGuidance:
         resume = AsyncMock(return_value=False)
         guard = AsyncMock()
         with (
-            patch.object(om, "postgres_db", db),
-            patch.object(om._completion_control_boundary, "guard", guard),
+            patch.object(om.app.state.resources, "postgres_db", db),
             patch.object(
-                om.job_control_operations.JobControlOperations,
+                om.app.state.resources.completion_control_boundary, "guard", guard
+            ),
+            patch.object(
+                job_controls_module.JobControlOperations,
                 "internal_resume_job",
                 resume,
             ),
@@ -192,9 +211,13 @@ class TestUrgentReplyRoutesToGuidance:
         db.append_queued_reply.return_value = False
         guard = AsyncMock()
         with (
-            patch.object(om, "COMPLETION_COMMANDS_ENABLED", True),
-            patch.object(om, "postgres_db", db),
-            patch.object(om._completion_control_boundary, "guard", guard),
+            patch.object(
+                om.app.state.resources.settings, "completion_commands_enabled", True
+            ),
+            patch.object(om.app.state.resources, "postgres_db", db),
+            patch.object(
+                om.app.state.resources.completion_control_boundary, "guard", guard
+            ),
             pytest.raises(HTTPException) as exc,
         ):
             await _route_inbound_reply(
@@ -217,9 +240,9 @@ class TestUrgentReplyRoutesToGuidance:
         db = _routing_db(_job(status="processing"))
         resume = AsyncMock()
         with (
-            patch.object(om, "postgres_db", db),
+            patch.object(om.app.state.resources, "postgres_db", db),
             patch.object(
-                om.job_control_operations.JobControlOperations,
+                job_controls_module.JobControlOperations,
                 "internal_resume_job",
                 resume,
             ),
@@ -248,9 +271,9 @@ class TestUrgentReplyRoutesToGuidance:
         db = _routing_db(_job(status="paused"))
         resume = AsyncMock()
         with (
-            patch.object(om, "postgres_db", db),
+            patch.object(om.app.state.resources, "postgres_db", db),
             patch.object(
-                om.job_control_operations.JobControlOperations,
+                job_controls_module.JobControlOperations,
                 "internal_resume_job",
                 resume,
             ),
@@ -265,6 +288,32 @@ class TestUrgentReplyRoutesToGuidance:
         assert resume.await_args.kwargs["reason"] == inbound_reply.URGENT_RESUME_REASON
 
     @pytest.mark.asyncio
+    async def test_urgent_on_operator_paused_job_reports_queued(self):
+        """The hold keeps the job parked: the message waits for the resume."""
+        import orchestrator.main as om
+
+        held = {
+            **_job(status="paused"),
+            "context": {"_operator_pause_hold": {"version": 1, "hold_id": "h1"}},
+        }
+        db = _routing_db(held)
+        resume = AsyncMock(return_value=True)
+        with (
+            patch.object(om.app.state.resources, "postgres_db", db),
+            patch.object(
+                job_controls_module.JobControlOperations,
+                "internal_resume_job",
+                resume,
+            ),
+        ):
+            strategy, _ = await _route_inbound_reply(
+                om, JOB_ID, "officer", "wake up and do Y", urgent=True
+            )
+
+        assert strategy == "queued_until_resume"
+        resume.assert_awaited_once()
+
+    @pytest.mark.asyncio
     async def test_blocking_reply_still_resumes_with_honest_reason(self):
         """A reply the job froze waiting for keeps resuming — that is the
         correct verb there — and now carries the actual cause."""
@@ -275,9 +324,9 @@ class TestUrgentReplyRoutesToGuidance:
         )
         resume = AsyncMock()
         with (
-            patch.object(om, "postgres_db", db),
+            patch.object(om.app.state.resources, "postgres_db", db),
             patch.object(
-                om.job_control_operations.JobControlOperations,
+                job_controls_module.JobControlOperations,
                 "internal_resume_job",
                 resume,
             ),
@@ -302,9 +351,9 @@ class TestUrgentReplyRoutesToGuidance:
         }
         resume = AsyncMock()
         with (
-            patch.object(om, "postgres_db", db),
+            patch.object(om.app.state.resources, "postgres_db", db),
             patch.object(
-                om.job_control_operations.JobControlOperations,
+                job_controls_module.JobControlOperations,
                 "internal_resume_job",
                 resume,
             ),
@@ -325,9 +374,9 @@ class TestUrgentReplyRoutesToGuidance:
         db = _routing_db(_job(status="processing"))
         resume = AsyncMock()
         with (
-            patch.object(om, "postgres_db", db),
+            patch.object(om.app.state.resources, "postgres_db", db),
             patch.object(
-                om.job_control_operations.JobControlOperations,
+                job_controls_module.JobControlOperations,
                 "internal_resume_job",
                 resume,
             ),
@@ -352,7 +401,7 @@ class TestCheckpointCoupledAckEndpoint:
 
         db = AsyncMock()
         db.consume_job_guidance.return_value = 4
-        body = om.GuidanceAckRequest(
+        body = messaging_module.GuidanceAckRequest(
             guidance_ids=["g1"],
             reply_keys=["id:r1"],
             feedback_keys=["feedback:id:f1"],
@@ -360,7 +409,7 @@ class TestCheckpointCoupledAckEndpoint:
             checkpoint_id="cp-9",
         )
         with (
-            patch.object(om, "postgres_db", db),
+            patch.object(om.app.state.resources, "postgres_db", db),
         ):
             result = await _ack_job_guidance(om, MagicMock(), JOB_ID, body)
 
@@ -382,14 +431,14 @@ class TestCheckpointCoupledAckEndpoint:
         db = AsyncMock()
         db.consume_job_guidance.side_effect = ValueError("checkpoint missing")
         with (
-            patch.object(om, "postgres_db", db),
+            patch.object(om.app.state.resources, "postgres_db", db),
             pytest.raises(HTTPException) as exc,
         ):
             await _ack_job_guidance(
                 om,
                 MagicMock(),
                 JOB_ID,
-                om.GuidanceAckRequest(guidance_ids=["g1"]),
+                messaging_module.GuidanceAckRequest(guidance_ids=["g1"]),
             )
 
         assert exc.value.status_code == 409
@@ -402,7 +451,9 @@ class TestCheckpointCoupledAckEndpoint:
 
 class TestHeartbeatCarriesGuidance:
     def _heartbeat_body(self, om):
-        return om.AgentHeartbeat(status="working", current_job_id=JOB_ID)
+        return agent_runtime_module.AgentHeartbeat(
+            status="working", current_job_id=JOB_ID
+        )
 
     def _db(self, context):
         db = AsyncMock()
@@ -425,14 +476,16 @@ class TestHeartbeatCarriesGuidance:
         entries = [{"id": "g1", "text": "steer", "source": "officer"}]
         db = self._db({"pending_guidance": entries})
         with (
-            patch.object(om, "postgres_db", db),
-            patch.object(om, "require_internal", AsyncMock()),
+            patch.object(om.app.state.resources, "postgres_db", db),
+            patch.object(access_module, "require_internal", AsyncMock()),
         ):
             out = await agent_registration.agent_heartbeat(
                 MagicMock(),
                 "agent-1",
                 self._heartbeat_body(om),
-                dependencies=om._agent_registration_dependencies(),
+                dependencies=sessions_composition.agent_registration_dependencies(
+                    om.app.state.resources
+                ),
             )
 
         assert out["job_status"] == "processing"
@@ -444,14 +497,16 @@ class TestHeartbeatCarriesGuidance:
 
         db = self._db({})
         with (
-            patch.object(om, "postgres_db", db),
-            patch.object(om, "require_internal", AsyncMock()),
+            patch.object(om.app.state.resources, "postgres_db", db),
+            patch.object(access_module, "require_internal", AsyncMock()),
         ):
             out = await agent_registration.agent_heartbeat(
                 MagicMock(),
                 "agent-1",
                 self._heartbeat_body(om),
-                dependencies=om._agent_registration_dependencies(),
+                dependencies=sessions_composition.agent_registration_dependencies(
+                    om.app.state.resources
+                ),
             )
 
         assert out["pending_guidance"] == []
@@ -463,14 +518,16 @@ class TestHeartbeatCarriesGuidance:
         db = self._db({})
         db.get_job.side_effect = RuntimeError("db blip")
         with (
-            patch.object(om, "postgres_db", db),
-            patch.object(om, "require_internal", AsyncMock()),
+            patch.object(om.app.state.resources, "postgres_db", db),
+            patch.object(access_module, "require_internal", AsyncMock()),
         ):
             out = await agent_registration.agent_heartbeat(
                 MagicMock(),
                 "agent-1",
                 self._heartbeat_body(om),
-                dependencies=om._agent_registration_dependencies(),
+                dependencies=sessions_composition.agent_registration_dependencies(
+                    om.app.state.resources
+                ),
             )
 
         assert out["pending_guidance"] is None
@@ -656,7 +713,6 @@ class TestExecuteRendersGuidance:
         context_mgr.ensure_within_limits = AsyncMock(
             side_effect=lambda msgs, *a, **k: msgs
         )
-        context_mgr.clear_old_tool_results.side_effect = lambda msgs: msgs
 
         return create_execute_node(
             llm_with_tools=llm,
@@ -819,6 +875,178 @@ class TestExecuteRendersGuidance:
             "[SUPERVISOR GUIDANCE]" in getattr(message, "content", "")
             for message in captured[0]
         )
+
+
+class TestExecuteAppendsGuidanceOnce:
+    """append_only (WP2 spec §C, B7): guidance is a typed context entry,
+    appended to the history once and folded into the newest carrier. Both
+    lanes filter and record ``delivered_guidance_ids``; the pinned lane acks
+    after the answered request, the stateless lane leaves the ack to the
+    fenced saver."""
+
+    _state = TestExecuteRendersGuidance._state
+
+    @pytest.fixture(autouse=True)
+    def _clean_inbox(self):
+        saved = dict(dual_app._guidance_inbox)
+        dual_app._guidance_inbox.clear()
+        yield
+        dual_app._guidance_inbox.clear()
+        dual_app._guidance_inbox.update(saved)
+
+    def _append_only_execute(
+        self, workspace_manager, todo_manager, captured, *, tool_context=None
+    ):
+        from agent.graph import create_execute_node
+
+        async def fake_ainvoke(prepared, **kwargs):
+            captured.append(list(prepared))
+            return AIMessage(
+                content="",
+                tool_calls=[{"name": "read_file", "args": {}, "id": "c1"}],
+            )
+
+        llm = MagicMock()
+        llm.ainvoke = AsyncMock(side_effect=fake_ainvoke)
+        config = MagicMock()
+        config.agent_id = "test-agent"
+        config.extra = {}
+        config.llm.model = "test-model"
+        config.llm.timeout = 10.0
+        config.llm.model_max_context_tokens = 100000
+        config.limits.model_max_context_tokens = 100000
+        config.limits.response_validation.enabled = False
+        config.context_management.max_summary_length = 500
+        config.context_management.injection_mode = "append_only"
+        config.memory.max_memories_per_entry = 5
+
+        context_mgr = MagicMock()
+        context_mgr.get_token_count.return_value = 50
+        context_mgr.config.compaction_threshold_tokens = 100000
+        context_mgr.config.summarization_threshold_tokens = 100000
+        context_mgr.config.keep_recent_messages = 10
+        context_mgr.should_summarize.return_value = False
+        context_mgr.ensure_within_limits = AsyncMock(
+            side_effect=lambda msgs, *a, **k: msgs
+        )
+        return create_execute_node(
+            llm_with_tools=llm,
+            todo_manager=todo_manager,
+            memory_manager=MagicMock(),
+            workspace_manager=workspace_manager,
+            config=config,
+            context_mgr=context_mgr,
+            retry_manager=MagicMock(),
+            auxiliary_llm=None,
+            summarization_prompt="",
+            tool_context=tool_context,
+            tool_names=["read_file"],
+        )
+
+    async def _execute(self, execute, state, ack):
+        with (
+            patch("agent.graph.get_phase_system_prompt", return_value="SYS"),
+            patch("agent.graph.get_archiver", return_value=None),
+            patch.object(dual_app, "ack_guidance", ack),
+        ):
+            return await execute(state)
+
+    @staticmethod
+    def _guidance_entries(messages):
+        from shared.runtime.core.context_entries import entry_kind
+
+        return [m for m in messages if entry_kind(m) == "guidance"]
+
+    @pytest.mark.asyncio
+    async def test_pinned_lane_appends_once_records_ids_and_acks(
+        self, workspace_manager, todo_manager
+    ):
+        dual_app._guidance_inbox["job-under-test"] = [
+            {"id": "g1", "text": "stop retrying X", "source": "officer"},
+            {"id": "g2", "text": "read file Z", "source": "officer"},
+        ]
+        captured = []
+        execute = self._append_only_execute(workspace_manager, todo_manager, captured)
+        ack = MagicMock()
+
+        result = await self._execute(execute, self._state(), ack)
+
+        (request,) = captured
+        carrier = request[-1]
+        assert carrier.content.startswith("hello\n\n")
+        assert carrier.content.count('<srw_context kind="guidance">') == 1
+        assert "stop retrying X" in carrier.content
+        assert "read file Z" in carrier.content
+        (entry,) = self._guidance_entries(result["messages"])
+        assert result["messages"][-1].tool_calls[0]["id"] == "c1"
+        assert result["messages"].index(entry) < len(result["messages"]) - 1
+        assert result["delivered_guidance_ids"] == ["g1", "g2"]
+        ack.assert_called_once_with(
+            "job-under-test", guidance_ids=["g1", "g2"], reply_threads=None
+        )
+
+    @pytest.mark.asyncio
+    async def test_pinned_lane_filters_delivered_ids_and_re_acks(
+        self, workspace_manager, todo_manager
+    ):
+        """An entry the history already holds is not appended again; while
+        the inbox still lists it the pinned lane acks it again (a lost
+        fire-and-forget ack is retried, as the legacy re-render did)."""
+        dual_app._guidance_inbox["job-under-test"] = [
+            {"id": "g1", "text": "already delivered", "source": "officer"}
+        ]
+        captured = []
+        execute = self._append_only_execute(workspace_manager, todo_manager, captured)
+        state = self._state()
+        state["delivered_guidance_ids"] = ["g1"]
+        ack = MagicMock()
+
+        result = await self._execute(execute, state, ack)
+
+        assert not any("already delivered" in str(m.content) for m in captured[0])
+        assert not self._guidance_entries(result["messages"])
+        assert result["delivered_guidance_ids"] == ["g1"]
+        ack.assert_called_once_with(
+            "job-under-test", guidance_ids=["g1"], reply_threads=None
+        )
+
+    @pytest.mark.asyncio
+    async def test_stateless_lane_records_ids_and_leaves_the_ack_to_the_saver(
+        self, workspace_manager, todo_manager
+    ):
+        from agent.tools.context import ToolContext
+
+        dual_app._guidance_inbox["job-under-test"] = [
+            {"id": "g1", "text": "read file Z", "source": "officer"}
+        ]
+        context = ToolContext(workspace_manager=workspace_manager)
+        context._stateless_worker = True
+        captured = []
+        execute = self._append_only_execute(
+            workspace_manager, todo_manager, captured, tool_context=context
+        )
+        ack = MagicMock()
+
+        result = await self._execute(execute, self._state(), ack)
+
+        assert captured[0][-1].content.count('<srw_context kind="guidance">') == 1
+        assert len(self._guidance_entries(result["messages"])) == 1
+        assert result["delivered_guidance_ids"] == ["g1"]
+        ack.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_no_guidance_still_writes_the_delivered_set(
+        self, workspace_manager, todo_manager
+    ):
+        captured = []
+        execute = self._append_only_execute(workspace_manager, todo_manager, captured)
+        ack = MagicMock()
+
+        result = await self._execute(execute, self._state(), ack)
+
+        assert result["delivered_guidance_ids"] == []
+        assert not self._guidance_entries(result["messages"])
+        ack.assert_not_called()
 
 
 # =============================================================================

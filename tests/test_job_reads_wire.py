@@ -21,6 +21,12 @@ from orchestrator import main
 from orchestrator.routers.job_reads import JobReadsDependencies, router
 from orchestrator.services.job_queries import JobQueryDependencies
 from orchestrator.services.job_reads import JobReadDependencies
+from orchestrator.application import http as http_composition
+from orchestrator.application import jobs as jobs_composition
+from orchestrator.security import access as access_module
+from orchestrator.security import auth as auth_module
+from orchestrator.services import job_queries as job_queries_module
+import functools
 
 
 USER = "11111111-1111-4111-8111-111111111111"
@@ -96,6 +102,7 @@ def reads_wire(monkeypatch):
     acquired.__aexit__ = AsyncMock(side_effect=release)
     db = SimpleNamespace(
         acquire=MagicMock(return_value=acquired),
+        container_workspace_creation_views=AsyncMock(return_value={}),
         get_project=AsyncMock(side_effect=project),
         query_jobs=AsyncMock(
             return_value=SimpleNamespace(
@@ -112,16 +119,20 @@ def reads_wire(monkeypatch):
         get_audit_counts=AsyncMock(side_effect=counts),
     )
     visible = AsyncMock(return_value=[UUID(PROJECT)])
-    monkeypatch.setattr(main, "postgres_db", db)
-    monkeypatch.setattr(main, "audit_reader", audit)
-    monkeypatch.setattr(main, "require_approved_user", approved)
-    monkeypatch.setattr(main, "require_job_access", AsyncMock(side_effect=job_access))
+    monkeypatch.setattr(main.app.state.resources, "postgres_db", db)
+    monkeypatch.setattr(main.app.state.resources, "audit_reader", audit)
+    monkeypatch.setattr(auth_module, "require_approved_user", approved)
     monkeypatch.setattr(
-        main, "require_project_member", AsyncMock(side_effect=project_member)
+        access_module, "require_job_access", AsyncMock(side_effect=job_access)
     )
-    monkeypatch.setattr(main, "user_visible_project_ids", visible)
-    app = FastAPI(default_response_class=main.CustomJSONResponse)
-    app.state.job_reads_dependencies_factory = main._job_reads_dependencies
+    monkeypatch.setattr(
+        access_module, "require_project_member", AsyncMock(side_effect=project_member)
+    )
+    monkeypatch.setattr(access_module, "user_visible_project_ids", visible)
+    app = FastAPI(default_response_class=http_composition.CustomJSONResponse)
+    app.state.job_reads_dependencies_factory = functools.partial(
+        jobs_composition.job_reads_dependencies, main.app.state.resources
+    )
     app.include_router(router)
     return SimpleNamespace(
         app=app,
@@ -169,6 +180,9 @@ async def test_project_array_keeps_children_change_record_fields_and_distinct_sq
         change_record_type="delivered",
         existing_extension={"nullable": None, "id": UUID(CHILD), "at": STAMP},
     )
+    for row in reads_wire.state.rows:
+        # Older jobs whose project-folder copy was implicit (see the detail case).
+        row.update(cloud_diff_baseline_commit="synthetic-baseline", cloud_checkout=None)
     params = {"limit": "17"}
     if status:
         params["status"] = status
@@ -189,11 +203,15 @@ async def test_project_array_keeps_children_change_record_fields_and_distinct_sq
     }
     assert all(job["cloud_review_mode"] == "diff" for job in jobs)
     assert all("project_has_cloud_folder" not in job for job in jobs)
+    assert all("cloud_checkout" not in job for job in jobs)
     query, *args = reads_wire.conn.fetch.call_args.args
     expected = (
         "SELECT js.*, jcr.delivery_status, jcr.delivery_ref, "
-        "jcr.delivery_sha, jcr.record_type AS change_record_type "
-        "FROM job_summary js LEFT JOIN job_change_records jcr ON jcr.job_id = js.id "
+        "jcr.delivery_sha, jcr.record_type AS change_record_type, "
+        "j.diff_status, j.cloud_diff_baseline_commit, "
+        "j.context->'cloud_checkout' AS cloud_checkout "
+        "FROM job_summary js JOIN jobs j ON j.id = js.id "
+        "LEFT JOIN job_change_records jcr ON jcr.job_id = js.id "
         "WHERE js.project_id = $1"
         + predicate
         + " ORDER BY js.created_at DESC LIMIT $"
@@ -247,6 +265,9 @@ async def test_detail_audit_and_private_projection_preserve_jsonb_and_extensions
         config_override=json.dumps(config) if as_text else config,
         existing_extension={"id": UUID(CHILD), "nullable": None},
         project_has_cloud_folder=True,
+        # An older job whose project-folder copy was implicit: no checkout
+        # key, a baseline, a project with a folder.
+        cloud_diff_baseline_commit="synthetic-baseline",
     )
     reads_wire.audit.is_available = available
     reads_wire.audit.get_audit_count.return_value = count
@@ -269,6 +290,31 @@ async def test_detail_audit_and_private_projection_preserve_jsonb_and_extensions
         reads_wire.audit.get_audit_count.assert_not_awaited()
     reads_wire.audit.get_audit_counts.assert_not_awaited()
     assert reads_wire.events == ["approved", "job_access"]
+
+
+@pytest.mark.asyncio
+async def test_detail_reads_exact_startup_view_after_owner_gate(reads_wire):
+    view = {
+        "stage": "readiness",
+        "state": "attention",
+        "reason_code": "invalid_image",
+        "readiness_deadline_at": STAMP,
+    }
+    reads_wire.state.job["status"] = "processing"
+    reads_wire.db.container_workspace_creation_views.return_value = {UUID(JOB): view}
+    response = await get(reads_wire, DETAIL)
+    assert response.status_code == 200
+    assert response.json()["workspace_creation"] == {
+        **view,
+        "readiness_deadline_at": "2026-09-07T08:00:00Z",
+    }
+    reads_wire.db.container_workspace_creation_views.assert_awaited_once_with(
+        "job", [JOB]
+    )
+    reads_wire.db.container_workspace_creation_views.reset_mock()
+    denied = await get(reads_wire, DETAIL, authenticated=False)
+    assert denied.status_code == 401
+    reads_wire.db.container_workspace_creation_views.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -324,7 +370,7 @@ async def test_stats_wire_ignores_status_and_preserves_future_status_counts(read
             {
                 "status": "invalid",
                 "origin": "invalid",
-                "offset": main.JOBS_MAX_OFFSET + 1,
+                "offset": job_queries_module.JOBS_MAX_OFFSET + 1,
             },
             422,
             "Unknown job status",
@@ -333,7 +379,7 @@ async def test_stats_wire_ignores_status_and_preserves_future_status_counts(read
             "/api/jobs",
             {
                 "origin": "invalid",
-                "offset": main.JOBS_MAX_OFFSET + 1,
+                "offset": job_queries_module.JOBS_MAX_OFFSET + 1,
                 "project_id": "invalid",
             },
             422,
@@ -341,7 +387,7 @@ async def test_stats_wire_ignores_status_and_preserves_future_status_counts(read
         ),
         (
             "/api/jobs",
-            {"offset": main.JOBS_MAX_OFFSET + 1, "project_id": "invalid"},
+            {"offset": job_queries_module.JOBS_MAX_OFFSET + 1, "project_id": "invalid"},
             400,
             "exceeds the maximum",
         ),
@@ -425,7 +471,7 @@ async def test_read_failures_keep_http_exception_or_existing_string_detail(
 
 def isolated_app(label, owner, count):
     """Compose a real router twice, with no collaborators taken from main."""
-    app = FastAPI(default_response_class=main.CustomJSONResponse)
+    app = FastAPI(default_response_class=http_composition.CustomJSONResponse)
     app.include_router(router)
     row = job_row(user_id=owner, existing_extension={"application": label})
     conn = SimpleNamespace(fetch=AsyncMock(return_value=[row]))
@@ -434,6 +480,7 @@ def isolated_app(label, owner, count):
     acquired.__aexit__ = AsyncMock(return_value=None)
     store = SimpleNamespace(
         acquire=MagicMock(return_value=acquired),
+        container_workspace_creation_views=AsyncMock(return_value={}),
         get_project=AsyncMock(return_value={"main_cloud_folder_handle": None}),
         query_jobs=AsyncMock(
             return_value=SimpleNamespace(
@@ -515,7 +562,7 @@ async def test_job_read_router_isolates_two_apps_and_resolves_each_request(
     forbidden_factory = MagicMock(
         side_effect=AssertionError("global application accessed")
     )
-    monkeypatch.setattr(main, "_job_reads_dependencies", forbidden_factory)
+    monkeypatch.setattr(jobs_composition, "job_reads_dependencies", forbidden_factory)
     first = isolated_app("first", USER, 3)
     second = isolated_app("second", CHILD, 8)
     responses = await asyncio.gather(get(first, path), get(second, path))
@@ -569,8 +616,8 @@ async def test_unconfigured_read_router_never_falls_back_to_main(monkeypatch):
     forbidden_factory = MagicMock(
         side_effect=AssertionError("global application accessed")
     )
-    monkeypatch.setattr(main, "_job_reads_dependencies", forbidden_factory)
-    app = FastAPI(default_response_class=main.CustomJSONResponse)
+    monkeypatch.setattr(jobs_composition, "job_reads_dependencies", forbidden_factory)
+    app = FastAPI(default_response_class=http_composition.CustomJSONResponse)
     app.include_router(router)
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=app, raise_app_exceptions=False),

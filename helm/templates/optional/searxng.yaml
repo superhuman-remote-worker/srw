@@ -30,6 +30,10 @@ data:
       secret_key: "overridden-by-SEARXNG_SECRET"
       limiter: false
       image_proxy: false
+    {{- with .Values.searxng.engines }}
+    engines:
+      {{- toYaml . | nindent 6 }}
+    {{- end }}
 ---
 apiVersion: v1
 kind: Secret

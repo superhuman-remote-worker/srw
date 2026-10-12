@@ -24,6 +24,7 @@ from orchestrator.database.postgres import PostgresDB
 from orchestrator.security import crypto
 from orchestrator.services.notification_catalog import notification_id
 from orchestrator.services.notification_service import NotificationService
+from orchestrator.services.notification_feed import NotificationFeedService
 
 SCHEMA_FILE = (
     Path(__file__).resolve().parents[1]
@@ -35,6 +36,107 @@ SCHEMA_FILE = (
 
 USER = str(uuid.uuid4())
 OTHER = str(uuid.uuid4())
+
+
+@pytest.mark.asyncio
+async def test_lifecycle_hint_crosses_real_postgres_replicas_only_for_owner(
+    pg_dsn, monkeypatch
+):
+    """Separate LISTEN leases, pg_notify, and a killed listener prove recovery."""
+    from orchestrator.services import notification_feed as feed_module
+
+    monkeypatch.setattr(feed_module, "_LISTENER_CHECK_SECONDS", 0.05)
+    monkeypatch.setattr(feed_module, "_RECONNECT_MIN_SECONDS", 0.3)
+    first_db = PostgresDB(
+        connection_string=pg_dsn, min_connections=1, max_connections=3
+    )
+    second_db = PostgresDB(
+        connection_string=pg_dsn,
+        min_connections=1,
+        max_connections=3,
+        server_settings={"application_name": "srw_lifecycle_test_replica_b"},
+    )
+    await first_db.connect()
+    await second_db.connect()
+    first, second = NotificationFeedService(), NotificationFeedService()
+    stop_first, stop_second = asyncio.Event(), asyncio.Event()
+    first_task = asyncio.create_task(first.run_lifecycle_bridge(first_db, stop_first))
+    second_task = asyncio.create_task(
+        second.run_lifecycle_bridge(second_db, stop_second)
+    )
+    try:
+        await asyncio.wait_for(
+            asyncio.gather(
+                first.lifecycle_bridge_ready.wait(),
+                second.lifecycle_bridge_ready.wait(),
+            ),
+            5,
+        )
+        owner, stranger, thread, generation = (str(uuid.uuid4()) for _ in range(4))
+        local = first.subscribe_sse(owner)
+        remote = second.subscribe_sse(owner)
+        foreign = second.subscribe_sse(stranger)
+        first.publish_lifecycle(
+            owner, thread, "provisioning", session_runtime_generation=generation
+        )
+        for stream in (local, remote):
+            hint = await asyncio.wait_for(stream.get(), 5)
+            assert hint == {
+                "type": "session.lifecycle",
+                "thread_id": thread,
+                "state": "provisioning",
+                "session_runtime_generation": generation,
+            }
+        assert local.empty()  # receiving our own NOTIFY is not a second delivery
+        assert foreign.empty()
+        listener_pid = await first_db.fetchval(
+            "SELECT pid FROM pg_stat_activity WHERE datname=current_database() "
+            "AND application_name='srw_lifecycle_test_replica_b'"
+        )
+        assert listener_pid is not None
+        assert await first_db.fetchval("SELECT pg_terminate_backend($1)", listener_pid)
+
+        async def listener_lost():
+            while second.lifecycle_bridge_ready.is_set():
+                await asyncio.sleep(0.01)
+
+        await asyncio.wait_for(listener_lost(), 5)
+        assert await asyncio.wait_for(remote.get(), 5) is None
+        gap = second.subscribe_sse(owner)
+        assert await asyncio.wait_for(gap.get(), 1) is None
+
+        async def listener_reinstalled():
+            while True:
+                pid = await first_db.fetchval(
+                    "SELECT pid FROM pg_stat_activity WHERE datname=current_database() "
+                    "AND application_name='srw_lifecycle_test_replica_b'"
+                )
+                if (
+                    pid is not None
+                    and pid != listener_pid
+                    and second.lifecycle_bridge_ready.is_set()
+                ):
+                    return
+                await asyncio.sleep(0.01)
+
+        await asyncio.wait_for(listener_reinstalled(), 5)
+        recovered = second.subscribe_sse(owner)
+        new_generation = str(uuid.uuid4())
+        first.publish_lifecycle(
+            owner, thread, "ready", session_runtime_generation=new_generation
+        )
+        assert (await asyncio.wait_for(recovered.get(), 5))[
+            "session_runtime_generation"
+        ] == new_generation
+        assert not first_task.done() and not second_task.done()
+    finally:
+        stop_first.set()
+        stop_second.set()
+        await asyncio.wait_for(asyncio.gather(first_task, second_task), 5)
+        await first_db.close()
+        await second_db.close()
+    assert not first.lifecycle_bridge_ready.is_set()
+    assert not second.lifecycle_bridge_ready.is_set()
 
 
 @pytest.fixture(scope="module")

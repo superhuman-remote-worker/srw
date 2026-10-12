@@ -13,8 +13,8 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from shared.credential_connectors import (
-    collect_credential_env,
     normalize_credential_env,
+    split_credential_env,
 )
 from shared.runtime.core.backends.remote import RemoteBackend
 from shared.runtime.core.credential_env import INSTALL_CREDENTIAL_ENV
@@ -29,9 +29,61 @@ def test_invalid_or_reserved_env_names(name):
     assert "synthetic-value" not in str(caught.value)
 
 
+@pytest.mark.parametrize(
+    "name",
+    [
+        "NODE_OPTIONS",
+        "GIT_SSH_COMMAND",
+        "JAVA_TOOL_OPTIONS",
+        "EDITOR",
+        "PAGER",
+        "PSQLRC",
+        "npm_config_registry",
+        "KUBECONFIG",
+    ],
+)
+def test_an_environment_connector_may_not_set_a_code_hook(name):
+    """Decision 36: SRW's own environment connectors follow the one rule."""
+    with pytest.raises(ValueError, match="connector may set|reserved") as caught:
+        normalize_credential_env({"VENDOR_TOKEN": "t", name: "synthetic-value"})
+    assert "synthetic-value" not in str(caught.value)
+
+
+@pytest.mark.parametrize(
+    "name",
+    ["HTTPS_PROXY", "no_proxy", "SSL_CERT_FILE", "NODE_AUTH_TOKEN", "GITHUB_TOKEN"],
+)
+def test_an_environment_connector_may_set_proxies_ca_bundles_and_credentials(name):
+    assert normalize_credential_env({name: "v"}) == {name: "v"}
+
+
+def test_a_stored_set_splits_into_what_is_delivered_and_what_is_refused():
+    values, refused = split_credential_env(
+        {"VENDOR_TOKEN": "t", "NODE_OPTIONS": "synthetic-value", "PATH": "/x"}
+    )
+    assert values == {"VENDOR_TOKEN": "t"}
+    assert set(refused) == {"NODE_OPTIONS", "PATH"}
+    assert "connector may set" in refused["NODE_OPTIONS"]
+    assert "reserved by the workspace" in refused["PATH"]
+    assert "synthetic-value" not in " ".join(refused.values())
+    # What no delivery can take still fails the delivery.
+    with pytest.raises(ValueError, match="name/value object"):
+        split_credential_env(["VENDOR_TOKEN"])
+    with pytest.raises(ValueError, match="must be a string"):
+        split_credential_env({"VENDOR_TOKEN": 3})
+
+
+def _environment(entries):
+    """What the environment materializer installs for a payload."""
+    from agent.connectors import deliveries_from_payload
+    from agent.connectors.env import credential_environment
+
+    return credential_environment(deliveries_from_payload(entries))
+
+
 def test_conflicting_connector_names_are_rejected():
     with pytest.raises(ValueError, match="Multiple attached connectors"):
-        collect_credential_env(
+        _environment(
             [
                 {
                     "type": "credentials",
@@ -40,6 +92,25 @@ def test_conflicting_connector_names_are_rejected():
                 {"type": "generic", "credentials": {"env_vars": {"API_KEY": "two"}}},
             ]
         )
+
+
+@pytest.mark.parametrize("env_vars", [{}, None])
+def test_a_credentials_connector_without_variables_is_refused(env_vars):
+    """The credentials spec's env_vars slot is required; generic's is not."""
+    credentials = {} if env_vars is None else {"env_vars": env_vars}
+    with pytest.raises(ValueError, match="Add at least one credential"):
+        _environment([{"type": "credentials", "credentials": credentials}])
+    assert _environment([{"type": "generic", "credentials": credentials}]) == {}
+
+
+def test_only_env_connectors_contribute_variables():
+    assert _environment(
+        [
+            {"type": "generic", "credentials": {"env_vars": {"A": "1"}}},
+            {"type": "credentials", "credentials": {"env_vars": {"B": "2"}}},
+            {"type": "postgresql", "credentials": {"env_vars": {"C": "3"}}},
+        ]
+    ) == {"A": "1", "B": "2"}
 
 
 def _install(target, values):
@@ -84,6 +155,37 @@ def test_install_retains_fields_and_quotes_shell_content(tmp_path):
     assert target.with_suffix(".json").stat().st_mode & 0o777 == 0o600
 
 
+def test_a_detached_driver_s_variables_are_unset_for_new_commands(
+    tmp_path, monkeypatch
+):
+    """A registered image driver detached live (D6): its names are unset in
+    the work item's environment file; the others stay, and a name no
+    connector may set (reserved, or a code hook the image may set itself) is
+    never touched."""
+    backend = RemoteBackend(host="unused", job_id="job-detach")
+    monkeypatch.setattr(backend, "_init_shell", lambda: None)
+    monkeypatch.setattr(
+        backend, "_resolve_home_path", lambda path: str(tmp_path / path)
+    )
+    sent = []
+
+    def send(command, secret, **kwargs):
+        sent.append(json.loads(secret))
+        subprocess.run(["bash", "-c", command], input=secret, text=True, check=True)
+        return True
+
+    monkeypatch.setattr(backend, "execute_claim_resource_with_secret_stdin", send)
+    backend.install_credential_environment({"ACME_TOKEN": "minted", "KEEP": "k"})
+    backend.unset_credential_environment(["ACME_TOKEN", "PATH", "NODE_OPTIONS"])
+    assert sent[-1] == {"ACME_TOKEN": None}
+    assert _read_vars(Path(backend._credential_env_path), ["ACME_TOKEN", "KEEP"]) == {
+        "ACME_TOKEN": None,
+        "KEEP": "k",
+    }
+    backend.unset_credential_environment(["PATH", "NODE_OPTIONS", "DEBIAN_FRONTEND"])
+    assert len(sent) == 2  # nothing to unset: no command
+
+
 def test_remote_delivery_uses_private_transport_and_work_identity(
     tmp_path, monkeypatch
 ):
@@ -118,7 +220,7 @@ def test_remote_delivery_uses_private_transport_and_work_identity(
 
         monkeypatch.setattr(backend, "_exec", execute)
         assert backend.exec_command('printf "%s" "$API_KEY"') == value
-        command, _ = backend._build_guarded_shell_command(
+        command = backend._build_guarded_shell_command(
             'printf "%s\\n" "$API_KEY"', "__DONE_test__", None
         )
         assert (
@@ -129,10 +231,10 @@ def test_remote_delivery_uses_private_transport_and_work_identity(
 
 
 def test_generic_credentials_do_not_enter_agent_environment(monkeypatch):
-    from agent.core.datasource_setup import process_datasources
+    from tests._connector_runtime import open_harness
 
     monkeypatch.delenv("SYNTHETIC_CONNECTOR_KEY", raising=False)
-    process_datasources(
+    connections, _ = open_harness(
         [
             {
                 "type": "generic",
@@ -140,15 +242,24 @@ def test_generic_credentials_do_not_enter_agent_environment(monkeypatch):
             }
         ]
     )
+    assert connections == {}
     assert "SYNTHETIC_CONNECTOR_KEY" not in os.environ
 
 
-def test_credentials_require_shell_workspace():
-    from agent.core.datasource_setup import install_workspace_credentials
+def _deliver_env(entries, workspace):
+    from agent.connectors import RuntimeContext, deliveries_from_payload
+    from agent.connectors.env import EnvFileMaterializer
 
+    EnvFileMaterializer().materialize(
+        deliveries_from_payload(entries),
+        RuntimeContext(execution="session", workspace_manager=workspace),
+    )
+
+
+def test_credentials_require_shell_workspace():
     workspace = SimpleNamespace(backend=SimpleNamespace(supports_shell=False))
     with pytest.raises(ValueError, match="sandbox or VM"):
-        install_workspace_credentials(
+        _deliver_env(
             [
                 {
                     "type": "credentials",
@@ -157,6 +268,120 @@ def test_credentials_require_shell_workspace():
             ],
             workspace,
         )
+
+
+def test_the_environment_materializer_installs_every_env_connector():
+    installed = []
+    workspace = SimpleNamespace(
+        backend=SimpleNamespace(
+            supports_shell=True, install_credential_environment=installed.append
+        )
+    )
+    _deliver_env(
+        [
+            {"type": "generic", "credentials": {"env_vars": {"A": "1"}}},
+            {"type": "postgresql", "credentials": {"env_vars": {"IGNORED": "x"}}},
+            {"type": "credentials", "credentials": {"env_vars": {"B": "2"}}},
+        ],
+        workspace,
+    )
+    assert installed == [{"A": "1", "B": "2"}]
+
+
+@pytest.mark.parametrize(
+    ("entries", "message"),
+    [
+        (
+            [
+                {"type": "credentials", "credentials": {"env_vars": {"K": "one"}}},
+                {"type": "generic", "credentials": {"env_vars": {"K": "two"}}},
+            ],
+            "Multiple attached connectors define K",
+        ),
+        (
+            [{"type": "credentials", "credentials": {"env_vars": {}}}],
+            "Add at least one credential environment variable",
+        ),
+        (
+            [{"type": "credentials", "credentials": {"env_vars": ["API_KEY"]}}],
+            "must be a name/value object",
+        ),
+        (
+            [{"type": "generic", "credentials": {"env_vars": None}}],
+            "must be a name/value object",
+        ),
+    ],
+)
+def test_the_environment_materializer_keeps_the_delivery_errors(entries, message):
+    """The refusals a delivery keeps: what no delivery can take."""
+    from agent.connectors import deliveries_from_payload
+    from agent.connectors.env import credential_environment
+
+    with pytest.raises(ValueError, match=message):
+        credential_environment(deliveries_from_payload(entries))
+
+
+@pytest.mark.parametrize("kind", ["generic", "credentials"])
+def test_a_row_saved_before_the_rule_is_delivered_without_a_refused_name(kind, caplog):
+    """At delivery the refused variable is skipped, logged and named in the
+    README with its reason, as a credential file outside the allowlist is;
+    the connector's other variables still arrive."""
+    import logging
+
+    from agent.connectors import deliveries_from_payload
+    from agent.connectors.env import EnvFileMaterializer, credential_environment
+
+    entries = [
+        {
+            "type": kind,
+            "name": "Vendor",
+            "credentials": {
+                "env_vars": {
+                    "VENDOR_TOKEN": "t",
+                    "NODE_OPTIONS": "synthetic-value",
+                    "PATH": "/x",
+                }
+            },
+        }
+    ]
+    deliveries = deliveries_from_payload(entries)
+    with caplog.at_level(logging.WARNING):
+        assert credential_environment(deliveries) == {"VENDOR_TOKEN": "t"}
+    assert "Skipping NODE_OPTIONS for 'Vendor'" in caplog.text
+    assert "Skipping PATH for 'Vendor'" in caplog.text
+    assert "synthetic-value" not in caplog.text
+
+    installed = []
+    backend = SimpleNamespace(
+        supports_shell=True, install_credential_environment=installed.append
+    )
+    rt = SimpleNamespace(workspace_manager=SimpleNamespace(backend=backend))
+    EnvFileMaterializer().materialize(deliveries, rt)
+    assert installed == [{"VENDOR_TOKEN": "t"}]
+
+    (facts,) = EnvFileMaterializer().facts(deliveries, rt)
+    text = "\n".join(facts.lines)
+    assert "Environment: `VENDOR_TOKEN`" in text
+    assert (
+        "  NODE_OPTIONS is not a variable a connector may set: tools read it to "
+        "run code or load their config; not delivered by SRW (a value set by an "
+        "earlier delivery stays until the work ends)" in facts.lines
+    )
+    assert (
+        "  Environment name PATH is reserved by the workspace; not delivered by "
+        "SRW (a value set by an earlier delivery stays until the work ends)"
+        in facts.lines
+    )
+    assert "synthetic-value" not in text
+
+
+def test_the_readme_reads_no_variables_from_an_unreadable_set():
+    from agent.connectors import deliveries_from_payload
+    from agent.connectors.env import EnvFileMaterializer
+
+    entries = [{"type": "generic", "name": "Odd", "credentials": {"env_vars": ["X"]}}]
+    (facts,) = EnvFileMaterializer().facts(deliveries_from_payload(entries), None)
+    assert facts.lines == ["- **Odd** (generic) — CLI via env vars"]
 
 
 def _browser_executor():

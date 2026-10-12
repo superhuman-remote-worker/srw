@@ -7,12 +7,44 @@ from typing import Any, Mapping
 import httpx
 
 from agent.tools.research.search.base import Result
-from agent.tools.research.search.errors import ProviderError, ProviderRequestError
+from agent.tools.research.search.errors import (
+    ProviderError,
+    ProviderRequestError,
+    ProviderUnavailableError,
+)
 from agent.tools.research.search.http import (
     configured_endpoint,
     raise_for_provider_status,
     transport_error,
 )
+
+
+_MAX_REPORTED_ENGINES = 5
+
+
+def _raise_if_engines_failed(unresponsive: Any) -> None:
+    """Treat an empty answer from failing upstream engines as an outage.
+
+    SearXNG answers HTTP 200 with no results when its upstream engines are
+    CAPTCHA-blocked or rate-limited, and names them in ``unresponsive_engines``.
+    That is an unavailable provider, not an empty result set: surfacing it lets
+    the search fallback answer and tells the model the tool, not the query,
+    failed. An empty answer with no failed engine stays an answer.
+    """
+    if not isinstance(unresponsive, list) or not unresponsive:
+        return
+    failures = []
+    for entry in unresponsive[:_MAX_REPORTED_ENGINES]:
+        if isinstance(entry, (list, tuple)) and len(entry) >= 2:
+            failures.append(f"{entry[0]} ({entry[1]})")
+        else:
+            failures.append(str(entry))
+    if len(unresponsive) > _MAX_REPORTED_ENGINES:
+        failures.append(f"{len(unresponsive) - _MAX_REPORTED_ENGINES} more")
+    raise ProviderUnavailableError(
+        f"SearXNG returned no results while {len(unresponsive)} upstream "
+        f"engine(s) failed: {', '.join(failures)}"
+    )
 
 
 class SearxngAdapter:
@@ -54,7 +86,7 @@ class SearxngAdapter:
             payload = response.json()
             if not isinstance(payload, Mapping):
                 raise ValueError("response is not an object")
-            return [
+            results = [
                 Result(
                     title=str(item.get("title") or "Untitled"),
                     url=str(item.get("url") or ""),
@@ -67,6 +99,9 @@ class SearxngAdapter:
             raise
         except Exception as exc:
             raise transport_error("SearXNG", exc) from exc
+        if not results:
+            _raise_if_engines_failed(payload.get("unresponsive_engines"))
+        return results
 
     def extract(self, urls: list[str], **kw: Any):
         del urls, kw

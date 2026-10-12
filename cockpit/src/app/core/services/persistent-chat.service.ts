@@ -12,14 +12,14 @@ import { takeUntilDestroyed } from '@angular/core/rxjs-interop';
 import { HttpClient } from '@angular/common/http';
 import { filter, firstValueFrom, map, Observable, Subscription, tap, timeout } from 'rxjs';
 import { environment } from '../environment';
-import { Project, ThreadCloudDiffSummary, ThreadMount, ThreadStatus } from '../models/api.model';
+import { Project, ThreadCloudDiffSummary, ThreadMount, ThreadProtectedSource, ThreadStatus, WorkspaceCreationView, WorkspaceLifecycleView } from '../models/api.model';
 // Type + pure derivation only — importing them from the review component
 // would pull it (and Monaco's loader) back into the eager bundle graph and
 // defeat the @defer that keeps the review surface lazy.
 import {
   folderLinkMatches,
   ProtectedFolderLink,
-  selectProtectedProjectMount,
+  protectedFolderSource,
 } from '../../views/job-diff-review/protected-folder-link';
 import { FilePreview, ThreadUploadEvent } from '../models/file.model';
 import {
@@ -32,12 +32,20 @@ import {
   Turn,
   UserTurn,
 } from '../models/turn.model';
+import {
+  parseSubagentRecoveryContinuation,
+  parseSubagentRecoveryResult,
+} from '../models/subagent-recovery.model';
 import { TranslocoService } from '@jsverse/transloco';
+import { WorkspaceChoice } from '../models/workspace-template.model';
+import { WorkspacePreview } from '../models/workspace.model';
+import { choiceBackend, choiceRequestFields } from '../../views/workspaces/workspace-template-utils';
 import { ApiService } from './api.service';
 import type { SessionQueueState } from '../models/api.model';
 import { ErrorMessageService } from './error-message.service';
 import { IndexedDbService } from './indexed-db.service';
 import { NotificationService } from './notification.service';
+import { classifySseProbeFailure, sseRetryDelayMs } from './sse-recovery';
 import { classifyResumeError, ConfigDriftItem } from './resume-error';
 import { reduce, ReducerAction } from './turn-reducer';
 import {
@@ -57,6 +65,12 @@ import {
 } from './persistent-thread-transport-bridge.service';
 import { CanvasService } from './canvas.service';
 import { CapabilitiesService } from './capabilities.service';
+import {
+  CloudFolderBinding,
+  CloudFolderProblem,
+  cloudFolderStateFromEvent,
+  cloudFolderStateFromStatus,
+} from '../util/cloud-mount-status';
 
 /**
  * Transport architecture (post WS→SSE migration, 2026-05-13):
@@ -110,6 +124,13 @@ function isCommittedCanvasControl(
 
 /** Session title from a landing draft's first message: first line, collapsed
  *  whitespace, capped at 60 chars (on a word boundary when one is near). */
+/** Reader-facing name for a workspace tier id: `vm` -> "VM", `sandbox` -> "container". */
+export function workspaceTierLabel(tier: string): string {
+  if (tier === 'vm') return 'VM';
+  if (tier === 'sandbox') return 'container';
+  return tier;
+}
+
 export function draftTitleFrom(message: string): string {
   const line = message.split('\n')[0].replace(/\s+/g, ' ').trim();
   if (!line) return 'Untitled Session';
@@ -138,6 +159,15 @@ const CONTROL_WS_WATCHDOG_TIMEOUT_MS = 45_000;
 // hours later. See `knowledge-base/knowledge/issues/persistent_chat_silent_disconnect.md`.
 const SSE_WATCHDOG_INTERVAL_MS = 5000;
 const SSE_WATCHDOG_TIMEOUT_MS = 45000;
+// A hung shared read must release its slot so later lifecycle observations
+// and an ambiguous End's fresh reread can proceed.
+const THREAD_META_RESPONSE_TIMEOUT_MS = 15_000;
+
+interface ThreadLifecycleObservation {
+  status?: unknown;
+  runtime_retirement_pending?: unknown;
+  session_runtime_generation?: unknown;
+}
 
 // After an interrupt POST we wait for the agent to emit `interrupt.ack` /
 // `turn.completed` over SSE to clear the "Stopping…" state. If that frame is
@@ -236,7 +266,7 @@ export interface ToolCallInfo {
 }
 
 /**
- * The tool call the agent is currently blocked on, delivered in the
+ * A tool call the agent is currently blocked on, delivered in the
  * session.state welcome frame so a (re)attaching client can render a
  * running-command card even when the in-flight turn isn't in REST history yet
  * (it's persisted only at turn end).
@@ -275,13 +305,38 @@ export type NarrationMode = 'silent' | 'verbose' | 'auto';
 type DurableControl =
   | { method: 'mode.set'; mode: PermissionMode }
   | { method: 'narration.set'; mode: NarrationMode }
-  | { method: 'workspace.undo' };
+  | { method: 'workspace.undo' }
+  | { method: 'compact'; focus?: string; boundary_message_id?: string };
 
-type DurableScalarControl = Exclude<DurableControl, { method: 'workspace.undo' }>;
+type DurableScalarControl = Extract<DurableControl, { method: 'mode.set' | 'narration.set' }>;
 
 function isDurableScalarControl(control: DurableControl): control is DurableScalarControl {
-  return control.method !== 'workspace.undo';
+  return control.method === 'mode.set' || control.method === 'narration.set';
 }
+
+/** Slash commands whose availability follows a declared control verb. The
+ *  palette offers a command only when its verb has a transport on the current
+ *  session (session_slash_commands_and_stateless_compact.md §2). */
+const SLASH_COMMAND_VERBS: Record<string, readonly string[]> = {
+  '/compact': ['compact'],
+  '/undo': ['undo', 'workspace.undo'],
+  '/auto': ['mode.set'],
+  '/supervised': ['mode.set'],
+  '/autonomous': ['mode.set'],
+  '/silent': ['narration.set'],
+  '/verbose': ['narration.set'],
+  '/upgrade-workspace': ['upgrade-to-workspace'],
+};
+
+/** Owner rejection codes with a specific explanation (the fallback is the
+ *  generic `chat.control.ownerRejected`). */
+const CONTROL_REJECTION_KEYS: Record<string, string> = {
+  compaction_failed: 'chat.control.compactFailed',
+  boundary_not_in_context: 'chat.control.compactBoundaryGone',
+  workspace_undo_no_checkpoint: 'chat.control.undoNothing',
+  workspace_undo_checkpoint_missing: 'chat.control.undoNothing',
+  workspace_undo_unsupported: 'chat.control.undoUnsupported',
+};
 
 interface DurableControlOutboxItem {
   threadId: string;
@@ -513,6 +568,17 @@ const LEGACY_SOCKET_VERBS = new Set([
  *  second; a swap that compacts first can take longer, hence the slack. */
 const CONFIG_UPDATE_ACK_TIMEOUT_MS = 30_000;
 
+/**
+ * How an `endSession` request finished, for the caller that owns navigation.
+ * - `done`: the End was accepted, or there was no thread.
+ * - `kept`: the session was busy and the user declined to stop its unfinished
+ *   turn; nothing was ended.
+ * - `retryable`: a stateless End met a retryable retirement fence (503). It
+ *   may already have begun; the thread row was re-read, and End is the retry.
+ * Any other failure still rejects.
+ */
+export type EndSessionOutcome = 'done' | 'kept' | 'retryable';
+
 /** Outcome of one `updateConfig` request — resolved, never rejected, so a
  *  caller can always settle its own optimistic state. */
 export type ConfigUpdateOutcome =
@@ -586,6 +652,12 @@ interface SessionStateSnapshot extends Record<string, unknown> {
   model: string | null;
   temperature: number | null;
   running_tool: RunningToolInfo | null;
+  /**
+   * Every call in flight, for a parallel batch (e.g. a subagent fan-out).
+   * Not sent by any server yet — both producers report only one call — so
+   * `running_tool` stays the fallback. See `parseRunningTools`.
+   */
+  running_tools?: RunningToolInfo[] | null;
   pending_permissions: unknown[];
   /** Present on task-aware servers; omitted by older rolling-deploy peers. */
   tasks?: SessionTask[];
@@ -714,6 +786,16 @@ export class PersistentChatService {
       const tid = this.threadId();
       if (!event || !tid || event.thread_id !== tid) return;
       const eventGeneration = this._canonicalRuntimeGeneration(event.session_runtime_generation);
+      if (this.terminalControlThreadId === tid) {
+        // Shared notifications also describe Resume from another client.
+        // They only wake a fresh owner read; neither the event nor a UUID
+        // different from G1 can alone grant successor control authority.
+        if (eventGeneration && eventGeneration !== this.retiredRuntimeGeneration) {
+          if (event.backend === 'vm') this.isVmSession.set(true);
+          untracked(() => void this._reconcileExternalResume(tid));
+        }
+        return;
+      }
       const invalidBinding = this.invalidBindingRuntime;
       if (invalidBinding?.threadId === tid) {
         // A binding refusal is scoped to one exact runtime. Same-G and
@@ -750,6 +832,8 @@ export class PersistentChatService {
       ) {
         return;
       }
+      if (this.successorRuntime?.threadId === tid &&
+          eventGeneration !== this.successorRuntime.generation) return;
       if (
         (event.session_runtime_generation !== undefined && !eventGeneration) ||
         (this.retiredRuntimeGeneration !== null &&
@@ -759,10 +843,6 @@ export class PersistentChatService {
       ) {
         return;
       }
-      // A delayed provisioning/booting/ready event from the just-ended
-      // runtime cannot reopen its startup card. Only explicit Resume clears
-      // this terminal latch.
-      if (this.terminalControlThreadId === tid) return;
       // Once the session is actually live, ignore further lifecycle
       // events (a duplicate from a racing /prepare must not regress
       // the UI). isStartingSession also gates rendering on
@@ -789,6 +869,15 @@ export class PersistentChatService {
           break;
       }
     });
+    // The shared feed is ephemeral. A reconnect is a bounded recovery edge
+    // for a Resume notification missed while the browser was offline.
+    effect(() => {
+      if (!this.notifications.isConnected()) return;
+      untracked(() => {
+        const tid = this.threadId();
+        if (tid) void this._reconcileExternalResume(tid);
+      });
+    });
     // Live/non-terminal stage publications travel on the app-wide
     // notification SSE. Terminal publications are durably replayed on the
     // thread journal and converge through the matching _handleEvent case.
@@ -804,6 +893,14 @@ export class PersistentChatService {
     // without Canvas ever depending on this service.
     effect(() => {
       this.threadTransport.setAgentTurnActive(this.isStreaming());
+    });
+
+    // A /compact (or "Summarize up to here") asked for mid-response runs once
+    // the session is idle again — see requestCompaction().
+    effect(() => {
+      const busy = this.isStreaming() || this.isAwaitingTurn();
+      if (busy) return;
+      untracked(() => this._flushDeferredCompaction());
     });
 
     // Stamp the start of an awaiting stretch and tick a 1 s clock while it
@@ -856,6 +953,10 @@ export class PersistentChatService {
       });
     });
     this.destroyRef.onDestroy(() => this._stopQueuePoll());
+    this.destroyRef.onDestroy(() => {
+      this.connectGeneration++;
+      this._stopSseWatchdog();
+    });
 
     // Invariant: "Stopping…" (isInterrupting) only makes sense while a turn
     // is actually streaming. Whenever streaming ends — turn completed, the
@@ -901,14 +1002,21 @@ export class PersistentChatService {
         if (e.persisted) revalidate(true);
       };
       const onResume = () => revalidate(true);
+      // `offline` means no network interface at all (unlike `online`, which
+      // can be wrong in the hopeful direction), so neither link survives it:
+      // leave "Connected" now rather than when the watchdog notices ~45s on.
+      // The reopened stream sits in the browser's retry loop until `online`.
+      const onOffline = () => revalidate(true);
       document.addEventListener('visibilitychange', onVisible);
       window.addEventListener('online', onUnforced);
+      window.addEventListener('offline', onOffline);
       window.addEventListener('focus', onUnforced);
       window.addEventListener('pageshow', onPageShow);
       document.addEventListener('resume', onResume);
       this.destroyRef.onDestroy(() => {
         document.removeEventListener('visibilitychange', onVisible);
         window.removeEventListener('online', onUnforced);
+        window.removeEventListener('offline', onOffline);
         window.removeEventListener('focus', onUnforced);
         window.removeEventListener('pageshow', onPageShow);
         document.removeEventListener('resume', onResume);
@@ -1047,10 +1155,12 @@ export class PersistentChatService {
 
   // --- Running-command snapshot ---
   // Set from the session.state welcome frame on (re)attach when the loop is
-  // blocked in a tool call; cleared when that tool completes or the turn ends.
-  // Lets the UI show a "running command" card instead of a blank "Connecting…"
-  // during a long mid-turn block (the in-flight turn isn't in REST history).
-  readonly runningTool = signal<RunningToolInfo | null>(null);
+  // blocked in tool calls; each entry is dropped when its tool completes, and
+  // all of them when the turn ends. Lets the UI show "running command" cards
+  // instead of a blank "Connecting…" during a long mid-turn block (the
+  // in-flight turn isn't in REST history). A list, because a parallel batch
+  // (a subagent fan-out) blocks on several calls at once.
+  readonly runningTools = signal<RunningToolInfo[]>([]);
 
   // --- Narration state ---
   readonly narrationMode = signal<NarrationMode>('auto');
@@ -1116,6 +1226,15 @@ export class PersistentChatService {
   //     turn.completed — see refreshCloudDiffCount / _scheduleCloudDiffRefresh). ---
   private readonly _protectedCloud = signal(false);
   readonly protectedCloud = computed(() => this._protectedCloud());
+  /** Cloud folders of this session that are not available, and why (D7). */
+  readonly cloudFolderProblems = signal<CloudFolderProblem[]>([]);
+  /** Every attached cloud folder with its level and binding state (main
+   *  cloud slices 3 to 6), for the session header. */
+  readonly cloudFolders = signal<CloudFolderBinding[]>([]);
+  /** The session's agent predates the in-pod plane: folders unmanaged. */
+  readonly cloudFoldersAgentOutdated = signal(false);
+  /** A protected session runs without its cloud (decision 42). */
+  readonly cloudFoldersProtected = signal(false);
   readonly cloudChangesCount = signal(0);
   readonly protectedMountName = signal<string | null>(null);
   /** ISO timestamp the current staged diff was captured at (the summary's
@@ -1128,6 +1247,9 @@ export class PersistentChatService {
    *  Phase 1; nothing read them until PC-19 needed to name the folder the
    *  staged diff applies to. */
   readonly threadMounts = signal<ThreadMount[]>([]);
+  /** A protected session's folder as the thread GET names it
+   *  (`protected_source`): the connector it bound at protected. */
+  readonly protectedSource = signal<ThreadProtectedSource | null>(null);
   /** A browser link to the protected project folder, or null when it cannot
    *  be derived with certainty. Consumers must still cross-check it against
    *  the diff summary's `protected_mount` (`folderLinkMatches`) before
@@ -1166,10 +1288,49 @@ export class PersistentChatService {
 
   // --- Lifecycle state from the row (drives the resume card) ---
   readonly threadStatus = signal<ThreadStatus | null>(null);
+  /** Exact viewed thread confirmed absent after an observed `ending` state. */
+  readonly deletedThreadId = signal<string | null>(null);
   readonly endedAt = signal<string | null>(null);
   /** Safe public projection of the immutable retirement outcome. The browser
    *  never receives or stores the server's retirement token/context. */
   readonly retirementDisposition = signal<'ended' | 'suspended' | null>(null);
+  /** True only while a pending retirement is a permanent Delete. */
+  readonly retirementPermanent = signal(false);
+  /** The row's execution lane; null until the thread row has been read. */
+  readonly executionLane = signal<'pinned' | 'stateless' | null>(null);
+  /**
+   * A stateless soft End left pending by a retryable fence: nothing on the
+   * server finishes it by itself, and End is the retry the server accepts.
+   * (A pinned retirement settles on the server; a permanent one is retried
+   * by Delete from the session list.)
+   */
+  readonly endRetryAvailable = computed(
+    () =>
+      this.threadStatus() === 'ending' &&
+      this.executionLane() === 'stateless' &&
+      !this.retirementPermanent(),
+  );
+  readonly workspaceLifecycle = signal<WorkspaceLifecycleView | null>(null);
+  readonly workspaceCreation = signal<WorkspaceCreationView | null>(null);
+
+  /** Bind an IDE response to this view, including same-thread Resume. A late
+   *  ready response cannot restore the idle view of a terminal retirement. */
+  captureWorkspaceLifecycleUpdate(
+    threadId: string,
+  ): (view: WorkspaceLifecycleView | null | undefined) => boolean {
+    const generation = this.connectGeneration;
+    return (view) => {
+      if (!this._isCurrentConnect(threadId, generation)) return false;
+      if (
+        this.threadStatus() === 'ended' ||
+        (this.threadStatus() === 'ending' && this.retirementDisposition() === 'ended')
+      ) {
+        return false;
+      }
+      if (view) this.workspaceLifecycle.set(view);
+      return true;
+    };
+  }
 
   // --- Session readiness (agent has finished init and is ready for messages) ---
   readonly sessionReady = signal(false);
@@ -1230,6 +1391,9 @@ export class PersistentChatService {
    * it until it is retried — never rendered as "waiting".
    */
   private readonly _queueState = signal<{ threadId: string; queue: SessionQueueState } | null>(null);
+  /** Bumped each time a live turn.started clears the block; a queue read
+   *  that straddles a bump is dropped (see _pollQueueState). */
+  private queueStateClears = 0;
   readonly queueState = computed<SessionQueueState | null>(() => {
     const q = this._queueState();
     if (!q || q.threadId == null) return null;
@@ -1307,6 +1471,7 @@ export class PersistentChatService {
   private async _pollQueueState(): Promise<void> {
     const tid = this.threadId();
     if (!tid) return;
+    const clears = this.queueStateClears;
     let queue: SessionQueueState | null = null;
     try {
       queue = await firstValueFrom(this.api.getThreadQueue(tid));
@@ -1316,7 +1481,21 @@ export class PersistentChatService {
       return;
     }
     if (this.threadId() !== tid) return;
+    // A live turn.started landed while the read was in flight: the read may
+    // predate the claim, and re-applying it would resurrect a parked block.
+    if (this.queueStateClears !== clears) return;
     this._applyQueueState(tid, queue);
+  }
+
+  /**
+   * Re-read the queue block after a snapshot reload that does not go back
+   * through /connection (horizon, rewind, snapshot retry). Those reloads
+   * make the replayed turn.started covered, so it no longer clears a parked
+   * block — a unit claimed while this tab was away would otherwise keep its
+   * parked bubble until a full reload (nothing polls while parked).
+   */
+  private _refreshQueueStateAfterSnapshot(): void {
+    void this._pollQueueState();
   }
 
   /**
@@ -1328,21 +1507,30 @@ export class PersistentChatService {
   async retryParked(): Promise<'ok' | 'refused'> {
     const tid = this.threadId();
     if (!tid) return 'refused';
+    // A unit parked with no pending input (a push remainder, say) settles on
+    // retry without starting a turn, so only a pending input earns a waiting
+    // stretch. Unknown (no block yet) keeps the old assumption.
+    const pendingInput = this.queueState()?.pending_input !== false;
     const outcome = await firstValueFrom(this.api.retryThreadQueue(tid));
     if (this.threadId() !== tid) return 'refused';
     if (outcome.kind === 'ok') {
       this._applyQueueState(tid, {
         state: outcome.state || 'queued',
         park_reason: null,
+        park_message: null,
         parked_at: null,
         retryable: false,
         attempts: 0,
-        pending_input: true,
+        pending_input: pendingInput,
       });
-      this.pendingTurnCount.update((c) => Math.max(c, 1));
+      if (pendingInput) this.pendingTurnCount.update((c) => Math.max(c, 1));
       return 'ok';
     }
     this.toast.danger(this.transloco.translate('chat.parked.retryFailed', { code: outcome.code }));
+    // A refusal can mean the block is stale (another tab or an operator
+    // already retried and the unit settled): re-read it rather than leave a
+    // parked bubble that nothing else will ever refresh.
+    void this._pollQueueState();
     return 'refused';
   }
   /**
@@ -1450,8 +1638,12 @@ export class PersistentChatService {
   readonly draftDefaultsLoading = signal(false);
   readonly draftDefaultsError = signal(false);
   readonly draftConnectorsEnabled = signal(true);
-  /** Empty means follow the project/account defaults, including workspace recipes. */
-  readonly draftWorkspaceBackend = signal('');
+  /** The recovery view's workspace choice (Slice A3). `default` omits the field, so the project or installation decides. */
+  readonly draftWorkspaceChoice = signal<WorkspaceChoice>({kind: 'default'});
+  /** The draft's one project, for the picker's lists and defaults. */
+  readonly draftProjectId = signal<string | null>(null);
+  /** What the thread preview resolved, for the picker's Default label. */
+  readonly draftWorkspacePreview = signal<WorkspacePreview | null>(null);
   private draftDefaultsGeneration = 0;
   private creatingFromDraft = false;
 
@@ -1463,6 +1655,14 @@ export class PersistentChatService {
 
   private sse: EventSource | null = null;
   private sseWatchdogTimer: ReturnType<typeof setInterval> | null = null;
+  private sseRetryTimer: ReturnType<typeof setTimeout> | null = null;
+  private sseRetryProbeInFlight: { generation: number } | null = null;
+  private sseRetryAttempt = 0;
+  private sseRecoveryHalted = false;
+  /** A reopened transport cannot grant controls until a fresh owner read
+   * proves the current status and runtime generation after the gap. */
+  private sseRecoveryPending = false;
+  private sseRecoveryExpectedGeneration: string | null = null;
   // One-shot fallback: force a reconnect if "Stopping…" doesn't clear after
   // an interrupt POST (lost ack frame). Armed in interrupt(), cleared by the
   // isInterrupting invariant effect.
@@ -1558,6 +1758,13 @@ export class PersistentChatService {
   // ready state, not a failed WebSocket open; remember it so focus/SSE
   // recovery and user actions cannot restart the reconnect ladder.
   private controlSocket: 'unknown' | 'websocket' | 'none' = 'unknown';
+  /** A manual compaction held until the running response ends (one per
+   *  thread; see requestCompaction). Dropped on teardown and thread switch. */
+  private deferredCompaction: {
+    threadId: string;
+    focus: string;
+    boundaryMessageId?: string;
+  } | null = null;
   /** The `/connection` control declaration, stamped with the thread it
    *  describes so a stale map can never answer for the next session
    *  (singleton-state rule: stamp, don't just reset). null = not resolved
@@ -1641,6 +1848,15 @@ export class PersistentChatService {
   } | null = null;
   /** Most recently terminal runtime on this same-thread review plane. */
   private retiredRuntimeGeneration: string | null = null;
+  private retirementObservationVersion = 0;
+  private endRequest: { threadId: string } | null = null;
+  private successorRuntime: { threadId: string; generation: string } | null = null;
+  private successorRead: {
+    threadId: string;
+    generation: number;
+    version: number;
+    promise: Promise<boolean>;
+  } | null = null;
   /** Thread on which the exact runtime-generation transport contract has
    *  been observed. Keep this across same-thread reconnect/Resume gaps so a
    *  delayed legacy-shaped lifecycle frame cannot mutate the successor UI. */
@@ -1679,6 +1895,9 @@ export class PersistentChatService {
       // delayed journal tail superseded even though /connection has not yet
       // installed the candidate. Only the candidate can cancel its retry.
       return eventGeneration === bindingRecovery.candidateGeneration;
+    }
+    if (this.successorRuntime?.threadId === threadId) {
+      return eventGeneration === this.successorRuntime.generation;
     }
     // A settled suspended frame is authoritative for a control plane already
     // retired by soft End. It must match the retired runtime, not be rejected
@@ -1838,9 +2057,27 @@ export class PersistentChatService {
     return failure?.status === 409 && failure.error?.detail?.code === 'turn_in_flight';
   }
 
+  /** Stateless End refused because the turn/unit is still leased or input,
+   *  control, interrupt or permission is pending; `?force=true` stops it. */
+  private _isStatelessEndBusyError(err: unknown): boolean {
+    const failure = err as {
+      status?: unknown;
+      error?: { detail?: { code?: unknown } };
+    };
+    return failure?.status === 409 && failure.error?.detail?.code === 'stateless_end_busy';
+  }
+
+  /** The API's own retryable retirement fence: a 503 whose JSON `detail` is
+   *  a string. A gateway 503 carries no such body and stays a failure. */
+  private _isRetryableEndFence(err: unknown): boolean {
+    const failure = err as { status?: unknown; error?: { detail?: unknown } };
+    return failure?.status === 503 && typeof failure.error?.detail === 'string';
+  }
+
   private _controlPlaneAllowed(threadId: string, openingGeneration?: number): boolean {
     return (
       !this.intentionalClose &&
+      !this.sseRecoveryPending &&
       this.threadId() === threadId &&
       this.terminalControlThreadId !== threadId &&
       this.invalidBindingRuntime?.threadId !== threadId &&
@@ -1989,6 +2226,16 @@ export class PersistentChatService {
     exactFrameGeneration: string | null = null,
   ): void {
     if (this.threadId() !== threadId) return;
+    const firstRetirement = this.terminalControlThreadId !== threadId;
+    // A duplicate G1 terminal frame/read is review-plane noise, not a new
+    // owner End. It must not cancel a fresh successor read queued behind it.
+    if (firstRetirement || (exactFrameGeneration &&
+        this.retiredRuntimeGeneration !== exactFrameGeneration)) {
+      this.retirementObservationVersion++;
+    }
+    const successorGeneration = this.successorRuntime?.threadId === threadId
+      ? this.successorRuntime.generation : null;
+    this.successorRuntime = null;
     const invalidBindingGeneration =
       this.invalidBindingRuntime?.threadId === threadId
         ? this.invalidBindingRuntime.generation
@@ -2006,12 +2253,13 @@ export class PersistentChatService {
     if (this.bindingRecoveryRuntime?.threadId === threadId) {
       this.bindingRecoveryRuntime = null;
     }
-    const firstRetirement = this.terminalControlThreadId !== threadId;
     this.terminalControlThreadId = threadId;
     if (exactFrameGeneration) {
       this.retiredRuntimeGeneration = exactFrameGeneration;
     } else if (this.sessionRuntimeGeneration) {
       this.retiredRuntimeGeneration = this.sessionRuntimeGeneration;
+    } else if (successorGeneration) {
+      this.retiredRuntimeGeneration = successorGeneration;
     } else if (invalidBindingGeneration) {
       this.retiredRuntimeGeneration = invalidBindingGeneration;
     } else if (recoveryGeneration) {
@@ -2019,6 +2267,9 @@ export class PersistentChatService {
     }
     this.sessionRuntimeGeneration = null;
     this.sessionReady.set(false);
+    if (lifecycle === 'ended' || this.retirementDisposition() === 'ended') {
+      this.workspaceLifecycle.set(null);
+    }
     this.startupPhase.set(null);
     this.connectionState.set('disconnected');
     // Terminal observation is also a turn boundary. Preserve every buffered
@@ -2093,6 +2344,7 @@ export class PersistentChatService {
       this.sessionRuntimeGeneration = null;
     }
     this.retirementDisposition.set(null);
+    this.retirementPermanent.set(false);
   }
 
   /**
@@ -2121,6 +2373,7 @@ export class PersistentChatService {
   ): Promise<void> {
     const previousThreadId = this.threadId();
     if (previousThreadId !== threadId) {
+      this.deletedThreadId.set(null);
       this.invalidBindingRuntime = null;
       this.bindingRecoveryRuntime = null;
     }
@@ -2183,6 +2436,7 @@ export class PersistentChatService {
       this.ncSessionFolder.set(null);
       this.cloudSessionUrl.set(null);
       this.sshHandle.set(null);
+      this.workspaceCreation.set(null);
       this.tasks.set([]);
       this.undoAvailable.set(false);
       this.rewindInFlight.set(false);
@@ -2197,16 +2451,21 @@ export class PersistentChatService {
       // Config-drift dialog state is per-thread; a stale drift list
       // from the previous thread must not survive a genuine switch.
       this.pendingDrift.set(null);
-      this.runningTool.set(null);
+      this.runningTools.set([]);
       this.citationsByCid.set(new Map());
       this.citationsLoaded.set(false);
       if (!preserveReviewPlane) {
         this._protectedCloud.set(false);
+        this.cloudFolderProblems.set([]);
+        this.cloudFolders.set([]);
+        this.cloudFoldersAgentOutdated.set(false);
+        this.cloudFoldersProtected.set(false);
         this.cloudChangesCount.set(0);
         this.protectedMountName.set(null);
         this.cloudStagedAt.set(null);
         this.cloudDiffPanelOpen.set(false);
         this.threadMounts.set([]);
+        this.protectedSource.set(null);
         this.protectedFolderLink.set(null);
         this.cloudDiffProbe.set('idle');
       }
@@ -2285,7 +2544,12 @@ export class PersistentChatService {
     this.error.set(null);
     this.creatingFromDraft = false;
     this.draftConnectorsEnabled.set(true);
-    this.draftWorkspaceBackend.set('');
+    this.draftWorkspaceChoice.set({kind: 'default'});
+    // The previous draft's Project and workspace preview must not show on the new landing.
+    // (retryDraftDefaults must NOT reset draftProjectId: a Project template choice retries,
+    // and the picker would drop the choice when the Project id went null.)
+    this.draftProjectId.set(null);
+    this.draftWorkspacePreview.set(null);
     this.isDraftSession.set(true);
     // Resolve the default project and compatible connector defaults as one
     // fail-closed context. The composer remains usable for drafting, but
@@ -2312,14 +2576,19 @@ export class PersistentChatService {
       if (generation !== this.draftDefaultsGeneration || !this.isDraftSession()) return;
       const defaultProject = projects.find((project) => project.is_default);
       this.draftProjectIds = defaultProject ? [defaultProject.id] : [];
+      this.draftProjectId.set(this.draftProjectIds?.[0] ?? null);
       const body = this.draftCreationContext();
-      if (this.capabilities.datasourceScopeAutoAttachAvailable() && this.draftConnectorsEnabled()) {
-        body['use_datasource_defaults'] = true;
-      } else {
-        // An opt-out or unavailable rollout capability is an explicit empty
-        // selection, even if the server enables defaults on omission.
+      if (!this.draftConnectorsEnabled()) {
+        // The user removed every connector: an explicit empty selection,
+        // the work's own included, even if the server attaches defaults on
+        // omission.
         body['datasource_ids'] = [];
+      } else if (this.capabilities.datasourceScopeAutoAttachAvailable()) {
+        body['use_datasource_defaults'] = true;
       }
+      // Otherwise neither field: an omitted selection attaches the work's
+      // own connectors (a personal project's My cloud and the owner's
+      // outbox) and no other default, which the preview names for review.
       // Admission resolves the workspace before selecting implicit defaults.
       // Keep the reviewed IDs explicit at create so later auto-attach edits
       // cannot add a connector the user did not see here.
@@ -2330,6 +2599,8 @@ export class PersistentChatService {
       );
       if (generation !== this.draftDefaultsGeneration || !this.isDraftSession()) return;
       this.draftProjectIds = preview.project_ids;
+      this.draftProjectId.set(preview.project_ids[0] ?? null);
+      this.draftWorkspacePreview.set({backend: preview.workspace_backend, source: 'default', binding: null});
       this.draftDatasourceIds.set(preview.datasource_ids);
     } catch (err) {
       if (generation !== this.draftDefaultsGeneration || !this.isDraftSession()) return;
@@ -2347,17 +2618,15 @@ export class PersistentChatService {
     void this.retryDraftDefaults();
   }
 
-  setDraftWorkspaceBackend(backend: string | null): void {
-    if (!['', 'virtual', 'sandbox', 'vm', 'none'].includes(backend ?? '')) return;
-    this.draftWorkspaceBackend.set(backend ?? '');
+  setDraftWorkspaceChoice(choice: WorkspaceChoice): void {
+    this.draftWorkspaceChoice.set(choice);
     void this.retryDraftDefaults();
   }
 
   private draftCreationContext(): Record<string, any> {
     const body: Record<string, any> = {};
     if (this.draftProjectIds?.length) body['project_ids'] = this.draftProjectIds;
-    const backend = this.draftWorkspaceBackend();
-    if (backend) body['config_override'] = {workspace: {backend}};
+    Object.assign(body, choiceRequestFields(this.draftWorkspaceChoice()));
     return body;
   }
 
@@ -2389,7 +2658,7 @@ export class PersistentChatService {
     const body: Record<string, any> = {...this.draftCreationContext(), title: draftTitleFrom(firstMessage)};
     body['datasource_ids'] = this.draftConnectorsEnabled() ? (this.draftDatasourceIds() ?? []) : [];
     try {
-      await this.createAndConnect(body);
+      await this.createAndConnect(body, {vm: choiceBackend(this.draftWorkspaceChoice(), this.draftWorkspacePreview()) === 'vm'});
     } catch {
       // createAndConnect surfaced the error state and re-showed the
       // queued bubbles; re-enter draft so the next send retries the
@@ -2406,7 +2675,7 @@ export class PersistentChatService {
    * Create a new persistent thread via REST, then connect.
    * Sets isCreating=true immediately so the UI can show a spinner.
    */
-  async createAndConnect(body: Record<string, any>): Promise<string> {
+  async createAndConnect(body: Record<string, any>, opts: {vm?: boolean} = {}): Promise<string> {
     this.disconnect();
     const creationGeneration = this.connectGeneration;
     let createdThreadId: string | null = null;
@@ -2426,13 +2695,21 @@ export class PersistentChatService {
     // A VM-backed create pays a cold KubeVirt boot — flag it up front so the
     // startup card shows the "Booting VM" copy and connect()'s readiness
     // poll uses the longer VM budget from the first iteration.
-    this.isVmSession.set((body?.['config_override'] as any)?.workspace?.backend === 'vm');
+    this.isVmSession.set(opts.vm ?? (body?.['config_override'] as any)?.workspace?.backend === 'vm');
     try {
       const resp = await firstValueFrom(
-        this.http.post<{ thread_id: string }>(`${environment.apiUrl}/persistent/threads`, body),
+        this.http.post<{ thread_id: string; notices?: string[] }>(
+          `${environment.apiUrl}/persistent/threads`,
+          body,
+        ),
       );
       const threadId = resp.thread_id;
       createdThreadId = threadId;
+      // A saved default model that can no longer run was replaced by the
+      // system default; the server says which (unavailable_model_handling.md).
+      for (const notice of resp.notices ?? []) {
+        this.toast.warning(notice, { duration: 15000 });
+      }
       if (this.connectGeneration !== creationGeneration || this.threadId() !== null) {
         // The thread was created, but the user navigated elsewhere
         // while the POST was in flight. Return its id to the caller
@@ -2680,13 +2957,65 @@ export class PersistentChatService {
     }
   }
 
+  private threadMetaRequest: {
+    threadId: string;
+    generation: number;
+    lifecycleOnly: boolean;
+    promise: Promise<ThreadLifecycleObservation | null>;
+  } | null = null;
+
+  /** Share an in-flight read within a view. An ambiguous End needs a fresh
+   *  read after any pre-End read finishes, never its earlier active snapshot. */
+  private async loadThreadMeta(
+    threadId: string,
+    generation = this.connectGeneration,
+    opts: { fresh?: boolean; lifecycleOnly?: boolean } = {},
+  ): Promise<ThreadLifecycleObservation | null> {
+    if (!this._isCurrentThreadRequest(threadId, generation)) return null;
+    const pending = this.threadMetaRequest;
+    if (pending?.threadId === threadId && pending.generation === generation) {
+      const observation = await pending.promise;
+      if (opts.fresh || (pending.lifecycleOnly && !opts.lifecycleOnly)) {
+        // The original caller's finally may still be queued behind this
+        // continuation. Release its settled slot before the required fresh
+        // read, or recursion silently hands back that old observation.
+        if (this.threadMetaRequest === pending) this.threadMetaRequest = null;
+        return this.loadThreadMeta(threadId, generation, { ...opts, fresh: false });
+      }
+      return observation;
+    }
+    const request = {
+      threadId,
+      generation,
+      lifecycleOnly: opts.lifecycleOnly === true,
+      promise: this._readThreadMeta(threadId, generation, opts.lifecycleOnly === true),
+    };
+    this.threadMetaRequest = request;
+    try {
+      return await request.promise;
+    } finally {
+      if (this.threadMetaRequest === request) this.threadMetaRequest = null;
+    }
+  }
+
   /** Load thread metadata (title, model, turn count) from REST. */
-  private async loadThreadMeta(threadId: string, generation?: number): Promise<void> {
+  private async _readThreadMeta(
+    threadId: string,
+    generation: number,
+    lifecycleOnly: boolean,
+  ): Promise<ThreadLifecycleObservation | null> {
+    const retirementVersion = this.retirementObservationVersion;
     try {
       const thread = await firstValueFrom(
-        this.http.get<any>(`${environment.apiUrl}/persistent/threads/${threadId}`),
+        this.http
+          .get<any>(`${environment.apiUrl}/persistent/threads/${threadId}`)
+          .pipe(timeout({ first: THREAD_META_RESPONSE_TIMEOUT_MS })),
       );
-      if (!this._isCurrentThreadRequest(threadId, generation)) return;
+      if (!this._isCurrentThreadRequest(threadId, generation) ||
+          retirementVersion !== this.retirementObservationVersion) return null;
+      const runtimeGeneration = this._canonicalRuntimeGeneration(thread.session_runtime_generation);
+      if (this.successorRuntime?.threadId === threadId &&
+          runtimeGeneration !== this.successorRuntime.generation) return null;
       const retirementPending = thread.runtime_retirement_pending === true;
       const retirementDisposition =
         thread.retirement_disposition === 'ended' || thread.retirement_disposition === 'suspended'
@@ -2704,7 +3033,7 @@ export class PersistentChatService {
       if (this.terminalControlThreadId === threadId) {
         const current = this.threadStatus();
         if ((current === 'ended' || current === 'suspended') && effectiveStatus !== current) {
-          return;
+          return thread;
         }
         if (
           current === 'ending' &&
@@ -2712,43 +3041,115 @@ export class PersistentChatService {
           effectiveStatus !== 'ended' &&
           effectiveStatus !== 'suspended'
         ) {
-          return;
+          return thread;
         }
       }
-      this.sessionTitle.set(thread.title || null);
-      const model = thread.metadata?.config_override?.llm?.model;
-      // `config_name` is an expert profile (normally `session_base`),
-      // not an LLM model.  Leave the display unknown until the resolved
-      // session-state snapshot supplies the effective model.
-      this.modelName.set(model || null);
-      const officer = thread.metadata?.config_override?.officer;
-      this.isOfficerThread.set(officer?.enabled === true || officer?.enabled === 'true');
-      const temperature = thread.metadata?.config_override?.llm?.temperature;
-      if (temperature != null) {
-        this.temperature.set(temperature);
+      // A periodic lifecycle read must not overwrite live model/turn state or
+      // fan out into review requests. Connect/recovery retain full hydration.
+      if (!lifecycleOnly) {
+        this.sessionTitle.set(thread.title || null);
+        const model = thread.metadata?.config_override?.llm?.model;
+        // `config_name` is an expert profile (normally `session_base`),
+        // not an LLM model.  Only a pinned override names the model here;
+        // otherwise the resolved session-state snapshot supplies it. A
+        // recovery read (SSE reconnect, End reconciliation) must not erase
+        // that resolved value, or the live pane falls back to a bare
+        // "Default". A thread switch already clears it.
+        if (model) this.modelName.set(model);
+        const officer = thread.metadata?.config_override?.officer;
+        this.isOfficerThread.set(officer?.enabled === true || officer?.enabled === 'true');
+        const temperature = thread.metadata?.config_override?.llm?.temperature;
+        if (temperature != null) {
+          this.temperature.set(temperature);
+        }
+        this.turnCount.set(thread.total_turns || 0);
+        this.ncSessionFolder.set(thread.nc_session_folder || null);
+        this.cloudSessionUrl.set(thread.cloud_session_url || null);
+        this.sshHandle.set(thread.ssh_handle || null);
       }
-      this.turnCount.set(thread.total_turns || 0);
-      this.ncSessionFolder.set(thread.nc_session_folder || null);
-      this.cloudSessionUrl.set(thread.cloud_session_url || null);
-      this.sshHandle.set(thread.ssh_handle || null);
       this.threadStatus.set(effectiveStatus);
       this.endedAt.set(thread.ended_at || thread.last_activity || null);
       this.retirementDisposition.set(retirementDisposition);
-      this.threadMounts.set(Array.isArray(thread.mounts) ? thread.mounts : []);
-      this._protectedCloud.set(!!thread.metadata?.protected_cloud);
-      if (this._protectedCloud()) {
-        void this.refreshCloudDiffCount();
-        void this.resolveProtectedFolderLink();
-      } else {
-        this.protectedFolderLink.set(null);
+      this.retirementPermanent.set(retirementPending && thread.retirement_permanent === true);
+      this.executionLane.set(
+        thread.execution_lane === 'pinned' || thread.execution_lane === 'stateless'
+          ? thread.execution_lane
+          : null,
+      );
+      this.workspaceLifecycle.set(thread.workspace_lifecycle ?? null);
+      this.workspaceCreation.set(thread.workspace_creation ?? null);
+      if (!lifecycleOnly) {
+        this.threadMounts.set(Array.isArray(thread.mounts) ? thread.mounts : []);
+        this.protectedSource.set(thread.protected_source ?? null);
+        this._protectedCloud.set(!!thread.metadata?.protected_cloud);
+        const folders = cloudFolderStateFromStatus(thread.metadata?.cloud_mount_status);
+        this.cloudFolderProblems.set(folders.problems);
+        this.cloudFolders.set(folders.folders);
+        this.cloudFoldersAgentOutdated.set(folders.agentOutdated);
+        this.cloudFoldersProtected.set(folders.protected);
+        if (this._protectedCloud()) {
+          void this.refreshCloudDiffCount();
+          void this.resolveProtectedFolderLink();
+        } else {
+          this.protectedFolderLink.set(null);
+        }
       }
       if (retirementPending) {
-        this._retireEndingControl(threadId, retirementDisposition);
+        this._retireEndingControl(threadId, retirementDisposition, runtimeGeneration);
       } else if (thread.status === 'ended') {
-        this._retireTerminalControl(threadId);
+        this._retireTerminalControl(threadId, runtimeGeneration);
       }
-    } catch {
+      return thread;
+    } catch (err: any) {
+      // A permanent Delete can settle after its request returned a retryable
+      // 503 (or another tab issued it). Only this exact lifecycle GET's 404
+      // proves the viewed ending row is gone; other errors stay non-fatal.
+      if (err?.status === 404 && this._isCurrentThreadRequest(threadId, generation) &&
+          retirementVersion === this.retirementObservationVersion &&
+          this.threadStatus() === 'ending') {
+        this.disconnect();
+        this.deletedThreadId.set(threadId);
+      }
       // Non-fatal — UI will show fallback values
+      return null;
+    }
+  }
+
+  /** One fresh read per recovery edge; ended views never poll indefinitely. */
+  private async _reconcileExternalResume(threadId: string): Promise<boolean> {
+    if (this.intentionalClose || this.threadStatus() !== 'ended' ||
+        this.terminalControlThreadId !== threadId || this.endRequest?.threadId === threadId ||
+        !this.retiredRuntimeGeneration) return false;
+    const generation = this.connectGeneration;
+    const version = this.retirementObservationVersion;
+    const pending = this.successorRead;
+    if (pending?.threadId === threadId && pending.generation === generation && pending.version === version) {
+      return pending.promise;
+    }
+    const retired = this.retiredRuntimeGeneration;
+    const oldEpoch = this.sseReplayCursor?.epoch ?? null;
+    const request = { threadId, generation, version, promise: Promise.resolve(false) };
+    request.promise = (async () => {
+      const thread = await this.loadThreadMeta(threadId, generation, { fresh: true, lifecycleOnly: true });
+      if (!this._isCurrentConnect(threadId, generation) || this.intentionalClose ||
+          version !== this.retirementObservationVersion || this.endRequest?.threadId === threadId ||
+          this.terminalControlThreadId !== threadId || this.threadStatus() !== 'ended') return false;
+      const successor = this._canonicalRuntimeGeneration(thread?.session_runtime_generation);
+      if (!successor || successor === retired || thread?.runtime_retirement_pending !== false ||
+          !['created', 'active', 'awaiting_user'].includes(String(thread?.status))) return false;
+      this.resumedFromEpoch = oldEpoch;
+      this._reopenTerminalControl(threadId);
+      this.successorRuntime = { threadId, generation: successor };
+      this.threadStatus.set(thread!.status as ThreadStatus);
+      this.endedAt.set(null);
+      await this.connect(threadId, { preserveReviewPlane: true });
+      return true;
+    })();
+    this.successorRead = request;
+    try {
+      return await request.promise;
+    } finally {
+      if (this.successorRead === request) this.successorRead = null;
     }
   }
 
@@ -2908,12 +3309,12 @@ export class PersistentChatService {
    */
   async resolveProtectedFolderLink(): Promise<void> {
     const threadId = this.threadId();
-    const mount = selectProtectedProjectMount(this.threadMounts());
-    if (!threadId || !mount?.source_ref) {
+    const folder = protectedFolderSource(this.protectedSource(), this.threadMounts());
+    if (!threadId || !folder) {
       this.protectedFolderLink.set(null);
       return;
     }
-    const project = await firstValueFrom(this.api.getProject(mount.source_ref));
+    const project = await firstValueFrom(this.api.getProject(folder.projectId));
     if (this.threadId() !== threadId) return; // stale response after a switch
     const url = project?.cloud_storage_url;
     if (!project || !url) {
@@ -2923,7 +3324,7 @@ export class PersistentChatService {
     this.protectedFolderLink.set({
       url,
       name: project.name,
-      targetPath: mount.target_path,
+      targetPath: folder.targetPath,
     });
   }
 
@@ -3020,12 +3421,18 @@ export class PersistentChatService {
 
     es.onopen = () => {
       if (this.sse !== es) return; // superseded — ignore late open
+      if (this.sseRecoveryPending) {
+        void this._verifyRecoveredSse(threadId, connectGeneration, es);
+        return;
+      }
       this.zone.run(() => {
         const wasReconnecting = this.connectionState() !== 'connected';
         const terminalReviewOnly = this.terminalControlThreadId === threadId;
         const bindingInvalid = this.invalidBindingRuntime?.threadId === threadId;
         const bindingRecovering = this.bindingRecoveryRuntime?.threadId === threadId;
-        const controlUnavailable = terminalReviewOnly || bindingInvalid || bindingRecovering;
+        const successorUnverified = this.successorRuntime?.threadId === threadId &&
+          this.sessionRuntimeGeneration !== this.successorRuntime.generation;
+        const controlUnavailable = terminalReviewOnly || bindingInvalid || bindingRecovering || successorUnverified;
         // EventSource liveness is not agent/control readiness. An ended
         // session deliberately retains (and may reopen) this stream for late
         // protected staging, but must not regain the green Connected UI or
@@ -3035,7 +3442,7 @@ export class PersistentChatService {
             ? 'error'
             : terminalReviewOnly
               ? 'disconnected'
-              : bindingRecovering
+              : bindingRecovering || successorUnverified
                 ? 'connecting'
                 : 'connected',
         );
@@ -3054,10 +3461,10 @@ export class PersistentChatService {
         // loop_crash even though the title was generated and persisted.
         if (wasReconnecting && this.threadId() === threadId) {
           void this.loadThreadMeta(threadId, connectGeneration);
-          // Slave the control WS to SSE recovery: the WS has no
-          // liveness probe of its own, so re-establish it whenever
-          // the (monitored) SSE recovers. Idempotent — bails if the
-          // WS is already open/connecting.
+          // Slave the control WS to SSE recovery: whatever took the
+          // stream down may have taken the WS too, so re-establish it
+          // whenever the SSE recovers. Idempotent — bails if the WS is
+          // already open (and not silent) or connecting.
           if (!controlUnavailable) this._ensureControlWs();
         }
       });
@@ -3085,23 +3492,25 @@ export class PersistentChatService {
       if (this.sse !== es) return;
       this.zone.run(() => {
         if (this.sse !== es) return;
+        if (!this.sseRecoveryPending) {
+          this.sseRecoveryExpectedGeneration = this.sessionRuntimeGeneration
+            ?? this.successorRuntime?.generation
+            ?? this.retiredRuntimeGeneration;
+        }
+        this.sseRecoveryPending = true;
+        this.reconnectAttempt.update((n) => n + 1);
+        const bindingInvalid = this.invalidBindingRuntime?.threadId === threadId;
+        const terminalReviewOnly = this.terminalControlThreadId === threadId;
+        this.connectionState.set(bindingInvalid ? 'error' : terminalReviewOnly ? 'disconnected' : 'connecting');
+        if (bindingInvalid) {
+          this.error.set(this.transloco.translate('errors.sessions.bindingInvalid'));
+        }
         if (es.readyState === EventSource.CLOSED) {
-          // Terminal — auth failure, thread gone, etc. The browser
-          // gave up. Don't bury the UI in a generic banner; let
-          // the threadStatus refresh below surface "ended" if
-          // that's what happened.
           this._stopSseWatchdog();
-          this.connectionState.set('error');
-          this.reconnectGaveUp.set(true);
-          this._refreshStatusAfterDrop(threadId, connectGeneration);
-        } else {
-          // CONNECTING — the browser is retrying. Show reconnecting.
-          const bindingInvalid = this.invalidBindingRuntime?.threadId === threadId;
-          this.connectionState.set(bindingInvalid ? 'error' : 'connecting');
-          if (bindingInvalid) {
-            this.error.set(this.transloco.translate('errors.sessions.bindingInvalid'));
-          }
-          this.reconnectAttempt.update((n) => n + 1);
+          this._dropControlWs();
+          es.close();
+          this.sse = null;
+          this._scheduleClosedSseRetry(threadId, connectGeneration);
         }
       });
     };
@@ -3125,7 +3534,18 @@ export class PersistentChatService {
     if (this.agentLastEventAt <= 0) {
       this.agentLastEventAt = Date.now();
     }
+    const generation = this.connectGeneration;
     this.sseWatchdogTimer = setInterval(() => {
+      // End authorization has no journal frame. Reconcile a viewed live or
+      // ending thread on this existing 5 s clock, including a sibling tab's
+      // End. Settlement stops these reads while review SSE remains open.
+      if (
+        !this.intentionalClose &&
+        this._isCurrentConnect(threadId, generation) &&
+        this.threadStatus() !== 'ended' && this.threadStatus() !== 'suspended'
+      ) {
+        void this.loadThreadMeta(threadId, generation, { lifecycleOnly: true });
+      }
       // Piggyback the agent-quiet signal on this 5s tick (audit #8):
       // only meaningful while a turn is open — an idle agent being
       // quiet is expected.
@@ -3148,15 +3568,20 @@ export class PersistentChatService {
       // (with replay-from-cursor) take over.
       this._stopSseWatchdog();
       this.zone.run(() => {
+        this.sseRecoveryExpectedGeneration = this.sessionRuntimeGeneration
+          ?? this.successorRuntime?.generation
+          ?? this.retiredRuntimeGeneration;
+        this.sseRecoveryPending = true;
         if (this.sse) {
           this.sse.close();
           this.sse = null;
         }
+        this._dropControlWs();
         this.connectionState.set(
           this.invalidBindingRuntime?.threadId === threadId ? 'error' : 'connecting',
         );
         this.reconnectAttempt.update((n) => n + 1);
-        void this._openSse(threadId);
+        this._scheduleClosedSseRetry(threadId, generation);
       });
     }, SSE_WATCHDOG_INTERVAL_MS);
   }
@@ -3169,16 +3594,18 @@ export class PersistentChatService {
   }
 
   /**
-   * Re-validate liveness on tab resume (visibilitychange / online / focus).
-   * The SSE is the single liveness authority: if it isn't OPEN or has gone
-   * silent past the watchdog timeout, force a reopen (replay-from-cursor);
-   * then ensure the control WS — which has no probe of its own — is back.
-   * No-op when there's no active, live session.
+   * Re-validate liveness on tab resume (visibilitychange / online / offline /
+   * focus). The SSE is the single liveness authority for "Connected": if it
+   * isn't OPEN or has gone silent past the watchdog timeout, force a reopen
+   * (replay-from-cursor). The control WS is judged by the same rules against
+   * its own clock — its readyState can't vouch for it any more than the
+   * stream's can — and re-ensured. No-op when there's no active, live session.
    */
   private _revalidateConnection(force = false): void {
     if (this.intentionalClose) return;
     const tid = this.threadId();
     if (!tid) return;
+    void this._reconcileExternalResume(tid);
     const terminalControl = this.terminalControlThreadId === tid;
     if (this.threadStatus() === 'ended' && !terminalControl) return;
     // `force` (long hidden-tab wake / bfcache restore / page resume) skips
@@ -3191,12 +3618,20 @@ export class PersistentChatService {
       this.sse.readyState !== EventSource.OPEN ||
       Date.now() - this.sseLastEventAt > SSE_WATCHDOG_TIMEOUT_MS;
     if (sseStale) {
-      // Closes + reopens the SSE and sets connectionState='connecting';
-      // the reopen's onopen also re-ensures the control WS (Change 2).
+      if (this.sseRecoveryPending && !this.sse) {
+        if (this.sseRetryTimer) clearTimeout(this.sseRetryTimer);
+        this.sseRetryTimer = null;
+        void this._retryClosedSse(tid, this.connectGeneration);
+        return;
+      }
+      // A dead WS is retired now, so nothing is written into it while the
+      // stream reconnects; the reopen's onopen then re-ensures it (Change 2).
+      if (!terminalControl && (force || this._controlWsSilent())) this._dropControlWs();
+      // Closes + reopens the SSE and sets connectionState='connecting'.
       this.reconnectNow();
     } else if (!terminalControl) {
       // SSE healthy but the WS may have silently dropped — re-ensure it.
-      this._ensureControlWs();
+      this._ensureControlWs(force);
     }
   }
 
@@ -3308,6 +3743,7 @@ export class PersistentChatService {
     if (!this._isCurrentConnect(tid, generation)) return;
     await this._loadSessionState(tid, generation);
     if (!this._isCurrentConnect(tid, generation)) return;
+    this._refreshQueueStateAfterSnapshot();
     await this._openSse(tid);
   }
 
@@ -3339,6 +3775,7 @@ export class PersistentChatService {
     if (!this._isCurrentConnect(tid, generation)) return;
     await this._loadSessionState(tid, generation);
     if (!this._isCurrentConnect(tid, generation)) return;
+    this._refreshQueueStateAfterSnapshot();
     if (this.sse) {
       this.sse.close();
       this.sse = null;
@@ -3404,23 +3841,164 @@ export class PersistentChatService {
     void this.cache.setThreadCursor(threadId, epoch, seq);
   }
 
-  /**
-   * After SSE drops to CLOSED, the agent may have flipped this thread to
-   * `ended` (idle archive, /done from another client). Re-fetch meta so the
-   * UI swaps to the resume card instead of stuck on "connection error".
-   */
-  private _refreshStatusAfterDrop(threadId: string, generation: number): void {
-    setTimeout(async () => {
-      if (!this._isCurrentConnect(threadId, generation)) return;
-      await this.loadThreadMeta(threadId, generation);
-      if (
-        this._isCurrentConnect(threadId, generation) &&
-        this.terminalControlThreadId === threadId &&
-        (!this.sse || this.sse.readyState === EventSource.CLOSED)
-      ) {
-        this.reconnectNow();
+  /** A closed EventSource will not retry itself. Keep one bounded owner probe
+   *  in flight and reopen only after authoritative metadata is readable. */
+  private _scheduleClosedSseRetry(threadId: string, generation: number): void {
+    if (this.intentionalClose || this.sseRecoveryHalted || !this._isCurrentConnect(threadId, generation) ||
+        this.sseRetryTimer || this.sseRetryProbeInFlight) return;
+    this.sseRetryTimer = setTimeout(() => {
+      this.sseRetryTimer = null;
+      void this._retryClosedSse(threadId, generation);
+    }, sseRetryDelayMs(this.sseRetryAttempt++));
+  }
+
+  private async _probeRecoveredOwner(threadId: string, generation: number): Promise<
+    { detail: any; failure: null } | { detail: null; failure: 'auth' | 'gone' | 'retry' }
+  > {
+    try {
+      await firstValueFrom(this.http.get<any>(
+        `${environment.apiUrl}/persistent/threads/${threadId}`,
+      ).pipe(timeout({ first: THREAD_META_RESPONSE_TIMEOUT_MS })));
+      if (!this._isCurrentConnect(threadId, generation) || this.intentionalClose) {
+        return { detail: null, failure: 'retry' };
       }
-    }, 1500);
+      // The typed probe classifies HTTP failures. The canonical reader also
+      // applies End/pending state, under its existing generation guards.
+      const observation = await this.loadThreadMeta(threadId, generation, {
+        fresh: true,
+      });
+      if (!observation || !['created', 'active', 'awaiting_user', 'ending', 'ended', 'suspended']
+          .includes(String(observation.status))) return { detail: null, failure: 'retry' };
+      if (observation.runtime_retirement_pending !== true &&
+          ['created', 'active', 'awaiting_user'].includes(String(observation.status)) &&
+          !this._canonicalRuntimeGeneration(observation.session_runtime_generation)) {
+        return { detail: null, failure: 'retry' };
+      }
+      return { detail: observation, failure: null };
+    } catch (error) {
+      return { detail: null, failure: classifySseProbeFailure(error) };
+    }
+  }
+
+  private _stopClosedSseRecovery(): void {
+    if (this.sseRetryTimer) clearTimeout(this.sseRetryTimer);
+    this.sseRetryTimer = null;
+    this.sseRetryAttempt = 0;
+    this.sseRecoveryHalted = false;
+    this.sseRetryProbeInFlight = null;
+    this.sseRecoveryPending = false;
+    this.sseRecoveryExpectedGeneration = null;
+  }
+
+  private async _acceptRecoveredSuccessor(
+    threadId: string, generation: number, detail: any,
+  ): Promise<boolean> {
+    const runtime = this._canonicalRuntimeGeneration(detail.session_runtime_generation);
+    if (!runtime || detail.runtime_retirement_pending !== false ||
+        !['created', 'active', 'awaiting_user'].includes(String(detail.status))) return false;
+    if (await this._reconcileExternalResume(threadId)) return true;
+    if (!this._isCurrentConnect(threadId, generation) || this.intentionalClose ||
+        this.terminalControlThreadId === threadId || this.endRequest?.threadId === threadId) return false;
+    this.successorRuntime = { threadId, generation: runtime };
+    await this.connect(threadId, { preserveReviewPlane: true });
+    return true;
+  }
+
+  private async _retryClosedSse(threadId: string, generation: number): Promise<void> {
+    if (this.intentionalClose || this.sseRecoveryHalted || !this._isCurrentConnect(threadId, generation) ||
+        this.sse || this.sseRetryProbeInFlight) return;
+    const probe = { generation };
+    this.sseRetryProbeInFlight = probe;
+    const result = await this._probeRecoveredOwner(threadId, generation);
+    if (this.sseRetryProbeInFlight === probe) this.sseRetryProbeInFlight = null;
+    if (this.intentionalClose || !this._isCurrentConnect(threadId, generation) || this.sse) return;
+    if (result.failure === 'auth' || result.failure === 'gone') {
+      this.sseRecoveryHalted = true;
+      this.reconnectGaveUp.set(true);
+      this.connectionState.set('error');
+      return;
+    }
+    if (result.failure) {
+      this._scheduleClosedSseRetry(threadId, generation);
+      return;
+    }
+    const detail = result.detail;
+    const runtime = this._canonicalRuntimeGeneration(detail.session_runtime_generation);
+    if (!this.sseRecoveryExpectedGeneration && runtime) this.sseRecoveryExpectedGeneration = runtime;
+    const expected = this.sseRecoveryExpectedGeneration;
+    const reviewOnly = detail.runtime_retirement_pending === true ||
+      ['ending', 'ended', 'suspended'].includes(String(detail.status));
+    if (expected && !runtime && !reviewOnly) {
+      this._scheduleClosedSseRetry(threadId, generation);
+      return;
+    }
+    if (expected && runtime !== expected && !reviewOnly) {
+      if (await this._acceptRecoveredSuccessor(threadId, generation, detail)) return;
+      this._scheduleClosedSseRetry(threadId, generation);
+      return;
+    }
+    if (this.endRequest?.threadId === threadId) {
+      this._scheduleClosedSseRetry(threadId, generation);
+      return;
+    }
+    await this._openSse(threadId);
+  }
+
+  /** An SSE handshake is not proof of owner access or the current runtime.
+   *  Verify both before restoring Connected and its control transport. */
+  private async _verifyRecoveredSse(
+    threadId: string, generation: number, es: EventSource,
+  ): Promise<void> {
+    if (this.sse !== es || !this._isCurrentConnect(threadId, generation)) return;
+    if (this.sseRetryProbeInFlight) return;
+    const probe = { generation };
+    this.sseRetryProbeInFlight = probe;
+    const result = await this._probeRecoveredOwner(threadId, generation);
+    if (this.sseRetryProbeInFlight === probe) this.sseRetryProbeInFlight = null;
+    if (this.sse !== es || !this._isCurrentConnect(threadId, generation) || this.intentionalClose) {
+      if (!this.intentionalClose && this._isCurrentConnect(threadId, generation) && !this.sse) {
+        this._scheduleClosedSseRetry(threadId, generation);
+      }
+      return;
+    }
+    if (es.readyState !== EventSource.OPEN) return;
+    const runtime = this._canonicalRuntimeGeneration(result.detail?.session_runtime_generation);
+    const expected = this.sseRecoveryExpectedGeneration;
+    const reviewOnly = result.detail?.runtime_retirement_pending === true ||
+      ['ending', 'ended', 'suspended'].includes(String(result.detail?.status));
+    if (this.endRequest?.threadId === threadId || result.failure ||
+        (expected && runtime !== expected && !reviewOnly)) {
+      es.close();
+      this.sse = null;
+      if (result.failure === 'auth' || result.failure === 'gone') {
+        this.sseRecoveryHalted = true;
+        this.reconnectGaveUp.set(true);
+        this.connectionState.set('error');
+      } else {
+        if (!expected || runtime === expected || !result.detail ||
+            !(await this._acceptRecoveredSuccessor(threadId, generation, result.detail))) {
+          this._scheduleClosedSseRetry(threadId, generation);
+        }
+      }
+      return;
+    }
+    this._stopClosedSseRecovery();
+    const terminal = this.terminalControlThreadId === threadId ||
+      this.threadStatus() === 'ending' || this.threadStatus() === 'ended' ||
+      this.threadStatus() === 'suspended';
+    const bindingInvalid = this.invalidBindingRuntime?.threadId === threadId;
+    const bindingRecovering = this.bindingRecoveryRuntime?.threadId === threadId;
+    const successorUnverified = this.successorRuntime?.threadId === threadId &&
+      this.sessionRuntimeGeneration !== this.successorRuntime.generation;
+    this.zone.run(() => {
+      this.connectionState.set(bindingInvalid ? 'error' : terminal ? 'disconnected' :
+        bindingRecovering || successorUnverified ? 'connecting' : 'connected');
+      if (!bindingInvalid && !this.sessionSnapshotFailed) this.error.set(null);
+      this.reconnectAttempt.set(0);
+      this.reconnectGaveUp.set(false);
+      this._startSseWatchdog(threadId);
+      if (!terminal && !bindingInvalid) this._ensureControlWs();
+    });
   }
 
   // ── Control WS (slash commands + permission decisions) ───────────────
@@ -3601,6 +4179,12 @@ export class PersistentChatService {
     threadId: string,
     connection: ConnectionPayload,
   ): boolean {
+    if (this.successorRuntime?.threadId === threadId &&
+        (connection.pinned_runtime_generation_contract !== 1 ||
+         this._canonicalRuntimeGeneration(connection.session_runtime_generation) !== this.successorRuntime.generation)) {
+      this._scheduleControlWsReconnect(threadId);
+      return false;
+    }
     const recovery = this.bindingRecoveryRuntime;
     if (recovery?.threadId !== threadId) return true;
     const responseGeneration =
@@ -3628,6 +4212,18 @@ export class PersistentChatService {
     this.sessionRuntimeGeneration = exactRuntimeContract
       ? this._canonicalRuntimeGeneration(connection.session_runtime_generation)
       : null;
+    // G2 is now the installed runtime; ordinary exact-generation binding
+    // recovery must remain free to adopt a later G3 if this binding fails.
+    const successorVerified = this.successorRuntime?.threadId === threadId &&
+      this.sessionRuntimeGeneration === this.successorRuntime.generation;
+    if (successorVerified) {
+      this.successorRuntime = null;
+      if (this.sse?.readyState === EventSource.OPEN &&
+          this.terminalControlThreadId !== threadId &&
+          this.invalidBindingRuntime?.threadId !== threadId) {
+        this.connectionState.set('connected');
+      }
+    }
     this.controlCapabilities.set(
       connection?.controls && typeof connection.controls === 'object'
         ? {
@@ -3692,18 +4288,115 @@ export class PersistentChatService {
     return 'websocket';
   }
 
-  /** Whether the currently declared session supports this rewind mode. */
+  /** Whether the currently declared session supports this rewind mode.
+   *
+   *  Only a live control plane whose transport is KNOWN can carry a rewind.
+   *  Before `/connection` answers, `controlTransport` assumes a socket (so a
+   *  stateless session offered the verb and answered "connection is down"),
+   *  and on a retired session (ended, ending, binding refused) the dispatch
+   *  guard drops the frame without a word. Rewind is destructive and never
+   *  queued, so it is not offered until a resolved transport can carry it. */
   rewindModeAvailable(mode: 'both' | 'conversation' | 'code'): boolean {
+    const threadId = this.threadId();
+    if (!threadId || !this._controlPlaneAllowed(threadId)) return false;
+    const declared = this.controlCapabilities();
+    if (declared?.threadId !== threadId && this.controlSocket === 'unknown') return false;
     const transport = this.controlTransport('rewind');
     if (transport === 'unavailable') return false;
     if (transport === 'websocket') return true;
-    const declared = this.controlCapabilities();
     const modes = declared?.options['rewind']?.modes;
     return mode === 'conversation' && (!modes || modes.includes(mode));
   }
 
   summarizeAvailable(): boolean {
-    return this.controlTransport('compact') === 'websocket';
+    return this.controlTransport('compact') !== 'unavailable';
+  }
+
+  /** Whether the slash palette should offer `command` on this session.
+   *
+   *  Follows the `/connection` declaration, never the lane: a command is
+   *  offered only when one of its verbs has a transport here. `/done` is
+   *  always offered (a socketless session ends through the owner End path),
+   *  and `/rewind` keeps its own mode-aware gate. */
+  slashCommandAvailable(command: string): boolean {
+    const threadId = this.threadId();
+    if (!threadId || !this._controlPlaneAllowed(threadId)) return false;
+    if (command === '/done') return true;
+    if (command === '/rewind') return this.rewindModeAvailable('conversation');
+    const verbs = SLASH_COMMAND_VERBS[command];
+    if (!verbs) return true;
+    return verbs.some((verb) => this.controlTransport(verb) !== 'unavailable');
+  }
+
+  /** Ask for a manual compaction, now or after the current response.
+   *
+   *  Compaction rewrites the conversation the running turn works on, so it
+   *  never runs beside one (either lane): while a response streams or a sent
+   *  message waits for its turn, the request is held here — one per thread,
+   *  the latest focus wins — and dispatched when the session goes idle. */
+  requestCompaction(focus = '', boundaryMessageId?: string): void {
+    const threadId = this.threadId();
+    if (!threadId || !this._controlPlaneAllowed(threadId)) return;
+    if (this.controlTransport('compact') === 'unavailable') {
+      this.error.set(this.transloco.translate('chat.control.compactUnavailable'));
+      return;
+    }
+    if (this.isStreaming() || this.isAwaitingTurn()) {
+      const alreadyDeferred = this.deferredCompaction?.threadId === threadId;
+      this.deferredCompaction = { threadId, focus, boundaryMessageId };
+      if (!alreadyDeferred) {
+        this._systemMessage(this.transloco.translate('chat.control.compactDeferred'));
+      }
+      return;
+    }
+    this._dispatchCompaction(focus, boundaryMessageId);
+  }
+
+  private _dispatchCompaction(focus: string, boundaryMessageId?: string): void {
+    const transport = this.controlTransport('compact');
+    if (transport === 'rest') {
+      const control: DurableControl = { method: 'compact' };
+      if (focus.trim()) control.focus = focus.trim();
+      if (boundaryMessageId) control.boundary_message_id = boundaryMessageId;
+      this._sendDurableControl(control);
+      return;
+    }
+    // No local "Compacting context..." echo: the agent's
+    // compaction.started/progress frames drive the live progress block, and
+    // a no-op answers with a summary-less context.compacted (rendered as a
+    // system line).
+    const frame: Record<string, unknown> = { method: 'compact', focus };
+    if (boundaryMessageId) frame['boundary_message_id'] = boundaryMessageId;
+    this._sendControl(frame);
+  }
+
+  private _flushDeferredCompaction(): void {
+    const deferred = this.deferredCompaction;
+    if (!deferred) return;
+    this.deferredCompaction = null;
+    if (deferred.threadId !== this.threadId() || !this._controlPlaneAllowed(deferred.threadId)) {
+      return;
+    }
+    this._dispatchCompaction(deferred.focus, deferred.boundaryMessageId);
+  }
+
+  /** `/done` on a session without an `archive` socket: the owner End path the
+   *  End button uses, which works on both lanes (and asks before stopping a
+   *  busy stateless turn). Stays on the page, like the socket `/done`. */
+  private async _endFromSlashCommand(): Promise<void> {
+    try {
+      const outcome = await this.endSession();
+      if (outcome === 'retryable') {
+        this.error.set(this.transloco.translate('errors.sessions.endRetryable'));
+      }
+    } catch (err: unknown) {
+      const detail = (err as { error?: { detail?: unknown } })?.error?.detail;
+      this.error.set(
+        typeof detail === 'string'
+          ? this.sanitizeError(detail)
+          : this.transloco.translate('errors.sessions.endFailed'),
+      );
+    }
   }
 
   /** Drop every control frame queued for `threadId` and tell the user. Runs
@@ -3713,13 +4406,25 @@ export class PersistentChatService {
     const queued = this.controlOutbox.filter((item) => item.threadId === threadId);
     if (queued.length === 0) return;
     this.controlOutbox = this.controlOutbox.filter((item) => item.threadId !== threadId);
+    let failed = false;
     for (const item of queued) {
       let requestId: string | undefined;
+      let method: unknown;
       try {
-        requestId = JSON.parse(item.frame)?.request_id;
+        const parsed = JSON.parse(item.frame);
+        requestId = parsed?.request_id;
+        method = parsed?.method;
       } catch {
         requestId = undefined;
       }
+      if (method === 'archive') {
+        // A /done typed before /connection answered: it already said
+        // "Ending session...", so finish it on the End path instead of
+        // contradicting that line.
+        void this._endFromSlashCommand();
+        continue;
+      }
+      failed = true;
       if (requestId) {
         this._settlePendingConfigUpdate(requestId, {
           ok: false,
@@ -3729,7 +4434,7 @@ export class PersistentChatService {
         });
       }
     }
-    this.error.set(this.transloco.translate('chat.control.unavailable'));
+    if (failed) this.error.set(this.transloco.translate('chat.control.unavailable'));
   }
 
   private _settlePendingConfigUpdate(requestId: string, outcome: ConfigUpdateOutcome): boolean {
@@ -3890,10 +4595,8 @@ export class PersistentChatService {
     }
   }
 
-  /** Force-close a half-open control WS that stopped delivering frames.
-   *  close() fires onclose locally even when the peer is unreachable, so
-   *  the regular reconnect ladder (with a fresh /connection token) takes
-   *  over from there. */
+  /** Replace a half-open control WS that stopped delivering frames, via the
+   *  regular reconnect ladder (with a fresh /connection token). */
   private _startControlWsWatchdog(threadId: string): void {
     this._stopControlWsWatchdog();
     this.controlWsWatchdogTimer = setInterval(() => {
@@ -3901,13 +4604,48 @@ export class PersistentChatService {
         this._stopControlWsWatchdog();
         return;
       }
-      const ws = this.controlWs;
-      if (!ws || ws.readyState !== WebSocket.OPEN) return;
-      if (Date.now() - this.controlWsLastMessageAt > CONTROL_WS_WATCHDOG_TIMEOUT_MS) {
+      if (this._controlWsSilent()) {
         console.warn('[persistent-chat] control WS silent past watchdog — forcing reconnect');
-        ws.close(4002, 'heartbeat timeout');
+        this._dropControlWs();
+        this._scheduleControlWsReconnect(threadId);
       }
     }, CONTROL_WS_WATCHDOG_INTERVAL_MS);
+  }
+
+  /** The watchdog's verdict, taken now instead of on its next tick: the
+   *  control WS it monitors still reports OPEN, yet nothing — not even the
+   *  agent's idle `ws.ping` — has arrived within the deadline. That socket
+   *  is half-open (laptop sleep, dropped link) and `send()` on it writes
+   *  into the void. Timers stop while a machine sleeps but the wall clock
+   *  does not, so right after a wake this holds before any tick has run. */
+  private _controlWsSilent(): boolean {
+    return (
+      this.controlWsWatchdogTimer !== null &&
+      this.controlWs?.readyState === WebSocket.OPEN &&
+      Date.now() - this.controlWsLastMessageAt > CONTROL_WS_WATCHDOG_TIMEOUT_MS
+    );
+  }
+
+  /** Retire the control WS without waiting for its close event. close() on
+   *  a socket whose peer is unreachable starts a closing handshake that
+   *  cannot complete, so `onclose` only fires once the browser's handshake
+   *  timeout gives up on it (about a minute in Chromium) — a reconnect keyed
+   *  off it would keep the dead socket installed that long. The caller
+   *  starts the replacement. */
+  private _dropControlWs(): void {
+    const ws = this.controlWs;
+    if (!ws) return;
+    this.controlWs = null;
+    this._stopControlWsWatchdog();
+    ws.onopen = null;
+    ws.onmessage = null;
+    ws.onerror = null;
+    ws.onclose = null;
+    try {
+      ws.close(4002, 'heartbeat timeout');
+    } catch {
+      // Already closed.
+    }
   }
 
   private _stopControlWsWatchdog(): void {
@@ -3938,13 +4676,18 @@ export class PersistentChatService {
 
   /** Open a control WS on demand if one isn't already open. Used by
    *  slash-command and permission paths when the user clicks during a
-   *  brief reconnect window. */
-  private _ensureControlWs(): void {
+   *  brief reconnect window. An OPEN socket that has gone silent — or any
+   *  OPEN socket, when `force` (a wake the page can't vouch for) — is
+   *  replaced rather than trusted. */
+  private _ensureControlWs(force = false): void {
     const tid = this.threadId();
     if (!tid) return;
     if (!this._controlPlaneAllowed(tid)) return;
     if (this.controlSocket === 'none') return;
-    if (this.controlWs?.readyState === WebSocket.OPEN) return;
+    if (this.controlWs?.readyState === WebSocket.OPEN) {
+      if (!force && !this._controlWsSilent()) return;
+      this._dropControlWs();
+    }
     if (this.controlWs?.readyState === WebSocket.CONNECTING) return;
     if (this.controlWsOpening) return;
     this.controlWsReconnectAttempt = 0;
@@ -3960,16 +4703,16 @@ export class PersistentChatService {
    * the serving owner writes the acknowledgement through its journal
    * allocator and the normal SSE reducer applies it.
    */
-  private _sendDurableControl(control: DurableControl): void {
+  private _sendDurableControl(control: DurableControl): boolean {
     const threadId = this.threadId();
-    if (!threadId || !this._controlPlaneAllowed(threadId)) return;
+    if (!threadId || !this._controlPlaneAllowed(threadId)) return false;
     const runtimeGeneration = this.sessionRuntimeGeneration;
     if (!runtimeGeneration) {
       this._setDurableControlError(
         { method: control.method, ordinal: ++this.durableControlOrdinal },
         this.transloco.translate('chat.control.admissionFailed'),
       );
-      return;
+      return false;
     }
     const ordinal = ++this.durableControlOrdinal;
     // Keep an ambiguous/in-flight head exactly where it is, but collapse
@@ -3998,7 +4741,7 @@ export class PersistentChatService {
         { method: control.method, ordinal },
         this.transloco.translate('chat.control.backpressure'),
       );
-      return;
+      return false;
     }
     const item: DurableControlOutboxItem = {
       threadId,
@@ -4019,6 +4762,7 @@ export class PersistentChatService {
     });
     this.durableControlOutbox.push(item);
     this._flushDurableControlOutbox();
+    return true;
   }
 
   /** Single-flight FIFO drain. An ambiguous failure leaves the item at the
@@ -4197,7 +4941,9 @@ export class PersistentChatService {
       return false;
     }
     const frame = JSON.stringify(data);
-    if (this.controlWs?.readyState === WebSocket.OPEN) {
+    // A silent OPEN socket is dead (see _controlWsSilent); queue instead,
+    // and the _ensureControlWs below replaces it.
+    if (this.controlWs?.readyState === WebSocket.OPEN && !this._controlWsSilent()) {
       try {
         this.controlWs.send(frame);
         return true;
@@ -4231,6 +4977,9 @@ export class PersistentChatService {
       this.error.set(this.transloco.translate('chat.control.unavailable'));
       return false;
     }
+    // Refused like any down socket (destructive controls never queue), but
+    // start the replacement so a retry can land.
+    if (this._controlWsSilent()) this._ensureControlWs();
     const ws = this.controlWs;
     if (!ws || ws.readyState !== WebSocket.OPEN) {
       this.error.set(this.transloco.translate('chat.rewind.connectionDown'));
@@ -4280,7 +5029,7 @@ export class PersistentChatService {
   private _sendCanvasControl(threadId: string, data: CanvasControl): boolean {
     if (!this._controlPlaneAllowed(threadId)) return false;
     const ws = this.controlWs;
-    if (!ws || ws.readyState !== WebSocket.OPEN) {
+    if (!ws || ws.readyState !== WebSocket.OPEN || this._controlWsSilent()) {
       if (isCommittedCanvasControl(data)) {
         this._queueCanvasSourceUpdate(threadId, data);
       }
@@ -4334,6 +5083,19 @@ export class PersistentChatService {
 
     this.reconnectGaveUp.set(false);
     this.reconnectAttempt.set(0);
+    this.sseRecoveryHalted = false;
+
+    if (this.sseRetryTimer) clearTimeout(this.sseRetryTimer);
+    this.sseRetryTimer = null;
+    if (this.sseRecoveryPending) {
+      if (this.sse) {
+        this.sse.close();
+        this.sse = null;
+      }
+      void this._retryClosedSse(tid, this.connectGeneration);
+      return;
+    }
+
     if (this.sse) {
       this.sse.close();
       this.sse = null;
@@ -4359,6 +5121,7 @@ export class PersistentChatService {
   ): Promise<void> {
     await this._loadSessionState(threadId, generation, preservedReplayCursor, true);
     if (!this._isCurrentConnect(threadId, generation) || this.intentionalClose) return;
+    this._refreshQueueStateAfterSnapshot();
     if (
       this.terminalControlThreadId !== threadId &&
       this.sessionSnapshotLoaded &&
@@ -4375,13 +5138,17 @@ export class PersistentChatService {
     // Invalidates cache/REST continuations from any in-flight connect even
     // when no transport has been installed yet.
     this.connectGeneration++;
+    this._stopClosedSseRecovery();
     // Let a newer thread claim control-WS opening immediately; the stale
     // async resolver observes its invalidated generation before install.
     this.controlWsOpeningGeneration++;
     this.controlWsOpening = false;
     this.controlSocket = 'unknown';
     this.sessionRuntimeGeneration = null;
-    if (!preserveReviewPlane) this.retiredRuntimeGeneration = null;
+    if (!preserveReviewPlane) {
+      this.retiredRuntimeGeneration = null;
+      this.successorRuntime = null;
+    }
     this.sessionSnapshotLoaded = false;
     this.sessionSnapshotFailed = false;
     this.sessionSnapshotCursor = null;
@@ -4394,6 +5161,7 @@ export class PersistentChatService {
     // transport down there is no turn.started to clear it — never leave
     // the composer stuck on "working" after a teardown.
     this.pendingTurnCount.set(0);
+    this.deferredCompaction = null;
     if (this.controlWsReconnectTimer) {
       clearTimeout(this.controlWsReconnectTimer);
       this.controlWsReconnectTimer = null;
@@ -4492,8 +5260,12 @@ export class PersistentChatService {
     this.cloudSessionUrl.set(null);
     this.sshHandle.set(null);
     this.threadStatus.set(null);
+    this.workspaceLifecycle.set(null);
+    this.workspaceCreation.set(null);
     this.endedAt.set(null);
     this.retirementDisposition.set(null);
+    this.retirementPermanent.set(false);
+    this.executionLane.set(null);
     this.tasks.set([]);
     this.undoAvailable.set(false);
     this.rewindInFlight.set(false);
@@ -4505,11 +5277,16 @@ export class PersistentChatService {
     this.pendingDrift.set(null);
     if (!preserveReviewPlane) {
       this._protectedCloud.set(false);
+      this.cloudFolderProblems.set([]);
+      this.cloudFolders.set([]);
+      this.cloudFoldersAgentOutdated.set(false);
+      this.cloudFoldersProtected.set(false);
       this.cloudChangesCount.set(0);
       this.protectedMountName.set(null);
       this.cloudStagedAt.set(null);
       this.cloudDiffPanelOpen.set(false);
       this.threadMounts.set([]);
+      this.protectedSource.set(null);
       this.protectedFolderLink.set(null);
       this.cloudDiffProbe.set('idle');
     }
@@ -4606,6 +5383,8 @@ export class PersistentChatService {
         // terminal latch and replay semantics unchanged; reconnecting here
         // would revive G1 control and suppress its later staged-diff event.
         if (this.terminalControlThreadId === threadId) {
+          if (await this._reconcileExternalResume(threadId)) return;
+          if (!this._isCurrentConnect(threadId, generation)) return;
           this.error.set(this.transloco.translate('errors.sessions.stillEnding'));
           void this.loadThreadMeta(threadId, generation);
           if (this._protectedCloud()) void this.refreshCloudDiffCount();
@@ -4641,13 +5420,30 @@ export class PersistentChatService {
    * An untyped DELETE failure is ambiguous: the request may not have reached
    * the server, or End may have committed while its response was lost. Keep
    * all planes intact until SSE/REST authoritatively observes terminal state.
+   *
+   * A stateless End has two typed refusals of its own (see
+   * `EndSessionOutcome`): `409 stateless_end_busy` asks before forcing, like
+   * `turn_in_flight`, and a string-detail 503 is reported as retryable after
+   * the thread row is re-read. Neither is ever retried automatically.
    */
-  async endSession(force = false): Promise<void> {
+  async endSession(force = false): Promise<EndSessionOutcome> {
+    const request = { threadId: this.threadId() ?? '' };
+    this.endRequest = request;
+    this.retirementObservationVersion++;
+    try {
+      return await this._endSession(force);
+    } finally {
+      if (this.endRequest === request) this.endRequest = null;
+    }
+  }
+
+  private async _endSession(force: boolean): Promise<EndSessionOutcome> {
     const threadId = this.threadId();
     if (!threadId) {
       this.disconnect();
-      return;
+      return 'done';
     }
+    const generation = this.connectGeneration;
     let outcome: unknown;
     try {
       const qs = force ? '?force=true' : '';
@@ -4657,19 +5453,35 @@ export class PersistentChatService {
         ),
       );
     } catch (err: unknown) {
+      if (!this._isCurrentConnect(threadId, generation)) throw err;
       if (this._isTurnInFlightEndError(err) && !force) {
         // Mid-turn guard (session_silent_failure_audit.md #11): the
         // orchestrator refuses to tear down a session whose agent is
         // mid-turn unless forced. Declining keeps the session alive.
         const proceed = confirm(this.transloco.translate('sessions.confirmEndMidTurn'));
         if (proceed) {
-          await this.endSession(true);
+          return this.endSession(true);
         }
-        return;
+        return 'kept';
       }
+      if (this._isStatelessEndBusyError(err) && !force) {
+        // The stateless turn/unit is still leased or has pending input or
+        // control. `force` stops the unfinished turn; declining ends nothing.
+        const proceed = confirm(this.transloco.translate('sessions.confirmEndStatelessBusy'));
+        return proceed ? this.endSession(true) : 'kept';
+      }
+      if (this.executionLane() === 'stateless' && this._isRetryableEndFence(err)) {
+        // The End may have begun durably (the row then projects a pending
+        // retirement → `ending`) or not at all; the row says which.
+        await this.loadThreadMeta(threadId, generation, { fresh: true });
+        return 'retryable';
+      }
+      // A pinned End can commit before its response is lost. Only a positive
+      // metadata observation retires controls; preserve the original failure.
+      await this.loadThreadMeta(threadId, generation, { fresh: true });
       throw err;
     }
-    if (this.threadId() !== threadId) return;
+    if (!this._isCurrentConnect(threadId, generation)) return 'done';
     this.intentionalClose = false;
     const body = outcome as { status?: unknown; retirement_disposition?: unknown } | null;
     // The owner endpoint is asynchronous for a live pinned runtime: `ending`
@@ -4688,6 +5500,7 @@ export class PersistentChatService {
     // A DELETE can win before the initial EventSource was installed. Keep an
     // SSE-only ending/ended view so late archive/staging events remain discoverable.
     if (!this.sse) void this._openSse(threadId);
+    return 'done';
   }
 
   /**
@@ -4968,13 +5781,19 @@ export class PersistentChatService {
     const lockKey = this.threadId();
     if (!lockKey) return; // nothing is flushable without a thread
     if (this.flushTokens.has(lockKey)) return;
+    if (this.sseRecoveryPending && this.sessionReady() && this.outbox().length > 0) {
+      this.outboxStalled.set(true);
+      return;
+    }
     const token = {};
     this.flushTokens.set(lockKey, token);
     try {
-      while (!this.intentionalClose && this.sessionReady() && this.outbox().length > 0) {
+      while (this._controlPlaneAllowed(lockKey) && this.sessionReady() && this.outbox().length > 0) {
         const head = this.outbox()[0];
         const tidAtPost = this.threadId();
         if (!tidAtPost) break;
+        const connectAtPost = this.connectGeneration;
+        const runtimeAtPost = this.sessionRuntimeGeneration;
         // Bump the attempt counter and, for a landing-draft item queued
         // before its thread existed (threadId ''), pin it to the thread
         // that now exists. Through the signal, never in place: the
@@ -5052,6 +5871,17 @@ export class PersistentChatService {
           this.outbox.update((q) =>
             q.map((i) => (i.localId === head.localId ? { ...i, content } : i)),
           );
+        }
+        // Upload may outlive a CLOSED stream, End, navigation or a successor
+        // connect. Keep the unaccepted item queued; no G1 send may slip into
+        // G2 while owner/stream/binding recovery is still unresolved.
+        if (!this.sessionReady() || !this._controlPlaneAllowed(tidAtPost) ||
+            this.connectGeneration !== connectAtPost ||
+            this.sessionRuntimeGeneration !== runtimeAtPost) {
+          if (this.threadId() === tidAtPost && this.outboxIds().has(item.localId)) {
+            this.outboxStalled.set(true);
+          }
+          return;
         }
         this.postingLocalIds.add(head.localId);
         let result: { ok: boolean; status: number; stale?: boolean };
@@ -5314,6 +6144,12 @@ export class PersistentChatService {
    */
   retryQueuedSends(): void {
     const threadId = this.threadId();
+    if (threadId && this.sseRecoveryPending) {
+      // A manual retry cannot prove the owner while a CLOSED journal is
+      // recovering. Keep Retry/Discard visible for the next user decision.
+      this.outboxStalled.set(true);
+      return;
+    }
     if (threadId && this.invalidBindingRuntime?.threadId === threadId) {
       // Exact authority rejected this generation. Keep the item queued, but
       // never turn a user click into another send or erase the actionable
@@ -5538,18 +6374,19 @@ export class PersistentChatService {
 
     switch (cmd) {
       case '/compact':
-        // No local "Compacting context..." echo: the agent's
-        // compaction.started/progress frames drive the live progress
-        // block, and a no-op answers with a summary-less
-        // context.compacted (rendered as a system line below).
-        this._sendControl({ method: 'compact', focus: arg });
+        this.requestCompaction(arg);
         return true;
       case '/done':
-        // _sendControl refuses (and says so) when this session has no
-        // socket transport for the verb — don't announce an end that was
-        // never dispatched.
-        if (this._sendControl({ method: 'archive' })) {
+        // The socket verb where one exists (it also syncs the cloud folder
+        // and titles the session); otherwise the owner End path. Announce
+        // only what was actually dispatched.
+        if (this.controlTransport('archive') === 'websocket') {
+          if (this._sendControl({ method: 'archive' })) {
+            this._systemMessage('Ending session...');
+          }
+        } else if (this.threadId() && this._controlPlaneAllowed(this.threadId()!)) {
           this._systemMessage('Ending session...');
+          void this._endFromSlashCommand();
         }
         return true;
       case '/auto':
@@ -5567,21 +6404,33 @@ export class PersistentChatService {
       case '/verbose':
         this.setNarrationMode('verbose');
         return true;
-      case '/undo':
-        if (this.controlSocket === 'none') {
-          this._sendDurableControl({ method: 'workspace.undo' });
-        } else {
-          // Pinned sessions retain the legacy direct-WS verb. The
-          // orchestrator deliberately refuses workspace.undo on the
-          // pinned REST lane because there is no lease-owned queue
-          // unit to fence the destructive operation against.
-          this._sendControl({ method: 'undo' });
-        }
-        this._systemMessage('Undoing last file changes...');
+      case '/undo': {
+        // Pinned sessions retain the legacy direct-WS verb. The
+        // orchestrator deliberately refuses workspace.undo on the pinned
+        // REST lane because there is no lease-owned queue unit to fence
+        // the destructive operation against.
+        const dispatched =
+          this.controlTransport('workspace.undo') === 'rest'
+            ? this._sendDurableControl({ method: 'workspace.undo' })
+            : this._sendControl({ method: 'undo' });
+        if (dispatched) this._systemMessage('Undoing last file changes...');
         return true;
+      }
       case '/upgrade-workspace': {
-        const tier = arg.trim().toLowerCase() === 'vm' ? 'vm' : 'sandbox';
-        this.upgradeWorkspace(tier);
+        const word = arg.trim();
+        const lower = word.toLowerCase();
+        if (!word) this.upgradeWorkspace(null);
+        else if (lower === 'vm') this.upgradeWorkspace('vm');
+        else if (lower === 'container' || lower === 'sandbox') {
+          if (this.controlTransport('upgrade-to-workspace') === 'websocket') {
+            // A pinned session refuses container upgrades before provisioning;
+            // say so here rather than send a frame that can only fail.
+            this.error.set(this.transloco.translate('chat.control.containerUpgradeUnavailable'));
+          } else {
+            this.upgradeWorkspace('sandbox');
+          }
+        }
+        else this.upgradeWorkspace(null, {template: word});
         return true;
       }
       default:
@@ -6345,11 +7194,7 @@ export class PersistentChatService {
 
   /** "Summarize up to here" — manual compaction bounded at a message. */
   summarizeUpTo(messageId: string): void {
-    this._sendControl({
-      method: 'compact',
-      focus: '',
-      boundary_message_id: messageId,
-    });
+    this.requestCompaction('', messageId);
   }
 
   /** Arm the one-shot stuck-"Rewinding…" fallback (see rewind() and
@@ -6384,8 +7229,10 @@ export class PersistentChatService {
    * and hot-swaps in place so shell/git/file tools become available without
    * dropping the conversation (workspace_tier_upgrade.md §4.2 S3 /
    * Phase 2). `vm` is the explicit human-intent trigger for the privileged
-   * tier — the server still gates it (can_use_vm + global kill-switch).
-   * Upgrade-only; progress and completion arrive via the
+   * tier — the server still gates it (can_use_vm + global kill-switch). A
+   * `null` tier with no template lets the server pick the next tier up;
+   * `opts.template` asks for a named template instead, whose tier the server
+   * infers. Upgrade-only; progress and completion arrive via the
    * `workspace_upgrade.*` frames (see `workspaceUpgradeInProgress`).
    *
    * `thenContinue` auto-sends a continuation once the upgrade lands, so the
@@ -6396,19 +7243,27 @@ export class PersistentChatService {
    * silently order-dependent. Clearing the offer here rather than in the card
    * is deliberate for the same reason: accepting from the pane while the card
    * is live has to dismiss it too. */
-  upgradeWorkspace(tier: 'sandbox' | 'vm', opts: { thenContinue?: boolean } = {}): void {
+  upgradeWorkspace(
+    tier: 'sandbox' | 'vm' | null,
+    opts: {thenContinue?: boolean; template?: string} = {},
+  ): void {
     if (this.controlTransport('upgrade-to-workspace') !== 'websocket') {
       // No transport on this session (queue-served sessions have none yet):
       // refuse before arming the in-progress state, and say so.
-      this.error.set(this.transloco.translate('chat.control.unavailable'));
+      this.error.set(this.transloco.translate('chat.control.upgradeUnavailable'));
       return;
     }
+    const control: Record<string, unknown> = {method: 'upgrade-to-workspace'};
+    if (tier) control['target_tier'] = tier;
+    if (opts.template) control['template'] = opts.template;
+    // _sendControl refuses (and says so) on a retired control plane; arm
+    // nothing for a frame that was never dispatched.
+    if (!this._sendControl(control)) return;
     this.pendingWorkspaceOffer.set(null);
     this.continueAfterUpgrade.set(opts.thenContinue === true);
-    this._sendControl({ method: 'upgrade-to-workspace', target_tier: tier });
-    this.workspaceUpgradeInProgress.set({ tier });
+    this.workspaceUpgradeInProgress.set({tier: tier ?? (opts.template ? 'vm' : 'next')});
     this._systemMessage(
-      tier === 'vm'
+      tier === 'vm' || opts.template
         ? 'Provisioning a VM workspace (requires approval), please wait...'
         : 'Provisioning workspace, please wait...',
     );
@@ -6523,7 +7378,7 @@ export class PersistentChatService {
           this.conversation().activeAssistantTurnId != null
         ) {
           this._closeActiveTurnIfAny('turn_interrupted');
-          this.runningTool.set(null);
+          this.runningTools.set([]);
           this.compaction.set(null);
         }
         if (params['model']) {
@@ -6532,13 +7387,10 @@ export class PersistentChatService {
         if (params['temperature'] != null) {
           this.temperature.set(params['temperature'] as number);
         }
-        // Running-command snapshot: only act when the key is present so
+        // Running-command snapshot: only act when a key is present so
         // a metadata-only session.state from another channel can't clobber it.
-        if ('running_tool' in params) {
-          const rt = params['running_tool'] as Partial<RunningToolInfo> | null;
-          this.runningTool.set(
-            rt && rt.tool ? { id: rt.id ?? '', tool: rt.tool, args: rt.args ?? {} } : null,
-          );
+        if ('running_tools' in params || 'running_tool' in params) {
+          this.runningTools.set(parseRunningTools(params));
         }
         // Pending supervised gates: re-render the approval card a
         // dropped stream (or a reload) would otherwise strand, leaving
@@ -6617,8 +7469,14 @@ export class PersistentChatService {
         // awaiting state. Clamped: a turn can start without a tracked
         // accept (other tab, injected input, reload mid-queue).
         this.pendingTurnCount.update((c) => Math.max(0, c - 1));
-        // A live turn means the unit is leased: any parked/queued block is stale.
-        this._queueState.set(null);
+        // A live turn means the unit is leased: any parked/queued block is
+        // stale. A frame the snapshot covers is history (the replay floor
+        // re-sends the latest turn's start) and says nothing about the lease,
+        // so it must not wipe the block /connection just read.
+        if (!coveredBySnapshot) {
+          this.queueStateClears++;
+          this._queueState.set(null);
+        }
         const turnId = String(params['turn_id'] ?? makeLocalId('turn'));
         const pendingInterrupt = this.pendingInterruptRequest;
         const pendingWasActive =
@@ -6689,18 +7547,21 @@ export class PersistentChatService {
         });
         break;
 
-      case 'tool.completed':
+      case 'tool.completed': {
+        const completedId = (params['id'] as string) || '';
         this.dispatch({
           type: 'tool_completed',
-          toolUseId: (params['id'] as string) || '',
+          toolUseId: completedId,
           result: (params['result'] as string) || '',
           isError: !!params['is_error'],
           timestamp: now,
         });
-        if (this.runningTool()?.id === ((params['id'] as string) || '')) {
-          this.runningTool.set(null);
+        // Only the finished call leaves; its siblings in a batch still run.
+        if (this.runningTools().some((rt) => rt.id === completedId)) {
+          this.runningTools.update((list) => list.filter((rt) => rt.id !== completedId));
         }
         break;
+      }
 
       case 'permission.request_batch': {
         const list = this._toPermissionRequests(params['requests']);
@@ -6834,7 +7695,7 @@ export class PersistentChatService {
 
         const closedActive = this._interruptTurnIfSafe(targetId, now, coveredBySnapshot);
         if (closedActive) {
-          this.runningTool.set(null);
+          this.runningTools.set([]);
           this.pendingTurnCount.set(0);
           this.isWaitingForInput.set(false);
           this.compaction.set(null);
@@ -6871,7 +7732,7 @@ export class PersistentChatService {
           if (pending && turnId === String(pending.targetTurnId)) {
             this._clearPendingInterruptRequest(pending);
           }
-          if (wasActive) this.runningTool.set(null);
+          if (wasActive) this.runningTools.set([]);
         }
         // A compaction never outlives its turn — clear a stale block
         // (e.g. the pod died mid-fold and the turn was closed).
@@ -6914,7 +7775,7 @@ export class PersistentChatService {
         // it across reloads (session_silent_failure_audit.md #2).
         this._closeActiveTurnIfAny('turn_interrupted');
         this.isInterrupting.set(false);
-        this.runningTool.set(null);
+        this.runningTools.set([]);
         this.compaction.set(null);
         // Conservative reset: a queued send may still run after the
         // failed turn, but its turn.started decrement is clamped —
@@ -6957,7 +7818,7 @@ export class PersistentChatService {
         const targetId = String(targetTurnId);
         const closedActive = this._interruptTurnIfSafe(targetId, now, coveredBySnapshot);
         if (closedActive) {
-          this.runningTool.set(null);
+          this.runningTools.set([]);
           this.pendingTurnCount.set(0);
         }
         // Any exact acknowledgement for this same turn makes a local
@@ -6986,19 +7847,28 @@ export class PersistentChatService {
         const rejectedMethod =
           params['method'] === 'mode.set' ||
           params['method'] === 'narration.set' ||
-          params['method'] === 'workspace.undo'
+          params['method'] === 'workspace.undo' ||
+          params['method'] === 'compact'
             ? params['method']
             : null;
         const rejectedMarker = rejectedMethod
           ? this._takeDurableControlAck(params, rejectedMethod)
           : null;
         if (coveredBySnapshot) break;
+        const code = typeof params['error_code'] === 'string' ? params['error_code'] : '';
+        const messageKey =
+          CONTROL_REJECTION_KEYS[code] ??
+          (rejectedMethod === 'compact'
+            ? 'chat.control.compactRejected'
+            : rejectedMethod === 'workspace.undo'
+              ? 'chat.control.undoRejected'
+              : 'chat.control.ownerRejected');
         this._setDurableControlError(
           rejectedMarker ?? {
             method: rejectedMethod,
             ordinal: ++this.durableControlOrdinal,
           },
-          this.transloco.translate('chat.control.ownerRejected'),
+          this.transloco.translate(messageKey),
         );
         break;
       }
@@ -7154,6 +8024,8 @@ export class PersistentChatService {
       }
 
       case 'context.compacted': {
+        // A stateless /compact is receipted by this very frame.
+        this._clearDurableControlErrorAfter(this._takeDurableControlAck(params, 'compact'));
         // Compaction finished — clear the live progress block.
         this.compaction.set(null);
         const summary = (params['summary'] as string | null) ?? '';
@@ -7258,10 +8130,13 @@ export class PersistentChatService {
         // pointed at a nonexistent "upgrade button" / `/upgrade` command.
         const cmd = (params['command'] as string) || '';
         const cmdNote = cmd ? ` (\`${cmd}\` needs root)` : '';
+        const hint =
+          this.controlTransport('upgrade-to-workspace') === 'websocket'
+            ? 'Send /upgrade-workspace vm to move this session onto a VM with sudo ' +
+              '(your files carry over).'
+            : 'This session cannot be upgraded in place; start a VM session for root access.';
         this._systemMessage(
-          `VM upgrade needed: ${(params['reason'] as string) || 'sudo detected'}${cmdNote}. ` +
-            `Send /upgrade-workspace vm to move this session onto a VM with sudo ` +
-            `(your files carry over).`,
+          `VM upgrade needed: ${(params['reason'] as string) || 'sudo detected'}${cmdNote}. ${hint}`,
         );
         break;
       }
@@ -7288,7 +8163,8 @@ export class PersistentChatService {
         // card is the accept path; the settings pane and the
         // /upgrade-workspace slash command remain as the after-reload
         // fallback (the card is live-only). Honor the offered tier; the
-        // tool only requests `sandbox` today.
+        // pinned agent offers `vm`; a `sandbox` offer on a pinned session is
+        // an older agent's.
         //
         // This fires mid-stream: request_freeze doesn't stop the turn on
         // the session path, so the agent is still talking when the card
@@ -7296,17 +8172,29 @@ export class PersistentChatService {
         // live, and they can't accumulate.
         const tier = (params['target_tier'] as string) || 'sandbox';
         const reason = (params['reason'] as string) || 'shell/git tools needed';
+        if (tier === 'sandbox' && this.controlTransport('upgrade-to-workspace') === 'websocket') {
+          // An older agent still offers a container on a pinned session,
+          // where accepting can only fail: keep the ask in scroll-back, but
+          // raise no card.
+          this._systemMessage(
+            `The agent requested a container workspace, which isn't available in this session: ${reason}`,
+          );
+          break;
+        }
         this.pendingWorkspaceOffer.set({ tier, reason });
         // Keep a line in the stream so the ask survives in scroll-back
         // once the card resolves — but state the fact only. The card is
         // the verb now, and it says "files carry over" itself.
-        this._systemMessage(`The agent requested a ${tier} workspace: ${reason}`);
+        this._systemMessage(`The agent requested a ${workspaceTierLabel(tier)} workspace: ${reason}`);
         break;
       }
 
       case 'workspace_upgrade.started':
         this.workspaceUpgradeInProgress.update(
-          (p) => p ?? { tier: (params['target_tier'] as string) || 'sandbox' },
+          (p) =>
+            !p || p.tier === 'next'
+              ? { ...p, tier: (params['target_tier'] as string) || 'sandbox' }
+              : p,
         );
         this._systemMessage('Provisioning workspace, please wait...');
         break;
@@ -7451,6 +8339,24 @@ export class PersistentChatService {
             `Workspace sync (${op}) failed${turnLabel}. Your changes are in the workspace but not yet saved to the cloud. Will retry on next turn.`,
           );
         }
+        break;
+      }
+
+      case 'cloud_mount.status': {
+        // The agent's live view of the sidecar cloud folders (D7). An agent
+        // that reports is up to date: an earlier outdated notice clears.
+        // The event names each mount's state, what it is and its level; for
+        // an agent that names only the state, the thread record says the rest.
+        const folders = cloudFolderStateFromEvent(params, {
+          problems: this.cloudFolderProblems(),
+          folders: this.cloudFolders(),
+          protected: this.cloudFoldersProtected(),
+          agentOutdated: this.cloudFoldersAgentOutdated(),
+        });
+        this.cloudFolderProblems.set(folders.problems);
+        this.cloudFolders.set(folders.folders);
+        this.cloudFoldersProtected.set(folders.protected);
+        this.cloudFoldersAgentOutdated.set(folders.agentOutdated);
         break;
       }
 
@@ -7779,6 +8685,31 @@ export function cloudCountFromSummary(s: ThreadCloudDiffSummary | null): number 
 // no better here than a user bubble.
 const SYNTHETIC_IMAGE_DELIVERY_RE = /^Image content from tool call \S+:\s*$/;
 
+/**
+ * The in-flight tool calls a `session.state` snapshot reports.
+ *
+ * `running_tools` (every unanswered call of the batch) wins when present;
+ * otherwise the single `running_tool` both producers send today — the agent's
+ * welcome frame names the first unanswered call of the last tool-calling
+ * message, and the orchestrator's durable snapshot the latest unmatched
+ * `tool.started`. So a cold reattach in the middle of a subagent fan-out shows
+ * one running card until a server sends the list. Entries without a tool
+ * name are dropped, as the single field always did.
+ */
+export function parseRunningTools(params: Record<string, unknown>): RunningToolInfo[] {
+  const toInfo = (raw: unknown): RunningToolInfo | null => {
+    if (!raw || typeof raw !== 'object') return null;
+    const rt = raw as Partial<RunningToolInfo>;
+    return rt.tool ? { id: rt.id ?? '', tool: rt.tool, args: rt.args ?? {} } : null;
+  };
+  const list = params['running_tools'];
+  if (Array.isArray(list)) {
+    return list.map(toInfo).filter((rt): rt is RunningToolInfo => rt !== null);
+  }
+  const single = toInfo(params['running_tool']);
+  return single ? [single] : [];
+}
+
 export function historyToTurns(messages: HistoryMessage[]): Turn[] {
   const turns: Turn[] = [];
   const turnByNumber = new Map<number, AssistantTurn>();
@@ -7837,12 +8768,26 @@ export function historyToTurns(messages: HistoryMessage[]): Turn[] {
     // the model was told something, but the user never said it, and a
     // transcript that claims otherwise is a lie the user cannot audit.
     // Joins 'summary' and 'error' as the third non-conversational role.
+    //
+    // A delegation-batch recovery's continuation is one of these too: the
+    // line the per-child recovery event has always had. Its structured
+    // marker carries the turn's call counts, so the line can state them in
+    // the viewer's language instead of the text written for the model.
     if (m.role === 'event') {
+      const subagentRecovery = parseSubagentRecoveryContinuation(m.metrics);
+      // The continuation carries the abandoned turn's number, and the
+      // successor answers it as that same turn. Everything the turn holds so
+      // far came from the run it replaced, which the journal replay of the
+      // latest turn never re-delivers.
+      const resumed =
+        subagentRecovery && m.turn_number != null ? turnByNumber.get(m.turn_number) : undefined;
+      if (resumed) resumed.priorRunEvents = resumed.events.length;
       turns.push({
         kind: 'system',
         id: m.id,
         content: m.content || '',
         timestamp: ts,
+        ...(subagentRecovery ? { subagentRecovery } : {}),
       });
       continue;
     }
@@ -7878,14 +8823,28 @@ export function historyToTurns(messages: HistoryMessage[]): Turn[] {
       // Match result back to the originating call. Rows missing
       // tool_call_id (pre-migration 0011 data) can't be linked and
       // are silently dropped — same as the prior behavior.
+      //
+      // By id, not by position, and across the whole transcript: a result
+      // a delegation-batch recovery wrote is created when the successor
+      // settles the turn, so it sorts after anything typed during the batch,
+      // yet still lands on its call.
       const callId = m.tool_call_id;
       if (!callId) continue;
       const tc = toolCallById.get(callId);
       if (!tc) continue;
       tc.result = m.content ?? '';
       tc.resultStatus = 'ok';
-      // Don't clobber a 'denied' decision recorded on the AI side.
-      if (tc.status !== 'denied') tc.status = 'completed';
+      // That recovery's marker says what became of the child; the result
+      // text is for the model and is never parsed. Each result row decides
+      // afresh, like the text it carries: a later unmarked result for the
+      // same call leaves no marker behind.
+      const recovery = parseSubagentRecoveryResult(m.metrics, callId);
+      if (recovery) tc.recovery = recovery;
+      else delete tc.recovery;
+      // Don't clobber a 'denied' decision recorded on the AI side. A
+      // recovered declined call is that same refusal.
+      const refused = tc.decision === 'denied' || recovery?.class === 'declined';
+      tc.status = refused ? 'denied' : 'completed';
       continue;
     }
 
@@ -7955,6 +8914,9 @@ export function historyToTurns(messages: HistoryMessage[]): Turn[] {
           // the live SSE path sets this from the same registry.
           category: tc.category,
           startedAt: ts,
+          // The AI row that carried the call: calls sharing it were issued in
+          // one model response, which is what makes a delegate fan-out.
+          messageKey: m.id,
         };
         turn.events.push(event);
         if (tc.id) toolCallById.set(tc.id, event);
@@ -7997,5 +8959,10 @@ interface HistoryMessage {
   tool_call_id?: string | null;
   /** Set only on role='ai' rows that carry reasoning content. */
   thinking?: string | null;
+  /**
+   * The row's `metrics` JSON. Read here only for the delegation-batch
+   * recovery marker (`subagent_recovery`, see subagent-recovery.model.ts).
+   */
+  metrics?: Record<string, unknown> | null;
   created_at: string | null;
 }

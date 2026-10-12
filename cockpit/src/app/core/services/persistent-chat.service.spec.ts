@@ -3,21 +3,24 @@ import { Injector, NgZone, PLATFORM_ID, runInInjectionContext, signal } from '@a
 import Dexie from 'dexie';
 import { TestBed } from '@angular/core/testing';
 import { HttpClient } from '@angular/common/http';
-import { NEVER, from, of, Subject, throwError } from 'rxjs';
+import { NEVER, from, map, of, Subject, throwError } from 'rxjs';
 import { TranslocoService } from '@jsverse/transloco';
 import {
   PersistentChatService,
   historyToTurns,
   cloudCountFromSummary,
   describeAppliedConfig,
+  parseRunningTools,
 } from './persistent-chat.service';
 import { ApiService } from './api.service';
 import { CapabilitiesService } from './capabilities.service';
 import { IndexedDbService } from './indexed-db.service';
 import { NotificationService } from './notification.service';
+import { reduce } from './turn-reducer';
 import { AppToastService } from '../../ui/toast';
 import {
   AssistantTurn,
+  groupEvents,
   isAssistantTurn,
   isSystemTurn,
   isToolCall,
@@ -27,9 +30,16 @@ import {
   UserTurn,
 } from '../models/turn.model';
 import { ThreadCloudDiffSummary } from '../models/api.model';
+import {
+  buildDelegateBatchMembers,
+  delegateMemberStatus,
+  summarizeDelegateBatch,
+} from '../models/delegate-batch.model';
+import { toolCardViewFromEvent } from '../tools/tool-card-adapters';
 import { UploadStatus } from '../models/file.model';
 import { PersistentThreadTransportBridge } from './persistent-thread-transport-bridge.service';
 import { CanvasService } from './canvas.service';
+import { PersistentChatComponent, canComposeDuringSession } from '../../views/persistent-chat/persistent-chat.component';
 
 const SESSION_RUNTIME_GENERATION = '55555555-5555-4555-8555-555555555555';
 const SESSION_RUNTIME_GENERATION_B = '66666666-6666-4666-8666-666666666666';
@@ -215,6 +225,7 @@ function createService(
   // the PersistentChatService constructor effect reads. Tests fire phase
   // transitions by setting this signal directly.
   const mockNotifications: any = {
+    isConnected: signal(false),
     lifecycleEvent: signal<{
       thread_id: string;
       state: string;
@@ -1176,7 +1187,7 @@ describe('PersistentChatService — connect()', () => {
     fireSseMessage(sseInstances[0], { method: 'token', params: { content: 'Completed.' } }, '0:5519');
     (service as any)._flushDeltas();
     expect(service.isStreaming()).toBe(true);
-    service.runningTool.set({ id: 'c1', tool: 'shell_execute', args: {} });
+    service.runningTools.set([{ id: 'c1', tool: 'shell_execute', args: {} }]);
 
     (service as any)._handleEvent({
       method: 'session.state',
@@ -1193,7 +1204,7 @@ describe('PersistentChatService — connect()', () => {
     const turn = service.turns().find(isAssistantTurn) as AssistantTurn;
     expect(turn.status).toBe('interrupted');
     expect((turn.events[0] as TextEvent).content).toBe('Completed.');
-    expect(service.runningTool()).toBeNull();
+    expect(service.runningTools()).toEqual([]);
     // A pinned welcome frame (no durable source) keeps the historical
     // reopen-only behaviour: it is followed by the exact WS state.
     fireSseMessage(sseInstances[0], { method: 'turn.started', params: { turn_id: 5 } }, '0:5521');
@@ -1682,6 +1693,28 @@ describe('PersistentChatService — createAndConnect()', () => {
     expect(service.threadId()).toBe('thread-new');
   });
 
+  it('shows each create notice as a warning toast', async () => {
+    // unavailable_model_handling.md: a saved default model that can no longer
+    // run is replaced by the system default, and the create response says so.
+    const { service, mockHttp } = createService();
+    const notice =
+      'Your default model `MiniMax-M3` is no longer available, so this session uses `muse-spark-1.3-contributor`. Choose a new default in Settings → Preferences.';
+    mockHttp.post.mockImplementation((url: string) =>
+      url.endsWith('/persistent/threads')
+        ? of({ thread_id: 'thread-new', status: 'created', notices: [notice] })
+        : of({}),
+    );
+    mockHttp.get.mockImplementation((url: string) => {
+      if (url.endsWith('/messages')) return of({ messages: [], total: 0 });
+      return of({ status: 'active', total_turns: 0 });
+    });
+
+    await service.createAndConnect({ config_name: 'scholar' });
+
+    const toast = TestBed.inject(AppToastService) as any;
+    expect(toast.warning).toHaveBeenCalledWith(notice, { duration: 15000 });
+  });
+
   it('does not connect a newly-created thread after the user navigates elsewhere', async () => {
     const { service, mockHttp, sseInstances } = createService();
     const createResponse = new Subject<{ thread_id: string }>();
@@ -1710,6 +1743,29 @@ describe('PersistentChatService — createAndConnect()', () => {
     expect(service.sessionTitle()).toBe('Thread B');
     expect(sseInstances).toHaveLength(1);
     expect(sseInstances[0].url).toContain('/persistent/threads/thread-B/stream');
+  });
+});
+
+describe('PersistentChatService — draft create passes the VM flag', () => {
+  async function createFromDraft(choice: any) {
+    const {service} = createService();
+    const spy = vi.spyOn(service, 'createAndConnect').mockResolvedValue('thread-new');
+    service.draftDefaultsLoading.set(false);
+    service.draftDefaultsError.set(false);
+    service.draftDatasourceIds.set([]);
+    service.draftWorkspaceChoice.set(choice);
+    await (service as any)._createFromDraftSession('hello');
+    return spy;
+  }
+
+  it('passes vm:true to createAndConnect for a VM draft', async () => {
+    const spy = await createFromDraft({kind: 'ref', ref: {name: 'vm-full', scope: {kind: 'Catalog', name: 'shared'}}, backend: 'vm', label: 'vm-full'});
+    expect(spy.mock.calls[0][1]).toEqual({vm: true});
+  });
+
+  it('passes vm:false to createAndConnect for a container draft', async () => {
+    const spy = await createFromDraft({kind: 'ref', ref: {name: 'container-full', scope: {kind: 'Catalog', name: 'shared'}}, backend: 'sandbox', label: 'container-full'});
+    expect(spy.mock.calls[0][1]).toEqual({vm: false});
   });
 });
 
@@ -2489,6 +2545,56 @@ describe('PersistentChatService — SSE event dispatch', () => {
     expect(service.cloudSyncDegraded()).toBe(false);
   });
 
+  it('keeps the live state of sidecar cloud folders from cloud_mount.status (D7)', async () => {
+    const { service, es } = await setup();
+    expect(service.cloudFolderProblems()).toEqual([]);
+    // An older agent left the notice; a reporting agent is up to date.
+    service.cloudFoldersAgentOutdated.set(true);
+    fireSseMessage(
+      es,
+      {
+        method: 'cloud_mount.status',
+        params: {
+          mounts: [
+            { name: 'project', state: 'unavailable', reason: 'credential_rejected' },
+            { name: 'home', state: 'mounted' },
+          ],
+          excluded: [],
+        },
+      },
+      '1:1',
+    );
+    expect(service.cloudFolderProblems()).toEqual([
+      { name: 'project', path: 'workspace/cloud/project', kind: '', reason: 'credential_rejected' },
+    ]);
+    // Every folder keeps its row in the header, mounted or not.
+    expect(service.cloudFolders().map((f) => [f.name, f.state, f.reason])).toEqual([
+      ['project', 'unavailable', 'credential_rejected'],
+      ['home', 'mounted', ''],
+    ]);
+    expect(service.cloudFoldersAgentOutdated()).toBe(false);
+    expect(service.cloudFoldersProtected()).toBe(false);
+    fireSseMessage(
+      es,
+      { method: 'cloud_mount.status', params: { mounts: [{ name: 'project', state: 'mounted' }] } },
+      '1:2',
+    );
+    expect(service.cloudFolderProblems()).toEqual([]);
+    // A protected session without its cloud (decision 42).
+    fireSseMessage(
+      es,
+      {
+        method: 'cloud_mount.status',
+        params: {
+          protected: true,
+          mounts: [{ name: 'lower', state: 'unavailable', reason: 'protected_unavailable' }],
+        },
+      },
+      '1:3',
+    );
+    expect(service.cloudFoldersProtected()).toBe(true);
+  });
+
   it('does NOT mark cloudSyncDegraded for a retryable per-turn workspace_sync.error', async () => {
     const { service, es } = await setup();
     fireSseMessage(
@@ -3076,6 +3182,281 @@ describe('PersistentChatService — SSE error handling', () => {
     vi.clearAllMocks();
   });
 
+  it('recovers a live same-generation journal after CLOSED during a temporary API outage', async () => {
+    vi.useFakeTimers();
+    try {
+      const ctx = createService();
+      let available = true;
+      ctx.mockHttp.get.mockImplementation((url: string) =>
+        url.endsWith('/api/persistent/threads/recover-live') && !available
+          ? throwError(() => ({ status: 503 }))
+          : activeSessionGet(url),
+      );
+      await ctx.service.connect('recover-live');
+      await vi.advanceTimersByTimeAsync(0);
+      const first = ctx.sseInstances[0];
+      fireSseOpen(first);
+      expect(ctx.service.connectionState()).toBe('connected');
+
+      available = false;
+      fireSseTerminalError(first);
+      expect(ctx.service.isConnected()).toBe(false);
+      await vi.advanceTimersByTimeAsync(2_000);
+      expect(ctx.sseInstances).toHaveLength(1);
+
+      available = true;
+      await vi.advanceTimersByTimeAsync(35_000);
+      expect(ctx.sseInstances.length).toBeGreaterThan(1);
+      const recovered = ctx.sseInstances.at(-1)!;
+      fireSseOpen(recovered);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(ctx.service.connectionState()).toBe('connected');
+      expect(first.close).toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('recovers a CLOSED initial journal handshake without an earlier onopen', async () => {
+    vi.useFakeTimers();
+    try {
+      const ctx = createService();
+      ctx.mockHttp.get.mockImplementation(activeSessionGet);
+      await ctx.service.connect('initial-handshake-closed');
+      const first = ctx.sseInstances[0];
+      fireSseTerminalError(first);
+      expect(ctx.service.isConnected()).toBe(false);
+      await vi.advanceTimersByTimeAsync(2_000);
+      expect(ctx.sseInstances).toHaveLength(2);
+      fireSseOpen(ctx.sseInstances[1]);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(ctx.service.connectionState()).toBe('connected');
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('reopens terminal review after CLOSED even when owner metadata clears G', async () => {
+    vi.useFakeTimers();
+    try {
+      const ctx = createService();
+      let ended = false;
+      ctx.mockHttp.get.mockImplementation((url: string) =>
+        activeSessionGet(url).pipe(map((row) =>
+          url.endsWith('/api/persistent/threads/terminal-null') && ended
+            ? { ...row, status: 'ended', session_runtime_generation: null }
+            : row)),
+      );
+      await ctx.service.connect('terminal-null');
+      fireSseOpen(ctx.sseInstances[0]);
+      const connectionReads = ctx.mockHttp.get.mock.calls.filter((call: any[]) =>
+        String(call[0]).endsWith('/api/sessions/terminal-null/connection')).length;
+      ended = true;
+      fireSseTerminalError(ctx.sseInstances[0]);
+      await vi.advanceTimersByTimeAsync(2_000);
+      expect(ctx.sseInstances).toHaveLength(2);
+      fireSseOpen(ctx.sseInstances[1]);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(ctx.service.threadStatus()).toBe('ended');
+      expect(ctx.service.connectionState()).toBe('disconnected');
+      expect(ctx.mockHttp.get.mock.calls.filter((call: any[]) =>
+        String(call[0]).endsWith('/api/sessions/terminal-null/connection'))).toHaveLength(connectionReads);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('keeps one timed owner probe in flight and retries after its timeout', async () => {
+    vi.useFakeTimers();
+    try {
+      const ctx = createService();
+      let hung = false;
+      ctx.mockHttp.get.mockImplementation((url: string) =>
+        hung && url.endsWith('/api/persistent/threads/probe-timeout')
+          ? NEVER : activeSessionGet(url),
+      );
+      await ctx.service.connect('probe-timeout');
+      const first = ctx.sseInstances[0];
+      fireSseOpen(first);
+      const initialReads = ctx.mockHttp.get.mock.calls.filter((call: any[]) =>
+        String(call[0]).endsWith('/api/persistent/threads/probe-timeout')).length;
+      hung = true;
+      fireSseTerminalError(first);
+      await vi.advanceTimersByTimeAsync(10_000);
+      const reads = ctx.mockHttp.get.mock.calls.filter((call: any[]) =>
+        String(call[0]).endsWith('/api/persistent/threads/probe-timeout'));
+      expect(reads).toHaveLength(initialReads + 1); // one unresolved probe
+      hung = false;
+      await vi.advanceTimersByTimeAsync(35_000);
+      expect(ctx.sseInstances.length).toBeGreaterThan(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('keeps a recovered successor connecting until its exact binding is verified', async () => {
+    vi.useFakeTimers();
+    try {
+      const ctx = createService();
+      const generationB = '66666666-6666-4666-8666-666666666666';
+      const binding = new Subject<any>();
+      let runtime = SESSION_RUNTIME_GENERATION;
+      ctx.mockHttp.get.mockImplementation((url: string) =>
+        url.endsWith('/connection') && runtime === generationB
+          ? binding.asObservable()
+          : activeSessionGet(url).pipe(map((row) => ({
+              ...row, session_runtime_generation: runtime, runtime_retirement_pending: false,
+            }))),
+      );
+      await ctx.service.connect('successor-after-close');
+      fireSseOpen(ctx.sseInstances[0]);
+      runtime = generationB;
+      fireSseTerminalError(ctx.sseInstances[0]);
+      await vi.advanceTimersByTimeAsync(2_000);
+      expect(ctx.sseInstances.length).toBe(2);
+      fireSseOpen(ctx.sseInstances[1]);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(ctx.service.connectionState()).toBe('connecting');
+      binding.next({
+        state: 'ready', control_socket: 'none', pinned_runtime_generation_contract: 1,
+        session_runtime_generation: generationB,
+      });
+      binding.complete();
+      await vi.advanceTimersByTimeAsync(0);
+      expect(ctx.service.connectionState()).toBe('connected');
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('cancels CLOSED recovery when the view disconnects', async () => {
+    vi.useFakeTimers();
+    try {
+      const ctx = createService();
+      ctx.mockHttp.get.mockImplementation((url: string) => activeSessionGet(url));
+      await ctx.service.connect('closed-navigate');
+      fireSseOpen(ctx.sseInstances[0]);
+      fireSseTerminalError(ctx.sseInstances[0]);
+      ctx.service.disconnect();
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(ctx.sseInstances).toHaveLength(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('does not grant live controls when first-connect recovery lacks a canonical runtime', async () => {
+    vi.useFakeTimers();
+    try {
+      const ctx = createService();
+      ctx.mockHttp.get.mockImplementation(() =>
+        of({ status: 'active', total_turns: 0, messages: [], total: 0 }),
+      );
+      await ctx.service.connect('missing-recovery-generation');
+      fireSseOpen(ctx.sseInstances[0]);
+      fireSseTerminalError(ctx.sseInstances[0]);
+      await vi.advanceTimersByTimeAsync(35_000);
+      expect(ctx.sseInstances).toHaveLength(1);
+      expect(ctx.service.connectionState()).toBe('connecting');
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('shares one owner probe when a reopened stream closes during onopen verification', async () => {
+    vi.useFakeTimers();
+    try {
+      const ctx = createService();
+      const held = new Subject<any>();
+      let hold = false;
+      ctx.mockHttp.get.mockImplementation((url: string) =>
+        hold && url.endsWith('/api/persistent/threads/verify-race')
+          ? held.asObservable() : activeSessionGet(url),
+      );
+      await ctx.service.connect('verify-race');
+      fireSseOpen(ctx.sseInstances[0]);
+      fireSseTerminalError(ctx.sseInstances[0]);
+      await vi.advanceTimersByTimeAsync(2_000);
+      const reopened = ctx.sseInstances[1];
+      expect(reopened).toBeDefined();
+      hold = true;
+      fireSseOpen(reopened);
+      fireSseTerminalError(reopened);
+      await vi.advanceTimersByTimeAsync(10_000);
+      expect(ctx.sseInstances).toHaveLength(2);
+      hold = false;
+      held.next({ status: 'active' });
+      held.complete();
+      await vi.advanceTimersByTimeAsync(3_000);
+      expect(ctx.sseInstances).toHaveLength(3);
+      expect(ctx.service.connectionState()).toBe('connecting');
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('keeps an uploaded queued send unsent when CLOSED begins before its POST', async () => {
+    vi.useFakeTimers();
+    try {
+      const ctx = createService();
+      ctx.mockHttp.get.mockImplementation(activeSessionGet);
+      await ctx.service.connect('upload-during-gap');
+      fireSseOpen(ctx.sseInstances[0]);
+      let releaseUpload!: (result: { ok: boolean; status: number }) => void;
+      const upload = new Promise<{ ok: boolean; status: number }>((resolve) => {
+        releaseUpload = resolve;
+      });
+      vi.spyOn(ctx.service as any, '_uploadStage').mockReturnValue(upload);
+      ctx.service.outbox.set([{
+        localId: 'queued-upload', displayContent: 'send after recovery',
+        threadId: 'upload-during-gap', attempts: 0,
+        pendingFiles: [{ id: 'file-1', status: 'queued' } as any],
+      }]);
+      const flush = (ctx.service as any)._flushOutbox();
+      fireSseTerminalError(ctx.sseInstances[0]);
+      releaseUpload({ ok: true, status: 200 });
+      await flush;
+      expect(ctx.mockHttp.post.mock.calls.filter((call: any[]) =>
+        String(call[0]).endsWith('/api/persistent/threads/upload-during-gap/input'))).toHaveLength(0);
+      expect(ctx.service.outbox().map((item) => item.localId)).toEqual(['queued-upload']);
+      expect(ctx.service.outboxStalled()).toBe(true);
+      await (ctx.service as any)._flushOutbox();
+      expect(ctx.mockHttp.post.mock.calls.filter((call: any[]) =>
+        String(call[0]).endsWith('/api/persistent/threads/upload-during-gap/input'))).toHaveLength(0);
+      ctx.service.retryQueuedSends();
+      expect(ctx.service.outboxStalled()).toBe(true);
+      ctx.service.disconnect();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('keeps binding recovery unverified when the journal reopens before /connection', async () => {
+    vi.useFakeTimers();
+    try {
+      const ctx = createService();
+      let holdBinding = false;
+      ctx.mockHttp.get.mockImplementation((url: string) =>
+        holdBinding && url.endsWith('/connection') ? NEVER : activeSessionGet(url),
+      );
+      await ctx.service.connect('binding-recovery-gap');
+      fireSseOpen(ctx.sseInstances[0]);
+      fireSseTerminalError(ctx.sseInstances[0]);
+      await vi.advanceTimersByTimeAsync(2_000);
+      holdBinding = true;
+      (ctx.service as any).bindingRecoveryRuntime = {
+        threadId: 'binding-recovery-gap',
+        rejectedGeneration: SESSION_RUNTIME_GENERATION,
+        candidateGeneration: '66666666-6666-4666-8666-666666666666',
+      };
+      fireSseOpen(ctx.sseInstances[1]);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(ctx.service.connectionState()).toBe('connecting');
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('bumps reconnectAttempt on transient onerror (browser retrying)', async () => {
     const ctx = createService();
     ctx.mockHttp.get.mockImplementation(() =>
@@ -3094,30 +3475,47 @@ describe('PersistentChatService — SSE error handling', () => {
     expect(ctx.service.reconnectAttempt()).toBe(2);
   });
 
-  it('sets reconnectGaveUp + error state on terminal CLOSED', async () => {
-    const ctx = createService();
-    ctx.mockHttp.get.mockImplementation(() =>
-      of({ status: 'active', total_turns: 0, messages: [], total: 0 }),
-    );
-    await ctx.service.connect('thread-term');
-    const es = ctx.sseInstances[0];
-    fireSseOpen(es);
+  it.each([401, 404])('stops automatic CLOSED recovery after an authoritative %i, even on wake', async (status) => {
+    vi.useFakeTimers();
+    try {
+      const ctx = createService();
+      let denied = false;
+      ctx.mockHttp.get.mockImplementation((url: string) =>
+        denied && url.endsWith('/api/persistent/threads/thread-term')
+          ? throwError(() => ({ status }))
+          : activeSessionGet(url),
+      );
+      await ctx.service.connect('thread-term');
+      const es = ctx.sseInstances[0];
+      fireSseOpen(es);
 
-    fireSseTerminalError(es);
-    expect(ctx.service.connectionState()).toBe('error');
-    expect(ctx.service.reconnectGaveUp()).toBe(true);
+      denied = true;
+      fireSseTerminalError(es);
+      expect(ctx.service.connectionState()).toBe('connecting');
+      await vi.advanceTimersByTimeAsync(2_000);
+      expect(ctx.service.connectionState()).toBe('error');
+      expect(ctx.service.reconnectGaveUp()).toBe(true);
+      await vi.advanceTimersByTimeAsync(120_000);
+      expect(ctx.sseInstances).toHaveLength(1);
+      const reads = ctx.mockHttp.get.mock.calls.length;
+      window.dispatchEvent(new Event('online'));
+      window.dispatchEvent(new Event('focus'));
+      await vi.advanceTimersByTimeAsync(0);
+      expect(ctx.mockHttp.get.mock.calls).toHaveLength(reads);
+      expect(ctx.sseInstances).toHaveLength(1);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('reconnectNow() drops the existing SSE and opens a fresh one', async () => {
     const ctx = createService();
-    ctx.mockHttp.get.mockImplementation(() =>
-      of({ status: 'active', total_turns: 0, messages: [], total: 0 }),
-    );
+    ctx.mockHttp.get.mockImplementation(activeSessionGet);
     await ctx.service.connect('thread-rn');
     const first = ctx.sseInstances[0];
     fireSseOpen(first);
     fireSseTerminalError(first);
-    expect(ctx.service.reconnectGaveUp()).toBe(true);
+    expect(ctx.service.connectionState()).toBe('connecting');
 
     ctx.service.reconnectNow();
     // _openSse awaits cache.getThreadCursor — drain microtasks.
@@ -3126,6 +3524,8 @@ describe('PersistentChatService — SSE error handling', () => {
     expect(first.close).toHaveBeenCalled();
     expect(ctx.sseInstances.length).toBe(2);
     expect(ctx.service.reconnectGaveUp()).toBe(false);
+    fireSseOpen(ctx.sseInstances[1]);
+    await new Promise((r) => setTimeout(r, 0));
     expect(ctx.service.reconnectAttempt()).toBe(0);
   });
 });
@@ -3149,9 +3549,7 @@ describe('PersistentChatService — SSE liveness watchdog', () => {
 
   it('force-reopens the SSE when no event arrives for > 45s', async () => {
     const ctx = createService();
-    ctx.mockHttp.get.mockImplementation(() =>
-      of({ status: 'active', total_turns: 0, messages: [], total: 0 }),
-    );
+    ctx.mockHttp.get.mockImplementation(activeSessionGet);
     await ctx.service.connect('thread-wd');
     // Drain the _openSse microtask chain (await getThreadCursor) so the
     // first EventSource has been constructed.
@@ -3161,8 +3559,9 @@ describe('PersistentChatService — SSE liveness watchdog', () => {
     fireSseOpen(first);
     expect(ctx.sseInstances.length).toBe(1);
 
-    // 50s of silence — past the 45s watchdog threshold.
-    await vi.advanceTimersByTimeAsync(50_000);
+    // 52s of silence — past the 45s watchdog threshold and first bounded
+    // owner probe before the replacement stream opens.
+    await vi.advanceTimersByTimeAsync(52_000);
 
     expect(first.close).toHaveBeenCalled();
     expect(ctx.sseInstances.length).toBe(2);
@@ -3227,7 +3626,7 @@ describe('PersistentChatService — SSE liveness watchdog', () => {
     expect(ctx.sseInstances.length).toBe(1);
   });
 
-  it('does not start a watchdog on terminal CLOSED', async () => {
+  it('does not leave the old watchdog running after terminal CLOSED', async () => {
     const ctx = createService();
     ctx.mockHttp.get.mockImplementation(() =>
       of({ status: 'active', total_turns: 0, messages: [], total: 0 }),
@@ -3238,11 +3637,11 @@ describe('PersistentChatService — SSE liveness watchdog', () => {
     const first = ctx.sseInstances[0];
     fireSseOpen(first);
     fireSseTerminalError(first);
-    expect(ctx.service.reconnectGaveUp()).toBe(true);
-
-    // After terminal close, no further reopens should happen no matter
-    // how much time passes.
-    await vi.advanceTimersByTimeAsync(120_000);
+    // The recovery timer may probe/reopen, but the old 5s watchdog must not
+    // read metadata before that timer fires.
+    const reads = ctx.mockHttp.get.mock.calls.length;
+    await vi.advanceTimersByTimeAsync(500);
+    expect(ctx.mockHttp.get.mock.calls.length).toBe(reads);
     expect(ctx.sseInstances.length).toBe(1);
   });
 });
@@ -4373,19 +4772,31 @@ describe('PersistentChatService — control commands', () => {
     expect(ctx.mockHttp.post).toHaveBeenCalledTimes(3);
   });
 
-  it('/upgrade-workspace defaults to the sandbox tier', async () => {
+  it.each([
+    ['/upgrade-workspace', { method: 'upgrade-to-workspace' }],
+    ['/upgrade-workspace vm', { method: 'upgrade-to-workspace', target_tier: 'vm' }],
+    [
+      '/upgrade-workspace website-builder',
+      { method: 'upgrade-to-workspace', template: 'website-builder' },
+    ],
+  ])('%s sends %o', async (input: string, control: Record<string, unknown>) => {
     const ctx = await readySession();
-    await ctx.service.sendMessage('/upgrade-workspace');
+    await ctx.service.sendMessage(input);
     const sent = ctx.wsInstances[0].send.mock.calls.map((c: any) => JSON.parse(c[0]));
-    expect(sent).toContainEqual({ method: 'upgrade-to-workspace', target_tier: 'sandbox' });
+    expect(sent).toContainEqual(control);
   });
 
-  it('/upgrade-workspace vm requests the vm tier (Phase 2, server-gated)', async () => {
-    const ctx = await readySession();
-    await ctx.service.sendMessage('/upgrade-workspace vm');
-    const sent = ctx.wsInstances[0].send.mock.calls.map((c: any) => JSON.parse(c[0]));
-    expect(sent).toContainEqual({ method: 'upgrade-to-workspace', target_tier: 'vm' });
-  });
+  it.each(['/upgrade-workspace container', '/upgrade-workspace sandbox'])(
+    '%s on a pinned session answers locally and sends nothing',
+    async (input: string) => {
+      const ctx = await readySession();
+      await ctx.service.sendMessage(input);
+      const sent = ctx.wsInstances[0].send.mock.calls.map((c: any) => JSON.parse(c[0]));
+      expect(sent.some((c: any) => c.method === 'upgrade-to-workspace')).toBe(false);
+      expect(ctx.service.error()).toBe('chat.control.containerUpgradeUnavailable');
+      expect(ctx.service.workspaceUpgradeInProgress()).toBeNull();
+    },
+  );
 
   it('setMode uses the lane-agnostic REST inbox and never the control WS', async () => {
     const ctx = await readySession();
@@ -5528,11 +5939,11 @@ describe('PersistentChatService — direct session WS (prepare + connection)', (
       '5:81',
     );
 
-    expect(ctx.service.runningTool()).toEqual({
+    expect(ctx.service.runningTools()).toEqual([{
       id: 'tool-live',
       tool: 'run_command',
       args: { cmd: 'make' },
-    });
+    }]);
     expect(ctx.service.pendingPermissions()).toEqual([
       {
         id: 'tool-gated',
@@ -6475,6 +6886,11 @@ describe('PersistentChatService — direct session WS (prepare + connection)', (
       );
       ctx.mockHttp.get.mockImplementation(
         connectGetMock({
+          threadMeta: {
+            status: 'active', total_turns: 0,
+            session_runtime_generation: SESSION_RUNTIME_GENERATION,
+            runtime_retirement_pending: false,
+          },
           connectionResponses: [
             throwError(() => ({
               status: 409,
@@ -6525,7 +6941,7 @@ describe('PersistentChatService — direct session WS (prepare + connection)', (
       expect(ctx.service.connectionState()).toBe('error');
       expect(ctx.service.error()).toBe('errors.sessions.bindingInvalid');
 
-      await vi.advanceTimersByTimeAsync(50_000);
+      await vi.advanceTimersByTimeAsync(52_000);
       const watchdogSse = ctx.sseInstances.at(-1)!;
       expect(watchdogSse).not.toBe(manualSse);
       fireSseOpen(watchdogSse);
@@ -6705,6 +7121,312 @@ describe('PersistentChatService — direct session WS (prepare + connection)', (
     await flushMicrotasks(20);
     expect(ctx.mockHttp.post).toHaveBeenCalledTimes(2);
     expect(ctx.service.outbox()).toEqual([]);
+  });
+
+  it('external Resume: an ended tab joins G2 through the shared lifecycle feed', async () => {
+    const ctx = createService();
+    let runtimeGeneration = SESSION_RUNTIME_GENERATION;
+    ctx.mockHttp.get.mockImplementation((url: string) => activeSessionGet(url).pipe(map((value) => ({
+      ...value,
+      session_runtime_generation: runtimeGeneration,
+      runtime_retirement_pending: false,
+    }))));
+    try {
+      await ctx.service.connect('external-resume');
+      const reviewSse = ctx.sseInstances[0];
+      fireSseOpen(reviewSse);
+      fireSseMessage(reviewSse, {
+        method: 'session.ended',
+        params: { session_runtime_generation: SESSION_RUNTIME_GENERATION },
+      }, '9:42');
+      expect(ctx.service.threadStatus()).toBe('ended');
+
+      runtimeGeneration = SESSION_RUNTIME_GENERATION_B;
+      ctx.notifications.lifecycleEvent.set({
+        thread_id: 'external-resume',
+        state: 'provisioning',
+        session_runtime_generation: SESSION_RUNTIME_GENERATION_B,
+      });
+      TestBed.tick();
+      await flushMicrotasks(30);
+
+      expect(ctx.service.threadStatus()).toBe('active');
+      expect(ctx.service.sessionReady()).toBe(true);
+      expect(ctx.wsInstances).toHaveLength(2);
+      expect(ctx.sseInstances).toHaveLength(2);
+      expect(ctx.sseInstances[1].close).not.toHaveBeenCalled();
+      expect((ctx.service as any).resumedFromEpoch).toBe(9);
+      expect(ctx.mockHttp.post.mock.calls.some((call: any[]) =>
+        String(call[0]).endsWith('/resume'))).toBe(false);
+    } finally {
+      ctx.service.disconnect();
+    }
+  });
+
+  it('external Resume: stale Send reconciles G2 after session_not_ended and flushes once', async () => {
+    const ctx = createService();
+    let runtimeGeneration = SESSION_RUNTIME_GENERATION;
+    ctx.mockHttp.get.mockImplementation((url: string) => activeSessionGet(url).pipe(map((value) => ({
+      ...value,
+      session_runtime_generation: runtimeGeneration,
+      runtime_retirement_pending: false,
+    }))));
+    ctx.mockHttp.post.mockImplementation((url: string) => url.endsWith('/resume')
+      ? throwError(() => ({ status: 409, error: { detail: { code: 'session_not_ended' } } }))
+      : of({ accepted: true, turn_id: 1 }));
+    try {
+      await ctx.service.connect('external-resume-send');
+      fireSseOpen(ctx.sseInstances[0]);
+      fireSseMessage(ctx.sseInstances[0], {
+        method: 'session.ended',
+        params: { session_runtime_generation: SESSION_RUNTIME_GENERATION },
+      }, '9:42');
+      runtimeGeneration = SESSION_RUNTIME_GENERATION_B;
+
+      expect(await ctx.service.sendMessage('send after external Resume')).toBe(true);
+      await flushMicrotasks(30);
+
+      expect.soft(ctx.service.outbox()).toEqual([]);
+      expect.soft(ctx.service.error()).toBeNull();
+      expect.soft(ctx.service.threadStatus()).toBe('active');
+      expect.soft(ctx.mockHttp.post.mock.calls.filter((call: any[]) =>
+        String(call[0]).endsWith('/input'))).toHaveLength(1);
+    } finally {
+      ctx.service.disconnect();
+    }
+  });
+
+  it('external Resume: G2 connection releases the temporary successor guard for later recovery', async () => {
+    const ctx = await externalResumeFixture();
+    try {
+      ctx.wake();
+      await flushMicrotasks(30);
+      expect(ctx.wsInstances).toHaveLength(2);
+      (ctx.service as any)._latchSessionBindingInvalid('external-races', SESSION_RUNTIME_GENERATION_B);
+      ctx.state.generation = '77777777-7777-4777-8777-777777777777';
+      ctx.notifications.lifecycleEvent.set({
+        thread_id: 'external-races', state: 'ready',
+        session_runtime_generation: ctx.state.generation,
+      });
+      TestBed.tick();
+      await flushMicrotasks(30);
+      expect(ctx.wsInstances).toHaveLength(3);
+      expect(ctx.service.sessionReady()).toBe(true);
+      expect(ctx.service.error()).toBeNull();
+    } finally { ctx.service.disconnect(); }
+  });
+
+  async function externalResumeFixture(initiallyEnded = false) {
+    const ctx = createService();
+    const state = { status: initiallyEnded ? 'ended' : 'active', generation: SESSION_RUNTIME_GENERATION };
+    const get = (url: string) => activeSessionGet(url).pipe(map((value) => ({
+      ...value, status: state.status, session_runtime_generation: state.generation,
+      runtime_retirement_pending: false,
+    })));
+    ctx.mockHttp.get.mockImplementation(get);
+    await ctx.service.connect('external-races');
+    fireSseOpen(ctx.sseInstances[0]);
+    if (!initiallyEnded) fireSseMessage(ctx.sseInstances[0], {
+      method: 'session.ended', params: { session_runtime_generation: SESSION_RUNTIME_GENERATION },
+    }, '9:42');
+    state.status = 'created';
+    state.generation = SESSION_RUNTIME_GENERATION_B;
+    const wake = () => {
+      ctx.notifications.lifecycleEvent.set({
+        thread_id: 'external-races', state: 'provisioning', backend: 'vm',
+        session_runtime_generation: SESSION_RUNTIME_GENERATION_B,
+      });
+      TestBed.tick();
+    };
+    return { ...ctx, state, get, wake };
+  }
+
+  it('external Resume: a tab opened ended learns G1 and notices G2 on focus', async () => {
+    const ctx = await externalResumeFixture(true);
+    try {
+      window.dispatchEvent(new Event('focus'));
+      await flushMicrotasks(40);
+      expect(ctx.service.threadStatus()).toBe('created');
+      expect(ctx.service.sessionReady()).toBe(true);
+      expect(ctx.wsInstances).toHaveLength(1);
+    } finally { ctx.service.disconnect(); }
+  });
+
+  it('external Resume: notification reconnection repairs a missed lifecycle edge', async () => {
+    const ctx = await externalResumeFixture();
+    try {
+      ctx.notifications.isConnected.set(true);
+      TestBed.tick();
+      await flushMicrotasks(40);
+      expect(ctx.service.threadStatus()).toBe('created');
+      expect(ctx.service.sessionReady()).toBe(true);
+    } finally { ctx.service.disconnect(); }
+  });
+
+  it('external Resume: cold G2 shows startup while stale G1 connection cannot flush', async () => {
+    const ctx = await externalResumeFixture();
+    const connection = new Subject<any>();
+    ctx.mockHttp.get.mockImplementation((url: string) => url.endsWith('/connection') ? connection : ctx.get(url));
+    try {
+      ctx.wake();
+      await flushMicrotasks(40);
+      expect(ctx.service.threadStatus()).toBe('created');
+      expect(ctx.service.isStartingSession()).toBe(true);
+      expect(ctx.service.isVmSession()).toBe(true);
+      await ctx.service.sendMessage('wait for G2');
+      connection.next({ state: 'ready', control_socket: 'websocket', ws_url: 'ws://stale',
+        pinned_runtime_generation_contract: 1, session_runtime_generation: SESSION_RUNTIME_GENERATION });
+      connection.complete();
+      await flushMicrotasks(30);
+      expect(ctx.service.sessionReady()).toBe(false);
+      expect(ctx.wsInstances).toHaveLength(1);
+      expect(ctx.service.outbox()).toHaveLength(1);
+      expect(ctx.mockHttp.post.mock.calls.filter((c: any[]) => String(c[0]).endsWith('/input'))).toHaveLength(0);
+    } finally { ctx.service.disconnect(); }
+  });
+
+  it('external Resume: a duplicate G1 metadata response does not cancel the fresh G2 read', async () => {
+    const ctx = await externalResumeFixture();
+    await flushMicrotasks(20);
+    const old = new Subject<any>();
+    let reads = 0;
+    ctx.mockHttp.get.mockImplementation((url: string) => {
+      if (url.endsWith('/persistent/threads/external-races') && ++reads === 1) return old;
+      return ctx.get(url);
+    });
+    try {
+      const oldRead = (ctx.service as any).loadThreadMeta('external-races');
+      ctx.wake();
+      const recovery = (ctx.service as any).successorRead.promise;
+      old.next({ status: 'ended', session_runtime_generation: SESSION_RUNTIME_GENERATION,
+        runtime_retirement_pending: false });
+      old.complete();
+      await oldRead;
+      expect(await recovery).toBe(true);
+      await flushMicrotasks(40);
+      expect(ctx.service.threadStatus()).toBe('created');
+      expect(ctx.service.sessionReady()).toBe(true);
+      // Old G1 read, required fresh G2 read, then connect's full hydration.
+      expect(reads).toBe(3);
+    } finally { ctx.service.disconnect(); }
+  });
+
+  it('external Resume: a new G2 End cancels the pending control resolution', async () => {
+    const ctx = await externalResumeFixture();
+    const connection = new Subject<any>();
+    ctx.mockHttp.get.mockImplementation((url: string) => url.endsWith('/connection') ? connection : ctx.get(url));
+    try {
+      ctx.wake();
+      await flushMicrotasks(40);
+      fireSseMessage(ctx.sseInstances[1], {
+        method: 'session.ended', params: { session_runtime_generation: SESSION_RUNTIME_GENERATION_B },
+      }, '10:3');
+      connection.next({ state: 'ready', control_socket: 'websocket', ws_url: 'ws://late-g2',
+        pinned_runtime_generation_contract: 1, session_runtime_generation: SESSION_RUNTIME_GENERATION_B });
+      connection.complete();
+      await flushMicrotasks(30);
+      expect(ctx.service.threadStatus()).toBe('ended');
+      expect(ctx.service.sessionReady()).toBe(false);
+      expect(ctx.wsInstances).toHaveLength(1);
+    } finally { ctx.service.disconnect(); }
+  });
+
+  it('external Resume: an unrelated lifecycle generation cannot change G2 startup', async () => {
+    const ctx = await externalResumeFixture();
+    const connection = new Subject<any>();
+    ctx.mockHttp.get.mockImplementation((url: string) => url.endsWith('/connection') ? connection : ctx.get(url));
+    try {
+      ctx.wake();
+      await flushMicrotasks(40);
+      ctx.notifications.lifecycleEvent.set({
+        thread_id: 'external-races', state: 'failed', reason: 'unrelated runtime',
+        session_runtime_generation: '77777777-7777-4777-8777-777777777777',
+      });
+      TestBed.tick();
+      expect(ctx.service.error()).toBeNull();
+      expect(ctx.service.threadStatus()).toBe('created');
+    } finally { ctx.service.disconnect(); }
+  });
+
+  it('external Resume: stateless stale Send joins G2 and posts input exactly once', async () => {
+    const ctx = createService();
+    let runtimeGeneration = SESSION_RUNTIME_GENERATION;
+    ctx.mockHttp.get.mockImplementation((url: string) => activeSessionGet(url).pipe(map((value) => ({
+      ...value,
+      execution_lane: 'stateless', control_socket: 'none', ws_url: null,
+      session_runtime_generation: runtimeGeneration, runtime_retirement_pending: false,
+    }))));
+    ctx.mockHttp.post.mockImplementation((url: string) => url.endsWith('/resume')
+      ? throwError(() => ({ status: 409, error: { detail: { code: 'session_not_ended' } } }))
+      : of({ accepted: true, turn_id: 1 }));
+    try {
+      await ctx.service.connect('stateless-external-resume');
+      fireSseOpen(ctx.sseInstances[0]);
+      fireSseMessage(ctx.sseInstances[0], {
+        method: 'session.ended', params: { session_runtime_generation: SESSION_RUNTIME_GENERATION },
+      }, '9:42');
+      runtimeGeneration = SESSION_RUNTIME_GENERATION_B;
+      expect(await ctx.service.sendMessage('queued on G2')).toBe(true);
+      await flushMicrotasks(40);
+      expect(ctx.service.threadStatus()).toBe('active');
+      expect(ctx.service.sessionReady()).toBe(true);
+      expect(ctx.wsInstances).toHaveLength(0);
+      expect(ctx.service.outbox()).toEqual([]);
+      expect(ctx.mockHttp.post.mock.calls.filter((c: any[]) => String(c[0]).endsWith('/input'))).toHaveLength(1);
+    } finally { ctx.service.disconnect(); }
+  });
+
+  it.each(['navigation', 'end'])('external Resume: %s invalidates an in-flight successor read', async (action) => {
+    const ctx = await externalResumeFixture();
+    const meta = new Subject<any>();
+    ctx.mockHttp.get.mockImplementation((url: string) => url.endsWith('/persistent/threads/external-races') ? meta : ctx.get(url));
+    try {
+      ctx.wake();
+      await flushMicrotasks();
+      if (action === 'navigation') ctx.service.disconnect();
+      else await ctx.service.endSession();
+      meta.next({ status: 'created', session_runtime_generation: SESSION_RUNTIME_GENERATION_B, runtime_retirement_pending: false });
+      meta.complete();
+      await flushMicrotasks(40);
+      expect(ctx.wsInstances).toHaveLength(1);
+      expect(ctx.service.sessionReady()).toBe(false);
+    } finally { ctx.service.disconnect(); }
+  });
+
+  it('external Resume: duplicate wake edges share a bounded read and can retry after timeout', async () => {
+    vi.useFakeTimers();
+    const ctx = await externalResumeFixture();
+    const meta = new Subject<any>();
+    ctx.mockHttp.get.mockImplementation((url: string) => url.endsWith('/persistent/threads/external-races') ? meta : ctx.get(url));
+    try {
+      const calls = () => ctx.mockHttp.get.mock.calls.filter((c: any[]) => String(c[0]).endsWith('/persistent/threads/external-races')).length;
+      const before = calls();
+      ctx.wake();
+      ctx.wake();
+      window.dispatchEvent(new Event('focus'));
+      await flushMicrotasks();
+      expect(calls()).toBe(before + 1);
+      await vi.advanceTimersByTimeAsync(15_000);
+      expect(ctx.service.threadStatus()).toBe('ended');
+      expect(meta.observed).toBe(false);
+      ctx.mockHttp.get.mockImplementation(ctx.get);
+      ctx.wake();
+      await flushMicrotasks(40);
+      expect(ctx.service.threadStatus()).toBe('created');
+      expect(ctx.service.sessionReady()).toBe(true);
+    } finally { ctx.service.disconnect(); vi.useRealTimers(); }
+  });
+
+  it.each([SESSION_RUNTIME_GENERATION, undefined, 'malformed'])('external Resume: fresh metadata with generation %s cannot reopen G1', async (generation) => {
+    const ctx = await externalResumeFixture();
+    ctx.state.generation = generation as string;
+    try {
+      ctx.wake();
+      await flushMicrotasks(40);
+      expect(ctx.service.threadStatus()).toBe('ended');
+      expect(ctx.service.sessionReady()).toBe(false);
+      expect(ctx.wsInstances).toHaveLength(1);
+    } finally { ctx.service.disconnect(); }
   });
 
   it('ignores same-G lifecycle noise after binding refusal and reconnects only for G2', async () => {
@@ -7562,7 +8284,7 @@ describe('PersistentChatService — direct session WS (prepare + connection)', (
       await flushMicrotasks();
 
       expect(ctx.service.threadStatus()).toBe('ended');
-      expect(ctx.wsInstances[0].close).toHaveBeenCalledWith(1000);
+      expect(ctx.wsInstances[0].close).toHaveBeenCalledWith(4002, 'heartbeat timeout');
       expect(ctx.sseInstances.length).toBeGreaterThanOrEqual(2);
       expect(ctx.service.cloudChangesCount()).toBe(1);
       const connectionCalls = ctx.mockHttp.get.mock.calls.filter((call: any[]) =>
@@ -7922,6 +8644,232 @@ describe('PersistentChatService — endSession()', () => {
   });
 });
 
+/**
+ * R1 follow-up: a stateless (queue-served) End has two refusals a pinned End
+ * does not. `409 stateless_end_busy` means the turn/unit is still leased or
+ * input/control is pending; `?force=true` stops it. A string-detail `503` is
+ * a retryable retirement fence: End may already have begun durably (the
+ * thread then projects `runtime_retirement_pending`), and End is the retry.
+ * The thread row carries `execution_lane` and, while a retirement is
+ * pending, `retirement_permanent`.
+ */
+describe('PersistentChatService — stateless End (busy, retryable, pending retry)', () => {
+  let originalEs: any;
+  let originalWs: any;
+
+  beforeEach(() => {
+    originalEs = (globalThis as any).EventSource;
+    originalWs = (globalThis as any).WebSocket;
+  });
+
+  afterEach(() => {
+    (globalThis as any).EventSource = originalEs;
+    (globalThis as any).WebSocket = originalWs;
+    vi.clearAllMocks();
+  });
+
+  const THREAD_META_URL = /\/persistent\/threads\/[^/?]+$/;
+
+  /** activeSessionGet, with `meta()` merged into the thread-row GET only. */
+  function sessionGetWithMeta(meta: () => Record<string, unknown>) {
+    return (url: string) =>
+      THREAD_META_URL.test(url)
+        ? activeSessionGet(url).pipe(map((body) => ({ ...body, ...meta() })))
+        : activeSessionGet(url);
+  }
+
+  function threadMetaReads(mockHttp: any): number {
+    return mockHttp.get.mock.calls.filter((call: any[]) => THREAD_META_URL.test(String(call[0])))
+      .length;
+  }
+
+  const statelessBusy = () =>
+    throwError(() => ({
+      status: 409,
+      error: {
+        detail: {
+          code: 'stateless_end_busy',
+          queue_state: 'leased',
+          lease_token: 7,
+          pending_input: true,
+          pending_control: false,
+          pending_interrupt: false,
+          pending_permission: false,
+        },
+      },
+    }));
+
+  const retryableFence = () =>
+    throwError(() => ({
+      status: 503,
+      error: { detail: 'Workspace resident retirement is not yet acknowledged' },
+    }));
+
+  it('asks before stopping a busy stateless turn and ends with force only on confirm', async () => {
+    const confirmSpy = vi.spyOn(globalThis, 'confirm').mockReturnValue(true);
+    try {
+      const ctx = createService();
+      ctx.mockHttp.get.mockImplementation(
+        sessionGetWithMeta(() => ({ execution_lane: 'stateless' })),
+      );
+      await ctx.service.connect('thread-stateless-busy');
+      fireSseOpen(ctx.sseInstances[0]);
+      ctx.mockHttp.delete
+        .mockReturnValueOnce(statelessBusy())
+        .mockReturnValueOnce(of({ status: 'ended' }));
+
+      await expect(ctx.service.endSession()).resolves.toBe('done');
+
+      expect(confirmSpy).toHaveBeenCalledTimes(1);
+      expect(confirmSpy).toHaveBeenCalledWith('sessions.confirmEndStatelessBusy');
+      expect(ctx.mockHttp.delete).toHaveBeenCalledTimes(2);
+      expect(ctx.mockHttp.delete.mock.calls[0][0]).not.toContain('force=true');
+      expect(ctx.mockHttp.delete.mock.calls[1][0]).toContain(
+        '/persistent/threads/thread-stateless-busy?force=true',
+      );
+      expect(ctx.service.threadStatus()).toBe('ended');
+    } finally {
+      confirmSpy.mockRestore();
+    }
+  });
+
+  it('leaves a busy stateless session running, never retrying, when the user declines', async () => {
+    const confirmSpy = vi.spyOn(globalThis, 'confirm').mockReturnValue(false);
+    try {
+      const ctx = createService();
+      ctx.mockHttp.get.mockImplementation(
+        sessionGetWithMeta(() => ({ execution_lane: 'stateless' })),
+      );
+      await ctx.service.connect('thread-stateless-keep');
+      fireSseOpen(ctx.sseInstances[0]);
+      ctx.mockHttp.delete.mockReturnValue(statelessBusy());
+
+      await expect(ctx.service.endSession()).resolves.toBe('kept');
+
+      expect(confirmSpy).toHaveBeenCalledTimes(1);
+      expect(ctx.mockHttp.delete).toHaveBeenCalledTimes(1);
+      expect(ctx.service.threadStatus()).toBe('active');
+      expect(ctx.service.connectionState()).toBe('connected');
+      expect(ctx.wsInstances[0].close).not.toHaveBeenCalled();
+      expect(ctx.sseInstances[0].close).not.toHaveBeenCalled();
+    } finally {
+      confirmSpy.mockRestore();
+    }
+  });
+
+  it('reports a retryable 503 once, re-reads the thread, and offers End again while it is ending', async () => {
+    const ctx = createService();
+    let pending = false;
+    ctx.mockHttp.get.mockImplementation(
+      sessionGetWithMeta(() =>
+        pending
+          ? {
+              execution_lane: 'stateless',
+              runtime_retirement_pending: true,
+              retirement_disposition: 'ended',
+              retirement_permanent: false,
+            }
+          : { execution_lane: 'stateless' },
+      ),
+    );
+    await ctx.service.connect('thread-stateless-fenced');
+    fireSseOpen(ctx.sseInstances[0]);
+    // The End began durably before the server fenced it.
+    ctx.mockHttp.delete.mockImplementation(() => {
+      pending = true;
+      return retryableFence();
+    });
+    const readsBefore = threadMetaReads(ctx.mockHttp);
+
+    await expect(ctx.service.endSession()).resolves.toBe('retryable');
+
+    expect(ctx.mockHttp.delete).toHaveBeenCalledTimes(1);
+    expect(threadMetaReads(ctx.mockHttp)).toBe(readsBefore + 1);
+    expect(ctx.service.threadStatus()).toBe('ending');
+    expect(ctx.service.retirementDisposition()).toBe('ended');
+    expect(ctx.service.endRetryAvailable()).toBe(true);
+    expect(ctx.sseInstances[0].close).not.toHaveBeenCalled();
+  });
+
+  it('keeps a stateless session live when the fenced End had not started', async () => {
+    const ctx = createService();
+    ctx.mockHttp.get.mockImplementation(
+      sessionGetWithMeta(() => ({ execution_lane: 'stateless' })),
+    );
+    await ctx.service.connect('thread-stateless-not-started');
+    fireSseOpen(ctx.sseInstances[0]);
+    ctx.mockHttp.delete.mockReturnValue(retryableFence());
+
+    await expect(ctx.service.endSession()).resolves.toBe('retryable');
+
+    expect(ctx.mockHttp.delete).toHaveBeenCalledTimes(1);
+    expect(ctx.service.threadStatus()).toBe('active');
+    expect(ctx.service.connectionState()).toBe('connected');
+    expect(ctx.wsInstances[0].close).not.toHaveBeenCalled();
+    // A live session keeps its ordinary End control; the retry affordance is
+    // only for a pending retirement.
+    expect(ctx.service.endRetryAvailable()).toBe(false);
+  });
+
+  it('offers End as the retry on a reloaded stateless soft retirement only', async () => {
+    const cases: Array<[Record<string, unknown>, boolean]> = [
+      [{ execution_lane: 'stateless', retirement_permanent: false }, true],
+      // A permanent Delete is retried from the session list, not by End.
+      [{ execution_lane: 'stateless', retirement_permanent: true }, false],
+      // A pinned retirement settles on the server by itself.
+      [{ execution_lane: 'pinned', retirement_permanent: false }, false],
+    ];
+    for (const [meta, offered] of cases) {
+      const ctx = createService();
+      ctx.mockHttp.get.mockImplementation(
+        sessionGetWithMeta(() => ({
+          runtime_retirement_pending: true,
+          retirement_disposition: 'ended',
+          ...meta,
+        })),
+      );
+
+      await ctx.service.connect('thread-reload-pending');
+
+      expect(ctx.service.threadStatus()).toBe('ending');
+      expect(ctx.service.endRetryAvailable()).toBe(offered);
+    }
+  });
+
+  it('keeps pinned End failures unaccepted and a declined busy session open', async () => {
+    const confirmSpy = vi.spyOn(globalThis, 'confirm').mockReturnValue(false);
+    try {
+      const fenced = createService();
+      fenced.mockHttp.get.mockImplementation(
+        sessionGetWithMeta(() => ({ execution_lane: 'pinned' })),
+      );
+      await fenced.service.connect('thread-pinned-fenced');
+      fenced.mockHttp.delete.mockReturnValue(retryableFence());
+
+      await expect(fenced.service.endSession()).rejects.toMatchObject({ status: 503 });
+      expect(fenced.mockHttp.delete).toHaveBeenCalledTimes(1);
+      expect(fenced.service.threadStatus()).toBe('active');
+
+      const midTurn = createService();
+      midTurn.mockHttp.get.mockImplementation(
+        sessionGetWithMeta(() => ({ execution_lane: 'pinned' })),
+      );
+      await midTurn.service.connect('thread-pinned-mid-turn');
+      midTurn.mockHttp.delete.mockReturnValue(
+        throwError(() => ({ status: 409, error: { detail: { code: 'turn_in_flight' } } })),
+      );
+
+      const outcome = await midTurn.service.endSession();
+      expect(outcome).toBe('kept');
+      expect(confirmSpy).toHaveBeenCalledWith('sessions.confirmEndMidTurn');
+      expect(midTurn.mockHttp.delete).toHaveBeenCalledTimes(1);
+      expect(midTurn.service.threadStatus()).toBe('active');
+    } finally {
+      confirmSpy.mockRestore();
+    }
+  });
+});
+
 describe('PersistentChatService — attachments', () => {
   let originalEs: any;
   let originalWs: any;
@@ -8034,7 +8982,7 @@ describe('PersistentChatService — interrupt self-healing', () => {
 
     expect(service.isStreaming()).toBe(false);
     expect(service.currentTurnId()).toBeNull();
-    expect(service.runningTool()).toBeNull();
+    expect(service.runningTools()).toEqual([]);
     expect(service.isInterrupting()).toBe(false);
     expect(service.pendingTurnCount()).toBe(0);
     expect(service.turns().find((turn) => turn.id === '1')).toMatchObject({
@@ -8544,7 +9492,13 @@ describe('PersistentChatService — workspace/VM upgrade notices (Q7/Q8)', () =>
   }
 
   it('vm_upgrade.needed points at the real /upgrade-workspace vm command, not a phantom button', async () => {
-    const { service, es } = await setup();
+    const ctx = createService();
+    // A pinned session: the upgrade verb has its socket transport.
+    ctx.mockHttp.get.mockImplementation(activeSessionGet);
+    await ctx.service.connect('thread-X');
+    fireSseOpen(ctx.sseInstances[0]);
+    const service = ctx.service;
+    const es = ctx.sseInstances[0];
     fireSseMessage(
       es,
       {
@@ -8559,6 +9513,20 @@ describe('PersistentChatService — workspace/VM upgrade notices (Q7/Q8)', () =>
     expect(lines.some((l) => l.includes('upgrade button'))).toBe(false);
     // The triggering command is surfaced for context.
     expect(lines.some((l) => l.includes('sudo apt-get install foo'))).toBe(true);
+  });
+
+  it('vm_upgrade.needed never suggests a command the session cannot carry', async () => {
+    // No socket, so no upgrade transport: pointing at /upgrade-workspace
+    // would only lead to a refusal.
+    const { service, es } = await setup();
+    fireSseMessage(
+      es,
+      { method: 'vm_upgrade.needed', params: { reason: 'sudo detected' } },
+      '1:1',
+    );
+    const lines = sysLines(service);
+    expect(lines.some((l) => l.startsWith('VM upgrade needed'))).toBe(true);
+    expect(lines.some((l) => l.includes('/upgrade-workspace'))).toBe(false);
   });
 
   it('workspace_upgrade.progress surfaces a live heartbeat during a slow provision', async () => {
@@ -8798,9 +9766,9 @@ describe('PersistentChatService — inline workspace upgrade offer', () => {
 
   it('workspace_upgrade.needed raises the offer and still records a system line', async () => {
     const ctx = await readySession();
-    offer(ctx.es, { target_tier: 'sandbox', reason: 'need to run pytest' });
+    offer(ctx.es, { target_tier: 'vm', reason: 'need to run pytest' });
     expect(ctx.service.pendingWorkspaceOffer()).toEqual({
-      tier: 'sandbox',
+      tier: 'vm',
       reason: 'need to run pytest',
     });
     const lines = ctx.service
@@ -8812,28 +9780,63 @@ describe('PersistentChatService — inline workspace upgrade offer', () => {
     expect(lines.some((l: string) => l.includes('session settings'))).toBe(false);
   });
 
-  it('defaults the offered tier to sandbox when the server omits it', async () => {
+  it('the system line names the tier readably, not by id', async () => {
+    const ctx = await readySession();
+    offer(ctx.es, { target_tier: 'vm', reason: 'need a shell' });
+    const lines = ctx.service
+      .turns()
+      .filter((t: any) => t.kind === 'system')
+      .map((t: any) => String(t.content));
+    expect(lines).toContain('The agent requested a VM workspace: need a shell');
+  });
+
+  it('a bare upgrade then .started replaces the "next" placeholder with the target tier', async () => {
+    const ctx = await readySession();
+    ctx.service.upgradeWorkspace(null);
+    expect(ctx.service.workspaceUpgradeInProgress()?.tier).toBe('next');
+    fireSseMessage(
+      ctx.es,
+      { method: 'workspace_upgrade.started', params: { target_tier: 'vm' } },
+      '1:9',
+    );
+    expect(ctx.service.workspaceUpgradeInProgress()?.tier).toBe('vm');
+  });
+
+  it('old container offer on a pinned session raises no card', async () => {
+    const ctx = await readySession();
+    offer(ctx.es, { target_tier: 'sandbox', reason: 'need a shell' });
+    expect(ctx.service.pendingWorkspaceOffer()).toBeNull();
+    const lines = ctx.service
+      .turns()
+      .filter((t: any) => t.kind === 'system')
+      .map((t: any) => String(t.content));
+    expect(
+      lines.some((l: string) => l.includes("isn't available in this session") && l.includes('need a shell')),
+    ).toBe(true);
+  });
+
+  it('an offer without a tier is the old container offer: no card on a pinned session', async () => {
     const ctx = await readySession();
     offer(ctx.es, { reason: 'shell needed' });
-    expect(ctx.service.pendingWorkspaceOffer()?.tier).toBe('sandbox');
+    expect(ctx.service.pendingWorkspaceOffer()).toBeNull();
   });
 
   it('a second offer replaces the first rather than accumulating', async () => {
     const ctx = await readySession();
-    offer(ctx.es, { target_tier: 'sandbox', reason: 'first' });
-    offer(ctx.es, { target_tier: 'sandbox', reason: 'second' }, '1:3');
+    offer(ctx.es, { target_tier: 'vm', reason: 'first' });
+    offer(ctx.es, { target_tier: 'vm', reason: 'second' }, '1:3');
     expect(ctx.service.pendingWorkspaceOffer()?.reason).toBe('second');
   });
 
   it('accepting clears the offer and sends the upgrade control message', async () => {
     const ctx = await readySession();
-    offer(ctx.es, { target_tier: 'sandbox', reason: 'need a shell' });
-    ctx.service.upgradeWorkspace('sandbox');
+    offer(ctx.es, { target_tier: 'vm', reason: 'need a shell' });
+    ctx.service.upgradeWorkspace('vm');
     expect(ctx.service.pendingWorkspaceOffer()).toBeNull();
-    expect(ctx.service.workspaceUpgradeInProgress()).toEqual({ tier: 'sandbox' });
+    expect(ctx.service.workspaceUpgradeInProgress()).toEqual({ tier: 'vm' });
     expect(sentControl(ctx)).toContainEqual({
       method: 'upgrade-to-workspace',
-      target_tier: 'sandbox',
+      target_tier: 'vm',
     });
   });
 
@@ -8928,7 +9931,7 @@ describe('PersistentChatService — inline workspace upgrade offer', () => {
 
   it('a failed upgrade clears the offer and sends nothing', async () => {
     const ctx = await readySession();
-    offer(ctx.es, { target_tier: 'sandbox', reason: 'need a shell' });
+    offer(ctx.es, { target_tier: 'vm', reason: 'need a shell' });
     ctx.service.upgradeWorkspace('sandbox', { thenContinue: true });
     fireSseMessage(
       ctx.es,
@@ -8947,7 +9950,7 @@ describe('PersistentChatService — inline workspace upgrade offer', () => {
 
   it('dismissing the offer touches only local state', async () => {
     const ctx = await readySession();
-    offer(ctx.es, { target_tier: 'sandbox', reason: 'need a shell' });
+    offer(ctx.es, { target_tier: 'vm', reason: 'need a shell' });
     ctx.service.dismissWorkspaceOffer();
     expect(ctx.service.pendingWorkspaceOffer()).toBeNull();
     expect(sentControl(ctx)).toHaveLength(0);
@@ -8956,7 +9959,7 @@ describe('PersistentChatService — inline workspace upgrade offer', () => {
 
   it('disconnect clears the upgrade state so it cannot bleed across threads', async () => {
     const ctx = await readySession();
-    offer(ctx.es, { target_tier: 'sandbox', reason: 'need a shell' });
+    offer(ctx.es, { target_tier: 'vm', reason: 'need a shell' });
     ctx.service.upgradeWorkspace('sandbox', { thenContinue: true });
     ctx.service.disconnect();
     // .complete only ever arrives over the control WS disconnect() just
@@ -9104,6 +10107,17 @@ describe('PersistentChatService — usage.updated telemetry', () => {
     expect(ctx.service.usage()).toBeNull();
     // A null-threaded value must never match the draft's null threadId.
     expect(ctx.service.currentUsage()).toBeNull();
+  });
+
+  it("enterDraftSession clears the previous draft's project and workspace preview", async () => {
+    const ctx = await connectWithUsage('thread-old', {turn: 1, input_tokens: 10_000, output_tokens: 40});
+    ctx.service.draftProjectId.set('project-old');
+    ctx.service.draftWorkspacePreview.set({backend: 'vm', source: 'default', binding: null});
+
+    ctx.service.enterDraftSession();
+
+    expect(ctx.service.draftProjectId()).toBeNull();
+    expect(ctx.service.draftWorkspacePreview()).toBeNull();
   });
 
   it('starts a new thread’s accumulation from zero, not the old thread’s total', async () => {
@@ -9424,6 +10438,454 @@ describe('PersistentChatService — usage.updated telemetry', () => {
     });
   });
 
+  describe('historyToTurns — a subagent fan-out is grouped by the message that issued it', () => {
+    // Two model responses in one turn, each fanning out to two subagents,
+    // with nothing between them. Contiguity alone would render one batch of
+    // four; the AI row id keeps them apart.
+    const ai = (id: string, calls: string[]) => ({
+      id,
+      role: 'ai',
+      content: null,
+      tool_calls: calls.map((callId) => ({
+        name: 'delegate_agent',
+        args: { subagent_type: 'explorer', description: callId },
+        id: callId,
+      })),
+      turn_number: 3,
+      created_at: null,
+    });
+    const tool = (callId: string) => ({
+      id: `r-${callId}`,
+      role: 'tool',
+      content: 'report',
+      tool_calls: null,
+      tool_call_id: callId,
+      turn_number: 3,
+      created_at: null,
+    });
+
+    it('stamps each call with its AI row id', () => {
+      const turns = historyToTurns([ai('m1', ['d1', 'd2']), tool('d1'), tool('d2')] as never);
+      const calls = (turns[0] as AssistantTurn).events.filter(isToolCall);
+      expect(calls.map((c) => c.messageKey)).toEqual(['m1', 'm1']);
+    });
+
+    it('renders two back-to-back fan-outs as two batches', () => {
+      const turns = historyToTurns([
+        ai('m1', ['d1', 'd2']), tool('d1'), tool('d2'),
+        ai('m2', ['d3', 'd4']), tool('d3'), tool('d4'),
+      ] as never);
+      const groups = groupEvents((turns[0] as AssistantTurn).events);
+      expect(groups.map((g) => g.kind)).toEqual(['delegate_batch', 'delegate_batch']);
+      expect(groups.map((g) => (g.kind === 'single' ? [g.event.id] : g.events.map((e) => e.id))))
+        .toEqual([['d1', 'd2'], ['d3', 'd4']]);
+    });
+  });
+
+  describe('historyToTurns — a delegation batch a recovery settled (§6.5 step 3)', () => {
+    // The executor died mid-batch. Its successor wrote one tool row per open
+    // call and one continuation event, each stamped with a structured marker
+    // in `metrics.subagent_recovery` (src/shared/session_subagent_batch.py).
+    // All of them carry the abandoned turn's number but are created at settle
+    // time, so the history endpoint (created_at order) lists them after
+    // anything the user typed during the batch.
+    const SETTLED = '2026-09-29T10:05:00+00:00';
+    const ai = (id: string, calls: string[], turn = 3) => ({
+      id,
+      role: 'ai',
+      content: null,
+      tool_calls: calls.map((callId) => ({
+        name: 'delegate_agent',
+        args: { subagent_type: 'explorer', description: `brief ${callId}` },
+        id: callId,
+      })),
+      turn_number: turn,
+      metrics: null,
+      created_at: '2026-09-29T10:00:00+00:00',
+    });
+    const recoveredResult = (
+      callId: string,
+      cls: string,
+      content: string,
+      subagentStatus: string | null = null,
+    ) => ({
+      id: `r-${callId}`,
+      role: 'tool',
+      content,
+      tool_calls: null,
+      tool_call_id: callId,
+      turn_number: 3,
+      metrics: {
+        subagent_recovery: {
+          version: 1,
+          kind: 'result',
+          class: cls,
+          tool_call_id: callId,
+          thread_id: subagentStatus ? `child-${callId}` : null,
+          handle: subagentStatus ? `explorer-${callId}` : null,
+          subagent_type: 'explorer',
+          subagent_status: subagentStatus,
+          report_path: null,
+          delivery_id: 'batch-delivery',
+        },
+      },
+      created_at: SETTLED,
+    });
+    const continuation = (counts: {
+      calls: number;
+      interrupted?: number;
+      not_started?: number;
+      declined?: number;
+      retired?: number;
+    }) => {
+      const { calls, interrupted = 0, not_started = 0, declined = 0, retired = 0 } = counts;
+      return {
+        id: 'continuation',
+        role: 'event',
+        content: '[subagent recovery] This turn was resumed after the process running it was replaced.',
+        tool_calls: null,
+        turn_number: 3,
+        metrics: {
+          subagent_recovery: {
+            version: 1,
+            kind: 'continuation',
+            supersedes_input_seq: 40,
+            calls,
+            finished: calls - interrupted - not_started - declined - retired,
+            interrupted,
+            not_started,
+            declined,
+            retired,
+          },
+        },
+        created_at: SETTLED,
+      };
+    };
+    const typed = {
+      id: 'typed',
+      role: 'human',
+      content: 'also check the tests',
+      tool_calls: null,
+      turn_number: 4,
+      metrics: null,
+      created_at: '2026-09-29T10:01:00+00:00',
+    };
+
+    /** The batch card's rows as the chat component builds them. */
+    function batchOf(turns: ReturnType<typeof historyToTurns>) {
+      const turn = turns.find(isAssistantTurn) as AssistantTurn;
+      const groups = groupEvents(turn.events);
+      expect(groups.map((g) => g.kind)).toEqual(['delegate_batch']);
+      const group = groups[0] as { kind: 'delegate_batch'; events: ToolCallEvent[] };
+      const members = buildDelegateBatchMembers(group.events, toolCardViewFromEvent);
+      const statuses = members.map((m) => delegateMemberStatus(m, null, null));
+      return { events: group.events, statuses, summary: summarizeDelegateBatch(statuses) };
+    }
+
+    it('shows each call as the marker says, and the continuation with its counts', () => {
+      const turns = historyToTurns([
+        ai('m1', ['d1', 'd2', 'd3', 'd4']),
+        recoveredResult('d1', 'completed', 'report of d1', 'completed'),
+        recoveredResult('d2', 'interrupted', '[delegate_agent: INTERRUPTED - no final report]', 'interrupted'),
+        recoveredResult('d3', 'not_started', '[delegate_agent: NOT STARTED]'),
+        recoveredResult('d4', 'not_started', '[delegate_agent: NOT STARTED]'),
+        continuation({ calls: 4, interrupted: 1, not_started: 2 }),
+      ] as never);
+
+      const { events, statuses, summary } = batchOf(turns);
+      expect(statuses).toEqual(['completed', 'interrupted', 'not_started', 'not_started']);
+      expect(summary).toEqual({ total: 4, finished: 4, failed: 0, interrupted: 1, notStarted: 2 });
+      // The text is the model's; the card reads the marker.
+      expect(events.map((e) => e.result)).toEqual([
+        'report of d1',
+        '[delegate_agent: INTERRUPTED - no final report]',
+        '[delegate_agent: NOT STARTED]',
+        '[delegate_agent: NOT STARTED]',
+      ]);
+
+      const notice = turns.find(isSystemTurn)!;
+      expect(notice.content).toContain('[subagent recovery]');
+      expect(notice.subagentRecovery).toEqual({
+        calls: 4,
+        finished: 1,
+        interrupted: 1,
+        notStarted: 2,
+        declined: 0,
+        retired: 0,
+      });
+    });
+
+    it('lands results on their batch card across input typed during the batch', () => {
+      // Server order: call, the typed message (created before the settle),
+      // then the settle's rows — the continuation first, as ids can order
+      // rows that share one created_at either way.
+      const turns = historyToTurns([
+        ai('m1', ['d1', 'd2']),
+        typed,
+        continuation({ calls: 2, interrupted: 1 }),
+        recoveredResult('d2', 'interrupted', 'interrupted d2', 'interrupted'),
+        recoveredResult('d1', 'completed', 'report of d1', 'completed'),
+      ] as never);
+
+      expect(turns.map((t) => t.kind)).toEqual(['assistant', 'user', 'system']);
+      expect((turns[1] as UserTurn).content).toBe('also check the tests');
+      const { events, statuses } = batchOf(turns);
+      expect(events.map((e) => e.result)).toEqual(['report of d1', 'interrupted d2']);
+      expect(statuses).toEqual(['completed', 'interrupted']);
+    });
+
+    it('keeps the batch when a reload replays the turn the successor answered', () => {
+      // The successor ran the continuation as turn 3 in a new journal epoch,
+      // so the snapshot replays turn 3 from the successor's turn.started. That
+      // replay re-delivers the answer, never the calls of the run it replaced.
+      const answer = {
+        id: 'answer',
+        role: 'ai',
+        content: '1: done 2: INTERRUPTED',
+        tool_calls: null,
+        turn_number: 3,
+        metrics: null,
+        created_at: '2026-09-29T10:05:04+00:00',
+      };
+      const history = historyToTurns([
+        ai('m1', ['d1', 'd2']),
+        recoveredResult('d1', 'completed', 'report of d1', 'completed'),
+        recoveredResult('d2', 'interrupted', 'interrupted d2', 'interrupted'),
+        continuation({ calls: 2, interrupted: 1 }),
+        answer,
+      ] as never);
+      expect((history.find(isAssistantTurn) as AssistantTurn).priorRunEvents).toBe(2);
+
+      let state = reduce(
+        { threadId: 't', turns: [], activeAssistantTurnId: null },
+        { type: 'load_history', threadId: 't', turns: history },
+      );
+      state = reduce(state, { type: 'turn_started', turnId: '3', startedAt: 1 });
+      state = reduce(state, { type: 'token', content: '1: done 2: INTERRUPTED', timestamp: 2 });
+      state = reduce(state, { type: 'turn_completed', turnId: '3', finishedAt: 3 });
+
+      const turns = state.turns.filter(isAssistantTurn);
+      expect(turns).toHaveLength(1);
+      const groups = groupEvents(turns[0].events);
+      expect(groups.map((g) => g.kind)).toEqual(['delegate_batch', 'single']);
+      const batch = (groups[0] as { kind: 'delegate_batch'; events: ToolCallEvent[] }).events;
+      expect(batch.map((e) => e.result)).toEqual(['report of d1', 'interrupted d2']);
+      const members = buildDelegateBatchMembers(batch, toolCardViewFromEvent);
+      expect(members.map((m) => delegateMemberStatus(m, null, null))).toEqual(['completed', 'interrupted']);
+      expect(((groups[1] as { kind: 'single'; event: TextEvent }).event).content).toBe('1: done 2: INTERRUPTED');
+    });
+
+    it('marks no prior run for an event of its own turn or a continuation opening a new one', () => {
+      // A per-child recovery event carries no continuation marker, and a
+      // pinned continuation is renumbered to the next turn: in both, a replay
+      // of the latest turn still re-delivers all of it.
+      const legacy = historyToTurns([
+        ai('m1', ['d1']),
+        { ...continuation({ calls: 1 }), metrics: null },
+      ] as never);
+      const pinned = historyToTurns([
+        ai('m1', ['d1', 'd2']),
+        { ...continuation({ calls: 2, interrupted: 1 }), turn_number: 4 },
+      ] as never);
+      for (const turns of [legacy, pinned]) {
+        expect('priorRunEvents' in (turns.find(isAssistantTurn) as AssistantTurn)).toBe(false);
+      }
+    });
+
+    it('shows a declined call as denied and a retired child as cancelled', () => {
+      const turns = historyToTurns([
+        ai('m1', ['d1', 'd2', 'd3']),
+        recoveredResult('d1', 'declined', 'User declined this tool call.'),
+        recoveredResult('d2', 'retired', '[delegate_agent: CANCELLED - session stopped]', 'cancelled'),
+        recoveredResult('d3', 'completed', 'partial report', 'capped'),
+        continuation({ calls: 3, declined: 1, retired: 1 }),
+      ] as never);
+
+      const { events, statuses, summary } = batchOf(turns);
+      expect(statuses).toEqual(['denied', 'cancelled', 'capped']);
+      expect(summary).toEqual({ total: 3, finished: 3, failed: 2, interrupted: 0, notStarted: 0 });
+      // A declined call is the refusal an AI-row decision would have recorded,
+      // so its own card reads denied as well.
+      expect(events[0].status).toBe('denied');
+      expect(events[1].status).toBe('completed');
+      expect(turns.find(isSystemTurn)!.subagentRecovery).toMatchObject({ declined: 1, retired: 1, finished: 1 });
+    });
+
+    it('renders a single call the per-child path recovered exactly as before', () => {
+      // No marker anywhere: the old path writes no tool row for an orphaned
+      // call, or leaves a durable one alone, and adds an event of its own.
+      const legacyEvent = {
+        id: 'legacy-event',
+        role: 'event',
+        content: 'report of the orphaned child',
+        tool_calls: null,
+        turn_number: 3,
+        metrics: null,
+        created_at: SETTLED,
+      };
+      const orphaned = historyToTurns([ai('m1', ['d1']), legacyEvent] as never);
+      const durable = historyToTurns([
+        ai('m1', ['d1']),
+        { ...recoveredResult('d1', 'completed', 'durable report'), metrics: { usage: { tokens: 12 } } },
+        { ...legacyEvent, content: '[subagent recovery] The original delegate_agent ToolMessage is already durable.' },
+      ] as never);
+
+      for (const turns of [orphaned, durable]) {
+        const turn = turns.find(isAssistantTurn) as AssistantTurn;
+        const groups = groupEvents(turn.events);
+        expect(groups.map((g) => g.kind)).toEqual(['single']);
+        const call = turn.events.find(isToolCall)!;
+        expect('recovery' in call).toBe(false);
+        expect(call.status).toBe('completed');
+        const notice = turns.find(isSystemTurn)!;
+        expect(Object.keys(notice).sort()).toEqual(['content', 'id', 'kind', 'timestamp']);
+      }
+      expect(orphaned.find(isAssistantTurn)!.events.find(isToolCall)!.result).toBeUndefined();
+      expect(durable.find(isAssistantTurn)!.events.find(isToolCall)!.result).toBe('durable report');
+      // Its ordinary card says what it always said.
+      const lone = durable.find(isAssistantTurn)!.events.find(isToolCall)!;
+      expect(toolCardViewFromEvent(lone).outcome).toBeUndefined();
+      expect(toolCardViewFromEvent(lone).status).toBe('ok');
+    });
+
+    it('marks a lone call of the settled turn on its ordinary card', () => {
+      // One settle covers every message of the turn (§5.1): message 1 fanned
+      // out and both results were delivered; message 2 issued one call, which
+      // renders as an ordinary card, and the executor died before it ran.
+      const delivered = (callId: string) => ({
+        id: `r-${callId}`,
+        role: 'tool',
+        content: `report of ${callId}`,
+        tool_calls: null,
+        tool_call_id: callId,
+        turn_number: 3,
+        metrics: null,
+        created_at: '2026-09-29T10:02:00+00:00',
+      });
+      const turns = historyToTurns([
+        ai('m1', ['d1', 'd2']),
+        delivered('d1'),
+        delivered('d2'),
+        ai('m2', ['d3']),
+        recoveredResult('d3', 'not_started', '[delegate_agent: NOT STARTED]'),
+        continuation({ calls: 3, not_started: 1 }),
+      ] as never);
+
+      const turn = turns.find(isAssistantTurn) as AssistantTurn;
+      const groups = groupEvents(turn.events);
+      expect(groups.map((g) => g.kind)).toEqual(['delegate_batch', 'single']);
+      const batch = groups[0] as { kind: 'delegate_batch'; events: ToolCallEvent[] };
+      const lone = (groups[1] as { kind: 'single'; event: ToolCallEvent }).event;
+
+      const loneView = toolCardViewFromEvent(lone);
+      expect(loneView.status).toBe('ok');
+      expect(loneView.outcome).toEqual({
+        labelKey: 'toolCard.delegateBatch.status.notStarted',
+        tone: 'neutral',
+      });
+      // The delivered fan-out carries no marker and no outcome.
+      expect(batch.events.map((e) => toolCardViewFromEvent(e).outcome)).toEqual([undefined, undefined]);
+    });
+
+    it('gives a lone interrupted or retired call the batch row label and tone', () => {
+      const viewOf = (cls: string, subagentStatus: string | null) => {
+        const turns = historyToTurns([
+          ai('m1', ['d1']),
+          recoveredResult('d1', cls, 'text for the model', subagentStatus),
+        ] as never);
+        return toolCardViewFromEvent(turns.find(isAssistantTurn)!.events.find(isToolCall)!);
+      };
+      expect(viewOf('interrupted', 'interrupted').outcome).toEqual({
+        labelKey: 'jobs.detail.subagentsStatuses.interrupted',
+        tone: 'warning',
+      });
+      expect(viewOf('retired', 'cancelled').outcome).toEqual({
+        labelKey: 'jobs.detail.subagentsStatuses.cancelled',
+        tone: 'danger',
+      });
+      // Already said by the card itself: OK for a completed child, Denied for
+      // a declined call.
+      expect(viewOf('completed', 'completed').outcome).toBeUndefined();
+      const declined = viewOf('declined', null);
+      expect(declined.outcome).toBeUndefined();
+      expect(declined.status).toBe('denied');
+    });
+
+    it('drops a marker when a later unmarked result for the same call arrives', () => {
+      const unmarked = {
+        ...recoveredResult('d1', 'completed', 'the later result'),
+        id: 'later',
+        metrics: null,
+        created_at: '2026-09-29T10:09:00+00:00',
+      };
+      for (const cls of ['not_started', 'declined']) {
+        const turns = historyToTurns([
+          ai('m1', ['d1']),
+          recoveredResult('d1', cls, 'settled text'),
+          unmarked,
+        ] as never);
+        const call = turns.find(isAssistantTurn)!.events.find(isToolCall)!;
+        expect('recovery' in call).toBe(false);
+        expect(call.result).toBe('the later result');
+        expect(call.status).toBe('completed');
+        expect(toolCardViewFromEvent(call).outcome).toBeUndefined();
+      }
+    });
+  });
+
+  describe('running-command snapshot — several calls in flight', () => {
+    it('parses the single running_tool every server sends today', () => {
+      expect(parseRunningTools({ running_tool: { id: 'c1', tool: 'run_command', args: { cmd: 'make' } } }))
+        .toEqual([{ id: 'c1', tool: 'run_command', args: { cmd: 'make' } }]);
+      expect(parseRunningTools({ running_tool: null })).toEqual([]);
+      // No tool name: nothing to show, as the single field always did.
+      expect(parseRunningTools({ running_tool: { id: 'c1' } })).toEqual([]);
+    });
+
+    it('prefers a running_tools list when a server sends one', () => {
+      expect(
+        parseRunningTools({
+          running_tool: { id: 'd1', tool: 'delegate_agent', args: {} },
+          running_tools: [
+            { id: 'd1', tool: 'delegate_agent', args: {} },
+            { id: 'd2', tool: 'delegate_agent' },
+            { id: 'bad' },
+          ],
+        }),
+      ).toEqual([
+        { id: 'd1', tool: 'delegate_agent', args: {} },
+        { id: 'd2', tool: 'delegate_agent', args: {} },
+      ]);
+    });
+
+    it('drops only the finished call on tool.completed, keeping its running siblings', () => {
+      const { service } = createService();
+      (service as any)._handleEvent({
+        method: 'session.state',
+        params: {
+          running_tools: [
+            { id: 'd1', tool: 'delegate_agent', args: {} },
+            { id: 'd2', tool: 'delegate_agent', args: {} },
+          ],
+        },
+      });
+      expect(service.runningTools().map((rt) => rt.id)).toEqual(['d1', 'd2']);
+
+      (service as any)._handleEvent({ method: 'tool.completed', params: { id: 'd1', result: 'ok' } });
+      expect(service.runningTools().map((rt) => rt.id)).toEqual(['d2']);
+
+      (service as any)._handleEvent({ method: 'tool.completed', params: { id: 'd2', result: 'ok' } });
+      expect(service.runningTools()).toEqual([]);
+    });
+
+    it('leaves the snapshot alone on a session.state that names neither field', () => {
+      const { service } = createService();
+      service.runningTools.set([{ id: 'c1', tool: 'run_command', args: {} }]);
+      (service as any)._handleEvent({ method: 'session.state', params: { model: 'm' } });
+      expect(service.runningTools()).toEqual([{ id: 'c1', tool: 'run_command', args: {} }]);
+    });
+  });
+
   describe('historyToTurns — synthetic image-delivery messages', () => {
     const msg = (over: Record<string, unknown>) => ({
       id: 'x',
@@ -9473,6 +10935,47 @@ describe('PersistentChatService — usage.updated telemetry', () => {
         msg({ id: '1', role: 'event', content: '[JOB_FINISHED] worker job completed' }),
       ] as never);
       expect(turns.filter((t) => t.kind === 'system')).toHaveLength(1);
+    });
+  });
+
+  describe("historyToTurns — injected context rows (role='context')", () => {
+    // Append-only context injection persists each injected block (memory,
+    // knowledge, guidance, ...) as its own thread_messages row with
+    // role='context'. The model sees it folded into the user message or tool
+    // result before it; the user never said it. Hiding goes by role, never
+    // by matching the text: an unknown role renders nothing.
+    it('renders neither a bubble nor a system line for a context row', () => {
+      const turns = historyToTurns([
+        {
+          id: '1',
+          role: 'human',
+          content: 'What did we decide about X?',
+          tool_calls: null,
+          turn_number: 1,
+          created_at: null,
+        },
+        {
+          id: '2',
+          role: 'context',
+          content: '<srw_context kind="memory">\n[m:3f9a2c] We decided Y.\n</srw_context>',
+          tool_calls: null,
+          turn_number: 1,
+          created_at: null,
+        },
+        {
+          id: '3',
+          role: 'ai',
+          content: 'We decided Y.',
+          tool_calls: null,
+          turn_number: 1,
+          created_at: null,
+        },
+      ] as never);
+      const users = turns.filter((t) => t.kind === 'user');
+      expect(users).toHaveLength(1);
+      expect((users[0] as { content: string }).content).toBe('What did we decide about X?');
+      expect(turns.filter((t) => t.kind === 'system')).toHaveLength(0);
+      expect(JSON.stringify(turns)).not.toContain('srw_context');
     });
   });
 
@@ -9752,6 +11255,183 @@ describe('PersistentChatService — Phase 2: wake recovery', () => {
 
     document.dispatchEvent(new Event('resume'));
     expect(reconnectSpy).toHaveBeenCalledTimes(1);
+  });
+});
+
+// knowledge-base/knowledge/issues/persistent_chat_silent_disconnect.md: a
+// laptop sleep kills both links underneath the page without a close frame,
+// so the EventSource and the pinned control WS keep reporting OPEN.
+describe('PersistentChatService — waking from sleep with silently dead transports', () => {
+  let originalEs: any;
+  let originalWs: any;
+
+  function setVisibility(state: string): void {
+    Object.defineProperty(document, 'visibilityState', {
+      value: state,
+      configurable: true,
+    });
+  }
+
+  function framesOn(ws: any) {
+    return ws.send.mock.calls.map((c: any) => JSON.parse(c[0]));
+  }
+
+  beforeEach(() => {
+    originalEs = (globalThis as any).EventSource;
+    originalWs = (globalThis as any).WebSocket;
+    vi.useFakeTimers();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+    (globalThis as any).EventSource = originalEs;
+    (globalThis as any).WebSocket = originalWs;
+    setVisibility('visible');
+    vi.clearAllMocks();
+  });
+
+  /** A pinned session with the stream and the control WS both up. */
+  async function connectPinned(threadId: string) {
+    const ctx = createService();
+    ctx.mockHttp.get.mockImplementation(activeSessionGet);
+    await ctx.service.connect(threadId);
+    await vi.advanceTimersByTimeAsync(0);
+    fireSseOpen(ctx.sseInstances[0]);
+    expect(ctx.service.connectionState()).toBe('connected');
+    expect(ctx.wsInstances).toHaveLength(1);
+    return { ...ctx, zombieWs: ctx.wsInstances[0] };
+  }
+
+  /** Suspend the machine: the wall clock jumps, but no timer fires and no
+   *  frame arrives. Pending timers keep their remaining delay, as browser
+   *  timers on a monotonic clock that stops while suspended do. */
+  function sleepFor(ms: number): void {
+    vi.setSystemTime(Date.now() + ms);
+  }
+
+  const TWO_HOURS = 2 * 60 * 60_000;
+
+  it('leaves Connected on the first watchdog tick after waking, with no wake event at all', async () => {
+    const ctx = await connectPinned('thread-sleep-tick');
+
+    sleepFor(TWO_HOURS);
+    await vi.advanceTimersByTimeAsync(5_000);
+
+    expect(ctx.sseInstances[0].close).toHaveBeenCalled();
+    expect(ctx.service.connectionState()).toBe('connecting');
+    await vi.advanceTimersByTimeAsync(2_000);
+    expect(ctx.sseInstances).toHaveLength(2);
+  });
+
+  it('a wake event retires the dead control WS too, instead of trusting its OPEN readyState', async () => {
+    const ctx = await connectPinned('thread-sleep-wake');
+
+    setVisibility('hidden');
+    document.dispatchEvent(new Event('visibilitychange'));
+    sleepFor(TWO_HOURS);
+    setVisibility('visible');
+    document.dispatchEvent(new Event('visibilitychange'));
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(ctx.service.connectionState()).toBe('connecting');
+    expect(ctx.sseInstances).toHaveLength(2);
+    expect(ctx.zombieWs.close).toHaveBeenCalled();
+
+    // The stream recovers and brings a fresh control socket with it.
+    fireSseOpen(ctx.sseInstances[1]);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(ctx.service.connectionState()).toBe('connected');
+    expect(ctx.wsInstances).toHaveLength(2);
+
+    // Commands now go out on the fresh socket, never into the dead one.
+    const fresh = ctx.wsInstances[1];
+    (ctx.service as any)._sendControl({ method: 'approve' });
+    expect(framesOn(fresh)).toContainEqual({ method: 'approve' });
+    expect(framesOn(ctx.zombieWs)).not.toContainEqual({ method: 'approve' });
+  });
+
+  it('a command issued right after waking, before any tick or wake event, is not written into the dead socket', async () => {
+    const ctx = await connectPinned('thread-sleep-click');
+
+    sleepFor(TWO_HOURS);
+    (ctx.service as any)._sendControl({ method: 'approve' });
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(framesOn(ctx.zombieWs)).not.toContainEqual({ method: 'approve' });
+    expect(ctx.zombieWs.close).toHaveBeenCalled();
+    // It rides the replacement socket once that opens.
+    expect(ctx.wsInstances).toHaveLength(2);
+    const fresh = ctx.wsInstances[1];
+    fresh.onopen();
+    expect(framesOn(fresh)).toContainEqual({ method: 'approve' });
+  });
+
+  it('a destructive control right after waking is refused, not lost, and its retry has a socket to use', async () => {
+    const ctx = await connectPinned('thread-sleep-rewind');
+
+    sleepFor(TWO_HOURS);
+    const sent = (ctx.service as any)._sendImmediateControl({ method: 'rewind', mode: 'both' });
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(sent).toBe(false);
+    expect(ctx.service.error()).toBe('chat.rewind.connectionDown');
+    expect(ctx.zombieWs.send).not.toHaveBeenCalled();
+    expect(ctx.wsInstances).toHaveLength(2);
+  });
+
+  it('going offline leaves Connected at once; coming back online reopens both transports', async () => {
+    const ctx = await connectPinned('thread-offline');
+
+    window.dispatchEvent(new Event('offline'));
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(ctx.service.connectionState()).toBe('connecting');
+    expect(ctx.sseInstances[0].close).toHaveBeenCalled();
+    expect(ctx.zombieWs.close).toHaveBeenCalled();
+
+    // Offline, the reopened stream cannot connect (the browser keeps
+    // retrying); `online` makes the next attempt immediately.
+    fireSseTransientError(ctx.sseInstances[1]);
+    window.dispatchEvent(new Event('online'));
+    await vi.advanceTimersByTimeAsync(0);
+    expect(ctx.sseInstances).toHaveLength(3);
+    fireSseOpen(ctx.sseInstances[2]);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(ctx.service.connectionState()).toBe('connected');
+    expect(ctx.wsInstances).toHaveLength(2);
+  });
+
+  it('the control WS watchdog replaces a half-open socket without waiting for its close event', async () => {
+    const ctx = await connectPinned('thread-ws-halfopen');
+
+    // The stream stays healthy; only the control socket goes quiet.
+    for (let i = 0; i < 3; i++) {
+      await vi.advanceTimersByTimeAsync(20_000);
+      fireSseNamedEvent(ctx.sseInstances[0], 'ping', {});
+    }
+    expect(ctx.zombieWs.close).toHaveBeenCalledWith(4002, 'heartbeat timeout');
+
+    // close() on an unreachable peer starts a closing handshake that cannot
+    // complete, so no close event arrives (the mock never fires one). The
+    // replacement must not wait for it.
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(ctx.wsInstances).toHaveLength(2);
+    expect(ctx.sseInstances).toHaveLength(1);
+    expect(ctx.service.connectionState()).toBe('connected');
+  });
+
+  it('a healthy control WS survives a focus revalidate', async () => {
+    const ctx = await connectPinned('thread-ws-healthy');
+
+    await vi.advanceTimersByTimeAsync(20_000);
+    fireSseNamedEvent(ctx.sseInstances[0], 'ping', {});
+    ctx.zombieWs.onmessage({ data: JSON.stringify({ method: 'ws.ping', params: {} }) });
+    window.dispatchEvent(new Event('focus'));
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(ctx.zombieWs.close).not.toHaveBeenCalled();
+    expect(ctx.wsInstances).toHaveLength(1);
+    expect(ctx.sseInstances).toHaveLength(1);
   });
 });
 
@@ -10386,17 +12066,170 @@ describe('PersistentChatService — control transport is declared, never inferre
     const ctx = await socketlessSession();
 
     ctx.service.upgradeWorkspace('sandbox');
-    expect(ctx.service.error()).toBe('chat.control.unavailable');
+    expect(ctx.service.error()).toBe('chat.control.upgradeUnavailable');
     expect(ctx.service.workspaceUpgradeInProgress()).toBeNull();
     expect((ctx.service as any).controlOutbox).toEqual([]);
 
     ctx.service.error.set(null);
+    expect((ctx.service as any).handleSlashCommand('/compact')).toBe(true);
+    expect(ctx.service.error()).toBe('chat.control.compactUnavailable');
+    expect((ctx.service as any).controlOutbox).toEqual([]);
+    expect(ctx.mockHttp.post).not.toHaveBeenCalled();
+    expect(ctx.wsInstances).toHaveLength(0);
+  });
+
+  it('/upgrade-workspace container without a transport keeps the generic refusal', async () => {
+    const ctx = await socketlessSession();
+    expect(ctx.service.controlTransport('upgrade-to-workspace')).toBe('unavailable');
+    await ctx.service.sendMessage('/upgrade-workspace container');
+    expect(ctx.service.error()).toBe('chat.control.upgradeUnavailable');
+  });
+
+  it('/done without an archive socket ends through the owner End path', async () => {
+    const ctx = await socketlessSession();
+    ctx.mockHttp.delete.mockReturnValue(of({ status: 'ended' }));
     const stamps = vi.spyOn(ctx.service as any, '_systemMessage');
+
     expect((ctx.service as any).handleSlashCommand('/done')).toBe(true);
-    expect(stamps).not.toHaveBeenCalledWith('Ending session...');
-    expect(ctx.service.error()).toBe('chat.control.unavailable');
+    await Promise.resolve();
+
+    expect(stamps).toHaveBeenCalledWith('Ending session...');
+    expect(ctx.mockHttp.delete).toHaveBeenCalledWith(
+      expect.stringContaining('/persistent/threads/socketless'),
+    );
+    expect(ctx.service.error()).toBeNull();
     expect((ctx.service as any).controlOutbox).toEqual([]);
     expect(ctx.wsInstances).toHaveLength(0);
+  });
+
+  it('the palette offers exactly the commands this session can carry', async () => {
+    const bare = await socketlessSession();
+    const offered = (ctx: typeof bare) =>
+      ['/compact', '/done', '/undo', '/rewind', '/auto', '/silent', '/upgrade-workspace'].filter(
+        (command) => ctx.service.slashCommandAvailable(command),
+      );
+    expect(offered(bare)).toEqual(['/done', '/undo', '/auto', '/silent']);
+
+    const withCompact = await socketlessSession({
+      ...declaredSocketless,
+      controls: { ...declaredSocketless.controls, compact: 'rest' },
+    });
+    expect(offered(withCompact)).toEqual(['/compact', '/done', '/undo', '/auto', '/silent']);
+  });
+
+  it('a declared stateless /compact rides the durable control inbox', async () => {
+    const ctx = await socketlessSession({
+      ...declaredSocketless,
+      controls: { ...declaredSocketless.controls, compact: 'rest' },
+    });
+    ctx.mockHttp.post.mockReturnValue(of({ state: 'pending' }));
+
+    expect(ctx.service.summarizeAvailable()).toBe(true);
+    expect((ctx.service as any).handleSlashCommand('/compact  the pricing  ')).toBe(true);
+
+    expect(ctx.mockHttp.post).toHaveBeenCalledWith(
+      expect.stringContaining('/persistent/threads/socketless/controls'),
+      expect.objectContaining({
+        method: 'compact',
+        focus: 'the pricing',
+        session_runtime_generation: declaredSocketless.session_runtime_generation,
+      }),
+    );
+    const body = ctx.mockHttp.post.mock.calls[0][1];
+    expect(body).not.toHaveProperty('boundary_message_id');
+    expect((ctx.service as any).controlOutbox).toEqual([]);
+    expect(ctx.wsInstances).toHaveLength(0);
+
+    // "Summarize up to here" carries its boundary on the same verb.
+    ctx.service.summarizeUpTo('msg-7');
+    expect(ctx.mockHttp.post.mock.calls.at(-1)?.[1]).toEqual(
+      expect.objectContaining({ method: 'compact', boundary_message_id: 'msg-7' }),
+    );
+  });
+
+  it('a /compact typed mid-response waits for the session to go idle', async () => {
+    const ctx = await socketlessSession({
+      ...declaredSocketless,
+      controls: { ...declaredSocketless.controls, compact: 'rest' },
+    });
+    ctx.mockHttp.post.mockReturnValue(of({ state: 'pending' }));
+    const stamps = vi.spyOn(ctx.service as any, '_systemMessage');
+    ctx.service.pendingTurnCount.set(1);
+    TestBed.tick();
+
+    (ctx.service as any).handleSlashCommand('/compact first');
+    (ctx.service as any).handleSlashCommand('/compact second');
+
+    expect(ctx.mockHttp.post).not.toHaveBeenCalled();
+    // Said once, however often it was asked.
+    expect(
+      stamps.mock.calls.filter(([line]) => line === 'chat.control.compactDeferred'),
+    ).toHaveLength(1);
+
+    ctx.service.pendingTurnCount.set(0);
+    TestBed.tick();
+
+    expect(ctx.mockHttp.post).toHaveBeenCalledTimes(1);
+    expect(ctx.mockHttp.post.mock.calls[0][1]).toEqual(
+      expect.objectContaining({ method: 'compact', focus: 'second' }),
+    );
+  });
+
+  it('an owner rejection of /compact says why, and its receipt clears the error', async () => {
+    const ctx = await socketlessSession({
+      ...declaredSocketless,
+      controls: { ...declaredSocketless.controls, compact: 'rest' },
+    });
+    ctx.mockHttp.post.mockReturnValue(of({ state: 'pending' }));
+    (ctx.service as any).handleSlashCommand('/compact');
+    const request = ctx.mockHttp.post.mock.calls[0][1];
+
+    fireSseMessage(
+      ctx.sseInstances[0],
+      {
+        method: 'control.rejected',
+        params: {
+          method: 'compact',
+          client_request_id: request.client_request_id,
+          error_code: 'compaction_failed',
+        },
+      },
+      '2:1',
+    );
+    expect(ctx.service.error()).toBe('chat.control.compactFailed');
+
+    (ctx.service as any).handleSlashCommand('/compact');
+    const retry = ctx.mockHttp.post.mock.calls[1][1];
+    fireSseMessage(
+      ctx.sseInstances[0],
+      {
+        method: 'context.compacted',
+        params: {
+          method: 'compact',
+          client_request_id: retry.client_request_id,
+          trigger: 'manual',
+          summary: 'folded',
+          turn: 2,
+          before: 40,
+          after: 6,
+        },
+      },
+      '2:2',
+    );
+    expect(ctx.service.error()).toBeNull();
+  });
+
+  it('/undo announces itself only when something was dispatched', async () => {
+    const ctx = await socketlessSession({
+      ...declaredSocketless,
+      session_runtime_generation: null,
+    });
+    const stamps = vi.spyOn(ctx.service as any, '_systemMessage');
+
+    // Without a runtime generation admission is refused locally.
+    expect((ctx.service as any).handleSlashCommand('/undo')).toBe(true);
+    expect(stamps).not.toHaveBeenCalledWith('Undoing last file changes...');
+    expect(ctx.service.error()).toBe('chat.control.admissionFailed');
   });
 
   it('frames queued before /connection resolved are failed once it declares no socket', async () => {
@@ -10566,5 +12399,838 @@ describe('PersistentChatService — queue state (parked / poll / retry)', () => 
     expect(await ctx.service.retryParked()).toBe('refused');
     expect(ctx.service.isParked()).toBe(true);
     expect((TestBed.inject(AppToastService) as any).danger).toHaveBeenCalled();
+  });
+
+  it('retryParked on a unit with no pending input opens no awaiting stretch', async () => {
+    // A unit parked with nothing to run (e.g. a push remainder) settles to
+    // `done` on retry without ever starting a turn; counting a turn here
+    // left "Waiting for an available agent…" up forever (live k3d, 09-23).
+    const ctx = await readyOn('thread-np', { queue: { ...parkedBlock, pending_input: false } });
+    await new Promise((r) => setTimeout(r, 0));
+    expect(ctx.service.isParked()).toBe(true);
+    (ctx.mockApi as any).retryThreadQueue = vi.fn().mockReturnValue(of({ kind: 'ok', state: 'queued' }));
+    expect(await ctx.service.retryParked()).toBe('ok');
+    expect(ctx.service.isParked()).toBe(false);
+    expect(ctx.service.queueState()?.pending_input).toBe(false);
+    expect(ctx.service.pendingTurnCount()).toBe(0);
+    expect(ctx.service.isAwaitingTurn()).toBe(false);
+  });
+
+  // A reload hydrates the durable snapshot, opens SSE at the replay floor
+  // (just before the latest turn) and reads /connection. The replayed
+  // turn.started is history the snapshot already covers: it says nothing
+  // about the unit's lease, so it must not wipe the parked block /connection
+  // just delivered (live k3d, 09-23: the composer reopened on a parked unit).
+  function durableReload(threadId: string, queue: Record<string, unknown>) {
+    const ctx = createService();
+    ctx.mockHttp.get.mockImplementation((url: string) => {
+      if (url.endsWith(`/sessions/${threadId}/connection`)) {
+        return of({ state: 'ready', ws_url: null, control_socket: 'none', queue });
+      }
+      if (url.endsWith(`/threads/${threadId}/state`)) {
+        return of({
+          thread_id: threadId,
+          permission_mode: 'supervised',
+          narration_mode: 'auto',
+          turn_count: 2,
+          turn_in_flight: false,
+          message_count: 4,
+          model: null,
+          temperature: null,
+          running_tool: null,
+          pending_permissions: [],
+          event_cursor: { epoch: 0, seq: 40 },
+          replay_cursor: { epoch: 0, seq: 30 },
+          snapshot_source: 'durable_journal',
+        });
+      }
+      return of({ status: 'active', total_turns: 2, messages: [], total: 0 });
+    });
+    return ctx;
+  }
+
+  it('a replayed turn.started the snapshot covers keeps the parked block from /connection', async () => {
+    const ctx = durableReload('thread-reload', parkedBlock);
+    await ctx.service.connect('thread-reload');
+    await new Promise((r) => setTimeout(r, 0));
+    expect(ctx.service.isParked()).toBe(true);
+
+    fireSseOpen(ctx.sseInstances[0]);
+    fireSseMessage(ctx.sseInstances[0], { method: 'turn.started', params: { turn_id: 2 } }, '0:31');
+    fireSseMessage(ctx.sseInstances[0], { method: 'turn.completed', params: { turn_id: 2 } }, '0:39');
+
+    expect(ctx.service.isParked()).toBe(true);
+    expect(ctx.service.queueState()?.park_reason).toBe('attach_failed');
+  });
+
+  it('a live turn.started past the snapshot still clears the parked block', async () => {
+    const ctx = durableReload('thread-live', parkedBlock);
+    await ctx.service.connect('thread-live');
+    await new Promise((r) => setTimeout(r, 0));
+    expect(ctx.service.isParked()).toBe(true);
+
+    fireSseOpen(ctx.sseInstances[0]);
+    fireSseMessage(ctx.sseInstances[0], { method: 'turn.started', params: { turn_id: 3 } }, '0:41');
+
+    expect(ctx.service.queueState()).toBeNull();
+    expect(ctx.service.isParked()).toBe(false);
+  });
+
+  const leasedBlock = {
+    state: 'leased',
+    park_reason: null,
+    parked_at: null,
+    retryable: false,
+    attempts: 0,
+    pending_input: false,
+  };
+
+  it('a snapshot reload that skips /connection re-reads the block (unit claimed meanwhile)', async () => {
+    const ctx = durableReload('thread-h', parkedBlock);
+    await ctx.service.connect('thread-h');
+    await new Promise((r) => setTimeout(r, 0));
+    expect(ctx.service.isParked()).toBe(true);
+    // Another tab retried while this one was away; the reload's replayed
+    // turn.started is now covered, so only the re-read can clear the block.
+    (ctx.mockApi as any).getThreadQueue = vi.fn().mockReturnValue(of(leasedBlock));
+    await (ctx.service as any)._retrySnapshotAndOpenSse(
+      'thread-h',
+      (ctx.service as any).connectGeneration,
+      null,
+    );
+    await new Promise((r) => setTimeout(r, 0));
+    fireSseMessage(ctx.sseInstances.at(-1)!, { method: 'turn.started', params: { turn_id: 2 } }, '0:31');
+
+    expect((ctx.mockApi as any).getThreadQueue).toHaveBeenCalledWith('thread-h');
+    expect(ctx.service.isParked()).toBe(false);
+    expect(ctx.service.queueState()?.state).toBe('leased');
+  });
+
+  it('a queue read that straddles a live turn.started is dropped, not re-applied', async () => {
+    const ctx = durableReload('thread-s', { ...parkedBlock, state: 'queued', park_reason: null });
+    await ctx.service.connect('thread-s');
+    await new Promise((r) => setTimeout(r, 0));
+    const pending = new Subject<unknown>();
+    (ctx.mockApi as any).getThreadQueue = vi.fn().mockReturnValue(pending);
+    const poll = (ctx.service as any)._pollQueueState();
+
+    fireSseOpen(ctx.sseInstances[0]);
+    fireSseMessage(ctx.sseInstances[0], { method: 'turn.started', params: { turn_id: 3 } }, '0:41');
+    expect(ctx.service.queueState()).toBeNull();
+    // The read was served before the claim and reports the unit parked.
+    pending.next(parkedBlock);
+    pending.complete();
+    await poll;
+
+    expect(ctx.service.queueState()).toBeNull();
+    expect(ctx.service.isParked()).toBe(false);
+  });
+
+  it('a refused retry re-reads the block, so a unit settled elsewhere unparks', async () => {
+    const ctx = await readyOn('thread-rr', { queue: parkedBlock });
+    await new Promise((r) => setTimeout(r, 0));
+    expect(ctx.service.isParked()).toBe(true);
+    (ctx.mockApi as any).retryThreadQueue = vi
+      .fn()
+      .mockReturnValue(of({ kind: 'refused', status: 404, code: 'not_parked' }));
+    (ctx.mockApi as any).getThreadQueue = vi
+      .fn()
+      .mockReturnValue(of({ ...leasedBlock, state: 'done' }));
+
+    expect(await ctx.service.retryParked()).toBe('refused');
+    await new Promise((r) => setTimeout(r, 0));
+
+    expect(ctx.service.isParked()).toBe(false);
+    expect(ctx.service.queueState()?.state).toBe('done');
+  });
+});
+
+describe('PersistentChatComponent — pending VM IDE ownership', () => {
+  let originalEs: any;
+  let originalWs: any;
+  let ctx: ReturnType<typeof createService>;
+  let host: any;
+  let tab: any;
+  let post: Subject<any>;
+  let poll: Subject<any>;
+  const threadId = 'watched';
+  const leaseId = '11111111-1111-4111-8111-111111111111';
+  const readyUrl = `https://example.test/api/ide/${threadId}/proxy/_vm/${leaseId}/`;
+
+  beforeEach(async () => {
+    originalEs = globalThis.EventSource;
+    originalWs = globalThis.WebSocket;
+    vi.useFakeTimers();
+    ctx = createService();
+    ctx.mockHttp.get.mockImplementation(activeSessionGet);
+    await ctx.service.connect(threadId);
+    post = new Subject<any>();
+    poll = new Subject<any>();
+    tab = {
+      closed: false, opener: {}, document: {title: '', body: {textContent: ''}},
+      location: {href: ''}, close: vi.fn(() => { tab.closed = true; }),
+    };
+    vi.spyOn(window, 'open').mockReturnValue(tab);
+    // Execute the real component open, polling and destroy methods over the
+    // real service generation guard. Replace only HTTP/popup boundaries and
+    // initialize the fields normally supplied by the component constructor.
+    host = Object.assign(Object.create(PersistentChatComponent.prototype), {
+      chat: ctx.service,
+      api: {
+        startThreadIdeSession: vi.fn(() => post),
+        getThreadIdeStatus: vi.fn(() => poll),
+        closeThreadIdeLease: vi.fn(() => of(void 0)),
+      },
+      toast: {warning: vi.fn()}, transloco: {translate: (key: string) => key},
+      idePollingTimer: null, pendingVmIdeOpen: null, vmIdeOpenDestroyed: false, startupTickInterval: null,
+      compactionTimer: null, capabilitiesSub: null, recordingStateSub: null,
+      isRecording: signal(false),
+    });
+  });
+
+  afterEach(() => {
+    post.complete();
+    poll.complete();
+    host.ngOnDestroy();
+    ctx.service.disconnect();
+    TestBed.resetTestingModule();
+    vi.clearAllTimers();
+    vi.useRealTimers();
+    vi.restoreAllMocks();
+    globalThis.EventSource = originalEs;
+    globalThis.WebSocket = originalWs;
+  });
+
+  function pending() {
+    host.openVmCodeServer();
+    post.next({status: 'restoring', access_lease_id: leaseId});
+    post.complete();
+  }
+
+  it('closes the exact pending lease when navigating away destroys the component', () => {
+    pending();
+    host.ngOnDestroy();
+    expect(host.api.closeThreadIdeLease).toHaveBeenCalledExactlyOnceWith(threadId, leaseId);
+    expect(tab.closed).toBe(true);
+  });
+
+  it.each(['restoring', 'active'])('closes a late %s POST lease after destruction without reviving the popup', async status => {
+    host.openVmCodeServer();
+    host.ngOnDestroy();
+    post.next({status, access_lease_id: leaseId, code_server_url: status === 'active' ? readyUrl : null});
+    post.complete();
+    await vi.advanceTimersByTimeAsync(3000);
+    expect.soft(host.api.closeThreadIdeLease).toHaveBeenCalledExactlyOnceWith(threadId, leaseId);
+    expect.soft(host.api.getThreadIdeStatus).not.toHaveBeenCalled();
+    expect.soft(tab.location.href).toBe('');
+    expect.soft(tab.closed).toBe(true);
+  });
+
+  it('discards a Ready poll already in flight when the component is destroyed', async () => {
+    pending();
+    await vi.advanceTimersByTimeAsync(3000);
+    expect(host.api.getThreadIdeStatus).toHaveBeenCalledWith(threadId, leaseId);
+    host.ngOnDestroy();
+    poll.next({status: 'active', access_lease_id: leaseId, code_server_url: readyUrl});
+    expect.soft(tab.location.href).toBe('');
+    expect.soft(host.api.closeThreadIdeLease).toHaveBeenCalledExactlyOnceWith(threadId, leaseId);
+  });
+
+  it('closes the original pending lease after a thread switch without touching its successor', async () => {
+    pending();
+    await ctx.service.connect('successor');
+    await vi.advanceTimersByTimeAsync(3000);
+    poll.next({status: 'active', access_lease_id: leaseId, code_server_url: readyUrl});
+    expect(tab.location.href).toBe('');
+    expect(host.api.closeThreadIdeLease).toHaveBeenCalledExactlyOnceWith(threadId, leaseId);
+  });
+
+  it('closes a late active POST lease after a thread switch without opening the old workspace', async () => {
+    host.openVmCodeServer();
+    await ctx.service.connect('successor');
+    post.next({status: 'active', access_lease_id: leaseId, code_server_url: readyUrl});
+    expect.soft(tab.location.href).toBe('');
+    expect.soft(host.api.closeThreadIdeLease).toHaveBeenCalledExactlyOnceWith(threadId, leaseId);
+  });
+
+  it.each(['post', 'poll'])('preserves the lease of an IDE popup already Ready through %s when navigating away', async readyVia => {
+    if (readyVia === 'post') {
+      host.openVmCodeServer();
+      post.next({status: 'active', access_lease_id: leaseId, code_server_url: readyUrl});
+    } else {
+      pending();
+      await vi.advanceTimersByTimeAsync(3000);
+      poll.next({status: 'active', access_lease_id: leaseId, code_server_url: readyUrl});
+    }
+    expect(tab.location.href).toBe(readyUrl);
+    host.ngOnDestroy();
+    expect(host.api.closeThreadIdeLease).not.toHaveBeenCalled();
+    expect(tab.closed).toBe(false);
+  });
+
+  it('already closes only the captured pending lease when the popup is closed', async () => {
+    pending();
+    tab.closed = true;
+    await vi.advanceTimersByTimeAsync(3000);
+    expect(host.api.closeThreadIdeLease).toHaveBeenCalledExactlyOnceWith(threadId, leaseId);
+  });
+
+  it('closes a known lease only once across popup close and repeated destruction', async () => {
+    pending();
+    tab.closed = true;
+    await vi.advanceTimersByTimeAsync(3000);
+    host.ngOnDestroy();
+    host.ngOnDestroy();
+    expect(host.api.closeThreadIdeLease).toHaveBeenCalledExactlyOnceWith(threadId, leaseId);
+  });
+
+  it('closes a late lease only once after repeated destruction', () => {
+    host.openVmCodeServer();
+    host.ngOnDestroy();
+    host.ngOnDestroy();
+    post.next({status: 'restoring', access_lease_id: leaseId});
+    host.ngOnDestroy();
+    expect(host.api.closeThreadIdeLease).toHaveBeenCalledExactlyOnceWith(threadId, leaseId);
+    expect(tab.close).toHaveBeenCalledTimes(1);
+  });
+
+  it.each(['restoring', 'active'])('keeps a replacement open independent of the prior late %s POST', async status => {
+    host.openVmCodeServer();
+    const replacementPost = new Subject<any>();
+    const replacementTab: any = {
+      closed: false, opener: {}, document: {title: '', body: {textContent: ''}},
+      location: {href: ''}, close: vi.fn(() => { replacementTab.closed = true; }),
+    };
+    const replacementLease = '22222222-2222-4222-8222-222222222222';
+    vi.mocked(window.open).mockReturnValue(replacementTab);
+    host.api.startThreadIdeSession.mockReturnValue(replacementPost);
+    host.openVmCodeServer();
+    replacementPost.next({status: 'restoring', access_lease_id: replacementLease});
+    replacementPost.complete();
+    post.next({status, access_lease_id: leaseId, code_server_url: readyUrl});
+    post.complete();
+
+    expect.soft(host.api.closeThreadIdeLease).toHaveBeenCalledExactlyOnceWith(threadId, leaseId);
+    expect.soft(tab.closed).toBe(true);
+    expect.soft(tab.location.href).toBe('');
+    await vi.advanceTimersByTimeAsync(3000);
+    expect(host.api.getThreadIdeStatus).toHaveBeenCalledExactlyOnceWith(threadId, replacementLease);
+    const replacementUrl = readyUrl.replace(leaseId, replacementLease);
+    poll.next({status: 'active', access_lease_id: replacementLease, code_server_url: replacementUrl});
+    expect(replacementTab.location.href).toBe(replacementUrl);
+    host.ngOnDestroy();
+    expect(replacementTab.closed).toBe(false);
+    expect(host.api.closeThreadIdeLease).toHaveBeenCalledExactlyOnceWith(threadId, leaseId);
+  });
+
+  it.each(['active', 'unavailable'])('ignores a replaced attempt’s late %s GET without affecting its replacement', async status => {
+    pending();
+    await vi.advanceTimersByTimeAsync(3000);
+    const replacementPost = new Subject<any>();
+    const replacementPoll = new Subject<any>();
+    const replacementLease = '22222222-2222-4222-8222-222222222222';
+    const replacementTab: any = {
+      closed: false, opener: {}, document: {title: '', body: {textContent: ''}},
+      location: {href: ''}, close: vi.fn(() => { replacementTab.closed = true; }),
+    };
+    vi.mocked(window.open).mockReturnValue(replacementTab);
+    host.api.startThreadIdeSession.mockReturnValue(replacementPost);
+    host.api.getThreadIdeStatus.mockReturnValue(replacementPoll);
+    host.openVmCodeServer();
+    replacementPost.next({status: 'restoring', access_lease_id: replacementLease});
+    replacementPost.complete();
+    poll.next({status, code_server_url: readyUrl, workspace_lifecycle: {state: 'ready'}});
+    poll.complete();
+    expect.soft(tab.closed).toBe(true);
+    expect.soft(tab.location.href).toBe('');
+    expect.soft(ctx.service.workspaceLifecycle()).not.toEqual({state: 'ready'});
+    expect.soft(host.api.closeThreadIdeLease).toHaveBeenCalledExactlyOnceWith(threadId, leaseId);
+    await vi.advanceTimersByTimeAsync(3000);
+    expect(host.api.getThreadIdeStatus).toHaveBeenLastCalledWith(threadId, replacementLease);
+    const replacementUrl = readyUrl.replace(leaseId, replacementLease);
+    replacementPoll.next({status: 'active', code_server_url: replacementUrl});
+    replacementPoll.complete();
+    expect(replacementTab.location.href).toBe(replacementUrl);
+    host.ngOnDestroy();
+    expect(replacementTab.closed).toBe(false);
+    expect(host.api.closeThreadIdeLease).toHaveBeenCalledExactlyOnceWith(threadId, leaseId);
+  });
+
+  it('already closes the pending lease at the existing five-minute polling timeout', async () => {
+    pending();
+    await vi.advanceTimersByTimeAsync(303_000);
+    expect(host.api.closeThreadIdeLease).toHaveBeenCalledExactlyOnceWith(threadId, leaseId);
+    expect(tab.closed).toBe(true);
+    expect(host.toast.warning).toHaveBeenCalledWith('jobs.lifecycle.wakeTimedOut');
+  });
+});
+
+describe('PersistentChatService — pending End visibility reconciliation', () => {
+  async function flushMicrotasks() {
+    for (let i = 0; i < 20; i++) await Promise.resolve();
+  }
+  let originalEs: any;
+  let originalWs: any;
+  let ctx: ReturnType<typeof createService>;
+  let meta: Record<string, unknown>;
+  const metaUrl = /\/persistent\/threads\/[^/?]+$/;
+  const reads = () => ctx.mockHttp.get.mock.calls.filter((call: any[]) => metaUrl.test(call[0])).length;
+  const pending = { runtime_retirement_pending: true, retirement_disposition: 'ended' };
+
+  beforeEach(() => {
+    originalEs = globalThis.EventSource;
+    originalWs = globalThis.WebSocket;
+    vi.useFakeTimers();
+    ctx = createService();
+    meta = { execution_lane: 'pinned', workspace_lifecycle: { state: 'ready' } };
+    ctx.mockHttp.get.mockImplementation((url: string) =>
+      metaUrl.test(url) ? activeSessionGet(url).pipe(map(body => ({ ...body, ...meta }))) : activeSessionGet(url),
+    );
+  });
+  afterEach(() => {
+    ctx.service.disconnect();
+    TestBed.resetTestingModule();
+    vi.useRealTimers();
+    globalThis.EventSource = originalEs;
+    globalThis.WebSocket = originalWs;
+  });
+  async function connected() {
+    await ctx.service.connect('watched');
+    fireSseOpen(ctx.sseInstances[0]);
+    await flushMicrotasks();
+    expect(ctx.service.isConnected()).toBe(true);
+  }
+  function expectEnding() {
+    expect(ctx.service.threadStatus()).toBe('ending');
+    expect(ctx.service.isConnected()).toBe(false);
+    expect(ctx.service.sessionReady()).toBe(false);
+    expect(ctx.service.isStartingSession()).toBe(false);
+    expect(ctx.service.endedAt()).toBeNull();
+    expect(ctx.service.workspaceLifecycle()).toBeNull();
+    expect(canComposeDuringSession(ctx.service.isConnected(), ctx.service.isStartingSession())).toBe(false);
+    expect(ctx.wsInstances[0].close).toHaveBeenCalledWith(1000);
+    expect(ctx.sseInstances[0].close).not.toHaveBeenCalled();
+  }
+
+  it.each([false, true])('discovers sibling-tab End and converges only on settlement (permanent=%s)', async permanent => {
+    await connected();
+    meta = { ...meta, ...pending, retirement_permanent: permanent };
+    await vi.advanceTimersByTimeAsync(5000);
+    expectEnding();
+    expect(ctx.service.retirementPermanent()).toBe(permanent);
+    expect(await ctx.service.sendMessage('cannot execute while ending')).toBe(false);
+    expect(ctx.service.outbox()).toEqual([]);
+    meta = { status: 'ended', execution_lane: 'pinned', ended_at: '2026-09-27T10:00:00Z' };
+    await vi.advanceTimersByTimeAsync(5000);
+    expect(ctx.service.threadStatus()).toBe('ended');
+    expect(ctx.service.endedAt()).toBe('2026-09-27T10:00:00Z');
+    const settledReads = reads();
+    await vi.advanceTimersByTimeAsync(15000);
+    expect(reads()).toBe(settledReads);
+    expect(ctx.sseInstances[0].close).not.toHaveBeenCalled();
+  });
+
+  it('leaves a viewed ending thread when its lifecycle GET confirms deletion', async () => {
+    await connected();
+    meta = { ...meta, ...pending, retirement_permanent: true };
+    await vi.advanceTimersByTimeAsync(5000);
+    expectEnding();
+
+    ctx.mockHttp.get.mockImplementation((url: string) =>
+      metaUrl.test(url)
+        ? throwError(() => ({ status: 404 }))
+        : activeSessionGet(url),
+    );
+    await vi.advanceTimersByTimeAsync(5000);
+
+    expect(ctx.service.deletedThreadId()).toBe('watched');
+    expect(ctx.sseInstances[0].close).toHaveBeenCalled();
+    const settledReads = reads();
+    await vi.advanceTimersByTimeAsync(15000);
+    expect(reads()).toBe(settledReads);
+  });
+
+  it.each([0, 401, 403, 503])('keeps an ending thread on metadata failure %s', async status => {
+    await connected();
+    meta = { ...meta, ...pending, retirement_permanent: true };
+    await vi.advanceTimersByTimeAsync(5000);
+    ctx.mockHttp.get.mockImplementation((url: string) =>
+      metaUrl.test(url)
+        ? throwError(() => ({ status }))
+        : activeSessionGet(url),
+    );
+
+    await vi.advanceTimersByTimeAsync(5000);
+    expect(ctx.service.threadStatus()).toBe('ending');
+    expect(ctx.service.deletedThreadId()).toBeNull();
+    expect(ctx.sseInstances[0].close).not.toHaveBeenCalled();
+  });
+
+  it.each(['navigate', 'resume'])('ignores an old 404 after %s', async action => {
+    await connected();
+    meta = { ...meta, ...pending, retirement_permanent: true };
+    await vi.advanceTimersByTimeAsync(5000);
+    const response = new Subject<any>();
+    ctx.mockHttp.get.mockImplementation((url: string) =>
+      metaUrl.test(url) ? response : activeSessionGet(url),
+    );
+    await vi.advanceTimersByTimeAsync(5000);
+    if (action === 'navigate') {
+      ctx.mockHttp.get.mockImplementation(activeSessionGet);
+      await ctx.service.connect('other');
+    } else {
+      fireSseMessage(ctx.sseInstances[0], {
+        method: 'session.ended',
+        params: { session_runtime_generation: SESSION_RUNTIME_GENERATION },
+      }, '1:1');
+      ctx.mockHttp.get.mockImplementation(activeSessionGet);
+      await ctx.service.resumeSession();
+    }
+
+    response.error({ status: 404 });
+    await flushMicrotasks();
+    expect(ctx.service.deletedThreadId()).toBeNull();
+    expect(ctx.service.threadStatus()).toBe('active');
+  });
+
+  it('does not overlap metadata reads while an earlier read is pending', async () => {
+    await connected();
+    const response = new Subject<any>();
+    ctx.mockHttp.get.mockImplementation((url: string) => metaUrl.test(url) ? response : activeSessionGet(url));
+    const before = reads();
+    await vi.advanceTimersByTimeAsync(15000);
+    expect(reads()).toBe(before + 1);
+    response.next({ status: 'active', ...pending });
+    response.complete();
+    await flushMicrotasks();
+    expectEnding();
+  });
+
+  it('times out a hung initial metadata read and permits later lifecycle reconciliation', async () => {
+    const stalled = new Subject<any>();
+    let initialMeta = true;
+    ctx.mockHttp.get.mockImplementation((url: string) => {
+      if (metaUrl.test(url) && initialMeta) {
+        initialMeta = false;
+        return stalled;
+      }
+      return metaUrl.test(url)
+        ? activeSessionGet(url).pipe(map(body => ({ ...body, ...meta })))
+        : activeSessionGet(url);
+    });
+    let connectFinished = false;
+    const connection = ctx.service.connect('watched').then(() => { connectFinished = true; });
+    await flushMicrotasks();
+    expect(stalled.observed).toBe(true);
+    await vi.advanceTimersByTimeAsync(14_999);
+    expect(connectFinished).toBe(false);
+    expect(reads()).toBe(1);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(connectFinished).toBe(true);
+    expect(stalled.observed).toBe(false);
+    await connection;
+    fireSseOpen(ctx.sseInstances[0]);
+    await flushMicrotasks();
+    meta = { ...meta, ...pending };
+    await vi.advanceTimersByTimeAsync(5000);
+    expectEnding();
+  });
+
+  it('releases a hung pre-End metadata read before rereading without overlap', async () => {
+    await connected();
+    const stalled = new Subject<any>();
+    ctx.mockHttp.get.mockImplementationOnce(() => stalled);
+    await vi.advanceTimersByTimeAsync(5000);
+    const before = reads();
+    const failure = new Error('End response lost');
+    ctx.mockHttp.delete.mockReturnValue(throwError(() => failure));
+    let endFailure: unknown;
+    const ending = ctx.service.endSession().catch(err => { endFailure = err; });
+    meta = { ...meta, ...pending };
+    await vi.advanceTimersByTimeAsync(14_999);
+    expect(reads()).toBe(before);
+    expect(stalled.observed).toBe(true);
+    expect(endFailure).toBeUndefined();
+    expect(ctx.service.isConnected()).toBe(true);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(stalled.observed).toBe(false);
+    expect(reads()).toBe(before + 1);
+    expect(endFailure).toBe(failure);
+    await ending;
+    expectEnding();
+    meta = { status: 'ended', ended_at: '2026-09-27T10:00:00Z' };
+    await vi.advanceTimersByTimeAsync(5000);
+    expect(ctx.service.threadStatus()).toBe('ended');
+    expect(ctx.sseInstances[0].close).not.toHaveBeenCalled();
+  });
+
+  it.each(['pending', 'ended'])('preserves End failure after a timed-out reread and later discovers %s', async outcome => {
+    await connected();
+    const stalled = new Subject<any>();
+    ctx.mockHttp.get.mockImplementationOnce(() => stalled);
+    const failure = new Error('End response lost');
+    ctx.mockHttp.delete.mockReturnValue(throwError(() => failure));
+    let endFailure: unknown;
+    const ending = ctx.service.endSession().catch(err => { endFailure = err; });
+    await flushMicrotasks();
+    const before = reads();
+    await vi.advanceTimersByTimeAsync(14_999);
+    expect(reads()).toBe(before);
+    expect(stalled.observed).toBe(true);
+    expect(endFailure).toBeUndefined();
+    await vi.advanceTimersByTimeAsync(1);
+    expect(stalled.observed).toBe(false);
+    expect(endFailure).toBe(failure);
+    await ending;
+    expect(ctx.service.threadStatus()).toBe('active');
+    expect(ctx.service.isConnected()).toBe(true);
+    expect(ctx.wsInstances[0].close).not.toHaveBeenCalled();
+    meta = outcome === 'pending'
+      ? { ...meta, ...pending }
+      : { status: 'ended', ended_at: '2026-09-27T10:00:00Z' };
+    await vi.advanceTimersByTimeAsync(5000);
+    expect(reads()).toBe(before + 1);
+    expect(ctx.service.threadStatus()).toBe(outcome === 'pending' ? 'ending' : 'ended');
+    expect(ctx.service.isConnected()).toBe(false);
+    expect(ctx.sseInstances[0].close).not.toHaveBeenCalled();
+  });
+
+  it.each(['navigate', 'disconnect', 'destroy'])('ignores pending reads and stops reconciliation on %s', async action => {
+    await connected();
+    const response = new Subject<any>();
+    ctx.mockHttp.get.mockImplementation((url: string) => url.endsWith('/threads/watched') ? response : activeSessionGet(url));
+    const beforePoll = reads();
+    await vi.advanceTimersByTimeAsync(5000);
+    expect(reads()).toBe(beforePoll + 1);
+    if (action === 'navigate') await ctx.service.connect('other');
+    if (action === 'disconnect') ctx.service.disconnect();
+    if (action === 'destroy') TestBed.resetTestingModule();
+    const before = reads();
+    response.next({ status: 'active', ...pending });
+    response.complete();
+    await vi.advanceTimersByTimeAsync(15000);
+    expect(ctx.service.threadStatus()).not.toBe('ending');
+    expect(reads()).toBe(before);
+  });
+
+  it('ignores an old retirement read after same-thread Resume', async () => {
+    await connected();
+    const response = new Subject<any>();
+    ctx.mockHttp.get.mockImplementation((url: string) => metaUrl.test(url) ? response : activeSessionGet(url));
+    const beforePoll = reads();
+    await vi.advanceTimersByTimeAsync(5000);
+    expect(reads()).toBe(beforePoll + 1);
+    fireSseMessage(ctx.sseInstances[0], { method: 'session.ended', params: { session_runtime_generation: SESSION_RUNTIME_GENERATION } }, '1:1');
+    ctx.mockHttp.get.mockImplementation(activeSessionGet);
+    await ctx.service.resumeSession();
+    fireSseOpen(ctx.sseInstances.at(-1)!);
+    response.next({ status: 'active', ...pending });
+    response.complete();
+    await flushMicrotasks();
+    expect(ctx.service.threadStatus()).toBe('active');
+    expect(ctx.service.isConnected()).toBe(true);
+  });
+
+  it.each(['pending', 'ended', 'uncommitted', 'unreadable'])('rereads ambiguous pinned End (%s), retaining the original failure', async outcome => {
+    await connected();
+    const failure = { status: 503, error: { detail: 'End result lost' } };
+    ctx.mockHttp.delete.mockImplementation(() => {
+      if (outcome === 'pending') meta = { ...meta, ...pending };
+      if (outcome === 'ended') meta = { status: 'ended', ended_at: '2026-09-27T10:00:00Z' };
+      if (outcome === 'unreadable') ctx.mockHttp.get.mockReturnValue(throwError(() => new Error('read failed')));
+      return throwError(() => failure);
+    });
+    const before = reads();
+    await expect(ctx.service.endSession()).rejects.toBe(failure);
+    expect(reads()).toBe(before + 1);
+    if (outcome === 'pending') expectEnding();
+    else if (outcome === 'ended') expect(ctx.service.threadStatus()).toBe('ended');
+    else {
+      expect(ctx.service.threadStatus()).toBe('active');
+      expect(ctx.service.isConnected()).toBe(true);
+      expect(ctx.wsInstances[0].close).not.toHaveBeenCalled();
+    }
+    expect(ctx.sseInstances[0].close).not.toHaveBeenCalled();
+  });
+
+  it('rereads after a pre-End metadata request without overlapping it', async () => {
+    await connected();
+    const response = new Subject<any>();
+    ctx.mockHttp.get.mockImplementationOnce(() => response);
+    await vi.advanceTimersByTimeAsync(5000);
+    meta = { ...meta, ...pending };
+    const failure = new Error('lost response');
+    ctx.mockHttp.delete.mockReturnValue(throwError(() => failure));
+    const before = reads();
+    const ending = ctx.service.endSession().catch(err => err);
+    await flushMicrotasks();
+    expect(reads()).toBe(before);
+    response.next({ status: 'active', execution_lane: 'pinned' });
+    response.complete();
+    expect(await ending).toBe(failure);
+    expect(reads()).toBe(before + 1);
+    expectEnding();
+  });
+
+  it('discards stale End failure reconciliation after navigation', async () => {
+    await connected();
+    const deletion = new Subject<any>();
+    ctx.mockHttp.delete.mockReturnValue(deletion);
+    const ending = ctx.service.endSession().catch(err => err);
+    await ctx.service.connect('other');
+    const before = reads();
+    const failure = new Error('old end failed');
+    deletion.error(failure);
+    expect(await ending).toBe(failure);
+    expect(reads()).toBe(before);
+    expect(ctx.service.threadId()).toBe('other');
+    expect(ctx.service.threadStatus()).toBe('active');
+  });
+
+  it('component discards late IDE-ready after terminal End without restoring workspace readiness', async () => {
+    await connected();
+    const ide = new Subject<any>();
+    const host: any = {
+      chat: ctx.service, api: { getThreadIdeStatus: () => ide },
+      ideStatus: signal(null), idePollingAttempts: 0, stopIdePolling: vi.fn(),
+    };
+    (PersistentChatComponent.prototype as any).fetchIdeStatus.call(host, 'watched');
+    ctx.mockHttp.delete.mockReturnValue(of({ status: 'ending', retirement_disposition: 'ended' }));
+    await ctx.service.endSession();
+    ide.next({ status: 'active', workspace_lifecycle: { state: 'ready' } });
+    expectEnding();
+    expect(host.ideStatus()).toBeNull();
+  });
+
+  it.each(['navigate', 'resume'])('component discards old IDE-ready after %s', async action => {
+    await connected();
+    const ide = new Subject<any>();
+    const host: any = {
+      chat: ctx.service, api: { getThreadIdeStatus: () => ide },
+      ideStatus: signal(null), idePollingAttempts: 0, stopIdePolling: vi.fn(),
+    };
+    (PersistentChatComponent.prototype as any).fetchIdeStatus.call(host, 'watched');
+    if (action === 'navigate') await ctx.service.connect('other');
+    else {
+      fireSseMessage(ctx.sseInstances[0], { method: 'session.ended', params: { session_runtime_generation: SESSION_RUNTIME_GENERATION } }, '1:1');
+      await ctx.service.resumeSession();
+    }
+    ctx.service.workspaceLifecycle.set({ state: 'waking' });
+    ide.next({ status: 'active', workspace_lifecycle: { state: 'ready' } });
+    expect(host.ideStatus()).toBeNull();
+    expect(ctx.service.workspaceLifecycle()).toEqual({ state: 'waking' });
+  });
+
+  it('reconciles stateless pending End through the existing review SSE', async () => {
+    ctx.mockHttp.get.mockImplementation((url: string) => activeSessionGet(url).pipe(map(body => ({
+      ...body, ...(metaUrl.test(url) ? meta : {}),
+      execution_lane: 'stateless', control_socket: 'none',
+    }))));
+    await connected();
+    expect(ctx.wsInstances).toHaveLength(0);
+    meta = { ...meta, ...pending };
+    await vi.advanceTimersByTimeAsync(5000);
+    expect(ctx.service.threadStatus()).toBe('ending');
+    expect(ctx.service.workspaceLifecycle()).toBeNull();
+    expect(ctx.service.endRetryAvailable()).toBe(true);
+    expect(ctx.service.isConnected()).toBe(false);
+    meta = { status: 'ended', ended_at: '2026-09-27T10:00:00Z' };
+    await vi.advanceTimersByTimeAsync(5000);
+    expect(ctx.service.threadStatus()).toBe('ended');
+    expect(ctx.sseInstances[0].close).not.toHaveBeenCalled();
+  });
+
+  it('does not repeat protected review requests on every metadata tick', async () => {
+    meta = { ...meta, metadata: { protected_cloud: true } };
+    ctx.mockApi.getThreadCloudDiffOutcome = vi.fn().mockReturnValue(of({ kind: 'ok', data: {
+      thread_id: 'watched', epoch: 1, staged_at: null, protected_mount: '/mnt/project',
+      counts: { added: 2, modified: 0, deleted: 0 }, files: [],
+    } }));
+    await connected();
+    const otherReads = () => ctx.mockHttp.get.mock.calls.filter((call: any[]) => !metaUrl.test(call[0])).length;
+    const before = otherReads();
+    const beforeReview = ctx.mockApi.getThreadCloudDiffOutcome.mock.calls.length;
+    const beforeMeta = reads();
+    await vi.advanceTimersByTimeAsync(15000);
+    expect(reads()).toBe(beforeMeta + 3);
+    expect(otherReads()).toBe(before);
+    expect(ctx.mockApi.getThreadCloudDiffOutcome).toHaveBeenCalledTimes(beforeReview);
+    expect(ctx.service.cloudChangesCount()).toBe(2);
+  });
+
+  it('preserves live model and turn metadata during lifecycle reconciliation', async () => {
+    await connected();
+    ctx.service.modelName.set('resolved-live-model');
+    ctx.service.turnCount.set(12);
+    await vi.advanceTimersByTimeAsync(5000);
+    expect(ctx.service.modelName()).toBe('resolved-live-model');
+    expect(ctx.service.turnCount()).toBe(12);
+  });
+
+  it('keeps the snapshot-resolved model when a full recovery read pins none', async () => {
+    // A session on its default model has no llm.model in its override; only
+    // the session-state snapshot names it. An SSE-reconnect hydration used to
+    // reset it to null, and the live settings pane then showed bare "Default".
+    await connected();
+    ctx.service.modelName.set('resolved-live-model');
+    meta = { ...meta, metadata: { config_override: { workspace: { backend: 'virtual' } } } };
+    await (ctx.service as any).loadThreadMeta('watched', undefined, { fresh: true });
+    expect(ctx.service.modelName()).toBe('resolved-live-model');
+  });
+
+  it('replaces typed workspace creation with null when a newer metadata read omits it', async () => {
+    meta = {...meta, workspace_creation: {
+      stage: 'scheduling', state: 'waiting_capacity', reason_code: 'scheduler_unschedulable',
+      readiness_deadline_at: null,
+    }};
+    await connected();
+    expect(ctx.service.workspaceCreation()?.state).toBe('waiting_capacity');
+    meta = {execution_lane: 'pinned'};
+    await vi.advanceTimersByTimeAsync(5000);
+    expect(ctx.service.workspaceCreation()).toBeNull();
+  });
+
+  it('does not restore the old workspace creation from a late read after navigation', async () => {
+    await connected();
+    const late = new Subject<any>();
+    ctx.mockHttp.get.mockImplementation((url: string) =>
+      metaUrl.test(url) ? late : activeSessionGet(url),
+    );
+    await vi.advanceTimersByTimeAsync(5000);
+    ctx.mockHttp.get.mockImplementation(activeSessionGet);
+    await ctx.service.connect('other');
+    expect(ctx.service.workspaceCreation()).toBeNull();
+    late.next({status: 'active', workspace_creation: {
+      stage: 'readiness', state: 'attention', reason_code: 'invalid_image',
+      readiness_deadline_at: null,
+    }});
+    late.complete();
+    await flushMicrotasks();
+    expect(ctx.service.workspaceCreation()).toBeNull();
+  });
+
+  it('still hydrates full metadata when recovery meets an in-flight lifecycle read', async () => {
+    await connected();
+    const response = new Subject<any>();
+    ctx.mockHttp.get.mockImplementationOnce(() => response);
+    await vi.advanceTimersByTimeAsync(5000);
+    meta = { ...meta, title: 'Updated title', metadata: { config_override: { llm: { model: 'new-model' } } } };
+    const recovery = (ctx.service as any).loadThreadMeta('watched');
+    response.next({ status: 'active', execution_lane: 'pinned' });
+    response.complete();
+    await recovery;
+    expect(ctx.service.sessionTitle()).toBe('Updated title');
+    expect(ctx.service.modelName()).toBe('new-model');
+  });
+
+  it('keeps real idle and suspended retirement lifecycle visible', async () => {
+    await connected();
+    meta = { ...meta, workspace_lifecycle: { state: 'waking' } };
+    await vi.advanceTimersByTimeAsync(5000);
+    expect(ctx.service.workspaceLifecycle()).toEqual({ state: 'waking' });
+    meta = { ...meta, runtime_retirement_pending: true, retirement_disposition: 'suspended', workspace_lifecycle: { state: 'suspended' } };
+    await vi.advanceTimersByTimeAsync(5000);
+    expect(ctx.service.workspaceLifecycle()).toEqual({ state: 'suspended' });
+    expect(ctx.service.retirementDisposition()).toBe('suspended');
   });
 });

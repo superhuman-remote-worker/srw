@@ -852,6 +852,68 @@ async def test_terminal_foreground_row_sends_the_child_status_not_the_thread_sta
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("thread_status", "child_status", "recovery_kind", "sent_status"),
+    [
+        ("ended", "completed", "terminal_foreground", "completed"),
+        ("active", "running", None, "interrupted"),
+    ],
+)
+async def test_session_orphan_counters_survive_the_roster_payload_shape(
+    tmp_path, thread_status, child_status, recovery_kind, sent_status
+):
+    """A session ledger lists the orchestrator's ROSTER PAYLOAD, not database
+    rows: ``subagent_thread_payload`` publishes the counters as ``turns`` and
+    ``tokens``. Recovery read ``total_turns``/``total_tokens`` and sent zeros,
+    which the orchestrator refuses for an ended child ("terminal session child
+    retry changed its turns") and writes over a live child's real counters.
+
+    The row is built by the production projection so the test cannot drift
+    from the wire shape."""
+
+    from orchestrator.services.subagent_projection import subagent_thread_payload
+
+    ctx, _ = make_parent(tmp_path)
+    ledger = StrictLedger()
+    child = "eeeeeeee-1111-4222-8333-555555555555"
+    row = subagent_thread_payload(
+        {
+            "id": child,
+            "parent_job_id": None,
+            "parent_thread_id": "parent-job",
+            "runtime_generation": "aaaaaaaa-1111-4222-8333-555555555555",
+            "subagent_handle": "reader-307f",
+            "subagent_type": "reader",
+            "status": thread_status,
+            "subagent_status": child_status,
+            "subagent_outcome": child_status if recovery_kind else None,
+            "subagent_error": None,
+            "total_turns": 8,
+            "total_tokens": 61474,
+            "report_path": ".subagents/reader-307f/report.md",
+            "parent_tool_call_id": "counted-call",
+            "metadata": {"subagent": {"run_in_background": False}},
+            "recovery_kind": recovery_kind,
+        }
+    )
+    assert "total_turns" not in row and "total_tokens" not in row
+    ledger.live = [row]
+    ledger.messages.append((child, AIMessage(content="durable finding"), 8))
+    runtime = runtime_for(
+        ctx, factory=lambda *_: pytest.fail("provider ran"), ledger=ledger
+    )
+    runtime.host.delivery_channel = "event"
+
+    recovered = await runtime.recover_orphans()
+
+    assert recovered[0]["status"] == sent_status
+    _, fields = ledger.foreground_terminal_calls[0]
+    assert fields["status"] == sent_status
+    assert fields["turns"] == 8
+    assert fields["tokens"] == 61474
+
+
+@pytest.mark.asyncio
 async def test_quiesce_adopts_inflight_durable_create_and_settles_without_provider(
     tmp_path,
 ):

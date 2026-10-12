@@ -16,6 +16,10 @@ spec:
       {{- include "srw.componentSelectorLabels" (dict "context" . "component" "vm-controller") | nindent 6 }}
   template:
     metadata:
+      {{- if (get (.Values.vm.resourceAdmission | default dict) "observerEnabled" | default false) }}
+      annotations:
+        checksum/vm-resource-policy: {{ include "srw.vmResourceInventoryConfig" . | sha256sum | quote }}
+      {{- end }}
       labels:
         {{- include "srw.componentSelectorLabels" (dict "context" . "component" "vm-controller") | nindent 8 }}
     spec:
@@ -29,6 +33,10 @@ spec:
           image: "{{ .Values.vmController.image.repository }}:{{ .Values.vmController.image.tag }}"
           imagePullPolicy: {{ .Values.vmController.image.pullPolicy }}
           env:
+            {{- if (get (.Values.vm.resourceAdmission | default dict) "observerEnabled" | default false) }}
+            - name: VM_RESOURCE_ADMISSION_CONFIG
+              value: {{ include "srw.vmResourceInventoryConfig" . | quote }}
+            {{- end }}
             - name: TRANSPORT
               value: "http"
             - name: LISTEN_PORT
@@ -40,7 +48,11 @@ spec:
             - name: VM_NAMESPACE
               value: {{ include "srw.vmControllerNamespace" . | quote }}
             - name: DEFAULT_VM_IMAGE
-              value: {{ .Values.vmController.defaultVmImage | default (printf "ghcr.io/superhuman-remote-worker/srw-agent-vm-base:v%s" .Chart.AppVersion) | quote }}
+              value: {{ include "srw.defaultVmImage" . | quote }}
+            - name: VM_NETWORK_PROFILE_ENABLED
+              value: {{ .Values.vmController.networkProfile.enabled | default false | quote }}
+            - name: VM_NETWORK_PROFILE_IMAGE_ALLOWLIST
+              value: {{ join "," (.Values.vmController.networkProfile.imageAllowlist | default list) | quote }}
             - name: DEFAULT_CPU
               value: {{ .Values.vmController.defaultCpu | quote }}
             - name: DEFAULT_MEMORY

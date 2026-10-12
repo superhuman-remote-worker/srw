@@ -177,6 +177,8 @@ def _make_mock_db(due_row: dict | None) -> MagicMock:
     # state before the fire (see TestArchivedProjectSkipsTheFire). None reads
     # as "no such project", which is not archived.
     db.get_project = AsyncMock(return_value=None)
+    # No project_workspace_defaults row: the installation decides the tier.
+    db.fetchrow = AsyncMock(return_value=None)
     return db
 
 
@@ -619,3 +621,32 @@ class TestArchivedProjectSkipsTheFire:
 
         db.create_job.assert_awaited_once()
         db.advance_automation_after_fire.assert_awaited_once()
+
+
+class TestWorkspaceSelectionRace:
+    """Slice A2b: a Project activation racing the fire is transient, not a
+    refusal — the tick rolls back and the row is re-claimed on the next pass."""
+
+    @pytest.mark.asyncio
+    async def test_a_selection_race_is_not_recorded_as_a_refusal(
+        self, monkeypatch
+    ) -> None:
+        from orchestrator.services.manifest_workspace_selection import (
+            WorkspaceSelectionRace,
+        )
+
+        monkeypatch.setattr(
+            "orchestrator.services.manifest_workspace_selection."
+            "select_project_workspace_default",
+            AsyncMock(side_effect=WorkspaceSelectionRace()),
+        )
+        db = _make_mock_db(due_row=_make_row(next_run_at=datetime.now(timezone.utc)))
+        db.refuse_automation_fire = AsyncMock()
+
+        with pytest.raises(WorkspaceSelectionRace):
+            await _process_one_due_automation(db)
+
+        db.refuse_automation_fire.assert_not_awaited()
+        db.skip_automation_fire.assert_not_awaited()
+        db.advance_automation_after_fire.assert_not_awaited()
+        db.create_job.assert_not_awaited()

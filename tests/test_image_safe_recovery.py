@@ -121,9 +121,6 @@ def config():
         message_count_threshold=5,
         message_count_min_tokens=200,
         keep_recent_messages=3,
-        keep_recent_tool_results=2,
-        max_tool_result_length=100,
-        placeholder_text="[cleared]",
     )
 
 

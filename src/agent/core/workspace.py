@@ -380,6 +380,20 @@ class WorkspaceManager:
         # Forge/auth metadata per cloned repo, keyed like _source_repos
         self._source_repo_meta: dict[str, dict] = {}
 
+        # Why a repository connector was left uncloned, keyed by clone name
+        # (the README says so instead of "cloned")
+        self.source_repo_skipped: dict[str, str] = {}
+
+        # The forge metadata (tokens) of repositories a live add is cloning,
+        # redacted from tool output until their checkouts are registered
+        # (agent.connectors.checkout.PENDING_META). Replaced whole, never
+        # mutated: a reader holds one tuple or the other.
+        self.source_repo_pending_meta: tuple[dict, ...] = ()
+        # The tokens of repositories detached live, whose checkouts stay on
+        # the workspace: redacted for the rest of the session
+        # (agent.connectors.checkout.DETACHED_META). Replaced whole.
+        self.source_repo_detached_meta: tuple[dict, ...] = ()
+
     @property
     def backend(self) -> "WorkspaceBackend":
         """Get the workspace backend."""

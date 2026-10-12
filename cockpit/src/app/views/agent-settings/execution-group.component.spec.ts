@@ -12,7 +12,10 @@ import {User} from '../../core/models/api.model';
  * constructor's effect() needs) with a mocked UserService signal, so
  * canUseVm() resolves against controllable state.
  */
-function createWith(user: Partial<User> | null = {is_admin: true}) {
+function createWith(
+  user: Partial<User> | null = {is_admin: true},
+  translations: Record<string, string> = {},
+) {
   const currentUser = signal<User | null>(
     user
       ? ({
@@ -37,8 +40,11 @@ function createWith(user: Partial<User> | null = {is_admin: true}) {
     logout: vi.fn(),
   };
 
+  // Echoes the key back by default (most tests read raw keys), but a caller
+  // may supply real strings for the handful of keys it asserts rendered text
+  // against — see the workspace-default-hint suite below.
   const mockTransloco = {
-    translate: (key: string) => key,
+    translate: (key: string) => translations[key] ?? key,
     langChanges$: of('en'),
     getActiveLang: () => 'en',
   };
@@ -237,5 +243,22 @@ describe('ExecutionGroupComponent workspace backend', () => {
     c.onWorkspaceBackendChange('virtual');
     c.resetAll();
     expect(c.workspaceBackend()).toBeNull();
+  });
+});
+
+describe('ExecutionGroupComponent without its workspace row (Slice A3)', () => {
+  it('emits no backend when the picker owns the workspace', () => {
+    const {component} = createWith({is_admin: true});
+    Object.defineProperty(component, 'showWorkspaceBackend', {value: () => false});
+    component.workspaceBackend.set('vm');
+    expect(component.getOverrides()['workspace']).toBeUndefined();
+  });
+
+  it('does not snap an ineligible user off a vm default it is not showing', () => {
+    const {component} = createWith({is_admin: false, can_use_vm: false});
+    Object.defineProperty(component, 'showWorkspaceBackend', {value: () => false});
+    Object.defineProperty(component, 'config', {value: () => ({workspace: {backend: 'vm'}})});
+    TestBed.tick();
+    expect(component.workspaceBackend()).toBeNull();
   });
 });

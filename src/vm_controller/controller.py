@@ -63,20 +63,44 @@ from vm_controller.lifecycle_auth import (
     unsigned_payload,
     verify_payload,
 )
+from shared.vm_disk_size import quantity_bytes as _quantity_bytes, resolved_disk_size
+from shared.logging_format import RedactingTextLogFormatter
 
 _log_level = os.environ.get("LOG_LEVEL", "INFO").upper()
+_log_handler = logging.StreamHandler()
+_log_handler.setFormatter(
+    RedactingTextLogFormatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+)
 if _log_level == "DEBUG" and not os.environ.get("DEBUG_ALL"):
     logging.basicConfig(
         level=logging.INFO,
-        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        handlers=[_log_handler],
     )
     logging.getLogger("vm-controller").setLevel(logging.DEBUG)
 else:
     logging.basicConfig(
         level=_log_level,
-        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        handlers=[_log_handler],
     )
 log = logging.getLogger("vm-controller")
+
+# Lock contention must not consume the controller's short creation claim.
+CREATION_LOCK_WAIT_SECONDS = 1.0
+
+
+class _CreationLockBusy(Exception):
+    pass
+
+
+async def _acquire_creation_lock(lock: asyncio.Lock, wait_timeout: float | None):
+    if wait_timeout is None:
+        await lock.acquire()
+        return
+    try:
+        await asyncio.wait_for(lock.acquire(), timeout=wait_timeout)
+    except TimeoutError as exc:
+        raise _CreationLockBusy from exc
+
 
 # Configuration from environment
 NATS_URL = os.environ.get("NATS_URL", "nats://nats-leaf.nats.svc.cluster.local:4222")
@@ -124,27 +148,6 @@ VM_GOLDEN_IMAGE_ENABLED = os.environ.get(
 # VM_DISK_SIZE) is never smaller than its source.
 VM_GOLDEN_DISK_SIZE = os.environ.get("VM_GOLDEN_DISK_SIZE", "").strip() or VM_DISK_SIZE
 
-_K8S_QUANTITY_RE = re.compile(r"^(\d+)(Ki|Mi|Gi|Ti|K|M|G|T)?$")
-_QUANTITY_MULT = {
-    None: 1,
-    "K": 10**3,
-    "M": 10**6,
-    "G": 10**9,
-    "T": 10**12,
-    "Ki": 2**10,
-    "Mi": 2**20,
-    "Gi": 2**30,
-    "Ti": 2**40,
-}
-
-
-def _quantity_bytes(value: object) -> int | None:
-    """Parse a Kubernetes storage quantity (``120Gi``) into bytes; None if malformed."""
-    m = _K8S_QUANTITY_RE.match(str(value).strip()) if value is not None else None
-    if not m:
-        return None
-    return int(m.group(1)) * _QUANTITY_MULT[m.group(2)]
-
 
 def effective_disk_size(job_config: Mapping[str, object]) -> str:
     """Per-job rootdisk size: ``job_config["disk_size"]`` when it is a valid
@@ -154,23 +157,20 @@ def effective_disk_size(job_config: Mapping[str, object]) -> str:
     ``VM_GOLDEN_DISK_SIZE`` above).
     """
     requested = job_config.get("disk_size")
-    if requested in (None, ""):
-        return VM_DISK_SIZE
-    req_bytes = _quantity_bytes(requested)
-    default_bytes = _quantity_bytes(VM_DISK_SIZE)
-    if req_bytes is None:
+    effective = resolved_disk_size(requested, VM_DISK_SIZE)
+    if requested not in (None, "") and _quantity_bytes(requested) is None:
         log.warning(
             "disk_size %r is not a k8s quantity; using %s", requested, VM_DISK_SIZE
         )
-        return VM_DISK_SIZE
-    if default_bytes is not None and req_bytes < default_bytes:
+    elif requested not in (None, "") and _quantity_bytes(requested) < _quantity_bytes(
+        VM_DISK_SIZE
+    ):
         log.warning(
             "disk_size %s is below the controller default %s; using the default",
             requested,
             VM_DISK_SIZE,
         )
-        return VM_DISK_SIZE
-    return str(requested).strip()
+    return effective
 
 
 # Bounded wait for a golden import/clone to reach Succeeded (mirrors the agent's
@@ -272,6 +272,7 @@ _CLEANUP_ANNOTATIONS = {
     "successor_pvc_uid": "srw.io/cleanup-successor-pvc-uid",
 }
 _CLEANUP_OUTCOMES = {
+    "controller_creation_rootdisk_delete": "deleted",
     "controller_rootdisk_delete": "deleted",
     "controller_failed_dv_recreate": "recreated",
     "controller_rootdisk_adopt": "adopted",
@@ -538,10 +539,99 @@ def _safe_uid(value: object) -> str | None:
     return value
 
 
+def _initial_ready_parent_preflight(
+    parent: object, *, job_id: str, generation: str, vm_uid: str, pvc_uid: str
+) -> Mapping | None:
+    """Bind a Ready stop to one signed False-keep parent and stored witness."""
+    from shared.vm_cancel_retention import valid_ready_retention_preflight
+
+    if not isinstance(parent, Mapping):
+        return None
+    preflight = parent.get("retention_preflight")
+    authority = preflight.get("frozen") if isinstance(preflight, Mapping) else None
+    expected_intent = {
+        "owner_id": job_id,
+        "owner_kind": "job",
+        "provision_generation": generation,
+        "purge_disk": False,
+        "pvc_uid": pvc_uid,
+        "resource": "vm_workspace",
+        "source": "job_terminal_vm_release",
+        "vm_uid": vm_uid,
+    }
+    try:
+        admission_id = parent.get("admission_id")
+        if str(UUID(admission_id)) != admission_id:
+            return None
+    except (TypeError, ValueError, AttributeError):
+        return None
+    if (
+        not valid_ready_retention_preflight(preflight, authority)
+        or preflight.get("kind") != "vm_job_initial_ready_preflight_v1"
+        or not isinstance(parent.get("intent"), Mapping)
+        or dict(parent["intent"]) != expected_intent
+        or authority["job_id"] != job_id
+        or authority["provision_generation"] != generation
+        or authority["namespace"] != VM_NAMESPACE
+        or authority["vm_uid"] != vm_uid
+        or authority["pvc_uid"] != pvc_uid
+        or authority["cleanup_request_id"] != parent.get("request_id")
+        or authority["cleanup_intent_digest"] != parent.get("intent_digest")
+    ):
+        return None
+    return preflight
+
+
+def _held_stop_cluster_matches(controller, authority: object) -> bool:
+    """Never accept a signed authority for a different Controller inventory."""
+    from shared.vm_cancel_retention import valid_never_app_ready_retention_authority
+
+    collector = getattr(controller, "resource_inventory_collector", None)
+    return (
+        valid_never_app_ready_retention_authority(authority)
+        and authority["namespace"] == VM_NAMESPACE
+        and collector is not None
+        and getattr(collector, "namespace", None) == VM_NAMESPACE
+        and getattr(collector, "cluster_id", None) == authority["cluster_id"]
+    )
+
+
 def _object_value(value: object, key: str, default=None):
     if isinstance(value, Mapping):
         return value.get(key, default)
     return getattr(value, key, default)
+
+
+def _pre_ssh_pod_wire(value: object) -> object:
+    """Use the SDK's actual wire names only at the pre-SSH Pod boundary."""
+
+    if isinstance(value, Mapping):
+        return value
+    from kubernetes.client import ApiClient, V1Pod
+
+    if not isinstance(value, V1Pod):
+        return value
+    wire = ApiClient().sanitize_for_serialization(value)
+    # A serializer double or unknown representation must not supply authority.
+    return wire if type(wire) is dict else None
+
+
+def _pre_ssh_effective_vm_grace(vm: object) -> int | None:
+    """Resolve admitted VM grace only for the pre-SSH terminal observer."""
+
+    spec = vm
+    for key in ("spec", "template", "spec"):
+        if not isinstance(spec, Mapping):
+            return None
+        spec = spec.get(key)
+        if not isinstance(spec, Mapping) or not spec:
+            return None
+    if "terminationGracePeriodSeconds" not in spec:
+        # KubeVirt v1.8.4: API DefaultGracePeriodSeconds and the launcher
+        # renderer's gracePeriodInSeconds use 30 only for an unset field.
+        return 30
+    grace = spec["terminationGracePeriodSeconds"]
+    return grace if type(grace) is int and grace > 0 else None
 
 
 def _metadata(value: object) -> object:
@@ -635,8 +725,25 @@ def _empty_container_state(value: object) -> bool:
     return all(getattr(value, field, None) is None for field in fields)
 
 
-def _exact_terminal_container_evidence(pod: object) -> dict | None:
+def _exact_terminal_container_evidence(
+    pod: object,
+    *,
+    pre_ssh_posttermination_gc: bool = False,
+    vm_template_grace: object = None,
+) -> dict | None:
     """Return current kubelet termination evidence, never ``lastState``."""
+
+    def aware_time(value: object) -> datetime | None:
+        if isinstance(value, datetime):
+            parsed = value
+        elif isinstance(value, str):
+            try:
+                parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            except ValueError:
+                return None
+        else:
+            return None
+        return parsed if parsed.tzinfo is not None else None
 
     pod_status = _object_value(pod, "status", {})
     if _object_value(pod_status, "reason") in {
@@ -649,13 +756,49 @@ def _exact_terminal_container_evidence(pod: object) -> dict | None:
     grace = _metadata_value(pod, "deletionGracePeriodSeconds")
     if grace is None:
         grace = _metadata_value(pod, "deletion_grace_period_seconds")
-    if grace == 0:
+    if pre_ssh_posttermination_gc and grace is None:
         return None
+    if grace is not None and (type(grace) is not int or grace < 0):
+        return None
+    posttermination_gc = grace == 0
+    deleted_at = None
+    if posttermination_gc:
+        if (
+            not pre_ssh_posttermination_gc
+            or type(vm_template_grace) is not int
+            or vm_template_grace <= 0
+        ):
+            return None
+        deleted_at = aware_time(_metadata_value(pod, "deletionTimestamp"))
+        if deleted_at is None:
+            deleted_at = aware_time(_metadata_value(pod, "deletion_timestamp"))
+        if deleted_at is None:
+            return None
     spec = _object_value(pod, "spec", {})
+    if posttermination_gc:
+        pod_spec_grace = _object_value(spec, "terminationGracePeriodSeconds")
+        if pod_spec_grace is None:
+            pod_spec_grace = _object_value(spec, "termination_grace_period_seconds")
+        if type(pod_spec_grace) is not int or pod_spec_grace <= 0:
+            return None
     restart_policy = _object_value(spec, "restartPolicy")
     if restart_policy is None:
         restart_policy = _object_value(spec, "restart_policy")
     if restart_policy != "Never":
+        return None
+    # A terminal Pod phase does not prove that an injected debug container
+    # stopped. This protocol admits only the launcher image's regular/init
+    # containers; ephemeral containers need a separate complete proof.
+    ephemeral = _container_entries(spec, "ephemeralContainers", "ephemeral_containers")
+    ephemeral_statuses = _container_entries(
+        pod_status, "ephemeralContainerStatuses", "ephemeral_container_statuses"
+    )
+    if (
+        ephemeral is None
+        or ephemeral_statuses is None
+        or ephemeral
+        or ephemeral_statuses
+    ):
         return None
     declared: dict[str, list[str]] = {}
     status_groups: dict[str, list[object]] = {}
@@ -715,6 +858,18 @@ def _exact_terminal_container_evidence(pod: object) -> dict | None:
             finished_at = _object_value(terminated, "finishedAt")
             if finished_at is None:
                 finished_at = _object_value(terminated, "finished_at")
+            if posttermination_gc:
+                started_at = _object_value(terminated, "startedAt")
+                if started_at is None:
+                    started_at = _object_value(terminated, "started_at")
+                started = aware_time(started_at)
+                finished = aware_time(finished_at)
+                if (
+                    started is None
+                    or finished is None
+                    or not started <= finished <= deleted_at
+                ):
+                    return None
             reason = _object_value(terminated, "reason")
             if (
                 _safe_uid(container_id) is None
@@ -834,7 +989,9 @@ class VMController:
         return locks[int.from_bytes(digest[:8], "big") % len(locks)]
 
     @asynccontextmanager
-    async def _workspace_lifecycle(self, owner_id: str):
+    async def _workspace_lifecycle(
+        self, owner_id: str, *, wait_timeout: float | None = None
+    ):
         """Serialize one workspace boundary, allowing same-task nesting."""
 
         lock = self._lifecycle_lock_for(str(owner_id))
@@ -849,7 +1006,7 @@ class VMController:
         if owners.get(key) is task:
             yield
             return
-        await lock.acquire()
+        await _acquire_creation_lock(lock, wait_timeout)
         owners[key] = task
         try:
             yield
@@ -928,6 +1085,14 @@ class VMController:
         ).hexdigest()
 
     def _parse_workspace_cleanup_carrier(self, lease: object) -> dict[str, object]:
+        from shared.vm_creation_issuance import CREATION_INTENT_ANNOTATION
+
+        if CREATION_INTENT_ANNOTATION in (
+            _metadata_value(lease, "annotations", {}) or {}
+        ):
+            from vm_controller.creation_actuation import carrier_record
+
+            return carrier_record(lease, secret=LIFECYCLE_HMAC_SECRET)
         metadata = _object_value(lease, "metadata")
         labels = _metadata_value(lease, "labels", {}) or {}
         annotations = _metadata_value(lease, "annotations", {}) or {}
@@ -1132,7 +1297,14 @@ class VMController:
             raise RuntimeError("workspace cleanup carrier identity changed")
         return carrier
 
-    async def _list_workspace_cleanup_carriers(self) -> tuple[dict[str, object], ...]:
+    async def _list_workspace_cleanup_carriers(
+        self, *, sources: frozenset[str] | None = None
+    ) -> tuple[dict[str, object], ...]:
+        from shared.vm_creation_issuance import (
+            CREATION_INTENT_ANNOTATION,
+            CREATION_SIGNATURE_ANNOTATION,
+        )
+
         if self.coordination_api is None:
             raise RuntimeError("workspace cleanup carrier authority is unavailable")
         response = await asyncio.to_thread(
@@ -1153,7 +1325,52 @@ class VMController:
                 or labels.get(WORKSPACE_CLEANUP_CARRIER_LABEL) != "true"
             ):
                 continue
+            annotations = _metadata_value(item, "annotations", {}) or {}
+            if (
+                sources is not None
+                and isinstance(annotations, Mapping)
+                and CREATION_INTENT_ANNOTATION in annotations
+                and "controller_vm_create" not in sources
+            ):
+                # A creation carrier may carry an unrelated unsigned cleanup
+                # source annotation. It cannot join a rootdisk-only pass.
+                continue
+            if CREATION_INTENT_ANNOTATION in annotations and not annotations.get(
+                CREATION_SIGNATURE_ANNOTATION
+            ):
+                # A publication interrupted before UID sealing is not effect
+                # evidence. Its durable DB reservation still excludes cleanup;
+                # only the original authenticated create may finish sealing.
+                continue
+            if CREATION_INTENT_ANNOTATION in annotations:
+                # The typed Lease LIST omits apiVersion/kind on its items. Read
+                # the exact captured object before verifying its full seal;
+                # a same-name replacement must never inherit the list UID.
+                name = _metadata_value(item, "name")
+                namespace = _metadata_value(item, "namespace")
+                uid = _metadata_value(item, "uid")
+                if (
+                    not all(isinstance(value, str) and value for value in (name, uid))
+                    or namespace != VM_NAMESPACE
+                ):
+                    raise RuntimeError("creation carrier list identity is incomplete")
+                current = await asyncio.to_thread(
+                    self.coordination_api.read_namespaced_lease,
+                    name=name,
+                    namespace=VM_NAMESPACE,
+                )
+                if (
+                    _metadata_value(current, "name") != name
+                    or _metadata_value(current, "namespace") != namespace
+                    or _metadata_value(current, "uid") != uid
+                    or CREATION_INTENT_ANNOTATION
+                    not in (_metadata_value(current, "annotations", {}) or {})
+                ):
+                    raise RuntimeError("creation carrier exact identity changed")
+                item = current
             carrier = self._parse_workspace_cleanup_carrier(item)
+            if sources is not None and carrier["source"] not in sources:
+                continue
             if not carrier["carrier_sealed"]:
                 carrier = await self._refresh_workspace_cleanup_carrier(carrier)
             carriers.append(carrier)
@@ -1888,6 +2105,18 @@ class VMController:
 
         manifest = yaml.safe_load(rendered)
         vmi_spec = manifest["spec"]["template"]["spec"]
+        if "network_profile" in job_config:
+            from shared.vm_network_profile import NETWORK_DATA, validate_network_profile
+
+            validate_network_profile(job_config["network_profile"])
+            cloud_volumes = [
+                item["cloudInitNoCloud"]
+                for item in vmi_spec["volumes"]
+                if "cloudInitNoCloud" in item
+            ]
+            if len(cloud_volumes) != 1 or set(cloud_volumes[0]) != {"secretRef"}:
+                raise ValueError("Unsupported VM NoCloud volume")
+            cloud_volumes[0]["networkData"] = NETWORK_DATA
         if VM_NODE_SELECTOR:
             vmi_spec["nodeSelector"] = dict(VM_NODE_SELECTOR)
         if VM_TOLERATIONS:
@@ -1914,6 +2143,56 @@ class VMController:
             rendered_cloud_init, host_key_fingerprint = _inject_ssh_host_key(
                 rendered_cloud_init
             )
+            if "network_profile" in job_config:
+                from pathlib import Path
+                from shared import vm_network_probe_guest
+
+                cloud_document = yaml.safe_load(rendered_cloud_init) or {}
+                if not isinstance(cloud_document, dict):
+                    raise ValueError("Unsupported profile cloud-init document")
+                commands = cloud_document.setdefault("runcmd", [])
+                if not isinstance(commands, list) or any(
+                    not isinstance(command, str)
+                    and not (
+                        isinstance(command, list)
+                        and command
+                        and all(isinstance(arg, str) for arg in command)
+                    )
+                    for command in commands
+                ):
+                    raise ValueError("Unsupported profile cloud-init runcmd")
+                # The pinned guest image already has agent-host and this read
+                # group. Do this before the existing SSH restart so new logins
+                # can hash the regenerated root:systemd-network network rule.
+                commands.insert(
+                    0,
+                    [
+                        "usermod",
+                        "--append",
+                        "--groups",
+                        "systemd-network",
+                        "agent-host",
+                    ],
+                )
+                files = cloud_document.setdefault("write_files", [])
+                if not isinstance(files, list) or any(
+                    not isinstance(item, dict)
+                    or item.get("path")
+                    == "/usr/local/bin/srw-network-profile-qualification"
+                    for item in files
+                ):
+                    raise ValueError("Unsupported profile cloud-init write_files")
+                files.append(
+                    {
+                        "path": "/usr/local/bin/srw-network-profile-qualification",
+                        "permissions": "0755",
+                        "owner": "root:root",
+                        "content": Path(vm_network_probe_guest.__file__).read_text(),
+                    }
+                )
+                rendered_cloud_init = "#cloud-config\n" + yaml.safe_dump(
+                    cloud_document, sort_keys=False
+                )
             # Internal hand-off only; both fields are removed before the VM is
             # sent to KubeVirt. The private key persists only in the Secret.
             manifest["_srwCloudInitUserData"] = rendered_cloud_init
@@ -2133,6 +2412,14 @@ class VMController:
     async def _preparation_loop(self):
         while not self._shutdown.is_set():
             try:
+                # Continue only admitted exact rootdisk deletes. Orphan discovery
+                # remains gated by VM_ROOTDISK_GC_ENABLED.
+                await self._reconcile_workspace_cleanup_carriers(
+                    sources=frozenset({"controller_rootdisk_delete"})
+                )
+            except Exception:
+                log.exception("Workspace cleanup permit reconciliation failed")
+            try:
                 await self._workspace_preparation().reconcile()
             except Exception:
                 log.exception("Workspace preparation reconciliation failed")
@@ -2151,27 +2438,53 @@ class VMController:
 
             binding = storage_binding(binding)
             lifecycle_owner = binding["owner_id"]
-        async with self._workspace_lifecycle(lifecycle_owner):
-            capacity_lock = getattr(self, "_capacity_lock", None)
-            if capacity_lock is None:
-                # A few unit-test fixtures intentionally construct via __new__.
-                capacity_lock = asyncio.Lock()
-                self._capacity_lock = capacity_lock
-            async with capacity_lock:
-                if binding is not None:
-                    if (
-                        not VM_PERSISTENT_ROOTDISK
-                        or LIFECYCLE_HMAC_SECRET is None
-                        or not getattr(self, "cloud_init_text", "")
-                    ):
-                        raise ValueError(
-                            "Retained VM workspaces require persistent disks and authenticated lifecycle hosting."
-                        )
+        wait_timeout = (
+            CREATION_LOCK_WAIT_SECONDS if "creation_retry" in job_config else None
+        )
+        try:
+            async with self._workspace_lifecycle(
+                lifecycle_owner, wait_timeout=wait_timeout
+            ):
+                capacity_lock = getattr(self, "_capacity_lock", None)
+                if capacity_lock is None:
+                    # A few unit-test fixtures intentionally construct via __new__.
+                    capacity_lock = asyncio.Lock()
+                    self._capacity_lock = capacity_lock
+                await _acquire_creation_lock(capacity_lock, wait_timeout)
+                try:
+                    if binding is not None:
+                        if (
+                            not VM_PERSISTENT_ROOTDISK
+                            or LIFECYCLE_HMAC_SECRET is None
+                            or not getattr(self, "cloud_init_text", "")
+                        ):
+                            raise ValueError(
+                                "Retained VM workspaces require persistent disks and authenticated lifecycle hosting."
+                            )
                     return await self._do_create_serialized(job_config)
-                return await self._do_create_serialized(job_config)
+                finally:
+                    capacity_lock.release()
+        except _CreationLockBusy:
+            from vm_controller.creation_actuation import CreationActuator
+
+            # Recheck the signed request against the durable owner before a
+            # busy reply. No admission or new effect is granted here.
+            return await CreationActuator(self).run(job_config, observe_only=True)
 
     async def _do_create_serialized(self, job_config: dict) -> dict:
         """Create while holding the reusable entity-name lifecycle lock."""
+        from shared.vm_resource_policy import configured_enforcement_required
+
+        if "creation_retry" not in job_config and configured_enforcement_required():
+            raise ValueError(
+                "VM resource admission requires durable creation authority"
+            )
+        if "creation_retry" in job_config:
+            from vm_controller.creation_actuation import CreationActuator
+
+            return await CreationActuator(self).run(job_config)
+        if "network_profile" in job_config:
+            raise ValueError("VM network profile requires durable creation authority")
         from kubernetes.client.exceptions import ApiException
 
         job_id = job_config.get("job_id", "unknown")
@@ -2809,6 +3122,136 @@ class VMController:
                         "refusing to delete a superseded rootdisk PVC UID"
                     )
 
+        ready_preflight = (
+            parent_cleanup.get("retention_preflight")
+            if isinstance(parent_cleanup, Mapping)
+            else None
+        )
+        if (
+            isinstance(parent_cleanup, Mapping)
+            and "retention_preflight" in parent_cleanup
+        ):
+            from shared.vm_cancel_retention import valid_retention_preflight
+
+            if not isinstance(ready_preflight, Mapping):
+                raise RuntimeError("retained delete preflight is malformed")
+            if ready_preflight.get("kind") == "vm_cancel_retention_preflight_v1":
+                if not valid_retention_preflight(
+                    ready_preflight, ready_preflight.get("frozen")
+                ):
+                    raise RuntimeError("retained delete preflight is malformed")
+            elif ready_preflight.get("kind") not in {
+                "vm_job_retained_ready_preflight_v1",
+                "vm_job_initial_ready_preflight_v1",
+            }:
+                raise RuntimeError("retained delete preflight is malformed")
+        ready_proof = isinstance(ready_preflight, Mapping) and ready_preflight.get(
+            "kind"
+        ) in {
+            "vm_job_retained_ready_preflight_v1",
+            "vm_job_initial_ready_preflight_v1",
+        }
+        if ready_proof:
+            from shared.vm_cancel_retention import valid_ready_retention_preflight
+
+            frozen = ready_preflight.get("frozen")
+            intent = parent_cleanup.get("intent")
+            expected_intent = {
+                "owner_id": job_id,
+                "owner_kind": "job",
+                "provision_generation": generation,
+                "purge_disk": False,
+                "pvc_uid": expected_rootdisk_pvc_uid,
+                "resource": "vm_workspace",
+                "source": "job_terminal_vm_release",
+                "vm_uid": expected_vm_uid,
+            }
+            if (
+                not valid_ready_retention_preflight(ready_preflight, frozen)
+                or owner_kind != "job"
+                or purge_disk is not False
+                or workspace_storage is not None
+                or generation is None
+                or expected_vm_uid is None
+                or expected_rootdisk_pvc_uid is None
+                or not isinstance(intent, Mapping)
+                or dict(intent) != expected_intent
+                or frozen["job_id"] != job_id
+                or frozen["provision_generation"] != generation
+                or frozen["vm_uid"] != expected_vm_uid
+                or frozen["pvc_uid"] != expected_rootdisk_pvc_uid
+                or frozen["cleanup_request_id"] != parent_cleanup.get("request_id")
+                or frozen["cleanup_intent_digest"]
+                != parent_cleanup.get("intent_digest")
+                or _safe_uid(parent_cleanup.get("admission_id")) is None
+                or (
+                    ready_preflight["kind"] == "vm_job_initial_ready_preflight_v1"
+                    and _initial_ready_parent_preflight(
+                        parent_cleanup,
+                        job_id=job_id,
+                        generation=generation,
+                        vm_uid=expected_vm_uid,
+                        pvc_uid=expected_rootdisk_pvc_uid,
+                    )
+                    != ready_preflight
+                )
+            ):
+                raise RuntimeError("Ready retained delete authority is unproven")
+            if vm_already_absent:
+                final_storage = await self._qualify_cancel_retained_rootdisk(
+                    job_id, expected_rootdisk_pvc_uid
+                )
+                if final_storage.get("dv_uid") != ready_preflight["dv_uid"]:
+                    raise RuntimeError("Ready retained disk identity changed")
+            elif ready_preflight["kind"] == "vm_job_initial_ready_preflight_v1":
+                strategy = _object_value(
+                    _object_value(current_vm, "spec", {}), "runStrategy"
+                )
+                if strategy == "RerunOnFailure":
+                    if (
+                        await self._qualify_ready_retention_preflight(
+                            frozen, vm=current_vm, require_ready=False
+                        )
+                        != ready_preflight
+                    ):
+                        raise RuntimeError("initial Ready runtime or disk changed")
+                elif strategy == "Halted":
+                    storage = await self._qualify_cancel_retained_rootdisk(
+                        job_id,
+                        expected_rootdisk_pvc_uid,
+                        allowed_runtime={"vm_name": vm_name, "vm_uid": admitted_vm_uid},
+                    )
+                    if storage.get("dv_uid") != ready_preflight["dv_uid"]:
+                        raise RuntimeError(
+                            "initial Ready retained disk identity changed"
+                        )
+                else:
+                    raise RuntimeError("initial Ready VM stop is unproven")
+            elif (
+                await self._qualify_ready_retention_preflight(frozen, vm=current_vm)
+                != ready_preflight
+            ):
+                raise RuntimeError("Ready retained runtime or disk changed")
+
+        if (
+            owner_kind == "job"
+            and purge_disk is False
+            and workspace_storage is None
+            and isinstance(parent_cleanup, Mapping)
+            and isinstance(parent_cleanup.get("intent"), Mapping)
+            and parent_cleanup["intent"].get("source") == "job_terminal_vm_release"
+            and not ready_proof
+        ):
+            await self._qualify_cancel_retained_rootdisk(
+                job_id,
+                expected_rootdisk_pvc_uid,
+                allowed_runtime=(
+                    {"vm_name": vm_name, "vm_uid": admitted_vm_uid}
+                    if not vm_already_absent
+                    else None
+                ),
+            )
+
         try:
             if vm_already_absent:
                 raise ApiException(status=404)
@@ -2949,6 +3392,7 @@ class VMController:
         *,
         exact_absence: bool = False,
         workspace_storage: dict | None = None,
+        retained_ready_stop_candidate: Mapping[str, object] | None = None,
     ) -> dict:
         """Query KubeVirt for a VM's current status."""
         from kubernetes.client.exceptions import ApiException
@@ -2959,11 +3403,39 @@ class VMController:
             from shared.vm_workspace_storage import storage_binding, storage_name
 
             workspace_storage = storage_binding(workspace_storage)
-            await self._retained_storage().probe(workspace_storage)
+            # A completed public workspace release intentionally removes the
+            # captured PVC and its attachment lease. Exact-absence status must
+            # inspect that physical absence below; the live-attachment probe
+            # would reject it before the VM/VMI/launcher checks could run.
+            if not exact_absence:
+                await self._retained_storage().probe(workspace_storage)
             rootdisk, rootdisk_owner = (
                 storage_name(workspace_storage),
                 workspace_storage["owner_id"],
             )
+        retained_probe = (
+            {"retained_storage_probe": workspace_storage}
+            if exact_absence and workspace_storage is not None
+            else {}
+        )
+        collector = getattr(self, "resource_inventory_collector", None)
+        cluster_id = getattr(collector, "cluster_id", None)
+        actual_scope = (
+            {
+                "controller_scope": {
+                    "version": 1,
+                    "namespace": VM_NAMESPACE,
+                    "cluster_id": cluster_id,
+                }
+            }
+            if exact_absence
+            and collector is not None
+            and getattr(collector, "namespace", None) == VM_NAMESPACE
+            and isinstance(cluster_id, str)
+            and cluster_id
+            and cluster_id == cluster_id.strip()
+            else {}
+        )
         try:
             vm = await asyncio.to_thread(
                 self.k8s_client.get_namespaced_custom_object,
@@ -2987,11 +3459,65 @@ class VMController:
                 and not await self._retained_storage().unused(workspace_storage)
             ):
                 rootdisk_known = False
+            # VM deletion can precede VMI and virt-launcher termination.  The
+            # exact-absence probe must not promote a VM 404 to compute-stop
+            # evidence while either same-name runtime object remains.
+            vmi_absent = False
+            launcher_absent = False
+            try:
+                await asyncio.to_thread(
+                    self.k8s_client.get_namespaced_custom_object,
+                    group=KUBEVIRT_GROUP,
+                    version=KUBEVIRT_VERSION,
+                    namespace=VM_NAMESPACE,
+                    plural=KUBEVIRT_VMI_PLURAL,
+                    name=vm_name,
+                )
+            except ApiException as vmi_error:
+                if vmi_error.status == 404:
+                    vmi_absent = True
+            if self.core_api is not None:
+                try:
+                    pods = await asyncio.to_thread(
+                        self.core_api.list_namespaced_pod,
+                        namespace=VM_NAMESPACE,
+                        label_selector=f"vm.kubevirt.io/name={vm_name}",
+                    )
+                    items = getattr(pods, "items", None)
+                    launcher_absent = isinstance(items, list) and not items
+                except Exception:
+                    launcher_absent = False
+            retained_rootdisk = None
+            if (
+                workspace_storage is None
+                and rootdisk_known
+                and rootdisk_uid is not None
+                and vmi_absent
+                and launcher_absent
+            ):
+                try:
+                    retained_rootdisk = await self._qualify_cancel_retained_rootdisk(
+                        job_id, rootdisk_uid
+                    )
+                except Exception:
+                    # Signed basic absence remains usable by legacy cleanup;
+                    # new retention cannot settle without the complete witness.
+                    pass
             return {
                 "job_id": job_id,
                 "status": "not_found",
                 "provision_generation": _provision_generation(provision_generation),
                 "rootdisk_identity_known": rootdisk_known,
+                "vmi_absent": vmi_absent,
+                "launcher_absent": launcher_absent,
+                "runtime_absence_known": vmi_absent and launcher_absent,
+                **(
+                    {"retained_rootdisk": retained_rootdisk}
+                    if retained_rootdisk is not None
+                    else {}
+                ),
+                **retained_probe,
+                **actual_scope,
                 **(
                     {"rootdisk_pvc_uid": rootdisk_uid}
                     if rootdisk_uid is not None
@@ -3019,6 +3545,8 @@ class VMController:
             "ready": ready,
             "phase": status.get("printableStatus", "Unknown"),
             "created": status.get("created", False),
+            **retained_probe,
+            **actual_scope,
         }
         if vm_uid is not None:
             result["vm_uid"] = vm_uid
@@ -3040,12 +3568,18 @@ class VMController:
             if exc.status != 404:
                 raise
             vmi_observed = False
+            vmi = None
         else:
             vmi_observed = True
+            vmi_uid = _safe_uid(_metadata_value(vmi, "uid"))
+            if vmi_uid is not None:
+                result["vmi_uid"] = vmi_uid
             vmi_status = vmi.get("status", {})
             result["vmi_phase"] = vmi_status.get("phase")
             interfaces = vmi_status.get("interfaces") or []
             pod_ip = interfaces[0].get("ipAddress") if interfaces else None
+            if interfaces and isinstance(interfaces[0].get("mac"), str):
+                result["interface_mac"] = interfaces[0]["mac"]
             active_pods = vmi_status.get("activePods") or {}
             active_pod_uid = next(iter(active_pods), None)
             if active_pod_uid is None and self.core_api is not None:
@@ -3085,21 +3619,156 @@ class VMController:
             )
         if rootdisk_pvc_uid is not None:
             result["rootdisk_pvc_uid"] = rootdisk_pvc_uid
+        if not exact_absence:
+            result.update(
+                await self._provisioning_status_evidence(
+                    vm=vm,
+                    vmi=vmi,
+                    owner_id=job_id,
+                    owner_kind=entity_type,
+                    generation=generation,
+                    rootdisk_name=rootdisk,
+                    rootdisk_owner_id=rootdisk_owner,
+                    rootdisk_owner_kind=(
+                        workspace_storage["owner_kind"]
+                        if workspace_storage is not None
+                        else entity_type
+                    ),
+                    expected_pvc_uid=rootdisk_pvc_uid,
+                )
+            )
+        # Completed clone retention is independent of guest readiness and of
+        # the adoption carrier's lifetime. Status polling rereads the durable
+        # source intent; failed observation simply retains the source pin.
+        creation_request = (
+            vm.get("metadata", {})
+            .get("annotations", {})
+            .get("srw.io/vm-create-request-id")
+        )
+        creation = None
+        if creation_request and not exact_absence:
+            try:
+                from vm_controller.creation_actuation import CreationActuator
+                from vm_controller.creation_sources import source_manager
+
+                creation = await CreationActuator(self).authority(
+                    "inspect", request_id=creation_request
+                )
+                await source_manager(self, creation).release_completed(creation)
+            except Exception:
+                log.warning(
+                    "completed clone source retention remains pending for VM %s",
+                    vm_name,
+                )
         prepared_annotation = (
             vm.get("metadata", {})
             .get("annotations", {})
             .get("srw.io/prepared-artifact")
         )
         if prepared_annotation and not exact_absence:
-            result["preparation"] = json.loads(prepared_annotation)
-            if rootdisk_pvc_uid is not None:
+            prepared_metadata = json.loads(prepared_annotation)
+            if creation_request:
+                # A protocol VM's receipt must agree with its immutable source;
+                # failed authority reads must not promote raw annotations.
+                prepared_metadata = None
+                if creation is not None:
+                    from vm_controller.creation_preparation import (
+                        observed_preparation_metadata,
+                    )
+
+                    prepared_metadata = observed_preparation_metadata(creation, vm)
+            if prepared_metadata is not None:
+                result["preparation"] = prepared_metadata
+            if rootdisk_pvc_uid is not None and not creation_request:
                 await self._workspace_preparation().observe_workspace(
                     "session" if entity_type == "thread" else "job",
                     job_id,
                     rootdisk=rootdisk,
                     pvc_uid=rootdisk_pvc_uid,
                 )
+        if retained_ready_stop_candidate is not None and workspace_storage is None:
+            proof = await self._qualify_ready_retention_preflight(
+                retained_ready_stop_candidate,
+                vm=vm,
+                vmi=vmi,
+                require_ready=(
+                    not isinstance(retained_ready_stop_candidate, Mapping)
+                    or retained_ready_stop_candidate.get("kind")
+                    != "vm_job_initial_ready_stop_candidate_v1"
+                ),
+            )
+            if (
+                proof is not None
+                and retained_ready_stop_candidate.get("job_id") == job_id
+                and retained_ready_stop_candidate.get("provision_generation")
+                == _provision_generation(provision_generation)
+            ):
+                result["retention_preflight"] = proof
         return result
+
+    async def _provisioning_status_evidence(
+        self,
+        *,
+        vm,
+        vmi,
+        owner_id,
+        owner_kind,
+        generation,
+        rootdisk_name,
+        rootdisk_owner_id,
+        rootdisk_owner_kind,
+        expected_pvc_uid,
+    ) -> dict:
+        """Read bounded phase evidence; an unavailable read is never absence."""
+        from kubernetes.client.exceptions import ApiException
+        from vm_controller.provisioning_observation import (
+            build_provisioning_observation,
+        )
+
+        unknown = {"provisioning_reason": "vm_phase_unproven"}
+        try:
+            # Legacy/malformed identity has no phase authority and needs no new
+            # Kubernetes probes. Do not synthesize a boot clock from VM age.
+            UUID(str(_metadata_value(vm, "uid")))
+            UUID(str(generation))
+            UUID(str(owner_id))
+            if owner_kind not in _OWNER_KINDS or self.core_api is None:
+                return unknown
+            # RetainedStorage currently renders a dataVolume-backed volume too.
+            # Its binding is not evidence that no DV needs observation. A real
+            # direct-PVC volume remains valid when this exact read returns 404.
+            dv = await self._get_dv(rootdisk_name)
+            try:
+                pvc = await asyncio.to_thread(
+                    self.core_api.read_namespaced_persistent_volume_claim,
+                    name=rootdisk_name,
+                    namespace=VM_NAMESPACE,
+                )
+            except ApiException as exc:
+                if exc.status != 404:
+                    raise
+                pvc = None
+            observation = build_provisioning_observation(
+                vm=vm,
+                vmi=vmi,
+                datavolume=dv,
+                pvc=pvc,
+                namespace=VM_NAMESPACE,
+                owner_kind=owner_kind,
+                owner_id=owner_id,
+                generation=generation,
+                rootdisk_name=rootdisk_name,
+                rootdisk_owner_kind=rootdisk_owner_kind,
+                rootdisk_owner_id=rootdisk_owner_id,
+            )
+            if observation["rootdisk_pvc_uid"] != expected_pvc_uid:
+                return unknown
+            return {"provisioning": observation}
+        except Exception:
+            # The signed status remains usable for established consumers; only
+            # phase-based actions are withheld. Never expose API bodies here.
+            log.debug("VM provisioning phase evidence unavailable for %s", owner_id)
+            return unknown
 
     async def _do_observe_workspace_recovery(
         self, captured_identity: Mapping[str, object]
@@ -3393,6 +4062,1039 @@ class VMController:
                 )
         return result
 
+    async def _do_inspect_pre_ssh_stop(
+        self,
+        job_id: str,
+        *,
+        provision_generation: str,
+        expected_vm_uid: str,
+        expected_pvc_uid: str,
+        parent_cleanup: Mapping | None = None,
+        held_stop_authority: Mapping | None = None,
+    ) -> dict | None:
+        """Read one pre-SSH launcher vector without authorizing or stopping it."""
+
+        from kubernetes.client.exceptions import ApiException
+        from shared.vm_pre_ssh_stop import valid_frozen_stop_candidate
+        from shared.vm_cancel_retention import (
+            never_app_ready_retention_authority_matches,
+            valid_retention_preflight,
+        )
+
+        generation = _provision_generation(provision_generation)
+        vm_name = f"agent-vm-{job_id}"
+        if (
+            generation is None
+            or _safe_uid(expected_vm_uid) is None
+            or _safe_uid(expected_pvc_uid) is None
+        ):
+            return None
+        ready_preflight = None
+        held_stop = held_stop_authority is not None
+        if held_stop:
+            if (
+                not _held_stop_cluster_matches(self, held_stop_authority)
+                or not isinstance(parent_cleanup, Mapping)
+                or held_stop_authority["job_id"] != job_id
+                or held_stop_authority["provision_generation"] != generation
+                or held_stop_authority["vm_uid"] != expected_vm_uid
+                or held_stop_authority["pvc_uid"] != expected_pvc_uid
+            ):
+                return None
+        elif parent_cleanup is not None:
+            ready_preflight = _initial_ready_parent_preflight(
+                parent_cleanup,
+                job_id=job_id,
+                generation=generation,
+                vm_uid=expected_vm_uid,
+                pvc_uid=expected_pvc_uid,
+            )
+            if ready_preflight is None:
+                return None
+        async with self._workspace_lifecycle(job_id):
+            try:
+                vm = await asyncio.to_thread(
+                    self.k8s_client.get_namespaced_custom_object,
+                    group=KUBEVIRT_GROUP,
+                    version=KUBEVIRT_VERSION,
+                    namespace=VM_NAMESPACE,
+                    plural=KUBEVIRT_PLURAL,
+                    name=vm_name,
+                )
+                vmi = await asyncio.to_thread(
+                    self.k8s_client.get_namespaced_custom_object,
+                    group=KUBEVIRT_GROUP,
+                    version=KUBEVIRT_VERSION,
+                    namespace=VM_NAMESPACE,
+                    plural=KUBEVIRT_VMI_PLURAL,
+                    name=vm_name,
+                )
+            except ApiException as exc:
+                if exc.status == 404:
+                    return None
+                raise
+            vm_meta = _metadata(vm)
+            labels = _object_value(vm_meta, "labels")
+            annotations = _object_value(vm_meta, "annotations")
+            vm_rv = _object_value(vm_meta, "resourceVersion") or _object_value(
+                vm_meta, "resource_version"
+            )
+            vm_generation = _object_value(vm_meta, "generation")
+            vm_spec = _object_value(vm, "spec", {})
+            vm_status = _object_value(vm, "status", {})
+            vm_conditions = _object_value(vm_status, "conditions", []) or []
+            ready_statuses = [
+                _object_value(condition, "status")
+                for condition in vm_conditions
+                if _object_value(condition, "type") == "Ready"
+            ]
+            if (
+                _admitted_vm_uid(vm, expected_name=vm_name) != expected_vm_uid
+                or _object_value(vm_meta, "deletionTimestamp") is not None
+                or _object_value(vm_meta, "deletion_timestamp") is not None
+                or not isinstance(labels, Mapping)
+                or labels.get("srw.io/owner-kind") != "job"
+                or labels.get("srw.io/owner-id") != job_id
+                or not isinstance(annotations, Mapping)
+                or annotations.get("srw.io/provision-generation") != generation
+                or (
+                    held_stop
+                    and annotations.get("srw.io/vm-create-request-id")
+                    != held_stop_authority["creation_request_id"]
+                )
+                or type(vm_generation) is not int
+                or vm_generation < 1
+                or _object_value(vm_spec, "runStrategy") != "RerunOnFailure"
+                or (
+                    held_stop
+                    and (
+                        len(ready_statuses) != 1
+                        or ready_statuses[0] not in {"True", "False"}
+                    )
+                )
+                or (
+                    ready_preflight is None
+                    and not held_stop
+                    and any(
+                        _object_value(condition, "type") == "Ready"
+                        and _object_value(condition, "status") == "True"
+                        for condition in vm_conditions
+                    )
+                )
+            ):
+                return None
+            vmi_uid = _safe_uid(_metadata_value(vmi, "uid"))
+            vmi_status = _object_value(vmi, "status", {})
+            if (
+                vmi_uid is None
+                or not _owned_by(vmi, kind="VirtualMachine", uid=expected_vm_uid)
+                or _object_value(vmi_status, "phase") != "Running"
+                or _object_value(vmi_status, "migrationState")
+                or _object_value(vmi_status, "migration_state")
+            ):
+                return None
+            pvc_known, pvc = await self._rootdisk_pvc_by_uid(
+                expected_pvc_uid, owner_id=job_id, owner_kind="job"
+            )
+            rootdisk_name = _metadata_value(pvc, "name") if pvc is not None else None
+            if not pvc_known or not isinstance(rootdisk_name, str) or not rootdisk_name:
+                return None
+            dv = await self._get_dv(rootdisk_name)
+            dv_uid = _safe_uid(_metadata_value(dv, "uid")) if dv else None
+            if (
+                dv_uid is None
+                or not _owned_by(pvc, kind="DataVolume", uid=dv_uid)
+                or _storage_volume_name(
+                    _object_value(_object_value(vm_spec, "template", {}), "spec", {}),
+                    rootdisk_name,
+                )
+                is None
+                or _storage_volume_name(_object_value(vmi, "spec", {}), rootdisk_name)
+                is None
+            ):
+                return None
+            pod_list = await asyncio.to_thread(
+                self.core_api.list_namespaced_pod,
+                namespace=VM_NAMESPACE,
+                label_selector=f"vm.kubevirt.io/name={vm_name}",
+            )
+            pods = _object_value(pod_list, "items")
+            if not isinstance(pods, list) or len(pods) != 1:
+                return None
+            pod = _pre_ssh_pod_wire(pods[0])
+            pod_meta = _metadata(pod)
+            pod_spec = _object_value(pod, "spec", {})
+            pod_status = _object_value(pod, "status", {})
+            pod_name = _object_value(pod_meta, "name")
+            pod_uid = _safe_uid(_object_value(pod_meta, "uid"))
+            pod_rv = _object_value(pod_meta, "resourceVersion") or _object_value(
+                pod_meta, "resource_version"
+            )
+            node_name = _object_value(pod_spec, "nodeName") or _object_value(
+                pod_spec, "node_name"
+            )
+            pod_labels = _object_value(pod_meta, "labels")
+            if (
+                pod_uid is None
+                or not _owned_by(pod, kind="VirtualMachineInstance", uid=vmi_uid)
+                or not isinstance(pod_labels, Mapping)
+                or pod_labels.get("vm.kubevirt.io/name") != vm_name
+                or _object_value(pod_meta, "deletionTimestamp") is not None
+                or _object_value(pod_meta, "deletion_timestamp") is not None
+                or _object_value(pod_status, "phase") != "Running"
+                or _object_value(pod_spec, "restartPolicy") != "Never"
+                or _object_value(pod_status, "reason")
+                in {"NodeLost", "ContainerStatusUnknown"}
+                or not isinstance(node_name, str)
+                or not node_name
+                or _storage_volume_name(pod_spec, rootdisk_name) is None
+                or not _container_mounts_volume(
+                    pod_spec, _storage_volume_name(pod_spec, rootdisk_name)
+                )
+            ):
+                return None
+            for key_pair in (
+                ("ephemeralContainers", "ephemeral_containers"),
+                ("ephemeralContainerStatuses", "ephemeral_container_statuses"),
+            ):
+                source = (
+                    pod_spec if key_pair[0] == "ephemeralContainers" else pod_status
+                )
+                group = _container_entries(source, *key_pair)
+                if group is None or group:
+                    return None
+            containers = []
+            names: set[str] = set()
+            for kind, spec_keys, status_keys in (
+                (
+                    "regular",
+                    ("containers", "containers"),
+                    ("containerStatuses", "container_statuses"),
+                ),
+                (
+                    "init",
+                    ("initContainers", "init_containers"),
+                    ("initContainerStatuses", "init_container_statuses"),
+                ),
+            ):
+                declared = _container_entries(pod_spec, *spec_keys)
+                statuses = _container_entries(pod_status, *status_keys)
+                if declared is None or statuses is None:
+                    return None
+                declared_names = [_object_value(item, "name") for item in declared]
+                status_names = [_object_value(item, "name") for item in statuses]
+                if (
+                    len(set(declared_names)) != len(declared_names)
+                    or set(declared_names) != set(status_names)
+                    or len(set(status_names)) != len(status_names)
+                ):
+                    return None
+                for status in statuses:
+                    name = _object_value(status, "name")
+                    container_id = _object_value(
+                        status, "containerID"
+                    ) or _object_value(status, "container_id")
+                    restart_count = _object_value(status, "restartCount")
+                    if restart_count is None:
+                        restart_count = _object_value(status, "restart_count")
+                    state = _object_value(status, "state", {})
+                    if (
+                        not isinstance(name, str)
+                        or not name
+                        or name in names
+                        or _safe_uid(container_id) is None
+                        or type(restart_count) is not int
+                        or restart_count != 0
+                        or not _empty_container_state(
+                            _object_value(status, "lastState")
+                            or _object_value(status, "last_state")
+                        )
+                        or (
+                            _object_value(state, "running") is None
+                            and _object_value(state, "terminated") is None
+                        )
+                    ):
+                        return None
+                    names.add(name)
+                    containers.append(
+                        {"kind": kind, "name": name, "container_id": container_id}
+                    )
+            try:
+                node = await asyncio.to_thread(self.core_api.read_node, name=node_name)
+            except Exception:
+                return None
+            node_uid = _safe_uid(_metadata_value(node, "uid"))
+            node_status = _object_value(node, "status", {})
+            node_conditions = _object_value(node_status, "conditions", []) or []
+            if node_uid is None or not any(
+                _object_value(condition, "type") == "Ready"
+                and _object_value(condition, "status") == "True"
+                for condition in node_conditions
+            ):
+                return None
+            result = {
+                "kind": (
+                    "vm_initial_ready_positive_stop_candidate_v1"
+                    if ready_preflight is not None
+                    else (
+                        "vm_job_never_app_ready_retained_stop_candidate_v1"
+                        if held_stop
+                        else "vm_pre_ssh_stop_candidate_v1"
+                    )
+                ),
+                "job_id": job_id,
+                "provision_generation": generation,
+                "namespace": VM_NAMESPACE,
+                "vm_name": vm_name,
+                "vm_uid": expected_vm_uid,
+                "vmi_uid": vmi_uid,
+                "launcher_name": pod_name,
+                "launcher_uid": pod_uid,
+                "pvc_uid": expected_pvc_uid,
+                "node_name": node_name,
+                "node_uid": node_uid,
+                "vm_resource_version": vm_rv,
+                "vm_generation": vm_generation,
+                "launcher_resource_version": pod_rv,
+                "containers": containers,
+            }
+            if ready_preflight is not None or held_stop:
+                result.update(
+                    cleanup_admission_id=parent_cleanup.get("admission_id"),
+                    cleanup_request_id=parent_cleanup.get("request_id"),
+                    cleanup_intent_digest=parent_cleanup.get("intent_digest"),
+                )
+            if held_stop:
+                result["kube_vm_ready_at_inspection"] = ready_statuses[0] == "True"
+                if not never_app_ready_retention_authority_matches(
+                    held_stop_authority, parent_cleanup, result
+                ):
+                    return None
+            if ready_preflight is not None:
+                if (
+                    not valid_frozen_stop_candidate(result)
+                    or not valid_retention_preflight(ready_preflight, result)
+                    or await self._qualify_ready_retention_preflight(
+                        ready_preflight["frozen"], vm=vm, vmi=vmi, require_ready=False
+                    )
+                    != ready_preflight
+                ):
+                    return None
+            return result if valid_frozen_stop_candidate(result) else None
+
+    async def _do_pre_ssh_stop(
+        self,
+        frozen: Mapping[str, object],
+        digest: str,
+        *,
+        retention_preflight=None,
+        held_stop_authority=None,
+        parent_cleanup=None,
+    ) -> dict:
+        """Stop only the exact retained launcher; ACK alone never proves zero."""
+
+        from kubernetes.client.exceptions import ApiException
+        from shared.vm_pre_ssh_stop import (
+            PRE_SSH_STOP_ANNOTATION,
+            PRE_SSH_STOP_FINALIZER,
+            valid_frozen_stop_candidate,
+            valid_positive_stop_proof,
+        )
+
+        if (
+            not valid_frozen_stop_candidate(frozen)
+            or not isinstance(digest, str)
+            or re.fullmatch(r"sha256:[0-9a-f]{64}", digest) is None
+            or frozen["namespace"] != VM_NAMESPACE
+        ):
+            return {"status": "identity_refused"}
+        job_id = str(frozen["job_id"])
+        initial_ready = frozen["kind"] == "vm_initial_ready_positive_stop_candidate_v1"
+        held_stop = (
+            frozen["kind"] == "vm_job_never_app_ready_retained_stop_candidate_v1"
+        )
+        if (initial_ready or held_stop) and retention_preflight is None:
+            return {"status": "identity_refused"}
+        if held_stop:
+            from shared.vm_cancel_retention import (
+                never_app_ready_retention_authority_matches,
+            )
+
+            if not (
+                _held_stop_cluster_matches(self, held_stop_authority)
+                and never_app_ready_retention_authority_matches(
+                    held_stop_authority, parent_cleanup, frozen
+                )
+            ):
+                return {"status": "identity_refused"}
+        elif held_stop_authority is not None or parent_cleanup is not None:
+            return {"status": "identity_refused"}
+        if retention_preflight is not None:
+            from shared.vm_cancel_retention import valid_retention_preflight
+
+            if not valid_retention_preflight(retention_preflight, frozen):
+                return {"status": "identity_refused"}
+
+        async def qualify_retention():
+            if retention_preflight is None:
+                return True
+            try:
+                observed = await self._qualify_cancel_retained_rootdisk(
+                    job_id, frozen["pvc_uid"], allowed_runtime=frozen
+                )
+                return all(
+                    retention_preflight.get(key) == value
+                    for key, value in observed.items()
+                )
+            except Exception:
+                return False
+
+        async def read_current():
+            vm = await asyncio.to_thread(
+                self.k8s_client.get_namespaced_custom_object,
+                group=KUBEVIRT_GROUP,
+                version=KUBEVIRT_VERSION,
+                namespace=VM_NAMESPACE,
+                plural=KUBEVIRT_PLURAL,
+                name=frozen["vm_name"],
+            )
+            pod = await asyncio.to_thread(
+                self.core_api.read_namespaced_pod,
+                namespace=VM_NAMESPACE,
+                name=frozen["launcher_name"],
+            )
+            pod = _pre_ssh_pod_wire(pod)
+            vm_meta = _metadata(vm)
+            pod_meta = _metadata(pod)
+            vm_labels = _object_value(vm_meta, "labels")
+            vm_annotations = _object_value(vm_meta, "annotations")
+            vm_conditions = (
+                _object_value(_object_value(vm, "status", {}), "conditions", []) or []
+            )
+            vm_strategy = _object_value(_object_value(vm, "spec", {}), "runStrategy")
+            vm_generation = _object_value(vm_meta, "generation")
+            pod_labels = _object_value(pod_meta, "labels")
+            if (
+                _admitted_vm_uid(vm, expected_name=frozen["vm_name"])
+                != frozen["vm_uid"]
+                or not isinstance(vm_labels, Mapping)
+                or vm_labels.get("srw.io/owner-kind") != "job"
+                or vm_labels.get("srw.io/owner-id") != job_id
+                or not isinstance(vm_annotations, Mapping)
+                or vm_annotations.get("srw.io/provision-generation")
+                != frozen["provision_generation"]
+                or (
+                    initial_ready
+                    and vm_annotations.get("srw.io/vm-create-request-id")
+                    != retention_preflight["frozen"]["request_id"]
+                )
+                or (
+                    held_stop
+                    and vm_annotations.get("srw.io/vm-create-request-id")
+                    != held_stop_authority["creation_request_id"]
+                )
+                or type(vm_generation) is not int
+                or vm_generation != frozen["vm_generation"] + (vm_strategy == "Halted")
+                or _object_value(vm_meta, "deletionTimestamp") is not None
+                or _object_value(vm_meta, "deletion_timestamp") is not None
+                or _safe_uid(_object_value(pod_meta, "uid")) != frozen["launcher_uid"]
+                or _object_value(pod_meta, "name") != frozen["launcher_name"]
+                or _object_value(pod_meta, "namespace") != VM_NAMESPACE
+                or not isinstance(pod_labels, Mapping)
+                or pod_labels.get("vm.kubevirt.io/name") != frozen["vm_name"]
+                or not _owned_by(
+                    pod, kind="VirtualMachineInstance", uid=frozen["vmi_uid"]
+                )
+                or (
+                    not (initial_ready or held_stop)
+                    and any(
+                        _object_value(condition, "type") == "Ready"
+                        and _object_value(condition, "status") == "True"
+                        for condition in vm_conditions
+                    )
+                )
+                or (
+                    initial_ready
+                    and vm_strategy != "Halted"
+                    and _object_value(_object_value(vm, "status", {}), "created")
+                    is not True
+                )
+            ):
+                return None
+            pod_spec = _object_value(pod, "spec", {})
+            pod_status = _object_value(pod, "status", {})
+            node_name = _object_value(pod_spec, "nodeName") or _object_value(
+                pod_spec, "node_name"
+            )
+            if (
+                node_name != frozen["node_name"]
+                or _object_value(pod_spec, "restartPolicy") != "Never"
+                or _object_value(pod_status, "reason")
+                in {"NodeLost", "ContainerStatusUnknown"}
+            ):
+                return None
+            for source, keys in (
+                (pod_spec, ("ephemeralContainers", "ephemeral_containers")),
+                (
+                    pod_status,
+                    ("ephemeralContainerStatuses", "ephemeral_container_statuses"),
+                ),
+            ):
+                group = _container_entries(source, *keys)
+                if group is None or group:
+                    return None
+            frozen_containers = {
+                (item["kind"], item["name"]): item["container_id"]
+                for item in frozen["containers"]
+            }
+            current_containers = {}
+            for kind, spec_keys, status_keys in (
+                (
+                    "regular",
+                    ("containers", "containers"),
+                    ("containerStatuses", "container_statuses"),
+                ),
+                (
+                    "init",
+                    ("initContainers", "init_containers"),
+                    ("initContainerStatuses", "init_container_statuses"),
+                ),
+            ):
+                declared = _container_entries(pod_spec, *spec_keys)
+                statuses = _container_entries(pod_status, *status_keys)
+                if declared is None or statuses is None:
+                    return None
+                declared_names = [_object_value(item, "name") for item in declared]
+                status_names = [_object_value(item, "name") for item in statuses]
+                if (
+                    len(set(declared_names)) != len(declared_names)
+                    or len(set(status_names)) != len(status_names)
+                    or set(declared_names) != set(status_names)
+                ):
+                    return None
+                for status in statuses:
+                    name = _object_value(status, "name")
+                    cid = _object_value(status, "containerID") or _object_value(
+                        status, "container_id"
+                    )
+                    restart_count = _object_value(status, "restartCount")
+                    if restart_count is None:
+                        restart_count = _object_value(status, "restart_count")
+                    last_state = _object_value(status, "lastState")
+                    if last_state is None:
+                        last_state = _object_value(status, "last_state")
+                    if (
+                        type(restart_count) is not int
+                        or restart_count != 0
+                        or not _empty_container_state(last_state)
+                    ):
+                        return None
+                    current_containers[(kind, name)] = cid
+            if current_containers != frozen_containers:
+                return None
+            pod_list = await asyncio.to_thread(
+                self.core_api.list_namespaced_pod,
+                namespace=VM_NAMESPACE,
+                label_selector=f"vm.kubevirt.io/name={frozen['vm_name']}",
+            )
+            listed = _object_value(pod_list, "items")
+            if (
+                not isinstance(listed, list)
+                or len(listed) != 1
+                or _safe_uid(_metadata_value(listed[0], "uid"))
+                != frozen["launcher_uid"]
+            ):
+                return None
+            node = await asyncio.to_thread(
+                self.core_api.read_node, name=frozen["node_name"]
+            )
+            conditions = (
+                _object_value(_object_value(node, "status", {}), "conditions", []) or []
+            )
+            if _safe_uid(_metadata_value(node, "uid")) != frozen["node_uid"] or not any(
+                _object_value(item, "type") == "Ready"
+                and _object_value(item, "status") == "True"
+                for item in conditions
+            ):
+                return None
+            pvc_known, pvc = await self._rootdisk_pvc_by_uid(
+                frozen["pvc_uid"], owner_id=job_id, owner_kind="job"
+            )
+            rootdisk_name = _metadata_value(pvc, "name") if pvc is not None else None
+            pod_volume = (
+                _storage_volume_name(pod_spec, rootdisk_name)
+                if isinstance(rootdisk_name, str)
+                else None
+            )
+            vm_template = _object_value(
+                _object_value(_object_value(vm, "spec", {}), "template", {}),
+                "spec",
+                {},
+            )
+            if (
+                not pvc_known
+                or not rootdisk_name
+                or pod_volume is None
+                or not _container_mounts_volume(pod_spec, pod_volume)
+                or _storage_volume_name(vm_template, rootdisk_name) is None
+            ):
+                return None
+            try:
+                vmi = await asyncio.to_thread(
+                    self.k8s_client.get_namespaced_custom_object,
+                    group=KUBEVIRT_GROUP,
+                    version=KUBEVIRT_VERSION,
+                    namespace=VM_NAMESPACE,
+                    plural=KUBEVIRT_VMI_PLURAL,
+                    name=frozen["vm_name"],
+                )
+            except ApiException as exc:
+                if exc.status != 404:
+                    raise
+                vmi = None
+            if vmi is not None:
+                vmi_status = _object_value(vmi, "status", {})
+                if (
+                    _safe_uid(_metadata_value(vmi, "uid")) != frozen["vmi_uid"]
+                    or not _owned_by(vmi, kind="VirtualMachine", uid=frozen["vm_uid"])
+                    or _object_value(vmi_status, "migrationState")
+                    or _object_value(vmi_status, "migration_state")
+                    or _storage_volume_name(
+                        _object_value(vmi, "spec", {}), rootdisk_name
+                    )
+                    is None
+                ):
+                    return None
+            return vm, pod, vmi
+
+        async with self._workspace_lifecycle(job_id):
+            try:
+                current = await read_current()
+            except ApiException as exc:
+                if exc.status == 404:
+                    return {"status": "identity_refused"}
+                raise
+            if current is None:
+                return {"status": "identity_refused"}
+            if not await qualify_retention():
+                return {"status": "identity_refused"}
+            vm, pod, vmi = current
+            if (
+                initial_ready
+                and _object_value(_object_value(vm, "spec", {}), "runStrategy")
+                != "Halted"
+            ):
+                if (
+                    vmi is None
+                    or await self._qualify_ready_retention_preflight(
+                        retention_preflight["frozen"],
+                        vm=vm,
+                        vmi=vmi,
+                        require_ready=False,
+                    )
+                    != retention_preflight
+                ):
+                    return {"status": "identity_refused"}
+            vm_spec = _object_value(vm, "spec", {})
+            run_strategy = _object_value(vm_spec, "runStrategy")
+            pod_meta = _metadata(pod)
+            annotations = _object_value(pod_meta, "annotations") or {}
+            finalizers = _object_value(pod_meta, "finalizers") or []
+            if (
+                not isinstance(annotations, Mapping)
+                or not isinstance(finalizers, list)
+                or run_strategy not in {"RerunOnFailure", "Halted"}
+            ):
+                return {"status": "identity_refused"}
+            own_finalizer = PRE_SSH_STOP_FINALIZER in finalizers
+            own_annotation = annotations.get(PRE_SSH_STOP_ANNOTATION)
+            if own_finalizer != (own_annotation == digest):
+                return {"status": "identity_refused"}
+            if own_annotation is not None and own_annotation != digest:
+                return {"status": "identity_refused"}
+            if not own_finalizer:
+                if (
+                    run_strategy != "RerunOnFailure"
+                    or vmi is None
+                    or _object_value(_object_value(vmi, "status", {}), "phase")
+                    != "Running"
+                    or _object_value(pod_meta, "deletionTimestamp") is not None
+                    or _object_value(pod_meta, "deletion_timestamp") is not None
+                ):
+                    return {"status": "identity_refused"}
+                pod_rv = _object_value(pod_meta, "resourceVersion") or _object_value(
+                    pod_meta, "resource_version"
+                )
+                if not isinstance(pod_rv, str) or not pod_rv:
+                    return {"status": "identity_refused"}
+                patch = [
+                    {
+                        "op": "test",
+                        "path": "/metadata/uid",
+                        "value": frozen["launcher_uid"],
+                    },
+                    {
+                        "op": "test",
+                        "path": "/metadata/resourceVersion",
+                        "value": pod_rv,
+                    },
+                ]
+                if _object_value(pod_meta, "annotations") is None:
+                    patch.append(
+                        {
+                            "op": "add",
+                            "path": "/metadata/annotations",
+                            "value": {PRE_SSH_STOP_ANNOTATION: digest},
+                        }
+                    )
+                else:
+                    patch.append(
+                        {
+                            "op": "add",
+                            "path": "/metadata/annotations/srw.io~1vm-pre-ssh-stop-intent-digest",
+                            "value": digest,
+                        }
+                    )
+                if _object_value(pod_meta, "finalizers") is None:
+                    patch.append(
+                        {
+                            "op": "add",
+                            "path": "/metadata/finalizers",
+                            "value": [PRE_SSH_STOP_FINALIZER],
+                        }
+                    )
+                else:
+                    patch.append(
+                        {
+                            "op": "add",
+                            "path": "/metadata/finalizers/-",
+                            "value": PRE_SSH_STOP_FINALIZER,
+                        }
+                    )
+                try:
+                    await asyncio.to_thread(
+                        self.core_api.patch_namespaced_pod,
+                        name=frozen["launcher_name"],
+                        namespace=VM_NAMESPACE,
+                        body=patch,
+                        _content_type="application/json-patch+json",
+                    )
+                except Exception:
+                    # The reply may be lost after the patch landed. Re-read
+                    # the same UID and intent annotation before any VM stop.
+                    pass
+                current = await read_current()
+                if current is None:
+                    return {"status": "identity_refused"}
+                vm, pod, vmi = current
+                pod_meta = _metadata(pod)
+                annotations = _object_value(pod_meta, "annotations") or {}
+                finalizers = _object_value(pod_meta, "finalizers") or []
+                if (
+                    annotations.get(PRE_SSH_STOP_ANNOTATION) != digest
+                    or PRE_SSH_STOP_FINALIZER not in finalizers
+                ):
+                    return {"status": "finalizer_pending"}
+            run_strategy = _object_value(_object_value(vm, "spec", {}), "runStrategy")
+            if run_strategy == "RerunOnFailure":
+                # Recheck storage immediately before Halted, after finalizer CAS.
+                if not await qualify_retention():
+                    return {"status": "identity_refused"}
+                if initial_ready and (
+                    vmi is None
+                    or await self._qualify_ready_retention_preflight(
+                        retention_preflight["frozen"],
+                        vm=vm,
+                        vmi=vmi,
+                        require_ready=False,
+                    )
+                    != retention_preflight
+                ):
+                    return {"status": "identity_refused"}
+                vm_meta = _metadata(vm)
+                vm_rv = _object_value(vm_meta, "resourceVersion") or _object_value(
+                    vm_meta, "resource_version"
+                )
+                if not isinstance(vm_rv, str) or not vm_rv:
+                    return {"status": "identity_refused"}
+                try:
+                    await asyncio.to_thread(
+                        self.k8s_client.patch_namespaced_custom_object,
+                        group=KUBEVIRT_GROUP,
+                        version=KUBEVIRT_VERSION,
+                        namespace=VM_NAMESPACE,
+                        plural=KUBEVIRT_PLURAL,
+                        name=frozen["vm_name"],
+                        body=[
+                            {
+                                "op": "test",
+                                "path": "/metadata/uid",
+                                "value": frozen["vm_uid"],
+                            },
+                            {
+                                "op": "test",
+                                "path": "/metadata/resourceVersion",
+                                "value": vm_rv,
+                            },
+                            {
+                                "op": "test",
+                                "path": "/spec/runStrategy",
+                                "value": "RerunOnFailure",
+                            },
+                            {
+                                "op": "replace",
+                                "path": "/spec/runStrategy",
+                                "value": "Halted",
+                            },
+                        ],
+                        _content_type="application/json-patch+json",
+                    )
+                except Exception:
+                    # A lost reply is settled by exact read, never by an ACK.
+                    pass
+            current = await read_current()
+            if current is None:
+                return {"status": "identity_refused"}
+            vm, pod, vmi = current
+            pod_meta = _metadata(pod)
+            annotations = _object_value(pod_meta, "annotations") or {}
+            finalizers = _object_value(pod_meta, "finalizers") or []
+            if (
+                _object_value(_object_value(vm, "spec", {}), "runStrategy") != "Halted"
+                or annotations.get(PRE_SSH_STOP_ANNOTATION) != digest
+                or PRE_SSH_STOP_FINALIZER not in finalizers
+            ):
+                return {"status": "halt_pending"}
+            terminal = _exact_terminal_container_evidence(
+                pod,
+                pre_ssh_posttermination_gc=True,
+                vm_template_grace=_pre_ssh_effective_vm_grace(vm),
+            )
+            if terminal is None:
+                return {"status": "pending_terminal_proof"}
+            vmi_disposition = "absent" if vmi is None else "terminal"
+            if vmi is not None and _object_value(
+                _object_value(vmi, "status", {}), "phase"
+            ) not in {"Succeeded", "Failed"}:
+                return {"status": "pending_terminal_proof"}
+            proof = {
+                "kind": (
+                    "vm_initial_ready_positive_stop_v1"
+                    if initial_ready
+                    else (
+                        "vm_job_never_app_ready_retained_positive_stop_v1"
+                        if held_stop
+                        else "vm_pre_ssh_positive_stop_v1"
+                    )
+                ),
+                "frozen_digest": digest,
+                "vm_uid": frozen["vm_uid"],
+                "vmi_uid": frozen["vmi_uid"],
+                "launcher_uid": frozen["launcher_uid"],
+                "node_uid": frozen["node_uid"],
+                "vm_run_strategy": "Halted",
+                "vm_generation": _object_value(_metadata(vm), "generation"),
+                "node_ready": True,
+                "vmi_disposition": vmi_disposition,
+                "same_generation_replacement": False,
+                "pod_finalizer": PRE_SSH_STOP_FINALIZER,
+                "pod_intent_digest": digest,
+                "pod_terminal": terminal["pod_terminal"],
+                "containers": terminal["containers"],
+                "controller_authenticated": True,
+            }
+            if not valid_positive_stop_proof(frozen, proof, frozen_digest=digest):
+                return {"status": "identity_refused"}
+            return {"status": "positive_terminal_proof", "terminal_evidence": proof}
+
+    async def _do_release_pre_ssh_stop_finalizer(
+        self,
+        frozen: Mapping[str, object],
+        digest: str,
+        terminal_evidence: Mapping[str, object],
+        *,
+        process_zero_receipt_id: str,
+        retention_preflight: Mapping | None = None,
+        held_stop_authority: Mapping | None = None,
+        parent_cleanup: Mapping | None = None,
+    ) -> dict:
+        """Drop only our retained-Pod finalizer after signed durable-zero authority."""
+
+        from kubernetes.client.exceptions import ApiException
+        from shared.vm_pre_ssh_stop import (
+            PRE_SSH_STOP_ANNOTATION,
+            PRE_SSH_STOP_FINALIZER,
+            valid_positive_stop_proof,
+        )
+
+        try:
+            if str(UUID(process_zero_receipt_id)) != process_zero_receipt_id:
+                return {"status": "identity_refused"}
+        except (ValueError, TypeError, AttributeError):
+            return {"status": "identity_refused"}
+        if (
+            not valid_positive_stop_proof(
+                frozen, terminal_evidence, frozen_digest=digest
+            )
+            or frozen["namespace"] != VM_NAMESPACE
+        ):
+            return {"status": "identity_refused"}
+        initial_ready = frozen["kind"] == "vm_initial_ready_positive_stop_candidate_v1"
+        held_stop = (
+            frozen["kind"] == "vm_job_never_app_ready_retained_stop_candidate_v1"
+        )
+        if initial_ready or held_stop:
+            from shared.vm_cancel_retention import (
+                never_app_ready_retention_authority_matches,
+                valid_retention_preflight,
+            )
+
+            if not valid_retention_preflight(retention_preflight, frozen):
+                return {"status": "identity_refused"}
+            if held_stop and not (
+                _held_stop_cluster_matches(self, held_stop_authority)
+                and never_app_ready_retention_authority_matches(
+                    held_stop_authority, parent_cleanup, frozen
+                )
+            ):
+                return {"status": "identity_refused"}
+        elif held_stop_authority is not None or parent_cleanup is not None:
+            return {"status": "identity_refused"}
+        async with self._workspace_lifecycle(str(frozen["job_id"])):
+            vm = await asyncio.to_thread(
+                self.k8s_client.get_namespaced_custom_object,
+                group=KUBEVIRT_GROUP,
+                version=KUBEVIRT_VERSION,
+                namespace=VM_NAMESPACE,
+                plural=KUBEVIRT_PLURAL,
+                name=frozen["vm_name"],
+            )
+            vm_labels = _metadata_value(vm, "labels")
+            vm_annotations = _metadata_value(vm, "annotations")
+            if (
+                _admitted_vm_uid(vm, expected_name=frozen["vm_name"])
+                != frozen["vm_uid"]
+                or _admitted_provision_generation(vm) != frozen["provision_generation"]
+                or _object_value(_object_value(vm, "spec", {}), "runStrategy")
+                != "Halted"
+                or _object_value(_metadata(vm), "generation")
+                != frozen["vm_generation"] + 1
+                or (
+                    held_stop
+                    and (
+                        not isinstance(vm_labels, Mapping)
+                        or vm_labels.get("srw.io/owner-kind") != "job"
+                        or vm_labels.get("srw.io/owner-id") != frozen["job_id"]
+                        or not isinstance(vm_annotations, Mapping)
+                        or vm_annotations.get("srw.io/vm-create-request-id")
+                        != held_stop_authority["creation_request_id"]
+                    )
+                )
+            ):
+                return {"status": "identity_refused"}
+            if initial_ready or held_stop:
+                try:
+                    storage = await self._qualify_cancel_retained_rootdisk(
+                        frozen["job_id"],
+                        frozen["pvc_uid"],
+                        allowed_runtime=frozen,
+                    )
+                except Exception:
+                    return {"status": "identity_refused"}
+                if any(
+                    retention_preflight.get(key) != value
+                    for key, value in storage.items()
+                ):
+                    return {"status": "identity_refused"}
+            try:
+                pod = await asyncio.to_thread(
+                    self.core_api.read_namespaced_pod,
+                    namespace=VM_NAMESPACE,
+                    name=frozen["launcher_name"],
+                )
+            except ApiException as exc:
+                if exc.status == 404:
+                    return {"status": "finalizer_released"}
+                raise
+            pod = _pre_ssh_pod_wire(pod)
+            meta = _metadata(pod)
+            annotations = _object_value(meta, "annotations") or {}
+            finalizers = _object_value(meta, "finalizers") or []
+            terminal = _exact_terminal_container_evidence(
+                pod,
+                pre_ssh_posttermination_gc=True,
+                vm_template_grace=_pre_ssh_effective_vm_grace(vm),
+            )
+            if (
+                _safe_uid(_object_value(meta, "uid")) != frozen["launcher_uid"]
+                or not _owned_by(
+                    pod, kind="VirtualMachineInstance", uid=frozen["vmi_uid"]
+                )
+                or not isinstance(annotations, Mapping)
+                or annotations.get(PRE_SSH_STOP_ANNOTATION) != digest
+                or not isinstance(finalizers, list)
+                or terminal is None
+                or terminal["containers"] != terminal_evidence["containers"]
+                or terminal["pod_terminal"] != terminal_evidence["pod_terminal"]
+            ):
+                return {"status": "identity_refused"}
+            if PRE_SSH_STOP_FINALIZER not in finalizers:
+                return {"status": "finalizer_released"}
+            if finalizers.count(PRE_SSH_STOP_FINALIZER) != 1:
+                return {"status": "identity_refused"}
+            rv = _object_value(meta, "resourceVersion") or _object_value(
+                meta, "resource_version"
+            )
+            if not isinstance(rv, str) or not rv:
+                return {"status": "identity_refused"}
+            patch = [
+                {
+                    "op": "test",
+                    "path": "/metadata/uid",
+                    "value": frozen["launcher_uid"],
+                },
+                {"op": "test", "path": "/metadata/resourceVersion", "value": rv},
+                {"op": "test", "path": "/metadata/finalizers", "value": finalizers},
+                {
+                    "op": "test",
+                    "path": "/metadata/annotations/srw.io~1vm-pre-ssh-stop-intent-digest",
+                    "value": digest,
+                },
+                {
+                    "op": "remove",
+                    "path": f"/metadata/finalizers/{finalizers.index(PRE_SSH_STOP_FINALIZER)}",
+                },
+            ]
+            try:
+                await asyncio.to_thread(
+                    self.core_api.patch_namespaced_pod,
+                    namespace=VM_NAMESPACE,
+                    name=frozen["launcher_name"],
+                    body=patch,
+                    _content_type="application/json-patch+json",
+                )
+            except Exception:
+                # A lost reply is settled by an exact read, not a second remove.
+                pass
+            try:
+                current = await asyncio.to_thread(
+                    self.core_api.read_namespaced_pod,
+                    namespace=VM_NAMESPACE,
+                    name=frozen["launcher_name"],
+                )
+            except ApiException as exc:
+                if exc.status == 404:
+                    return {"status": "finalizer_released"}
+                raise
+            current_meta = _metadata(current)
+            current_finalizers = _object_value(current_meta, "finalizers") or []
+            if (
+                _safe_uid(_object_value(current_meta, "uid")) != frozen["launcher_uid"]
+                or PRE_SSH_STOP_FINALIZER in current_finalizers
+            ):
+                return {"status": "finalizer_pending"}
+            return {"status": "finalizer_released"}
+
     # =========================================================================
     # Golden-image cloning
     # (knowledge-base/knowledge/features/vm_golden_image_boot_acceleration.md)
@@ -3600,6 +5302,11 @@ class VMController:
         pvc_labels = _metadata_value(pvc, "labels", {}) or {}
         if (
             _metadata_value(pvc, "name") != name
+            or _metadata_value(pvc, "uid") != pvc_uid
+            or (
+                expected_pvc_uid is not None
+                and _metadata_value(pvc, "uid") != expected_pvc_uid
+            )
             or _metadata_value(pvc, "deletionTimestamp") is not None
             or _metadata_value(pvc, "deletion_timestamp") is not None
             or not isinstance(pvc_labels, Mapping)
@@ -3609,6 +5316,211 @@ class VMController:
         ):
             raise RuntimeError("rootdisk PVC ownership is not exact")
         return dv, pvc, dv_uid, pvc_uid
+
+    async def _qualify_cancel_retained_rootdisk(
+        self, job_id: str, expected_pvc_uid: str, *, allowed_runtime=None
+    ) -> dict:
+        """Observe a standalone DV/PVC chain; never detach ownership to make it safe."""
+        from uuid import UUID
+        from vm_controller.creation_disposition_resources import scan_consumers
+
+        try:
+            if any(str(UUID(value)) != value for value in (job_id, expected_pvc_uid)):
+                raise ValueError
+        except (TypeError, ValueError, AttributeError) as exc:
+            raise RuntimeError("retained rootdisk identity is unproven") from exc
+        name = _rootdisk_name(job_id)
+        dv, pvc, dv_uid, pvc_uid = await self._exact_rootdisk_identity(
+            name, owner_kind="job", owner_id=job_id, expected_pvc_uid=expected_pvc_uid
+        )
+        dv_refs = _metadata_value(dv, "ownerReferences")
+        if dv_refs is None:
+            dv_refs = _metadata_value(dv, "owner_references")
+        pvc_refs = _metadata_value(pvc, "ownerReferences")
+        if pvc_refs is None:
+            pvc_refs = _metadata_value(pvc, "owner_references")
+        if (
+            dv_refs not in (None, [])
+            or _metadata_value(dv, "namespace") != VM_NAMESPACE
+            or _metadata_value(pvc, "namespace") != VM_NAMESPACE
+            or not isinstance(pvc_refs, list)
+            or len(pvc_refs) != 1
+        ):
+            raise RuntimeError("retained rootdisk ownership is not standalone")
+        ref = pvc_refs[0]
+        if (
+            _object_value(ref, "kind") != "DataVolume"
+            or _object_value(ref, "uid") != dv_uid
+            or _object_value(ref, "name") != name
+            or (_object_value(ref, "apiVersion") or _object_value(ref, "api_version"))
+            != "cdi.kubevirt.io/v1beta1"
+            or _object_value(ref, "controller") is not True
+        ):
+            raise RuntimeError("retained rootdisk owner reference is unproven")
+        try:
+            if str(UUID(dv_uid)) != dv_uid:
+                raise ValueError
+            await scan_consumers(
+                self,
+                VM_NAMESPACE,
+                f"agent-vm-{job_id}",
+                name,
+                allowed_runtime=allowed_runtime,
+            )
+        except Exception as exc:
+            raise RuntimeError("retained rootdisk consumers are unproven") from exc
+        storage = {
+            "namespace": VM_NAMESPACE,
+            "owner_id": job_id,
+            "pvc_name": name,
+            "pvc_uid": pvc_uid,
+            "dv_uid": dv_uid,
+            "ownership": "standalone_dv",
+            "deleting": False,
+        }
+        if allowed_runtime is not None:
+            return storage
+        return {
+            "version": 1,
+            "kind": "vm_retained_rootdisk_v1",
+            "owner_kind": "job",
+            **storage,
+            "no_consumers": True,
+        }
+
+    async def _qualify_ready_retention_preflight(
+        self,
+        candidate: Mapping[str, object],
+        *,
+        vm=None,
+        vmi=None,
+        require_ready: bool = True,
+    ) -> dict | None:
+        """Read exact Ready runtime and its standalone disk before any stop."""
+        from shared.vm_cancel_retention import (
+            valid_ready_retention_candidate,
+            valid_ready_retention_preflight,
+        )
+
+        if (
+            LIFECYCLE_HMAC_SECRET is None
+            or not valid_ready_retention_candidate(candidate)
+            or candidate["namespace"] != VM_NAMESPACE
+            or (
+                not require_ready
+                and candidate["kind"] != "vm_job_initial_ready_stop_candidate_v1"
+            )
+        ):
+            return None
+        collector = getattr(self, "resource_inventory_collector", None)
+        if (
+            collector is None
+            or getattr(collector, "namespace", None) != VM_NAMESPACE
+            or getattr(collector, "cluster_id", None) != candidate["cluster_id"]
+        ):
+            return None
+        job_id = candidate["job_id"]
+        vm_name = f"agent-vm-{job_id}"
+        try:
+            if vm is None:
+                vm = await asyncio.to_thread(
+                    self.k8s_client.get_namespaced_custom_object,
+                    group=KUBEVIRT_GROUP,
+                    version=KUBEVIRT_VERSION,
+                    namespace=VM_NAMESPACE,
+                    plural=KUBEVIRT_PLURAL,
+                    name=vm_name,
+                )
+            if vmi is None:
+                vmi = await asyncio.to_thread(
+                    self.k8s_client.get_namespaced_custom_object,
+                    group=KUBEVIRT_GROUP,
+                    version=KUBEVIRT_VERSION,
+                    namespace=VM_NAMESPACE,
+                    plural=KUBEVIRT_VMI_PLURAL,
+                    name=vm_name,
+                )
+            vm_status = _object_value(vm, "status", {}) or {}
+            vmi_status = _object_value(vmi, "status", {}) or {}
+            vm_labels = _metadata_value(vm, "labels", {}) or {}
+            vm_annotations = _metadata_value(vm, "annotations", {}) or {}
+            if (
+                _admitted_vm_uid(vm, expected_name=vm_name) != candidate["vm_uid"]
+                or _admitted_provision_generation(vm)
+                != candidate["provision_generation"]
+                or _metadata_value(vmi, "name") != vm_name
+                or _metadata_value(vmi, "uid") != candidate["vmi_uid"]
+                or vm_labels.get("srw.io/owner-kind") != "job"
+                or vm_labels.get("srw.io/owner-id") != job_id
+                or vm_annotations.get("srw.io/vm-create-request-id")
+                != candidate["request_id"]
+                or _object_value(vm_status, "created") is not True
+                or (
+                    require_ready
+                    and not any(
+                        _object_value(c, "type") == "Ready"
+                        and _object_value(c, "status") == "True"
+                        for c in (_object_value(vm_status, "conditions", []) or [])
+                    )
+                )
+                or _object_value(vmi_status, "phase") != "Running"
+            ):
+                return None
+            pods = await asyncio.to_thread(
+                self.core_api.list_namespaced_pod,
+                namespace=VM_NAMESPACE,
+                label_selector=f"vm.kubevirt.io/name={vm_name}",
+            )
+            items = _object_value(pods, "items")
+            if not isinstance(items, list) or len(items) != 1:
+                return None
+            pod = items[0]
+            pod_name = _metadata_value(pod, "name")
+            pod_spec = _object_value(pod, "spec", {}) or {}
+            node_name = _object_value(pod_spec, "nodeName") or _object_value(
+                pod_spec, "node_name"
+            )
+            if (
+                not isinstance(pod_name, str)
+                or not pod_name
+                or _metadata_value(pod, "uid") != candidate["launcher_uid"]
+                or _object_value(_object_value(pod, "status", {}), "phase") != "Running"
+                or not isinstance(node_name, str)
+                or not node_name
+            ):
+                return None
+            node = await asyncio.to_thread(self.core_api.read_node, name=node_name)
+            if _metadata_value(node, "uid") != candidate["node_uid"]:
+                return None
+            runtime = {
+                "vm_name": vm_name,
+                "vm_uid": candidate["vm_uid"],
+                "vmi_uid": candidate["vmi_uid"],
+                "launcher_name": pod_name,
+                "launcher_uid": candidate["launcher_uid"],
+            }
+            storage = await self._qualify_cancel_retained_rootdisk(
+                job_id, candidate["pvc_uid"], allowed_runtime=runtime
+            )
+            proof = {
+                "version": 1,
+                "kind": (
+                    "vm_job_initial_ready_preflight_v1"
+                    if candidate["kind"] == "vm_job_initial_ready_stop_candidate_v1"
+                    else "vm_job_retained_ready_preflight_v1"
+                ),
+                "stop_policy": (
+                    "initial_ready_cancel_v1"
+                    if candidate["kind"] == "vm_job_initial_ready_stop_candidate_v1"
+                    else "retained_ready_continuation_v1"
+                ),
+                "frozen": dict(candidate),
+                **storage,
+                "consumer_scope": "exact_frozen_runtime_only",
+            }
+            return proof if valid_ready_retention_preflight(proof, candidate) else None
+        except Exception:
+            return None
 
     async def _cleanup_carrier_pvc(self, name: str) -> object | None:
         from kubernetes.client.exceptions import ApiException
@@ -3647,6 +5559,7 @@ class VMController:
         carrier: Mapping[str, object],
         *,
         require_failed_dv: bool,
+        before_delete=None,
     ) -> bool:
         """Delete only the carrier's old immutable DV/PVC identities."""
 
@@ -3676,10 +5589,14 @@ class VMController:
             self._validate_cleanup_carrier_pvc(pvc, carrier)
 
         if dv is not None:
+            if before_delete is not None:
+                await before_delete()
             await self._delete_dv(name, expected_uid=str(carrier["old_dv_uid"]))
         if pvc is not None:
             from kubernetes.client.exceptions import ApiException
 
+            if before_delete is not None:
+                await before_delete()
             try:
                 await asyncio.to_thread(
                     self.core_api.delete_namespaced_persistent_volume_claim,
@@ -3711,9 +5628,20 @@ class VMController:
     async def _reconcile_workspace_cleanup_carrier(
         self, carrier: Mapping[str, object]
     ) -> bool:
+        if carrier["source"] == "controller_vm_create":
+            from vm_controller.creation_actuation import reconcile_creation_carrier
+
+            return await reconcile_creation_carrier(self, carrier)
         async with self._workspace_lifecycle(str(carrier["owner_id"])):
             carrier = await self._refresh_workspace_cleanup_carrier(carrier)
             resumed = await self._resume_workspace_cleanup_reservation(carrier)
+            if resumed.get("creation_disposition") is not None:
+                from vm_controller.creation_disposition import CreationDisposer
+
+                # A child recovered independently must use the same consumer
+                # fences as its parent, never the legacy unconditional delete.
+                await CreationDisposer(self).run(resumed["creation_disposition"])
+                return False
             if resumed.get("allowed") is not True:
                 if resumed.get("completed_outcome") == carrier["outcome"]:
                     if carrier["source"] == "controller_failed_dv_recreate":
@@ -3766,8 +5694,10 @@ class VMController:
                 )
             return False
 
-    async def _reconcile_workspace_cleanup_carriers(self) -> None:
-        for carrier in await self._list_workspace_cleanup_carriers():
+    async def _reconcile_workspace_cleanup_carriers(
+        self, *, sources: frozenset[str] | None = None
+    ) -> None:
+        for carrier in await self._list_workspace_cleanup_carriers(sources=sources):
             try:
                 await self._reconcile_workspace_cleanup_carrier(carrier)
             except Exception as exc:
@@ -3955,6 +5885,10 @@ class VMController:
 
     async def _delete_dv(self, name: str, *, expected_uid: str | None = None) -> None:
         """DELETE a CDI DataVolume (its PVC cascades); 404 is success."""
+        if name.startswith("agent-vm-golden-"):
+            from vm_controller.creation_sources import GoldenSources
+
+            return await GoldenSources(self).delete(name, expected_uid=expected_uid)
         from kubernetes.client.exceptions import ApiException
 
         try:
@@ -4976,6 +6910,20 @@ class VMController:
                 data["job_id"],
                 provision_generation=request_generation,
                 exact_absence=data.get("exact_absence") is True,
+                **(
+                    {
+                        "retained_ready_stop_candidate": data[
+                            "retained_ready_stop_candidate"
+                        ]
+                    }
+                    if "retained_ready_stop_candidate" in data
+                    else {}
+                ),
+                **(
+                    {"workspace_storage": data["workspace_storage"]}
+                    if data.get("workspace_storage") is not None
+                    else {}
+                ),
             )
             response = sign_payload(
                 response,
@@ -5020,6 +6968,228 @@ class VMController:
                     operation="status",
                     correlation_id=request_id,
                 )
+
+    async def _dispatch_pre_ssh_stop(self, data: Mapping[str, object]) -> dict:
+        """One signed, Job-only inspect/stop/release operation."""
+
+        action = data.get("action")
+        job_id = data.get("job_id")
+        generation = _provision_generation(data.get("provision_generation"))
+        if not isinstance(job_id, str) or generation is None:
+            return {"status": "identity_refused"}
+        if action == "inspect_never_app_ready_retained":
+            from shared.vm_cancel_retention import (
+                never_app_ready_retention_authority_matches,
+                valid_retention_preflight,
+            )
+
+            authority = data.get("held_stop_authority")
+            parent = data.get("parent_cleanup")
+            if not _held_stop_cluster_matches(self, authority):
+                return {"status": "identity_refused"}
+            candidate = await self._do_inspect_pre_ssh_stop(
+                job_id,
+                provision_generation=generation,
+                expected_vm_uid=data.get("expected_vm_uid"),
+                expected_pvc_uid=data.get("expected_pvc_uid"),
+                parent_cleanup=parent,
+                held_stop_authority=authority,
+            )
+            if not never_app_ready_retention_authority_matches(
+                authority, parent, candidate
+            ):
+                result = {"status": "identity_refused"}
+            else:
+                try:
+                    storage = await self._qualify_cancel_retained_rootdisk(
+                        job_id, candidate["pvc_uid"], allowed_runtime=candidate
+                    )
+                    preflight = {
+                        "version": 1,
+                        "kind": "vm_cancel_retention_preflight_v1",
+                        "stop_policy": "cancel_retention_v1",
+                        "frozen": candidate,
+                        **storage,
+                        "consumer_scope": "exact_frozen_runtime_only",
+                    }
+                    result = (
+                        {
+                            "status": "candidate",
+                            "frozen": candidate,
+                            "retention_preflight": preflight,
+                        }
+                        if valid_retention_preflight(preflight, candidate)
+                        else {"status": "identity_refused"}
+                    )
+                except Exception:
+                    result = {"status": "identity_refused"}
+        elif action == "inspect_initial_ready":
+            from shared.vm_cancel_retention import valid_retention_preflight
+            from shared.vm_pre_ssh_stop import valid_frozen_stop_candidate
+
+            parent = data.get("parent_cleanup")
+            preflight = _initial_ready_parent_preflight(
+                parent,
+                job_id=job_id,
+                generation=generation,
+                vm_uid=data.get("expected_vm_uid"),
+                pvc_uid=data.get("expected_pvc_uid"),
+            )
+            if preflight is None:
+                return {"status": "identity_refused"}
+            candidate = await self._do_inspect_pre_ssh_stop(
+                job_id,
+                provision_generation=generation,
+                expected_vm_uid=data.get("expected_vm_uid"),
+                expected_pvc_uid=data.get("expected_pvc_uid"),
+                parent_cleanup=parent,
+            )
+            if (
+                not valid_frozen_stop_candidate(candidate)
+                or candidate["kind"] != "vm_initial_ready_positive_stop_candidate_v1"
+                or candidate["cleanup_admission_id"] != parent["admission_id"]
+                or not valid_retention_preflight(preflight, candidate)
+            ):
+                result = {"status": "identity_refused"}
+            else:
+                result = {
+                    "status": "candidate",
+                    "frozen": candidate,
+                    "retention_preflight": preflight,
+                }
+        elif action == "inspect":
+            candidate = await self._do_inspect_pre_ssh_stop(
+                job_id,
+                provision_generation=generation,
+                expected_vm_uid=data.get("expected_vm_uid"),
+                expected_pvc_uid=data.get("expected_pvc_uid"),
+            )
+            result = (
+                {"status": "candidate", "frozen": candidate}
+                if candidate is not None
+                else {"status": "identity_refused"}
+            )
+            if candidate is not None:
+                try:
+                    storage = await self._qualify_cancel_retained_rootdisk(
+                        job_id, candidate["pvc_uid"], allowed_runtime=candidate
+                    )
+                    result["retention_preflight"] = {
+                        "version": 1,
+                        "kind": "vm_cancel_retention_preflight_v1",
+                        "stop_policy": "cancel_retention_v1",
+                        "frozen": candidate,
+                        **storage,
+                        "consumer_scope": "exact_frozen_runtime_only",
+                    }
+                except Exception:
+                    # Legacy inspection remains usable. New retention authority
+                    # requires this capability witness before admitting a stop.
+                    pass
+        elif action == "stop":
+            frozen = data.get("frozen")
+            if (
+                not isinstance(frozen, Mapping)
+                or frozen.get("job_id") != job_id
+                or frozen.get("provision_generation") != generation
+            ):
+                return {"status": "identity_refused"}
+            result = await self._do_pre_ssh_stop(
+                frozen,
+                data.get("frozen_digest"),
+                **(
+                    {"retention_preflight": data["retention_preflight"]}
+                    if "retention_preflight" in data
+                    else {}
+                ),
+                **(
+                    {
+                        "held_stop_authority": data.get("held_stop_authority"),
+                        "parent_cleanup": data.get("parent_cleanup"),
+                    }
+                    if frozen.get("kind")
+                    == "vm_job_never_app_ready_retained_stop_candidate_v1"
+                    or "held_stop_authority" in data
+                    or "parent_cleanup" in data
+                    else {}
+                ),
+            )
+        elif action == "release":
+            frozen = data.get("frozen")
+            proof = data.get("terminal_evidence")
+            if (
+                not isinstance(frozen, Mapping)
+                or frozen.get("job_id") != job_id
+                or frozen.get("provision_generation") != generation
+                or not isinstance(proof, Mapping)
+            ):
+                return {"status": "identity_refused"}
+            result = await self._do_release_pre_ssh_stop_finalizer(
+                frozen,
+                data.get("frozen_digest"),
+                proof,
+                process_zero_receipt_id=data.get("process_zero_receipt_id"),
+                **(
+                    {"retention_preflight": data["retention_preflight"]}
+                    if "retention_preflight" in data
+                    else {}
+                ),
+                **(
+                    {
+                        "held_stop_authority": data.get("held_stop_authority"),
+                        "parent_cleanup": data.get("parent_cleanup"),
+                    }
+                    if frozen.get("kind")
+                    == "vm_job_never_app_ready_retained_stop_candidate_v1"
+                    or "held_stop_authority" in data
+                    or "parent_cleanup" in data
+                    else {}
+                ),
+            )
+        else:
+            result = {"status": "identity_refused"}
+        return {"job_id": job_id, "provision_generation": generation, **result}
+
+    async def handle_pre_ssh_stop(self, msg):
+        """NATS request/reply for the same authenticated stop-only protocol."""
+
+        if not msg.reply or LIFECYCLE_HMAC_SECRET is None:
+            return
+        try:
+            signed = json.loads(msg.data.decode())
+            if not isinstance(signed, Mapping):
+                return
+            action = signed.get("action")
+            if action not in {
+                "inspect",
+                "inspect_initial_ready",
+                "inspect_never_app_ready_retained",
+                "stop",
+                "release",
+            } or not await self._verify_lifecycle_request(
+                signed,
+                "pre-ssh-stop",
+                mutating=action
+                not in {
+                    "inspect",
+                    "inspect_initial_ready",
+                    "inspect_never_app_ready_retained",
+                },
+            ):
+                return
+            request_id = _lifecycle_request_id(signed)
+            result = await self._dispatch_pre_ssh_stop(unsigned_payload(signed))
+        except Exception:
+            log.exception("VM pre-SSH stop request refused")
+            return
+        response = sign_payload(
+            result,
+            direction="response",
+            operation="pre-ssh-stop",
+            secret=LIFECYCLE_HMAC_SECRET,
+            correlation_id=request_id,
+        )
+        await self.nc.publish(msg.reply, json.dumps(response).encode())
 
     async def handle_list(self, msg):
         """vm.lifecycle.list → _do_list (request/reply only).
@@ -5067,6 +7237,67 @@ class VMController:
 
     async def http_create(self, request):
         """POST /vms — body is the create payload, returns the result dict."""
+        return await self._http_create(request, operation="create")
+
+    async def http_creation_retry(self, request):
+        """Dedicated protocol route: an older replica returns 404, never creates."""
+        return await self._http_create(
+            request, operation="creation_retry_create", require_creation_retry=True
+        )
+
+    async def http_creation_dispose(self, request):
+        """Authenticated cancellation of an existing immutable create request."""
+        from vm_controller.creation_disposition import http_dispose
+
+        return await http_dispose(self, request)
+
+    async def http_pre_ssh_stop(self, request):
+        """HTTP form of the signed exact stop-only request/reply."""
+
+        from aiohttp import web
+
+        if LIFECYCLE_HMAC_SECRET is None:
+            return web.json_response(
+                {"error": "authentication unavailable"}, status=503
+            )
+        try:
+            signed = await request.json()
+            if not isinstance(signed, Mapping):
+                raise ValueError("malformed request")
+            action = signed.get("action")
+            if action not in {
+                "inspect",
+                "inspect_initial_ready",
+                "inspect_never_app_ready_retained",
+                "stop",
+                "release",
+            } or not await self._verify_lifecycle_request(
+                signed,
+                "pre-ssh-stop",
+                mutating=action
+                not in {
+                    "inspect",
+                    "inspect_initial_ready",
+                    "inspect_never_app_ready_retained",
+                },
+            ):
+                return web.json_response({"error": "authentication failed"}, status=401)
+            request_id = _lifecycle_request_id(signed)
+            result = await self._dispatch_pre_ssh_stop(unsigned_payload(signed))
+            return web.json_response(
+                sign_payload(
+                    result,
+                    direction="response",
+                    operation="pre-ssh-stop",
+                    secret=LIFECYCLE_HMAC_SECRET,
+                    correlation_id=request_id,
+                )
+            )
+        except Exception:
+            log.exception("HTTP pre-SSH stop request failed")
+            return web.json_response({"error": "stop request failed"}, status=503)
+
+    async def _http_create(self, request, *, operation, require_creation_retry=False):
         from aiohttp import web
 
         try:
@@ -5074,15 +7305,30 @@ class VMController:
         except Exception as e:
             return web.json_response({"error": f"invalid json: {e}"}, status=400)
 
-        if not payload.get("job_id"):
+        if not isinstance(payload, Mapping) or not payload.get("job_id"):
             return web.json_response({"error": "job_id required"}, status=400)
         if not isinstance(payload, Mapping) or not await self._verify_lifecycle_request(
-            payload, "create", mutating=True
+            payload, operation, mutating=True
         ):
             return web.json_response({"error": "authentication failed"}, status=401)
         request_id = _lifecycle_request_id(payload)
         payload = unsigned_payload(payload)
         request_generation = _provision_generation(payload.get("provision_generation"))
+
+        if require_creation_retry and "creation_retry" not in payload:
+            return web.json_response(
+                sign_payload(
+                    {
+                        "status": "creation_attention",
+                        "reason": "creation_protocol_unproven",
+                    },
+                    direction="response",
+                    operation=operation,
+                    secret=LIFECYCLE_HMAC_SECRET,
+                    correlation_id=request_id,
+                ),
+                status=400,
+            )
 
         try:
             result = await self._do_create(payload)
@@ -5090,7 +7336,7 @@ class VMController:
                 sign_payload(
                     result,
                     direction="response",
-                    operation="create",
+                    operation=operation,
                     secret=LIFECYCLE_HMAC_SECRET,
                     correlation_id=request_id,
                 ),
@@ -5109,7 +7355,7 @@ class VMController:
                 sign_payload(
                     error_result,
                     direction="response",
-                    operation="create",
+                    operation=operation,
                     secret=LIFECYCLE_HMAC_SECRET,
                     correlation_id=request_id,
                 ),
@@ -5251,6 +7497,15 @@ class VMController:
                     else {}
                 ),
                 **({"exact_absence": True} if exact_absence else {}),
+                **(
+                    {
+                        "retained_ready_stop_candidate": request.query[
+                            "retained_ready_stop_candidate"
+                        ]
+                    }
+                    if "retained_ready_stop_candidate" in request.query
+                    else {}
+                ),
             },
             operation="status",
         )
@@ -5265,6 +7520,15 @@ class VMController:
                 job_id,
                 provision_generation=request_payload.get("provision_generation"),
                 exact_absence=request_payload.get("exact_absence") is True,
+                **(
+                    {
+                        "retained_ready_stop_candidate": json.loads(
+                            request_payload["retained_ready_stop_candidate"]
+                        )
+                    }
+                    if request_payload.get("retained_ready_stop_candidate") is not None
+                    else {}
+                ),
                 **(
                     {
                         "workspace_storage": json.loads(
@@ -5490,6 +7754,43 @@ class VMController:
             status=status,
         )
 
+    async def http_resolve_creation_config(self, request):
+        """Authenticate a read-only effective configuration snapshot, without grants."""
+        from aiohttp import web
+        from vm_controller.creation_configuration import resolve_creation_configuration
+
+        operation = "creation_config_resolve"
+        try:
+            value = await request.json()
+        except (ValueError, TypeError):
+            return web.json_response({"error": "invalid_request"}, status=400)
+        if (
+            LIFECYCLE_HMAC_SECRET is None
+            or not isinstance(value, Mapping)
+            or not await self._verify_lifecycle_request(
+                value, operation, mutating=False
+            )
+        ):
+            return web.json_response({"error": "authentication_failed"}, status=401)
+        try:
+            payload = unsigned_payload(value)
+            if set(payload) != {"request"}:
+                raise ValueError("invalid resolution request")
+            result = resolve_creation_configuration(self, payload["request"])
+            status = 200
+        except (ValueError, TypeError, KeyError, AttributeError):
+            result, status = {"reason": "creation_configuration_unproven"}, 409
+        return web.json_response(
+            sign_payload(
+                result,
+                direction="response",
+                operation=operation,
+                secret=LIFECYCLE_HMAC_SECRET,
+                correlation_id=_lifecycle_request_id(value),
+            ),
+            status=status,
+        )
+
     async def http_health(self, _request):
         """GET /healthz — liveness probe target."""
         from aiohttp import web
@@ -5634,6 +7935,11 @@ class VMController:
 
         app = web.Application()
         app.router.add_post("/vms", self.http_create)
+        app.router.add_post("/vm-creation/create", self.http_creation_retry)
+        app.router.add_post("/vm-creation/dispose", self.http_creation_dispose)
+        app.router.add_post(
+            "/vm-creation/configuration", self.http_resolve_creation_config
+        )
         app.router.add_post("/workspace-disks/release", self.http_release_workspace)
         app.router.add_post("/workspace-disks/detach", self.http_detach_workspace)
         app.router.add_post("/workspace-preparations/{action}", self.http_preparation)
@@ -5644,6 +7950,7 @@ class VMController:
             "/workspace-recovery/pins", self.http_workspace_recovery_pin
         )
         app.router.add_get("/vms", self.http_list)
+        app.router.add_post("/vm-pre-ssh-stop", self.http_pre_ssh_stop)
         app.router.add_delete("/vms/{job_id}", self.http_delete)
         app.router.add_get("/vms/{job_id}", self.http_status)
         app.router.add_get("/healthz", self.http_health)
@@ -5666,6 +7973,25 @@ class VMController:
         self.load_template()
         self.init_k8s()
         await self.headscale.init()
+        from shared.vm_resource_inventory_settings import InventorySettings
+        from vm_controller.resource_inventory_runtime import inventory_observer_context
+
+        async with inventory_observer_context(
+            InventorySettings.from_environment(),
+            base_url=ORCHESTRATOR_URL,
+            secret=LIFECYCLE_HMAC_SECRET,
+            stop=self._shutdown,
+        ) as observer:
+            self.resource_inventory_collector = (
+                observer.collector if observer is not None else None
+            )
+            try:
+                await self._run_transports()
+            finally:
+                self.resource_inventory_collector = None
+
+    async def _run_transports(self):
+        """Serve lifecycle requests within the inventory observer lifetime."""
         preparation_task = asyncio.create_task(self._preparation_loop())
 
         # Pre-warm the default image's golden so the first job doesn't pay the
@@ -5692,6 +8018,9 @@ class VMController:
                 f"vm.lifecycle.get{suffix}", cb=self.handle_status_query
             )
             await self.nc.subscribe(f"vm.lifecycle.list{suffix}", cb=self.handle_list)
+            await self.nc.subscribe(
+                f"vm.lifecycle.pre_ssh_stop{suffix}", cb=self.handle_pre_ssh_stop
+            )
             log.info(
                 "Subscribed to vm.lifecycle.{create,delete,get,list}.%s — waiting for NATS requests",
                 ORCHESTRATOR_ID,

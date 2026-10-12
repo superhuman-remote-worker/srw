@@ -53,6 +53,15 @@ rules:
   - apiGroups: [""]
     resources: ["configmaps"]
     verbs: ["create", "delete", "get", "list", "patch", "update"]
+  {{- if .Values.connectors.inPodPlane.enabled }}
+  # The in-pod plane (connector drivers D7): each sidecar workspace Pod's
+  # credential Secret (an rclone config), created with an ownerReference to
+  # the Pod. Create only: the orchestrator never reads, lists, patches or
+  # deletes a Secret here; garbage collection removes it with its Pod.
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["create"]
+  {{- end }}
   # Session router: per-session Service + Ingress lifecycle managed by
   # SessionRouterService when a thread binds to an agent. See
   # knowledge-base/knowledge/features/direct_session_websockets.md §RBAC changes.
@@ -77,6 +86,42 @@ subjects:
   - kind: ServiceAccount
     name: {{ include "srw.orchestratorServiceAccountName" . }}
     namespace: {{ .Release.Namespace }}
+{{- if and .Values.agent.stateless.enabled .Values.agent.stateless.processZeroFinalizer }}
+{{- /* Cluster-scoped: carry the namespace so two same-named releases in
+     different namespaces do not collide (vm-preflight does the same). */ -}}
+{{- $nodeObserver := printf "%s-%s-orchestrator-node-observer" (include "srw.fullname" .) .Release.Namespace | trunc 63 | trimSuffix "-" }}
+---
+# Read-only Node access for the stateless executor retention sweep: an
+# executor retained by its process-zero finalizer on a Node that is gone (404)
+# or tainted node.kubernetes.io/out-of-service never gets terminal container
+# statuses from a kubelet, so the Node is the only evidence left. Exact `get`
+# by name only; no list/watch.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ $nodeObserver }}
+  labels:
+    {{- include "srw.componentLabels" (dict "context" . "component" "orchestrator") | nindent 4 }}
+rules:
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ $nodeObserver }}
+  labels:
+    {{- include "srw.componentLabels" (dict "context" . "component" "orchestrator") | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ $nodeObserver }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "srw.orchestratorServiceAccountName" . }}
+    namespace: {{ .Release.Namespace }}
+{{- end }}
 {{- range $namespace := (.Values.agent.pinnedLegacyNamespaces | default list | uniq) }}
 {{- if ne $namespace $.Release.Namespace }}
 ---

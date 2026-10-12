@@ -9,44 +9,85 @@ Connect with: websocat ws://localhost:8001/ws/chat
 
 import asyncio
 import hashlib
-import hmac
-import inspect
 import json
 import logging
 import contextlib
 import os
 import socket
-import re
 import time
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass, field
 from datetime import datetime
-from pathlib import Path
 from typing import (
     Any,
     Awaitable,
     Callable,
     Dict,
     List,
-    NoReturn,
     Optional,
+    Sequence,
     Set,
     Tuple,
 )
-from uuid import UUID, uuid4
+from uuid import uuid4
 
 import httpx
-from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, Request, WebSocket
 from fastapi.responses import JSONResponse
 
 from agent.api import session_transport as _session_transport
-from agent.api._session_auth import validate_session_token as _validate_session_token
+from agent.api._session_auth import SessionAuthBindings
+from agent.api.session_canvas_control import CanvasControlChannel
+from agent.api.session_termination import (
+    SessionTerminationCoordinator,
+    SessionTerminationPorts,
+)
+from agent.api.native_workspace_first_use import (
+    configured_public_keys,
+    register_native_first_use_route,
+)
+from agent.api import session_workspace as _session_workspace
+from agent.api.session_attach import (
+    SessionAttachCoordinator,
+    SessionAttachPorts,
+)
+from agent.api.session_contract import (
+    EventJournalUnavailable,
+    SessionOperations,
+    SessionRuntimeView,
+    TerminationAdmissionClosed,
+    WorkspaceNotReady as WorkspaceNotReady,
+    canonical_session_identity_fingerprint,
+)
+from agent.api.session_identity import (
+    SessionIdentityPorts,
+    SessionIdentityRuntime,
+    canonical_runtime_generation,
+    environment_pod_uid,
+)
+from agent.api.session_input import (
+    InputWaitPlan,
+    SessionInputPorts,
+    SessionInputRuntime,
+)
+from agent.api.session_http import (
+    SessionHttpPorts,
+    register_session_http_routes,
+    stateless_rejection,
+)
+from agent.api.session_websocket import (
+    SessionConnectionPorts,
+    SessionSocketCommands,
+    SessionSocketPorts,
+    SessionWelcomePorts,
+    register_session_websocket_routes,
+)
 from agent.api.models import PinnedSessionRecipient, pinned_session_recipient_matches
 from agent.api.orchestrator_client import (
     DuplicateThreadBinding,
     OrchestratorClient,
     SessionEnded,
-    SessionGrantDenied,
+    SessionGrantDenied as SessionGrantDenied,
     ThreadConfigUpdateDenied,
     create_orchestrator_client_from_env,
 )
@@ -57,9 +98,13 @@ from agent.api.persistent_session import (
     resolve_memory_extraction_prompt,
 )
 from agent.tools.registry import TOOL_REGISTRY
-from agent.core.archiver import inflight_tool_call
-from agent.core.context import extract_summary_text, repair_tool_pairing
-from shared.runtime.core.message_markers import turn_membership
+from agent.core.archiver import inflight_tool_calls
+from agent.core.context import (
+    extract_summary_text,
+    repair_tool_pairing,
+    repair_tool_result_adjacency,
+)
+from shared.runtime.core.message_markers import is_compaction_view, turn_membership
 from shared.runtime.core.skill_resolution import (
     APP_GUIDE_LOADER_TOOL,
     app_guide_health_snapshot,
@@ -76,23 +121,21 @@ from agent.services.workspace_undo import (
 )
 from agent.api.lease_context import LeaseLostError
 from agent.api.lease_context import current_lease as _current_lease_var
+from agent.api.pinned_write_fence import PROCESS_PINNED_WRITE_FENCE
 from shared import event_journal as _event_journal
-from shared.pinned_session_identity import (
-    PINNED_SESSION_READY_IDENTITY_CONTRACT,
-    pinned_session_ready_identity_fingerprint,
-)
+from shared.pinned_session_identity import PINNED_SESSION_READY_IDENTITY_CONTRACT
 from shared.thread_presence import (
     expire_permission_if_untethered,
     mark_stateless_natural_pause,
 )
 from shared.session_retirement import update_stateless_claim_status
-from shared.runtime_actor import RuntimeActorContext
 from agent.agent import UniversalAgent
 
 # Re-exported: tests/test_persistent_app.py and tests/test_session_wake_event_role.py
 # import the thread_messages serialiser from here (lifted to src/core in U3 WP1
 # so the subagent runtime shares it).
 from agent.core.thread_messages import (  # noqa: F401
+    ANTHROPIC_CONTENT_KEY,
     _ROLE_MAP,
     _extract_thinking,
     _persist_one_message,
@@ -118,341 +161,49 @@ _started_at: Optional[datetime] = None
 
 # Session layer (created/destroyed per thread assignment):
 _session: Optional[PersistentSession] = None
-_thread_id: Optional[str] = None
-_pinned_status_identity_enabled = False
-_pinned_runtime_generation_enabled = False
-_session_runtime_generation: Optional[str] = None
-_session_runtime_attach_token: Optional[str] = None
+# The bound thread, the durable runtime generation and attach token, the
+# advertised contracts, the per-attach input generation and the local attach
+# generation live in one owner, ``_session_identity`` (composed below).
 # Process-local mirror of the orchestrator's exact ``ending`` authority. It is
 # scoped to the complete attached runtime identity, not the process: pool/dual
 # agents may safely serve a successor after exact cleanup clears this tuple.
-_retirement_admission_identity: Optional[tuple[str, Optional[str], Optional[str]]] = (
-    None
-)
-_retirement_admission_disposition: Optional[str] = None
-_retirement_admission_token: Optional[str] = None
-_retirement_admission_permanent: Optional[bool] = None
+
+
 # An exact drain-suspend can outlive local teardown when the settlement
 # response is lost. Keep that process nonclaimable and retry the same immutable
 # identity from a tracked task independent of normal heartbeat authority;
 # never downgrade it to a broad End.
-_pending_drain_suspend: Optional[dict[str, Any]] = None
-_pending_drain_suspend_retry_task: Optional[asyncio.Task[None]] = None
-
-# Pool-mode attach admission is deliberately split from the heavy attach
-# transaction.  The orchestrator holds its datasource-selection advisory lock
-# while POSTing /session/attach.  A synchronous attach polls the workspace
-# endpoint, which takes that same lock, so the two processes deadlock.  Claim
-# the empty process synchronously, return ``attaching``, then let the fully
-# exception-safe attach transaction run after the orchestrator has released
-# its lock.  The claim is process-local and set before the 200 response: a
-# second POST can never slip into the setup window.
-_pool_attach_lock = asyncio.Lock()
-_pool_attach_claim: Optional[str] = None
-_pool_attach_runtime_generation: Optional[str] = None
-_pool_attach_token: Optional[str] = None
-_pool_attach_task: Optional[asyncio.Task[None]] = None
-# Exact proof retained between exception-safe attach rollback and the
-# orchestrator's generation-rotating release CAS. Never infer it from a
-# swallowed cleanup error or from an absent session after globals were reset.
-_failed_attach_release_receipt: Optional[dict[str, Any]] = None
-# Mutable only while one exact delivered attach is constructing. It records
-# the one-way setup boundary plus the attested workspace coordinates needed to
-# prove a partial sandbox runtime writer-free even when PersistentSession was
-# not constructed yet. Never log this mapping: it contains transport paths.
-_failed_attach_workspace_cleanup_context: Optional[dict[str, Any]] = None
 
 
-def _retain_failed_attach_release_receipt(receipt: dict[str, Any]) -> bool:
-    """Install one immutable attach-abort proof without replacing a claimant.
-
-    Dual mode can prove that actor binding failed before its one-way setup latch
-    flipped; the normal attach rollback installs a stronger process-zero proof.
-    In both cases a delayed failure from G1 must never replace G2's retained
-    proof, so equality is benign/idempotent and every other incumbent wins.
-    """
-
-    global _failed_attach_release_receipt
-
-    if not isinstance(receipt, dict):
-        return False
-    incumbent = _failed_attach_release_receipt
-    if incumbent is not None:
-        return incumbent == receipt
-    _failed_attach_release_receipt = dict(receipt)
-    return True
-
-
-def _pool_heartbeat_status() -> str:
-    """Advertise a synchronous pool claim before ``_session`` exists."""
-
-    return (
-        "ready"
-        if _session is None
-        and _pool_attach_claim is None
-        and _pending_drain_suspend is None
-        and _failed_attach_release_receipt is None
-        else "session"
+# The attached session's identity: bound thread, durable runtime generation and
+# attach token, advertised contracts, per-attach input generation and local
+# attach generation. One owner per process; every other owner reads it through
+# ``snapshot()``/``fingerprint()`` at call time.
+_session_identity = SessionIdentityRuntime(
+    SessionIdentityPorts(
+        agent_id=lambda: _registered_pinned_agent_id(),
+        pod_uid=environment_pod_uid,
+        lease=lambda: _current_lease_var.get(),
+        stateless_mode=lambda: _stateless_mode(),
+        orchestrator_client=lambda: _orchestrator_client,
+        identity_replaced=lambda: _session_termination.reset_retirement_admission_mirror(),
+        # Pinned transcript writes are fenced on the adopted life (P2).
+        write_fence=PROCESS_PINNED_WRITE_FENCE,
     )
-
-
-def _pinned_status_identity_advertised(payload: Any) -> bool:
-    """Accept only the exact numeric v1 additive lifecycle capability."""
-
-    return bool(
-        isinstance(payload, dict)
-        and type(payload.get("pinned_status_identity_contract")) is int
-        and payload["pinned_status_identity_contract"] == 1
-    )
-
-
-def _pinned_runtime_generation_advertised(payload: Any) -> bool:
-    """Accept only the exact numeric v1 runtime-generation capability."""
-
-    return bool(
-        isinstance(payload, dict)
-        and type(payload.get("pinned_runtime_generation_contract")) is int
-        and payload["pinned_runtime_generation_contract"] == 1
-    )
-
-
-def _canonical_runtime_generation(value: Any) -> str | None:
-    if not isinstance(value, str) or not value.strip():
-        return None
-    try:
-        return str(UUID(value.strip()))
-    except (TypeError, ValueError):
-        return None
-
-
-_ATTACH_WORKSPACE_IDENTITY_UNSET = object()
-
-
-def _canonical_attach_workspace_identity(
-    workspace_generation: Any,
-    workspace_runtime_incarnation: Any,
-) -> Optional[Tuple[Optional[str], Optional[str]]]:
-    """Canonicalize an explicitly delivered workspace-authority pair.
-
-    ``None`` as the return value means the caller omitted the contract (the
-    dedicated startup path). ``(None, None)`` means the claim bundle captured
-    no physical identity yet; shared attach may still poll a workspace whose
-    session-runtime generation is authoritative. Keeping those states distinct
-    prevents a compatibility default from weakening a delivered exact pair.
-    """
-
-    generation_omitted = workspace_generation is _ATTACH_WORKSPACE_IDENTITY_UNSET
-    incarnation_omitted = (
-        workspace_runtime_incarnation is _ATTACH_WORKSPACE_IDENTITY_UNSET
-    )
-    if generation_omitted or incarnation_omitted:
-        if generation_omitted and incarnation_omitted:
-            return None
-        raise WorkspaceNotReady(
-            "Attach workspace identity must be delivered as an exact pair"
-        )
-    if workspace_generation is None and workspace_runtime_incarnation is None:
-        return (None, None)
-
-    canonical_generation = _canonical_runtime_generation(workspace_generation)
-    canonical_incarnation = _canonical_runtime_generation(workspace_runtime_incarnation)
-    if canonical_generation is None or canonical_incarnation is None:
-        raise WorkspaceNotReady("Attach workspace identity is malformed or incomplete")
-    return canonical_generation, canonical_incarnation
-
-
-def _assert_attach_workspace_tier(
-    expected: Optional[Tuple[Optional[str], Optional[str]]],
-    *,
-    is_lite_session: bool,
-) -> None:
-    """Reject an exact physical claim for a resolved no-workspace tier."""
-
-    if expected is None or expected == (None, None):
-        return
-    if is_lite_session:
-        raise WorkspaceNotReady(
-            "Attach workspace identity does not match the resolved workspace tier"
-        )
-
-
-def _assert_attach_workspace_payload(
-    expected: Optional[Tuple[Optional[str], Optional[str]]],
-    payload: Any,
-) -> None:
-    """Fence an observed workspace response to the delivered claim identity."""
-
-    if expected is None or expected == (None, None):
-        return
-    raw_generation = (
-        payload.get("workspace_generation") if isinstance(payload, dict) else None
-    )
-    raw_incarnation = (
-        payload.get("workspace_runtime_incarnation")
-        if isinstance(payload, dict)
-        else None
-    )
-    if raw_generation is None and raw_incarnation is None:
-        observed: Tuple[Optional[str], Optional[str]] = (None, None)
-    else:
-        canonical_generation = _canonical_runtime_generation(raw_generation)
-        canonical_incarnation = _canonical_runtime_generation(raw_incarnation)
-        if canonical_generation is None or canonical_incarnation is None:
-            raise WorkspaceNotReady(
-                "Observed workspace identity is malformed or incomplete"
-            )
-        observed = canonical_generation, canonical_incarnation
-    if observed != expected:
-        raise WorkspaceNotReady("Workspace identity changed during attach")
-
-
-def _adopt_attached_runtime_identity(
-    generation: Any,
-    attach_token: Any = None,
-    *,
-    contract_advertised: bool,
-) -> None:
-    """Install one exact runtime identity before any attach-side await."""
-
-    global _session_runtime_generation, _session_runtime_attach_token
-    global _pinned_runtime_generation_enabled
-    global _retirement_admission_identity, _retirement_admission_disposition
-    global _retirement_admission_token
-    global _retirement_admission_permanent
-
-    canonical_generation = _canonical_runtime_generation(generation)
-    canonical_token = (
-        _canonical_runtime_generation(attach_token)
-        if attach_token is not None
-        else None
-    )
-    if contract_advertised and (
-        canonical_generation is None
-        or (not _stateless_mode() and canonical_token is None)
-    ):
-        raise WorkspaceNotReady(
-            "Pinned runtime generation contract omitted its exact generation "
-            "or attach token"
-        )
-    if generation is not None and canonical_generation is None:
-        raise WorkspaceNotReady("Pinned runtime generation is malformed")
-    if attach_token is not None and canonical_token is None:
-        raise WorkspaceNotReady("Pinned runtime attach token is malformed")
-    _session_runtime_generation = canonical_generation
-    _session_runtime_attach_token = canonical_token
-    _pinned_runtime_generation_enabled = contract_advertised
-    _retirement_admission_identity = None
-    _retirement_admission_disposition = None
-    _retirement_admission_token = None
-    _retirement_admission_permanent = None
-    client = _orchestrator_client
-    if client is not None and canonical_generation is not None:
-        adopt = getattr(client, "adopt_session_runtime_identity", None)
-        if not callable(adopt) or not adopt(
-            canonical_generation,
-            canonical_token,
-            contract_advertised=contract_advertised,
-        ):
-            raise WorkspaceNotReady("Pinned runtime identity could not be adopted")
-
-
-def _clear_attached_runtime_identity(
-    *,
-    expected_generation: str | None = None,
-    expected_attach_token: str | None = None,
-) -> bool:
-    """Clear only a captured generation, never a successor's authority."""
-
-    global _session_runtime_generation, _session_runtime_attach_token
-    global _pinned_runtime_generation_enabled
-    global _retirement_admission_identity, _retirement_admission_disposition
-    global _retirement_admission_token
-    global _retirement_admission_permanent
-
-    if (
-        expected_generation is not None
-        and _session_runtime_generation != expected_generation
-    ):
-        return False
-    if (
-        expected_attach_token is not None
-        and _session_runtime_attach_token != expected_attach_token
-    ):
-        return False
-    client = _orchestrator_client
-    if client is not None:
-        clear = getattr(client, "clear_session_runtime_identity", None)
-        if callable(clear) and not inspect.iscoroutinefunction(clear):
-            clear(
-                expected_generation=expected_generation,
-                expected_attach_token=expected_attach_token,
-            )
-    _session_runtime_generation = None
-    _session_runtime_attach_token = None
-    _pinned_runtime_generation_enabled = False
-    _retirement_admission_identity = None
-    _retirement_admission_disposition = None
-    _retirement_admission_token = None
-    _retirement_admission_permanent = None
-    return True
-
-
-def _bind_attached_runtime_payload(
-    payload: Any,
-    *,
-    protected_required: bool,
-) -> str | None:
-    """Fence a workspace response to this attach's exact runtime life."""
-
-    if not isinstance(payload, dict):
-        raise WorkspaceNotReady("Workspace runtime identity is unavailable")
-    advertised = _pinned_runtime_generation_advertised(payload)
-    raw_generation = payload.get("session_runtime_generation")
-    generation = _canonical_runtime_generation(raw_generation)
-    if raw_generation is not None and generation is None:
-        raise WorkspaceNotReady("Workspace runtime generation is malformed")
-    if advertised and generation is None:
-        raise WorkspaceNotReady(
-            "Workspace runtime generation contract omitted its generation"
-        )
-    if _pinned_runtime_generation_enabled and not advertised:
-        raise WorkspaceNotReady("Workspace runtime generation contract disappeared")
-    if (
-        _session_runtime_generation is not None
-        and generation != _session_runtime_generation
-    ):
-        raise WorkspaceNotReady("Workspace runtime generation changed during attach")
-    if _session_runtime_generation is None and generation is not None:
-        _adopt_attached_runtime_identity(
-            generation,
-            _session_runtime_attach_token,
-            contract_advertised=advertised,
-        )
-    if protected_required and (
-        not advertised or generation is None or _session_runtime_generation is None
-    ):
-        raise ProtectedCloudUnavailable(
-            "Protected workspace has no exact runtime generation"
-        )
-    return generation
-
+)
 
 # Pool mode: agent can be reused across sessions (Docker Compose mode)
-_sessions_served: int = 0
-_max_sessions_per_process: int = int(
-    os.environ.get("MAX_SESSIONS_PER_PROCESS", "0")
-)  # 0 = unlimited
+
 
 # Pod exit scheduling
-_pending_exit_task: Optional[asyncio.Task] = None
+
 
 # Drain intent — set the first time the orchestrator's heartbeat response
 # carries ``intents.should_drain=true`` AND the session is in a drainable
 # state. Drives a one-shot suspend/detach + exit so the agent doesn't keep
 # reacting on every subsequent heartbeat. While a turn is in flight the
 # intent is deferred (flag stays False) and re-checked on each 5s tick.
-_drain_intent_handled: bool = False
-_drain_deferred_logged: bool = False
+
 
 # Kubernetes termination-admission fence for dedicated persistent pods.
 #
@@ -462,10 +213,7 @@ _drain_deferred_logged: bool = False
 # refused.  The boolean is the fast in-process half, set by the loopback route.
 # Neither is durable authority: Kubernetes owns pod termination; Post/thread
 # state and the Officer recycler own durable replacement.
-_TERMINATION_SENTINEL_PATH = Path("/tmp/srw-persistent-terminating")
-_termination_admission_fenced: bool = False
-_termination_fence_reason: Optional[str] = None
-_TERMINATION_QUEUE_SENTINEL = INTERRUPT_SENTINEL
+
 
 # Process-local authorization latch for auxiliary provider work. The primary
 # loop must remain able to reach its pre-turn maintenance callback after a
@@ -476,16 +224,6 @@ _TERMINATION_QUEUE_SENTINEL = INTERRUPT_SENTINEL
 # actual provider boundary, including work queued before the failure.
 _runtime_authorization_admission_open: bool = False
 
-# One process incarnation inside one pod. Kubernetes may restart a container
-# without changing the pod UID; this value lets the successor reclaim work
-# that existed only in the predecessor's RAM queue. The separate session
-# generation fences the durable thread binding. Reset on every attach.
-_input_runtime_generation: Optional[str] = None
-_queued_input_claims: set[tuple[str, int]] = set()
-# Serializes durable reclaim with local queue/priority publication. In
-# particular, a concurrent human B may not steal a just-deferred wake A between
-# A's generation CAS and its priority reclaim.
-_input_delivery_reclaim_lock = asyncio.Lock()
 _INPUT_CANCELLATION_ENABLED_ENV = "PERSISTENT_INPUT_CANCELLATION_ENABLED"
 
 
@@ -500,17 +238,11 @@ def _persistent_input_cancellation_enabled() -> bool:
     }
 
 
-# True exactly while the persistent loop is parked in _loop_get_user_input's
-# queue wait — the only state where an out-of-band teardown (drain-suspend)
-# cannot kill user-visible work mid-turn.
-_awaiting_input: bool = False
-
 # Self-cleanup watchdogs (PR 2 — protect against the abandoned-pod failure modes
 # that the orchestrator reconciler can only catch with a 60s+ delay):
-#   _ws_connected_event  → set when /ws/chat first accepts a connection.
+#   _ws_connected_event  → set on a WS connection or newly queued human input.
 #   _watchdog_tasks      → background tasks cancelled on detach/shutdown.
-_ws_connected_event: Optional[asyncio.Event] = None
-_watchdog_tasks: list[asyncio.Task] = []
+
 
 # Awaitable single-flight for _terminate_session. Out-of-band teardown (drain,
 # watchdog, REST detach) cancels the loop task and awaits it — but
@@ -523,8 +255,7 @@ _watchdog_tasks: list[asyncio.Task] = []
 # 'suspended' transition. The loop task itself remains a non-awaiting
 # re-entrant caller (otherwise outer teardown and cancelled loop deadlock),
 # while every independent caller awaits the same authoritative cleanup result.
-_terminating: bool = False
-_termination_task: Optional[asyncio.Task[None]] = None
+
 
 # Reference to the currently running persistent-loop task. Set by ws_chat when
 # it spawns the loop, cleared when _terminate_session runs. _terminate_session()
@@ -536,10 +267,7 @@ _termination_task: Optional[asyncio.Task[None]] = None
 # Headless sessions (chunk 1): the loop now outlives any single WebSocket. It is
 # only cancelled by _terminate_session, never by WS close.
 _loop_task: Optional[asyncio.Task] = None
-_session_boot_ws_timeout_s: int = int(
-    os.environ.get("SESSION_BOOT_WS_TIMEOUT_S", "600")
-)
-_thread_status_poll_s: int = int(os.environ.get("THREAD_STATUS_POLL_S", "60"))
+
 
 # Resume backstop: a hard ceiling on how many messages the restore read loads,
 # applied as `seq DESC LIMIT N` (newest N) so one pathological tail — thousands
@@ -564,8 +292,9 @@ _vm_upgrade_poll_timeout: int = int(os.environ.get("VM_UPGRADE_POLL_TIMEOUT", "9
 # be sent directly to a single WebSocket scoped to ws_chat. Under headless
 # semantics the loop must outlive any single WS attach, so the loop instead
 # broadcasts via _broadcast() and each WebSocket connection registers its own
-# queue via _subscribe(). A _run_subscriber_pump task drains each queue into
-# its WS. Closing a WS just calls _unsubscribe() — the loop keeps running.
+# queue via _subscribe(). The session WebSocket transport runs one pump per
+# connection that drains its queue into its WS. Closing a WS just calls
+# _unsubscribe() — the loop keeps running.
 #
 # Keyed by client_id (generated server-side per WS connection). Bounded queue
 # protects the loop from a slow consumer: on overflow the oldest frame is
@@ -573,55 +302,361 @@ _vm_upgrade_poll_timeout: int = int(os.environ.get("VM_UPGRADE_POLL_TIMEOUT", "9
 _SUBSCRIBER_QUEUE_MAXSIZE: int = 1000
 _subscribers: Dict[str, asyncio.Queue] = {}
 
-_CANVAS_AWARENESS_TTL_S: float = max(
-    15.0, min(60.0, float(os.environ.get("CANVAS_AWARENESS_TTL_S", "15")))
+# Canvas control/awareness state for connected clients. One channel per
+# process, like the subscriber registry; attach/terminate clear it across the
+# session boundary and each disconnect releases only its own lease.
+_canvas_control = CanvasControlChannel(
+    load_state=lambda: _current_canvas_for_control(),
+    invalidate_recent_read=lambda path: _invalidate_session_recent_read(path),
+    identity_fingerprint=lambda: _session_identity.fingerprint(),
+    broadcast=lambda method, params: _broadcast(method, params),
+    fan_out_live=lambda frame: _fan_out_live_frame(frame),
 )
-_CANVAS_CONTROL_VALIDATION_MIN_INTERVAL_S = 0.5
-_CANVAS_AWARENESS_RENEW_MIN_INTERVAL_S = 1.0
+
+# Input admission, delivery and interrupt state: the loop's input queue, the
+# claims published into it, the reclaim lock and protected-reclaim task, the
+# interrupt mode/target/hard-cancel event and the parked (awaiting-input)
+# window. One owner per process, like the Canvas channel. Attach, loop start
+# and teardown use its lifecycle operations; every dependency, including the
+# runtime identity, is read at call time.
+_session_input = SessionInputRuntime(
+    SessionInputPorts(
+        session=lambda: _session,
+        identity=lambda: _session_identity.snapshot(),
+        stateless_mode=lambda: _stateless_mode(),
+        runtime_admission_closed=lambda: _session_termination.runtime_admission_closed(),
+        protected_cloud_ready=lambda: _protected_cloud_runtime_ready(),
+        identity_fingerprint=lambda: _session_identity.fingerprint(),
+        cancellation_enabled=lambda: _persistent_input_cancellation_enabled(),
+        turn_open=lambda: _turn_event_open,
+        tool_inflight=lambda: _tool_inflight,
+        broadcast=lambda method, params: _broadcast(method, params),
+        track_side_task=lambda task: _session_termination.track_session_side_task(task),
+        human_input_accepted=lambda content: _schedule_early_title(content),
+        begin_input_wait=lambda: _begin_loop_input_wait(),
+    ),
+    logger=logger,
+)
 
 
-@dataclass(frozen=True)
-class _CanvasAwarenessLease:
-    task: asyncio.Task
-    params: Dict[str, Any]
-    renewed_at: float
-    validated_at: float
+def _publish_session(session: Any) -> None:
+    """Install (or clear) the attached session slot."""
+
+    global _session
+    _session = session
 
 
-_canvas_awareness: Dict[str, _CanvasAwarenessLease] = {}
-_canvas_control_validation_at: Dict[tuple[str, str], float] = {}
-_canvas_source_updates: Dict[str, tuple[str, int, str]] = {}
-_canvas_presentation_updates: Dict[str, int] = {}
+def _reset_turn_state() -> None:
+    """Clear the per-turn tool/turn flags an attach or rollback starts from."""
 
-# Idle keepalive on the control WS (see _run_subscriber_pump). Must be
-# shorter than the cockpit's CONTROL_WS_WATCHDOG_TIMEOUT_MS and any
-# edge/tunnel idle timeout on the WS path.
-_WS_PING_INTERVAL_S: float = 20.0
+    global _tool_inflight, _turn_event_open
+    global _turn_tool_execution_identity, _turn_tool_execution_external_hook
+    _tool_inflight = False
+    _tool_inflight_calls.clear()
+    _turn_tool_execution_identity = None
+    _turn_tool_execution_external_hook = None
+    _turn_event_open = False
 
-# Loop-facing input primitives. Used to be closure-scoped inside ws_chat;
-# hoisted to module level so they survive WS reconnect. All three are reset
-# on session attach / cleared on _terminate_session.
-_loop_user_queue: Optional[asyncio.Queue] = None
-# Tri-state interrupt flag (phase 2): None = no interrupt pending,
-# "graceful" = stop after current tool call completes, "hard" = cancel the
-# in-flight LLM stream immediately and drop the partial AIMessage. Set by
-# the agent's POST /api/interrupt handler based on current _tool_inflight
-# state. Consumed by persistent_graph's check_interrupt callback at three
-# sites (pre-LLM, mid-astream, between tool calls). Legacy WS interrupt
-# path uses the same flag — sets "hard" when no tool is inflight.
-_loop_interrupt_flag: Optional[str] = None
-# Exact transcript turn the pending interrupt belongs to. A mode without a
-# matching target is invalid and is cleared rather than allowed to strike a
-# successor turn.
-_loop_interrupt_target_turn_id: Optional[int] = None
-# Hard-interrupt signal (phase 3). Set alongside _loop_interrupt_flag="hard"
-# so the loop can tear down a blocked LLM / auxiliary await (e.g. a hung
-# summarization read) immediately, instead of waiting for the cooperative
-# check_interrupt poll — which can't fire while the turn is parked in a
-# network read. Created in _attach_session, set in the interrupt handlers
-# when no tool is in flight, cleared whenever the flag is consumed.
-_hard_interrupt_event: Optional[asyncio.Event] = None
-_loop_last_user_content: List[str] = [""]
+
+def _reset_event_journal_cursor() -> None:
+    global _events_epoch, _next_seq
+    _events_epoch = 0
+    _next_seq = 0
+
+
+def _discard_event_writer() -> None:
+    global _event_writer
+    _event_writer = None
+
+
+def _reset_draft_title() -> None:
+    global _draft_title_value
+    _draft_title_value = None
+
+
+def _set_cloud_sync_retry_pending(pending: bool) -> None:
+    global _cloud_sync_retry_pending
+    _cloud_sync_retry_pending = pending
+
+
+def _close_runtime_authorization() -> None:
+    global _runtime_authorization_admission_open
+    _runtime_authorization_admission_open = False
+
+
+def _register_session_mcp_tools(manager: Any) -> None:
+    """Replace (or clear) the process-global MCP entries of the tool registry."""
+
+    from agent.tools.registry import register_mcp_tools
+
+    register_mcp_tools(manager)
+
+
+async def _open_event_journal() -> None:
+    """Resolve this attach's generation and seq seed, then start its writer.
+
+    Clean reattaches reuse the thread's current epoch with the seq counter
+    seeded above every previously served frame (see
+    ``_resolve_event_journal_epoch``). A stateless attach fences every flush
+    on the live claim; a pinned attach fences it on its exact runtime identity
+    and starts the durable control consumer it owns for the whole attach.
+    """
+
+    global _events_epoch, _next_seq, _event_writer
+    session = _session
+    _events_epoch, _next_seq = await _resolve_event_journal_epoch(
+        session.postgres_conn, _session_identity.thread_id
+    )
+    live_lease = _current_lease_var.get()
+    pinned_agent_id = _registered_pinned_agent_id() if live_lease is None else None
+    writer = _OrderedPersistentEventWriter(
+        postgres_conn=session.postgres_conn,
+        thread_id=_session_identity.thread_id,
+        epoch=_events_epoch,
+        on_terminal_failure=_event_persistence_failed,
+        # Stateless executor attach: fence every flush on the live claim (the
+        # executor set the LeaseHandle before attaching). Pinned lane:
+        # ContextVar default None -> today's statement.
+        lease=live_lease,
+        pinned_agent_id=pinned_agent_id,
+        pinned_runtime_generation=(
+            _session_identity.session_generation if live_lease is None else None
+        ),
+        pinned_runtime_attach_token=(
+            _session_identity.attach_token if live_lease is None else None
+        ),
+    )
+    writer.start()
+    _event_writer = writer
+    if live_lease is None and pinned_agent_id is not None:
+        await _start_thread_control_watcher(agent_id=pinned_agent_id)
+
+
+# Session attachment: the attach sequence, failed-attach cleanup and release
+# receipts, and the pool admission claim. One owner per process; every
+# collaborator it names is read at call time.
+_session_attach = SessionAttachCoordinator(
+    SessionAttachPorts(
+        identity=lambda: _session_identity,
+        input_runtime=lambda: _session_input,
+        agent=lambda: _agent,
+        orchestrator_client=lambda: _orchestrator_client,
+        stateless_mode=lambda: _stateless_mode(),
+        lease=lambda: _current_lease_var.get(),
+        session=lambda: _session,
+        publish_session=lambda session: _publish_session(session),
+        session_factory=lambda **kwargs: PersistentSession(**kwargs),
+        provider_admission=lambda *args, **kwargs: _loop_provider_admission_open(
+            *args, **kwargs
+        ),
+        effect_authority=lambda *args, **kwargs: (
+            _loop_runtime_effect_authority_current(*args, **kwargs)
+        ),
+        settlement_authority=lambda *args, **kwargs: (
+            _loop_runtime_settlement_authority_current(*args, **kwargs)
+        ),
+        retirement_authorized=lambda *args, **kwargs: (
+            _session_termination.retirement_authorized_now(*args, **kwargs)
+        ),
+        terminate_failed_attach_if_authorized=lambda life: (
+            _session_termination.terminate_failed_attach_if_authorized(life)
+        ),
+        subagent_event_available=lambda *args, **kwargs: (
+            _session_subagent_event_available(*args, **kwargs)
+        ),
+        reset_turn_state=lambda: _reset_turn_state(),
+        reset_draft_title=lambda: _reset_draft_title(),
+        set_cloud_sync_retry_pending=lambda pending: _set_cloud_sync_retry_pending(
+            pending
+        ),
+        close_runtime_authorization=lambda: _close_runtime_authorization(),
+        clear_canvas=lambda: _canvas_control.clear_all(),
+        clear_subscribers=lambda: _subscribers.clear(),
+        side_tasks_active=lambda: any(
+            not task.done() for task in _session_termination.session_side_tasks
+        ),
+        quiesce_side_tasks=lambda: _session_termination.quiesce_session_side_tasks(),
+        pending_drain_suspend=lambda: _session_termination.pending_drain_suspend,
+        event_writer=lambda: _event_writer,
+        discard_event_writer=lambda: _discard_event_writer(),
+        reset_journal_cursor=lambda: _reset_event_journal_cursor(),
+        open_event_journal=lambda: _open_event_journal(),
+        events_epoch=lambda: _events_epoch,
+        stop_interrupt_watcher=lambda: _stop_thread_interrupt_watcher(),
+        stop_control_watcher=lambda: _stop_thread_control_watcher(),
+        stop_and_join_watchdogs=lambda: _session_termination.stop_and_join_watchdogs(),
+        start_watchdogs=lambda: _session_termination.start_watchdogs(),
+        update_thread_status=lambda *args, **kwargs: _update_thread_status(
+            *args, **kwargs
+        ),
+        restore_messages=lambda: _restore_session_messages(),
+        broadcast=lambda method, params: _broadcast(method, params),
+        officer_config=lambda: _officer_cfg(),
+        loop_running=lambda: _loop_task is not None and not _loop_task.done(),
+        ensure_loop_started=lambda source: _ensure_persistent_loop_started(source),
+        wire_aux_archiver=lambda: _wire_session_aux_archiver(),
+        emit_citation_verdict=lambda *args, **kwargs: _emit_citation_verdict(
+            *args, **kwargs
+        ),
+        emit_canvas_event=lambda *args, **kwargs: _emit_canvas_event(*args, **kwargs),
+        poll_workspace_ready=lambda *args, **kwargs: (
+            _session_workspace.poll_workspace_ready(*args, **kwargs)
+        ),
+        load_expert_config=lambda name: _load_expert_config(name),
+        apply_session_tool_group_markers=lambda *args, **kwargs: (
+            _apply_session_tool_group_markers(*args, **kwargs)
+        ),
+        llm_config_with_cache_key=lambda llm_cfg: _llm_config_with_cache_key(llm_cfg),
+        build_sync_coordinator=lambda **kwargs: _build_sync_coordinator(**kwargs),
+        legacy_nc_cloud_cfg=lambda nc_folder: _legacy_nc_cloud_cfg(nc_folder),
+        register_mcp_tools=lambda manager: _register_session_mcp_tools(manager),
+    ),
+    logger=logger,
+)
+
+
+def _publish_loop_task(value: Any) -> None:
+    global _loop_task
+    _loop_task = value
+
+
+def _publish_event_writer(value: Any) -> None:
+    global _event_writer
+    _event_writer = value
+
+
+def _publish_active_permission(value: Any) -> None:
+    global _active_permission_request_id
+    _active_permission_request_id = value
+
+
+def _publish_runtime_authorization(value: Any) -> None:
+    global _runtime_authorization_admission_open
+    _runtime_authorization_admission_open = value
+
+
+def _publish_draft_title(value: Any) -> None:
+    global _draft_title_value
+    _draft_title_value = value
+
+
+def _pinned_session_subagent_runtime() -> Any:
+    """The attached pinned session's delegation runtime, or ``None``."""
+
+    if _stateless_mode():
+        # The stateless executor hands its own batch over at ``stop()``.
+        return None
+    context = getattr(_session, "tool_context", None)
+    return getattr(context, "subagent_runtime", None)
+
+
+def _leave_delegation_batch_for_successor() -> None:
+    """Hand a pinned session's delegation batch to its successor (P4).
+
+    The termination fence's first activation calls this: a pod deletion
+    (preStop or the process shutdown), never a person's Stop or End. Each
+    running child then ends at its next boundary as interrupted by the
+    restart, no call returns a result, and the successor settles the turn at
+    Resume or respawn (parallel_subagents.md §14.2 P4, D7).
+    """
+
+    leave = getattr(
+        _pinned_session_subagent_runtime(), "leave_foreground_for_successor", None
+    )
+    if callable(leave):
+        leave(retiring=True)
+
+
+def _delegation_batch_left_for_successor() -> bool:
+    """Whether the open turn waits only on a batch the successor now owns."""
+
+    runtime = _pinned_session_subagent_runtime()
+    return getattr(runtime, "foreground_held_for_successor", False) is True
+
+
+# Termination owns retirement, quiescence and its tasks; composition remains here
+# until R3.4. Each port names the collaborator read at invocation time.
+_session_termination = SessionTerminationCoordinator(
+    SessionTerminationPorts(
+        announced_permissions=lambda: _announced_permission_rows,
+        attach=lambda: _session_attach,
+        await_pending_cloud_push=lambda *args, **kwargs: _await_pending_cloud_push(
+            *args, **kwargs
+        ),
+        background_push_owns=lambda *args, **kwargs: _background_push_owns(
+            *args, **kwargs
+        ),
+        canvas_control=lambda: _canvas_control,
+        close_pinned_control_inbox=lambda *args, **kwargs: _close_pinned_control_inbox(
+            *args, **kwargs
+        ),
+        control_owner_agent_id=lambda: _control_owner_agent_id,
+        delegation_batch_left_for_successor=lambda: (
+            _delegation_batch_left_for_successor()
+        ),
+        event_writer=lambda: _event_writer,
+        handle_idle_archive=lambda *args, **kwargs: _handle_idle_archive(
+            *args, **kwargs
+        ),
+        heartbeat_task=lambda: _heartbeat_task,
+        identity=lambda: _session_identity,
+        idle_timeout_error=IdleTimeoutError,
+        memory_unavailable_error=MemoryUnavailableError,
+        workspace_unavailable_error=WorkspaceUnavailableError,
+        input_runtime=lambda: _session_input,
+        leave_delegation_batch_for_successor=lambda: (
+            _leave_delegation_batch_for_successor()
+        ),
+        loop_on_error=lambda *args, **kwargs: _loop_on_error(*args, **kwargs),
+        loop_task=lambda: _loop_task,
+        officer_config=lambda *args, **kwargs: _officer_cfg(*args, **kwargs),
+        orchestrator_client=lambda: _orchestrator_client,
+        permission_gates=lambda: _gates_in_flight,
+        publish_active_permission=lambda *args, **kwargs: _publish_active_permission(
+            *args, **kwargs
+        ),
+        publish_draft_title=lambda *args, **kwargs: _publish_draft_title(
+            *args, **kwargs
+        ),
+        publish_event_writer=lambda *args, **kwargs: _publish_event_writer(
+            *args, **kwargs
+        ),
+        publish_loop_task=lambda *args, **kwargs: _publish_loop_task(*args, **kwargs),
+        publish_runtime_authorization=lambda *args,
+        **kwargs: _publish_runtime_authorization(*args, **kwargs),
+        publish_session=lambda *args, **kwargs: _publish_session(*args, **kwargs),
+        registered_pinned_agent_id=lambda *args, **kwargs: _registered_pinned_agent_id(
+            *args, **kwargs
+        ),
+        reset_journal_cursor=lambda *args, **kwargs: _reset_event_journal_cursor(
+            *args, **kwargs
+        ),
+        reset_turn_state=lambda *args, **kwargs: _reset_turn_state(*args, **kwargs),
+        retire_announced_permissions=lambda *args,
+        **kwargs: _retire_announced_permission_rows(*args, **kwargs),
+        session=lambda: _session,
+        session_type=PersistentSession,
+        set_cloud_sync_retry_pending=lambda *args,
+        **kwargs: _set_cloud_sync_retry_pending(*args, **kwargs),
+        set_pinned_control_admission=lambda *args,
+        **kwargs: _set_pinned_control_admission(*args, **kwargs),
+        stateless_mode=lambda *args, **kwargs: _stateless_mode(*args, **kwargs),
+        stop_control_watcher=lambda *args, **kwargs: _stop_thread_control_watcher(
+            *args, **kwargs
+        ),
+        stop_interrupt_watcher=lambda *args, **kwargs: _stop_thread_interrupt_watcher(
+            *args, **kwargs
+        ),
+        subscribers=lambda: _subscribers,
+        tool_inflight=lambda: _tool_inflight,
+        turn_event_open=lambda: _turn_event_open,
+        update_thread_status=lambda *args, **kwargs: _update_thread_status(
+            *args, **kwargs
+        ),
+    ),
+    logger=logger,
+    termination_queue_sentinel=INTERRUPT_SENTINEL,
+)
 
 # Serializes rewinds: two concurrent rewind frames on one session would race
 # the sweep/truncate pair. Second caller gets an error, not a queue.
@@ -635,17 +670,9 @@ _rewind_lock: asyncio.Lock = asyncio.Lock()
 # fine title — not worth a DB column.
 _draft_title_value: Optional[str] = None
 # Session-local fire-and-forget work must not survive pool reuse.  Every task
-# captures an immutable attach generation and is terminally joined during
-# teardown before the event writer or claimant lease is released.
-_session_generation: int = 0
-_session_side_tasks: set[asyncio.Task[Any]] = set()
-_protected_input_reclaim_task: Optional[asyncio.Task[Any]] = None
-
-
-def _track_session_side_task(task: asyncio.Task[Any]) -> asyncio.Task[Any]:
-    _session_side_tasks.add(task)
-    task.add_done_callback(_session_side_tasks.discard)
-    return task
+# captures an immutable attach generation (``_session_identity``) and is
+# terminally joined during teardown before the event writer or claimant lease
+# is released.
 
 
 def _session_identity_matches(
@@ -655,41 +682,23 @@ def _session_identity_matches(
 ) -> bool:
     return bool(
         _session is session
-        and _thread_id == thread_id
-        and _session_generation == generation
+        and _session_identity.thread_id == thread_id
+        and _session_identity.attach_generation == generation
     )
-
-
-async def _quiesce_session_side_tasks() -> None:
-    """Cancel and join title/stage tasks before process-global identity reuse."""
-
-    pending = {
-        task
-        for task in _session_side_tasks
-        if task is not asyncio.current_task() and not task.done()
-    }
-    if not pending:
-        return
-    for task in pending:
-        task.cancel()
-    done, pending = await asyncio.wait(
-        pending,
-        timeout=float(os.environ.get("SESSION_SIDE_TASK_CLOSE_TIMEOUT_S", "5")),
-    )
-    for task in done:
-        try:
-            task.result()
-        except (asyncio.CancelledError, Exception):
-            pass
-    if pending:
-        raise RuntimeError(f"{len(pending)} session side task(s) ignored cancellation")
 
 
 # True while a tool call is mid-`ainvoke`. Read by POST /api/interrupt to
 # pick hard vs graceful mode. Latched only after the final execution-admission
 # callback succeeds, immediately before `tool.ainvoke`; cleared in
-# _loop_on_tool_result.
+# _loop_on_tool_result once no call is left in flight.
 _tool_inflight: bool = False
+# The ids of the calls behind ``_tool_inflight``. A session delegation batch
+# runs several calls at once, so the first ``tool.completed`` must not clear
+# the flag while its siblings still run, and a reattaching client is told
+# every running call (parallel_subagents.md F17). The flag stays the
+# authority on whether anything runs: cleared wherever the flag is reset, and
+# ids found beside a false flag are stale.
+_tool_inflight_calls: set[str] = set()
 
 # Exact stateless claim/turn identity after a bound, approved tool reaches the
 # pre-ainvoke external-effect boundary. Unlike _tool_inflight this survives the
@@ -710,8 +719,8 @@ def _record_turn_tool_execution_identity() -> Optional[Tuple[str, int, int]]:
         handle is None
         or handle.unit_id is None
         or int(handle.lease_token) <= 0
-        or _thread_id is None
-        or str(_thread_id) != str(handle.unit_id)
+        or _session_identity.thread_id is None
+        or str(_session_identity.thread_id) != str(handle.unit_id)
         or _session is None
     ):
         # Pinned sessions have no queue claim and need no shutdown replay
@@ -842,6 +851,14 @@ _turn_tool_execution_external_hook: Optional[Callable[[Tuple[str, int, int]], No
     None
 )
 
+# Idle-time memory prefetch seam for the stateless executor (append-only
+# context injection WP4, B8). Nothing tells a leased claim that new input
+# arrived, so the executor installs a per-claim check: has ``run_queue.
+# input_seq`` risen past the input this claim serves, under its exact lease
+# (a lost lease counts as yes). The loop's end-of-turn prefetch polls it and
+# stops. Pinned sessions leave it unset and check their input runtime.
+_turn_idle_input_external_probe: Optional[Callable[[], Awaitable[bool]]] = None
+
 # Phase 2 event-log cursor. Allocated synchronously by _broadcast, then queued
 # through one ordered writer so a later sequence can never become visible in
 # Postgres before an earlier queued sequence. Each DB-backed runtime attach
@@ -936,20 +953,6 @@ _NOTIFICATION_METHODS = frozenset(
     }
 )
 
-# Roles POST /api/input may request. 'human' is the normal path; 'event' is a
-# system-injected notice (currently: a worker job this session created reached a
-# terminal state — knowledge-base/knowledge/features/session_wake_on_job_completion.md).
-#
-# An allow-list rather than a passthrough because ordinary /api/input is an
-# internal orchestrator effect endpoint rather than a browser-token endpoint.
-# Durable events must name the exact runtime fingerprint and also require the
-# existing internal transport key below. Human requests that carry the new
-# fingerprint are fenced identically; the missing-field compatibility branch
-# remains only until the orchestrator forwarding cutover is atomic. An
-# arbitrary role would let anything that can reach the pod forge 'ai' or
-# 'system' rows.
-_ACCEPTED_INPUT_ROLES = frozenset({"human", "event"})
-
 
 def _stateless_mode() -> bool:
     """True when this process runs as the M3 stateless turn executor.
@@ -965,38 +968,26 @@ def _stateless_mode() -> bool:
     return os.environ.get("STATELESS_EXECUTOR", "").strip() == "1"
 
 
-def _current_stateless_lease_token() -> Optional[int]:
-    """Return the exact live claim token for this attached stateless thread."""
-
-    if not _stateless_mode() or _thread_id is None:
-        return None
-    handle = _current_lease_var.get()
-    if (
-        handle is None
-        or not handle.active
-        or handle.lost.is_set()
-        or str(handle.unit_id) != str(_thread_id)
-    ):
-        return None
-    return int(handle.lease_token)
-
-
 async def _safe_mark_stateless_natural_pause(*, require_untethered: bool) -> bool:
     """Best-effort durable presence oracle for stateless natural pauses."""
 
-    if _session is None or _session.postgres_conn is None or _thread_id is None:
+    if (
+        _session is None
+        or _session.postgres_conn is None
+        or _session_identity.thread_id is None
+    ):
         return False
-    lease_token = _current_stateless_lease_token()
+    lease_token = _session_identity.stateless_lease_token()
     if lease_token is None:
         logger.warning(
             "Skipped stateless natural pause without exact lease (thread=%s)",
-            _thread_id,
+            _session_identity.thread_id,
         )
         return False
     try:
         return await mark_stateless_natural_pause(
             _session.postgres_conn,
-            thread_id=_thread_id,
+            thread_id=_session_identity.thread_id,
             lease_token=lease_token,
             require_untethered=require_untethered,
         )
@@ -1006,383 +997,10 @@ async def _safe_mark_stateless_natural_pause(*, require_untethered: bool) -> boo
         # this advisory status write.
         logger.warning(
             "Failed stateless natural-pause presence check (thread=%s): %s",
-            _thread_id,
+            _session_identity.thread_id,
             exc,
         )
         return False
-
-
-def _stateless_reject() -> JSONResponse:
-    """409 for direct-session verbs on a stateless executor pod."""
-    return JSONResponse(
-        {
-            "error": (
-                "stateless executor: this pod serves queued turns from the "
-                "run_queue (threads.execution_lane='stateless'); direct "
-                "session attach/input is not accepted here"
-            )
-        },
-        status_code=409,
-    )
-
-
-class WorkspaceNotReady(RuntimeError):
-    """The session's workspace container never became ready in time.
-
-    Subclasses RuntimeError so existing ``except RuntimeError`` handlers (e.g.
-    the pool-mode /session/attach path) keep catching it, while the lifespan
-    startup can catch it specifically to exit cleanly instead of crash-looping.
-    """
-
-
-class ProtectedCloudUnavailable(WorkspaceNotReady):
-    """A protected attach cannot prove its lower+overlay delivery contract.
-
-    This is terminal for the current attach.  Retrying a partially described
-    protected payload as an ordinary workspace would expose credentials and
-    tools before the review boundary exists, so callers must fail closed.
-    """
-
-
-_PROTECTED_CLOUD_SAFE_ERROR_CODES = frozenset(
-    {
-        "feature_disabled",
-        "malformed_protected_marker",
-        "unsupported_workspace_tier",
-        "no_protected_mount",
-        "engage_refused",
-        "engage_failed",
-    }
-)
-
-
-def _protected_workspace_marker(payload: Dict[str, Any]) -> str:
-    """Classify the additive workspace marker without truthiness coercion."""
-
-    if "protected_cloud" not in payload or payload.get("protected_cloud") is False:
-        return "off"
-    if payload.get("protected_cloud") is True:
-        return "on"
-    raise ProtectedCloudUnavailable("malformed protected-cloud workspace marker")
-
-
-def _validate_protected_cloud_mount(payload: Any) -> Dict[str, Any]:
-    """Return an exact protected lower+overlay payload or fail closed."""
-
-    if not isinstance(payload, dict):
-        raise ProtectedCloudUnavailable("protected-cloud mount payload is missing")
-    overlay = payload.get("overlay")
-    mounts = payload.get("mounts")
-    if (
-        type(payload.get("version")) is not int
-        or payload.get("version") != 1
-        or payload.get("driver") != "rclone"
-        or payload.get("protected") is not True
-        or payload.get("skip_workspace_links") is not True
-        or payload.get("fallback") is not False
-        or not isinstance(overlay, dict)
-        or overlay.get("lower") != "/cloud/lower"
-        or overlay.get("merged") != "/cloud/merged"
-        or overlay.get("upper") != "/home/agent-host/.overlay/upper"
-        or overlay.get("work") != "/home/agent-host/.overlay/work"
-        or not isinstance(overlay.get("quota_bytes"), int)
-        or isinstance(overlay.get("quota_bytes"), bool)
-        or overlay.get("quota_bytes") <= 0
-        or not isinstance(mounts, list)
-        or len(mounts) != 1
-    ):
-        raise ProtectedCloudUnavailable("protected-cloud mount payload is malformed")
-
-    lowers = [
-        mount
-        for mount in mounts
-        if isinstance(mount, dict) and mount.get("mount_kind") == "protected_lower"
-    ]
-    if len(lowers) != 1:
-        raise ProtectedCloudUnavailable(
-            "protected-cloud payload must contain exactly one protected lower"
-        )
-    lower = lowers[0]
-    source = lower.get("source")
-    source_config = source.get("config") if isinstance(source, dict) else None
-    auth = lower.get("auth")
-    if (
-        not isinstance(lower.get("mount_id"), str)
-        or not lower.get("mount_id")
-        or lower.get("backend") != "nextcloud"
-        or lower.get("target_path") != "/cloud/lower"
-        or lower.get("workspace_name") != "lower"
-        or lower.get("access") != "read_only"
-        or not isinstance(source, dict)
-        or source.get("type") != "webdav"
-        or not isinstance(source_config, dict)
-        or source_config.get("vendor") != "nextcloud"
-        or not isinstance(source_config.get("url"), str)
-        or not source_config.get("url")
-        or not isinstance(source_config.get("user"), str)
-        or not source_config.get("user")
-        or not isinstance(auth, dict)
-        or auth.get("type") != "basic"
-        or not isinstance(auth.get("password"), str)
-        or not auth.get("password")
-    ):
-        raise ProtectedCloudUnavailable("protected-cloud lower mount is malformed")
-    return payload
-
-
-def _protected_workspace_delivery(payload: Dict[str, Any]) -> str:
-    """Return ``off``, ``engaging`` or ``ready`` for a workspace response."""
-
-    if _protected_workspace_marker(payload) == "off":
-        mount = payload.get("cloud_mount")
-        protected_mount_shape = False
-        if isinstance(mount, dict):
-            mounts = mount.get("mounts")
-            protected_mount_shape = (
-                ("protected" in mount and mount.get("protected") is not False)
-                or "overlay" in mount
-                or (
-                    isinstance(mounts, list)
-                    and any(
-                        isinstance(candidate, dict)
-                        and candidate.get("mount_kind") == "protected_lower"
-                        for candidate in mounts
-                    )
-                )
-            )
-        if (
-            payload.get("protected_cloud_state") is not None
-            or payload.get("protected_cloud_error_code") is not None
-            or protected_mount_shape
-        ):
-            raise ProtectedCloudUnavailable(
-                "protected-cloud payload has no authoritative marker"
-            )
-        return "off"
-    state = payload.get("protected_cloud_state")
-    status = payload.get("status")
-    if state in {"engaging", "failed"}:
-        # Pending/refused responses are a deliberately tiny, coordinate-free
-        # projection.  Use an allowlist rather than chasing aliases: attach
-        # consumes ``remote.host`` directly, and one forgotten transport key
-        # would otherwise bypass a blacklist without ever being inspected.
-        allowed_non_ready = {
-            "status",
-            "protected_cloud",
-            "protected_cloud_state",
-            "protected_cloud_error_code",
-            "pod_ip",
-            "pod_name",
-            "pod_port",
-            "namespace",
-            "vm_status",
-            "vm_ssh_host",
-            "vm_ssh_port",
-            "vm_name",
-            "ssh_key_path",
-            "workspace_generation",
-            "workspace_runtime_incarnation",
-            "workspace_ssh_host_key_fingerprint",
-            "git_remote_url",
-            "managed_repository_credentials",
-            "repositories",
-            "resolved_config",
-            "config_override",
-            "project_ids",
-            "datasources",
-            "nc_session_folder",
-            "cloud_sync",
-            "cloud_mount",
-            "cloud_sync_degraded",
-            "canvas_presentation_available",
-            "canvas_live_apps_available",
-            "canvas_shared_browser_available",
-        }
-        neutral_none = allowed_non_ready - {
-            "status",
-            "protected_cloud",
-            "protected_cloud_state",
-            "protected_cloud_error_code",
-            "project_ids",
-            "cloud_sync_degraded",
-            "canvas_presentation_available",
-            "canvas_live_apps_available",
-            "canvas_shared_browser_available",
-        }
-        if (
-            any(key not in allowed_non_ready for key in payload)
-            or any(payload.get(key) is not None for key in neutral_none)
-            or ("project_ids" in payload and payload.get("project_ids") != [])
-            or any(
-                payload.get(key) is not False
-                for key in (
-                    "cloud_sync_degraded",
-                    "canvas_presentation_available",
-                    "canvas_live_apps_available",
-                    "canvas_shared_browser_available",
-                )
-                if key in payload
-            )
-        ):
-            raise ProtectedCloudUnavailable(
-                "protected-cloud non-ready payload exposed runtime coordinates"
-            )
-    if state == "engaging" and status == "creating":
-        return "engaging"
-    if state == "failed" and status == "failed":
-        code = payload.get("protected_cloud_error_code")
-        safe_code = (
-            code
-            if isinstance(code, str) and code in _PROTECTED_CLOUD_SAFE_ERROR_CODES
-            else "engage_failed"
-        )
-        raise ProtectedCloudUnavailable(
-            f"protected-cloud engage was refused ({safe_code})"
-        )
-    if state != "ready" or status != "ready":
-        raise ProtectedCloudUnavailable(
-            "protected-cloud workspace has no authoritative ready state"
-        )
-    declared_backends: list[str] = []
-    if "backend" in payload:
-        direct_backend = payload.get("backend")
-        if not isinstance(direct_backend, str):
-            raise ProtectedCloudUnavailable(
-                "protected cloud workspace backend declaration is malformed"
-            )
-        declared_backends.append(direct_backend)
-    override = payload.get("config_override")
-    if override is not None:
-        if not isinstance(override, dict):
-            raise ProtectedCloudUnavailable(
-                "protected cloud workspace override is malformed"
-            )
-        workspace = override.get("workspace")
-        if workspace is not None:
-            if not isinstance(workspace, dict) or not isinstance(
-                workspace.get("backend"), str
-            ):
-                raise ProtectedCloudUnavailable(
-                    "protected cloud workspace override is malformed"
-                )
-            declared_backends.append(workspace["backend"])
-    resolved = payload.get("resolved_config")
-    if resolved is not None:
-        if not isinstance(resolved, dict):
-            raise ProtectedCloudUnavailable(
-                "protected cloud resolved config is malformed"
-            )
-        agent = resolved.get("agent")
-        if agent is not None and not isinstance(agent, dict):
-            raise ProtectedCloudUnavailable(
-                "protected cloud resolved agent config is malformed"
-            )
-        workspace = agent.get("workspace") if isinstance(agent, dict) else None
-        if workspace is not None:
-            if not isinstance(workspace, dict) or not isinstance(
-                workspace.get("backend"), str
-            ):
-                raise ProtectedCloudUnavailable(
-                    "protected cloud resolved workspace config is malformed"
-                )
-            declared_backends.append(workspace["backend"])
-    if (
-        not declared_backends
-        or any(backend != "sandbox" for backend in declared_backends)
-        or not isinstance(payload.get("pod_ip"), str)
-        or not payload.get("pod_ip")
-        or (
-            payload.get("pod_port") is not None
-            and (
-                type(payload.get("pod_port")) is not int
-                or not 1 <= payload.get("pod_port") <= 65535
-            )
-        )
-        or payload.get("vm_status") not in (None, "none")
-        or payload.get("vm_ssh_host") is not None
-        or payload.get("vm_ssh_port") is not None
-        or payload.get("vm_name") is not None
-        or _canonical_runtime_generation(payload.get("workspace_generation")) is None
-        or _canonical_runtime_generation(payload.get("workspace_runtime_incarnation"))
-        is None
-        or not isinstance(payload.get("workspace_ssh_host_key_fingerprint"), str)
-        or not payload.get("workspace_ssh_host_key_fingerprint")
-        or not _pinned_runtime_generation_advertised(payload)
-        or _canonical_runtime_generation(payload.get("session_runtime_generation"))
-        is None
-    ):
-        raise ProtectedCloudUnavailable(
-            "protected cloud requires an exact sandbox workspace"
-        )
-    remote = payload.get("remote")
-    if remote is not None:
-        expected_port = payload.get("pod_port") or 30022
-        expected_key = payload.get("ssh_key_path") or "/run/secrets/vm-ssh-key"
-        if (
-            not isinstance(remote, dict)
-            or set(remote)
-            - {
-                "host",
-                "port",
-                "username",
-                "key_path",
-                "workspace_path",
-            }
-            or remote.get("host") != payload.get("pod_ip")
-            or remote.get("port") != expected_port
-            or remote.get("username") != "agent-host"
-            or remote.get("key_path") != expected_key
-            or remote.get("workspace_path") != "/home/agent-host/workspace"
-        ):
-            raise ProtectedCloudUnavailable(
-                "protected cloud remote endpoint does not match its attestation"
-            )
-    if (
-        payload.get("cloud_sync") is not None
-        or payload.get("nc_session_folder") is not None
-    ):
-        raise ProtectedCloudUnavailable(
-            "protected-cloud payload exposed a legacy live-write surface"
-        )
-    _validate_protected_cloud_mount(payload.get("cloud_mount"))
-    return "ready"
-
-
-@dataclass(frozen=True, slots=True)
-class _ProtectedWorkspaceIdentity:
-    """Exact protected workspace + mount bytes authorized for one attach."""
-
-    pod_ip: str
-    pod_port: int
-    workspace_generation: str
-    runtime_incarnation: str
-    host_fingerprint: str
-    session_runtime_generation: str
-    cloud_mount_json: str
-
-
-def _protected_workspace_identity(
-    payload: Dict[str, Any],
-) -> _ProtectedWorkspaceIdentity:
-    if _protected_workspace_delivery(payload) != "ready":
-        raise ProtectedCloudUnavailable("protected workspace is not ready")
-    return _ProtectedWorkspaceIdentity(
-        pod_ip=payload["pod_ip"],
-        pod_port=payload.get("pod_port") or 30022,
-        workspace_generation=str(UUID(payload["workspace_generation"])),
-        runtime_incarnation=str(UUID(payload["workspace_runtime_incarnation"])),
-        host_fingerprint=payload["workspace_ssh_host_key_fingerprint"],
-        session_runtime_generation=str(UUID(payload["session_runtime_generation"])),
-        cloud_mount_json=json.dumps(
-            payload["cloud_mount"],
-            sort_keys=True,
-            separators=(",", ":"),
-        ),
-    )
-
-
-class EventJournalUnavailable(RuntimeError):
-    """The persistent event generation could not be resolved authoritatively."""
 
 
 class ControlInboxBlocked(EventJournalUnavailable):
@@ -1426,19 +1044,6 @@ def _officer_cfg():
     # Strict `is True`: tests wire sessions with MagicMock configs, and a
     # truthy Mock attribute must not flip a normal session into officer mode.
     return cfg if getattr(cfg, "enabled", False) is True else None
-
-
-def _terminal_retirement_disposition() -> str:
-    """Choose the immutable outcome before beginning pinned retirement."""
-
-    identity = _attached_retirement_identity()
-    if (
-        identity is not None
-        and _retirement_admission_identity == identity
-        and _retirement_admission_disposition in {"ended", "suspended"}
-    ):
-        return _retirement_admission_disposition
-    return "suspended" if _officer_cfg() is not None else "ended"
 
 
 async def emit_session_event(method: str, params: dict) -> None:
@@ -1492,7 +1097,11 @@ def _turn_in_flight() -> bool:
     mid-turn without an explicit ``force``
     (knowledge-base/knowledge/issues/session_silent_failure_audit.md #11).
     """
-    return _loop_task is not None and not _loop_task.done() and not _awaiting_input
+    return (
+        _loop_task is not None
+        and not _loop_task.done()
+        and not _session_input.awaiting_input
+    )
 
 
 def _session_toolset_report() -> dict:
@@ -1521,7 +1130,7 @@ def _session_toolset_report() -> dict:
     if session is None:
         return {
             "attached": False,
-            "thread_id": _thread_id,
+            "thread_id": _session_identity.thread_id,
             "report": None,
         }
     names = [
@@ -1531,7 +1140,7 @@ def _session_toolset_report() -> dict:
     ]
     backend = getattr(getattr(session, "workspace_manager", None), "backend", None)
     report = build_agent_toolset_report(
-        thread_id=getattr(session, "thread_id", None) or _thread_id,
+        thread_id=getattr(session, "thread_id", None) or _session_identity.thread_id,
         tool_names=names,
         backend=backend,
     )
@@ -1546,125 +1155,6 @@ def _app_guide_health() -> dict[str, str]:
         isinstance(metadata, dict) and metadata.get("category") == "product_help"
     )
     return app_guide_health_snapshot(reader_available=reader_available)
-
-
-def _termination_admission_closed() -> bool:
-    """Return the earliest process-visible Kubernetes termination signal.
-
-    ``deletionTimestamp`` itself lives outside the container, so this function
-    deliberately does not claim to observe the API-server mutation atomically.
-    The preStop shell creates the sentinel before Python/HTTP work; the route
-    then latches the in-process boolean.  Either one closes admission.
-    """
-
-    if _termination_admission_fenced:
-        return True
-    try:
-        return _TERMINATION_SENTINEL_PATH.exists()
-    except OSError:
-        # A broken pod-local fence path is not a reason to spend through a
-        # termination signal.  The normal /tmp path is always stat-able.
-        return True
-
-
-def _attached_retirement_identity() -> tuple[str, Optional[str], Optional[str]] | None:
-    if _thread_id is None:
-        return None
-    return (
-        str(_thread_id),
-        _session_runtime_generation,
-        _session_runtime_attach_token,
-    )
-
-
-def _retirement_admission_closed() -> bool:
-    """True only for the exact attached life whose End has begun."""
-
-    identity = _attached_retirement_identity()
-    return identity is not None and _retirement_admission_identity == identity
-
-
-def _runtime_admission_closed() -> bool:
-    """Combined local fence for user/control/provider work.
-
-    Kubernetes termination is process-scoped. An owner End is session-scoped
-    so a pool agent can safely accept a later exact attach after cleanup.
-    """
-
-    return _termination_admission_closed() or _retirement_admission_closed()
-
-
-def activate_termination_admission_fence(source: str) -> bool:
-    """Latch the no-new-turn fence and wake an idle queue waiter.
-
-    Returns True only for the first process-local transition.  Repeated preStop
-    callbacks/signals are idempotent and never consume a queued user/event row.
-    """
-
-    global _termination_admission_fenced, _termination_fence_reason
-    first = not _termination_admission_fenced
-    _termination_admission_fenced = True
-    if _termination_fence_reason is None:
-        _termination_fence_reason = str(source or "termination")[:80]
-    if first:
-        logger.warning(
-            "Persistent runtime admission fenced for termination (source=%s, "
-            "turn_open=%s, tool_inflight=%s)",
-            _termination_fence_reason,
-            _turn_event_open,
-            _tool_inflight,
-        )
-    # queue.get() otherwise has no reason to wake and notice the file/flag.
-    # The sentinel is filtered by the loop and is never persisted.
-    if _awaiting_input and _loop_user_queue is not None:
-        try:
-            _loop_user_queue.put_nowait(_TERMINATION_QUEUE_SENTINEL)
-        except asyncio.QueueFull:  # pragma: no cover - production queue unbounded
-            pass
-    return first
-
-
-def _termination_quiescent() -> bool:
-    """True after the current turn's complete settlement boundary."""
-
-    if _tool_inflight or _turn_event_open:
-        return False
-    session = _session
-    if session is not None:
-        auxiliary = getattr(session, "auxiliary_llm", None)
-        if int(getattr(auxiliary, "provider_calls_inflight", 0) or 0) > 0:
-            return False
-        memory = getattr(session, "memory_service", None)
-        if int(getattr(memory, "background_tasks_inflight", 0) or 0) > 0:
-            return False
-    task = _loop_task
-    return task is None or task.done() or _awaiting_input
-
-
-async def _wait_for_termination_quiescence(timeout_seconds: float) -> bool:
-    """Wait within preStop's grace budget; never cancel an active tool."""
-
-    deadline = asyncio.get_running_loop().time() + max(0.0, timeout_seconds)
-    while not _termination_quiescent():
-        remaining = deadline - asyncio.get_running_loop().time()
-        if remaining <= 0:
-            return False
-        await asyncio.sleep(min(0.05, remaining))
-    return True
-
-
-def _termination_rejection() -> JSONResponse:
-    """Stable, base64/secret-free retry contract for direct injectors."""
-
-    return JSONResponse(
-        {
-            "error": "runtime_terminating",
-            "retryable": True,
-            "message": "Persistent runtime is terminating; retry on its replacement.",
-        },
-        status_code=503,
-        headers={"Retry-After": "5"},
-    )
 
 
 def _protected_cloud_runtime_ready() -> bool:
@@ -1685,43 +1175,10 @@ def _protected_cloud_runtime_ready() -> bool:
 
 
 def _runtime_input_admission_open() -> bool:
-    return not _runtime_admission_closed() and _protected_cloud_runtime_ready()
-
-
-def _protected_cloud_unavailable_rejection() -> JSONResponse:
-    return JSONResponse(
-        {
-            "error": "protected_cloud_unavailable",
-            "retryable": True,
-            "message": "Protected cloud is temporarily unavailable; retry when it recovers.",
-        },
-        status_code=503,
-        headers={"Retry-After": "5"},
+    return (
+        not _session_termination.runtime_admission_closed()
+        and _protected_cloud_runtime_ready()
     )
-
-
-def _current_pinned_session_identity_fingerprint() -> str | None:
-    """Return the exact local identity used by readiness and effect gates."""
-
-    return pinned_session_ready_identity_fingerprint(
-        thread_id=_thread_id,
-        runtime_generation=_session_runtime_generation,
-        agent_id=_registered_pinned_agent_id(),
-        runtime_attach_token=_session_runtime_attach_token,
-        pod_uid=os.environ.get("POD_UID"),
-    )
-
-
-def _canonical_pinned_session_identity_fingerprint(value: Any) -> str | None:
-    """Return one exact v1 fingerprint, never a normalised lookalike."""
-
-    if not isinstance(value, str) or not (
-        value.startswith("sha256:")
-        and len(value) == 71
-        and all(char in "0123456789abcdef" for char in value[7:])
-    ):
-        return None
-    return value
 
 
 def _session_ready() -> bool:
@@ -1729,19 +1186,19 @@ def _session_ready() -> bool:
     primitives are ready to accept a WS subscriber.
 
     Three-way check: ``_session.llm_with_tools`` is set near the end of
-    ``PersistentSession.setup()``, but ``_loop_user_queue`` is initialized
-    later in ``_attach_session`` (after repo clone, cloud sync pull, message
+    ``PersistentSession.setup()``, but the input queue is published
+    later by the attach coordinator (after repo clone, cloud sync pull, message
     restore, and the ``thread_status='active'`` DB update). Anything that
     gates session readiness — the readiness probes (``/ready``,
-    ``/session/status``) and ``handle_persistent_websocket`` — must call
+    ``/session/status``) and the session WebSocket transport — must call
     this so the WS isn't accepted in the mid-attach window where the loop's
     get-user-input callback would crash on a ``None`` queue.
     """
     return (
-        not _runtime_admission_closed()
+        not _session_termination.runtime_admission_closed()
         and _session is not None
         and _session.llm_with_tools is not None
-        and _loop_user_queue is not None
+        and _session_input.queue is not None
         and _protected_cloud_runtime_ready()
     )
 
@@ -1769,7 +1226,7 @@ def _ensure_persistent_loop_started(
         if callable(_cb_setter):
             _cb_setter(_loop_compaction_progress)
         callbacks = PersistentLoopCallbacks(
-            get_user_input=_loop_get_user_input,
+            get_user_input=_session_input.get_user_input,
             on_token=_loop_on_token,
             on_thinking=_loop_on_thinking,
             on_tool_start=_loop_on_tool_start,
@@ -1780,7 +1237,8 @@ def _ensure_persistent_loop_started(
             on_turn_start=_loop_on_turn_start,
             on_turn_complete=_loop_on_turn_complete,
             on_error=_loop_on_error,
-            check_interrupt=_loop_check_interrupt,
+            check_interrupt=_session_input.check_interrupt,
+            peek_interrupt_cause=_session_input.peek_interrupt_cause,
             on_workspace_upgrade_needed=_loop_on_workspace_upgrade_needed,
             on_workspace_commit=_loop_on_workspace_commit,
             on_context_compacted=_loop_on_context_compacted,
@@ -1789,22 +1247,26 @@ def _ensure_persistent_loop_started(
             on_turn_settled=_loop_on_turn_settled,
             archive_llm_call=_loop_archive_llm_call,
             on_usage=_loop_on_usage,
-            hard_interrupt_event=_hard_interrupt_event,
+            hard_interrupt_event=_session_input.hard_interrupt_event,
             on_thinking_reset=_loop_on_thinking_reset,
             before_turn_authorization=_loop_before_turn_authorization,
             before_provider_admission=_loop_provider_admission_open,
             before_provider_execution=_loop_runtime_effect_authority_current,
-            admit_input_delivery=_loop_admit_input_delivery,
-            defer_input_delivery=_loop_defer_input_delivery,
-            cancel_input_delivery=_loop_cancel_input_delivery,
-            defer_and_requeue_input_delivery=(_loop_defer_and_requeue_input_delivery),
-            settle_input_delivery=_loop_settle_input_delivery,
+            admit_input_delivery=_session_input.admit_delivery,
+            defer_input_delivery=_session_input.defer_delivery,
+            cancel_input_delivery=_session_input.cancel_delivery,
+            defer_and_requeue_input_delivery=(
+                _session_input.defer_and_requeue_delivery
+            ),
+            settle_input_delivery=_session_input.settle_delivery,
+            idle_input_arrived=_loop_idle_input_arrived,
+            save_pending_memory=_loop_save_pending_memory,
         )
         # Tag the loop task — and the turn/aux tasks it spawns, which copy this
         # context at creation — with thread_id for log correlation.
         from agent.core.logging_config import bind_log_context, reset_log_context
 
-        _ctx_token = bind_log_context(thread_id=_thread_id)
+        _ctx_token = bind_log_context(thread_id=_session_identity.thread_id)
         _loop_task = asyncio.create_task(
             run_persistent_loop(
                 llm_with_tools=_session.llm_with_tools,
@@ -1821,10 +1283,7 @@ def _ensure_persistent_loop_started(
                 project_ids=_session.project_ids,
                 tool_context=_session.tool_context,
                 initial_turn_count=_session.turn_count,
-                get_current_tools=lambda: (
-                    _session.llm_with_tools,
-                    _session.tools,
-                ),
+                get_current_tools=_loop_current_tools,
                 get_current_context=lambda: (
                     _session.context_manager,
                     _session.config,
@@ -1850,13 +1309,10 @@ def _ensure_persistent_loop_started(
             ),
             name="persistent-loop",
         )
-        asyncio.create_task(
-            _loop_completion_handler(_loop_task),
-            name="persistent-loop-completion",
-        )
+        _session_termination.start_loop_completion_handler(_loop_task)
         logger.info(
             "Persistent loop started: thread=%s source=%s",
-            _thread_id,
+            _session_identity.thread_id,
             source,
         )
         reset_log_context(_ctx_token)
@@ -1870,656 +1326,15 @@ def _ensure_persistent_loop_started(
     else:
         logger.info(
             "Persistent loop already running: thread=%s source=%s",
-            _thread_id,
+            _session_identity.thread_id,
             source,
         )
     return True
 
 
-async def _handle_heartbeat_intents(response: dict[str, Any]) -> None:
-    """Heartbeat-response callback: react to orchestrator-set intents.
-
-    Currently only ``should_drain`` triggers anything. What it does depends
-    on session state:
-
-    - No session attached → exit the pod (idle pool agent, nothing to save).
-    - Session attached, loop parked between turns → clean drain-suspend:
-      flush + teardown, then ask the orchestrator to snapshot the workspace
-      and mark the thread ``suspended`` so the next user input walks the
-      proven suspended-resume path on a fresh (new-build) agent. Falls back
-      to the legacy ``ended`` detach if the orchestrator can't suspend.
-    - Session attached, turn in flight → defer; re-checked on every 5s
-      heartbeat until the loop parks. A drain never kills a running turn.
-
-    Idempotent: fires once per process; later heartbeats observing the same
-    intent are no-ops. See
-    knowledge-base/knowledge/issues/session_agent_drift_drain_kills_idle_sessions.md.
-    """
-    global _drain_intent_handled, _drain_deferred_logged
-    if _drain_intent_handled:
-        return
-    intents = response.get("intents") or {}
-    if not isinstance(intents, dict):
-        return
-    if not intents.get("should_drain"):
-        return
-    reason = intents.get("drain_reason", "unspecified")
-
-    pending = _pending_drain_suspend
-    if pending is not None and pending.get("locally_quiesced") is True:
-        # Begin makes ordinary heartbeats authority-refused, so they cannot be
-        # the retry clock. Rejoin/start the one tracked exact settlement task;
-        # it uses capped backoff and keeps this runtime non-ready throughout.
-        _drain_intent_handled = True
-        await asyncio.shield(_start_pending_exact_drain_suspend_retry())
-        return
-
-    if _session is not None and not _session_parked():
-        if not _drain_deferred_logged:
-            logger.info(
-                "Drain intent received from orchestrator (reason=%s) but a "
-                "turn is in flight — deferring until the loop parks",
-                reason,
-            )
-            _drain_deferred_logged = True
-        return
-
-    _drain_intent_handled = True
-    if _session is None:
-        logger.info(
-            "Drain intent received from orchestrator (reason=%s) — no session "
-            "attached, exiting",
-            reason,
-        )
-        _schedule_exit(delay=1.0)
-        return
-
-    logger.info(
-        "Drain intent received from orchestrator (reason=%s) — suspending "
-        "session and exiting",
-        reason,
-    )
-    await _drain_suspend_session()
-
-
-def _session_parked() -> bool:
-    """True when the persistent loop is parked waiting for user input.
-
-    Parked = blocked in _loop_get_user_input's queue wait with nothing
-    queued and no tool call in flight. Anything else counts as an active
-    turn and must not be torn down out-of-band.
-    """
-    if not _awaiting_input or _tool_inflight:
-        return False
-    if _runtime_admission_closed():
-        # Queue contents remain durable/deferred for the replacement.  They do
-        # not make the predecessor active once termination admission is closed.
-        return True
-    queue = _loop_user_queue
-    return queue is None or queue.empty()
-
-
-async def _drain_suspend_session() -> None:
-    """Drain an attached idle session via clean suspend instead of kill.
-
-    Converges on the attention-sleep terminal state — thread ``suspended``,
-    workspace snapshotted to S3, both pods gone — so the next user input
-    resumes through the existing suspended-restore path instead of racing a
-    half-deleted workspace pod (the 409→503 "session ended" failure this
-    replaces).
-    """
-    global _drain_intent_handled, _pending_drain_suspend
-
-    thread_id = _thread_id
-    runtime_agent_id = _registered_pinned_agent_id()
-    runtime_generation = _session_runtime_generation
-    runtime_attach_token = _session_runtime_attach_token
-    runtime_session = _session
-
-    # Suspend is a terminal retirement disposition too. Close/drain durable
-    # controls and install the exact retirement token before touching the
-    # loop, workspace, mounts, or transport. A failed begin leaves the current
-    # session intact so a later heartbeat can retry safely.
-    if not await _begin_exact_session_retirement(
-        pinned_agent_id=runtime_agent_id,
-        retirement_disposition="suspended",
-    ):
-        _drain_intent_handled = False
-        logger.warning(
-            "Drain-suspend could not begin exact retirement; local teardown "
-            "suppressed (thread=%s)",
-            thread_id,
-        )
-        return
-
-    if runtime_generation is not None and runtime_attach_token is not None:
-        _pending_drain_suspend = {
-            "thread_id": thread_id,
-            "agent_id": runtime_agent_id,
-            "session_runtime_generation": runtime_generation,
-            "session_runtime_attach_token": runtime_attach_token,
-            "session_runtime_retirement_token": _retirement_admission_token,
-            "workspace_generation": str(
-                getattr(runtime_session, "workspace_generation", "") or ""
-            ),
-            "workspace_runtime_incarnation": str(
-                getattr(runtime_session, "workspace_runtime_incarnation", "") or ""
-            ),
-            "locally_quiesced": False,
-        }
-
-    # Flush + teardown WITHOUT marking the thread ended — the orchestrator
-    # owns the 'suspended' transition and its durable lifecycle frame below.
-    # Publishing that outcome from the agent before the settlement CAS would
-    # lie on a failed snapshot/cleanup. Clearing _session here also
-    # makes the SIGTERM shutdown handler a no-op when the orchestrator
-    # deletes this pod as part of the suspend.
-    try:
-        await _terminate_session(
-            "drain",
-            mark_thread=False,
-            preserve_shell=False,
-        )
-    except Exception as e:
-        logger.warning(f"Session teardown during drain-suspend failed: {e}")
-        # The exact ``ending`` token remains the durable authority fence. Do
-        # not ask the orchestrator to snapshot/delete/settle while local
-        # producers, the ordered writer, or mount managers may still be live.
-        # Leaving this unhandled lets the same runtime retry quiescence; the
-        # retirement reconciler is the cross-process backstop.
-        _drain_intent_handled = False
-        return
-
-    if _pending_drain_suspend is not None:
-        _pending_drain_suspend["locally_quiesced"] = True
-        _pending_drain_suspend["local_quiescence_protocol"] = str(
-            getattr(runtime_session, "local_quiescence_protocol", "") or ""
-        )
-        await asyncio.shield(_start_pending_exact_drain_suspend_retry())
-        return
-
-    suspended = False
-    if _orchestrator_client and thread_id:
-        try:
-            suspended = await _orchestrator_client.suspend_thread(
-                thread_id,
-                pinned_agent_id=runtime_agent_id,
-                session_runtime_generation=runtime_generation,
-                session_runtime_attach_token=runtime_attach_token,
-            )
-        except Exception as e:
-            logger.warning(f"Drain-suspend request failed: {e}")
-    if (
-        not suspended
-        and thread_id
-        and (runtime_generation is None or runtime_attach_token is None)
-    ):
-        # Legacy fallback: mark ended (recoverable — the orchestrator's
-        # 'ended' handler snapshots best-effort via _suspend_thread_resources
-        # and refuses to clobber an already-'suspended' thread, so a lost
-        # suspend response can't end a suspended session). Uses the captured
-        # thread_id — _update_thread_status reads module globals that
-        # _terminate_session already cleared.
-        logger.warning(
-            "Drain-suspend unavailable for thread %s — falling back to "
-            "legacy ended detach",
-            thread_id,
-        )
-        if _orchestrator_client:
-            try:
-                await _orchestrator_client.update_thread_status(
-                    thread_id,
-                    "ended",
-                    pinned_agent_id=runtime_agent_id,
-                    session_runtime_generation=runtime_generation,
-                    session_runtime_attach_token=runtime_attach_token,
-                )
-            except Exception as e:
-                logger.warning(f"Fallback ended write failed: {e}")
-    _schedule_exit(delay=1.0)
-
-
-def _start_pending_exact_drain_suspend_retry() -> asyncio.Task[None]:
-    """Own one exact post-quiescence suspend retry loop."""
-
-    global _pending_drain_suspend_retry_task
-
-    task = _pending_drain_suspend_retry_task
-    if task is not None and not task.done():
-        return task
-    task = asyncio.create_task(
-        _retry_pending_exact_drain_suspend(),
-        name="exact-drain-suspend-settlement",
-    )
-    _pending_drain_suspend_retry_task = task
-    return task
-
-
-async def _retry_pending_exact_drain_suspend() -> None:
-    """Retry/reconcile exact suspend without heartbeat or cleanup replay."""
-
-    global _drain_intent_handled, _pending_drain_suspend
-    global _pending_drain_suspend_retry_task
-
-    pending = _pending_drain_suspend
-    if pending is None or pending.get("locally_quiesced") is not True:
-        _drain_intent_handled = False
-        return
-    attempt = 0
-    try:
-        while _pending_drain_suspend is pending:
-            client = _orchestrator_client
-            suspended = False
-            if client is not None:
-                try:
-                    suspended = await client.suspend_thread(
-                        pending["thread_id"],
-                        pinned_agent_id=pending.get("agent_id"),
-                        session_runtime_generation=pending[
-                            "session_runtime_generation"
-                        ],
-                        session_runtime_attach_token=pending[
-                            "session_runtime_attach_token"
-                        ],
-                        session_runtime_retirement_token=pending.get(
-                            "session_runtime_retirement_token"
-                        ),
-                        local_runtime_quiesced=True,
-                        local_quiescence_protocol=pending.get(
-                            "local_quiescence_protocol"
-                        ),
-                        workspace_generation=pending.get("workspace_generation")
-                        or None,
-                        workspace_runtime_incarnation=pending.get(
-                            "workspace_runtime_incarnation"
-                        )
-                        or None,
-                    )
-                except Exception as exc:
-                    logger.warning(
-                        "Exact drain-suspend retry failed: %s",
-                        type(exc).__name__,
-                    )
-            if not suspended and client is not None:
-                outcome_reader = getattr(client, "get_thread_retirement_outcome", None)
-                if callable(outcome_reader):
-                    try:
-                        outcome = await outcome_reader(
-                            pending["thread_id"],
-                            pinned_agent_id=pending["agent_id"],
-                            session_runtime_generation=pending[
-                                "session_runtime_generation"
-                            ],
-                            session_runtime_attach_token=pending[
-                                "session_runtime_attach_token"
-                            ],
-                            session_runtime_retirement_token=pending[
-                                "session_runtime_retirement_token"
-                            ],
-                            retirement_disposition="suspended",
-                            retirement_permanent=False,
-                        )
-                    except Exception:
-                        outcome = None
-                    suspended = bool(
-                        isinstance(outcome, dict)
-                        and outcome.get("status") == "settled_or_superseded"
-                        and outcome.get("outcome") in {"settled", "deleted"}
-                        and outcome.get("retirement_disposition") == "suspended"
-                        and outcome.get("retirement_permanent") is False
-                    )
-            if suspended:
-                _pending_drain_suspend = None
-                _drain_intent_handled = True
-                _schedule_exit(delay=1.0)
-                return
-            _drain_intent_handled = True
-            delay = _EXACT_RETIREMENT_SETTLEMENT_RETRY_DELAYS[
-                min(attempt + 1, len(_EXACT_RETIREMENT_SETTLEMENT_RETRY_DELAYS) - 1)
-            ]
-            logger.warning(
-                "Exact drain-suspend remains pending for thread %s; process "
-                "kept nonclaimable for retry",
-                pending["thread_id"],
-            )
-            attempt += 1
-            await asyncio.sleep(delay)
-    finally:
-        if _pending_drain_suspend_retry_task is asyncio.current_task():
-            _pending_drain_suspend_retry_task = None
-
-
-_DEREGISTER_ON_EXIT_TIMEOUT_S = 5.0
-
-
-async def _deregister_before_exit() -> None:
-    """Best-effort deregistration ahead of os._exit.
-
-    os._exit bypasses the lifespan shutdown that normally deregisters
-    (the startup-failure ``_exit_*`` helpers already deregister inline),
-    so without this every clean exit leaves an agents row that the
-    orchestrator's 3-minute heartbeat sweep flips to offline and reports
-    as a fleet:agents_offline corpse. Bounded and non-raising — a slow or
-    failed deregister must never hold up or abort the exit (the
-    stale-agent sweep stays the backstop, exactly as for crashes).
-    """
-    client = _orchestrator_client
-    if client is None:
-        return
-    client.stop_heartbeat()
-    hb = _heartbeat_task
-    if hb is not None and not hb.done() and hb is not asyncio.current_task():
-        # A heartbeat landing mid-deregister would 404 and re-register,
-        # resurrecting the row this call is about to delete. Never
-        # self-cancel — drain intents arrive inside the heartbeat task.
-        hb.cancel()
-    if not client.agent_id:
-        return
-    try:
-        await asyncio.wait_for(
-            client.deregister(), timeout=_DEREGISTER_ON_EXIT_TIMEOUT_S
-        )
-    except Exception as e:
-        logger.warning(f"Best-effort deregister before exit failed: {e}")
-
-
-def _schedule_exit(delay: float = 1.0) -> None:
-    """Schedule process exit after a short delay (allows final I/O to flush)."""
-    global _pending_exit_task
-
-    if _pending_exit_task and not _pending_exit_task.done():
-        _pending_exit_task.cancel()
-
-    async def _exit():
-        await asyncio.sleep(delay)
-        await _deregister_before_exit()
-        logger.info("Session complete — exiting process")
-        os._exit(0)
-
-    _pending_exit_task = asyncio.create_task(_exit())
-
-
 # ---------------------------------------------------------------------------
 # Self-cleanup watchdogs (PR 2)
 # ---------------------------------------------------------------------------
-
-
-async def _boot_ws_watchdog(timeout_s: int) -> None:
-    """Exit if no /ws/chat connection arrives within ``timeout_s`` of attach.
-
-    A persistent agent that boots, attaches to a thread, then never receives
-    a WebSocket has no other way to know it's been abandoned (e.g. user
-    navigated away during creation). Without this watchdog the pod sits
-    forever heartbeating and holding a slot. The orchestrator reconciler
-    catches this too, but only after a 60s+ delay; this watchdog kills
-    locally on the configured cadence.
-
-    Officer sessions are exempt: they are headless BY DESIGN — no browser
-    ever attaches, so "no WS yet" is their normal steady state, not
-    abandonment (found by the S3 k3d smoke: every officer died exactly
-    600s after boot and had to be respawned by the orchestrator watchdog).
-    The officer watchdog owns their lifecycle end to end.
-    """
-    if _officer_cfg() is not None:
-        return
-    if _ws_connected_event is None:
-        return
-    try:
-        await asyncio.wait_for(_ws_connected_event.wait(), timeout=timeout_s)
-        return  # WS arrived — normal lifecycle takes over
-    except asyncio.TimeoutError:
-        logger.warning(
-            "No WebSocket connection within %ds for thread %s — "
-            "exiting (likely abandoned during creation).",
-            timeout_s,
-            _thread_id,
-        )
-    try:
-        await _terminate_session("boot_ws_timeout")
-    except Exception as e:
-        logger.warning(f"Detach during boot-WS timeout failed: {e}")
-        # Exact pinned teardown may still have a writer, workspace process, or
-        # unacknowledged retirement receipt.  Keep the runtime fenced and let
-        # its tracked retry/reconciler converge; exiting would discard the
-        # only truthful local-quiescence owner.
-        return
-    _schedule_exit(delay=1.0)
-
-
-async def _thread_status_watchdog(poll_s: int) -> None:
-    """Exit if the bound thread transitions to a terminal state out-of-band.
-
-    The orchestrator's stale_agent_detector can flip a thread to 'ended'
-    via ``mark_orphaned_threads_ended`` or release the binding via
-    ``mark_stuck_session_agents_ready`` (PR 1). When that happens this pod
-    is orphaned — no work to do, holding a slot.
-
-    'awaiting_user' is the eager-mode transient idle state set by this same
-    agent's loop on natural pause with no subscribers (Phase 5,
-    ``_loop_get_user_input``). It is NOT a terminal state — the orchestrator's
-    attention-sleep watchdog owns the eventual ``awaiting_user → suspended``
-    transition and we mustn't pre-empt it from here, or we kill the very
-    untethered-survival behaviour Phase 1 + Phase 5 were built to enable.
-
-    'suspended' means the orchestrator has already snapshotted + deleted the
-    workspace pod — at that point we're a stranded agent with no workspace,
-    so we exit.
-    """
-    global _retirement_admission_identity, _retirement_admission_disposition
-    global _retirement_admission_token
-    global _retirement_admission_permanent
-
-    bound_thread_id = _thread_id
-    bound_runtime_generation = _session_runtime_generation
-    bound_runtime_attach_token = _session_runtime_attach_token
-    runtime_generation_required = _pinned_runtime_generation_enabled
-    while True:
-        try:
-            await asyncio.sleep(poll_s)
-        except asyncio.CancelledError:
-            raise
-        if not _orchestrator_client or not bound_thread_id:
-            continue
-        if (
-            _thread_id != bound_thread_id
-            or _session_runtime_generation != bound_runtime_generation
-            or _session_runtime_attach_token != bound_runtime_attach_token
-        ):
-            return
-        try:
-            lifecycle = await _orchestrator_client.get_thread_lifecycle(bound_thread_id)
-        except Exception as e:
-            logger.debug(f"Thread lifecycle poll failed (non-fatal): {e}")
-            continue
-        if not lifecycle:
-            continue
-        if (
-            _thread_id != bound_thread_id
-            or _session_runtime_generation != bound_runtime_generation
-            or _session_runtime_attach_token != bound_runtime_attach_token
-        ):
-            return
-        status = lifecycle.get("status")
-        observed_generation = _canonical_runtime_generation(
-            lifecycle.get("session_runtime_generation")
-        )
-        generation_moved = bool(
-            bound_runtime_generation is not None
-            and observed_generation != bound_runtime_generation
-        )
-        generation_missing = bool(
-            runtime_generation_required and observed_generation is None
-        )
-        observed_attach_token = _canonical_runtime_generation(
-            lifecycle.get("session_runtime_attach_token")
-        )
-        attach_token_moved = observed_attach_token != bound_runtime_attach_token
-        retirement_preflight = lifecycle.get("runtime_retirement_preflight") is True
-        retirement_authorized = lifecycle.get("runtime_retirement_authorized") is True
-        if retirement_preflight and not retirement_authorized:
-            # Owner End is still checking turn/control preconditions. No
-            # authority has been minted and it may be aborted; keep the exact
-            # runtime fully alive and never infer retirement from "pending".
-            continue
-        if (
-            status == "ending"
-            and retirement_authorized
-            and not generation_moved
-            and not generation_missing
-            and not attach_token_moved
-        ):
-            disposition = lifecycle.get("retirement_disposition")
-            permanent = lifecycle.get("retirement_permanent")
-            retirement_token = _canonical_runtime_generation(
-                lifecycle.get("session_runtime_retirement_token")
-            )
-            if disposition not in {"ended", "suspended"}:
-                logger.warning(
-                    "Authorized retirement omitted its immutable disposition "
-                    "(thread=%s)",
-                    bound_thread_id,
-                )
-                continue
-            if type(permanent) is not bool:
-                logger.warning(
-                    "Authorized retirement omitted immutable permanent intent "
-                    "(thread=%s)",
-                    bound_thread_id,
-                )
-                continue
-            identity = _attached_retirement_identity()
-            if identity is None:
-                return
-            _retirement_admission_identity = identity
-            _retirement_admission_disposition = disposition
-            # A malformed/missing token is not locally accepted. The common
-            # Begin call below will idempotently recover the exact token from
-            # the server before any teardown effect.
-            _retirement_admission_token = retirement_token
-            _retirement_admission_permanent = permanent
-            try:
-                await _terminate_session("thread_retirement_authorized")
-            except Exception as exc:
-                logger.warning(
-                    "Authorized retirement cleanup failed: %s", type(exc).__name__
-                )
-                return
-            _schedule_exit(delay=1.0)
-            return
-        if status == "ending":
-            # Exact-contract retirement is actionable only with the explicit
-            # authorization bit and immutable disposition/token handshake.
-            # A malformed or mixed-version shape must not trick the runtime
-            # into tearing down while owner preflight may still abort.
-            logger.warning(
-                "Ignoring unauthorised/malformed ending lifecycle response "
-                "for thread %s",
-                bound_thread_id,
-            )
-            continue
-        if (
-            status not in ("created", "active", "awaiting_user")
-            or generation_moved
-            or generation_missing
-            or attach_token_moved
-        ):
-            logger.info(
-                "Thread %s lifecycle no longer belongs to this runtime "
-                "(status=%r generation_match=%s attach_match=%s) — exiting.",
-                bound_thread_id,
-                status,
-                not (generation_moved or generation_missing),
-                not attach_token_moved,
-            )
-            try:
-                await _terminate_session("thread_ended_oob")
-            except Exception as e:
-                logger.warning(f"Detach during status-watchdog exit failed: {e}")
-                # Local writer/process/mount quiescence or exact receipt is
-                # unproven.  Exiting here would abandon live workspace writers
-                # and the only local retry owner. Stay fenced/nonclaimable;
-                # the exact retirement task or durable reconciler converges it.
-                return
-            _schedule_exit(delay=1.0)
-            return
-
-
-def _start_watchdogs() -> None:
-    """Start watchdog tasks for the active session. Safe to call repeatedly."""
-    global _ws_connected_event, _watchdog_tasks
-
-    # Stateless executor (M3): no boot-WS ever arrives (input rides the run
-    # queue) and thread status is orchestrator-owned — both watchdogs would
-    # tear down healthy cached sessions. The run_queue lease/reaper plays
-    # their abandoned-pod role in this mode.
-    if _stateless_mode():
-        logger.debug("Stateless executor mode: session watchdogs disabled")
-        return
-
-    # Stop any prior watchdogs (defensive — should already be cleared).
-    for task in _watchdog_tasks:
-        if not task.done():
-            task.cancel()
-    _watchdog_tasks = []
-
-    _ws_connected_event = asyncio.Event()
-    _watchdog_tasks = [
-        asyncio.create_task(
-            _boot_ws_watchdog(_session_boot_ws_timeout_s),
-            name="boot-ws-watchdog",
-        ),
-        asyncio.create_task(
-            _thread_status_watchdog(_thread_status_poll_s),
-            name="thread-status-watchdog",
-        ),
-    ]
-
-
-def _stop_watchdogs() -> None:
-    """Cancel all active watchdogs. Skips the current task to avoid self-cancel."""
-    global _watchdog_tasks
-    current = asyncio.current_task()
-    for task in _watchdog_tasks:
-        if task is current or task.done():
-            continue
-        task.cancel()
-    _watchdog_tasks = []
-
-
-async def _stop_and_join_watchdogs() -> None:
-    """Cancel watchdogs and prove every independent task has quiesced."""
-
-    global _watchdog_tasks
-    current = asyncio.current_task()
-    owned = [
-        task for task in _watchdog_tasks if task is not current and not task.done()
-    ]
-    _stop_watchdogs()
-    if not owned:
-        return
-    done, pending = await asyncio.wait(
-        owned,
-        timeout=float(os.environ.get("SESSION_WATCHDOG_CLOSE_TIMEOUT_S", "5")),
-    )
-    if pending:
-        # Retain exact task ownership so the same retirement can retry joining
-        # it. Remote stage/delete/settlement must not race an ignored cancel.
-        _watchdog_tasks = list(pending)
-        raise EventJournalUnavailable(
-            f"{len(pending)} session watchdog(s) ignored cancellation"
-        )
-    for task in done:
-        if not task.cancelled() and task.exception() is not None:
-            logger.warning(
-                "Session watchdog failed while joining terminal teardown: %s",
-                type(task.exception()).__name__,
-            )
-
-
-def _signal_ws_connected() -> None:
-    """Signal that a WebSocket has connected. Cancels the boot-WS watchdog."""
-    if _ws_connected_event is not None:
-        _ws_connected_event.set()
 
 
 def _get_agent_metrics() -> Optional[Dict[str, Any]]:
@@ -2591,186 +1406,14 @@ def _aux_health_for_heartbeat() -> Optional[Dict[str, Any]]:
         return None
 
 
-async def _release_delivered_attach_before_dedicated_exit(thread_id: str) -> None:
-    """Rotate a failed dedicated attach only from its exact zero proof."""
-
-    receipt = _failed_attach_release_receipt
-    if receipt is None:
-        return
-    if not isinstance(receipt, dict) or receipt.get("thread_id") != thread_id:
-        raise EventJournalUnavailable(
-            "failed attach release receipt belongs to a different runtime"
-        )
-    confirmed = await _release_failed_attach_receipt_until_confirmed(
-        thread_id,
-        runtime_generation=receipt.get("session_runtime_generation"),
-        runtime_attach_token=receipt.get("session_runtime_attach_token"),
-    )
-    if not confirmed:
-        raise EventJournalUnavailable(
-            "failed attach release remains unconfirmed; exit suppressed"
-        )
-
-
-async def _exit_workspace_not_ready(thread_id: str, exc: Exception) -> NoReturn:
-    """Handle an unrecoverable workspace error during lifespan startup
-    (WorkspaceNotReady — never provisioned/wedged; or WorkspaceUnavailableError
-    — pod dead/unreachable): best-effort deregister then exit.
-
-    Exits the process with status 0 (pod Completed, not Failed) so Kubernetes
-    does not restart-loop the pod.  The orchestrator's session reconciler will
-    recover the workspace and bind a fresh agent on the next interaction.
-    """
-    logger.info(
-        "Workspace not ready for thread %s (%s) — exiting cleanly so the "
-        "orchestrator can rebind once the workspace recovers (not a crash).",
-        thread_id,
-        exc,
-    )
-    await _release_delivered_attach_before_dedicated_exit(thread_id)
-    if _orchestrator_client:
-        try:
-            _orchestrator_client.stop_heartbeat()
-            if _heartbeat_task:
-                _heartbeat_task.cancel()
-            await _orchestrator_client.deregister()
-            await _orchestrator_client.close()
-        except Exception as de:
-            logger.warning(
-                "Best-effort deregister on workspace-not-ready failed: %s", de
-            )
-    os._exit(0)
-
-
-async def _exit_grant_denied(thread_id: str, exc: Exception) -> NoReturn:
-    """Handle a capability-grant denial at session attach (the workspace endpoint
-    returned 403): log the REAL reason and exit cleanly (status 0, pod Completed
-    — no K8s restart-loop). Unlike :func:`_exit_workspace_not_ready` this is NOT
-    a transient workspace problem — a rebind hits the identical denial — so we do
-    NOT claim the orchestrator will recover it. The cockpit re-surfaces the
-    reason on its next create/prepare via the grant pre-flight (Layers 1/2).
-    See knowledge-base/knowledge/issues/session_permission_mode_grant_denied_ready_timeout.md.
-    """
-    logger.error(
-        "Session attach denied for thread %s by capability grants (%s) — exiting "
-        "cleanly; NOT retrying (a rebind hits the same denial). The cockpit "
-        "surfaces this on its next create/prepare grant pre-flight.",
-        thread_id,
-        exc,
-    )
-    await _release_delivered_attach_before_dedicated_exit(thread_id)
-    if _orchestrator_client:
-        try:
-            _orchestrator_client.stop_heartbeat()
-            if _heartbeat_task:
-                _heartbeat_task.cancel()
-            await _orchestrator_client.deregister()
-            await _orchestrator_client.close()
-        except Exception as de:
-            logger.warning("Best-effort deregister on grant-denied exit failed: %s", de)
-    os._exit(0)
-
-
-async def _exit_memory_unavailable(thread_id: str, exc: Exception) -> NoReturn:
-    """Handle a required-memory setup failure at session attach: a configured
-    memory component (embedding-backed store or a plugin whose transport won't
-    resolve — e.g. the reranker endpoint) could not be set up.
-
-    Like :func:`_exit_grant_denied` this is a deterministic config failure, NOT
-    a transient workspace problem — a rebind hits the identical failure — so we
-    exit cleanly (status 0, pod Completed, no K8s restart-loop) rather than
-    crash-looping. The cockpit re-surfaces the reason on its next create/prepare
-    via the orchestrator's endpoint pre-flight (which validates the same roles
-    before spawning a pod). See
-    knowledge-base/knowledge/issues/openrouter_auxiliary_crashes_session_via_memory_reranker.md.
-    """
-    logger.error(
-        "Session attach failed for thread %s — required memory unavailable (%s) "
-        "— exiting cleanly; NOT retrying (a rebind hits the same failure). The "
-        "cockpit surfaces this on its next create/prepare endpoint pre-flight.",
-        thread_id,
-        exc,
-    )
-    await _release_delivered_attach_before_dedicated_exit(thread_id)
-    if _orchestrator_client:
-        try:
-            _orchestrator_client.stop_heartbeat()
-            if _heartbeat_task:
-                _heartbeat_task.cancel()
-            await _orchestrator_client.deregister()
-            await _orchestrator_client.close()
-        except Exception as de:
-            logger.warning(
-                "Best-effort deregister on memory-unavailable exit failed: %s", de
-            )
-    os._exit(0)
-
-
-async def _exit_duplicate_provision(thread_id: str) -> NoReturn:
-    """Handle a lost provisioning race (409) during lifespan startup.
-
-    Another live agent already owns this thread, so this pod must not serve it.
-    We exit with status 0 (pod Completed under restartPolicy: Never, no restart
-    loop) so the pod drops out of the per-session Service's endpoints instead of
-    lingering as an orphan that black-holes ~half the cockpit's connection
-    attempts (the Service uses publishNotReadyAddresses, so a not-ready orphan
-    stays a live target). Only this pod's own agent record is cleaned up — never
-    any thread-scoped resource, which belongs to the winning agent.
-    """
-    logger.warning(
-        "Lost the provisioning race for thread %s — another live agent already "
-        "owns it; exiting cleanly so this orphan pod leaves the session Service "
-        "endpoints (not a crash).",
-        thread_id,
-    )
-    if _orchestrator_client:
-        try:
-            _orchestrator_client.stop_heartbeat()
-            if _heartbeat_task:
-                _heartbeat_task.cancel()
-            await _orchestrator_client.deregister()
-            await _orchestrator_client.close()
-        except Exception as de:
-            logger.warning(
-                "Best-effort deregister on duplicate-provision exit failed: %s", de
-            )
-    os._exit(0)
-
-
-async def _exit_session_ended(thread_id: str) -> NoReturn:
-    """Exit a dedicated runtime refused by the ended-session fence."""
-
-    logger.info(
-        "Thread %s ended before runtime attach — exiting without retrying or "
-        "serving credentials.",
-        thread_id,
-    )
-    if _orchestrator_client:
-        try:
-            _orchestrator_client.stop_heartbeat()
-            if _heartbeat_task:
-                _heartbeat_task.cancel()
-            await _orchestrator_client.deregister()
-            await _orchestrator_client.close()
-        except Exception as de:
-            logger.warning("Best-effort ended-session deregister failed: %s", de)
-    os._exit(0)
-
-
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Initialize persistent agent, register with orchestrator, start heartbeat."""
-    global \
-        _agent, \
-        _session, \
-        _orchestrator_client, \
-        _heartbeat_task, \
-        _started_at, \
-        _thread_id
+    global _agent, _session, _orchestrator_client, _heartbeat_task, _started_at
 
     _started_at = datetime.now()
     stateless = _stateless_mode()
-    pool_mode = _thread_id is None
+    pool_mode = _session_identity.thread_id is None
     if stateless:
         logger.info(
             f"Starting stateless turn executor agent: config={_config_path} "
@@ -2780,7 +1423,7 @@ async def lifespan(app: FastAPI):
     else:
         logger.info(
             f"Starting persistent agent: config={_config_path}, "
-            f"thread={_thread_id or '(pool mode — waiting for assignment)'}"
+            f"thread={_session_identity.thread_id or '(pool mode — waiting for assignment)'}"
         )
 
     # 1. Create and initialize UniversalAgent (singleton layer)
@@ -2826,24 +1469,26 @@ async def lifespan(app: FastAPI):
                 )
             else:
                 # Dedicated mode: auto-create thread if needed (backwards compatible)
-                if _thread_id is None:
+                if _session_identity.thread_id is None:
                     created_id = await _orchestrator_client.create_thread(
                         config_name=_config_path or "session_base",
                         permission_mode=_agent.config.interactive.permission_mode,
                         title=f"Local Session ({_config_path or 'session_base'})",
                     )
                     if created_id:
-                        _thread_id = created_id
-                        logger.info(f"Auto-created thread: {_thread_id}")
+                        _session_identity.bind_thread(created_id)
+                        logger.info(
+                            f"Auto-created thread: {_session_identity.thread_id}"
+                        )
                     else:
                         logger.warning(
                             "Failed to create thread — generating local UUID"
                         )
 
-                if _thread_id is None:
+                if _session_identity.thread_id is None:
                     import uuid
 
-                    _thread_id = str(uuid.uuid4())
+                    _session_identity.bind_thread(str(uuid.uuid4()))
 
                 # A thread-bound registration that loses the provisioning race
                 # raises DuplicateThreadBinding (orchestrator 409); the except
@@ -2855,14 +1500,14 @@ async def lifespan(app: FastAPI):
                 # (network / 5xx): keep the pod up but session-less.
                 dedicated_register_ok = await _orchestrator_client.register(
                     agent_mode="persistent",
-                    thread_id=_thread_id,
+                    thread_id=_session_identity.thread_id,
                 )
                 if not dedicated_register_ok:
                     logger.error(
                         "Persistent registration for thread %s failed "
                         "(transient / non-409) — pod will stay up but will NOT "
                         "attach a session.",
-                        _thread_id,
+                        _session_identity.thread_id,
                     )
 
             # Start heartbeat
@@ -2872,14 +1517,14 @@ async def lifespan(app: FastAPI):
                 # Advertising ready in that window would overwrite the
                 # reservation's agents.status='session', make exact failure
                 # cleanup impossible, and let dispatch double-claim the pod.
-                return _pool_heartbeat_status()
+                return _session_attach.pool_heartbeat_status()
 
             _heartbeat_task = asyncio.create_task(
                 _orchestrator_client.run_heartbeat_loop(
                     get_status=_heartbeat_status,
                     get_job_id=lambda: None,
                     get_metrics=_get_agent_metrics,
-                    on_response=_handle_heartbeat_intents,
+                    on_response=_on_heartbeat_response,
                 )
             )
             logger.info("Registered with orchestrator as persistent agent")
@@ -2888,58 +1533,29 @@ async def lifespan(app: FastAPI):
             # Exit cleanly so this orphan pod leaves the per-session Service
             # endpoints; the winning agent keeps serving and the orchestrator
             # does not rebind (the binding already exists). Does not return.
-            await _exit_duplicate_provision(_thread_id)
+            await _session_termination.exit_duplicate_provision(
+                _session_identity.thread_id
+            )
         except SessionEnded:
-            await _exit_session_ended(_thread_id)
+            await _session_termination.exit_session_ended(_session_identity.thread_id)
         except Exception as e:
             logger.warning(f"Failed to register with orchestrator (non-fatal): {e}")
             _orchestrator_client = None
     else:
         logger.info("No ORCHESTRATOR_URL — running standalone")
 
-    # If we have a thread_id (dedicated mode) and registration succeeded, set
-    # up the session immediately. If register was refused (409), skip the
-    # attach — the legitimate owner already holds this thread.
-    if _thread_id and dedicated_register_ok:
-        # Fallback: generate UUID if still None (standalone mode)
-        if _thread_id is None:
-            import uuid
-
-            _thread_id = str(uuid.uuid4())
-
-        try:
-            await _attach_session(_thread_id)
-        except SessionEnded:
-            await _exit_session_ended(_thread_id)
-        except SessionGrantDenied as e:
-            # The session's resolved config exceeds the owner's capability grants
-            # (workspace endpoint returned 403) — e.g. a grant revoked between the
-            # orchestrator's create/provision pre-flight (Layers 1/2) and this
-            # attach. Permanent: exit with the REAL reason instead of the
-            # misleading 'workspace not provisioned' rebind path; the cockpit
-            # re-surfaces it on its next create/prepare grant pre-flight.
-            await _exit_grant_denied(_thread_id, e)
-        except MemoryUnavailableError as e:
-            # A configured/required memory component couldn't be set up (store
-            # init or a plugin transport that won't resolve — e.g. the reranker
-            # endpoint). Deterministic config failure: exit cleanly with the REAL
-            # reason instead of crashing (which triggered a workspace-release +
-            # crash-loop retry). The cockpit re-surfaces it via the orchestrator
-            # endpoint pre-flight.
-            await _exit_memory_unavailable(_thread_id, e)
-        except (WorkspaceNotReady, WorkspaceUnavailableError) as e:
-            # Workspace raced us / is wedged (WorkspaceNotReady) or its pod is
-            # dead/unreachable (WorkspaceUnavailableError — SSH connect exhausted
-            # against a destroyed workspace): exit cleanly (status 0) instead of
-            # crashing, so K8s doesn't restart-loop. The orchestrator's session
-            # reconcile (ensure_workspace drift probe) recreates the pod and
-            # rebinds a fresh agent. See _exit_workspace_not_ready.
-            await _exit_workspace_not_ready(_thread_id, e)
-    elif _thread_id and not dedicated_register_ok:
+    # Serve process health after bounded initialization/registration. The attach
+    # coordinator owns the long exact workspace wait; /ready stays transaction-gated.
+    if _session_identity.thread_id and dedicated_register_ok:
+        _session_attach.start_dedicated_attach(
+            _session_identity.thread_id,
+            on_failure=_session_termination.handle_attach_failure,
+        )
+    elif _session_identity.thread_id and not dedicated_register_ok:
         logger.info(
             "Skipping session attach for thread %s — orchestrator refused "
             "registration.",
-            _thread_id,
+            _session_identity.thread_id,
         )
     elif stateless:
         logger.info(
@@ -2956,21 +1572,25 @@ async def lifespan(app: FastAPI):
     # --- Shutdown ---
     logger.info("Shutting down persistent agent")
 
-    # A pool attach is admitted synchronously but finishes in the background.
-    # Own that task through shutdown so workspace/setup code cannot continue
-    # after the client is deregistered and lose its exact release fence.
-    attach_task = _pool_attach_task
-    if attach_task is not None and not attach_task.done():
-        attach_task.cancel()
-        try:
-            await attach_task
-        except asyncio.CancelledError:
-            pass
+    attaching = any(
+        task is not None and not task.done()
+        for task in (_session_attach.startup_task, _session_attach.pool_task)
+    )
+    _session_termination.activate_termination_admission_fence(
+        "startup_shutdown" if attaching else "shutdown"
+    )
+    logger.info(
+        "Shutting down attach: admission fenced (source=%s)",
+        _session_termination.termination_fence_reason,
+    )
+    attach_settled = await _session_attach.stop_startup_attach()
+    if attach_settled:
+        await _session_attach.release_shutdown_receipt()
 
     # Exact drain settlement retries are independent of ordinary heartbeats
     # (Begin makes those authority-refused). Own their lifetime explicitly so
     # no HTTP/outcome task survives client close during process shutdown.
-    drain_retry_task = _pending_drain_suspend_retry_task
+    drain_retry_task = _session_termination.pending_drain_suspend_retry_task
     if drain_retry_task is not None and not drain_retry_task.done():
         drain_retry_task.cancel()
         try:
@@ -2989,8 +1609,10 @@ async def lifespan(app: FastAPI):
     # Detach any active session. Stateless lane: never mark the thread ended —
     # thread lifecycle belongs to the orchestrator, and the next claim (on any
     # pod) picks the thread back up from thread_messages.
-    if _session:
-        await _terminate_session("shutdown", mark_thread=not stateless)
+    if _session and attach_settled:
+        await _session_termination.terminate("shutdown", mark_thread=not stateless)
+
+    await _session_termination.drain_loop_completion_tasks()
 
     if _orchestrator_client:
         try:
@@ -3184,46 +1806,6 @@ def _load_expert_config(config_name: str):
     )
 
 
-def _session_backend_is_lite(config: Optional[Dict[str, Any]]) -> bool:
-    """True if a resolved session config / override selects a lite tier
-    (``virtual``/``none``).
-
-    Lite tiers run with no workspace pod, so the session attach must skip the
-    workspace-readiness poll (which would otherwise raise ``WorkspaceNotReady``
-    for a pod that never exists) and let ``PersistentSession._setup_workspace``
-    build the object-store backend from the injected mounts (the lite tiers
-    have no SSH workspace pod — no_workspace_agent_mode.md §4).
-    """
-    if not isinstance(config, dict):
-        return False
-    from agent.core.backends.factory import LITE_BACKENDS
-
-    # config_override is flat ({workspace: ...}); a resolved_config blob nests
-    # the agent config under "agent".
-    ws = config.get("workspace") or (config.get("agent") or {}).get("workspace") or {}
-    return ws.get("backend") in LITE_BACKENDS
-
-
-def _session_backend_is_vm(config: Optional[Dict[str, Any]]) -> bool:
-    """True if a resolved session config / override selects the VM tier
-    (``vm``, or its legacy ``remote`` alias).
-
-    A vm-tier session's workspace is a KubeVirt VM, and its readiness poll must
-    accept ONLY that VM: a sandbox container is ready in seconds while a cold VM
-    boot takes minutes, so a container that exists for any reason would always
-    win the race and silently attach the session to the wrong tier
-    (knowledge-base/knowledge/issues/session_vm_backend_never_attaches.md Defect 2).
-
-    Same dual-shape contract as :func:`_session_backend_is_lite`.
-    """
-    if not isinstance(config, dict):
-        return False
-    from agent.core.backends.factory import VM_BACKENDS
-
-    ws = config.get("workspace") or (config.get("agent") or {}).get("workspace") or {}
-    return ws.get("backend") in VM_BACKENDS
-
-
 _FLEET_MANAGEMENT_DISABLED_KEY = "_fleet_management_disabled"
 _JOB_CONTROL_DISABLED_KEY = "_job_control_disabled"
 _JOB_INSPECTION_DISABLED_KEY = "_job_inspection_disabled"
@@ -3255,38 +1837,6 @@ def _apply_session_tool_group_markers(
             merged_config[marker] = True
         else:
             merged_config.pop(marker, None)
-
-
-def _apply_datasource_enrichment_to_resolved(
-    resolved_config: Optional[Dict[str, Any]],
-    ds_tool_categories: Dict[str, List[str]],
-    cli_ds_types: List[str],
-) -> None:
-    """Fold datasource-derived config into an orchestrator-resolved blob.
-
-    Hydration (``load_config_from_resolved``) deliberately skips the
-    config_override merge, so the datasource tool categories and
-    ``_cli_datasources`` applied to config_override during attach never reach
-    a hydrated session. Mutate the blob's ``agent`` dict in place instead:
-    tool categories merge into ``agent["tools"]``; ``_cli_datasources`` goes
-    at the TOP level, because ``serialize_resolved_config`` flattens
-    ``extra`` keys there and ``load_agent_config_from_dict`` folds unknown
-    top-level keys back into ``config.extra``.
-
-    No-op when ``resolved_config`` is absent or malformed.
-    """
-    if not resolved_config:
-        return
-    agent_dict = resolved_config.get("agent")
-    if not isinstance(agent_dict, dict):
-        return
-    if ds_tool_categories:
-        agent_tools = agent_dict.get("tools")
-        agent_tools = dict(agent_tools) if isinstance(agent_tools, dict) else {}
-        agent_tools.update(ds_tool_categories)
-        agent_dict["tools"] = agent_tools
-    if cli_ds_types:
-        agent_dict["_cli_datasources"] = cli_ds_types
 
 
 def _sanitize_live_session_config_override(
@@ -3524,487 +2074,6 @@ async def _bump_event_journal_epoch(postgres_conn: Any, thread_id: str) -> int:
     return new_epoch
 
 
-async def _strict_cleanup_partial_attach_local_resources(
-    context: dict[str, Any],
-) -> None:
-    """Close every datasource/MCP owner created before session construction."""
-
-    resources: list[Any] = []
-    seen: set[int] = set()
-    for registry_name in ("datasources", "datasource_clients"):
-        registry = context.get(registry_name)
-        if not isinstance(registry, dict):
-            continue
-        for resource in registry.values():
-            if resource is None or id(resource) in seen:
-                continue
-            seen.add(id(resource))
-            resources.append(resource)
-    for resource in resources:
-        try:
-            aclose = getattr(resource, "aclose", None)
-            if callable(aclose):
-                result = aclose()
-                if inspect.isawaitable(result):
-                    await result
-                continue
-            close = getattr(resource, "close", None)
-            if callable(close):
-                result = close()
-                if inspect.isawaitable(result):
-                    await result
-        except Exception as exc:
-            raise EventJournalUnavailable(
-                "partial attach local datasource owner did not quiesce"
-            ) from exc
-    context["datasources"] = {}
-    context["datasource_clients"] = {}
-
-
-async def _strict_cleanup_partial_sandbox_workspace(
-    context: dict[str, Any],
-) -> str:
-    """Prove all writers zero on an attested sandbox before G rotation."""
-
-    remote = context.get("remote")
-    generation = _canonical_runtime_generation(context.get("workspace_generation"))
-    incarnation = _canonical_runtime_generation(
-        context.get("workspace_runtime_incarnation")
-    )
-    fingerprint = context.get("workspace_ssh_host_key_fingerprint")
-    thread_id = context.get("thread_id")
-    if not (
-        isinstance(remote, dict)
-        and isinstance(remote.get("host"), str)
-        and remote["host"].strip()
-        and type(remote.get("port", 22)) is int
-        and 1 <= remote.get("port", 22) <= 65535
-        and isinstance(thread_id, str)
-        and thread_id
-        and generation is not None
-        and incarnation is not None
-        and isinstance(fingerprint, str)
-        and fingerprint.strip()
-    ):
-        raise EventJournalUnavailable(
-            "partial sandbox attach lacks exact workspace cleanup authority"
-        )
-
-    from shared.runtime.core.backends.remote import RemoteBackend
-
-    try:
-        backend = RemoteBackend(
-            host=remote["host"],
-            port=remote.get("port", 22),
-            username=remote.get("username", "agent-host"),
-            key_path=remote.get("key_path", "/run/secrets/vm-ssh-key"),
-            workspace_path=remote.get("workspace_path", "/home/agent-host/workspace"),
-            job_id=thread_id,
-            connect_timeout=remote.get("connect_timeout", 30),
-            max_retries=remote.get("max_retries", 5),
-            retry_timeouts_as_booting=remote.get("retry_timeouts_as_booting", False),
-            sudo_action="freeze",
-            workspace_generation=generation,
-            runtime_incarnation=incarnation,
-            expected_host_key_fingerprint=fingerprint,
-            workspace_tier="sandbox",
-        )
-    except Exception as exc:
-        raise EventJournalUnavailable(
-            "partial sandbox cleanup authority is malformed"
-        ) from exc
-
-    loop = asyncio.get_running_loop()
-    try:
-        await loop.run_in_executor(None, backend.connect)
-        protocol = await loop.run_in_executor(
-            None, backend.protected_workspace_zero_cleanup_strict
-        )
-        if protocol != "workspace_process_zero_v1":
-            raise EventJournalUnavailable(
-                "partial sandbox workspace process-zero proof is unavailable"
-            )
-        return protocol
-    except EventJournalUnavailable:
-        raise
-    except Exception as exc:
-        raise EventJournalUnavailable(
-            "partial sandbox workspace did not quiesce"
-        ) from exc
-    finally:
-        try:
-            await loop.run_in_executor(None, backend.disconnect)
-        except Exception:
-            logger.warning(
-                "Partial sandbox cleanup transport did not disconnect",
-                exc_info=True,
-            )
-
-
-async def _cleanup_failed_event_journal_attach(
-    thread_id: str, *, restore_thread_id: str | None = None
-) -> dict[str, Any] | None:
-    """Quiesce a partial attach and return its exact release proof.
-
-    A delivered pinned attach owns a real G/attach reservation. Rotating that
-    generation is safe only after every local/remote writer is proven zero;
-    preserving the shell or swallowing writer/cleanup uncertainty would let
-    old work cross into the replacement. Legacy/stateless cleanup retains its
-    historical handoff behavior and returns no release receipt.
-    """
-
-    global _session, _thread_id, _event_writer
-    global _events_epoch, _next_seq, _tool_inflight, _turn_event_open
-    global _turn_tool_execution_identity, _turn_tool_execution_external_hook
-    global _loop_user_queue, _loop_interrupt_flag, _loop_interrupt_target_turn_id
-    global _hard_interrupt_event
-    global _loop_last_user_content
-    global _input_runtime_generation
-    global _runtime_authorization_admission_open
-    global _pinned_status_identity_enabled
-    global _pinned_runtime_generation_enabled
-    global _failed_attach_workspace_cleanup_context
-    global _failed_attach_release_receipt
-
-    exact_generation = _session_runtime_generation
-    exact_attach_token = _session_runtime_attach_token
-    exact_pinned_attach = bool(
-        _pinned_runtime_generation_enabled
-        and exact_generation is not None
-        and exact_attach_token is not None
-    )
-    release_receipt: dict[str, Any] | None = None
-    cleanup_context = _failed_attach_workspace_cleanup_context
-
-    await _stop_thread_interrupt_watcher()
-    await _stop_thread_control_watcher()
-    if exact_pinned_attach:
-        await _stop_and_join_watchdogs()
-        await _quiesce_session_side_tasks()
-
-    writer = _event_writer
-    if writer is not None:
-        try:
-            await writer.close()
-        except Exception as exc:
-            if exact_pinned_attach:
-                raise EventJournalUnavailable(
-                    "partial attach event writer did not quiesce"
-                ) from exc
-            logger.warning(
-                "Failed to close event writer after attach failure (thread=%s): %s",
-                thread_id,
-                exc,
-            )
-        else:
-            _event_writer = None
-
-    failed_session = _session
-    if failed_session is not None:
-        tool_context = getattr(failed_session, "tool_context", None)
-        if tool_context is not None:
-            tool_context.citation_verdict_callback = None
-            tool_context.canvas_event_callback = None
-        try:
-            # An exact delivered attach is about to rotate its G and therefore
-            # must destructively retire/prove its shell and workspace writers.
-            # Legacy/stateless handoff keeps the historical preserve behavior.
-            await failed_session.cleanup(
-                preserve_shell=not exact_pinned_attach,
-                preserve_workspace_daemons=(
-                    not exact_pinned_attach
-                    and getattr(failed_session, "shell_owner_token", None) is not None
-                    and getattr(
-                        failed_session,
-                        "stateless_warm_reuse_safe",
-                        True,
-                    )
-                    is False
-                ),
-            )
-        except Exception as exc:
-            if exact_pinned_attach:
-                raise EventJournalUnavailable(
-                    "partial attach runtime did not quiesce"
-                ) from exc
-            logger.warning(
-                "Failed to clean partial session after event-journal error "
-                "(thread=%s): %s",
-                thread_id,
-                exc,
-            )
-    elif exact_pinned_attach:
-        if not (
-            isinstance(cleanup_context, dict)
-            and cleanup_context.get("thread_id") == thread_id
-        ):
-            raise EventJournalUnavailable(
-                "partial attach lacks an exact local cleanup boundary"
-            )
-        if cleanup_context.get("setup_started") is True:
-            await _strict_cleanup_partial_attach_local_resources(cleanup_context)
-            tier = cleanup_context.get("workspace_tier")
-            if tier == "sandbox":
-                protocol = await _strict_cleanup_partial_sandbox_workspace(
-                    cleanup_context
-                )
-                cleanup_context["local_quiescence_protocol"] = protocol
-            elif tier in {"virtual", "none"}:
-                cleanup_context["local_quiescence_protocol"] = "agent_runtime_zero_v1"
-            else:
-                # VM/remote requires the orchestrator's exact actuator proof.
-                # An agent process can close only its local producers and must
-                # retain the delivered attach fence until that authority acts.
-                raise EventJournalUnavailable(
-                    "partial physical attach requires actuator quiescence"
-                )
-        else:
-            # This monotonic branch is possible only before datasource,
-            # session, backend or workspace setup begins. The server repeats
-            # the zero-input/control and exact workspace-tuple predicates
-            # before rotating G.
-            cleanup_context["local_quiescence_protocol"] = "agent_attach_not_started_v1"
-
-    if exact_pinned_attach:
-        protocol = str(
-            (
-                getattr(failed_session, "local_quiescence_protocol", "")
-                if failed_session is not None
-                else (cleanup_context or {}).get("local_quiescence_protocol")
-            )
-            or ""
-        )
-        workspace_generation = (
-            str(getattr(failed_session, "workspace_generation", "") or "")
-            if failed_session is not None
-            else str((cleanup_context or {}).get("workspace_generation") or "")
-        )
-        workspace_runtime_incarnation = (
-            str(getattr(failed_session, "workspace_runtime_incarnation", "") or "")
-            if failed_session is not None
-            else str((cleanup_context or {}).get("workspace_runtime_incarnation") or "")
-        )
-        pod_uid = str(os.environ.get("POD_UID") or "").strip()
-        if (
-            not pod_uid
-            or protocol
-            not in {
-                "workspace_process_zero_v1",
-                "agent_runtime_zero_v1",
-                "agent_attach_not_started_v1",
-            }
-            or bool(workspace_generation) != bool(workspace_runtime_incarnation)
-            or (protocol == "workspace_process_zero_v1" and not workspace_generation)
-            or (protocol == "agent_runtime_zero_v1" and workspace_generation)
-        ):
-            raise EventJournalUnavailable(
-                "partial attach produced no trusted local quiescence receipt"
-            )
-        release_receipt = {
-            "thread_id": thread_id,
-            "session_runtime_generation": exact_generation,
-            "session_runtime_attach_token": exact_attach_token,
-            "agent_pod_uid": pod_uid,
-            "local_runtime_quiesced": True,
-            "local_quiescence_protocol": protocol,
-            "workspace_generation": workspace_generation or None,
-            "workspace_runtime_incarnation": (workspace_runtime_incarnation or None),
-        }
-
-    _session = None
-    _thread_id = restore_thread_id
-    _failed_attach_workspace_cleanup_context = None
-    _events_epoch = 0
-    _next_seq = 0
-    _tool_inflight = False
-    _turn_tool_execution_identity = None
-    _turn_tool_execution_external_hook = None
-    _turn_event_open = False
-    _loop_user_queue = None
-    _loop_interrupt_flag = None
-    _loop_interrupt_target_turn_id = None
-    _hard_interrupt_event = None
-    _loop_last_user_content = [""]
-    _input_runtime_generation = None
-    _runtime_authorization_admission_open = False
-    _pinned_status_identity_enabled = False
-    _clear_attached_runtime_identity()
-    _clear_attached_runtime_actor()
-    _queued_input_claims.clear()
-    _clear_all_canvas_awareness()
-    _subscribers.clear()
-    from agent.tools.registry import register_mcp_tools
-
-    register_mcp_tools(None)
-    _apply_session_embedding_env(None)
-    if release_receipt is not None and not _retain_failed_attach_release_receipt(
-        release_receipt
-    ):
-        raise EventJournalUnavailable(
-            "partial attach release proof conflicts with another runtime"
-        )
-    return release_receipt
-
-
-async def _cleanup_failed_attach_until_proven(
-    thread_id: str,
-    *,
-    restore_thread_id: str | None = None,
-) -> dict[str, Any] | None:
-    """Keep one delivered exact attach nonclaimable until cleanup is proven."""
-
-    expected_session = _session
-    expected_identity = (
-        _session_runtime_generation,
-        _session_runtime_attach_token,
-    )
-    exact = bool(_pinned_runtime_generation_enabled and all(expected_identity))
-    attempt = 0
-    while True:
-        try:
-            return await _cleanup_failed_event_journal_attach(
-                thread_id,
-                restore_thread_id=restore_thread_id,
-            )
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:
-            still_exact_owner = bool(
-                exact
-                and _session is expected_session
-                and _session_runtime_generation == expected_identity[0]
-                and _session_runtime_attach_token == expected_identity[1]
-            )
-            if not still_exact_owner:
-                raise
-            delay = _EXACT_RETIREMENT_SETTLEMENT_RETRY_DELAYS[
-                min(
-                    attempt + 1,
-                    len(_EXACT_RETIREMENT_SETTLEMENT_RETRY_DELAYS) - 1,
-                )
-            ]
-            attempt += 1
-            logger.warning(
-                "Exact failed-attach cleanup remains unproven; retaining "
-                "the nonclaimable owner and retrying (thread=%s type=%s)",
-                thread_id,
-                type(exc).__name__,
-            )
-            if delay:
-                await asyncio.sleep(delay)
-
-
-async def _release_failed_attach_receipt_until_confirmed(
-    thread_id: str,
-    *,
-    runtime_generation: str | None,
-    runtime_attach_token: str | None,
-) -> bool:
-    """Retry one proven delivered-attach abort without weakening its fence."""
-
-    global _failed_attach_release_receipt
-
-    receipt = _failed_attach_release_receipt
-    if not (
-        isinstance(receipt, dict)
-        and receipt.get("thread_id") == thread_id
-        and receipt.get("session_runtime_generation") == runtime_generation
-        and receipt.get("session_runtime_attach_token") == runtime_attach_token
-    ):
-        return False
-    client = _orchestrator_client
-    if client is None:
-        return False
-    attempt = 0
-    while _failed_attach_release_receipt is receipt:
-        try:
-            confirmed = await client.release_thread_agent(
-                thread_id,
-                session_runtime_generation=runtime_generation,
-                session_runtime_attach_token=runtime_attach_token,
-                agent_pod_uid=receipt["agent_pod_uid"],
-                local_runtime_quiesced=True,
-                local_quiescence_protocol=receipt["local_quiescence_protocol"],
-                workspace_generation=receipt.get("workspace_generation"),
-                workspace_runtime_incarnation=receipt.get(
-                    "workspace_runtime_incarnation"
-                ),
-            )
-        except Exception as exc:
-            logger.warning(
-                "Exact failed-attach release attempt failed (thread=%s type=%s)",
-                thread_id,
-                type(exc).__name__,
-            )
-            confirmed = False
-        if confirmed:
-            if _failed_attach_release_receipt is receipt:
-                _failed_attach_release_receipt = None
-            return True
-        delay = _EXACT_RETIREMENT_SETTLEMENT_RETRY_DELAYS[
-            min(attempt + 1, len(_EXACT_RETIREMENT_SETTLEMENT_RETRY_DELAYS) - 1)
-        ]
-        attempt += 1
-        await asyncio.sleep(delay)
-    return False
-
-
-# Memory-path embedding routing keys. EmbeddingService is a process-wide
-# singleton built from these EMBEDDING_* env vars at first call. The memory
-# reranker's RERANK_* transport (the `rerank` catalog slot) rides along under
-# the same scrub-on-claim contract: the scorer reads them at bind time, so a
-# following tenant must never inherit the previous tenant's rerank host/key.
-MEMORY_EMBEDDING_ENV_KEYS = (
-    "EMBEDDING_PROVIDER",
-    "EMBEDDING_MODEL",
-    "EMBEDDING_BASE_URL",
-    "EMBEDDING_API_KEY",
-    "RERANK_MODEL",
-    "RERANK_BASE_URL",
-    "RERANK_API_KEY",
-)
-
-
-def _apply_session_embedding_env(env_keys: Optional[Dict[str, Any]]) -> None:
-    """Replace the process embedding profile with this attach's snapshot.
-
-    Scrub-on-claim (stateless_agents.md §5.6 — M3 deliverable D, and a live
-    pinned-lane pod-reuse leak): the KB path (``apply_kb_embedding_env``) was
-    deliberately hardened pop-first for pod reuse; the memory path was not —
-    it pushed ``EMBEDDING_API_KEY`` into process-global ``os.environ`` and
-    never popped it, so a following tenant whose config omitted ``env_keys``
-    skipped the block and inherited the prior tenant's key + un-reset
-    singleton. Symmetric now: at EVERY attach, unconditionally pop all
-    memory-embedding keys and null the memory-embedding singleton BEFORE
-    applying the new ``env_keys`` (which then re-set them only if provided).
-
-    Acceptance (tests/test_turn_executor.py scrub matrix): after an attach
-    with tenant-A env_keys followed by an attach with tenant-B env_keys
-    absent, ``os.environ`` carries no A values and the singleton is None.
-    """
-    for k in MEMORY_EMBEDDING_ENV_KEYS:
-        os.environ.pop(k, None)
-    from shared.runtime.services import embedding_service as _embedding_module
-
-    _embedding_module._embedding_service = None
-    # KB path: already a complete pop-first attach-time snapshot.
-    _embedding_module.apply_kb_embedding_env(env_keys)
-    if env_keys:
-        for k in MEMORY_EMBEDDING_ENV_KEYS:
-            value = env_keys.get(k)
-            if value is not None:
-                os.environ[k] = str(value)
-        if any(
-            k in env_keys
-            for k in MEMORY_EMBEDDING_ENV_KEYS + _embedding_module.KB_EMBEDDING_ENV_KEYS
-        ):
-            logger.info(
-                "Embedding overrides applied: memory_model=%s, kb_model=%s",
-                os.environ.get("EMBEDDING_MODEL"),
-                os.environ.get("KB_EMBEDDING_MODEL"),
-            )
-
-
 def _llm_config_with_cache_key(llm_cfg: Any) -> Any:
     """Copy ``llm_cfg`` with the per-thread OpenAI cache-routing key.
 
@@ -4014,1936 +2083,27 @@ def _llm_config_with_cache_key(llm_cfg: Any) -> Any:
     transmits it to first-party OpenAI only; every other provider/endpoint
     ignores the field, so setting it unconditionally here is safe.
     """
-    if not _thread_id:
+    if not _session_identity.thread_id:
         return llm_cfg
     import dataclasses
 
-    return dataclasses.replace(llm_cfg, prompt_cache_key=f"srw-thread-{_thread_id}")
-
-
-async def _attach_session_inner(
-    thread_id: str,
-    config_override: Optional[Dict[str, Any]] = None,
-    resolved_config: Optional[Dict[str, Any]] = None,
-    project_ids: Optional[List[str]] = None,
-    datasources: Optional[List[Dict[str, Any]]] = None,
-    config_name: Optional[str] = None,
-    runtime_actor: Optional[Dict[str, Any]] = None,
-    pinned_status_identity_contract: Any = None,
-    pinned_runtime_generation_contract: Any = None,
-    session_runtime_generation: Any = None,
-    session_runtime_attach_token: Any = None,
-    conversation_revision: Any = None,
-    events_epoch: Any = None,
-    workspace_generation: Any = _ATTACH_WORKSPACE_IDENTITY_UNSET,
-    workspace_runtime_incarnation: Any = _ATTACH_WORKSPACE_IDENTITY_UNSET,
-) -> None:
-    """Create and attach a PersistentSession for the given thread.
-
-    This is the core session setup logic, extracted from the lifespan so it
-    can be reused by both dedicated mode (lifespan startup) and pool mode
-    (POST /session/attach).
-
-    ``config_name`` (pool mode): the thread's config, used as the session
-    base instead of the pod's boot config when provided.
-    """
-    global _session, _thread_id, _events_epoch, _next_seq, _tool_inflight
-    global _turn_tool_execution_identity, _turn_tool_execution_external_hook
-    global _turn_event_open, _session_generation, _draft_title_value
-    global _event_writer, _cloud_sync_retry_pending
-    global _runtime_authorization_admission_open
-    global _pinned_status_identity_enabled
-    global _pinned_runtime_generation_enabled
-    global _failed_attach_workspace_cleanup_context
-
-    expected_workspace_identity = _canonical_attach_workspace_identity(
-        workspace_generation,
-        workspace_runtime_incarnation,
-    )
-    prior_thread_id = _thread_id
-
-    _cloud_sync_retry_pending = False
-    # A pooled process must never carry a prior Officer's successful
-    # maintenance result into the next attachment. Ordinary sessions bypass
-    # this latch through ``_officer_cfg() is None`` below.
-    _runtime_authorization_admission_open = False
-    _pinned_status_identity_enabled = bool(
-        type(pinned_status_identity_contract) is int
-        and pinned_status_identity_contract == 1
-    )
-    runtime_contract_advertised = bool(
-        type(pinned_runtime_generation_contract) is int
-        and pinned_runtime_generation_contract == 1
-    )
-    client_generation = (
-        getattr(_orchestrator_client, "session_runtime_generation", None)
-        if _orchestrator_client is not None
-        else None
-    )
-    if not isinstance(client_generation, str):
-        client_generation = None
-    client_attach_token = (
-        getattr(_orchestrator_client, "session_runtime_attach_token", None)
-        if _orchestrator_client is not None
-        else None
-    )
-    if not isinstance(client_attach_token, str):
-        client_attach_token = None
-    _adopt_attached_runtime_identity(
-        session_runtime_generation
-        if session_runtime_generation is not None
-        else client_generation,
-        session_runtime_attach_token
-        if session_runtime_attach_token is not None
-        else client_attach_token,
-        contract_advertised=(
-            runtime_contract_advertised
-            or (
-                getattr(
-                    _orchestrator_client,
-                    "pinned_runtime_generation_contract",
-                    False,
-                )
-                is True
-            )
-        ),
-    )
-    _clear_all_canvas_awareness()
-
-    if _session is not None:
-        raise RuntimeError(
-            f"Cannot attach thread {thread_id}: already attached to {_thread_id}"
-        )
-    if _failed_attach_workspace_cleanup_context is not None:
-        raise RuntimeError(
-            "Cannot attach while a prior runtime cleanup proof remains pending"
-        )
-
-    stale_side_tasks = {task for task in _session_side_tasks if not task.done()}
-    if stale_side_tasks:
-        raise RuntimeError(
-            "Cannot attach a new thread while prior session tasks remain active"
-        )
-    _session_generation += 1
-    _draft_title_value = None
-
-    # A normal detach always closes and clears the prior writer. Recover from a
-    # stale writer defensively before a pool-mode reattach so no event can land
-    # under the previous thread/pool identity.
-    if _event_writer is not None:
-        logger.warning(
-            "Closing stale thread_events writer before attaching thread %s",
-            thread_id,
-        )
-        await _event_writer.close()
-        _event_writer = None
-
-    _thread_id = thread_id
-    if _pinned_runtime_generation_enabled and not _stateless_mode():
-        _failed_attach_workspace_cleanup_context = {
-            "thread_id": thread_id,
-            "setup_started": False,
-            "workspace_tier": None,
-            "workspace_generation": None,
-            "workspace_runtime_incarnation": None,
-            "workspace_ssh_host_key_fingerprint": None,
-            "remote": None,
-            "datasources": {},
-            "datasource_clients": {},
-        }
-
-    runtime_actor_context = _runtime_actor_context_for_attach(runtime_actor)
-
-    # Determine the backend before polling: a lite (virtual/none) session has
-    # NO workspace pod, so polling for one would always fail (WorkspaceNotReady).
-    # The pool path passes config_override; a dedicated agent fetches it here.
-    # The orchestrator attaches the lite object-store mounts to this response
-    # for lite threads, so the session can build its backend without a pod.
-    _rc, _co = resolved_config, config_override
-    attached_workspace_generation = ""
-    if _rc is None and _co is None and _orchestrator_client and _thread_id:
-        try:
-            _peek = await _orchestrator_client.get_thread_workspace(_thread_id)
-            if isinstance(_peek, dict):
-                peek_delivery = _protected_workspace_delivery(_peek)
-                # A valid engaging response is intentionally coordinate- and
-                # credential-free, including the runtime generation.  It is a
-                # poll instruction, not an attach payload: validating ready
-                # identity here would make the dedicated path fail before
-                # `_poll_workspace_ready` can observe engage -> ready.
-                if peek_delivery != "engaging":
-                    _assert_attach_workspace_payload(
-                        expected_workspace_identity,
-                        _peek,
-                    )
-                    _bind_attached_runtime_payload(
-                        _peek,
-                        protected_required=(_protected_workspace_marker(_peek) == "on"),
-                    )
-                    _pinned_status_identity_enabled = (
-                        _pinned_status_identity_advertised(_peek)
-                    )
-                    attached_workspace_generation = str(
-                        _peek.get("workspace_generation") or ""
-                    )
-                _rc = _peek.get("resolved_config")
-                _co = _peek.get("config_override")
-        except (ProtectedCloudUnavailable, SessionEnded, WorkspaceNotReady):
-            raise
-        except Exception:
-            pass
-    # Check BOTH blobs: the resolved config is the agent's preferred hydration
-    # source, the override is the authoritative tier — either may carry it.
-    is_lite_session = _session_backend_is_lite(_rc) or _session_backend_is_lite(_co)
-    # Same dual-blob read for the VM tier: a vm-tier session must attach to its
-    # VM and never to a container that happens to be ready (Defect 2).
-    is_vm_session = _session_backend_is_vm(_rc) or _session_backend_is_vm(_co)
-    _assert_attach_workspace_tier(
-        expected_workspace_identity,
-        is_lite_session=is_lite_session,
-    )
-    if _failed_attach_workspace_cleanup_context is not None:
-        _failed_attach_workspace_cleanup_context["workspace_tier"] = (
-            "vm" if is_vm_session else "virtual" if is_lite_session else "sandbox"
-        )
-
-    # Wait for workspace container (if orchestrator is provisioning one).
-    # Skipped for lite tiers, which run with no pod — the session builds its
-    # object-store backend from the injected mounts (persistent_session.py).
-    workspace_override = None
-    if not is_lite_session and _orchestrator_client and _thread_id:
-        workspace_override = await _poll_workspace_ready(
-            _orchestrator_client,
-            _thread_id,
-            timeout=120,
-            raise_on_denied=True,
-            require_vm=is_vm_session,
-        )
-        if workspace_override:
-            _assert_attach_workspace_payload(
-                expected_workspace_identity,
-                workspace_override,
-            )
-            _bind_attached_runtime_payload(
-                workspace_override,
-                protected_required=(
-                    _protected_workspace_marker(workspace_override) == "on"
-                ),
-            )
-            _pinned_status_identity_enabled = _pinned_status_identity_advertised(
-                workspace_override
-            )
-            logger.info(
-                f"Workspace ready ({workspace_override.get('backend')}): "
-                f"{workspace_override['remote']['host']}"
-            )
-            if _failed_attach_workspace_cleanup_context is not None:
-                remote = workspace_override.get("remote")
-                _failed_attach_workspace_cleanup_context.update(
-                    {
-                        "workspace_tier": workspace_override.get("backend"),
-                        "workspace_generation": workspace_override.get(
-                            "workspace_generation"
-                        ),
-                        "workspace_runtime_incarnation": workspace_override.get(
-                            "workspace_runtime_incarnation"
-                        ),
-                        "workspace_ssh_host_key_fingerprint": workspace_override.get(
-                            "workspace_ssh_host_key_fingerprint"
-                        ),
-                        "remote": dict(remote) if isinstance(remote, dict) else None,
-                    }
-                )
-        elif is_vm_session:
-            # Never silently downgrade a vm-tier session to a container. Say what
-            # actually failed so the pod log names the real cause instead of
-            # blaming a container this session was never supposed to have.
-            raise WorkspaceNotReady(
-                "VM workspace never became ready for this vm-tier session "
-                "(metadata.vm did not reach status='ready' with an ssh_host "
-                "within the VM budget). Not falling back to a sandbox container."
-            )
-        else:
-            raise WorkspaceNotReady(
-                "No workspace container provisioned for thread. "
-                "Cannot attach session without an isolated workspace."
-            )
-    elif is_lite_session:
-        logger.info(
-            "Lite (no-pod) session for thread %s — skipping workspace poll",
-            _thread_id,
-        )
-
-    attached_workspace_generation = str(
-        (workspace_override or {}).get("workspace_generation")
-        or attached_workspace_generation
-        or ""
-    )
-
-    # Apply config overrides, project_ids, and datasources from thread metadata
-    if not config_override:
-        config_override = (workspace_override or {}).get("config_override")
-    if resolved_config is None:
-        resolved_config = (workspace_override or {}).get("resolved_config")
-    if not project_ids:
-        project_ids = (workspace_override or {}).get("project_ids") or []
-    cloud_mount_cfg = (
-        workspace_override.get("cloud_mount") if workspace_override else None
-    )
-    # Protected state is an exact three-way contract.  Always perform a fresh
-    # fetch before constructing PersistentSession: an engage can be revoked or
-    # fail after the readiness poll, and stale credentials must not win merely
-    # because the first response already populated every optional field.
-    initial_delivery = _protected_workspace_delivery(workspace_override or {})
-    protected_cloud = initial_delivery == "ready"
-    protected_workspace_identity = (
-        _protected_workspace_identity(workspace_override)
-        if protected_cloud and workspace_override is not None
-        else None
-    )
-    if protected_cloud:
-        _bind_attached_runtime_payload(
-            workspace_override,
-            protected_required=True,
-        )
-    if _orchestrator_client and _thread_id:
-        try:
-            ws_info = await _orchestrator_client.get_thread_workspace(_thread_id)
-            if ws_info:
-                _assert_attach_workspace_payload(
-                    expected_workspace_identity,
-                    ws_info,
-                )
-                _bind_attached_runtime_payload(
-                    ws_info,
-                    protected_required=(
-                        protected_cloud or _protected_workspace_marker(ws_info) == "on"
-                    ),
-                )
-                _pinned_status_identity_enabled = _pinned_status_identity_advertised(
-                    ws_info
-                )
-                fresh_delivery = _protected_workspace_delivery(ws_info)
-                if fresh_delivery == "engaging":
-                    raise ProtectedCloudUnavailable(
-                        "protected-cloud engage changed while attaching"
-                    )
-                if protected_cloud and fresh_delivery != "ready":
-                    raise ProtectedCloudUnavailable(
-                        "protected-cloud authority disappeared while attaching"
-                    )
-                protected_cloud = fresh_delivery == "ready"
-                attached_workspace_generation = attached_workspace_generation or str(
-                    ws_info.get("workspace_generation") or ""
-                )
-                if not config_override:
-                    config_override = ws_info.get("config_override")
-                if resolved_config is None:
-                    resolved_config = ws_info.get("resolved_config")
-                if not project_ids:
-                    project_ids = ws_info.get("project_ids") or []
-                if not datasources:
-                    datasources = ws_info.get("datasources")
-                if protected_cloud:
-                    # Latest authoritative bytes replace, rather than fill, an
-                    # earlier mount so a revoked/rotated reader cannot be used.
-                    cloud_mount_cfg = ws_info.get("cloud_mount")
-                    _validate_protected_cloud_mount(cloud_mount_cfg)
-                    fresh_identity = _protected_workspace_identity(ws_info)
-                    if fresh_identity != protected_workspace_identity:
-                        raise ProtectedCloudUnavailable(
-                            "protected workspace identity changed before setup"
-                        )
-                elif not cloud_mount_cfg:
-                    cloud_mount_cfg = ws_info.get("cloud_mount")
-            elif protected_cloud:
-                raise ProtectedCloudUnavailable(
-                    "protected-cloud workspace authority is unavailable"
-                )
-        except (ProtectedCloudUnavailable, SessionEnded, WorkspaceNotReady):
-            raise
-        except Exception:
-            if protected_cloud:
-                raise ProtectedCloudUnavailable(
-                    "protected-cloud workspace revalidation failed"
-                )
-
-    # config_override is final here (request > workspace_override > ws_info)
-    # and caller-authored on every one of those routes. Strip loader-owned
-    # keys ONCE, before the runtime decorates it (``extra._cli_datasources``
-    # below) and before the deep-merge onto config.extra further down: a
-    # thread override carrying ``_db_prompt_keys: []`` must not unfence the
-    # expert's DB prompts (security audit 2026-08-27, finding #2).
-    if isinstance(config_override, dict):
-        from shared.runtime.core.loader import strip_loader_owned_keys
-
-        config_override = strip_loader_owned_keys(config_override)
-
-    # Crossing this one-way boundary means config/datasource/session setup may
-    # have created local or remote actors. Any later delivered-attach abort
-    # must prove actual agent/workspace process zero; it can never downgrade
-    # to `agent_attach_not_started_v1` even if construction fails before
-    # PersistentSession is assigned.
-    if _failed_attach_workspace_cleanup_context is not None:
-        _failed_attach_workspace_cleanup_context["setup_started"] = True
-
-    # Process datasources: create connections, inject env vars, apply tool overrides
-    # Note: repository cloning is deferred until AFTER the workspace is
-    # initialized, then runs on the workspace backend (repos/<name> on the
-    # workspace container) — never on the agent pod.
-    datasources_dict: Dict[str, Any] = {}
-    datasource_clients: Dict[str, Any] = {}
-    repo_datasources: List[Dict[str, Any]] = []
-    kb_datasources: List[Dict[str, Any]] = []
-    mcp_manager = None
-    if datasources:
-        from agent.core.datasource_setup import (
-            datasource_tool_categories,
-            process_datasources,
-        )
-
-        # Separate repos (cloned later) from other datasources
-        repo_datasources = [ds for ds in datasources if ds.get("type") == "repository"]
-        kb_datasources = [ds for ds in datasources if ds.get("type") == "kb"]
-        non_repo_datasources = [
-            ds for ds in datasources if ds.get("type") not in ("repository", "kb")
-        ]
-        datasources_dict, datasource_clients, cli_ds_types = process_datasources(
-            non_repo_datasources
-        )
-        if _failed_attach_workspace_cleanup_context is not None:
-            _failed_attach_workspace_cleanup_context["datasources"] = datasources_dict
-            _failed_attach_workspace_cleanup_context["datasource_clients"] = (
-                datasource_clients
-            )
-        mcp_manager = datasources_dict.get("mcp")
-        if mcp_manager is not None:
-            _t_step = time.perf_counter()
-            try:
-                await mcp_manager.connect_all()
-            except Exception as e:
-                logger.warning(
-                    "Unexpected session MCP discovery failure (%s); continuing",
-                    type(e).__name__,
-                )
-            mcp_manager.annotate_configs()
-            logger.info(
-                "attach step: mcp connect_all %.2fs", time.perf_counter() - _t_step
-            )
-
-        # Inject datasource tool categories so the correct tools are loaded
-        # when config is resolved below. Shared map with the orchestrator's
-        # _build_datasource_tool_override — the two previously disagreed on
-        # read-write managed connectors (write-tools vs CLI-only).
-        ds_tool_categories = datasource_tool_categories(datasources)
-        config_override = dict(config_override or {})
-        tools_override = dict(config_override.get("tools", {}))
-        tools_override.update(ds_tool_categories)
-        if tools_override:
-            config_override["tools"] = tools_override
-
-        if cli_ds_types:
-            config_override.setdefault("extra", {})["_cli_datasources"] = cli_ds_types
-
-        # Hydrated attaches load the orchestrator-resolved blob below and
-        # never touch config_override — fold the same enrichment into the
-        # blob's agent dict, or a hydrated attach silently drops read-only
-        # connector tools and the CLI prompt block. The warm-pool path
-        # compensated orchestrator-side; the dedicated-pod path did not
-        # (live_session_settings.md P0.2).
-        _apply_datasource_enrichment_to_resolved(
-            resolved_config, ds_tool_categories, cli_ds_types
-        )
-
-        logger.info(
-            "Processed %d datasource(s) for session: %d connections, %d CLI",
-            len(datasources),
-            len(datasources_dict),
-            len(cli_ds_types),
-        )
-
-    # Pool-mode agents serve sequential sessions. Replace (or clear) the
-    # process-global dynamic entries before config hydration/tool loading.
-    from agent.tools.registry import register_mcp_tools
-
-    register_mcp_tools(mcp_manager)
-
-    effective_config = _agent.config
-    _hydrated = False
-    if resolved_config:
-        # Orchestrator-resolved config: the blob is the full, frozen,
-        # credential-injected session config (base + expert + overrides). Hydrate
-        # it directly — no config_name load, no config_override flat-merge (which
-        # would degrade the resolved layers). This is the warm-pool / cold-attach
-        # expert delivery channel — the fix for the 3-minute stall.
-        from shared.runtime.core.loader import create_llm, load_config_from_resolved
-
-        effective_config = load_config_from_resolved(resolved_config)
-        _hydrated = True
-        logger.info(
-            "Attach: hydrated orchestrator-resolved config for thread %s "
-            "(model=%s, persona_source=%s)",
-            thread_id,
-            effective_config.llm.model,
-            effective_config.extra.get("_persona_source"),
-        )
-    elif config_name:
-        # The thread's config beats the pod's boot config — idle-pool pods
-        # boot as workers, and a session served from the worker YAML loses
-        # its persistent memory pipeline (no teardown_extractor) among the
-        # rest of the session profile. Fail-loud on unknown names.
-        effective_config = _load_expert_config(config_name)
-        logger.info(
-            "Attach: session base config '%s' (overrides pod boot config)",
-            config_name,
-        )
-
-    llm = _agent._llm
-    if _hydrated:
-        # The resolved llm carries the final model + injected transport.
-        llm = create_llm(
-            _llm_config_with_cache_key(effective_config.llm),
-            effective_config.limits,
-        )
-        logger.info(
-            "Attach: built session LLM from resolved config: model=%s",
-            effective_config.llm.model,
-        )
-    elif config_override:
-        import dataclasses
-
-        from shared.runtime.core.loader import (
-            _apply_settings_matrix,
-            create_llm,
-            deep_merge,
-            load_agent_config_from_dict,
-        )
-
-        # The legacy (experts-off) attach path reads the RAW request override
-        # rather than the orchestrator's merged fragment, so it needs its own
-        # normalisation — otherwise `canvas: false` never becomes the `[]` that
-        # _apply_session_tool_group_markers matches on, and the group stays on.
-        # Same seam for a legacy llm.strategic/tactical/subagent block.
-        config_override = normalize_delegation_block(
-            normalize_llm_tiers(
-                normalize_tool_policy(config_override, source="thread-override"),
-                source="thread-override",
-            ),
-            source="thread-override",
-        )
-        base_dict = dataclasses.asdict(effective_config)
-        merged = deep_merge(base_dict, config_override)
-        _apply_session_tool_group_markers(merged, config_override)
-
-        # If the override changes the model, re-apply settings_matrix for the
-        # new model family so temperature/top_p/limits get correct defaults.
-        # Override LLM keys are treated as "explicitly set" so the matrix
-        # won't overwrite them.
-        if config_override.get("llm"):
-            override_llm_keys = set(config_override["llm"].keys())
-            _apply_settings_matrix(
-                merged, override_llm_keys, effective_config._deployment_dir
-            )
-
-        effective_config = load_agent_config_from_dict(
-            merged, deployment_dir=effective_config._deployment_dir
-        )
-        if config_override.get("llm"):
-            llm = create_llm(
-                _llm_config_with_cache_key(effective_config.llm),
-                effective_config.limits,
-            )
-            logger.info(
-                f"Config override applied: model={effective_config.llm.model}, "
-                f"temperature={effective_config.llm.temperature}"
-            )
-
-    # Task 15: thread protected_cloud into config.extra via the same channel
-    # _cli_datasources uses (loader.py reads config.extra["_protected_cloud"]
-    # at render time — loader.py:3913-3915), so the interactive prompt's
-    # honesty block renders for this session. Applied once, after
-    # effective_config is fully resolved (hydrated / config_override-merged /
-    # config_name-loaded / plain boot config) rather than folded into the
-    # config_override merge above — pushing it through config_override would
-    # make an otherwise-empty override truthy and force every protected
-    # thread through the `elif config_override:` deep-merge/rebuild branch
-    # even when no other override exists.
-    #
-    # NEVER mutate effective_config in place here: on the plain-boot path
-    # (no resolved_config / config_name / config_override) effective_config
-    # IS the module-singleton _agent.config, which pool-mode pods reuse
-    # across sequential session attaches — an in-place write would leak
-    # _protected_cloud into every later NON-protected session on the pod
-    # (whose live cloud files really are saved, making the honesty block a
-    # lie). Clone via dataclasses.replace with a copied extra dict instead;
-    # the new object is assigned back to the local, so all downstream use
-    # in this function picks it up. The guards skip test stubs that aren't
-    # real AgentConfig dataclasses.
-    import dataclasses
-
-    if (
-        protected_cloud
-        and hasattr(effective_config, "extra")
-        and dataclasses.is_dataclass(effective_config)
-    ):
-        effective_config = dataclasses.replace(
-            effective_config,
-            extra={**effective_config.extra, "_protected_cloud": True},
-        )
-
-    # Auxiliary LLM rebuild. The boot-time _agent._auxiliary_llm is built from
-    # config.auxiliary.model in the YAML default — for persistent sessions
-    # without an override that's RedHatAI/... with no transport, which routes
-    # title-generation/memory-extraction calls to api.openai.com with
-    # not-needed and 401s. When the orchestrator's create_thread injection
-    # (or a runtime config.update) supplies an auxiliary section, build a
-    # session-scoped AuxiliaryLLM and pass it in instead of the singleton.
-    auxiliary_llm = _agent._auxiliary_llm
-    if (config_override and config_override.get("auxiliary", {}).get("model")) or (
-        _hydrated and effective_config.auxiliary and effective_config.auxiliary.model
-    ):
-        from shared.runtime.core.loader import (
-            LLMConfig,
-            create_llm,
-            resolve_model_settings,
-        )
-        from shared.runtime.services.auxiliary import AuxiliaryLLM
-
-        aux_cfg = effective_config.auxiliary
-        model_settings = resolve_model_settings(
-            aux_cfg.model, effective_config._deployment_dir
-        )
-        aux_llm_config = LLMConfig(
-            model=aux_cfg.model,
-            base_url=aux_cfg.base_url,
-            api_key=aux_cfg.api_key,
-            provider=aux_cfg.provider,
-            extra_headers=aux_cfg.extra_headers,
-            temperature=aux_cfg.temperature,
-            top_p=model_settings.get("top_p"),
-            top_k=model_settings.get("top_k"),
-            model_max_context_tokens=model_settings.get("model_max_context_tokens"),
-            extra_body=model_settings.get("extra_body"),
-            max_retries=1,
-        )
-        aux_structured_output_method = model_settings.get(
-            "structured_output_method", "json_schema"
-        )
-        fallback_model = effective_config.llm.model
-        fallback_settings = resolve_model_settings(
-            fallback_model, effective_config._deployment_dir
-        )
-        aux_inner = create_llm(aux_llm_config, effective_config.limits)
-        auxiliary_llm = AuxiliaryLLM(
-            llm=aux_inner,
-            max_iterations=aux_cfg.max_iterations,
-            timeout=aux_cfg.timeout,
-            max_context_tokens=model_settings.get("model_max_context_tokens"),
-            structured_output_method=aux_structured_output_method,
-            # Drop-in fallback to the main session model when the dedicated aux
-            # model is unreachable — keeps compaction/memory/titles alive instead
-            # of crashing the session. See
-            # knowledge-base/knowledge/issues/openrouter_auxiliary_misrouted_to_openai.md.
-            fallback_llm=llm,
-            fallback_structured_output_method=fallback_settings.get(
-                "structured_output_method", "json_schema"
-            ),
-        )
-        logger.info(
-            "Auxiliary override applied: model=%s, base_url=%s",
-            aux_cfg.model,
-            aux_cfg.base_url or "default",
-        )
-
-    # Embedding override + scrub-on-claim (§5.6): replace the process-wide
-    # embedding profile (memory + KB) with this attach's snapshot — pop-first
-    # on BOTH paths, singleton nulled unconditionally. Extracted to a helper
-    # so the tenant-A→tenant-B residue acceptance is unit-testable.
-    _env_keys_src = (
-        (effective_config.extra or {}).get("env_keys")
-        if _hydrated
-        else (config_override.get("env_keys") if config_override else None)
-    )
-    _apply_session_embedding_env(_env_keys_src)
-
-    from agent.services.knowledge.bindings import build_knowledge_bindings
-
-    knowledge_bindings = build_knowledge_bindings(
-        project_ids=project_ids or [],
-        datasources=kb_datasources,
-        runtime_actor=runtime_actor_context,
-    )
-
-    # Create PersistentSession
-    live_lease = _current_lease_var.get()
-    shell_owner_token = None
-    if live_lease is not None and live_lease.active:
-        if str(live_lease.unit_id) != str(_thread_id):
-            raise RuntimeError(
-                "Stateless lease identity does not match the session being attached"
-            )
-        shell_owner_token = live_lease.lease_token
-
-    _session = PersistentSession(
-        thread_id=_thread_id,
-        config=effective_config,
-        shell_owner_token=shell_owner_token,
-        protected_cloud_required=protected_cloud,
-        pinned_runtime_identity_required=bool(
-            _pinned_runtime_generation_enabled and shell_owner_token is None
-        ),
-        orchestrator_client=_orchestrator_client,
-        session_parent_authority_provider=_session_subagent_parent_authority,
-        subagent_provider_admission=_loop_provider_admission_open,
-        subagent_effect_authority=_loop_runtime_effect_authority_current,
-        subagent_settlement_authority=(_loop_runtime_settlement_authority_current),
-        subagent_event_callback=_session_subagent_event_available,
-        project_ids=project_ids or [],
-        datasources=datasources_dict,
-        knowledge_bindings=knowledge_bindings,
-        runtime_actor=runtime_actor_context,
-        _datasource_clients=datasource_clients,
-        # Raw payload kept as the live-change diff baseline (Slice B).
-        datasource_configs=list(datasources or []),
-    )
-    _session.execution_snapshot = (resolved_config or {}).get("execution_snapshot")
-    # PersistentSession now owns every local/remote cleanup handle. The
-    # construction-only context must not survive into pool reuse.
-    _failed_attach_workspace_cleanup_context = None
-    if protected_workspace_identity is not None:
-        _session.protected_workspace_generation = (
-            protected_workspace_identity.workspace_generation
-        )
-        _session.protected_workspace_runtime_incarnation = (
-            protected_workspace_identity.runtime_incarnation
-        )
-    if project_ids:
-        logger.info(f"Session scoped to {len(project_ids)} project(s): {project_ids}")
-    git_remote_url = (
-        workspace_override.get("git_remote_url") if workspace_override else None
-    )
-    _t_step = time.perf_counter()
-    try:
-        await _session.setup(
-            llm=llm,
-            auxiliary_llm=auxiliary_llm,
-            postgres_conn=_agent.postgres_conn,
-            vector_conn=getattr(_agent, "vector_conn", None),
-            workspace_override=workspace_override,
-            git_remote_url=git_remote_url,
-            cloud_mount_cfg=cloud_mount_cfg,
-        )
-        if protected_cloud:
-            if _orchestrator_client is None or _thread_id is None:
-                raise ProtectedCloudUnavailable(
-                    "protected-cloud workspace cannot be revalidated"
-                )
-            final_workspace = await _orchestrator_client.get_thread_workspace(
-                _thread_id
-            )
-            if not isinstance(final_workspace, dict):
-                raise ProtectedCloudUnavailable(
-                    "protected-cloud workspace authority is unavailable"
-                )
-            _assert_attach_workspace_payload(
-                expected_workspace_identity,
-                final_workspace,
-            )
-            _bind_attached_runtime_payload(
-                final_workspace,
-                protected_required=True,
-            )
-            if _protected_workspace_delivery(final_workspace) != "ready":
-                raise ProtectedCloudUnavailable(
-                    "protected-cloud workspace is no longer ready"
-                )
-            final_mount = final_workspace.get("cloud_mount")
-            _validate_protected_cloud_mount(final_mount)
-            final_identity = _protected_workspace_identity(final_workspace)
-            if (
-                final_identity != protected_workspace_identity
-                or final_mount != cloud_mount_cfg
-                or not _session.protected_cloud_ready()
-            ):
-                raise ProtectedCloudUnavailable(
-                    "protected-cloud mount authority changed during setup"
-                )
-    except BaseException:
-        await _cleanup_failed_event_journal_attach(
-            thread_id, restore_thread_id=prior_thread_id
-        )
-        raise
-    logger.info("attach step: session.setup %.2fs", time.perf_counter() - _t_step)
-    # Install the lifecycle provider fence before restore/attach can invoke
-    # compaction or any other auxiliary model. Turn-complete and hot-swap paths
-    # call the same idempotent wiring helper again for rebuilt instances.
-    _wire_session_aux_archiver()
-
-    # Live citation-verdict push: let the engine's background verifier broadcast
-    # pending→verified/failed so the cockpit citations panel updates in place
-    # rather than only at the next per-turn refresh. Set before the first turn
-    # (so it's wired before the lazily-built CitationEngine is first used).
-    if _session is not None and _session.tool_context is not None:
-        _session.tool_context.citation_verdict_callback = _emit_citation_verdict
-        _session.tool_context.canvas_event_callback = _emit_canvas_event
-
-    # Resolve the authoritative (generation, seq seed) before the first
-    # broadcast. Clean reattaches REUSE the thread's current epoch with the
-    # seq counter seeded above every previously served frame, so cached client
-    # cursors stay valid and no cache-wipe cascade fires; the epoch bumps only
-    # when the previous session life is terminal (see
-    # _resolve_event_journal_epoch). A provisioning SSE opened against a
-    # pre-bump generation uses the existing mid-stream epoch-change
-    # reconciliation path.
-    _tool_inflight = False
-    _turn_tool_execution_identity = None
-    _turn_tool_execution_external_hook = None
-    _turn_event_open = False
-    _events_epoch = 0
-    _next_seq = 0
-    if _session is not None and _session.postgres_conn is not None:
-        try:
-            _events_epoch, _next_seq = await _resolve_event_journal_epoch(
-                _session.postgres_conn, _thread_id
-            )
-            live_lease = _current_lease_var.get()
-            pinned_agent_id = (
-                _registered_pinned_agent_id() if live_lease is None else None
-            )
-            writer = _OrderedPersistentEventWriter(
-                postgres_conn=_session.postgres_conn,
-                thread_id=_thread_id,
-                epoch=_events_epoch,
-                on_terminal_failure=_event_persistence_failed,
-                # Stateless executor attach: fence every flush on the live
-                # claim (the executor set the LeaseHandle before attaching).
-                # Pinned lane: ContextVar default None → today's statement.
-                lease=live_lease,
-                pinned_agent_id=pinned_agent_id,
-                pinned_runtime_generation=(
-                    _session_runtime_generation if live_lease is None else None
-                ),
-                pinned_runtime_attach_token=(
-                    _session_runtime_attach_token if live_lease is None else None
-                ),
-            )
-            writer.start()
-            _event_writer = writer
-            if live_lease is None and pinned_agent_id is not None:
-                await _start_thread_control_watcher(agent_id=pinned_agent_id)
-        except Exception as exc:
-            logger.error(
-                "Event journal initialization failed; aborting session attach "
-                "(thread=%s): %s",
-                _thread_id,
-                exc,
-                exc_info=True,
-            )
-            await _cleanup_failed_event_journal_attach(thread_id)
-            if isinstance(exc, EventJournalUnavailable):
-                raise
-            raise EventJournalUnavailable(
-                "Persistent event journal initialization failed"
-            ) from exc
-
-    cloud_mount_active = bool(
-        _session.cloud_mount_manager and _session.cloud_mount_manager.active
-    )
-
-    from agent.core.datasource_setup import install_workspace_credentials
-
-    await asyncio.to_thread(
-        install_workspace_credentials, datasources or [], _session.workspace_manager
-    )
-
-    # Clone repository datasources into the workspace (deferred from above).
-    # All clone/auth operations run on the workspace backend — there is no
-    # agent-local clone path (knowledge-base/knowledge/features/no_workspace_agent_mode.md §9.4).
-    if repo_datasources and _session.workspace_manager:
-        from agent.core.datasource_setup import clone_repository_datasources
-
-        clone_repository_datasources(repo_datasources, _session.workspace_manager)
-
-    # README.md workspace-facts block (connectors, materials, layout) — after
-    # the workspace is initialized and repositories are cloned. Written even
-    # without connectors so the file states the explicit "none" case.
-    if _session.workspace_manager:
-        from agent.core.datasource_setup import inject_workspace_facts
-
-        try:
-            inject_workspace_facts(
-                datasources or [],
-                _session.workspace_manager,
-                expert=getattr(_session.config, "display_name", None),
-            )
-        except Exception as e:
-            logger.warning(f"Failed to write workspace facts: {e}")
-
-    # Initialize cloud workspace sync if the orchestrator gave us a config.
-    # F-C1: a protected thread NEVER adopts cloud_sync or nc_session_folder
-    # from either fetch site — protected mode's only sanctioned live-write
-    # surface is the capture overlay (already reflected in
-    # cloud_mount_active above); letting either field through here would
-    # rebuild a live agent-service WebDAV sync in every degraded-protected
-    # scenario (refused engage, flag off, VM tier, overlay-failure teardown).
-    suppress_disposable_cloud = bool(
-        _stateless_mode()
-        and getattr(getattr(effective_config, "workspace", None), "backend", None)
-        == "none"
-    )
-    cloud_cfg = (
-        None
-        if cloud_mount_active or protected_cloud or suppress_disposable_cloud
-        else workspace_override.get("cloud_sync")
-        if workspace_override
-        else None
-    )
-    nc_folder = (
-        None
-        if protected_cloud or suppress_disposable_cloud
-        else workspace_override.get("nc_session_folder")
-        if workspace_override
-        else None
-    )
-    cloud_degraded_hint = False
-    if not suppress_disposable_cloud and (
-        not cloud_mount_active
-        and (not cloud_cfg or not nc_folder)
-        and _orchestrator_client
-        and _thread_id
-    ):
-        try:
-            ws_info = await _orchestrator_client.get_thread_workspace(_thread_id)
-            if ws_info:
-                _assert_attach_workspace_payload(
-                    expected_workspace_identity,
-                    ws_info,
-                )
-                _bind_attached_runtime_payload(
-                    ws_info,
-                    protected_required=(
-                        protected_cloud or _protected_workspace_marker(ws_info) == "on"
-                    ),
-                )
-                fresh_delivery = _protected_workspace_delivery(ws_info)
-                if protected_cloud:
-                    if fresh_delivery != "ready":
-                        raise ProtectedCloudUnavailable(
-                            "protected-cloud authority changed during attach"
-                        )
-                    fresh_mount = ws_info.get("cloud_mount")
-                    _validate_protected_cloud_mount(fresh_mount)
-                    if (
-                        fresh_mount != cloud_mount_cfg
-                        or _protected_workspace_identity(ws_info)
-                        != protected_workspace_identity
-                    ):
-                        raise ProtectedCloudUnavailable(
-                            "protected-cloud mount authority changed during attach"
-                        )
-                elif fresh_delivery == "ready":
-                    raise ProtectedCloudUnavailable(
-                        "protected-cloud mode was enabled during attach"
-                    )
-                attached_workspace_generation = attached_workspace_generation or str(
-                    ws_info.get("workspace_generation") or ""
-                )
-                if not protected_cloud:
-                    cloud_cfg = cloud_cfg or ws_info.get("cloud_sync")
-                    nc_folder = nc_folder or ws_info.get("nc_session_folder")
-                cloud_degraded_hint = bool(ws_info.get("cloud_sync_degraded"))
-        except (ProtectedCloudUnavailable, SessionEnded, WorkspaceNotReady):
-            raise
-        except Exception:
-            # A stateless turn cannot distinguish "no cloud configured" from
-            # "the credential/config boundary was unreachable" and must not
-            # execute unsynced on that ambiguity. Pinned keeps the historical
-            # degraded behavior and retries on its next boundary.
-            if _stateless_mode():
-                _cloud_sync_retry_pending = True
-            if protected_cloud:
-                raise ProtectedCloudUnavailable(
-                    "protected-cloud workspace revalidation failed"
-                )
-    if suppress_disposable_cloud:
-        # backend=none is an intentionally disposable ScratchBackend with no
-        # user file tools. The orchestrator may still provision a generic
-        # session cloud folder; mirroring internal scratch scaffolding into it
-        # would both violate the stateless tier contract and lack a durable
-        # workspace generation. Suppress both structured and legacy sync paths
-        # only for stateless claims; pinned keeps its historical behavior.
-        cloud_cfg = None
-        nc_folder = None
-        _cloud_sync_retry_pending = False
-    # The late credential/config fetch above is often the first place a lite
-    # attach receives its binding generation. Retain the final value even when
-    # no coordinator is built, so an omitted/degraded payload cannot hide a
-    # pending generation row from the turn-start fail-closed check.
-    _session.cloud_sync_workspace_generation = attached_workspace_generation
-    # Back-compat: translate a bare nc_session_folder into the new schema.
-    # F-C1: gated on `not protected_cloud` too (defense-in-depth — nc_folder
-    # is already forced None above for a protected thread, but this keeps
-    # the invariant explicit at the point the shim actually fires).
-    if not cloud_mount_active and not protected_cloud and not cloud_cfg and nc_folder:
-        cloud_cfg = _legacy_nc_cloud_cfg(nc_folder)
-    if cloud_cfg:
-        try:
-            _session.workspace_sync = _build_sync_coordinator(
-                workspace_path=_session.workspace_manager.path,
-                workspace_backend=_session.workspace_manager.backend,
-                cloud_cfg=cloud_cfg,
-                thread_id=str(_thread_id or ""),
-                workspace_generation=attached_workspace_generation,
-            )
-            if _session.workspace_sync is None:
-                raise RuntimeError("cloud sync payload resolved no usable mounts")
-            if _session.workspace_sync:
-                # Phase 1 of cloud_collaboration_model.md: turn-boundary sync,
-                # not background polling. Do one blocking initial pull to
-                # seed the workspace with current cloud-side contents before
-                # the agent starts its first turn — and raise immediately if
-                # any mount is broken, so the operator sees it before any
-                # actual work is committed.
-                #
-                # Stateless executor: SKIP this pull. Every claimed turn runs
-                # the same full pull at turn start (_run_persistent_turn's
-                # turn-boundary sync) seconds after this attach, so the
-                # attach-time pull is a duplicate full-mount walk on the
-                # claim's critical path (measured 41s of the 49s attach,
-                # 2026-08-08 baseline). Broken-mount surfacing moves to the
-                # turn's _resilient_cloud_sync path, which broadcasts
-                # workspace_sync.error and flags degradation — same operator
-                # visibility, one walk instead of two.
-                if _stateless_mode():
-                    logger.info(
-                        "attach step: initial cloud pull_all skipped "
-                        "(stateless — turn-start pull covers seeding)"
-                    )
-                else:
-                    _t_step = time.perf_counter()
-                    await _session.workspace_sync.pull_all()
-                    logger.info(
-                        "attach step: initial cloud pull_all %.2fs",
-                        time.perf_counter() - _t_step,
-                    )
-                logger.info(
-                    "Cloud workspace sync coordinator started (%d mount(s))",
-                    len(_session.workspace_sync),
-                )
-        except Exception as e:
-            # The coordinator build or initial pull failed. Historically this
-            # was swallowed to a warning and the session then ran unsynced for
-            # its entire life with no signal — the exact mechanism behind the
-            # prod-private "files didn't clone, but I saw no error" incident
-            # (knowledge-base/knowledge/issues/main_cloud.md Issue 13). Surface it to the cockpit
-            # over the same workspace_sync.error channel the turn-loop uses
-            # (_resilient_cloud_sync), so the operator sees a degraded-sync
-            # state instead of silence.
-            logger.warning(f"Failed to start cloud workspace sync: {e}")
-            _broadcast(
-                "workspace_sync.error",
-                {
-                    "op": "initial_pull",
-                    "turn_id": 0,
-                    "message": str(e),
-                    "degraded": True,
-                },
-            )
-            _session.workspace_sync = None
-            _cloud_sync_retry_pending = True
-    elif cloud_degraded_hint:
-        # Cloud is up but the orchestrator resolved no sync target for this
-        # thread (session-folder provisioning failed upstream, so nc_session_folder
-        # and the project mounts are all empty). Surface the same degraded-sync
-        # state the failed-initial-pull path uses, instead of running silently
-        # unsynced for the session's whole life (knowledge-base/knowledge/issues/main_cloud.md Issue 13).
-        logger.warning(
-            "Thread %s: main cloud is up but no sync target resolved — "
-            "session will run unsynced.",
-            _thread_id,
-        )
-        _broadcast(
-            "workspace_sync.error",
-            {
-                "op": "provision",
-                "turn_id": 0,
-                "message": "Cloud sync could not be set up for this session "
-                "(no sync target was provisioned).",
-                "degraded": True,
-            },
-        )
-        _cloud_sync_retry_pending = True
-
-    # Restore message history from DB (for session resume)
-    _t_step = time.perf_counter()
-    await _restore_session_messages()
-    logger.info("attach step: message restore %.2fs", time.perf_counter() - _t_step)
-
-    # Mark thread as active. Stateless attach is an authorization boundary:
-    # End may have fenced the queue after claim-bundle returned, so a failed
-    # exact-lease CAS must abort before loop/tool admission.
-    if not await _update_thread_status("active"):
-        raise LeaseLostError("stateless attach lost lifecycle authority")
-
-    # Initialize headless loop primitives. These survive WS reconnect so that
-    # the loop can keep reading input / responding to interrupts across
-    # transport churn. Cleared in _terminate_session.
-    global _loop_user_queue, _loop_interrupt_flag, _loop_interrupt_target_turn_id
-    global _loop_last_user_content
-    global _hard_interrupt_event, _input_runtime_generation
-    global _input_delivery_reclaim_lock
-    # Keep readiness closed until durable child recovery has completely
-    # converged.  Publishing the queue earlier lets a concurrent status/input
-    # request start the provider between two orphan reconciliations.
-    _loop_user_queue = None
-    _loop_interrupt_flag = None
-    _loop_interrupt_target_turn_id = None
-    _hard_interrupt_event = asyncio.Event()
-    _loop_last_user_content = [""]
-    _input_runtime_generation = str(uuid4())
-    _input_delivery_reclaim_lock = asyncio.Lock()
-    _queued_input_claims.clear()
-
-    # Child generations survive their parent process. Reconcile predecessors
-    # under this exact authority before any provider can become ready;
-    # recovered background evidence joins the durable-input reclaim below.
-    await _session.recover_subagents()
-    _loop_user_queue = asyncio.Queue()
-
-    # Publish mount state only after the authoritative active CAS and queue
-    # barrier.  An End racing message/repository restore must not observe a
-    # misleading ready event from a runtime that is about to roll back.
-    if cloud_mount_active:
-        _broadcast(
-            "cloud_mount.ready",
-            {
-                "mounts": [
-                    {
-                        "mount_id": m.mount_id,
-                        "mount_kind": m.mount_kind,
-                        "target_path": m.target_path,
-                        "workspace_name": m.workspace_name,
-                    }
-                    for m in _session.cloud_mount_manager.mounts
-                ]
-            },
-        )
-    elif _session.cloud_mount_error:
-        _broadcast(
-            "cloud_mount.error",
-            {"message": _session.cloud_mount_error, "degraded": True},
-        )
-
-    # Restore deliberately excludes persisted-but-unadmitted delivery rows:
-    # they are executable inbox work, not passive conversation context. Claim
-    # and queue them after the exact reciprocal binding is active.
-    # Pinned input deliveries are owned by the reciprocal thread/agent/pod
-    # binding.  A stateless turn is instead owned by its run_queue lease and
-    # deliberately has no registered agent row; trying to enter the pinned
-    # reclaimer here makes every pooled attach fail after all of its durable
-    # setup has already completed.  The turn executor reads the stateless
-    # inbox through input_seq/consumed_seq after this attach returns.
-    if not _stateless_mode():
-        await _reclaim_pending_pinned_inputs()
-
-    # Start self-cleanup watchdogs (PR 2): exit on boot-WS timeout or
-    # out-of-band thread.status='ended'. Cancelled by _terminate_session.
-    _start_watchdogs()
-
-    # Officer boot self-wake (centurion.md §4): the loop starts LAZILY on
-    # first input / WS attach, so a freshly booted or respawned officer would
-    # otherwise park forever with restored history and no running loop. This
-    # wake IS the bootstrap, and it makes any durable notices restored above
-    # readable in the very first turn. Gated on the loop not already running:
-    # a re-attach (e.g. a retried /session/attach POST) must not inject a
-    # second boot wake — the k3d smoke produced exactly that duplicate.
-    # Stateless executor pods never self-wake: turns run only under a
-    # run_queue lease (officer threads stay on the pinned lane in S1).
-    if (
-        _officer_cfg() is not None
-        and not _stateless_mode()
-        and (_loop_task is None or _loop_task.done())
-    ):
-        _ensure_persistent_loop_started("officer_boot")
-        await _accept_user_input(
-            "[wake: session started/restarted] You are the project officer "
-            "coming back online after a start or restart. Reorient from your "
-            "charter and knowledge base; recent orchestrator notices (if any) "
-            "are in your history above. A fresh sitrep arrives with the next "
-            "orchestrator wake. If nothing needs you now, file a sleep.",
-            role="event",
-        )
-
-    logger.info(f"Session attached: thread={_thread_id} events_epoch={_events_epoch}")
-
-
-async def _attach_session(
-    thread_id: str,
-    config_override: Optional[Dict[str, Any]] = None,
-    resolved_config: Optional[Dict[str, Any]] = None,
-    project_ids: Optional[List[str]] = None,
-    datasources: Optional[List[Dict[str, Any]]] = None,
-    config_name: Optional[str] = None,
-    runtime_actor: Optional[Dict[str, Any]] = None,
-    pinned_status_identity_contract: Any = None,
-    pinned_runtime_generation_contract: Any = None,
-    session_runtime_generation: Any = None,
-    session_runtime_attach_token: Any = None,
-    conversation_revision: Any = None,
-    events_epoch: Any = None,
-    workspace_generation: Any = _ATTACH_WORKSPACE_IDENTITY_UNSET,
-    workspace_runtime_incarnation: Any = _ATTACH_WORKSPACE_IDENTITY_UNSET,
-) -> None:
-    """Exception-safe attach transaction around the full construction tail."""
-
-    previous_thread_id = _thread_id
-    try:
-        await _attach_session_inner(
-            thread_id=thread_id,
-            config_override=config_override,
-            resolved_config=resolved_config,
-            project_ids=project_ids,
-            datasources=datasources,
-            config_name=config_name,
-            runtime_actor=runtime_actor,
-            pinned_status_identity_contract=pinned_status_identity_contract,
-            pinned_runtime_generation_contract=pinned_runtime_generation_contract,
-            session_runtime_generation=session_runtime_generation,
-            session_runtime_attach_token=session_runtime_attach_token,
-            conversation_revision=conversation_revision,
-            events_epoch=events_epoch,
-            workspace_generation=workspace_generation,
-            workspace_runtime_incarnation=workspace_runtime_incarnation,
-        )
-    except BaseException:
-        # Covers every post-construction await, including event-journal setup,
-        # repository/message restore, lifecycle CAS, and input reclamation.
-        # The helper is idempotent when the inner setup guard already ran.
-        exact_identity = (
-            _session_runtime_generation,
-            _session_runtime_attach_token,
-        )
-        retained_receipt = _failed_attach_release_receipt
-        exact_receipt_exists = bool(
-            isinstance(retained_receipt, dict)
-            and retained_receipt.get("thread_id") == thread_id
-            and retained_receipt.get("session_runtime_generation") == exact_identity[0]
-            and retained_receipt.get("session_runtime_attach_token")
-            == exact_identity[1]
-        )
-        if (
-            _session is not None
-            or _thread_id != previous_thread_id
-            or (
-                _pinned_runtime_generation_enabled
-                and all(exact_identity)
-                and not exact_receipt_exists
-            )
-        ):
-            await _cleanup_failed_attach_until_proven(
-                thread_id, restore_thread_id=previous_thread_id
-            )
-        raise
-
-
-async def _terminate_session(
-    reason: str,
-    *,
-    mark_thread: bool = True,
-    preserve_shell: Optional[bool] = None,
-    preserve_workspace_daemons: bool = False,
-) -> None:
-    """Tear down the current session and return to idle.
-
-    Called by:
-      - WS-handler finally block? NO — under headless semantics WS close only
-        unsubscribes; the loop survives. WS close never calls this.
-      - Out-of-band lifecycle: drain intent, boot-WS timeout, thread-status
-        watchdog, REST /session/detach, process shutdown, MAX_SESSIONS sweep.
-      - The persistent loop's own completion handler (idle timeout, crash,
-        clean /done exit) routes here via _loop_completion_handler.
-
-    Re-entrancy: cancelling the loop task makes run_persistent_loop return
-    CLEANLY (it swallows CancelledError in the input wait), so the loop's
-    completion handler re-enters this function with reason="loop_complete"
-    while the out-of-band teardown is still running. The _terminating guard
-    makes that inner call a no-op — load-bearing for drain-suspend, where
-    the inner call's 'ended' write would defeat the orchestrator's
-    'suspended' transition.
-
-    Steps:
-      1. Cancel in-flight persistent-loop task (prevents permission_check race
-         that the commit 3a1d265 race-fix protects against).
-      2. Mark thread as ended (still resumable — `ended` is the only inactive
-         state). Skipped when ``mark_thread=False`` — the drain-suspend path
-         uses that to keep status authority with the orchestrator, which
-         flips the thread to 'suspended' instead.
-      3. Git commit + push.
-      4. Clean up session resources. ``preserve_shell`` is an independent
-         ownership disposition: true for a claim/pod handoff, false for a
-         genuine thread end. When omitted it follows ``not mark_thread`` for
-         back-compat, but losing an exact pinned binding always forces preserve.
-         ``preserve_workspace_daemons`` is narrower still: only the stateless
-         physical-claim handoff leaves workspace-side rclone/overlay processes
-         resident while retiring their agent-local controllers.
-      5. Clear session globals AND headless input primitives + subscribers.
-      6. Increment session counter, exit if max reached.
-
-    `reason` is logged and stored for observability — e.g. "drain",
-    "idle_timeout", "loop_crash", "loop_complete", "shutdown", "rest_detach",
-    "thread_ended_oob", "boot_ws_timeout", "legacy".
-    """
-    global _terminating, _termination_task
-    active = _termination_task
-    if active is not None and not active.done():
-        if asyncio.current_task() is _loop_task:
-            # The active owner cancels and awaits this loop task. Awaiting the
-            # owner here would form a cycle; this is the one safe no-op
-            # re-entry. Every independent release/complete caller waits below.
-            logger.debug("Terminate(%s) re-entered from the loop being joined", reason)
-            return
-        await asyncio.shield(active)
-        return
-    if not _session:
-        return
-    termination_session = _session
-    termination_identity = _attached_retirement_identity()
-
-    async def _run() -> None:
-        global _terminating, _termination_task
-        _terminating = True
-        try:
-            retry_attempt = 0
-            while True:
-                try:
-                    await _terminate_session_inner(
-                        reason,
-                        mark_thread=mark_thread,
-                        preserve_shell=preserve_shell,
-                        preserve_workspace_daemons=preserve_workspace_daemons,
-                    )
-                    if reason in {
-                        "boot_ws_timeout",
-                        "thread_ended_oob",
-                        "thread_retirement_authorized",
-                    }:
-                        # These callers are watchdog tasks. The common teardown
-                        # cancels/joins them while this child remains shielded,
-                        # so only the surviving exact owner can schedule exit.
-                        _schedule_exit(delay=1.0)
-                    return
-                except asyncio.CancelledError:
-                    raise
-                except Exception as exc:
-                    retry_identity = _retirement_admission_identity
-                    retryable_exact_retirement = bool(
-                        _pinned_runtime_generation_enabled
-                        and termination_identity is not None
-                        and _session is termination_session
-                        and _attached_retirement_identity() == termination_identity
-                        and (
-                            retry_identity == termination_identity
-                            or (mark_thread and retry_identity is None)
-                        )
-                    )
-                    if not retryable_exact_retirement:
-                        raise
-                    delay = _EXACT_RETIREMENT_SETTLEMENT_RETRY_DELAYS[
-                        min(
-                            retry_attempt + 1,
-                            len(_EXACT_RETIREMENT_SETTLEMENT_RETRY_DELAYS) - 1,
-                        )
-                    ]
-                    retry_attempt += 1
-                    logger.warning(
-                        "Exact local retirement quiescence failed; retaining "
-                        "the nonclaimable owner and retrying (thread=%s type=%s)",
-                        termination_identity[0],
-                        type(exc).__name__,
-                    )
-                    if delay:
-                        await asyncio.sleep(delay)
-        finally:
-            _terminating = False
-            if _termination_task is asyncio.current_task():
-                _termination_task = None
-
-    task = asyncio.create_task(
-        _run(),
-        name=f"session-terminate-{str(_thread_id or 'detached')[:12]}",
-    )
-    _termination_task = task
-    try:
-        await asyncio.shield(task)
-    except asyncio.CancelledError:
-        # Teardown continues as the single owner. Propagate caller
-        # cancellation without publishing a false completion signal.
-        raise
-
-
-_EXACT_RETIREMENT_SETTLEMENT_RETRY_DELAYS = (0.0, 0.25, 1.0, 3.0)
-
-
-async def _settle_exact_retirement_after_quiescence(
-    *,
-    pinned_agent_id: str | None,
-    retirement_disposition: str,
-    retirement_permanent: bool,
-    expected_identity: tuple[str, str | None, str | None] | None,
-) -> bool:
-    """Retry/reconcile only the immutable final ACK, never local cleanup.
-
-    The orchestrator may durably settle and then lose the HTTP 200. Replaying
-    the same G/attach/T/disposition/permanent/proof tuple is idempotent and a
-    settled-or-superseded 200 is authoritative.  The tracked common
-    termination task remains the retry owner with a capped backoff after the
-    short fast-retry window.  It never re-enters shell/mount/session cleanup.
-    A read of the append-only exact outcome ledger closes the masked-response
-    case without inferring success from a generic 409 or a successor life.
-    """
-
-    exact_generation = expected_identity[1] if expected_identity else None
-    exact_attach_token = expected_identity[2] if expected_identity else None
-    exact_retirement_token = _retirement_admission_token
-    exact_contract = bool(
-        _pinned_runtime_generation_enabled
-        and pinned_agent_id
-        and exact_generation
-        and exact_attach_token
-        and exact_retirement_token
-    )
-    attempt = 0
-    while True:
-        delay = _EXACT_RETIREMENT_SETTLEMENT_RETRY_DELAYS[
-            min(attempt, len(_EXACT_RETIREMENT_SETTLEMENT_RETRY_DELAYS) - 1)
-        ]
-        if delay:
-            await asyncio.sleep(delay)
-        if _attached_retirement_identity() != expected_identity:
-            return False
-        try:
-            settled = await _update_thread_status(
-                "ended",
-                pinned_agent_id=pinned_agent_id,
-                retirement_disposition=retirement_disposition,
-                retirement_permanent=retirement_permanent,
-            )
-        except Exception as exc:
-            logger.warning(
-                "Exact retirement settlement attempt failed (thread=%s type=%s)",
-                expected_identity[0] if expected_identity else _thread_id,
-                type(exc).__name__,
-            )
-            settled = False
-        if settled:
-            return True
-        if not exact_contract:
-            return False
-        outcome_reader = getattr(
-            _orchestrator_client, "get_thread_retirement_outcome", None
-        )
-        if callable(outcome_reader):
-            try:
-                outcome = await outcome_reader(
-                    expected_identity[0],
-                    pinned_agent_id=pinned_agent_id,
-                    session_runtime_generation=exact_generation,
-                    session_runtime_attach_token=exact_attach_token,
-                    session_runtime_retirement_token=exact_retirement_token,
-                    retirement_disposition=retirement_disposition,
-                    retirement_permanent=retirement_permanent,
-                )
-            except Exception as exc:
-                logger.warning(
-                    "Exact retirement outcome reconciliation failed "
-                    "(thread=%s type=%s)",
-                    expected_identity[0],
-                    type(exc).__name__,
-                )
-                outcome = None
-            if (
-                isinstance(outcome, dict)
-                and outcome.get("status") == "settled_or_superseded"
-                and outcome.get("outcome") in {"settled", "deleted"}
-                and outcome.get("retirement_disposition") == retirement_disposition
-                and outcome.get("retirement_permanent") is retirement_permanent
-            ):
-                return True
-        attempt += 1
-
-
-async def _terminate_session_inner(
-    reason: str,
-    *,
-    mark_thread: bool = True,
-    preserve_shell: Optional[bool] = None,
-    preserve_workspace_daemons: bool = False,
-) -> None:
-    """Body of _terminate_session — only reached holding the _terminating guard."""
-    global _session, _thread_id, _sessions_served, _loop_task
-    global _loop_user_queue, _loop_interrupt_flag, _loop_interrupt_target_turn_id
-    global _loop_last_user_content
-    global _hard_interrupt_event
-    global _events_epoch, _next_seq, _tool_inflight, _turn_event_open
-    global _turn_tool_execution_identity, _turn_tool_execution_external_hook
-    global _event_writer, _cloud_sync_retry_pending, _draft_title_value
-    global _active_permission_request_id
-    global _input_runtime_generation
-    global _runtime_authorization_admission_open
-    global _pinned_status_identity_enabled
-
-    if not _session:
-        return
-
-    thread_id = _thread_id
-    runtime_generation = _session_runtime_generation
-    runtime_attach_token = _session_runtime_attach_token
-    retirement_disposition = _terminal_retirement_disposition()
-    retirement_permanent = (
-        _retirement_admission_permanent
-        if _retirement_admission_identity == _attached_retirement_identity()
-        and _retirement_admission_permanent is not None
-        else False
-    )
-    preserve_remote_shell = (
-        not mark_thread if preserve_shell is None else preserve_shell
-    )
-    logger.info(f"Terminating session: thread={thread_id} reason={reason}")
-
-    pinned_control_owner = (
-        None
-        if _stateless_mode()
-        else (_control_owner_agent_id or _registered_pinned_agent_id())
-    )
-    if mark_thread and not _stateless_mode():
-        # Linearize retirement before *any* local teardown effect. Besides
-        # explicit/idle archive, this common path owns loop crash/complete,
-        # shutdown, watchdog and REST detach. Cancelling the loop, stopping
-        # transports or cleaning mounts before the durable ``ending`` fence
-        # would leave the row preparable while teardown was already in flight.
-        # Repeating the exact generation/attach-token transition is
-        # intentionally idempotent and reuses the orchestrator's pending
-        # retirement authority.
-        if not await _begin_exact_session_retirement(
-            pinned_agent_id=pinned_control_owner,
-            retirement_disposition=retirement_disposition,
-            retirement_permanent=retirement_permanent,
-            # Common termination owns a dedicated retry task and may run after
-            # the turn loop has already completed/crashed. Never reopen input
-            # or controls into a consumerless runtime between Begin retries.
-            reopen_controls_if_uncommitted=False,
-        ):
-            raise EventJournalUnavailable(
-                f"cannot begin exact thread retirement before teardown: {thread_id}"
-            )
-
-    # Cancel in-flight loop_task FIRST. Out-of-band callers (heartbeat-intent
-    # drain, thread-status watchdog) reach this without going through the
-    # loop's normal exit path, so without this the loop's next
-    # _session.permission_mode access AttributeErrors when we null _session
-    # below. Skipped when invoked from inside the loop itself (e.g. via
-    # _loop_completion_handler's cleanup, which would deadlock awaiting self).
-    loop_task = _loop_task
-    if loop_task is not None and loop_task is not asyncio.current_task():
-        if not loop_task.done():
-            loop_task.cancel()
-            try:
-                await loop_task
-            except (asyncio.CancelledError, Exception):
-                pass
-    _loop_task = None
-
-    # Cancel and join self-cleanup watchdogs first — merely dropping their
-    # task references would let a delayed cancellation/finally block overlap
-    # the remote stage/delete/settlement actuator below.
-    await _stop_and_join_watchdogs()
-
-    # Close public admission before stopping a pinned owner. The dedicated
-    # gate is needed for drain-suspend: the general agent status route forbids
-    # writing ``suspended``, and marking ``ended`` would prevent the snapshot
-    # transition that follows teardown. The thread-row update serializes with
-    # admission; one last exact-owner drain then consumes every request that
-    # committed before closure. A lost binding means a successor owns that
-    # work, so this runtime must not adopt it.
-    admission_closed = True
-    if pinned_control_owner is not None and not _retirement_admission_closed():
-        admission_closed = await _close_pinned_control_inbox(
-            agent_id=pinned_control_owner
-        )
-        if not admission_closed:
-            # The reciprocal binding is the pinned owner's resource fence. A
-            # stale pod that lost it may close only its own transports; the
-            # successor can already be using the deterministic remote tmux.
-            preserve_remote_shell = True
-            logger.info(
-                "Pinned control admission close skipped: exact binding moved "
-                "(thread=%s agent=%s)",
-                thread_id,
-                pinned_control_owner,
-            )
-
-    # Retire this thread's announced permission rows, then drop the ledger.
-    # The turn-end sweep in _loop_on_turn_complete is the usual owner, but the
-    # cancel above skips it. The helper holds the exact queue lease or pinned
-    # reciprocal binding through each irreversible UPDATE, so a binding move
-    # after admission closure cannot let this stale runtime touch successor
-    # rows.
-    _gates_in_flight.clear()
-    _active_permission_request_id = None
-    await _retire_announced_permission_rows(f"session terminated ({reason})")
-    _announced_permission_rows.clear()
-
-    # A pinned consumer owns the attach lifetime; a stateless consumer owns
-    # the active lease. In both cases it must be fully stopped before the
-    # journal writer drains or ownership is released.
-    await _stop_thread_interrupt_watcher()
-    await _stop_thread_control_watcher()
-
-    # Join process-global side tasks while the captured session/thread identity
-    # and event writer are still authoritative.  A delayed title or protected
-    # cloud ping must never observe the next pool attachment.
-    await _quiesce_session_side_tasks()
-
-    # B11: final memory capture for ALL pinned terminate reasons — the ✕-button
-    # detach (and drain, watchdog, shutdown, …) historically skipped
-    # extraction entirely. Stateless turns instead mint one durable per-turn
-    # obligation and must never run this full-history writer as a duplicate.
-    # Manager-mode only; the flag-off pinned path keeps today's (skipping)
-    # behaviour. The guard flag stops a re-extraction when
-    # _handle_archive/_handle_idle_archive already captured. Must run before
-    # _session.cleanup() tears down the stores; contained like the sibling
-    # teardown steps — a memory failure must never skip cleanup.
-    if (
-        not _stateless_mode()
-        and _session.memory_service is not None
-        and not _session.final_memory_extracted
-        and _session.messages
-        and not (_session.shell_owner_token is not None and not mark_thread)
-        and not _termination_admission_closed()
-    ):
-        try:
-            from agent.services.memory import CaptureEvent
-
-            await _session.memory_service.capture(
-                CaptureEvent(kind="session_end", messages=_session.messages)
-            )
-            _session.final_memory_extracted = True
-            logger.info("Terminate(%s): final memory capture complete", reason)
-        except Exception as e:
-            logger.warning(f"Terminate memory capture failed (non-fatal): {e}")
-
-    # capture_nowait(pre_compaction) and asynchronous citation verification
-    # both carry session-scoped write/callback authority. Disarm and join them
-    # before the journal closes and before a queue claimant can be released.
-    try:
-        quiesce_result = _session.quiesce_background_tasks()
-        if inspect.isawaitable(quiesce_result):
-            await quiesce_result
-        elif isinstance(_session, PersistentSession):
-            raise RuntimeError("PersistentSession RAM quiescence is not awaitable")
-    except Exception as exc:
-        if not _stateless_mode():
-            raise EventJournalUnavailable(
-                "pinned session background work did not quiesce"
-            ) from exc
-        if _session.shell_owner_token is not None:
-            raise
-        logger.warning(
-            "Pinned session background-task quiescence failed (contained)",
-            exc_info=True,
-        )
-
-    # Final cloud sync + drop secrets. No more background polling to stop:
-    # Phase 1 moved sync to turn boundaries via the coordinator. The last
-    # turn's background push must land first — never two concurrent walks of
-    # one mount, and never an aclose under an in-flight push.
-    if _session.workspace_sync:
-        try:
-            await _await_pending_cloud_push()
-            # Stateless bytes are committed only by the armed generation task
-            # above. A second raw push here would have no durable requirement
-            # or acknowledgement and, on lease-loss teardown, could overlap a
-            # successor's pull. Pinned teardown keeps its existing final
-            # push+pull byte-for-byte.
-            if not _stateless_mode():
-                await _session.workspace_sync.push_all()
-                await _session.workspace_sync.pull_all()
-        except Exception as e:
-            logger.warning(f"Final cloud sync failed (non-fatal): {e}")
-        if _background_push_owns(_session.workspace_sync):
-            # Step 4a: a handed-off push still transmits through this
-            # coordinator; its done-callback closes it. Closing here would
-            # yank the WebDAV client from under the off-slot transmit.
-            logger.info(
-                "cloud sync coordinator left open for the handed-off push (thread %s)",
-                thread_id,
-            )
-        else:
-            try:
-                await _session.workspace_sync.aclose()
-            except Exception as e:
-                logger.debug(f"Cloud sync aclose failed (non-fatal): {e}")
-
-    # Final git commit + push
-    if _session.workspace_manager:
-        git_mgr = getattr(_session.workspace_manager, "git_manager", None)
-        if git_mgr and git_mgr.is_active:
-            try:
-                if git_mgr.has_uncommitted_changes():
-                    git_mgr.commit(f"Session detach: thread {thread_id}")
-                git_mgr.push()
-            except Exception as e:
-                logger.warning(f"Final git push failed (non-fatal): {e}")
-
-    # The journal owns a captured pool + thread identity. Drain it while both
-    # the session and live subscribers still exist: terminal Canvas failures
-    # can then emit their direct reconciliation control before teardown clears
-    # either registry, and a pool-mode reattach cannot inherit queued events.
-    event_writer = _event_writer
-    if event_writer is not None:
-        try:
-            await event_writer.close()
-        except Exception as e:
-            if not _stateless_mode():
-                # A pinned End is not allowed to stage/delete/settle while an
-                # ordinary G-scoped journal batch may still be in flight.
-                # Preserve the writer and exact local retirement fence so the
-                # same authority can retry close; do not publish a false
-                # terminal lifecycle edge.
-                raise EventJournalUnavailable(
-                    "pinned thread event writer did not quiesce"
-                ) from e
-            logger.warning(
-                "thread_events writer close failed (thread=%s): %s",
-                thread_id,
-                e,
-            )
-        else:
-            _event_writer = None
-
-    # Shell ownership is deliberately separate from thread-status authority.
-    # Claim switches preserve by explicit/default disposition; a stale pinned
-    # owner that lost its reciprocal binding is forced to preserve above.
-    # This is deliberately after final Git: GitManager itself delegates through
-    # the remote shell. From here onward cleanup may mutate mount transports but
-    # no new tool/shell command is admitted.
-    _session.retire_shell_owner()
-    await _session.cleanup(
-        preserve_shell=preserve_remote_shell,
-        preserve_workspace_daemons=preserve_workspace_daemons,
-    )
-
-    if mark_thread and not await _settle_exact_retirement_after_quiescence(
-        pinned_agent_id=pinned_control_owner,
-        retirement_disposition=retirement_disposition,
-        retirement_permanent=retirement_permanent,
-        expected_identity=(
-            str(thread_id),
-            runtime_generation,
-            runtime_attach_token,
-        ),
-    ):
-        # Keep the exact local retirement mirror + captured session identity
-        # intact. The durable retirement reconciler may settle the same proof;
-        # no caller re-enters local cleanup, no false terminal frame is emitted,
-        # and no broad DB fallback may reopen Resume while unresolved.
-        raise EventJournalUnavailable(
-            f"cannot durably settle thread lifecycle after local teardown: {thread_id}"
-        )
-
-    # Clear session state
-    _session = None
-    _thread_id = None
-    _clear_attached_runtime_actor()
-
-    # Clear headless input primitives + subscriber registry. The pump tasks
-    # owned by each subscriber are cancelled by their ws_chat finally blocks
-    # when those handlers notice the WS close; dropping the registry here
-    # ensures stale entries don't accumulate across sessions.
-    _loop_user_queue = None
-    _loop_interrupt_flag = None
-    _loop_interrupt_target_turn_id = None
-    _hard_interrupt_event = None
-    _loop_last_user_content = [""]
-    _input_runtime_generation = None
-    _runtime_authorization_admission_open = False
-    _pinned_status_identity_enabled = False
-    _clear_attached_runtime_identity(
-        expected_generation=runtime_generation,
-        expected_attach_token=runtime_attach_token,
-    )
-    _queued_input_claims.clear()
-    _draft_title_value = None
-    _clear_all_canvas_awareness()
-    _subscribers.clear()
-
-    # Phase 2 event-log cursor reset. The next session attach reads the
-    # epoch fresh from the threads table. The ordered writer was already
-    # drained and cleared above, before either captured identity disappeared.
-    _events_epoch = 0
-    _next_seq = 0
-    _tool_inflight = False
-    _turn_tool_execution_identity = None
-    _turn_tool_execution_external_hook = None
-    _turn_event_open = False
-    # Pool agents serve many threads; a pending retry must not leak into the
-    # next session, whose attach resolves its own cloud state.
-    _cloud_sync_retry_pending = False
-
-    # Safety valve: restart after N sessions to guard against state leakage
-    _sessions_served += 1
-    if _max_sessions_per_process > 0 and _sessions_served >= _max_sessions_per_process:
-        logger.info(
-            f"Max sessions per process reached ({_sessions_served}/{_max_sessions_per_process}). "
-            "Exiting — Docker will restart the container."
-        )
-        import sys
-
-        sys.exit(0)
-
-    logger.info(
-        f"Session terminated: thread={thread_id} "
-        f"reason={reason} (sessions served: {_sessions_served})"
+    return dataclasses.replace(
+        llm_cfg, prompt_cache_key=f"srw-thread-{_session_identity.thread_id}"
     )
 
 
-async def _detach_session() -> None:
-    """Back-compat shim. Prefer _terminate_session(reason) at new call sites.
-
-    Kept so existing tests patching `_detach_session` continue to work and so
-    code paths not yet updated don't break. Logs at DEBUG so each invocation
-    is traceable.
-    """
-    logger.debug("_detach_session() called via back-compat shim")
-    await _terminate_session("legacy")
-
-
-def _runtime_actor_context_for_attach(
-    payload: Optional[Dict[str, Any]],
-) -> RuntimeActorContext | None:
-    """Resolve one actor object shared by maintenance and every session tool."""
-
-    actor = RuntimeActorContext.from_payload(payload)
-    if payload is not None and actor is None:
-        raise RuntimeError("Malformed server-derived runtime actor context")
-    client = _orchestrator_client
-    if actor is None and client is not None:
-        # Dedicated runtime clients receive the actor during registration.
-        actor = getattr(client, "runtime_actor", None)
-    elif actor is not None and client is not None:
-        # Pool/stateless attach receives its actor in the server payload. The
-        # heartbeat maintenance channel and the session/tool bindings must
-        # share this exact mutable object so a rotation cannot leave tools on
-        # the predecessor bearer.
-        adopt = getattr(client, "adopt_runtime_actor", None)
-        if callable(adopt):
-            adopt(actor)
-        else:  # deliberately tiny dry-run/test adapters
-            client.runtime_actor = actor
-    return actor
+# A dedicated Pod (``--thread-id``; the provisioner stamps
+# SESSION_BOUND_THREAD_ID) serves exactly one thread. When the Pod's own
+# teardown settles that thread's End, the orchestrator deliberately leaves the
+# Pod alone — its request is the caller — and historical claimant retirement
+# only acts on a terminal Pod, so the process must exit itself, exactly as the
+# watchdog-driven End does. Pool and dual Pods carry no bound thread; the pool
+# owns their lifecycle. See
+# knowledge-base/knowledge/issues/agent_initiated_pinned_end_wedges_permanent_delete.md.
 
 
-def _clear_attached_runtime_actor() -> None:
-    """Drop project authority at the common session teardown boundary."""
-
-    client = _orchestrator_client
-    clear = getattr(client, "clear_runtime_actor", None) if client else None
-    if callable(clear):
-        clear()
-
-
-async def _run_pool_attach_transaction(
-    thread_id: str,
-    attach: Dict[str, Any],
-    runtime_generation: str | None,
-    attach_token: str | None,
-) -> None:
-    """Finish one synchronously claimed pool attach in the background.
-
-    ``_attach_session`` owns rollback of every process-global/session resource.
-    This wrapper owns only the admission claim and the exact orchestrator
-    thread↔agent reservation.  A failed attach releases that reservation once;
-    a successful attach leaves it in place for the live session.
-    """
-
-    global _pool_attach_claim, _pool_attach_task
-    global _pool_attach_runtime_generation, _pool_attach_token
-
-    succeeded = False
-    release_confirmed = False
-    try:
-        await _attach_session(thread_id=thread_id, **attach)
-        succeeded = True
-        logger.info("Pool session setup complete for thread %s", thread_id)
-    except asyncio.CancelledError:
-        logger.info("Pool session setup cancelled for thread %s", thread_id)
-        raise
-    except BaseException as exc:
-        # Do not echo an arbitrary workspace/config exception: internal
-        # payloads may carry credential material.  The attach transaction logs
-        # its own bounded diagnostics at the failing boundary.
-        logger.error(
-            "Pool session setup failed for thread %s (%s)",
-            thread_id,
-            type(exc).__name__,
-        )
-    finally:
-        if not succeeded and _orchestrator_client is not None:
-            try:
-                # The server rotates G only after this exact delivered attach
-                # proves every local/workspace writer zero.  Missing or stale
-                # receipts deliberately retain the process-local claim.
-                release_confirmed = (
-                    await _release_failed_attach_receipt_until_confirmed(
-                        thread_id,
-                        runtime_generation=runtime_generation,
-                        runtime_attach_token=attach_token,
-                    )
-                )
-            except BaseException as exc:
-                logger.warning(
-                    "Failed to release exact pool binding for thread %s (%s)",
-                    thread_id,
-                    type(exc).__name__,
-                )
-        async with _pool_attach_lock:
-            if succeeded or release_confirmed:
-                if (
-                    _pool_attach_claim == thread_id
-                    and _pool_attach_runtime_generation == runtime_generation
-                    and _pool_attach_token == attach_token
-                ):
-                    _pool_attach_claim = None
-                    _pool_attach_runtime_generation = None
-                    _pool_attach_token = None
-                if _pool_attach_task is asyncio.current_task():
-                    _pool_attach_task = None
-            elif (
-                _pool_attach_claim == thread_id
-                and _pool_attach_runtime_generation == runtime_generation
-                and _pool_attach_token == attach_token
-            ):
-                # Deliberately retain the claim.  The exact reservation could
-                # not be proven released, so this process must remain
-                # non-ready/nonclaimable until lifecycle reconciliation or
-                # shutdown removes it.
-                logger.error(
-                    "Pool attach failure for thread %s retained its local "
-                    "ownership fence after unconfirmed DB release",
-                    thread_id,
-                )
-
-
-async def _admit_pool_session_attach(request: Dict[str, Any]) -> JSONResponse:
-    """Claim an idle persistent process and schedule its heavy attach.
-
-    The claim and task are installed before returning 200.  This is the
-    persistent-pool equivalent of dual mode's ``PodState.SESSION`` latch and
-    is the narrow callback-deadlock break for protected workspace polling.
-    """
-
-    global _pool_attach_claim, _pool_attach_task
-    global _pool_attach_runtime_generation, _pool_attach_token
+async def _pool_session_attach_response(request: Dict[str, Any]) -> JSONResponse:
+    """``POST /session/attach`` for a pool process: validate, then admit."""
 
     thread_id = request.get("thread_id")
     if not isinstance(thread_id, str) or not thread_id:
@@ -5954,86 +2114,144 @@ async def _admit_pool_session_attach(request: Dict[str, Any]) -> JSONResponse:
     )
     if recipient_refusal is not None:
         return recipient_refusal
-    runtime_contract = _pinned_runtime_generation_advertised(request)
-    generation_raw = request.get("session_runtime_generation")
-    attach_token_raw = request.get("session_runtime_attach_token")
-    runtime_generation = _canonical_runtime_generation(generation_raw)
-    attach_token = _canonical_runtime_generation(attach_token_raw)
-    if (
-        (generation_raw is not None and runtime_generation is None)
-        or (attach_token_raw is not None and attach_token is None)
-        or (runtime_contract and (runtime_generation is None or attach_token is None))
-    ):
-        return JSONResponse(
-            {"error": "exact session runtime identity is required"},
-            status_code=409,
-        )
+    admission = await _session_attach.admit_pool_attach(thread_id, request)
+    return JSONResponse(admission.body, status_code=admission.status_code)
 
-    async with _pool_attach_lock:
-        if (
-            _session is not None
-            or _pool_attach_claim is not None
-            or _pending_drain_suspend is not None
-        ):
-            owner = (
-                _thread_id
-                or _pool_attach_claim
-                or _pending_drain_suspend.get("thread_id")
-            )
-            return JSONResponse(
-                {
-                    "error": f"Already attached to thread {owner}",
-                    "current_thread_id": owner,
-                },
-                status_code=409,
-            )
 
-        _pool_attach_claim = thread_id
-        _pool_attach_runtime_generation = runtime_generation
-        _pool_attach_token = attach_token
-        attach = {
-            "config_override": request.get("config_override"),
-            "resolved_config": request.get("resolved_config"),
-            "project_ids": request.get("project_ids"),
-            "datasources": request.get("datasources"),
-            "config_name": request.get("config_name"),
-            "runtime_actor": request.get("runtime_actor"),
-            "pinned_status_identity_contract": request.get(
-                "pinned_status_identity_contract"
-            ),
-            "pinned_runtime_generation_contract": request.get(
-                "pinned_runtime_generation_contract"
-            ),
-            "session_runtime_generation": runtime_generation,
-            "session_runtime_attach_token": attach_token,
+@dataclass(frozen=True, slots=True)
+class SessionTransportBindings:
+    """The session client transport's ports over this process's runtime."""
+
+    auth: SessionAuthBindings
+    http: SessionHttpPorts
+    socket: SessionSocketPorts
+
+
+def _attached_session_thread_id() -> str:
+    """The attached session's own thread, for pool pods without an env binding."""
+
+    session = _session
+    if session is None:
+        return ""
+    return str(getattr(session, "thread_id", "") or "")
+
+
+def _welcome_running_tools(session: Any) -> List[Dict[str, Any]]:
+    """Every tool call this session's loop is blocked in right now.
+
+    The unanswered calls of the in-flight assistant message that are
+    mid-``ainvoke``: the whole batch of a parallel delegation, only the
+    running call of a sequential one. The Cockpit's ``parseRunningTools``
+    reads the list; ``running_tool`` (its first entry) stays for older
+    Cockpits. Without per-call ids behind the latch (a flag set directly)
+    the first unanswered call is the running one, as before the list.
+    """
+
+    if not _tool_inflight:
+        return []
+    unanswered = inflight_tool_calls(session.messages)
+    running_ids = set(_tool_inflight_calls)
+    running = [call for call in unanswered if call["id"] in running_ids]
+    if not running:
+        running = unanswered[:1]
+    return [
+        {
+            "id": call["id"],
+            "tool": call["tool"],
+            "args": _safe_serialize(call["args"]),
         }
-        try:
-            _adopt_attached_runtime_identity(
-                runtime_generation,
-                attach_token,
-                contract_advertised=runtime_contract,
-            )
-            _pool_attach_task = asyncio.create_task(
-                _run_pool_attach_transaction(
-                    thread_id,
-                    attach,
-                    runtime_generation,
-                    attach_token,
-                ),
-                name=f"pool-session-attach:{thread_id}",
-            )
-        except BaseException:
-            _pool_attach_claim = None
-            _pool_attach_runtime_generation = None
-            _pool_attach_token = None
-            _pool_attach_task = None
-            _clear_attached_runtime_identity(
-                expected_generation=runtime_generation,
-                expected_attach_token=attach_token,
-            )
-            raise
+        for call in running
+    ]
 
-    return JSONResponse({"status": "attaching", "thread_id": thread_id})
+
+def _welcome_running_tool(session: Any) -> Optional[Dict[str, Any]]:
+    """The first tool call this session's loop is blocked in, if any."""
+
+    running = _welcome_running_tools(session)
+    return running[0] if running else None
+
+
+def session_transport_bindings() -> SessionTransportBindings:
+    """Bind the session client transport to this process's runtime.
+
+    Persistent and dual applications register the transport routes from these
+    ports. Every provider and operation resolves this module's state or owner
+    function when it is called, never when it is bound: the attached session,
+    its identity and the stateless lease change across attach, replacement and
+    retirement, and a binding that captured them would authorize a stale
+    client against a successor. Operations pass their arguments through
+    unchanged. Admission, the loop, interrupts, permissions, commands and the
+    subscriber registry remain owned here (R3.3); only the binding lives in
+    this factory until R3.4 composes the runtime explicitly.
+    """
+
+    runtime = SessionRuntimeView(
+        stateless_mode=lambda: _stateless_mode(),
+        session=lambda: _session,
+        thread_id=lambda: _session_identity.thread_id,
+        identity_fingerprint=lambda: _session_identity.fingerprint(),
+        runtime_admission_closed=lambda: _session_termination.runtime_admission_closed(),
+        retirement_admission_closed=lambda: _session_termination.retirement_admission_closed(),
+        protected_cloud_ready=lambda: _protected_cloud_runtime_ready(),
+        session_ready=lambda: _session_ready(),
+        input_queue=lambda: _session_input.queue,
+        turn_open=lambda: _turn_event_open,
+        tool_inflight=lambda: _tool_inflight,
+    )
+    operations = SessionOperations(
+        ensure_loop_started=lambda *args, **kwargs: _ensure_persistent_loop_started(
+            *args, **kwargs
+        ),
+        accept_input=lambda *args, **kwargs: _session_input.accept(*args, **kwargs),
+        signal_interrupt=lambda *args, **kwargs: (
+            _session_input.signal_interrupt_for_turn(*args, **kwargs)
+        ),
+        resolve_permission=lambda *args, **kwargs: _resolve_pending_permission(
+            *args, **kwargs
+        ),
+    )
+    return SessionTransportBindings(
+        auth=SessionAuthBindings(
+            attached_thread_id=lambda: _attached_session_thread_id(),
+            identity_fingerprint=lambda: _session_identity.fingerprint(),
+        ),
+        http=SessionHttpPorts(
+            runtime=runtime,
+            operations=operations,
+            note_human_input_queued=lambda: _session_termination.signal_ws_connected(),
+        ),
+        socket=SessionSocketPorts(
+            runtime=runtime,
+            operations=operations,
+            connection=SessionConnectionPorts(
+                subscribe=lambda client_id: _subscribe(client_id),
+                unsubscribe=lambda client_id: _unsubscribe(client_id),
+                note_connection_arrived=lambda: _session_termination.signal_ws_connected(),
+                track_side_task=lambda task: _session_termination.track_session_side_task(
+                    task
+                ),
+            ),
+            welcome=SessionWelcomePorts(
+                durable_control_modes=lambda: _durable_session_control_modes(),
+                pending_permissions=lambda: _pending_permission_requests(),
+                running_tool=lambda session: _welcome_running_tool(session),
+                running_tools=lambda session: _welcome_running_tools(session),
+            ),
+            commands=SessionSocketCommands(
+                config_update=lambda *args, **kwargs: _handle_config_update(
+                    *args, **kwargs
+                ),
+                compact=lambda *args, **kwargs: _handle_compact(*args, **kwargs),
+                archive=lambda ws: _handle_archive(ws),
+                vm_upgrade=lambda ws: _handle_vm_upgrade(ws),
+                workspace_upgrade=lambda ws, target_tier, template: (
+                    _handle_workspace_upgrade(ws, target_tier, template)
+                ),
+                rewind=lambda ws, data: _handle_rewind(ws, data),
+            ),
+            canvas=_canvas_control,
+        ),
+    )
 
 
 def create_persistent_app(config_path: str, thread_id: Optional[str] = None) -> FastAPI:
@@ -6046,9 +2264,9 @@ def create_persistent_app(config_path: str, thread_id: Optional[str] = None) -> 
     Returns:
         FastAPI app with WebSocket and health endpoints
     """
-    global _config_path, _thread_id
+    global _config_path
     _config_path = config_path
-    _thread_id = thread_id
+    _session_identity.bind_thread(thread_id)
 
     app = FastAPI(
         title="Persistent Agent API",
@@ -6056,6 +2274,7 @@ def create_persistent_app(config_path: str, thread_id: Optional[str] = None) -> 
         version="1.0.0",
         lifespan=lifespan,
     )
+    register_native_first_use_route(app, native_first_use_context)
 
     # --- Health endpoints (same pattern as worker) ---
 
@@ -6068,7 +2287,7 @@ def create_persistent_app(config_path: str, thread_id: Optional[str] = None) -> 
                     "healthy" if app_guide.get("state") == "ready" else "degraded"
                 ),
                 "mode": "stateless" if _stateless_mode() else "persistent",
-                "thread_id": _thread_id,
+                "thread_id": _session_identity.thread_id,
                 "uptime_seconds": (datetime.now() - _started_at).total_seconds()
                 if _started_at
                 else 0,
@@ -6088,12 +2307,14 @@ def create_persistent_app(config_path: str, thread_id: Optional[str] = None) -> 
         host = request.client.host if request.client is not None else ""
         if host not in {"127.0.0.1", "::1", "localhost"}:
             return JSONResponse({"error": "loopback only"}, status_code=403)
-        activate_termination_admission_fence("kubernetes_prestop")
+        _session_termination.activate_termination_admission_fence("kubernetes_prestop")
         timeout_seconds = max(
             0.0,
             float(os.environ.get("PERSISTENT_TERMINATION_DRAIN_SECONDS", "165")),
         )
-        parked = await _wait_for_termination_quiescence(timeout_seconds)
+        parked = await _session_termination.wait_for_termination_quiescence(
+            timeout_seconds
+        )
         if not parked:
             logger.error(
                 "Persistent termination grace expired before the current turn "
@@ -6120,7 +2341,7 @@ def create_persistent_app(config_path: str, thread_id: Optional[str] = None) -> 
                 {
                     "ready": is_ready,
                     "mode": "stateless",
-                    "thread_id": _thread_id,
+                    "thread_id": _session_identity.thread_id,
                     "capabilities": {"durable_input_delivery": False},
                 },
                 status_code=200 if is_ready else 503,
@@ -6132,7 +2353,7 @@ def create_persistent_app(config_path: str, thread_id: Optional[str] = None) -> 
             and _session.protected_cloud_required
             and _session.protected_cloud_ready()
         )
-        session_identity_fingerprint = _current_pinned_session_identity_fingerprint()
+        session_identity_fingerprint = _session_identity.fingerprint()
         capabilities: dict[str, Any] = {
             "durable_input_delivery": True,
             "pinned_session_identity_contract": (
@@ -6145,11 +2366,13 @@ def create_persistent_app(config_path: str, thread_id: Optional[str] = None) -> 
         }
         if _pinned_session_recipient_capable():
             capabilities["pinned_session_recipient_binding"] = True
+        if _native_first_use_capable():
+            capabilities["native_workspace_first_use1"] = True
         return JSONResponse(
             {
                 "ready": is_ready,
                 "mode": "persistent",
-                "thread_id": _thread_id,
+                "thread_id": _session_identity.thread_id,
                 "session_identity_fingerprint": session_identity_fingerprint,
                 "capabilities": capabilities,
             },
@@ -6166,7 +2389,7 @@ def create_persistent_app(config_path: str, thread_id: Optional[str] = None) -> 
         return JSONResponse(
             {
                 "mode": "persistent",
-                "thread_id": _thread_id,
+                "thread_id": _session_identity.thread_id,
                 "turn_in_flight": _turn_in_flight(),
                 "config": _config_path,
                 "permission_mode": _session.permission_mode if _session else None,
@@ -6187,15 +2410,12 @@ def create_persistent_app(config_path: str, thread_id: Optional[str] = None) -> 
     async def recipient_bound_session_status(request: dict = {}):
         """Report turn state only for this exact pinned runtime identity."""
 
-        expected = _canonical_pinned_session_identity_fingerprint(
+        expected = canonical_session_identity_fingerprint(
             request.get("session_identity_fingerprint")
             if isinstance(request, dict)
             else None
         )
-        if (
-            expected is None
-            or _current_pinned_session_identity_fingerprint() != expected
-        ):
+        if expected is None or _session_identity.fingerprint() != expected:
             return JSONResponse(
                 {"error": "session_identity_mismatch", "retryable": True},
                 status_code=409,
@@ -6203,7 +2423,7 @@ def create_persistent_app(config_path: str, thread_id: Optional[str] = None) -> 
         return JSONResponse(
             {
                 "ready": _session_ready(),
-                "thread_id": _thread_id,
+                "thread_id": _session_identity.thread_id,
                 "state": "session" if _session is not None else "idle",
                 "turn_in_flight": _turn_in_flight(),
                 "recipient_verified": True,
@@ -6241,8 +2461,8 @@ def create_persistent_app(config_path: str, thread_id: Optional[str] = None) -> 
         if _stateless_mode():
             # The executor owns attach/detach on this pod — an out-of-band
             # attach would corrupt its session cache and run outside a lease.
-            return _stateless_reject()
-        return await _admit_pool_session_attach(request)
+            return stateless_rejection()
+        return await _pool_session_attach_response(request)
 
     @app.post("/session/detach")
     async def session_detach(request: dict = {}):
@@ -6254,16 +2474,13 @@ def create_persistent_app(config_path: str, thread_id: Optional[str] = None) -> 
         if _stateless_mode():
             # A detach mid-lease would kill a claimed turn out-of-band; the
             # executor detaches its own cached session between claims.
-            return _stateless_reject()
-        expected = _canonical_pinned_session_identity_fingerprint(
+            return stateless_rejection()
+        expected = canonical_session_identity_fingerprint(
             request.get("session_identity_fingerprint")
             if isinstance(request, dict)
             else None
         )
-        if (
-            expected is None
-            or _current_pinned_session_identity_fingerprint() != expected
-        ):
+        if expected is None or _session_identity.fingerprint() != expected:
             return JSONResponse(
                 {"error": "session_identity_mismatch", "retryable": True},
                 status_code=409,
@@ -6271,14 +2488,18 @@ def create_persistent_app(config_path: str, thread_id: Optional[str] = None) -> 
         if _session is None:
             return JSONResponse({"status": "already_idle", "thread_id": None})
 
-        thread_id = _thread_id
+        thread_id = _session_identity.thread_id
         try:
-            await _terminate_session("rest_detach")
+            result = await _session_termination.terminate("rest_detach")
+            if result == "actuator_requested":
+                return JSONResponse(
+                    {"status": "ending", "thread_id": thread_id}, status_code=202
+                )
             return JSONResponse(
                 {
                     "status": "detached",
                     "thread_id": thread_id,
-                    "sessions_served": _sessions_served,
+                    "sessions_served": _session_termination.sessions_served,
                 }
             )
         except Exception:
@@ -6312,8 +2533,8 @@ def create_persistent_app(config_path: str, thread_id: Optional[str] = None) -> 
         except Exception:
             body = None
         expected_agent_id = _registered_pinned_agent_id()
-        expected_generation = _session_runtime_generation
-        expected_attach_token = _session_runtime_attach_token
+        expected_generation = _session_identity.session_generation
+        expected_attach_token = _session_identity.attach_token
         expected_workspace_generation = getattr(
             _session, "protected_workspace_generation", ""
         )
@@ -6333,7 +2554,7 @@ def create_persistent_app(config_path: str, thread_id: Optional[str] = None) -> 
             != expected_generation
             or request.headers.get("x-session-runtime-attach-token")
             != expected_attach_token
-            or body.get("thread_id") != _thread_id
+            or body.get("thread_id") != _session_identity.thread_id
             or body.get("workspace_generation") != expected_workspace_generation
             or body.get("workspace_runtime_incarnation") != expected_runtime_incarnation
         ):
@@ -6350,7 +2571,7 @@ def create_persistent_app(config_path: str, thread_id: Optional[str] = None) -> 
             error_ref = uuid4().hex[:12]
             logger.exception(
                 "Cloud overlay unavailable for thread %s (error_ref=%s)",
-                _thread_id,
+                _session_identity.thread_id,
                 error_ref,
             )
             return JSONResponse(
@@ -6366,7 +2587,7 @@ def create_persistent_app(config_path: str, thread_id: Optional[str] = None) -> 
             error_ref = uuid4().hex[:12]
             logger.exception(
                 "Failed to reset cloud overlay for thread %s (error_ref=%s)",
-                _thread_id,
+                _session_identity.thread_id,
                 error_ref,
             )
             return JSONResponse(
@@ -6374,167 +2595,23 @@ def create_persistent_app(config_path: str, thread_id: Optional[str] = None) -> 
                 status_code=500,
             )
 
-    # --- Headless REST input endpoints (phase 2) ---
+    # --- Session client transport: REST input verbs and the session socket ---
     #
-    # Counterparts to the WS-receive-loop methods, exposed so the orchestrator's
-    # SSE-based clients (cockpit chunk 3, MCP, curl) can drive the session
-    # without a WebSocket. The orchestrator forwards from
-    # POST /api/threads/{id}/{input,interrupt,approve/{approval_id}}.
-
-    @app.post("/api/input")
-    async def api_input(request: Request):
-        return await handle_api_input(request)
-
-    @app.post("/api/interrupt")
-    async def api_interrupt(request: Request):
-        return await handle_api_interrupt(request)
-
-    @app.post("/api/approve")
-    async def api_approve(request: Request):
-        return await handle_api_approve(request)
-
-    # --- WebSocket endpoint ---
-
-    @app.websocket("/ws/chat")
-    async def ws_chat(ws: WebSocket):
-        # Validate the session JWT carried as ?t={token}.
-        if not await _validate_session_token(ws):
-            return
-        await handle_persistent_websocket(ws)
-
-    # External path the per-session Ingress routes to (the cockpit dials
-    # wss://api.<domain>/p/<thread_id>/ws?t=<jwt>). The {thread_id} path param
-    # is unused — the bound thread is enforced by _validate_session_token
-    # against SESSION_BOUND_THREAD_ID + the JWT's tid claim.
-    @app.websocket("/p/{thread_id}/ws")
-    async def ws_session(ws: WebSocket, thread_id: str):
-        if not await _validate_session_token(ws):
-            return
-        await handle_persistent_websocket(ws)
+    # The transport owners parse, authenticate and map refusals; this runtime
+    # keeps admission, interrupts, permissions and the loop behind the ports.
+    transport = session_transport_bindings()
+    register_session_http_routes(app, transport.http)
+    register_session_websocket_routes(app, auth=transport.auth, ports=transport.socket)
 
     return app
-
-
-# --- REST handlers (module-level so dual_app can call them too) ---
-#
-# Reached from both:
-#   - persistent_app.create_persistent_app()'s /api/{input,interrupt,approve}
-#     routes (pure persistent mode, agent.py --mode persistent).
-#   - dual_app.create_dual_app() routes (dual mode — adds pod-state pre-check
-#     then delegates here).
-#
-# Mirror of the /ws/chat consolidation; same rationale, see
-# knowledge-base/knowledge/issues/persistent_session_dual_mode_phase1_gap.md.
-
-
-class TerminationAdmissionClosed(RuntimeError):
-    """Input reached the runtime after its termination fence closed."""
-
-
-class DurableInputUnavailable(RuntimeError):
-    """A retry-stable event could not establish its durable inbox row."""
-
-
-class SessionIdentityMismatch(RuntimeError):
-    """Input was addressed to a different pinned runtime incarnation."""
-
-
-@dataclass(frozen=True, slots=True)
-class AcceptedInput:
-    message_id: str
-    delivery_id: str
-    delivery_state: str
-    claim_generation: int
-    enqueued: bool
-    duplicate: bool = False
-    deferred: bool = False
-
-
-def _accepted_input_payload(admission: AcceptedInput) -> dict[str, Any]:
-    """Serialize one durable input acknowledgement across REST and WS.
-
-    Once the transcript+delivery transaction commits, the input belongs to
-    the durable inbox.  In particular, ``deferred`` means the successor will
-    reclaim it; telling an uncorrelated WebSocket client to retry would mint a
-    second delivery identity and could buy a second turn.
-    """
-
-    return {
-        "accepted": True,
-        "message_id": admission.message_id,
-        "duplicate": admission.duplicate,
-        "deferred": admission.deferred,
-        "retryable": False,
-        "delivery_id": admission.delivery_id,
-        "delivery_state": admission.delivery_state,
-    }
-
-
-def _pinned_input_runtime_identity() -> tuple[str, str, str, str]:
-    agent_id = _registered_pinned_agent_id()
-    pod_uid = str(os.environ.get("POD_UID") or "").strip()
-    generation = str(_input_runtime_generation or "").strip()
-    attach_token = str(_session_runtime_attach_token or "").strip()
-    if agent_id is None or not pod_uid or not generation or not attach_token:
-        raise DurableInputUnavailable
-    return agent_id, pod_uid, generation, attach_token
-
-
-def _session_subagent_parent_authority():
-    """Snapshot the exact current pinned life or stateless turn lease."""
-
-    from shared.session_subagent_authority import (
-        SessionParentAuthority,
-        SessionParentAuthorityRefused,
-    )
-
-    thread_id = str(_thread_id or "").strip()
-    if not thread_id:
-        raise SessionParentAuthorityRefused("parent_missing")
-    lease = _current_lease_var.get()
-    if lease is not None:
-        if (
-            not lease.active
-            or lease.lost.is_set()
-            or str(lease.unit_id or "") != thread_id
-            or type(lease.lease_token) is not int
-            or lease.lease_token <= 0
-            or not isinstance(lease.executor_id, str)
-            or not lease.executor_id
-            or not isinstance(lease.pod_uid, str)
-            or not lease.pod_uid
-        ):
-            raise SessionParentAuthorityRefused("stateless_parent_not_current")
-        return SessionParentAuthority(
-            execution_lane="stateless",
-            parent_thread_id=thread_id,
-            lease_token=lease.lease_token,
-            executor_id=lease.executor_id,
-            executor_pod_uid=lease.pod_uid,
-        )
-
-    agent_id = _registered_pinned_agent_id()
-    pod_uid = str(os.environ.get("POD_UID") or "").strip()
-    generation = str(_session_runtime_generation or "").strip()
-    attach_token = str(_session_runtime_attach_token or "").strip()
-    if not agent_id or not pod_uid or not generation or not attach_token:
-        raise SessionParentAuthorityRefused("pinned_parent_not_current")
-    return SessionParentAuthority(
-        execution_lane="pinned",
-        parent_thread_id=thread_id,
-        agent_id=agent_id,
-        pod_uid=pod_uid,
-        session_runtime_generation=generation,
-        runtime_attach_token=attach_token,
-    )
 
 
 async def _session_subagent_event_available(_message: str) -> None:
     """Low-latency wake after the terminal transaction queued role=event."""
 
-    if _stateless_mode() or _session is None or _loop_user_queue is None:
+    if _stateless_mode() or _session is None or _session_input.queue is None:
         return
-    await _reclaim_pending_pinned_inputs()
+    await _session_input.reclaim_pending()
 
 
 async def _loop_runtime_authority_current(
@@ -6552,8 +2629,11 @@ async def _loop_runtime_authority_current(
 
     def local_authority_open() -> bool:
         return bool(
-            not _termination_admission_closed()
-            and (allow_retirement_settlement or not _retirement_admission_closed())
+            not _session_termination.termination_admission_closed()
+            and (
+                allow_retirement_settlement
+                or not _session_termination.retirement_admission_closed()
+            )
         )
 
     if not local_authority_open() or not _protected_cloud_runtime_ready():
@@ -6564,7 +2644,7 @@ async def _loop_runtime_authority_current(
             return False
         authority = None
         try:
-            authority = _session_subagent_parent_authority()
+            authority = _session_identity.parent_authority()
             if authority.execution_lane != "stateless":
                 return False
             current = await session.postgres_conn.session_parent_authority_current(
@@ -6577,14 +2657,15 @@ async def _loop_runtime_authority_current(
             )
             current = False
         try:
-            authority_after = _session_subagent_parent_authority()
+            authority_after = _session_identity.parent_authority()
         except Exception:
             authority_after = None
         same_local_life = bool(
             session is _session
             and authority is not None
             and authority_after == authority
-            and str(authority.parent_thread_id) == str(_thread_id or "")
+            and str(authority.parent_thread_id)
+            == str(_session_identity.thread_id or "")
         )
         if current is not True and same_local_life:
             # Wake the executor immediately when the DB rejects a lease whose
@@ -6599,19 +2680,19 @@ async def _loop_runtime_authority_current(
             and local_authority_open()
             and _protected_cloud_runtime_ready()
         )
-    if not _pinned_runtime_generation_enabled:
+    if not _session_identity.runtime_contract:
         # Compatibility phase for old orchestrators. Strict mode/new attaches
         # advertise the additive contract and always take the exact DB fence.
         return True
     session = _session
-    thread_id = _thread_id
+    thread_id = _session_identity.thread_id
     if session is None or session.postgres_conn is None or thread_id is None:
         return False
     try:
         agent_id, pod_uid, _process_generation, attach_token = (
-            _pinned_input_runtime_identity()
+            _session_input.pinned_identity()
         )
-        session_generation = str(_session_runtime_generation or "").strip()
+        session_generation = str(_session_identity.session_generation or "").strip()
         if not session_generation:
             return False
         current = await session.postgres_conn.verify_pinned_runtime_effect_authority(
@@ -6630,9 +2711,9 @@ async def _loop_runtime_authority_current(
     return bool(
         current is True
         and session is _session
-        and str(thread_id) == str(_thread_id)
-        and _process_generation == _input_runtime_generation
-        and attach_token == _session_runtime_attach_token
+        and str(thread_id) == str(_session_identity.thread_id)
+        and _process_generation == _session_identity.process_generation
+        and attach_token == _session_identity.attach_token
         and local_authority_open()
         and _protected_cloud_runtime_ready()
     )
@@ -6650,371 +2731,21 @@ async def _loop_runtime_settlement_authority_current() -> bool:
     return await _loop_runtime_authority_current(allow_retirement_settlement=True)
 
 
-async def _transition_claimed_input(
-    delivery_id: str,
-    claim_generation: int,
-    transition: str,
-    *,
-    turn_number: int | None = None,
-    reason: str | None = None,
-) -> bool:
-    if _session is None or _session.postgres_conn is None or _thread_id is None:
-        return False
-    try:
-        live_lease = _current_lease_var.get()
-        if live_lease is not None and live_lease.active:
-            executor_id = str(live_lease.executor_id or "").strip()
-            pod_uid = str(live_lease.pod_uid or "").strip()
-            if (
-                str(live_lease.unit_id or "") != str(_thread_id)
-                or not executor_id
-                or not pod_uid
-            ):
-                return False
-            return await _session.postgres_conn.transition_stateless_input_delivery(
-                thread_id=_thread_id,
-                delivery_id=delivery_id,
-                lease_token=int(live_lease.lease_token),
-                executor_id=executor_id,
-                pod_uid=pod_uid,
-                claim_generation=claim_generation,
-                transition=transition,
-                turn_number=turn_number,
-                reason=reason,
-            )
-        agent_id, pod_uid, runtime_generation, runtime_attach_token = (
-            _pinned_input_runtime_identity()
-        )
-        return await _session.postgres_conn.transition_pinned_input_delivery(
-            thread_id=_thread_id,
-            delivery_id=delivery_id,
-            agent_id=agent_id,
-            pod_uid=pod_uid,
-            runtime_generation=runtime_generation,
-            session_runtime_generation=str(_session_runtime_generation or ""),
-            runtime_attach_token=runtime_attach_token,
-            claim_generation=claim_generation,
-            transition=transition,
-            turn_number=turn_number,
-            reason=reason,
-        )
-    except Exception as exc:
-        logger.warning(
-            "Durable input %s transition failed (%s)",
-            transition,
-            type(exc).__name__,
-        )
-        return False
+def _schedule_early_title(content: str) -> None:
+    """Title the thread from an accepted opening prompt.
 
-
-async def _queue_claimed_input(row: dict[str, Any]) -> bool:
-    """Queue one exact durable claim once in this process generation."""
-
-    if _session is None or _session.postgres_conn is None or _thread_id is None:
-        return False
-    queue = _loop_user_queue
-    if queue is None:
-        return False
-    delivery_id = str(row["delivery_id"])
-    claim_generation = int(row["claim_generation"])
-    key = (delivery_id, claim_generation)
-    if key in _queued_input_claims:
-        return False
-    if not _protected_cloud_runtime_ready():
-        await _transition_claimed_input(
-            delivery_id,
-            claim_generation,
-            "deferred",
-            reason="protected_cloud_unavailable_before_queue",
-        )
-        _schedule_protected_input_reclaim()
-        return False
-    agent_id, pod_uid, runtime_generation, runtime_attach_token = (
-        _pinned_input_runtime_identity()
-    )
-    queued = await _session.postgres_conn.mark_pinned_input_delivery_queued(
-        thread_id=_thread_id,
-        delivery_id=delivery_id,
-        agent_id=agent_id,
-        pod_uid=pod_uid,
-        runtime_generation=runtime_generation,
-        session_runtime_generation=str(_session_runtime_generation or ""),
-        runtime_attach_token=runtime_attach_token,
-        claim_generation=claim_generation,
-    )
-    if not queued:
-        return False
-    # Another same-process request may have completed the identical DB CAS
-    # while this coroutine awaited it. Re-check at the no-await publication
-    # boundary so concurrent HTTP retries still produce one queue item.
-    if key in _queued_input_claims:
-        return False
-    if _runtime_admission_closed() or not _protected_cloud_runtime_ready():
-        await _transition_claimed_input(
-            delivery_id,
-            claim_generation,
-            "deferred",
-            reason=(
-                "runtime_terminating_before_queue"
-                if _runtime_admission_closed()
-                else "protected_cloud_unavailable_before_queue_publish"
-            ),
-        )
-        if not _runtime_admission_closed():
-            _schedule_protected_input_reclaim()
-        return False
-
-    # No await between local dedup publication and the unbounded put. A retry
-    # in this process observes the set; a process death loses the set and its
-    # new runtime generation reclaims the durable queued row.
-    _queued_input_claims.add(key)
-    queue_item = {
-        "content": str(row["content"]),
-        "id": str(row["message_id"]),
-        "role": str(row["role"]),
-        "source": str(row["source"]),
-        "delivery_id": delivery_id,
-        "claim_generation": claim_generation,
-    }
-    if row.get("supersedes_input_seq") is not None:
-        queue_item["supersedes_input_seq"] = int(row["supersedes_input_seq"])
-    queue.put_nowait(queue_item)
-    return True
-
-
-async def _reclaim_pending_pinned_inputs_locked() -> set[tuple[str, int]]:
-    """Replay pending input while holding ``_input_delivery_reclaim_lock``."""
-
-    if _session is None or _session.postgres_conn is None or _thread_id is None:
-        return set()
-    agent_id, pod_uid, runtime_generation, runtime_attach_token = (
-        _pinned_input_runtime_identity()
-    )
-    rows = await _session.postgres_conn.claim_pending_pinned_input_deliveries(
-        thread_id=_thread_id,
-        agent_id=agent_id,
-        pod_uid=pod_uid,
-        runtime_generation=runtime_generation,
-        session_runtime_generation=str(_session_runtime_generation or ""),
-        runtime_attach_token=runtime_attach_token,
-    )
-    queued: set[tuple[str, int]] = set()
-    for row in rows:
-        if await _queue_claimed_input(row):
-            queued.add((str(row["delivery_id"]), int(row["claim_generation"])))
-    if queued:
-        logger.info(
-            "Reclaimed %d durable persistent input(s) for thread %s",
-            len(queued),
-            _thread_id,
-        )
-    return queued
-
-
-async def _reclaim_pending_pinned_inputs() -> set[tuple[str, int]]:
-    """Attach-time or accept-time replay for persisted unadmitted input."""
-
-    async with _input_delivery_reclaim_lock:
-        return await _reclaim_pending_pinned_inputs_locked()
-
-
-def _schedule_protected_input_reclaim() -> None:
-    """Reclaim deferred input once this exact protected runtime heals."""
-
-    global _protected_input_reclaim_task
-    if _runtime_admission_closed() or _session is None or _thread_id is None:
-        return
-    current = _protected_input_reclaim_task
-    if current is not None and not current.done():
-        return
-    session = _session
-    thread_id = str(_thread_id)
-    generation = _session_generation
-
-    async def _wait_and_reclaim() -> None:
-        global _protected_input_reclaim_task
-        try:
-            while _session_identity_matches(session, thread_id, generation):
-                if _runtime_admission_closed():
-                    return
-                if _protected_cloud_runtime_ready():
-                    await _reclaim_pending_pinned_inputs()
-                    return
-                await asyncio.sleep(1.0)
-        finally:
-            if _protected_input_reclaim_task is asyncio.current_task():
-                _protected_input_reclaim_task = None
-
-    _protected_input_reclaim_task = _track_session_side_task(
-        asyncio.create_task(
-            _wait_and_reclaim(),
-            name=f"protected-input-reclaim-{thread_id[:12]}",
-        )
-    )
-
-
-async def _accept_user_input(
-    content: str,
-    *,
-    role: str = "human",
-    delivery_id: str | None = None,
-    expected_session_identity_fingerprint: str | None = None,
-) -> AcceptedInput:
-    """Persist an accepted user message, then enqueue it for the loop.
-
-    Returns the durable/local admission outcome. Persisting BEFORE the 200 closes the
-    swallowed-input gap (session_silent_failure_audit.md #1): the queue is
-    process memory, so without the row a mid-turn input vanished from the UI
-    on reload and died with the pod. The loop reuses the id when it consumes
-    the item, so its own persist is an upsert onto this row (final
-    turn_number), never a duplicate.
-
-    ``role`` controls only how the row is PERSISTED; the in-memory message stays
-    a ``HumanMessage`` regardless. That split is deliberate, and both halves are
-    load-bearing:
-
-    * ``role='event'`` keeps a system-injected notice (a worker job the session
-      created has finished) out of the human-bubble family, so the transcript
-      does not claim the user said it. It joins the shipped non-conversational
-      roles ``summary`` and ``error``, which the cockpit already branches on.
-    * Keeping the carrier a ``HumanMessage`` is what keeps ``_save_turn_ai_messages``
-      correct — it reconciles a turn by walking backwards until it hits one — and
-      avoids introducing a novel LangChain type into the graph. A synthetic
-      AIMessage+ToolMessage pair (the *transient* injection family) would be the
-      wrong shape: this is a one-time fact that must survive compaction.
+    The cockpit header fills in on submit rather than only after the
+    (possibly long) first turn ends. Fire-and-forget — must not block input
+    acceptance. _early_title_from_prompt self-guards on a placeholder title and
+    a low-signal prompt; the after-turn pass in _loop_on_turn_complete remains
+    the fallback. The input owner calls this only for human input.
     """
-    if _runtime_admission_closed():
-        raise TerminationAdmissionClosed
-    if not _protected_cloud_runtime_ready():
-        raise ProtectedCloudUnavailable
-    if (
-        expected_session_identity_fingerprint is not None
-        and _current_pinned_session_identity_fingerprint()
-        != expected_session_identity_fingerprint
-    ):
-        raise SessionIdentityMismatch
 
-    parsed_delivery_id = UUID(str(delivery_id)) if delivery_id else uuid4()
-    injected = role != "human"
-    if not injected:
-        _loop_last_user_content[0] = content
-
-    if _session is None or _session.postgres_conn is None or _thread_id is None:
-        raise DurableInputUnavailable
-    try:
-        agent_id, pod_uid, runtime_generation, runtime_attach_token = (
-            _pinned_input_runtime_identity()
-        )
-        row = await asyncio.wait_for(
-            _session.postgres_conn.persist_pinned_input_delivery(
-                thread_id=_thread_id,
-                delivery_id=str(parsed_delivery_id),
-                role=role,
-                content=content,
-                source="officer_wake" if injected else "direct_human",
-                turn_number=_session.turn_count + 1,
-                agent_id=agent_id,
-                pod_uid=pod_uid,
-                runtime_generation=runtime_generation,
-                session_runtime_generation=str(_session_runtime_generation or ""),
-                runtime_attach_token=runtime_attach_token,
-            ),
-            timeout=5.0,
-        )
-    except Exception as exc:
-        logger.warning("Durable input persist/claim failed (%s)", type(exc).__name__)
-        raise DurableInputUnavailable from exc
-
-    state = str(row["state"])
-    claim_generation = int(row["claim_generation"])
-    duplicate = not bool(row.get("transcript_inserted"))
-    if state in {"admitted", "settled", "cancelled"}:
-        return AcceptedInput(
-            message_id=str(row["message_id"]),
-            delivery_id=str(parsed_delivery_id),
-            delivery_state=state,
-            claim_generation=claim_generation,
-            enqueued=False,
-            duplicate=True,
-        )
-
-    if not _protected_cloud_runtime_ready():
-        deferred = await _transition_claimed_input(
-            str(parsed_delivery_id),
-            claim_generation,
-            "deferred",
-            reason="protected_cloud_unavailable_after_persist",
-        )
-        if not deferred:
-            raise DurableInputUnavailable
-        _schedule_protected_input_reclaim()
-        return AcceptedInput(
-            message_id=str(row["message_id"]),
-            delivery_id=str(parsed_delivery_id),
-            delivery_state="deferred",
-            claim_generation=claim_generation,
-            enqueued=False,
-            duplicate=duplicate,
-            deferred=True,
-        )
-
-    if _runtime_admission_closed():
-        await _transition_claimed_input(
-            str(parsed_delivery_id),
-            claim_generation,
-            "deferred",
-            reason="runtime_terminating_after_persist",
-        )
-        return AcceptedInput(
-            message_id=str(row["message_id"]),
-            delivery_id=str(parsed_delivery_id),
-            delivery_state="deferred",
-            claim_generation=claim_generation,
-            enqueued=False,
-            duplicate=duplicate,
-            deferred=True,
-        )
-
-    key = (str(parsed_delivery_id), claim_generation)
-    already_queued = key in _queued_input_claims
-    # Claim the whole durable inbox in transcript order, including this row.
-    # That both preserves ordering and gives a same-process runtime a bounded
-    # way to recover inputs deferred by a transient authorization failure. A
-    # retry of this row observes the local claim set and cannot publish twice.
-    newly_queued = await _reclaim_pending_pinned_inputs()
-    queued_here = key in _queued_input_claims
-    enqueued = key in newly_queued and not already_queued
-    deferred = not queued_here and _runtime_admission_closed()
-    if injected and enqueued:
-        # Make the injection visible in a live cockpit. Nothing else would:
-        # /api/input broadcasts nothing and no frame carries user-message
-        # content (the cockpit builds a user turn from its own optimistic
-        # dispatch on send, or from a history reload). Without this the user
-        # watches a turn start and stream a reply with no visible prompt — the
-        # agent apparently talking to itself. Rides the normal _broadcast path,
-        # so it reaches WS subscribers and the thread_events log (hence SSE)
-        # alike.
-        _broadcast(
-            "session.event",
-            {
-                "content": str(row["content"]),
-                "id": str(row["message_id"]),
-                "role": role,
-            },
-        )
-    # Title the thread from the opening prompt(s) so the cockpit header fills in
-    # on submit rather than only after the (possibly long) first turn ends.
-    # Fire-and-forget — must not block input acceptance. _early_title_from_prompt
-    # self-guards on a placeholder title and a low-signal prompt; the after-turn
-    # pass in _loop_on_turn_complete remains the fallback.
-    #
-    # Injected input is excluded: a wake landing in a young session would
-    # retitle the whole thread after the job-completion text.
-    if not injected and _session is not None and _session.turn_count <= 2:
+    if _session is not None and _session.turn_count <= 2:
         title_session = _session
-        title_thread_id = str(_thread_id or "")
-        title_generation = _session_generation
-        _track_session_side_task(
+        title_thread_id = str(_session_identity.thread_id or "")
+        title_generation = _session_identity.attach_generation
+        _session_termination.track_session_side_task(
             asyncio.create_task(
                 _early_title_from_prompt(
                     content,
@@ -7024,882 +2755,6 @@ async def _accept_user_input(
                 ),
                 name=f"early-title-{title_thread_id[:12]}",
             )
-        )
-    return AcceptedInput(
-        message_id=str(row["message_id"]),
-        delivery_id=str(parsed_delivery_id),
-        delivery_state="deferred" if deferred else "queued" if queued_here else state,
-        claim_generation=claim_generation,
-        enqueued=enqueued,
-        duplicate=duplicate,
-        deferred=deferred,
-    )
-
-
-async def handle_api_input(request: Request) -> JSONResponse:
-    """Push user input onto the loop's queue. Body: {content, role?, turn_id?}.
-
-    ``role`` defaults to 'human'. The orchestrator sends ``role='event'`` when
-    injecting a system notice (a worker job the session created finished) so the
-    persisted row does not render as a user bubble.
-
-    Before persistence, a 503 tells either caller to retry. After the durable
-    transaction commits, both human and event inputs receive an accepted 202
-    with their exact delivery state. The orchestrator interprets that as
-    persisted-not-executed and retains its stable-identity outbox claim; an
-    uncorrelated human client must not submit a second input.
-    """
-    if _stateless_mode():
-        return _stateless_reject()
-    if _runtime_admission_closed():
-        return _termination_rejection()
-    if _session is not None and not _protected_cloud_runtime_ready():
-        return _protected_cloud_unavailable_rejection()
-    if _session is None or _loop_user_queue is None:
-        return JSONResponse({"error": "Session not active"}, status_code=503)
-    try:
-        body = await request.json()
-    except Exception:
-        return JSONResponse({"error": "invalid JSON"}, status_code=400)
-    content = body.get("content", "")
-    if not isinstance(content, str) or not content:
-        return JSONResponse(
-            {"error": "content must be a non-empty string"},
-            status_code=400,
-        )
-    role = body.get("role") or "human"
-    if role not in _ACCEPTED_INPUT_ROLES:
-        return JSONResponse(
-            {"error": f"role must be one of {sorted(_ACCEPTED_INPUT_ROLES)}"},
-            status_code=400,
-        )
-    delivery_id = body.get("delivery_id")
-    expected_session_identity_fingerprint = body.get("session_identity_fingerprint")
-    if role == "event":
-        import uuid as _uuid
-
-        if delivery_id is None:
-            return JSONResponse(
-                {"error": "durable event input requires a delivery_id"},
-                status_code=400,
-            )
-        expected_key = os.environ.get("MCP_INTERNAL_KEY", "")
-        presented_key = request.headers.get("X-Internal-Key", "")
-        if not expected_key or not hmac.compare_digest(expected_key, presented_key):
-            # The identity links an outbox row to its one paid turn. It is
-            # server-owned authority, not an unauthenticated dedup hint.
-            return JSONResponse(
-                {"error": "durable event delivery requires internal authority"},
-                status_code=403,
-            )
-        try:
-            delivery_id = str(_uuid.UUID(str(delivery_id)))
-        except (ValueError, TypeError, AttributeError):
-            return JSONResponse(
-                {"error": "delivery_id must be a UUID"}, status_code=400
-            )
-    elif delivery_id is not None:
-        return JSONResponse(
-            {"error": "delivery_id is reserved for durable event input"},
-            status_code=400,
-        )
-    expected_session_identity_fingerprint = (
-        _canonical_pinned_session_identity_fingerprint(
-            expected_session_identity_fingerprint
-        )
-    )
-    if (
-        expected_session_identity_fingerprint is None
-        or _current_pinned_session_identity_fingerprint()
-        != expected_session_identity_fingerprint
-    ):
-        return JSONResponse(
-            {"error": "session_identity_mismatch", "retryable": True},
-            status_code=409,
-        )
-    if not _ensure_persistent_loop_started("rest_input"):
-        if _runtime_admission_closed():
-            return _termination_rejection()
-        return JSONResponse({"error": "Session not ready"}, status_code=503)
-    try:
-        admission = await _accept_user_input(
-            content,
-            role=role,
-            delivery_id=delivery_id,
-            expected_session_identity_fingerprint=expected_session_identity_fingerprint,
-        )
-    except TerminationAdmissionClosed:
-        return _termination_rejection()
-    except ProtectedCloudUnavailable:
-        return _protected_cloud_unavailable_rejection()
-    except DurableInputUnavailable:
-        return JSONResponse(
-            {
-                "error": "durable_input_unavailable",
-                "retryable": True,
-                "message": "Durable input admission is temporarily unavailable.",
-            },
-            status_code=503,
-            headers={"Retry-After": "5"},
-        )
-    except SessionIdentityMismatch:
-        return JSONResponse(
-            {"error": "session_identity_mismatch", "retryable": True},
-            status_code=409,
-        )
-    return JSONResponse(
-        {
-            **_accepted_input_payload(admission),
-            "turn_id": _session.turn_count,
-            "queue_depth": _loop_user_queue.qsize(),
-        },
-        status_code=(
-            200
-            if admission.delivery_state in {"admitted", "settled", "cancelled"}
-            else 202
-        ),
-    )
-
-
-def _clear_loop_interrupt(*, target_turn_id: int | None = None) -> bool:
-    """Clear one pending interrupt without crossing a turn boundary.
-
-    When ``target_turn_id`` is supplied, a newer turn's pending interrupt is
-    left untouched. Mode, target and the hard-event signal are one logical
-    value and are always cleared together.
-    """
-
-    global _loop_interrupt_flag, _loop_interrupt_target_turn_id
-    if target_turn_id is not None and _loop_interrupt_target_turn_id != int(
-        target_turn_id
-    ):
-        return False
-    had_interrupt = (
-        _loop_interrupt_flag is not None
-        or _loop_interrupt_target_turn_id is not None
-        or bool(_hard_interrupt_event and _hard_interrupt_event.is_set())
-    )
-    _loop_interrupt_flag = None
-    _loop_interrupt_target_turn_id = None
-    if _hard_interrupt_event is not None:
-        _hard_interrupt_event.clear()
-    return had_interrupt
-
-
-def _signal_interrupt_for_turn(
-    target_turn_id: int,
-    *,
-    force_graceful: bool = False,
-) -> Optional[str]:
-    """Synchronously signal RAM iff ``target_turn_id`` is still active.
-
-    The check and mutation have no await between them. That is the local half
-    of the exact-target fence: the database protects the lease generation,
-    while this function prevents a late request for turn N from interrupting
-    turn N+1 after an in-process transition.
-    """
-
-    global _loop_interrupt_flag, _loop_interrupt_target_turn_id
-    if (
-        _session is None
-        or not _turn_event_open
-        or int(_session.turn_count) != int(target_turn_id)
-    ):
-        return None
-    mode = "graceful" if (_tool_inflight or force_graceful) else "hard"
-    _loop_interrupt_flag = mode
-    _loop_interrupt_target_turn_id = int(target_turn_id)
-    # Hard interrupt with no tool in flight ⇒ the loop is parked in an LLM /
-    # auxiliary await; signal it to cancel that await immediately rather than
-    # waiting for the next cooperative check_interrupt poll.
-    if mode == "hard" and _hard_interrupt_event is not None:
-        _hard_interrupt_event.set()
-    return mode
-
-
-async def handle_api_interrupt(request: Optional[Request] = None) -> JSONResponse:
-    """Signal the pinned loop, optionally fenced to a correlated turn.
-
-    Every HTTP call must carry the exact pinned-session fingerprint.  After
-    removing that identity field, an otherwise-empty body retains the legacy
-    active-turn behavior. New orchestrator forwarding may additionally supply
-    ``client_request_id`` and ``target_turn_id``; those calls are rejected
-    before any RAM mutation unless the exact transcript turn is active.
-    Stateless pods consume the durable inbox instead of this direct route.
-    """
-
-    if _stateless_mode():
-        return _stateless_reject()
-    if _session is None:
-        return JSONResponse({"error": "Session not active"}, status_code=503)
-
-    parsed_body: Dict[str, Any] = {}
-    if request is not None:
-        raw = await request.body()
-        if raw:
-            try:
-                parsed = json.loads(raw)
-            except (TypeError, ValueError):
-                return JSONResponse(
-                    {"error": "invalid JSON", "error_code": "invalid_request"},
-                    status_code=400,
-                )
-            if not isinstance(parsed, dict):
-                return JSONResponse(
-                    {
-                        "error": "body must be a JSON object",
-                        "error_code": "invalid_request",
-                    },
-                    status_code=400,
-                )
-            parsed_body = parsed
-
-    expected_session_identity_fingerprint = (
-        _canonical_pinned_session_identity_fingerprint(
-            parsed_body.get("session_identity_fingerprint")
-        )
-    )
-    if (
-        expected_session_identity_fingerprint is None
-        or _current_pinned_session_identity_fingerprint()
-        != expected_session_identity_fingerprint
-    ):
-        return JSONResponse(
-            {"error": "session_identity_mismatch", "retryable": True},
-            status_code=409,
-        )
-
-    body = dict(parsed_body)
-    body.pop("session_identity_fingerprint", None)
-    if not body:
-        # Legacy clients omitted a turn identity. Scope the exact-runtime
-        # request to the concrete active turn observed now; an idle request
-        # must never arm the next input.
-        target_turn_id = int(_session.turn_count)
-        mode = _signal_interrupt_for_turn(target_turn_id)
-        if mode is None:
-            return JSONResponse(
-                {
-                    "ack": False,
-                    "applied": False,
-                    "target_turn_id": target_turn_id,
-                    "error": "target turn is no longer active",
-                    "error_code": "target_turn_not_active",
-                },
-                status_code=409,
-            )
-        logger.info(
-            "Interrupt received via legacy REST "
-            "(target_turn=%d mode=%s tool_inflight=%s)",
-            target_turn_id,
-            mode,
-            _tool_inflight,
-        )
-        return JSONResponse(
-            {
-                "ack": True,
-                "applied": True,
-                "target_turn_id": target_turn_id,
-                "mode": mode,
-            }
-        )
-
-    client_request_id = body.get("client_request_id")
-    target_turn_id = body.get("target_turn_id")
-    if not isinstance(client_request_id, str) or not client_request_id:
-        return JSONResponse(
-            {
-                "error": "client_request_id must be a non-empty string",
-                "error_code": "invalid_request",
-            },
-            status_code=400,
-        )
-    if (
-        isinstance(target_turn_id, bool)
-        or not isinstance(target_turn_id, int)
-        or target_turn_id < 1
-    ):
-        return JSONResponse(
-            {
-                "error": "target_turn_id must be a positive integer",
-                "error_code": "invalid_request",
-            },
-            status_code=400,
-        )
-
-    response: Dict[str, Any] = {
-        "client_request_id": client_request_id,
-        "target_turn_id": target_turn_id,
-    }
-    request_id = body.get("request_id")
-    if request_id is not None:
-        if not isinstance(request_id, str) or not request_id:
-            return JSONResponse(
-                {
-                    "error": "request_id must be a non-empty string",
-                    "error_code": "invalid_request",
-                },
-                status_code=400,
-            )
-        response["request_id"] = request_id
-
-    mode = _signal_interrupt_for_turn(target_turn_id)
-    if mode is None:
-        return JSONResponse(
-            {
-                **response,
-                "applied": False,
-                "error": "target turn is no longer active",
-                "error_code": "target_turn_not_active",
-            },
-            status_code=409,
-        )
-    logger.info(
-        "Correlated interrupt received via REST "
-        "(target_turn=%d mode=%s tool_inflight=%s)",
-        target_turn_id,
-        mode,
-        _tool_inflight,
-    )
-    return JSONResponse({**response, "ack": True, "applied": True, "mode": mode})
-
-
-async def handle_api_approve(request: Request) -> JSONResponse:
-    """Resolve a pending permission gate by UPDATEing the
-    thread_permission_requests row. Body: {decision: approve|deny,
-    approval_id?}. If approval_id is omitted, the most-recent-pending
-    row for this thread is resolved (legacy single-pending-at-a-time
-    contract). The DB trigger emits NOTIFY → agent's permission_check
-    wakes up."""
-    if _stateless_mode():
-        return _stateless_reject()
-    if _session is None:
-        return JSONResponse({"error": "Session not active"}, status_code=503)
-    try:
-        body = await request.json()
-    except Exception:
-        return JSONResponse({"error": "invalid JSON"}, status_code=400)
-    decision_raw = body.get("decision")
-    if decision_raw == "approve":
-        decision = "approved"
-    elif decision_raw == "deny":
-        decision = "denied"
-    else:
-        return JSONResponse(
-            {"error": "decision must be 'approve' or 'deny'"},
-            status_code=400,
-        )
-    approval_id = body.get("approval_id")
-    resolved = await _resolve_pending_permission(
-        decision,
-        approval_id=approval_id,
-        decided_by="rest_client",
-    )
-    if resolved is None:
-        return JSONResponse(
-            {
-                "error": "No matching pending request",
-                "approval_id": approval_id,
-            },
-            status_code=404,
-        )
-    return JSONResponse(
-        {
-            "accepted": True,
-            "decision": decision_raw,
-            "approval_id": str(resolved["id"]),
-            "tool_call_id": resolved["tool_call_id"],
-        }
-    )
-
-
-# --- WebSocket handler (module-level so dual_app can call it too) ---
-
-
-async def handle_persistent_websocket(ws: WebSocket) -> None:
-    """WebSocket consumer for an already-running persistent session.
-
-    Headless lifecycle (chunk 1):
-      - First WS attach spawns the persistent loop with module-level
-        callbacks. Subsequent attaches just register a subscriber and
-        tap into the existing loop's broadcast stream.
-      - WS close calls _unsubscribe() and cancels this connection's pump
-        task. The loop keeps running. It only stops via
-        _loop_completion_handler (idle timeout, /done, crash) or via
-        out-of-band _terminate_session (drain, watchdog, REST detach).
-      - The pod no longer exits when the WS closes — that was the
-        WS-bound era. _schedule_exit is now driven only by drain intent
-        and shutdown paths.
-
-    Reached from both:
-      - persistent_app.create_persistent_app()'s /ws/chat route (pure
-        persistent mode, agent.py --mode persistent).
-      - dual_app.ws_chat (dual mode — adds pod-state pre-checks then
-        delegates here). Sharing this body is what closes the Phase-1
-        gap described in
-        knowledge-base/knowledge/issues/persistent_session_dual_mode_phase1_gap.md.
-    """
-    import uuid
-
-    validated_identity = getattr(ws.state, "session_identity_fingerprint", None)
-    validated_session = _session
-    await ws.accept()
-    if (
-        not isinstance(validated_identity, str)
-        or validated_session is None
-        or _session is not validated_session
-        or _current_pinned_session_identity_fingerprint() != validated_identity
-    ):
-        await ws.close(code=4403, reason="session identity changed")
-        return
-
-    # Stateless executor (M3): sessions on this pod are driven exclusively by
-    # run_queue claims — there is no live WS surface. Mirror the REST 409.
-    if _stateless_mode():
-        try:
-            await ws.send_json(
-                {
-                    "method": "error",
-                    "params": {
-                        "message": (
-                            "stateless executor: this pod serves queued turns; "
-                            "no direct session WebSocket is available"
-                        )
-                    },
-                }
-            )
-        except Exception:
-            pass
-        await ws.close(code=4409, reason="stateless executor")
-        return
-
-    if _runtime_admission_closed():
-        try:
-            await ws.send_json(
-                {
-                    "method": "input.rejected",
-                    "params": {
-                        "error": "runtime_terminating",
-                        "retryable": True,
-                        "message": "Retry input on the replacement runtime.",
-                    },
-                }
-            )
-        finally:
-            await ws.close(code=4512, reason="runtime terminating")
-        return
-
-    # Signal the boot-WS watchdog that a connection arrived. Done before
-    # the readiness check so even a failed-to-be-ready connection counts:
-    # the user clearly came back, and a different error path applies.
-    _signal_ws_connected()
-
-    # Readiness gates on the loop primitives, not just the session — see
-    # _session_ready() for the why. Single source of truth shared with
-    # /ready and /session/status so the probe and the WS gate can't drift.
-    if not _session_ready():
-        await _ws_send(ws, "error", {"message": "Agent not ready"})
-        await ws.close(code=4503, reason="Agent not ready")
-        return
-
-    # Register this WS as a subscriber on the broadcast hub.
-    client_id = uuid.uuid4().hex
-    queue = _subscribe(client_id)
-    pump_task = asyncio.create_task(
-        _run_subscriber_pump(ws, client_id, queue),
-        name=f"subscriber-pump-{client_id[:8]}",
-    )
-
-    logger.info(f"WebSocket connected: thread={_thread_id} client={client_id[:8]}")
-
-    def _identity_current() -> bool:
-        return bool(
-            _session is validated_session
-            and _current_pinned_session_identity_fingerprint() == validated_identity
-        )
-
-    async def _reject_preloop_identity_change() -> None:
-        _unsubscribe(client_id)
-        _clear_canvas_awareness(client_id)
-        if not pump_task.done():
-            pump_task.cancel()
-            try:
-                await pump_task
-            except asyncio.CancelledError:
-                pass
-        await ws.close(code=4403, reason="session identity changed")
-
-    def _spawn_ws_effect(coro: Any, *, name: str) -> asyncio.Task[Any]:
-        return _track_session_side_task(asyncio.create_task(coro, name=name))
-
-    # Send current session state so this client can sync. Direct send —
-    # this is the welcome frame, only the connecting client cares.
-    #
-    # running_tool: if the loop is blocked in a tool call right now, tell this
-    # (re)attaching client which command is running so it can render a "running
-    # command" card instead of a blank "Connecting…". Incremental history may
-    # already carry the AIMessage + tool_call, but it cannot say that the call
-    # is still running — this welcome frame is the authoritative snapshot.
-    #
-    # pending_permissions: same idea for supervised gates that are still
-    # waiting on an answer. The durable row survives, but REST history does
-    # not carry it, so without this a reload (or a dropped live stream) leaves
-    # the approval card unrenderable and the gate unanswerable — the failure
-    # in knowledge-history/done/supervised_parallel_gates_timeout_fabricates_denial.md.
-    running_tool = (
-        inflight_tool_call(validated_session.messages) if _tool_inflight else None
-    )
-    if running_tool is not None:
-        running_tool = {
-            "id": running_tool["id"],
-            "tool": running_tool["tool"],
-            "args": _safe_serialize(running_tool["args"]),
-        }
-    (
-        durable_permission_mode,
-        durable_narration_mode,
-    ) = await _durable_session_control_modes()
-    if not _identity_current():
-        await _reject_preloop_identity_change()
-        return
-    pending_permissions = await _pending_permission_requests()
-    if not _identity_current():
-        await _reject_preloop_identity_change()
-        return
-    task_manager = validated_session.session_task_manager
-    session_tasks = task_manager.to_dict_list() if task_manager is not None else []
-    await _ws_send(
-        ws,
-        "session.state",
-        {
-            "thread_id": _thread_id,
-            "permission_mode": durable_permission_mode,
-            "narration_mode": durable_narration_mode,
-            "turn_count": validated_session.turn_count,
-            # Authoritative join signal for a cold Cockpit reattach. REST can
-            # already contain an incrementally persisted prefix of this turn;
-            # the client uses (turn_in_flight, turn_count) to keep that prefix
-            # and cursor-replayed suffix in one streaming bubble.
-            "turn_in_flight": _turn_event_open,
-            "message_count": len(validated_session.messages),
-            "model": validated_session.config.llm.model,
-            "temperature": validated_session.config.llm.temperature,
-            "running_tool": running_tool,
-            "pending_permissions": pending_permissions,
-            "tasks": session_tasks,
-        },
-    )
-    if not _identity_current():
-        await _reject_preloop_identity_change()
-        return
-
-    # Spawn the persistent loop if it isn't already running. Reconnecting
-    # to a session whose loop is mid-turn just joins the broadcast — no
-    # restart, no replay (replay arrives in chunk 2 via the event log).
-    _ensure_persistent_loop_started("websocket", client_id=client_id)
-
-    # --- WebSocket receive loop ---
-    try:
-        # The exact current queue lock is also the admission serialization
-        # point. Any old-token admission that started before this claim must
-        # commit before this snapshot; one that starts after it observes the
-        # new token and cannot create old-generation work. Fetch the complete
-        # (unbounded) generation once so one steal produces at most one epoch
-        # rotation and one terminal boundary per abandoned target.
-        while True:
-            raw = await ws.receive_text()
-            if not _identity_current():
-                await ws.close(code=4403, reason="session identity changed")
-                break
-            try:
-                data = json.loads(raw)
-            except json.JSONDecodeError:
-                # Plain text → treat as message
-                data = {"method": "message", "content": raw}
-
-            method = data.get("method", "message")
-            if _retirement_admission_closed():
-                # This socket may predate the exact ``ending`` transition.
-                # Retire every moment-scoped control surface together: a late
-                # approval/config/upgrade must not leak through simply because
-                # it is not a user-message verb. The SSE/journal plane lives in
-                # Cockpit and is intentionally independent of this socket.
-                await _ws_send(
-                    ws,
-                    "input.rejected",
-                    {
-                        "error": "runtime_terminating",
-                        "retryable": True,
-                        "message": "Retry input on the replacement runtime.",
-                    },
-                )
-                await ws.close(code=4512, reason="runtime terminating")
-                break
-
-            if method == "message":
-                content = data.get("content", "")
-                if content and _loop_user_queue is not None:
-                    try:
-                        admission = await _accept_user_input(
-                            content,
-                            expected_session_identity_fingerprint=validated_identity,
-                        )
-                        rejection_error = "runtime_terminating"
-                        rejection_message = "Retry input on the replacement runtime."
-                    except TerminationAdmissionClosed:
-                        admission = None
-                        rejection_error = "runtime_terminating"
-                        rejection_message = "Retry input on the replacement runtime."
-                    except ProtectedCloudUnavailable:
-                        admission = None
-                        rejection_error = "protected_cloud_unavailable"
-                        rejection_message = (
-                            "Retry input when the protected cloud mount recovers."
-                        )
-                    except DurableInputUnavailable:
-                        admission = None
-                        rejection_error = "durable_input_unavailable"
-                        rejection_message = "Retry input when durable storage recovers."
-                    except SessionIdentityMismatch:
-                        await ws.close(code=4403, reason="session identity changed")
-                        break
-                    if admission is None:
-                        await _ws_send(
-                            ws,
-                            "input.rejected",
-                            {
-                                "error": rejection_error,
-                                "retryable": True,
-                                "message": rejection_message,
-                            },
-                        )
-                    elif admission.deferred:
-                        await _ws_send(
-                            ws,
-                            "input.accepted",
-                            _accepted_input_payload(admission),
-                        )
-
-            elif method in {
-                "canvas.presentation_updated",
-                "canvas.source_updated",
-                "canvas.user_editing",
-                "canvas.user_idle",
-            }:
-                await _handle_canvas_control(
-                    ws,
-                    data,
-                    client_id,
-                    expected_session_identity_fingerprint=validated_identity,
-                )
-
-            elif method == "approve":
-                # Phase 3: resolve the most-recent-pending permission
-                # request in the DB. Cockpit can pass an explicit
-                # approval_id to disambiguate when multiple are
-                # pending (rare — agent's loop serializes most flows).
-                approval_id = data.get("approval_id")
-                _spawn_ws_effect(
-                    _resolve_pending_permission(
-                        "approved",
-                        approval_id=approval_id,
-                        decided_by="ws_client",
-                    ),
-                    name="resolve-approve",
-                )
-
-            elif method == "deny":
-                approval_id = data.get("approval_id")
-                _spawn_ws_effect(
-                    _resolve_pending_permission(
-                        "denied",
-                        approval_id=approval_id,
-                        decided_by="ws_client",
-                    ),
-                    name="resolve-deny",
-                )
-
-            elif method == "interrupt":
-                # Legacy WebSocket clients carry no target. Bind the request to
-                # the concrete active turn observed now; never leave a bare flag
-                # that can interrupt a later input.
-                target_turn_id = int(_session.turn_count) if _session else 0
-                mode = (
-                    _signal_interrupt_for_turn(target_turn_id)
-                    if target_turn_id > 0
-                    else None
-                )
-                if mode is None:
-                    await _ws_send(
-                        ws,
-                        "interrupt.ack",
-                        {
-                            "applied": False,
-                            "target_turn_id": target_turn_id or None,
-                            "error_code": "target_turn_not_active",
-                        },
-                    )
-                    logger.info("Idle legacy WebSocket interrupt rejected")
-                else:
-                    await _ws_send(
-                        ws,
-                        "interrupt.ack",
-                        {
-                            "applied": True,
-                            "target_turn_id": target_turn_id,
-                            "mode": mode,
-                        },
-                    )
-                    logger.info(
-                        "Interrupt acknowledged (target_turn=%d mode=%s)",
-                        target_turn_id,
-                        mode,
-                    )
-
-            elif method in {"mode.set", "narration.set"}:
-                # These verbs are lane-agnostic orchestrator REST controls.
-                # Keeping a second live-only mutation path here would let an
-                # old client change RAM without the desired scalar, inbox
-                # order, durable result receipt, or owner fence.
-                await _ws_send(
-                    ws,
-                    "error",
-                    {
-                        "code": "control_transport_retired",
-                        "message": "Use the session control REST endpoint",
-                    },
-                )
-
-            elif method == "config.update":
-                config_override = data.get("config", {})
-                # Slice B: a datasource change rides the same frame as a
-                # sibling key — the full desired selection (None = unchanged).
-                datasource_ids = data.get("datasource_ids")
-                if config_override or datasource_ids is not None:
-                    _spawn_ws_effect(
-                        _handle_config_update(
-                            ws,
-                            config_override,
-                            datasource_ids=datasource_ids,
-                            request_id=data.get("request_id"),
-                        ),
-                        name="handle-config-update",
-                    )
-
-            elif method == "compact":
-                # Manual compaction (/compact command, or the rewind action
-                # sheet's "Summarize up to here" with boundary_message_id).
-                focus = data.get("focus", "")
-                _spawn_ws_effect(
-                    _handle_compact(
-                        ws, focus, boundary_message_id=data.get("boundary_message_id")
-                    ),
-                    name="handle-compact",
-                )
-
-            elif method == "archive":
-                # End session (/done command)
-                _spawn_ws_effect(_handle_archive(ws), name="handle-archive")
-
-            elif method == "upgrade-to-vm":
-                # Upgrade workspace from container to VM
-                _spawn_ws_effect(_handle_vm_upgrade(ws), name="handle-vm-upgrade")
-
-            elif method == "upgrade-to-workspace":
-                # Upgrade a lite (virtual) session to a real sandbox container
-                target_tier = data.get("target_tier", "sandbox")
-                _spawn_ws_effect(
-                    _handle_workspace_upgrade(ws, target_tier),
-                    name="handle-workspace-upgrade",
-                )
-
-            elif method == "undo":
-                if _session is None:
-                    await _ws_send(
-                        ws,
-                        "error",
-                        {"message": "Session no longer active"},
-                    )
-                    continue
-                if _session.shell_owner_token is not None:
-                    await _ws_send(
-                        ws,
-                        "error",
-                        {
-                            "code": "control_transport_required",
-                            "message": "Use the session control REST endpoint",
-                        },
-                    )
-                    continue
-                turn_id = data.get("turn_id")
-                try:
-                    restored = await _session.undo_turn(turn_id)
-                except WorkspaceUndoUnavailable as exc:
-                    await _ws_send(
-                        ws,
-                        "error",
-                        {
-                            "code": exc.code,
-                            "message": str(exc),
-                        },
-                    )
-                except WorkspaceUndoRetryable as exc:
-                    await _ws_send(
-                        ws,
-                        "error",
-                        {
-                            "code": "workspace_undo_retryable",
-                            "message": str(exc),
-                        },
-                    )
-                else:
-                    await _ws_send(
-                        ws,
-                        "files.restored",
-                        {**restored, "turn_id": turn_id},
-                    )
-
-            elif method == "rewind":
-                if _session is None:
-                    await _ws_send(
-                        ws,
-                        "error",
-                        {
-                            "message": "Session no longer active",
-                            "request_id": data.get("request_id"),
-                        },
-                    )
-                    continue
-                _spawn_ws_effect(
-                    _handle_rewind(ws, data),
-                    name="handle-rewind",
-                )
-
-            else:
-                await _ws_send(ws, "error", {"message": f"Unknown method: {method}"})
-
-    except WebSocketDisconnect:
-        logger.info(
-            f"WebSocket disconnected: thread={_thread_id} "
-            f"client={client_id[:8]} (loop continues)"
-        )
-    except Exception as e:
-        logger.exception(f"WebSocket error: {e}")
-    finally:
-        # Headless keystone: WS close only unsubscribes. The loop keeps
-        # running until _loop_completion_handler routes its natural exit,
-        # or out-of-band _terminate_session intervenes. We do NOT cancel
-        # _loop_task here, and we do NOT schedule pod exit.
-        _unsubscribe(client_id)
-        _clear_canvas_awareness(client_id)
-        if not pump_task.done():
-            pump_task.cancel()
-            try:
-                await pump_task
-            except asyncio.CancelledError:
-                pass
-        logger.info(
-            f"WebSocket pump released: thread={_thread_id} client={client_id[:8]}"
         )
 
 
@@ -7916,7 +2771,7 @@ def _subscribe(client_id: str) -> asyncio.Queue:
 
     Each WebSocket connection (and later, each SSE consumer) gets its own
     bounded queue. _broadcast() enqueues onto every registered queue;
-    _run_subscriber_pump drains one queue into one WS.
+    the session WebSocket transport's pump drains one queue into one WS.
 
     Phase 5: if this is the first subscriber after an untethered pause,
     schedule a status revert to 'active' so the attention-sleep watchdog
@@ -7927,8 +2782,12 @@ def _subscribe(client_id: str) -> asyncio.Queue:
     queue = _session_transport.subscribe(
         _subscribers, client_id, maxsize=_SUBSCRIBER_QUEUE_MAXSIZE
     )
-    if was_empty and _orchestrator_client is not None and _thread_id is not None:
-        _track_session_side_task(
+    if (
+        was_empty
+        and _orchestrator_client is not None
+        and _session_identity.thread_id is not None
+    ):
+        _session_termination.track_session_side_task(
             asyncio.create_task(
                 _safe_set_thread_status("active"), name="phase5-revert-active"
             )
@@ -7953,14 +2812,16 @@ async def _file_officer_wake(minutes: int, reason: str) -> None:
     (centurion.md §4).
     """
     try:
-        if _orchestrator_client is None or _thread_id is None:
+        if _orchestrator_client is None or _session_identity.thread_id is None:
             return
-        ok = await _orchestrator_client.file_officer_wake(_thread_id, minutes, reason)
+        ok = await _orchestrator_client.file_officer_wake(
+            _session_identity.thread_id, minutes, reason
+        )
         if not ok:
             logger.warning(
                 "Officer wake filing rejected for thread %s "
                 "(watchdog will file sleep_max)",
-                _thread_id,
+                _session_identity.thread_id,
             )
     except Exception as e:
         logger.warning(
@@ -8917,10 +3778,10 @@ def _broadcast_frame(
             receipt=receipt,
         )
         writer = _event_writer
-        if writer is None or writer.thread_id != _thread_id:
+        if writer is None or writer.thread_id != _session_identity.thread_id:
             logger.error(
                 "thread_events writer unavailable (thread=%s epoch=%d seq=%d kind=%s)",
-                _thread_id,
+                _session_identity.thread_id,
                 epoch,
                 seq,
                 method,
@@ -9028,7 +3889,7 @@ async def _durable_session_control_modes() -> tuple[str, str]:
     if _session is None:
         return "supervised", "auto"
     fallback = (_session.permission_mode, _session.narration_mode)
-    if _session.postgres_conn is None or _thread_id is None:
+    if _session.postgres_conn is None or _session_identity.thread_id is None:
         return fallback
 
     from shared.thread_controls import applied_control_scalar
@@ -9039,7 +3900,7 @@ async def _durable_session_control_modes() -> tuple[str, str]:
                 row = await conn.fetchrow(
                     "SELECT permission_mode, narration_mode FROM threads "
                     "WHERE id = $1::uuid",
-                    _thread_id,
+                    _session_identity.thread_id,
                 )
                 if row is None:
                     return fallback
@@ -9061,7 +3922,7 @@ async def _durable_session_control_modes() -> tuple[str, str]:
                     "WHERE request.thread_id = $1::uuid "
                     "AND request.outcome IS NULL "
                     "ORDER BY request.request_seq",
-                    _thread_id,
+                    _session_identity.thread_id,
                 )
         for receipt in receipts:
             scalar = applied_control_scalar(
@@ -9114,6 +3975,32 @@ def _pinned_session_recipient_capable() -> bool:
         and str(
             getattr(_orchestrator_client, "dispatch_process_generation", None) or ""
         ).strip()
+    )
+
+
+def native_first_use_context() -> dict[str, Any]:
+    """Call-time exact pinned authority for dedicated and dual Session apps."""
+
+    return {
+        "session": _session,
+        "identity": _session_identity,
+        "termination": _session_termination,
+        "agent_id": _registered_pinned_agent_id(),
+        "pod_uid": environment_pod_uid(),
+        "process_generation": getattr(
+            _orchestrator_client, "dispatch_process_generation", None
+        ),
+        "public_keys": configured_public_keys(),
+    }
+
+
+def _native_first_use_capable() -> bool:
+    return bool(
+        _pinned_session_recipient_capable()
+        and environment_pod_uid()
+        and configured_public_keys()
+        and not _stateless_mode()
+        and _officer_cfg() is None
     )
 
 
@@ -9207,7 +4094,18 @@ def _describe_control_request(request: Any) -> tuple[str, str, Optional[str]]:
         return "narration.changed", "applied", None
     if request.verb == "workspace.undo" and request.payload == {}:
         return "files.restored", "applied", None
+    if request.verb == "compact" and _valid_compact_payload(request.payload):
+        return "context.compacted", "applied", None
     return "control.rejected", "rejected", "unsupported_control"
+
+
+def _valid_compact_payload(payload: Any) -> bool:
+    """``{focus?, boundary_message_id?}``, each a non-empty string when present."""
+    return (
+        isinstance(payload, dict)
+        and set(payload) <= {"focus", "boundary_message_id"}
+        and all(isinstance(value, str) and value for value in payload.values())
+    )
 
 
 async def _finalize_durable_control(
@@ -9232,10 +4130,12 @@ async def _finalize_durable_control(
                 lease_token=lease_token,
                 agent_id=agent_id,
                 runtime_generation=(
-                    _session_runtime_generation if agent_id is not None else None
+                    _session_identity.session_generation
+                    if agent_id is not None
+                    else None
                 ),
                 runtime_attach_token=(
-                    _session_runtime_attach_token if agent_id is not None else None
+                    _session_identity.attach_token if agent_id is not None else None
                 ),
                 outcome=outcome,
                 error_code=error_code,
@@ -9259,21 +4159,27 @@ async def _reconcile_durable_control_scalars(
 
     if (lease_token is None) == (agent_id is None):
         raise ValueError("exactly one control owner credential is required")
-    if _session is None or _session.postgres_conn is None or _thread_id is None:
+    if (
+        _session is None
+        or _session.postgres_conn is None
+        or _session_identity.thread_id is None
+    ):
         raise EventJournalUnavailable("control scalar reconciliation lost session")
 
     async with _session.postgres_conn.acquire() as conn:
         async with conn.transaction():
             fenced = await owner_fence_current(
                 conn,
-                thread_id=_thread_id,
+                thread_id=_session_identity.thread_id,
                 lease_token=lease_token,
                 agent_id=agent_id,
                 runtime_generation=(
-                    _session_runtime_generation if agent_id is not None else None
+                    _session_identity.session_generation
+                    if agent_id is not None
+                    else None
                 ),
                 runtime_attach_token=(
-                    _session_runtime_attach_token if agent_id is not None else None
+                    _session_identity.attach_token if agent_id is not None else None
                 ),
             )
             if not fenced:
@@ -9283,7 +4189,7 @@ async def _reconcile_durable_control_scalars(
             row = await conn.fetchrow(
                 "SELECT permission_mode, narration_mode FROM threads "
                 "WHERE id = $1::uuid",
-                _thread_id,
+                _session_identity.thread_id,
             )
     if row is None or _session is None:
         raise ControlInboxBlocked("control scalar reconciliation lost thread")
@@ -9306,10 +4212,14 @@ async def _set_pinned_control_admission(
     the binding; database failures raise and must not be treated as closure.
     """
 
-    if _session is None or _session.postgres_conn is None or _thread_id is None:
+    if (
+        _session is None
+        or _session.postgres_conn is None
+        or _session_identity.thread_id is None
+    ):
         raise EventJournalUnavailable("control admission gate lost session")
-    runtime_generation = _session_runtime_generation
-    runtime_attach_token = _session_runtime_attach_token
+    runtime_generation = _session_identity.session_generation
+    runtime_attach_token = _session_identity.attach_token
     if runtime_generation is None:
         return False
     async with _session.postgres_conn.acquire() as conn:
@@ -9318,7 +4228,7 @@ async def _set_pinned_control_admission(
                 "SELECT agent_id, execution_lane, status, runtime_generation, "
                 "runtime_attach_token, runtime_retirement_token FROM threads "
                 "WHERE id = $1::uuid FOR UPDATE",
-                _thread_id,
+                _session_identity.thread_id,
             )
             if (
                 thread is None
@@ -9338,7 +4248,7 @@ async def _set_pinned_control_admission(
                 "SELECT 1 FROM agents WHERE id = $1::uuid "
                 "AND thread_id = $2::uuid FOR SHARE",
                 agent_id,
-                _thread_id,
+                _session_identity.thread_id,
             )
             if reciprocal is None:
                 return False
@@ -9349,7 +4259,7 @@ async def _set_pinned_control_admission(
                 "AND runtime_generation = $4::uuid "
                 "AND runtime_attach_token IS NOT DISTINCT FROM $5::uuid "
                 "AND runtime_retirement_token IS NULL RETURNING id",
-                _thread_id,
+                _session_identity.thread_id,
                 agent_id,
                 bool(open_for_admission),
                 runtime_generation,
@@ -9383,7 +4293,7 @@ async def _close_pinned_control_inbox(*, agent_id: str) -> bool:
             raise
         logger.info(
             "Pinned control owner moved during final drain (thread=%s agent=%s)",
-            _thread_id,
+            _session_identity.thread_id,
             agent_id,
         )
         return False
@@ -9442,9 +4352,11 @@ async def _drain_thread_controls(
     if (lease_token is None) == (agent_id is None):
         raise ValueError("exactly one control owner credential is required")
 
-    runtime_generation = _session_runtime_generation if agent_id is not None else None
+    runtime_generation = (
+        _session_identity.session_generation if agent_id is not None else None
+    )
     runtime_attach_token = (
-        _session_runtime_attach_token if agent_id is not None else None
+        _session_identity.attach_token if agent_id is not None else None
     )
     if agent_id is not None and runtime_generation is None:
         raise ControlInboxBlocked("pinned control owner lacks runtime generation")
@@ -9452,13 +4364,17 @@ async def _drain_thread_controls(
     applied = 0
     async with _control_drain_lock:
         while True:
-            if _session is None or _session.postgres_conn is None or _thread_id is None:
+            if (
+                _session is None
+                or _session.postgres_conn is None
+                or _session_identity.thread_id is None
+            ):
                 return applied
             if lease_token is not None:
                 handle = _current_lease_var.get()
                 if (
                     handle is None
-                    or handle.unit_id != str(_thread_id)
+                    or handle.unit_id != str(_session_identity.thread_id)
                     or handle.lease_token != int(lease_token)
                     or handle.lost.is_set()
                 ):
@@ -9471,7 +4387,7 @@ async def _drain_thread_controls(
                 async with conn.transaction():
                     owns_thread = await owner_fence_current(
                         conn,
-                        thread_id=_thread_id,
+                        thread_id=_session_identity.thread_id,
                         lease_token=lease_token,
                         agent_id=agent_id,
                         runtime_generation=runtime_generation,
@@ -9488,14 +4404,14 @@ async def _drain_thread_controls(
                     if agent_id is not None:
                         await adopt_next_pinned_control_request(
                             conn,
-                            thread_id=_thread_id,
+                            thread_id=_session_identity.thread_id,
                             agent_id=agent_id,
                             runtime_generation=runtime_generation,
                             runtime_attach_token=runtime_attach_token,
                         )
                     request = await fetch_next_control_request(
                         conn,
-                        thread_id=_thread_id,
+                        thread_id=_session_identity.thread_id,
                         lease_token=lease_token,
                         agent_id=agent_id,
                         runtime_generation=runtime_generation,
@@ -9512,7 +4428,7 @@ async def _drain_thread_controls(
                         )
                     receipt = await fetch_control_receipt(
                         conn,
-                        thread_id=_thread_id,
+                        thread_id=_session_identity.thread_id,
                         request_id=request.id,
                     )
 
@@ -9559,7 +4475,7 @@ async def _drain_thread_controls(
                 logger.info(
                     "session-control timing: thread=%s verb=%s seq=%d "
                     "recovered_receipt=true total=%.3fs",
-                    _thread_id,
+                    _session_identity.thread_id,
                     request.verb,
                     request.request_seq,
                     time.perf_counter() - started,
@@ -9594,6 +4510,13 @@ async def _drain_thread_controls(
                     raise ControlInboxBlocked(
                         f"workspace undo failed before acknowledgement: {request.id}"
                     ) from exc
+            elif outcome == "applied" and request.verb == "compact":
+                (
+                    event_kind,
+                    outcome,
+                    error_code,
+                    effect_params,
+                ) = await _apply_compact_control(request, lease_token=lease_token)
             params: Dict[str, Any] = {
                 "request_id": str(request.id),
                 "client_request_id": str(request.client_request_id),
@@ -9605,8 +4528,12 @@ async def _drain_thread_controls(
                 "narration.set",
             }:
                 params["mode"] = str(request.payload.get("mode") or "")
-            elif outcome == "applied" and request.verb == "workspace.undo":
-                params.update(effect_params)
+            elif outcome == "applied" and request.verb in {
+                "workspace.undo",
+                "compact",
+            }:
+                # The envelope above wins over any same-named effect key.
+                params = {**effect_params, **params}
             else:
                 params["error_code"] = error_code
 
@@ -9651,7 +4578,7 @@ async def _drain_thread_controls(
             logger.info(
                 "session-control timing: thread=%s verb=%s seq=%d "
                 "recovered_receipt=false journal=%.3fs total=%.3fs",
-                _thread_id,
+                _session_identity.thread_id,
                 request.verb,
                 request.request_seq,
                 journal_seconds,
@@ -9800,7 +4727,11 @@ async def _start_thread_control_watcher(
             open_for_admission=False,
         )
     await _stop_thread_control_watcher()
-    if _session is None or _session.postgres_conn is None or _thread_id is None:
+    if (
+        _session is None
+        or _session.postgres_conn is None
+        or _session_identity.thread_id is None
+    ):
         raise EventJournalUnavailable("cannot start control owner without a session")
 
     _control_owner_lease_token = int(lease_token) if lease_token is not None else None
@@ -9838,12 +4769,12 @@ async def _start_thread_control_watcher(
     _control_watcher_task = asyncio.create_task(
         _control_watcher_loop(
             postgres_conn=_session.postgres_conn,
-            thread_id=str(_thread_id),
+            thread_id=str(_session_identity.thread_id),
             stop=stop,
             lease_token=_control_owner_lease_token,
             agent_id=_control_owner_agent_id,
         ),
-        name=f"thread-control-watcher-{str(_thread_id)[:8]}",
+        name=f"thread-control-watcher-{str(_session_identity.thread_id)[:8]}",
     )
     return drained
 
@@ -9900,14 +4831,18 @@ async def _finalize_durable_interrupt(
 
     from shared.thread_interrupts import finalize_interrupt_request
 
-    if _session is None or _session.postgres_conn is None or _thread_id is None:
+    if (
+        _session is None
+        or _session.postgres_conn is None
+        or _session_identity.thread_id is None
+    ):
         return "lost_owner"
     async with _session.postgres_conn.acquire() as conn:
         async with conn.transaction():
             return await finalize_interrupt_request(
                 conn,
                 request_id=request.id,
-                thread_id=_thread_id,
+                thread_id=_session_identity.thread_id,
                 lease_token=int(lease_token),
                 target_turn_id=int(request.target_turn_id),
                 outcome=outcome,
@@ -9938,12 +4873,16 @@ async def _drain_thread_interrupts(*, lease_token: int, target_turn_id: int) -> 
     applied_count = 0
     async with _interrupt_drain_lock:
         while True:
-            if _session is None or _session.postgres_conn is None or _thread_id is None:
+            if (
+                _session is None
+                or _session.postgres_conn is None
+                or _session_identity.thread_id is None
+            ):
                 return applied_count
             handle = _current_lease_var.get()
             if (
                 handle is None
-                or handle.unit_id != str(_thread_id)
+                or handle.unit_id != str(_session_identity.thread_id)
                 or handle.lease_token != int(lease_token)
                 or handle.lost.is_set()
             ):
@@ -9956,7 +4895,7 @@ async def _drain_thread_interrupts(*, lease_token: int, target_turn_id: int) -> 
                 async with conn.transaction():
                     owns_thread = await owner_fence_current(
                         conn,
-                        thread_id=_thread_id,
+                        thread_id=_session_identity.thread_id,
                         lease_token=int(lease_token),
                     )
                     if not owns_thread:
@@ -9966,7 +4905,7 @@ async def _drain_thread_interrupts(*, lease_token: int, target_turn_id: int) -> 
                         )
                     request = await fetch_next_interrupt_request(
                         conn,
-                        thread_id=_thread_id,
+                        thread_id=_session_identity.thread_id,
                         lease_token=int(lease_token),
                         target_turn_id=int(target_turn_id),
                     )
@@ -9974,7 +4913,7 @@ async def _drain_thread_interrupts(*, lease_token: int, target_turn_id: int) -> 
                         return applied_count
                     receipt = await fetch_interrupt_receipt(
                         conn,
-                        thread_id=_thread_id,
+                        thread_id=_session_identity.thread_id,
                         request_id=request.id,
                     )
 
@@ -10010,13 +4949,13 @@ async def _drain_thread_interrupts(*, lease_token: int, target_turn_id: int) -> 
                 logger.info(
                     "session-interrupt timing: thread=%s turn=%d "
                     "recovered_receipt=true total=%.3fs",
-                    _thread_id,
+                    _session_identity.thread_id,
                     request.target_turn_id,
                     time.perf_counter() - started,
                 )
                 continue
 
-            mode = _signal_interrupt_for_turn(request.target_turn_id)
+            mode = _session_input.signal_interrupt_for_turn(request.target_turn_id)
             outcome = "applied" if mode is not None else "rejected"
             error_code = None if mode is not None else "target_turn_not_active"
             params: Dict[str, Any] = {
@@ -10061,7 +5000,7 @@ async def _drain_thread_interrupts(*, lease_token: int, target_turn_id: int) -> 
             logger.info(
                 "session-interrupt timing: thread=%s turn=%d applied=%s "
                 "recovered_receipt=false journal=%.3fs total=%.3fs",
-                _thread_id,
+                _session_identity.thread_id,
                 request.target_turn_id,
                 outcome == "applied",
                 journal_seconds,
@@ -10082,19 +5021,23 @@ async def _rotate_thread_interrupt_recovery_epoch(*, lease_token: int) -> int:
 
     global _event_writer, _events_epoch, _next_seq
 
-    if _session is None or _session.postgres_conn is None or _thread_id is None:
+    if (
+        _session is None
+        or _session.postgres_conn is None
+        or _session_identity.thread_id is None
+    ):
         raise EventJournalUnavailable("interrupt epoch recovery lost its session")
     handle = _current_lease_var.get()
     if (
         handle is None
-        or handle.unit_id != str(_thread_id)
+        or handle.unit_id != str(_session_identity.thread_id)
         or handle.lease_token != int(lease_token)
         or handle.lost.is_set()
     ):
         raise InterruptInboxBlocked("interrupt epoch recovery lost local lease")
 
     old_writer = _event_writer
-    if old_writer is None or old_writer.thread_id != str(_thread_id):
+    if old_writer is None or old_writer.thread_id != str(_session_identity.thread_id):
         raise EventJournalUnavailable("interrupt epoch recovery has no writer")
     _event_writer = None
     await old_writer.close()
@@ -10109,7 +5052,7 @@ async def _rotate_thread_interrupt_recovery_epoch(*, lease_token: int) -> int:
                     "SELECT 1 FROM threads WHERE id = $1::uuid "
                     "AND execution_lane = 'stateless' AND agent_id IS NULL "
                     "FOR UPDATE",
-                    _thread_id,
+                    _session_identity.thread_id,
                 )
                 if thread is None:
                     handle.lost.set()
@@ -10121,7 +5064,7 @@ async def _rotate_thread_interrupt_recovery_epoch(*, lease_token: int) -> int:
                     "WHERE unit_id = $1::uuid AND unit_kind = 'session_turn' "
                     "AND state = 'leased' AND lease_token = $2::bigint "
                     "FOR UPDATE",
-                    _thread_id,
+                    _session_identity.thread_id,
                     int(lease_token),
                 )
                 if queue is None:
@@ -10135,7 +5078,7 @@ async def _rotate_thread_interrupt_recovery_epoch(*, lease_token: int) -> int:
 
                 permission_retirement = await retire_stale_stateless_permissions(
                     conn,
-                    thread_id=str(_thread_id),
+                    thread_id=str(_session_identity.thread_id),
                     retired_lease_token=int(lease_token) - 1,
                     successor_lease_token=int(lease_token),
                     reason="lease_expired",
@@ -10154,7 +5097,7 @@ async def _rotate_thread_interrupt_recovery_epoch(*, lease_token: int) -> int:
                 else:
                     new_epoch = await _event_journal.bump_epoch(
                         conn,
-                        thread_id=str(_thread_id),
+                        thread_id=str(_session_identity.thread_id),
                     )
                     recovered_hwm = 0
     except BaseException:
@@ -10169,7 +5112,7 @@ async def _rotate_thread_interrupt_recovery_epoch(*, lease_token: int) -> int:
     try:
         new_writer = _OrderedPersistentEventWriter(
             postgres_conn=_session.postgres_conn,
-            thread_id=str(_thread_id),
+            thread_id=str(_session_identity.thread_id),
             epoch=_events_epoch,
             on_terminal_failure=_event_persistence_failed,
             lease=handle,
@@ -10181,7 +5124,7 @@ async def _rotate_thread_interrupt_recovery_epoch(*, lease_token: int) -> int:
     _event_writer = new_writer
     logger.info(
         "session-owner recovery epoch: thread=%s token=%d old=%d new=%d permissions=%d",
-        _thread_id,
+        _session_identity.thread_id,
         lease_token,
         old_epoch,
         _events_epoch,
@@ -10213,13 +5156,17 @@ async def _reconcile_stale_thread_interrupts(
 
     reconciled = 0
     async with _interrupt_drain_lock:
-        if _session is None or _session.postgres_conn is None or _thread_id is None:
+        if (
+            _session is None
+            or _session.postgres_conn is None
+            or _session_identity.thread_id is None
+        ):
             return reconciled, None
         while True:
             handle = _current_lease_var.get()
             if (
                 handle is None
-                or handle.unit_id != str(_thread_id)
+                or handle.unit_id != str(_session_identity.thread_id)
                 or handle.lease_token != int(lease_token)
                 or handle.lost.is_set()
             ):
@@ -10233,7 +5180,7 @@ async def _reconcile_stale_thread_interrupts(
                 async with conn.transaction():
                     owns_thread = await owner_fence_current_for_update(
                         conn,
-                        thread_id=_thread_id,
+                        thread_id=_session_identity.thread_id,
                         lease_token=int(lease_token),
                     )
                     if not owns_thread:
@@ -10243,13 +5190,13 @@ async def _reconcile_stale_thread_interrupts(
                         )
                     requests = await fetch_stale_interrupt_requests(
                         conn,
-                        thread_id=_thread_id,
+                        thread_id=_session_identity.thread_id,
                         current_lease_token=int(lease_token),
                     )
                     stale_permissions = bool(
                         await conn.fetchval(
                             _STALE_PERMISSION_EXISTS_SQL,
-                            _thread_id,
+                            _session_identity.thread_id,
                             int(lease_token),
                         )
                     )
@@ -10259,7 +5206,7 @@ async def _reconcile_stale_thread_interrupts(
                             "SELECT consumed_seq FROM run_queue "
                             "WHERE unit_id = $1::uuid AND state = 'leased' "
                             "AND lease_token = $2::bigint",
-                            _thread_id,
+                            _session_identity.thread_id,
                             int(lease_token),
                         )
                         result = (
@@ -10275,7 +5222,7 @@ async def _reconcile_stale_thread_interrupts(
                         receipts = {
                             request.id: await fetch_interrupt_receipt(
                                 conn,
-                                thread_id=_thread_id,
+                                thread_id=_session_identity.thread_id,
                                 request_id=request.id,
                             )
                             for request in requests
@@ -10386,7 +5333,7 @@ async def _reconcile_stale_thread_interrupts(
                         async with conn.transaction():
                             if not await owner_fence_current_for_update(
                                 conn,
-                                thread_id=_thread_id,
+                                thread_id=_session_identity.thread_id,
                                 lease_token=int(lease_token),
                             ):
                                 handle.lost.set()
@@ -10395,7 +5342,7 @@ async def _reconcile_stale_thread_interrupts(
                                 )
                             consumed = await consume_applied_interrupt_input_live(
                                 conn,
-                                thread_id=_thread_id,
+                                thread_id=_session_identity.thread_id,
                                 current_lease_token=int(lease_token),
                                 accepted_lease_token=int(request.accepted_lease_token),
                                 target_turn_id=int(request.target_turn_id),
@@ -10433,7 +5380,7 @@ async def _reconcile_stale_thread_interrupts(
                 logger.info(
                     "session-interrupt stale recovery: thread=%s request=%s "
                     "accepted_token=%d current_token=%d receipt=%s",
-                    _thread_id,
+                    _session_identity.thread_id,
                     request.id,
                     request.accepted_lease_token,
                     lease_token,
@@ -10444,7 +5391,7 @@ async def _reconcile_stale_thread_interrupts(
                 async with conn.transaction():
                     if not await owner_fence_current_for_update(
                         conn,
-                        thread_id=_thread_id,
+                        thread_id=_session_identity.thread_id,
                         lease_token=int(lease_token),
                     ):
                         handle.lost.set()
@@ -10455,7 +5402,7 @@ async def _reconcile_stale_thread_interrupts(
                         "SELECT consumed_seq FROM run_queue "
                         "WHERE unit_id = $1::uuid AND state = 'leased' "
                         "AND lease_token = $2::bigint",
-                        _thread_id,
+                        _session_identity.thread_id,
                         int(lease_token),
                     )
                     return (
@@ -10575,7 +5522,11 @@ async def _start_thread_interrupt_watcher_locked(
     global _interrupt_owner_lease_token, _interrupt_owner_turn_id
 
     await _stop_thread_interrupt_watcher_locked()
-    if _session is None or _session.postgres_conn is None or _thread_id is None:
+    if (
+        _session is None
+        or _session.postgres_conn is None
+        or _session_identity.thread_id is None
+    ):
         raise EventJournalUnavailable("cannot start interrupt owner without a session")
     _interrupt_owner_lease_token = int(lease_token)
     _interrupt_owner_turn_id = int(target_turn_id)
@@ -10594,12 +5545,12 @@ async def _start_thread_interrupt_watcher_locked(
     _interrupt_watcher_task = asyncio.create_task(
         _interrupt_watcher_loop(
             postgres_conn=_session.postgres_conn,
-            thread_id=str(_thread_id),
+            thread_id=str(_session_identity.thread_id),
             stop=stop,
             lease_token=_interrupt_owner_lease_token,
             target_turn_id=_interrupt_owner_turn_id,
         ),
-        name=f"thread-interrupt-watcher-{str(_thread_id)[:8]}",
+        name=f"thread-interrupt-watcher-{str(_session_identity.thread_id)[:8]}",
     )
     return drained
 
@@ -10687,10 +5638,21 @@ def _emit_canvas_event(method: str, params: Dict[str, Any]) -> None:
         logger.warning("Canvas invalidation broadcast failed: %s", exc)
 
 
+def _invalidate_session_recent_read(path: str) -> None:
+    """Forget a cached workspace read after a committed Canvas source save."""
+
+    if _session is not None and _session.tool_context is not None:
+        _session.tool_context.invalidate_recent_read(path)
+
+
 async def _current_canvas_for_control() -> dict[str, Any] | None:
     """Load authoritative Canvas state with the attached delegated owner."""
 
-    if _session is None or _thread_id is None or _session.tool_context is None:
+    if (
+        _session is None
+        or _session_identity.thread_id is None
+        or _session.tool_context is None
+    ):
         return None
     context = _session.tool_context
     user_id = str(context.user_id or "").strip()
@@ -10699,389 +5661,9 @@ async def _current_canvas_for_control() -> dict[str, Any] | None:
     config_name = str(context.config.get("agent_id") or _config_path or "persistent")
     client = create_orchestrator_client_from_env(config_name, user_id=user_id)
     try:
-        return await client.get_thread_canvas(_thread_id)
+        return await client.get_thread_canvas(_session_identity.thread_id)
     finally:
         await client.close()
-
-
-def _validated_canvas_control_state(
-    data: Dict[str, Any], state: dict[str, Any] | None
-) -> dict[str, Any] | None:
-    """Match an untrusted control frame to exact authoritative Canvas state."""
-
-    if state is None or data.get("canvas_id") != "main":
-        return None
-    revision = data.get("presentation_revision")
-    if (
-        isinstance(revision, bool)
-        or not isinstance(revision, int)
-        or revision != state.get("presentation_revision")
-    ):
-        return None
-    if data.get("method") == "canvas.presentation_updated":
-        return state
-
-    source = state.get("source")
-    if (
-        not isinstance(source, dict)
-        or source.get("type") != "workspace_file"
-        or not isinstance(data.get("path"), str)
-        or data["path"] != source.get("path")
-        or not isinstance(data.get("source_version"), str)
-        or data["source_version"] != state.get("source_version")
-    ):
-        return None
-    return state
-
-
-def _cancel_canvas_awareness(client_id: str) -> _CanvasAwarenessLease | None:
-    lease = _canvas_awareness.pop(client_id, None)
-    if lease is not None and lease.task is not asyncio.current_task():
-        lease.task.cancel()
-    return lease
-
-
-def _fan_out_canvas_idle(client_id: str, params: Dict[str, Any]) -> None:
-    _fan_out_live_frame(
-        {
-            "method": "canvas.user_idle",
-            "params": {**params, "sender_id": client_id},
-        }
-    )
-
-
-async def _expire_canvas_awareness(
-    client_id: str, editing_session_id: str, params: Dict[str, Any]
-) -> None:
-    try:
-        await asyncio.sleep(_CANVAS_AWARENESS_TTL_S)
-    except asyncio.CancelledError:
-        return
-    lease = _canvas_awareness.get(client_id)
-    if (
-        lease is None
-        or lease.task is not asyncio.current_task()
-        or lease.params.get("editing_session_id") != editing_session_id
-    ):
-        return
-    _canvas_awareness.pop(client_id, None)
-    _fan_out_canvas_idle(client_id, params)
-
-
-def _clear_canvas_awareness(client_id: str) -> None:
-    """Expire every courtesy lease owned by one disconnected connection."""
-
-    lease = _cancel_canvas_awareness(client_id)
-    if lease is not None:
-        _fan_out_canvas_idle(client_id, lease.params)
-    for key in [key for key in _canvas_control_validation_at if key[0] == client_id]:
-        _canvas_control_validation_at.pop(key, None)
-    _canvas_source_updates.pop(client_id, None)
-    _canvas_presentation_updates.pop(client_id, None)
-
-
-def _clear_all_canvas_awareness() -> None:
-    """Cancel leases without emitting across a detach/reattach boundary."""
-
-    leases = list(_canvas_awareness.values())
-    _canvas_awareness.clear()
-    _canvas_control_validation_at.clear()
-    _canvas_source_updates.clear()
-    _canvas_presentation_updates.clear()
-    for lease in leases:
-        lease.task.cancel()
-
-
-def _start_canvas_awareness(
-    client_id: str,
-    params: Dict[str, Any],
-    *,
-    renewed_at: float,
-    validated_at: float,
-) -> None:
-    editing_session_id = str(params["editing_session_id"])
-    task = asyncio.create_task(
-        _expire_canvas_awareness(client_id, editing_session_id, params),
-        name=f"canvas-awareness-{client_id[:8]}",
-    )
-    _canvas_awareness[client_id] = _CanvasAwarenessLease(
-        task=task,
-        params=params,
-        renewed_at=renewed_at,
-        validated_at=validated_at,
-    )
-    _fan_out_live_frame(
-        {
-            "method": "canvas.user_editing",
-            "params": {
-                **params,
-                "sender_id": client_id,
-                "ttl_ms": int(_CANVAS_AWARENESS_TTL_S * 1000),
-            },
-        }
-    )
-
-
-async def _handle_canvas_control(
-    ws: WebSocket,
-    data: Dict[str, Any],
-    client_id: str,
-    *,
-    expected_session_identity_fingerprint: str | None = None,
-) -> bool:
-    """Handle validated edit invalidation and live-only awareness frames."""
-
-    method = data.get("method")
-    allowed = {
-        "canvas.presentation_updated",
-        "canvas.source_updated",
-        "canvas.user_editing",
-        "canvas.user_idle",
-    }
-    if method not in allowed:
-        return False
-    if method == "canvas.presentation_updated":
-        expected_fields = {"method", "canvas_id", "presentation_revision"}
-    else:
-        expected_fields = {
-            "method",
-            "canvas_id",
-            "path",
-            "presentation_revision",
-            "source_version",
-        }
-        if method in {"canvas.user_editing", "canvas.user_idle"}:
-            expected_fields.add("editing_session_id")
-    if set(data) != expected_fields:
-        await _ws_send(
-            ws,
-            "error",
-            {
-                "code": "invalid_canvas_control",
-                "message": "Canvas control message is invalid",
-            },
-        )
-        return True
-    editing_session_id = data.get("editing_session_id")
-    if method in {"canvas.user_editing", "canvas.user_idle"} and (
-        not isinstance(editing_session_id, str)
-        or not re.fullmatch(r"[A-Za-z0-9_-]{8,128}", editing_session_id)
-    ):
-        await _ws_send(
-            ws,
-            "error",
-            {
-                "code": "invalid_canvas_control",
-                "message": "Canvas editing session is invalid",
-            },
-        )
-        return True
-    path = data.get("path")
-    revision = data.get("presentation_revision")
-    source_version = data.get("source_version")
-    invalid_identity = (
-        data.get("canvas_id") != "main"
-        or isinstance(revision, bool)
-        or not isinstance(revision, int)
-        or revision < 1
-    )
-    invalid_file_identity = method != "canvas.presentation_updated" and (
-        not isinstance(path, str)
-        or not 0 < len(path) <= 4096
-        or not isinstance(source_version, str)
-        or not re.fullmatch(r"sha256:[0-9a-f]{64}", source_version)
-    )
-    if invalid_identity or invalid_file_identity:
-        await _ws_send(
-            ws,
-            "error",
-            {
-                "code": "invalid_canvas_control",
-                "message": "Canvas control message is invalid",
-            },
-        )
-        return True
-
-    now = asyncio.get_running_loop().time()
-    if method in {"canvas.user_editing", "canvas.user_idle"}:
-        lease = _canvas_awareness.get(client_id)
-        if lease is not None and all(
-            data.get(field) == lease.params.get(field)
-            for field in (
-                "canvas_id",
-                "path",
-                "presentation_revision",
-                "source_version",
-                "editing_session_id",
-            )
-        ):
-            if method == "canvas.user_idle":
-                _cancel_canvas_awareness(client_id)
-                _fan_out_canvas_idle(client_id, lease.params)
-                return True
-            if now - lease.validated_at < _CANVAS_AWARENESS_TTL_S:
-                if now - lease.renewed_at < _CANVAS_AWARENESS_RENEW_MIN_INTERVAL_S:
-                    # Exact duplicate/over-eager renewal: the current server TTL
-                    # is still live, so avoid task churn and redundant fan-out.
-                    return True
-                _cancel_canvas_awareness(client_id)
-                _start_canvas_awareness(
-                    client_id,
-                    lease.params,
-                    renewed_at=now,
-                    validated_at=lease.validated_at,
-                )
-                return True
-
-    source_identity: tuple[str, int, str] | None = None
-    if method == "canvas.source_updated":
-        assert isinstance(path, str) and isinstance(revision, int)
-        assert isinstance(source_version, str)
-        source_identity = (path, revision, source_version)
-        if _canvas_source_updates.get(client_id) == source_identity:
-            # The successful save response may be retried. A real subsequent
-            # save advances the revision, so only the exact last accepted
-            # identity is safe to deduplicate locally.
-            return True
-
-        # Do not drop a distinct committed revision. Pace authoritative checks
-        # instead, bounding invalid/mismatched spam without losing a real save.
-        validation_key = (client_id, "source")
-        last_validation = _canvas_control_validation_at.get(validation_key)
-        if last_validation is not None:
-            remaining = _CANVAS_CONTROL_VALIDATION_MIN_INTERVAL_S - (
-                now - last_validation
-            )
-            if remaining > 0:
-                await asyncio.sleep(remaining)
-                now = asyncio.get_running_loop().time()
-        _canvas_control_validation_at[validation_key] = now
-    elif method == "canvas.presentation_updated":
-        assert isinstance(revision, int)
-        if _canvas_presentation_updates.get(client_id) == revision:
-            return True
-        validation_key = (client_id, "presentation")
-        last_validation = _canvas_control_validation_at.get(validation_key)
-        if last_validation is not None:
-            remaining = _CANVAS_CONTROL_VALIDATION_MIN_INTERVAL_S - (
-                now - last_validation
-            )
-            if remaining > 0:
-                await asyncio.sleep(remaining)
-                now = asyncio.get_running_loop().time()
-        _canvas_control_validation_at[validation_key] = now
-    else:
-        validation_key = (client_id, "awareness")
-        last_validation = _canvas_control_validation_at.get(validation_key)
-        if (
-            last_validation is not None
-            and now - last_validation < _CANVAS_CONTROL_VALIDATION_MIN_INTERVAL_S
-        ):
-            await _ws_send(
-                ws,
-                "error",
-                {
-                    "code": "canvas_control_rate_limited",
-                    "message": "Canvas control messages are arriving too quickly",
-                },
-            )
-            return True
-        _canvas_control_validation_at[validation_key] = now
-
-    try:
-        state = await _current_canvas_for_control()
-    except Exception as exc:
-        logger.warning("Canvas control state validation failed: %s", exc)
-        await _ws_send(
-            ws,
-            "error",
-            {
-                "code": "canvas_control_unavailable",
-                "message": "Canvas state could not be validated",
-            },
-        )
-        return True
-    if (
-        expected_session_identity_fingerprint is not None
-        and _current_pinned_session_identity_fingerprint()
-        != expected_session_identity_fingerprint
-    ):
-        return True
-    state = _validated_canvas_control_state(data, state)
-    if state is None:
-        await _ws_send(
-            ws,
-            "error",
-            {
-                "code": "canvas_control_stale",
-                "message": "Canvas state changed; reload before continuing",
-            },
-        )
-        return True
-
-    if method == "canvas.presentation_updated":
-        source = state.get("source")
-        source_type = source.get("type") if isinstance(source, dict) else None
-        _broadcast(
-            "canvas.updated",
-            {
-                "canvas_id": "main",
-                "presentation_revision": state["presentation_revision"],
-                "source_type": source_type,
-                "updated_at": state.get("updated_at"),
-            },
-        )
-        assert isinstance(revision, int)
-        _canvas_presentation_updates[client_id] = revision
-        return True
-
-    if method == "canvas.source_updated":
-        if _session is not None and _session.tool_context is not None:
-            _session.tool_context.invalidate_recent_read(path)
-        _broadcast(
-            "canvas.source_updated",
-            {
-                "canvas_id": "main",
-                "presentation_revision": state["presentation_revision"],
-                "source_type": "workspace_file",
-                "updated_at": state.get("updated_at"),
-            },
-        )
-        assert source_identity is not None
-        _canvas_source_updates[client_id] = source_identity
-        return True
-
-    awareness_params = {
-        "canvas_id": "main",
-        "path": path,
-        "presentation_revision": state["presentation_revision"],
-        "source_version": state["source_version"],
-        "editing_session_id": editing_session_id,
-    }
-    assert isinstance(editing_session_id, str)
-    previous = _cancel_canvas_awareness(client_id)
-    if previous is not None:
-        _fan_out_canvas_idle(client_id, previous.params)
-    if method == "canvas.user_idle":
-        _fan_out_canvas_idle(client_id, awareness_params)
-        return True
-
-    _start_canvas_awareness(
-        client_id,
-        awareness_params,
-        renewed_at=now,
-        validated_at=now,
-    )
-    return True
-
-
-async def _run_subscriber_pump(
-    ws: WebSocket, client_id: str, queue: asyncio.Queue
-) -> None:
-    """Drain one socket's queue; the handler owns cancellation and unsubscribe."""
-    await _session_transport.run_subscriber_pump(
-        ws, queue, ping_interval=_WS_PING_INTERVAL_S
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -11089,10 +5671,42 @@ async def _run_subscriber_pump(
 #
 # These used to be closures inside ws_chat. They've been hoisted so the loop
 # can outlive any single WebSocket connection: callbacks reference module
-# globals (_session, _loop_user_queue, _loop_interrupt_flag,
-# _loop_last_user_content, _orchestrator_client, _thread_id) and emit via
-# _broadcast() rather than writing to one ws.
+# globals (_session, _orchestrator_client, _session_identity) and emit via
+# _broadcast() rather than writing to one ws. The input and interrupt
+# callbacks are the input owner's (``_session_input``).
 # ---------------------------------------------------------------------------
+
+
+async def _on_heartbeat_response(response: Dict[str, Any]) -> None:
+    """Heartbeat-response callback of a registered persistent runtime.
+
+    Holds a pinned session's fan-out advertisement for its next turn start
+    (parallel_subagents.md §14.2 P5), then hands the response to the
+    termination coordinator, which owns the drain intent. The hold is a plain
+    store and cannot fail the drain path.
+    """
+
+    _session_attach.hold_heartbeat_subagent_advertisement(response)
+    await _session_termination.handle_heartbeat_intents(response)
+
+
+def _loop_current_tools() -> tuple[Any, Any]:
+    """The tool binding a turn runs with, read once after its input arrives.
+
+    First applies the fan-out advertisement a heartbeat held for this pinned
+    session (P5). The loop reads this once per input, before the turn starts
+    and never again inside it, so a switch that arrives mid-turn reaches the
+    next turn and the running turn keeps the binding and the gate it started
+    with. A failed apply keeps the current binding.
+    """
+
+    try:
+        _session_attach.apply_heartbeat_subagent_advertisement()
+    except Exception:  # noqa: BLE001 - never fail a turn over the switch
+        logger.warning(
+            "Heartbeat fan-out advertisement could not be applied", exc_info=True
+        )
+    return _session.llm_with_tools, _session.tools
 
 
 async def _loop_before_turn_authorization() -> tuple[bool, str]:
@@ -11141,274 +5755,16 @@ def _loop_auxiliary_provider_admission_open() -> bool:
     return _officer_cfg() is None or _runtime_authorization_admission_open
 
 
-async def _loop_admit_input_delivery(
-    delivery_id: str, claim_generation: int, turn_number: int
-) -> bool | None:
-    """Cross the durable execution boundary immediately before model spend."""
+async def _begin_loop_input_wait() -> InputWaitPlan:
+    """The loop's turn-boundary step before it parks for the next input.
 
-    if not _runtime_input_admission_open():
-        if not _runtime_admission_closed():
-            _schedule_protected_input_reclaim()
-        return False
-    admitted = await _transition_claimed_input(
-        delivery_id,
-        claim_generation,
-        "admitted",
-        turn_number=turn_number,
-    )
-    # Close the in-process race as tightly as possible. If the sentinel became
-    # visible while the CAS awaited Postgres, roll the not-yet-used admission
-    # back to retryable before returning to the loop. No provider call exists
-    # between these two statements.
-    if admitted and not _runtime_input_admission_open():
-        deferred = await _transition_claimed_input(
-            delivery_id,
-            claim_generation,
-            "unadmit",
-            reason=(
-                "runtime_terminating_before_provider"
-                if _runtime_admission_closed()
-                else "protected_cloud_unavailable_before_provider"
-            ),
-        )
-        if deferred:
-            _queued_input_claims.discard((delivery_id, claim_generation))
-            if not _runtime_admission_closed():
-                _schedule_protected_input_reclaim()
-            return None
-        return False
-    return admitted
-
-
-async def _loop_defer_input_delivery(
-    delivery_id: str, claim_generation: int, reason: str
-) -> bool:
-    deferred = await _transition_claimed_input(
-        delivery_id,
-        claim_generation,
-        "deferred",
-        reason=reason,
-    )
-    if deferred:
-        _queued_input_claims.discard((delivery_id, claim_generation))
-        if not _runtime_admission_closed() and not _protected_cloud_runtime_ready():
-            _schedule_protected_input_reclaim()
-    return deferred
-
-
-async def _loop_cancel_input_delivery(
-    delivery_id: str,
-    claim_generation: int,
-    turn_number: int,
-    reason: str,
-) -> bool:
-    if not _persistent_input_cancellation_enabled():
-        logger.warning(
-            "Pinned input cancellation writer is disabled; halting before provider"
-        )
-        return False
-    cancelled = await _transition_claimed_input(
-        delivery_id,
-        claim_generation,
-        "cancelled",
-        turn_number=turn_number,
-        reason=reason,
-    )
-    if cancelled:
-        _queued_input_claims.discard((delivery_id, claim_generation))
-    return cancelled
-
-
-async def _loop_defer_and_requeue_input_delivery(
-    delivery_id: str,
-    claim_generation: int,
-    content: str,
-    role: str,
-    source: str,
-    reason: str,
-) -> dict[str, Any] | None:
-    """Atomically defer and priority-reclaim one stopped server wake.
-
-    The shared lock prevents concurrent input acceptance from reclaiming the
-    deferred row into the ordinary FIFO in the gap between its generation CAS
-    and priority publication. Claiming the exact stable identity mints a fresh
-    generation; the returned item stays in the graph's one-item priority slot.
+    Emits ``ready``, runs the natural-pause transition and an Officer's sleep
+    filing, and returns how long the wait may last. The input owner sets the
+    parked window only after this returns. On idle timeout the plan raises
+    IdleTimeoutError; the loop unwinds and ``_handle_idle_archive`` first
+    authorizes exact retirement before it emits the generation-tagged
+    diagnostic, so a failed Begin leaves the live UI and runtime usable.
     """
-
-    if source != "officer_wake" or role == "human":
-        return None
-    if (
-        _runtime_admission_closed()
-        or _session is None
-        or _session.postgres_conn is None
-        or _thread_id is None
-    ):
-        return None
-    async with _input_delivery_reclaim_lock:
-        try:
-            deferred = await _transition_claimed_input(
-                delivery_id,
-                claim_generation,
-                "deferred",
-                reason=reason,
-            )
-            if not deferred:
-                return None
-            _queued_input_claims.discard((delivery_id, claim_generation))
-            agent_id, pod_uid, runtime_generation, runtime_attach_token = (
-                _pinned_input_runtime_identity()
-            )
-            row = await asyncio.wait_for(
-                _session.postgres_conn.persist_pinned_input_delivery(
-                    thread_id=_thread_id,
-                    delivery_id=delivery_id,
-                    role=role,
-                    content=content,
-                    source=source,
-                    turn_number=_session.turn_count + 1,
-                    agent_id=agent_id,
-                    pod_uid=pod_uid,
-                    runtime_generation=runtime_generation,
-                    session_runtime_generation=str(_session_runtime_generation or ""),
-                    runtime_attach_token=runtime_attach_token,
-                ),
-                timeout=5.0,
-            )
-            next_generation = int(row["claim_generation"])
-            if str(row["state"]) not in {"owned", "queued"}:
-                return None
-            queued = await _session.postgres_conn.mark_pinned_input_delivery_queued(
-                thread_id=_thread_id,
-                delivery_id=delivery_id,
-                agent_id=agent_id,
-                pod_uid=pod_uid,
-                runtime_generation=runtime_generation,
-                session_runtime_generation=str(_session_runtime_generation or ""),
-                runtime_attach_token=runtime_attach_token,
-                claim_generation=next_generation,
-            )
-            if not queued:
-                return None
-            if _runtime_admission_closed():
-                await _transition_claimed_input(
-                    delivery_id,
-                    next_generation,
-                    "deferred",
-                    reason="runtime_terminating_before_priority_requeue",
-                )
-                return None
-        except Exception as exc:
-            logger.warning(
-                "Deferred wake priority reclaim failed (%s)", type(exc).__name__
-            )
-            return None
-
-        key = (delivery_id, next_generation)
-        if key in _queued_input_claims:
-            return None
-        _queued_input_claims.add(key)
-        return {
-            "content": str(row["content"]),
-            "id": str(row["message_id"]),
-            "role": str(row["role"]),
-            "source": source,
-            "delivery_id": delivery_id,
-            "claim_generation": next_generation,
-        }
-
-
-async def _loop_settle_input_delivery(delivery_id: str, claim_generation: int) -> bool:
-    settled = await _transition_claimed_input(
-        delivery_id,
-        claim_generation,
-        "settled",
-    )
-    if settled:
-        _queued_input_claims.discard((delivery_id, claim_generation))
-    return settled
-
-
-_PINNED_INPUT_POLL_SECONDS = 1.0
-
-
-async def _wait_for_persistent_input(
-    queue: asyncio.Queue,
-    *,
-    timeout: float | None = None,
-) -> Any:
-    """Wait while polling the durable pinned inbox for correctness.
-
-    Orchestrator-side input no longer needs a Pod-IP POST: it commits a stable
-    delivery and this exact reciprocal runtime claims it. LISTEN would only be
-    a latency optimization; the bounded poll means a lost notification, a pod
-    replacement, or an IP-reused foreign process cannot lose or consume work.
-    """
-
-    if _stateless_mode():
-        if timeout is None:
-            return await queue.get()
-        return await asyncio.wait_for(queue.get(), timeout=timeout)
-
-    loop = asyncio.get_running_loop()
-    deadline = loop.time() + timeout if timeout is not None else None
-    while True:
-        if _runtime_admission_closed():
-            # Leave every claimed/queued row for the successor. Normal
-            # teardown cancels this wait after preStop observes the park.
-            await asyncio.Future()
-        try:
-            await _reclaim_pending_pinned_inputs()
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            logger.warning(
-                "Durable pinned input poll failed for thread %s; retrying",
-                _thread_id,
-                exc_info=True,
-            )
-        if not queue.empty():
-            return await queue.get()
-
-        remaining = None if deadline is None else deadline - loop.time()
-        if remaining is not None and remaining <= 0:
-            raise asyncio.TimeoutError
-        wait_for = _PINNED_INPUT_POLL_SECONDS
-        if remaining is not None:
-            wait_for = min(wait_for, remaining)
-        try:
-            return await asyncio.wait_for(queue.get(), timeout=wait_for)
-        except asyncio.TimeoutError:
-            if deadline is not None and loop.time() >= deadline:
-                raise
-
-
-async def _loop_get_user_input() -> str:
-    """Wait for the next user input. Honors session idle timeout.
-
-    On idle timeout, raises IdleTimeoutError. The loop unwinds and
-    ``_handle_idle_archive`` first authorizes exact retirement before it emits
-    the generation-tagged diagnostic; a failed Begin must leave the live UI and
-    runtime usable.
-    """
-    global _awaiting_input
-
-    queue = _loop_user_queue
-    if queue is None:
-        # _attach_session always initializes this. If we hit None here the
-        # session is being torn down — fail loudly so the loop unwinds.
-        raise RuntimeError("_loop_user_queue not initialized — session torn down?")
-
-    if _runtime_admission_closed():
-        # Do not consume already-durable queued work. The exact successor
-        # reclaims it from thread_input_deliveries; transcript restore excludes
-        # unadmitted rows because conversation context is not an inbox. This
-        # wait is cancelled by normal process shutdown after preStop observes
-        # the exact parked boundary.
-        _awaiting_input = True
-        try:
-            await asyncio.Future()
-        finally:
-            _awaiting_input = False
 
     _broadcast("ready", {})
 
@@ -11437,7 +5793,7 @@ async def _loop_get_user_input() -> str:
         and _session is not None
         and _session.turn_count > 0
         and _orchestrator_client is not None
-        and _thread_id is not None
+        and _session_identity.thread_id is not None
     )
     if should_consider_flip:
         if _stateless_mode():
@@ -11453,113 +5809,72 @@ async def _loop_get_user_input() -> str:
                 name="phase5-flip-awaiting-user",
             )
 
-    # Parked window for the drain-suspend gate (_session_parked): exactly the
-    # span where this coroutine is blocked on the queue. The finally also
-    # covers loop-task cancellation and the idle-timeout raise.
-    _awaiting_input = True
-    try:
-        if _session is None:
-            return await _wait_for_persistent_input(queue)
+    if _session is None:
+        return InputWaitPlan()
 
-        if officer_cfg is not None:
-            # Officer park (centurion.md §4). The primary wake is the
-            # orchestrator's Postgres-durable timer: consume the sleep tool's
-            # parked request and FILE the wake-up call; when no request was
-            # made (turn ended in plain text) file nothing — the officer
-            # watchdog files sleep_max on our behalf. The local wait is only
-            # a long, labeled backstop for the one failure external timers
-            # can't cover: timer path down while the API is up. Never raises
-            # IdleTimeoutError — an officer session never idle-archives.
-            sleep_req = None
-            if _session.tool_context is not None:
-                sleep_req = _session.tool_context.consume_officer_sleep()
-            if sleep_req is not None:
-                minutes = max(
-                    officer_cfg.sleep_min_minutes,
-                    min(
-                        int(sleep_req.get("minutes") or 0),
-                        officer_cfg.sleep_max_minutes,
-                    ),
-                )
-                asyncio.create_task(
-                    _file_officer_wake(minutes, sleep_req.get("reason") or ""),
-                    name="officer-file-wake",
-                )
-            try:
-                return await _wait_for_persistent_input(
-                    queue,
-                    timeout=officer_cfg.backstop_seconds,
-                )
-            except asyncio.TimeoutError:
-                logger.warning(
-                    "Officer backstop wake fired for thread %s — the "
-                    "orchestrator's durable timer never delivered",
-                    _thread_id,
-                )
-                return {
-                    "content": (
-                        "[backstop wake] The orchestrator's durable timer did "
-                        "not fire in time — its wake path may be degraded. "
-                        "Check the situation via your tools; if a conference "
-                        "hold is standing and no brief has arrived yet, go "
-                        "back to sleep."
-                    ),
-                    "role": "event",
-                }
+    if officer_cfg is not None:
+        # Officer park (centurion.md §4). The primary wake is the
+        # orchestrator's Postgres-durable timer: consume the sleep tool's
+        # parked request and FILE the wake-up call; when no request was
+        # made (turn ended in plain text) file nothing — the officer
+        # watchdog files sleep_max on our behalf. The local wait is only
+        # a long, labeled backstop for the one failure external timers
+        # can't cover: timer path down while the API is up. Never raises
+        # IdleTimeoutError — an officer session never idle-archives.
+        sleep_req = None
+        if _session.tool_context is not None:
+            sleep_req = _session.tool_context.consume_officer_sleep()
+        if sleep_req is not None:
+            minutes = max(
+                officer_cfg.sleep_min_minutes,
+                min(
+                    int(sleep_req.get("minutes") or 0),
+                    officer_cfg.sleep_max_minutes,
+                ),
+            )
+            asyncio.create_task(
+                _file_officer_wake(minutes, sleep_req.get("reason") or ""),
+                name="officer-file-wake",
+            )
 
-        idle_timeout_minutes = _session.config.interactive.idle_timeout_minutes
-        if idle_timeout_minutes and idle_timeout_minutes > 0:
-            idle_timeout_seconds = idle_timeout_minutes * 60
-            try:
-                return await _wait_for_persistent_input(
-                    queue,
-                    timeout=idle_timeout_seconds,
-                )
-            except asyncio.TimeoutError:
-                logger.info(
-                    "Idle timeout (%dmin) for thread %s",
-                    idle_timeout_minutes,
-                    _thread_id,
-                )
-                raise IdleTimeoutError(f"Idle timeout after {idle_timeout_seconds}s")
-        return await _wait_for_persistent_input(queue)
-    finally:
-        _awaiting_input = False
+        def _officer_backstop_wake() -> dict[str, str]:
+            logger.warning(
+                "Officer backstop wake fired for thread %s — the "
+                "orchestrator's durable timer never delivered",
+                _session_identity.thread_id,
+            )
+            return {
+                "content": (
+                    "[backstop wake] The orchestrator's durable timer did "
+                    "not fire in time — its wake path may be degraded. "
+                    "Check the situation via your tools; if a conference "
+                    "hold is standing and no brief has arrived yet, go "
+                    "back to sleep."
+                ),
+                "role": "event",
+            }
 
-
-def _loop_check_interrupt() -> Optional[str]:
-    """One-shot read of the interrupt flag. Returns the mode or None.
-
-    Returns:
-        None when no interrupt is pending.
-        "hard" to cancel the in-flight LLM stream immediately and drop the
-            partial AIMessage (set when interrupt fires with no tool active).
-        "graceful" to stop after the current tool call completes (set when
-            interrupt fires with a tool mid-`ainvoke`).
-
-    Consumed by persistent_graph at three checkpoints. A `bool(result)`
-    check preserves the legacy "any interrupt → stop" semantics for sites
-    that don't yet branch on the mode.
-    """
-    mode = _loop_interrupt_flag
-    target_turn_id = _loop_interrupt_target_turn_id
-    if mode is None:
-        if target_turn_id is not None:
-            _clear_loop_interrupt()
-        return None
-    current_turn_id = int(_session.turn_count) if _session is not None else None
-    if target_turn_id is None or target_turn_id != current_turn_id:
-        logger.warning(
-            "Discarding unscoped/stale interrupt "
-            "(target_turn=%s current_turn=%s mode=%s)",
-            target_turn_id,
-            current_turn_id,
-            mode,
+        return InputWaitPlan(
+            timeout_seconds=officer_cfg.backstop_seconds,
+            on_timeout=_officer_backstop_wake,
         )
-        _clear_loop_interrupt()
-        return None
-    _clear_loop_interrupt(target_turn_id=target_turn_id)
-    return mode
+
+    idle_timeout_minutes = _session.config.interactive.idle_timeout_minutes
+    if idle_timeout_minutes and idle_timeout_minutes > 0:
+        idle_timeout_seconds = idle_timeout_minutes * 60
+
+        def _idle_timeout() -> None:
+            logger.info(
+                "Idle timeout (%dmin) for thread %s",
+                idle_timeout_minutes,
+                _session_identity.thread_id,
+            )
+            raise IdleTimeoutError(f"Idle timeout after {idle_timeout_seconds}s")
+
+        return InputWaitPlan(
+            timeout_seconds=idle_timeout_seconds, on_timeout=_idle_timeout
+        )
+    return InputWaitPlan()
 
 
 async def _loop_on_token(token: str) -> None:
@@ -11614,10 +5929,10 @@ async def _loop_on_tool_execution_start(tool_name: str, tool_call_id: str) -> No
     """Latch the exact claim/turn crossing a real tool's effect boundary."""
 
     global _tool_inflight
-    del tool_name, tool_call_id
+    del tool_name
     if not await _loop_runtime_effect_authority_current():
         if not _protected_cloud_runtime_ready():
-            _schedule_protected_input_reclaim()
+            _session_input.schedule_protected_reclaim()
             raise WorkspaceUnavailableError(
                 "protected cloud became unavailable before tool execution"
             )
@@ -11644,6 +5959,9 @@ async def _loop_on_tool_execution_start(tool_name: str, tool_call_id: str) -> No
     # This callback returns directly into `tool.ainvoke`. No earlier UI or
     # permission callback may set the latch: if this final health/identity
     # gate raises, no result callback runs to clear it.
+    if not _tool_inflight:
+        _tool_inflight_calls.clear()
+    _tool_inflight_calls.add(str(tool_call_id or ""))
     _tool_inflight = True
 
 
@@ -11654,7 +5972,12 @@ async def _loop_on_tool_result(
     is_error: bool = False,
 ) -> None:
     global _tool_inflight
-    _tool_inflight = False
+    # Only this call ended: siblings of a parallel batch are still running.
+    if _tool_inflight:
+        _tool_inflight_calls.discard(str(tool_call_id or ""))
+    else:
+        _tool_inflight_calls.clear()
+    _tool_inflight = bool(_tool_inflight_calls)
     # Truncate large results for transport (full result is in message history)
     display_result = result[:2000] + "..." if len(result) > 2000 else result
     _broadcast(
@@ -11713,7 +6036,11 @@ async def _insert_permission_request(
     tool_call_id: str, tool_name: str, tool_args: Dict[str, Any]
 ) -> Optional[str]:
     """INSERT a pending row and return its UUID. None on failure."""
-    if _session is None or _session.postgres_conn is None or _thread_id is None:
+    if (
+        _session is None
+        or _session.postgres_conn is None
+        or _session_identity.thread_id is None
+    ):
         return None
     try:
         async with _session.postgres_conn.acquire() as conn:
@@ -11729,7 +6056,7 @@ async def _insert_permission_request(
                     handle is None
                     or not handle.active
                     or handle.lost.is_set()
-                    or str(handle.unit_id) != str(_thread_id)
+                    or str(handle.unit_id) != str(_session_identity.thread_id)
                     or int(handle.lease_token) <= 0
                 ):
                     if handle is not None:
@@ -11744,7 +6071,7 @@ async def _insert_permission_request(
                         "AND NOT (COALESCE(metadata, '{}'::jsonb) "
                         "         ? '_stateless_workspace_retirement_pending') "
                         "FOR UPDATE",
-                        _thread_id,
+                        _session_identity.thread_id,
                     )
                     queue_live = None
                     if thread_live is not None:
@@ -11755,7 +6082,7 @@ async def _insert_permission_request(
                             "AND state = 'leased' "
                             "AND lease_token = $2::bigint "
                             "FOR SHARE",
-                            _thread_id,
+                            _session_identity.thread_id,
                             int(handle.lease_token),
                         )
                     if queue_live is None:
@@ -11767,7 +6094,7 @@ async def _insert_permission_request(
                         " accepted_lease_token) "
                         "VALUES ($1, $2, $3, $4::jsonb, $5::bigint) "
                         "RETURNING id",
-                        _thread_id,
+                        _session_identity.thread_id,
                         tool_call_id,
                         tool_name,
                         json.dumps(_safe_serialize(tool_args)),
@@ -11782,7 +6109,7 @@ async def _insert_permission_request(
                 "(thread_id, tool_call_id, tool_name, tool_args) "
                 "VALUES ($1, $2, $3, $4::jsonb) "
                 "RETURNING id",
-                _thread_id,
+                _session_identity.thread_id,
                 tool_call_id,
                 tool_name,
                 json.dumps(_safe_serialize(tool_args)),
@@ -11831,7 +6158,11 @@ async def _has_terminal_permission_decision(tool_call_id: str) -> bool:
     the pre-batch behavior — the per-call gate path still inserts and gates
     — rather than blocking the announce.
     """
-    if _session is None or _session.postgres_conn is None or _thread_id is None:
+    if (
+        _session is None
+        or _session.postgres_conn is None
+        or _session_identity.thread_id is None
+    ):
         return False
     try:
         async with _session.postgres_conn.acquire() as conn:
@@ -11840,7 +6171,7 @@ async def _has_terminal_permission_decision(tool_call_id: str) -> bool:
                 "WHERE thread_id = $1 AND tool_call_id = $2 "
                 "  AND status IN ('approved', 'denied') "
                 "LIMIT 1",
-                _thread_id,
+                _session_identity.thread_id,
                 tool_call_id,
             )
         return found is not None
@@ -11858,7 +6189,7 @@ async def _has_terminal_permission_decision(tool_call_id: str) -> bool:
 # announced by the turn currently running. Mutated in place (never rebound) so
 # tests and concurrent readers see one dict.
 #
-# The thread id is carried per entry, not read from the ambient `_thread_id`,
+# The thread id is carried per entry, not read from the ambient bound thread,
 # because this module is process-global and a pool agent serves many threads in
 # sequence: an entry that outlived its session (see _terminate_session_inner)
 # must never be swept — and broadcast as resolved — by the NEXT thread, whose
@@ -11885,7 +6216,7 @@ def _permission_retirement_authority() -> Optional[Tuple[str, int | str]]:
     """Capture the exact credential allowed to retire permission rows."""
 
     if _stateless_mode():
-        lease_token = _current_stateless_lease_token()
+        lease_token = _session_identity.stateless_lease_token()
         return ("stateless", lease_token) if lease_token is not None else None
     agent_id = _control_owner_agent_id or _registered_pinned_agent_id()
     return ("pinned", agent_id) if agent_id is not None else None
@@ -11988,7 +6319,7 @@ async def _retire_announced_permission_rows(
     if _session is None or _session.postgres_conn is None:
         return
     authority = _permission_retirement_authority()
-    if authority is None or _thread_id is None:
+    if authority is None or _session_identity.thread_id is None:
         logger.info(
             "Skipped permission-row retirement without exact owner (%s)", reason
         )
@@ -12001,7 +6332,7 @@ async def _retire_announced_permission_rows(
         tool_call_id: entry
         for tool_call_id, entry in _announced_permission_rows.items()
         if (mode is None or not _gate_needed(mode, entry[1]))
-        and entry[2] == _thread_id
+        and entry[2] == _session_identity.thread_id
         and tool_call_id not in _gates_in_flight
         and entry[0] != _active_permission_request_id
     }
@@ -12019,7 +6350,7 @@ async def _retire_announced_permission_rows(
                     if authority_kind == "stateless"
                     else _RETIRE_PINNED_PERMISSION_SQL,
                     request_id,
-                    _thread_id,
+                    _session_identity.thread_id,
                     authority_credential,
                 )
                 doomed.pop(tool_call_id, None)
@@ -12059,7 +6390,7 @@ async def _loop_announce_permission_batch(tool_calls: List[Dict[str, Any]]) -> N
     finished tool. The per-call gate path then *claims* these rows rather
     than inserting its own — see ``_loop_permission_check``.
     """
-    if _session is None or _thread_id is None:
+    if _session is None or _session_identity.thread_id is None:
         return
     # A mode control can commit while the LLM is producing its tool batch.
     # Drain under the exact current owner immediately before deciding which
@@ -12099,7 +6430,11 @@ async def _loop_announce_permission_batch(tool_calls: List[Dict[str, Any]]) -> N
         # ledger nothing can tell a row that was answered from one the turn
         # walked away from. Stamped with the announcing thread so a later
         # session in this same process can never sweep it.
-        _announced_permission_rows[tool_call_id] = (request_id, tool_name, _thread_id)
+        _announced_permission_rows[tool_call_id] = (
+            request_id,
+            tool_name,
+            _session_identity.thread_id,
+        )
         requests.append(
             {
                 "id": tool_call_id,
@@ -12126,7 +6461,11 @@ async def _pending_permission_requests() -> List[Dict[str, Any]]:
     Soft-fails to ``[]``: a welcome frame must still go out if this lookup
     breaks.
     """
-    if _session is None or _session.postgres_conn is None or _thread_id is None:
+    if (
+        _session is None
+        or _session.postgres_conn is None
+        or _session_identity.thread_id is None
+    ):
         return []
     try:
         async with _session.postgres_conn.acquire() as conn:
@@ -12135,7 +6474,7 @@ async def _pending_permission_requests() -> List[Dict[str, Any]]:
                 "FROM thread_permission_requests "
                 "WHERE thread_id = $1 AND status = 'pending' "
                 "ORDER BY requested_at ASC",
-                _thread_id,
+                _session_identity.thread_id,
             )
     except Exception as e:
         logger.warning("Pending permission lookup failed: %s", e)
@@ -12211,8 +6550,8 @@ async def _wait_for_permission_resolution(
 
         read_task = asyncio.create_task(_read_status())
         interrupt_task = (
-            asyncio.create_task(_hard_interrupt_event.wait())
-            if _hard_interrupt_event is not None
+            asyncio.create_task(_session_input.hard_interrupt_event.wait())
+            if _session_input.hard_interrupt_event is not None
             else None
         )
         if interrupt_task is None:
@@ -12239,7 +6578,10 @@ async def _wait_for_permission_resolution(
             if current in terminal_statuses:
                 return str(current)
 
-            if _hard_interrupt_event is not None and _hard_interrupt_event.is_set():
+            if (
+                _session_input.hard_interrupt_event is not None
+                and _session_input.hard_interrupt_event.is_set()
+            ):
                 # Stop pressed. Leave the row pending — the user made no
                 # decision, so nothing may be recorded as one.
                 logger.info(
@@ -12257,17 +6599,17 @@ async def _wait_for_permission_resolution(
                 if remaining <= 0:
                     break
                 poll_seconds = min(_PERMISSION_POLL_SECONDS, remaining)
-                if _hard_interrupt_event is None:
+                if _session_input.hard_interrupt_event is None:
                     await asyncio.sleep(poll_seconds)
                 else:
                     try:
                         await asyncio.wait_for(
-                            _hard_interrupt_event.wait(),
+                            _session_input.hard_interrupt_event.wait(),
                             timeout=poll_seconds,
                         )
                     except asyncio.TimeoutError:
                         pass
-                    if _hard_interrupt_event.is_set():
+                    if _session_input.hard_interrupt_event.is_set():
                         logger.info(
                             "Permission wait interrupted (req=%s) — leaving pending",
                             request_id,
@@ -12285,7 +6627,7 @@ async def _wait_for_permission_resolution(
                     return str(current)
 
             if _stateless_mode():
-                lease_token = _current_stateless_lease_token()
+                lease_token = _session_identity.stateless_lease_token()
                 if lease_token is None:
                     # Lease loss is not a user decision. Leave the row pending
                     # for the successor/retirement path.
@@ -12296,7 +6638,10 @@ async def _wait_for_permission_resolution(
                     )
                     return "interrupted"
 
-                if _hard_interrupt_event is not None and _hard_interrupt_event.is_set():
+                if (
+                    _session_input.hard_interrupt_event is not None
+                    and _session_input.hard_interrupt_event.is_set()
+                ):
                     logger.info(
                         "Permission wait interrupted (req=%s) — leaving pending",
                         request_id,
@@ -12307,7 +6652,7 @@ async def _wait_for_permission_resolution(
                     async with postgres_conn.acquire() as conn:
                         expiry = await expire_permission_if_untethered(
                             conn,
-                            thread_id=str(_thread_id),
+                            thread_id=str(_session_identity.thread_id),
                             request_id=request_id,
                             lease_token=lease_token,
                         )
@@ -12365,7 +6710,10 @@ async def _wait_for_permission_resolution(
                 # nobody beat us to it. This acquisition is released as soon
                 # as the boundary update and read complete.
 
-                if _hard_interrupt_event is not None and _hard_interrupt_event.is_set():
+                if (
+                    _session_input.hard_interrupt_event is not None
+                    and _session_input.hard_interrupt_event.is_set()
+                ):
                     logger.info(
                         "Permission wait interrupted (req=%s) — leaving pending",
                         request_id,
@@ -12422,7 +6770,11 @@ async def _resolve_pending_permission(
     """UPDATE a pending permission row by id, or the most-recent-pending if
     no id given. Returns the resolved row dict or None if not found / no
     pending request matched."""
-    if _session is None or _session.postgres_conn is None or _thread_id is None:
+    if (
+        _session is None
+        or _session.postgres_conn is None
+        or _session_identity.thread_id is None
+    ):
         return None
     if decision not in ("approved", "denied"):
         return None
@@ -12448,7 +6800,7 @@ async def _resolve_pending_permission(
                     "  ORDER BY requested_at DESC LIMIT 1"
                     ") "
                     "RETURNING id, status, tool_call_id, thread_id",
-                    _thread_id,
+                    _session_identity.thread_id,
                     decision,
                     decided_by,
                 )
@@ -12535,7 +6887,10 @@ async def _loop_permission_check(
         # claim that row instead of inserting a second one for the same
         # tool_call_id (there is no unique constraint to stop a duplicate).
         claimed_request_id: Optional[str] = None
-        if _session.postgres_conn is not None and _thread_id is not None:
+        if (
+            _session.postgres_conn is not None
+            and _session_identity.thread_id is not None
+        ):
             try:
                 async with _session.postgres_conn.acquire() as conn:
                     existing = await conn.fetchrow(
@@ -12544,7 +6899,7 @@ async def _loop_permission_check(
                         "  AND status IN ('approved', 'denied', 'pending') "
                         "ORDER BY decided_at DESC NULLS LAST, requested_at DESC "
                         "LIMIT 1",
-                        _thread_id,
+                        _session_identity.thread_id,
                         tool_call_id,
                     )
                 if existing is not None and existing["status"] != "pending":
@@ -12614,13 +6969,13 @@ async def _loop_permission_check(
 
         # Phase 5: sudo gate hit untethered is the second natural-pause site.
         # Flip the thread so the attention-sleep watchdog can fire after the
-        # configured TTL. Idempotent against the _loop_get_user_input write.
+        # configured TTL. Idempotent against the _begin_loop_input_wait write.
         # Officer sessions never flip (centurion.md §4) — their pending gate
         # surfaces via the sitrep instead.
         if (
             _officer_cfg() is None
             and _orchestrator_client is not None
-            and _thread_id is not None
+            and _session_identity.thread_id is not None
         ):
             if _stateless_mode():
                 await _safe_mark_stateless_natural_pause(require_untethered=True)
@@ -12778,8 +7133,8 @@ def _capture_cloud_generation_claim(sync: Any) -> _CloudGenerationClaim:
     if (
         handle is None
         or not handle.active
-        or not _thread_id
-        or str(handle.unit_id) != str(_thread_id)
+        or not _session_identity.thread_id
+        or str(handle.unit_id) != str(_session_identity.thread_id)
         or _session is None
         or _session.postgres_conn is None
         or not str(getattr(sync, "workspace_generation", ""))
@@ -12788,7 +7143,7 @@ def _capture_cloud_generation_claim(sync: Any) -> _CloudGenerationClaim:
             "stateless cloud sync lacks an exact queue/workspace generation"
         )
     return _CloudGenerationClaim(
-        thread_id=str(_thread_id),
+        thread_id=str(_session_identity.thread_id),
         lease_token=int(handle.lease_token),
         workspace_generation=str(sync.workspace_generation),
         postgres=_session.postgres_conn,
@@ -12976,13 +7331,13 @@ async def _assert_no_pending_stateless_cloud_generation() -> None:
     if (
         handle is None
         or not handle.active
-        or not _thread_id
-        or str(handle.unit_id) != str(_thread_id)
+        or not _session_identity.thread_id
+        or str(handle.unit_id) != str(_session_identity.thread_id)
         or _session.postgres_conn is None
     ):
         raise LeaseLostError("stateless no-cloud check lacks an exact lease")
     claim = _CloudGenerationClaim(
-        thread_id=str(_thread_id),
+        thread_id=str(_session_identity.thread_id),
         lease_token=int(handle.lease_token),
         workspace_generation=_session.cloud_sync_workspace_generation,
         postgres=_session.postgres_conn,
@@ -13399,7 +7754,7 @@ async def _retry_cloud_sync_start(turn_id: int) -> None:
     """
     global _cloud_sync_retry_pending
 
-    if _session is None or not _orchestrator_client or not _thread_id:
+    if _session is None or not _orchestrator_client or not _session_identity.thread_id:
         return
     if (
         _session.workspace_manager is None
@@ -13408,7 +7763,9 @@ async def _retry_cloud_sync_start(turn_id: int) -> None:
         _cloud_sync_retry_pending = False
         return
     try:
-        ws_info = await _orchestrator_client.get_thread_workspace(_thread_id)
+        ws_info = await _orchestrator_client.get_thread_workspace(
+            _session_identity.thread_id
+        )
     except Exception:
         return
     if not ws_info:
@@ -13437,7 +7794,7 @@ async def _retry_cloud_sync_start(turn_id: int) -> None:
             workspace_path=_session.workspace_manager.path,
             workspace_backend=_session.workspace_manager.backend,
             cloud_cfg=cloud_cfg,
-            thread_id=str(_thread_id),
+            thread_id=str(_session_identity.thread_id),
             workspace_generation=str(ws_info.get("workspace_generation") or ""),
         )
         if not coordinator:
@@ -13464,7 +7821,13 @@ async def _retry_cloud_sync_start(turn_id: int) -> None:
 
 
 async def _loop_on_turn_start(turn_id: int) -> None:
-    global _turn_event_open, _turn_tool_execution_identity
+    global _turn_event_open, _turn_tool_execution_identity, _tool_inflight
+    # No call crosses a turn boundary: a call whose result callback never ran
+    # (a tool that raised WorkspaceUnavailableError, a failed persist) must
+    # not keep the per-call latch set, or Stop, drain and preStop would treat
+    # this session as mid-tool from now on.
+    _tool_inflight = False
+    _tool_inflight_calls.clear()
     if _session is None:
         _turn_event_open = False
         _turn_tool_execution_identity = None
@@ -13481,7 +7844,7 @@ async def _loop_on_turn_start(turn_id: int) -> None:
             # and consumer could not be armed. The loop will run its normal
             # terminal callback for this failed turn.
             _turn_event_open = False
-            _clear_loop_interrupt(target_turn_id=turn_id)
+            _session_input.clear_interrupt(target_turn_id=turn_id)
             raise
     _broadcast("turn.started", {"turn_id": turn_id})
 
@@ -13507,10 +7870,10 @@ async def _loop_on_turn_start(turn_id: int) -> None:
     # ordering (and the pull's remote listing reflects the last turn's
     # writes). This is where a too-fast reply pays the push cost: inside a
     # started turn, visibly, instead of in an invisible pre-turn queue.
-    if _stateless_mode() and _thread_id:
+    if _stateless_mode() and _session_identity.thread_id:
         # Step 4a: a push this pod handed off for THIS thread is superseded by
         # the new claim — cancel it and let generation recovery adopt+resume.
-        await _cancel_background_cloud_push(str(_thread_id))
+        await _cancel_background_cloud_push(str(_session_identity.thread_id))
     await _await_pending_cloud_push()
 
     # Phase 1 of cloud_collaboration_model.md §9: pull cloud-side edits
@@ -13527,7 +7890,7 @@ async def _loop_on_turn_start(turn_id: int) -> None:
             ):
                 _broadcast("workspace_sync.pulled", {"turn_id": turn_id})
 
-    # User-message persistence moved to accept time (_accept_user_input) plus
+    # User-message persistence moved to accept time (SessionInputRuntime.accept) plus
     # the loop's per-append upsert (persist_message). The content-based save
     # that lived here read the *most recent* content global for every queued
     # turn, so multiple queued inputs all persisted the last message's text
@@ -13555,7 +7918,7 @@ def _wire_session_aux_archiver() -> None:
     is the same object), so wiring it once keeps every aux path archived.
 
     Idempotent and cheap (just assigns three fields); fire-and-forget. Uses
-    ``job_id=_thread_id`` + ``agent_type="persistent"`` to match the session
+    ``job_id=<bound thread>`` + ``agent_type="persistent"`` to match the session
     main-call archiving in ``_loop_archive_llm_call``. See
     knowledge-base/knowledge/issues/surface_silent_aux_failures.md (Phase 1.6).
     """
@@ -13567,7 +7930,7 @@ def _wire_session_aux_archiver() -> None:
         # converges through this function. A hot swap must not detach either
         # observability or the termination no-spend fence.
         gate_setter(_loop_auxiliary_provider_admission_open)
-    if not _thread_id:
+    if not _session_identity.thread_id:
         return
     try:
         from agent.core.archiver import get_archiver
@@ -13575,7 +7938,9 @@ def _wire_session_aux_archiver() -> None:
         archiver = get_archiver()
         if archiver is not None:
             _session.auxiliary_llm.set_job_context(
-                archiver=archiver, job_id=_thread_id, agent_type="persistent"
+                archiver=archiver,
+                job_id=_session_identity.thread_id,
+                agent_type="persistent",
             )
     except Exception as e:
         logger.debug(f"Could not wire session aux archiver (non-fatal): {e}")
@@ -13610,15 +7975,15 @@ async def _notify_cloud_stage(
     internal_key = os.getenv("MCP_INTERNAL_KEY", "")
     if internal_key:
         headers["X-Internal-Key"] = internal_key
-    target_thread_id = str(thread_id or _thread_id or "")
+    target_thread_id = str(thread_id or _session_identity.thread_id or "")
     target_agent_id = str(
         agent_id or getattr(_orchestrator_client, "agent_id", None) or ""
     )
-    target_generation = _canonical_runtime_generation(
-        session_runtime_generation or _session_runtime_generation
+    target_generation = canonical_runtime_generation(
+        session_runtime_generation or _session_identity.session_generation
     )
-    target_attach_token = _canonical_runtime_generation(
-        session_runtime_attach_token or _session_runtime_attach_token
+    target_attach_token = canonical_runtime_generation(
+        session_runtime_attach_token or _session_identity.attach_token
     )
     if not target_thread_id or not target_agent_id or target_generation is None:
         return
@@ -13641,10 +8006,16 @@ async def _loop_on_workspace_commit(sha: str) -> None:
     Best-effort: a miss only degrades rewind code-restore granularity for
     this turn (the resolver falls back to the previous mapped commit).
     """
-    if _session is None or _session.postgres_conn is None or _thread_id is None:
+    if (
+        _session is None
+        or _session.postgres_conn is None
+        or _session_identity.thread_id is None
+    ):
         return
     try:
-        await _session.postgres_conn.record_turn_commit(_thread_id, sha)
+        await _session.postgres_conn.record_turn_commit(
+            _session_identity.thread_id, sha
+        )
     except Exception:
         logger.warning("record_turn_commit failed (non-fatal)", exc_info=True)
 
@@ -13663,7 +8034,7 @@ async def _loop_on_turn_complete(
     # a reattach during turn-end persistence never reopens an already-completed
     # assistant bubble merely because the broader loop is not parked yet.
     _turn_event_open = False
-    _clear_loop_interrupt(target_turn_id=turn_id)
+    _session_input.clear_interrupt(target_turn_id=turn_id)
     await _loop_on_turn_complete_body(
         turn_id,
         metrics,
@@ -13699,6 +8070,59 @@ async def _loop_on_turn_settled(turn_id: int) -> None:
     # run_queue disposition. Shutdown in that gap must retain the post-effect
     # classification. The executor clears the exact identity after its durable
     # complete/park/release CAS.
+
+
+async def _loop_idle_input_arrived() -> bool:
+    """Whether new input must stop the end-of-turn memory prefetch (WP4, B8).
+
+    Stateless: the executor's per-claim check (``run_queue.input_seq`` under
+    the exact lease); without one the prefetch never holds a slot. Pinned:
+    input the runtime already queued, else a durable delivery it can claim
+    now (the same reclaim the input wait runs every second; claiming early
+    only moves it into the queue the loop reads next).
+    """
+    if not _loop_provider_admission_open():
+        return True
+    probe = _turn_idle_input_external_probe
+    if probe is not None:
+        return bool(await probe())
+    if _stateless_mode():
+        return True
+    queue = _session_input.queue
+    if queue is None:
+        return True
+    if not queue.empty():
+        return True
+    await _session_input.reclaim_pending()
+    return not queue.empty()
+
+
+async def _loop_save_pending_memory(
+    payload: Optional[Dict[str, Any]], expected_id: Optional[str]
+) -> bool:
+    """Save or clear the thread's durable pending memory set (WP4, D32).
+
+    A fenced, atomic ``jsonb_set`` on ``threads.metadata`` through the
+    agent's own pool (the stateless lane proves its exact lease first, like
+    every turn write). ``payload`` None clears the stored set whose id is
+    ``expected_id``.
+    """
+    if (
+        _session is None
+        or _session.postgres_conn is None
+        or _session_identity.thread_id is None
+    ):
+        return False
+    return bool(
+        await asyncio.wait_for(
+            _session.postgres_conn.save_thread_pending_memory(
+                _session_identity.thread_id,
+                payload,
+                expected_id=expected_id,
+            ),
+            timeout=5.0,
+        )
+    )
 
 
 # Turn-complete reconcile: bounded attempts + per-attempt timeout. The
@@ -13757,7 +8181,7 @@ async def _reconcile_turn_with_retry(
             await asyncio.wait_for(
                 _save_turn_ai_messages(
                     _session.postgres_conn,
-                    _thread_id,
+                    _session_identity.thread_id,
                     _session.messages,
                     turn_id,
                     metrics=metrics,
@@ -13860,7 +8284,11 @@ async def _loop_on_turn_complete_body(
     # turn-start hook (e.g. workspace_sync.error) can tear down the WS before
     # the title frame is flushed, leaving the cockpit header stuck on
     # "Untitled Session" until a manual refetch.
-    if turn_id <= 3 and _session.postgres_conn and not _termination_admission_closed():
+    if (
+        turn_id <= 3
+        and _session.postgres_conn
+        and not _session_termination.termination_admission_closed()
+    ):
         await _auto_title_after_first_turn()
 
     # Phase 1 of cloud_collaboration_model.md §9: push the agent's edits to
@@ -13915,11 +8343,11 @@ async def _loop_on_turn_complete_body(
             # malformed stateless row must fail closed rather than leave an
             # unfenced SSH/tar task running after claimant handoff.
             raise LeaseLostError("protected-cloud staging requires pinned execution")
-        stage_thread_id = str(_thread_id or "")
+        stage_thread_id = str(_session_identity.thread_id or "")
         stage_agent_id = str(getattr(_orchestrator_client, "agent_id", None) or "")
-        stage_runtime_generation = _session_runtime_generation
-        stage_attach_token = _session_runtime_attach_token
-        _track_session_side_task(
+        stage_runtime_generation = _session_identity.session_generation
+        stage_attach_token = _session_identity.attach_token
+        _session_termination.track_session_side_task(
             asyncio.create_task(
                 _notify_cloud_stage(
                     stage_thread_id,
@@ -13932,17 +8360,28 @@ async def _loop_on_turn_complete_body(
         )
 
 
-def _loop_archive_llm_call(prepared: Any, response: Any, metrics: dict) -> None:
+def _loop_archive_llm_call(
+    prepared: Any,
+    response: Any,
+    metrics: dict,
+    history_messages: Optional[Sequence[Any]] = None,
+) -> None:
     """Audit one main-LLM call to the llm_requests trail, in the background.
 
     Sessions previously wrote no llm_requests at all — job agents were
     auditable, session hangs were not (session_silent_failure_audit.md #14).
     The Mongo insert is synchronous, so it runs in a thread; failures are
     non-fatal by audit-trail contract.
+
+    ``history_messages`` is the request before the carrier fold (append-only
+    context injection, WP2 spec §F.6): ``llm_requests`` keeps ``prepared``,
+    the folded request the provider got, and the chat_history delta reads the
+    history, so a typed context entry is archived as context. None: the
+    delta reads ``prepared``.
     """
-    if _session is None or _thread_id is None:
+    if _session is None or _session_identity.thread_id is None:
         return
-    thread_id = _thread_id
+    thread_id = _session_identity.thread_id
     turn = _session.turn_count
     model = metrics.get("model") or getattr(
         getattr(_session.config, "llm", None), "model", "unknown"
@@ -13968,6 +8407,7 @@ def _loop_archive_llm_call(prepared: Any, response: Any, metrics: dict) -> None:
                     "output_tokens": metrics.get("output_tokens"),
                     "cached_tokens": metrics.get("cached_tokens"),
                 },
+                history_messages=history_messages,
             )
         except Exception as e:
             logger.debug(f"llm_requests archive failed (non-fatal): {e}")
@@ -13988,13 +8428,17 @@ async def _loop_persist_message(msg: Any) -> bool:
     ``_session.turn_count`` for the turn number — the loop callback carries no
     turn id (same convention as ``_record_compaction``).
     """
-    if _session is None or _session.postgres_conn is None or _thread_id is None:
+    if (
+        _session is None
+        or _session.postgres_conn is None
+        or _session_identity.thread_id is None
+    ):
         return False
     try:
         await asyncio.wait_for(
             _persist_one_message(
                 _session.postgres_conn,
-                _thread_id,
+                _session_identity.thread_id,
                 msg,
                 _session.turn_count,
                 tool_decisions=dict(_session.tool_decisions),
@@ -14031,9 +8475,9 @@ async def _loop_on_error(message: str, turn_id: Optional[int] = None) -> None:
         else (int(_session.turn_count) if _session is not None else None)
     )
     if terminal_turn_id is None:
-        _clear_loop_interrupt()
+        _session_input.clear_interrupt()
     else:
-        _clear_loop_interrupt(target_turn_id=terminal_turn_id)
+        _session_input.clear_interrupt(target_turn_id=terminal_turn_id)
     payload: Dict[str, Any] = {"message": message}
     if turn_id is not None:
         payload["turn_id"] = turn_id
@@ -14042,12 +8486,12 @@ async def _loop_on_error(message: str, turn_id: Optional[int] = None) -> None:
     if (
         _session is not None
         and _session.postgres_conn is not None
-        and _thread_id is not None
+        and _session_identity.thread_id is not None
     ):
         try:
             await asyncio.wait_for(
                 _session.postgres_conn.save_thread_message(
-                    thread_id=_thread_id,
+                    thread_id=_session_identity.thread_id,
                     role="error",
                     content=message,
                     turn_number=(
@@ -14069,7 +8513,8 @@ async def _loop_on_workspace_upgrade_needed(freeze_data: Dict[str, Any]) -> None
 
     - ``workspace_upgrade_required`` — a lite agent called
       ``request_workspace_upgrade`` → emit ``workspace_upgrade.needed`` (the
-      sandbox offer; accept sends ``upgrade-to-workspace``).
+      upgrade offer: a VM in a Session, a container in a Job; accept sends
+      ``upgrade-to-workspace``).
     - ``vm_upgrade_required`` — a sandbox sudo intercept → emit
       ``vm_upgrade.needed`` (the existing VM offer; accept sends
       ``upgrade-to-vm``). Unchanged behavior.
@@ -14090,6 +8535,102 @@ async def _loop_on_workspace_upgrade_needed(freeze_data: Dict[str, Any]) -> None
             "command": freeze_data.get("command"),
         },
     )
+
+
+#: ``(lease_token, context.compacted params)`` of the last resume-time
+#: compaction that persisted its checkpoint while a stateless claim was attached.
+#: A durable ``compact`` control drained under the SAME lease is already
+#: satisfied by it (attach restores before the control drain), so the drain
+#: restates that compaction instead of folding a second time.
+_resume_compaction_receipt: Optional[Tuple[int, Dict[str, Any]]] = None
+
+
+def _compaction_frame_params(
+    summary_text: Optional[str], before: int, after: int, trigger: str
+) -> Dict[str, Any]:
+    """The ``context.compacted`` params for the session's current turn."""
+    turn = _session.turn_count if _session else None
+    params: Dict[str, Any] = {
+        "before": before,
+        "after": after,
+        "trigger": trigger,
+        "summary": summary_text,
+        "turn": turn,
+    }
+    # Completion stats from the summarization engine (n_passes, duration_ms,
+    # before/after tokens) — extends context.compacted per
+    # knowledge-base/knowledge/features/context_summarization_rework.md.
+    ctx_mgr_stats = getattr(
+        getattr(_session, "context_manager", None),
+        "_last_summarization_stats",
+        None,
+    )
+    if isinstance(ctx_mgr_stats, dict):
+        params.update(ctx_mgr_stats)
+    return params
+
+
+async def _persist_compaction_checkpoint(
+    summary_text: str,
+    before: int,
+    after: int,
+    trigger: str,
+    *,
+    control_request_id: Optional[str] = None,
+) -> bool:
+    """Write the ``role='summary'`` restore checkpoint. Raises on failure.
+
+    Returns False only when there is nothing to write to (no summary, session
+    or thread). On the stateless lane the row is fenced by the current lease
+    (``save_thread_message``), so a lost lease raises ``LeaseLostError``.
+    """
+    if not (
+        summary_text
+        and _session
+        and _session.postgres_conn
+        and _session_identity.thread_id
+    ):
+        return False
+    turn = _session.turn_count
+    # Type-guard: defensive against an unexpected turn_count type so an
+    # arithmetic glitch never kills the checkpoint. In production turn_count
+    # is always int (initialized to 0 in PersistentSession); the guard mainly
+    # protects test mocks where a bare MagicMock attribute slips through.
+    turn_int = turn if isinstance(turn, int) else 0
+    boundary_turn = max(turn_int - 1, 0)
+    # Resolve the message-granular boundary the summarizer just set (the id
+    # of the last message its summary covers) into a seq, so resume loads
+    # `summary + (seq > boundary_seq)` — the exact live tail — instead of the
+    # whole post-boundary turn(s). None ⇒ resume falls back to boundary_turn
+    # (e.g. resume-time compaction, whose restored messages carry fresh ids
+    # that don't resolve to a persisted row).
+    boundary_seq = None
+    ctx_mgr = getattr(_session, "context_manager", None)
+    boundary_id = getattr(ctx_mgr, "_last_compaction_boundary_id", None)
+    if boundary_id:
+        try:
+            boundary_seq = await _session.postgres_conn.get_seq_for_message_id(
+                _session_identity.thread_id, boundary_id
+            )
+        except Exception as e:
+            logger.debug(f"boundary_seq lookup failed (non-fatal): {e}")
+    metrics: Dict[str, Any] = {
+        "before": before,
+        "after": after,
+        "trigger": trigger,
+        "boundary_turn": boundary_turn,
+        "boundary_seq": boundary_seq,
+    }
+    if control_request_id is not None:
+        metrics["control_request_id"] = control_request_id
+    await _session.postgres_conn.save_thread_message(
+        thread_id=_session_identity.thread_id,
+        role="summary",
+        content=summary_text,
+        turn_number=turn,
+        metrics=metrics,
+    )
+    return True
 
 
 async def _record_compaction(
@@ -14119,34 +8660,15 @@ async def _record_compaction(
     is safe for manual ``/compact`` and resume-time compaction (where all turns
     are already fully saved).
 
-    A non-None ``ws`` sends the live event over the control socket (manual
-    ``/compact``); the auto and resume paths pass ``ws=None`` to use the
-    broadcast/SSE channel.
+    A non-None ``ws`` sends the live event over that socket only; the manual
+    (pinned), auto and resume paths pass ``ws=None`` to use the broadcast/SSE
+    channel. The stateless manual path does not come through here: its
+    ``context.compacted`` is the durable control receipt
+    (``_apply_compact_control``).
     """
-    turn = _session.turn_count if _session else None
-    # Type-guard: defensive against an unexpected turn_count type so an
-    # arithmetic glitch never kills event emission. In production turn_count
-    # is always int (initialized to 0 in PersistentSession); the guard mainly
-    # protects test mocks where a bare MagicMock attribute slips through.
-    turn_int = turn if isinstance(turn, int) else 0
-    boundary_turn = max(turn_int - 1, 0)
-    params = {
-        "before": before,
-        "after": after,
-        "trigger": trigger,
-        "summary": summary_text,
-        "turn": turn,
-    }
-    # Completion stats from the summarization engine (n_passes, duration_ms,
-    # before/after tokens) — extends context.compacted per
-    # knowledge-base/knowledge/features/context_summarization_rework.md.
-    ctx_mgr_stats = getattr(
-        getattr(_session, "context_manager", None),
-        "_last_summarization_stats",
-        None,
-    )
-    if isinstance(ctx_mgr_stats, dict):
-        params.update(ctx_mgr_stats)
+    global _resume_compaction_receipt
+
+    params = _compaction_frame_params(summary_text, before, after, trigger)
     try:
         if ws is not None:
             await _ws_send(ws, "context.compacted", params)
@@ -14155,39 +8677,17 @@ async def _record_compaction(
     except Exception as e:
         logger.debug(f"Failed to emit context.compacted (non-fatal): {e}")
 
-    if summary_text and _session and _session.postgres_conn and _thread_id:
-        # Resolve the message-granular boundary the summarizer just set (the id
-        # of the last message its summary covers) into a seq, so resume loads
-        # `summary + (seq > boundary_seq)` — the exact live tail — instead of the
-        # whole post-boundary turn(s). None ⇒ resume falls back to boundary_turn
-        # (e.g. resume-time compaction, whose restored messages carry fresh ids
-        # that don't resolve to a persisted row).
-        boundary_seq = None
-        ctx_mgr = getattr(_session, "context_manager", None)
-        boundary_id = getattr(ctx_mgr, "_last_compaction_boundary_id", None)
-        if boundary_id:
-            try:
-                boundary_seq = await _session.postgres_conn.get_seq_for_message_id(
-                    _thread_id, boundary_id
-                )
-            except Exception as e:
-                logger.debug(f"boundary_seq lookup failed (non-fatal): {e}")
-        try:
-            await _session.postgres_conn.save_thread_message(
-                thread_id=_thread_id,
-                role="summary",
-                content=summary_text,
-                turn_number=turn,
-                metrics={
-                    "before": before,
-                    "after": after,
-                    "trigger": trigger,
-                    "boundary_turn": boundary_turn,
-                    "boundary_seq": boundary_seq,
-                },
-            )
-        except Exception as e:
-            logger.warning(f"Failed to persist compaction marker (non-fatal): {e}")
+    try:
+        persisted = await _persist_compaction_checkpoint(
+            summary_text or "", before, after, trigger
+        )
+    except Exception as e:
+        logger.warning(f"Failed to persist compaction marker (non-fatal): {e}")
+        return
+    if persisted and trigger == "resume":
+        lease_token = _session_identity.stateless_lease_token()
+        if lease_token is not None:
+            _resume_compaction_receipt = (lease_token, dict(params))
 
 
 async def _loop_on_context_compacted(
@@ -14208,65 +8708,6 @@ async def _loop_compaction_progress(event: str, params: Dict[str, Any]) -> None:
     See knowledge-base/knowledge/features/context_summarization_rework.md (S3).
     """
     _broadcast(event, params)
-
-
-async def _loop_completion_handler(loop_task: asyncio.Task) -> None:
-    """Wait for the persistent loop to finish, then run reason-appropriate cleanup.
-
-    Under headless semantics the WS handler no longer cleans up after the loop
-    in its finally block — the loop outlives the WS. So we attach this
-    completion handler when the loop is spawned, and it routes the exit path:
-
-    - IdleTimeoutError → archive + terminate as "idle_timeout"
-    - Other exceptions → terminate as "loop_crash"
-    - Clean exit → terminate as "loop_complete"
-    - CancelledError → already inside _terminate_session, do nothing
-    """
-    try:
-        await loop_task
-    except IdleTimeoutError:
-        logger.info("Persistent loop exited via idle timeout")
-        if _stateless_mode():
-            # Stateless lane: the pod-side idle timer must never end the
-            # THREAD — thread lifecycle is orchestrator-owned, and an
-            # 'ended' status (or the session.ended frame the archive
-            # broadcasts) would force an epoch bump on the next claim's
-            # attach (client cache-wipe cascade). Just drop the cached
-            # session; the next claim rebuilds from thread_messages.
-            await _terminate_session("idle_timeout", mark_thread=False)
-            return
-        try:
-            await _handle_idle_archive()
-        except Exception as e:
-            logger.warning(f"Idle archive failed: {e}")
-        await _terminate_session("idle_timeout")
-    except asyncio.CancelledError:
-        # Cancellation came from _terminate_session itself — don't re-enter.
-        # Re-raise so the wrapper task surfaces as cancelled.
-        raise
-    except Exception as e:
-        logger.warning(f"Persistent loop crashed: {e}", exc_info=True)
-        # Every opened turn gets a terminal edge, on this path too: without a
-        # turn.error the journal keeps turn.started open, every attached
-        # client spins on a turn that ended, and every reload that replays
-        # the journal reopens it. Persisted as a role='error' row so the
-        # line survives reload. Not on a lost lease — that turn belongs to
-        # a successor claim now, which closes it itself.
-        if not isinstance(e, LeaseLostError):
-            try:
-                await _loop_on_error(
-                    "The session loop stopped before this turn could be "
-                    f"settled: {e}. The transcript is preserved — send a "
-                    "message to continue."
-                )
-            except Exception:
-                logger.debug(
-                    "turn.error on loop crash failed (non-fatal)", exc_info=True
-                )
-        await _terminate_session("loop_crash", mark_thread=not _stateless_mode())
-    else:
-        logger.info("Persistent loop completed cleanly")
-        await _terminate_session("loop_complete", mark_thread=not _stateless_mode())
 
 
 def _safe_serialize(obj: Any) -> Any:
@@ -14305,23 +8746,72 @@ def _sanitize_restored_history(restored: list) -> list:
     return sanitize_history_for_provider_boundary(restored, model)
 
 
+def _row_turn(db_msg: dict) -> Optional[int]:
+    """The turn that consumed a transcript row, or ``None`` when unknown.
+
+    An admitted input delivery records the turn that actually ran it. The
+    row's own ``turn_number`` is only a hint for pinned input: two messages
+    typed during one turn both carry the next number.
+    """
+    for key in ("admitted_turn_number", "turn_number"):
+        value = db_msg.get(key)
+        if value is None or isinstance(value, bool):
+            continue
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
+def _conversation_order(db_messages: list) -> list:
+    """Order chronological transcript rows the way the model saw them.
+
+    ``seq`` is write order, not conversation order. Input is persisted when
+    it is accepted, so a message typed while a tool runs gets a ``seq``
+    between the tool call and its result, and a recovery row for an abandoned
+    turn is written after input that arrived later. The loop reads input only
+    between turns, so the live history is ordered by turn: this is a stable
+    sort by the turn that consumed each row, keeping ``seq`` order inside a
+    turn. A row without a turn keeps its place behind the row before it.
+    See knowledge-base/knowledge/features/parallel_subagents.md §10.2 (F19).
+    """
+    keyed = []
+    turn = 0
+    for db_msg in db_messages:
+        row_turn = _row_turn(db_msg)
+        if row_turn is not None:
+            turn = row_turn
+        keyed.append((turn, db_msg))
+    return [db_msg for _, db_msg in sorted(keyed, key=lambda item: item[0])]
+
+
 def _db_rows_to_lc_messages(db_messages: list) -> list:
     """Convert ``thread_messages`` rows to LangChain messages with stable ids.
 
     Shared by the restore paths (Path A checkpoint+tail, Path B full load).
-    Falls back to positional pairing of tool results for legacy rows whose
-    ``tool_call_id`` column is NULL (predates the column); current rows carry
-    it explicitly. Skips system rows — the loop adds a fresh system from the
-    current config. ``role='summary'`` rows are already excluded by the DB
-    query.
+    Takes rows in ``seq`` order and returns them in conversation order
+    (``_conversation_order``) with every tool result directly behind its call
+    (``repair_tool_result_adjacency``). Falls back to positional pairing of
+    tool results for legacy rows whose ``tool_call_id`` column is NULL
+    (predates the column); current rows carry it explicitly. Skips system
+    rows — the loop adds a fresh system from the current config.
+    ``role='summary'`` rows are already excluded by the DB query.
+    A ``role='context'`` row comes back as the typed context entry it was
+    (its stored text, never re-rendered) and folds into its carrier at the
+    next request build; an unreadable one is dropped, and the planner
+    re-injects what is still relevant.
     """
     import uuid as _uuid
     from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
+    from shared.runtime.core.context_entries import context_entry_from_row
+    from shared.runtime.core.message_markers import PERSIST_ROLE_CONTEXT
+
     restored: list = []
     pending_tool_call_ids: list[str] = []
 
-    for db_msg in db_messages:
+    for db_msg in _conversation_order(db_messages):
         role = db_msg["role"]
         content = db_msg["content"] or ""
         tool_calls = db_msg.get("tool_calls")
@@ -14347,7 +8837,34 @@ def _db_rows_to_lc_messages(db_messages: list) -> list:
             # on the next pod recycle, and the session would answer a question
             # it can no longer see. (postgres_db's history query excludes only
             # 'summary' and 'error', so 'event' rows do reach here.)
-            restored.append(HumanMessage(content=content, id=msg_id))
+            # A compaction summary saved as a row (a forked child's seed) gets
+            # its marker back; rows persist no additional_kwargs.
+            from agent.core.context import (
+                SUMMARY_LEAD_IN,
+                make_summary_message,
+                summary_text,
+            )
+
+            if isinstance(content, str) and content.startswith(SUMMARY_LEAD_IN):
+                restored.append(
+                    make_summary_message(
+                        summary_text(HumanMessage(content=content)),
+                        message_id=msg_id,
+                    )
+                )
+            else:
+                restored.append(HumanMessage(content=content, id=msg_id))
+
+        elif role == PERSIST_ROLE_CONTEXT:
+            # A typed context entry (append-only context injection). The
+            # history query reads additional_kwargs for these rows only.
+            entry = context_entry_from_row(
+                db_msg.get("content"), db_msg.get("additional_kwargs"), id=msg_id
+            )
+            if entry is None:
+                logger.debug("Dropping unreadable context row %s on restore", msg_id)
+            else:
+                restored.append(entry)
 
         elif role in ("ai", "assistant"):
             lc_tool_calls = []
@@ -14361,8 +8878,23 @@ def _db_rows_to_lc_messages(db_messages: list) -> list:
                     for tc in tool_calls
                 ]
             pending_tool_call_ids = [tc["id"] for tc in lc_tool_calls]
+            # An Anthropic turn comes back as the blocks the provider produced
+            # (thinking with its signature, text, tool_use), so the restored
+            # request starts with the live one and keeps its reasoning.
+            raw = db_msg.get("provider_raw")
+            native = raw.get(ANTHROPIC_CONTENT_KEY) if isinstance(raw, dict) else None
+            response_metadata = {}
+            if isinstance(native, list) and native:
+                content = native
+                if raw.get("model"):
+                    response_metadata["model_name"] = raw["model"]
             restored.append(
-                AIMessage(content=content, tool_calls=lc_tool_calls, id=msg_id)
+                AIMessage(
+                    content=content,
+                    tool_calls=lc_tool_calls,
+                    id=msg_id,
+                    response_metadata=response_metadata,
+                )
             )
 
         elif role == "tool":
@@ -14381,7 +8913,7 @@ def _db_rows_to_lc_messages(db_messages: list) -> list:
 
         # Skip system rows — the loop adds a fresh one from current config
 
-    return restored
+    return repair_tool_result_adjacency(restored)
 
 
 async def _restore_session_messages() -> None:
@@ -14416,12 +8948,16 @@ async def _restore_session_messages() -> None:
     view (cockpit reads it via a separate orchestrator-side query); only the
     in-memory LLM context is bounded.
     """
-    if not _session or not _agent or not _agent.postgres_conn or not _thread_id:
+    if (
+        not _session
+        or not _agent
+        or not _agent.postgres_conn
+        or not _session_identity.thread_id
+    ):
         return
 
     try:
         import uuid as _uuid
-        from langchain_core.messages import SystemMessage
 
         from agent.llm.response_guards import strip_removal_markers
 
@@ -14431,7 +8967,9 @@ async def _restore_session_messages() -> None:
             _session.config.context_management, "max_summary_length", 10000
         )
 
-        ckpt = await _agent.postgres_conn.get_latest_compaction_checkpoint(_thread_id)
+        ckpt = await _agent.postgres_conn.get_latest_compaction_checkpoint(
+            _session_identity.thread_id
+        )
         boundary_turn = ckpt.get("boundary_turn") if ckpt else None
         boundary_seq = ckpt.get("boundary_seq") if ckpt else None
 
@@ -14444,30 +8982,33 @@ async def _restore_session_messages() -> None:
                 # not cover (seq > boundary_seq), independent of turn size — the
                 # fix for the 793-message-turn OOM. Capped by the resume floor.
                 db_messages = await _agent.postgres_conn.get_thread_messages_history(
-                    thread_id=_thread_id,
+                    thread_id=_session_identity.thread_id,
                     limit=_resume_message_limit,
                     seq_gt=boundary_seq,
                     newest_first=True,
+                    include_provider_raw=True,
                 )
             else:
                 # Back-compat: summary rows written before boundary_seq shipped
                 # carry only boundary_turn — fall back to the turn cursor.
                 db_messages = await _agent.postgres_conn.get_thread_messages_history(
-                    thread_id=_thread_id,
+                    thread_id=_session_identity.thread_id,
                     limit=_resume_message_limit,
                     since_turn=boundary_turn,
                     newest_first=True,
+                    include_provider_raw=True,
                 )
             if len(db_messages) >= _resume_message_limit:
                 logger.warning(
-                    f"Resume floor hit on thread {_thread_id}: post-boundary tail "
+                    f"Resume floor hit on thread {_session_identity.thread_id}: post-boundary tail "
                     f"trimmed to newest {_resume_message_limit} messages (stale "
                     f"boundary or a runaway tail) — bounded, but old context may drop"
                 )
 
-            summary_msg = SystemMessage(
-                content=f"[Summary of prior work]\n{ckpt['summary']}",
-                id=str(_uuid.uuid4()),
+            from agent.core.context import make_summary_message
+
+            summary_msg = make_summary_message(
+                ckpt["summary"], message_id=str(_uuid.uuid4())
             )
             restored: list = [summary_msg, *_db_rows_to_lc_messages(db_messages)]
 
@@ -14516,7 +9057,7 @@ async def _restore_session_messages() -> None:
                 )
                 logger.info(
                     f"Restored from checkpoint ({cursor}) for "
-                    f"thread {_thread_id} ({len(restored)} msgs in context; "
+                    f"thread {_session_identity.thread_id} ({len(restored)} msgs in context; "
                     f"tail of {len(db_messages)} raw rows; "
                     f"turn_count={_session.turn_count})"
                 )
@@ -14556,13 +9097,14 @@ async def _restore_session_messages() -> None:
         # exit-137 OOM). ensure_within_limits then summarizes them and Path B
         # writes a checkpoint so the next resume hits Path A.
         db_messages = await _agent.postgres_conn.get_thread_messages_history(
-            thread_id=_thread_id,
+            thread_id=_session_identity.thread_id,
             limit=_resume_message_limit,
             newest_first=True,
+            include_provider_raw=True,
         )
         if len(db_messages) >= _resume_message_limit:
             logger.warning(
-                f"Resume floor hit on thread {_thread_id} (no checkpoint): loaded "
+                f"Resume floor hit on thread {_session_identity.thread_id} (no checkpoint): loaded "
                 f"newest {_resume_message_limit} of a larger log — bounded to avoid OOM"
             )
 
@@ -14609,7 +9151,7 @@ async def _restore_session_messages() -> None:
             last_turn = max((m.get("turn_number") or 0 for m in db_messages), default=0)
             _session.turn_count = last_turn
             logger.info(
-                f"Restored {len(restored)} messages for thread {_thread_id} "
+                f"Restored {len(restored)} messages for thread {_session_identity.thread_id} "
                 f"(from {len(db_messages)} stored; last turn: {last_turn})"
             )
 
@@ -14699,8 +9241,13 @@ def _select_turn_messages(
     exact input id (stateless) or the latest HumanMessage (pinned). A
     stateless walk that finds no anchor reconciles zero rows — the
     incremental writes already hold the turn's content and the DB still
-    mints the boundary — rather than failing the settlement.
+    mints the boundary — rather than failing the settlement. A typed context
+    entry is a HumanMessage too, but never the turn's boundary: the pinned
+    walk saves it with the turn's rows and walks on to the input.
     """
+    from shared.runtime.core.context_entries import is_context_entry
+    from shared.runtime.core.message_markers import is_compaction_summary
+
     input_id = str(turn_input_message_id) if turn_input_message_id else None
     if authoritative_turn_boundary and any(
         turn_membership(msg) is not None for msg in messages
@@ -14715,14 +9262,18 @@ def _select_turn_messages(
     to_save: List[Any] = []
     boundary_found = False
     for msg in reversed(messages):
+        if is_compaction_summary(msg):
+            # Runtime-authored and saved as the compaction checkpoint, never a
+            # turn row; a HumanMessage, but not the turn's boundary.
+            continue
         if authoritative_turn_boundary:
             if str(getattr(msg, "id", "")) == input_id:
                 boundary_found = True
                 break
-        elif hasattr(msg, "type") and msg.type in (
+        elif getattr(msg, "type", None) in (
             "human",
             "HumanMessageChunk",
-        ):
+        ) and not is_context_entry(msg):
             boundary_found = True
             break
         to_save.append(msg)
@@ -14797,13 +9348,18 @@ async def _save_turn_ai_messages(
         # mid-turn, this updates the same rows (stable id, ON CONFLICT). Saving
         # every row (not just AI) keeps the reconcile the durability backstop for
         # any incremental write that was dropped mid-turn (_loop_persist_message
-        # is best-effort).
-        rows = [
-            _serialize_message_row(
+        # is best-effort). A compaction view (a capped/elided/shed copy of a
+        # row) is written insert-if-absent: it backstops a lost write — a tool
+        # call must never be left without its result — but never overwrites
+        # the durable full row with the lossy copy.
+        rows = []
+        for msg in to_save:
+            row = _serialize_message_row(
                 msg, turn_number, metrics=metrics, tool_decisions=tool_decisions
             )
-            for msg in to_save
-        ]
+            if is_compaction_view(msg):
+                row["insert_if_absent"] = True
+            rows.append(row)
         if authoritative_turn_boundary:
             producer_id = await client.save_thread_messages(
                 thread_id,
@@ -14846,7 +9402,11 @@ async def _handle_rewind(ws: WebSocket, data: Dict[str, Any]) -> None:
     async def _err(message: str) -> None:
         await _ws_send(ws, "error", {"message": message, "request_id": request_id})
 
-    if _session is None or _session.postgres_conn is None or _thread_id is None:
+    if (
+        _session is None
+        or _session.postgres_conn is None
+        or _session_identity.thread_id is None
+    ):
         await _err("Session no longer active")
         return
     mode = data.get("mode", "conversation")
@@ -14868,7 +9428,7 @@ async def _handle_rewind(ws: WebSocket, data: Dict[str, Any]) -> None:
         #    not kill the in-flight turn or discard queued inputs — cheap to do
         #    ahead of the interrupt since the rewind lock excludes the only
         #    writer that could tombstone this row concurrently.
-        row = await conn.get_live_message(_thread_id, message_id)
+        row = await conn.get_live_message(_session_identity.thread_id, message_id)
         if row is None:
             await _err("Message not found (it may already be rewound)")
             return
@@ -14883,7 +9443,7 @@ async def _handle_rewind(ws: WebSocket, data: Dict[str, Any]) -> None:
         #    the loop to park. _turn_event_open is the turn-in-flight signal.
         if _turn_event_open:
             active_turn_id = int(_session.turn_count)
-            if _signal_interrupt_for_turn(active_turn_id) is None:
+            if _session_input.signal_interrupt_for_turn(active_turn_id) is None:
                 await _err("Could not interrupt the running turn — try again")
                 return
             deadline = asyncio.get_event_loop().time() + 60.0
@@ -14897,19 +9457,18 @@ async def _handle_rewind(ws: WebSocket, data: Dict[str, Any]) -> None:
         # out-of-band teardown (drain, watchdog, REST detach) to tear the
         # session down underneath us. Re-validate before touching anything
         # that assumes it's still alive.
-        if _session is None or _session.postgres_conn is None or _thread_id is None:
+        if (
+            _session is None
+            or _session.postgres_conn is None
+            or _session_identity.thread_id is None
+        ):
             await _err("Session no longer active")
             return
 
         # 3. Drain queued inputs: their rows sit past the sweep boundary and
         #    are about to be tombstoned; processing them post-rewind would
         #    resurrect the abandoned timeline.
-        if _loop_user_queue is not None:
-            while True:
-                try:
-                    _loop_user_queue.get_nowait()
-                except asyncio.QueueEmpty:
-                    break
+        _session_input.drain_queue()
 
         # 4. Workspace forward-restore — fallible, so it gates the sweep.
         abandoned_sha = None
@@ -14924,7 +9483,9 @@ async def _handle_rewind(ws: WebSocket, data: Dict[str, Any]) -> None:
                     "unavailable (conversation-only rewind still works)"
                 )
                 return
-            restored_to_sha = await conn.resolve_restore_commit(_thread_id, from_seq)
+            restored_to_sha = await conn.resolve_restore_commit(
+                _session_identity.thread_id, from_seq
+            )
             if not restored_to_sha:
                 await _err(
                     "No workspace checkpoint exists before this message — "
@@ -14960,7 +9521,9 @@ async def _handle_rewind(ws: WebSocket, data: Dict[str, Any]) -> None:
                 # would resolve to the abandoned tree instead of the one we
                 # just restored to.
                 try:
-                    await conn.record_turn_commit(_thread_id, restore_commit_sha)
+                    await conn.record_turn_commit(
+                        _session_identity.thread_id, restore_commit_sha
+                    )
                 except Exception:
                     logger.warning(
                         "record_turn_commit failed after rewind restore (non-fatal)",
@@ -14973,7 +9536,7 @@ async def _handle_rewind(ws: WebSocket, data: Dict[str, Any]) -> None:
         try:
             # 5. Sweep + ledger (one transaction). mode='code' ledgers only.
             result = await conn.apply_rewind(
-                _thread_id,
+                _session_identity.thread_id,
                 from_seq=from_seq,
                 mode=mode,
                 actor="ws_client",
@@ -15018,7 +9581,6 @@ async def _handle_rewind(ws: WebSocket, data: Dict[str, Any]) -> None:
                             not _session.messages and result["surviving_turn"] > 0
                         )
                 _session.turn_count = result["surviving_turn"]
-                _loop_last_user_content[0] = ""
 
                 # 6b. Narrow resweep: step 2's interrupt-wait can run for up
                 #     to 60s, long enough for the very turn being interrupted
@@ -15027,13 +9589,15 @@ async def _handle_rewind(ws: WebSocket, data: Dict[str, Any]) -> None:
                 #     normal run with no stragglers sweeps 0 rows. Not a
                 #     second apply_rewind: that would append a duplicate
                 #     thread_rewinds ledger row for the same rewind.
-                stray_count = await conn.resweep_rewind(_thread_id, from_seq)
+                stray_count = await conn.resweep_rewind(
+                    _session_identity.thread_id, from_seq
+                )
                 if stray_count > 0:
                     logger.warning(
                         "Rewind resweep caught %d stray row(s) written during "
                         "the interrupt wait (thread=%s from_seq=%s)",
                         stray_count,
-                        _thread_id,
+                        _session_identity.thread_id,
                         from_seq,
                     )
 
@@ -15057,16 +9621,18 @@ async def _handle_rewind(ws: WebSocket, data: Dict[str, Any]) -> None:
                     if old_writer is not None:
                         _event_writer = None
                         await old_writer.close()
-                    _events_epoch = await _bump_event_journal_epoch(conn, _thread_id)
+                    _events_epoch = await _bump_event_journal_epoch(
+                        conn, _session_identity.thread_id
+                    )
                     _next_seq = 0
                     new_writer = _OrderedPersistentEventWriter(
                         postgres_conn=conn,
-                        thread_id=_thread_id,
+                        thread_id=_session_identity.thread_id,
                         epoch=_events_epoch,
                         on_terminal_failure=_event_persistence_failed,
                         pinned_agent_id=_registered_pinned_agent_id(),
-                        pinned_runtime_generation=_session_runtime_generation,
-                        pinned_runtime_attach_token=_session_runtime_attach_token,
+                        pinned_runtime_generation=_session_identity.session_generation,
+                        pinned_runtime_attach_token=_session_identity.attach_token,
                     )
                     new_writer.start()
                     _event_writer = new_writer
@@ -15075,20 +9641,25 @@ async def _handle_rewind(ws: WebSocket, data: Dict[str, Any]) -> None:
                         "Rewind epoch bump failed — viewers repaint on next attach",
                         exc_info=True,
                     )
-                    if _event_writer is None and _thread_id is not None:
+                    if (
+                        _event_writer is None
+                        and _session_identity.thread_id is not None
+                    ):
                         # Keep journaling alive under the still-current epoch
                         # rather than leaving the rest of the session
                         # unjournaled because the bump failed.
                         try:
                             recovery_writer = _OrderedPersistentEventWriter(
                                 postgres_conn=conn,
-                                thread_id=_thread_id,
+                                thread_id=_session_identity.thread_id,
                                 epoch=_events_epoch,
                                 on_terminal_failure=_event_persistence_failed,
                                 pinned_agent_id=_registered_pinned_agent_id(),
-                                pinned_runtime_generation=(_session_runtime_generation),
+                                pinned_runtime_generation=(
+                                    _session_identity.session_generation
+                                ),
                                 pinned_runtime_attach_token=(
-                                    _session_runtime_attach_token
+                                    _session_identity.attach_token
                                 ),
                             )
                             recovery_writer.start()
@@ -15110,7 +9681,7 @@ async def _handle_rewind(ws: WebSocket, data: Dict[str, Any]) -> None:
                     logger.warning(
                         "Rewind rehydrate came back empty after sweep "
                         "(thread=%s from_seq=%s surviving_turn=%s)",
-                        _thread_id,
+                        _session_identity.thread_id,
                         from_seq,
                         result["surviving_turn"],
                     )
@@ -15143,18 +9714,151 @@ async def _handle_rewind(ws: WebSocket, data: Dict[str, Any]) -> None:
         except Exception as e:
             logger.exception(
                 "Rewind failed after the sweep gate: thread=%s from_seq=%s",
-                _thread_id,
+                _session_identity.thread_id,
                 from_seq,
             )
             await _err(f"Rewind failed: {e}")
             return
         logger.info(
             "Rewind applied: thread=%s mode=%s from_seq=%s swept=%s",
-            _thread_id,
+            _session_identity.thread_id,
             mode,
             from_seq,
             result["swept"],
         )
+
+
+class _ManualCompactionRefused(Exception):
+    """A manual compaction that cannot run, known before anything changed."""
+
+    def __init__(self, code: str, message: str) -> None:
+        super().__init__(message)
+        self.code = code
+        self.message = message
+
+
+#: How long a pinned ``/compact`` that arrives while a turn is running waits for
+#: the loop to park before refusing. The Cockpit already defers the command
+#: until the response ends; this absorbs the turn-end → ``ready`` window and a
+#: client that does not defer.
+_MANUAL_COMPACT_IDLE_WAIT_S = 30.0
+_MANUAL_COMPACT_IDLE_POLL_S = 0.25
+
+
+async def _await_turn_idle(timeout_s: float) -> bool:
+    """Wait until no turn is in flight. False when the deadline passed first."""
+    deadline = time.monotonic() + timeout_s
+    while _turn_in_flight():
+        if time.monotonic() >= deadline:
+            return False
+        await asyncio.sleep(_MANUAL_COMPACT_IDLE_POLL_S)
+    return True
+
+
+async def _compact_session_manually(
+    focus: str = "", boundary_message_id: Optional[str] = None
+) -> Tuple[str, Optional[str], int, int]:
+    """Run one manual compaction over the attached session's working context.
+
+    Shared by the pinned socket verb (``_handle_compact``) and the stateless
+    durable control (``_apply_compact_control``); the caller holds
+    ``_rewind_lock`` and guarantees no turn is running. Adopts the result into
+    ``_session.messages`` but persists and announces nothing — that differs per
+    lane. Returns ``(outcome, summary_text, before, after)`` with outcome
+    ``compacted`` | ``noop`` | ``failed`` (the summarizer produced nothing; the
+    conversation is intact). Raises ``_ManualCompactionRefused`` before any
+    change when the session is not ready, the runtime is terminating, or the
+    boundary message is no longer resident.
+    """
+    if not _session or not _session.context_manager:
+        raise _ManualCompactionRefused("session_not_ready", "Session not ready")
+
+    from agent.llm.response_guards import strip_removal_markers
+
+    ctx_mgr = _session.context_manager
+
+    # Manual compaction can run before the first loop start — make sure
+    # progress frames flow either way (idempotent setter; getattr for
+    # test doubles that stub the context manager).
+    _cb_setter = getattr(ctx_mgr, "set_progress_callback", None)
+    if callable(_cb_setter):
+        _cb_setter(_loop_compaction_progress)
+
+    # "Summarize up to here" (session rewind's sibling action): map the
+    # chosen message to keep_recent_override = the number of messages from
+    # it (inclusive) to the end, counted on the same basis
+    # summarize_and_compact uses (injected context excluded — legacy pieces
+    # are filtered before keep_recent applies, typed entries ride with their
+    # carriers and are not counted, see keep_window_start).
+    keep_recent_override = None
+    if boundary_message_id:
+        from shared.runtime.core.context_entries import is_context_injection
+        from agent.database.postgres_db import _coerce_row_id
+
+        target_uuid = str(_coerce_row_id(boundary_message_id))
+        cut_index = None
+        for i, m in enumerate(_session.messages):
+            mid = getattr(m, "id", None)
+            if mid and str(_coerce_row_id(mid)) == target_uuid:
+                cut_index = i
+                break
+        if cut_index is None:
+            raise _ManualCompactionRefused(
+                "boundary_not_in_context",
+                "That message is no longer in working context — it may "
+                "already be summarized",
+            )
+        keep_recent_override = sum(
+            1 for m in _session.messages[cut_index:] if not is_context_injection(m)
+        )
+
+    before_count = len(_session.messages)
+    runs_before = getattr(ctx_mgr, "compaction_runs", 0)
+    if _session_termination.runtime_admission_closed():
+        raise _ManualCompactionRefused(
+            "runtime_terminating",
+            "Persistent runtime is terminating; retry on its replacement",
+        )
+    result = await ctx_mgr.summarize_and_compact(
+        messages=_session.messages,
+        auxiliary=_session.auxiliary_llm,
+        max_summary_length=getattr(
+            _session.config.context_management, "max_summary_length", 10000
+        ),
+        keep_recent_override=keep_recent_override,
+        trigger="manual",
+        focus=focus or None,
+        # A manual /compact: native where the family is (compaction WP6).
+        allow_native=True,
+    )
+    # summarize_and_compact returns a LangGraph reducer delta; this
+    # transport has no reducer, so strip the RemoveMessage markers before
+    # adopting. Leaking them into _session.messages made every later LLM
+    # call false-detect a compaction and re-persist the same summary row
+    # (the duplicate-banner bug, 2026-06-12).
+    _session.messages[:] = strip_removal_markers(result)
+    after_count = len(_session.messages)
+
+    runs_after = getattr(ctx_mgr, "compaction_runs", 0)
+    compacted_now = (
+        isinstance(runs_before, int)
+        and isinstance(runs_after, int)
+        and runs_after > runs_before
+    )
+    logger.info(
+        f"Manual compaction: {before_count} → {after_count} messages "
+        f"(summarized={compacted_now})"
+    )
+    if compacted_now:
+        return (
+            "compacted",
+            extract_summary_text(_session.messages),
+            before_count,
+            after_count,
+        )
+    if getattr(ctx_mgr, "last_compaction_failed", False) is True:
+        return "failed", None, before_count, after_count
+    return "noop", None, before_count, after_count
 
 
 async def _handle_compact(
@@ -15170,119 +9874,61 @@ async def _handle_compact(
     `/compact` (`boundary_message_id=None`) — any manual compaction racing a
     rewind hits the same hazard, not just the rewind sheet's "Summarize up
     to here".
+
+    Never runs beside a turn: the turn appends to the same list while the
+    summarizer is awaited, and adopting the result would drop those messages
+    from working memory. A request that arrives mid-turn waits (bounded) for
+    the loop to park.
     """
-    if _runtime_admission_closed():
+    if _session_termination.runtime_admission_closed():
         await _ws_send(
             ws,
             "error",
             {"message": "Persistent runtime is terminating; retry on its replacement"},
         )
         return
+    if not await _await_turn_idle(_MANUAL_COMPACT_IDLE_WAIT_S):
+        await _ws_send(
+            ws,
+            "error",
+            {
+                "message": "A response is still running — send /compact again "
+                "when it finishes"
+            },
+        )
+        return
     if _rewind_lock.locked():
         await _ws_send(
             ws,
             "error",
-            {"message": "A rewind is in progress — try again when it finishes"},
+            {
+                "message": "A rewind or compaction is in progress — try again "
+                "when it finishes"
+            },
         )
         return
     async with _rewind_lock:
         try:
-            if not _session or not _session.context_manager:
-                await _ws_send(ws, "error", {"message": "Session not ready"})
+            try:
+                (
+                    outcome,
+                    summary_text,
+                    before_count,
+                    after_count,
+                ) = await _compact_session_manually(focus, boundary_message_id)
+            except _ManualCompactionRefused as refusal:
+                await _ws_send(ws, "error", {"message": refusal.message})
                 return
 
-            from agent.llm.response_guards import strip_removal_markers
-
-            ctx_mgr = _session.context_manager
-
-            # Manual compaction can run before the first loop start — make sure
-            # progress frames flow either way (idempotent setter; getattr for
-            # test doubles that stub the context manager).
-            _cb_setter = getattr(ctx_mgr, "set_progress_callback", None)
-            if callable(_cb_setter):
-                _cb_setter(_loop_compaction_progress)
-
-            # "Summarize up to here" (session rewind's sibling action): map the
-            # chosen message to keep_recent_override = the number of messages from
-            # it (inclusive) to the end, counted on the same basis
-            # summarize_and_compact uses (workspace injections excluded — they are
-            # filtered before keep_recent applies).
-            keep_recent_override = None
-            if boundary_message_id:
-                from shared.runtime.core.workspace_injection import (
-                    is_workspace_injection_message,
-                )
-                from agent.database.postgres_db import _coerce_row_id
-
-                target_uuid = str(_coerce_row_id(boundary_message_id))
-                cut_index = None
-                for i, m in enumerate(_session.messages):
-                    mid = getattr(m, "id", None)
-                    if mid and str(_coerce_row_id(mid)) == target_uuid:
-                        cut_index = i
-                        break
-                if cut_index is None:
-                    await _ws_send(
-                        ws,
-                        "error",
-                        {
-                            "message": "That message is no longer in working "
-                            "context — it may already be summarized"
-                        },
-                    )
-                    return
-                keep_recent_override = sum(
-                    1
-                    for m in _session.messages[cut_index:]
-                    if not is_workspace_injection_message(m)
-                )
-
-            before_count = len(_session.messages)
-            runs_before = getattr(ctx_mgr, "compaction_runs", 0)
-            if _runtime_admission_closed():
-                await _ws_send(
-                    ws,
-                    "error",
-                    {
-                        "message": "Persistent runtime is terminating; retry on "
-                        "its replacement"
-                    },
-                )
-                return
-            result = await ctx_mgr.summarize_and_compact(
-                messages=_session.messages,
-                auxiliary=_session.auxiliary_llm,
-                max_summary_length=getattr(
-                    _session.config.context_management, "max_summary_length", 10000
-                ),
-                keep_recent_override=keep_recent_override,
-                trigger="manual",
-                focus=focus or None,
-            )
-            # summarize_and_compact returns a LangGraph reducer delta; this
-            # transport has no reducer, so strip the RemoveMessage markers before
-            # adopting. Leaking them into _session.messages made every later LLM
-            # call false-detect a compaction and re-persist the same summary row
-            # (the duplicate-banner bug, 2026-06-12).
-            _session.messages[:] = strip_removal_markers(result)
-            after_count = len(_session.messages)
-
-            runs_after = getattr(ctx_mgr, "compaction_runs", 0)
-            compacted_now = (
-                isinstance(runs_before, int)
-                and isinstance(runs_after, int)
-                and runs_after > runs_before
-            )
-            if compacted_now:
+            if outcome == "compacted":
                 # A summary was actually produced: journal the completion
                 # (broadcast, not ws-only — SSE replay must be able to clear the
                 # progress UI after a reload) and persist the role='summary'
                 # checkpoint row.
-                summary_text = extract_summary_text(_session.messages)
                 await _record_compaction(
                     summary_text, before_count, after_count, trigger="manual", ws=None
                 )
-            else:
+            elif outcome == "noop":
                 # No-op (below thresholds / nothing to fold): transient notice to
                 # the requesting client only — no banner row, no journal entry.
                 # summary=None tells the cockpit to render a system line instead
@@ -15300,13 +9946,12 @@ async def _handle_compact(
                         "turn": turn if isinstance(turn, int) else None,
                     },
                 )
-            logger.info(
-                f"Manual compaction: {before_count} → {after_count} messages "
-                f"(summarized={compacted_now})"
-            )
+            # outcome == "failed": the engine already journaled
+            # compaction.failed ("conversation kept intact") — a second
+            # "nothing to compact" line would contradict it.
 
             # Commit + push workspace to Gitea on compaction (natural checkpoint boundary)
-            if _session.workspace_manager:
+            if _session and _session.workspace_manager:
                 git_mgr = getattr(_session.workspace_manager, "git_manager", None)
                 if git_mgr and git_mgr.is_active:
                     try:
@@ -15323,6 +9968,118 @@ async def _handle_compact(
         except Exception as e:
             logger.warning(f"Compaction failed: {e}")
             await _ws_send(ws, "error", {"message": f"Compaction failed: {e}"})
+
+
+async def _apply_compact_control(
+    request: Any, *, lease_token: Optional[int]
+) -> Tuple[str, str, Optional[str], Dict[str, Any]]:
+    """Run the stateless manual compaction a durable ``compact`` control asks for.
+
+    Returns ``(event_kind, outcome, error_code, receipt_params)`` for the
+    drain to journal as the durable receipt: ``context.compacted`` (a folded
+    summary, or ``summary: None`` when there was nothing to fold) or
+    ``control.rejected``. Raises ``ControlInboxBlocked`` only where the request
+    must stay pending for this or a successor claimant: a lost session or
+    lease, a terminating runtime, or a checkpoint that could not be written. A
+    summarizer failure is a durable rejection instead — a blocked control is
+    released as transient and requeued forever, starving the session's input.
+    (session_slash_commands_and_stateless_compact.md §3)
+    """
+    if lease_token is None:
+        # Admission keeps compact off the pinned inbox (it has a socket verb).
+        return "control.rejected", "rejected", "unsupported_control", {}
+    if (
+        _session is None
+        or _session.postgres_conn is None
+        or _session_identity.thread_id is None
+    ):
+        raise ControlInboxBlocked(f"compaction lost its session: {request.id}")
+
+    request_id = str(request.id)
+    payload = request.payload if isinstance(request.payload, dict) else {}
+
+    # A checkpoint written for this exact request whose receipt never
+    # committed (crash between the two): answer from it, fold nothing twice.
+    try:
+        checkpoint = await _session.postgres_conn.get_latest_compaction_checkpoint(
+            _session_identity.thread_id
+        )
+    except Exception as exc:
+        raise ControlInboxBlocked(
+            f"compaction checkpoint lookup failed: {request.id}"
+        ) from exc
+    if checkpoint and checkpoint.get("control_request_id") == request_id:
+        return (
+            "context.compacted",
+            "applied",
+            None,
+            {
+                "before": checkpoint.get("before"),
+                "after": checkpoint.get("after"),
+                "trigger": "manual",
+                "summary": checkpoint.get("summary") or None,
+                "turn": checkpoint.get("turn_number"),
+            },
+        )
+
+    # Attach restores before the drain; when that restore already compacted
+    # under this claim, the request is satisfied by it (same banner turn, so
+    # the Cockpit replaces rather than duplicates).
+    resumed = _resume_compaction_receipt
+    if resumed is not None and resumed[0] == lease_token:
+        params = dict(resumed[1])
+        params["trigger"] = "manual"
+        params["satisfied_by"] = "resume"
+        return "context.compacted", "applied", None, params
+
+    try:
+        async with _rewind_lock:
+            outcome, summary_text, before, after = await _compact_session_manually(
+                str(payload.get("focus") or ""),
+                payload.get("boundary_message_id") or None,
+            )
+            if outcome == "compacted":
+                try:
+                    await _persist_compaction_checkpoint(
+                        summary_text or "",
+                        before,
+                        after,
+                        "manual",
+                        control_request_id=request_id,
+                    )
+                except Exception as exc:
+                    raise ControlInboxBlocked(
+                        f"compaction checkpoint persist failed: {request.id}"
+                    ) from exc
+    except _ManualCompactionRefused as refusal:
+        if refusal.code == "boundary_not_in_context":
+            return "control.rejected", "rejected", refusal.code, {}
+        raise ControlInboxBlocked(
+            f"compaction cannot run yet ({refusal.code}): {request.id}"
+        ) from refusal
+    except (ControlInboxBlocked, asyncio.CancelledError):
+        raise
+    except LeaseLostError as exc:
+        raise ControlInboxBlocked(f"compaction lost its lease: {request.id}") from exc
+    except Exception:
+        logger.warning(
+            "Manual compaction failed for control %s", request.id, exc_info=True
+        )
+        return "control.rejected", "rejected", "compaction_failed", {}
+
+    if outcome == "failed":
+        return "control.rejected", "rejected", "compaction_failed", {}
+    return (
+        "context.compacted",
+        "applied",
+        None,
+        _compaction_frame_params(
+            summary_text if outcome == "compacted" else None,
+            before,
+            after,
+            "manual",
+        ),
+    )
 
 
 def _scrub_secret_values(fragment: Any) -> Any:
@@ -15355,19 +10112,19 @@ async def _close_datasources_after_turn(
     release its resource cleanly. Polls the turn flag and closes as soon as
     the loop parks (or the session ends).
     """
-    from agent.core.datasource_setup import close_datasource_connections
+    from agent.connectors.connections import close_connections
 
     try:
         while _turn_in_flight():
             await asyncio.sleep(0.5)
-        close_datasource_connections(connections, clients)
+        close_connections(connections, clients)
         logger.info(
             "Closed %d replaced datasource connection(s) after turn end",
             len(connections),
         )
     except asyncio.CancelledError:
         # Shutdown teardown — close immediately; nothing left in flight.
-        close_datasource_connections(connections, clients)
+        close_connections(connections, clients)
         raise
     except Exception as e:
         logger.warning("Deferred datasource close failed: %s", e)
@@ -15538,7 +10295,7 @@ async def _handle_config_update(
     and on every error frame this handler emits, so a client with several
     in-flight updates can correlate outcomes (live_session_settings.md P0.3).
     """
-    global _session, _orchestrator_client, _thread_id
+    global _session, _orchestrator_client
 
     saved_snapshot = None
 
@@ -15615,11 +10372,11 @@ async def _handle_config_update(
         tools_update = bool(config_override.get("tools"))
         authorization_update = tools_update or ds_update or security_runtime_update
         effective_override = config_override
-        if _orchestrator_client and _thread_id:
+        if _orchestrator_client and _session_identity.thread_id:
             try:
                 execution_snapshot = getattr(_session, "execution_snapshot", None)
                 enriched = await _orchestrator_client.update_thread_config(
-                    _thread_id,
+                    _session_identity.thread_id,
                     config_override,
                     datasource_ids=datasource_ids,
                     snapshot_generation=(
@@ -15673,8 +10430,13 @@ async def _handle_config_update(
         # attach converges). Credentials never ride config_override — this
         # internal endpoint re-injects them per fetch.
         new_ds_payload: Optional[List[Dict[str, Any]]] = None
+        # Hidden connector SSH keys from the same response; consumed (popped
+        # and zeroed) by resetup_datasources, never merged into any config.
+        new_ssh_identities: Optional[List[Dict[str, Any]]] = None
         if ds_update:
-            ws_info = await _orchestrator_client.get_thread_workspace(_thread_id)
+            ws_info = await _orchestrator_client.get_thread_workspace(
+                _session_identity.thread_id
+            )
             if not isinstance(ws_info, dict):
                 await _send_error(
                     "Session connector update could not be applied",
@@ -15686,6 +10448,7 @@ async def _handle_config_update(
                 )
                 return
             new_ds_payload = ws_info.get("datasources") or []
+            new_ssh_identities = ws_info.pop("workspace_ssh_identities", None)
 
         # Live `config.update` is the same raw-override shape as the legacy
         # attach path above; normalise before both the merge and the markers.
@@ -15774,7 +10537,11 @@ async def _handle_config_update(
             # also covers a tools fragment riding the same frame. Replaced
             # connections stay open until the in-flight turn (if any) ends —
             # bound tools captured them in closures at load time.
-            ds_summary = await _session.resetup_datasources(new_ds_payload or [])
+            ds_summary = await _session.resetup_datasources(
+                new_ds_payload or [],
+                workspace_ssh_identities=new_ssh_identities,
+            )
+            new_ssh_identities = None
             stale_conns = ds_summary.pop("stale_connections", {})
             stale_clients = ds_summary.pop("stale_clients", {})
             if stale_conns or stale_clients:
@@ -15793,31 +10560,27 @@ async def _handle_config_update(
         # response" once the history exceeds the new model's window. See
         # knowledge-history/done/session_model_switch_stale_context_manager_empty_response.md.
         _session.refresh_context_limits()
+        # Same for what tools read at call time (multimodal, the model window,
+        # delegation settings): an llm-only update rebinds without a reload.
+        _session.refresh_tool_context_config()
+        # Except the delegate_agent description, which states the live cap and
+        # fan-out mode the runtime enforces: reload when it changed.
+        _session.refresh_delegation_description()
 
         # Rebuild auxiliary LLM if auxiliary settings changed. Symmetric to
         # the chat-side rebuild — the boot-time singleton on _agent doesn't
         # carry the new credentials, so we replace _session.auxiliary_llm
         # with a session-scoped instance.
         if effective_override.get("auxiliary"):
-            from shared.runtime.core.loader import LLMConfig, resolve_model_settings
+            from shared.runtime.core.loader import (
+                create_auxiliary_llms,
+                resolve_model_settings,
+            )
             from shared.runtime.services.auxiliary import AuxiliaryLLM
 
             aux_cfg = new_config.auxiliary
             model_settings = resolve_model_settings(
                 aux_cfg.model, new_config._deployment_dir
-            )
-            aux_llm_config = LLMConfig(
-                model=aux_cfg.model,
-                base_url=aux_cfg.base_url,
-                api_key=aux_cfg.api_key,
-                provider=aux_cfg.provider,
-                extra_headers=aux_cfg.extra_headers,
-                temperature=aux_cfg.temperature,
-                top_p=model_settings.get("top_p"),
-                top_k=model_settings.get("top_k"),
-                model_max_context_tokens=model_settings.get("model_max_context_tokens"),
-                extra_body=model_settings.get("extra_body"),
-                max_retries=1,
             )
             aux_structured_output_method = model_settings.get(
                 "structured_output_method", "json_schema"
@@ -15826,9 +10589,12 @@ async def _handle_config_update(
             fallback_settings = resolve_model_settings(
                 fallback_model, new_config._deployment_dir
             )
-            aux_inner = create_llm(aux_llm_config, new_config.limits)
+            aux_clients = create_auxiliary_llms(
+                aux_cfg, model_settings, new_config.limits
+            )
             _session.auxiliary_llm = AuxiliaryLLM(
-                llm=aux_inner,
+                llm=aux_clients.llm,
+                summarization_llm=aux_clients.summarization_llm,
                 max_iterations=aux_cfg.max_iterations,
                 timeout=aux_cfg.timeout,
                 max_context_tokens=model_settings.get("model_max_context_tokens"),
@@ -15936,36 +10702,23 @@ async def _handle_archive(ws: WebSocket) -> None:
             await _ws_send(ws, "error", {"message": "Session not ready"})
             return
 
-        archived_thread_id = _thread_id
-        archived_runtime_generation = _session_runtime_generation
-        archived_disposition = _terminal_retirement_disposition()
+        archived_thread_id = _session_identity.thread_id
+        archived_runtime_generation = _session_identity.session_generation
+        archived_disposition = _session_termination.terminal_retirement_disposition()
         # Close durable input/control/Resume admission before the first
         # teardown-side await. Memory, title, cloud sync and Git finalization
         # can all be slow; leaving the runtime live through those operations
         # would admit work that this archive path is already committed to
         # discarding. The orchestrator's exact generation/token transition is
         # the cross-process authority fence.
-        if not await _begin_exact_session_retirement(
+        if not await _session_termination.begin_retirement(
             retirement_disposition=archived_disposition,
         ):
             raise EventJournalUnavailable(
                 "session retirement admission could not be closed"
             )
 
-        # 0. Final cloud sync. No background poll to stop after Phase 1.
-        # Await the last turn's background push first (same contract as
-        # _terminate_session): no concurrent walk, no aclose under a push.
-        if _session.workspace_sync:
-            try:
-                await _await_pending_cloud_push()
-                await _session.workspace_sync.push_all()
-                await _session.workspace_sync.pull_all()
-            except Exception as e:
-                logger.warning(f"Final cloud sync failed (non-fatal): {e}")
-            try:
-                await _session.workspace_sync.aclose()
-            except Exception as e:
-                logger.debug(f"Cloud sync aclose failed (non-fatal): {e}")
+        # Common termination owns the once-only final cloud/Git flush.
 
         # 1. Extract final memories on the pinned lane. Stateless turns already
         # own durable per-turn obligations; a full-history teardown pass would
@@ -15981,7 +10734,7 @@ async def _handle_archive(ws: WebSocket) -> None:
         if (
             not _stateless_mode()
             and _session.memory_service is not None
-            and not _termination_admission_closed()
+            and not _session_termination.termination_admission_closed()
         ):
             from agent.services.memory import CaptureEvent
 
@@ -15994,7 +10747,7 @@ async def _handle_archive(ws: WebSocket) -> None:
             and recall_store
             and _session.auxiliary_llm
             and _session.messages
-            and not _termination_admission_closed()
+            and not _session_termination.termination_admission_closed()
         ):
             try:
                 from shared.runtime.services.auxiliary import extract_and_store_memories
@@ -16012,7 +10765,9 @@ async def _handle_archive(ws: WebSocket) -> None:
         # 2. Generate title if untitled
         if _session.postgres_conn:
             try:
-                thread = await _session.postgres_conn.get_thread(_thread_id)
+                thread = await _session.postgres_conn.get_thread(
+                    _session_identity.thread_id
+                )
                 current = thread.get("title", "") if thread else ""
                 if (
                     not current
@@ -16026,7 +10781,7 @@ async def _handle_archive(ws: WebSocket) -> None:
                         async with _session.postgres_conn.acquire() as conn:
                             await conn.execute(
                                 "UPDATE threads SET title = $2 WHERE id = $1",
-                                _thread_id,
+                                _session_identity.thread_id,
                                 title,
                             )
             except Exception as e:
@@ -16038,7 +10793,17 @@ async def _handle_archive(ws: WebSocket) -> None:
         # state, not a falsely ended one. The orchestrator journals the
         # authoritative terminal edge; this direct WS acknowledgement is only
         # a low-latency echo for the command issuer after settlement succeeds.
-        await _terminate_session("archive")
+        result = await _session_termination.terminate("archive")
+        if result == "actuator_requested":
+            await _ws_send(
+                ws,
+                "session.ending",
+                {
+                    "thread_id": archived_thread_id,
+                    "session_runtime_generation": archived_runtime_generation,
+                },
+            )
+            return
         terminal_params = {
             "thread_id": archived_thread_id,
             "session_runtime_generation": archived_runtime_generation,
@@ -16068,27 +10833,27 @@ async def _update_thread_status(
     retirement_permanent: Optional[bool] = None,
 ) -> bool:
     """Durably update status via REST, falling back when REST says ``False``."""
-    runtime_generation = _session_runtime_generation
-    runtime_attach_token = _session_runtime_attach_token
-    runtime_retirement_token = _retirement_admission_token
-    if not _stateless_mode() and _pinned_runtime_generation_enabled:
+    runtime_generation = _session_identity.session_generation
+    runtime_attach_token = _session_identity.attach_token
+    runtime_retirement_token = _session_termination.retirement_admission_token
+    if not _stateless_mode() and _session_identity.runtime_contract:
         if runtime_generation is None:
             logger.warning(
                 "Pinned runtime generation was advertised but no exact "
                 "generation is attached (thread=%s status=%s)",
-                _thread_id,
+                _session_identity.thread_id,
                 status,
             )
             return False
     if not _stateless_mode() and (
-        _pinned_status_identity_enabled or _pinned_runtime_generation_enabled
+        _session_identity.status_contract or _session_identity.runtime_contract
     ):
         exact_agent_id = pinned_agent_id or _registered_pinned_agent_id()
         if exact_agent_id is None:
             logger.warning(
                 "Pinned status identity was advertised but no registered "
                 "agent id is available (thread=%s status=%s)",
-                _thread_id,
+                _session_identity.thread_id,
                 status,
             )
             return False
@@ -16099,16 +10864,16 @@ async def _update_thread_status(
             or status not in {"active", "awaiting_user"}
             or _session is None
             or _session.postgres_conn is None
-            or _thread_id is None
+            or _session_identity.thread_id is None
         ):
             return False
-        lease_token = _current_stateless_lease_token()
+        lease_token = _session_identity.stateless_lease_token()
         if lease_token is None:
             return False
         try:
             return await update_stateless_claim_status(
                 _session.postgres_conn,
-                thread_id=_thread_id,
+                thread_id=_session_identity.thread_id,
                 lease_token=lease_token,
                 status=status,
             )
@@ -16116,19 +10881,19 @@ async def _update_thread_status(
             logger.warning(
                 "Exact-lease stateless status update failed "
                 "(thread=%s status=%s token=%s): %s",
-                _thread_id,
+                _session_identity.thread_id,
                 status,
                 lease_token,
                 exc,
             )
             return False
-    if _orchestrator_client and _thread_id:
+    if _orchestrator_client and _session_identity.thread_id:
         try:
             if pinned_agent_id is None:
                 if retirement_disposition is not None:
                     return False
                 updated = await _orchestrator_client.update_thread_status(
-                    _thread_id,
+                    _session_identity.thread_id,
                     status,
                 )
             else:
@@ -16145,13 +10910,16 @@ async def _update_thread_status(
                     if status not in {"ending", "ended"}:
                         return False
                     status_kwargs["retirement_permanent"] = retirement_permanent
-                if status == "ended" and _pinned_runtime_generation_enabled:
-                    identity = _attached_retirement_identity()
+                if status == "ended" and _session_identity.runtime_contract:
+                    identity = _session_identity.retirement_identity()
                     if (
                         identity is None
-                        or _retirement_admission_identity != identity
-                        or _retirement_admission_disposition != retirement_disposition
-                        or _retirement_admission_permanent is not retirement_permanent
+                        or _session_termination.retirement_admission_identity
+                        != identity
+                        or _session_termination.retirement_admission_disposition
+                        != retirement_disposition
+                        or _session_termination.retirement_admission_permanent
+                        is not retirement_permanent
                         or runtime_retirement_token is None
                         or _session is None
                     ):
@@ -16192,7 +10960,7 @@ async def _update_thread_status(
                             workspace_runtime_incarnation
                         )
                 updated = await _orchestrator_client.update_thread_status(
-                    _thread_id,
+                    _session_identity.thread_id,
                     status,
                     **status_kwargs,
                 )
@@ -16208,7 +10976,7 @@ async def _update_thread_status(
         return False
 
     # Fallback to direct DB
-    if _session and _session.postgres_conn and _thread_id:
+    if _session and _session.postgres_conn and _session_identity.thread_id:
         try:
             if pinned_agent_id is not None:
                 async with _session.postgres_conn.acquire() as conn:
@@ -16218,7 +10986,7 @@ async def _update_thread_status(
                             "runtime_attach_token "
                             "FROM threads "
                             "WHERE id = $1::uuid FOR UPDATE",
-                            _thread_id,
+                            _session_identity.thread_id,
                         )
                         if (
                             thread is None
@@ -16240,7 +11008,7 @@ async def _update_thread_status(
                             "SELECT 1 FROM agents WHERE id = $1::uuid "
                             "AND thread_id = $2::uuid FOR SHARE",
                             pinned_agent_id,
-                            _thread_id,
+                            _session_identity.thread_id,
                         )
                         if reciprocal is None:
                             return False
@@ -16277,7 +11045,7 @@ async def _update_thread_status(
                                 )
                                 + "AND status <> 'ended' RETURNING id"
                             )
-                            params = [_thread_id, pinned_agent_id]
+                            params = [_session_identity.thread_id, pinned_agent_id]
                             if runtime_generation is not None:
                                 params.append(runtime_generation)
                                 params.append(runtime_attach_token)
@@ -16303,7 +11071,7 @@ async def _update_thread_status(
                                 )
                                 + "AND status <> 'ended' RETURNING id"
                             )
-                            params = [_thread_id, pinned_agent_id]
+                            params = [_session_identity.thread_id, pinned_agent_id]
                             if runtime_generation is not None:
                                 params.append(runtime_generation)
                                 params.append(runtime_attach_token)
@@ -16312,436 +11080,17 @@ async def _update_thread_status(
                             return False
                         return updated is not None
             if status == "ended":
-                await _session.postgres_conn.end_thread(_thread_id)
+                await _session.postgres_conn.end_thread(_session_identity.thread_id)
                 return True
             else:
                 return bool(
                     await _session.postgres_conn.update_thread_status(
-                        _thread_id, status
+                        _session_identity.thread_id, status
                     )
                 )
         except Exception as e:
             logger.warning(f"Failed to update thread status to {status}: {e}")
     return False
-
-
-async def _reconcile_retirement_begin_or_reopen_controls(
-    *,
-    identity: tuple[str, Optional[str], Optional[str]],
-    exact_agent_id: str,
-    retirement_disposition: str,
-    retirement_permanent: bool,
-    begin_was_sent: bool,
-    reopen_if_uncommitted: bool,
-) -> bool:
-    """Resolve an ambiguous Begin before reopening durable controls.
-
-    The control inbox is closed before the HTTP Begin. A dropped response may
-    mean either no retirement exists (the same runtime must reopen controls) or
-    an exact T was authorized (the runtime must adopt it and quiesce). Only the
-    exact lifecycle projection and token-null reopen CAS may distinguish those
-    cases; a generic 409, timeout, or moved successor never authorizes reopen.
-    """
-
-    global _retirement_admission_identity, _retirement_admission_disposition
-    global _retirement_admission_token, _retirement_admission_permanent
-
-    if _attached_retirement_identity() != identity:
-        return False
-
-    async def reopen_exact_runtime() -> bool | None:
-        """Reopen durable controls and the already-settled child runtime.
-
-        The DB CAS proves this exact life is still token-null.  Child resume
-        then performs its own awaited effect-authority proof.  If that second
-        proof or the settled-state check fails, close controls again and latch
-        local admission: an otherwise-live session must not resume only half
-        of its execution surfaces.
-        """
-
-        global _retirement_admission_identity, _retirement_admission_disposition
-        global _retirement_admission_token, _retirement_admission_permanent
-
-        if _attached_retirement_identity() != identity:
-            return None
-        if (
-            _retirement_admission_identity == identity
-            and _retirement_admission_token is not None
-        ):
-            return None
-        if not await _set_pinned_control_admission(
-            agent_id=exact_agent_id,
-            open_for_admission=True,
-        ):
-            return None
-        if _retirement_admission_identity == identity:
-            # A prior local resume failure may have latched a token-less
-            # admission fence. The exact token-null CAS above proves that
-            # fence is now safe to clear before SessionHost re-proves effect
-            # authority. An authorized token is never reopenable here.
-            _retirement_admission_identity = None
-            _retirement_admission_disposition = None
-            _retirement_admission_token = None
-            _retirement_admission_permanent = None
-        session = _session
-        resume = getattr(session, "resume_subagents", None)
-        try:
-            if session is None or not callable(resume):
-                raise RuntimeError("session has no child-runtime resume boundary")
-            await resume()
-            if _session is not session or _attached_retirement_identity() != identity:
-                raise RuntimeError("session identity moved during child-runtime resume")
-            return True
-        except Exception:
-            logger.warning(
-                "Child runtime could not resume after retirement abort "
-                "(thread=%s agent=%s)",
-                identity[0],
-                exact_agent_id,
-                exc_info=True,
-            )
-            try:
-                if _attached_retirement_identity() == identity:
-                    await _set_pinned_control_admission(
-                        agent_id=exact_agent_id,
-                        open_for_admission=False,
-                    )
-            except Exception:
-                logger.warning(
-                    "Control admission re-close failed after child-runtime "
-                    "resume refusal (thread=%s agent=%s)",
-                    identity[0],
-                    exact_agent_id,
-                    exc_info=True,
-                )
-            if _attached_retirement_identity() == identity:
-                _retirement_admission_identity = identity
-                _retirement_admission_disposition = retirement_disposition
-                _retirement_admission_token = None
-                _retirement_admission_permanent = retirement_permanent
-            return False
-
-    if not begin_was_sent:
-        # No retirement request crossed the process boundary. Reopening still
-        # uses the exact token-null DB CAS: a concurrent owner Begin or a moved
-        # successor wins and leaves this process closed.
-        if reopen_if_uncommitted:
-            try:
-                await reopen_exact_runtime()
-            except Exception:
-                logger.warning(
-                    "Exact control admission reopen failed after local retirement "
-                    "preflight (thread=%s agent=%s)",
-                    identity[0],
-                    exact_agent_id,
-                    exc_info=True,
-                )
-        return False
-
-    client = _orchestrator_client
-    lifecycle_reader = getattr(client, "get_thread_lifecycle", None)
-    if not callable(lifecycle_reader):
-        # Begin may have committed. A missing outcome reader cannot prove that
-        # controls are safe to reopen, even if the transport reported failure.
-        return False
-
-    attempt = 0
-    while _attached_retirement_identity() == identity:
-        try:
-            lifecycle = await lifecycle_reader(identity[0])
-        except Exception as exc:
-            logger.warning(
-                "Exact retirement Begin reconciliation failed (thread=%s type=%s)",
-                identity[0],
-                type(exc).__name__,
-            )
-            return False
-        if not isinstance(lifecycle, dict):
-            return False
-        observed_generation = _canonical_runtime_generation(
-            lifecycle.get("session_runtime_generation")
-        )
-        observed_attach = _canonical_runtime_generation(
-            lifecycle.get("session_runtime_attach_token")
-        )
-        exact_life = bool(
-            observed_generation == identity[1] and observed_attach == identity[2]
-        )
-        if lifecycle.get("authority_refused") is True or not exact_life:
-            # A successor/moved owner must never be reopened by this actor.
-            return False
-        pending = lifecycle.get("runtime_retirement_pending") is True
-        preflight = lifecycle.get("runtime_retirement_preflight") is True
-        authorized = lifecycle.get("runtime_retirement_authorized") is True
-        if pending and authorized and lifecycle.get("status") == "ending":
-            token = _canonical_runtime_generation(
-                lifecycle.get("session_runtime_retirement_token")
-            )
-            if (
-                token is not None
-                and lifecycle.get("retirement_disposition") == retirement_disposition
-                and lifecycle.get("retirement_permanent") is retirement_permanent
-            ):
-                _retirement_admission_identity = identity
-                _retirement_admission_disposition = retirement_disposition
-                _retirement_admission_token = token
-                _retirement_admission_permanent = retirement_permanent
-                return True
-            # An authorized but malformed/conflicting immutable authority is
-            # not recoverable by this actor and must remain fail-closed.
-            return False
-        if (
-            not pending
-            and not preflight
-            and not authorized
-            and lifecycle.get("status")
-            in {
-                "created",
-                "active",
-                "awaiting_user",
-            }
-        ):
-            # This exact read proves no T at its snapshot. The reopen CAS
-            # repeats the same token-null predicate, so a Begin landing in
-            # between wins and forces another reconciliation iteration.
-            if not reopen_if_uncommitted:
-                return False
-            try:
-                reopened = await reopen_exact_runtime()
-                if reopened is not None:
-                    return False
-            except Exception:
-                logger.warning(
-                    "Exact control admission reopen raced retirement "
-                    "reconciliation (thread=%s agent=%s)",
-                    identity[0],
-                    exact_agent_id,
-                    exc_info=True,
-                )
-                return False
-        elif not (pending and preflight and not authorized):
-            # Only the server's hidden preflight is expected to remain
-            # unresolved until its TTL either authorizes or aborts it.
-            return False
-        delay = _EXACT_RETIREMENT_SETTLEMENT_RETRY_DELAYS[
-            min(attempt + 1, len(_EXACT_RETIREMENT_SETTLEMENT_RETRY_DELAYS) - 1)
-        ]
-        attempt += 1
-        if delay:
-            await asyncio.sleep(delay)
-    return False
-
-
-async def _begin_exact_session_retirement(
-    *,
-    pinned_agent_id: Optional[str] = None,
-    retirement_disposition: str = "ended",
-    retirement_permanent: bool = False,
-    reopen_controls_if_uncommitted: bool = True,
-) -> bool:
-    """Close admission for this exact pinned life and mirror it locally."""
-
-    global _retirement_admission_identity, _retirement_admission_disposition
-    global _retirement_admission_token
-    global _retirement_admission_permanent
-
-    if _stateless_mode() or _session is None:
-        return False
-    if retirement_disposition not in {"ended", "suspended"}:
-        return False
-    if type(retirement_permanent) is not bool:
-        return False
-    identity = _attached_retirement_identity()
-    if identity is None:
-        return False
-    # Close the whole parent admission surface before child quiescence. A
-    # timeout or ambiguous terminal-delivery write leaves the child runtime
-    # non-accepting; keeping parent providers/inputs open in that state would
-    # create a half-live session. The common termination owner retries this
-    # exact tokenless identity until child settlement and Begin converge.
-    if _retirement_admission_identity != identity:
-        _retirement_admission_identity = identity
-        _retirement_admission_disposition = retirement_disposition
-        _retirement_admission_token = None
-        _retirement_admission_permanent = retirement_permanent
-    # Child terminal/transcript writes require the still-current parent
-    # authority. Close child admission and settle every generation before the
-    # server installs the retirement token that revokes it.
-    try:
-        await _session.quiesce_subagents(
-            f"parent session retiring as {retirement_disposition}"
-        )
-    except Exception:
-        logger.warning(
-            "Session child runtime did not quiesce before retirement "
-            "(thread=%s disposition=%s)",
-            _thread_id,
-            retirement_disposition,
-            exc_info=True,
-        )
-        return False
-    # From this point onward every child is settled. Exact no-retirement
-    # reconciliation clears the tokenless latch and resumes both surfaces
-    # together; every other failure stays safely fail-closed.
-    if _retirement_admission_identity == identity:
-        if _retirement_admission_disposition != retirement_disposition:
-            return False
-        if _retirement_admission_permanent is not retirement_permanent:
-            return False
-        if _retirement_admission_token is not None:
-            return True
-        # The watchdog may have observed an authorised shape whose token was
-        # lost/malformed. Fall through to the idempotent exact Begin call and
-        # recover T before any local teardown effect.
-    exact_agent_id = pinned_agent_id or _registered_pinned_agent_id()
-    if exact_agent_id is not None:
-        # This is the sole pre-retirement operation. It serializes with public
-        # durable-control admission while the runtime token is still open and
-        # drains everything admitted before closure. Once `ending` installs a
-        # retirement token, the control owner fence intentionally refuses all
-        # further consumption; never move this drain after the status call.
-        try:
-            if not await _close_pinned_control_inbox(agent_id=exact_agent_id):
-                if _pinned_runtime_generation_enabled:
-                    return await _reconcile_retirement_begin_or_reopen_controls(
-                        identity=identity,
-                        exact_agent_id=exact_agent_id,
-                        retirement_disposition=retirement_disposition,
-                        retirement_permanent=retirement_permanent,
-                        begin_was_sent=False,
-                        reopen_if_uncommitted=reopen_controls_if_uncommitted,
-                    )
-                return False
-        except Exception:
-            logger.warning(
-                "Exact control preflight failed before retirement (thread=%s agent=%s)",
-                _thread_id,
-                exact_agent_id,
-                exc_info=True,
-            )
-            if _pinned_runtime_generation_enabled:
-                return await _reconcile_retirement_begin_or_reopen_controls(
-                    identity=identity,
-                    exact_agent_id=exact_agent_id,
-                    retirement_disposition=retirement_disposition,
-                    retirement_permanent=retirement_permanent,
-                    begin_was_sent=False,
-                    reopen_if_uncommitted=reopen_controls_if_uncommitted,
-                )
-            return False
-    retirement_token: str | None = None
-    if _pinned_runtime_generation_enabled:
-        if (
-            exact_agent_id is None
-            or _session_runtime_generation is None
-            or _session_runtime_attach_token is None
-            or _orchestrator_client is None
-        ):
-            if exact_agent_id is not None:
-                await _reconcile_retirement_begin_or_reopen_controls(
-                    identity=identity,
-                    exact_agent_id=exact_agent_id,
-                    retirement_disposition=retirement_disposition,
-                    retirement_permanent=retirement_permanent,
-                    begin_was_sent=False,
-                    reopen_if_uncommitted=reopen_controls_if_uncommitted,
-                )
-            return False
-        begin = getattr(_orchestrator_client, "begin_thread_retirement", None)
-        if not callable(begin):
-            await _reconcile_retirement_begin_or_reopen_controls(
-                identity=identity,
-                exact_agent_id=exact_agent_id,
-                retirement_disposition=retirement_disposition,
-                retirement_permanent=retirement_permanent,
-                begin_was_sent=False,
-                reopen_if_uncommitted=reopen_controls_if_uncommitted,
-            )
-            return False
-        try:
-            response = await begin(
-                str(_thread_id),
-                pinned_agent_id=exact_agent_id,
-                session_runtime_generation=_session_runtime_generation,
-                session_runtime_attach_token=_session_runtime_attach_token,
-                retirement_disposition=retirement_disposition,
-                retirement_permanent=retirement_permanent,
-            )
-        except Exception:
-            logger.warning(
-                "Exact retirement Begin transport failed (thread=%s agent=%s)",
-                identity[0],
-                exact_agent_id,
-                exc_info=True,
-            )
-            return await _reconcile_retirement_begin_or_reopen_controls(
-                identity=identity,
-                exact_agent_id=exact_agent_id,
-                retirement_disposition=retirement_disposition,
-                retirement_permanent=retirement_permanent,
-                begin_was_sent=True,
-                reopen_if_uncommitted=reopen_controls_if_uncommitted,
-            )
-        if not isinstance(response, dict):
-            return await _reconcile_retirement_begin_or_reopen_controls(
-                identity=identity,
-                exact_agent_id=exact_agent_id,
-                retirement_disposition=retirement_disposition,
-                retirement_permanent=retirement_permanent,
-                begin_was_sent=True,
-                reopen_if_uncommitted=reopen_controls_if_uncommitted,
-            )
-        if (
-            response.get("status") != "ending"
-            or response.get("retirement_disposition") != retirement_disposition
-            or response.get("retirement_permanent") is not retirement_permanent
-        ):
-            return await _reconcile_retirement_begin_or_reopen_controls(
-                identity=identity,
-                exact_agent_id=exact_agent_id,
-                retirement_disposition=retirement_disposition,
-                retirement_permanent=retirement_permanent,
-                begin_was_sent=True,
-                reopen_if_uncommitted=reopen_controls_if_uncommitted,
-            )
-        retirement_token = _canonical_runtime_generation(
-            response.get("session_runtime_retirement_token")
-        )
-        if retirement_token is None:
-            return await _reconcile_retirement_begin_or_reopen_controls(
-                identity=identity,
-                exact_agent_id=exact_agent_id,
-                retirement_disposition=retirement_disposition,
-                retirement_permanent=retirement_permanent,
-                begin_was_sent=True,
-                reopen_if_uncommitted=reopen_controls_if_uncommitted,
-            )
-    else:
-        if not await _update_thread_status(
-            "ending",
-            pinned_agent_id=exact_agent_id,
-            retirement_disposition=retirement_disposition,
-            retirement_permanent=retirement_permanent,
-        ):
-            if exact_agent_id is not None:
-                await _reconcile_retirement_begin_or_reopen_controls(
-                    identity=identity,
-                    exact_agent_id=exact_agent_id,
-                    retirement_disposition=retirement_disposition,
-                    retirement_permanent=retirement_permanent,
-                    begin_was_sent=False,
-                    reopen_if_uncommitted=reopen_controls_if_uncommitted,
-                )
-            return False
-    # The server fenced the captured G/token. Never mirror that fence onto a
-    # successor attached while the request was in flight.
-    if _session is None or _attached_retirement_identity() != identity:
-        return False
-    _retirement_admission_identity = identity
-    _retirement_admission_disposition = retirement_disposition
-    _retirement_admission_token = retirement_token
-    _retirement_admission_permanent = retirement_permanent
-    return True
 
 
 async def _handle_idle_archive(ws: Optional[WebSocket] = None) -> None:
@@ -16754,12 +11103,12 @@ async def _handle_idle_archive(ws: Optional[WebSocket] = None) -> None:
         if not _session:
             return
 
-        idle_thread_id = _thread_id
+        idle_thread_id = _session_identity.thread_id
         # Idle exit is just as terminal as an explicit /done. Close exact
         # runtime admission before memory/title/Git awaits so a late control
         # or user input cannot enter behind the decision to retire.
-        if not await _begin_exact_session_retirement(
-            retirement_disposition=_terminal_retirement_disposition(),
+        if not await _session_termination.begin_retirement(
+            retirement_disposition=_session_termination.terminal_retirement_disposition(),
             # IdleTimeoutError means the loop has already returned. Keep the
             # gate closed and let common termination's exact retry owner retry
             # Begin; reopening here would admit work with no loop consumer.
@@ -16784,7 +11133,7 @@ async def _handle_idle_archive(ws: Optional[WebSocket] = None) -> None:
         if (
             not _stateless_mode()
             and _session.memory_service is not None
-            and not _termination_admission_closed()
+            and not _session_termination.termination_admission_closed()
         ):
             from agent.services.memory import CaptureEvent
 
@@ -16797,7 +11146,7 @@ async def _handle_idle_archive(ws: Optional[WebSocket] = None) -> None:
             and recall_store
             and _session.auxiliary_llm
             and _session.messages
-            and not _termination_admission_closed()
+            and not _session_termination.termination_admission_closed()
         ):
             try:
                 from shared.runtime.services.auxiliary import extract_and_store_memories
@@ -16815,7 +11164,9 @@ async def _handle_idle_archive(ws: Optional[WebSocket] = None) -> None:
         # 1. Generate title if untitled
         if _session.postgres_conn:
             try:
-                thread = await _session.postgres_conn.get_thread(_thread_id)
+                thread = await _session.postgres_conn.get_thread(
+                    _session_identity.thread_id
+                )
                 current = thread.get("title", "") if thread else ""
                 if (
                     not current
@@ -16829,302 +11180,26 @@ async def _handle_idle_archive(ws: Optional[WebSocket] = None) -> None:
                         async with _session.postgres_conn.acquire() as conn:
                             await conn.execute(
                                 "UPDATE threads SET title = $2 WHERE id = $1",
-                                _thread_id,
+                                _session_identity.thread_id,
                                 title,
                             )
             except Exception as e:
                 logger.warning(f"Idle title generation failed: {e}")
 
-        # 2. Git commit + push. The caller immediately enters common teardown,
-        # which alone closes admission, drains controls, and performs the exact
-        # pinned-owner lifecycle CAS.
-        if _session.workspace_manager:
-            git_mgr = getattr(_session.workspace_manager, "git_manager", None)
-            if git_mgr and git_mgr.is_active:
-                try:
-                    if git_mgr.has_uncommitted_changes():
-                        git_mgr.commit(f"Idle timeout: thread {_thread_id}")
-                    git_mgr.push()
-                except Exception as e:
-                    logger.warning(f"Idle git push failed: {e}")
+        # Common termination owns the once-only final Git flush.
 
         # 3. Close durable admission/Resume, then settle the exact retirement
         # before reporting completion. The orchestrator's settlement owns the
         # durable ``session.ended`` journal edge. Publishing an agent-local
         # terminal frame earlier would make a failed settlement look ended and
         # could let Cockpit reopen Resume while cleanup is still in flight.
-        await _terminate_session("idle_timeout")
-
+        result = await _session_termination.terminate("idle_timeout")
+        if result == "actuator_requested":
+            logger.info("Idle archive awaiting VM stop: thread=%s", idle_thread_id)
+            return
         logger.info(f"Idle archive complete: thread={idle_thread_id}")
     except Exception as e:
         logger.warning(f"Idle archive failed: {e}")
-
-
-async def _poll_workspace_ready(
-    client: Any,
-    thread_id: str,
-    timeout: int = 120,
-    poll_interval: float = 2.0,
-    *,
-    raise_on_denied: bool = False,
-    vm_timeout: int = _vm_upgrade_poll_timeout,
-    require_vm: bool = False,
-) -> Optional[Dict[str, Any]]:
-    """Poll orchestrator for workspace container readiness.
-
-    ``vm_timeout`` is the extended budget applied automatically once the poll
-    observes a VM-backed thread in flight (``vm_status`` provisioning/created):
-    a cold KubeVirt boot (CDI import + guest boot) routinely runs minutes past
-    the sandbox-container ``timeout`` default, so the deadline self-extends
-    rather than declaring a still-booting VM "not ready"
-    (knowledge-base/knowledge/features/session_create_on_vm.md).
-
-    ``require_vm`` makes the VM the ONLY acceptable answer: a ready sandbox
-    container is refused (and logged as a provisioning leak) instead of being
-    returned. Checking ``vm_status`` first is not sufficient on its own — within
-    a single iteration a not-yet-ready VM falls through to the container branch,
-    and since a container is ready in ~8 s against a multi-minute VM boot it wins
-    that race every time. Callers pass this when the thread's resolved tier is
-    ``vm``; the sandbox-upgrade caller deliberately does not
-    (knowledge-base/knowledge/issues/session_vm_backend_never_attaches.md Defect 2).
-
-    Returns:
-        Workspace config dict {"backend": "remote", "remote": {host, port, ...}}
-        or None if timeout, unavailable, or no workspace provisioned.
-    """
-    import time
-
-    start = time.monotonic()
-    deadline = start + timeout
-    _vm_budget_applied = False
-
-    while time.monotonic() < deadline:
-        ws = await client.get_thread_workspace(
-            thread_id, raise_on_denied=raise_on_denied
-        )
-        if not ws:
-            # The client collapses every non-200 to None. For a vm-tier
-            # session that includes a transient 5xx from the orchestrator
-            # (a restart, or a repository authority that is briefly
-            # unavailable) and bailing here mis-reports a booting VM as
-            # "never became ready" while releasing the pinned agent — the
-            # VM budget bounds the retry instead.
-            if require_vm:
-                logger.warning(
-                    "Thread %s: workspace status unavailable — retrying within "
-                    "the VM budget.",
-                    thread_id,
-                )
-                await asyncio.sleep(poll_interval)
-                continue
-            return None
-
-        protected_delivery = _protected_workspace_delivery(ws)
-        if protected_delivery == "engaging":
-            await asyncio.sleep(poll_interval)
-            continue
-
-        # SSH key: orchestrator sends the path it resolved (dev compose
-        # key or K8s secret mount); fall back to the K8s default.
-        ssh_key = ws.get("ssh_key_path") or "/run/secrets/vm-ssh-key"
-
-        # Check VM workspace first (takes precedence over container)
-        vm_status = ws.get("vm_status")
-
-        # A VM-backed thread pays a cold KubeVirt boot far beyond the
-        # sandbox-container default. Extend the poll deadline ONCE the moment we
-        # observe the VM is in flight so a legitimate cold boot isn't declared
-        # "not ready" — self-adjusting, no caller signal needed.
-        if not _vm_budget_applied and vm_status in ("provisioning", "created"):
-            deadline = start + max(timeout, vm_timeout)
-            _vm_budget_applied = True
-            logger.info(
-                "Thread %s: VM workspace provisioning detected — extending "
-                "workspace readiness budget to %ss.",
-                thread_id,
-                max(timeout, vm_timeout),
-            )
-        if vm_status == "ready" and ws.get("vm_ssh_host"):
-            return {
-                "backend": "vm",
-                # Server-derived provisioner authority must survive this
-                # normalization boundary. PersistentSession deliberately does
-                # not trust the provisioner from agent config.
-                "workspace_provisioner": ws.get("workspace_provisioner"),
-                "workspace_generation": ws.get("workspace_generation"),
-                "workspace_runtime_incarnation": ws.get(
-                    "workspace_runtime_incarnation"
-                ),
-                # VM endpoints retain the historical AutoAddPolicy path; Slice
-                # 2 admits no stateless VM claimant with a pinned pod identity.
-                "workspace_ssh_host_key_fingerprint": None,
-                # Slice 1 has no trusted VM host-identity adapter.
-                "canvas_presentation_available": False,
-                "canvas_live_apps_available": False,
-                "canvas_shared_browser_available": False,
-                "remote": {
-                    "host": ws["vm_ssh_host"],
-                    "port": ws.get("vm_ssh_port", 22),
-                    "username": "agent-host",
-                    "key_path": ssh_key,
-                    "workspace_path": "/home/agent-host/workspace",
-                },
-                "git_remote_url": ws.get("git_remote_url"),
-                "managed_repository_credentials": ws.get(
-                    "managed_repository_credentials"
-                ),
-                "repositories": ws.get("repositories"),
-                "config_override": ws.get("config_override"),
-                "project_ids": ws.get("project_ids") or [],
-                "datasources": ws.get("datasources"),
-                "nc_session_folder": ws.get("nc_session_folder"),
-                "cloud_sync": ws.get("cloud_sync"),
-                "cloud_mount": ws.get("cloud_mount"),
-                "cloud_sync_degraded": ws.get("cloud_sync_degraded"),
-                # F-C1: carried through so _attach_session can fail-close the
-                # legacy nc_session_folder sync shim for protected threads.
-                "protected_cloud": ws.get("protected_cloud"),
-                "protected_cloud_state": ws.get("protected_cloud_state"),
-                "protected_cloud_error_code": ws.get("protected_cloud_error_code"),
-            }
-
-        # A vm-tier thread accepts no substitute. Bail on a terminal VM instead
-        # of burning the full VM budget — the pre-existing 'failed' bail below
-        # also requires the CONTAINER to have failed, which never happens on a
-        # thread that (correctly) has no container.
-        if require_vm:
-            if not vm_status:
-                # No VM context at all on a vm-tier thread — provisioning was
-                # never requested (create_thread sets vm.status='provisioning'
-                # synchronously before the agent can poll, and it persists across
-                # resume). Terminal, so fail fast rather than sitting out the
-                # budget; mirrors the container branch's status=='none' bail.
-                logger.warning(
-                    "Thread %s: vm-tier session has no VM context — no VM was "
-                    "ever provisioned for it.",
-                    thread_id,
-                )
-                return None
-            if vm_status == "failed":
-                logger.warning(
-                    "Thread %s: VM provisioning failed — not falling back to a "
-                    "container (vm-tier session).",
-                    thread_id,
-                )
-                return None
-            if ws.get("status") == "ready" and ws.get("pod_ip"):
-                # A container exists for a vm-tier thread: a provisioning leak
-                # (see Defect 1). Refuse it — attaching here is precisely the
-                # silent wrong-tier downgrade this guard exists to prevent.
-                logger.warning(
-                    "Thread %s: ignoring a ready workspace container on a vm-tier "
-                    "session (pod %s) — this container should not exist; waiting "
-                    "for the VM instead.",
-                    thread_id,
-                    ws.get("pod_ip"),
-                )
-            await asyncio.sleep(poll_interval)
-            continue
-
-        # Check container workspace
-        status = ws.get("status", "none")
-
-        if status == "ready" and ws.get("pod_ip"):
-            workspace_generation = ws.get("workspace_generation")
-            workspace_runtime_incarnation = ws.get("workspace_runtime_incarnation")
-            workspace_ssh_host_key_fingerprint = ws.get(
-                "workspace_ssh_host_key_fingerprint"
-            )
-            if not workspace_generation or not workspace_runtime_incarnation:
-                # Never let a detached fingerprint look like independently
-                # usable authority. Stateless setup consumes one triplet.
-                workspace_ssh_host_key_fingerprint = None
-            return {
-                "backend": "sandbox",
-                # This is orchestrator authority, not an inference from the
-                # normalized backend label. Dropping it makes every sandbox
-                # attach fail closed before its first model call.
-                "workspace_provisioner": ws.get("workspace_provisioner"),
-                # Preserve the authoritative protected-ready tuple through
-                # normalization.  `_attach_session_inner` revalidates the
-                # normalized response immediately before constructing
-                # PersistentSession; dropping status/pod coordinates here
-                # would turn a valid protected answer into an ambiguous one.
-                "status": "ready",
-                "pod_ip": ws["pod_ip"],
-                "pod_port": ws.get("pod_port") or 30022,
-                "ssh_key_path": ssh_key,
-                "pinned_status_identity_contract": ws.get(
-                    "pinned_status_identity_contract"
-                ),
-                "pinned_runtime_generation_contract": ws.get(
-                    "pinned_runtime_generation_contract"
-                ),
-                "session_runtime_generation": ws.get("session_runtime_generation"),
-                "workspace_generation": workspace_generation,
-                "workspace_runtime_incarnation": workspace_runtime_incarnation,
-                "workspace_ssh_host_key_fingerprint": (
-                    workspace_ssh_host_key_fingerprint
-                ),
-                # This is an orchestrator-attested capability, not a property
-                # inferred from the backend label or endpoint reachability.
-                "canvas_presentation_available": (
-                    ws.get("canvas_presentation_available") is True
-                ),
-                "canvas_live_apps_available": (
-                    ws.get("canvas_live_apps_available") is True
-                ),
-                "canvas_shared_browser_available": (
-                    ws.get("canvas_shared_browser_available") is True
-                ),
-                "remote": {
-                    "host": ws["pod_ip"],
-                    "port": ws.get("pod_port") or 30022,
-                    "username": "agent-host",
-                    "key_path": ssh_key,
-                    "workspace_path": "/home/agent-host/workspace",
-                },
-                "git_remote_url": ws.get("git_remote_url"),
-                "managed_repository_credentials": ws.get(
-                    "managed_repository_credentials"
-                ),
-                "repositories": ws.get("repositories"),
-                "config_override": ws.get("config_override"),
-                "project_ids": ws.get("project_ids") or [],
-                "datasources": ws.get("datasources"),
-                "nc_session_folder": ws.get("nc_session_folder"),
-                "cloud_sync": ws.get("cloud_sync"),
-                "cloud_mount": ws.get("cloud_mount"),
-                "cloud_sync_degraded": ws.get("cloud_sync_degraded"),
-                # F-C1: see comment above (vm branch).
-                "protected_cloud": ws.get("protected_cloud"),
-                "protected_cloud_state": ws.get("protected_cloud_state"),
-                "protected_cloud_error_code": ws.get("protected_cloud_error_code"),
-            }
-        if status == "failed" and (not vm_status or vm_status == "failed"):
-            # The internal readiness response can carry the one-shot managed
-            # repository authority bundle once a runtime is ready.  Never log
-            # the response object on a terminal/error branch: a mixed-version
-            # or racing response could otherwise put encrypted-handoff
-            # plaintext in pod logs.  Status fields are sufficient to diagnose
-            # the provisioning failure.
-            logger.warning(
-                "Workspace provisioning failed for thread %s "
-                "(container_status=%s, vm_status=%s)",
-                thread_id,
-                status,
-                vm_status or "none",
-            )
-            return None
-        if status == "none" and not vm_status:
-            # No workspace provisioned for this thread (no K8s)
-            return None
-
-        # Still creating — wait and poll again
-        await asyncio.sleep(poll_interval)
-
-    logger.warning(f"Workspace polling timed out after {timeout}s")
-    return None
 
 
 def _upgrade_already_satisfied(src_backend: Any, target_tier: str) -> bool:
@@ -17167,9 +11242,10 @@ async def _handle_vm_upgrade(ws: WebSocket) -> None:
 
 
 async def _handle_workspace_upgrade(
-    ws: WebSocket, target_tier: str = "sandbox"
+    ws: WebSocket, target_tier: str | None = None, template: str | None = None
 ) -> None:
-    """Handle a lite (``virtual``) → ``sandbox`` workspace upgrade from cockpit.
+    """Handle a lite (``virtual``) → ``sandbox``/``vm`` workspace upgrade from
+    cockpit, optionally to a named template.
 
     The live, in-process counterpart to the worker freeze→re-dispatch path
     (``workspace_tier_upgrade.md`` §4.2 S3): provision a real workspace
@@ -17185,8 +11261,14 @@ async def _handle_workspace_upgrade(
     ``_poll_vm_ready``, builds the backend with ``sudo_action="allow"``, seeds +
     swaps as usual, and re-opens the shell-layer sudo gate after the swap. (The
     pre-existing ``_handle_vm_upgrade`` stays the sandbox→vm sudo-escalation path.)
+
+    A ``template`` always resolves to the ``vm`` tier client-side — the
+    orchestrator refuses a template of any other tier — and its refusal text
+    (e.g. an unavailable container-tier template, a tier that isn't higher, an
+    unknown name) is surfaced verbatim as the ``workspace_upgrade.failed``
+    reason.
     """
-    if not _session or not _orchestrator_client or not _thread_id:
+    if not _session or not _orchestrator_client or not _session_identity.thread_id:
         await _ws_send(ws, "workspace_upgrade.failed", {"reason": "Session not ready"})
         return
 
@@ -17207,7 +11289,16 @@ async def _handle_workspace_upgrade(
         )
         return
 
-    target_tier = target_tier or "sandbox"
+    src_backend = (
+        _session.workspace_manager.backend if _session.workspace_manager else None
+    )
+
+    if template:
+        target_tier = "vm"  # the orchestrator refuses a template of any other tier
+    elif not target_tier:
+        # The in-process container swap below is refused on this lane, so the
+        # next tier a lite Session can actually reach is a VM.
+        target_tier = "vm"
     if target_tier == "sandbox":
         # The old in-process swap has no durable receipt spanning Pod
         # attestation, repository-key delivery, and seed writes. Fail before
@@ -17217,8 +11308,9 @@ async def _handle_workspace_upgrade(
             "workspace_upgrade.failed",
             {
                 "reason": (
-                    "Kubernetes hot workspace upgrades require exact runtime "
-                    "authority; use the normal pause/redispatch path"
+                    "Container upgrades aren't available in this session. Use "
+                    "/upgrade-workspace vm, or start a new Session with a "
+                    "container workspace."
                 )
             },
         )
@@ -17226,14 +11318,10 @@ async def _handle_workspace_upgrade(
     await _ws_send(
         ws,
         "workspace_upgrade.started",
-        {"thread_id": _thread_id, "target_tier": target_tier},
+        {"thread_id": _session_identity.thread_id, "target_tier": target_tier},
     )
 
     try:
-        src_backend = (
-            _session.workspace_manager.backend if _session.workspace_manager else None
-        )
-
         # Already serves the requested tier — nothing to upgrade (idempotent).
         # Tier-aware: a sandbox source does NOT satisfy a vm target (sandbox is
         # shell-capable but unprivileged), so sandbox→vm falls through to provision
@@ -17243,7 +11331,7 @@ async def _handle_workspace_upgrade(
                 ws,
                 "workspace_upgrade.complete",
                 {
-                    "thread_id": _thread_id,
+                    "thread_id": _session_identity.thread_id,
                     "target_tier": target_tier,
                     "message": f"Workspace already provides the {target_tier} tier",
                 },
@@ -17251,21 +11339,21 @@ async def _handle_workspace_upgrade(
             return
 
         # 1. Request provisioning via orchestrator (S2).
-        ok = await _orchestrator_client.request_thread_workspace_upgrade(
-            _thread_id, target_tier=target_tier
+        ok, detail = await _orchestrator_client.request_thread_workspace_upgrade(
+            _session_identity.thread_id, target_tier=target_tier, template=template
         )
         if not ok:
             await _ws_send(
                 ws,
                 "workspace_upgrade.failed",
-                {"reason": "Orchestrator rejected workspace upgrade request"},
+                {"reason": detail or "Orchestrator rejected workspace upgrade request"},
             )
             return
 
         # 2. Poll for readiness, then normalize to a {"backend", "remote"} block.
         #    A vm provisions through metadata.vm (vm_status), which _poll_vm_ready
         #    tolerates through the async provisioning window and bails promptly on
-        #    'failed'; _poll_workspace_ready would mis-bail on the still-empty
+        #    'failed'; poll_workspace_ready would mis-bail on the still-empty
         #    container status. Sandbox keeps the container poller (returns the
         #    block directly).
         if target_tier == "vm":
@@ -17277,7 +11365,7 @@ async def _handle_workspace_upgrade(
                     ws,
                     "workspace_upgrade.progress",
                     {
-                        "thread_id": _thread_id,
+                        "thread_id": _session_identity.thread_id,
                         "target_tier": "vm",
                         "elapsed_s": elapsed_s,
                         "timeout_s": _vm_upgrade_poll_timeout,
@@ -17286,7 +11374,7 @@ async def _handle_workspace_upgrade(
 
             vm_cfg = await _poll_vm_ready(
                 _orchestrator_client,
-                _thread_id,
+                _session_identity.thread_id,
                 timeout=_vm_upgrade_poll_timeout,
                 progress_cb=_emit_vm_progress,
             )
@@ -17306,8 +11394,11 @@ async def _handle_workspace_upgrade(
                 else None
             )
         else:
-            ws_config = await _poll_workspace_ready(
-                _orchestrator_client, _thread_id, timeout=300
+            ws_config = await _session_workspace.poll_workspace_ready(
+                _orchestrator_client,
+                _session_identity.thread_id,
+                timeout=300,
+                session_runtime_generation=None,
             )
         if not ws_config or not ws_config.get("remote"):
             # A vm that never came ready (usually the cold ~2.8GB CDI import
@@ -17317,10 +11408,12 @@ async def _handle_workspace_upgrade(
             # `kubectl delete` (workspace_tier_upgrade.md Q7). Best-effort.
             if target_tier == "vm":
                 try:
-                    await _orchestrator_client.abort_thread_vm_upgrade(_thread_id)
+                    await _orchestrator_client.abort_thread_vm_upgrade(
+                        _session_identity.thread_id
+                    )
                 except Exception as e:
                     logger.warning(
-                        f"VM abort/teardown after failed upgrade ({_thread_id}): {e}"
+                        f"VM abort/teardown after failed upgrade ({_session_identity.thread_id}): {e}"
                     )
             await _ws_send(
                 ws,
@@ -17360,7 +11453,7 @@ async def _handle_workspace_upgrade(
             username=remote.get("username", "agent-host"),
             key_path=remote.get("key_path"),
             workspace_path=remote.get("workspace_path", "/home/agent-host/workspace"),
-            job_id=_thread_id,
+            job_id=_session_identity.thread_id,
             default_timeout=shell_config.get("default_timeout", 120),
             max_tabs=shell_config.get("max_tabs", 15),
             connect_timeout=remote.get("connect_timeout", 30),
@@ -17407,21 +11500,35 @@ async def _handle_workspace_upgrade(
             # backing+runtime fence used on a cold attach protects hot upgrades.
             await asyncio.to_thread(new_backend.claim_shell_owner)
 
-        # 5. Seed the new workspace from the live virtual prefix (S3a). Pure
-        #    in-process copy (the agent holds the object-store creds). Run off
-        #    the event loop — SFTP writes are blocking.
-        seeded = 0
-        if src_backend is not None:
-            from agent.core.backends.seed import seed_workspace
+        # 5-6 run outside any live connector change: its checkouts clone off
+        # the event loop onto the current backend, so one landing during the
+        # seed would reach the new workspace half done, and the swap
+        # re-delivers the connectors that change has applied. A change that
+        # arrives meanwhile waits for the swap (it never waits on us: neither
+        # step takes anything a live change holds).
+        live_change = getattr(_session, "_live_connector_lock", None)
+        async with (
+            live_change
+            if isinstance(live_change, asyncio.Lock)
+            else contextlib.nullcontext()
+        ):
+            # 5. Seed the new workspace from the live virtual prefix (S3a).
+            #    Pure in-process copy (the agent holds the object-store creds).
+            #    Run off the event loop — SFTP writes are blocking.
+            seeded = 0
+            if src_backend is not None:
+                from agent.core.backends.seed import seed_workspace
 
-            seeded = await asyncio.to_thread(seed_workspace, src_backend, new_backend)
-            logger.info(
-                f"Seeded {seeded} file(s) into upgraded workspace for {_thread_id}"
-            )
+                seeded = await asyncio.to_thread(
+                    seed_workspace, src_backend, new_backend
+                )
+                logger.info(
+                    f"Seeded {seeded} file(s) into upgraded workspace for {_session_identity.thread_id}"
+                )
 
-        # 6. Hot-swap + re-derive the toolset (S1) so shell/git/file tools
-        #    appear on the next turn (get_current_tools re-reads per turn).
-        _session.swap_backend(new_backend)
+            # 6. Hot-swap + re-derive the toolset (S1) so shell/git/file tools
+            #    appear on the next turn (get_current_tools re-reads per turn).
+            _session.swap_backend(new_backend)
 
         # 6a. Re-establish the OpenCloud cloud mount on the NEW backend. The
         #     mount is a per-host rclone process, so it does NOT follow the
@@ -17433,8 +11540,14 @@ async def _handle_workspace_upgrade(
         #     a remount failure must not abort the otherwise-successful upgrade.
         #     See knowledge-base/knowledge/issues/workspace_upgrade_drops_cloud_mount.md.
         try:
-            _ws_info = await _orchestrator_client.get_thread_workspace(_thread_id)
-            _fresh_cloud_mount = _ws_info.get("cloud_mount") if _ws_info else None
+            _ws_info = await _orchestrator_client.get_thread_workspace(
+                _session_identity.thread_id
+            )
+            _fresh_cloud_mount = (
+                (_ws_info.get("cloud_mount") or _ws_info.get("cloud_mount_sidecar"))
+                if _ws_info
+                else None
+            )
             if _fresh_cloud_mount:
                 if _session.cloud_mount_manager is not None:
                     await _session.cloud_mount_manager.aclose()
@@ -17447,12 +11560,20 @@ async def _handle_workspace_upgrade(
                         ws,
                         "workspace_upgrade.cloud_mount_degraded",
                         {
-                            "thread_id": _thread_id,
+                            "thread_id": _session_identity.thread_id,
                             "reason": _session.cloud_mount_error or "mount inactive",
                         },
                     )
+            elif _ws_info:
+                # Nothing mounts on the new runtime: each attached folder it
+                # left out is named in the prompt, not the old runtime's set.
+                _session._note_undelivered_cloud_folders(
+                    _ws_info.get("cloud_folders_excluded")
+                )
         except Exception as e:
-            logger.warning(f"Cloud remount after upgrade failed ({_thread_id}): {e}")
+            logger.warning(
+                f"Cloud remount after upgrade failed ({_session_identity.thread_id}): {e}"
+            )
 
         _session.resetup_tools_for_backend()
 
@@ -17474,7 +11595,7 @@ async def _handle_workspace_upgrade(
         #    not a virtual. Deep-merged into metadata.config_override; non-fatal.
         try:
             await _orchestrator_client.update_thread_config(
-                _thread_id, {"workspace": {"backend": backend_tier}}
+                _session_identity.thread_id, {"workspace": {"backend": backend_tier}}
             )
         except Exception as e:
             logger.warning(f"Persisting upgraded tier failed (non-fatal): {e}")
@@ -17483,17 +11604,19 @@ async def _handle_workspace_upgrade(
             ws,
             "workspace_upgrade.complete",
             {
-                "thread_id": _thread_id,
+                "thread_id": _session_identity.thread_id,
                 "target_tier": backend_tier,
                 "seeded_files": seeded,
             },
         )
         logger.info(
-            f"Workspace upgrade ({backend_tier}) complete for thread {_thread_id}"
+            f"Workspace upgrade ({backend_tier}) complete for thread {_session_identity.thread_id}"
         )
 
     except Exception as e:
-        logger.exception(f"Workspace upgrade failed for thread {_thread_id}")
+        logger.exception(
+            f"Workspace upgrade failed for thread {_session_identity.thread_id}"
+        )
         # A failure AFTER the vm was provisioned (e.g. the seed or swap step,
         # once vm_status was already ready) would otherwise leak the running VM —
         # only the poll-timeout path tore it down before. Tear it down here too
@@ -17501,10 +11624,12 @@ async def _handle_workspace_upgrade(
         # ready VM (workspace_tier_upgrade.md Q7).
         if target_tier == "vm" and _orchestrator_client is not None:
             try:
-                await _orchestrator_client.abort_thread_vm_upgrade(_thread_id)
+                await _orchestrator_client.abort_thread_vm_upgrade(
+                    _session_identity.thread_id
+                )
             except Exception as ee:
                 logger.warning(
-                    f"VM teardown after upgrade failure ({_thread_id}): {ee}"
+                    f"VM teardown after upgrade failure ({_session_identity.thread_id}): {ee}"
                 )
         await _ws_send(ws, "workspace_upgrade.failed", {"reason": str(e)})
 
@@ -17640,7 +11765,7 @@ def _title_looks_conversational(title: str) -> bool:
 
 async def _generate_title(messages: List[Any], auxiliary_llm: Any) -> Optional[str]:
     """Generate a short title from conversation using AuxiliaryLLM."""
-    if _termination_admission_closed():
+    if _session_termination.termination_admission_closed():
         logger.debug("Title generation skipped: termination admission is closed")
         return None
     if not auxiliary_llm or not messages:
@@ -17651,9 +11776,13 @@ async def _generate_title(messages: List[Any], auxiliary_llm: Any) -> Optional[s
         )
         return None
     try:
-        # Grab first few exchanges for title generation
+        from shared.runtime.core.context_entries import is_context_injection
+
+        # Grab first few exchanges for title generation; injected context
+        # (memory, knowledge, ...) is not what the conversation is about.
+        conversation = [m for m in messages if not is_context_injection(m)]
         sample = []
-        for m in messages[:10]:
+        for m in conversation[:10]:
             content = getattr(m, "content", None)
             if isinstance(content, str) and content:
                 sample.append(_excerpt_for_title(content))
@@ -17683,7 +11812,7 @@ async def _generate_title(messages: List[Any], auxiliary_llm: Any) -> Optional[s
         # main-model fallback rather than a silent "Untitled Session".
         from shared.runtime.services.auxiliary import GenerateTitleTask
 
-        if _termination_admission_closed():
+        if _session_termination.termination_admission_closed():
             logger.debug("Title generation skipped: termination admission closed")
             return None
         result = await auxiliary_llm.chain(GenerateTitleTask("\n".join(sample)))
@@ -17786,9 +11915,15 @@ async def _write_title_if_placeholder(
     untouched. Returns True iff the title was written.
     """
     session = expected_session if expected_session is not None else _session
-    thread_id = expected_thread_id if expected_thread_id is not None else _thread_id
+    thread_id = (
+        expected_thread_id
+        if expected_thread_id is not None
+        else _session_identity.thread_id
+    )
     generation = (
-        expected_generation if expected_generation is not None else _session_generation
+        expected_generation
+        if expected_generation is not None
+        else _session_identity.attach_generation
     )
     if not title or not session or not session.postgres_conn or not thread_id:
         return False
@@ -17852,7 +11987,7 @@ async def _early_title_from_prompt(
     draft taken from the opening prompt — so it fills on submit instead of only
     after the (possibly long) first turn lands.
 
-    Primary *placeholder* path. Fire-and-forget from _accept_user_input; must
+    Primary *placeholder* path. Fire-and-forget from input acceptance; must
     never block input acceptance. The authoritative, grounded, schema-bound LLM
     title is minted later by _auto_title_after_first_turn, which replaces this
     draft. Low-signal prompts get no draft and are left to that pass.
@@ -17860,11 +11995,15 @@ async def _early_title_from_prompt(
     global _draft_title_value
     try:
         session = expected_session if expected_session is not None else _session
-        thread_id = expected_thread_id if expected_thread_id is not None else _thread_id
+        thread_id = (
+            expected_thread_id
+            if expected_thread_id is not None
+            else _session_identity.thread_id
+        )
         generation = (
             expected_generation
             if expected_generation is not None
-            else _session_generation
+            else _session_identity.attach_generation
         )
         if not session or not session.postgres_conn or not thread_id:
             return
@@ -17905,9 +12044,13 @@ async def _auto_title_after_first_turn() -> None:
     """
     global _draft_title_value
     try:
-        if not _session or not _session.postgres_conn or not _thread_id:
+        if (
+            not _session
+            or not _session.postgres_conn
+            or not _session_identity.thread_id
+        ):
             return
-        thread = await _session.postgres_conn.get_thread(_thread_id)
+        thread = await _session.postgres_conn.get_thread(_session_identity.thread_id)
         current = thread.get("title", "") if thread else ""
         # Overwrite a placeholder or our own draft — never a manual rename.
         if not _title_is_placeholder(current) and current != _draft_title_value:

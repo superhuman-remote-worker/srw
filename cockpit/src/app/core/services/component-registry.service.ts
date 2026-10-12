@@ -10,12 +10,14 @@ import { ComponentMetadata, ComponentType } from '../../workbench/layout.model';
 })
 export class ComponentRegistryService {
   private registry = new Map<ComponentType, ComponentMetadata>();
+  private loads = new Map<ComponentType, Promise<Type<unknown>>>();
 
   /**
    * Register a component for use in the layout system.
    */
   register(metadata: ComponentMetadata): void {
     this.registry.set(metadata.type, metadata);
+    this.loads.delete(metadata.type);
   }
 
   /**
@@ -26,10 +28,24 @@ export class ComponentRegistryService {
   }
 
   /**
-   * Get the Angular component class for a type.
+   * Load the Angular component class for a type. Resolves `undefined` for an
+   * unregistered type. The load runs once per type; a failed load is forgotten
+   * so the next call retries (a chunk fetch can fail transiently).
    */
-  getComponent(type: ComponentType): Type<unknown> | undefined {
-    return this.registry.get(type)?.component;
+  loadComponent(type: ComponentType): Promise<Type<unknown> | undefined> {
+    const meta = this.registry.get(type);
+    if (!meta) return Promise.resolve(undefined);
+
+    let pending = this.loads.get(type);
+    if (!pending) {
+      const started = meta.load();
+      pending = started;
+      this.loads.set(type, started);
+      started.catch(() => {
+        if (this.loads.get(type) === started) this.loads.delete(type);
+      });
+    }
+    return pending;
   }
 
   /**

@@ -19,6 +19,10 @@ from shared.orch_surface.jobs.envelope import (
     http_status_of,
     response_detail,
 )
+from shared.orch_surface.workspace_choice import (
+    WorkspaceArgumentError,
+    workspace_field,
+)
 
 _ALL = frozenset({"mcp", "session", "officer"})
 _MCP = frozenset({"mcp"})
@@ -167,6 +171,7 @@ async def create_job(
     slot: str | None = None,
     ticket: str | None = None,
     work_category: str | None = None,
+    workspace: str | dict[str, Any] | None = None,
 ) -> str:
     """Create a new job for agent execution.
 
@@ -225,6 +230,12 @@ async def create_job(
             tester, executor). Optional — the slot's category governs the
             worker's contract; this records your stated intent and is named
             in the kickoff when the two disagree.
+        workspace: The workspace this job runs in. Omit it to use the project's
+            default (or, without a project, the installation's). "none" runs the
+            job with no workspace. A template name such as "container-minimal",
+            or one listed by manifest_list kind=WorkspaceTemplate, is looked up
+            in the project, then your own templates, then the shared catalog.
+            A child job inherits its parent's workspace and can't set this.
 
     Returns:
         Created job details with ID
@@ -259,6 +270,12 @@ async def create_job(
         merged_context["officer_slot"] = str(slot)
 
     try:
+        try:
+            workspace_supplied, workspace_binding = await workspace_field(
+                client, workspace, project_id=project_id or caller.lineage_project_id
+            )
+        except WorkspaceArgumentError as problem:
+            return f"Refusing to create job: {problem}"
         result = await client.create_job(
             description=description,
             config_name=choice.config_name,
@@ -288,6 +305,8 @@ async def create_job(
             required_deliverables=required_deliverables,
             ticket=ticket,
             work_category=work_category,
+            workspace=workspace_binding,
+            workspace_supplied=workspace_supplied,
         )
         return fmt.format_created_job(
             result, choice.config_name, expert=choice.reference

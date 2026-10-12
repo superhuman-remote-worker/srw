@@ -1561,30 +1561,52 @@ class TestEvictDeadWorkspaces:
 
 class TestSweeperRegistrationShape:
     def test_settings_sweeper_is_leader_gated(self):
+        """The sweeper is only ever started leader-gated (``run_when_leader``).
+
+        (The lifespan characterization also pins this behaviourally.)
+        """
+        import ast
         import inspect
 
-        import orchestrator.main as orchestrator_main
+        # R1.B12: the background tasks are started by the application's
+        # composition, which names the sweeper through its owning module.
+        from orchestrator.application import background_tasks
 
-        source = inspect.getsource(orchestrator_main.lifespan)
-        assert (
-            "run_when_leader(code_server_settings_sweeper, _shutdown_event)" in source
-        )
+        source = inspect.getsource(background_tasks.start_background_tasks)
+        tree = ast.parse(source)
+        gated = []
+        for node in ast.walk(tree):
+            if not (
+                isinstance(node, ast.Call)
+                and ast.unparse(node.func) == "tasks.start_leader_gated"
+            ):
+                continue
+            target = node.args[1]
+            if isinstance(target, ast.Call) and ast.unparse(target.func).endswith(
+                "partial"
+            ):
+                target = target.args[0]
+            gated.append(ast.unparse(target))
+        assert "ide_settings.code_server_settings_sweeper" in gated
+        mentions = source.count("code_server_settings_sweeper")
+        assert mentions == 1
 
     @pytest.mark.asyncio
     async def test_disabled_sweeper_parks_instead_of_returning(self, monkeypatch):
         # A bare return would make run_when_leader respawn (and log) the
         # disabled sweeper every poll second for the whole leadership tenure.
-        import orchestrator.main as orchestrator_main
+        # R1.B11: the loop lives in its domain owner and takes its
+        # collaborators as keyword parameters instead of main's globals.
         from orchestrator.services import ide_settings
 
         monkeypatch.setenv("IDE_SETTINGS_SYNC_ENABLED", "false")
         db = MagicMock()
         db.list_active_ide_workspaces = AsyncMock(return_value=[])
         provisioner = MagicMock()
+        snapshots = MagicMock()
+        vms = MagicMock()
         store_factory = MagicMock()
         classifier_factory = MagicMock()
-        monkeypatch.setattr(orchestrator_main, "postgres_db", db)
-        monkeypatch.setattr(orchestrator_main, "container_provisioner", provisioner)
         monkeypatch.setattr(ide_settings, "IdeSettingsStore", store_factory)
         monkeypatch.setattr(ide_settings, "OpenVsxClassifier", classifier_factory)
 
@@ -1599,7 +1621,13 @@ class TestSweeperRegistrationShape:
         wait = AsyncMock(side_effect=observed_wait)
         monkeypatch.setattr(shutdown, "wait", wait)
         task = asyncio.create_task(
-            orchestrator_main.code_server_settings_sweeper(shutdown)
+            ide_settings.code_server_settings_sweeper(
+                shutdown,
+                db=db,
+                container_provisioner=provisioner,
+                snapshot_service=snapshots,
+                vm_provisioner=vms,
+            )
         )
         try:
             await asyncio.wait_for(waiting.wait(), timeout=1)
@@ -1609,6 +1637,8 @@ class TestSweeperRegistrationShape:
             classifier_factory.assert_not_called()
             assert db.mock_calls == []
             assert provisioner.mock_calls == []
+            assert snapshots.mock_calls == []
+            assert vms.mock_calls == []
 
             shutdown.set()
             await asyncio.wait_for(task, timeout=1)
@@ -1617,6 +1647,8 @@ class TestSweeperRegistrationShape:
             classifier_factory.assert_not_called()
             assert db.mock_calls == []
             assert provisioner.mock_calls == []
+            assert snapshots.mock_calls == []
+            assert vms.mock_calls == []
         finally:
             if not task.done():
                 task.cancel()

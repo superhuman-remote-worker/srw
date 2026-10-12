@@ -64,6 +64,13 @@ orchestrator:
   kbGitAllowedHosts: "git.internal.example.com"
   kbExternalReindexConcurrency: 2
   kbReindexSweepSeconds: 900
+  # First deploy the capable bridge with this off. Enable only after proving
+  # all pre-bridge processes/creators are gone; existing v1 work continues off.
+  containerStartupStageAuthority:
+    enabled: false
+  vmProvisioning:
+    creationRetryEnabled: false
+    rootdiskStallTimeoutSeconds: 2700
   # Recovery readers, controls and cleanup guards ship in every version. These
   # switches open automatic probes only after the protocol rollout described
   # in the chart README and its disposable-cluster gate have passed.

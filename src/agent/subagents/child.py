@@ -524,7 +524,8 @@ def build_child_config(entry: Mapping[str, Any], *, live_llm_config: Any = None)
     an ``inherit`` entry (``llm._inherit_llm``) is then overlaid with the
     parent's LIVE ``LLMConfig`` (dispatch-time credentials, a fallback swap);
     a pinned entry without credentials borrows the parent's when it runs on
-    the same provider. ``officer.enabled`` is forced off (D(4): a DB ``$ref``
+    the same provider and names no endpoint of its own (or the parent's).
+    ``officer.enabled`` is forced off (D(4): a DB ``$ref``
     to a centurion must never bring the officer loop guard into a child).
     """
     data = copy.deepcopy(dict(entry))
@@ -536,11 +537,19 @@ def build_child_config(entry: Mapping[str, Any], *, live_llm_config: Any = None)
     if raw_llm.get(ROSTER_INHERIT_MARKER):
         cfg.llm = overlay_live_llm(cfg.llm, live_llm_config)
     elif live_llm_config is not None and cfg.llm.api_key is None:
+        from shared.runtime.core.transport_resolution import endpoint_within
+
         same_provider = (cfg.llm.provider or None) in (
             None,
             getattr(live_llm_config, "provider", None),
         )
-        if same_provider:
+        # A key follows its endpoint (same rule as LLMConfig.with_override):
+        # borrow the parent's key only when the entry names no endpoint of its
+        # own or names the parent's.
+        same_host = cfg.llm.base_url is None or endpoint_within(
+            cfg.llm.base_url, getattr(live_llm_config, "base_url", None)
+        )
+        if same_provider and same_host:
             borrowed: Dict[str, Any] = {
                 "api_key": getattr(live_llm_config, "api_key", None)
             }
@@ -697,6 +706,7 @@ def drop_missing_before_tool_bindings(
 def build_context_manager(cfg: Any) -> Any:
     """``PersistentSession._build_context_config`` / ``_setup_context_manager``."""
     from agent.core.context import ContextConfig, ContextManager
+    from agent.core.summarizer import load_summarizer_prompt
 
     ctx, lim = cfg.context_management, cfg.limits
     return ContextManager(
@@ -705,7 +715,6 @@ def build_context_manager(cfg: Any) -> Any:
             summarization_threshold_tokens=lim.context_threshold_tokens,
             message_count_threshold=lim.message_count_threshold,
             message_count_min_tokens=lim.message_count_min_tokens,
-            keep_recent_tool_results=ctx.keep_recent_tool_results,
             keep_recent_messages=ctx.keep_recent_messages,
             keep_window_max_tool_result_chars=ctx.keep_window_max_tool_result_chars,
             model_max_context_tokens=lim.model_max_context_tokens,
@@ -713,6 +722,7 @@ def build_context_manager(cfg: Any) -> Any:
         ),
         model=cfg.llm.model or "gpt-4",
         summarization_call_timeout=cfg.auxiliary.summarization_call_timeout,
+        summarization_prompt=load_summarizer_prompt(cfg),
     )
 
 
@@ -779,6 +789,9 @@ def rebase_context(
     ctx.canvas_event_callback = None
     ctx.progress_committer = None
     ctx.citation_engine = None
+    # A child has no memory of its own (overlays/subagent.yaml): a memory
+    # tool a $ref'd expert names must not read through the parent's manager.
+    ctx.memory_service = None
     ctx._snapshot_callback = None
     ctx._freeze_request = None
     ctx._officer_sleep_request = None
@@ -800,6 +813,8 @@ def rebase_context(
     ctx.subagent_runtime = None
     ctx._parent_host = None
     ctx._subagent_parent_kind = None
+    ctx._subagent_execution_lane = None
+    ctx._session_subagent_batch_settle_contract = False
     ctx._session_parent_authority_provider = None
     ctx._session_parent_authority = None
     ctx.parent_context_probe = None

@@ -169,3 +169,145 @@ def test_use_skill_refuses_managed_app_guide_workspace_bytes(tmp_path):
     assert "read_product_guide" in out
     assert "managed by the running SRW product" in out
     assert "STALE-OR-USER-CONTROLLED-GUIDANCE" not in out
+
+
+def _use_skill_with_binding(
+    tmp_path, *, menu_names=(), bound_skill="verify-before-done"
+):
+    """A use_skill bound to a workspace whose menu omits a bound skill.
+
+    Mirrors the orchestrator's filter_bound_skills: the bound skill rides the
+    frozen instructions channel (skills/<name>/SKILL.md on disk + an
+    instruction_files binding), not the optional catalog menu.
+    """
+    from shared.runtime.core.loader import InstructionFileEntry
+
+    ws = WorkspaceManager(
+        job_id="t", base_path=tmp_path, backend=FilesystemTestBackend(tmp_path)
+    )
+    ctx = ToolContext(
+        workspace_manager=ws,
+        config={
+            "_resolved_skills": {
+                "menu": [{"name": name} for name in menu_names],
+                "files": {},
+            }
+        },
+    )
+    ctx._instruction_files = [
+        InstructionFileEntry(
+            trigger="before_tool:todo_complete",
+            skill=bound_skill,
+            enforce=True,
+        )
+    ]
+    ctx._llm_config = None
+    tools = {t.name: t for t in create_skill_tools(ctx)}
+    return ws, ctx, tools["use_skill"]
+
+
+def test_use_skill_loads_bound_skill_via_authorized_binding(tmp_path):
+    """A gate-required bound skill is loadable through its advertised route.
+
+    Regression for worker_verification_skill_tool_contract_mismatch: the menu
+    refused verify-before-done (filtered by design) while the gate required
+    it, and only read_file satisfied the prerequisite. use_skill must also
+    serve currently bound skills; absence from the optional menu alone is not
+    a refusal. Records the same versioned read so the gate is satisfied.
+    """
+    import hashlib
+    from unittest.mock import patch
+
+    ws, ctx, use_skill = _use_skill_with_binding(tmp_path, menu_names=("free-skill",))
+    body = "---\nname: verify-before-done\n---\nBOUND-BODY-v1"
+    ws.backend.mkdir("skills/verify-before-done")
+    ws.write_file("skills/verify-before-done/SKILL.md", body)
+
+    real_record = ToolContext.record_file_read
+    with patch.object(
+        ToolContext, "record_file_read", autospec=True, side_effect=real_record
+    ) as record:
+        out = use_skill.invoke({"skill_name": "verify-before-done"})
+
+    assert "BOUND-BODY-v1" in out
+    assert "not available" not in out.lower()
+    assert record.call_args.args[1:] == ("skills/verify-before-done/SKILL.md", body)
+    assert ctx.check_tool_enforcement("todo_complete") is None
+    expected_version = "sha256:" + hashlib.sha256(body.encode("utf-8")).hexdigest()
+    assert (
+        ctx._instruction_read_stamps["skills/verify-before-done/SKILL.md"][
+            "content_version"
+        ]
+        == expected_version
+    )
+
+
+def test_use_skill_still_refuses_unbound_workspace_skill(tmp_path):
+    """The bound-skill route must not become an arbitrary workspace reader.
+
+    A skill file present on disk without a menu entry AND without an
+    instruction binding stays refused; workspace bytes alone grant nothing.
+    """
+    ws, _ctx, use_skill = _use_skill_with_binding(
+        tmp_path, menu_names=("free-skill",), bound_skill="verify-before-done"
+    )
+    ws.backend.mkdir("skills/attacker-skill")
+    ws.write_file(
+        "skills/attacker-skill/SKILL.md",
+        "---\nname: attacker-skill\n---\nATTACKER-BYTES",
+    )
+
+    out = use_skill.invoke({"skill_name": "attacker-skill"})
+
+    assert "not available" in out.lower()
+    assert "ATTACKER-BYTES" not in out
+
+
+def _use_skill_phase_scoped(tmp_path):
+    from shared.runtime.core.loader import InstructionFileEntry
+
+    ws = WorkspaceManager(
+        job_id="t", base_path=tmp_path, backend=FilesystemTestBackend(tmp_path)
+    )
+    ctx = ToolContext(
+        workspace_manager=ws,
+        config={"_resolved_skills": {"menu": [], "files": {}}},
+    )
+    ctx._instruction_files = [
+        InstructionFileEntry(
+            trigger="before_tool:todo_complete",
+            skill="verify-before-done",
+            enforce=True,
+            phases=["tactical"],
+            read_scope="phase",
+            max_read_age_turns=20,
+        )
+    ]
+    ctx._llm_config = None
+    tools = {t.name: t for t in create_skill_tools(ctx)}
+    return ws, ctx, tools["use_skill"]
+
+
+def test_bound_use_skill_read_expires_on_phase_change(tmp_path):
+    """A bound use_skill read must not permanently satisfy the gate.
+
+    Phase/freshness invalidation is intentional: moving to a new concrete
+    phase legitimately re-arms the prerequisite, and one correct new read
+    (via either advertised route) allows progress again.
+    """
+    ws, ctx, use_skill = _use_skill_phase_scoped(tmp_path)
+    body = "---\nname: verify-before-done\n---\nPHASED-BODY"
+    ws.backend.mkdir("skills/verify-before-done")
+    ws.write_file("skills/verify-before-done/SKILL.md", body)
+
+    ctx.set_current_phase("tactical", phase_number=2, turn_count=5)
+    out = use_skill.invoke({"skill_name": "verify-before-done"})
+    assert "PHASED-BODY" in out
+    assert ctx.check_tool_enforcement("todo_complete") is None
+
+    ctx.set_current_phase("tactical", phase_number=4, turn_count=9)
+    assert ctx.check_tool_enforcement("todo_complete") is not None
+
+    out = use_skill.invoke({"skill_name": "verify-before-done"})
+    assert "PHASED-BODY" in out
+    assert ctx.check_tool_enforcement("todo_complete") is None

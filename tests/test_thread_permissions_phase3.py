@@ -93,7 +93,7 @@ def _install_session(postgres_conn=None, permission_mode="supervised"):
     session.tool_decisions = {}
     session.postgres_conn = postgres_conn
     mod._session = session
-    mod._thread_id = "thread-test"
+    mod._session_identity._thread_id = "thread-test"
     return session
 
 
@@ -107,13 +107,13 @@ class TestPermissionCheckEarlyReturns:
         import agent.api.persistent_app as mod
 
         mod._session = None
-        mod._thread_id = None
+        mod._session_identity._thread_id = None
 
     def teardown_method(self):
         import agent.api.persistent_app as mod
 
         mod._session = None
-        mod._thread_id = None
+        mod._session_identity._thread_id = None
 
     @pytest.mark.asyncio
     async def test_no_session_denies(self):
@@ -163,13 +163,13 @@ class TestInsertPermissionRequest:
         import agent.api.persistent_app as mod
 
         mod._session = None
-        mod._thread_id = None
+        mod._session_identity._thread_id = None
 
     def teardown_method(self):
         import agent.api.persistent_app as mod
 
         mod._session = None
-        mod._thread_id = None
+        mod._session_identity._thread_id = None
 
     @pytest.mark.asyncio
     async def test_returns_uuid_string(self):
@@ -210,10 +210,10 @@ class TestInsertPermissionRequest:
 
         postgres = _make_postgres_conn(insert_returns="aaaaaaaa-1111")
         _install_session(postgres_conn=postgres)
-        mod._thread_id = "11111111-1111-4111-8111-111111111111"
+        mod._session_identity._thread_id = "11111111-1111-4111-8111-111111111111"
         monkeypatch.setenv("STATELESS_EXECUTOR", "1")
         handle = LeaseHandle()
-        handle.update(mod._thread_id, 17)
+        handle.update(mod._session_identity.thread_id, 17)
         context_token = mod._current_lease_var.set(handle)
         try:
             rid = await mod._insert_permission_request("tc1", "read_file", {})
@@ -239,13 +239,13 @@ class TestResolvePendingPermission:
         import agent.api.persistent_app as mod
 
         mod._session = None
-        mod._thread_id = None
+        mod._session_identity._thread_id = None
 
     def teardown_method(self):
         import agent.api.persistent_app as mod
 
         mod._session = None
-        mod._thread_id = None
+        mod._session_identity._thread_id = None
 
     @pytest.mark.asyncio
     async def test_resolves_by_explicit_id(self):
@@ -312,20 +312,20 @@ class TestWaitForPermissionResolution:
         import agent.api.persistent_app as mod
 
         mod._session = None
-        mod._thread_id = None
+        mod._session_identity._thread_id = None
         # The wait races the status read against this module global. A stale
         # Event left behind by an earlier test file is bound to that file's
         # (now closed) event loop, so awaiting it here raises and the wait
         # returns its conservative 'denied' default instead of the real
         # status. Own the precondition rather than inherit it.
-        mod._hard_interrupt_event = None
+        mod._session_input._hard_interrupt_event = None
 
     def teardown_method(self):
         import agent.api.persistent_app as mod
 
         mod._session = None
-        mod._thread_id = None
-        mod._hard_interrupt_event = None
+        mod._session_identity._thread_id = None
+        mod._session_input._hard_interrupt_event = None
 
     @pytest.mark.asyncio
     async def test_returns_immediately_if_already_approved(self):
@@ -434,20 +434,20 @@ class TestLoopPermissionCheckDBPath:
         import agent.api.persistent_app as mod
 
         mod._session = None
-        mod._thread_id = None
+        mod._session_identity._thread_id = None
         mod._subscribers.clear()
         mod._events_epoch = 0
         mod._next_seq = 0
         # Reaches _wait_for_permission_resolution — same cross-loop hazard.
-        mod._hard_interrupt_event = None
+        mod._session_input._hard_interrupt_event = None
 
     def teardown_method(self):
         import agent.api.persistent_app as mod
 
         mod._session = None
-        mod._thread_id = None
+        mod._session_identity._thread_id = None
         mod._subscribers.clear()
-        mod._hard_interrupt_event = None
+        mod._session_input._hard_interrupt_event = None
 
     @pytest.mark.asyncio
     async def test_denies_when_insert_fails(self):

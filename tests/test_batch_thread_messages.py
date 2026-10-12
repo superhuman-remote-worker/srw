@@ -329,6 +329,126 @@ async def test_reconcile_is_idempotent(db):
 
 
 @pytest.mark.asyncio
+async def test_compaction_view_fills_a_lost_row_but_never_rewrites_a_landed_one(db):
+    """``insert_if_absent`` rows (lossy compaction views): the landed full
+    result keeps its content and seq, a result whose incremental write was
+    lost is filled with the view (no tool call left without its result), rows
+    the batch mints keep their order, and the effect range still ends at the
+    final answer."""
+    await _seed_turn_boundary(db, "view-boundary", 9)
+    landed = await db.save_thread_message(
+        thread_id=_TID,
+        role="tool",
+        content="full result",
+        turn_number=9,
+        tool_call_id="tc-landed",
+        id="view-landed",
+    )
+    rows = [
+        _row(
+            "view-landed",
+            "tool",
+            "capped view",
+            9,
+            tool_call_id="tc-landed",
+            insert_if_absent=True,
+        ),
+        _row(
+            "view-lost",
+            "tool",
+            "capped view",
+            9,
+            tool_call_id="tc-lost",
+            insert_if_absent=True,
+        ),
+        _row("view-final", "ai", "answer", 9),
+    ]
+    lease = LeaseHandle()
+    lease.update(_TID, 17)
+    context_token = current_lease.set(lease)
+    try:
+        for _attempt in range(2):  # the reconcile is retryable: idempotent
+            await db.save_thread_messages(
+                _TID,
+                rows,
+                turn_input_message_id="view-boundary",
+                turn_number=9,
+                memory_scope_kind="thread",
+                memory_scope_id=_TID,
+            )
+    finally:
+        current_lease.reset(context_token)
+
+    after = await _seqs_by_id(db)
+    landed_row = after[_coerce_row_id("view-landed")]
+    lost_row = after[_coerce_row_id("view-lost")]
+    final_row = after[_coerce_row_id("view-final")]
+    assert landed_row["content"] == "full result"
+    assert landed_row["seq"] == landed["seq"]
+    assert lost_row["content"] == "capped view"
+    assert lost_row["seq"] < final_row["seq"]
+    assert len(after) == 4  # boundary + three rows, nothing duplicated
+    async with db.acquire() as conn:
+        detail = await conn.fetchval(
+            "SELECT detail FROM completion_effects WHERE producer_kind = 'session_turn'"
+        )
+    if isinstance(detail, str):
+        detail = json.loads(detail)
+    assert detail["end_seq"] == final_row["seq"]
+
+
+@pytest.mark.asyncio
+async def test_compaction_view_keeps_its_tool_link_in_step_with_the_ai_row(db):
+    """A mid-turn cross-family model switch remaps tool-call ids in memory
+    (sanitize_history_for_provider_boundary) on the AI message AND its tool
+    result. The AI row upserts the new id; the view row must follow it, or
+    the stored pair splits and restore prunes both halves as orphans. The
+    link moves, the landed full content still never does."""
+    await _seed_turn_boundary(db, "link-boundary", 9)
+    await db.save_thread_message(
+        thread_id=_TID,
+        role="tool",
+        content="full result",
+        turn_number=9,
+        tool_call_id="toolu_01ABCDEF",
+        id="link-landed",
+    )
+    rows = [
+        _row(
+            "link-landed",
+            "tool",
+            "capped view",
+            9,
+            tool_call_id="7aec07fb2",
+            insert_if_absent=True,
+        ),
+        _row("link-final", "ai", "answer", 9),
+    ]
+    lease = LeaseHandle()
+    lease.update(_TID, 17)
+    context_token = current_lease.set(lease)
+    try:
+        await db.save_thread_messages(
+            _TID,
+            rows,
+            turn_input_message_id="link-boundary",
+            turn_number=9,
+            memory_scope_kind="thread",
+            memory_scope_id=_TID,
+        )
+    finally:
+        current_lease.reset(context_token)
+
+    async with db.acquire() as conn:
+        landed = await conn.fetchrow(
+            "SELECT content, tool_call_id FROM thread_messages WHERE id = $1",
+            _coerce_row_id("link-landed"),
+        )
+    assert landed["content"] == "full result"
+    assert landed["tool_call_id"] == "7aec07fb2"
+
+
+@pytest.mark.asyncio
 async def test_reconcile_bumps_thread_turn_count(db):
     await db.save_thread_messages(
         _TID,

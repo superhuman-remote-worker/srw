@@ -1273,6 +1273,8 @@ class AsyncCockpitClient:
         required_deliverables: list[str] | None = None,
         ticket: str | None = None,
         work_category: str | None = None,
+        workspace: dict[str, Any] | None = None,
+        workspace_supplied: bool = False,
     ) -> dict[str, Any]:
         """Create a new job.
 
@@ -1302,6 +1304,8 @@ class AsyncCockpitClient:
             work_category: Explicit work category for the precedence law —
                 the caller's stated intent, recorded against the slot's
                 category in the kickoff contract
+            workspace / workspace_supplied: the REST WorkspaceBinding (None = no
+                workspace), sent only when supplied.
 
         Returns:
             Created job record with ID
@@ -1339,6 +1343,8 @@ class AsyncCockpitClient:
             body["thread_id"] = thread_id
         if required_deliverables:
             body["required_deliverables"] = required_deliverables
+        if workspace_supplied:
+            body["workspace"] = workspace
         resp = await self._mutation_request("POST", "/api/jobs", json=body)
         resp.raise_for_status()
         return resp.json()
@@ -1780,6 +1786,13 @@ class AsyncCockpitClient:
     async def list_models(self) -> dict[str, Any]:
         """List available models from the model catalog."""
         resp = await self._client.get("/api/models")
+        resp.raise_for_status()
+        return resp.json()
+
+    @_create_retry_decorator()
+    async def list_connector_drivers(self) -> dict[str, Any]:
+        """The capability matrix of every installed connector driver."""
+        resp = await self._client.get("/api/datasources/drivers")
         resp.raise_for_status()
         return resp.json()
 
@@ -2478,6 +2491,8 @@ class AsyncCockpitClient:
         context: dict[str, Any] | None = None,
         priority: int = 5,
         required_deliverables: list[str] | None = None,
+        workspace: dict[str, Any] | None = None,
+        workspace_supplied: bool = False,
     ) -> dict[str, Any]:
         """Create a job within a project context.
 
@@ -2498,6 +2513,8 @@ class AsyncCockpitClient:
                 one exact "pr:<owner>/<repository>" bound to a writable
                 attached repository. Do not use repos/<alias>/ paths or
                 replace a refused publication contract with a note.
+            workspace / workspace_supplied: the REST WorkspaceBinding (None = no
+                workspace), sent only when supplied.
 
         Returns:
             Created job record with ID
@@ -2523,6 +2540,8 @@ class AsyncCockpitClient:
             body["context"] = context
         if required_deliverables:
             body["required_deliverables"] = required_deliverables
+        if workspace_supplied:
+            body["workspace"] = workspace
         resp = await self._mutation_request(
             "POST", f"/api/projects/{project_id}/jobs", json=body
         )
@@ -2739,7 +2758,8 @@ class AsyncCockpitClient:
             default_branch: Branch to clone (repository type)
             config: Non-secret type-specific configuration
             is_global: Publish for all users (capability-gated)
-            read_only: Declarative public/project access hint
+            read_only: The creator's read-only tag: agents get no write tools
+                for this connector, for everyone who uses it
             scope_mode: ``all`` for every otherwise-authorized work context,
                 or ``projects`` to restrict availability to project_ids
             project_ids: Full initial project scope. Omit for all-scope
@@ -2806,7 +2826,7 @@ class AsyncCockpitClient:
             default_branch: New default branch
             config: New non-secret type-specific configuration
             is_global: Publish/unpublish (publication is capability-gated)
-            read_only: New declarative read-only hint
+            read_only: New read-only tag (agents get no write tools for it)
             scope_mode: New availability scope. Omit to preserve it.
             project_ids: Desired full project set. Omit to preserve existing
                 links; pass [] to remove all links (valid only with all scope).
@@ -2891,13 +2911,20 @@ class AsyncCockpitClient:
         datasource_id: str,
         read_only: bool | None = None,
         description: str | None = None,
+        access: str | None = None,
     ) -> dict[str, str]:
-        """Update project-level settings for a linked datasource."""
+        """Update project-level settings for a linked datasource.
+
+        ``access`` sets the link's default level, for a connector whose
+        driver has strict levels (a cloud folder: ``read_only``,
+        ``protected``, ``read_write``); such a link takes no ``read_only``."""
         body: dict[str, Any] = {}
         if read_only is not None:
             body["read_only"] = read_only
         if description is not None:
             body["description"] = description
+        if access is not None:
+            body["access"] = access
         resp = await self._mutation_request(
             "PATCH",
             f"/api/projects/{project_id}/datasources/{datasource_id}",
@@ -3252,13 +3279,25 @@ class AsyncCockpitClient:
         datasource_ids: list[str] | None = None,
         model: str | None = None,
         temperature: float | None = None,
+        workspace: dict[str, Any] | None = None,
+        workspace_supplied: bool = False,
+        datasource_access: dict[str, str] | None = None,
     ) -> dict[str, Any]:
         """Create a new persistent thread.
+
+        A session has one project or none: pass ``project_id``.
+        ``project_ids`` is deprecated and takes at most one project.
 
         ``datasource_ids`` is tri-state at the MCP boundary: an omitted field
         arrives here as the internal ``None`` sentinel and requests automatic
         defaults, while ``[]`` attaches no connectors and IDs request exactly
         that authorized selection. The MCP schema rejects explicit JSON null.
+
+        workspace / workspace_supplied: the REST WorkspaceBinding (None = no
+        workspace), sent only when supplied.
+
+        ``datasource_access``: the level per attached connector with access
+        levels (``{connector id: level}``), sent only when given.
 
         Returns:
             Dict with ``thread_id`` and ``status``.
@@ -3280,6 +3319,10 @@ class AsyncCockpitClient:
             body["model"] = model
         if temperature is not None:
             body["temperature"] = temperature
+        if workspace_supplied:
+            body["workspace"] = workspace
+        if datasource_access:
+            body["datasource_access"] = datasource_access
         resp = await self._mutation_request(
             "POST", "/api/persistent/threads", json=body
         )

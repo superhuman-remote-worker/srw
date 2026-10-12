@@ -73,7 +73,7 @@ def test_prompt_files_discovered():
 @pytest.mark.parametrize("path", PROMPT_FILES)
 def test_renders_without_shell(path):
     """No template may leak shell guidance when no shell tool is bound."""
-    out = _render(path, NO_SHELL, cli_datasources=["postgresql"])
+    out = _render(path, NO_SHELL)
     for phrase in SHELL_PHRASES:
         assert phrase not in out, f"{path} mentions '{phrase}' with no shell bound"
 
@@ -82,7 +82,7 @@ def test_renders_without_shell(path):
 def test_renders_cleanly_both_ways(path):
     """Every template must render for both tool sets, leaving no markers behind."""
     for tools in (NO_SHELL, WITH_SHELL):
-        out = _render(path, tools, cli_datasources=["postgresql"])
+        out = _render(path, tools)
         assert "{%" not in _strip_raw(out), f"{path} left an unrendered Jinja marker"
 
 
@@ -91,21 +91,10 @@ def test_shell_blocks_return_when_shell_is_bound():
     gated = [p for p in PROMPT_FILES if "has_shell" in open(p).read()]
     assert gated, "no template gates on has_shell — did the gating regress?"
     for path in gated:
-        out = _render(path, WITH_SHELL, cli_datasources=["postgresql"])
+        out = _render(path, WITH_SHELL)
         assert any(p in out for p in SHELL_PHRASES), (
             f"{path} suppresses shell guidance even with a shell bound"
         )
-
-
-def test_datasource_cli_block_requires_a_shell():
-    """The datasource block instructs `run_command`; it is wrong without one."""
-    path = "config/prompts/systemprompt_interactive.txt"
-    assert "datasource_access" in _render(
-        path, WITH_SHELL, cli_datasources=["postgresql"]
-    )
-    assert "datasource_access" not in _render(
-        path, NO_SHELL, cli_datasources=["postgresql"]
-    )
 
 
 class TestHasShellTools:

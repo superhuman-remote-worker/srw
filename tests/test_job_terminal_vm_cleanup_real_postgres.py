@@ -1,0 +1,514 @@
+"""Durable terminal cleanup nomination never reinterprets historical retention."""
+
+import json
+from unittest.mock import AsyncMock
+from uuid import UUID, uuid4
+
+import pytest
+
+from tests.test_vm_idle_lifecycle_real_postgres import (
+    db as _db_fixture,
+    pg_dsn,  # noqa: F401 - imported pytest fixture dependency
+    postgres_db_fixture,  # noqa: F401 - imported pytest fixture dependency
+    _schema_applied,  # noqa: F401 - imported pytest fixture dependency
+    seed_wait,
+)
+from tests.test_vm_idle_terminal_review_real_postgres import controls_for
+
+db = _db_fixture
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "workspace_context",
+    [{}, {"workspace_container": {"status": "deleted"}}, {"vm": {}}],
+    ids=["virtual", "container-reclaimed", "empty-vm"],
+)
+async def test_cancelled_stateless_non_vm_owner_is_nominated_after_caller_loss(
+    db,
+    workspace_context,
+):
+    owner = uuid4()
+    await db.execute(
+        "INSERT INTO jobs(id,description,status,execution_lane,context) "
+        "VALUES($1,'cancel caller disappeared','created','stateless',$2::jsonb)",
+        owner,
+        json.dumps(workspace_context),
+    )
+    assert await db.cancel_stateless_job(str(owner)) == (True, False)
+
+    # The caller never enters the settle loop. The durable worker must still
+    # select this owner after a restart, even after its container is reclaimed.
+    nominated = await db.list_terminal_vm_cleanup_jobs(limit=4)
+    assert [row["id"] for row in nominated] == [str(owner)]
+    assert (
+        json.loads(nominated[0]["context"])["_stateless_cancel_cleanup_pending"] is True
+    )
+    assert (
+        await db.list_terminal_vm_cleanup_jobs(
+            limit=4,
+            after_id=str(owner),
+        )
+        == []
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "status,lane,marker,inherited",
+    [
+        ("cancelled", "stateless", False, False),
+        ("cancelled", "stateless", "true", False),
+        ("cancelled", "stateless", None, False),
+        ("cancelled", "pinned", True, False),
+        ("completed", "stateless", True, False),
+        ("failed", "stateless", True, False),
+        ("cancelled", "stateless", True, True),
+    ],
+    ids=["false", "string", "null", "pinned", "completed", "failed", "inherited"],
+)
+async def test_non_vm_nomination_requires_exact_shared_cancel_intent(
+    db,
+    status,
+    lane,
+    marker,
+    inherited,
+):
+    owner, parent = uuid4(), uuid4()
+    await db.execute(
+        "INSERT INTO jobs(id,description,status,execution_lane) "
+        "VALUES($1,'parent','processing','stateless')",
+        parent,
+    )
+    await db.execute(
+        "INSERT INTO jobs(id,parent_job_id,description,status,execution_lane,context) "
+        "VALUES($1,$2,'not an eligible cancel',$3,$4,$5::jsonb)",
+        owner,
+        parent,
+        status,
+        lane,
+        json.dumps(
+            {
+                "_stateless_cancel_cleanup_pending": marker,
+                "inherits_parent_workspace": inherited,
+            }
+        ),
+    )
+    assert await db.list_terminal_vm_cleanup_jobs(limit=4) == []
+
+
+@pytest.mark.asyncio
+async def test_shared_cancel_reconciler_retries_archive_before_clearing_marker(db):
+    from tests.test_job_terminal_vm_cleanup import controls
+
+    owner = uuid4()
+    await db.execute(
+        "INSERT INTO jobs(id,description,status,execution_lane,context) "
+        "VALUES($1,'caller lost','created','stateless','{}')",
+        owner,
+    )
+    assert await db.cancel_stateless_job(str(owner)) == (True, False)
+    archive = AsyncMock(side_effect=RuntimeError("external cleanup unavailable"))
+
+    # A fresh worker uses the real nomination, locks, strict checkpoint prune
+    # and marker transaction. External teardown is a port, deliberately held.
+    assert (
+        await controls(store=db, archive=archive).reconcile_terminal_vm_cleanups() == 0
+    )
+    archive.assert_awaited_once_with(str(owner))
+    assert await db.stateless_cancel_cleanup_pending(str(owner)) is True
+
+    archive = AsyncMock()
+    assert (
+        await controls(store=db, archive=archive).reconcile_terminal_vm_cleanups() == 1
+    )
+    archive.assert_awaited_once_with(str(owner))
+    assert await db.stateless_cancel_cleanup_pending(str(owner)) is False
+    assert await db.list_terminal_vm_cleanup_jobs(limit=4) == []
+
+
+@pytest.mark.asyncio
+async def test_pinned_cancel_marks_intent_without_purging_historical_terminal_vm(db):
+    historical, cancelled, generation, pvc_uid = (uuid4() for _ in range(4))
+    vm = {
+        "status": "ready",
+        "provision_generation": str(generation),
+        "rootdisk_pvc_uid": str(pvc_uid),
+    }
+    await db.execute(
+        "INSERT INTO jobs(id,description,status,execution_lane,context) "
+        "VALUES($1,'historical retained','completed','pinned',$3::jsonb),"
+        "($2,'new cancel','paused','pinned',$3::jsonb)",
+        historical,
+        cancelled,
+        json.dumps({"vm": vm}),
+    )
+
+    # A terminal status alone is not a new instruction to purge a disk.
+    assert await db.list_terminal_vm_cleanup_jobs(limit=4) == []
+    # This legacy fixture has no exact Ready creation/reservation proof. It
+    # must remain untouched until its VM is known to be non-Ready.
+    assert not await db.linearize_pinned_cancel(
+        str(cancelled), expected_status="paused", completion_commands_enabled=True
+    )
+    assert await db.list_terminal_vm_cleanup_jobs(limit=4) == []
+    await db.execute(
+        "UPDATE jobs SET context=jsonb_set(context,'{vm,status}',"
+        "'\"failed\"'::jsonb) WHERE id=$1",
+        cancelled,
+    )
+    assert await db.linearize_pinned_cancel(
+        str(cancelled),
+        expected_status="paused",
+        completion_commands_enabled=True,
+    )
+    nominated = await db.list_terminal_vm_cleanup_jobs(limit=4)
+    assert [row["id"] for row in nominated] == [str(cancelled)]
+    assert json.loads(nominated[0]["context"])["_job_terminal_vm_cleanup"] == {
+        "version": 1,
+        "source": "cancel",
+        "provision_generation": str(generation),
+    }
+    assert not await db.complete_terminal_vm_cleanup_marker(
+        str(cancelled),
+        expected_generation=str(generation),
+    )
+
+    # An admitted parent is still selected for supported cleanup; this test
+    # deliberately does not write any physical-absence/process-zero proof.
+    await db.execute(
+        "INSERT INTO vm_workspace_cleanup_admissions "
+        "(id,owner_kind,owner_id,pvc_uid,source,request_id,intent_digest) "
+        "VALUES($1,'job',$2,$3,'job_terminal_vm_release',$4,'exact-intent')",
+        uuid4(),
+        cancelled,
+        pvc_uid,
+        uuid4(),
+    )
+    assert [row["id"] for row in await db.list_terminal_vm_cleanup_jobs(limit=4)] == [
+        str(cancelled),
+    ]
+    assert not await db.complete_terminal_vm_cleanup_marker(
+        str(cancelled),
+        expected_generation=str(generation),
+    )
+
+
+@pytest.mark.asyncio
+async def test_ordinary_vm_approval_atomically_selects_terminal_cleanup(
+    db,
+    monkeypatch,
+    tmp_path,
+):
+    owner, _, identity = await seed_wait(db)
+    await db.execute(
+        "UPDATE jobs SET status='pending_review',workspace_idle_episode=NULL,"
+        "workspace_idle_revision=workspace_idle_revision+1,"
+        "freeze_data=$2::jsonb WHERE id=$1",
+        owner,
+        json.dumps({"freeze_type": "job_complete", "summary": "approved"}),
+    )
+    controls = await controls_for(db, monkeypatch, tmp_path)
+    controls.dependencies.forge.is_initialized = False
+    monkeypatch.setattr(
+        "orchestrator.services.completion.apply_terminal_job_side_effects",
+        AsyncMock(return_value={}),
+    )
+    # A credential lease still inside its window (connector drivers C2).
+    from orchestrator.services import connector_credential_leases as leases
+
+    connector = uuid4()
+    await db.execute(
+        "INSERT INTO datasources (id, name, type) VALUES ($1, $2, 'lease_probe')",
+        connector,
+        f"probe-{connector}",
+    )
+    async with db.acquire() as conn:
+        lease = await leases.issue_or_redeliver(
+            conn,
+            owner=leases.LeaseOwner.job(str(owner)),
+            connector_id=str(connector),
+            driver="srw.lease-probe/v1",
+            access="ReadWrite",
+        )
+
+    result = await controls.approve_job(
+        str(owner),
+        user={"id": "reviewer"},
+        job=await db.get_job(str(owner)),
+        request=None,
+    )
+
+    assert result["status"] == "approved" and result["cleanup_pending"] is True
+    assert (
+        await db.fetchval(
+            "SELECT revoke_reason FROM connector_credential_leases WHERE id = $1",
+            UUID(lease.id),
+        )
+        == "job_completed"
+    )
+    row = await db.fetchrow("SELECT status,context FROM jobs WHERE id=$1", owner)
+    assert row["status"] == "completed"
+    assert json.loads(row["context"])["_job_terminal_vm_cleanup"] == {
+        "version": 1,
+        "source": "approve",
+        "provision_generation": str(identity["generation"]),
+    }
+    assert [item["id"] for item in await db.list_terminal_vm_cleanup_jobs(limit=4)] == [
+        str(owner),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_completed_exact_parent_keeps_deleting_marker_nominated(db):
+    owner, other, generation, pvc_uid, admission_id, other_admission = (
+        uuid4() for _ in range(6)
+    )
+    vm = {
+        "status": "deleting",
+        "provision_generation": str(generation),
+        "rootdisk_pvc_uid": str(pvc_uid),
+    }
+    for job_id, marker_admission in ((owner, admission_id), (other, other_admission)):
+        await db.execute(
+            "INSERT INTO jobs(id,description,status,execution_lane,context) "
+            "VALUES($1,'completed cleanup','completed','pinned',$2::jsonb)",
+            job_id,
+            json.dumps(
+                {
+                    "vm": vm,
+                    "_job_terminal_vm_cleanup": {
+                        "version": 1,
+                        "source": "approve",
+                        "provision_generation": str(generation),
+                        "admission_id": str(marker_admission),
+                    },
+                }
+            ),
+        )
+    await db.execute(
+        "INSERT INTO vm_workspace_cleanup_admissions "
+        "(id,owner_kind,owner_id,pvc_uid,source,request_id,intent_digest,"
+        "completed_at,outcome) VALUES "
+        "($1,'job',$2,$3,'job_terminal_vm_release',$4,'exact-intent',"
+        "clock_timestamp(),'completed'),"
+        "($5,'job',$6,$3,'job_terminal_vm_release',$7,'exact-intent',"
+        "clock_timestamp(),'completed')",
+        admission_id,
+        owner,
+        pvc_uid,
+        uuid4(),
+        uuid4(),
+        other,
+        uuid4(),
+    )
+
+    nominated = await db.list_terminal_vm_cleanup_jobs(limit=4)
+    assert [row["id"] for row in nominated] == [str(owner)]
+    # A completed receipt by another identity cannot close this generation.
+    assert not await db.complete_terminal_vm_cleanup_marker(
+        str(other),
+        expected_generation=str(generation),
+    )
+
+
+@pytest.mark.asyncio
+async def test_terminal_marker_binds_only_its_exact_admitted_parent(db):
+    owner, generation, pvc_uid, admission_id, wrong_admission = (
+        uuid4() for _ in range(5)
+    )
+    await db.execute(
+        "INSERT INTO jobs(id,description,status,execution_lane,context) "
+        "VALUES($1,'selected cleanup','completed','pinned',$2::jsonb)",
+        owner,
+        json.dumps(
+            {
+                "vm": {
+                    "status": "ready",
+                    "provision_generation": str(generation),
+                    "rootdisk_pvc_uid": str(pvc_uid),
+                },
+                "_job_terminal_vm_cleanup": {
+                    "version": 1,
+                    "source": "approve",
+                    "provision_generation": str(generation),
+                },
+            }
+        ),
+    )
+    await db.execute(
+        "INSERT INTO vm_workspace_cleanup_admissions "
+        "(id,owner_kind,owner_id,pvc_uid,source,request_id,intent_digest) "
+        "VALUES($1,'job',$2,$3,'job_terminal_vm_release',$4,'exact-intent')",
+        admission_id,
+        owner,
+        pvc_uid,
+        uuid4(),
+    )
+    assert not await db.bind_terminal_vm_cleanup_admission(
+        str(owner),
+        expected_generation=str(generation),
+        admission_id=str(wrong_admission),
+        pvc_uid=str(pvc_uid),
+    )
+    assert not await db.bind_terminal_vm_cleanup_admission(
+        str(owner),
+        expected_generation=str(generation),
+        admission_id=str(admission_id),
+        pvc_uid=str(uuid4()),
+    )
+    assert await db.bind_terminal_vm_cleanup_admission(
+        str(owner),
+        expected_generation=str(generation),
+        admission_id=str(admission_id),
+        pvc_uid=str(pvc_uid),
+    )
+    context = json.loads(
+        (
+            await db.fetchrow(
+                "SELECT context FROM jobs WHERE id=$1",
+                owner,
+            )
+        )["context"]
+    )
+    assert context["_job_terminal_vm_cleanup"]["admission_id"] == str(admission_id)
+    assert not await db.bind_terminal_vm_cleanup_admission(
+        str(owner),
+        expected_generation=str(generation),
+        admission_id=str(wrong_admission),
+        pvc_uid=str(pvc_uid),
+    )
+
+
+@pytest.mark.asyncio
+async def test_self_owned_child_pinned_and_stateless_cleanup_select_null_safe(db):
+    parent = uuid4()
+    await db.execute(
+        "INSERT INTO jobs(id,description,status,execution_lane) "
+        "VALUES($1,'parent','processing','stateless')",
+        parent,
+    )
+    expected = set()
+    for flag_name, flag in (
+        ("absent", "absent"),
+        ("null", None),
+        ("false", False),
+        ("true", True),
+    ):
+        vm = {
+            "status": "failed",
+            "provision_generation": str(uuid4()),
+            "rootdisk_pvc_uid": str(uuid4()),
+        }
+        context = {"vm": vm}
+        if flag_name != "absent":
+            context["inherits_parent_workspace"] = flag
+        pinned, stateless = uuid4(), uuid4()
+        await db.execute(
+            "INSERT INTO jobs(id,parent_job_id,description,status,execution_lane,context) "
+            "VALUES($1,$3,'child VM','paused','pinned',$4::jsonb),"
+            "($2,$3,'child cancellation','cancelled','stateless',$5::jsonb)",
+            pinned,
+            stateless,
+            parent,
+            json.dumps(context),
+            json.dumps({**context, "_stateless_cancel_cleanup_pending": True}),
+        )
+        assert await db.linearize_pinned_cancel(
+            str(pinned),
+            expected_status="paused",
+            completion_commands_enabled=True,
+        )
+        marked = json.loads(
+            (
+                await db.fetchrow(
+                    "SELECT context FROM jobs WHERE id=$1",
+                    pinned,
+                )
+            )["context"]
+        )
+        assert ("_job_terminal_vm_cleanup" in marked) is (flag is not True)
+        if flag is not True:
+            expected.update({str(pinned), str(stateless)})
+
+    assert {
+        row["id"]
+        for row in await db.list_terminal_vm_cleanup_jobs(
+            limit=25,
+        )
+    } == expected
+
+
+@pytest.mark.asyncio
+async def test_self_owned_child_approval_selects_vm_cleanup_null_safe(
+    db,
+    monkeypatch,
+    tmp_path,
+):
+    parent = uuid4()
+    await db.execute(
+        "INSERT INTO jobs(id,description,status,execution_lane) "
+        "VALUES($1,'parent','processing','stateless')",
+        parent,
+    )
+    controls = await controls_for(db, monkeypatch, tmp_path)
+    controls.dependencies.forge.is_initialized = False
+    controls.dependencies.subjob_output.graft_subjob_output = AsyncMock(
+        return_value=None
+    )
+    monkeypatch.setattr(
+        "orchestrator.services.completion.apply_terminal_job_side_effects",
+        AsyncMock(return_value={}),
+    )
+    expected = set()
+    for flag_name, flag in (
+        ("absent", "absent"),
+        ("null", None),
+        ("false", False),
+        ("true", True),
+    ):
+        owner, _, identity = await seed_wait(db)
+        row = await db.get_job(str(owner))
+        context = row["context"]
+        if isinstance(context, str):
+            context = json.loads(context)
+        if flag_name != "absent":
+            context["inherits_parent_workspace"] = flag
+        await db.execute(
+            "UPDATE jobs SET parent_job_id=$2,context=$3::jsonb,"
+            "status='pending_review',workspace_idle_episode=NULL,"
+            "workspace_idle_revision=workspace_idle_revision+1,"
+            "freeze_data=$4::jsonb WHERE id=$1",
+            owner,
+            parent,
+            json.dumps(context),
+            json.dumps({"freeze_type": "job_complete", "summary": "approved"}),
+        )
+        result = await controls.approve_job(
+            str(owner),
+            user={"id": "reviewer"},
+            job=await db.get_job(str(owner)),
+            request=None,
+        )
+        assert result["status"] == "approved"
+        marked = json.loads(
+            (
+                await db.fetchrow(
+                    "SELECT context FROM jobs WHERE id=$1",
+                    owner,
+                )
+            )["context"]
+        )
+        assert ("_job_terminal_vm_cleanup" in marked) is (flag is not True)
+        if flag is not True:
+            assert marked["_job_terminal_vm_cleanup"]["provision_generation"] == str(
+                identity["generation"]
+            )
+            expected.add(str(owner))
+
+    assert {
+        row["id"]
+        for row in await db.list_terminal_vm_cleanup_jobs(
+            limit=25,
+        )
+    } == expected

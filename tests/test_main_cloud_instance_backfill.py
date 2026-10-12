@@ -22,6 +22,8 @@ from fastapi import HTTPException
 from orchestrator.routers.main_cloud_settings import (
     backfill_main_cloud_instance_authority,
 )
+from orchestrator.application import access as access_composition
+from orchestrator.application import workspace as workspace_composition
 
 
 PROOF = "025b48d99509423b4b10d0b8963270a2b0202f167345f1f506eb798f884c4768"
@@ -77,29 +79,35 @@ def _run(db, *, reattest=True):
 
     The route moved to ``routers.main_cloud_settings`` and its body to
     ``services.main_cloud_settings``; both read their collaborators from the
-    injected ``MainCloudSettingsRouteDependencies``, which ``main`` builds from
-    the same globals this patches. ``reload_active_main_cloud_instance`` is now
-    imported into the *service* module's namespace, so it has to be patched
-    there — patching it on ``main`` would no longer intercept.
+    injected ``MainCloudSettingsRouteDependencies``, which the workspace
+    composition builds from the application's resources this patches; the
+    admin gate is the access composition's, bound to the same application.
+    ``reload_active_main_cloud_instance`` is imported into the *service*
+    module's namespace, so it has to be patched there.
     """
     import orchestrator.main
     from orchestrator.services import main_cloud_settings as ops
 
+    resources = orchestrator.main.app.state.resources
     admin_gate = AsyncMock(return_value={"id": "admin"})
+
+    async def require_admin(bound_resources, request):
+        assert bound_resources is resources
+        return await admin_gate(request)
+
     reattest_stub = AsyncMock(return_value=reattest)
     with (
-        patch.multiple(
-            orchestrator.main,
-            _require_admin=admin_gate,
-            postgres_db=db,
-        ),
+        patch.object(access_composition, "require_admin", require_admin),
+        patch.object(resources, "postgres_db", db),
         patch.object(ops, "reload_active_main_cloud_instance", reattest_stub),
     ):
-        dependencies = orchestrator.main._main_cloud_settings_dependencies()
-        # Proof the patches intercept: the factory resolves these globals live,
-        # so the endpoint runs against exactly the doubles wired here.
+        dependencies = workspace_composition.main_cloud_settings_dependencies(resources)
+        # Proof the patches intercept: the factory reads the application's
+        # resources and the gate owner live, so the endpoint runs against
+        # exactly the doubles wired here.
         assert dependencies.operations.store is db
-        assert dependencies.require_admin is admin_gate
+        assert dependencies.require_admin.func is require_admin
+        assert dependencies.require_admin.args == (resources,)
         yield SimpleNamespace(
             dependencies=dependencies,
             admin_gate=admin_gate,

@@ -1,12 +1,14 @@
 import {Component} from '@angular/core';
 import {DatasourceListComponent} from './datasource-list.component';
+import {CustomizeTabsComponent} from '../../shell/customize-tabs/customize-tabs.component';
 
 @Component({
   selector: 'app-datasources-page',
   standalone: true,
-  imports: [DatasourceListComponent],
+  imports: [DatasourceListComponent, CustomizeTabsComponent],
   template: `
     <div class="page">
+      <app-customize-tabs />
       <main class="page-content">
         <app-datasource-list />
       </main>

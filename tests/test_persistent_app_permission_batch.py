@@ -21,6 +21,12 @@ PINNED_AGENT_ID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
 def _exact_pinned_permission_owner(monkeypatch):
     """Permission sweeps in this unit module run as one exact pinned owner."""
 
+    # These legacy unit sessions have no advertised generation/attach contract.
+    # A prior file's modern runtime must not supply authority to their fakes.
+    monkeypatch.setattr(pa._session_identity, "_runtime_contract", False)
+    monkeypatch.setattr(pa._session_identity, "_status_contract", False)
+    monkeypatch.setattr(pa._session_identity, "_session_generation", None)
+    monkeypatch.setattr(pa._session_identity, "_attach_token", None)
     monkeypatch.setattr(
         pa,
         "_permission_retirement_authority",
@@ -76,7 +82,7 @@ class TestAnnounceBatch:
         bcast = MagicMock()
         with (
             patch.object(pa, "_session", _mock_session()),
-            patch.object(pa, "_thread_id", "tid"),
+            patch.object(pa._session_identity, "_thread_id", "tid"),
             patch.object(pa, "_insert_permission_request", _insert),
             patch.object(pa, "_broadcast", bcast),
         ):
@@ -97,7 +103,7 @@ class TestAnnounceBatch:
         insert = AsyncMock()
         with (
             patch.object(pa, "_session", _mock_session("autonomous")),
-            patch.object(pa, "_thread_id", "tid"),
+            patch.object(pa._session_identity, "_thread_id", "tid"),
             patch.object(pa, "_insert_permission_request", insert),
             patch.object(pa, "_broadcast", bcast),
         ):
@@ -120,7 +126,7 @@ class TestAnnounceBatch:
         bcast = MagicMock()
         with (
             patch.object(pa, "_session", _mock_session("auto_accept")),
-            patch.object(pa, "_thread_id", "tid"),
+            patch.object(pa._session_identity, "_thread_id", "tid"),
             patch.object(pa, "_insert_permission_request", _insert),
             patch.object(pa, "_broadcast", bcast),
         ):
@@ -137,7 +143,7 @@ class TestAnnounceBatch:
         bcast = MagicMock()
         with (
             patch.object(pa, "_session", _mock_session()),
-            patch.object(pa, "_thread_id", "tid"),
+            patch.object(pa._session_identity, "_thread_id", "tid"),
             patch.object(pa, "_insert_permission_request", _insert),
             patch.object(pa, "_broadcast", bcast),
         ):
@@ -184,7 +190,7 @@ class TestClaimsAnnouncedRow:
 
         with (
             patch.object(pa, "_session", session),
-            patch.object(pa, "_thread_id", "tid"),
+            patch.object(pa._session_identity, "_thread_id", "tid"),
             patch.object(pa, "_subscribers", {"c1": MagicMock()}),
             patch.object(pa, "_insert_permission_request", insert),
             patch.object(pa, "_wait_for_permission_resolution", _wait),
@@ -205,7 +211,7 @@ class TestClaimsAnnouncedRow:
 
         with (
             patch.object(pa, "_session", session),
-            patch.object(pa, "_thread_id", "tid"),
+            patch.object(pa._session_identity, "_thread_id", "tid"),
             patch.object(pa, "_subscribers", {"c1": MagicMock()}),
             patch.object(pa, "_insert_permission_request", AsyncMock()),
             patch.object(
@@ -229,7 +235,7 @@ class TestClaimsAnnouncedRow:
 
         with (
             patch.object(pa, "_session", session),
-            patch.object(pa, "_thread_id", "tid"),
+            patch.object(pa._session_identity, "_thread_id", "tid"),
             patch.object(pa, "_subscribers", {"c1": MagicMock()}),
             patch.object(pa, "_insert_permission_request", insert),
             patch.object(
@@ -321,7 +327,7 @@ class TestAnnounceSkipsTerminalRows:
 
         with (
             patch.object(pa, "_session", session),
-            patch.object(pa, "_thread_id", "tid"),
+            patch.object(pa._session_identity, "_thread_id", "tid"),
             patch.object(pa, "_insert_permission_request", insert),
             patch.object(pa, "_broadcast", bcast),
         ):
@@ -355,7 +361,7 @@ class TestCallbackWiring:
 
         with (
             patch.object(pa, "_session", _mock_session()),
-            patch.object(pa, "_thread_id", "tid"),
+            patch.object(pa._session_identity, "_thread_id", "tid"),
             patch.object(pa, "_loop_task", None),
             patch.object(pa, "_session_ready", lambda: True),
             patch.object(pa, "run_persistent_loop", _fake_run),
@@ -468,7 +474,7 @@ class TestAnnouncedRowsDoNotOutliveTheTurn:
 
         with (
             patch.object(pa, "_session", session),
-            patch.object(pa, "_thread_id", "tid"),
+            patch.object(pa._session_identity, "_thread_id", "tid"),
             patch.object(pa, "_announced_permission_rows", {}),
             patch.object(pa, "_subscribers", {}),
             patch.object(pa, "_broadcast", MagicMock()),
@@ -499,7 +505,7 @@ class TestAnnouncedRowsDoNotOutliveTheTurn:
 
         with (
             patch.object(pa, "_session", session),
-            patch.object(pa, "_thread_id", "tid"),
+            patch.object(pa._session_identity, "_thread_id", "tid"),
             patch.object(pa, "_announced_permission_rows", {}),
             patch.object(pa, "_subscribers", {"c1": MagicMock()}),
             patch.object(pa, "_broadcast", MagicMock()),
@@ -528,7 +534,7 @@ class TestAnnouncedRowsDoNotOutliveTheTurn:
 
         with (
             patch.object(pa, "_session", session),
-            patch.object(pa, "_thread_id", "tid"),
+            patch.object(pa._session_identity, "_thread_id", "tid"),
             patch.object(pa, "_announced_permission_rows", {}),
             patch.object(pa, "_subscribers", {"c1": MagicMock()}),
             patch.object(pa, "_broadcast", bcast),
@@ -559,7 +565,7 @@ class TestAnnouncedRowsDoNotOutliveTheTurn:
 
         with (
             patch.object(pa, "_session", session),
-            patch.object(pa, "_thread_id", "tid"),
+            patch.object(pa._session_identity, "_thread_id", "tid"),
             patch.object(pa, "_announced_permission_rows", {}),
             patch.object(pa, "_subscribers", {"c1": MagicMock()}),
             patch.object(pa, "_broadcast", MagicMock()),
@@ -584,7 +590,7 @@ class TestAnnouncedRowsDoNotOutliveTheTurn:
 
         with (
             patch.object(pa, "_session", session),
-            patch.object(pa, "_thread_id", "tid"),
+            patch.object(pa._session_identity, "_thread_id", "tid"),
             patch.object(pa, "_announced_permission_rows", {}),
             patch.object(pa, "_subscribers", {"c1": MagicMock()}),
             patch.object(pa, "_broadcast", MagicMock()),
@@ -619,7 +625,7 @@ class TestClaimSelectSoftFailKeepsTheAnnouncedRow:
 
         with (
             patch.object(pa, "_session", session),
-            patch.object(pa, "_thread_id", "tid"),
+            patch.object(pa._session_identity, "_thread_id", "tid"),
             patch.object(pa, "_announced_permission_rows", {}),
             patch.object(pa, "_subscribers", {"c1": MagicMock()}),
             patch.object(pa, "_broadcast", MagicMock()),
@@ -647,7 +653,7 @@ class TestClaimSelectSoftFailKeepsTheAnnouncedRow:
 
         with (
             patch.object(pa, "_session", session),
-            patch.object(pa, "_thread_id", "tid"),
+            patch.object(pa._session_identity, "_thread_id", "tid"),
             patch.object(pa, "_announced_permission_rows", ledger),
             patch.object(pa, "_subscribers", {}),
             patch.object(pa, "_broadcast", MagicMock()),
@@ -738,7 +744,7 @@ class TestSweepCannotExpireAGateMidClaim:
 
         with (
             patch.object(pa, "_session", session),
-            patch.object(pa, "_thread_id", "tid"),
+            patch.object(pa._session_identity, "_thread_id", "tid"),
             patch.object(pa, "_announced_permission_rows", {}),
             patch.object(pa, "_gates_in_flight", set()),
             patch.object(pa, "_active_permission_request_id", None),
@@ -780,7 +786,7 @@ class TestGateReservationIsAlwaysReleased:
 
         with (
             patch.object(pa, "_session", session),
-            patch.object(pa, "_thread_id", "tid"),
+            patch.object(pa._session_identity, "_thread_id", "tid"),
             patch.object(pa, "_gates_in_flight", gates),
             patch.object(pa, "_announced_permission_rows", {}),
             patch.object(pa, "_subscribers", {"c1": MagicMock()}),
@@ -799,7 +805,7 @@ class TestGateReservationIsAlwaysReleased:
 
         with (
             patch.object(pa, "_session", session),
-            patch.object(pa, "_thread_id", "tid"),
+            patch.object(pa._session_identity, "_thread_id", "tid"),
             patch.object(pa, "_gates_in_flight", gates),
             patch.object(pa, "_announced_permission_rows", {}),
             patch.object(pa, "_subscribers", {"c1": MagicMock()}),
@@ -820,7 +826,7 @@ class TestGateReservationIsAlwaysReleased:
 
         with (
             patch.object(pa, "_session", session),
-            patch.object(pa, "_thread_id", "tid"),
+            patch.object(pa._session_identity, "_thread_id", "tid"),
             patch.object(pa, "_gates_in_flight", gates),
             patch.object(pa, "_announced_permission_rows", {}),
             patch.object(pa, "_subscribers", {"c1": MagicMock()}),
@@ -850,7 +856,7 @@ class TestGateReservationIsAlwaysReleased:
 
         with (
             patch.object(pa, "_session", session),
-            patch.object(pa, "_thread_id", "tid"),
+            patch.object(pa._session_identity, "_thread_id", "tid"),
             patch.object(pa, "_gates_in_flight", gates),
             patch.object(pa, "_announced_permission_rows", {}),
             patch.object(pa, "_subscribers", {"c1": MagicMock()}),
@@ -894,7 +900,7 @@ class TestSweepWithoutADbKeepsTheLedger:
 
         with (
             patch.object(pa, "_session", session),
-            patch.object(pa, "_thread_id", "tid"),
+            patch.object(pa._session_identity, "_thread_id", "tid"),
             patch.object(pa, "_announced_permission_rows", ledger),
             patch.object(pa, "_gates_in_flight", set()),
             patch.object(pa, "_broadcast", bcast),
@@ -913,7 +919,7 @@ class TestSweepWithoutADbKeepsTheLedger:
 
         with (
             patch.object(pa, "_session", None),
-            patch.object(pa, "_thread_id", "tid"),
+            patch.object(pa._session_identity, "_thread_id", "tid"),
             patch.object(pa, "_announced_permission_rows", ledger),
             patch.object(pa, "_gates_in_flight", set()),
             patch.object(pa, "_broadcast", MagicMock()),
@@ -952,7 +958,7 @@ class TestSweepHoldsExactRuntimeAuthority:
 
         with (
             patch.object(pa, "_session", session),
-            patch.object(pa, "_thread_id", "tid"),
+            patch.object(pa._session_identity, "_thread_id", "tid"),
             patch.object(pa, "_announced_permission_rows", ledger),
             patch.object(pa, "_gates_in_flight", set()),
             patch.object(pa, "_active_permission_request_id", None),
@@ -984,7 +990,7 @@ class TestSweepHoldsExactRuntimeAuthority:
 
         with (
             patch.object(pa, "_session", session),
-            patch.object(pa, "_thread_id", "tid"),
+            patch.object(pa._session_identity, "_thread_id", "tid"),
             patch.object(pa, "_announced_permission_rows", ledger),
             patch.object(pa, "_gates_in_flight", set()),
             patch.object(pa, "_active_permission_request_id", None),
@@ -1014,15 +1020,15 @@ async def _terminate(reason: str = "rest_detach", **kwargs):
     """Drive the real terminate path with everything unrelated stubbed."""
     with (
         patch.object(pa, "_update_thread_status", AsyncMock()),
-        patch.object(pa, "_stop_watchdogs", MagicMock()),
+        patch.object(pa._session_termination, "stop_watchdogs", MagicMock()),
         patch.object(pa, "_stop_thread_control_watcher", AsyncMock()),
         patch.object(pa, "_stop_thread_interrupt_watcher", AsyncMock()),
-        patch.object(pa, "_clear_all_canvas_awareness", MagicMock()),
+        patch.object(pa._canvas_control, "clear_all", MagicMock()),
         patch.object(pa, "_loop_task", None),
         patch.object(pa, "_event_writer", None),
-        patch.object(pa, "_max_sessions_per_process", 0),
+        patch.object(pa._session_termination, "max_sessions_per_process", 0),
     ):
-        await pa._terminate_session_inner(reason, **kwargs)
+        await pa._session_termination._terminate_inner(reason, **kwargs)
 
 
 class TestTerminateDoesNotStrandOrLeakAnnouncedRows:
@@ -1036,7 +1042,7 @@ class TestTerminateDoesNotStrandOrLeakAnnouncedRows:
 
         with (
             patch.object(pa, "_session", session),
-            patch.object(pa, "_thread_id", "tid-old"),
+            patch.object(pa._session_identity, "_thread_id", "tid-old"),
             patch.object(pa, "_announced_permission_rows", ledger),
             patch.object(pa, "_gates_in_flight", {"tc_0"}),
             patch.object(pa, "_active_permission_request_id", "rid-tc_0"),
@@ -1076,7 +1082,7 @@ class TestTerminateDoesNotStrandOrLeakAnnouncedRows:
 
         with (
             patch.object(pa, "_session", old_session),
-            patch.object(pa, "_thread_id", "tid-old"),
+            patch.object(pa._session_identity, "_thread_id", "tid-old"),
             patch.object(pa, "_announced_permission_rows", ledger),
             patch.object(pa, "_gates_in_flight", set()),
             patch.object(pa, "_active_permission_request_id", None),
@@ -1093,7 +1099,7 @@ class TestTerminateDoesNotStrandOrLeakAnnouncedRows:
             new_session = _session_with_store(store)
             with (
                 patch.object(pa, "_session", new_session),
-                patch.object(pa, "_thread_id", "tid-new"),
+                patch.object(pa._session_identity, "_thread_id", "tid-new"),
             ):
                 await pa._loop_announce_permission_batch(
                     [{"name": "web_search", "args": {}, "id": "tc_new"}]
@@ -1122,7 +1128,7 @@ class TestTerminateDoesNotStrandOrLeakAnnouncedRows:
 
         with (
             patch.object(pa, "_session", session),
-            patch.object(pa, "_thread_id", "tid"),
+            patch.object(pa._session_identity, "_thread_id", "tid"),
             patch.object(pa, "_announced_permission_rows", ledger),
             patch.object(pa, "_gates_in_flight", gates),
             patch.object(pa, "_active_permission_request_id", "rid-tc_0"),
@@ -1155,7 +1161,7 @@ class TestTerminateDoesNotStrandOrLeakAnnouncedRows:
         store.fetchval = AsyncMock(return_value=None)
         with (
             patch.object(pa, "_session", session),
-            patch.object(pa, "_thread_id", "tid"),
+            patch.object(pa._session_identity, "_thread_id", "tid"),
             patch.object(pa, "_announced_permission_rows", ledger),
             patch.object(pa, "_gates_in_flight", set()),
             patch.object(pa, "_active_permission_request_id", None),
@@ -1197,7 +1203,7 @@ class TestSweepIsThreadScoped:
 
         with (
             patch.object(pa, "_session", session),
-            patch.object(pa, "_thread_id", "tid-mine"),
+            patch.object(pa._session_identity, "_thread_id", "tid-mine"),
             patch.object(pa, "_announced_permission_rows", ledger),
             patch.object(pa, "_gates_in_flight", set()),
             patch.object(pa, "_active_permission_request_id", None),
@@ -1231,7 +1237,7 @@ class TestGatesInFlightExclusion:
 
         with (
             patch.object(pa, "_session", session),
-            patch.object(pa, "_thread_id", "tid"),
+            patch.object(pa._session_identity, "_thread_id", "tid"),
             patch.object(pa, "_announced_permission_rows", ledger),
             patch.object(pa, "_gates_in_flight", {"tc_0"}),
             patch.object(pa, "_active_permission_request_id", None),
@@ -1254,7 +1260,7 @@ class TestGatesInFlightExclusion:
 
         with (
             patch.object(pa, "_session", session),
-            patch.object(pa, "_thread_id", "tid"),
+            patch.object(pa._session_identity, "_thread_id", "tid"),
             patch.object(pa, "_announced_permission_rows", ledger),
             patch.object(pa, "_gates_in_flight", set()),
             patch.object(pa, "_active_permission_request_id", "rid-tc_0"),

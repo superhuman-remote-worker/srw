@@ -22,6 +22,12 @@ caught *below* the generic resolve fallback so a denial is never downgraded to
 an unchecked ``config_override``), then unroutable model slots. None may be
 reordered or relaxed: several of them are the only thing standing between a
 revoked connector or a moved workspace and a credential-bearing bundle.
+
+A refusal that fails the job is written here only by a build that persists
+dispatch state. A build that does not (pinned delivery under completion
+commands, and the stateless claim) returns it as a :class:`JobStartRefusal`
+instead, and the claim owner submits it through the completion-command path
+(connector drivers decision 34).
 """
 
 from __future__ import annotations
@@ -36,8 +42,10 @@ from fastapi import HTTPException
 from orchestrator.logging_config import bind_log_context, reset_log_context
 from orchestrator.schemas.job_runtime import JobStartRequest
 from orchestrator.security.access import externalize_gitea_url, redact_config_override
+from orchestrator.services import connector_bind_time, connector_credential_leases
 from orchestrator.services.config_resolver import unrouted_model_slots
-from orchestrator.services.job_datasource_selection import repository_datasource_names
+from orchestrator.services.datasource_policy import SHELL_WORKSPACE_DETAIL
+from orchestrator.services.job_datasource_selection import shell_connector_names
 from orchestrator.services.job_workspace_runtime import (
     JobWorkspaceRuntimeDependencies,
     apply_sticky_sudo_denial,
@@ -54,13 +62,39 @@ from orchestrator.services.manifest_execution_snapshot import (
     srw_snapshot_config,
 )
 from shared.backend_kinds import LITE_BACKENDS
+from shared.connectors.builtin import needs_knowledge_profile
+from orchestrator.services.model_availability import (
+    WHERE_JOB,
+    ModelUnavailable,
+    unavailable_slots,
+)
 from orchestrator.services.job_mutation_target import (
     FRESH_PINNED_RECIPIENT_ATTESTATION_ATTEMPTS,
     FRESH_PINNED_RECIPIENT_ATTESTATION_DELAY_S,
     PinnedJobMutationTarget,
 )
-from shared.runtime.core.loader import canonical_config_name
+from shared.runtime.core.loader import (
+    canonical_config_name,
+    deep_merge,
+    normalize_llm_tiers,
+)
 from shared.workspace_contract import WORKSPACE_RUNTIME_CONTEXT_KEY
+
+
+@dataclass(frozen=True, slots=True)
+class JobStartRefusal:
+    """A start bundle refused for good: the job must end ``failed``.
+
+    :func:`build_job_start_request` returns one only when it does not persist
+    dispatch state. There completion commands own the job's status, or a
+    stale claimant must not write it, so the claim owner submits the refusal
+    through the completion-command path under its own fence (connector
+    drivers decision 34). ``message`` is the job's error message; ``reason``
+    names the refusal for logs.
+    """
+
+    reason: str
+    message: str
 
 
 class JobStartBundleStore(Protocol):
@@ -109,6 +143,9 @@ class JobStartBundleDependencies:
     ]
     build_datasource_tool_override: Callable[
         [list[dict[str, Any]], dict[str, Any] | None], dict[str, Any]
+    ]
+    build_workspace_ssh_identities: Callable[
+        [list[dict[str, Any]]], list[dict[str, Any]] | None
     ]
 
     # Repository authority (B04-era managed repository service).
@@ -256,12 +293,111 @@ async def prepare_job_repository_before_claim(
         return False
 
 
+async def unavailable_models_before_claim(
+    job: Mapping[str, Any],
+    *,
+    dependencies: JobStartBundleDependencies,
+) -> ModelUnavailable | None:
+    """The model refusal :func:`build_job_start_request` would raise, asked
+    before the dispatcher claims the job (unavailable_model_handling.md S4).
+
+    The start bundle refuses only after the claim, and pinned delivery and the
+    stateless claim build it without persisting while completion commands own
+    job status. There the refusal only logs: the job stays ``processing``, is
+    re-queued when its lease expires and is claimed again on a fresh agent,
+    forever. Asked here, the dispatcher fails it with a status CAS like its
+    other pre-claim refusals.
+
+    Reads what the bundle will run: the job's frozen execution snapshot when
+    it has one (its account defaults already fell back when it was admitted,
+    D2). A historical job without one is checked for its explicit pins only,
+    its ``config_override`` over its expert's own configuration; an account
+    default still falls back when such a job is resolved, so it is never
+    refused here. Only the registry is asked; nothing is credentialed.
+
+    ``None`` when every model can run, and when the check cannot tell (no
+    registry source installed yet, or the check itself failed): the start
+    bundle's refusal stays the backstop.
+    """
+    from shared.runtime.core import model_registry
+
+    if not model_registry.lookups_registered():
+        return None
+    job_id = str(job["id"])
+    postgres_db = dependencies.store
+    try:
+        execution_snapshot = await read_execution(postgres_db, "Job", job_id)
+        if execution_snapshot is not None:
+            frozen_blob, _frozen_policy = srw_snapshot_config(execution_snapshot)
+            config = frozen_blob.get("agent")
+        else:
+            config = job.get("config_override") or {}
+            if isinstance(config, str):
+                config = json.loads(config)
+            if dependencies.is_experts_db_enabled():
+                # As resolve_config takes the request layer: a pre-U1 phase
+                # tier is lifted into llm.model, or dropped beside an explicit
+                # one. The flat path (experts DB off) delivers and checks the
+                # tiers as they are.
+                config = normalize_llm_tiers(config, source="request-override")
+                expert_row = (
+                    await postgres_db.get_expert_by_id(str(job["expert_id"]))
+                    if job.get("expert_id")
+                    else None
+                )
+                if expert_row is not None:
+                    from shared.runtime.core.expert_resolution import (
+                        build_expert_config,
+                    )
+
+                    expert_config, _prompts = build_expert_config({}, expert_row)
+                    config = deep_merge(expert_config, config)
+        found = await unavailable_slots(
+            config,
+            user_id=str(job["user_id"]) if job.get("user_id") else None,
+            store=postgres_db,
+            resolve_model=model_registry.resolve_model,
+        )
+    except Exception:  # noqa: BLE001 — the start bundle's refusal is the backstop
+        dependencies.logger.warning(
+            "Dispatch: model check before the claim failed for job %s; the start "
+            "bundle decides",
+            job_id,
+            exc_info=True,
+        )
+        return None
+    return ModelUnavailable(found) if found else None
+
+
+async def _fail_unavailable_model(
+    job_id: str,
+    unavailable: ModelUnavailable,
+    postgres_db: Any,
+    persist_dispatch_state: bool,
+    logger: logging.Logger,
+) -> None:
+    """Fail a job whose configured model cannot run, naming it
+    (unavailable_model_handling.md §5)."""
+    logger.error(
+        "Dispatch: job %s refused, unavailable model slot(s): %s",
+        job_id,
+        [entry.as_dict() for entry in unavailable.entries],
+    )
+    if persist_dispatch_state:
+        await postgres_db.update_job_status(
+            job_id,
+            status="failed",
+            error_message=unavailable.message(where=WHERE_JOB),
+        )
+
+
 async def build_job_start_request(
     job: dict,
     *,
     persist_dispatch_state: bool = True,
+    deliver_connector_leases: bool = True,
     dependencies: JobStartBundleDependencies,
-) -> "JobStartRequest | None":
+) -> "JobStartRequest | JobStartRefusal | None":
     """Build the canonical credential-complete worker start bundle.
 
     Both the pinned push dispatcher and stateless claim-bundle endpoint use
@@ -270,11 +406,23 @@ async def build_job_start_request(
     the historical status/cache writes on a refused bundle. Stateless claim
     assembly disables those writes because credential resolution can outlive
     its queue lease; the final exact-token recheck then makes the whole build
-    read-only from a stale claimant's point of view.
+    read-only from a stale claimant's point of view. It also turns off
+    ``deliver_connector_leases`` and puts the lease tokens into the bundle
+    inside its claim transaction instead.
+
+    ``None`` means nothing more to do here: the job is not ready yet, or a
+    persisting build already wrote its refusal. A build that does not persist
+    returns a refusal that fails the job as a :class:`JobStartRefusal`, for
+    the claim owner to submit through the completion-command path.
     """
     postgres_db = dependencies.store
     gitea_client = dependencies.forge
     logger = dependencies.logger
+
+    def _refused(reason: str, message: str) -> JobStartRefusal | None:
+        # A persisting build has written ``failed`` already; otherwise the
+        # claim owner submits the refusal under its own fence.
+        return None if persist_dispatch_state else JobStartRefusal(reason, message)
 
     job_id = str(job["id"])
     _log_token = bind_log_context(job_id=job_id)
@@ -355,10 +503,10 @@ async def build_job_start_request(
                     status="failed",
                     error_message="connector_unavailable",
                 )
-            return None
+            return _refused("connector_unavailable", "connector_unavailable")
 
         has_knowledge_scope = bool(job.get("project_id")) or any(
-            str(ds.get("type") or "").lower() == "kb" for ds in (resolved_ds or [])
+            needs_knowledge_profile(ds) for ds in (resolved_ds or [])
         )
         dependencies.apply_cloud_storage_override(resolved_ds, job_context)
         datasources_payload = dependencies.build_datasources_payload(resolved_ds)
@@ -386,18 +534,21 @@ async def build_job_start_request(
                 f"{workspace_decision.reason or workspace_decision.state}"
             )
             logger.error("Dispatch: job %s refused — %s", job_id, msg)
-            if persist_dispatch_state and workspace_decision.state in {
-                "invalid",
-                "failed",
-                "mismatch",
-            }:
-                await postgres_db.update_job_status(
-                    job_id=job_id, status="failed", error_message=msg
-                )
+            if workspace_decision.state in {"invalid", "failed", "mismatch"}:
+                if persist_dispatch_state:
+                    await postgres_db.update_job_status(
+                        job_id=job_id, status="failed", error_message=msg
+                    )
+                return _refused("workspace_contract", msg)
             return None
 
         managed_repository_credentials: list[dict[str, Any]] | None = None
+        workspace_ssh_identities: list[dict[str, Any]] | None = None
         if workspace_decision.effective_backend in {"sandbox", "vm"}:
+            # Connector keys only ever reach a shell-capable workspace.
+            workspace_ssh_identities = dependencies.build_workspace_ssh_identities(
+                resolved_ds
+            )
             try:
                 (
                     git_remote_url,
@@ -463,21 +614,21 @@ async def build_job_start_request(
         # lite selection — but this re-checks the fully resolved set, covering
         # resume / VM-resume and any future path that could attach a repo the
         # submit guard never saw.
-        if dependencies.backend_from_override(config_override) in LITE_BACKENDS:
-            repo_names = repository_datasource_names(resolved_ds)
-            if repo_names:
+        lite_backend = dependencies.backend_from_override(config_override)
+        if lite_backend in LITE_BACKENDS:
+            shell_names = shell_connector_names(resolved_ds, lite_backend)
+            if shell_names:
                 msg = (
                     "workspace.backend is a lite tier (virtual/none) but a "
-                    f"connector requiring a shell is attached ({', '.join(repo_names)}). "
-                    "Repository and credential connectors need a full workspace — use "
-                    "backend='sandbox' or 'vm'."
+                    f"connector requiring a shell is attached ({', '.join(shell_names)}). "
+                    f"{SHELL_WORKSPACE_DETAIL} — use backend='sandbox' or 'vm'."
                 )
                 logger.error("Dispatch: job %s rejected — %s", job_id, msg)
                 if persist_dispatch_state:
                     await postgres_db.update_job_status(
                         job_id=job_id, status="failed", error_message=msg
                     )
-                return None
+                return _refused("lite_shell_connector", msg)
             try:
                 config_override = dependencies.inject_lite_workspace_config(
                     config_override, prefix=f"jobs/{job_id}/"
@@ -488,7 +639,7 @@ async def build_job_start_request(
                     await postgres_db.update_job_status(
                         job_id=job_id, status="failed", error_message=str(exc)
                     )
-                return None
+                return _refused("lite_config", str(exc))
             logger.info(
                 "Dispatch: job %s using lite workspace (backend=%s, no pod)",
                 job_id,
@@ -530,7 +681,7 @@ async def build_job_start_request(
                 await postgres_db.update_job_status(
                     job_id=job_id, status="failed", error_message=msg
                 )
-            return None
+            return _refused("missing_ssh_remote", msg)
 
         # Current work delivers its frozen snapshot with current authorization
         # and transient credentials. Only historical jobs without a snapshot
@@ -565,15 +716,21 @@ async def build_job_start_request(
                         job_id, redact_config_override(_resolved)
                     )
             except dependencies.grant_denied_error as gd:
+                detail = dependencies.grant_violations_detail(gd.violations)
                 if persist_dispatch_state:
                     await postgres_db.update_job_status(
                         job_id,
                         status="failed",
-                        error_message=dependencies.grant_violations_detail(
-                            gd.violations
-                        ),
+                        error_message=detail,
                     )
-                return None
+                return _refused("grant_denied", detail)
+            except ModelUnavailable as unavailable:
+                await _fail_unavailable_model(
+                    job_id, unavailable, postgres_db, persist_dispatch_state, logger
+                )
+                return _refused(
+                    "model_unavailable", unavailable.message(where=WHERE_JOB)
+                )
         elif dependencies.is_experts_db_enabled():
             try:
                 expert_row = None
@@ -659,15 +816,22 @@ async def build_job_start_request(
                 )
             except dependencies.grant_denied_error as gd:
                 logger.warning("Dispatch denied for job %s: %s", job_id, gd)
+                detail = dependencies.grant_violations_detail(gd.violations)
                 if persist_dispatch_state:
                     await postgres_db.update_job_status(
                         job_id,
                         status="failed",
-                        error_message=dependencies.grant_violations_detail(
-                            gd.violations
-                        ),
+                        error_message=detail,
                     )
-                return None
+                return _refused("grant_denied", detail)
+            except ModelUnavailable as unavailable:
+                # Fail closed: the flat fallback would run the same model.
+                await _fail_unavailable_model(
+                    job_id, unavailable, postgres_db, persist_dispatch_state, logger
+                )
+                return _refused(
+                    "model_unavailable", unavailable.message(where=WHERE_JOB)
+                )
             except Exception:
                 logger.exception(
                     "Dispatch: resolve_config failed for job %s; falling back "
@@ -680,11 +844,20 @@ async def build_job_start_request(
         # Same helper drives both first-dispatch and resume so an orphaned
         # job re-dispatched to a fresh agent doesn't lose its credentials.
         # (Still injected into config_override for the no-blob fallback path.)
-        config_override = await dependencies.inject_dispatch_credentials(
-            job,
-            config_override,
-            include_kb_profile=has_knowledge_scope,
-        )
+        try:
+            config_override = await dependencies.inject_dispatch_credentials(
+                job,
+                config_override,
+                include_kb_profile=has_knowledge_scope,
+                # Only the config the agent runs refuses: with a delivered blob
+                # this flat copy is not sent.
+                strict=resolved_config is None,
+            )
+        except ModelUnavailable as unavailable:
+            await _fail_unavailable_model(
+                job_id, unavailable, postgres_db, persist_dispatch_state, logger
+            )
+            return _refused("model_unavailable", unavailable.message(where=WHERE_JOB))
         # Log injected env-key NAMES (never values) so a missing credential —
         # e.g. EMBEDDING_API_KEY, which silently disables memory + KB — is
         # greppable at dispatch (embedding_key_missing_silently_disables_memory_and_kb.md).
@@ -716,6 +889,39 @@ async def build_job_start_request(
                     await postgres_db.update_job_status(
                         job_id, status="failed", error_message=msg
                     )
+                return _refused("unrouted_model", msg)
+
+        # Credential leases (connector drivers C2): a lease connector's entry
+        # carries a lease token, never its upstream credential. Issued or
+        # delivered again only after every refusal above, so a refused
+        # bundle mints nothing. The stateless claim defers this to its claim
+        # transaction, where the run_queue lease is re-checked.
+        if deliver_connector_leases:
+            lease_owner = connector_credential_leases.job_lease_owner(job)
+            # A service driver's image is looked up first, outside any
+            # transaction (D5); the delivery then only applies it. A
+            # registered driver's bind is never waited for here: the
+            # dispatcher's preflight held the job until it was bound (D6), and
+            # until each provider-minted credential was live (C5).
+            await connector_credential_leases.prepare_lease_delivery(
+                postgres_db, datasources_payload, owner=lease_owner, bind_wait=0
+            )
+            try:
+                await connector_credential_leases.deliver_connector_leases_with(
+                    postgres_db,
+                    datasources_payload,
+                    owner=lease_owner,
+                )
+            except connector_bind_time.BindTimeError as exc:
+                # A bind still running or retrying waits for a later dispatch;
+                # one that failed for good fails the job with its reason.
+                logger.warning("Dispatch: job %s connector binds: %s", job_id, exc)
+                if isinstance(exc, connector_bind_time.BindTimeRefused):
+                    if persist_dispatch_state:
+                        await postgres_db.update_job_status(
+                            job_id, status="failed", error_message=str(exc)[:1000]
+                        )
+                    return _refused("connector_bind_refused", str(exc)[:1000])
                 return None
 
         # Build job start request. resolved_config and config_override are
@@ -744,6 +950,7 @@ async def build_job_start_request(
             datasources=datasources_payload,
             repositories=repositories_payload,
             managed_repository_credentials=managed_repository_credentials,
+            workspace_ssh_identities=workspace_ssh_identities,
             branch_name=job.get("branch_name"),
             project_id=str(job["project_id"]) if job.get("project_id") else None,
             runtime_actor=runtime_actor.to_payload(),
@@ -778,10 +985,12 @@ __all__ = [
     "FRESH_PINNED_RECIPIENT_ATTESTATION_DELAY_S",
     "JobStartBundleDependencies",
     "JobStartBundleStore",
+    "JobStartRefusal",
     "PinnedJobMutationTarget",
     "build_job_start_request",
     "job_project_repositories",
     "mask_repository_transport",
     "prepare_job_repository_before_claim",
     "redispatch_livelock_trip",
+    "unavailable_models_before_claim",
 ]

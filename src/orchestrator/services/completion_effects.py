@@ -12,12 +12,18 @@ from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 from orchestrator.services.completion_effect_policy import COMPLETION_EFFECT_INDEX
 from orchestrator.services.container_provisioner import WorkspaceTeardownIdentity
 from orchestrator.services.vm_workspace_recovery_store import (
+    CleanupPermit,
     bind_vm_cleanup_permit,
     vm_cleanup_kwargs,
     cleanup_intent_digest,
     completed_cleanup_outcome,
+    complete_vm_cleanup_permit,
+    prepare_vm_cleanup_resource,
 )
 from orchestrator.services.workspace_lifecycle import WorkspaceOwner
+from orchestrator.services.completion_teardown_replay import (
+    CancelledContainerCompletionReplay,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -97,6 +103,7 @@ async def run_completion_workspace_teardown(
     effect_runner: Any | None,
     *,
     dependencies: CompletionEffectDependencies,
+    cancelled_container_replay: CancelledContainerCompletionReplay | None = None,
 ) -> dict[str, Any]:
     """Run S36 under its durable report-order/admission authorization.
 
@@ -151,28 +158,70 @@ async def run_completion_workspace_teardown(
                 "resource": resource,
                 "source": "completion_workspace_teardown",
             }
-            permit = await recovery_store.acquire_cleanup_permit(
-                owner_kind="job",
-                owner_id=UUID(job_id),
-                pvc_uid=parsed_pvc_uid,
-                request_id=request_id,
-                source="completion_workspace_teardown",
-                intent_digest=cleanup_intent_digest(resource_intent),
-            )
+            if cancelled_container_replay is not None:
+                if (
+                    effect_runner is not None
+                    or resource != "legacy_workspace"
+                    or job_id != str(cancelled_container_replay.job_id)
+                    or request_id != cancelled_container_replay.request_id
+                    or cleanup_intent_digest(resource_intent)
+                    != cancelled_container_replay.intent_digest
+                    or parsed_pvc_uid is not None
+                ):
+                    raise RuntimeError("completion teardown replay identity changed")
+                permit = (
+                    await recovery_store.acquire_cancelled_container_completion_replay(
+                        cancelled_container_replay
+                    )
+                )
+            else:
+                permit = await recovery_store.acquire_cleanup_permit(
+                    owner_kind="job",
+                    owner_id=UUID(job_id),
+                    pvc_uid=parsed_pvc_uid,
+                    request_id=request_id,
+                    source="completion_workspace_teardown",
+                    intent_digest=cleanup_intent_digest(resource_intent),
+                )
             if not permit.allowed:
                 raise RuntimeError(
                     "workspace teardown held for unresolved workspace recovery"
                 )
-            return bind_vm_cleanup_permit(
+            bound = bind_vm_cleanup_permit(
                 permit, request_id=request_id, intent=resource_intent
             )
+            if resource == "vm":
+                await prepare_vm_cleanup_resource(recovery_store, bound)
+            return bound
 
         async def _complete_destructive_cleanup(permit: Any, outcome: str) -> None:
+            if cancelled_container_replay is not None:
+                if (
+                    outcome != "completed"
+                    or getattr(permit, "admission_id", None)
+                    != cancelled_container_replay.admission_id
+                    or not await recovery_store.complete_cancelled_container_completion_replay(
+                        cancelled_container_replay
+                    )
+                ):
+                    raise RuntimeError(
+                        "completion teardown replay acknowledgement refused"
+                    )
+                return
             admission_id = getattr(permit, "admission_id", None)
             if admission_id is not None:
-                await recovery_store.complete_cleanup_permit(
-                    admission_id, outcome=outcome
-                )
+                intent = (getattr(permit, "parent_cleanup", None) or {}).get("intent")
+                if isinstance(intent, Mapping) and intent.get("resource") == "vm":
+                    await complete_vm_cleanup_permit(
+                        recovery_store,
+                        permit,
+                        outcome=outcome,
+                        provisioner=vm_provisioner,
+                    )
+                else:
+                    await recovery_store.complete_cleanup_permit(
+                        admission_id, outcome=outcome
+                    )
 
         async def _release_captured_vm(intent: Mapping[str, Any]) -> Any:
             from orchestrator.services.vm_provisioner import (
@@ -212,12 +261,106 @@ async def run_completion_workspace_teardown(
                 or not 1 <= ssh_port <= 65535
             ):
                 raise RuntimeError("VM teardown intent has invalid SSH port")
+            identity = VMTeardownIdentity(
+                provision_generation=generation,
+                vm_uid=vm_uid,
+                rootdisk_pvc_uid=rootdisk_uid,
+                ssh_host=ssh_host,
+                ssh_port=ssh_port,
+                ssh_host_key_fingerprint=ssh_host_key_fingerprint,
+            )
+            from orchestrator.services.vm_job_retained_resume import (
+                acquire_retained_terminal_cleanup,
+                complete_retained_cancel,
+            )
+
+            retained = await acquire_retained_terminal_cleanup(
+                recovery_store,
+                vm_provisioner,
+                job_id=job_id,
+                identity=identity,
+            )
+            if retained is not None:
+                if not isinstance(retained, CleanupPermit) or not retained.allowed:
+                    raise RuntimeError("retained terminal cleanup held")
+                parent = retained.parent_cleanup
+                if (
+                    not isinstance(parent, Mapping)
+                    or not isinstance(parent.get("intent"), Mapping)
+                    or parent["intent"].get("purge_disk") is not False
+                ):
+                    raise RuntimeError("retained terminal cleanup identity changed")
+                replayed = completed_cleanup_outcome(retained)
+                if replayed is not None:
+                    if replayed != "completed":
+                        raise RuntimeError("retained terminal cleanup held")
+                    await complete_vm_cleanup_permit(
+                        recovery_store,
+                        retained,
+                        outcome="completed",
+                        provisioner=vm_provisioner,
+                    )
+                    if (
+                        await complete_retained_cancel(
+                            postgres_db,
+                            job_id,
+                            clear_pending=False,
+                        )
+                        is not True
+                    ):
+                        raise RuntimeError("retained terminal proof incomplete")
+                    return VMTeardownResult("completed", True)
+                if (
+                    await prepare_vm_cleanup_resource(
+                        recovery_store,
+                        retained,
+                    )
+                    is None
+                ):
+                    raise RuntimeError("retained terminal charge unproven")
+                outcome = await vm_provisioner.release_vm_captured(
+                    job_id,
+                    identity,
+                    ssh_host=ssh_host,
+                    ssh_port=ssh_port,
+                    purge_disk=False,
+                    capture_snapshot=False,
+                    **vm_cleanup_kwargs(retained),
+                )
+                if outcome.disposition == "completed":
+                    await complete_vm_cleanup_permit(
+                        recovery_store,
+                        retained,
+                        outcome="completed",
+                        provisioner=vm_provisioner,
+                    )
+                    if (
+                        await complete_retained_cancel(
+                            postgres_db,
+                            job_id,
+                            clear_pending=False,
+                        )
+                        is not True
+                    ):
+                        raise RuntimeError("retained terminal proof incomplete")
+                return outcome
             if (
                 not isinstance(ssh_host_key_fingerprint, str)
                 or not ssh_host_key_fingerprint.startswith("SHA256:")
                 or any(character.isspace() for character in ssh_host_key_fingerprint)
             ):
                 raise RuntimeError("VM teardown intent has invalid SSH host key")
+            from orchestrator.services.vm_idle_lifecycle import (
+                retained_terminal_rootdisk,
+            )
+
+            if await retained_terminal_rootdisk(
+                postgres_db,
+                job_id=job_id,
+                generation=generation,
+                pvc_uid=rootdisk_uid,
+            ):
+                raise RuntimeError("terminal_retention_unknown: exact rootdisk held")
             cleanup = await _admit_destructive_cleanup(
                 rootdisk_uid,
                 resource="vm",
@@ -230,17 +373,12 @@ async def run_completion_workspace_teardown(
             replayed = completed_cleanup_outcome(cleanup)
             if replayed is not None:
                 outcome = VMTeardownResult(replayed, replayed == "completed")
+                if replayed == "completed":
+                    await _complete_destructive_cleanup(cleanup, "completed")
             else:
                 outcome = await vm_provisioner.release_vm_captured(
                     job_id,
-                    VMTeardownIdentity(
-                        provision_generation=generation,
-                        vm_uid=vm_uid,
-                        rootdisk_pvc_uid=rootdisk_uid,
-                        ssh_host=ssh_host,
-                        ssh_port=ssh_port,
-                        ssh_host_key_fingerprint=ssh_host_key_fingerprint,
-                    ),
+                    identity,
                     ssh_host=ssh_host,
                     ssh_port=ssh_port,
                     purge_disk=True,
@@ -376,6 +514,29 @@ async def run_completion_workspace_teardown(
                         "teardown_disposition": "deferred",
                         "higher_report_seq": authorization.higher_report_seq,
                     }
+
+            # A legacy/default-off S36 callback has no captured VM intent.
+            # A newly managed terminal rootdisk still retains its independent
+            # disposition after the idle flag is disabled.
+            if effect_runner is None and hasattr(postgres_db, "acquire"):
+                current_job = await postgres_db.get_job(job_id)
+                current_vm = (
+                    _get_vm_context(current_job) if current_job is not None else {}
+                )
+                if isinstance(current_vm, Mapping):
+                    from orchestrator.services.vm_idle_lifecycle import (
+                        retained_terminal_rootdisk,
+                    )
+
+                    if await retained_terminal_rootdisk(
+                        postgres_db,
+                        job_id=job_id,
+                        generation=current_vm.get("provision_generation"),
+                        pvc_uid=current_vm.get("rootdisk_pvc_uid"),
+                    ):
+                        raise RuntimeError(
+                            "terminal_retention_unknown: exact rootdisk held"
+                        )
 
             use_uid_fenced_kubernetes_teardown = False
             use_identity_fenced_vm_teardown = False
@@ -533,13 +694,48 @@ async def run_completion_workspace_teardown(
             if not (
                 use_identity_fenced_vm_teardown or use_uid_fenced_kubernetes_teardown
             ):
+                from orchestrator.services.vm_legacy_completion_cleanup import (
+                    routes_terminal_vm_to_archive,
+                )
+
+                legacy_job = (
+                    await postgres_db.get_job(job_id) if effect_runner is None else None
+                )
+                if effect_runner is None and routes_terminal_vm_to_archive(legacy_job):
+                    # Archive already admits exact VM authority. A broad legacy
+                    # owner claim here would block that normal admission.
+                    cleanup_actions = await _archive_and_cleanup_workspace(job_id)
+                    return {
+                        "actions": list(cleanup_actions),
+                        "teardown_disposition": "completed",
+                    }
                 cleanup = await _admit_destructive_cleanup(
                     None,
                     resource="legacy_workspace",
                     intent={"purge_workspace": True},
                 )
                 replayed = completed_cleanup_outcome(cleanup)
-                if replayed is None:
+                if replayed is not None and replayed.startswith(
+                    "superseded_before_issue:"
+                ):
+                    from orchestrator.services.vm_legacy_completion_cleanup import (
+                        superseded_legacy_completion_matches,
+                    )
+
+                    current_job = await postgres_db.get_job(job_id)
+                    if (
+                        effect_runner is not None
+                        or not superseded_legacy_completion_matches(
+                            cleanup,
+                            job_id=job_id,
+                            vm=_get_vm_context(current_job),
+                        )
+                    ):
+                        raise RuntimeError("legacy VM cleanup supersession changed")
+                    # Logical supersession never proves physical completion.
+                    # The ordinary exact parent still owns archive/stop/release.
+                    cleanup_actions = await _archive_and_cleanup_workspace(job_id)
+                elif replayed is None:
                     cleanup_actions = await _archive_and_cleanup_workspace(job_id)
                     await _complete_destructive_cleanup(cleanup, "completed")
         except Exception as exc:
@@ -586,9 +782,38 @@ async def run_completion_workspace_teardown(
     return output
 
 
+async def replay_cancelled_container_completion_teardown(
+    replay: CancelledContainerCompletionReplay,
+    *,
+    dependencies: CompletionEffectDependencies,
+) -> bool:
+    """Replay only the selected S36, then verify its durable exact outcome."""
+    if not isinstance(replay, CancelledContainerCompletionReplay):
+        return False
+    result = await run_completion_workspace_teardown(
+        str(replay.job_id),
+        None,
+        dependencies=dependencies,
+        cancelled_container_replay=replay,
+    )
+    if result.get("teardown_disposition") != "completed":
+        return False
+    permit = (
+        await dependencies.recovery_store.acquire_cancelled_container_completion_replay(
+            replay
+        )
+    )
+    return bool(
+        permit.allowed
+        and permit.admission_id == replay.admission_id
+        and completed_cleanup_outcome(permit) == "completed"
+    )
+
+
 __all__ = [
     "CompletionEffectDependencies",
     "completion_effect_dedup_key",
     "run_completion_effect",
     "run_completion_workspace_teardown",
+    "replay_cancelled_container_completion_teardown",
 ]

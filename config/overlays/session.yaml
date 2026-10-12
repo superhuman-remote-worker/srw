@@ -46,6 +46,14 @@ tools:
   # Not used in persistent mode
   communication: [ ]
 
+browser:
+  security:
+    # A session's browser runs in its own workspace container (browser-exec
+    # over SSH), so localhost is that container, as in the worker overlay. The
+    # agent can then preview a page it serves itself. Cloud metadata stays
+    # blocked.
+    blocked_domains: ["169.254.169.254"]
+
 limits:
   # The persistent loop's in-process LLM attempt ceiling per turn (it used to
   # be a hard-coded 3 in src/agent/persistent_graph.py; U3 WP1 reads this key so a

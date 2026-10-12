@@ -3,6 +3,7 @@
 import asyncio
 import logging
 from unittest.mock import ANY, AsyncMock, MagicMock, patch
+from uuid import UUID
 
 import pytest
 
@@ -11,6 +12,16 @@ IDE_RUNTIME = "11111111-1111-4111-8111-111111111111"
 IDE_RESERVATION = "22222222-2222-4222-8222-222222222222"
 IDE_CLAIM_TOKEN = 7
 IDE_WORK_TOKEN = 11
+
+
+@pytest.fixture(autouse=True)
+def legacy_resource_cleanup(monkeypatch):
+    """Synthetic IDE cleanup owners have no v3 resource charge."""
+    import orchestrator.services.vm_workspace_recovery_store as recovery
+
+    monkeypatch.setattr(
+        recovery, "prepare_vm_cleanup_resource", AsyncMock(return_value=None)
+    )
 
 
 class _ExactIdeRuntimeDB:
@@ -69,7 +80,10 @@ def browser_ide_transport_available(monkeypatch):
 @pytest.fixture
 def service_factory():
     from orchestrator.services.ide_session import IdeSessionService
-    from orchestrator.services.container_provisioner import WorkspaceRuntimeAttestation
+    from orchestrator.services.container_provisioner import (
+        ContainerProvisioner,
+        WorkspaceRuntimeAttestation,
+    )
 
     db = AsyncMock()
     db.merge_ide_session_context = AsyncMock()
@@ -89,7 +103,7 @@ def service_factory():
         }
     )
 
-    container_provisioner = AsyncMock()
+    container_provisioner = AsyncMock(spec_set=ContainerProvisioner)
     container_provisioner.is_available = True
     creation = {
         "id": IDE_RESERVATION,
@@ -104,8 +118,11 @@ def service_factory():
     )
     container_provisioner.get_ide_creation_result = AsyncMock(return_value=creation)
 
-    async def claim_restore_work(_job_id, *, claimant, lease_seconds=300):
+    async def claim_restore_work(
+        _job_id, *, claimant, lease_seconds=300, expected_runtime_incarnation
+    ):
         assert lease_seconds == 300
+        assert expected_runtime_incarnation == IDE_RUNTIME
         return {
             **creation,
             "restore_work_claimed_by": claimant,
@@ -169,6 +186,20 @@ def _k8s_ide_job(*, job_id: str, runtime_incarnation: str) -> dict:
     }
 
 
+def _native_ide_cleanup(svc, state="settled", *, error=None):
+    from orchestrator.services.container_provisioner import (
+        ContainerProvisioner,
+        WorkspaceCleanupOutcome,
+    )
+
+    provisioner = ContainerProvisioner()
+    provisioner.reconcile_ide_cleanup_intent = AsyncMock(
+        return_value=WorkspaceCleanupOutcome(state), side_effect=error
+    )
+    svc._container_provisioner = provisioner
+    return provisioner.reconcile_ide_cleanup_intent
+
+
 @pytest.mark.asyncio
 async def test_vm_ide_delete_stands_down_for_workspace_recovery(
     service_factory,
@@ -217,6 +248,7 @@ async def test_stop_k8s_ide_stale_deletion_is_superseded_without_context_mutatio
     svc._delete_k8s_ide_container_with_outcome = AsyncMock(
         return_value=RuntimeDeletionOutcome("stale_target_settled")
     )
+    reconcile = _native_ide_cleanup(svc, "superseded")
 
     result = await svc.stop_session(job_id)
 
@@ -227,20 +259,20 @@ async def test_stop_k8s_ide_stale_deletion_is_superseded_without_context_mutatio
     }
     assert db.cas_calls == []
     assert db.unconditional_calls == []
+    reconcile.assert_awaited_once_with(job_id, expected_runtime_incarnation=runtime)
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("outcome_state", "expected_status", "expected_result"),
+    ("outcome_state", "expected_result"),
     (
-        ("current_deleted", "expired", "stopped"),
-        ("refused", "cleanup_pending", "cleanup_pending"),
+        ("current_deleted", "stopped"),
+        ("refused", "cleanup_pending"),
     ),
 )
 async def test_stop_k8s_ide_projects_outcome_through_exact_runtime_cas(
     service_factory,
     outcome_state,
-    expected_status,
     expected_result,
 ):
     from orchestrator.services.container_provisioner import RuntimeDeletionOutcome
@@ -253,23 +285,28 @@ async def test_stop_k8s_ide_projects_outcome_through_exact_runtime_cas(
     svc._delete_k8s_ide_container_with_outcome = AsyncMock(
         return_value=RuntimeDeletionOutcome(outcome_state)
     )
+    reconcile = _native_ide_cleanup(svc)
 
     result = await svc.stop_session(job_id)
 
     assert result["status"] == expected_result
-    assert len(db.cas_calls) == 1
-    observed_job, updates, observed_runtime = db.cas_calls[0]
-    assert observed_job == job_id
-    assert observed_runtime == runtime
-    assert updates["status"] == expected_status
+    if outcome_state == "current_deleted":
+        assert len(db.cas_calls) == 1
+        observed_job, updates, observed_runtime = db.cas_calls[0]
+        assert observed_job == job_id
+        assert observed_runtime == runtime
+        assert updates["status"] == "expired"
+        reconcile.assert_awaited_once_with(job_id, expected_runtime_incarnation=runtime)
+    else:
+        assert result["retryable"] is True
+        assert db.cas_calls == []
+        reconcile.assert_not_awaited()
     assert db.unconditional_calls == []
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("outcome_state", ("current_deleted", "refused"))
 async def test_stop_k8s_ide_cas_loss_preserves_successor(
     service_factory,
-    outcome_state,
 ):
     from orchestrator.services.container_provisioner import RuntimeDeletionOutcome
 
@@ -282,8 +319,9 @@ async def test_stop_k8s_ide_cas_loss_preserves_successor(
     )
     svc._db = db
     svc._delete_k8s_ide_container_with_outcome = AsyncMock(
-        return_value=RuntimeDeletionOutcome(outcome_state)
+        return_value=RuntimeDeletionOutcome("current_deleted")
     )
+    _native_ide_cleanup(svc)
 
     result = await svc.stop_session(job_id)
 
@@ -295,6 +333,73 @@ async def test_stop_k8s_ide_cas_loss_preserves_successor(
     assert len(db.cas_calls) == 1
     assert db.cas_calls[0][2] == runtime
     assert db.unconditional_calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("physical_state", ["current_deleted", "stale_target_settled"])
+@pytest.mark.parametrize("fault", ["retryable", "exception", "missing"])
+async def test_stop_k8s_ide_unsettled_cleanup_remains_retryable_without_projection(
+    service_factory, physical_state, fault
+):
+    from orchestrator.services.container_provisioner import RuntimeDeletionOutcome
+
+    job_id = "77777777-7777-4777-8777-777777777777"
+    runtime = "88888888-8888-4888-8888-888888888888"
+    svc = service_factory
+    db = _ExactIdeRuntimeDB(_k8s_ide_job(job_id=job_id, runtime_incarnation=runtime))
+    svc._db = db
+    svc._delete_k8s_ide_container_with_outcome = AsyncMock(
+        return_value=RuntimeDeletionOutcome(physical_state)
+    )
+    if fault == "missing":
+        svc._container_provisioner = object()
+    else:
+        _native_ide_cleanup(
+            svc,
+            "retryable",
+            error=RuntimeError("cleanup interrupted") if fault == "exception" else None,
+        )
+
+    assert await svc.stop_session(job_id) == {
+        "status": "cleanup_pending",
+        "job_id": job_id,
+        "retryable": True,
+    }
+    assert db.cas_calls == []
+    assert db.unconditional_calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("restore_type", ["k8s_container", "container", "vm"])
+@pytest.mark.parametrize("identity", ["exact", "missing", "malformed"])
+async def test_stop_retiring_ide_requires_exact_k8s_identity(
+    service_factory, restore_type, identity
+):
+    from orchestrator.services.container_provisioner import RuntimeDeletionOutcome
+
+    job_id = "99999999-9999-4999-8999-999999999999"
+    runtime = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+    job = _k8s_ide_job(job_id=job_id, runtime_incarnation=runtime)
+    session = job["context"]["ide_session"]
+    session.update(status="retiring_process_zero", restore_type=restore_type)
+    if identity == "missing":
+        session.pop("_runtime_incarnation")
+    elif identity == "malformed":
+        session["_runtime_incarnation"] = "not-a-runtime"
+    svc = service_factory
+    svc._db = _ExactIdeRuntimeDB(job)
+    svc._delete_k8s_ide_container_with_outcome = AsyncMock(
+        return_value=RuntimeDeletionOutcome("current_deleted")
+    )
+    _native_ide_cleanup(svc)
+
+    result = await svc.stop_session(job_id)
+
+    if restore_type == "k8s_container" and identity == "exact":
+        assert result["status"] == "stopped"
+    else:
+        assert result["status"] == "no_active_session"
+        svc._delete_k8s_ide_container_with_outcome.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -476,6 +581,7 @@ async def test_ide_repository_key_refuses_raw_coordinate_before_loading_secret(
 @pytest.mark.asyncio
 async def test_ide_repository_key_rejects_reused_ip_host_key_before_stdin(
     service_factory,
+    caplog,
 ):
     """A same-IP successor with a different SSH key receives zero bytes."""
 
@@ -486,9 +592,12 @@ async def test_ide_repository_key_rejects_reused_ip_host_key_before_stdin(
     svc._run_secret_stdin_process = AsyncMock(return_value=True)
     attestation = svc._container_provisioner.attest_ide_runtime.return_value
 
-    with patch(
-        "orchestrator.services.ssh_helpers._scan_pinned_host_key",
-        new=AsyncMock(return_value=(None, b"SSH host key mismatch")),
+    with (
+        patch(
+            "orchestrator.services.ssh_helpers._scan_pinned_host_key",
+            new=AsyncMock(return_value=(None, b"SSH host key mismatch")),
+        ),
+        caplog.at_level("WARNING", logger="orchestrator.services.ide_session"),
     ):
         assert not await svc._install_and_sync_managed_repository_over_ssh(
             "job-reused-ip",
@@ -503,6 +612,9 @@ async def test_ide_repository_key_rejects_reused_ip_host_key_before_stdin(
 
     svc._run_secret_stdin_process.assert_not_awaited()
     assert bytes(secret) == b"\x00" * len(secret)
+    diagnostic = "\n".join(record.getMessage() for record in caplog.records)
+    assert "phase=host_key" in diagnostic
+    assert "SSH host key mismatch" not in diagnostic
 
 
 @pytest.mark.asyncio
@@ -549,6 +661,7 @@ async def test_repository_key_ssh_is_killed_and_reaped_on_lease_cancellation(
     process = MagicMock(returncode=None)
     process.stdin = MagicMock()
     process.stdin.drain = AsyncMock(return_value=None)
+    process.stdin.wait_closed = AsyncMock(return_value=None)
     started = asyncio.Event()
     blocker = asyncio.Event()
 
@@ -571,7 +684,7 @@ async def test_repository_key_ssh_is_killed_and_reaped_on_lease_cancellation(
         new=AsyncMock(return_value=process),
     ):
         task = asyncio.create_task(svc._run_secret_stdin_process(["ssh"], secret))
-        await started.wait()
+        await asyncio.wait_for(started.wait(), timeout=2)
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await task
@@ -599,6 +712,333 @@ async def test_restore_session_uses_long_vm_wait_estimate(
 
     assert result["status"] == "restoring"
     assert result["estimated_seconds"] == 420
+
+
+@pytest.mark.asyncio
+async def test_first_repo_ide_restore_uses_atomic_attempt_receipt(
+    service_factory, browser_ide_transport_available
+):
+    svc = service_factory
+    svc._db.get_job = AsyncMock(
+        return_value={"id": "job-first-ide", "repo_name": "demo/repo", "context": {}}
+    )
+    svc._container_provisioner._ide_creation_plan = AsyncMock(
+        return_value={"digest": "a" * 64}
+    )
+    reservation = {
+        "id": IDE_RESERVATION,
+        "claim_token": IDE_CLAIM_TOKEN,
+        "reservation_generation": 1,
+        "desired_manifest_digest": "a" * 64,
+    }
+    svc._db.begin_managed_ide_restore_attempt = AsyncMock(
+        return_value={"disposition": "accepted", "reservation": reservation}
+    )
+    svc._restore_session = AsyncMock()
+
+    result = await svc.start_session("job-first-ide")
+    await asyncio.sleep(0)
+
+    assert result["status"] == "restoring"
+    svc._db.begin_managed_ide_restore_attempt.assert_awaited_once()
+    assert (
+        svc._db.begin_managed_ide_restore_attempt.await_args.kwargs[
+            "desired_manifest_digest"
+        ]
+        == "a" * 64
+    )
+    assert svc._restore_session.await_args.kwargs["creation_reservation"] == reservation
+    svc._db.merge_ide_session_context.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("outcome", "expected"),
+    (("aborted", "stopped"), ("retryable", "cleanup_pending")),
+)
+async def test_stop_uidless_ide_restore_cancels_exact_attempt(
+    service_factory, outcome, expected
+):
+    svc = service_factory
+    attempt_id = "44444444-4444-4444-8444-444444444444"
+    svc._db.get_job = AsyncMock(
+        return_value={
+            "id": "job-uidless-stop",
+            "context": {
+                "ide_session": {
+                    "status": "restoring",
+                    "restore_type": "k8s_container",
+                    "_restore_attempt_id": attempt_id,
+                    "_creation_reservation_id": IDE_RESERVATION,
+                    "_creation_claim_token": str(IDE_CLAIM_TOKEN),
+                }
+            },
+        }
+    )
+    svc._container_provisioner.cancel_ide_restore_attempt = AsyncMock(
+        return_value={"reconciliation_outcome": outcome}
+    )
+    svc._delete_ide_vm = AsyncMock()
+    svc._delete_ide_container = AsyncMock()
+
+    result = await svc.stop_session("job-uidless-stop")
+
+    assert result["status"] == expected
+    assert svc._container_provisioner.cancel_ide_restore_attempt.await_args.kwargs == {
+        "attempt_id": attempt_id,
+        "reservation_id": IDE_RESERVATION,
+        "claim_token": IDE_CLAIM_TOKEN,
+    }
+    svc._delete_ide_vm.assert_not_awaited()
+    svc._delete_ide_container.assert_not_awaited()
+    svc._db.merge_ide_session_context.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_post_after_exact_uidless_abort_admits_new_ide_attempt(
+    service_factory, browser_ide_transport_available
+):
+    svc = service_factory
+    svc.get_session_status = AsyncMock(return_value={"status": "available"})
+    svc._db.get_job = AsyncMock(
+        return_value={
+            "id": "job-after-zero-abort",
+            "repo_name": "demo/repo",
+            "context": {
+                "ide_session": {
+                    "status": "expired",
+                    "restore_type": "k8s_container",
+                    "source": "gitea",
+                    "snapshot_type": "gitea",
+                    "_restore_attempt_id": "44444444-4444-4444-8444-444444444444",
+                }
+            },
+        }
+    )
+    svc._container_provisioner._ide_creation_plan = AsyncMock(
+        return_value={"digest": "a" * 64}
+    )
+    svc._db.begin_managed_ide_restore_attempt = AsyncMock(
+        return_value={
+            "disposition": "accepted",
+            "reservation": {
+                "id": IDE_RESERVATION,
+                "claim_token": IDE_CLAIM_TOKEN,
+                "reservation_generation": 2,
+                "desired_manifest_digest": "a" * 64,
+            },
+        }
+    )
+    svc._restore_session = AsyncMock()
+
+    result = await svc.start_session("job-after-zero-abort")
+    await asyncio.sleep(0)
+
+    assert result["status"] == "restoring"
+    svc._db.begin_managed_ide_restore_attempt.assert_awaited_once()
+    assert (
+        svc._restore_session.await_args.kwargs["creation_reservation"]["id"]
+        == IDE_RESERVATION
+    )
+
+
+@pytest.mark.asyncio
+async def test_concurrent_ide_post_loser_reports_winners_restoring_state(
+    service_factory, browser_ide_transport_available
+):
+    svc = service_factory
+    svc.get_session_status = AsyncMock(
+        side_effect=[
+            {"status": "available"},
+            {"status": "restoring", "estimated_seconds": 45},
+        ]
+    )
+    svc._db.get_job = AsyncMock(
+        return_value={
+            "id": "job-concurrent-post",
+            "repo_name": "demo/repo",
+            "context": {},
+        }
+    )
+    svc._container_provisioner._ide_creation_plan = AsyncMock(
+        return_value={"digest": "a" * 64}
+    )
+    svc._db.begin_managed_ide_restore_attempt = AsyncMock(
+        return_value={"disposition": "held"}
+    )
+    svc._restore_session = AsyncMock()
+
+    result = await svc.start_session("job-concurrent-post")
+
+    assert result == {"status": "restoring", "estimated_seconds": 45}
+    svc._restore_session.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_maintenance_continues_expired_exact_ide_attempt_without_owner_post(
+    service_factory,
+):
+    svc = service_factory
+    attempt_id = "44444444-4444-4444-8444-444444444444"
+    job = {
+        "id": "job-expired-issuer",
+        "repo_name": "demo/repo",
+        "context": {
+            "ide_session": {
+                "status": "restoring",
+                "source": "gitea",
+                "snapshot_type": "gitea",
+                "restore_type": "k8s_container",
+                "_restore_attempt_id": attempt_id,
+                "_creation_reservation_id": IDE_RESERVATION,
+                "_creation_claim_token": str(IDE_CLAIM_TOKEN),
+            }
+        },
+    }
+    pending = {
+        "id": IDE_RESERVATION,
+        "owner_id": job["id"],
+        "owner_kind": "job",
+        "scope": "ide",
+        "operation_kind": "restore",
+        "phase": "reserved",
+        "reservation_generation": 9,
+        "claim_token": IDE_CLAIM_TOKEN,
+        "desired_manifest_digest": "a" * 64,
+        "lifecycle_fingerprint": {
+            "restore_attempt_id": attempt_id,
+            "restore_source": "gitea",
+            "restore_snapshot_type": "gitea",
+        },
+    }
+    claimed = {**pending, "claimed_by": "ide-maintenance", "claim_token": 8}
+    svc._db.list_pending_ide_restore_attempts = AsyncMock(return_value=[pending])
+    svc._db.get_job = AsyncMock(return_value=job)
+    svc._db.reserve_managed_repository_workspace_creation = AsyncMock(
+        return_value=claimed
+    )
+    svc._container_provisioner._ide_creation_plan = AsyncMock(
+        return_value={"digest": "a" * 64}
+    )
+    svc._restore_session = AsyncMock()
+
+    assert await svc.reconcile_pending_ide_restore_attempts(limit=1) == 1
+    await asyncio.sleep(0)
+
+    assert svc._db.reserve_managed_repository_workspace_creation.await_count == 1
+    assert (
+        svc._db.reserve_managed_repository_workspace_creation.await_args.kwargs[
+            "expected_existing_reservation_id"
+        ]
+        == IDE_RESERVATION
+    )
+    assert (
+        svc._db.reserve_managed_repository_workspace_creation.await_args.kwargs[
+            "expected_restore_attempt_id"
+        ]
+        == attempt_id
+    )
+    assert svc._restore_session.await_args.kwargs["creation_reservation"] == claimed
+
+
+@pytest.mark.asyncio
+async def test_replacement_restore_passes_fresh_request_context_to_first_b_publication(
+    service_factory,
+):
+    svc = service_factory
+    retired = "33333333-3333-4333-8333-333333333333"
+    request = {
+        "status": "restoring",
+        "source": "gitea",
+        "snapshot_type": "gitea",
+        "started_at": "2026-09-28T05:00:00+00:00",
+        "last_activity": None,
+        "code_server_url": None,
+        "max_lifetime_minutes": 240,
+    }
+    svc._create_or_resume_k8s_ide = AsyncMock(return_value=None)
+
+    await svc._restore_session(
+        "job-replacement-b",
+        {"id": "job-replacement-b", "repo_name": "demo/repo"},
+        "gitea",
+        8,
+        "16Gi",
+        restore_operation_id=retired,
+        restore_context=request,
+    )
+
+    assert svc._create_or_resume_k8s_ide.await_args.kwargs == {
+        "operation_id": retired,
+        "creation_reservation": None,
+        "expected_runtime": None,
+        "replacement_restore_context": request,
+    }
+
+
+@pytest.mark.asyncio
+async def test_maintenance_continues_settled_ide_restore_work_without_recreating_pod(
+    service_factory,
+):
+    svc = service_factory
+    attempt_id = "44444444-4444-4444-8444-444444444444"
+    job = {
+        "id": "job-settled-issuer",
+        "repo_name": "demo/repo",
+        "context": {
+            "ide_session": {
+                "status": "restoring",
+                "source": "gitea",
+                "snapshot_type": "gitea",
+                "restore_type": "k8s_container",
+                "_restore_attempt_id": attempt_id,
+                "_creation_reservation_id": IDE_RESERVATION,
+                "_creation_claim_token": str(IDE_CLAIM_TOKEN),
+                "_runtime_incarnation": IDE_RUNTIME,
+            }
+        },
+    }
+    settled = {
+        "id": IDE_RESERVATION,
+        "owner_id": job["id"],
+        "reservation_generation": 9,
+        "claim_token": IDE_CLAIM_TOKEN,
+        "desired_manifest_digest": "a" * 64,
+        "lifecycle_fingerprint": {"restore_attempt_id": attempt_id},
+        "runtime_incarnation": UUID(IDE_RUNTIME),
+        "result_kind": "settled",
+    }
+    svc._db.list_pending_ide_restore_attempts = AsyncMock(return_value=[settled])
+    svc._db.get_job = AsyncMock(return_value=job)
+    svc._db.reserve_managed_repository_workspace_creation = AsyncMock()
+    svc._restore_session = AsyncMock()
+
+    assert await svc.reconcile_pending_ide_restore_attempts(limit=1) == 1
+    await asyncio.sleep(0)
+
+    svc._db.reserve_managed_repository_workspace_creation.assert_not_awaited()
+    assert (
+        svc._restore_session.await_args.kwargs["expected_restore_runtime"]
+        == IDE_RUNTIME
+    )
+    assert "creation_reservation" not in svc._restore_session.await_args.kwargs
+
+
+@pytest.mark.asyncio
+async def test_ide_maintenance_tick_runs_attempt_continuation_before_ttl():
+    from orchestrator.services.ide_session import ide_session_ttl_sweeper
+
+    shutdown = asyncio.Event()
+    ide_sessions = MagicMock()
+    ide_sessions.reconcile_pending_ide_restore_attempts = AsyncMock(return_value=1)
+
+    async def check_ttl():
+        shutdown.set()
+        return 0
+
+    ide_sessions.check_ttl_all = AsyncMock(side_effect=check_ttl)
+    await ide_session_ttl_sweeper(shutdown, ide_sessions=ide_sessions)
+    ide_sessions.reconcile_pending_ide_restore_attempts.assert_awaited_once()
 
 
 @pytest.mark.asyncio
@@ -870,9 +1310,12 @@ async def test_two_ide_service_instances_run_exact_b_effects_once(service_factor
     shared = first._container_provisioner
     claimed = False
 
-    async def claim(_job_id, *, claimant, lease_seconds=300):
+    async def claim(
+        _job_id, *, claimant, lease_seconds=300, expected_runtime_incarnation
+    ):
         nonlocal claimed
         assert lease_seconds == 300
+        assert expected_runtime_incarnation == IDE_RUNTIME
         if claimed:
             return None
         claimed = True
@@ -920,7 +1363,10 @@ async def test_ide_restart_reclaims_expired_work_token(service_factory):
     svc = service_factory
     creation = svc._container_provisioner.get_current_ide_creation_result.return_value
 
-    async def reclaim(_job_id, *, claimant, lease_seconds=300):
+    async def reclaim(
+        _job_id, *, claimant, lease_seconds=300, expected_runtime_incarnation
+    ):
+        assert expected_runtime_incarnation == IDE_RUNTIME
         return {
             **creation,
             "restore_work_claimed_by": claimant,

@@ -76,6 +76,7 @@ from uuid import UUID, uuid4
 
 import httpx
 
+from orchestrator.services import connector_credential_leases
 from orchestrator.services.container_provisioner import (
     WORKSPACE_RUNTIME_INCARNATION_KEY,
 )
@@ -90,6 +91,12 @@ from orchestrator.services.session_runtime_identity import (
     agent_sha_is_current,
     expected_agent_shas,
     thread_uses_pinned_execution,
+)
+from shared.run_queue import LANE_PINNED
+from shared.session_subagent_batch import (
+    SESSION_SUBAGENT_BATCH_SETTLE_CONTRACT,
+    SESSION_SUBAGENT_BATCH_SETTLE_CONTRACT_KEY,
+    SESSION_SUBAGENT_FANOUT_KEY,
 )
 
 logger = logging.getLogger(__name__)
@@ -140,6 +147,9 @@ class SessionAttachBindingDependencies:
     * ``reserve_session_attach_binding`` / ``release_session_attach_binding``
       / ``send_session_attach_locked`` — this module's own functions, reached
       through main's bridges so a patch there steers the sequencer.
+    * ``session_subagent_fanout`` — ``(lane) -> bool``, the operator's session
+      fan-out switch (``DeploymentSettings.session_subagent_fanout``), read at
+      every attach; off when a composition does not wire it.
     """
 
     store: Any
@@ -159,6 +169,7 @@ class SessionAttachBindingDependencies:
         ..., Awaitable[SessionAttachReleaseOutcome]
     ]
     send_session_attach_locked: Callable[..., Awaitable[bool]]
+    session_subagent_fanout: Callable[[str], bool] = lambda _lane: False
 
 
 async def bind_registered_persistent_agent(
@@ -286,6 +297,15 @@ async def send_session_attach(
     dependencies: SessionAttachBindingDependencies,
 ) -> bool:
     """Serialize connector selection with the complete attach delivery."""
+    # The network part of a lease delivery (a driver image, a git swap
+    # upstream's DNS and TLS) runs before the lock, the pool connection and
+    # the attach reservation; the delivery under them finds it remembered.
+    # A registered driver's bind is started and waited for there too (D6),
+    # so one still running never takes the release-and-successor path; one
+    # that outlasts the wait is delivered later, with a README notice.
+    await connector_credential_leases.prepare_thread_lease_delivery(
+        dependencies.store, thread_id
+    )
     async with dependencies.store.thread_datasource_lock(thread_id):
         return await dependencies.send_session_attach_locked(
             agent,
@@ -383,7 +403,7 @@ async def release_session_attach_binding(
                     thread_id,
                 )
                 agent = await conn.fetchrow(
-                    "SELECT thread_id, current_job_id, status, hostname, pod_uid "
+                    "SELECT thread_id, current_job_id, status, agent_mode, hostname, pod_uid "
                     "FROM agents "
                     "WHERE id = $1 FOR UPDATE",
                     agent_id,
@@ -423,7 +443,6 @@ async def release_session_attach_binding(
                     str(thread.get("status") or "") != "created"
                     or thread.get("runtime_authority_exposed") is not True
                     or agent.get("current_job_id") is not None
-                    or str(agent.get("status") or "") != "session"
                 ):
                     return "unsafe"
                 current_pod_uid = str(agent.get("pod_uid") or "")
@@ -457,6 +476,43 @@ async def release_session_attach_binding(
                     # the marker proven reciprocal to the captured agent in
                     # this same rotation transaction—never UID-delete it.
                     updated_metadata.pop("agent_pod", None)
+                # Dedicated actors advertise booting/ready before setup. Only
+                # their exact protected create-intent Pod plus a monotonic
+                # pre-setup proof may release that delivered life. Other status
+                # mismatches still refuse; zero-admission is repeated below.
+                observed_status = str(agent.get("status") or "")
+                dedicated_pre_setup = bool(
+                    not pre_delivery
+                    and local_runtime_quiesced
+                    and local_quiescence_protocol == "agent_attach_not_started_v1"
+                    and observed_status in {"booting", "ready"}
+                    and str(agent.get("agent_mode") or "") == "persistent"
+                    and isinstance(agent_pod_marker, dict)
+                    and agent_pod_marker.get("protection_protocol") == "finalizer_v1"
+                    and str(agent_pod_marker.get("runtime_generation") or "")
+                    == expected_runtime_generation
+                    and not agent_pod_marker.get("warm_binding_protection")
+                )
+                if dedicated_pre_setup:
+                    # Provisioner ownership lives in the immutable create
+                    # intent, not in the published Pod marker.
+                    dedicated_pre_setup = bool(
+                        await conn.fetchval(
+                            "SELECT EXISTS (SELECT 1 FROM thread_agent_pod_provision_intents "
+                            "WHERE attempt_id::text=$1 AND thread_id=$2::uuid "
+                            "AND runtime_generation=$3::uuid AND provisioner='persistent' "
+                            "AND status='published' AND pod_name=$4 AND pod_uid=$5 "
+                            "AND namespace=$6 AND protection_protocol='finalizer_v1')",
+                            str(agent_pod_marker.get("provision_attempt") or ""),
+                            thread_id,
+                            expected_runtime_generation,
+                            str(agent.get("hostname") or ""),
+                            current_pod_uid,
+                            str(agent_pod_marker.get("namespace") or ""),
+                        )
+                    )
+                if observed_status != "session" and not dedicated_pre_setup:
+                    return "unsafe"
                 warm_binding = None
                 if isinstance(agent_pod_marker, dict) and str(
                     agent_pod_marker.get("warm_binding_protection") or ""
@@ -557,11 +613,13 @@ async def release_session_attach_binding(
                 admitted_input = await conn.fetchval(
                     "SELECT EXISTS (SELECT 1 FROM thread_input_deliveries "
                     "WHERE thread_id=$1::uuid AND owner_agent_id=$2::uuid "
-                    "AND owner_runtime_generation=$3::uuid "
-                    "AND state IN ('admitted','settled'))",
+                    "AND owner_pod_uid=$3 "
+                    "AND (state IN ('admitted','settled') OR "
+                    "($4::boolean AND state IN ('owned','queued'))))",
                     thread_id,
                     agent_id,
-                    expected_runtime_generation,
+                    current_pod_uid,
+                    proof_protocol == "agent_attach_not_started_v1",
                 )
                 admitted_control = await conn.fetchval(
                     "SELECT EXISTS (SELECT 1 FROM thread_control_requests "
@@ -570,6 +628,18 @@ async def release_session_attach_binding(
                     expected_runtime_generation,
                 )
                 if admitted_input or admitted_control:
+                    return "unsafe"
+
+                # Local pre-setup zero says nothing about an external workspace
+                # create already admitted by this thread. Reservation and UID
+                # publication take the same thread lock: either publication
+                # settles first, or the captured life stays bound for normal
+                # retirement. Never rotate away from an unresolved obligation.
+                if await conn.fetchval(
+                    "SELECT EXISTS (SELECT 1 FROM thread_workspace_provision_intents "
+                    "WHERE thread_id=$1::uuid AND status IN ('planned','revoking','fenced'))",
+                    thread_id,
+                ):
                     return "unsafe"
 
                 successor_generation = str(uuid4())
@@ -617,11 +687,12 @@ async def release_session_attach_binding(
                 agent_updated = await conn.execute(
                     "UPDATE agents SET thread_id=NULL, status=$4 "
                     "WHERE id=$1::uuid AND thread_id=$2::uuid "
-                    "AND pod_uid=$3 AND current_job_id IS NULL AND status='session'",
+                    "AND pod_uid=$3 AND current_job_id IS NULL AND status::text=$5",
                     agent_id,
                     thread_id,
                     current_pod_uid,
                     "draining" if warm_binding is not None else "ready",
+                    observed_status,
                 )
                 if thread_updated != "UPDATE 1" or agent_updated != "UPDATE 1":
                     raise _AttachAbortCASLost
@@ -713,6 +784,21 @@ async def acknowledge_retiring_failed_attach(
         return await _settled_readback()
     settle_status = str(context.get("settle_status") or "")
     if settle_status not in {"ended", "suspended"}:
+        return await _settled_readback()
+
+    if local_quiescence_protocol == "agent_attach_not_started_v1" and context.get(
+        "workspace_backend"
+    ) in {"vm", "remote"}:
+        # An agent that never entered setup may request the normal captured
+        # actuator. It cannot attest VM writers, and nomination is not release.
+        await store.request_pinned_pre_setup_retirement(
+            thread_id,
+            runtime_generation=expected_runtime_generation,
+            runtime_attach_token=expected_attach_token,
+            retirement_token=retirement_token,
+            agent_id=agent_id,
+            pod_uid=expected_agent_pod_uid,
+        )
         return await _settled_readback()
 
     receipt_protocol = local_quiescence_protocol
@@ -853,6 +939,26 @@ async def send_session_attach_locked(
         config_name=config_name,
         runtime_agent_id=agent_id,
     )
+    if payload is not None:
+        # Credential leases (connector drivers C2), under the datasource lock
+        # the caller holds: a warm re-attach or a recycled pod receives the
+        # thread's same token; a failed attach revokes nothing. The attach
+        # token is reserved by now, so ANY failure here (a refused lease, a
+        # lost connection, a lock conflict) takes the no-payload path below
+        # and releases the reservation; nothing may escape past it.
+        try:
+            await connector_credential_leases.deliver_connector_leases_with(
+                store,
+                payload.get("datasources"),
+                owner=connector_credential_leases.LeaseOwner.thread(thread_id),
+            )
+        except Exception:
+            logger.warning(
+                "Session attach: connector leases unavailable for thread %s",
+                thread_id,
+                exc_info=True,
+            )
+            payload = None
     if payload is None:
         try:
             release = await dependencies.release_session_attach_binding(
@@ -900,6 +1006,19 @@ async def send_session_attach_locked(
             )
         return release not in {"released", "already_detached"}
     payload["session_runtime_attach_token"] = attach_token
+    # This orchestrator settles an abandoned delegation turn as one batch
+    # (parallel_subagents.md §12). Both pinned /session/attach handlers read
+    # named fields, so the key is safe for agents that predate it; it is NOT
+    # part of the shared payload, which the stateless executor splats into
+    # ``_attach_session`` (the claim bundle advertises it beside ``attach``).
+    payload[SESSION_SUBAGENT_BATCH_SETTLE_CONTRACT_KEY] = (
+        SESSION_SUBAGENT_BATCH_SETTLE_CONTRACT
+    )
+    # The operator's fan-out switch for the pinned lane (§12, D5), read at
+    # this attach; handlers that predate it ignore the named field.
+    payload[SESSION_SUBAGENT_FANOUT_KEY] = bool(
+        dependencies.session_subagent_fanout(LANE_PINNED)
+    )
 
     current = await store.get_thread(thread_id)
     if (

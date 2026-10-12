@@ -9,10 +9,13 @@ the full attempt UUID's reader and group on the immutable backend instance.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
+from typing import Any
 
+from orchestrator.services.cloud import protected_provider
 from orchestrator.services.cloud.protected_effect_contract import (
     NextcloudEffectFenceIntent,
     NextcloudEffectHorizon,
@@ -32,18 +35,25 @@ logger = logging.getLogger(__name__)
 _LIVE_THREAD_STATUSES = {"created", "active", "awaiting_user", "suspended"}
 
 
-async def _resolve_backend_instance(*, postgres_db, router, instance_id: str):
-    """Resolve one retained installation without provider/active fallback."""
+async def _resolve_backend_instance(
+    *, postgres_db, router, instance_id: str, backend_id: object
+):
+    """Resolve one retained installation without provider/active fallback.
 
+    ``backend_id`` is the provider the protected record names; it must be one
+    that offers the protected level (fail closed otherwise).
+    """
+
+    expected_backend_id = protected_provider(backend_id)
     try:
         return router.for_backend_instance(
             instance_id,
-            expected_backend_id="nextcloud",
+            expected_backend_id=expected_backend_id,
         )
     except Exception:
         authority = await postgres_db.get_main_cloud_backend_instance(
             instance_id,
-            expected_backend_id="nextcloud",
+            expected_backend_id=expected_backend_id,
         )
         if authority is None:
             raise RuntimeError("protected reader backend installation is unavailable")
@@ -88,7 +98,12 @@ async def _active_attempt_is_current(
         and protected_cloud_marker_state(_metadata_object(thread)) == "on"
     ):
         return False
-    selected = select_protected_mount(await postgres_db.list_thread_mounts(thread_id))
+    # The session's protected folder (thread_protected_sources; for one
+    # release an older session's thread_mounts row): a grant whose source
+    # it no longer is, is stale.
+    selected = select_protected_mount(
+        await postgres_db.list_protected_selection_rows(thread_id)
+    )
     return bool(
         isinstance(selected, Mapping)
         and str(selected.get("id") or "") == str(row.get("selected_mount_id") or "")
@@ -107,6 +122,7 @@ async def _close_abandoned_effect_intents(*, postgres_db, router) -> int:
                 postgres_db=postgres_db,
                 router=router,
                 instance_id=instance_id,
+                backend_id=row.get("backend_id"),
             )
             key = backend.protected_effect_hmac_key
             config_sha256 = str(row.get("config_sha256") or "")
@@ -192,6 +208,7 @@ async def reconcile_orphaned_ro_mounts(*, postgres_db, router) -> int:
                     postgres_db=postgres_db,
                     router=router,
                     instance_id=plan.backend_instance_id,
+                    backend_id=plan.backend,
                 )
                 if await revoke_ro_mount_attempt(
                     backend=backend,
@@ -212,4 +229,29 @@ async def reconcile_orphaned_ro_mounts(*, postgres_db, router) -> int:
     return revoked
 
 
-__all__ = ["reconcile_orphaned_ro_mounts"]
+async def ro_reader_reconciler_loop(
+    shutdown_event: asyncio.Event, *, store, router: Callable[[], Any]
+) -> None:
+    """Leader-gated periodic sweep of orphaned protected-mode RO grants.
+
+    Revoke-on-teardown alone is not enough (a crash/killed pod can skip it), so
+    this independently revokes any active ``cloud_ro_mounts`` grant whose thread
+    is gone/ended (design §8.1.4). Runs every 15 minutes.
+    """
+    logger.info("RO reader reconciler started")
+    while not shutdown_event.is_set():
+        try:
+            await reconcile_orphaned_ro_mounts(postgres_db=store, router=router())
+        except Exception as e:
+            logger.error("Error in RO reader reconciler: %s", e)
+
+        try:
+            await asyncio.wait_for(shutdown_event.wait(), timeout=900.0)
+            break
+        except asyncio.TimeoutError:
+            pass
+
+    logger.info("RO reader reconciler stopped")
+
+
+__all__ = ["reconcile_orphaned_ro_mounts", "ro_reader_reconciler_loop"]

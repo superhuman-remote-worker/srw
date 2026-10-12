@@ -1,18 +1,45 @@
 """Focused control-plane regressions for stateless worker admission/verbs."""
 
+from orchestrator.services import job_dispatcher
+from orchestrator.services.workspace_lifecycle import EnsureOutcome
+from tests.test_b11_job_dispatcher import dispatch_pending_jobs as run_dispatch_and_wait
 from tests import _b09_control_seams as control_seams
 
 import asyncio
 import json
+from datetime import datetime, timezone
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import ANY, AsyncMock, MagicMock
 from uuid import UUID, uuid4
 
 import pytest
 from fastapi import HTTPException
 
 from orchestrator.database.postgres import PostgresDB
+from orchestrator.application import jobs as jobs_composition
+from orchestrator.application import preparation as preparation_composition
+from orchestrator.application import workflows as workflows_composition
+from orchestrator.schemas import job_controls as job_controls_module
+from orchestrator.schemas import messaging as messaging_module
+from orchestrator.security import access as access_module
+from orchestrator.services import container_provisioner as container_provisioner_module
+from orchestrator.services import grant_enforcement as grant_enforcement_module
+from orchestrator.services import job_dispatcher as job_dispatcher_module
+from orchestrator.services import job_mutation_controls as job_mutation_controls_module
+from orchestrator.services import job_start_bundle as job_start_bundle_module
+from orchestrator.services import (
+    job_workspace_authority as job_workspace_authority_module,
+)
+from orchestrator.services import job_workspace_runtime as job_workspace_runtime_module
+from orchestrator.services import notification_service as notification_service_module
+from orchestrator.services import session_wake as session_wake_module
+from orchestrator.services import subjob_completion as subjob_completion_module
+from orchestrator.services import subjob_output as subjob_output_module
+from orchestrator.services import thread_retirement as thread_retirement_module
+from orchestrator.services import vm_workspace_policy as vm_workspace_policy_module
+from orchestrator.services import workspace as workspace_module
+import httpx
 
 
 JOB_ID = "11111111-1111-1111-1111-111111111111"
@@ -44,19 +71,34 @@ def _db_with_conn(conn):
     return db
 
 
+def _fetch_with(conn, text):
+    """The one ``conn.fetch`` call whose statement holds ``text``."""
+    [call] = [c for c in conn.fetch.await_args_list if c.args and text in c.args[0]]
+    return call
+
+
 def test_omitted_lane_defaults_stateless_when_fully_capable(monkeypatch):
     from orchestrator import main
 
-    monkeypatch.setattr(main, "STATELESS_WORKER_ENABLED", True)
-    monkeypatch.setattr(main.container_provisioner, "_k8s_available", True)
-    monkeypatch.setattr(main.container_provisioner, "_in_cluster", True)
+    monkeypatch.setattr(
+        main.app.state.resources.settings, "stateless_worker_enabled", True
+    )
+    monkeypatch.setattr(
+        container_provisioner_module.container_provisioner, "_k8s_available", True
+    )
+    monkeypatch.setattr(
+        container_provisioner_module.container_provisioner, "_in_cluster", True
+    )
 
     assert (
-        main._resolve_requested_job_execution_lane(
+        job_workspace_runtime_module.resolve_requested_job_execution_lane(
             None,
             default_stateless=True,
             needs_vm=False,
             needs_sandbox=True,
+            dependencies=preparation_composition.job_workspace_runtime_dependencies(
+                main.app.state.resources
+            ),
         )
         == "stateless"
     )
@@ -67,16 +109,25 @@ def test_external_vm_jobs_stay_pinned_across_lane_arms(monkeypatch, requested_la
     from orchestrator import main
 
     monkeypatch.setenv("VM_MODE", "external")
-    monkeypatch.setattr(main, "STATELESS_WORKER_ENABLED", True)
-    monkeypatch.setattr(main.container_provisioner, "_k8s_available", True)
-    monkeypatch.setattr(main.container_provisioner, "_in_cluster", True)
+    monkeypatch.setattr(
+        main.app.state.resources.settings, "stateless_worker_enabled", True
+    )
+    monkeypatch.setattr(
+        container_provisioner_module.container_provisioner, "_k8s_available", True
+    )
+    monkeypatch.setattr(
+        container_provisioner_module.container_provisioner, "_in_cluster", True
+    )
 
     assert (
-        main._resolve_requested_job_execution_lane(
+        job_workspace_runtime_module.resolve_requested_job_execution_lane(
             requested_lane,
             default_stateless=True,
             needs_vm=True,
             needs_sandbox=False,
+            dependencies=preparation_composition.job_workspace_runtime_dependencies(
+                main.app.state.resources
+            ),
         )
         == "pinned"
     )
@@ -86,36 +137,51 @@ def test_same_cluster_vm_is_stateless_for_explicit_and_default_arms(monkeypatch)
     from orchestrator import main
 
     monkeypatch.setenv("VM_MODE", "same-cluster")
-    monkeypatch.setattr(main, "STATELESS_WORKER_ENABLED", True)
+    monkeypatch.setattr(
+        main.app.state.resources.settings, "stateless_worker_enabled", True
+    )
     # VM admission is backed by the authenticated VM controller, not the
     # container provisioner capability used by the sandbox arm.
-    monkeypatch.setattr(main.container_provisioner, "_k8s_available", False)
-    monkeypatch.setattr(main.container_provisioner, "_in_cluster", False)
+    monkeypatch.setattr(
+        container_provisioner_module.container_provisioner, "_k8s_available", False
+    )
+    monkeypatch.setattr(
+        container_provisioner_module.container_provisioner, "_in_cluster", False
+    )
 
     assert (
-        main._resolve_requested_job_execution_lane(
+        job_workspace_runtime_module.resolve_requested_job_execution_lane(
             "stateless",
             default_stateless=True,
             needs_vm=True,
             needs_sandbox=False,
+            dependencies=preparation_composition.job_workspace_runtime_dependencies(
+                main.app.state.resources
+            ),
         )
         == "stateless"
     )
     assert (
-        main._resolve_requested_job_execution_lane(
+        job_workspace_runtime_module.resolve_requested_job_execution_lane(
             None,
             default_stateless=True,
             needs_vm=True,
             needs_sandbox=False,
+            dependencies=preparation_composition.job_workspace_runtime_dependencies(
+                main.app.state.resources
+            ),
         )
         == "stateless"
     )
     assert (
-        main._resolve_requested_job_execution_lane(
+        job_workspace_runtime_module.resolve_requested_job_execution_lane(
             "pinned",
             default_stateless=True,
             needs_vm=True,
             needs_sandbox=False,
+            dependencies=preparation_composition.job_workspace_runtime_dependencies(
+                main.app.state.resources
+            ),
         )
         == "pinned"
     )
@@ -124,16 +190,25 @@ def test_same_cluster_vm_is_stateless_for_explicit_and_default_arms(monkeypatch)
 def test_omitted_lane_default_falls_back_without_sandbox(monkeypatch):
     from orchestrator import main
 
-    monkeypatch.setattr(main, "STATELESS_WORKER_ENABLED", True)
-    monkeypatch.setattr(main.container_provisioner, "_k8s_available", True)
-    monkeypatch.setattr(main.container_provisioner, "_in_cluster", True)
+    monkeypatch.setattr(
+        main.app.state.resources.settings, "stateless_worker_enabled", True
+    )
+    monkeypatch.setattr(
+        container_provisioner_module.container_provisioner, "_k8s_available", True
+    )
+    monkeypatch.setattr(
+        container_provisioner_module.container_provisioner, "_in_cluster", True
+    )
 
     assert (
-        main._resolve_requested_job_execution_lane(
+        job_workspace_runtime_module.resolve_requested_job_execution_lane(
             None,
             default_stateless=True,
             needs_vm=False,
             needs_sandbox=False,
+            dependencies=preparation_composition.job_workspace_runtime_dependencies(
+                main.app.state.resources
+            ),
         )
         is None
     )
@@ -150,16 +225,25 @@ def test_omitted_lane_default_falls_back_without_in_cluster_provisioner(
 ):
     from orchestrator import main
 
-    monkeypatch.setattr(main, "STATELESS_WORKER_ENABLED", True)
-    monkeypatch.setattr(main.container_provisioner, "_k8s_available", available)
-    monkeypatch.setattr(main.container_provisioner, "_in_cluster", in_cluster)
+    monkeypatch.setattr(
+        main.app.state.resources.settings, "stateless_worker_enabled", True
+    )
+    monkeypatch.setattr(
+        container_provisioner_module.container_provisioner, "_k8s_available", available
+    )
+    monkeypatch.setattr(
+        container_provisioner_module.container_provisioner, "_in_cluster", in_cluster
+    )
 
     assert (
-        main._resolve_requested_job_execution_lane(
+        job_workspace_runtime_module.resolve_requested_job_execution_lane(
             None,
             default_stateless=True,
             needs_vm=False,
             needs_sandbox=True,
+            dependencies=preparation_composition.job_workspace_runtime_dependencies(
+                main.app.state.resources
+            ),
         )
         is None
     )
@@ -168,16 +252,25 @@ def test_omitted_lane_default_falls_back_without_in_cluster_provisioner(
 def test_omitted_lane_default_is_subordinate_to_worker_admission(monkeypatch):
     from orchestrator import main
 
-    monkeypatch.setattr(main, "STATELESS_WORKER_ENABLED", False)
-    monkeypatch.setattr(main.container_provisioner, "_k8s_available", True)
-    monkeypatch.setattr(main.container_provisioner, "_in_cluster", True)
+    monkeypatch.setattr(
+        main.app.state.resources.settings, "stateless_worker_enabled", False
+    )
+    monkeypatch.setattr(
+        container_provisioner_module.container_provisioner, "_k8s_available", True
+    )
+    monkeypatch.setattr(
+        container_provisioner_module.container_provisioner, "_in_cluster", True
+    )
 
     assert (
-        main._resolve_requested_job_execution_lane(
+        job_workspace_runtime_module.resolve_requested_job_execution_lane(
             None,
             default_stateless=True,
             needs_vm=False,
             needs_sandbox=True,
+            dependencies=preparation_composition.job_workspace_runtime_dependencies(
+                main.app.state.resources
+            ),
         )
         is None
     )
@@ -186,16 +279,25 @@ def test_omitted_lane_default_is_subordinate_to_worker_admission(monkeypatch):
 def test_omitted_lane_stays_unchanged_when_default_is_off(monkeypatch):
     from orchestrator import main
 
-    monkeypatch.setattr(main, "STATELESS_WORKER_ENABLED", True)
-    monkeypatch.setattr(main.container_provisioner, "_k8s_available", True)
-    monkeypatch.setattr(main.container_provisioner, "_in_cluster", True)
+    monkeypatch.setattr(
+        main.app.state.resources.settings, "stateless_worker_enabled", True
+    )
+    monkeypatch.setattr(
+        container_provisioner_module.container_provisioner, "_k8s_available", True
+    )
+    monkeypatch.setattr(
+        container_provisioner_module.container_provisioner, "_in_cluster", True
+    )
 
     assert (
-        main._resolve_requested_job_execution_lane(
+        job_workspace_runtime_module.resolve_requested_job_execution_lane(
             None,
             default_stateless=False,
             needs_vm=False,
             needs_sandbox=True,
+            dependencies=preparation_composition.job_workspace_runtime_dependencies(
+                main.app.state.resources
+            ),
         )
         is None
     )
@@ -251,16 +353,25 @@ def test_explicit_stateless_infeasibility_still_raises(
 ):
     from orchestrator import main
 
-    monkeypatch.setattr(main, "STATELESS_WORKER_ENABLED", admission_enabled)
-    monkeypatch.setattr(main.container_provisioner, "_k8s_available", available)
-    monkeypatch.setattr(main.container_provisioner, "_in_cluster", in_cluster)
+    monkeypatch.setattr(
+        main.app.state.resources.settings, "stateless_worker_enabled", admission_enabled
+    )
+    monkeypatch.setattr(
+        container_provisioner_module.container_provisioner, "_k8s_available", available
+    )
+    monkeypatch.setattr(
+        container_provisioner_module.container_provisioner, "_in_cluster", in_cluster
+    )
 
     with pytest.raises(HTTPException) as exc:
-        main._resolve_requested_job_execution_lane(
+        job_workspace_runtime_module.resolve_requested_job_execution_lane(
             "stateless",
             default_stateless=True,
             needs_vm=False,
             needs_sandbox=needs_sandbox,
+            dependencies=preparation_composition.job_workspace_runtime_dependencies(
+                main.app.state.resources
+            ),
         )
     assert exc.value.status_code == status_code
     assert exc.value.detail == detail
@@ -269,25 +380,37 @@ def test_explicit_stateless_infeasibility_still_raises(
 def test_explicit_lanes_are_unchanged_when_default_is_on(monkeypatch):
     from orchestrator import main
 
-    monkeypatch.setattr(main, "STATELESS_WORKER_ENABLED", True)
-    monkeypatch.setattr(main.container_provisioner, "_k8s_available", True)
-    monkeypatch.setattr(main.container_provisioner, "_in_cluster", True)
+    monkeypatch.setattr(
+        main.app.state.resources.settings, "stateless_worker_enabled", True
+    )
+    monkeypatch.setattr(
+        container_provisioner_module.container_provisioner, "_k8s_available", True
+    )
+    monkeypatch.setattr(
+        container_provisioner_module.container_provisioner, "_in_cluster", True
+    )
 
     assert (
-        main._resolve_requested_job_execution_lane(
+        job_workspace_runtime_module.resolve_requested_job_execution_lane(
             "pinned",
             default_stateless=True,
             needs_vm=False,
             needs_sandbox=False,
+            dependencies=preparation_composition.job_workspace_runtime_dependencies(
+                main.app.state.resources
+            ),
         )
         == "pinned"
     )
     assert (
-        main._resolve_requested_job_execution_lane(
+        job_workspace_runtime_module.resolve_requested_job_execution_lane(
             "stateless",
             default_stateless=True,
             needs_vm=False,
             needs_sandbox=True,
+            dependencies=preparation_composition.job_workspace_runtime_dependencies(
+                main.app.state.resources
+            ),
         )
         == "stateless"
     )
@@ -339,11 +462,14 @@ async def test_create_job_explicit_lane_is_bound_and_invalid_lane_rejected(monke
 async def test_leased_cancel_publishes_status_without_pruning_checkpoint():
     conn = MagicMock()
     conn.transaction.return_value = _AsyncCM()
+    conn.execute = AsyncMock(return_value="UPDATE 1")
 
     async def fetchrow(sql, *_args):
         normalized = " ".join(sql.split())
         if normalized.startswith("SELECT state FROM run_queue"):
             return {"state": "leased"}
+        if normalized.startswith("SELECT id FROM jobs"):
+            return {"id": UUID(JOB_ID)}
         if normalized.startswith("UPDATE run_queue"):
             return None
         if normalized.startswith("SELECT recovery_id FROM vm_workspace_recovery_jobs"):
@@ -353,10 +479,18 @@ async def test_leased_cancel_publishes_status_without_pruning_checkpoint():
         raise AssertionError(normalized)
 
     conn.fetchrow = AsyncMock(side_effect=fetchrow)
+    conn.fetchval = AsyncMock(return_value=False)
+    conn.fetch = AsyncMock(return_value=[])
     db = _db_with_conn(conn)
 
     assert await db.cancel_stateless_job(JOB_ID) == (True, False)
     db.delete_checkpoint_thread.assert_not_awaited()
+    # The cancel transaction revokes the Job's credential leases (C2) and
+    # requests the revoke of what SRW minted for it at a provider (C5).
+    revoke = _fetch_with(conn, "UPDATE connector_credential_leases")
+    assert revoke.args[1:] == (str(UUID(JOB_ID)), "job_cancelled")
+    minted = _fetch_with(conn, "UPDATE connector_minted_credentials")
+    assert minted.args[1:] == ("job", UUID(JOB_ID), "job_cancelled")
     job_update = next(
         call
         for call in conn.fetchrow.await_args_list
@@ -370,6 +504,10 @@ async def test_leased_cancel_publishes_status_without_pruning_checkpoint():
     # A response-lost retry after cleanup cleared the marker must be able to
     # re-arm idempotent cleanup instead of waiting the full settle timeout.
     assert "status::text <> 'cancelled' OR NOT" in cancel_sql
+    conn.execute.assert_awaited_once()
+    marker_sql, marker_job_id = conn.execute.await_args.args
+    assert "_stateless_cancel_cleanup_pending" in marker_sql
+    assert marker_job_id == UUID(JOB_ID)
 
 
 @pytest.mark.asyncio
@@ -422,6 +560,7 @@ async def test_cancel_finalizer_waits_for_lease_then_prunes_checkpoint():
             return {
                 "status": "cancelled",
                 "execution_lane": "stateless",
+                "retained_resume": None,
                 "cleanup_pending": True,
             }
         raise AssertionError(normalized)
@@ -468,6 +607,9 @@ async def test_cancel_cleanup_session_lock_is_single_owner_and_released(monkeypa
 @pytest.mark.asyncio
 async def test_cancel_cleanup_marker_clears_only_after_queue_is_done():
     conn = MagicMock()
+    conn.fetchval = AsyncMock(
+        return_value=False
+    )  # Legacy fixture has no VM retention schema.
     conn.transaction.return_value = _AsyncCM()
     conn.fetchrow = AsyncMock(
         side_effect=[
@@ -485,6 +627,7 @@ async def test_cancel_cleanup_marker_clears_only_after_queue_is_done():
 @pytest.mark.asyncio
 async def test_cancel_cleanup_marker_stays_while_queue_is_live():
     conn = MagicMock()
+    conn.fetchval = AsyncMock(return_value=False)
     conn.transaction.return_value = _AsyncCM()
     conn.fetchrow = AsyncMock(return_value={"state": "leased"})
     db = _db_with_conn(conn)
@@ -496,6 +639,7 @@ async def test_cancel_cleanup_marker_stays_while_queue_is_live():
 @pytest.mark.asyncio
 async def test_cancel_cleanup_finalizers_are_idempotent_after_marker_clear():
     conn = MagicMock()
+    conn.fetchval = AsyncMock(return_value=False)
     conn.transaction.return_value = _AsyncCM()
     cleanup_pending = True
 
@@ -508,6 +652,7 @@ async def test_cancel_cleanup_finalizers_are_idempotent_after_marker_clear():
             return {
                 "status": "cancelled",
                 "execution_lane": "stateless",
+                "retained_resume": None,
                 "cleanup_pending": cleanup_pending,
             }
         if normalized.startswith("UPDATE jobs"):
@@ -549,11 +694,19 @@ async def test_prepare_delete_fences_queue_before_job_and_strictly_prunes():
         raise AssertionError(normalized)
 
     conn.fetchrow = AsyncMock(side_effect=fetchrow)
+    conn.fetch = AsyncMock(return_value=[])
     db = _db_with_conn(conn)
+    db.quiesce_cancelled_stateless_vm_parent = AsyncMock(return_value=False)
 
     assert await db.prepare_stateless_job_for_delete(JOB_ID)
     assert calls == ["queue_lock", "queue_close", "job_cancel"]
     db.delete_checkpoint_thread.assert_awaited_once_with(JOB_ID, strict=True)
+    # The fence is the delete decision: it revokes the Job's leases (C2) and
+    # requests the revoke of its minted credentials (C5).
+    revoke = _fetch_with(conn, "UPDATE connector_credential_leases")
+    assert revoke.args[1:] == (str(UUID(JOB_ID)), "job_deleted")
+    minted = _fetch_with(conn, "UPDATE connector_minted_credentials")
+    assert minted.args[1:] == ("job", UUID(JOB_ID), "job_deleted")
 
 
 @pytest.mark.asyncio
@@ -572,7 +725,9 @@ async def test_prepare_delete_prune_failure_retains_fenced_job_for_retry():
         raise AssertionError(normalized)
 
     conn.fetchrow = AsyncMock(side_effect=fetchrow)
+    conn.fetch = AsyncMock(return_value=[])
     db = _db_with_conn(conn)
+    db.quiesce_cancelled_stateless_vm_parent = AsyncMock(return_value=False)
     db.delete_checkpoint_thread.side_effect = RuntimeError("prune unavailable")
 
     with pytest.raises(RuntimeError, match="prune unavailable"):
@@ -597,6 +752,9 @@ async def test_final_prepared_delete_removes_queue_and_job_atomically():
             return {"execution_lane": "stateless", "delete_pending": True}
         if normalized.startswith("SELECT status, completion_outcome_kind,"):
             return {"status": "created", "completion_outcome_kind": None}
+        if normalized.startswith("SELECT * FROM vm_job_creation_owners WHERE job_id="):
+            # Ordinary stateless Job: no VM retry has created an audit owner.
+            return None
         raise AssertionError(normalized)
 
     conn.fetchrow = AsyncMock(side_effect=fetchrow)
@@ -621,10 +779,17 @@ async def test_final_prepared_delete_removes_queue_and_job_atomically():
         raise AssertionError(normalized)
 
     conn.execute = AsyncMock(side_effect=execute)
+    conn.fetch = AsyncMock(return_value=[])
     db = _db_with_conn(conn)
 
     assert await db.delete_job(JOB_ID, prepared_stateless=True)
     assert lock_order == ["queue", "docker_advisory", "job"]
+    # Revoked before the row goes: the lease rows cascade with the Job (C2);
+    # the minted credentials' records outlive it (C5).
+    revoke = _fetch_with(conn, "UPDATE connector_credential_leases")
+    assert revoke.args[1:] == (str(UUID(JOB_ID)), "job_deleted")
+    minted = _fetch_with(conn, "UPDATE connector_minted_credentials")
+    assert minted.args[1:] == ("job", UUID(JOB_ID), "job_deleted")
     assert (
         conn.fetchrow.await_args_list[0]
         .args[0]
@@ -750,7 +915,11 @@ async def test_explicit_resume_unparks_then_updates_job_in_one_transaction():
         raise AssertionError(normalized)
 
     conn.fetchrow = AsyncMock(side_effect=fetchrow)
-    conn.fetchval = AsyncMock(return_value=True)
+    conn.fetchval = AsyncMock(
+        side_effect=lambda sql, *args: False
+        if "_worker_execution_hold" in sql
+        else True
+    )
     db = _db_with_conn(conn)
 
     assert await db.queue_stateless_job_for_resume(
@@ -764,7 +933,7 @@ async def test_explicit_resume_unparks_then_updates_job_in_one_transaction():
         if call.args and "WITH cur AS" in call.args[0]
     )
     assert enqueue_call.args[6] == 13
-    conn.fetchval.assert_awaited_once()
+    assert conn.fetchval.await_count == 2
     assert "state = 'parked'" in conn.fetchval.await_args.args[0]
     assert any(
         "execution_lane = 'stateless'" in call.args[0]
@@ -800,6 +969,7 @@ async def test_delegation_resume_keeps_waiting_status_cas_inside_queue_transacti
         raise AssertionError(normalized)
 
     conn.fetchrow = AsyncMock(side_effect=fetchrow)
+    conn.fetchval = AsyncMock(return_value=False)
     db = _db_with_conn(conn)
 
     assert await db.queue_stateless_job_for_resume(
@@ -838,6 +1008,7 @@ async def test_resume_during_old_terminal_lease_records_newer_wake_watermark():
         raise AssertionError(normalized)
 
     conn.fetchrow = AsyncMock(side_effect=fetchrow)
+    conn.fetchval = AsyncMock(return_value=False)
     db = _db_with_conn(conn)
 
     assert await db.queue_stateless_job_for_resume(
@@ -1009,19 +1180,45 @@ async def test_stateless_dispatch_refusal_cannot_overwrite_winning_control(
         "priority": 0,
         "user_id": None,
     }
-    monkeypatch.setattr(main, "AUTO_ASSIGN_ENABLED", False)
-    monkeypatch.setattr(main, "STATELESS_WORKER_ENABLED", True)
-    monkeypatch.setattr(main.container_provisioner, "_k8s_available", True)
-    monkeypatch.setattr(main.container_provisioner, "_in_cluster", True)
+    monkeypatch.setattr(main.app.state.resources.settings, "auto_assign_enabled", False)
     monkeypatch.setattr(
-        main.postgres_db,
+        main.app.state.resources.settings, "stateless_worker_enabled", True
+    )
+    monkeypatch.setattr(
+        container_provisioner_module.container_provisioner, "_k8s_available", True
+    )
+    monkeypatch.setattr(
+        container_provisioner_module.container_provisioner, "_in_cluster", True
+    )
+    monkeypatch.setattr(
+        main.app.state.resources.postgres_db,
+        "get_job_discovery_cutoff",
+        AsyncMock(return_value=datetime.now(timezone.utc)),
+    )
+    monkeypatch.setattr(
+        main.app.state.resources.postgres_db,
         "get_admittable_stateless_jobs",
         AsyncMock(return_value=[job]),
     )
     update = AsyncMock(return_value=False)
-    monkeypatch.setattr(main.postgres_db, "update_job_status", update)
+    monkeypatch.setattr(
+        main.app.state.resources.postgres_db, "update_job_status", update
+    )
 
-    await main._try_dispatch_pending_jobs()
+    monkeypatch.setattr(
+        main.app.state.resources,
+        "job_dispatch_state",
+        job_dispatcher.JobDispatchState(),
+    )
+    monkeypatch.setattr(
+        main.app.state.resources.postgres_db, "get_job", AsyncMock(return_value=job)
+    )
+
+    await run_dispatch_and_wait(
+        dependencies=jobs_composition.job_dispatch_dependencies(
+            main.app.state.resources
+        )
+    )
 
     update.assert_awaited_once_with(
         JOB_ID,
@@ -1055,34 +1252,166 @@ async def test_stateless_workspace_failure_uses_scanned_status_cas(monkeypatch):
         "user_id": None,
         "parent_job_id": None,
     }
-    monkeypatch.setattr(main, "AUTO_ASSIGN_ENABLED", False)
-    monkeypatch.setattr(main, "STATELESS_WORKER_ENABLED", True)
-    monkeypatch.setattr(main.container_provisioner, "_k8s_available", True)
-    monkeypatch.setattr(main.container_provisioner, "_in_cluster", True)
+    monkeypatch.setattr(main.app.state.resources.settings, "auto_assign_enabled", False)
     monkeypatch.setattr(
-        main.postgres_db,
+        main.app.state.resources.settings, "stateless_worker_enabled", True
+    )
+    monkeypatch.setattr(
+        container_provisioner_module.container_provisioner, "_k8s_available", True
+    )
+    monkeypatch.setattr(
+        container_provisioner_module.container_provisioner, "_in_cluster", True
+    )
+    monkeypatch.setattr(
+        main.app.state.resources.postgres_db,
+        "get_job_discovery_cutoff",
+        AsyncMock(return_value=datetime.now(timezone.utc)),
+    )
+    monkeypatch.setattr(
+        main.app.state.resources.postgres_db,
         "get_admittable_stateless_jobs",
         AsyncMock(return_value=[job]),
     )
     monkeypatch.setattr(
-        main,
+        job_dispatcher,
         "ensure_workspace",
         AsyncMock(
             return_value=SimpleNamespace(
-                outcome=main.EnsureOutcome.FAILED,
+                outcome=EnsureOutcome.FAILED,
                 status="failed",
+                mutation_required=False,
             )
         ),
     )
     update = AsyncMock(return_value=False)
-    monkeypatch.setattr(main.postgres_db, "update_job_status", update)
+    monkeypatch.setattr(
+        main.app.state.resources.postgres_db, "update_job_status", update
+    )
 
-    await main._try_dispatch_pending_jobs()
+    monkeypatch.setattr(
+        main.app.state.resources,
+        "job_dispatch_state",
+        job_dispatcher.JobDispatchState(),
+    )
+    monkeypatch.setattr(
+        main.app.state.resources.postgres_db, "get_job", AsyncMock(return_value=job)
+    )
+
+    await run_dispatch_and_wait(
+        dependencies=jobs_composition.job_dispatch_dependencies(
+            main.app.state.resources
+        )
+    )
 
     update.assert_awaited_once_with(
         JOB_ID,
         status="failed",
         error_message="Workspace container failed: image pull failed",
+        expected_status="created",
+    )
+
+
+_CONTAINER_EXITED = (
+    "Workspace container exited with code 0 (Completed) before it became ready. "
+    "A workspace image must keep running SRW's SSH server: build it FROM an SRW "
+    "base image and don't override its ENTRYPOINT or USER."
+)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("recorded", "error_message"),
+    [
+        # The exit message already names the workspace container.
+        (_CONTAINER_EXITED, _CONTAINER_EXITED),
+        # Every other recorded error keeps the shared prefix.
+        (
+            "Workspace image registry.example/x:1 could not be pulled: "
+            "InvalidImageName (bad ref)",
+            "Workspace container failed: Workspace image registry.example/x:1 "
+            "could not be pulled: InvalidImageName (bad ref)",
+        ),
+    ],
+    ids=["container-exited", "pull-failure"],
+)
+async def test_a_failed_first_creation_fails_the_job_with_its_recorded_error(
+    monkeypatch, recorded, error_message
+):
+    from orchestrator import main
+
+    # create_workspace leaves the Pod's context and its error, then returns
+    # False; the dispatcher's FAILED branch re-reads the Job for that error.
+    job = {
+        "id": JOB_ID,
+        "status": "created",
+        "execution_lane": "stateless",
+        "assigned_agent_id": None,
+        "context": {
+            "workspace_container": {
+                "status": "created",
+                "error": recorded,
+                "provisioner": "k8s",
+            }
+        },
+        "config_override": {"workspace": {"backend": "sandbox"}},
+        "priority": 0,
+        "user_id": None,
+        "parent_job_id": None,
+    }
+    monkeypatch.setattr(main.app.state.resources.settings, "auto_assign_enabled", False)
+    monkeypatch.setattr(
+        main.app.state.resources.settings, "stateless_worker_enabled", True
+    )
+    monkeypatch.setattr(
+        container_provisioner_module.container_provisioner, "_k8s_available", True
+    )
+    monkeypatch.setattr(
+        container_provisioner_module.container_provisioner, "_in_cluster", True
+    )
+    monkeypatch.setattr(
+        main.app.state.resources.postgres_db,
+        "get_job_discovery_cutoff",
+        AsyncMock(return_value=datetime.now(timezone.utc)),
+    )
+    monkeypatch.setattr(
+        main.app.state.resources.postgres_db,
+        "get_admittable_stateless_jobs",
+        AsyncMock(return_value=[job]),
+    )
+    ensure = AsyncMock(
+        return_value=SimpleNamespace(
+            outcome=EnsureOutcome.FAILED,
+            status="failed",
+            mutation_required=False,
+        )
+    )
+    monkeypatch.setattr(job_dispatcher, "ensure_workspace", ensure)
+    update = AsyncMock(return_value=False)
+    monkeypatch.setattr(
+        main.app.state.resources.postgres_db, "update_job_status", update
+    )
+    monkeypatch.setattr(
+        main.app.state.resources,
+        "job_dispatch_state",
+        job_dispatcher.JobDispatchState(),
+    )
+    monkeypatch.setattr(
+        main.app.state.resources.postgres_db, "get_job", AsyncMock(return_value=job)
+    )
+
+    await run_dispatch_and_wait(
+        dependencies=jobs_composition.job_dispatch_dependencies(
+            main.app.state.resources
+        )
+    )
+
+    # The dispatcher fails the Job on FAILED, so it alone opts in to failing
+    # a Job create at once on an exited container.
+    assert ensure.await_args.kwargs["fail_on_exited_container"] is True
+    update.assert_awaited_once_with(
+        JOB_ID,
+        status="failed",
+        error_message=error_message,
         expected_status="created",
     )
 
@@ -1109,25 +1438,50 @@ async def test_dispatcher_waits_instead_of_failing_uidless_k8s_runtime(monkeypat
         "user_id": None,
         "parent_job_id": None,
     }
-    monkeypatch.setattr(main, "AUTO_ASSIGN_ENABLED", False)
-    monkeypatch.setattr(main, "STATELESS_WORKER_ENABLED", True)
+    monkeypatch.setattr(main.app.state.resources.settings, "auto_assign_enabled", False)
     monkeypatch.setattr(
-        main.postgres_db,
+        main.app.state.resources.settings, "stateless_worker_enabled", True
+    )
+    monkeypatch.setattr(
+        main.app.state.resources.postgres_db,
+        "get_job_discovery_cutoff",
+        AsyncMock(return_value=datetime.now(timezone.utc)),
+    )
+    monkeypatch.setattr(
+        main.app.state.resources.postgres_db,
         "get_admittable_stateless_jobs",
         AsyncMock(return_value=[job]),
     )
     prepare = AsyncMock(
         return_value=("wait", job, "kubernetes_attestation_unavailable")
     )
-    monkeypatch.setattr(main, "_prepare_job_workspace_runtime", prepare)
+    monkeypatch.setattr(
+        job_workspace_authority_module, "prepare_job_workspace_runtime", prepare
+    )
     update = AsyncMock()
-    monkeypatch.setattr(main.postgres_db, "update_job_status", update)
+    monkeypatch.setattr(
+        main.app.state.resources.postgres_db, "update_job_status", update
+    )
     provision = AsyncMock(side_effect=AssertionError("provisioning attempted"))
-    monkeypatch.setattr(main, "ensure_workspace", provision)
+    monkeypatch.setattr(job_dispatcher, "ensure_workspace", provision)
 
-    await main._try_dispatch_pending_jobs()
+    monkeypatch.setattr(
+        main.app.state.resources,
+        "job_dispatch_state",
+        job_dispatcher.JobDispatchState(),
+    )
+    monkeypatch.setattr(
+        main.app.state.resources.postgres_db, "get_job", AsyncMock(return_value=job)
+    )
 
-    prepare.assert_awaited_once_with(job)
+    await run_dispatch_and_wait(
+        dependencies=jobs_composition.job_dispatch_dependencies(
+            main.app.state.resources
+        )
+    )
+
+    # The dispatch composition binds the owner with its dependencies.
+    prepare.assert_awaited_once_with(job, dependencies=ANY)
     update.assert_not_awaited()
     provision.assert_not_awaited()
 
@@ -1162,16 +1516,36 @@ async def test_vm_lane_repair_losing_status_cas_does_not_close_queue(monkeypatch
     async def acquire():
         yield conn
 
-    monkeypatch.setattr(main, "AUTO_ASSIGN_ENABLED", False)
-    monkeypatch.setattr(main, "STATELESS_WORKER_ENABLED", True)
+    monkeypatch.setattr(main.app.state.resources.settings, "auto_assign_enabled", False)
     monkeypatch.setattr(
-        main.postgres_db,
+        main.app.state.resources.settings, "stateless_worker_enabled", True
+    )
+    monkeypatch.setattr(
+        main.app.state.resources.postgres_db,
+        "get_job_discovery_cutoff",
+        AsyncMock(return_value=datetime.now(timezone.utc)),
+    )
+    monkeypatch.setattr(
+        main.app.state.resources.postgres_db,
         "get_admittable_stateless_jobs",
         AsyncMock(return_value=[job]),
     )
-    monkeypatch.setattr(main.postgres_db, "acquire", acquire)
+    monkeypatch.setattr(main.app.state.resources.postgres_db, "acquire", acquire)
 
-    await main._try_dispatch_pending_jobs()
+    monkeypatch.setattr(
+        main.app.state.resources,
+        "job_dispatch_state",
+        job_dispatcher.JobDispatchState(),
+    )
+    monkeypatch.setattr(
+        main.app.state.resources.postgres_db, "get_job", AsyncMock(return_value=job)
+    )
+
+    await run_dispatch_and_wait(
+        dependencies=jobs_composition.job_dispatch_dependencies(
+            main.app.state.resources
+        )
+    )
 
     conn.execute.assert_not_called()
 
@@ -1214,31 +1588,53 @@ async def test_same_cluster_vm_dispatch_stays_stateless_and_reaches_admission(
         },
     }
     monkeypatch.setenv("VM_MODE", "same-cluster")
-    monkeypatch.setattr(main, "AUTO_ASSIGN_ENABLED", False)
-    monkeypatch.setattr(main, "STATELESS_WORKER_ENABLED", True)
+    monkeypatch.setattr(main.app.state.resources.settings, "auto_assign_enabled", False)
     monkeypatch.setattr(
-        main.postgres_db,
+        main.app.state.resources.settings, "stateless_worker_enabled", True
+    )
+    monkeypatch.setattr(
+        main.app.state.resources.postgres_db,
+        "get_job_discovery_cutoff",
+        AsyncMock(return_value=datetime.now(timezone.utc)),
+    )
+    monkeypatch.setattr(
+        main.app.state.resources.postgres_db,
         "get_admittable_stateless_jobs",
         AsyncMock(return_value=[job]),
     )
     monkeypatch.setattr(
-        main,
-        "_prepare_job_workspace_runtime",
+        job_workspace_authority_module,
+        "prepare_job_workspace_runtime",
         AsyncMock(return_value=("proceed", job, None)),
     )
-    monkeypatch.setattr(main, "_check_vm_permission", AsyncMock())
+    monkeypatch.setattr(vm_workspace_policy_module, "check_vm_permission", AsyncMock())
     monkeypatch.setattr(
-        main, "vm_provisioning_decision", MagicMock(return_value="ready")
+        job_dispatcher, "vm_provisioning_decision", MagicMock(return_value="ready")
     )
     monkeypatch.setattr(
-        main,
-        "_prepare_job_repository_before_claim",
+        job_start_bundle_module,
+        "prepare_job_repository_before_claim",
         AsyncMock(return_value=True),
     )
     admitted = AsyncMock(return_value=(True, "inserted"))
-    monkeypatch.setattr(main.postgres_db, "admit_stateless_worker_job", admitted)
+    monkeypatch.setattr(
+        main.app.state.resources.postgres_db, "admit_stateless_worker_job", admitted
+    )
 
-    await main._try_dispatch_pending_jobs()
+    monkeypatch.setattr(
+        main.app.state.resources,
+        "job_dispatch_state",
+        job_dispatcher.JobDispatchState(),
+    )
+    monkeypatch.setattr(
+        main.app.state.resources.postgres_db, "get_job", AsyncMock(return_value=job)
+    )
+
+    await run_dispatch_and_wait(
+        dependencies=jobs_composition.job_dispatch_dependencies(
+            main.app.state.resources
+        )
+    )
 
     admitted.assert_awaited_once_with(
         JOB_ID,
@@ -1255,6 +1651,17 @@ async def test_resume_retries_pinned_verb_after_vm_lane_repair(monkeypatch):
         AsyncMock(return_value=None),
     )
     from orchestrator import main
+
+    # This fixture exercises lane fallback with an unconnected mocked store.
+    # Durable creation Resume has its own real-PostgreSQL authority tests.
+    monkeypatch.setattr(
+        main.app.state.resources.postgres_db, "supports_vm_creation_retry", False
+    )
+    monkeypatch.setattr(
+        PostgresDB,
+        "pinned_ready_cancel_retention_held",
+        AsyncMock(return_value=False),
+    )
 
     job = {
         "id": JOB_ID,
@@ -1273,24 +1680,30 @@ async def test_resume_retries_pinned_verb_after_vm_lane_repair(monkeypatch):
     }
     pinned = {**job, "execution_lane": "pinned"}
     monkeypatch.setattr(
-        main,
+        access_module,
         "require_internal_or_job_access",
         AsyncMock(return_value=(None, job)),
     )
-    monkeypatch.setattr(main, "_user_experts_enabled", AsyncMock(return_value=False))
+    monkeypatch.setattr(
+        grant_enforcement_module, "user_experts_enabled", AsyncMock(return_value=False)
+    )
     stateless_queue = AsyncMock(return_value=False)
     pinned_queue = AsyncMock(return_value=True)
     monkeypatch.setattr(
-        main.postgres_db,
+        main.app.state.resources.postgres_db,
         "queue_stateless_job_for_resume",
         stateless_queue,
     )
-    monkeypatch.setattr(main.postgres_db, "get_job", AsyncMock(return_value=pinned))
-    monkeypatch.setattr(main.postgres_db, "queue_job_for_resume", pinned_queue)
-    monkeypatch.setattr(main, "_trigger_dispatch", MagicMock())
+    monkeypatch.setattr(
+        main.app.state.resources.postgres_db, "get_job", AsyncMock(return_value=pinned)
+    )
+    monkeypatch.setattr(
+        main.app.state.resources.postgres_db, "queue_job_for_resume", pinned_queue
+    )
+    monkeypatch.setattr(job_dispatcher_module, "trigger_dispatch", MagicMock())
 
     result = await control_seams.resume_job(
-        MagicMock(), JOB_ID, main.JobResumeRequest()
+        MagicMock(), JOB_ID, job_controls_module.JobResumeRequest()
     )
 
     assert result["status"] == "queued"
@@ -1299,6 +1712,7 @@ async def test_resume_retries_pinned_verb_after_vm_lane_repair(monkeypatch):
         JOB_ID,
         None,
         expected_status="paused",
+        lift_operator_pause_hold="",
     )
 
 
@@ -1315,18 +1729,20 @@ async def test_internal_resume_retries_pinned_verb_after_vm_lane_repair(monkeypa
     }
     pinned = {**stateless, "execution_lane": "pinned"}
     monkeypatch.setattr(
-        main.postgres_db,
+        main.app.state.resources.postgres_db,
         "get_job",
         AsyncMock(side_effect=(stateless, pinned)),
     )
     monkeypatch.setattr(
-        main.postgres_db,
+        main.app.state.resources.postgres_db,
         "queue_stateless_job_for_resume",
         AsyncMock(return_value=False),
     )
     pinned_queue = AsyncMock(return_value=True)
-    monkeypatch.setattr(main.postgres_db, "queue_job_for_resume", pinned_queue)
-    monkeypatch.setattr(main, "_trigger_dispatch", MagicMock())
+    monkeypatch.setattr(
+        main.app.state.resources.postgres_db, "queue_job_for_resume", pinned_queue
+    )
+    monkeypatch.setattr(job_dispatcher_module, "trigger_dispatch", MagicMock())
 
     await control_seams.internal_resume_job(
         JOB_ID,
@@ -1358,37 +1774,45 @@ async def test_cancel_retries_pinned_verb_after_vm_lane_repair(monkeypatch):
     }
     pinned = {**job, "execution_lane": "pinned"}
     monkeypatch.setattr(
-        main,
+        access_module,
         "require_internal_or_job_access",
         AsyncMock(return_value=(None, job)),
     )
     monkeypatch.setattr(
-        main.postgres_db,
+        main.app.state.resources.postgres_db,
         "cancel_stateless_job",
         AsyncMock(return_value=(False, False)),
     )
-    monkeypatch.setattr(main.postgres_db, "get_job", AsyncMock(return_value=pinned))
-    pinned_cancel = AsyncMock(return_value=True)
-    monkeypatch.setattr(main.postgres_db, "cancel_job", pinned_cancel)
-    linearize = AsyncMock(return_value=True)
-    monkeypatch.setattr(main.postgres_db, "linearize_pinned_cancel", linearize)
-    monkeypatch.setattr(main.postgres_db, "delete_checkpoint_thread", AsyncMock())
     monkeypatch.setattr(
-        main.thread_retirement_operations, "archive_and_cleanup_workspace", AsyncMock()
+        main.app.state.resources.postgres_db, "get_job", AsyncMock(return_value=pinned)
+    )
+    pinned_cancel = AsyncMock(return_value=True)
+    monkeypatch.setattr(
+        main.app.state.resources.postgres_db, "cancel_job", pinned_cancel
+    )
+    linearize = AsyncMock(return_value=True)
+    monkeypatch.setattr(
+        main.app.state.resources.postgres_db, "linearize_pinned_cancel", linearize
     )
     monkeypatch.setattr(
-        main.job_mutation_operations.JobControlOperations,
+        main.app.state.resources.postgres_db, "delete_checkpoint_thread", AsyncMock()
+    )
+    monkeypatch.setattr(
+        thread_retirement_module, "archive_and_cleanup_workspace", AsyncMock()
+    )
+    monkeypatch.setattr(
+        job_mutation_controls_module.JobControlOperations,
         "cascade_cancel_to_children",
         AsyncMock(return_value=True),
     )
     monkeypatch.setattr(
-        main.subjob_completion_operations,
+        subjob_completion_module,
         "handle_scholar_completion",
         AsyncMock(),
     )
-    monkeypatch.setattr(main, "maybe_wake_session", AsyncMock())
-    monkeypatch.setattr(main, "_kick_session_wake_drain", MagicMock())
-    monkeypatch.setattr(main, "_trigger_dispatch", MagicMock())
+    monkeypatch.setattr(session_wake_module, "maybe_wake_session", AsyncMock())
+    monkeypatch.setattr(session_wake_module, "kick_drain", MagicMock())
+    monkeypatch.setattr(job_dispatcher_module, "trigger_dispatch", MagicMock())
 
     assert await control_seams.cancel_job(MagicMock(), JOB_ID) == {
         "status": "cancelled"
@@ -1398,7 +1822,7 @@ async def test_cancel_retries_pinned_verb_after_vm_lane_repair(monkeypatch):
     linearize.assert_awaited_once_with(
         JOB_ID,
         expected_status="created",
-        completion_commands_enabled=main.COMPLETION_COMMANDS_ENABLED,
+        completion_commands_enabled=main.app.state.resources.settings.completion_commands_enabled,
     )
 
 
@@ -1419,18 +1843,22 @@ async def test_pinned_cancel_linearizes_before_agent_post_and_prunes_after(
         "context": {},
     }
     order = []
-    monkeypatch.setattr(main, "COMPLETION_COMMANDS_ENABLED", enabled)
     monkeypatch.setattr(
-        main,
+        main.app.state.resources.settings, "completion_commands_enabled", enabled
+    )
+    monkeypatch.setattr(
+        access_module,
         "require_internal_or_job_access",
         AsyncMock(return_value=(None, job)),
     )
     linearize = AsyncMock(
         side_effect=lambda *_a, **_k: order.append("linearize") or True
     )
-    monkeypatch.setattr(main.postgres_db, "linearize_pinned_cancel", linearize)
     monkeypatch.setattr(
-        main.postgres_db,
+        main.app.state.resources.postgres_db, "linearize_pinned_cancel", linearize
+    )
+    monkeypatch.setattr(
+        main.app.state.resources.postgres_db,
         "get_agent",
         AsyncMock(
             return_value={
@@ -1461,31 +1889,37 @@ async def test_pinned_cancel_linearizes_before_agent_post_and_prunes_after(
     client.post = AsyncMock(
         side_effect=lambda *_a, **_k: order.append("post") or response
     )
-    monkeypatch.setattr(main.httpx, "AsyncClient", MagicMock(return_value=client))
+    monkeypatch.setattr(httpx, "AsyncClient", MagicMock(return_value=client))
     monkeypatch.setattr(
-        main.thread_retirement_operations, "archive_and_cleanup_workspace", AsyncMock()
+        thread_retirement_module, "archive_and_cleanup_workspace", AsyncMock()
     )
-    monkeypatch.setattr(main.postgres_db, "cancel_job", AsyncMock(return_value=False))
     monkeypatch.setattr(
-        main.postgres_db,
+        main.app.state.resources.postgres_db,
+        "cancel_job",
+        AsyncMock(return_value=False),
+    )
+    monkeypatch.setattr(
+        main.app.state.resources.postgres_db,
         "get_job",
         AsyncMock(return_value={**job, "status": "cancelled"}),
     )
     prune = AsyncMock(side_effect=lambda *_: order.append("prune"))
-    monkeypatch.setattr(main.postgres_db, "delete_checkpoint_thread", prune)
     monkeypatch.setattr(
-        main.job_mutation_operations.JobControlOperations,
+        main.app.state.resources.postgres_db, "delete_checkpoint_thread", prune
+    )
+    monkeypatch.setattr(
+        job_mutation_controls_module.JobControlOperations,
         "cascade_cancel_to_children",
         AsyncMock(return_value=True),
     )
     monkeypatch.setattr(
-        main.subjob_completion_operations,
+        subjob_completion_module,
         "handle_scholar_completion",
         AsyncMock(),
     )
-    monkeypatch.setattr(main, "maybe_wake_session", AsyncMock())
-    monkeypatch.setattr(main, "_kick_session_wake_drain", MagicMock())
-    monkeypatch.setattr(main, "_trigger_dispatch", MagicMock())
+    monkeypatch.setattr(session_wake_module, "maybe_wake_session", AsyncMock())
+    monkeypatch.setattr(session_wake_module, "kick_drain", MagicMock())
+    monkeypatch.setattr(job_dispatcher_module, "trigger_dispatch", MagicMock())
 
     assert await control_seams.cancel_job(MagicMock(), JOB_ID) == {
         "status": "cancelled"
@@ -1507,30 +1941,36 @@ async def test_flag_on_completed_pinned_cancel_stays_completed_without_cleanup(
         "assigned_agent_id": None,
         "context": {},
     }
-    monkeypatch.setattr(main, "COMPLETION_COMMANDS_ENABLED", True)
     monkeypatch.setattr(
-        main,
+        main.app.state.resources.settings, "completion_commands_enabled", True
+    )
+    monkeypatch.setattr(
+        access_module,
         "require_internal_or_job_access",
         AsyncMock(return_value=(None, job)),
     )
     linearize = AsyncMock(return_value=False)
-    monkeypatch.setattr(main.postgres_db, "linearize_pinned_cancel", linearize)
     monkeypatch.setattr(
-        main.postgres_db,
+        main.app.state.resources.postgres_db, "linearize_pinned_cancel", linearize
+    )
+    monkeypatch.setattr(
+        main.app.state.resources.postgres_db,
         "get_job",
         AsyncMock(return_value={**job, "status": "completed"}),
     )
     cleanup = AsyncMock()
     monkeypatch.setattr(
-        main.thread_retirement_operations.ThreadRetirementOperations,
+        thread_retirement_module.ThreadRetirementOperations,
         "archive_and_cleanup_workspace",
         cleanup,
     )
-    monkeypatch.setattr(main.postgres_db, "cancel_job", AsyncMock())
-    monkeypatch.setattr(main.postgres_db, "delete_checkpoint_thread", AsyncMock())
+    monkeypatch.setattr(main.app.state.resources.postgres_db, "cancel_job", AsyncMock())
+    monkeypatch.setattr(
+        main.app.state.resources.postgres_db, "delete_checkpoint_thread", AsyncMock()
+    )
     cascade = AsyncMock()
     monkeypatch.setattr(
-        main.job_mutation_operations.JobControlOperations,
+        job_mutation_controls_module.JobControlOperations,
         "cascade_cancel_to_children",
         cascade,
     )
@@ -1545,8 +1985,8 @@ async def test_flag_on_completed_pinned_cancel_stays_completed_without_cleanup(
         completion_commands_enabled=True,
     )
     cleanup.assert_not_awaited()
-    main.postgres_db.cancel_job.assert_not_awaited()
-    main.postgres_db.delete_checkpoint_thread.assert_not_awaited()
+    main.app.state.resources.postgres_db.cancel_job.assert_not_awaited()
+    main.app.state.resources.postgres_db.delete_checkpoint_thread.assert_not_awaited()
     cascade.assert_not_awaited()
 
 
@@ -1554,6 +1994,10 @@ async def test_flag_on_completed_pinned_cancel_stays_completed_without_cleanup(
 async def test_pinned_cancel_linearizer_has_terminal_status_parity_guard():
     conn = AsyncMock()
     conn.transaction = MagicMock(return_value=_AsyncCM())
+    conn.fetchrow = AsyncMock(
+        side_effect=lambda sql, *_: {"context": {}} if "FROM jobs" in sql else None
+    )
+    conn.fetchval = AsyncMock(return_value=False)
     conn.execute.return_value = "UPDATE 0"
     db = _db_with_conn(conn)
 
@@ -1576,6 +2020,14 @@ async def test_cancel_sql_names_control_marker_only_when_completion_flag_on():
         normalized = " ".join(sql.split())
         if normalized.startswith("SELECT state FROM run_queue"):
             return {"state": "queued"}
+        if normalized.startswith("SELECT unit_id FROM run_queue"):
+            return {"unit_id": UUID(JOB_ID)}
+        if normalized.startswith("SELECT * FROM jobs"):
+            return {"context": {}}
+        if normalized.startswith("SELECT * FROM vm_creation_retries"):
+            return None
+        if normalized.startswith("SELECT id FROM jobs"):
+            return {"id": UUID(JOB_ID)}
         if normalized.startswith("UPDATE run_queue"):
             return {"state": "done"}
         if normalized.startswith("UPDATE jobs"):
@@ -1583,6 +2035,7 @@ async def test_cancel_sql_names_control_marker_only_when_completion_flag_on():
         raise AssertionError(normalized)
 
     conn.fetchrow = AsyncMock(side_effect=fetchrow)
+    conn.fetchval = AsyncMock(return_value=False)
     db = _db_with_conn(conn)
 
     assert not await db.linearize_pinned_cancel(
@@ -1625,20 +2078,28 @@ async def test_flag_on_cancel_returns_exact_409_for_active_control_claim(
             }
         },
     }
-    monkeypatch.setattr(main, "COMPLETION_COMMANDS_ENABLED", True)
     monkeypatch.setattr(
-        main,
+        main.app.state.resources.settings, "completion_commands_enabled", True
+    )
+    monkeypatch.setattr(
+        access_module,
         "require_internal_or_job_access",
         AsyncMock(return_value=(None, job)),
     )
-    monkeypatch.setattr(main.postgres_db, "get_job", AsyncMock(return_value=job))
+    monkeypatch.setattr(
+        main.app.state.resources.postgres_db, "get_job", AsyncMock(return_value=job)
+    )
     stateless_cancel = AsyncMock(return_value=(False, False))
     pinned_cancel = AsyncMock(return_value=False)
-    monkeypatch.setattr(main.postgres_db, "cancel_stateless_job", stateless_cancel)
-    monkeypatch.setattr(main.postgres_db, "linearize_pinned_cancel", pinned_cancel)
+    monkeypatch.setattr(
+        main.app.state.resources.postgres_db, "cancel_stateless_job", stateless_cancel
+    )
+    monkeypatch.setattr(
+        main.app.state.resources.postgres_db, "linearize_pinned_cancel", pinned_cancel
+    )
     cleanup = AsyncMock()
     monkeypatch.setattr(
-        main.thread_retirement_operations, "archive_and_cleanup_workspace", cleanup
+        thread_retirement_module, "archive_and_cleanup_workspace", cleanup
     )
 
     with pytest.raises(HTTPException) as exc:
@@ -1677,36 +2138,38 @@ async def test_cancel_endpoint_closes_queued_stateless_unit_without_agent_post(
         "context": {},
     }
     monkeypatch.setattr(
-        main,
+        access_module,
         "require_internal_or_job_access",
         AsyncMock(return_value=(None, job)),
     )
     cancel = AsyncMock(return_value=(True, True))
-    monkeypatch.setattr(main.postgres_db, "cancel_stateless_job", cancel)
+    monkeypatch.setattr(
+        main.app.state.resources.postgres_db, "cancel_stateless_job", cancel
+    )
     settle = AsyncMock(return_value=True)
     monkeypatch.setattr(
-        main.job_mutation_operations.JobControlOperations,
+        job_mutation_controls_module.JobControlOperations,
         "wait_for_stateless_cancel_settle",
         settle,
     )
-    monkeypatch.setattr(main.postgres_db, "get_agent", AsyncMock())
+    monkeypatch.setattr(main.app.state.resources.postgres_db, "get_agent", AsyncMock())
     cleanup = AsyncMock()
     monkeypatch.setattr(
-        main.thread_retirement_operations, "archive_and_cleanup_workspace", cleanup
+        thread_retirement_module, "archive_and_cleanup_workspace", cleanup
     )
     monkeypatch.setattr(
-        main.job_mutation_operations.JobControlOperations,
+        job_mutation_controls_module.JobControlOperations,
         "cascade_cancel_to_children",
         AsyncMock(return_value=True),
     )
     monkeypatch.setattr(
-        main.subjob_completion_operations,
+        subjob_completion_module,
         "handle_scholar_completion",
         AsyncMock(),
     )
-    monkeypatch.setattr(main, "maybe_wake_session", AsyncMock())
-    monkeypatch.setattr(main, "_kick_session_wake_drain", MagicMock())
-    monkeypatch.setattr(main, "_trigger_dispatch", MagicMock())
+    monkeypatch.setattr(session_wake_module, "maybe_wake_session", AsyncMock())
+    monkeypatch.setattr(session_wake_module, "kick_drain", MagicMock())
+    monkeypatch.setattr(job_dispatcher_module, "trigger_dispatch", MagicMock())
 
     assert await control_seams.cancel_job(MagicMock(), JOB_ID) == {
         "status": "cancelled"
@@ -1715,7 +2178,7 @@ async def test_cancel_endpoint_closes_queued_stateless_unit_without_agent_post(
     cancel.assert_awaited_once_with(JOB_ID)
     settle.assert_awaited_once_with(JOB_ID)
     cleanup.assert_not_awaited()
-    main.postgres_db.get_agent.assert_not_awaited()
+    main.app.state.resources.postgres_db.get_agent.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -1747,7 +2210,7 @@ async def test_blocking_message_status_is_exact_worker_fenced(
         yield MagicMock()
 
     monkeypatch.setattr(
-        main.postgres_db,
+        main.app.state.resources.postgres_db,
         "get_job",
         AsyncMock(
             return_value={
@@ -1762,17 +2225,17 @@ async def test_blocking_message_status_is_exact_worker_fenced(
         ),
     )
     monkeypatch.setattr(
-        main.postgres_db,
+        main.app.state.resources.postgres_db,
         "get_user",
         AsyncMock(return_value={"email": "owner@example.com", "display_name": "Owner"}),
     )
     monkeypatch.setattr(
-        main.postgres_db,
+        main.app.state.resources.postgres_db,
         "check_message_rate_limit",
         AsyncMock(return_value={"job_hourly": 0, "job_daily": 0, "user_daily": 0}),
     )
     monkeypatch.setattr(
-        main.postgres_db,
+        main.app.state.resources.postgres_db,
         "reserve_message_delivery_intent",
         AsyncMock(
             return_value={
@@ -1783,28 +2246,40 @@ async def test_blocking_message_status_is_exact_worker_fenced(
         ),
     )
     monkeypatch.setattr(
-        main.postgres_db,
+        main.app.state.resources.postgres_db,
         "begin_message_delivery_attempt",
         AsyncMock(return_value={"delivery_claimed": True, "attempt_number": 1}),
     )
     monkeypatch.setattr(
-        main.postgres_db,
+        main.app.state.resources.postgres_db,
         "settle_message_delivery_attempt",
         AsyncMock(return_value=True),
     )
     monkeypatch.setattr(
-        main.postgres_db, "get_message_sequence", AsyncMock(return_value=1)
+        main.app.state.resources.postgres_db,
+        "get_message_sequence",
+        AsyncMock(return_value=1),
     )
-    monkeypatch.setattr(main.postgres_db, "log_message", AsyncMock())
-    monkeypatch.setattr(main.postgres_db, "set_message_email_id", AsyncMock())
-    monkeypatch.setattr(main.postgres_db, "settle_outbound_message_log", AsyncMock())
-    monkeypatch.setattr(main.postgres_db, "mark_route_user_delivery", AsyncMock())
-    monkeypatch.setattr(main.postgres_db, "create_routed_blocking_freeze", committed)
-    monkeypatch.setattr(main.postgres_db, "acquire", acquire)
+    monkeypatch.setattr(
+        main.app.state.resources.postgres_db, "log_message", AsyncMock()
+    )
+    monkeypatch.setattr(
+        main.app.state.resources.postgres_db, "set_message_email_id", AsyncMock()
+    )
+    monkeypatch.setattr(
+        main.app.state.resources.postgres_db, "settle_outbound_message_log", AsyncMock()
+    )
+    monkeypatch.setattr(
+        main.app.state.resources.postgres_db, "mark_route_user_delivery", AsyncMock()
+    )
+    monkeypatch.setattr(
+        main.app.state.resources.postgres_db, "create_routed_blocking_freeze", committed
+    )
+    monkeypatch.setattr(main.app.state.resources.postgres_db, "acquire", acquire)
     from orchestrator.services.notification_service import RecordResult
 
     monkeypatch.setattr(
-        main.notification_service,
+        notification_service_module.notification_service,
         "record_agent_message",
         AsyncMock(
             return_value=RecordResult(
@@ -1812,7 +2287,7 @@ async def test_blocking_message_status_is_exact_worker_fenced(
             )
         ),
     )
-    body = main.MessageSendRequest(
+    body = messaging_module.MessageSendRequest(
         to="user",
         subject="Need input",
         message="Please answer",
@@ -1829,7 +2304,9 @@ async def test_blocking_message_status_is_exact_worker_fenced(
             MagicMock(),
             JOB_ID,
             body,
-            dependencies=main._agent_messaging_dependencies(),
+            dependencies=workflows_composition.agent_messaging_dependencies(
+                main.app.state.resources
+            ),
         )
 
     if status_cas_wins:
@@ -1860,40 +2337,40 @@ async def test_cancel_endpoint_waits_for_leased_owner_before_workspace_cleanup(
         "context": {},
     }
     monkeypatch.setattr(
-        main,
+        access_module,
         "require_internal_or_job_access",
         AsyncMock(return_value=(None, job)),
     )
     monkeypatch.setattr(
-        main.postgres_db,
+        main.app.state.resources.postgres_db,
         "cancel_stateless_job",
         AsyncMock(return_value=(True, False)),
     )
     settle = AsyncMock(return_value=True)
     monkeypatch.setattr(
-        main.job_mutation_operations.JobControlOperations,
+        job_mutation_controls_module.JobControlOperations,
         "wait_for_stateless_cancel_settle",
         settle,
     )
     direct_cleanup = AsyncMock()
     monkeypatch.setattr(
-        main.thread_retirement_operations,
+        thread_retirement_module,
         "archive_and_cleanup_workspace",
         direct_cleanup,
     )
     monkeypatch.setattr(
-        main.job_mutation_operations.JobControlOperations,
+        job_mutation_controls_module.JobControlOperations,
         "cascade_cancel_to_children",
         AsyncMock(return_value=True),
     )
     monkeypatch.setattr(
-        main.subjob_completion_operations,
+        subjob_completion_module,
         "handle_scholar_completion",
         AsyncMock(),
     )
-    monkeypatch.setattr(main, "maybe_wake_session", AsyncMock())
-    monkeypatch.setattr(main, "_kick_session_wake_drain", MagicMock())
-    monkeypatch.setattr(main, "_trigger_dispatch", MagicMock())
+    monkeypatch.setattr(session_wake_module, "maybe_wake_session", AsyncMock())
+    monkeypatch.setattr(session_wake_module, "kick_drain", MagicMock())
+    monkeypatch.setattr(job_dispatcher_module, "trigger_dispatch", MagicMock())
 
     assert await control_seams.cancel_job(MagicMock(), JOB_ID) == {
         "status": "cancelled"
@@ -1918,32 +2395,32 @@ async def test_cancel_keeps_root_workspace_when_stateless_child_did_not_settle(
         "assigned_agent_id": None,
     }
     monkeypatch.setattr(
-        main,
+        access_module,
         "require_internal_or_job_access",
         AsyncMock(return_value=(None, job)),
     )
     monkeypatch.setattr(
-        main.postgres_db,
+        main.app.state.resources.postgres_db,
         "cancel_stateless_job",
         AsyncMock(return_value=(True, True)),
     )
     monkeypatch.setattr(
-        main.job_mutation_operations.JobControlOperations,
+        job_mutation_controls_module.JobControlOperations,
         "cascade_cancel_to_children",
         AsyncMock(return_value=False),
     )
     cleanup = AsyncMock()
     monkeypatch.setattr(
-        main.thread_retirement_operations, "archive_and_cleanup_workspace", cleanup
+        thread_retirement_module, "archive_and_cleanup_workspace", cleanup
     )
     monkeypatch.setattr(
-        main.subjob_completion_operations,
+        subjob_completion_module,
         "handle_scholar_completion",
         AsyncMock(),
     )
-    monkeypatch.setattr(main, "maybe_wake_session", AsyncMock())
-    monkeypatch.setattr(main, "_kick_session_wake_drain", MagicMock())
-    monkeypatch.setattr(main, "_trigger_dispatch", MagicMock())
+    monkeypatch.setattr(session_wake_module, "maybe_wake_session", AsyncMock())
+    monkeypatch.setattr(session_wake_module, "kick_drain", MagicMock())
+    monkeypatch.setattr(job_dispatcher_module, "trigger_dispatch", MagicMock())
 
     with pytest.raises(HTTPException) as error:
         await control_seams.cancel_job(MagicMock(), JOB_ID)
@@ -1967,17 +2444,17 @@ async def test_cascade_cancel_reports_unsettled_stateless_child(monkeypatch):
         "assigned_agent_id": None,
     }
     monkeypatch.setattr(
-        main.postgres_db,
+        main.app.state.resources.postgres_db,
         "get_descendant_jobs",
         AsyncMock(return_value=[child]),
     )
     monkeypatch.setattr(
-        main.postgres_db,
+        main.app.state.resources.postgres_db,
         "cancel_stateless_job",
         AsyncMock(return_value=(True, False)),
     )
     monkeypatch.setattr(
-        main.job_mutation_operations.JobControlOperations,
+        job_mutation_controls_module.JobControlOperations,
         "wait_for_stateless_cancel_settle",
         AsyncMock(return_value=False),
     )
@@ -2001,18 +2478,26 @@ async def test_flag_on_cascade_pinned_control_loser_has_zero_external_io(monkeyp
             }
         },
     }
-    monkeypatch.setattr(main, "COMPLETION_COMMANDS_ENABLED", True)
     monkeypatch.setattr(
-        main.postgres_db, "get_descendant_jobs", AsyncMock(return_value=[child])
+        main.app.state.resources.settings, "completion_commands_enabled", True
+    )
+    monkeypatch.setattr(
+        main.app.state.resources.postgres_db,
+        "get_descendant_jobs",
+        AsyncMock(return_value=[child]),
     )
     linearize = AsyncMock(return_value=False)
-    monkeypatch.setattr(main.postgres_db, "linearize_pinned_cancel", linearize)
-    monkeypatch.setattr(main.postgres_db, "get_job", AsyncMock(return_value=child))
+    monkeypatch.setattr(
+        main.app.state.resources.postgres_db, "linearize_pinned_cancel", linearize
+    )
+    monkeypatch.setattr(
+        main.app.state.resources.postgres_db, "get_job", AsyncMock(return_value=child)
+    )
     cleanup = AsyncMock()
     monkeypatch.setattr(
-        main.thread_retirement_operations, "archive_and_cleanup_workspace", cleanup
+        thread_retirement_module, "archive_and_cleanup_workspace", cleanup
     )
-    monkeypatch.setattr(main.postgres_db, "get_agent", AsyncMock())
+    monkeypatch.setattr(main.app.state.resources.postgres_db, "get_agent", AsyncMock())
 
     assert not await control_seams.cascade_cancel_to_children(JOB_ID)
 
@@ -2022,7 +2507,7 @@ async def test_flag_on_cascade_pinned_control_loser_has_zero_external_io(monkeyp
         completion_commands_enabled=True,
     )
     cleanup.assert_not_awaited()
-    main.postgres_db.get_agent.assert_not_awaited()
+    main.app.state.resources.postgres_db.get_agent.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -2037,17 +2522,21 @@ async def test_flag_on_cascade_pinned_cancel_linearizes_before_cleanup(monkeypat
         "context": {},
     }
     order: list[str] = []
-    monkeypatch.setattr(main, "COMPLETION_COMMANDS_ENABLED", True)
     monkeypatch.setattr(
-        main.postgres_db, "get_descendant_jobs", AsyncMock(return_value=[child])
+        main.app.state.resources.settings, "completion_commands_enabled", True
     )
     monkeypatch.setattr(
-        main.postgres_db,
+        main.app.state.resources.postgres_db,
+        "get_descendant_jobs",
+        AsyncMock(return_value=[child]),
+    )
+    monkeypatch.setattr(
+        main.app.state.resources.postgres_db,
         "linearize_pinned_cancel",
         AsyncMock(side_effect=lambda *_a, **_k: order.append("linearize") or True),
     )
     monkeypatch.setattr(
-        main.thread_retirement_operations,
+        thread_retirement_module,
         "archive_and_cleanup_workspace",
         AsyncMock(side_effect=lambda *_a, **_k: order.append("cleanup")),
     )
@@ -2069,19 +2558,21 @@ async def test_cascade_cancel_retry_settles_existing_child_cleanup_marker(monkey
         "context": {"_stateless_cancel_cleanup_pending": True},
     }
     monkeypatch.setattr(
-        main.postgres_db,
+        main.app.state.resources.postgres_db,
         "get_descendant_jobs",
         AsyncMock(return_value=[child]),
     )
     monkeypatch.setattr(
-        main.postgres_db,
+        main.app.state.resources.postgres_db,
         "cancel_stateless_job",
         AsyncMock(return_value=(False, False)),
     )
-    monkeypatch.setattr(main.postgres_db, "get_job", AsyncMock(return_value=child))
+    monkeypatch.setattr(
+        main.app.state.resources.postgres_db, "get_job", AsyncMock(return_value=child)
+    )
     settle = AsyncMock(return_value=True)
     monkeypatch.setattr(
-        main.job_mutation_operations.JobControlOperations,
+        job_mutation_controls_module.JobControlOperations,
         "wait_for_stateless_cancel_settle",
         settle,
     )
@@ -2094,27 +2585,42 @@ async def test_cascade_cancel_retry_settles_existing_child_cleanup_marker(monkey
 async def test_cancel_settle_prunes_then_cleans_workspace(monkeypatch):
     from orchestrator import main
 
-    finalize = AsyncMock(side_effect=(False, True))
-    monkeypatch.setattr(main.postgres_db, "finalize_cancelled_stateless_job", finalize)
+    # This unit fixture has no admitted completion teardown to replay.
     monkeypatch.setattr(
-        main.postgres_db,
+        main.app.state.resources.postgres_db,
+        "cancelled_container_completion_replay",
+        AsyncMock(return_value=None),
+    )
+    monkeypatch.setattr(
+        main.app.state.resources.postgres_db,
+        "quiesce_cancelled_stateless_vm_parent",
+        AsyncMock(return_value=False),
+    )
+    finalize = AsyncMock(side_effect=(False, True))
+    monkeypatch.setattr(
+        main.app.state.resources.postgres_db,
+        "finalize_cancelled_stateless_job",
+        finalize,
+    )
+    monkeypatch.setattr(
+        main.app.state.resources.postgres_db,
         "stateless_cancel_cleanup_lock",
         _owned_cleanup_lock,
     )
     monkeypatch.setattr(
-        main.postgres_db,
+        main.app.state.resources.postgres_db,
         "stateless_cancel_cleanup_pending",
         AsyncMock(return_value=True),
     )
     complete = AsyncMock(return_value=True)
     monkeypatch.setattr(
-        main.postgres_db,
+        main.app.state.resources.postgres_db,
         "complete_stateless_cancel_cleanup",
         complete,
     )
     cleanup = AsyncMock()
     monkeypatch.setattr(
-        main.thread_retirement_operations.ThreadRetirementOperations,
+        thread_retirement_module.ThreadRetirementOperations,
         "archive_and_cleanup_workspace",
         cleanup,
     )
@@ -2137,27 +2643,41 @@ async def test_cancel_settle_keeps_resume_block_until_workspace_cleanup_succeeds
 ):
     from orchestrator import main
 
-    finalize = AsyncMock(return_value=True)
-    monkeypatch.setattr(main.postgres_db, "finalize_cancelled_stateless_job", finalize)
     monkeypatch.setattr(
-        main.postgres_db,
+        main.app.state.resources.postgres_db,
+        "cancelled_container_completion_replay",
+        AsyncMock(return_value=None),
+    )
+    monkeypatch.setattr(
+        main.app.state.resources.postgres_db,
+        "quiesce_cancelled_stateless_vm_parent",
+        AsyncMock(return_value=False),
+    )
+    finalize = AsyncMock(return_value=True)
+    monkeypatch.setattr(
+        main.app.state.resources.postgres_db,
+        "finalize_cancelled_stateless_job",
+        finalize,
+    )
+    monkeypatch.setattr(
+        main.app.state.resources.postgres_db,
         "stateless_cancel_cleanup_lock",
         _owned_cleanup_lock,
     )
     monkeypatch.setattr(
-        main.postgres_db,
+        main.app.state.resources.postgres_db,
         "stateless_cancel_cleanup_pending",
         AsyncMock(return_value=True),
     )
     complete = AsyncMock(return_value=True)
     monkeypatch.setattr(
-        main.postgres_db,
+        main.app.state.resources.postgres_db,
         "complete_stateless_cancel_cleanup",
         complete,
     )
     cleanup = AsyncMock(side_effect=(RuntimeError("teardown busy"), None))
     monkeypatch.setattr(
-        main.thread_retirement_operations.ThreadRetirementOperations,
+        thread_retirement_module.ThreadRetirementOperations,
         "archive_and_cleanup_workspace",
         cleanup,
     )
@@ -2178,6 +2698,16 @@ async def test_cancel_settle_keeps_resume_block_until_workspace_cleanup_succeeds
 async def test_concurrent_cancel_settlers_run_destructive_cleanup_once(monkeypatch):
     from orchestrator import main
 
+    monkeypatch.setattr(
+        main.app.state.resources.postgres_db,
+        "cancelled_container_completion_replay",
+        AsyncMock(return_value=None),
+    )
+    monkeypatch.setattr(
+        main.app.state.resources.postgres_db,
+        "quiesce_cancelled_stateless_vm_parent",
+        AsyncMock(return_value=False),
+    )
     cleanup_lock = asyncio.Lock()
     marker_pending = True
 
@@ -2208,29 +2738,29 @@ async def test_concurrent_cancel_settlers_run_destructive_cleanup_once(monkeypat
         await release_first_cleanup.wait()
 
     monkeypatch.setattr(
-        main.postgres_db,
+        main.app.state.resources.postgres_db,
         "stateless_cancel_cleanup_lock",
         try_cleanup_lock,
     )
     monkeypatch.setattr(
-        main.postgres_db,
+        main.app.state.resources.postgres_db,
         "stateless_cancel_cleanup_pending",
         AsyncMock(side_effect=pending),
     )
     monkeypatch.setattr(
-        main.postgres_db,
+        main.app.state.resources.postgres_db,
         "finalize_cancelled_stateless_job",
         AsyncMock(return_value=True),
     )
     complete_mock = AsyncMock(side_effect=complete)
     monkeypatch.setattr(
-        main.postgres_db,
+        main.app.state.resources.postgres_db,
         "complete_stateless_cancel_cleanup",
         complete_mock,
     )
     cleanup_mock = AsyncMock(side_effect=cleanup)
     monkeypatch.setattr(
-        main.thread_retirement_operations.ThreadRetirementOperations,
+        thread_retirement_module.ThreadRetirementOperations,
         "archive_and_cleanup_workspace",
         cleanup_mock,
     )
@@ -2242,7 +2772,7 @@ async def test_concurrent_cancel_settlers_run_destructive_cleanup_once(monkeypat
             poll_seconds=0.001,
         )
     )
-    await first_cleanup_entered.wait()
+    await asyncio.wait_for(first_cleanup_entered.wait(), 1)
     second = asyncio.create_task(
         control_seams.wait_for_stateless_cancel_settle(
             JOB_ID,
@@ -2273,19 +2803,35 @@ async def test_phase_approval_reenqueues_stateless_job(monkeypatch, tmp_path):
         "user_id": "33333333-3333-3333-3333-333333333333",
     }
     monkeypatch.setattr(
-        main,
+        access_module,
         "require_internal_or_job_access",
         AsyncMock(return_value=(None, job)),
     )
     monkeypatch.setattr(
-        main.subjob_output_operations,
+        subjob_output_module,
         "resolve_job_repo",
         AsyncMock(return_value=(None, None)),
     )
-    monkeypatch.setattr(main, "gitea_client", SimpleNamespace(is_initialized=False))
-    monkeypatch.setattr(main, "workspace_service", SimpleNamespace(base_path=tmp_path))
+    monkeypatch.setattr(
+        main.app.state.resources, "gitea_client", SimpleNamespace(is_initialized=False)
+    )
+    monkeypatch.setattr(
+        workspace_module, "workspace_service", SimpleNamespace(base_path=tmp_path)
+    )
+    # Model an available idle schema with no open operation for this offline
+    # stateless fixture; approval then follows the ordinary queue path.
+    monkeypatch.setattr(
+        "orchestrator.services.vm_idle_lifecycle.VMIdleLifecycleStore.schema_available",
+        AsyncMock(return_value=True),
+    )
+    monkeypatch.setattr(
+        "orchestrator.services.vm_idle_lifecycle.VMIdleLifecycleStore.get_open_for_owner",
+        AsyncMock(return_value=None),
+    )
     queued = AsyncMock(return_value=True)
-    monkeypatch.setattr(main.postgres_db, "queue_stateless_job_for_resume", queued)
+    monkeypatch.setattr(
+        main.app.state.resources.postgres_db, "queue_stateless_job_for_resume", queued
+    )
 
     result = await control_seams.approve_job(MagicMock(), JOB_ID)
 
@@ -2295,4 +2841,34 @@ async def test_phase_approval_reenqueues_stateless_job(monkeypatch, tmp_path):
         priority=7,
         fair_key="33333333-3333-3333-3333-333333333333",
         expected_status="pending_review",
+        idle_phase_source_snapshot=None,
     )
+
+
+@pytest.mark.asyncio
+async def test_internal_stateless_reply_forwards_exact_route_fence(monkeypatch):
+    from orchestrator import main
+
+    route_id = str(uuid4())
+    job = {
+        "id": JOB_ID,
+        "status": "waiting_for_reply",
+        "execution_lane": "stateless",
+        "priority": 2,
+        "user_id": None,
+    }
+    monkeypatch.setattr(
+        main.app.state.resources.postgres_db, "get_job", AsyncMock(return_value=job)
+    )
+    queued = AsyncMock(return_value=True)
+    monkeypatch.setattr(
+        main.app.state.resources.postgres_db, "queue_stateless_job_for_resume", queued
+    )
+    monkeypatch.setattr(job_dispatcher_module, "trigger_dispatch", MagicMock())
+    assert await control_seams.internal_resume_job(
+        JOB_ID,
+        "answer",
+        expected_status="waiting_for_reply",
+        expected_route_id=route_id,
+    )
+    assert queued.await_args.kwargs["expected_route_id"] == route_id

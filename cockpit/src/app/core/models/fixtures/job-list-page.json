@@ -16,6 +16,7 @@
       "branch_name": null,
       "merge_status": null,
       "diff_status": null,
+      "cloud_diff_baseline_commit": null,
       "exported_at": null,
       "exported_folder_handle": null,
       "error_message": null,
@@ -32,9 +33,12 @@
         "state": "waiting"
       },
       "workspace_recovery": null,
+      "vm_creation": null,
       "audit_count": null,
       "cloud_review_mode": "open_folder",
-      "exported_folder_url": null
+      "exported_folder_url": null,
+      "workspace_lifecycle": null,
+      "workspace_creation": null
     },
     {
       "id": "33333333-3333-4333-8333-333333333334",
@@ -52,6 +56,7 @@
       "branch_name": null,
       "merge_status": null,
       "diff_status": null,
+      "cloud_diff_baseline_commit": null,
       "exported_at": null,
       "exported_folder_handle": null,
       "error_message": null,
@@ -68,9 +73,12 @@
         "state": "waiting"
       },
       "workspace_recovery": null,
+      "vm_creation": null,
       "audit_count": null,
       "cloud_review_mode": "open_folder",
-      "exported_folder_url": null
+      "exported_folder_url": null,
+      "workspace_lifecycle": null,
+      "workspace_creation": null
     }
   ],
   "total": 10000,

@@ -57,6 +57,8 @@ from langchain_core.messages import (
 
 from agent.core.context import repair_tool_pairing
 from agent.core.thread_messages import _serialize_message_row
+from shared.runtime.core.context_entries import context_entry_from_row
+from shared.runtime.core.message_markers import PERSIST_ROLE_CONTEXT
 from shared.subagent_parent_authority import (
     ParentExecutionAuthority,
     coerce_parent_execution_authority,
@@ -156,7 +158,10 @@ def restore_subagent_messages(rows: Sequence[Mapping[str, Any]]) -> list[BaseMes
     later rows use the ordinary transcript columns.  The child's system prompt
     remains transient and is therefore skipped unless it is a fork seed (for
     example a compacted summary).  Malformed rows fail closed: revival must not
-    silently forget evidence before spending a successor generation.
+    silently forget evidence before spending a successor generation.  A
+    ``role='context'`` row is harness context, not evidence: it comes back as
+    the typed entry it was, and an unreadable one is dropped (the planner
+    re-injects what is still relevant).
     """
 
     restored: list[BaseMessage] = []
@@ -195,6 +200,17 @@ def restore_subagent_messages(rows: Sequence[Mapping[str, Any]]) -> list[BaseMes
 
         if role in {"human", "user", "event"}:
             restored.append(HumanMessage(content=content, **identity))
+        elif role == PERSIST_ROLE_CONTEXT:
+            entry = context_entry_from_row(
+                raw.get("content"), raw.get("additional_kwargs"), id=message_id
+            )
+            if entry is None:
+                logger.debug(
+                    "Dropping unreadable context row %s from a child transcript",
+                    message_id,
+                )
+            else:
+                restored.append(entry)
         elif role in {"ai", "assistant"}:
             if tool_calls is not None and not isinstance(tool_calls, list):
                 raise SubagentTranscriptDecodeError(

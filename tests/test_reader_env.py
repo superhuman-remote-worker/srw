@@ -119,6 +119,24 @@ class TestAcquireReaderEnv:
         await release_reader_env(env)
 
     @pytest.mark.asyncio
+    async def test_reader_output_is_redacted_with_the_parents_tokens(
+        self, parent_context
+    ):
+        # The child's fresh workspace knows no repository tokens, but its
+        # shell reaches the parent's clones: the parent's known credentials
+        # must carry over, or `git remote -v` in a worktree child leaks.
+        from agent.core.tool_output_redaction import redact_tool_result
+
+        token = "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b"  # synthetic
+        parent_ctx, _ = parent_context
+        parent_ctx.workspace_manager.source_repo_meta["repo"] = {"token": token}
+        env = await acquire_reader_env(parent_ctx, ["read_file"], index=0, total=1)
+        assert env.context.workspace_manager.source_repo_meta == {}
+        assert token in env.context.redaction_secrets
+        assert token not in redact_tool_result(f"GIT_TOKEN={token}", env.context)
+        await release_reader_env(env)
+
+    @pytest.mark.asyncio
     async def test_reader_isolated_from_parent_undo_and_freeze(self, parent_context):
         parent_ctx, _ = parent_context
         parent_ctx._snapshot_callback = lambda p: None

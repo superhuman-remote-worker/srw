@@ -316,6 +316,36 @@ async def prepare_session(
         raise HTTPException(status_code=404, detail="thread not found")
     if str(thread.get("user_id") or "") != str(user["id"]):
         raise HTTPException(status_code=403, detail="thread access denied")
+    if thread.get("execution_lane") == LANE_PINNED:
+        from orchestrator.services.vm_idle_lifecycle import VMIdleLifecycleStore
+
+        idle = VMIdleLifecycleStore(db)
+        if (
+            await idle.get_open_for_thread(thread_id) is not None
+            or await idle.get_pending_access_continuation(thread_id) is not None
+        ):
+            _require_supported_protected_prepare_override(
+                thread,
+                body.config_override,
+            )
+            if body.config_name is not None:
+                try:
+                    validate_config_name(body.config_name)
+                except InvalidConfigNameError as exc:
+                    raise HTTPException(status_code=422, detail=str(exc)) from exc
+            session_tool_policy.with_validated_tool_overrides(
+                body.config_override,
+            )
+            wake = await idle.request_thread_wake(
+                thread_id,
+                execution_requested=True,
+            )
+            if wake is None:
+                raise HTTPException(
+                    status_code=409,
+                    detail={"code": "session_idle_wake_held"},
+                )
+            return PrepareResponse(state="waking")
     _require_preparable_thread(thread)
     runtime_authority = thread_runtime_authority(thread)
     if runtime_authority is None:
@@ -394,7 +424,7 @@ async def _do_prepare(
     runtime_authority: ThreadRuntimeAuthority,
     *,
     dependencies: SessionsDependencies,
-) -> None:
+) -> bool | None:
     """Run the actual provisioning + readiness work asynchronously.
 
     Serializes concurrent prepares on the same thread via advisory lock.
@@ -618,9 +648,28 @@ async def _do_prepare(
             expected_session_identity_fingerprint=(
                 binding.session_identity_fingerprint
             ),
+            **(
+                {
+                    "vm_store": db,
+                    "vm_thread_id": thread_id,
+                    "vm_runtime_generation": runtime_authority.generation,
+                    "vm_binding": binding,
+                }
+                if _backend == "vm"
+                else {}
+            ),
         ):
             current = await db.get_thread(thread_id)
-            if same_thread_runtime_authority(current, runtime_authority):
+            current_binding = await db.get_pinned_session_binding(
+                thread_id,
+                expected_runtime_generation=runtime_authority.generation,
+            )
+            if (
+                same_thread_runtime_authority(current, runtime_authority)
+                and current_binding is not None
+                and current_binding.target_key == binding.target_key
+                and current_binding.agent_status in startup_statuses
+            ):
                 _emit("failed", reason="agent /ready timeout")
             return
 
@@ -634,18 +683,30 @@ async def _do_prepare(
             current_binding is None
             or current_binding.target_key != binding.target_key
             or current_binding.agent_status not in startup_statuses
+            or not same_thread_runtime_authority(
+                await db.get_thread(thread_id), runtime_authority
+            )
         ):
             return
 
         # Create the route resource.
         route_published = False
+        route_cleanup_required = True
         try:
-            await dependencies.session_router.ensure_route(
-                thread_id=thread_id,
-                pod_name=binding.agent_hostname,
-                pod_uid=binding.pod_uid,
-                runtime_generation=runtime_authority.generation,
-            )
+            try:
+                await dependencies.session_router.ensure_route(
+                    thread_id=thread_id,
+                    pod_name=binding.agent_hostname,
+                    pod_uid=binding.pod_uid,
+                    runtime_generation=runtime_authority.generation,
+                )
+            except SessionRouteAuthorityError as route_error:
+                # A definite failed atomic Pod patch has no Service/Ingress
+                # effect from this attempt. Exact-recipient teardown here
+                # could otherwise delete a sibling prepare's completed route.
+                if route_error.no_route_effect:
+                    route_cleanup_required = False
+                raise
 
             current_binding = await db.get_pinned_session_binding(
                 thread_id,
@@ -655,18 +716,20 @@ async def _do_prepare(
                 current_binding is None
                 or current_binding.target_key != binding.target_key
                 or current_binding.agent_status not in startup_statuses
+                or not same_thread_runtime_authority(
+                    await db.get_thread(thread_id), runtime_authority
+                )
             ):
                 return
 
             _emit("ready")
             route_published = True
+            return True
         finally:
-            # ``ensure_route`` may create the deterministic Service before an
-            # Ingress failure. Any path that does not publish ready therefore
-            # owes exact G/Pod cleanup, including exceptions from the final DB
-            # reread. A false result means cleanup authority was not proven;
-            # surface that failure instead of silently wedging the successor.
-            if not route_published:
+            # Once route publication may have begun, a Service-only failure or
+            # final DB reread failure still owes exact G/Pod cleanup. A false
+            # result means cleanup authority was not proven; surface it.
+            if not route_published and route_cleanup_required:
                 route_removed = await dependencies.session_router.teardown_route(
                     thread_id,
                     expected_namespace=binding.pod_namespace,
@@ -680,6 +743,95 @@ async def _do_prepare(
         current = await db.get_thread(thread_id)
         if same_thread_runtime_authority(current, runtime_authority):
             _emit("failed", reason=str(e))
+
+
+async def prepare_woken_pinned_session(
+    thread_id: str,
+    operation_id: str,
+    *,
+    dependencies: SessionsDependencies,
+) -> bool:
+    """Replay the existing prepare path only for one Ready, authorized wake."""
+    from orchestrator.services.vm_idle_lifecycle import VMIdleLifecycleStore
+
+    thread = await dependencies.store.get_thread(thread_id)
+    idle = VMIdleLifecycleStore(dependencies.store)
+    operation = await idle.get_open_for_thread(thread_id)
+    access_continuation = None
+    if operation is None:
+        access_continuation = await idle.get_pending_access_continuation(thread_id)
+        if (
+            access_continuation is not None
+            and str(access_continuation["operation_id"]) == operation_id
+        ):
+            operation = await idle.get_operation(operation_id)
+    if (
+        thread is None
+        or operation is None
+        or str(operation["id"]) != operation_id
+        or operation["release_kind"] != "pinned_thread"
+        or operation["wake_ready_at"] is None
+        or not (
+            operation["wake_execution_requested"]
+            or (
+                access_continuation is not None
+                and operation["phase"] == "ready"
+                and operation["closed_at"] is not None
+                and not operation["wake_execution_requested"]
+            )
+        )
+        or operation["thread_terminal_intent_at"] is not None
+        or thread.get("status") != "created"
+        or thread.get("runtime_retirement_token") is not None
+    ):
+        return False
+    authority = thread_runtime_authority(thread)
+    metadata = thread.get("metadata") or {}
+    if isinstance(metadata, str):
+        try:
+            metadata = json.loads(metadata)
+        except (TypeError, ValueError):
+            return False
+    vm = metadata.get("vm") if isinstance(metadata, dict) else None
+    proof = operation["thread_wake_ready_identity"]
+    if isinstance(proof, str):
+        try:
+            proof = json.loads(proof)
+        except (TypeError, ValueError):
+            return False
+    if (
+        authority is None
+        or thread.get("execution_lane") != LANE_PINNED
+        or not isinstance(vm, dict)
+        or not isinstance(proof, dict)
+        or vm.get("status") != "ready"
+        or vm.get("identity_authenticated") is not True
+        or vm.get("provision_generation") != proof.get("generation")
+        or vm.get("vm_uid") != proof.get("vm_uid")
+        or vm.get("vmi_uid") != proof.get("vmi_uid")
+        or vm.get("active_pod_uid") != proof.get("launcher_uid")
+        or vm.get("rootdisk_pvc_uid") != proof.get("pvc_uid")
+        or vm.get("idle_wake_operation_id") != operation_id
+    ):
+        return False
+    try:
+        _require_supported_protected_prepare_override(thread, None)
+        boot_name = thread.get("config_name") or "session_base"
+        if _is_expert_uuid(boot_name):
+            boot_name = "session_base"
+        validate_config_name(boot_name)
+    except (HTTPException, InvalidConfigNameError):
+        return False
+    return bool(
+        await _do_prepare(
+            thread_id,
+            str(thread["user_id"]),
+            boot_name,
+            None,
+            authority,
+            dependencies=dependencies,
+        )
+    )
 
 
 async def _provision_agent_for_thread(
@@ -775,13 +927,16 @@ PINNED_CONTROLS: dict[str, ControlTransport] = {
 #: Queue-served sessions bind no agent, so nothing rides a socket. Config
 #: edits go through the owner PATCH (persisted at admission, applied by the
 #: next claim's attach — the same turn-boundary semantics the pane already
-#: documents); the scalar verbs and workspace undo ride the control inbox.
-#: ``compact`` / ``archive`` / ``rewind`` / ``upgrade-to-workspace`` have no
-#: stateless transport yet (stateless_agents.md §"Still open after S1/S2")
-#: and are deliberately ABSENT rather than mapped to something that drops them.
+#: documents); the scalar verbs, workspace undo and manual compaction ride the
+#: control inbox (compact: session_slash_commands_and_stateless_compact.md §3).
+#: ``archive`` / ``upgrade-to-workspace`` have no stateless transport (End is
+#: the owner DELETE; there is no stateless tier upgrade) and ``rewind`` is added
+#: per request below; absent verbs are deliberately ABSENT rather than mapped to
+#: something that drops them.
 STATELESS_CONTROLS: dict[str, ControlTransport] = {
     "config.update": "rest",
     "workspace.undo": "rest",
+    "compact": "rest",
     "mode.set": "rest",
     "narration.set": "rest",
 }
@@ -1007,6 +1162,15 @@ async def get_connection(
         raise AssertionError("unreachable")
     _require_live_agent(current_binding)
 
+    if dependencies.session_tokens is None:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "code": "session_token_service_unavailable",
+                "message": "Session control is unavailable: configure SESSION_JWT_SECRET",
+            },
+        )
+
     # Make /connection self-healing: any code path that binds an agent to a
     # thread (POST /prepare, the legacy resume in main.py, orchestrator restart
     # re-binding from DB) must end up routable. ensure_route is idempotent and
@@ -1014,6 +1178,7 @@ async def get_connection(
     # Service + Ingress exist by the time the cockpit opens the WS — no matter
     # which path bound the agent.
     route_committed = False
+    route_cleanup_required = True
     try:
         await dependencies.session_router.ensure_route(
             thread_id=runtime_authority.thread_id,
@@ -1055,12 +1220,14 @@ async def get_connection(
         route_committed = True
         return response
     except SessionRouteAuthorityError as exc:
+        if exc.no_route_effect:
+            route_cleanup_required = False
         raise HTTPException(status_code=425, detail="session not ready") from exc
     finally:
         # Exact cleanup covers partial Service/Ingress creation, a failed final
         # DB read, a status/identity race, and token construction failure.  It
         # is deliberately armed only when route mutation begins.
-        if not route_committed:
+        if not route_committed and route_cleanup_required:
             route_removed = await dependencies.session_router.teardown_route(
                 runtime_authority.thread_id,
                 expected_namespace=binding.pod_namespace,

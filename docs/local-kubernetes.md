@@ -196,7 +196,8 @@ single-origin mode and accept its certificate warning. Then use:
 The account is seeded by the local Keycloak configuration. Its email is
 pre-verified and it maps to the local Gitea administrator.
 
-The local overlay also enables published multi-user test accounts:
+The local values file also sets `keycloak.devUsers.enabled: true`, which adds
+published multi-user test accounts:
 
 | Username | Password | Roles |
 |---|---|---|
@@ -208,8 +209,38 @@ The local overlay also enables published multi-user test accounts:
 | `dev-user-4` | `srw-k3d-dev-usr4` | user |
 
 > [!WARNING]
-> Anyone who has read this repository knows these passwords. The chart default
-> keeps development users disabled; only the local overlay enables them.
+> Anyone who has read this repository knows these passwords.
+> `keycloak.devUsers.enabled` defaults to `false`, so an installation without the
+> local values file creates none of these accounts. Never enable it on a
+> reachable deployment.
+
+Keycloak creates these accounts only on its first start with an empty database.
+If your cluster's Keycloak database predates the setting, a Helm upgrade does
+not add them. Add them to the running realm instead:
+
+```bash
+kubectl --context k3d-srw --namespace srw exec -i deploy/srw-keycloak -c keycloak -- sh -s <<'EOF'
+kc() { /opt/keycloak/bin/kcadm.sh "$@" --config /tmp/kcadm.config; }
+kc config credentials --server "http://localhost:8080${KC_HTTP_RELATIVE_PATH}" \
+  --realm master --user "$KEYCLOAK_ADMIN" --password "$KEYCLOAK_ADMIN_PASSWORD"
+while read -r name password roles; do
+  kc create users -r srw -s username="$name" -s email="$name@localhost" \
+    -s emailVerified=true -s enabled=true -s firstName="$name" -s lastName=Dev
+  kc set-password -r srw --username "$name" --new-password "$password"
+  for role in $roles; do kc add-roles -r srw --uusername "$name" --rolename "$role"; done
+done <<'USERS'
+dev-admin-1 srw-k3d-dev-adm1 admin user
+dev-admin-2 srw-k3d-dev-adm2 admin user
+dev-user-1 srw-k3d-dev-usr1 user
+dev-user-2 srw-k3d-dev-usr2 user
+dev-user-3 srw-k3d-dev-usr3 user
+dev-user-4 srw-k3d-dev-usr4 user
+USERS
+EOF
+```
+
+Accounts that already exist report `User exists`; the command still sets their
+passwords and adds their roles.
 
 ## Local endpoints
 
@@ -338,6 +369,57 @@ Some ConfigMap changes require an explicit workload restart. Prefer letting
 the chart or Tilt own rollouts; use a manual restart only while diagnosing a
 local change.
 
+### Reclaiming disk
+
+Every Tilt build pushes new image tags to the k3d registry and caches the
+images in the k3d node. Neither removes old ones on its own: the registry has
+no garbage collection, and the node's kubelet only prunes images once the host
+disk is 85% full. An active development machine can accumulate more than
+100 GB in a few weeks, and a full disk evicts every pod and can stop the k3s
+API server.
+
+Preview the cleanup, then run it:
+
+```bash
+./scripts/local-dev-gc.sh --dry-run
+./scripts/local-dev-gc.sh
+```
+
+The script keeps:
+
+- every image that a workload in any running k3d cluster references;
+- the newest two tags per repository (`KEEP_TAGS`); and
+- anything pushed in the last 24 hours (`KEEP_HOURS`).
+
+It also removes older Tilt tags from the host Docker image store and trims
+BuildKit cache above 20 GB (`BUILD_CACHE_MAX`). The registry is stopped during
+its garbage collection, usually for less than a minute. The script skips that
+step while Tilt is building. If a running k3d cluster cannot list its
+workloads, it does not prune the registry or the node at all.
+
+To run it every day, install a systemd user timer:
+
+```bash
+./scripts/local-dev-gc.sh --install-timer
+journalctl --user -u srw-local-dev-gc   # what each run removed
+./scripts/local-dev-gc.sh --remove-timer
+```
+
+The timer runs at about 04:30. If the machine was off then, it runs at your
+next login. The unit records the checkout path, your `PATH`, and the settings
+above when you install it. After moving the checkout or changing a setting, run
+`--install-timer` again, for example
+`KEEP_TAGS=3 ./scripts/local-dev-gc.sh --install-timer`. User timers run only
+while you are logged in unless you enable lingering with
+`loginctl enable-linger`.
+
+When you investigate disk use by hand, note that `/var/lib/docker` and
+`/var/lib/containerd` are readable only by root. Unprivileged `du` and desktop
+disk analyzers skip them silently, so use `docker system df -v`. With Docker's
+containerd image store, image layers appear under both Images and Build Cache
+in that output. The build-cache figure therefore overstates what pruning it
+would free.
+
 ## Teardown
 
 Choose the smallest teardown that matches what you intend to remove:
@@ -451,6 +533,25 @@ kubectl --context k3d-srw --namespace srw get secret srw-session-jwt
 
 Re-running `scripts/local-dev-up.sh` creates the Secret if it is absent without
 rotating an existing value.
+
+### The disk filled up and pods were evicted
+
+The local registry and node image cache grow with every Tilt build. Free space
+as described in [Reclaiming disk](#reclaiming-disk). If `kubectl` still cannot
+reach the cluster afterwards, check for a `k3s server` process:
+
+```bash
+docker exec k3d-srw-server-0 ps aux | grep 'k3s server'
+```
+
+The node container can stay `Up`, and `k3d cluster list` can still report it as
+running, after k3s itself has crashed. Restart the node, then delete the
+evicted pods:
+
+```bash
+docker restart k3d-srw-server-0
+kubectl --context k3d-srw delete pods --all-namespaces --field-selector=status.phase=Failed
+```
 
 ### Source and images appear out of sync
 

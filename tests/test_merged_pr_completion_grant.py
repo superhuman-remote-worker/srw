@@ -330,7 +330,7 @@ class TestUnmergedPrGateReason:
     async def test_job_without_a_pull_request_costs_no_io(self):
         """No PR record means no grant read and no forge call at all."""
         db = _fake_db()
-        with patch("orchestrator.main.postgres_db", db):
+        with patch("orchestrator.main.app.state.resources.postgres_db", db):
             reason = await control_seams.unmerged_pr_gate_reason(
                 _job(pull_request=False), user={"id": OWNER_ID, "is_admin": False}
             )
@@ -341,7 +341,9 @@ class TestUnmergedPrGateReason:
     async def test_principal_with_the_grant_is_not_blocked(self):
         db = _fake_db(can_complete=True)
         with ExitStack() as stack:
-            stack.enter_context(patch("orchestrator.main.postgres_db", db))
+            stack.enter_context(
+                patch("orchestrator.main.app.state.resources.postgres_db", db)
+            )
             stack.enter_context(
                 patch(
                     "orchestrator.services.job_delivery.unmerged_pr_block_reason",
@@ -356,7 +358,9 @@ class TestUnmergedPrGateReason:
     async def test_principal_without_the_grant_is_blocked(self):
         db = _fake_db(can_complete=False)
         with ExitStack() as stack:
-            stack.enter_context(patch("orchestrator.main.postgres_db", db))
+            stack.enter_context(
+                patch("orchestrator.main.app.state.resources.postgres_db", db)
+            )
             stack.enter_context(
                 patch(
                     "orchestrator.services.job_delivery.unmerged_pr_block_reason",
@@ -373,7 +377,9 @@ class TestUnmergedPrGateReason:
         """user=None is the agent/autonomous path; the owner's grants decide."""
         db = _fake_db(can_complete=False)
         with ExitStack() as stack:
-            stack.enter_context(patch("orchestrator.main.postgres_db", db))
+            stack.enter_context(
+                patch("orchestrator.main.app.state.resources.postgres_db", db)
+            )
             stack.enter_context(
                 patch(
                     "orchestrator.services.job_delivery.unmerged_pr_block_reason",
@@ -387,7 +393,9 @@ class TestUnmergedPrGateReason:
     async def test_the_jobs_project_reaches_the_capability_read(self):
         db = _fake_db(can_complete=False)
         with ExitStack() as stack:
-            stack.enter_context(patch("orchestrator.main.postgres_db", db))
+            stack.enter_context(
+                patch("orchestrator.main.app.state.resources.postgres_db", db)
+            )
             stack.enter_context(
                 patch(
                     "orchestrator.services.job_delivery.unmerged_pr_block_reason",
@@ -404,18 +412,20 @@ class TestApproveJobGate:
     def _patch(self, stack, job, db):
         stack.enter_context(
             patch(
-                "orchestrator.main.require_internal_or_job_access",
+                "orchestrator.security.access.require_internal_or_job_access",
                 AsyncMock(return_value=({"id": OWNER_ID, "is_admin": False}, job)),
             )
         )
         stack.enter_context(
             patch.object(
-                orchestrator.main._completion_control_boundary,
+                orchestrator.main.app.state.resources.completion_control_boundary,
                 "guard",
                 AsyncMock(),
             )
         )
-        stack.enter_context(patch("orchestrator.main.postgres_db", db))
+        stack.enter_context(
+            patch("orchestrator.main.app.state.resources.postgres_db", db)
+        )
 
     async def test_unmerged_pull_request_refuses_with_403(self):
         job = _pending_job()
@@ -447,7 +457,7 @@ class TestApproveJobGate:
             )
             merge_policy = stack.enter_context(
                 patch(
-                    "orchestrator.main.job_control_operations.JobControlOperations._unmerged_pr_gate_reason",
+                    "orchestrator.services.job_controls.JobControlOperations._unmerged_pr_gate_reason",
                     AsyncMock(),
                 )
             )
@@ -473,7 +483,7 @@ class TestApproveJobGate:
             )
             stack.enter_context(
                 patch(
-                    "orchestrator.main.job_control_operations.JobControlOperations._unmerged_pr_gate_reason",
+                    "orchestrator.services.job_controls.JobControlOperations._unmerged_pr_gate_reason",
                     AsyncMock(return_value="pull request #1 is open, not merged"),
                 )
             )
@@ -493,7 +503,7 @@ class TestApproveJobGate:
             self._patch(stack, job, db)
             stack.enter_context(
                 patch.object(
-                    orchestrator.main._completion_control_boundary,
+                    orchestrator.main.app.state.resources.completion_control_boundary,
                     "claim",
                     AsyncMock(side_effect=RuntimeError("past the gate")),
                 )

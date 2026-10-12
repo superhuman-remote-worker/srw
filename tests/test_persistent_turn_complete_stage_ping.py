@@ -93,7 +93,7 @@ class TestNotifyCloudStage:
         client_cls, client = _mock_httpx_client()
 
         with (
-            patch.object(papp, "_thread_id", "tid-1"),
+            patch.object(papp._session_identity, "_thread_id", "tid-1"),
             patch("httpx.AsyncClient", client_cls),
         ):
             await papp._notify_cloud_stage(
@@ -119,8 +119,8 @@ class TestNotifyCloudStage:
         client_cls, client = _mock_httpx_client()
 
         with (
-            patch.object(papp, "_thread_id", "tid-2"),
-            patch.object(papp, "_session_runtime_attach_token", None),
+            patch.object(papp._session_identity, "_thread_id", "tid-2"),
+            patch.object(papp._session_identity, "_attach_token", None),
             patch("httpx.AsyncClient", client_cls),
         ):
             await papp._notify_cloud_stage(
@@ -145,8 +145,8 @@ class TestNotifyCloudStage:
         )
 
         with (
-            patch.object(papp, "_thread_id", "tid-3"),
-            patch.object(papp, "_session_runtime_attach_token", None),
+            patch.object(papp._session_identity, "_thread_id", "tid-3"),
+            patch.object(papp._session_identity, "_attach_token", None),
             patch("httpx.AsyncClient", client_cls),
         ):
             await papp._notify_cloud_stage(
@@ -158,8 +158,8 @@ class TestNotifyCloudStage:
     async def test_never_raises_when_client_construction_fails(self, monkeypatch):
         monkeypatch.setenv("MCP_INTERNAL_KEY", "secret")
         with (
-            patch.object(papp, "_thread_id", "tid-4"),
-            patch.object(papp, "_session_runtime_attach_token", None),
+            patch.object(papp._session_identity, "_thread_id", "tid-4"),
+            patch.object(papp._session_identity, "_attach_token", None),
             patch("httpx.AsyncClient", side_effect=RuntimeError("boom")),
         ):
             await papp._notify_cloud_stage(
@@ -191,7 +191,7 @@ class TestLoopOnTurnCompleteStagePing:
         mock_notify = AsyncMock()
         with (
             patch.object(papp, "_session", session),
-            patch.object(papp, "_thread_id", "tid"),
+            patch.object(papp._session_identity, "_thread_id", "tid"),
             patch.object(papp, "_broadcast", MagicMock()),
             patch.object(papp, "_notify_cloud_stage", mock_notify),
             patch.object(
@@ -199,8 +199,8 @@ class TestLoopOnTurnCompleteStagePing:
                 "_orchestrator_client",
                 MagicMock(agent_id=AGENT_ID),
             ),
-            patch.object(papp, "_session_runtime_generation", GENERATION),
-            patch.object(papp, "_session_runtime_attach_token", ATTACH_TOKEN),
+            patch.object(papp._session_identity, "_session_generation", GENERATION),
+            patch.object(papp._session_identity, "_attach_token", ATTACH_TOKEN),
         ):
             await papp._loop_on_turn_complete(turn_id=5, metrics={})
             await asyncio.sleep(0)  # let the fire-and-forget task run
@@ -218,7 +218,7 @@ class TestLoopOnTurnCompleteStagePing:
         mock_notify = AsyncMock()
         with (
             patch.object(papp, "_session", session),
-            patch.object(papp, "_thread_id", "tid"),
+            patch.object(papp._session_identity, "_thread_id", "tid"),
             patch.object(papp, "_broadcast", MagicMock()),
             patch.object(papp, "_notify_cloud_stage", mock_notify),
         ):
@@ -234,7 +234,7 @@ class TestLoopOnTurnCompleteStagePing:
         mock_notify = AsyncMock()
         with (
             patch.object(papp, "_session", session),
-            patch.object(papp, "_thread_id", "tid"),
+            patch.object(papp._session_identity, "_thread_id", "tid"),
             patch.object(papp, "_broadcast", MagicMock()),
             patch.object(papp, "_notify_cloud_stage", mock_notify),
         ):

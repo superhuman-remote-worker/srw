@@ -67,7 +67,17 @@ import socket
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, AsyncIterator, Dict, List, Optional, Tuple
+from typing import (
+    Any,
+    AsyncIterator,
+    Awaitable,
+    Callable,
+    Dict,
+    List,
+    Mapping,
+    Optional,
+    Tuple,
+)
 from uuid import UUID, uuid4
 
 import httpx
@@ -78,17 +88,30 @@ from agent.api.orchestrator_client import (
     ClaimBundleError,
     CompletionNonTerminalReportError,
 )
-from shared.event_journal import append_system_frame
+from agent.api.session_input import (
+    INTERRUPT_CAUSE_LEASE_LOST,
+    INTERRUPT_CAUSE_SHUTDOWN,
+)
+from shared.event_journal import append_system_frame, bump_epoch
 from shared.job_freeze_types import (
     AUTO_CONTINUE_FREEZE_TYPES,
     FREEZE_TYPE_BATCH_BOUNDARY,
 )
+from shared.persistent_input_delivery import (
+    stale_admission_answered_sql,
+    stale_stateless_admission_sql,
+)
 from shared.run_queue import (
     HEARTBEAT_INTERVAL_SECONDS,
+    LANE_STATELESS,
     PARK_REASON_ATTACH_FAILED,
     PARK_REASON_COMPLETION_CAS_FAILED,
+    PARK_REASON_MODEL_UNAVAILABLE,
+    PARK_REASON_RETRY_EXHAUSTED,
     PARK_REASON_SHUTDOWN_CANCELLED,
     RETRYABLE_PARK_REASONS,
+    STATE_PARKED,
+    STATE_QUEUED,
     UNIT_KIND_SESSION_TURN,
     ClaimedUnit,
     attach_failure_backoff_seconds,
@@ -100,8 +123,22 @@ from shared.run_queue import (
     park_unit,
     record_attach_failure,
     release_unit,
+    transient_release_backoff_seconds,
 )
-from shared.session_retirement import acknowledge_session_claim_quiesced
+from shared.session_permission_retirement import retire_stale_stateless_permissions
+from shared.session_pending_memory import (
+    SESSION_PENDING_MEMORY_KEY,
+    valid_pending_memory,
+)
+from shared.session_subagent_batch import (
+    SESSION_SUBAGENT_BATCH_SETTLE_CONTRACT_KEY,
+    SESSION_SUBAGENT_FANOUT_KEY,
+)
+from shared.session_retirement import (
+    acknowledge_session_claim_quiesced,
+    active_claim_authority,
+    stateless_stop_markers,
+)
 from shared.cloud_push_tasks import (
     PushAdoptionDeferred,
     claim_bg_task,
@@ -110,7 +147,9 @@ from shared.cloud_push_tasks import (
     fail_bg_task,
 )
 from shared.subagent_lifecycle import SubagentLifecycleError
+from shared.runtime.core.context_entries import is_context_entry
 from shared.runtime.core.workspace_backend import WorkspaceUnavailableError
+from shared.worker_errors import worker_error_cause, worker_workspace_exhaustion_cause
 from shared.workspace_recovery import (
     WorkspaceRecoveryCode,
     WorkspaceRecoveryDisposition,
@@ -123,6 +162,8 @@ from shared.worker_queue import (
     claim_worker_batch,
     complete_worker_batch,
     get_worker_completion_acceptance,
+    hold_failed_container_worker_report,
+    hold_interrupted_container_worker,
     renew_worker_batch,
     release_worker_batch,
     rotate_worker_batch,
@@ -136,6 +177,31 @@ _COMPLETION_REPORT_PAYLOAD_FIELDS = (
     "error",
     "freeze_data",
 )
+
+
+def _uncertain_worker_workspace_report(
+    *,
+    completion_commands_enabled: bool,
+    workspace_backend: str | None,
+    workspace_provisioner: str | None,
+    goal_achieved: bool,
+    error: Any,
+) -> bool:
+    """Select only typed uncertain workspace failures for the restriction hold."""
+    if not completion_commands_enabled or goal_achieved is not False:
+        return False
+    if not isinstance(error, dict) or not (
+        error.get("type") == "workspace_unavailable"
+        or worker_workspace_exhaustion_cause(error) is not None
+    ):
+        return False
+    return bool(
+        workspace_backend == "sandbox"
+        and workspace_provisioner == "k8s"
+        or workspace_backend == "vm"
+        and not workspace_recovery_enabled()
+    )
+
 
 # --- Tunables (env-overridable where deployment cares) -----------------------
 
@@ -206,13 +272,35 @@ def _enabled_env(name: str, default: bool = False) -> bool:
 # roles ('human'/'ai'); rewound rows are dead timelines and must not be
 # answered. ``seq > COALESCE(consumed_seq, -1)`` — a NULL consumed watermark
 # means nothing was ever answered, so the oldest human row qualifies.
-_PENDING_INPUT_SQL = """
+#
+# An event is owed while its delivery is persisted/queued/deferred, or while
+# it is an admission of an older lease that never settled: the executor that
+# admitted it died in the turn (parallel_subagents.md §8, "Recovery turn
+# killed"; K4). ``delivery_state`` tells the executor which, and
+# ``admission_answered`` whether that turn already reached its durable end, in
+# which case the executor settles it instead of serving it again
+# (``stale_stateless_admission_sql`` / ``stale_admission_answered_sql``).
+_OWED_STALE_ADMISSION = stale_stateless_admission_sql(
+    lease_token="queue.lease_token", watermark="$2::bigint"
+)
+_PENDING_INPUT_SQL = f"""
     SELECT message.id, message.seq, message.content, message.turn_number,
-           message.role, delivery.delivery_id, delivery.supersedes_input_seq
+           message.role, delivery.delivery_id, delivery.supersedes_input_seq,
+           superseded.role AS supersedes_input_role,
+           delivery.state AS delivery_state,
+           CASE WHEN delivery.state = 'admitted'
+                THEN {stale_admission_answered_sql()}
+                ELSE FALSE
+           END AS admission_answered
     FROM thread_messages AS message
     LEFT JOIN thread_input_deliveries AS delivery
       ON delivery.message_id = message.id
      AND delivery.thread_id = message.thread_id
+    LEFT JOIN thread_messages AS superseded
+      ON superseded.thread_id = message.thread_id
+     AND superseded.seq = delivery.supersedes_input_seq
+    LEFT JOIN run_queue AS queue
+      ON queue.unit_id = message.thread_id
     WHERE message.thread_id = $1
       AND message.rewound_at IS NULL
       AND (
@@ -223,6 +311,8 @@ _PENDING_INPUT_SQL = """
               AND delivery.execution_lane = 'stateless'
               AND delivery.state IN ('persisted', 'queued', 'deferred')
           )
+          OR
+          (message.role = 'event' AND {_OWED_STALE_ADMISSION})
       )
     ORDER BY
         CASE
@@ -246,74 +336,104 @@ SELECT GREATEST(COALESCE(consumed_seq, -1), $4::bigint)
    AND input_delivery_capable_lease_token = $2
 """
 
-_PENDING_EVENT_EXISTS_SQL = """
+# The idle-time memory prefetch at the end of a session turn (append-only
+# context injection WP4, B8) asks whether new input arrived. Admission bumps
+# ``input_seq`` on the leased row and sends no signal, so the step polls it
+# under the exact lease. COALESCE keeps "no row" (the lease is gone: NULL)
+# apart from a row without input yet (-1).
+_LEASED_INPUT_SEQ_SQL = """
+SELECT COALESCE(input_seq, -1)
+  FROM run_queue
+ WHERE unit_id = $1
+   AND unit_kind = 'session_turn'
+   AND state = 'leased'
+   AND lease_token = $2
+"""
+
+# Skip-if-answered runs before attach and may complete the unit only when no
+# event is owed. An older lease's unsettled admission is owed too, answered or
+# not: the ordinary path then either serves it again or, when its turn already
+# ended, settles it (settling needs the claimant authority the bundle stamps).
+_OWED_STALE_ADMISSION_OF_QUEUE = stale_stateless_admission_sql(
+    lease_token="queue.lease_token", watermark="queue.consumed_seq"
+)
+_PENDING_EVENT_EXISTS_SQL = f"""
 SELECT EXISTS (
     SELECT 1
       FROM thread_input_deliveries AS delivery
       JOIN thread_messages AS message ON message.id = delivery.message_id
+      LEFT JOIN run_queue AS queue ON queue.unit_id = delivery.thread_id
      WHERE delivery.thread_id = $1
-       AND delivery.execution_lane = 'stateless'
-       AND delivery.state IN ('persisted', 'queued', 'deferred')
        AND message.rewound_at IS NULL
+       AND (
+           (
+               delivery.execution_lane = 'stateless'
+               AND delivery.state IN ('persisted', 'queued', 'deferred')
+           )
+           OR (message.role = 'event' AND {_OWED_STALE_ADMISSION_OF_QUEUE})
+       )
 )
 """
 
 # Transcript-truth answered check (skip-if-answered's second leg). The
 # watermark leg catches a predecessor that persisted AND completed; this one
-# catches a predecessor whose turn ran to its final answer but whose
-# settlement never advanced ``consumed_seq`` (the loop died in the
-# turn-complete hook — e.g. the pre-fix compaction crash in
+# catches a predecessor whose turn reached its durable answer but whose
+# settlement never advanced ``consumed_seq`` (it died between the answer and
+# the watermark checkpoint, or in the turn-complete hook — e.g. the pre-fix
+# compaction crash in
 # knowledge-base/knowledge/issues/stateless_turn_settlement_crashes_after_midturn_compaction.md).
-# Without it, an operator unpark re-injects the already-answered human row
-# and the thread answers it twice. Returns the seq of the oldest pending
-# human row that is followed by a final assistant answer — content, no tool
-# calls (the loop ends a turn exactly there) — with no newer human input in
-# between; NULL when the oldest pending input is genuinely unanswered.
+# Without it, a successor or an operator unpark re-injects the already-answered
+# human row and the thread answers it twice.
+#
+# Only the OLDEST pending human row is examined, and only its own turn can
+# answer it. The stateless lane admits input while a turn runs: the queued row
+# takes the next turn number, and the running turn's answer lands after it, so
+# a later position in ``seq`` proves nothing
+# (knowledge-base/knowledge/issues/stateless_second_input_skipped_as_answered.md).
+# The input's turn number is its durable execution identity (fixed at
+# admission under the thread lock; the executor runs exactly that turn and the
+# loop stamps every row of it). The input is answered when either
+#   * its turn's authoritative final reconcile committed — that fenced
+#     transaction writes the turn's transcript and mints ``turn_execution_id``
+#     on this exact input row (the stateless ``turn.completed`` frame is
+#     published only after it), or
+#   * the loop's incremental writer already persisted a final answer of THIS
+#     turn: content, no tool calls (the loop ends a turn exactly there).
+# Returns that input's seq, or NULL when it is genuinely unanswered — the
+# watermark never advances past an input that did not run.
 _ANSWERED_BY_TRANSCRIPT_SQL = """
-SELECT input.seq
-  FROM thread_messages AS input
- WHERE input.thread_id = $1
-   AND input.role = 'human'
-   AND input.rewound_at IS NULL
-   AND input.seq > $2::bigint
-   AND input.seq <= $3::bigint
-   AND EXISTS (
-       SELECT 1
-         FROM thread_messages AS answer
-        WHERE answer.thread_id = input.thread_id
-          AND answer.role = 'ai'
-          AND answer.rewound_at IS NULL
-          AND answer.seq > input.seq
-          AND COALESCE(answer.content, '') <> ''
-          AND (
-              answer.tool_calls IS NULL
-              OR jsonb_typeof(answer.tool_calls) <> 'array'
-              OR jsonb_array_length(answer.tool_calls) = 0
-              -- A turn whose last assistant message carried a tool call
-              -- (answer text + write_file in one message) has no zero-tool
-              -- final row; its own turn.completed frame is the settled
-              -- boundary instead (stateless_turn_resilience.md step 3 → 4a).
-              OR EXISTS (
-                  SELECT 1
-                    FROM thread_events AS frame
-                   WHERE frame.thread_id = input.thread_id
-                     AND frame.kind = 'turn.completed'
-                     AND frame.payload ->> 'turn_id' = input.turn_number::text
-                     AND frame.created_at >= answer.created_at
+WITH oldest AS (
+    SELECT input.seq, input.turn_number, input.turn_execution_id
+      FROM thread_messages AS input
+     WHERE input.thread_id = $1
+       AND input.role = 'human'
+       AND input.rewound_at IS NULL
+       AND input.seq > $2::bigint
+       AND input.seq <= $3::bigint
+     ORDER BY input.seq ASC
+     LIMIT 1
+)
+SELECT oldest.seq
+  FROM oldest
+ WHERE oldest.turn_number IS NOT NULL
+   AND (
+       oldest.turn_execution_id IS NOT NULL
+       OR EXISTS (
+           SELECT 1
+             FROM thread_messages AS answer
+            WHERE answer.thread_id = $1
+              AND answer.role = 'ai'
+              AND answer.rewound_at IS NULL
+              AND answer.turn_number = oldest.turn_number
+              AND answer.seq > oldest.seq
+              AND COALESCE(answer.content, '') <> ''
+              AND (
+                  answer.tool_calls IS NULL
+                  OR jsonb_typeof(answer.tool_calls) <> 'array'
+                  OR jsonb_array_length(answer.tool_calls) = 0
               )
-          )
-          AND NOT EXISTS (
-              SELECT 1
-                FROM thread_messages AS later_input
-               WHERE later_input.thread_id = input.thread_id
-                 AND later_input.role = 'human'
-                 AND later_input.rewound_at IS NULL
-                 AND later_input.seq > input.seq
-                 AND later_input.seq < answer.seq
-          )
+       )
    )
- ORDER BY input.seq ASC
- LIMIT 1
 """
 
 # Shutdown classification (step 4a): a cancelled turn that crossed a tool
@@ -342,6 +462,149 @@ SELECT NOT EXISTS (
               AND result_row.tool_call_id = tool_call ->> 'id'
        )
 )
+"""
+
+# Consumption is an input watermark, not proof that an external command
+# finished. A successor must inspect all live debt before restore can repair
+# an unanswered call out of model context. Delegation-only batches retain
+# their existing child-ledger recovery; mixed batches remain ambiguous.
+_SESSION_TOOL_DEBT_SQL = """
+SELECT EXISTS (
+    SELECT 1 FROM thread_messages AS malformed_row
+     WHERE malformed_row.thread_id = $1::uuid
+       AND malformed_row.role = 'ai'
+       AND malformed_row.rewound_at IS NULL
+       AND malformed_row.tool_calls IS NOT NULL
+       AND jsonb_typeof(malformed_row.tool_calls) IS DISTINCT FROM 'array'
+) OR EXISTS (
+    -- A result identifies a call by turn/id, not an occurrence. Duplicate
+    -- same-turn IDs cannot prove which physical effect that result settled.
+    SELECT 1
+      FROM thread_messages AS duplicate_row
+     CROSS JOIN LATERAL jsonb_array_elements(
+         CASE WHEN jsonb_typeof(duplicate_row.tool_calls) = 'array'
+              THEN duplicate_row.tool_calls ELSE '[]'::jsonb END
+     ) AS duplicate_call
+     WHERE duplicate_row.thread_id = $1::uuid
+       AND duplicate_row.role = 'ai'
+       AND duplicate_row.rewound_at IS NULL
+     GROUP BY duplicate_row.turn_number, duplicate_call ->> 'id'
+    HAVING COUNT(*) > 1 AND BOOL_OR(EXISTS (
+        SELECT 1 FROM jsonb_array_elements(
+            CASE WHEN jsonb_typeof(duplicate_row.tool_calls) = 'array'
+                 THEN duplicate_row.tool_calls ELSE '[]'::jsonb END
+        ) AS sibling
+        WHERE sibling ->> 'name' IS DISTINCT FROM 'delegate_agent'
+    ))
+) OR EXISTS (
+    SELECT 1
+      FROM thread_messages AS call_row
+     CROSS JOIN LATERAL jsonb_array_elements(
+         CASE WHEN jsonb_typeof(call_row.tool_calls) = 'array'
+              THEN call_row.tool_calls ELSE '[]'::jsonb END
+     ) AS tool_call
+     WHERE call_row.thread_id = $1::uuid
+       AND call_row.role = 'ai'
+       AND call_row.rewound_at IS NULL
+       AND (
+           jsonb_typeof(tool_call -> 'id') IS DISTINCT FROM 'string'
+           OR BTRIM(COALESCE(tool_call ->> 'id', '')) = ''
+           OR NOT EXISTS (
+               SELECT 1 FROM thread_messages AS result_row
+                WHERE result_row.thread_id = call_row.thread_id
+                  AND result_row.role = 'tool'
+                  AND result_row.rewound_at IS NULL
+                  AND result_row.seq > call_row.seq
+                  AND result_row.turn_number IS NOT DISTINCT FROM call_row.turn_number
+                  AND result_row.tool_call_id = tool_call ->> 'id'
+           )
+       )
+       AND EXISTS (
+           SELECT 1 FROM jsonb_array_elements(
+               CASE WHEN jsonb_typeof(call_row.tool_calls) = 'array'
+                    THEN call_row.tool_calls ELSE '[]'::jsonb END
+           ) AS sibling
+            WHERE sibling ->> 'name' IS DISTINCT FROM 'delegate_agent'
+               OR jsonb_typeof(sibling -> 'id') IS DISTINCT FROM 'string'
+               OR BTRIM(COALESCE(sibling ->> 'id', '')) = ''
+       )
+)
+"""
+
+_SESSION_TOOL_DEBT_AUTHORITY_SQL = (
+    """
+SELECT t.metadata, q.leased_until,
+       ("""
+    + _SESSION_TOOL_DEBT_SQL
+    + """) AS unresolved
+  FROM threads AS t JOIN run_queue AS q ON q.unit_id = t.id
+ WHERE t.id = $1::uuid
+   AND t.execution_lane = 'stateless' AND t.agent_id IS NULL
+   AND t.status IN ('created', 'active', 'awaiting_user')
+   AND t.runtime_retirement_token IS NULL
+   AND q.unit_kind = 'session_turn' AND q.state = 'leased'
+   AND q.lease_token = $2::bigint AND q.leased_by = $3::text
+   AND q.leased_until > clock_timestamp()
+"""
+)
+
+_LOCK_SESSION_TOOL_DEBT_QUEUE_SQL = """
+SELECT unit_id FROM run_queue WHERE unit_id = $1::uuid FOR UPDATE
+"""
+
+# Shutdown classification, the delegation branch (parallel_subagents.md §6.3,
+# §8): a cancelled turn whose only tool calls without a result are the calls
+# of a delegation-only batch is released for a successor to settle, not
+# parked. True iff
+#   * some persisted call has no result row (else the branch above applies),
+#   * every assistant row holding such a call carries delegate_agent calls
+#     only (a mixed batch never runs; any other call keeps today's park), and
+#   * every child this process opened a row for in the batch ($3 child ids,
+#     $4 their tool call ids, from the runtime) has that durable row for
+#     exactly its call. A child runs only after its row is open, so the
+#     successor then sees every child that may have done work, and a call
+#     with no row did nothing.
+_DELEGATION_BATCH_RECOVERABLE_SQL = """
+WITH unanswered AS (
+    SELECT call_row.tool_calls AS row_calls
+      FROM thread_messages AS call_row
+     CROSS JOIN LATERAL jsonb_array_elements(
+         CASE WHEN jsonb_typeof(call_row.tool_calls) = 'array'
+              THEN call_row.tool_calls ELSE '[]'::jsonb END
+     ) AS tool_call
+     WHERE call_row.thread_id = $1
+       AND call_row.role = 'ai'
+       AND call_row.rewound_at IS NULL
+       AND call_row.seq > $2::bigint
+       AND NOT EXISTS (
+           SELECT 1
+             FROM thread_messages AS result_row
+            WHERE result_row.thread_id = call_row.thread_id
+              AND result_row.role = 'tool'
+              AND result_row.rewound_at IS NULL
+              AND result_row.seq > call_row.seq
+              AND result_row.tool_call_id = tool_call ->> 'id'
+       )
+)
+SELECT EXISTS (SELECT 1 FROM unanswered)
+   AND NOT EXISTS (
+       SELECT 1
+         FROM unanswered
+        CROSS JOIN LATERAL jsonb_array_elements(unanswered.row_calls) AS sibling
+        WHERE sibling ->> 'name' IS DISTINCT FROM 'delegate_agent'
+   )
+   AND NOT EXISTS (
+       SELECT 1
+         FROM unnest($3::text[], $4::text[]) AS opened(child_id, tool_call_id)
+        WHERE NOT EXISTS (
+            SELECT 1
+              FROM threads AS child
+             WHERE child.parent_thread_id = $1
+               AND child.parent_tool_call_id = opened.tool_call_id
+               AND child.kind = 'subagent'
+               AND child.id::text = opened.child_id
+        )
+   )
 """
 
 
@@ -384,6 +647,11 @@ def attach_fingerprint(attach: Dict[str, Any]) -> str:
       convergence, but a warm owner applies their ordered pending request in
       place. Hashing them forced a full detach/attach before that drain (9–11s
       measured on k3d for a scalar whose journal write took ~10ms).
+    * The per-claim fan-out advertisement (``CLAIM_ADVERTISEMENT_KEYS``): the
+      executor re-applies it to a warm session at every claim
+      (``PersistentSession.apply_subagent_fanout_advertisement``), so the
+      operator's switch reaches every warm session at its next claim without
+      forcing all of them through a fresh attach at once.
 
     Every other config-content change (model, prompts, tools, datasources and
     other interactive settings) still changes the hash and forces the attach
@@ -408,6 +676,11 @@ def attach_fingerprint(attach: Dict[str, Any]) -> str:
             result.pop("interactive", None)
         return result
 
+    attach = {
+        key: value
+        for key, value in attach.items()
+        if key not in CLAIM_ADVERTISEMENT_KEYS
+    }
     rc = attach.get("resolved_config")
     override = attach.get("config_override")
     if isinstance(rc, dict):
@@ -481,10 +754,98 @@ def fingerprint_diff_paths(
     return paths
 
 
+#: The per-claim advertisements the orchestrator puts beside ``attach``
+#: (parallel_subagents.md §12): its batch-settle capability and its operator
+#: fan-out switch for the stateless lane. Folded into the attach keywords for
+#: a fresh attach and re-applied in place to a warm session at every claim,
+#: so they stay out of the attach fingerprint.
+CLAIM_ADVERTISEMENT_KEYS: frozenset[str] = frozenset(
+    {SESSION_SUBAGENT_BATCH_SETTLE_CONTRACT_KEY, SESSION_SUBAGENT_FANOUT_KEY}
+)
+
+
+def claim_bundle_attach(bundle: Mapping[str, Any]) -> Dict[str, Any]:
+    """The ``SessionAttachCoordinator.attach`` keywords of a stateless claim bundle.
+
+    ``attach`` is splatted into the coordinator's ``attach``, so the orchestrator puts
+    each per-claim advertisement beside it, never inside it: an agent image
+    without the keyword would refuse every claim. Both are folded in here as
+    keywords, which reach the session, its tool context and the fan-out gate
+    at a fresh attach. A bundle from an orchestrator that still carried the
+    capability inside ``attach`` supplies it the same way; the top-level value
+    wins. Neither is part of the attach fingerprint: a warm session gets them
+    from ``claim_bundle_advertisement`` at every claim instead.
+    """
+
+    attach = dict(bundle.get("attach") or {})
+    for key in sorted(CLAIM_ADVERTISEMENT_KEYS):
+        nested = attach.pop(key, None)
+        value = bundle.get(key, nested)
+        if value is not None:
+            attach[key] = value
+    return attach
+
+
+def claim_bundle_advertisement(attach: Mapping[str, Any]) -> Tuple[Any, Any]:
+    """This claim's raw ``(batch-settle capability, fan-out switch)``.
+
+    Read from the folded attach keywords (``claim_bundle_attach``). An absent
+    value is ``None``, which the session treats as off: an orchestrator that
+    no longer advertises either value turns fan-out off at the next claim.
+    """
+
+    return (
+        attach.get(SESSION_SUBAGENT_BATCH_SETTLE_CONTRACT_KEY),
+        attach.get(SESSION_SUBAGENT_FANOUT_KEY),
+    )
+
+
+def claim_bundle_pending_memory(bundle: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
+    """The thread's durable pending memory set the claim bundle carries.
+
+    Append-only context injection WP4 (D32, B9): the orchestrator reads
+    ``threads.metadata`` for every claim anyway and puts the set beside
+    ``attach``, never inside it, so a set written at every turn end never
+    changes the attach fingerprint. A fresh attach and a warm reuse both
+    take it from here. ``None`` when absent or unreadable.
+    """
+
+    return valid_pending_memory(bundle.get(SESSION_PENDING_MEMORY_KEY))
+
+
+def completed_input_checkpoint(
+    target: Mapping[str, Any], *, claim_consumed_seq: Optional[int]
+) -> Optional[int]:
+    """The human watermark a finished turn checkpoints when it closes.
+
+    An ordinary turn consumed its own input row. A subagent recovery turn
+    answered the input its continuation supersedes: a human row is consumed
+    there (the recovery already advanced the watermark to it, so this is a
+    repeat the close accepts).
+
+    ``None`` when the superseded input is not a human row: a wake, a job
+    completion, or the continuation of an earlier recovery whose turn
+    delegated again (parallel_subagents.md D3). The recovery settled that
+    event's own delivery, and the human watermark is not this turn's to move.
+    The close would refuse a checkpoint at the event's seq, because it
+    requires the event's delivery to be owned by the current lease and after
+    a crash it never is; and accepted, it would skip human input typed below
+    that seq.
+    """
+
+    superseded = target.get("supersedes_input_seq")
+    if superseded is not None and target.get("supersedes_input_role") != "human":
+        return None
+    return max(
+        int(superseded if superseded is not None else target["seq"]),
+        int(claim_consumed_seq) if claim_consumed_seq is not None else -1,
+    )
+
+
 def strip_restored_pending_humans(
     messages: List[Any], pending_rows: List[Dict[str, Any]]
 ) -> int:
-    """Drop restored copies of not-yet-consumed human rows from the tail.
+    """Drop restored copies of not-yet-consumed human rows.
 
     ``_restore_session_messages`` loads ALL live rows — including pending
     unanswered ones (rows whose ``seq`` is past the consumed watermark).
@@ -492,46 +853,88 @@ def strip_restored_pending_humans(
     DB write idempotent); without this strip the turn would see the pending
     message twice (once as restored history, once as the injected input).
 
-    Matching strategy: **by message id when the restored message carries the
-    DB row id** (future-proof — today's restore deliberately mints fresh
-    uuid4 ids and does not even select the id column, so id matches never
-    occur), **else by exact content equality matched tail-to-tail** (the
-    pending rows are the newest rows, so their restored copies are the last
-    messages; both sequences are seq-ordered and compared from the end).
+    Matching strategy: **by message id wherever the copy sits** — restore
+    keeps the DB row id, and an id match is the row itself, so position does
+    not matter (restore orders by turn, which puts pending input at the tail,
+    but a row without a turn number can still follow it). **Else by exact
+    content equality matched tail-to-tail**, for a copy restored without its
+    row id: the pending rows are the newest rows, so their restored copies
+    are the last messages; both sequences are seq-ordered and compared from
+    the end.
 
-    Stops at the first trailing message that is not a matching HumanMessage:
-    a non-trailing human is history and stays; an unanswered ``role='event'``
-    row (never enqueued by the orchestrator, so never in ``pending_rows``)
-    legitimately remains in context as history — matching today's documented
-    behavior for accepted-but-unconsumed notices.
+    The content match stops at the first trailing message that is not a
+    matching HumanMessage: a non-trailing human is history and stays; an
+    unanswered ``role='event'`` row (never enqueued by the orchestrator, so
+    never in ``pending_rows``) legitimately remains in context as history —
+    matching today's documented behavior for accepted-but-unconsumed notices.
 
-    Mutates ``messages`` in place; returns the number of messages removed.
+    One kind of pending event is restored: an older lease's admission that
+    never settled (``delivery_state == 'admitted'``), which the executor
+    serves again. Its restored copy is stripped like a human one; the event
+    is injected once, as the input of the turn that serves it.
+
+    A stripped input takes the run of typed context entries right after it
+    along (append-only context injection): they were appended for the turn
+    that input started and would otherwise fold into whatever message now
+    precedes them. The turn that serves the input again plans its own. The
+    tail matcher looks past a trailing run of entries to the input they
+    follow.
+
+    Mutates ``messages`` in place; returns the number of messages removed,
+    entries included.
     """
     if not messages or not pending_rows:
         return 0
-    pending_ids = {
-        str(row["id"]): row for row in pending_rows if row.get("id") is not None
-    }
     # Event deliveries are deliberately excluded by transcript restore until
     # provider admission. Keep only rows that restore actually loaded, or an
     # event after a human row would stop the tail matcher and duplicate the
-    # human on a fresh attach.
-    remaining = [row for row in pending_rows if row.get("role", "human") == "human"]
+    # human on a fresh attach. An admitted event was loaded.
+    remaining = [
+        row
+        for row in pending_rows
+        if row.get("role", "human") == "human"
+        or row.get("delivery_state") == "admitted"
+    ]
+    pending_ids = {
+        str(row["id"]): row for row in remaining if row.get("id") is not None
+    }
     removed = 0
+    if pending_ids:
+        kept = []
+        stripping_entries = False
+        for msg in messages:
+            if stripping_entries and is_context_entry(msg):
+                removed += 1
+                continue
+            stripping_entries = False
+            msg_id = getattr(msg, "id", None)
+            row = pending_ids.get(str(msg_id)) if msg_id is not None else None
+            if (
+                row is not None
+                and getattr(msg, "type", None) == "human"
+                and not is_context_entry(msg)
+            ):
+                del pending_ids[str(msg_id)]
+                remaining.remove(row)
+                removed += 1
+                stripping_entries = True
+                continue
+            kept.append(msg)
+        messages[:] = kept
     while messages and remaining:
-        msg = messages[-1]
+        end = len(messages)
+        while end and is_context_entry(messages[end - 1]):
+            end -= 1
+        if not end:
+            break
+        msg = messages[end - 1]
         if getattr(msg, "type", None) != "human":
             break
-        msg_id = getattr(msg, "id", None)
-        row = pending_ids.get(str(msg_id)) if msg_id is not None else None
-        if row is not None and row in remaining:
-            remaining.remove(row)
-        elif _message_text(msg) == (remaining[-1].get("content") or ""):
-            remaining.pop()
-        else:
+        if _message_text(msg) != (remaining[-1].get("content") or ""):
             break
-        messages.pop()
-        removed += 1
+        remaining.pop()
+        removed += len(messages) - (end - 1)
+        del messages[end - 1 :]
     return removed
 
 
@@ -572,6 +975,290 @@ _PARK_REASON_MAP = {
 
 def _park_reason_for(executor_reason: str) -> str:
     return _PARK_REASON_MAP.get(executor_reason, executor_reason)
+
+
+# --- Exhausted error release -------------------------------------------------
+# knowledge-base/knowledge/issues/voluntary_session_release_bypasses_retry_budget.md.
+# A voluntarily released row is never an expired lease, so the reaper's
+# max_attempts check cannot bound a release loop; the release itself must. When
+# it parks, the park is only half of the disposition: Cockpit derives the
+# visible lifecycle from the journal, so the epoch edge, the settled claimant
+# authority and ``turn.parked`` commit with the queue CAS or not at all.
+# Global per-thread lock order is threads -> run_queue (REST admission, End and
+# the reaper take the same order); the CAS takes the second lock.
+
+# Every ``_release`` reason, classified. Only a DETERMINISTIC pre-effect
+# failure — one a retry cannot fix without something changing — counts toward
+# the park budget. A TRANSIENT one (DB, transport, the orchestrator restarting
+# mid-deploy, a lost race, shutdown or drain) re-queues without limit under a
+# capped exponential backoff: such claims always recovered on their own, and
+# parking them turns every deploy blackout into manual Retries. When a site
+# cannot tell the two apart it is transient. tests/test_run_queue_park_
+# lifecycle.py fails on a release site whose reason is in neither table.
+_DETERMINISTIC_RELEASE_REASONS = frozenset(
+    {
+        # The durable input row cannot be run as it stands.
+        "empty_event_input",
+        "pending_turn_identity_invalid",
+        # The persistent loop ended on its own while this executor was
+        # healthy — a crash on this input, or the strict-pairing halt that
+        # exists to stop repeated provider spend. Shutdown never lands here:
+        # stop() marks the lease lost before aborting, and a cancelled claim
+        # takes the shutdown release. A DB blip can end the loop too, which is
+        # why the budget is max_attempts such failures, not one.
+        "loop_died",
+    }
+)
+_TRANSIENT_RELEASE_REASONS = frozenset(
+    {
+        "bundle_error",  # transport: the orchestrator is unreachable
+        "pending_query_failed",  # DB
+        "pending_event_query_failed",  # DB
+        "event_delivery_claim_failed",  # DB
+        "event_delivery_claim_lost",  # lost a race for the delivery
+        "stale_admission_settle_failed",  # DB / lease loss
+        "control_inbox_failed",  # DB / owner fence
+        # DB or lease loss; a corrupt receipt cannot be told apart here.
+        "stale_interrupt_recovery_failed",
+        # Warm reuse only: the detach makes the next claim's attach fresh.
+        "pending_turn_identity_mismatch",
+        "loop_not_ready",  # includes runtime admission closed (shutdown/drain)
+        # An unclassified exception: a bug and a DB error look the same.
+        "serve_crash",
+        "completion_cas_failed",  # the answer is durable and checkpointed
+    }
+)
+# Claim-bundle HTTP refusals: a 4xx is the orchestrator refusing THIS claim
+# (409 attach assembly refused, 403 lease validation, 401/400/422), so it is
+# deterministic; a 5xx, a timeout or a rate limit is the orchestrator unwell.
+_TRANSIENT_BUNDLE_STATUSES = frozenset({408, 425, 429})
+
+
+def _release_is_deterministic(reason: str) -> bool:
+    status = reason.removeprefix("bundle_")
+    if status != reason and status.isdigit():
+        code = int(status)
+        return 400 <= code < 500 and code not in _TRANSIENT_BUNDLE_STATUSES
+    if reason in _DETERMINISTIC_RELEASE_REASONS:
+        return True
+    if reason not in _TRANSIENT_RELEASE_REASONS:
+        logger.warning("unclassified release reason %r treated as transient", reason)
+    return False
+
+
+_LOCK_RELEASE_THREAD_SQL = """
+SELECT execution_lane, agent_id, metadata
+  FROM threads
+ WHERE id = $1::uuid
+   FOR UPDATE
+"""
+
+_RELEASED_QUEUE_ROW_SQL = """
+SELECT state, lease_token, leased_by, park_reason,
+       attempts_since_completion, max_attempts, attach_failures
+  FROM run_queue
+ WHERE unit_id = $1::uuid
+"""
+
+_CLEAR_ACTIVE_CLAIM_SQL = """
+UPDATE threads
+   SET metadata = metadata - '_stateless_active_claim'
+ WHERE id = $1::uuid
+RETURNING id
+"""
+
+
+@dataclass(frozen=True)
+class _ReleaseDisposition:
+    """The committed queue outcome of one exact error release."""
+
+    state: str
+    attempts: int
+    journaled: bool = False
+    # A retry found this claim's own earlier commit (its response was lost).
+    replayed: bool = False
+
+
+@contextlib.asynccontextmanager
+async def _db_transaction(db: Any) -> AsyncIterator[Any]:
+    """One explicit transaction on a pool wrapper or a bare connection."""
+
+    acquire = getattr(db, "acquire", None)
+    if acquire is None:
+        async with db.transaction():
+            yield db
+        return
+    async with acquire() as conn:
+        async with conn.transaction():
+            yield conn
+
+
+async def _retire_parked_claim_authority(
+    conn: Any,
+    *,
+    unit_id: str,
+    metadata: Any,
+    lease_token: int,
+    pod_name: str,
+    pod_uid: str,
+) -> None:
+    """Clear the credential-bound claimant record a quiesced park retires.
+
+    The caller has drained every local writer, so the claimant's own
+    quiescence is the proof; nothing about the workspace is asserted. A record
+    for this exact token must name this pod (and UID, when known). An older
+    token is a leftover of an earlier voluntary disposition — a steal or End
+    would already have removed it. Anything else is not this claimant's to
+    clear and is left, logged, for the operator.
+    """
+
+    if metadata is None:
+        return
+    try:
+        active = active_claim_authority(metadata)
+    except RuntimeError:
+        logger.warning(
+            "parked release left a malformed active-claim record: unit=%s", unit_id
+        )
+        return
+    if active is None:
+        return
+    active_token, authority = active
+    if active_token > lease_token or (
+        active_token == lease_token
+        and (
+            authority.pod != pod_name
+            or (bool(pod_uid) and authority.pod_uid != pod_uid)
+        )
+    ):
+        logger.warning(
+            "parked release left a foreign active claim: unit=%s token=%d "
+            "active_token=%d active_pod=%s",
+            unit_id,
+            lease_token,
+            active_token,
+            authority.pod,
+        )
+        return
+    if await conn.fetchval(_CLEAR_ACTIVE_CLAIM_SQL, unit_id) is None:
+        raise RuntimeError("parked release lost its locked thread row")
+
+
+async def _settle_session_release(
+    db: Any,
+    claim: ClaimedUnit,
+    *,
+    cas: Callable[[Any], Awaitable[Optional[str]]],
+    pod_name: str,
+    pod_uid: str,
+    park_reason: str,
+    release_reason: str,
+    error: Optional[str] = None,
+) -> Optional[_ReleaseDisposition]:
+    """Run one exact error-release CAS and, when it parks, journal it atomically.
+
+    ``cas(conn)`` is the fenced queue statement (a bounded release or the
+    attach-failure record) and returns the resulting state, ``None`` when
+    fenced out. The caller must have quiesced the claim. Returns ``None`` when
+    the lease belongs to someone else.
+    """
+
+    unit_id = str(claim.unit_id)
+    token = int(claim.lease_token)
+    session_unit = str(claim.unit_kind) == UNIT_KIND_SESSION_TURN
+    async with _db_transaction(db) as conn:
+        thread = (
+            await conn.fetchrow(_LOCK_RELEASE_THREAD_SQL, unit_id)
+            if session_unit
+            else None
+        )
+        state = await cas(conn)
+        queue = await conn.fetchrow(_RELEASED_QUEUE_ROW_SQL, unit_id)
+        attempts = (
+            int(queue["attempts_since_completion"])
+            if queue is not None
+            else int(claim.attempts_since_completion)
+        )
+        if state is None:
+            # Claims, steals and End all advance the token; only this claimant
+            # takes token N off 'leased' without doing so. A writer-free row
+            # still at N is therefore its own earlier commit whose response
+            # was lost: report it again, journal nothing twice.
+            if (
+                queue is not None
+                and int(queue["lease_token"] or 0) == token
+                and str(queue["state"] or "") in {STATE_QUEUED, STATE_PARKED}
+                and queue["leased_by"] is None
+            ):
+                return _ReleaseDisposition(
+                    state=str(queue["state"]), attempts=attempts, replayed=True
+                )
+            return None
+        if (
+            str(state) != STATE_PARKED
+            or thread is None
+            or str(thread["execution_lane"] or "") != LANE_STATELESS
+            or thread["agent_id"] is not None
+        ):
+            return _ReleaseDisposition(state=str(state), attempts=attempts)
+
+        reason = str(
+            (queue["park_reason"] if queue is not None else None) or park_reason
+        )
+        await _retire_parked_claim_authority(
+            conn,
+            unit_id=unit_id,
+            metadata=thread["metadata"],
+            lease_token=token,
+            pod_name=pod_name,
+            pod_uid=pod_uid,
+        )
+        # Fences any warm allocator still holding this epoch, exactly like a
+        # reaper park; the frames below are the new epoch's first facts.
+        await bump_epoch(conn, thread_id=unit_id)
+        # A loop that died while a tool awaited approval leaves that prompt
+        # pending under this token, and nothing retires it while parked (the
+        # reaper's parked-row sweep only reaches older tokens). The quiesced
+        # claimant cannot answer it, and N + 1 is the generation the next
+        # claim mints — the same boundary its attach-time recovery retires.
+        # Interrupts need no such step: pre-injection releases never opened
+        # admission, and loop death closes it with a final owner drain.
+        await retire_stale_stateless_permissions(
+            conn,
+            thread_id=unit_id,
+            retired_lease_token=token,
+            successor_lease_token=token + 1,
+            reason="lease_expired",
+            epoch_already_bumped=True,
+        )
+        # No target turn id: bundle, attach and pre-injection failures never
+        # reached turn.started, and when a loop died mid-turn the client's
+        # active-turn fallback for an uncorrelated frame is exactly that turn.
+        # Either way the queue block the client re-anchors to shows the park;
+        # this frame names why.
+        payload: dict[str, Any] = {
+            "reason": reason,
+            "release_reason": release_reason,
+            "attempts": attempts,
+            "retryable": reason in RETRYABLE_PARK_REASONS,
+            "parked_by": pod_name,
+            "lease_token": token,
+        }
+        if queue is not None:
+            # The budget counts failures, not claims (hand-backs and
+            # transient releases bump attempts too), so name both.
+            payload["failures"] = int(queue["attach_failures"])
+            payload["max_attempts"] = int(queue["max_attempts"])
+        if error:
+            payload["error"] = error[: _ERROR_SIGNATURE_MESSAGE_CHARS * 4]
+        frame = await append_system_frame(
+            conn, thread_id=unit_id, kind="turn.parked", payload=payload
+        )
+        if frame is None:
+            raise RuntimeError("thread disappeared while journaling a parked release")
+        return _ReleaseDisposition(
+            state=STATE_PARKED, attempts=attempts, journaled=True
+        )
 
 
 class StatelessTurnExecutor:
@@ -625,10 +1312,14 @@ class StatelessTurnExecutor:
         self._worker_preempted = asyncio.Event()
         self._worker_preempt_status: Optional[str] = None
         self._worker_terminal_report_generation: tuple[str, int] | None = None
+        self._worker_exhaustion_checkpoint_generation: tuple[str, int] | None = None
+        self._worker_container_report_uncertain = False
+        self._worker_node_interrupted = False
         self._worker_completion_accepted_generation: tuple[str, int] | None = None
         self._worker_workspace_recovery: WorkspaceRecoveryHandoff | None = None
         self._worker_workspace_recovery_code: WorkspaceRecoveryCode | None = None
         self._worker_workspace_backend: str | None = None
+        self._worker_workspace_provisioner: str | None = None
         self._worker_quarantined = False
         self._worker_runtime_quiesced = False
         self._worker_retirement_lock = asyncio.Lock()
@@ -676,7 +1367,11 @@ class StatelessTurnExecutor:
         # Full-settle close evidence survives cancellation into the claim's
         # finally block. Cleanup must never downgrade an atomic
         # close+checkpoint retry into a gate-only close.
-        self._pending_settled_close: tuple[str, int, int, int] | None = None
+        self._pending_settled_close: tuple[str, int, int, int | None] | None = None
+        # Only cancellation before Session admission/lease activation. Its
+        # input may belong to an unknown predecessor effect, so shutdown's
+        # ordinary pre-effect hand-back is not an authorized disposition.
+        self._session_admission_cancelled: tuple[str, int] | None = None
         # Monotonic executor-owned copy of the exact external-effect seam.
         # PersistentApp session globals are intentionally cleared by a
         # physical detach, which can precede the queue completion CAS.
@@ -781,10 +1476,14 @@ class StatelessTurnExecutor:
                         int(self._lease.lease_token),
                     )
                 self._lease.mark_lost()
+            # Tagged as the platform's own abort: a running delegation batch
+            # does not treat it as a person's Stop and keeps its children
+            # (parallel_subagents.md §8); every other turn stops as before.
             self._abort_turn_politely(
                 pa,
                 target_turn_id=target_turn_id,
                 force_graceful=tool_execution_started,
+                cause=INTERRUPT_CAUSE_SHUTDOWN,
             )
             try:
                 await asyncio.wait_for(asyncio.shield(task), self._abort_grace_seconds)
@@ -792,8 +1491,12 @@ class StatelessTurnExecutor:
                 logger.error(
                     "stateless executor still running after interrupt — "
                     "cancelling; a quiesced post-effect claim will be parked "
-                    "instead of retried"
+                    "instead of retried unless its turn can be continued"
                 )
+                # The turn is abandoned to a successor. A delegation child
+                # this cancellation interrupts keeps the durable row a crash
+                # leaves, for the successor's settle to interrupt.
+                self._leave_subagents_for_successor(pa)
                 task.cancel()
                 with contextlib.suppress(asyncio.CancelledError, Exception):
                     await task
@@ -964,9 +1667,10 @@ class StatelessTurnExecutor:
     @staticmethod
     def _worker_mcp_attached(request: JobStartRequest) -> bool:
         """Whether resolved claim inputs will construct an MCP manager."""
+        from shared.connectors.builtin import delivers_in
 
         return any(
-            isinstance(datasource, dict) and datasource.get("type") == "mcp"
+            isinstance(datasource, dict) and delivers_in(datasource, "mcp_client")
             for datasource in (request.datasources or ())
         )
 
@@ -1315,10 +2019,14 @@ class StatelessTurnExecutor:
         self._worker_preempted = asyncio.Event()
         self._worker_preempt_status = None
         self._worker_terminal_report_generation = None
+        self._worker_exhaustion_checkpoint_generation = None
+        self._worker_container_report_uncertain = False
+        self._worker_node_interrupted = False
         self._worker_completion_accepted_generation = None
         self._worker_workspace_recovery = None
         self._worker_workspace_recovery_code = None
         self._worker_workspace_backend = None
+        self._worker_workspace_provisioner = None
         self._worker_runtime_quiesced = False
         self._worker_recovery_handoff_done = False
         self._worker_lease_disposition_uncertain = False
@@ -1364,6 +2072,9 @@ class StatelessTurnExecutor:
             timing["outcome"] = f"quarantined:{self._worker_handoff_reason()}"
             return
         except SubagentLifecycleError as exc:
+            if self._worker_node_interrupted:
+                timing["outcome"] = await self._hold_interrupted_worker_node(claim)
+                return
             if await self._resolve_workspace_recovery(claim, error=exc):
                 timing["outcome"] = await self._handoff_workspace_recovery(claim=claim)
                 return
@@ -1397,6 +2108,9 @@ class StatelessTurnExecutor:
             timing["outcome"] = "released:child_lifecycle_failed"
             return
         except Exception as exc:
+            if self._worker_node_interrupted:
+                timing["outcome"] = await self._hold_interrupted_worker_node(claim)
+                return
             if self._worker_quarantined:
                 self.request_stop()
                 timing["outcome"] = f"quarantined:{self._worker_handoff_reason()}"
@@ -1416,8 +2130,18 @@ class StatelessTurnExecutor:
                 unit_id,
                 int(token),
             )
-            if report_started:
-                # Once an HTTP report has begun, correction 8 owns every
+            checkpoint_started = self._worker_exhaustion_checkpoint_generation == (
+                unit_id,
+                int(token),
+            )
+            if report_started or checkpoint_started:
+                if await self._hold_unaccepted_container_report(claim):
+                    with contextlib.suppress(Exception):
+                        await self._cleanup_worker_runtime(preserve_shell=True)
+                    timing["outcome"] = "held:worker_execution_outcome_unknown"
+                    return
+                # Once durable give-up sealing or an HTTP report has begun,
+                # correction 8 owns every
                 # ambiguous tail failure. Never issue a second report from
                 # this generation and never park it: preserve runtime state,
                 # release with backoff, and let a successor consume or
@@ -1437,11 +2161,19 @@ class StatelessTurnExecutor:
                     return
                 await self._release_worker_claim(
                     claim,
-                    reason="terminal_report_failed",
+                    reason=(
+                        "terminal_report_failed"
+                        if report_started
+                        else "giveup_checkpoint_unproven"
+                    ),
                     park_on_exhaustion=False,
                     timing=timing,
                 )
-                timing["outcome"] = "released:terminal_report_failed"
+                timing["outcome"] = (
+                    "released:terminal_report_failed"
+                    if report_started
+                    else "released:giveup_checkpoint_unproven"
+                )
                 return
             if str(self._lease.unit_id or "") != unit_id or int(
                 self._lease.lease_token
@@ -1476,7 +2208,18 @@ class StatelessTurnExecutor:
                 and not self._lease.lost.is_set()
             ):
                 final_state = self._worker_retry_exhausted_state(
-                    self._worker_driver_error_state(str(exc), job_id=unit_id),
+                    self._worker_driver_error_state(
+                        str(exc),
+                        job_id=unit_id,
+                        cause=(
+                            {"type": exc.code.value}
+                            if isinstance(exc, ClaimBundleError)
+                            and isinstance(exc.code, WorkspaceRecoveryCode)
+                            else {"type": "workspace_unavailable"}
+                            if isinstance(exc, WorkspaceUnavailableError)
+                            else None
+                        ),
+                    ),
                     attempts=unit.attempts_since_completion,
                     max_attempts=claim.max_attempts,
                 )
@@ -1582,6 +2325,7 @@ class StatelessTurnExecutor:
         self._worker_workspace_backend = (request.workspace_runtime or {}).get(
             "assigned_backend"
         )
+        self._worker_workspace_provisioner = request.workspace_provisioner
         timing["mcp_attached"] = self._worker_mcp_attached(request)
         metadata = self._worker_job_metadata(request)
         context = request.context or {}
@@ -1667,6 +2411,9 @@ class StatelessTurnExecutor:
                 await self._join_worker_local_task(
                     asyncio.create_task(streaming_gen.aclose())
                 )
+
+        if self._worker_node_interrupted:
+            return await self._hold_interrupted_worker_node(claim)
 
         if await self._resolve_workspace_recovery(claim, final_state=final_state):
             return await self._handoff_workspace_recovery(claim=claim)
@@ -1766,6 +2513,24 @@ class StatelessTurnExecutor:
             return "rotated"
 
         if self._worker_stop_is_recoverable(final_state, freeze_type):
+            payload, _ = self._worker_completion_wire_payload(final_state)
+            error = payload.get("error")
+            if (
+                self._completion_commands_enabled
+                and self._worker_workspace_backend == "sandbox"
+                and self._worker_workspace_provisioner == "k8s"
+                and payload.get("should_stop") is True
+                and payload.get("goal_achieved", False) is False
+                and isinstance(error, dict)
+                and error.get("type") == "workspace_unavailable"
+            ):
+                # An interrupted tool may already have effects. Queue backoff
+                # would re-enter the graph without evidence that replay is safe.
+                # The existing report protocol holds the exact accepted claim;
+                # connectivity and cleanup disposition belong to the server.
+                return await self._report_worker_terminal(
+                    claim, final_state, client=client, timing=timing
+                )
             if unit.attempts_since_completion >= claim.max_attempts:
                 final_state = self._worker_retry_exhausted_state(
                     final_state,
@@ -1825,6 +2590,19 @@ class StatelessTurnExecutor:
         unit = claim.unit
         job_id = str(unit.unit_id)
         token = unit.lease_token
+        if (
+            isinstance(final_state.get("error"), dict)
+            and final_state["error"].get("type") == "worker_retry_exhausted"
+            and isinstance(final_state.get("completion_report_payload"), dict)
+        ):
+            # A save may commit before its caller observes success. Mark this
+            # generation before sealing so an ambiguous checkpoint failure
+            # cannot fall back to a second, synthetic HTTP completion report.
+            self._worker_exhaustion_checkpoint_generation = (job_id, int(token))
+            agent = _pa()._agent
+            final_state = await agent.checkpoint_worker_retry_exhaustion(
+                job_id=job_id, lease_token=token, terminal_state=final_state
+            )
         wire_payload, payload_source = self._worker_completion_wire_payload(final_state)
         if wire_payload.get("should_stop") is not True:
             # Fail closed before marking this generation as report-started.
@@ -1857,6 +2635,14 @@ class StatelessTurnExecutor:
         # failures preserve tmux and re-report; the exact coded pre-write 422
         # below instead follows ordinary bounded retry/parking semantics.
         self._worker_terminal_report_generation = (job_id, int(token))
+        error = wire_payload.get("error")
+        self._worker_container_report_uncertain = _uncertain_worker_workspace_report(
+            completion_commands_enabled=self._completion_commands_enabled,
+            workspace_backend=self._worker_workspace_backend,
+            workspace_provisioner=self._worker_workspace_provisioner,
+            goal_achieved=wire_payload.get("goal_achieved", False),
+            error=error,
+        )
         started_at = time.perf_counter()
         try:
             reported = await client.report_completion(
@@ -1870,6 +2656,7 @@ class StatelessTurnExecutor:
             # follows ordinary retry/parking semantics rather than the
             # ambiguous-HTTP no-park path.
             self._worker_terminal_report_generation = None
+            self._worker_container_report_uncertain = False
             logger.error(
                 "worker completion definitively refused: unit=%s token=%d code=%s",
                 job_id,
@@ -1899,6 +2686,8 @@ class StatelessTurnExecutor:
             return f"released:{exc.code}"
         finally:
             self._add_worker_finish_timing(timing, started_at)
+        if reported:
+            self._worker_container_report_uncertain = False
         if await self._resolve_workspace_recovery(claim):
             return await self._handoff_workspace_recovery(claim=claim)
         if not reported:
@@ -1930,6 +2719,7 @@ class StatelessTurnExecutor:
                     failed_report_status = renewal.job_status
                     self._observe_worker_renewal(job_id, renewal)
             if accepted_completion is not None:
+                self._worker_container_report_uncertain = False
                 logger.info(
                     "worker completion already accepted: unit=%s token=%d "
                     "command=%s state=%s after ambiguous HTTP result",
@@ -1950,6 +2740,15 @@ class StatelessTurnExecutor:
             if self._lease.lost.is_set():
                 await self._cleanup_worker_runtime(preserve_shell=True)
                 return "error"
+            # Pause does not settle an interrupted command. Record its
+            # separate restriction before the ordinary preemption path can
+            # close the queue and leave an explicitly liftable pause.
+            if (
+                failed_report_status == "paused"
+                and await self._hold_unaccepted_container_report(claim)
+            ):
+                await self._cleanup_worker_runtime(preserve_shell=True)
+                return "held:worker_execution_outcome_unknown"
             if self._worker_preempted.is_set():
                 await self._finish_external_worker_preempt(
                     claim,
@@ -1957,6 +2756,9 @@ class StatelessTurnExecutor:
                     timing=timing,
                 )
                 return "preempted"
+            if await self._hold_unaccepted_container_report(claim):
+                await self._cleanup_worker_runtime(preserve_shell=True)
+                return "held:worker_execution_outcome_unknown"
             await self._cleanup_worker_runtime(
                 preserve_shell=failed_report_status
                 not in {"completed", "failed", "cancelled"}
@@ -2190,6 +2992,7 @@ class StatelessTurnExecutor:
                 "managed_repository_credentials",
                 "managed_repository_credentials",
             ),
+            ("workspace_ssh_identities", "workspace_ssh_identities"),
             ("branch_name", "branch_name"),
             ("project_id", "project_id"),
             ("runtime_actor", "runtime_actor"),
@@ -2391,6 +3194,13 @@ class StatelessTurnExecutor:
                         {next_state, lost_waiter, preempt_waiter},
                         return_when=asyncio.FIRST_COMPLETED,
                     )
+                    # A same-tick Pause must not discard already-observed
+                    # interruption evidence and publish an ordinary resumable
+                    # stop. Inspect only a completed local result; native hold
+                    # admission still gives Cancel/accepted successors priority.
+                    if next_state.done():
+                        with contextlib.suppress(asyncio.CancelledError, Exception):
+                            self._observe_worker_node_interruption(next_state.result())
                     # Ownership/control always wins a same-tick graph result.
                     if self._lease.lost.is_set():
                         next_state.cancel()
@@ -2412,7 +3222,16 @@ class StatelessTurnExecutor:
                             0.0, stream_started_at - agent_start_started_at
                         )
                     if isinstance(state, dict):
-                        final_state = state
+                        # This private stream field is emitted only for an
+                        # actual LangGraph NodeCancelledError. Latch before
+                        # generator-finally/quiescence can fail, and strip it
+                        # before any sibling completion path sees the state.
+                        self._observe_worker_node_interruption(state)
+                        final_state = {
+                            key: value
+                            for key, value in state.items()
+                            if key != "_worker_node_cancelled"
+                        }
                         error = state.get("error")
                         if isinstance(error, dict):
                             if error.get("type") == "workspace_unavailable":
@@ -2450,6 +3269,16 @@ class StatelessTurnExecutor:
                     waiter.cancel()
                     with contextlib.suppress(asyncio.CancelledError):
                         await waiter
+
+    def _observe_worker_node_interruption(self, state: Any) -> None:
+        if (
+            isinstance(state, dict)
+            and state.get("_worker_node_cancelled") is True
+            and self._completion_commands_enabled
+            and self._worker_workspace_backend == "sandbox"
+            and self._worker_workspace_provisioner == "k8s"
+        ):
+            self._worker_node_interrupted = True
 
     async def _worker_heartbeat_loop(self, claim: WorkerClaim) -> None:
         unit = claim.unit
@@ -2731,6 +3560,7 @@ class StatelessTurnExecutor:
         message: str,
         *,
         job_id: str | None = None,
+        cause: dict[str, Any] | None = None,
     ) -> Dict[str, Any]:
         return {
             "job_id": job_id,
@@ -2740,6 +3570,7 @@ class StatelessTurnExecutor:
                 "type": "worker_driver_error",
                 "recoverable": True,
                 "message": str(message),
+                **({"cause": dict(cause)} if cause is not None else {}),
             },
         }
 
@@ -2761,6 +3592,16 @@ class StatelessTurnExecutor:
         exhausted = dict(final_state)
         prior_error = final_state.get("error")
         error = dict(prior_error) if isinstance(prior_error, dict) else {}
+        # Preserve typed setup failures as well as graph-reported causes. A
+        # generic driver failure carries no invented workspace diagnosis.
+        cause = worker_error_cause(
+            error.get("cause")
+            if error.get("type") == "worker_driver_error"
+            and isinstance(error.get("cause"), dict)
+            else prior_error
+        )
+        if cause is not None:
+            error["cause"] = cause
         prior_freeze = final_state.get("freeze_data")
         reason = error.get("message")
         if not reason and isinstance(prior_freeze, dict):
@@ -2847,6 +3688,21 @@ class StatelessTurnExecutor:
     async def _cleanup_worker_runtime_locked(self, *, preserve_shell: bool) -> None:
         agent = _pa()._agent
         if agent is not None:
+            if self._worker_container_report_uncertain or self._worker_node_interrupted:
+                # This reduces outstanding local work; it never settles the
+                # durable barrier or proves a remote command stopped.
+                try:
+                    await self._join_worker_local_task(
+                        asyncio.create_task(agent.quiesce_worker_workspace_recovery())
+                    )
+                except (Exception, asyncio.CancelledError) as exc:
+                    self.request_stop()
+                    if isinstance(exc, asyncio.CancelledError):
+                        raise
+                    logger.warning(
+                        "Container worker local retirement remains unknown",
+                        exc_info=True,
+                    )
             if self._lease.lost.is_set():
                 # Local lease loss is already sufficient to revoke effect
                 # authority.  Do not ask quiesce/its DB probe to rediscover the
@@ -2900,6 +3756,14 @@ class StatelessTurnExecutor:
         park_on_exhaustion: bool = True,
         timing: dict[str, Any] | None = None,
     ) -> None:
+        if self._worker_node_interrupted:
+            await self._hold_interrupted_worker_node(claim)
+            return
+        if (
+            reason == "terminal_report_failed"
+            and await self._hold_unaccepted_container_report(claim)
+        ):
+            return
         if self._lease.lost.is_set() or self._worker_quarantined:
             logger.info(
                 "run_queue release: worker unit=%s token=%d reason=%s "
@@ -2935,6 +3799,49 @@ class StatelessTurnExecutor:
             reason,
             state,
         )
+
+    async def _hold_interrupted_worker_node(self, claim: WorkerClaim) -> str:
+        try:
+            decision = await hold_interrupted_container_worker(
+                self._db, unit_id=claim.unit_id, lease_token=claim.lease_token
+            )
+            if decision in {"held", "superseded"}:
+                self._lease.mark_lost()
+        except Exception:
+            # No report or fallback release. Exact expiry classification owns
+            # an attempt whose restriction could not be committed here.
+            logger.exception("Interrupted worker node hold unavailable")
+        try:
+            await self._cleanup_worker_runtime(preserve_shell=True)
+        except Exception:
+            self.request_stop()
+            logger.exception("Interrupted worker node retirement remains unknown")
+        return "held:worker_execution_outcome_unknown"
+
+    async def _hold_unaccepted_container_report(self, claim: WorkerClaim) -> bool:
+        if not self._worker_container_report_uncertain:
+            return False
+        if self._worker_completion_accepted_generation == (
+            str(claim.unit_id),
+            int(claim.lease_token),
+        ):
+            self._worker_container_report_uncertain = False
+            return False
+        try:
+            decision = await hold_failed_container_worker_report(
+                self._db,
+                unit_id=claim.unit_id,
+                lease_token=claim.lease_token,
+            )
+            if decision in {"held", "superseded"}:
+                self._lease.mark_lost()
+        except Exception:
+            # No fallback release: a still-leased attempt is reconsidered by
+            # the exact expired-attempt reaper after this worker retires.
+            logger.exception(
+                "Container worker report hold unavailable; refusing graph retry"
+            )
+        return True
 
     async def _serve_claim(self, claim: ClaimedUnit) -> None:
         pa = _pa()
@@ -3005,12 +3912,12 @@ class StatelessTurnExecutor:
             self._mark_warm(claim)
             return
 
-        # (b) Skip-if-answered, transcript leg: the oldest pending input
-        # already has its final answer in thread_messages (a predecessor's
+        # (b) Skip-if-answered, transcript leg: the oldest pending input's
+        # own turn already reached its durable answer (a predecessor's
         # settlement died after the answer landed). Advance the watermark to
-        # that input instead of answering it again; complete_unit re-queues
-        # the unit when newer input is waiting behind it. A pending event
-        # delivery keeps the ordinary path (the claim must run it).
+        # exactly that input instead of answering it again; complete_unit
+        # re-queues the unit when newer input is waiting behind it. A pending
+        # event delivery keeps the ordinary path (the claim must run it).
         if (
             not watermarks_answered
             and claim.input_seq is not None
@@ -3109,12 +4016,20 @@ class StatelessTurnExecutor:
             pa._turn_start_external_hook = None
             pa._turn_complete_external_hook = None
             pa._turn_tool_execution_external_hook = None
+            pa._turn_idle_input_external_probe = None
             settled = self._settled_claim == (str(claim.unit_id), int(token))
             self._settled_claim = None
             shutdown_retry = self._shutdown_retry_claim == (unit_id, int(token))
             if shutdown_retry:
                 self._shutdown_retry_claim = None
-            if cancelled or shutdown_retry:
+            admission_cancelled = self._session_admission_cancelled == (
+                unit_id,
+                int(token),
+            )
+            if admission_cancelled:
+                self._session_admission_cancelled = None
+                self.request_stop()
+            elif cancelled or shutdown_retry:
                 # SIGTERM's hard-cancel is still an ownership transition. Do
                 # not leave a live exact claim to expire after this Pod object
                 # disappears: first drain every local/SFTP/background writer,
@@ -3144,8 +4059,11 @@ class StatelessTurnExecutor:
         settled, no tool effect crossed — release with attempts++. (3) not
         settled, effect crossed, but every persisted tool call has its
         durable ToolMessage — release: the successor continues from the
-        transcript. (4) an in-flight tool with no result row — the only
-        remaining park.
+        transcript. (3b) the calls without a result are those of a
+        delegation-only batch whose opened children all have their rows —
+        release: the successor settles the batch (parallel_subagents.md §8).
+        (4) any other in-flight tool with no result row — the only remaining
+        park.
         """
 
         pa = _pa()
@@ -3197,6 +4115,17 @@ class StatelessTurnExecutor:
                 logger.warning(
                     "shutdown mid-turn after tool effects, all results durable: "
                     "releasing unit=%s token=%d for a successor to continue",
+                    claim.unit_id,
+                    claim.lease_token,
+                )
+                tool_execution_started = False
+            elif await self._delegation_batch_recoverable(pa, claim):
+                # The children are stopped by the detach below and keep the
+                # rows a crash leaves; the input stays unconsumed, and the
+                # successor's attach settles the batch and continues the turn.
+                logger.warning(
+                    "shutdown mid-turn during a delegation batch: releasing "
+                    "unit=%s token=%d for a successor to settle",
                     claim.unit_id,
                     claim.lease_token,
                 )
@@ -3261,6 +4190,19 @@ class StatelessTurnExecutor:
         token: int,
         claim_lost: asyncio.Event,
     ) -> None:
+        try:
+            if not await self._admit_session_tool_history(pa, claim):
+                return
+        except asyncio.CancelledError:
+            self._session_admission_cancelled = (unit_id, int(token))
+            raise
+        except Exception as exc:
+            # Classification or park/journal ambiguity must not fall through
+            # run()'s generic pre-effect release; this is predecessor debt,
+            # before the new claim has attached or activated any local writer.
+            raise _PostEffectParkError(
+                "Session predecessor tool admission is unproven"
+            ) from exc
         # (d) Claim bundle — the pinned contract. On failure the token-guarded
         # release below is a no-op when the lease is genuinely gone (401/403 =
         # "treat as lease lost: release nothing" happens naturally via the
@@ -3275,6 +4217,11 @@ class StatelessTurnExecutor:
                     "claim bundle 404 for unit %s — unit vanished, dropping claim",
                     unit_id,
                 )
+                return
+            if e.model_unavailable_message:
+                # Retrying cannot help until the owner switches the model:
+                # park now with the refusal the cockpit shows.
+                await self._park_model_unavailable(claim, e.model_unavailable_message)
                 return
             logger.warning(
                 "claim bundle %d for unit %s — releasing (token-guarded: a "
@@ -3304,7 +4251,7 @@ class StatelessTurnExecutor:
             return
 
         timing["bundle"] = time.perf_counter() - t0
-        attach = bundle.get("attach") or {}
+        attach = claim_bundle_attach(bundle)
         # Watermarks: the claim's values were read atomically inside the claim
         # statement — they are the authority; the bundle's copy is diagnostics.
         consumed_seq = claim.consumed_seq
@@ -3314,7 +4261,7 @@ class StatelessTurnExecutor:
         fresh_attach = False
         reuse = (
             pa._session is not None
-            and pa._thread_id == unit_id
+            and pa._session_identity.thread_id == unit_id
             and self._attached_fingerprint == fingerprint
             and pa._session.stateless_warm_reuse_safe
         )
@@ -3337,7 +4284,7 @@ class StatelessTurnExecutor:
         else:
             if (
                 pa._session is not None
-                and pa._thread_id == unit_id
+                and pa._session_identity.thread_id == unit_id
                 and self._attached_bundle is not None
             ):
                 # Same thread, changed fingerprint: name WHICH bundle paths
@@ -3358,7 +4305,7 @@ class StatelessTurnExecutor:
                 return
             t0 = time.perf_counter()
             try:
-                await pa._attach_session(**attach)
+                await pa._session_attach.attach(**attach)
             except Exception as e:
                 logger.warning(
                     "attach failed for unit %s: %s", unit_id, e, exc_info=True
@@ -3402,6 +4349,17 @@ class StatelessTurnExecutor:
         # the first lazy shell initialization.
         if pa._session is not None:
             pa._session.set_shell_owner_token(token)
+            # This claim's fan-out advertisement (parallel_subagents.md §12).
+            # A warm session skipped attach, so the operator's switch reaches
+            # it only here; a fresh attach already built with the same values,
+            # which makes this a no-op for it. Before any input is injected.
+            pa._session_attach.apply_subagent_advertisement(
+                *claim_bundle_advertisement(attach)
+            )
+            # The durable pending memory set (WP4, D32/B9): the idle-time
+            # prefetch of an earlier turn, maybe on another pod. Before any
+            # input is injected, so the turn's first request takes it in.
+            self._apply_pending_memory(pa, bundle, unit_id)
 
         # A claim may beat the reaper's post-steal journal transaction. Close
         # that abandoned generation and settle its exact interrupted input
@@ -3481,6 +4439,30 @@ class StatelessTurnExecutor:
             logger.warning("pending-input query failed for unit %s: %s", unit_id, e)
             await self._release(claim, reason="pending_query_failed")
             return
+        # (f2) An event an older lease admitted and never settled is owed
+        # again (its executor died in the turn). When that turn already
+        # reached its durable end, settle it here instead: serving it again
+        # would answer it twice. What is left is served below; the claim of
+        # its delivery re-queues it under this lease.
+        if any(
+            row.get("delivery_state") == "admitted" and row.get("admission_answered")
+            for row in pending
+        ):
+            try:
+                pending = await self._settle_answered_stale_admissions(
+                    claim, unit_id, consumed_seq, pending
+                )
+            except Exception:
+                logger.warning(
+                    "settling an answered stale event admission failed for "
+                    "unit %s token=%d",
+                    unit_id,
+                    token,
+                    exc_info=True,
+                )
+                await self._detach_cached_session("stale_admission_settle_failed")
+                await self._release(claim, reason="stale_admission_settle_failed")
+                return
         if not pending:
             # Enqueue without input (possible race) — nothing to answer.
             fallback = (
@@ -3604,7 +4586,7 @@ class StatelessTurnExecutor:
 
         # (h) Inject — the row already exists (accept-time persist is
         # orchestrator-side on this lane), so ONLY the queue put + loop
-        # arming from _accept_user_input are reproduced here; its persist is
+        # arming from input acceptance are reproduced here; its persist is
         # deliberately not. The id makes the loop's own turn-start persist an
         # idempotent upsert onto the same row.
         turn_done = asyncio.Event()
@@ -3616,6 +4598,14 @@ class StatelessTurnExecutor:
         pa._turn_complete_external_hook = lambda _turn_id: turn_done.set()
         pa._turn_tool_execution_external_hook = (
             lambda identity: self._record_claim_tool_effect(claim, identity)
+        )
+        # WP4 (B8): the end-of-turn memory prefetch stops when input newer
+        # than this claim's target reaches the queue row, or the lease goes.
+        served_seq = max(
+            int(target["seq"]), consumed_seq if consumed_seq is not None else -1
+        )
+        pa._turn_idle_input_external_probe = lambda: self._idle_input_arrived(
+            claim, served_seq
         )
         if not pa._ensure_persistent_loop_started("stateless_claim"):
             await self._detach_cached_session("loop_not_ready")
@@ -3678,7 +4668,7 @@ class StatelessTurnExecutor:
         if recovery_context is not None:
             recovery_context._stateless_subagent_recovery_active = is_subagent_recovery
         try:
-            await pa._loop_user_queue.put(queue_item)
+            await pa._session_input.publish_executor_input(queue_item)
 
             # (i) Wait for the full-turn settlement hook (event, not a poll),
             # the lease-lost signal, or the loop dying under us. PersistentApp
@@ -3717,14 +4707,15 @@ class StatelessTurnExecutor:
             t0 = time.perf_counter()
             await self._await_cloud_push_staged(pa)
             timing["stage"] = time.perf_counter() - t0
-            superseded_input_seq = target.get("supersedes_input_seq")
-            completed_input_seq = max(
-                int(
-                    superseded_input_seq
-                    if superseded_input_seq is not None
-                    else target["seq"]
-                ),
-                int(claim.consumed_seq) if claim.consumed_seq is not None else -1,
+            completed_input_seq = completed_input_checkpoint(
+                target, claim_consumed_seq=claim.consumed_seq
+            )
+            # Without a checkpoint, completion keeps the watermark this claim
+            # observed after attach: nothing the turn did consumes human input.
+            completion_consumed_seq = (
+                completed_input_seq
+                if completed_input_seq is not None
+                else (consumed_seq if consumed_seq >= 0 else None)
             )
             self._pending_settled_close = (
                 str(claim.unit_id),
@@ -3798,7 +4789,7 @@ class StatelessTurnExecutor:
             timing["detach_final"] = time.perf_counter() - t0
             t0 = time.perf_counter()
             state = await self._complete_with_retry(
-                claim, consumed_seq=completed_input_seq
+                claim, consumed_seq=completion_consumed_seq
             )
             timing["complete"] = time.perf_counter() - t0
             if state is None:
@@ -3826,9 +4817,9 @@ class StatelessTurnExecutor:
                 self.request_stop()
                 return
             logger.info(
-                "run_queue complete: unit=%s consumed_seq=%d state=%s",
+                "run_queue complete: unit=%s consumed_seq=%s state=%s",
                 unit_id,
-                completed_input_seq,
+                completion_consumed_seq,
                 state,
             )
             logger.info(
@@ -3864,8 +4855,12 @@ class StatelessTurnExecutor:
             )
             turn_id = self._owned_abort_target(pa)
             # Signal before interrupt-watcher close/drain: those are remote/DB
-            # joins and must not delay the process-local abort edge.
-            self._abort_turn_politely(pa, target_turn_id=turn_id)
+            # joins and must not delay the process-local abort edge. A
+            # delegation batch leaves this abort pending: its children stop at
+            # their own lost-authority check, and their saves are refused.
+            self._abort_turn_politely(
+                pa, target_turn_id=turn_id, cause=INTERRUPT_CAUSE_LEASE_LOST
+            )
             if turn_id is not None:
                 await self._close_interrupt_window(
                     pa,
@@ -4034,12 +5029,15 @@ class StatelessTurnExecutor:
 
         token = claim.lease_token
         pending_close = self._pending_settled_close
-        if (
-            completed_input_seq is None
-            and pending_close is not None
-            and pending_close[:3]
-            == (str(claim.unit_id), int(token), int(target_turn_id))
-        ):
+        # The close of a fully settled turn. Without a checkpoint (a recovery
+        # turn whose superseded input was an event, completed_input_checkpoint)
+        # it is just as idempotent, so it is retried just the same.
+        settled_close = pending_close is not None and pending_close[:3] == (
+            str(claim.unit_id),
+            int(token),
+            int(target_turn_id),
+        )
+        if completed_input_seq is None and settled_close:
             completed_input_seq = pending_close[3]
         attempts = 0
         try:
@@ -4056,7 +5054,7 @@ class StatelessTurnExecutor:
                 except asyncio.CancelledError:
                     raise
                 except Exception:
-                    if completed_input_seq is None:
+                    if completed_input_seq is None and not settled_close:
                         raise
                     attempts += 1
                     logger.warning(
@@ -4079,11 +5077,7 @@ class StatelessTurnExecutor:
             with contextlib.suppress(BaseException):
                 await pa._stop_thread_interrupt_watcher()
             raise
-        if pending_close is not None and pending_close[:3] == (
-            str(claim.unit_id),
-            int(token),
-            int(target_turn_id),
-        ):
+        if settled_close:
             self._pending_settled_close = None
         await pa._stop_thread_interrupt_watcher()
         if not closed:
@@ -4100,7 +5094,7 @@ class StatelessTurnExecutor:
         return True
 
     async def _transcript_answered_seq(self, claim: ClaimedUnit) -> Optional[int]:
-        """Seq of the oldest pending input the transcript already answers, or None.
+        """Seq of the oldest pending input if its own turn already answered it.
 
         Read-only and fail-open to None: a query failure means "not proven
         answered", and the ordinary claim path decides. See
@@ -4162,9 +5156,61 @@ class StatelessTurnExecutor:
                     if r.get("supersedes_input_seq") is not None
                     else None
                 ),
+                "supersedes_input_role": (
+                    str(r.get("supersedes_input_role"))
+                    if r.get("supersedes_input_role") is not None
+                    else None
+                ),
+                "delivery_state": (
+                    str(r.get("delivery_state"))
+                    if r.get("delivery_state") is not None
+                    else None
+                ),
+                "admission_answered": bool(r.get("admission_answered")),
             }
             for r in rows
         ]
+
+    async def _settle_answered_stale_admissions(
+        self,
+        claim: ClaimedUnit,
+        unit_id: str,
+        consumed_seq: Optional[int],
+        pending: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        """Settle each older lease's admission whose turn already ended.
+
+        Its executor died after the turn's durable end and before the loop
+        settled the delivery (or the settle lost a race with the completion).
+        The DB re-checks both facts under this claim's exact authority; the
+        pending rows are then read again. Raises when the settle cannot run
+        under this claim.
+        """
+
+        for row in pending:
+            if not (
+                row.get("delivery_state") == "admitted"
+                and row.get("admission_answered")
+                and row.get("delivery_id")
+            ):
+                continue
+            outcome = await self._db.settle_answered_stateless_admission(
+                thread_id=unit_id,
+                delivery_id=str(row["delivery_id"]),
+                lease_token=claim.lease_token,
+                executor_id=self._pod_name,
+                pod_uid=self._pod_uid,
+            )
+            logger.info(
+                "stale event admission whose turn already ended: unit=%s "
+                "token=%d seq=%s delivery=%s outcome=%s",
+                unit_id,
+                claim.lease_token,
+                row.get("seq"),
+                str(row["delivery_id"])[:8],
+                outcome,
+            )
+        return await self._fetch_pending_rows(unit_id, consumed_seq)
 
     async def _heartbeat_loop(
         self, claim: ClaimedUnit, claim_lost: asyncio.Event | None = None
@@ -4238,6 +5284,43 @@ class StatelessTurnExecutor:
             return "turn_done"
         return "loop_died"
 
+    def _apply_pending_memory(
+        self, pa: Any, bundle: Mapping[str, Any], unit_id: str
+    ) -> None:
+        """Hand the bundle's pending memory set to the session (WP4, B9).
+
+        Best-effort: an unreadable set or a session without the seam is
+        skipped; the next retrieval finds the same memories again.
+        """
+        stored = claim_bundle_pending_memory(bundle)
+        apply = getattr(pa._session, "apply_pending_memory", None)
+        if stored is None or apply is None:
+            return
+        try:
+            apply(stored)
+        except Exception:
+            logger.warning(
+                "pending memory set not applied for unit %s (non-fatal)",
+                unit_id,
+                exc_info=True,
+            )
+
+    async def _idle_input_arrived(self, claim: ClaimedUnit, served_seq: int) -> bool:
+        """Whether the end-of-turn memory prefetch must stop (WP4, B8).
+
+        True when ``run_queue.input_seq`` rose past the input this claim
+        serves, or the exact lease is gone (no prefetch may hold a slot
+        this claim no longer owns). Each check is one indexed read.
+        """
+        if self._lease.lost.is_set():
+            return True
+        input_seq = await self._db.fetchval(
+            _LEASED_INPUT_SEQ_SQL, claim.unit_id, int(claim.lease_token)
+        )
+        if input_seq is None:
+            return True
+        return int(input_seq) > int(served_seq)
+
     def _activate_lease(self, unit_id: Any, lease_token: int) -> None:
         """Install a new exact claimant and retire prior effect evidence."""
 
@@ -4288,7 +5371,7 @@ class StatelessTurnExecutor:
         target_turn_id = getattr(pa, "_interrupt_owner_turn_id", None)
         if (
             not unit_id
-            or str(getattr(pa, "_thread_id", "") or "") != str(unit_id)
+            or str(pa._session_identity.thread_id or "") != str(unit_id)
             or getattr(pa, "_interrupt_owner_lease_token", None) != lease_token
             or isinstance(target_turn_id, bool)
             or not isinstance(target_turn_id, int)
@@ -4521,6 +5604,106 @@ class StatelessTurnExecutor:
             return False
         return bool(value)
 
+    async def _session_tool_debt(self, conn: Any, claim: ClaimedUnit) -> Any:
+        """Unknown results only under this live queue and owner authority."""
+        row = await conn.fetchrow(
+            _SESSION_TOOL_DEBT_AUTHORITY_SQL,
+            claim.unit_id,
+            claim.lease_token,
+            self._pod_name,
+        )
+        if row is None:
+            return None
+        metadata = row["metadata"] if row["metadata"] is not None else {}
+        if stateless_stop_markers(metadata):
+            return None
+        if type(row["unresolved"]) is not bool:
+            raise RuntimeError("Session tool-debt classification is unproven")
+        if not row["unresolved"]:
+            # Normal completion retains the previous credential record until
+            # the next bundle publishes its successor. It is not park
+            # authority, and the ordinary bundle still validates/replaces it.
+            return row
+        active = active_claim_authority(metadata)
+        if active is not None:
+            token, actor = active
+            if (
+                token != claim.lease_token
+                or actor.pod != self._pod_name
+                or not self._pod_uid
+                or actor.pod_uid != self._pod_uid
+            ):
+                return None
+        return row
+
+    async def _admit_session_tool_history(self, pa: Any, claim: ClaimedUnit) -> bool:
+        """Park predecessor effect debt before attach, pairing or provider I/O.
+
+        The initial read only selects a possible hold. The existing atomic
+        release/journal transaction rechecks locked current authority and
+        debt before it can retire this queue lease. Any lost or ambiguous
+        authority refuses admission; it is never treated as absent debt.
+        """
+        row = await self._session_tool_debt(self._db, claim)
+        if row is None:
+            # A previous cached owner may still be resident. No validated
+            # bundle/attach will retire it on this refusal, so do not accept
+            # another owner after an unproven claim or predecessor authority.
+            self.request_stop()
+            return False
+        if not row["unresolved"]:
+            return True
+
+        # The cache can still belong to the previous unit. Drain under that
+        # unit's existing lease; do not hand its push to this new claim or
+        # activate the new mutable lease before the admission decision.
+        await self._quiesce_claim_before_transition(
+            pa, reason="unresolved_predecessor_tool"
+        )
+        clear = False
+        reason = "loop_died_after_tool_effect"
+
+        async def park_current_debt(conn: Any) -> Optional[str]:
+            nonlocal clear
+            clear = False
+            await conn.fetchrow(_LOCK_SESSION_TOOL_DEBT_QUEUE_SQL, claim.unit_id)
+            current = await self._session_tool_debt(conn, claim)
+            if current is None:
+                return None
+            if not current["unresolved"]:
+                clear = True
+                return None
+            state = await park_unit(
+                conn,
+                unit_id=claim.unit_id,
+                lease_token=claim.lease_token,
+                reason=reason,
+            )
+            # park_unit's general CAS intentionally accepts only token/state.
+            # This admission path also owes a current, unexpired owner at the
+            # CAS; an expiry while acquiring locks/checking debt rolls back.
+            if state is not None and not await conn.fetchval(
+                "SELECT $1::timestamptz > clock_timestamp()",
+                current["leased_until"],
+            ):
+                raise _PostEffectParkError(
+                    "Session admission lease expired before park"
+                )
+            return state
+
+        outcome = await self._settle_release(
+            claim,
+            cas=park_current_debt,
+            park_reason=reason,
+            release_reason="unresolved_predecessor_tool",
+        )
+        if outcome is None and not clear:
+            self.request_stop()
+        # A real late result may clear the debt under the same locked claim.
+        # A lost commit response is the existing idempotent parked outcome,
+        # never permission to reconstruct model/tool context.
+        return outcome is None and clear
+
     async def _park_post_effect_claim(
         self,
         pa: Any,
@@ -4588,6 +5771,7 @@ class StatelessTurnExecutor:
         *,
         target_turn_id: Optional[int],
         force_graceful: bool = False,
+        cause: str = INTERRUPT_CAUSE_SHUTDOWN,
     ) -> bool:
         """Interrupt the loop the way the interrupt verb does: graceful while
         a tool call is mid-invoke, hard otherwise (cancels a blocked LLM
@@ -4596,6 +5780,10 @@ class StatelessTurnExecutor:
         Stateless lease loss may race the end of a turn. Never synthesize an
         unscoped flag: the persistent-loop helper atomically verifies that the
         exact durable turn is still active before mutating interrupt state.
+
+        ``cause`` is never a person's: ``shutdown`` from ``stop``,
+        ``lease_lost`` when the claim was taken away. A delegation batch
+        leaves such an interrupt pending instead of stopping its children.
         """
         if (
             isinstance(target_turn_id, bool)
@@ -4607,9 +5795,10 @@ class StatelessTurnExecutor:
             )
             return False
         try:
-            mode = pa._signal_interrupt_for_turn(
+            mode = pa._session_input.signal_interrupt_for_turn(
                 target_turn_id,
                 force_graceful=force_graceful,
+                cause=cause,
             )
         except Exception:
             logger.warning("failed to signal turn abort", exc_info=True)
@@ -4622,11 +5811,81 @@ class StatelessTurnExecutor:
             )
             return False
         logger.info(
-            "turn abort requested (mode=%s target_turn=%d)",
+            "turn abort requested (mode=%s cause=%s target_turn=%d)",
             mode,
+            cause,
             target_turn_id,
         )
         return True
+
+    @staticmethod
+    def _session_subagent_runtime(pa: Any) -> Any:
+        """The attached session's delegation runtime, or ``None``."""
+
+        session = getattr(pa, "_session", None)
+        context = getattr(session, "tool_context", None)
+        return getattr(context, "subagent_runtime", None)
+
+    def _leave_subagents_for_successor(self, pa: Any) -> None:
+        """Mark the attached session's foreground children for a successor.
+
+        Explicit, never inferred: only ``stop`` calls it, right before it
+        cancels a turn it could not finish in the shutdown window. Children
+        cancelled after this keep their ``running`` rows (a crash's durable
+        state); a person's Stop and every other cancellation keep writing
+        their terminal rows.
+        """
+
+        try:
+            runtime = self._session_subagent_runtime(pa)
+            leave = getattr(runtime, "leave_foreground_for_successor", None)
+            if callable(leave):
+                leave()
+        except Exception:
+            # The children then commit ``cancelled`` rows: the settle reports
+            # them as ended, never loses them.
+            logger.warning(
+                "could not hand the delegation batch to a successor",
+                exc_info=True,
+            )
+
+    async def _delegation_batch_recoverable(self, pa: Any, claim: ClaimedUnit) -> bool:
+        """The in-flight turn's only unresolved effects are a delegation batch
+        a successor can settle (``_DELEGATION_BATCH_RECOVERABLE_SQL``).
+
+        Reads the children this process opened from the attached runtime
+        before the physical detach tears it down, and checks each against its
+        durable row. Any doubt (no session, no reader, a failed query) keeps
+        today's park.
+        """
+
+        if getattr(pa, "_session", None) is None or str(
+            pa._session_identity.thread_id or ""
+        ) != str(claim.unit_id):
+            return False
+        fetchval = getattr(self._db, "fetchval", None)
+        if fetchval is None:
+            return False
+        try:
+            runtime = self._session_subagent_runtime(pa)
+            opened = list(getattr(runtime, "foreground_opened", None) or [])
+            call_ids = [str(tool_call_id) for tool_call_id, _ in opened]
+            child_ids = [str(child_id) for _, child_id in opened]
+            value = await fetchval(
+                _DELEGATION_BATCH_RECOVERABLE_SQL,
+                claim.unit_id,
+                claim.consumed_seq if claim.consumed_seq is not None else -1,
+                child_ids,
+                call_ids,
+            )
+        except Exception:
+            logger.warning(
+                "delegation-batch recoverability check failed for unit %s; parking",
+                claim.unit_id,
+                exc_info=True,
+            )
+            return False
+        return value is True
 
     async def _wait_turn_unwind(
         self, turn_done: asyncio.Event, loop_task: Optional[asyncio.Task]
@@ -4677,7 +5936,7 @@ class StatelessTurnExecutor:
         )
 
     async def _complete_with_retry(
-        self, claim: ClaimedUnit, *, consumed_seq: int
+        self, claim: ClaimedUnit, *, consumed_seq: int | None
     ) -> Optional[str]:
         """complete_unit with bounded retries. Returns the resulting state,
         None when fenced out, or the sentinel 'error' after exhausted retries.
@@ -4711,9 +5970,57 @@ class StatelessTurnExecutor:
         )
         return "error"
 
+    async def _settle_release(
+        self,
+        claim: ClaimedUnit,
+        *,
+        cas: Callable[[Any], Awaitable[Optional[str]]],
+        park_reason: str,
+        release_reason: str,
+        error: Optional[str] = None,
+    ) -> Optional[_ReleaseDisposition]:
+        """:func:`_settle_session_release` with bounded retries.
+
+        A lost commit response replays as this claim's own disposition, so a
+        retry can neither journal twice nor abandon an already-settled lease
+        to the reaper (whose claimant-loss hold would then need Pod proof).
+        Raises the last error once every attempt failed; the lease is then
+        still exactly this claim's and expires instead.
+        """
+
+        last_error: Optional[Exception] = None
+        for attempt in range(1, COMPLETE_RETRY_ATTEMPTS + 1):
+            try:
+                return await _settle_session_release(
+                    self._db,
+                    claim,
+                    cas=cas,
+                    pod_name=self._pod_name,
+                    pod_uid=self._pod_uid,
+                    park_reason=park_reason,
+                    release_reason=release_reason,
+                    error=error,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                last_error = exc
+                if attempt < COMPLETE_RETRY_ATTEMPTS:
+                    await asyncio.sleep(0.5 * attempt)
+        assert last_error is not None
+        raise last_error
+
     async def _release(self, claim: ClaimedUnit, *, reason: str) -> None:
         """Voluntary error release (§5.1): default linear backoff, token-
-        guarded (a genuinely lost lease makes this a recorded no-op)."""
+        guarded (a genuinely lost lease makes this a recorded no-op).
+
+        Every caller is pre-effect (post-effect failures park fail-closed).
+        A deterministic reason (``_release_is_deterministic``) is counted
+        against the row's retry budget: the failure that reaches
+        ``max_attempts`` parks as ``retry_exhausted`` — owner-retryable — and
+        journals ``turn.parked`` in the same commit, instead of re-queueing
+        forever. A transient reason never parks and backs off exponentially
+        (capped), so an orchestrator or DB outage heals by itself."""
         pa = _pa()
         # Warm affinity is valid only after successful completion. Every
         # leased->queued error transition retires the cached loop/session so a
@@ -4734,12 +6041,35 @@ class StatelessTurnExecutor:
             if self._exact_claim_handle_lost(claim):
                 await self._ack_terminal_claim_loss(claim)
             return
-        try:
-            state = await release_unit(
-                self._db,
+
+        deterministic = _release_is_deterministic(reason)
+
+        async def error_release(conn: Any) -> Optional[str]:
+            if deterministic:
+                return await release_unit(
+                    conn,
+                    unit_id=claim.unit_id,
+                    lease_token=claim.lease_token,
+                    error=True,
+                    park_reason=PARK_REASON_RETRY_EXHAUSTED,
+                    last_error=reason,
+                )
+            return await release_unit(
+                conn,
                 unit_id=claim.unit_id,
                 lease_token=claim.lease_token,
+                backoff_seconds=transient_release_backoff_seconds(
+                    claim.attempts_since_completion
+                ),
                 error=True,
+            )
+
+        try:
+            outcome = await self._settle_release(
+                claim,
+                cas=error_release,
+                park_reason=PARK_REASON_RETRY_EXHAUSTED,
+                release_reason=reason,
             )
         except Exception:
             logger.warning(
@@ -4750,7 +6080,7 @@ class StatelessTurnExecutor:
                 exc_info=True,
             )
             return
-        if state is None:
+        if outcome is None:
             logger.info(
                 "run_queue release: unit=%s token=%d reason=%s "
                 "(already fenced out — nothing to release)",
@@ -4761,14 +6091,91 @@ class StatelessTurnExecutor:
             await self._ack_terminal_claim_loss(claim)
             self._clear_claim_tool_effect(pa, claim)
         else:
-            logger.info(
-                "run_queue release: unit=%s token=%d reason=%s state=%s",
+            log = logger.warning if outcome.state == STATE_PARKED else logger.info
+            log(
+                "run_queue release: unit=%s token=%d reason=%s (%s) state=%s "
+                "attempts=%d%s",
                 claim.unit_id,
                 claim.lease_token,
                 reason,
-                state,
+                "deterministic" if deterministic else "transient",
+                outcome.state,
+                outcome.attempts,
+                " (retry budget exhausted)" if outcome.state == STATE_PARKED else "",
             )
             self._clear_claim_tool_effect(pa, claim)
+
+    async def _park_model_unavailable(self, claim: ClaimedUnit, message: str) -> None:
+        """Park a claim the orchestrator refused because a configured model
+        cannot run (unavailable_model_handling.md §5).
+
+        Parks at once — no retry budget is spent — as
+        ``park_reason='model_unavailable'`` with the refusal text as
+        ``last_error``; the queue view shows it to the owner, and an owner
+        retry after a model switch replays nothing (pre-effect). Journals
+        ``turn.parked`` in the same commit like every other park.
+        """
+        pa = _pa()
+        await self._quiesce_claim_before_transition(
+            pa,
+            reason="release_model_unavailable",
+            claim=claim,
+        )
+        if self._lease.lost.is_set():
+            logger.info(
+                "run_queue release: unit=%s token=%d reason=model_unavailable "
+                "skipped after local ownership loss",
+                claim.unit_id,
+                claim.lease_token,
+            )
+            if self._exact_claim_handle_lost(claim):
+                await self._ack_terminal_claim_loss(claim)
+            return
+        error_text = message[:_LAST_ERROR_CHARS]
+
+        async def model_unavailable_park(conn: Any) -> Optional[str]:
+            return await park_unit(
+                conn,
+                unit_id=claim.unit_id,
+                lease_token=claim.lease_token,
+                reason=PARK_REASON_MODEL_UNAVAILABLE,
+                last_error=error_text,
+            )
+
+        try:
+            outcome = await self._settle_release(
+                claim,
+                cas=model_unavailable_park,
+                park_reason=PARK_REASON_MODEL_UNAVAILABLE,
+                release_reason="model_unavailable",
+                error=error_text,
+            )
+        except Exception:
+            logger.warning(
+                "run_queue model-unavailable park failed for unit %s — the "
+                "lease will expire instead",
+                claim.unit_id,
+                exc_info=True,
+            )
+            return
+        if outcome is None:
+            logger.info(
+                "run_queue release: unit=%s token=%d reason=model_unavailable "
+                "(already fenced out — nothing to park)",
+                claim.unit_id,
+                claim.lease_token,
+            )
+            await self._ack_terminal_claim_loss(claim)
+            self._clear_claim_tool_effect(pa, claim)
+            return
+        self._clear_claim_tool_effect(pa, claim)
+        logger.warning(
+            "run_queue release: unit=%s token=%d reason=model_unavailable state=%s: %s",
+            claim.unit_id,
+            claim.lease_token,
+            outcome.state,
+            error_text,
+        )
 
     async def _release_attach_failure(
         self, claim: ClaimedUnit, exc: BaseException
@@ -4779,7 +6186,7 @@ class StatelessTurnExecutor:
         (stateless_turn_resilience.md step 2). The claim already counted this
         attempt; ``record_attach_failure`` records the failure signature and
         either re-queues with a growing backoff or parks with
-        ``park_reason='attach_failed'`` — and a park is journaled as a
+        ``park_reason='attach_failed'`` — and a park commits with its
         ``turn.parked`` frame so a queued message never turns into silence.
         """
         pa = _pa()
@@ -4801,14 +6208,30 @@ class StatelessTurnExecutor:
         signature = _error_signature(exc)
         error_text = str(exc)[:_LAST_ERROR_CHARS]
         backoff = attach_failure_backoff_seconds(claim.attempts_since_completion)
-        try:
+        recorded: dict[str, Any] = {}
+
+        async def attach_failure_release(conn: Any) -> Optional[str]:
             row = await record_attach_failure(
-                self._db,
+                conn,
                 unit_id=claim.unit_id,
                 lease_token=claim.lease_token,
                 error=error_text,
                 signature=signature,
                 backoff_seconds=backoff,
+            )
+            recorded.clear()
+            if row is None:
+                return None
+            recorded.update(row)
+            return str(row.get("state") or "")
+
+        try:
+            outcome = await self._settle_release(
+                claim,
+                cas=attach_failure_release,
+                park_reason=PARK_REASON_ATTACH_FAILED,
+                release_reason="attach_failed",
+                error=error_text,
             )
         except Exception:
             logger.warning(
@@ -4818,7 +6241,7 @@ class StatelessTurnExecutor:
                 exc_info=True,
             )
             return
-        if row is None:
+        if outcome is None:
             logger.info(
                 "run_queue release: unit=%s token=%d reason=attach_failed "
                 "(already fenced out — nothing to release)",
@@ -4829,26 +6252,17 @@ class StatelessTurnExecutor:
             self._clear_claim_tool_effect(pa, claim)
             return
         self._clear_claim_tool_effect(pa, claim)
-        state = str(row.get("state") or "")
-        attempts = int(row.get("attempts_since_completion") or 0)
         logger.warning(
             "run_queue release: unit=%s token=%d reason=attach_failed state=%s "
-            "attempts=%d attach_failures=%d backoff=%.0fs signature=%s",
+            "attempts=%d attach_failures=%s backoff=%.0fs signature=%s",
             claim.unit_id,
             claim.lease_token,
-            state,
-            attempts,
-            int(row.get("attach_failures") or 0),
+            outcome.state,
+            outcome.attempts,
+            recorded.get("attach_failures", "?"),
             backoff,
             signature,
         )
-        if state == "parked":
-            await self._journal_parked(
-                claim,
-                reason=PARK_REASON_ATTACH_FAILED,
-                error=error_text,
-                attempts=attempts,
-            )
 
     async def _journal_parked(
         self,
@@ -4923,7 +6337,10 @@ class StatelessTurnExecutor:
         """
 
         pa = _pa()
-        if pa._thread_id == str(claim.unit_id) and pa._session is not None:
+        if (
+            pa._session_identity.thread_id == str(claim.unit_id)
+            and pa._session is not None
+        ):
             await self._detach_cached_session("terminal_claim_fenced")
         try:
             acknowledged = await acknowledge_session_claim_quiesced(
@@ -4967,10 +6384,11 @@ class StatelessTurnExecutor:
         pa._turn_complete_external_hook = None
         pa._turn_start_external_hook = None
         pa._turn_tool_execution_external_hook = None
+        pa._turn_idle_input_external_probe = None
         if pa._session is None:
             # A failed attach can leave _thread_id set with no session
             # (dual_app precedent) — clear it so the next claim starts clean.
-            pa._thread_id = None
+            pa._session_identity.release_thread()
             return
         # Queue-claim detach retires only this Python/SFTP owner. Workspace
         # rclone/overlay residents are durable handoff state and may still be
@@ -4978,7 +6396,7 @@ class StatelessTurnExecutor:
         # writeback. Public End owns a separate exact remote resident-retirement
         # acknowledgement before any emptyDir snapshot.
         preserve_workspace_daemons = True
-        await pa._terminate_session(
+        await pa._session_termination.terminate(
             reason,
             mark_thread=False,
             preserve_shell=True,
@@ -4999,15 +6417,16 @@ class StatelessTurnExecutor:
         across sequential tenants:
 
         * memory-embedding env keys + singleton, KB profile keys + singleton
-          (also scrubbed pop-first inside _attach_session's
-          _apply_session_embedding_env — this claim-time pass covers claims
+          (also scrubbed pop-first inside the attach's
+          apply_session_embedding_env — this claim-time pass covers claims
           whose attach then fails before reaching that block);
         * the dual-mode guidance/reply inboxes (worker-plane; a stateless pod
           never runs jobs, but they are process-global dicts, so clear them).
         """
         try:
-            pa = _pa()
-            pa._apply_session_embedding_env(None)
+            from agent.api.session_attach import apply_session_embedding_env
+
+            apply_session_embedding_env(None)
         except Exception:
             logger.warning("embedding scrub failed (non-fatal)", exc_info=True)
         try:

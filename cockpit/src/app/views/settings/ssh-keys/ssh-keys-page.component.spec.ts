@@ -82,7 +82,7 @@ describe('SshKeysPageComponent', () => {
       fixture.detectChanges();
       await fixture.whenStable();
       expect(service.loadKeys).not.toHaveBeenCalled();
-      expect(TestBed.inject(Router).navigateByUrl).toHaveBeenCalledWith('/settings');
+      expect(TestBed.inject(Router).navigateByUrl).toHaveBeenCalledWith('/settings/general');
       expect(fixture.nativeElement.querySelector('form')).toBeNull();
       expect(fixture.nativeElement.querySelector('button')).toBeNull();
     } finally {

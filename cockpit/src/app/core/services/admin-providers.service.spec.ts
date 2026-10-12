@@ -2,6 +2,7 @@ import {describe, expect, it, vi} from 'vitest';
 import {Injector, runInInjectionContext} from '@angular/core';
 import {HttpClient} from '@angular/common/http';
 import {of} from 'rxjs';
+import {AdminModelsService} from './admin-models.service';
 import {AdminProvidersService} from './admin-providers.service';
 import {ReadinessService} from './readiness.service';
 import {ModelService} from './model.service';
@@ -20,11 +21,12 @@ function createService(mockHttp?: any) {
       {provide: HttpClient, useValue: http},
       {provide: ReadinessService, useValue: {load: vi.fn()}},
       {provide: ModelService, useValue: {load: vi.fn()}},
+      {provide: AdminModelsService, useValue: {loadModels: vi.fn()}},
     ],
   });
 
   const service = runInInjectionContext(injector, () => new AdminProvidersService());
-  return {service, http};
+  return {service, http, adminModels: injector.get(AdminModelsService)};
 }
 
 describe('AdminProvidersService', () => {
@@ -126,6 +128,21 @@ describe('AdminProvidersService', () => {
         {},
       );
       expect(got.models[0].id).toBe('gemma');
+    });
+
+    it('sends the context cap on a bulk import and reloads the catalog table', () => {
+      const http = {
+        get: vi.fn(),
+        post: vi.fn().mockReturnValue(of({created: ['gpt-5.5'], skipped: [], rejected: []})),
+        put: vi.fn(), patch: vi.fn(), delete: vi.fn(),
+      };
+      const {service, adminModels} = createService(http);
+      service.importSubscriptionModels('ep-subs', ['gpt-5.5'], false, 200000).subscribe();
+      expect(http.post).toHaveBeenCalledWith(
+        expect.stringContaining('/admin/providers/endpoints/ep-subs/models/import'),
+        {model_ids: ['gpt-5.5'], include_needs_review: false, context_window_cap: 200000},
+      );
+      expect(adminModels.loadModels).toHaveBeenCalledTimes(1);
     });
   });
 

@@ -19,6 +19,7 @@ export type TextareaSize = 'sm' | 'md' | 'lg';
   template: `
     <textarea
       #textareaEl
+      [attr.id]="inputId() || null"
       class="app-textarea__field"
       [value]="value()"
       [placeholder]="placeholder()"
@@ -54,6 +55,8 @@ export class AppTextareaComponent {
   invalid = input<boolean>(false);
   fullWidth = input<boolean>(true);
   ariaLabel = input<string>('');
+  /** `id` of the native control, so an `<app-form-field [forId]>` label can point at it. */
+  inputId = input<string>('');
   resize = input<'none' | 'vertical' | 'horizontal' | 'both'>('vertical');
 
   changed = output<string>();

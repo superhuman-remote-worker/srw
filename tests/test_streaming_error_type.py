@@ -39,7 +39,6 @@ def _bare_agent(job_id: str = "job-under-test") -> UniversalAgent:
     agent._knowledge_graph = None
     agent._datasource_connections = {}
     agent._datasource_clients = {}
-    agent._datasource_files_manifest = None
     agent._checkpoint_conn = None
     agent._checkpointer = None
     return agent

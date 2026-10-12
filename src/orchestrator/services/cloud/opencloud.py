@@ -42,6 +42,11 @@ from orchestrator.services.cloud.base import (
 from orchestrator.services.cloud.backend_instance_authority import (
     main_cloud_installation_proof_sha256,
 )
+from orchestrator.services.cloud.capabilities import (
+    CHECKOUT_WRITE_BACK,
+    CloudCapability,
+    ProviderCapabilities,
+)
 from orchestrator.services.cloud.config import OpenCloudSettings
 from orchestrator.services.cloud.etag_baseline import (
     PropfindError,
@@ -96,6 +101,83 @@ _FOLDER_EDITOR_ROLE_NAME = "Can edit"
 _AGENT_HOME_SPACE_NAME = "srw-agent-home"
 _TOKEN_CLOCK_SKEW_SECONDS = 30.0
 
+_NO_USER_READER = "no per-user read-only credential exists"
+
+#: What OpenCloud delivers (main_cloud_as_connectors.md, "Provider support
+#: matrix"). ``ensure_ro_reader``/``mint_ro_grant`` exist but nothing calls
+#: them, so no read-only or protected level is offered.
+OPENCLOUD_CAPABILITIES = ProviderCapabilities(
+    backend_id=BACKEND_ID,
+    title="OpenCloud",
+    capabilities=(
+        CloudCapability(
+            "cloud_folder",
+            "project",
+            "read_only",
+            "unsupported",
+            "the read-only reader code exists, but nothing calls it yet",
+        ),
+        CloudCapability(
+            "cloud_folder",
+            "project",
+            "read_write",
+            "offered",
+            "the orchestrator's Keycloak service account, a member of every "
+            "project Space; the workspace holds only its short-lived tokens, "
+            "which reach every project Space while they last",
+            frozenset({"sandbox"}),
+        ),
+        CloudCapability(
+            "cloud_folder",
+            "project",
+            "protected",
+            "unsupported",
+            "the protected review lane is built for Nextcloud only",
+        ),
+        CloudCapability(
+            "cloud_folder",
+            "user_root",
+            "read_write",
+            "unsupported",
+            "works today only through deprecated Keycloak impersonation, "
+            "so it is not offered",
+        ),
+        CloudCapability(
+            "cloud_folder", "user_root", "read_only", "unsupported", _NO_USER_READER
+        ),
+        CloudCapability(
+            "cloud_folder", "user_root", "protected", "unsupported", _NO_USER_READER
+        ),
+        CloudCapability(
+            "cloud_folder_checkout",
+            "project",
+            "read_only",
+            "offered",
+            "the folder is copied into the job's repository before it starts; "
+            "SRW never applies the copy's changes",
+            frozenset({"sandbox", "vm"}),
+        ),
+        CloudCapability(
+            "cloud_folder_checkout",
+            "project",
+            "reviewed_write_back",
+            "offered",
+            CHECKOUT_WRITE_BACK,
+            frozenset({"sandbox", "vm"}),
+        ),
+        CloudCapability(
+            "cloud_outbox",
+            None,
+            "read_write",
+            "offered",
+            "a folder SRW creates in its agent-home Space and shares with the "
+            "execution's owner; a session's workspace holds short-lived tokens "
+            "of the orchestrator's service account",
+            frozenset({"sandbox"}),
+        ),
+    ),
+)
+
 
 class OpenCloudBackend:
     """Main-cloud backend for OpenCloud.
@@ -111,6 +193,24 @@ class OpenCloudBackend:
     """
 
     backend_id = BACKEND_ID
+    capabilities = OPENCLOUD_CAPABILITIES
+    #: Its rclone mounts use bearer tokens the agent refreshes, so they stay
+    #: on the in-workspace path (connector drivers D7).
+    static_mount_credentials = False
+    #: What ``ensure_initialized`` proves: it mints a service-account token
+    #: from the issuer with the client credentials and reaches the internal
+    #: URL with it. The public URL and the role, quota and TLS settings are
+    #: never exercised.
+    attested_fields: frozenset[str] = frozenset(
+        {
+            "version",
+            "backend_id",
+            "base_url",
+            "keycloak_issuer",
+            "keycloak_client_id",
+            "keycloak_client_secret",
+        }
+    )
 
     def __init__(self, settings: OpenCloudSettings) -> None:
         self._settings = settings
@@ -190,6 +290,36 @@ class OpenCloudBackend:
         legacy ``username``/``password`` plumbing silently falls back.
         """
         return {}
+
+    def cloud_sync_config(
+        self, webdav_url: str, *, target_user_sub: Optional[str] = None
+    ) -> Optional[dict[str, Any]]:
+        """The agent's ``cloud_sync`` entry for one folder, or ``None``.
+
+        The agent mints service-account tokens via client credentials. With
+        ``target_user_sub`` (a user-home Space, owned by exactly one user and
+        invisible to the service account) it exchanges that token for a
+        user-scoped one (RFC 8693) and authenticates WebDAV with it. Never
+        logs the auth payload.
+        """
+        if not self._client_secret:
+            return None
+        auth: dict[str, Any] = {
+            "issuer": self._keycloak_issuer,
+            "client_id": self._client_id,
+            "client_secret": self._client_secret,
+        }
+        if target_user_sub:
+            auth["type"] = "keycloak_user_impersonation"
+            auth["target_user_sub"] = target_user_sub
+        else:
+            auth["type"] = "keycloak_client_credentials"
+        return {"backend": self.backend_id, "webdav_url": webdav_url, "auth": auth}
+
+    @staticmethod
+    def legacy_folder_id(handle: ProjectFolderHandle) -> Optional[int]:
+        """OpenCloud never had a ``projects.nextcloud_folder_id``."""
+        return None
 
     async def build_rclone_mount_spec(
         self,
@@ -1135,13 +1265,16 @@ class OpenCloudBackend:
     # ------------------------------------------------------------- Session folders
 
     @instrument_backend_op("ensure_session_folder")
-    async def ensure_session_folder(self, *, session_id: str) -> SessionFolderHandle:
+    async def ensure_session_folder(
+        self, *, session_id: str, exclusive: bool = False
+    ) -> SessionFolderHandle:
         """Create ``sessions/{session_id}`` under the agent-home Space via WebDAV.
 
         OpenCloud WebDAV lives at ``{base_url}/dav/spaces/{drive-id}/``
         (note: NOT ``/remote.php/dav/...`` — that's Nextcloud only). The
         path must be MKCOL-ed one segment at a time because intermediate
-        collections are NOT auto-created.
+        collections are NOT auto-created. ``exclusive`` refuses a folder that
+        exists already (``ALREADY_EXISTS``) instead of reusing it.
         """
         self._ensure_ready()
         if self._agent_home_webdav_base is None:
@@ -1162,6 +1295,13 @@ class OpenCloudBackend:
                     url,
                     headers={"Authorization": f"Bearer {token}"},
                 )
+                if resp.status_code == 405 and exclusive and i == len(parts) - 1:
+                    raise CloudBackendError(
+                        CloudBackendErrorKind.ALREADY_EXISTS,
+                        f"Session folder '{folder_path}' already exists",
+                        backend=self.backend_id,
+                        status_code=405,
+                    )
                 if resp.status_code in (201, 405):
                     continue
                 resp.raise_for_status()

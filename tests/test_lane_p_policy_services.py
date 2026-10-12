@@ -25,7 +25,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 from fastapi import HTTPException
 
-import orchestrator.main as main
+from orchestrator.schemas.job_create import JobCreate
 from orchestrator.services import (
     agent_toolset_probe as toolset,
     config_overrides,
@@ -37,11 +37,28 @@ from orchestrator.services import (
     session_config_resolution as sessioncfg,
     session_create_overrides as overrides,
     session_tool_policy as toolpolicy,
+    session_tool_view,
     session_workspace_policy as wspolicy,
+    thread_config_update as config_update,
     virtual_workspace,
     vm_workspace_policy as vmpolicy,
     workspace_tier_policy as tier,
 )
+from orchestrator.services import agent_toolset_probe as agent_toolset_probe_module
+from orchestrator.services import config_overrides as config_overrides_module
+from orchestrator.services import datasource_config as datasource_config_module
+from orchestrator.services import deployment_gates as deployment_gates_module
+from orchestrator.services import grant_enforcement as grant_enforcement_module
+from orchestrator.services import job_create_ingress as job_create_ingress_module
+from orchestrator.services import session_class_policy as session_class_policy_module
+from orchestrator.services import (
+    session_create_overrides as session_create_overrides_module,
+)
+from orchestrator.services import session_tool_policy as session_tool_policy_module
+from orchestrator.services import virtual_workspace as virtual_workspace_module
+from orchestrator.services import vm_workspace_policy as vm_workspace_policy_module
+from orchestrator.services import workspace_tier_policy as workspace_tier_policy_module
+from shared.connectors.builtin import MCP_STDIO_RETIRED
 
 # ---------------------------------------------------------------------------
 # Feature gates
@@ -52,44 +69,43 @@ from orchestrator.services import (
 _GATES = [
     (
         gates.is_experts_db_enabled,
-        main._is_experts_db_enabled,
+        deployment_gates_module.is_experts_db_enabled,
         "EXPERTS_DB_ENABLED",
         True,
     ),
     (
         gates.is_skills_db_enabled,
-        main._is_skills_db_enabled,
+        deployment_gates_module.is_skills_db_enabled,
         "SKILLS_DB_ENABLED",
         False,
     ),
     (
         gates.mcp_datasources_enabled,
-        main._mcp_datasources_enabled,
+        deployment_gates_module.mcp_datasources_enabled,
         "MCP_DATASOURCES_ENABLED",
         False,
     ),
     (
         gates.datasource_defaults_on_omission,
-        main._datasource_defaults_on_omission,
+        deployment_gates_module.datasource_defaults_on_omission,
         "DATASOURCE_DEFAULTS_ON_OMISSION",
         False,
     ),
     (
         gates.datasource_scope_auto_attach_v1_enabled,
-        main._datasource_scope_auto_attach_v1_enabled,
+        deployment_gates_module.datasource_scope_auto_attach_v1_enabled,
         "DATASOURCE_SCOPE_AUTO_ATTACH_V1_ENABLED",
         False,
     ),
-    (gates.mcp_stdio_enabled, main._mcp_stdio_enabled, "MCP_STDIO_ENABLED", False),
     (
         gates.is_protected_cloud_mode_enabled,
-        main._is_protected_cloud_mode_enabled,
+        deployment_gates_module.is_protected_cloud_mode_enabled,
         "PROTECTED_CLOUD_MODE_ENABLED",
         False,
     ),
     (
         gates.require_pinned_status_identity,
-        main._require_pinned_status_identity,
+        deployment_gates_module.require_pinned_status_identity,
         "REQUIRE_PINNED_STATUS_IDENTITY",
         True,
     ),
@@ -119,10 +135,16 @@ def test_gate_vocabulary_matches_main(
 
 
 def test_gates_are_read_live_not_cached(monkeypatch):
-    monkeypatch.setenv("MCP_STDIO_ENABLED", "true")
-    assert gates.mcp_stdio_enabled() is True
-    monkeypatch.setenv("MCP_STDIO_ENABLED", "false")
-    assert gates.mcp_stdio_enabled() is False
+    monkeypatch.setenv("MCP_DATASOURCES_ENABLED", "true")
+    assert gates.mcp_datasources_enabled() is True
+    monkeypatch.setenv("MCP_DATASOURCES_ENABLED", "false")
+    assert gates.mcp_datasources_enabled() is False
+
+
+def test_the_stdio_gate_is_gone():
+    """Connector drivers D5b retired the agent-pod stdio path with its flag."""
+    assert not hasattr(gates, "mcp_stdio_enabled")
+    assert "mcp_stdio_enabled" not in deployment_gates_module.__all__
 
 
 # ---------------------------------------------------------------------------
@@ -171,9 +193,7 @@ _MCP_CASES = [
 
 
 @pytest.mark.parametrize(("url", "creds", "fragment"), _MCP_CASES)
-def test_validate_mcp_datasource_matches_main(monkeypatch, url, creds, fragment):
-    monkeypatch.delenv("MCP_STDIO_ENABLED", raising=False)
-
+def test_validate_mcp_datasource_matches_main(url, creds, fragment):
     def run(fn):
         try:
             fn(url, creds)
@@ -182,7 +202,7 @@ def test_validate_mcp_datasource_matches_main(monkeypatch, url, creds, fragment)
             return (exc.status_code, str(exc.detail))
 
     moved = run(datasource_config.validate_mcp_datasource)
-    original = run(main._validate_mcp_datasource)
+    original = run(datasource_config_module.validate_mcp_datasource)
     assert moved == original
     if fragment is None:
         assert moved is None
@@ -191,35 +211,21 @@ def test_validate_mcp_datasource_matches_main(monkeypatch, url, creds, fragment)
         assert moved[0] == 400
 
 
-def test_validate_mcp_datasource_reads_the_stdio_gate_from_the_new_module(monkeypatch):
-    """The moved body consults ``deployment_gates`` on every call, so env still steers."""
-    monkeypatch.delenv("MCP_STDIO_ENABLED", raising=False)
-    with pytest.raises(HTTPException) as off:
-        datasource_config.validate_mcp_datasource(None, {"transport": "stdio"})
-    assert "disabled on this deployment" in str(off.value.detail)
-
-    monkeypatch.setenv("MCP_STDIO_ENABLED", "true")
-    with pytest.raises(HTTPException) as on:
-        datasource_config.validate_mcp_datasource(None, {"transport": "stdio"})
-    assert "credentials.command" in str(on.value.detail)
-
-    datasource_config.validate_mcp_datasource(
-        None,
+@pytest.mark.parametrize(
+    "creds",
+    [
+        {"transport": "stdio"},
+        {"transport": " STDIO "},
         {"transport": "stdio", "command": "srv", "args": ["-x"], "env": {"A": "b"}},
-    )
-
-
-def test_validate_mcp_datasource_rejects_null_bytes(monkeypatch):
+    ],
+)
+def test_validate_mcp_datasource_refuses_every_stdio_server(monkeypatch, creds):
+    """Stdio is retired (connector drivers D5b), whatever the old flag says."""
     monkeypatch.setenv("MCP_STDIO_ENABLED", "true")
-    for creds in (
-        {"transport": "stdio", "command": "sr\x00v"},
-        {"transport": "stdio", "command": "srv", "args": ["a\x00"]},
-        {"transport": "stdio", "command": "srv", "env": {"A=B": "c"}},
-        {"transport": "stdio", "command": "srv", "env": {"A": 1}},
-        {"transport": "stdio", "command": "srv", "unknown": 1},
-    ):
-        with pytest.raises(HTTPException):
-            datasource_config.validate_mcp_datasource(None, creds)
+    with pytest.raises(HTTPException) as refused:
+        datasource_config.validate_mcp_datasource(None, creds)
+    assert refused.value.status_code == 400
+    assert refused.value.detail == MCP_STDIO_RETIRED
 
 
 # ---------------------------------------------------------------------------
@@ -241,9 +247,9 @@ class TestWorkspaceTierPolicy:
     )
     def test_backend_from_override_matches_main(self, override, expected):
         assert tier.backend_from_override(override) == expected
-        assert tier.backend_from_override(override) == main._backend_from_override(
+        assert tier.backend_from_override(
             override
-        )
+        ) == workspace_tier_policy_module.backend_from_override(override)
 
     def test_non_lite_returns_the_caller_object_itself(self):
         co = {"workspace": {"backend": "sandbox"}}
@@ -310,9 +316,9 @@ class TestWorkspaceTierPolicy:
     )
     def test_is_lite_config_override(self, override, expected):
         assert tier.is_lite_config_override(override) is expected
-        assert tier.is_lite_config_override(override) == main._is_lite_config_override(
+        assert tier.is_lite_config_override(
             override
-        )
+        ) == workspace_tier_policy_module.is_lite_config_override(override)
 
     def test_thread_workspace_backend_reads_json_metadata(self):
         thread = {
@@ -339,12 +345,12 @@ class TestObjectStoreStartupChecks:
         env = {"S3_ENDPOINT": "https://s3", "VIRTUAL_WORKSPACE_RCLONE_TYPE": "memory"}
         msg = virtual_workspace.object_store_startup_warning(env)
         assert "NON-DURABLE" in msg
-        assert msg == main._object_store_startup_warning(env)
+        assert msg == virtual_workspace_module.object_store_startup_warning(env)
 
     def test_unset_seams_name_both_failures(self):
         msg = virtual_workspace.object_store_startup_warning({})
         assert "S3_ENDPOINT unset" in msg and "LiteWorkspaceConfigError" in msg
-        assert msg == main._object_store_startup_warning({})
+        assert msg == virtual_workspace_module.object_store_startup_warning({})
 
     def test_warn_only_by_default(self):
         assert virtual_workspace.check_object_store_config({}) is not None
@@ -377,24 +383,6 @@ class TestSessionWorkspacePolicy:
     def test_vm_is_creatable_but_never_a_saved_default(self):
         assert "vm" in wspolicy.SESSION_CREATE_WORKSPACE_BACKENDS
         assert "vm" not in wspolicy.SESSION_WORKSPACE_BACKENDS
-        assert wspolicy.default_session_workspace_backend(
-            {"workspace_backend": "vm"}
-        ) == (wspolicy.SESSION_DEFAULT_WORKSPACE_BACKEND)
-
-    @pytest.mark.parametrize(
-        ("settings", "expected"),
-        [
-            ({"workspace_backend": "sandbox"}, "sandbox"),
-            ({"workspace_backend": "bogus"}, "virtual"),
-            ({}, "virtual"),
-            (None, "virtual"),
-        ],
-    )
-    def test_default_backend_chain(self, settings, expected):
-        assert wspolicy.default_session_workspace_backend(settings) == expected
-        assert wspolicy.default_session_workspace_backend(
-            settings
-        ) == main._default_session_workspace_backend(settings)
 
     def test_workspace_override_accepts_vm_and_rejects_unknown(self):
         assert wspolicy.validated_session_workspace_override(
@@ -451,7 +439,7 @@ class TestSessionClassPolicy:
         assert classes.session_class_pinned_refusal(config) == expected
         assert classes.session_class_pinned_refusal(
             config
-        ) == main._stateless_session_class_refusal(config)
+        ) == config_update.session_class_pinned_refusal(config)
 
     def test_conference_is_checked_before_enabled(self):
         both = {"officer": {"enabled": True, "conference": True}}
@@ -489,7 +477,7 @@ class TestSessionClassPolicy:
         assert classes.protected_cloud_officer_active(config) is expected
         assert classes.protected_cloud_officer_active(
             config
-        ) == main._protected_cloud_officer_active(config)
+        ) == session_class_policy_module.protected_cloud_officer_active(config)
 
     @pytest.mark.parametrize(
         "config", [None, {"agent": 3}, {"officer": 5}, {"officer": {"enabled": 1}}]
@@ -697,7 +685,14 @@ class TestToolOverrideBoundary:
 
 
 class TestToolPolicyPrediction:
-    """The resolved and legacy predictions, compared against ``main``."""
+    """The resolved and legacy predictions, compared against their consumers.
+
+    The differential cases originally compared the moved functions with the
+    copies still in ``main``. Since R1.B10 their only consumer is
+    ``services.session_tool_view`` (the tool-groups read and the creation
+    preview), so the contract is now that the name *that* module looks up at
+    call time is the canonical policy.
+    """
 
     CASES = [
         None,
@@ -708,7 +703,7 @@ class TestToolPolicyPrediction:
     ]
 
     @pytest.mark.parametrize("override", CASES)
-    def test_merged_policy_matches_main(self, override):
+    def test_merged_policy_matches_its_consumer(self, override):
         kwargs = dict(
             base_config_name="session_base",
             expert_row=None,
@@ -716,13 +711,13 @@ class TestToolPolicyPrediction:
             request_override=override,
         )
         assert toolpolicy.merged_session_tool_policy(**kwargs) == (
-            main._merged_session_tool_policy(**kwargs)
+            session_tool_view.merged_session_tool_policy(**kwargs)
         )
 
     @pytest.mark.parametrize("override", CASES)
-    def test_legacy_policy_matches_main(self, override):
+    def test_legacy_policy_matches_its_consumer(self, override):
         assert toolpolicy.legacy_session_tool_policy("session_base", override) == (
-            main._legacy_session_tool_policy("session_base", override)
+            session_tool_view.legacy_session_tool_policy("session_base", override)
         )
 
     @pytest.mark.parametrize("override", CASES)
@@ -734,13 +729,15 @@ class TestToolPolicyPrediction:
             request_override=override,
         )
         assert toolpolicy.merged_session_tool_groups(**kwargs) == (
-            main._merged_session_tool_groups(**kwargs)
+            session_tool_policy_module.merged_session_tool_groups(**kwargs)
         )
 
     @pytest.mark.parametrize("override", CASES)
     def test_legacy_groups_match_main(self, override):
         assert toolpolicy.legacy_session_tool_groups("session_base", override) == (
-            main._legacy_session_tool_groups("session_base", override)
+            session_tool_policy_module.legacy_session_tool_groups(
+                "session_base", override
+            )
         )
 
     def test_delegation_gate_applies_to_both_predictions(self):
@@ -766,7 +763,7 @@ class TestToolPolicyPrediction:
         legacy_on, _ = toolpolicy.legacy_session_tool_policy("session_base", gated)
         assert legacy_on["delegation"] == ["delegate_agent"]
 
-    def test_a_malformed_stored_expert_fragment_raises_exactly_as_main_does(self):
+    def test_a_malformed_stored_expert_fragment_raises_exactly_as_its_consumer(self):
         """Pinned, not endorsed.
 
         ``resolve_config`` json-decodes the expert row BEFORE the provenance
@@ -783,7 +780,7 @@ class TestToolPolicyPrediction:
         with pytest.raises(json.JSONDecodeError):
             toolpolicy.merged_session_tool_policy(**kwargs)
         with pytest.raises(json.JSONDecodeError):
-            main._merged_session_tool_policy(**kwargs)
+            session_tool_view.merged_session_tool_policy(**kwargs)
 
 
 # ---------------------------------------------------------------------------
@@ -815,16 +812,16 @@ class TestAgentToolsetProbe:
         assert partial["degraded_reason"] == "thin"
         assert partial["prediction_reason"] is None
 
-    def test_origin_fields_match_main(self):
+    def test_origin_fields_match_the_tool_view_consumer(self):
         for m in (
             toolset.unmeasured("x"),
             toolset.Measurement({"core": []}, "t", {"a": 1}, None),
             toolset.Measurement({"core": []}, None, None, "thin", partial=True),
         ):
-            twin = main._Measurement(
+            twin = agent_toolset_probe_module.Measurement(
                 m.categories, m.observed_at, m.backend, m.reason, m.partial
             )
-            assert toolset.origin_fields(m) == main._origin_fields(twin)
+            assert toolset.origin_fields(m) == session_tool_view.origin_fields(twin)
 
     @pytest.mark.asyncio
     async def test_no_agent_is_unmeasured_without_touching_the_store(self):
@@ -967,7 +964,9 @@ class TestGrantRefusalShapes:
         assert (
             detail == "config exceeds your capability grants: shell_tools; vm_workspace"
         )
-        assert detail == main._grant_violations_detail(["shell_tools", "vm_workspace"])
+        assert detail == grant_enforcement_module.grant_violations_detail(
+            ["shell_tools", "vm_workspace"]
+        )
 
     def test_endpoint_violations_detail_is_the_rendered_string(self):
         detail = sessioncfg.endpoint_violations_detail(["llm: no url"])
@@ -992,7 +991,7 @@ class TestStripAcknowledgedGrants:
         out = grants.strip_acknowledged_grants(
             fragment, {"shell_tools": False}, {"shell_tools"}
         )
-        assert out == main._strip_acknowledged_grants(
+        assert out == grant_enforcement_module.strip_acknowledged_grants(
             {"tools": {"shell": True}}, {"shell_tools": False}, {"shell_tools"}
         )
         assert not out.get("tools", {}).get("shell")
@@ -1325,7 +1324,9 @@ class TestVmWorkspacePolicy:
     )
     def test_vm_needs_release_matches_main(self, ctx, expected):
         assert vmpolicy.vm_needs_release(ctx) is expected
-        assert vmpolicy.vm_needs_release(ctx) == main._vm_needs_release(ctx)
+        assert vmpolicy.vm_needs_release(
+            ctx
+        ) == vm_workspace_policy_module.vm_needs_release(ctx)
 
 
 # ---------------------------------------------------------------------------
@@ -1362,7 +1363,7 @@ class TestPublicJobIngress:
     def test_stripping_matches_main(self):
         moved, original = self._job(), self._job()
         ingress.strip_public_job_reserved_markers(moved)
-        main._strip_public_job_reserved_markers(original)
+        job_create_ingress_module.strip_public_job_reserved_markers(original)
         assert moved.context == original.context
         assert moved.config_override == original.config_override
 
@@ -1372,6 +1373,22 @@ class TestPublicJobIngress:
         )
         ingress.strip_raw_officer_claim_context(job)
         assert job.context == {"kept": True}
+
+    def test_operator_pause_hold_cannot_be_seeded_at_creation(self):
+        seeded = {
+            "_operator_pause_hold": {"version": 1, "hold_id": "forged"},
+            "last_operator_pause_hold": {"hold_id": "forged"},
+            "kept": True,
+        }
+        internal = SimpleNamespace(context=dict(seeded))
+        ingress.strip_raw_officer_claim_context(internal)
+        public = self._job(context=dict(seeded))
+        ingress.strip_public_job_reserved_markers(public)
+        body = JobCreate(description="seeded hold", context=dict(seeded))
+
+        assert internal.context == {"kept": True}
+        assert public.context == {"kept": True}
+        assert body.context == {"kept": True}
 
     def test_non_dict_context_is_left_alone(self):
         job = self._job(context=None, config_override=None)
@@ -1385,11 +1402,11 @@ class TestPublicJobIngress:
         )
         assert (
             ingress.PUBLIC_JOB_CONTEXT_RESERVED_KEYS
-            == main._PUBLIC_JOB_CONTEXT_RESERVED_KEYS
+            == job_create_ingress_module.PUBLIC_JOB_CONTEXT_RESERVED_KEYS
         )
         assert (
             ingress.PUBLIC_JOB_CONFIG_RESERVED_KEYS
-            == main._PUBLIC_JOB_CONFIG_RESERVED_KEYS
+            == job_create_ingress_module.PUBLIC_JOB_CONFIG_RESERVED_KEYS
         )
 
 
@@ -1451,7 +1468,7 @@ class TestSessionCreateValidators:
         assert overrides.validated_session_officer_override({}) is None
         assert overrides.validated_session_officer_override(None) is None
 
-    def test_officer_override_matches_main(self):
+    def test_officer_override_matches_the_config_commit_core(self):
         for co in (
             {"officer": {"enabled": True, "sleep_min_minutes": 5}},
             {"officer": {"conference": True}},
@@ -1459,7 +1476,7 @@ class TestSessionCreateValidators:
         ):
             assert overrides.validated_session_officer_override(
                 co
-            ) == main._validated_session_officer_override(co)
+            ) == config_update.validated_session_officer_override(co)
 
     def test_post_owned_fragment_materializes_safe_absent_values(self):
         seen: list = []
@@ -1519,7 +1536,9 @@ class TestSessionCreateValidators:
         assert overrides.effective_officer_post_owned_refusal(config) == expected
         assert overrides.effective_officer_post_owned_refusal(
             config
-        ) == main._effective_officer_post_owned_refusal(config)
+        ) == session_create_overrides_module.effective_officer_post_owned_refusal(
+            config
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -1655,7 +1674,13 @@ class TestSessionConfigResolution:
             dependencies=deps,
         )
         assert seen["called"] is True
-        assert seen["base_defaults"] == {"llm": {"model": "sentinel-account-model"}}
+        # Slice A2b: the snapshot-less path folds in the chain's tier
+        # (installation default "virtual", from the fake store's fetchrow
+        # returning no project row) on top of the stubbed account layer.
+        assert seen["base_defaults"] == {
+            "llm": {"model": "sentinel-account-model"},
+            "workspace": {"backend": "virtual"},
+        }
 
     @pytest.mark.asyncio
     async def test_a_project_scoped_thread_skips_the_mount_lookup(self):
@@ -1849,7 +1874,7 @@ class TestAccountDefaults:
         assert "workspace" not in worker
 
     @pytest.mark.asyncio
-    async def test_session_layer_carries_the_workspace_backend(self):
+    async def test_the_session_layer_no_longer_carries_a_workspace(self):
         store = MagicMock()
         store.get_user_settings = AsyncMock(
             return_value={
@@ -1868,7 +1893,7 @@ class TestAccountDefaults:
         layer = await sessioncfg.account_defaults_layer(
             "u", "session", dependencies=deps
         )
-        assert layer["workspace"] == {"backend": "sandbox"}
+        assert "workspace" not in layer
         assert layer["llm"]["model"] == "p", (
             "persistent_agent.model wins over default_model"
         )
@@ -2095,4 +2120,6 @@ class TestSessionPreflights:
 )
 def test_looks_like_uuid_matches_main(value, expected):
     assert config_overrides.looks_like_uuid(value) is expected
-    assert config_overrides.looks_like_uuid(value) == main._looks_like_uuid(value)
+    assert config_overrides.looks_like_uuid(
+        value
+    ) == config_overrides_module.looks_like_uuid(value)

@@ -112,6 +112,23 @@ $mono: 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, monospace;
   color: var(--danger);
 }
 
+/* An outcome the status cannot state (ToolCardView.outcome): a delegation a
+   recovery settled. Coloured by the tone its batch-card row badge has. */
+.tc__status--tone-warning,
+.tc__status--tone-warning .tc__status-icon {
+  color: var(--warning);
+}
+
+.tc__status--tone-neutral,
+.tc__status--tone-neutral .tc__status-icon {
+  color: var(--text-muted);
+}
+
+.tc__status--tone-danger,
+.tc__status--tone-danger .tc__status-icon {
+  color: var(--danger);
+}
+
 /* Error/denied accents, visible even while collapsed. */
 .tc--error {
   border-left: 3px solid var(--danger);

@@ -24,6 +24,9 @@ from tests.test_manifest_native_full_schema import (
     admit,
     assignment,
 )
+from orchestrator.application import controls as controls_composition
+from orchestrator.services import officer_conference as officer_conference_module
+from orchestrator.services import snapshot_service as snapshot_service_module
 
 database = full_schema.database
 postgres_url = full_schema.postgres_url
@@ -126,7 +129,8 @@ async def test_new_account_deletion_keeps_completed_manifest_history(database):
     )
 
     result = await delete_user(
-        user_id=str(user["id"]), dependencies=SimpleNamespace(store=database)
+        user_id=str(user["id"]),
+        dependencies=SimpleNamespace(store=database, main_cloud_router=None),
     )
     assert result == {"status": "deleted"}
     assert await database.get_user(str(user["id"])) is None
@@ -272,6 +276,78 @@ async def test_account_deletion_detaches_native_project_kb_creator(database):
 
 
 @pytest.mark.asyncio
+async def test_account_deletion_detaches_native_project_cloud_folder_creator(database):
+    """A key-only project connector (no config marker) outlives its creator too."""
+
+    user, project = await owner(database, "Native cloud creator")
+    datasource_id = uuid4()
+    await database.execute(
+        "INSERT INTO datasources "
+        "(id,name,type,created_by,scope_mode,auto_attach,managed_key) "
+        "VALUES ($1,'Project cloud folder','cloud_folder',$2,'projects',TRUE,"
+        "'project-cloud:' || $3::uuid::text)",
+        datasource_id,
+        user["id"],
+        project["id"],
+    )
+    await database.execute(
+        "INSERT INTO project_datasources (project_id,datasource_id) VALUES ($1,$2)",
+        project["id"],
+        datasource_id,
+    )
+
+    assert await database.delete_user(str(user["id"])) is True
+    assert (
+        await database.fetchval(
+            "SELECT created_by FROM datasources WHERE id=$1", datasource_id
+        )
+        is None
+    )
+    assert await database.delete_project(str(project["id"])) is True
+    assert (
+        await database.fetchval(
+            "SELECT count(*) FROM datasources WHERE id=$1", datasource_id
+        )
+        == 0
+    )
+
+
+@pytest.mark.asyncio
+async def test_account_deletion_removes_the_users_own_session_outbox(database):
+    """A user's own connector (cloud-outbox:<user>) goes with the account:
+    its creator FK would otherwise refuse the deletion, and nobody else may
+    attach it. Another user's outbox stays."""
+
+    user, _project = await owner(database, "Outbox owner")
+    other, _other_project = await owner(database, "Other outbox owner")
+    outboxes = {}
+    for who in (user, other):
+        outboxes[who["id"]] = uuid4()
+        await database.execute(
+            "INSERT INTO datasources "
+            "(id,name,type,created_by,scope_mode,auto_attach,config,managed_key) "
+            "VALUES ($1,'Session outbox','cloud_outbox',$2,'all',TRUE,'{}'::jsonb,"
+            "'cloud-outbox:' || $2::uuid::text)",
+            outboxes[who["id"]],
+            who["id"],
+        )
+
+    assert await database.delete_user(str(user["id"])) is True
+    assert (
+        await database.fetchval(
+            "SELECT count(*) FROM datasources WHERE id=$1", outboxes[user["id"]]
+        )
+        == 0
+    )
+    assert (
+        await database.fetchval(
+            "SELECT created_by FROM datasources WHERE id=$1", outboxes[other["id"]]
+        )
+        == other["id"]
+    )
+
+
+@pytest.mark.asyncio
 async def test_project_delete_ignores_only_settled_ownerless_session_history(
     database, monkeypatch
 ):
@@ -288,14 +364,22 @@ async def test_project_delete_ignores_only_settled_ownerless_session_history(
         initial_metadata={"config_override": {"workspace": {"backend": "none"}}},
     )
     thread = await database.get_thread(thread_id)
-    monkeypatch.setattr(main, "postgres_db", database)
-    monkeypatch.setattr(main, "_conclude_conference_if_any", AsyncMock())
-    monkeypatch.setattr(main, "snapshot_service", SimpleNamespace(is_available=False))
-    monkeypatch.setattr(main, "gitea_client", SimpleNamespace(is_initialized=False))
+    monkeypatch.setattr(main.app.state.resources, "postgres_db", database)
+    monkeypatch.setattr(
+        officer_conference_module, "conclude_conference_if_any", AsyncMock()
+    )
+    monkeypatch.setattr(
+        snapshot_service_module, "snapshot_service", SimpleNamespace(is_available=False)
+    )
+    monkeypatch.setattr(
+        main.app.state.resources, "gitea_client", SimpleNamespace(is_initialized=False)
+    )
 
-    assert await main._end_thread_flow(
-        thread_id, thread, permanent=False, force=True
-    ) == {"status": "ended"}
+    assert await controls_composition.thread_retirement_operations(
+        main.app.state.resources
+    ).end_thread_flow(thread_id, thread, permanent=False, force=True) == {
+        "status": "ended"
+    }
     ended = await database.get_thread(thread_id)
     assert ended["status"] == "ended"
     assert ended["runtime_retirement_token"] is None

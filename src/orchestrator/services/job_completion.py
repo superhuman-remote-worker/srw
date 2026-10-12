@@ -12,9 +12,23 @@ from fastapi import HTTPException, Request
 from fastapi.responses import JSONResponse
 
 from orchestrator.schemas.job_runtime import JobCompleteRequest
+from orchestrator.services.completion import START_REFUSED_ERROR_TYPE
 
 
 DURABLE_COMPLETION_HTTP_ERROR = "_completion_http_error"
+#: Lane fences and transport fields: never part of the admitted payload.
+_COMPLETION_TRANSPORT_FIELDS = frozenset(
+    {
+        "lease_token",
+        "agent_id",
+        "client_report_id",
+        "pinned_delivery_id",
+        "pinned_projection_digest",
+        "pinned_delivery_proof",
+        "pinned_process_generation",
+        "pinned_pod_uid",
+    }
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -78,7 +92,12 @@ async def run_persisted_completion_workflow(
         ACCEPTED_COMPLETION_DECISION_KEY,
     )
 
+    from orchestrator.services.workspace_idle_completion_events import (
+        ACCEPTED_IDLE_WAIT_SOURCE_KEY,
+    )
+
     payload.pop(ACCEPTED_COMPLETION_DECISION_KEY, None)
+    payload.pop(ACCEPTED_IDLE_WAIT_SOURCE_KEY, None)
     payload.update(
         {
             "lease_token": command.get("accepted_lease_token"),
@@ -117,6 +136,23 @@ async def complete_job(
 
     if not _authorized:
         await dependencies.require_internal(request)
+    if (
+        isinstance(body.error, Mapping)
+        and body.error.get("type") == START_REFUSED_ERROR_TYPE
+    ):
+        # Reserved for the refusal the orchestrator admits for a claim
+        # (refuse_job_start), which never comes through this route. An
+        # agent's report must not claim it, in either mode.
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "completion_reserved_error_type",
+                "message": (
+                    f"error.type {START_REFUSED_ERROR_TYPE!r} is reserved for "
+                    "the orchestrator"
+                ),
+            },
+        )
     if not dependencies.commands_enabled():
         return await dependencies.legacy_complete(
             request,
@@ -135,10 +171,7 @@ async def complete_job(
         CompletionTeardownInProgress,
     )
 
-    payload = body.model_dump(
-        mode="json",
-        exclude={"lease_token", "agent_id", "client_report_id"},
-    )
+    payload = body.model_dump(mode="json", exclude=set(_COMPLETION_TRANSPORT_FIELDS))
     try:
         accepted = await dependencies.accept_command(
             dependencies.store,
@@ -147,6 +180,11 @@ async def complete_job(
             status_reorder_enabled=dependencies.status_reorder_enabled(),
             lease_token=body.lease_token,
             agent_id=str(body.agent_id) if body.agent_id is not None else None,
+            pinned_delivery_id=body.pinned_delivery_id,
+            pinned_projection_digest=body.pinned_projection_digest,
+            pinned_delivery_proof=body.pinned_delivery_proof,
+            pinned_process_generation=body.pinned_process_generation,
+            pinned_pod_uid=body.pinned_pod_uid,
             client_report_id=(
                 str(body.client_report_id)
                 if body.client_report_id is not None
@@ -297,12 +335,115 @@ async def complete_job(
     )
 
 
+async def refuse_job_start(
+    job_id: str,
+    *,
+    reason: str,
+    message: str,
+    resume: bool,
+    agent_id: str | None = None,
+    lease_token: int | None = None,
+    dependencies: JobCompletionDependencies,
+) -> bool:
+    """Fail a claimed job whose start bundle was refused, through the ledger.
+
+    Connector drivers decision 34. While completion commands own job status,
+    a claim owner cannot write ``failed`` itself: the refusal is admitted as
+    the terminal report the job's claim would have sent, under that claim's
+    own fence (the pinned claim's ``agent_id`` or the stateless worker's
+    ``lease_token``) and only while the claimed row is still ``processing``.
+    The finalizer then writes ``failed`` with ``message`` through its status
+    CAS. A cancel or another control that won the row first, before admission
+    or before the finalizer, keeps it; a stale claim is fenced out. A
+    stateless admission also closes the queue unit, so nothing claims the job
+    again. The row's origin is ``dispatch``.
+
+    ``resume`` says whether the refused claim resumed a job that had already
+    run (the pinned resume lane, or a stateless job with a checkpoint). The
+    finalizer then keeps the job's workspace instead of tearing it down
+    (``completion.refused_resume_keeps_workspace``); a refused fresh start
+    still tears down what was provisioned for it.
+
+    Only the admission runs here: it is bounded database work, and the
+    background finalizer drain picks the command up. Returns whether the
+    command was admitted. ``False`` leaves the job to its lane's earlier
+    behaviour; that includes completion commands being off, where the caller
+    keeps its own handling.
+    """
+
+    from orchestrator.services.job_completion_commands import CompletionCommandError
+
+    logger = dependencies.logger
+    if not dependencies.commands_enabled():
+        return False
+    body = JobCompleteRequest(
+        should_stop=True,
+        goal_achieved=False,
+        error={
+            "type": START_REFUSED_ERROR_TYPE,
+            "reason": reason,
+            "message": message,
+            "recoverable": False,
+            "resume": bool(resume),
+        },
+        lease_token=lease_token,
+        agent_id=agent_id,
+    )
+    try:
+        accepted = await dependencies.accept_command(
+            dependencies.store,
+            job_id=job_id,
+            payload=body.model_dump(
+                mode="json", exclude=set(_COMPLETION_TRANSPORT_FIELDS)
+            ),
+            status_reorder_enabled=dependencies.status_reorder_enabled(),
+            lease_token=lease_token,
+            agent_id=agent_id,
+            client_report_id=None,
+            # The claim set ``processing``; a control that moved the row
+            # since keeps it, and nothing is admitted.
+            expected_job_status="processing",
+            origin="dispatch",
+            requested_by=(
+                f"start-refusal:agent:{agent_id}"
+                if agent_id is not None
+                else f"start-refusal:worker-lease:{lease_token}"
+            ),
+        )
+    except CompletionCommandError as exc:
+        # The claim lost its row first (a control, a newer owner, a stolen
+        # lease): whoever won it decides the job.
+        logger.warning(
+            "Dispatch: start refusal for job %s (%s) not admitted: %s",
+            job_id,
+            reason,
+            exc,
+        )
+        return False
+    except Exception:
+        logger.exception(
+            "Dispatch: start refusal for job %s (%s) could not be admitted",
+            job_id,
+            reason,
+        )
+        return False
+    logger.info(
+        "Dispatch: start refusal for job %s (%s) admitted as completion command %s",
+        job_id,
+        reason,
+        accepted.command_id,
+    )
+    return True
+
+
 __all__ = [
     "DURABLE_COMPLETION_HTTP_ERROR",
     "JobCompletionDependencies",
     "PersistedCompletionDependencies",
+    "START_REFUSED_ERROR_TYPE",
     "complete_job",
     "durable_completion_http_outcome",
     "raise_durable_completion_http_outcome",
+    "refuse_job_start",
     "run_persisted_completion_workflow",
 ]

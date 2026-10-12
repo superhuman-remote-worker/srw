@@ -8,8 +8,12 @@ Covers:
   - WS interrupt handler picks hard vs graceful based on _tool_inflight.
   - Interrupt mid-stream in persistent_graph: "hard" drops partial AIMessage,
     other modes (graceful, legacy bool) preserve it.
-  - Orchestrator per-turn lock: same (thread, turn) shares one Lock,
-    different (thread, turn) get distinct Locks, cleanup after timeout.
+  - Orchestrator per-turn lock (one ``ThreadTurnLocks`` per application):
+    same (thread, turn) shares one Lock, different (thread, turn) get
+    distinct Locks, cleanup after timeout.
+  - Orchestrator SSE route (``routers/thread_transport``) over the stream
+    service (``services/thread_event_stream``): no-cursor anchor, zombie-epoch
+    recheck, and client presence.
   - Agent REST endpoints (/api/input, /api/interrupt, /api/approve) routing
     and 503-when-detached behavior.
 """
@@ -20,12 +24,13 @@ import json
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from orchestrator.application import transport as transport_composition
 
 
 def test_pruner_preserves_receipts_until_owner_request_is_terminal():
-    import orchestrator.main as om
+    from orchestrator.services import retention_sweepers
 
-    source = inspect.getsource(om.thread_events_prune_sweeper)
+    source = inspect.getsource(retention_sweepers.thread_events_prune_sweeper)
     assert source.count("request.id = thread_events.control_request_id") == 2
     assert source.count("request.id = thread_events.interrupt_request_id") == 2
     assert source.count("request.outcome IS NULL") == 4
@@ -230,7 +235,7 @@ class TestBroadcastCursor:
         fake_session.postgres_conn = fake_conn
 
         mod._session = fake_session
-        mod._thread_id = "thread-xyz"
+        mod._session_identity._thread_id = "thread-xyz"
         mod._subscribe("c1")
         writer = mod._OrderedPersistentEventWriter(
             postgres_conn=fake_conn,
@@ -295,13 +300,13 @@ class TestBroadcastCursor:
         request_id = "77777777-7777-4777-8777-777777777777"
         agent_id = "88888888-8888-4888-8888-888888888888"
         mod._session = session
-        mod._thread_id = "99999999-9999-4999-8999-999999999999"
+        mod._session_identity._thread_id = "99999999-9999-4999-8999-999999999999"
         mod._events_epoch = 3
         mod._next_seq = 10
         live = mod._subscribe("durable-control")
         writer = mod._OrderedPersistentEventWriter(
             postgres_conn=pool,
-            thread_id=mod._thread_id,
+            thread_id=mod._session_identity.thread_id,
             epoch=3,
             on_terminal_failure=lambda _events, _reason: None,
             pinned_agent_id=agent_id,
@@ -768,11 +773,13 @@ class TestInterruptModeSelection:
     mode = 'graceful' if a tool is currently mid-`ainvoke`, else 'hard'.
     The mode picks the right behavior at the persistent_graph check sites."""
 
-    def setup_method(self):
+    @pytest.fixture(autouse=True)
+    def tool_state(self, monkeypatch):
         import agent.api.persistent_app as mod
 
-        mod._loop_interrupt_flag = None
-        mod._tool_inflight = False
+        monkeypatch.setattr(mod._session_input, "_interrupt_mode", None)
+        monkeypatch.setattr(mod, "_tool_inflight", False)
+        monkeypatch.setattr(mod, "_tool_inflight_calls", set())
 
     def test_loop_on_tool_start_does_not_claim_execution_inflight(self):
         import agent.api.persistent_app as mod
@@ -789,9 +796,32 @@ class TestInterruptModeSelection:
         async def _run():
             await mod._loop_on_tool_execution_start("read_file", "tc1")
 
+        # This callback test owns the effect-authority response. Another test's
+        # retired session must not supply the authority for this synthetic turn.
+        authority = AsyncMock(return_value=True)
+        with patch.object(mod, "_loop_runtime_effect_authority_current", authority):
+            asyncio.run(_run())
+        authority.assert_awaited_once_with()
+        assert mod._tool_inflight is True
+        assert mod._tool_inflight_calls == {"tc1"}
+
+    def test_loop_on_tool_execution_start_refuses_termination_before_inflight(
+        self, monkeypatch
+    ):
+        import agent.api.persistent_app as mod
+
+        monkeypatch.setattr(
+            mod._session_termination, "termination_admission_fenced", True
+        )
+
+        async def _run():
+            with pytest.raises(mod.TerminationAdmissionClosed):
+                await mod._loop_on_tool_execution_start("read_file", "tc1")
+
         with patch.object(mod, "_protected_cloud_runtime_ready", return_value=True):
             asyncio.run(_run())
-        assert mod._tool_inflight is True
+        assert mod._tool_inflight is False
+        assert mod._tool_inflight_calls == set()
 
     def test_loop_on_tool_result_clears_inflight(self):
         import agent.api.persistent_app as mod
@@ -964,41 +994,30 @@ class TestPersistentGraphInterruptModes:
 class TestPerTurnLock:
     """The per-turn lock dedupes concurrent POSTs from multi-tab cockpits.
     Two POSTs racing on the same (thread, turn) share one asyncio.Lock; the
-    second sees lock.locked() and returns 409."""
+    second sees lock.locked() and returns 409 (the route's refusal itself is
+    exercised in test_thread_input_enqueue). The registry is one
+    ``ThreadTurnLocks`` per application, so each case builds its own."""
 
     def setup_method(self):
-        import orchestrator.main as om
+        from orchestrator.services.thread_turn_locks import ThreadTurnLocks
 
-        om._thread_turn_locks.clear()
-        om._thread_turn_inflight.clear()
-
-    def teardown_method(self):
-        import orchestrator.main as om
-
-        om._thread_turn_locks.clear()
-        om._thread_turn_inflight.clear()
+        self.turn_locks = ThreadTurnLocks()
 
     def test_same_key_shares_one_lock(self):
-        import orchestrator.main as om
-
-        lock_a = om._ensure_thread_turn_lock("thread-x", 5)
-        lock_b = om._ensure_thread_turn_lock("thread-x", 5)
+        lock_a = self.turn_locks.ensure("thread-x", 5)
+        lock_b = self.turn_locks.ensure("thread-x", 5)
         assert lock_a is lock_b
 
     def test_different_keys_distinct_locks(self):
-        import orchestrator.main as om
-
-        l_thread = om._ensure_thread_turn_lock("thread-x", 5)
-        l_other_thread = om._ensure_thread_turn_lock("thread-y", 5)
-        l_other_turn = om._ensure_thread_turn_lock("thread-x", 6)
+        l_thread = self.turn_locks.ensure("thread-x", 5)
+        l_other_thread = self.turn_locks.ensure("thread-y", 5)
+        l_other_turn = self.turn_locks.ensure("thread-x", 6)
         assert l_thread is not l_other_thread
         assert l_thread is not l_other_turn
 
     @pytest.mark.asyncio
     async def test_concurrent_acquire_returns_locked_for_second(self):
-        import orchestrator.main as om
-
-        lock = om._ensure_thread_turn_lock("thread-x", 1)
+        lock = self.turn_locks.ensure("thread-x", 1)
         await lock.acquire()
         try:
             # Second caller sees the lock held; the HTTP handler returns
@@ -1008,6 +1027,24 @@ class TestPerTurnLock:
             lock.release()
         # After release the next caller can acquire.
         assert lock.locked() is False
+
+    def test_application_serves_every_request_from_one_registry(self):
+        """The application composes a fresh dependency bundle per request, but
+        the lock registry must be the same object every time — otherwise two
+        tabs would get distinct locks and both forward."""
+        import orchestrator.main as om
+        from orchestrator.services.thread_turn_locks import ThreadTurnLocks
+
+        assert isinstance(om.app.state.resources.thread_turn_locks, ThreadTurnLocks)
+        first = transport_composition.thread_transport_dependencies(
+            om.app.state.resources
+        )
+        second = transport_composition.thread_transport_dependencies(
+            om.app.state.resources
+        )
+        assert first is not second
+        assert first.turn_locks is om.app.state.resources.thread_turn_locks
+        assert second.turn_locks is om.app.state.resources.thread_turn_locks
 
 
 # ---------------------------------------------------------------------------
@@ -1023,7 +1060,7 @@ class TestAgentRestInputEndpointsNoSession:
         import agent.api.persistent_app as mod
 
         mod._session = None
-        mod._loop_user_queue = None
+        mod._session_input._queue = None
 
     def test_api_input_503_without_session(self):
         from fastapi.testclient import TestClient
@@ -1066,10 +1103,9 @@ class TestAgentRestInputEndpointsNoSession:
         # Stand up a minimal session so we get past the 503 gate.
         mod._session = MagicMock()
         mod._session.protected_cloud_required = False
-        mod._loop_user_queue = _asyncio.Queue()
-        mod._loop_last_user_content = [""]
-        mod._retirement_admission_identity = None
-        mod._termination_admission_fenced = False
+        mod._session_input._queue = _asyncio.Queue()
+        mod._session_termination.retirement_admission_identity = None
+        mod._session_termination.termination_admission_fenced = False
 
         try:
             app = create_persistent_app("interactive")
@@ -1078,7 +1114,7 @@ class TestAgentRestInputEndpointsNoSession:
             assert resp.status_code == 400
         finally:
             mod._session = None
-            mod._loop_user_queue = None
+            mod._session_input._queue = None
 
     @pytest.mark.asyncio
     async def test_api_input_starts_loop_without_websocket(self):
@@ -1145,14 +1181,13 @@ class TestAgentRestInputEndpointsNoSession:
                 self.row["state"] = "queued"
                 return True
 
-        mod._thread_id = "thread-rest"
+        mod._session_identity._thread_id = "thread-rest"
         mod._loop_task = None
-        mod._loop_user_queue = asyncio.Queue()
-        mod._loop_last_user_content = [""]
-        mod._hard_interrupt_event = asyncio.Event()
-        mod._input_runtime_generation = str(uuid4())
-        mod._session_runtime_attach_token = str(uuid4())
-        mod._queued_input_claims.clear()
+        mod._session_input._queue = asyncio.Queue()
+        mod._session_input._hard_interrupt_event = asyncio.Event()
+        mod._session_identity._process_generation = str(uuid4())
+        mod._session_identity._attach_token = str(uuid4())
+        mod._session_input._queued_claims.clear()
         mod._session = SimpleNamespace(
             llm_with_tools=object(),
             tools=[],
@@ -1185,11 +1220,13 @@ class TestAgentRestInputEndpointsNoSession:
                     "run_persistent_loop",
                     new=fake_run_persistent_loop,
                 ),
-                patch.object(mod, "_loop_completion_handler", new=AsyncMock()),
+                patch.object(
+                    mod._session_termination, "loop_completion_handler", new=AsyncMock()
+                ),
                 patch.object(mod, "_early_title_from_prompt", new=AsyncMock()),
                 patch.object(
-                    mod,
-                    "_current_pinned_session_identity_fingerprint",
+                    mod._session_identity,
+                    "fingerprint",
                     return_value=exact_session_fingerprint,
                 ),
                 patch.object(
@@ -1199,7 +1236,11 @@ class TestAgentRestInputEndpointsNoSession:
                 ),
                 patch.dict("os.environ", {"POD_UID": "rest-input-pod"}),
             ):
-                response = await mod.handle_api_input(request)
+                from agent.api import session_http
+
+                response = await session_http.handle_input(
+                    request, mod.session_transport_bindings().http
+                )
                 # Persistence/queue ownership is not execution admission.
                 assert response.status_code == 202
                 await asyncio.wait_for(mod._loop_task, timeout=1)
@@ -1212,13 +1253,13 @@ class TestAgentRestInputEndpointsNoSession:
             assert all(i["claim_generation"] == 1 for i in seen_inputs)
         finally:
             mod._session = None
-            mod._thread_id = None
+            mod._session_identity._thread_id = None
             mod._loop_task = None
-            mod._loop_user_queue = None
-            mod._hard_interrupt_event = None
-            mod._input_runtime_generation = None
-            mod._session_runtime_attach_token = None
-            mod._queued_input_claims.clear()
+            mod._session_input._queue = None
+            mod._session_input._hard_interrupt_event = None
+            mod._session_identity._process_generation = None
+            mod._session_identity._attach_token = None
+            mod._session_input._queued_claims.clear()
 
 
 # ---------------------------------------------------------------------------
@@ -1237,7 +1278,7 @@ class TestNoCursorReplayStart:
 
     @pytest.mark.asyncio
     async def test_anchors_past_last_terminal_event(self):
-        import orchestrator.main as om
+        from orchestrator.services import thread_event_stream as event_stream
 
         captured = {}
 
@@ -1248,7 +1289,7 @@ class TestNoCursorReplayStart:
                 # Simulate MAX(seq) of the epoch's terminal events.
                 return 7
 
-        start = await om._no_cursor_replay_start(_Conn(), "thread-x", 3)
+        start = await event_stream.no_cursor_replay_start(_Conn(), "thread-x", 3)
 
         # Replay only seq > 7 (the in-flight turn), NOT the whole epoch.
         assert start == 7
@@ -1263,24 +1304,24 @@ class TestNoCursorReplayStart:
     async def test_returns_zero_when_no_turn_has_finished(self):
         """First turn still in flight (no terminal event yet) → replay from 0
         so the in-flight first turn, absent from REST history, is delivered."""
-        import orchestrator.main as om
+        from orchestrator.services import thread_event_stream as event_stream
 
         class _Conn:
             async def fetchval(self, sql, *args):
                 return 0  # COALESCE(MAX(seq), 0) with no terminal rows
 
-        start = await om._no_cursor_replay_start(_Conn(), "thread-x", 0)
+        start = await event_stream.no_cursor_replay_start(_Conn(), "thread-x", 0)
         assert start == 0
 
     @pytest.mark.asyncio
     async def test_coerces_null_max_to_zero(self):
-        import orchestrator.main as om
+        from orchestrator.services import thread_event_stream as event_stream
 
         class _Conn:
             async def fetchval(self, sql, *args):
                 return None
 
-        start = await om._no_cursor_replay_start(_Conn(), "thread-x", 0)
+        start = await event_stream.no_cursor_replay_start(_Conn(), "thread-x", 0)
         assert start == 0
 
 
@@ -1294,7 +1335,7 @@ class _ScriptedConn:
 
     Dispatches on the SQL text rather than call order, so the open-path
     MIN(seq) probe, the mid-loop events_epoch re-read, and the
-    _no_cursor_replay_start anchor query stay independently controllable.
+    no_cursor_replay_start anchor query stay independently controllable.
     """
 
     def __init__(self, *, epochs, anchor=0, min_seq=0, rows_script=None):
@@ -1317,7 +1358,7 @@ class _ScriptedConn:
             return self._epochs.pop(0) if self._epochs else None
         if "MIN(seq)" in sql:
             return self._min_seq
-        if "turn.completed" in sql:  # _no_cursor_replay_start anchor
+        if "turn.completed" in sql:  # no_cursor_replay_start anchor
             return self._anchor
         return 0  # generic MAX(seq) tail (unused on the matching-cursor path)
 
@@ -1344,6 +1385,37 @@ class _FakeRequest:
         return False
 
 
+def _stream_deps(store, require_thread_owner):
+    """One application's transport collaborators for the SSE route.
+
+    Only the store and the owner gate are consulted by the stream; the input
+    and forwarding collaborators are inert placeholders here.
+    """
+    from types import SimpleNamespace
+
+    from orchestrator.routers import thread_transport
+    from orchestrator.services.thread_turn_locks import ThreadTurnLocks
+
+    return thread_transport.ThreadTransportDependencies(
+        store=store,
+        require_thread_owner=require_thread_owner,
+        require_approved_user=AsyncMock(
+            side_effect=AssertionError("the stream gates on the owner check")
+        ),
+        forwarding=SimpleNamespace(),
+        stateless_input=SimpleNamespace(),
+        turn_locks=ThreadTurnLocks(),
+    )
+
+
+async def _open_stream(thread_id, request, dependencies):
+    from orchestrator.routers import thread_transport
+
+    return await thread_transport.thread_event_stream(
+        thread_id, request, dependencies=dependencies
+    )
+
+
 class TestThreadEventStreamEpochRecheck:
     """Phase 1: a live SSE generator opened before an agent re-attach must
     detect the events_epoch bump on its own poll loop and terminate with a
@@ -1351,19 +1423,17 @@ class TestThreadEventStreamEpochRecheck:
     forever while its keepalive pings fool the client watchdog."""
 
     def _patch(self, monkeypatch, conn, *, server_epoch=3, recheck_s=0.0):
-        import orchestrator.main as om
+        from orchestrator.services import thread_event_stream as event_stream
 
-        monkeypatch.setattr(om, "THREAD_EVENTS_EPOCH_RECHECK_S", recheck_s)
-        monkeypatch.setattr(
-            om,
-            "require_thread_owner",
-            AsyncMock(return_value=(MagicMock(), {"events_epoch": server_epoch})),
-        )
+        monkeypatch.setattr(event_stream, "THREAD_EVENTS_EPOCH_RECHECK_S", recheck_s)
         fake_db = MagicMock()
         fake_db.acquire = lambda: _Acquire(conn)
-        monkeypatch.setattr(om, "postgres_db", fake_db)
         # Neutralize the backoff sleeps so the loop spins instantly.
         monkeypatch.setattr(asyncio, "sleep", AsyncMock(return_value=None))
+        return _stream_deps(
+            fake_db,
+            AsyncMock(return_value=(MagicMock(), {"events_epoch": server_epoch})),
+        )
 
     async def _drain(self, resp, cap=25):
         chunks = []
@@ -1381,15 +1451,13 @@ class TestThreadEventStreamEpochRecheck:
         the generator terminates."""
         import json
 
-        import orchestrator.main as om
-
         conn = _ScriptedConn(epochs=[3, 3, 4], anchor=17, min_seq=0)
-        self._patch(monkeypatch, conn, server_epoch=3)
+        deps = self._patch(monkeypatch, conn, server_epoch=3)
 
         # Matching cursor (epoch 3) so the open path skips the mismatch/
         # retention branches and the loop starts clean.
         req = _FakeRequest(last_event_id="3:100")
-        resp = await om.thread_event_stream("thread-x", req)
+        resp = await _open_stream("thread-x", req, deps)
         chunks = await self._drain(resp)
 
         assert chunks[0] == ": open\n\n"
@@ -1417,13 +1485,11 @@ class TestThreadEventStreamEpochRecheck:
         id: 4:0, server_seq 0."""
         import json
 
-        import orchestrator.main as om
-
         conn = _ScriptedConn(epochs=[4], anchor=0, min_seq=0)
-        self._patch(monkeypatch, conn, server_epoch=3)
+        deps = self._patch(monkeypatch, conn, server_epoch=3)
 
         req = _FakeRequest(last_event_id="3:100")
-        resp = await om.thread_event_stream("thread-x", req)
+        resp = await _open_stream("thread-x", req, deps)
         chunks = await self._drain(resp)
 
         horizon = [c for c in chunks if "gone_beyond_horizon" in c]
@@ -1438,13 +1504,11 @@ class TestThreadEventStreamEpochRecheck:
     async def test_thread_deleted_terminates_without_horizon(self, monkeypatch):
         """Criterion 3: events_epoch re-read returns None (row gone) → the
         generator terminates silently, no horizon frame."""
-        import orchestrator.main as om
-
         conn = _ScriptedConn(epochs=[None], min_seq=0)
-        self._patch(monkeypatch, conn, server_epoch=3)
+        deps = self._patch(monkeypatch, conn, server_epoch=3)
 
         req = _FakeRequest(last_event_id="3:100")
-        resp = await om.thread_event_stream("thread-x", req)
+        resp = await _open_stream("thread-x", req, deps)
         chunks = await self._drain(resp)
 
         assert chunks == [": open\n\n"]
@@ -1455,18 +1519,16 @@ class TestThreadEventStreamEpochRecheck:
         """Criterion 4: while rows flow the epoch is never re-read and no
         horizon frame appears — the guard is idle-only. id: lines carry the
         unchanged server epoch."""
-        import orchestrator.main as om
-
         rows = [
             {"seq": 1, "kind": "token", "payload": {"content": "a"}},
             {"seq": 2, "kind": "token", "payload": {"content": "b"}},
         ]
         # High recheck window so the brief idle after the batch never trips it.
         conn = _ScriptedConn(epochs=[9], rows_script=[rows], min_seq=0)
-        self._patch(monkeypatch, conn, server_epoch=3, recheck_s=999.0)
+        deps = self._patch(monkeypatch, conn, server_epoch=3, recheck_s=999.0)
 
         req = _FakeRequest(last_event_id="3:0")
-        resp = await om.thread_event_stream("thread-x", req)
+        resp = await _open_stream("thread-x", req, deps)
 
         # Pull exactly the open comment + the two row frames, then close —
         # the post-batch idle loop spins without yielding, so don't ask for a
@@ -1492,20 +1554,22 @@ class TestThreadEventStreamPresence:
 
     @pytest.mark.asyncio
     async def test_stateless_establishes_after_owner_gate(self, monkeypatch):
-        import orchestrator.main as om
+        from orchestrator.services import thread_event_stream as event_stream
         from shared.thread_presence import PresenceRefresh
 
         auth = AsyncMock(return_value=self._owner_row("stateless"))
         refresh = AsyncMock(return_value=PresenceRefresh(True, True))
-        monkeypatch.setattr(om, "require_thread_owner", auth)
-        monkeypatch.setattr(om, "refresh_thread_presence", refresh)
+        monkeypatch.setattr(event_stream, "refresh_thread_presence", refresh)
+        store = MagicMock()
 
-        response = await om.thread_event_stream("thread-x", _FakeRequest())
+        response = await _open_stream(
+            "thread-x", _FakeRequest(), _stream_deps(store, auth)
+        )
         assert auth.await_count == 1
         refresh.assert_awaited_once_with(
-            om.postgres_db,
+            store,
             thread_id="thread-x",
-            ttl_seconds=om.THREAD_CLIENT_PRESENCE_TTL_S,
+            ttl_seconds=event_stream.THREAD_CLIENT_PRESENCE_TTL_S,
             establish=True,
         )
         iterator = response.body_iterator
@@ -1516,7 +1580,7 @@ class TestThreadEventStreamPresence:
 
     @pytest.mark.asyncio
     async def test_periodic_renewal_reauthorizes_before_touch(self, monkeypatch):
-        import orchestrator.main as om
+        from orchestrator.services import thread_event_stream as event_stream
         from shared.thread_presence import PresenceRefresh
 
         auth = AsyncMock(
@@ -1528,14 +1592,14 @@ class TestThreadEventStreamPresence:
         refresh = AsyncMock(
             side_effect=[PresenceRefresh(True, True), RuntimeError("renew failed")]
         )
-        monkeypatch.setattr(om, "require_thread_owner", auth)
-        monkeypatch.setattr(om, "refresh_thread_presence", refresh)
-        monkeypatch.setattr(om, "THREAD_CLIENT_PRESENCE_RENEW_S", 0.0)
+        monkeypatch.setattr(event_stream, "refresh_thread_presence", refresh)
+        monkeypatch.setattr(event_stream, "THREAD_CLIENT_PRESENCE_RENEW_S", 0.0)
         fake_db = MagicMock()
         fake_db.acquire = lambda: _Acquire(_ScriptedConn(epochs=[], min_seq=0))
-        monkeypatch.setattr(om, "postgres_db", fake_db)
 
-        response = await om.thread_event_stream("thread-x", _FakeRequest())
+        response = await _open_stream(
+            "thread-x", _FakeRequest(), _stream_deps(fake_db, auth)
+        )
         iterator = response.body_iterator
         assert await iterator.__anext__() == ": open\n\n"
         with pytest.raises(StopAsyncIteration):
@@ -1547,8 +1611,9 @@ class TestThreadEventStreamPresence:
 
     @pytest.mark.asyncio
     async def test_renewal_auth_failure_closes_without_refresh(self, monkeypatch):
-        import orchestrator.main as om
         from fastapi import HTTPException
+
+        from orchestrator.services import thread_event_stream as event_stream
         from shared.thread_presence import PresenceRefresh
 
         auth = AsyncMock(
@@ -1558,14 +1623,14 @@ class TestThreadEventStreamPresence:
             ]
         )
         refresh = AsyncMock(return_value=PresenceRefresh(True, True))
-        monkeypatch.setattr(om, "require_thread_owner", auth)
-        monkeypatch.setattr(om, "refresh_thread_presence", refresh)
-        monkeypatch.setattr(om, "THREAD_CLIENT_PRESENCE_RENEW_S", 0.0)
+        monkeypatch.setattr(event_stream, "refresh_thread_presence", refresh)
+        monkeypatch.setattr(event_stream, "THREAD_CLIENT_PRESENCE_RENEW_S", 0.0)
         fake_db = MagicMock()
         fake_db.acquire = lambda: _Acquire(_ScriptedConn(epochs=[], min_seq=0))
-        monkeypatch.setattr(om, "postgres_db", fake_db)
 
-        response = await om.thread_event_stream("thread-x", _FakeRequest())
+        response = await _open_stream(
+            "thread-x", _FakeRequest(), _stream_deps(fake_db, auth)
+        )
         iterator = response.body_iterator
         assert await iterator.__anext__() == ": open\n\n"
         with pytest.raises(StopAsyncIteration):
@@ -1575,18 +1640,83 @@ class TestThreadEventStreamPresence:
         assert refresh.await_count == 1
 
     @pytest.mark.asyncio
-    async def test_pinned_stream_never_touches_presence(self, monkeypatch):
-        import orchestrator.main as om
+    @pytest.mark.parametrize(
+        ("caller", "tethers"),
+        [
+            ({"id": "user-x"}, True),  # cookie / OIDC session
+            ({"id": "user-x", "auth_method": "mcp", "scopes": ["user"]}, True),
+            ({"id": "user-x", "auth_method": "pat", "scopes": ["chat:write"]}, True),
+            ({"id": "user-x", "auth_method": "pat", "scopes": ["admin"]}, True),
+            (
+                {"id": "user-x", "auth_method": "pat", "scopes": ["chat:read"]},
+                False,
+            ),
+            (
+                {
+                    "id": "user-x",
+                    "auth_method": "pat",
+                    "scopes": ["chat:read", "jobs:write"],
+                },
+                False,
+            ),
+        ],
+    )
+    async def test_only_a_caller_who_could_answer_records_presence(
+        self, monkeypatch, caller, tethers
+    ):
+        """Presence keeps permission prompts open (and the turn's executor
+        slot leased) and blocks the natural pause, so it is a claim that
+        someone attached can answer. A read-only token still streams — it
+        is re-authorized on the renewal cadence — but never tethers."""
+        from orchestrator.services import thread_event_stream as event_stream
+        from shared.thread_presence import PresenceRefresh
 
-        monkeypatch.setattr(
-            om,
-            "require_thread_owner",
-            AsyncMock(return_value=self._owner_row("pinned")),
+        thread = {"events_epoch": 3, "execution_lane": "stateless"}
+        auth = AsyncMock(return_value=(caller, thread))
+        refresh = AsyncMock(return_value=PresenceRefresh(True, True))
+        monkeypatch.setattr(event_stream, "refresh_thread_presence", refresh)
+        monkeypatch.setattr(event_stream, "THREAD_CLIENT_PRESENCE_RENEW_S", 0.0)
+        monkeypatch.setattr(event_stream, "THREAD_EVENTS_EPOCH_RECHECK_S", 999.0)
+        monkeypatch.setattr(asyncio, "sleep", AsyncMock(return_value=None))
+        rows = [{"seq": 1, "kind": "token", "payload": {"content": "a"}}]
+        conn = _ScriptedConn(epochs=[3], rows_script=[rows], min_seq=0)
+        fake_db = MagicMock()
+        fake_db.acquire = lambda: _Acquire(conn)
+
+        response = await _open_stream(
+            "thread-x",
+            _FakeRequest(last_event_id="3:0"),
+            _stream_deps(fake_db, auth),
         )
-        refresh = AsyncMock()
-        monkeypatch.setattr(om, "refresh_thread_presence", refresh)
+        iterator = response.body_iterator
+        assert await iterator.__anext__() == ": open\n\n"
+        # The first loop pass runs the renewal before it streams the row:
+        # every stateless stream is re-authorized, only a tethering caller
+        # writes presence.
+        assert "id: 3:1\n" in await iterator.__anext__()
+        await iterator.aclose()
 
-        response = await om.thread_event_stream("thread-x", _FakeRequest())
+        assert auth.await_count >= 2
+        if tethers:
+            assert refresh.await_args_list[0].kwargs["establish"] is True
+            assert refresh.await_count >= 2
+        else:
+            refresh.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_pinned_stream_never_touches_presence(self, monkeypatch):
+        from orchestrator.services import thread_event_stream as event_stream
+
+        refresh = AsyncMock()
+        monkeypatch.setattr(event_stream, "refresh_thread_presence", refresh)
+
+        response = await _open_stream(
+            "thread-x",
+            _FakeRequest(),
+            _stream_deps(
+                MagicMock(), AsyncMock(return_value=self._owner_row("pinned"))
+            ),
+        )
         iterator = response.body_iterator
         assert await iterator.__anext__() == ": open\n\n"
         await iterator.aclose()

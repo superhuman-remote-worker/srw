@@ -410,7 +410,7 @@ class TestAsyncCockpitClientPersistentThreads:
                 title="Research Session",
                 permission_mode="autonomous",
                 project_id="proj-1",
-                project_ids=["proj-1", "proj-2"],
+                project_ids=["proj-1"],
                 datasource_ids=[],
                 model="openai/gpt-4",
                 temperature=0.7,
@@ -421,7 +421,7 @@ class TestAsyncCockpitClientPersistentThreads:
             assert body["title"] == "Research Session"
             assert body["permission_mode"] == "autonomous"
             assert body["project_id"] == "proj-1"
-            assert body["project_ids"] == ["proj-1", "proj-2"]
+            assert body["project_ids"] == ["proj-1"]
             assert body["datasource_ids"] == []
             assert "use_datasource_defaults" not in body
             assert body["model"] == "openai/gpt-4"
@@ -610,6 +610,44 @@ async def test_list_datasources_tool_reports_full_ids_revisions_and_cursor():
 
 
 @pytest.mark.asyncio
+async def test_list_connector_drivers_tool_reports_levels_and_enforcement():
+    mock_client = AsyncMock()
+    mock_client.list_connector_drivers.return_value = {
+        "protocol_version": "1.0",
+        "drivers": [
+            {
+                "name": "srw.postgresql/v1",
+                "title": "PostgreSQL",
+                "legacy_type": "postgresql",
+                "plane": "harness",
+                "delivery_forms": ["managed_connection"],
+                "supported_backends": ["sandbox"],
+                "access_levels": [
+                    {
+                        "id": "ReadOnly",
+                        "enforced_by": "READ ONLY transaction",
+                        "advisory": False,
+                    }
+                ],
+                "trust": {"tier": "builtin", "claims_declared_by_author": False},
+            }
+        ],
+    }
+
+    with patch.object(_mcp_server_mod, "_get_client", return_value=mock_client):
+        result = await _mcp_server_mod.list_connector_drivers()
+
+    mock_client.list_connector_drivers.assert_awaited_once_with()
+    assert "srw.postgresql/v1" in result
+    assert "Access ReadOnly [enforced]: READ ONLY transaction" in result
+
+    mock_client.list_connector_drivers.side_effect = RuntimeError("down")
+    with patch.object(_mcp_server_mod, "_get_client", return_value=mock_client):
+        failed = await _mcp_server_mod.list_connector_drivers()
+    assert "list connector drivers" in failed
+
+
+@pytest.mark.asyncio
 async def test_get_datasource_tool_reports_exact_management_state():
     connector_id = "11111111-2222-4333-8444-555555555555"
     mock_client = AsyncMock()
@@ -669,6 +707,32 @@ async def test_update_datasource_tool_reports_new_policy_revision():
     assert "Policy revision: 8" in result
     assert "Availability scope: projects" in result
     assert "Projects: project-a" in result
+    assert "Notice" not in result
+
+
+@pytest.mark.asyncio
+async def test_update_datasource_tool_reports_each_notice():
+    """An edit that dropped a stored variable no connector may set says so,
+    one line per notice, as the cockpit does."""
+    mock_client = AsyncMock()
+    mock_client.update_datasource.return_value = {
+        "id": "connector-1",
+        "notices": [
+            "Dropped from the stored variables: NODE_OPTIONS is not a variable",
+            "Dropped from the stored variables: EDITOR is not a variable",
+        ],
+    }
+
+    with patch.object(_mcp_server_mod, "_get_client", return_value=mock_client):
+        result = await _mcp_server_mod.update_datasource(
+            "connector-1", credentials={"env_vars": {"VENDOR_TOKEN": "t"}}
+        )
+
+    lines = result.splitlines()
+    assert lines[1:] == [
+        "Notice: Dropped from the stored variables: NODE_OPTIONS is not a variable",
+        "Notice: Dropped from the stored variables: EDITOR is not a variable",
+    ]
 
 
 @pytest.mark.asyncio
@@ -706,6 +770,31 @@ async def test_reindex_summary_defaults_skipped_duplicates_for_older_payloads():
         result = await _mcp_server_mod.reindex_knowledge("project-1")
 
     assert "skipped_duplicates: 0" in result
+
+
+@pytest.mark.asyncio
+async def test_update_project_tool_names_the_stored_secrets_it_dropped():
+    """A read-modify-write through get_project + update_project that changes
+    an endpoint keeps none of the redacted secrets; the tool must say so."""
+    mock_client = AsyncMock()
+    mock_client.update_project.return_value = {
+        "status": "updated",
+        "dropped_hidden_keys": ["llm.api_key", "workspace.remote"],
+    }
+
+    with patch.object(_mcp_server_mod, "_get_client", return_value=mock_client):
+        result = await _mcp_server_mod.update_project(
+            "project-1", default_config_override={"llm": {"base_url": "https://x"}}
+        )
+
+    assert "llm.api_key" in result
+    assert "workspace.remote" in result
+
+    mock_client.update_project.return_value = {"status": "updated"}
+    with patch.object(_mcp_server_mod, "_get_client", return_value=mock_client):
+        result = await _mcp_server_mod.update_project("project-1", name="n")
+
+    assert result == "Project project-1 updated (updated)."
 
 
 class TestMcpPersistentThreadTools:
@@ -762,6 +851,54 @@ class TestMcpPersistentThreadTools:
             mock_client.create_persistent_thread.await_args.kwargs["datasource_ids"]
             == []
         )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "projects",
+        [
+            {"project_ids": ["proj-1", "proj-2"]},
+            {"project_id": "proj-1", "project_ids": ["proj-2"]},
+        ],
+        ids=["two_project_ids", "project_id_plus_another"],
+    )
+    async def test_create_persistent_thread_refuses_a_second_project(
+        self, mock_client, projects
+    ):
+        """Refused before the workspace lookup, which would otherwise search
+        without a project and could report a misleading 'no such template'."""
+        create_persistent_thread = _mcp_server_mod.create_persistent_thread
+
+        result = await create_persistent_thread(workspace="my-template", **projects)
+
+        assert result == (
+            "Refusing to create the session: A Session can belong to one "
+            "project at most. Pick one project, or none."
+        )
+        # The MCP image cannot import orchestrator code, so the words are
+        # repeated there; this keeps them equal to the server's 422 detail.
+        from orchestrator.services.thread_project_authorization import (
+            ONE_PROJECT_PER_SESSION_DETAIL,
+        )
+
+        assert result.endswith(ONE_PROJECT_PER_SESSION_DETAIL)
+        mock_client.create_persistent_thread.assert_not_awaited()
+        mock_client.list_manifest_resources.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_create_persistent_thread_same_project_in_both_fields_is_one(
+        self, mock_client
+    ):
+        create_persistent_thread = _mcp_server_mod.create_persistent_thread
+        mock_client.create_persistent_thread.return_value = {
+            "thread_id": "tid-3",
+            "status": "created",
+        }
+
+        await create_persistent_thread(project_id="proj-1", project_ids=["proj-1"])
+
+        kwargs = mock_client.create_persistent_thread.await_args.kwargs
+        assert kwargs["project_id"] == "proj-1"
+        assert kwargs["project_ids"] == ["proj-1"]
 
     @pytest.mark.asyncio
     async def test_create_persistent_thread_error(self, mock_client):

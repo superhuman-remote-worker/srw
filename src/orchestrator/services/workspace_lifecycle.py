@@ -8,9 +8,21 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, Literal, Optional
+from typing import Any, Awaitable, Literal, Optional
 
 OwnerKind = Literal["job", "session"]
+
+
+class SessionWorkspaceObservationYielded(RuntimeError):
+    """A Session creator yielded its locks without failing or becoming Ready."""
+
+
+async def run_session_workspace_creation(operation: Awaitable[object]) -> None:
+    """Consume a background creator's scheduling yield without claiming Ready."""
+    try:
+        await operation
+    except SessionWorkspaceObservationYielded:
+        return
 
 
 @dataclass(frozen=True)
@@ -72,16 +84,39 @@ _RESTORE_REQUIRED_STATUSES = {
 class EnsureResult:
     outcome: EnsureOutcome
     status: Optional[str] = None
+    mutation_required: bool = False
 
 
 async def _create(
     owner: "WorkspaceOwner",
     provisioner,
-    ws_config,
     *,
     stateless_creation_generation: str | None = None,
     allow_stateless_create: bool = False,
     pinned_runtime_lock_held: bool = False,
+    fail_on_exited_container: bool = False,
+) -> "EnsureResult":
+    try:
+        return await _create_or_yield(
+            owner,
+            provisioner,
+            stateless_creation_generation=stateless_creation_generation,
+            allow_stateless_create=allow_stateless_create,
+            pinned_runtime_lock_held=pinned_runtime_lock_held,
+            fail_on_exited_container=fail_on_exited_container,
+        )
+    except SessionWorkspaceObservationYielded:
+        return EnsureResult(EnsureOutcome.PENDING, status="pending")
+
+
+async def _create_or_yield(
+    owner: "WorkspaceOwner",
+    provisioner,
+    *,
+    stateless_creation_generation: str | None = None,
+    allow_stateless_create: bool = False,
+    pinned_runtime_lock_held: bool = False,
+    fail_on_exited_container: bool = False,
 ) -> "EnsureResult":
     strict_kwargs: dict[str, Any] = {}
     if stateless_creation_generation is not None:
@@ -89,19 +124,20 @@ async def _create(
             "stateless_creation_generation": stateless_creation_generation,
             "allow_stateless_create": allow_stateless_create,
         }
+    if fail_on_exited_container and owner.kind == "job":
+        strict_kwargs["fail_on_exited_container"] = True
     if owner.kind == "session" and stateless_creation_generation is None:
         pinned_create = getattr(provisioner, "create_pinned_thread_workspace", None)
         if not callable(pinned_create):
             ok = False
         else:
-            pinned_kwargs = dict(ws_config or {})
+            pinned_kwargs: dict[str, Any] = {}
             if pinned_runtime_lock_held:
                 pinned_kwargs["runtime_lock_held"] = True
             ok = await pinned_create(owner.id, **pinned_kwargs)
     else:
         ok = await provisioner.create_workspace(
             owner,
-            **(ws_config or {}),
             **strict_kwargs,
         )
     return EnsureResult(
@@ -115,7 +151,6 @@ async def _ensure_existing_runtime(
     *,
     provisioner,
     current_status: Optional[str],
-    ws_config: Optional[dict],
     expected_runtime_incarnation: str,
     stateless_creation_generation: str | None,
 ) -> "EnsureResult":
@@ -154,7 +189,6 @@ async def _ensure_existing_runtime(
                 owner,
                 generation=stateless_creation_generation,
                 expected_runtime_incarnation=expected_runtime_incarnation,
-                **(ws_config or {}),
             )
         except Exception:
             return EnsureResult(EnsureOutcome.PENDING, status=current_status)
@@ -180,7 +214,6 @@ async def _ensure_existing_runtime(
         return await _create(
             owner,
             provisioner,
-            ws_config,
             stateless_creation_generation=generation,
             allow_stateless_create=True,
         )
@@ -202,7 +235,6 @@ async def _ensure_existing_runtime(
                 return await _create(
                     owner,
                     provisioner,
-                    ws_config,
                     stateless_creation_generation=stateless_creation_generation,
                     allow_stateless_create=True,
                 )
@@ -329,7 +361,6 @@ async def ensure_workspace(
     provisioner,
     suspension,
     current_status: Optional[str],
-    ws_config: Optional[dict] = None,
     expected_runtime_incarnation: Optional[str] = None,
     require_runtime_incarnation: bool = False,
     snapshot_restore_required: Any = False,
@@ -338,6 +369,8 @@ async def ensure_workspace(
     allow_stateless_create: bool = False,
     stateless_creation_refused: bool = False,
     pinned_runtime_lock_held: bool = False,
+    recreate_missing: bool = True,
+    fail_on_exited_container: bool = False,
 ) -> "EnsureResult":
     """Idempotently drive owner's workspace toward 'ready'. Owner-agnostic
     extraction of the job dispatcher's container branch (main.py).
@@ -355,7 +388,12 @@ async def ensure_workspace(
       the exact terminal UID is deleted with a UID precondition and recreated;
       absence, replacement, and ambiguity fail closed without effects.
     * Legacy/non-incarnation 'ready' rows retain their phase-only liveness
-      probe for compatibility.
+      probe for compatibility. ``recreate_missing=False`` lets the dispatcher
+      defer that legacy fallback to its bounded mutation lane; it does not
+      alter the strict incarnation or creation-authority paths above it.
+    * ``fail_on_exited_container`` is only for a caller that fails the Job on
+      FAILED (the dispatcher): a Job create whose container exits before
+      Ready then reports FAILED at once. Other callers keep the legacy wait.
     """
     s = current_status
     if stateless_creation_refused:
@@ -401,7 +439,6 @@ async def ensure_workspace(
             owner,
             provisioner=provisioner,
             current_status=s,
-            ws_config=ws_config,
             expected_runtime_incarnation=expected_runtime_incarnation,
             stateless_creation_generation=stateless_creation_generation,
         )
@@ -412,10 +449,10 @@ async def ensure_workspace(
         return await _create(
             owner,
             provisioner,
-            ws_config,
             stateless_creation_generation=stateless_creation_generation,
             allow_stateless_create=allow_stateless_create,
             pinned_runtime_lock_held=pinned_runtime_lock_held,
+            fail_on_exited_container=fail_on_exited_container,
         )
     if require_runtime_incarnation and s in ("suspended", "restoring"):
         # Stateless restore is authorized only by the exact-true marker handled
@@ -429,7 +466,6 @@ async def ensure_workspace(
             return await _create(
                 owner,
                 provisioner,
-                ws_config,
                 stateless_creation_generation=stateless_creation_generation,
                 allow_stateless_create=allow_stateless_create,
                 pinned_runtime_lock_held=pinned_runtime_lock_held,
@@ -450,7 +486,6 @@ async def ensure_workspace(
         return await _create(
             owner,
             provisioner,
-            ws_config,
             stateless_creation_generation=stateless_creation_generation,
             allow_stateless_create=allow_stateless_create,
             pinned_runtime_lock_held=pinned_runtime_lock_held,
@@ -463,7 +498,6 @@ async def ensure_workspace(
         return await _create(
             owner,
             provisioner,
-            ws_config,
             pinned_runtime_lock_held=pinned_runtime_lock_held,
         )
     # "Already progressing" set — keep in sync with the NOT IN clause in
@@ -481,6 +515,12 @@ async def ensure_workspace(
             else:
                 live = await probe(owner)
             if live is False:
+                if not recreate_missing:
+                    # A dispatcher ready-check may discover drift, but only
+                    # its bounded mutation lane may enter creation.
+                    return EnsureResult(
+                        EnsureOutcome.PENDING, status=s, mutation_required=True
+                    )
                 if (
                     require_runtime_incarnation
                     and stateless_creation_generation is None
@@ -489,10 +529,10 @@ async def ensure_workspace(
                 return await _create(
                     owner,
                     provisioner,
-                    ws_config,
                     stateless_creation_generation=stateless_creation_generation,
                     allow_stateless_create=allow_stateless_create,
                     pinned_runtime_lock_held=pinned_runtime_lock_held,
+                    fail_on_exited_container=fail_on_exited_container,
                 )
         return EnsureResult(EnsureOutcome.READY, status="ready")
     # Unknown / unexpected status — wait (the dispatcher skips and retries).

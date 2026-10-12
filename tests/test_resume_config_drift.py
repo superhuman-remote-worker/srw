@@ -51,7 +51,10 @@ def _discard_background_task(coroutine):
 def _patch_caller_and_db(user: dict, db):
     stack = ExitStack()
     stack.enter_context(
-        patch("orchestrator.main.require_approved_user", AsyncMock(return_value=user))
+        patch(
+            "orchestrator.security.auth.require_approved_user",
+            AsyncMock(return_value=user),
+        )
     )
     stack.enter_context(
         patch(
@@ -59,7 +62,7 @@ def _patch_caller_and_db(user: dict, db):
             AsyncMock(return_value=user),
         )
     )
-    stack.enter_context(patch("orchestrator.main.postgres_db", db))
+    stack.enter_context(patch("orchestrator.main.app.state.resources.postgres_db", db))
     # Past the drift gate, resume_thread reprovisions an agent and
     # provisions/reuses the session's cloud folder — machinery this file has
     # no interest in exercising. Keep it inert and deterministic rather than
@@ -67,21 +70,25 @@ def _patch_caller_and_db(user: dict, db):
     # the box the tests happen to run on.
     stack.enter_context(
         patch(
-            "orchestrator.main.agent_provisioner", SimpleNamespace(is_available=False)
-        )
-    )
-    stack.enter_context(
-        patch(
-            "orchestrator.main.persistent_provisioner",
+            "orchestrator.services.agent_provisioner.agent_provisioner",
             SimpleNamespace(is_available=False),
         )
     )
     stack.enter_context(
-        patch("orchestrator.main.ensure_session_workspace", AsyncMock())
+        patch(
+            "orchestrator.services.persistent_provisioner.persistent_provisioner",
+            SimpleNamespace(is_available=False),
+        )
     )
     stack.enter_context(
         patch(
-            "orchestrator.main.asyncio.create_task",
+            "orchestrator.services.session_provisioner.ensure_session_workspace",
+            AsyncMock(),
+        )
+    )
+    stack.enter_context(
+        patch(
+            "asyncio.create_task",
             side_effect=_discard_background_task,
         )
     )
@@ -128,6 +135,33 @@ def _fake_drift(items: list[DriftItem]) -> AsyncMock:
 
 class TestResumeConfigDrift:
     @pytest.mark.asyncio
+    async def test_native_resume_announces_successor_without_cockpit_prepare(
+        self, user_a, thread_a, fake_db, fake_request
+    ):
+        from tests._b09_control_seams import resume_thread
+
+        thread = _ended_thread(thread_a)
+        thread["metadata"] = {"config_override": {"workspace": {"backend": "vm"}}}
+        with (
+            _patch_caller_and_db(user_a, fake_db),
+            patch(
+                "orchestrator.services.thread_resume.thread_config_drift",
+                _fake_drift([]),
+            ),
+            patch("orchestrator.services.session_lifecycle.emit") as emit,
+        ):
+            result = await resume_thread(str(thread["id"]), fake_request)
+
+        assert result["status"] == "created"
+        emit.assert_called_once_with(
+            str(user_a["id"]),
+            str(thread["id"]),
+            "provisioning",
+            session_runtime_generation=RESUMED_RUNTIME_GENERATION,
+            backend="vm",
+        )
+
+    @pytest.mark.asyncio
     async def test_drift_returns_428_and_does_not_mutate(
         self, user_a, thread_a, fake_db, fake_request
     ):
@@ -140,7 +174,7 @@ class TestResumeConfigDrift:
 
         with _patch_caller_and_db(user_a, fake_db):
             with patch(
-                "orchestrator.main.thread_resume_operations.thread_config_drift",
+                "orchestrator.services.thread_resume.thread_config_drift",
                 _fake_drift(drift),
             ):
                 with pytest.raises(HTTPException) as exc:
@@ -179,7 +213,7 @@ class TestResumeConfigDrift:
 
         with _patch_caller_and_db(user_a, fake_db):
             with patch(
-                "orchestrator.main.thread_resume_operations.thread_config_drift",
+                "orchestrator.services.thread_resume.thread_config_drift",
                 _fake_drift(drift),
             ):
                 result = await resume_thread(
@@ -209,7 +243,7 @@ class TestResumeConfigDrift:
 
         with _patch_caller_and_db(user_a, fake_db):
             with patch(
-                "orchestrator.main.thread_resume_operations.thread_config_drift",
+                "orchestrator.services.thread_resume.thread_config_drift",
                 _fake_drift(drift),
             ):
                 with pytest.raises(HTTPException) as exc:
@@ -254,7 +288,7 @@ class TestResumeConfigDrift:
 
         with _patch_caller_and_db(user_a, fake_db):
             with patch(
-                "orchestrator.main.thread_resume_operations.thread_config_drift",
+                "orchestrator.services.thread_resume.thread_config_drift",
                 _fake_drift(drift),
             ):
                 result = await resume_thread(
@@ -296,7 +330,7 @@ class TestResumeConfigDrift:
 
         with _patch_caller_and_db(user_a, fake_db):
             with patch(
-                "orchestrator.main.thread_resume_operations.thread_config_drift",
+                "orchestrator.services.thread_resume.thread_config_drift",
                 _fake_drift(drift),
             ):
                 result = await resume_thread(thread_id, fake_request)
@@ -324,7 +358,7 @@ class TestResumeConfigDrift:
 
         with _patch_caller_and_db(user_a, fake_db):
             with patch(
-                "orchestrator.main.thread_resume_operations.thread_config_drift",
+                "orchestrator.services.thread_resume.thread_config_drift",
                 _fake_drift(drift),
             ):
                 with pytest.raises(HTTPException) as exc:
@@ -353,7 +387,7 @@ class TestResumeConfigDrift:
 
         with _patch_caller_and_db(user_a, fake_db):
             with patch(
-                "orchestrator.main.thread_resume_operations.thread_config_drift",
+                "orchestrator.services.thread_resume.thread_config_drift",
                 _fake_drift([]),
             ):
                 result = await resume_thread(thread_id, fake_request)
@@ -376,7 +410,7 @@ class TestResumeConfigDrift:
 
         with _patch_caller_and_db(user_a, fake_db):
             with patch(
-                "orchestrator.main.thread_resume_operations.thread_config_drift",
+                "orchestrator.services.thread_resume.thread_config_drift",
                 drift_probe,
             ):
                 with pytest.raises(HTTPException) as exc:
@@ -412,7 +446,7 @@ class TestResumeConfigDrift:
 
         with _patch_caller_and_db(user_a, fake_db):
             with patch(
-                "orchestrator.main._resolve_session_config",
+                "orchestrator.services.session_config_resolution.resolve_session_config",
                 AsyncMock(side_effect=RuntimeError("boom")),
             ):
                 with pytest.raises(HTTPException) as exc:
@@ -462,11 +496,11 @@ class TestResumeConfigDrift:
         with _patch_caller_and_db(user_admin, fake_db):
             with (
                 patch(
-                    "orchestrator.main._thread_project_ids",
+                    "orchestrator.services.thread_mount_rows.thread_project_ids",
                     AsyncMock(return_value=[project_id]),
                 ),
                 patch(
-                    "orchestrator.main._resolve_session_config",
+                    "orchestrator.services.session_config_resolution.resolve_session_config",
                     AsyncMock(return_value=None),
                 ),
             ):
@@ -521,7 +555,7 @@ class TestResumeConfigDrift:
 
         with _patch_caller_and_db(user_a, fake_db):
             with patch(
-                "orchestrator.main._resolve_session_config",
+                "orchestrator.services.session_config_resolution.resolve_session_config",
                 AsyncMock(return_value=None),
             ):
                 with pytest.raises(HTTPException) as exc:
@@ -532,3 +566,35 @@ class TestResumeConfigDrift:
         assert DS_CORRUPT not in str(exc.value.detail)
         fake_db.resume_thread.assert_not_awaited()
         fake_db.record_thread_config_drift_ack.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_retained_creation_wait_preserves_ended_and_does_not_schedule_resume(
+    user_a, thread_a, fake_db, fake_request, monkeypatch
+):
+    from datetime import datetime, timezone
+    from tests._b09_control_seams import resume_thread
+
+    thread = _ended_thread(thread_a)
+    thread["execution_lane"] = "pinned"
+    until = datetime.now(timezone.utc)
+
+    async def pending_fence(self, thread_id):
+        assert thread_id == str(thread["id"])
+        return {"gc_after": until}
+
+    monkeypatch.setattr(
+        type(fake_db), "get_pinned_retained_creation_wait", pending_fence, raising=False
+    )
+    with _patch_caller_and_db(user_a, fake_db):
+        with patch(
+            "orchestrator.services.thread_resume.thread_config_drift", _fake_drift([])
+        ):
+            with pytest.raises(HTTPException) as refused:
+                await resume_thread(str(thread["id"]), fake_request)
+    assert refused.value.status_code == 409
+    assert refused.value.detail["code"] == "workspace_predecessor_cleanup_pending"
+    assert refused.value.detail["retry_after"] == until.isoformat()
+    assert thread["status"] == "ended"
+    assert thread["runtime_generation"] == ENDED_RUNTIME_GENERATION
+    fake_db.resume_thread.assert_not_awaited()

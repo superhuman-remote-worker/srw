@@ -46,6 +46,8 @@ def deps():
         store=SimpleNamespace(
             get_user=AsyncMock(return_value={"default_project_id": PROJECT}),
             get_project=AsyncMock(return_value={"id": PROJECT}),
+            # No project_workspace_defaults row: the installation decides.
+            fetchrow=AsyncMock(return_value=None),
         ),
         require_project_access=AsyncMock(),
         bundled_expert_exists=Mock(return_value=True),
@@ -54,6 +56,8 @@ def deps():
         resolve_worker_expert=AsyncMock(
             return_value=ExpertSelection({"id": EXPERT}, "application")
         ),
+        preview_expert_refusals=AsyncMock(return_value=[]),
+        srw_image=Mock(return_value="installed:1"),
     )
 
 
@@ -304,12 +308,14 @@ async def test_legacy_project_default_only_applies_in_disabled_db_root_mode(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("as_json", [False, True])
-async def test_override_precedence_null_removal_and_workspace_request_are_preserved(
-    deps, scope, as_json
-):
+async def test_override_precedence_and_null_removal_are_preserved(deps, scope, as_json):
     project_override = {
         "llm": {"model": "project", "temperature": 0.2},
         "extra": {"keep": True, "remove": 1},
+        # Slice A2b: a legacy Project's stored workspace backend no longer
+        # leaks through this merge; the workspace defaults chain resolves it
+        # instead (here: the shipped installation default, since this
+        # fixture's store never returns a project_workspace_defaults row).
         "workspace": {"backend": "vm"},
         "items": [1, 2],
     }
@@ -334,7 +340,7 @@ async def test_override_precedence_null_removal_and_workspace_request_are_preser
     assert result.config_override == {
         "llm": {"model": "request", "temperature": 0.2},
         "extra": {"keep": True, "request": True},
-        "workspace": {"backend": "vm"},
+        "workspace": {"backend": "sandbox"},
         "items": [4],
     }
     assert result.requested_workspace_backend is None
@@ -419,7 +425,9 @@ async def test_interleaved_preparations_keep_dependency_and_context_isolation(
     second_deps = replace(
         deps,
         store=SimpleNamespace(
-            get_user=AsyncMock(), get_project=AsyncMock(return_value={"id": PARENT})
+            get_user=AsyncMock(),
+            get_project=AsyncMock(return_value={"id": PARENT}),
+            fetchrow=AsyncMock(return_value=None),
         ),
         require_project_access=AsyncMock(),
         resolve_worker_expert=AsyncMock(
@@ -471,3 +479,171 @@ async def test_two_authored_workspace_selections_remain_an_error(deps, scope):
             config_override={"workspace": {"backend": "sandbox"}},
         )
     assert denied.value.status_code == 422
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("origin", ["user_rest", "internal_rest"])
+async def test_a_root_job_in_a_plain_project_reaches_the_resolver(
+    deps, scope, origin, monkeypatch
+):
+    deps.store.get_project.return_value = {"id": PROJECT, "manifest_composed": False}
+    calls = []
+
+    async def fake_select(db, user, **kwargs):
+        calls.append(kwargs)
+        return {"backend": "sandbox"}, {
+            "sources": {"tier": "installation", "template": "builtin"}
+        }
+
+    monkeypatch.setattr(
+        "orchestrator.services.manifest_workspace_selection.select_execution_workspace",
+        fake_select,
+    )
+    result = await prepare(deps, scope, origin=origin)
+    assert calls and calls[0]["supplied"] is False
+    assert result.workspace_selection["sources"]["tier"] == "installation"
+
+
+# --------------------------------------------------------------------------- #
+# Inline experts (creation UI slice S2)
+# --------------------------------------------------------------------------- #
+
+
+def inline_expert(**runtime):
+    return {
+        "inline": {
+            "runtime": {
+                "adapter": "srw/v1",
+                "config": {
+                    "config": {"llm": {"model": "gpt-4o"}},
+                    "prompts": {"persona": "A plain helper."},
+                },
+                **runtime,
+            }
+        }
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("origin", ["user_rest", "internal_rest"])
+async def test_inline_expert_is_the_callers_choice_without_catalogue_identity(
+    deps, scope, origin
+):
+    result = await prepare(
+        deps,
+        scope,
+        origin=origin,
+        expert=inline_expert(),
+        expert_based_on="developer",
+    )
+    assert result.expert_row == {
+        "expert_type": "worker",
+        "config": {"llm": {"model": "gpt-4o"}},
+        "prompts": {"persona": "A plain helper."},
+        "harness_config_layers": [],
+        "harness_asset_name": None,
+        "harness_config_name": None,
+    }
+    assert "manifest_uid" not in result.expert_row and "id" not in result.expert_row
+    assert result.expert_id is None
+    assert result.config_name == "worker_base"
+    # A caller choice: no project/personal/application default displaces it.
+    assert result.expert_source == "caller"
+    deps.resolve_worker_expert.assert_not_awaited()
+    deps.bundled_expert_exists.assert_not_called()
+    assert result.context["expert_selection"] == {"source": "inline"}
+    assert result.context["expert_based_on"] == "developer"
+
+
+@pytest.mark.asyncio
+async def test_expert_based_on_is_recorded_only_for_an_inline_expert(deps, scope):
+    result = await prepare(
+        deps,
+        scope,
+        expert="developer",
+        expert_based_on="scholar",
+        context={"expert_based_on": "forged-by-context"},
+    )
+    assert result.expert_row is None
+    assert result.config_name == "developer"
+    assert "expert_based_on" not in result.context
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "selector",
+    [{"expert_id": EXPERT}, {"config_name": "developer"}],
+    ids=["expert_id", "config_name"],
+)
+async def test_inline_expert_cannot_be_combined_with_a_catalogue_selector(
+    deps, scope, selector
+):
+    with pytest.raises(HTTPException) as refused:
+        await prepare(deps, scope, expert=inline_expert(), **selector)
+    assert refused.value.status_code == 400
+    assert "inline expert" in refused.value.detail
+    deps.resolve_worker_expert.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_inline_base_alias_config_name_is_not_a_conflict(deps, scope):
+    result = await prepare(deps, scope, expert=inline_expert(), config_name="defaults")
+    assert result.expert_row is not None and result.config_name == "worker_base"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "image,accepted",
+    [("installed:1", True), ("example.invalid/other:1", False), (None, False)],
+)
+async def test_inline_image_must_be_the_installed_harness(deps, scope, image, accepted):
+    expert = inline_expert(image=image)
+    if accepted:
+        result = await prepare(deps, scope, expert=expert)
+        assert result.expert_row is not None
+        return
+    with pytest.raises(HTTPException) as refused:
+        await prepare(deps, scope, expert=expert)
+    assert refused.value.status_code == 422
+    assert "installed harness" in refused.value.detail
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "private,fragment",
+    [
+        ({"prompts": {"system": "Replace the scaffold."}}, "Unknown prompt keys"),
+        (
+            {"prompts": {"persona": "Hi {prompt_content}"}},
+            "reserved prompt placeholders",
+        ),
+        ({"config": {"llm": {"api_key": "sk-caller"}}}, "credential"),
+        ({"config": {"workspace": {"remote": {"host": "x"}}}}, "runtime authority"),
+        ({"layers": [{"env_keys": {"K": "v"}}]}, "credential"),
+        ({"asset_name": "../../etc"}, "asset"),
+        ({"asset_name": "no-such-installed-asset"}, "installed assets"),
+        ({"config_name": "bad name; rm -rf /"}, None),
+    ],
+)
+async def test_inline_content_passes_the_expert_write_gates(
+    deps, scope, private, fragment
+):
+    expert = inline_expert()
+    expert["inline"]["runtime"]["config"].update(private)
+    with pytest.raises(HTTPException) as refused:
+        await prepare(deps, scope, expert=expert)
+    assert 400 <= refused.value.status_code < 500
+    if fragment:
+        assert fragment in str(refused.value.detail)
+    deps.resolve_worker_expert.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_inline_tool_vocabulary_smuggling_is_refused(deps, scope):
+    expert = inline_expert()
+    expert["inline"]["runtime"]["config"]["config"] = {
+        "tools": {"canvas": ["run_command"]}
+    }
+    with pytest.raises(HTTPException) as refused:
+        await prepare(deps, scope, expert=expert)
+    assert 400 <= refused.value.status_code < 500

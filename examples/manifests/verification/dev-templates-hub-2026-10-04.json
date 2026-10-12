@@ -1,0 +1,255 @@
+{
+  "date": "2026-10-04",
+  "slice": "A3: workspace templates in the cockpit and over MCP",
+  "commitRange": "62c40de2d..5f3c6dde7",
+  "commit": "orchestrator/agents/MCP 010d7218b, cockpit 5f3c6dde7",
+  "stack": "shared dev (kubectl context main, namespace superhuman-remote-worker), Helm release superhuman-remote-worker-deployment rev 1101 (chart srw-dev-0.0.1157, appVersion sha-2350724); CI component-sha images; VMs on (KubeVirt v1.8.4)",
+  "caller": "REST through orchestrator pod srw-orchestrator-64c9b65869-nrpw5 with X-Internal-Key + X-MCP-User-Id (helper /tmp/srw_dev.py from templates_slice_a_deferred_tests 'Calling the dev API', removed afterwards), impersonating the owner's dev admin 52b14734-ed8c-464b-a045-4de8c36a18f1 (T1 impersonated two non-admin users, GET only); MCP tools called in srw-mcp-5545886d78-h7xtv through mcp.call_tool with _get_mcp_caller_ctx bound to the same admin; DB reads through the helper's SELECT-only path; audit reads (read-only transaction) on the audit database",
+  "approval": "Owner approved D1-D4, including exactly one VM, on 2026-10-04",
+  "preChecks": {
+    "runningImages": {
+      "orchestrator": "ghcr.io/superhuman-remote-worker/srw-orchestrator:sha-010d721 (both replicas, started 19:04:44Z)",
+      "agent": "ghcr.io/superhuman-remote-worker/srw-agent:sha-010d721 (stateless pool and pinned pods)",
+      "cockpit": "ghcr.io/superhuman-remote-worker/srw-cockpit:sha-5f3c6dd",
+      "mcp": "ghcr.io/superhuman-remote-worker/srw-mcp@sha256:46ed78cdad6c636c77715d9e26af9f7014cd6795f112eaa3a1515bbf4d950065 (/health source_revision 010d7218b1b6b59300fef71047ab59e103694770)",
+      "vmController": "ghcr.io/superhuman-remote-worker/srw-vm-controller:sha-010d721",
+      "workspace": "WORKSPACE_IMAGE ghcr.io/superhuman-remote-worker/srw-workspace:sha-fe4d5e1 (image.workspace.tag and image.workspaceMinimal.tag sha-fe4d5e1: CI rebuilds the workspace images only when their inputs change)",
+      "vmDefault": "vm-controller DEFAULT_VM_IMAGE ghcr.io/superhuman-remote-worker/srw-agent-vm-base:sha-6b9a1ad"
+    },
+    "runningCode": "md5 of src/mcp_server/server.py, shared/orch_surface/workspace_choice.py, jobs/control.py and client.py in the MCP pod equal the tree at 010d7218b; workspace_choice.py equal in the orchestrator and an agent pod",
+    "helmValues": "read-only: workspace.customImages.privileged false (orchestrator env WORKSPACE_CUSTOM_IMAGES_PRIVILEGED=false), WORKSPACE_FUSE_PRIVILEGED=true, WORKSPACE_TRUSTED_IMAGE_REPOSITORIES [srw-workspace-minimal:sha-fe4d5e1], builtinTemplates.vmResources 8 / 16Gi / 30Gi. Not modified.",
+    "model": "Jobs ran with config_override {llm: {model: gpt-6-sol}, scholar: {enabled: false}} (scholar off to keep each Job to one agent)"
+  },
+  "checks": [
+    {
+      "check": "D1.T1",
+      "name": "R19: non-admin owner edits the personal Project's workspace defaults and is offered Account templates; an editor elsewhere is not",
+      "request": "GET /api/projects/{id}/workspace-defaults as the non-admin user (X-MCP-User-Id)",
+      "ids": {
+        "user": "6bd04c7f-108c-4dce-a31a-6f17124b8efd (non-admin, approved)",
+        "personalProject": "eb23fb82-cd8e-4abb-a32e-3b63feb7c326",
+        "editorProject": "dea407ad-5f6c-42c0-a3e0-c164dca5372e (Compliance; role editor)",
+        "secondOwner": "909a1b8a-c6e6-431e-a0b7-dab8450582cd (srwtest@proton.me), personal fa9db572-f86b-47e6-9945-fde3a11b8279, owned non-personal 189082b8-75c6-4757-b015-9468fd845a4a"
+      },
+      "result": "pass",
+      "observed": {
+        "step1": "SELECT found 19 non-admin approved users with a personal Project; no non-admin is a viewer anywhere, so an editor membership was used. srwtest owns all its Projects, so a second user covered step 3",
+        "step2": "personal eb23fb82-...: 200, can_edit true, account_templates true, managed_by_manifest false",
+        "step3": "Compliance dea407ad-... (editor): 200, can_edit false, account_templates false",
+        "extra": "srwtest personal fa9db572-...: can_edit true, account_templates true; srwtest's owned non-personal 189082b8-...: can_edit true, account_templates false (only a personal Project offers Account templates as defaults)",
+        "step4": "not run (browser login as a non-admin)"
+      }
+    },
+    {
+      "check": "D1.builtins",
+      "name": "Catalog/shared lists the four installation-managed built-ins pinned to the deployed images",
+      "request": "GET /api/resources?kind=WorkspaceTemplate&scope_kind=Catalog&scope_name=shared",
+      "result": "pass",
+      "observed": {
+        "count": 4,
+        "container-full": "uid 0a06fe24-22ae-4fe4-9878-f3d248564c7a rv 2, installationManaged true, sandbox, ghcr.io/superhuman-remote-worker/srw-workspace:sha-fe4d5e1, 2 CPU / 4Gi, requests 0.5 / 1Gi",
+        "container-minimal": "uid 332c84df-65df-42b5-8759-77008d1680db rv 2, installationManaged true, sandbox, ghcr.io/superhuman-remote-worker/srw-workspace-minimal:sha-fe4d5e1, 2 CPU / 4Gi, requests 0.5 / 1Gi",
+        "virtual": "uid 033b2e36-8ccb-4d4a-9dd0-af8d6c27d82f rv 1, installationManaged true, virtual, no image",
+        "vm-full": "uid c76fbc0c-e9f5-44ea-b292-975938aa1866 rv 1, installationManaged true, vm, ghcr.io/superhuman-remote-worker/srw-agent-vm-base:sha-6b9a1ad, 8 CPU / 16Gi / 30Gi",
+        "pinning": "The container images equal WORKSPACE_IMAGE / image.workspaceMinimal (sha-fe4d5e1) and vm-full equals DEFAULT_VM_IMAGE (sha-6b9a1ad); they match WORKSPACE_BUILTIN_TEMPLATES in the orchestrator env. They are not sha-010d721 because CI tags images per component and the workspace/VM images were last rebuilt at fe4d5e1/6b9a1ad."
+      }
+    },
+    {
+      "check": "D1.mcp",
+      "name": "Dev MCP server: schema revision 14 and the workspace property on the three create tools",
+      "request": "GET http://localhost:8000/health in the srw-mcp pod; /app/tool-schema.json (the artifact /health compares with the live tools/list)",
+      "result": "pass",
+      "observed": {
+        "health": "status healthy, tool_schema_revision 14, tool_count 122, source_revision 010d7218b1b6..., schema_artifact_status match (live tools/list equals the artifact), digest sha256:fbfeb4a69e9d...",
+        "workspaceProperty": "create_job, create_project_job, create_persistent_thread: anyOf [string, object, null], default null, with the A3 description (create_job adds 'A child job inherits its parent's workspace and can't set this.'; create_persistent_thread says inline recipes are refused)"
+      }
+    },
+    {
+      "check": "D2.templateJob",
+      "name": "Mine container template on the deployed minimal image; a Job bound to it by ref",
+      "request": "POST /api/manifests/apply WorkspaceTemplate a3-dev-lean (Account/me, sandbox, image ghcr.io/superhuman-remote-worker/srw-workspace-minimal:sha-fe4d5e1 read from container-minimal, 1 CPU / 2Gi / 15Gi); POST /api/jobs {project_id: personal, user_id, workspace: {template: {ref: {name: a3-dev-lean, scope: {kind: Account, name: 52b14734-ed8c-464b-a045-4de8c36a18f1}}}}, config_override}",
+      "ids": {
+        "template": "64c14dae-1f4d-4b1b-b29f-2b568e01deb6",
+        "job": "e4c7e2f6-ca81-4a88-ad23-4d396020d9a4",
+        "project": "a9eae0b7-498d-409d-9573-ad3830dcb893"
+      },
+      "result": "pass",
+      "observed": {
+        "apply": "200, stored scope Account/52b14734-ed8c-464b-a045-4de8c36a18f1, resourceVersion 1, installationManaged false",
+        "create": "200, workspace_contract requested sandbox, assigned sandbox, assignment_source request; execution_lane stateless",
+        "pod": "workspace-e4c7e2f6-ca8 Running ~20 s after create: image ghcr.io/superhuman-remote-worker/srw-workspace-minimal:sha-fe4d5e1, limits cpu 1 / memory 2Gi, requests cpu 250m / memory 2Gi; privileged true with SYS_ADMIN and /dev/fuse (SRW's trusted repository, as expected)",
+        "storage": "PVC pvc-workspace-e4c7e2f6-ca8 15Gi Bound; df in the pod: /home/agent-host 15G",
+        "context.workspace_sources": {
+          "tier": "explicit",
+          "template": "explicit",
+          "template_name": null
+        },
+        "config_override.workspace (server-written)": {
+          "backend": "sandbox",
+          "sandbox": {
+            "cpu": 1,
+            "image": "ghcr.io/superhuman-remote-worker/srw-workspace-minimal:sha-fe4d5e1",
+            "memory": "2Gi",
+            "storage": "15Gi",
+            "pull_policy": "IfNotPresent"
+          }
+        },
+        "run": "reached pending_review. The worker had no shell tool on dev ('shell unavailable'), so it couldn't run the commands; sizes were read with kubectl instead"
+      }
+    },
+    {
+      "check": "D2.mcpName",
+      "name": "MCP create_project_job with workspace='a3-dev-lean' admits on that template",
+      "request": "mcp.call_tool('create_project_job', {project_id: personal, description, workspace: 'a3-dev-lean', config_override})",
+      "ids": {
+        "job": "5e9729ed-dbdb-4920-b73d-19443539bc7e"
+      },
+      "result": "pass",
+      "observed": {
+        "lookups": "GET /api/resources Project/a9eae0b7-... (miss), Account/me (hit); then POST /api/projects/a9eae0b7-.../jobs 200",
+        "toolResult": "Job created successfully ... Workspace: requested=sandbox, assigned=sandbox, effective=pending",
+        "pod": "workspace-5e9729ed-dbd: image ...srw-workspace-minimal:sha-fe4d5e1, limits cpu 1 / memory 2Gi, requests 250m / 2Gi; PVC 15Gi (df 15G)",
+        "context.workspace_sources": {
+          "tier": "explicit",
+          "template": "explicit",
+          "template_name": null
+        },
+        "run": "reached pending_review"
+      }
+    },
+    {
+      "check": "D2.mcpNone",
+      "name": "MCP create_project_job with workspace='none' gives backend none",
+      "request": "mcp.call_tool('create_project_job', {..., workspace: 'none'})",
+      "ids": {
+        "job": "31dec365-00b0-40dc-8ffe-8c4edfd86a34"
+      },
+      "result": "pass",
+      "observed": {
+        "lookups": "none (no GET /api/resources); POST /api/projects/a9eae0b7-.../jobs 200",
+        "toolResult": "Workspace: requested=none, assigned=none, effective=none",
+        "job": "config_override.workspace {backend: none}; _workspace_contract assigned_backend none; workspace_sources explicit; dispatch log 'using lite workspace (backend=none, no pod)'; no workspace pod",
+        "runtime": "NOT A3: the Job then failed 9 s into its run (lane pinned) with 'Failed to clone job workspace repo 'job-31dec365' - refusing to fall back to a disconnected git init (work would be lost on teardown). Check repository reachability from this backend.' See outOfScopeFindings[0]."
+      }
+    },
+    {
+      "check": "D2.mcpUnknown",
+      "name": "MCP create_project_job with an unknown name is refused naming manifest_list; nothing created",
+      "request": "mcp.call_tool('create_project_job', {..., workspace: 'a3-no-such-template'})",
+      "result": "pass",
+      "observed": {
+        "toolResult": "Refusing to create job: No workspace template named 'a3-no-such-template' is visible here; list them with manifest_list kind=WorkspaceTemplate.",
+        "lookups": "3 GET /api/resources (Project, Account, Catalog); no POST",
+        "nothingCreated": "SELECT count(*) FROM jobs WHERE user_id=admin: 739 before and after; 0 rows with the probe description"
+      }
+    },
+    {
+      "check": "D2.child422",
+      "name": "Agent create_job with workspace from inside a Job gets the server's child-job 422; no child is created",
+      "request": "POST /api/jobs (parent, on a3-dev-lean) with config_override.tools.job_control [create_job] and a description telling the worker to call create_job(description, workspace='a3-dev-lean') once",
+      "ids": {
+        "parentJob": "ed44a733-a1c1-4ebf-a4a9-6b9f6c50033c"
+      },
+      "result": "pass",
+      "observed": {
+        "call": "19:36:53 gpt-6-sol called create_job {description: 'A3 dev child probe: reply done', workspace: 'a3-dev-lean'} (no approval needed)",
+        "server": "orchestrator log 19:36:53.384 'POST /api/jobs 422 (22ms)' after the Account lookup",
+        "toolResult": "Action 'create' failed for job N/A:\nChild jobs inherit their parent workspace; select it on the root execution.",
+        "nothingCreated": "SELECT count(*) FROM jobs WHERE parent_job_id = ed44a733-...: 0; no job with the probe description",
+        "after": "the worker did not retry, reported the result and reached pending_review"
+      }
+    },
+    {
+      "check": "D3",
+      "name": "Unprivileged custom-image path: Mine container template on a public non-SRW image",
+      "request": "apply a3-dev-custom (Account/me, sandbox, docker.io/library/python:3.12-slim, IfNotPresent, 1 CPU / 2Gi / 10Gi); POST /api/jobs bound to it by ref",
+      "ids": {
+        "template": "f51ffe48-8704-492f-839b-f70c2c4f4f5b",
+        "job": "125c2e79-1d70-4f4c-bf15-1e96e4f715c7"
+      },
+      "result": "partial: admits and runs unprivileged as A1 promises; the Job neither runs nor fails, it holds with a typed readiness_deadline attention and no actionable error (known issue)",
+      "observed": {
+        "admission": "200; workspace_contract requested/assigned sandbox; workspace_sources explicit",
+        "pod": "workspace-125c2e79-1d7, image docker.io/library/python:3.12-slim (pulled within ~25 s), limits 1 / 2Gi, requests 250m / 2Gi, PVC 10Gi",
+        "privilege": "unprivileged profile as A1 section 3 specifies: no privileged flag, capabilities CHOWN DAC_OVERRIDE FOWNER SETGID SETUID NET_BIND_SERVICE SYS_CHROOT KILL AUDIT_WRITE (no SYS_ADMIN), allowPrivilegeEscalation true, pod seccomp RuntimeDefault, no dev-fuse hostPath volume (volumes: workspace-data, ssh-pubkey, workspace-identity, code-server-config, token). Compare D2's trusted pod: privileged true, SYS_ADMIN, dev-fuse hostPath, seccomp Unconfined",
+        "container": "SRW sets no command, so the image's default CMD (python3) ran without stdin and exited at once: terminated exit 0 'Completed' at 19:37:00 (started and finished the same second); restartPolicy Never; pod phase Succeeded; never Ready",
+        "job": "stayed status created, workspace_container.status creating, error_message null. Both orchestrator replicas logged 'Workspace container created but not ready within timeout: workspace-125c2e79-1d7' every ~5 s from 19:39:09. At the readiness deadline (19:46:45Z) workspace_creation became {stage: readiness, state: attention, reason_code: readiness_deadline}; still no message saying the container exited or that the image lacks the SRW workspace contract (sshd)",
+        "known": "knowledge/issues/container_template_job_failure_path_follow_ups.md item 2 (an image without the SRW workspace contract stays creating; the 10-02 exit-17 qualification reached the same readiness_deadline attention). This run adds an exit-0 (Succeeded) case; not filed again",
+        "cleanup": "PUT /api/jobs/{id}/cancel 200 {status: cancelled} (workspace_container.status deleted); DELETE 200 on the first try; pod, PVC and Service gone"
+      }
+    },
+    {
+      "check": "D4",
+      "name": "VM sizing: a Mine VM template based on vm-full with custom sizes (the one approved VM)",
+      "request": "apply a3-dev-vm (Account/me, vm, image ghcr.io/superhuman-remote-worker/srw-agent-vm-base:sha-6b9a1ad from vm-full, 2 CPU / 4Gi / 40Gi); POST /api/jobs bound to it by ref",
+      "ids": {
+        "template": "8dae6619-7508-48bc-b3d1-20252d90900c",
+        "job": "414958b8-2cb8-46f2-a084-5d4e2a837166",
+        "vm": "agent-vm-414958b8-2cb8-46f2-a084-5d4e2a837166 (provision_generation 3b753e52-4d17-47a6-88b5-1a8713ee980b)",
+        "rootdisk": "DataVolume/PVC agent-vm-414958b8-2cb8-46f2-a084-5d4e2a837166-rootdisk"
+      },
+      "result": "pass (sizes reach the VM); cleanup partial: the Job row can't be deleted (500, not A3)",
+      "observed": {
+        "admission": "200; workspace_contract requested/assigned vm (vm_runtime_not_ready while creating); config_override.workspace {backend: vm, vm: {image: ...srw-agent-vm-base:sha-6b9a1ad, cpu_cores: 2, memory: 4Gi, disk_size: 40Gi}}; workspace_sources explicit",
+        "controllerRequest": "context.vm.creation_request: cpu_cores 2, memory 4Gi, disk_size 40Gi, vm_image ...srw-agent-vm-base:sha-6b9a1ad; resource_admission template_profile guest_vcpus 2, guest_memory_bytes 4294967296; host vector cpu 2000m, memory 4619374272 bytes",
+        "vm": "VirtualMachine spec domain.cpu.cores 2, domain.memory.guest 4Gi",
+        "vmi": "Running on node2; cpu cores 2 (host-model), memory guest 4Gi (status guestAtBoot/guestCurrent/guestRequested 4Gi, maxGuest 16Gi), currentCPUTopology cores 2; virt-launcher requests cpu 500m, memory 4372Mi",
+        "disk": "DataVolume spec.storage.resources.requests.storage 40Gi (storageClass longhorn-ephemeral-vm), cloned from golden PVC agent-vm-golden-fdf6242ec0b2; PVC capacity 43418Mi (CDI filesystem overhead 0.06); disk.img in the launcher 41,807,773,696 bytes (38.9 GiB) on a 42G filesystem",
+        "timeline": "created 19:42:30; status paused with context.vm.status waiting_creation_configuration (preflight admitted) until the controller's create effect; VM/VMI objects 19:47:19; DV clone done ~19:49:20; VMI Running 19:50:09; ssh_pending 19:50:54; ready 19:51:16; dispatcher 'using VM workspace' and admitted to the stateless queue 19:51:41; processing 19:51:51",
+        "run": "processing 19:51:51 -> pending_review 19:56:50. The worker reported no shell tool ('shell unavailable'), so in-guest nproc/free/df weren't run; the sizes above come from the VM, VMI, launcher and DataVolume objects. job_complete summary: 'Verified that no shell-execution tool is available, so the requested VM-sizing commands could not be run.'"
+      },
+      "cleanup": "PUT /api/jobs/{id}/cancel 200 {status: cancelled, cleanup_pending: true} at 19:57:11; snapshot uploaded 19:58:29 (224,157,667 bytes); vm-controller 'Deleting VM ... rootdisk=purge' 19:58:31, then 'VM controller rejected delete ...: captured rootdisk cleanup is still reconciling' and 'VM exact teardown remains retry_pending' 19:58:40. By 20:09 the VM, VMI, DataVolume, PVC, launcher pod and cloud-init secret were all absent. context.vm.status stayed retiring_process_zero. DELETE /api/jobs/{id} answered 500 on all nine tries 20:09:39-20:19:08: 'update or delete on table \"jobs\" violates foreign key constraint \"vm_creation_retries_job_id_fkey\" on table \"vm_creation_retries\"'. The FK (migration 0257) has no ON DELETE and no code deletes vm_creation_retries rows for Jobs; 14 terminal Jobs on dev (8 cancelled, 6 completed, created 2026-09-25..10-04) carry such rows. Several other cancelled VM Jobs on dev also sit in retiring_process_zero."
+    },
+    {
+      "check": "T3 (partial, no VM)",
+      "name": "The defaults chain hands out vm: the decision, checked through admission's own preview",
+      "request": "POST /api/projects {name: a3-dev-vm-chain, user_id}; PUT /api/projects/{id}/workspace-defaults {jobs: vm, sessions: null, container: null, vm: null}; POST /api/persistent/tool-groups/preview {expert_type: worker, project_id, config_override}",
+      "ids": {
+        "project": "5485dd21-d4ee-4a6b-9277-6618bd49f5fc (manifest resource 30268fcd-e010-48cf-a35a-8b3d0538cfca)"
+      },
+      "result": "pass for the chain's decision; the Job/VM half (vm-full's 8 CPU / 16Gi / 30Gi on a real VM) not run",
+      "observed": {
+        "put": "200: effective.jobs {mode: vm, source: project}, effective.vm {template_name: vm-full, source: builtin}, vm_available true",
+        "preview": "workspace {backend: vm, source: project, binding: {template: {ref: {name: vm-full, scope: Catalog/shared}}}, sources: {tier: project, template: builtin}, template_name: vm-full}",
+        "whyNotTheD4Vm": "D4's Mine template can't be this Project's default: PUT with vm {name: a3-dev-vm, scope: Account/me} -> 422 'Pick a Catalog template or one of this Project's templates.' (a non-personal Project offers only Catalog and Project templates), and the owner's personal Project defaults were off limits. A second VM wasn't approved.",
+        "cleanup": "no Jobs in the Project; DELETE /api/projects/{id} 200 {status: deleted}; projects row gone; srw_resources Project row tombstoned (deleted_at 19:47:00)"
+      }
+    }
+  ],
+  "envNotes": [
+    "Dev's worker expert (worker_base) has no shell tool on this build: the D2 template Job and the D4 VM Job both reported 'shell unavailable', so in-guest/in-pod commands were read with kubectl instead (container df, VM launcher disk image).",
+    "Many leftover workspace-*, ws-thread-* and canvas-gateway-role-* pods from earlier weeks are on dev; untouched.",
+    "Pinned agent pod srw-agent-j-d5a5a300 that ran the none Job was recycled after the failure, so its log is gone; the audit database has no rows for that Job.",
+    "No VM was running on dev before D4; one VM was created for D4 and no other."
+  ],
+  "outOfScopeFindings": [
+    {
+      "what": "A Job with backend none fails at start on dev with a job-repo clone refusal",
+      "evidence": "Job 31dec365-... (MCP workspace='none', root, pinned lane): admitted with backend none and no pod; 9 s later failed with 'Failed to clone job workspace repo 'job-31dec365' - refusing to fall back to a disconnected git init ...' (src/agent/core/workspace.py). The same refusal was seen on 2026-08-24 when a clone URL lacked credentials (tests/protected_cloud_e2e_results_2026-08-24-e853.md). Only three root none Jobs exist on dev; the previous one (2026-07-27) completed. A3 only sends workspace: null, which the REST path has accepted since A1, so this is a runtime defect on the lite backend, not A3. The agent log was lost with the recycled pinned pod; reproduce on a stack where the agent pod is kept."
+    },
+    {
+      "what": "A Job that created a VM can't be deleted: DELETE /api/jobs/{id} answers 500 on the vm_creation_retries foreign key",
+      "evidence": "D4 Job 414958b8-...: cancelled, VM/VMI/DV/PVC gone, nine DELETEs over ten minutes all 500 'violates foreign key constraint vm_creation_retries_job_id_fkey'. Migration 0257 declares job_id REFERENCES jobs(id) without ON DELETE; no code deletes vm_creation_retries rows for Jobs; 14 terminal dev Jobs carry such rows. The Job's context.vm.status also stays retiring_process_zero after the physical teardown (the 2026-09-28 note stateless_vm_cancel_checkpoint_prune_cleanup_cycle calls that stale status harmless). A 500 rather than a refusal suggests the route never expected the row. Not A3; not filed as an issue."
+    }
+  ],
+  "cleanup": {
+    "jobsDeleted": [
+      "e4c7e2f6-ca81-4a88-ad23-4d396020d9a4 (cancel 200, DELETE 200)",
+      "5e9729ed-dbdb-4920-b73d-19443539bc7e (cancel 200, DELETE 200)",
+      "31dec365-00b0-40dc-8ffe-8c4edfd86a34 (failed; DELETE 200)",
+      "ed44a733-a1c1-4ebf-a4a9-6b9f6c50033c (cancel 200, DELETE 200)",
+      "125c2e79-1d70-4f4c-bf15-1e96e4f715c7 (cancel 200, DELETE 200)"
+    ],
+    "templatesDeleted": {
+      "64c14dae-1f4d-4b1b-b29f-2b568e01deb6": "a3-dev-lean, DELETE /api/resources/{uid}?expected_version=1 200",
+      "f51ffe48-8704-492f-839b-f70c2c4f4f5b": "a3-dev-custom, DELETE ...?expected_version=1 200",
+      "8dae6619-7508-48bc-b3d1-20252d90900c": "a3-dev-vm, DELETE ...?expected_version=1 200 (after the Job was cancelled)"
+    },
+    "projectsDeleted": {
+      "5485dd21-d4ee-4a6b-9277-6618bd49f5fc": "a3-dev-vm-chain, DELETE 200"
+    },
+    "helpersRemoved": "/tmp/srw_dev.py and /tmp/audit.py removed from srw-orchestrator-64c9b65869-nrpw5; /tmp/mcp_call.py removed from srw-mcp-5545886d78-h7xtv",
+    "leftovers": "One: the cancelled D4 Job row 414958b8-2cb8-46f2-a084-5d4e2a837166 (plus its vm_creation_retries row, Gitea repo job-414958b8 and VM snapshot), because DELETE 500s on the vm_creation_retries foreign key. No Kubernetes object remains for any ID from this run (pods, PVCs, Services, VMs, VMIs, DataVolumes, secrets checked). All three templates and the scratch Project are deleted (srw_resources rows tombstoned). Recorded under Leftovers in knowledge/tests/templates_slice_a_deferred_tests.md.",
+    "untouched": "The owner's existing Mine VM templates srw-development (6dacc230-...) and srw-development-m (a898f622-...); every existing Project's defaults; Helm values"
+  }
+}

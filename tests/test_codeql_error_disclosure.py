@@ -28,7 +28,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from fastapi.testclient import TestClient
 
-from tests._mounted_router import mount_main_routes, mount_router
+from tests._mounted_router import mount_router
 
 
 # The text of the exceptions raised below. No response body may contain it.
@@ -75,6 +75,7 @@ def _datasource_wire(row: dict):
     from orchestrator.routers.datasources import DatasourcesDependencies as RouteDeps
     from orchestrator.routers.datasources import router
     from orchestrator.services.datasources import DatasourceDependencies as OpDeps
+    from orchestrator.services.connector_drivers import builtin_connector_drivers
     from orchestrator.services.kb_task_registry import KbDatasourceTaskRegistry
     from orchestrator.services.knowledge_index import KnowledgeIndexDependencies
 
@@ -105,6 +106,7 @@ def _datasource_wire(row: dict):
         ),
         mcp_datasources_enabled=lambda: False,
         validate_mcp_datasource=lambda _url, _creds: None,
+        connector_drivers=builtin_connector_drivers(),
     )
     deps = RouteDeps(
         store=store,
@@ -148,11 +150,19 @@ def _exploding_module(attribute: str) -> MagicMock:
     ("ds_type", "target", "patcher"),
     [
         ("kb", "orchestrator.services.kb_datasources.test_kb_datasource", "attr"),
-        ("postgresql", "orchestrator.services.datasources.asyncpg.connect", "attr"),
+        (
+            "postgresql",
+            "orchestrator.services.connector_drivers.managed.asyncpg.connect",
+            "attr",
+        ),
         ("neo4j", "neo4j", "module"),
         ("mongodb", "pymongo", "module"),
         ("webdav", "webdav3.client", "module"),
-        ("email", "orchestrator.services.datasources.probe_email_connection", "attr"),
+        (
+            "email",
+            "orchestrator.services.connector_drivers.mail.probe_email_connection",
+            "attr",
+        ),
     ],
 )
 def test_a_failing_connector_probe_reports_without_the_exception_text(
@@ -213,36 +223,27 @@ def test_a_crashing_probe_gate_is_a_500_without_the_exception_text():
 
 
 # =============================================================================
-# POST /api/admin/system-settings/main_cloud/test — two probe failures, 200
+# GET /api/admin/main-cloud — a failing health probe, 200
 # =============================================================================
 
-MAIN_CLOUD = "/api/admin/system-settings/main_cloud"
+MAIN_CLOUD_PAGE = "/api/admin/main-cloud"
 
 
-def _main_cloud_client(monkeypatch, *, build=None, ensure=None):
+def _main_cloud_client(health_check):
     from orchestrator.routers import main_cloud_settings as route_module
     from orchestrator.services import main_cloud_settings as ops
-    from orchestrator.services.cloud import config as cloud_config
-
-    monkeypatch.setattr(cloud_config, "missing_secret_envs", lambda *_a, **_k: [])
-    if build is not None:
-        monkeypatch.setattr(ops, "build_backend", build)
-    else:
-        probe = SimpleNamespace(
-            ensure_initialized=ensure,
-            health_check=AsyncMock(),
-            close=AsyncMock(),
-        )
-        monkeypatch.setattr(ops, "build_backend", lambda **_k: probe)
 
     async def require_admin(_request):
         return {"id": "admin-1"}
 
+    active = SimpleNamespace(
+        backend_id="nextcloud", is_initialized=True, health_check=health_check
+    )
     operations = ops.MainCloudSettingsDependencies(
-        store=SimpleNamespace(delete_system_setting=AsyncMock(return_value=None)),
-        cloud_router=SimpleNamespace(active=None, active_instance_id=None),
-        rebind_cloud_router=lambda _backend: None,
-        thread_mount_dependencies=lambda: None,
+        store=SimpleNamespace(
+            get_active_main_cloud_backend_instance=AsyncMock(return_value=None)
+        ),
+        cloud_router=SimpleNamespace(active=active),
     )
     dependencies = route_module.MainCloudSettingsRouteDependencies(
         operations=operations,
@@ -255,47 +256,30 @@ def _main_cloud_client(monkeypatch, *, build=None, ensure=None):
     return TestClient(app, raise_server_exceptions=False)
 
 
-def _main_cloud_body() -> dict:
-    return {
-        "value": {"backend_id": "opencloud", "base_url": "https://cloud.example"},
-        "credentials_ref": "env:OC_CLIENT_SECRET",
-        "expected_activation_revision": 0,
-    }
+def test_a_raising_health_probe_is_reported_without_the_exception_text():
+    client = _main_cloud_client(AsyncMock(side_effect=RuntimeError(BOOM)))
 
-
-def test_a_failing_backend_build_keeps_its_reason_without_the_exception_text(
-    monkeypatch,
-):
-    def build(**_kwargs):
-        raise RuntimeError(BOOM)
-
-    client = _main_cloud_client(monkeypatch, build=build)
-
-    response = client.post(f"{MAIN_CLOUD}/test", json=_main_cloud_body())
+    response = client.get(MAIN_CLOUD_PAGE)
 
     assert response.status_code == 200
     body = response.json()
-    assert body["ok"] is False
-    assert body["detail"] == "build_backend failed"
+    assert body["health"] == {"ok": False, "latency_ms": None, "detail": "unreachable"}
     assert_no_leak(body)
-    error_ref_of(body)
 
 
-def test_a_failing_backend_init_keeps_its_reason_without_the_exception_text(
-    monkeypatch,
-):
+def test_an_upstream_error_text_in_the_health_detail_is_not_echoed():
+    from orchestrator.services.cloud import HealthStatus
+
     client = _main_cloud_client(
-        monkeypatch, ensure=AsyncMock(side_effect=RuntimeError(BOOM))
+        AsyncMock(return_value=HealthStatus(ok=False, latency_ms=0.0, detail=BOOM))
     )
 
-    response = client.post(f"{MAIN_CLOUD}/test", json=_main_cloud_body())
+    response = client.get(MAIN_CLOUD_PAGE)
 
     assert response.status_code == 200
     body = response.json()
-    assert body["ok"] is False
-    assert body["detail"] == "ensure_initialized raised"
+    assert body["health"]["detail"] == "unreachable"
     assert_no_leak(body)
-    error_ref_of(body)
 
 
 # =============================================================================
@@ -328,6 +312,8 @@ def _job_diff_client():
 
     store = SimpleNamespace(
         get_project=AsyncMock(return_value=project),
+        # The caller decides the diff as an editor of the job's project.
+        get_user_role_in_project=AsyncMock(return_value="editor"),
         update_job_cloud_diff=AsyncMock(),
         update_job_merge_status=AsyncMock(),
         update_job_status=AsyncMock(),
@@ -382,25 +368,24 @@ def test_an_unroutable_cloud_backend_names_the_backend_but_not_the_exception():
 # =============================================================================
 
 
+# A canonical v1 session identity; detach validates it exactly.
+_SESSION_FP = "sha256:" + ("f" * 64)
+
+
 def _persistent_client(monkeypatch, *, session, terminate=None):
     from agent.api import persistent_app as module
 
     app = module.create_persistent_app("config", "thread-1")
     monkeypatch.setattr(module, "_stateless_mode", lambda: False)
     monkeypatch.setattr(module, "_session", session)
-    monkeypatch.setattr(module, "_thread_id", "thread-1")
-    monkeypatch.setattr(module, "_sessions_served", 1)
-    monkeypatch.setattr(
-        module, "_canonical_pinned_session_identity_fingerprint", lambda _v: "fp"
-    )
-    monkeypatch.setattr(
-        module, "_current_pinned_session_identity_fingerprint", lambda: "fp"
-    )
+    monkeypatch.setattr(module._session_identity, "_thread_id", "thread-1")
+    monkeypatch.setattr(module._session_termination, "sessions_served", 1)
+    monkeypatch.setattr(module._session_identity, "fingerprint", lambda: _SESSION_FP)
     monkeypatch.setattr(module, "_registered_pinned_agent_id", lambda: AGENT_ID)
-    monkeypatch.setattr(module, "_session_runtime_generation", "gen-1")
-    monkeypatch.setattr(module, "_session_runtime_attach_token", "tok-1")
+    monkeypatch.setattr(module._session_identity, "_session_generation", "gen-1")
+    monkeypatch.setattr(module._session_identity, "_attach_token", "tok-1")
     if terminate is not None:
-        monkeypatch.setattr(module, "_terminate_session", terminate)
+        monkeypatch.setattr(module._session_termination, "terminate", terminate)
     return TestClient(app, raise_server_exceptions=False), module
 
 
@@ -441,7 +426,7 @@ def test_persistent_detach_failure_is_a_500_without_the_exception_text(monkeypat
     )
 
     response = client.post(
-        "/session/detach", json={"session_identity_fingerprint": "fp"}
+        "/session/detach", json={"session_identity_fingerprint": _SESSION_FP}
     )
 
     assert response.status_code == 500
@@ -538,20 +523,15 @@ def test_dual_app_detach_failure_is_a_500_without_the_exception_text(monkeypatch
 
     app = module.create_dual_app()
     monkeypatch.setattr(module, "_pod_state", module.PodState.SESSION)
-    monkeypatch.setattr(pa, "_thread_id", "thread-1")
+    monkeypatch.setattr(pa._session_identity, "_thread_id", "thread-1")
+    monkeypatch.setattr(pa._session_identity, "fingerprint", lambda: _SESSION_FP)
     monkeypatch.setattr(
-        pa, "_canonical_pinned_session_identity_fingerprint", lambda _v: "fp"
-    )
-    monkeypatch.setattr(
-        pa, "_current_pinned_session_identity_fingerprint", lambda: "fp"
-    )
-    monkeypatch.setattr(
-        pa, "_terminate_session", AsyncMock(side_effect=RuntimeError(BOOM))
+        pa._session_termination, "terminate", AsyncMock(side_effect=RuntimeError(BOOM))
     )
     client = TestClient(app, raise_server_exceptions=False)
 
     response = client.post(
-        "/session/detach", json={"session_identity_fingerprint": "fp"}
+        "/session/detach", json={"session_identity_fingerprint": _SESSION_FP}
     )
 
     assert response.status_code == 500
@@ -589,7 +569,12 @@ class _DB:
 def _magic_client(
     monkeypatch, *, tool_name: str = "run_command", rows=None, thread_id=None
 ):
-    import orchestrator.main as main
+    """The magic routes, mounted from their router with one application's store.
+
+    The router reads ``headless_notifications`` as a module at call time, so the
+    token validation is patched on that module object.
+    """
+    from orchestrator.routers import thread_permissions
 
     permission_row = {
         "id": "perm-1",
@@ -598,7 +583,7 @@ def _magic_client(
         "status": "pending",
     }
     monkeypatch.setattr(
-        main.headless_notifications,
+        thread_permissions.headless_notifications,
         "validate_magic_link",
         AsyncMock(
             return_value={
@@ -608,10 +593,21 @@ def _magic_client(
             }
         ),
     )
-    monkeypatch.setattr(
-        main, "postgres_db", _DB(rows if rows is not None else [permission_row])
+    store = _DB(rows if rows is not None else [permission_row])
+    app = mount_router(
+        thread_permissions.router,
+        factories={
+            "thread_permission_dependencies_factory": (
+                lambda: thread_permissions.ThreadPermissionDependencies(
+                    store=store,
+                    require_thread_owner=AsyncMock(),
+                    notification_service=MagicMock(),
+                    cockpit_url=lambda: "http://localhost:4200",
+                    wake_after_permission_decision=AsyncMock(),
+                )
+            )
+        },
     )
-    app = mount_main_routes(["/magic/approve/{token}", "/magic/extend/{token}"])
     return TestClient(app, raise_server_exceptions=False)
 
 

@@ -26,6 +26,11 @@ from agent.services.image_content import (
 from agent.services.cloud_mount.guardrails import workspace_path_touches_cloud
 from agent.utils.pdf import PDFReader, format_read_info
 from agent.tools.context import ToolContext
+from agent.core.redaction_write_guard import (
+    adds_redaction_marker,
+    redaction_marker_refusal,
+)
+from shared.content_redaction import REDACTED
 
 from shared.tool_catalog.definitions import (
     FILE_TOOLS_METADATA as FILE_TOOLS_METADATA,
@@ -1110,8 +1115,10 @@ def create_file_tools(context: ToolContext) -> List[Any]:
             # missed while the agent was detached.
             existed = workspace.exists(path)
             had_recent_read = context.was_recently_read(path)
+            existing = workspace.read_file(path) if existed else ""
+            if adds_redaction_marker(existing, content):
+                return redaction_marker_refusal(path, "write_file")
             if existed:
-                existing = workspace.read_file(path)
                 if existing.strip() and not context.recent_read_matches(path, existing):
                     context.invalidate_recent_read(path)
                     from shared.runtime.services.guardrails import format_nudge
@@ -1224,6 +1231,17 @@ def create_file_tools(context: ToolContext) -> List[Any]:
                     f"Use 'start' to prepend, 'end' to append, or omit for replace mode."
                 )
 
+            if position == "end":
+                prospective = content + new_string
+            elif position == "start":
+                prospective = new_string + content
+            elif old_string and content.count(old_string) == 1:
+                prospective = content.replace(old_string, new_string, 1)
+            else:
+                prospective = content  # replace-mode errors are reported below
+            if adds_redaction_marker(content, prospective):
+                return redaction_marker_refusal(path, "edit_file")
+
             # Snapshot for undo before editing
             if context._snapshot_callback:
                 context._snapshot_callback(path)
@@ -1253,6 +1271,17 @@ def create_file_tools(context: ToolContext) -> List[Any]:
             count = content.count(old_string)
 
             if count == 0:
+                if REDACTED in old_string:
+                    # Most likely copied from a redacted read: the file holds
+                    # the real value where the view showed the marker.
+                    return (
+                        f"Error: old_string not found in {path} — it contains "
+                        f"{REDACTED}. The view you read was redacted where a "
+                        "credential-shaped value stands, so the file holds a "
+                        "different value there. Choose an old_string that "
+                        "avoids the redacted span (the text before or after "
+                        "it on the line)."
+                    )
                 # Show a short snippet of the file to help the caller orient
                 preview = content[:200].replace("\n", "\\n")
                 return (

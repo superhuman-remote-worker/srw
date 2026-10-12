@@ -412,6 +412,7 @@ interface EditorForm {
           [showProjectMemory]="false"
           [gatedCapabilities]="gatedCapabilities()"
           [catalog]="catalog()"
+          [workspaceBackendLabel]="'agentSettings.execution.workspaceRecommended'"
         />
       </section>
 

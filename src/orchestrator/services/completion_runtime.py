@@ -219,7 +219,13 @@ class CompletionControlBoundary:
         if decision.blocked:
             raise HTTPException(status_code=409, detail="completion finalizing")
 
-    async def claim(self, job: Mapping[str, Any], *, source: str) -> Any:
+    async def claim(
+        self,
+        job: Mapping[str, Any],
+        *,
+        source: str,
+        terminal_review_source: Mapping[str, Any] | None = None,
+    ) -> Any:
         if not self._enabled:
             return None
         from orchestrator.services.completion_control import (
@@ -232,6 +238,11 @@ class CompletionControlBoundary:
                 source=source,
                 expected_status=str(job.get("status") or ""),
                 expected_lane=str(job.get("execution_lane") or "pinned"),
+                **(
+                    {"terminal_review_source": terminal_review_source}
+                    if terminal_review_source is not None
+                    else {}
+                ),
             )
         except CompletionControlClaimConflict as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
@@ -242,6 +253,8 @@ class CompletionControlBoundary:
         *,
         source: str,
         expected_agent_id: str | None,
+        operator_hold: bool = False,
+        paused_by: str | None = None,
     ) -> Any:
         if not self._enabled:
             return None
@@ -254,6 +267,8 @@ class CompletionControlBoundary:
                 job_id,
                 source=source,
                 expected_agent_id=expected_agent_id,
+                operator_hold=operator_hold,
+                paused_by=paused_by,
             )
         except CompletionControlClaimConflict as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc

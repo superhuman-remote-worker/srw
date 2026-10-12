@@ -33,6 +33,10 @@ from testcontainers.postgres import PostgresContainer
 
 from orchestrator.database.postgres import PostgresDB
 from orchestrator.security import crypto
+from orchestrator.application import http as http_composition
+from orchestrator.application import jobs as jobs_composition
+from orchestrator.security import auth as auth_module
+import functools
 
 SCHEMA_FILE = (
     Path(__file__).resolve().parents[1]
@@ -351,15 +355,19 @@ async def list_client(db, monkeypatch):
     from orchestrator import main
     from orchestrator.routers.job_reads import router as job_reads_router
 
-    monkeypatch.setattr(main, "postgres_db", db)
+    monkeypatch.setattr(main.app.state.resources, "postgres_db", db)
     monkeypatch.setattr(
-        main,
+        auth_module,
         "require_approved_user",
         AsyncMock(return_value={"id": str(uuid.uuid4()), "is_admin": True}),
     )
-    monkeypatch.setattr(main, "audit_reader", SimpleNamespace(is_available=False))
-    app = FastAPI(default_response_class=main.CustomJSONResponse)
-    app.state.job_reads_dependencies_factory = main._job_reads_dependencies
+    monkeypatch.setattr(
+        main.app.state.resources, "audit_reader", SimpleNamespace(is_available=False)
+    )
+    app = FastAPI(default_response_class=http_composition.CustomJSONResponse)
+    app.state.job_reads_dependencies_factory = functools.partial(
+        jobs_composition.job_reads_dependencies, main.app.state.resources
+    )
     app.include_router(job_reads_router)
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=app), base_url="http://list.test"
@@ -387,9 +395,11 @@ class TestListWirePagination:
         )
         # Real SQL must discard its private workspace join columns before the
         # public model sees them. Synthetic data only; no provider/workspace.
+        # The checkout's level decides the review mode, as on the project list.
         async with db.acquire() as conn:
             await conn.execute(
-                """UPDATE jobs SET context = '{"vm":{"ssh_host":"synthetic-private"}}',
+                """UPDATE jobs SET context = '{"vm":{"ssh_host":"synthetic-private"},
+                   "cloud_checkout":{"access":"reviewed_write_back"}}',
                    config_override = '{"llm":{"api_key":"synthetic-private"}}'
                    WHERE id = $1""",
                 uuid.UUID(first_root),
@@ -407,11 +417,13 @@ class TestListWirePagination:
         assert [j["id"] for j in page["jobs"]] == [first_root, child]
         assert page["limit"] == 1 and page["total"] == 2 and page["has_more"] is True
         assert page["jobs"][0]["config_name"] is None
+        assert [j["cloud_review_mode"] for j in page["jobs"]] == ["diff", "open_folder"]
         for private in (
             "synthetic-private",
             "_workspace_context",
             "_workspace_config_override",
             "project_has_cloud_folder",
+            "cloud_checkout",
         ):
             assert private not in first.text
 

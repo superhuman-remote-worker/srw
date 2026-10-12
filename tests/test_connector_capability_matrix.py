@@ -1,0 +1,728 @@
+"""The generated capability matrix (connector drivers D2).
+
+``GET /api/datasources/drivers`` is assembled from the installed driver
+registry alone.  Pinned here:
+
+* every installed driver is listed, with its access levels and their
+  ``enforced_by`` lines, trust, credential slots and egress columns;
+* built-in drivers are "built-in, trusted"; a managed MCP server is
+  "managed", its claims SRW's but its image never trusted; anything else is
+  marked as its author's word;
+* no credential value can appear: the route reads no connector, and a
+  ``writeOnly`` schema loses any value its author put there;
+* any approved user may read it, and the literal segment wins over
+  ``/{datasource_id}``;
+* the response is the cockpit's fixture byte for byte, so the cockpit specs
+  render what the API returns (the managed MCP servers' rows, installed only
+  where the chart names their images, in a fixture of their own).
+  Regenerate the fixtures with
+  ``UPDATE_CONNECTOR_GOLDENS=1 python -m pytest tests/test_connector_capability_matrix.py``.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock
+
+import pytest
+from fastapi import HTTPException
+from fastapi.testclient import TestClient
+
+from orchestrator.services.connector_drivers import (
+    ConnectorDriverRegistry,
+    builtin_connector_drivers,
+)
+from orchestrator.services.connector_drivers.matrix import (
+    HostingStatus,
+    capability_matrix,
+    public_schema,
+)
+from shared.connectors.builtin import (
+    BUILTIN_SPECS,
+    DATASOURCE_SPECS,
+    IMAGE_DRIVER_SPEC,
+    MANAGED_MCP_SPECS,
+)
+from shared.connectors.contract import (
+    AccessLevel,
+    CredentialSlot,
+    DriverSpec,
+    EgressRule,
+)
+from tests._mounted_router import mount_router
+
+ROOT = Path(__file__).resolve().parents[1]
+FIXTURE = ROOT / "cockpit/src/app/core/models/fixtures/connector-drivers.json"
+MANAGED_FIXTURE = FIXTURE.with_name("connector-drivers-managed.json")
+UPDATE = os.environ.get("UPDATE_CONNECTOR_GOLDENS") == "1"
+
+USER = {"id": "00000000-0000-0000-0000-0000000000c1", "is_admin": False}
+STORED_SECRET = "hunter2-stored"
+AUTHOR_SECRET = "hunter2-author-default"
+
+
+class _ImageDriver:
+    """A driver that is not SRW's own code (what D6 will register)."""
+
+    def __init__(self, spec: DriverSpec) -> None:
+        self.spec = spec
+
+
+def _image_spec() -> DriverSpec:
+    return DriverSpec(
+        name="community.ticketing/v1",
+        title="Ticketing",
+        plane="bind_time",
+        delivery_forms=("env_file",),
+        config_schema={
+            "type": "object",
+            "properties": {
+                "host": {"type": "string", "default": "tickets.example.com"},
+                "token": {"type": "string", "writeOnly": True, "default": "x"},
+            },
+        },
+        credential_slots=(
+            CredentialSlot(
+                "api",
+                "secret_string",
+                {
+                    "type": "object",
+                    "properties": {
+                        "key": {
+                            "type": "string",
+                            "writeOnly": True,
+                            "default": AUTHOR_SECRET,
+                            "examples": [AUTHOR_SECRET],
+                        }
+                    },
+                },
+                required=True,
+            ),
+        ),
+        access_levels=(
+            AccessLevel("ReadOnly", 0, "The token's scope.", tools=("t_read",)),
+        ),
+        supported_backends=frozenset({"sandbox"}),
+        workspace_requirements="A shell.",
+        egress=(EgressRule("${config.host}", (443,)),),
+        needs_dns="The host is a name.",
+    )
+
+
+def _store() -> SimpleNamespace:
+    """Every read a connector route could make, each holding a secret."""
+    row = {"id": "d1", "type": "postgresql", "credentials": {"p": STORED_SECRET}}
+    return SimpleNamespace(
+        list_datasources=AsyncMock(return_value=[row]),
+        list_datasource_catalog=AsyncMock(return_value={"items": [row]}),
+        list_eligible_datasources=AsyncMock(return_value=[row]),
+        get_datasource=AsyncMock(return_value=row),
+        # Registered drivers the caller can see (D6): none here.
+        get_projects_for_user=AsyncMock(return_value=[]),
+        fetch=AsyncMock(return_value=[]),
+    )
+
+
+def _client(*, registry=None, approved=None):
+    from orchestrator.routers.datasources import DatasourcesDependencies, router
+    from orchestrator.services.datasources import DatasourceDependencies
+
+    store = _store()
+
+    async def approved_user(_request, _store):
+        return USER
+
+    async def unreachable(*_args, **_kwargs):
+        raise AssertionError("the matrix needs no connector gate")
+
+    deps = DatasourcesDependencies(
+        store=store,
+        operations=DatasourceDependencies(
+            store=store,
+            vector_db=MagicMock(),
+            knowledge_index=MagicMock(),
+            mcp_datasources_enabled=lambda: False,
+            validate_mcp_datasource=lambda _url, _creds: None,
+            connector_drivers=registry or builtin_connector_drivers(),
+        ),
+        require_approved_user=approved or approved_user,
+        require_project_member=unreachable,
+        require_project_owner=unreachable,
+        require_datasource_access=unreachable,
+        require_datasource_owner=unreachable,
+        require_job_access=unreachable,
+    )
+    app = mount_router(
+        router, factories={"datasources_dependencies_factory": lambda: deps}
+    )
+    return SimpleNamespace(client=TestClient(app), store=store)
+
+
+@pytest.fixture(scope="module")
+def matrix():
+    return capability_matrix(builtin_connector_drivers())
+
+
+class TestBuiltinMatrix:
+    def test_every_installed_driver_is_listed_in_registry_order(self, matrix):
+        registry = builtin_connector_drivers()
+        # The stored type of registered drivers' connectors is no driver
+        # anyone picks: each registration is its own row (D6).
+        assert [d["name"] for d in matrix["drivers"]] == [
+            spec.name for spec in registry.specs() if spec is not IMAGE_DRIVER_SPEC
+        ]
+        assert {d["name"] for d in matrix["drivers"]} == {
+            spec.name for spec in BUILTIN_SPECS
+        }
+        assert matrix["protocol_version"] == "1.0"
+
+    @pytest.mark.parametrize("spec", DATASOURCE_SPECS, ids=lambda s: s.name)
+    def test_access_levels_carry_their_enforced_by_lines(self, matrix, spec):
+        entry = next(d for d in matrix["drivers"] if d["name"] == spec.name)
+        assert entry["access_levels"], spec.name
+        assert [level["id"] for level in entry["access_levels"]] == list(
+            spec.ranked_access_ids()
+        )
+        for level in entry["access_levels"]:
+            declared = spec.access_level(level["id"])
+            assert level["enforced_by"] == declared.enforced_by
+            assert level["advisory"] is declared.advisory
+            assert level["rank"] == declared.rank
+            assert level["tools"] == (
+                "*" if declared.tools == "*" else list(declared.tools)
+            )
+            # Only a strict driver's levels say what they let through; the
+            # others' rows are as they were before the key existed.
+            assert level.get("writes") == declared.writes
+            assert ("writes" in level) is (declared.writes is not None)
+
+    def test_a_declared_writes_is_carried_and_an_unset_one_is_absent(self):
+        from orchestrator.services.connector_drivers.matrix import _access_level
+
+        assert _access_level(AccessLevel("r", 0, "A grant.", writes="none")) == {
+            "id": "r",
+            "rank": 0,
+            "tools": [],
+            "enforced_by": "A grant.",
+            "advisory": False,
+            "writes": "none",
+        }
+        assert "writes" not in _access_level(AccessLevel("r", 0, "A grant."))
+
+    def test_spec_fields_are_carried(self, matrix):
+        kb = next(d for d in matrix["drivers"] if d["name"] == "srw.kb/v1")
+        assert kb["legacy_type"] == "kb"
+        assert kb["plane"] == "harness"
+        assert kb["delivery_forms"] == ["knowledge_index"]
+        assert kb["supported_backends"] == ["none", "sandbox", "virtual", "vm"]
+        assert kb["forced_read_only"] is True
+        assert kb["default_access"] == "ReadOnly"
+        assert kb["operations"] == ["status", "reindex"]
+        assert kb["holds_upstream_credentials"] is True
+        mcp = next(d for d in matrix["drivers"] if d["name"] == "srw.mcp/v1")
+        assert [level["id"] for level in mcp["access_levels"]] == ["ReadWrite"]
+        assert mcp["access_levels"][0]["tools"] == "*"
+        assert mcp["deployment_gate"] == "mcp_datasources"
+        env = next(d for d in matrix["drivers"] if d["name"] == "srw.env/v1")
+        assert env["access_levels"] == []
+        assert env["legacy_type"] is None
+
+    def test_builtins_are_built_in_and_trusted(self, matrix):
+        for entry in matrix["drivers"]:
+            assert entry["trust"] == {
+                "tier": "builtin",
+                "trusted": True,
+                "image": None,
+                "claims_declared_by_author": False,
+            }
+
+    def test_builtins_run_in_process_so_egress_is_not_enforced_by_srw(self, matrix):
+        for entry in matrix["drivers"]:
+            assert entry["egress"] == {
+                "declared": {"rules": [], "needs_dns": None},
+                "enforced": {
+                    "status": "not_applicable",
+                    "reason": "runs_in_srw_process",
+                },
+                "installation": {
+                    "status": "not_applicable",
+                    "reason": "runs_in_srw_process",
+                },
+            }
+
+    def test_credential_slots_describe_names_kinds_and_rules(self, matrix):
+        email = next(d for d in matrix["drivers"] if d["name"] == "srw.email/v1")
+        assert [
+            (s["name"], s["kind"], s["required"], s["access_levels"])
+            for s in email["credential_slots"]
+        ] == [
+            ("mailbox", "secret_string", True, []),
+            ("smtp", "secret_string", False, ["send"]),
+        ]
+        password = email["credential_slots"][0]["schema"]["properties"]["password"]
+        assert password == {"type": "string", "writeOnly": True}
+
+    @pytest.mark.parametrize("spec", DATASOURCE_SPECS, ids=lambda s: s.name)
+    def test_each_slot_names_its_key_names_field(self, matrix, spec):
+        entry = next(d for d in matrix["drivers"] if d["name"] == spec.name)
+        assert [s["names_field"] for s in entry["credential_slots"]] == [
+            slot.names_field for slot in spec.credential_slots
+        ]
+
+    def test_the_credentials_slot_lists_its_names_under_env_var_names(self, matrix):
+        credentials = next(
+            d for d in matrix["drivers"] if d["name"] == "srw.credentials/v1"
+        )
+        assert credentials["credential_slots"][0]["names_field"] == "env_var_names"
+
+    def test_the_matrix_is_json(self, matrix):
+        assert json.loads(json.dumps(matrix)) == matrix
+
+
+class TestDevelopmentDrivers:
+    def test_the_lease_probe_is_labelled_development_never_trusted(self):
+        # Installed only where orchestrator.connectorLeases.probeDriver is on.
+        matrix = capability_matrix(builtin_connector_drivers(lease_probe=True))
+        *builtins, probe = matrix["drivers"]
+        assert probe["name"] == "srw.lease-probe/v1"
+        assert probe["trust"] == {
+            "tier": "development",
+            "trusted": False,
+            "image": None,
+            # SRW wrote it: its claims are SRW's, not a third party's.
+            "claims_declared_by_author": False,
+        }
+        assert [d["name"] for d in builtins] == [
+            spec.name
+            for spec in builtin_connector_drivers().specs()
+            if spec is not IMAGE_DRIVER_SPEC
+        ]
+        assert all(d["trust"]["tier"] == "builtin" for d in builtins)
+
+    def test_without_the_switch_it_is_not_installed(self, matrix):
+        assert "srw.lease-probe/v1" not in {d["name"] for d in matrix["drivers"]}
+
+
+_BUILTIN_NAMES = frozenset(spec.name for spec in BUILTIN_SPECS)
+
+
+def _managed_rows() -> dict:
+    """What a deployment installing every managed MCP server of SRW's
+    catalogue (D5a) adds to the matrix, with the service-pod hosting the
+    chart requires for one: the cockpit renders these rows from
+    ``fixtures/connector-drivers-managed.json``."""
+    registry = builtin_connector_drivers(
+        managed_mcp_images={
+            spec.name: f"registry.example/{spec.name.split('/')[0]}:1"
+            for spec in MANAGED_MCP_SPECS
+        }
+    )
+    matrix = capability_matrix(registry, hosting=HostingStatus(enabled=True))
+    return {
+        **matrix,
+        "drivers": [d for d in matrix["drivers"] if d["name"] not in _BUILTIN_NAMES],
+    }
+
+
+class TestManagedMcpServers:
+    """SRW curates them and its front enforces their levels; their image is
+    a third party's."""
+
+    def test_each_is_managed_never_trusted_and_its_claims_are_srws(self):
+        rows = _managed_rows()["drivers"]
+        assert [d["name"] for d in rows] == [s.name for s in MANAGED_MCP_SPECS]
+        for row in rows:
+            assert row["trust"] == {
+                "tier": "managed",
+                "trusted": False,
+                "image": f"registry.example/{row['name'].split('/')[0]}:1",
+                "claims_declared_by_author": False,
+            }
+
+    def test_each_offers_its_specs_levels_and_owns_its_type(self):
+        for spec, row in zip(MANAGED_MCP_SPECS, _managed_rows()["drivers"]):
+            assert row["legacy_type"] == spec.legacy_type
+            assert row["serves_stored_type"] is True
+            assert [level["id"] for level in row["access_levels"]] == list(
+                spec.ranked_access_ids()
+            )
+            # The connector picks its level in its config, from those levels.
+            assert row["config_schema"]["properties"]["access"]["enum"] == list(
+                spec.ranked_access_ids()
+            )
+
+    def test_the_built_ins_stay_built_in_beside_them(self):
+        registry = builtin_connector_drivers(
+            managed_mcp_images={s.name: "r/x:1" for s in MANAGED_MCP_SPECS}
+        )
+        tiers = {
+            d["name"]: d["trust"]["tier"]
+            for d in capability_matrix(registry)["drivers"]
+        }
+        assert {tiers[name] for name in _BUILTIN_NAMES} == {"builtin"}
+
+    def test_the_cockpit_fixture_is_the_response(self):
+        rendered = json.dumps(_managed_rows(), indent=2) + "\n"
+        if UPDATE:
+            MANAGED_FIXTURE.write_text(rendered)
+        assert MANAGED_FIXTURE.read_text() == rendered, (
+            "the cockpit's managed fixture is stale; regenerate it with "
+            "UPDATE_CONNECTOR_GOLDENS=1 python -m pytest "
+            "tests/test_connector_capability_matrix.py"
+        )
+
+
+class TestDriversOutsideTheTrustedList:
+    def test_every_claim_is_marked_as_the_authors(self):
+        registry = ConnectorDriverRegistry([_ImageDriver(_image_spec())])
+        (entry,) = capability_matrix(registry)["drivers"]
+        assert entry["trust"] == {
+            "tier": "custom",
+            "trusted": False,
+            "image": None,
+            "claims_declared_by_author": True,
+        }
+        assert entry["egress"]["declared"] == {
+            "rules": [{"host": "${config.host}", "ports": [443], "protocol": "tcp"}],
+            "needs_dns": "The host is a name.",
+        }
+        assert entry["egress"]["enforced"]["status"] == "not_enforced"
+        assert entry["egress"]["installation"]["status"] == "not_enforced"
+
+    def test_an_in_process_driver_with_a_foreign_name_is_not_built_in(self):
+        from orchestrator.services.connector_drivers.base import DatasourceDriver
+
+        spec = DriverSpec(
+            **{
+                **{
+                    f: getattr(DATASOURCE_SPECS[0], f)
+                    for f in DATASOURCE_SPECS[0].__dataclass_fields__
+                },
+                "name": "acme.generic/v1",
+            }
+        )
+        registry = ConnectorDriverRegistry([DatasourceDriver(spec)])
+        (entry,) = capability_matrix(registry)["drivers"]
+        assert entry["trust"]["claims_declared_by_author"] is True
+
+
+def _service_driver(*, needs_dns: str | None = None) -> _ImageDriver:
+    from dataclasses import replace
+
+    from shared.connectors.contract import ServiceSpec
+
+    driver = _ImageDriver(
+        replace(
+            _image_spec(), plane="service", service=ServiceSpec(), needs_dns=needs_dns
+        )
+    )
+    driver.image_reference = "ghcr.io/acme/ticketing:1"
+    return driver
+
+
+class TestServicePlaneEgress:
+    """D5: a hosted driver pod's egress is pinned per pod."""
+
+    def test_without_hosting_nothing_is_enforced(self):
+        registry = ConnectorDriverRegistry([_service_driver()])
+        for hosting in (None, HostingStatus(enabled=False)):
+            (entry,) = capability_matrix(registry, hosting=hosting)["drivers"]
+            assert entry["egress"]["enforced"] == {
+                "status": "not_enforced",
+                "reason": "service_hosting_disabled",
+            }
+            assert entry["egress"]["installation"] == entry["egress"]["enforced"]
+
+    def test_hosted_pods_pin_their_declared_hosts(self):
+        registry = ConnectorDriverRegistry([_service_driver()])
+        (entry,) = capability_matrix(registry, hosting=HostingStatus(enabled=True))[
+            "drivers"
+        ]
+        assert entry["egress"]["enforced"] == {
+            "status": "enforced",
+            "reason": "pinned_per_pod",
+            "mechanism": "networkpolicy_ipblock",
+            "dns": "none",
+        }
+        assert entry["egress"]["installation"] == {
+            "status": "unverified",
+            "reason": "start_up_wait_unverified",
+            "namespace_default_deny": True,
+            "start_up_wait": True,
+        }
+        # The pods' image, never a connector's pinned addresses: this matrix
+        # reads no connector.
+        assert entry["trust"]["image"] == "ghcr.io/acme/ticketing:1"
+
+    def test_a_driver_that_needs_dns_says_names_are_unrestricted(self):
+        registry = ConnectorDriverRegistry([_service_driver(needs_dns="SRV records")])
+        (entry,) = capability_matrix(
+            registry, hosting=HostingStatus(enabled=True, enforcement_verified=True)
+        )["drivers"]
+        assert entry["egress"]["enforced"]["reason"] == "pinned_per_pod_with_dns"
+        assert entry["egress"]["enforced"]["dns"] == "cluster_resolver"
+        assert entry["egress"]["installation"]["status"] == "verified"
+
+    def test_built_ins_stay_in_process_with_hosting_on(self):
+        matrix = capability_matrix(
+            builtin_connector_drivers(), hosting=HostingStatus(enabled=True)
+        )
+        assert matrix == capability_matrix(builtin_connector_drivers())
+
+    def test_the_route_passes_this_installations_hosting(self):
+        from orchestrator.routers.datasources import DatasourcesDependencies
+
+        assert DatasourcesDependencies.__dataclass_fields__[
+            "service_hosting"
+        ].default == HostingStatus(enabled=False)
+
+
+class TestNoCredentialValue:
+    def test_write_only_schemas_lose_their_values(self):
+        schema = {
+            "type": "object",
+            "properties": {
+                "host": {"type": "string", "default": "db.example.com"},
+                "secret": {
+                    "type": "object",
+                    "writeOnly": True,
+                    "default": {"k": "v"},
+                    "properties": {"nested": {"type": "string", "examples": ["e"]}},
+                },
+            },
+        }
+        cleaned = public_schema(schema)
+        assert cleaned["properties"]["host"]["default"] == "db.example.com"
+        assert "default" not in cleaned["properties"]["secret"]
+        assert "examples" not in cleaned["properties"]["secret"]["properties"]["nested"]
+
+    def test_a_parent_default_holding_a_secret_childs_value_is_dropped(self):
+        schema = {
+            "type": "object",
+            "default": {"user": "svc", "password": AUTHOR_SECRET},
+            "examples": [{"password": AUTHOR_SECRET}],
+            "properties": {
+                "user": {"type": "string", "default": "svc"},
+                "password": {"type": "string", "writeOnly": True},
+            },
+        }
+        cleaned = public_schema(schema)
+        assert "default" not in cleaned and "examples" not in cleaned
+        assert AUTHOR_SECRET not in json.dumps(cleaned)
+        # A sibling that holds no secret keeps its documentation.
+        assert cleaned["properties"]["user"]["default"] == "svc"
+
+    def test_const_and_enum_inside_a_secret_are_dropped(self):
+        schema = {
+            "type": "object",
+            "properties": {
+                "pin": {"type": "string", "writeOnly": True, "const": AUTHOR_SECRET},
+                "auth": {
+                    "type": "object",
+                    "writeOnly": True,
+                    "properties": {"key": {"enum": [AUTHOR_SECRET, "other"]}},
+                },
+                "mode": {"enum": ["a", "b"]},
+                "backend": {"const": "imap_smtp"},
+            },
+        }
+        cleaned = public_schema(schema)
+        assert AUTHOR_SECRET not in json.dumps(cleaned)
+        assert cleaned["properties"]["pin"] == {"type": "string", "writeOnly": True}
+        assert cleaned["properties"]["auth"]["properties"]["key"] == {}
+        assert cleaned["properties"]["mode"] == {"enum": ["a", "b"]}
+        assert cleaned["properties"]["backend"] == {"const": "imap_smtp"}
+
+    def test_a_secret_pointing_at_a_shared_definition_loses_its_default(self):
+        schema = {
+            "type": "object",
+            "$defs": {"token": {"type": "string", "default": AUTHOR_SECRET}},
+            "properties": {
+                "token": {"$ref": "#/$defs/token", "writeOnly": True},
+                "label": {"$ref": "#/$defs/token"},
+            },
+        }
+        cleaned = public_schema(schema)
+        assert "$defs" not in cleaned
+        assert cleaned["properties"]["token"] == {"type": "string", "writeOnly": True}
+        # The non-secret use of the same definition is inlined with its default.
+        assert cleaned["properties"]["label"] == {
+            "type": "string",
+            "default": AUTHOR_SECRET,
+        }
+        assert "$ref" not in json.dumps(cleaned)
+
+    @pytest.mark.parametrize(
+        "ref",
+        ["https://example.com/schema.json", "#/$defs/missing", "#/$defs/loop"],
+    )
+    def test_a_remote_missing_or_circular_ref_shows_nothing(self, ref):
+        schema = {
+            "type": "object",
+            "$defs": {"loop": {"$ref": "#/$defs/loop", "default": AUTHOR_SECRET}},
+            "properties": {"key": {"$ref": ref, "writeOnly": True}},
+        }
+        cleaned = public_schema(schema)
+        assert cleaned["properties"]["key"] == {}
+        assert AUTHOR_SECRET not in json.dumps(cleaned)
+
+    def test_properties_named_like_keywords_survive_inside_a_secret(self):
+        schema = {
+            "type": "object",
+            "writeOnly": True,
+            "properties": {
+                "default": {"type": "string"},
+                "examples": {"type": "string"},
+                "enum": {"type": "string"},
+            },
+        }
+        cleaned = public_schema(schema)
+        assert set(cleaned["properties"]) == {"default", "examples", "enum"}
+
+    def test_an_authors_secret_default_never_reaches_the_response(self):
+        wire = _client(registry=ConnectorDriverRegistry([_ImageDriver(_image_spec())]))
+        response = wire.client.get("/api/datasources/drivers")
+        assert response.status_code == 200
+        assert AUTHOR_SECRET not in response.text
+        assert '"x"' not in response.text
+        # A non-secret default is the author's documentation and stays.
+        assert "tickets.example.com" in response.text
+
+    def test_the_route_reads_no_connector(self):
+        wire = _client()
+        response = wire.client.get("/api/datasources/drivers")
+        assert response.status_code == 200
+        assert STORED_SECRET not in response.text
+        # Only the registered drivers the caller sees are read (D6): never a
+        # connector.
+        registration_reads = {"get_projects_for_user", "fetch"}
+        for name in set(vars(wire.store)) - registration_reads:
+            getattr(wire.store, name).assert_not_awaited()
+        assert "connector_driver_registrations" in wire.store.fetch.await_args.args[0]
+
+
+class TestRoute:
+    def test_any_approved_user_reads_the_matrix(self, matrix):
+        response = _client().client.get("/api/datasources/drivers")
+        assert response.status_code == 200
+        assert response.json() == matrix
+
+    def test_an_unapproved_caller_is_refused(self):
+        async def refuse(_request, _store):
+            raise HTTPException(status_code=403, detail="not approved")
+
+        response = _client(approved=refuse).client.get("/api/datasources/drivers")
+        assert response.status_code == 403
+
+    def test_the_literal_segment_wins_over_a_datasource_id(self):
+        wire = _client()
+        assert wire.client.get("/api/datasources/drivers").status_code == 200
+        wire.store.get_datasource.assert_not_awaited()
+
+    def test_the_cockpit_fixture_is_the_response(self):
+        body = _client().client.get("/api/datasources/drivers").json()
+        rendered = json.dumps(body, indent=2) + "\n"
+        if UPDATE:
+            FIXTURE.write_text(rendered)
+        assert FIXTURE.read_text() == rendered, (
+            "the cockpit fixture is stale; regenerate it with "
+            "UPDATE_CONNECTOR_GOLDENS=1 python -m pytest "
+            "tests/test_connector_capability_matrix.py"
+        )
+
+
+class TestRegisteredDrivers:
+    """Registered image drivers (D6): a row each, where the caller sees them."""
+
+    def _registration(self, **over):
+        from orchestrator.services.connector_driver_registrations import (
+            registration_from_row,
+        )
+        from shared.connectors.registration import spec_to_json
+
+        spec = spec_to_json(_image_spec())
+        spec.update(
+            name="acme.env/v1",
+            plane="bind_time",
+            delivery_forms=["env_file"],
+            credential_delivery="inline",
+            supported_backends=["sandbox"],
+            env_names=["ACME_TOKEN"],
+        )
+        row = {
+            "id": "00000000-0000-0000-0000-00000000d6d6",
+            "name": "acme.env/v1",
+            "scope_kind": "Account",
+            "owner_id": USER["id"],
+            "project_id": None,
+            "title": "Acme",
+            "description": None,
+            "image_reference": "ghcr.io/acme/env:1",
+            "image_digest": "sha256:" + "1" * 64,
+            "spec": json.dumps(spec),
+            "spec_hash": "sha256:" + "2" * 64,
+            "spec_source": "label",
+            "protocol_version": "1.0",
+            "plane": "bind_time",
+            "source_document": None,
+            "created_by": USER["id"],
+            "created_at": None,
+            "updated_at": None,
+            "disabled_at": None,
+            "disabled_by": None,
+            **over,
+        }
+        return row, registration_from_row(row)
+
+    def test_a_registration_row_carries_its_trust_and_where_it_lives(self):
+        from orchestrator.services.connector_driver_registrations import (
+            DriverTrustPolicy,
+        )
+        from orchestrator.services.connector_drivers.matrix import (
+            registered_driver_entry,
+        )
+
+        _row, registration = self._registration()
+        entry = registered_driver_entry(
+            registration,
+            trust=DriverTrustPolicy().trust(registration.image_reference),
+            hosting=HostingStatus(enabled=True),
+        )
+        assert entry["name"] == "acme.env/v1"
+        assert entry["legacy_type"] == "image_driver"
+        assert entry["serves_stored_type"] is False
+        assert entry["trust"] == {
+            "tier": "custom",
+            "trusted": False,
+            "privileged": False,
+            "image": "ghcr.io/acme/env:1",
+            "claims_declared_by_author": True,
+        }
+        assert entry["registration"]["scope"] == {
+            "kind": "Account",
+            "name": USER["id"],
+        }
+        # The variables its bind may set are visible before anyone uses it.
+        assert entry["registration"]["env_names"] == ["ACME_TOKEN"]
+        assert entry["registration"]["disabled"] is False
+        # Its pods pin their egress like service pods.
+        assert entry["egress"]["enforced"]["status"] == "enforced"
+        trusted = DriverTrustPolicy(trusted_repositories=("ghcr.io/acme",))
+        assert trusted.trust(registration.image_reference)["tier"] == "trusted"
+
+    def test_the_route_lists_the_registrations_the_caller_sees(self):
+        row, _registration = self._registration()
+        wire = _client()
+        # The visible registrations, then (the caller owns it) its usage.
+        wire.store.fetch = AsyncMock(side_effect=[[row], []])
+        body = wire.client.get("/api/datasources/drivers").json()
+        names = [driver["name"] for driver in body["drivers"]]
+        assert names[-1] == "acme.env/v1"
+        assert body["drivers"][-1]["registration"]["can_manage"] is True
+        query, account, projects = wire.store.fetch.await_args_list[0].args
+        assert "connector_driver_registrations" in query
+        assert str(account) == USER["id"]
+        assert projects == []

@@ -20,6 +20,54 @@ describe('detectModelFamily — Muse Spark 1.3', () => {
   );
 });
 
+describe('detectModelFamily — Kimi K3', () => {
+  it.each(['', 'moonshotai/', 'openrouter/moonshotai/'])(
+    'claims K3 but leaves K2.x on default with prefix %s', (prefix) => {
+      expect(detectModelFamily(`${prefix}kimi-k3`)).toBe('kimi-k3');
+      expect(detectModelFamily(`${prefix}Kimi-K3`)).toBe('kimi-k3');
+      expect(detectModelFamily(`${prefix}kimi-k3:batch`)).toBe('kimi-k3');
+      expect(detectModelFamily(`${prefix}kimi-k3[1m]`)).toBe('kimi-k3');
+      expect(detectModelFamily(`${prefix}kimi-k2.6`)).toBe('default');
+      expect(detectModelFamily(`${prefix}kimi-k2.7-code`)).toBe('default');
+      expect(detectModelFamily(`${prefix}kimi-k30`)).toBe('default');
+      expect(detectModelFamily(`${prefix}kimi-k3.5`)).toBe('default');
+    },
+  );
+});
+
+describe('detectModelFamily — Qwen3.8-27B', () => {
+  it('claims the 27B but not Qwen3 8B or the Qwen3.8 API rows', () => {
+    for (const id of ['Qwen/Qwen3.8-27B', 'Qwen/Qwen3.8-27B-FP8', 'qwen/qwen3.8-27b:free', 'openrouter/qwen/qwen3.8-27b']) {
+      expect(detectModelFamily(id)).toBe('qwen3.8-27b');
+    }
+    expect(detectModelFamily('qwen/qwen3-8b')).toBe('qwen');
+    expect(detectModelFamily('qwen/qwen3.8-max-0902')).toBe('qwen3.8-max');
+    expect(detectModelFamily('qwen3.8-270b')).toBe('qwen');
+  });
+});
+
+describe('detectModelFamily — Qwen3.8 Max', () => {
+  it('claims Max and Max Prime but not the text-only open 2.4T or Flash', () => {
+    for (const id of ['qwen3.8-max', 'qwen/qwen3.8-max-0902', 'openrouter/qwen/qwen3.8-max-prime']) {
+      expect(detectModelFamily(id)).toBe('qwen3.8-max');
+    }
+    expect(detectModelFamily('qwen/qwen3.8-2.4t-a95b')).toBe('qwen');
+    expect(detectModelFamily('qwen/qwen3.8-flash')).toBe('qwen');
+    expect(detectModelFamily('qwen3.8-maximal')).toBe('qwen');
+  });
+});
+
+describe('detectModelFamily — Grok 4.7', () => {
+  it('claims 4.7 but leaves older Grok rows on default', () => {
+    for (const id of ['grok-4.7', 'x-ai/grok-4.7-20260916', 'openrouter/x-ai/grok-4.7', 'grok-4.7-fast']) {
+      expect(detectModelFamily(id)).toBe('grok-4.7');
+    }
+    for (const id of ['grok-4.6', 'grok-4.3', 'grok-build-0.1', 'grok-4.70', 'grok-4.7.1']) {
+      expect(detectModelFamily(id)).toBe('default');
+    }
+  });
+});
+
 describe('detectModelFamily — GLM', () => {
   it.each(['', 'z-ai/', 'openrouter/z-ai/', 'zai-org/'])(
     'distinguishes GLM-5.3 Flash vision settings with prefix %s', (prefix) => {
@@ -50,6 +98,31 @@ describe('detectModelFamily — Claude Opus 5', () => {
   it('leaves older Opus rows on the generic family', () => {
     expect(detectModelFamily('claude-opus-4-8')).toBe('claude-opus');
     expect(detectModelFamily('claude-opus-4-5')).toBe('claude-opus');
+  });
+});
+
+describe('detectModelFamily — Claude Opus 5.5', () => {
+  it('maps Opus 5.5 IDs to their own family in both spellings', () => {
+    expect(detectModelFamily('claude-opus-5-5')).toBe('claude-opus-5-5');
+    expect(detectModelFamily('claude-opus-5-5-20260922')).toBe('claude-opus-5-5');
+    expect(detectModelFamily('openrouter/anthropic/claude-opus-5.5')).toBe(
+      'claude-opus-5-5',
+    );
+  });
+
+  it('keeps dated Opus 5 snapshots on claude-opus-5', () => {
+    expect(detectModelFamily('claude-opus-5-20260401')).toBe('claude-opus-5');
+  });
+});
+
+describe('detectModelFamily — Claude Sonnet 5', () => {
+  it('maps Sonnet 5 and 5.5 to one family and keeps 4.x generic', () => {
+    expect(detectModelFamily('claude-sonnet-5')).toBe('claude-sonnet-5');
+    expect(detectModelFamily('claude-sonnet-5-5')).toBe('claude-sonnet-5');
+    expect(detectModelFamily('claude-sonnet-5-5-20260928')).toBe('claude-sonnet-5');
+    expect(detectModelFamily('openrouter/anthropic/claude-sonnet-5.5')).toBe('claude-sonnet-5');
+    expect(detectModelFamily('claude-sonnet-4-6')).toBe('claude-sonnet');
+    expect(detectModelFamily('claude-sonnet-4-5-20250929')).toBe('claude-sonnet');
   });
 });
 
@@ -93,6 +166,23 @@ describe('detectModelFamily — GPT-6', () => {
   it('keeps neighbors unaffected', () => {
     expect(detectModelFamily('gpt-5.6-sol')).toBe('gpt-5.6');
     expect(detectModelFamily('gpt-5')).toBe('gpt-5');
+  });
+});
+
+describe('detectModelFamily — GPT-6.1 Sol', () => {
+  it.each(['', 'openai/', 'codex/', 'openrouter/openai/'])(
+    'resolves Sol through %s', (prefix) => {
+      for (const model of ['gpt-6.1-sol', 'GPT-6.1-SOL', 'gpt-6.1-sol-20260929', 'gpt-6.1-sol:batch']) {
+        expect(detectModelFamily(prefix + model)).toBe('gpt-6.1-sol');
+      }
+    },
+  );
+
+  it('preserves Codex variants and rejects similar names', () => {
+    expect(detectModelFamily('gpt-6.1-sol-codex')).toBe('codex');
+    expect(detectModelFamily('codex/gpt-6.1-sol-codex-spark')).toBe('codex-spark');
+    expect(detectModelFamily('gpt-6.10-sol')).toBe('gpt-6');
+    expect(detectModelFamily('gpt-6.1-solstice')).toBe('gpt-6');
   });
 });
 

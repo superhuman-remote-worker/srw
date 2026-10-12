@@ -15,7 +15,7 @@ fake with ``fail_on=...`` or manipulate its state directly.
 
 from __future__ import annotations
 
-from typing import Optional
+from typing import Any, Optional
 
 from orchestrator.services.cloud import (
     CloudBackendError,
@@ -29,14 +29,31 @@ from orchestrator.services.cloud import (
     UserHome,
     UserId,
 )
+from orchestrator.services.cloud.capabilities import (
+    MATRIX_ROWS,
+    CloudCapability,
+    ProviderCapabilities,
+)
 
 BACKEND_ID = "fake"
+
+#: The fake offers nothing: a test that needs a capability declares its own.
+FAKE_CAPABILITIES = ProviderCapabilities(
+    backend_id=BACKEND_ID,
+    title="Fake",
+    capabilities=tuple(
+        CloudCapability(*row, "unsupported", "an in-memory test double")
+        for row in MATRIX_ROWS
+    ),
+)
 
 
 class FakeMainCloudBackend:
     """Minimal in-memory backend for contract tests."""
 
     backend_id = BACKEND_ID
+    capabilities = FAKE_CAPABILITIES
+    attested_fields: frozenset[str] = frozenset()
 
     def __init__(
         self,
@@ -129,6 +146,18 @@ class FakeMainCloudBackend:
     @property
     def webdav_credentials(self) -> dict[str, str]:
         return {"username": "fake-agent", "password": "fake-password"}
+
+    def cloud_sync_config(
+        self, webdav_url: str, *, target_user_sub: Optional[str] = None
+    ) -> Optional[dict[str, Any]]:
+        return {
+            "backend": self.backend_id,
+            "webdav_url": webdav_url,
+            "auth": {"type": "basic", **self.webdav_credentials},
+        }
+
+    def legacy_folder_id(self, handle: ProjectFolderHandle) -> Optional[int]:
+        return None
 
     # ---------------------------------------------------------------- Lifecycle
 
@@ -408,12 +437,20 @@ class FakeMainCloudBackend:
 
     # ------------------------------------------------------------- Session folders
 
-    async def ensure_session_folder(self, *, session_id: str) -> SessionFolderHandle:
+    async def ensure_session_folder(
+        self, *, session_id: str, exclusive: bool = False
+    ) -> SessionFolderHandle:
         self._ensure_ready()
         self._fail_if_configured()
-        # Idempotent
+        # Idempotent, unless the caller asks for a folder of its own.
         for existing_id in self._session_folders:
             if existing_id == session_id:
+                if exclusive:
+                    raise CloudBackendError(
+                        CloudBackendErrorKind.ALREADY_EXISTS,
+                        f"session folder {session_id} exists",
+                        backend=self.backend_id,
+                    )
                 return SessionFolderHandle(
                     backend=self.backend_id,
                     native_id=f"sessions/{session_id}",

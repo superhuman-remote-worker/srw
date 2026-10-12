@@ -1,9 +1,9 @@
 """Connector knowledge projection: note content, and degradation without Neo4j.
 
 The note is what an agent retrieves when it asks "what can I connect to?", so
-its content is per-type by design: a repository names the clone path, a
-read-write managed connector names the CLI and its env vars, a read-only one
-names the tools instead, and a KB says it is read-only and centrally indexed.
+its content is the driver's to write: a repository names the clone path, a
+managed connector names the tools its access level binds (from the driver's
+spec), and a KB says it is read-only and centrally indexed.
 
 The projection has two legs and they fail independently. Neo4j is optional —
 absent, the pgvector row is still written and no caller sees an error. Only a
@@ -17,6 +17,10 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from orchestrator.services import knowledge_projection as subject
+from orchestrator.services.connector_drivers import builtin_connector_drivers
+
+#: The built-in drivers, as the application's registry holds them.
+DRIVERS = builtin_connector_drivers()
 
 
 PROJECT_ID = "00000000-0000-0000-0000-0000000000b1"
@@ -44,6 +48,7 @@ def _deps(*, conn=None, graph=None, logger=None):
         store=_pool(connection),
         logger=logger or MagicMock(),
         graph=graph if graph is not None else SimpleNamespace(get=lambda: None),
+        connector_drivers=DRIVERS,
     )
 
 
@@ -68,7 +73,7 @@ def test_generic_connector_note_lists_env_var_names_but_no_values():
         "credentials": {"env_vars": {"PROD_PASSWORD": "hunter2"}},
     }
 
-    content = subject.build_datasource_note_content(ds)
+    content = subject.build_datasource_note_content(ds, drivers=DRIVERS)
 
     assert "## Connector: Production DB" in content
     assert "The prod store" in content
@@ -86,14 +91,14 @@ def test_generic_connector_note_tolerates_json_string_credentials():
     }
 
     assert "`TOKEN` — available in workspace" in subject.build_datasource_note_content(
-        ds
+        ds, drivers=DRIVERS
     )
 
 
 def test_generic_connector_note_tolerates_unparseable_credentials():
     ds = {"type": "generic", "name": "Broken", "credentials": "not json"}
 
-    content = subject.build_datasource_note_content(ds)
+    content = subject.build_datasource_note_content(ds, drivers=DRIVERS)
 
     assert content == "## Connector: Broken"
 
@@ -105,7 +110,7 @@ def test_repository_note_slugs_the_name_into_the_clone_path():
         "default_branch": "trunk",
     }
 
-    content = subject.build_datasource_note_content(ds)
+    content = subject.build_datasource_note_content(ds, drivers=DRIVERS)
 
     assert "## Repository: My Awesome Repo!!!" in content
     assert "Cloned to `./repos/my-awesome-repo/`" in content
@@ -120,7 +125,7 @@ def test_kb_note_states_the_release_read_only_rule_and_the_root():
         "config": {"root_path": "knowledge/"},
     }
 
-    content = subject.build_datasource_note_content(ds)
+    content = subject.build_datasource_note_content(ds, drivers=DRIVERS)
 
     assert "## OKF Knowledge Base: Vault" in content
     assert "Centrally indexed and read-only to agents in this release." in content
@@ -129,21 +134,24 @@ def test_kb_note_states_the_release_read_only_rule_and_the_root():
 
 
 @pytest.mark.parametrize(
-    "ds_type,tool,env",
+    "ds_type,write_tool,cli",
     [
-        ("postgresql", "psql", "PGHOST"),
-        ("neo4j", "cypher-shell", "NEO4J_URI"),
-        ("mongodb", "mongosh", "MONGOSH_URI"),
+        ("postgresql", "sql_execute", "psql"),
+        ("neo4j", "cypher_execute", "cypher-shell"),
+        ("mongodb", "mongo_insert", "mongosh"),
     ],
 )
-def test_a_read_write_managed_connector_names_its_cli_and_env(ds_type, tool, env):
+def test_a_read_write_managed_connector_names_its_write_tools_not_a_cli(
+    ds_type, write_tool, cli
+):
     ds = {"type": ds_type, "name": "Analytics", "project_read_only": False}
 
-    content = subject.build_datasource_note_content(ds)
+    content = subject.build_datasource_note_content(ds, drivers=DRIVERS)
 
-    assert "**Access:** full (CLI)" in content
-    assert f"`{tool}`" in content
-    assert env in content
+    assert "**Access:** read-write (tools)" in content
+    assert f"`{write_tool}`" in content
+    assert cli not in content
+    assert "CLI" not in content
 
 
 @pytest.mark.parametrize(
@@ -157,7 +165,7 @@ def test_a_read_write_managed_connector_names_its_cli_and_env(ds_type, tool, env
 def test_a_read_only_managed_connector_names_tools_and_denies_the_cli(ds_type, tool):
     ds = {"type": ds_type, "name": "Analytics", "project_read_only": True}
 
-    content = subject.build_datasource_note_content(ds)
+    content = subject.build_datasource_note_content(ds, drivers=DRIVERS)
 
     assert "**Access:** read-only (tools)" in content
     assert tool in content
@@ -167,7 +175,7 @@ def test_a_read_only_managed_connector_names_tools_and_denies_the_cli(ds_type, t
 def test_a_read_write_webdav_connector_lists_the_write_tools():
     ds = {"type": "webdav", "name": "Files", "project_read_only": False}
 
-    content = subject.build_datasource_note_content(ds)
+    content = subject.build_datasource_note_content(ds, drivers=DRIVERS)
 
     assert "**Access:** read-write" in content
     assert "`webdav_write`" in content
@@ -177,7 +185,7 @@ def test_a_read_write_webdav_connector_lists_the_write_tools():
 def test_a_read_only_webdav_connector_omits_the_write_tools():
     ds = {"type": "webdav", "name": "Files", "project_read_only": True}
 
-    content = subject.build_datasource_note_content(ds)
+    content = subject.build_datasource_note_content(ds, drivers=DRIVERS)
 
     assert "**Access:** read-only" in content
     assert "`webdav_write`" not in content
@@ -187,7 +195,82 @@ def test_a_read_only_webdav_connector_omits_the_write_tools():
 def test_an_unknown_type_still_produces_a_minimal_note():
     ds = {"type": "smoke-signal", "name": "Odd", "description": "who knows"}
 
-    assert subject.build_datasource_note_content(ds) == "## Connector: Odd\nwho knows"
+    assert (
+        subject.build_datasource_note_content(ds, drivers=DRIVERS)
+        == "## Connector: Odd\nwho knows"
+    )
+    assert (
+        subject.datasource_retrieval_messages(ds, drivers=DRIVERS)[0]
+        == "Odd database connection"
+    )
+
+
+@pytest.mark.parametrize("read_only", [False, True])
+@pytest.mark.parametrize("ds_type", ["postgresql", "neo4j", "mongodb", "webdav"])
+def test_a_managed_note_lists_exactly_its_access_levels_tools(ds_type, read_only):
+    """The tools come from the spec's access level, so a read-only link never
+    advertises a tool it does not bind (the Neo4j note used to)."""
+    from shared.connectors.builtin import spec_for_type
+
+    spec = spec_for_type(ds_type)
+    level = spec.access_level("ReadOnly" if read_only else "ReadWrite")
+    content = subject.build_datasource_note_content(
+        {"type": ds_type, "name": "X", "project_read_only": read_only},
+        drivers=DRIVERS,
+    )
+    listed = [
+        line.split("`")[1] for line in content.splitlines() if line.startswith("- `")
+    ]
+    assert listed == list(level.tools)
+
+
+def test_the_registry_is_required():
+    """No module-level fallback: the application passes its registry."""
+    import dataclasses
+    import inspect
+
+    fields = {
+        field.name: field
+        for field in dataclasses.fields(subject.KnowledgeProjectionDependencies)
+    }
+    assert fields["connector_drivers"].default is dataclasses.MISSING
+    for function in (
+        subject.build_datasource_note_content,
+        subject.datasource_retrieval_messages,
+    ):
+        parameter = inspect.signature(function).parameters["drivers"]
+        assert parameter.default is inspect.Parameter.empty
+    assert not hasattr(subject, "_builtin_drivers")
+
+
+def test_the_note_is_the_drivers_to_write():
+    """A registry passed in decides, as the application's own registry does."""
+    from orchestrator.services.connector_drivers import ConnectorDriverRegistry
+    from orchestrator.services.connector_drivers.env import GenericDriver
+
+    class Custom(GenericDriver):
+        def knowledge_note(self, row):
+            return f"custom note for {row['name']}"
+
+        def retrieval_messages(self, row):
+            return ["custom phrase"]
+
+    drivers = ConnectorDriverRegistry([Custom()])
+    ds = {"type": "generic", "name": "Mine"}
+    assert (
+        subject.build_datasource_note_content(ds, drivers=drivers)
+        == "custom note for Mine"
+    )
+    assert subject.datasource_retrieval_messages(ds, drivers=drivers) == [
+        "custom phrase"
+    ]
+    # A type the registry does not serve gets the bare note.
+    assert (
+        subject.build_datasource_note_content(
+            {"type": "kb", "name": "K", "description": "d"}, drivers=drivers
+        )
+        == "## Connector: K\nd"
+    )
 
 
 # =============================================================================

@@ -212,6 +212,68 @@ excluded_rules = [
 #                Preserve shipped SQL bytes: retrofitting NOT VALID, IF EXISTS,
 #                or concurrent indexes would cause checksum drift. These are
 #                exact-file exceptions; future migrations retain all rules.
+#        - app/0258: one constraint-missing-not-valid on the new 0257 retry
+#                ledger. Both migrations enter develop together with creation
+#                admission disabled; the ledger has no pre-rollout writers.
+#                The pair constraint must be atomic with its new columns.
+#        - app/0261: one constraint-missing-not-valid on same-transaction
+#                validation of the effect-kind check. The 0258 effect ledger
+#                is new in this rollout, and the replacement only widens its
+#                accepted values, so every existing row satisfies it. Keeping
+#                the replacement atomic avoids an unconstrained interval.
+#                These two exact files have also already been applied to the
+#                preserved disposable acceptance database. Preserve their SQL
+#                checksums; all other new migrations retain full lint coverage.
+#        - app/0272-0275, 0277, 0278, 0280: 32 findings from the idle-lifecycle
+#                and thread-owned VM resource rollout, reported by develop run
+#                35974496286 after the files had been replayed on the scratch
+#                and acceptance databases (see the 2026-09-2x VM reports in
+#                knowledge-base/knowledge/superpowers/plans/). The shapes:
+#                * Every constraint-missing-not-valid CHECK constrains columns
+#                  added by the SAME ALTER, whose defaults satisfy it (new
+#                  columns all NULL, owner_kind DEFAULT 'job', resource_version
+#                  DEFAULT 1, release_kind DEFAULT 'stateless'), or replaces a
+#                  check with a strictly wider one (0277 adds 'pinned_thread').
+#                  That is the app/0123 carve-out: the scan can only see rows it
+#                  accepts, and NOT VALID would open a window for a bad row.
+#                * The indexes and FKs in 0272/0273/0275 are on
+#                  vm_idle_operations, which app/0270 creates in this same
+#                  rollout, or point at tables created in the same file
+#                  (pinned_job_deliveries, pinned_job_wait_receipts). Each file
+#                  is transactional-atomic with the triggers that enforce the
+#                  same invariant, so CONCURRENTLY cannot be used (the app/0117
+#                  shape).
+#                * 0274/0278/0280 touch the small VM admission ledgers from
+#                  app/0257 and app/0264 (vm_creation_retries,
+#                  vm_resource_waiters, vm_resource_reservations), whose size
+#                  is bounded by VM count. 0278's new FK columns start all
+#                  NULL, so validation is trivial. The SHARE ROW EXCLUSIVE
+#                  lock that an FK takes on the table it references
+#                  (threads/agents here, job_completion_commands in 0272) is
+#                  waited for at most 2 s, the file's lock_timeout.
+#                * 0278's five ban-drop-not-null findings are that migration's
+#                  purpose: a thread-owned creation retry or resource waiter
+#                  has no job_id/execution_*. The exact-owner CHECKs added in
+#                  the same ALTER keep them NOT NULL for every owner_kind='job'
+#                  row, and only the thread-owned admission path writes
+#                  owner_kind='thread'.
+#                Preserve their SQL checksums. All other new migrations keep
+#                full lint coverage.
+#        - app/0323: native non-quota retirement deliberately permits NULL
+#                reservation pairs. Quota v3 still requires its exact debit;
+#                the same-transaction pair CHECK refuses half-null identities.
+#                Its validation can only accept prior NOT NULL pairs, on the
+#                bounded VM cleanup-authority ledger, under lock_timeout=2s
+#                and statement_timeout=30s. The three findings are the two
+#                intentional DROP NOT NULL statements and that atomic CHECK.
+#                These exact bytes were applied by the isolated R3.3c fresh,
+#                upgrade and real-PG acceptance runs before publication (0323
+#                SHA256 2859c2488a807331e1d9ccf7df73ce56695d22b9cbcf52e1160c2f48c6454c4b).
+#                Preserve the checksum, following the existing frozen-history
+#                policy above. tests/test_r33c_publication_ci.py pins the bytes;
+#                test_vm_nonquota_retained_resume_real_postgres.py exercises
+#                non-quota authority, while quota/refusal suites remain intact.
+#                Both rules stay enabled for every other migration.
 excluded_paths = [
     "src/orchestrator/database/migrations/app/0001_initial.sql",
     "src/orchestrator/database/migrations/vector/0001_initial.sql",
@@ -237,5 +299,15 @@ excluded_paths = [
     "src/orchestrator/database/migrations/app/0254_vm_workspace_recovery_reconciler.sql",
     "src/orchestrator/database/migrations/app/0255_vm_workspace_recovery_controller_evidence.sql",
     "src/orchestrator/database/migrations/app/0256_vm_workspace_cleanup_delegation.sql",
+    "src/orchestrator/database/migrations/app/0258_vm_creation_effects.sql",
+    "src/orchestrator/database/migrations/app/0261_vm_creation_attachment_effect.sql",
+    "src/orchestrator/database/migrations/app/0272_vm_idle_terminal_review.sql",
+    "src/orchestrator/database/migrations/app/0273_vm_idle_access_wake_lineage.sql",
+    "src/orchestrator/database/migrations/app/0274_vm_resource_whole_launcher.sql",
+    "src/orchestrator/database/migrations/app/0275_vm_idle_pinned_job.sql",
+    "src/orchestrator/database/migrations/app/0277_vm_idle_pinned_session.sql",
+    "src/orchestrator/database/migrations/app/0278_vm_resource_thread_runtime.sql",
+    "src/orchestrator/database/migrations/app/0280_vm_thread_cancel_carrier.sql",
+    "src/orchestrator/database/migrations/app/0323_nonquota_retained_vm_resume.sql",
     "src/orchestrator/database/migrations/vector/0008_kb_index_chunking.sql",
 ]

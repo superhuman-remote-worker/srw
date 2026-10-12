@@ -8,8 +8,9 @@ agents never see connectors you didn't attach.
 
 ## Supported types
 
-- **MCP Server** — tools discovered from a remote HTTP/SSE server or a trusted
-  local stdio command, when MCP connectors are enabled on the deployment.
+- **MCP Server** — tools discovered from a remote HTTP/SSE server, when MCP
+  connectors are enabled on the deployment. A local stdio command no longer
+  runs inside the agent; a stdio server's image runs as a managed MCP server.
 - **PostgreSQL, MongoDB, and Neo4j** — relational, document, and graph
   database access.
 - **WebDAV** — cloud file storage (this is how the built-in cloud storage and
@@ -21,7 +22,15 @@ agents never see connectors you didn't attach.
 - **OKF Knowledge Base** — centrally indexed Markdown knowledge the agent can
   search and read.
 - **Credential files** — kubeconfig, SSH key, or a generic file the agent
-  needs to reach some other system.
+  needs to reach some other system, delivered to a sandbox or VM workspace.
+  A kubeconfig or generic file lands at its path under the workspace home
+  (kubeconfigs are merged into `~/.kube/config`, so `kubectl` works as is);
+  an SSH key is held by an ssh-agent and never written to disk. A file's
+  path must be in a credential location (`~/.kube/`, `~/.aws/`, `~/.azure/`,
+  `~/.docker/`, `~/.srw-files/`, a few `~/.config/<app>/` directories,
+  `~/.netrc`, `~/.pgpass`), and the files go when the session ends or the job
+  finishes. A job that ends while paused or waiting for review keeps them in
+  its workspace until the job is deleted.
 - **Credentials** — named environment variables for API keys or website
   logins, delivered to a sandbox or VM workspace. Scripts read them from the
   environment; browser forms use `browser_type(ref=..., env_var="NAME")`.

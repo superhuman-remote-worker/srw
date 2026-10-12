@@ -86,14 +86,16 @@ def _reset_agent_globals():
     import agent.api.persistent_app as mod
 
     mod._session = None
-    mod._thread_id = None
-    mod._pinned_status_identity_enabled = False
-    mod._pinned_runtime_generation_enabled = False
-    mod._session_runtime_generation = None
-    mod._session_runtime_attach_token = None
+    mod._session_identity._thread_id = None
+    mod._session_identity._status_contract = False
+    mod._session_identity._runtime_contract = False
+    mod._session_identity._session_generation = None
+    mod._session_identity._attach_token = None
     mod._orchestrator_client = None
     mod._subscribers.clear()
-    mod._loop_user_queue = None
+    mod._session_input._queue = None
+    mod._session_termination.termination_admission_fenced = False
+    mod._session_termination.termination_fence_reason = None
 
 
 def _install_session(*, turn_count: int, headless_mode: str = "eager"):
@@ -109,28 +111,41 @@ def _install_session(*, turn_count: int, headless_mode: str = "eager"):
     session.config.interactive.idle_timeout_minutes = 0
     session.config.headless = HeadlessConfig(mode=headless_mode)
     mod._session = session
-    mod._thread_id = "thread-phase6"
+    mod._session_identity._thread_id = "thread-phase6"
     client = AsyncMock()
     client.update_thread_status = AsyncMock(return_value=True)
     mod._orchestrator_client = client
-    mod._loop_user_queue = asyncio.Queue()
+    mod._session_input._queue = asyncio.Queue()
     return session, client
 
 
 def test_reset_agent_globals_clears_pinned_identity_protocol() -> None:
     import agent.api.persistent_app as mod
 
-    mod._pinned_status_identity_enabled = True
-    mod._pinned_runtime_generation_enabled = True
-    mod._session_runtime_generation = "leaked-generation"
-    mod._session_runtime_attach_token = "leaked-attach"
+    mod._session_identity._status_contract = True
+    mod._session_identity._runtime_contract = True
+    mod._session_identity._session_generation = "leaked-generation"
+    mod._session_identity._attach_token = "leaked-attach"
 
     _reset_agent_globals()
 
-    assert mod._pinned_status_identity_enabled is False
-    assert mod._pinned_runtime_generation_enabled is False
-    assert mod._session_runtime_generation is None
-    assert mod._session_runtime_attach_token is None
+    assert mod._session_identity.status_contract is False
+    assert mod._session_identity.runtime_contract is False
+    assert mod._session_identity.session_generation is None
+    assert mod._session_identity.attach_token is None
+
+
+def test_reset_agent_globals_clears_process_termination_admission(monkeypatch):
+    """A previous lifespan shutdown cannot park this fake session's input."""
+    import agent.api.persistent_app as mod
+
+    monkeypatch.setattr(mod._session_termination, "termination_admission_fenced", True)
+    monkeypatch.setattr(
+        mod._session_termination, "termination_fence_reason", "prior-shutdown"
+    )
+    _reset_agent_globals()
+    assert mod._session_termination.termination_admission_fenced is False
+    assert mod._session_termination.termination_fence_reason is None
 
 
 class TestPoliteModeFlip:
@@ -151,8 +166,8 @@ class TestPoliteModeFlip:
         await asyncio.sleep(0)
         client.update_thread_status.reset_mock()
 
-        mod._loop_user_queue.put_nowait("hi")
-        await mod._loop_get_user_input()
+        mod._session_input.queue.put_nowait("hi")
+        await asyncio.wait_for(mod._session_input.get_user_input(), timeout=1)
         await asyncio.sleep(0)
 
         client.update_thread_status.assert_awaited_with(
@@ -166,9 +181,9 @@ class TestPoliteModeFlip:
         import agent.api.persistent_app as mod
 
         _, client = _install_session(turn_count=0, headless_mode="polite")
-        mod._loop_user_queue.put_nowait("hi")
+        mod._session_input.queue.put_nowait("hi")
 
-        await mod._loop_get_user_input()
+        await asyncio.wait_for(mod._session_input.get_user_input(), timeout=1)
         await asyncio.sleep(0)
 
         client.update_thread_status.assert_not_called()
@@ -183,8 +198,8 @@ class TestPoliteModeFlip:
         await asyncio.sleep(0)
         client.update_thread_status.reset_mock()
 
-        mod._loop_user_queue.put_nowait("hi")
-        await mod._loop_get_user_input()
+        mod._session_input.queue.put_nowait("hi")
+        await asyncio.wait_for(mod._session_input.get_user_input(), timeout=1)
         await asyncio.sleep(0)
 
         for call in client.update_thread_status.await_args_list:
@@ -196,9 +211,9 @@ class TestPoliteModeFlip:
         import agent.api.persistent_app as mod
 
         _, client = _install_session(turn_count=2, headless_mode="eager")
-        mod._loop_user_queue.put_nowait("hi")
+        mod._session_input.queue.put_nowait("hi")
 
-        await mod._loop_get_user_input()
+        await asyncio.wait_for(mod._session_input.get_user_input(), timeout=1)
         await asyncio.sleep(0)
 
         client.update_thread_status.assert_awaited_with(
@@ -216,8 +231,8 @@ class TestPoliteModeFlip:
         # the downstream idle-timeout read works.
         del mod._session.config.headless
 
-        mod._loop_user_queue.put_nowait("hi")
-        await mod._loop_get_user_input()
+        mod._session_input.queue.put_nowait("hi")
+        await asyncio.wait_for(mod._session_input.get_user_input(), timeout=1)
         await asyncio.sleep(0)
 
         # Eager fallback + no subscribers → should flip.
@@ -237,7 +252,7 @@ class TestSweeperPerThreadTTL:
 
     @pytest.mark.asyncio
     async def test_sweeper_sql_joins_users_and_coalesces(self, monkeypatch):
-        import orchestrator.main as orch_main
+        from orchestrator.services import session_attention
 
         captured: dict = {}
         evt = asyncio.Event()
@@ -260,24 +275,36 @@ class TestSweeperPerThreadTTL:
             async def __aexit__(self_inner, exc_type, exc, tb):
                 return None
 
-        # monkeypatch, not bare assignment: these are module globals, and a
-        # leaked MagicMock `postgres_db` breaks every later test in the run
-        # that awaits a real DB method.
+        # The store and suspension service are the sweeper's dependencies; the
+        # presence promotion is a module-level name looked up in
+        # ``session_attention`` at call time (monkeypatch restores it).
         fake_db = MagicMock()
         fake_db.acquire = lambda: _Acquire()
-        monkeypatch.setattr(orch_main, "postgres_db", fake_db)
         monkeypatch.setattr(
-            orch_main,
+            session_attention,
             "promote_expired_stateless_pauses",
             AsyncMock(return_value=[]),
         )
+        # The default TTL is a module global read per sweep; a non-default
+        # value proves the bound parameter comes from it, not a literal 60.
+        monkeypatch.setattr(session_attention, "ATTENTION_SLEEP_MINUTES", 17)
 
         suspension = MagicMock()
         suspension.is_enabled = True
         suspension.suspend_thread_workspace = AsyncMock(return_value=False)
-        monkeypatch.setattr(orch_main, "workspace_suspension_service", suspension)
+        dependencies = session_attention.SessionAttentionDependencies(
+            store=fake_db,
+            container_provisioner=MagicMock(),
+            workspace_suspension=suspension,
+            persistent_provisioner=None,
+            persistent_thread_recycler=lambda: None,
+            emit_session_provisioning_failure=AsyncMock(),
+            thread_retirement_operations=MagicMock(),
+            notification_service=MagicMock(),
+            cockpit_url=lambda: "http://localhost:4200",
+        )
 
-        await orch_main.attention_sleep_sweeper(evt)
+        await session_attention.attention_sleep_sweeper(evt, dependencies=dependencies)
 
         q = captured.get("query", "")
         assert "LEFT JOIN users" in q
@@ -285,4 +312,4 @@ class TestSweeperPerThreadTTL:
         assert "t.metadata->'config_override'->'headless'" in q
         assert "u.settings->'persistent_agent'" in q
         # Global default is the only bound parameter, passed as int.
-        assert captured.get("args") == (int(orch_main._ATTENTION_SLEEP_MINUTES),)
+        assert captured.get("args") == (int(session_attention.ATTENTION_SLEEP_MINUTES),)

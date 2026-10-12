@@ -181,10 +181,19 @@ class AudioHelper:
 
     def __init__(self):
         """Initialize the Audio Helper with configuration from environment."""
-        primary_key = os.getenv("OPENAI_API_KEY", "")
+        from shared.runtime.core.transport_resolution import (
+            is_openai_default_endpoint,
+        )
 
-        self.api_key = os.getenv("WHISPER_API_KEY", primary_key)
+        # OPENAI_API_KEY is the fallback only when the endpoint IS OpenAI (a
+        # key follows its endpoint).
         self.api_base = os.getenv("WHISPER_BASE_URL", self.OPENAI_API_URL)
+        primary_key = (
+            os.getenv("OPENAI_API_KEY", "")
+            if is_openai_default_endpoint(self.api_base)
+            else ""
+        )
+        self.api_key = os.getenv("WHISPER_API_KEY", primary_key)
         self.model = os.getenv("WHISPER_MODEL", "whisper-1")
         self.timeout = float(os.getenv("WHISPER_TIMEOUT", "300"))
         self.default_language = os.getenv("WHISPER_LANGUAGE")

@@ -73,6 +73,13 @@ When the corresponding tools are actually loaded, a session can:
 - request a safe-point pause or cancel a job; and
 - inspect the current project's jobs and repository metadata.
 
+`create_job` also takes `workspace`, which can be:
+- a template name, such as `"container-minimal"`;
+- `"none"`;
+- omitted, for the project default.
+
+A child job inherits its parent's workspace.
+
 Some workspace tiers also expose a project-repository checkout or a workspace
 upgrade request. Treat those as current-session capabilities, not universal
 Fleet features.

@@ -24,13 +24,17 @@ import pytest
 from orchestrator.services.cloud import (
     CloudBackendError,
     CloudBackendErrorKind,
+    CloudMountSubject,
     NextcloudBackend,
     ProjectFolderHandle,
 )
 from orchestrator.services.cloud.config import NextcloudSettings
+from orchestrator.services.cloud.folder_grants import principal_ids
 
 NEXTCLOUD_BASE = "https://nc.example.com"
 AGENT_USER = "agent-service"
+_WRITER = principal_ids("writer", "11111111-1111-4111-8111-111111111111")[0]
+_READER = principal_ids("reader", "11111111-1111-4111-8111-111111111111")[0]
 # Mountpoint with a space → exercises URL-encoding end-to-end (the real
 # "NC Validation Project" group folder has one too).
 MOUNTPOINT = "Test Project"
@@ -294,6 +298,49 @@ class TestRemoveUserFromGroup:
         assert b"grp1" in seen["content"]  # groupid sent in the request body
 
 
+class TestEnsureSessionFolderExclusive:
+    """An exclusive create refuses a folder that exists already (the job
+    outbox copies only into a folder of its own); a plain one reuses it."""
+
+    def _backend(self, existing: set[str]) -> tuple[NextcloudBackend, list[str]]:
+        made: list[str] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            assert request.method == "MKCOL"
+            path = unquote(request.url.path).split(f"/files/{AGENT_USER}/", 1)[1]
+            if path in existing:
+                return httpx.Response(405)
+            made.append(path)
+            return httpx.Response(201)
+
+        be = NextcloudBackend(_nc_test_settings())
+        be._client = httpx.AsyncClient(
+            base_url=NEXTCLOUD_BASE, transport=httpx.MockTransport(handler)
+        )
+        be._initialized = True
+        return be, made
+
+    @pytest.mark.asyncio
+    async def test_an_existing_folder_is_refused_only_when_exclusive(self):
+        be, _made = self._backend({"sessions", "sessions/report-1"})
+
+        with pytest.raises(CloudBackendError) as ei:
+            await be.ensure_session_folder(session_id="report-1", exclusive=True)
+        assert ei.value.kind is CloudBackendErrorKind.ALREADY_EXISTS
+
+        handle = await be.ensure_session_folder(session_id="report-1")
+        assert handle.native_id == "sessions/report-1"
+
+    @pytest.mark.asyncio
+    async def test_an_existing_parent_never_refuses(self):
+        be, made = self._backend({"sessions"})
+
+        handle = await be.ensure_session_folder(session_id="report-2", exclusive=True)
+
+        assert handle.native_id == "sessions/report-2"
+        assert made == ["sessions/report-2"]
+
+
 def _install_fake(backend: NextcloudBackend, fake: FakeNextcloud) -> None:
     """Wire a pre-initialized adapter up to the fake server."""
     backend._client = httpx.AsyncClient(
@@ -552,3 +599,198 @@ class TestUninitialized:
         with pytest.raises(CloudBackendError) as ei:
             await be.list_project_folder(_handle())
         assert ei.value.kind == CloudBackendErrorKind.UNAVAILABLE
+
+
+class TestRcloneMountSpec:
+    """rclone's nextcloud vendor builds chunked uploads from a
+    /dav/files/<user>/ URL and refuses any other ("the remote url looks
+    incorrect"): a Group Folder's /dav/groupfolders/ URL mounts with
+    whole-file uploads, every other surface keeps chunking."""
+
+    @pytest.mark.asyncio
+    async def test_a_group_folder_mounts_without_chunked_uploads(self):
+        be = NextcloudBackend(_nc_test_settings())
+        spec = await be.build_rclone_mount_spec(
+            handle=_handle(),
+            mount_kind="project",
+            target_path="/cloud/test",
+            access="read_write",
+            subject=CloudMountSubject(username=_WRITER, credential="writer-pw"),
+        )
+        assert spec.source_config["url"].startswith(
+            f"{NEXTCLOUD_BASE}/remote.php/dav/groupfolders/{_WRITER}/"
+        )
+        assert spec.source_config["user"] == _WRITER
+        assert spec.auth == {"type": "basic", "password": "writer-pw"}
+        assert spec.source_config["nextcloud_chunk_size"] == "0"
+        assert spec.source_config["vendor"] == "nextcloud"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "subject",
+        [
+            None,
+            CloudMountSubject(),
+            CloudMountSubject(username=AGENT_USER),
+            CloudMountSubject(username=_WRITER),
+        ],
+    )
+    async def test_a_project_folder_is_never_mounted_as_the_service_account(
+        self, subject
+    ):
+        """Main cloud slice 7: no per-folder grant, no project mount."""
+        be = NextcloudBackend(_nc_test_settings())
+        with pytest.raises(CloudBackendError) as caught:
+            await be.build_rclone_mount_spec(
+                handle=_handle(),
+                mount_kind="project",
+                target_path="/cloud/test",
+                access="read_write",
+                subject=subject,
+            )
+        assert caught.value.kind == CloudBackendErrorKind.NOT_SUPPORTED
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("username", "access"),
+        [
+            (AGENT_USER, "read_write"),
+            ("admin", "read_only"),
+            (_READER, "read_write"),
+            # Read-only is the reader's doing, never a writer behind a flag.
+            (_WRITER, "read_only"),
+            (_WRITER, "protected"),
+            (_READER, "protected"),
+        ],
+    )
+    async def test_only_a_grant_principal_at_its_level_is_mounted(
+        self, username, access
+    ):
+        be = NextcloudBackend(_nc_test_settings())
+        with pytest.raises(CloudBackendError) as caught:
+            await be.build_rclone_mount_spec(
+                handle=_handle(),
+                mount_kind="project",
+                target_path="/cloud/test",
+                access=access,
+                subject=CloudMountSubject(username=username, credential="pw"),
+            )
+        assert caught.value.kind == CloudBackendErrorKind.INVALID_REQUEST
+
+    @pytest.mark.asyncio
+    async def test_a_reader_mounts_read_only_over_the_public_url_on_a_vm(self):
+        be = NextcloudBackend(_nc_test_settings())
+        spec = await be.build_rclone_mount_spec(
+            handle=_handle(),
+            mount_kind="project",
+            target_path="/cloud/test",
+            access="read_only",
+            subject=CloudMountSubject(username=_READER, credential="reader-pw"),
+            prefer_public_url=True,
+        )
+        assert spec.source_config["user"] == _READER
+        assert spec.source_config["url"].startswith(
+            f"{be._public_url}/remote.php/dav/groupfolders/{_READER}/"
+        )
+
+    @pytest.mark.asyncio
+    async def test_ends_reconstruction_of_an_old_mount_keeps_its_bytes(self):
+        """The old rule's in-workspace mount, rebuilt for End to adopt and
+        remove its resident process: the service account, as it was."""
+        be = NextcloudBackend(_nc_test_settings())
+        spec = await be.build_rclone_mount_spec(
+            handle=_handle(),
+            mount_kind="project",
+            target_path="/cloud/test",
+            access="read_write",
+            subject=CloudMountSubject(legacy_service_account=True),
+        )
+        assert spec.source_config["user"] == AGENT_USER
+        assert spec.source_config["url"].startswith(
+            f"{NEXTCLOUD_BASE}/remote.php/dav/groupfolders/{AGENT_USER}/"
+        )
+
+    @staticmethod
+    def _home(uid: str = "a" * 64):
+        return ProjectFolderHandle(
+            backend="nextcloud",
+            native_id=f"home:{uid}",
+            vendor_meta={"kind": "user_home", "username": uid},
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_user_root_mounts_as_its_user_with_chunked_uploads(self):
+        """Main cloud slice 4: the user's own account, its own app password
+        (as the login name it was issued for), the account's /dav/files/."""
+        be = NextcloudBackend(_nc_test_settings())
+        uid = "a" * 64
+        spec = await be.build_rclone_mount_spec(
+            handle=self._home(uid),
+            mount_kind="user_root",
+            target_path="/cloud/my_cloud",
+            access="read_write",
+            subject=CloudMountSubject(username="ann", credential="app-pw"),
+        )
+        assert spec.source_config == {
+            "url": f"{NEXTCLOUD_BASE}/remote.php/dav/files/{uid}/",
+            "vendor": "nextcloud",
+            "user": "ann",
+        }
+        assert spec.auth == {"type": "basic", "password": "app-pw"}
+        assert "nextcloud_chunk_size" not in spec.source_config
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "subject",
+        [
+            None,
+            CloudMountSubject(username="ann"),
+            CloudMountSubject(credential="app-pw"),
+            CloudMountSubject(legacy_service_account=True),
+        ],
+    )
+    async def test_a_user_root_without_its_users_credential_never_mounts(
+        self, subject, monkeypatch
+    ):
+        # The old env escape hatch is gone: nothing but the user's own
+        # credential mounts their root.
+        monkeypatch.setenv("NEXTCLOUD_RCLONE_USER_HOME_USERNAME", "a" * 64)
+        monkeypatch.setenv("NEXTCLOUD_RCLONE_USER_HOME_PASSWORD", "env-pw")
+        be = NextcloudBackend(_nc_test_settings())
+        with pytest.raises(CloudBackendError) as caught:
+            await be.build_rclone_mount_spec(
+                handle=self._home(),
+                mount_kind="user_root",
+                target_path="/cloud/my_cloud",
+                access="read_write",
+                subject=subject,
+            )
+        assert caught.value.kind == CloudBackendErrorKind.NOT_SUPPORTED
+
+    def test_it_grants_user_roots(self):
+        from orchestrator.services.cloud.user_root_grant import (
+            SupportsUserRootGrant,
+        )
+
+        be = NextcloudBackend(_nc_test_settings())
+        assert isinstance(be, SupportsUserRootGrant)
+        assert be.capabilities.offers(
+            "cloud_folder", "user_root", "read_write", workspace_backend="sandbox"
+        )
+        assert not be.capabilities.offers(
+            "cloud_folder", "user_root", "read_write", workspace_backend="vm"
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_session_folder_keeps_chunked_uploads(self):
+        from orchestrator.services.cloud import SessionFolderHandle
+
+        be = NextcloudBackend(_nc_test_settings())
+        spec = await be.build_rclone_mount_spec(
+            handle=SessionFolderHandle(backend="nextcloud", native_id="sessions/ab"),
+            mount_kind="session_folder",
+            target_path="/cloud/home",
+            access="read_write",
+        )
+        assert "/remote.php/dav/files/" in spec.source_config["url"]
+        assert "nextcloud_chunk_size" not in spec.source_config

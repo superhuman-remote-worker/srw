@@ -136,7 +136,7 @@ def test_gitea_canonical_url_discards_misconfigured_admin_userinfo(
 
 
 def test_public_job_ingress_recursively_strips_repository_authority() -> None:
-    from orchestrator.main import JobCreate
+    from orchestrator.schemas.job_create import JobCreate
 
     body = JobCreate(
         description="caller cannot author repository authority",
@@ -144,9 +144,11 @@ def test_public_job_ingress_recursively_strips_repository_authority() -> None:
             "git_remote_url": "http://admin:secret@gitea/repo.git",
             "wrapper": {
                 "managed_repository_credentials": [{"private_key": "secret"}],
+                "workspace_ssh_identities": [{"private_key": "secret"}],
                 "repo_name": "foreign-project",
                 "ordinary": "kept",
             },
+            "workspace_ssh_identities": [{"private_key": "secret"}],
         },
         config_override={
             "wrapper": {
@@ -692,6 +694,10 @@ def test_workspace_materialization_never_places_private_key_in_command_or_file()
     assert materialize_command.index("present") < materialize_command.index(
         f"Host {payload['alias']}"
     )
+    # The workspace repository's key has no lifetime: a pinned job or an
+    # idle-forever session that never re-attaches must keep pushing.
+    assert "ssh-add -t" not in materialize_command
+    assert "then cat >/dev/null; else" in materialize_command
 
 
 def test_workspace_materialization_wipes_untransferred_keys_on_early_failure(
@@ -732,7 +738,7 @@ def test_workspace_materialization_wipes_untransferred_keys_on_early_failure(
 
 
 def test_internal_transport_repr_and_errors_are_secret_free() -> None:
-    from orchestrator.main import JobStartRequest
+    from orchestrator.schemas.job_runtime import JobStartRequest
 
     authority = _authority()
     payload = _runtime_payload(authority)

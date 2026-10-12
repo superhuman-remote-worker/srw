@@ -1,7 +1,7 @@
 import { Injectable, inject, signal, NgZone } from '@angular/core';
 import { HttpClient } from '@angular/common/http';
 import { TranslocoService } from '@jsverse/transloco';
-import { catchError, Observable, of } from 'rxjs';
+import { catchError, firstValueFrom, Observable, of, timeout } from 'rxjs';
 import {
   EMPTY_NOTIFICATION_COUNTS,
   Notification,
@@ -13,6 +13,7 @@ import {
 } from '../models/notification.model';
 import { environment } from '../environment';
 import { AppToastService } from '../../ui/toast';
+import { classifySseProbeFailure, sseRetryDelayMs } from './sse-recovery';
 
 /** A session event from a persistent agent (permission request, VM upgrade, etc.). */
 export interface SessionEvent {
@@ -122,6 +123,18 @@ export class NotificationService {
   readonly feedNextBefore = signal<string | null>(null);
 
   private eventSource: EventSource | null = null;
+  private sseWanted = false;
+  private sseGeneration = 0;
+  private sseRetryAttempt = 0;
+  private sseHalted = false;
+  private sseRetryTimer: ReturnType<typeof setTimeout> | null = null;
+  private sseProbeInFlight: { generation: number } | null = null;
+  private readonly wakeSse = () => {
+    if (!this.sseWanted || this.sseHalted || this.eventSource || this.sseProbeInFlight) return;
+    if (this.sseRetryTimer) clearTimeout(this.sseRetryTimer);
+    this.sseRetryTimer = null;
+    void this.retryClosedSse(this.sseGeneration);
+  };
 
   /** Load the first feed page from REST. */
   loadNotifications(limit = 100): void {
@@ -262,14 +275,25 @@ export class NotificationService {
 
   /** Connect to SSE stream for real-time notification updates. */
   connectSSE(): void {
-    if (this.eventSource) return;
+    if (this.sseWanted) return;
+    this.sseWanted = true;
+    if (typeof window !== 'undefined') window.addEventListener('online', this.wakeSse);
+    if (typeof document !== 'undefined') document.addEventListener('visibilitychange', this.wakeSse);
+    this.openSse();
+  }
+
+  private openSse(): void {
+    if (!this.sseWanted || this.eventSource) return;
+    const generation = ++this.sseGeneration;
 
     // ngsw-bypass keeps the service worker from buffering this SSE stream.
-    this.eventSource = new EventSource(`${this.baseUrl}/notifications/events?ngsw-bypass=true`, {
+    const es = new EventSource(`${this.baseUrl}/notifications/events?ngsw-bypass=true`, {
       withCredentials: true,
     });
+    this.eventSource = es;
 
-    this.eventSource.onmessage = (e: MessageEvent) => {
+    es.onmessage = (e: MessageEvent) => {
+      if (this.eventSource !== es) return;
       this.zone.run(() => {
         try {
           this.handleSseEvent(JSON.parse(e.data));
@@ -279,13 +303,57 @@ export class NotificationService {
       });
     };
 
-    this.eventSource.onopen = () => {
+    es.onopen = () => {
+      if (this.eventSource !== es || generation !== this.sseGeneration) return;
+      this.sseRetryAttempt = 0;
       this.zone.run(() => this.isConnected.set(true));
     };
 
-    this.eventSource.onerror = () => {
+    es.onerror = () => {
+      if (this.eventSource !== es || generation !== this.sseGeneration) return;
       this.zone.run(() => this.isConnected.set(false));
+      if (es.readyState !== EventSource.CLOSED) return;
+      es.close();
+      this.eventSource = null;
+      this.scheduleSseRetry(generation);
     };
+  }
+
+  private scheduleSseRetry(generation: number): void {
+    if (!this.sseWanted || this.sseHalted || generation !== this.sseGeneration || this.sseRetryTimer || this.sseProbeInFlight) return;
+    const delay = sseRetryDelayMs(this.sseRetryAttempt++);
+    this.sseRetryTimer = setTimeout(() => {
+      this.sseRetryTimer = null;
+      void this.retryClosedSse(generation);
+    }, delay);
+  }
+
+  private async retryClosedSse(generation: number): Promise<void> {
+    if (!this.sseWanted || this.sseHalted || generation !== this.sseGeneration || this.eventSource || this.sseProbeInFlight) return;
+    const probe = { generation };
+    this.sseProbeInFlight = probe;
+    let failure: 'auth' | 'gone' | 'retry' | null = null;
+    try {
+      // Unlike the SSE route, the feed read requires an approved user. A 200
+      // stream opened as anonymous after cookie loss must not claim recovery.
+      await firstValueFrom(this.http.get(`${this.baseUrl}/notifications`, {
+        params: { limit: '1' },
+      }).pipe(timeout({ first: 15_000 })));
+    } catch (error) {
+      failure = classifySseProbeFailure(error);
+    } finally {
+      if (this.sseProbeInFlight === probe) this.sseProbeInFlight = null;
+    }
+    if (!this.sseWanted || generation !== this.sseGeneration) return;
+    if (failure === 'auth' || failure === 'gone') {
+      this.sseHalted = true;
+      return;
+    }
+    if (failure) {
+      this.scheduleSseRetry(generation);
+      return;
+    }
+    this.openSse();
   }
 
   /**
@@ -387,12 +455,20 @@ export class NotificationService {
 
   /** Disconnect from SSE stream. */
   disconnectSSE(): void {
+    this.sseWanted = false;
+    this.sseHalted = false;
+    this.sseGeneration++;
+    this.sseProbeInFlight = null;
+    if (this.sseRetryTimer) clearTimeout(this.sseRetryTimer);
+    this.sseRetryTimer = null;
+    if (typeof window !== 'undefined') window.removeEventListener('online', this.wakeSse);
+    if (typeof document !== 'undefined') document.removeEventListener('visibilitychange', this.wakeSse);
     if (this.eventSource) {
       this.eventSource.close();
       this.eventSource = null;
-      this.isConnected.set(false);
-      this.lifecycleEvent.set(null);
-      this.cloudDiffStagedEvent.set(null);
     }
+    this.isConnected.set(false);
+    this.lifecycleEvent.set(null);
+    this.cloudDiffStagedEvent.set(null);
   }
 }

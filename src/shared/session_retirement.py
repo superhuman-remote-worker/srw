@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Any, AsyncIterator
 from uuid import UUID
 
@@ -21,6 +22,11 @@ WORKSPACE_RETIREMENT_PENDING_KEY = "_stateless_workspace_retirement_pending"
 WORKSPACE_RETIREMENT_SETTLED_KEY = "_stateless_workspace_retirement_settled"
 CLAIM_LOSS_LEDGER_KEY = "_stateless_claim_losses"
 CLAIM_LOSS_HOLD_KEY = "_stateless_claim_loss_hold"
+# Bounded, diagnostic-only trail of how claimant-loss debt was settled
+# (Kubernetes exact-terminal proof or an operator attestation). Never
+# authority: nothing reads it to decide anything.
+CLAIM_LOSS_RECEIPTS_KEY = "_stateless_claim_loss_receipts"
+CLAIM_LOSS_RECEIPT_LIMIT = 8
 ACTIVE_CLAIM_KEY = "_stateless_active_claim"
 RESIDENT_RETIREMENT_ACK_KEY = "_stateless_resident_retirement_ack"
 SHELL_RETIREMENT_ACK_KEY = "_stateless_shell_retirement_ack"
@@ -81,6 +87,115 @@ def _optional_authority_text(value: Any, *, label: str) -> str | None:
     if not isinstance(value, str) or not value.strip():
         raise RuntimeError(f"{label} is malformed")
     return value
+
+
+def initial_creation_retirement_authority(value: Any) -> dict[str, Any]:
+    """Parse the exact unpublished initial creation; never a process-stop proof."""
+
+    fields = {
+        "generation",
+        "reservation_id",
+        "reservation_generation",
+        "claim_token",
+        "runtime_incarnation",
+        "pvc_uid",
+        "service_uid",
+        "seed_configmap_uid",
+        "namespace",
+    }
+    if not isinstance(value, dict) or set(value) != fields:
+        raise RuntimeError("initial creation retirement authority is malformed")
+    result = dict(value)
+    for field in (
+        "generation",
+        "reservation_id",
+        "runtime_incarnation",
+        "pvc_uid",
+        "service_uid",
+        "seed_configmap_uid",
+    ):
+        raw = result[field]
+        if raw is None and field in {"pvc_uid", "service_uid", "seed_configmap_uid"}:
+            continue
+        try:
+            if not isinstance(raw, str) or str(UUID(raw)) != raw:
+                raise ValueError()
+        except (ValueError, TypeError, AttributeError) as exc:
+            raise RuntimeError(
+                "initial creation retirement identity is malformed"
+            ) from exc
+    for field in ("reservation_generation", "claim_token"):
+        if _exact_nonnegative_int(result[field], label=field) <= 0:
+            raise RuntimeError("initial creation retirement claim is malformed")
+    if not isinstance(result["namespace"], str) or not result["namespace"].strip():
+        raise RuntimeError("initial creation retirement namespace is malformed")
+    return result
+
+
+def retained_startup_attention_retirement_authority(value: Any) -> dict[str, Any]:
+    """Parse one retained G2 attention End; this never grants Ready authority."""
+
+    fields = {
+        "version",
+        "generation",
+        "reservation_id",
+        "reservation_generation",
+        "claim_token",
+        "runtime_incarnation",
+        "pvc_uid",
+        "service_uid",
+        "seed_configmap_uid",
+        "namespace",
+        "predecessor_reservation_id",
+        "predecessor_generation",
+        "predecessor_binding_generation",
+        "predecessor_runtime_incarnation",
+        "predecessor_cleanup_id",
+        "scheduled_at",
+        "startup_attention_at",
+    }
+    if not isinstance(value, dict) or set(value) != fields:
+        raise RuntimeError("retained startup attention authority is malformed")
+    result = dict(value)
+    if type(result["version"]) is not int or result["version"] != 1:
+        raise RuntimeError("retained startup attention version is malformed")
+    for field in ("reservation_generation", "claim_token"):
+        if _exact_nonnegative_int(result[field], label=field) <= 0:
+            raise RuntimeError("retained startup attention claim is malformed")
+    for field in (
+        "generation",
+        "reservation_id",
+        "runtime_incarnation",
+        "pvc_uid",
+        "service_uid",
+        "seed_configmap_uid",
+        "predecessor_reservation_id",
+        "predecessor_generation",
+        "predecessor_binding_generation",
+        "predecessor_runtime_incarnation",
+        "predecessor_cleanup_id",
+    ):
+        raw = result[field]
+        if raw is None and field == "seed_configmap_uid":
+            continue
+        try:
+            if not isinstance(raw, str) or str(UUID(raw)) != raw:
+                raise ValueError()
+        except (TypeError, ValueError, AttributeError) as exc:
+            raise RuntimeError(
+                "retained startup attention identity is malformed"
+            ) from exc
+    if not isinstance(result["namespace"], str) or not result["namespace"].strip():
+        raise RuntimeError("retained startup attention namespace is malformed")
+    for field in ("scheduled_at", "startup_attention_at"):
+        raw = result[field]
+        try:
+            at = datetime.fromisoformat(raw)
+            if at.tzinfo is None or at.utcoffset() is None:
+                raise ValueError()
+        except (TypeError, ValueError, AttributeError) as exc:
+            raise RuntimeError("retained startup attention clock is malformed") from exc
+    return result
 
 
 def _retirement_ack_matches(
@@ -184,6 +299,42 @@ def stateless_retirement_authority(
         )
     if marker["workspace_absence_proven"]:
         raise RuntimeError("terminal workspace absence proof is unsupported")
+    if "initial_creation" in marker:
+        initial = initial_creation_retirement_authority(marker["initial_creation"])
+        if (
+            initial["runtime_incarnation"] != marker["runtime_incarnation"]
+            or marker["terminal_token"] <= 0
+            or not marker["claimant_quiesced"]
+            or not marker["shell_retirement_required"]
+            or not marker["resident_cleanup_required"]
+            or any(
+                marker[field] is not None
+                for field in (
+                    "workspace_generation",
+                    "endpoint_generation",
+                    "host_key_fingerprint",
+                )
+            )
+        ):
+            raise RuntimeError(
+                "initial creation retirement disagrees with terminal authority"
+            )
+    if "retained_startup_attention" in marker:
+        retained = retained_startup_attention_retirement_authority(
+            marker["retained_startup_attention"]
+        )
+        if (
+            "initial_creation" in marker
+            or retained["runtime_incarnation"] != marker["runtime_incarnation"]
+            or marker["terminal_token"] <= 0
+            or not marker["claimant_quiesced"]
+            or not marker["shell_retirement_required"]
+            or not marker["resident_cleanup_required"]
+            or marker["endpoint_generation"] is not None
+        ):
+            raise RuntimeError(
+                "retained startup attention disagrees with terminal authority"
+            )
 
     # Compatibility for acknowledgements written by the first S2 build: its
     # nested jsonb_set used create_if_missing=false, so PostgreSQL could commit
@@ -326,6 +477,32 @@ def stateless_settled_retirement_authority(
     )
     if settled["cleanup_complete"] is not True:
         raise RuntimeError("settled retirement lacks cleanup proof")
+    if "initial_creation" in settled:
+        initial = initial_creation_retirement_authority(settled["initial_creation"])
+        expected_backing = (
+            f"k8s-pvc:{initial['namespace']}:{initial['pvc_uid']}"
+            if initial["pvc_uid"] is not None
+            else None
+        )
+        if (
+            initial["runtime_incarnation"] != settled["runtime_incarnation"]
+            or settled["terminal_token"] <= 0
+            or settled["snapshot_restore_required"] is not False
+            or backing_id != expected_backing
+        ):
+            raise RuntimeError("settled initial creation authority disagrees")
+    if "retained_startup_attention" in settled:
+        retained = retained_startup_attention_retirement_authority(
+            settled["retained_startup_attention"]
+        )
+        if (
+            "initial_creation" in settled
+            or retained["runtime_incarnation"] != settled["runtime_incarnation"]
+            or settled["terminal_token"] <= 0
+            or settled["snapshot_restore_required"] is not False
+            or backing_id != f"k8s-pvc:{retained['namespace']}:{retained['pvc_uid']}"
+        ):
+            raise RuntimeError("settled retained startup attention disagrees")
     return settled
 
 
@@ -415,6 +592,9 @@ def claim_loss_hold(metadata: dict[str, Any]) -> dict[str, Any] | None:
     state = str(raw.get("intended_state") or "")
     if token <= 0 or attempts < 0 or state not in {"queued", "parked", "done"}:
         raise RuntimeError("stateless claim-loss hold is malformed")
+    reason = raw.get("park_reason")
+    if reason is not None and (not isinstance(reason, str) or not reason.strip()):
+        raise RuntimeError("stateless claim-loss hold is malformed")
     return dict(raw)
 
 
@@ -437,6 +617,7 @@ async def acknowledge_session_claim_quiesced(
     pod_uid: str,
     quiesced_by: str = "claimant",
     expected_terminal_token: int | None = None,
+    receipt: dict[str, Any] | None = None,
 ) -> bool:
     """ACK one terminally fenced claimant after all local I/O has drained.
 
@@ -445,6 +626,11 @@ async def acknowledge_session_claim_quiesced(
     unresolved-only ledger keeps every stolen generation until an exact
     claimant/pod proof removes it; a later End cannot mistake queued/parked for
     local-I/O quiescence.
+
+    ``receipt`` (optional evidence fields) is appended, in the same metadata
+    write that removes the debt, to the bounded ``CLAIM_LOSS_RECEIPTS_KEY``
+    trail, so the proof that settled a hold is durable before anything that
+    depended on it (the executor Pod's retention finalizer) is released.
     """
 
     tid = thread_id if isinstance(thread_id, UUID) else UUID(str(thread_id))
@@ -547,6 +733,26 @@ async def acknowledge_session_claim_quiesced(
                 next_metadata.pop(CLAIM_LOSS_HOLD_KEY, None)
             if retirement_pending:
                 next_metadata[CLAIM_RETIREMENT_KEY] = retirement
+            if receipt is not None:
+                prior = next_metadata.get(CLAIM_LOSS_RECEIPTS_KEY)
+                receipts = (
+                    [item for item in prior if isinstance(item, dict)]
+                    if isinstance(prior, list)
+                    else []
+                )
+                receipts.append(
+                    {
+                        **receipt,
+                        "lease_token": token,
+                        "pod": owner,
+                        "pod_uid": owner_uid,
+                        "quiesced_by": quiesced_by,
+                        "settled_at": datetime.now(timezone.utc).isoformat(),
+                    }
+                )
+                next_metadata[CLAIM_LOSS_RECEIPTS_KEY] = receipts[
+                    -CLAIM_LOSS_RECEIPT_LIMIT:
+                ]
             updated = await conn.fetchval(
                 """
                 UPDATE threads
@@ -572,6 +778,10 @@ async def acknowledge_session_claim_quiesced(
             if updated is None:
                 return False
             if restore is not None:
+                # The hold's own ``claim_loss_hold`` reason goes with it: a
+                # parked row gets back the reason it was parked for (a hold
+                # stored before the reason was kept can only have come from
+                # the steal's max-attempts park), any other state none.
                 restored = await conn.fetchval(
                     """
                     UPDATE run_queue
@@ -579,7 +789,13 @@ async def acknowledge_session_claim_quiesced(
                         attempts_since_completion = $4::integer,
                         run_after = COALESCE($5::text::timestamptz, run_after),
                         queued_at = CASE WHEN $6::text IS NULL THEN queued_at
-                                         ELSE $6::text::timestamptz END
+                                         ELSE $6::text::timestamptz END,
+                        park_reason = CASE WHEN $3::text = 'parked'
+                                           THEN COALESCE($7::text,
+                                                         'reaper_max_attempts')
+                                           ELSE NULL END,
+                        parked_at = CASE WHEN $3::text = 'parked'
+                                         THEN parked_at ELSE NULL END
                     WHERE unit_id = $1::uuid
                       AND unit_kind = 'session_turn'
                       AND state = 'parked'
@@ -593,6 +809,7 @@ async def acknowledge_session_claim_quiesced(
                     int(restore["attempts_since_completion"]),
                     restore.get("run_after"),
                     restore.get("queued_at"),
+                    restore.get("park_reason"),
                 )
                 if restored is None:
                     raise RuntimeError("claim-loss settlement lost its parked hold")
@@ -785,6 +1002,8 @@ __all__ = [
     "ACTIVE_CLAIM_KEY",
     "CLAIM_LOSS_HOLD_KEY",
     "CLAIM_LOSS_LEDGER_KEY",
+    "CLAIM_LOSS_RECEIPTS_KEY",
+    "CLAIM_LOSS_RECEIPT_LIMIT",
     "CLAIM_RETIREMENT_KEY",
     "RESIDENT_RETIREMENT_ACK_KEY",
     "SHELL_RETIREMENT_ACK_KEY",

@@ -21,7 +21,7 @@ from orchestrator.schemas.provider_catalog import (
 )
 from orchestrator.services.model_catalog import ModelCatalogService
 from orchestrator.services.provider_catalog import ProviderCatalogService
-from shared.helm_provenance import RECONCILE_MANIFEST_KEY
+from shared.helm_provenance import AUTO_PIN_BREADCRUMB, RECONCILE_MANIFEST_KEY
 
 NOW = datetime(2026, 9, 12, tzinfo=timezone.utc)
 MANIFEST = {
@@ -199,9 +199,40 @@ class TestHelmManagedOverview:
             "source": "ui",
             "managed_by_helm": True,
             "helm_drift": True,
+            "auto_pinned": False,
         }
         assert out["defaults"]["embedding"]["managed_by_helm"] is False
         assert out["defaults"]["embedding"]["model"] is None
+
+    @pytest.mark.asyncio
+    async def test_auto_pin_is_flagged(self):
+        """Admin → Defaults labels a pin the readiness auto-pin chose."""
+        store = _provider_store()
+        settings = {
+            "llm.default_rerank_model": {
+                "value": {"model": "qwen3-reranker-8b"},
+                "source": "default",
+                "updated_by": AUTO_PIN_BREADCRUMB,
+            },
+            # Same source, but written by a boot-time seeder, not the auto-pin.
+            "llm.default_search_model": {
+                "value": {"model": "searxng"},
+                "source": "default",
+                "updated_by": None,
+            },
+        }
+        base = store.get_system_setting.side_effect
+        store.get_system_setting = AsyncMock(
+            side_effect=lambda key: (
+                {"key": key, **settings[key]} if key in settings else base(key)
+            )
+        )
+        out = await _provider_service(store).helm_managed_overview()
+
+        assert out["defaults"]["rerank"]["auto_pinned"] is True
+        assert out["defaults"]["rerank"]["model"] == "qwen3-reranker-8b"
+        assert out["defaults"]["search"]["auto_pinned"] is False
+        assert out["defaults"]["embedding"]["auto_pinned"] is False
 
     @pytest.mark.asyncio
     async def test_overview_without_manifest(self):

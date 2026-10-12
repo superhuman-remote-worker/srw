@@ -7,16 +7,19 @@ shares the app-owned completion-control boundary with job completion.
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import json
 import logging
+import os
 from typing import Any
-from uuid import NAMESPACE_URL, UUID, uuid5
+from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
 import httpx
 from fastapi import HTTPException, Request
+from shared.vm_resource_admission import ResourceAdmissionError
 
 from orchestrator.schemas.job_controls import (
     JobApproveRequest,
@@ -25,11 +28,26 @@ from orchestrator.schemas.job_controls import (
     WorkspaceRecoveryRetryRequest,
 )
 from orchestrator.schemas.workspaces import VMCreateRequest
+from orchestrator.services import connector_credential_leases
 from orchestrator.services.grant_enforcement import GrantDenied
+from orchestrator.services.job_projection import (
+    public_live_vm_status,
+    public_vm_status,
+)
 from orchestrator.services.manifest_runtime_ownership import (
     require_srw_runtime,
     uses_srw_runtime,
 )
+from shared.operator_pause_hold import (
+    operator_pause_lift_already_consumed,
+    operator_pause_lift_token,
+)
+from shared.worker_execution_hold import (
+    WORKER_EXECUTION_HOLD_MESSAGE,
+    worker_execution_held,
+    worker_execution_held_sql,
+)
+from shared.pinned_job_delivery import stamp_pinned_resume_input_ids
 from orchestrator.services.vm_workspace_recovery_store import (
     acquire_vm_cleanup_permit,
     vm_cleanup_kwargs,
@@ -40,10 +58,31 @@ from shared.runtime.core.tool_policy import ToolPolicyError
 from shared.workspace_contract import resolve_workspace_contract
 
 
+# Approval selects ordinary terminal VM cleanup in the same transaction as
+# completed status. Historical terminal rows without this intent remain owned
+# by their original retention decisions and are not swept retroactively.
+_TERMINAL_VM_APPROVAL_CONTEXT_SQL = """
+CASE WHEN jsonb_typeof(context->'vm')='object'
+          AND context->'vm' <> '{}'::jsonb
+          AND (parent_job_id IS NULL OR
+               context->>'inherits_parent_workspace' IS DISTINCT FROM 'true')
+          AND COALESCE(context->'vm'->>'status','') NOT IN ('deleted','deleting')
+     THEN jsonb_set(COALESCE(context,'{}'::jsonb),
+          '{_job_terminal_vm_cleanup}',
+          jsonb_build_object('version',1,'source','approve',
+            'provision_generation',context->'vm'->>'provision_generation'), true)
+     ELSE context END
+"""
+
+
 def resume_reject_should_requeue(status_code: int) -> bool:
     """Return whether a stale-ready agent rejection should re-enter dispatch."""
 
     return status_code == 409
+
+
+async def _no_mint_gate(_job: Any) -> tuple[str, str | None]:
+    return "dispatch", None
 
 
 @dataclass(frozen=True, slots=True)
@@ -86,6 +125,10 @@ class JobControlDependencies:
     get_container_context: Callable[[Mapping[str, Any]], Mapping[str, Any]]
     get_vm_context: Callable[[Mapping[str, Any]], Mapping[str, Any]]
     recovery_store: Any
+    validate_workspace_recovery_storage: Callable[[str], Awaitable[bool]] | None = None
+    #: A job's provider-minted credentials before its claim (connector
+    #: drivers C5, ``connector_minted_credentials.job_mint_gate``).
+    job_mint_gate: Callable[[Any], Awaitable[tuple[str, str | None]]] = _no_mint_gate
 
 
 @dataclass(frozen=True, slots=True)
@@ -99,6 +142,8 @@ class JobControlOperations:
     ) -> dict[str, Any]:
         """Provision a VM after the router has authorized job access."""
 
+        if worker_execution_held(job.get("context")):
+            raise HTTPException(status_code=409, detail=WORKER_EXECUTION_HOLD_MESSAGE)
         assigned_backend = resolve_workspace_contract(job).assigned_backend
         if assigned_backend != "vm":
             raise HTTPException(
@@ -159,7 +204,12 @@ class JobControlOperations:
         *,
         live: bool,
     ) -> dict[str, Any]:
-        """Read one authorized job's captured and optional live VM status."""
+        """Read one authorized job's captured and optional live VM status.
+
+        Coordinate-free, like the job API: the router's gate is job access (any
+        project member), and the job API keeps ``context.vm`` — SSH host/port,
+        host-key pin, pod and VM identities — from exactly that audience.
+        """
 
         context = job.get("context") or {}
         vm_context = context.get("vm") if isinstance(context, dict) else None
@@ -168,7 +218,10 @@ class JobControlOperations:
                 status_code=404,
                 detail=f"No VM context for job '{job_id}'",
             )
-        result: dict[str, Any] = {"job_id": job_id, "vm": vm_context}
+        result: dict[str, Any] = {
+            "job_id": job_id,
+            "vm": public_vm_status(vm_context),
+        }
         if live:
             if not self.dependencies.vm_provisioner.lifecycle_available:
                 result["live_error"] = "VM provisioning not available"
@@ -177,7 +230,7 @@ class JobControlOperations:
                     job_id
                 )
                 if live_status:
-                    result["live"] = live_status
+                    result["live"] = public_live_vm_status(live_status)
                 else:
                     result["live_error"] = "No response from VM controller"
         return result
@@ -196,23 +249,39 @@ class JobControlOperations:
                     job_id, entity_type="job"
                 )
             )
-            permit = await acquire_vm_cleanup_permit(
-                self.dependencies.recovery_store,
-                owner_kind="job",
-                owner_id=job_id,
-                identity=identity,
-                source="public_vm_delete",
-                purge_disk=True,
+            from orchestrator.services.vm_job_retained_disk_purge import (
+                acquire_job_retained_disk_purge,
             )
+
+            retained = await acquire_job_retained_disk_purge(
+                self.dependencies.recovery_store,
+                job_id=job_id,
+                identity=identity,
+            )
+            if retained is None:
+                permit = await acquire_vm_cleanup_permit(
+                    self.dependencies.recovery_store,
+                    owner_kind="job",
+                    owner_id=job_id,
+                    identity=identity,
+                    source="public_vm_delete",
+                    purge_disk=True,
+                )
         except Exception as exc:
             raise HTTPException(
                 status_code=409,
                 detail="VM cleanup authority is temporarily unavailable",
             ) from exc
+        if retained is not None:
+            return await self._delete_retained_job_vm(job_id, identity, retained)
         if not permit.allowed:
             raise HTTPException(
                 status_code=409,
-                detail="VM cleanup is held for workspace recovery",
+                detail=(
+                    "Close active workspace access, then retry VM cleanup"
+                    if permit.reason == "active_workspace_access"
+                    else "VM cleanup is held for workspace recovery"
+                ),
             )
         disposition = completed_cleanup_outcome(permit)
         if disposition is None:
@@ -226,13 +295,61 @@ class JobControlOperations:
             )
             disposition = outcome.disposition
             if disposition in {"completed", "identity_superseded"}:
+                try:
+                    await complete_vm_cleanup_permit(
+                        self.dependencies.recovery_store,
+                        permit,
+                        outcome=disposition,
+                        provisioner=self.dependencies.vm_provisioner,
+                    )
+                except ResourceAdmissionError as exc:
+                    raise HTTPException(
+                        status_code=409,
+                        detail="VM cleanup physical stop is not yet proven",
+                    ) from exc
+        elif disposition == "completed":
+            # A replayed cleanup outcome still owes its exact resource debit
+            # if the prior process died between controller stop and settlement.
+            try:
                 await complete_vm_cleanup_permit(
                     self.dependencies.recovery_store,
                     permit,
                     outcome=disposition,
+                    provisioner=self.dependencies.vm_provisioner,
                 )
+            except ResourceAdmissionError as exc:
+                raise HTTPException(
+                    status_code=409,
+                    detail="VM cleanup physical stop is not yet proven",
+                ) from exc
         if disposition != "completed":
             raise HTTPException(status_code=500, detail="Failed to delete VM")
+        return {"status": "deleting", "job_id": job_id}
+
+    async def _delete_retained_job_vm(self, job_id, identity, permit):
+        """Purge the disk after its old immutable retained compute stop."""
+
+        if not permit.allowed:
+            raise HTTPException(
+                status_code=409, detail="VM retained-disk purge authority is held"
+            )
+        from orchestrator.services.vm_job_retained_disk_purge import (
+            execute_job_retained_disk_purge,
+        )
+
+        try:
+            await execute_job_retained_disk_purge(
+                self.dependencies.recovery_store,
+                self.dependencies.vm_provisioner,
+                job_id=job_id,
+                identity=identity,
+                permit=permit,
+            )
+        except ResourceAdmissionError as exc:
+            raise HTTPException(
+                status_code=409,
+                detail="VM retained-disk purge is not yet proven",
+            ) from exc
         return {"status": "deleting", "job_id": job_id}
 
     async def resume_job(
@@ -297,12 +414,91 @@ class JobControlOperations:
             job=job,
             request=request,
         )
+        if not result.pop("_terminal_notification_owned", False):
+            await self.dependencies.resolve_job_notifications(
+                job_id,
+                user=user,
+                hook="approve",
+            )
+        return result
+
+    async def publish_terminal_review(self, operation: dict[str, Any]) -> None:
+        """Replay frozen terminal artifacts after the exact DB approval commit."""
+        from orchestrator.services.vm_idle_lifecycle import _object
+
+        payload = _object(operation.get("terminal_publication"))
+        if (
+            payload.get("version") != 1
+            or operation.get("terminal_source_command_id") is None
+        ):
+            raise ValueError("terminal publication source missing")
+        job_id = str(operation["owner_id"])
+        if payload.get("job_id") != job_id:
+            raise ValueError("terminal publication owner changed")
+        job = await self.dependencies.store.get_job(job_id)
+        if job is None or job["status"] != "completed":
+            raise RuntimeError("terminal publication awaits committed completion")
+        completion_data = payload.get("completion_data")
+        repo_name, job_branch = payload.get("repo_name"), payload.get("job_branch")
+        if not isinstance(completion_data, dict) or not all(
+            isinstance(value, str) and value for value in (repo_name, job_branch)
+        ):
+            raise ValueError("terminal publication payload invalid")
+        completion_json = json.dumps(completion_data, indent=2, ensure_ascii=False)
+        if not self.dependencies.forge.is_initialized:
+            raise RuntimeError("terminal completion artifact repository unavailable")
+        wrote = await self.dependencies.forge.create_or_update_file(
+            repo_name,
+            "output/job_completion.json",
+            completion_json,
+            "Approve job: write job_completion.json",
+        )
+        if not wrote:
+            raise RuntimeError("terminal completion artifact publication deferred")
+        removed = await self.dependencies.forge.delete_file(
+            repo_name,
+            "output/job_frozen.json",
+            "Approve job: remove job_frozen.json",
+        )
+        if not removed:
+            raise RuntimeError("terminal frozen artifact removal deferred")
+        local_output = self.dependencies.workspace.base_path / "output"
+        if local_output.exists():
+            (local_output / "job_completion.json").write_text(completion_json)
+            frozen_path = local_output / "job_frozen.json"
+            if frozen_path.exists():
+                frozen_path.unlink()
+        from orchestrator.services.completion import write_job_change_record
+        from orchestrator.services.project_loops import job_loop_id
+
+        # The legacy merge runs only on the winning approval transition. The
+        # replayable publication owns only idempotent history and notifications.
+        if (
+            not job_loop_id(job)
+            and await self.dependencies.store.get_job_change_record(job_id) is None
+        ):
+            record_job = {**job, "freeze_data": completion_data}
+            await write_job_change_record(
+                record_job,
+                "completed",
+                db=self.dependencies.store,
+                vector_db=self.dependencies.vector_store,
+            )
+            if await self.dependencies.store.get_job_change_record(job_id) is None:
+                raise RuntimeError("terminal change record publication deferred")
+        await self.dependencies.maybe_wake_session(
+            self.dependencies.store,
+            job_id,
+            "completed",
+        )
+        self.dependencies.kick_session_wake_drain(self.dependencies.store)
+        actor_id = payload.get("actor_id")
         await self.dependencies.resolve_job_notifications(
             job_id,
-            user=user,
+            user={"id": actor_id} if isinstance(actor_id, str) and actor_id else None,
             hook="approve",
         )
-        return result
+        self.dependencies.trigger_dispatch()
 
     def subscribe_sudo_events(self):
         return self.dependencies.sudo_gate.subscribe_sse()
@@ -716,6 +912,35 @@ class JobControlOperations:
         can call it directly. ``req`` is only needed on the internal-actor branch
         (no ``user``), which a notification action never takes."""
         require_srw_runtime(job)
+        if worker_execution_held(job.get("context")):
+            raise HTTPException(409, WORKER_EXECUTION_HOLD_MESSAGE)
+        pinned_retention_held = getattr(
+            type(self.dependencies.store), "pinned_ready_cancel_retention_held", None
+        )
+        if pinned_retention_held is not None and await pinned_retention_held(
+            self.dependencies.store, job_id
+        ):
+            raise HTTPException(
+                409,
+                {
+                    "code": "pinned_ready_cancel_retention_held",
+                    "message": "This cancelled VM Job has retained storage awaiting permanent Delete.",
+                },
+            )
+        # An explicit resume is the authority that lifts an operator pause
+        # hold, but only the hold on the row this request was authorized
+        # against: every pinned re-queue/claim below CASes on it, so a pause
+        # that lands after this read makes the resume lose instead of being
+        # crossed.
+        operator_pause_lift = operator_pause_lift_token(job)
+        recovery_context = self.dependencies.get_container_context(job)
+        if "recovery_cleanup" in recovery_context:
+            validate_storage = self.dependencies.validate_workspace_recovery_storage
+            if validate_storage is None or not await validate_storage(job_id):
+                raise HTTPException(
+                    409,
+                    "Workspace recovery cleanup or exact retained storage is not ready",
+                )
         recovery = await self.dependencies.recovery_store.unresolved_participation(
             UUID(job_id)
         )
@@ -1004,6 +1229,44 @@ class JobControlOperations:
                     "job_id": job_id,
                 }
 
+            if (
+                getattr(self.dependencies.store, "supports_vm_creation_retry", False)
+                is True
+            ):
+                from orchestrator.services.vm_creation_resume import (
+                    resume_pending_creation,
+                )
+                from orchestrator.services.vm_creation_retry_store import (
+                    VMCreationRetryConflict,
+                )
+
+                try:
+                    creation = await resume_pending_creation(
+                        self.dependencies.store,
+                        job_id=job_id,
+                        feedback=request.feedback,
+                        feedback_reason=feedback_reason,
+                        lift_operator_pause_hold=operator_pause_lift,
+                    )
+                except VMCreationRetryConflict as exc:
+                    raise HTTPException(
+                        status_code=409,
+                        detail={
+                            "code": exc.reason,
+                            "message": {
+                                "creation_request_unproven": "The original VM creation record could not be verified. This attempt needs operator inspection.",
+                                "vm_creation_retry_disabled": "VM creation retry is disabled on this deployment.",
+                                "job_admission_expired": "The original job deadline elapsed; Resume cannot extend it.",
+                            }.get(
+                                exc.reason,
+                                "VM creation cannot be resumed under its current workspace or execution authority.",
+                            ),
+                        },
+                    ) from exc
+                if creation is not None:
+                    self.dependencies.trigger_dispatch()
+                    return creation
+
             async def _queue_for_dispatch(
                 message: str,
                 *,
@@ -1029,6 +1292,8 @@ class JobControlOperations:
                     if feedback
                     else None
                 )
+                if job.get("execution_lane") == "pinned":
+                    context_merge = stamp_pinned_resume_input_ids(context_merge)
                 expected_status = expected_status_override or str(job["status"])
                 if (
                     job.get("execution_lane") == "stateless"
@@ -1043,6 +1308,12 @@ class JobControlOperations:
                         workspace_context_key,
                         context_merge,
                         expected_status=expected_status,
+                        lift_operator_pause_hold=operator_pause_lift,
+                        **(
+                            {"owner_resume_user_id": user.get("id") if user else None}
+                            if workspace_context_key == "vm"
+                            else {}
+                        ),
                         **self.dependencies.completion_control.resume_guard_kwargs(),
                     )
                 elif job.get("execution_lane") == "stateless":
@@ -1052,6 +1323,7 @@ class JobControlOperations:
                         priority=int(job.get("priority") or 0),
                         fair_key=(str(job["user_id"]) if job.get("user_id") else None),
                         expected_status=expected_status,
+                        lift_operator_pause_hold=operator_pause_lift,
                         **self.dependencies.completion_control.resume_guard_kwargs(),
                     )
                 elif workspace_preflight_required and control_claim is not None:
@@ -1064,6 +1336,7 @@ class JobControlOperations:
                             context_merge,
                             expected_status=expected_status,
                             completion_control_claim_id=str(control_claim.claim_id),
+                            lift_operator_pause_hold=operator_pause_lift,
                         )
                     except Exception:
                         await self.dependencies.completion_control.abort(control_claim)
@@ -1075,6 +1348,7 @@ class JobControlOperations:
                         job_id,
                         context_merge,
                         expected_status=expected_status,
+                        lift_operator_pause_hold=operator_pause_lift,
                         **self.dependencies.completion_control.resume_guard_kwargs(),
                     )
                 if not queued and job.get("execution_lane") == "stateless":
@@ -1112,6 +1386,7 @@ class JobControlOperations:
                                     completion_control_claim_id=str(
                                         fallback_claim.claim_id
                                     ),
+                                    lift_operator_pause_hold=operator_pause_lift,
                                 )
                             except Exception:
                                 await self.dependencies.completion_control.abort(
@@ -1128,13 +1403,17 @@ class JobControlOperations:
                                     raise RuntimeError(
                                         "workspace preflight requires a context key"
                                     )
-                                await self.dependencies.store.shed_workspace_context(
+                                if not await self.dependencies.store.shed_workspace_context(
                                     job_id, workspace_context_key
-                                )
+                                ):
+                                    raise HTTPException(
+                                        409, "Workspace cleanup is still pending"
+                                    )
                             queued = await self.dependencies.store.queue_job_for_resume(
                                 job_id,
                                 context_merge,
                                 expected_status=expected_status,
+                                lift_operator_pause_hold=operator_pause_lift,
                                 **self.dependencies.completion_control.resume_guard_kwargs(),
                             )
                         if queued:
@@ -1164,6 +1443,24 @@ class JobControlOperations:
                             status_code=409,
                             detail="Job lifecycle cleanup is already in progress",
                         )
+                    if operator_pause_lift_already_consumed(
+                        refreshed, operator_pause_lift, feedback=feedback
+                    ):
+                        # A concurrent explicit resume (a double-click) lifted
+                        # this exact hold first, carrying the same feedback.
+                        # The job IS resumed; answer as the winner did.
+                        self.dependencies.logger.info(
+                            "Resume of job %s joined a concurrent resume of "
+                            "operator pause hold %s",
+                            job_id,
+                            operator_pause_lift,
+                        )
+                        return {
+                            "status": "queued",
+                            "message": "Operator pause hold already lifted by a "
+                            "concurrent resume; job queued for auto-dispatch",
+                            "job_id": job_id,
+                        }
                     raise HTTPException(
                         status_code=409,
                         detail="Job changed while it was being queued for resume",
@@ -1174,6 +1471,48 @@ class JobControlOperations:
                 )
                 self.dependencies.trigger_dispatch()
                 return {"status": "queued", "message": message, "job_id": job_id}
+
+            if job.get("execution_lane") in {"stateless", "pinned"} and (
+                os.getenv("WORKSPACE_IDLE_RELEASE_ENABLED", "false").lower() == "true"
+                or self.dependencies.get_vm_context(job).get(
+                    "_suspend_remote_io_closed"
+                )
+                or self.dependencies.get_vm_context(job).get("idle_wake_operation_id")
+            ):
+                from orchestrator.services.vm_idle_lifecycle import VMIdleLifecycleStore
+
+                idle_store = VMIdleLifecycleStore(self.dependencies.store)
+                if (
+                    await idle_store.schema_available()
+                    and await idle_store.get_open_for_owner(job_id) is not None
+                ):
+                    wake = await idle_store.request_wake(
+                        job_id,
+                        execution_requested=True,
+                        **(
+                            {
+                                "context_merge": {
+                                    "queued_feedback": request.feedback,
+                                    "queued_feedback_reason": feedback_reason,
+                                }
+                            }
+                            if request and request.feedback
+                            else {}
+                        ),
+                    )
+                    if wake is None:
+                        raise HTTPException(
+                            status_code=409,
+                            detail={
+                                "code": "vm_idle_wake_unavailable",
+                                "message": "The stopped VM has no current wake authority.",
+                            },
+                        )
+                    return {
+                        "status": "waking",
+                        "message": "Retained VM wake is pending attested readiness",
+                        "job_id": job_id,
+                    }
 
             (
                 workspace_action,
@@ -1217,9 +1556,10 @@ class JobControlOperations:
                         {**job, "id": job_id}, source="missing_workspace_resume"
                     )
                 elif job.get("execution_lane") != "stateless":
-                    await self.dependencies.store.shed_workspace_context(
+                    if not await self.dependencies.store.shed_workspace_context(
                         job_id, workspace_context_key
-                    )
+                    ):
+                        raise HTTPException(409, "Workspace cleanup is still pending")
                 return await _queue_for_dispatch(
                     f"No live {missing_workspace} workspace — queued for re-provisioning",
                     workspace_preflight_required=True,
@@ -1243,6 +1583,14 @@ class JobControlOperations:
                 # workspace-contract claim before any pod POST.
                 return await _queue_for_dispatch(
                     "Completion-safe resume queued for auto-dispatch"
+                )
+            if operator_pause_lift:
+                # Lifting a hold always re-queues through the guarded write:
+                # it appends this feedback to whatever queued behind the hold
+                # (the direct path's plain context merge would replace it),
+                # and the dispatcher's resume lane keeps the same workspace.
+                return await _queue_for_dispatch(
+                    "Operator pause hold lifted; job queued for auto-dispatch"
                 )
 
             # Determine which agent to use
@@ -1303,15 +1651,18 @@ class JobControlOperations:
             # _resume_job_on_agent reads job["context"], not the DB. Idempotent
             # with the queue fallback below, which merges the same value.
             if request.feedback:
+                feedback_delivery_id = str(uuid4())
                 await self.dependencies.store.merge_job_context(
                     job_id,
                     {
                         "queued_feedback": request.feedback,
                         "queued_feedback_reason": feedback_reason,
+                        "queued_feedback_delivery_id": feedback_delivery_id,
                     },
                 )
                 job_context["queued_feedback"] = request.feedback
                 job_context["queued_feedback_reason"] = feedback_reason
+                job_context["queued_feedback_delivery_id"] = feedback_delivery_id
                 job = {**job, "context": job_context}
 
             # Restore S3 environment snapshot into the VM before resuming.
@@ -1342,10 +1693,22 @@ class JobControlOperations:
                 return await _queue_for_dispatch(
                     "Repository authority is not ready; job remains queued"
                 )
+            # A provider-minted credential exists before the claim (C5), as the
+            # dispatcher's preflight requires; otherwise the dispatcher holds
+            # the job until it does (and fails it on a provider's refusal).
+            mint_action, mint_reason = await self.dependencies.job_mint_gate(job)
+            if mint_action != "dispatch":
+                return await _queue_for_dispatch(
+                    f"{mint_reason}; job queued for dispatch"
+                    if mint_reason
+                    else "A connector's credential is being minted; job queued "
+                    "for dispatch"
+                )
             if not await self.dependencies.store.claim_job_for_agent(
                 job_id,
                 str(agent_id),
                 allow_failed=True,
+                lift_operator_pause_hold=operator_pause_lift,
             ):
                 return await _queue_for_dispatch(
                     "Job queued for authoritative resume dispatch"
@@ -1440,6 +1803,37 @@ class JobControlOperations:
         """Core of :func:`approve_job` after the access gate — request-free so the
         notification ``review_queue.approve`` handler can call it directly."""
         require_srw_runtime(job)
+        from orchestrator.services.vm_idle_phase_approval import (
+            approval_source_snapshot,
+            review_source_snapshot,
+        )
+
+        phase_snapshot = approval_source_snapshot(job)
+        review_snapshot = review_source_snapshot(job)
+        idle_episode = job.get("workspace_idle_episode")
+        if isinstance(idle_episode, str):
+            try:
+                idle_episode = json.loads(idle_episode)
+            except (TypeError, ValueError):
+                idle_episode = None
+        vm_phase_wait = bool(
+            isinstance(idle_episode, dict)
+            and idle_episode.get("wait_kind") == "human_approval"
+            and isinstance(idle_episode.get("runtime_identity"), dict)
+            and idle_episode["runtime_identity"].get("backend") == "vm"
+        )
+        if (
+            isinstance(idle_episode, dict)
+            and idle_episode.get("wait_kind") == "human_review"
+            and review_snapshot is None
+        ):
+            raise HTTPException(
+                status_code=409, detail="terminal review source changed"
+            )
+        if vm_phase_wait and phase_snapshot is None:
+            raise HTTPException(
+                status_code=409, detail="idle phase approval source changed"
+            )
         if request is None:
             request = JobApproveRequest()
         await self.dependencies.completion_control.guard(
@@ -1496,7 +1890,13 @@ class JobControlOperations:
                     ),
                 )
             control_claim = await self.dependencies.completion_control.claim(
-                {**job, "id": job_id}, source="public_approve"
+                {**job, "id": job_id},
+                source="public_approve",
+                **(
+                    {"terminal_review_source": review_snapshot}
+                    if review_snapshot is not None
+                    else {}
+                ),
             )
 
             # 2. Read freeze data — DB first, Gitea fallback, local fallback
@@ -1544,7 +1944,115 @@ class JobControlOperations:
                 local_frozen = (
                     self.dependencies.workspace.base_path / "output" / "job_frozen.json"
                 )
+                if (
+                    freeze_type == "phase_boundary"
+                    and job.get("execution_lane") == "pinned"
+                    and (
+                        self.dependencies.get_vm_context(job).get(
+                            "_suspend_remote_io_closed"
+                        )
+                        or self.dependencies.get_vm_context(job).get(
+                            "idle_wake_operation_id"
+                        )
+                    )
+                ):
+                    from orchestrator.services.vm_idle_lifecycle import (
+                        VMIdleLifecycleStore,
+                    )
+                    from orchestrator.services.completion_control import (
+                        CompletionControlClaimConflict,
+                    )
+
+                    idle_store = VMIdleLifecycleStore(self.dependencies.store)
+                    if (
+                        await idle_store.schema_available()
+                        and await idle_store.get_open_for_owner(job_id) is not None
+                    ):
+                        if control_claim is None:
+                            raise HTTPException(
+                                status_code=409,
+                                detail="Pinned idle phase approval requires durable control authority",
+                            )
+                        try:
+                            async with self.dependencies.completion_control.finish(
+                                control_claim
+                            ) as (conn, _locked_job):
+                                wake = await idle_store.approve_phase_wake_on_conn(
+                                    conn,
+                                    job_id=job_id,
+                                    claim_id=str(control_claim.claim_id),
+                                    expected_source=phase_snapshot,
+                                )
+                                if wake is None:
+                                    raise CompletionControlClaimConflict(
+                                        "pinned idle phase approval source changed"
+                                    )
+                        except CompletionControlClaimConflict as exc:
+                            raise HTTPException(
+                                status_code=409, detail=str(exc)
+                            ) from exc
+                        control_claim_finished = True
+                        return {
+                            "status": "waking",
+                            "job_id": job_id,
+                            "freeze_type": freeze_type,
+                            "phase_type": frozen_data.get("phase_type"),
+                            "phase_number": frozen_data.get("phase_number"),
+                            "command": frozen_data.get("command"),
+                        }
                 if job.get("execution_lane") == "stateless":
+                    if freeze_type == "phase_boundary":
+                        from orchestrator.services.vm_idle_lifecycle import (
+                            VMIdleLifecycleStore,
+                        )
+
+                        idle_store = VMIdleLifecycleStore(self.dependencies.store)
+                        if (
+                            await idle_store.schema_available()
+                            and await idle_store.get_open_for_owner(job_id) is not None
+                        ):
+                            if control_claim is None:
+                                raise HTTPException(
+                                    status_code=409,
+                                    detail="Idle phase approval requires durable control authority",
+                                )
+                            from orchestrator.services.completion_control import (
+                                CompletionControlClaimConflict,
+                            )
+
+                            try:
+                                async with self.dependencies.completion_control.finish(
+                                    control_claim
+                                ) as (conn, _locked_job):
+                                    wake = await idle_store.approve_phase_wake_on_conn(
+                                        conn,
+                                        job_id=job_id,
+                                        claim_id=str(control_claim.claim_id),
+                                        expected_source=phase_snapshot,
+                                    )
+                                    if wake is None:
+                                        raise CompletionControlClaimConflict(
+                                            "idle phase approval source changed"
+                                        )
+                            except CompletionControlClaimConflict as exc:
+                                raise HTTPException(
+                                    status_code=409, detail=str(exc)
+                                ) from exc
+                            control_claim_finished = True
+                            self.dependencies.logger.info(
+                                "Job %s phase boundary approved; exact VM wake %s "
+                                "must attest Ready before execution",
+                                job_id,
+                                wake["wake_id"],
+                            )
+                            return {
+                                "status": "waking",
+                                "job_id": job_id,
+                                "freeze_type": freeze_type,
+                                "phase_type": frozen_data.get("phase_type"),
+                                "phase_number": frozen_data.get("phase_number"),
+                                "command": frozen_data.get("command"),
+                            }
                     queued = (
                         await self.dependencies.store.queue_stateless_job_for_resume(
                             job_id,
@@ -1555,6 +2063,9 @@ class JobControlOperations:
                             expected_status=str(job["status"]),
                             **self.dependencies.completion_control.resume_guard_kwargs(
                                 control_claim=control_claim
+                            ),
+                            idle_phase_source_snapshot=(
+                                phase_snapshot if vm_phase_wait else None
                             ),
                         )
                     )
@@ -1621,6 +2132,130 @@ class JobControlOperations:
 
             completion_json = json.dumps(completion_data, indent=2, ensure_ascii=False)
 
+            if review_snapshot is not None:
+                if control_claim is None:
+                    raise HTTPException(
+                        status_code=409,
+                        detail="Terminal review requires durable control authority",
+                    )
+                from orchestrator.services.completion_control import (
+                    CompletionControlClaimConflict,
+                )
+                from orchestrator.services.vm_idle_lifecycle import (
+                    VMIdleLifecycleStore,
+                )
+
+                idle_store = VMIdleLifecycleStore(self.dependencies.store)
+                publication = {
+                    "version": 1,
+                    "job_id": job_id,
+                    "completion_data": completion_data,
+                    "repo_name": repo_name,
+                    "job_branch": job_branch,
+                    "actor_id": str(user.get("id"))
+                    if user and user.get("id")
+                    else None,
+                }
+                try:
+                    async with self.dependencies.completion_control.finish_claim(
+                        control_claim
+                    ) as (conn, _locked_job):
+                        operation = await idle_store.approve_terminal_review_on_conn(
+                            conn,
+                            job_id=job_id,
+                            claim_id=str(control_claim.claim_id),
+                            expected_source=review_snapshot,
+                            publication=publication,
+                            queue_state_before_claim=control_claim.queue_state_before_claim,
+                            queue_token_before_claim=control_claim.fence_value,
+                        )
+                        if operation is None:
+                            raise CompletionControlClaimConflict(
+                                "terminal review source or retained storage authority changed"
+                            )
+                        updated = await conn.fetchrow(
+                            "UPDATE jobs SET status='completed',freeze_data=NULL,"
+                            "assigned_agent_id=NULL,completed_at=COALESCE(completed_at,CURRENT_TIMESTAMP),"
+                            "updated_at=CURRENT_TIMESTAMP WHERE id=$1::uuid "
+                            "AND status='pending_review' "
+                            "AND execution_lane IN ('stateless','pinned') "
+                            "RETURNING id",
+                            job_id,
+                        )
+                        if updated is None:
+                            raise CompletionControlClaimConflict(
+                                "job changed while terminal review was committed"
+                            )
+                except CompletionControlClaimConflict as exc:
+                    raise HTTPException(status_code=409, detail=str(exc)) from exc
+                control_claim_finished = True
+                # Preserve the pre-existing best-effort merge on this one
+                # transition. Publication replay must never repeat it.
+                try:
+                    from orchestrator.services.completion import (
+                        apply_terminal_job_side_effects,
+                    )
+
+                    await apply_terminal_job_side_effects(
+                        job,
+                        "completed",
+                        gitea=self.dependencies.forge,
+                        db=self.dependencies.store,
+                        vector_db=self.dependencies.vector_store,
+                    )
+                except Exception:
+                    self.dependencies.logger.warning(
+                        "Job %s: terminal side effects failed (non-fatal)",
+                        job_id,
+                        exc_info=True,
+                    )
+                claimant = f"approve-route:{uuid4()}"
+                claimed = await idle_store.claim_terminal_publication(
+                    str(operation["id"]),
+                    claimant=claimant,
+                )
+                publication_pending = claimed is None
+                if claimed is not None:
+                    try:
+                        await asyncio.wait_for(
+                            self.publish_terminal_review(claimed),
+                            timeout=10,
+                        )
+                        publication_pending = (
+                            not await idle_store.mark_terminal_published(
+                                str(operation["id"]),
+                                token=claimed["claim_token"],
+                                claimant=claimant,
+                            )
+                        )
+                    except Exception:
+                        publication_pending = True
+                        self.dependencies.logger.exception(
+                            "Terminal approval committed; publication will replay for %s",
+                            job_id,
+                        )
+                        await idle_store.defer_terminal_publication(
+                            str(operation["id"]),
+                            token=claimed["claim_token"],
+                            claimant=claimant,
+                        )
+                    finally:
+                        await idle_store.release_claim(
+                            str(operation["id"]),
+                            token=claimed["claim_token"],
+                            claimant=claimant,
+                        )
+                return {
+                    "status": "approved",
+                    "job_id": job_id,
+                    "summary": completion_data.get("summary", ""),
+                    "deliverables": completion_data.get("deliverables", []),
+                    "approved_at": completion_data["approved_at"],
+                    "publication_pending": publication_pending,
+                    "cleanup_pending": operation.get("closed_at") is None,
+                    "_terminal_notification_owned": True,
+                }
+
             stateless_approval_committed = False
             if job.get("execution_lane") == "stateless" and control_claim is None:
                 # Linearize the stateless approval before any durable artifact
@@ -1636,6 +2271,7 @@ class JobControlOperations:
                         )
                         updated = await conn.fetchrow(
                             "UPDATE jobs SET status = 'completed', freeze_data = NULL, "
+                            f"context={_TERMINAL_VM_APPROVAL_CONTEXT_SQL}, "
                             "completed_at = CURRENT_TIMESTAMP, "
                             "updated_at = CURRENT_TIMESTAMP "
                             "WHERE id = $1::uuid AND execution_lane = 'stateless' "
@@ -1691,6 +2327,7 @@ class JobControlOperations:
                     ):
                         updated = await conn.fetchrow(
                             "UPDATE jobs SET status = 'completed', "
+                            f"context={_TERMINAL_VM_APPROVAL_CONTEXT_SQL}, "
                             "freeze_data = NULL, assigned_agent_id = NULL, "
                             "completed_at = COALESCE(completed_at, CURRENT_TIMESTAMP), "
                             "updated_at = CURRENT_TIMESTAMP "
@@ -1711,6 +2348,7 @@ class JobControlOperations:
                 async with self.dependencies.store.acquire() as conn:
                     await conn.execute(
                         "UPDATE jobs SET status = 'completed', freeze_data = NULL, "
+                        f"context={_TERMINAL_VM_APPROVAL_CONTEXT_SQL}, "
                         "completed_at = CURRENT_TIMESTAMP, "
                         "updated_at = CURRENT_TIMESTAMP WHERE id = $1::uuid",
                         job_id,
@@ -1726,6 +2364,11 @@ class JobControlOperations:
             # terminal branch). Without it an approved job got neither the merge
             # of its contracted deliverables nor a change record, and its work sat
             # on `job/<short_id>` forever. Best-effort: never fails the approval.
+            # Its credential leases (connector drivers C2) stopped renewing at
+            # pending_review; revoke what is left of their window.
+            await connector_credential_leases.revoke_execution_leases_with(
+                self.dependencies.store, job_id=job_id, reason="job_completed"
+            )
             try:
                 from orchestrator.services.completion import (
                     apply_terminal_job_side_effects,
@@ -1773,6 +2416,26 @@ class JobControlOperations:
                 "deliverables": completion_data.get("deliverables", []),
                 "approved_at": completion_data["approved_at"],
             }
+            approval_context = job.get("context") or {}
+            if isinstance(approval_context, str):
+                approval_context = json.loads(approval_context)
+            vm = (
+                approval_context.get("vm")
+                if isinstance(approval_context, Mapping)
+                else None
+            )
+            inherited_workspace = (
+                isinstance(approval_context, Mapping)
+                and job.get("parent_job_id")
+                and approval_context.get("inherits_parent_workspace") is True
+            )
+            if (
+                isinstance(vm, Mapping)
+                and vm
+                and not inherited_workspace
+                and vm.get("status") not in {"deleted", "deleting"}
+            ):
+                result["cleanup_pending"] = True
             if merge_result:
                 result["merge"] = merge_result
             return result
@@ -1814,6 +2477,10 @@ class JobControlOperations:
             job = await self.dependencies.store.get_job(job_id)
             if not job:
                 raise HTTPException(status_code=404, detail=f"Job '{job_id}' not found")
+            if worker_execution_held(job.get("context")):
+                raise HTTPException(
+                    status_code=409, detail=WORKER_EXECUTION_HOLD_MESSAGE
+                )
             require_srw_runtime(job)
             if self.dependencies.redispatch_livelock_trip(job) is not None:
                 raise HTTPException(
@@ -1887,11 +2554,25 @@ class JobControlOperations:
                 )
 
             # 4. Build the VM-request delta — merged into context.vm below so any
-            #    existing vm siblings are preserved.
+            #    existing vm siblings are preserved. The VM provisions the
+            #    defaults chain's VM template, read as the Job's owner.
+            from orchestrator.services.workspace_defaults_resolution import (
+                upgrade_record,
+            )
+
+            _, upgrade = await upgrade_record(
+                self.dependencies.store,
+                job.get("user_id"),
+                role="worker",
+                project_id=str(job["project_id"]) if job.get("project_id") else None,
+                current_backend="sandbox",
+                requested_backend="vm",
+            )
             vm_updates = {
                 "requested": True,
                 "upgrade_from": "container",
                 "upgrade_command": frozen_data.get("command", ""),
+                **upgrade,
             }
             upgraded_workspace_contract = {
                 "version": 1,
@@ -1964,7 +2645,8 @@ class JobControlOperations:
                         "    assigned_agent_id = NULL, execution_lane = 'pinned', "
                         "    updated_at = CURRENT_TIMESTAMP "
                         "WHERE id = $2::uuid AND status::text = $3::text "
-                        f"AND execution_lane = $4::text{control_guard} RETURNING id",
+                        f"AND execution_lane = $4::text{control_guard} "
+                        f"AND NOT {worker_execution_held_sql()} RETURNING id",
                         *update_args,
                     )
                     if updated is None:
@@ -2159,6 +2841,8 @@ class JobControlOperations:
         if not job:
             raise HTTPException(status_code=404, detail=f"Job '{job_id}' not found")
         require_srw_runtime(job)
+        if worker_execution_held(job.get("context")):
+            raise HTTPException(409, WORKER_EXECUTION_HOLD_MESSAGE)
         if self.dependencies.redispatch_livelock_trip(job) is not None:
             raise HTTPException(
                 status_code=409,
@@ -2237,6 +2921,8 @@ class JobControlOperations:
         # + paused (dispatchable) — fused so the dispatcher can never observe a
         # half-written decision.
         resume_context = {"sudo_denial": sudo_denial, "queued_feedback": feedback}
+        if job.get("execution_lane") != "stateless":
+            resume_context = stamp_pinned_resume_input_ids(resume_context)
         if job.get("execution_lane") == "stateless":
             try:
                 queued = await self.dependencies.store.queue_stateless_job_for_resume(
@@ -2396,6 +3082,8 @@ class JobControlOperations:
         if not uses_srw_runtime(job):
             return False
         observed_status = str(job.get("status") or "")
+        if job.get("execution_lane") == "pinned":
+            updates = stamp_pinned_resume_input_ids(updates)
         if expected_status is not None and observed_status != expected_status:
             self.dependencies.logger.warning(
                 "_internal_resume_job: expected status %s but job %s is %s",
@@ -2417,6 +3105,24 @@ class JobControlOperations:
                 job_id, source="internal_resume"
             )
 
+        if job.get("execution_lane") == "pinned":
+            from orchestrator.services.vm_idle_lifecycle import VMIdleLifecycleStore
+
+            idle_store = VMIdleLifecycleStore(self.dependencies.store)
+            if (
+                await idle_store.schema_available()
+                and await idle_store.get_open_for_owner(job_id) is not None
+            ):
+                return (
+                    await idle_store.request_wake(
+                        job_id,
+                        execution_requested=True,
+                        context_merge=updates,
+                        expected_route_id=expected_route_id,
+                    )
+                    is not None
+                )
+
         if job.get("execution_lane") == "stateless":
             queued = await self.dependencies.store.queue_stateless_job_for_resume(
                 job_id,
@@ -2424,6 +3130,11 @@ class JobControlOperations:
                 priority=int(job.get("priority") or 0),
                 fair_key=(str(job["user_id"]) if job.get("user_id") else None),
                 expected_status=observed_status,
+                **(
+                    {"expected_route_id": expected_route_id}
+                    if expected_route_id is not None
+                    else {}
+                ),
                 **self.dependencies.completion_control.resume_guard_kwargs(
                     completion_owner_command_id, completion_owner
                 ),
@@ -2467,6 +3178,14 @@ class JobControlOperations:
             job_id,
             job.get("execution_lane", "pinned"),
         )
+        if operator_pause_lift_token(job):
+            # The write merged around the hold: the feedback waits for the
+            # operator's explicit resume instead of redispatching the job.
+            self.dependencies.logger.info(
+                "Job %s is held by an operator pause; queued feedback waits for "
+                "an explicit resume",
+                job_id,
+            )
         self.dependencies.trigger_dispatch()
         return True
 

@@ -15,6 +15,7 @@ import os
 import re
 import uuid
 from contextlib import asynccontextmanager
+from itertools import groupby
 from pathlib import Path
 from typing import Optional, Any, List, Dict, Tuple
 
@@ -31,6 +32,7 @@ from shared.row_identity import (
     _THREAD_MSG_ID_NS as _THREAD_MSG_ID_NS,
     _coerce_row_id as _coerce_row_id,
 )
+from shared.runtime.core.message_markers import PERSIST_ROLE_CONTEXT
 
 try:
     import asyncpg
@@ -40,6 +42,14 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 QUERIES_DIR = Path(__file__).parent / "queries" / "postgres"
+
+# The one ``additional_kwargs`` read the resume history projection makes: a
+# typed context entry (``role='context'``) is rebuilt from its schema; every
+# other row keeps the HF-7 diet (see ``get_thread_messages_history``).
+_CONTEXT_ROW_KWARGS_PROJECTION = (
+    f"CASE WHEN message.role = '{PERSIST_ROLE_CONTEXT}' "
+    "THEN message.additional_kwargs END AS additional_kwargs"
+)
 
 
 def _active_run_queue_lease():
@@ -67,8 +77,8 @@ def _active_run_queue_lease_for_thread(thread_id: str):
     thread B.  The comparison happens before acquiring a connection so this
     mismatch is a fail-closed, zero-SQL path.
 
-    No active handle means the pinned lane and preserves its historical
-    unfenced behavior.
+    No active handle means the pinned lane, whose transcript writers fence on
+    the armed pinned life instead (:func:`_active_pinned_write_identity`).
     """
 
     lease = _active_run_queue_lease()
@@ -130,6 +140,102 @@ async def _require_run_queue_fence(conn, lease) -> None:
         raise LeaseLostError(
             f"run_queue lease lost for unit {unit_id} (token {lease_token})"
         )
+
+
+def _active_pinned_write_identity():
+    """The pinned life this process's transcript writes are fenced on.
+
+    ``None`` when the process cell is unarmed: no exact runtime generation was
+    adopted (the rolling-deploy exception the pinned event journal keeps), or
+    the process is stateless. Only consulted when no run_queue lease is held.
+    Imported lazily for the same reason as :func:`_active_run_queue_lease`.
+    """
+    try:
+        from agent.api.pinned_write_fence import current_pinned_write_identity
+    except Exception:  # pragma: no cover - defensive (partial installs)
+        return None
+    return current_pinned_write_identity()
+
+
+# The pinned event journal's fence (``_LOCK_PINNED_EVENT_THREAD_SQL`` and
+# ``_LOCK_PINNED_CONTROL_AGENT_SQL`` in ``agent.api.persistent_app``) without
+# its event epoch and without its retirement-token clause: the thread row at
+# mutation strength, matching the exact agent, runtime generation and attach
+# token of one live life, then the reciprocal agent row. The order is
+# retirement's and admission's (thread, agent, then the write), and the
+# thread lock is taken at the strength the activity bump needs, so the write
+# never upgrades it.
+#
+# An open retirement does not refuse a transcript write. Between Begin and
+# the settle the life still owns its turn: a forced End reaches the agent up
+# to a heartbeat later, and the stream or tool that finishes meanwhile must
+# keep its rows (a refused tool row would make restore strip a call whose
+# side effect happened). Nothing can duplicate in that window: the settle
+# needs this runtime's own quiescence receipt, writes only the results that
+# have no row, and nulls the agent and attach token in the same transaction,
+# and a successor exists only after it. From the settle on, every write of
+# the old life is refused.
+_PINNED_WRITE_THREAD_LOCK_SQL = """
+    SELECT 1 FROM threads
+    WHERE id = $1::uuid
+      AND execution_lane = 'pinned'
+      AND agent_id = $2::uuid
+      AND runtime_generation = $3::uuid
+      AND runtime_attach_token = $4::uuid
+      AND status IN ('created', 'active', 'awaiting_user', 'suspended')
+    FOR NO KEY UPDATE
+"""
+_PINNED_WRITE_AGENT_LOCK_SQL = """
+    SELECT 1 FROM agents
+    WHERE id = $1::uuid AND thread_id = $2::uuid
+    FOR SHARE
+"""
+
+
+async def _require_pinned_write_fence(conn, thread_id: str, identity) -> None:
+    """Prove the armed pinned life still owns ``thread_id`` inside a write tx.
+
+    The caller's transaction then inserts and bumps activity under these
+    locks, so a rebind or a retirement settle either waits for the write or
+    commits first and makes this refuse. A refusal raises
+    :class:`~agent.api.pinned_write_fence.PinnedWriteRefused` (a
+    ``LeaseLostError``): the transaction rolls back and nothing lands.
+    """
+    from agent.api.pinned_write_fence import PinnedWriteRefused
+
+    refused = None
+    if not identity.agent_id or not identity.attach_token:
+        refused = "incomplete pinned identity"
+    elif (
+        await conn.fetchval(
+            _PINNED_WRITE_THREAD_LOCK_SQL,
+            thread_id,
+            identity.agent_id,
+            identity.runtime_generation,
+            identity.attach_token,
+        )
+        is None
+    ):
+        refused = "thread no longer bound to this life"
+    elif (
+        await conn.fetchval(_PINNED_WRITE_AGENT_LOCK_SQL, identity.agent_id, thread_id)
+        is None
+    ):
+        refused = "agent no longer bound to the thread"
+    if refused is None:
+        return
+    logger.warning(
+        "pinned transcript fence refused (%s): thread=%s agent=%s "
+        "generation=%s attach_token=%s",
+        refused,
+        thread_id,
+        identity.agent_id,
+        identity.runtime_generation,
+        identity.attach_token,
+    )
+    raise PinnedWriteRefused(
+        f"pinned runtime life is not current for thread {thread_id}: {refused}"
+    )
 
 
 class PostgresDB:
@@ -1320,12 +1426,16 @@ class PostgresDB:
         history that the summary row already covers (see
         ``get_latest_compaction_checkpoint``).
 
-        Pass ``seq_gt=S`` to load only rows with ``seq > S``, ordered by ``seq``
-        (exact insertion order). This is the message-granular resume cursor: a
-        compaction records ``boundary_seq`` = the seq of the last message its
-        summary covers, and resume loads ``summary + (seq > boundary_seq)`` — the
-        agent's real live tail — instead of whole post-boundary turns. Preferred
-        over ``since_turn`` when the checkpoint carries a ``boundary_seq``.
+        Pass ``seq_gt=S`` to load only the rows after row ``S``, ordered by
+        ``seq`` (exact insertion order). This is the message-granular resume
+        cursor: a compaction records ``boundary_seq`` = the seq of the last
+        message its summary covers, and resume loads the summary plus the rows
+        after that message — the agent's real live tail — instead of whole
+        post-boundary turns. "After" is ``seq > S`` or a later turn than row
+        ``S``'s: input typed during a tool call has a lower ``seq`` than the rest
+        of its turn and belongs to the next one, so the summary may never have
+        seen it. Preferred over ``since_turn`` when the checkpoint carries a
+        ``boundary_seq``.
 
         Pass ``newest_first=True`` (with a ``limit``) for the resume backstop:
         the rows are selected ``seq DESC LIMIT N`` (the **newest** N, not the
@@ -1335,34 +1445,69 @@ class PostgresDB:
         mechanism. The caller logs when ``len(result) == limit`` (trimmed).
         """
         # HF-7 thread-read diet: the resume consumers read only
-        # role/content/tool_calls/tool_call_id (_db_rows_to_lc_messages) and
-        # turn_number (the turn_count restore in _restore_session_messages). The
+        # role/content/tool_calls/tool_call_id (_db_rows_to_lc_messages),
+        # turn_number (the turn_count restore in _restore_session_messages) and
+        # admitted_turn_number (conversation order, _conversation_order). The
         # other 10 columns — including the large JSONB reasoning/tool_results/
         # provider_raw/response_metadata/additional_kwargs — were fetched on
         # every resume and never read (the rebuilt AIMessage doesn't carry them).
         # Select only what resume consumes. The seq / turn_number / created_at
         # ORDER BYs below don't require the column in the projection.
+        # One exception, scoped by role: a ``role='context'`` row (a typed
+        # context entry, append-only context injection) is rebuilt from its
+        # ``additional_kwargs.srw_injection`` schema, so the CASE fetches the
+        # column for those rows only and stays NULL for every other row.
         provider_projection = ", message.provider_raw" if include_provider_raw else ""
+        params: List[Any] = [thread_id]
+        # The turn that consumed a row: an admitted delivery records it, the
+        # row's own number is a hint for pinned input (restore orders by it,
+        # agent.api.persistent_app._conversation_order).
+        row_turn = "COALESCE(delivery.admitted_turn_number, message.turn_number)"
+        boundary_join = ""
+        seq_cursor = ""
+        if seq_gt is not None:
+            params.append(seq_gt)
+            boundary = f"${len(params)}"
+            # The summary covers a prefix of the conversation, which is ordered
+            # by turn and then seq. Input typed during a tool call has a lower
+            # seq than the rest of that turn, so a bare `seq > S` cursor drops
+            # it when the summary did not cover it. Load every row written
+            # after the boundary row, as before, plus every row of a later turn
+            # than the boundary row's.
+            boundary_join = f"""
+            LEFT JOIN (
+                SELECT COALESCE(
+                           boundary_delivery.admitted_turn_number,
+                           boundary_message.turn_number
+                       ) AS turn
+                FROM thread_messages AS boundary_message
+                LEFT JOIN thread_input_deliveries AS boundary_delivery
+                  ON boundary_delivery.message_id = boundary_message.id
+                WHERE boundary_message.thread_id = $1
+                  AND boundary_message.seq = {boundary}
+                LIMIT 1
+            ) AS boundary ON TRUE"""
+            seq_cursor = f"""
+              AND (seq > {boundary} OR {row_turn} > boundary.turn)"""
         query = f"""
             SELECT message.id, message.role, message.content,
                    message.tool_calls, message.tool_call_id,
-                   message.turn_number{provider_projection}
+                   message.turn_number,
+                   delivery.admitted_turn_number,
+                   {_CONTEXT_ROW_KWARGS_PROJECTION}{provider_projection}
             FROM thread_messages AS message
+            LEFT JOIN thread_input_deliveries AS delivery
+              ON delivery.message_id = message.id{boundary_join}
             WHERE message.thread_id = $1
               AND message.role NOT IN ('summary', 'error')
               AND message.rewound_at IS NULL
-              AND NOT EXISTS (
-                    SELECT 1 FROM thread_input_deliveries AS delivery
-                     WHERE delivery.message_id = message.id
-                       AND delivery.state IN (
-                           'persisted', 'owned', 'queued', 'deferred', 'cancelled'
-                       )
-                  )
+              AND (
+                    delivery.state IS NULL
+                    OR delivery.state NOT IN (
+                        'persisted', 'owned', 'queued', 'deferred', 'cancelled'
+                    )
+                  ){seq_cursor}
         """
-        params: List[Any] = [thread_id]
-        if seq_gt is not None:
-            params.append(seq_gt)
-            query += f"\n              AND seq > ${len(params)}"
         if since_turn is not None:
             params.append(since_turn)
             query += f"\n              AND turn_number > ${len(params)}"
@@ -1396,9 +1541,17 @@ class PostgresDB:
                     "tool_calls": _j(row["tool_calls"]) if row["tool_calls"] else None,
                     "tool_call_id": row["tool_call_id"],
                     "turn_number": row["turn_number"],
+                    "admitted_turn_number": row.get("admitted_turn_number"),
                     **(
                         {"provider_raw": _j(row["provider_raw"])}
                         if include_provider_raw
+                        else {}
+                    ),
+                    # Only a context row gets the key (the HF-7 diet holds
+                    # for the rest; see _CONTEXT_ROW_KWARGS_PROJECTION).
+                    **(
+                        {"additional_kwargs": _j(row.get("additional_kwargs"))}
+                        if row["role"] == PERSIST_ROLE_CONTEXT
                         else {}
                     ),
                 }
@@ -1450,6 +1603,13 @@ class PostgresDB:
             "boundary_turn": metrics.get("boundary_turn"),
             "boundary_seq": metrics.get("boundary_seq"),
             "turn_number": row["turn_number"],
+            "before": metrics.get("before"),
+            "after": metrics.get("after"),
+            "trigger": metrics.get("trigger"),
+            # Set only by a stateless manual compaction (the durable control it
+            # answered): lets a successor recognise a checkpoint whose journal
+            # receipt never committed instead of compacting a second time.
+            "control_request_id": metrics.get("control_request_id"),
         }
 
     async def get_seq_for_message_id(
@@ -1750,6 +1910,100 @@ class PostgresDB:
         return [str(row["commit_sha"]) for row in rows]
 
     # ------------------------------------------------------------------
+    # Pending memory set of a session (append-only context injection WP4)
+    # ------------------------------------------------------------------
+
+    _SAVE_PENDING_MEMORY_SQL = """
+        UPDATE threads
+        SET metadata = jsonb_set(
+            COALESCE(metadata, '{}'::jsonb), ARRAY[$2::text], $3::jsonb, true
+        )
+        WHERE id = $1::uuid
+        RETURNING 1
+    """
+    _CLEAR_PENDING_MEMORY_SQL = """
+        UPDATE threads
+        SET metadata = metadata - $2::text
+        WHERE id = $1::uuid
+          AND metadata -> $2::text ->> 'id' = $3::text
+        RETURNING 1
+    """
+
+    async def save_thread_pending_memory(
+        self,
+        thread_id: str,
+        payload: Optional[Dict[str, Any]],
+        *,
+        expected_id: Optional[str] = None,
+    ) -> bool:
+        """Write or clear the session's durable pending memory set (D32).
+
+        ``payload`` (the serialized idle-time prefetch) is written under
+        ``SESSION_PENDING_MEMORY_KEY`` with one atomic ``jsonb_set``: every
+        other metadata key is left as it is, so no writer that owns another
+        key is overwritten. ``payload`` None removes the stored set only when
+        its id is ``expected_id`` (the set this turn took in); a newer set is
+        never cleared by an older turn.
+
+        Fenced like the turn's other writes: the thread row is locked first
+        (the repository's threads -> run_queue order), then a stateless
+        claimant proves its exact lease before the update, so a zombie never
+        writes after a steal. The pinned lane has no queue lease. Returns
+        True when the statement ran; False when the thread is gone. A lost
+        lease raises ``LeaseLostError``.
+        """
+        from shared.session_pending_memory import SESSION_PENDING_MEMORY_KEY
+
+        if payload is None and not expected_id:
+            return False
+        lease = _active_run_queue_lease_for_thread(thread_id)
+        async with self.acquire() as conn:
+            async with conn.transaction():
+                exists = await conn.fetchval(
+                    "SELECT 1 FROM threads WHERE id = $1::uuid FOR UPDATE",
+                    thread_id,
+                )
+                if exists is None:
+                    return False
+                if lease is not None:
+                    await _require_run_queue_fence(conn, lease)
+                if payload is not None:
+                    await conn.fetchval(
+                        self._SAVE_PENDING_MEMORY_SQL,
+                        thread_id,
+                        SESSION_PENDING_MEMORY_KEY,
+                        json.dumps(payload),
+                    )
+                else:
+                    await conn.fetchval(
+                        self._CLEAR_PENDING_MEMORY_SQL,
+                        thread_id,
+                        SESSION_PENDING_MEMORY_KEY,
+                        str(expected_id),
+                    )
+        return True
+
+    async def get_thread_pending_memory(
+        self, thread_id: str
+    ) -> Optional[Dict[str, Any]]:
+        """The session's stored pending memory set, if it holds a valid one.
+
+        Read by a pinned session at setup in a fresh process (the stateless
+        lane gets the set from its claim bundle).
+        """
+        from shared.session_pending_memory import (
+            SESSION_PENDING_MEMORY_KEY,
+            valid_pending_memory,
+        )
+
+        value = await self.fetchval(
+            "SELECT metadata -> $2::text FROM threads WHERE id = $1::uuid",
+            thread_id,
+            SESSION_PENDING_MEMORY_KEY,
+        )
+        return valid_pending_memory(value)
+
+    # ------------------------------------------------------------------
     # Durable persistent-session state (migration 0133)
     # ------------------------------------------------------------------
 
@@ -1982,6 +2236,19 @@ class PostgresDB:
     # Shared by the single-row upsert (RETURNING id, seq) and the turn-complete
     # reconcile batch (same statement minus RETURNING — executemany discards
     # results). Keep the column set in lockstep with the orchestrator's writer.
+    #
+    # ``metrics`` belongs to the writer that owns it. The agent writes turn
+    # metrics on AI rows only, so an AI row takes what the upsert brings. A
+    # non-AI row keeps metrics it already has when the upsert brings none: the
+    # loop re-saves its input row at turn start, and a recovery continuation
+    # carries ``metrics.subagent_recovery`` written by the orchestrator
+    # (parallel_subagents.md §6.5), which that re-save must not erase.
+    #
+    # ``additional_kwargs`` likewise keeps what is stored when the upsert
+    # brings none. A ``role='context'`` row's schema is what restore rebuilds
+    # the entry from (append-only context injection, WP2 spec §F), and a
+    # re-save of the same id without it — a reconcile pass, or a writer that
+    # never serializes kwargs — must not erase it.
     _THREAD_MESSAGE_UPSERT_SQL = """
         INSERT INTO thread_messages
             (id, thread_id, role, content, tool_calls, turn_number,
@@ -1994,19 +2261,35 @@ class PostgresDB:
             content           = EXCLUDED.content,
             tool_calls        = EXCLUDED.tool_calls,
             turn_number       = EXCLUDED.turn_number,
-            metrics           = EXCLUDED.metrics,
+            metrics           = CASE
+                WHEN thread_messages.role = 'ai' THEN EXCLUDED.metrics
+                ELSE COALESCE(EXCLUDED.metrics, thread_messages.metrics)
+            END,
             tool_call_id      = EXCLUDED.tool_call_id,
             thinking          = EXCLUDED.thinking,
             reasoning         = EXCLUDED.reasoning,
             tool_results      = EXCLUDED.tool_results,
             provider          = EXCLUDED.provider,
             provider_raw      = EXCLUDED.provider_raw,
-            additional_kwargs = EXCLUDED.additional_kwargs,
+            additional_kwargs = COALESCE(
+                EXCLUDED.additional_kwargs, thread_messages.additional_kwargs
+            ),
             response_metadata = EXCLUDED.response_metadata
         RETURNING id, seq
     """
     _THREAD_MESSAGE_UPSERT_BATCH_SQL = _THREAD_MESSAGE_UPSERT_SQL.replace(
         "RETURNING id, seq", ""
+    )
+    # Same columns, insert-if-absent: a batch row flagged ``insert_if_absent``
+    # (a lossy compaction view the reconcile still owes when the incremental
+    # write was lost) fills a missing row but never rewrites an existing one's
+    # content. Only the tool link follows: a mid-turn cross-family model switch
+    # remaps tool-call ids in memory on the AI message and its result alike,
+    # the AI row upserts the new id, and a result left on the old one would
+    # split the stored pair (restore then prunes both halves as orphans).
+    _THREAD_MESSAGE_INSERT_IF_ABSENT_BATCH_SQL = (
+        _THREAD_MESSAGE_UPSERT_SQL.partition("ON CONFLICT (id)")[0]
+        + "ON CONFLICT (id) DO UPDATE SET tool_call_id = EXCLUDED.tool_call_id"
     )
     _THREAD_ACTIVITY_BUMP_SQL = """
         UPDATE threads
@@ -2143,6 +2426,11 @@ class PostgresDB:
           back the row's monotonic insertion order, so a compaction can record
           ``boundary_seq`` without a follow-up read.
 
+        Fenced on both lanes: a stateless write on its exact run_queue lease
+        (``LeaseLostError``), a pinned write on the armed pinned life
+        (``PinnedWriteRefused``, a ``LeaseLostError``). A refused write rolls
+        back whole.
+
         Mirrors the orchestrator's column set and the ``threads`` activity bump.
         ``tool_call_id`` is set only on role='tool' rows; ``thinking`` only on
         role='ai' rows with reasoning. The component columns (reasoning,
@@ -2181,10 +2469,19 @@ class PostgresDB:
             return row
 
         lease = _active_run_queue_lease_for_thread(thread_id)
+        pinned = _active_pinned_write_identity() if lease is None else None
         async with self.acquire() as conn:
-            if lease is None:
-                # Pinned lane: today's exact behavior (autocommit statements).
+            if lease is None and pinned is None:
+                # Unarmed pinned lane (no exact runtime generation adopted):
+                # the historical autocommit statements.
                 row = await _write(conn)
+            elif lease is None:
+                # Pinned lane: the thread row locked on this exact life, then
+                # the agent row, then the upsert and activity bump, in one
+                # transaction (P2). A replaced or settled life writes nothing.
+                async with conn.transaction():
+                    await _require_pinned_write_fence(conn, thread_id, pinned)
+                    row = await _write(conn)
             else:
                 # Public End, admission, and reaper retirement lock the thread
                 # before its queue row.  Establish the message FK's parent-row
@@ -2212,14 +2509,20 @@ class PostgresDB:
         role: str,
         content: str,
         source: str,
-        turn_number: Optional[int],
         agent_id: str,
         pod_uid: str,
         runtime_generation: str,
         session_runtime_generation: str,
         runtime_attach_token: str,
+        turn_number: Optional[int] = None,
+        turn_number_hint: Optional[int] = None,
     ) -> Dict[str, Any]:
-        """Persist and claim one pinned input in a parent-first transaction."""
+        """Persist and claim one pinned input in a parent-first transaction.
+
+        ``turn_number_hint`` numbers only a row this call creates; a retry of
+        an admitted or settled identity resolves to its receipt whatever the
+        session's turn counter says now. ``turn_number`` asserts the turn.
+        """
 
         from shared.persistent_input_delivery import persist_input_delivery
 
@@ -2233,6 +2536,7 @@ class PostgresDB:
                     content=content,
                     source=source,
                     turn_number=turn_number,
+                    turn_number_hint=turn_number_hint,
                     agent_id=agent_id,
                     pod_uid=pod_uid,
                     runtime_generation=runtime_generation,
@@ -2257,6 +2561,32 @@ class PostgresDB:
         async with self.acquire() as conn:
             async with conn.transaction():
                 return await claim_pending_input_deliveries(
+                    conn,
+                    thread_id=thread_id,
+                    agent_id=agent_id,
+                    pod_uid=pod_uid,
+                    runtime_generation=runtime_generation,
+                    session_runtime_generation=session_runtime_generation,
+                    runtime_attach_token=runtime_attach_token,
+                )
+
+    async def reserve_stale_pinned_admissions(
+        self,
+        *,
+        thread_id: str,
+        agent_id: str,
+        pod_uid: str,
+        runtime_generation: str,
+        session_runtime_generation: str,
+        runtime_attach_token: str,
+    ) -> Dict[str, List[str]]:
+        """Serve again, settle or park events an earlier process admitted."""
+
+        from shared.persistent_input_delivery import reserve_stale_pinned_admissions
+
+        async with self.acquire() as conn:
+            async with conn.transaction():
+                return await reserve_stale_pinned_admissions(
                     conn,
                     thread_id=thread_id,
                     agent_id=agent_id,
@@ -2419,6 +2749,32 @@ class PostgresDB:
                     pod_uid=pod_uid,
                 )
 
+    async def settle_answered_stateless_admission(
+        self,
+        *,
+        thread_id: str,
+        delivery_id: str,
+        lease_token: int,
+        executor_id: str,
+        pod_uid: str,
+    ) -> Optional[str]:
+        """Settle an older lease's admission whose turn already ended."""
+
+        from shared.persistent_input_delivery import (
+            settle_answered_stateless_admission,
+        )
+
+        async with self.acquire() as conn:
+            async with conn.transaction():
+                return await settle_answered_stateless_admission(
+                    conn,
+                    thread_id=thread_id,
+                    delivery_id=delivery_id,
+                    lease_token=lease_token,
+                    executor_id=executor_id,
+                    pod_uid=pod_uid,
+                )
+
     async def transition_stateless_input_delivery(
         self,
         *,
@@ -2472,7 +2828,11 @@ class PostgresDB:
         a stable ``id`` makes the upsert land on the incremental row via
         ``ON CONFLICT (id)``, and ``seq`` is preserved (assigned once on first
         insert). No ``RETURNING`` — the reconcile never reads ``seq`` back, and
-        ``executemany`` discards results anyway.
+        ``executemany`` discards results anyway. A dict flagged
+        ``insert_if_absent`` (a lossy compaction view of its row) only
+        inserts: it fills a row whose incremental write was lost and never
+        rewrites the content of one that landed (its ``tool_call_id`` alone
+        follows, so a remapped pair stays paired).
 
         The upsert runs inside a transaction so the whole turn reconciles
         atomically. This batches ONLY the reconcile; the incremental mid-turn
@@ -2487,7 +2847,8 @@ class PostgresDB:
         the final transcript. A stale claimant therefore commits neither, and
         an idempotent reconcile returns the same producer identity. A later
         project/mount edit cannot redirect the captured destination. Pinned
-        callers have no lease context and preserve the transcript-only path.
+        callers have no lease context and keep the transcript-only path,
+        fenced on the armed pinned life like :meth:`save_thread_message`.
 
         An empty message list remains a no-op except for the stateless producer
         path: even a turn that emitted no AI/tool row must durably mint its
@@ -2497,6 +2858,7 @@ class PostgresDB:
             return None
 
         lease = _active_run_queue_lease_for_thread(thread_id)
+        pinned = _active_pinned_write_identity() if lease is None else None
         should_mint_effect = lease is not None and bool(turn_input_message_id)
         if not messages and not should_mint_effect:
             # In particular, preserve the pinned lane's historical empty-batch
@@ -2529,10 +2891,12 @@ class PostgresDB:
             return json.dumps(value) if value is not None else None
 
         args: List[Tuple] = []
+        insert_if_absent: List[bool] = []
         max_turn = 0
         for m in messages:
             row_turn_number = m.get("turn_number")
             max_turn = max(max_turn, row_turn_number or 0)
+            insert_if_absent.append(m.get("insert_if_absent") is True)
             args.append(
                 (
                     _coerce_row_id(m.get("id")),
@@ -2557,9 +2921,12 @@ class PostgresDB:
         async with self.acquire() as conn:
             async with conn.transaction():
                 # Match public End's threads -> run_queue order before any
-                # batch FK/upsert or activity mutation. Pinned lane (no lease
-                # context) keeps today's exact transaction shape.
+                # batch FK/upsert or activity mutation. The pinned lane locks
+                # the thread on its armed life, then the agent row (P2); an
+                # unarmed pinned lane keeps the historical transaction shape.
                 memory_parent = None
+                if pinned is not None:
+                    await _require_pinned_write_fence(conn, thread_id, pinned)
                 if lease is not None:
                     # The authoritative final reconcile captures its memory
                     # tenancy while the thread row is locked, before the exact
@@ -2608,10 +2975,17 @@ class PostgresDB:
                 # Same upsert as save_thread_message, minus RETURNING. Each
                 # execution's ON CONFLICT is independent (executemany runs N
                 # separate commands), so distinct-id rows never collide.
-                if args:
+                # Insert-if-absent rows run as their own statement per
+                # consecutive run, in row order, so a row either kind has to
+                # mint still lands at its position in seq.
+                for only_if_absent, run in groupby(
+                    zip(insert_if_absent, args), key=lambda pair: pair[0]
+                ):
                     await conn.executemany(
-                        self._THREAD_MESSAGE_UPSERT_BATCH_SQL,
-                        args,
+                        self._THREAD_MESSAGE_INSERT_IF_ABSENT_BATCH_SQL
+                        if only_if_absent
+                        else self._THREAD_MESSAGE_UPSERT_BATCH_SQL,
+                        [row for _, row in run],
                     )
                 # One activity/turn bump for the whole batch (was per-message).
                 # The stateless producer path also bumps an output-less turn.
@@ -2877,6 +3251,7 @@ class JobsNamespace:
             forge_web_url_matches_connector,
             parse_owner_repo,
         )
+        from shared.connectors.contract import bound_read_only
         from shared.deliverable_contract import normalize_repository_identity
 
         async with self.db.acquire() as conn:
@@ -2886,6 +3261,7 @@ class JobsNamespace:
                     SELECT datasource.connection_url,
                            datasource.config,
                            datasource.read_only,
+                           datasource.is_global,
                            datasource.policy_revision,
                            contract.pr_repositories,
                            contract.pr_bindings,
@@ -2911,11 +3287,18 @@ class JobsNamespace:
                     job_id,
                     datasource_id,
                 )
+                # Bound read-only (its project link or its creator's tag, a
+                # public one with no mode set included): no PR authority.
                 if (
                     row is None
                     or row["job_status"] != "processing"
-                    or row["read_only"]
-                    or row["project_read_only"]
+                    or bound_read_only(
+                        {
+                            "read_only": row["read_only"],
+                            "is_global": row["is_global"],
+                            "project_read_only": row["project_read_only"],
+                        }
+                    )
                 ):
                     return False
                 try:

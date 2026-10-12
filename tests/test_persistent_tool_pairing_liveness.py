@@ -5,6 +5,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 import pytest
+
+from tests._session_termination_adapter import termination_target
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from openai import BadRequestError
 
@@ -189,10 +191,12 @@ async def test_non_pairing_provider_400_keeps_normal_error_behavior(monkeypatch)
     async def _astream(_messages, **_kwargs):
         nonlocal provider_calls
         provider_calls += 1
-        # Two complete ordinary turns exhaust the existing three-attempt
-        # generic retry budget. Unlike pairing errors they are surfaced
-        # normally and never enter the LF-5 circuit.
-        if provider_calls <= 6:
+        # Two complete ordinary turns, each rejected deterministically: an
+        # invalid_request_error 400 is sent once per turn, not replayed through
+        # the generic retry budget (deterministic_provider_rejection_retried_
+        # unchanged.md). Unlike pairing errors they are surfaced normally and
+        # never enter the LF-5 circuit.
+        if provider_calls <= 2:
             raise _bad_request("Invalid schema for response_format")
         yield AIMessage(content="third turn still ran")
 
@@ -212,7 +216,7 @@ async def test_non_pairing_provider_400_keeps_normal_error_behavior(monkeypatch)
         messages=messages,
     )
 
-    assert provider_calls == 7
+    assert provider_calls == 3
     assert all(
         "Session halted after two consecutive" not in str(call.args[0])
         for call in on_error.await_args_list
@@ -284,22 +288,24 @@ async def test_mid_tool_drift_waits_for_pair_then_replacement_restore_is_valid()
     from agent.api import persistent_app
 
     saved = {
-        name: getattr(persistent_app, name)
+        name: getattr(*termination_target(persistent_app, name))
         for name in (
             "_session",
-            "_awaiting_input",
             "_tool_inflight",
-            "_loop_user_queue",
             "_drain_intent_handled",
             "_drain_deferred_logged",
         )
     }
+    saved_input = (
+        persistent_app._session_input._awaiting_input,
+        persistent_app._session_input._queue,
+    )
     persistent_app._session = MagicMock()
-    persistent_app._awaiting_input = False
+    persistent_app._session_input._awaiting_input = False
     persistent_app._tool_inflight = False
-    persistent_app._loop_user_queue = None
-    persistent_app._drain_intent_handled = False
-    persistent_app._drain_deferred_logged = False
+    persistent_app._session_input._queue = None
+    persistent_app._session_termination.drain_intent_handled = False
+    persistent_app._session_termination.drain_deferred_logged = False
     drain = AsyncMock()
     durable: list = []
     input_count = 0
@@ -309,15 +315,15 @@ async def test_mid_tool_drift_waits_for_pair_then_replacement_restore_is_valid()
         input_count += 1
         if input_count == 1:
             return "inspect safely"
-        persistent_app._awaiting_input = True
-        await persistent_app._handle_heartbeat_intents(
+        persistent_app._session_input._awaiting_input = True
+        await persistent_app._session_termination.handle_heartbeat_intents(
             {"intents": {"should_drain": True, "drain_reason": "image_drift"}}
         )
         raise asyncio.CancelledError
 
     async def _tool_start(*_args):
         persistent_app._tool_inflight = True
-        await persistent_app._handle_heartbeat_intents(
+        await persistent_app._session_termination.handle_heartbeat_intents(
             {"intents": {"should_drain": True, "drain_reason": "image_drift"}}
         )
         drain.assert_not_awaited()
@@ -326,7 +332,7 @@ async def test_mid_tool_drift_waits_for_pair_then_replacement_restore_is_valid()
         # _execute_turn persists the ToolMessage before this callback.
         assert any(isinstance(message, ToolMessage) for message in durable)
         persistent_app._tool_inflight = False
-        await persistent_app._handle_heartbeat_intents(
+        await persistent_app._session_termination.handle_heartbeat_intents(
             {"intents": {"should_drain": True, "drain_reason": "image_drift"}}
         )
         drain.assert_not_awaited()
@@ -358,7 +364,9 @@ async def test_mid_tool_drift_waits_for_pair_then_replacement_restore_is_valid()
     )
 
     try:
-        with patch.object(persistent_app, "_drain_suspend_session", drain):
+        with patch.object(
+            persistent_app._session_termination, "drain_suspend_session", drain
+        ):
             await run_persistent_loop(
                 llm_with_tools=first_llm,
                 tools=[tool],
@@ -418,5 +426,9 @@ async def test_mid_tool_drift_waits_for_pair_then_replacement_restore_is_valid()
         assert replacement_call_ids == replacement_result_ids == {"call_drain"}
         assert durable == durable_snapshot
     finally:
+        (
+            persistent_app._session_input._awaiting_input,
+            persistent_app._session_input._queue,
+        ) = saved_input
         for name, value in saved.items():
-            setattr(persistent_app, name, value)
+            setattr(*termination_target(persistent_app, name), value)

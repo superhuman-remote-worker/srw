@@ -1,0 +1,63 @@
+{
+  "_note": "Open-weight chat templates vendored byte-for-byte at pinned Hugging Face revisions for tests/test_prompt_cache_prefix_invariance.py. Never edit a template file: re-download it at a new revision and update its entry (sha256 is checked by the test). Revisions follow knowledge-base/knowledge/features/append_only_context_injection_research/aoci_q3_chat_templates.md. License notices: NOTICE.txt.",
+  "templates": {
+    "qwen3.6": {
+      "file": "qwen3_6_27b.chat_template.jinja",
+      "kind": "jinja",
+      "repo": "Qwen/Qwen3.6-27B",
+      "revision": "6a9e13bd6fc8f0983b9b99948120bc37f49c13e9",
+      "source_url": "https://huggingface.co/Qwen/Qwen3.6-27B/resolve/6a9e13bd6fc8f0983b9b99948120bc37f49c13e9/chat_template.jinja",
+      "license": "Apache-2.0",
+      "sha256": "e84f32a23fdda27689f868aa4a1a5621f41133e51a48d7f3efcbea2839574259",
+      "special_tokens": {"eos_token": "<|im_end|>", "pad_token": "<|endoftext|>"}
+    },
+    "gemma-4": {
+      "file": "gemma_4_31b_it.chat_template.jinja",
+      "kind": "jinja",
+      "repo": "google/gemma-4-31B-it",
+      "revision": "842da3794eaa0b77d5f08bae87a17459d91ff475",
+      "source_url": "https://huggingface.co/google/gemma-4-31B-it/resolve/842da3794eaa0b77d5f08bae87a17459d91ff475/chat_template.jinja",
+      "license": "Apache-2.0",
+      "sha256": "ae53464bf3be25802b3a5b37def7fd89667067d7577049b3b2d74c4d8de4c6d4",
+      "special_tokens": {"bos_token": "<bos>", "eos_token": "<eos>", "pad_token": "<pad>", "unk_token": "<unk>"}
+    },
+    "glm-5.2": {
+      "file": "glm_5_2.chat_template.jinja",
+      "kind": "jinja",
+      "repo": "zai-org/GLM-5.2",
+      "revision": "cf457fa734ab149ffef225f80893eb38c6ff5cdc",
+      "source_url": "https://huggingface.co/zai-org/GLM-5.2/resolve/cf457fa734ab149ffef225f80893eb38c6ff5cdc/chat_template.jinja",
+      "license": "MIT",
+      "sha256": "172dc74a35e1752df75ecfb2b2cf9326d2852bb1379868ebeec9571654489679",
+      "special_tokens": {"eos_token": "<|endoftext|>", "pad_token": "<|endoftext|>"}
+    },
+    "minimax-m2": {
+      "file": "minimax_m2.chat_template.jinja",
+      "kind": "jinja",
+      "repo": "MiniMaxAI/MiniMax-M2",
+      "revision": "757303d492a50514c312788b5247a4f696a4c6a3",
+      "source_url": "https://huggingface.co/MiniMaxAI/MiniMax-M2/resolve/757303d492a50514c312788b5247a4f696a4c6a3/chat_template.jinja",
+      "license": "MIT with MiniMax attribution clause (modified-mit)",
+      "sha256": "86cd6e574dec52bf6d7e678c5b46ceb5223d68b3a1130bbbc09d0a2dc0909438",
+      "special_tokens": {"bos_token": "]~!b[", "eos_token": "[e~[", "unk_token": "]!d~["}
+    },
+    "deepseek-v3.2": {
+      "file": "deepseek_v3_2.encoding_dsv32.py.txt",
+      "kind": "dsv32_encoder",
+      "repo": "deepseek-ai/DeepSeek-V3.2",
+      "revision": "a7e62ac04ecb2c0a54d736dc46601c5606cf10a6",
+      "source_url": "https://huggingface.co/deepseek-ai/DeepSeek-V3.2/resolve/a7e62ac04ecb2c0a54d736dc46601c5606cf10a6/encoding/encoding_dsv32.py",
+      "license": "MIT",
+      "sha256": "5e068c2ba2a6e5ebe37a49bb005650c507e7935d77a32f3f7c11ee071498b370",
+      "special_tokens": {}
+    }
+  },
+  "not_vendored": {
+    "minimax-m3": {
+      "repo": "MiniMaxAI/MiniMax-M3",
+      "revision": "f0e1c1e04d40177e4673a22097036854f536e9c0",
+      "license": "MiniMax Community License (non-commercial grant; commercial use needs attribution plus a notice to or authorization from MiniMax)",
+      "reason": "Not vendored into this commercially licensed repository; the test is a skip with this reason."
+    }
+  }
+}

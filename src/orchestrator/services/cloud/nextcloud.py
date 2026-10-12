@@ -29,7 +29,6 @@ from __future__ import annotations
 import itertools
 import hashlib
 import logging
-import os
 import re
 import time
 from collections.abc import Awaitable, Callable
@@ -51,6 +50,11 @@ from orchestrator.services.cloud.base import (
 from orchestrator.services.cloud.backend_instance_authority import (
     main_cloud_installation_proof_sha256,
 )
+from orchestrator.services.cloud.capabilities import (
+    CHECKOUT_WRITE_BACK,
+    CloudCapability,
+    ProviderCapabilities,
+)
 from orchestrator.services.cloud.config import NextcloudSettings
 from orchestrator.services.cloud.etag_baseline import (
     PropfindError,
@@ -65,6 +69,7 @@ from orchestrator.services.cloud.handles import (
     ShareHandle,
     UserId,
 )
+from orchestrator.services.cloud.nextcloud_user_root import NextcloudUserRootGrant
 from orchestrator.services.cloud.retry import LeakyBucket
 from orchestrator.services.cloud.telemetry import instrument_backend_op
 from orchestrator.services.cloud.protected_reader_authority import (
@@ -83,6 +88,25 @@ _ALL_PERMISSIONS = 31  # read(1) + update(2) + create(4) + delete(8) + share(16)
 _SESSION_SHARE_PERMISSIONS = 15  # same minus share
 _READ_PERMISSION = 1  # read only — the protected-mode RO reader grant
 
+#: A per-folder grant's Group Folder permissions by kind: the reader reads,
+#: the writer reads, updates, creates and deletes; neither may share.
+_FOLDER_GRANT_PERMISSIONS = {"reader": _READ_PERMISSION, "writer": 15}
+#: The only principals and groups the per-folder grant methods create or
+#: delete (``folder_grants`` names them after the grant row), so a revoke
+#: can never remove any other account.
+_FOLDER_PRINCIPAL_RE = re.compile(r"srw-(reader|writer)-f-([0-9a-f]{32})\Z")
+_FOLDER_GROUP_RE = re.compile(r"srw-(rog|rwg)-f-([0-9a-f]{32})\Z")
+_FOLDER_GROUP_KIND = {"rog": "reader", "rwg": "writer"}
+#: The one grant kind a project mount at each level may carry (as
+#: ``folder_grants.KIND_FOR_ACCESS``).
+_FOLDER_KIND_FOR_ACCESS = {"read_only": "reader", "read_write": "writer"}
+#: A per-folder principal's own quota: it is an ordinary Nextcloud user,
+#: but stores nothing of its own (its folder's Group Folder quota is apart).
+#: Nextcloud has no per-user or per-group switch for sharing or user
+#: lookup, only the installation-wide sharing settings, which SRW leaves
+#: to the operator.
+_FOLDER_PRINCIPAL_QUOTA = "0 B"
+
 # Nextcloud 30.0.10+ enforces 20 new user shares per 10 minutes per user on
 # /ocs/v2.php/apps/files_sharing/api/v1/shares. The client-side bucket sits
 # at 15/10min to leave headroom for clock skew and concurrent processes.
@@ -96,8 +120,103 @@ _PROTECTED_EFFECT_AUTHORITY_HEADER = "X-SRW-Protected-Effect-Authority"
 _PROTECTED_EFFECT_SIGNATURE_HEADER = "X-SRW-Protected-Effect-Signature"
 _PROTECTED_EFFECT_INSTANCE_HEADER = "X-SRW-Backend-Instance"
 
+_UNRESTRICTABLE_APP_TOKEN = (
+    "an app token cannot be restricted to read-only or to one path"
+)
 
-class NextcloudBackend:
+#: What Nextcloud delivers (main_cloud_as_connectors.md, "Provider support
+#: matrix"). A project folder is mounted as its per-folder grant's principal
+#: (``folder_grants``), never as agent-service: a reader for ``read_only``, a
+#: writer for ``read_write``. The workspace tier narrows it: a VM's rclone
+#: config holds the credential itself, so only the reader is offered there.
+NEXTCLOUD_CAPABILITIES = ProviderCapabilities(
+    backend_id=BACKEND_ID,
+    title="Nextcloud",
+    capabilities=(
+        CloudCapability(
+            "cloud_folder",
+            "project",
+            "read_only",
+            "offered",
+            "a reader account allowed to read only this folder; on a VM its "
+            "credential sits in the workspace's rclone config",
+            frozenset({"sandbox", "vm"}),
+        ),
+        CloudCapability(
+            "cloud_folder",
+            "project",
+            "read_write",
+            "offered",
+            "a writer account per project member that can read and write only "
+            "this project's folder",
+            frozenset({"sandbox"}),
+        ),
+        CloudCapability(
+            "cloud_folder",
+            "project",
+            "protected",
+            "offered",
+            "the reader grant as a read-only lower layer; writes stay in an "
+            "overlay until the owner approves them in review",
+            frozenset({"sandbox"}),
+        ),
+        CloudCapability(
+            "cloud_folder",
+            "user_root",
+            "read_write",
+            "offered",
+            "a per-user app token for the user's own files, granted once by the "
+            "user (Connect your cloud); it cannot be limited to read-only or to "
+            "one folder",
+            frozenset({"sandbox"}),
+        ),
+        CloudCapability(
+            "cloud_folder",
+            "user_root",
+            "read_only",
+            "unsupported",
+            _UNRESTRICTABLE_APP_TOKEN,
+        ),
+        CloudCapability(
+            "cloud_folder",
+            "user_root",
+            "protected",
+            "unsupported",
+            _UNRESTRICTABLE_APP_TOKEN,
+        ),
+        CloudCapability(
+            "cloud_folder_checkout",
+            "project",
+            "read_only",
+            "offered",
+            "the folder is copied into the job's repository before it starts; "
+            "SRW never applies the copy's changes",
+            frozenset({"sandbox", "vm"}),
+        ),
+        CloudCapability(
+            "cloud_folder_checkout",
+            "project",
+            "reviewed_write_back",
+            "offered",
+            CHECKOUT_WRITE_BACK,
+            frozenset({"sandbox", "vm"}),
+        ),
+        CloudCapability(
+            "cloud_outbox",
+            None,
+            "read_write",
+            "offered",
+            "a folder SRW creates in the agent-service account's home and "
+            "shares with the execution's owner; a session mounts it with "
+            "agent-service's credential (which can still write every project "
+            "folder, until slice 7b), so not on a root VM",
+            frozenset({"sandbox"}),
+        ),
+    ),
+)
+
+
+class NextcloudBackend(NextcloudUserRootGrant):
     """Main-cloud backend for Nextcloud.
 
     Reads configuration from environment variables:
@@ -110,6 +229,28 @@ class NextcloudBackend:
     """
 
     backend_id = BACKEND_ID
+    capabilities = NEXTCLOUD_CAPABILITIES
+    #: Its rclone mounts authenticate with a static app password, which the
+    #: in-pod plane's supervisor can hold as a config file (connector drivers
+    #: D7).
+    static_mount_credentials = True
+    #: Routing keys and secret-reference fields ``ensure_initialized`` proves:
+    #: it connects to the internal URL as the admin account and, when the
+    #: protected-effect lane is configured, verifies its signed attestation
+    #: (URL, config digest, HMAC key). It never uses the agent account or
+    #: the public URL, so a change to those is not proven by the proof.
+    attested_fields: frozenset[str] = frozenset(
+        {
+            "version",
+            "backend_id",
+            "base_url",
+            "admin_user",
+            "admin_password",
+            "protected_effect_url",
+            "protected_effect_config_sha256",
+            "protected_effect_hmac_key",
+        }
+    )
 
     def __init__(self, settings: NextcloudSettings) -> None:
         # Phase 1.5 parity with OpenCloudBackend (Issue 12): consume a
@@ -338,43 +479,114 @@ class NextcloudBackend:
         """Agent credentials for WebDAV access to Nextcloud folders."""
         return {"username": self._agent_user, "password": self._agent_password}
 
-    def _explicit_user_home_credentials(
-        self, handle: ProjectFolderHandle, subject: CloudMountSubject | None
-    ) -> dict[str, str] | None:
-        """Resolve explicit user-granted credentials for a user-home mount.
-
-        v1 intentionally does not pair ``/remote.php/dav/files/{user}/`` with
-        the agent-service password. For homelab/single-user deployments we
-        support an explicit app-password-style env pair:
-
-        * ``NEXTCLOUD_RCLONE_USER_HOME_USERNAME``
-        * ``NEXTCLOUD_RCLONE_USER_HOME_PASSWORD``
-
-        A username-specific password env is also accepted for multi-user test
-        deployments: ``NEXTCLOUD_RCLONE_USER_HOME_PASSWORD_<SANITIZED_USER>``.
-        """
-        username = (
-            handle.vendor_meta.get("username")
-            or (subject.username if subject else None)
-            or ""
+    @property
+    def service_account_logins(self) -> frozenset[tuple[str, str]]:
+        """``(host, username)`` of each account SRW itself signs in as (the
+        admin and the agent account) on each host this installation is
+        reached at, internal and public, lower-cased. A connector holding
+        one holds SRW's own credential to a whole cloud home (main cloud
+        slice 8 retires the ownerless ones)."""
+        hosts = {urlsplit(url).hostname for url in (self._base_url, self._public_url)}
+        users = {self._admin_user, self._agent_user}
+        return frozenset(
+            (host.lower(), user.casefold())
+            for host in hosts
+            if host
+            for user in users
+            if user
         )
-        username = str(username).strip()
-        if not username:
+
+    def cloud_sync_config(
+        self, webdav_url: str, *, target_user_sub: Optional[str] = None
+    ) -> Optional[dict[str, Any]]:
+        """The agent's ``cloud_sync`` entry for one folder: basic auth as the
+        agent-service account, or ``None`` without its credentials.
+
+        Nextcloud has no token exchange, so ``target_user_sub`` changes
+        nothing. Never logs the auth payload.
+        """
+        creds = self.webdav_credentials or {}
+        if not creds.get("username") or not creds.get("password"):
+            return None
+        return {
+            "backend": self.backend_id,
+            "webdav_url": webdav_url,
+            "auth": {
+                "type": "basic",
+                "username": creds["username"],
+                "password": creds["password"],
+            },
+        }
+
+    @staticmethod
+    def legacy_folder_id(handle: ProjectFolderHandle) -> Optional[int]:
+        """The pre-abstraction ``projects.nextcloud_folder_id``: the Group
+        Folder id, while that column is still written."""
+        try:
+            return int(handle.native_id)
+        except (TypeError, ValueError):
             return None
 
-        configured_user = os.getenv("NEXTCLOUD_RCLONE_USER_HOME_USERNAME")
-        configured_password = os.getenv("NEXTCLOUD_RCLONE_USER_HOME_PASSWORD")
-        if configured_user and configured_password and configured_user == username:
-            return {"username": configured_user, "password": configured_password}
+    @staticmethod
+    def protected_lower_transport(row: dict[str, Any]) -> dict[str, Any]:
+        """The provider half of a protected mount's read-only lower layer.
 
-        env_suffix = re.sub(r"[^A-Z0-9]+", "_", username.upper()).strip("_")
-        if env_suffix:
-            user_password = os.getenv(
-                f"NEXTCLOUD_RCLONE_USER_HOME_PASSWORD_{env_suffix}"
+        Built from an active ``cloud_ro_mounts`` reader grant: rclone WebDAV
+        as the per-mount reader account, never the agent-service account.
+        The caller adds the overlay layout and the cache settings.
+        """
+        return {
+            "backend": BACKEND_ID,
+            "source": {
+                "type": "webdav",
+                "config": {
+                    "url": row["webdav_url"],
+                    "vendor": BACKEND_ID,
+                    "user": row["reader_id"],
+                },
+            },
+            "auth": {"type": "basic", "password": row["credentials"]},
+        }
+
+    def _project_folder_transport(
+        self,
+        handle: ProjectFolderHandle,
+        subject: CloudMountSubject | None,
+        access: str,
+    ) -> tuple[Optional[str], dict[str, str]]:
+        """A project's Group Folder as its per-folder grant's principal.
+
+        ``subject`` carries the grant's principal and password; a reader is
+        mounted read-only only, a writer read-write only (a read-only level
+        is the reader's credential's doing, never a writer's behind an
+        rclone flag). A project mount is never made as the
+        service account, which can write every project folder: without a
+        grant there is no mount (``NOT_SUPPORTED``). The one exception is
+        End's reconstruction of a mount the old rule made that way
+        (``legacy_service_account``), byte for byte as it was.
+        """
+        if subject is not None and subject.credential:
+            principal = _FOLDER_PRINCIPAL_RE.fullmatch(str(subject.username or ""))
+            kind = principal.group(1) if principal is not None else None
+            if kind is None or kind != _FOLDER_KIND_FOR_ACCESS.get(access):
+                raise CloudBackendError(
+                    CloudBackendErrorKind.INVALID_REQUEST,
+                    "a project mount's principal is not its per-folder grant's",
+                    backend=self.backend_id,
+                    retryable=False,
+                )
+            return (
+                self.folder_grant_webdav_url(handle, str(subject.username)),
+                {"username": str(subject.username), "password": subject.credential},
             )
-            if user_password:
-                return {"username": username, "password": user_password}
-        return None
+        if subject is not None and subject.legacy_service_account:
+            return self.get_project_folder_webdav_url(handle), self.webdav_credentials
+        raise CloudBackendError(
+            CloudBackendErrorKind.NOT_SUPPORTED,
+            "no per-folder grant for this project folder",
+            backend=self.backend_id,
+            retryable=False,
+        )
 
     async def build_rclone_mount_spec(
         self,
@@ -387,21 +599,34 @@ class NextcloudBackend:
         prefer_public_url: bool = False,
     ) -> RcloneMountSpec:
         """Build an rclone WebDAV spec for a Nextcloud-backed cloud surface."""
+        group_folder = False
         if isinstance(handle, SessionFolderHandle):
             webdav_url = self.get_session_folder_webdav_url(handle)
             creds = self.webdav_credentials
         else:
             if handle.vendor_meta.get("kind") == "user_home":
+                # A user's own root: as the user's own account, with the app
+                # password they granted (the user-root connector's), never
+                # the service account. Without it there is no mount
+                # (``NOT_SUPPORTED``). rclone's chunked uploads stay on: they
+                # go through /dav/uploads/<uid>/, which it derives from this
+                # URL.
                 username = str(handle.vendor_meta.get("username") or "")
                 webdav_url = (
                     f"{self._base_url}/remote.php/dav/files/{quote(username, safe='')}/"
                     if username
                     else None
                 )
-                creds = self._explicit_user_home_credentials(handle, subject) or {}
+                creds = (
+                    {"username": str(subject.username), "password": subject.credential}
+                    if subject is not None and subject.credential and subject.username
+                    else {}
+                )
             else:
-                webdav_url = self.get_project_folder_webdav_url(handle)
-                creds = self.webdav_credentials
+                webdav_url, creds = self._project_folder_transport(
+                    handle, subject, access
+                )
+                group_folder = True
 
         # Cross-cluster VM runtimes can't reach the internal service URL; swap
         # to the public edge (no-op unless the URL is internal-prefixed). Mirror
@@ -428,13 +653,21 @@ class NextcloudBackend:
                 backend=self.backend_id,
             )
 
+        source_config = {
+            "url": webdav_url,
+            "vendor": "nextcloud",
+            "user": creds["username"],
+        }
+        if group_folder:
+            # rclone's nextcloud vendor uploads in chunks through
+            # /dav/uploads/<user>/, which it derives from a /dav/files/<user>/
+            # URL; a Group Folder's /dav/groupfolders/ URL has no such user
+            # home, so rclone refuses to build the remote at all ("the
+            # remote url looks incorrect"). Whole-file uploads work there.
+            source_config["nextcloud_chunk_size"] = "0"
         return RcloneMountSpec(
             source_type="webdav",
-            source_config={
-                "url": webdav_url,
-                "vendor": "nextcloud",
-                "user": creds["username"],
-            },
+            source_config=source_config,
             auth={"type": "basic", "password": creds["password"]},
             cache={
                 "vfs_cache_mode": "full",
@@ -1241,8 +1474,14 @@ class NextcloudBackend:
     # ------------------------------------------------------------- Session folders
 
     @instrument_backend_op("ensure_session_folder")
-    async def ensure_session_folder(self, *, session_id: str) -> SessionFolderHandle:
-        """Create a session folder under the agent-service user's home."""
+    async def ensure_session_folder(
+        self, *, session_id: str, exclusive: bool = False
+    ) -> SessionFolderHandle:
+        """Create a session folder under the agent-service user's home.
+
+        ``exclusive`` refuses a folder that exists already
+        (``ALREADY_EXISTS``) instead of reusing it: the caller has no record
+        that the folder is its own."""
         self._ensure_ready()
         folder_path = f"sessions/{session_id}"
         try:
@@ -1255,6 +1494,13 @@ class NextcloudBackend:
                     url,
                     auth=(self._agent_user, self._agent_password),
                 )
+                if resp.status_code == 405 and exclusive and i == len(parts) - 1:
+                    raise CloudBackendError(
+                        CloudBackendErrorKind.ALREADY_EXISTS,
+                        f"Session folder '{folder_path}' already exists",
+                        backend=self.backend_id,
+                        status_code=405,
+                    )
                 # 201 = created, 405 = already exists — both fine.
                 if resp.status_code in (201, 405):
                     continue
@@ -1810,6 +2056,250 @@ class NextcloudBackend:
             )
         await self._delete_group(plan.group_id)
         await self._delete_user(plan.reader_id)
+
+    # ------------------------------------------------------ per-folder grants
+
+    def _folder_principal_ids(
+        self, principal_id: str, group_id: str, kind: Optional[str] = None
+    ) -> str:
+        """The grant kind ``principal_id`` and ``group_id`` name, or raise.
+
+        Both must be one per-folder grant's (same kind, same row id), and
+        ``kind``, when given, theirs: these methods create and delete
+        Nextcloud accounts, so they refuse any other name outright.
+        """
+        principal = _FOLDER_PRINCIPAL_RE.fullmatch(str(principal_id or ""))
+        group = _FOLDER_GROUP_RE.fullmatch(str(group_id or ""))
+        if (
+            principal is None
+            or group is None
+            or principal.group(1) != _FOLDER_GROUP_KIND[group.group(1)]
+            or principal.group(2) != group.group(2)
+            or (kind is not None and principal.group(1) != kind)
+        ):
+            raise CloudBackendError(
+                CloudBackendErrorKind.INVALID_REQUEST,
+                "per-folder grant principal is malformed",
+                backend=self.backend_id,
+                retryable=False,
+            )
+        return principal.group(1)
+
+    def folder_grant_webdav_url(
+        self, handle: ProjectFolderHandle, principal_id: str
+    ) -> Optional[str]:
+        """The Group Folder's internal WebDAV URL as ``principal_id``.
+
+        The groupfolders namespace, as the service account's mounts use it:
+        it lists only the Group Folders the principal is granted (exactly
+        this one), whatever its own home holds.
+        """
+        mountpoint = handle.vendor_meta.get("mountpoint")
+        if not mountpoint or not principal_id:
+            return None
+        return (
+            f"{self._base_url}/remote.php/dav/groupfolders/"
+            f"{quote(str(principal_id), safe='')}/{quote(str(mountpoint), safe='')}/"
+        )
+
+    async def _folder_group_ids(self, folder_id: int) -> set[str]:
+        """The groups a Group Folder grants (``POST .../groups`` is not
+        idempotent: a second one fails the folder's unique constraint)."""
+        resp = await self._client.get(
+            f"/index.php/apps/groupfolders/folders/{folder_id}",
+            params={"format": "json"},
+        )
+        resp.raise_for_status()
+        self._assert_not_html(resp)
+        data = (resp.json().get("ocs") or {}).get("data") or {}
+        groups = data.get("groups") if isinstance(data, dict) else None
+        if isinstance(groups, dict):
+            return {str(key) for key in groups}
+        if isinstance(groups, list):
+            return {
+                str(item.get("id") or item.get("group_id") or "")
+                for item in groups
+                if isinstance(item, dict)
+            }
+        return set()
+
+    @instrument_backend_op("ensure_folder_principal")
+    async def ensure_folder_principal(
+        self,
+        handle: ProjectFolderHandle,
+        *,
+        principal_id: str,
+        group_id: str,
+        password: str,
+        kind: str,
+    ) -> None:
+        """Create (or complete) one per-folder grant's principal.
+
+        The order is ``grant_protected_reader_attempt``'s, through the plain
+        admin client (the signed lane accepts only protected attempts): the
+        user with its stored password and a 0 B quota, its group, the
+        group's grant on the folder, the grant's permissions, and only then
+        the membership, so the principal never observes Group Folders' broad
+        default. Every step accepts "already done", so a retry completes a
+        crashed attempt. Then the principal must read the folder; a refused
+        password is reset to the stored one once (a principal a lost attempt
+        created with another). A folder not at its path (404 while the
+        principal's own groupfolders root reads) does not fail the grant: its
+        mount reports not_found, as any folder that went missing does.
+        """
+        self._ensure_ready()
+        grant_kind = self._folder_principal_ids(principal_id, group_id, kind)
+        webdav_url = self.folder_grant_webdav_url(handle, principal_id)
+        try:
+            folder_id = int(handle.native_id)
+        except (TypeError, ValueError):
+            folder_id = 0
+        if folder_id <= 0 or not webdav_url or not password:
+            raise CloudBackendError(
+                CloudBackendErrorKind.INVALID_REQUEST,
+                "per-folder grant names no Group Folder or no password",
+                backend=self.backend_id,
+                retryable=False,
+            )
+        permissions = _FOLDER_GRANT_PERMISSIONS[grant_kind]
+        try:
+            resp = await self._client.post(
+                "/ocs/v2.php/cloud/users",
+                params={"format": "json"},
+                data={"userid": principal_id, "password": password},
+            )
+            self._require_ocs_status(
+                resp, ok={100, 200, 102}, op="create folder grant principal"
+            )
+            # A full Nextcloud user, but with no room of its own: what it
+            # writes lands in its folder (the Group Folder's own quota).
+            # Set on every ensure, so a principal made before this gets it
+            # at its next one.
+            resp = await self._client.put(
+                f"/ocs/v2.php/cloud/users/{principal_id}",
+                params={"format": "json"},
+                data={"key": "quota", "value": _FOLDER_PRINCIPAL_QUOTA},
+            )
+            self._require_ocs_status(
+                resp, ok={100, 200}, op="set folder grant principal quota"
+            )
+            resp = await self._client.post(
+                "/ocs/v2.php/cloud/groups",
+                params={"format": "json"},
+                data={"groupid": group_id},
+            )
+            self._require_ocs_status(
+                resp, ok={100, 200, 102}, op="create folder grant group"
+            )
+            if group_id not in await self._folder_group_ids(folder_id):
+                resp = await self._client.post(
+                    f"/index.php/apps/groupfolders/folders/{folder_id}/groups",
+                    params={"format": "json"},
+                    data={"group": group_id},
+                )
+                self._require_ocs_status(
+                    resp, ok={100, 200}, op="attach folder grant group"
+                )
+            resp = await self._client.post(
+                f"/index.php/apps/groupfolders/folders/{folder_id}/groups/{group_id}",
+                params={"format": "json"},
+                data={"permissions": str(permissions)},
+            )
+            self._require_ocs_status(
+                resp, ok={100, 200}, op="set folder grant permissions"
+            )
+            resp = await self._client.post(
+                f"/ocs/v2.php/cloud/users/{principal_id}/groups",
+                params={"format": "json"},
+                data={"groupid": group_id},
+            )
+            self._require_ocs_status(
+                resp, ok={100, 200, 102}, op="add folder grant principal to group"
+            )
+            status = await self._principal_reads(webdav_url, principal_id, password)
+            if status == 401:
+                resp = await self._client.put(
+                    f"/ocs/v2.php/cloud/users/{principal_id}",
+                    params={"format": "json"},
+                    data={"key": "password", "value": password},
+                )
+                self._require_ocs_status(
+                    resp, ok={100, 200}, op="reset folder grant password"
+                )
+                status = await self._principal_reads(webdav_url, principal_id, password)
+            if status == 404 and (
+                await self._principal_reads(
+                    webdav_url.rstrip("/").rsplit("/", 1)[0] + "/",
+                    principal_id,
+                    password,
+                )
+                == 207
+            ):
+                # The principal is live, but its folder is not at the
+                # handle's path (moved, or gone): the grant stands, and the
+                # mount says not_found, as for any folder that went missing.
+                logger.warning(
+                    "Per-folder principal %s: its Group Folder %s is not at its path",
+                    principal_id,
+                    folder_id,
+                )
+                status = 207
+        except httpx.HTTPError as e:
+            raise self._map_http_error(e) from e
+        if status != 207:
+            raise CloudBackendError(
+                CloudBackendErrorKind.AUTHENTICATION_FAILED
+                if status == 401
+                else CloudBackendErrorKind.UNKNOWN,
+                f"folder grant principal cannot read its folder: HTTP {status}",
+                backend=self.backend_id,
+                status_code=status,
+            )
+
+    async def _principal_reads(
+        self, webdav_url: str, principal_id: str, password: str
+    ) -> int:
+        """The status of a ``Depth: 0`` PROPFIND of the folder as the
+        principal (207 when it reads it)."""
+        resp = await self._client.request(
+            "PROPFIND",
+            webdav_url,
+            headers={"Depth": "0"},
+            auth=(principal_id, password),
+        )
+        return resp.status_code
+
+    @instrument_backend_op("revoke_folder_principal")
+    async def revoke_folder_principal(
+        self, *, principal_id: str, group_id: str
+    ) -> None:
+        """Remove one per-folder grant: its group first (which drops the
+        folder grant with it), then its principal. Idempotent."""
+        self._ensure_ready()
+        self._folder_principal_ids(principal_id, group_id)
+        try:
+            await self._delete_group(group_id)
+            await self._delete_user(principal_id)
+        except httpx.HTTPError as e:
+            raise self._map_http_error(e) from e
+
+    def folder_principal_client(
+        self, principal_id: str, password: str
+    ) -> httpx.AsyncClient:
+        """A client authenticated as a per-folder principal (the read-only
+        probe's). The caller closes it."""
+        if _FOLDER_PRINCIPAL_RE.fullmatch(str(principal_id or "")) is None:
+            raise CloudBackendError(
+                CloudBackendErrorKind.INVALID_REQUEST,
+                "per-folder grant principal is malformed",
+                backend=self.backend_id,
+                retryable=False,
+            )
+        return httpx.AsyncClient(
+            base_url=self._base_url,
+            auth=(principal_id, password),
+            timeout=30.0,
+        )
 
     async def seed_canary_fixture(self, handle: ProjectFolderHandle) -> CanaryFixture:
         """Write a real canary file with the WRITE identity and discover REAL

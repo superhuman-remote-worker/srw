@@ -15,6 +15,10 @@ the neutral else and two branches' hexes were never checked.)
 import re
 
 from orchestrator.services import brand
+from orchestrator.services.magic_link_pages import (
+    magic_link_confirmation_page,
+    magic_link_result_page,
+)
 
 CATPPUCCIN = {
     "#1e1e2e",
@@ -32,33 +36,28 @@ CATPPUCCIN = {
 
 
 def _pages() -> list[str]:
-    from orchestrator.main import (
-        _magic_link_confirmation_page,
-        _magic_link_result_page,
-    )
-
     return [
         # intended_decision arms -- each picks its own button_color literal.
-        _magic_link_confirmation_page(
+        magic_link_confirmation_page(
             tool_name="run_command",
             tool_args_preview='{"cmd": "ls"}',
             intended_decision="approved",
             token="T1",
         ),
-        _magic_link_confirmation_page(
+        magic_link_confirmation_page(
             tool_name="run_command",
             tool_args_preview='{"cmd": "ls"}',
             intended_decision="denied",
             token="T1",
         ),
-        _magic_link_confirmation_page(
+        magic_link_confirmation_page(
             tool_name="run_command",
             tool_args_preview='{"cmd": "ls"}',
             intended_decision=None,
             token="T1",
         ),
         # extend_status arms -- each renders its own inline banner literal.
-        _magic_link_confirmation_page(
+        magic_link_confirmation_page(
             tool_name="run_command",
             tool_args_preview='{"cmd": "ls"}',
             intended_decision=None,
@@ -66,27 +65,27 @@ def _pages() -> list[str]:
             extend_status="extended",
             extends_remaining=2,
         ),
-        _magic_link_confirmation_page(
+        magic_link_confirmation_page(
             tool_name="run_command",
             tool_args_preview='{"cmd": "ls"}',
             intended_decision="denied",
             token="T1",
             extend_status="cap_reached",
         ),
-        _magic_link_confirmation_page(
+        magic_link_confirmation_page(
             tool_name="run_command",
             tool_args_preview='{"cmd": "ls"}',
             intended_decision=None,
             token="T1",
             extend_status="not_awaiting",
         ),
-        _magic_link_result_page(
+        magic_link_result_page(
             title="Approved",
             body="The agent may proceed.",
             cockpit_url="https://cockpit.test/",
         ),
         # is_error=True picks a different accent -- cover both branches.
-        _magic_link_result_page(
+        magic_link_result_page(
             title="Link expired",
             body="This approval link is no longer valid.",
             cockpit_url="https://cockpit.test/",
@@ -126,9 +125,7 @@ def test_disabled_extend_button_keeps_its_brand_styling() -> None:
     the brand colour, border or type scale. The palette tests above cannot see
     it: the page as a whole still contains every brand hex.
     """
-    from orchestrator.main import _magic_link_confirmation_page
-
-    page = _magic_link_confirmation_page(
+    page = magic_link_confirmation_page(
         tool_name="run_command",
         tool_args_preview='{"cmd": "ls"}',
         intended_decision="denied",

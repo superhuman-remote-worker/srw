@@ -41,11 +41,17 @@ server, etc.) — see [Production install](#production-install-bring-your-own).
 
 ## Prerequisites
 
+For a fresh K3s server, complete [host preparation](../docs/k3s-host-preparation.md)
+first, especially on shared Fedora hosts or when volumes must use a separate disk.
+
 - **Kubernetes** 1.28+ with at least 8 vCPU / 16 GiB RAM available for the namespace
 - **Ingress controller** — `nginx`, `traefik`, or another. The chart defaults to `traefik` (override via `ingress.className`). The opt-in single-origin profile supplies its own namespaced gateway instead.
 - **cert-manager** with a `ClusterIssuer` for multi-host TLS (set `ingress.tls.issuerName`). It is not required by the self-signed single-origin profile.
 - **DNS** — wildcard or per-subdomain records pointing at your ingress LB for `*.<global.domain>` (`api`, `auth`, `git`, `cloud`, `mcp`). An IP-based single-origin profile needs no DNS.
 - **Helm** 3.12+
+- **Workspace SSH Secret** `srw-vm-ssh-key` with matching `ssh-privatekey` and
+  `ssh-publickey`, including for container-only installations. The generator's
+  `install.sh` creates or validates this before Helm; manual installs must supply it.
 - **A `dockerconfigjson` pull secret** if you're pulling private GHCR images. Public images need no credentials.
 
 Optional but recommended:
@@ -258,6 +264,10 @@ helm install srw oci://ghcr.io/superhuman-remote-worker/charts/superhuman-remote
 `MCP_INTERNAL_KEY`, and `IDE_CREDENTIAL_KEY`, and create internal credentials.
 **This mode is for evaluation only** — see
 [Secrets](#secrets) for production options.
+
+The first login is the initial administrator, `keycloak.bootstrapAdmin.username`
+(`test` when empty), with the password you supply as `KC_REALM_ADMIN_PASSWORD`;
+see [Secret schema](#secret-schema). No test accounts are created.
 
 After install, follow the printed `NOTES.txt` to back up the encryption key.
 
@@ -574,9 +584,44 @@ the operator that owns the external database.
 **OIDC / SSO** (when Keycloak or external IdP enabled):
 - `KEYCLOAK_ADMIN_USER`, `KEYCLOAK_ADMIN_PASSWORD` (internal Keycloak only)
 - `KC_DB_PASSWORD` (internal Keycloak only) — used as the Postgres superuser password on the dedicated `srw-keycloakdb` StatefulSet *and* as the connection password the Keycloak pod presents. When pointing the bundled Keycloak at an external Postgres (`databases.keycloak.internal: false`), the same value is sent over the wire — pre-provision a `keycloak` role with this password on your managed instance.
-- `KC_REALM_ADMIN_PASSWORD`
+- `KC_REALM_ADMIN_PASSWORD` — password for the initial SRW administrator
+  selected by `keycloak.bootstrapAdmin.username` (bundled Keycloak).
 - `MCP_OIDC_CLIENT_SECRET` (if `mcp.enabled`)
 - `GITEA_OIDC_CLIENT_SECRET`, `NEXTCLOUD_OIDC_CLIENT_SECRET`, `OPENCLOUD_KEYCLOAK_CLIENT_SECRET`, `PGADMIN_OIDC_CLIENT_SECRET` (per enabled component)
+
+For a new installation with bundled Keycloak, choose the initial SRW login in
+your values file:
+
+```yaml
+keycloak:
+  bootstrapAdmin:
+    username: admin
+```
+
+Use 1–64 ASCII letters, digits, dots, underscores, or hyphens, starting with a
+letter or digit. The name must differ from enabled `keycloak.devUsers` accounts,
+including case variants. Supply its password through `KC_REALM_ADMIN_PASSWORD`
+in your chosen Secret source. Keycloak requires at least 16 characters and a
+password different from the username. For bundled Keycloak 26.2 realm import,
+exclude double quotes, backslashes, control characters, and `${` sequences from
+this password: import substitutes environment variables before parsing JSON.
+Other punctuation and Unicode are supported. This user receives the SRW `admin` role;
+Keycloak's master administrator (`KEYCLOAK_ADMIN_USER`) and the Gitea service
+administrator (`GITEA_ADMIN_USER`) keep their separate credentials.
+
+An empty or omitted username retains the historical `test` login on fresh
+installs. On connected Helm upgrades, the chart reads the existing realm
+ConfigMap, preserves its initial username when the value is empty, and rejects
+an explicit change. This setting seeds a new realm; it does not rename a user
+in an existing Keycloak database. Keep the same explicit value in offline or
+GitOps rendering, where Helm cannot read the existing ConfigMap. Create further
+administrators through SRW user management. Password reconciliation on pod
+restart continues to target the selected initial user.
+
+The chart creates no test accounts. `keycloak.devUsers` seeds six accounts
+whose passwords are published in this repository; it exists for local k3d
+development, defaults to `false`, and must never be enabled on a reachable
+deployment. See [Local Kubernetes with k3d](../docs/local-kubernetes.md#4-log-in).
 
 **Git, cloud, admin credentials:**
 - `GITEA_ADMIN_USER`, `GITEA_ADMIN_PASSWORD` (internal Gitea only)
@@ -674,7 +719,9 @@ without this policy.
   tools and the `present-with-canvas` companion skill rather than advertising
   a broken capability; an enabled MCP pod also requires the key to start.
   Chart-created mode generates and preserves it automatically.
-- `DEFAULT_DS_WEBDAV_*` (auto-configure a default WebDAV datasource for new users)
+- `DEFAULT_DS_WEBDAV_USERNAME`, `DEFAULT_DS_WEBDAV_PASSWORD` (only with
+  `cloud.externalBackend: webdav`: the credential of the default WebDAV
+  datasource `init.py` seeds for that server; the bundled clouds seed none)
 
 A skeleton `srw.env` to feed into `kubectl create secret generic ... --from-env-file=`:
 
@@ -699,6 +746,68 @@ openssl rand -base64 32  # APP_ENCRYPTION_KEY
 openssl rand -base64 48  # MCP_INTERNAL_KEY
 openssl rand -base64 48  # IDE_CREDENTIAL_KEY
 ```
+
+---
+
+## Workspace defaults
+
+These values decide what a Job or Session gets when nobody names a workspace.
+[Workspace defaults](../examples/manifests/container-workspace-templates.md#workspace-defaults)
+describes the whole lookup, including each Project's own defaults, which win
+over these.
+
+```yaml
+workspace:
+  defaults:
+    jobs: container     # none | virtual | container | vm
+    sessions: virtual
+    container: ""       # empty = the built-in container-full
+    vm: ""              # empty = the built-in vm-full
+```
+
+| Key | Shipped value | Meaning |
+|---|---|---|
+| `workspace.defaults.jobs` | `container` | The tier of a Job: `none`, `virtual`, `container` or `vm` |
+| `workspace.defaults.sessions` | `virtual` | The tier of a Session, same choices |
+| `workspace.defaults.container` | `""` | The name of a `backend: sandbox` WorkspaceTemplate in Catalog `shared`; empty means `container-full` |
+| `workspace.defaults.vm` | `""` | The name of a `backend: vm` WorkspaceTemplate in Catalog `shared`; empty means `vm-full` |
+
+- **The shipped values change nothing.** Jobs get a container with the
+  installation image and sizes (through `container-full`); Sessions get
+  `virtual`. The image pulls as before too: `Always` for a `latest` tag without
+  a digest, `IfNotPresent` for a pinned tag or a digest, whatever
+  `image.workspace.pullPolicy` says.
+- **A template name must exist in the shared Catalog** with the matching
+  backend. Any template there works, not only a built-in, so you can point every
+  container at your own image without forking the chart.
+- **`vm` values need VMs.** Setting `vm` as a mode, or a `vm` template, while
+  `vm.mode` is `off` is reported as a problem.
+- **Built-ins turned off.** With `workspace.builtinTemplates.enabled: false`, an
+  empty template name means the plain backend: the installation image and the
+  installation sizes, without a template.
+- **Delivery.** The chart renders the block as `WORKSPACE_DEFAULTS` (JSON) into
+  the orchestrator's ConfigMap; `values.schema.json` checks the modes and the
+  name format. As with `workspace.builtinTemplates`, Reloader restarts the
+  orchestrator when the block changes; with Reloader off, restart it by hand.
+- **Startup check.** After it reconciles the built-in templates, the orchestrator
+  checks these values. It logs each problem as an error starting with
+  `Workspace defaults:`, for example
+  `Workspace defaults: The installation's container template 'x' (Helm workspace.defaults.container) no longer exists.`
+  Every Project's Settings tab shows the same problems. The orchestrator still
+  starts; work that needs the broken value fails with that message.
+- **Upgrade backfill.** Each start also logs
+  `Workspace defaults backfill: {'manifest': …, 'legacy_project': …, 'preference': …, 'healed': …, 'skipped': …}`,
+  the number of pre-existing workspace settings it copied into Project defaults.
+  It copies each value once; later starts log zeros. `healed` counts manifest
+  Projects whose defaults it brought back in line with the active Project
+  revision; `skipped` counts Projects it couldn't read, each logged with its
+  error and retried at the next start.
+- **Rolling back to a release before these defaults.** Older releases ignore
+  the Project defaults, with one exception: a Project manifest that uses the
+  object form of `defaults.workspace` (`{jobs: …, sessions: …, container: …}`)
+  makes the older code fail on that Project. Before you roll back, apply such
+  Projects again with the shorthand (`workspace: <alias>`) or without the
+  field.
 
 ---
 
@@ -859,7 +968,105 @@ Two Secrets must exist in the release namespace:
 Pin `vmController.defaultVmImage` to a published tag. The default points at the tag that
 matches the chart's `appVersion`, which exists only for released charts.
 
+### Container startup stage rollout
+
+`orchestrator.containerStartupStageAuthority.enabled` defaults to `false`
+(`CONTAINER_STARTUP_STAGE_AUTHORITY_ENABLED`). It admits version-1 container
+startup receipts for Jobs and stateless Sessions. Scheduling waits do not spend
+readiness, image-pull or SSH budgets. The exact Pod's scheduling transition starts
+immutable budgets; authenticated Ready settles the receipt. An expired budget
+leaves an attention state with normal Cancel/End controls. A Job's execution
+deadline remains independent and can cancel it while it waits for capacity.
+
+Deploy the capable application and migrations `0309`/`0310` with this value off
+first. Before enabling it in a separate rollout, verify that every pre-bridge
+orchestrator Pod UID and process is gone, including detached Job workspace
+creators and Session creation callbacks. Ready replica counts, dispatcher drain
+and lease expiry alone do not prove those older writers have stopped. The chart
+replaces orchestrator Pods on either switch transition even without Reloader;
+that checksum does not replace the pre-activation absence check.
+
+Turning the switch off stops new adoption while existing version-1 receipts
+continue. After activation, roll back only to a version-1-capable bridge image.
+Existing settled receipts with an unfinished Job remain held for normal Cancel;
+the new observer does not reopen them or issue a second Pod create.
+
 ### Durable VM workspace recovery rollout
+
+VM startup uses separate clocks for disk preparation, placement and guest boot.
+`orchestrator.vmProvisioning.rootdiskStallTimeoutSeconds` defaults to `2700`
+(`VM_ROOTDISK_STALL_TIMEOUT_S`). It measures active disk preparation without
+forward progress; dependency/placement waits pause that clock. A stalled disk or
+unverifiable phase produces a visible attention message and retains the disk.
+The existing `VM_PROVISION_TIMEOUT_S` boot budget (default `600`) begins only
+after the first authenticated observation of the exact guest VMI as Running.
+Initialization keeps its separate deadline. Roll out the phase-aware controller
+before the orchestrator; older controller responses cannot authorize a boot
+timeout cleanup. Phase observations never bypass SSH or initialization checks.
+
+`orchestrator.vmProvisioning.creationRetryEnabled` defaults to `false`
+(`VM_CREATION_RETRY_ENABLED`). It admits new Job VM creates through durable
+configuration resolution, fenced creation effects, and a separate SSH/init Ready
+release. Existing operations keep reconciling when admission is disabled.
+Migration `0260_vm_creation_ready_release.sql` and a deployed controller with
+the complete creation and cleanup contract are required. Current controller
+source advertises `creation_retry_protocol: 1`; verify the deployed image and
+its compatibility before activation. Keep this switch off until the source,
+attachment, cancellation and live acceptance gates in the failed-creation retry
+plan have passed.
+
+For an existing compatible durable-creation deployment, roll out unused-grant
+acknowledgement in this order: apply migrations `0284` and `0285` and upgrade
+all orchestrators that accept the new authority operation while pinning
+`vmController.image.tag` to the currently deployed compatible controller image;
+then upgrade the controller image. The chart renders the controller image
+independently in `helm/templates/vm-controller/deployment.yaml`; this protocol
+needs no new chart flag. An older controller ignores the extra receipt in a
+successful grant. A newer controller talking to an older orchestrator cannot
+surrender a grant and must retain its uncertain effect. This sequence applies
+to the unused-grant extension; the phase-aware-controller prerequisite above
+still applies when introducing that earlier recovery contract.
+
+Only the handler that received a winning grant can acknowledge that it refused
+before entering a create method. Its exact private receipt settles that effect
+as `not_attempted`. An absent Kubernetes object, an old grant without a receipt,
+a lost winning response, and any create method already entered remain uncertain
+and held. An acknowledged grant does not itself release capacity: cancellation
+still follows the normal exact source, disk, attachment and physical-absence
+disposition before releasing the reservation.
+
+Retained-disk restarts can opt into the closed single-NIC NoCloud DHCP profile
+with `vmController.networkProfile.enabled: true` and an explicit
+`vmController.networkProfile.imageAllowlist` of full `repository@sha256:<digest>`
+image references. Both settings default to disabled/empty and are sent to the
+controller and orchestrator as `VM_NETWORK_PROFILE_ENABLED` and
+`VM_NETWORK_PROFILE_IMAGE_ALLOWLIST` (a comma-separated list). Only admit clean
+images whose `enp1s0` network behavior has been verified. Prepared VM artifacts
+need their own exact compatible provenance and are held by this initial policy.
+New profile selection also requires same-cluster mode and
+`orchestrator.vmProvisioning.creationRetryEnabled: true`; the legacy direct
+create path cannot select it. The disposable recovery gate reads its explicit
+image from `vmController.defaultVmImage`, which must be the exact allowlisted
+digest when the profile is enabled.
+
+A selected profile is frozen in creation intent and inherited by retries, idle
+wakes and retained workspace handoffs even if new admission is later disabled.
+Reuse also requires authenticated first-boot evidence of the effective
+name-only DHCP rule and current guest network identity. Existing Job disks without
+that immutable profile and proof remain warm at idle release and enter a visible
+recoverable hold on retained successor admission, regardless of the fresh
+admission switch. The setting does not migrate or edit their guest configuration.
+
+Pinned Sessions using durable same-cluster creation and resource enforcement
+select the profile for fresh, unprepared allowlisted images. Readiness and wake
+check the frozen creation source and exact disk, VM, VMI, launcher and network
+receipt; Session receipt reuse also checks the interface MAC. A qualified Session
+disk keeps its original image/profile when the admission flag or allowlist
+changes. Missing or mismatched evidence holds its wake. Unprofiled historical
+Session disks are held when the profile is enabled; with it disabled, their
+existing legacy behavior is preserved. Before enabling this profile for retained
+Session workspaces, verify the exact guest image and a same-PVC restart with a
+changed VMI UID and MAC. Prepared images need separate qualification.
 
 Durable recovery is installed reader-first. Its database records, job projection,
 Retry/Cancel controls, disk retention pins and cleanup guards remain active even
@@ -921,6 +1128,96 @@ overlap, slow boot, deadline pause, forced deletion, missing stop evidence, and
 marker/checkpoint/PVC survival. The cluster is deleted on success and failure;
 `--keep-on-failure` is the explicit diagnostic exception.
 
+`orchestrator.vmJobCancelRetention.enabled` defaults to false and renders
+`VM_JOB_CANCEL_RETENTION_ENABLED`. It admits new compute-only retention authority
+for exactly scoped cancelled stateless VM Jobs, including never-Ready Jobs and,
+with migration `0340_vm_job_ready_cancel_retention.sql`, initial Jobs with durable
+Ready history. Admission requires the exact current creation, compute reservation
+and disk custody; an unissued purge request can be superseded only with proof
+that it had no physical effects. Disabled admission or missing schema holds new
+candidates rather than selecting disk purge. Persisted retention guards, exact
+retries, settlement and separately authorized permanent Delete remain active.
+Historical, already admitted ordinary purge requests retain their exact replay
+contract; upgrading cannot recover data already purged.
+
+With VM workspace recovery disabled, an exactly bound VM Worker attempt is held
+when its executor is lost after bundle authorization. The interrupted command
+is not requeued. Cancel remains available and preserves the disk through the
+retention checks above. The hold survives Cancel: stopping compute does not
+establish the interrupted command's outcome, and Resume remains blocked. This
+change adds no automatic replay or command-disposition repair.
+
+Migration `0339_vm_job_retained_resume.sql` and matching server/controller code
+add explicit owner **Resume** for this retained Cancel lineage. Resume keeps the
+same Job and PVC, preserves the frozen image/configuration, and admits a fresh
+VM generation only after the preceding cleanup has settled and released its
+compute reservation. The gate must be enabled to admit a new continuation;
+already admitted work remains protected and can reconcile after it is disabled.
+The retained data remains on the original PVC. Stopping compute through this
+path does not create an S3 disk snapshot or a separate backup.
+
+Each resumed VM must settle its own terminal cleanup before another Resume.
+A Ready VM requires authenticated process retirement and physical stop proof;
+a never-Ready VM uses the separate pre-SSH stop checks. A failed creation that
+provably issued no VM can settle without inventing a VM stop receipt. An issued
+or uncertain creation stays held until its actual outcome is established,
+including any reservation that still accounts for possible compute.
+
+For an initial Ready Cancel, missing or failed SSH retirement can use a distinct
+positive-stop proof bound to the committed retention authority. It halts the
+exact VM and requires complete terminated-container evidence before releasing
+the finalizer, then verifies the original signed stop and retained disk before
+releasing the compute reservation. A missing or partial proof leaves cleanup
+pending and compute accounted for.
+
+**Cancel** retains the protected disk. Explicit permanent **Delete** first
+settles the current continuation, then authorizes deletion of that exact disk
+using the complete retained history. This also applies when the latest Resume
+failed before creating a VM: its no-effect result and the preceding physical
+disk custody must both be proved. A timeout or absent API response is not proof
+that cleanup completed; use the existing controls and reported pending state.
+
+Publish with the effective gate false. Enable only after the schema and
+retention-aware Controller/Core/Agent versions are installed, preservation and
+Delete acceptance is qualified, and every old controller/transport consumer and
+cleanup Core/worker actor has physically stopped. A single new controller response or
+Ready Deployment does not prove that boundary. Both enabling and disabling roll
+Core and stateless worker Pods through template checksums. Disabling stops new
+admissions only after old enabled actors exit; it does not undo admitted work or
+permit rollback to actors that cannot recognize retained authority.
+
+The separate A1 retained-disk Resume adapter is disabled by default at
+`orchestrator.vmRetainedResumeAcceptanceGate.enabled`. On an exclusively owned
+disposable cluster, enable it together with same-cluster VM mode, durable
+creation retries, the remote operation protocol, retained rootdisks, and the
+network profile's explicit immutable image allowlist. Run
+`scripts/vm-retained-resume-gate.py --help` for its exact context, cluster UID,
+Job, dedicated owner (display name `A1 retained Resume gate <run-id>`), PVC,
+provider Pod and private-output inputs. The wrapper installs a
+run-owned temporary VM-count ResourceQuota only after the predecessor's
+production cleanup settles; it removes that exact quota after the owner Resume
+has joined a rejected VM effect. The application service account receives no
+quota write permission. The adapter refuses any unrelated runnable worker
+batch, so older queued work must be resolved through normal owner controls
+before enabling the real worker pool. The provider holds `job_complete` until
+the gate captures the actual worker and re-reads the retained sentinel over
+pinned SSH; normal terminal cleanup may then remove the VM. Its local-path
+result proves a retained
+PVC and real worker flow; it is distinct from the Longhorn durability gate.
+
+For a fresh isolated A1 run, `scripts/vm-retained-resume-fixture.py` creates the
+dedicated paused Job through the ordinary PostgreSQL Job writer, freezes its
+Expert/model and VM image in the execution snapshot, and calls the real VM
+creation preflight. It waits for authenticated first-boot Ready, network-profile
+proof, and the bound PVC/PV before returning the Job, owner, and PVC UIDs needed
+by the acceptance wrapper. The fixture command requires the default-off gate
+flag, an empty Job database, an owned namespace and provider model, and exact
+cluster, orchestrator Pod, and image identities. It grants no worker lease.
+It seeds or verifies the run-owned provider endpoint/model through normal
+database writers, passing the provider inference key only through private stdin.
+Keep the worker deployment at zero replicas until this fixture and the
+acceptance wrapper's queue isolation checks have passed.
+
 ### Verify
 
 ```bash
@@ -957,8 +1254,11 @@ kubectl -n <ns> create secret generic srw-ssh-gateway-ca \
 
 1. **`sshGateway.hostKeySecret`** — one entry per name in `sshGateway.hostKeyNames`, and **both
    halves of each**. The private half is mounted into the gateway
-   (`SSH_GATEWAY_HOST_KEYS`); the `.pub` half is mounted into the **orchestrator**, which is
-   where `GET /api/ssh/host-keys` runs (`SSH_GATEWAY_PUBLIC_HOST_KEYS`). Both variables are
+   (`SSH_GATEWAY_HOST_KEYS`); only the `.pub` half is mounted into the
+   **orchestrator** and verifying pinned **agents** (`SSH_GATEWAY_PUBLIC_HOST_KEYS`).
+   The orchestrator serves `GET /api/ssh/host-keys`; both it and the agents verify
+   signed native first-use notices. Agents never receive the gateway private keys.
+   Both variables are
    rendered from that one `hostKeyNames` list, because when the served and published key sets
    drift a client sees a host-key mismatch indistinguishable from an active MITM. Omit the
    `.pub` halves and the orchestrator pod will not start — deliberately, because the
@@ -996,6 +1296,41 @@ kubectl -n <ns> create secret generic srw-ssh-gateway-ca \
    ```
 
 ### Required values
+
+When upgrading native first-use support, roll out verifying agents with their
+public-key mounts first, then the orchestrator relay, and the gateway last.
+Check `native_workspace_first_use1: true` in the agent's `/ready` capabilities.
+An ordinary pinned target without that capability cannot acknowledge native
+use; the new gateway closes its channel if acknowledgement fails. This does
+not start a model turn or authorize workspace cleanup.
+
+Use the matching chart to configure the agent public-key projection. Updating
+only the image under an older chart keeps the orchestrator running, but leaves
+that projection unavailable and new agents unable to advertise this capability.
+
+During the staged upgrade, pin the gateway's previous immutable image with
+`sshGateway.image` while installing the new orchestrator relay/provisioner and
+agent image. This override is a complete image descriptor, for example:
+
+```yaml
+sshGateway:
+  image:
+    repository: ghcr.io/superhuman-remote-worker/srw-orchestrator
+    digest: sha256:<previous-gateway-digest>
+    pullPolicy: IfNotPresent
+```
+
+Once every target agent has its verification keys and advertises the capability,
+set `sshGateway.image: null` to move the gateway onto `image.orchestrator`.
+The default is null, so existing installs continue sharing the orchestrator pin.
+
+For key rotation, configure both old and new public keys on all verifying
+participants before changing the gateway signer. Retain the old public key
+through the 30-second proof lifetime plus the five-second clock allowance after
+its last use. Check that running participants have received the new set before
+removing it.
+Recycle existing agent Pods when the configured key-name list changes; their
+environment and selected Secret items were fixed when they were created.
 
 | Value | Why it has no default |
 |---|---|
@@ -1201,8 +1536,9 @@ kubectl -n srw get secret srw-secrets \
 Then visit `https://<global.domain>` for a multi-host deployment, or the exact
 `https://<exposure.singleOrigin.address>:<publicPort>` origin for single-origin
 mode; omit `:443` when using the default HTTPS port. The seeded realm administrator
-credentials (when using internal Keycloak) are
-`test` / value of `KC_REALM_ADMIN_PASSWORD`. The separate Keycloak server
+credentials (when using internal Keycloak) are the chosen
+`keycloak.bootstrapAdmin.username` (historical default `test`) / value of
+`KC_REALM_ADMIN_PASSWORD`. The separate Keycloak server
 administrator uses `KEYCLOAK_ADMIN_USER` and `KEYCLOAK_ADMIN_PASSWORD`.
 
 ---

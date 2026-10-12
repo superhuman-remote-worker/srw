@@ -164,6 +164,9 @@ async def reconcile_pinned_warm_binding_protections(
     publish = getattr(db, "publish_pinned_warm_binding_protection", None)
     bind = getattr(db, "bind_pinned_warm_agent", None)
     begin_release = getattr(db, "begin_pinned_warm_binding_release", None)
+    begin_deleted_release = getattr(
+        db, "begin_deleted_pinned_warm_binding_release", None
+    )
     complete_release = getattr(db, "complete_pinned_warm_binding_release", None)
     abort = getattr(db, "abort_unmodified_pinned_warm_binding", None)
     if any(
@@ -407,9 +410,18 @@ async def reconcile_pinned_warm_binding_protections(
             else:
                 unresolved += 1
             continue
-        if source != "attach":
+        if source != "attach" and not row.get("deleted_owner_release"):
             unresolved += 1
             continue
+        if status == "bound":
+            if (
+                not row.get("deleted_owner_release")
+                or begin_deleted_release is None
+                or not await begin_deleted_release(protection_id)
+            ):
+                unresolved += 1
+                continue
+            status = "terminal_release"
         if status == "planned":
             observation = await observe(row)
             state = str(observation.get("state") or "")
@@ -439,8 +451,34 @@ async def reconcile_pinned_warm_binding_protections(
         if status == "protected" and not await begin_release(protection_id):
             unresolved += 1
             continue
-        release_result = await release(row)
+        # R3.2's unpublished writer (superseded by 0301) left an ordinary
+        # release at an owner deleted under this life's exact permanent
+        # receipt when its follow-up release failed. That state alone grants
+        # no Pod proof and cannot become terminal_release, so it settles only
+        # through the terminal-only release: the exact Pod must be terminal or
+        # absent, and it never returns to the pool.
+        deleted_owner_releasing = status == "releasing" and bool(
+            row.get("deleted_owner_release")
+        )
+        if status == "terminal_release" and (
+            not row.get("deleted_owner_release")
+            or begin_deleted_release is None
+            or not await begin_deleted_release(protection_id)
+        ):
+            unresolved += 1
+            continue
+        release_result = (
+            await release(row, terminal_only=True)
+            if status == "terminal_release" or deleted_owner_releasing
+            else await release(row)
+        )
         if not isinstance(release_result, dict):
+            unresolved += 1
+            continue
+        if deleted_owner_releasing and (
+            release_result.get("outcome") != "exact_absent_v1"
+            or release_result.get("agent_present")
+        ):
             unresolved += 1
             continue
         if await complete_release(

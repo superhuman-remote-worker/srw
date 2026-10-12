@@ -164,79 +164,33 @@ def _pick(*names: str, default: Optional[str] = None) -> Optional[str]:
 def load_main_cloud_config(
     *,
     backend_override: Optional[str] = None,
-    db_overlay: Optional[dict] = None,
 ) -> MainCloudConfig:
     """Load and validate the deploy-time main-cloud config.
+
+    The configuration is the deployment's environment, which the Helm chart
+    renders (``configmap.yaml``: ``MAIN_CLOUD_BACKEND`` and friends). There
+    is no live overlay: the admin connection form and its API are gone
+    (main_cloud_as_connectors.md, "Configuration: Helm only").
 
     Resolution order for the backend id:
 
     1. ``backend_override`` parameter (used by ``MainCloudRouter`` to
        instantiate a cached legacy backend for non-destructive switching).
-    2. ``db_overlay["value"]["backend_id"]`` — the persisted setting
-       from the cockpit admin UI (Phase 4).
-    3. ``MAIN_CLOUD_BACKEND`` env var — operator override in .env.
-    4. ``_detect_legacy_nextcloud_mode()`` heuristic.
-    5. Default → ``opencloud`` (Phase 3 greenfield).
+    2. ``MAIN_CLOUD_BACKEND`` env var.
+    3. ``_detect_legacy_nextcloud_mode()`` heuristic.
+    4. Default → ``opencloud`` (Phase 3 greenfield).
 
-    Each non-secret field is resolved as ``db_overlay.value`` > env var >
-    hardcoded default. Secret fields (passwords, client secrets) always
-    come from the env var named in ``db_overlay.credentials_ref`` — if
-    ``credentials_ref`` is ``None`` or doesn't start with ``env:``, the
-    reader falls back to the legacy env var for that field directly.
-
-    Parameters
-    ----------
-    backend_override:
-        Force a specific backend id.
-    db_overlay:
-        A dict with keys ``value`` (dict) and ``credentials_ref`` (str or
-        None), matching the shape returned by
-        ``PostgresDB.get_system_setting('main_cloud')``.
+    Each field is resolved as env var > hardcoded default.
 
     Raises
     ------
     pydantic.ValidationError:
-        If required env vars / overlay fields are missing or invalid.
+        If required env vars are missing or invalid.
     ValueError:
         If ``backend_id`` is unknown.
     """
-    overlay_value: dict = {}
-    credentials_ref: Optional[str] = None
-    if db_overlay:
-        raw_value = db_overlay.get("value") or {}
-        if isinstance(raw_value, dict):
-            overlay_value = raw_value
-        credentials_ref = db_overlay.get("credentials_ref")
 
-    def _ov(key: str) -> Optional[str]:
-        """Overlay lookup — returns None when the key is missing or empty."""
-        val = overlay_value.get(key)
-        if val is None or val == "":
-            return None
-        return str(val)
-
-    def _secret(field: str, *env_fallbacks: str) -> Optional[str]:
-        """Resolve a secret field via credentials_ref or env fallback.
-
-        If ``credentials_ref`` is ``"env:NAME"`` and ``overlay_value``
-        marks this field as credentials-ref-sourced (by listing it in
-        ``__secret_fields__``), read ``os.getenv("NAME")``. Otherwise
-        fall back to the first non-empty env var from ``env_fallbacks``.
-        """
-        secret_fields = overlay_value.get("__secret_fields__", [])
-        if (
-            credentials_ref
-            and credentials_ref.startswith("env:")
-            and field in secret_fields
-        ):
-            return os.getenv(credentials_ref[4:]) or None
-        return _pick(*env_fallbacks)
-
-    backend_id = (
-        backend_override
-        or overlay_value.get("backend_id")
-        or os.getenv("MAIN_CLOUD_BACKEND")
-    )
+    backend_id = backend_override or os.getenv("MAIN_CLOUD_BACKEND")
     if not backend_id:
         # Phase 3: the greenfield default is OpenCloud. Deployments that
         # already have NEXTCLOUD_* env vars set (i.e. in-place upgrades
@@ -245,10 +199,10 @@ def load_main_cloud_config(
         backend_id = "nextcloud" if _detect_legacy_nextcloud_mode() else "opencloud"
 
     if backend_id == "nextcloud":
-        base_url = _ov("base_url") or _pick(
+        base_url = _pick(
             "MAIN_CLOUD_URL", "NEXTCLOUD_URL", default="http://localhost:8800"
         )
-        public_url = _ov("public_url") or _pick(
+        public_url = _pick(
             "MAIN_CLOUD_PUBLIC_URL", "NEXTCLOUD_PUBLIC_URL", default=base_url
         )
         raw = {
@@ -256,37 +210,30 @@ def load_main_cloud_config(
                 "backend_id": "nextcloud",
                 "base_url": base_url,
                 "public_url": public_url,
-                "admin_user": _ov("admin_user")
-                or _pick(
+                "admin_user": _pick(
                     "MAIN_CLOUD_ADMIN_USER", "NEXTCLOUD_ADMIN_USER", default="admin"
                 ),
-                "admin_password": _secret(
-                    "admin_password",
+                "admin_password": _pick(
                     "MAIN_CLOUD_ADMIN_PASSWORD",
                     "NEXTCLOUD_ADMIN_PASSWORD",
                 )
                 or "admin",
-                "agent_user": _ov("agent_user")
-                or _pick(
+                "agent_user": _pick(
                     "MAIN_CLOUD_AGENT_USER",
                     "NEXTCLOUD_AGENT_USER",
                     default="agent-service",
                 ),
-                "agent_password": _secret(
-                    "agent_password",
+                "agent_password": _pick(
                     "MAIN_CLOUD_AGENT_PASSWORD",
                     "NEXTCLOUD_AGENT_PASSWORD",
                 )
                 or "agent-service-dev",
-                "oidc_client_secret": _secret(
-                    "oidc_client_secret", "NEXTCLOUD_OIDC_CLIENT_SECRET"
+                "oidc_client_secret": _pick("NEXTCLOUD_OIDC_CLIENT_SECRET"),
+                "protected_effect_url": _pick("NEXTCLOUD_PROTECTED_EFFECT_URL"),
+                "protected_effect_config_sha256": _pick(
+                    "NEXTCLOUD_PROTECTED_EFFECT_CONFIG_SHA256"
                 ),
-                "protected_effect_url": _ov("protected_effect_url")
-                or _pick("NEXTCLOUD_PROTECTED_EFFECT_URL"),
-                "protected_effect_config_sha256": _ov("protected_effect_config_sha256")
-                or _pick("NEXTCLOUD_PROTECTED_EFFECT_CONFIG_SHA256"),
-                "protected_effect_hmac_key": _secret(
-                    "protected_effect_hmac_key",
+                "protected_effect_hmac_key": _pick(
                     "NEXTCLOUD_PROTECTED_EFFECT_HMAC_KEY",
                 ),
             }
@@ -297,10 +244,10 @@ def load_main_cloud_config(
         # Real deployments override every value via Helm secrets / Vault —
         # same convention as the Nextcloud branch above. The client_secret
         # default matches the placeholder the Keycloak realm ships with.
-        oc_base_url = _ov("base_url") or _pick(
+        oc_base_url = _pick(
             "MAIN_CLOUD_URL", "OPENCLOUD_URL", default="http://localhost:9200"
         )
-        oc_public_url = _ov("public_url") or _pick(
+        oc_public_url = _pick(
             "MAIN_CLOUD_PUBLIC_URL", "OPENCLOUD_PUBLIC_URL", default=oc_base_url
         )
         raw = {
@@ -308,29 +255,23 @@ def load_main_cloud_config(
                 "backend_id": "opencloud",
                 "base_url": oc_base_url,
                 "public_url": oc_public_url,
-                "keycloak_issuer": _ov("keycloak_issuer")
-                or _pick(
+                "keycloak_issuer": _pick(
                     "OPENCLOUD_KEYCLOAK_ISSUER",
                     default="http://localhost:8180/realms/srw",
                 ),
-                "keycloak_client_id": _ov("keycloak_client_id")
-                or os.getenv(
+                "keycloak_client_id": os.getenv(
                     "OPENCLOUD_KEYCLOAK_CLIENT_ID",
                     "opencloud-orchestrator",
                 ),
-                "keycloak_client_secret": _secret(
-                    "keycloak_client_secret", "OPENCLOUD_KEYCLOAK_CLIENT_SECRET"
-                )
+                "keycloak_client_secret": _pick("OPENCLOUD_KEYCLOAK_CLIENT_SECRET")
                 or "opencloud-orchestrator-local-secret",
-                "admin_role_claim_value": _ov("admin_role_claim_value")
-                or os.getenv("OPENCLOUD_ADMIN_ROLE_CLAIM_VALUE", "opencloudAdmin"),
-                "default_quota_bytes": overlay_value.get("default_quota_bytes")
-                if overlay_value.get("default_quota_bytes") is not None
-                else _parse_int(os.getenv("OPENCLOUD_DEFAULT_QUOTA_BYTES")),
-                "mount_insecure_tls": (
-                    _ov("mount_insecure_tls")
-                    or os.getenv("OPENCLOUD_MOUNT_INSECURE_TLS", "")
-                )
+                "admin_role_claim_value": os.getenv(
+                    "OPENCLOUD_ADMIN_ROLE_CLAIM_VALUE", "opencloudAdmin"
+                ),
+                "default_quota_bytes": _parse_int(
+                    os.getenv("OPENCLOUD_DEFAULT_QUOTA_BYTES")
+                ),
+                "mount_insecure_tls": os.getenv("OPENCLOUD_MOUNT_INSECURE_TLS", "")
                 .strip()
                 .lower()
                 in ("1", "true", "yes"),
@@ -340,10 +281,10 @@ def load_main_cloud_config(
         raw = {
             "settings": {
                 "backend_id": "ms365",
-                "tenant_id": _ov("tenant_id") or os.getenv("MS365_TENANT_ID"),
-                "client_id": _ov("client_id") or os.getenv("MS365_CLIENT_ID"),
-                "client_secret": _secret("client_secret", "MS365_CLIENT_SECRET"),
-                "site_id": _ov("site_id") or os.getenv("MS365_SITE_ID"),
+                "tenant_id": os.getenv("MS365_TENANT_ID"),
+                "client_id": os.getenv("MS365_CLIENT_ID"),
+                "client_secret": _pick("MS365_CLIENT_SECRET"),
+                "site_id": os.getenv("MS365_SITE_ID"),
             }
         }
     else:
@@ -367,7 +308,7 @@ def _parse_int(value: Optional[str]) -> Optional[int]:
 
 # Required (non-optional) secret fields per backend → the ordered env-var
 # fallbacks ``load_main_cloud_config`` reads for each. Keep in lockstep with
-# the ``_secret(...)`` calls in the loader above. ``oidc_client_secret`` is
+# the secret ``_pick(...)`` calls in the loader above. ``oidc_client_secret`` is
 # intentionally absent — it is ``Optional`` on ``NextcloudSettings``.
 _REQUIRED_SECRET_ENVS: dict[str, dict[str, tuple[str, ...]]] = {
     "nextcloud": {
@@ -383,22 +324,19 @@ _REQUIRED_SECRET_ENVS: dict[str, dict[str, tuple[str, ...]]] = {
 }
 
 
-def missing_secret_envs(
-    backend_id: str, db_overlay: Optional[dict] = None
-) -> list[dict]:
+def missing_secret_envs(backend_id: str) -> list[dict]:
     """Report which *required* secret env vars are unset for a backend config.
 
-    Mirrors the secret-resolution precedence of ``load_main_cloud_config``
-    (``credentials_ref`` override > legacy env-var fallbacks) but only inspects
-    *presence* — it never reads a secret's value and never falls back to the
-    built-in dev defaults the loader uses (``admin`` / ``agent-service-dev`` /
-    ``opencloud-orchestrator-local-secret``).
+    Mirrors the secret resolution of ``load_main_cloud_config`` but only
+    inspects *presence* — it never reads a secret's value and never falls back
+    to the built-in dev defaults the loader uses (``admin`` /
+    ``agent-service-dev`` / ``opencloud-orchestrator-local-secret``).
 
     The loader keeps those dev defaults on purpose so a bare ``.env`` or a test
-    run "just works". This helper lets the admin endpoints **refuse to activate**
-    (PUT) or **warn before probing** (test) a backend whose real secrets are not
-    wired, instead of silently connecting with dev credentials and failing at
-    the first cloud call. See ``knowledge-base/knowledge/issues/main_cloud.md`` Issue 5.
+    run "just works". This helper lets startup warn about a backend whose real
+    secrets are not wired, instead of silently connecting with dev credentials
+    and failing at the first cloud call. See
+    ``knowledge-base/knowledge/issues/main_cloud.md`` Issue 5.
 
     Returns one ``{"field", "env_var", "checked"}`` entry per missing secret; an
     empty list means every required secret resolves to a non-empty value.
@@ -407,29 +345,8 @@ def missing_secret_envs(
     if not required:
         return []
 
-    credentials_ref: Optional[str] = None
-    secret_fields: list[str] = []
-    if db_overlay:
-        credentials_ref = db_overlay.get("credentials_ref")
-        raw_value = db_overlay.get("value")
-        if isinstance(raw_value, dict):
-            secret_fields = raw_value.get("__secret_fields__", []) or []
-
     missing: list[dict] = []
     for field, env_fallbacks in required.items():
-        # credentials_ref ("env:NAME") wins when the overlay marks this field
-        # as credentials-ref-sourced — identical precedence to ``_secret()``.
-        if (
-            credentials_ref
-            and credentials_ref.startswith("env:")
-            and field in secret_fields
-        ):
-            env_name = credentials_ref[4:]
-            if not os.getenv(env_name):
-                missing.append(
-                    {"field": field, "env_var": env_name, "checked": [env_name]}
-                )
-            continue
         if not _pick(*env_fallbacks):
             missing.append(
                 {
@@ -494,10 +411,7 @@ def main_cloud_routing_snapshot(settings: MainCloudConfig) -> dict:
     raise ValueError("MS365 does not have a main-cloud instance contract")
 
 
-def main_cloud_secret_references(
-    backend_id: str,
-    db_overlay: Optional[dict] = None,
-) -> dict[str, str]:
+def main_cloud_secret_references(backend_id: str) -> dict[str, str]:
     """Resolve the env *names* that supplied the active backend's secrets.
 
     Secret values are never returned. Required fields fail closed when their
@@ -516,30 +430,9 @@ def main_cloud_secret_references(
         if backend_id == "nextcloud"
         else {}
     )
-    overlay_value = (db_overlay or {}).get("value") or {}
-    if not isinstance(overlay_value, dict):
-        overlay_value = {}
-    secret_fields = overlay_value.get("__secret_fields__") or []
-    if not isinstance(secret_fields, list):
-        secret_fields = []
-    credentials_ref = (db_overlay or {}).get("credentials_ref")
 
     refs: dict[str, str] = {}
     for field, fallbacks in {**required, **optional}.items():
-        if (
-            isinstance(credentials_ref, str)
-            and credentials_ref.startswith("env:")
-            and field in secret_fields
-        ):
-            env_name = credentials_ref[4:]
-            if not env_name or not os.getenv(env_name):
-                if field in required:
-                    raise ValueError(
-                        f"required secret env is unset for {backend_id}.{field}"
-                    )
-                continue
-            refs[field] = f"env:{env_name}"
-            continue
         env_name = next((name for name in fallbacks if os.getenv(name)), None)
         if env_name is None:
             if field in required:

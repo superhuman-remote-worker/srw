@@ -44,17 +44,21 @@ from orchestrator.security.access import (
     project_status_filter_sql,
     redact_datasource,
     redact_datasources,
+    redact_public_config_override,
     redact_repositories,
     redact_repository,
+    dropped_hidden_config_values,
+    restore_hidden_config_values,
     user_can_access_datasource,
 )
 from orchestrator.services import project_provisioning
-from orchestrator.services.cloud import ProjectFolderHandle
+from orchestrator.services.cloud import ProjectFolderHandle, folder_grants
 from orchestrator.services.cloud.identity import (
     get_home_browser_url_cached,
     peek_home_browser_url,
 )
 from orchestrator.services.config_overrides import (
+    refuse_execution_owned_workspace_keys,
     validated_config_name as _validated_config_name,
 )
 from orchestrator.services.managed_repository_authority import (
@@ -68,6 +72,99 @@ from orchestrator.services.managed_repository_authority import (
 from orchestrator.services.officer_metadata import (
     thread_officer_meta as _thread_officer_meta,
 )
+from shared.connectors.builtin import spec_for_row
+from shared.connectors.contract import AccessContext, strict_access
+from shared.connectors.platform import (
+    PROJECT_KB,
+    managed_kind,
+    managed_refusal,
+    platform_owned,
+)
+
+
+def _link_forced_read_only(datasource: dict[str, Any]) -> bool:
+    """Whether the connector's driver keeps every project link read-only (KB)."""
+    spec = spec_for_row(datasource)
+    return spec is not None and spec.forced_read_only
+
+
+def _link_access_offered(datasource: dict[str, Any]) -> tuple[str, ...]:
+    """The levels a project link of a strict connector may default to: what
+    its driver offers the connector on some workspace tier."""
+    from orchestrator.services.connector_drivers.base import SupportsOfferedAccess
+    from orchestrator.services.connector_drivers.registry import (
+        builtin_connector_drivers,
+    )
+
+    spec = spec_for_row(datasource)
+    if spec is None:
+        return ()
+    driver = builtin_connector_drivers().for_type(datasource.get("type"))
+    if isinstance(driver, SupportsOfferedAccess):
+        return tuple(driver.offered_access(datasource, AccessContext()))
+    return spec.ranked_access_ids()
+
+
+def _link_access_settings(
+    datasource: dict[str, Any], body: ProjectDatasourceSettings | None
+) -> tuple[bool | None, Any]:
+    """The ``read_only`` and ``access`` a project link of ``datasource``
+    stores from ``body`` (``...``: ``access`` unchanged), or a 422.
+
+    A connector whose driver's levels say what they let through (strict,
+    ``strict_access``: a cloud folder) takes a default level per link,
+    ``access``, and never the ``read_only`` boolean, which the link keeps
+    NULL: a read-only default is the level that writes nothing. The level
+    must be one the driver offers the connector on some workspace tier; an
+    execution on a tier that does not offer it gets it lowered. Any other
+    driver keeps ``read_only`` and takes no level.
+    """
+    spec = spec_for_row(datasource)
+    sent = body.model_fields_set if body is not None else set()
+    read_only = body.read_only if body is not None else None
+    access = body.access if body is not None else None
+    if spec is None or not strict_access(spec):
+        if access is not None:
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "code": "link_access_not_a_level",
+                    "message": (
+                        f"{spec.title if spec else 'This'} connectors take no "
+                        "access level per project link; set read_only instead"
+                    ),
+                },
+            )
+        return read_only, ...
+    if read_only:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "link_access_is_a_level",
+                "message": (
+                    f"{spec.title} connectors take an access level per project "
+                    "link (access), not read_only"
+                ),
+                "offered": list(_link_access_offered(datasource)),
+            },
+        )
+    if access is not None:
+        offered = _link_access_offered(datasource)
+        if access not in offered:
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "code": "link_access_not_offered",
+                    "message": (
+                        f"{spec.title} does not offer the access level "
+                        f"{access!r} for this connector"
+                        + (f" (offered: {', '.join(offered)})" if offered else "")
+                    ),
+                    "access": access,
+                    "offered": list(offered),
+                },
+            )
+    return None, (access if "access" in sent else ...)
 
 
 @dataclass(frozen=True)
@@ -95,6 +192,29 @@ class ProjectDependencies:
     with_validated_tool_overrides: Callable[
         [dict[str, Any] | None], dict[str, Any] | None
     ]
+
+
+def public_project(project: dict[str, Any]) -> dict[str, Any]:
+    """A project row as it may leave the orchestrator.
+
+    ``default_config_override`` is merged under every job in the project, so it
+    can hold what a job override holds — a BYO ``llm.api_key``, capability keys
+    in ``env_keys``, a mount's ``rclone_spec``, the ``workspace.remote``
+    transport — and every project MEMBER reads this row. It leaves by the job
+    API's policy (:func:`redact_public_config_override`); ``update_project``
+    restores the hidden values when the redacted view is written back.
+
+    A manifest-composed row (every project after ``migrate_projects``) also
+    carries the Project ``manifest``, whose Expert ``layers`` hold that override
+    and each link override verbatim, and whose team controller holds the
+    officer's config; it leaves by the same policy. The document keeps its
+    shape, so a reader comparing it to its resource still can.
+    """
+    out = dict(project)
+    for key in ("default_config_override", "manifest"):
+        if out.get(key) is not None:
+            out[key] = redact_public_config_override(out[key])
+    return out
 
 
 # =============================================================================
@@ -139,6 +259,7 @@ async def create_project(
     # shell tool for jobs whose owner has no shell_tools grant. Validated on
     # WRITE only — no existing row is touched, and the field only reaches this
     # check when a caller explicitly sends it.
+    refuse_execution_owned_workspace_keys(body.default_config_override)
     validated_project_override = dependencies.with_validated_tool_overrides(
         body.default_config_override
     )
@@ -205,7 +326,7 @@ async def create_project(
             project, dependencies=dependencies.provisioning
         )
 
-        return project
+        return public_project(project)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e)) from e
 
@@ -322,7 +443,7 @@ async def list_projects(
         if scope_pid:
             projects = [p for p in projects if str(p.get("id", "")) == str(scope_pid)]
 
-        return projects
+        return [public_project(p) for p in projects]
     except HTTPException:
         raise
     except Exception as e:
@@ -431,7 +552,7 @@ async def get_project(
                     handle
                 )
 
-    return project
+    return public_project(project)
 
 
 async def quiesce_archived_project(
@@ -538,7 +659,6 @@ async def update_project(
     and reports what it stopped (§4.5).
     """
     store = dependencies.store
-    logger = dependencies.logger
 
     kwargs = {k: v for k, v in body.model_dump().items() if v is not None}
     if not kwargs:
@@ -560,7 +680,24 @@ async def update_project(
     # project-memory toggle re-submits the STORED override, so a project
     # already holding an invalid tools block surfaces it here instead of
     # quietly binding foreign tools on every job.
+    report: dict[str, Any] = {}
     if "default_config_override" in kwargs:
+        refuse_execution_owned_workspace_keys(kwargs["default_config_override"])
+        # Reads serve the redacted view (public_project) and the cockpit writes
+        # that view back whole, so without this, flipping one key would delete
+        # every stored secret in the override.
+        stored_override = project.get("default_config_override")
+        kwargs["default_config_override"] = restore_hidden_config_values(
+            kwargs["default_config_override"], stored_override
+        )
+        # A write that changes an endpoint (or a section) restores nothing
+        # there; say so rather than 200 with keys silently gone — an MCP
+        # read-modify-write client has no other way to find out.
+        dropped = dropped_hidden_config_values(
+            kwargs["default_config_override"], stored_override
+        )
+        if dropped:
+            report["dropped_hidden_keys"] = dropped
         kwargs["default_config_override"] = dependencies.with_validated_tool_overrides(
             kwargs["default_config_override"]
         )
@@ -582,24 +719,6 @@ async def update_project(
     if not success:
         raise HTTPException(status_code=404, detail=f"Project '{project_id}' not found")
 
-    # Sync cloud_storage_read_only to the project-scoped WebDAV datasource
-    if body.cloud_storage_read_only is not None:
-        try:
-            project_ds = await store.list_project_datasources(project_id)
-            for ds in project_ds:
-                if ds["type"] == "webdav":
-                    await store.link_datasource_to_project(
-                        project_id=project_id,
-                        datasource_id=str(ds["id"]),
-                        read_only=body.cloud_storage_read_only,
-                    )
-                    break
-        except Exception as e:
-            logger.warning(
-                f"Failed to sync cloud_storage_read_only to datasource "
-                f"for project {project_id}: {e}"
-            )
-
     # Archiving quiesces the children and says so (§4.5). Only on the
     # transition INTO archived: re-PATCHing an already-archived project must
     # not re-hold an officer the owner deliberately released. Unarchive
@@ -607,9 +726,9 @@ async def update_project(
     archiving_now = str(kwargs.get("status") or "").lower() == "archived"
     if archiving_now and not project_is_archived(project):
         quiesced = await quiesce_archived_project(project_id, dependencies=dependencies)
-        return {"status": "updated", "archived": True, **quiesced}
+        return {"status": "updated", "archived": True, **quiesced, **report}
 
-    return {"status": "updated"}
+    return {"status": "updated", **report}
 
 
 async def delete_project(
@@ -657,6 +776,15 @@ async def delete_project(
         await conn.execute(
             "UPDATE datasources SET project_id = NULL WHERE project_id = $1", uuid_val
         )
+
+    # The project's per-folder principals go before its folder does (their
+    # rows outlive the project; what this cannot finish, the sweep does).
+    await folder_grants.revoke_folder_grants(
+        store,
+        dependencies.main_cloud_router,
+        reason="project_deleted",
+        project_id=project_id,
+    )
 
     success = await store.delete_project(project_id)
     if not success:
@@ -800,6 +928,17 @@ async def update_project_member(
     )
     if not success:
         raise HTTPException(status_code=404, detail="Member not found")
+    if body.role == "viewer":
+        # A viewer binds the project's folder read-only: its writer goes now,
+        # best effort (the sweep revokes what is left).
+        await folder_grants.revoke_folder_grants(
+            dependencies.store,
+            dependencies.main_cloud_router,
+            reason="role_lowered",
+            project_id=project_id,
+            user_id=user_id,
+            kind="writer",
+        )
     return {"status": "updated"}
 
 
@@ -837,6 +976,16 @@ async def remove_project_member(
     if not success:
         raise HTTPException(status_code=404, detail="Member not found")
 
+    # The member's per-folder principals of this project's folder: revoked
+    # now, best effort (the sweep revokes what is left).
+    await folder_grants.revoke_folder_grants(
+        store,
+        dependencies.main_cloud_router,
+        reason="member_removed",
+        project_id=project_id,
+        user_id=user_id,
+    )
+
     # Remove from Keycloak group
     if dependencies.keycloak_groups.is_initialized:
         user = await store.get_user(user_id)
@@ -859,10 +1008,18 @@ async def remove_project_member(
         except Exception as e:
             logger.warning(f"Failed to revoke Gitea access for member {user_id}: {e}")
 
-    # Main-cloud group removal flows through Keycloak — OpenCloud reconciles
-    # LibreGraph memberships from the OIDC `groups` claim on login, so the
-    # Keycloak-side remove above is sufficient. No direct backend.remove call
-    # needed.
+    # The main cloud's own project group too: add_project_member adds the
+    # member directly (sync_project_member_to_groups), and the group carries
+    # the folder's permissions in the cloud, so a removed member's own cloud
+    # account ("My cloud") would keep reaching the folder. OpenCloud also
+    # reconciles from the Keycloak `groups` claim at the next login;
+    # Nextcloud never does. Best effort: the SRW removal stands.
+    project = await store.get_project(project_id)
+    removed_member = await store.get_user(user_id) if project else None
+    if project and removed_member:
+        await project_provisioning.remove_project_member_from_backend_group(
+            project, removed_member, dependencies=dependencies.provisioning
+        )
 
     return {"status": "removed"}
 
@@ -1129,13 +1286,8 @@ async def link_datasource_to_project(
             status_code=403, detail="Not authorized to link this connector"
         )
 
-    from orchestrator.services.kb_datasources import native_kb_project_id
-
-    if native_kb_project_id(ds):
-        raise HTTPException(
-            status_code=409,
-            detail="The native knowledge connector cannot be linked to another project",
-        )
+    if platform_owned(ds):
+        raise HTTPException(status_code=409, detail=managed_refusal(ds, "link"))
     is_connector_owner = str(ds.get("created_by") or "") == str(user["id"])
     if (ds.get("scope_mode") == "projects" or not ds.get("is_global")) and not (
         user.get("is_admin") or is_connector_owner
@@ -1145,15 +1297,15 @@ async def link_datasource_to_project(
             detail="Only the connector owner or an admin may add this project link",
         )
 
+    read_only, access = _link_access_settings(ds, body)
     try:
-        effective_read_only = (
-            True if ds.get("type") == "kb" else (body.read_only if body else None)
-        )
+        effective_read_only = True if _link_forced_read_only(ds) else read_only
         await store.link_datasource_to_project(
             project_id,
             datasource_id,
             read_only=effective_read_only,
             description=body.description if body else None,
+            access=None if access is ... else access,
             authority_user_id=str(user["id"]),
             authority_is_admin=bool(user.get("is_admin")),
         )
@@ -1186,13 +1338,26 @@ async def update_project_datasource(
         raise HTTPException(
             status_code=404, detail=f"Connector '{datasource_id}' not found"
         )
-    effective_read_only = True if ds.get("type") == "kb" else body.read_only
+    kind = managed_kind(ds)
+    spec = spec_for_row(ds)
+    if (
+        kind is not None
+        and kind != PROJECT_KB
+        and body.read_only
+        and not (spec is not None and strict_access(spec))
+    ):
+        # A read-only link on a connector SRW keeps whose driver has no
+        # level that says it writes nothing.
+        raise HTTPException(status_code=409, detail=managed_refusal(ds, "link_access"))
+    read_only, access = _link_access_settings(ds, body)
+    effective_read_only = True if _link_forced_read_only(ds) else read_only
     try:
         success = await store.update_project_datasource(
             project_id,
             datasource_id,
             read_only=effective_read_only,
             description=body.description,
+            access=access,
             authority_user_id=str(user["id"]),
             authority_is_admin=bool(user.get("is_admin")),
         )
@@ -1234,13 +1399,8 @@ async def resolve_datasource_unlink(
     ds = await dependencies.store.get_datasource(datasource_id)
     if not ds:
         raise HTTPException(status_code=404, detail="Connector not found")
-    from orchestrator.services.kb_datasources import native_kb_project_id
-
-    if native_kb_project_id(ds):
-        raise HTTPException(
-            status_code=409,
-            detail="The native knowledge connector link is managed by its project",
-        )
+    if platform_owned(ds):
+        raise HTTPException(status_code=409, detail=managed_refusal(ds, "unlink"))
     is_connector_owner = str(ds.get("created_by") or "") == str(user["id"])
     return ds, not (user.get("is_admin") or is_connector_owner)
 

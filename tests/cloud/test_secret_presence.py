@@ -72,33 +72,16 @@ class TestMissingSecretEnvs:
         monkeypatch.setenv("OPENCLOUD_KEYCLOAK_CLIENT_SECRET", "shh")
         assert missing_secret_envs("opencloud") == []
 
-    def test_credentials_ref_satisfies_when_set(self, monkeypatch: pytest.MonkeyPatch):
+    def test_the_environment_is_the_only_source(self, monkeypatch: pytest.MonkeyPatch):
+        """No overlay can name another env var: Helm configures the cloud."""
         _clear_cloud_env(monkeypatch)
-        # No legacy env vars set, but credentials_ref points at a set var and
-        # the overlay marks the fields as ref-sourced — mirrors _secret().
         monkeypatch.setenv("VAULT_NC_PASS", "from-vault")
-        overlay = {
-            "credentials_ref": "env:VAULT_NC_PASS",
-            "value": {
-                "backend_id": "nextcloud",
-                "__secret_fields__": ["admin_password", "agent_password"],
-            },
-        }
-        assert missing_secret_envs("nextcloud", overlay) == []
-
-    def test_credentials_ref_unset_is_reported(self, monkeypatch: pytest.MonkeyPatch):
-        _clear_cloud_env(monkeypatch)
-        overlay = {
-            "credentials_ref": "env:VAULT_NC_PASS",  # deliberately never set
-            "value": {
-                "backend_id": "nextcloud",
-                "__secret_fields__": ["admin_password", "agent_password"],
-            },
-        }
-        missing = missing_secret_envs("nextcloud", overlay)
+        missing = missing_secret_envs("nextcloud")
         assert {m["field"] for m in missing} == {"admin_password", "agent_password"}
-        # All resolve against the credentials_ref'd var, not the legacy fallback.
-        assert {m["env_var"] for m in missing} == {"VAULT_NC_PASS"}
+        assert {m["env_var"] for m in missing} == {
+            "NEXTCLOUD_ADMIN_PASSWORD",
+            "NEXTCLOUD_AGENT_PASSWORD",
+        }
 
     def test_unknown_backend_returns_empty(self, monkeypatch: pytest.MonkeyPatch):
         _clear_cloud_env(monkeypatch)

@@ -3,8 +3,12 @@ import {RouterLink} from '@angular/router';
 import {TranslocoPipe} from '@jsverse/transloco';
 import {AppIconComponent} from '../../../ui/icon';
 import {VexillumComponent} from '../../../ui/vexillum';
-import {AppSelectComponent} from '../../../ui/select';
 import {AppButtonComponent} from '../../../ui/button';
+import {WorkspacePickerComponent} from '../../agent-settings/workspace-picker.component';
+import type {WorkspaceChoice} from '../../../core/models/workspace-template.model';
+import type {WorkspacePreview} from '../../../core/models/workspace.model';
+import type {WorkspaceCreationView} from '../../../core/models/api.model';
+import {workspaceCreationMessageKey} from '../../../core/util/workspace-creation';
 
 /** One suggestion chip, already resolved to the active language. */
 export interface DisplayedSuggestion {
@@ -30,7 +34,7 @@ export interface DisplayedSuggestion {
   selector: 'app-chat-empty-state',
   standalone: true,
   changeDetection: ChangeDetectionStrategy.OnPush,
-  imports: [RouterLink, TranslocoPipe, AppIconComponent, VexillumComponent, AppSelectComponent, AppButtonComponent],
+  imports: [RouterLink, TranslocoPipe, AppIconComponent, VexillumComponent, AppButtonComponent, WorkspacePickerComponent],
   styleUrl: './chat-empty-state.component.scss',
   template: `
     <div class="empty-inner" [class.draft-recovery]="variant() === 'recovery'"
@@ -42,18 +46,12 @@ export interface DisplayedSuggestion {
       <p class="empty-subtitle">{{ subtitleKey() | transloco }}</p>
 
       @if (variant() === 'recovery') {
-        <label class="draft-workspace">
-          <span>{{ 'agentSettings.execution.workspaceBackend' | transloco }}</span>
-          <app-select size="sm" [value]="workspaceBackend()"
-                      [ariaLabel]="'agentSettings.execution.workspaceBackend' | transloco"
-                      (changed)="workspaceChanged.emit($event)">
-            <option value="">{{ 'chat.draft.workspaceDefault' | transloco }}</option>
-            <option value="virtual">{{ 'advanced.options.virtual' | transloco }}</option>
-            <option value="sandbox">{{ 'advanced.options.container' | transloco }}</option>
-            <option value="vm">{{ 'advanced.options.vmQemu' | transloco }}</option>
-            <option value="none">{{ 'advanced.options.none' | transloco }}</option>
-          </app-select>
-        </label>
+        <div class="draft-workspace">
+          @defer (on immediate) {
+            <app-workspace-picker role="session" [projectId]="projectId()" [preview]="workspacePreview()"
+              [choice]="workspaceChoice()" (choiceChange)="workspaceChoiceChanged.emit($event)" />
+          }
+        </div>
       }
 
       @if (variant() !== 'ready') {
@@ -113,19 +111,24 @@ export class ChatEmptyStateComponent {
   connectorsError = input<boolean>(false);
   connectorsEnabled = input<boolean>(false);
   datasourceCount = input<number>(0);
-  workspaceBackend = input<string>('');
+  workspaceChoice = input<WorkspaceChoice>({kind: 'default'});
+  projectId = input<string | null>(null);
+  workspacePreview = input<WorkspacePreview | null>(null);
+  workspaceCreation = input<WorkspaceCreationView | null>(null);
 
   suggestionPicked = output<DisplayedSuggestion>();
   connectorsToggled = output<boolean>();
   retryRequested = output<void>();
-  workspaceChanged = output<string | null>();
+  workspaceChoiceChanged = output<WorkspaceChoice>();
   sendRetried = output<void>();
 
   protected readonly titleKey = computed(() =>
+    this.workspaceCreation() && this.variant() === 'ready' ? 'workspaceCreation.title' :
     this.variant() === 'recovery' ? 'chat.draft.recoveryTitle' :
       this.variant() === 'draft' ? 'chat.draft.title' : 'chat.empty.title',
   );
   protected readonly subtitleKey = computed(() =>
+    this.workspaceCreation() && this.variant() === 'ready' ? workspaceCreationMessageKey(this.workspaceCreation()!) :
     this.variant() === 'recovery' ? 'chat.draft.recoveryBody' :
       this.variant() === 'draft' ? 'chat.draft.subtitle' : 'chat.empty.subtitle',
   );

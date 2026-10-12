@@ -149,6 +149,16 @@ class TestBackendContract:
         assert h1.backend == backend.backend_id
 
     @pytest.mark.asyncio
+    async def test_an_exclusive_session_folder_is_never_one_already_there(
+        self, backend: MainCloudBackend
+    ):
+        fresh = await backend.ensure_session_folder(session_id="new-1", exclusive=True)
+        assert fresh.native_id == "sessions/new-1"
+        with pytest.raises(CloudBackendError) as exc:
+            await backend.ensure_session_folder(session_id="new-1", exclusive=True)
+        assert exc.value.kind == CloudBackendErrorKind.ALREADY_EXISTS
+
+    @pytest.mark.asyncio
     async def test_delete_project_folder_no_op_on_missing(
         self, backend: MainCloudBackend
     ):

@@ -12,6 +12,11 @@ from orchestrator.services.default_experts import (
     seed_managed_default_experts,
 )
 from shared.runtime.core.loader import canonical_config_name, resolve_config_path
+from orchestrator.application import preparation as preparation_composition
+from orchestrator.services import (
+    session_config_resolution as session_config_resolution_module,
+)
+from orchestrator.services import session_tool_policy as session_tool_policy_module
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -277,7 +282,6 @@ def test_default_expert_migration_shape():
 
 def test_default_assistant_runtime_control_groups_are_really_off():
     """The resolved policy must reach the runtime gates, not stop at YAML."""
-    from orchestrator import main as orchestrator_main
     from orchestrator.services.config_resolver import resolve_config
     from agent.api.persistent_session import (
         _agent_catalog_enabled,
@@ -298,7 +302,7 @@ def test_default_assistant_runtime_control_groups_are_really_off():
         capture=capture,
     )
     blob["agent"].update(
-        orchestrator_main._session_tool_group_disabled_markers(
+        session_tool_policy_module.session_tool_group_disabled_markers(
             capture["merged_fragment"]
         )
     )
@@ -316,7 +320,7 @@ async def test_account_reasoning_is_a_floor_below_the_expert(monkeypatch):
     from orchestrator.services.config_resolver import resolve_config
 
     monkeypatch.setattr(
-        orchestrator_main.postgres_db,
+        orchestrator_main.app.state.resources.postgres_db,
         "get_user_settings",
         AsyncMock(
             return_value={
@@ -326,11 +330,16 @@ async def test_account_reasoning_is_a_floor_below_the_expert(monkeypatch):
         ),
     )
     monkeypatch.setattr(
-        orchestrator_main.postgres_db,
+        orchestrator_main.app.state.resources.postgres_db,
         "resolve_default_for_capability",
         AsyncMock(return_value=None),
     )
-    account_floor = await orchestrator_main._resolve_default_models("user-1")
+    account_floor = await session_config_resolution_module.resolve_default_models(
+        "user-1",
+        dependencies=preparation_composition.session_config_dependencies(
+            orchestrator_main.app.state.resources
+        ),
+    )
 
     assert account_floor["llm"] == {
         "model": "account-model",

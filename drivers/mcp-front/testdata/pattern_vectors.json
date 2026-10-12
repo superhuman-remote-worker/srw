@@ -1,0 +1,23 @@
+{
+  "comment": "Tool-class pattern vectors shared by the front (Go) and the orchestrator (shared/connectors/mcp.py): '*' matches any run of characters, everything else itself.",
+  "cases": [
+    {"pattern": "get_me", "name": "get_me", "match": true},
+    {"pattern": "get_me", "name": "get_meta", "match": false},
+    {"pattern": "get_*", "name": "get_me", "match": true},
+    {"pattern": "get_*", "name": "get_", "match": true},
+    {"pattern": "get_*", "name": "forget_me", "match": false},
+    {"pattern": "*_read", "name": "issue_read", "match": true},
+    {"pattern": "*_read", "name": "issue_read_write", "match": false},
+    {"pattern": "*", "name": "anything", "match": true},
+    {"pattern": "a*b*c", "name": "abc", "match": true},
+    {"pattern": "a*b*c", "name": "aXbYc", "match": true},
+    {"pattern": "a*b*c", "name": "acb", "match": false},
+    {"pattern": "a*a", "name": "a", "match": false},
+    {"pattern": "a*a", "name": "aa", "match": true},
+    {"pattern": "*ab*b", "name": "abab", "match": true},
+    {"pattern": "list.*", "name": "list.repos", "match": true},
+    {"pattern": "list.*", "name": "listXrepos", "match": false},
+    {"pattern": "notes-*", "name": "notes-read", "match": true},
+    {"pattern": "Get*", "name": "get_me", "match": false}
+  ]
+}

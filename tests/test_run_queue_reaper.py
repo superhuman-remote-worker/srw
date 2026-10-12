@@ -110,6 +110,11 @@ async def test_worker_reaper_resolves_exact_attempt_before_exhaustion(
     monkeypatch, evidence
 ):
     monkeypatch.setenv("VM_WORKSPACE_RECOVERY_ENABLED", "true")
+    # This unit isolates the VM protocol after positive non-container classification.
+    monkeypatch.setattr(
+        "shared.worker_execution_hold.hold_container_worker_attempt",
+        AsyncMock(return_value="not_applicable"),
+    )
     conn = _conn()
     conn.queue_row = {
         **_queue(state="leased", token=8, attempts=5),
@@ -520,7 +525,16 @@ async def test_reap_cas_returns_exact_pre_steal_admission_turn():
 
 
 @pytest.mark.asyncio
-async def test_atomic_session_steal_parks_exact_uid_debt_after_settlement(monkeypatch):
+@pytest.mark.parametrize(
+    ("settled_state", "settled_reason"),
+    [("queued", None), ("parked", "reaper_max_attempts")],
+)
+async def test_atomic_session_steal_parks_exact_uid_debt_after_settlement(
+    monkeypatch, settled_state, settled_reason
+):
+    """The hold keeps the settled disposition; a max-attempts park keeps its
+    reason in the hold, since the hold's own park overwrites it."""
+
     conn = _conn()
     conn.thread_row = _thread(
         metadata={
@@ -533,9 +547,10 @@ async def test_atomic_session_steal_parks_exact_uid_debt_after_settlement(monkey
     )
     leased = _queue(state="leased", token=8, leased_by="pod-1")
     leased["leased_until"] = "expired"
-    settled = _queue(state="queued", token=9, leased_by=None, attempts=2)
+    settled = _queue(state=settled_state, token=9, leased_by=None, attempts=2)
     settled["queued_at"] = "2026-08-11T12:00:00+00:00"
     settled["run_after"] = "2026-08-11T12:00:03+00:00"
+    settled["park_reason"] = settled_reason
 
     async def _fetchrow(sql, *_args):
         if sql == mod._LOCK_THREAD_SQL:
@@ -547,7 +562,7 @@ async def test_atomic_session_steal_parks_exact_uid_debt_after_settlement(monkey
             return {
                 "unit_id": UNIT_A,
                 "unit_kind": "session_turn",
-                "state": "queued",
+                "state": settled_state,
                 "attempts_since_completion": 2,
                 "lease_token": 9,
             }
@@ -583,13 +598,17 @@ async def test_atomic_session_steal_parks_exact_uid_debt_after_settlement(monkey
         "pod_uid": "uid-old",
         "quiesced": False,
     }
-    assert stored["_stateless_claim_loss_hold"] == {
+    expected_hold = {
         "lease_token": 9,
-        "intended_state": "queued",
+        "intended_state": settled_state,
         "attempts_since_completion": 2,
         "queued_at": "2026-08-11T12:00:00+00:00",
         "run_after": "2026-08-11T12:00:03+00:00",
     }
+    if settled_state == "parked":
+        expected_hold["park_reason"] = settled_reason
+    assert stored["_stateless_claim_loss_hold"] == expected_hold
+    assert "park_reason" in mod._LOCK_QUEUE_UNIT_SQL
     assert "_stateless_active_claim" not in stored
     assert conn.fetchrow.await_args_list[-1].args[0] == mod._PARK_CLAIM_LOSS_HOLD_SQL
     assert "run_after = NULL" not in mod._PARK_CLAIM_LOSS_HOLD_SQL
@@ -1478,7 +1497,7 @@ async def test_loop_leader_gates_on_reaper_advisory_lock(monkeypatch):
     conn.fetchval = _fetchval
     conn.execute = AsyncMock()
 
-    async def _reap(c, *, grace_seconds, session_steal=None):
+    async def _reap(c, *, grace_seconds, session_steal=None, worker_steal=None):
         assert c is conn
         shutdown.set()  # one cycle, then stop
         return []
@@ -1544,7 +1563,7 @@ async def test_loop_survives_cycle_errors_and_recontends(monkeypatch):
     conn.execute = AsyncMock()
     rounds = []
 
-    async def _reap(c, *, grace_seconds, session_steal=None):
+    async def _reap(c, *, grace_seconds, session_steal=None, worker_steal=None):
         rounds.append(1)
         if len(rounds) == 1:
             raise ConnectionError("db blip")

@@ -34,6 +34,22 @@
 # Tilt gives up.
 update_settings(k8s_upsert_timeout_secs=900)
 
+# Context guard — the inner loop must never touch the shared `main` cluster.
+# allow_k8s_contexts() is ADDITIVE to Tilt's built-in local-context allowance,
+# so it alone cannot exclude other local clusters. Fail fast unless the active
+# context is exactly the local k3d dev cluster, before any side-effecting work
+# below. Do NOT add `main` (or any other context) here.
+allow_k8s_contexts('k3d-srw')
+
+if k8s_context() != 'k3d-srw':
+    fail("Refusing to run: Kubernetes context is '%s', expected 'k3d-srw'. " % k8s_context() +
+         "Switch with 'kubectl config use-context k3d-srw' or export a k3d-only KUBECONFIG.")
+
+# Operational rule: keep Tilt's watched checkout stable. Branch-changing work
+# (checkout/pull/rebase) belongs in a separate worktree, never in this tree
+# while Tilt watches it — a mid-build tree swap can ship mixed image content
+# that no in-tree guard can catch (2026-09-22 incident).
+
 # -----------------------------------------------------------------------------
 # Global watch exclusions — paths Tilt must never treat as a code change.
 #
@@ -75,6 +91,7 @@ docker_build(
         'pyproject.toml',
         '.dockerignore',
         'docker/Dockerfile.orchestrator.dev',
+        'docker/prepare-tokenizer-cache.py',
         'scripts/check_kubernetes_sdk_auth.py',
         'requirements/',
         'scripts/lock_dependencies.py',
@@ -82,6 +99,7 @@ docker_build(
     live_update=[
         fall_back_on([
             'docker/Dockerfile.orchestrator.dev',
+            'docker/prepare-tokenizer-cache.py',
             'scripts/check_kubernetes_sdk_auth.py',
             'requirements/',
             'scripts/lock_dependencies.py',
@@ -269,6 +287,34 @@ docker_build(
         'docker/browser-exec',
         'docker/check-browser-stream.py',
         'docker/assert-browser-stack.sh',
+        'docker/assert-workspace-contract.sh',
+    ],
+    ignore=[
+        '.git/',
+        '.playwright-mcp/',
+        '.tilt-state/',
+    ],
+)
+
+# -----------------------------------------------------------------------------
+# Workspace (minimal) — the container-minimal built-in template's image.
+# Without this, image.workspaceMinimal keeps pointing at GHCR on every local
+# k3d, and the built-in's Job waits on a pull that never succeeds. Same
+# Dockerfile, stopped at the `minimal` stage; `full` above is `FROM minimal`,
+# so this build reuses that build's cached layers (and vice versa).
+# -----------------------------------------------------------------------------
+docker_build(
+    'srw-workspace-minimal',
+    context='.',
+    dockerfile='docker/Dockerfile.workspace',
+    target='minimal',
+    only=[
+        'docker/Dockerfile.workspace',
+        'docker/workspace-entrypoint.sh',
+        'docker/browser-exec',
+        'docker/check-browser-stream.py',
+        'docker/assert-browser-stack.sh',
+        'docker/assert-workspace-contract.sh',
     ],
     ignore=[
         '.git/',
@@ -330,7 +376,7 @@ local(
 # `vm.mode: same-cluster`; built here unconditionally so the local k3d gate
 # always runs the controller from the working tree, not from GHCR
 # (knowledge-base/knowledge/features/single_cluster_vm_deployment.md §6 Lane D).
-# No live_update: the image is three Python files and rebuilds in seconds.
+# Rebuild the installed controller and shared package together.
 # -----------------------------------------------------------------------------
 docker_build(
     'srw-vm-controller',
@@ -338,17 +384,12 @@ docker_build(
     dockerfile='docker/Dockerfile.vm-controller',
     only=[
         'src/vm_controller/',
-        'src/shared/__init__.py',
-        'src/shared/vm_lifecycle_auth.py',
-        'src/shared/workspace_initialization.py',
-        'src/shared/vm_workspace_storage.py',
-        'src/shared/workspace_preparation.py',
-        'src/shared/workspace_preparation_settings.py',
-        'src/shared/workspace_preparation_network.py',
+        'src/shared/',
         'pyproject.toml',
         '.dockerignore',
         'docker/Dockerfile.vm-controller',
         'scripts/check_kubernetes_sdk_auth.py',
+        'scripts/check_vm_controller_imports.py',
         'requirements/',
         'scripts/lock_dependencies.py',
     ],
@@ -373,14 +414,98 @@ docker_build(
     ignore=['**/__pycache__', '**/*.pyc'],
 )
 
+# -----------------------------------------------------------------------------
+# Connector driver shim (connector drivers D5): the static Go helper every
+# service driver pod runs as its canary-wait and shim-install init containers
+# and as the driver container's command. The chart pins it by digest.
+# -----------------------------------------------------------------------------
+docker_build(
+    'srw-driver-shim',
+    context='.',
+    dockerfile='docker/Dockerfile.driver-shim',
+    only=['drivers/shim/', 'docker/Dockerfile.driver-shim'],
+)
+
+# Development echo service driver (connector drivers D5): the image behind
+# srw.echo-service/v1, which only the k3d profile installs
+# (connectors.drivers.echo) and scripts/k3d-service-driver-gate.py drives.
+# Dev-only: built here, never by CI or for production. The chart receives it
+# as tag@digest, so a pod launch needs no registry lookup.
+docker_build(
+    'srw-driver-echo',
+    context='.',
+    dockerfile='docker/Dockerfile.driver-echo',
+    only=['drivers/echo/', 'docker/Dockerfile.driver-echo'],
+)
+
+# Managed MCP front (connector drivers D5a): SRW's static Go front every
+# managed MCP driver pod runs beside its server, the pod's only exposed port.
+# The same image carries the stdio bridge (D5b), which a stdio server's pod
+# installs from it. The chart pins it by digest, as it does the shim.
+docker_build(
+    'srw-driver-mcp-front',
+    context='.',
+    dockerfile='docker/Dockerfile.driver-mcp-front',
+    only=['drivers/mcp-front/', 'drivers/mcp-bridge/', 'docker/Dockerfile.driver-mcp-front'],
+)
+
+# Development MCP test server (D5a): the image behind srw.mcp-test/v1, which
+# only the k3d profile installs (connectors.drivers.mcpTest) and
+# scripts/k3d-managed-mcp-gate.py drives. Dev-only, like the echo driver.
+docker_build(
+    'srw-driver-mcp-test',
+    context='.',
+    dockerfile='docker/Dockerfile.driver-mcp-test',
+    only=['drivers/mcp-test/', 'docker/Dockerfile.driver-mcp-test'],
+)
+
+# Git swap driver (connector drivers C3): srw.git-swap/v1, the smart-HTTP
+# reverse proxy token repositories are cloned through. A product driver (CI
+# publishes it); the k3d profile turns it on (connectors.drivers.gitSwap) and
+# scripts/k3d-git-swap-gate.py drives it. The chart receives it as tag@digest.
+docker_build(
+    'srw-driver-git-swap',
+    context='.',
+    dockerfile='docker/Dockerfile.driver-git-swap',
+    only=['drivers/git-swap/', 'docker/Dockerfile.driver-git-swap'],
+)
+
+# The in-pod plane (connector drivers D7): the privileged FUSE opener and the
+# unprivileged cloud mount supervisor every session workspace Pod with cloud
+# folders runs as native sidecars. Product images (CI publishes them); the
+# chart receives them as tag@digest. One Dockerfile, two targets; its build
+# stage compiles both Go modules.
+docker_build(
+    'srw-fuse-opener',
+    context='.',
+    dockerfile='docker/Dockerfile.in-pod-mount',
+    target='opener',
+    only=['drivers/fuse-opener/', 'drivers/cloud-mount/', 'docker/Dockerfile.in-pod-mount'],
+)
+docker_build(
+    'srw-cloud-mount',
+    context='.',
+    dockerfile='docker/Dockerfile.in-pod-mount',
+    target='rclone',
+    only=['drivers/fuse-opener/', 'drivers/cloud-mount/', 'docker/Dockerfile.in-pod-mount'],
+)
+
 _srw_images = [
     ('srw-orchestrator', 'image.orchestrator.repository', 'image.orchestrator.tag'),
     ('srw-cockpit', 'image.cockpit.repository', 'image.cockpit.tag'),
     ('srw-agent', 'image.agent.repository', 'image.agent.tag'),
     ('srw-mcp', 'image.mcp.repository', 'image.mcp.tag'),
     ('srw-workspace', 'image.workspace.repository', 'image.workspace.tag'),
+    ('srw-workspace-minimal', 'image.workspaceMinimal.repository', 'image.workspaceMinimal.tag'),
     ('srw-vm-controller', 'vmController.image.repository', 'vmController.image.tag'),
     ('srw-vm-preparer', 'vmController.preparation.image.repository', 'vmController.preparation.image.tag'),
+    ('srw-driver-shim', 'connectors.drivers.shim.image.repository', 'connectors.drivers.shim.image.tag'),
+    ('srw-driver-echo', 'connectors.drivers.echo.image.repository', 'connectors.drivers.echo.image.tag'),
+    ('srw-driver-mcp-front', 'connectors.drivers.mcpFront.image.repository', 'connectors.drivers.mcpFront.image.tag'),
+    ('srw-driver-mcp-test', 'connectors.drivers.mcpTest.image.repository', 'connectors.drivers.mcpTest.image.tag'),
+    ('srw-driver-git-swap', 'connectors.drivers.gitSwap.image.repository', 'connectors.drivers.gitSwap.image.tag'),
+    ('srw-fuse-opener', 'connectors.inPodPlane.opener.image.repository', 'connectors.inPodPlane.opener.image.tag'),
+    ('srw-cloud-mount', 'connectors.inPodPlane.rclone.image.repository', 'connectors.inPodPlane.rclone.image.tag'),
 ]
 
 # Tilt fills in TILT_IMAGE_<i> (the freshly built+pushed ref) per image_deps
@@ -396,7 +521,7 @@ for i in range(len(_srw_images)):
     _srw_helm_env['TILT_IMAGE_KEY_TAG_%s' % i] = _srw_images[i][2]
     # These chart images also accept a digest, which outranks the tag. Tilt
     # owns the local image selection, including a pin saved by an earlier gate.
-    if _srw_images[i][0] in ['srw-mcp', 'srw-vm-preparer']:
+    if _srw_images[i][0] in ['srw-mcp', 'srw-vm-preparer', 'srw-driver-shim', 'srw-driver-echo', 'srw-driver-mcp-front', 'srw-driver-mcp-test', 'srw-driver-git-swap', 'srw-fuse-opener', 'srw-cloud-mount']:
         _srw_helm_env['TILT_IMAGE_KEY_DIGEST_%s' % i] = _srw_images[i][2][:-4] + '.digest'
 
 _srw_exposure_mode = os.getenv('SRW_EXPOSURE_MODE') or 'multi-host'
@@ -422,7 +547,7 @@ k8s_custom_deploy(
         '--timeout=14m',
     ] + _srw_values_args,
     apply_env=_srw_helm_env,
-    delete_cmd=['helm', 'uninstall', '--namespace', 'srw', 'srw'],
+    delete_cmd=['helm', 'uninstall', '--kube-context', 'k3d-srw', '--namespace', 'srw', 'srw'],
     # Values edits DO trigger a redeploy (changed 2026-08-30). This was `deps=[]`,
     # inherited from the `helm_resource` default this replaced, which meant an
     # edit to either values file was silently a no-op: Tilt reported the resource

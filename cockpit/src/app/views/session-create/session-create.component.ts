@@ -1,11 +1,16 @@
 import {workspaceCreationFields, workspacePreviewConfig} from "../agent-settings/workspace-selection";
-import {Component, computed, effect, inject, OnInit, signal, ViewChild} from '@angular/core';
+import {WorkspacePickerComponent} from '../agent-settings/workspace-picker.component';
+import {WorkspaceChoice} from '../../core/models/workspace-template.model';
+import {choiceBackend, choiceRequestFields} from '../workspaces/workspace-template-utils';
+import {Component, computed, effect, inject, OnInit, signal, untracked, ViewChild} from '@angular/core';
 import {ActivatedRoute, Router} from '@angular/router';
-import {HttpClient} from '@angular/common/http';
+import {HttpClient, HttpParams} from '@angular/common/http';
 import {firstValueFrom} from 'rxjs';
 import {environment} from '../../core/environment';
 import {UserService} from '../../core/services/user.service';
 import {AgentSettingsComponent} from '../../views/agent-settings/agent-settings.component';
+import {ExpertPickerComponent} from '../../views/agent-settings/expert-picker.component';
+import {executionManifest, inlineExpertSelection, toYaml} from '../../views/agent-settings/execution-request';
 import {ApiService, SessionToolGroupsResponse} from '../../core/services/api.service';
 import {resolveEffectiveModels} from '../../views/agent-settings/agent-settings.types';
 import {ModelService} from '../../core/services/model.service';
@@ -18,8 +23,7 @@ import {AppInputComponent} from '../../ui/input';
 import {AppChipComponent} from '../../ui/chip';
 import {AppIconComponent} from '../../ui/icon';
 import {AppFormFieldComponent} from '../../ui/form-field';
-import {AppSwitchComponent} from '../../ui/switch';
-import {EffectiveModels, EligibleDatasource, ExpertDefaultsResponse} from '../../core/models/api.model';
+import {EffectiveModels, EligibleDatasource, Expert, ExpertDefaultsResponse, ExpertTemplateSource} from '../../core/models/api.model';
 
 interface Project {
   id: string;
@@ -30,21 +34,9 @@ interface Project {
   main_cloud_backend?: string | null;
 }
 
-/**
- * Whether the protected-cloud session-create checkbox should render.
- *
- * Visible only when the deployment flag is on AND at least one selected
- * project is a non-default Nextcloud project (spec §2/§4: default projects
- * excluded in v1; Nextcloud-only per design §9.2).
- */
-export function protectedCloudToggleVisible(
-  featureOn: boolean,
-  selected: Array<{ is_default?: boolean; main_cloud_backend?: string | null }>,
-): boolean {
-  return featureOn && selected.some(
-    (p) => !p.is_default && p.main_cloud_backend === 'nextcloud',
-  );
-}
+/** The workspace tiers the eligible list narrows a cloud folder's levels
+ *  for (`?workspace_backend=`). */
+const ELIGIBLE_BACKENDS: ReadonlySet<string> = new Set(['sandbox', 'vm', 'virtual', 'none']);
 
 /**
  * What "Start a new session" carries forward from a drifted session's source
@@ -58,6 +50,8 @@ export function protectedCloudToggleVisible(
  */
 export interface SessionCreatePrefill {
   projectIds: string[];
+  /** The source thread's `project_id` column: set only when it had exactly one project. */
+  primaryProjectId: string | null;
   expertId: string | null;
   model: string | null;
   datasourceIds: string[];
@@ -74,10 +68,19 @@ export function mapThreadToPrefill(thread: Record<string, unknown> | null): Sess
   const model = llm['model'];
   return {
     projectIds: rawProjectIds.map(String),
+    primaryProjectId: typeof thread['project_id'] === 'string' && thread['project_id'] ? (thread['project_id'] as string) : null,
     expertId: typeof expertId === 'string' && expertId ? expertId : null,
     model: typeof model === 'string' && model ? model : null,
     datasourceIds: rawDatasourceIds.map(String),
   };
+}
+
+/** Sessions carry one project (single_project_sessions.md). From a source thread
+ *  take its primary project. Otherwise take its one non-default project
+ *  (`project_ids` excludes the personal project). Otherwise none, and the caller
+ *  falls back to the personal project. */
+export function pickPrefillProject(prefill: SessionCreatePrefill): string | null {
+  return prefill.primaryProjectId ?? prefill.projectIds[0] ?? null;
 }
 
 /**
@@ -93,19 +96,6 @@ export function keepEligibleIds(ids: string[], eligible: Array<{ id: string }>):
   return ids.filter((id) => set.has(id));
 }
 
-interface Expert {
-  id: string;
-  display_name: string;
-  description: string;
-  icon: string;
-  color: string;
-  tags: string[];
-  /** 'bundled' (disk) | 'user' | 'global' (DB). DB experts → expert_id. */
-  source?: string;
-  storage_kind?: 'bundled' | 'db';
-  expert_type?: string;
-}
-
 interface ExpertDetail extends Expert {
   workspace_preference?: {backend: "none" | "virtual" | "sandbox" | "vm"} | null;
   config: Record<string, unknown>;
@@ -117,13 +107,15 @@ interface ExpertDetail extends Expert {
 
 /**
  * Full-page session creation component.
- * Uses the shared AgentSettingsComponent in session mode (horizontal tabs).
+ * Uses the shared AgentSettingsComponent in session mode: the session block,
+ * then Expert / Workspace / Connectors.
  */
 @Component({
   selector: 'app-session-create',
   standalone: true,
   imports: [
     AgentSettingsComponent,
+    WorkspacePickerComponent,
     SidebarToggleComponent,
     TranslocoPipe,
     AppButtonComponent,
@@ -131,7 +123,7 @@ interface ExpertDetail extends Expert {
     AppChipComponent,
     AppIconComponent,
     AppFormFieldComponent,
-    AppSwitchComponent,
+    ExpertPickerComponent,
   ],
   template: `
     <div class="session-create-page">
@@ -144,96 +136,10 @@ interface ExpertDetail extends Expert {
       </div>
 
       <div class="form-container">
-        <!-- Title -->
-        <app-form-field [label]="'sessions.create.titleLabel' | transloco">
-          <app-input
-            [(value)]="title"
-            [placeholder]="'sessions.create.titlePlaceholder' | transloco"
-            [disabled]="creating()"
-          />
-        </app-form-field>
-
-        <!-- Projects (multi-select chips) -->
-        @if (projects().length > 0) {
-          <app-form-field
-            [label]="'sessions.create.projectsLabel' | transloco"
-            [hint]="'sessions.create.projectsHint' | transloco"
-            [error]="archivedSelected() ? ('sessions.create.projectArchivedWarning' | transloco) : ''"
-          >
-            <div class="project-chips">
-              @for (project of projects(); track project.id) {
-                <app-chip
-                  [selected]="selectedProjectIds().has(project.id)"
-                  [disabled]="creating()"
-                  [ariaLabel]="project.description || project.name"
-                  (clicked)="toggleProject(project.id)"
-                >{{ project.name }}@if (project.status === 'archived') { {{ 'sessions.create.projectArchived' | transloco }}}</app-chip>
-              }
-            </div>
-          </app-form-field>
-        }
-
-        <!-- Protected cloud toggle: only for non-default Nextcloud projects,
-             gated on the deployment feature flag (Slice C). -->
-        @if (protectedCloudVisible()) {
-          <label class="protected-cloud-toggle">
-            <input type="checkbox" [checked]="protectedCloud()"
-                   [disabled]="creating()"
-                   (change)="protectedCloud.set($any($event.target).checked)" />
-            {{ 'sessions.create.protectedCloud' | transloco }}
-          </label>
-          <span class="field-hint">{{ 'sessions.create.protectedCloudHint' | transloco }}</span>
-        }
-
-        <!-- Expert selector: session experts by default (expert_type || tags);
-             "Show all experts" lists every role — the server accepts a
-             cross-role pick and resolves it on the session overlay. -->
-        <app-form-field [label]="'sessions.create.expertLabel' | transloco">
-          <app-switch formFieldAction size="sm" [checked]="showAllExperts()" [disabled]="creating()" (changed)="setShowAllExperts($event)">
-            {{ 'experts.showAll' | transloco }}
-          </app-switch>
-          @if (loadingExperts()) {
-            <div class="loading-hint">{{ 'sessions.create.expertLoading' | transloco }}</div>
-          } @else if (experts().length > 0) {
-            <div class="expert-grid">
-              @for (expert of experts(); track expert.id) {
-                <button
-                  type="button"
-                  class="expert-card"
-                  [class.selected]="selectedExpert()?.id === expert.id"
-                  [style.--expert-color]="expert.color"
-                  (click)="toggleExpert(expert)"
-                  [disabled]="creating()"
-                >
-                  @if (selectedExpert()?.id === expert.id) {
-                    <app-icon size="lg" class="expert-check">check_circle</app-icon>
-                  }
-                  <app-icon size="inherit" class="expert-icon" [style.color]="expert.color">{{ expert.icon }}</app-icon>
-                  <span class="expert-name">{{ expert.display_name }}</span>
-                  <span class="expert-desc">{{ expert.description }}</span>
-                  @if (expert.expert_type && expert.expert_type !== 'session') {
-                    <span class="expert-role">{{ expert.expert_type }}</span>
-                  }
-                </button>
-              }
-            </div>
-          }
-          @if (selectedExpert()) {
-            <span class="field-hint">
-              {{ 'sessions.create.expertSelectedPrefix' | transloco }} {{ selectedExpert()!.display_name }}
-              @if (selectedExpertSource()) {
-                · {{ ('settings.expertDefaults.source.' + selectedExpertSource()) | transloco }}
-              }
-            </span>
-          }
-        </app-form-field>
-
-        <!-- Agent Settings (horizontal tabs: Settings / Advanced) -->
-        @if (expertDetail()?.workspace_preference?.backend; as preference) {
-          <p class="field-hint">{{ 'agentSettings.execution.workspaceRecommendation' | transloco:{tier: preference} }}</p>
-        }
         <app-agent-settings
           mode="session"
+          [workspacePicker]="true"
+          [pickerBackend]="pickerBackend()"
           [config]="workspaceConfig()"
           [resolvedToolset]="toolPreview()"
           [readsResolvedToolset]="true"
@@ -248,9 +154,75 @@ interface ExpertDetail extends Expert {
           [initialDatasourceIds]="prefillDatasourceIds()"
           [loadingExpert]="loadingExpert()"
           [gatedCapabilities]="capabilities.grants() ?? null"
-          (change)="loadToolPreview()"
+          [expertName]="selectedExpert()?.display_name ?? ''"
+          [expertSource]="selectedExpertSource()"
+          (change)="onSettingsChange()"
           (retryDatasources)="loadDatasourcesList()"
-        />
+        >
+          <div settingsTop class="session-fields">
+            <!-- Title -->
+            <app-form-field [label]="'sessions.create.titleLabel' | transloco">
+              <app-input
+                [(value)]="title"
+                [placeholder]="'sessions.create.titlePlaceholder' | transloco"
+                [disabled]="creating()"
+              />
+            </app-form-field>
+
+            <!-- Projects (single choice; single_project_sessions.md) -->
+            @if (projects().length > 0) {
+              <app-form-field
+                [label]="'sessions.create.projectsLabel' | transloco"
+                [hint]="'sessions.create.projectsHint' | transloco"
+                [error]="archivedSelected() ? ('sessions.create.projectArchivedWarning' | transloco) : ''"
+              >
+                <div class="project-chips">
+                  <app-chip [selected]="selectedProjectIds().size === 0" [disabled]="creating()" (clicked)="selectProject(null)">
+                    {{ 'sessions.create.noProject' | transloco }}
+                  </app-chip>
+                  @for (project of projects(); track project.id) {
+                    <app-chip
+                      [selected]="selectedProjectIds().has(project.id)"
+                      [disabled]="creating()"
+                      [ariaLabel]="project.description || project.name"
+                      (clicked)="selectProject(project.id)"
+                    >{{ project.name }}@if (project.status === 'archived') { {{ 'sessions.create.projectArchived' | transloco }}}</app-chip>
+                  }
+                </div>
+              </app-form-field>
+            }
+          </div>
+
+          <!-- Expert templates: session experts by default (expert_type || tags);
+               "Show all experts" lists every role — the server accepts a
+               cross-role pick and resolves it on the session overlay. -->
+          <app-expert-picker
+            expertPicker
+            hideTag="session"
+            [experts]="experts()"
+            [selectedId]="selectedExpert()?.id ?? null"
+            [loading]="loadingExperts()"
+            [disabled]="creating()"
+            [showAll]="showAllExperts()"
+            [defaultId]="effectiveDefaultExpertId()"
+            [defaultSource]="defaultExpertSource()"
+            (picked)="toggleExpert($event)"
+            (showAllChange)="setShowAllExperts($event)"
+          />
+
+          <app-workspace-picker
+            workspacePicker
+            role="session"
+            labelKey="agentSettings.workspacePicker.templateLabel"
+            [projectId]="selectedProjectId()"
+            [preview]="toolPreview()?.workspace ?? null"
+            [recommendation]="expertDetail()?.workspace_preference?.backend ?? null"
+            [recommendedBy]="selectedExpert()?.display_name ?? ''"
+            [disabled]="creating()"
+            [choice]="workspaceChoice()"
+            (choiceChange)="onWorkspaceChoice($event)"
+          />
+        </app-agent-settings>
 
         <!-- A rejected config is correctable, so the error lands here and the
              form keeps every selection instead of unmounting into the chat
@@ -262,15 +234,25 @@ interface ExpertDetail extends Expert {
           </div>
         }
 
+        @if (manifestOpen()) {
+          <section class="manifest-view" [attr.aria-label]="'agentSettings.manifest.title' | transloco">
+            <span class="manifest-title">{{ 'agentSettings.manifest.sessionTitle' | transloco }}</span>
+            <pre class="manifest-yaml">{{ manifestText() }}</pre>
+          </section>
+        }
+
         <!-- Footer -->
         <div class="form-actions">
+          <app-button variant="ghost" class="manifest-toggle" (clicked)="toggleManifest()">
+            {{ (manifestOpen() ? 'agentSettings.manifest.hide' : 'agentSettings.manifest.show') | transloco }}
+          </app-button>
           <app-button variant="secondary" (clicked)="cancel()" [disabled]="creating()">
             {{ 'sessions.create.cancel' | transloco }}
           </app-button>
           <app-button
             variant="primary"
             [loading]="creating()"
-            [disabled]="loadingDatasources() || datasourceLoadError() || loadingExpert() || loadingWorkspacePreview()"
+            [disabled]="loadingDatasources() || datasourceLoadError() || loadingExpert() || loadingWorkspacePreview() || !vmSizingValid() || !delegationCapValid()"
             (clicked)="createSession()"
           >
             {{ creating() ? ('sessions.create.creating' | transloco) : ('sessions.create.createSession' | transloco) }}
@@ -313,7 +295,7 @@ interface ExpertDetail extends Expert {
       flex-direction: column;
       gap: 20px;
       padding: 20px;
-      max-width: var(--content-max-width);
+      max-width: 52rem;
       width: 100%;
       margin: 0 auto;
     }
@@ -322,6 +304,11 @@ interface ExpertDetail extends Expert {
        under it. The gap above gives every section consistent separation. */
     app-agent-settings {
       display: block;
+    }
+    .session-fields {
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
     }
     .create-error {
       display: flex;
@@ -347,81 +334,32 @@ interface ExpertDetail extends Expert {
       flex-wrap: wrap;
       gap: 6px;
     }
-    .protected-cloud-toggle {
-      display: flex;
-      align-items: center;
-      gap: 8px;
-      font-size: 13px;
-      color: var(--text-primary, var(--text-primary));
-      cursor: pointer;
-    }
-    .loading-hint {
-      font-size: 12px;
-      color: var(--text-muted);
-      padding: 8px 0;
-    }
-    .expert-grid {
-      display: grid;
-      grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
-      gap: 10px;
-    }
-    .expert-role {
-      font-size: 10px;
-      padding: 1px 6px;
-      border-radius: var(--radius-tag);
-      background: color-mix(in srgb, var(--accent-color) 8%, transparent);
-      color: var(--text-secondary);
-    }
-    .expert-card {
-      position: relative;
+    .manifest-view {
       display: flex;
       flex-direction: column;
-      align-items: flex-start;
       gap: 6px;
-      padding: 14px;
-      border: 1px solid var(--border-color, var(--surface-1));
+      padding: 12px 14px;
       border-radius: var(--radius-surface);
-      background: var(--surface-0, var(--surface-0));
-      cursor: pointer;
-      text-align: left;
-      transition: all 0.15s;
-      font-family: inherit;
-      color: var(--text-primary, var(--text-primary));
+      background: var(--surface-0);
+      border: 1px solid var(--border-hairline);
     }
-    .expert-card:hover:not(:disabled) {
-      border-color: var(--expert-color, var(--accent-color));
-      background: color-mix(in srgb, var(--accent-color) 20%, transparent);
-    }
-    .expert-card.selected {
-      border-color: var(--expert-color, var(--accent-color));
-      background: color-mix(in srgb, var(--accent-color) 20%, transparent);
-      box-shadow: 0 0 0 1px var(--expert-color, var(--accent-color));
-    }
-    .expert-card:disabled {
-      opacity: 0.6;
-      cursor: not-allowed;
-    }
-    .expert-check {
-      position: absolute;
-      top: 8px;
-      right: 8px;
-      color: var(--expert-color, var(--accent-color));
-    }
-    .expert-icon {
-      font-size: 28px;
-    }
-    .expert-name {
-      font-size: 13px;
+    .manifest-title {
+      font-size: 12px;
       font-weight: 600;
+      color: var(--text-secondary);
     }
-    .expert-desc {
-      font-size: 11px;
-      color: var(--text-muted);
-      line-height: 1.4;
-      display: -webkit-box;
-      -webkit-line-clamp: 2;
-      -webkit-box-orient: vertical;
-      overflow: hidden;
+    .manifest-yaml {
+      margin: 0;
+      max-height: 28rem;
+      overflow: auto;
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 12px;
+      line-height: 1.55;
+      color: var(--text-primary);
+      white-space: pre;
+    }
+    .manifest-toggle {
+      margin-right: auto;
     }
     .form-actions {
       display: flex;
@@ -439,10 +377,6 @@ interface ExpertDetail extends Expert {
 
       .page-header {
         padding: 8px 12px;
-      }
-
-      .expert-grid {
-        grid-template-columns: 1fr;
       }
 
       .form-actions {
@@ -478,6 +412,14 @@ export class SessionCreateComponent implements OnInit {
   readonly createError = signal<string | null>(null);
   readonly projects = signal<Project[]>([]);
   readonly selectedProjectIds = signal<Set<string>>(new Set());
+  readonly selectedProjectId = computed(() => [...this.selectedProjectIds()][0] ?? null);
+  readonly workspaceChoice = signal<WorkspaceChoice>({kind: 'default'});
+  readonly pickerBackend = computed(() => choiceBackend(this.workspaceChoice(), this.toolPreview()?.workspace));
+
+  onWorkspaceChoice(choice: WorkspaceChoice): void {
+    this.workspaceChoice.set(choice);
+    this.loadToolPreview();
+  }
   readonly selectedProjects = computed(() =>
     this.projects().filter(p => this.selectedProjectIds().has(p.id)),
   );
@@ -486,16 +428,29 @@ export class SessionCreateComponent implements OnInit {
   readonly archivedSelected = computed(() =>
     this.selectedProjects().some(p => p.status === 'archived'),
   );
-  readonly protectedCloud = signal(false);
-  readonly protectedCloudVisible = computed(() =>
-    protectedCloudToggleVisible(this.capabilities.protectedCloudAvailable(), this.selectedProjects()),
-  );
+  /** The workspace tier the eligible list was last asked for: a cloud
+   *  folder's levels depend on it (protected is the container tier's). */
+  private eligibleBackendRequested: string | null | undefined = undefined;
+  /** The tier the picked workspace runs on, as the eligible list names it. */
+  readonly eligibleBackend = computed(() => {
+    const backend = this.pickerBackend();
+    return backend && ELIGIBLE_BACKENDS.has(backend) ? backend : null;
+  });
   readonly experts = signal<Expert[]>([]);
   /** "Show all experts": drop the session role filter (U1 — every expert stays
    *  usable in every role; the picker's role is pre-selected, not enforced). */
   readonly showAllExperts = signal(false);
   readonly selectedExpert = signal<Expert | null>(null);
-  private readonly effectiveDefaultExpertId = signal<string | null>(null);
+  /** The selected Expert's authored content — what a changed template's
+   *  inline copy is built from. Null while loading, or when it cannot be read
+   *  (the form then sends selector + overrides, as before). */
+  readonly expertTemplate = signal<ExpertTemplateSource | null>(null);
+  readonly manifestOpen = signal(false);
+  readonly manifestText = signal('');
+  readonly effectiveDefaultExpertId = signal<string | null>(null);
+  /** Where the effective default came from — labels its card. Unlike
+   *  `selectedExpertSource` it does not flip to `explicit` on a pick. */
+  readonly defaultExpertSource = signal<'project' | 'user' | 'application' | 'explicit' | null>(null);
   readonly selectedExpertSource = signal<'project' | 'user' | 'application' | 'explicit' | null>(null);
   private expertSelectionTouched = false;
   private defaultRequestSerial = 0;
@@ -563,6 +518,16 @@ export class SessionCreateComponent implements OnInit {
     effect(() => {
       const userId = this.userService.currentUserId();
       if (userId) this.loadProjects(userId);
+    });
+    // A connector's levels depend on the tier: re-read the eligible list when
+    // the picked workspace moves to another one (never before the first read).
+    effect(() => {
+      const backend = this.eligibleBackend();
+      untracked(() => {
+        if (this.eligibleBackendRequested !== undefined && backend !== this.eligibleBackendRequested) {
+          this.loadDatasourcesList();
+        }
+      });
     });
   }
 
@@ -669,30 +634,28 @@ export class SessionCreateComponent implements OnInit {
     if (!this.projectsLoaded) return; // this form's own project list still in flight
     const projects = this.projects();
     if (this.threadPrefill) {
-      const survivors = keepEligibleIds(this.threadPrefill.projectIds, projects);
-      if (survivors.length > 0) {
-        this.selectedProjectIds.set(new Set(survivors));
-        this.loadDatasourcesList();
-        this.loadEffectiveDefault();
-        this.loadToolPreview();
+      const wanted = pickPrefillProject(this.threadPrefill);
+      if (wanted) {
+        const survivors = keepEligibleIds([wanted], projects);
+        if (survivors.length > 0) {
+          this.selectedProjectIds.set(new Set(survivors));
+          this.loadDatasourcesList();
+          this.loadEffectiveDefault();
+          this.loadToolPreview();
+        }
+        // A project the source thread had but this account can't see any more is dropped, not
+        // replaced by the personal project, as before. A merely archived one is kept.
+        this.resolveArchivedPrefillProjects(survivors.length ? [] : [wanted]);
+        return;
       }
-      // else: the source thread had no project, or none it had are still
-      // accessible here — leave unselected. Faithful to what actually
-      // survived on the source thread, rather than substituting the
-      // unrelated account default.
-      //
-      // "Not in the list" now has one benign cause — merely archived — which
-      // is kept rather than dropped.
-      this.resolveArchivedPrefillProjects(
-        this.threadPrefill.projectIds.filter((id) => !survivors.includes(id)),
-      );
-      return;
+      // The source thread had no project at all: fall through to the personal project.
     }
     const defaultProject = projects.find(p => p.is_default);
     if (defaultProject) {
       this.selectedProjectIds.set(new Set([defaultProject.id]));
       // Refresh eligible datasources now that a project is selected.
       this.loadDatasourcesList();
+      this.loadToolPreview();
     }
   }
 
@@ -768,6 +731,7 @@ export class SessionCreateComponent implements OnInit {
         if (serial !== this.defaultRequestSerial || this.expertSelectionTouched) return;
         this.effectiveDefaultExpertId.set(response?.defaults?.session?.effective?.id ?? null);
         this.selectedExpertSource.set(response?.defaults?.session?.source ?? null);
+        this.defaultExpertSource.set(response?.defaults?.session?.source ?? null);
         this.applyEffectiveDefault();
       },
     });
@@ -845,12 +809,17 @@ export class SessionCreateComponent implements OnInit {
     this.loadingDatasources.set(true);
     this.datasourceLoadError.set(false);
     // The server applies all-project scope matching and computes owner-specific
-    // defaults for this exact session context.
-    const qs = Array.from(this.selectedProjectIds())
-      .map(id => `project_id=${encodeURIComponent(id)}`)
-      .join('&');
-    const url = `${environment.apiUrl}/datasources/eligible${qs ? '?' + qs : ''}`;
-    this.http.get<EligibleDatasource[]>(url).subscribe({
+    // defaults for this exact session context, keeping only what a session
+    // can attach (a project's folder checkout is for jobs).
+    let params = new HttpParams();
+    for (const id of this.selectedProjectIds()) params = params.append('project_id', id);
+    params = params.set('execution', 'session');
+    // The levels a cloud folder offers on the picked tier.
+    const backend = this.eligibleBackend();
+    this.eligibleBackendRequested = backend;
+    if (backend) params = params.set('workspace_backend', backend);
+    const url = `${environment.apiUrl}/datasources/eligible`;
+    this.http.get<EligibleDatasource[]>(url, {params}).subscribe({
       next: (ds) => {
         if (serial !== this.datasourceRequestSerial) return;
         this.datasources.set(ds);
@@ -866,19 +835,12 @@ export class SessionCreateComponent implements OnInit {
     });
   }
 
-  toggleProject(id: string): void {
+  selectProject(id: string | null): void {
     this.projectSelectionTouched = true;
-    this.selectedProjectIds.update(current => {
-      const next = new Set(current);
-      if (next.has(id)) next.delete(id);
-      else next.add(id);
-      return next;
-    });
-    // Refresh eligible datasources for the new project selection.
+    this.selectedProjectIds.set(id ? new Set([id]) : new Set());
     this.loadDatasourcesList();
     this.loadEffectiveDefault();
-    // The project layer can override the expert's tools, so the prediction
-    // moves with the selection.
+    // The project layer can override the expert's tools and workspace, so the prediction moves with the selection.
     this.loadToolPreview();
   }
 
@@ -893,6 +855,11 @@ export class SessionCreateComponent implements OnInit {
   private fetchExpertDetail(expertId: string): void {
     const serial = ++this.expertDetailSerial;
     this.expertDetail.set(null);
+    this.expertTemplate.set(null);
+    const selected = this.selectedExpert();
+    this.api.getExpertTemplate(selected?.id === expertId ? selected : {id: expertId}).subscribe((template) => {
+      if (serial === this.expertDetailSerial) this.expertTemplate.set(template);
+    });
     this.loadingExpert.set(true);
     this.http.get<ExpertDetail>(
       `${environment.apiUrl}/experts/${expertId}?account_defaults=true&role=session`,
@@ -952,17 +919,16 @@ export class SessionCreateComponent implements OnInit {
     const serial = ++this.toolPreviewSerial;
     this.loadingWorkspacePreview.set(true);
     const expert = this.selectedExpert();
-    const projectIds = Array.from(this.selectedProjectIds());
     // Routed EXACTLY as createSession routes it. A preview that resolved a
     // different expert layer from the create it previews would be this
     // series' defect in the surface built to prevent it.
     const {configName, expertId} = this.expertRouting(expert);
     this.api.previewToolGroups({
       config_override: this.agentSettings?.getOverrides() ?? {},
-      workspace_preference: this.expertDetail()?.workspace_preference?.backend ?? null,
+      ...choiceRequestFields(this.workspaceChoice()),
       config_name: configName,
       expert_id: expertId ?? null,
-      project_id: projectIds.length === 1 ? projectIds[0] : null,
+      project_id: this.selectedProjectId(),
     }).subscribe((preview) => {
       if (serial !== this.toolPreviewSerial) return;
       this.loadingWorkspacePreview.set(false);
@@ -993,54 +959,20 @@ export class SessionCreateComponent implements OnInit {
     };
   }
 
+  vmSizingValid(): boolean {
+    return this.agentSettings?.vmSizingValid() ?? true;
+  }
+
+  /** The session delegation cap field holds nothing the orchestrator refuses. */
+  delegationCapValid(): boolean {
+    return this.agentSettings?.delegationCapValid() ?? true;
+  }
+
   async createSession(): Promise<void> {
-    if (this.loadingDatasources() || this.datasourceLoadError() || this.loadingExpert() || this.loadingWorkspacePreview()) return;
+    if (this.loadingDatasources() || this.datasourceLoadError() || this.loadingExpert() || this.loadingWorkspacePreview() || !this.vmSizingValid() || !this.delegationCapValid()) return;
     this.creating.set(true);
 
-    const expert = this.selectedExpert();
-    const {configName, expertId} = this.expertRouting(expert);
-    const projectIds = Array.from(this.selectedProjectIds());
-
-    // Build config_override from settings component
-    const workspaceFields = workspaceCreationFields(this.agentSettings?.getOverrides() ?? {}, this.toolPreview()?.workspace);
-    const configOverride = workspaceFields.config_override;
-
-    // Extract permission_mode and model from overrides (session-specific handling).
-    // Only send permission_mode when the user actually picked a per-session
-    // override; omitting it lets the backend fall back to the user's saved
-    // default, then the config default. Sending a hardcoded 'supervised' here
-    // would clobber that saved default and forced every session to Supervised.
-    const permissionMode = (configOverride['interactive'] as any)?.['permission_mode'] ?? null;
-    const model = (configOverride['llm'] as any)?.['model'] ?? null;
-
-    const body: Record<string, unknown> = {
-      title: this.title || 'Untitled Session',
-      config_name: configName,
-      expert_id: expertId,
-      project_ids: projectIds.length > 0 ? projectIds : undefined,
-    };
-
-    if (permissionMode) body['permission_mode'] = permissionMode;
-    if (model) body['model'] = model;
-
-    // Include full config_override if there are non-model overrides
-    const hasNonTrivialOverrides = Object.keys(configOverride).some(
-      k => k !== 'interactive' && k !== 'llm'
-    ) || (configOverride['llm'] && Object.keys(configOverride['llm'] as any).some(k => k !== 'model'));
-    if (hasNonTrivialOverrides) {
-      body['config_override'] = configOverride;
-    }
-
-    if ("workspace" in workspaceFields) body["workspace"] = workspaceFields.workspace;
-
-    // Datasource IDs
-    const dsIds = this.agentSettings?.getSelectedDatasourceIds() ?? [];
-    // Empty is an explicit opt-out; omission means "apply server defaults".
-    body['datasource_ids'] = dsIds;
-
-    if (this.protectedCloud() && this.protectedCloudVisible()) {
-      body['protected_cloud'] = true;
-    }
+    const body = this.buildBody();
 
     // Create BEFORE navigating. The form used to hand the body to the chat
     // route and unmount, so a rejected config destroyed every selection and
@@ -1064,6 +996,112 @@ export class SessionCreateComponent implements OnInit {
       );
       this.creating.set(false);
     }
+  }
+
+  /**
+   * The request Start sends: the Expert (selector, or a complete inline copy
+   * when the form changed the template), the workspace, the connectors, and
+   * the permission mode beside them — no Expert overrides on a baseline
+   * (creation_ui_expert_workspace_connectors.md D2).
+   *
+   * The session path carries only a few `config_override` sections at create
+   * (llm, tools, delegation, interactive.permission_mode, workspace), so a
+   * changed template's whole Expert — including Expert → More and the idle
+   * timeout, which used to be dropped as `ignored_config_keys` — rides the
+   * inline copy instead.
+   */
+  buildBody(): Record<string, unknown> {
+    const settings = this.agentSettings;
+    const expert = this.selectedExpert();
+    const template = this.expertTemplate();
+    const projectIds = Array.from(this.selectedProjectIds());
+    const body: Record<string, unknown> = {
+      title: this.title || 'Untitled Session',
+      project_ids: projectIds.length > 0 ? projectIds : undefined,
+    };
+
+    const task = settings?.getTaskOverrides() ?? {};
+    const idleChanged = (task['interactive'] as Record<string, unknown> | undefined)?.['idle_timeout_minutes'] !== undefined;
+    const inline = !!(expert && template && (settings?.hasExpertChanges() || idleChanged));
+
+    let configOverride: Record<string, unknown>;
+    let workspaceFields: ReturnType<typeof workspaceCreationFields>;
+    if (inline) {
+      const expertConfig = settings!.getExpertOverrides();
+      const idle = (task['interactive'] as Record<string, unknown> | undefined)?.['idle_timeout_minutes'];
+      if (idle !== undefined) {
+        expertConfig['interactive'] = {...(expertConfig['interactive'] as Record<string, unknown> ?? {}), idle_timeout_minutes: idle};
+      }
+      body['expert'] = inlineExpertSelection(template!, expertConfig, null);
+      body['expert_based_on'] = expert!.id;
+      workspaceFields = workspaceCreationFields(task, this.workspaceChoice());
+      configOverride = workspaceFields.config_override;
+    } else {
+      const {configName, expertId} = this.expertRouting(expert);
+      body['config_name'] = configName;
+      body['expert_id'] = expertId;
+      // An untouched template sends only its session-level settings; the
+      // legacy override path stays where no inline copy can be built.
+      const overrides = expert && template ? task : (settings?.getOverrides() ?? {});
+      workspaceFields = workspaceCreationFields(overrides, this.workspaceChoice());
+      configOverride = workspaceFields.config_override;
+      const model = (configOverride['llm'] as any)?.['model'] ?? null;
+      if (model) body['model'] = model;
+      // Include full config_override if there are non-model overrides
+      const hasNonTrivialOverrides = Object.keys(configOverride).some(
+        k => k !== 'interactive' && k !== 'llm'
+      ) || (configOverride['llm'] && Object.keys(configOverride['llm'] as any).some(k => k !== 'model'));
+      if (hasNonTrivialOverrides) body['config_override'] = configOverride;
+    }
+
+    // Only send permission_mode when the user actually picked a per-session
+    // override; omitting it lets the backend fall back to the user's saved
+    // default, then the config default. Sending a hardcoded 'supervised' here
+    // would clobber that saved default and forced every session to Supervised.
+    const permissionMode = (configOverride['interactive'] as any)?.['permission_mode'] ?? null;
+    if (permissionMode) body['permission_mode'] = permissionMode;
+
+    if ("workspace" in workspaceFields) body["workspace"] = workspaceFields.workspace;
+
+    // Empty is an explicit opt-out; omission means "apply server defaults".
+    body['datasource_ids'] = settings?.getSelectedDatasourceIds() ?? [];
+    // The level chosen for each selected cloud folder; one at protected
+    // makes the session protected. Unchosen ones get their project default.
+    const access = settings?.getSelectedDatasourceAccess() ?? {};
+    if (Object.keys(access).length) body['datasource_access'] = access;
+    return body;
+  }
+
+  onSettingsChange(): void {
+    this.loadToolPreview();
+    this.refreshManifest();
+  }
+
+  toggleManifest(): void {
+    this.manifestOpen.set(!this.manifestOpen());
+    this.refreshManifest();
+  }
+
+  /** The read-only manifest view of exactly what Start would send. */
+  refreshManifest(): void {
+    if (!this.manifestOpen()) return;
+    const body = this.buildBody();
+    const selected = new Set((body['datasource_ids'] as string[]) ?? []);
+    const access = (body['datasource_access'] as Record<string, string> | undefined) ?? {};
+    const settings: Record<string, unknown> = {};
+    if (body['permission_mode']) settings['permission_mode'] = body['permission_mode'];
+    if (body['model']) settings['model'] = body['model'];
+    if (body['config_override']) Object.assign(settings, body['config_override']);
+    const doc = executionManifest({
+      kind: 'session',
+      expert: (body['expert'] as never) ?? (body['expert_id'] as string) ?? (body['config_name'] as string) ?? null,
+      workspace: body['workspace'],
+      connectors: this.datasources()
+        .filter((d) => selected.has(d.id))
+        .map((d) => ({id: d.id, name: d.name, access: access[d.id] ?? null})),
+      settings,
+    });
+    this.manifestText.set(toYaml(doc));
   }
 
   cancel(): void {

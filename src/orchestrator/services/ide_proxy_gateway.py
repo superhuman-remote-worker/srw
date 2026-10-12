@@ -50,6 +50,7 @@ _IDE_PROXY_REQUEST_ALLOW_HEADERS = frozenset(
         "accept",
         "accept-language",
         "cache-control",
+        "content-type",
         "if-match",
         "if-modified-since",
         "if-none-match",
@@ -330,6 +331,7 @@ async def _ide_ws_runtime_is_current(
         and current.host == target.host
         and current.port == target.port
         and current.backend == target.backend
+        and (target.backend != "vm" or current.identity == target.identity)
     )
 
 

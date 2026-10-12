@@ -10,11 +10,12 @@ nothing else in the suite would have caught:
 2. The single-flight registry is one object per application build, and its
    eviction is identity-checked — a newer schedule for the same thread must
    survive the previous task's completion callback.
-3. The moved bodies still resolve their collaborators through ``main`` at call
-   time, so an existing ``patch("orchestrator.main._x")`` reaches them. This is
-   the failure §P3 of the batch note describes: a wrapper in ``main`` does not
-   intercept a call made *inside* a service, so a patch can silently do nothing
-   while the test still passes.
+3. The moved bodies still resolve their collaborators through the owner at
+   call time, so a patch of the owning service function reaches them. This is
+   the failure §P3 of the batch note describes: a wrapper does not intercept a
+   call made *inside* a service, so a patch can silently do nothing while the
+   test still passes. (R1.B12 removed ``main``'s wrappers; the composition now
+   binds the owner itself with ``bound(owner, deps_factory, resources)``.)
 """
 
 from __future__ import annotations
@@ -29,6 +30,8 @@ import pytest
 import orchestrator.main as orch_main
 from orchestrator.routers import agent_thread_workspace
 from orchestrator.services import stateless_workspace_scheduler
+from orchestrator.application import preparation as preparation_composition
+from orchestrator.services import thread_mount_rows as thread_mount_rows_module
 
 _THREAD_ID = "a1111111-1111-1111-1111-111111111111"
 
@@ -163,32 +166,48 @@ async def test_the_ensure_registry_is_one_object_and_evicts_by_identity():
 def test_main_builds_exactly_one_ensure_registry():
     """The registry is shared state: rebuilding it per call would not
     single-flight anything."""
-    first = orch_main._stateless_workspace_schedule_dependencies().registry
-    second = orch_main._stateless_workspace_schedule_dependencies().registry
-    assert first is second is orch_main._stateless_workspace_ensure_registry
+    first = preparation_composition.stateless_workspace_schedule_dependencies(
+        orch_main.app.state.resources
+    ).registry
+    second = preparation_composition.stateless_workspace_schedule_dependencies(
+        orch_main.app.state.resources
+    ).registry
+    assert (
+        first
+        is second
+        is orch_main.app.state.resources.stateless_workspace_ensure_registry
+    )
 
 
 @pytest.mark.asyncio
-async def test_a_main_patch_still_reaches_the_moved_body(monkeypatch):
-    """`patch("orchestrator.main._thread_project_ids")` must steer the service.
+async def test_an_owner_patch_still_reaches_the_moved_body(monkeypatch):
+    """A patch of ``thread_mount_rows.thread_project_ids`` must steer the service.
 
-    The dependency object is rebuilt per call from ``main``'s namespace, which
-    is the only reason the existing suites that patch these names keep working
-    after the bodies moved. A factory that captured the collaborator at import
-    would leave every one of them green and inert.
+    The dependency object is rebuilt per call and binds the owner when the
+    factory runs, which is the only reason the suites that patch the owner
+    keep working after the bodies moved. A factory that captured the
+    collaborator at import would leave every one of them green and inert.
     """
     sentinel = ["11111111-1111-1111-1111-111111111111"]
-    calls: list[str] = []
+    calls: list[tuple[str, object]] = []
 
-    async def _stub(thread_id: str) -> list[str]:
-        calls.append(thread_id)
+    async def _stub(thread_id: str, *, dependencies: object) -> list[str]:
+        calls.append((thread_id, dependencies))
         return sentinel
 
-    monkeypatch.setattr(orch_main, "_thread_project_ids", _stub)
-    dependencies = orch_main._thread_workspace_delivery_dependencies()
-    assert dependencies.thread_project_ids is _stub
+    monkeypatch.setattr(thread_mount_rows_module, "thread_project_ids", _stub)
+    resources = orch_main.app.state.resources
+    dependencies = preparation_composition.thread_workspace_delivery_dependencies(
+        resources
+    )
+    assert dependencies.thread_project_ids.__wrapped__ is _stub
     assert await dependencies.thread_project_ids(_THREAD_ID) is sentinel
-    assert calls == [_THREAD_ID]
+    assert [thread_id for thread_id, _ in calls] == [_THREAD_ID]
+    mount_dependencies = calls[0][1]
+    assert isinstance(
+        mount_dependencies, thread_mount_rows_module.ThreadMountDependencies
+    )
+    assert mount_dependencies.store is resources.postgres_db
 
-    attach = orch_main._session_attach_payload_dependencies()
-    assert attach.thread_project_ids is _stub
+    attach = preparation_composition.session_attach_payload_dependencies(resources)
+    assert attach.thread_project_ids.__wrapped__ is _stub

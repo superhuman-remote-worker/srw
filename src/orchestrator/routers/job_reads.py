@@ -8,6 +8,7 @@ startup. Main retains forwarding functions only for existing direct callers.
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Awaitable, Callable
+from uuid import UUID
 
 from fastapi import APIRouter, Depends, Query, Request
 
@@ -15,6 +16,7 @@ from orchestrator.schemas.job_list import JOB_LIST_RESPONSES
 from orchestrator.security.access import require_job_access, require_project_member
 from orchestrator.security.auth import require_approved_user
 from orchestrator.services import job_queries, job_reads
+from orchestrator.services.vm_idle_public import read_vm_idle_states
 
 router = APIRouter()
 
@@ -120,7 +122,7 @@ async def list_jobs(
     query rather than concluding the job does not exist.
     """
     user = await dependencies.require_approved_user(request, dependencies.store)
-    return await job_queries.list_jobs(
+    result = await job_queries.list_jobs(
         user=user,
         dependencies=dependencies.queries,
         status=status,
@@ -135,6 +137,23 @@ async def list_jobs(
         offset=offset,
         include_total=include_total,
     )
+    states = await read_vm_idle_states(
+        dependencies.store,
+        owner_kind="job",
+        owner_ids=[str(job["id"]) for job in result["jobs"]],
+    )
+    for job in result["jobs"]:
+        job["workspace_lifecycle"] = states.get(str(job["id"]))
+    creations = await dependencies.store.container_workspace_creation_views(
+        "job", [str(job["id"]) for job in result["jobs"]]
+    )
+    for job in result["jobs"]:
+        job["workspace_creation"] = (
+            None
+            if job.get("status") in {"completed", "failed", "cancelled"}
+            else creations.get(UUID(str(job["id"])))
+        )
+    return result
 
 
 @router.get("/api/jobs/{job_id}")
@@ -146,9 +165,27 @@ async def get_job(
 ) -> dict[str, Any]:
     """Get a single job by ID."""
     _, job = await dependencies.require_job_access(request, dependencies.store, job_id)
-    return await job_reads.read_job(
+    result = await job_reads.read_job(
         job_id=job_id, authorized_job=job, dependencies=dependencies.reads
     )
+    if job.get("status") not in {"completed", "failed", "cancelled"}:
+        states = await read_vm_idle_states(
+            dependencies.store,
+            owner_kind="job",
+            owner_ids=[job_id],
+        )
+        result["workspace_lifecycle"] = states.get(job_id)
+    else:
+        result["workspace_lifecycle"] = None
+    creations = await dependencies.store.container_workspace_creation_views(
+        "job", [job_id]
+    )
+    result["workspace_creation"] = (
+        None
+        if job.get("status") in {"completed", "failed", "cancelled"}
+        else creations.get(UUID(job_id))
+    )
+    return result
 
 
 @router.get("/api/stats/jobs")

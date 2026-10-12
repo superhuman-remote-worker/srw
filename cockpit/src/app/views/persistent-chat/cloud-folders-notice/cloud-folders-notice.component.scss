@@ -1,0 +1,104 @@
+@use '../../../../styles/variables' as v;
+
+:host {
+  display: block;
+  flex-shrink: 0;
+}
+
+// Something the user asked for is missing, nothing is broken: the same
+// caution tint as the cloud review banner, without its accent rail.
+.cfn {
+  display: flex;
+  align-items: flex-start;
+  gap: v.$space-sm;
+  padding: v.$space-sm v.$space-md;
+  background: var(--warning-tint);
+  border-bottom: 1px solid var(--border-color);
+}
+
+.cfn__icon {
+  flex: 0 0 auto;
+  color: var(--warning);
+}
+
+// Every folder is bound: information, not a caution.
+.cfn--ok {
+  background: transparent;
+
+  .cfn__icon {
+    color: var(--text-muted);
+  }
+}
+
+.cfn__body {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.cfn__title {
+  margin: 0;
+  font-size: v.$font-size-sm;
+  font-weight: v.$font-weight-medium;
+  color: var(--text-primary);
+}
+
+.cfn__list {
+  margin: v.$space-xs 0 0;
+  padding-left: v.$space-md;
+  font-size: v.$font-size-sm;
+  color: var(--text-primary);
+  overflow-wrap: anywhere;
+}
+
+.cfn__name {
+  font-family: var(--font-mono, monospace);
+}
+
+.cfn__sep {
+  margin: 0 v.$space-xs;
+}
+
+.cfn__meta {
+  margin: v.$space-xs 0 0;
+  font-size: v.$font-size-sm;
+  color: var(--text-primary);
+}
+
+.cfn__folder--down {
+  color: var(--warning);
+}
+
+.cfn__label {
+  font-weight: v.$font-weight-medium;
+}
+
+.cfn__level {
+  margin-left: v.$space-xs;
+  padding: 0 v.$space-xs;
+  border-radius: var(--radius-tag);
+  background: var(--surface-1);
+  color: var(--text-secondary);
+  font-size: v.$font-size-xs;
+}
+
+.cfn__review {
+  margin-left: v.$space-sm;
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--accent-color);
+  font: inherit;
+  font-size: v.$font-size-sm;
+  font-weight: v.$font-weight-medium;
+  cursor: pointer;
+
+  &:hover {
+    text-decoration: underline;
+  }
+
+  &:focus-visible {
+    outline: none;
+    box-shadow: 0 0 0 2px var(--ring);
+    border-radius: var(--radius-tag);
+  }
+}

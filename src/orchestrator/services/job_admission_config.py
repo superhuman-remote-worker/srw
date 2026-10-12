@@ -10,10 +10,11 @@ HTTP exceptions remain the compatibility contract for this extraction.
 from dataclasses import dataclass
 import json
 import logging
-from typing import Any, Awaitable, Callable, Protocol
+from typing import Any, Awaitable, Callable, Literal, Protocol
 
 from fastapi import HTTPException
 
+from orchestrator.schemas.inline_expert import InlineExpertSelection
 from orchestrator.schemas.job_create import JobCreate
 from orchestrator.services.config_overrides import (
     deep_merge_dicts,
@@ -70,6 +71,19 @@ class ResolveWorkerExpert(Protocol):
     ) -> ExpertSelection: ...
 
 
+class PreviewExpertRefusals(Protocol):
+    """Why creation would refuse this bundled expert for this owner ([] = none)."""
+
+    async def __call__(
+        self,
+        *,
+        config_name: str,
+        owner_id: str | None,
+        project_id: str | None,
+        config_override: dict[str, Any] | None,
+    ) -> list[str]: ...
+
+
 @dataclass(frozen=True)
 class JobAdmissionConfigDependencies:
     store: JobConfigStore
@@ -78,6 +92,10 @@ class JobAdmissionConfigDependencies:
     experts_db_enabled: Callable[[], bool]
     user_experts_enabled: Callable[[], Awaitable[bool]]
     resolve_worker_expert: ResolveWorkerExpert
+    preview_expert_refusals: PreviewExpertRefusals
+    # The installed SRW harness image an inline expert's explicit image must
+    # equal: the one the execution snapshot records.
+    srw_image: Callable[[], str]
 
 
 @dataclass(frozen=True)
@@ -93,6 +111,19 @@ class JobAdmissionConfig:
     requested_workspace_backend: str | None
     root_creation: bool
     workspace_selection: dict[str, Any] | None = None
+    # Who chose this worker, read by the work-default stage that runs after
+    # the Officer stage (job_admission_work_expert): "caller" — named, or a
+    # child's inherited selector — is never displaced; "scope" is a project or
+    # personal default; "fallback" is the application default or bare base.
+    expert_source: Literal["caller", "scope", "fallback"] = "caller"
+    # config_override as it would be without the pre-selected default's
+    # project_experts overlay. Set only when that overlay was merged, so a
+    # work default that displaces the expert does not inherit its tuning.
+    unselected_config_override: dict[str, Any] | None = None
+    # A caller's complete inline Expert, validated, as the resolver row the
+    # execution snapshot freezes. It has no catalogue identity: expert_id is
+    # None and config_name is the worker base whenever this is set.
+    expert_row: dict[str, Any] | None = None
 
 
 async def prepare_job_admission_config(
@@ -135,6 +166,11 @@ async def prepare_job_admission_config(
     # children/specialists keep their explicit/inherited selector and never
     # silently acquire a user's current default.
     project = None
+    # An inline Expert is a complete definition the caller owns for this job;
+    # it is never layered over, or combined with, a catalogue selection.
+    inline_expert = (
+        job.expert.inline if isinstance(job.expert, InlineExpertSelection) else None
+    )
     # One catalogue, one selector: `expert` takes a bundled slug or a DB
     # expert UUID and resolves to the (base config, DB overlay) pair this
     # funnel persists. The deprecated aliases go through the same helper,
@@ -142,12 +178,32 @@ async def prepare_job_admission_config(
     # knowledge-base/knowledge/issues/experts_one_catalogue_two_selection_paths.md.
     try:
         expert_choice = resolve_expert_selection(
-            expert=job.expert,
+            expert=None if inline_expert is not None else job.expert,
             config_name=job.config_name,
             expert_id=job.expert_id,
         )
     except ExpertReferenceConflict as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    expert_row: dict[str, Any] | None = None
+    # Display-only provenance is server-recorded for inline experts only.
+    context.pop("expert_based_on", None)
+    if inline_expert is not None:
+        if expert_choice.kind != "default":
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "An inline expert cannot be combined with config_name or "
+                    "expert_id; select one expert source."
+                ),
+            )
+        from orchestrator.services.inline_expert import admit_inline_expert
+
+        expert_row = admit_inline_expert(
+            inline_expert, role="worker", trusted_image=dependencies.srw_image()
+        )
+        context["expert_selection"] = {"source": "inline"}
+        if job.expert_based_on:
+            context["expert_based_on"] = job.expert_based_on
     if expert_choice.kind == "bundled" and job.expert:
         # `expert` means "an entry from the catalogue", so a slug that is
         # not in it is a typo, not a deployment config. Refuse now: the
@@ -220,6 +276,18 @@ async def prepare_job_admission_config(
             # asyncpg may return JSONB as a string — parse it
             if isinstance(project_default_override, str):
                 project_default_override = json.loads(project_default_override)
+            if (
+                isinstance(project_default_override, dict)
+                and "workspace" in project_default_override
+            ):
+                # Slice A2b: the workspace defaults chain reads
+                # project_workspace_defaults for the Project layer; a legacy
+                # Project's stored backend no longer leaks through here.
+                project_default_override = {
+                    key: value
+                    for key, value in project_default_override.items()
+                    if key != "workspace"
+                }
 
     config_override = project_default_override
     resolved_expert_id = explicit_expert_id
@@ -228,7 +296,8 @@ async def prepare_job_admission_config(
     # Only actual worker children/specialists carry parent_job_id.
     root_creation = not job.parent_job_id
     should_resolve_default = (
-        root_creation
+        expert_row is None
+        and root_creation
         and bool(effective_user_id)
         and config_name == "worker_base"
         and dependencies.experts_db_enabled()
@@ -240,6 +309,7 @@ async def prepare_job_admission_config(
         and dependencies.experts_db_enabled()
     )
     selection = None
+    unselected_config_override: dict[str, Any] | None = None
     try:
         if should_resolve_default or should_validate_explicit:
             principal = scope.principal
@@ -259,6 +329,7 @@ async def prepare_job_admission_config(
             if selection.project_override and not (project or {}).get(
                 "manifest_composed"
             ):
+                unselected_config_override = dict(config_override or {})
                 config_override = deep_merge_dicts(
                     config_override or {}, selection.project_override
                 )
@@ -267,7 +338,8 @@ async def prepare_job_admission_config(
                 "expert_id": resolved_expert_id,
             }
         elif (
-            root_creation
+            expert_row is None
+            and root_creation
             and config_name == "worker_base"
             and project
             and project.get("default_config_name")
@@ -290,11 +362,22 @@ async def prepare_job_admission_config(
             "source": "bundled",
             "expert": expert_choice.reference,
         }
+    expert_source: Literal["caller", "scope", "fallback"] = "caller"
+    if root_creation and expert_choice.kind == "default" and expert_row is None:
+        if selection is not None:
+            expert_source = "fallback" if selection.source == "application" else "scope"
+        else:
+            # Only the legacy project slug above can have moved config_name.
+            expert_source = "fallback" if config_name == "worker_base" else "scope"
 
     if request_config_override:
         config_override = deep_merge_dicts(
             config_override or {}, request_config_override
         )
+        if unselected_config_override is not None:
+            unselected_config_override = deep_merge_dicts(
+                unselected_config_override, request_config_override
+            )
 
     workspace_selection = None
     workspace_supplied = "workspace" in job.model_fields_set
@@ -303,9 +386,9 @@ async def prepare_job_admission_config(
             422,
             "Child jobs inherit their parent workspace; select it on the root execution.",
         )
-    if root_creation and (
-        workspace_supplied or (project or {}).get("manifest_composed")
-    ):
+    # Every root Job with an owner resolves the workspace defaults chain; a
+    # supplied workspace without an owner still gets the 422 below.
+    if root_creation and (workspace_supplied or effective_user_id):
         from orchestrator.services.manifest_workspace_selection import (
             select_execution_workspace,
         )
@@ -329,6 +412,10 @@ async def prepare_job_admission_config(
         config_override = bind_execution_workspace(
             config_override or {}, workspace_config
         )
+        if unselected_config_override is not None:
+            unselected_config_override = bind_execution_workspace(
+                unselected_config_override, workspace_config
+            )
         if workspace_supplied:
             requested_workspace_backend = workspace_config["backend"]
 
@@ -342,4 +429,7 @@ async def prepare_job_admission_config(
         requested_workspace_backend=requested_workspace_backend,
         root_creation=root_creation,
         workspace_selection=workspace_selection,
+        expert_source=expert_source,
+        unselected_config_override=unselected_config_override,
+        expert_row=expert_row,
     )

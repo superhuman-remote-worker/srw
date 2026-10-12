@@ -1,0 +1,16 @@
+# Profile overlay for R3.2's live acceptance — the session client transport in
+# BOTH agent modes. Layered ON TOP of the session-attention stack, never
+# instead of it.
+#
+# One warm pool agent. Pool agents are provisioned for jobs and therefore run
+# the default dual mode; the session create/prepare/resume paths try an idle
+# pool agent first, so the first session attaches to this dual pod and is
+# served by dual_app's routes. The floor counts every managed agent pod, so
+# while that session holds the pod no replacement is warmed and the next
+# session gets a dedicated persistent-mode pod. The ceiling leaves room for
+# both sessions, a worker job and the pool agent's successor.
+agent:
+  pool:
+    minAgents: "1"
+    buffer: "0"
+    maxAgents: "4"

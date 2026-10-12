@@ -34,6 +34,7 @@ from __future__ import annotations
 import logging
 import os
 import re
+from collections.abc import Mapping
 from typing import Any, Awaitable, Callable, Literal
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 from uuid import UUID
@@ -41,10 +42,17 @@ from uuid import UUID
 from fastapi import HTTPException, Request
 
 from orchestrator.security.auth import require_approved_user
+from orchestrator.security.config_redaction import (  # noqa: F401 — re-exported
+    redact_config_override,
+    redact_public_config_override,
+    restore_hidden_config_values,
+    dropped_hidden_config_values,
+)
 from orchestrator.services.project_status import (
     PROJECT_ARCHIVED_DETAIL as PROJECT_ARCHIVED_DETAIL,
     project_is_archived as project_is_archived,
 )
+from shared.connectors.builtin import spec_for_row
 
 logger = logging.getLogger(__name__)
 
@@ -1021,8 +1029,21 @@ def redact_datasource(ds: dict[str, Any]) -> dict[str, Any]:
     if not ds:
         return ds
     out = dict(ds)
-    if ds.get("type") == "credentials":
-        out["env_var_names"] = sorted((ds.get("credentials") or {}).get("env_vars", {}))
+    # A slot whose key names the spec makes visible (the credentials
+    # connector's environment) shows them, never their values: only an
+    # object's keys are names; any other stored shape shows none.
+    spec = spec_for_row(ds)
+    credentials = ds.get("credentials")
+    for slot in spec.credential_slots if spec is not None else ():
+        if slot.names_field:
+            value = (
+                credentials.get(slot.name) if isinstance(credentials, Mapping) else None
+            )
+            out[slot.names_field] = (
+                sorted(str(name) for name in value)
+                if isinstance(value, Mapping)
+                else []
+            )
     out.pop("credentials", None)
     out.pop("connection_url_redacted", None)
     if "connection_url" in out:
@@ -1140,49 +1161,6 @@ def redact_repository(repo: dict[str, Any]) -> dict[str, Any]:
 def redact_repositories(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """List variant of :func:`redact_repository`."""
     return [redact_repository(row) for row in rows]
-
-
-# Key names (case-insensitive) whose VALUE is always a credential. The suffix
-# match covers the ``env_keys`` block (EMBEDDING_API_KEY, OPENROUTER_API_KEY,
-# VISION_API_KEY, WHISPER_API_KEY, TTS_API_KEY, CITATION_LLM_API_KEY, ...).
-_SECRET_KEY_NAMES = frozenset(
-    {"api_key", "password", "secret", "token", "private_key", "rclone_spec"}
-)
-_SECRET_KEY_SUFFIX = "_api_key"
-
-
-def _is_secret_key(key: str) -> bool:
-    k = key.lower()
-    return k in _SECRET_KEY_NAMES or k.endswith(_SECRET_KEY_SUFFIX)
-
-
-def redact_config_override(co: Any) -> Any:
-    """Return a deep copy of a ``config_override`` with credential fields removed.
-
-    Non-mutating and recursive (walks dicts and lists). Removes any key whose
-    name (case-insensitive) is one of api_key/password/secret/token/private_key/
-    rclone_spec, or ends with ``_api_key`` — i.e. ``llm.api_key``, phase overrides
-    ``llm.{strategic,tactical,summarization}.api_key``, ``auxiliary.api_key``,
-    every ``env_keys.*_API_KEY``, and ``workspace.mounts[].rclone_spec``.
-
-    Non-secret fields are preserved verbatim (``llm.model``/``provider``/
-    ``base_url``/``temperature``, ``env_keys.*_MODEL``/``*_BASE_URL``/``*_PROVIDER``,
-    ``workspace.backend``, ...).
-
-    Used at two boundaries:
-    - the user-facing GET endpoints (redact before returning), and
-    - persistence of ``threads.metadata.config_override`` (secrets are injected
-      in-flight only — see ``_inject_thread_dispatch_credentials`` in main.py).
-
-    Keep this pure: no DB access, no logging of values (it handles secrets).
-    """
-    if isinstance(co, dict):
-        return {
-            k: redact_config_override(v) for k, v in co.items() if not _is_secret_key(k)
-        }
-    if isinstance(co, list):
-        return [redact_config_override(v) for v in co]
-    return co
 
 
 async def user_can_access_datasource(
@@ -1394,7 +1372,8 @@ def apply_mcp_scope(
     # Legacy MCP rows carry exactly one scope string; PAT rows have a list
     # of action scopes (not the legacy 'user'/'all'/'project:<uuid>' shape).
     # Treat anything that doesn't look like a legacy MCP scope as a no-op
-    # here — PAT scopes are checked by the action-scope decorator, not by
+    # here — PAT action scopes are enforced per route when the token is
+    # resolved (security.token_scopes via auth._resolve_pat), not by
     # row-level visibility.
     scope = scopes[0]
     if scope in ("", "all", "user"):

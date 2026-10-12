@@ -1,0 +1,32 @@
+{
+  "date": "2026-10-07",
+  "slice": "Pinned workspace-upgrade offer fix (stateless upgrade design, decision 1)",
+  "commits": "adc04a315 (availability route), a8a23177d (agent offer), 6fbfba9d7 (handler default + refusal copy), 6f57da1a6 (cockpit), 52011ccec (docs)",
+  "stack": "local k3d (context k3d-srw, namespace srw), orchestrator srw-registry:5000/srw-orchestrator:tilt-923eaf3de1398e5d live-synced with the Task 1 service code (VM_PROVISIONING_UNAVAILABLE and _VM_UPGRADE_IN_PROGRESS_STATUSES present); STATELESS_SESSION_ENABLED=true, CONTAINER_STARTUP_STAGE_AUTHORITY_ENABLED=false, VMs off",
+  "caller": "python in the orchestrator pod, httpx to localhost with X-Internal-Key",
+  "checks": [
+    {
+      "check": "availability route on a stateless virtual Session",
+      "request": "GET /api/agents/threads/6ea39396-f5e5-420b-ab85-9645da57988b/upgrade-availability (X-Internal-Key)",
+      "result": "pass",
+      "observed": "200 {\"vm\":{\"available\":false,\"reason\":\"Workspace upgrades are not yet supported on the stateless lane\"}}"
+    },
+    {
+      "check": "unknown thread",
+      "request": "GET /api/agents/threads/00000000-0000-4000-8000-000000000000/upgrade-availability (X-Internal-Key)",
+      "result": "pass",
+      "observed": "404 {\"detail\":\"Thread not found\"}"
+    },
+    {
+      "check": "internal-only",
+      "request": "same route without X-Internal-Key",
+      "result": "pass",
+      "observed": "401 {\"detail\":\"Invalid internal key\"}"
+    }
+  ],
+  "notRun": [
+    "A pinned virtual Session's availability (expected available false, 'VM workspaces aren't available on this installation.' locally): local k3d has no pinned virtual Session (stateless is on, and turning it off needs a Helm change through tilt, which is not used); covered by TestUpgradeAvailability unit cases",
+    "The agent's offer path (tool asks, then offers a VM or explains): needs an LLM turn on a pinned virtual Session; the local MiniMax key answers 402 and dev runs only stateless Sessions (tool stripped). Owed on prod after the next v0.0.X, which runs pinned Sessions",
+    "The cockpit's pinned surfaces (Container 'not available in this session', /upgrade-workspace container answered locally, old container offers raise no card): no pinned Session locally; covered by settings-pane and persistent-chat service specs (814 passed)"
+  ]
+}

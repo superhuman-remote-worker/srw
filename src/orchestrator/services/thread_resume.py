@@ -16,8 +16,19 @@ from orchestrator.schemas.thread_lifecycle import (
     ThreadResumeRequest,
     ThreadRewindRequest,
 )
-from orchestrator.services.cloud import SessionFolderHandle
+from orchestrator.services.cloud import (
+    CloudBackendError,
+    CloudBackendErrorKind,
+    SessionFolderHandle,
+)
 from orchestrator.services.cloud.identity import resolve_user_identity_cached
+from orchestrator.services.cloud_connector_mounts import (
+    CLOUD_OUTBOX_KEY,
+    outbox_attached,
+    outbox_record,
+    selected_ids,
+    uses_connector_rule,
+)
 from orchestrator.services.config_drift import (
     DriftItem,
     acknowledged_drift_ids,
@@ -26,7 +37,12 @@ from orchestrator.services.config_drift import (
 )
 from orchestrator.services.datasource_policy import classify_datasource_selection
 from orchestrator.services.grant_enforcement import GrantDenied
+from orchestrator.services.model_availability import ModelUnavailable
 from orchestrator.services.manifest_runtime_ownership import require_srw_runtime
+from orchestrator.services.session_cloud_preparation import (
+    ensure_new_outbox_folder,
+    outbox_selected,
+)
 from orchestrator.services.session_provisioner import ensure_session_workspace
 from orchestrator.services.session_runtime_admission import (
     protected_cloud_marker_state,
@@ -62,7 +78,6 @@ class ThreadResumeDependencies:
     hold_officer_for_conference: Callable[..., Awaitable[None]]
     is_protected_cloud_mode_enabled: Callable[[], bool]
     schedule_protected_engage: Callable[..., Any]
-    should_skip_session_folder: Callable[[list[dict[str, Any]]], bool]
     await_protected_cloud_runtime_ready: Callable[[str], Awaitable[bool]]
     find_idle_persistent_agent: Callable[[], Awaitable[Any]]
     thread_has_knowledge_scope: Callable[..., Awaitable[bool]]
@@ -215,6 +230,11 @@ async def thread_config_drift(
     except GrantDenied:
         # Expected: this is exactly the signal we came here to harvest.
         pass
+    except ModelUnavailable:
+        # Not grant drift. Resume proceeds so the owner can switch the model;
+        # input admission refuses a turn with the model named until then
+        # (unavailable_model_handling.md §5).
+        pass
     except Exception as exc:
         # We could not determine whether grants drifted. Reporting "no drift"
         # would let the session resume on an unknown state; fail closed with
@@ -290,7 +310,6 @@ async def resume_thread(
     _hold_officer_for_conference = dependencies.hold_officer_for_conference
     _is_protected_cloud_mode_enabled = dependencies.is_protected_cloud_mode_enabled
     _schedule_protected_engage = dependencies.schedule_protected_engage
-    _should_skip_session_folder = dependencies.should_skip_session_folder
     _register_late_cloud_setup = partial(
         register_late_cloud_setup, dependencies=dependencies
     )
@@ -326,6 +345,35 @@ async def resume_thread(
             status_code=409,
             detail="Session execution lane does not support resume",
         )
+    if execution_lane == LANE_PINNED and thread.get("status") in {
+        "awaiting_user",
+        "suspended",
+        "created",
+    }:
+        from orchestrator.services.vm_idle_lifecycle import VMIdleLifecycleStore
+
+        idle = VMIdleLifecycleStore(postgres_db)
+        open_idle = await idle.get_open_for_thread(thread_id)
+        continuation = await idle.get_pending_access_continuation(thread_id)
+        if (
+            open_idle is not None
+            or continuation is not None
+            or thread.get("status") == "suspended"
+        ):
+            wake = await idle.request_thread_wake(
+                thread_id,
+                execution_requested=True,
+            )
+            if wake is None and open_idle is not None:
+                raise HTTPException(
+                    status_code=409,
+                    detail={"code": "session_idle_wake_held"},
+                )
+            if wake is not None:
+                return {
+                    "status": "resuming",
+                    "wake_id": str(wake["wake_id"]),
+                }
     if thread.get("status") != "ended":
         if (
             execution_lane == LANE_PINNED
@@ -489,6 +537,16 @@ async def resume_thread(
                         status_code=503,
                         detail="Stateless workspace retirement remains incomplete",
                     )
+                settled = locked_metadata.get("_stateless_workspace_retirement_settled")
+                if isinstance(settled, dict) and "initial_creation" in settled:
+                    from orchestrator.services.workspace_lifecycle import WorkspaceOwner
+
+                    if not await container_provisioner.validate_retained_initial_workspace_storage(
+                        WorkspaceOwner.session(thread_id)
+                    ):
+                        raise HTTPException(
+                            503, "Retained initial workspace storage changed"
+                        )
                 if not await postgres_db.resume_thread(thread_id):
                     raise HTTPException(
                         status_code=409,
@@ -503,11 +561,27 @@ async def resume_thread(
                 status_code=503,
                 detail="Stateless workspace lifecycle lock acquisition timed out",
             ) from exc
-    elif not await postgres_db.resume_thread(thread_id):
-        raise HTTPException(
-            status_code=409,
-            detail="Thread could not be resumed while workspace cleanup is active",
+    else:
+        wait_probe = getattr(
+            type(postgres_db), "get_pinned_retained_creation_wait", None
         )
+        pending_fence = (
+            await wait_probe(postgres_db, thread_id) if callable(wait_probe) else None
+        )
+        if pending_fence is not None:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "workspace_predecessor_cleanup_pending",
+                    "message": "Workspace cleanup is still waiting for prior creation requests to expire. The session remains ended; retry Resume after cleanup finishes.",
+                    "retry_after": pending_fence["gc_after"].isoformat(),
+                },
+            )
+        if not await postgres_db.resume_thread(thread_id):
+            raise HTTPException(
+                status_code=409,
+                detail="Thread could not be resumed while workspace cleanup is active",
+            )
 
     # The pre-resume owner snapshot is terminal by construction. Every
     # provisioning decision below must use the exact row reopened by the
@@ -519,6 +593,20 @@ async def resume_thread(
             status_code=409, detail=thread_runtime_refusal_detail(thread)
         )
     metadata = thread_metadata_object(thread)
+
+    # Resume may originate from MCP/API or another tab. Publish its accepted
+    # life on the existing shared feed without depending on this caller to
+    # subsequently drive /prepare. This snapshot is fresh after the Resume
+    # transaction, and no await separates its authority check from the hint.
+    from orchestrator.services.session_lifecycle import emit as lifecycle_emit
+
+    lifecycle_emit(
+        str(thread["user_id"]),
+        thread_id,
+        "provisioning",
+        session_runtime_generation=resume_runtime_authority.generation,
+        **({"backend": "vm"} if _thread_workspace_backend(thread) == "vm" else {}),
+    )
 
     async def _resume_runtime_is_current() -> bool:
         return same_thread_runtime_authority(
@@ -545,7 +633,9 @@ async def resume_thread(
     ):
         ro_row = await postgres_db.get_ro_mount_by_thread(thread_id)
         if not ro_row or ro_row.get("status") != "active":
-            resume_mount_rows = await postgres_db.list_thread_mounts(thread_id)
+            resume_mount_rows = await postgres_db.list_protected_selection_rows(
+                thread_id
+            )
             _schedule_protected_engage(
                 thread_id,
                 user_id=str(user["id"]),
@@ -553,37 +643,35 @@ async def resume_thread(
                 runtime_generation=resume_runtime_authority.generation,
             )
 
-    # Provision cloud session folder if missing (e.g. session was created
-    # before the cloud backend was initialized), or retry the share alone
-    # if the folder exists but no share_handle was recorded — this unstucks
-    # threads where folder creation raced the user's first browser login.
+    # Provision the session's outbox folder if missing (e.g. session was
+    # created before the cloud backend was initialized), or retry the share
+    # alone if the folder exists but no share_handle was recorded — this
+    # unstucks threads where folder creation raced the user's first browser
+    # login. Only while the outbox is attached (main cloud slice 6.1): a
+    # session without it has no session folder at all, and nothing takes
+    # its place.
     existing_session_handle = thread.get("main_cloud_session_handle") or thread.get(
         "nc_session_folder"
     )
-    needs_share_only = bool(existing_session_handle) and not thread.get(
-        "main_cloud_share_handle"
+    needs_share_only = (
+        bool(existing_session_handle)
+        and not thread.get("main_cloud_share_handle")
+        and outbox_attached(metadata)
     )
-    # Phase 4: if the thread already has a working mount, skip the
-    # late-provision branch — the mount is the user-visible cloud surface
-    # and a session folder on top would be redundant. The share-retry
-    # branch is untouched: it only fires on existing folders, so it
-    # remains the recovery path for old session folders that lost their
-    # share record.
-    try:
-        existing_mounts = await postgres_db.list_thread_mounts(thread_id)
-    except Exception as e:
-        existing_mounts = []
-        logger.warning(
-            "Thread %s: failed to read thread_mounts during resume late-provision "
-            "check (%s); proceeding with default policy.",
-            thread_id,
-            e,
-        )
-    needs_full_provision = (
-        not existing_session_handle
-        and not thread.get("nc_session_folder")
-        and not _should_skip_session_folder(existing_mounts)
-    )
+    outbox_id: str | None = None
+    if not existing_session_handle and uses_connector_rule(metadata):
+        try:
+            outbox_id = await outbox_selected(
+                postgres_db, thread.get("user_id"), selected_ids(metadata)
+            )
+        except Exception as e:
+            logger.warning(
+                "Thread %s: failed to read its outbox during resume (%s); "
+                "its folder is not provisioned now.",
+                thread_id,
+                e,
+            )
+    needs_full_provision = outbox_id is not None
     if protected_cloud_marker_state(metadata) == "on":
         # Protected sessions use the project reader + overlay exclusively.
         # Never provision/share the legacy live session folder on resume.
@@ -614,9 +702,35 @@ async def resume_thread(
                         existing_handle, backend=backend.backend_id
                     )
                 else:
-                    session_handle = await backend.ensure_session_folder(
-                        session_id=tid[:8]
-                    )
+                    # A new folder, named by the session's full id; one
+                    # already there is never taken over.
+                    try:
+                        session_handle = await ensure_new_outbox_folder(
+                            tid,
+                            connector_id=str(outbox_id),
+                            backend=backend,
+                            store=postgres_db,
+                            recorded_folder=outbox_record(metadata).get("folder"),
+                        )
+                    except CloudBackendError as e:
+                        if e.kind != CloudBackendErrorKind.ALREADY_EXISTS:
+                            raise
+                        logger.warning(
+                            "Thread %s: a folder is already at its outbox's "
+                            "name; it is not taken over",
+                            tid,
+                        )
+                        await postgres_db.merge_thread_cloud_metadata(
+                            tid,
+                            {
+                                CLOUD_OUTBOX_KEY: {
+                                    "connector_id": outbox_id,
+                                    "state": "unavailable",
+                                    "reason": "folder_exists",
+                                }
+                            },
+                        )
+                        return
                     if not await _resume_runtime_is_current():
                         return
                 share_handle = None
@@ -645,6 +759,16 @@ async def resume_thread(
                     expected_runtime_generation=resume_runtime_authority.generation,
                 ):
                     return
+                if outbox_id is not None:
+                    await postgres_db.merge_thread_cloud_metadata(
+                        tid,
+                        {
+                            CLOUD_OUTBOX_KEY: {
+                                "connector_id": outbox_id,
+                                "state": "ready",
+                            }
+                        },
+                    )
                 logger.info(
                     "Thread %s: %s cloud session folder",
                     tid,
@@ -768,6 +892,9 @@ async def resume_thread(
                             if cur.get("project_id")
                             else None,
                             include_kb_profile=include_kb_profile,
+                            # The fallback copy; the attach checks the
+                            # resolved config strictly.
+                            strict=False,
                         )
                         # The attach boundary owns the authoritative datasource
                         # re-read. Passing a pre-resolved payload here recreated

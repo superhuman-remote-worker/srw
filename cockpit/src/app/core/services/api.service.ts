@@ -22,9 +22,12 @@ import {
     DatasourceCreateRequest,
     DatasourceIndexStatus,
     DatasourceReindexResult,
+    DatasourceTestEdits,
     DatasourceTestResult,
     DatasourceUpdateRequest,
     EligibleDatasource,
+    ExpertExportBundle,
+    ExpertTemplateSource,
     LinkableDatasourceProjectsResponse,
     LinkableProjectDatasourceFilters,
     LinkableProjectDatasourcesResponse,
@@ -56,6 +59,7 @@ import {
     JobUsage,
     JobSubagentRoster,
     JobSubjobRoster,
+    ThreadSubagentRoster,
     JobRejectResult,
     JobReviewSessionResult,
     JobStatistics,
@@ -85,6 +89,8 @@ import {
     ProjectRepositoryUpdateRequest,
     ProjectStatus,
     ProjectUpdateRequest,
+    ProjectWorkspaceDefaults,
+    ProjectWorkspaceDefaultsUpdate,
     PullRequestStatus,
     PromoteRequest,
     StuckJobsResponse,
@@ -99,12 +105,16 @@ import {
     User,
     UserCapabilities,
     VoiceCapabilities,
+    WorkspaceTemplateList,
 } from '../models/api.model';
 import type {
   AdminCapacity,
+  CloudRootConnectStart,
+  CloudRootStatus,
   SessionQueueState,
   SessionQueueRetryOutcome,
   RunQueueUnparkResult,
+  WorkspaceLifecycleView,
 } from '../models/api.model';
 import {
   ThreadUploadEvent,
@@ -131,6 +141,14 @@ import {
   TtsLibraryFilters,
   TtsLibrarySetting,
 } from '../models/tts-voices';
+import {
+  ManifestApplyResult, WorkspaceBinding, WorkspaceTemplateDocument, WorkspaceTemplateItem,
+  WorkspaceTemplateItems, WorkspaceTemplateSpec,
+} from '../models/workspace-template.model';
+import {
+  ConnectorDriverMatrix,
+  RegisterConnectorDriverRequest,
+} from '../models/connector-driver.model';
 import {environment} from '../environment';
 
 /**
@@ -177,8 +195,10 @@ export interface JobVersionInfo {
  * IDE session status from the orchestrator.
  */
 export interface IdeSessionStatus {
-  status: 'unavailable' | 'available' | 'restoring' | 'active' | 'idle' | 'expired' | 'failed';
+  status: 'unavailable' | 'available' | 'ready' | 'restoring' | 'active' | 'idle' | 'expired' | 'failed';
   code_server_url?: string | null;
+  access_lease_id?: string;
+  workspace_lifecycle?: WorkspaceLifecycleView | null;
     gitea_url?: string | null;
   snapshot_type?: string;
   estimated_seconds?: number;
@@ -704,6 +724,40 @@ export class ApiService {
     );
   }
 
+  /**
+   * The authored content a create form copies when the user changes an Expert
+   * template (creation_ui_expert_workspace_connectors.md D2).
+   *
+   * The manifest resource's `spec.runtime.config` is the source: it keeps the
+   * installed asset and `config_name` a bundled Expert needs. The export
+   * endpoint 409s for every Expert carrying an `asset_name` (all bundled
+   * ones), so it is only the fallback for an Expert with no resource. Null
+   * when neither can be read — the form then sends selector + overrides.
+   */
+  getExpertTemplate(expert: {id: string; manifest_uid?: string | null}): Observable<ExpertTemplateSource | null> {
+    type ResourceBody = {resource?: {spec?: {
+      runtime?: {config?: ExpertTemplateSource['runtimeConfig']};
+      workspacePreference?: {backend: string} | null;
+    }}};
+    if (expert.manifest_uid) {
+      return this.http.get<ResourceBody>(`${this.baseUrl}/resources/${encodeURIComponent(expert.manifest_uid)}`).pipe(
+        map((body) => {
+          const spec = body?.resource?.spec;
+          const runtimeConfig = spec?.runtime?.config;
+          if (!runtimeConfig || typeof runtimeConfig.config !== 'object' || runtimeConfig.config === null) return null;
+          return {runtimeConfig, workspacePreference: spec?.workspacePreference ?? null};
+        }),
+        catchError(() => of(null)),
+      );
+    }
+    return this.http.get<ExpertExportBundle>(`${this.baseUrl}/experts/${encodeURIComponent(expert.id)}/export`).pipe(
+      map((bundle) => (bundle && typeof bundle.config === 'object'
+        ? {runtimeConfig: {config: bundle.config ?? {}, prompts: bundle.prompts ?? {}}}
+        : null)),
+      catchError(() => of(null)),
+    );
+  }
+
   /** Effective application/project/personal expert defaults for this caller. */
   getExpertDefaults(projectId?: string | null): Observable<ExpertDefaultsResponse | null> {
     const params = projectId ? new HttpParams().set('project_id', projectId) : undefined;
@@ -963,16 +1017,48 @@ export class ApiService {
 
   /** Get execution-authorized, scope-matching connectors for an exact project
    * context. The server computes owner-specific `default_selected`; callers
-   * must not infer defaults from visibility or `auto_attach` alone. */
-  getEligibleDatasources(projectIds?: string[]): Observable<EligibleDatasource[]> {
+   * must not infer defaults from visibility or `auto_attach` alone.
+   * `execution` keeps only the connectors that kind of execution can attach
+   * (a project's cloud folder mounts in sessions, its checkout copies into
+   * jobs); omitted, the server lists every kind. */
+  getEligibleDatasources(
+    projectIds?: string[],
+    execution?: 'session' | 'job',
+  ): Observable<EligibleDatasource[]> {
     let params = new HttpParams();
     for (const pid of projectIds ?? []) {
       if (pid) {
         params = params.append('project_id', pid);
       }
     }
+    if (execution) params = params.set('execution', execution);
     return this.http
       .get<EligibleDatasource[]>(`${this.baseUrl}/datasources/eligible`, { params });
+  }
+
+  /** The capability matrix of every installed connector driver. Errors reach
+   * the caller, which keeps its pre-matrix behaviour. */
+  getConnectorDrivers(): Observable<ConnectorDriverMatrix> {
+    return this.http.get<ConnectorDriverMatrix>(`${this.baseUrl}/datasources/drivers`);
+  }
+
+  /** Register a driver image (D6). Errors reach the caller: the server's
+   * detail says why an image or a scope was refused. */
+  registerConnectorDriver(body: RegisterConnectorDriverRequest): Observable<{id: string}> {
+    return this.http.post<{id: string}>(`${this.baseUrl}/connector-drivers`, body);
+  }
+
+  /** Delete a driver registration whose bindings are revoked and which no
+   * connector uses, or which is disabled (409 otherwise, with the reason). */
+  deleteConnectorDriver(id: string): Observable<{status: string}> {
+    return this.http.delete<{status: string}>(`${this.baseUrl}/connector-drivers/${id}`);
+  }
+
+  /** Disable (or enable again) a driver registration: disabled, it binds
+   * nothing new and its live bindings are revoked. */
+  setConnectorDriverDisabled(id: string, disabled: boolean): Observable<{id: string}> {
+    const action = disabled ? 'disable' : 'enable';
+    return this.http.post<{id: string}>(`${this.baseUrl}/connector-drivers/${id}/${action}`, {});
   }
 
   /** Projects the caller may use in a connector's availability policy. Current
@@ -1052,10 +1138,18 @@ export class ApiService {
   }
 
   /**
-   * Test connectivity to a datasource.
+   * Test connectivity to a datasource. ``edits`` is the SSH endpoint the
+   * connector form is editing (``connection_url``/``config``): an SSH
+   * connector's Test reaches it instead of the saved one.
    */
-  testDatasource(id: string): Observable<DatasourceTestResult | null> {
-    return this.http.post<DatasourceTestResult>(`${this.baseUrl}/datasources/${id}/test`, {}).pipe(
+  testDatasource(
+    id: string,
+    edits?: DatasourceTestEdits,
+  ): Observable<DatasourceTestResult | null> {
+    return this.http.post<DatasourceTestResult>(
+      `${this.baseUrl}/datasources/${id}/test`,
+      edits ?? {},
+    ).pipe(
       catchError((error) => {
         console.error(`Failed to test datasource ${id}:`, error);
         return of(null);
@@ -1198,6 +1292,48 @@ export class ApiService {
         console.error(`Failed to update project datasource:`, error);
         return of(null);
       }),
+    );
+  }
+
+  // ===== My cloud: the caller's own cloud root (main cloud slice 4) =====
+  // Every call acts on the caller's own root; errors reach the caller.
+
+  /** The caller's cloud root and its state (the row is ensured first). */
+  getCloudRoot(): Observable<CloudRootStatus> {
+    return this.http.get<CloudRootStatus>(`${this.baseUrl}/me/cloud-root`);
+  }
+
+  /** Start "Connect your cloud": the page to open (`login_url`). 409 with
+   *  the unsupported reason as `detail` when there is no root to connect. */
+  connectCloudRoot(): Observable<CloudRootConnectStart> {
+    return this.http.post<CloudRootConnectStart>(`${this.baseUrl}/me/cloud-root/connect`, {});
+  }
+
+  /** Cancel the caller's connect flow; answers the state after it. */
+  cancelCloudRootConnect(): Observable<CloudRootStatus & {cancelled?: boolean}> {
+    return this.http.delete<CloudRootStatus & {cancelled?: boolean}>(
+      `${this.baseUrl}/me/cloud-root/connect`,
+    );
+  }
+
+  /** Disconnect: the cloud is asked to revoke the credential
+   *  (`provider_revoked`) and SRW forgets it. */
+  disconnectCloudRoot(): Observable<CloudRootStatus> {
+    return this.http.delete<CloudRootStatus>(`${this.baseUrl}/me/cloud-root`);
+  }
+
+  /** Set a project link's default access level, for a connector whose
+   *  driver has strict levels (a cloud folder); null clears it to the
+   *  driver's default. Errors reach the caller: a refused level (422
+   *  `link_access_not_offered`) says which ones are offered. */
+  setProjectDatasourceAccess(
+    projectId: string,
+    datasourceId: string,
+    access: string | null,
+  ): Observable<{ status: string }> {
+    return this.http.patch<{ status: string }>(
+      `${this.baseUrl}/projects/${projectId}/datasources/${datasourceId}`,
+      { access },
     );
   }
 
@@ -1901,9 +2037,11 @@ export class ApiService {
   /**
    * Get IDE session status for a job.
    */
-  getIdeSession(jobId: string): Observable<IdeSessionStatus | null> {
+  getIdeSession(jobId: string, leaseId?: string): Observable<IdeSessionStatus | null> {
     return this.http
-      .get<IdeSessionStatus>(`${this.baseUrl}/jobs/${jobId}/ide`)
+      .get<IdeSessionStatus>(`${this.baseUrl}/jobs/${jobId}/ide`, {
+        params: leaseId ? {lease_id: leaseId} : {},
+      })
       .pipe(
         catchError((error) => {
           console.error(`Failed to get IDE session for ${jobId}:`, error);
@@ -1945,9 +2083,11 @@ export class ApiService {
   /**
    * Stop an active IDE session.
    */
-  stopIdeSession(jobId: string): Observable<{ status: string } | null> {
+  stopIdeSession(jobId: string, leaseId?: string): Observable<{ status: string } | null> {
     return this.http
-      .delete<{ status: string }>(`${this.baseUrl}/jobs/${jobId}/ide`)
+      .delete<{ status: string }>(`${this.baseUrl}/jobs/${jobId}/ide`, {
+        params: leaseId ? {lease_id: leaseId} : {},
+      })
       .pipe(
         tap(() => this.toast.success(this.t('toasts.ide.stopped'))),
         catchError((error) => {
@@ -1956,6 +2096,13 @@ export class ApiService {
           return of(null);
         }),
       );
+  }
+
+  /** Quiet cleanup for a VM access attempt abandoned before the IDE opened. */
+  closeVmIdeLease(jobId: string, leaseId: string): Observable<void> {
+    return this.http.delete<void>(`${this.baseUrl}/jobs/${jobId}/ide`, {
+      params: {lease_id: leaseId},
+    }).pipe(catchError(() => of(void 0)));
   }
 
     /**
@@ -1971,6 +2118,25 @@ export class ApiService {
                     console.error(`Failed to get thread ${threadId}:`, error);
                     return of(null);
                 }),
+            );
+    }
+
+    /**
+     * The session's frozen resolved agent config (redacted), for the live
+     * settings pane's locked fields. Null when the endpoint is unavailable (older
+     * orchestrator), the session predates execution snapshots, or the read
+     * fails — the pane then says it cannot show those values.
+     */
+    getThreadResolvedConfig(threadId: string): Observable<Record<string, unknown> | null> {
+        return this.http
+            .get<{config?: {agent?: Record<string, unknown>} | null}>(
+                `${this.baseUrl}/persistent/threads/${threadId}/resolved-config`,
+            )
+            .pipe(
+                // The frozen blob wraps the agent config with prompts, skills
+                // and render metadata; the settings read config paths.
+                map((body) => body?.config?.agent ?? null),
+                catchError(() => of(null)),
             );
     }
 
@@ -2039,7 +2205,7 @@ export class ApiService {
      * Same deadline and same silent-null contract as the thread read.
      */
     previewToolGroups(body: {
-        workspace?: Record<string, unknown> | null;
+        workspace?: WorkspaceBinding;
         workspace_preference?: 'none' | 'virtual' | 'sandbox' | 'vm' | null;
         config_name?: string | null;
         expert_id?: string | null;
@@ -2068,15 +2234,31 @@ export class ApiService {
     /**
      * Get IDE status for a persistent thread's workspace.
      */
-    getThreadIdeStatus(threadId: string): Observable<IdeSessionStatus | null> {
+    getThreadIdeStatus(threadId: string, leaseId?: string): Observable<IdeSessionStatus | null> {
         return this.http
-            .get<IdeSessionStatus>(`${this.baseUrl}/persistent/threads/${threadId}/ide`)
+            .get<IdeSessionStatus>(`${this.baseUrl}/persistent/threads/${threadId}/ide`, {
+                params: leaseId ? {lease_id: leaseId} : {},
+            })
             .pipe(
                 catchError((error) => {
                     console.error(`Failed to get IDE status for thread ${threadId}:`, error);
                     return of(null);
                 }),
             );
+    }
+
+    /** A user gesture admits one pinned VM IDE tab and may wake its workspace. */
+    startThreadIdeSession(threadId: string): Observable<IdeSessionStatus | null> {
+        return this.http.post<IdeSessionStatus>(
+            `${this.baseUrl}/persistent/threads/${threadId}/ide`, {},
+        ).pipe(catchError(() => of(null)));
+    }
+
+    closeThreadIdeLease(threadId: string, leaseId: string): Observable<void> {
+        return this.http.delete<void>(
+            `${this.baseUrl}/persistent/threads/${threadId}/ide`,
+            {params: {lease_id: leaseId}},
+        ).pipe(catchError(() => of(void 0)));
     }
 
   /**
@@ -2292,6 +2474,22 @@ export class ApiService {
         return of(null);
       }),
     );
+  }
+
+  /**
+   * The children one session delegated (`delegate_agent`), live and ended.
+   * Null on failure, so a poller keeps the rows it already has instead of
+   * blanking a card on one transient error.
+   */
+  getSessionSubagents(threadId: string): Observable<ThreadSubagentRoster | null> {
+    return this.http
+      .get<ThreadSubagentRoster>(`${this.baseUrl}/persistent/threads/${threadId}/subagents`)
+      .pipe(
+        catchError((error) => {
+          console.error(`Failed to fetch subagents for session ${threadId}:`, error);
+          return of(null);
+        }),
+      );
   }
 
   // ===== Repo Browser Endpoints (Gitea proxy) =====
@@ -2537,6 +2735,75 @@ export class ApiService {
     return this.http.patch<{ status: string }>(`${this.baseUrl}/projects/${id}`, body);
   }
 
+  /** The Project's row in the workspace defaults chain: what it stores,
+   *  what each field resolves to and why, and whether the manifest owns it. */
+  getProjectWorkspaceDefaults(id: string): Observable<ProjectWorkspaceDefaults> {
+    return this.http.get<ProjectWorkspaceDefaults>(`${this.baseUrl}/projects/${id}/workspace-defaults`);
+  }
+
+  /** Replaces all four values. Errors propagate (409 manifest-owned, 422
+   *  validation, 403 not owner/admin) — the same reason `updateProjectFields`
+   *  does not swallow them. */
+  putProjectWorkspaceDefaults(
+    id: string,
+    body: ProjectWorkspaceDefaultsUpdate,
+  ): Observable<ProjectWorkspaceDefaults> {
+    return this.http.put<ProjectWorkspaceDefaults>(`${this.baseUrl}/projects/${id}/workspace-defaults`, body);
+  }
+
+  /** Visible WorkspaceTemplate resources for one scope, for the Settings
+   *  tab's template pickers. Falls back to an empty list rather than failing
+   *  the whole panel over one scope the caller can't read. */
+  listWorkspaceTemplates(scopeKind: string, scopeName: string): Observable<WorkspaceTemplateList> {
+    const params = new HttpParams()
+      .set('scope_kind', scopeKind)
+      .set('scope_name', scopeName)
+      .set('kind', 'WorkspaceTemplate');
+    return this.http
+      .get<WorkspaceTemplateList>(`${this.baseUrl}/resources`, {params})
+      .pipe(catchError(() => of({resources: []})));
+  }
+
+  /** The Workspaces list's variant of `listWorkspaceTemplates`: errors reach the
+   *  caller, so one unreadable scope shows its own error instead of an empty group. */
+  listWorkspaceTemplatesStrict(scopeKind: string, scopeName: string): Observable<WorkspaceTemplateItems> {
+    const params = new HttpParams()
+      .set('scope_kind', scopeKind)
+      .set('scope_name', scopeName)
+      .set('kind', 'WorkspaceTemplate');
+    return this.http.get<WorkspaceTemplateItems>(`${this.baseUrl}/resources`, {params});
+  }
+
+  getResource(uid: string): Observable<WorkspaceTemplateItem> {
+    return this.http.get<WorkspaceTemplateItem>(`${this.baseUrl}/resources/${uid}`);
+  }
+
+  /** Creates or replaces a resource. An update must send the version it read,
+   *  keyed `Kind/ScopeKind/ScopeName/name`; a stale one gets 409. */
+  applyManifest(
+    document: WorkspaceTemplateDocument,
+    expectedVersions?: Record<string, number>,
+  ): Observable<ManifestApplyResult> {
+    const body: Record<string, unknown> = {source: JSON.stringify(document), format: 'json'};
+    if (expectedVersions && Object.keys(expectedVersions).length) body['expected_versions'] = expectedVersions;
+    return this.http.post<ManifestApplyResult>(`${this.baseUrl}/manifests/apply`, body);
+  }
+
+  deleteResource(uid: string, expectedVersion: number): Observable<{deleted: boolean; uid: string}> {
+    const params = new HttpParams().set('expected_version', String(expectedVersion));
+    return this.http.delete<{deleted: boolean; uid: string}>(`${this.baseUrl}/resources/${uid}`, {params});
+  }
+
+  /** Runs a recipe through the same selection admission uses (A1/A2b), so the
+   *  editor sees admission's 422 for fields the manifest preview accepts. */
+  checkWorkspaceRecipe(spec: WorkspaceTemplateSpec, projectId: string | null): Observable<unknown> {
+    return this.http.post(`${this.baseUrl}/persistent/tool-groups/preview`, {
+      expert_type: 'worker',
+      workspace: {template: {inline: spec}},
+      project_id: projectId,
+    });
+  }
+
   /** The same PATCH with failures flattened to `null`. Nothing calls it today —
    *  every project write now needs the refusal — but the contract is kept so a
    *  caller that wants a bare success/failure does not have to re-derive it. */
@@ -2766,12 +3033,14 @@ export class ApiService {
   }
 
   /**
-   * Mode B of the job cloud workflow — export a completed loose job's output/
-   * folder to a freshly-allocated shared cloud folder. Only valid for jobs
-   * that are completed AND have no project_id. Returns the folder's
-   * browser/WebDAV URLs and the number of files copied.
+   * Re-sync a job's outbox: copy its deliverables into its owner's shared
+   * cloud folder (the completion copy's folder, overwritten in place). Valid
+   * for any completed, pending-review or reviewing job, a cloud project's
+   * too. Returns the folder's browser/WebDAV URLs and the number of files
+   * copied; `unshared` says why the folder is not visible yet.
    *
-   * See knowledge-history/done/job_cloud_export.md §3.2.
+   * See knowledge-history/done/job_cloud_export.md §3.2 and
+   * main_cloud_as_connectors.md, slice 6.2.
    */
   exportJobToSharedFolder(jobId: string): Observable<JobCloudExportResult | null> {
     return this.http
@@ -2788,10 +3057,17 @@ export class ApiService {
             folder: result?.folder?.path ?? result?.folder?.name ?? '',
           };
           // `shared: false` means the bytes landed but the folder isn't
-          // visible to this user yet (no cloud account until their first
-          // login), so opening it would 404. Say that instead of "success".
+          // visible to this user yet, so opening it would 404. Say why
+          // instead of "success": no cloud account until their first login,
+          // the cloud's share rate limit, or a share error.
           if (result && result.shared === false) {
-            this.toast.warning(this.t('toasts.jobs.exportedNotShared', params));
+            const key =
+              result.unshared === 'rate_limited'
+                ? 'toasts.jobs.exportedRateLimited'
+                : result.unshared === 'share_failed'
+                  ? 'toasts.jobs.exportedShareFailed'
+                  : 'toasts.jobs.exportedNotShared';
+            this.toast.warning(this.t(key, params));
           } else {
             this.toast.success(this.t('toasts.jobs.exportedToCloud', params));
           }

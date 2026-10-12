@@ -45,8 +45,10 @@ class ManifestExecutionService:
         cancel_srw=None,
         native_hosting_enabled=False,
         harness_egress="[]",
+        connector_drivers,
     ):
         self.db, self.store = db, ManifestStore(db)
+        self.connector_drivers = connector_drivers
         self.runtime, self.namespace = runtime, namespace
         self.authorize_datasources = authorize_datasources
         self.workspace = workspace
@@ -120,6 +122,35 @@ class ManifestExecutionService:
                     raise HTTPException(
                         422, "Datasource connectors require config.datasourceId."
                     ) from None
+        # `null` (no workspace) and a binding are explicit choices. An omitted
+        # workspace is decided here, as the executing account: an SRW harness
+        # Job resolves the defaults chain; a generic image gets only its
+        # Project's container template when the Project's Jobs mode is
+        # container, otherwise no workspace (never an installation default).
+        if "workspace" in execution:
+            workspace_receipt = {
+                "sources": {"tier": "explicit", "template": "explicit"},
+                "template_name": None,
+            }
+        else:
+            from orchestrator.services.manifest_workspace_selection import (
+                select_execution_workspace,
+                select_generic_project_workspace,
+            )
+
+            if adapter == "srw/v1":
+                _, workspace_receipt = await select_execution_workspace(
+                    self.db,
+                    user,
+                    project_id=project_id,
+                    role="worker",
+                    request=request,
+                )
+            else:
+                workspace_receipt = await select_generic_project_workspace(
+                    self.db, user, project_id=project_id, request=request
+                )
+            execution["workspace"] = (workspace_receipt or {}).get("resolved")
         workspace = execution["workspace"]
         instance_recipe = None
         if adapter == "srw/v1" and workspace and "instanceRef" in workspace:
@@ -160,6 +191,7 @@ class ManifestExecutionService:
                 effective_work_owner_id=str(user["id"]),
                 trusted_system_inheritance=False,
                 legacy_job_id=None,
+                execution_kind="job",
             )
         config_name, config_override = (
             "worker_base",
@@ -169,7 +201,12 @@ class ManifestExecutionService:
             key: deepcopy(prepared[key])
             for key in ("document", "resolved", "revision", "dependencies")
         }
+        # A default template is pinned like any referenced resource.
+        for dependency in (workspace_receipt or {}).get("dependencies", []):
+            if dependency not in snapshot["dependencies"]:
+                snapshot["dependencies"].append(deepcopy(dependency))
         if adapter == "srw/v1":
+            from orchestrator.services.inline_expert import srw_expert_row
             from orchestrator.services.manifest_execution_snapshot import (
                 prepare_srw_snapshot,
             )
@@ -206,13 +243,7 @@ class ManifestExecutionService:
                 project_ids=[project_id] if project_id else [],
                 config_name=config_name,
                 expert_id=None,
-                expert_row={
-                    "expert_type": "worker",
-                    "config": deepcopy(private.get("config", {})),
-                    "prompts": deepcopy(private.get("prompts", {})),
-                    "harness_config_layers": deepcopy(private.get("layers", [])),
-                    "harness_asset_name": private.get("asset_name"),
-                },
+                expert_row=srw_expert_row(private, expert_type="worker"),
                 config_override=config_override,
                 description=spec.get("task", {}).get("text", ""),
                 datasource_ids=datasource_ids,
@@ -272,13 +303,16 @@ class ManifestExecutionService:
             authority_user_id=str(user["id"]),
             authority_project_ids=[project_id] if project_id else [],
             execution_manifest=snapshot,
+            # With execution_manifest given, create_job reads the receipt only
+            # to record which layers supplied the workspace.
+            workspace_selection=workspace_receipt,
         )
         if workspace and adapter == "generic":
             await self.workspace.reserve(str(job["id"]), workspace, user)
         return job["id"]
 
     async def secret(self, ref, authority, *, materialize):
-        await authority.secret(ref["scope"])
+        await authority.secret(ref["scope"], name=ref["name"])
         row = await self.db.fetchrow(
             "SELECT ciphertext,keys FROM srw_resource_secrets WHERE scope_kind=$1 AND scope_name=$2 AND name=$3",
             ref["scope"]["kind"],
@@ -310,55 +344,37 @@ class ManifestExecutionService:
                 secret_env[name] = await self.secret(
                     value["secretRef"], authority, materialize=materialize
                 )
+
+        async def resolve_credential(ref):
+            return await self.secret(ref, authority, materialize=materialize)
+
         for alias, selection in spec["execution"]["connectors"].items():
             connector = selection["inline"]
-            driver, config = connector["driver"], connector.get("config", {})
-            if driver not in {"srw.env/v1", "srw.files/v1"}:
+            driver = self.connector_drivers.manifest_driver(connector["driver"])
+            if driver is None:
                 raise HTTPException(
                     422, "Connector driver is not installed for generic hosting."
                 )
-            if "access" in connector:
-                raise HTTPException(
-                    422,
-                    "Env/file delivery cannot enforce ReadOnly/ReadWrite; use credentials scoped by the external resource.",
-                )
-            values = config.get("env" if driver == "srw.env/v1" else "files", {})
-            if not isinstance(values, dict) or set(config) - {
-                "env" if driver == "srw.env/v1" else "files"
-            }:
-                raise HTTPException(422, "Invalid env/file connector configuration.")
-            credentials = connector.get("credentials", {})
-            for name, value in values.items():
-                if (
-                    isinstance(value, dict)
-                    and set(value) == {"credential"}
-                    and value["credential"] in credentials
-                ):
-                    value = await self.secret(
-                        credentials[value["credential"]]["secretRef"],
-                        authority,
-                        materialize=materialize,
-                    )
-                if not isinstance(value, str):
-                    raise HTTPException(
-                        422,
-                        "Connector values must be strings or declared credential selections.",
-                    )
-                if driver == "srw.env/v1":
+            driver.validate(connector)
+            binding = await driver.bind(
+                connector, alias=alias, resolve_credential=resolve_credential
+            )
+            names = []
+            for entry in binding.entries:
+                if entry.form == "pod_env":
+                    name = entry.value["name"]
                     if name in environment:
                         raise HTTPException(
                             422, "Connector environment bindings collide."
                         )
-                    environment[name] = value
+                    environment[name] = entry.value["value"]
                 else:
-                    if not name.startswith("/run/srw/bindings/"):
-                        raise HTTPException(
-                            422, "Connector files must be under /run/srw/bindings/."
-                        )
-                    files.append(GenericBoundFile(name, value))
+                    name = entry.value["path"]
+                    files.append(GenericBoundFile(name, entry.value["content"]))
+                names.append(name)
             descriptor["connectors"][alias] = {
-                "driver": driver,
-                "bindings": list(values),
+                "driver": driver.spec.name,
+                "bindings": names,
             }
         return GenericBindings(
             secret_env=secret_env,
@@ -372,15 +388,29 @@ class ManifestExecutionService:
         if self.workspace:
             await self.workspace.reconcile_vm_detach()
         if self.cancel_srw:
-            overdue = await self.db.fetch("""SELECT j.id FROM srw_execution_specs s JOIN jobs j ON s.work_kind='Job' AND s.work_id=j.id
-                WHERE s.harness_adapter='srw/v1' AND s.resource_id IS NOT NULL AND j.status IN ('created','processing')
-                AND s.resolved->'spec'->>'timeoutSeconds' IS NOT NULL
-                AND s.created_at + ((s.resolved->'spec'->>'timeoutSeconds')::double precision * interval '1 second') <= now()
-                ORDER BY s.created_at LIMIT 50""")
+            from orchestrator.services.execution_deadline import (
+                ExecutionDeadline,
+                expired_srw_jobs,
+            )
+
+            overdue = await expired_srw_jobs(self.db)
             for item in overdue:
                 job = await self.db.get_job(str(item["id"]))
-                if job and job["status"] in {"created", "processing"}:
-                    await self.cancel_srw(job)
+                if job:
+                    try:
+                        await self.cancel_srw(
+                            job,
+                            expected_execution_deadline=ExecutionDeadline.from_row(
+                                item
+                            ),
+                        )
+                    except HTTPException:
+                        # Control or exact retirement can remain blocked. A
+                        # failed cleanup must not starve other overdue owners.
+                        logger.warning(
+                            "SRW deadline cancellation remains pending for job %s",
+                            item["id"],
+                        )
         rows = await self.db.fetch("""SELECT s.id FROM srw_execution_specs s JOIN jobs j ON s.work_kind='Job' AND s.work_id=j.id
             WHERE s.harness_adapter='generic' AND (j.status IN ('created','processing') OR EXISTS(
               SELECT 1 FROM srw_execution_attempts a WHERE a.execution_id=s.id AND a.cleaned_at IS NULL))
@@ -726,6 +756,21 @@ class ManifestExecutionService:
             snapshot["id"],
             identity.attempt,
         )
+        if final:
+            # The generic execution ended: revoke its credential leases
+            # (connector drivers C2). Idempotent; a retried attempt is not
+            # final and keeps them.
+            from orchestrator.services.connector_credential_leases import (
+                revoke_execution_leases,
+            )
+
+            owner = (
+                {"thread_id": snapshot["work_id"]}
+                if snapshot.get("work_kind") == "Session"
+                else {"job_id": snapshot["work_id"]}
+            )
+            async with self.db.acquire() as conn:
+                await revoke_execution_leases(conn, reason="execution_ended", **owner)
         return True
 
     async def report_outcome(

@@ -11,6 +11,7 @@ from shared.orch_surface.jobs import registry_metadata
 
 from shared.tool_catalog.names import (
     APP_GUIDE_LOADER_TOOL,
+    MEMORY_SEARCH_TOOL_NAME,
     PRODUCT_CAPABILITIES_TOOL_NAME,
 )
 
@@ -301,13 +302,13 @@ WORKSPACE_UPGRADE_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
         "module": "core.upgrade",
         "function": "request_workspace_upgrade",
         "description": (
-            "Request an upgrade from the lite workspace to a real sandbox "
-            "container (shell, git, file tools). A human decides before "
+            "Ask to upgrade from the lite workspace to one with a shell (a "
+            "Session gets a VM, a Job a container). A human decides before "
             "anything is provisioned; you only request, and you may not be "
             "resumed afterwards."
         ),
         "category": "core",
-        "short_description": "Ask to upgrade to a real sandbox workspace.",
+        "short_description": "Ask to upgrade to a workspace with a shell.",
         "phases": ["strategic", "tactical"],  # Available in both modes
         # No config lists this; persistent_session.py:1547 and agent.py:3078
         # append it, and only where there is something to upgrade to.
@@ -701,6 +702,25 @@ KNOWLEDGE_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
         "description": "Regenerate the OKF index.md for a knowledge base",
         "category": "knowledge",
         "short_description": "Regenerate index.md (grouped links by type).",
+        "phases": ["strategic", "tactical"],
+    },
+}
+
+
+# memory/__init__. The bound tool delegates to the ``memory_search`` extension
+# of the session's or job's MemoryManager (``memory.pipeline.extensions``);
+# ``get_all_tool_names`` binds it only while that extension can run.
+MEMORY_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
+    MEMORY_SEARCH_TOOL_NAME: {
+        "module": "memory",
+        "function": "memory_search",
+        "description": (
+            "Search the project's long-term memory (facts, decisions, "
+            "preferences and fixes from earlier jobs and sessions) for "
+            "something the conversation does not already hold"
+        ),
+        "category": "memory",
+        "short_description": "Search project memory for earlier facts and decisions.",
         "phases": ["strategic", "tactical"],
     },
 }
@@ -1380,7 +1400,7 @@ SHELL_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
         # wanted "shell commands on" from silently acquiring a cloud-mount
         # reporter that happens to share the category.
         "grant": "code",
-        "gate": "cloud_mount_manager.active",
+        "gate": "cloud_mount_manager.active, or sidecar cloud folders attached",
     },
 }
 
@@ -1502,7 +1522,7 @@ FILESYSTEM_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
     "search_files": {
         "module": "workspace.filesystem",
         "function": "search_files",
-        "description": "Search for text content in workspace files",
+        "description": "Search workspace files for literal text (not a regex)",
         "category": "workspace",
         "phases": ["strategic", "tactical"],
     },

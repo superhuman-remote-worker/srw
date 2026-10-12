@@ -63,6 +63,7 @@ from orchestrator.services.webhook_transports import (
     NtfyTransport,
     SlackWebhookTransport,
 )
+from shared.content_redaction import sanitize, sanitize_text
 
 logger = logging.getLogger(__name__)
 
@@ -1056,11 +1057,24 @@ class NotificationService:
             if sequence is not None
             else f"message:{thread_id}:{uuid.uuid4()}"
         )
+        # Worker text (audit OC-05): the subject and message are the worker's
+        # own words, and can carry a credential it or a page it read supplied.
+        # Redacted here, where the untrusted part is known — never over the
+        # assembled body, which would also strip the links the server built.
+        # An escalation arrives already sanitized and counts nothing twice.
+        subject = sanitize_text(subject)
+        clean_message = sanitize(message_md)
+        message_md = clean_message.text
+        if clean_message.redacted:
+            message_md += (
+                f"\n\n_({clean_message.count} secret-shaped value(s) redacted "
+                "from the worker's message.)_"
+            )
         payload: dict[str, Any] = {
             "job_id": str(job_id),
             "thread_id": str(thread_id),
             "sequence": sequence,
-            "job_description": (job.get("description") or "")[:100],
+            "job_description": sanitize_text(job.get("description") or "")[:100],
             "config_name": str(job.get("config_name") or "worker_base"),
             "blocking": bool(blocking),
             "reply_routing": {"job_id": str(job_id), "thread_id": str(thread_id)},
@@ -1101,6 +1115,10 @@ class NotificationService:
         """
         label = config_name or "job"
         subject = "Job needs manual review — automated verification failed"
+        # The reviewer's text is agent-written: it rides both the body and the
+        # payload the feed row and SSE frame carry.
+        raw_reason = reason
+        reason = sanitize_text(reason) if reason else reason
         if reason:
             body_md = (
                 f"Automated verification for your **{label}** job stopped without "
@@ -1114,7 +1132,9 @@ class NotificationService:
                 f"(the review pipeline died), so it has been returned to **manual "
                 f"review**. Approve it or send it back with feedback."
             )
-        digest = hashlib.sha1((reason or "pipeline").encode("utf-8")).hexdigest()[:8]
+        digest = hashlib.sha1((raw_reason or "pipeline").encode("utf-8")).hexdigest()[
+            :8
+        ]
         return await self.record(
             recipient_id=str(user_id),
             category="review_queue",
@@ -1144,6 +1164,9 @@ class NotificationService:
         automation per day — the same guard trips on every tick until fixed."""
         display_name = automation_name or "(unnamed)"
         today = datetime.now(timezone.utc).date().isoformat()
+        # A guard's reason can quote the failure it tripped on (a job error
+        # echoing a credential-bearing remote); body and payload both carry it.
+        reason = sanitize_text(reason)
         return await self.record(
             recipient_id=str(user_id),
             category="automation_disabled",

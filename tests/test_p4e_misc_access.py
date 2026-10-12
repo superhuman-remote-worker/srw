@@ -24,12 +24,17 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from fastapi import HTTPException
+from orchestrator.application import projects as projects_composition
+from orchestrator.application import workflows as workflows_composition
 
 
 def _patch_caller_and_db(user: dict, db):
     stack = ExitStack()
     stack.enter_context(
-        patch("orchestrator.main.require_approved_user", AsyncMock(return_value=user))
+        patch(
+            "orchestrator.security.auth.require_approved_user",
+            AsyncMock(return_value=user),
+        )
     )
     stack.enter_context(
         patch(
@@ -37,7 +42,7 @@ def _patch_caller_and_db(user: dict, db):
             AsyncMock(return_value=user),
         )
     )
-    stack.enter_context(patch("orchestrator.main.postgres_db", db))
+    stack.enter_context(patch("orchestrator.main.app.state.resources.postgres_db", db))
     return stack
 
 
@@ -48,8 +53,8 @@ def _patch_pending_actions_caller(user: dict, db, fake_request):
     own namespace, so the gate has to be patched there to steer the route; and
     the route resolves its collaborators through
     ``request.app.state.pending_actions_dependencies_factory``. The factory is
-    evaluated per call, so it picks up the patched ``main.postgres_db`` and
-    hands over ``main._pending_actions_cache`` itself.
+    evaluated per call, so it picks up the patched ``postgres_db`` resource and
+    hands over the application's ``pending_actions_cache`` itself.
     """
     stack = _patch_caller_and_db(user, db)
     stack.enter_context(
@@ -63,10 +68,12 @@ def _patch_pending_actions_caller(user: dict, db, fake_request):
 
 
 def _point_at_pending_actions_factory(fake_request):
-    from orchestrator.main import _pending_actions_dependencies
+    import orchestrator.main
 
     fake_request.app.state.pending_actions_dependencies_factory = (
-        lambda: _pending_actions_dependencies()
+        lambda: workflows_composition.pending_actions_dependencies(
+            orchestrator.main.app.state.resources
+        )
     )
     return fake_request
 
@@ -82,7 +89,8 @@ class TestExpertsGated:
             raise HTTPException(status_code=403, detail="denied")
 
         with patch(
-            "orchestrator.main.require_approved_user", AsyncMock(side_effect=_denied)
+            "orchestrator.security.auth.require_approved_user",
+            AsyncMock(side_effect=_denied),
         ):
             with pytest.raises(HTTPException) as exc:
                 await catalogue_route(expert_routes.list_experts)(fake_request)
@@ -94,7 +102,8 @@ class TestExpertsGated:
             raise HTTPException(status_code=403, detail="denied")
 
         with patch(
-            "orchestrator.main.require_approved_user", AsyncMock(side_effect=_denied)
+            "orchestrator.security.auth.require_approved_user",
+            AsyncMock(side_effect=_denied),
         ):
             with pytest.raises(HTTPException) as exc:
                 await catalogue_route(expert_routes.get_expert)(fake_request, "scholar")
@@ -104,18 +113,22 @@ class TestExpertsGated:
 class TestSshKeyGenerateGated:
     @pytest.mark.asyncio
     async def test_runs_gate(self, fake_request):
-        from orchestrator.main import _datasources_dependencies
+        import orchestrator.main
         from orchestrator.routers.datasources import generate_datasource_ssh_key
 
         async def _denied(*_a, **_kw):
             raise HTTPException(status_code=403, detail="denied")
 
         with patch(
-            "orchestrator.main.require_approved_user", AsyncMock(side_effect=_denied)
+            "orchestrator.security.auth.require_approved_user",
+            AsyncMock(side_effect=_denied),
         ):
             with pytest.raises(HTTPException) as exc:
                 await generate_datasource_ssh_key(
-                    fake_request, dependencies=_datasources_dependencies()
+                    fake_request,
+                    dependencies=projects_composition.datasources_dependencies(
+                        orchestrator.main.app.state.resources
+                    ),
                 )
         assert exc.value.status_code == 403
 
@@ -126,10 +139,10 @@ class TestPendingActions:
         self, user_admin, fake_db, fake_request
     ):
         """Admin path passes no owner filter — DB returns global counts."""
-        from orchestrator.main import _pending_actions_cache
+        import orchestrator.main
         from orchestrator.routers.actions import get_pending_actions
 
-        _pending_actions_cache.clear()
+        orchestrator.main.app.state.resources.pending_actions_cache.clear()
         fake_db.get_pending_action_counts = AsyncMock(
             return_value={"counts": {"total": 99}, "most_urgent": None}
         )
@@ -144,10 +157,10 @@ class TestPendingActions:
     ):
         """Non-admin path resolves caller's project memberships and passes
         owner_user_id + visible_project_ids — narrowing the DB query."""
-        from orchestrator.main import _pending_actions_cache
+        import orchestrator.main
         from orchestrator.routers.actions import get_pending_actions
 
-        _pending_actions_cache.clear()
+        orchestrator.main.app.state.resources.pending_actions_cache.clear()
         fake_db.get_pending_action_counts = AsyncMock(
             return_value={"counts": {"total": 3}, "most_urgent": None}
         )
@@ -166,10 +179,10 @@ class TestPendingActions:
         """Two callers with different visibility hit the DB twice (different
         cache keys). Without the fix, the admin's first response would have
         leaked into user_a's slot."""
-        from orchestrator.main import _pending_actions_cache
+        import orchestrator.main
         from orchestrator.routers.actions import get_pending_actions
 
-        _pending_actions_cache.clear()
+        orchestrator.main.app.state.resources.pending_actions_cache.clear()
         fake_db.get_pending_action_counts = AsyncMock(
             return_value={"counts": {"total": 0}, "most_urgent": None}
         )
@@ -182,10 +195,10 @@ class TestPendingActions:
 
     @pytest.mark.asyncio
     async def test_runs_gate(self, fake_request):
-        from orchestrator.main import _pending_actions_cache
+        import orchestrator.main
         from orchestrator.routers.actions import get_pending_actions
 
-        _pending_actions_cache.clear()
+        orchestrator.main.app.state.resources.pending_actions_cache.clear()
         _point_at_pending_actions_factory(fake_request)
 
         async def _denied(*_a, **_kw):
@@ -203,24 +216,29 @@ class TestPendingActions:
 class TestCitationDetail:
     @pytest.mark.asyncio
     async def test_runs_gate(self, fake_request):
-        from orchestrator.main import _citations_dependencies
+        import orchestrator.main
         from orchestrator.routers.citations import get_citation_detail
 
         async def _denied(*_a, **_kw):
             raise HTTPException(status_code=403, detail="denied")
 
         with patch(
-            "orchestrator.main.require_approved_user", AsyncMock(side_effect=_denied)
+            "orchestrator.security.auth.require_approved_user",
+            AsyncMock(side_effect=_denied),
         ):
             with pytest.raises(HTTPException) as exc:
                 await get_citation_detail(
-                    fake_request, 1, dependencies=_citations_dependencies()
+                    fake_request,
+                    1,
+                    dependencies=projects_composition.citations_dependencies(
+                        orchestrator.main.app.state.resources
+                    ),
                 )
         assert exc.value.status_code == 403
 
     @pytest.mark.asyncio
     async def test_missing_citation_404(self, user_a, fake_db, fake_request):
-        from orchestrator.main import _citations_dependencies
+        import orchestrator.main
         from orchestrator.routers.citations import get_citation_detail
 
         fake_conn = MagicMock()
@@ -233,11 +251,15 @@ class TestCitationDetail:
 
         with (
             _patch_caller_and_db(user_a, fake_db),
-            patch("orchestrator.main.vector_db", fake_vector_db),
+            patch("orchestrator.main.app.state.resources.vector_db", fake_vector_db),
         ):
             with pytest.raises(HTTPException) as exc:
                 await get_citation_detail(
-                    fake_request, 9999, dependencies=_citations_dependencies()
+                    fake_request,
+                    9999,
+                    dependencies=projects_composition.citations_dependencies(
+                        orchestrator.main.app.state.resources
+                    ),
                 )
         assert exc.value.status_code == 404
 
@@ -248,7 +270,7 @@ class TestCitationDetail:
         """Citation links to job_a (owned by user_a). user_b is a stranger
         to project_a, so user_can_access_any_job returns False and the
         endpoint 404s (probe-resistant — doesn't leak existence)."""
-        from orchestrator.main import _citations_dependencies
+        import orchestrator.main
         from orchestrator.routers.citations import get_citation_detail
 
         fake_conn = MagicMock()
@@ -268,17 +290,21 @@ class TestCitationDetail:
 
         with (
             _patch_caller_and_db(user_b, fake_db),
-            patch("orchestrator.main.vector_db", fake_vector_db),
+            patch("orchestrator.main.app.state.resources.vector_db", fake_vector_db),
         ):
             with pytest.raises(HTTPException) as exc:
                 await get_citation_detail(
-                    fake_request, 1, dependencies=_citations_dependencies()
+                    fake_request,
+                    1,
+                    dependencies=projects_composition.citations_dependencies(
+                        orchestrator.main.app.state.resources
+                    ),
                 )
         assert exc.value.status_code == 404
 
     @pytest.mark.asyncio
     async def test_owner_succeeds(self, user_a, job_a, fake_db, fake_request):
-        from orchestrator.main import _citations_dependencies
+        import orchestrator.main
         from orchestrator.routers.citations import get_citation_detail
 
         row = {
@@ -297,9 +323,13 @@ class TestCitationDetail:
 
         with (
             _patch_caller_and_db(user_a, fake_db),
-            patch("orchestrator.main.vector_db", fake_vector_db),
+            patch("orchestrator.main.app.state.resources.vector_db", fake_vector_db),
         ):
             result = await get_citation_detail(
-                fake_request, 1, dependencies=_citations_dependencies()
+                fake_request,
+                1,
+                dependencies=projects_composition.citations_dependencies(
+                    orchestrator.main.app.state.resources
+                ),
             )
         assert result["id"] == 1

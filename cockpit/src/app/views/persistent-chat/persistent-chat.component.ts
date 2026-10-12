@@ -28,7 +28,7 @@ import {CitationRefDirective} from '../../core/markdown/citation-ref.directive';
 import {WorkspaceFileLinkDirective} from '../../core/markdown/workspace-file-link.directive';
 import {KatexDirective} from '../../core/markdown/katex.directive';
 import {TranslocoPipe, TranslocoService} from '@jsverse/transloco';
-import {ChatAttachment, PermissionRequest, PersistentChatService, RewindPrefill, RunningToolInfo, ToolCallInfo,} from '../../core/services/persistent-chat.service';
+import {ChatAttachment, EndSessionOutcome, PermissionRequest, PersistentChatService, RewindPrefill, RunningToolInfo, ToolCallInfo, workspaceTierLabel,} from '../../core/services/persistent-chat.service';
 import {uploadSummary} from '../../core/services/upload-stage';
 import {
     AssistantTurn,
@@ -42,6 +42,7 @@ import {
     FoldedSummary,
     groupEvents,
     isAssistantTurn,
+    isFollowedByAnswer,
     isSessionBoundary,
     isSystemTurn,
     isUserTurn,
@@ -61,8 +62,11 @@ import {
     UserTurn,
 } from '../../core/models/turn.model';
 import {ToolCardView} from '../../core/models/tool-card.model';
+import {buildDelegateBatchMembers, DelegateBatchMember} from '../../core/models/delegate-batch.model';
 import {toolCardViewFromEvent} from '../../core/tools/tool-card-adapters';
 import {ApiService, IdeSessionStatus} from '../../core/services/api.service';
+import {workspaceLifecycleReasonKey} from '../../core/util/vm-lifecycle';
+import {workspaceCreationMessageKey} from '../../core/util/workspace-creation';
 import {I18nService} from '../../core/services/i18n.service';
 import {FileHandlingService} from '../../core/services/file-handling.service';
 import {ChatPreferencesService, type ChatTextSize, type ReadingWidth} from '../../core/services/chat-preferences.service';
@@ -81,6 +85,7 @@ import {AppBadgeComponent} from '../../ui/badge';
 import {CitationsPanelComponent} from './citations-panel/citations-panel.component';
 import {CloudReviewDialogComponent} from '../job-diff-review/cloud-review-dialog.component';
 import {CloudReviewBannerComponent} from './cloud-review-banner/cloud-review-banner.component';
+import {CloudFoldersNoticeComponent} from './cloud-folders-notice/cloud-folders-notice.component';
 import {SshConnectPanelComponent} from './ssh-connect-panel/ssh-connect-panel.component';
 import {ChatEmptyStateComponent, type DisplayedSuggestion} from './chat-empty-state/chat-empty-state.component';
 import {CapabilitiesService} from '../../core/services/capabilities.service';
@@ -89,6 +94,7 @@ import {AppIconComponent} from '../../ui/icon';
 import {AppDialogComponent} from '../../ui/dialog';
 import {AppToolCardComponent} from '../../ui/tool-card';
 import {JobBatchCardComponent} from '../../ui/tool-card/job-batch-card.component';
+import {DelegateBatchCardComponent} from '../../ui/tool-card/delegate-batch-card.component';
 import {AppReadAloudComponent} from '../../ui/read-aloud';
 import {AppInlineEditableTextComponent} from '../../ui/inline-editable-text';
 import {AppToastService} from '../../ui/toast';
@@ -109,6 +115,16 @@ interface Suggestion {
     de: string;
 }
 
+interface PendingVmIdeOpen {
+    threadId: string;
+    tab: Window;
+    leaseId: string | null;
+    timer: ReturnType<typeof setInterval> | null;
+    state: 'pending' | 'abandoned' | 'handedOff';
+    leaseCloseRequested: boolean;
+    applyLifecycle: ReturnType<PersistentChatService['captureWorkspaceLifecycleUpdate']>;
+}
+
 const SLASH_COMMANDS: SlashCommand[] = [
     {command: '/compact', descriptionKey: 'chat.slash.compact'},
     {command: '/done', descriptionKey: 'chat.slash.done'},
@@ -119,6 +135,7 @@ const SLASH_COMMANDS: SlashCommand[] = [
     {command: '/autonomous', descriptionKey: 'chat.slash.autonomous'},
     {command: '/silent', descriptionKey: 'chat.slash.silent'},
     {command: '/verbose', descriptionKey: 'chat.slash.verbose'},
+    {command: '/upgrade-workspace', descriptionKey: 'chat.slash.upgradeWorkspace'},
 ];
 
 const TOOL_LABELS: Record<string, string> = {
@@ -310,6 +327,22 @@ export function isStartupBannerVisible(isStartingSession: boolean, turnCount: nu
     return isStartingSession && turnCount > 0;
 }
 
+/** Keep manual recovery visible after a stream fails, even for a newly
+ *  created thread with no completed turn yet. End and startup own their
+ *  separate controls. */
+export function shouldShowReconnectBanner(
+    connection: 'disconnected' | 'connecting' | 'connected' | 'error',
+    status: string | null,
+    sessionReady: boolean,
+    retryAttempt: number,
+    turnCount: number,
+): boolean {
+    return sessionReady
+        && ['created', 'active', 'awaiting_user'].includes(status ?? '')
+        && connection !== 'connected'
+        && (retryAttempt > 0 || (connection === 'disconnected' && status === 'active' && turnCount > 0));
+}
+
 /** Queued-turn bubble escalation: NN/g's 10 s attention limit, then an
  *  elapsed counter from 60 s. Time-based only — never a queue position. */
 export const QUEUE_BUSY_AFTER_MS = 10_000;
@@ -366,7 +399,15 @@ export function canComposeDuringSession(
     isDraftSession = false,
     isEnded = false,
     isResuming = false,
+    isParked = false,
 ): boolean {
+    // A parked unit records new input without reviving it (only an owner
+    // Retry or an operator unpark does), so an open box just swallowed the
+    // message; the parked bubble carries the way out. Not on an ended or
+    // suspended thread: the End funnel settles its unit (a parked one closes
+    // to `done`), so a parked block there is stale and sending still resumes;
+    // likewise mid-resume, where /connection is about to re-derive it.
+    if (isParked && !isEnded && !isResuming) return false;
     // `isEnded` keeps the box live on a resumable session so a user can draft
     // before bringing the agent back. Composing costs nothing; only SENDING
     // resumes (persistent-chat.service.sendMessage), so a half-written message
@@ -496,23 +537,25 @@ export function pickCurrentStartupStep<T extends {state: string}>(steps: readonl
 }
 
 /**
- * The running-command card to surface on (re)attach, or null. Suppressed when
- * the in-flight tool call is already rendered inside a visible turn (warm
- * reconnect) so it isn't double-shown; surfaced when it isn't (cold reload
- * mid-turn, where the in-flight turn isn't in REST history yet).
+ * The running-command cards to surface on (re)attach: one per in-flight tool
+ * call that is not already rendered inside a visible turn. A call shown in a
+ * turn (warm reconnect) is suppressed so it isn't double-shown; one that isn't
+ * (cold reload mid-turn, where the in-flight turn isn't in REST history yet)
+ * gets a card. Several at once for a parallel batch, e.g. a subagent fan-out.
  */
-export function pickRunningCommandCard(
-    runningTool: RunningToolInfo | null,
+export function pickRunningCommandCards(
+    runningTools: readonly RunningToolInfo[],
     turns: readonly Turn[],
-): RunningToolInfo | null {
-    if (!runningTool) return null;
+): RunningToolInfo[] {
+    if (runningTools.length === 0) return [];
+    const rendered = new Set<string>();
     for (const turn of turns) {
         if (!isAssistantTurn(turn)) continue;
         for (const ev of turn.events) {
-            if (ev.kind === 'tool_call' && ev.id === runningTool.id) return null;
+            if (ev.kind === 'tool_call') rendered.add(ev.id);
         }
     }
-    return runningTool;
+    return runningTools.filter((rt) => !rendered.has(rt.id));
 }
 
 /**
@@ -674,7 +717,11 @@ export function pickCodeServerUrlToOpen(status: IdeSessionStatus | null): string
  * payloads that were about to advertise a URL) — where SSH is exactly the
  * working fallback.
  */
-export function sshWorkspaceReachable(status: IdeSessionStatus | null): boolean {
+export function sshWorkspaceReachable(
+    status: IdeSessionStatus | null,
+    lifecycle?: {state: string} | null,
+): boolean {
+    if (lifecycle) return lifecycle.state !== 'unsupported';
     if (!status) return false;
     return status.status === 'active' || status.status === 'restoring' || !!status.code;
 }
@@ -907,11 +954,13 @@ export function clearDraft(threadId: string | null): void {
         AppDialogComponent,
         AppToolCardComponent,
         JobBatchCardComponent,
+        DelegateBatchCardComponent,
         AppReadAloudComponent,
         AppInlineEditableTextComponent,
         CitationsPanelComponent,
         CloudReviewDialogComponent,
         CloudReviewBannerComponent,
+    CloudFoldersNoticeComponent,
         SshConnectPanelComponent,
         ChatEmptyStateComponent,
     ],
@@ -1014,10 +1063,12 @@ export function clearDraft(threadId: string | null): void {
               @if (ideStatus()?.gitea_url; as giteaUrl) {
                 <app-menu-item (activated)="openIde(giteaUrl)">{{ 'chat.header.gitButton' | transloco }}</app-menu-item>
               }
-              @if (ideStatus()?.status === 'active' && ideStatus()?.code_server_url) {
+              @if (chat.workspaceLifecycle() && chat.workspaceLifecycle()?.state !== 'unsupported') {
+                <app-menu-item (activated)="openVmCodeServer()">{{ 'chat.header.ideButton' | transloco }}</app-menu-item>
+              } @else if (ideStatus()?.status === 'active' && ideStatus()?.code_server_url) {
                 <app-menu-item (activated)="openCodeServer()">{{ 'chat.header.ideButton' | transloco }}</app-menu-item>
               }
-              @if (ideStatus()?.status === 'restoring') {
+              @if (!chat.workspaceLifecycle() && ideStatus()?.status === 'restoring') {
                 <app-menu-item [disabled]="true">{{ 'chat.header.ideLoadingTooltip' | transloco }}</app-menu-item>
               }
               @if (sshButtonVisible()) {
@@ -1030,18 +1081,32 @@ export function clearDraft(threadId: string | null): void {
                         (clicked)="disconnectAndLeave()">
               {{ 'chat.header.disconnect' | transloco }}
             </app-button>
-          } @else if (chat.cloudSessionUrl() || chat.ncSessionFolder() || chat.verifiedProjectFolder()) {
-            <!-- Asleep/ended session. Every other header action drives the live
-                 agent, so the isConnected() gate above is right for them — but
-                 these just open an external cloud URL that loadThreadMeta has
-                 already resolved, and they are the one deliverable surface a
-                 user comes back to a dead session for. Keep them reachable.
+          } @else if (chat.workspaceLifecycle() || chat.cloudSessionUrl() || chat.ncSessionFolder() || chat.verifiedProjectFolder()) {
+            <!-- A suspended VM can be woken by explicit IDE/SSH access even
+                 while its agent is disconnected. Cloud files are likewise
+                 useful after a session has ended. Keep both reachable.
 
                  PC-19: for a protected session the project folder is the one
                  the staged diff applies to; the legacy session folder is an
                  empty agent-service directory. Both are offered, each named
                  for what it is — and the project action exists only when the
                  mount has been cross-checked against the diff summary. -->
+            @if (chat.workspaceLifecycle()?.state && chat.workspaceLifecycle()?.state !== 'unsupported') {
+              <app-icon-button
+                size="sm"
+                [ariaLabel]="'chat.header.moreActions' | transloco"
+                [appMenuTrigger]="asleepVmMenu"
+                menuPlacement="bottom-end"
+              >
+                <app-icon size="sm">more_vert</app-icon>
+              </app-icon-button>
+              <app-menu #asleepVmMenu>
+                <app-menu-item (activated)="openVmCodeServer()">{{ 'chat.header.ideButton' | transloco }}</app-menu-item>
+                @if (sshButtonVisible()) {
+                  <app-menu-item (activated)="showSshPanel.update(v => !v)">{{ 'chat.header.sshButton' | transloco }}</app-menu-item>
+                }
+              </app-menu>
+            }
             @if (chat.verifiedProjectFolder(); as folder) {
               @if (headerCompact()) {
                 <app-icon-button
@@ -1078,8 +1143,39 @@ export function clearDraft(threadId: string | null): void {
               }
             }
           }
+          @if (!chat.isConnected() && chat.endRetryAvailable()) {
+            <!-- A stateless End fenced by a retryable 503 stays pending until
+                 End is pressed again (nothing on the server finishes it), so
+                 the header keeps End while the session shows as ending. -->
+            <app-button variant="ghost" size="sm"
+                        [loading]="isDisconnecting()"
+                        [ariaLabel]="(isDisconnecting() ? 'chat.header.disconnecting' : 'chat.header.disconnect') | transloco"
+                        (clicked)="disconnectAndLeave()">
+              {{ 'chat.header.disconnect' | transloco }}
+            </app-button>
+          }
         </div>
       </div>
+
+      @if (chat.workspaceLifecycle(); as lifecycle) {
+        <div class="vm-lifecycle" role="status">
+          {{ ('jobs.lifecycle.state.' + lifecycle.state) | transloco }}
+          @if (lifecycle.idle_expires_at) {
+            · {{ 'jobs.lifecycle.idleAt' | transloco }} {{ lifecycle.idle_expires_at | date:'shortTime' }}
+          }
+          @if (lifecycle.reason_code) {
+            · {{ lifecycleReasonKey(lifecycle.reason_code) | transloco }}
+          }
+          @if (lifecycle.next_retry_at) {
+            · {{ 'jobs.lifecycle.nextRetry' | transloco }} {{ lifecycle.next_retry_at | date:'shortTime' }}
+          }
+        </div>
+      }
+      @if (chat.workspaceCreation(); as creation) {
+        <div class="vm-lifecycle" role="status">
+          {{ workspaceCreationMessageKey(creation) | transloco }}
+        </div>
+      }
 
       <!-- Pending protected-cloud review. Deliberately OUTSIDE the
            isConnected() gate above: the review API serves ended threads on
@@ -1097,6 +1193,17 @@ export function clearDraft(threadId: string | null): void {
         [threadId]="chat.threadId()"
         (review)="chat.cloudDiffPanelOpen.set(true)"
         (recheck)="chat.refreshCloudDiffCount()"
+      />
+
+      <!-- Every attached cloud folder and its binding state (main cloud
+           slices 3 to 6); one that did not mount says why, and the
+           workspace starts anyway (connector drivers D7). -->
+      <app-cloud-folders-notice
+        [problems]="chat.cloudFolderProblems()"
+        [folders]="chat.cloudFolders()"
+        [protectedCloud]="chat.cloudFoldersProtected()"
+        [agentOutdated]="chat.cloudFoldersAgentOutdated()"
+        (showReview)="showCloudReview()"
       />
 
       <!-- View menu: device-local display prefs (chatPrefs/localStorage).
@@ -1338,10 +1445,35 @@ export function clearDraft(threadId: string | null): void {
           @switch (turn.kind) {
             @case ('system') {
               <div class="message message-system">
-                <div class="system-message">
-                  <app-icon size="sm" class="system-icon">info</app-icon>
-                  {{ turn.content }}
-                </div>
+                @if (turn.subagentRecovery; as r) {
+                  <!-- The continuation a delegation-batch recovery wrote: the
+                       call counts from its marker, in the viewer's language.
+                       The text the model was given stays on hover. -->
+                  <div class="system-message" data-testid="subagent-recovery-notice" [attr.title]="turn.content">
+                    <app-icon size="sm" class="system-icon">info</app-icon>
+                    <span>
+                      {{ 'chat.system.subagentRecovery.resumed' | transloco }}:
+                      {{ 'chat.system.subagentRecovery.finished' | transloco:{done: r.finished, total: r.calls} }}
+                      @if (r.interrupted) {
+                        · {{ 'chat.system.subagentRecovery.interrupted' | transloco:{count: r.interrupted} }}
+                      }
+                      @if (r.notStarted) {
+                        · {{ 'chat.system.subagentRecovery.notStarted' | transloco:{count: r.notStarted} }}
+                      }
+                      @if (r.declined) {
+                        · {{ 'chat.system.subagentRecovery.declined' | transloco:{count: r.declined} }}
+                      }
+                      @if (r.retired) {
+                        · {{ 'chat.system.subagentRecovery.retired' | transloco:{count: r.retired} }}
+                      }
+                    </span>
+                  </div>
+                } @else {
+                  <div class="system-message">
+                    <app-icon size="sm" class="system-icon">info</app-icon>
+                    {{ turn.content }}
+                  </div>
+                }
               </div>
             }
             @case ('compaction') {
@@ -1606,6 +1738,15 @@ export function clearDraft(threadId: string | null): void {
                           <app-job-batch-card [views]="jobBatchViews(group)"
                                               (diffRequested)="openJobDiff($event)" />
                         </div>
+                      } @else if (group.kind === 'delegate_batch') {
+                        <!-- A subagent fan-out: the delegate_agent calls of one
+                             message, one card with a row per child. A single
+                             delegation stays an ordinary card. -->
+                        <div class="event-tool">
+                          <app-delegate-batch-card [members]="delegateBatchMembers(group)"
+                                                   [parentThreadId]="chat.threadId()"
+                                                   [superseded]="delegateBatchSuperseded(turn, group)" />
+                        </div>
                       } @else {
                         @switch (group.event.kind) {
                           @case ('tool_call') {
@@ -1683,6 +1824,7 @@ export function clearDraft(threadId: string | null): void {
               @if (chat.sessionReady()) {
                 <app-chat-empty-state
                   variant="ready"
+                  [workspaceCreation]="chat.workspaceCreation()"
                   [suggestions]="displayedSuggestions()"
                   (suggestionPicked)="pickSuggestion($event)"
                 />
@@ -1715,9 +1857,11 @@ export function clearDraft(threadId: string | null): void {
             [connectorsError]="chat.draftDefaultsError()"
             [connectorsEnabled]="chat.draftConnectorsEnabled()"
             [datasourceCount]="chat.draftDatasourceIds()?.length ?? 0"
-            [workspaceBackend]="chat.draftWorkspaceBackend()"
+            [workspaceChoice]="chat.draftWorkspaceChoice()"
+            [projectId]="chat.draftProjectId()"
+            [workspacePreview]="chat.draftWorkspacePreview()"
             (connectorsToggled)="chat.setDraftConnectorsEnabled($event)"
-            (workspaceChanged)="chat.setDraftWorkspaceBackend($event)"
+            (workspaceChoiceChanged)="chat.setDraftWorkspaceChoice($event)"
             (retryRequested)="chat.retryDraftDefaults()"
             (sendRetried)="chat.retryDraftSession()"
           />
@@ -1735,7 +1879,7 @@ export function clearDraft(threadId: string | null): void {
             </div>
             <div class="message-body turn-body parked-body">
               <div class="parked-line">{{ 'chat.parked.title' | transloco }}</div>
-              <div class="parked-reason">{{ parkedReasonKey() | transloco }}</div>
+              <div class="parked-reason">{{ chat.queueState()?.park_message || (parkedReasonKey() | transloco) }}</div>
               @if (chat.queueState()?.retryable) {
                 <div class="parked-actions">
                   <app-button variant="ghost" size="sm" data-testid="chat-parked-retry"
@@ -1821,11 +1965,12 @@ export function clearDraft(threadId: string | null): void {
           </div>
         }
 
-        <!-- Running-command card — shown on (re)attach when the agent is
-             blocked in a tool call that isn't already rendered in a visible
+        <!-- Running-command cards — shown on (re)attach when the agent is
+             blocked in tool calls that aren't already rendered in a visible
              turn (cold reload mid-turn: the in-flight turn isn't in REST
-             history yet). Reuses the .mile marker styles (no new SCSS). -->
-        @if (runningCommandCard(); as rc) {
+             history yet). One per call. Reuses the .mile marker styles (no
+             new SCSS). -->
+        @for (rc of runningCommandCards(); track $index) {
           <div class="mile">
             <div class="mile-label">{{ 'chat.stream.running' | transloco:{ tool: rc.tool } }}</div>
             <div class="mile-detail">
@@ -1847,7 +1992,7 @@ export function clearDraft(threadId: string | null): void {
             @switch (woc.state) {
               @case ('offer') {
                 <div class="mile-label">{{ 'chat.workspaceOffer.title' | transloco }}</div>
-                <div class="mile-title">{{ 'chat.workspaceOffer.detail' | transloco:{ tier: woc.tier } }}</div>
+                <div class="mile-title">{{ 'chat.workspaceOffer.detail' | transloco:{ tier: tierLabel(woc.tier) } }}</div>
                 <div class="mile-detail">
                   <app-icon size="sm" class="mile-detail-icon">terminal</app-icon>
                   <span class="mile-args">{{ woc.reason }}</span>
@@ -1869,7 +2014,7 @@ export function clearDraft(threadId: string | null): void {
                 <div class="mile-detail">
                   <span class="action-spinner-sm" aria-hidden="true"></span>
                   <span class="mile-args">
-                    {{ 'chat.workspaceOffer.provisioning' | transloco:{ tier: woc.tier } }}
+                    {{ 'chat.workspaceOffer.provisioning' | transloco:{ tier: tierLabel(woc.tier) } }}
                     @if (woc.elapsed) { ({{ woc.elapsed }}s) }
                   </span>
                 </div>
@@ -2215,7 +2360,7 @@ export function clearDraft(threadId: string | null): void {
               <button
                 type="button"
                 class="ctrl"
-                [disabled]="!chat.isConnected()"
+                [disabled]="!chat.isConnected() || chat.isParked()"
                 [title]="'chat.composer.attach' | transloco"
                 [class.active]="attachmentMenuOpen()"
                 (click)="attachmentMenuOpen() ? closeAttachmentMenu() : openAttachmentMenu()"
@@ -2245,7 +2390,7 @@ export function clearDraft(threadId: string | null): void {
               <button
                 type="button"
                 class="ctrl"
-                [disabled]="!chat.isConnected()"
+                [disabled]="!chat.isConnected() || chat.isParked()"
                 [title]="'chat.composer.takePhoto' | transloco"
                 (click)="pickCamera()"
               >
@@ -2265,7 +2410,7 @@ export function clearDraft(threadId: string | null): void {
               <button
                 type="button"
                 class="send mic"
-                [disabled]="!chat.isConnected() || isTranscribing() || sttUnavailable()"
+                [disabled]="!chat.isConnected() || chat.isParked() || isTranscribing() || sttUnavailable()"
                 [title]="(sttUnavailable() ? 'chat.composer.sttNotConfigured' : 'chat.composer.recordVoice') | transloco"
                 (pointerdown)="$event.preventDefault()"
                 (click)="startRecording()"
@@ -2484,13 +2629,16 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
     private readonly destroyRef = inject(DestroyRef);
 
     /**
-     * The running-command card to show on (re)attach (or null). Surfaces the
-     * agent's in-flight tool call when it isn't already visible in a turn — see
-     * pickRunningCommandCard.
+     * The running-command cards to show on (re)attach. Surfaces the agent's
+     * in-flight tool calls that aren't already visible in a turn — see
+     * pickRunningCommandCards.
      */
-    readonly runningCommandCard = computed(() =>
-        pickRunningCommandCard(this.chat.runningTool(), this.chat.turns()),
+    readonly runningCommandCards = computed(() =>
+        pickRunningCommandCards(this.chat.runningTools(), this.chat.turns()),
     );
+
+    /** Reader-facing tier name for the offer card (vm -> VM, sandbox -> container). */
+    readonly tierLabel = workspaceTierLabel;
 
     /** The workspace-upgrade offer/provisioning card, or null. */
     readonly workspaceOfferCard = computed(() =>
@@ -2583,6 +2731,7 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
     private readonly headerActionsEl = viewChild.required<ElementRef<HTMLDivElement>>('headerActionsEl');
     @ViewChild('inputEl') inputEl!: ElementRef<HTMLTextAreaElement>;
     @ViewChild('fileInput') fileInput?: ElementRef<HTMLInputElement>;
+    @ViewChild(CloudReviewBannerComponent, {read: ElementRef}) cloudReviewBanner?: ElementRef<HTMLElement>;
     @ViewChild('cameraInput') cameraInput?: ElementRef<HTMLInputElement>;
     @ViewChild('waveformCanvas') waveformCanvas?: ElementRef<HTMLCanvasElement>;
 
@@ -2633,7 +2782,8 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
     /** SSH button gate: a deployed gateway AND a workspace it can reach —
      *  see {@link sshWorkspaceReachable} for what counts as reachable. */
     readonly sshButtonVisible = computed(
-        () => !!this.capabilities.sshGateway() && sshWorkspaceReachable(this.ideStatus()),
+        () => !!this.capabilities.sshGateway() &&
+            sshWorkspaceReachable(this.ideStatus(), this.chat.workspaceLifecycle()),
     );
 
     /**
@@ -2707,10 +2857,12 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
     readonly showSlashMenu = signal(false);
     readonly slashSelectedIndex = signal(0);
     private readonly slashQuery = signal('');
+    // Only commands with a transport on this session are offered: the
+    // service answers from the /connection declaration, per command.
     readonly filteredCommands = computed(() =>
         SLASH_COMMANDS.filter(c =>
             c.command.startsWith(this.slashQuery()) &&
-            (c.command !== '/rewind' || this.chat.rewindModeAvailable('conversation'))));
+            this.chat.slashCommandAvailable(c.command)));
 
     // Empty-state suggestions (loaded once per mount; the whole set renders, nothing is picked)
     private readonly pickedSuggestions = signal<Suggestion[]>([]);
@@ -2808,7 +2960,8 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
     /**
      * Whether the composer accepts input: during startup (type + queue +
      * flush on ready), while connected, and in the landing draft (type first,
-     * session created on send); false during a mid-session reconnect.
+     * session created on send); false during a mid-session reconnect and
+     * while the session's unit is parked.
      */
     readonly canCompose = computed(() =>
         canComposeDuringSession(
@@ -2817,6 +2970,7 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
             this.chat.isDraftSession(),
             this.chat.threadStatus() === 'ended' || this.chat.threadStatus() === 'suspended',
             this.chat.isResuming(),
+            this.chat.isParked(),
         ),
     );
 
@@ -2838,7 +2992,11 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
 
     // IDE status
     readonly ideStatus = signal<IdeSessionStatus | null>(null);
+    readonly lifecycleReasonKey = workspaceLifecycleReasonKey;
+    readonly workspaceCreationMessageKey = workspaceCreationMessageKey;
     private idePollingTimer: ReturnType<typeof setInterval> | null = null;
+    private pendingVmIdeOpen: PendingVmIdeOpen | null = null;
+    private vmIdeOpenDestroyed = false;
     private idePollingAttempts = 0;
 
     private autoScroll = true;
@@ -2851,6 +3009,9 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
         effect(() => {
             const connected = this.chat.isConnected();
             const threadId = this.chat.threadId();
+            if (this.pendingVmIdeOpen && this.pendingVmIdeOpen.threadId !== threadId) {
+                this.abandonVmIdeOpen(this.pendingVmIdeOpen);
+            }
             if (connected && threadId) {
                 this.startIdePolling(threadId);
             } else {
@@ -3151,12 +3312,13 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
         return this.transloco.translate(key);
     });
 
-    readonly isShowingReconnectBanner = computed(() =>
-        this.chat.connectionState() === 'disconnected'
-        && this.chat.threadStatus() === 'active'
-        && this.chat.sessionReady()
-        && this.chat.turns().length > 0,
-    );
+    readonly isShowingReconnectBanner = computed(() => shouldShowReconnectBanner(
+        this.chat.connectionState(),
+        this.chat.threadStatus(),
+        this.chat.sessionReady(),
+        this.chat.reconnectAttempt(),
+        this.chat.turns().length,
+    ));
 
     readonly scrolledAway = signal(false);
     readonly newMessageCount = signal(0);
@@ -3185,19 +3347,22 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
         if (this.chat.threadStatus() === 'suspended') {
             return this.transloco.translate('chat.input.suspendedSendResumes');
         }
-        if (this.chat.isStartingSession()) return this.transloco.translate('chat.input.sessionStarting');
-        if (!this.chat.isConnected()) return this.transloco.translate('chat.input.connect');
-        if (this.chat.isInterrupting()) return this.transloco.translate('chat.input.stopping');
-        if (this.chat.isStreaming()) return this.transloco.translate('chat.input.working');
         // A parked unit needs a retry — say so, not "waiting". A park an owner
         // may NOT revive (claim-loss hold, stop markers, a non-retryable
         // reason) renders no Retry button, so it must not name a retry either:
-        // only an operator's admin unpark clears it.
+        // only an operator's admin unpark clears it. Ahead of the starting/
+        // connecting copy — a reloaded parked session is still "starting",
+        // since a park is no readiness evidence — because the composer is
+        // closed while parked (canComposeDuringSession) and this line says why.
         if (this.chat.isParked()) {
             return this.transloco.translate(
                 this.chat.queueState()?.retryable ? 'chat.input.parked' : 'chat.input.parkedBlocked',
             );
         }
+        if (this.chat.isStartingSession()) return this.transloco.translate('chat.input.sessionStarting');
+        if (!this.chat.isConnected()) return this.transloco.translate('chat.input.connect');
+        if (this.chat.isInterrupting()) return this.transloco.translate('chat.input.stopping');
+        if (this.chat.isStreaming()) return this.transloco.translate('chat.input.working');
         // isAwaitingTurn: the send is accepted but no agent has picked it up
         // yet — say "waiting", not "working"; the queued bubble carries the
         // escalation copy.
@@ -3280,6 +3445,8 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
     ngOnDestroy(): void {
         // Don't disconnect — keep session alive across navigation
         this.stopIdePolling();
+        this.vmIdeOpenDestroyed = true;
+        if (this.pendingVmIdeOpen) this.abandonVmIdeOpen(this.pendingVmIdeOpen);
         if (this.startupTickInterval) {
             clearInterval(this.startupTickInterval);
             this.startupTickInterval = null;
@@ -3328,7 +3495,12 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
         // /rewind is pure UI — open the target picker instead of handing the
         // text to the service, which would send it to the agent as chat.
         if (isRewindCommand(text)) {
-            if (!this.chat.rewindModeAvailable('conversation')) return;
+            // Not offered in the slash menu either, but a typed-out /rewind
+            // must be refused out loud rather than vanish without a word.
+            if (!this.chat.rewindModeAvailable('conversation')) {
+                this.chat.error.set(this.transloco.translate('chat.rewind.unavailable'));
+                return;
+            }
             this.inputText = '';
             clearDraft(threadId);
             this.openRewindPicker();
@@ -3658,8 +3830,9 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
         const files = event.dataTransfer?.files;
         if (!files || files.length === 0) return;
         // Honour the same gating as the file picker — if the session is
-        // disconnected, the upload would fail anyway.
-        if (!this.chat.isConnected()) return;
+        // disconnected, the upload would fail anyway; if its unit is parked,
+        // the chip could never be sent.
+        if (!this.chat.isConnected() || this.chat.isParked()) return;
 
         this.applyFilePreviews(await this.fileHandling.createFilePreviews(Array.from(files)));
     }
@@ -3667,8 +3840,11 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
     onInputChange(value: string): void {
         this.composerDraftRevision++;
         const trimmed = value.trimStart();
-        if (trimmed.startsWith('/')) {
-            const query = trimmed.split(/\s/)[0].toLowerCase();
+        // Offer completions only while the command word itself is being
+        // typed. Once an argument starts (`/compact the pricing`) the menu
+        // must close, or Enter "completes" the command and drops the argument.
+        if (trimmed.startsWith('/') && !/\s/.test(trimmed)) {
+            const query = trimmed.toLowerCase();
             this.slashQuery.set(query);
             this.showSlashMenu.set(this.filteredCommands().length > 0);
             this.slashSelectedIndex.set(0);
@@ -3940,12 +4116,22 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
                 return;
             }
             if (event.key === 'Tab' || (event.key === 'Enter' && !event.shiftKey)) {
-                event.preventDefault();
                 const selected = cmds[this.slashSelectedIndex()];
-                if (selected) {
-                    this.selectSlashCommand(selected);
+                // Enter on a command that is already typed in full runs it
+                // (falls through to the send below); otherwise complete it.
+                if (
+                    event.key === 'Enter' &&
+                    selected &&
+                    this.inputText.trim().toLowerCase() === selected.command
+                ) {
+                    this.showSlashMenu.set(false);
+                } else {
+                    event.preventDefault();
+                    if (selected) {
+                        this.selectSlashCommand(selected);
+                    }
+                    return;
                 }
-                return;
             }
             if (event.key === 'Escape') {
                 this.showSlashMenu.set(false);
@@ -4013,6 +4199,100 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
         });
     }
 
+    openVmCodeServer(): void {
+        const threadId = this.chat.threadId();
+        if (!threadId || this.vmIdeOpenDestroyed) return;
+        const tab = window.open('', '_blank');
+        if (!tab) {
+            this.toast.warning(this.transloco.translate('jobs.lifecycle.popupBlocked'));
+            return;
+        }
+        tab.opener = null;
+        tab.document.title = this.transloco.translate('jobs.lifecycle.wakingTab');
+        tab.document.body.textContent = this.transloco.translate('jobs.lifecycle.wakingTab');
+        if (this.pendingVmIdeOpen) this.abandonVmIdeOpen(this.pendingVmIdeOpen);
+        const attempt: PendingVmIdeOpen = {
+            threadId, tab, leaseId: null, timer: null, state: 'pending',
+            leaseCloseRequested: false,
+            applyLifecycle: this.chat.captureWorkspaceLifecycleUpdate(threadId),
+        };
+        this.pendingVmIdeOpen = attempt;
+        // Keep the response callback after abandonment: the server may already
+        // have admitted a lease whose exact ID we still need to close.
+        this.api.startThreadIdeSession(threadId).subscribe(result => {
+            const leaseId = result?.access_lease_id;
+            attempt.leaseId = leaseId ?? null;
+            if (!this.isCurrentVmIdeOpen(attempt, result)) {
+                this.abandonVmIdeOpen(attempt);
+                return;
+            }
+            if (!result || !leaseId || result.status === 'unavailable') {
+                this.abandonVmIdeOpen(attempt);
+                this.toast.warning(this.transloco.translate('jobs.lifecycle.ideUnavailable'));
+                return;
+            }
+            if (result.status === 'active' && result.code_server_url) {
+                this.handOffVmIdeOpen(attempt, result.code_server_url);
+                return;
+            }
+            let attempts = 0;
+            attempt.timer = setInterval(() => {
+                if (!this.isCurrentVmIdeOpen(attempt)) {
+                    this.abandonVmIdeOpen(attempt);
+                    return;
+                }
+                if (++attempts > 100) {
+                    this.abandonVmIdeOpen(attempt);
+                    this.toast.warning(this.transloco.translate('jobs.lifecycle.wakeTimedOut'));
+                    return;
+                }
+                this.api.getThreadIdeStatus(threadId, leaseId).subscribe(status => {
+                    if (!this.isCurrentVmIdeOpen(attempt, status)) {
+                        this.abandonVmIdeOpen(attempt);
+                        return;
+                    }
+                    if (status?.status === 'active' && status.code_server_url) {
+                        this.handOffVmIdeOpen(attempt, status.code_server_url);
+                    } else if (!status || status.status === 'unavailable' || status.status === 'failed') {
+                        this.abandonVmIdeOpen(attempt);
+                        this.toast.warning(this.transloco.translate('jobs.lifecycle.ideUnavailable'));
+                    }
+                });
+            }, 3000);
+        });
+    }
+
+    private isCurrentVmIdeOpen(attempt: PendingVmIdeOpen, status?: IdeSessionStatus | null): boolean {
+        return attempt.state === 'pending' && !this.vmIdeOpenDestroyed
+            && this.pendingVmIdeOpen === attempt && !attempt.tab.closed
+            && attempt.applyLifecycle(status?.workspace_lifecycle);
+    }
+
+    private abandonVmIdeOpen(attempt: PendingVmIdeOpen): void {
+        if (attempt.state === 'handedOff') return;
+        if (attempt.state === 'pending') {
+            attempt.state = 'abandoned';
+            if (!attempt.tab.closed) attempt.tab.close();
+        }
+        if (attempt.timer) clearInterval(attempt.timer);
+        attempt.timer = null;
+        if (this.pendingVmIdeOpen === attempt) this.pendingVmIdeOpen = null;
+        if (attempt.leaseId && !attempt.leaseCloseRequested) {
+            attempt.leaseCloseRequested = true;
+            this.api.closeThreadIdeLease(attempt.threadId, attempt.leaseId).subscribe();
+        }
+    }
+
+    private handOffVmIdeOpen(attempt: PendingVmIdeOpen, url: string): void {
+        attempt.state = 'handedOff';
+        if (attempt.timer) clearInterval(attempt.timer);
+        attempt.timer = null;
+        this.pendingVmIdeOpen = null;
+        // The Ready popup now owns its transport and lease independently of
+        // the Session view. Navigation must not revoke that active IDE tab.
+        attempt.tab.location.href = url;
+    }
+
     /**
      * The session scratch folder is only relabelled when a project-folder
      * action sits beside it. On an ordinary session there is nothing to
@@ -4023,6 +4303,14 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
             ? 'chat.header.sessionFilesButton'
             : 'chat.header.filesButton',
     );
+
+    /** The protected folder's row in the cloud folders strip points at the
+     *  review banner, the one place the review opens from. */
+    showCloudReview(): void {
+        const banner = this.cloudReviewBanner?.nativeElement;
+        banner?.scrollIntoView({block: 'nearest'});
+        banner?.querySelector<HTMLElement>('button')?.focus();
+    }
 
     /** PC-19: the protected project folder, never a guessed URL. Only ever
      *  reachable when `verifiedProjectFolder` resolved one. */
@@ -4059,17 +4347,29 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
     async disconnectAndLeave(): Promise<void> {
         if (this.isDisconnecting()) return;
         this.isDisconnecting.set(true);
+        let outcome: EndSessionOutcome = 'done';
         try {
-            await this.chat.endSession();
+            outcome = await this.chat.endSession();
         } catch (e: any) {
             this.toast.danger(this.errors.translate(e, 'errors.sessions.endFailed'));
-        } finally {
-            // Leaving destroys this component, so clearing the flag is normally
-            // moot — but a guard can refuse the navigation, and then the header
-            // has to come back rather than spin forever.
-            const left = await this.router.navigate(['/sessions']);
-            if (!left) this.isDisconnecting.set(false);
+            this.isDisconnecting.set(false);
+            return;
         }
+        if (outcome !== 'done') {
+            // The session is still here: the user declined to stop a busy
+            // turn (`kept`), or cleanup has not finished and End is
+            // the retry (`retryable`). Stay, with End usable again.
+            if (outcome === 'retryable') {
+                this.toast.warning(this.transloco.translate('errors.sessions.endRetryable'));
+            }
+            this.isDisconnecting.set(false);
+            return;
+        }
+        // Leaving destroys this component, so clearing the flag is normally
+        // moot — but a guard can refuse the navigation, and then the header
+        // has to come back rather than spin forever.
+        const left = await this.router.navigate(['/sessions']);
+        if (!left) this.isDisconnecting.set(false);
     }
 
     async onRenameSession(threadId: string, title: string): Promise<void> {
@@ -4116,7 +4416,9 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
 
     private fetchIdeStatus(threadId: string): void {
         this.idePollingAttempts++;
+        const applyLifecycle = this.chat.captureWorkspaceLifecycleUpdate(threadId);
         this.api.getThreadIdeStatus(threadId).subscribe(status => {
+            if (!applyLifecycle(status?.workspace_lifecycle)) return;
             this.ideStatus.set(status);
             // Stop polling once active or after 30 attempts (5 min)
             if (status?.status === 'active' || this.idePollingAttempts >= 30) {
@@ -4334,6 +4636,44 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
         const views = group.events.map((e) => this.toolView(e));
         this.jobBatchViewsCache.set(group, views);
         return views;
+    }
+
+    /** Members of a subagent fan-out, memoized per group object like {@link jobBatchViews}. */
+    private readonly delegateBatchMembersCache = new WeakMap<object, DelegateBatchMember[]>();
+
+    delegateBatchMembers(group: EventGroup & {kind: 'delegate_batch'}): DelegateBatchMember[] {
+        const cached = this.delegateBatchMembersCache.get(group);
+        if (cached) return cached;
+        const members = buildDelegateBatchMembers(group.events, (e) => this.toolView(e));
+        this.delegateBatchMembersCache.set(group, members);
+        return members;
+    }
+
+    /**
+     * Whether assistant prose follows a fan-out in the transcript, so a call
+     * still without a result is abandoned, not running, and must not be polled.
+     *
+     * Kept apart from {@link delegateBatchMembers}: that memo is keyed on the
+     * group, and a group of an older turn keeps its object identity when a later
+     * turn arrives. This one is rebuilt whenever the transcript changes.
+     */
+    private delegateSupersededCache: {
+        turns: readonly Turn[];
+        byGroup: WeakMap<object, boolean>;
+    } | null = null;
+
+    delegateBatchSuperseded(turn: AssistantTurn, group: EventGroup & {kind: 'delegate_batch'}): boolean {
+        const turns = this.chat.turns();
+        if (this.delegateSupersededCache?.turns !== turns) {
+            this.delegateSupersededCache = {turns, byGroup: new WeakMap()};
+        }
+        const cache = this.delegateSupersededCache.byGroup;
+        let superseded = cache.get(group);
+        if (superseded === undefined) {
+            superseded = isFollowedByAnswer(turns, turn, group.events[group.events.length - 1].id);
+            cache.set(group, superseded);
+        }
+        return superseded;
     }
 
     /**

@@ -172,6 +172,7 @@ async def prepare_pinned_session_mutation_target(
     runtime_generation: str,
     attach_token: str,
     dependencies: PinnedSessionMutationTargetDependencies,
+    required_capability: str | None = None,
 ) -> PinnedSessionMutationTarget | None:
     """Resolve one exact registered process before delivering session state."""
 
@@ -234,6 +235,9 @@ async def prepare_pinned_session_mutation_target(
     if not (
         isinstance(capabilities, Mapping)
         and capabilities.get("pinned_session_recipient_binding") is True
+        and (
+            required_capability is None or capabilities.get(required_capability) is True
+        )
         and observed_thread in {None, "", thread_id}
     ):
         return None

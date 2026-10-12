@@ -8,6 +8,12 @@ relaxing one.
 from pydantic import BaseModel, Field, field_validator
 
 
+class VMGatewayAccessRequest(BaseModel):
+    """Bounded signed gateway proof; identity is resolved from key and handle."""
+
+    proof: dict[str, str | int] = Field(...)
+
+
 class SshKeyCreate(BaseModel):
     name: str = Field(..., min_length=1, max_length=100, description="Display name")
     public_key: str = Field(..., min_length=1, max_length=8192)

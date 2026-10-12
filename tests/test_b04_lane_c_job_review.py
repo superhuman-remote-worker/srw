@@ -5,10 +5,10 @@ Characterization first: ``tests/test_export_to_cloud_endpoint.py``,
 already drive these three handlers through ``orchestrator.main``. This suite
 re-states the properties that a *handler move* can quietly change and that the
 existing suites do not pin: which gate guards which route (and that the export
-alone needs the authenticated user, not just the row), that the deterministic
-folder name and the collapsed prefix survive, that a failed share is a success
-with ``shared: false``, and that the review session's server-authored seed is
-still set on a private attribute JSON cannot reach.
+and the review session need the authenticated user, not just the row), that
+the folder name and the collapsed prefix survive, that a failed share is a
+success with ``shared: false``, and that the review session's server-authored
+seed is still set on a private attribute JSON cannot reach.
 """
 
 from __future__ import annotations
@@ -46,6 +46,8 @@ USER = {
 }
 REPO = "job-a6fa6f2a"
 BRANCH = "job/a6fa6f2a"
+#: The job's full id, the suffix of a new outbox folder's name.
+JOB_HEX = JOB_ID.replace("-", "")
 
 
 # =============================================================================
@@ -54,17 +56,17 @@ BRANCH = "job/a6fa6f2a"
 
 
 class TestJobExportFolderName:
-    def test_the_slug_leads_and_the_short_id_disambiguates(self):
+    def test_the_slug_leads_and_the_full_id_disambiguates(self):
         assert (
             job_export._job_export_folder_name(JOB_ID, "You maintain a daily digest")
-            == "you-maintain-a-daily-digest-a6fa6f2a"
+            == f"you-maintain-a-daily-digest-{JOB_HEX}"
         )
 
     def test_the_same_job_always_maps_to_the_same_name(self):
         first = job_export._job_export_folder_name(JOB_ID, "Ship it")
         second = job_export._job_export_folder_name(JOB_ID, "Ship it")
 
-        assert first == second == "ship-it-a6fa6f2a"
+        assert first == second == f"ship-it-{JOB_HEX}"
 
     def test_accents_are_folded_rather_than_dropped_to_dashes(self):
         assert job_export._job_export_folder_name(JOB_ID, "Führe aus").startswith(
@@ -74,22 +76,22 @@ class TestJobExportFolderName:
     def test_only_the_first_line_of_a_multi_line_description_is_used(self):
         assert job_export._job_export_folder_name(
             JOB_ID, "First line\nSecond line"
-        ) == ("first-line-a6fa6f2a")
+        ) == (f"first-line-{JOB_HEX}")
 
     def test_a_long_description_is_cut_on_a_word_boundary(self):
         name = job_export._job_export_folder_name(
             JOB_ID, "alpha bravo charlie delta echo foxtrot golf hotel india"
         )
 
-        assert name.endswith("-a6fa6f2a")
-        slug = name[: -len("-a6fa6f2a")]
+        assert name.endswith(f"-{JOB_HEX}")
+        slug = name[: -len(f"-{JOB_HEX}")]
         assert len(slug) <= job_export._EXPORT_SLUG_MAX
         assert not slug.endswith("-")
 
     @pytest.mark.parametrize("description", ["", None, "   ", "!!! ???"])
     def test_an_unusable_description_falls_back_to_the_job_id(self, description):
         assert job_export._job_export_folder_name(JOB_ID, description) == (
-            "job-a6fa6f2a9101"
+            f"job-{JOB_HEX}"
         )
 
     def test_the_name_is_a_single_safe_path_segment(self):
@@ -124,6 +126,7 @@ def _job(**over):
     job = {
         "id": JOB_ID,
         "status": "completed",
+        "user_id": USER["id"],
         "description": "Ship it",
         "project_has_cloud_folder": False,
         "freeze_data": {"deliverables": ["output/digest.md"]},
@@ -150,6 +153,15 @@ def _backend(**over):
     return backend
 
 
+def _export_store(owner=USER):
+    """The job's owner (whom its outbox is shared with) and the writes."""
+    return SimpleNamespace(
+        update_job_exported_folder=AsyncMock(),
+        get_user=AsyncMock(return_value=owner),
+        merge_job_context=AsyncMock(),
+    )
+
+
 def _export_deps(*, job=None, backend=None, forge=None, store=None, gate=None):
     backend = backend if backend is not None else _backend()
     forge = forge or SimpleNamespace(
@@ -157,7 +169,7 @@ def _export_deps(*, job=None, backend=None, forge=None, store=None, gate=None):
         list_contents=AsyncMock(return_value=[]),
         get_file_bytes=AsyncMock(return_value=b"payload"),
     )
-    store = store or SimpleNamespace(update_job_exported_folder=AsyncMock())
+    store = store or _export_store()
     export = job_export.JobExportDependencies(
         store=store,
         forge=forge,
@@ -187,11 +199,13 @@ def _request():
 class TestExportToSharedFolder:
     @pytest.mark.asyncio
     async def test_the_gate_supplies_both_the_user_and_the_row(self):
-        """Export is the one lane C route that needs the caller, not just the
-        row: the cloud folder is provisioned and shared in that user's name."""
-        gate = AsyncMock(return_value=(USER, _job()))
+        """Export needs the caller, not just the row, but the folder is the
+        job owner's: provisioned and shared in the owner's name, read from
+        the store, whoever re-syncs it."""
+        gate = AsyncMock(return_value=({"id": "someone-else"}, _job()))
         backend = _backend()
-        deps = _export_deps(gate=gate, backend=backend)
+        store = _export_store()
+        deps = _export_deps(gate=gate, backend=backend, store=store)
         seen = {}
 
         def for_owner(user):
@@ -203,6 +217,7 @@ class TestExportToSharedFolder:
         await export_job_to_shared_folder(_request(), JOB_ID, dependencies=deps)
 
         gate.assert_awaited_once()
+        store.get_user.assert_awaited_once_with(USER["id"])
         assert seen["user"] is USER
         assert backend.ensure_user.await_args.kwargs["sub"] == "sub-1"
         assert backend.ensure_user.await_args.kwargs["email"] == USER["email"]
@@ -222,17 +237,77 @@ class TestExportToSharedFolder:
         )
 
     @pytest.mark.asyncio
-    async def test_a_cloud_folder_project_is_routed_to_the_diff_flow(self):
+    async def test_a_cloud_folder_project_resyncs_its_outbox_too(self):
         deps = _export_deps(job=_job(project_has_cloud_folder=True))
 
-        with pytest.raises(HTTPException) as exc:
-            await export_job_to_shared_folder(_request(), JOB_ID, dependencies=deps)
-
-        assert exc.value.status_code == 409
-        assert exc.value.detail == (
-            "Job's project has a cloud folder — use the diff-review "
-            "(accept/reject) flow instead of shared-folder export."
+        result = await export_job_to_shared_folder(
+            _request(), JOB_ID, dependencies=deps
         )
+
+        assert result["files_copied"] == 1
+        assert result["shared"] is True
+
+    @pytest.mark.asyncio
+    async def test_a_job_in_review_is_exported(self):
+        deps = _export_deps(job=_job(status="reviewing"))
+        result = await export_job_to_shared_folder(
+            _request(), JOB_ID, dependencies=deps
+        )
+        assert result["files_copied"] == 1
+
+    @pytest.mark.asyncio
+    async def test_a_full_share_bucket_leaves_the_copy_unshared(self):
+        from orchestrator.services.cloud.retry import BucketFull
+
+        backend = _backend(share_session_folder=AsyncMock(side_effect=BucketFull(90)))
+        deps = _export_deps(backend=backend)
+
+        result = await export_job_to_shared_folder(
+            _request(), JOB_ID, dependencies=deps
+        )
+
+        assert (result["shared"], result["unshared"]) == (False, "rate_limited")
+        assert result["files_copied"] == 1
+
+    @pytest.mark.asyncio
+    async def test_a_share_error_after_the_copy_is_unshared_not_a_502(self):
+        backend = _backend(
+            share_session_folder=AsyncMock(side_effect=_cloud_error("dup"))
+        )
+        deps = _export_deps(backend=backend)
+
+        result = await export_job_to_shared_folder(
+            _request(), JOB_ID, dependencies=deps
+        )
+
+        assert (result["shared"], result["unshared"]) == (False, "share_failed")
+
+    @pytest.mark.asyncio
+    async def test_a_resync_renews_a_folder_an_earlier_copy_shared(self):
+        """A re-sync re-creates a share the owner removed; a cloud that
+        refuses a second share of a recorded share keeps the one it has."""
+        handle = SessionFolderHandle(backend="nextcloud", native_id="/folder/17")
+        backend = _backend(
+            share_session_folder=AsyncMock(
+                side_effect=CloudBackendError(
+                    CloudBackendErrorKind.PERMISSION_DENIED,
+                    "already shared",
+                    backend="nextcloud",
+                )
+            )
+        )
+        job = _job(
+            exported_folder_handle=handle.to_db(),
+            context={"job_outbox": {"shared": True, "handle": handle.to_db()}},
+        )
+        deps = _export_deps(job=job, backend=backend)
+
+        result = await export_job_to_shared_folder(
+            _request(), JOB_ID, dependencies=deps
+        )
+
+        assert result["shared"] is True
+        backend.share_session_folder.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_an_uninitialized_backend_refuses_before_the_forge_check(self):
@@ -275,19 +350,26 @@ class TestExportToSharedFolder:
 
         deps.export.cloud_router.for_owner(
             USER
-        ).ensure_session_folder.assert_awaited_once_with(session_id="old-name")
+        ).ensure_session_folder.assert_awaited_once_with(
+            session_id="old-name", exclusive=False
+        )
         assert result["folder"]["name"] == "old-name"
 
     @pytest.mark.asyncio
     async def test_a_fresh_export_derives_the_name_from_the_job(self):
-        deps = _export_deps()
+        backend = _backend()
+        deps = _export_deps(backend=backend)
 
         result = await export_job_to_shared_folder(
             _request(), JOB_ID, dependencies=deps
         )
 
-        assert result["folder"]["name"] == "ship-it-a6fa6f2a"
-        assert result["folder"]["path"] == "/ship-it-a6fa6f2a"
+        # A new folder is created as the job's own, never reused.
+        backend.ensure_session_folder.assert_awaited_once_with(
+            session_id=f"ship-it-{JOB_HEX}", exclusive=True
+        )
+        assert result["folder"]["name"] == f"ship-it-{JOB_HEX}"
+        assert result["folder"]["path"] == f"/ship-it-{JOB_HEX}"
 
     @pytest.mark.asyncio
     async def test_the_common_prefix_is_collapsed_on_the_destination(self):
@@ -473,7 +555,7 @@ class TestExportToSharedFolder:
 
     @pytest.mark.asyncio
     async def test_the_job_is_stamped_only_after_a_successful_copy(self):
-        store = SimpleNamespace(update_job_exported_folder=AsyncMock())
+        store = _export_store()
         backend = _backend(put_session_file=AsyncMock(side_effect=ValueError("odd")))
         deps = _export_deps(backend=backend, store=store)
 
@@ -484,7 +566,7 @@ class TestExportToSharedFolder:
 
     @pytest.mark.asyncio
     async def test_a_successful_export_stamps_the_handle(self):
-        store = SimpleNamespace(update_job_exported_folder=AsyncMock())
+        store = _export_store()
         deps = _export_deps(store=store)
 
         result = await export_job_to_shared_folder(
@@ -528,7 +610,10 @@ def _review_deps(*, job=None, store=None, create_thread=None, bundle=None):
             return_value=[
                 {"id": DATASOURCE_ID, "connection_url": "https://forge/org/app.git"}
             ]
-        )
+        ),
+        # The review session reads the policy rows of what it attaches; a
+        # connector without one stays and fails closed at admission.
+        get_datasource_policy_rows=AsyncMock(return_value=[]),
     )
     review = job_review_session.JobReviewSessionDependencies(
         store=store,

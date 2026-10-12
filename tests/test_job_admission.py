@@ -1,6 +1,7 @@
 """The shared admission coordinator preserves stage authority and failure order."""
 
 import asyncio
+from dataclasses import replace
 from datetime import datetime, timezone
 import subprocess
 import sys
@@ -211,6 +212,7 @@ async def test_pipeline_passes_prepared_authority_and_snapshot_references(flow, 
         internal_call=origin == "internal_rest",
         internal_origin_bound=True,
         dependencies=flow.factories["datasources"].return_value,
+        unattended=True,
     )
     flow.stages["delivery"].assert_awaited_once_with(
         command=flow.command,
@@ -262,6 +264,17 @@ async def test_pipeline_passes_prepared_authority_and_snapshot_references(flow, 
         *(step for name in STAGES for step in (f"bind_{name}", name)),
         "redact",
     ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("preparation", [None, object()])
+async def test_only_an_officer_ticket_selects_as_unattended(flow, preparation):
+    # Work a user starts gets their outbox among its defaults; an officer's
+    # ticket (prepared by the officer stage) does not.
+    flow.stages["officer"].return_value = replace(flow.officer, preparation=preparation)
+    await admit(flow)
+    kwargs = flow.stages["datasources"].await_args.kwargs
+    assert kwargs["unattended"] is (preparation is not None)
 
 
 @pytest.mark.asyncio

@@ -89,12 +89,38 @@ _POST_SPLIT_OVERLAY_ADDITIONS: dict[str, tuple[str, ...]] = {
     # WP3: the roster runtime knobs on DelegationConfig (schema + overlay
     # values; the dataclass defaults are identical, so the effective-config
     # identity below holds without an exclusion).
-    "worker": ("delegation.max_concurrent", "delegation.run_in_background_default"),
+    # Summarizer thinking off: the shared root states
+    # auxiliary.summarization_reasoning_level (both roles; same value as the
+    # dataclass default, so the effective compare needs no exclusion).
+    # Append-only context injection WP2: the shared root states
+    # context_management.injection_mode and memory.max_memories_per_entry
+    # (both roles; same values as the dataclass defaults, so the effective
+    # compare needs no exclusion).
+    # Append-only context injection WP5a: the shared root binds memory_search
+    # (a new category, tools.memory) and its memory.pipeline.extensions entry,
+    # both roles (D34). Both differ from the dataclass defaults ([]), so the
+    # effective compare strips them on both sides.
+    "worker": (
+        "delegation.max_concurrent",
+        "delegation.run_in_background_default",
+        "auxiliary.summarization_reasoning_level",
+        "context_management.injection_mode",
+        "memory.max_memories_per_entry",
+        "tools.memory",
+        "memory.pipeline.extensions",
+    ),
     # U3 WP1: the persistent loop reads limits.llm_inproc_retries (it was a
     # hard-coded 3); the overlay pins the historical 3 against the dataclass
     # default of 5, so the effective compare strips it too (see
     # ``_without_effective_additions``).
-    "session": ("limits.llm_inproc_retries",),
+    "session": (
+        "limits.llm_inproc_retries",
+        "auxiliary.summarization_reasoning_level",
+        "context_management.injection_mode",
+        "memory.max_memories_per_entry",
+        "tools.memory",
+        "memory.pipeline.extensions",
+    ),
 }
 #: Keys later work packages DELETED from an overlay after the baseline was
 #: frozen (role -> dotted paths, with the WP that removed them) — the mirror
@@ -110,12 +136,30 @@ _POST_SPLIT_OVERLAY_REMOVALS: dict[str, tuple[str, ...]] = {
     # rerank catalog capability (migration 0240): the shared root no longer
     # names the reranker model — the `rerank` pin arrives as RERANK_MODEL at
     # dispatch and the loader default is None, so the key left both overlays.
+    # Per-turn tool-result clearing was retired (it broke the prompt cache
+    # every turn), so its window key left the shared root.
     "worker": (
         "limits.tool_category_timeouts.delegation",
         "workspace.backend",
         "memory.reranker.model",
+        "context_management.keep_recent_tool_results",
     ),
-    "session": ("workspace.backend", "memory.reranker.model"),
+    "session": (
+        "workspace.backend",
+        "memory.reranker.model",
+        "context_management.keep_recent_tool_results",
+    ),
+}
+#: Keys whose overlay VALUE changed after the baseline was frozen (role ->
+#: dotted paths, with the work that changed them). Present on both sides with
+#: different values: asserted present on each side first (a stale entry cannot
+#: hide a leak), then stripped from both before the comparison.
+_POST_SPLIT_OVERLAY_CHANGES: dict[str, tuple[str, ...]] = {
+    # Website demo findings F10 (2026-10-11): a session's browser runs in its
+    # own workspace container, so the session overlay opens localhost as the
+    # worker overlay does (only cloud metadata stays blocked).
+    "worker": (),
+    "session": ("browser.security.blocked_domains",),
 }
 #: Tool names later work packages added to a tool CATEGORY on top of the
 #: frozen baseline (role -> category -> names, with the work that added them).
@@ -207,6 +251,11 @@ def _without_post_split_additions(
             assert not _dotted_present(out, dotted), (
                 f"{dotted} is listed as removed but present"
             )
+    for dotted in _POST_SPLIT_OVERLAY_CHANGES.get(role, ()):
+        present = _dotted_present(out, dotted)
+        assert present or not require, f"{dotted} is listed as changed but absent"
+        if present:
+            _delete_dotted(out, dotted)
     out = _without_post_split_tools(out, role)
     return _without_post_split_bindings(out, role, require=require)
 
@@ -236,7 +285,10 @@ def _without_post_split_removals(data: dict, role: str, *, require: bool) -> dic
     role-base compare); an expert leaf on the frozen base is stripped without
     the assertion."""
     out = copy.deepcopy(data)
-    for dotted in _POST_SPLIT_OVERLAY_REMOVALS.get(role, ()):
+    for dotted in (
+        *_POST_SPLIT_OVERLAY_REMOVALS.get(role, ()),
+        *_POST_SPLIT_OVERLAY_CHANGES.get(role, ()),
+    ):
         present = _dotted_present(out, dotted)
         assert present or not require, f"{dotted} is listed as removed but absent"
         if present:
@@ -276,6 +328,7 @@ def _without_effective_additions(agent: dict, role: str) -> dict:
     for dotted in (
         *_POST_SPLIT_OVERLAY_ADDITIONS.get(role, ()),
         *_POST_SPLIT_OVERLAY_REMOVALS.get(role, ()),
+        *_POST_SPLIT_OVERLAY_CHANGES.get(role, ()),
     ):
         *parents, leaf = dotted.split(".")
         node = out

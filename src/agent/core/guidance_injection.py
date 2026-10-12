@@ -17,18 +17,24 @@ from typing import Any, Dict, List, Tuple
 
 from langchain_core.messages import AIMessage, BaseMessage, ToolMessage
 
+from shared.runtime.core.injection_markers import (
+    GUIDANCE_TOOL_CALL_ID_PREFIX as GUIDANCE_TOOL_CALL_ID_PREFIX,
+)
 from shared.runtime.core.workspace_injection import content_hash_id
 
-# Prefix for identifying synthetic guidance injection tool calls
-GUIDANCE_TOOL_CALL_ID_PREFIX = "guidance_inject_"
 
-
-def format_supervisor_guidance(entries: List[Dict[str, Any]]) -> str:
+def format_supervisor_guidance(
+    entries: List[Dict[str, Any]], repeat_notice: bool = True
+) -> str:
     """Render all pending guidance entries as one [SUPERVISOR GUIDANCE] block.
 
     Args:
         entries: Pending guidance entries from the heartbeat inbox, each
             ``{id, text, source, created_at}``.
+        repeat_notice: Keep the "may repeat for a turn or two" sentence. The
+            legacy tail re-renders guidance until the ack lands; an
+            append-only entry appears once and stays (D21), so it drops the
+            sentence.
 
     Returns:
         Formatted block, or "" when there is nothing to render.
@@ -50,9 +56,13 @@ def format_supervisor_guidance(entries: List[Dict[str, Any]]) -> str:
     header = (
         "[SUPERVISOR GUIDANCE] Mid-run guidance from your supervisor. "
         "Your current plan and todos remain in force — fold this guidance "
-        "into the work in progress instead of re-planning. It may repeat "
-        "for a turn or two until delivery is confirmed; act on it once."
+        "into the work in progress instead of re-planning."
     )
+    if repeat_notice:
+        header += (
+            " It may repeat for a turn or two until delivery is confirmed; "
+            "act on it once."
+        )
     return header + "\n\n" + "\n".join(lines)
 
 

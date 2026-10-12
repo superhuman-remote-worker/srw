@@ -68,3 +68,12 @@ croniter>=2.0.0
 # 2026-09-17, sha-2a9f65a). The module also has a no-op fallback so dev
 # stays safe if the API is absent.
 opentelemetry-api>=1.20.0
+# Connector "Test connection" opens the target from the orchestrator
+# (services/connector_drivers/managed.py, mcp_client.py). The clients are
+# imported lazily, so without them the image boots and every Neo4j, WebDAV and
+# MCP test reports "connection failed" whatever the target (live-diagnosed on
+# k3d 2026-10-08). Floors match the agent's root requirements.txt. MongoDB's
+# pymongo already arrives through motor.
+neo4j>=5.16.0
+webdavclient3>=3.14.0
+mcp>=1.9,<2.0

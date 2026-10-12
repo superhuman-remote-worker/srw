@@ -12,6 +12,7 @@ from fastapi.responses import HTMLResponse, RedirectResponse, StreamingResponse
 from fastapi.testclient import TestClient
 
 from shared.anti_framing import TrustedParentAntiFramingMiddleware
+from orchestrator.application import http as http_composition
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -279,15 +280,13 @@ def test_same_origin_compatibility_prefix_must_be_narrow(prefix: str) -> None:
 def test_ide_exception_fails_closed_when_api_and_cockpit_share_an_authority(
     monkeypatch,
 ) -> None:
-    import orchestrator.main
-
     monkeypatch.setenv("IDE_PROXY_BASE_URL", "https://cockpit.example.test")
     monkeypatch.setenv("SRW_SPA_BASE_URL", "https://cockpit.example.test:443")
     monkeypatch.setenv("CORS_ORIGINS", "https://cockpit.example.test.")
-    assert orchestrator.main._isolated_ide_frame_authorities() == {}
+    assert http_composition.isolated_ide_frame_authorities() == {}
 
     monkeypatch.setenv("IDE_PROXY_BASE_URL", "https://api.example.test:443")
-    assert orchestrator.main._isolated_ide_frame_authorities() == {
+    assert http_composition.isolated_ide_frame_authorities() == {
         "/api/ide/": ("api.example.test", "api.example.test:443")
     }
 

@@ -22,6 +22,46 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+#: Lead line of the message that restates the todo list when the conversation
+#: no longer contains its current rendering (after compaction, on resume).
+TODO_LIST_RESTATEMENT_LEAD = (
+    "[TODO_LIST] Your current todo list, restated because the conversation "
+    "no longer shows it:"
+)
+
+
+#: Longest headline shown for a todo that is no longer the current work.
+TODO_HEADLINE_MAX_CHARS = 240
+
+
+def todo_headline(content: str) -> str:
+    """First line of a todo, whitespace-collapsed and capped.
+
+    Completed todos, and the "Completed:"/"Next:" lines of a todo tool
+    result, show only this: the full body of a finished todo is already in
+    the history (the phase-start list) and the phase archive, and repeating
+    long strategic bodies in every todo result would grow the history by
+    several thousand tokens per completion.
+    """
+    first = next((line for line in content.splitlines() if line.strip()), "")
+    line = " ".join(first.split())
+    if len(line) > TODO_HEADLINE_MAX_CHARS:
+        line = f"{line[: TODO_HEADLINE_MAX_CHARS - 1].rstrip()}…"
+    return line
+
+
+def _message_text(message: Any) -> str:
+    """Plain text of a message's content (str, or the text parts of a list)."""
+    content = getattr(message, "content", "")
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "\n".join(
+            part.get("text", "") if isinstance(part, dict) else str(part)
+            for part in content
+        )
+    return str(content or "")
+
 
 class TodoStatus(Enum):
     """Status values for todo items."""
@@ -362,21 +402,30 @@ class TodoManager:
         return all(t.status == TodoStatus.COMPLETED for t in self._todos)
 
     def format_for_injection(self) -> str:
-        """Format the full todo list for transient HumanMessage injection.
+        """Render the full current todo list — the one rendering the model sees.
 
         Returns all todos grouped by status (completed, in progress, pending)
         with a brief tool usage guide. Completed items are shown as crossed
-        off so the agent retains awareness of finished work after context
-        compaction.
+        off so the agent retains awareness of finished work.
+
+        The list enters the conversation history once per change and is never
+        re-rendered per request (append-only context injection, D17-D19):
+        the ``todo_complete`` and ``next_phase_todos`` results, the phase-start
+        messages and the restatement after compaction or on resume all embed
+        this exact text, and ``list_restatement`` checks for it by substring.
+        So it must be a pure function of the durable todo state: no counters
+        that move without a list change, no timestamps, no turn numbers, and
+        nothing that is lost on a checkpoint resume (the staged phase name is
+        not checkpointed, so it is not part of the header).
 
         Returns:
-            Formatted string for injection into prepared_messages
+            Formatted todo list, or "No active todos." for an empty list
         """
         if not self._todos:
             return "No active todos."
 
         phase_type = "Strategic" if self._is_strategic_phase else "Tactical"
-        phase_name = self._current_phase_name or self._staged_phase_name
+        phase_name = self._current_phase_name
         if phase_name:
             lines = [
                 f"Current Tasks — Phase {self._phase_number} ({phase_type}): {phase_name}"
@@ -398,7 +447,7 @@ class TodoManager:
             lines.append("")
             lines.append("Completed:")
             for todo in completed:
-                lines.append(f"  - [x] {todo.id}: {todo.content}")
+                lines.append(f"  - [x] {todo.id}: {todo_headline(todo.content)}")
                 if todo is latest_noted_todo:
                     note = " | ".join(" ".join(item.split()) for item in todo.notes)
                     if len(note) > 1000:
@@ -432,6 +481,23 @@ class TodoManager:
         lines.append(format_nudge("todo_list_footer", model=self._model_name))
 
         return "\n".join(lines)
+
+    def list_restatement(self, messages: List[Any]) -> Optional[str]:
+        """Text that restates the current list, or None when none is needed.
+
+        None when the list is empty or its current rendering
+        (``format_for_injection``) already appears in ``messages``: a todo
+        tool result, a phase-start message or an earlier restatement. The
+        caller appends the text once as a HumanMessage (world-state rule:
+        append when absent, never re-render per request).
+        """
+        if not self._todos:
+            return None
+        rendering = self.format_for_injection()
+        for message in reversed(messages):
+            if rendering in _message_text(message):
+                return None
+        return f"{TODO_LIST_RESTATEMENT_LEAD}\n\n{rendering}"
 
     def format_for_display(self) -> str:
         """Format todos for Layer 2 injection.
@@ -716,6 +782,10 @@ class TodoManager:
             Phase name or empty string if not set
         """
         return self._staged_phase_name
+
+    def list_staged(self) -> List[TodoItem]:
+        """List the todos staged for the next tactical phase."""
+        return self._staged_todos.copy()
 
     def apply_staged_todos(self) -> None:
         """Apply staged todos to the active todo list.

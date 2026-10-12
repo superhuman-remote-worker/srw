@@ -520,21 +520,23 @@ class TestTeardownExtraction:
         extraction = AsyncMock()
         with (
             patch(
-                "agent.api.persistent_app._begin_exact_session_retirement",
+                "agent.api.persistent_app._session_termination.begin_retirement",
                 AsyncMock(return_value=True),
             ),
             patch(
-                "agent.api.persistent_app._termination_admission_closed",
+                "agent.api.persistent_app._session_termination.termination_admission_closed",
                 return_value=False,
             ),
             patch("agent.api.persistent_app._stateless_mode", return_value=False),
             patch("agent.api.persistent_app._session", session),
-            patch("agent.api.persistent_app._thread_id", "tid"),
+            patch("agent.api.persistent_app._session_identity._thread_id", "tid"),
             patch(
                 "agent.api.persistent_app._update_thread_status",
                 new=AsyncMock(return_value=True),
             ),
-            patch("agent.api.persistent_app._terminate_session", AsyncMock()),
+            patch(
+                "agent.api.persistent_app._session_termination.terminate", AsyncMock()
+            ),
             patch(
                 "shared.runtime.services.auxiliary.extract_and_store_memories",
                 extraction,
@@ -553,22 +555,24 @@ class TestTeardownExtraction:
         extraction = AsyncMock()
         with (
             patch(
-                "agent.api.persistent_app._begin_exact_session_retirement",
+                "agent.api.persistent_app._session_termination.begin_retirement",
                 AsyncMock(return_value=True),
             ),
             patch(
-                "agent.api.persistent_app._termination_admission_closed",
+                "agent.api.persistent_app._session_termination.termination_admission_closed",
                 return_value=False,
             ),
             patch("agent.api.persistent_app._stateless_mode", return_value=False),
             patch("agent.api.persistent_app._session", session),
-            patch("agent.api.persistent_app._thread_id", "tid"),
+            patch("agent.api.persistent_app._session_identity._thread_id", "tid"),
             patch("agent.api.persistent_app._broadcast"),
             patch(
                 "agent.api.persistent_app._update_thread_status",
                 AsyncMock(return_value=True),
             ),
-            patch("agent.api.persistent_app._terminate_session", AsyncMock()),
+            patch(
+                "agent.api.persistent_app._session_termination.terminate", AsyncMock()
+            ),
             patch(
                 "shared.runtime.services.auxiliary.extract_and_store_memories",
                 extraction,
@@ -593,9 +597,11 @@ class TestTeardownExtraction:
         ws = AsyncMock()
         with (
             patch("agent.api.persistent_app._session", session),
-            patch("agent.api.persistent_app._thread_id", "tid"),
+            patch("agent.api.persistent_app._session_identity._thread_id", "tid"),
             patch("agent.api.persistent_app._broadcast"),
-            patch("agent.api.persistent_app._terminate_session", AsyncMock()),
+            patch(
+                "agent.api.persistent_app._session_termination.terminate", AsyncMock()
+            ),
             patch(
                 "shared.runtime.services.auxiliary.extract_and_store_memories",
                 extraction,
@@ -626,19 +632,21 @@ class TestTeardownExtraction:
         session.retire_shell_owner = MagicMock()
         with (
             patch.object(pa, "_session", session),
-            patch.object(pa, "_thread_id", "tid"),
+            patch.object(pa._session_identity, "_thread_id", "tid"),
             patch.object(pa, "_loop_task", None),
             patch.object(pa, "_event_writer", None),
-            patch.object(pa, "_stop_watchdogs"),
+            patch.object(pa._session_termination, "stop_watchdogs"),
             patch.object(pa, "_stop_thread_interrupt_watcher", AsyncMock()),
             patch.object(pa, "_stop_thread_control_watcher", AsyncMock()),
             patch.object(pa, "_retire_announced_permission_rows", AsyncMock()),
-            patch.object(pa, "_quiesce_session_side_tasks", AsyncMock()),
-            patch.object(pa, "_clear_all_canvas_awareness"),
+            patch.object(
+                pa._session_termination, "quiesce_session_side_tasks", AsyncMock()
+            ),
+            patch.object(pa._canvas_control, "clear_all"),
             patch.object(pa, "_subscribers", {}),
-            patch.object(pa, "_max_sessions_per_process", 0),
-            patch.object(pa, "_terminating", False),
+            patch.object(pa._session_termination, "max_sessions_per_process", 0),
+            patch.object(pa._session_termination, "terminating", False),
         ):
-            await pa._terminate_session("test", mark_thread=False)
+            await pa._session_termination.terminate("test", mark_thread=False)
 
         session.memory_service.capture.assert_not_awaited()

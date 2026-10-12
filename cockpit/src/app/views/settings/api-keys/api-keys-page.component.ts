@@ -7,7 +7,6 @@ import {
   inject,
   signal,
 } from '@angular/core';
-import {Router} from '@angular/router';
 import {TranslocoPipe} from '@jsverse/transloco';
 import {ApiKey, ApiKeysService, CreateApiKeyResponse} from '../../../core/services/api-keys.service';
 import {UserService} from '../../../core/services/user.service';
@@ -71,9 +70,6 @@ const DEFAULT_SCOPES = ['jobs:read', 'chat:read'];
       <div class="api-keys-container">
         <div class="page-header">
           <app-sidebar-toggle />
-          <button class="back-button" (click)="goBack()" [attr.aria-label]="'common.back' | transloco">
-            <app-icon size="inherit">arrow_back</app-icon>
-          </button>
           <h1 class="page-title">{{ 'settings.apiKeys.title' | transloco }}</h1>
         </div>
 
@@ -244,7 +240,6 @@ const DEFAULT_SCOPES = ['jobs:read', 'chat:read'];
     .api-keys-container { display: flex; flex-direction: column; gap: 24px; }
     .page-header { display: flex; align-items: center; gap: 12px; }
     .page-title { margin: 0; font-size: 1.5rem; }
-    .back-button { background: none; border: none; color: var(--text-primary); cursor: pointer; padding: 4px; display: inline-flex; align-items: center; }
     .page-desc { color: var(--text-secondary); margin: 0; }
     .section-title { margin: 0 0 4px; font-size: 1.1rem; }
     .section-desc { color: var(--text-secondary); margin: 0 0 12px; font-size: 0.9rem; }
@@ -313,7 +308,6 @@ const DEFAULT_SCOPES = ['jobs:read', 'chat:read'];
 export class ApiKeysPageComponent {
   readonly service = inject(ApiKeysService);
   private readonly userService = inject(UserService);
-  private readonly router = inject(Router);
 
   /** Master list of all scope options. */
   readonly scopes = ALL_SCOPES;
@@ -358,10 +352,6 @@ export class ApiKeysPageComponent {
 
   constructor() {
     this.service.loadKeys();
-  }
-
-  goBack(): void {
-    this.router.navigateByUrl('/settings');
   }
 
   toggleScope(value: string, checked: boolean): void {

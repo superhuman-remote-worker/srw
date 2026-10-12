@@ -23,7 +23,7 @@ from enum import Enum
 from typing import Any, Dict, List, Optional
 from uuid import UUID, uuid4
 
-from fastapi import FastAPI, HTTPException, Request, WebSocket
+from fastapi import FastAPI, HTTPException, WebSocket
 from fastapi.responses import JSONResponse
 
 from agent.api.models import (
@@ -40,12 +40,15 @@ from agent.api.models import (
     pinned_job_recipient_matches,
     pinned_session_recipient_matches,
 )
-from agent.api._session_auth import validate_session_token as _validate_session_token
 from agent.api.job_stream import close_job_stream as _close_stream
 from agent.api.orchestrator_client import (
     OrchestratorClient,
     create_orchestrator_client_from_env,
 )
+from agent.api.session_contract import canonical_session_identity_fingerprint
+from agent.api.session_http import register_session_http_routes
+from agent.api.native_workspace_first_use import register_native_first_use_route
+from agent.api.session_websocket import register_session_websocket_routes
 from agent.agent import UniversalAgent
 from shared.runtime.core.loader import resolve_config_path
 from agent.core.phase import push_evidence_snapshot
@@ -57,10 +60,8 @@ from shared.workspace_contract import (
 from shared.subagent_lifecycle import (
     SubagentLifecycleError,
 )
-from shared.pinned_session_identity import (
-    PINNED_SESSION_READY_IDENTITY_CONTRACT,
-    pinned_session_ready_identity_fingerprint,
-)
+from shared.pinned_session_identity import PINNED_SESSION_READY_IDENTITY_CONTRACT
+from shared.session_subagent_batch import SESSION_SUBAGENT_FANOUT_KEY
 
 logger = logging.getLogger(__name__)
 
@@ -280,13 +281,13 @@ async def _release_unstarted_session_attach(claim: dict[str, Any]) -> bool:
         "workspace_runtime_incarnation": claim.get("workspace_runtime_incarnation"),
     }
     pa._orchestrator_client = _orchestrator_client
-    if not pa._retain_failed_attach_release_receipt(receipt):
+    if not pa._session_attach.retain_release_receipt(receipt):
         logger.error(
             "Pre-setup attach abort for thread %s conflicts with a retained proof",
             claim["thread_id"],
         )
         return False
-    confirmed = await pa._release_failed_attach_receipt_until_confirmed(
+    confirmed = await pa._session_attach.release_receipt_until_confirmed(
         claim["thread_id"],
         runtime_generation=claim["session_runtime_generation"],
         runtime_attach_token=claim["session_runtime_attach_token"],
@@ -566,6 +567,14 @@ async def _handle_heartbeat_intents(response: Dict[str, Any]) -> None:
     global _drain_intent_received, _drain_intent_handled, _drain_deferred_logged
     _check_job_preempted(response)
     _update_guidance_inbox(response)
+    if SESSION_SUBAGENT_FANOUT_KEY in response:
+        # A pinned session adopted on persistent_app's state takes the
+        # operator's fan-out switch from this response at its next turn
+        # start (parallel_subagents.md §14.2 P5). Only a response for a
+        # pinned thread carries the key.
+        import agent.api.persistent_app as pa
+
+        pa._session_attach.hold_heartbeat_subagent_advertisement(response)
     intents = response.get("intents") or {}
     if not isinstance(intents, dict) or not intents.get("should_drain"):
         return
@@ -591,11 +600,11 @@ async def _handle_heartbeat_intents(response: Dict[str, Any]) -> None:
         os._exit(0)
     elif _pod_state == PodState.SESSION:
         # Dual pods host adopted sessions on persistent_app's module state
-        # (/session/attach seeds pa.* and calls pa._attach_session), so the
+        # (/session/attach seeds pa.* and calls pa._session_attach.attach), so the
         # drain semantics are delegated, not re-implemented.
         import agent.api.persistent_app as pa
 
-        if pa._session is None or not pa._session_parked():
+        if pa._session is None or not pa._session_termination.session_parked():
             # No live session object yet (/session/attach flips the pod
             # state before the backgrounded setup creates pa._session) or a
             # turn is in flight — never tear down out-of-band. Left
@@ -615,7 +624,7 @@ async def _handle_heartbeat_intents(response: Dict[str, Any]) -> None:
             "Drain intent received (reason=%s) — suspending session and exiting",
             intents.get("drain_reason", "unspecified"),
         )
-        await pa._drain_suspend_session()
+        await pa._session_termination.drain_suspend_session()
     elif not _drain_intent_handled:
         # Busy — log once. The graph picks this up via is_drain_requested().
         _drain_intent_handled = True
@@ -724,9 +733,9 @@ async def lifespan(app: FastAPI):
     # Detach any active session
     if _pod_state == PodState.SESSION:
         try:
-            from agent.api.persistent_app import _detach_session
+            from agent.api.persistent_app import _session_termination
 
-            await _detach_session()
+            await _session_termination.detach_session()
         except Exception as e:
             logger.warning(f"Session detach during shutdown failed: {e}")
 
@@ -890,9 +899,9 @@ async def _reset_to_idle(
 
         if _pod_state == PodState.SESSION and not skip_session_cleanup:
             try:
-                from agent.api.persistent_app import _detach_session
+                from agent.api.persistent_app import _session_termination
 
-                await _detach_session()
+                await _session_termination.detach_session()
             except Exception as e:
                 logger.warning(f"Session cleanup during reset failed: {e}")
 
@@ -1019,6 +1028,7 @@ async def _process_orchestrator_job(
     datasources: Optional[list] = None,
     repositories: Optional[list] = None,
     managed_repository_credentials: Optional[list] = None,
+    workspace_ssh_identities: Optional[list] = None,
     branch_name: Optional[str] = None,
     project_id: Optional[str] = None,
     runtime_actor: Optional[Dict[str, Any]] = None,
@@ -1084,6 +1094,8 @@ async def _process_orchestrator_job(
             metadata["repositories"] = repositories
         if managed_repository_credentials:
             metadata["managed_repository_credentials"] = managed_repository_credentials
+        if workspace_ssh_identities:
+            metadata["workspace_ssh_identities"] = workspace_ssh_identities
         if branch_name:
             metadata["branch_name"] = branch_name
         if project_id:
@@ -1203,6 +1215,9 @@ def create_dual_app(config_path: Optional[str] = None) -> FastAPI:
         version="2.0.0",
         lifespan=lifespan,
     )
+    import agent.api.persistent_app as pa
+
+    register_native_first_use_route(app, pa.native_first_use_context)
 
     # ===================================================================
     # Health endpoints
@@ -1252,7 +1267,7 @@ def create_dual_app(config_path: Optional[str] = None) -> FastAPI:
 
         # When in SESSION state, the readiness gate is the three-way check
         # in persistent_app._session_ready() — shared with /session/status
-        # and handle_persistent_websocket so probe and WS gate stay aligned.
+        # and the session WebSocket transport so probe and WS gate stay aligned.
         if _pod_state == PodState.SESSION:
             import agent.api.persistent_app as pa
 
@@ -1267,13 +1282,7 @@ def create_dual_app(config_path: Optional[str] = None) -> FastAPI:
                 and pa._session is not None
                 and pa._session.protected_cloud_ready() is True
             )
-            session_identity_fingerprint = pinned_session_ready_identity_fingerprint(
-                thread_id=pa._thread_id,
-                runtime_generation=pa._session_runtime_generation,
-                agent_id=pa._registered_pinned_agent_id(),
-                runtime_attach_token=pa._session_runtime_attach_token,
-                pod_uid=os.environ.get("POD_UID"),
-            )
+            session_identity_fingerprint = pa._session_identity.fingerprint()
             capabilities: dict[str, bool | int] = {
                 "durable_input_delivery": True,
                 "pinned_session_identity_contract": (
@@ -1286,6 +1295,8 @@ def create_dual_app(config_path: Optional[str] = None) -> FastAPI:
             }
             if _pinned_session_recipient_capable():
                 capabilities["pinned_session_recipient_binding"] = True
+            if pa._native_first_use_capable():
+                capabilities["native_workspace_first_use1"] = True
             return ReadyResponse(
                 ready=session_ready,
                 message="Session ready" if session_ready else "Session initializing",
@@ -1407,11 +1418,19 @@ def create_dual_app(config_path: Optional[str] = None) -> FastAPI:
         if _shutdown_requested:
             raise HTTPException(503, "Agent is shutting down")
 
+        from agent.api.pinned_delivery import accepted_pinned_job_delivery
+
         if _pod_state == PodState.WORKING and _current_job_id == request.job_id:
+            acknowledgement = accepted_pinned_job_delivery(
+                request,
+                _orchestrator_client,
+                retry=True,
+            )
             return JobStartResponse(
                 job_id=request.job_id,
                 status="accepted",
                 message="Job was already accepted by this runtime",
+                **acknowledgement,
             )
 
         try:
@@ -1429,6 +1448,12 @@ def create_dual_app(config_path: Optional[str] = None) -> FastAPI:
                     409,
                     f"Pod is in {_pod_state.value} state, cannot accept job",
                 )
+            # Keep the delivery binding and local state change indivisible.
+            acknowledgement = accepted_pinned_job_delivery(
+                request,
+                _orchestrator_client,
+                retry=False,
+            )
             _pod_state = PodState.WORKING
             _current_job_id = request.job_id
 
@@ -1465,6 +1490,7 @@ def create_dual_app(config_path: Optional[str] = None) -> FastAPI:
                 datasources=request.datasources,
                 repositories=request.repositories,
                 managed_repository_credentials=(request.managed_repository_credentials),
+                workspace_ssh_identities=(request.workspace_ssh_identities),
                 branch_name=request.branch_name,
                 project_id=request.project_id,
                 runtime_actor=request.runtime_actor,
@@ -1476,6 +1502,7 @@ def create_dual_app(config_path: Optional[str] = None) -> FastAPI:
             job_id=request.job_id,
             status="accepted",
             message="Job processing started",
+            **acknowledgement,
         )
 
     @app.post("/job/cancel", tags=["Worker"])
@@ -1568,11 +1595,22 @@ def create_dual_app(config_path: Optional[str] = None) -> FastAPI:
         if _shutdown_requested:
             raise HTTPException(503, "Agent is shutting down")
 
+        from agent.api.pinned_delivery import (
+            accepted_pinned_job_delivery,
+            resume_feedback_with_delegation,
+        )
+
         if _pod_state == PodState.WORKING and _current_job_id == request.job_id:
+            acknowledgement = accepted_pinned_job_delivery(
+                request,
+                _orchestrator_client,
+                retry=True,
+            )
             return JobStartResponse(
                 job_id=request.job_id,
                 status="accepted",
                 message="Job resume was already accepted by this runtime",
+                **acknowledgement,
             )
 
         try:
@@ -1590,10 +1628,20 @@ def create_dual_app(config_path: Optional[str] = None) -> FastAPI:
                     409,
                     f"Pod is in {_pod_state.value} state, cannot accept resume",
                 )
+            acknowledgement = accepted_pinned_job_delivery(
+                request,
+                _orchestrator_client,
+                retry=False,
+            )
             _pod_state = PodState.WORKING
             _current_job_id = request.job_id
 
         _clear_stop()
+        feedback, feedback_reason = resume_feedback_with_delegation(
+            request.feedback,
+            request.feedback_reason,
+            request.delegation_results,
+        )
 
         async def _do_resume():
             global _current_job_id, _pod_state
@@ -1628,10 +1676,16 @@ def create_dual_app(config_path: Optional[str] = None) -> FastAPI:
                     resume_metadata["managed_repository_credentials"] = (
                         request.managed_repository_credentials
                     )
+                if request.workspace_ssh_identities:
+                    resume_metadata["workspace_ssh_identities"] = (
+                        request.workspace_ssh_identities
+                    )
                 if request.project_id:
                     resume_metadata["project_id"] = request.project_id
                 if request.runtime_actor:
                     resume_metadata["runtime_actor"] = request.runtime_actor
+                if request.delegation_results:
+                    resume_metadata["delegation_results"] = request.delegation_results
                 resume_metadata["workspace_runtime"] = request.workspace_runtime
                 for field in (
                     "workspace_provisioner",
@@ -1657,8 +1711,8 @@ def create_dual_app(config_path: Optional[str] = None) -> FastAPI:
                     request.job_id,
                     metadata=resume_metadata if resume_metadata else None,
                     resume=True,
-                    feedback=request.feedback,
-                    feedback_reason=request.feedback_reason,
+                    feedback=feedback,
+                    feedback_reason=feedback_reason,
                     original_config_name=request.config_name,
                     previous_status=request.previous_status,
                     stream=True,
@@ -1734,6 +1788,7 @@ def create_dual_app(config_path: Optional[str] = None) -> FastAPI:
             job_id=request.job_id,
             status="accepted",
             message="Job resume started",
+            **acknowledgement,
         )
 
     @app.get("/job/current", tags=["Worker"])
@@ -1895,7 +1950,7 @@ def create_dual_app(config_path: Optional[str] = None) -> FastAPI:
                 pa._config_path = _config_path
                 pa._started_at = _started_at
 
-                await pa._attach_session(
+                await pa._session_attach.attach(
                     thread_id=thread_id,
                     config_override=request.get("config_override"),
                     resolved_config=request.get("resolved_config"),
@@ -1912,6 +1967,10 @@ def create_dual_app(config_path: Optional[str] = None) -> FastAPI:
                     pinned_runtime_generation_contract=request.get(
                         "pinned_runtime_generation_contract"
                     ),
+                    session_subagent_batch_settle_contract=request.get(
+                        "session_subagent_batch_settle_contract"
+                    ),
+                    session_subagent_fanout=request.get("session_subagent_fanout"),
                     session_runtime_generation=runtime_generation,
                     session_runtime_attach_token=runtime_attach_token,
                     workspace_generation=workspace_generation,
@@ -1922,10 +1981,11 @@ def create_dual_app(config_path: Optional[str] = None) -> FastAPI:
                 logger.exception(f"Session setup failed for thread {thread_id}")
                 import agent.api.persistent_app as pa
 
-                # _attach_session sets pa._thread_id before it can fail;
+                # The attach binds the thread before it can fail;
                 # _detach_session short-circuits when _session is None and
-                # never clears _thread_id, so we have to do it explicitly.
-                pa._thread_id = None
+                # never unbinds it, so we have to do it explicitly -- but only
+                # this attach's own thread.
+                pa._session_identity.release_thread(expected=thread_id)
                 # Release the exact reciprocal DB reservation before this pod
                 # advertises itself idle.  The endpoint treats an already-
                 # replaced binding as a successful/benign no-op, so ``True``
@@ -1936,7 +1996,7 @@ def create_dual_app(config_path: Optional[str] = None) -> FastAPI:
                 if _orchestrator_client:
                     try:
                         release_confirmed = (
-                            await pa._release_failed_attach_receipt_until_confirmed(
+                            await pa._session_attach.release_receipt_until_confirmed(
                                 thread_id,
                                 runtime_generation=runtime_generation,
                                 runtime_attach_token=runtime_attach_token,
@@ -2009,7 +2069,7 @@ def create_dual_app(config_path: Optional[str] = None) -> FastAPI:
         """Check if session is fully set up and ready for WebSocket.
 
         Delegates to ``persistent_app._session_ready()`` so /ready (SESSION
-        branch), this endpoint, and ``handle_persistent_websocket`` share one
+        branch), this endpoint, and the session WebSocket transport share one
         definition of "ready for a WS" and can't drift.
         """
         import agent.api.persistent_app as pa
@@ -2020,7 +2080,7 @@ def create_dual_app(config_path: Optional[str] = None) -> FastAPI:
         return JSONResponse(
             {
                 "ready": pa._session_ready(),
-                "thread_id": pa._thread_id,
+                "thread_id": pa._session_identity.thread_id,
                 "state": "session",
                 "turn_in_flight": pa._turn_in_flight(),
             }
@@ -2032,15 +2092,12 @@ def create_dual_app(config_path: Optional[str] = None) -> FastAPI:
 
         import agent.api.persistent_app as pa
 
-        expected = pa._canonical_pinned_session_identity_fingerprint(
+        expected = canonical_session_identity_fingerprint(
             request.get("session_identity_fingerprint")
             if isinstance(request, dict)
             else None
         )
-        if (
-            expected is None
-            or pa._current_pinned_session_identity_fingerprint() != expected
-        ):
+        if expected is None or pa._session_identity.fingerprint() != expected:
             return JSONResponse(
                 {"error": "session_identity_mismatch", "retryable": True},
                 status_code=409,
@@ -2053,7 +2110,7 @@ def create_dual_app(config_path: Optional[str] = None) -> FastAPI:
         return JSONResponse(
             {
                 "ready": pa._session_ready(),
-                "thread_id": pa._thread_id,
+                "thread_id": pa._session_identity.thread_id,
                 "state": "session",
                 "turn_in_flight": pa._turn_in_flight(),
                 "recipient_verified": True,
@@ -2081,15 +2138,12 @@ def create_dual_app(config_path: Optional[str] = None) -> FastAPI:
 
         import agent.api.persistent_app as pa
 
-        expected = pa._canonical_pinned_session_identity_fingerprint(
+        expected = canonical_session_identity_fingerprint(
             request.get("session_identity_fingerprint")
             if isinstance(request, dict)
             else None
         )
-        if (
-            expected is None
-            or pa._current_pinned_session_identity_fingerprint() != expected
-        ):
+        if expected is None or pa._session_identity.fingerprint() != expected:
             return JSONResponse(
                 {"error": "session_identity_mismatch", "retryable": True},
                 status_code=409,
@@ -2099,11 +2153,11 @@ def create_dual_app(config_path: Optional[str] = None) -> FastAPI:
             return JSONResponse({"status": "not_in_session"}, status_code=404)
 
         try:
-            thread_id = pa._thread_id
+            thread_id = pa._session_identity.thread_id
             # Same reason string as persistent_app's /session/detach so the
             # documented "Terminate(rest_detach)" signal greps identically
             # on dual pool pods (was the "legacy" back-compat shim).
-            await pa._terminate_session("rest_detach")
+            await pa._session_termination.terminate("rest_detach")
 
             if _should_loop():
                 await _reset_to_idle("session detach", skip_session_cleanup=True)
@@ -2124,59 +2178,38 @@ def create_dual_app(config_path: Optional[str] = None) -> FastAPI:
                 status_code=500,
             )
 
-    # --- Persistent-session REST endpoints (orchestrator-driven turns) ---
+    # --- Session client transport (orchestrator-driven turns, session socket) ---
     #
-    # Mirror of /api/{input,interrupt,approve} in persistent_app.py. The
-    # orchestrator forwards from POST /api/persistent/threads/{id}/{input,
-    # interrupt,approve} to whichever agent is attached to the thread, which
-    # in cluster usage is a dual-mode pod. Without these routes the agent
-    # returns 404 and the cockpit's turn never lands. See task #136 /
-    # knowledge-base/knowledge/issues/persistent_session_dual_mode_phase1_gap.md for the parallel
-    # WS-handler gap this duplication caused.
+    # Dual pods host adopted sessions on the persistent runtime's state
+    # (/session/attach seeds it and calls its attach), so the same transport
+    # owners serve both modes. The orchestrator forwards POST
+    # /api/persistent/threads/{id}/{input,interrupt,approve} to whichever agent
+    # is attached to the thread, which in cluster usage can be a dual-mode pod.
+    # Dual mode adds its own pod-state prechecks; see
+    # knowledge-base/knowledge/issues/persistent_session_dual_mode_phase1_gap.md.
+    import agent.api.persistent_app as pa
 
-    @app.post("/api/input", tags=["Session"])
-    async def api_input(request: Request):
+    transport = pa.session_transport_bindings()
+
+    def _session_mode_precheck() -> Optional[JSONResponse]:
         if _pod_state != PodState.SESSION:
             return JSONResponse(
                 {"error": "Pod is not in session mode"}, status_code=404
             )
-        import agent.api.persistent_app as pa
+        return None
 
-        return await pa.handle_api_input(request)
+    register_session_http_routes(
+        app, transport.http, precheck=_session_mode_precheck, tags=["Session"]
+    )
 
-    @app.post("/api/interrupt", tags=["Session"])
-    async def api_interrupt(request: Request):
-        if _pod_state != PodState.SESSION:
-            return JSONResponse(
-                {"error": "Pod is not in session mode"}, status_code=404
-            )
-        import agent.api.persistent_app as pa
+    async def _session_socket_precheck(ws: WebSocket) -> bool:
+        """Dual-mode gate between session authentication and the socket.
 
-        return await pa.handle_api_interrupt(request)
-
-    @app.post("/api/approve", tags=["Session"])
-    async def api_approve(request: Request):
-        if _pod_state != PodState.SESSION:
-            return JSONResponse(
-                {"error": "Pod is not in session mode"}, status_code=404
-            )
-        import agent.api.persistent_app as pa
-
-        return await pa.handle_api_approve(request)
-
-    async def _do_ws_chat(ws: WebSocket) -> None:
-        """Shared WS handler for both /ws/chat and /p/{thread_id}/ws.
-
-        The two routes exist so the agent answers both the legacy direct path
-        (/ws/chat, used by local dev with websocat and any cluster-internal
-        callers) and the external path that the per-session Ingress forwards
-        through Traefik (/p/<thread_id>/ws — cockpit's new direct-WS path).
+        Covers both /ws/chat (local dev with websocat, cluster-internal
+        callers) and the external /p/<thread_id>/ws path the per-session
+        Ingress forwards through Traefik.
         """
         global _pending_exit_task
-
-        # Validate the session JWT carried as ?t={token}.
-        if not await _validate_session_token(ws):
-            return
 
         # Cancel any pending exit from a previous WS disconnect (e.g. page
         # refresh). Vestigial under the Phase-1 keystone — the WS-disconnect
@@ -2196,11 +2229,10 @@ def create_dual_app(config_path: Optional[str] = None) -> FastAPI:
                 }
             )
             await ws.close(code=4403, reason="Not in session mode")
-            return
+            return False
 
-        import agent.api.persistent_app as pa
-
-        if not pa._session or not pa._session.llm_with_tools:
+        session = transport.socket.runtime.session()
+        if not session or not session.llm_with_tools:
             await ws.accept()
             await ws.send_json(
                 {
@@ -2209,24 +2241,17 @@ def create_dual_app(config_path: Optional[str] = None) -> FastAPI:
                 }
             )
             await ws.close(code=4503, reason="Session not ready")
-            return
+            return False
 
-        # Delegate to the shared module-level handler. Same implementation
-        # the pure-persistent route uses — Phase-1 keystone, subscriber
-        # model, Phase-5 status flips all included. See
-        # knowledge-base/knowledge/issues/persistent_session_dual_mode_phase1_gap.md for why
-        # this delegation matters.
-        await pa.handle_persistent_websocket(ws)
+        # The shared transport serves the connection from here: the Phase-1
+        # keystone, subscriber model and Phase-5 status flips included.
+        return True
 
-    @app.websocket("/ws/chat")
-    async def ws_chat(ws: WebSocket):
-        await _do_ws_chat(ws)
-
-    @app.websocket("/p/{thread_id}/ws")
-    async def ws_session(ws: WebSocket, thread_id: str):
-        # thread_id is enforced by _validate_session_token against
-        # SESSION_BOUND_THREAD_ID + the JWT's tid claim — the path param is
-        # only here so the Ingress's /p/<tid>/ws path matches a FastAPI route.
-        await _do_ws_chat(ws)
+    register_session_websocket_routes(
+        app,
+        auth=transport.auth,
+        ports=transport.socket,
+        precheck=_session_socket_precheck,
+    )
 
     return app

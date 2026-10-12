@@ -143,8 +143,14 @@ class TestResumeJobOnAgentRefusesWorkspacelessJob:
         resolve = AsyncMock(return_value=[])
         shed = AsyncMock(return_value=True)
         with (
-            patch.object(om.postgres_db, "resolve_datasources_for_job", resolve),
-            patch.object(om.postgres_db, "shed_workspace_context", shed),
+            patch.object(
+                om.app.state.resources.postgres_db,
+                "resolve_datasources_for_job",
+                resolve,
+            ),
+            patch.object(
+                om.app.state.resources.postgres_db, "shed_workspace_context", shed
+            ),
         ):
             assert await control_seams.resume_job_on_agent(job, agent) is False
 
@@ -172,7 +178,9 @@ class TestResumeJobOnAgentRefusesWorkspacelessJob:
         agent = {"id": "c5651fce-c097-419c-822e-ada39c8c9d43", "pod_ip": "10.42.0.9"}
 
         shed = AsyncMock(side_effect=RuntimeError("Not connected to database"))
-        with patch.object(om.postgres_db, "shed_workspace_context", shed):
+        with patch.object(
+            om.app.state.resources.postgres_db, "shed_workspace_context", shed
+        ):
             assert await control_seams.resume_job_on_agent(job, agent) is False
 
     @pytest.mark.asyncio
@@ -190,8 +198,12 @@ class TestResumeJobOnAgentRefusesWorkspacelessJob:
         }
         shed = AsyncMock()
         with (
-            patch.object(om, "COMPLETION_COMMANDS_ENABLED", True),
-            patch.object(om.postgres_db, "shed_workspace_context", shed),
+            patch.object(
+                om.app.state.resources.settings, "completion_commands_enabled", True
+            ),
+            patch.object(
+                om.app.state.resources.postgres_db, "shed_workspace_context", shed
+            ),
         ):
             assert await control_seams.resume_job_on_agent(job, agent) is False
 

@@ -27,6 +27,7 @@ from uuid import uuid4
 from fastapi import HTTPException
 
 from orchestrator.schemas.projects import ExternalKnowledgeBase
+from orchestrator.services import project_cloud_connectors
 from orchestrator.services.cloud import FeatureNotAvailable
 from orchestrator.services.cloud.identity import resolve_user_identity_cached
 from orchestrator.services.datasource_config import (
@@ -64,6 +65,25 @@ class ProjectRepairState:
     bg_repair_tasks: set[asyncio.Task] = field(default_factory=set)
     bg_repair_last: dict[str, float] = field(default_factory=dict)
     bg_repair_cooldown_s: float = BG_REPAIR_COOLDOWN_S
+
+    async def drain(self) -> None:
+        """Cancel and await every in-flight background repair (R1.B12).
+
+        The application calls this at shutdown, before its stores close. A
+        repair is re-derived from drift on a later project read, so a cancelled
+        one leaves nothing to hand over. The task set is left empty and usable;
+        the heal locks and the per-key throttle are bookkeeping, not tasks, and
+        are left as they are. The calling task is never cancelled.
+        """
+        current = asyncio.current_task()
+        drained = [task for task in self.bg_repair_tasks if task is not current]
+        pending = [task for task in drained if not task.done()]
+        for task in pending:
+            task.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+        for task in drained:
+            self.bg_repair_tasks.discard(task)
 
 
 @dataclass(frozen=True)
@@ -142,19 +162,71 @@ async def sync_project_member_to_groups(
             )
 
 
+async def remove_project_member_from_backend_group(
+    project: dict[str, Any],
+    user: dict[str, Any],
+    *,
+    dependencies: ProjectProvisioningDependencies,
+) -> bool:
+    """Remove a removed member from the project's main-cloud group, best
+    effort; whether the cloud confirmed it.
+
+    The counterpart of :func:`sync_project_member_to_groups`' direct add: the
+    group (``project-<id>``) carries the folder's permissions in the cloud
+    itself, so a member left in it keeps reaching the folder with any
+    credential to their own account ("My cloud", a full-account app
+    password), whatever SRW's membership says. Keycloak's group removal does
+    not reach Nextcloud's group, which was added directly. A failure is
+    logged, never raised: the SRW removal stands.
+    """
+    project_id = str(project.get("id") or "")
+    if project.get("is_default") or not project.get("main_cloud_backend"):
+        return False
+    backend = dependencies.main_cloud_router.for_project_optional(project)
+    if backend is None or not backend.is_initialized:
+        dependencies.logger.warning(
+            "Project %s: removed member %s stays in the main cloud's project "
+            "group: no reachable backend for its installation",
+            project_id,
+            user.get("id"),
+        )
+        return False
+    group_name = f"project-{project_id}"
+    try:
+        resolved = await resolve_user_identity_cached(dependencies.store, user, backend)
+        if not resolved:
+            return False
+        await backend.remove_user_from_group(resolved, group_name)
+    except Exception:
+        dependencies.logger.warning(
+            "Project %s: could not remove member %s from the main cloud's "
+            "group %s; they may still reach the folder through their own "
+            "cloud account",
+            project_id,
+            user.get("id"),
+            group_name,
+            exc_info=True,
+        )
+        return False
+    return True
+
+
 async def ensure_project_cloud_resources(
     project: dict[str, Any],
     *,
     dependencies: ProjectProvisioningDependencies,
 ) -> dict[str, Any]:
-    """Ensure a project has its Keycloak group, main-cloud Space and WebDAV
-    datasource — and that every current member is in both groups.
+    """Ensure a project has its Keycloak group, main-cloud Space and cloud
+    folder connector — and that every current member is in both groups.
 
-    Two conditional steps:
+    Two conditional steps, and the connector:
 
     * **Folder creation** runs only when `main_cloud_folder_handle` is missing
       (protected by a per-project lock because `ensure_project_folder` is not
       idempotent — each call creates a new Space).
+    * **The cloud folder connector** (``project_cloud_connectors``) is
+      created once the project has a folder in the active installation, and
+      repointed when its folder handle was repaired.
     * **Member sync** runs unconditionally (the Keycloak and LibreGraph adds
       are idempotent). This repairs the common case where the Space already
       exists but the user was never added to the groups — e.g. project created
@@ -165,11 +237,11 @@ async def ensure_project_cloud_resources(
       several external HTTP round-trips — see
       knowledge-base/knowledge/issues/project_page_open_blocks_on_cloud_heal.md).
 
-    Default projects skip both: they piggyback on the owner's personal home
-    Space (already attached as a datasource by the user-creation flow), so a
-    separate project Space + `project-<id>` group would be dead state. The
-    cloud_storage_url branch in `get_project` resolves to the user's home
-    browser URL for default projects.
+    Default projects skip both: their cloud is the owner's own root, the
+    user-root connector ("My cloud", linked to the default project; main
+    cloud slice 4), so a separate project Space + `project-<id>` group would
+    be dead state. The cloud_storage_url branch in `get_project` resolves to
+    the user's home browser URL for default projects.
 
     Returns the (possibly updated) project dict.
     """
@@ -247,12 +319,7 @@ async def ensure_project_cloud_resources(
                         project_name=project_name,
                         group_id=group_name,
                     )
-                    legacy_id: int | None = None
-                    if backend.backend_id == "nextcloud":
-                        try:
-                            legacy_id = int(folder_handle.native_id)
-                        except ValueError:
-                            legacy_id = None
+                    legacy_id = backend.legacy_folder_id(folder_handle)
                     await store.update_project(
                         project_id_str,
                         main_cloud_backend=backend.backend_id,
@@ -280,6 +347,15 @@ async def ensure_project_cloud_resources(
                         f"Failed to create cloud resources for project "
                         f"{project_id_str}: {e}"
                     )
+
+    # The folder's own connector, once the folder exists; repointed when the
+    # project's folder handle was repaired. Never raises.
+    await project_cloud_connectors.ensure_project_cloud_connector(
+        store,
+        project,
+        active_instance_id=dependencies.main_cloud_router.active_instance_id,
+        log=logger,
+    )
 
     # Member sync — always runs when this helper does. Idempotent add in both
     # Keycloak and the backend; essential for self-healing projects whose

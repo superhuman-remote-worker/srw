@@ -74,6 +74,10 @@ class ThreadDatasourceAuthorizationDependencies:
 
     store: ThreadDatasourceStore
     thread_project_ids: Callable[[str], Awaitable[list[str]]]
+    #: Reads each authorized row's credentials from its Connector's resource
+    #: secret, in place (``connector_secrets.read_connector_credentials``);
+    #: ``None`` delivers the row's own.
+    connector_credentials: Callable[..., Awaitable[None]] | None = None
 
 
 async def authorize_thread_datasource_selection(
@@ -85,10 +89,17 @@ async def authorize_thread_datasource_selection(
     effective_work_owner_id: str | None = None,
     trusted_system_inheritance: bool = False,
     legacy_job_id: str | None = None,
+    execution_kind: str | None = None,
     dependencies: ThreadDatasourceAuthorizationDependencies,
 ) -> tuple[list[str], dict[str, int]]:
-    """Resolve one complete selection and its exact policy snapshot."""
+    """Resolve one complete selection and its exact policy snapshot.
+
+    ``execution_kind`` (``session`` or ``job``) refuses, with a 400 that says
+    why, a connector its driver attaches only to the other kind (a cloud
+    folder to sessions).
+    """
     from orchestrator.services.datasource_policy import (
+        DatasourceExecutionKindError,
         DatasourceUnavailableError,
         DatasourceWorkspaceTierError,
         authorize_datasource_selection,
@@ -108,13 +119,14 @@ async def authorize_thread_datasource_selection(
             allow_admin_explicit_override=True,
             trusted_system_inheritance=trusted_system_inheritance,
             legacy_job_id=legacy_job_id,
+            execution_kind=execution_kind,
         )
     except DatasourceUnavailableError as exc:
         raise HTTPException(
             status_code=403,
             detail="One or more selected connectors are unavailable",
         ) from exc
-    except DatasourceWorkspaceTierError as exc:
+    except (DatasourceWorkspaceTierError, DatasourceExecutionKindError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
@@ -301,7 +313,12 @@ async def resolve_authorized_thread_datasources(
     target_project_ids: list[str] | None = None,
     dependencies: ThreadDatasourceAuthorizationDependencies,
 ) -> list[dict[str, Any]]:
-    """Authorize and exactly resolve a thread connector snapshot."""
+    """Authorize and exactly resolve a thread connector snapshot.
+
+    The credentials come from each Connector's resource secret, which the
+    connector policy has just authorized this thread to use (decision 11),
+    or from the row where the resource has none yet.
+    """
     selected, policy_revisions = await revalidate_thread_datasource_selection(
         thread,
         datasource_ids,
@@ -312,7 +329,10 @@ async def resolve_authorized_thread_datasources(
         datasource_ids=selected,
         project_ids=target_project_ids,
     )
-    return require_exact_datasource_resolution(selected, policy_revisions, resolved)
+    rows = require_exact_datasource_resolution(selected, policy_revisions, resolved)
+    if dependencies.connector_credentials is not None:
+        await dependencies.connector_credentials(rows, authorized=selected)
+    return rows
 
 
 __all__ = [

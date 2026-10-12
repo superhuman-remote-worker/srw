@@ -1,5 +1,6 @@
 {{- $runtimeAuthorityCutover := .Values.orchestrator.runtimeAuthorityMigrationMaintenanceAck | default false -}}
 {{- $vmRemoteProtocol := .Values.orchestrator.vmRemoteOperationProtocol.enabled | default false -}}
+{{- $vmRetainedResumeGate := .Values.orchestrator.vmRetainedResumeAcceptanceGate | default dict -}}
 {{- $workspaceCleanupProtocol := .Values.orchestrator.workspaceCleanupReconciliationEnabled | default false -}}
 {{- $workspaceLifecycleCutover := .Values.orchestrator.workspaceLifecycleProtocolCutoverEnabled | default false -}}
 {{- $manifestCutover := .Values.orchestrator.manifestContractCutoverEnabled | default false -}}
@@ -32,6 +33,13 @@ spec:
         srw.io/vm-remote-operation-protocol: v1
         {{- end }}
       annotations:
+        # Pool admission settings are read once by AgentProvisioner. Bind the
+        # exact ConfigMap inputs so a zero-floor upgrade stops refill even when
+        # Reloader is disabled. Normalize rendered strings without losing zero.
+        checksum/agent-pool-settings: {{ dict "maxAgents" (.Values.agent.pool.maxAgents | toString) "minAgents" (.Values.agent.pool.minAgents | toString) "buffer" (.Values.agent.pool.buffer | toString) "reservedSessionSlots" (.Values.agent.pool.reservedSessionSlots | toString) "reservedJobSlots" (.Values.agent.pool.reservedJobSlots | toString) | toJson | sha256sum | quote }}
+        {{- if (get (.Values.vm.resourceAdmission | default dict) "observerEnabled" | default false) }}
+        checksum/vm-resource-policy: {{ include "srw.vmResourceInventoryConfig" . | sha256sum | quote }}
+        {{- end }}
         checksum/infrastructure-metering-gates: {{ toJson .Values.infrastructureMetering | sha256sum | quote }}
         # This flag is a money-spending admission fence. The orchestrator reads
         # it from a ConfigMap key, so bind its exact value into the Pod template
@@ -39,6 +47,10 @@ spec:
         # controlled enable/disable therefore deterministically converges every
         # replica before operators rely on the new policy.
         checksum/officer-auto-pull-release: {{ dict "officerAutoPullReleaseEnabled" (.Values.orchestrator.officerAutoPullReleaseEnabled | default false) | toJson | sha256sum | quote }}
+        # The session subagent fan-out switch is read once at startup and is
+        # the rollback lever (parallel_subagents.md §12): clearing it must
+        # replace every replica even when the optional Reloader is disabled.
+        checksum/session-subagent-fanout-lanes: {{ dict "sessionSubagentFanoutLanes" (.Values.orchestrator.sessionSubagentFanoutLanes | default "") | toJson | sha256sum | quote }}
         # Completion/control policy is read once at process startup. Hash the
         # exact ConfigMap inputs so mode and finalizer changes replace every
         # orchestrator replica without relying on the optional Reloader.
@@ -51,12 +63,17 @@ spec:
         # replace the process even when the optional Reloader is disabled.
         checksum/manifest-hosting: {{ toJson .Values.manifestHosting | sha256sum | quote }}
         checksum/workspace-cleanup-reconciliation: {{ dict "enabled" $workspaceCleanupProtocol | toJson | sha256sum | quote }}
+        # Activation and deactivation must replace every orchestrator even
+        # without Reloader. This switch only admits new v1 startup receipts.
+        checksum/container-startup-stage-authority: {{ dict "enabled" (get (.Values.orchestrator.containerStartupStageAuthority | default dict) "enabled" | default false) | toJson | sha256sum | quote }}
         checksum/workspace-preparation: {{ include "srw.vmPreparationEnvironment" . | sha256sum | quote }}
         checksum/workspace-lifecycle-protocol-cutover: {{ dict "enabled" $workspaceLifecycleCutover | toJson | sha256sum | quote }}
         checksum/workspace-lifecycle-service-account: {{ .Values.orchestrator.workspaceLifecycleServiceAccountGeneration | default "0197" | toString | sha256sum | quote }}
         checksum/vm-remote-operation-protocol: {{ dict "enabled" $vmRemoteProtocol | toJson | sha256sum | quote }}
         checksum/vm-workspace-recovery: {{ toJson .Values.orchestrator.vmWorkspaceRecovery | sha256sum | quote }}
+        checksum/vm-job-cancel-retention: {{ dict "enabled" ((.Values.orchestrator.vmJobCancelRetention | default dict).enabled | default false) | toJson | sha256sum | quote }}
         checksum/vm-workspace-recovery-acceptance-gate: {{ toJson .Values.orchestrator.vmWorkspaceRecoveryAcceptanceGate | sha256sum | quote }}
+        checksum/vm-retained-resume-acceptance-gate: {{ toJson $vmRetainedResumeGate | sha256sum | quote }}
     spec:
       serviceAccountName: {{ include "srw.orchestratorServiceAccountName" . }}
       terminationGracePeriodSeconds: {{ .Values.orchestrator.terminationGracePeriodSeconds }}
@@ -96,6 +113,18 @@ spec:
           imagePullPolicy: {{ .Values.image.orchestrator.pullPolicy }}
           ports:
             - containerPort: 8085
+            {{- with .Values.orchestrator.connectorLeases.exchangePort }}
+            # The credential lease exchange (connector drivers C2): its own
+            # port, served by a second minimal ASGI app. No ingress routes it.
+            - name: lease-exchange
+              containerPort: {{ . }}
+            {{- end }}
+            {{- if and .Values.connectors.servicePods.enabled .Values.orchestrator.connectorLeases.exchangePort }}
+            # The exchange server's canary (connector drivers D5): a driver
+            # pod's start-up deny target, admitted from the driver namespace.
+            - name: lease-canary
+              containerPort: {{ .Values.connectors.servicePods.canaryPort }}
+            {{- end }}
           env:
             # Migration 0185 is intentionally not rolling-compatible.  An
             # existing database accepts it only after the operator drains old
@@ -114,6 +143,11 @@ spec:
                 configMapKeyRef:
                   name: {{ include "srw.configMapName" . }}
                   key: WORKSPACE_CLEANUP_RECONCILIATION_ENABLED
+            - name: CONTAINER_STARTUP_STAGE_AUTHORITY_ENABLED
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: CONTAINER_STARTUP_STAGE_AUTHORITY_ENABLED
             # The orchestrator is the only reader of this key
             # (services/pinned_k8s_effect.py). Without it the bounded legacy
             # namespace search collapses to the release namespace alone, which
@@ -207,11 +241,6 @@ spec:
                 configMapKeyRef:
                   name: {{ include "srw.configMapName" . }}
                   key: MCP_DATASOURCES_ENABLED
-            - name: MCP_STDIO_ENABLED
-              valueFrom:
-                configMapKeyRef:
-                  name: {{ include "srw.configMapName" . }}
-                  key: MCP_STDIO_ENABLED
             - name: DATASOURCE_DEFAULTS_ON_OMISSION
               valueFrom:
                 configMapKeyRef:
@@ -522,6 +551,12 @@ spec:
                 configMapKeyRef:
                   name: {{ include "srw.configMapName" . }}
                   key: STATELESS_WORKER_DEFAULT_ENABLED
+            # Retention admission is default-off; persisted guards remain active.
+            - name: VM_JOB_CANCEL_RETENTION_ENABLED
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: VM_JOB_CANCEL_RETENTION_ENABLED
             # Recovery admission, workers, and the leader reconciler consume
             # one rendered protocol surface. This Deployment does not use the
             # shared ConfigMap through envFrom, so every key is explicit here.
@@ -965,18 +1000,6 @@ spec:
                   key: NEXTCLOUD_PROTECTED_EFFECT_HMAC_KEY
                   optional: false
             {{- end }}
-            - name: NEXTCLOUD_RCLONE_USER_HOME_USERNAME
-              valueFrom:
-                configMapKeyRef:
-                  name: {{ include "srw.configMapName" . }}
-                  key: NEXTCLOUD_RCLONE_USER_HOME_USERNAME
-                  optional: true
-            - name: NEXTCLOUD_RCLONE_USER_HOME_PASSWORD
-              valueFrom:
-                secretKeyRef:
-                  name: {{ include "srw.secretName" . }}
-                  key: NEXTCLOUD_RCLONE_USER_HOME_PASSWORD
-                  optional: true
             {{- end }}
             # Default WebDAV datasource (optional)
             - name: DEFAULT_DS_WEBDAV_URL
@@ -1015,6 +1038,15 @@ spec:
                 configMapKeyRef:
                   name: {{ include "srw.configMapName" . }}
                   key: MAIN_CLOUD_BACKEND
+                  optional: true
+            # The operator's confirmation that Helm's main cloud may replace
+            # the active installation with a different one
+            # (cloud.replaceInstallation; absent unless set).
+            - name: MAIN_CLOUD_REPLACE_INSTALLATION
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: MAIN_CLOUD_REPLACE_INSTALLATION
                   optional: true
             - name: CLOUD_WORKSPACE_DRIVER
               valueFrom:
@@ -1318,6 +1350,10 @@ spec:
                   key: NTFY_TOKEN
                   optional: true
             # VM lifecycle (optional)
+            {{- if (get (.Values.vm.resourceAdmission | default dict) "observerEnabled" | default false) }}
+            - name: VM_RESOURCE_ADMISSION_CONFIG
+              value: {{ include "srw.vmResourceInventoryConfig" . | quote }}
+            {{- end }}
             - name: VM_MODE
               valueFrom:
                 configMapKeyRef:
@@ -1370,6 +1406,10 @@ spec:
                   name: {{ include "srw.configMapName" . }}
                   key: VM_PERSISTENT_ROOTDISK
                   optional: true
+            - name: VM_NETWORK_PROFILE_ENABLED
+              value: {{ .Values.vmController.networkProfile.enabled | default false | quote }}
+            - name: VM_NETWORK_PROFILE_IMAGE_ALLOWLIST
+              value: {{ join "," (.Values.vmController.networkProfile.imageAllowlist | default list) | quote }}
             # Admission must see the same capabilities as the VM controller.
             {{- range $key, $_ := (include "srw.vmPreparationEnvironment" . | fromYaml) }}
             - name: {{ $key }}
@@ -1402,6 +1442,24 @@ spec:
                 configMapKeyRef:
                   name: {{ include "srw.configMapName" . }}
                   key: WORKSPACE_FUSE_PRIVILEGED
+                  optional: true
+            - name: WORKSPACE_TRUSTED_IMAGE_REPOSITORIES
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: WORKSPACE_TRUSTED_IMAGE_REPOSITORIES
+                  optional: true
+            - name: WORKSPACE_CUSTOM_IMAGES_PRIVILEGED
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: WORKSPACE_CUSTOM_IMAGES_PRIVILEGED
+                  optional: true
+            - name: WORKSPACE_IMAGE_PULL_TIMEOUT_SECONDS
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: WORKSPACE_IMAGE_PULL_TIMEOUT_SECONDS
                   optional: true
             - name: OPERATOR_HOME_ALLOWED_EMAIL
               valueFrom:
@@ -1436,11 +1494,35 @@ spec:
               value: {{ .Release.Name | quote }}
             - name: SSH_KEY_PATH
               value: "/run/secrets/vm-ssh-key"
+            - name: VM_ROOTDISK_STALL_TIMEOUT_S
+              value: {{ .Values.orchestrator.vmProvisioning.rootdiskStallTimeoutSeconds | quote }}
+            - name: VM_CREATION_RETRY_ENABLED
+              value: {{ .Values.orchestrator.vmProvisioning.creationRetryEnabled | default false | quote }}
+            {{- if (.Values.orchestrator.vmIdleRelease | default dict).enabled }}
+            {{- if not (include "srw.vmSameCluster" .) }}
+            {{- fail "vmIdleRelease requires vm.mode=same-cluster" }}
+            {{- end }}
+            {{- if not .Values.vmController.persistentRootdisk.enabled }}
+            {{- fail "vmIdleRelease requires persistentRootdisk.enabled" }}
+            {{- end }}
+            {{- if not .Values.orchestrator.vmProvisioning.creationRetryEnabled }}
+            {{- fail "vmIdleRelease requires creationRetryEnabled" }}
+            {{- end }}
+            {{- if not .Values.orchestrator.vmRemoteOperationProtocol.enabled }}
+            {{- fail "vmIdleRelease requires vmRemoteOperationProtocol.enabled" }}
+            {{- end }}
+            {{- end }}
+            - name: WORKSPACE_IDLE_RELEASE_ENABLED
+              value: {{ (.Values.orchestrator.vmIdleRelease | default dict).enabled | default false | quote }}
             - name: VM_WORKSPACE_RECOVERY_ACCEPTANCE_GATE_ENABLED
               value: {{ .Values.orchestrator.vmWorkspaceRecoveryAcceptanceGate.enabled | quote }}
+            - name: VM_RETAINED_RESUME_ACCEPTANCE_GATE_ENABLED
+              value: {{ get $vmRetainedResumeGate "enabled" | default false | quote }}
             {{- if .Values.orchestrator.vmWorkspaceRecoveryAcceptanceGate.enabled }}
             - name: VM_WORKSPACE_RECOVERY_GATE_SLOW_BOOT_SECONDS
               value: "15"
+            - name: VM_WORKSPACE_RECOVERY_GATE_VM_IMAGE
+              value: {{ .Values.vmController.defaultVmImage | quote }}
             {{- end }}
             # Budget for the WS proxy's /ready poll. Must outlast the agent's
             # own _poll_workspace_ready (120s) plus margin for cold image pulls.
@@ -1478,6 +1560,11 @@ spec:
                 configMapKeyRef:
                   name: {{ include "srw.configMapName" . }}
                   key: OFFICER_AUTO_PULL_RELEASE_ENABLED
+            - name: SESSION_SUBAGENT_FANOUT_LANES
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: SESSION_SUBAGENT_FANOUT_LANES
             {{- if eq (include "srw.vmMode" .) "external" }}
             # Agent tailscale sidecar gate (consumed by AgentProvisioner)
             - name: AGENT_TAILSCALE_ENABLED
@@ -1784,6 +1871,232 @@ spec:
             - name: KB_GIT_SSH_KNOWN_HOSTS
               value: {{ . | quote }}
             {{- end }}
+            {{- with .Values.orchestrator.workspaceSshKnownHosts }}
+            - name: WORKSPACE_SSH_KNOWN_HOSTS
+              value: {{ . | quote }}
+            {{- end }}
+            # Connector credential leases (connector drivers C2).
+            - name: CONNECTOR_LEASE_EXCHANGE_PORT
+              value: {{ .Values.orchestrator.connectorLeases.exchangePort | default 0 | quote }}
+            - name: CONNECTOR_LEASE_TTL_SECONDS
+              value: {{ .Values.orchestrator.connectorLeases.ttlSeconds | quote }}
+            - name: CONNECTOR_LEASE_SWEEP_INTERVAL_SECONDS
+              value: {{ .Values.orchestrator.connectorLeases.sweepIntervalSeconds | quote }}
+            - name: CONNECTOR_LEASE_PROBE_ENABLED
+              value: {{ .Values.orchestrator.connectorLeases.probeDriver | quote }}
+            # Driver image resolution (connector drivers D5).
+            {{- with .Values.connectors.drivers.registry }}
+            - name: CONNECTOR_DRIVER_REGISTRY_INSECURE_HOSTS
+              value: {{ join "," .insecureHosts | quote }}
+            - name: CONNECTOR_DRIVER_REGISTRY_PRIVATE_HOSTS
+              value: {{ join "," .privateHosts | quote }}
+            - name: CONNECTOR_DRIVER_REGISTRY_TOKEN_HOSTS
+              value: {{ join "," .tokenHosts | quote }}
+            - name: CONNECTOR_DRIVER_RESOLVE_CACHE_SECONDS
+              value: {{ .resolveCacheSeconds | quote }}
+            - name: CONNECTOR_DRIVER_RESOLVE_TIMEOUT_SECONDS
+              value: {{ .resolveTimeoutSeconds | quote }}
+            {{- end }}
+            # Credentials SRW mints at a provider (connector drivers C5).
+            {{- with (.Values.connectors.providerMinting | default dict) }}
+            - name: CONNECTOR_PROVIDER_MINTING_ENABLED
+              value: {{ (hasKey . "enabled" | ternary .enabled true) | quote }}
+            - name: CONNECTOR_PROVIDER_MINTING_PRIVATE_HOSTS
+              value: {{ join "," (.privateHosts | default list) | quote }}
+            {{- end }}
+            # Service-plane driver hosting (connector drivers D5).
+            {{- with .Values.connectors.servicePods }}
+            - name: CONNECTOR_SERVICE_PODS_ENABLED
+              value: {{ .enabled | quote }}
+            {{- if .enabled }}
+            {{- if has (int .canaryPort) (list 8085 (int $.Values.orchestrator.connectorLeases.exchangePort)) }}
+            {{- fail "connectors.servicePods.canaryPort must be a port of its own: not 8085 and not orchestrator.connectorLeases.exchangePort" }}
+            {{- end }}
+            - name: CONNECTOR_LEASE_CANARY_PORT
+              value: {{ .canaryPort | quote }}
+            {{- end }}
+            - name: CONNECTOR_SERVICE_ENFORCEMENT_VERIFIED
+              value: {{ .networkEnforcementVerified | quote }}
+            - name: CONNECTOR_SERVICE_CLUSTER_CIDRS
+              value: {{ join "," .clusterCidrs | quote }}
+            - name: CONNECTOR_SERVICE_PRIVATE_TIERS
+              value: {{ join "," .privateTiers | quote }}
+            {{- $refused := .refusedCidrs | default list }}
+            {{- if not $refused }}
+            {{- range $tier := $.Values.workspace.networkPolicy.tiers }}
+            {{- if has $tier.name $.Values.connectors.servicePods.privateTiers }}
+            {{- $refused = concat $refused ($tier.except | default list) }}
+            {{- end }}
+            {{- end }}
+            {{- end }}
+            - name: CONNECTOR_SERVICE_REFUSED_CIDRS
+              value: {{ $refused | uniq | join "," | quote }}
+            # Hosting is refused unless this address lies in clusterCidrs.
+            - name: CONNECTOR_SERVICE_POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+            # Hosting is refused unless driver pods are refused this node.
+            - name: CONNECTOR_SERVICE_NODE_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.hostIP
+            - name: CONNECTOR_SERVICE_IPV6
+              value: {{ .ipv6 | quote }}
+            - name: CONNECTOR_SERVICE_NAMESPACE
+              value: {{ include "srw.connectorsNamespace" $ | quote }}
+            - name: CONNECTOR_SERVICE_RELEASE_NAMESPACE
+              value: {{ $.Release.Namespace | quote }}
+            - name: CONNECTOR_SERVICE_MAX_INSTALLATION
+              value: {{ .maxInstallation | quote }}
+            - name: CONNECTOR_SERVICE_IDLE_SECONDS
+              value: {{ .idleSeconds | quote }}
+            - name: CONNECTOR_SERVICE_START_TIMEOUT_SECONDS
+              value: {{ .startTimeoutSeconds | quote }}
+            - name: CONNECTOR_SERVICE_RECONCILE_SECONDS
+              value: {{ .reconcileIntervalSeconds | quote }}
+            # Re-pinning: a serving pod's egress hosts are resolved again on
+            # this interval; a changed address set starts its replacement.
+            - name: CONNECTOR_SERVICE_RERESOLVE_SECONDS
+              value: {{ .reresolveSeconds | quote }}
+            - name: CONNECTOR_SERVICE_REPIN_DRAIN_SECONDS
+              value: {{ .repinDrainSeconds | quote }}
+            # The lease exchange as driver pods dial it: the orchestrator
+            # Service, pinned into each pod's hostAliases (no DNS there).
+            - name: CONNECTOR_SERVICE_EXCHANGE_HOST
+              value: {{ printf "%s.%s.svc" (include "srw.serviceName" (dict "context" $ "component" "orchestrator")) $.Release.Namespace | quote }}
+            # The exchange peer in each driver pod's egress policy.
+            - name: CONNECTOR_SERVICE_ORCHESTRATOR_LABELS
+              value: {{ include "srw.componentSelectorLabels" (dict "context" $ "component" "orchestrator") | fromYaml | toJson | quote }}
+            - name: CONNECTOR_SERVICE_RESOURCES
+              value: {{ .driverResources | toJson | quote }}
+            {{- end }}
+            {{- if and .Values.connectors.servicePods.enabled (not .Values.connectors.drivers.shim.image.digest) }}
+            {{- fail "connectors.servicePods.enabled needs connectors.drivers.shim.image.digest: every driver pod runs the shim, so it is pinned by digest (CI stamps it; Tilt sets it in k3d)" }}
+            {{- end }}
+            - name: CONNECTOR_DRIVER_SHIM_IMAGE
+              value: {{ include "srw.imageRef" (dict "image" .Values.connectors.drivers.shim.image) | quote }}
+            # Registered driver images (connector drivers D6): the trusted
+            # repositories (a path-boundary match), whether custom images may
+            # have privilege anyway, and the bind-time pod limits (the
+            # namespace's Terminating pod quota is the cap's backstop).
+            - name: CONNECTOR_DRIVER_TRUSTED_REPOSITORIES
+              value: {{ .Values.connectors.drivers.trustedRepositories | default list | toJson | quote }}
+            {{- with .Values.connectors.customDrivers }}
+            - name: CONNECTOR_CUSTOM_DRIVERS_PRIVILEGED
+              value: {{ .privileged | quote }}
+            - name: CONNECTOR_BIND_TIME_DEADLINE_SECONDS
+              value: {{ .bindDeadlineSeconds | quote }}
+            - name: CONNECTOR_BIND_TIME_WAIT_SECONDS
+              value: {{ .bindWaitSeconds | quote }}
+            - name: CONNECTOR_BIND_TIME_SPEC_PODS_PER_USER
+              value: {{ .specPodsPerUser | quote }}
+            {{- end }}
+            - name: CONNECTOR_BIND_TIME_MAX_PODS
+              value: {{ .Values.connectors.servicePods.quota.bindTimePods | quote }}
+            {{- with .Values.connectors.drivers.echo }}
+            {{- if .enabled }}
+            {{- if not $.Values.connectors.servicePods.enabled }}
+            {{- fail "connectors.drivers.echo.enabled needs connectors.servicePods.enabled: the echo driver is a service-plane driver" }}
+            {{- end }}
+            {{- if not .image.repository }}
+            {{- fail "connectors.drivers.echo.enabled needs connectors.drivers.echo.image.repository" }}
+            {{- end }}
+            # Development only: the srw.echo-service/v1 driver's image
+            # reference; a digest pins it (tag@digest), a tag alone follows.
+            - name: CONNECTOR_ECHO_DRIVER_IMAGE
+              value: {{ printf "%s:%s%s" .image.repository (.image.tag | default "latest") (ternary (printf "@%s" .image.digest) "" (ne (.image.digest | default "") "")) | quote }}
+            {{- end }}
+            {{- end }}
+            # Managed MCP servers (connector drivers D5a, D5b): driver name ->
+            # image reference (tag, or tag@digest), and the front they run
+            # behind (whose image also carries the stdio bridge).
+            {{- $managedMcp := dict }}
+            {{- range $key, $name := dict "gitea" "srw.gitea-mcp/v1" }}
+            {{- $entry := index $.Values.connectors.drivers.managedMcp $key }}
+            {{- if $entry.enabled }}
+            {{- $_ := set $managedMcp $name $entry.image }}
+            {{- end }}
+            {{- end }}
+            {{- if .Values.connectors.drivers.mcpTest.enabled }}
+            {{- $_ := set $managedMcp "srw.mcp-test/v1" .Values.connectors.drivers.mcpTest.image }}
+            {{- end }}
+            {{- if .Values.connectors.drivers.mcpStdioTest.enabled }}
+            {{- $_ := set $managedMcp "srw.mcp-stdio-test/v1" .Values.connectors.drivers.mcpStdioTest.image }}
+            {{- end }}
+            {{- if .Values.connectors.drivers.mcpStdioProbe.enabled }}
+            {{- /* SRW's MCP test server in stdio mode: the mcpTest image. */}}
+            {{- $_ := set $managedMcp "srw.mcp-stdio-probe/v1" .Values.connectors.drivers.mcpTest.image }}
+            {{- end }}
+            {{- if $managedMcp }}
+            {{- if not .Values.connectors.servicePods.enabled }}
+            {{- fail "a managed MCP server (connectors.drivers.managedMcp, mcpTest, mcpStdioTest, mcpStdioProbe) needs connectors.servicePods.enabled: it runs as a service-plane driver" }}
+            {{- end }}
+            {{- if not .Values.connectors.drivers.mcpFront.image.digest }}
+            {{- fail "a managed MCP server needs connectors.drivers.mcpFront.image.digest: every managed MCP pod runs the front, so it is pinned by digest (CI stamps it; Tilt sets it in k3d)" }}
+            {{- end }}
+            {{- $references := dict }}
+            {{- range $name, $image := $managedMcp }}
+            {{- if not $image.repository }}
+            {{- fail (printf "the managed MCP server %s needs its image.repository" $name) }}
+            {{- end }}
+            {{- $_ := set $references $name (printf "%s:%s%s" $image.repository ($image.tag | default "latest") (ternary (printf "@%s" $image.digest) "" (ne ($image.digest | default "") ""))) }}
+            {{- end }}
+            - name: CONNECTOR_MANAGED_MCP_IMAGES
+              value: {{ $references | toJson | quote }}
+            - name: CONNECTOR_MCP_FRONT_IMAGE
+              value: {{ include "srw.imageRef" (dict "image" .Values.connectors.drivers.mcpFront.image) | quote }}
+            {{- end }}
+            # The git swap driver (connector drivers C3): what a token
+            # repository it cannot serve gets (always rendered: it applies
+            # with the driver off too), and, when it is on, its image and
+            # SRW's connector driver certificate authority.
+            - name: CONNECTOR_GIT_SWAP_FALLBACK
+              value: {{ .Values.connectors.drivers.gitSwap.fallback | quote }}
+            {{- with .Values.connectors.drivers.gitSwap }}
+            {{- if .enabled }}
+            {{- if not $.Values.connectors.servicePods.enabled }}
+            {{- fail "connectors.drivers.gitSwap.enabled needs connectors.servicePods.enabled: the git swap driver is a service-plane driver" }}
+            {{- end }}
+            {{- if not .image.repository }}
+            {{- fail "connectors.drivers.gitSwap.enabled needs connectors.drivers.gitSwap.image.repository" }}
+            {{- end }}
+            # A digest pins it (tag@digest; CI stamps it), a tag alone follows.
+            - name: CONNECTOR_GIT_SWAP_IMAGE
+              value: {{ printf "%s:%s%s" .image.repository (.image.tag | default "latest") (ternary (printf "@%s" .image.digest) "" (ne (.image.digest | default "") "")) | quote }}
+            - name: CONNECTOR_DRIVER_CA_DIR
+              value: /run/srw/connector-driver-ca
+            {{- end }}
+            {{- end }}
+            # The in-pod plane's cloud mount sidecars (connector drivers D7):
+            # the workspace provisioner adds them only with both images. A
+            # published chart pins both by digest (CI stamps them): the
+            # opener runs privileged in every Pod that mounts, and the
+            # supervisor holds the credentials.
+            {{- with .Values.connectors.inPodPlane }}
+            {{- if .enabled }}
+            {{- range $name, $sidecar := dict "opener" .opener "rclone" .rclone }}
+            {{- if not $sidecar.image.repository }}
+            {{- fail (printf "connectors.inPodPlane.enabled needs connectors.inPodPlane.%s.image.repository" $name) }}
+            {{- end }}
+            {{- if and (not $sidecar.image.digest) (not $sidecar.image.tag) }}
+            {{- fail (printf "connectors.inPodPlane.enabled needs connectors.inPodPlane.%s.image.digest or .tag" $name) }}
+            {{- end }}
+            {{- end }}
+            - name: CONNECTOR_IN_POD_OPENER_IMAGE
+              value: {{ include "srw.imageRef" (dict "image" .opener.image) | quote }}
+            - name: CONNECTOR_IN_POD_RCLONE_IMAGE
+              value: {{ include "srw.imageRef" (dict "image" .rclone.image) | quote }}
+            - name: CONNECTOR_IN_POD_CACHE_SIZE
+              value: {{ .cacheSize | default "10Gi" | quote }}
+            - name: CONNECTOR_IN_POD_DRAIN_SECONDS
+              value: {{ .drainSeconds | default 60 | quote }}
+            - name: CONNECTOR_IN_POD_MAX_MOUNTS
+              value: {{ .maxMounts | default 8 | quote }}
+            - name: CONNECTOR_IN_POD_SUPERVISOR_MEMORY
+              value: {{ .supervisorMemory | default "" | quote }}
+            {{- end }}
+            {{- end }}
             - name: KB_EXTERNAL_REINDEX_CONCURRENCY
               value: {{ .Values.orchestrator.kbExternalReindexConcurrency | quote }}
             - name: KB_REINDEX_SWEEP_SECONDS
@@ -1846,6 +2159,27 @@ spec:
             - name: SSH_GATEWAY_HOSTNAME
               value: {{ .Values.sshGateway.hostname | quote }}
             {{- end }}
+            # Appended at the end on purpose; see the note above.
+            - name: WORKSPACE_BUILTIN_TEMPLATES
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: WORKSPACE_BUILTIN_TEMPLATES
+                  optional: true
+            # Appended at the end on purpose; see the note above.
+            - name: WORKSPACE_DEFAULTS
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: WORKSPACE_DEFAULTS
+                  optional: true
+            {{- if .Values.sshGateway.enabled }}
+            # AgentProvisioner needs only the Secret's name. It derives the
+            # selected public item names from SSH_GATEWAY_PUBLIC_HOST_KEYS;
+            # no gateway private key bytes enter the orchestrator or agent Pods.
+            - name: AGENT_SSH_GATEWAY_HOST_KEY_SECRET
+              value: {{ .Values.sshGateway.hostKeySecret | quote }}
+            {{- end }}
           volumeMounts:
             - name: workspace
               mountPath: /workspace
@@ -1856,6 +2190,11 @@ spec:
             {{- if .Values.sshGateway.enabled }}
             - name: ssh-gateway-host-keys
               mountPath: {{ include "srw.sshGatewayHostKeyDir" . }}
+              readOnly: true
+            {{- end }}
+            {{- if .Values.connectors.drivers.gitSwap.enabled }}
+            - name: connector-driver-ca
+              mountPath: /run/srw/connector-driver-ca
               readOnly: true
             {{- end }}
           lifecycle:
@@ -1932,4 +2271,22 @@ spec:
               - key: {{ printf "%s.pub" . | quote }}
                 path: {{ printf "%s.pub" . | quote }}
               {{- end }}
+        {{- end }}
+        {{- if .Values.connectors.drivers.gitSwap.enabled }}
+        # SRW's connector driver certificate authority (C3): it signs each
+        # TLS driver pod's certificate. This pod only; 0444 for the non-root
+        # orchestrator user, as vm-ssh-key above.
+        - name: connector-driver-ca
+          secret:
+            secretName: {{ include "srw.connectorDriverCaSecretName" . }}
+            # A missing Secret means "the git swap driver is not installed;
+            # token repositories take the fallback", never a pod that cannot
+            # start (the orchestrator logs it).
+            optional: true
+            defaultMode: 0444
+            items:
+              - key: tls.crt
+                path: tls.crt
+              - key: tls.key
+                path: tls.key
         {{- end }}

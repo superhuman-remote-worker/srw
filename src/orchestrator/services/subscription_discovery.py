@@ -343,6 +343,26 @@ class ImportOutcome:
         }
 
 
+def _capped_context_window(candidate: ModelCandidate, cap: int | None) -> int | None:
+    """The window to store for ``candidate`` under an admin's bulk cap.
+
+    A cap only ever lowers the window. An advertised maximum is clamped to it.
+    With no advertised maximum the row would fall back to its family default,
+    so the cap is stored only when that default exceeds it (or is unknown);
+    otherwise NULL keeps the row tracking the family matrix.
+    """
+    if cap is None:
+        return candidate.context_window
+    if candidate.context_window:
+        return min(cap, candidate.context_window)
+    from shared.runtime.core.model_registry import _family_context_window
+
+    family_window = _family_context_window(candidate.model_id)
+    if family_window and family_window <= cap:
+        return None
+    return cap
+
+
 async def import_candidates(
     *,
     db: Any,
@@ -350,6 +370,7 @@ async def import_candidates(
     candidates: Iterable[ModelCandidate],
     requested_ids: Iterable[str] | None,
     include_review: bool,
+    context_window_cap: int | None = None,
 ) -> ImportOutcome:
     """Register the administrator's selection as catalog rows. Idempotent.
 
@@ -363,6 +384,8 @@ async def import_candidates(
     * A ``needs_review`` model is rejected unless the caller opted in, and is
       then stored with ``needs_review`` on its routing block plus the safe
       Chat Completions protocol, so nothing silently inherits Codex behaviour.
+    * ``context_window_cap`` lowers a row's window, never raises it (see
+      :func:`_capped_context_window`).
     """
     from shared.runtime.core.model_registry import family_of
 
@@ -410,7 +433,7 @@ async def import_candidates(
                 display_label=candidate.display_label,
                 capabilities=list(candidate.capabilities or ("chat", "auxiliary")),
                 family=candidate.family or family_of(candidate.model_id),
-                context_window=candidate.context_window,
+                context_window=_capped_context_window(candidate, context_window_cap),
                 params_json=params or None,
                 enabled=True,
                 seeded_from="subscription-proxy:discover",

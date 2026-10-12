@@ -1,5 +1,9 @@
-// Regenerate static PWA artwork from the SVG sources. Requires Inkscape and
-// ImageMagick (`magick`) on PATH. Run from cockpit: node scripts/generate-pwa-icons.mjs
+// Regenerate static PWA artwork and the link-preview card from the SVG
+// sources. Requires Inkscape and ImageMagick (`magick`) on PATH, and Cinzel,
+// Inter and JetBrains Mono visible to fontconfig as TTF/OTF. Without them the
+// artwork silently renders in fallback faces; WOFF2 does not count, fc-match
+// lists it but Inkscape cannot draw from it.
+// Run from cockpit: node scripts/generate-pwa-icons.mjs
 import {execFileSync} from 'node:child_process';
 import {mkdtempSync, readFileSync, rmSync, writeFileSync} from 'node:fs';
 import {tmpdir} from 'node:os';
@@ -9,15 +13,16 @@ import {fileURLToPath} from 'node:url';
 const root = fileURLToPath(new URL('..', import.meta.url));
 const icons = join(root, 'src/assets/icons');
 const publicDir = join(root, 'public');
+const social = join(root, 'src/assets/social');
 const temp = mkdtempSync(join(tmpdir(), 'srw-pwa-icons-'));
 const icon = readFileSync(join(icons, 'icon.svg'), 'utf8');
 const manifest = JSON.parse(readFileSync(join(publicDir, 'manifest.webmanifest'), 'utf8'));
 
-function render(svg, path, size) {
+function render(svg, path, width, height = width) {
   const source = join(temp, 'icon.svg');
   writeFileSync(source, svg);
   execFileSync('inkscape', [source, '--export-type=png', `--export-filename=${path}`,
-    `--export-width=${size}`, `--export-height=${size}`], {stdio: 'pipe'});
+    `--export-width=${width}`, `--export-height=${height}`], {stdio: 'pipe'});
 }
 
 try {
@@ -47,6 +52,10 @@ try {
   }
   execFileSync('magick', [join(publicDir, 'favicon-16.png'), join(publicDir, 'favicon-32.png'),
     join(publicDir, 'favicon-48.png'), join(publicDir, 'favicon.ico')], {stdio: 'pipe'});
+
+  // og:image in index.html. Social crawlers do not render SVG, so the PNG ships.
+  render(readFileSync(join(social, 'og-1200x630.svg'), 'utf8'),
+    join(social, 'og-1200x630.png'), 1200, 630);
 } finally {
   rmSync(temp, {recursive: true, force: true});
 }

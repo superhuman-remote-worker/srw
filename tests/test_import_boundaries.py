@@ -18,9 +18,13 @@ def boundary_tree(tmp_path):
     for package in (
         "agent",
         "orchestrator",
+        "orchestrator/application",
+        "orchestrator/operator_cli",
         "orchestrator/routers",
         "orchestrator/schemas",
+        "orchestrator/security",
         "orchestrator/services",
+        "orchestrator/services/connector_drivers",
         "mcp_server",
         "vm_controller",
         "shared",
@@ -60,8 +64,29 @@ def boundary_tree(tmp_path):
         "orchestrator/services/preference_defaults.py": "from shared.value import VALUE\n",
         "orchestrator/services/session_workspace_policy.py": "from shared.value import VALUE\n",
         "orchestrator/services/manifest_legacy.py": "from shared.runtime.provider import VALUE\n",
+        # R1.B12: the composition package and the one entrypoint allowed to use
+        # it outside ``orchestrator.main`` (the stateless-wake operator harness).
+        "orchestrator/application/__init__.py": "from shared.value import VALUE\n",
+        "orchestrator/application/controls.py": "from shared.value import VALUE\n",
+        "orchestrator/application/transport.py": "from shared.value import VALUE\n",
+        "orchestrator/operator_cli/__init__.py": "",
+        "orchestrator/operator_cli/stateless_wake_acceptance.py": (
+            "import orchestrator.application\n"
+            "from orchestrator.application import controls, transport\n"
+        ),
         "mcp_server/app.py": "from shared.contracts.item import VALUE\n",
         "vm_controller/app.py": "from shared.value import VALUE\n",
+        # D1c: the drivers' internal rules, imported only by the drivers.
+        "orchestrator/services/workspace_ssh_connector.py": (
+            "from shared.value import VALUE\n"
+        ),
+        "orchestrator/security/credential_files.py": "from shared.value import VALUE\n",
+        "orchestrator/services/connector_drivers/workspace_ssh.py": (
+            "from orchestrator.services.workspace_ssh_connector import VALUE\n"
+        ),
+        "orchestrator/services/connector_drivers/credential_files.py": (
+            "from orchestrator.security.credential_files import VALUE\n"
+        ),
     }.items():
         (tmp_path / "src" / module).write_text(body)
     # New extraction boundaries declare their source modules in the manifest.
@@ -76,6 +101,15 @@ def boundary_tree(tmp_path):
             if path.is_dir() or path.with_suffix(".py").exists():
                 continue
             path.parent.mkdir(parents=True, exist_ok=True)
+            # A module inside a sub-package (R1.B11 names
+            # services.lifecycle.reconciler) needs every package level to be
+            # a regular package, or the linter cannot resolve it.
+            package = path.parent
+            while (
+                package != tmp_path / "src" and not (package / "__init__.py").exists()
+            ):
+                (package / "__init__.py").write_text("")
+                package = package.parent
             path.with_suffix(".py").write_text("from shared.value import VALUE\n")
     return tmp_path
 
@@ -100,8 +134,59 @@ def test_allowed_runtime_and_lightweight_dependencies_pass(boundary_tree):
     result = lint_boundaries(boundary_tree)
     assert result.returncode == 0, result.stdout + result.stderr
     # The generic manifest path also excludes the legacy harness adapter.
-    # 24 since R1.B09 added its contract over control, delivery and retirement.
-    assert "Contracts: 24 kept, 0 broken" in result.stdout
+    # 24 since R1.B09 added its contract over control, delivery and retirement;
+    # 25 since R1.B10 added session transport, projections and permissions;
+    # 26 since R1.B11 added scheduling, reconciliation and task ownership;
+    # 28 since R1.B12 closed the entrypoint and the composition boundary;
+    # 29 since R3.2 fenced the session client transport off the runtime;
+    # 30 since R3.3a fenced the session input owner off the runtime and loop;
+    # 32 since D1a kept the connector driver contract on the standard library;
+    # 33 since D1c kept the drivers' internal rules to the drivers;
+    # 34 since D1b fenced the agent's connector materializers off the runtime.
+    assert "Contracts: 34 kept, 0 broken" in result.stdout
+
+
+@pytest.mark.parametrize(
+    ("source", "target"),
+    [
+        (
+            "orchestrator/services/datasources.py",
+            "orchestrator.services.workspace_ssh_connector",
+        ),
+        (
+            "orchestrator/application/settings.py",
+            "orchestrator.services.workspace_ssh_connector",
+        ),
+        ("orchestrator/services/projects.py", "orchestrator.security.credential_files"),
+        ("agent/core/setup.py", "orchestrator.security.credential_files"),
+    ],
+)
+def test_only_the_drivers_import_their_internal_rules(boundary_tree, source, target):
+    path = boundary_tree / "src" / source
+    path.parent.mkdir(parents=True, exist_ok=True)
+    (path.parent / "__init__.py").touch()
+    path.write_text(f"import {target}\n")
+    result = lint_boundaries(boundary_tree)
+    assert result.returncode != 0, result.stdout + result.stderr
+    assert "Only the connector drivers use their internal rules BROKEN" in result.stdout
+
+
+def test_connector_contract_rejects_a_framework_import(boundary_tree):
+    (boundary_tree / "src/shared/connectors.py").write_text("import yaml\n")
+    result = lint_boundaries(boundary_tree)
+    assert result.returncode != 0, result.stdout + result.stderr
+    assert (
+        "The connector driver contract uses the standard library only BROKEN"
+        in result.stdout
+    )
+
+
+def test_connector_materializers_reject_the_loop(boundary_tree):
+    (boundary_tree / "src/agent/connectors.py").write_text("import langgraph\n")
+    result = lint_boundaries(boundary_tree)
+    assert result.returncode != 0, result.stdout + result.stderr
+    assert "Connector materializers do not import the agent runtime" in result.stdout
+    assert "the loop BROKEN" in result.stdout
 
 
 @pytest.mark.parametrize(
@@ -144,6 +229,22 @@ def test_allowed_runtime_and_lightweight_dependencies_pass(boundary_tree):
             "orchestrator.main",
         ),
         ("orchestrator/services/pinned_retirement.py", "orchestrator.main"),
+        ("orchestrator/routers/thread_session.py", "orchestrator.main"),
+        ("orchestrator/routers/thread_history.py", "orchestrator.main"),
+        ("orchestrator/routers/thread_transport.py", "orchestrator.main"),
+        ("orchestrator/routers/thread_permissions.py", "orchestrator.main"),
+        ("orchestrator/schemas/thread_session.py", "orchestrator.main"),
+        ("orchestrator/schemas/thread_transport.py", "orchestrator.main"),
+        ("orchestrator/services/session_wake.py", "orchestrator.main"),
+        ("orchestrator/services/session_attention.py", "orchestrator.main"),
+        ("orchestrator/services/pinned_forwarding.py", "orchestrator.main"),
+        ("orchestrator/services/thread_event_stream.py", "orchestrator.main"),
+        ("orchestrator/services/stateless_input_admission.py", "orchestrator.main"),
+        ("orchestrator/services/session_tool_view.py", "orchestrator.main"),
+        ("orchestrator/services/thread_permissions.py", "orchestrator.main"),
+        ("orchestrator/services/thread_projection.py", "orchestrator.main"),
+        ("orchestrator/services/magic_link_pages.py", "orchestrator.main"),
+        ("orchestrator/services/thread_turn_locks.py", "orchestrator.main"),
         ("orchestrator/services/preference_defaults.py", "orchestrator.main"),
         ("orchestrator/services/session_workspace_policy.py", "orchestrator.main"),
         ("orchestrator/schemas/job_create.py", "orchestrator.main"),
@@ -204,6 +305,28 @@ def test_allowed_runtime_and_lightweight_dependencies_pass(boundary_tree):
         ("orchestrator/routers/media.py", "orchestrator.main"),
         ("orchestrator/routers/projects.py", "orchestrator.main"),
         ("orchestrator/schemas/media.py", "orchestrator.main"),
+        # R1.B11: scheduling, reconciliation, startup and task ownership.
+        ("orchestrator/services/application_tasks.py", "orchestrator.main"),
+        ("orchestrator/services/job_dispatcher.py", "orchestrator.main"),
+        ("orchestrator/services/stale_agent_detector.py", "orchestrator.main"),
+        ("orchestrator/services/pinned_k8s_reconciliation.py", "orchestrator.main"),
+        ("orchestrator/services/retention_sweepers.py", "orchestrator.main"),
+        ("orchestrator/services/startup_backfills.py", "orchestrator.main"),
+        (
+            "orchestrator/services/infrastructure_metering/bootstrap.py",
+            "orchestrator.main",
+        ),
+        ("orchestrator/services/lifecycle/reconciler.py", "orchestrator.main"),
+        ("orchestrator/services/sudo_gate.py", "orchestrator.main"),
+        ("orchestrator/services/ide_settings.py", "orchestrator.main"),
+        # R1.B12: nothing imports the entrypoint, and only the entrypoint (plus
+        # the named operator harness) composes the application.
+        ("orchestrator/application/controls.py", "orchestrator.main"),
+        ("orchestrator/operator_cli/__init__.py", "orchestrator.main"),
+        ("orchestrator/routers/contacts.py", "orchestrator.application"),
+        ("orchestrator/services/job_queries.py", "orchestrator.application.controls"),
+        ("orchestrator/schemas/job_create.py", "orchestrator.application"),
+        ("orchestrator/operator_cli/__init__.py", "orchestrator.application"),
         ("vm_controller/app.py", "headscale_client"),
     ],
 )

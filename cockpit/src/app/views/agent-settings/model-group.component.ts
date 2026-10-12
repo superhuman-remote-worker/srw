@@ -285,6 +285,11 @@ export class ModelGroupComponent {
    *  gates this on the Delegation tool being enabled; defaults to shown so the
    *  component works standalone. */
   showSubagent = input(true);
+  /** Preselect the model last picked on this surface (localStorage) when the
+   *  config pins none. The three-section host turns it off: there a template
+   *  is the starting point, so an untouched form must show the template's own
+   *  default instead of a pick carried over from an earlier job. */
+  rememberLastModel = input(true);
 
   change = output<void>();
 
@@ -499,10 +504,11 @@ export class ModelGroupComponent {
       | undefined;
     const rosterModel = (rosterLlm?.['model'] as string) ?? null;
 
-    this.model.set(baseModel ? null : this.loadSavedModel(this.modelStorageKey()));
+    const remember = this.rememberLastModel();
+    this.model.set(baseModel || !remember ? null : this.loadSavedModel(this.modelStorageKey()));
     // Subagents inherit the model, so a pinned model is also "already
     // resolved" for them — don't preselect a saved subagent model then.
-    this.subagentModel.set(rosterModel || baseModel ? null : this.loadSavedModel('subagent'));
+    this.subagentModel.set(rosterModel || baseModel || !remember ? null : this.loadSavedModel('subagent'));
     // Reasoning picks don't survive a config prefill — the new expert's
     // config (and possibly family) makes the old level meaningless. This
     // fires on more than a deliberate expert switch: SessionCreateComponent

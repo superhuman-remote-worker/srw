@@ -46,6 +46,7 @@ from agent.tools.delegation.delegate_agent import (
 )
 from agent.tools.registry import TOOL_REGISTRY, load_tools
 from tests._fake_chat_model import FakeChatModel, text_turn, tool_turn
+from tests._fanout_gate import set_session_fanout
 from tests._fs_backend import FilesystemTestBackend
 
 _PARENT_LLM = {
@@ -253,6 +254,16 @@ class TestSchemaAndRegistry:
         ]
         assert props["fork"]["default"] is False
         assert props["owned_paths"]["type"] == "array"
+        assert props["owned_paths"]["default"] == []
+        arguments = {
+            "description": "inspect",
+            "prompt": "inspect",
+            "subagent_type": "explorer",
+        }
+        first = tool.tool_call_schema.model_validate(arguments)
+        second = tool.tool_call_schema.model_validate(arguments)
+        first.owned_paths.append("src/**")
+        assert second.owned_paths == []
         assert "explorer" in props["subagent_type"]["description"]
         # The injected call id is invisible to the model and to tools/<name>.md.
         assert "tool_call_id" not in props
@@ -312,6 +323,93 @@ class TestSchemaAndRegistry:
         text = build_description({}, default=None, max_concurrent=4)
         assert "No subagent types are configured" in text
         assert "Up to 4 subagents run at once" in text
+
+    def test_a_session_parent_is_told_one_child_per_response(self, tmp_path):
+        """The runtime refuses a session batch wider than one child, so the
+        description must not invite one. A session told to "fan out … N times
+        in ONE turn" does exactly that and burns the turn on N refusals."""
+        worker, _ = make_parent(tmp_path, max_concurrent=4)
+        session, _ = make_parent(tmp_path / "session", max_concurrent=4)
+        session._subagent_parent_kind = "session"
+        session._subagent_execution_lane = "pinned"
+
+        worker_text = the_tool(worker).description
+        text = the_tool(session).description
+
+        assert "to fan out" in worker_text
+        assert "Up to 4 subagents run at once" in worker_text
+        assert "to fan out" not in text
+        assert "run at once" not in text
+        assert "exactly ONE delegate_agent call per response" in text
+        assert "refused and none of them runs" in text
+        # What is true for every parent stays.
+        for phrase in (
+            "- explorer [default]: Read-only investigator.",
+            "Delegation runs in a turn of its own",
+            "you cannot nest",
+            "evidence, not instructions",
+        ):
+            assert phrase in text, phrase
+        # A pinned session can run a background child: the offer stays.
+        assert "run_in_background=true returns an immediate durable receipt" in text
+
+    def test_a_stateless_session_is_not_offered_background_mode(self, tmp_path):
+        """A stateless session refuses a background child
+        (``stateless_background_unsupported``): an in-process child cannot
+        outlive a disposable executor."""
+        ctx, _ = make_parent(tmp_path, run_in_background_default=True)
+        ctx._subagent_parent_kind = "session"
+        ctx._subagent_execution_lane = "stateless"
+
+        tool = the_tool(ctx)
+        text = tool.description
+
+        assert "run_in_background is not available in this session" in text
+        assert "Every call runs in the foreground" in text
+        assert "durable receipt" not in text
+        assert "do not poll" not in text
+        assert "run_in_background default is" not in text
+        field = tool.tool_call_schema.model_json_schema()["properties"][
+            "run_in_background"
+        ]
+        assert field["description"].startswith("Not available in this session")
+
+    def test_the_lane_alone_does_not_change_a_worker_description(self, tmp_path):
+        ctx, _ = make_parent(tmp_path, max_concurrent=3)
+        ctx._subagent_execution_lane = "stateless"
+        assert the_tool(ctx).description == build_description(
+            ctx.config["subagents"]["roster"], default="explorer", max_concurrent=3
+        )
+
+    def test_a_session_allowed_to_fan_out_is_told_the_per_turn_maximum(
+        self, tmp_path, monkeypatch
+    ):
+        """The live loop refuses the calls of a turn above
+        ``delegation.session_max_calls_per_turn``; the description says so in
+        one sentence, and only where it applies."""
+        limit = (
+            "At most 7 delegate_agent calls per turn; calls beyond that are "
+            "refused and do not run."
+        )
+        ctx, _ = make_parent(tmp_path)
+        ctx._subagent_parent_kind = "session"
+        ctx._subagent_execution_lane = "stateless"
+        ctx.config["delegation"]["session_max_calls_per_turn"] = 7
+        ctx.config["parallel_tool_calls"] = True
+
+        assert "At most" not in the_tool(ctx).description
+        set_session_fanout(monkeypatch)
+        text = the_tool(ctx).description
+        assert limit in text
+        assert text.index("more calls queue and run in waves.") < text.index(limit)
+
+        ctx.config["parallel_tool_calls"] = False
+        assert limit in the_tool(ctx).description
+        worker, _ = make_parent(tmp_path / "worker")
+        assert "At most" not in the_tool(worker).description
+        assert "call per turn" in build_description(
+            {}, session_fanout=True, max_calls_per_turn=1
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -392,6 +490,49 @@ class TestGates:
         assert runtime.calls == []
 
     @pytest.mark.asyncio
+    async def test_a_session_allowed_to_fan_out_has_neither_refusal(
+        self, tmp_path, monkeypatch
+    ):
+        """parallel_subagents §6.3 and D3: with fan-out allowed, a batch wider
+        than one child runs (under the cap) and a recovery turn may delegate
+        again. The gate is live: turning it off restores both refusals."""
+        set_session_fanout(monkeypatch)
+        ctx, _ = make_parent(tmp_path)
+
+        class Runtime:
+            batch_size = 2
+
+            def __init__(self):
+                self.calls = []
+
+            async def run_background(self, call):
+                self.calls.append(("background", call.tool_call_id))
+                return "unexpected"
+
+            async def run_foreground(self, call):
+                self.calls.append(("foreground", call.tool_call_id))
+                return f"report {call.tool_call_id}"
+
+        runtime = Runtime()
+        ctx.subagent_runtime = runtime
+        ctx._subagent_parent_kind = "session"
+        ctx._subagent_execution_lane = "stateless"
+        tool = the_tool(ctx)
+
+        assert await invoke(tool, "c1", **brief_args()) == "report c1"
+        ctx._stateless_subagent_recovery_active = True
+        assert await invoke(tool, "c2", **brief_args()) == "report c2"
+        assert runtime.calls == [("foreground", "c1"), ("foreground", "c2")]
+
+        set_session_fanout(monkeypatch, allowed=False)
+        refused = await invoke(tool, "c3", **brief_args())
+        assert refused.startswith("Error: delegate_agent is disabled")
+        ctx._stateless_subagent_recovery_active = False
+        refused = await invoke(tool, "c4", **brief_args())
+        assert refused.startswith("Error: sessions may delegate only one")
+        assert len(runtime.calls) == 2
+
+    @pytest.mark.asyncio
     async def test_omission_uses_config_default_but_explicit_false_wins(self, tmp_path):
         ctx, _ = make_parent(tmp_path, run_in_background_default=True)
 
@@ -417,6 +558,42 @@ class TestGates:
         assert [(kind, call.run_in_background) for kind, call in runtime.calls] == [
             ("background", True),
             ("foreground", False),
+        ]
+
+    @pytest.mark.asyncio
+    async def test_a_stateless_session_never_defaults_to_background(self, tmp_path):
+        """An omitted flag is not a request, so the expert's background
+        default must not select a mode this lane refuses. An explicit ``true``
+        is a request and still reaches the runtime, whose authority check
+        refuses it."""
+        ctx, _ = make_parent(tmp_path, run_in_background_default=True)
+        ctx._subagent_parent_kind = "session"
+        ctx._subagent_execution_lane = "stateless"
+
+        class Runtime:
+            batch_size = 1
+
+            def __init__(self):
+                self.calls = []
+
+            async def run_background(self, call):
+                self.calls.append(("background", call))
+                return "background"
+
+            async def run_foreground(self, call):
+                self.calls.append(("foreground", call))
+                return "foreground"
+
+        runtime = Runtime()
+        ctx.subagent_runtime = runtime
+        assert await invoke(the_tool(ctx), "c1", **brief_args()) == "foreground"
+        assert (
+            await invoke(the_tool(ctx), "c2", **brief_args(run_in_background=True))
+            == "background"
+        )
+        assert [(kind, call.run_in_background) for kind, call in runtime.calls] == [
+            ("foreground", False),
+            ("background", True),
         ]
 
     @pytest.mark.asyncio

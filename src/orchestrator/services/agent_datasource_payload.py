@@ -9,15 +9,26 @@ root-owned). That shared use is why they live in one module rather than being
 duplicated per lane — the two boundaries previously disagreed about read-write
 managed connectors, and a second copy is how that recurs.
 
+What one row becomes is its connector driver's ``bind``
+(``orchestrator.services.connector_drivers``); this module walks the rows,
+applies the drivers' deployment gates and per-execution limits, and keeps
+the wire format.
+
+It is also where a connector creator's read-only tag joins the project link
+(connector drivers decisions 31 and 32): every forwarded row carries the
+stricter of the two as ``project_read_only``, so the drivers, the tool
+categories, the credential leases and the agent all bind it at one level.
+The wire key keeps its name, since agent images roll independently.
+
 What is deliberately NOT here: connector authorization. ``datasource_policy``
 remains the authority for whether a selection may be attached at all, and the
 job-side reauthorization lives in ``job_datasource_selection``. This module
 assumes it was handed an already-authorized, exactly-resolved set and only
 decides what of it crosses the wire.
 
-Deployment gates (``MCP_DATASOURCES_ENABLED`` / ``MCP_STDIO_ENABLED``) arrive as
-injected callables rather than being read here, so a test that steers the gate
-on the application module still steers this module.
+The deployment gate (``MCP_DATASOURCES_ENABLED``) arrives as an injected
+callable rather than being read here, so a test that steers the gate on the
+application module still steers this module.
 """
 
 from __future__ import annotations
@@ -27,10 +38,23 @@ import logging
 from dataclasses import dataclass
 from typing import Any, Callable
 
-from orchestrator.services.datasource_config import (
-    normalize_kb_config as _normalize_kb_config,
+from orchestrator.services.connector_credential_leases import (
+    harness_credentials,
+    lease_spec,
 )
-from orchestrator.services.email_datasource import email_dispatch_config
+from orchestrator.services.connector_drivers import ConnectorDriverRegistry
+from orchestrator.services.connector_drivers.base import (
+    BindContext,
+    DeploymentGates,
+    SupportsWorkspaceSshIdentity,
+    payload_entry,
+)
+from orchestrator.services.connector_drivers.workspace_ssh import (
+    WorkspaceSshConnectorError,
+)
+from shared.connectors.builtin import GIT_SWAP_SPEC
+from shared.connectors.contract import bound_read_only
+from shared.connectors.git_swap import FALLBACK_TOKEN_IN_URL
 from shared.datasource_policy import datasource_tool_categories
 
 
@@ -38,38 +62,78 @@ from shared.datasource_policy import datasource_tool_categories
 class DatasourcePayloadDependencies:
     """Per-invocation collaborators for the agent datasource payload.
 
-    ``mcp_datasources_enabled`` / ``mcp_stdio_enabled`` are callables, not
-    booleans: the deployment gates they read are evaluated per call by the
-    application, so a monkeypatched gate is observed here too.
+    ``mcp_datasources_enabled`` is a callable, not a boolean: the
+    deployment gate it reads is evaluated per call by the application, so a
+    monkeypatched gate is observed here too.
     """
 
     logger: logging.Logger
     mcp_datasources_enabled: Callable[[], bool]
-    mcp_stdio_enabled: Callable[[], bool]
+    #: The application's installed connector drivers.
+    connector_drivers: ConnectorDriverRegistry
+    #: The deployment's default SSH host-key pins, as known_hosts
+    #: text, for SSH connectors without a pin of their own. Both the
+    #: ``ssh_identity`` descriptor and the delivered identity read it
+    #: here, so they always agree.
+    workspace_ssh_known_hosts: Callable[[], str]
+    #: What a token repository gets when the git swap driver cannot serve it
+    #: (``connectors.drivers.gitSwap.fallback``, C3): ``token-in-url`` (the
+    #: delivery before C3) or ``refuse``. Read per call, as the gates are.
+    git_swap_fallback: Callable[[], str] = lambda: FALLBACK_TOKEN_IN_URL
+
+    def deployment_gates(self) -> DeploymentGates:
+        return DeploymentGates(
+            mcp_datasources_enabled=self.mcp_datasources_enabled,
+        )
 
 
-def mcp_datasource_runtime_allowed(
-    datasource: dict[str, Any],
+def forwarded_datasources(
+    datasources: list[dict[str, Any]] | None,
     *,
     dependencies: DatasourcePayloadDependencies,
-) -> bool:
-    """Apply deployment gates to a resolved datasource without exposing secrets."""
-    if datasource.get("type") != "mcp":
-        return True
-    if not dependencies.mcp_datasources_enabled():
-        return False
-    credentials = datasource.get("credentials") or {}
-    if isinstance(credentials, str):
-        try:
-            credentials = json.loads(credentials)
-        except (json.JSONDecodeError, ValueError):
-            credentials = {}
-    transport = (
-        credentials.get("transport", "http")
-        if isinstance(credentials, dict)
-        else "http"
-    )
-    return str(transport).lower() != "stdio" or dependencies.mcp_stdio_enabled()
+    log_skipped: bool = False,
+) -> list[dict[str, Any]]:
+    """The resolved rows an agent receives, in order.
+
+    A row whose driver's deployment gate is off is left out, and a driver
+    that allows only so many connectors per execution (email: one, because
+    the agent keys connections by type) keeps the first ones. Both the
+    payload and the tool categories are built from this, so a tool tier is
+    only granted for a connector that is delivered. A stored type no driver
+    serves is forwarded as stored.
+
+    A row its creator tagged read-only is forwarded as a copy whose
+    ``project_read_only`` is set (:func:`bound_read_only`): a read-write or
+    missing project link never lifts the tag, for whoever runs it.
+    """
+    gates = dependencies.deployment_gates()
+    forwarded: list[dict[str, Any]] = []
+    bound_per_driver: dict[str, int] = {}
+    for ds in datasources or []:
+        driver = dependencies.connector_drivers.for_type(ds.get("type"))
+        if driver is not None:
+            if not driver.runtime_allowed(ds, gates):
+                continue
+            limit = driver.spec.max_per_execution
+            if limit is not None:
+                bound = bound_per_driver.get(driver.spec.name, 0)
+                if bound >= limit:
+                    if log_skipped:
+                        ds_type = ds["type"]
+                        dependencies.logger.warning(
+                            "Skipping additional %s datasource %r: only %s %s "
+                            "datasource per job/session is supported",
+                            ds_type,
+                            ds.get("name"),
+                            "one" if limit == 1 else limit,
+                            ds_type,
+                        )
+                    continue
+                bound_per_driver[driver.spec.name] = bound + 1
+        if bound_read_only(ds) and not ds.get("project_read_only"):
+            ds = {**ds, "project_read_only": True}
+        forwarded.append(ds)
+    return forwarded
 
 
 def build_datasource_tool_override(
@@ -97,13 +161,12 @@ def build_datasource_tool_override(
     # Shared single source of truth with the agent's session attach path
     # (they previously disagreed on read-write managed connectors). Email is
     # tier-keyed inside the shared map (EMAIL_TIER_TOOLS keyed by
-    # config.access, clamped by project_read_only) — no extra handling here.
-    enabled_datasources = [
-        datasource
-        for datasource in datasources
-        if mcp_datasource_runtime_allowed(datasource, dependencies=dependencies)
-    ]
-    tools_override.update(datasource_tool_categories(enabled_datasources))
+    # config.access, clamped by project_read_only). The categories come from
+    # the rows the agent actually receives, so a second mailbox the payload
+    # leaves out cannot raise the email tier of the one it forwards, and a
+    # creator's read-only tag clamps them as it clamps the payload.
+    forwarded = forwarded_datasources(datasources, dependencies=dependencies)
+    tools_override.update(datasource_tool_categories(forwarded))
     override["tools"] = tools_override
     return override
 
@@ -111,18 +174,22 @@ def build_datasource_tool_override(
 def apply_cloud_storage_override(
     resolved_ds: list[dict[str, Any]], job_context: dict[str, Any]
 ) -> None:
-    """Apply job-level cloud_storage_read_only override to WebDAV datasources.
+    """Apply a job's cloud_storage_read_only to its WebDAV datasources.
 
-    If the job's context contains cloud_storage_read_only, it overrides the
-    project-level read_only setting on any webdav datasource in the resolved list.
-    Mutates resolved_ds in place.
+    The key is the job creator's, unchecked at admission, so it can only
+    tighten: a WebDAV connector is read-only when its project link is or the
+    job asks for it. A job cannot lift a read-only link the project owner set,
+    nor the connector creator's read-only tag, which the payload applies
+    after this (:func:`forwarded_datasources`). Mutates resolved_ds in place.
     """
     override = job_context.get("cloud_storage_read_only")
     if override is None:
         return
     for ds in resolved_ds:
         if ds["type"] == "webdav":
-            ds["project_read_only"] = bool(override)
+            ds["project_read_only"] = bool(ds.get("project_read_only")) or bool(
+                override
+            )
 
 
 def build_datasources_payload(
@@ -132,9 +199,10 @@ def build_datasources_payload(
 ) -> list[dict[str, Any]] | None:
     """Build the datasources payload for sending to the agent.
 
-    Strips internal fields (id, job_id, created_at, updated_at) that the
-    agent doesn't need. For read-only managed connectors, credentials are
-    withheld (tools hold them internally).
+    Each forwarded row's driver (:func:`forwarded_datasources`) binds it to
+    the entry the agent receives (or to nothing); internal fields such as the
+    row's id, job and timestamps stay behind.  Rows over a driver's
+    per-execution limit are skipped with a warning.
 
     Args:
         resolved_ds: List of resolved datasource dicts from the database
@@ -145,93 +213,85 @@ def build_datasources_payload(
     if not resolved_ds:
         return None
 
-    managed_types = {"postgresql", "neo4j", "mongodb", "webdav", "email"}
+    gates = dependencies.deployment_gates()
+    ctx = BindContext(
+        gates=gates,
+        logger=dependencies.logger,
+        default_known_hosts=dependencies.workspace_ssh_known_hosts(),
+        git_swap=dependencies.connector_drivers.get(GIT_SWAP_SPEC.name),
+        git_swap_fallback=dependencies.git_swap_fallback(),
+    )
     payload = []
-    email_forwarded = False
-    for ds in resolved_ds:
+    for ds in forwarded_datasources(
+        resolved_ds, dependencies=dependencies, log_skipped=True
+    ):
         creds = ds.get("credentials") or {}
         if isinstance(creds, str):
-            import json as json_module
-
             try:
-                creds = json_module.loads(creds)
+                creds = json.loads(creds)
             except (json.JSONDecodeError, ValueError):
                 creds = {}
 
-        is_read_only = ds.get("project_read_only", False)
-        ds_type = ds["type"]
-        if not mcp_datasource_runtime_allowed(ds, dependencies=dependencies):
-            continue
-
-        # Read-only managed connectors: withhold credentials (tools hold them).
-        # Email is exempt — its tools need a live IMAP login at every tier;
-        # read-only is expressed as the access floor on entry['config'] instead.
-        if ds_type in managed_types and is_read_only and ds_type != "email":
-            creds = {}
-
-        # External OKF KBs are centrally indexed and read-only in Slice 4 v1.
-        # The agent needs the stable index id + display metadata, never the
-        # remote URL or repository credentials.
-        if ds_type == "kb":
-            creds = {}
-            is_read_only = True
-
-        entry = {
-            "type": ds_type,
-            "name": ds["name"],
-            "description": ds.get("description"),
-            "connection_url": None if ds_type == "kb" else ds.get("connection_url"),
-            "credentials": creds,
-            "project_read_only": is_read_only,
-        }
-        if ds_type == "kb":
-            entry["datasource_id"] = str(ds["id"])
-            # stored=True keeps the native-project marker in the payload: the
-            # agent's binding builder needs it to collapse a project's own KB
-            # row into the writable native binding instead of adding a second,
-            # read-only binding for the same notes.
-            entry["config"] = _normalize_kb_config(ds.get("config"), stored=True)
-        if ds_type == "repository":
-            # Repository identity is server-owned runtime authority.  Keep the
-            # raw database ``id`` out of the payload, but carry its exact value
-            # under the dedicated internal key consumed by the clone/tool
-            # binding.  ``resolved_ds`` comes from the authorization query;
-            # callers and models never select this field.
-            datasource_id = ds.get("id")
-            if datasource_id is not None:
-                entry["datasource_id"] = str(datasource_id)
-            # The clone reads config["forge"] to resolve the forge API base;
-            # without it every repository records forge="" and repo_open_pr
-            # can never be used. _datasource_row_to_dict already parsed the
-            # JSONB, so this is a real dict. No secrets live in config —
-            # credentials travel in `creds`.
-            entry["config"] = ds.get("config") or {}
-        if ds_type == "email":
-            # v1: one mailbox per job/session — the agent keys connections by
-            # type, so a second email datasource would silently shadow the
-            # first (knowledge-base/knowledge/features/email_datasource.md, open questions).
-            if email_forwarded:
-                dependencies.logger.warning(
-                    "Skipping additional email datasource %r: only one email "
-                    "datasource per job/session is supported",
-                    ds.get("name"),
+        driver = dependencies.connector_drivers.for_type(ds["type"])
+        if driver is None:
+            # A stored type no driver serves is forwarded as stored, except
+            # the upstream secret of a lease driver (connector drivers C2),
+            # which never reaches an agent, installed or not.
+            if lease_spec(ds) is not None:
+                creds = {}
+            payload.append(
+                payload_entry(
+                    ds,
+                    credentials=creds,
+                    read_only=ds.get("project_read_only", False),
                 )
-                continue
-            email_forwarded = True
-            entry["config"] = email_dispatch_config(
-                ds.get("config"),
-                project_read_only=bool(is_read_only),
-                owner_can_autonomous_send=bool(
-                    ds.get("_owner_can_autonomous_send", False)
-                ),
             )
-        if ds.get("cli_hint"):
-            entry["cli_hint"] = ds["cli_hint"]
-        if ds.get("default_branch"):
-            entry["default_branch"] = ds["default_branch"]
-        if ds_type == "repository" and ds.get("require_default_branch") is True:
-            entry["require_default_branch"] = True
-
-        payload.append(entry)
+            continue
+        entry = driver.bind(ds, creds, ctx=ctx)
+        if entry is not None:
+            spec = lease_spec(entry)
+            if spec is not None:
+                # A lease driver's entry never carries its upstream secret,
+                # whatever its bind returned, but what its driver keeps for
+                # the agent process (the git swap's forge token); the lease
+                # step fills in the lease.
+                entry["credentials"] = harness_credentials(entry, spec)
+            payload.append(entry)
 
     return payload or None
+
+
+def build_workspace_ssh_identities(
+    resolved_ds: list[dict[str, Any]] | None,
+    *,
+    dependencies: DatasourcePayloadDependencies,
+) -> list[dict[str, Any]] | None:
+    """The hidden ``workspace_ssh_identities`` field for one delivery.
+
+    Built only from an already-authorized, exactly-resolved connector set,
+    like :func:`build_datasources_payload`: each row's driver says whether it
+    holds a key for the workspace's ssh-agent. A row that cannot be delivered
+    is logged by id and fixed reason code and left out; it never fails the
+    delivery. ``None`` when nothing is delivered, so the field is absent from
+    the wire.
+    """
+    default_known_hosts = dependencies.workspace_ssh_known_hosts()
+    identities: list[dict[str, Any]] = []
+    for ds in resolved_ds or []:
+        driver = dependencies.connector_drivers.for_type(ds.get("type"))
+        if not isinstance(driver, SupportsWorkspaceSshIdentity):
+            continue
+        try:
+            identity = driver.workspace_ssh_identity(
+                ds, default_known_hosts=default_known_hosts
+            )
+        except WorkspaceSshConnectorError as exc:
+            dependencies.logger.warning(
+                "SSH connector %s cannot be delivered to a workspace (%s)",
+                ds.get("id"),
+                exc.code,
+            )
+            continue
+        if identity is not None:
+            identities.append(identity.to_payload())
+    return identities or None

@@ -16,11 +16,13 @@ The read-only preview added for quick chat shares the creation admission plan.
 from __future__ import annotations
 
 from typing import Any
+from uuid import UUID
 
 from fastapi import APIRouter, Request
 
 from orchestrator.schemas.thread_admission import ThreadCreateRequest
 from orchestrator.services import thread_admission
+from orchestrator.services.vm_idle_public import read_vm_idle_states
 
 # No `tags=` and no prefix: the two declarations this replaces carried neither,
 # and either would change the published OpenAPI operation for a route whose
@@ -87,13 +89,35 @@ async def list_threads(
     """List persistent threads for the authenticated user."""
     dependencies = get_thread_admission_dependencies(request)
     user = await dependencies.require_approved_user(request, dependencies.store)
-    return await thread_admission.list_threads(
+    result = await thread_admission.list_threads(
         request,
         project_id,
         status,
         dependencies=dependencies,
         user=user,
     )
+    states = await read_vm_idle_states(
+        dependencies.store,
+        owner_kind="thread",
+        owner_ids=[str(thread["id"]) for thread in result["threads"]],
+        current_thread_creations={
+            str(thread["id"]): thread["vm_creation"]
+            for thread in result["threads"]
+            if thread.get("vm_creation") is not None
+        },
+    )
+    for thread in result["threads"]:
+        thread["workspace_lifecycle"] = states.get(str(thread["id"]))
+    creations = await dependencies.store.container_workspace_creation_views(
+        "thread", [str(thread["id"]) for thread in result["threads"]]
+    )
+    for thread in result["threads"]:
+        thread["workspace_creation"] = (
+            None
+            if thread.get("status") in {"ended", "suspended"}
+            else creations.get(UUID(str(thread["id"])))
+        )
+    return result
 
 
 __all__ = [

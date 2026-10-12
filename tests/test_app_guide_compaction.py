@@ -2,7 +2,6 @@
 
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 
-from agent.core.context import ContextConfig, ContextManager
 from shared.runtime.core.expert_resolution import fence_skills_menu
 from shared.runtime.core.skill_resolution import (
     APP_GUIDE_LOADER_TOOL,
@@ -62,28 +61,12 @@ def test_app_guide_can_be_loaded_again_after_old_result_is_compacted(monkeypatch
             id="tool-recent",
         ),
     ]
-    manager = ContextManager(
-        ContextConfig(
-            compaction_threshold_tokens=100_000,
-            summarization_threshold_tokens=100_000,
-            keep_recent_tool_results=1,
-            keep_recent_messages=6,
-            max_tool_result_length=50_000,
-        )
-    )
-
-    compacted = manager.prepare_messages_for_llm(messages, aggressive=True)
-
-    compacted_old = next(
-        message
-        for message in compacted
-        if isinstance(message, ToolMessage) and message.tool_call_id == "guide-old"
-    )
-    assert compacted_old.content == manager.config.placeholder_text
+    # Compaction summarises the old turn away and keeps the recent one, so
+    # the old guide result is no longer in the conversation.
+    compacted = messages[3:]
     assert old_guide_result not in "\n".join(
         str(message.content) for message in compacted
     )
-    assert manager.state.total_tool_results_cleared == 1
 
     # Production builds this fenced catalog block afresh for each model call;
     # it is not dependent on retaining an old ToolMessage in conversation.

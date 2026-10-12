@@ -9,13 +9,15 @@ import os
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, replace
 from datetime import datetime
-from typing import Any, Mapping
+from typing import Any, Awaitable, Callable, Mapping
 from uuid import UUID, uuid4, uuid5, NAMESPACE_URL
 
 from orchestrator.services.vm_workspace_recovery_telemetry import (
     VMWorkspaceRecoveryTelemetry,
     workspace_recovery_telemetry,
 )
+from shared.vm_resource_admission import ResourceAdmissionError
+from shared.vm_provisioning_phases import rebind_recovered_provisioning
 from shared.worker_queue import (
     get_worker_attempt_disposition,
     park_worker_batch_for_workspace_recovery,
@@ -342,6 +344,9 @@ class CleanupPermit:
     reason: str | None = None
     completed_outcome: str | None = None
     parent_cleanup: Mapping[str, Any] | None = None
+    creation_disposition: Mapping[str, Any] | None = None
+    # Set when admission used a reviewed successor instead of the asked ID.
+    request_id: UUID | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -388,6 +393,48 @@ def cleanup_intent_digest(intent: Mapping[str, Any]) -> str:
     return f"sha256:{hashlib.sha256(encoded).hexdigest()}"
 
 
+def lifecycle_vm_cleanup_identity(
+    *,
+    owner_kind: str,
+    owner_id: str,
+    identity: Any,
+    source: str,
+    purge_disk: bool,
+) -> tuple[UUID, UUID | None, UUID, dict[str, Any]]:
+    """The historical lifecycle request and its complete resource intent."""
+    try:
+        parsed_owner_id = UUID(str(owner_id))
+    except (TypeError, ValueError, AttributeError):
+        parsed_owner_id = uuid5(
+            NAMESPACE_URL, f"workspace-cleanup-owner:{owner_kind}:{owner_id}"
+        )
+    try:
+        parsed_pvc_uid = (
+            UUID(str(identity.rootdisk_pvc_uid))
+            if identity.rootdisk_pvc_uid is not None
+            else None
+        )
+    except (TypeError, ValueError, AttributeError):
+        parsed_pvc_uid = None
+    request_id = uuid5(
+        NAMESPACE_URL,
+        "workspace-cleanup:"
+        f"{source}:{owner_kind}:{owner_id}:{identity.provision_generation}:"
+        f"{identity.vm_uid}:{identity.rootdisk_pvc_uid}",
+    )
+    resource_intent = {
+        "owner_kind": owner_kind,
+        "owner_id": str(parsed_owner_id),
+        "provision_generation": identity.provision_generation,
+        "vm_uid": identity.vm_uid or "",
+        "pvc_uid": str(parsed_pvc_uid or ""),
+        "purge_disk": bool(purge_disk),
+        "resource": "vm_workspace",
+        "source": f"lifecycle_vm_{source}"[:64],
+    }
+    return parsed_owner_id, parsed_pvc_uid, request_id, resource_intent
+
+
 def completed_cleanup_outcome(permit: Any) -> str | None:
     """Read a durable replay outcome without trusting loose test doubles."""
 
@@ -427,6 +474,12 @@ def _parent_cleanup_identity(
     expected_vm_uid: str | None,
 ) -> tuple[UUID, UUID, str, str] | None:
     try:
+        if proof.get("kind") == "creation_disposition":
+            from orchestrator.services.vm_creation_disposition_cleanup import (
+                disposition_parent_identity,
+            )
+
+            return disposition_parent_identity(proof)
         intent = proof["intent"]
         if (
             not isinstance(intent, Mapping)
@@ -459,8 +512,139 @@ async def acquire_vm_cleanup_permit(
     identity: Any,
     source: str,
     purge_disk: bool,
+    _conn: Any = None,
+    _purge_successor: tuple[str, UUID] | None = None,
 ) -> CleanupPermit:
-    """Admit one exact VM/PVC cleanup intent through recovery authority."""
+    """Admit one exact VM/PVC cleanup intent through recovery authority.
+
+    ``_purge_successor`` is only for ``acquire_pinned_thread_retirement_cleanup_permit``.
+    """
+
+    canonical_owner, pvc_uid, request_id, intent_digest, resource_intent = (
+        vm_cleanup_request_identity(
+            owner_kind=owner_kind,
+            owner_id=owner_id,
+            identity=identity,
+            source=source,
+            purge_disk=purge_disk,
+        )
+    )
+    arguments = dict(
+        owner_kind=owner_kind,
+        owner_id=canonical_owner,
+        pvc_uid=pvc_uid,
+        request_id=request_id,
+        source=source,
+        intent_digest=intent_digest,
+    )
+    if _purge_successor is not None:
+        arguments["purge_successor"] = _purge_successor
+    if _conn is None:
+        permit = await recovery_store.acquire_cleanup_permit(**arguments)
+    else:
+        permit = await recovery_store.acquire_cleanup_permit_on_conn(_conn, **arguments)
+    if (
+        _conn is None
+        and owner_kind == "job"
+        and source == "job_terminal_vm_release"
+        and purge_disk is True
+        and not permit.allowed
+        and permit.reason == "workspace_cleanup_already_admitted"
+    ):
+        from orchestrator.services.vm_legacy_completion_cleanup import (
+            supersede_unissued_legacy_completion,
+        )
+
+        try:
+            return await supersede_unissued_legacy_completion(
+                recovery_store,
+                owner_id=canonical_owner,
+                identity=identity,
+            )
+        except (ResourceAdmissionError, ValueError, TypeError):
+            return permit
+    bound = bind_vm_cleanup_permit(
+        permit,
+        request_id=getattr(permit, "request_id", None) or request_id,
+        intent=resource_intent,
+    )
+    if (
+        bound.allowed
+        and owner_kind in {"job", "thread"}
+        and source != "vm_idle_release"
+    ):
+        await prepare_vm_cleanup_resource(recovery_store, bound, _conn=_conn)
+    return bound
+
+
+PINNED_THREAD_RETIREMENT_CLEANUP_SOURCE = "pinned_thread_retirement"
+
+
+def pinned_thread_purge_successor_request_id(keep_request_id: UUID) -> UUID:
+    """The purge's own request ID after a keep admission holds the shared one."""
+
+    return uuid5(
+        NAMESPACE_URL, f"vm-workspace-cleanup-purge-after-keep:{keep_request_id}"
+    )
+
+
+async def acquire_pinned_thread_retirement_cleanup_permit(
+    recovery_store: Any,
+    *,
+    thread_id: str | UUID,
+    identity: Any,
+    purge_disk: bool,
+) -> CleanupPermit:
+    """Admit a legacy (non-v3) pinned thread VM cleanup for its disposition.
+
+    A soft End keeps the root disk and a later permanent Delete purges it: two
+    retirement operations on one VM identity. The ordinary derivation gives both
+    one request ID (the disposition is only in the intent digest), so the Delete
+    after a soft End met the keep's completed admission and was refused for
+    ever. The keep, and a purge with no keep before it (Delete of a live
+    session), keep that historical ID. A purge whose historical ID already holds
+    exactly this identity's keep admission is admitted under a deterministic
+    successor ID, decided under the admission's own locks: the same for every
+    retry of the Delete, never minted per attempt, and the keep row stays as
+    recorded. Any other intent under the historical ID still raises
+    ``cleanup_request_id_reused``; every exact owner/PVC/generation check of the
+    admission is unchanged.
+    """
+
+    source = PINNED_THREAD_RETIREMENT_CLEANUP_SOURCE
+    purge_successor = None
+    if purge_disk:
+        _, _, shared_request_id, keep_digest, _ = vm_cleanup_request_identity(
+            owner_kind="thread",
+            owner_id=thread_id,
+            identity=identity,
+            source=source,
+            purge_disk=False,
+        )
+        purge_successor = (
+            keep_digest,
+            pinned_thread_purge_successor_request_id(shared_request_id),
+        )
+    return await acquire_vm_cleanup_permit(
+        recovery_store,
+        owner_kind="thread",
+        owner_id=thread_id,
+        identity=identity,
+        source=source,
+        purge_disk=purge_disk,
+        _purge_successor=purge_successor,
+    )
+
+
+def vm_cleanup_request_identity(
+    *,
+    owner_kind: str,
+    owner_id: str | UUID,
+    identity: Any,
+    source: str,
+    purge_disk: bool,
+) -> tuple[UUID, UUID | None, UUID, str, dict[str, Any]]:
+    """Derive the same immutable request/intent used by cleanup admission."""
 
     canonical_owner = _cleanup_uuid(owner_id, namespace=f"{owner_kind}-owner")
     raw_pvc_uid = getattr(identity, "rootdisk_pvc_uid", None)
@@ -490,15 +674,123 @@ async def acquire_vm_cleanup_permit(
         "source": source,
     }
     request_id = uuid5(NAMESPACE_URL, f"vm-workspace-cleanup:{intent}")
-    permit = await recovery_store.acquire_cleanup_permit(
-        owner_kind=owner_kind,
-        owner_id=canonical_owner,
-        pvc_uid=pvc_uid,
-        request_id=request_id,
-        source=source,
-        intent_digest=cleanup_intent_digest(resource_intent),
+    return (
+        canonical_owner,
+        pvc_uid,
+        request_id,
+        cleanup_intent_digest(resource_intent),
+        resource_intent,
     )
-    return bind_vm_cleanup_permit(permit, request_id=request_id, intent=resource_intent)
+
+
+async def _vm_cleanup_resource_scope(conn, recovery_store, permit):
+    """Lock the genuine owner/source before selecting its installed resource policy."""
+    proof = getattr(permit, "parent_cleanup", None)
+    if not isinstance(proof, Mapping) or not isinstance(proof.get("intent"), Mapping):
+        return None
+    intent = proof["intent"]
+    if (
+        intent.get("owner_kind") not in {"job", "thread"}
+        or intent.get("source") == "vm_idle_release"
+    ):
+        return None
+    if (
+        proof.get("admission_id") != str(permit.admission_id)
+        or cleanup_intent_digest(intent) != proof.get("intent_digest")
+        or intent.get("purge_disk") not in {True, False}
+    ):
+        raise ResourceAdmissionError("resource_cleanup_identity_unproven")
+    if intent["owner_kind"] == "thread":
+        if intent.get("source") != "pinned_thread_retirement":
+            return None
+        from orchestrator.services.vm_resource_thread_cleanup import (
+            thread_cleanup_scope,
+        )
+
+        return await thread_cleanup_scope(conn, recovery_store, permit, proof)
+    try:
+        owner_id = UUID(intent["owner_id"])
+        generation = UUID(intent["provision_generation"])
+        pvc_uid = UUID(intent["pvc_uid"])
+    except (KeyError, TypeError, ValueError, AttributeError):
+        raise ResourceAdmissionError("resource_cleanup_identity_unproven") from None
+    preliminary = await conn.fetchrow(
+        "SELECT request_id,controller_configuration FROM vm_creation_retries "
+        "WHERE job_id=$1 AND provision_generation=$2",
+        owner_id,
+        generation,
+    )
+    if preliminary is None:
+        return None
+    configuration = _json(preliminary["controller_configuration"])
+    if not isinstance(configuration, dict) or configuration.get("version") != 3:
+        return None
+    from orchestrator.services.vm_creation_retry_store import VMCreationRetryStore
+    from orchestrator.services.vm_resource_job_runtime import (
+        installed_job_resource_store,
+    )
+
+    creation = VMCreationRetryStore(recovery_store.db)
+    job = await creation._scope(
+        conn,
+        owner_id,
+        pvc_uid,
+        own_admission=permit.admission_id,
+        hold_queue=False,
+    )
+    retry = await conn.fetchrow(
+        "SELECT * FROM vm_creation_retries WHERE request_id=$1 FOR UPDATE",
+        preliminary["request_id"],
+    )
+    cleanup = await conn.fetchrow(
+        "SELECT * FROM vm_workspace_cleanup_admissions WHERE id=$1 FOR UPDATE",
+        permit.admission_id,
+    )
+    if retry is None or cleanup is None:
+        raise ResourceAdmissionError("resource_cleanup_identity_unproven")
+    charge = await conn.fetchrow(
+        "SELECT state FROM vm_resource_reservations WHERE request_id=$1 "
+        "ORDER BY revision DESC LIMIT 1",
+        retry["request_id"],
+    )
+    if charge is None:
+        raise ResourceAdmissionError("resource_cleanup_charge_unproven")
+    if charge["state"] == "released":
+        return None
+    resource = await installed_job_resource_store(
+        conn,
+        recovery_store.db,
+        retry["controller_configuration"],
+        fresh=False,
+    )
+    if resource is None:
+        raise ResourceAdmissionError("resource_cleanup_policy_unproven")
+    return resource, retry, job, cleanup, proof
+
+
+async def prepare_vm_cleanup_resource(recovery_store, permit, *, _conn=None):
+    """Fence a charged ordinary cleanup before its external delete effect."""
+    proof = getattr(permit, "parent_cleanup", None)
+    if not isinstance(proof, Mapping) or not isinstance(proof.get("intent"), Mapping):
+        return None
+    if _conn is not None:
+        scope = await _vm_cleanup_resource_scope(_conn, recovery_store, permit)
+        if scope is None:
+            return None
+        resource, retry, job, cleanup, intent = scope
+        return await resource.mark_cleanup_teardown_on_conn(
+            _conn,
+            retry=retry,
+            job=job,
+            cleanup=cleanup,
+            intent=intent,
+        )
+    async with recovery_store.db.acquire() as conn, conn.transaction():
+        return await prepare_vm_cleanup_resource(
+            recovery_store,
+            permit,
+            _conn=conn,
+        )
 
 
 async def complete_vm_cleanup_permit(
@@ -506,10 +798,92 @@ async def complete_vm_cleanup_permit(
     permit: CleanupPermit | Any,
     *,
     outcome: str,
+    provisioner: Any = None,
+    claim_current: Callable[[], Awaitable[bool]] | None = None,
 ) -> None:
     admission_id = getattr(permit, "admission_id", None)
-    if admission_id is not None:
+    if admission_id is None:
+        return
+    proof = getattr(permit, "parent_cleanup", None)
+    if (
+        isinstance(proof, Mapping)
+        and isinstance(proof.get("intent"), Mapping)
+        and proof["intent"].get("source") == "pinned_thread_retained_disk_purge"
+    ):
+        from orchestrator.services.vm_thread_retained_disk_purge import (
+            complete_retained_disk_purge,
+        )
+
+        await complete_retained_disk_purge(
+            recovery_store, permit, outcome=outcome, provisioner=provisioner
+        )
+        return
+    if (
+        isinstance(proof, Mapping)
+        and isinstance(proof.get("intent"), Mapping)
+        and proof["intent"].get("source") == "public_vm_delete"
+    ):
+        from orchestrator.services.vm_job_retained_disk_purge import (
+            complete_job_retained_disk_purge,
+            has_job_retained_disk_purge_authority,
+        )
+
+        if await has_job_retained_disk_purge_authority(recovery_store, admission_id):
+            await complete_job_retained_disk_purge(
+                recovery_store, permit, outcome=outcome, provisioner=provisioner
+            )
+            return
+    if outcome != "completed":
+        if await prepare_vm_cleanup_resource(recovery_store, permit) is not None:
+            raise ResourceAdmissionError("resource_cleanup_stop_unproven")
         await recovery_store.complete_cleanup_permit(admission_id, outcome=outcome)
+        return
+    candidate = await prepare_vm_cleanup_resource(recovery_store, permit)
+    if candidate is None:
+        # A caller's completed-outcome hint is not durable source authority.
+        # The store refuses retained-disk parents unless the bound dedicated
+        # path above validated their purge receipt; ordinary replay is a no-op.
+        if claim_current is not None and not await claim_current():
+            raise ResourceAdmissionError("lifecycle_claim_changed")
+        await recovery_store.complete_cleanup_permit(admission_id, outcome=outcome)
+        return
+    if provisioner is None:
+        raise ResourceAdmissionError("resource_cleanup_stop_unproven")
+    # The authenticated controller probe happens outside the owner/policy row
+    # locks. The final transaction rechecks every identity and the permit.
+    evidence = await provisioner.attest_vm_cleanup_stop(candidate)
+    if evidence is None:
+        raise ResourceAdmissionError("resource_cleanup_stop_unproven")
+    if claim_current is not None and not await claim_current():
+        raise ResourceAdmissionError("lifecycle_claim_changed")
+    async with recovery_store.db.acquire() as conn, conn.transaction():
+        scope = await _vm_cleanup_resource_scope(conn, recovery_store, permit)
+        if scope is None:
+            # A concurrent completion may have released this exact receipt
+            # while our probe ran. Missing source/policy is not replay proof.
+            if await conn.fetchval(
+                "SELECT EXISTS(SELECT 1 FROM vm_resource_thread_cleanup_authorities a "
+                "JOIN vm_resource_thread_cleanup_stops s USING(cleanup_admission_id) "
+                "LEFT JOIN vm_resource_reservations r ON r.id=a.reservation_id "
+                "JOIN vm_creation_retries source ON source.request_id=a.request_id "
+                "WHERE a.cleanup_admission_id=$1 AND (r.state='released' OR "
+                "public.valid_vm_thread_nonquota_cleanup_source(a,source))) "
+                "OR EXISTS(SELECT 1 FROM vm_resource_cleanup_stop_receipts s "
+                "JOIN vm_resource_reservations r ON r.id=s.reservation_id "
+                "WHERE s.cleanup_admission_id=$1 AND r.state='released')",
+                admission_id,
+            ):
+                return
+            raise ResourceAdmissionError("resource_cleanup_identity_unproven")
+        resource, retry, job, cleanup, intent = scope
+        await resource.release_cleanup_compute_on_conn(
+            conn,
+            retry=retry,
+            job=job,
+            cleanup=cleanup,
+            intent=intent,
+            proof=evidence,
+        )
 
 
 class VMWorkspaceRecoveryStore:
@@ -1354,11 +1728,256 @@ class VMWorkspaceRecoveryStore:
         parent_cleanup: Mapping[str, Any] | None = None,
         parent_provision_generation: str | None = None,
         expected_vm_uid: str | None = None,
+        purge_successor: tuple[str, UUID] | None = None,
     ) -> CleanupPermit:
         """Serialize destructive admission with recovery and its exact disk pin."""
+        async with self.db.acquire() as conn:
+            async with conn.transaction():
+                return await self.acquire_cleanup_permit_on_conn(
+                    conn,
+                    owner_kind=owner_kind,
+                    owner_id=owner_id,
+                    pvc_uid=pvc_uid,
+                    request_id=request_id,
+                    source=source,
+                    intent_digest=intent_digest,
+                    revalidate_completed=revalidate_completed,
+                    parent_cleanup=parent_cleanup,
+                    parent_provision_generation=parent_provision_generation,
+                    expected_vm_uid=expected_vm_uid,
+                    purge_successor=purge_successor,
+                )
+
+    async def resume_open_lifecycle_vm_delete(
+        self,
+        *,
+        owner_id: UUID,
+        identity: Any,
+        request_id: UUID,
+        intent_digest: str,
+    ) -> CleanupPermit | None:
+        """Reacquire an existing, exact Job VM purge; never issue a new admission.
+
+        A later ordinary reaper may otherwise try to keep the same disk under
+        the purge's deterministic request ID.  Select and lock the open parent
+        first so this path cannot turn an absent or changed parent into a grant.
+        """
+        canonical_owner, expected_pvc_uid, expected_request_id, expected_intent = (
+            lifecycle_vm_cleanup_identity(
+                owner_kind="job",
+                owner_id=str(owner_id),
+                identity=identity,
+                source="delete",
+                purge_disk=True,
+            )
+        )
+        if (
+            canonical_owner != owner_id
+            or expected_pvc_uid is None
+            or expected_request_id != request_id
+            or cleanup_intent_digest(expected_intent) != intent_digest
+        ):
+            return CleanupPermit(
+                allowed=False, reason="cleanup_parent_identity_changed"
+            )
+        async with self.db.acquire() as conn, conn.transaction():
+            # Match ordinary admission's owner/PVC advisory and owner-row lock
+            # order before taking the admission row lock.
+            for lock_key in (
+                f"workspace-recovery:job:{owner_id}",
+                f"workspace-recovery-pvc:{expected_pvc_uid}",
+            ):
+                await conn.execute(
+                    "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+                    lock_key,
+                )
+            job = await conn.fetchrow(
+                "SELECT parent_job_id,context FROM jobs WHERE id=$1 FOR UPDATE",
+                owner_id,
+            )
+            rows = await conn.fetch(
+                "SELECT id,request_id,pvc_uid,source,intent_digest,"
+                "parent_admission_id FROM vm_workspace_cleanup_admissions "
+                "WHERE owner_kind='job' AND owner_id=$1 AND completed_at IS NULL "
+                "FOR UPDATE",
+                owner_id,
+            )
+            if not rows:
+                return None
+            if len(rows) != 1:
+                return CleanupPermit(allowed=False, reason="cleanup_parent_ambiguous")
+            row = rows[0]
+            try:
+                generation = str(UUID(str(identity.provision_generation)))
+                vm_uid = str(UUID(str(identity.vm_uid)))
+                pvc_uid = UUID(str(identity.rootdisk_pvc_uid))
+            except (AttributeError, TypeError, ValueError):
+                return CleanupPermit(allowed=False, reason="cleanup_identity_unproven")
+            if (
+                row["source"] != "lifecycle_vm_delete"
+                or row["request_id"] != request_id
+                or row["pvc_uid"] != pvc_uid
+                or row["pvc_uid"] != expected_pvc_uid
+                or row["intent_digest"] != intent_digest
+                or row["parent_admission_id"] is not None
+            ):
+                return CleanupPermit(
+                    allowed=False, reason="cleanup_parent_identity_changed"
+                )
+            canonical_owner, ambiguous = _job_workspace_owner(owner_id, job)
+            context = _json(job["context"]) if job is not None else None
+            vm = context.get("vm") if isinstance(context, dict) else None
+            if (
+                ambiguous
+                or canonical_owner != owner_id
+                or not isinstance(vm, dict)
+                or vm.get("identity_authenticated") is not True
+                or vm.get("identity_provision_generation") != generation
+                or vm.get("provision_generation") != generation
+                or vm.get("vm_uid") != vm_uid
+                or vm.get("rootdisk_pvc_uid") != str(pvc_uid)
+            ):
+                return CleanupPermit(allowed=False, reason="cleanup_identity_unproven")
+            # The normal admission method rechecks recovery, IDE leases and
+            # owner locks inside this transaction.  It can only return the
+            # selected row, which remains locked until the transaction ends.
+            return await self.acquire_cleanup_permit_on_conn(
+                conn,
+                owner_kind="job",
+                owner_id=owner_id,
+                pvc_uid=pvc_uid,
+                request_id=request_id,
+                source="lifecycle_vm_delete",
+                intent_digest=intent_digest,
+            )
+
+    async def has_open_lifecycle_vm_delete(self, owner_id: UUID) -> bool:
+        """Read-only selector before an authenticated external identity capture."""
+        async with self.db.acquire() as conn:
+            return bool(
+                await conn.fetchval(
+                    "SELECT EXISTS(SELECT 1 FROM vm_workspace_cleanup_admissions "
+                    "WHERE owner_kind='job' AND owner_id=$1 "
+                    "AND source='lifecycle_vm_delete' AND completed_at IS NULL)",
+                    owner_id,
+                )
+            )
+
+    async def acquire_cancelled_container_completion_replay(
+        self, replay: Any
+    ) -> CleanupPermit:
+        """Reacquire only the selected original S36 after current queue proof."""
+        from orchestrator.services.completion_teardown_replay import (
+            CancelledContainerCompletionReplay,
+            lock_completion_replay_owner,
+            select_cancelled_container_completion_replay,
+        )
+
+        if not isinstance(replay, CancelledContainerCompletionReplay):
+            return CleanupPermit(
+                allowed=False, reason="completion_replay_identity_changed"
+            )
+        async with self.db.acquire() as conn, conn.transaction():
+            await lock_completion_replay_owner(conn, replay)
+            if (
+                await select_cancelled_container_completion_replay(
+                    conn, replay.job_id, expected=replay, allow_completed=True
+                )
+                is None
+            ):
+                return CleanupPermit(
+                    allowed=False, reason="completion_replay_identity_changed"
+                )
+            permit = await self.acquire_cleanup_permit_on_conn(
+                conn,
+                owner_kind="job",
+                owner_id=replay.job_id,
+                pvc_uid=None,
+                request_id=replay.request_id,
+                source="completion_workspace_teardown",
+                intent_digest=replay.intent_digest,
+                revalidate_completed=True,
+            )
+            if permit.admission_id != replay.admission_id:
+                return CleanupPermit(
+                    allowed=False, reason="completion_replay_identity_changed"
+                )
+            return permit
+
+    async def complete_cancelled_container_completion_replay(self, replay: Any) -> bool:
+        """Acknowledge the original S36 only after archive and current proof."""
+        from orchestrator.services.completion_teardown_replay import (
+            CancelledContainerCompletionReplay,
+            lock_completion_replay_owner,
+            select_cancelled_container_completion_replay,
+        )
+
+        if not isinstance(replay, CancelledContainerCompletionReplay):
+            return False
+        async with self.db.acquire() as conn, conn.transaction():
+            await lock_completion_replay_owner(conn, replay)
+            if (
+                await select_cancelled_container_completion_replay(
+                    conn, replay.job_id, expected=replay, allow_completed=True
+                )
+                is None
+            ):
+                return False
+            row = await conn.fetchrow(
+                "SELECT completed_at,outcome FROM vm_workspace_cleanup_admissions "
+                "WHERE id=$1 AND owner_kind='job' AND owner_id=$2 "
+                "AND source='completion_workspace_teardown' AND request_id=$3 "
+                "AND intent_digest=$4 AND pvc_uid IS NULL AND parent_admission_id IS NULL FOR UPDATE",
+                replay.admission_id,
+                replay.job_id,
+                replay.request_id,
+                replay.intent_digest,
+            )
+            if row is None:
+                return False
+            if row["completed_at"] is not None:
+                return row["outcome"] == "completed"
+            await conn.execute(
+                "UPDATE vm_workspace_cleanup_admissions "
+                "SET completed_at=clock_timestamp(),outcome='completed' WHERE id=$1",
+                replay.admission_id,
+            )
+            return True
+
+    async def acquire_cleanup_permit_on_conn(
+        self,
+        conn: Any,
+        *,
+        owner_kind: str,
+        owner_id: UUID,
+        pvc_uid: UUID | None,
+        request_id: UUID,
+        source: str,
+        intent_digest: str,
+        revalidate_completed: bool = False,
+        parent_cleanup: Mapping[str, Any] | None = None,
+        parent_provision_generation: str | None = None,
+        expected_vm_uid: str | None = None,
+        purge_successor: tuple[str, UUID] | None = None,
+        _retained_purge_bootstrap: Any = None,
+    ) -> CleanupPermit:
+        """Serialize destructive admission with recovery and its exact disk pin.
+
+        ``purge_successor`` is ``(keep_digest, successor_request_id)``: when
+        ``request_id`` already holds exactly that keep admission for this owner,
+        PVC and source, the purge is admitted under the successor ID instead
+        (``acquire_pinned_thread_retirement_cleanup_permit``).
+        """
 
         if not isinstance(intent_digest, str) or not intent_digest:
             raise ValueError("cleanup intent digest must be nonempty")
+        if source == "controller_creation_rootdisk_delete" and (
+            not isinstance(parent_cleanup, Mapping)
+            or parent_cleanup.get("kind") != "creation_disposition"
+        ):
+            return CleanupPermit(
+                allowed=False, reason="parent_cleanup_identity_changed"
+            )
         parent_identity = None
         if parent_cleanup is not None:
             parent_identity = _parent_cleanup_identity(
@@ -1369,166 +1988,275 @@ class VMWorkspaceRecoveryStore:
                 provision_generation=parent_provision_generation,
                 expected_vm_uid=expected_vm_uid,
             )
-            if source != "controller_rootdisk_delete" or parent_identity is None:
+            expected_source = (
+                "controller_creation_rootdisk_delete"
+                if parent_cleanup.get("kind") == "creation_disposition"
+                else "controller_rootdisk_delete"
+            )
+            if source != expected_source or parent_identity is None:
                 return CleanupPermit(
                     allowed=False, reason="parent_cleanup_identity_changed"
                 )
         parent_id = parent_identity[0] if parent_identity is not None else None
 
-        async with self.db.acquire() as conn:
-            async with conn.transaction():
-                owner_locks = {(owner_kind, owner_id)}
-                if owner_kind == "job":
-                    membership = await conn.fetchrow(
-                        "SELECT parent_job_id,context FROM jobs WHERE id=$1",
-                        owner_id,
+        owner_locks = {(owner_kind, owner_id)}
+        if owner_kind == "job":
+            membership = await conn.fetchrow(
+                "SELECT parent_job_id,context FROM jobs WHERE id=$1",
+                owner_id,
+            )
+            owner_locks.add(("job", owner_id))
+            if membership is not None and membership["parent_job_id"] is not None:
+                owner_locks.add(("job", membership["parent_job_id"]))
+        for kind, identifier in sorted(owner_locks):
+            await conn.execute(
+                "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+                f"workspace-recovery:{kind}:{identifier}",
+            )
+        if pvc_uid is not None:
+            await conn.execute(
+                "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+                f"workspace-recovery-pvc:{pvc_uid}",
+            )
+        if owner_kind == "job":
+            membership = await conn.fetchrow(
+                "SELECT parent_job_id,context FROM jobs WHERE id=$1",
+                owner_id,
+            )
+            if membership is not None:
+                canonical_owner, ambiguous = _job_workspace_owner(owner_id, membership)
+                if ambiguous or ("job", canonical_owner) not in owner_locks:
+                    raise WorkspaceRecoveryControlConflict(
+                        "workspace_owner_changed",
+                        "Canonical workspace ownership changed during cleanup admission.",
                     )
-                    owner_locks.add(("job", owner_id))
-                    if (
-                        membership is not None
-                        and membership["parent_job_id"] is not None
-                    ):
-                        owner_locks.add(("job", membership["parent_job_id"]))
-                for kind, identifier in sorted(owner_locks):
-                    await conn.execute(
-                        "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
-                        f"workspace-recovery:{kind}:{identifier}",
-                    )
-                if pvc_uid is not None:
-                    await conn.execute(
-                        "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
-                        f"workspace-recovery-pvc:{pvc_uid}",
-                    )
-                if owner_kind == "job":
-                    membership = await conn.fetchrow(
-                        "SELECT parent_job_id,context FROM jobs WHERE id=$1",
-                        owner_id,
-                    )
-                    if membership is not None:
-                        canonical_owner, ambiguous = _job_workspace_owner(
-                            owner_id, membership
-                        )
-                        if ambiguous or ("job", canonical_owner) not in owner_locks:
-                            raise WorkspaceRecoveryControlConflict(
-                                "workspace_owner_changed",
-                                "Canonical workspace ownership changed during cleanup admission.",
-                            )
-                        owner_id = canonical_owner
-                prior = await conn.fetchrow(
-                    "SELECT id,completed_at,pvc_uid,source,intent_digest,outcome,parent_admission_id "
-                    "FROM vm_workspace_cleanup_admissions "
-                    "WHERE owner_kind=$1 AND owner_id=$2 AND request_id=$3 FOR UPDATE",
-                    owner_kind,
-                    owner_id,
-                    request_id,
+                owner_id = canonical_owner
+        if owner_kind == "job" and source.startswith("lifecycle_vm_"):
+            # The idle releaser owns the exact agent-first, then VM-stop path.
+            # Share its Job row lock so a cleanup admitted first is seen by
+            # nomination, and nomination first makes ordinary cleanup stand
+            # down even when it is replaying an earlier request ID.
+            await conn.fetchrow("SELECT id FROM jobs WHERE id=$1 FOR UPDATE", owner_id)
+            if (
+                await conn.fetchval(
+                    "SELECT to_regclass('public.pinned_job_deliveries') IS NOT NULL"
                 )
-                if parent_identity is not None:
-                    parent = await conn.fetchrow(
-                        "SELECT owner_kind,owner_id,pvc_uid,source,request_id,intent_digest,completed_at,parent_admission_id "
-                        "FROM vm_workspace_cleanup_admissions WHERE id=$1 FOR UPDATE",
-                        parent_id,
-                    )
-                    if (
-                        parent is None
-                        or (parent["completed_at"] is not None and prior is None)
-                        or parent["parent_admission_id"] is not None
-                        or parent["owner_kind"] != owner_kind
-                        or parent["owner_id"] != owner_id
-                        or parent["pvc_uid"] != pvc_uid
-                        or parent["request_id"] != parent_identity[1]
-                        or parent["intent_digest"] != parent_identity[2]
-                        or parent["source"] != parent_identity[3]
-                    ):
-                        return CleanupPermit(
-                            allowed=False, reason="parent_cleanup_identity_changed"
-                        )
-                if prior is not None:
-                    if (
-                        prior["pvc_uid"] != pvc_uid
-                        or prior["source"] != source
-                        or prior["intent_digest"] != intent_digest
-                        or prior["parent_admission_id"] != parent_id
-                    ):
-                        raise WorkspaceRecoveryControlConflict(
-                            "cleanup_request_id_reused",
-                            "Cleanup request ID was already used with different resource intent.",
-                        )
-                    if prior["completed_at"] is not None and revalidate_completed:
-                        later_recovery = await conn.fetchrow(
-                            "SELECT r.id FROM vm_workspace_recoveries r "
-                            "LEFT JOIN vm_workspace_recovery_retention_pins pin "
-                            "ON pin.recovery_id=r.id AND pin.released_at IS NULL "
-                            "WHERE r.resolved_at IS NULL AND ((r.owner_kind=$1 AND r.owner_id=$2) "
-                            "OR ($3::uuid IS NOT NULL AND pin.pvc_uid=$3)) FOR UPDATE OF r",
-                            owner_kind,
-                            owner_id,
-                            pvc_uid,
-                        )
-                        if later_recovery is not None:
-                            return CleanupPermit(
-                                allowed=False,
-                                recovery_id=later_recovery["id"],
-                                reason="workspace_recovery_unresolved",
-                            )
-                        later_cleanup = await conn.fetchrow(
-                            "SELECT id FROM vm_workspace_cleanup_admissions "
-                            "WHERE id<>$1 AND ((owner_kind=$2 AND owner_id=$3) "
-                            "OR ($4::uuid IS NOT NULL AND pvc_uid=$4)) "
-                            "AND completed_at IS NULL FOR UPDATE",
-                            prior["id"],
-                            owner_kind,
-                            owner_id,
-                            pvc_uid,
-                        )
-                        if later_cleanup is not None:
-                            return CleanupPermit(
-                                allowed=False,
-                                admission_id=later_cleanup["id"],
-                                reason="workspace_cleanup_already_admitted",
-                            )
-                    return CleanupPermit(
-                        allowed=True,
-                        admission_id=prior["id"],
-                        reason=(
-                            None
-                            if prior["completed_at"] is None
-                            else "cleanup_request_already_completed"
-                        ),
-                        completed_outcome=(
-                            prior["outcome"]
-                            if prior["completed_at"] is not None
-                            else None
-                        ),
-                    )
-                active_cleanup = await conn.fetchrow(
-                    "SELECT id FROM vm_workspace_cleanup_admissions "
-                    "WHERE ((owner_kind=$1 AND owner_id=$2) "
-                    "OR ($3::uuid IS NOT NULL AND pvc_uid=$3)) "
-                    "AND completed_at IS NULL AND ($4::uuid IS NULL OR id<>$4) FOR UPDATE",
-                    owner_kind,
+                and await conn.fetchval(
+                    "SELECT 1 FROM vm_idle_operations WHERE owner_kind='job' "
+                    "AND owner_id=$1 AND release_kind='pinned_job' "
+                    "AND closed_at IS NULL LIMIT 1",
                     owner_id,
-                    pvc_uid,
-                    parent_id,
                 )
-                if active_cleanup is not None:
-                    permit = CleanupPermit(
-                        allowed=False,
-                        admission_id=active_cleanup["id"],
-                        reason="workspace_cleanup_already_admitted",
+                is not None
+            ):
+                return CleanupPermit(allowed=False, reason="pinned_job_idle_owned")
+        if source != "vm_idle_release":
+            # Operation leases are admitted under the owner row lock.  Take
+            # that same lock before issuing a physical cleanup permit; an
+            # edit already in flight wins with a bounded hold, and a cleanup
+            # permit that won first is seen by new IDE operation admission.
+            if owner_kind == "job":
+                await conn.fetchrow(
+                    "SELECT id FROM jobs WHERE id=$1 FOR UPDATE", owner_id
+                )
+            elif owner_kind == "thread":
+                await conn.fetchrow(
+                    "SELECT id FROM threads WHERE id=$1 FOR UPDATE", owner_id
+                )
+            if await conn.fetchval(
+                "SELECT EXISTS(SELECT 1 FROM vm_idle_access_leases "
+                "WHERE owner_kind=$1 AND owner_id=$2 AND closed_at IS NULL "
+                "AND expires_at>clock_timestamp())",
+                owner_kind,
+                owner_id,
+            ):
+                wake_scope = None
+                if (
+                    owner_kind == "job"
+                    and source == "controller_vm_create"
+                    and parent_id is None
+                ):
+                    from orchestrator.services.vm_creation_retry_store import (
+                        VMCreationRetryStore,
                     )
-                    self._emit(
-                        event="cleanup_blocked",
-                        state="recovering_workspace",
-                        phase="reconciling_outcome",
-                        code="none",
-                        result="blocked",
-                        reason=permit.reason,
-                        cleanup_blocker=permit.reason,
-                        job_id=owner_id if owner_kind == "job" else None,
+
+                    wake_scope = await VMCreationRetryStore(
+                        self.db
+                    ).idle_wake_access_scope_on_conn(
+                        conn,
+                        owner_id=owner_id,
                         pvc_uid=pvc_uid,
+                        reservation_request_id=request_id,
+                        intent_digest=intent_digest,
                     )
-                    return permit
-                recovery = await conn.fetchrow(
+                if wake_scope is None or await conn.fetchval(
+                    "SELECT EXISTS(SELECT 1 FROM vm_idle_access_leases "
+                    "WHERE owner_kind=$1 AND owner_id=$2 AND closed_at IS NULL "
+                    "AND expires_at>clock_timestamp() AND (wake_id IS DISTINCT FROM $3 "
+                    "OR provision_generation IS DISTINCT FROM $4 OR vm_uid IS DISTINCT FROM $5))",
+                    owner_kind,
+                    owner_id,
+                    wake_scope["wake_id"],
+                    wake_scope["provision_generation"],
+                    wake_scope["vm_uid"],
+                ):
+                    return CleanupPermit(
+                        allowed=False, reason="active_workspace_access"
+                    )
+        if (
+            owner_kind == "job"
+            and source in {"completion_workspace_teardown", "kept_disk"}
+            and await conn.fetchval(
+                "SELECT to_regclass('public.vm_idle_operations') IS NOT NULL"
+            )
+            and await conn.fetchval(
+                "SELECT 1 FROM vm_idle_operations WHERE owner_kind='job' "
+                "AND owner_id=$1 AND ($2::uuid IS NULL OR pvc_uid=$2) "
+                "AND storage_disposition='retention_unknown' LIMIT 1",
+                owner_id,
+                pvc_uid,
+            )
+            is not None
+        ):
+            return CleanupPermit(allowed=False, reason="terminal_retention_unknown")
+        if (
+            parent_id is not None
+            and await conn.fetchval(
+                "SELECT source FROM vm_workspace_cleanup_admissions WHERE id=$1",
+                parent_id,
+            )
+            == "pinned_thread_retained_disk_purge"
+        ):
+            from orchestrator.services.vm_thread_retained_disk_purge import (
+                validate_retained_disk_parent,
+            )
+
+            await validate_retained_disk_parent(conn, parent_id)
+        if (
+            parent_id is not None
+            and await conn.fetchval(
+                "SELECT source FROM vm_workspace_cleanup_admissions WHERE id=$1",
+                parent_id,
+            )
+            == "public_vm_delete"
+            and await conn.fetchval(
+                "SELECT to_regclass('public.vm_job_retained_disk_purge_authorities') "
+                "IS NOT NULL"
+            )
+            and await conn.fetchval(
+                "SELECT EXISTS(SELECT 1 FROM vm_job_retained_disk_purge_authorities "
+                "WHERE cleanup_admission_id=$1)",
+                parent_id,
+            )
+        ):
+            from orchestrator.services.vm_job_retained_disk_purge import (
+                validate_job_retained_disk_parent,
+            )
+
+            await validate_job_retained_disk_parent(conn, parent_id)
+        from orchestrator.services.vm_job_cancel_retention import (
+            guard_retention_cleanup_on_conn,
+        )
+
+        try:
+            await guard_retention_cleanup_on_conn(
+                conn,
+                owner_kind=owner_kind,
+                owner_id=owner_id,
+                pvc_uid=pvc_uid,
+                source=source,
+                request_id=request_id,
+                intent_digest=intent_digest,
+                parent_admission_id=parent_id,
+                bootstrap=_retained_purge_bootstrap,
+            )
+        except ResourceAdmissionError as exc:
+            return CleanupPermit(allowed=False, reason=str(exc))
+        prior = await conn.fetchrow(
+            "SELECT id,completed_at,pvc_uid,source,intent_digest,outcome,parent_admission_id "
+            "FROM vm_workspace_cleanup_admissions "
+            "WHERE owner_kind=$1 AND owner_id=$2 AND request_id=$3 FOR UPDATE",
+            owner_kind,
+            owner_id,
+            request_id,
+        )
+        admitted_request_id = None
+        if (
+            purge_successor is not None
+            and parent_cleanup is None
+            and prior is not None
+            and prior["intent_digest"] == purge_successor[0]
+            and prior["source"] == source
+            and prior["pvc_uid"] == pvc_uid
+            and prior["parent_admission_id"] is None
+        ):
+            # The shared ID recorded this identity's keep; the purge is the
+            # distinct later operation and owns its own deterministic ID.
+            request_id = admitted_request_id = purge_successor[1]
+            prior = await conn.fetchrow(
+                "SELECT id,completed_at,pvc_uid,source,intent_digest,outcome,"
+                "parent_admission_id FROM vm_workspace_cleanup_admissions "
+                "WHERE owner_kind=$1 AND owner_id=$2 AND request_id=$3 FOR UPDATE",
+                owner_kind,
+                owner_id,
+                request_id,
+            )
+        if parent_identity is not None:
+            parent = await conn.fetchrow(
+                "SELECT owner_kind,owner_id,pvc_uid,source,request_id,intent_digest,completed_at,parent_admission_id "
+                "FROM vm_workspace_cleanup_admissions WHERE id=$1 FOR UPDATE",
+                parent_id,
+            )
+            if (
+                parent is None
+                or (parent["completed_at"] is not None and prior is None)
+                or parent["parent_admission_id"] is not None
+                or parent["owner_kind"] != owner_kind
+                or parent["owner_id"] != owner_id
+                or parent["pvc_uid"] != pvc_uid
+                or parent["request_id"] != parent_identity[1]
+                or parent["intent_digest"] != parent_identity[2]
+                or parent["source"] != parent_identity[3]
+            ):
+                return CleanupPermit(
+                    allowed=False, reason="parent_cleanup_identity_changed"
+                )
+        if (
+            parent_cleanup is not None
+            and parent_cleanup.get("kind") == "creation_disposition"
+        ):
+            from orchestrator.services.vm_creation_disposition_cleanup import (
+                validate_disposition_child,
+            )
+
+            if not await validate_disposition_child(
+                conn,
+                parent_cleanup,
+                owner_kind=owner_kind,
+                owner_id=owner_id,
+                pvc_uid=pvc_uid,
+                request_id=request_id,
+                source=source,
+                intent_digest=intent_digest,
+                provision_generation=parent_provision_generation,
+                expected_vm_uid=expected_vm_uid,
+            ):
+                return CleanupPermit(
+                    allowed=False, reason="parent_cleanup_identity_changed"
+                )
+        if prior is not None:
+            if (
+                prior["pvc_uid"] != pvc_uid
+                or prior["source"] != source
+                or prior["intent_digest"] != intent_digest
+                or prior["parent_admission_id"] != parent_id
+            ):
+                raise WorkspaceRecoveryControlConflict(
+                    "cleanup_request_id_reused",
+                    "Cleanup request ID was already used with different resource intent.",
+                )
+            if prior["completed_at"] is not None and revalidate_completed:
+                later_recovery = await conn.fetchrow(
                     "SELECT r.id FROM vm_workspace_recoveries r "
                     "LEFT JOIN vm_workspace_recovery_retention_pins pin "
                     "ON pin.recovery_id=r.id AND pin.released_at IS NULL "
@@ -1538,40 +2266,119 @@ class VMWorkspaceRecoveryStore:
                     owner_id,
                     pvc_uid,
                 )
-                if recovery is not None:
-                    permit = CleanupPermit(
+                if later_recovery is not None:
+                    return CleanupPermit(
                         allowed=False,
-                        recovery_id=recovery["id"],
+                        recovery_id=later_recovery["id"],
                         reason="workspace_recovery_unresolved",
                     )
-                    self._emit(
-                        event="cleanup_blocked",
-                        state="recovering_workspace",
-                        phase="reconciling_outcome",
-                        code="none",
-                        result="blocked",
-                        reason=permit.reason,
-                        cleanup_blocker=permit.reason,
-                        operation_id=permit.recovery_id,
-                        job_id=owner_id if owner_kind == "job" else None,
-                        pvc_uid=pvc_uid,
-                    )
-                    return permit
-                admission_id = uuid4()
-                await conn.execute(
-                    "INSERT INTO vm_workspace_cleanup_admissions "
-                    "(id,owner_kind,owner_id,pvc_uid,source,request_id,intent_digest,parent_admission_id) "
-                    "VALUES ($1,$2,$3,$4,$5,$6,$7,$8)",
-                    admission_id,
+                later_cleanup = await conn.fetchrow(
+                    "SELECT id FROM vm_workspace_cleanup_admissions "
+                    "WHERE id<>$1 AND ((owner_kind=$2 AND owner_id=$3) "
+                    "OR ($4::uuid IS NOT NULL AND pvc_uid=$4)) "
+                    "AND completed_at IS NULL AND ($5::uuid IS NULL OR id<>$5) FOR UPDATE",
+                    prior["id"],
                     owner_kind,
                     owner_id,
                     pvc_uid,
-                    source,
-                    request_id,
-                    intent_digest,
-                    parent_id,
+                    parent_id
+                    if parent_cleanup is not None
+                    and parent_cleanup.get("kind") == "creation_disposition"
+                    else None,
                 )
-                return CleanupPermit(allowed=True, admission_id=admission_id)
+                if later_cleanup is not None:
+                    return CleanupPermit(
+                        allowed=False,
+                        admission_id=later_cleanup["id"],
+                        reason="workspace_cleanup_already_admitted",
+                    )
+            return CleanupPermit(
+                allowed=True,
+                admission_id=prior["id"],
+                reason=(
+                    None
+                    if prior["completed_at"] is None
+                    else "cleanup_request_already_completed"
+                ),
+                completed_outcome=(
+                    prior["outcome"] if prior["completed_at"] is not None else None
+                ),
+                request_id=admitted_request_id,
+            )
+        active_cleanup = await conn.fetchrow(
+            "SELECT id FROM vm_workspace_cleanup_admissions "
+            "WHERE ((owner_kind=$1 AND owner_id=$2) "
+            "OR ($3::uuid IS NOT NULL AND pvc_uid=$3)) "
+            "AND completed_at IS NULL AND ($4::uuid IS NULL OR id<>$4) FOR UPDATE",
+            owner_kind,
+            owner_id,
+            pvc_uid,
+            parent_id,
+        )
+        if active_cleanup is not None:
+            permit = CleanupPermit(
+                allowed=False,
+                admission_id=active_cleanup["id"],
+                reason="workspace_cleanup_already_admitted",
+            )
+            self._emit(
+                event="cleanup_blocked",
+                state="recovering_workspace",
+                phase="reconciling_outcome",
+                code="none",
+                result="blocked",
+                reason=permit.reason,
+                cleanup_blocker=permit.reason,
+                job_id=owner_id if owner_kind == "job" else None,
+                pvc_uid=pvc_uid,
+            )
+            return permit
+        recovery = await conn.fetchrow(
+            "SELECT r.id FROM vm_workspace_recoveries r "
+            "LEFT JOIN vm_workspace_recovery_retention_pins pin "
+            "ON pin.recovery_id=r.id AND pin.released_at IS NULL "
+            "WHERE r.resolved_at IS NULL AND ((r.owner_kind=$1 AND r.owner_id=$2) "
+            "OR ($3::uuid IS NOT NULL AND pin.pvc_uid=$3)) FOR UPDATE OF r",
+            owner_kind,
+            owner_id,
+            pvc_uid,
+        )
+        if recovery is not None:
+            permit = CleanupPermit(
+                allowed=False,
+                recovery_id=recovery["id"],
+                reason="workspace_recovery_unresolved",
+            )
+            self._emit(
+                event="cleanup_blocked",
+                state="recovering_workspace",
+                phase="reconciling_outcome",
+                code="none",
+                result="blocked",
+                reason=permit.reason,
+                cleanup_blocker=permit.reason,
+                operation_id=permit.recovery_id,
+                job_id=owner_id if owner_kind == "job" else None,
+                pvc_uid=pvc_uid,
+            )
+            return permit
+        admission_id = uuid4()
+        await conn.execute(
+            "INSERT INTO vm_workspace_cleanup_admissions "
+            "(id,owner_kind,owner_id,pvc_uid,source,request_id,intent_digest,parent_admission_id) "
+            "VALUES ($1,$2,$3,$4,$5,$6,$7,$8)",
+            admission_id,
+            owner_kind,
+            owner_id,
+            pvc_uid,
+            source,
+            request_id,
+            intent_digest,
+            parent_id,
+        )
+        return CleanupPermit(
+            allowed=True, admission_id=admission_id, request_id=admitted_request_id
+        )
 
     async def complete_cleanup_permit(
         self,
@@ -1589,11 +2396,60 @@ class VMWorkspaceRecoveryStore:
             )
         async with self.db.acquire() as conn:
             async with conn.transaction():
+                # Cleanup writes now share the retention guard's owner/PVC
+                # locks. Take them before the child row, matching admission and
+                # parent validation; row-first completion can deadlock with a
+                # validator that already owns those advisory locks.
+                identity = await conn.fetchrow(
+                    "SELECT owner_kind,owner_id,pvc_uid,source,request_id,"
+                    "intent_digest,parent_admission_id "
+                    "FROM vm_workspace_cleanup_admissions WHERE id=$1",
+                    admission_id,
+                )
+                if identity is None:
+                    return False
+                await conn.execute(
+                    "SELECT pg_advisory_xact_lock(hashtextextended($1,0))",
+                    f"workspace-recovery:{identity['owner_kind']}:{identity['owner_id']}",
+                )
+                if identity["pvc_uid"] is not None:
+                    await conn.execute(
+                        "SELECT pg_advisory_xact_lock(hashtextextended($1,0))",
+                        f"workspace-recovery-pvc:{identity['pvc_uid']}",
+                    )
                 row = await conn.fetchrow(
-                    "SELECT request_id,intent_digest,completed_at,outcome "
+                    "SELECT owner_kind,owner_id,pvc_uid,source,request_id,"
+                    "intent_digest,parent_admission_id,completed_at,outcome "
                     "FROM vm_workspace_cleanup_admissions WHERE id=$1 FOR UPDATE",
                     admission_id,
                 )
+                if row is None or any(
+                    row[key] != identity[key] for key in identity.keys()
+                ):
+                    return False
+                if (
+                    row is not None
+                    and row.get("source") == "pinned_thread_retained_disk_purge"
+                ):
+                    raise ResourceAdmissionError("retained_disk_binding_required")
+                if (
+                    row is not None
+                    and row.get("source") == "public_vm_delete"
+                    and await conn.fetchval(
+                        "SELECT to_regclass('public.vm_job_retained_disk_purge_authorities') "
+                        "IS NOT NULL"
+                    )
+                    and await conn.fetchval(
+                        "SELECT EXISTS(SELECT 1 FROM vm_job_retained_disk_purge_authorities "
+                        "WHERE cleanup_admission_id=$1)",
+                        admission_id,
+                    )
+                ):
+                    raise ResourceAdmissionError("retained_disk_binding_required")
+                # VM create adoption/non-issuance is settled atomically with
+                # its retry ledger, never through generic cleanup completion.
+                if row is not None and row.get("source") == "controller_vm_create":
+                    return False
                 if row is None or (
                     request_id is not None
                     and (
@@ -1612,6 +2468,342 @@ class VMWorkspaceRecoveryStore:
                 )
                 return True
 
+    async def settle_never_issued_job_terminal(
+        self,
+        job_id: str,
+        *,
+        provision_generation: str,
+    ) -> UUID:
+        """Settle one cancelled Job's exact never-issued VM parent and projection.
+
+        This is logical non-issuance, not physical stop attestation. The normal
+        caller still owns checkpoint pruning, archive order and Cancel marker
+        clearing. A failed source check rolls back even a fresh parent admit.
+        """
+        from types import SimpleNamespace
+        from orchestrator.services.vm_creation_preflight import (
+            _execution_binding,
+            _preflight,
+        )
+        from shared.vm_creation_retry import canonical_request_digest
+        from shared.vm_creation_issuance import canonical_configuration_digest
+
+        try:
+            owner_id = UUID(job_id)
+            generation = UUID(provision_generation)
+            if str(owner_id) != job_id or str(generation) != provision_generation:
+                raise ValueError
+        except (TypeError, ValueError, AttributeError):
+            raise ResourceAdmissionError(
+                "job_vm_never_issued_source_unproven"
+            ) from None
+        _, _, request_id, digest, _ = vm_cleanup_request_identity(
+            owner_kind="job",
+            owner_id=owner_id,
+            identity=SimpleNamespace(
+                provision_generation=str(generation),
+                vm_uid=None,
+                rootdisk_pvc_uid=None,
+            ),
+            source="job_terminal_vm_release",
+            purge_disk=True,
+        )
+        async with self.db.acquire() as conn, conn.transaction():
+            # The established recovery admission takes owner advisory/row
+            # locks before the parent, then retry and waiter locks follow.
+            permit = await self.acquire_cleanup_permit_on_conn(
+                conn,
+                owner_kind="job",
+                owner_id=owner_id,
+                pvc_uid=None,
+                request_id=request_id,
+                source="job_terminal_vm_release",
+                intent_digest=digest,
+            )
+            if not permit.allowed or permit.admission_id is None:
+                raise ResourceAdmissionError("job_vm_never_issued_parent_unproven")
+            parent = await conn.fetchrow(
+                "SELECT * FROM vm_workspace_cleanup_admissions WHERE id=$1 FOR UPDATE",
+                permit.admission_id,
+            )
+            job = await conn.fetchrow(
+                "SELECT * FROM jobs WHERE id=$1 FOR UPDATE",
+                owner_id,
+            )
+            retry = await conn.fetchrow(
+                "SELECT * FROM vm_creation_retries WHERE owner_kind='job' "
+                "AND job_id=$1 AND provision_generation=$2 FOR UPDATE",
+                owner_id,
+                generation,
+            )
+            if retry is None:
+                raise ResourceAdmissionError("job_vm_never_issued_source_unproven")
+            waiter = await conn.fetchrow(
+                "SELECT * FROM vm_resource_waiters WHERE request_id=$1 FOR UPDATE",
+                retry["request_id"],
+            )
+            queue = await conn.fetchrow(
+                "SELECT state FROM run_queue WHERE unit_id=$1 "
+                "AND unit_kind='worker_batch'",
+                owner_id,
+            )
+            execution = await conn.fetchrow(
+                "SELECT *, CASE WHEN resolved->'spec'->>'timeoutSeconds' IS NULL "
+                "THEN NULL ELSE created_at+((resolved->'spec'->>'timeoutSeconds')::double precision "
+                "* interval '1 second') END AS deadline "
+                "FROM srw_execution_specs WHERE work_kind='Job' AND work_id=$1 "
+                "FOR SHARE",
+                owner_id,
+            )
+            # The source predicate below is about every generation. Block
+            # mutations of existing child evidence while it is evaluated;
+            # 0327's INSERT guards serialize rows without a Job FK with the
+            # locked owner, including repository and execution writers.
+            await conn.fetch(
+                "SELECT lease_token FROM worker_batch_attempts WHERE job_id=$1 "
+                "ORDER BY lease_token FOR SHARE",
+                owner_id,
+            )
+            await conn.fetch(
+                "SELECT id FROM managed_repository_creation_intents "
+                "WHERE authority_kind='job' AND authority_id=$1 "
+                "ORDER BY id FOR SHARE",
+                owner_id,
+            )
+            await conn.fetch(
+                "SELECT id FROM managed_repository_authorities "
+                "WHERE authority_kind='job' AND authority_id=$1 "
+                "ORDER BY id FOR SHARE",
+                owner_id,
+            )
+            for table in (
+                "managed_repository_process_zero_receipts",
+                "managed_repository_workspace_creation_reservations",
+                "managed_repository_workspace_cleanup_intents",
+            ):
+                await conn.fetch(
+                    f"SELECT id FROM {table} WHERE owner_kind='job' AND owner_id=$1 "
+                    "ORDER BY id FOR SHARE",
+                    owner_id,
+                )
+            await conn.fetch(
+                "SELECT a.execution_id,a.attempt FROM srw_execution_attempts a "
+                "JOIN srw_execution_specs x ON x.id=a.execution_id "
+                "WHERE x.work_kind='Job' AND x.work_id=$1 "
+                "ORDER BY a.execution_id,a.attempt FOR SHARE OF a",
+                owner_id,
+            )
+            await conn.fetch(
+                "SELECT b.execution_id,b.instance_id FROM srw_execution_workspace_bindings b "
+                "JOIN srw_execution_specs x ON x.id=b.execution_id "
+                "WHERE x.work_kind='Job' AND x.work_id=$1 "
+                "ORDER BY b.execution_id,b.instance_id FOR SHARE OF b",
+                owner_id,
+            )
+            await conn.fetch(
+                "SELECT id FROM srw_workspace_instances WHERE owner_id=$1 "
+                "OR execution_id IN (SELECT id FROM srw_execution_specs "
+                "WHERE work_kind='Job' AND work_id=$1) ORDER BY id FOR SHARE",
+                owner_id,
+            )
+            context = _json(job["context"]) if job is not None else None
+            vm = context.get("vm") if isinstance(context, dict) else None
+            try:
+                preflight = _preflight(vm) if isinstance(vm, dict) else None
+                preflight_request = preflight.get("request") if preflight else None
+                captured = vm.get("creation_request") if isinstance(vm, dict) else None
+                # Historical retry, waiter and parent writers take this owner lock.
+                source_valid = bool(
+                    parent is not None
+                    and parent["owner_kind"] == "job"
+                    and parent["owner_id"] == owner_id
+                    and parent["pvc_uid"] is None
+                    and parent["source"] == "job_terminal_vm_release"
+                    and parent["parent_admission_id"] is None
+                    and parent["request_id"] == request_id
+                    and parent["intent_digest"] == digest
+                    and (
+                        parent["completed_at"] is None
+                        or parent["outcome"] == "completed"
+                    )
+                    and job["status"] == "cancelled"
+                    and job["execution_lane"] == "stateless"
+                    and job["parent_job_id"] is None
+                    and job["assigned_agent_id"] is None
+                    and context.get("_stateless_cancel_cleanup_pending") is True
+                    and context.get("_vm_creation_pending") == str(retry["request_id"])
+                    and vm.get("status") == "waiting_creation_configuration"
+                    and vm.get("provision_generation") == str(generation)
+                    and await conn.fetchval(
+                        "SELECT public.job_vm_creation_never_issued_predecessors($1,$2)",
+                        owner_id,
+                        str(generation),
+                    )
+                    is True
+                    and queue is not None
+                    and queue["state"] == "done"
+                    and preflight is not None
+                    and preflight.get("state") == "admitted"
+                    and preflight["request_id"] == str(retry["request_id"])
+                    and preflight.get("expected_pvc_uid") is None
+                    and retry["expected_pvc_uid"] is None
+                    and preflight.get("predecessor_cleanup_admission_id") is None
+                    and retry["predecessor_cleanup_admission_id"] is None
+                    and preflight.get("predecessor_evidence") in (None, {})
+                    and _json(retry["predecessor_evidence"]) == {}
+                    and isinstance(preflight_request, dict)
+                    and preflight_request.get("entity_type") == "job"
+                    and preflight_request.get("job_id") == str(owner_id)
+                    and preflight_request.get("provision_generation") == str(generation)
+                    and preflight_request.get("preparation") is None
+                    and preflight_request.get("workspace_storage") is None
+                    and canonical_request_digest(preflight_request)
+                    == preflight["request_digest"]
+                    and isinstance(captured, dict)
+                    and captured.get("version") == 1
+                    and captured.get("provision_generation") == str(generation)
+                    and captured.get("initial_request") is True
+                    and captured.get("issuance_authority_bound") is False
+                    and captured.get("controller_configuration_authenticated") is True
+                    and captured.get("request") == _json(retry["canonical_request"])
+                    and captured.get("request_digest") == retry["request_digest"]
+                    and captured.get("controller_configuration")
+                    == _json(retry["controller_configuration"])
+                    and captured.get("controller_configuration_digest")
+                    == retry["controller_configuration_digest"]
+                    and canonical_request_digest(_json(retry["canonical_request"]))
+                    == retry["request_digest"]
+                    and canonical_configuration_digest(
+                        _json(retry["controller_configuration"])
+                    )
+                    == retry["controller_configuration_digest"]
+                    and _execution_binding(preflight)
+                    == {
+                        key: retry[key]
+                        for key in (
+                            "execution_id",
+                            "execution_revision",
+                            "execution_generation",
+                            "admission_deadline",
+                        )
+                    }
+                    and execution is not None
+                    and execution["harness_adapter"] == "srw/v1"
+                    and all(
+                        execution[key] == retry[other]
+                        for key, other in (
+                            ("id", "execution_id"),
+                            ("revision", "execution_revision"),
+                            ("generation", "execution_generation"),
+                            ("deadline", "admission_deadline"),
+                        )
+                    )
+                    and waiter is not None
+                    and waiter["request_id"] == retry["request_id"]
+                    and waiter["state"] == "cancelled"
+                    and waiter["reason"] == "job_cancelled"
+                    and await conn.fetchval(
+                        "SELECT public.job_vm_creation_never_issued_source($1,$2)",
+                        owner_id,
+                        str(generation),
+                    )
+                    is True
+                    and not await conn.fetchval(
+                        "SELECT EXISTS(SELECT 1 FROM vm_workspace_cleanup_admissions "
+                        "WHERE owner_kind='job' AND owner_id=$1 AND id<>$2 "
+                        "AND completed_at IS NULL)",
+                        owner_id,
+                        parent["id"],
+                    )
+                )
+            except (KeyError, TypeError, ValueError, AttributeError):
+                source_valid = False
+            if not source_valid:
+                raise ResourceAdmissionError("job_vm_never_issued_source_unproven")
+            # Freeze the exact non-secret repository pair (or explicit absence)
+            # before completing this logical parent. Normal final Delete later
+            # revokes the key and creation intent, so those mutable ledgers
+            # cannot serve as the settlement-time audit on their own.
+            pair_raw = await conn.fetchval(
+                "SELECT public.job_vm_repository_pair_evidence($1)",
+                owner_id,
+            )
+            pair = _json(pair_raw) if pair_raw is not None else None
+            receipt = await conn.fetchrow(
+                "SELECT * FROM vm_job_repository_settlement_receipts "
+                "WHERE cleanup_admission_id=$1 FOR SHARE",
+                parent["id"],
+            )
+            if receipt is None:
+                await conn.execute(
+                    "INSERT INTO vm_job_repository_settlement_receipts "
+                    "(cleanup_admission_id,request_id,job_id,provision_generation,"
+                    "authority_id,creation_intent_id,repository_owner,repo_name,"
+                    "project_id,forge_key_id,key_generation,intent_generation,"
+                    "clean_repo_url) "
+                    "VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)",
+                    parent["id"],
+                    retry["request_id"],
+                    owner_id,
+                    generation,
+                    (UUID(pair["authority_id"]) if pair else None),
+                    (UUID(pair["creation_intent_id"]) if pair else None),
+                    (pair["repository_owner"] if pair else None),
+                    (pair["repo_name"] if pair else None),
+                    (UUID(pair["project_id"]) if pair and pair["project_id"] else None),
+                    (pair["forge_key_id"] if pair else None),
+                    (pair["key_generation"] if pair else None),
+                    (pair["intent_generation"] if pair else None),
+                    (pair["clean_repo_url"] if pair else None),
+                )
+            elif (
+                receipt["request_id"] != retry["request_id"]
+                or receipt["job_id"] != owner_id
+                or receipt["provision_generation"] != generation
+                or _json(
+                    await conn.fetchval(
+                        "SELECT public.vm_job_repository_receipt_pair(r) "
+                        "FROM vm_job_repository_settlement_receipts r "
+                        "WHERE cleanup_admission_id=$1",
+                        parent["id"],
+                    )
+                )
+                != pair
+            ):
+                raise ResourceAdmissionError(
+                    "job_vm_repository_settlement_receipt_changed"
+                )
+            if parent["completed_at"] is None:
+                settled = await conn.execute(
+                    "UPDATE vm_workspace_cleanup_admissions SET "
+                    "completed_at=clock_timestamp(),outcome='completed' "
+                    "WHERE id=$1 AND owner_kind='job' AND owner_id=$2 "
+                    "AND source='job_terminal_vm_release' AND request_id=$3 "
+                    "AND intent_digest=$4 AND pvc_uid IS NULL "
+                    "AND parent_admission_id IS NULL AND completed_at IS NULL",
+                    parent["id"],
+                    owner_id,
+                    request_id,
+                    digest,
+                )
+                if settled != "UPDATE 1":
+                    raise ResourceAdmissionError("job_vm_never_issued_parent_unproven")
+            projected = await conn.execute(
+                "UPDATE jobs SET context=jsonb_set(context,'{vm,status}',"
+                "'\"deleted\"'::jsonb,true),updated_at=clock_timestamp() "
+                "WHERE id=$1 AND status='cancelled' AND execution_lane='stateless' "
+                "AND assigned_agent_id IS NULL "
+                "AND context->'_stateless_cancel_cleanup_pending'='true'::jsonb "
+                "AND context->'vm'->>'provision_generation'=$2 "
+                "AND context->'vm'->>'status'='waiting_creation_configuration' "
+                "AND public.job_vm_creation_never_issued_terminal_source($1,$2)",
+                owner_id,
+                str(generation),
+            )
+            if projected != "UPDATE 1":
+                raise ResourceAdmissionError("job_vm_never_issued_projection_unproven")
+            return parent["id"]
+
     async def resume_cleanup_permit(
         self,
         admission_id: UUID,
@@ -1624,13 +2816,51 @@ class VMWorkspaceRecoveryStore:
     ) -> CleanupPermit:
         """Validate a controller reservation recovered from Kubernetes state."""
 
-        async with self.db.acquire() as conn:
+        async with self.db.acquire() as conn, conn.transaction():
             row = await conn.fetchrow(
-                "SELECT id,owner_kind,owner_id,source,request_id,intent_digest,"
-                "completed_at,outcome "
-                "FROM vm_workspace_cleanup_admissions WHERE id=$1",
+                "SELECT * FROM vm_workspace_cleanup_admissions WHERE id=$1",
                 admission_id,
             )
+            if row is not None:
+                await conn.execute(
+                    "SELECT pg_advisory_xact_lock(hashtextextended($1,0))",
+                    f"workspace-recovery:{row['owner_kind']}:{row['owner_id']}",
+                )
+                if row["pvc_uid"] is not None:
+                    await conn.execute(
+                        "SELECT pg_advisory_xact_lock(hashtextextended($1,0))",
+                        f"workspace-recovery-pvc:{row['pvc_uid']}",
+                    )
+                row = await conn.fetchrow(
+                    "SELECT * FROM vm_workspace_cleanup_admissions WHERE id=$1 FOR UPDATE",
+                    admission_id,
+                )
+                if row is None:
+                    return CleanupPermit(
+                        allowed=False, reason="cleanup_reservation_changed"
+                    )
+                from orchestrator.services.vm_job_cancel_retention import (
+                    guard_retention_cleanup_on_conn,
+                )
+
+                try:
+                    await guard_retention_cleanup_on_conn(
+                        conn,
+                        owner_kind=row["owner_kind"],
+                        owner_id=row["owner_id"],
+                        pvc_uid=row["pvc_uid"],
+                        source=row["source"],
+                        request_id=row["request_id"],
+                        intent_digest=row["intent_digest"],
+                        parent_admission_id=row["parent_admission_id"],
+                    )
+                except ResourceAdmissionError as exc:
+                    return CleanupPermit(allowed=False, reason=str(exc))
+            from orchestrator.services.vm_creation_disposition_cleanup import (
+                child_disposition_identity,
+            )
+
+            disposition = await child_disposition_identity(conn, row) if row else None
         if (
             row is None
             or row["owner_kind"] != owner_kind
@@ -1646,6 +2876,110 @@ class VMWorkspaceRecoveryStore:
                 admission_id=admission_id,
                 reason="cleanup_request_already_completed",
                 completed_outcome=row["outcome"],
+                creation_disposition=disposition,
+            )
+        if row["parent_admission_id"] is not None:
+            async with self.db.acquire() as conn, conn.transaction():
+                if (
+                    await conn.fetchval(
+                        "SELECT source FROM vm_workspace_cleanup_admissions WHERE id=$1",
+                        row["parent_admission_id"],
+                    )
+                    == "pinned_thread_retained_disk_purge"
+                ):
+                    from orchestrator.services.vm_thread_retained_disk_purge import (
+                        validate_retained_disk_parent,
+                    )
+
+                    await validate_retained_disk_parent(
+                        conn, row["parent_admission_id"]
+                    )
+                    # The child may have completed while parent validation
+                    # waited for the owner. A durable completion acknowledges
+                    # its outcome; it must not authorize another disk effect.
+                    current = await conn.fetchrow(
+                        "SELECT * FROM vm_workspace_cleanup_admissions WHERE id=$1 FOR UPDATE",
+                        admission_id,
+                    )
+                    if current is None or any(
+                        current[key] != row[key]
+                        for key in (
+                            "owner_kind",
+                            "owner_id",
+                            "pvc_uid",
+                            "source",
+                            "request_id",
+                            "intent_digest",
+                            "parent_admission_id",
+                        )
+                    ):
+                        return CleanupPermit(
+                            allowed=False, reason="cleanup_reservation_changed"
+                        )
+                    if current["completed_at"] is not None:
+                        return CleanupPermit(
+                            allowed=False,
+                            admission_id=admission_id,
+                            reason="cleanup_request_already_completed",
+                            completed_outcome=current["outcome"],
+                        )
+                if (
+                    await conn.fetchval(
+                        "SELECT source FROM vm_workspace_cleanup_admissions WHERE id=$1",
+                        row["parent_admission_id"],
+                    )
+                    == "public_vm_delete"
+                    and await conn.fetchval(
+                        "SELECT to_regclass('public.vm_job_retained_disk_purge_authorities') "
+                        "IS NOT NULL"
+                    )
+                    and await conn.fetchval(
+                        "SELECT EXISTS(SELECT 1 FROM vm_job_retained_disk_purge_authorities "
+                        "WHERE cleanup_admission_id=$1)",
+                        row["parent_admission_id"],
+                    )
+                ):
+                    from orchestrator.services.vm_job_retained_disk_purge import (
+                        validate_job_retained_disk_parent,
+                    )
+
+                    await validate_job_retained_disk_parent(
+                        conn, row["parent_admission_id"]
+                    )
+                    current = await conn.fetchrow(
+                        "SELECT * FROM vm_workspace_cleanup_admissions WHERE id=$1 FOR UPDATE",
+                        admission_id,
+                    )
+                    if current is None or any(
+                        current[key] != row[key]
+                        for key in (
+                            "owner_kind",
+                            "owner_id",
+                            "pvc_uid",
+                            "source",
+                            "request_id",
+                            "intent_digest",
+                            "parent_admission_id",
+                        )
+                    ):
+                        return CleanupPermit(
+                            allowed=False, reason="cleanup_reservation_changed"
+                        )
+                    if current["completed_at"] is not None:
+                        return CleanupPermit(
+                            allowed=False,
+                            admission_id=admission_id,
+                            reason="cleanup_request_already_completed",
+                            completed_outcome=current["outcome"],
+                        )
+        if disposition is not None:
+            # Older controllers must stop even if they ignore the new typed
+            # disposition field. Only the dedicated actuator has consumer fences.
+            return CleanupPermit(
+                allowed=False,
+                admission_id=admission_id,
+                reason="creation_disposition_required",
+                creation_disposition=disposition,
             )
         return CleanupPermit(allowed=True, admission_id=admission_id)
 
@@ -1974,12 +3308,16 @@ class VMWorkspaceRecoveryStore:
         job_id: UUID,
         lease_token: int,
         authority_digest: str,
+        vm_mode: str | None = None,
+        vm_binding_required: bool | None = None,
     ) -> bool:
         return await record_worker_bundle_authorized(
             conn,
             job_id=job_id,
             lease_token=lease_token,
             authority_digest=authority_digest,
+            vm_mode=vm_mode,
+            vm_binding_required=vm_binding_required,
         )
 
     async def list_retention_pin_commands(
@@ -3164,6 +4502,8 @@ class VMWorkspaceRecoveryStore:
                         == str(operation["vm_uid"])
                         and str(owner_vm.get("rootdisk_pvc_uid") or "")
                         == str(operation["root_pvc_uid"])
+                        and owner_vm.get("vmi_uid")
+                        in (None, str(operation["prior_vmi_uid"]))
                     )
                     if not projection_current:
                         await self._pause_claim_locked(
@@ -3244,6 +4584,54 @@ class VMWorkspaceRecoveryStore:
                         diagnostic={"projection_errors": projection_errors},
                     )
                     return False
+                if operation["owner_kind"] == "job":
+                    revision = owner_vm.get("provisioning_revision", 0)
+                    if type(revision) is not int or not 0 <= revision < 2**63 - 2:
+                        await self._pause_claim_locked(
+                            conn,
+                            operation_id=operation_id,
+                            version=version,
+                            claim_token=claim_token,
+                            worker_id=self.worker_id,
+                            code=WorkspaceRecoveryCode.IDENTITY_CONFLICT,
+                            diagnostic={"reason": "owner_vm_phase_revision_invalid"},
+                        )
+                        return False
+                    successor_phase = None
+                    if "provisioning" in owner_vm:
+                        phase_now = await conn.fetchval(
+                            "SELECT extract(epoch FROM clock_timestamp())::double precision"
+                        )
+                        try:
+                            successor_phase = rebind_recovered_provisioning(
+                                owner_vm["provisioning"],
+                                expected_identity={
+                                    "owner_kind": "job",
+                                    "owner_id": str(operation["owner_id"]),
+                                    "namespace": operation["namespace"],
+                                    "provision_generation": str(
+                                        operation["provision_generation"]
+                                    ),
+                                    "vm_uid": str(operation["vm_uid"]),
+                                    "vmi_uid": str(operation["prior_vmi_uid"]),
+                                    "rootdisk_pvc_uid": str(operation["root_pvc_uid"]),
+                                },
+                                successor_vmi_uid=str(successor["vmi_uid"]),
+                                now=phase_now,
+                            )
+                        except (ValueError, TypeError, KeyError):
+                            await self._pause_claim_locked(
+                                conn,
+                                operation_id=operation_id,
+                                version=version,
+                                claim_token=claim_token,
+                                worker_id=self.worker_id,
+                                code=WorkspaceRecoveryCode.IDENTITY_CONFLICT,
+                                diagnostic={
+                                    "reason": "owner_vm_phase_changed_or_invalid"
+                                },
+                            )
+                            return False
                 for participant in participants:
                     changed = await release_worker_batch_from_workspace_recovery(
                         conn,
@@ -3287,7 +4675,10 @@ class VMWorkspaceRecoveryStore:
                         "ssh_registration_id": successor.get("ssh_registration_id"),
                         "ssh_ready_source": "workspace_recovery",
                         "recovering": False,
+                        "provisioning_revision": revision + 1,
                     }
+                    if successor_phase is not None:
+                        projected["provisioning"] = successor_phase
                     bound = await conn.fetchval(
                         """
                         UPDATE jobs
@@ -3299,6 +4690,9 @@ class VMWorkspaceRecoveryStore:
                            AND context->'vm'->>'provision_generation'=$3
                            AND context->'vm'->>'vm_uid'=$4
                            AND context->'vm'->>'rootdisk_pvc_uid'=$5
+                           AND COALESCE(context->'vm'->'provisioning_revision',
+                                        '0'::jsonb)=$6::jsonb
+                           AND COALESCE(context->'vm'->>'vmi_uid','')=$7
                         RETURNING 1
                         """,
                         operation["owner_id"],
@@ -3306,18 +4700,13 @@ class VMWorkspaceRecoveryStore:
                         str(operation["provision_generation"]),
                         str(operation["vm_uid"]),
                         str(operation["root_pvc_uid"]),
+                        json.dumps(revision),
+                        str(owner_vm.get("vmi_uid") or ""),
                     )
                     if bound is None:
-                        await self._pause_claim_locked(
-                            conn,
-                            operation_id=operation_id,
-                            version=version,
-                            claim_token=claim_token,
-                            worker_id=self.worker_id,
-                            code=WorkspaceRecoveryCode.IDENTITY_CONFLICT,
-                            diagnostic={"reason": "owner_vm_projection_changed"},
-                        )
-                        return False
+                        # Participant releases above are in this transaction.
+                        # An unexpected projection CAS miss must roll them back.
+                        raise _RecoveryClaimLost
                 pin_released = await conn.fetchval(
                     """
                     UPDATE vm_workspace_recovery_retention_pins pin
@@ -3375,6 +4764,32 @@ class VMWorkspaceRecoveryStore:
                 )
                 if recovered is None:
                     raise _RecoveryClaimLost
+                if operation["owner_kind"] == "job":
+                    from orchestrator.services.vm_resource_job_runtime import (
+                        installed_job_resource_store,
+                    )
+
+                    resource_retry = await conn.fetchrow(
+                        "SELECT * FROM vm_creation_retries WHERE job_id=$1 "
+                        "AND provision_generation=$2 FOR UPDATE",
+                        operation["owner_id"],
+                        operation["provision_generation"],
+                    )
+                    resource = await installed_job_resource_store(
+                        conn,
+                        self.db,
+                        resource_retry["controller_configuration"]
+                        if resource_retry is not None
+                        else None,
+                        fresh=False,
+                    )
+                    if resource is not None:
+                        await resource.append_recovery_successor_on_conn(
+                            conn,
+                            retry=resource_retry,
+                            operation=operation,
+                            final_observation=final,
+                        )
                 slot_released = await conn.fetchval(
                     "DELETE FROM vm_workspace_recovery_probe_slots "
                     "WHERE recovery_id=$1 AND claim_token=$2 RETURNING 1",
@@ -3383,7 +4798,7 @@ class VMWorkspaceRecoveryStore:
                 )
                 if slot_released is None:
                     raise _RecoveryClaimLost
-        except _RecoveryClaimLost:
+        except (_RecoveryClaimLost, ResourceAdmissionError):
             return False
         return True
 

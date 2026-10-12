@@ -674,6 +674,7 @@ async def get_project_officer_summary(
             if isinstance(entry, dict)
         },
         "stale_claims": officer_state.get("backlog_stale_claims") or [],
+        "workspace_refusals": officer_state.get("backlog_workspace_refusals") or {},
         "stale_claim_policy": officer_state.get("backlog_stale_claim_policy")
         or stale_claim_policy,
         "worker_spend_ceiling_daily": officer_meta.get("worker_spend_ceiling_daily"),

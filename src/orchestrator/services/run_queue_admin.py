@@ -11,6 +11,11 @@ this is a service rather than four router bodies:
   quiescence``, and an unreadable metadata blob is treated as *stopped*, not as
   permission: ``stateless_stop_markers`` raising is a refusal, never a pass.
   The thread row is read ``FOR UPDATE`` in the same transaction that unparks.
+* **Attest is the only override of claimant-loss debt.** A hold settles
+  automatically only on observed exact-terminal proof; ``attest-claimant-gone``
+  records a named administrator's assertion (with a durable receipt) for the
+  cases Kubernetes can never prove, and refuses while the API shows the exact
+  claimant running or still inside its termination grace.
 * **The completion-command verbs are disabled-by-default.** With the feature
   off they answer ``404``, not ``403`` — the endpoint does not exist rather
   than existing and refusing, so nothing enumerates a disabled surface.
@@ -30,7 +35,7 @@ from uuid import UUID
 
 from fastapi import HTTPException
 
-from shared.session_retirement import stateless_stop_markers
+from shared.session_retirement import CLAIM_LOSS_LEDGER_KEY, stateless_stop_markers
 
 logger = logging.getLogger(__name__)
 
@@ -106,19 +111,348 @@ async def unpark_run_queue_unit(
                     except (TypeError, ValueError):
                         metadata = None
                 try:
-                    stopped = bool(stateless_stop_markers(metadata))
+                    markers = stateless_stop_markers(metadata)
                 except RuntimeError:
-                    stopped = True
-                if stopped:
-                    raise HTTPException(
-                        status_code=409,
-                        detail="Unit is awaiting claimant quiescence",
-                    )
+                    markers = frozenset({"malformed"})
+                if markers:
+                    detail = "Unit is awaiting claimant quiescence"
+                    if CLAIM_LOSS_LEDGER_KEY in markers:
+                        # Unpark never clears claimant-loss debt; point the
+                        # operator at the one audited verb that can.
+                        detail += (
+                            "; once the claimant process is confirmed gone, "
+                            f"POST /api/admin/run-queue/{unit_id}"
+                            "/attest-claimant-gone"
+                        )
+                    raise HTTPException(status_code=409, detail=detail)
             ok = await unpark_unit(conn, unit_id=unit_id)
     if not ok:
         raise HTTPException(status_code=404, detail="Unit is not parked")
     logger.info("run_queue unpark: unit=%s", unit_id)
     return {"unit_id": unit_id, "state": "queued"}
+
+
+def _metadata_object(value: Any) -> Any:
+    if value is None:
+        return {}
+    if isinstance(value, str):
+        try:
+            return json.loads(value)
+        except (TypeError, ValueError):
+            return None
+    return value
+
+
+async def _observe_for_attestation(pod_name: str, uid: str) -> tuple[str, Any | None]:
+    """Fail-closed Kubernetes read behind every operator attestation.
+
+    One bounded raw read of the exact UID (no pool-label filter, so a chart
+    rename cannot hide a Pod still inside its grace). ``(authority, exact
+    Pod or None)``; 503 unless the API actually answered (only a real 404
+    counts as an answer of absence), 409 while the exact Pod is running or
+    still inside its termination grace.
+    """
+    from datetime import datetime, timezone
+
+    from orchestrator.services.agent_provisioner import (
+        AgentPodObservationError,
+        agent_provisioner,
+    )
+
+    try:
+        authority, pod = await agent_provisioner.observe_agent_pod_exact(
+            pod_name, expected_pod_uid=uid
+        )
+    except AgentPodObservationError:
+        raise HTTPException(
+            status_code=503,
+            detail="Kubernetes did not answer for the claimant pod; retry "
+            "the attestation once the API is reachable",
+        ) from None
+    if authority == "exact_live":
+        raise HTTPException(
+            status_code=409,
+            detail="Claimant pod is running in the Kubernetes API; "
+            "it cannot be attested gone",
+        )
+    exact = pod if authority not in {"exact_absent", "replacement"} else None
+    # Kubernetes stamps deletionTimestamp at the END of the graceful window.
+    deadline = getattr(getattr(exact, "metadata", None), "deletion_timestamp", None)
+    if isinstance(deadline, datetime) and deadline.tzinfo is None:
+        deadline = deadline.replace(tzinfo=timezone.utc)
+    if (
+        authority != "exact_terminal"
+        and isinstance(deadline, datetime)
+        and deadline > datetime.now(timezone.utc)
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail="Claimant pod is inside its termination grace until "
+            f"{deadline.isoformat()}; the kubelet may still report it terminal",
+        )
+    return authority, exact
+
+
+async def attest_claimant_gone(
+    unit_id: str,
+    *,
+    pod: str,
+    pod_uid: str,
+    reason: str,
+    admin: Any,
+    dependencies: RunQueueAdminDependencies,
+) -> dict[str, Any]:
+    """Settle claimant-loss debt whose exact claimant a human confirmed gone.
+
+    The reaper settles a hold only on the exact Pod UID observed with every
+    container terminated. A 404 (force delete, node GC, a pre-finalizer Pod)
+    or a lost node's frozen statuses can never prove that, by design, so this
+    audited verb is the override. It never contradicts a live observation:
+    409 while the exact Pod runs or is still inside its termination grace.
+    It ACKs every debt naming the exact ``(pod, pod_uid)`` with
+    ``quiesced_by="operator:<admin id>"`` and a durable receipt, and — when
+    that Pod is still retained by the executor finalizer and no other claim
+    names it — releases the finalizer as well.
+    """
+    from orchestrator.services.agent_provisioner import agent_provisioner
+    from shared.session_retirement import (
+        CLAIM_LOSS_HOLD_KEY,
+        acknowledge_session_claim_quiesced,
+        unresolved_claim_losses,
+    )
+
+    not_found = HTTPException(
+        status_code=404, detail="No unresolved claimant-loss debt names that pod"
+    )
+    pod_name = str(pod or "").strip()
+    uid = str(pod_uid or "").strip()
+    try:
+        UUID(str(unit_id))
+        UUID(uid)
+    except (ValueError, TypeError):
+        raise not_found from None
+    async with dependencies.db.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT execution_lane, metadata FROM threads WHERE id = $1::uuid",
+            unit_id,
+        )
+    if row is None or str(row["execution_lane"] or "") != "stateless" or not pod_name:
+        raise not_found
+    try:
+        losses = unresolved_claim_losses(_metadata_object(row["metadata"]))
+    except RuntimeError:
+        raise HTTPException(
+            status_code=409,
+            detail="Claimant-loss ledger is malformed; it cannot be attested",
+        ) from None
+    tokens = sorted(
+        token
+        for token, authority in losses.items()
+        if authority.pod == pod_name and authority.pod_uid == uid
+    )
+    if not tokens:
+        raise not_found
+
+    kubernetes_authority, _ = await _observe_for_attestation(pod_name, uid)
+
+    actor = f"operator:{admin['id']}"
+    settled: list[int] = []
+    for token in tokens:
+        if await acknowledge_session_claim_quiesced(
+            dependencies.db,
+            thread_id=unit_id,
+            previous_lease_token=token,
+            leased_by=pod_name,
+            pod_uid=uid,
+            quiesced_by=actor,
+            receipt={
+                "evidence": "operator_attestation",
+                "kubernetes_authority": kubernetes_authority,
+                "reason": reason,
+            },
+        ):
+            settled.append(token)
+    if not settled:
+        raise HTTPException(
+            status_code=409,
+            detail="Claimant-loss debt changed concurrently; re-read and retry",
+        )
+    logger.warning(
+        "run_queue claimant attested gone: unit=%s pod=%s uid=%s tokens=%s "
+        "kubernetes=%s by=%s reason=%r",
+        unit_id,
+        pod_name,
+        uid,
+        settled,
+        kubernetes_authority,
+        actor,
+        reason,
+    )
+
+    async with dependencies.db.acquire() as conn:
+        after = _metadata_object(
+            await conn.fetchval(
+                "SELECT metadata FROM threads WHERE id = $1::uuid", unit_id
+            )
+        )
+    hold_released = isinstance(after, dict) and not (
+        {CLAIM_LOSS_LEDGER_KEY, CLAIM_LOSS_HOLD_KEY} & set(after)
+    )
+
+    retained = await agent_provisioner.read_stateless_executor_pod(
+        pod_name, expected_pod_uid=uid
+    )
+    finalizer_released = False
+    if _retained_by_executor_finalizer(retained):
+        finalizer_released = await _release_attested_executor(
+            retained, pod_name=pod_name, uid=uid, dependencies=dependencies
+        )
+    return {
+        "unit_id": unit_id,
+        "pod": pod_name,
+        "pod_uid": uid,
+        "settled_lease_tokens": settled,
+        "kubernetes_authority": kubernetes_authority,
+        "hold_released": hold_released,
+        "finalizer_released": finalizer_released,
+    }
+
+
+def _retained_by_executor_finalizer(pod: Any) -> bool:
+    from orchestrator.services.agent_provisioner import (
+        STATELESS_EXECUTOR_PROCESS_ZERO_FINALIZER,
+    )
+
+    metadata = getattr(pod, "metadata", None)
+    return (
+        pod is not None
+        and getattr(metadata, "deletion_timestamp", None) is not None
+        and STATELESS_EXECUTOR_PROCESS_ZERO_FINALIZER
+        in (getattr(metadata, "finalizers", None) or [])
+    )
+
+
+async def _release_attested_executor(
+    pod: Any, *, pod_name: str, uid: str, dependencies: RunQueueAdminDependencies
+) -> bool:
+    """Release a retained executor a human attested gone, if nothing names it.
+
+    The same one-snapshot lease/ledger check as the reaper's sweep: an
+    attestation for one unit never unprotects a UID another claim still owes.
+    """
+    from orchestrator.services.agent_provisioner import agent_provisioner
+    from orchestrator.services.run_queue_reaper import unreferenced_executor_uids
+
+    async with dependencies.db.acquire() as conn:
+        unreferenced = uid in await unreferenced_executor_uids(conn, {uid: pod_name})
+    if not unreferenced:
+        return False
+    # The human attestation is the process-zero proof here.
+    return await agent_provisioner.release_stateless_executor_finalizer_exact(
+        pod, require_process_zero=False
+    )
+
+
+# security_events is the admin-visible audit log (GET /api/admin/security-events);
+# an operator attestation that no claim-loss ledger can hold lands there. Same
+# columns as PostgresDB.record_security_event, written through ``acquire`` so the
+# receipt commits BEFORE the finalizer is released.
+_EXECUTOR_ATTESTATION_RECEIPT_SQL = """
+INSERT INTO security_events
+    (event_type, user_id, auth_method, real_is_admin, view_as,
+     resource_type, resource_id, method, path, detail)
+VALUES ('operator_attestation', $1, NULL, TRUE, FALSE,
+        'stateless_executor_pod', $2, 'POST', $3, $4)
+"""
+
+
+async def attest_executor_pod_gone(
+    pod: str,
+    *,
+    pod_uid: str,
+    reason: str,
+    admin: Any,
+    dependencies: RunQueueAdminDependencies,
+) -> dict[str, Any]:
+    """Release a retained executor no claim owes, on a human attestation.
+
+    For a Pod the reaper cannot release by itself because no evidence it
+    trusts will ever arrive — e.g. statuses frozen on a node that is neither
+    deleted nor tainted ``out-of-service`` (tainting it is the sanctioned
+    alternative), or a stuck debug container. Refused unless the exact UID is
+    deleting, past its termination grace, retained by the executor finalizer,
+    and unreferenced by any session lease or claim-loss ledger (that debt goes
+    through ``attest-claimant-gone`` instead). The receipt is written to the
+    security-event audit log before the release.
+    """
+    from orchestrator.services.agent_provisioner import agent_provisioner
+    from orchestrator.services.run_queue_reaper import unreferenced_executor_uids
+
+    pod_name = str(pod or "").strip()
+    uid = str(pod_uid or "").strip()
+    not_retained = HTTPException(
+        status_code=404, detail="No retained executor pod has that name and UID"
+    )
+    try:
+        UUID(uid)
+    except (ValueError, TypeError):
+        raise not_retained from None
+    if not pod_name:
+        raise not_retained
+    kubernetes_authority, _ = await _observe_for_attestation(pod_name, uid)
+    retained = await agent_provisioner.read_stateless_executor_pod(
+        pod_name, expected_pod_uid=uid
+    )
+    if not _retained_by_executor_finalizer(retained):
+        raise not_retained
+    async with dependencies.db.acquire() as conn:
+        if uid not in await unreferenced_executor_uids(conn, {uid: pod_name}):
+            raise HTTPException(
+                status_code=409,
+                detail="A session lease or claim-loss ledger still names this "
+                "pod; settle that unit with attest-claimant-gone",
+            )
+        await conn.execute(
+            _EXECUTOR_ATTESTATION_RECEIPT_SQL,
+            _admin_uuid(admin),
+            uid,
+            f"/api/admin/run-queue/executor-pods/{pod_name}/attest-gone",
+            json.dumps(
+                {
+                    "pod": pod_name,
+                    "pod_uid": uid,
+                    "reason": reason,
+                    "kubernetes_authority": kubernetes_authority,
+                },
+                sort_keys=True,
+            ),
+        )
+    released = await agent_provisioner.release_stateless_executor_finalizer_exact(
+        retained, require_process_zero=False
+    )
+    logger.warning(
+        "run_queue executor attested gone: pod=%s uid=%s kubernetes=%s "
+        "released=%s by=operator:%s reason=%r",
+        pod_name,
+        uid,
+        kubernetes_authority,
+        released,
+        admin["id"],
+        reason,
+    )
+    return {
+        "pod": pod_name,
+        "pod_uid": uid,
+        "kubernetes_authority": kubernetes_authority,
+        "finalizer_released": released,
+    }
+
+
+def _admin_uuid(admin: Any) -> UUID | None:
+    try:
+        return UUID(str(admin["id"]))
+    except (KeyError, TypeError, ValueError):
+        return None
 
 
 async def unpark_completion_command(

@@ -835,6 +835,27 @@ class TestSessionFolder:
             assert r.headers.get("Authorization", "").startswith("Bearer ")
 
     @pytest.mark.asyncio
+    async def test_an_exclusive_create_refuses_an_existing_folder(self):
+        be = OpenCloudBackend(_settings())
+        fake = FakeOpenCloud()
+        _install_fake(be, fake)
+        handle_webdav = fake._handle_webdav
+
+        def existing(request: httpx.Request) -> httpx.Response:
+            if request.method == "MKCOL":
+                return httpx.Response(405)
+            return handle_webdav(request)
+
+        fake._handle_webdav = existing
+
+        with pytest.raises(CloudBackendError) as exc_info:
+            await be.ensure_session_folder(session_id="abc123", exclusive=True)
+        assert exc_info.value.kind == CloudBackendErrorKind.ALREADY_EXISTS
+        # A plain create reuses it, as a session's folder always has.
+        handle = await be.ensure_session_folder(session_id="abc123")
+        assert handle.native_id == "sessions/abc123"
+
+    @pytest.mark.asyncio
     async def test_share_and_revoke_round_trip(self):
         be = OpenCloudBackend(_settings())
         fake = FakeOpenCloud()

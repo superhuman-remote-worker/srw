@@ -17,10 +17,11 @@ import logging
 import os
 import time
 from datetime import datetime, timezone
-from typing import Any, List, Optional
+from typing import Any, Iterable, List, Optional
 
 from langchain_core.tools import tool
 
+from agent.core.tool_output_redaction import workspace_secrets
 from agent.tools.shell.coding_tools import _truncate_output
 from agent.tools.shell.shell_manager import SUDO_FREEZE_SENTINEL
 from agent.tools.context import ToolContext
@@ -285,15 +286,38 @@ def _apply_tail(output: str, tail: int) -> str:
     )
 
 
-def create_shell_tools(context: ToolContext) -> List[Any]:
+def _resolved_shell_mode(requested_names: Optional[Iterable[str]]) -> Optional[str]:
+    """The mode the resolved name list already chose, or ``None``.
+
+    ``get_all_tool_names`` is the one resolution of ``shell.mode``: it aliases
+    ``run_command`` and ``shell_execute`` onto the mode's executor, so a
+    resolved list names exactly one of them. Re-deriving the mode here from a
+    second config read let the two disagree and bind neither. Anything else
+    (no executor, both, a caller that passes no names) leaves it to config.
+    """
+    if requested_names is None:
+        return None
+    names = set(requested_names)
+    if "shell_execute" in names and "run_command" not in names:
+        return "persistent"
+    if "run_command" in names and "shell_execute" not in names:
+        return "stateless"
+    return None
+
+
+def create_shell_tools(
+    context: ToolContext, requested_names: Optional[Iterable[str]] = None
+) -> List[Any]:
     """Create shell tools with injected context.
 
-    Returns different tool sets based on shell.mode config:
-    - "stateless" (default): [run_command, shell_read]
+    Returns different tool sets based on shell.mode:
+    - "stateless" (default): [run_command, cancel_command, shell_read]
     - "persistent": [shell_execute, shell_read]
 
     Args:
         context: ToolContext with shell_manager
+        requested_names: The resolved names ``load_tools`` is binding. When
+            they name exactly one executor, that decides the mode.
 
     Returns:
         List of LangChain tool functions
@@ -308,13 +332,15 @@ def create_shell_tools(context: ToolContext) -> List[Any]:
     max_output_chars = context.get_config("max_output_chars", DEFAULT_MAX_OUTPUT_CHARS)
     max_read_lines = context.get_config("shell_max_read_lines", DEFAULT_MAX_READ_LINES)
 
-    # Determine shell mode from config
-    shell_config = context.get_config("shell", {})
-    mode = (
-        shell_config.get("mode", "stateless")
-        if isinstance(shell_config, dict)
-        else "stateless"
-    )
+    # Determine shell mode: the resolved name list, else config
+    mode = _resolved_shell_mode(requested_names)
+    if mode is None:
+        shell_config = context.get_config("shell", {})
+        mode = (
+            shell_config.get("mode", "stateless")
+            if isinstance(shell_config, dict)
+            else "stateless"
+        )
 
     @tool
     def srw_cloud_status() -> str:
@@ -326,6 +352,16 @@ def create_shell_tools(context: ToolContext) -> List[Any]:
         """
         manager = _cloud_mount_manager(context)
         if manager is None:
+            # Folders the workspace's sidecars own (D7) report even when
+            # none of them mounted: that is when the agent needs the reason.
+            cloud_mount_cfg = context.get_config("cloud_mount", {})
+            candidate = (
+                cloud_mount_cfg.get("_manager")
+                if isinstance(cloud_mount_cfg, dict)
+                else None
+            )
+            if getattr(type(candidate), "delivery", None) == "sidecar":
+                return candidate.status()
             return "No active rclone cloud mount for this session."
         return manager.status()
 
@@ -433,13 +469,23 @@ def create_shell_tools(context: ToolContext) -> List[Any]:
             # shell_read, re-run with a higher timeout, or cancel_command it.
             if "--- still running ---" in output:
                 output = _apply_tail(output, tail)
-                output = _truncate_output(output, max_output_chars, "output")
+                output = _truncate_output(
+                    output,
+                    max_output_chars,
+                    "output",
+                    secrets=workspace_secrets(context),
+                )
                 return output + _CANCEL_HINT
 
             # Colliding: the shared run_command tab is busy with a previous
             # command, so this one never ran. cancel_command is the way out.
             if "previous command still running" in output:
-                output = _truncate_output(output, max_output_chars, "output")
+                output = _truncate_output(
+                    output,
+                    max_output_chars,
+                    "output",
+                    secrets=workspace_secrets(context),
+                )
                 return output + _CANCEL_HINT
 
             # Genuine interactive prompt: stateless run_command can't answer it,
@@ -455,7 +501,9 @@ def create_shell_tools(context: ToolContext) -> List[Any]:
                 )
 
             output = _apply_tail(output, tail)
-            output = _truncate_output(output, max_output_chars, "output")
+            output = _truncate_output(
+                output, max_output_chars, "output", secrets=workspace_secrets(context)
+            )
 
             warning = _scan_for_error_patterns(output)
             if warning:
@@ -571,7 +619,12 @@ def create_shell_tools(context: ToolContext) -> List[Any]:
                     return freeze_msg
                 time.sleep(0.5)
                 text, metadata = sm.read_with_offset(name, lines=tail)
-                text = _truncate_output(text, max_output_chars, "shell output")
+                text = _truncate_output(
+                    text,
+                    max_output_chars,
+                    "shell output",
+                    secrets=workspace_secrets(context),
+                )
                 return f"{tab_header}\n{text}"
 
             elif is_async:
@@ -606,7 +659,12 @@ def create_shell_tools(context: ToolContext) -> List[Any]:
                     return freeze_msg
                 time.sleep(0.5)
                 text, metadata = sm.read(name, since_cursor=True)
-                text = _truncate_output(text, max_output_chars, "shell output")
+                text = _truncate_output(
+                    text,
+                    max_output_chars,
+                    "shell output",
+                    secrets=workspace_secrets(context),
+                )
                 if guard_msg:
                     text = f"{guard_msg}\n\n{text}"
                 if delete_msg:
@@ -647,7 +705,12 @@ def create_shell_tools(context: ToolContext) -> List[Any]:
                 if freeze_msg:
                     return freeze_msg
                 output = _apply_tail(output, tail)
-                output = _truncate_output(output, max_output_chars, "output")
+                output = _truncate_output(
+                    output,
+                    max_output_chars,
+                    "output",
+                    secrets=workspace_secrets(context),
+                )
                 # Scan for application-level errors in output
                 warning = _scan_for_error_patterns(output)
                 if warning:
@@ -691,7 +754,12 @@ def create_shell_tools(context: ToolContext) -> List[Any]:
             text, metadata = sm.read_with_offset(
                 name, lines=capped_lines, offset=offset
             )
-            text = _truncate_output(text, max_output_chars, "shell output")
+            text = _truncate_output(
+                text,
+                max_output_chars,
+                "shell output",
+                secrets=workspace_secrets(context),
+            )
             info = f"({metadata['mode']}) {metadata['lines_returned']}/{metadata['total_lines']} lines"
             return f"{tab_header}\n{info}\n{text}"
         except (KeyError, ValueError) as e:

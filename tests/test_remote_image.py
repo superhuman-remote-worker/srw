@@ -11,6 +11,7 @@ from fastapi import HTTPException
 from PIL import Image
 
 from orchestrator.services import remote_image as subject
+from orchestrator.application import projects as projects_composition
 
 
 def _png(width: int = 2, height: int = 3) -> bytes:
@@ -275,21 +276,26 @@ async def test_fetch_rejects_oversized_declared_body_without_reading_it():
 
 @pytest.mark.asyncio
 async def test_endpoint_authenticates_before_fetch(fake_request):
-    from orchestrator.main import _media_dependencies
+    import orchestrator.main
     from orchestrator.routers.media import load_remote_image
     from orchestrator.schemas.media import RemoteImageRequest
 
     denied = HTTPException(status_code=401, detail="signed out")
     fetch = AsyncMock()
     with (
-        patch("orchestrator.main.require_approved_user", AsyncMock(side_effect=denied)),
+        patch(
+            "orchestrator.security.auth.require_approved_user",
+            AsyncMock(side_effect=denied),
+        ),
         patch("orchestrator.routers.media.fetch_remote_image", fetch),
     ):
         with pytest.raises(HTTPException) as exc:
             await load_remote_image(
                 fake_request,
                 RemoteImageRequest(url="https://images.example/a.png"),
-                dependencies=_media_dependencies(),
+                dependencies=projects_composition.media_dependencies(
+                    orchestrator.main.app.state.resources
+                ),
             )
     assert exc.value.status_code == 401
     fetch.assert_not_awaited()
@@ -297,7 +303,7 @@ async def test_endpoint_authenticates_before_fetch(fake_request):
 
 @pytest.mark.asyncio
 async def test_endpoint_returns_no_store_nosniff_image(fake_request, user_a):
-    from orchestrator.main import _media_dependencies
+    import orchestrator.main
     from orchestrator.routers.media import load_remote_image
     from orchestrator.schemas.media import RemoteImageRequest
 
@@ -309,7 +315,8 @@ async def test_endpoint_returns_no_store_nosniff_image(fake_request, user_a):
     )
     with (
         patch(
-            "orchestrator.main.require_approved_user", AsyncMock(return_value=user_a)
+            "orchestrator.security.auth.require_approved_user",
+            AsyncMock(return_value=user_a),
         ),
         patch(
             "orchestrator.routers.media.fetch_remote_image",
@@ -319,7 +326,9 @@ async def test_endpoint_returns_no_store_nosniff_image(fake_request, user_a):
         response = await load_remote_image(
             fake_request,
             RemoteImageRequest(url="https://images.example/a.png"),
-            dependencies=_media_dependencies(),
+            dependencies=projects_composition.media_dependencies(
+                orchestrator.main.app.state.resources
+            ),
         )
 
     assert response.media_type == "image/png"

@@ -23,6 +23,10 @@ from dataclasses import dataclass
 from typing import Any, AsyncIterator, Mapping
 from uuid import UUID, uuid5
 
+from orchestrator.services.workspace_idle_completion_events import (
+    ACCEPTED_IDLE_WAIT_SOURCE_KEY,
+    capture_completion_wait_on_conn,
+)
 from shared.run_queue import complete_unit
 
 # ``v1`` is the already-shipped status-first workflow.  A reordered command
@@ -148,6 +152,7 @@ def canonical_completion_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
             "agent_id",
             "client_report_id",
             ACCEPTED_COMPLETION_DECISION_KEY,
+            ACCEPTED_IDLE_WAIT_SOURCE_KEY,
         }
     }
 
@@ -309,11 +314,28 @@ async def accept_completion_command(
     agent_id: str | None,
     client_report_id: str | None,
     requested_by: str,
+    pinned_delivery_id: UUID | None = None,
+    pinned_projection_digest: str | None = None,
+    pinned_delivery_proof: str | None = None,
+    pinned_process_generation: str | None = None,
+    pinned_pod_uid: str | None = None,
     code_version: str | None = None,
     status_reorder_enabled: bool = False,
+    expected_job_status: str | None = None,
+    origin: str = "agent",
 ) -> CompletionAcceptResult:
-    """Accept one immutable completion report in a short fenced transaction."""
+    """Accept one immutable completion report in a short fenced transaction.
 
+    ``expected_job_status`` additionally requires the job's status under the
+    jobs-row lock: a server-side report for a claim (a refused job start)
+    loses to any control that moved the row first, before anything is written.
+    ``origin`` records who reported: the agent, or ``dispatch`` for such a
+    server-side report. Both carry exactly one lane fence; the fenceless
+    ``operator`` origin is not admitted here.
+    """
+
+    if origin == "operator":
+        raise ValueError("operator-origin commands carry no fence to admit")
     job_uuid = UUID(str(job_id))
     canonical_payload = canonical_completion_payload(payload)
     digest = completion_payload_digest(str(job_uuid), canonical_payload)
@@ -346,6 +368,7 @@ async def accept_completion_command(
                 """
                 SELECT id, status::text AS status, execution_lane,
                        assigned_agent_id, completion_seq_hwm, context,
+                       parent_job_id, config_override, resolved_config,
                        (SELECT execution.harness_adapter FROM srw_execution_specs execution
                         WHERE execution.work_kind='Job' AND execution.work_id=jobs.id)
                        AS execution_harness_adapter,
@@ -410,6 +433,22 @@ async def accept_completion_command(
                 job.get("context"), now_epoch=job.get("db_now_epoch")
             ):
                 raise CompletionControlInProgress
+            if expected_job_status is not None and str(job["status"]) != str(
+                expected_job_status
+            ):
+                raise CompletionFenceRejected(
+                    "job status changed before the report was admitted"
+                )
+
+            if job["execution_lane"] == "pinned" and await conn.fetchval(
+                "SELECT EXISTS(SELECT 1 FROM vm_idle_operations "
+                "WHERE owner_kind='job' AND owner_id=$1 "
+                "AND closed_at IS NULL)",
+                job_uuid,
+            ):
+                raise CompletionFenceRejected(
+                    "pinned idle operation owns this Job's report authority"
+                )
 
             lane = str(job["execution_lane"] or "pinned")
             accepted_token: int | None = None
@@ -457,6 +496,24 @@ async def accept_completion_command(
                         "completion report does not match the assigned agent"
                     )
 
+            pinned_delivery = None
+            if accepted_agent is not None and pinned_delivery_id is not None:
+                from orchestrator.services.pinned_job_delivery import (
+                    accept_pinned_report_on_conn,
+                )
+
+                pinned_delivery = await accept_pinned_report_on_conn(
+                    conn,
+                    job_id=job_uuid,
+                    agent_id=accepted_agent,
+                    delivery_id=pinned_delivery_id,
+                    projection_digest=pinned_projection_digest,
+                    process_generation=pinned_process_generation,
+                    pod_uid=pinned_pod_uid,
+                    delivery_proof=pinned_delivery_proof,
+                    source_kind="completion",
+                )
+
             # An authorized S36 callback may resume after every finalizer clock
             # has expired.  The jobs-row lock shared with its authorization is
             # the linearization point: exact-key replays above remain
@@ -497,6 +554,22 @@ async def accept_completion_command(
                     stored_payload[ACCEPTED_COMPLETION_DECISION_KEY] = {
                         "tool_call_id": tool_call_id,
                     }
+            idle_source = await capture_completion_wait_on_conn(
+                conn,
+                job=job,
+                report=canonical_payload,
+                lease_token=accepted_token,
+                pinned_delivery=pinned_delivery,
+                # Preserve legacy marker behavior above, but never invent new
+                # idle evidence by stringifying malformed historical JSON.
+                decision_tool_call_id=(
+                    completion_decision.get("tool_call_id")
+                    if isinstance(completion_decision, Mapping)
+                    else None
+                ),
+            )
+            if idle_source is not None:
+                stored_payload[ACCEPTED_IDLE_WAIT_SOURCE_KEY] = idle_source
             payload_json = _canonical_json(stored_payload)
 
             # FIRST database write of the handler.  Cursor and queue writes
@@ -511,7 +584,7 @@ async def accept_completion_command(
                 ) VALUES (
                     $1::uuid, $2::bigint, $3::uuid, $4::jsonb,
                     $5::text, $6::bigint, $7::uuid,
-                    $8::text, 'agent', $9::text,
+                    $8::text, $14::text, $9::text,
                     now() + make_interval(secs => $10::float8), $11::text,
                     now() + make_interval(secs => $12::float8), $13::boolean
                 )
@@ -533,7 +606,23 @@ async def accept_completion_command(
                 selected_code_version,
                 COMPLETION_INLINE_GRACE_SECONDS,
                 bool(status_reorder_enabled),
+                str(origin),
             )
+            if idle_source is not None and pinned_delivery is not None:
+                from orchestrator.services.pinned_job_delivery import (
+                    record_pinned_wait_receipt_on_conn,
+                )
+
+                if (
+                    await record_pinned_wait_receipt_on_conn(
+                        conn,
+                        delivery=pinned_delivery,
+                        source_kind="completion",
+                        source_id=command["id"],
+                    )
+                    is None
+                ):
+                    raise CompletionFenceRejected("pinned completion source changed")
             await conn.execute(
                 """
                 UPDATE jobs

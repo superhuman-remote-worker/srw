@@ -18,10 +18,10 @@ WHY: Your context window is finite and you may lose information during compactio
 {% if has_tool("kb_write") -%}
 - Knowledge base — Persistent notes stored via kb_write/kb_search/kb_update. Injected every LLM call as transient messages. Your ground truth for facts, decisions, and discovered information. Write important state EARLY and OFTEN using kb_write, because conversation context can be compacted at any time.
 {% endif -%}
-- Memory system — Automatically extracted insights recalled via hybrid search. Injected every LLM call as transient messages. Persists across context compaction automatically.
+- Memory system — Automatically extracted insights recalled via hybrid search. Relevant memories arrive as context{% if has_tool("memory_search") %}; call memory_search to look up anything else from earlier work{% endif %}. Persists across context compaction automatically.
 - README.md — What this workspace is, which connectors are attached and where they live (e.g. repositories under repos/<name>/), and what input materials were provided. Read it first.
 - plan.md — Execution plan. Read when you need strategic context; it is NOT in your prompt.
-- todos.yaml — Current phase tasks, injected every call. Work them in order, one at a time.
+- todos.yaml — Current phase tasks. The list arrives at each phase start and with every todo tool result; `todo_list` shows it on demand. Work them in order, one at a time.
 - archive/ — Phase retrospectives and archived todos.
 - tools/ — Per-tool documentation. Read tools/<tool_name>.md before first use of any tool.
 
@@ -58,21 +58,6 @@ Rule: Use notes/ to persist important facts and decisions. If you don't write it
 14. Before calling job_complete, cross-check every deliverable against the original requirements. Your confidence must reflect actual verified outcomes. If any requirement is unmet or unverified, confidence must be below 0.5.
 15. Complete todos one at a time. Each todo_complete call must reflect verified work for that specific todo. Never batch-complete multiple todos in a single call to skip past blockers.
 </constraints>
-
-{% if cli_datasources and has_shell -%}
-<datasource_access>
-This job has read-write datasource access via named connections. Use `run_command` — credentials are pre-configured, do NOT pass connection flags. Check README.md for the exact connection names.
-{% if has_cli_datasource("postgresql") -%}
-- PostgreSQL: `PGSERVICE=<name> psql -c "your SQL here"` (service names in README.md)
-{% endif -%}
-{% if has_cli_datasource("neo4j") -%}
-- Neo4j: `cypher-shell --address "$NEO4J_<NAME>_URI" --username "$NEO4J_<NAME>_USERNAME" --password "$NEO4J_<NAME>_PASSWORD" --format plain "your Cypher here"`
-{% endif -%}
-{% if has_cli_datasource("mongodb") -%}
-- MongoDB: `mongosh "$MONGO_<NAME>_URI" --quiet --eval "your query here"`
-{% endif -%}
-</datasource_access>
-{% endif -%}
 
 <phase_model>
 You work in alternating phases. A strategic phase reviews progress and plans; it ends by staging the next tactical phase's todos with `next_phase_todos` or, once every deliverable is verified, with `job_complete`. A tactical phase executes the staged todos one at a time (`todo_complete` after each) and may end early with `request_replan` when the plan itself is wrong. Each phase opens with a `[phase: strategic|tactical]` message carrying that phase's instructions; they stay in force until the next [PHASE_TRANSITION] notice, and the todo list header names the current phase. Some tools belong to one phase only and say so in their description; calling one outside its phase returns an error for that call without affecting the other calls in the batch.

@@ -13,16 +13,20 @@ Persistent mode (opt-in via shell.mode: persistent):
 Available in both strategic and tactical phases. Requires tmux + ShellManager.
 """
 
-from typing import Any, Dict, List
+from typing import Any, Dict, Iterable, List, Optional
 
 from agent.tools.context import ToolContext
 
 
-def create_shell_tools(context: ToolContext) -> List[Any]:
+def create_shell_tools(
+    context: ToolContext, requested_names: Optional[Iterable[str]] = None
+) -> List[Any]:
     """Create all shell tools with injected context.
 
     Args:
         context: ToolContext with workspace_manager
+        requested_names: The resolved names being bound (they pick the
+            shell mode; see ``shell_tools.create_shell_tools``)
 
     Returns:
         List of LangChain tool functions
@@ -42,7 +46,7 @@ def create_shell_tools(context: ToolContext) -> List[Any]:
             create_shell_tools as _create_shell_tools,
         )
 
-        tools.extend(_create_shell_tools(context))
+        tools.extend(_create_shell_tools(context, requested_names))
 
     return tools
 

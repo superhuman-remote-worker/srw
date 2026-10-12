@@ -13,7 +13,7 @@ The operation is split along the seams it already had, not into helpers:
   ``delegation``/``workspace``/``tools``/``officer`` block is carried (or named
   as dropped) is testable on its own.
 * :func:`select_thread_datasources` — the three-way selection origin
-  (``explicit`` / ``default`` / ``omitted_compat``) plus its provenance stamp.
+  (``explicit`` / ``default`` / ``native_default``) plus its provenance stamp.
 * :func:`resolve_thread_creation_plan` — every admission decision and every
   refusal, ending in the exact ``create_thread`` INSERT arguments. Nothing here
   has a side effect outside the request.
@@ -60,7 +60,6 @@ from __future__ import annotations
 import asyncio
 import copy
 import logging
-from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, Protocol
 from uuid import uuid4
@@ -71,10 +70,31 @@ from orchestrator.database.postgres import (
     DatasourceMaterializationAuthorizationError,
     DatasourcePolicyConflictError,
 )
+from orchestrator.schemas.inline_expert import InlineExpertSelection
 from orchestrator.schemas.thread_admission import ThreadCreateRequest
 from orchestrator.security.access import redact_config_override
+from orchestrator.services.cloud_connector_mounts import (
+    CLOUD_MOUNT_RULE_KEY,
+    CLOUD_OUTBOX_KEY,
+    CONNECTOR_RULE,
+)
 from orchestrator.services.config_overrides import validated_config_name
+from orchestrator.services.connector_drivers.cloud_outbox import CloudOutboxDriver
+from orchestrator.services.connector_access import (
+    PROTECTED,
+    ConnectorAccessError,
+    SelectionAccess,
+    resolve_selection_access,
+    strict_selection_rows,
+)
+from orchestrator.services.connector_refs import (
+    connector_access_requests,
+    refuse_connector_selector_conflict,
+    resolve_execution_connectors,
+)
 from orchestrator.services.config_resolver import resolve_config
+from orchestrator.services.in_pod_mount import InPodPlaneSettings
+from orchestrator.services.model_availability import render_fallback_notice
 from orchestrator.services.default_experts import (
     DefaultExpertUnavailable,
     ExpertSelectionError,
@@ -104,12 +124,15 @@ from orchestrator.services.session_create_overrides import (
     validated_reasoning_level,
     validated_session_officer_override,
 )
+from orchestrator.services.session_cloud_preparation import (
+    create_session_outbox,
+    outbox_selected,
+)
 from orchestrator.services.session_runtime_admission import thread_runtime_authority
 from orchestrator.services.session_tool_policy import validated_tool_overrides
 from orchestrator.services.session_workspace_policy import (
     validated_session_workspace_override,
 )
-from orchestrator.services.stateless_workspace_gate import thread_metadata_object
 from orchestrator.services.thread_project_authorization import (
     ThreadProjectAuthorizationDependencies,
     thread_creation_project_ids,
@@ -118,7 +141,9 @@ from orchestrator.services.workspace_binding import (
     ensure_virtual_thread_workspace_binding,
 )
 from orchestrator.services.workspace_tier_policy import backend_from_override
+from shared.connectors.contract import AccessContext
 from shared.backend_kinds import LITE_BACKENDS
+from shared.expert_reference import ExpertReferenceConflict, resolve_expert_selection
 from shared.runtime.core.loader import canonical_config_name
 
 logger = logging.getLogger(__name__)
@@ -143,15 +168,9 @@ class ThreadAdmissionStore(Protocol):
         self, project_id: str, thread_id: str, **kwargs: Any
     ) -> Any: ...
 
-    async def replace_thread_mounts(
-        self, thread_id: str, rows: list[dict[str, Any]]
-    ) -> Any: ...
-
-    async def list_thread_mounts(self, thread_id: str) -> list[dict[str, Any]]: ...
-
-    async def list_thread_mounts_bulk(
-        self, thread_ids: list[str]
-    ) -> dict[str, list[dict[str, Any]]]: ...
+    async def list_protected_selection_rows(
+        self, thread_id: str
+    ) -> list[dict[str, Any]]: ...
 
     async def list_threads(self, **kwargs: Any) -> list[dict[str, Any]]: ...
 
@@ -192,8 +211,7 @@ class ThreadAdmissionDependencies:
     *B05 policy reached through main's dependency objects* — the service needs
     a dependency argument this module has no business building:
     ``resolve_session_account_defaults``, ``prefetch_roster_refs``,
-    ``resolve_thread_execution_lane``, ``build_thread_mount_rows``,
-    ``should_skip_session_folder``, ``enforce_session_create_grants``,
+    ``resolve_thread_execution_lane``, ``enforce_session_create_grants``,
     ``check_vm_permission``, ``resolve_cloud_session_url``.
 
     *Sibling admission policy*, injected rather than called directly so a test
@@ -230,8 +248,6 @@ class ThreadAdmissionDependencies:
     resolve_session_account_defaults: Callable[..., Awaitable[dict[str, Any]]]
     prefetch_roster_refs: Callable[..., Awaitable[Any]]
     resolve_thread_execution_lane: Callable[..., str]
-    build_thread_mount_rows: Callable[..., Awaitable[list[dict[str, Any]]]]
-    should_skip_session_folder: Callable[[list[dict[str, Any]]], bool]
     enforce_session_create_grants: Callable[..., Awaitable[Any]]
     check_vm_permission: Callable[..., Awaitable[Any]]
     resolve_cloud_session_url: Callable[..., str | None]
@@ -253,6 +269,12 @@ class ThreadAdmissionDependencies:
     send_session_attach: Callable[..., Awaitable[bool]]
     provision_or_assign: Callable[..., Awaitable[None]]
     redact_thread_metadata: Callable[[dict[str, Any]], dict[str, Any]]
+
+    # *Expert selection*: whether a bundled `expert` slug is in the catalogue,
+    # and the installed SRW harness image an inline expert's explicit image
+    # must equal (the image the execution snapshot records).
+    bundled_expert_exists: Callable[[str], bool]
+    srw_image: Callable[[], str]
 
     def project_dependencies(self) -> ThreadProjectAuthorizationDependencies:
         """Dependencies for the sibling project-policy module."""
@@ -281,8 +303,17 @@ class ThreadCreationPlan:
     use_k8s: bool
     create_kwargs: dict[str, Any]
     ignored_override_keys: list[str] = field(default_factory=list)
+    # Account model preferences that could no longer run and were replaced by
+    # the system default (unavailable_model_handling.md D2), rendered for the
+    # owner. Additive in the create response.
+    model_notices: list[str] = field(default_factory=list)
     officer_requested: bool = False
     explicit_officer_commission: bool = False
+    # Whether one attached cloud folder is bound at ``protected`` (the
+    # session's protected marker is derived from it), and every strict
+    # connector's resolved level (``metadata.datasource_access``).
+    protected: bool = False
+    datasource_access: dict[str, str | None] = field(default_factory=dict)
 
 
 def build_session_config_override(
@@ -409,32 +440,78 @@ async def select_thread_datasources(
 ) -> tuple[list[str], dict[str, int], dict[str, Any]]:
     """Materialize one complete selection with the thread row.
 
-    Cockpit sends a reviewed array (including ``[]``); omission is temporarily
-    gated for older API clients that encoded an opt-out by leaving the field
-    out. Returns ``(ids, policy_revisions, provenance)``.
+    An explicit list (the cockpit's reviewed array, ``execution`` refs) is
+    exactly what attaches: ``[]`` attaches nothing, the project's own
+    connectors included. Omission attaches the session's own connectors (its
+    projects' knowledge base and cloud folder, ``native_default``), plus every
+    other default when the caller asks (``use_datasource_defaults``) or the
+    deployment attaches defaults on omission. Returns
+    ``(ids, policy_revisions, provenance)``.
     """
-    if "datasource_ids" in request_body.model_fields_set:
+    ids, revisions, provenance, _access = await _select_thread_datasources(
+        request_body,
+        user,
+        thread_backend=thread_backend,
+        effective_project_ids=effective_project_ids,
+        dependencies=dependencies,
+    )
+    return ids, revisions, provenance
+
+
+async def _select_thread_datasources(
+    request_body: ThreadCreateRequest,
+    user: dict[str, Any],
+    *,
+    thread_backend: str | None,
+    effective_project_ids: list[str],
+    dependencies: ThreadAdmissionDependencies,
+) -> tuple[list[str], dict[str, int], dict[str, Any], dict[str, str]]:
+    """:func:`select_thread_datasources`, and the level each
+    ``execution.connectors`` entry asks for, by connector id."""
+    requested_ids = request_body.datasource_ids or []
+    execution_access: dict[str, str] = {}
+    if request_body.execution is not None:
+        # Connector refs are an explicit selection of the ids they name: the
+        # same branch, the same authorization, the same snapshot.
+        requested_ids = await resolve_execution_connectors(
+            dependencies.store,
+            request_body.execution,
+            owner_id=str(user["id"]),
+            project_id=(
+                effective_project_ids[0] if len(effective_project_ids) == 1 else None
+            ),
+            accepts_access=True,
+        )
+        execution_access = connector_access_requests(
+            request_body.execution, requested_ids
+        )
+    if (
+        "datasource_ids" in request_body.model_fields_set
+        or request_body.execution is not None
+    ):
         thread_selection_origin = "explicit"
         (
             selected_thread_datasource_ids,
             selected_thread_datasource_revisions,
         ) = await dependencies.authorize_thread_datasource_selection(
             user,
-            request_body.datasource_ids or [],
+            requested_ids,
             workspace_backend=thread_backend,
             target_project_ids=effective_project_ids,
             effective_work_owner_id=str(user["id"]),
+            execution_kind="session",
         )
-    elif (
-        request_body.use_datasource_defaults
-        or dependencies.datasource_defaults_on_omission()
-    ):
+    else:
         from orchestrator.services.datasource_policy import (
             DatasourceUnavailableError,
             default_datasource_selection,
         )
 
-        thread_selection_origin = "default"
+        every_default = bool(
+            request_body.use_datasource_defaults
+            or dependencies.datasource_defaults_on_omission()
+        )
+        thread_selection_origin = "default" if every_default else "native_default"
         try:
             (
                 selected_thread_datasource_ids,
@@ -444,16 +521,14 @@ async def select_thread_datasources(
                 str(user["id"]),
                 effective_project_ids,
                 thread_backend,
+                execution_kind="session",
+                native_only=not every_default,
             )
         except DatasourceUnavailableError as exc:
             raise HTTPException(
                 status_code=403,
                 detail="One or more selected connectors are unavailable",
             ) from exc
-    else:
-        thread_selection_origin = "omitted_compat"
-        selected_thread_datasource_ids = []
-        selected_thread_datasource_revisions = {}
 
     thread_selection_provenance = await datasource_selection_provenance(
         datasource_ids=selected_thread_datasource_ids,
@@ -468,7 +543,189 @@ async def select_thread_datasources(
         selected_thread_datasource_ids,
         selected_thread_datasource_revisions,
         thread_selection_provenance,
+        execution_access,
     )
+
+
+async def resolve_session_access(
+    request_body: ThreadCreateRequest,
+    user: dict[str, Any],
+    *,
+    selected_ids: list[str],
+    execution_access: dict[str, str],
+    effective_project_ids: list[str],
+    primary_project_id: str | None,
+    effective_backend: str | None,
+    officer: bool,
+    dependencies: ThreadAdmissionDependencies,
+) -> tuple[SelectionAccess, list[dict[str, Any]]]:
+    """The level of every attached connector with access levels (main cloud
+    slice 5), from ``datasource_access``, ``execution.connectors.*.access``
+    and the deprecated ``protected_cloud`` alias, or the request's 422; and
+    those connectors' rows (``strict_selection_rows``).
+
+    The alias asks for the session project's own cloud folder at
+    ``protected``; it is refused when that folder is not selected
+    (``protected_cloud_requires_folder``) or ``datasource_access`` gives it
+    another level (``protected_cloud_conflict``), never ignored. A
+    protected level needs the Container tier
+    (``protected_cloud_unsupported_workspace``) and an ordinary session
+    (``protected_cloud_unsupported_session_class``); then every level is
+    resolved by the one rule (``connector_access.resolve_selection_access``).
+    """
+    from shared.connectors.platform import project_cloud_key
+
+    requested: dict[str, str] = dict(request_body.datasource_access or {})
+    for datasource_id, level in execution_access.items():
+        if requested.get(datasource_id, level) != level:
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "code": "connector_access_conflict",
+                    "message": (
+                        "datasource_access and execution.connectors ask for "
+                        "different levels of one connector"
+                    ),
+                    "datasource_id": datasource_id,
+                },
+            )
+        requested[datasource_id] = level
+    rows = await strict_selection_rows(
+        dependencies.store, selected_ids, effective_project_ids
+    )
+    own_key = project_cloud_key(primary_project_id) if primary_project_id else None
+    own_folder = next(
+        (
+            str(row["id"])
+            for row in rows
+            if own_key is not None and row.get("managed_key") == own_key
+        ),
+        None,
+    )
+    if request_body.protected_cloud:
+        if own_folder is None or own_folder not in selected_ids:
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "code": "protected_cloud_requires_folder",
+                    "message": (
+                        "protected_cloud protects the session project's own "
+                        "cloud folder, which this session does not attach"
+                    ),
+                },
+            )
+        if requested.get(own_folder, PROTECTED) != PROTECTED:
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "code": "protected_cloud_conflict",
+                    "message": (
+                        "protected_cloud asks for the project's cloud folder at "
+                        f"protected, datasource_access for {requested[own_folder]!r}"
+                    ),
+                    "datasource_id": own_folder,
+                },
+            )
+        requested[own_folder] = PROTECTED
+    if PROTECTED in requested.values():
+        if effective_backend != "sandbox":
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "code": "protected_cloud_unsupported_workspace",
+                    "message": (
+                        "Protected cloud sessions require the Container workspace tier."
+                    ),
+                },
+            )
+        if officer:
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "code": "protected_cloud_unsupported_session_class",
+                    "message": (
+                        "Protected cloud sessions are not supported for the "
+                        "background Officer runtime."
+                    ),
+                },
+            )
+    ctx = AccessContext(
+        workspace_backend=effective_backend,
+        officer=officer,
+        protected_mode_enabled=dependencies.is_protected_cloud_mode_enabled(),
+        execution="session",
+    )
+    try:
+        resolved = await resolve_selection_access(
+            dependencies.store,
+            owner_id=str(user["id"]),
+            datasource_ids=selected_ids,
+            project_ids=effective_project_ids,
+            requested=requested,
+            ctx=ctx,
+            rows=rows,
+        )
+    except ConnectorAccessError as exc:
+        raise HTTPException(status_code=422, detail=exc.detail) from exc
+    return resolved, rows
+
+
+async def frozen_protected_source(
+    connector_id: str,
+    rows: list[dict[str, Any]],
+    *,
+    dependencies: ThreadAdmissionDependencies,
+) -> dict[str, Any]:
+    """The protected folder a new session records (``thread_protected_sources``),
+    from the cloud_folder connector bound at protected, or a 422.
+
+    Built from the connector's config, never looked up again: the project,
+    its installation and the folder handle verbatim, and
+    ``projects/<slug>`` from the project's name now, so a later rename or
+    re-point never changes what a staged review applies to. A folder the
+    protected reader cannot be made for (no project, a handle that is not a
+    Nextcloud Group Folder's) is refused here, not at engage.
+    """
+    from orchestrator.services.cloud_staging.source_identity import (
+        ProtectedMountSourceIdentity,
+    )
+    from orchestrator.services.thread_mount_rows import slugify_mount_name
+
+    row = next((row for row in rows if str(row.get("id")) == connector_id), None)
+    config = (row or {}).get("config") or {}
+    project = (
+        await dependencies.store.get_project(str(config["project_id"]))
+        if config.get("project_id")
+        else None
+    )
+    source = {
+        "id": str(uuid4()),
+        "datasource_id": connector_id,
+        "mount_kind": "project",
+        "source_kind": "project_folder",
+        "source_ref": str(config.get("project_id") or ""),
+        "target_path": f"projects/{slugify_mount_name(str((project or {}).get('name') or ''))}",
+        "backend_id": config.get("backend_id"),
+        "backend_instance_id": config.get("backend_instance_id"),
+        "cloud_handle": config.get("folder_handle"),
+    }
+    if (
+        config.get("folder_kind") != "project"
+        or not project
+        or ProtectedMountSourceIdentity.from_mount_row(source) is None
+    ):
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "protected_cloud_source_invalid",
+                "message": (
+                    "This cloud folder cannot be protected: it is not a "
+                    "project's Nextcloud Group Folder"
+                ),
+                "datasource_id": connector_id,
+            },
+        )
+    return source
 
 
 async def resolve_thread_creation_plan(
@@ -481,18 +738,23 @@ async def resolve_thread_creation_plan(
 
     Raises the create path's refusals in their original order: project scope,
     expert selection, override validity, Officer release/post authority,
-    conference single-writer, protected-cloud compatibility, connector policy,
-    VM availability and capability grants.
+    conference single-writer, connector policy, the connectors' access
+    levels with protected-cloud compatibility (protected is a connector's
+    level, so it is known only once the selection is), VM availability and
+    capability grants.
     """
     # Project scope is needed for both selection precedence and grant
-    # resolution, so authorize it before choosing the expert.
+    # resolution, so authorize it before choosing the expert. A new Session
+    # has one project or none: thread_creation_project_ids refuses a second
+    # one with 422 before any lookup.
+    refuse_connector_selector_conflict(request_body)
     requested_project_ids = thread_creation_project_ids(request_body, user)
     effective_project_ids = await dependencies.authorize_thread_project_ids(
         user, requested_project_ids
     )
-    # A project default/config override is safe only with one unambiguous
-    # primary project. The legacy project_id field explicitly identifies
-    # that primary; otherwise a multi-project session skips this layer.
+    # The Session's one project, if any, is its primary: threads.project_id
+    # and the Project layer of the defaults chain (experts, workspace,
+    # config). project_id and project_ids name the same project here.
     primary_project_id = (
         str(request_body.project_id)
         if request_body.project_id
@@ -504,18 +766,71 @@ async def resolve_thread_creation_plan(
     # and every later attach. Fetch them only after scope authorization so
     # an invalid project request fails before any unrelated account work.
     all_user_settings = await dependencies.store.get_user_settings(str(user["id"]))
+    account_notices: list[dict[str, Any]] = []
     account_defaults = await dependencies.resolve_session_account_defaults(
-        str(user["id"]), all_user_settings or {}
+        str(user["id"]), all_user_settings or {}, notices=account_notices
     )
+    model_notices = list(
+        dict.fromkeys(render_fallback_notice(notice) for notice in account_notices)
+    )
+
+    # `expert` supersedes the deprecated aliases. A string goes through the
+    # job funnel's resolver so every "two experts in one call" refusal reads
+    # the same; an inline Expert is a complete definition that is never
+    # combined with, or layered over, a catalogue selection.
+    inline_expert = (
+        request_body.expert.inline
+        if isinstance(request_body.expert, InlineExpertSelection)
+        else None
+    )
+    requested_config_name = request_body.config_name
+    requested_expert_id = request_body.expert_id
+    if request_body.expert is not None:
+        try:
+            expert_choice = resolve_expert_selection(
+                expert=None if inline_expert is not None else request_body.expert,
+                config_name=request_body.config_name,
+                expert_id=request_body.expert_id,
+                role="session",
+            )
+        except ExpertReferenceConflict as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        if inline_expert is not None and expert_choice.kind != "default":
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "An inline expert cannot be combined with config_name or "
+                    "expert_id; select one expert source."
+                ),
+            )
+        if (
+            inline_expert is None
+            and expert_choice.kind == "bundled"
+            and not dependencies.bundled_expert_exists(expert_choice.config_name)
+        ):
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Unknown expert '{expert_choice.config_name}'. Use "
+                    "list_experts (GET /api/experts) to see the selectable "
+                    "experts; pass a bundled expert id or a DB expert UUID."
+                ),
+            )
+        requested_config_name = (
+            expert_choice.config_name
+            if expert_choice.kind == "bundled"
+            else "session_base"
+        )
+        requested_expert_id = expert_choice.expert_id
 
     # Write boundary: threads.config_name is read back by /resume, by the
     # Officer recycler and by the magic-link wake, all of which provision
     # from a fire-and-forget task with no request left to answer. Refuse a
     # value none of them could ever boot, here, before the INSERT.
     config_name = canonical_config_name(
-        validated_config_name(request_body.config_name) or "session_base"
+        validated_config_name(requested_config_name) or "session_base"
     )
-    if request_body.expert_id and config_name != "session_base":
+    if requested_expert_id and config_name != "session_base":
         raise HTTPException(
             status_code=400,
             detail=(
@@ -523,22 +838,31 @@ async def resolve_thread_creation_plan(
                 "config_name; select one expert source"
             ),
         )
-    selected_expert_id = request_body.expert_id
+    selected_expert_id = requested_expert_id
     selected_expert_row: dict[str, Any] | None = None
     project_expert_override: dict[str, Any] | None = None
     selection = None
+    if inline_expert is not None:
+        from orchestrator.services.inline_expert import admit_inline_expert
+
+        # Validated before the create-time policy resolve below, so that view
+        # and the INSERT's snapshot read the same gated definition.
+        selected_expert_row = admit_inline_expert(
+            inline_expert, role="session", trusted_image=dependencies.srw_image()
+        )
     try:
         if (
-            dependencies.is_experts_db_enabled()
+            inline_expert is None
+            and dependencies.is_experts_db_enabled()
             and await dependencies.user_experts_enabled()
-            and (request_body.expert_id or config_name == "session_base")
+            and (requested_expert_id or config_name == "session_base")
         ):
             selection = await resolve_root_expert(
                 dependencies.store,
                 expert_type="session",
                 user_id=str(user["id"]),
                 project_id=primary_project_id,
-                explicit_expert_id=request_body.expert_id,
+                explicit_expert_id=requested_expert_id,
                 is_admin=bool(user.get("is_admin")),
             )
             selected_expert_row = selection.expert
@@ -627,16 +951,6 @@ async def resolve_thread_creation_plan(
     effective_backend = backend_from_override(effective_create_config)
     if effective_backend:
         config_override.setdefault("workspace", {})["backend"] = effective_backend
-    if request_body.protected_cloud and effective_backend != "sandbox":
-        raise HTTPException(
-            status_code=422,
-            detail={
-                "code": "protected_cloud_unsupported_workspace",
-                "message": (
-                    "Protected cloud sessions require the Container workspace tier."
-                ),
-            },
-        )
 
     # Officer/conference selects pinned-only lifecycle machinery. Freeze
     # the fully resolved booleans into the highest-priority request layer
@@ -647,16 +961,15 @@ async def resolve_thread_creation_plan(
         effective_create_config
     )
     config_override.setdefault("officer", {}).update(materialized_session_class)
-    if request_body.protected_cloud and materialized_session_class["enabled"]:
+    # Agent attach requires one project for every enabled background Officer,
+    # including an Officer selected by an account or Expert default. Check the
+    # canonical authorized set; with a second project already refused above,
+    # this catches the projectless Officer.
+    _officer_requested = materialized_session_class["enabled"]
+    if _officer_requested and len(effective_project_ids) != 1:
         raise HTTPException(
-            status_code=422,
-            detail={
-                "code": "protected_cloud_unsupported_session_class",
-                "message": (
-                    "Protected cloud sessions are not supported for the "
-                    "background Officer runtime."
-                ),
-            },
+            status_code=400,
+            detail="A background Officer needs exactly one project.",
         )
 
     # Conference embodiment (centurion.md §2/S9): validate the MATERIALIZED
@@ -710,15 +1023,13 @@ async def resolve_thread_creation_plan(
     # incarnation at a time. Refuse BEFORE provisioning — the atomic
     # registration claim after the INSERT below is the authority; this
     # early check just avoids creating a thread we would immediately
-    # have to stand down. Posts are project-scoped, so an officer class
-    # materialized onto a project-less session (account/expert default)
-    # has no post to claim and keeps its pre-post behavior: it creates,
-    # unregistered — every project-keyed officer read already ignores it.
-    _officer_requested = (config_override.get("officer") or {}).get("enabled") is True
+    # have to stand down. The project gates above (one project at most, and
+    # an Officer needs exactly one) exclude unbound and multi-project
+    # Officers before any post lookup or provisioning.
     _explicit_officer_commission = (
         request_body._officer_post_config_snapshot is not None
     )
-    if _officer_requested and primary_project_id:
+    if _officer_requested:
         if not await dependencies.can_manage_project_officer(user, primary_project_id):
             raise HTTPException(
                 status_code=403,
@@ -753,13 +1064,39 @@ async def resolve_thread_creation_plan(
         selected_thread_datasource_ids,
         selected_thread_datasource_revisions,
         thread_selection_provenance,
-    ) = await select_thread_datasources(
+        execution_access,
+    ) = await _select_thread_datasources(
         request_body,
         user,
         thread_backend=thread_backend,
         effective_project_ids=effective_project_ids,
         dependencies=dependencies,
     )
+    # Each attached connector with access levels gets its level now, once
+    # (main cloud slice 5); the session is protected exactly when one cloud
+    # folder is bound at ``protected``. The protected refusals come here,
+    # after the selection that says whether a folder is protected.
+    selection_access, strict_rows = await resolve_session_access(
+        request_body,
+        user,
+        selected_ids=selected_thread_datasource_ids,
+        execution_access=execution_access,
+        effective_project_ids=effective_project_ids,
+        primary_project_id=primary_project_id,
+        effective_backend=effective_backend,
+        officer=bool(materialized_session_class["enabled"]),
+        dependencies=dependencies,
+    )
+    protected = selection_access.protected is not None
+    protected_source = (
+        await frozen_protected_source(
+            selection_access.protected, strict_rows, dependencies=dependencies
+        )
+        if selection_access.protected is not None
+        else None
+    )
+    if selection_access.origins:
+        thread_selection_provenance["access"] = selection_access.origins
     # VM tier is operator-gated on top of the ``vm_workspace`` PDP grant that
     # enforce_session_create_grants runs below: the global ``vm_workspaces``
     # kill-switch + per-user ``can_use_vm`` (admins bypass). Fail fast with a
@@ -800,16 +1137,16 @@ async def resolve_thread_creation_plan(
         workspace_backend=thread_backend,
         effective_config=effective_create_config,
     )
-    if request_body.protected_cloud:
+    if protected:
         # Protected-cloud overlay staging is not yet lease/runtime fenced;
         # keep it on the dedicated plane even when ordinary sandbox
         # sessions are admitted to the stateless pool.
         execution_lane = "pinned"
 
     # Store config_override + datasource ids in thread metadata. Project
-    # attachment is the canonical concern of ``thread_mounts`` (Phase 1
-    # of cloud_collaboration_model.md §9) — the legacy
-    # ``metadata.project_ids`` JSONB key is no longer written.
+    # attachment is ``threads.project_id`` (single_project_sessions.md) — the
+    # legacy ``metadata.project_ids`` JSONB key is no longer written, and
+    # neither is a ``thread_mounts`` row (main cloud slice 8).
     metadata_patch = {}
     if config_override:
         # This is the explicit per-session layer only. Account fallback and
@@ -823,8 +1160,20 @@ async def resolve_thread_creation_plan(
         metadata_patch["expert_selection_source"] = (
             selection.source if selection else "explicit"
         )
-    if request_body.protected_cloud:
+    elif inline_expert is not None:
+        # No identity to persist: the definition itself is frozen by the
+        # INSERT's snapshot. The template it was copied from is display-only.
+        metadata_patch["expert_selection_source"] = "inline"
+        if request_body.expert_based_on:
+            metadata_patch["expert_based_on"] = request_body.expert_based_on
+    if protected:
+        # Written by the server alone, from the connector's level.
         metadata_patch["protected_cloud"] = True
+    if selection_access.levels:
+        metadata_patch["datasource_access"] = dict(selection_access.levels)
+    # Its cloud folders are its attached cloud connectors from birth (main
+    # cloud slice 3): it never converts, and End rebuilds that rule.
+    metadata_patch[CLOUD_MOUNT_RULE_KEY] = CONNECTOR_RULE
     trusted_seed = request_body._trusted_seed
     if trusted_seed is not None:
         # Keep this narrow and auditable. A future server-owned seed needs
@@ -879,6 +1228,12 @@ async def resolve_thread_creation_plan(
     )
     if workspace_selection is not None:
         create_kwargs["workspace_selection"] = workspace_selection
+    if inline_expert is not None:
+        create_kwargs["expert_row"] = selected_expert_row
+    if protected_source is not None:
+        # Inserted with the thread: a protected session never exists
+        # without its folder.
+        create_kwargs["protected_source"] = protected_source
     if trusted_seed is not None:
         create_kwargs["initial_event"] = trusted_seed.opening_event
     # A review branch is attach authority, not decorative metadata. Commit
@@ -901,8 +1256,11 @@ async def resolve_thread_creation_plan(
         use_k8s=use_k8s,
         create_kwargs=create_kwargs,
         ignored_override_keys=ignored_override_keys,
+        model_notices=model_notices,
         officer_requested=_officer_requested,
         explicit_officer_commission=_explicit_officer_commission,
+        protected=protected,
+        datasource_access=dict(selection_access.levels),
     )
 
 
@@ -999,17 +1357,6 @@ async def commit_thread_creation(
     if backend_from_override(config_override) == "virtual":
         await ensure_virtual_thread_workspace_binding(store, thread_id)
 
-    # Seed thread_mounts for the attached projects.
-    if plan.effective_project_ids:
-        try:
-            mount_rows = await dependencies.build_thread_mount_rows(
-                plan.effective_project_ids
-            )
-            if mount_rows:
-                await store.replace_thread_mounts(thread_id, mount_rows)
-        except Exception as e:
-            logger.warning("Thread %s: failed to seed thread_mounts: %s", thread_id, e)
-
     # Engage protected cloud mode ONCE at create (design §3.3/§11.4), fire-
     # and-forget so create latency is unaffected — mirrors
     # ``provision_thread_workspace`` below. Fail-closed: a refusal or
@@ -1018,9 +1365,9 @@ async def commit_thread_creation(
     # the session simply boots with no cloud mount. Registered via
     # ``schedule_protected_engage`` (F-I1) so a concurrent attach that
     # lands before this task finishes can await it instead of racing it.
-    if request_body.protected_cloud:
+    if plan.protected:
         if dependencies.is_protected_cloud_mode_enabled():
-            seeded_rows = await store.list_thread_mounts(thread_id)
+            seeded_rows = await store.list_protected_selection_rows(thread_id)
             engage_thread = await store.get_thread(thread_id)
             engage_authority = thread_runtime_authority(engage_thread)
             if engage_authority is None:
@@ -1050,70 +1397,20 @@ async def commit_thread_creation(
     return str(thread_id), created_runtime_authority
 
 
-async def _provision_thread_vm(
-    tid: str,
-    cfg: str,
-    config_override: dict,
-    *,
-    dependencies: ThreadAdmissionDependencies,
-) -> None:
-    """Install the VM provision intent under the thread's current authority."""
-    from orchestrator.services.vm_workspace_config import vm_provisioning_options
-
-    store = dependencies.store
-    vm_provisioner = dependencies.vm_provisioner
-    try:
-        async with store.thread_advisory_lock(tid):
-            current = await store.get_thread(tid)
-            current_authority = thread_runtime_authority(current)
-            current_metadata = thread_metadata_object(current or {})
-            raw_vm = current_metadata.get("vm")
-            if raw_vm is not None and not isinstance(raw_vm, Mapping):
-                ok = False
-            elif current_authority is None:
-                ok = False
-            else:
-                options = await vm_provisioning_options(
-                    store,
-                    "Session",
-                    current,
-                    fallback=current_metadata.get("config_override", config_override),
-                )
-                ok = await vm_provisioner.create_thread_vm(
-                    thread_id=tid,
-                    agent_config=cfg,
-                    **options,
-                    expected_runtime_generation=(current_authority.generation),
-                    expected_agent_id=(
-                        str(current["agent_id"])
-                        if current and current.get("agent_id") is not None
-                        else None
-                    ),
-                    expected_attach_token=(
-                        str(current["runtime_attach_token"])
-                        if current and current.get("runtime_attach_token") is not None
-                        else None
-                    ),
-                    expected_vm_context=(dict(raw_vm) if raw_vm is not None else None),
-                )
-    except Exception:
-        logger.exception("Thread %s: VM provisioning request raised", tid)
-        ok = False
-    if not ok:
-        # The provisioner generation-fences failures only after a
-        # successful intent install.  A stale/retired caller must
-        # not mutate the current thread merely to surface an old
-        # request failure.
-        logger.warning(
-            "Thread %s: VM provisioning authority was not admitted",
-            tid,
-        )
-
-
 async def _provision_thread_workspace_container(
     tid: str, *, dependencies: ThreadAdmissionDependencies
 ) -> None:
-    ok = await dependencies.container_provisioner.create_pinned_thread_workspace(tid)
+    from orchestrator.services.workspace_lifecycle import (
+        SessionWorkspaceObservationYielded,
+    )
+
+    try:
+        ok = await dependencies.container_provisioner.create_pinned_thread_workspace(
+            tid
+        )
+    except SessionWorkspaceObservationYielded:
+        logger.info("Thread %s: workspace observation yielded to End", tid)
+        return
     if not ok:
         logger.error(
             "Thread %s: workspace container provisioning failed. "
@@ -1133,6 +1430,30 @@ async def _assign_thread_workspace(
         )
 
 
+def sidecar_pod_planned_at_create(
+    plan: ThreadCreationPlan, main_cloud_router: Any = None
+) -> bool:
+    """Whether a new session's container Pod plans its cloud mounts from the
+    in-pod plane (connector drivers D7): a Kubernetes container session with
+    the plane on, on an installation whose main cloud mounts with a static
+    password. Lite and VM sessions have no such Pod; with no main cloud, or
+    one whose mounts need bearer tokens (OpenCloud), no plan results, so the
+    session folder need not come first."""
+    if not (
+        plan.use_k8s
+        and not plan.lite_session
+        and not plan.vm_session
+        and InPodPlaneSettings.from_env() is not None
+    ):
+        return False
+    if main_cloud_router is None:
+        return True
+    if getattr(main_cloud_router, "active_instance_id", None) is None:
+        return False
+    active = getattr(main_cloud_router, "active", None)
+    return getattr(active, "static_mount_credentials", False) is True
+
+
 async def provision_thread_workspace(
     plan: ThreadCreationPlan,
     thread_id: str,
@@ -1149,29 +1470,16 @@ async def provision_thread_workspace(
     provisioning path below (no_workspace_agent_mode.md §4). The session
     agent builds its lite backend from the mounts injected at attach.
     """
-    config_override = plan.config_override
     if plan.lite_session:
         logger.info(
             "Thread %s: lite workspace backend — no workspace pod provisioned",
             thread_id,
         )
     elif plan.vm_session:
-        # VM tier: the workspace is a KubeVirt VM (metadata.vm), not a
-        # sandbox container. Mark it provisioning SYNCHRONOUSLY so the agent's
-        # attach-time workspace poll (_poll_workspace_ready) observes a VM in
-        # flight (vm_status truthy) and waits on the VM budget instead of
-        # bailing "no workspace provisioned". Then fire create_thread_vm
-        # fire-and-forget (mirrors the container task) with the requested
-        # sizing; the agent pod provisioned below SSHes into the VM once it
-        # reports ready. (knowledge-base/knowledge/features/session_create_on_vm.md)
-        asyncio.create_task(
-            _provision_thread_vm(
-                thread_id,
-                plan.config_name,
-                config_override,
-                dependencies=dependencies,
-            )
-        )
+        # Its immutable creation source must name the protected agent/attach
+        # tuple. Both warm and dedicated agents enter the same authenticated
+        # workspace poll after binding, which admits and resumes fresh creates.
+        logger.info("Thread %s: VM creation awaits pinned agent binding", thread_id)
     elif plan.use_k8s:
         if plan.execution_lane == "stateless":
             # Stateless create shares the same distributed lifecycle owner
@@ -1287,9 +1595,22 @@ async def setup_thread_main_cloud(
     thread_id: str,
     user: dict[str, Any],
     *,
+    datasource_ids: list[str] | None = None,
+    workspace_backend: str | None = None,
+    protected: bool = False,
     dependencies: ThreadAdmissionDependencies,
 ) -> None:
-    """Provision (or deliberately skip) the legacy main-cloud session folder."""
+    """Create a new session's outbox folder, when its outbox is attached.
+
+    The session folder is the outbox connector's (main cloud slice 6.1): a
+    session without the owner's outbox in ``datasource_ids`` (an explicit
+    ``[]`` included) gets no folder at all, and nothing else stands in. Nor
+    does a tier the outbox is not offered on (a root VM), or a protected
+    session, which mounts its protected folder alone: the folder would never
+    be mounted. A failure is recorded on the session
+    (``cloud_outbox.state: "unavailable"`` with a closed reason) and the
+    session starts anyway; the share is retried before its next Pod.
+    """
     # Fresh session folder for a new thread — resolve via the owner
     # seam (active today). The thread row is stamped with this
     # backend's id below, so resume/delete later dispatch via
@@ -1298,75 +1619,67 @@ async def setup_thread_main_cloud(
     # fails closed when no durable active-instance authority exists,
     # because callers that intend a cloud effect must never fall back
     # to an unattested adapter.  Thread creation itself is not such an
-    # effect: in a no-cloud deployment it must continue without the
-    # legacy session folder.
+    # effect: in a no-cloud deployment it must continue without a
+    # session folder.
     store = dependencies.store
     main_cloud_router = dependencies.main_cloud_router
-    if main_cloud_router.active_instance_id is None:
+    if main_cloud_router.active_instance_id is None or protected:
+        return
+    try:
+        connector_id = await outbox_selected(store, user.get("id"), datasource_ids)
+    except Exception as e:
+        logger.warning(
+            "Thread %s: could not read its outbox selection (%s); no session "
+            "folder is created",
+            thread_id,
+            e,
+        )
+        return
+    if connector_id is None:
         return
     backend = main_cloud_router.for_owner(user)
-    if not backend.is_initialized and backend.is_configured:
-        await backend.ensure_initialized()
-    if not backend.is_initialized:
-        return
-
-    # Phase 4 (cloud_collaboration_model.md §9): if the thread
-    # already has any mount with a working webdav_url — project,
-    # project_default, or repo — the legacy session folder would
-    # be a redundant second sync target. Skip provisioning it.
-    # The gate is observable-state: failed mount resolution
-    # leaves no usable row, the legacy folder is still
-    # provisioned as fallback, the thread never ends up with
-    # zero cloud surfaces.
-    try:
-        existing_mounts = await store.list_thread_mounts(thread_id)
-    except Exception as e:
-        existing_mounts = []
-        logger.warning(
-            "Thread %s: failed to read thread_mounts before session "
-            "folder provisioning (%s); proceeding with legacy folder.",
-            thread_id,
-            e,
-        )
-    if dependencies.should_skip_session_folder(existing_mounts):
+    tier = AccessContext(
+        workspace_backend=workspace_backend,
+        execution="session",
+        main_cloud_backend=getattr(backend, "backend_id", None),
+    )
+    if not CloudOutboxDriver().offered_access({"config": {}}, tier):
         logger.info(
-            "Thread %s: skipping legacy session folder — at least "
-            "one mount with a working webdav_url is observable.",
+            "Thread %s: its outbox is not offered on the %s tier; no session "
+            "folder is created",
             thread_id,
+            workspace_backend,
         )
         return
-
     try:
-        session_handle = await backend.ensure_session_folder(session_id=thread_id[:8])
-        share_handle = None
-        # ensure_user (not just resolve_user_identity) so we synchronously
-        # provision the cloud user record here — otherwise we race the
-        # fire-and-forget JIT task from auth.get_current_user and the
-        # share gets skipped on a user's very first session.
-        resolved_user_id = await backend.ensure_user(
-            sub=user.get("keycloak_sub") or "",
-            issuer=getattr(backend, "_keycloak_issuer", "") or "",
-            email=user.get("email"),
-            display_name=user.get("display_name"),
-            preferred_username=user.get("preferred_username"),
-        )
-        if resolved_user_id:
-            share_handle = await backend.share_session_folder(
-                session_handle, resolved_user_id
-            )
-        await store.update_thread_main_cloud(
-            thread_id,
-            backend_id=backend.backend_id,
-            backend_instance_id=str(backend.backend_instance_id),
-            session_handle=session_handle.to_db(),
-            share_handle=share_handle.to_db() if share_handle else None,
-        )
+        if not backend.is_initialized and backend.is_configured:
+            await backend.ensure_initialized()
     except Exception as e:
         logger.warning(
-            "Failed to provision main-cloud session folder for thread %s: %s",
+            "Thread %s: the main cloud did not initialize for its outbox: %s",
             thread_id,
             e,
         )
+    if not backend.is_initialized:
+        try:
+            await store.merge_thread_cloud_metadata(
+                thread_id,
+                {
+                    CLOUD_OUTBOX_KEY: {
+                        "connector_id": connector_id,
+                        "state": "unavailable",
+                        "reason": "backend_unavailable",
+                    }
+                },
+            )
+        except Exception:
+            logger.warning(
+                "Thread %s: its outbox state was not recorded", thread_id, exc_info=True
+            )
+        return
+    await create_session_outbox(
+        thread_id, user, connector_id=connector_id, backend=backend, store=store
+    )
 
 
 async def _assign_pool_agent(
@@ -1511,6 +1824,22 @@ async def create_thread(
             plan, request_body, user, dependencies=dependencies
         )
 
+        main_cloud_first = sidecar_pod_planned_at_create(
+            plan, dependencies.main_cloud_router
+        )
+        if main_cloud_first:
+            # A sidecar Pod's cloud folders are fixed when the Pod is created
+            # (connector drivers D7), so its session folder must exist
+            # first; the Pod then starts a Nextcloud folder-create later.
+            await setup_thread_main_cloud(
+                thread_id,
+                user,
+                datasource_ids=plan.selected_datasource_ids,
+                workspace_backend=plan.thread_backend,
+                protected=plan.protected,
+                dependencies=dependencies,
+            )
+
         await provision_thread_workspace(plan, thread_id, dependencies=dependencies)
 
         # Run Gitea + Nextcloud setup in parallel, and AWAIT both before
@@ -1529,7 +1858,20 @@ async def create_thread(
                 lite_session=plan.lite_session,
                 dependencies=dependencies,
             ),
-            setup_thread_main_cloud(thread_id, user, dependencies=dependencies),
+            *(
+                ()
+                if main_cloud_first
+                else (
+                    setup_thread_main_cloud(
+                        thread_id,
+                        user,
+                        datasource_ids=plan.selected_datasource_ids,
+                        workspace_backend=plan.thread_backend,
+                        protected=plan.protected,
+                        dependencies=dependencies,
+                    ),
+                )
+            ),
         )
 
         schedule_thread_agent(
@@ -1546,6 +1888,8 @@ async def create_thread(
             # create rebuild did not carry. Additive — clients that do not
             # read it are unaffected; the Strict phase turns this into a 400.
             response["ignored_config_keys"] = plan.ignored_override_keys
+        if plan.model_notices:
+            response["notices"] = plan.model_notices
         return response
     except DatasourceMaterializationAuthorizationError as exc:
         raise HTTPException(
@@ -1580,16 +1924,23 @@ async def list_threads(
             project_id=project_id,
             status=status,
         )
-        # Phase 2: default-project threads have no legacy session folder, so the
-        # cloud-button URL comes from the project_default mount row. Fetch every
-        # thread's mounts in one query (was a per-thread N+1).
-        mounts_by_thread = await dependencies.store.list_thread_mounts_bulk(
-            [str(t["id"]) for t in threads]
-        )
+        # The cloud button opens the session's outbox folder; no mount row
+        # stands in for it (main cloud slices 3 and 4).
         for t in threads:
-            t["cloud_session_url"] = dependencies.resolve_cloud_session_url(
-                t, mounts_by_thread.get(str(t["id"]), [])
+            t["cloud_session_url"] = dependencies.resolve_cloud_session_url(t)
+        if getattr(dependencies.store, "supports_vm_creation_retry", False):
+            from orchestrator.services.vm_creation_owner_view import (
+                thread_creation_views,
             )
+
+            progress = await thread_creation_views(
+                dependencies.store,
+                [str(t["id"]) for t in threads],
+                viewer_user_id=str(user["id"]),
+                admin=user.get("is_admin") is True,
+            )
+            for t in threads:
+                t["vm_creation"] = progress.get(str(t["id"]))
         return {"threads": [dependencies.redact_thread_metadata(t) for t in threads]}
     except HTTPException:
         raise

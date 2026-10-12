@@ -13,6 +13,7 @@ uses. See knowledge-base/knowledge/issues/delegation_child_machinery_retirement.
 import subprocess
 
 import pytest
+from orchestrator.application import background_tasks as background_tasks_composition
 
 
 # ===========================================================================
@@ -200,7 +201,6 @@ class TestDelegationTimeout:
     def test_timeout_sweeper_function_exists(self):
         """Verify the timeout policy and application-owned task wiring."""
         import inspect
-        import pathlib
 
         from orchestrator.services import completion_recovery
 
@@ -210,9 +210,23 @@ class TestDelegationTimeout:
         assert inspect.iscoroutinefunction(
             completion_recovery.delegation_timeout_sweeper
         )
-        main_src = pathlib.Path("src/orchestrator/main.py").read_text()
-        assert "completion_recovery_operations.delegation_timeout_sweeper" in main_src
-        assert "delegation_timeout_task" in main_src
+        # R1.B12: the background-task composition owns the wiring main.py
+        # used to hold.
+        tasks_src = inspect.getsource(background_tasks_composition)
+        assert "completion_recovery_operations.delegation_timeout_sweeper" in tasks_src
+        # R1.B11: started (leader-gated) through the lifecycle's task set and
+        # awaited at shutdown under its key.
+        start = tasks_src.index(
+            '"delegation_timeout"', tasks_src.index("async def start_background_tasks(")
+        )
+        assert tasks_src.rindex(
+            "tasks.start_leader_gated(", 0, start
+        ) > tasks_src.rfind("tasks.start(", 0, start)
+
+        assert (
+            "delegation_timeout"
+            in background_tasks_composition.BACKGROUND_TASK_SHUTDOWN_ORDER
+        )
 
 
 # ===========================================================================

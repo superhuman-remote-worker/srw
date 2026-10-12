@@ -14,6 +14,26 @@ import type {
 } from '../../core/services/api.service';
 import {ToolsGroupComponent} from '../agent-settings/tools-group.component';
 import {SettingsPaneComponent} from './settings-pane.component';
+import {ConnectorDriversService} from '../../core/services/connector-drivers.service';
+import {
+  ConnectorDriver,
+  ConnectorDriverMatrix,
+  driverForType,
+} from '../../core/models/connector-driver.model';
+// The API's own capability matrix for the built-in drivers.
+import driversFixture from '../../core/models/fixtures/connector-drivers.json';
+
+const BUILTIN_DRIVERS = (driversFixture as unknown as ConnectorDriverMatrix).drivers;
+
+/** The capability matrix as the pane reads it; null = not loaded (yet). */
+function driversStub(drivers: ConnectorDriver[] | null = null) {
+  const current = signal(drivers);
+  return {
+    drivers: current,
+    load: vi.fn(),
+    forType: (type: string) => driverForType(current(), type),
+  };
+}
 
 /** Build the resolved tool-groups answer the pane now reads. */
 function toolsetAnswer(
@@ -62,6 +82,10 @@ function createPane(options: {
   toolGroups$?: Observable<SessionToolGroupsResponse | null>;
   /** Thread ids whose metadata differs, for the thread-switch test. */
   threadsById?: Record<string, Record<string, unknown>>;
+  /** The capability matrix; null (the default) = not loaded yet. */
+  drivers?: ConnectorDriver[] | null;
+  /** `metadata.datasource_access`: the levels the session bound. */
+  access?: Record<string, unknown>;
 } = {}) {
   const chat = {
     threadId: signal<string | null>('thread-1'),
@@ -82,6 +106,7 @@ function createPane(options: {
     setMode: vi.fn(),
     setNarrationMode: vi.fn(),
     upgradeWorkspace: vi.fn(),
+    controlTransport: vi.fn(() => 'websocket'),
   };
   const api = {
     getPersistentThread: vi.fn().mockReturnValue(
@@ -89,6 +114,7 @@ function createPane(options: {
         metadata: {
           config_override: options.override ?? {},
           datasource_ids: options.attachedIds ?? [],
+          ...(options.access ? {datasource_access: options.access} : {}),
         },
         project_ids: [],
       }),
@@ -97,12 +123,17 @@ function createPane(options: {
     getSessionToolGroups: vi
       .fn()
       .mockReturnValue(options.toolGroups$ ?? of(options.toolGroups ?? null)),
+    // Locked-row facts: display only, never part of the diff.
+    getExperts: vi.fn().mockReturnValue(of([])),
+    getProject: vi.fn().mockReturnValue(of(null)),
+    getThreadResolvedConfig: vi.fn().mockReturnValue(of(null)),
   };
   const capabilities = {
     grants: signal(options.grants ?? null),
     datasourceScopeAutoAttachAvailable: () => true,
   };
   const modelService = {load: vi.fn()};
+  const connectorDrivers = driversStub(options.drivers ?? null);
 
   TestBed.configureTestingModule({
     providers: [
@@ -111,6 +142,7 @@ function createPane(options: {
       {provide: ApiService, useValue: api},
       {provide: CapabilitiesService, useValue: capabilities},
       {provide: ModelService, useValue: modelService},
+      {provide: ConnectorDriversService, useValue: connectorDrivers},
     ],
   });
   const component = TestBed.inject(SettingsPaneComponent);
@@ -129,7 +161,7 @@ function createPane(options: {
   };
   Object.defineProperty(component, 'settings', {value: () => fakeSettings});
   TestBed.tick(); // fire the load effect
-  return {component, chat, api, fakeSettings};
+  return {component, chat, api, fakeSettings, connectorDrivers};
 }
 
 /** `shell` bound to exactly the code-granted `srw_cloud_status` — the default
@@ -192,6 +224,7 @@ function createPaneWithRealToolsGroup(toolGroups: SessionToolGroupsResponse) {
     setMode: vi.fn(),
     setNarrationMode: vi.fn(),
     upgradeWorkspace: vi.fn(),
+    controlTransport: vi.fn(() => 'websocket'),
   };
   const api = {
     getPersistentThread: vi.fn().mockReturnValue(
@@ -199,6 +232,9 @@ function createPaneWithRealToolsGroup(toolGroups: SessionToolGroupsResponse) {
     ),
     getEligibleDatasources: vi.fn().mockReturnValue(of([])),
     getSessionToolGroups: vi.fn().mockReturnValue(of(toolGroups)),
+    getExperts: vi.fn().mockReturnValue(of([])),
+    getProject: vi.fn().mockReturnValue(of(null)),
+    getThreadResolvedConfig: vi.fn().mockReturnValue(of(null)),
   };
   const capabilities = {
     grants: signal(null),
@@ -213,6 +249,7 @@ function createPaneWithRealToolsGroup(toolGroups: SessionToolGroupsResponse) {
       {provide: ApiService, useValue: api},
       {provide: CapabilitiesService, useValue: capabilities},
       {provide: ModelService, useValue: modelService},
+      {provide: ConnectorDriversService, useValue: driversStub()},
     ],
   });
   const component = TestBed.inject(SettingsPaneComponent);
@@ -366,6 +403,7 @@ describe('SettingsPaneComponent locked-on categories, from the DOM', () => {
       setMode: vi.fn(),
       setNarrationMode: vi.fn(),
       upgradeWorkspace: vi.fn(),
+      controlTransport: vi.fn(() => 'websocket'),
     };
     const api = {
       getPersistentThread: vi.fn().mockReturnValue(
@@ -373,6 +411,9 @@ describe('SettingsPaneComponent locked-on categories, from the DOM', () => {
       ),
       getEligibleDatasources: vi.fn().mockReturnValue(of([])),
       getSessionToolGroups: vi.fn().mockReturnValue(of(toolGroups)),
+      getExperts: vi.fn().mockReturnValue(of([])),
+      getProject: vi.fn().mockReturnValue(of(null)),
+      getThreadResolvedConfig: vi.fn().mockReturnValue(of(null)),
     };
 
     TestBed.configureTestingModule({
@@ -392,6 +433,7 @@ describe('SettingsPaneComponent locked-on categories, from the DOM', () => {
           useValue: {grants: signal(null), datasourceScopeAutoAttachAvailable: () => true},
         },
         {provide: ModelService, useValue: {load: vi.fn()}},
+        {provide: ConnectorDriversService, useValue: driversStub()},
       ],
     });
 
@@ -850,6 +892,73 @@ describe('SettingsPaneComponent datasources (Slice B)', () => {
     expect(component.pickerDatasources().map((d) => d.id)).toEqual(['ds-pg', 'kb-1']);
     expect(component.lockedDatasourceIds()).toEqual(['kb-1']);
   });
+
+  it("asks for a session's eligible connectors and loads the matrix", () => {
+    const {api, connectorDrivers} = createPane({attachedIds: [], eligible: [PG]});
+    expect(api.getEligibleDatasources).toHaveBeenCalledWith([], 'session');
+    expect(connectorDrivers.load).toHaveBeenCalled();
+  });
+
+  it('freezes what its driver cannot attach live, and hides it unattached', () => {
+    const FOLDER = {id: 'folder-1', type: 'cloud_folder', name: 'Project folder'};
+    const OTHER_FOLDER = {id: 'folder-2', type: 'cloud_folder', name: 'Other folder'};
+    const KB = {id: 'kb-1', type: 'kb', name: 'Docs KB'};
+    const {component} = createPane({
+      attachedIds: ['folder-1', 'kb-1'],
+      eligible: [PG, FOLDER, OTHER_FOLDER, KB],
+      drivers: BUILTIN_DRIVERS,
+    });
+    // The matrix says live_attach: false for both: a cloud folder is
+    // mounted when the session starts.
+    expect(component.pickerDatasources().map((d) => d.id)).toEqual(['ds-pg', 'folder-1', 'kb-1']);
+    expect(component.lockedDatasourceIds()).toEqual(['folder-1', 'kb-1']);
+  });
+
+  it('follows the matrix once it loads, and the built-in copy before', () => {
+    const FOLDER = {id: 'folder-1', type: 'cloud_folder', name: 'Project folder'};
+    const KB = {id: 'kb-1', type: 'kb', name: 'Docs KB'};
+    const {component, connectorDrivers} = createPane({
+      attachedIds: ['folder-1', 'kb-1', 'ds-pg'],
+      eligible: [PG, FOLDER, KB],
+      drivers: null,
+    });
+    // Before the matrix: the copy (the KB rule, and the cloud folders).
+    expect(component.lockedDatasourceIds()).toEqual(['folder-1', 'kb-1']);
+    // A driver that turns live attach on is followed; one that turns it off too.
+    connectorDrivers.drivers.set(
+      BUILTIN_DRIVERS.map((driver) =>
+        driver.legacy_type === 'cloud_folder'
+          ? {...driver, live_attach: true}
+          : driver.legacy_type === 'postgresql'
+            ? {...driver, live_attach: false}
+            : driver,
+      ),
+    );
+    expect(component.lockedDatasourceIds()).toEqual(['ds-pg', 'kb-1']);
+  });
+
+  it('shows the level each attached cloud folder was bound at', () => {
+    const FOLDER = {id: 'folder-1', type: 'cloud_folder', name: 'Project folder'};
+    const {component} = createPane({
+      attachedIds: ['folder-1'],
+      eligible: [FOLDER],
+      drivers: BUILTIN_DRIVERS,
+      access: {'folder-1': 'protected', 'bogus': 7},
+    });
+    expect(component.attachedAccess()).toEqual({'folder-1': 'protected'});
+    // Frozen: a cloud folder's level changes only at the next start.
+    expect(component.lockedDatasourceIds()).toEqual(['folder-1']);
+  });
+
+  it('never freezes the placeholder of an attachment that fell out of eligibility', () => {
+    const {component} = createPane({
+      attachedIds: ['gone'],
+      eligible: [PG],
+      drivers: BUILTIN_DRIVERS,
+    });
+    expect(component.pickerDatasources().find((d) => d.id === 'gone')?.unavailable).toBe(true);
+    expect(component.lockedDatasourceIds()).toEqual([]);
+  });
 });
 
 describe('SettingsPaneComponent workspace tier', () => {
@@ -870,12 +979,42 @@ describe('SettingsPaneComponent workspace tier', () => {
   it('denies the VM upgrade without the vm grant; admin (null grants) allows', () => {
     const {component} = createPane({grants: {vm_workspace: false}});
     expect(component.workspaceTier()).toBe('virtual');
-    expect(component.tierReachability()['sandbox']).toBe('ok');
     expect(component.tierReachability()['vm']).toBe('needsApproval');
 
     TestBed.resetTestingModule();
     const {component: admin} = createPane({grants: null});
     expect(admin.tierReachability()['vm']).toBe('ok');
+  });
+
+  it('a pinned session (socket transport) offers no container upgrade, and says so', () => {
+    const {component, chat} = createPane({grants: null});
+    expect(chat.controlTransport('upgrade-to-workspace')).toBe('websocket');
+    expect(component.tierReachability()['sandbox']).toBe('sessionUnsupported');
+    expect(component.tierReachability()['vm']).toBe('ok');
+    component.onTierPicked('sandbox');
+    expect(component.pendingTier()).toBeNull();
+  });
+
+  it('a REST upgrade transport keeps the container choice', () => {
+    const {component, chat} = createPane({grants: null});
+    chat.controlTransport.mockReturnValue('rest');
+    chat.workspaceTier.set('virtual');
+    expect(component.tierReachability()['sandbox']).toBe('ok');
+  });
+
+  it('a session with no upgrade transport reaches no tier, and says so', () => {
+    const {component, chat} = createPane({grants: null});
+    chat.controlTransport.mockReturnValue('unavailable');
+    // Re-read: the reachability computed depends on the tier signal, so
+    // nudge it the way a real thread-meta load would.
+    chat.workspaceTier.set('virtual');
+    expect(component.tierReachability()).toEqual({
+      sandbox: 'sessionUnsupported',
+      vm: 'sessionUnsupported',
+      none: 'downgrade',
+    });
+    component.onTierPicked('sandbox');
+    expect(component.pendingTier()).toBeNull();
   });
 
   it('vm tier offers no further upgrades (upgrade-only, no downgrades)', () => {
@@ -906,9 +1045,9 @@ describe('SettingsPaneComponent tier upgrade confirmation', () => {
 
   it('a reachable pick opens the dialog instead of dispatching', () => {
     const {component, chat} = createPane({grants: null});
-    component.onTierPicked('sandbox');
+    component.onTierPicked('vm');
 
-    expect(component.pendingTier()).toBe('sandbox');
+    expect(component.pendingTier()).toBe('vm');
     expect(chat.upgradeWorkspace).not.toHaveBeenCalled();
   });
 
@@ -923,7 +1062,7 @@ describe('SettingsPaneComponent tier upgrade confirmation', () => {
 
   it('dismissing dispatches nothing — the tier is unchanged', () => {
     const {component, chat} = createPane({grants: null});
-    component.onTierPicked('sandbox');
+    component.onTierPicked('vm');
     component.pendingTier.set(null); // what (closed) and Cancel both do
 
     expect(chat.upgradeWorkspace).not.toHaveBeenCalled();
@@ -1103,17 +1242,126 @@ describe('SettingsPaneComponent delegation gate', () => {
     const {component, chat, fakeSettings} = createPane({
       toolGroups: toolsetAnswer({delegation: 'on', canvas: 'on'}, {enumerate_only: {delegation: NAMES}}),
     });
-    fakeSettings.getOverrides.mockReturnValue({delegation: {max_concurrent: 2}});
+    fakeSettings.getOverrides.mockReturnValue({delegation: {session_max_concurrent: 2}});
     component.onSettingsChange();
     vi.runAllTimers();
     expect(chat.updateConfig).toHaveBeenCalledExactlyOnceWith({
-      delegation: {max_concurrent: 2},
+      delegation: {session_max_concurrent: 2},
     });
 
     // A later, unrelated edit (canvas off) does not re-send the knob.
-    fakeSettings.getOverrides.mockReturnValue({delegation: {max_concurrent: 2}, tools: {canvas: []}});
+    fakeSettings.getOverrides.mockReturnValue({
+      delegation: {session_max_concurrent: 2},
+      tools: {canvas: []},
+    });
     component.onSettingsChange();
     vi.runAllTimers();
     expect(chat.updateConfig).toHaveBeenLastCalledWith({tools: {canvas: []}});
+  });
+});
+
+describe('SettingsPaneComponent session delegation cap', () => {
+  // parallel_subagents.md §6.4 / D2. A session allowed to fan out reads its
+  // own cap, `delegation.session_max_concurrent`, and ignores the worker cap
+  // `delegation.max_concurrent` — so the pane writing the worker key meant a
+  // user who set 2 got 6. The pane is only ever a session, so it reads and
+  // writes the session key and nothing else.
+  beforeEach(() => vi.useFakeTimers());
+  afterEach(() => {
+    vi.useRealTimers();
+    TestBed.resetTestingModule();
+  });
+  const NAMES = ['delegate_agent', 'list_agents', 'message_agent', 'stop_agent', 'wait_agent'];
+  const delegationOn = () =>
+    toolsetAnswer({delegation: 'on', canvas: 'on'}, {enumerate_only: {delegation: NAMES}});
+
+  async function flushOutcome() {
+    await Promise.resolve();
+    await Promise.resolve();
+  }
+
+  it('a worker-cap edit is never dispatched from a session', () => {
+    const {component, chat, fakeSettings} = createPane({toolGroups: delegationOn()});
+    fakeSettings.getOverrides.mockReturnValue({delegation: {max_concurrent: 2}});
+    component.onSettingsChange();
+    vi.runAllTimers();
+    expect(chat.updateConfig).not.toHaveBeenCalled();
+  });
+
+  it('an unset cap is never written: unrelated edits carry no inherited value', () => {
+    const {component, chat, fakeSettings} = createPane({toolGroups: delegationOn()});
+    fakeSettings.getOverrides.mockReturnValue({tools: {canvas: []}});
+    component.onSettingsChange();
+    vi.runAllTimers();
+    expect(chat.updateConfig).toHaveBeenCalledExactlyOnceWith({tools: {canvas: []}});
+  });
+
+  it('the stored session cap is the baseline: re-pinning the same value sends nothing', () => {
+    const {component, chat, fakeSettings} = createPane({
+      toolGroups: delegationOn(),
+      override: {delegation: {session_max_concurrent: 3}},
+    });
+    fakeSettings.getOverrides.mockReturnValue({delegation: {session_max_concurrent: 3}});
+    component.onSettingsChange();
+    vi.runAllTimers();
+    expect(chat.updateConfig).not.toHaveBeenCalled();
+
+    fakeSettings.getOverrides.mockReturnValue({delegation: {session_max_concurrent: 5}});
+    component.onSettingsChange();
+    vi.runAllTimers();
+    expect(chat.updateConfig).toHaveBeenCalledExactlyOnceWith({
+      delegation: {session_max_concurrent: 5},
+    });
+  });
+
+  it('a value the orchestrator would refuse is never dispatched', () => {
+    const {component, chat, fakeSettings} = createPane({toolGroups: delegationOn()});
+    for (const refused of [0, 21, 2.5]) {
+      fakeSettings.getOverrides.mockReturnValue({delegation: {session_max_concurrent: refused}});
+      component.onSettingsChange();
+      vi.runAllTimers();
+    }
+    expect(chat.updateConfig).not.toHaveBeenCalled();
+  });
+
+  it('with the real tools group: typing a cap sends session_max_concurrent only', () => {
+    const {component, chat, toolsGroup} = createPaneWithRealToolsGroup(delegationOn());
+    Object.defineProperty(toolsGroup, 'delegationCapScope', {value: () => 'session'});
+
+    toolsGroup.onDelegationCapChange(25); // out of range: flagged, not sent
+    component.onSettingsChange();
+    vi.runAllTimers();
+    expect(chat.updateConfig).not.toHaveBeenCalled();
+
+    toolsGroup.onDelegationCapChange(2);
+    component.onSettingsChange();
+    vi.runAllTimers();
+    expect(chat.updateConfig).toHaveBeenCalledExactlyOnceWith({
+      delegation: {session_max_concurrent: 2},
+    });
+  });
+
+  it('a socket-confirmed cap is folded into the overlay, so the field keeps showing it', async () => {
+    const {component, chat, fakeSettings} = createPane({toolGroups: delegationOn()});
+    chat.updateConfig.mockResolvedValue({
+      ok: true,
+      requestId: 'req-cap',
+      transport: 'websocket',
+      applied: {delegation: {session_max_concurrent: 2}},
+      effective: 'now',
+    });
+    fakeSettings.getOverrides.mockReturnValue({delegation: {session_max_concurrent: 2}});
+    component.onSettingsChange();
+    vi.runAllTimers();
+    await flushOutcome();
+
+    expect(
+      (component.liveConfig()['delegation'] as Record<string, unknown>)['session_max_concurrent'],
+    ).toBe(2);
+    // Emptying the field afterwards is not a change: the session holds 2.
+    fakeSettings.getOverrides.mockReturnValue({});
+    component.onSettingsChange();
+    vi.runAllTimers();
+    expect(chat.updateConfig).toHaveBeenCalledTimes(1);
   });
 });

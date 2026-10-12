@@ -10,6 +10,7 @@ workspace, command line, environment, tmux scrollback, or Git configuration.
 
 from __future__ import annotations
 
+import ipaddress
 import re
 import shlex
 from typing import Any, Iterable, Mapping, MutableMapping
@@ -22,6 +23,35 @@ _VERSION = 1
 _NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$")
 _ALIAS = re.compile(r"^srw-repo-[a-f0-9]{32}$")
 _AUTHORITY_SLUG = re.compile(r"^[a-f0-9]{32}$")
+# A value written onto an SSH config line: no whitespace (a newline would
+# start a new directive), no ``%`` (token expansion) and no ``#``.
+_SSH_CONFIG_VALUE = re.compile(r"^[^\s%#\"'\\]{1,4096}$")
+#: Every identity alias (``srw-repo-<32hex>``) starts with this. No other
+#: ``Host`` line may: config.d is read in slug order and the first matching
+#: block wins, so a declared host spelled like an alias would take it over.
+RESERVED_SSH_HOST_PREFIX = "srw-repo-"
+# An ``extra_hosts`` entry becomes a ``Host`` *pattern*: only plain ASCII DNS
+# labels or an IP literal, so ``*``, ``?``, ``!`` or a list can never widen
+# the block past the one host the connector declared.
+_SSH_HOST_LABEL = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?")
+
+
+def _plain_ssh_host(value: Any) -> bool:
+    text = str(value)
+    if not text or len(text) > 253 or "%" in text:
+        return False
+    try:
+        ipaddress.ip_address(text)
+    except ValueError:
+        return all(_SSH_HOST_LABEL.fullmatch(label) for label in text.split("."))
+    return True
+
+
+#: Lifetime (``ssh-add -t``) of a connector identity's key in its workspace
+#: ``ssh-agent``. Every materialization re-adds a proven resident's key, which
+#: restarts the clock, so only an agent nobody retired outlives it. Managed
+#: repository keys carry none (see the launch command).
+SSH_AGENT_KEY_LIFETIME_SECONDS = 7 * 24 * 60 * 60
 
 
 # Executed inside the workspace through the private control-plane SSH channel.
@@ -593,6 +623,128 @@ def _managed_root(home_path: str) -> str:
     return f"{home}/.ssh/srw-managed"
 
 
+def _ssh_config_value(value: Any) -> str:
+    text = str(value)
+    if not _SSH_CONFIG_VALUE.fullmatch(text):
+        raise ManagedRepositoryMaterializationError(
+            "managed_repository_credential_invalid"
+        )
+    return text
+
+
+def render_ssh_identity_config(
+    *,
+    alias: str,
+    socket_path: str,
+    known_hosts_path: str,
+    host: str | None,
+    port: int | None = None,
+    user: str | None = None,
+    strict_host_key_checking: bool = False,
+    host_key_alias: str | None = None,
+    extra_hosts: Iterable[str] = (),
+) -> str:
+    """Render one dedicated agent's ``config.d/<slug>.conf``.
+
+    The one renderer for managed repositories, connector identities and the
+    IDE. It always starts with the exact ``Host srw-repo-<slug>`` and
+    ``  IdentityAgent <socket>`` lines: retirement adopts an agent that has no
+    receipt (a crash between spawn and receipt) only when its config holds
+    both, so a file without them would wedge terminal teardown.
+
+    ``extra_hosts`` repeats the identity's settings under the real host names
+    an ``ssh_key`` connector declares, so a plain ``ssh <host>`` finds it.
+    ``host_key_alias`` keys the pinned or learned host key by the alias, which
+    keeps one identity's ``known_hosts`` independent of how its host is
+    spelled. ``IdentitiesOnly`` is deliberately absent: the agent holds exactly
+    one key, and ``IdentitiesOnly yes`` without an ``IdentityFile`` would
+    suppress the agent-only identity we intentionally keep off disk.
+    """
+
+    if not _ALIAS.fullmatch(str(alias)):
+        raise ManagedRepositoryMaterializationError(
+            "managed_repository_credential_invalid"
+        )
+    if port is not None and (
+        isinstance(port, bool) or not isinstance(port, int) or not 1 <= port <= 65535
+    ):
+        raise ManagedRepositoryMaterializationError(
+            "managed_repository_credential_invalid"
+        )
+    settings: list[str] = []
+    if port is not None:
+        settings.append(f"  Port {port}")
+    if user is not None:
+        settings.append(f"  User {_ssh_config_value(user)}")
+    settings.extend(
+        [
+            "  BatchMode yes",
+            "  StrictHostKeyChecking "
+            + ("yes" if strict_host_key_checking else "accept-new"),
+            f"  UserKnownHostsFile {_ssh_config_value(known_hosts_path)}",
+        ]
+    )
+    if host_key_alias is not None:
+        settings.append(f"  HostKeyAlias {_ssh_config_value(host_key_alias)}")
+    agent_line = f"  IdentityAgent {_ssh_config_value(socket_path)}"
+    lines = [f"Host {alias}", agent_line]
+    if host is not None:
+        lines.append(f"  HostName {_ssh_config_value(host)}")
+    lines.extend(settings)
+    for pattern in extra_hosts:
+        # Second line of defence behind normalize_ssh_host: the same grammar,
+        # checked where the pattern is written.
+        if not _plain_ssh_host(pattern) or str(pattern).lower().startswith(
+            RESERVED_SSH_HOST_PREFIX
+        ):
+            raise ManagedRepositoryMaterializationError(
+                "managed_repository_credential_invalid"
+            )
+        lines.extend([f"Host {_ssh_config_value(pattern)}", agent_line, *settings])
+    return "\n".join(lines) + "\n"
+
+
+def managed_ssh_config_include_command(*, home_path: str) -> str:
+    """Return a command that makes ``~/.ssh/config`` include the namespace.
+
+    The ``Include`` is placed behind its own ``Match all``. Appended bare, it
+    lands inside whatever ``Host`` block the file happens to end with (a
+    user's own, or one an older connector clone appended); OpenSSH then
+    reads the included aliases only for that host, and every managed alias
+    silently fails to resolve. Idempotent: the exact two-line pair is
+    appended once and a legacy bare ``Include`` line is left alone.
+    """
+
+    root = _managed_root(home_path)
+    config_path = shlex.quote(f"{root.rsplit('/', 1)[0]}/config")
+    include = shlex.quote(f"Include {root}/config.d/*.conf")
+    return (
+        f"touch {config_path} "
+        f"&& (awk -v inc={include} "
+        '\'prev == "Match all" && $0 == inc { found = 1 } { prev = $0 } '
+        f"END {{ exit !found }}' {config_path} "
+        f"|| printf '\\nMatch all\\n%s\\n' {include} >> {config_path}) "
+        f"&& chmod 600 {config_path}"
+    )
+
+
+def managed_ssh_namespace_setup_command(*, home_path: str) -> str:
+    """Create the private namespace and wire it into ``~/.ssh/config``."""
+
+    root = _managed_root(home_path)
+    directories = " ".join(
+        shlex.quote(f"{root}/{name}")
+        for name in ("config.d", "sockets", "agents", "known_hosts.d")
+    )
+    return (
+        f"mkdir -p {directories} "
+        f"&& chmod 700 {shlex.quote(root.rsplit('/', 1)[0])} {shlex.quote(root)} "
+        f"{directories} "
+        f"&& exec 8>{shlex.quote(root + '/setup.lock')} && flock -x 8 "
+        "&& " + managed_ssh_config_include_command(home_path=home_path)
+    )
+
+
 def managed_repository_agent_retirement_command(
     *,
     home_path: str,
@@ -698,15 +850,33 @@ def managed_repository_agent_launch_command(
     workspace_generation: str | None = None,
     runtime_incarnation: str | None = None,
     config_content: str | None = None,
+    key_lifetime_seconds: int | None = None,
 ) -> str:
-    """Retire one predecessor and launch/record one exact replacement agent."""
+    """Retire one predecessor and launch/record one exact replacement agent.
+
+    ``expected_fingerprint`` alone proves locally that the agent holds exactly
+    that key, which is all an identity without a repository can prove;
+    ``probe_url`` additionally proves forge access and requires it.
+    ``key_lifetime_seconds`` loads the key with ``ssh-add -t``, and a
+    fingerprint-proven reuse re-adds it, restarting that lifetime. Managed
+    repositories leave it unset: their key must outlive any pinned job or
+    idle-forever session that never re-attaches, and the forge revokes it.
+    """
 
     slug = _authority_slug(authority_id)
     if isinstance(generation, bool) or int(generation) < 1:
         raise ManagedRepositoryMaterializationError(
             "managed_repository_credential_invalid"
         )
-    if (expected_fingerprint is None) != (probe_url is None):
+    if probe_url is not None and expected_fingerprint is None:
+        raise ManagedRepositoryMaterializationError(
+            "managed_repository_credential_invalid"
+        )
+    if key_lifetime_seconds is not None and (
+        isinstance(key_lifetime_seconds, bool)
+        or not isinstance(key_lifetime_seconds, int)
+        or key_lifetime_seconds < 1
+    ):
         raise ManagedRepositoryMaterializationError(
             "managed_repository_credential_invalid"
         )
@@ -820,11 +990,26 @@ def managed_repository_agent_launch_command(
             f"chmod 600 {shlex.quote(config_path)}; "
         )
     successful_suffix = "" if keep_rollback_trap else "; trap - EXIT"
+    lifetime = (
+        f"-t {int(key_lifetime_seconds)} " if key_lifetime_seconds is not None else ""
+    )
+    load_key = (
+        f"SSH_AUTH_SOCK={shlex.quote(socket_path)} ssh-add {lifetime}- >/dev/null 2>&1"
+    )
+    # A reused resident is re-added only to restart a lifetime, and only when
+    # the fingerprint proves it holds this very key; otherwise stdin is
+    # drained, as before lifetimes existed.
+    reuse_key = (
+        load_key
+        if key_lifetime_seconds is not None and expected_fingerprint is not None
+        else "cat >/dev/null"
+    )
     proof_suffix = ""
-    if expected_fingerprint is not None and probe_url is not None:
-        proof_suffix = (
-            f"; {local_key_proof} || exit 86; "
-            f"GIT_TERMINAL_PROMPT=0 git ls-remote {shlex.quote(probe_url)} "
+    if expected_fingerprint is not None:
+        proof_suffix = f"; {local_key_proof} || exit 86"
+    if probe_url is not None:
+        proof_suffix += (
+            f"; GIT_TERMINAL_PROMPT=0 git ls-remote {shlex.quote(probe_url)} "
             "HEAD >/dev/null"
         )
     return (
@@ -842,10 +1027,11 @@ def managed_repository_agent_launch_command(
         f"exec 9>{shlex.quote(lock_path)}; flock -x 9; "
         + presence
         + publish_config
-        + 'if test "$_srw_agent_reused" = yes; then cat >/dev/null; else '
-        # Keep the generation lock in the launching shell but never let the
-        # long-lived ssh-agent inherit descriptor 9 and wedge later rotations.
-        + f"_srw_agent_output=$(ssh-agent -a {shlex.quote(socket_path)} -s 9>&-); "
+        + f'if test "$_srw_agent_reused" = yes; then {reuse_key}; else '
+        # Keep both locks in the launching shell. Older ssh-agent versions
+        # retain inherited descriptors, so close the generation lock (9) and
+        # the IDE caller's setup lock (8) before launching the resident.
+        + f"_srw_agent_output=$(ssh-agent -a {shlex.quote(socket_path)} -s 9>&- 8>&-); "
         + "_srw_agent_spawned=yes; "
         + "_srw_agent_pid=$(printf '%s\\n' \"$_srw_agent_output\" "
         + "| sed -n 's/^SSH_AGENT_PID=\\([0-9][0-9]*\\);.*$/\\1/p'); "
@@ -873,7 +1059,7 @@ def managed_repository_agent_launch_command(
         + f"'socket={socket_path}' > \"$_srw_state_tmp\"; "
         + 'chmod 600 "$_srw_state_tmp"; '
         + f'mv -f -- "$_srw_state_tmp" {shlex.quote(state_path)}; '
-        + f"SSH_AUTH_SOCK={shlex.quote(socket_path)} ssh-add - >/dev/null 2>&1; fi"
+        + f"{load_key}; fi"
         + proof_suffix
         + successful_suffix
     )
@@ -904,6 +1090,7 @@ def _execute_managed_secret_command(
     secret: str | bytes | bytearray,
     *,
     timeout: int,
+    operation: str = "managed repository credential materialization",
 ) -> bool:
     """Use the stateless claim fence when the backend provides that seam."""
 
@@ -914,10 +1101,31 @@ def _execute_managed_secret_command(
                 command,
                 secret,
                 timeout=timeout,
-                operation="managed repository credential materialization",
+                operation=operation,
             )
         )
     return bool(backend.execute_with_secret_stdin(command, secret, timeout=timeout))
+
+
+def _backend_runtime_authority(backend: Any) -> tuple[str | None, str | None]:
+    """The server-attested ``(workspace_generation, runtime_incarnation)``."""
+
+    runtime_authority = getattr(backend, "managed_repository_runtime_authority", None)
+    if runtime_authority is None:
+        return None, None
+    if not isinstance(runtime_authority, tuple) or len(runtime_authority) != 2:
+        raise ManagedRepositoryMaterializationError(
+            "managed_repository_materialization_failed"
+        )
+    try:
+        return (
+            str(UUID(str(runtime_authority[0]))),
+            str(UUID(str(runtime_authority[1]))),
+        )
+    except (TypeError, ValueError) as exc:
+        raise ManagedRepositoryMaterializationError(
+            "managed_repository_materialization_failed"
+        ) from exc
 
 
 def _materialize_validated_credentials(
@@ -935,37 +1143,14 @@ def _materialize_validated_credentials(
         )
 
     home_path = _backend_managed_home(backend)
-    runtime_authority = getattr(backend, "managed_repository_runtime_authority", None)
-    if runtime_authority is not None:
-        if not isinstance(runtime_authority, tuple) or len(runtime_authority) != 2:
-            raise ManagedRepositoryMaterializationError(
-                "managed_repository_materialization_failed"
-            )
-        try:
-            runtime_workspace_generation = str(UUID(str(runtime_authority[0])))
-            runtime_incarnation = str(UUID(str(runtime_authority[1])))
-        except (TypeError, ValueError) as exc:
-            raise ManagedRepositoryMaterializationError(
-                "managed_repository_materialization_failed"
-            ) from exc
-    else:
-        runtime_workspace_generation = None
-        runtime_incarnation = None
+    runtime_workspace_generation, runtime_incarnation = _backend_runtime_authority(
+        backend
+    )
 
     try:
         setup_ok = _execute_managed_secret_command(
             backend,
-            "mkdir -p ~/.ssh/srw-managed/config.d ~/.ssh/srw-managed/sockets "
-            "~/.ssh/srw-managed/agents "
-            "&& chmod 700 ~/.ssh ~/.ssh/srw-managed "
-            "~/.ssh/srw-managed/config.d ~/.ssh/srw-managed/sockets "
-            "~/.ssh/srw-managed/agents "
-            "&& exec 8>~/.ssh/srw-managed/setup.lock && flock -x 8 "
-            "&& touch ~/.ssh/config "
-            "&& (grep -qxF 'Include ~/.ssh/srw-managed/config.d/*.conf' ~/.ssh/config "
-            "|| printf '\\nInclude ~/.ssh/srw-managed/config.d/*.conf\\n' "
-            ">> ~/.ssh/config) "
-            "&& chmod 600 ~/.ssh/config",
+            managed_ssh_namespace_setup_command(home_path=home_path),
             b"",
             timeout=15,
         )
@@ -981,20 +1166,13 @@ def _materialize_validated_credentials(
         for item in validated:
             authority_slug = item["authority_id"].replace("-", "")
             socket_path = f"{home_path}/.ssh/srw-managed/sockets/{authority_slug}.sock"
-            known_hosts = f"{home_path}/.ssh/srw-managed/known_hosts"
-            config = (
-                f"Host {item['alias']}\n"
-                f"  HostName {item['ssh_host']}\n"
-                f"  Port {item['ssh_port']}\n"
-                "  User git\n"
-                f"  IdentityAgent {socket_path}\n"
-                # This is a dedicated per-authority agent containing exactly one
-                # key. ``IdentitiesOnly yes`` would suppress agent-only keys unless
-                # a matching IdentityFile also existed, defeating the deliberate
-                # no-private-key-file design.
-                "  BatchMode yes\n"
-                "  StrictHostKeyChecking accept-new\n"
-                f"  UserKnownHostsFile {known_hosts}\n"
+            config = render_ssh_identity_config(
+                alias=item["alias"],
+                socket_path=socket_path,
+                known_hosts_path=f"{home_path}/.ssh/srw-managed/known_hosts",
+                host=item["ssh_host"],
+                port=item["ssh_port"],
+                user="git",
             )
             # Replacement is an acknowledged handoff: retire every exact
             # predecessor (including legacy agents whose socket was unlinked),
@@ -1082,9 +1260,14 @@ def materialize_managed_repository_credentials(
 
 __all__ = [
     "ManagedRepositoryMaterializationError",
+    "RESERVED_SSH_HOST_PREFIX",
+    "SSH_AGENT_KEY_LIFETIME_SECONDS",
     "managed_repository_agent_launch_command",
     "managed_repository_agent_retirement_command",
     "managed_repository_agent_zero_command",
+    "managed_ssh_config_include_command",
+    "managed_ssh_namespace_setup_command",
     "materialize_managed_repository_credentials",
+    "render_ssh_identity_config",
     "repository_url_has_credentials",
 ]

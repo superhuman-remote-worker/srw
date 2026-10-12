@@ -480,6 +480,9 @@
             },
             "storage": {
               "$ref": "#/$defs/Quantity"
+            },
+            "requests": {
+              "$ref": "#/$defs/Compute"
             }
           }
         },
@@ -640,6 +643,11 @@
           "properties": {
             "ref": {
               "$ref": "#/$defs/Ref"
+            },
+            "access": {
+              "description": "The level a Session binds this Connector at, for a driver with access levels (a cloud folder: read_only, protected, read_write). Omitted: its project link's default. Only a Session's create request chooses one.",
+              "type": "string",
+              "pattern": "^[A-Za-z][A-Za-z0-9_]{0,62}$"
             }
           }
         },
@@ -819,6 +827,32 @@
         }
       ]
     },
+    "WorkspaceMode": {
+      "enum": [
+        "none",
+        "virtual",
+        "container",
+        "vm"
+      ]
+    },
+    "WorkspaceDefaults": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "jobs": {
+          "$ref": "#/$defs/WorkspaceMode"
+        },
+        "sessions": {
+          "$ref": "#/$defs/WorkspaceMode"
+        },
+        "container": {
+          "$ref": "#/$defs/Name"
+        },
+        "vm": {
+          "$ref": "#/$defs/Name"
+        }
+      }
+    },
     "ProjectDefaults": {
       "type": "object",
       "additionalProperties": false,
@@ -827,7 +861,17 @@
           "$ref": "#/$defs/Name"
         },
         "workspace": {
-          "$ref": "#/$defs/NullableAlias"
+          "oneOf": [
+            {
+              "$ref": "#/$defs/Name"
+            },
+            {
+              "type": "null"
+            },
+            {
+              "$ref": "#/$defs/WorkspaceDefaults"
+            }
+          ]
         },
         "connectors": {
           "$ref": "#/$defs/AliasList"

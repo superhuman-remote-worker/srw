@@ -9,6 +9,8 @@ import pytest
 
 import orchestrator.main
 from orchestrator.services.vm_remote_operation import VMRemoteOperationUnavailable
+from orchestrator.services import snapshot_service as snapshot_service_module
+from orchestrator.services import vm_provisioner as vm_provisioner_module
 
 
 VM_GENERATION = "11111111-1111-4111-8111-111111111111"
@@ -65,7 +67,7 @@ async def test_k8s_same_ip_successor_is_not_captured():
         },
     }
 
-    with patch.object(orchestrator.main, "snapshot_service", service):
+    with patch.object(snapshot_service_module, "snapshot_service", service):
         assert not await control_seams.capture_workspace_snapshot_for_freeze(
             job, job["id"]
         )
@@ -99,7 +101,7 @@ async def test_explicit_vm_uses_one_exact_remote_operation_lease():
     }
 
     with (
-        patch.object(orchestrator.main, "snapshot_service", service),
+        patch.object(snapshot_service_module, "snapshot_service", service),
         patch(
             "orchestrator.services.vm_remote_operation.claim_vm_remote_operation", claim
         ),
@@ -107,8 +109,8 @@ async def test_explicit_vm_uses_one_exact_remote_operation_lease():
         assert await control_seams.capture_workspace_snapshot_for_freeze(job, job["id"])
 
     claim.assert_awaited_once_with(
-        db=orchestrator.main.postgres_db,
-        provisioner=orchestrator.main.vm_provisioner,
+        db=orchestrator.main.app.state.resources.postgres_db,
+        provisioner=vm_provisioner_module.vm_provisioner,
         owner_id="job-vm",
         owner_kind="job",
         operation_kind="snapshot_capture",
@@ -140,7 +142,7 @@ async def test_vm_claim_refusal_sends_no_snapshot_bytes():
     }
 
     with (
-        patch.object(orchestrator.main, "snapshot_service", service),
+        patch.object(snapshot_service_module, "snapshot_service", service),
         patch(
             "orchestrator.services.vm_remote_operation.claim_vm_remote_operation",
             AsyncMock(side_effect=VMRemoteOperationUnavailable("dark")),
@@ -171,7 +173,7 @@ async def test_explicit_local_container_capture_remains_available():
         },
     }
 
-    with patch.object(orchestrator.main, "snapshot_service", service):
+    with patch.object(snapshot_service_module, "snapshot_service", service):
         assert await control_seams.capture_workspace_snapshot_for_freeze(job, job["id"])
 
     service.capture_vm_snapshot.assert_awaited_once_with(

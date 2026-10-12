@@ -74,15 +74,17 @@ from orchestrator.services.grant_enforcement import (
     GrantDenied,
     strip_acknowledged_grants,
 )
+from orchestrator.services.model_availability import (
+    WHERE_SESSION,
+    ModelUnavailable,
+    stale_account_model_reason,
+)
 from orchestrator.services.session_class_policy import protected_cloud_officer_active
 from orchestrator.services.session_runtime_admission import (
     protected_cloud_marker_state,
 )
 from orchestrator.services.session_tool_policy import (
     session_tool_group_disabled_markers,
-)
-from orchestrator.services.session_workspace_policy import (
-    default_session_workspace_backend,
 )
 from orchestrator.services.manifest_execution_snapshot import (
     apply_srw_delivery_bindings,
@@ -130,8 +132,59 @@ class SessionConfigDependencies:
     thread_has_knowledge_scope: Callable[..., Awaitable[bool]]
 
 
+async def _account_model_or_fallback(
+    stored: str | None,
+    *,
+    user_id: str | None,
+    capability: str,
+    slot: str,
+    source: str,
+    store: Any,
+    notices: list[dict[str, Any]] | None,
+) -> str | None:
+    """A stored account preference if it can run, else the system default for
+    the capability, with a notice (unavailable_model_handling.md D2).
+
+    The preference is kept when there is no enabled system default to fall
+    back to: the delivery refusal then names the model the user chose, not
+    the base config's placeholder.
+    """
+    system = None
+    if stored:
+        reason = await stale_account_model_reason(
+            str(stored), user_id=user_id, capability=capability, store=store
+        )
+        if reason is None:
+            return stored
+        system = await store.resolve_default_for_capability(capability)
+        if not system:
+            return stored
+        logger.info(
+            "Account preference %s=%r cannot run (%s); using system default %r",
+            source,
+            stored,
+            reason,
+            system,
+        )
+        if notices is not None:
+            notices.append(
+                {
+                    "slot": slot,
+                    "skipped": str(stored),
+                    "reason": reason,
+                    "used": system,
+                    "source": source,
+                }
+            )
+        return system
+    return await store.resolve_default_for_capability(capability)
+
+
 async def resolve_default_models(
-    user_id: str | None, *, dependencies: "SessionConfigDependencies"
+    user_id: str | None,
+    *,
+    dependencies: "SessionConfigDependencies",
+    notices: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Effective default chat + auxiliary MODEL NAMES for a user (no transport).
 
@@ -142,17 +195,34 @@ async def resolve_default_models(
     ``resolve_config`` applies above the base config's placeholder model and below
     the expert. base_url/api_key for the chosen models are injected into the
     delivery blob, not here. Reused by job dispatch AND session attach.
+
+    A pinned default that can no longer run falls back to the system default
+    instead of being admitted (unavailable_model_handling.md D2); each such
+    fallback is appended to ``notices`` when the caller passes a list, so the
+    returned layer keeps its shape.
     """
     out: dict[str, Any] = {}
     user_settings: dict[str, Any] = {}
     if user_id:
         user_settings = await dependencies.store.get_user_settings(str(user_id)) or {}
-    chat = user_settings.get(
-        "default_model"
-    ) or await dependencies.store.resolve_default_for_capability("chat")
-    aux = user_settings.get(
-        "default_auxiliary_model"
-    ) or await dependencies.store.resolve_default_for_capability("auxiliary")
+    chat = await _account_model_or_fallback(
+        user_settings.get("default_model"),
+        user_id=str(user_id) if user_id else None,
+        capability="chat",
+        slot="llm",
+        source="account.default_model",
+        store=dependencies.store,
+        notices=notices,
+    )
+    aux = await _account_model_or_fallback(
+        user_settings.get("default_auxiliary_model"),
+        user_id=str(user_id) if user_id else None,
+        capability="auxiliary",
+        slot="auxiliary",
+        source="account.default_auxiliary_model",
+        store=dependencies.store,
+        notices=notices,
+    )
     if chat:
         out.setdefault("llm", {})["model"] = chat
     reasoning = user_settings.get("default_reasoning_level")
@@ -270,9 +340,16 @@ async def resolve_session_account_defaults(
     all_user_settings: dict[str, Any] | None = None,
     *,
     dependencies: "SessionConfigDependencies",
+    notices: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
-    """Account-level session fallbacks, always below the selected expert."""
-    out = await resolve_default_models(user_id, dependencies=dependencies)
+    """Account-level session fallbacks, always below the selected expert.
+
+    ``persistent_agent.model`` that can no longer run is dropped in favour of
+    the default chat model, with a notice (see :func:`resolve_default_models`).
+    """
+    out = await resolve_default_models(
+        user_id, dependencies=dependencies, notices=notices
+    )
     if not user_id:
         return out
     settings = (
@@ -282,8 +359,36 @@ async def resolve_session_account_defaults(
     )
     persistent = (settings or {}).get("persistent_agent") or {}
     layer: dict[str, Any] = {}
-    if persistent.get("model"):
-        layer["llm"] = {"model": persistent["model"]}
+    session_model = persistent.get("model")
+    if session_model:
+        reason = await stale_account_model_reason(
+            str(session_model),
+            user_id=str(user_id),
+            capability="chat",
+            store=dependencies.store,
+        )
+        fallback = (out.get("llm") or {}).get("model")
+        if reason is not None and fallback:
+            logger.info(
+                "Account preference persistent_agent.model=%r cannot run (%s); "
+                "using %r",
+                session_model,
+                reason,
+                fallback,
+            )
+            if notices is not None:
+                notices.append(
+                    {
+                        "slot": "llm",
+                        "skipped": str(session_model),
+                        "reason": reason,
+                        "used": fallback,
+                        "source": "account.persistent_agent.model",
+                    }
+                )
+            session_model = None
+    if session_model:
+        layer["llm"] = {"model": session_model}
     interactive: dict[str, Any] = {}
     for key in ("permission_mode", "idle_timeout_minutes"):
         if persistent.get(key) is not None:
@@ -299,7 +404,6 @@ async def resolve_session_account_defaults(
         )
     if headless:
         layer["headless"] = headless
-    layer["workspace"] = {"backend": default_session_workspace_backend(persistent)}
     return deep_merge_dicts(out, layer)
 
 
@@ -310,11 +414,13 @@ async def account_defaults_layer(
 
     Single source for "what the caller's account contributes below the expert",
     so the create forms can render the same resolved config the server will
-    actually build. Sessions get the full session layer — crucially including
-    ``workspace.backend``, which is ``virtual`` by default and therefore does
-    NOT match ``session_base.yaml``'s ``sandbox``; workers get only the
-    default-model floor, matching the ``base_defaults`` the job dispatcher
-    passes. Both mirror the exact calls in ``create_thread`` and the dispatcher.
+    actually build. Sessions get the full session layer (model, interactive
+    and headless preferences); workers get only the default-model floor,
+    matching the ``base_defaults`` the job dispatcher passes. Neither layer
+    carries a workspace tier any more — Slice A2b moved that to the defaults
+    chain (``select_execution_workspace``), so it is no longer an account
+    preference. Both mirror the exact calls in ``create_thread`` and the
+    dispatcher.
 
     Returns ``{}`` for an anonymous caller: with no account there is no layer,
     and the framework base is already the honest answer.
@@ -448,6 +554,13 @@ async def resolve_session_config(
             if status is not None:
                 status.update(state="denied", grant_violations=list(denied.violations))
             raise
+        except ModelUnavailable as unavailable:
+            if status is not None:
+                status.update(
+                    state="model_unavailable",
+                    unavailable_models=[e.as_dict() for e in unavailable.entries],
+                )
+            raise
         except Exception:
             if status is not None:
                 status["state"] = "error"
@@ -489,6 +602,24 @@ async def resolve_session_config(
         base_defaults = await resolve_session_account_defaults(
             user_id, dependencies=dependencies
         )
+        # A Session that predates snapshots, and never materialized a
+        # backend into its config_override, still needs a tier to render.
+        # Slice A2b: that tier comes from the defaults chain, not an account
+        # preference — templates still reach Sessions only through
+        # snapshots, so this renders the tier alone.
+        if not ((request_override or {}).get("workspace") or {}).get("backend"):
+            from orchestrator.services.workspace_defaults_resolution import (
+                resolve_workspace_defaults,
+            )
+            from shared.workspace_defaults import MODE_BACKEND
+
+            resolution = await resolve_workspace_defaults(
+                dependencies.store, role="session", project_id=project_id
+            )
+            base_defaults = {
+                **base_defaults,
+                "workspace": {"backend": MODE_BACKEND[resolution.mode]},
+            }
         project_overrides = None
         if project_id and expert_id:
             link = await dependencies.store.get_project_expert_link(
@@ -625,6 +756,15 @@ async def resolve_session_config(
             # something different from what attach enforces.
             status["grant_violations"] = list(gd.violations)
         raise
+    except ModelUnavailable as unavailable:
+        # Fail closed like a grant denial: falling back to config_name would
+        # run the base YAML model, which has no route either.
+        if status is not None:
+            status.update(
+                state="model_unavailable",
+                unavailable_models=[e.as_dict() for e in unavailable.entries],
+            )
+        raise
     except Exception:
         logger.exception(
             "Session resolve failed for thread %s; falling back to config_name",
@@ -673,6 +813,10 @@ async def require_supported_protected_session_class(
             )
     except HTTPException:
         raise
+    except ModelUnavailable as unavailable:
+        raise HTTPException(
+            status_code=409, detail=unavailable.detail(where=WHERE_SESSION)
+        ) from unavailable
     except Exception as exc:
         raise HTTPException(
             status_code=409,
@@ -737,6 +881,9 @@ async def session_grant_violations(
         return []
     except GrantDenied as gd:
         return list(gd.violations)
+    except ModelUnavailable:
+        # Not a grant matter: session_endpoint_violations reports it.
+        return []
 
 
 async def session_endpoint_violations(
@@ -773,6 +920,8 @@ async def session_endpoint_violations(
     except GrantDenied:
         # The grant pre-flight owns this rejection; don't double-report.
         return []
+    except ModelUnavailable as unavailable:
+        return [unavailable.message(where=WHERE_SESSION)]
     except Exception:
         # Resolve failure → agent falls back to config_name (fail-open), same as
         # session_grant_violations.

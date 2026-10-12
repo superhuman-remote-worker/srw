@@ -13,8 +13,13 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 import json
 import math
-from typing import Any
+from typing import Any, Mapping
 from uuid import UUID, uuid4
+
+from shared.operator_pause_hold import (
+    OPERATOR_PAUSE_HOLD_CONTEXT_KEY,
+    operator_pause_hold_jsonb_sql,
+)
 
 
 COMPLETION_FINALIZING_DETAIL = "completion finalizing"
@@ -40,6 +45,7 @@ class CompletionControlClaim:
     expected_lane: str
     fence_kind: str
     fence_value: str
+    queue_state_before_claim: str | None = None
 
 
 def _json_object(value: Any) -> dict[str, Any]:
@@ -231,6 +237,7 @@ class CompletionControl:
         source: str,
         expected_status: str,
         expected_lane: str,
+        terminal_review_source: Mapping[str, Any] | None = None,
     ) -> CompletionControlClaim:
         """Fence the current executor and durably claim one human mutation.
 
@@ -248,16 +255,40 @@ class CompletionControl:
             raise ValueError("completion control lane must be pinned or stateless")
         if not expected_status or len(expected_status) > 64:
             raise ValueError("completion control expected status is invalid")
+        if terminal_review_source is not None and (
+            source != "public_approve"
+            or expected_status != "pending_review"
+            or expected_lane not in {"stateless", "pinned"}
+        ):
+            raise ValueError("terminal review claim requires final approval")
 
         blocked: CompletionControlDecision | None = None
         claim: CompletionControlClaim | None = None
+        pinned_approve_agent = None
+        if expected_lane == "pinned" and bounded_source == "public_approve":
+            async with self.db.acquire() as probe:
+                pinned_approve_agent = await probe.fetchval(
+                    "SELECT assigned_agent_id FROM jobs WHERE id=$1",
+                    canonical,
+                )
         async with self.db.acquire() as conn:
             async with conn.transaction():
+                if pinned_approve_agent is not None:
+                    if (
+                        await conn.fetchval(
+                            "SELECT id FROM agents WHERE id=$1 FOR UPDATE",
+                            pinned_approve_agent,
+                        )
+                        is None
+                    ):
+                        raise CompletionControlClaimConflict(
+                            "pinned approval agent changed"
+                        )
                 # Global order: queue first, jobs second. Pinned jobs normally
                 # have no row; the lookup still precedes the jobs lock.
                 queue = await conn.fetchrow(
                     """
-                    SELECT unit_kind, state, lease_token
+                    SELECT unit_kind, state, lease_token, leased_by
                     FROM run_queue
                     WHERE unit_id=$1::uuid
                     FOR UPDATE
@@ -267,7 +298,8 @@ class CompletionControl:
                 job = await conn.fetchrow(
                     """
                     SELECT status::text AS status, execution_lane,
-                           assigned_agent_id, context,
+                           assigned_agent_id, context, freeze_data,
+                           workspace_idle_episode, workspace_idle_revision,
                            extract(epoch FROM clock_timestamp())::float8
                                AS db_now_epoch
                     FROM jobs
@@ -281,10 +313,44 @@ class CompletionControl:
                 if (
                     str(job["status"]) != expected_status
                     or str(job["execution_lane"] or "pinned") != expected_lane
+                    or (
+                        expected_lane == "pinned"
+                        and bounded_source == "public_approve"
+                        and job["assigned_agent_id"] != pinned_approve_agent
+                    )
                 ):
                     raise CompletionControlClaimConflict(
                         "job changed while control was being claimed"
                     )
+                pinned_idle_approval = False
+                if expected_lane == "pinned":
+                    idle = await conn.fetchrow(
+                        "SELECT * FROM vm_idle_operations WHERE owner_kind='job' "
+                        "AND owner_id=$1 AND closed_at IS NULL",
+                        canonical,
+                    )
+                    if idle is not None:
+                        if (
+                            bounded_source != "public_approve"
+                            or "release_kind" not in idle
+                            or idle["release_kind"] != "pinned_job"
+                            or idle["pinned_agent_id"] != job["assigned_agent_id"]
+                        ):
+                            raise CompletionControlClaimConflict(
+                                "pinned idle operation owns this control"
+                            )
+                        pinned_idle_approval = True
+                    if terminal_review_source is not None:
+                        from orchestrator.services.vm_idle_phase_approval import (
+                            review_source_snapshot,
+                        )
+
+                        if review_source_snapshot(dict(job)) != dict(
+                            terminal_review_source
+                        ):
+                            raise CompletionControlClaimConflict(
+                                "pinned terminal review source changed"
+                            )
 
                 route = await conn.fetchrow(
                     """
@@ -314,6 +380,22 @@ class CompletionControl:
                             raise CompletionControlClaimConflict(
                                 "stateless worker queue is missing"
                             )
+                        if terminal_review_source is not None:
+                            from orchestrator.services.vm_idle_phase_approval import (
+                                review_source_snapshot,
+                            )
+
+                            if (
+                                bounded_source != "public_approve"
+                                or review_source_snapshot(dict(job))
+                                != dict(terminal_review_source)
+                                or queue["state"] not in {"done", "parked"}
+                                or queue["leased_by"] is not None
+                                or job["assigned_agent_id"] is not None
+                            ):
+                                raise CompletionControlClaimConflict(
+                                    "terminal review worker or source changed"
+                                )
                         fence_kind = "worker_lease"
                         fence_value = str(int(queue["lease_token"]))
                         closed = await conn.fetchrow(
@@ -356,6 +438,11 @@ class CompletionControl:
                     release_agent_sql = (
                         ""
                         if expected_lane == "stateless"
+                        or pinned_idle_approval
+                        or (
+                            expected_lane == "pinned"
+                            and terminal_review_source is not None
+                        )
                         else "assigned_agent_id=NULL,"
                     )
                     updated = await conn.fetchrow(
@@ -408,6 +495,11 @@ class CompletionControl:
                         expected_lane=expected_lane,
                         fence_kind=fence_kind,
                         fence_value=fence_value,
+                        queue_state_before_claim=(
+                            str(queue["state"])
+                            if expected_lane == "stateless"
+                            else None
+                        ),
                     )
 
         if blocked is not None:
@@ -424,6 +516,8 @@ class CompletionControl:
         *,
         source: str,
         expected_agent_id: str | None,
+        operator_hold: bool = False,
+        paused_by: str | None = None,
     ) -> CompletionControlClaim:
         """Publish a pinned pause and retain an external-I/O exclusion marker.
 
@@ -431,6 +525,10 @@ class CompletionControl:
         command: whichever jobs-row status write wins is authoritative. The
         marker only spans the subsequent old-agent/VM pause calls, preventing
         a dispatcher or another control from exposing a successor to stale I/O.
+
+        ``operator_hold`` also stamps the durable operator pause hold in the
+        same write (see :mod:`shared.operator_pause_hold`); it
+        outlives this claim so the released row is not redispatched.
         """
 
         canonical = UUID(str(job_id))
@@ -440,6 +538,37 @@ class CompletionControl:
         expected_agent = (
             UUID(str(expected_agent_id)) if expected_agent_id is not None else None
         )
+        claim_context = f"""jsonb_set(
+                            COALESCE(context, '{{}}'::jsonb),
+                            '{{{COMPLETION_CONTROL_CLAIM_KEY}}}',
+                            jsonb_build_object(
+                                'version', $2::int,
+                                'claim_id', $3::text,
+                                'source', $4::text,
+                                'expected_status', 'paused',
+                                'expected_lane', 'pinned',
+                                'fence_kind', 'assigned_agent',
+                                'fence_value', $5::text,
+                                'claimed_at', to_jsonb(now()),
+                                'expires_epoch', to_jsonb(
+                                    extract(epoch FROM now()) + $6::float8
+                                )
+                            ),
+                            true
+                        )"""
+        hold_args: tuple[Any, ...] = ()
+        if operator_hold:
+            claim_context = (
+                f"jsonb_set({claim_context}, "
+                f"'{{{OPERATOR_PAUSE_HOLD_CONTEXT_KEY}}}', "
+                + operator_pause_hold_jsonb_sql(
+                    hold_id_parameter="$8",
+                    source_parameter="$4",
+                    paused_by_parameter="$9",
+                )
+                + ", true)"
+            )
+            hold_args = (str(uuid4()), paused_by)
 
         async with self.db.acquire() as conn:
             async with conn.transaction():
@@ -488,24 +617,7 @@ class CompletionControl:
                     f"""
                     UPDATE jobs
                     SET status='paused', assigned_agent_id=NULL,
-                        context=jsonb_set(
-                            COALESCE(context, '{{}}'::jsonb),
-                            '{{{COMPLETION_CONTROL_CLAIM_KEY}}}',
-                            jsonb_build_object(
-                                'version', $2::int,
-                                'claim_id', $3::text,
-                                'source', $4::text,
-                                'expected_status', 'paused',
-                                'expected_lane', 'pinned',
-                                'fence_kind', 'assigned_agent',
-                                'fence_value', $5::text,
-                                'claimed_at', to_jsonb(now()),
-                                'expires_epoch', to_jsonb(
-                                    extract(epoch FROM now()) + $6::float8
-                                )
-                            ),
-                            true
-                        ),
+                        context={claim_context},
                         updated_at=CURRENT_TIMESTAMP
                     WHERE id=$1::uuid
                       AND status='processing'
@@ -520,6 +632,7 @@ class CompletionControl:
                     fence_value,
                     float(COMPLETION_CONTROL_CLAIM_SECONDS),
                     expected_agent,
+                    *hold_args,
                 )
                 if updated is None:
                     raise CompletionControlClaimConflict(
@@ -548,13 +661,34 @@ class CompletionControl:
         canonical = UUID(claim.job_id)
         async with self.db.acquire() as conn:
             async with conn.transaction():
+                if (
+                    claim.expected_lane == "pinned"
+                    and claim.source == "public_approve"
+                    and claim.fence_value != "unassigned"
+                ):
+                    try:
+                        agent_id = UUID(claim.fence_value)
+                    except ValueError as exc:
+                        raise CompletionControlClaimConflict(
+                            "pinned approval agent identity invalid"
+                        ) from exc
+                    if (
+                        await conn.fetchval(
+                            "SELECT id FROM agents WHERE id=$1 FOR UPDATE",
+                            agent_id,
+                        )
+                        is None
+                    ):
+                        raise CompletionControlClaimConflict(
+                            "pinned approval agent changed"
+                        )
                 await conn.fetchrow(
                     "SELECT unit_id FROM run_queue WHERE unit_id=$1::uuid FOR UPDATE",
                     canonical,
                 )
                 job = await conn.fetchrow(
                     """
-                    SELECT status::text AS status, execution_lane, context,
+                    SELECT status::text AS status, execution_lane, assigned_agent_id, context,
                            extract(epoch FROM clock_timestamp())::float8
                                AS db_now_epoch
                     FROM jobs WHERE id=$1::uuid FOR UPDATE
@@ -565,6 +699,12 @@ class CompletionControl:
                     job is None
                     or str(job["status"]) != claim.expected_status
                     or str(job["execution_lane"] or "pinned") != claim.expected_lane
+                    or (
+                        claim.expected_lane == "pinned"
+                        and claim.source == "public_approve"
+                        and str(job.get("assigned_agent_id") or "unassigned")
+                        != claim.fence_value
+                    )
                     or not completion_control_claim_owned_active(
                         job["context"],
                         claim.claim_id,

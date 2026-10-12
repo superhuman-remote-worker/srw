@@ -191,6 +191,15 @@ sudo install -o root -g root -m 0644 /tmp/code-server.service /etc/systemd/syste
 sudo systemctl daemon-reload
 # Intentionally NOT `systemctl enable`d — the orchestrator manages it over SSH.
 
+# The owner-authorized live IDE starts an agent-host user unit.  A lingering
+# user manager survives the SSH channel used to request startup; the unit is
+# deliberately not enabled, so no code-server process starts at guest boot.
+sudo install -d -o agent-host -g agent-host -m 0755 /home/agent-host/.config/systemd/user
+sudo install -o agent-host -g agent-host -m 0644 \
+  /tmp/srw-code-server-user.service \
+  /home/agent-host/.config/systemd/user/srw-code-server-user.service
+sudo loginctl enable-linger agent-host
+
 # user-data-dir / extensions-dir live outside $HOME (see config). code-server
 # runs as agent-host, so agent-host must own this tree.
 sudo mkdir -p /var/lib/code-server/extensions

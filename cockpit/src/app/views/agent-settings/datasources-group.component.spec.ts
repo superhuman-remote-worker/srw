@@ -5,10 +5,19 @@ import {
   datasourceSelectionDifferenceCount,
   datasourceSetKey,
   isRepositoryDatasource,
+  requiresShellWorkspace,
   selectedDatasourceIds,
   DatasourcesGroupComponent,
 } from './datasources-group.component';
 import {DatasourceType, EligibleDatasource} from '../../core/models/api.model';
+import {
+  ConnectorDriverMatrix,
+  driverForType,
+} from '../../core/models/connector-driver.model';
+// The API's own capability matrix for the built-in drivers.
+import driversFixture from '../../core/models/fixtures/connector-drivers.json';
+
+const BUILTIN_DRIVERS = (driversFixture as unknown as ConnectorDriverMatrix).drivers;
 
 /**
  * Selection logic for the explicit-only datasource picker: server-computed
@@ -130,10 +139,131 @@ describe('datasources-group selection logic', () => {
     expect(activeDatasourceIds(ds, null, new Set(['auto']))).toEqual(new Set(['auto']));
   });
 
+  it("preselects a project's own connectors whatever the rollout gate says", () => {
+    const folder = {...makeDs('folder', 'cloud_folder', true), managed_key: 'project-cloud:p1'};
+    // Written before the key: only the older marker says it is the project's.
+    const kb = {...makeDs('kb', 'kb', true), config: {native_project_id: 'p1'}};
+    const shared = makeDs('shared', 'postgresql', true);
+    const ds = [folder, kb, shared];
+    // Gate off: the platform-owned defaults only, never another default.
+    expect(activeDatasourceIds(ds, null)).toEqual(new Set(['folder', 'kb']));
+    expect(datasourceSelectionDifferenceCount(ds, null)).toBe(0);
+    // Gate on: every server default.
+    expect(activeDatasourceIds(ds, null, undefined, true)).toEqual(
+      new Set(['folder', 'kb', 'shared']),
+    );
+    // A platform-owned row the server does not default (another project's
+    // folder) stays off; so does a marker on a row that is no KB.
+    const foreign = {...makeDs('foreign', 'cloud_folder'), managed_key: 'project-cloud:p2'};
+    const marked = {...makeDs('marked', 'postgresql', true), config: {native_project_id: 'p1'}};
+    expect(activeDatasourceIds([foreign, marked], null)).toEqual(new Set());
+    // Live mode keeps the session's attached set, platform rows or not.
+    expect(activeDatasourceIds(ds, null, new Set(['shared']))).toEqual(new Set(['shared']));
+  });
+
+  it("a project's own connector is removable, and removing every one sends none", () => {
+    const folder = {...makeDs('folder', 'cloud_folder', true), managed_key: 'project-cloud:p1'};
+    const kb = {...makeDs('kb', 'kb', true), managed_key: 'project-kb:p1'};
+    const ds = [folder, kb];
+    const withoutFolder = {
+      key: datasourceSetKey(ds),
+      ids: new Set(['kb']),
+      touched: new Set(['folder']),
+    };
+    expect(selectedDatasourceIds(ds, withoutFolder, false)).toEqual(['kb']);
+    expect(datasourceSelectionDifferenceCount(ds, withoutFolder)).toBe(1);
+    const none = {key: datasourceSetKey(ds), ids: new Set<string>(), touched: new Set(['folder', 'kb'])};
+    // The explicit empty list the create form sends: no connector at all.
+    expect(selectedDatasourceIds(ds, none, false)).toEqual([]);
+    expect(datasourceSelectionDifferenceCount(ds, none)).toBe(2);
+  });
+
   it('isRepositoryDatasource is case-insensitive', () => {
     expect(isRepositoryDatasource('repository')).toBe(true);
     expect(isRepositoryDatasource('Repository')).toBe(true);
     expect(isRepositoryDatasource('postgresql')).toBe(false);
+  });
+
+  it('requiresShellWorkspace matches the drivers that need a shell', () => {
+    for (const type of [
+      'repository',
+      'credentials',
+      'generic',
+      'ssh_key',
+      'Generic',
+      'kubeconfig',
+      'generic_file',
+    ]) {
+      expect(requiresShellWorkspace(type)).toBe(true);
+    }
+    for (const type of ['kb', 'postgresql', 'email', 'mcp']) {
+      expect(requiresShellWorkspace(type)).toBe(false);
+    }
+  });
+
+  it('excludes generic and SSH-key connectors under a lite backend', () => {
+    const ds = [
+      makeDs('env', 'generic', true),
+      makeDs('key', 'ssh_key', true),
+      makeDs('pg', 'postgresql', true),
+    ];
+    expect(selectedDatasourceIds(ds, null, true, undefined, true)).toEqual(['pg']);
+  });
+
+  it('reads the matrix: a driver needs a shell when its backends leave a lite tier out', () => {
+    // The built-ins agree with the fallback copy, type by type.
+    for (const driver of BUILTIN_DRIVERS) {
+      if (!driver.legacy_type) continue;
+      expect(requiresShellWorkspace(driver.legacy_type, BUILTIN_DRIVERS)).toBe(
+        requiresShellWorkspace(driver.legacy_type),
+      );
+    }
+    // A driver that changes its backends is followed, both ways.
+    const shellGeneric = BUILTIN_DRIVERS.map((driver) =>
+      driver.legacy_type === 'generic'
+        ? {...driver, supported_backends: ['none', 'sandbox', 'virtual', 'vm']}
+        : driver.legacy_type === 'postgresql'
+          ? {...driver, supported_backends: ['sandbox', 'virtual', 'vm']}
+          : driver,
+    );
+    expect(requiresShellWorkspace('generic', shellGeneric)).toBe(false);
+    expect(requiresShellWorkspace('postgresql', shellGeneric)).toBe(true);
+    const ds = [makeDs('env', 'generic', true), makeDs('pg', 'postgresql', true)];
+    expect(selectedDatasourceIds(ds, null, true, undefined, true, shellGeneric)).toEqual(['env']);
+    expect(allDatasourcesSelected(ds, null, true, undefined, undefined, true, shellGeneric)).toBe(true);
+  });
+
+  it('keeps the fallback copy for a type the matrix does not list', () => {
+    expect(requiresShellWorkspace('repository', [])).toBe(true);
+    expect(requiresShellWorkspace('kb', null)).toBe(false);
+  });
+});
+
+describe("datasources-group the creator's read-only tag", () => {
+  function picker(): DatasourcesGroupComponent {
+    const component = Object.create(DatasourcesGroupComponent.prototype);
+    component.connectorDrivers = {
+      forType: (type: string) => driverForType(BUILTIN_DRIVERS, type),
+    };
+    return component;
+  }
+
+  it('badges a private row its creator tagged read-only', () => {
+    const component = picker();
+    const row = (type: string, over: Partial<EligibleDatasource>) => ({
+      ...makeDs('ds', type),
+      ...over,
+    });
+    // Every user's agents get its read tools only (decision 31).
+    expect(component.isPrivateReadOnly(row('postgresql', {read_only: true}))).toBe(true);
+    expect(component.isPrivateReadOnly(row('postgresql', {read_only: false}))).toBe(false);
+    expect(component.isPrivateReadOnly(row('postgresql', {read_only: null}))).toBe(false);
+    // A public row keeps its own badge.
+    expect(
+      component.isPrivateReadOnly(row('postgresql', {read_only: true, is_global: true})),
+    ).toBe(false);
+    // An MCP server binds every tool it lists, whatever the flag says.
+    expect(component.isPrivateReadOnly(row('mcp', {read_only: true}))).toBe(false);
   });
 });
 

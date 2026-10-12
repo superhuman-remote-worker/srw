@@ -33,6 +33,7 @@ from __future__ import annotations
 import asyncio
 from typing import Callable, Coroutine
 
+from orchestrator.services.application_tasks import drain_task_mapping
 
 ProtectedEngageKey = tuple[str, str]
 
@@ -90,6 +91,19 @@ class CloudTaskRegistry:
                 self._stage.pop(key, None)
 
         self._stage[key] = asyncio.create_task(_run())
+
+    # -- shutdown ---------------------------------------------------------
+    async def drain(self) -> None:
+        """Cancel and await every in-flight engage and stage (R1.B12).
+
+        The application calls this at shutdown, before its stores close. Both
+        halves are cancelled before either is awaited; each body runs its own
+        cancellation path (the thread advisory lock it holds is released by
+        its context manager). Afterwards both registries are empty — including
+        a stage cancelled before it started, whose own ``finally`` never ran —
+        and usable.
+        """
+        await drain_task_mapping(self._protected_engage, self._stage)
 
     # -- inspection -------------------------------------------------------
     # The live mappings, not copies: existing suites reach into these to seed a

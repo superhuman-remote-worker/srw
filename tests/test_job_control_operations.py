@@ -17,6 +17,7 @@ from orchestrator.services.job_controls import (
     JobControlDependencies,
     JobControlOperations,
 )
+from orchestrator.schemas import job_controls as job_controls_module
 
 
 JOB_ID = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
@@ -306,9 +307,165 @@ async def test_command_mode_resume_queues_stateless_before_agent_delivery(
         priority=7,
         fair_key="user-a",
         expected_status="paused",
+        lift_operator_pause_hold="",
     )
     operations.dependencies.resume_job_on_agent.assert_not_awaited()
     operations.dependencies.trigger_dispatch.assert_called_once_with()
+
+
+@pytest.mark.asyncio
+async def test_resume_joins_idle_vm_wake_before_missing_workspace_shed(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("WORKSPACE_IDLE_RELEASE_ENABLED", "false")
+    store = MagicMock()
+    store.prepare_stateless_job_for_workspace_resume = AsyncMock(return_value=True)
+    operations = _operations(tmp_path, store=store)
+    job = {
+        **_frozen_job(execution_lane="stateless"),
+        "context": {
+            "vm": {"status": "suspended", "_suspend_remote_io_closed": REQUEST_ID}
+        },
+    }
+    operations.dependencies.get_vm_context.return_value = job["context"]["vm"]
+    with patch(
+        "orchestrator.services.vm_idle_lifecycle.VMIdleLifecycleStore"
+    ) as idle_class:
+        idle = idle_class.return_value
+        idle.schema_available = AsyncMock(return_value=True)
+        idle.get_open_for_owner = AsyncMock(return_value={"id": REQUEST_ID})
+        idle.request_wake = AsyncMock(return_value={"phase": "waking"})
+        result = await operations.resume_job_internal(
+            JOB_ID,
+            user={"id": "user-a"},
+            job=job,
+        )
+
+    assert result["status"] == "waking"
+    idle.request_wake.assert_awaited_once_with(JOB_ID, execution_requested=True)
+    operations.dependencies.prepare_job_workspace_runtime.assert_not_awaited()
+    store.prepare_stateless_job_for_workspace_resume.assert_not_awaited()
+
+
+def _operator_paused_job() -> dict:
+    return {
+        "id": JOB_ID,
+        "status": "paused",
+        "execution_lane": "pinned",
+        "assigned_agent_id": None,
+        "context": {"_operator_pause_hold": {"version": 1, "hold_id": "hold-1"}},
+    }
+
+
+@pytest.mark.asyncio
+async def test_command_mode_resume_lifts_only_the_observed_operator_pause_hold(
+    tmp_path: Path,
+) -> None:
+    store = MagicMock()
+    store.queue_job_for_resume = AsyncMock(return_value=True)
+    operations = _operations(tmp_path, store=store, completion_commands_enabled=True)
+
+    result = await operations.resume_job_internal(
+        JOB_ID, user={"id": "user-a"}, job=_operator_paused_job()
+    )
+
+    assert result["status"] == "queued"
+    store.queue_job_for_resume.assert_awaited_once_with(
+        JOB_ID, None, expected_status="paused", lift_operator_pause_hold="hold-1"
+    )
+
+
+@pytest.mark.asyncio
+async def test_legacy_resume_of_a_held_job_requeues_through_the_guarded_write(
+    tmp_path: Path,
+) -> None:
+    """Flag off: lifting a hold never takes the direct path's plain merge."""
+    store = MagicMock()
+    store.merge_job_context = AsyncMock()
+    store.claim_job_for_agent = AsyncMock(return_value=True)
+    store.queue_job_for_resume = AsyncMock(return_value=True)
+    operations = _operations(tmp_path, store=store)
+
+    result = await operations.resume_job_internal(
+        JOB_ID,
+        user={"id": "user-a"},
+        job=_operator_paused_job(),
+        request=job_controls_module.JobResumeRequest(
+            agent_id="agent-a", feedback="focus"
+        ),
+    )
+
+    assert result["status"] == "queued"
+    # The guarded write appends this feedback to whatever queued behind the
+    # hold; the direct path's merge_job_context would have replaced it.
+    assert store.queue_job_for_resume.await_args.kwargs["lift_operator_pause_hold"] == (
+        "hold-1"
+    )
+    store.merge_job_context.assert_not_awaited()
+    store.claim_job_for_agent.assert_not_awaited()
+    operations.dependencies.resume_job_on_agent.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "refreshed_context, feedback, joins",
+    [
+        # A double-click: the winner lifted this exact hold with the same text.
+        (
+            {
+                "last_operator_pause_hold": {"hold_id": "hold-1"},
+                "queued_feedback": "focus",
+            },
+            "focus",
+            True,
+        ),
+        ({"last_operator_pause_hold": {"hold_id": "hold-1"}}, None, True),
+        # A newer pause landed: a real conflict.
+        (
+            {
+                "last_operator_pause_hold": {"hold_id": "hold-1"},
+                "_operator_pause_hold": {"hold_id": "hold-2"},
+            },
+            None,
+            False,
+        ),
+        # The winner queued different feedback: this request's would be lost.
+        (
+            {
+                "last_operator_pause_hold": {"hold_id": "hold-1"},
+                "queued_feedback": "other",
+            },
+            "focus",
+            False,
+        ),
+    ],
+)
+async def test_concurrent_resume_of_the_same_hold_is_idempotent(
+    tmp_path: Path, refreshed_context, feedback, joins
+) -> None:
+    store = MagicMock()
+    store.queue_job_for_resume = AsyncMock(return_value=False)
+    store.get_job = AsyncMock(
+        return_value={**_operator_paused_job(), "context": refreshed_context}
+    )
+    operations = _operations(tmp_path, store=store, completion_commands_enabled=True)
+    request = job_controls_module.JobResumeRequest(feedback=feedback)
+
+    if joins:
+        result = await operations.resume_job_internal(
+            JOB_ID, user={"id": "user-a"}, job=_operator_paused_job(), request=request
+        )
+        assert result["status"] == "queued"
+    else:
+        with pytest.raises(HTTPException) as raised:
+            await operations.resume_job_internal(
+                JOB_ID,
+                user={"id": "user-a"},
+                job=_operator_paused_job(),
+                request=request,
+            )
+        assert raised.value.status_code == 409
 
 
 @pytest.mark.asyncio
@@ -358,23 +515,114 @@ async def test_public_vm_delete_stands_down_before_recovery_owned_cleanup(
     )
     provisioner.release_vm_captured = AsyncMock()
     provisioner.delete_vm = AsyncMock(return_value=True)
-    operations.dependencies.recovery_store.acquire_cleanup_permit = AsyncMock(
-        return_value=SimpleNamespace(
-            allowed=False,
-            reason="workspace_recovery_unresolved",
+    with (
+        patch(
+            "orchestrator.services.vm_job_retained_disk_purge.acquire_job_retained_disk_purge",
+            new_callable=AsyncMock,
+            return_value=None,
+        ),
+        patch(
+            "orchestrator.services.job_controls.acquire_vm_cleanup_permit",
+            new_callable=AsyncMock,
+        ) as acquire,
+    ):
+        acquire.return_value = SimpleNamespace(
+            allowed=False, reason="workspace_recovery_unresolved"
         )
-    )
-
-    with pytest.raises(HTTPException) as refused:
-        await operations.delete_vm(JOB_ID)
+        with pytest.raises(HTTPException) as refused:
+            await operations.delete_vm(JOB_ID)
 
     assert refused.value.status_code == 409
     provisioner.capture_vm_teardown_identity.assert_awaited_once_with(
         JOB_ID, entity_type="job"
     )
-    operations.dependencies.recovery_store.acquire_cleanup_permit.assert_awaited_once()
+    acquire.assert_awaited_once()
     provisioner.release_vm_captured.assert_not_awaited()
     provisioner.delete_vm.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("retained_stop", [False, True])
+async def test_retained_selector_checks_old_stop_before_requiring_runtime_uids(
+    retained_stop: bool,
+) -> None:
+    from orchestrator.services.vm_job_retained_disk_purge import (
+        acquire_job_retained_disk_purge,
+    )
+
+    conn = MagicMock()
+    conn.execute = AsyncMock()
+    conn.fetchrow = AsyncMock(return_value={"id": JOB_ID})
+    conn.fetchval = AsyncMock(return_value=retained_stop)
+
+    @asynccontextmanager
+    async def scope():
+        yield conn
+
+    conn.transaction = scope
+    store = SimpleNamespace(db=SimpleNamespace(acquire=scope))
+    identity = SimpleNamespace(
+        provision_generation="aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        vm_uid=None,
+        rootdisk_pvc_uid=None,
+    )
+
+    result = await acquire_job_retained_disk_purge(
+        store, job_id=JOB_ID, identity=identity
+    )
+
+    if retained_stop:
+        assert result.allowed is False
+        assert result.reason == "retained_disk_identity_unproven"
+    else:
+        assert result is None
+    conn.fetchval.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_public_vm_delete_unallocated_job_keeps_ordinary_cleanup_path(
+    tmp_path: Path,
+) -> None:
+    operations = _operations(tmp_path)
+    provisioner = operations.dependencies.vm_provisioner
+    provisioner.lifecycle_available = True
+    provisioner.capture_vm_teardown_identity = AsyncMock(
+        return_value=SimpleNamespace(
+            provision_generation="aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+            vm_uid=None,
+            rootdisk_pvc_uid=None,
+        )
+    )
+    provisioner.release_vm_captured = AsyncMock(
+        return_value=SimpleNamespace(disposition="completed")
+    )
+    conn = MagicMock()
+    conn.execute = AsyncMock()
+    conn.fetchval = AsyncMock(return_value=False)
+
+    @asynccontextmanager
+    async def scope():
+        yield conn
+
+    conn.transaction = scope
+    operations.dependencies.recovery_store.db = SimpleNamespace(acquire=scope)
+    with (
+        patch(
+            "orchestrator.services.job_controls.acquire_vm_cleanup_permit",
+            new_callable=AsyncMock,
+            return_value=SimpleNamespace(allowed=True, completed_outcome=None),
+        ) as acquire,
+        patch(
+            "orchestrator.services.job_controls.complete_vm_cleanup_permit",
+            new_callable=AsyncMock,
+        ) as complete,
+    ):
+        result = await operations.delete_vm(JOB_ID)
+
+    assert result == {"status": "deleting", "job_id": JOB_ID}
+    acquire.assert_awaited_once()
+    provisioner.release_vm_captured.assert_awaited_once()
+    complete.assert_awaited_once()
 
 
 @pytest.mark.asyncio
@@ -394,20 +642,133 @@ async def test_public_vm_delete_retains_cleanup_permit_on_ambiguous_outcome(
         return_value=SimpleNamespace(disposition="retry_pending")
     )
     recovery_store = operations.dependencies.recovery_store
-    recovery_store.acquire_cleanup_permit = AsyncMock(
-        return_value=SimpleNamespace(
-            allowed=True,
-            admission_id="dddddddd-dddd-4ddd-8ddd-dddddddddddd",
-        )
+    permit = SimpleNamespace(
+        allowed=True,
+        admission_id="dddddddd-dddd-4ddd-8ddd-dddddddddddd",
     )
     recovery_store.complete_cleanup_permit = AsyncMock()
 
-    with pytest.raises(HTTPException) as pending:
-        await operations.delete_vm(JOB_ID)
+    with (
+        patch(
+            "orchestrator.services.vm_job_retained_disk_purge.acquire_job_retained_disk_purge",
+            new_callable=AsyncMock,
+            return_value=None,
+        ),
+        patch(
+            "orchestrator.services.job_controls.acquire_vm_cleanup_permit",
+            new_callable=AsyncMock,
+        ) as acquire,
+    ):
+        acquire.return_value = permit
+        with pytest.raises(HTTPException) as pending:
+            await operations.delete_vm(JOB_ID)
 
     assert pending.value.status_code == 500
     provisioner.release_vm_captured.assert_awaited_once()
     recovery_store.complete_cleanup_permit.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("binding_kind", ["bound", "unbound"])
+async def test_retained_job_delete_uses_only_its_dedicated_purge(
+    tmp_path: Path, binding_kind: str
+) -> None:
+    operations = _operations(tmp_path)
+    provisioner = operations.dependencies.vm_provisioner
+    provisioner.lifecycle_available = True
+    identity = SimpleNamespace(
+        provision_generation="aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        vm_uid="bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+        rootdisk_pvc_uid="cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+    )
+    provisioner.capture_vm_teardown_identity = AsyncMock(return_value=identity)
+    provisioner.delete_vm_captured = AsyncMock(
+        return_value=SimpleNamespace(disposition="completed")
+    )
+    provisioner.release_vm_captured = AsyncMock()
+    permit = SimpleNamespace(
+        allowed=True,
+        admission_id="dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+        parent_cleanup={"admission_id": "dddddddd-dddd-4ddd-8ddd-dddddddddddd"},
+        completed_outcome=None,
+    )
+    with (
+        patch(
+            "orchestrator.services.vm_job_retained_disk_purge.acquire_job_retained_disk_purge",
+            new_callable=AsyncMock,
+            return_value=permit,
+        ),
+        patch(
+            "orchestrator.services.vm_job_retained_disk_purge.read_job_retained_disk_purge_candidate",
+            new_callable=AsyncMock,
+            return_value={"binding_kind": binding_kind},
+        ),
+        patch(
+            "orchestrator.services.vm_job_retained_disk_purge.complete_job_retained_disk_purge",
+            new_callable=AsyncMock,
+        ) as complete,
+    ):
+        assert await operations.delete_vm(JOB_ID) == {
+            "status": "deleting",
+            "job_id": JOB_ID,
+        }
+    provisioner.release_vm_captured.assert_not_awaited()
+    if binding_kind == "bound":
+        provisioner.delete_vm_captured.assert_not_awaited()
+    else:
+        provisioner.delete_vm_captured.assert_awaited_once_with(
+            JOB_ID,
+            identity,
+            entity_type="job",
+            purge_disk=True,
+            parent_cleanup=permit.parent_cleanup,
+        )
+    complete.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_completed_retained_job_purge_does_not_repeat_controller_effect(
+    tmp_path: Path,
+) -> None:
+    operations = _operations(tmp_path)
+    provisioner = operations.dependencies.vm_provisioner
+    provisioner.lifecycle_available = True
+    provisioner.capture_vm_teardown_identity = AsyncMock(
+        return_value=SimpleNamespace(
+            provision_generation="aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+            vm_uid="bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+            rootdisk_pvc_uid="cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+        )
+    )
+    provisioner.delete_vm_captured = AsyncMock()
+    provisioner.release_vm_captured = AsyncMock()
+    permit = SimpleNamespace(
+        allowed=True,
+        admission_id="dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+        parent_cleanup={},
+        completed_outcome="completed",
+    )
+    with (
+        patch(
+            "orchestrator.services.vm_job_retained_disk_purge.acquire_job_retained_disk_purge",
+            new_callable=AsyncMock,
+            return_value=permit,
+        ),
+        patch(
+            "orchestrator.services.vm_job_retained_disk_purge.read_job_retained_disk_purge_candidate",
+            new_callable=AsyncMock,
+            return_value={"binding_kind": "unbound"},
+        ) as candidate,
+        patch(
+            "orchestrator.services.vm_job_retained_disk_purge.complete_job_retained_disk_purge",
+            new_callable=AsyncMock,
+        ) as complete,
+    ):
+        assert (await operations.delete_vm(JOB_ID))["status"] == "deleting"
+    candidate.assert_awaited_once()
+    provisioner.delete_vm_captured.assert_not_awaited()
+    provisioner.release_vm_captured.assert_not_awaited()
+    complete.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -448,8 +809,14 @@ async def test_approve_phase_boundary_requeues_under_completion_claim(
 
 
 @pytest.mark.asyncio
-async def test_upgrade_to_vm_commits_contract_before_dispatch(tmp_path: Path) -> None:
-    job = _frozen_job()
+async def test_upgrade_to_vm_commits_contract_before_dispatch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The VM provisions the shipped chain's VM template: no built-ins declared.
+    monkeypatch.delenv("WORKSPACE_DEFAULTS", raising=False)
+    monkeypatch.delenv("WORKSPACE_BUILTIN_TEMPLATES", raising=False)
+    owner = {"id": "33333333-3333-4333-8333-333333333333"}
+    job = {**_frozen_job(), "user_id": owner["id"]}
     connection = AsyncMock()
     connection.fetchrow = AsyncMock(return_value={"id": JOB_ID})
 
@@ -465,6 +832,7 @@ async def test_upgrade_to_vm_commits_contract_before_dispatch(tmp_path: Path) ->
 
     store = MagicMock()
     store.get_job = AsyncMock(return_value=job)
+    store.get_user = AsyncMock(return_value=owner)
     store.acquire = acquire
     control = _completion_control()
     operations = _operations(tmp_path, store=store, completion_control=control)
@@ -473,6 +841,14 @@ async def test_upgrade_to_vm_commits_contract_before_dispatch(tmp_path: Path) ->
 
     result = await operations.upgrade_job_to_vm_internal(JOB_ID)
 
+    store.get_user.assert_awaited_once_with(owner["id"])
+    vm_updates = json.loads(connection.fetchrow.await_args.args[1])
+    assert vm_updates["upgrade_config"] == {}
+    assert vm_updates["upgrade_sources"] == {
+        "tier": "upgrade",
+        "template": "builtin",
+        "template_name": None,
+    }
     sql = connection.fetchrow.await_args.args[0]
     assert "assignment_source" in connection.fetchrow.await_args.args[5]
     assert "status = 'paused', freeze_data = NULL" in sql
@@ -484,6 +860,133 @@ async def test_upgrade_to_vm_commits_contract_before_dispatch(tmp_path: Path) ->
         hook="vm_upgrade",
     )
     assert result["status"] == "approved_vm_upgrade"
+
+
+@pytest.mark.asyncio
+async def test_an_ownerless_job_upgrades_to_a_bare_vm(tmp_path: Path) -> None:
+    # Trusted internal callers and their subjobs create Jobs without an owner:
+    # nobody to read templates as, so the VM is provisioned as it always was.
+    connection = AsyncMock()
+    connection.fetchrow = AsyncMock(return_value={"id": JOB_ID})
+
+    @asynccontextmanager
+    async def transaction():
+        yield
+
+    connection.transaction = transaction
+
+    @asynccontextmanager
+    async def acquire():
+        yield connection
+
+    store = MagicMock()
+    store.get_job = AsyncMock(return_value={**_frozen_job(), "user_id": None})
+    store.get_user = AsyncMock()
+    store.acquire = acquire
+    operations = _operations(
+        tmp_path, store=store, completion_control=_completion_control()
+    )
+    operations.dependencies.vm_provisioner.is_available = True
+    operations.dependencies.vm_provisioner.mode = "same-cluster"
+
+    result = await operations.upgrade_job_to_vm_internal(JOB_ID)
+
+    assert result["status"] == "approved_vm_upgrade"
+    store.get_user.assert_not_awaited()
+    vm_updates = json.loads(connection.fetchrow.await_args.args[1])
+    assert (vm_updates["upgrade_config"], vm_updates["upgrade_sources"]) == ({}, None)
+
+
+# What the provisioner and the controller actually record: SSH transport,
+# pod/VM coordinates and identities, generation authority, host-key pin.
+_VM_CONTEXT = {
+    "status": "ready",
+    "provisioner": "http",
+    "provision_generation": "7d5c6a0e-2f7e-4d55-9d1e-0c6f0b3f1a11",
+    "vm_name": "srw-vm-aaaaaaaa",
+    "namespace": "srw-vms",
+    "ssh_host": "10.42.0.17",
+    "ssh_port": 2222,
+    "ssh_host_key_fingerprint": "SHA256:hostkeypin",
+    "ssh_registration_id": "reg-1",
+    "vm_uid": "vm-uid-1",
+    "rootdisk_pvc_uid": "pvc-uid-1",
+}
+_LIVE_STATUS = {
+    "job_id": JOB_ID,
+    "vm_name": "srw-vm-aaaaaaaa",
+    "namespace": "srw-vms",
+    "ready": True,
+    "phase": "Running",
+    "created": True,
+    "vm_uid": "vm-uid-1",
+    "provision_generation": "7d5c6a0e-2f7e-4d55-9d1e-0c6f0b3f1a11",
+    "vmi_phase": "Running",
+    "pod_ip": "10.42.0.17",
+    "active_pod_uid": "pod-uid-1",
+    "credential_runtime_started": True,
+}
+_VM_COORDINATES = (
+    "10.42.0.17",
+    "2222",
+    "SHA256:hostkeypin",
+    "srw-vm-aaaaaaaa",
+    "srw-vms",
+    "vm-uid-1",
+    "pod-uid-1",
+    "pvc-uid-1",
+    "reg-1",
+    "7d5c6a0e",
+)
+
+
+@pytest.mark.asyncio
+async def test_vm_status_returns_the_job_apis_coordinate_free_view(
+    tmp_path: Path,
+) -> None:
+    """``GET /api/vms/{job_id}`` is gated by ``require_job_access`` — any
+    project member — and the job API deliberately strips ``context.vm`` from
+    that audience (``redact_job_config_override``). This route handed the raw
+    branch and the raw controller reply to the same callers."""
+    operations = _operations(tmp_path)
+    provisioner = operations.dependencies.vm_provisioner
+    provisioner.lifecycle_available = True
+    provisioner.query_status = AsyncMock(return_value=dict(_LIVE_STATUS))
+    job = {"id": JOB_ID, "status": "processing", "context": {"vm": _VM_CONTEXT}}
+
+    result = await operations.get_vm_status(JOB_ID, job, live=True)
+
+    assert result == {
+        "job_id": JOB_ID,
+        "vm": {"status": "ready"},
+        "live": {
+            "status": None,
+            "ready": True,
+            "phase": "Running",
+            "vmi_phase": "Running",
+            "created": True,
+        },
+    }
+    rendered = json.dumps(result)
+    for coordinate in _VM_COORDINATES:
+        assert coordinate not in rendered
+    provisioner.query_status.assert_awaited_once_with(JOB_ID)
+
+
+@pytest.mark.asyncio
+async def test_vm_status_carries_the_job_apis_attention_message(
+    tmp_path: Path,
+) -> None:
+    operations = _operations(tmp_path)
+    vm = {**_VM_CONTEXT, "status": "retiring_process_zero"}
+
+    result = await operations.get_vm_status(
+        JOB_ID, {"id": JOB_ID, "context": {"vm": vm}}, live=False
+    )
+
+    assert result["vm"]["status"] == "retiring_process_zero"
+    assert result["vm"]["message"].startswith("VM cleanup is waiting")
+    assert "live" not in result
 
 
 def test_extracted_router_openapi_matches_original_surface() -> None:

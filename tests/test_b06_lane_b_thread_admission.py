@@ -23,17 +23,31 @@ from orchestrator.database.postgres import (
     DatasourceMaterializationAuthorizationError,
     DatasourcePolicyConflictError,
 )
+from orchestrator.routers import thread_admission as admission_router
 from orchestrator.schemas.thread_admission import (
     ThreadCreateRequest,
     TrustedThreadSeed,
 )
 from orchestrator.services import thread_admission as ta
+from orchestrator.services.default_experts import ExpertSelection
 
 THREAD = "11111111-1111-4111-8111-111111111111"
 GENERATION = "22222222-2222-4222-8222-222222222222"
 PROJECT = "33333333-3333-4333-8333-333333333333"
 OTHER_PROJECT = "44444444-4444-4444-8444-444444444444"
 USER = {"id": "55555555-5555-4555-8555-555555555555", "is_admin": False}
+ONE_PROJECT_DETAIL = (
+    "A Session can belong to one project at most. Pick one project, or none."
+)
+
+
+@pytest.fixture(autouse=True)
+def _container_sessions(monkeypatch):
+    """Slice A2b: an unpinned Session's tier comes from the defaults chain,
+    not the account preference. These flows exercise container Sessions, so
+    the installation supplies that tier."""
+    monkeypatch.setenv("WORKSPACE_DEFAULTS", '{"sessions": "container"}')
+    monkeypatch.delenv("WORKSPACE_BUILTIN_TEMPLATES", raising=False)
 
 
 def _created_thread(**over: Any) -> dict[str, Any]:
@@ -72,14 +86,25 @@ def _deps(**over: Any) -> ta.ThreadAdmissionDependencies:
         get_officer_thread_for_project=AsyncMock(return_value=None),
         register_project_officer_thread=AsyncMock(return_value={}),
         decommission_project_officer=AsyncMock(),
-        replace_thread_mounts=AsyncMock(),
         list_thread_mounts=AsyncMock(return_value=[]),
-        list_thread_mounts_bulk=AsyncMock(return_value={}),
         list_threads=AsyncMock(return_value=[]),
         merge_thread_workspace_context=AsyncMock(),
         bind_thread_managed_repository=AsyncMock(return_value=True),
         update_thread_main_cloud=AsyncMock(),
         thread_advisory_lock=_lock(),
+        # The policy reads behind an omitted connector list (the session's
+        # own connectors): an approved member with none.
+        get_user=AsyncMock(return_value={"id": USER["id"], "is_approved": True}),
+        user_is_member_of_projects=AsyncMock(return_value=True),
+        list_default_datasource_candidates=AsyncMock(return_value=[]),
+        # The selection's connectors with access levels (main cloud slice 5):
+        # none, unless a test attaches the project's cloud folder.
+        resolve_datasources_for_thread=AsyncMock(return_value=[]),
+        get_user_project_roles=AsyncMock(return_value={}),
+        # A protected folder's project (its frozen source's target), and
+        # the protected session's folder the engage reads back.
+        get_project=AsyncMock(return_value={"id": PROJECT, "name": "Atlas"}),
+        list_protected_selection_rows=AsyncMock(return_value=[]),
     )
     for key, value in store_over.items():
         setattr(store, key, value)
@@ -110,8 +135,6 @@ def _deps(**over: Any) -> ta.ThreadAdmissionDependencies:
         ),
         prefetch_roster_refs=AsyncMock(return_value=None),
         resolve_thread_execution_lane=MagicMock(return_value="pinned"),
-        build_thread_mount_rows=AsyncMock(return_value=[]),
-        should_skip_session_folder=MagicMock(return_value=False),
         enforce_session_create_grants=AsyncMock(),
         check_vm_permission=AsyncMock(),
         resolve_cloud_session_url=MagicMock(return_value=None),
@@ -130,6 +153,8 @@ def _deps(**over: Any) -> ta.ThreadAdmissionDependencies:
         send_session_attach=AsyncMock(return_value=True),
         provision_or_assign=AsyncMock(),
         redact_thread_metadata=MagicMock(side_effect=lambda t: t),
+        bundled_expert_exists=MagicMock(return_value=True),
+        srw_image=MagicMock(return_value="installed:1"),
     )
     fields.update(over)
     return ta.ThreadAdmissionDependencies(**fields)
@@ -137,6 +162,49 @@ def _deps(**over: Any) -> ta.ThreadAdmissionDependencies:
 
 async def _plan(body: ThreadCreateRequest, deps: ta.ThreadAdmissionDependencies):
     return await ta.resolve_thread_creation_plan(body, USER, dependencies=deps)
+
+
+#: The project's own cloud folder connector (main cloud slice 3).
+FOLDER = "66666666-6666-4666-8666-666666666666"
+
+
+def _folder_row() -> dict[str, Any]:
+    return {
+        "id": FOLDER,
+        "name": "Atlas cloud folder",
+        "type": "cloud_folder",
+        "managed_key": f"project-cloud:{PROJECT}",
+        "created_by": USER["id"],
+        "is_global": False,
+        "read_only": None,
+        "project_read_only": None,
+        "project_access": None,
+        "config": {
+            "folder_kind": "project",
+            "project_id": PROJECT,
+            "backend_id": "nextcloud",
+            "backend_instance_id": GENERATION,
+            "folder_handle": (
+                '{"backend": "nextcloud", "native_id": "7", '
+                '"vendor_meta": {"mountpoint": "Atlas"}}'
+            ),
+        },
+    }
+
+
+def _protected_body(**fields: Any) -> ThreadCreateRequest:
+    """The legacy alias, on a session of the project with its folder."""
+    return ThreadCreateRequest(
+        project_id=PROJECT, datasource_ids=[FOLDER], protected_cloud=True, **fields
+    )
+
+
+def _folder_deps(**over: Any) -> ta.ThreadAdmissionDependencies:
+    store = over.pop("store", {})
+    store.setdefault(
+        "resolve_datasources_for_thread", AsyncMock(return_value=[_folder_row()])
+    )
+    return _deps(store=store, **over)
 
 
 # =============================================================================
@@ -209,6 +277,28 @@ class TestConfigOverrideRebuild:
         )
         assert override["workspace"]["backend"] == "virtual"
 
+    @pytest.mark.parametrize("key", ["container", "sandbox"])
+    def test_workspace_container_or_sandbox_is_refused_at_create(self, key):
+        """Container image/resources come only from the selected
+        WorkspaceTemplate; a caller-authored ``workspace.container`` (the old
+        side door) or ``workspace.sandbox`` (the template's rendered form) is
+        refused here, at the New Session create boundary."""
+        with pytest.raises(HTTPException) as exc:
+            ta.build_session_config_override(
+                ThreadCreateRequest(
+                    config_override={
+                        "workspace": {key: {"image": "registry.example/x:1"}}
+                    }
+                ),
+                user_id=USER["id"],
+                dependencies=_deps(),
+            )
+        assert exc.value.status_code == 422
+        assert (
+            "are no longer supported. Put the image and resources in a "
+            "WorkspaceTemplate" in exc.value.detail
+        )
+
     def test_an_unknown_nested_key_is_reported_rather_than_dropped_silently(self):
         override, ignored = ta.build_session_config_override(
             ThreadCreateRequest(config_override={"memory": {"enabled": False}}),
@@ -254,38 +344,58 @@ class TestDatasourceSelection:
         deps.authorize_thread_datasource_selection.assert_awaited_once()
 
     @pytest.mark.asyncio
-    async def test_omission_without_the_gate_selects_nothing(self):
+    async def test_omission_without_the_gate_selects_the_sessions_own(
+        self, monkeypatch
+    ):
+        from orchestrator.services import datasource_policy
+
+        resolver = AsyncMock(return_value=(["kb", "cloud"], {"kb": 1, "cloud": 3}))
+        monkeypatch.setattr(datasource_policy, "default_datasource_selection", resolver)
         deps = _deps()
-        ids, _revisions, provenance = await ta.select_thread_datasources(
+        ids, revisions, provenance = await ta.select_thread_datasources(
             ThreadCreateRequest(),
             USER,
             thread_backend="sandbox",
-            effective_project_ids=[],
+            effective_project_ids=[PROJECT],
             dependencies=deps,
         )
-        assert ids == []
-        assert provenance["origin"] == "omitted_compat"
+        assert ids == ["kb", "cloud"] and revisions == {"kb": 1, "cloud": 3}
+        assert provenance["origin"] == "native_default"
+        resolver.assert_awaited_once_with(
+            deps.store,
+            USER["id"],
+            [PROJECT],
+            "sandbox",
+            execution_kind="session",
+            native_only=True,
+        )
         deps.authorize_thread_datasource_selection.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_defaults_are_resolved_when_the_caller_asks(self, monkeypatch):
         from orchestrator.services import datasource_policy
 
-        monkeypatch.setattr(
-            datasource_policy,
-            "default_datasource_selection",
-            AsyncMock(return_value=(["d1"], {"d1": 2})),
-        )
+        resolver = AsyncMock(return_value=(["d1"], {"d1": 2}))
+        monkeypatch.setattr(datasource_policy, "default_datasource_selection", resolver)
+        deps = _deps()
         ids, revisions, provenance = await ta.select_thread_datasources(
             ThreadCreateRequest(use_datasource_defaults=True),
             USER,
             thread_backend="sandbox",
             effective_project_ids=[PROJECT],
-            dependencies=_deps(),
+            dependencies=deps,
         )
         assert ids == ["d1"] and revisions == {"d1": 2}
         assert provenance["origin"] == "default"
         assert provenance["creation_path"] == "persistent_thread_rest"
+        resolver.assert_awaited_once_with(
+            deps.store,
+            USER["id"],
+            [PROJECT],
+            "sandbox",
+            execution_kind="session",
+            native_only=False,
+        )
 
     @pytest.mark.asyncio
     async def test_an_unavailable_default_is_the_generic_403(self, monkeypatch):
@@ -314,6 +424,145 @@ class TestDatasourceSelection:
 
 
 class TestCreationPlan:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("entrypoint", ["preview", "create"])
+    async def test_projectless_background_officer_is_refused_before_insert(
+        self, monkeypatch, entrypoint
+    ):
+        deps = _deps()
+        monkeypatch.setattr(
+            admission_router, "get_thread_admission_dependencies", lambda _request: deps
+        )
+        body = ThreadCreateRequest(config_override={"officer": {"enabled": True}})
+
+        with pytest.raises(HTTPException) as exc:
+            if entrypoint == "preview":
+                await admission_router.preview_thread_creation(body, MagicMock())
+            else:
+                await admission_router.create_thread(body, MagicMock())
+
+        assert exc.value.status_code == 400
+        assert "exactly one project" in exc.value.detail
+        deps.store.create_thread.assert_not_awaited()
+        deps.provision_or_assign.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("source", ["account", "expert"])
+    async def test_inherited_background_officer_requires_one_project(
+        self, monkeypatch, source
+    ):
+        deps = _deps()
+        if source == "account":
+            deps.resolve_session_account_defaults.return_value = {
+                "workspace": {"backend": "sandbox"},
+                "officer": {"enabled": True},
+            }
+        else:
+            monkeypatch.setattr(
+                ta,
+                "resolve_root_expert",
+                AsyncMock(
+                    return_value=ExpertSelection(
+                        expert={
+                            "id": "expert-1",
+                            "config": {"officer": {"enabled": True}},
+                        },
+                        source="application",
+                    )
+                ),
+            )
+            deps.is_experts_db_enabled.return_value = True
+            deps.user_experts_enabled.return_value = True
+
+        with pytest.raises(HTTPException) as exc:
+            await _plan(ThreadCreateRequest(), deps)
+
+        assert exc.value.status_code == 400
+        assert "exactly one project" in exc.value.detail
+
+    @pytest.mark.asyncio
+    async def test_disabled_inherited_officer_stays_ordinary(self):
+        deps = _deps(
+            resolve_session_account_defaults=AsyncMock(
+                return_value={"officer": {"enabled": True}}
+            )
+        )
+        body = ThreadCreateRequest(config_override={"officer": {"enabled": False}})
+
+        plan = await _plan(body, deps)
+
+        assert plan.effective_project_ids == []
+        assert plan.officer_requested is False
+
+    @pytest.mark.asyncio
+    async def test_a_legacy_primary_cannot_smuggle_a_second_project_into_an_officer(
+        self,
+    ):
+        body = ThreadCreateRequest(
+            project_id=PROJECT,
+            project_ids=[PROJECT, OTHER_PROJECT],
+            config_override={"officer": {"enabled": True}},
+        )
+        object.__setattr__(body, "_officer_post_config_snapshot", {})
+        deps = _deps()
+
+        with pytest.raises(HTTPException) as exc:
+            await _plan(body, deps)
+
+        assert exc.value.status_code == 422
+        assert exc.value.detail == ONE_PROJECT_DETAIL
+        deps.store.create_thread.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("entrypoint", ["preview", "create"])
+    @pytest.mark.parametrize(
+        "projects",
+        [
+            {"project_ids": [PROJECT, OTHER_PROJECT]},
+            {"project_id": PROJECT, "project_ids": [OTHER_PROJECT]},
+        ],
+        ids=["two_project_ids", "project_id_plus_another"],
+    )
+    async def test_two_projects_are_refused_before_any_account_work(
+        self, monkeypatch, entrypoint, projects
+    ):
+        deps = _deps()
+        monkeypatch.setattr(
+            admission_router, "get_thread_admission_dependencies", lambda _request: deps
+        )
+        body = ThreadCreateRequest(**projects)
+
+        with pytest.raises(HTTPException) as exc:
+            if entrypoint == "preview":
+                await admission_router.preview_thread_creation(body, MagicMock())
+            else:
+                await admission_router.create_thread(body, MagicMock())
+
+        assert exc.value.status_code == 422
+        assert exc.value.detail == ONE_PROJECT_DETAIL
+        deps.authorize_thread_project_ids.assert_not_awaited()
+        deps.store.get_user_settings.assert_not_awaited()
+        deps.resolve_session_account_defaults.assert_not_awaited()
+        deps.store.create_thread.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_one_project_is_the_primary_and_writes_no_mount_row(self):
+        """A one-project Session gets that project as threads.project_id: the
+        server adds no personal project beside it. Its cloud folders are its
+        connectors, so no thread_mounts row is written (main cloud slice 8):
+        this store has no writer to call."""
+        body = ThreadCreateRequest(project_ids=[OTHER_PROJECT])
+        deps = _deps()
+
+        plan = await _plan(body, deps)
+        await ta.commit_thread_creation(plan, body, USER, dependencies=deps)
+
+        assert plan.effective_project_ids == [OTHER_PROJECT]
+        assert plan.primary_project_id == OTHER_PROJECT
+        assert plan.create_kwargs["project_id"] == OTHER_PROJECT
+        assert not hasattr(deps, "build_thread_mount_rows")
+        assert not hasattr(deps.store, "replace_thread_mounts")
+
     @pytest.mark.asyncio
     async def test_scope_is_authorized_before_any_account_work(self):
         deps = _deps(
@@ -378,31 +627,43 @@ class TestCreationPlan:
         assert plan.create_kwargs["permission_mode"] == "supervised"
 
     @pytest.mark.asyncio
+    async def test_a_new_session_follows_the_connector_rule_from_birth(self):
+        """Main cloud slice 3: its cloud folders are its attached connectors,
+        so it never converts and End rebuilds that rule."""
+        plan = await _plan(ThreadCreateRequest(), _deps())
+        metadata = plan.create_kwargs["initial_metadata"]
+        assert metadata["cloud_mount_rule"] == "connectors"
+
+    @pytest.mark.asyncio
     async def test_protected_cloud_requires_the_container_tier(self):
-        body = ThreadCreateRequest(
-            protected_cloud=True, config_override={"workspace": {"backend": "virtual"}}
-        )
+        body = _protected_body(config_override={"workspace": {"backend": "virtual"}})
         with pytest.raises(HTTPException) as exc:
-            await _plan(body, _deps())
+            await _plan(body, _folder_deps())
         assert exc.value.status_code == 422
         assert exc.value.detail["code"] == "protected_cloud_unsupported_workspace"
 
     @pytest.mark.asyncio
     async def test_protected_cloud_is_refused_for_the_officer_runtime(self):
-        body = ThreadCreateRequest(
-            protected_cloud=True, config_override={"officer": {"enabled": True}}
-        )
+        body = _protected_body(config_override={"officer": {"enabled": True}})
+        # A commission reaches the connector selection, where a protected
+        # folder is known (main cloud slice 5).
+        body._officer_post_config_snapshot = {}
         with pytest.raises(HTTPException) as exc:
-            await _plan(body, _deps())
+            await _plan(body, _folder_deps())
         assert exc.value.status_code == 422
         assert exc.value.detail["code"] == "protected_cloud_unsupported_session_class"
 
     @pytest.mark.asyncio
     async def test_protected_cloud_stays_pinned_even_when_stateless_is_admitted(self):
-        deps = _deps(resolve_thread_execution_lane=MagicMock(return_value="stateless"))
-        plan = await _plan(ThreadCreateRequest(protected_cloud=True), deps)
+        deps = _folder_deps(
+            resolve_thread_execution_lane=MagicMock(return_value="stateless")
+        )
+        plan = await _plan(_protected_body(), deps)
         assert plan.execution_lane == "pinned"
         assert plan.create_kwargs["initial_metadata"]["protected_cloud"] is True
+        assert plan.create_kwargs["initial_metadata"]["datasource_access"] == {
+            FOLDER: "protected"
+        }
 
     @pytest.mark.asyncio
     async def test_a_hand_rolled_post_owned_key_is_refused_at_the_request_boundary(
@@ -454,10 +715,19 @@ class TestCreationPlan:
         deps.enforce_officer_auto_pull_release.assert_called_once_with(True)
 
     @pytest.mark.asyncio
-    async def test_auto_pull_is_materialized_off_for_an_ordinary_officer(self):
-        body = ThreadCreateRequest(config_override={"officer": {"enabled": True}})
-        plan = await _plan(body, _deps())
-        assert plan.config_override["officer"]["auto_pull"] is False
+    async def test_single_project_server_owned_commission_keeps_post_authority(self):
+        body = ThreadCreateRequest(
+            project_id=PROJECT, config_override={"officer": {"enabled": True}}
+        )
+        object.__setattr__(body, "_officer_post_config_snapshot", {})
+        deps = _deps()
+
+        plan = await _plan(body, deps)
+
+        assert plan.effective_project_ids == [PROJECT]
+        assert plan.officer_requested is True
+        assert plan.explicit_officer_commission is True
+        deps.can_manage_project_officer.assert_awaited_once_with(USER, PROJECT)
 
     @pytest.mark.asyncio
     async def test_a_conference_needs_exactly_one_project(self):
@@ -599,6 +869,187 @@ class TestCreationPlan:
 
 
 # =============================================================================
+# Expert selection: the unified `expert` field and inline experts (creation UI
+# slice S2)
+# =============================================================================
+
+DB_EXPERT = "66666666-6666-4666-8666-666666666666"
+
+
+def _inline(**private: Any) -> dict[str, Any]:
+    return {
+        "inline": {
+            "runtime": {
+                "adapter": "srw/v1",
+                "config": {
+                    "config": {"interactive": {"permission_mode": "auto_accept"}},
+                    "prompts": {"persona": "A terse pair programmer."},
+                    **private,
+                },
+            }
+        }
+    }
+
+
+def _experts_on(monkeypatch, **over: Any) -> tuple[Any, AsyncMock]:
+    resolver = AsyncMock(
+        return_value=ExpertSelection(
+            expert={"id": DB_EXPERT, "config": {}}, source="explicit"
+        )
+    )
+    monkeypatch.setattr(ta, "resolve_root_expert", resolver)
+    deps = _deps(
+        is_experts_db_enabled=MagicMock(return_value=True),
+        user_experts_enabled=AsyncMock(return_value=True),
+        **over,
+    )
+    return deps, resolver
+
+
+class TestExpertSelection:
+    @pytest.mark.asyncio
+    async def test_an_inline_expert_is_frozen_without_identity_or_default(
+        self, monkeypatch
+    ):
+        deps, resolver = _experts_on(monkeypatch)
+        plan = await _plan(
+            ThreadCreateRequest(expert=_inline(), expert_based_on="assistant"), deps
+        )
+
+        resolver.assert_not_awaited()
+        assert plan.config_name == "session_base"
+        assert plan.create_kwargs["config_name"] == "session_base"
+        row = plan.create_kwargs["expert_row"]
+        assert row["expert_type"] == "session"
+        assert row["prompts"] == {"persona": "A terse pair programmer."}
+        assert "id" not in row and "manifest_uid" not in row
+        metadata = plan.create_kwargs["initial_metadata"]
+        assert "expert_id" not in metadata
+        assert metadata["expert_selection_source"] == "inline"
+        assert metadata["expert_based_on"] == "assistant"
+        # The create-time policy resolve read the inline definition: its
+        # permission mode reaches the materialized thread column.
+        assert plan.effective_create_config["interactive"]["permission_mode"] == (
+            "auto_accept"
+        )
+        assert plan.create_kwargs["permission_mode"] == "auto_accept"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "selector",
+        [{"expert_id": DB_EXPERT}, {"config_name": "scholar"}],
+        ids=["expert_id", "config_name"],
+    )
+    async def test_an_inline_expert_cannot_be_combined_with_a_selector(
+        self, monkeypatch, selector
+    ):
+        deps, resolver = _experts_on(monkeypatch)
+        with pytest.raises(HTTPException) as exc:
+            await _plan(ThreadCreateRequest(expert=_inline(), **selector), deps)
+        assert exc.value.status_code == 400
+        assert "inline expert" in exc.value.detail
+        resolver.assert_not_awaited()
+        deps.resolve_session_account_defaults.assert_awaited()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "change,status,fragment",
+        [
+            ({"image": "example.invalid/other:1"}, 422, "installed harness"),
+            ({"config": {"prompts": {"system": "x"}}}, 422, "Unknown prompt keys"),
+            (
+                {"config": {"config": {"llm": {"base_url": "https://evil"}}}},
+                422,
+                "credential",
+            ),
+        ],
+    )
+    async def test_inline_gates_refuse_before_the_policy_resolve(
+        self, monkeypatch, change, status, fragment
+    ):
+        deps, resolver = _experts_on(monkeypatch)
+        expert = _inline()
+        runtime = expert["inline"]["runtime"]
+        if "config" in change:
+            runtime["config"].update(change["config"])
+        else:
+            runtime.update(change)
+        resolve = MagicMock(side_effect=AssertionError("resolved an unvetted expert"))
+        monkeypatch.setattr(ta, "resolve_config", resolve)
+        with pytest.raises(HTTPException) as exc:
+            await _plan(ThreadCreateRequest(expert=expert), deps)
+        assert exc.value.status_code == status
+        assert fragment in str(exc.value.detail)
+        resolve.assert_not_called()
+        deps.store.create_thread.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_a_uuid_expert_selects_the_db_expert(self, monkeypatch):
+        deps, resolver = _experts_on(monkeypatch)
+        plan = await _plan(
+            ThreadCreateRequest(expert=DB_EXPERT, expert_based_on="ignored"), deps
+        )
+        assert resolver.await_args.kwargs["explicit_expert_id"] == DB_EXPERT
+        metadata = plan.create_kwargs["initial_metadata"]
+        assert metadata["expert_id"] == DB_EXPERT
+        assert "expert_based_on" not in metadata
+        assert "expert_row" not in plan.create_kwargs
+
+    @pytest.mark.asyncio
+    async def test_a_bundled_expert_slug_selects_the_bundled_expert(self, monkeypatch):
+        deps, resolver = _experts_on(monkeypatch)
+        plan = await _plan(ThreadCreateRequest(expert="assistant"), deps)
+        resolver.assert_not_awaited()
+        deps.bundled_expert_exists.assert_called_once_with("assistant")
+        assert plan.config_name == "assistant"
+        assert "expert_row" not in plan.create_kwargs
+
+    @pytest.mark.asyncio
+    async def test_an_unknown_bundled_expert_slug_is_refused(self, monkeypatch):
+        deps, _ = _experts_on(
+            monkeypatch, bundled_expert_exists=MagicMock(return_value=False)
+        )
+        with pytest.raises(HTTPException) as exc:
+            await _plan(ThreadCreateRequest(expert="no-such-expert"), deps)
+        assert exc.value.status_code == 400
+        assert "Unknown expert" in exc.value.detail
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "fields",
+        [
+            {"expert": "assistant", "expert_id": DB_EXPERT},
+            {"expert": DB_EXPERT, "config_name": "assistant"},
+            {"expert": "assistant", "config_name": "scholar"},
+        ],
+    )
+    async def test_two_experts_in_one_request_are_refused(self, monkeypatch, fields):
+        deps, resolver = _experts_on(monkeypatch)
+        with pytest.raises(HTTPException) as exc:
+            await _plan(ThreadCreateRequest(**fields), deps)
+        assert exc.value.status_code == 400
+        resolver.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_the_session_base_spelling_is_not_a_choice(self, monkeypatch):
+        deps, resolver = _experts_on(monkeypatch)
+        await _plan(
+            ThreadCreateRequest(expert="session_base", expert_id=DB_EXPERT), deps
+        )
+        assert resolver.await_args.kwargs["explicit_expert_id"] == DB_EXPERT
+
+    @pytest.mark.asyncio
+    async def test_commit_hands_the_inline_definition_to_the_insert(self):
+        deps = _deps()
+        body = ThreadCreateRequest(expert=_inline())
+        plan = await _plan(body, deps)
+        await ta.commit_thread_creation(plan, body, USER, dependencies=deps)
+        kwargs = deps.store.create_thread.await_args.kwargs
+        assert kwargs["expert_row"] is plan.create_kwargs["expert_row"]
+        assert "expert_id" not in kwargs["initial_metadata"]
+
+
+# =============================================================================
 # Commit
 # =============================================================================
 
@@ -653,32 +1104,19 @@ class TestCommit:
         deps.hold_officer_for_conference.assert_awaited_once_with(PROJECT, THREAD)
 
     @pytest.mark.asyncio
-    async def test_a_disabled_deployment_records_why_protected_cloud_is_absent(self):
-        deps = _deps(is_protected_cloud_mode_enabled=MagicMock(return_value=False))
-        plan = await _plan(ThreadCreateRequest(protected_cloud=True), deps)
-        await ta.commit_thread_creation(
-            plan, ThreadCreateRequest(protected_cloud=True), USER, dependencies=deps
+    async def test_a_disabled_deployment_refuses_a_protected_folder(self):
+        """Main cloud slice 5: protected is the folder's level, which a
+        deployment with the switch off does not offer; asking for it is
+        refused, never accepted without its lane."""
+        deps = _folder_deps(
+            is_protected_cloud_mode_enabled=MagicMock(return_value=False)
         )
+        with pytest.raises(HTTPException) as exc:
+            await _plan(_protected_body(), deps)
+        assert exc.value.status_code == 422
+        assert exc.value.detail["code"] == "connector_access_unavailable"
+        assert exc.value.detail["access"] == "protected"
         deps.schedule_protected_engage.assert_not_called()
-        deps.record_protected_error.assert_awaited_once()
-        assert (
-            deps.record_protected_error.await_args.kwargs["code"] == "feature_disabled"
-        )
-
-    @pytest.mark.asyncio
-    async def test_a_mount_seeding_failure_never_fails_the_create(self):
-        deps = _deps(
-            authorize_thread_project_ids=AsyncMock(
-                side_effect=lambda _u, ids: list(ids)
-            ),
-            build_thread_mount_rows=AsyncMock(side_effect=RuntimeError("gitea down")),
-        )
-        plan = await _plan(ThreadCreateRequest(project_id=PROJECT), deps)
-        thread_id, authority = await ta.commit_thread_creation(
-            plan, ThreadCreateRequest(project_id=PROJECT), USER, dependencies=deps
-        )
-        assert thread_id == THREAD
-        assert authority.generation == GENERATION
 
 
 # =============================================================================
@@ -762,6 +1200,57 @@ class TestCreateThreadOperation:
         assert "agent" in order
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("plane", [True, False])
+    async def test_a_sidecar_pod_waits_for_the_session_folder(self, monkeypatch, plane):
+        """With the in-pod plane (D7) a container session's Pod fixes its
+        cloud folders when created, so the session folder comes first;
+        without it the two still run side by side."""
+        order: list[str] = []
+
+        async def main_cloud(*_a, **_kw):
+            order.append("main_cloud")
+
+        async def provision(*_a, **_kw):
+            order.append("provision")
+
+        monkeypatch.setattr(ta, "setup_thread_main_cloud", main_cloud)
+        monkeypatch.setattr(ta, "provision_thread_workspace", provision)
+        monkeypatch.setattr(ta, "setup_thread_gitea", AsyncMock())
+        if plane:
+            monkeypatch.setenv("CONNECTOR_IN_POD_OPENER_IMAGE", "o@sha256:" + "1" * 64)
+            monkeypatch.setenv("CONNECTOR_IN_POD_RCLONE_IMAGE", "r@sha256:" + "2" * 64)
+        else:
+            monkeypatch.delenv("CONNECTOR_IN_POD_OPENER_IMAGE", raising=False)
+        router = SimpleNamespace(
+            active_instance_id="00000000-0000-4000-8000-000000000001",
+            active=SimpleNamespace(static_mount_credentials=True),
+            for_owner=MagicMock(),
+        )
+        deps = _deps(
+            container_provisioner=SimpleNamespace(
+                is_available=True,
+                in_cluster=True,
+                create_pinned_thread_workspace=AsyncMock(return_value=True),
+            ),
+            main_cloud_router=router,
+        )
+        await ta.create_thread(ThreadCreateRequest(), MagicMock(), dependencies=deps)
+        assert order == (
+            ["main_cloud", "provision"] if plane else ["provision", "main_cloud"]
+        )
+        plan = await _plan(ThreadCreateRequest(), deps)
+        assert ta.sidecar_pod_planned_at_create(plan, router) is plane
+        # No plan results without a main cloud, or on one whose mounts need
+        # bearer tokens (OpenCloud): the session folder need not come first.
+        no_cloud = SimpleNamespace(active_instance_id=None)
+        assert ta.sidecar_pod_planned_at_create(plan, no_cloud) is False
+        bearer = SimpleNamespace(
+            active_instance_id="00000000-0000-4000-8000-000000000001",
+            active=SimpleNamespace(static_mount_credentials=False),
+        )
+        assert ta.sidecar_pod_planned_at_create(plan, bearer) is False
+
+    @pytest.mark.asyncio
     async def test_a_materialization_denial_is_403(self):
         deps = _deps(
             require_approved_user=AsyncMock(
@@ -812,7 +1301,7 @@ class TestCreateThreadOperation:
 
 class TestWorkspaceActuation:
     @pytest.mark.asyncio
-    async def test_vm_create_forwards_the_selected_image_and_rootdisk(self):
+    async def test_vm_create_waits_for_the_authenticated_bound_workspace_poll(self):
         vm = {
             "image": "registry.example/dev-vm:v1",
             "cpu_cores": 12,
@@ -833,12 +1322,7 @@ class TestWorkspaceActuation:
         plan = await _plan(ThreadCreateRequest(config_override=override), deps)
         await ta.provision_thread_workspace(plan, THREAD, dependencies=deps)
         await asyncio.sleep(0)
-        called = deps.vm_provisioner.create_thread_vm.await_args.kwargs
-        assert called["vm_image"] == vm["image"]
-        assert called["cpu_cores"] == 12
-        assert called["memory"] == "24Gi"
-        assert called["disk_size"] == "120Gi"
-        assert called["expected_runtime_generation"] == GENERATION
+        deps.vm_provisioner.create_thread_vm.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_a_lite_session_provisions_no_workspace_pod(self):
@@ -892,24 +1376,21 @@ class TestWorkspaceActuation:
 
 class TestListThreads:
     @pytest.mark.asyncio
-    async def test_mounts_are_fetched_in_one_query_and_metadata_is_redacted(self):
+    async def test_each_thread_gets_its_outbox_url_and_metadata_is_redacted(self):
+        """The cloud button is the outbox folder's URL, from the thread alone:
+        no mount row is read (main cloud slice 8)."""
         rows = [{"id": THREAD}, {"id": OTHER_PROJECT}]
         deps = _deps(
-            store={
-                "list_threads": AsyncMock(return_value=rows),
-                "list_thread_mounts_bulk": AsyncMock(
-                    return_value={THREAD: [{"webdav_url": "https://c/x"}]}
-                ),
-            },
+            store={"list_threads": AsyncMock(return_value=rows)},
             resolve_cloud_session_url=MagicMock(return_value="https://c/x"),
             redact_thread_metadata=MagicMock(
                 side_effect=lambda t: {**t, "redacted": True}
             ),
         )
         result = await ta.list_threads(MagicMock(), dependencies=deps)
-        deps.store.list_thread_mounts_bulk.assert_awaited_once_with(
-            [THREAD, OTHER_PROJECT]
-        )
+        calls = deps.resolve_cloud_session_url.call_args_list
+        assert [call.args[0]["id"] for call in calls] == [THREAD, OTHER_PROJECT]
+        assert all(len(call.args) == 1 and not call.kwargs for call in calls)
         assert all(t["redacted"] for t in result["threads"])
         assert result["threads"][0]["cloud_session_url"] == "https://c/x"
 

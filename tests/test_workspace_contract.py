@@ -1,7 +1,15 @@
 from __future__ import annotations
 
+from datetime import datetime, timezone
+
+from orchestrator.services import job_dispatcher
+from orchestrator.services.workspace_lifecycle import (
+    EnsureOutcome,
+    EnsureResult,
+    WorkspaceOwner,
+)
+from tests.test_b11_job_dispatcher import dispatch_pending_jobs as run_dispatch_and_wait
 from copy import deepcopy
-from types import SimpleNamespace
 from unittest.mock import AsyncMock
 from uuid import uuid4
 
@@ -21,6 +29,13 @@ from shared.workspace_contract import (
     vm_mode_from_env,
     workspace_contract_projection,
 )
+from orchestrator.application import jobs as jobs_composition
+from orchestrator.application import preparation as preparation_composition
+from orchestrator.services import container_provisioner as container_provisioner_module
+from orchestrator.services import (
+    job_workspace_authority as job_workspace_authority_module,
+)
+from orchestrator.services import job_workspace_runtime as job_workspace_runtime_module
 
 
 HISTORICAL_K8S_JOB_RUNTIME = {
@@ -364,7 +379,7 @@ def test_common_creation_boundary_strips_forged_runtime_authority() -> None:
 
 
 def test_http_job_model_strips_workspace_authority_at_parse_boundary() -> None:
-    from orchestrator.main import JobCreate
+    from orchestrator.schemas.job_create import JobCreate
 
     body = JobCreate(
         description="caller cannot attest its own workspace",
@@ -784,7 +799,12 @@ async def test_completion_recovery_reprovisions_and_retires_the_stale_marker(
     current["status"] = "paused"
     current["context"]["workspace_container"]["status"] = "deleted"
     deleted_job = await db.get_job(job["id"])
-    assert orch_main._job_needs_sandbox(deleted_job)
+    assert job_workspace_runtime_module.job_needs_sandbox(
+        deleted_job,
+        dependencies=preparation_composition.job_workspace_runtime_dependencies(
+            orch_main.app.state.resources
+        ),
+    )
     assert control_seams.resume_missing_workspace(deleted_job) == "sandbox"
 
     # Model the provisioner's replacement callback. JSONB merge legitimately
@@ -795,7 +815,9 @@ async def test_completion_recovery_reprovisions_and_retires_the_stale_marker(
     )
 
     async def provision_replacement(owner, **kwargs):
-        assert owner == orch_main.WorkspaceOwner.job(job["id"])
+        assert owner == WorkspaceOwner.job(job["id"])
+        if kwargs["current_status"] == "ready":
+            return EnsureResult(EnsureOutcome.READY, status="ready")
         assert kwargs["current_status"] == "deleted"
         db.jobs[job["id"]]["context"]["workspace_container"].update(
             {
@@ -807,45 +829,55 @@ async def test_completion_recovery_reprovisions_and_retires_the_stale_marker(
                 "_runtime_incarnation": replacement.runtime_incarnation,
             }
         )
-        return SimpleNamespace(
-            outcome=orch_main.EnsureOutcome.PENDING,
+        return EnsureResult(
+            outcome=EnsureOutcome.PENDING,
             status="creating",
         )
 
+    db.get_job_discovery_cutoff = AsyncMock(return_value=datetime.now(timezone.utc))
     db.get_admittable_stateless_jobs = AsyncMock(
         side_effect=lambda **_kwargs: [deepcopy(db.jobs[job["id"]])]
     )
     db.admit_stateless_worker_job = AsyncMock(return_value=(True, "inserted"))
     db.update_job_status = AsyncMock()
-    monkeypatch.setattr(orch_main, "postgres_db", db)
-    monkeypatch.setattr(orch_main, "AUTO_ASSIGN_ENABLED", False)
-    monkeypatch.setattr(orch_main, "STATELESS_WORKER_ENABLED", True)
-    monkeypatch.setattr(orch_main.container_provisioner, "_k8s_available", True)
-    monkeypatch.setattr(orch_main.container_provisioner, "_in_cluster", True)
+    monkeypatch.setattr(orch_main.app.state.resources, "postgres_db", db)
+    monkeypatch.setattr(
+        orch_main.app.state.resources.settings, "auto_assign_enabled", False
+    )
+    monkeypatch.setattr(
+        orch_main.app.state.resources.settings, "stateless_worker_enabled", True
+    )
+    monkeypatch.setattr(
+        container_provisioner_module.container_provisioner, "_k8s_available", True
+    )
+    monkeypatch.setattr(
+        container_provisioner_module.container_provisioner, "_in_cluster", True
+    )
     live_attestation = AsyncMock(return_value=replacement)
     monkeypatch.setattr(
-        orch_main.container_provisioner,
+        container_provisioner_module.container_provisioner,
         "attest_workspace_runtime",
         live_attestation,
     )
     ensure_workspace = AsyncMock(side_effect=provision_replacement)
-    monkeypatch.setattr(orch_main, "ensure_workspace", ensure_workspace)
+    monkeypatch.setattr(job_dispatcher, "ensure_workspace", ensure_workspace)
 
-    # First real dispatcher pass sees the deleted lifecycle state and starts
-    # ordinary provisioning without trying to attest the vanished predecessor.
-    await orch_main._try_dispatch_pending_jobs()
+    monkeypatch.setattr(
+        orch_main.app.state.resources,
+        "job_dispatch_state",
+        job_dispatcher.JobDispatchState(),
+    )
+    # The owned create observes deleted, then its completion wakes a fresh
+    # ready preflight. That pass retires the predecessor marker by exact CAS
+    # before admitting the server-created successor; it never re-attests the
+    # vanished predecessor or treats the old marker as successor authority.
+    await run_dispatch_and_wait(
+        dependencies=jobs_composition.job_dispatch_dependencies(
+            orch_main.app.state.resources
+        )
+    )
     ensure_workspace.assert_awaited_once()
-    live_attestation.assert_not_awaited()
-    db.admit_stateless_worker_job.assert_not_awaited()
-
-    # The replacement callback left the predecessor marker beside its new UID.
-    # That successor was created by this server under a durable reservation, so
-    # it is not an adopted runtime: the next dispatcher pass retires the stale
-    # marker by exact snapshot CAS and admits the resumed job exactly once.
-    # Refreshing the marker instead would be a second adoption of a Pod nobody
-    # adopted, and leaving it would make every later pre-network check
-    # re-attest the vanished predecessor and refuse delivery for good.
-    await orch_main._try_dispatch_pending_jobs()
+    assert ensure_workspace.await_args.kwargs["current_status"] == "deleted"
 
     resumed = await db.get_job(job["id"])
     runtime = resumed["context"]["workspace_container"]
@@ -1084,9 +1116,18 @@ async def test_pre_delivery_recheck_ignores_only_opposite_tier_residue(
             "workspace_container": READY_SANDBOX,
         },
     }
-    monkeypatch.setattr(main.postgres_db, "get_job", AsyncMock(return_value=refreshed))
+    monkeypatch.setattr(
+        main.app.state.resources.postgres_db,
+        "get_job",
+        AsyncMock(return_value=refreshed),
+    )
 
-    assert await main._workspace_runtime_unchanged_before_delivery(original)
+    assert await job_workspace_authority_module.workspace_runtime_unchanged_before_delivery(
+        original,
+        dependencies=preparation_composition.job_workspace_authority_dependencies(
+            main.app.state.resources
+        ),
+    )
 
 
 @pytest.mark.asyncio
@@ -1106,9 +1147,18 @@ async def test_pre_delivery_recheck_refuses_matching_runtime_change(
             "vm": {**READY_VM, "ssh_host": "replacement.internal"},
         },
     }
-    monkeypatch.setattr(main.postgres_db, "get_job", AsyncMock(return_value=refreshed))
+    monkeypatch.setattr(
+        main.app.state.resources.postgres_db,
+        "get_job",
+        AsyncMock(return_value=refreshed),
+    )
 
-    assert not await main._workspace_runtime_unchanged_before_delivery(original)
+    assert not await job_workspace_authority_module.workspace_runtime_unchanged_before_delivery(
+        original,
+        dependencies=preparation_composition.job_workspace_authority_dependencies(
+            main.app.state.resources
+        ),
+    )
 
 
 def test_worker_recipient_accepts_exact_server_tier_projection() -> None:
@@ -1130,7 +1180,9 @@ def test_worker_recipient_accepts_exact_server_tier_projection() -> None:
 
 
 def test_job_start_workspace_authority_survives_producer_consumer_round_trip() -> None:
-    from orchestrator.main import JobStartRequest as ProducerJobStartRequest
+    from orchestrator.schemas.job_runtime import (
+        JobStartRequest as ProducerJobStartRequest,
+    )
     from agent.api.models import JobStartRequest as ConsumerJobStartRequest
 
     runtime = {

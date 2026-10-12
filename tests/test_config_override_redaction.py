@@ -8,7 +8,23 @@ persistence, while every non-secret field is preserved verbatim.
 
 import copy
 
+import pytest
+
 from orchestrator.security import access
+from orchestrator.services.thread_projection import redact_thread_metadata
+from orchestrator.application import jobs as jobs_composition
+
+
+def test_thread_vm_initial_runtime_marker_stays_internal():
+    marker = {
+        "runtime_generation": "synthetic-generation",
+        "agent_id": "synthetic-agent",
+        "runtime_attach_token": "synthetic-private-token",
+    }
+    thread = {"metadata": {"vm": {"status": "provisioning", "initial_runtime": marker}}}
+    public = redact_thread_metadata(thread)
+    assert public["metadata"]["vm"] == {"status": "provisioning"}
+    assert thread["metadata"]["vm"]["initial_runtime"] == marker
 
 
 def _full_config_override() -> dict:
@@ -127,56 +143,59 @@ class TestRedactConfigOverride:
 
 
 class TestRedactThreadMetadataShape:
-    """``main._redact_thread_metadata`` must return metadata as a parsed
-    OBJECT — asyncpg hands JSONB back as a JSON string, and the old
+    """``thread_projection.redact_thread_metadata`` must return metadata as a
+    parsed OBJECT — asyncpg hands JSONB back as a JSON string, and the old
     "preserve the original representation" behavior returned that string
     through the owner-facing thread endpoints, silently breaking every
     Cockpit consumer typed against ``metadata?: Record<string, unknown>``
     (settings-pane prefill, attached-datasource defaults, REST
     model/temperature seeding)."""
 
-    def _main(self):
-        import orchestrator.main as main
-
-        return main
-
     def test_string_metadata_returned_as_parsed_object(self):
         import json
 
-        main = self._main()
         md = {"config_override": {"llm": {"model": "m", "api_key": "sk-SECRET"}}}
-        out = main._redact_thread_metadata({"id": "t", "metadata": json.dumps(md)})
+        out = redact_thread_metadata({"id": "t", "metadata": json.dumps(md)})
         assert isinstance(out["metadata"], dict)
         assert out["metadata"]["config_override"]["llm"]["model"] == "m"
         assert "api_key" not in out["metadata"]["config_override"]["llm"]
 
+    def test_public_runtime_generation_is_canonical_and_not_a_capability(self):
+        from uuid import UUID
+
+        generation = UUID("33333333-4444-4555-8666-777777777777")
+        row = {"runtime_generation": generation, "runtime_attach_token": "secret"}
+        out = redact_thread_metadata(row)
+        assert out["session_runtime_generation"] == str(generation)
+        assert "runtime_generation" not in out and "runtime_attach_token" not in out
+        assert row["runtime_generation"] == generation
+        for invalid in (None, "", "not-a-uuid"):
+            assert (
+                redact_thread_metadata({"runtime_generation": invalid}).get(
+                    "session_runtime_generation"
+                )
+                is None
+            )
+
     def test_dict_metadata_stays_object_and_redacts(self):
-        main = self._main()
         md = {
             "config_override": {"llm": {"api_key": "sk-SECRET"}},
             "datasource_ids": ["a"],
         }
-        out = main._redact_thread_metadata({"id": "t", "metadata": md})
+        out = redact_thread_metadata({"id": "t", "metadata": md})
         assert out["metadata"]["datasource_ids"] == ["a"]
         assert "api_key" not in out["metadata"]["config_override"]["llm"]
 
     def test_absent_or_unparseable_metadata_becomes_empty_object(self):
-        main = self._main()
-        assert main._redact_thread_metadata({"id": "t"})["metadata"] == {}
+        assert redact_thread_metadata({"id": "t"})["metadata"] == {}
         assert (
-            main._redact_thread_metadata({"id": "t", "metadata": "{not json"})[
-                "metadata"
-            ]
+            redact_thread_metadata({"id": "t", "metadata": "{not json"})["metadata"]
             == {}
         )
-        assert (
-            main._redact_thread_metadata({"id": "t", "metadata": None})["metadata"]
-            == {}
-        )
+        assert redact_thread_metadata({"id": "t", "metadata": None})["metadata"] == {}
 
     def test_workspace_binding_dropped(self):
-        main = self._main()
-        out = main._redact_thread_metadata(
+        out = redact_thread_metadata(
             {
                 "id": "t",
                 "metadata": {
@@ -184,16 +203,17 @@ class TestRedactThreadMetadataShape:
                     "_stateless_workspace_process_zero_observation": {
                         "runtime_incarnation": "server-owned"
                     },
+                    "aoci_pending_memory": {"v": 1, "id": "set-1", "memory": []},
                     "keep": True,
                 },
             }
         )
         assert "_workspace_binding" not in out["metadata"]
         assert "_stateless_workspace_process_zero_observation" not in out["metadata"]
+        assert "aoci_pending_memory" not in out["metadata"]
         assert out["metadata"]["keep"] is True
 
     def test_runtime_retirement_authority_is_redacted_to_safe_state(self):
-        main = self._main()
         internal = {
             "runtime_generation": "generation-secret",
             "runtime_attach_token": "attach-secret",
@@ -215,7 +235,7 @@ class TestRedactThreadMetadataShape:
                 "captured_resources": {"grant_handle": "private"}
             },
         }
-        out = main._redact_thread_metadata({"id": "t", "metadata": {}, **internal})
+        out = redact_thread_metadata({"id": "t", "metadata": {}, **internal})
         for key in internal:
             assert key not in out
         assert out["runtime_retirement_pending"] is True
@@ -224,8 +244,7 @@ class TestRedactThreadMetadataShape:
         assert "10.0.0.8" not in repr(out)
 
     def test_hidden_retirement_preflight_is_not_public_ending(self):
-        main = self._main()
-        out = main._redact_thread_metadata(
+        out = redact_thread_metadata(
             {
                 "id": "t",
                 "metadata": {},
@@ -238,12 +257,196 @@ class TestRedactThreadMetadataShape:
         assert out["retirement_disposition"] is None
         assert "hidden-token" not in repr(out)
 
+    @staticmethod
+    def _stateless(metadata: dict) -> dict:
+        return {
+            "id": "t",
+            "status": "ended",
+            "execution_lane": "stateless",
+            "metadata": metadata,
+        }
+
+    @pytest.mark.parametrize("permanent", [False, True])
+    def test_pending_stateless_retirement_is_public_ending(self, permanent):
+        """A stateless End or Delete answered 503 is not a settled End.
+
+        Its marker stays pending until End, Delete or Resume is retried; the
+        owner projection must say so (R1.B12 thread ``9bee082e`` read
+        ``ended`` with the marker still set).
+        """
+
+        out = redact_thread_metadata(
+            self._stateless(
+                {
+                    "_stateless_workspace_retirement_pending": True,
+                    "_stateless_claim_retirement": {
+                        "terminal_token": 8,
+                        "permanent": permanent,
+                    },
+                }
+            )
+        )
+
+        assert out["runtime_retirement_pending"] is True
+        assert out["retirement_disposition"] == "ended"
+        assert out["retirement_permanent"] is permanent
+
+    def test_settled_stateless_retirement_is_not_pending(self):
+        out = redact_thread_metadata(
+            self._stateless(
+                {
+                    "_stateless_workspace_retirement_settled": {
+                        "terminal_token": 8,
+                        "permanent": False,
+                    }
+                }
+            )
+        )
+
+        assert out["runtime_retirement_pending"] is False
+        assert out["retirement_disposition"] is None
+        assert out["retirement_permanent"] is False
+
+    @staticmethod
+    def _settled_permanent_metadata() -> dict:
+        return {
+            "_stateless_workspace_retirement_settled": {
+                "terminal_token": 2,
+                "cleanup_complete": True,
+                "permanent": True,
+                "snapshot_restore_required": False,
+                "workspace_absence_proven": False,
+                "runtime_incarnation": "6a5b7eb8-ba34-4179-884d-7da1bee7bcc8",
+                "backing_id": (
+                    "k8s-pvc:superhuman-remote-worker:"
+                    "9f06c714-07d3-439b-91b7-c599d9d49231"
+                ),
+            }
+        }
+
+    @pytest.mark.parametrize("jsonb_string", [False, True])
+    def test_settled_permanent_delete_is_public_ending_until_row_disappears(
+        self, jsonb_string
+    ):
+        import json
+
+        metadata = self._settled_permanent_metadata()
+        row = self._stateless(json.dumps(metadata) if jsonb_string else metadata)
+        original = copy.deepcopy(row)
+        out = redact_thread_metadata(row)
+
+        assert out["runtime_retirement_pending"] is True
+        assert out["retirement_disposition"] == "ended"
+        assert out["retirement_permanent"] is True
+        assert row == original
+        assert "runtime_incarnation" not in out
+        assert "backing_id" not in out
+
+    @pytest.mark.parametrize(
+        ("status", "lane", "permanent", "cleanup_complete"),
+        [
+            ("ended", "stateless", False, True),
+            ("active", "stateless", True, True),
+            ("ended", "pinned", True, True),
+            ("ended", "stateless", True, False),
+        ],
+    )
+    def test_settled_projection_requires_ended_stateless_valid_permanent_marker(
+        self, status, lane, permanent, cleanup_complete
+    ):
+        metadata = self._settled_permanent_metadata()
+        marker = metadata["_stateless_workspace_retirement_settled"]
+        marker["permanent"] = permanent
+        marker["cleanup_complete"] = cleanup_complete
+        row = {**self._stateless(metadata), "status": status, "execution_lane": lane}
+
+        out = redact_thread_metadata(row)
+
+        assert out["runtime_retirement_pending"] is False
+        assert out["retirement_permanent"] is False
+
+    @pytest.mark.parametrize(
+        "broken",
+        [
+            {"permanent": True},
+            {"terminal_token": 2, "permanent": None, "cleanup_complete": True},
+            {"terminal_token": 2, "permanent": "true", "cleanup_complete": True},
+        ],
+    )
+    def test_malformed_settled_marker_does_not_break_owner_projection(self, broken):
+        out = redact_thread_metadata(
+            self._stateless({"_stateless_workspace_retirement_settled": broken})
+        )
+        assert out["runtime_retirement_pending"] is False
+        assert out["retirement_disposition"] is None
+        assert out["retirement_permanent"] is False
+
+    def test_overlapping_settled_and_claim_authority_does_not_promote(self):
+        metadata = {
+            **self._settled_permanent_metadata(),
+            "_stateless_claim_retirement": {"permanent": True},
+        }
+        out = redact_thread_metadata(self._stateless(metadata))
+        assert out["runtime_retirement_pending"] is False
+        assert out["retirement_permanent"] is False
+
+    def test_authorized_pinned_retirement_keeps_precedence_over_settled_marker(self):
+        out = redact_thread_metadata(
+            {
+                **self._stateless(self._settled_permanent_metadata()),
+                "runtime_retirement_token": "pinned-token",
+                "runtime_retirement_authorized_at": "2026-10-07T22:00:00Z",
+                "runtime_retirement_permanent": False,
+                "runtime_retirement_context": {"settle_status": "suspended"},
+            }
+        )
+        assert out["runtime_retirement_pending"] is True
+        assert out["retirement_disposition"] == "suspended"
+        assert out["retirement_permanent"] is False
+
+    def test_active_stateless_retirement_keeps_precedence_over_settled_marker(self):
+        metadata = {
+            **self._settled_permanent_metadata(),
+            "_stateless_workspace_retirement_pending": True,
+            "_stateless_claim_retirement": {"permanent": False},
+        }
+        out = redact_thread_metadata(self._stateless(metadata))
+        assert out["runtime_retirement_pending"] is True
+        assert out["retirement_disposition"] == "ended"
+        assert out["retirement_permanent"] is False
+
+    def test_stateless_marker_on_another_lane_is_not_public_ending(self):
+        thread = self._stateless({"_stateless_workspace_retirement_pending": True})
+        thread["execution_lane"] = "pinned"
+
+        out = redact_thread_metadata(thread)
+
+        assert out["runtime_retirement_pending"] is False
+        assert out["retirement_permanent"] is False
+
+    @pytest.mark.parametrize("authorized", [True, False])
+    def test_pinned_permanence_is_public_only_while_pending(self, authorized):
+        out = redact_thread_metadata(
+            {
+                "id": "t",
+                "metadata": {},
+                "runtime_retirement_token": "retirement-secret",
+                "runtime_retirement_permanent": True,
+                "runtime_retirement_authorized_at": (
+                    "2026-08-26T00:00:01Z" if authorized else None
+                ),
+                "runtime_retirement_context": {"settle_status": "ended"},
+            }
+        )
+
+        assert out["runtime_retirement_pending"] is authorized
+        assert out["retirement_permanent"] is authorized
+        assert "runtime_retirement_permanent" not in out
+
 
 class TestRedactJobWorkspaceAuthority:
     def test_public_job_projection_is_coordinate_and_credential_free(self):
-        import orchestrator.main as main
-
-        out = main._redact_job_config_override(
+        out = jobs_composition.redact_job_config_override(
             {
                 "id": "job-1",
                 "config_override": {

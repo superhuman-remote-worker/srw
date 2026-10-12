@@ -1,14 +1,17 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import os
+import socket
 import subprocess
 
 import httpx
 import pytest
 import pytest_asyncio
 import yaml
+import uvicorn
 
 from tests.e2e.app.deterministic_provider.provider import (
     CHAT_MODEL_ID,
@@ -66,6 +69,7 @@ async def arm(
     scenario: str = "reply",
     required_responses: int = 1,
     chunk_delay_ms: int | None = None,
+    nonstream_delay_ms: int | None = None,
 ) -> dict:
     body: dict[str, object] = {
         "scenario": scenario,
@@ -73,6 +77,8 @@ async def arm(
     }
     if chunk_delay_ms is not None:
         body["chunk_delay_ms"] = chunk_delay_ms
+    if nonstream_delay_ms is not None:
+        body["nonstream_delay_ms"] = nonstream_delay_ms
     response = await control.post(
         f"/control/scenarios/{run_id}/arm",
         json=body,
@@ -224,6 +230,209 @@ async def test_non_streaming_reply_and_exhaustion_are_accounted(
         "success",
         "unexpected_exhausted",
     }
+
+
+async def _wait_for_pending(store: ScenarioStore, run_id: str) -> dict:
+    async def pending() -> dict:
+        for _ in range(100):
+            state = await store.state(run_id)
+            if state["pending_calls"] == 1:
+                return state
+            await asyncio.sleep(0.01)
+        raise AssertionError("required nonstream call never became pending")
+
+    return await asyncio.wait_for(pending(), timeout=2)
+
+
+async def test_slow_nonstream_cancelled_client_keeps_response_unconsumed(
+    store: ScenarioStore,
+    control: httpx.AsyncClient,
+    inference: httpx.AsyncClient,
+) -> None:
+    run_id = "slow-nonstream-cancel-001"
+    await arm(control, run_id, scenario="slow-nonstream", nonstream_delay_ms=15_000)
+    request = asyncio.create_task(
+        inference.post("/v1/chat/completions", json=chat_request(run_id))
+    )
+    pending = await _wait_for_pending(store, run_id)
+    assert pending["reserved_required_responses"] == 1
+    assert pending["remaining_required_responses"] == 0
+    assert pending["consumed_required_responses"] == 0
+    request.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await request
+    for _ in range(100):
+        settled = await store.state(run_id)
+        if settled["pending_calls"] == 0:
+            break
+        await asyncio.sleep(0.01)
+    assert settled["pending_calls"] == 0
+    assert settled["reserved_required_responses"] == 0
+    assert settled["remaining_required_responses"] == 1
+    assert settled["consumed_required_responses"] == 0
+    assert settled["calls"][-1]["stream"] is False
+    assert settled["calls"][-1]["outcome"] == "cancelled"
+
+
+async def test_slow_nonstream_releases_one_response_only_after_delay(
+    store: ScenarioStore,
+    control: httpx.AsyncClient,
+    inference: httpx.AsyncClient,
+) -> None:
+    run_id = "slow-nonstream-success-001"
+    await arm(control, run_id, scenario="slow-nonstream", nonstream_delay_ms=15_000)
+    request = asyncio.create_task(
+        inference.post("/v1/chat/completions", json=chat_request(run_id))
+    )
+    pending = await _wait_for_pending(store, run_id)
+    assert pending["reserved_required_responses"] == 1
+    assert pending["consumed_required_responses"] == 0
+    response = await asyncio.wait_for(request, timeout=18)
+    assert response.status_code == 200
+    settled = await store.state(run_id)
+    assert settled["pending_calls"] == 0
+    assert settled["consumed_required_responses"] == 1
+    assert settled["remaining_required_responses"] == 0
+    assert settled["calls"][-1]["outcome"] == "success"
+    assert settled["calls"][-1]["stream"] is False
+    assert settled["calls"][-1]["duration_ms"] >= 14_000
+
+
+async def test_slow_nonstream_arm_bounds_and_stream_refusal(
+    store: ScenarioStore,
+    control: httpx.AsyncClient,
+    inference: httpx.AsyncClient,
+) -> None:
+    for delay in (14_999, 30_001):
+        response = await control.post(
+            "/control/scenarios/slow-nonstream-bound-001/arm",
+            json={
+                "scenario": "slow-nonstream",
+                "required_responses": 1,
+                "nonstream_delay_ms": delay,
+            },
+        )
+        assert response.status_code == 422
+    for body in (
+        {"scenario": "slow-nonstream", "required_responses": 1},
+        {
+            "scenario": "slow-nonstream",
+            "required_responses": 2,
+            "nonstream_delay_ms": 15_000,
+        },
+        {"scenario": "reply", "required_responses": 1, "nonstream_delay_ms": 15_000},
+    ):
+        response = await control.post(
+            "/control/scenarios/slow-nonstream-bound-001/arm", json=body
+        )
+        assert response.status_code == 422
+    await arm(
+        control,
+        "slow-nonstream-bound-001",
+        scenario="slow-nonstream",
+        nonstream_delay_ms=15_000,
+    )
+    response = await inference.post(
+        "/v1/chat/completions",
+        json=chat_request("slow-nonstream-bound-001", stream=True),
+    )
+    assert response.status_code == 422
+    state = await store.state("slow-nonstream-bound-001")
+    assert state["pending_calls"] == state["consumed_required_responses"] == 0
+    assert state["remaining_required_responses"] == 1
+
+
+async def test_slow_nonstream_real_http_socket_disconnect_is_cancelled(
+    store: ScenarioStore,
+    control: httpx.AsyncClient,
+) -> None:
+    run_id = "slow-nonstream-socket-001"
+    await arm(control, run_id, scenario="slow-nonstream", nonstream_delay_ms=15_000)
+    with socket.socket() as reservation:
+        reservation.bind(("127.0.0.1", 0))
+        port = reservation.getsockname()[1]
+    server = uvicorn.Server(
+        uvicorn.Config(
+            create_inference_app(store, inference_api_key=INFERENCE_KEY),
+            host="127.0.0.1",
+            port=port,
+            log_level="critical",
+            lifespan="off",
+        )
+    )
+    serving = asyncio.create_task(server.serve())
+    writer = None
+    try:
+        for _ in range(100):
+            if server.started:
+                break
+            await asyncio.sleep(0.01)
+        assert server.started
+        _reader, writer = await asyncio.open_connection("127.0.0.1", port)
+        body = json.dumps(chat_request(run_id)).encode()
+        writer.write(
+            (
+                f"POST /v1/chat/completions HTTP/1.1\r\n"
+                f"Host: 127.0.0.1\r\n"
+                f"Authorization: Bearer {INFERENCE_KEY}\r\n"
+                f"Content-Type: application/json\r\n"
+                f"Content-Length: {len(body)}\r\n\r\n"
+            ).encode()
+            + body
+        )
+        await writer.drain()
+        pending = await _wait_for_pending(store, run_id)
+        assert pending["reserved_required_responses"] == 1
+        writer.close()
+        await writer.wait_closed()
+        for _ in range(100):
+            settled = await store.state(run_id)
+            if settled["pending_calls"] == 0:
+                break
+            await asyncio.sleep(0.01)
+        assert settled["pending_calls"] == 0
+        assert settled["consumed_required_responses"] == 0
+        assert settled["remaining_required_responses"] == 1
+        assert settled["calls"][-1]["outcome"] == "cancelled"
+    finally:
+        if writer is not None and not writer.is_closing():
+            writer.close()
+            await writer.wait_closed()
+        server.should_exit = True
+        server.force_exit = True
+        await asyncio.wait_for(serving, timeout=3)
+
+
+async def test_slow_nonstream_keeps_structured_nonrequired_calls_immediate(
+    store: ScenarioStore,
+    control: httpx.AsyncClient,
+    inference: httpx.AsyncClient,
+) -> None:
+    run_id = "slow-nonstream-structured-001"
+    await arm(control, run_id, scenario="slow-nonstream", nonstream_delay_ms=15_000)
+    structured = chat_request(
+        run_id,
+        extra={
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "ConversationTitle",
+                    "schema": {"type": "object"},
+                },
+            }
+        },
+    )
+    for streaming in (False, True):
+        structured["stream"] = streaming
+        response = await asyncio.wait_for(
+            inference.post("/v1/chat/completions", json=structured), timeout=2
+        )
+        assert response.status_code == 200
+    state = await store.state(run_id)
+    assert state["pending_calls"] == 0
+    assert state["required_responses"] == state["remaining_required_responses"] == 1
+    assert state["consumed_required_responses"] == 0
+    assert [call["stream"] for call in state["calls"]] == [False, True]
 
 
 async def test_concurrent_required_calls_cannot_share_one_reserved_response(
@@ -641,6 +850,112 @@ async def test_worker_job_scenario_fails_closed_without_a_required_tool(
     )
     assert response.status_code == 422
     assert response.json()["error"]["type"] == "required_tool_missing"
+
+
+@pytest.mark.parametrize(
+    "proof", ["valid", "reset", "wrong-run", "failed-command", "absent"]
+)
+async def test_retained_sentinel_worker_requires_real_tool_result(
+    control: httpx.AsyncClient,
+    inference: httpx.AsyncClient,
+    tmp_path,
+    proof: str,
+) -> None:
+    run_id = "retained-sentinel-001"
+    sentinel = tmp_path / ".srw-a1-gate" / run_id / "sentinel"
+    sentinel.parent.mkdir(parents=True)
+    sentinel.write_bytes(b"distinct uncommitted gate data\n")
+    digest = hashlib.sha256(sentinel.read_bytes()).hexdigest()
+    armed = await control.post(
+        f"/control/scenarios/{run_id}/arm",
+        json={"scenario": "retained-sentinel-worker", "sentinel_sha256": digest},
+    )
+    assert armed.status_code == 201
+    assert (
+        await control.post(f"/control/scenarios/{run_id}/release-completion")
+    ).status_code == 409
+    tools = [
+        {
+            "type": "function",
+            "function": {"name": name, "parameters": {"type": "object"}},
+        }
+        for name in (
+            "read_file",
+            "todo_complete",
+            "next_phase_todos",
+            "job_complete",
+            "run_command",
+        )
+    ]
+    for _ in range(7):
+        response = await inference.post(
+            "/v1/chat/completions", json=chat_request(run_id, extra={"tools": tools})
+        )
+        assert response.status_code == 200
+    call = response.json()["choices"][0]["message"]["tool_calls"][0]["function"]
+    assert call["name"] == "run_command"
+    command = json.loads(call["arguments"])["command"]
+    result = subprocess.run(
+        ["sh", "-c", command], cwd=tmp_path, capture_output=True, text=True
+    )
+    assert result.returncode == 0
+    output = "Exit code: 0\n--- stdout ---\n" + result.stdout
+    if proof == "wrong-run":
+        output = output.replace(run_id, run_id + "-other")
+    elif proof == "failed-command":
+        output = output.replace("Exit code: 0", "Exit code: 1")
+    elif proof == "absent":
+        output = "Exit code: 0\n--- stdout ---\n"
+    payload = chat_request(run_id, extra={"tools": tools})
+    payload["messages"].append(
+        {"role": "tool", "tool_call_id": "sentinel", "content": output}
+    )
+    response = await inference.post("/v1/chat/completions", json=payload)
+    if proof in {"valid", "reset"}:
+        assert response.status_code == 200
+        assert (
+            response.json()["choices"][0]["message"]["tool_calls"][0]["function"][
+                "name"
+            ]
+            == "todo_complete"
+        )
+        remaining = [
+            await inference.post("/v1/chat/completions", json=payload) for _ in range(2)
+        ]
+        waiting_completion = asyncio.create_task(
+            inference.post("/v1/chat/completions", json=payload)
+        )
+        await asyncio.sleep(0.05)
+        assert not waiting_completion.done()
+        held = (await control.get(f"/control/scenarios/{run_id}")).json()
+        assert held["worker_job_tool_steps"] == 10
+        assert held["completion_released"] is False
+        if proof == "reset":
+            assert (
+                await control.delete(f"/control/scenarios/{run_id}")
+            ).status_code == 200
+            refused = await asyncio.wait_for(waiting_completion, timeout=5)
+            assert refused.status_code == 409
+            assert refused.json()["error"]["type"] == "scenario_changed"
+            return
+        released = await control.post(f"/control/scenarios/{run_id}/release-completion")
+        assert released.status_code == 200
+        assert released.json()["completion_released"] is True
+        remaining.append(await asyncio.wait_for(waiting_completion, timeout=5))
+        assert [
+            item.json()["choices"][0]["message"]["tool_calls"][0]["function"]["name"]
+            for item in remaining
+        ] == ["todo_complete", "read_file", "job_complete"]
+        state = await control.get(f"/control/scenarios/{run_id}")
+        assert state.json()["worker_job_tool_steps"] == 11
+        assert state.json()["sentinel_sha256"] == digest
+        assert state.json()["completion_released"] is True
+    else:
+        assert response.status_code == 422
+        assert response.json()["error"]["type"] == "workspace_proof_missing"
+        assert (
+            await control.post(f"/control/scenarios/{run_id}/release-completion")
+        ).status_code == 409
 
 
 async def test_search_job_scenario_drives_search_completion_and_todos(
@@ -1249,6 +1564,7 @@ async def test_control_state_never_retains_prompts_tool_arguments_or_headers(
         "stream",
         "outcome",
         "duration_ms",
+        "consume_required",
     }
 
 
@@ -1258,8 +1574,8 @@ async def test_auxiliary_schemas_are_modelled_and_an_unknown_one_is_not(
 ) -> None:
     """Every structured schema a real worker asks for is answered, and only those.
 
-    A worker job that runs long enough compacts its context
-    (``ConversationSummary``) and may curate or converge its knowledge
+    A worker job that runs long enough compacts its context (a Markdown
+    checkpoint, no ``response_format``) and may curate or converge its knowledge
     (``CurationResult`` / ``KnowledgeAssemblyResult``). Leaving those
     unmodelled made each one a 422 that the agent retried and then degraded
     around — a real behaviour change, and `unexpected_schema` noise that hides
@@ -1281,26 +1597,31 @@ async def test_auxiliary_schemas_are_modelled_and_an_unknown_one_is_not(
             },
         )
 
-    summary = await inference.post(
-        "/v1/chat/completions", json=structured("ConversationSummary")
+    checkpoint = await inference.post(
+        "/v1/chat/completions",
+        json=chat_request(
+            run_id,
+            extra={
+                "messages": [
+                    {"role": "system", "content": "You are writing a checkpoint."},
+                    {
+                        "role": "user",
+                        "content": (
+                            "Here is the conversation to summarize:\n\n"
+                            f"<conversation>\n[User]: E2E-{run_id} verify\n"
+                            "</conversation>\n\nWrite the checkpoint now."
+                        ),
+                    },
+                ]
+            },
+        ),
     )
-    assert summary.status_code == 200
-    payload = json.loads(summary.json()["choices"][0]["message"]["content"])
-    assert payload["summary"] == f"E2E-{run_id} deterministic conversation summary."
-    # Every field the compaction model declares must be present, or the agent
-    # falls back to trimming exactly as it did against a 422.
-    assert set(payload) == {
-        "summary",
-        "tasks_completed",
-        "tasks_in_progress",
-        "key_decisions",
-        "current_state",
-        "blockers",
-        "critical_facts",
-        "state_changes",
-        "pinned_instructions",
-        "identity_anchor",
-    }
+    assert checkpoint.status_code == 200
+    content = checkpoint.json()["choices"][0]["message"]["content"]
+    # Compaction is text mode: the agent needs Markdown sections back, or it
+    # rejects the pass and keeps the history uncompacted.
+    assert content.startswith("## Objective\n")
+    assert f"E2E-{run_id} deterministic conversation summary." in content
 
     curation = await inference.post(
         "/v1/chat/completions", json=structured("CurationResult")
@@ -1333,3 +1654,182 @@ async def test_auxiliary_schemas_are_modelled_and_an_unknown_one_is_not(
     state = (await control.get(f"/control/scenarios/{run_id}")).json()
     assert state["unexpected_count"] == 1
     assert state["pending_calls"] == 0
+
+
+# ---------------------------------------------------------------------------
+# Startup dimension-probe windows
+# ---------------------------------------------------------------------------
+
+# Exactly what EmbeddingService.verify_dimensions() sends through the OpenAI
+# SDK (which requests base64 unless told otherwise).
+PROBE_REQUEST = {
+    "model": EMBEDDING_MODEL_ID,
+    "input": "dimension probe",
+    "encoding_format": "base64",
+}
+
+
+async def arm_probe_window(
+    control: httpx.AsyncClient, window_id: str, expected_probes: int
+) -> httpx.Response:
+    return await control.post(
+        f"/control/probe-windows/{window_id}/arm",
+        json={"expected_probes": expected_probes},
+    )
+
+
+async def test_unwindowed_startup_probe_stays_a_visible_unscoped_rejection(
+    control: httpx.AsyncClient,
+    inference: httpx.AsyncClient,
+) -> None:
+    response = await inference.post("/v1/embeddings", json=PROBE_REQUEST)
+
+    assert response.status_code == 409
+    overview = (await control.get("/control/scenarios")).json()
+    assert overview["unscoped_unexpected_calls"] == 1
+    assert overview["unscoped_calls"][0]["outcome"] == (
+        "run_correlation_required_no_active_scenario"
+    )
+    assert overview["active_probe_window"] is None
+    assert overview["probe_windows"] == []
+
+
+async def test_armed_window_answers_and_accounts_every_expected_probe(
+    control: httpx.AsyncClient,
+    inference: httpx.AsyncClient,
+) -> None:
+    armed = await arm_probe_window(control, "attach-dual-001", 2)
+    assert armed.status_code == 201
+    assert armed.json()["expected_probes"] == 2
+
+    for request in (PROBE_REQUEST, {**PROBE_REQUEST, "input": ["dimension probe"]}):
+        response = await inference.post("/v1/embeddings", json=request)
+        assert response.status_code == 200
+        body = response.json()
+        assert body["model"] == EMBEDDING_MODEL_ID
+        vector = body["data"][0]["embedding"]
+        assert len(vector) == EMBEDDING_DIMENSIONS
+        assert all(isinstance(value, float) for value in vector)
+
+    state = (await control.get("/control/probe-windows/attach-dual-001")).json()
+    assert state["consumed_probes"] == 2
+    assert state["excess_probes"] == 0
+    assert state["settled"] is True
+    assert [call["outcome"] for call in state["calls"]] == ["success", "success"]
+    assert [call["sequence"] for call in state["calls"]] == [1, 2]
+    overview = (await control.get("/control/scenarios")).json()
+    assert overview["unscoped_unexpected_calls"] == 0
+    assert overview["active_probe_window"] == "attach-dual-001"
+
+
+async def test_excess_probe_is_refused_and_leaves_the_window_unsettled(
+    control: httpx.AsyncClient,
+    inference: httpx.AsyncClient,
+) -> None:
+    await arm_probe_window(control, "attach-one-001", 1)
+    assert (
+        await inference.post("/v1/embeddings", json=PROBE_REQUEST)
+    ).status_code == 200
+
+    excess = await inference.post("/v1/embeddings", json=PROBE_REQUEST)
+
+    assert excess.status_code == 409
+    assert excess.json()["error"]["type"] == "probe_window_exhausted"
+    state = (await control.get("/control/probe-windows/attach-one-001")).json()
+    assert state["consumed_probes"] == 1
+    assert state["excess_probes"] == 1
+    assert state["settled"] is False
+    assert state["calls"][-1]["outcome"] == "unexpected_excess_probe"
+
+
+@pytest.mark.parametrize(
+    "request_body",
+    [
+        pytest.param({**PROBE_REQUEST, "input": "memory text"}, id="other-input"),
+        pytest.param({**PROBE_REQUEST, "model": "other-embedding"}, id="wrong-model"),
+        pytest.param({**PROBE_REQUEST, "dimensions": 1024}, id="extra-field"),
+        pytest.param(
+            {**PROBE_REQUEST, "input": ["dimension probe", "dimension probe"]},
+            id="batch",
+        ),
+        pytest.param({**PROBE_REQUEST, "encoding_format": "binary"}, id="format"),
+        pytest.param(
+            {**PROBE_REQUEST, "input": "E2E-other-run dimension probe"},
+            id="correlated",
+        ),
+    ],
+)
+async def test_window_absorbs_only_the_exact_probe_shape(
+    control: httpx.AsyncClient,
+    inference: httpx.AsyncClient,
+    request_body: dict,
+) -> None:
+    await arm_probe_window(control, "attach-shape-001", 1)
+
+    response = await inference.post("/v1/embeddings", json=request_body)
+
+    assert response.status_code in {400, 409}
+    state = (await control.get("/control/probe-windows/attach-shape-001")).json()
+    assert state["consumed_probes"] == 0
+    assert state["calls"] == []
+    overview = (await control.get("/control/scenarios")).json()
+    assert overview["unscoped_unexpected_calls"] == 1
+
+
+async def test_window_takes_the_probe_before_a_single_armed_scenario(
+    control: httpx.AsyncClient,
+    inference: httpx.AsyncClient,
+) -> None:
+    await arm(control, "run-with-probe-001")
+    await arm_probe_window(control, "attach-run-001", 1)
+
+    assert (
+        await inference.post("/v1/embeddings", json=PROBE_REQUEST)
+    ).status_code == 200
+
+    run = (await control.get("/control/scenarios/run-with-probe-001")).json()
+    assert run["calls"] == []
+    state = (await control.get("/control/probe-windows/attach-run-001")).json()
+    assert state["consumed_probes"] == 1
+
+
+async def test_windows_are_serial_unique_and_closing_keeps_the_record(
+    control: httpx.AsyncClient,
+    inference: httpx.AsyncClient,
+) -> None:
+    assert (await arm_probe_window(control, "attach-a-001", 1)).status_code == 201
+    second = await arm_probe_window(control, "attach-b-001", 1)
+    assert second.status_code == 409
+    assert second.json()["error"]["type"] == "probe_window_active"
+
+    closed = await control.delete("/control/probe-windows/attach-a-001")
+    assert closed.status_code == 200
+    assert closed.json()["closed"] is True
+    assert closed.json()["settled"] is False
+    reused = await arm_probe_window(control, "attach-a-001", 1)
+    assert reused.status_code == 409
+    assert reused.json()["error"]["type"] == "probe_window_exists"
+
+    after_close = await inference.post("/v1/embeddings", json=PROBE_REQUEST)
+    assert after_close.status_code == 409
+    overview = (await control.get("/control/scenarios")).json()
+    assert overview["active_probe_window"] is None
+    assert [window["window_id"] for window in overview["probe_windows"]] == [
+        "attach-a-001"
+    ]
+    assert overview["probe_windows"][0]["settled"] is False
+    assert overview["unscoped_unexpected_calls"] == 1
+
+
+async def test_probe_window_validation_is_fail_closed(
+    control: httpx.AsyncClient,
+) -> None:
+    for body in ({"expected_probes": 0}, {"expected_probes": 33}, {}):
+        response = await control.post(
+            "/control/probe-windows/attach-bad-001/arm", json=body
+        )
+        assert response.status_code == 422
+    invalid = await arm_probe_window(control, "bad window!", 1)
+    assert invalid.status_code in {400, 404, 422}
+    missing = await control.get("/control/probe-windows/attach-none-001")
+    assert missing.status_code == 404

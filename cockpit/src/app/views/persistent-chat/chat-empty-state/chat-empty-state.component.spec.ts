@@ -1,5 +1,5 @@
 import {afterEach, beforeAll, describe, expect, it} from 'vitest';
-import {Component, EventEmitter, Injector, runInInjectionContext, ɵresolveComponentResources} from '@angular/core';
+import {Component, EventEmitter, Input, Output, Injector, runInInjectionContext, ɵresolveComponentResources} from '@angular/core';
 import {TestBed} from '@angular/core/testing';
 import {provideRouter} from '@angular/router';
 import {TranslocoService, TranslocoTestingModule} from '@jsverse/transloco';
@@ -7,6 +7,7 @@ import {ChatEmptyStateComponent} from './chat-empty-state.component';
 import en from '../../../../assets/i18n/en.json';
 import {AppSelectComponent} from '../../../ui/select';
 import {AppButtonComponent} from '../../../ui/button';
+import {WorkspacePickerComponent} from '../../agent-settings/workspace-picker.component';
 
 // Vitest's JIT transform does not retain model()/viewChild() metadata. Keep
 // the production recovery template, substituting only the shared UI controls.
@@ -31,6 +32,16 @@ class ButtonStub {
   disabled = false;
   size = '';
   clicked = new EventEmitter<void>();
+}
+
+// The real picker loads data; this render spec only needs it to exist.
+@Component({selector: 'app-workspace-picker', standalone: true, template: ''})
+class WorkspacePickerStub {
+  @Input() role = 'session';
+  @Input() projectId: string | null = null;
+  @Input() preview: unknown = null;
+  @Input() choice: unknown = null;
+  @Output() choiceChange = new EventEmitter<unknown>();
 }
 
 function create() {
@@ -71,10 +82,10 @@ describe('ChatEmptyStateComponent variants', () => {
 
   afterEach(() => TestBed.resetTestingModule());
 
-  function render(inputs: Record<string, unknown>): HTMLElement {
+  async function render(inputs: Record<string, unknown>): Promise<HTMLElement> {
     TestBed.overrideComponent(ChatEmptyStateComponent, {
-      remove: {imports: [AppSelectComponent, AppButtonComponent]},
-      add: {imports: [SelectStub, ButtonStub]},
+      remove: {imports: [AppSelectComponent, AppButtonComponent, WorkspacePickerComponent]},
+      add: {imports: [SelectStub, ButtonStub, WorkspacePickerStub]},
     });
     TestBed.overrideComponent(ChatEmptyStateComponent, {
       set: {styleUrl: undefined, styleUrls: []},
@@ -98,21 +109,33 @@ describe('ChatEmptyStateComponent variants', () => {
     const inst = fixture.componentInstance as unknown as Record<string, unknown>;
     for (const [k, v] of Object.entries(inputs)) inst[k] = () => v;
     fixture.detectChanges();
+    // The workspace picker sits in an @defer block; let it resolve and render.
+    await fixture.whenStable();
+    fixture.detectChanges();
     return fixture.nativeElement as HTMLElement;
   }
 
   const text = (root: HTMLElement) => (root.textContent ?? '').replace(/\s+/g, ' ').trim();
 
-  it('renders neither the connectors control nor the advanced link for "ready"', () => {
-    const root = render({variant: 'ready', suggestions: []});
+  it('renders neither the connectors control nor the advanced link for "ready"', async () => {
+    const root = await render({variant: 'ready', suggestions: []});
     expect(root.querySelector('.draft-connectors')).toBeNull();
     expect(root.querySelector('.draft-advanced')).toBeNull();
     // The other half of "two i18n keys": ready's own copy, not draft's.
     expect(text(root)).toContain('The agent is connected and listening');
   });
 
-  it('renders both the connectors control and the advanced link for "draft"', () => {
-    const root = render({
+  it('does not claim the agent is listening while typed creation needs attention', async () => {
+    const root = await render({variant: 'ready', suggestions: [], workspaceCreation: {
+      stage: 'readiness', state: 'attention', reason_code: 'invalid_image',
+      readiness_deadline_at: null,
+    }});
+    expect(text(root)).toContain('Workspace needs attention');
+    expect(text(root)).not.toContain('agent is connected and listening');
+  });
+
+  it('renders both the connectors control and the advanced link for "draft"', async () => {
+    const root = await render({
       variant: 'draft',
       suggestions: [],
       connectorsEnabled: true,
@@ -124,8 +147,8 @@ describe('ChatEmptyStateComponent variants', () => {
     expect(text(root)).toContain('Default connectors (2)');
   });
 
-  it('still renders suggestion chips for either variant', () => {
-    const root = render({
+  it('still renders suggestion chips for either variant', async () => {
+    const root = await render({
       variant: 'ready',
       suggestions: [{icon: 'route', text: 'Review the manifest'}],
     });
@@ -133,27 +156,25 @@ describe('ChatEmptyStateComponent variants', () => {
     expect(chip?.textContent).toContain('Review the manifest');
   });
 
-  it('renders recovery controls without navigating away from retained messages', () => {
-    const root = render({
+  it('renders recovery controls without navigating away from retained messages', async () => {
+    const root = await render({
       variant: 'recovery', suggestions: [], connectorsEnabled: true,
-      datasourceCount: 1, workspaceBackend: '',
+      datasourceCount: 1,
     });
     expect(root.querySelector('[data-testid="draft-recovery"]')).not.toBeNull();
     expect(root.querySelector('input[type="checkbox"]')).not.toBeNull();
-    const select = root.querySelector('select');
-    expect(select).not.toBeNull();
-    expect(Array.from(select!.options).map(o => o.value)).toEqual(['', 'virtual', 'sandbox', 'vm', 'none']);
+    expect(root.querySelector('app-workspace-picker')).not.toBeNull();
     expect(root.querySelector('.draft-retry button')?.textContent).toContain('Retry sending');
     expect(text(root)).toContain('Your messages have not been sent');
     expect(root.querySelector('.draft-advanced')).toBeNull();
     expect(root.querySelector('.empty-mark')).toBeNull();
   });
 
-  it('keeps correction controls available when the new preview is refused', () => {
-    const root = render({
+  it('keeps correction controls available when the new preview is refused', async () => {
+    const root = await render({
       variant: 'recovery', suggestions: [], connectorsError: true,
     });
-    expect(root.querySelector('select')).not.toBeNull();
+    expect(root.querySelector('app-workspace-picker')).not.toBeNull();
     expect(root.querySelector<HTMLInputElement>('input[type="checkbox"]')?.disabled).toBe(false);
     expect(root.querySelector<HTMLButtonElement>('.draft-retry button')?.disabled).toBe(true);
     expect(root.querySelector('.draft-connectors-error button')).not.toBeNull();

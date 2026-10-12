@@ -91,6 +91,14 @@ image:
     tag: latest
     digest: ""
     pullPolicy: Always
+  # -- The minimal workspace image: the SRW workspace contract, the browser
+  # stack and a small CLI set. image.workspace is built on top of it. Its
+  # repository is always trusted, like image.workspace. Built and tagged
+  # together with image.workspace, so both always carry the same tag.
+  workspaceMinimal:
+    repository: ghcr.io/superhuman-remote-worker/srw-workspace-minimal
+    tag: latest
+    digest: ""
 
 # Public, declarative component identity. Source revisions are full commit IDs,
 # never display tags. Artifact digests remain empty unless the corresponding
@@ -135,6 +143,369 @@ manifestHosting:
   # Rules apply to new attempts. Cancel active attempts for immediate revocation.
   harnessEgress: []
 
+# =============================================================================
+# Connector drivers: service-plane hosting (connector drivers D5)
+# =============================================================================
+connectors:
+  servicePods:
+    # -- Host service-plane connector drivers (shared driver pods with a
+    # Service, in their own namespace). Off by default. Needs
+    # orchestrator.connectorLeases.exchangePort: drivers authenticate to the
+    # lease exchange with their own identity.
+    #
+    # Turning it off: every orchestrator replica with hosting off refuses
+    # driver pod identities at its exchange and revokes them (at start, then
+    # every minute, so pods an older replica still starts during the rollout
+    # are revoked too), but deletes nothing.
+    # The namespace is kept (helm.sh/resource-policy: keep) with whatever pods
+    # were running. Turning hosting back on removes them on the reconciler's
+    # first pass; to clean up for good instead, delete the namespace by hand:
+    #   kubectl delete namespace <release fullname>-connectors
+    enabled: false
+    # -- Empty selects orchestrator.connectorLeases.networkPolicy.driverNamespace,
+    # else <release fullname>-connectors. Must be a dedicated namespace.
+    namespace: ""
+    # -- The Kubernetes minor the namespace's Pod Security `baseline` level is
+    # pinned to (enforce-version), so a cluster upgrade never changes it.
+    podSecurityVersion: "v1.31"
+    # -- Installation cap on live service pods (one per connector, image
+    # digest and credential generation). The orchestrator refuses past it
+    # with a capacity error; the namespace's NotTerminating pod quota is the
+    # backstop. At the cap a new pod takes the place of the longest-idle pod
+    # no binding uses, waiting first for a stopped pod still terminating
+    # (for 90 s at most). A connector whose config or tier changed takes
+    # its own superseded pod's place at once, live bindings and all: those
+    # bindings (a managed MCP session, a git swap transfer) are cut for the
+    # successor's start time, without the repinDrainSeconds drain. A
+    # successor that fails to start shows on the connector's driver pods
+    # (stopped reason and launch error, the egress view; for a git swap
+    # repository, its Test too).
+    maxInstallation: 10
+    # -- Seconds a pod stays up after its last binding ended (or after a
+    # newer generation of its connector superseded it, until that
+    # generation's pod is ready: then it drains for repinDrainSeconds).
+    idleSeconds: 600
+    # -- Seconds a new pod may take to become ready (canary wait included)
+    # before it is stopped and its key backed off.
+    startTimeoutSeconds: 180
+    # -- Seconds between the leader's reconcile passes.
+    reconcileIntervalSeconds: 15
+    # -- Seconds between re-resolutions of a serving pod's pinned egress
+    # hosts. A shared pod with live bindings never idles, so without this an
+    # upstream that changed its addresses would stay unreachable from it.
+    # When two re-resolutions in a row give the same changed answer (a pool
+    # answering a rotating subset replaces nothing), a replacement pod
+    # starts with the new NetworkPolicy and hostAliases, the connector's
+    # endpoint Service moves to it once it is ready, and the old pod stops
+    # repinDrainSeconds after that, once the Service is seen to name the
+    # replacement. A host that no longer resolves, or resolves into a range
+    # SRW refuses, keeps what was pinned. A real move is followed within two
+    # intervals. 0 never re-resolves (a pod keeps its addresses until it
+    # idles).
+    reresolveSeconds: 300
+    # -- Seconds a pod replaced after a re-pin, or superseded by its
+    # connector's new generation (a config or tier change), keeps running
+    # once its successor is ready and the endpoint Service names it, so
+    # requests in flight on it can finish. Not at the installation's cap:
+    # there a superseded pod stops at once for its successor (maxInstallation).
+    repinDrainSeconds: 30
+    # -- The lease exchange server's second listener: every driver pod's
+    # start-up wait must find it refused while the exchange answers. The same
+    # server serves both, so they open and close together; the orchestrator
+    # admits the driver namespace on it and no driver policy ever allows it.
+    # A port of its own: never the exchange port or 8085.
+    canaryPort: 8089
+    # -- Driver pod egress is pinned per pod: each declared host is resolved
+    # once and written into the pod's NetworkPolicy ipBlocks and hostAliases.
+    # These are the cluster's REAL pod and service ranges (k3s defaults
+    # below), always refused as egress targets.
+    # The orchestrator refuses to host (stops every driver pod, starts none)
+    # unless its own pod address and the lease exchange's Service address lie
+    # inside them, so a cluster with other ranges fails closed.
+    clusterCidrs:
+      - 10.42.0.0/16
+      - 10.43.0.0/16
+    # -- Project network tiers whose connectors' pods may reach private and
+    # home addresses (RFC 1918, CGNAT, IPv6 ULA). A connector qualifies only
+    # when every project it belongs to is on one of these tiers. A declared
+    # egress CIDR that overlaps an always-refused range is refused as a whole:
+    # 100.64.0.0/10 contains Alibaba's metadata address 100.100.100.200, so
+    # declare the narrower ranges a driver needs.
+    privateTiers:
+      - home-allowed
+    # -- Ranges no driver pod may reach even where private addresses are
+    # allowed: the cluster's nodes (kube-apiserver, kubelet, etcd) and its
+    # load balancers. Empty uses the `except` lists of the workspace tiers
+    # named in privateTiers (workspace.networkPolicy.tiers), so a driver pod
+    # reaches no more than that tier's workspaces do. Those defaults are one
+    # installation's ranges: the orchestrator refuses to host unless its own
+    # node's address is refused to driver pods, so set the cluster's node
+    # ranges here (k3d: the docker network) when they differ.
+    refusedCidrs: []
+    # -- Pin AAAA answers too (dual-stack clusters only).
+    ipv6: false
+    # -- Set only after the cluster's CNI enforced the 12-probe start-up
+    # harness against a driver pod. Shown in the capability matrix's
+    # installation column; it gates nothing (the start-up wait always runs).
+    networkEnforcementVerified: false
+    # -- Driver container defaults (LimitRange defaultRequest/default) and
+    # ceilings (max). A driver's spec may ask for less or more, up to max.
+    driverResources:
+      requests:
+        cpu: "50m"
+        memory: "64Mi"
+        ephemeralStorage: "64Mi"
+      limits:
+        cpu: "500m"
+        memory: "256Mi"
+        ephemeralStorage: "1Gi"
+      max:
+        cpu: "2"
+        memory: "2Gi"
+        ephemeralStorage: "4Gi"
+    quota:
+      # -- Bind-time driver pods (Terminating scope; D6).
+      bindTimePods: 10
+      requestsCpu: "4"
+      requestsMemory: "8Gi"
+      limitsCpu: "16"
+      limitsMemory: "32Gi"
+      ephemeralStorage: "40Gi"
+      # -- One Secret per service pod, plus room for D6. Services: one per
+      # service pod and one endpoint Service per connector and image digest
+      # with a live pod (D5a); the chart never sets the quota below twice
+      # maxInstallation, whatever this says.
+      secrets: 64
+      services: 48
+  # -- The in-pod plane (connector drivers D7): a session workspace Pod's
+  # cloud folders are mounted by two native sidecars, so the FUSE daemons and
+  # the cloud credentials live outside the workspace container. The opener
+  # (srw-fuse-opener, docker/Dockerfile.in-pod-mount target opener) is
+  # privileged and only opens /dev/fuse, mounts and passes the descriptor on;
+  # the supervisor (srw-cloud-mount, target rclone) runs rclone unprivileged
+  # and holds the credentials, as a file from a Secret the Pod owns. Mounts
+  # are set up when a session's workspace Pod is created; one that does not
+  # come up never blocks the workspace, it is shown as unavailable.
+  #
+  # Such a Pod's workspace runs WITHOUT FUSE: no /dev/fuse, SYS_ADMIN or
+  # privilege, so a user can no longer run sshfs or rclone mount in its
+  # shell. VM, lite and job workspaces, OpenCloud mounts and officers keep
+  # the in-workspace path and workspace.fuse. A protected session keeps
+  # workspace.fuse for its capture overlay; its read-only lower comes from
+  # the sidecars when its reader grant is active as the Pod is created.
+  #
+  # Needs: the release namespace admits privileged Pods (the opener), and
+  # the orchestrator may create Secrets there (the chart grants create only).
+  # CI stamps tag and digest; a render from the repository uses the tag.
+  inPodPlane:
+    enabled: true
+    opener:
+      image:
+        repository: ghcr.io/superhuman-remote-worker/srw-fuse-opener
+        tag: latest
+        digest: ""
+    rclone:
+      image:
+        repository: ghcr.io/superhuman-remote-worker/srw-cloud-mount
+        tag: latest
+        digest: ""
+    # -- What every mount's rclone cache in a Pod stays under together. The
+    # cache emptyDir has no sizeLimit (the kubelet would evict the whole Pod
+    # past it, and rclone's cap is soft), so it uses node disk. The
+    # supervisor requests this much ephemeral storage for scheduling.
+    cacheSize: 10Gi
+    # -- How long the supervisor waits for pending uploads at a drain
+    # request (End of a stateless session) and when it stops. At most 90:
+    # the workspace Pod's grace period is 120 s and the workspace and the
+    # opener stop within it too.
+    drainSeconds: 60
+    # -- At most this many mounts per Pod; the rest are shown as left out.
+    maxMounts: 8
+    # -- The supervisor's memory limit. Empty: 256Mi plus 192Mi per mount,
+    # at most 2Gi (each mount runs its own rclone).
+    supervisorMemory: ""
+  # -- Driver images users register themselves (connector drivers D6): in
+  # their Account, as Project editors in a Project, as administrators in the
+  # shared Catalog. Any image may be registered; the control is privilege,
+  # never admission (the workspace-image policy). A custom image runs
+  # unprivileged in bind-time pods under the namespace baseline; its bind
+  # returns data (environment variables, credential files) that SRW delivers.
+  # Needs servicePods.enabled for its pods.
+  customDrivers:
+    # -- Let images outside drivers.trustedRepositories have privilege too
+    # (for an in-pod driver; the in-pod plane above serves only SRW's own
+    # cloud mounts). Off: only trusted repositories.
+    privileged: false
+    # -- A bind-time pod's activeDeadlineSeconds: the longest one driver
+    # operation (bind, revoke, check, spec) may run, canary wait included.
+    bindDeadlineSeconds: 120
+    # -- How long a session's attach or claim waits for a new bind; the bind
+    # goes on meanwhile and the session gets the connector at a later
+    # delivery (a job waits in the dispatcher instead, never blocking it).
+    # Below the agent's 30 s request to the orchestrator: at most 25.
+    bindWaitSeconds: 20
+    # -- How many spec-operation pods (registering an image without a spec
+    # label) one user may run at once.
+    specPodsPerUser: 2
+  # -- Credentials SRW mints at a provider (connector drivers C5): a
+  # kubeconfig connector's token_request (a TokenRequest token for one
+  # ServiceAccount, bound to a Secret SRW deletes when the execution ends)
+  # and GitHub App repository connectors (one-hour installation tokens for
+  # one repository). The orchestrator calls the provider itself: its address
+  # must be public, or private on a project tier that allows private
+  # addresses, never loopback, link-local or cloud metadata.
+  providerMinting:
+    # -- Offer both options, and run the leader's revoke sweep. Off: neither
+    # can be saved or delivered; credentials minted before lapse at the
+    # provider on their own (bound Secrets stay behind).
+    enabled: true
+    # -- Provider hosts (host or host:port) the operator trusts at a private
+    # or cluster address, for every project, e.g. kubernetes.default.svc for
+    # the cluster SRW runs in. Link-local and metadata addresses never.
+    # A connector's Test reaches its host from the orchestrator under the
+    # same rule (a repository's forge API and SSH endpoint). SRW's own Gitea
+    # needs no entry: Test trusts the endpoints the chart configures for it
+    # (its internal and public API URLs and SSH endpoints, each with its
+    # port only), never for a mint.
+    privateHosts: []
+  drivers:
+    # -- Repositories whose driver images are trusted (D6), matched on a
+    # path boundary: ghcr.io/acme trusts ghcr.io/acme/driver but never
+    # ghcr.io/acme-evil. A trusted image may have privilege; every other
+    # registered image is custom and its claims are its author's.
+    trustedRepositories: []
+    # -- SRW's static driver shim (docker/Dockerfile.driver-shim): the
+    # canary-wait and shim-install init containers of every driver pod, and
+    # the driver container's command. servicePods.enabled needs a digest
+    # (the chart fails to render without one); CI stamps tag and digest.
+    shim:
+      image:
+        repository: ghcr.io/superhuman-remote-worker/srw-driver-shim
+        tag: latest
+        digest: ""
+    # -- How a bind resolves a driver image reference to a digest. Any
+    # registry may serve a driver image; anonymous pulls only (private
+    # registries need pull credentials SRW does not hold yet).
+    registry:
+      # -- Registries reached over plain HTTP (host[:port]), e.g. the k3d
+      # registry. Everything else is HTTPS.
+      insecureHosts: []
+      # -- Registries (host[:port]) that may resolve to a private, loopback
+      # or cluster address, e.g. an in-cluster or LAN registry. Every other
+      # registry, token host and blob redirect target must be a public
+      # address; link-local and cloud metadata addresses never are reached.
+      privateHosts: []
+      # -- Extra bearer-token hosts a registry may send SRW to. The
+      # registry's own host and auth.docker.io are always allowed.
+      tokenHosts: []
+      # -- Seconds a tag's resolution is reused before the next lookup.
+      resolveCacheSeconds: 60
+      # -- Deadline of one registry lookup at bind.
+      resolveTimeoutSeconds: 10
+    # -- Development only: the srw.echo-service/v1 service driver, whose pod
+    # runs SRW's srw-driver-echo image (built by Tilt; never published). It
+    # keeps a fake secret behind a lease and answers with its request file,
+    # so scripts/k3d-service-driver-gate.py can prove service-plane hosting.
+    # A digest pins the reference (tag@digest); without one the tag follows.
+    # Needs servicePods.enabled. Never in production.
+    echo:
+      enabled: false
+      image:
+        repository: ""
+        tag: ""
+        digest: ""
+    # -- SRW's front for managed MCP servers (docker/Dockerfile.driver-mcp-front):
+    # the only exposed port of every managed MCP driver pod. It checks each
+    # request's lease token with the lease exchange, injects the connector's
+    # upstream credential, hides and refuses the tools a ReadOnly binding may
+    # not call, and scrubs the credential from every answer. The image also
+    # carries SRW's stdio bridge, which a stdio server's pod installs from it
+    # to run one process of the server per binding (D5b). A managed MCP
+    # driver needs a digest (the chart fails to render without one); CI
+    # stamps tag and digest.
+    mcpFront:
+      image:
+        repository: ghcr.io/superhuman-remote-worker/srw-driver-mcp-front
+        tag: latest
+        digest: ""
+    # -- Managed MCP servers from SRW's catalogue (connector drivers D5a):
+    # stock MCP server images that speak streamable HTTP, run as shared
+    # service pods behind the front. Each needs servicePods.enabled and the
+    # front's digest. The image reference may follow a tag or pin a digest
+    # (tag@digest; the digest wins).
+    managedMcp:
+      # -- srw.gitea-mcp/v1: the official Gitea MCP server. A connector names
+      # its Gitea URL and holds a Gitea token, which only the front and the
+      # server ever see (per request, from the lease exchange).
+      gitea:
+        enabled: false
+        image:
+          repository: docker.gitea.com/gitea-mcp-server
+          tag: "1.8.0"
+          digest: "sha256:5fad9c4a1148071fd58ed617f779115f65a13c517c20427a3b39f80cac43e600"
+    # -- Development only: srw.mcp-test/v1, SRW's MCP test server
+    # (docker/Dockerfile.driver-mcp-test, built by Tilt; never published),
+    # which scripts/k3d-managed-mcp-gate.py runs behind the front. Never in
+    # production.
+    mcpTest:
+      enabled: false
+      image:
+        repository: ""
+        tag: ""
+        digest: ""
+    # -- The git swap driver, srw.git-swap/v1 (connector drivers C3;
+    # docker/Dockerfile.driver-git-swap): a git smart-HTTP reverse proxy in a
+    # shared service pod per repository connector. A token repository on
+    # HTTPS port 443 is cloned through it: the workspace keeps the clean
+    # upstream URL as its remote and holds only a lease token; the driver
+    # exchanges it for the forge token per request. ReadOnly refuses every
+    # push; ReadWrite allows branch pushes only (no deletes, no tags). Needs
+    # servicePods.enabled; the chart creates SRW's driver certificate
+    # authority (ca below). CI stamps tag and digest.
+    gitSwap:
+      enabled: false
+      image:
+        repository: ghcr.io/superhuman-remote-worker/srw-driver-git-swap
+        tag: latest
+        digest: ""
+      # -- What a token repository the driver cannot serve gets (the driver
+      # is off, or the repository is not HTTPS on port 443): "token-in-url",
+      # its token in the clone URL as before C3 (logged per connector), or
+      # "refuse", no clone and the reason in the agent's README.
+      fallback: token-in-url
+    # -- SRW's connector driver certificate authority (C3): signs each TLS
+    # driver pod's certificate; workspaces trust it for the driver's URL
+    # only. Generated once at install and kept (resource-policy keep) when
+    # gitSwap is on, unless secretName names an existing Secret with tls.crt
+    # and tls.key (Vault, ESO). Mounted into the orchestrator only.
+    ca:
+      secretName: ""
+      validityDays: 3650
+    # -- Development only: srw.mcp-stdio-test/v1 (D5b), Docker's stock
+    # mcp/memory image, unchanged, behind the front and SRW's stdio bridge,
+    # one process per binding. It needs no external account;
+    # scripts/k3d-managed-mcp-stdio-gate.py drives it. Pulled from Docker
+    # Hub at the pinned digest. Never in production.
+    # Blast radius of every stdio server's pod: each binding's process runs
+    # as a user of its own with its processes capped, but all of them share
+    # the server container's one memory limit (the spec's resources), so
+    # one binding's process outgrowing it OOM-kills every binding's process
+    # and the bridge, and the pod restarts. This server holds each Node
+    # heap to 64 MiB under a 640 MiB limit; a spec can cap a process's
+    # address space (address_space_mb, opt-in: it breaks Node and Go).
+    mcpStdioTest:
+      enabled: false
+      image:
+        repository: docker.io/mcp/memory
+        tag: latest
+        digest: "sha256:db0c2db07a44b6797eba7a832b1bda142ffc899588aae82c92780cbb2252407f"
+    # -- Development only: srw.mcp-stdio-probe/v1 (D5b), SRW's MCP test
+    # server in stdio mode (the mcpTest image, so it needs mcpTest's image),
+    # whose probe tools let scripts/k3d-managed-mcp-stdio-gate.py prove one
+    # binding's process cannot reach another's. Never in production.
+    mcpStdioProbe:
+      enabled: false
+
 orchestrator:
   # -- 1 replica by default. NOT a statement about what HA needs: leader
   # election (M1) makes replicas:2 correctness-safe and removes the
@@ -166,6 +537,12 @@ orchestrator:
   # generation admitted before the flag closes may finish without stranding
   # its process-zero/maintenance fence.
   workspaceCleanupReconciliationEnabled: false
+  # -- Admit container startup v1 receipts only after the capable bridge and
+  # migrations 0309/0310 are deployed and all pre-bridge orchestrator processes
+  # and their in-flight creators are gone. Disable to stop new adoption;
+  # existing v1 work continues. Roll back only to a v1-capable image.
+  containerStartupStageAuthority:
+    enabled: false
   # -- One-release coordinated cutover for the 0197/0198 workspace lifecycle
   # authority epoch. Keep true while advancing the ServiceAccount generation:
   # the namespace RoleBinding revokes the predecessor account and Recreate
@@ -188,6 +565,27 @@ orchestrator:
   # value intentionally retains same-cluster TCP/22 for existing/read-only VM
   # paths; mutation admission is fenced by the application + database gate.
   vmRemoteOperationProtocol:
+    enabled: false
+  vmProvisioning:
+    # -- Admit new jobs through the durable creation protocol. Keep disabled
+    # until every controller supports the complete creation and cleanup contract.
+    creationRetryEnabled: false
+    # -- Active rootdisk preparation time without forward progress before
+    # attention. Placement waits pause this clock; the disk is retained.
+    rootdiskStallTimeoutSeconds: 2700
+  # -- Retain the exact rootdisk while releasing idle stateless VM Jobs.
+  # Requires the remote-I/O and durable creation protocols; off until the
+  # lifecycle/access acceptance gate is reviewed. Turning this off stops new
+  # idle admissions; this image still reconciles existing operations and
+  # access leases. Drain all migration-0270 operations before rolling back to
+  # an image that cannot recognize them.
+  vmIdleRelease:
+    enabled: false
+  # -- Admit exact never-Ready cancelled Job VM retention. New admissions only:
+  # persisted retention guards, retries and typed permanent Delete stay active
+  # when false. Enable only after qualified controllers and cleanup actors have
+  # replaced every old actor. Disabling does not authorize legacy rollback.
+  vmJobCancelRetention:
     enabled: false
   # -- Durable recovery for held stateless VM workspaces. The reader, cleanup
   # guards and recovery controls remain active while automation is disabled;
@@ -214,6 +612,11 @@ orchestrator:
   # The gate wrapper enables this only on the uniquely owned k3d cluster it
   # creates. Never enable it on a shared or production release.
   vmWorkspaceRecoveryAcceptanceGate:
+    enabled: false
+  # -- Expose the disposable retained-disk Resume acceptance adapter only on
+  # an exclusively owned cluster. The host wrapper owns its temporary quota;
+  # the application receives no quota write permission.
+  vmRetainedResumeAcceptanceGate:
     enabled: false
   resources:
     requests:
@@ -250,6 +653,18 @@ orchestrator:
   # unattended-operation deployment gates are complete; false always permits
   # disabling an already configured century and suppresses new tick admission.
   officerAutoPullReleaseEnabled: false
+  # -- Session lanes whose parents may run several delegate_agent calls from
+  # one response (subagent fan-out): "" (off), "stateless" or
+  # "stateless,pinned". Enabled by default for both lanes. Advertised per
+  # claim and attach and, for a running pinned session, on its heartbeat;
+  # never frozen into a session: set "stateless" to turn the pinned lane off
+  # or "" to turn both off. A stateless session returns to single-call
+  # delegation at its next claim, a running pinned session at its next turn
+  # after its next heartbeat, while a batch already in flight is still settled
+  # by recovery. The orchestrator's own code default
+  # (SESSION_SUBAGENT_FANOUT_LANES unset) is off, so a run outside this chart
+  # stays opt-in.
+  sessionSubagentFanoutLanes: "stateless,pinned"
   # -- Additional exact Git host or host:port endpoints trusted for external
   # OKF KB datasources. The built-in public-provider set remains enabled.
   # Wildcards, IP literals, and localhost are rejected. Example:
@@ -267,6 +682,42 @@ orchestrator:
   # -- Optional OpenSSH known_hosts content for external OKF KB deploy-key
   # remotes. Non-empty content switches SSH from accept-new to strict pinning.
   kbGitSshKnownHosts: ""
+  # -- Optional OpenSSH known_hosts content pinning the host keys of external
+  # SSH hosts that SSH-key repository and ssh_key connectors reach from a
+  # workspace (e.g. GitHub's and GitLab.com's published keys). Only lines that
+  # name a connector's host apply to it; a connector's own known_hosts field
+  # wins. A pinned connector gets StrictHostKeyChecking yes, any other one
+  # accept-new into its own per-connector known_hosts file.
+  workspaceSshKnownHosts: ""
+  # -- Connector credential leases (connector drivers C2). A connector whose
+  # driver delivers by lease never sends its upstream credential to an agent:
+  # the workspace receives a short-lived lease token, and the driver exchanges
+  # it for the credential on a dedicated orchestrator port.
+  connectorLeases:
+    # -- The lease exchange's own container and Service port; 0 (the default)
+    # serves no exchange. It serves the exchange and introspection routes and
+    # nothing else, and no ingress routes it. Setting a port always renders
+    # the NetworkPolicy below, which admits only driver pods to it. Off until
+    # service-plane hosting (D5) brings the drivers that call it. Never 8085.
+    exchangePort: 0
+    # -- Seconds a lease lives after its last renewal (decision 9: 900). The
+    # leader renews leases of live executions in the second half of this
+    # window; a paused Job's lease lapses after it. Minimum 60.
+    ttlSeconds: 900
+    # -- Seconds between renewal sweeps; capped at a quarter of ttlSeconds.
+    sweepIntervalSeconds: 60
+    # -- Development only: install the srw.lease-probe/v1 driver, which keeps
+    # a fake secret behind a lease so a gate can drive the lease lifecycle and
+    # the exchange before a real lease driver exists. Never in production.
+    probeDriver: false
+    # -- Rendered whenever exchangePort is set: the orchestrator pods' ingress
+    # keeps the API port (8085) open to every source, as today, and admits
+    # only pods in driverNamespace to the exchange port. There is no switch:
+    # the exchange is never served without it.
+    networkPolicy:
+      # -- The namespace connector driver pods run in. Empty selects
+      # <release fullname>-connectors (service-plane hosting, D5).
+      driverNamespace: ""
   # -- Maximum simultaneous external OKF Git snapshot/embed operations per
   # orchestrator replica (create/update/manual/test plus the leader sweep).
   kbExternalReindexConcurrency: 2
@@ -508,14 +959,17 @@ agent:
   # -- Separate canary gate for the persistent-session capability tool.
   # Operators must also enable the endpoint gate for controlled live probes.
   productCapabilitiesToolEnabled: "false"
-  # -- Enable user-added MCP servers as datasources. Both gates default off;
-  # stdio executes third-party commands in agent pods and should remain off
-  # for hosted/multi-tenant deployments without suitable isolation.
+  # -- Enable user-added MCP servers (http or sse) as datasources. Off by
+  # default. A stdio server no longer runs in agent pods (connector drivers
+  # D5b): its image runs as a managed MCP server (connectors.drivers), and
+  # the former agent.mcpStdioEnabled fails the render when set to true.
   mcpDatasourcesEnabled: "false"
-  mcpStdioEnabled: "false"
   # -- Temporary compatibility gate for REST/session requests that omit
-  # datasource_ids. Cockpit submits an explicit reviewed array; enable this
-  # after legacy clients no longer encode "none" by omission.
+  # datasource_ids. Omission always attaches the project's own platform-owned
+  # connectors (knowledge base, cloud folder); this gate adds the owner's and
+  # the project's other defaults. An explicit [] attaches none. Cockpit
+  # submits an explicit reviewed array; enable this after legacy clients no
+  # longer encode "none" by omission.
   datasourceDefaultsOnOmission: "false"
   # -- Coordinated rollout gate for the connector project-scope/auto-attach UI.
   # Keep false until all orchestrator replicas understand the v1 API contract.
@@ -656,6 +1110,37 @@ agent:
     # this budget covers model execution and local staging. Worker batches run at least
     # worker.batchMinWallSeconds and rotate at the batch edge regardless.
     shutdownTimeoutSeconds: 300
+    # -- Stamp executor Pods with the `lifecycle.srw.dev/stateless-executor-
+    # process-zero` finalizer so a stolen claim's exact Pod UID stays readable
+    # until its containers are observed terminated and the orchestrator has
+    # recorded that proof (claimant-loss holds cannot settle otherwise). The
+    # orchestrator's run_queue reaper releases it, so the pool leaves no
+    # `Terminating` Pods behind on rollouts or scale-downs while the
+    # orchestrator runs. Executors on a lost node are released once the Node
+    # is deleted or tainted `node.kubernetes.io/out-of-service` (this also
+    # renders a read-only `nodes: get` ClusterRole for the orchestrator); a
+    # retained Pod no claim owes can be released with
+    # POST /api/admin/run-queue/executor-pods/<pod>/attest-gone, and one a
+    # claim still owes with POST /api/admin/run-queue/<unit>/attest-claimant-gone.
+    # Release is scoped by `app.kubernetes.io/instance` (the release name), not
+    # the chart name, so a chart rename does not strand executors the previous
+    # chart created. A `kubectl debug` container that is still running blocks
+    # release until it exits; one whose image never pulled does not.
+    #
+    # Without a running orchestrator deleted executors stay `Terminating`
+    # (containers already stopped): helm uninstall / `tilt down`, and a
+    # namespace delete, which then hangs on them. A reinstall's orchestrator
+    # releases them; otherwise strip them in bulk (all Terminating executors
+    # of release <release> in <ns>):
+    #   kubectl -n <ns> get pods -l srw/class=agent-stateless,app.kubernetes.io/instance=<release> \
+    #     -o jsonpath='{range .items[?(@.metadata.deletionTimestamp)]}{.metadata.name}{"\n"}{end}' \
+    #     | xargs -r -I{} kubectl -n <ns> patch pod {} --type=json \
+    #         -p '[{"op":"remove","path":"/metadata/finalizers"}]'
+    # Rolling back to a chart older than this setting: first `helm upgrade`
+    # with processZeroFinalizer=false and wait for the executor Deployment to
+    # finish rolling (this orchestrator releases the old Pods), THEN roll back;
+    # otherwise the older orchestrator strands every finalized executor.
+    processZeroFinalizer: true
     # -- Recover an idle thread's stale cloud push through a low-priority
     # bg_task. Default off; requires migration 0233 and matching executors.
     cloudPushRecoveryEnabled: false
@@ -1042,6 +1527,10 @@ auth:
 # to render rather than letting the operator find out as a crash-loop.
 sshGateway:
   enabled: false
+  # -- Optional full image descriptor (repository, tag or digest, pullPolicy).
+  # Null uses image.orchestrator. Pin the previous gateway digest while
+  # upgrading the relay and verifying agents; clear this after qualification.
+  image: null
   # -- Gateway pods. EVERY abuse cap the gateway enforces is PER POD, so this
   # value multiplies all of them.
   #
@@ -1094,20 +1583,22 @@ sshGateway:
   #
   # This Secret must carry, for every name in `hostKeyNames` below, BOTH the
   # private half (`<name>`, mounted into the gateway) and its public half
-  # (`<name>.pub`, mounted into the ORCHESTRATOR, which is where
-  # `GET /api/ssh/host-keys` runs). Without the `.pub` halves that endpoint
-  # answers 200 with an empty list forever and pinning clients silently
-  # degrade to trust-on-first-use.
+  # (`<name>.pub`, projected into the ORCHESTRATOR for host-key publication
+  # and into pinned agents for native first-use proof verification). Without
+  # the `.pub` halves, the publication endpoint answers 200 with an empty
+  # list forever and pinning clients silently degrade to trust-on-first-use.
   hostKeySecret: ""
-  # -- Host-key names inside `hostKeySecret`. ONE list drives all four
+  # -- Host-key names inside `hostKeySecret`. ONE list drives
   # derived things — the gateway's `SSH_GATEWAY_HOST_KEYS`, the orchestrator's
-  # `SSH_GATEWAY_PUBLIC_HOST_KEYS`, and both pods' projected `items` — because
+  # `SSH_GATEWAY_PUBLIC_HOST_KEYS`, all public-only projections, and the
+  # provisioner's selected item names — because
   # when the served and the published key sets drift, clients see a host-key
   # mismatch indistinguishable from an active MITM.
   #
-  # Ed25519 ONLY. `_require_ed25519_host_key` (ssh_gateway_config.py) raises on
-  # any algorithm that is not `ssh-ed25519` at `load_config`, so an RSA host
-  # key means the gateway refuses to start; a server's advertised host-key
+  # At most four unique, safe names; the key material must be Ed25519.
+  # `_require_ed25519_host_key`
+  # (ssh_gateway_config.py) raises on any non-Ed25519 key at `load_config`,
+  # so an RSA host key means the gateway refuses to start; a server's host-key
   # algorithms come straight from the loaded key material, and an RSA key drags
   # in legacy SHA-1 `ssh-rsa`.
   hostKeyNames:
@@ -2284,6 +2775,14 @@ keycloak:
   # When false, fill in the externalIssuerUrl and externalInternalUrl fields below.
   internal: true
   image: quay.io/keycloak/keycloak:26.2
+  # -- Initial SRW login for the bundled Keycloak realm. Password comes from
+  # KC_REALM_ADMIN_PASSWORD. This does not configure the Keycloak master admin.
+  bootstrapAdmin:
+    # Empty preserves the existing realm ConfigMap's initial username during
+    # connected Helm upgrades; a fresh install defaults to the historical test.
+    # Set before first install: 1-64 ASCII letters/digits/._-, starting alnum.
+    # Keep the same explicit value for offline/GitOps renders (no lookup).
+    username: ""
   # -- Replica count for the bundled Keycloak. The pod runs in production mode
   # (`start`), so >1 is correctness-safe without extra infrastructure: the
   # Infinispan cluster discovers peers via `jdbc-ping` through the Keycloak
@@ -2325,7 +2824,7 @@ keycloak:
   # k3d developer shares one known set instead of hand-rolling accounts.
   # Enabling this on any reachable deployment hands anyone who has read the
   # repo full admin access.
-  # The bootstrap `test` admin is separate and always created; its password
+  # The bootstrapAdmin user is separate and always created; its password
   # comes from the required KC_REALM_ADMIN_PASSWORD secret, never from here.
   devUsers:
     enabled: false
@@ -2536,13 +3035,16 @@ nextcloud:
         limits:
           memory: "64Mi"
           cpu: "100m"
+  # Idle is cheap, but every authenticated request costs ~0.7 CPU-s (Argon2id
+  # login + PHP bootstrap), so a 500m cap stretched each WebDAV/OCS call to
+  # ~1.5 s and serialised concurrent session creates and cloud pushes.
   resources:
     requests:
       memory: "256Mi"
-      cpu: "100m"
+      cpu: "200m"
     limits:
       memory: "1Gi"
-      cpu: "500m"
+      cpu: "2"
 
 opencloud:
   enabled: true
@@ -2624,9 +3126,17 @@ cloud:
   rcloneMount:
     # -- Treat SSH workspace containers as rclone/FUSE-capable runtimes.
     allowContainer: true
-  # -- Optional explicit Nextcloud username for rclone user-home mounts.
-  # Pair with Secret key NEXTCLOUD_RCLONE_USER_HOME_PASSWORD.
-  nextcloudRcloneUserHomeUsername: ""
+  # -- The main cloud is configured here only; the admin Main cloud page is
+  # read-only. At startup the orchestrator adopts a change to these values
+  # on its own only where its attestation proves it: the same installation
+  # reached at a new internal URL, admin account or protected-effect lane.
+  # Any other change (the public URL, the agent account or its secret
+  # reference), a *different* installation (another provider or server), or
+  # a cloud reinstalled at the same address is adopted only when this names
+  # the active installation id shown on the Main cloud page: new work then
+  # goes to the described cloud, and everything stamped with the old
+  # installation stays on it. Leave empty otherwise; a stale id is ignored.
+  replaceInstallation: ""
 
 # =============================================================================
 # Workspace
@@ -2642,6 +3152,72 @@ workspace:
     # is required by k3d/containerd and many managed cluster runtimes even when
     # /dev/fuse and SYS_ADMIN are present.
     privileged: true
+  images:
+    # -- Image repositories (host/path, any tag or digest) whose workspaces keep
+    # the privileged FUSE profile. The repository of image.workspace is always
+    # trusted, and so is the repository of image.workspaceMinimal. Every other
+    # image is a custom image; see customImages.
+    trustedRepositories: []
+  customImages:
+    # -- Give custom workspace images the same privileged FUSE profile as
+    # trusted ones. Off by default: a custom image decides what runs as root in
+    # its container, and privileged is one step from root on the node. Enable
+    # only when you trust everyone who can author workspace templates.
+    privileged: false
+  builtinTemplates:
+    # -- Ship the built-in workspace templates in the shared Catalog: virtual,
+    # container-minimal, container-full and, when VMs are on, vm-full. The
+    # orchestrator reconciles them at every start. They are read-only in the
+    # application; users duplicate one to change it. false retires them.
+    # Changing this block changes the orchestrator's ConfigMap; with
+    # reloader.enabled (on by default), Reloader restarts the orchestrator so
+    # the new start picks it up. With Reloader off, restart it by hand.
+    enabled: true
+    # -- Sizes of the two built-in container templates. cpu and memory are the
+    # maximum; requests is what Kubernetes reserves on the node. A Job that
+    # names no workspace gets container-full (see workspace.defaults), so these
+    # are every such Job's sizes. The shipped values equal the sizes of a
+    # container workspace without a template.
+    containerResources:
+      cpu: 2
+      memory: 4Gi
+      requests:
+        cpu: 0.5
+        memory: 1Gi
+    # -- Sizes of the built-in vm-full template. cpu must be a whole number.
+    # cpu and memory equal what a VM gets today when nothing states sizes. They
+    # are not vmController.defaultCpu and defaultMemory, which apply only to a
+    # request without sizes; the orchestrator always sends sizes. storage is
+    # larger than vmController.vmDiskSize on purpose: a VM is usually chosen to
+    # install software, and 20Gi fills quickly. The VM controller never makes a
+    # disk smaller than vmController.vmDiskSize, so a larger vmDiskSize wins.
+    # A VM upgrade (a Session's, or a Job frozen for sudo) that names no
+    # template gets the VM template of the workspace defaults, vm-full unless
+    # workspace.defaults.vm or the Project names another, so it gets these
+    # sizes too. They don't change a VM whose recipe states only backend: vm.
+    vmResources:
+      cpu: 8
+      memory: 16Gi
+      storage: 30Gi
+  # What a Job or Session gets when nobody names a workspace (Slice A2b).
+  # Modes: none | virtual | container | vm. A template name refers to a
+  # WorkspaceTemplate in Catalog/shared; empty means the built-in
+  # (container-full, vm-full), or the plain backend when builtinTemplates is
+  # off. A Project's own defaults win over these.
+  defaults:
+    jobs: container
+    sessions: virtual
+    container: ""
+    vm: ""
+  # -- How long a custom workspace image may take to pull before a Job fails
+  # with the pull error (with startup-stage tracking, before the Job shows that
+  # its image didn't finish pulling in time). The installation image is
+  # prewarmed and unaffected.
+  # The Job dispatcher runs at most two workspace creations at once, so two
+  # slow or unpullable custom images can delay other new Job workspaces for up
+  # to this budget. orchestrator.containerStartupStageAuthority.enabled frees
+  # the slot after one observation.
+  imagePullTimeoutSeconds: 600
   # -- Access mode for the shared workspace PVC. Production uses
   # ReadWriteMany (Longhorn). Single-node clusters with RWO-only storage
   # (k3s local-path) can override to "ReadWriteOnce".
@@ -2814,6 +3390,14 @@ searxng:
   image: ghcr.io/searxng/searxng:2026.8.20-8d3dd0cd4
   service:
     port: 8080
+  # -- Per-engine overrides merged by name into the upstream engine list
+  # (settings.yml `engines:`; an unknown name adds a new engine). Upstream
+  # defaults stay untouched when empty. Useful when the default web engines
+  # are CAPTCHA-blocked from the cluster's egress IP, e.g.:
+  #   engines:
+  #     - name: bing
+  #       disabled: false
+  engines: []
   resources:
     requests:
       memory: "512Mi"
@@ -2825,7 +3409,7 @@ searxng:
 crawl4ai:
   # -- Default-off because the browser service needs about 4 GiB at its
   # supported ceiling. Enabling this deploys the fixed-destination service;
-  # catalog/provider registration remains an explicit admin action.
+  # the research-provider seed hook registers it and fills an unset fetch default.
   enabled: false
   image: docker.io/unclecode/crawl4ai:0.9.2
   service:
@@ -2900,7 +3484,20 @@ codexProxy:
   # unrelated jobs on the same proxy. v7.2.110 adds IsRequestScoped() and is a
   # strict descendant of that fix. Dev has run it since 2026-07-30.
   # knowledge-history/done/codex_stream_disconnect_shape_nudge.md
-  image: docker.io/eceasy/cli-proxy-api:v7.2.110
+  #
+  # v7.3.13 (2026-09-22) was the first build that lists `claude-opus-5-5`. It
+  # drops `gpt-5.3-codex-spark`, `gpt-5.4` and `gpt-5.4-mini` from its Codex
+  # catalog (upstream stopped publishing them): disable those catalog rows
+  # before rolling anything from v7.3.13 on.
+  #
+  # Pinned at v7.3.20 (2026-09-29), a strict descendant of that fix. Anthropic
+  # now rejects Opus 5.5 below Claude Code 2.1.280 (`claude_code_version_too_old`,
+  # which v7.3.13's 2.1.258 profile hit); v7.3.15+ presents 2.1.280. From
+  # v7.3.17 Claude reasoning is only visible when the request asks for it
+  # (`include_reasoning`, sent by the loader's OpenAI factory). After ANY move
+  # of this pin, run scripts/subscription-proxy-probe.py ONCE against the new
+  # proxy.
+  image: docker.io/eceasy/cli-proxy-api:v7.3.20
   storageSize: "1Gi"
   # Retries INSIDE the proxy, on 403/408/500/502/503/504. An unset key yields 0
   # (Go zero value) despite upstream's config.example.yaml documenting 3.
@@ -2909,12 +3506,21 @@ codexProxy:
   # is what burns credentials — the upstream reporter watched it take out 4 of
   # 6, then 5 of 6 — so on an older image this value is an amplifier, not a
   # cure. If you ever pin the image back below v7.2.110, set this to 0.
+  # (v7.3.20 keeps IsRequestScoped(), so 3 stays safe on the current pin.)
   requestRetry: 3
   # Body-level request/response logging to the pod log. OFF by default: it emits
   # full prompts AND auth headers. Flip to true only while actively catching an
   # upstream error the status endpoint won't explain, then flip it back.
   requestLog: false
   debug: false
+  # Keep a conversation on one connected account. Provider prompt caches are
+  # per account, and the proxy's default round-robin moves every request to
+  # the next one, so with several accounts a conversation's turns read none of
+  # each other's cache. SRW sends the job or thread id as `X-Session-ID`
+  # (LLMConfig.prompt_cache_key). A 429 or an unavailable account still fails
+  # over to another one. Supported since at least v7.2.110.
+  sessionAffinity: true
+  sessionAffinityTtl: "1h"
   # Optional dedicated *inference* credential, distinct from the management
   # key. CLIProxyAPI guards /v0/management/* with MANAGEMENT_PASSWORD and
   # /v1/* with its own access-manager API keys; SRW historically stored the
@@ -3170,7 +3776,9 @@ llm:
     # with its defaults chosen instead of waiting for an admin to click
     # through them. Same insert-only contract as everything above: a kind
     # that already has a pin (set by an admin, or claimed by the boot-time
-    # Tavily/SearXNG/Crawl4AI/ElevenLabs seeders) is left alone.
+    # Tavily/SearXNG/Crawl4AI/ElevenLabs seeders) is left alone. The one
+    # exception is an automatic pin (below): nobody chose it, so a declared
+    # default replaces it.
     #
     # The model must be an enabled catalog row carrying the kind's
     # capability — seeded via systemModels / systemEndpoints above, imported
@@ -3185,7 +3793,12 @@ llm:
     #   search, search_fallback        -> search
     #   fetch                          -> fetch
     # The readiness gate needs chat, auxiliary, embedding and rerank pinned
-    # before jobs and sessions can start.
+    # before jobs and sessions can start. You rarely need to declare them:
+    # when one of those four has enabled catalog rows but no pin, the Job
+    # (and the orchestrator at startup, and Admin → Models on every catalog
+    # write) pins the row dispatch would fall back to anyway — the first by
+    # display label, i.e. the only one when you seed one model per
+    # capability. Declare a kind here to choose among several.
     #
     # defaults:
     #   chat: "claude-opus-4-7"
@@ -3475,6 +4088,67 @@ vm:
   # same-cluster mode, by the VM controller.
   lifecycleAuthSecretName: ""
   lifecycleAuthSecretKey: VM_LIFECYCLE_HMAC_SECRET
+  # Default-off VM resource policy. Full admission requires one explicit whole-
+  # launcher document, durable creation retry, and receipt-bound operator
+  # activation after fresh inventory audit; these flags do not activate it.
+  # Explicit limits and cluster-wide read acknowledgement are required.
+  resourceAdmission:
+    observerEnabled: false
+    shadowEnabled: false
+    enforcementEnabled: false
+    clusterWidePodReadAcknowledged: false
+    stableClusterId: ""
+    inventory:
+      publishIntervalSeconds: null
+      staleAfterSeconds: null
+      maxItems: null
+      maxBytes: null
+      requestTimeoutSeconds: null
+      collectionTimeoutSeconds: null
+      publicationTimeoutSeconds: null
+      historyLimit: null
+      nodeLabelKeys: []
+      kubevirtNamespace: null
+      kubevirtName: null
+    hostCost:
+      cpuMillicoresPerVcpuNumerator: null
+      cpuMillicoresPerVcpuDenominator: null
+      launcherCpuOverheadMillicores: null
+      fixedMemoryOverheadBytes: null
+      perVcpuMemoryOverheadBytes: null
+      memoryOverheadBasisPoints: null
+      version: null
+      ephemeralStorageReserveBytes: null
+      kvmDevices: null
+      tunDevices: null
+      vhostNetDevices: null
+    nodeHeadroom:
+      cpuMillicores: null
+      memoryBytes: null
+      kvmDevices: null
+      ephemeralStorageBytes: null
+      tunDevices: null
+      vhostNetDevices: null
+    # Installed launcher expectation and hard budgets are operator inputs.
+    # All remain unset while resource admission is disabled.
+    launcherProfile: null
+    installationBudget:
+      cpuMillicores: null
+      memoryBytes: null
+      ephemeralStorageBytes: null
+      kvmDevices: null
+      tunDevices: null
+      vhostNetDevices: null
+    ownerBudget:
+      cpuMillicores: null
+      memoryBytes: null
+      ephemeralStorageBytes: null
+      kvmDevices: null
+      tunDevices: null
+      vhostNetDevices: null
+    fairness:
+      maxBypasses: null
+      priorityAgingSeconds: null
   preflight:
     # -- Fail install/upgrade from a hook Job when KubeVirt/CDI CRDs are absent.
     enabled: true
@@ -3492,6 +4166,11 @@ vm:
 #   - Nodes with hardware virtualization (vmx/svm) and KubeVirt feature gates
 #
 vmController:
+  # -- Opt in only for immutable clean single-NIC VM images whose network
+  # behavior has been verified by the operator. Existing disks are not upgraded.
+  networkProfile:
+    enabled: false
+    imageAllowlist: []
   # -- DEPRECATED one-release alias. true resolves vm.mode=off to same-cluster.
   enabled: false
   # -- DEPRECATED one-release alias. Same-cluster transport is always HTTP.

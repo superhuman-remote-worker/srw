@@ -187,6 +187,7 @@ def test_default_orchestrator_is_untouched(default_docs: list[dict]) -> None:
     container = _container(orchestrator, "orchestrator")
     assert "SSH_GATEWAY_PUBLIC_HOST_KEYS" not in _env(container)
     assert "SSH_GATEWAY_HOSTNAME" not in _env(container)
+    assert "AGENT_SSH_GATEWAY_HOST_KEY_SECRET" not in _env(container)
     volumes = orchestrator["spec"]["template"]["spec"].get("volumes", [])
     assert not [v for v in volumes if "ssh-gateway" in v["name"]]
 
@@ -208,12 +209,62 @@ def test_workspace_policy_does_not_admit_a_gateway_that_is_off(
 # ---------------------------------------------------------------------------
 
 
-def test_reuses_the_orchestrator_image(gateway: dict) -> None:
+def test_reuses_the_orchestrator_image(gateway: dict, orchestrator: dict) -> None:
     container = _container(gateway, "ssh-gateway")
+    relay = _container(orchestrator, "orchestrator")
     assert "orchestrator" in container["image"]
+    assert container["image"] == relay["image"]
+    assert container["imagePullPolicy"] == relay["imagePullPolicy"]
     assert container["command"][0] == "uvicorn"
     assert "orchestrator.ssh_gateway:create_app" in container["command"]
     assert "--factory" in container["command"]
+
+
+def test_gateway_can_stay_on_its_old_digest_during_relay_upgrade() -> None:
+    old_digest = "sha256:" + "a" * 64
+    new_digest = "sha256:" + "b" * 64
+    docs = _render(
+        *ENABLE,
+        "--set",
+        f"image.orchestrator.digest={new_digest}",
+        "--set",
+        "sshGateway.image.repository=ghcr.io/superhuman-remote-worker/srw-orchestrator",
+        "--set",
+        f"sshGateway.image.digest={old_digest}",
+        "--set",
+        "sshGateway.image.pullPolicy=IfNotPresent",
+    )
+    gateway = _container(_one(docs, "Deployment", "ssh-gateway"), "ssh-gateway")
+    relay = _container(_one(docs, "Deployment", "-orchestrator"), "orchestrator")
+    assert gateway["image"] == (
+        "ghcr.io/superhuman-remote-worker/srw-orchestrator@" + old_digest
+    )
+    assert relay["image"] == (
+        "ghcr.io/superhuman-remote-worker/srw-orchestrator@" + new_digest
+    )
+    assert gateway["imagePullPolicy"] == "IfNotPresent"
+
+
+@pytest.mark.parametrize(
+    ("flag", "override"),
+    [
+        ("--set", "sshGateway.image.tag=old"),
+        (
+            "--set",
+            "sshGateway.image.repository=ghcr.io/superhuman-remote-worker/srw-orchestrator",
+        ),
+        ("--set", "sshGateway.image=old"),
+        ("--set-json", "sshGateway.image={}"),
+        ("--set-json", "sshGateway.image=[]"),
+        ("--set", "sshGateway.image=false"),
+    ],
+)
+def test_incomplete_gateway_image_override_is_rejected(
+    flag: str, override: str
+) -> None:
+    result = _run(*ENABLE, flag, override)
+    assert result.returncode != 0
+    assert "sshGateway.image" in result.stderr
 
 
 def test_runs_non_root_with_readonly_rootfs(gateway: dict) -> None:
@@ -416,7 +467,13 @@ def test_host_key_env_is_appended_after_the_existing_orchestrator_env(
     end leaves every pre-existing index where it was.
     """
     names = [entry["name"] for entry in _container(orchestrator, "orchestrator")["env"]]
-    assert names[-2:] == ["SSH_GATEWAY_PUBLIC_HOST_KEYS", "SSH_GATEWAY_HOSTNAME"]
+    assert names[-5:] == [
+        "SSH_GATEWAY_PUBLIC_HOST_KEYS",
+        "SSH_GATEWAY_HOSTNAME",
+        "WORKSPACE_BUILTIN_TEMPLATES",
+        "WORKSPACE_DEFAULTS",
+        "AGENT_SSH_GATEWAY_HOST_KEY_SECRET",
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -845,10 +902,53 @@ def test_workspace_policy_admits_the_gateway(docs: list[dict]) -> None:
         ]
         assert admitted, f"{policy['metadata']['name']} does not admit the gateway"
         ports = {port["port"] for rule in admitted for port in rule["ports"]}
-        # 30022 only: VM-tier workspaces are refused upstream by
-        # ssh_gateway_targets (vm_unsupported), so port 22 would be an
-        # unused hole.
+        # This fixture uses VM mode off. VM mode is covered separately by
+        # the paired gateway-egress/workspace-ingress regression below.
         assert ports == {30022}
+
+
+@pytest.mark.parametrize(
+    ("setting", "expected_ports"),
+    [
+        ("vm.mode=off", {30022}),
+        ("vm.mode=same-cluster", {22, 30022}),
+        ("vmController.enabled=true", {22, 30022}),
+    ],
+)
+def test_gateway_workspace_ssh_policy_is_bidirectional(
+    setting: str,
+    expected_ports: set[int],
+) -> None:
+    """A real VM inner hop needs gateway egress as well as workspace ingress."""
+    documents = _render(
+        *ENABLE,
+        "--set",
+        setting,
+        "--set",
+        "vm.lifecycleAuthSecretName=vm-lifecycle-test",
+    )
+    gateway = _one(documents, "NetworkPolicy", "ssh-gateway")
+    workspace_rules = [
+        rule
+        for rule in gateway["spec"]["egress"]
+        if rule.get("to")
+        == [{"podSelector": {"matchLabels": {"srw.io/component": "agent-workspace"}}}]
+    ]
+    assert len(workspace_rules) == 1
+    assert {p["port"] for p in workspace_rules[0]["ports"]} == expected_ports
+    for policy in _find(documents, "NetworkPolicy", "workspace-policy"):
+        admitted = [
+            rule
+            for rule in policy["spec"]["ingress"]
+            if any(
+                source.get("podSelector", {})
+                .get("matchLabels", {})
+                .get("app.kubernetes.io/component")
+                == "ssh-gateway"
+                for source in rule.get("from", [])
+            )
+        ]
+        assert {p["port"] for rule in admitted for p in rule["ports"]} == expected_ports
 
 
 # ---------------------------------------------------------------------------

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from collections.abc import Mapping
 from typing import Any
 from urllib.parse import urldefrag, urljoin, urlsplit
@@ -22,9 +23,31 @@ from agent.tools.research.search.http import (
 )
 
 
-_CRAWL4AI_OPS = frozenset({"extract", "crawl"})
+_CRAWL4AI_OPS = frozenset({"extract", "crawl", "map"})
 _MAX_REQUEST_URLS = 100
 _MAX_CRAWL_PAGES = 100
+_MAX_MAP_URLS = 500
+# A map renders pages only to read their links, so it walks the frontier in
+# small batches and stops once it has enough URLs instead of rendering a whole
+# depth level it will not use.
+_MAP_FETCH_BATCH = 10
+_MAX_MAP_FETCHES = 50
+
+
+def _path_patterns(value: Any, name: str) -> list[re.Pattern[str]]:
+    """Compile model-supplied path regexes, rejecting a bad one as a bad request."""
+    if not value:
+        return []
+    patterns = [value] if isinstance(value, str) else list(value)
+    compiled: list[re.Pattern[str]] = []
+    for pattern in patterns:
+        try:
+            compiled.append(re.compile(str(pattern)))
+        except re.error as exc:
+            raise ProviderRequestError(
+                f"Invalid {name} pattern {pattern!r}: {exc}"
+            ) from exc
+    return compiled
 
 
 class Crawl4AIAdapter:
@@ -221,5 +244,62 @@ class Crawl4AIAdapter:
         raise ProviderRequestError("Crawl4AI does not support search")
 
     def map(self, url: str, **kw: Any) -> list[str]:
-        del url, kw
-        raise ProviderRequestError("Crawl4AI does not support map")
+        """Discover a site's URLs by following internal links breadth-first.
+
+        Crawl4AI 0.9.x exposes no URL-discovery endpoint (its URL seeder is
+        library-only), so this walks the same returned internal links as
+        ``crawl`` but keeps only the URLs. ``max_depth`` counts link hops from
+        ``url``: depth 1 renders only the start page. ``select_paths`` /
+        ``exclude_paths`` are regexes searched against the URL path and scope
+        both what is listed and what is followed. ``instructions`` has no
+        Crawl4AI equivalent and is ignored.
+        """
+        self._require("map")
+        select = _path_patterns(kw.get("select_paths"), "select_paths")
+        exclude = _path_patterns(kw.get("exclude_paths"), "exclude_paths")
+
+        def wanted(candidate: str) -> bool:
+            path = urlsplit(candidate).path or "/"
+            if select and not any(p.search(path) for p in select):
+                return False
+            return not any(p.search(path) for p in exclude)
+
+        try:
+            max_depth = min(max(int(kw.get("max_depth", 1)), 1), 5)
+            limit = min(max(int(kw.get("limit", 50)), 1), _MAX_MAP_URLS)
+
+            root = urldefrag(url)[0]
+            discovered = [root] if wanted(root) else []
+            seen = {root}
+            frontier = [root]
+            fetches = 0
+            with httpx.Client(timeout=120.0, follow_redirects=False) as client:
+                for _depth in range(max_depth):
+                    next_frontier: list[str] = []
+                    for offset in range(0, len(frontier), _MAP_FETCH_BATCH):
+                        if len(discovered) >= limit or fetches >= _MAX_MAP_FETCHES:
+                            break
+                        batch = frontier[offset : offset + _MAP_FETCH_BATCH]
+                        batch = batch[: _MAX_MAP_FETCHES - fetches]
+                        fetches += len(batch)
+                        for _page, links in self._fetch(client, batch):
+                            for candidate in links:
+                                if candidate in seen:
+                                    continue
+                                seen.add(candidate)
+                                if not wanted(candidate):
+                                    continue
+                                discovered.append(candidate)
+                                next_frontier.append(candidate)
+                    frontier = next_frontier
+                    if (
+                        not frontier
+                        or len(discovered) >= limit
+                        or fetches >= _MAX_MAP_FETCHES
+                    ):
+                        break
+            return discovered[:limit]
+        except ProviderError:
+            raise
+        except Exception as exc:
+            raise transport_error("Crawl4AI", exc) from exc

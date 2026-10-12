@@ -1,21 +1,150 @@
 """Tests for the container provisioner service."""
 
 import asyncio
+import json
 import os
+import re
 import subprocess
 import threading
 from contextlib import asynccontextmanager
+from http.client import RemoteDisconnected
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 from uuid import uuid4
 
 import pytest
+from kubernetes.client.exceptions import ApiException
+from urllib3.exceptions import ProtocolError
 
 from orchestrator.services.workspace_lifecycle import WorkspaceOwner
 
 
 _TEST_POD_UID = "11111111-1111-4111-8111-111111111111"
 _TEST_RESOURCE_UID = "22222222-2222-4222-8222-222222222222"
+
+
+@pytest.mark.asyncio
+async def test_staged_ready_rejects_ssh_peer_with_wrong_pod_host_key():
+    """An authenticated key on another route cannot publish this Pod Ready."""
+
+    from datetime import datetime, timedelta, timezone
+
+    from orchestrator.services import container_provisioner as provider_module
+    from orchestrator.services.container_provisioner import ContainerProvisioner
+
+    owner = WorkspaceOwner.job(str(uuid4()))
+    pod_uid = str(uuid4())
+    receipt_id = str(uuid4())
+    fingerprint = "SHA256:" + "A" * 43
+    now = datetime.now(timezone.utc)
+    scheduled_at = now - timedelta(seconds=5)
+    ready_at = now - timedelta(seconds=2)
+    pod = SimpleNamespace(
+        metadata=SimpleNamespace(
+            uid=pod_uid,
+            creation_timestamp=scheduled_at - timedelta(seconds=1),
+            deletion_timestamp=None,
+        ),
+        spec=SimpleNamespace(node_name="node-1"),
+        status=SimpleNamespace(
+            phase="Running",
+            pod_ip="10.42.0.50",
+            conditions=[
+                SimpleNamespace(
+                    type="PodScheduled",
+                    status="True",
+                    last_transition_time=scheduled_at,
+                ),
+                SimpleNamespace(
+                    type="Ready", status="True", last_transition_time=ready_at
+                ),
+            ],
+            container_statuses=[
+                SimpleNamespace(
+                    name="workspace", ready=True, state=SimpleNamespace(waiting=None)
+                )
+            ],
+        ),
+    )
+    receipt = {
+        "id": receipt_id,
+        "claim_token": 1,
+        "runtime_incarnation": pod_uid,
+        "phase": "runtime_bound",
+        "settled_at": None,
+        "cancel_requested_at": None,
+        "startup_protocol_version": 1,
+        "startup_state": "starting",
+        "scheduled_at": scheduled_at,
+        "ready_budget_seconds": 120,
+        "pull_budget_seconds": None,
+        "ssh_budget_seconds": 30,
+        "startup_first_ready_at": ready_at,
+    }
+
+    class ObservationDB:
+        async def observe_container_startup(self, *args, **kwargs):
+            return True
+
+    provisioner = ContainerProvisioner()
+    provisioner._db = ObservationDB()
+    provisioner._core_api = MagicMock()
+    provisioner._core_api.read_namespaced_pod.return_value = pod
+    provisioner.get_current_workspace_creation_result = AsyncMock(return_value=receipt)
+    provisioner._require_workspace_pod_connection_identity = MagicMock()
+    provisioner._require_workspace_creation_reservation_annotation = MagicMock()
+    provisioner._trusted_pod_ssh_identity = AsyncMock(
+        return_value=(f"k8s-pod:{pod_uid}", fingerprint, pod_uid)
+    )
+
+    async def wrong_peer_probe(*args, **kwargs):
+        return (
+            (False, 1, "wrong host key")
+            if kwargs.get("expected_host_key_fingerprint")
+            else (True, 1, "")
+        )
+
+    with (
+        patch.object(
+            provider_module, "resolve_ssh_key_path", return_value="/run/test-key"
+        ),
+        patch.object(
+            provider_module,
+            "workspace_private_key_fingerprint",
+            return_value=fingerprint,
+        ),
+        patch.object(
+            provider_module,
+            "wait_for_agent_ssh",
+            new=AsyncMock(side_effect=wrong_peer_probe),
+        ) as probe,
+    ):
+        result = await provisioner._observe_container_startup_stage(
+            owner.pod_name,
+            owner=owner,
+            reservation=receipt,
+            expected_runtime_incarnation=pod_uid,
+            expected_creation_generation=None,
+            expected_network_tier=None,
+            expected_pvc_name=None,
+            expected_seed_configmap=None,
+            timeout=120,
+            pull_image=None,
+            observation_check=None,
+            authority_check=None,
+        )
+
+    assert result is None
+    provisioner._trusted_pod_ssh_identity.assert_awaited_once_with(
+        owner.pod_name,
+        pvc_name=None,
+        expected_owner=owner,
+        expected_runtime_incarnation=pod_uid,
+        expected_creation_generation=None,
+        expected_network_tier=None,
+        expected_seed_configmap=None,
+    )
+    assert probe.await_args.kwargs["expected_host_key_fingerprint"] == fingerprint
 
 
 @pytest.mark.asyncio
@@ -126,6 +255,15 @@ class _PinnedWorkspaceIntentDB:
         if current is not None:
             return current == kwargs["resource_uid"]
         self.published[kwargs["resource"]] = kwargs["resource_uid"]
+        return True
+
+    async def record_pinned_workspace_provision_create_receipt(
+        self, thread_id, **kwargs
+    ):
+        assert thread_id == self.THREAD_ID
+        assert kwargs["runtime_generation"] == self.GENERATION
+        assert kwargs["attempt_id"] == self.intent["attempt_id"]
+        self.events.append(("receipt", kwargs))
         return True
 
     async def complete_pinned_thread_workspace_provision_intent(
@@ -646,6 +784,9 @@ class TestPinnedWorkspaceProvisionIntentFlow:
         names = [event[0] for event in events]
         assert names.index("reserve") < names.index("create-pvc")
         assert names.index("create-pvc") < names.index("create-configmap")
+        assert (
+            names.index("create-pvc") < names.index("receipt") < names.index("publish")
+        )
         assert names.index("create-configmap") < names.index("create-pod")
         assert names.index("create-pod") < names.index("create-service")
         assert names.index("create-service") < names.index("complete")
@@ -974,14 +1115,17 @@ class TestPinnedWorkspaceProvisionIntentFlow:
             "grace_period_seconds": 0,
             "_request_timeout": (5, 30),
         }
-        if replacement:
-            provisioner._core_api.read_namespaced_pod.assert_not_called()
-        else:
-            provisioner._core_api.read_namespaced_pod.assert_called_once_with(
-                name=intent["pod_name"],
-                namespace="captured-old-namespace",
-                _request_timeout=(5, 30),
-            )
+        # One read decides the delete's grace (a Pod running the cloud mount
+        # opener gets time to detach, connector drivers D7); the absent case
+        # reads once more to observe the deletion.
+        reads = provisioner._core_api.read_namespaced_pod.call_args_list
+        assert len(reads) == (1 if replacement else 2)
+        for read in reads:
+            assert read.kwargs == {
+                "name": intent["pod_name"],
+                "namespace": "captured-old-namespace",
+                "_request_timeout": (5, 30),
+            }
 
 
 class TestWorkspacePodLive:
@@ -1248,6 +1392,26 @@ class TestWorkspacePodAuthority:
         provisioner = self._provisioner()
         pod = self._pod(regular_terminated=False, deleting=True)
         pod.status.phase = "Pending"
+        pod.status.container_statuses = []
+        pod.spec.node_name = None
+        provisioner._core_api.read_namespaced_pod.return_value = pod
+
+        assert (
+            await provisioner.workspace_pod_authority(
+                WorkspaceOwner.session("t1"),
+                expected_runtime_incarnation=self.RUNTIME,
+            )
+            == "exact_terminal"
+        )
+
+    @pytest.mark.asyncio
+    async def test_podgc_failed_unscheduled_pod_is_still_process_zero(self):
+        # PodGC's unscheduled-terminating sweep flips a deleting Pod that never
+        # got a node to Failed before force-deleting it; the finalizer keeps
+        # the object, and a Pending-only rule would then retain it forever.
+        provisioner = self._provisioner()
+        pod = self._pod(regular_terminated=False, deleting=True)
+        pod.status.phase = "Failed"
         pod.status.container_statuses = []
         pod.spec.node_name = None
         provisioner._core_api.read_namespaced_pod.return_value = pod
@@ -2638,6 +2802,11 @@ class TestCreateWorkspace:
         mock_core_api.create_namespaced_pod = MagicMock(
             side_effect=lambda **kw: _pod_from_manifest(kw["body"])
         )
+        mock_core_api.read_namespaced_pod.side_effect = lambda **kw: (
+            _pod_from_manifest(
+                mock_core_api.create_namespaced_pod.call_args.kwargs["body"]
+            )
+        )
         provisioner._core_api = mock_core_api
 
         with patch.object(
@@ -2776,6 +2945,7 @@ class TestCreateWorkspace:
 class _StrictCreationDB(_CreationReservationDBDouble):
     def __init__(self, events=None):
         self._init_creation_reservation()
+        self.thread = {"user_id": None, "metadata": {}}
         self.events = events if events is not None else []
         self.valid = True
         self.claimed = True
@@ -2805,11 +2975,40 @@ class _StrictCreationDB(_CreationReservationDBDouble):
 
     async def publish_stateless_thread_workspace_runtime(self, thread_id, **kwargs):
         self.events.append(("publish", thread_id, kwargs))
+        if self.published:
+            self.thread["runtime_generation"] = kwargs["generation"]
+            self.thread["metadata"]["workspace_container"] = {
+                "status": "created",
+                "_runtime_incarnation": kwargs["runtime_incarnation"],
+                "_creation_reservation_id": kwargs["creation_reservation_id"],
+                "_creation_claim_token": str(kwargs["creation_claim_token"]),
+                "_runtime_creation": {"attempted": True},
+            }
         return self.published
 
     async def complete_stateless_thread_workspace_creation(self, thread_id, **kwargs):
         self.events.append(("complete", thread_id, kwargs))
+        if self.completed:
+            self._creation_reservation.update(
+                phase="settled",
+                result_kind="settled",
+                settled_at="now",
+                thread_runtime_generation=kwargs["generation"],
+            )
+            self.thread["execution_lane"] = "stateless"
+            self.thread["runtime_generation"] = kwargs["generation"]
+            self.thread["metadata"]["workspace_container"] = {
+                "status": "ready",
+                "_runtime_incarnation": kwargs["runtime_incarnation"],
+                "_creation_reservation_id": kwargs["creation_reservation_id"],
+                "_creation_claim_token": str(kwargs["creation_claim_token"]),
+            }
         return self.completed
+
+    async def get_current_managed_repository_workspace_creation_result(
+        self, _thread_id, **_kwargs
+    ):
+        return dict(self._creation_reservation)
 
     async def clear_stateless_thread_workspace_runtime_for_recreation(
         self, thread_id, **kwargs
@@ -2833,7 +3032,7 @@ class _StrictCreationDB(_CreationReservationDBDouble):
         return "internet-only"
 
     async def get_thread(self, *_args):
-        return {"user_id": None}
+        return self.thread
 
     async def record_stateless_thread_workspace_process_zero(self, thread_id, **kwargs):
         self.events.append(("record_process_zero", thread_id, kwargs))
@@ -3044,6 +3243,11 @@ class _PinnedSessionContainerDB(_CreationReservationDBDouble):
         self.published = {}
         self.ready = None
 
+    async def get_job(self, job_id):
+        # The same double also covers fresh Job creation. No retained recovery
+        # predecessor exists in those cases.
+        return {"id": job_id, "status": "paused", "context": {}}
+
     @asynccontextmanager
     async def thread_advisory_lock(self, _thread_id):
         yield True
@@ -3138,6 +3342,7 @@ class _PinnedSessionContainerDB(_CreationReservationDBDouble):
 
 class TestStrictStatelessWorkspaceCreation:
     THREAD_ID = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
+    IDE_JOB_ID = "bbbbbbbb-cccc-4ddd-8eee-ffffffffffff"
     GENERATION = "11111111-2222-4333-8444-555555555555"
     RUNTIME = "66666666-7777-4888-8999-aaaaaaaaaaaa"
 
@@ -3378,6 +3583,115 @@ class TestStrictStatelessWorkspaceCreation:
             )
         )
         return p
+
+    @classmethod
+    def _ide_attestation_objects(cls, provisioner):
+        """A Job IDE Pod and its seed, distinct from the Job workspace Pod."""
+        owner = WorkspaceOwner.job(cls.IDE_JOB_ID)
+        pod_name = f"ide-{owner.id[:12]}"
+        seed_name = f"code-server-config-{pod_name}"
+        pod = cls._pod(seed_name=seed_name)
+        pod.metadata.name = pod_name
+        pod.metadata.labels = {
+            "app": "srw-workspace",
+            owner.label_key: owner.id,
+            "srw/component": "ide-session",
+            "srw.io/component": "agent-workspace",
+            "srw.io/network-tier": "internet-only",
+        }
+        seed = cls._seed(provisioner)
+        seed.metadata.name = seed_name
+        seed.metadata.labels.pop(cls._owner().label_key)
+        seed.metadata.labels[owner.label_key] = owner.id
+        seed.metadata.owner_references[0].name = pod_name
+        return owner, pod_name, seed_name, pod, seed
+
+    @pytest.mark.asyncio
+    async def test_ide_host_key_attests_seed_named_for_ide_pod(self):
+        p = self._provisioner()
+        owner, pod_name, seed_name, pod, seed = self._ide_attestation_objects(p)
+        p._core_api.read_namespaced_pod.side_effect = [pod, pod]
+        p._core_api.read_namespaced_config_map.side_effect = [seed, seed]
+
+        with patch(
+            "orchestrator.services.container_provisioner.k8s_stream",
+            return_value="256 SHA256:trusted host (ED25519)",
+        ):
+            backing_id, fingerprint, runtime = await p._trusted_pod_ssh_identity(
+                pod_name,
+                expected_owner=owner,
+                expected_runtime_incarnation=self.RUNTIME,
+                expected_network_tier="internet-only",
+                expected_seed_configmap=seed_name,
+                expected_pod_name=pod_name,
+                expected_component="ide-session",
+            )
+
+        assert backing_id == f"k8s-pod:{p._namespace}:{self.RUNTIME}"
+        assert fingerprint == "SHA256:trusted"
+        assert runtime == self.RUNTIME
+        assert p._core_api.read_namespaced_config_map.call_count == 2
+
+    @pytest.mark.asyncio
+    async def test_ide_host_key_rejects_foreign_seed_owner(self):
+        from orchestrator.services.container_provisioner import (
+            WorkspaceRuntimeAuthorityError,
+        )
+
+        p = self._provisioner()
+        owner, pod_name, seed_name, pod, seed = self._ide_attestation_objects(p)
+        seed.metadata.labels[owner.label_key] = self.THREAD_ID
+        p._core_api.read_namespaced_pod.return_value = pod
+        p._core_api.read_namespaced_config_map.return_value = seed
+
+        with pytest.raises(
+            WorkspaceRuntimeAuthorityError,
+            match="workspace seed ConfigMap owner authority changed",
+        ):
+            await p._trusted_pod_ssh_identity(
+                pod_name,
+                expected_owner=owner,
+                expected_runtime_incarnation=self.RUNTIME,
+                expected_network_tier="internet-only",
+                expected_seed_configmap=seed_name,
+                expected_pod_name=pod_name,
+                expected_component="ide-session",
+            )
+
+    @pytest.mark.asyncio
+    async def test_ide_host_key_rejects_seed_uid_change_after_exec(self):
+        from orchestrator.services.container_provisioner import (
+            WorkspaceRuntimeAuthorityError,
+        )
+
+        p = self._provisioner()
+        owner, pod_name, seed_name, pod, seed = self._ide_attestation_objects(p)
+        confirmed_seed = self._seed(p)
+        confirmed_seed.metadata.name = seed_name
+        confirmed_seed.metadata.labels.pop(self._owner().label_key)
+        confirmed_seed.metadata.labels[owner.label_key] = owner.id
+        confirmed_seed.metadata.owner_references[0].name = pod_name
+        confirmed_seed.metadata.uid = "99999999-aaaa-4bbb-8ccc-eeeeeeeeeeee"
+        p._core_api.read_namespaced_pod.side_effect = [pod, pod]
+        p._core_api.read_namespaced_config_map.side_effect = [seed, confirmed_seed]
+
+        with patch(
+            "orchestrator.services.container_provisioner.k8s_stream",
+            return_value="256 SHA256:trusted host (ED25519)",
+        ):
+            with pytest.raises(
+                WorkspaceRuntimeAuthorityError,
+                match="workspace seed ConfigMap UID changed",
+            ):
+                await p._trusted_pod_ssh_identity(
+                    pod_name,
+                    expected_owner=owner,
+                    expected_runtime_incarnation=self.RUNTIME,
+                    expected_network_tier="internet-only",
+                    expected_seed_configmap=seed_name,
+                    expected_pod_name=pod_name,
+                    expected_component="ide-session",
+                )
 
     @classmethod
     async def _active_reservation(cls, db):
@@ -3690,6 +4004,59 @@ class TestStrictStatelessWorkspaceCreation:
             self.THREAD_ID,
             {"runtime_incarnation": self.RUNTIME},
         )
+
+    @pytest.mark.asyncio
+    async def test_process_zero_finalizer_releases_a_pod_ended_while_it_started(
+        self,
+    ):
+        """An End seconds after the create meets a sidecar Pod still starting:
+        the kubelet stops it with the supervisor and the workspace never
+        created, and the release must not wait for them forever."""
+        p = self._provisioner()
+        pod = self._pod()
+        pod.metadata.deletion_timestamp = "now"
+        pod.metadata.finalizers = ["lifecycle.srw.dev/stateless-process-zero"]
+        pod.spec.node_name = "k3d-srw-server-0"
+        pod.spec.init_containers = [
+            SimpleNamespace(name="srw-fuse-opener"),
+            SimpleNamespace(name="srw-cloud-mount"),
+        ]
+        never = dict(
+            state=SimpleNamespace(
+                waiting=SimpleNamespace(reason="PodInitializing"),
+                running=None,
+                terminated=None,
+            ),
+            last_state=SimpleNamespace(waiting=None, running=None, terminated=None),
+            container_id=None,
+            started=False,
+            ready=False,
+            restart_count=0,
+        )
+        pod.status.phase = "Failed"
+        pod.status.conditions = [
+            SimpleNamespace(type="Initialized", status="False", reason=None)
+        ]
+        pod.status.container_statuses = [SimpleNamespace(name="workspace", **never)]
+        pod.status.init_container_statuses = [
+            SimpleNamespace(
+                name="srw-fuse-opener",
+                state=SimpleNamespace(
+                    terminated=SimpleNamespace(exit_code=0, reason="Completed"),
+                    running=None,
+                    waiting=None,
+                ),
+                container_id="containerd://opener",
+            ),
+            SimpleNamespace(name="srw-cloud-mount", **never),
+        ]
+        p._core_api.read_namespaced_pod.return_value = pod
+
+        assert await p.release_stateless_workspace_process_zero_finalizer(
+            self._owner(),
+            expected_runtime_incarnation=self.RUNTIME,
+        )
+        p._core_api.patch_namespaced_pod.assert_called_once()
 
     @pytest.mark.asyncio
     async def test_process_zero_finalizer_refuses_without_durable_receipt(self):
@@ -5033,6 +5400,7 @@ class TestCreateWorkspacePvc:
             return _pod_from_manifest(kw["body"])
 
         core.create_namespaced_pod = create_pod
+        core.read_namespaced_pod.side_effect = lambda **kw: _pod_from_manifest(pod_body)
         if pvc_body is not None:
 
             def create_claim(**kw):
@@ -5076,6 +5444,343 @@ class TestCreateWorkspacePvc:
             == "pvc-workspace-abcdef123456"
         )
         assert "emptyDir" not in vols["workspace-data"]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("drift", "transport"),
+        [
+            ("exact", "timeout"),
+            ("exact", "protocol"),
+            ("retained_class", "protocol"),
+            ("retained_uid_drift", "protocol"),
+            ("retained_uid_after_bind", "protocol"),
+            ("reservation", "timeout"),
+            ("digest", "timeout"),
+            ("effect_token", "timeout"),
+            ("malformed_effect", "timeout"),
+            ("pvc", "timeout"),
+            ("pvc_uid", "timeout"),
+            ("seed", "timeout"),
+            ("seed_uid", "timeout"),
+            ("image", "timeout"),
+            ("network", "timeout"),
+            ("owner", "timeout"),
+            ("generation", "timeout"),
+            ("stale_claim", "timeout"),
+            ("cancelled", "timeout"),
+            ("cancel_after_read", "timeout"),
+        ],
+    )
+    async def test_job_accepted_pod_create_lost_response_requires_exact_adoption(
+        self, drift, transport
+    ):
+        """An ordinary Job has no Session generation to rescue a lost 201.
+
+        The apiserver accepts one PVC-backed Pod and loses only its response.
+        The current reservation/effect, manifest digest, Pod UID and captured
+        PVC UID must authorize exact read/adoption, or refuse success;
+        another owner's/same-name Pod cannot count as successful creation.
+        """
+
+        class _CapturedJobDB(_PinnedSessionContainerDB):
+            current = True
+
+            def _creation_claim_matches(self, kwargs):
+                return bool(
+                    self.current
+                    and self._creation_reservation.get("cancel_requested_at") is None
+                    and super()._creation_claim_matches(kwargs)
+                )
+
+            async def begin_managed_repository_workspace_creation_effect(
+                self, owner_id, **kwargs
+            ):
+                row = await super().begin_managed_repository_workspace_creation_effect(
+                    owner_id, **kwargs
+                )
+                if row is not None:
+                    effect = self._creation_reservation["external_effects"][
+                        kwargs["resource_kind"]
+                    ]
+                    effect["claim_token"] = kwargs["claim_token"]
+                    effect["ambiguity_until"] = "future"
+                    # asyncpg's default jsonb decoder returns text in the
+                    # live reservation row, not a Python mapping.
+                    encoded_effects = json.dumps(
+                        self._creation_reservation["external_effects"]
+                    )
+                    if kwargs["resource_kind"] == "pod":
+                        if drift == "malformed_effect":
+                            encoded_effects = "{"
+                        elif drift == "effect_token":
+                            decoded = json.loads(encoded_effects)
+                            decoded["pod"]["claim_token"] += 1
+                            encoded_effects = json.dumps(decoded)
+                        elif drift == "digest":
+                            row["desired_manifest_digest"] = "f" * 64
+                    row["external_effects"] = encoded_effects
+                return row
+
+            async def record_managed_repository_workspace_creation_resource(
+                self, owner_id, **kwargs
+            ):
+                if not self._creation_claim_matches(kwargs):
+                    return False
+                if kwargs["resource_kind"] in {"pvc", "seed"}:
+                    key = (
+                        "pvc_uid"
+                        if kwargs["resource_kind"] == "pvc"
+                        else "seed_configmap_uid"
+                    )
+                    self._creation_reservation[key] = kwargs["resource_uid"]
+                return True
+
+        owner = WorkspaceOwner.job("abcdef12-3456-4abc-8abc-123456789abc")
+        p = self._provisioner(pvc_enabled=True)
+        p._db = _CapturedJobDB()
+        pod_body, pvc_body = {}, {}
+        core = self._capture_core(pod_body, pvc_body)
+        if drift in {"retained_class", "retained_uid_drift", "retained_uid_after_bind"}:
+            from orchestrator.services.container_provisioner import _pvc_name_for
+
+            retained_pvc_name = _pvc_name_for(owner)
+            p._db.get_job = AsyncMock(
+                return_value={
+                    "id": owner.id,
+                    "status": "paused",
+                    "context": {"workspace_container": {"recovery_cleanup": {}}},
+                }
+            )
+            p._db.get_workspace_recovery_storage = AsyncMock(
+                return_value={
+                    "pvc_uid": _TEST_RESOURCE_UID,
+                    "resource_location": {"namespace": p._namespace},
+                }
+            )
+            pvc_body.update(
+                {
+                    "metadata": {
+                        "name": retained_pvc_name,
+                        "namespace": p._namespace,
+                        "labels": {
+                            "app": "srw-workspace",
+                            "srw/component": "workspace-pvc",
+                            "srw.io/component": "agent-workspace",
+                            owner.label_key: owner.id,
+                        },
+                    },
+                    "spec": {
+                        "accessModes": ["ReadWriteOnce"],
+                        "storageClassName": "retained-historical-class",
+                    },
+                }
+            )
+            core.create_namespaced_persistent_volume_claim = MagicMock()
+        seed_name = f"code-server-config-{owner.pod_name}"
+        seed_uid = "33333333-4444-4555-8666-777777777777"
+        p._resolve_ide_seed_files = AsyncMock(return_value={"settings.json": "{}"})
+        p._create_seed_configmap = AsyncMock(return_value=seed_name)
+        seed_configmap = _configmap_from_manifest(
+            {
+                "metadata": {
+                    "name": seed_name,
+                    "namespace": p._namespace,
+                    "labels": {
+                        "app": "srw-workspace",
+                        "srw/component": "workspace-seed",
+                        "srw.io/component": "agent-workspace",
+                        owner.label_key: owner.id,
+                    },
+                    "annotations": {
+                        "srw.io/workspace-creation-reservation": "33333333-3333-4333-8333-333333333333"
+                    },
+                },
+                "data": {},
+            },
+            uid=seed_uid,
+        )
+        core.read_namespaced_config_map = MagicMock(return_value=seed_configmap)
+
+        async def adopt_seed(*_args, **_kwargs):
+            seed_configmap.metadata.owner_references = [
+                {
+                    "apiVersion": "v1",
+                    "kind": "Pod",
+                    "name": owner.pod_name,
+                    "uid": _TEST_POD_UID,
+                    "controller": True,
+                }
+            ]
+            return True
+
+        p._adopt_configmap = AsyncMock(side_effect=adopt_seed)
+        accepted = {}
+
+        def accepted_then_timeout(**kwargs):
+            pod_body.update(kwargs["body"])
+            accepted["pod"] = _pod_from_manifest(kwargs["body"])
+            if drift == "reservation":
+                accepted["pod"].metadata.annotations[
+                    "srw.io/workspace-creation-reservation"
+                ] = "99999999-9999-4999-8999-999999999999"
+            elif drift == "pvc":
+                next(
+                    volume
+                    for volume in accepted["pod"].spec.volumes
+                    if volume["name"] == "workspace-data"
+                )["persistentVolumeClaim"]["claimName"] = "pvc-workspace-other"
+            elif drift == "seed":
+                next(
+                    volume
+                    for volume in accepted["pod"].spec.volumes
+                    if volume["name"] == "code-server-config"
+                )["configMap"]["name"] = "code-server-config-other"
+            elif drift in {"pvc_uid", "retained_uid_drift"}:
+                core.read_namespaced_persistent_volume_claim = MagicMock(
+                    return_value=_pvc_from_manifest(
+                        pvc_body, uid="99999999-9999-4999-8999-999999999999"
+                    )
+                )
+            elif drift == "seed_uid":
+                seed_configmap.metadata.uid = "99999999-9999-4999-8999-999999999999"
+            elif drift == "image":
+                next(
+                    container
+                    for container in accepted["pod"].spec.containers
+                    if container["name"] == "workspace"
+                )["image"] = "untrusted:image"
+            elif drift == "network":
+                accepted["pod"].metadata.labels["srw.io/network-tier"] = "private"
+            elif drift == "owner":
+                accepted["pod"].metadata.labels[owner.label_key] = (
+                    "99999999-9999-4999-8999-999999999999"
+                )
+            elif drift == "generation":
+                accepted["pod"].metadata.annotations[
+                    "srw.io/runtime-creation-generation"
+                ] = "99999999-9999-4999-8999-999999999999"
+            elif drift == "stale_claim":
+                p._db.current = False
+            elif drift == "cancelled":
+                p._db._creation_reservation["cancel_requested_at"] = "now"
+            if transport == "protocol":
+                raise ProtocolError(
+                    "Connection aborted.",
+                    RemoteDisconnected("Remote end closed connection without response"),
+                )
+            raise TimeoutError("apiserver accepted Pod but response was lost")
+
+        core.create_namespaced_pod = MagicMock(side_effect=accepted_then_timeout)
+
+        def read_accepted_pod(**_kwargs):
+            if drift == "cancel_after_read":
+                p._db._creation_reservation["cancel_requested_at"] = "now"
+            return accepted["pod"]
+
+        core.read_namespaced_pod = MagicMock(side_effect=read_accepted_pod)
+        p._core_api = core
+        if drift in {"retained_class", "retained_uid_drift", "retained_uid_after_bind"}:
+            assert await p.validate_workspace_recovery_storage(owner.id)
+        with patch.object(p, "_wait_for_ready", new_callable=AsyncMock) as wait:
+            if drift == "retained_uid_after_bind":
+
+                async def replace_retained_uid_after_bind(*_args, **_kwargs):
+                    core.read_namespaced_persistent_volume_claim = MagicMock(
+                        return_value=_pvc_from_manifest(
+                            pvc_body, uid="99999999-9999-4999-8999-999999999999"
+                        )
+                    )
+                    return "10.42.0.100"
+
+                wait.side_effect = replace_retained_uid_after_bind
+            else:
+                wait.return_value = "10.42.0.100"
+            result = await p.create_workspace(owner, fail_on_exited_container=True)
+
+        reservation = p._db._creation_reservation
+        assert reservation["owner_kind"] == "job"
+        assert reservation["operation_kind"] == "create"
+        assert reservation["scope"] == "workspace_container"
+        assert reservation["claim_token"] == 1
+        assert re.fullmatch(r"[0-9a-f]{64}", reservation["desired_manifest_digest"])
+        assert reservation["external_effects"]["pod"]["issued_at"] is not None
+        assert reservation["external_effects"]["pod"]["claim_token"] == 1
+        assert reservation["external_effects"]["pod"]["observed_uid"] is None or (
+            reservation["external_effects"]["pod"]["observed_uid"] == _TEST_POD_UID
+        )
+        assert reservation["pvc_uid"] == _TEST_RESOURCE_UID
+        assert reservation["seed_configmap_uid"] == seed_uid
+        assert pod_body["metadata"]["name"] == owner.pod_name
+        assert (
+            "srw.io/runtime-creation-generation"
+            not in pod_body["metadata"]["annotations"]
+        )
+        assert (
+            pod_body["metadata"]["annotations"][  # exact durable token
+                "srw.io/workspace-creation-reservation"
+            ]
+            == reservation["id"]
+        )
+        assert core.create_namespaced_pod.call_count == 1
+        assert result is (drift in {"exact", "retained_class"})
+        if drift == "retained_uid_after_bind":
+            wait.assert_awaited_once()
+            assert reservation["pod_uid"] == _TEST_POD_UID
+            assert not any(
+                call.args[1].get("status") == "ready"
+                for call in p._db.merge_workspace_container_context.await_args_list
+            )
+        elif drift not in {"exact", "retained_class"}:
+            wait.assert_not_awaited()
+            if drift in {
+                "stale_claim",
+                "cancelled",
+                "digest",
+                "effect_token",
+                "malformed_effect",
+            }:
+                core.read_namespaced_pod.assert_not_called()
+            p._db.merge_workspace_container_context.assert_not_awaited()
+        else:
+            assert reservation["runtime_incarnation"] == _TEST_POD_UID
+            assert reservation["pod_uid"] == _TEST_POD_UID
+            core.read_namespaced_pod.assert_called()
+        if drift in {"retained_class", "retained_uid_drift", "retained_uid_after_bind"}:
+            core.create_namespaced_persistent_volume_claim.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_job_definite_pod_create_rejection_never_adopts_by_name(self):
+        owner = WorkspaceOwner.job("abcdef12-3456-4abc-8abc-123456789abc")
+        p = self._provisioner(pvc_enabled=False)
+        p._core_api = MagicMock()
+        p._core_api.create_namespaced_pod.side_effect = ApiException(status=403)
+
+        assert await p.create_workspace(owner) is False
+        p._core_api.create_namespaced_pod.assert_called_once()
+        p._core_api.read_namespaced_pod.assert_not_called()
+        assert p._db._creation_reservation.get("pod_uid") is None
+
+    @pytest.mark.asyncio
+    async def test_job_unissued_pod_effect_never_reads_or_creates_by_name(self):
+        class _NoPodEffectDB(_PinnedSessionContainerDB):
+            async def begin_managed_repository_workspace_creation_effect(
+                self, owner_id, **kwargs
+            ):
+                if kwargs["resource_kind"] == "pod":
+                    return None
+                return await super().begin_managed_repository_workspace_creation_effect(
+                    owner_id, **kwargs
+                )
+
+        owner = WorkspaceOwner.job("abcdef12-3456-4abc-8abc-123456789abc")
+        p = self._provisioner(pvc_enabled=False)
+        p._db = _NoPodEffectDB()
+        p._core_api = MagicMock()
+
+        assert await p.create_workspace(owner) is False
+        p._core_api.create_namespaced_pod.assert_not_called()
+        p._core_api.read_namespaced_pod.assert_not_called()
+        assert "pod" not in p._db._creation_reservation["external_effects"]
 
     @pytest.mark.asyncio
     async def test_disabled_uses_emptydir_and_creates_no_pvc(self):
@@ -5453,6 +6158,9 @@ class TestWorkspaceService:
             _pvc_from_manifest(pvc_body)
         )
         core.read_namespaced_service = lambda **_kw: _service_from_manifest(svc_body)
+        core.read_namespaced_pod.side_effect = lambda **kw: (
+            _pod_from_manifest(core.create_namespaced_pod.call_args.kwargs["body"])
+        )
         p._core_api = core
 
         with patch.object(p, "_wait_for_ready", new_callable=AsyncMock) as w:
@@ -7168,6 +7876,76 @@ class TestWorkspaceNamedResourceAuthority:
         assert body["metadata"]["labels"][self.OWNER.label_key] == self.OWNER.id
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("reference_case", ("exact", "foreign", "pod_replaced"))
+    async def test_seed_conflict_keeps_only_exact_pod_owner_reference(
+        self, reference_case
+    ):
+        from orchestrator.services.container_provisioner import (
+            WorkspaceRuntimeAuthorityError,
+        )
+
+        class _Conflict(Exception):
+            status = 409
+
+        p = self._provisioner()
+        referenced_uid = str(uuid4()) if reference_case == "foreign" else self.POD_UID
+        seed = self._seed(
+            p,
+            owner_references=[
+                SimpleNamespace(
+                    api_version="v1",
+                    kind="Pod",
+                    name=self.OWNER.pod_name,
+                    uid=referenced_uid,
+                    controller=True,
+                    block_owner_deletion=False,
+                )
+            ],
+        )
+        p._core_api.create_namespaced_config_map.side_effect = _Conflict()
+        p._core_api.read_namespaced_config_map.side_effect = lambda **_kwargs: seed
+        incumbent = TestStrictStatelessWorkspaceCreation._pod()
+        replacement = TestStrictStatelessWorkspaceCreation._pod(runtime=str(uuid4()))
+        if reference_case == "pod_replaced":
+            p._core_api.read_namespaced_pod.side_effect = [incumbent, replacement]
+        else:
+            p._core_api.read_namespaced_pod.return_value = incumbent
+
+        def replace_seed(*, body, **_kwargs):
+            seed.metadata.owner_references = [
+                SimpleNamespace(
+                    api_version=ref["apiVersion"],
+                    kind=ref["kind"],
+                    name=ref["name"],
+                    uid=ref["uid"],
+                    controller=ref["controller"],
+                    block_owner_deletion=ref["blockOwnerDeletion"],
+                )
+                for ref in body["metadata"].get("ownerReferences", [])
+            ]
+            return seed
+
+        p._core_api.replace_namespaced_config_map.side_effect = replace_seed
+        request = p._create_seed_configmap(
+            self.OWNER.pod_name,
+            {"settings.json": {"content": "{}"}},
+            expected_owner=self.OWNER,
+            expected_creation_generation=self.GENERATION,
+        )
+        if reference_case != "exact":
+            with pytest.raises(WorkspaceRuntimeAuthorityError):
+                await request
+            if reference_case == "foreign":
+                p._core_api.replace_namespaced_config_map.assert_not_called()
+                assert seed.metadata.owner_references[0].uid == referenced_uid
+            else:
+                p._core_api.replace_namespaced_config_map.assert_called_once()
+        else:
+            assert await request == p._seed_configmap_name(self.OWNER.pod_name)
+            assert len(seed.metadata.owner_references) == 1
+            assert seed.metadata.owner_references[0].uid == self.POD_UID
+
+    @pytest.mark.asyncio
     async def test_seed_adoption_and_delete_are_uid_preconditioned(self):
         p = self._provisioner()
         pod = TestStrictStatelessWorkspaceCreation._pod(
@@ -7487,13 +8265,52 @@ class TestIdePodResourceAuthority:
                 deletion_timestamp=None,
                 owner_references=[
                     SimpleNamespace(
+                        api_version="v1",
+                        kind="Pod",
                         name=f"ide-{cls.JOB_ID[:12]}",
                         uid=cls.RUNTIME,
                         controller=True,
+                        block_owner_deletion=False,
                     )
                 ],
             )
         )
+
+    @pytest.mark.asyncio
+    async def test_exact_admitted_ide_receipt_skips_second_reservation(self):
+        p = self._provisioner()
+        plan = await p._ide_creation_plan(
+            self.JOB_ID,
+            cpu="250m",
+            memory="512Mi",
+            cpu_limit="1000m",
+            memory_limit="2Gi",
+        )
+        receipt = {
+            "id": "33333333-3333-4333-8333-333333333333",
+            "owner_kind": "job",
+            "owner_id": self.JOB_ID,
+            "scope": "ide",
+            "operation_kind": "restore",
+            "reservation_generation": 1,
+            "claimed_by": "ide-issuer:one",
+            "claim_token": 1,
+            "desired_manifest_digest": plan["digest"],
+            "external_mutation_started_at": "2026-09-28T00:00:00Z",
+        }
+        p._create_ide_pod_reserved = AsyncMock(return_value=None)
+        with patch.object(
+            type(p._db),
+            "reserve_managed_repository_workspace_creation",
+            new=AsyncMock(side_effect=AssertionError("unexpected second reservation")),
+        ):
+            assert (
+                await p.create_ide_pod(self.JOB_ID, creation_reservation=receipt)
+                is None
+            )
+        passed = p._create_ide_pod_reserved.await_args.kwargs
+        assert passed["_creation_reservation"] is receipt
+        assert passed["_creation_plan"]["digest"] == plan["digest"]
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
@@ -7537,6 +8354,54 @@ class TestIdePodResourceAuthority:
         p._seed_workspace_state.assert_not_awaited()
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("foreign_reference", (False, True))
+    async def test_live_409_repairs_only_exact_unowned_seed(self, foreign_reference):
+        class _Conflict(Exception):
+            status = 409
+
+        p = self._provisioner()
+        pod_name = f"ide-{self.JOB_ID[:12]}"
+        seed_name = p._seed_configmap_name(pod_name)
+        p._create_seed_configmap.return_value = seed_name
+        p._adopt_configmap = type(p)._adopt_configmap.__get__(p)
+        p._core_api.create_namespaced_pod.side_effect = _Conflict()
+        p._core_api.read_namespaced_pod.return_value = self._pod(p, seed_name=seed_name)
+        seed = self._seed(p)
+        seed.metadata.owner_references = []
+        if foreign_reference:
+            seed.metadata.owner_references = [
+                SimpleNamespace(
+                    name=pod_name,
+                    uid=str(uuid4()),
+                    controller=True,
+                )
+            ]
+        p._core_api.read_namespaced_config_map.side_effect = lambda **_kwargs: seed
+
+        def adopt_seed(*, body, **_kwargs):
+            seed.metadata.owner_references = [
+                SimpleNamespace(
+                    name=ref["name"],
+                    uid=ref["uid"],
+                    controller=ref["controller"],
+                )
+                for ref in body["metadata"]["ownerReferences"]
+            ]
+            return seed
+
+        p._core_api.patch_namespaced_config_map.side_effect = adopt_seed
+
+        result = await p.create_ide_pod(self.JOB_ID)
+        if foreign_reference:
+            assert result is None
+            p._core_api.patch_namespaced_config_map.assert_not_called()
+            assert seed.metadata.owner_references[0].uid != self.RUNTIME
+        else:
+            assert result == "10.42.0.30"
+            assert len(seed.metadata.owner_references) == 1
+            assert seed.metadata.owner_references[0].uid == self.RUNTIME
+
+    @pytest.mark.asyncio
     async def test_live_409_malformed_storage_refuses_without_seed_cleanup(self):
         class _Conflict(Exception):
             status = 409
@@ -7556,6 +8421,48 @@ class TestIdePodResourceAuthority:
         assert await p.create_ide_pod(self.JOB_ID) is None
         p._delete_seed_configmap.assert_not_awaited()
         p._wait_for_ready.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_replacement_409_publishes_b_without_predecessor_attempt_marker(self):
+        class _Conflict(Exception):
+            status = 409
+
+        p = self._provisioner()
+        p._core_api.create_namespaced_pod.side_effect = _Conflict()
+        p._core_api.read_namespaced_pod.return_value = self._pod(p)
+
+        result = await p.create_ide_pod(
+            self.JOB_ID,
+            operation_id="33333333-3333-4333-8333-333333333333",
+            replacement_restore_context={
+                "status": "restoring",
+                "source": "gitea",
+                "snapshot_type": "gitea",
+                "started_at": "2026-09-28T05:00:00+00:00",
+                "last_activity": None,
+                "code_server_url": None,
+                "idle_timeout_minutes": 30,
+                "max_lifetime_minutes": 240,
+            },
+        )
+
+        assert result == "10.42.0.30"
+        assert p._core_api.create_namespaced_pod.call_count == 1
+        assert p._db.merge_ide_session_context.await_count == 2
+        for call in p._db.merge_ide_session_context.await_args_list:
+            updates = call.args[1]
+            assert updates["_restore_attempt_id"] is None
+            assert updates["status"] == "restoring"
+            assert updates["source"] == "gitea"
+            assert updates["snapshot_type"] == "gitea"
+            assert updates["started_at"] == "2026-09-28T05:00:00+00:00"
+            assert updates["last_activity"] is None
+            assert updates["code_server_url"] is None
+            assert updates["max_lifetime_minutes"] == 240
+            assert updates["_runtime_incarnation"] == self.RUNTIME
+            assert updates["_creation_reservation_id"] == (
+                "33333333-3333-4333-8333-333333333333"
+            )
 
     def test_ide_manifest_installs_universal_process_zero_finalizer(self):
         p = self._provisioner()
@@ -7682,3 +8589,203 @@ class TestIdePodResourceAuthority:
         assert outcome.state == "refused"
         p._core_api.delete_namespaced_pod.assert_not_called()
         p._delete_seed_configmap.assert_not_awaited()
+
+
+_DROP = object()
+
+
+class TestDeletedPodStoppedMidStart:
+    """``_deleted_pod_stopped_before_its_containers_started`` on the status
+    shape the k3d main-cloud gate left: a stateless session ended four
+    seconds after its sidecar Pod was created (real client models)."""
+
+    @staticmethod
+    def _raw(**over):
+        never = {
+            "state": {"waiting": {"reason": "PodInitializing"}},
+            "lastState": {},
+            "ready": False,
+            "restartCount": 0,
+            "started": False,
+            "image": "x",
+            "imageID": "",
+        }
+        raw = {
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {
+                "name": "ws-thread-02346676-bb5",
+                "uid": "236673c7-cffd-47c6-b015-0c23f5f275ec",
+                "deletionTimestamp": "2026-10-10T15:32:17Z",
+                "deletionGracePeriodSeconds": 0,
+                "finalizers": ["lifecycle.srw.dev/stateless-process-zero"],
+            },
+            "spec": {
+                "nodeName": "k3d-srw-server-0",
+                "containers": [{"name": "workspace", "image": "x"}],
+                "initContainers": [
+                    {
+                        "name": "srw-fuse-opener",
+                        "image": "x",
+                        "restartPolicy": "Always",
+                    },
+                    {
+                        "name": "srw-cloud-mount",
+                        "image": "x",
+                        "restartPolicy": "Always",
+                    },
+                ],
+            },
+            "status": {
+                "phase": "Failed",
+                "conditions": [
+                    {"type": "PodReadyToStartContainers", "status": "False"},
+                    {
+                        "type": "Initialized",
+                        "status": "False",
+                        "reason": "ContainersNotInitialized",
+                    },
+                    {"type": "Ready", "status": "False"},
+                    {"type": "PodScheduled", "status": "True"},
+                ],
+                "initContainerStatuses": [
+                    {
+                        "name": "srw-fuse-opener",
+                        "containerID": "containerd://69903a76",
+                        "state": {
+                            "terminated": {
+                                "exitCode": 0,
+                                "reason": "Completed",
+                                "startedAt": "2026-10-10T15:32:18Z",
+                                "finishedAt": "2026-10-10T15:32:18Z",
+                            }
+                        },
+                        "lastState": {},
+                        "ready": False,
+                        "restartCount": 0,
+                        "started": False,
+                        "image": "x",
+                        "imageID": "",
+                    },
+                    {"name": "srw-cloud-mount", **never},
+                ],
+                "containerStatuses": [{"name": "workspace", **never}],
+            },
+        }
+        for path, value in over.items():
+            node = raw
+            *parents, leaf = path.split(".")
+            for key in parents:
+                node = node[int(key)] if isinstance(node, list) else node[key]
+            if value is _DROP:
+                if isinstance(node, list):
+                    node.pop(int(leaf))
+                else:
+                    node.pop(leaf)
+            elif isinstance(node, list):
+                node[int(leaf)] = value
+            else:
+                node[leaf] = value
+        return raw
+
+    @staticmethod
+    def _pod(raw):
+        from kubernetes.client import ApiClient
+
+        return ApiClient()._ApiClient__deserialize(raw, "V1Pod")
+
+    def test_the_gate_s_stuck_pod_is_process_zero(self):
+        from orchestrator.services import container_provisioner as cp
+
+        pod = self._pod(self._raw())
+        assert not cp._all_pod_container_statuses_terminated(pod)
+        assert cp._deleted_pod_stopped_before_its_containers_started(pod)
+        assert cp._pod_has_exact_process_zero(pod)
+
+    @pytest.mark.parametrize(
+        ("why", "over"),
+        [
+            ("not deleted", {"metadata.deletionTimestamp": None}),
+            ("not terminal", {"status.phase": "Running"}),
+            (
+                "PodGC marked it, not its kubelet",
+                {
+                    "status.conditions.3": {
+                        "type": "DisruptionTarget",
+                        "status": "True",
+                        "reason": "DeletionByPodGC",
+                    }
+                },
+            ),
+            (
+                "initialized: the workspace may have run",
+                {"status.conditions.1": {"type": "Initialized", "status": "True"}},
+            ),
+            (
+                "a created supervisor, not terminated",
+                {"status.initContainerStatuses.1.containerID": "containerd://x"},
+            ),
+            (
+                "a supervisor that restarted",
+                {"status.initContainerStatuses.1.restartCount": 1},
+            ),
+            (
+                "a supervisor with a last state",
+                {
+                    "status.initContainerStatuses.1.lastState": {
+                        "terminated": {"exitCode": 1}
+                    }
+                },
+            ),
+            (
+                "a running supervisor",
+                {
+                    "status.initContainerStatuses.1.state": {
+                        "running": {"startedAt": "2026-10-10T15:32:18Z"}
+                    }
+                },
+            ),
+            ("a started workspace", {"status.containerStatuses.0.started": True}),
+            (
+                "a workspace with an ID",
+                {"status.containerStatuses.0.containerID": "containerd://w"},
+            ),
+            ("a status missing", {"status.initContainerStatuses.1": _DROP}),
+            ("not scheduled (the other proof's case)", {"spec.nodeName": None}),
+        ],
+    )
+    def test_anything_less_than_proof_is_refused(self, why, over):
+        from orchestrator.services import container_provisioner as cp
+
+        pod = self._pod(self._raw(**over))
+        assert not cp._deleted_pod_stopped_before_its_containers_started(pod), why
+
+    def test_a_pod_without_init_containers_keeps_the_strict_workspace_proof(self):
+        """No init container: nothing proves the workspace never ran but its
+        own status, which is not enough for the tenant's container."""
+        from orchestrator.services import container_provisioner as cp
+
+        raw = self._raw()
+        raw["spec"]["initContainers"] = []
+        raw["status"]["initContainerStatuses"] = []
+        pod = self._pod(raw)
+        assert not cp._deleted_pod_stopped_before_its_containers_started(pod)
+
+    def test_a_waiting_debug_container_is_refused(self):
+        from orchestrator.services import container_provisioner as cp
+
+        raw = self._raw()
+        raw["spec"]["ephemeralContainers"] = [{"name": "debugger", "image": "x"}]
+        raw["status"]["ephemeralContainerStatuses"] = [
+            {
+                "name": "debugger",
+                "state": {"waiting": {"reason": "PodInitializing"}},
+                "lastState": {},
+                "ready": False,
+                "restartCount": 0,
+                "image": "x",
+                "imageID": "",
+            }
+        ]
+        pod = self._pod(raw)
+        assert not cp._deleted_pod_stopped_before_its_containers_started(pod)

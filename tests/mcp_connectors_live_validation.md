@@ -10,6 +10,16 @@ closure audit, the `srw` k3d containers were running and both MCP flags were
 enabled in `deployment/values-local.yaml`, but the Kubernetes API was
 unresponsive and Tilt was not running.
 
+**Superseded for stdio (connector drivers D5b):** stdio MCP servers no longer
+run in agent pods, and `MCP_STDIO_ENABLED` / `agent.mcpStdioEnabled` are gone
+(setting the Helm key to true fails the render). A stored stdio connector is
+refused on create and edit, never delivered, and its Test answers
+"unsupported". Every stdio check below (the local connector, the npm/uvx
+runtimes, stdio canaries and subprocess reaping, the stdio gate matrix rows)
+no longer applies; a stdio image runs as a managed MCP server behind the
+front, gated by `scripts/k3d-managed-mcp-stdio-gate.py`. The remote (http and
+sse) checks still stand.
+
 **Source documents:**
 
 - `knowledge-base/knowledge/features/mcp_datasources.md`
@@ -130,17 +140,17 @@ user content; record only sanitized excerpts and identifiers here.
    tilt get uiresources
    ```
 
-2. The local overlay enables both flags:
+2. The local overlay enables the MCP flag:
 
    ```bash
    helm template srw helm/ -f deployment/values-local.yaml \
-     | grep -E 'MCP_(DATASOURCES|STDIO)_ENABLED'
+     | grep -E 'MCP_DATASOURCES_ENABLED'
 
    kubectl --context=k3d-srw -n srw get configmap srw-config \
-     -o jsonpath='{.data.MCP_DATASOURCES_ENABLED}{" "}{.data.MCP_STDIO_ENABLED}{"\n"}'
+     -o jsonpath='{.data.MCP_DATASOURCES_ENABLED}{"\n"}'
    ```
 
-   Expected for the full local matrix: `true true`.
+   Expected for the full local matrix: `true`.
 
 3. Orchestrator, Cockpit, and at least one newly provisioned agent use images
    containing the MCP commits. Do not rely only on a mutable `latest` tag;
@@ -175,8 +185,7 @@ user content; record only sanitized excerpts and identifiers here.
       Ready.
 - [ ] Tilt reports the relevant resources healthy; no stale failed build is
       serving older code.
-- [ ] `srw-config` contains
-      `MCP_DATASOURCES_ENABLED=true` and `MCP_STDIO_ENABLED=true`.
+- [ ] `srw-config` contains `MCP_DATASOURCES_ENABLED=true`.
 - [ ] A newly created agent pod contains the expected MCP Python packages.
 - [ ] The agent image has working `node`, `npx`, `uv`, and `uvx` executables.
 - [ ] The recorded image identities correspond to the Git SHA under test.
@@ -464,8 +473,8 @@ deployment:
       deployment policy intends them to fail closed.
 - [ ] One user's connector cannot be reached through another user's job,
       project, session, or guessed UUID.
-- [ ] The multi-tenant stdio threat model has an explicit security decision
-      before `MCP_STDIO_ENABLED` is enabled outside trusted/dev environments.
+- [ ] A stdio image runs only as a managed MCP server, each binding's
+      process as a user of its own (D5b): no agent pod runs one.
 
 ## P2.2 Load and soak
 

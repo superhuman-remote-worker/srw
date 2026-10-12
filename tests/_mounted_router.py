@@ -16,7 +16,7 @@ def mount_router(
     factories: Mapping[str, Callable[..., Any]] | None = None,
 ) -> FastAPI:
     """Mount the given routers with only this application's operation factories."""
-    from orchestrator.main import CustomJSONResponse
+    from orchestrator.application.http import CustomJSONResponse
 
     app = FastAPI(default_response_class=CustomJSONResponse)
     for name, factory in (factories or {}).items():

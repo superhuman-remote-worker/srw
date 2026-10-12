@@ -251,36 +251,6 @@
           "default": "sandbox",
           "description": "Workspace backend type. 'sandbox' (SSH/SFTP to an isolated workspace container) and 'vm' (SSH/SFTP to a KubeVirt VM with sudo gate) get the full shell/git/browser toolset. The lite tiers run with no workspace pod (no_workspace_agent_mode.md): 'virtual' exposes object-store-backed file tools (no shell/git/browser); 'none' exposes no file tools at all. Shell/browser/git are gated off automatically for the lite tiers by backend capability, not by config. The agent never operates on its own filesystem."
         },
-        "container": {
-          "type": "object",
-          "description": "Workspace container settings (only used when backend: container). The orchestrator provisions the container and injects SSH connection details automatically.",
-          "properties": {
-            "image": {
-              "type": "string",
-              "description": "Workspace container image override (defaults to WORKSPACE_IMAGE env var)"
-            },
-            "cpu": {
-              "type": "string",
-              "default": "500m",
-              "description": "CPU request for workspace container"
-            },
-            "memory": {
-              "type": "string",
-              "default": "1Gi",
-              "description": "Memory request for workspace container"
-            },
-            "cpu_limit": {
-              "type": "string",
-              "default": "2000m",
-              "description": "CPU limit for workspace container"
-            },
-            "memory_limit": {
-              "type": "string",
-              "default": "4Gi",
-              "description": "Memory limit for workspace container"
-            }
-          }
-        },
         "remote": {
           "type": "object",
           "description": "Remote backend settings (only used when backend: remote)",
@@ -2061,17 +2031,11 @@
           "default": true,
           "description": "Trigger context compaction when archiving todos"
         },
-        "keep_recent_tool_results": {
-          "type": "integer",
-          "minimum": 0,
-          "default": 15,
-          "description": "Number of recent tool results to preserve in full during context compaction. Higher values retain more context but slow compaction."
-        },
         "keep_recent_messages": {
           "type": "integer",
           "minimum": 1,
           "default": 10,
-          "description": "Number of recent messages to preserve during compaction and trimming"
+          "description": "Number of recent messages to preserve during compaction"
         },
         "summarization_template": {
           "type": "string",
@@ -2313,6 +2277,25 @@
           "type": "boolean",
           "default": false,
           "description": "Roster runtime: the `run_in_background` value used only when a `delegate_agent` call omits the argument. false = wait for the report as this tool result; true = return a durable receipt and push the child's completion automatically. An explicit false always wins."
+        },
+        "session_max_concurrent": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 20,
+          "description": "A session parent's own cap on concurrently running children (a fan-out batch, queued calls and background children alike); calls above it queue and run in waves. Unset = the parent model family's `session_max_concurrent` from config/model_config_matrix.yaml, else 6. Out-of-range values are clamped by the loader. `max_concurrent` stays the worker cap. Whether a session may fan out at all is the orchestrator's deployment setting (`orchestrator.sessionSubagentFanoutLanes`), not configuration."
+        },
+        "family_session_max_concurrent": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 20,
+          "description": "Written by the settings matrix from the parent model family; any authored value is overwritten. Use `session_max_concurrent` instead."
+        },
+        "session_max_calls_per_turn": {
+          "type": "integer",
+          "default": 20,
+          "minimum": 1,
+          "maximum": 64,
+          "description": "Total `delegate_agent` calls one session parent turn may make across all its batches; calls above it get an error result and do not run."
         }
       },
       "additionalProperties": false

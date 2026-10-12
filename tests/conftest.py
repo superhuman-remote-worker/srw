@@ -3,10 +3,35 @@
 import os
 import sys
 import tempfile
+from contextlib import asynccontextmanager
+from functools import wraps
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 from uuid import UUID
 
 import pytest
+
+
+def pytest_configure(config):
+    """Set disposable Postgres defaults before any test modules are collected."""
+    from testcontainers.postgres import PostgresContainer
+
+    original_init = PostgresContainer.__init__
+
+    @wraps(original_init)
+    def init_without_disk_sync(self, *args, **kwargs):
+        original_init(self, *args, **kwargs)
+        # These databases are recreated for each fixture, so crash durability
+        # only adds disk waits to schema creation, commits and TRUNCATE.
+        if self._command is None:
+            self.with_command(
+                "postgres -c fsync=off -c synchronous_commit=off -c full_page_writes=off"
+            )
+
+    patch = pytest.MonkeyPatch()
+    patch.setattr(PostgresContainer, "__init__", init_without_disk_sync)
+    config.add_cleanup(patch.undo)
+
 
 # orchestrator/main.py SystemExits at import time unless the license gate is
 # accepted. Tests only exercise its utility functions — auto-accept here so
@@ -35,6 +60,81 @@ def _isolate_encryption_cipher_cache():
     _encryption_crypto.reset_cipher_cache()
     yield
     _encryption_crypto.reset_cipher_cache()
+
+
+@pytest.fixture(autouse=True)
+def _isolate_pinned_write_fence():
+    """Keep the agent's process-wide pinned transcript fence per-test.
+
+    ``persistent_app``'s session identity arms
+    ``agent.api.pinned_write_fence.PROCESS_PINNED_WRITE_FENCE`` whenever a
+    test drives an attach that adopts a runtime generation. Left armed, it
+    fences every later lease-less ``save_thread_message(s)`` in the same xdist
+    worker on a life that does not exist, an order-dependent failure far from
+    its cause.
+    """
+    yield
+    module = sys.modules.get("agent.api.pinned_write_fence")
+    if module is not None:
+        module.PROCESS_PINNED_WRITE_FENCE.reset()
+
+
+def _persistent_session_state(module):
+    return (
+        module._session,
+        dict(vars(module._session_identity)),
+        dict(vars(module._session_termination)),
+    )
+
+
+def _imported_persistent_session_state(module):
+    """The session state ``persistent_app`` has right after its import."""
+
+    identity = module._session_identity
+    termination = module._session_termination
+    fresh_identity = type(identity)(identity._ports)
+    fresh_termination = type(termination)(
+        termination._ports,
+        logger=termination._logger,
+        termination_queue_sentinel=termination.termination_queue_sentinel,
+    )
+    return None, dict(vars(fresh_identity)), dict(vars(fresh_termination))
+
+
+@pytest.fixture(autouse=True)
+def _isolate_persistent_session_runtime(monkeypatch):
+    """Give every test back the agent's process session state it started with.
+
+    ``persistent_app`` keeps the attached session, its identity (thread,
+    generation, attach token, runtime contract) and the termination
+    coordinator's retirement admission as process singletons. A test that
+    attaches or retires without restoring them changes how a later test in the
+    same xdist worker classifies a failed retirement. A leaked runtime contract
+    made an unproven settlement an exact retirement that retries forever; with
+    the retry delays patched to zero that loop never yielded, logged on every
+    pass and grew the worker to ~40 GiB.
+
+    ``monkeypatch`` is undone before the restore: it can be set up before this
+    fixture (another autouse fixture requests it), and its own later undo would
+    write back whatever a test's mid-test ``setattr`` captured as the old value.
+    """
+    module = sys.modules.get("agent.api.persistent_app")
+    saved = _persistent_session_state(module) if module is not None else None
+    yield
+    monkeypatch.undo()
+    module = sys.modules.get("agent.api.persistent_app")
+    if module is None:
+        return
+    if saved is None:
+        saved = _imported_persistent_session_state(module)
+    session, identity, termination = saved
+    module._session = session
+    for owner, state in (
+        (module._session_identity, identity),
+        (module._session_termination, termination),
+    ):
+        vars(owner).clear()
+        vars(owner).update(state)
 
 
 from orchestrator.services import notification_catalog as _notification_catalog  # noqa: E402
@@ -119,57 +219,78 @@ def _isolate_declared_provenance_env(monkeypatch):
 
 
 # =============================================================================
-# Orchestrator module-singleton hygiene
+# Orchestrator application-state hygiene
 # =============================================================================
 #
-# orchestrator/main.py owns process-wide singletons (``postgres_db`` and
-# friends). A test that swaps one in with a bare assignment rather than
-# monkeypatch leaks it into every test that runs after it in the same process,
-# and the failure surfaces hundreds of tests later in a file that never touched
-# the global — e.g. a leaked ``MagicMock`` postgres_db turning an unrelated
-# ``await postgres_db.<method>()`` into "MagicMock can't be used in 'await'".
-# Snapshot the identities around every test and put them back, so a missing
-# restore stays local to the test that made it.
-#
-# All tests and applications use the installed canonical package, so there is
-# one orchestrator module and one set of process-wide singletons to guard.
+# The entrypoint's application (``orchestrator.main.app``) owns its resources
+# (``app.state.resources``: stores, clients, registries, deployment settings),
+# and the process-wide service singletons live in their owning modules. A test
+# that swaps one in with a bare assignment rather than monkeypatch leaks it into
+# every test that runs after it in the same process, and the failure surfaces
+# hundreds of tests later in a file that never touched it — e.g. a leaked
+# ``MagicMock`` store turning an unrelated ``await store.<method>()`` into
+# "MagicMock can't be used in 'await'". Snapshot the identities around every
+# test and put them back, so a missing restore stays local to the test that
+# made it.
 
-_ORCH_MAIN_MODULE_NAMES = ("orchestrator.main",)
-_ORCH_MAIN_SINGLETONS = (
-    "postgres_db",
-    "workspace_suspension_service",
-    "persistent_provisioner",
-    "email_service",
-    "headless_notifications",
+_OWNER_SINGLETONS = (
+    ("orchestrator.services.agent_provisioner", "agent_provisioner"),
+    ("orchestrator.services.container_provisioner", "container_provisioner"),
+    ("orchestrator.services.docker_provisioner", "docker_provisioner"),
+    ("orchestrator.services.email", "email_service"),
+    ("orchestrator.services.ide_proxy", "ide_proxy_service"),
+    ("orchestrator.services.ide_session", "ide_session_service"),
+    ("orchestrator.services.imap_poller", "imap_poller"),
+    ("orchestrator.services.nats_bridge", "nats_bridge"),
+    ("orchestrator.services.notification_service", "notification_service"),
+    ("orchestrator.services.persistent_provisioner", "persistent_provisioner"),
+    ("orchestrator.services.snapshot_service", "snapshot_service"),
+    ("orchestrator.services.sudo_gate", "sudo_gate"),
+    ("orchestrator.services.vm_provisioner", "vm_provisioner"),
+    ("orchestrator.services.workspace", "workspace_service"),
+    ("orchestrator.services.workspace_suspension", "workspace_suspension_service"),
+    # Process-wide seams ``create_app()`` binds to the most recently built
+    # application; a test that builds its own application must not leave them
+    # pointing at it.
+    ("orchestrator.security.auth", "_cloud_router_provider"),
+    ("orchestrator.security.auth", "_forge_provider"),
+    ("orchestrator.routers.vm_workspace_cleanup_authority", "_store_factory"),
+    ("orchestrator.routers.vm_creation_retry_authority", "_store_factory"),
+    ("orchestrator.routers.vm_resource_inventory", "_configuration"),
 )
 
 
 @pytest.fixture(autouse=True)
 def _restore_orchestrator_singletons():
-    modules = []
-    for name in _ORCH_MAIN_MODULE_NAMES:
-        module = sys.modules.get(name)
-        if module is not None and not any(module is seen for seen in modules):
-            modules.append(module)
+    import dataclasses
 
-    snapshots = [
-        (
-            module,
-            {
-                name: getattr(module, name)
-                for name in _ORCH_MAIN_SINGLETONS
-                if hasattr(module, name)
-            },
+    snapshots = []
+    main = sys.modules.get("orchestrator.main")
+    resources = getattr(
+        getattr(getattr(main, "app", None), "state", None), "_state", {}
+    )
+    resources = resources.get("resources") if isinstance(resources, dict) else None
+    if resources is not None:
+        fields = [f.name for f in dataclasses.fields(resources)]
+        snapshots.append(
+            (
+                resources,
+                {n: getattr(resources, n) for n in fields if hasattr(resources, n)},
+            )
         )
-        for module in modules
-    ]
+        settings = resources.settings
+        snapshots.append((settings, dataclasses.asdict(settings)))
+    for module_name, attribute in _OWNER_SINGLETONS:
+        module = sys.modules.get(module_name)
+        if module is not None and hasattr(module, attribute):
+            snapshots.append((module, {attribute: getattr(module, attribute)}))
     try:
         yield
     finally:
-        for module, snapshot in snapshots:
+        for owner, snapshot in snapshots:
             for name, value in snapshot.items():
-                if getattr(module, name, None) is not value:
-                    setattr(module, name, value)
+                if getattr(owner, name, None) is not value:
+                    setattr(owner, name, value)
 
 
 # =============================================================================
@@ -447,6 +568,27 @@ def fake_db(
         side_effect=list_datasource_projects_bulk
     )
     db.list_datasources = AsyncMock(side_effect=list_datasources)
+    # This graph has no open container workspace creation receipts.
+    db.container_workspace_creation_views = AsyncMock(return_value={})
+
+    # PostgresDB.acquire() is an @asynccontextmanager, not a coroutine: the
+    # owner reads (read_vm_idle_states on job/thread detail and list, and
+    # VMIdleLifecycleStore on pinned Resume) open it with ``async with``. This
+    # graph holds no VM contexts and no vm_idle_operations rows, so every raw
+    # read answers empty, as the real query would. Only reads are modelled; a
+    # raw write through this double still fails loudly. Tests needing SQL
+    # rows keep overriding ``fake_db.acquire`` themselves.
+    empty_reads = SimpleNamespace(
+        fetch=AsyncMock(return_value=[]),
+        fetchrow=AsyncMock(return_value=None),
+        fetchval=AsyncMock(return_value=None),
+    )
+
+    @asynccontextmanager
+    async def acquire():
+        yield empty_reads
+
+    db.acquire = MagicMock(side_effect=acquire)
     return db
 
 

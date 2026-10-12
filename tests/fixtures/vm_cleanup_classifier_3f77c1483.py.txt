@@ -1,0 +1,44 @@
+def _classify_captured_probe(
+        probe: _VMTeardownProbe,
+        identity: VMTeardownIdentity,
+        *,
+        purge_disk: bool = True,
+    ) -> str:
+        """Map one authenticated observation to completed/matched/superseded."""
+
+        if probe.disposition in {"unknown", "superseded"}:
+            return probe.disposition
+        current = probe.identity
+        if current is None:
+            return "unknown"
+        if probe.disposition == "present":
+            if identity.vm_uid is None or current.vm_uid != identity.vm_uid:
+                return "superseded"
+            if purge_disk:
+                if not probe.rootdisk_identity_known:
+                    return "unknown"
+                if identity.rootdisk_pvc_uid is None:
+                    return "unknown"
+                if current.rootdisk_pvc_uid != identity.rootdisk_pvc_uid:
+                    return "superseded"
+            return "matched"
+        # A VM 404 can race KubeVirt VMI and virt-launcher deletion. Cleanup
+        # completion must prove the whole runtime absent before callers may
+        # settle a permit or debit a compute reservation.
+        if not (
+            probe.runtime_absence_known
+            and probe.vmi_absent
+            and probe.launcher_absent
+        ):
+            return "unknown"
+        if not probe.rootdisk_identity_known:
+            return "unknown"
+        if current.rootdisk_pvc_uid is None:
+            # VM and rootdisk both proven absent: a lost delete response is
+            # exact idempotent success even when DB context is still stale.
+            return "completed"
+        if identity.rootdisk_pvc_uid is None:
+            return "unknown"
+        if current.rootdisk_pvc_uid != identity.rootdisk_pvc_uid:
+            return "superseded"
+        return "matched" if purge_disk else "completed"

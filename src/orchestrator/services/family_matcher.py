@@ -40,13 +40,20 @@ _FAMILY_RULES: list[tuple[re.Pattern, str | Callable[[re.Match], FamilyDetection
         re.compile(r"^openrouter/(.+)$"),
         lambda m: detect_family(m.group(1)),
     ),
-    # Anthropic. claude-opus-5 must beat the generic claude-opus rule: only
-    # Opus 5 accepts the full effort ladder, so it has its own matrix family
+    # The codex/ transport prefix does not make a model a Codex variant.
+    (re.compile(r"^codex/(.+)$", re.IGNORECASE), lambda m: detect_family(m.group(1))),
+    # Anthropic. claude-opus-5-5 must beat claude-opus-5, which must beat the
+    # generic claude-opus rule: only Opus 5.x accepts the full effort ladder,
+    # and 5.5 moved the default effort, so each has its own matrix family
     # (family_of() in shared/runtime/core/model_registry.py encodes the same
-    # precedence). Older ids stay on `claude-opus` — "claude-opus-4-5" does not
-    # contain "claude-opus-5".
+    # precedence). 5.5 matches the hyphen and OpenRouter's dotted form; the
+    # digit guard keeps a dated Opus 5 snapshot on claude-opus-5. Older ids
+    # stay on `claude-opus` — "claude-opus-4-5" does not contain "claude-opus-5".
+    (re.compile(r"claude-opus-5[.-]5(?!\d)", re.IGNORECASE), "claude-opus-5-5"),
     (re.compile(r"claude-opus-5", re.IGNORECASE), "claude-opus-5"),
     (re.compile(r"claude-opus", re.IGNORECASE), "claude-opus"),
+    # Sonnet 5 and 5.5 before generic Sonnet: only 5.x takes the full ladder.
+    (re.compile(r"claude-sonnet-5", re.IGNORECASE), "claude-sonnet-5"),
     (re.compile(r"claude-sonnet", re.IGNORECASE), "claude-sonnet"),
     (re.compile(r"claude-haiku", re.IGNORECASE), "claude-haiku"),
     # Fable 5 and 5.1 share one family (identical matrix knobs).
@@ -56,6 +63,10 @@ _FAMILY_RULES: list[tuple[re.Pattern, str | Callable[[re.Match], FamilyDetection
     # the `gpt-5` prefix and the `codex` substring.
     (re.compile(r"codex-spark", re.IGNORECASE), "codex-spark"),
     (re.compile(r"codex", re.IGNORECASE), "codex"),
+    (
+        re.compile(r"(?:^|/)gpt-6\.1-sol(?:$|[-:])", re.IGNORECASE),
+        "gpt-6.1-sol",
+    ),
     # GPT-6 (Astra). Sits below the codex rules on purpose: those match any id
     # containing "codex", so a future gpt-6 codex variant keeps landing in the
     # codex family rather than here — family_of() in model_registry.py encodes
@@ -98,7 +109,15 @@ _FAMILY_RULES: list[tuple[re.Pattern, str | Callable[[re.Match], FamilyDetection
         re.compile(r"(?:^|/)muse-spark-1\.3(?:$|[-:])", re.IGNORECASE),
         "muse-spark-1.3",
     ),
+    # Kimi K3 before the generic kimi rule; K2.x keeps default prompts.
+    (re.compile(r"(?:^|/)kimi-k3(?![\w.])", re.IGNORECASE), "kimi-k3"),
     (re.compile(r"kimi", re.IGNORECASE), "default"),
+    # Qwen3.8-27B only; the dot keeps Qwen3 8B (qwen3-8b) off it.
+    (re.compile(r"(?:^|/)qwen3\.8-27b(?![\w.])", re.IGNORECASE), "qwen3.8-27b"),
+    # Qwen3.8 Max and Max Prime; the open 2.4T-A95B is text-only and stays off.
+    (re.compile(r"(?:^|/)qwen3\.8-max(?![\w.])", re.IGNORECASE), "qwen3.8-max"),
+    # Grok 4.7 only; older 4.x rows keep default.
+    (re.compile(r"(?:^|/)grok-4\.7(?![\w.])", re.IGNORECASE), "grok-4.7"),
     # Embeddings
     (re.compile(r"text-embedding", re.IGNORECASE), "openai-embedding"),
 ]

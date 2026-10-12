@@ -6,7 +6,7 @@ import {Contact, ContactProjectRef} from '../../core/models/api.model';
 import {ApiService} from '../../core/services/api.service';
 import {ContactsService} from '../../core/services/contacts.service';
 import {UserService} from '../../core/services/user.service';
-import {SidebarToggleComponent} from '../../shell/sidebar-toggle/sidebar-toggle.component';
+import {CustomizeTabsComponent} from '../../shell/customize-tabs/customize-tabs.component';
 import {AppButtonComponent} from '../../ui/button';
 import {AppConfirmNameDialogComponent} from '../../ui/confirm-name-dialog';
 import {AppIconComponent} from '../../ui/icon';
@@ -24,7 +24,7 @@ import {ContactListComponent} from './contact-list.component';
     TranslocoPipe,
     ContactListComponent,
     ContactFormComponent,
-    SidebarToggleComponent,
+    CustomizeTabsComponent,
     AppButtonComponent,
     AppConfirmNameDialogComponent,
     AppIconComponent,
@@ -34,9 +34,7 @@ import {ContactListComponent} from './contact-list.component';
   ],
   template: `
     <div class="page">
-      <div class="page-toggle">
-        <app-sidebar-toggle />
-      </div>
+      <app-customize-tabs />
 
       <main class="page-content">
         <header class="header">
@@ -139,15 +137,6 @@ import {ContactListComponent} from './contact-list.component';
         display: flex;
         flex-direction: column;
         height: 100%;
-      }
-
-      .page-toggle {
-        padding: 8px 12px;
-        flex-shrink: 0;
-      }
-
-      .page-toggle:not(:has(.sidebar-toggle)) {
-        display: none;
       }
 
       .page-content {

@@ -119,7 +119,7 @@ class RerankerScorer:
         return self._client
 
     async def _rerank(
-        self, query: str, documents: List[str]
+        self, query: str, documents: List[str], *, retries: bool = True
     ) -> List[Tuple[int, float]]:
         """Call the endpoint; return (index, relevance_score) pairs.
 
@@ -127,8 +127,10 @@ class RerankerScorer:
         attempts, exponential backoff from ``retry_backoff``); if they outlast
         the budget the call raises ``TransientScorerError`` for the manager to
         degrade this one turn. Structural failures raise immediately.
+        ``retries=False`` (``AssembleRequest.retries``, the session's
+        idle-time prefetch under its hard budget) makes one attempt only.
         """
-        attempts = self.retries + 1
+        attempts = self.retries + 1 if retries else 1
         last_exc: Optional[Exception] = None
         for attempt in range(attempts):
             if attempt:
@@ -186,7 +188,9 @@ class RerankerScorer:
             return items
 
         ranked = await self._rerank(
-            req.query_text, [item.candidate.text or "" for item in to_rank]
+            req.query_text,
+            [item.candidate.text or "" for item in to_rank],
+            retries=getattr(req, "retries", True) is not False,
         )
         if len(ranked) != len(to_rank):
             raise ValueError(
@@ -219,17 +223,28 @@ def resolve_reranker_transport(
     ``RERANK_API_KEY`` (the embedding key never leaves the embedding host),
     and when no rerank endpoint resolves at all both fall back to
     ``EMBEDDING_*`` — the single-router deployment the plugin was built for.
-    An explicit ``memory.reranker.base_url`` keeps its pre-catalog contract
-    (any key that resolves), so existing overrides keep working.
+    An explicit ``memory.reranker.base_url`` is authenticated by its own
+    ``memory.reranker.api_key``, or by an env key only when that key's paired
+    base URL is the same host: a key follows its endpoint.
     """
     if env is None:
         env = os.environ
     model = cfg.model or env.get("RERANK_MODEL") or DEFAULT_RERANK_MODEL
     if cfg.base_url:
         base_url = cfg.base_url
-        api_key = (
-            cfg.api_key or env.get("RERANK_API_KEY") or env.get("EMBEDDING_API_KEY")
-        )
+        api_key = cfg.api_key
+        if not api_key:
+            from shared.runtime.core.transport_resolution import endpoint_within
+
+            for prefix in ("RERANK", "EMBEDDING"):
+                paired = env.get(f"{prefix}_BASE_URL")
+                if (
+                    paired
+                    and endpoint_within(base_url, paired)
+                    and env.get(f"{prefix}_API_KEY")
+                ):
+                    api_key = env[f"{prefix}_API_KEY"]
+                    break
     elif env.get("RERANK_BASE_URL"):
         base_url = env["RERANK_BASE_URL"]
         api_key = cfg.api_key or env.get("RERANK_API_KEY")

@@ -515,8 +515,11 @@ def test_image_workflows_pass_full_source_revision_separately_from_short_sha():
 
     assert _count_full_revision(main, "SRW_SOURCE_REVISION") >= 7
     assert _count_full_revision(develop, "SRW_SOURCE_REVISION") >= 7
-    assert _count_full_revision(main, "org.opencontainers.image.revision") == 7
-    assert _count_full_revision(develop, "org.opencontainers.image.revision") == 7
+    # Eleven build identities; the workspace job labels two images (the
+    # full one and the minimal one it is built on), and so does the in-pod
+    # plane's (the FUSE opener and the cloud mount supervisor).
+    assert _count_full_revision(main, "org.opencontainers.image.revision") == 13
+    assert _count_full_revision(develop, "org.opencontainers.image.revision") == 13
     for component in (
         "agent",
         "orchestrator",
@@ -525,6 +528,11 @@ def test_image_workflows_pass_full_source_revision_separately_from_short_sha():
         "workspace",
         "vm-controller",
         "vm-preparer",
+        "driver-shim",
+        "driver-mcp-front",
+        "driver-git-swap",
+        "fuse-opener",
+        "cloud-mount",
     ):
         assert f"io.srw.component={component}" in main
         assert f"io.srw.component={component}" in develop
@@ -544,12 +552,15 @@ def test_image_workflows_pass_full_source_revision_separately_from_short_sha():
 
     # ...and it must stay *derived* from the full sha, so the two cannot drift
     # apart into an image tagged with one commit and labeled with another.
-    # Seven build identities: the five services, controller and disk builder.
-    assert develop.count("short=${FULL::7}") == 7
+    # Eleven build identities: the five services, controller, disk builder,
+    # the connector driver shim, the managed MCP front, the git swap driver
+    # and the in-pod plane (opener and supervisor, one identity).
+    assert develop.count("short=${FULL::7}") == 11
     # The chart-stamping step derives every baked tag from the same identity
     # sha whose full form ships as that component's provenance revision —
-    # seven including the ephemeral preparation builder.
-    assert len(re.findall(r'="sha-\$\{SHA_[A-Z]+::7\}"', develop)) == 7
+    # eleven including the ephemeral preparation builder, the driver shim,
+    # the managed MCP front, the git swap driver and the in-pod plane.
+    assert len(re.findall(r'="sha-\$\{SHA_[A-Z]+::7\}"', develop)) == 11
 
     assert (
         ".provenance.components[strenv(component)].sourceRevision = strenv(GITHUB_SHA)"

@@ -18,6 +18,8 @@ from shared.persistent_input_delivery import (
     transition_input_delivery,
 )
 from tests import test_persistent_recycler_real_postgres as fixtures
+from orchestrator.application import controls as controls_composition
+from orchestrator.services import agent_provisioner as agent_provisioner_module
 
 db = fixtures.db
 pg_dsn = fixtures.pg_dsn
@@ -113,8 +115,8 @@ async def _used_virtual(
     provider = AgentProvisioner()
     provider._k8s_available = True
     provider._core_api = k8s
-    monkeypatch.setattr(main, "agent_provisioner", provider)
-    monkeypatch.setattr(main, "postgres_db", db)
+    monkeypatch.setattr(agent_provisioner_module, "agent_provisioner", provider)
+    monkeypatch.setattr(main.app.state.resources, "postgres_db", db)
     retirement = await db.begin_pinned_thread_retirement(
         ids["thread"], permanent=permanent
     )
@@ -138,7 +140,9 @@ async def test_used_virtual_actor_exit_settles_after_exact_pod_stop(
 ):
     ids, retirement, k8s = await _used_virtual(db, monkeypatch, permanent=permanent)
     assert ids["process_generation"] != ids["generation"]
-    assert await main._recover_captured_sandbox_process_zero(retirement)
+    assert await controls_composition.pinned_retirement_operations(
+        main.app.state.resources
+    ).recover_captured_process_zero(retirement)
     assert not k8s.pods
     thread = await db.get_thread(ids["thread"])
     receipt = fixtures._json(thread["runtime_retirement_local_quiescence"])
@@ -155,8 +159,12 @@ async def test_used_virtual_actor_exit_settles_after_exact_pod_stop(
         )
         == receipt
     )
-    assert main._retirement_has_exact_local_quiescence(retirement, thread)
-    assert await main._recover_captured_sandbox_process_zero(retirement)
+    assert controls_composition.pinned_retirement_operations(
+        main.app.state.resources
+    ).retirement_has_exact_local_quiescence(retirement, thread)
+    assert await controls_composition.pinned_retirement_operations(
+        main.app.state.resources
+    ).recover_captured_process_zero(retirement)
     with pytest.raises(asyncpg.CheckViolationError):
         await db.execute(
             "UPDATE threads SET runtime_retirement_local_quiescence=NULL WHERE id=$1::uuid",
@@ -220,7 +228,7 @@ async def test_used_virtual_actor_exit_settles_after_exact_pod_stop(
     core_api.read_namespaced_service.side_effect = fixtures._K8sError(404)
     networking_api.read_namespaced_ingress.side_effect = fixtures._K8sError(404)
     monkeypatch.setattr(
-        main,
+        main.app.state.resources,
         "session_router",
         SessionRouterService(
             namespace="agents-a",
@@ -229,9 +237,9 @@ async def test_used_virtual_actor_exit_settles_after_exact_pod_stop(
             networking_api=networking_api,
         ),
     )
-    await main._pinned_retirement_operations().cleanup_pinned_thread_retirement(
-        retirement
-    )
+    await controls_composition.pinned_retirement_operations(
+        main.app.state.resources
+    ).cleanup_pinned_thread_retirement(retirement)
     for read in (
         core_api.read_namespaced_service,
         networking_api.read_namespaced_ingress,
@@ -262,16 +270,34 @@ async def test_process_generation_difference_never_turns_used_life_into_zero_adm
     ids, retirement, _ = await _used_virtual(
         db, monkeypatch, input_state=input_state, status=status
     )
-    recovered = await main._recover_captured_sandbox_process_zero(retirement)
-    # Queued work was never admitted; the existing created-life protocol may
-    # still settle it. An admitted input from a distinct process UUID cannot.
+    recovered = await controls_composition.pinned_retirement_operations(
+        main.app.state.resources
+    ).recover_captured_process_zero(retirement)
+    assert recovered
+    thread = await db.get_thread(ids["thread"])
+    receipt = thread["runtime_retirement_local_quiescence"]
+    if isinstance(receipt, str):
+        import json
+
+        receipt = json.loads(receipt)
+    # Only the original never-used created life qualifies for zero admission.
+    # Used lives need the explicit abrupt protocol, which preserves input
+    # state and acknowledges partial execution without inventing completion.
     if status == "created" and input_state == "queued":
-        assert recovered
+        assert "recovery_protocol" not in receipt
     else:
-        assert not recovered
-        assert (await db.get_thread(ids["thread"]))[
-            "runtime_retirement_local_quiescence"
-        ] is None
+        assert receipt["recovery_protocol"] == "abrupt_virtual_actor_exit_v1"
+        assert receipt["stranded_input_count"] == int(input_state == "queued")
+        assert receipt["partial_admission_count"] == int(input_state == "admitted")
+    assert str(thread["runtime_retirement_token"]) == retirement["token"]
+    assert thread["status"] == status
+    assert (
+        await db.fetchval(
+            "SELECT state FROM thread_input_deliveries WHERE delivery_id=$1::uuid",
+            ids["delivery_id"],
+        )
+        == input_state
+    )
 
 
 @pytest.mark.asyncio

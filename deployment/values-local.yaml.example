@@ -108,7 +108,8 @@ secrets:
     # password on every pod restart by the chart's postStart hook. It must be at
     # least 16 characters or the realm password policy rejects the reset (and the
     # hook swallows the error), so the old 4-character "test" no longer works.
-    # The shared dev accounts live behind keycloak.devUsers — see README.
+    # The shared dev accounts live behind keycloak.devUsers — see
+    # docs/local-kubernetes.md.
     KEYCLOAK_ADMIN_USER: "admin"
     KEYCLOAK_ADMIN_PASSWORD: "dev_kc_admin"
     KC_ADMIN_USER: "admin"
@@ -160,8 +161,6 @@ secrets:
     DISCORD_WEBHOOK_URL: ""
     SLACK_WEBHOOK_URL: ""
     NTFY_TOKEN: ""
-    DEFAULT_DS_WEBDAV_USERNAME: ""
-    DEFAULT_DS_WEBDAV_PASSWORD: ""
     CODEX_MANAGEMENT_KEY: "dev_codex_key"
     MCP_INTERNAL_KEY: "dev_mcp_internal_key"
     # Fixed admin MCP token, seeded into the DB at orchestrator startup + on
@@ -270,6 +269,20 @@ orchestrator:
   # leader-election noise. This now MATCHES the chart default (1) — kept
   # explicit so a future default change cannot silently double the footprint.
   replicas: 1
+  # Session subagent fan-out (several delegate_agent calls per response):
+  # "" (off), "stateless" (the chart default) or "stateless,pinned".
+  # Uncomment to turn it off for this cluster:
+  # sessionSubagentFanoutLanes: ""
+  # Connector credential leases (connector drivers C2): the k3d profile
+  # serves the exchange port (with its NetworkPolicy), installs the
+  # development lease probe driver and shortens the lease window so
+  # scripts/k3d-credential-lease-gate.py can watch a paused Job's lease lapse
+  # and an idle session's lease outlive it in minutes, not 15.
+  connectorLeases:
+    exchangePort: 8088
+    probeDriver: true
+    ttlSeconds: 120
+    sweepIntervalSeconds: 15
   resources:
     requests:
       memory: "256Mi"
@@ -277,6 +290,116 @@ orchestrator:
     limits:
       memory: "1Gi"
       cpu: "500m"
+
+# -----------------------------------------------------------------------------
+# Connector drivers, service plane (connector drivers D5): the k3d profile
+# hosts shared driver pods in `srw-connectors` (Pod Security baseline, a
+# static default deny, quotas). Needs orchestrator.connectorLeases.exchangePort
+# above. scripts/k3d-service-driver-gate.py exercises it.
+# -----------------------------------------------------------------------------
+connectors:
+  servicePods:
+    enabled: true
+    maxInstallation: 4
+    # Short enough for the gate to watch an idle pod stop and its identity
+    # be revoked.
+    idleSeconds: 60
+    reconcileIntervalSeconds: 5
+    # The k3d node is a container on a docker network (172.x): a home-allowed
+    # driver pod must never reach it (kubelet, apiserver). The orchestrator
+    # refuses to host while its node is reachable to driver pods.
+    refusedCidrs:
+      - 172.16.0.0/12      # docker networks: the k3d node and load balancer
+      - 10.42.0.0/16
+      - 10.43.0.0/16
+      - 169.254.0.0/16
+  # Provider-minted credentials (C5): the cluster SRW runs in is a provider
+  # the operator trusts, so a kubeconfig connector's TokenRequest may reach
+  # its API server at its service address (scripts/k3d-provider-minted-gate.py).
+  providerMinting:
+    privateHosts: ["kubernetes.default.svc"]
+  drivers:
+    registry:
+      # The k3d registry Tilt pushes driver images to; the orchestrator pod
+      # resolves `srw-registry` on the k3d network (a private address) and
+      # reaches it over HTTP.
+      insecureHosts: ["srw-registry:5000"]
+      privateHosts: ["srw-registry:5000"]
+      # A re-pushed tag is seen within seconds (the gate's moved-tag check).
+      resolveCacheSeconds: 5
+    # Hosting needs the shim pinned by digest. Tilt builds srw-driver-shim and
+    # overrides repository, tag and digest; this placeholder only keeps a
+    # plain `helm install` rendering (its driver pods would not start).
+    shim:
+      image:
+        repository: srw-registry:5000/srw-driver-shim
+        tag: dev
+        digest: "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+    # The development echo service driver (srw.echo-service/v1). Tilt builds
+    # srw-driver-echo and overrides repository, tag and digest; these
+    # placeholders only keep a plain `helm install` rendering.
+    echo:
+      enabled: true
+      image:
+        repository: srw-registry:5000/srw-driver-echo
+        tag: dev
+    # Managed MCP (D5a). Tilt builds srw-driver-mcp-front and srw-driver-mcp-test
+    # and overrides their repository, tag and digest; these placeholders only
+    # keep a plain `helm install` rendering. The official Gitea MCP server is
+    # pulled from docker.gitea.com at the chart's pinned digest.
+    mcpFront:
+      image:
+        repository: srw-registry:5000/srw-driver-mcp-front
+        tag: dev
+        digest: "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+    managedMcp:
+      gitea:
+        enabled: true
+    # The development MCP test server (srw.mcp-test/v1) the managed MCP gate
+    # drives.
+    mcpTest:
+      enabled: true
+      image:
+        repository: srw-registry:5000/srw-driver-mcp-test
+        tag: dev
+    # The git swap driver (C3): token repositories on HTTPS port 443 are
+    # cloned through it. Tilt builds srw-driver-git-swap and overrides
+    # repository, tag and digest; these placeholders only keep a plain
+    # `helm install` rendering. The chart generates SRW's driver CA. Token
+    # repositories it cannot serve (the in-cluster Gitea over http) keep the
+    # token-in-URL fallback, so the other gates' repositories still clone.
+    # scripts/k3d-git-swap-gate.py drives it.
+    gitSwap:
+      enabled: true
+      image:
+        repository: srw-registry:5000/srw-driver-git-swap
+        tag: dev
+      fallback: token-in-url
+    # The development stdio server (srw.mcp-stdio-test/v1, D5b): Docker's
+    # stock mcp/memory image behind the front and the stdio bridge the front's
+    # image carries, pulled from Docker Hub at the chart's pinned digest. The
+    # managed MCP stdio gate drives it.
+    mcpStdioTest:
+      enabled: true
+    # The MCP test server in stdio mode (srw.mcp-stdio-probe/v1, D5b, the
+    # mcpTest image): the stdio gate's isolation probes.
+    mcpStdioProbe:
+      enabled: true
+  # The in-pod plane (connector drivers D7): session workspace Pods get their
+  # cloud folders from two sidecars and run without FUSE. On by default; Tilt
+  # builds srw-fuse-opener and srw-cloud-mount and overrides repository, tag
+  # and digest; these placeholders only keep a plain `helm install`
+  # rendering. scripts/k3d-cloud-mount-sidecar-gate.py drives it.
+  inPodPlane:
+    enabled: true
+    opener:
+      image:
+        repository: srw-registry:5000/srw-fuse-opener
+        tag: dev
+    rclone:
+      image:
+        repository: srw-registry:5000/srw-cloud-mount
+        tag: dev
 
 databases:
   # Non-HA local default. All five PostgreSQL engines continue to inherit
@@ -312,13 +435,13 @@ databases:
 # Post-deploy needs a one-time sign-in via Settings → AI Subscriptions; tokens
 # persist in the codex-proxy-auth PVC.
 #
-# Pin the image: the chart default is the verified v7.2.110, and this file must
-# not silently drift below it (see helm/values.yaml for why v7.2.110 is a
-# floor, not a preference).
+# Pin the image to the chart default (v7.3.20), and never let this file drift
+# below v7.2.110 (see helm/values.yaml for why that is a floor, not a
+# preference). After changing it, run scripts/subscription-proxy-probe.py once.
 # -----------------------------------------------------------------------------
 codexProxy:
   enabled: false
-  image: docker.io/eceasy/cli-proxy-api:v7.2.110
+  image: docker.io/eceasy/cli-proxy-api:v7.3.20
 
 # -----------------------------------------------------------------------------
 # GreenMail — test-only IMAP/SMTP server for the `email` datasource. OFF by
@@ -458,7 +581,8 @@ logFormat: "text"
 #     enabled: false
 
 # Shared k3d test accounts — 2 admins + 4 regular users, fixed passwords
-# documented in README.md. Dev overlay only; the chart default is false.
+# documented in docs/local-kubernetes.md. Dev overlay only; the chart default
+# is false.
 keycloak:
   devUsers:
     enabled: true
@@ -500,5 +624,4 @@ llm:
     #   chat: "gpt-5-mini"
     #   auxiliary: "gpt-5-mini"
     #   embedding: "qwen/qwen3-embedding-8b"
-    #   rerank: "qwen/qwen3-reranker-8b"
     #   rerank: "qwen/qwen3-reranker-8b"

@@ -41,53 +41,66 @@ ORDER BY boundary.seq, effect.producer_id
 """
 
 
+# A subagent row ``child`` of the session ``$1`` that recovery still owes
+# something: a live child, or a foreground child that ended after its durable
+# parent call but whose result never reached the parent. The ToolMessage is the
+# delivery fact; the recovery stamp closes a child recovery already settled.
+# The agent-facing live list (``list_live_session_subagent_threads``) and
+# rewind's pending-child check both read this one predicate, so what recovery
+# still owes and what blocks a rewind cannot drift apart.
+LIVE_SESSION_CHILD_PREDICATE_SQL = """
+    child.kind = 'subagent'
+    AND child.parent_job_id IS NULL
+    AND child.parent_thread_id = $1::uuid
+    AND (
+        (child.status IN ('created', 'active')
+         AND child.subagent_status IN ('queued', 'running'))
+        OR (
+            child.status = 'ended'
+            AND child.subagent_outcome IS DISTINCT FROM 'cancelled:parent_retired'
+            AND child.parent_tool_call_id IS NOT NULL
+            AND COALESCE(
+                child.metadata->'subagent'->>'run_in_background', 'false'
+            ) = 'false'
+            AND (child.metadata->>'subagent_foreground_recovery_generation')
+                  IS DISTINCT FROM child.runtime_generation::text
+            AND NOT EXISTS (
+                SELECT 1 FROM thread_messages AS parent_result
+                WHERE parent_result.thread_id = $1::uuid
+                  AND parent_result.role = 'tool'
+                  AND parent_result.tool_call_id = child.parent_tool_call_id
+                  AND parent_result.rewound_at IS NULL
+            )
+            AND EXISTS (
+                SELECT 1
+                FROM thread_messages AS parent_call
+                CROSS JOIN LATERAL jsonb_array_elements(
+                    CASE WHEN jsonb_typeof(parent_call.tool_calls) = 'array'
+                         THEN parent_call.tool_calls ELSE '[]'::jsonb END
+                ) AS tool_call
+                WHERE parent_call.thread_id = $1::uuid
+                  AND parent_call.role = 'ai'
+                  AND parent_call.rewound_at IS NULL
+                  AND tool_call->>'id' = child.parent_tool_call_id
+            )
+        )
+    )
+"""
+
+
 # Kept in one place so preview and the locked mutation cannot drift.
-LIVE_SESSION_CHILD_EXISTS_SQL = """
+LIVE_SESSION_CHILD_EXISTS_SQL = f"""
 SELECT EXISTS (
     SELECT 1
     FROM threads AS child
-    WHERE child.kind = 'subagent'
-      AND child.parent_job_id IS NULL
-      AND child.parent_thread_id = $1::uuid
-      AND (
-          (child.status IN ('created', 'active')
-           AND child.subagent_status IN ('queued', 'running'))
-          OR (
-              child.status = 'ended'
-              AND child.subagent_outcome IS DISTINCT FROM 'cancelled:parent_retired'
-              AND child.parent_tool_call_id IS NOT NULL
-              AND COALESCE(
-                  child.metadata->'subagent'->>'run_in_background', 'false'
-              ) = 'false'
-              AND (child.metadata->>'subagent_foreground_recovery_generation')
-                    IS DISTINCT FROM child.runtime_generation::text
-              AND NOT EXISTS (
-                  SELECT 1 FROM thread_messages AS parent_result
-                  WHERE parent_result.thread_id = $1::uuid
-                    AND parent_result.role = 'tool'
-                    AND parent_result.tool_call_id = child.parent_tool_call_id
-                    AND parent_result.rewound_at IS NULL
-              )
-              AND EXISTS (
-                  SELECT 1
-                  FROM thread_messages AS parent_call
-                  CROSS JOIN LATERAL jsonb_array_elements(
-                      CASE WHEN jsonb_typeof(parent_call.tool_calls) = 'array'
-                           THEN parent_call.tool_calls ELSE '[]'::jsonb END
-                  ) AS tool_call
-                  WHERE parent_call.thread_id = $1::uuid
-                    AND parent_call.role = 'ai'
-                    AND parent_call.rewound_at IS NULL
-                    AND tool_call->>'id' = child.parent_tool_call_id
-              )
-          )
-      )
+    WHERE {LIVE_SESSION_CHILD_PREDICATE_SQL}
 )
 """
 
 
 __all__ = [
     "LIVE_SESSION_CHILD_EXISTS_SQL",
+    "LIVE_SESSION_CHILD_PREDICATE_SQL",
     "LIVE_USER_TARGET_SQL",
     "SESSION_MEMORY_REWIND_GUARD_SQL",
 ]

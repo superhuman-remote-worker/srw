@@ -357,11 +357,11 @@ _CATEGORY_BLOCKS: dict[str, str] = {
     ),
     EXECUTOR: (
         "Ship it, prove it appropriately, report it honestly. "
-        "Durable project files go under `projects/<project-slug>/` in this "
-        "isolated workspace; on completion the orchestrator applies a "
-        "conflict-free diff to the project cloud folder. Job scratch stays "
-        "outside that folder. The declared deliverables are the one hard check "
-        "on this work. "
+        "When this job carries a copy of the project's cloud folder, the task "
+        "brief's Project Cloud Folder section names its directory and says "
+        "what happens to your edits there; durable project files go there, and "
+        "job scratch stays outside it. The declared deliverables are the one "
+        "hard check on this work. "
         "EVIDENCE APPROPRIATE TO THE CLAIM: tests for logic, SCREENSHOTS for "
         "UI, a running deployment (bring it up, curl its health endpoint) for "
         "hosting, style-guide conformance for design. Tests are regression "

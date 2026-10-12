@@ -1,0 +1,1209 @@
+"""Immutable retention admission for an exact cancelled, never-ready Job VM.
+
+The rollout flag admits new authority only. Persisted authority, its deletion
+fence, and typed permanent Delete remain effective when admission is disabled.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+from collections.abc import Mapping
+from dataclasses import dataclass, replace
+from typing import Literal
+from uuid import NAMESPACE_URL, UUID, uuid5
+
+from shared.vm_resource_admission import ResourceAdmissionError
+
+from orchestrator.services.vm_workspace_recovery_store import (
+    CleanupPermit,
+    bind_vm_cleanup_permit,
+    prepare_vm_cleanup_resource,
+    vm_cleanup_request_identity,
+)
+
+
+def cancel_retention_admission_enabled(environ=None) -> bool:
+    source = os.environ if environ is None else environ
+    value = source.get("VM_JOB_CANCEL_RETENTION_ENABLED", "false").strip().lower()
+    if value not in {"true", "false"}:
+        raise ValueError("VM_JOB_CANCEL_RETENTION_ENABLED must be true or false")
+    return value == "true"
+
+
+def _json(value):
+    return json.loads(value) if isinstance(value, str) else value
+
+
+def _uuid(value):
+    parsed = UUID(str(value))
+    if str(parsed) != str(value):
+        raise ValueError("noncanonical retention identity")
+    return parsed
+
+
+async def _installed(conn):
+    return await conn.fetchval(
+        "SELECT to_regclass('public.vm_job_cancel_retention_authorities') IS NOT NULL"
+    )
+
+
+async def _initial_ready_installed(conn):
+    return await conn.fetchval(
+        "SELECT to_regprocedure('public.vm_job_initial_ready_retention_candidate(uuid,uuid,uuid,uuid,uuid,uuid,boolean)') IS NOT NULL"
+    )
+
+
+def _initial_ready_wire(owner, identity, candidate, request_id, digest):
+    return {
+        "version": 1,
+        "kind": "vm_job_initial_ready_stop_candidate_v1",
+        "owner_kind": "job",
+        "job_id": str(owner),
+        "namespace": candidate["namespace"],
+        "cluster_id": candidate["cluster_id"],
+        "request_id": candidate["creation_request_id"],
+        "provision_generation": identity.provision_generation,
+        "reservation_id": candidate["reservation_id"],
+        "reservation_revision": candidate["reservation_revision"],
+        "vm_uid": identity.vm_uid,
+        "vmi_uid": candidate["vmi_uid"],
+        "launcher_uid": candidate["launcher_uid"],
+        "node_uid": candidate["node_uid"],
+        "pvc_uid": identity.rootdisk_pvc_uid,
+        "cleanup_request_id": str(request_id),
+        "cleanup_intent_digest": digest,
+    }
+
+
+async def initial_ready_retention_candidate(db, *, job_id, identity):
+    """Read the exact root candidate; release all locks before signed status I/O."""
+    owner, pvc = _uuid(job_id), _uuid(identity.rootdisk_pvc_uid)
+    async with db.acquire() as conn, conn.transaction():
+        if not await _initial_ready_installed(conn):
+            return None
+        for key in (f"workspace-recovery:job:{owner}", f"workspace-recovery-pvc:{pvc}"):
+            await conn.execute(
+                "SELECT pg_advisory_xact_lock(hashtextextended($1,0))", key
+            )
+        _, _, request_id, digest, _ = vm_cleanup_request_identity(
+            owner_kind="job",
+            owner_id=owner,
+            identity=identity,
+            source="job_terminal_vm_release",
+            purge_disk=False,
+        )
+        pinned = await conn.fetchval(
+            "SELECT execution_lane='pinned' AND "
+            "context->'_job_terminal_vm_cleanup'->>'retention_policy'='4' "
+            "FROM jobs WHERE id=$1",
+            owner,
+        )
+        candidate_function = (
+            "vm_job_pinned_ready_retention_candidate"
+            if pinned
+            else "vm_job_initial_ready_retention_candidate"
+        )
+        lookup_request_id = request_id
+        if pinned:
+            if not await conn.fetchval(
+                "SELECT to_regprocedure('public.vm_job_pinned_ready_retention_candidate"
+                "(uuid,uuid,uuid,uuid,uuid,uuid,boolean)') IS NOT NULL"
+            ):
+                return None
+            _, _, old_request, _, _ = vm_cleanup_request_identity(
+                owner_kind="job",
+                owner_id=owner,
+                identity=identity,
+                source="job_terminal_vm_release",
+                purge_disk=True,
+            )
+            lookup_request_id = old_request
+        old = await conn.fetchrow(
+            "SELECT id FROM vm_workspace_cleanup_admissions WHERE owner_kind='job' "
+            "AND owner_id=$1 AND request_id=$2 FOR UPDATE",
+            owner,
+            lookup_request_id,
+        )
+        candidate = _json(
+            await conn.fetchval(
+                f"SELECT public.{candidate_function}($1,$2,$3,$4,$5)",
+                owner,
+                _uuid(identity.provision_generation),
+                _uuid(identity.vm_uid),
+                pvc,
+                old["id"] if old else None,
+            )
+        )
+        if not isinstance(candidate, dict):
+            return None
+        if old is not None:
+            request_id = uuid5(
+                NAMESPACE_URL, f"vm-job-cancel-retain-v1:{old['id']}:{digest}"
+            )
+        return _initial_ready_wire(owner, identity, candidate, request_id, digest)
+
+
+async def read_current_initial_ready_preflight(
+    db, parent_cleanup, *, job_id, generation
+):
+    """Recognize immutable initial Ready custody before external stop I/O."""
+    from shared.vm_cancel_retention import valid_ready_retention_preflight
+
+    owner = _uuid(job_id)
+    async with db.acquire() as conn, conn.transaction():
+        if not await _initial_ready_installed(conn):
+            return False, None
+        await conn.execute(
+            "SELECT pg_advisory_xact_lock(hashtextextended($1,0))",
+            f"workspace-recovery:job:{owner}",
+        )
+        locator = await conn.fetchrow(
+            "SELECT a.pvc_uid FROM vm_job_cancel_retention_authorities a JOIN jobs j ON j.id=a.job_id "
+            "WHERE a.job_id=$1 AND a.policy_version IN (3,4) AND NOT j.context ? '_vm_job_retained_resume'",
+            owner,
+        )
+        if locator is None:
+            return False, None
+        await conn.execute(
+            "SELECT pg_advisory_xact_lock(hashtextextended($1,0))",
+            f"workspace-recovery-pvc:{locator['pvc_uid']}",
+        )
+        await conn.fetchrow(
+            "SELECT unit_id FROM run_queue WHERE unit_id=$1 FOR UPDATE", owner
+        )
+        await conn.fetchrow("SELECT id FROM jobs WHERE id=$1 FOR UPDATE", owner)
+        authority = await conn.fetchrow(
+            "SELECT a.*,c.completed_at,a.admitted_xact_id<>pg_current_xact_id() AS committed "
+            "FROM vm_job_cancel_retention_authorities a JOIN vm_workspace_cleanup_admissions c "
+            "ON c.id=a.cleanup_admission_id JOIN jobs j ON j.id=a.job_id "
+            "WHERE a.job_id=$1 AND a.policy_version IN (3,4) AND NOT j.context ? '_vm_job_retained_resume' "
+            "AND j.context->'vm'->>'provision_generation'=a.provision_generation::text "
+            "AND j.context->'vm'->>'vm_uid'=a.vm_uid::text "
+            "AND j.context->'vm'->>'rootdisk_pvc_uid'=a.pvc_uid::text",
+            owner,
+        )
+        if (
+            authority is None
+            or not authority["committed"]
+            or str(authority["provision_generation"]) != str(generation)
+        ):
+            raise ResourceAdmissionError("initial_ready_retention_changed")
+        if (
+            isinstance(parent_cleanup, dict)
+            and isinstance(parent_cleanup.get("intent"), dict)
+            and parent_cleanup["intent"].get("purge_disk") is True
+        ):
+            purge = await conn.fetchrow(
+                "SELECT * FROM vm_job_retained_disk_purge_authorities WHERE job_id=$1 "
+                "AND cleanup_admission_id::text=$2 AND provision_generation=$3 AND vm_uid=$4 AND pvc_uid=$5 "
+                "AND admitted_xact_id<>pg_current_xact_id()",
+                owner,
+                parent_cleanup.get("admission_id"),
+                authority["provision_generation"],
+                authority["vm_uid"],
+                authority["pvc_uid"],
+            )
+            if purge is None:
+                raise ResourceAdmissionError("initial_ready_purge_unproven")
+            intent = {
+                **_json(authority["retaining_intent"]),
+                "purge_disk": True,
+                "source": "public_vm_delete",
+            }
+            expected = bind_vm_cleanup_permit(
+                CleanupPermit(allowed=True, admission_id=purge["cleanup_admission_id"]),
+                request_id=purge["cleanup_request_id"],
+                intent=intent,
+            ).parent_cleanup
+            if parent_cleanup != expected or not await conn.fetchval(
+                "SELECT public.validate_vm_job_retained_disk_purge($1,false)",
+                purge["cleanup_admission_id"],
+            ):
+                raise ResourceAdmissionError("initial_ready_purge_changed")
+            return True, None
+        if authority["completed_at"] is not None:
+            raise ResourceAdmissionError("initial_ready_retention_completed")
+        proof = _json(authority["ready_retention_preflight"])
+        candidate = _json(
+            await conn.fetchval(
+                "SELECT public.vm_job_retained_ready_candidate(a) FROM vm_job_cancel_retention_authorities a WHERE cleanup_admission_id=$1",
+                authority["cleanup_admission_id"],
+            )
+        )
+        expected = bind_vm_cleanup_permit(
+            CleanupPermit(allowed=True, admission_id=authority["cleanup_admission_id"]),
+            request_id=authority["cleanup_request_id"],
+            intent=_json(authority["retaining_intent"]),
+        ).parent_cleanup
+        if (
+            not valid_ready_retention_preflight(proof, candidate)
+            or parent_cleanup != {**expected, "retention_preflight": proof}
+            or not await conn.fetchval(
+                "SELECT public.validate_vm_job_cancel_retention($1,false)",
+                authority["cleanup_admission_id"],
+            )
+        ):
+            raise ResourceAdmissionError("initial_ready_retention_changed")
+        return True, proof
+
+
+async def retention_for_admission_on_conn(conn, admission_id: UUID):
+    if not await _installed(conn):
+        return None
+    row = await conn.fetchrow(
+        "SELECT * FROM vm_job_cancel_retention_authorities "
+        "WHERE cleanup_admission_id=$1 OR superseded_admission_id=$1",
+        admission_id,
+    )
+    return dict(row) if row else None
+
+
+async def current_policy1_retention_parent(
+    db, parent_cleanup, *, job_id, generation, vm_uid, pvc_uid
+) -> Literal["other", "open", "settled"] | None:
+    """Select only the immutable never-Ready retaining parent for positive stop.
+
+    Other means this Job has no policy-1 authority. None means an existing
+    authority or supplied parent cannot be proven current. The stop store
+    rechecks open authority under locks before issuing any effect.
+    """
+    try:
+        owner = _uuid(job_id)
+        incarnation = _uuid(generation)
+        expected_vm = _uuid(vm_uid)
+        expected_pvc = _uuid(pvc_uid)
+        async with db.acquire() as conn:
+            if not await _installed(conn):
+                return None
+            row = await conn.fetchrow(
+                "SELECT a.*,c.completed_at FROM vm_job_cancel_retention_authorities a "
+                "JOIN vm_workspace_cleanup_admissions c ON c.id=a.cleanup_admission_id "
+                "WHERE a.job_id=$1 AND a.provision_generation=$2",
+                owner,
+                incarnation,
+            )
+            if row is None:
+                return (
+                    None
+                    if await conn.fetchval(
+                        "SELECT EXISTS(SELECT 1 FROM vm_job_cancel_retention_authorities "
+                        "WHERE job_id=$1)",
+                        owner,
+                    )
+                    else "other"
+                )
+            if row["policy_version"] != 1:
+                return "other"
+            # An outer transaction makes a newly admitted stop intent
+            # savepoint-local. Refuse policy-1 physical effects in that scope.
+            if conn.is_in_transaction():
+                return None
+            if not isinstance(parent_cleanup, Mapping):
+                return None
+            expected = bind_vm_cleanup_permit(
+                CleanupPermit(allowed=True, admission_id=row["cleanup_admission_id"]),
+                request_id=row["cleanup_request_id"],
+                intent=_json(row["retaining_intent"]),
+            ).parent_cleanup
+            if (
+                row["vm_uid"] != expected_vm
+                or row["pvc_uid"] != expected_pvc
+                or dict(parent_cleanup) != expected
+            ):
+                return None
+            if row["completed_at"] is not None:
+                return (
+                    "settled"
+                    if await conn.fetchval(
+                        "SELECT public.vm_job_cancel_retention_settled($1)",
+                        row["cleanup_admission_id"],
+                    )
+                    else None
+                )
+            return (
+                "open"
+                if await conn.fetchval(
+                    "SELECT public.validate_vm_job_cancel_retention($1,false)",
+                    row["cleanup_admission_id"],
+                )
+                else None
+            )
+    except Exception:
+        return None
+
+
+async def current_policy1_stop_authority(
+    db, parent_cleanup, *, job_id, generation, vm_uid, pvc_uid
+) -> dict | None:
+    """Read a committed, current policy-1 authority under its writer locks."""
+    from shared.vm_cancel_retention import (
+        valid_never_app_ready_retention_authority,
+    )
+
+    try:
+        owner, incarnation = _uuid(job_id), _uuid(generation)
+        expected_vm, expected_pvc = _uuid(vm_uid), _uuid(pvc_uid)
+        if not isinstance(parent_cleanup, Mapping):
+            return None
+        async with db.acquire() as conn:
+            # A released savepoint still belongs to its outer transaction.
+            if conn.is_in_transaction() or not await _installed(conn):
+                return None
+            async with conn.transaction():
+                await conn.execute(
+                    "SELECT pg_advisory_xact_lock(hashtextextended($1,0))",
+                    f"workspace-recovery:job:{owner}",
+                )
+                locator = await conn.fetchrow(
+                    "SELECT pvc_uid FROM vm_job_cancel_retention_authorities "
+                    "WHERE job_id=$1 AND provision_generation=$2 AND policy_version=1",
+                    owner,
+                    incarnation,
+                )
+                if locator is None or locator["pvc_uid"] != expected_pvc:
+                    return None
+                await conn.execute(
+                    "SELECT pg_advisory_xact_lock(hashtextextended($1,0))",
+                    f"workspace-recovery-pvc:{expected_pvc}",
+                )
+                await conn.fetchrow(
+                    "SELECT unit_id FROM run_queue WHERE unit_id=$1 FOR UPDATE", owner
+                )
+                job = await conn.fetchrow(
+                    "SELECT id,status,execution_lane,assigned_agent_id,context "
+                    "FROM jobs WHERE id=$1 FOR UPDATE",
+                    owner,
+                )
+                row = await conn.fetchrow(
+                    "SELECT a.*,c.completed_at FROM vm_job_cancel_retention_authorities a "
+                    "JOIN vm_workspace_cleanup_admissions c ON c.id=a.cleanup_admission_id "
+                    "WHERE a.job_id=$1 AND a.provision_generation=$2 "
+                    "AND a.policy_version=1 FOR UPDATE OF c",
+                    owner,
+                    incarnation,
+                )
+                if row is None or job is None or row["completed_at"] is not None:
+                    return None
+                context = _json(job["context"])
+                vm = context.get("vm") if isinstance(context, dict) else None
+                if (
+                    not isinstance(vm, dict)
+                    or vm.get("status") != "retiring_process_zero"
+                    or vm.get("provision_generation") != str(incarnation)
+                    or vm.get("vm_uid") != str(expected_vm)
+                    or vm.get("rootdisk_pvc_uid") != str(expected_pvc)
+                ):
+                    return None
+                await conn.fetchrow(
+                    "SELECT request_id FROM vm_creation_retries WHERE request_id=$1 FOR UPDATE",
+                    row["creation_request_id"],
+                )
+                await conn.fetchrow(
+                    "SELECT id FROM vm_resource_reservations WHERE id=$1 FOR UPDATE",
+                    row["reservation_id"],
+                )
+                if (
+                    row["vm_uid"] != expected_vm
+                    or row["pvc_uid"] != expected_pvc
+                    or row["admitted_xact_id"]
+                    == await conn.fetchval("SELECT pg_current_xact_id()")
+                ):
+                    return None
+                expected = bind_vm_cleanup_permit(
+                    CleanupPermit(
+                        allowed=True, admission_id=row["cleanup_admission_id"]
+                    ),
+                    request_id=row["cleanup_request_id"],
+                    intent=_json(row["retaining_intent"]),
+                ).parent_cleanup
+                if dict(parent_cleanup) != expected or not await conn.fetchval(
+                    "SELECT public.validate_vm_job_cancel_retention($1,false)",
+                    row["cleanup_admission_id"],
+                ):
+                    return None
+                result = {
+                    "version": 1,
+                    "kind": "vm_job_cancel_retention_held_stop_authority_v1",
+                    "policy_version": 1,
+                    "owner_kind": "job",
+                    "job_id": str(row["job_id"]),
+                    "provision_generation": str(row["provision_generation"]),
+                    "namespace": row["namespace"],
+                    "cluster_id": row["cluster_id"],
+                    "cleanup_admission_id": str(row["cleanup_admission_id"]),
+                    "cleanup_request_id": str(row["cleanup_request_id"]),
+                    "cleanup_intent_digest": row["intent_digest"],
+                    "creation_request_id": str(row["creation_request_id"]),
+                    "reservation_id": str(row["reservation_id"]),
+                    "reservation_revision": row["reservation_revision"],
+                    "vm_uid": str(row["vm_uid"]),
+                    "vmi_uid": str(row["vmi_uid"]),
+                    "launcher_uid": str(row["launcher_uid"]),
+                    "pvc_uid": str(row["pvc_uid"]),
+                    "node_uid": str(row["node_uid"]),
+                }
+                return (
+                    result
+                    if valid_never_app_ready_retention_authority(result)
+                    else None
+                )
+    except Exception:
+        return None
+
+
+@dataclass(frozen=True)
+class JobRetainedPurgeBootstrap:
+    """Private transaction-only proposal; never physical effect authority."""
+
+    job_id: UUID
+    pvc_uid: UUID
+    final_request_id: UUID
+    provision_generation: UUID
+    cleanup_request_id: UUID
+    intent_digest: str
+    retention_admission_ids: frozenset[UUID]
+
+
+async def guard_retention_cleanup_on_conn(
+    conn,
+    *,
+    owner_kind: str,
+    owner_id: UUID,
+    pvc_uid: UUID | None,
+    source: str,
+    request_id: UUID,
+    intent_digest: str,
+    parent_admission_id: UUID | None,
+    bootstrap=None,
+) -> None:
+    """Called under owner/PVC locks before replay, creation, or resumed effect."""
+
+    if not await _installed(conn):
+        return
+    if await conn.fetchval(
+        "SELECT public.vm_job_cancel_retention_cleanup_allowed($1,$2,$3,$4,$5,$6,$7,false)",
+        owner_kind,
+        owner_id,
+        pvc_uid,
+        source,
+        request_id,
+        intent_digest,
+        parent_admission_id,
+    ):
+        return
+    # Only the dedicated service constructs this after locked exact reads.
+    # The deferred SQL constraint independently requires its complete chain.
+    if (
+        type(bootstrap) is JobRetainedPurgeBootstrap
+        and owner_kind == "job"
+        and parent_admission_id is None
+        and source == "public_vm_delete"
+        and bootstrap.job_id == owner_id
+        and bootstrap.pvc_uid == pvc_uid
+        and bootstrap.cleanup_request_id == request_id
+        and bootstrap.intent_digest == intent_digest
+    ):
+        rows = await conn.fetch(
+            "SELECT cleanup_admission_id,job_id,pvc_uid FROM vm_job_cancel_retention_authorities "
+            "WHERE (job_id=$1 OR pvc_uid=$2) AND NOT "
+            "public.vm_job_cancel_retention_discharged(cleanup_admission_id)",
+            owner_id,
+            pvc_uid,
+        )
+        if (
+            rows
+            and {r["cleanup_admission_id"] for r in rows}
+            == bootstrap.retention_admission_ids
+            and all(r["job_id"] == owner_id and r["pvc_uid"] == pvc_uid for r in rows)
+            and (
+                await conn.fetchval(
+                    "SELECT EXISTS(SELECT 1 FROM vm_creation_retries WHERE request_id=$1 "
+                    "AND owner_kind='job' AND job_id=$2 AND provision_generation=$3 "
+                    "AND observed_pvc_uid=$4 AND state='succeeded')",
+                    bootstrap.final_request_id,
+                    owner_id,
+                    bootstrap.provision_generation,
+                    pvc_uid,
+                )
+                or (
+                    await conn.fetchval(
+                        "SELECT to_regprocedure("
+                        "'public.vm_cancel_late_adopted_retained_terminal(uuid)') IS NOT NULL"
+                    )
+                    and await conn.fetchval(
+                        "SELECT EXISTS(SELECT 1 FROM vm_job_cancel_retention_authorities a "
+                        "WHERE a.job_id=$1 AND a.pvc_uid=$2 "
+                        "AND a.creation_request_id=$3 AND a.provision_generation=$4 "
+                        "AND public.vm_cancel_late_adopted_retained_terminal(a.cleanup_admission_id))",
+                        owner_id,
+                        pvc_uid,
+                        bootstrap.final_request_id,
+                        bootstrap.provision_generation,
+                    )
+                )
+            )
+        ):
+            return
+    raise ResourceAdmissionError("cancel_retention_disk_protected")
+
+
+async def retention_settlement_is_current_on_conn(
+    conn,
+    *,
+    job_id: UUID,
+    generation: UUID,
+    admission_id: UUID,
+) -> bool:
+    if not await _installed(conn):
+        return False
+    ready_scope = "r.ready_at IS NULL"
+    if await _initial_ready_installed(conn):
+        ready_scope = "((a.policy_version=1 AND r.ready_at IS NULL) OR (a.policy_version IN (3,4) AND r.ready_at IS NOT NULL AND r.job_retained_resume_id IS NULL))"
+    return bool(
+        await conn.fetchval(
+            "SELECT EXISTS(SELECT 1 FROM vm_job_cancel_retention_authorities a "
+            "JOIN jobs j ON j.id=a.job_id LEFT JOIN run_queue q ON q.unit_id=j.id "
+            "JOIN vm_creation_retries r ON r.request_id=a.creation_request_id "
+            "WHERE a.cleanup_admission_id=$1 AND a.job_id=$2 AND a.provision_generation=$3 "
+            "AND j.status='cancelled' AND ((a.policy_version=4 AND j.execution_lane='pinned') "
+            "OR (a.policy_version IN (1,3) AND j.execution_lane='stateless')) "
+            "AND j.parent_job_id IS NULL AND j.assigned_agent_id IS NULL "
+            "AND j.context->'vm'->>'provision_generation'=a.provision_generation::text "
+            "AND j.context->'vm'->>'vm_uid'=a.vm_uid::text "
+            "AND j.context->'vm'->>'rootdisk_pvc_uid'=a.pvc_uid::text "
+            "AND ((a.policy_version=4 AND (q.unit_id IS NULL OR "
+            "(q.state='done' AND q.leased_by IS NULL AND q.leased_until IS NULL))) "
+            "OR (a.policy_version IN (1,3) AND q.unit_kind='worker_batch' "
+            "AND q.state='done' AND q.leased_by IS NULL AND q.leased_until IS NULL)) "
+            f"AND {ready_scope} AND (r.state='succeeded' OR ("
+            "a.policy_version=1 AND r.state='settled' "
+            "AND r.reason='creation_adopted' AND r.resolved_at IS NOT NULL "
+            "AND r.claim_token IS NULL AND r.claim_expires_at IS NULL "
+            "AND r.observed_vm_uid=a.vm_uid AND r.observed_pvc_uid=a.pvc_uid "
+            "AND j.context->'vm'->>'creation_request_id'=r.request_id::text "
+            "AND j.context->'vm'->>'status'='deleted' "
+            "AND (j.context->>'_vm_creation_pending'=r.request_id::text OR ("
+            "NOT j.context ? '_vm_creation_pending' "
+            "AND NOT j.context ? '_stateless_cancel_cleanup_pending' "
+            "AND j.context->'vm'->'compute_released'='true'::jsonb)) "
+            "AND NOT EXISTS(SELECT 1 FROM vm_creation_effects e "
+            "WHERE e.request_id=r.request_id AND e.state='issued'))) "
+            "AND NOT EXISTS(SELECT 1 FROM vm_creation_retries later WHERE later.owner_kind='job' "
+            "AND later.job_id=a.job_id AND (later.created_at,later.request_id)>(r.created_at,r.request_id))) "
+            "AND public.vm_job_cancel_retention_settled($1)",
+            admission_id,
+            job_id,
+            generation,
+        )
+    )
+
+
+async def _ready_purge_replay_on_conn(
+    conn, store, *, owner, identity, generation, vm_uid, pvc
+):
+    """Classify an already-admitted Ready purge; grant no new cleanup authority."""
+    _, _, request_id, digest, _ = vm_cleanup_request_identity(
+        owner_kind="job",
+        owner_id=owner,
+        identity=identity,
+        source="job_terminal_vm_release",
+        purge_disk=True,
+    )
+    parent = await conn.fetchrow(
+        "SELECT * FROM vm_workspace_cleanup_admissions WHERE owner_kind='job' "
+        "AND owner_id=$1 AND request_id=$2 AND pvc_uid=$3 "
+        "AND source='job_terminal_vm_release' AND intent_digest=$4 "
+        "AND parent_admission_id IS NULL AND completed_at IS NULL AND outcome IS NULL "
+        "FOR UPDATE",
+        owner,
+        request_id,
+        pvc,
+        digest,
+    )
+    if parent is None:
+        return False
+    from orchestrator.services.vm_creation_retry_store import (
+        VMCreationRetryConflict,
+        VMCreationRetryStore,
+    )
+
+    try:
+        job = await VMCreationRetryStore(store.db)._scope(
+            conn, owner, pvc, own_admission=parent["id"], hold_queue=False
+        )
+    except VMCreationRetryConflict:
+        return False
+    # Re-read after all owner/PVC/parent/queue/Job lock waits. Projection alone
+    # cannot establish Ready history, and a later Ready observation is drift.
+    context = _json(job["context"])
+    vm = context.get("vm") if isinstance(context, dict) else None
+    if (
+        job["status"] != "cancelled"
+        or job["execution_lane"] != "stateless"
+        or job["parent_job_id"] is not None
+        or job["assigned_agent_id"] is not None
+        or not isinstance(vm, dict)
+        or vm.get("status") not in {"retiring_process_zero", "deleting", "deleted"}
+        or vm.get("workspace_storage") is not None
+        or context.get("_vm_job_retained_resume") is not None
+        or context.get("_vm_creation_pending") is not None
+        or context.get("_stateless_cancel_cleanup_pending") is not True
+        or vm.get("identity_authenticated") is not True
+        or vm.get("identity_provision_generation") != str(generation)
+        or vm.get("provision_generation") != str(generation)
+        or vm.get("vm_uid") != str(vm_uid)
+        or vm.get("rootdisk_pvc_uid") != str(pvc)
+    ):
+        return False
+    retry = await conn.fetchrow(
+        "SELECT * FROM vm_creation_retries WHERE owner_kind='job' AND job_id=$1 "
+        "AND request_id::text=$2 FOR SHARE",
+        owner,
+        vm.get("creation_request_id"),
+    )
+    if (
+        retry is None
+        or retry["state"] != "succeeded"
+        or retry["reason"] != "creation_adopted"
+        or retry["provision_generation"] != generation
+        or retry["observed_vm_uid"] != vm_uid
+        or retry["observed_pvc_uid"] != pvc
+        or retry["ready_at"] is None
+        or retry["ready_at"] >= parent["admitted_at"]
+    ):
+        return False
+    return bool(
+        await conn.fetchval(
+            "SELECT EXISTS(SELECT 1 FROM run_queue WHERE unit_kind='worker_batch' "
+            "AND unit_id=$1 AND state='done' AND leased_by IS NULL AND leased_until IS NULL) "
+            "AND NOT EXISTS(SELECT 1 FROM vm_creation_retries WHERE owner_kind='job' "
+            "AND job_id=$1 AND (created_at,request_id)>($2,$3)) "
+            "AND NOT EXISTS(SELECT 1 FROM vm_job_cancel_retention_authorities "
+            "WHERE job_id=$1 OR pvc_uid=$4)",
+            owner,
+            retry["created_at"],
+            retry["request_id"],
+            pvc,
+        )
+    )
+
+
+async def _bind_cancelled_boot_occupancy(conn, store, *, job, identity):
+    """Account for a guest that booted after Cancel stopped phase polling.
+
+    The caller holds the normal owner/PVC/queue/Job locks. Only the signed,
+    current inventory can supply the missing VMI/launcher, through the same
+    exact reservation binding used before Ready. This grants neither Ready
+    nor cleanup: the complete retention predicate still runs afterwards.
+    """
+    from orchestrator.services.vm_resource_job_runtime import (
+        installed_job_resource_store,
+    )
+    from shared.vm_resource_inventory import InventoryError
+
+    context = _json(job["context"])
+    vm = context.get("vm") if isinstance(context, dict) else None
+    if (
+        job["status"] != "cancelled"
+        or job["execution_lane"] != "stateless"
+        or job["parent_job_id"] is not None
+        or job["assigned_agent_id"] is not None
+        or not isinstance(vm, dict)
+        or context.get("_stateless_cancel_cleanup_pending") is not True
+        or context.get("_vm_job_retained_resume") is not None
+        or vm.get("status")
+        not in {
+            "created",
+            "ssh_pending",
+            "ssh_unreachable",
+            "waiting_creation_configuration",
+        }
+        or vm.get("ssh_verified_at") is not None
+        or vm.get("active_pod_uid") is not None
+        or vm.get("workspace_storage") is not None
+        or vm.get("identity_authenticated") is not True
+        or vm.get("identity_provision_generation") != identity.provision_generation
+        or vm.get("provision_generation") != identity.provision_generation
+        or vm.get("vm_uid") != identity.vm_uid
+        or vm.get("rootdisk_pvc_uid") != identity.rootdisk_pvc_uid
+    ):
+        return
+    retry = await conn.fetchrow(
+        "SELECT * FROM vm_creation_retries WHERE owner_kind='job' AND job_id=$1 "
+        "ORDER BY created_at DESC,request_id DESC LIMIT 1 FOR UPDATE",
+        job["id"],
+    )
+    if (
+        retry is None
+        or str(retry["request_id"]) != vm.get("creation_request_id")
+        or str(retry["request_id"]) != context.get("_vm_creation_pending")
+        or retry["state"] not in {"succeeded", "settled"}
+        or retry["reason"] != "creation_adopted"
+        or retry["ready_at"] is not None
+        or retry["claim_token"] is not None
+        or retry["claim_expires_at"] is not None
+        or str(retry["provision_generation"]) != identity.provision_generation
+        or str(retry["observed_vm_uid"]) != identity.vm_uid
+        or str(retry["observed_pvc_uid"]) != identity.rootdisk_pvc_uid
+        or _json(retry["canonical_request"]).get("workspace_storage") is not None
+        or not await conn.fetchval(
+            "SELECT EXISTS(SELECT 1 FROM run_queue WHERE unit_kind='worker_batch' "
+            "AND unit_id=$1 AND state='done' AND leased_by IS NULL AND leased_until IS NULL)",
+            job["id"],
+        )
+    ):
+        return
+    late_adopted = retry["state"] == "settled"
+    if late_adopted and (
+        vm.get("status") != "waiting_creation_configuration"
+        or not await conn.fetchval(
+            "SELECT public.vm_cancel_late_adopted_source($1,$2,$3,$4,$5)",
+            job["id"],
+            retry["provision_generation"],
+            retry["observed_vm_uid"],
+            retry["observed_pvc_uid"],
+            retry["request_id"],
+        )
+    ):
+        return
+    if not late_adopted and vm.get("status") == "waiting_creation_configuration":
+        return
+    try:
+        resource = await installed_job_resource_store(
+            conn, store.db, retry["controller_configuration"], fresh=False
+        )
+        if resource is None:
+            return
+        await resource._lock_policy(conn, allow_off=True)
+        head = await conn.fetchrow(
+            "SELECT s.document,s.digest FROM vm_resource_inventory_heads h "
+            "JOIN vm_resource_inventory_snapshots s ON s.snapshot_id=h.current_snapshot_id "
+            "WHERE h.cluster_id=$1 AND h.policy_digest=$2 AND NOT h.observation_conflict FOR UPDATE OF h",
+            resource.inventory.cluster_id,
+            resource.inventory.policy_digest,
+        )
+        if head is None:
+            return
+        snapshot = resource.inventory._snapshot(_json(head["document"]), head["digest"])
+        candidates = [
+            vmi for vmi in snapshot["vmis"] if vmi["vm_uid"] == identity.vm_uid
+        ]
+        if len(candidates) != 1 or vm.get("vmi_uid") not in (
+            None,
+            candidates[0]["uid"],
+        ):
+            return
+        # Match the binder's waiter-before-reservation lock order.
+        await conn.fetchrow(
+            "SELECT request_id FROM vm_resource_waiters WHERE request_id=$1 FOR UPDATE",
+            retry["request_id"],
+        )
+        charge = await conn.fetchrow(
+            "SELECT state,vm_uid,vmi_uid,launcher_uid FROM vm_resource_reservations "
+            "WHERE request_id=$1 FOR UPDATE",
+            retry["request_id"],
+        )
+        if charge is None or dict(charge) != {
+            "state": "reserved",
+            "vm_uid": None,
+            "vmi_uid": None,
+            "launcher_uid": None,
+        }:
+            return
+        # Rechecks complete/fresh inventory, source/configuration, singular
+        # launcher, node, owner/generation, and immutable reservation identities.
+        vmi_uid = candidates[0]["uid"]
+        if not await resource.bind_observed_runtime_on_conn(
+            conn,
+            retry=retry,
+            vm={**vm, "vmi_uid": vmi_uid},
+            job_id=str(job["id"]),
+            generation=identity.provision_generation,
+            cancel_late_adopted=late_adopted,
+        ):
+            return
+        await conn.execute(
+            "UPDATE jobs SET context=jsonb_set(context,'{vm,vmi_uid}',to_jsonb($2::text)),"
+            "updated_at=clock_timestamp() WHERE id=$1",
+            job["id"],
+            vmi_uid,
+        )
+    except (ResourceAdmissionError, InventoryError):
+        return
+
+
+async def acquire_cancel_retention(
+    store, *, job_id: str, identity, retention_preflight=None
+):
+    """None is reserved for clearly unrelated work, never a recognized refusal."""
+
+    from orchestrator.services.vm_job_retained_resume import (
+        acquire_retained_resume_cleanup,
+    )
+
+    try:
+        owner = _uuid(job_id)
+    except (TypeError, ValueError, AttributeError):
+        return CleanupPermit(allowed=False, reason="cancel_retention_identity_unproven")
+    continuation = await acquire_retained_resume_cleanup(
+        store,
+        job_id=job_id,
+        identity=identity,
+        retention_preflight=retention_preflight,
+    )
+    if continuation is not None:
+        return continuation
+    async with store.db.acquire() as conn, conn.transaction():
+        await conn.execute(
+            "SELECT pg_advisory_xact_lock(hashtextextended($1,0))",
+            f"workspace-recovery:job:{owner}",
+        )
+        prior = None
+        if await _installed(conn):
+            prior = await conn.fetchrow(
+                "SELECT a.*,c.completed_at,c.outcome FROM vm_job_cancel_retention_authorities a "
+                "JOIN vm_workspace_cleanup_admissions c ON c.id=a.cleanup_admission_id "
+                "WHERE a.job_id=$1 ORDER BY a.admitted_at DESC LIMIT 1",
+                owner,
+            )
+        job = await conn.fetchrow("SELECT * FROM jobs WHERE id=$1", owner)
+        context = _json(job["context"]) if job else None
+        vm = context.get("vm") if isinstance(context, dict) else None
+        marker = (
+            context.get("_job_terminal_vm_cleanup")
+            if isinstance(context, dict)
+            else None
+        )
+        pinned_ready = bool(
+            job is not None
+            and job["execution_lane"] == "pinned"
+            and isinstance(marker, dict)
+            and marker.get("retention_policy") == 4
+        )
+        if prior is None and (
+            job is None
+            or job["status"] != "cancelled"
+            or (job["execution_lane"] != "stateless" and not pinned_ready)
+            or not isinstance(vm, dict)
+        ):
+            return None
+        try:
+            generation = _uuid(identity.provision_generation)
+            vm_uid = _uuid(identity.vm_uid)
+            pvc = _uuid(identity.rootdisk_pvc_uid)
+        except (TypeError, ValueError, AttributeError):
+            return CleanupPermit(
+                allowed=False, reason="cancel_retention_identity_unproven"
+            )
+        await conn.execute(
+            "SELECT pg_advisory_xact_lock(hashtextextended($1,0))",
+            f"workspace-recovery-pvc:{pvc}",
+        )
+        ready_root = bool(
+            await conn.fetchval(
+                "SELECT EXISTS(SELECT 1 FROM vm_creation_retries WHERE owner_kind='job' "
+                "AND job_id=$1 AND provision_generation=$2 AND observed_vm_uid=$3 "
+                "AND observed_pvc_uid=$4 AND ready_at IS NOT NULL)",
+                owner,
+                generation,
+                vm_uid,
+                pvc,
+            )
+        )
+        if (
+            prior is None
+            and not pinned_ready
+            and await _installed(conn)
+            and await _ready_purge_replay_on_conn(
+                conn,
+                store,
+                owner=owner,
+                identity=identity,
+                generation=generation,
+                vm_uid=vm_uid,
+                pvc=pvc,
+            )
+        ):
+            # Ordinary cleanup changes the Ready projection while its original
+            # True parent is still open. Resume that parent through the existing
+            # stop, process-zero, signed attestation and charge-release checks.
+            return None
+        if prior is not None:
+            if (
+                prior["provision_generation"] != generation
+                or prior["vm_uid"] != vm_uid
+                or prior["pvc_uid"] != pvc
+            ):
+                return CleanupPermit(
+                    allowed=False, reason="cancel_retention_identity_changed"
+                )
+            # Existing immutable authority wins even when flag text is invalid.
+            if prior["completed_at"] is not None:
+                valid = await retention_settlement_is_current_on_conn(
+                    conn,
+                    job_id=owner,
+                    generation=generation,
+                    admission_id=prior["cleanup_admission_id"],
+                )
+            else:
+                valid = await conn.fetchval(
+                    "SELECT public.validate_vm_job_cancel_retention($1,false)",
+                    prior["cleanup_admission_id"],
+                )
+            if not valid:
+                return CleanupPermit(
+                    allowed=False, reason="cancel_retention_authority_changed"
+                )
+            permit = bind_vm_cleanup_permit(
+                CleanupPermit(
+                    allowed=True,
+                    admission_id=prior["cleanup_admission_id"],
+                    completed_outcome=prior["outcome"],
+                ),
+                request_id=prior["cleanup_request_id"],
+                intent=_json(prior["retaining_intent"]),
+            )
+            if prior["policy_version"] in (3, 4):
+                permit = replace(
+                    permit,
+                    parent_cleanup={
+                        **permit.parent_cleanup,
+                        "retention_preflight": _json(
+                            prior["ready_retention_preflight"]
+                        ),
+                    },
+                )
+            return permit
+        if not cancel_retention_admission_enabled():
+            return CleanupPermit(allowed=False, reason="cancel_retention_not_activated")
+        if not await _installed(conn):
+            return CleanupPermit(
+                allowed=False, reason="cancel_retention_schema_unavailable"
+            )
+        if ready_root and not await _initial_ready_installed(conn):
+            return CleanupPermit(
+                allowed=False, reason="cancel_retention_schema_unavailable"
+            )
+        if pinned_ready and not await conn.fetchval(
+            "SELECT to_regprocedure('public.vm_job_pinned_ready_retention_candidate"
+            "(uuid,uuid,uuid,uuid,uuid,uuid,boolean)') IS NOT NULL"
+        ):
+            return CleanupPermit(
+                allowed=False, reason="cancel_retention_schema_unavailable"
+            )
+        _, _, old_request, old_digest, _ = vm_cleanup_request_identity(
+            owner_kind="job",
+            owner_id=owner,
+            identity=identity,
+            source="job_terminal_vm_release",
+            purge_disk=True,
+        )
+        _, _, request_id, digest, intent = vm_cleanup_request_identity(
+            owner_kind="job",
+            owner_id=owner,
+            identity=identity,
+            source="job_terminal_vm_release",
+            purge_disk=False,
+        )
+        old = await conn.fetchrow(
+            "SELECT * FROM vm_workspace_cleanup_admissions "
+            "WHERE owner_kind='job' AND owner_id=$1 AND request_id=$2 FOR UPDATE",
+            owner,
+            old_request,
+        )
+        if old is not None and (
+            old["source"] != "job_terminal_vm_release"
+            or old["pvc_uid"] != pvc
+            or old["intent_digest"] != old_digest
+            or old["completed_at"] is not None
+            or old["parent_admission_id"] is not None
+        ):
+            return CleanupPermit(
+                allowed=False, reason="cancel_retention_old_parent_changed"
+            )
+        from orchestrator.services.vm_creation_retry_store import (
+            VMCreationRetryConflict,
+            VMCreationRetryStore,
+        )
+
+        try:
+            job = await VMCreationRetryStore(store.db)._scope(
+                conn,
+                owner,
+                pvc,
+                own_admission=old["id"] if old else None,
+                hold_queue=False,
+            )
+        except VMCreationRetryConflict as exc:
+            return CleanupPermit(allowed=False, reason=str(exc))
+        if not ready_root:
+            await _bind_cancelled_boot_occupancy(
+                conn, store, job=job, identity=identity
+            )
+        candidate_function = (
+            "vm_job_pinned_ready_retention_candidate"
+            if pinned_ready
+            else "vm_job_initial_ready_retention_candidate"
+            if ready_root
+            else "vm_job_cancel_retention_candidate"
+        )
+        candidate = await conn.fetchval(
+            f"SELECT public.{candidate_function}($1,$2,$3,$4,$5)",
+            owner,
+            generation,
+            vm_uid,
+            pvc,
+            old["id"] if old else None,
+        )
+        candidate = _json(candidate)
+        if not isinstance(candidate, dict):
+            return CleanupPermit(
+                allowed=False, reason="cancel_retention_scope_unproven"
+            )
+        if old is not None:
+            request_id = uuid5(
+                NAMESPACE_URL, f"vm-job-cancel-retain-v1:{old['id']}:{digest}"
+            )
+        if ready_root:
+            from shared.vm_cancel_retention import valid_ready_retention_preflight
+
+            frozen = _initial_ready_wire(owner, identity, candidate, request_id, digest)
+            if not valid_ready_retention_preflight(retention_preflight, frozen):
+                return CleanupPermit(
+                    allowed=False, reason="initial_ready_retention_unproven"
+                )
+        if old is not None:
+            request_id = uuid5(
+                NAMESPACE_URL,
+                f"vm-job-cancel-retain-v1:{old['id']}:{digest}",
+            )
+            await conn.execute(
+                "UPDATE vm_workspace_cleanup_admissions SET "
+                "completed_at=clock_timestamp(),outcome='superseded_by_retention' WHERE id=$1",
+                old["id"],
+            )
+        permit = await store.acquire_cleanup_permit_on_conn(
+            conn,
+            owner_kind="job",
+            owner_id=owner,
+            pvc_uid=pvc,
+            request_id=request_id,
+            source="job_terminal_vm_release",
+            intent_digest=digest,
+        )
+        if not permit.allowed:
+            # Never commit a superseded old parent without its successor.
+            raise ResourceAdmissionError("cancel_retention_successor_refused")
+        permit = bind_vm_cleanup_permit(permit, request_id=request_id, intent=intent)
+        await conn.execute(
+            "INSERT INTO vm_job_cancel_retention_authorities "
+            "(cleanup_admission_id,superseded_admission_id,job_id,creation_request_id,"
+            "provision_generation,reservation_id,reservation_revision,vm_uid,vmi_uid,"
+            "launcher_uid,pvc_uid,node_uid,namespace,cluster_id,cleanup_request_id,"
+            "intent_digest,retaining_intent,superseded_request_id,superseded_intent_digest,policy_version,ready_retention_preflight) "
+            "VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17::jsonb,$18,$19,$20,$21::jsonb)",
+            permit.admission_id,
+            old["id"] if old else None,
+            owner,
+            UUID(candidate["creation_request_id"]),
+            generation,
+            UUID(candidate["reservation_id"]),
+            candidate["reservation_revision"],
+            vm_uid,
+            UUID(candidate["vmi_uid"]),
+            UUID(candidate["launcher_uid"]),
+            pvc,
+            UUID(candidate["node_uid"]),
+            candidate["namespace"],
+            candidate["cluster_id"],
+            request_id,
+            digest,
+            json.dumps(intent),
+            old["request_id"] if old else None,
+            old["intent_digest"] if old else None,
+            4 if pinned_ready else 3 if ready_root else 1,
+            json.dumps(retention_preflight) if ready_root else None,
+        )
+        if old is not None:
+            await conn.execute(
+                "UPDATE jobs SET context=jsonb_set(context,"
+                "'{_job_terminal_vm_cleanup,admission_id}',to_jsonb($3::text)) "
+                "WHERE id=$1 AND context->'_job_terminal_vm_cleanup'->>'admission_id'=$2",
+                owner,
+                str(old["id"]),
+                str(permit.admission_id),
+            )
+        if ready_root:
+            permit = replace(
+                permit,
+                parent_cleanup={
+                    **permit.parent_cleanup,
+                    "retention_preflight": retention_preflight,
+                },
+            )
+        await prepare_vm_cleanup_resource(store, permit, _conn=conn)
+        return permit
+
+
+async def complete_cancel_retention_marker(db, job_id: str):
+    """None means legacy cleanup; a retaining owner needs its full settled proof."""
+    owner = _uuid(job_id)
+    async with db.acquire() as conn, conn.transaction():
+        if not await _installed(conn):
+            return None
+        await conn.execute(
+            "SELECT pg_advisory_xact_lock(hashtextextended($1,0))",
+            f"workspace-recovery:job:{owner}",
+        )
+        authority = await conn.fetchrow(
+            "SELECT * FROM vm_job_cancel_retention_authorities WHERE job_id=$1 ORDER BY admitted_at DESC LIMIT 1",
+            owner,
+        )
+        if authority is None:
+            return None
+        await conn.execute(
+            "SELECT pg_advisory_xact_lock(hashtextextended($1,0))",
+            f"workspace-recovery-pvc:{authority['pvc_uid']}",
+        )
+        await conn.fetchrow(
+            "SELECT id FROM vm_workspace_cleanup_admissions WHERE id=$1 FOR SHARE",
+            authority["cleanup_admission_id"],
+        )
+        await conn.fetchrow(
+            "SELECT unit_id FROM run_queue WHERE unit_id=$1 FOR UPDATE", owner
+        )
+        job = await conn.fetchrow("SELECT id FROM jobs WHERE id=$1 FOR UPDATE", owner)
+        if job is None:
+            return True
+        if not await retention_settlement_is_current_on_conn(
+            conn,
+            job_id=owner,
+            generation=authority["provision_generation"],
+            admission_id=authority["cleanup_admission_id"],
+        ):
+            return False
+        disk_kept = not await conn.fetchval(
+            "SELECT public.vm_job_cancel_retention_discharged($1)",
+            authority["cleanup_admission_id"],
+        )
+        await conn.execute(
+            "UPDATE jobs SET context=jsonb_set(context-'_stateless_cancel_cleanup_pending'"
+            "-(CASE WHEN $3::boolean THEN '_vm_creation_pending' "
+            "ELSE '_stateless_cancel_cleanup_pending' END),'{vm}',"
+            "(context->'vm')||$2::jsonb),updated_at=clock_timestamp() WHERE id=$1",
+            owner,
+            json.dumps(
+                {"status": "deleted", "compute_released": True, "disk_kept": disk_kept}
+            ),
+            bool(
+                await conn.fetchval(
+                    "SELECT EXISTS(SELECT 1 FROM vm_creation_retries r JOIN jobs j ON j.id=r.job_id "
+                    "WHERE r.request_id=$1 AND r.state='settled' AND r.reason='creation_adopted' "
+                    "AND j.context->>'_vm_creation_pending'=r.request_id::text "
+                    "AND j.context->'vm'->>'creation_request_id'=r.request_id::text)",
+                    authority["creation_request_id"],
+                )
+            ),
+        )
+        return True

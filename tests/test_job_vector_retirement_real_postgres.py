@@ -22,6 +22,14 @@ from testcontainers.postgres import PostgresContainer
 from orchestrator.database.migrate import run_migrations
 from orchestrator.database.postgres import PostgresDB
 from orchestrator.routers import job_lifecycle as job_lifecycle_routes
+from orchestrator.application import controls as controls_composition
+from orchestrator.security import access as access_module
+from orchestrator.services import (
+    job_freeze_notifications as job_freeze_notifications_module,
+)
+from orchestrator.services import snapshot_service as snapshot_service_module
+from orchestrator.services import thread_retirement as thread_retirement_module
+import functools
 
 
 MIGRATIONS = (
@@ -81,23 +89,25 @@ async def client(stores, monkeypatch):
             raise HTTPException(status_code=404)
         return {"id": str(uuid4()), "is_admin": True}, job
 
-    monkeypatch.setattr(main, "postgres_db", app_db)
-    monkeypatch.setattr(main, "vector_db", vector_db)
-    monkeypatch.setattr(main, "require_job_access", access)
+    monkeypatch.setattr(main.app.state.resources, "postgres_db", app_db)
+    monkeypatch.setattr(main.app.state.resources, "vector_db", vector_db)
+    monkeypatch.setattr(access_module, "require_job_access", access)
     monkeypatch.setattr(
-        main.thread_retirement_operations.ThreadRetirementOperations,
+        thread_retirement_module.ThreadRetirementOperations,
         "archive_and_cleanup_workspace",
         AsyncMock(),
     )
     monkeypatch.setattr(
-        main.job_freeze_notification_service,
+        job_freeze_notifications_module,
         "resolve_job_notifications",
         AsyncMock(),
     )
-    monkeypatch.setattr(main, "snapshot_service", SimpleNamespace(is_available=False))
+    monkeypatch.setattr(
+        snapshot_service_module, "snapshot_service", SimpleNamespace(is_available=False)
+    )
     app = FastAPI()
-    app.state.job_control_route_dependencies_factory = (
-        main._job_mutation_route_dependencies
+    app.state.job_control_route_dependencies_factory = functools.partial(
+        controls_composition.job_mutation_route_dependencies, main.app.state.resources
     )
     app.add_api_route(
         "/api/jobs/{job_id}", job_lifecycle_routes.delete_job, methods=["DELETE"]

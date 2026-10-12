@@ -178,13 +178,17 @@ async def test_unchanged_lease_recovery_circuit_is_atomic_and_project_scoped():
                 foreign_thread_id,
                 vacant_project_id,
             )
+            # Agent 1 holds the expired leases. The redispatch claimants are
+            # free 'ready' agents: the pinned claim CAS serializes on the agent
+            # row and refuses a busy one, so agent 4's refused claim below
+            # proves the trip marker rather than agent availability.
             agent_ids = await conn.fetch(
                 """
                 INSERT INTO agents (config_name, hostname, status)
                 VALUES ('defaults', 'lease-agent-1', 'working'),
-                       ('defaults', 'lease-agent-2', 'working'),
-                       ('defaults', 'lease-agent-3', 'working'),
-                       ('defaults', 'lease-agent-4', 'working')
+                       ('defaults', 'lease-agent-2', 'ready'),
+                       ('defaults', 'lease-agent-3', 'ready'),
+                       ('defaults', 'lease-agent-4', 'ready')
                 RETURNING id
                 """
             )

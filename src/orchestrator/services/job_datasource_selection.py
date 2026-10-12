@@ -36,6 +36,10 @@ from uuid import UUID
 
 from fastapi import HTTPException
 
+from orchestrator.services.datasource_policy import (
+    execution_kind_refuses,
+    workspace_tier_refuses,
+)
 from shared.backend_kinds import LITE_BACKENDS
 
 
@@ -81,20 +85,26 @@ class JobDatasourceSelectionDependencies:
     revalidate_selection: Callable[
         [dict[str, Any]], Awaitable[tuple[list[str], dict[str, int]]]
     ]
+    #: Reads each authorized row's credentials from its Connector's resource
+    #: secret, in place (``connector_secrets.read_connector_credentials``);
+    #: ``None`` delivers the row's own.
+    connector_credentials: Callable[..., Awaitable[None]] | None = None
 
 
-def repository_datasource_names(datasources: Any) -> list[str]:
-    """Names of repository and credential sources requiring a shell workspace.
+def shell_connector_names(datasources: Any, workspace_backend: str | None) -> list[str]:
+    """Names of the connectors ``workspace_backend`` cannot serve.
 
-    Repositories need a clone target and credentials need a command environment;
-    the lite tiers provide neither (§4/§7).
+    Repositories need a clone target, and credential and generic
+    environments, SSH keys and credential files need a shell; the lite tiers
+    provide neither (§4/§7). The rule
+    is the drivers' ``supported_backends`` (``workspace_tier_refuses``).
     Returns a (possibly empty) list of human-readable names for the error.
     """
     names: list[str] = []
     for ds in datasources or []:
         if not isinstance(ds, dict):
             continue
-        if (ds.get("type") or "").lower() in {"repository", "credentials"}:
+        if workspace_tier_refuses(ds, workspace_backend):
             names.append(str(ds.get("name") or ds.get("id") or "?"))
     return names
 
@@ -147,7 +157,7 @@ async def filter_implicit_lite_datasource_ids(
 
     Explicit selections fail loudly in the central policy service. Inherited
     and automatic choices are creation-time seeds, so lite tiers keep the
-    usable connectors while omitting repositories and credential environments.
+    usable connectors while omitting the ones their drivers say need a shell.
     Missing IDs remain in the list and therefore still fail closed when the
     complete set is authorized.
     """
@@ -155,11 +165,33 @@ async def filter_implicit_lite_datasource_ids(
         return datasource_ids
     rows = await dependencies.store.get_datasource_policy_rows(datasource_ids)
     repositories = {
-        str(row["id"])
-        for row in rows
-        if str(row.get("type") or "").lower() in {"repository", "credentials"}
+        str(row["id"]) for row in rows if workspace_tier_refuses(row, workspace_backend)
     }
     return [value for value in datasource_ids if str(value) not in repositories]
+
+
+async def filter_execution_kind_datasource_ids(
+    datasource_ids: list[str],
+    execution_kind: str,
+    *,
+    dependencies: JobDatasourceSelectionDependencies,
+) -> list[str]:
+    """Drop the connectors ``execution_kind`` cannot attach from an implicit
+    selection (``execution_kind_refuses``).
+
+    A job that inherits its session's selection inherits the session's cloud
+    folder, which mounts into sessions only; the job keeps the rest, as a
+    lite tier keeps what it can serve. An explicit selection is refused
+    instead, in the central policy service. Missing IDs remain, and still
+    fail closed when the complete set is authorized.
+    """
+    if not datasource_ids:
+        return datasource_ids
+    rows = await dependencies.store.get_datasource_policy_rows(datasource_ids)
+    refused = {
+        str(row["id"]) for row in rows if execution_kind_refuses(row, execution_kind)
+    }
+    return [value for value in datasource_ids if str(value) not in refused]
 
 
 async def datasource_selection_provenance(
@@ -299,13 +331,21 @@ async def resolve_authorized_job_datasources(
     *,
     dependencies: JobDatasourceSelectionDependencies,
 ) -> list[dict[str, Any]]:
-    """Authorize and exactly resolve a job's immutable connector snapshot."""
+    """Authorize and exactly resolve a job's immutable connector snapshot.
+
+    The credentials come from each Connector's resource secret, which the
+    connector policy has just authorized this job to use (decision 11), or
+    from the row where the resource has none yet.
+    """
     selected, policy_revisions = await dependencies.revalidate_selection(job)
     resolved = await dependencies.store.resolve_datasources_for_job(
         str(job["id"]),
         project_id=(str(job["project_id"]) if job.get("project_id") else None),
     )
-    return require_exact_datasource_resolution(selected, policy_revisions, resolved)
+    rows = require_exact_datasource_resolution(selected, policy_revisions, resolved)
+    if dependencies.connector_credentials is not None:
+        await dependencies.connector_credentials(rows, authorized=selected)
+    return rows
 
 
 async def revalidate_job_datasource_ids(

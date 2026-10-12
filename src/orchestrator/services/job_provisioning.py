@@ -27,6 +27,7 @@ from __future__ import annotations
 import base64
 import logging
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 from typing import Any
 
 from orchestrator.services.managed_repository_authority import (
@@ -146,6 +147,63 @@ async def _ensure_loop_job_gitignore(
         return False
 
 
+async def _with_context(postgres_db: Any, job_row: dict[str, Any]) -> dict[str, Any]:
+    """``job_row`` with its ``context``: ``create_job``'s RETURNING row has
+    none, so it is read back once."""
+    if "context" in job_row:
+        return job_row
+    try:
+        stored = await postgres_db.get_job(str(job_row["id"]))
+    except Exception:
+        logger.warning(
+            "Could not read job %s's context back", job_row.get("id"), exc_info=True
+        )
+        stored = None
+    context = stored.get("context") if isinstance(stored, dict) else None
+    return {**job_row, "context": context}
+
+
+async def _release_unseeded_copy(
+    postgres_db: Any, job_row: dict[str, Any], reason: str
+) -> None:
+    """Fail an admitted copy no seed will make, so the job still dispatches.
+
+    Admission stamps ``cloud_baseline: seeding`` on a job that carries the
+    project's checkout before its row exists; the dispatcher holds it until
+    the seed finishes. When provisioning cannot fire one (no repository, no
+    folder), the job would wait forever: record why instead, as a failed
+    seed records it.
+    """
+    from orchestrator.services.job_cloud_checkout import job_context
+
+    baseline = job_context(await _with_context(postgres_db, job_row)).get(
+        "cloud_baseline"
+    )
+    if not isinstance(baseline, dict) or baseline.get("state") != "seeding":
+        return
+    try:
+        await postgres_db.merge_job_context(
+            str(job_row["id"]),
+            {"cloud_baseline": {"state": "failed", "error": reason}},
+        )
+    except Exception:
+        logger.exception(
+            "Failed to release the unseeded project folder copy of job %s",
+            job_row.get("id"),
+        )
+
+
+@dataclass
+class _CopySeed:
+    """Whether provisioning fired the copy's seed, and why not if it did not."""
+
+    started: bool = False
+    unseeded_reason: str = (
+        "the project folder could not be copied: the job has no repository "
+        "or the project no cloud folder"
+    )
+
+
 async def provision_job_repo(
     *,
     job_row: dict[str, Any],
@@ -170,7 +228,51 @@ async def provision_job_repo(
     passes ``username`` / ``full_name`` / ``sub`` so Gitea can pre-provision
     the user when they have never logged into Gitea directly (the old
     email-only call silently no-ops for such users).
+
+    A copy admission stamped ``seeding`` that no seed was fired for is
+    released (:func:`_release_unseeded_copy`) on every way out, a raise
+    included, or the dispatcher would hold the job in ``created`` forever. A
+    loop's raise is its spawn's to settle: it fails the loop job, and its
+    handoff authority may already be gone. What a raise cannot reach (a
+    restart mid-request, a seed task killed with its pod) the stale-seed
+    sweep releases (``release_stale_cloud_baseline_seeds``).
     """
+    seed = _CopySeed()
+    try:
+        result = await _provision_job_repo(
+            job_row=job_row,
+            gitea_client=gitea_client,
+            postgres_db=postgres_db,
+            main_cloud_router=main_cloud_router,
+            loop_floor=loop_floor,
+            require_repository=require_repository,
+            authority_check=authority_check,
+            seed=seed,
+        )
+    except Exception:
+        if not seed.started and not loop_floor:
+            await _release_unseeded_copy(
+                postgres_db,
+                job_row,
+                "the job's provisioning failed before its project folder was copied",
+            )
+        raise
+    if not seed.started:
+        await _release_unseeded_copy(postgres_db, job_row, seed.unseeded_reason)
+    return result
+
+
+async def _provision_job_repo(
+    *,
+    job_row: dict[str, Any],
+    gitea_client: Any,
+    postgres_db: Any,
+    main_cloud_router: Any,
+    loop_floor: bool,
+    require_repository: bool,
+    authority_check: Callable[[], Awaitable[None]] | None,
+    seed: _CopySeed,
+) -> dict[str, Any]:
     await _permit(authority_check)
     if not gitea_client.is_initialized:
         if loop_floor or require_repository:
@@ -178,6 +280,7 @@ async def provision_job_repo(
                 "Gitea is unavailable; cannot provision isolated job repository",
                 phase="repository",
             )
+        seed.unseeded_reason = "Gitea is unavailable; the job has no repository"
         return job_row
 
     # asyncpg returns native UUIDs; str()-coerce before any postgres_db
@@ -373,16 +476,17 @@ async def provision_job_repo(
                     raise
             logger.warning(f"Failed to grant Gitea access for job {job_id_str}: {e}")
 
-    # Mode A baseline seed (job_cloud_export.md §3.1). Fire-and-forget —
-    # runs in a background task that walks the project's cloud folder and
-    # pushes text files into the job's Gitea repo under projects/<slug>/.
-    # While it runs, the job carries context.cloud_baseline.state='seeding'
-    # and the dispatcher gate skips it. Ordinary jobs seed asynchronously and
-    # retain the legacy fail-open behavior. Loops seed synchronously and fail
-    # their spawn if the baseline is incomplete: an unattended loop must never
-    # run without the durable file state it is meant to improve.
-    # Only fires when the project actually has a cloud folder provisioned;
-    # loose jobs and projects without a cloud_folder handle skip this path.
+    # The project folder's copy (job_cloud_export.md §3.1; slice 6.3's
+    # cloud_folder_checkout). Loops seed synchronously and fail their spawn
+    # if the baseline is incomplete: an unattended loop must never run
+    # without the durable file state it is meant to improve. Any other job
+    # gets a copy only when it carries the project's checkout connector
+    # (context.cloud_checkout, stamped by admission, or decided here from
+    # the rows attached to work admitted elsewhere): a fire-and-forget seed
+    # that copies binary files too, while context.cloud_baseline.state=
+    # 'seeding' keeps the dispatcher off it. A subjob gets none: its branch
+    # already holds its parent's copy, edits included. Only fires when the
+    # project actually has a cloud folder provisioned.
     if project_id and job_row.get("repo_name"):
         try:
             await _permit(authority_check)
@@ -403,6 +507,32 @@ async def provision_job_repo(
                 ) from exc
             project_row = None
         if project_row and project_row.get("main_cloud_folder_handle"):
+            from orchestrator.services.job_cloud_checkout import (
+                CHECKOUT_CONTEXT_KEY,
+                job_context,
+                provisioning_stamp,
+            )
+
+            # What the job is told about its copy, and the checkout of work
+            # admission did not decide; merged before the seed is fired so
+            # the dispatcher already sees ``seeding``.
+            await _permit(authority_check)
+            known = await _with_context(postgres_db, job_row)
+            await _permit(authority_check)
+            stamp = await provisioning_stamp(
+                postgres_db,
+                job_row=known,
+                project={**project_row, "id": project_id},
+                loop_floor=loop_floor,
+            )
+            if stamp:
+                await _permit(authority_check)
+                await postgres_db.merge_job_context(job_id_str, stamp)
+                await _permit(authority_check)
+            checkout_attached = CHECKOUT_CONTEXT_KEY in {
+                **job_context(known),
+                **(stamp or {}),
+            }
             if loop_floor:
                 from orchestrator.services.job_cloud_baseline import (
                     seed_project_folder_baseline,
@@ -411,6 +541,7 @@ async def provision_job_repo(
                 baseline_kwargs: dict[str, Any] = {}
                 if authority_check is not None:
                     baseline_kwargs["authority_check"] = authority_check
+                seed.started = True
                 try:
                     await seed_project_folder_baseline(
                         job_id=job_id_str,
@@ -443,7 +574,7 @@ async def provision_job_repo(
                         "project cloud baseline could not be seeded completely",
                         phase="cloud",
                     )
-            else:
+            elif checkout_attached and not parent_job_id:
                 from orchestrator.services.job_cloud_baseline import fire_baseline_seed
 
                 fire_baseline_seed(
@@ -454,7 +585,9 @@ async def provision_job_repo(
                     postgres_db=postgres_db,
                     gitea_client=gitea_client,
                     main_cloud_router=main_cloud_router,
+                    include_binary=True,
                 )
+                seed.started = True
         elif loop_floor:
             raise JobProvisioningError(
                 "project loop requires a provisioned cloud folder",

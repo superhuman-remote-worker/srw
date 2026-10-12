@@ -496,9 +496,18 @@ def _delimited_user_body(
     """
     parts = [reason_line]
     if officer_context and officer_context.strip():
+        # The officer writes this from what he read — worker text included —
+        # and it rides the same email as the worker's body, so it gets the
+        # same sanitizer and the same visible count.
+        context = sanitize(officer_context.strip())
+        context_block = "\n".join(f"> {line}" for line in context.text.splitlines())
+        if context.redacted:
+            context_block += (
+                f"\n\n_({context.count} secret-shaped value(s) redacted "
+                "from the officer's context.)_"
+            )
         parts.append(
-            "**Officer context** (as written by the officer):\n\n"
-            + "\n".join(f"> {line}" for line in officer_context.strip().splitlines())
+            "**Officer context** (as written by the officer):\n\n" + context_block
         )
     # "verbatim" means unedited by us, not unsanitized: a worker (or a page it
     # summarized) can put a credential in here, and this body goes to email
@@ -770,6 +779,8 @@ async def escalate_route(
     reason: str,
     actor_kind: str,
     actor_id: Optional[str] = None,
+    officer_thread_id: Optional[str] = None,
+    officer_incarnation: Optional[int] = None,
     officer_context: Optional[str] = None,
     expected_states: Optional[tuple] = None,
     notifier: Any = None,
@@ -781,6 +792,11 @@ async def escalate_route(
     ``{"escalated": bool, "delivered": bool}``. Never raises.
     """
     try:
+        officer_source = {}
+        if officer_thread_id is not None:
+            officer_source["officer_thread_id"] = officer_thread_id
+        if officer_incarnation is not None:
+            officer_source["officer_incarnation"] = officer_incarnation
         updated = await db.transition_message_route(
             str(route["route_id"]),
             to_state="escalated_to_user",
@@ -790,6 +806,7 @@ async def escalate_route(
             actor_kind=actor_kind,
             actor_id=actor_id,
             note=reason,
+            **officer_source,
         )
     except Exception:
         logger.exception(

@@ -19,6 +19,7 @@ from typing import Any
 
 from shared.run_queue import (
     PARK_REASON_CLAIM_LOSS_HOLD,
+    PARK_REASON_MODEL_UNAVAILABLE,
     RETRYABLE_PARK_REASONS,
     STATE_PARKED,
     queue_state_for,
@@ -84,6 +85,7 @@ def queue_block(state: dict[str, Any] | None, metadata: Any) -> dict[str, Any]:
         return {
             "state": "none",
             "park_reason": None,
+            "park_message": None,
             "parked_at": None,
             "retryable": False,
             "attempts": 0,
@@ -91,9 +93,17 @@ def queue_block(state: dict[str, Any] | None, metadata: Any) -> dict[str, Any]:
         }
     parked = state.get("state") == STATE_PARKED
     refusal = park_retry_refusal(state.get("park_reason"), metadata) if parked else None
+    # Only a reason whose ``last_error`` was written for the owner is shown:
+    # other parks record internal error text.
+    park_message = (
+        state.get("last_error")
+        if parked and state.get("park_reason") == PARK_REASON_MODEL_UNAVAILABLE
+        else None
+    )
     return {
         "state": state.get("state"),
         "park_reason": state.get("park_reason") if parked else None,
+        "park_message": park_message,
         "parked_at": _iso(state.get("parked_at")) if parked else None,
         "retryable": bool(parked and refusal is None),
         "attempts": int(state.get("attempts") or 0),

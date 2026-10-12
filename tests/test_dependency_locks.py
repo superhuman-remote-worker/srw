@@ -1,12 +1,14 @@
 """Dependency drift must fail before a stale or incompatible image can ship."""
 
 import ast
+import importlib.metadata
 import importlib.util
 import json
 from pathlib import Path
 import re
 import shlex
 import shutil
+import sys
 
 import pytest
 import yaml
@@ -17,6 +19,50 @@ SPEC = importlib.util.spec_from_file_location(
 )
 locks = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(locks)
+
+#: The packages the orchestrator image copies in beside its locked environment.
+ORCHESTRATOR_IMAGE_PACKAGES = {"orchestrator", "shared"}
+
+
+def third_party_imports(package: Path) -> dict[str, set[str]]:
+    """Top-level third-party import names under ``package``, by importing file.
+
+    Function-local imports count: a lazy import of a missing package still
+    boots, then fails every call (the connector probes' "connection failed").
+    """
+    found: dict[str, set[str]] = {}
+    for path in sorted(package.rglob("*.py")):
+        for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
+            if isinstance(node, ast.Import):
+                modules = [alias.name for alias in node.names]
+            elif isinstance(node, ast.ImportFrom) and node.level == 0:
+                modules = [node.module]
+            else:
+                continue
+            for module in modules:
+                name = module.split(".")[0]
+                if (
+                    name not in sys.stdlib_module_names
+                    and name not in ORCHESTRATOR_IMAGE_PACKAGES
+                ):
+                    found.setdefault(name, set()).add(
+                        path.relative_to(package).as_posix()
+                    )
+    return found
+
+
+def unlocked_imports(imports: dict[str, set[str]], pins: dict[str, str]) -> list:
+    """Import names no pinned distribution provides, with their importers."""
+    providers = importlib.metadata.packages_distributions()
+    missing = []
+    for name, importers in sorted(imports.items()):
+        distributions = {name, *providers.get(name, ())}
+        if not any(
+            re.sub(r"[-_.]+", "-", distribution).lower() in pins
+            for distribution in distributions
+        ):
+            missing.append((name, sorted(importers)))
+    return missing
 
 
 @pytest.fixture
@@ -150,3 +196,26 @@ def test_shared_sdk_policy_matches_both_resolutions(role):
     assert {name: pins[name] for name in policy} == policy
     manifest = json.loads((ROOT / locks.paths(role)[2]).read_text())
     assert manifest["platform"] == "linux/amd64"
+
+
+def test_orchestrator_imports_resolve_against_its_lock():
+    """Every third-party package an orchestrator module imports is in its image."""
+    pins = locks.pinned_versions(ROOT / locks.paths("orchestrator")[1])
+    imports = third_party_imports(ROOT / "src/orchestrator")
+    assert unlocked_imports(imports, pins) == []
+
+
+def test_import_scan_sees_the_lazy_connector_probe_imports():
+    imports = third_party_imports(ROOT / "src/orchestrator")
+    probes = "services/connector_drivers/"
+    for name in ("neo4j", "pymongo", "webdav3"):
+        assert probes + "managed.py" in imports[name]
+    assert probes + "mcp_client.py" in imports["mcp"]
+
+
+def test_lazy_import_missing_from_the_lock_is_reported(tmp_path):
+    (tmp_path / "probe.py").write_text(
+        "import httpx\n\n\ndef probe():\n    from neo4j import GraphDatabase\n"
+    )
+    imports = third_party_imports(tmp_path)
+    assert unlocked_imports(imports, {"httpx": "0.28.1"}) == [("neo4j", ["probe.py"])]

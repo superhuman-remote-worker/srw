@@ -1,7 +1,8 @@
 """HTTP adapters for the connector (datasource) surface.
 
-Route order is part of the contract: ``/api/datasources/catalog`` and
-``/api/datasources/eligible`` are declared before
+Route order is part of the contract: ``/api/datasources/catalog``,
+``/api/datasources/eligible`` and ``/api/datasources/drivers`` are declared
+before
 ``/api/datasources/{datasource_id}`` so the literal segments win, and
 ``/api/projects/linkable-datasource-targets`` is declared here rather than on
 the projects router for the same reason.
@@ -23,12 +24,13 @@ from __future__ import annotations
 
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Literal
 
 from fastapi import APIRouter, Depends, Query, Request
 
 from orchestrator.schemas.datasources import (
     DatasourceCreate,
+    DatasourceTestRequest,
     DatasourceUpdate,
     SSHKeyGenerateRequest,
     SSHKeyGenerateResponse,
@@ -41,7 +43,18 @@ from orchestrator.security.access import (
     require_project_owner,
 )
 from orchestrator.security.auth import require_approved_user
-from orchestrator.services import datasources
+from orchestrator.services import connector_driver_registrations, datasources
+from orchestrator.services.connector_driver_registrations import DriverTrustPolicy
+from orchestrator.services.connector_drivers.matrix import (
+    HostingStatus,
+    capability_matrix,
+    egress_columns,
+    registered_driver_entry,
+)
+from orchestrator.services.connector_drivers.registered import (
+    SupportsDriverRegistration,
+)
+from orchestrator.services.connector_service_hosting import connector_egress_view
 
 router = APIRouter()
 
@@ -56,6 +69,12 @@ class DatasourcesDependencies:
     require_datasource_access: Callable[..., Awaitable[Any]] = require_datasource_access
     require_datasource_owner: Callable[..., Awaitable[Any]] = require_datasource_owner
     require_job_access: Callable[..., Awaitable[Any]] = require_job_access
+    #: Service-plane driver hosting on this installation (D5), for the
+    #: matrix's egress columns.
+    service_hosting: HostingStatus = HostingStatus()
+    #: The operator's trust in registered driver images (D6), for the
+    #: matrix's trust column.
+    driver_trust: DriverTrustPolicy = DriverTrustPolicy()
 
 
 def get_datasources_dependencies(request: Request) -> DatasourcesDependencies:
@@ -177,6 +196,20 @@ async def list_eligible_datasources(
         default=None,
         description="Project(s) to include linked connectors for (repeatable)",
     ),
+    execution: Literal["session", "job"] | None = Query(
+        default=None,
+        description=(
+            "Only connectors this kind of execution can attach (a cloud "
+            "folder is a session's); omit for all"
+        ),
+    ),
+    workspace_backend: Literal["sandbox", "vm", "virtual", "none"] | None = Query(
+        default=None,
+        description=(
+            "The execution's workspace tier: a connector with access levels "
+            "(a cloud folder) lists the levels offered on it; omit for any tier"
+        ),
+    ),
     *,
     dependencies: DatasourcesDependencies = Depends(get_datasources_dependencies),
 ) -> list[dict[str, Any]]:
@@ -192,9 +225,82 @@ async def list_eligible_datasources(
     return await datasources.list_eligible_datasources(
         user=user,
         project_id=project_id,
+        execution=execution,
+        workspace_backend=workspace_backend,
         require_project_member=member_of,
         dependencies=dependencies.operations,
     )
+
+
+@router.get("/api/datasources/drivers")
+async def list_connector_drivers(
+    request: Request,
+    *,
+    dependencies: DatasourcesDependencies = Depends(get_datasources_dependencies),
+) -> dict[str, Any]:
+    """The capability matrix of every driver the caller can use.
+
+    The installed drivers describe installed software and read no connector,
+    so any approved user may read them, as the catalog without a project
+    filter. Registered image drivers (D6) are listed only where the caller
+    can see them: the shared Catalog, their Account, their Projects.
+    """
+    user = await dependencies.require_approved_user(request, dependencies.store)
+    matrix = capability_matrix(
+        dependencies.operations.connector_drivers,
+        hosting=dependencies.service_hosting,
+    )
+    registrations = await connector_driver_registrations.list_visible_registrations(
+        dependencies.store, user
+    )
+    # Whether the caller may disable or delete each, and what a Disable
+    # revokes (the page offers its buttons and names that in its confirm).
+    views = await connector_driver_registrations.management_views(
+        dependencies.store, user, registrations, dependencies.driver_trust
+    )
+    for registration, view in zip(registrations, views, strict=True):
+        entry = registered_driver_entry(
+            registration,
+            trust=dependencies.driver_trust.trust(registration.image_reference),
+            hosting=dependencies.service_hosting,
+        )
+        entry["registration"]["can_manage"] = view["can_manage"]
+        if "usage" in view:
+            entry["registration"]["usage"] = view["usage"]
+        matrix["drivers"].append(entry)
+    return matrix
+
+
+@router.get("/api/datasources/{datasource_id}/egress")
+async def get_connector_egress(
+    request: Request,
+    datasource_id: str,
+    *,
+    dependencies: DatasourcesDependencies = Depends(get_datasources_dependencies),
+) -> dict[str, Any]:
+    """What one connector's driver pods enforce (connector drivers D5).
+
+    The matrix's ``enforced`` column per connector: each recent service pod's
+    pinned addresses, their resolution time and the DNS status, beside the
+    driver's declaration and this installation's status. Only a caller who
+    may read the connector sees where it connects.
+    """
+    _user, ds = await dependencies.require_datasource_access(
+        request, dependencies.store, datasource_id
+    )
+    driver = await dependencies.operations.driver_for(ds)
+    spec = driver.spec if driver is not None else None
+    view = await connector_egress_view(dependencies.store, datasource_id, spec=spec)
+    if spec is not None:
+        _enforced, installation = egress_columns(
+            spec,
+            in_process=False,
+            hosting=dependencies.service_hosting,
+            # A registered image driver runs in driver pods on any plane.
+            pod_hosted=isinstance(driver, SupportsDriverRegistration),
+        )
+        view["installation"] = installation
+    return view
 
 
 @router.get("/api/datasources/{datasource_id}")
@@ -347,6 +453,7 @@ async def reindex_datasource_knowledge(
 async def test_datasource(
     request: Request,
     datasource_id: str,
+    body: DatasourceTestRequest | None = None,
     *,
     dependencies: DatasourcesDependencies = Depends(get_datasources_dependencies),
 ) -> dict[str, Any]:
@@ -355,7 +462,8 @@ async def test_datasource(
     The gate is bound rather than awaited here so it stays inside the
     operation's try/except: an unexpected (non-``HTTPException``) failure
     while resolving the connector must still surface as a 500 with its
-    message, exactly as it did in ``main``.
+    message, exactly as it did in ``main``. ``body`` carries the SSH endpoint
+    a connector form is editing (see :class:`DatasourceTestRequest`).
     """
 
     async def owned_datasource() -> tuple[dict[str, Any], dict[str, Any]]:
@@ -364,5 +472,7 @@ async def test_datasource(
         )
 
     return await datasources.test_datasource(
-        resolve_datasource=owned_datasource, dependencies=dependencies.operations
+        resolve_datasource=owned_datasource,
+        overrides=body.model_dump(exclude_unset=True) if body is not None else None,
+        dependencies=dependencies.operations,
     )

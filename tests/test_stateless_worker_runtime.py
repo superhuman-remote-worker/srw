@@ -1025,6 +1025,13 @@ def _bundle(claim: WorkerClaim) -> dict:
                     "private_key": "hidden-runtime-bearer",
                 }
             ],
+            "workspace_ssh_identities": [
+                {
+                    "authority_id": "22222222-2222-4222-8222-222222222222",
+                    "kind": "ssh_key",
+                    "private_key": "hidden-connector-key",
+                }
+            ],
             "workspace_runtime": {
                 "requested_backend": "sandbox",
                 "assigned_backend": "sandbox",
@@ -1066,6 +1073,14 @@ def test_worker_bundle_preserves_exact_workspace_authority_in_metadata():
             "private_key": "hidden-runtime-bearer",
         }
     ]
+    assert metadata["workspace_ssh_identities"] == [
+        {
+            "authority_id": "22222222-2222-4222-8222-222222222222",
+            "kind": "ssh_key",
+            "private_key": "hidden-connector-key",
+        }
+    ]
+    assert "hidden-connector-key" not in repr(request)
     assert metadata["workspace_runtime"] == {
         "requested_backend": "sandbox",
         "assigned_backend": "sandbox",
@@ -1230,10 +1245,10 @@ def worker_runtime(monkeypatch):
         "agent": pa._agent,
         "client": pa._orchestrator_client,
         "session": pa._session,
-        "thread_id": pa._thread_id,
+        "thread_id": pa._session_identity.thread_id,
     }
     pa._session = None
-    pa._thread_id = None
+    pa._session_identity._thread_id = None
     monkeypatch.setattr(
         turn_executor.StatelessTurnExecutor,
         "_scrub_process_residue",
@@ -1245,7 +1260,7 @@ def worker_runtime(monkeypatch):
         pa._agent = saved["agent"]
         pa._orchestrator_client = saved["client"]
         pa._session = saved["session"]
-        pa._thread_id = saved["thread_id"]
+        pa._session_identity._thread_id = saved["thread_id"]
 
 
 def _install(
@@ -2273,7 +2288,6 @@ async def test_agent_finalization_hold_retires_admission_then_disposes_shell_onc
         )
     }
     agent._datasource_clients = {}
-    agent._datasource_files_manifest = None
     agent._checkpoint_conn = None
     agent._checkpointer = object()
     agent._worker_env_restore = {}
@@ -2378,7 +2392,6 @@ async def test_agent_hold_drains_admitted_resource_io_and_retires_original_backe
     agent._knowledge_graph = None
     agent._datasource_connections = {}
     agent._datasource_clients = {}
-    agent._datasource_files_manifest = None
     agent._checkpoint_conn = None
     agent._checkpointer = None
     agent._worker_env_restore = {}
@@ -2529,8 +2542,9 @@ async def test_recoverable_end_releases_without_reporting(worker_runtime, monkey
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("workspace_recovery", [False, True])
+@pytest.mark.parametrize("sealed_report", [False, True])
 async def test_last_recoverable_attempt_reports_visible_terminal_give_up(
-    worker_runtime, monkeypatch, workspace_recovery
+    worker_runtime, monkeypatch, workspace_recovery, sealed_report
 ):
     claim = _claim(input_seq=4, prior="processing", attempts=5, max_attempts=5)
     final = {
@@ -2541,6 +2555,10 @@ async def test_last_recoverable_attempt_reports_visible_terminal_give_up(
         },
         "error": {"type": "llm_unavailable", "recoverable": True},
     }
+    if sealed_report:
+        from agent.graph import checkpoint_completion_report
+
+        final.update(checkpoint_completion_report(final))
     executor, agent, client, _, rotate, complete, release = _install(
         monkeypatch, claim, final
     )
@@ -2550,7 +2568,17 @@ async def test_last_recoverable_attempt_reports_visible_terminal_give_up(
         client.backend = "vm"
         client.report_workspace_recovery.return_value = _recovery_receipt(claim)
 
-    await executor._serve_worker_claim(claim)
+    checkpoint_reset = None
+    if sealed_report and not workspace_recovery:
+        from tests.test_worker_retry_exhaustion_checkpoint import bind_checkpoint_agent
+
+        checkpoint_reset = await bind_checkpoint_agent(agent, claim, final, executor)
+        assert agent._checkpointer is agent._graph.checkpointer
+    try:
+        await executor._serve_worker_claim(claim)
+    finally:
+        if checkpoint_reset is not None:
+            turn_executor.current_lease.reset(checkpoint_reset)
 
     if workspace_recovery:
         client.report_completion.assert_not_awaited()
@@ -2566,6 +2594,12 @@ async def test_last_recoverable_attempt_reports_visible_terminal_give_up(
     assert reported["error"]["recoverable"] is False
     assert reported["freeze_data"]["freeze_type"] == "worker_retry_exhausted"
     assert reported["freeze_data"]["attempts"] == 5
+    wire, _ = turn_executor.StatelessTurnExecutor._worker_completion_wire_payload(
+        reported
+    )
+    assert wire["error"]["type"] == "worker_retry_exhausted"
+    assert wire["error"]["recoverable"] is False
+    assert wire["freeze_data"]["freeze_type"] == "worker_retry_exhausted"
     complete.assert_awaited_once()
     rotate.assert_not_awaited()
     release.assert_not_awaited()
@@ -2619,6 +2653,74 @@ async def test_last_pregraph_driver_failure_reports_visible_terminal_give_up(
     rotate.assert_not_awaited()
     release.assert_not_awaited()
     assert agent.cleanup_calls == [False]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "stage", ["before_commit", "after_commit", "readback", "lease_loss", "binding"]
+)
+async def test_giveup_checkpoint_ambiguity_never_starts_http_or_parks(
+    worker_runtime, monkeypatch, stage
+):
+    from tests.test_worker_retry_exhaustion_checkpoint import (
+        bind_checkpoint_agent,
+        outage,
+    )
+
+    claim = _claim(input_seq=4, prior="processing", attempts=5, max_attempts=5)
+    final = outage()
+    executor, agent, client, _, rotate, complete, release = _install(
+        monkeypatch, claim, final
+    )
+    reset = await bind_checkpoint_agent(agent, claim, final, executor)
+    assert agent._checkpointer is agent._graph.checkpointer
+    update = agent._graph.aupdate_state
+    read = agent._graph.aget_state
+    reads = 0
+
+    async def ambiguous_update(*args, **kwargs):
+        if stage == "after_commit":
+            await update(*args, **kwargs)
+        elif stage == "lease_loss":
+            executor._lease.mark_lost()
+            raise turn_executor.LeaseLostError("injected lost lease")
+        raise TimeoutError("injected checkpoint ambiguity")
+
+    async def unavailable_readback(*args, **kwargs):
+        nonlocal reads
+        reads += 1
+        if reads == 2:
+            raise TimeoutError("injected checkpoint read-back ambiguity")
+        return await read(*args, **kwargs)
+
+    if stage == "binding":
+        agent._worker_thread_config = None
+    elif stage == "readback":
+        agent._graph.aget_state = unavailable_readback
+    else:
+        agent._graph.aupdate_state = ambiguous_update
+    try:
+        await executor._serve_worker_claim(claim)
+        client.report_completion.assert_not_awaited()
+        complete.assert_not_awaited()
+        rotate.assert_not_awaited()
+        assert executor._worker_terminal_report_generation is None
+        assert executor._worker_exhaustion_checkpoint_generation == (
+            str(claim.unit_id),
+            claim.lease_token,
+        )
+        if stage == "lease_loss":
+            release.assert_not_awaited()
+        else:
+            release.assert_awaited_once_with(
+                executor._db,
+                unit_id=claim.unit_id,
+                lease_token=claim.lease_token,
+                park_on_exhaustion=False,
+            )
+        assert agent.cleanup_calls == [True]
+    finally:
+        turn_executor.current_lease.reset(reset)
 
 
 @pytest.mark.asyncio
@@ -2846,6 +2948,36 @@ async def test_terminal_report_failure_preserves_shell_and_error_releases(
         lease_token=claim.lease_token,
         park_on_exhaustion=False,
     )
+
+
+@pytest.mark.asyncio
+async def test_vm_typed_report_loss_selects_restriction_without_generic_release(
+    worker_runtime, monkeypatch
+):
+    monkeypatch.setenv("VM_WORKSPACE_RECOVERY_ENABLED", "false")
+    claim = _claim(input_seq=9, prior="processing")
+    final = {
+        "should_stop": True,
+        "goal_achieved": False,
+        "error": {"type": "workspace_unavailable"},
+    }
+    executor, agent, client, _, _, _, release = _install(
+        monkeypatch, claim, final, report_result=False
+    )
+    executor._completion_commands_enabled = True
+    executor._worker_workspace_backend = "vm"
+    executor._worker_workspace_provisioner = None
+    hold = AsyncMock(return_value="held")
+    monkeypatch.setattr(turn_executor, "hold_failed_container_worker_report", hold)
+
+    result = await executor._report_worker_terminal(claim, final, client=client)
+
+    hold.assert_awaited_once_with(
+        executor._db, unit_id=claim.unit_id, lease_token=claim.lease_token
+    )
+    assert result == "held:worker_execution_outcome_unknown"
+    release.assert_not_awaited()
+    assert agent.hold_calls >= 1
 
 
 @pytest.mark.asyncio
@@ -3582,18 +3714,35 @@ def test_worker_environment_is_restored_between_claims(monkeypatch):
     agent = UniversalAgent.__new__(UniversalAgent)
     agent._worker_env_restore = {}
     monkeypatch.setenv("TENANT_ONLY_KEY", "pod-baseline")
-    monkeypatch.delenv("PGPASSWORD", raising=False)
+    monkeypatch.delenv("TENANT_NEW_KEY", raising=False)
 
     agent._capture_worker_environment(
         {
-            "resolved_config": {"agent": {"env_keys": {"TENANT_ONLY_KEY": "secret"}}},
+            "resolved_config": {
+                "agent": {
+                    "env_keys": {"TENANT_ONLY_KEY": "secret", "TENANT_NEW_KEY": "x"}
+                }
+            },
             "datasources": [{"type": "postgresql"}],
         }
     )
     os.environ["TENANT_ONLY_KEY"] = "secret"
-    os.environ["PGPASSWORD"] = "database-secret"
+    os.environ["TENANT_NEW_KEY"] = "tenant-secret"
 
     agent._restore_worker_environment()
 
     assert os.environ["TENANT_ONLY_KEY"] == "pod-baseline"
-    assert "PGPASSWORD" not in os.environ
+    assert "TENANT_NEW_KEY" not in os.environ
+
+
+def test_managed_connectors_leave_the_worker_environment_alone():
+    """The CLI mode that wrote PG*/NEO4J_*/MONGOSH_URI into the agent process
+    is gone, so a managed connector no longer adds keys to the snapshot."""
+    agent = UniversalAgent.__new__(UniversalAgent)
+    agent._worker_env_restore = {}
+
+    agent._capture_worker_environment(
+        {"datasources": [{"type": "postgresql"}, {"type": "neo4j"}]}
+    )
+
+    assert agent._worker_env_restore == {}

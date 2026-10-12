@@ -8,11 +8,16 @@ What the runtime owns, and the ``delegate_agent`` tool only calls:
   runtime (B.1);
 - the worktree index counter (``.worktrees/<handle>`` is handle-named; the
   index keeps ``reader_env``'s port block allocation distinct per child);
-- the per-parent ``asyncio.Semaphore(delegation.max_concurrent)`` — N calls
+- the per-parent concurrency limit (``LiveConcurrencyLimit`` over
+  ``fanout.delegation_max_concurrent``, re-read at every admission) — N calls
   in one batch run concurrently up to the cap and in waves above it;
 - ``begin_batch(n)`` — the tool node stamps how many delegate calls the
   current batch carries so every envelope shares the parent's headroom by N
   (B.5);
+- ``stop_foreground_batch()`` — Stop reaches the batch (parallel_subagents
+  D4): every running foreground child gets ``graceful_stop`` and returns a
+  ``STOPPED`` result, and every call still queued behind the cap returns
+  ``NOT STARTED`` without a child row;
 - ``run_foreground(call)`` — build the child (``build_child``), run the
   driver on the brief, render the envelope, record through the
   ``SubagentLedger`` (the DB ledger in production, WP3), remember the result;
@@ -38,16 +43,24 @@ import time
 import uuid
 from datetime import datetime, timezone
 from dataclasses import dataclass, field, replace
-from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple
+from typing import Any, Callable, Dict, List, Mapping, NoReturn, Optional, Tuple
 
 from agent.core.context import sanitize_history_for_provider_boundary
 
+from agent.subagents.batch_recovery import (
+    PARENT_RESTART_ERROR,
+    PARENT_RESTART_NOT_STARTED_OUTCOME,
+    PARENT_RESTART_OUTCOME,
+    PARENT_RESTART_STATUS,
+    SessionTurnRecovery,
+)
 from agent.subagents.budgets import ChildBudgets
 from agent.subagents.child import SharedWriterGuard, SpawnRefused, build_child
 from agent.subagents.driver import SubagentDriver, SubagentResult
 from agent.subagents.envelope import build_envelope, build_replay_envelope, report_path
 from agent.subagents.fork import seed_fork_history
 from agent.subagents.host import ParentHost, ParentRef
+from agent.subagents.limiter import LiveConcurrencyLimit
 from agent.subagents.ledger import (
     SUBAGENT_STATUSES,
     NullLedger,
@@ -60,6 +73,105 @@ logger = logging.getLogger(__name__)
 #: How long a ledger write may block the parent (non-fatal past it).
 _LEDGER_TIMEOUT_S = 5.0
 _ORPHAN_PARTIAL_MAX_CHARS = 4000
+
+#: First line of the result of a foreground child stopped because its parent's
+#: turn was stopped (D4). Styled like the recovery markers a session parent
+#: already knows (``batch_recovery.INTERRUPTED_HEADER`` and NOT STARTED).
+STOPPED_HEADER = "[delegate_agent: STOPPED - did not finish]"
+#: The marker of a call that never started. The description explains it; the
+#: settle renders the same first line (``shared.session_subagent_batch``).
+NOT_STARTED_HEADER = "[delegate_agent: NOT STARTED]"
+#: The reason a stopped child's one tool-less synthesis turn is given
+#: (``driver.SYNTH_PROMPT``: "You have reached your stop request. ...").
+BATCH_STOP_REASON = "stop request"
+#: How long each stopped child may take for that synthesis turn, as for a
+#: retirement (``quiesce``); a stuck provider or tool is then hard-stopped.
+BATCH_STOP_GRACE_S = 10.0
+#: How a child ends that stopped at a boundary because its parent's provider
+#: admission closed (``driver.classify``).
+_DRAIN_OUTCOME = "interrupted:drain"
+#: The ends a running child reaches when the shutdown's fence closes its
+#: admission: at a boundary (drain), or while its effect-authority proof was
+#: in flight, which the fence then fails (authority).
+_HANDED_OVER_ENDS = frozenset({_DRAIN_OUTCOME, "interrupted:authority"})
+
+
+def stopped_not_started_text() -> str:
+    """The result of a call still queued behind the cap when its turn stopped."""
+
+    return (
+        f"{NOT_STARTED_HEADER}\n"
+        "This subagent never started: this turn was stopped while the call was "
+        "still queued. It did no work and changed nothing.\n"
+        "If the task is still needed, call delegate_agent again with the same "
+        "task."
+    )
+
+
+def stopped_envelope(envelope: str, *, has_text: bool) -> str:
+    """The result of a child stopped by its turn's Stop, around its envelope.
+
+    Only what is known: the child was stopped and did not finish, its text is
+    partial, and the workspace may hold its incomplete changes. The envelope
+    keeps the provenance header (handle, type, turns, tokens) and the report.
+    """
+
+    if has_text:
+        cause = (
+            "This subagent was stopped before it finished, because this turn "
+            "was stopped. The report below is what it wrote when it was "
+            "stopped: partial and unverified, not a finished answer."
+        )
+    else:
+        cause = (
+            "This subagent was stopped before it finished, because this turn "
+            "was stopped. It left no report."
+        )
+    return "\n".join(
+        [
+            STOPPED_HEADER,
+            cause,
+            envelope,
+            "Anything it changed in the workspace is still there and may be "
+            "incomplete.",
+            "If this work is still needed, first check the workspace for what "
+            "it already produced. Then either finish the remainder yourself or "
+            "call delegate_agent again with a task limited to what is still "
+            "missing.",
+        ]
+    )
+
+
+def _orphan_row_counter(row: Mapping[str, Any], name: str) -> int:
+    """A recovered child's ``turns``/``tokens`` from either listing shape.
+
+    A worker ledger lists database rows (``total_turns``); a session ledger
+    lists the orchestrator's roster payload (``turns``). Reading only the
+    database name sent zeros for every session orphan, and the orchestrator
+    refuses a terminal retry whose counters differ from the stored ones.
+    """
+    for key in (f"total_{name}", name):
+        value = row.get(key)
+        if value is None or isinstance(value, bool):
+            continue
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            continue
+    return 0
+
+
+class _LeftForSuccessor(BaseException):
+    """Leave the concurrency slot; the call is then held for the successor.
+
+    A ``BaseException`` so no ``except Exception`` between the raise and
+    ``_spawn`` turns it into a child failure. ``handle`` names a minted handle
+    that has nothing to settle (no row was opened).
+    """
+
+    def __init__(self, handle: Optional[str] = None) -> None:
+        super().__init__(handle)
+        self.handle = handle
 
 
 class _BackgroundSettled(Exception):
@@ -150,7 +262,7 @@ class SubagentRuntime:
         *,
         roster: Optional[Mapping[str, Mapping[str, Any]]] = None,
         default: Optional[str] = None,
-        max_concurrent: int = 4,
+        max_concurrent: int | Callable[[], int] = 4,
         ledger: Optional[SubagentLedger] = None,
         llm_factory: Optional[Callable[[Any, Any], Any]] = None,
         clock: Callable[[], float] = time.monotonic,
@@ -165,22 +277,63 @@ class SubagentRuntime:
             if isinstance(entry, Mapping)
         }
         self.default = str(default) if default else None
-        try:
-            cap = int(max_concurrent)
-        except (TypeError, ValueError):
-            cap = 4
-        self.max_concurrent = max(1, cap)
+        # The cap is either fixed or a zero-argument callable over the
+        # parent's LIVE context (from_context): the limiter re-reads it at
+        # every admission, so a live config update reaches the semaphore as
+        # well as the tool description (parallel_subagents.md §6.4).
+        cap_source: int | Callable[[], int]
+        if callable(max_concurrent):
+            cap_source = max_concurrent
+        else:
+            try:
+                cap_source = max(1, int(max_concurrent))
+            except (TypeError, ValueError):
+                cap_source = 4
         self.ledger: SubagentLedger = ledger if ledger is not None else NullLedger()
         self._llm_factory = llm_factory
         self.clock = clock
         self._hex_source = hex_source or (lambda: secrets.token_hex(2))
         self._driver_kwargs = dict(driver_kwargs or {})
 
-        self._semaphore = asyncio.Semaphore(self.max_concurrent)
+        self._semaphore = LiveConcurrencyLimit(cap_source, fallback=4)
         self._writer_guard = SharedWriterGuard()
         self._handles: set[str] = set()
+        # Handles whose child leaves nothing to settle: its strict terminal
+        # receipt committed, ``_spawn`` returned before any durable row was
+        # opened, or orphan recovery ended its foreground row durably (alone
+        # or in its turn's settle). ``quiesce`` without parent authority may
+        # close a life whose every minted handle is here; a minted handle
+        # missing from it may still have a build or durable create in flight.
+        self._settled_handles: set[str] = set()
         self._worktree_index = 0
         self._batch_size = 1
+        # Set by ``stop_foreground_batch`` for the current batch only;
+        # ``begin_batch`` clears it.
+        self._foreground_stop: Optional[str] = None
+        # Set once by ``leave_foreground_for_successor`` (a graceful shutdown)
+        # and never cleared: this runtime is being torn down, and a successor
+        # settles its foreground batch.
+        self._foreground_left_for_successor = False
+        # With the hand-over, when the parent session is retired after it (the
+        # pinned lane): each child ends at its next boundary and its row ends
+        # ``interrupted:parent_restart`` before the retirement, which would
+        # otherwise cancel a running row for good.
+        self._foreground_ends_for_successor = False
+        # Set once by ``leave_to_retirement`` (a retirement the orchestrator
+        # authorized took the parent's authority) and never cleared: no child
+        # of this life writes again, and no delegate call returns.
+        self._left_to_retirement = False
+        # Foreground calls in progress, and the waiters of the ones held
+        # for the successor (``_await_successor_cancellation``) with their
+        # in-flight keys. A held call does nothing more and never returns.
+        self._foreground_in_progress = 0
+        self._successor_waiters: set[asyncio.Future] = set()
+        self._held_keys: set[Tuple[str, str]] = set()
+        # (parent tool call id, child id) of every foreground child whose
+        # durable row this runtime opened in the current batch, in open order.
+        # ``begin_batch`` clears it. Read at shutdown to check, against the
+        # database, that every child that may have run has its row.
+        self._foreground_opened: List[Tuple[str, str]] = []
         self._active: Dict[str, SubagentDriver] = {}
         self._records: Dict[Tuple[str, str], SubagentRecord] = {}
         self._inflight: Dict[Tuple[str, str], asyncio.Future] = {}
@@ -211,19 +364,33 @@ class SubagentRuntime:
         cls, context: Any, host: ParentHost, **kwargs: Any
     ) -> "SubagentRuntime":
         """The runtime of a parent ``ToolContext``: roster / default from
-        ``config["subagents"]``, the cap from ``config["delegation"]``."""
+        ``config["subagents"]``, the cap read live through
+        ``fanout.delegation_max_concurrent`` — the function the
+        ``delegate_agent`` description reads, so both state one cap."""
+        from agent.tools.delegation.fanout import delegation_max_concurrent
+
         config = getattr(context, "config", None) or {}
         subagents = config.get("subagents") or {}
         if not isinstance(subagents, Mapping):
             subagents = {}
-        delegation = config.get("delegation") or {}
-        if not isinstance(delegation, Mapping):
-            delegation = {}
         kwargs.setdefault("roster", subagents.get("roster") or {})
         kwargs.setdefault("default", subagents.get("default"))
-        raw_cap = delegation.get("max_concurrent")
-        kwargs.setdefault("max_concurrent", 4 if raw_cap is None else raw_cap)
+        kwargs.setdefault("max_concurrent", lambda: delegation_max_concurrent(context))
         return cls(context, host, **kwargs)
+
+    @property
+    def max_concurrent(self) -> int:
+        """This parent's current cap on concurrently running children."""
+        return self._semaphore.limit
+
+    def refresh_concurrency(self) -> int:
+        """Apply a changed cap to calls already queued behind the limit.
+
+        The cap is re-read at every admission and release; a live config
+        update calls this so a raised cap starts queued children at once
+        instead of when the next child finishes. Returns how many started.
+        """
+        return self._semaphore.wake()
 
     # ------------------------------------------------------------------
     # Roster / handles / counters / batch
@@ -277,10 +444,158 @@ class SubagentRuntime:
         except (TypeError, ValueError):
             size = 1
         self._batch_size = max(1, size)
+        # A new batch starts unstopped: a Stop belongs to the batch it hit.
+        self._foreground_stop = None
+        self._foreground_opened = []
 
     @property
     def batch_size(self) -> int:
         return self._batch_size
+
+    @property
+    def foreground_batch_stopped(self) -> bool:
+        """Whether the current foreground batch was stopped (D4)."""
+        return self._foreground_stop is not None
+
+    @property
+    def foreground_opened(self) -> List[Tuple[str, str]]:
+        """``(parent tool call id, child id)`` of every foreground child whose
+        durable row this runtime opened in the current batch.
+
+        A child runs only after its row is open, so this is every child of
+        the batch that may have done work. A call still queued behind the cap
+        or still being built is not in it: it has done nothing.
+        """
+        return list(self._foreground_opened)
+
+    @property
+    def foreground_left_for_successor(self) -> bool:
+        return self._foreground_left_for_successor
+
+    def leave_foreground_for_successor(self, *, retiring: bool = False) -> None:
+        """Hand the foreground batch to the next process (graceful shutdown).
+
+        Stateless lane (``retiring=False``): set by the executor immediately
+        before it cancels a turn it could not finish in its shutdown window.
+        From then on, a foreground child cancelled before it finished writes
+        no terminal row: it stays ``running`` exactly as a crash leaves it,
+        so the successor's settle classifies it live and ends it
+        ``interrupted:parent_restart`` (parallel_subagents.md §8). A child
+        that already finished keeps its terminal row and report; a call that
+        never opened a row stays without one. A person's Stop and every
+        other cancellation are unaffected. Never cleared: the runtime is torn
+        down with the session.
+
+        A call that reaches a new child after this (queued behind the cap and
+        handed a freed slot, or still being built) opens no row, makes no
+        provider call and returns no result: it waits for the cancellation
+        that follows, and the successor reports it as not started.
+
+        Pinned lane (``retiring=True``, §14.2 P4): set at the first
+        activation of the termination fence, a platform shutdown. The session
+        is retired after it, and the retirement cancels every row still
+        running, so nothing is cancelled here: each running child goes on to
+        its next boundary, where the closed provider admission ends it. Its
+        row then ends ``interrupted:parent_restart`` (or with its own outcome
+        when it finished anyway), it keeps its transcript, and its call is
+        held like a queued one: no result reaches the parent, whose turn
+        waits until the termination cancels it. A child that never got a
+        provider response (its row opened across the hand-over) ends
+        ``interrupted:not_started`` instead. The successor's live list then
+        names every child of the turn, and its settle writes one result per
+        call (D7).
+        """
+        self._foreground_left_for_successor = True
+        if retiring:
+            self._foreground_ends_for_successor = True
+
+    @property
+    def foreground_held_for_successor(self) -> bool:
+        """The batch was handed over and every foreground call in progress is
+        held: no child of it runs, and no call can still spend, write or
+        return a result. A child still on its way to its next boundary keeps
+        this false."""
+
+        return bool(
+            self._foreground_left_for_successor
+            and self._successor_waiters
+            and len(self._successor_waiters) == self._foreground_in_progress
+            and not self._foreground_terminal_pending
+        )
+
+    def _unheld_inflight(self) -> List[asyncio.Future]:
+        """The in-flight foreground calls not held for the successor."""
+
+        return [
+            future
+            for key, future in self._inflight.items()
+            if key not in self._held_keys
+        ]
+
+    def _release_successor_waiters(self) -> None:
+        """Cancel every held call: zero writes, and nothing is returned."""
+
+        for waiter in list(self._successor_waiters):
+            if not waiter.done():
+                waiter.cancel()
+
+    async def _await_successor_cancellation(
+        self, call: SubagentCall, *, settled_handle: Optional[str] = None
+    ) -> NoReturn:
+        """Hold a foreground call the successor now owns until the shutdown
+        cancels its turn. Returning anything would become a tool result.
+
+        ``settled_handle`` names a minted handle that leaves nothing to settle
+        here: the call opened no row, or its row's terminal write committed.
+        """
+        if settled_handle is not None:
+            self._settled_handles.add(settled_handle)
+        logger.info(
+            "subagent call %s held for the successor (parent shutting down)",
+            call.tool_call_id or "<no id>",
+        )
+        key = self._key(call)
+        waiter = asyncio.get_running_loop().create_future()
+        self._successor_waiters.add(waiter)
+        if key is not None:
+            self._held_keys.add(key)
+        try:
+            await waiter
+        finally:
+            self._successor_waiters.discard(waiter)
+            if key is not None:
+                self._held_keys.discard(key)
+        raise AssertionError("unreachable: the held call is only ever cancelled")
+
+    async def stop_foreground_batch(
+        self, *, grace_s: float = BATCH_STOP_GRACE_S
+    ) -> int:
+        """Stop the current foreground batch (parallel_subagents D4).
+
+        Every running foreground child gets ``graceful_stop``: one bounded
+        tool-less turn for a partial answer, then a hard stop; its call then
+        returns a ``STOPPED`` result. A call still queued behind the cap, or
+        still being built, returns ``NOT STARTED`` and opens no child row. A
+        child whose row opens after this call is stopped before its first
+        provider call. Background children are not touched. Returns how many
+        running children were asked to stop.
+        """
+
+        self._foreground_stop = BATCH_STOP_REASON
+        drivers = [
+            driver
+            for handle, driver in list(self._active.items())
+            if handle not in self._background
+        ]
+        if drivers:
+            await asyncio.gather(
+                *(
+                    driver.graceful_stop(BATCH_STOP_REASON, timeout=grace_s)
+                    for driver in drivers
+                ),
+                return_exceptions=True,
+            )
+        return len(drivers)
 
     @property
     def active(self) -> Dict[str, SubagentDriver]:
@@ -333,9 +648,70 @@ class SubagentRuntime:
 
     async def run_foreground(self, call: SubagentCall) -> str:
         """Run one child to its end and return the envelope text (the
-        ToolMessage content). Idempotent per ``(parent_job_id, tool_call_id)``."""
+        ToolMessage content). Idempotent per ``(parent_job_id, tool_call_id)``.
+
+        Once a pinned batch is handed to the successor (``leave_foreground_
+        for_successor(retiring=True)``) no call returns, whatever it ended
+        with: a replay, a refusal or a failure would otherwise become a tool
+        result the parent saves, and the successor's settle owns the turn. The
+        same holds once the batch was left to an authorized retirement
+        (``leave_to_retirement``), and for a call that failed because such a
+        retirement took the parent's authority before the termination left
+        it (``_retired_by_orchestrator``).
+        """
         if call.run_in_background:
             return await self.run_background(call)
+        # Counted so ``foreground_held_for_successor`` can tell a batch whose
+        # every call is held from one with a call still in progress.
+        self._foreground_in_progress += 1
+        try:
+            try:
+                envelope = await self._run_foreground(call)
+            except Exception:
+                if not (
+                    self._foreground_ends_for_successor
+                    or await self._retired_by_orchestrator()
+                ):
+                    raise
+                logger.warning(
+                    "subagent call %s failed after the hand-over; its result is "
+                    "the successor's",
+                    call.tool_call_id or "<no id>",
+                    exc_info=True,
+                )
+                await self._await_successor_cancellation(call)
+            if self._foreground_ends_for_successor or self._left_to_retirement:
+                await self._await_successor_cancellation(call)
+            return envelope
+        finally:
+            self._foreground_in_progress -= 1
+
+    async def _retired_by_orchestrator(self) -> bool:
+        """Whether this life was left, or is about to be left, to a retirement
+        the orchestrator authorized.
+
+        Asked when a delegate call failed: until the lifecycle watchdog's next
+        poll, an authorized retirement shows only as refused child writes
+        (``pinned_parent_not_current``), and such a failure is no result for
+        the parent to save. An End still in preflight refuses them too but
+        may abort, so the host reads the lifecycle now and only an authorized
+        retirement of this exact life counts.
+        """
+
+        if self._left_to_retirement:
+            return True
+        probe = getattr(self.host, "retirement_authorized", None)
+        if not callable(probe):
+            return False
+        try:
+            authorized = (await probe()) is True
+        except Exception:
+            authorized = False
+        # The leave may have run while the lifecycle was read (and the read
+        # failed): a left runtime holds the call all the same.
+        return authorized or self._left_to_retirement
+
+    async def _run_foreground(self, call: SubagentCall) -> str:
         key = self._key(call)
         if key is not None:
             record = self._records.get(key)
@@ -394,13 +770,43 @@ class SubagentRuntime:
         entry: Mapping[str, Any],
         call: SubagentCall,
     ) -> str:
+        try:
+            return await self._spawn_child(key, name, entry, call)
+        except _LeftForSuccessor as left:
+            # Raised inside the concurrency limit, so its slot is free again:
+            # a held call must never keep one, or the calls still queued
+            # behind the cap would wait for it forever.
+            await self._await_successor_cancellation(call, settled_handle=left.handle)
+
+    async def _spawn_child(
+        self,
+        key: Optional[Tuple[str, str]],
+        name: str,
+        entry: Mapping[str, Any],
+        call: SubagentCall,
+    ) -> str:
+        if self._foreground_left_for_successor:
+            # Before the admission check: a retirement's quiesce closes it,
+            # and a handed-over call must not return even that error.
+            await self._await_successor_cancellation(call)
         if not self._accepting:
             return "Error: subagent runtime is quiescing; no new work accepted"
+        if self._foreground_stop is not None:
+            return stopped_not_started_text()
         isolation = str(call.isolation or entry.get("isolation") or "shared")
         handle = self.mint_handle(name)
         subagent_id = str(uuid.uuid4())
 
         async with self._semaphore:
+            if self._foreground_left_for_successor:
+                # Queued behind the cap when the batch was handed over: a
+                # freed slot must not start it (§8, "not started"), and it is
+                # passed on at once to the next queued call.
+                raise _LeftForSuccessor(handle)
+            if self._foreground_stop is not None:
+                # Queued behind the cap when the turn was stopped.
+                self._settled_handles.add(handle)
+                return stopped_not_started_text()
             budgets = ChildBudgets.from_entry(entry, name)
             try:
                 build = await build_child(
@@ -420,6 +826,9 @@ class SubagentRuntime:
                     budgets=budgets,
                 )
             except SpawnRefused as refused:
+                self._settled_handles.add(handle)
+                if self._foreground_ends_for_successor:
+                    raise _LeftForSuccessor(handle) from None
                 return f"Error: {refused}"
             except asyncio.CancelledError:
                 raise
@@ -431,14 +840,35 @@ class SubagentRuntime:
                     exc,
                     exc_info=True,
                 )
+                self._settled_handles.add(handle)
+                if self._foreground_ends_for_successor:
+                    # Handed over while it was being built: no row, no result.
+                    raise _LeftForSuccessor(handle) from None
                 return (
                     f"Error: subagent {handle} ({name}) could not be started — "
                     f"{type(exc).__name__}: {exc}"
                 )
 
+            if self._foreground_left_for_successor:
+                # Handed over while its environment was being built: no row.
+                try:
+                    await build.release()
+                except Exception:
+                    logger.warning(
+                        "subagent %s: release failed after the hand-over",
+                        handle,
+                        exc_info=True,
+                    )
+                raise _LeftForSuccessor(handle)
             if not self._accepting:
                 await build.release()
+                self._settled_handles.add(handle)
                 return "Error: subagent runtime is quiescing; child was not started"
+            if self._foreground_stop is not None:
+                # Stopped while its environment was being built: no row yet.
+                await build.release()
+                self._settled_handles.add(handle)
+                return stopped_not_started_text()
 
             messages = None
             if call.fork:
@@ -481,6 +911,8 @@ class SubagentRuntime:
             except BaseException:
                 await driver.close()
                 raise
+            if call.tool_call_id:
+                self._foreground_opened.append((str(call.tool_call_id), subagent_id))
             self._active[handle] = driver
             logger.info(
                 "subagent %s (%s) spawned: isolation=%s write_policy=%s tools=%d "
@@ -494,9 +926,35 @@ class SubagentRuntime:
                 budgets.max_tokens,
                 call.fork,
             )
+            result: Optional[SubagentResult] = None
+            run_failure: Optional[str] = None
             try:
-                result = await driver.run(call.prompt)
+                if self._foreground_left_for_successor:
+                    # Handed over while its row was being opened: the child
+                    # never reaches its first provider call. Stateless: the
+                    # row stays as opened (the successor interrupts it).
+                    # Pinned: it is ended below, before the retirement.
+                    if not self._foreground_ends_for_successor:
+                        raise _LeftForSuccessor()
+                else:
+                    if self._foreground_stop is not None:
+                        # The Stop landed while the row was being opened: the
+                        # child ends stopped before its first provider call.
+                        await driver.graceful_stop(self._foreground_stop, timeout=0.0)
+                    result = await driver.run(call.prompt)
             except asyncio.CancelledError:
+                if self._foreground_left_for_successor:
+                    # Graceful shutdown: leave the row running, as a crash
+                    # would, for the successor's settle to interrupt (§8).
+                    logger.info(
+                        "subagent %s (%s) left running for the successor "
+                        "(parent shutting down): %d turns, %d tokens",
+                        handle,
+                        name,
+                        driver.provider_calls,
+                        driver.tokens,
+                    )
+                    raise
                 await self._commit_foreground_terminal(
                     handle,
                     subagent_id,
@@ -511,13 +969,27 @@ class SubagentRuntime:
                 logger.error(
                     "subagent %s (%s): run failed: %s", handle, name, exc, exc_info=True
                 )
-                await self._commit_foreground_terminal(
-                    handle, subagent_id, status="error", outcome="error", error=str(exc)
-                )
-                return (
+                run_failure = (
                     f"Error: subagent {handle} ({name}) failed — "
                     f"{type(exc).__name__}: {exc}"
                 )
+                try:
+                    await self._commit_foreground_terminal(
+                        handle,
+                        subagent_id,
+                        status="error",
+                        outcome="error",
+                        error=str(exc),
+                    )
+                except Exception:
+                    if not self._foreground_ends_for_successor:
+                        raise
+                    logger.warning(
+                        "subagent %s (%s): terminal write failed after the hand-over",
+                        handle,
+                        name,
+                        exc_info=True,
+                    )
             finally:
                 self._active.pop(handle, None)
                 try:
@@ -525,26 +997,81 @@ class SubagentRuntime:
                 except Exception:  # pragma: no cover - best effort
                     logger.warning("subagent %s: close failed", handle, exc_info=True)
 
-        envelope = build_envelope(
-            result,
-            workspace_manager=getattr(self.parent_context, "workspace_manager", None),
-            entry_budget=budgets.return_budget_tokens,
-            probe=self.host.context_probe(),
-            n_in_batch=self._batch_size,
-            model=self._parent_model(),
-        )
+        if self._left_to_retirement:
+            # Stopped by ``leave_to_retirement``, or finished just as it came:
+            # no report is spilled and no row written, as no authority remains
+            # for them. The retirement ends a running row
+            # ``cancelled:parent_retired`` (D4) and Resume answers the call.
+            raise _LeftForSuccessor()
+        if self._foreground_ends_for_successor and (
+            result is None or result.status in _HANDED_OVER_ENDS
+        ):
+            # Pinned hand-over (P4): the shutdown's fence ended this child at
+            # its boundary (its effect-authority proof may have been in flight
+            # when the fence closed admission), or it never ran. End its row for the restart,
+            # before the retirement can cancel it; the successor's settle
+            # writes its result. No report is spilled: its transcript has
+            # what it wrote.
+            await self._end_for_successor(handle, subagent_id, name, result)
+            await self._await_successor_cancellation(call)
+        if run_failure is not None:
+            if self._foreground_ends_for_successor:
+                await self._await_successor_cancellation(call)
+            return run_failure
+        if result is None:  # pragma: no cover - only a pinned hand-over skips it
+            raise RuntimeError(f"subagent {handle} ({name}) produced no result")
+
+        try:
+            envelope = build_envelope(
+                result,
+                workspace_manager=getattr(
+                    self.parent_context, "workspace_manager", None
+                ),
+                entry_budget=budgets.return_budget_tokens,
+                probe=self.host.context_probe(),
+                n_in_batch=self._batch_size,
+                model=self._parent_model(),
+            )
+        except Exception:
+            if not self._foreground_ends_for_successor:
+                raise
+            # Handed over: the envelope is never returned, but the child's
+            # row must still end before the retirement; its transcript keeps
+            # what the unspilled report said.
+            logger.warning(
+                "subagent %s (%s): report could not be spilled after the hand-over",
+                handle,
+                name,
+                exc_info=True,
+            )
+            envelope = ""
+        if self._foreground_stop is not None and result.status == "interrupted:stopped":
+            envelope = stopped_envelope(envelope, has_text=bool(result.text.strip()))
         status = result.kind if result.kind in SUBAGENT_STATUSES else "error"
         spilled = report_path(handle) if self._report_exists(handle) else None
-        await self._commit_foreground_terminal(
-            handle,
-            subagent_id,
-            status=status,
-            outcome=result.status,
-            turns=result.turns,
-            tokens=result.tokens,
-            report_path=spilled,
-            error=result.error,
-        )
+        try:
+            await self._commit_foreground_terminal(
+                handle,
+                subagent_id,
+                status=status,
+                outcome=result.status,
+                turns=result.turns,
+                tokens=result.tokens,
+                report_path=spilled,
+                error=result.error,
+            )
+        except Exception:
+            if not self._foreground_ends_for_successor:
+                raise
+            # Handed over: no result may reach the parent. The receipt stays
+            # pending, so quiescence keeps waiting and retirement refuses.
+            logger.warning(
+                "subagent %s (%s): terminal write failed after the hand-over",
+                handle,
+                name,
+                exc_info=True,
+            )
+            await self._await_successor_cancellation(call)
         logger.info(
             "subagent %s (%s) %s: %d turns, %d tokens, %.1fs",
             handle,
@@ -554,6 +1081,10 @@ class SubagentRuntime:
             result.tokens,
             result.duration,
         )
+        if self._foreground_ends_for_successor:
+            # Finished across the hand-over: its row and report stand, and the
+            # successor's settle replays them as this call's result.
+            await self._await_successor_cancellation(call)
         if key is not None:
             self._records[key] = SubagentRecord(
                 key=key,
@@ -577,7 +1108,29 @@ class SubagentRuntime:
         concrete child thread and generation.  Null/best-effort ledgers are
         therefore refused here even though foreground U3 delegation continues
         to tolerate them.
+
+        Once the runtime is left to an authorized retirement, or the call
+        failed because such a retirement took the parent's authority, the
+        call returns nothing, as a foreground one: its refusal is no result
+        for the parent to save, and the termination cancels the turn.
         """
+        try:
+            answer = await self._run_background(call)
+        except Exception:
+            if not await self._retired_by_orchestrator():
+                raise
+        else:
+            if not self._left_to_retirement:
+                return answer
+        # Counted like a held foreground call (``foreground_held_for_
+        # successor``).
+        self._foreground_in_progress += 1
+        try:
+            await self._await_successor_cancellation(call)
+        finally:
+            self._foreground_in_progress -= 1
+
+    async def _run_background(self, call: SubagentCall) -> str:
         key = self._key(call)
         if key is not None:
             record = self._records.get(key)
@@ -1731,7 +2284,10 @@ class SubagentRuntime:
         deterministic interrupted evidence envelope through the normal atomic
         Lane-B transaction. A session foreground predecessor also receives one
         durable event because its synchronous tool-return channel died with
-        the prior process; worker foreground calls retain graph replay.
+        the prior process; worker foreground calls retain graph replay. A
+        session turn with more than one delegation call is settled as one
+        batch instead (``batch_recovery``): one tool result per call and one
+        continuation, when the orchestrator lists recovery plans.
         """
         async with self._recovery_lock:
             if self._recovery_complete:
@@ -1747,9 +2303,33 @@ class SubagentRuntime:
                 raise RuntimeError(
                     f"subagent orphan recovery has no parent {parent.kind} id"
                 )
-            rows = await asyncio.wait_for(lister(parent_id), timeout=_LEDGER_TIMEOUT_S)
+            # A session parent also gets the orchestrator's per-turn plans
+            # with the candidates (parallel_subagents.md §6.2). Plans are the
+            # proof that the orchestrator can settle a turn as one batch; one
+            # that predates them lists none, and every child then recovers on
+            # its own. Every other parent lists rows only.
+            plans: Optional[List[Any]] = None
+            recovery_lister = getattr(self.ledger, "list_live_recovery", None)
+            session_parent = (
+                str(getattr(self.host, "delivery_channel", "lane_b") or "") == "event"
+            )
+            if session_parent and callable(recovery_lister):
+                listed = await asyncio.wait_for(
+                    recovery_lister(parent_id), timeout=_LEDGER_TIMEOUT_S
+                )
+                if not isinstance(listed, Mapping):
+                    raise RuntimeError(
+                        "subagent orphan recovery returned no durable list"
+                    )
+                rows = listed.get("subagents")
+                plans = listed.get("recovery_turns")
+            else:
+                rows = await asyncio.wait_for(
+                    lister(parent_id), timeout=_LEDGER_TIMEOUT_S
+                )
             if not isinstance(rows, list):
                 raise RuntimeError("subagent orphan recovery returned no durable list")
+            batch = SessionTurnRecovery.for_runtime(self, rows, plans)
 
             recovered: List[Dict[str, Any]] = []
             adopter = getattr(self.ledger, "adopt_live", None)
@@ -1786,6 +2366,16 @@ class SubagentRuntime:
                         getattr(self.host, "delivery_channel", "lane_b") or "lane_b"
                     )
                     if delivery_channel == "event":
+                        if batch is not None:
+                            # A turn with more than one delegation call is
+                            # settled once, at its first listed child.
+                            settled, handled = await batch.recover(row)
+                            recovered.extend(settled)
+                            if handled:
+                                # The settle ended its row, or it was closed
+                                # meanwhile: nothing is left to settle here.
+                                self._settled_handles.add(handle)
+                                continue
                         loader = getattr(self.ledger, "load_messages", None)
                         terminalize = getattr(
                             self.ledger,
@@ -1841,8 +2431,8 @@ class SubagentRuntime:
                                 message=envelope,
                                 status=terminal_status,
                                 outcome=terminal_outcome,
-                                turns=int(row.get("total_turns") or 0),
-                                tokens=int(row.get("total_tokens") or 0),
+                                turns=_orphan_row_counter(row, "turns"),
+                                tokens=_orphan_row_counter(row, "tokens"),
                                 report_path=row.get("report_path") or None,
                                 error=(
                                     row.get("subagent_error")
@@ -1868,6 +2458,7 @@ class SubagentRuntime:
                                 f"session foreground orphan {handle} could not "
                                 "be durably delivered"
                             )
+                        self._settled_handles.add(handle)
                         delivered = (
                             str(committed.get("result") or "") != "already_delivered"
                         )
@@ -1900,11 +2491,12 @@ class SubagentRuntime:
                         subagent_id,
                         status="interrupted",
                         outcome="interrupted:parent_restart",
-                        turns=int(row.get("total_turns") or 0),
-                        tokens=int(row.get("total_tokens") or 0),
+                        turns=_orphan_row_counter(row, "turns"),
+                        tokens=_orphan_row_counter(row, "tokens"),
                         report_path=row.get("report_path") or None,
                         error="the parent runtime restarted",
                     )
+                    self._settled_handles.add(handle)
                     recovered.append(
                         {
                             "handle": handle,
@@ -1956,8 +2548,8 @@ class SubagentRuntime:
                 run.terminal_fields = {
                     "status": "interrupted",
                     "outcome": "interrupted:parent_restart",
-                    "turns": int(row.get("total_turns") or 0),
-                    "tokens": int(row.get("total_tokens") or 0),
+                    "turns": _orphan_row_counter(row, "turns"),
+                    "tokens": _orphan_row_counter(row, "tokens"),
                     "report_path": row.get("report_path") or None,
                     "error": run.error,
                 }
@@ -1978,7 +2570,13 @@ class SubagentRuntime:
             return recovered
 
     async def quiesce(self, reason: str = "parent quiescing") -> None:
-        """Close admission, settle current children, and commit their evidence."""
+        """Close admission, settle current children, and commit their evidence.
+
+        A foreground call held for the successor (``leave_foreground_for_
+        successor``) is already settled here: it has nothing to commit and
+        is never waited for. The termination's cancellation of the parent
+        turn ends it, writing nothing.
+        """
         async with self._state_lock:
             self._accepting = False
         # A durable create may already be in flight.  No new reservation can
@@ -1996,9 +2594,9 @@ class SubagentRuntime:
             async with self._state_lock:
                 if (
                     self._recovery_complete
-                    and not self._handles
+                    and self._handles <= self._settled_handles
                     and not self._active
-                    and not self._inflight
+                    and not self._unheld_inflight()
                     and not self._background
                     and not self._background_reservations
                     and not self._background_admissions
@@ -2008,16 +2606,20 @@ class SubagentRuntime:
                 ):
                     # Public End can revoke parent effect authority before
                     # the local watchdog runs. After orphan recovery, a life
-                    # that never reserved a child has no evidence to commit.
-                    # Close locally without ledger writes or notifications;
-                    # Resume still requires exact current parent authority.
+                    # whose every minted handle settled (terminal receipt
+                    # committed, or refused before any durable row) has no
+                    # evidence to commit; one that never reserved a child is
+                    # the empty case. Close locally without ledger writes or
+                    # notifications; Resume still requires exact current
+                    # parent authority.
                     return
             # A failed proof is ambiguous: the exact owner may be gone, or
             # the authority store may be transiently unavailable before the
             # retirement Begin commits. Keep admission closed, but preserve
             # the runtime so the same exact life can retry quiescence or resume
             # after a proven-uncommitted Begin. Explicit authority-loss paths
-            # call ``abandon`` themselves.
+            # call ``abandon`` themselves; a retirement the orchestrator
+            # authorized for this life goes to ``leave_to_retirement``.
             raise RuntimeError(
                 "subagent quiesce cannot prove exact settlement authority"
             )
@@ -2065,7 +2667,7 @@ class SubagentRuntime:
                     if not task.done():
                         task.cancel()
                 await asyncio.gather(*tasks, return_exceptions=True)
-        foreground_futures = list(self._inflight.values())
+        foreground_futures = self._unheld_inflight()
         if foreground_futures:
             try:
                 await asyncio.wait_for(
@@ -2168,6 +2770,8 @@ class SubagentRuntime:
             self._abandoning = True
             self._persistence_abandoned = True
         await self._background_admissions_drained.wait()
+        # A held call never ends on its own; waiting for it would hang.
+        self._release_successor_waiters()
         tasks = list(self._background_tasks.values())
         for task in tasks:
             if not task.done():
@@ -2187,6 +2791,59 @@ class SubagentRuntime:
         self._active.clear()
         await self._notify_changed()
 
+    async def leave_to_retirement(self, reason: str = "parent retired") -> None:
+        """Leave every child to the parent's authorized retirement (D4).
+
+        A retirement the orchestrator authorizes itself (a person's End, an
+        Officer decommission, the idle stand-down) installs its token before
+        the runtime hears of it, which revokes, for good, the parent authority
+        every child write needs: ``quiesce`` can then settle neither a live
+        child nor a pending receipt. The termination calls this instead, and
+        only with the orchestrator's authorization of this exact life in
+        hand.
+
+        Nothing is written. Running children are stopped and their rows stay
+        running, for the retirement to end ``cancelled:parent_retired``; a
+        queued or starting call never starts. No foreground call returns: each
+        is held, as at a platform hand-over, until the termination cancels the
+        parent turn, and Resume's settle answers each call once. Background
+        children are released as by ``abandon``. Returns once no child runs
+        and every foreground call in progress is held. The runtime is never
+        reused (``resume`` refuses it).
+        """
+        # First, so no call can return or write while the lock is awaited.
+        self._foreground_left_for_successor = True
+        self._left_to_retirement = True
+        async with self._state_lock:
+            self._accepting = False
+            self._abandoning = True
+            self._persistence_abandoned = True
+        await self._background_admissions_drained.wait()
+        tasks = [task for task in self._background_tasks.values() if not task.done()]
+        for task in tasks:
+            task.cancel()
+        drivers = list(self._active.values())
+        logger.info(
+            "subagent runtime left to the retirement (%s): stopping %d child(ren)",
+            reason,
+            len(drivers),
+        )
+        await asyncio.gather(
+            *(driver.stop(timeout=BATCH_STOP_GRACE_S) for driver in drivers),
+            return_exceptions=True,
+        )
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + BATCH_STOP_GRACE_S
+        while self._active or self._unheld_inflight():
+            if loop.time() >= deadline:
+                raise RuntimeError(
+                    "subagent retirement left a child running or a call unheld"
+                )
+            await asyncio.sleep(0.01)
+        await self._notify_changed()
+
     # ------------------------------------------------------------------
     # Teardown
     # ------------------------------------------------------------------
@@ -2197,6 +2854,7 @@ class SubagentRuntime:
         async with self._state_lock:
             self._accepting = False
         await self._background_admissions_drained.wait()
+        self._release_successor_waiters()
         for run in self._background.values():
             if run.status in {"queued", "running"}:
                 run.stop_requested = True
@@ -2388,11 +3046,69 @@ class SubagentRuntime:
         else:
             await self._ledger_update(subagent_id, **fields)
 
+    async def _end_for_successor(
+        self,
+        handle: str,
+        subagent_id: str,
+        name: str,
+        result: Optional[SubagentResult],
+    ) -> None:
+        """End a handed-over child's row as interrupted by the restart (P4).
+
+        The ends the successor's settle reads (``batch_recovery``): a child
+        that ran ends ``interrupted:parent_restart`` and its result is the
+        INTERRUPTED one, built from its transcript; a child that never got a
+        provider response (its row was opened across the hand-over, or the
+        fence refused its first call) did no work and ends
+        ``interrupted:not_started``, reported NOT STARTED. Written now
+        because the parent's retirement follows and would end a running row
+        ``cancelled:parent_retired``, which no recovery lists. A failed write
+        stays pending: quiescence and retirement then keep waiting, and a
+        forced stop leaves the row running for the successor.
+        """
+        turns = result.turns if result is not None else 0
+        tokens = result.tokens if result is not None else 0
+        ran = turns > 0
+        outcome = PARENT_RESTART_OUTCOME if ran else PARENT_RESTART_NOT_STARTED_OUTCOME
+        try:
+            await self._commit_foreground_terminal(
+                handle,
+                subagent_id,
+                status=PARENT_RESTART_STATUS,
+                outcome=outcome,
+                turns=turns,
+                tokens=tokens,
+                report_path=(
+                    report_path(handle) if ran and self._report_exists(handle) else None
+                ),
+                error=PARENT_RESTART_ERROR,
+            )
+        except Exception:
+            logger.warning(
+                "subagent %s (%s): could not end it for the successor",
+                handle,
+                name,
+                exc_info=True,
+            )
+            return
+        logger.info(
+            "subagent %s (%s) ended %s for the successor (parent shutting "
+            "down): %d turns, %d tokens",
+            handle,
+            name,
+            outcome,
+            turns,
+            tokens,
+        )
+
     async def _commit_foreground_terminal(
         self, handle: str, subagent_id: str, **fields: Any
     ) -> None:
         """Commit or retain one strict foreground terminal receipt."""
 
+        if self._left_to_retirement:
+            # No authority remains for the write: the retirement ends the row.
+            return
         try:
             await self._terminal_ledger_update(subagent_id, **fields)
         except BaseException:
@@ -2404,6 +3120,7 @@ class SubagentRuntime:
             raise
         else:
             self._foreground_terminal_pending.pop(handle, None)
+            self._settled_handles.add(handle)
 
     async def _ledger_update(self, subagent_id: str, **fields: Any) -> None:
         if self._persistence_abandoned:
@@ -2419,7 +3136,13 @@ class SubagentRuntime:
 
 
 __all__ = [
+    "BATCH_STOP_GRACE_S",
+    "BATCH_STOP_REASON",
+    "NOT_STARTED_HEADER",
+    "STOPPED_HEADER",
     "SubagentCall",
     "SubagentRecord",
     "SubagentRuntime",
+    "stopped_envelope",
+    "stopped_not_started_text",
 ]

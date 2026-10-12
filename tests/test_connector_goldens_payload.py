@@ -1,0 +1,306 @@
+"""Golden pins: the datasources payload the orchestrator sends to the agent.
+
+``build_datasources_payload`` (with ``apply_cloud_storage_override`` before it,
+as both dispatch paths call them) is the only place a resolved connector row
+becomes something the agent receives. The agent payload is an untyped list and
+agent images roll independently of the orchestrator, so D1 must keep it
+byte-identical (``connector_drivers.md``, "Wire compatibility"). Each case
+compares the compact JSON serialisation, key order included.
+
+Input rows are shaped like ``resolve_datasources_for_job`` returns them (see
+``tests/_connector_goldens.py``). The MCP deployment gates are the real
+``deployment_gates`` functions, steered by the environment as in production.
+
+Regenerate: ``UPDATE_CONNECTOR_GOLDENS=1 python -m pytest
+tests/test_connector_goldens_payload.py`` (see ``tests/_connector_goldens.py``).
+"""
+
+from __future__ import annotations
+
+import json
+from dataclasses import dataclass, field
+from types import SimpleNamespace
+from typing import Any
+
+import pytest
+
+from orchestrator.services import agent_datasource_payload as payload_module
+from orchestrator.services.connector_drivers import builtin_connector_drivers
+from orchestrator.services.deployment_gates import (
+    mcp_datasources_enabled,
+)
+from tests._connector_goldens import (
+    KINDS,
+    Golden,
+    all_rows,
+    resolved_row,
+)
+
+#: A user other than the connector's creator: a consumer of a public or
+#: shared connector.
+OTHER = "00000000-0000-0000-0000-0000000000c2"
+
+
+@dataclass(frozen=True)
+class PayloadCase:
+    rows: list[dict[str, Any]]
+    job_context: dict[str, Any] = field(default_factory=dict)
+    mcp: bool = True
+    pinned_defect: str | None = None
+
+
+CASES: dict[str, PayloadCase] = {}
+for _kind in KINDS:
+    CASES[f"{_kind}/read_write"] = PayloadCase([resolved_row(_kind)])
+    # Read-only Postgres and MongoDB links withhold the (unused) credentials
+    # object; Neo4j and WebDAV log in with theirs and keep it (D1a).
+    CASES[f"{_kind}/read_only"] = PayloadCase(
+        [resolved_row(_kind, project_read_only=True)]
+    )
+CASES.update(
+    {
+        # No project link: the LEFT JOIN yields NULL and the entry carries
+        # ``project_read_only: null`` rather than false.
+        "postgresql/unlinked": PayloadCase(
+            [resolved_row("postgresql", project_read_only=None)]
+        ),
+        # The creator's read-only tag is not forwarded as such: it joins the
+        # project link in ``project_read_only``, the stricter of the two
+        # (decisions 31 and 32), for the owner and every consumer alike.
+        "postgresql/creator_read_only_public": PayloadCase(
+            [
+                resolved_row(
+                    "postgresql", read_only=True, is_global=True, created_by=OTHER
+                )
+            ]
+        ),
+        # A read-write project link cannot lift the creator's tag ...
+        "postgresql/creator_read_only_link_read_write": PayloadCase(
+            [resolved_row("postgresql", read_only=True, project_read_only=False)]
+        ),
+        # ... and neither can a missing one.
+        "postgresql/creator_read_only_unlinked": PayloadCase(
+            [resolved_row("postgresql", read_only=True, project_read_only=None)]
+        ),
+        # A public connector whose creator never chose a mode is read-only.
+        "postgresql/public_no_mode_set": PayloadCase(
+            [resolved_row("postgresql", is_global=True, created_by=OTHER)]
+        ),
+        # A creator who published it read-write leaves the link to decide.
+        "postgresql/public_read_write_link_read_write": PayloadCase(
+            [resolved_row("postgresql", read_only=False, is_global=True)]
+        ),
+        "postgresql/public_read_write_link_read_only": PayloadCase(
+            [
+                resolved_row(
+                    "postgresql",
+                    read_only=False,
+                    is_global=True,
+                    project_read_only=True,
+                )
+            ]
+        ),
+        # An explicit read-write tag on a private connector changes nothing.
+        "postgresql/private_read_write_tag": PayloadCase(
+            [resolved_row("postgresql", read_only=False)]
+        ),
+        "repository_token/creator_read_only": PayloadCase(
+            [resolved_row("repository_token", read_only=True)]
+        ),
+        "email/creator_read_only_floors_access": PayloadCase(
+            [
+                resolved_row(
+                    "email",
+                    read_only=True,
+                    config={"access": "send", "folders": ["INBOX"]},
+                )
+            ]
+        ),
+        "mixed/all_kinds_creator_read_only": PayloadCase(
+            [resolved_row(kind, read_only=True) for kind in KINDS]
+        ),
+        "mixed/all_kinds_public_no_mode_set": PayloadCase(
+            [resolved_row(kind, is_global=True, created_by=OTHER) for kind in KINDS]
+        ),
+        "generic/credentials_stored_as_json_string": PayloadCase(
+            [
+                resolved_row(
+                    "generic",
+                    credentials=json.dumps({"env_vars": {"BILLING_TOKEN": "x"}}),
+                )
+            ]
+        ),
+        "generic/credentials_unparseable_string": PayloadCase(
+            [resolved_row("generic", credentials="{not json")]
+        ),
+        "generic/no_cli_hint_or_url": PayloadCase(
+            [resolved_row("generic", cli_hint=None, connection_url=None)]
+        ),
+        "webdav/cloud_storage_override_read_only": PayloadCase(
+            [resolved_row("webdav")],
+            job_context={"cloud_storage_read_only": True},
+        ),
+        # The job's override only tightens: it cannot lift a read-only link,
+        "webdav/cloud_storage_override_cannot_lift_read_only": PayloadCase(
+            [resolved_row("webdav", project_read_only=True)],
+            job_context={"cloud_storage_read_only": False},
+        ),
+        # nor the creator's read-only tag under a read-write link.
+        "webdav/cloud_storage_override_cannot_lift_creator_read_only": PayloadCase(
+            [resolved_row("webdav", read_only=True, project_read_only=False)],
+            job_context={"cloud_storage_read_only": False},
+        ),
+        # The override touches webdav rows only.
+        "postgresql/cloud_storage_override_ignored": PayloadCase(
+            [resolved_row("postgresql")],
+            job_context={"cloud_storage_read_only": True},
+        ),
+        "repository_token/require_default_branch": PayloadCase(
+            [resolved_row("repository_token", require_default_branch=True)]
+        ),
+        "repository_token/no_id_no_config": PayloadCase(
+            [resolved_row("repository_token", id=None, config=None)]
+        ),
+        "email/read_only_link_floors_access": PayloadCase(
+            [
+                resolved_row(
+                    "email",
+                    project_read_only=True,
+                    config={"access": "send", "folders": ["INBOX"]},
+                )
+            ]
+        ),
+        "email/unattended_send_without_owner_grant": PayloadCase(
+            [
+                resolved_row(
+                    "email",
+                    config={
+                        "access": "send",
+                        "folders": ["INBOX"],
+                        "unattended_send": True,
+                    },
+                    _owner_can_autonomous_send=False,
+                )
+            ]
+        ),
+        "email/unattended_send_with_owner_grant": PayloadCase(
+            [
+                resolved_row(
+                    "email",
+                    config={
+                        "access": "send",
+                        "folders": ["INBOX"],
+                        "unattended_send": True,
+                    },
+                    _owner_can_autonomous_send=True,
+                )
+            ]
+        ),
+        "email/raw_config_defaults": PayloadCase(
+            [resolved_row("email", config={"folders": [" INBOX ", "", 3]})]
+        ),
+        "email/second_mailbox_skipped": PayloadCase(
+            [
+                resolved_row("email"),
+                resolved_row(
+                    "email",
+                    id="d5000b0c-0000-0000-0000-000000000b0c",
+                    name="Sales inbox",
+                ),
+            ]
+        ),
+        "kb/config_needs_normalising": PayloadCase(
+            [resolved_row("kb", config={"root_path": "./notes//daily/"})]
+        ),
+        "mcp_remote/datasources_gate_off": PayloadCase(
+            [resolved_row("mcp_remote")], mcp=False
+        ),
+        "mcp_stdio/datasources_gate_off": PayloadCase(
+            [resolved_row("mcp_stdio")], mcp=False
+        ),
+        "mixed/all_kinds_read_write": PayloadCase(all_rows()),
+        "mixed/all_kinds_read_only": PayloadCase(all_rows(project_read_only=True)),
+        "mixed/all_kinds_gates_off": PayloadCase(all_rows(), mcp=False),
+        # Key order after the driver's own fields: cli_hint, default_branch,
+        # then require_default_branch.
+        "generic/cli_hint_and_default_branch": PayloadCase(
+            [resolved_row("generic", default_branch="release")]
+        ),
+        "repository_token/every_trailing_key": PayloadCase(
+            [
+                resolved_row(
+                    "repository_token",
+                    cli_hint="clone with care",
+                    require_default_branch=True,
+                )
+            ]
+        ),
+        # A stored type no driver serves is forwarded as stored.
+        "unknown_type/forwarded_as_stored": PayloadCase(
+            [
+                resolved_row(
+                    "generic",
+                    type="ftp",
+                    default_branch="main",
+                    project_read_only=True,
+                )
+            ]
+        ),
+        "empty": PayloadCase([]),
+    }
+)
+
+
+@pytest.fixture(scope="module")
+def golden():
+    golden = Golden("payload", CASES)
+    yield golden
+    golden.flush()
+
+
+@pytest.fixture
+def gates(monkeypatch):
+    def apply(case: PayloadCase) -> None:
+        if case.mcp:
+            monkeypatch.setenv("MCP_DATASOURCES_ENABLED", "true")
+        else:
+            monkeypatch.delenv("MCP_DATASOURCES_ENABLED", raising=False)
+
+    return apply
+
+
+def build_payload(case: PayloadCase) -> tuple[list[dict] | None, list[str]]:
+    """Run the dispatch order: cloud override, then the payload builder."""
+    logged: list[str] = []
+    logger = SimpleNamespace(warning=lambda msg, *args: logged.append(msg % args))
+    rows = [dict(row) for row in case.rows]
+    payload_module.apply_cloud_storage_override(rows, dict(case.job_context))
+    payload = payload_module.build_datasources_payload(
+        rows,
+        dependencies=payload_module.DatasourcePayloadDependencies(
+            logger=logger,
+            mcp_datasources_enabled=mcp_datasources_enabled,
+            connector_drivers=builtin_connector_drivers(),
+            workspace_ssh_known_hosts=lambda: "",
+        ),
+    )
+    return payload, logged
+
+
+@pytest.mark.parametrize("case_id", list(CASES))
+def test_payload_matches_golden(case_id, golden, gates):
+    case = CASES[case_id]
+    gates(case)
+
+    payload, warnings = build_payload(case)
+
+    result: dict[str, Any] = {"payload": payload}
+    if warnings:
+        result["warnings"] = warnings
+    if case.pinned_defect:
+        result["pinned_defect"] = case.pinned_defect
+    golden.check(case_id, result, exact_bytes=True)
+
+
+def test_golden_covers_every_case(golden):
+    golden.assert_covers_cases()

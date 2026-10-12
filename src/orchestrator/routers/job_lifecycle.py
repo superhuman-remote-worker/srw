@@ -9,8 +9,15 @@ from typing import Any, Awaitable, Callable
 from fastapi import APIRouter, Depends, HTTPException, Request
 
 from orchestrator.schemas.job_create import PublicJobCreateBody
+from orchestrator.services.config_overrides import (
+    refuse_caller_transport_keys,
+    refuse_execution_owned_workspace_keys,
+)
 from orchestrator.services.job_admission import JobAdmissionActor
-from orchestrator.services.job_mutation_controls import JobControlOperations
+from orchestrator.services.job_mutation_controls import (
+    JobCancelResponse,
+    JobControlOperations,
+)
 
 router = APIRouter()
 
@@ -107,6 +114,11 @@ async def admit_job_request(
                 str(job.project_id),
                 min_role="editor",
             )
+    # Fail closed on caller-supplied transport, the same write-boundary
+    # vocabulary as the MCP create tool. Runs after auth so an anonymous
+    # request still gets 401 first.
+    refuse_caller_transport_keys(job.config_override)
+    refuse_execution_owned_workspace_keys(job.config_override)
     return await dependencies.admit_job(
         command=job,
         actor=JobAdmissionActor(
@@ -185,7 +197,7 @@ async def cancel_job(
     dependencies: JobControlRouteDependencies = Depends(
         get_job_control_route_dependencies
     ),
-) -> dict[str, str]:
+) -> JobCancelResponse:
     """Cancel a running job. **Dual-callable** (P4b): cockpit user with job
     access (``require_job_access``) OR agent with valid ``X-Internal-Key``
     (agent's `cancel_job` tool path).
@@ -215,13 +227,19 @@ async def pause_job(
     to the agent pod. The agent finishes its current graph node, saves
     the checkpoint, and becomes available for new work.
 
-    The paused job re-enters the dispatch queue and will be auto-resumed
-    when an agent becomes available.
+    The paused job stays paused on either lane: it carries a durable operator
+    pause hold that neither the dispatcher, the stateless admission and worker
+    claim, nor an internal resume will cross, so it runs again only after an
+    explicit ``POST /api/jobs/{job_id}/resume`` (or an admin assignment).
     """
-    _, job = await dependencies.require_internal_or_job_access(
+    user, job = await dependencies.require_internal_or_job_access(
         request, dependencies.store, job_id
     )
-    return await dependencies.operations.pause(job_id, job=job)
+    return await dependencies.operations.pause(
+        job_id,
+        job=job,
+        paused_by=str(user["id"]) if user and user.get("id") else None,
+    )
 
 
 @router.put("/api/jobs/{job_id}/agent-release")

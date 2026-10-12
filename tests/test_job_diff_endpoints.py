@@ -27,6 +27,7 @@ from fastapi import HTTPException
 
 import orchestrator.main
 from orchestrator.routers import job_diff as job_diff_routes
+from orchestrator.application import workspace as workspace_composition
 
 # --------------------------------------------------------------------------- #
 # Fixtures / helpers
@@ -121,8 +122,12 @@ def _patch_endpoint(*, user: dict, job: dict, gitea) -> ExitStack:
     # ``user``/``job`` are the pair the caller hands to ``_deps`` — the access
     # gate lives on the route dependencies, not on a patchable global.
     stack = ExitStack()
-    stack.enter_context(patch("orchestrator.main.gitea_client", gitea))
-    stack.enter_context(patch("orchestrator.main.postgres_db", MagicMock()))
+    stack.enter_context(
+        patch("orchestrator.main.app.state.resources.gitea_client", gitea)
+    )
+    stack.enter_context(
+        patch("orchestrator.main.app.state.resources.postgres_db", MagicMock())
+    )
     return stack
 
 
@@ -135,7 +140,9 @@ def _deps(user: dict, job: dict):
     reads ``main``'s globals when it runs.
     """
     return dataclasses.replace(
-        orchestrator.main._job_diff_dependencies(),
+        workspace_composition.job_diff_dependencies(
+            orchestrator.main.app.state.resources
+        ),
         require_job_access=AsyncMock(return_value=(user, job)),
     )
 

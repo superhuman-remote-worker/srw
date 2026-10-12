@@ -8,10 +8,13 @@ helpers neither construct provisioners nor perform network or database I/O.
 from __future__ import annotations
 
 import json
+import os
+import time
 from typing import Any, Callable, Mapping, Protocol
 from uuid import UUID
 
 from orchestrator.services.cloud.handles import SessionFolderHandle
+from orchestrator.services.vm_creation_progress import vm_creation_projection
 from shared.workspace_contract import (
     WORKSPACE_CONTRACT_CONTEXT_KEY,
     WORKSPACE_DISPATCH_AUTHORITY_CONTEXT_KEY,
@@ -52,6 +55,100 @@ _WORKSPACE_RECOVERY_STATES = {
     "reconciling_outcome",
     "paused_attention",
 }
+
+_VM_PHASE_ATTENTION_MESSAGES = {
+    "vm_rootdisk_stalled": "VM disk preparation needs attention because progress has stopped.",
+    "vm_runtime_changed": "VM startup needs attention because its runtime changed unexpectedly.",
+    "vm_phase_identity_conflict": "VM startup needs attention because its workspace identity could not be verified.",
+}
+
+
+def _vm_phase_attention_message(vm: Mapping[str, Any]) -> str | None:
+    from orchestrator.services.dispatch_guards import vm_phase_decision
+
+    if vm.get("status") == "query_failed":
+        return "VM startup needs attention because its progress could not be verified. The workspace disk is retained."
+    if vm.get("status") == "ready" and (
+        vm.get("provisioning_attention_reason") is None
+        and vm.get("provisioning") is None
+    ):
+        return None
+    # Existing cleanup, dependency and initialization handlers own their
+    # diagnostics. Only initial VM startup uses the new phase policy.
+    if vm.get("status") not in {
+        "creating",
+        "created",
+        "provisioning",
+        "starting",
+        "ssh_pending",
+        "running",
+        "query_failed",
+        "ready",
+    }:
+        return None
+    if vm.get("initialization_started_at") is not None and vm.get("status") != "ready":
+        return None
+    decision = vm_phase_decision(
+        vm,
+        now=time.time(),
+        timeout_s=int(os.environ.get("VM_PROVISION_TIMEOUT_S", "600")),
+        rootdisk_stall_timeout_s=int(
+            os.environ.get("VM_ROOTDISK_STALL_TIMEOUT_S", "2700")
+        ),
+    )
+    if decision.action != "attention":
+        return None
+    return (
+        _VM_PHASE_ATTENTION_MESSAGES.get(
+            decision.reason,
+            "VM startup needs attention because its progress could not be verified.",
+        )
+        + " The workspace disk is retained."
+    )
+
+
+def vm_provisioning_message(vm: Any) -> str | None:
+    """Same safe startup/cleanup diagnostic for list and detail reads."""
+    if not isinstance(vm, dict):
+        return None
+    if (
+        vm.get("status") == "retiring_process_zero"
+        or vm.get("retirement_cleanup_pending") is True
+    ):
+        reason = (
+            "VM cleanup is waiting to verify that previous workspace processes have stopped. "
+            if vm.get("status") == "retiring_process_zero"
+            else "VM cleanup is waiting for the previous workspace release to finish. "
+        )
+        return reason + "The workspace disk is retained; cleanup retries automatically."
+    if not isinstance(vm.get("status"), str):
+        return None
+    return _vm_phase_attention_message(vm)
+
+
+# The coordinate-free slice of a controller's live VM status reply. The rest of
+# it — pod IP, VM name and namespace, VM/pod UIDs, provision generation — is
+# the transport and generation authority redact_job_config_override keeps off
+# the job API; the controller's raw error text is dropped with it.
+_PUBLIC_LIVE_VM_KEYS = ("status", "ready", "phase", "vmi_phase", "created")
+
+
+def public_vm_status(vm: Any) -> dict[str, Any]:
+    """What the job API shows of a job's ``context.vm`` branch: its lifecycle
+    status and the same safe diagnostic ``redact_job_config_override`` turns
+    into ``error_message``. SSH host/port, host-key pin and identities stay
+    server-side."""
+    vm = vm if isinstance(vm, Mapping) else {}
+    public: dict[str, Any] = {"status": vm.get("status")}
+    message = vm_provisioning_message(dict(vm))
+    if message:
+        public["message"] = message
+    return public
+
+
+def public_live_vm_status(live: Mapping[str, Any]) -> dict[str, Any]:
+    """The coordinate-free fields of a live VM controller status reply."""
+    return {key: live.get(key) for key in _PUBLIC_LIVE_VM_KEYS}
 
 
 def workspace_recovery_projection(job: Mapping[str, Any]) -> dict[str, Any] | None:
@@ -102,6 +199,10 @@ def redact_job_config_override(
     """Strip credentials and private workspace lease identity from a job."""
 
     job = dict(job)
+    # get_job loads native idle authority for approval's route-load fence; it
+    # is not part of the public Job projection.
+    job.pop("workspace_idle_episode", None)
+    job.pop("workspace_idle_revision", None)
     if (
         not isinstance(job.get("workspace_contract"), dict)
         or "state" not in job["workspace_contract"]
@@ -112,6 +213,9 @@ def redact_job_config_override(
     recovery = workspace_recovery_projection(job)
     job.pop("_workspace_recovery", None)
     job["workspace_recovery"] = recovery
+    creation = vm_creation_projection(job)
+    job.pop("_vm_creation", None)
+    job["vm_creation"] = creation
     job = redact_nested_workspace_state(
         job, field="context", runtime_incarnation_key=runtime_incarnation_key
     )
@@ -128,20 +232,10 @@ def redact_job_config_override(
             job.get("status") in {"created", "paused"}
             and not job.get("error_message")
             and isinstance(vm, dict)
-            and (
-                vm.get("status") == "retiring_process_zero"
-                or vm.get("retirement_cleanup_pending") is True
-            )
         ):
-            reason = (
-                "VM cleanup is waiting to verify that previous workspace processes "
-                "have stopped. "
-                if vm.get("status") == "retiring_process_zero"
-                else "VM cleanup is waiting for the previous workspace release to finish. "
-            )
-            job["error_message"] = reason + (
-                "The workspace disk is retained; cleanup retries automatically."
-            )
+            message = vm_provisioning_message(vm)
+            if message:
+                job["error_message"] = message
         # The coordinate-free workspace_contract projection above is the
         # public contract. Provisioner branches contain SSH hosts, pod/service
         # coordinates and generation authority needed only by server and
@@ -149,7 +243,10 @@ def redact_job_config_override(
         public_context = dict(context)
         for key in (
             "vm",
+            "last_vm",
+            "_vm_creation_pending",
             "workspace_container",
+            "last_workspace_container",
             WORKSPACE_CONTRACT_CONTEXT_KEY,
             WORKSPACE_DISPATCH_AUTHORITY_CONTEXT_KEY,
             WORKSPACE_RUNTIME_CONTEXT_KEY,
@@ -159,6 +256,13 @@ def redact_job_config_override(
         job["context"] = (
             json.dumps(public_context) if context_was_str else public_context
         )
+    if (
+        creation is not None
+        and job.get("status") in {"created", "paused", "failed"}
+        and not job.get("error_message")
+        and recovery is None
+    ):
+        job["error_message"] = creation["message"]
     co = job.get("config_override")
     if co is None:
         return job
@@ -210,6 +314,7 @@ def redact_nested_workspace_state(
                 "_docker_workspace_attested",
                 "_docker_workspace_host_key_fingerprint",
                 "quarantine_reason",
+                "initial_runtime",
             )
         ):
             continue
@@ -224,6 +329,7 @@ def redact_nested_workspace_state(
         context.pop("_docker_workspace_attested", None)
         context.pop("_docker_workspace_host_key_fingerprint", None)
         context.pop("quarantine_reason", None)
+        context.pop("initial_runtime", None)
         cleaned[context_key] = context
     if not changed:
         return record
@@ -263,27 +369,79 @@ def resolve_exported_folder_url(
         return None
 
 
+def _review_context(job: Mapping[str, Any]) -> dict[str, Any] | None:
+    """The job's context when the read carried it, else ``None``."""
+    context = job.get("context")
+    if isinstance(context, str):
+        try:
+            context = json.loads(context)
+        except (json.JSONDecodeError, TypeError):
+            return None
+    return context if isinstance(context, dict) else None
+
+
+def cloud_review_mode(job: Mapping[str, Any], *, has_cloud_folder: bool) -> str:
+    """``diff`` when the job has a project-folder diff to review, or one may
+    still come; ``open_folder`` otherwise.
+
+    A diff to review: ``diff_status`` is set. One that may still come: the
+    job's checkout is at ``reviewed_write_back`` (``context.cloud_checkout``,
+    or a read's ``cloud_checkout`` column), or the job is an older one whose
+    copy was implicit (no checkout key, a baseline, a project with a
+    folder). A read-only copy, a job without one and a loose job get the
+    folder affordance: their deliverables are what the outbox delivers. A
+    read that carries neither the context nor the column can only answer
+    from ``diff_status``; both job lists carry the column.
+    """
+    if job.get("diff_status"):
+        return "diff"
+    context = _review_context(job)
+    if context is not None:
+        known, checkout = True, context.get("cloud_checkout")
+    elif "cloud_checkout" in job:
+        known, checkout = True, job.get("cloud_checkout")
+        if isinstance(checkout, str):
+            try:
+                checkout = json.loads(checkout)
+            except (json.JSONDecodeError, TypeError):
+                checkout = None
+    else:
+        known, checkout = False, None
+    if isinstance(checkout, dict):
+        return (
+            "diff" if checkout.get("access") == "reviewed_write_back" else "open_folder"
+        )
+    if (
+        known
+        and checkout is None
+        and job.get("cloud_diff_baseline_commit")
+        and has_cloud_folder
+    ):
+        return "diff"
+    return "open_folder"
+
+
 def with_cloud_review_mode(
     job: dict[str, Any], *, resolve_folder_url: Callable[[str | None], str | None]
 ) -> dict[str, Any]:
     """Attach the computed ``cloud_review_mode`` and drop the raw join column.
 
-    Routing signal for the cockpit's job-review UI: a job whose project has a
-    main-cloud folder goes through the Mode A diff-review flow (``'diff'``);
-    everything else — loose jobs and projects without a cloud folder, including
-    the auto-assigned default project — gets the Mode B "Open cloud folder"
-    affordance (``'open_folder'``). Mirrors the seed-time gate in
-    ``services/job_cloud_baseline.py``. ``project_has_cloud_folder`` is computed
-    by the ``LEFT JOIN projects`` in the postgres read queries; we pop it so the
-    raw column never leaves over REST.
+    Routing signal for the cockpit's job-review UI (:func:`cloud_review_mode`):
+    a job with a project-folder diff to review, or one that may still come,
+    goes through the diff-review flow (``'diff'``); everything else gets the
+    "Open cloud folder" affordance (``'open_folder'``), whose export is the
+    job's outbox re-synced. ``project_has_cloud_folder`` is computed by the
+    ``LEFT JOIN projects`` in the postgres read queries, and a list read may
+    carry ``cloud_checkout`` as a column; both are popped so neither raw
+    column leaves over REST.
 
     Also resolves ``exported_folder_handle`` into a ready-to-open
     ``exported_folder_url`` for the same reason: handles are opaque to
     everything outside the owning backend, so the cockpit can't derive it.
     """
     job = dict(job)
-    job["cloud_review_mode"] = (
-        "diff" if job.pop("project_has_cloud_folder", False) else "open_folder"
-    )
+    has_folder = bool(job.pop("project_has_cloud_folder", False))
+    job["cloud_review_mode"] = cloud_review_mode(job, has_cloud_folder=has_folder)
+    job.pop("cloud_checkout", None)
     job["exported_folder_url"] = resolve_folder_url(job.get("exported_folder_handle"))
     return job

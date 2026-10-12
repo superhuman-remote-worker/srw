@@ -355,13 +355,27 @@ class PreparationStore:
                 raise PreparationConflict(
                     "Preparation DataVolume identity changed before deletion."
                 )
+            from vm_controller.creation_sources import pins
+
+            if not dv["metadata"].get("resourceVersion"):
+                raise PreparationConflict("Preparation source revision is unproven.")
+            if any(
+                pin["state"] not in {"released", "disposed"}
+                for pin in pins(dv).values()
+            ):
+                return False
             await self.call(
                 self.custom.delete_namespaced_custom_object,
                 group="cdi.kubevirt.io",
                 version="v1beta1",
                 plural="datavolumes",
                 name=name,
-                body={"preconditions": {"uid": dv_uid}},
+                body={
+                    "preconditions": {
+                        "uid": dv_uid,
+                        "resourceVersion": dv["metadata"]["resourceVersion"],
+                    }
+                },
             )
         if pvc is not None:
             await self.call(

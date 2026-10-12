@@ -15,6 +15,18 @@ from fastapi import HTTPException
 import orchestrator.main as main
 from orchestrator.services.runtime_actor import RuntimeActorRefreshExchange
 from shared.runtime_actor import RuntimeActorContext
+from orchestrator.application import access as access_composition
+from orchestrator.application import sessions as sessions_composition
+from orchestrator.schemas import (
+    officer_runtime_verification as officer_runtime_verification_module,
+)
+from orchestrator.security import access as access_module
+from orchestrator.services import runtime_actor as runtime_actor_module
+from orchestrator.services import (
+    runtime_actor_verification as runtime_actor_verification_module,
+)
+from orchestrator.services import session_wake as session_wake_module
+import functools
 
 
 PROJECT_ID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
@@ -33,7 +45,10 @@ def _routed_request():
     """
     request = MagicMock()
     request.app.state.officer_runtime_verification_dependencies_factory = (
-        main._officer_runtime_verification_dependencies
+        functools.partial(
+            sessions_composition.officer_runtime_verification_dependencies,
+            main.app.state.resources,
+        )
     )
     return request
 
@@ -45,7 +60,9 @@ def _body(**overrides):
         "expires_in_seconds": 900,
     }
     values.update(overrides)
-    return main.OfficerRuntimeVerificationPlanRequest(**values)
+    return officer_runtime_verification_module.OfficerRuntimeVerificationPlanRequest(
+        **values
+    )
 
 
 @pytest.mark.asyncio
@@ -61,13 +78,18 @@ async def test_admin_plan_route_uses_only_authenticated_admin_identity(monkeypat
         }
     )
     audit = AsyncMock()
-    monkeypatch.setattr(main, "_require_admin", require_admin)
-    monkeypatch.setattr(main, "create_runtime_verification_plan", create)
-    monkeypatch.setattr(main, "log_security_event", audit)
-    monkeypatch.setattr(main, "OFFICER_RUNTIME_VERIFICATION_ENABLED", True)
+    monkeypatch.setattr(access_composition, "require_admin", require_admin)
+    monkeypatch.setattr(runtime_actor_verification_module, "create_plan", create)
+    monkeypatch.setattr(access_module, "log_security_event", audit)
+    monkeypatch.setattr(
+        main.app.state.resources.settings, "officer_runtime_verification_enabled", True
+    )
     request = MagicMock()
     request.app.state.officer_runtime_verification_dependencies_factory = (
-        main._officer_runtime_verification_dependencies
+        functools.partial(
+            sessions_composition.officer_runtime_verification_dependencies,
+            main.app.state.resources,
+        )
     )
 
     result = (
@@ -86,7 +108,7 @@ async def test_admin_plan_route_uses_only_authenticated_admin_identity(monkeypat
         },
     }
     create.assert_awaited_once_with(
-        main.postgres_db,
+        main.app.state.resources.postgres_db,
         enabled=True,
         project_id=PROJECT_ID,
         idempotency_key=IDEMPOTENCY_KEY,
@@ -98,7 +120,7 @@ async def test_admin_plan_route_uses_only_authenticated_admin_identity(monkeypat
         response_loss_gap_seconds=None,
     )
     audit.assert_awaited_once_with(
-        main.postgres_db,
+        main.app.state.resources.postgres_db,
         event_type="officer_runtime_verification_created",
         user=admin,
         resource_type="officer_runtime_verification",
@@ -114,9 +136,11 @@ async def test_admin_plan_route_uses_only_authenticated_admin_identity(monkeypat
 @pytest.mark.asyncio
 async def test_viewer_cannot_reach_plan_service(monkeypatch):
     denied = HTTPException(status_code=403, detail="Admin access required")
-    monkeypatch.setattr(main, "_require_admin", AsyncMock(side_effect=denied))
+    monkeypatch.setattr(
+        access_composition, "require_admin", AsyncMock(side_effect=denied)
+    )
     create = AsyncMock()
-    monkeypatch.setattr(main, "create_runtime_verification_plan", create)
+    monkeypatch.setattr(runtime_actor_verification_module, "create_plan", create)
 
     with pytest.raises(HTTPException) as exc:
         await officer_runtime_verification_router.create_officer_runtime_verification(
@@ -130,16 +154,18 @@ async def test_viewer_cannot_reach_plan_service(monkeypatch):
 @pytest.mark.asyncio
 async def test_disabled_plan_route_is_not_discoverable_as_an_active_seam(monkeypatch):
     monkeypatch.setattr(
-        main,
-        "_require_admin",
+        access_composition,
+        "require_admin",
         AsyncMock(return_value={"id": ADMIN_ID, "real_is_admin": True}),
     )
-    monkeypatch.setattr(main, "OFFICER_RUNTIME_VERIFICATION_ENABLED", False)
     monkeypatch.setattr(
-        main,
-        "create_runtime_verification_plan",
+        main.app.state.resources.settings, "officer_runtime_verification_enabled", False
+    )
+    monkeypatch.setattr(
+        runtime_actor_verification_module,
+        "create_plan",
         AsyncMock(
-            side_effect=main.RuntimeVerificationPlanError(
+            side_effect=runtime_actor_verification_module.RuntimeVerificationPlanError(
                 "verification_disabled", "disabled", status_code=404
             )
         ),
@@ -171,13 +197,17 @@ async def test_committed_response_loss_returns_only_generic_retry(monkeypatch):
         response_lost=True,
         verification_plan_id=PLAN_ID,
     )
-    monkeypatch.setattr(main, "require_internal", AsyncMock())
+    monkeypatch.setattr(access_module, "require_internal", AsyncMock())
     monkeypatch.setattr(
-        main, "refresh_runtime_actor_exchange", AsyncMock(return_value=exchange)
+        runtime_actor_module,
+        "refresh_runtime_actor_exchange",
+        AsyncMock(return_value=exchange),
     )
     kick = MagicMock()
-    monkeypatch.setattr(main, "_kick_officer_event_drain", kick)
-    monkeypatch.setattr(main, "OFFICER_RUNTIME_VERIFICATION_ENABLED", True)
+    monkeypatch.setattr(session_wake_module, "kick_event_drain", kick)
+    monkeypatch.setattr(
+        main.app.state.resources.settings, "officer_runtime_verification_enabled", True
+    )
 
     with pytest.raises(HTTPException) as exc:
         await officer_runtime_verification_router.refresh_runtime_actor(
@@ -208,16 +238,23 @@ async def test_recover_transition_is_admin_only_and_exact_plan(monkeypatch):
     )
     audit = AsyncMock()
     monkeypatch.setattr(
-        main,
-        "_require_admin",
+        access_composition,
+        "require_admin",
         AsyncMock(return_value=admin),
     )
-    monkeypatch.setattr(main, "transition_runtime_verification_plan", transition)
-    monkeypatch.setattr(main, "log_security_event", audit)
-    monkeypatch.setattr(main, "OFFICER_RUNTIME_VERIFICATION_ENABLED", True)
+    monkeypatch.setattr(
+        runtime_actor_verification_module, "transition_plan", transition
+    )
+    monkeypatch.setattr(access_module, "log_security_event", audit)
+    monkeypatch.setattr(
+        main.app.state.resources.settings, "officer_runtime_verification_enabled", True
+    )
     request = MagicMock()
     request.app.state.officer_runtime_verification_dependencies_factory = (
-        main._officer_runtime_verification_dependencies
+        functools.partial(
+            sessions_composition.officer_runtime_verification_dependencies,
+            main.app.state.resources,
+        )
     )
 
     result = await officer_runtime_verification_router.transition_officer_runtime_verification(
@@ -226,7 +263,7 @@ async def test_recover_transition_is_admin_only_and_exact_plan(monkeypatch):
 
     assert result["plan"]["state"] == "recovering"
     transition.assert_awaited_once_with(
-        main.postgres_db,
+        main.app.state.resources.postgres_db,
         enabled=True,
         project_id=PROJECT_ID,
         plan_id=PLAN_ID,
@@ -234,7 +271,7 @@ async def test_recover_transition_is_admin_only_and_exact_plan(monkeypatch):
         actor_id=ADMIN_ID,
     )
     audit.assert_awaited_once_with(
-        main.postgres_db,
+        main.app.state.resources.postgres_db,
         event_type="officer_runtime_verification_recovery_requested",
         user=admin,
         resource_type="officer_runtime_verification",
@@ -264,10 +301,16 @@ async def test_transition_retry_after_lost_response_is_audited_as_replay(monkeyp
         ]
     )
     audit = AsyncMock()
-    monkeypatch.setattr(main, "_require_admin", AsyncMock(return_value=admin))
-    monkeypatch.setattr(main, "transition_runtime_verification_plan", transition)
-    monkeypatch.setattr(main, "log_security_event", audit)
-    monkeypatch.setattr(main, "OFFICER_RUNTIME_VERIFICATION_ENABLED", True)
+    monkeypatch.setattr(
+        access_composition, "require_admin", AsyncMock(return_value=admin)
+    )
+    monkeypatch.setattr(
+        runtime_actor_verification_module, "transition_plan", transition
+    )
+    monkeypatch.setattr(access_module, "log_security_event", audit)
+    monkeypatch.setattr(
+        main.app.state.resources.settings, "officer_runtime_verification_enabled", True
+    )
 
     # The first successful HTTP result is deliberately discarded.
     await officer_runtime_verification_router.transition_officer_runtime_verification(
@@ -299,13 +342,22 @@ async def test_disarm_success_emits_attributed_security_event(monkeypatch):
         }
     )
     audit = AsyncMock()
-    monkeypatch.setattr(main, "_require_admin", AsyncMock(return_value=admin))
-    monkeypatch.setattr(main, "transition_runtime_verification_plan", transition)
-    monkeypatch.setattr(main, "log_security_event", audit)
-    monkeypatch.setattr(main, "OFFICER_RUNTIME_VERIFICATION_ENABLED", True)
+    monkeypatch.setattr(
+        access_composition, "require_admin", AsyncMock(return_value=admin)
+    )
+    monkeypatch.setattr(
+        runtime_actor_verification_module, "transition_plan", transition
+    )
+    monkeypatch.setattr(access_module, "log_security_event", audit)
+    monkeypatch.setattr(
+        main.app.state.resources.settings, "officer_runtime_verification_enabled", True
+    )
     request = MagicMock()
     request.app.state.officer_runtime_verification_dependencies_factory = (
-        main._officer_runtime_verification_dependencies
+        functools.partial(
+            sessions_composition.officer_runtime_verification_dependencies,
+            main.app.state.resources,
+        )
     )
 
     result = await officer_runtime_verification_router.transition_officer_runtime_verification(
@@ -314,7 +366,7 @@ async def test_disarm_success_emits_attributed_security_event(monkeypatch):
 
     assert result["plan"]["disarmed_by"] == ADMIN_ID
     transition.assert_awaited_once_with(
-        main.postgres_db,
+        main.app.state.resources.postgres_db,
         enabled=True,
         project_id=PROJECT_ID,
         plan_id=PLAN_ID,
@@ -322,7 +374,7 @@ async def test_disarm_success_emits_attributed_security_event(monkeypatch):
         actor_id=ADMIN_ID,
     )
     audit.assert_awaited_once_with(
-        main.postgres_db,
+        main.app.state.resources.postgres_db,
         event_type="officer_runtime_verification_disarmed",
         user=admin,
         resource_type="officer_runtime_verification",
@@ -339,21 +391,23 @@ async def test_disarm_success_emits_attributed_security_event(monkeypatch):
 async def test_idempotency_conflict_is_stable_409_and_not_success_audited(monkeypatch):
     audit = AsyncMock()
     monkeypatch.setattr(
-        main,
-        "_require_admin",
+        access_composition,
+        "require_admin",
         AsyncMock(return_value={"id": ADMIN_ID, "real_is_admin": True}),
     )
     monkeypatch.setattr(
-        main,
-        "create_runtime_verification_plan",
+        runtime_actor_verification_module,
+        "create_plan",
         AsyncMock(
-            side_effect=main.RuntimeVerificationPlanError(
+            side_effect=runtime_actor_verification_module.RuntimeVerificationPlanError(
                 "idempotency_conflict", "different request"
             )
         ),
     )
-    monkeypatch.setattr(main, "log_security_event", audit)
-    monkeypatch.setattr(main, "OFFICER_RUNTIME_VERIFICATION_ENABLED", True)
+    monkeypatch.setattr(access_module, "log_security_event", audit)
+    monkeypatch.setattr(
+        main.app.state.resources.settings, "officer_runtime_verification_enabled", True
+    )
 
     with pytest.raises(HTTPException) as exc:
         await officer_runtime_verification_router.create_officer_runtime_verification(

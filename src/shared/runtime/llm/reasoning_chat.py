@@ -20,7 +20,7 @@ from contextvars import ContextVar
 from typing import TYPE_CHECKING, Any, AsyncIterator, Callable, Iterator, Optional
 
 import httpx
-from langchain_core.messages import AIMessageChunk
+from langchain_core.messages import AIMessage, AIMessageChunk
 from langchain_core.outputs import ChatGenerationChunk
 from langchain_openai import ChatOpenAI
 from pydantic import PrivateAttr
@@ -915,6 +915,120 @@ class AsyncReasoningCapturingClient(httpx.AsyncClient):
         return await super().send(request, **kwargs)
 
 
+def _content_parts(content: Any) -> list:
+    if isinstance(content, str):
+        return [{"type": "text", "text": content}] if content else []
+    return list(content or [])
+
+
+def fold_system_messages(messages: list) -> list:
+    """Leave at most one system message, and only as the first message.
+
+    For chat templates that accept a single leading system turn — Qwen3.x
+    raises ``System message must be at the beginning.`` on any other — while
+    SRW may add system nudges mid-history (and histories from before the
+    compaction summary became a user message hold it as a second system
+    message). The leading run of system messages merges into
+    one; each later system message becomes a user turn where it stands, so the
+    messages before it (and the provider's cached prefix) are unchanged.
+    Returns a new list; the input dicts are not mutated.
+    """
+    lead = 0
+    while lead < len(messages) and messages[lead].get("role") == "system":
+        lead += 1
+    out = []
+    if lead:
+        contents = [m.get("content") for m in messages[:lead]]
+        if all(isinstance(c, str) for c in contents):
+            merged: Any = "\n\n".join(c for c in contents if c)
+        else:
+            merged = []
+            for c in contents:
+                parts = _content_parts(c)
+                if merged and parts:
+                    merged.append({"type": "text", "text": "\n\n"})
+                merged.extend(parts)
+        out.append({**messages[0], "content": merged})
+    for m in messages[lead:]:
+        out.append({**m, "role": "user"} if m.get("role") == "system" else m)
+    return out
+
+
+def mark_anthropic_cache_breakpoints(messages: list, payload_messages: list) -> list:
+    """Put Anthropic cache breakpoints on the system prompt and the stable history.
+
+    ``messages`` is the request view (context entries already folded into
+    their carriers). Besides the system prompt it marks, by request shape
+    (WP2 spec §H):
+
+    - **legacy tail** (any legacy injection in the request): the per-turn
+      injections (memory, knowledge, guidance, the App Guide turn boundary,
+      ...) sit at the tail and change each turn. A breakpoint on the last
+      message, which is what the subscription proxy places when the caller
+      sends none, writes the cache entry inside that tail, so no later
+      request can read it. The last message that is not an injection is
+      marked instead. Measured through CLIProxyAPI on 2026-09-29: 81-84% of
+      input cached with these two markers, against a fixed ~2.6k tokens
+      without.
+    - **append-only** (a folded carrier in the request): nothing is rebuilt,
+      so the newest AIMessage (the message right before the newest carrier
+      group) reads the previous request's entry, and the last message writes
+      the next one. Three of Anthropic's four breakpoints.
+    - otherwise the last message.
+
+    ``messages`` are the LangChain messages ``payload_messages`` were converted
+    from. The conversion is one-to-one; on a length mismatch the indices cannot
+    be mapped and the payload is returned unchanged. Returns a new list.
+    """
+    from shared.runtime.core.context_entries import (
+        has_folded_carrier,
+        is_context_injection,
+        is_legacy_injection,
+    )
+
+    if len(messages) != len(payload_messages):
+        return payload_messages
+    system_idx = next(
+        (
+            i
+            for i, m in enumerate(payload_messages)
+            if m.get("role") in ("system", "developer")
+        ),
+        None,
+    )
+    last_idx = len(messages) - 1 if messages else None
+    anchors: set = {system_idx}
+    if any(is_legacy_injection(m) for m in messages):
+        anchors.add(
+            next(
+                (
+                    i
+                    for i in range(len(messages) - 1, -1, -1)
+                    if not is_context_injection(messages[i])
+                ),
+                None,
+            )
+        )
+    elif has_folded_carrier(messages):
+        anchors.add(
+            next(
+                (
+                    i
+                    for i in range(len(messages) - 1, -1, -1)
+                    if isinstance(messages[i], AIMessage)
+                ),
+                None,
+            )
+        )
+        anchors.add(last_idx)
+    else:
+        anchors.add(last_idx)
+    out = list(payload_messages)
+    for idx in anchors - {None}:
+        out[idx] = {**out[idx], "cache_control": {"type": "ephemeral"}}
+    return out
+
+
 class ReasoningChatOpenAI(ChatOpenAI):
     """ChatOpenAI that captures reasoning_content and validates context limits.
 
@@ -937,6 +1051,20 @@ class ReasoningChatOpenAI(ChatOpenAI):
         response = llm.invoke("Solve this problem step by step...")
         reasoning = response.additional_kwargs.get("reasoning_content")
     """
+
+    # Family setting `single_system_message` (model_config_matrix.yaml): fold
+    # the request down to one leading system message before it is sent.
+    single_system_message: bool = False
+
+    # Claude over an OpenAI-format transport (the subscription proxy): add
+    # explicit cache breakpoints — see mark_anthropic_cache_breakpoints.
+    anthropic_cache_breakpoints: bool = False
+
+    # Set by the factory when this client has no route (OpenAI's endpoint with
+    # only the ``not-needed`` key): every call raises ModelRouteMissing naming
+    # this model instead of sending a request that 401s
+    # (unavailable_model_handling.md D6).
+    route_missing_model: Optional[str] = None
 
     # Use PrivateAttr for Pydantic compatibility
     _reasoning_client: ReasoningCapturingClient = PrivateAttr(default=None)
@@ -972,6 +1100,18 @@ class ReasoningChatOpenAI(ChatOpenAI):
         # Store after init
         self._reasoning_client = reasoning_client
         self._async_reasoning_client = async_reasoning_client
+
+    def _get_request_payload(self, input_, *, stop=None, **kwargs):
+        payload = super()._get_request_payload(input_, stop=stop, **kwargs)
+        if self.single_system_message and isinstance(payload.get("messages"), list):
+            payload["messages"] = fold_system_messages(payload["messages"])
+        if self.anthropic_cache_breakpoints and isinstance(
+            payload.get("messages"), list
+        ):
+            payload["messages"] = mark_anthropic_cache_breakpoints(
+                self._convert_input(input_).to_messages(), payload["messages"]
+            )
+        return payload
 
     def _post_process_result(self, result):
         """Post-process LLM result: capture reasoning and debug output.
@@ -1049,11 +1189,19 @@ class ReasoningChatOpenAI(ChatOpenAI):
 
         return result
 
+    def _refuse_missing_route(self) -> None:
+        if self.route_missing_model:
+            from shared.runtime.core.transport_resolution import ModelRouteMissing
+
+            raise ModelRouteMissing(self.route_missing_model)
+
     def _generate(self, *args, **kwargs):
+        self._refuse_missing_route()
         result = super()._generate(*args, **kwargs)
         return self._post_process_result(result)
 
     async def _agenerate(self, *args, **kwargs):
+        self._refuse_missing_route()
         result = await super()._agenerate(*args, **kwargs)
         return self._post_process_result(result)
 
@@ -1068,6 +1216,7 @@ class ReasoningChatOpenAI(ChatOpenAI):
         merged AIMessage carries ``additional_kwargs.reasoning_content``,
         matching the non-streaming code path's contract.
         """
+        self._refuse_missing_route()
         for chunk in super()._stream(*args, **kwargs):
             yield chunk
         rc = (
@@ -1086,6 +1235,7 @@ class ReasoningChatOpenAI(ChatOpenAI):
 
     async def _astream(self, *args, **kwargs):
         """Async counterpart of :meth:`_stream`."""
+        self._refuse_missing_route()
         async for chunk in super()._astream(*args, **kwargs):
             yield chunk
         rc = (

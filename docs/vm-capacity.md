@@ -1,0 +1,239 @@
+# VM capacity diagnostics
+
+Administrators can read VM resource accounting in the `vm` block of
+`GET /api/admin/capacity`. The executor counts and KEDA `desired` value retain
+their existing meaning. This endpoint does not reserve resources or enable
+resource admission.
+
+## Configuration and rollout boundary
+
+Resource admission remains disabled by default. Observation alone uses
+`observerEnabled: true` with `shadowEnabled` and `enforcementEnabled` false.
+The full resource policy requires all three flags true, explicit
+`clusterWidePodReadAcknowledged: true`, and
+`orchestrator.vmProvisioning.creationRetryEnabled: true`. The flags install
+one versioned policy document in both services; they do not activate the
+durable admission mode automatically. A shadow-only flag combination is
+unsupported. **Shadow is the durable policy's installation and audit state:**
+while the full policy is deployed in that state, new VM creation waits for
+activation. Capacity tables or reservation records alone grant no authority.
+
+Configure observation under `vm.resourceAdmission` in your Helm values:
+
+| Setting | Purpose |
+| --- | --- |
+| `observerEnabled` | Publish authenticated inventory; defaults to `false`. |
+| `stableClusterId` | Stable identity for the cluster's policy and inventory. |
+| `clusterWidePodReadAcknowledged` | Explicitly permit the observer's cluster-wide Pod inventory. |
+| `inventory` | Explicit freshness, timeout, item/byte/history bounds and placement label keys. |
+| `launcherProfile` | Expected installed KubeVirt launcher shape; requires the exact KubeVirt namespace/name and architecture label. |
+| `hostCost`, `nodeHeadroom`, `installationBudget`, `ownerBudget`, `fairness` | Explicit six-dimensional admission inputs; left unset by default. The full policy cannot render with missing values. |
+
+Observation requires `vm.mode: same-cluster`, a configured lifecycle HMAC
+Secret, and all required inventory settings. See the comments in
+[the chart values](../helm/values.yaml) for the complete fields. Set resource
+budgets from the actual launcher requests and node overhead; guest CPU and
+memory alone do not describe host demand.
+
+The ordinary PVC launcher profile supports exactly KubeVirt `v1.6.6` and
+`v1.8.4` on `amd64` with KVM. Set `launcherProfile.kubevirtVersion` to the
+installed version and `costAlgorithm` to
+`kubevirt-<version>-amd64-ordinary-pvc-v1`. The observed and target KubeVirt
+versions must match that profile. Unknown versions, custom hypervisor
+configuration and unsupported launcher features hold admission.
+
+The installation CPU budget applies to the operator's reserved host cost.
+`launcherProfile.cpuAllocationRatio` describes KubeVirt's actual requests;
+`hostCost.cpuMillicoresPerVcpuNumerator` and `Denominator` independently choose
+a conservative reservation. For example, numerator `1000` and denominator `1`
+reserve one CPU per guest vCPU even if KubeVirt requests less. CPU and memory
+budgets also include the configured launcher overhead, so their full values
+are not available for guest allocations. The count backstop can remain enabled
+alongside these budgets.
+
+Choose the installation and owner budgets from eligible-node capacity and
+other workload reservations. The chart does not derive them. Review the exact
+JSON rendered as `VM_RESOURCE_ADMISSION_CONFIG` in both Deployments; it must
+have one policy digest and match the supported KubeVirt installation and
+launcher profile. Use the same document for each operator transition. Install
+the new application code and required migrations while resource admission is
+still disabled, then use the configured orchestrator environment to run the
+explicit policy command. Its input is a local file containing that reviewed
+JSON policy, plus the expected stable cluster ID and policy digest:
+
+```text
+python -m orchestrator.operator_cli.vm_resource_policy ensure-shadow \
+  --policy-file resource-policy.json --cluster-id CLUSTER_ID \
+  --policy-digest sha256:POLICY_DIGEST
+```
+
+The command emits a JSON receipt with `cluster_id`, `namespace`,
+`policy_digest`, `revision`, and `mode`. Save the complete receipt. Every later
+transition requires it through `--expected-receipt-file`; a changed policy or
+stale receipt is refused. The command never selects budgets, changes Helm
+flags, or starts admission in the background.
+
+If a transition may have committed but its output was lost, read the installed
+receipt with the same reviewed policy file, cluster ID, and digest:
+
+```text
+python -m orchestrator.operator_cli.vm_resource_policy current-receipt \
+  --policy-file resource-policy.json --cluster-id CLUSTER_ID \
+  --policy-digest sha256:POLICY_DIGEST
+```
+
+This read-only command refuses a missing row or any document/identity mismatch.
+Compare the returned mode and revision with the intended transition before
+choosing the next action. It does not retry or reverse a transition. Keep the
+full receipt as the expected input for the next transition; an old receipt is
+never silently accepted.
+
+```text
+python -m orchestrator.operator_cli.vm_resource_policy activate-enforce \
+  --policy-file resource-policy.json --cluster-id CLUSTER_ID \
+  --policy-digest sha256:POLICY_DIGEST \
+  --expected-receipt-file shadow-receipt.json
+```
+
+Use the new receipt from each successful transition for `begin-drain` and
+`finalize-off`, with the same policy file, cluster ID and digest.
+
+After installing the shadow row, deploy the **same** reviewed all-true policy
+to both services with durable creation retry enabled. New creates hold while
+the durable mode is `shadow`. Confirm a fresh, complete, authenticated
+whole-cluster inventory, the exact installed launcher profile, and the
+absence of any SRW-attributable VM, VMI or launcher and any unresolved
+reservation.
+Then invoke `activate-enforce` with the saved shadow receipt and save its new
+receipt. The service checks those conditions again under the policy lock.
+Genuine Job and pinned-session creates then use the same durable reservation
+ledger; Kubernetes still makes the final placement decision. Validate both
+owner paths and physical release before treating a live cluster as qualified.
+
+If a winning VM creation handler refuses before entering a Kubernetes or
+attachment create method, its exact private receipt can settle that issued
+effect as `not_attempted`. A receipt-proven pre-create refusal may then proceed
+through ordinary retry or cancellation. An absent object alone, an older grant
+without a receipt, a lost winning response, or a create method already entered
+cannot prove no effect; the reservation remains held. On cancellation, the
+source, retained disk, Secret and attachment still require their exact physical
+evidence and completion. Capacity is released only when the ordinary
+disposition settles, including when a retained workspace keeps its disk.
+
+To turn enforcement off, invoke `begin-drain` with the enforce receipt first.
+This stops fresh grants while existing v3 effects and charged cleanup continue
+to reconcile. **Keep the original all-true Helm policy and inventory publisher
+in place during drain.** Wait for reservations and live waiters to settle and
+for the fresh inventory to show no attributable SRW runtime, then invoke
+`finalize-off` with the drain receipt. Only after its off receipt may the Helm
+flags be returned to observer-only or disabled. Turning the process flag off
+while the durable row still says `enforce` does not revoke already frozen v3
+requests; changing the policy document during drain also removes the fresh
+inventory needed to finish it. Do not roll back to an image that cannot
+reconcile the existing reservation ledger.
+The current lifecycle treats `off` as terminal for that installed cluster
+policy; `ensure-shadow` does not re-enable an off row. A later rollout needs a
+separately reviewed policy-epoch transition, not a replay of this command.
+
+The separate object-count backstop is `vmController.maxConcurrentVms`, passed
+to the controller as `VM_MAX_CONCURRENT`. Its chart default is `4`; a deployment
+may override it. It is not a resource-based safe-concurrency recommendation.
+The admin endpoint reports its maximum as unknown until it has authoritative
+controller configuration, even when this Helm value is configured.
+
+## Reading capacity
+
+In Cockpit, open **Admin → Capacity → VM capacity**. Each installed cluster has
+its own policy mode, inventory freshness, configured admission budgets, count
+backstop, waiting and teardown diagnostics, durable holds, and six-dimensional
+resource tables. Expand **Nodes**
+with a click or Enter/Space to inspect exact node accounting. A dash means
+unknown, including a missing count maximum or an unaccountable resource
+dimension; it must not be read as zero. When inventory accounting is unavailable,
+the page keeps known durable holds visible and hides node and cluster totals.
+
+Each installed cluster policy reports its mode and inventory freshness. The
+projection reads policy, inventory, waiters and reservations in one read-only
+database snapshot. `available` means that inventory can be accounted for; it
+does not promise that a particular VM can schedule.
+
+For an installed six-dimensional policy, `admission_budget` reports the
+installation limit across all owners, the limit for each owner separately, and
+the CPU reservation formula: `ceil(guest_vcpus × numerator / denominator) +
+launcher_overhead_millicores` per VM. Cockpit labels these as configured
+admission budgets. The policy mode indicates whether admission enforces them.
+The limits come from the validated installed policy and remain visible when
+inventory is stale or missing; a legacy policy without these limits reports
+`null`. CPU millicores are the operator's reserved cost, which can differ from
+KubeVirt's actual node CPU request. A CPU budget equals a guest-vCPU ceiling
+only when the installed CPU cost formula supports that interpretation. The
+budget rows and durable holds are distinct from physical node remaining
+capacity; none alone establishes that a particular VM fits.
+
+Resource vectors contain CPU millicores, memory bytes, ephemeral-storage bytes,
+and KVM, TUN and vhost-net device counts. Node totals distinguish allocatable
+resources, headroom, scheduled external demand, unbound reservations, bound
+reservations awaiting Ready (`bound_reserved`), active and warm VMs, teardown
+holds, remaining resources and shortfalls. A bound reservation retains its
+observed high-water demand even when that demand exceeds the admitted budget
+and prevents Ready. Request selectors,
+tolerations, storage topology and individual VM size still determine placement.
+
+The separate `held` block retains known durable charges when inventory is
+missing, incomplete, stale or unclassified, and when policy mode is `off` or
+`drain`. Unknown dimensions are `null`. `orphaned_held` accounts for reservations
+whose exact node disappeared; these are separate from the node totals. Pending
+external workloads are also reported separately from scheduled demand. An exact
+managed launcher, including an authenticated recovery successor, is not charged
+again as external demand.
+
+A legacy `agent-vm-` guest without sufficient owner or reservation identity
+makes capacity unknown, including while deleting or without a launcher. Its
+absence from Pod requests cannot establish free installation or owner capacity.
+Golden-image VMs and unrelated guests keep their separate external accounting.
+
+The count backstop is separate from resource accounting. `observed` counts
+non-deleting `agent-vm-` objects, excluding golden-image VMs. Its configured
+`maximum` remains unknown when no authoritative controller limit is available;
+the endpoint does not infer that limit from reservations or local defaults.
+
+Waiting diagnostics include original age, nonfit count, bypasses and protected
+requests. They provide no completion estimate or exact queue rank. Teardown
+diagnostics mark an exact idle-release operation overdue after five minutes
+without progress. Holds without a matching operation have unknown age. This
+threshold never expires a reservation: release still requires the normal
+identity and physical-cleanup proofs.
+
+The Job list and detail view, and the Sessions list, show the current owner's
+creation wait when the request can be tied to that exact Job or pinned session
+runtime. The owner view distinguishes a local resource wait, a controller count
+hold, a controller connection hold, and an older or otherwise ambiguous hold.
+For a local resource wait it may show the originally requested guest vCPUs and
+memory, the original enqueue time, and an exact request-size nonfit finding.
+It does not expose cluster budgets, other owners' requests, queue position,
+predicted fit, or an ETA. A count maximum absent from the admin API remains
+unknown in Cockpit too.
+
+## Failed provisioning and retained Job disks
+
+A Job VM that never reaches SSH readiness can still occupy a launcher and a
+reservation. Timeout or cancellation starts ordinary cleanup; it does not by
+itself prove that compute stopped. The Job-only pre-SSH stop protocol binds the
+current creation request, reservation, VM, VMI, launcher, disk and node before
+requesting shutdown. Cleanup releases capacity only after the matching stop
+evidence and runtime-absence checks settle. Missing or changed identity keeps
+the reservation held.
+
+Stopping compute can retain the disk for Resume. Permanent Job deletion then
+requires an exclusive released workspace binding (or proven unbound disk),
+the complete chain of stopped physical generations and a signed final disk
+purge receipt from the original controller namespace and cluster. An unfinished
+controller cleanup child or a disk consumer keeps deletion pending. Prior stop
+receipts and released reservations remain immutable audit evidence.
+
+Roll out the updated VM Controller and its namespaced VM/Pod-finalizer patch
+permissions before the Orchestrator with migrations 0333 and 0334. Older or
+rerouted controllers cannot supply the required proof. When cleanup stays held,
+compare the owner's creation request, reservation and cleanup evidence with the
+actual VM, launcher and PVC before retrying an operation. Do not infer release
+from a timeout, missing SSH, or an acknowledgement alone.

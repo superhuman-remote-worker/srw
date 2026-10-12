@@ -8,6 +8,12 @@ In the phase alternation architecture:
 - `todo_complete` is shared (marks tasks done, triggers phase transitions)
 - `todo_list` is shared (helps see current state)
 - `request_replan` is tactical-only (the in-flight adaptation path)
+
+The todo list is not re-sent with every request. `todo_complete` and
+`next_phase_todos` return the full current list
+(``TodoManager.format_for_injection``), so the list enters the history exactly
+where it changes; `todo_list` lets the model pull it on demand. See
+knowledge-base/knowledge/features/append_only_context_injection.md (D17-D19).
 """
 
 import logging
@@ -15,6 +21,7 @@ from typing import Any, List
 
 from langchain_core.tools import tool
 
+from agent.managers.todo import todo_headline
 from agent.tools.context import ToolContext
 
 from shared.tool_catalog.definitions import (
@@ -74,7 +81,8 @@ def create_todo_tools(context: ToolContext) -> List[Any]:
             phase_name: Optional name for the phase (e.g., "Phase 1: Document Processing")
 
         Returns:
-            Success message confirming todos were staged, or error if validation fails.
+            Confirmation with the staged todos and the full current todo list,
+            or an error if validation fails.
         """
         try:
             # Enforcement of the todo guide read is now config-driven via
@@ -115,14 +123,23 @@ def create_todo_tools(context: ToolContext) -> List[Any]:
             # Use TodoManager's staging method which handles validation
             result = todo_mgr.stage_tactical_todos(todos, phase_name)
 
+            # The staged batch (ids are assigned when the next phase starts),
+            # then the full current strategic list (D18).
+            staged = "\n".join(f"  - {t.content}" for t in todo_mgr.list_staged())
+            message = f"{result}\n{staged}\n\n{todo_mgr.format_for_injection()}"
+
             # Check if all other strategic todos are complete
             remaining = [t for t in todo_mgr.list_pending()]
             if len(remaining) <= 1:
                 # Only the current todo (create todos) remains
-                return f"{result}\n\nAll strategic todos complete. Invoke the `todo_complete` tool to transition to tactical phase."
+                return f"{message}\n\nAll strategic todos complete. Invoke the `todo_complete` tool to transition to tactical phase."
             else:
-                remaining_list = "\n".join(f"  - {t.content}" for t in remaining)
-                return f"{result}\n\nRemaining strategic todos before transition:\n{remaining_list}"
+                return (
+                    f"{message}\n\nRemaining strategic todos before transition: "
+                    "the pending ones above. Complete each with the "
+                    "`todo_complete` tool; completing the last one starts the "
+                    "tactical phase."
+                )
 
         except ValueError as e:
             return f"Error: {str(e)}"
@@ -157,8 +174,8 @@ def create_todo_tools(context: ToolContext) -> List[Any]:
         Returns:
             Status message including:
             - Which task was completed
-            - How many tasks remain
             - What the next task is (if any)
+            - The full current todo list
             - Phase transition signal when all tasks complete
 
         Phase Transitions:
@@ -231,22 +248,7 @@ def create_todo_tools(context: ToolContext) -> List[Any]:
                                 source_phase=todo_mgr.phase_number,
                             )
 
-                    # Build response message
-                    remaining = todo_mgr.list_pending()
                     is_last = todo_mgr.all_complete()
-
-                    if is_last:
-                        message = (
-                            f"Completed: {todo.content}\n"
-                            f"All tasks complete! Ready for phase transition."
-                        )
-                    else:
-                        next_task = remaining[0] if remaining else None
-                        next_str = f"\nNext: {next_task.content}" if next_task else ""
-                        message = (
-                            f"Completed: {todo.content}\n"
-                            f"Remaining: {len(remaining)} tasks{next_str}"
-                        )
             else:
                 # Original behavior: complete first pending task
                 result = todo_mgr.complete_first_pending_sync(notes=completion_notes)
@@ -258,6 +260,24 @@ def create_todo_tools(context: ToolContext) -> List[Any]:
                         (t for t in todo_mgr.list_all() if t.id == completed_id), None
                     )
                     completed_content = _done.content if _done else ""
+
+            # A completion returns the full current list (D18): the list
+            # enters the history where it changed, never per request.
+            if completed_id:
+                # Headlines only: the list below carries the pending bodies.
+                if is_last:
+                    head = (
+                        f"Completed: {todo_headline(completed_content)}\n"
+                        "All tasks complete! Ready for phase transition."
+                    )
+                else:
+                    remaining = todo_mgr.list_pending()
+                    head = f"Completed: {todo_headline(completed_content)}" + (
+                        f"\nNext: {remaining[0].id}: {todo_headline(remaining[0].content)}"
+                        if remaining
+                        else ""
+                    )
+                message = f"{head}\n\n{todo_mgr.format_for_injection()}"
 
             # Add phase transition signal if this was the last task
             if is_last:

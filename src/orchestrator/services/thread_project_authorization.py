@@ -5,7 +5,8 @@ Extracted verbatim from ``orchestrator.main`` (R1.B06 lane B, census group
 repository scope, so this module is an authorization boundary and not a lookup
 helper.
 
-Four properties are load-bearing and move unchanged:
+Five properties are load-bearing. The first four moved unchanged; the fifth
+came with the one-project rule:
 
 * **Classification ranks below authorization.** ``archived`` is a lifecycle
   verdict; a caller with no membership still learns only ``revoked``, never
@@ -25,6 +26,10 @@ Four properties are load-bearing and move unchanged:
   membership grant.** Omission means that project; naming a different or
   additional one is refused before project or connector policy could widen the
   request.
+* **A new Session has one project or none.** More than one distinct project
+  is a 422 (``ONE_PROJECT_PER_SESSION_DETAIL``), checked after the MCP token
+  scope so a scoped token still gets its 403. Only creation checks it; older
+  multi-project Sessions still read, resume and take config updates.
 
 Every collaborator arrives per invocation through
 :class:`ThreadProjectAuthorizationDependencies`; ``store`` is main's
@@ -47,6 +52,11 @@ from orchestrator.security.access import (
 from orchestrator.services.config_drift import (
     acknowledged_drift_ids,
     strip_acknowledged,
+)
+from shared.connectors.builtin import needs_knowledge_profile
+
+ONE_PROJECT_PER_SESSION_DETAIL = (
+    "A Session can belong to one project at most. Pick one project, or none."
 )
 
 
@@ -209,6 +219,13 @@ def thread_creation_project_ids(
     merely another membership grant. Omission therefore means that project,
     while an attempt to name a different or additional project fails before
     project or datasource policy resolution can widen the request.
+
+    A new Session belongs to one project or none (owner decision 2026-09-24,
+    knowledge-base/knowledge/features/single_project_sessions.md). More than
+    one distinct project is a 422, checked after the token scope so a scoped
+    token still learns only the scope's 403. Every create path (REST create
+    and preview, MCP, review Sessions, Officers) goes through here; reads,
+    resume and config updates of older multi-project Sessions do not.
     """
     requested = list(request_body.project_ids or [])
     if request_body.project_id and str(request_body.project_id) not in requested:
@@ -216,16 +233,18 @@ def thread_creation_project_ids(
     requested = list(dict.fromkeys(str(value) for value in requested))
 
     scoped_project = mcp_scope_project_id(user)
-    if scoped_project is None:
-        return requested
+    if scoped_project is not None:
+        scoped_project_id = str(scoped_project)
+        if requested and requested != [scoped_project_id]:
+            raise HTTPException(
+                status_code=403,
+                detail="Access denied by MCP token scope",
+            )
+        return [scoped_project_id]
 
-    scoped_project_id = str(scoped_project)
-    if requested and requested != [scoped_project_id]:
-        raise HTTPException(
-            status_code=403,
-            detail="Access denied by MCP token scope",
-        )
-    return [scoped_project_id]
+    if len(requested) > 1:
+        raise HTTPException(status_code=422, detail=ONE_PROJECT_PER_SESSION_DETAIL)
+    return requested
 
 
 async def thread_has_knowledge_scope(
@@ -245,12 +264,13 @@ async def thread_has_knowledge_scope(
         return True
     for datasource_id in datasource_ids or []:
         datasource = await dependencies.store.get_datasource(str(datasource_id))
-        if datasource and str(datasource.get("type") or "").lower() == "kb":
+        if datasource and needs_knowledge_profile(datasource):
             return True
     return False
 
 
 __all__ = [
+    "ONE_PROJECT_PER_SESSION_DETAIL",
     "ProjectVerdict",
     "ThreadProjectAuthorizationDependencies",
     "ThreadProjectStore",

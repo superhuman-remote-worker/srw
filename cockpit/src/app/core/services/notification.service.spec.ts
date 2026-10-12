@@ -2,7 +2,7 @@ import {describe, expect, it, vi} from 'vitest';
 import {Injector, NgZone, runInInjectionContext} from '@angular/core';
 import {HttpClient} from '@angular/common/http';
 import {TranslocoService} from '@jsverse/transloco';
-import {of} from 'rxjs';
+import {of, throwError} from 'rxjs';
 import {NotificationService} from './notification.service';
 import {AppToastService} from '../../ui/toast';
 import {EMPTY_NOTIFICATION_COUNTS, Notification} from '../models/notification.model';
@@ -49,6 +49,147 @@ function row(overrides: Partial<Notification> = {}): Notification {
     ...overrides,
   };
 }
+
+describe('NotificationService — closed SSE recovery', () => {
+  it('reopens the owner feed after a temporary API outage without another init call', async () => {
+    vi.useFakeTimers();
+    const original = globalThis.EventSource;
+    const streams: any[] = [];
+    class FakeEventSource {
+      static readonly CONNECTING = 0;
+      static readonly OPEN = 1;
+      static readonly CLOSED = 2;
+      readyState = 0;
+      onopen: (() => void) | null = null;
+      onerror: (() => void) | null = null;
+      onmessage: (() => void) | null = null;
+      close = vi.fn(() => { this.readyState = 2; });
+      constructor() { streams.push(this); }
+    }
+    (globalThis as any).EventSource = FakeEventSource;
+    try {
+      const {service, http} = createService();
+      let available = true;
+      http.get.mockImplementation(() => available
+        ? of({items: [], next_before: null, counts: EMPTY_NOTIFICATION_COUNTS})
+        : throwError(() => ({status: 503})));
+      service.connectSSE();
+      streams[0].readyState = 1;
+      streams[0].onopen();
+      expect(service.isConnected()).toBe(true);
+
+      available = false;
+      streams[0].readyState = 2;
+      streams[0].onerror();
+      expect(service.isConnected()).toBe(false);
+      await vi.advanceTimersByTimeAsync(2_000);
+      expect(streams).toHaveLength(1);
+
+      available = true;
+      await vi.advanceTimersByTimeAsync(35_000);
+      expect(streams.length).toBeGreaterThan(1);
+      streams.at(-1).readyState = 1;
+      streams.at(-1).onopen();
+      await vi.advanceTimersByTimeAsync(0);
+      expect(service.isConnected()).toBe(true);
+      service.disconnectSSE();
+    } finally {
+      (globalThis as any).EventSource = original;
+      vi.useRealTimers();
+    }
+  });
+
+  it('retries a CLOSED initial handshake without a prior successful open', async () => {
+    vi.useFakeTimers();
+    const original = globalThis.EventSource;
+    const streams: any[] = [];
+    class FakeEventSource {
+      static readonly CLOSED = 2;
+      readyState = 0;
+      onopen: (() => void) | null = null;
+      onerror: (() => void) | null = null;
+      close = vi.fn(() => { this.readyState = 2; });
+      constructor() { streams.push(this); }
+    }
+    (globalThis as any).EventSource = FakeEventSource;
+    try {
+      const {service} = createService();
+      service.connectSSE();
+      streams[0].readyState = 2;
+      streams[0].onerror();
+      await vi.advanceTimersByTimeAsync(2_000);
+      expect(streams).toHaveLength(2);
+      streams[1].readyState = 1;
+      streams[1].onopen();
+      expect(service.isConnected()).toBe(true);
+      service.disconnectSSE();
+    } finally {
+      (globalThis as any).EventSource = original;
+      vi.useRealTimers();
+    }
+  });
+
+  it.each([403, 404])('does not auto-reopen a feed rejected with %i, even on wake', async (status) => {
+    vi.useFakeTimers();
+    const original = globalThis.EventSource;
+    const streams: any[] = [];
+    class FakeEventSource {
+      static readonly CLOSED = 2;
+      readyState = 0;
+      onopen: (() => void) | null = null;
+      onerror: (() => void) | null = null;
+      close = vi.fn(() => { this.readyState = 2; });
+      constructor() { streams.push(this); }
+    }
+    (globalThis as any).EventSource = FakeEventSource;
+    try {
+      const {service, http} = createService();
+      http.get.mockReturnValue(throwError(() => ({status})));
+      service.connectSSE();
+      streams[0].readyState = 2;
+      streams[0].onerror();
+      await vi.advanceTimersByTimeAsync(120_000);
+      expect(streams).toHaveLength(1);
+      expect(service.isConnected()).toBe(false);
+      const reads = http.get.mock.calls.length;
+      window.dispatchEvent(new Event('online'));
+      document.dispatchEvent(new Event('visibilitychange'));
+      await vi.advanceTimersByTimeAsync(0);
+      expect(http.get.mock.calls).toHaveLength(reads);
+      expect(streams).toHaveLength(1);
+      service.disconnectSSE();
+    } finally {
+      (globalThis as any).EventSource = original;
+      vi.useRealTimers();
+    }
+  });
+
+  it('cancels the recovery timer when the feed is intentionally disconnected', async () => {
+    vi.useFakeTimers();
+    const original = globalThis.EventSource;
+    const streams: any[] = [];
+    class FakeEventSource {
+      static readonly CLOSED = 2;
+      readyState = 0;
+      onerror: (() => void) | null = null;
+      close = vi.fn(() => { this.readyState = 2; });
+      constructor() { streams.push(this); }
+    }
+    (globalThis as any).EventSource = FakeEventSource;
+    try {
+      const {service} = createService();
+      service.connectSSE();
+      streams[0].readyState = 2;
+      streams[0].onerror();
+      service.disconnectSSE();
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(streams).toHaveLength(1);
+    } finally {
+      (globalThis as any).EventSource = original;
+      vi.useRealTimers();
+    }
+  });
+});
 
 describe('NotificationService.handleSseEvent — legacy frames that still ride the stream', () => {
   it('user_registered → info toast + adminUserRegistered signal', () => {

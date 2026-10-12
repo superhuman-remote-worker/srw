@@ -255,8 +255,8 @@ class IdeProxyService:
         if backend == "fenced" or backend is None:
             self.evict(entity_id)
             return None
-        if str(row.get("id") or "") != entity_id or not self._owner_is_live(
-            owner_kind, row
+        if str(row.get("id") or "") != entity_id or not await self._owner_allows_target(
+            owner_kind, row, scope, runtime
         ):
             self.evict(entity_id)
             return None
@@ -278,14 +278,55 @@ class IdeProxyService:
 
         if backend == "vm":
             self.evict(entity_id)
-            # The VM lifecycle attestation proves the launcher Pod and guest
-            # SSH identity; it does *not* prove that code-server is listening
-            # on the launcher Pod's port 38080. Direct launcher routing is a
-            # category error. Keep VM IDE unavailable until the existing
-            # host-key-pinned SSH direct-tcpip contract is integrated here.
-            raise IdeProxyUnavailable(
-                "vm_ide_transport_unavailable",
-                "VM IDE transport requires an exact guest tunnel",
+            provisioner = self._vm_provisioner
+            if provisioner is None or not callable(
+                getattr(provisioner, "attest_workspace_runtime", None)
+            ):
+                raise IdeProxyUnavailable(
+                    "vm_ide_transport_unavailable",
+                    "VM IDE authority is unavailable",
+                )
+            try:
+                proof = await provisioner.attest_workspace_runtime(
+                    entity_id,
+                    entity_type=owner_kind,
+                )
+            except Exception as exc:
+                raise IdeProxyUnavailable(
+                    "vm_ide_runtime_unproven",
+                    "VM IDE runtime is not ready",
+                ) from exc
+            if not all(
+                getattr(proof, name, None)
+                for name in (
+                    "vm_uid",
+                    "vmi_uid",
+                    "launcher_pod_uid",
+                    "rootdisk_pvc_uid",
+                    "ssh_host_key_fingerprint",
+                    "host",
+                    "port",
+                )
+            ):
+                raise IdeProxyUnavailable(
+                    "vm_ide_transport_unavailable",
+                    "VM IDE runtime is not ready",
+                )
+            return IdeProxyTarget(
+                entity_id=entity_id,
+                owner_kind=owner_kind,
+                backend="vm",
+                scope="vm",
+                host=proof.host,
+                port=proof.port,
+                identity=(
+                    proof.workspace_generation,
+                    proof.vm_uid,
+                    proof.vmi_uid,
+                    proof.launcher_pod_uid,
+                    proof.rootdisk_pvc_uid,
+                    proof.ssh_host_key_fingerprint,
+                ),
             )
 
         if coordinate is None:
@@ -456,7 +497,74 @@ class IdeProxyService:
                 "waiting",
                 "waiting_for_reply",
             }
-        return status in {"created", "active", "idle", "awaiting_user"}
+        return status in {"created", "active", "idle", "awaiting_user"} or (
+            status == "suspended" and row.get("execution_lane") == "pinned"
+        )
+
+    async def _owner_allows_target(
+        self, owner_kind: str, row: dict, scope: str | None, runtime: dict | None
+    ) -> bool:
+        """Admit a terminal Job only to its completed, exact IDE restore."""
+
+        if self._owner_is_live(owner_kind, row):
+            return True
+        if (
+            owner_kind != "job"
+            or str(row.get("status") or "") not in {"completed", "failed", "cancelled"}
+            or scope != "ide"
+            or not isinstance(runtime, dict)
+            or runtime.get("restore_type") != "k8s_container"
+            or runtime.get("status") not in {"active", "idle"}
+        ):
+            return False
+        read = getattr(
+            self._db, "get_current_managed_repository_workspace_creation_result", None
+        )
+        if not callable(read):
+            return False
+        try:
+            owner_id = UUID(str(row.get("id")))
+            runtime_uid = UUID(str(runtime.get("_runtime_incarnation")))
+            reservation_id = UUID(str(runtime.get("_creation_reservation_id")))
+            raw_token = runtime.get("_creation_claim_token")
+            if isinstance(raw_token, bool):
+                return False
+            claim_token = int(raw_token)
+            if claim_token <= 0:
+                return False
+            receipt = await read(
+                str(owner_id), owner_kind="job", scope="ide", operation_kind="restore"
+            )
+            if not isinstance(receipt, dict) or (
+                UUID(str(receipt.get("id"))) != reservation_id
+                or UUID(str(receipt.get("owner_id"))) != owner_id
+                or UUID(str(receipt.get("runtime_incarnation"))) != runtime_uid
+                or UUID(str(receipt.get("pod_uid"))) != runtime_uid
+                or receipt.get("owner_kind") != "job"
+                or receipt.get("scope") != "ide"
+                or receipt.get("operation_kind") != "restore"
+                or receipt.get("claim_token") != claim_token
+                or receipt.get("phase") != "settled"
+                or receipt.get("result_kind") != "settled"
+                or receipt.get("settled_at") is None
+                or receipt.get("cancel_requested_at") is not None
+                or receipt.get("restore_work_completed_at") is None
+                or receipt.get("restore_work_result_kind") != "active"
+            ):
+                return False
+            return not bool(
+                await self._db.fetchval(
+                    "SELECT EXISTS (SELECT 1 FROM "
+                    "managed_repository_workspace_cleanup_intents "
+                    "WHERE owner_kind='job' AND owner_id=$1::uuid "
+                    "AND scope='ide' AND settled_at IS NULL)",
+                    owner_id,
+                )
+            )
+        except Exception:
+            # A failed authority read is uncertainty, never permission to use
+            # a terminal owner's browser target. Cancellation still propagates.
+            return False
 
     @staticmethod
     def _owner_lifecycle_projection(owner_kind: str, row: dict) -> tuple[str, ...]:
@@ -520,17 +628,16 @@ class IdeProxyService:
         if entity is None:
             return None
         initial_owner_kind, initial_row, initial_ctx = entity
-        if (
-            initial_owner_kind != owner_kind
-            or not self._owner_is_live(owner_kind, initial_row)
-            or not self._owner_runtime_is_admitted(owner_kind, initial_row, initial_ctx)
-        ):
-            return None
         initial_backend, initial_scope, current_runtime, _ = self._classify_target(
             initial_ctx
         )
         if (
-            initial_backend != "k8s"
+            initial_owner_kind != owner_kind
+            or not await self._owner_allows_target(
+                owner_kind, initial_row, initial_scope, current_runtime
+            )
+            or not self._owner_runtime_is_admitted(owner_kind, initial_row, initial_ctx)
+            or initial_backend != "k8s"
             or initial_scope != scope
             or current_runtime != initial_runtime
         ):
@@ -624,7 +731,9 @@ class IdeProxyService:
         )
         if (
             confirmed_owner_kind != owner_kind
-            or not self._owner_is_live(owner_kind, confirmed_row)
+            or not await self._owner_allows_target(
+                owner_kind, confirmed_row, confirmed_scope, confirmed_runtime
+            )
             or not self._owner_runtime_is_admitted(
                 owner_kind, confirmed_row, confirmed_ctx
             )

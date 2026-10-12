@@ -38,6 +38,7 @@ logger = logging.getLogger(__name__)
 # Default per-operation subprocess timeouts (seconds).
 _DEFAULT_TRANSFER_TIMEOUT = 300  # get/put — may move large objects
 _DEFAULT_META_TIMEOUT = 60  # head/list/delete/copy — metadata ops
+_MAX_STAT_OUTPUT_BYTES = 64 * 1024
 
 # rclone signals "the thing isn't there" with various wordings across backends;
 # we only need to tell a missing object apart from a real transport error.
@@ -180,19 +181,144 @@ class RcloneObjectStore(ObjectStore):
     def _is_not_found(self, proc: subprocess.CompletedProcess) -> bool:
         return bool(_NOT_FOUND_RE.search(self._stderr(proc)))
 
+    def _run_cancellable_stat(
+        self,
+        key: str,
+        *,
+        cancelled: Callable[[], bool],
+        deadline: float,
+    ) -> subprocess.CompletedProcess:
+        """Read one metadata response without hiding cancellation or a child."""
+
+        args = [self._rclone_bin, "lsjson", "--stat", self._remote_path(key)]
+        env = dict(os.environ)
+        env.update(self._env_overlay)
+        if cancelled():
+            raise ObjectStoreError("rclone lsjson cancelled")
+        started = time.perf_counter()
+        try:
+            proc = subprocess.Popen(
+                args,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                env=env,
+                bufsize=0,
+            )
+        except FileNotFoundError as exc:
+            raise ObjectStoreError(
+                f"rclone binary '{self._rclone_bin}' not found on PATH"
+            ) from exc
+        selector: selectors.BaseSelector | None = None
+        try:
+            assert proc.stdout is not None
+            selector = selectors.DefaultSelector()
+            selector.register(proc.stdout, selectors.EVENT_READ)
+            output = bytearray()
+            stat_deadline = min(deadline, time.monotonic() + self._meta_timeout)
+            while selector.get_map() or proc.poll() is None:
+                if cancelled():
+                    raise ObjectStoreError("rclone lsjson cancelled")
+                remaining = stat_deadline - time.monotonic()
+                if remaining <= 0:
+                    raise ObjectStoreError("rclone lsjson timed out")
+                if not selector.get_map():
+                    time.sleep(min(remaining, 0.25))
+                    continue
+                for event, _ in selector.select(min(remaining, 0.25)):
+                    chunk = os.read(
+                        event.fileobj.fileno(),
+                        min(4096, _MAX_STAT_OUTPUT_BYTES + 1 - len(output)),
+                    )
+                    if not chunk:
+                        selector.unregister(event.fileobj)
+                        continue
+                    output.extend(chunk)
+                    if len(output) > _MAX_STAT_OUTPUT_BYTES:
+                        raise ObjectStoreError("rclone lsjson stat output too large")
+            if cancelled():
+                raise ObjectStoreError("rclone lsjson cancelled")
+            return subprocess.CompletedProcess(
+                args=args,
+                returncode=proc.returncode,
+                stdout=bytes(output),
+                stderr=b"",
+            )
+        finally:
+            if selector is not None:
+                selector.close()
+            if proc.poll() is None:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.wait()
+            if proc.stdout is not None:
+                proc.stdout.close()
+            count, total = self.op_stats.get("lsjson", (0, 0.0))
+            self.op_stats["lsjson"] = (
+                count + 1,
+                total + (time.perf_counter() - started),
+            )
+
+    def _exact_file_size(
+        self,
+        key: str,
+        *,
+        cancelled: Callable[[], bool] | None = None,
+        deadline: float | None = None,
+    ) -> int | None:
+        """Return one exact file's size, or None for no file at this key."""
+
+        if cancelled is None:
+            proc = self._run(["lsjson", "--stat", self._remote_path(key)])
+        else:
+            if deadline is None:
+                raise ValueError("cancellable stat requires a transfer deadline")
+            proc = self._run_cancellable_stat(
+                key, cancelled=cancelled, deadline=deadline
+            )
+        if proc.returncode in (3, 4):
+            return None
+        if proc.returncode != 0:
+            raise ObjectStoreError(f"rclone lsjson stat failed for {key}")
+        try:
+            info = json.loads(proc.stdout.decode("utf-8"))
+        except (ValueError, UnicodeDecodeError) as exc:
+            raise ObjectStoreError(f"rclone lsjson stat was invalid for {key}") from exc
+        if not isinstance(info, dict) or type(info.get("IsDir")) is not bool:
+            raise ObjectStoreError(f"rclone lsjson stat was invalid for {key}")
+        if info["IsDir"]:
+            return None
+        size = info.get("Size")
+        if type(size) is not int or size < 0:
+            raise ObjectStoreError(f"rclone lsjson file size was invalid for {key}")
+        return size
+
     # =========================================================================
     # ObjectStore interface
     # =========================================================================
 
     def get(self, key: str) -> bytes:
+        size = self._exact_file_size(key)
+        if size is None:
+            raise FileNotFoundError(key)
         proc = self._run(
             ["cat", self._remote_path(key)], timeout=self._transfer_timeout
         )
         if proc.returncode == 0:
+            if not proc.stdout:
+                after = self._exact_file_size(key)
+                if after is None:
+                    raise FileNotFoundError(key)
+                if size != 0 or after != 0:
+                    raise ObjectStoreError(
+                        f"rclone cat returned unexpected empty file {key}"
+                    )
             return proc.stdout
-        if self._is_not_found(proc):
+        if proc.returncode in (3, 4):
             raise FileNotFoundError(key)
-        raise ObjectStoreError(f"rclone cat failed for {key}: {self._stderr(proc)}")
+        raise ObjectStoreError(f"rclone cat failed for {key}")
 
     def get_bounded(
         self,
@@ -211,6 +337,16 @@ class RcloneObjectStore(ObjectStore):
 
         if max_bytes < 0:
             raise ValueError("max_bytes must not be negative")
+        deadline = time.monotonic() + self._transfer_timeout
+        size = self._exact_file_size(
+            key,
+            cancelled=cancelled if cancelled is not None else lambda: False,
+            deadline=deadline,
+        )
+        if size is None:
+            raise FileNotFoundError(key)
+        if size > max_bytes:
+            raise RcloneSizeLimitExceeded(max_bytes, size)
         env = dict(os.environ)
         env.update(self._env_overlay)
         try:
@@ -231,7 +367,6 @@ class RcloneObjectStore(ObjectStore):
             assert proc.stdout is not None
             selector = selectors.DefaultSelector()
             selector.register(proc.stdout, selectors.EVENT_READ)
-            deadline = time.monotonic() + self._transfer_timeout
             data = bytearray()
             while True:
                 if cancelled is not None and cancelled():
@@ -267,8 +402,22 @@ class RcloneObjectStore(ObjectStore):
                 return_code = proc.wait(timeout=remaining)
             except subprocess.TimeoutExpired as exc:
                 raise ObjectStoreError("rclone cat timed out") from exc
+            if return_code in (3, 4):
+                raise FileNotFoundError(key)
             if return_code != 0:
                 raise ObjectStoreError(f"rclone cat failed for {key}")
+            if not data:
+                after = self._exact_file_size(
+                    key,
+                    cancelled=cancelled if cancelled is not None else lambda: False,
+                    deadline=deadline,
+                )
+                if after is None:
+                    raise FileNotFoundError(key)
+                if size != 0 or after != 0:
+                    raise ObjectStoreError(
+                        f"rclone cat returned unexpected empty file {key}"
+                    )
             return bytes(data)
         finally:
             if selector is not None:
@@ -299,20 +448,7 @@ class RcloneObjectStore(ObjectStore):
             )
 
     def head(self, key: str) -> Optional[int]:
-        # lsjson --stat describes the leaf itself: a file yields IsDir=false +
-        # Size; a directory prefix yields IsDir=true (which is NOT a file, so
-        # None); a missing path is a non-zero exit (None). This is how we keep
-        # the file-vs-prefix distinction crisp in a flat key space.
-        proc = self._run(["lsjson", "--stat", self._remote_path(key)])
-        if proc.returncode != 0:
-            return None
-        try:
-            info = json.loads(proc.stdout.decode("utf-8") or "null")
-        except (ValueError, UnicodeDecodeError):
-            return None
-        if not info or info.get("IsDir", False):
-            return None
-        return int(info.get("Size", 0))
+        return self._exact_file_size(key)
 
     def list(self, prefix: str) -> List[ObjectInfo]:
         proc = self._run(

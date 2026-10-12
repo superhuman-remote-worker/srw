@@ -1,7 +1,7 @@
 """Datasource and repository connector API contracts."""
 
 from typing import Any, Literal
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 from shared.runtime.core.datasource_catalog import DATASOURCE_TYPE_IDS
 
 
@@ -54,9 +54,25 @@ class DatasourceCreate(BaseModel):
     read_only: bool | None = Field(
         None,
         description=(
-            "Declared read-only flag for public connectors (defaults to true "
-            "on publish; kb is always read-only). Declarative — credentials "
-            "are the enforcement boundary."
+            "The creator's read-only tag: agents get no write tools for this "
+            "connector, for everyone who uses it (defaults to true on "
+            "publish; kb is always read-only; a remote MCP connector still "
+            "gets every tool its server lists). The credential still decides "
+            "what is really allowed."
+        ),
+    )
+    driver_registration_id: str | None = Field(
+        None,
+        description=(
+            "A registered driver's connector (type image_driver): the "
+            "registration it runs, pinned for the connector's life"
+        ),
+    )
+    driver: str | None = Field(
+        None,
+        description=(
+            "A registered driver's connector: its driver name, resolved in the "
+            "shared Catalog, then the one selected project, then your Account"
         ),
     )
 
@@ -98,7 +114,11 @@ class DatasourceUpdate(BaseModel):
     )
     read_only: bool | None = Field(
         None,
-        description="Declared read-only flag (kb: always true; declarative only)",
+        description=(
+            "The creator's read-only tag: agents get no write tools for this "
+            "connector, for everyone who uses it (kb: always true; a remote "
+            "MCP connector still gets every tool its server lists)"
+        ),
     )
     scope_mode: Literal["all", "projects"] | None = Field(
         None, description="New execution availability mode"
@@ -125,6 +145,21 @@ class DatasourceUpdate(BaseModel):
         return self
 
 
+class DatasourceTestRequest(BaseModel):
+    """Optional body of ``POST /api/datasources/{id}/test``.
+
+    The connector form tests before it saves. For an SSH-key repository or an
+    ``ssh_key`` connector, the endpoint being typed (``connection_url`` and
+    ``config``) is what Test reaches; it is validated like an update and never
+    stored. Other connector types ignore it and test the saved row.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    connection_url: str | None = Field(None, max_length=2048)
+    config: dict[str, Any] | None = None
+
+
 class SSHKeyGenerateRequest(BaseModel):
     """Request body for generating an SSH keypair for a repository connector."""
 
@@ -149,6 +184,17 @@ class ProjectDatasourceSettings(BaseModel):
 
     read_only: bool | None = Field(
         None,
-        description="Managed connectors: true = read-only tools, false/null = CLI mode",
+        description="Managed connectors: true = read-only tools, false/null = read-write tools",
+    )
+    access: str | None = Field(
+        None,
+        pattern=r"^[A-Za-z][A-Za-z0-9_]{0,62}$",
+        description=(
+            "Connectors whose driver has access levels that say what they let "
+            "through (a cloud folder: read_only, protected, read_write): the "
+            "level the project's work binds it at when it names none. Such a "
+            "link takes a level instead of read_only; null on update clears it "
+            "(the driver's default). Omitted on update: unchanged."
+        ),
     )
     description: str | None = Field(None, description="Project-specific usage context")

@@ -15,20 +15,39 @@ from typing import Any
 
 REDACTED = "***REDACTED***"
 
+# The VM controller's signed HTTP URL includes this one secret query value.
+# Stop at the next query parameter so generation and request diagnostics remain.
+_LIFECYCLE_AUTH = re.compile(
+    r"(?i)\blifecycle_auth(\s{0,16}=\s{0,16})[^&\s\"',}{)#;]{1,4096}"
+)
+
 # key: <value> / key=<value> for secret-ish key names.
 _KV_SECRET = re.compile(
     r"(?i)\b(authorization|api[_-]?key|secret|client[_-]?secret|password|passwd|"
     r"token|access[_-]?key|private[_-]?key|refresh[_-]?token)"
-    r"(\"?\s*[:=]\s*\"?)"
-    r"([^\s\"',}{)]+)"
+    r"(\"?\s{0,16}[:=]\s{0,16}\"?)"
+    r"([^\s\"',}{)]{1,4096})"
 )
-# Standalone secret-shaped tokens.
+# Standalone secret-shaped tokens. Every quantifier is bounded and the JWT is
+# anchored by a lookbehind outside its own alphabet: `\b` treats `-` as a
+# boundary, so `eyJ-eyJ-…` started a match at every repetition and each one
+# rescanned the rest of the record.
 _STANDALONE = [
-    re.compile(r"(?i)\bbearer\s+[A-Za-z0-9._\-]+"),  # bearer <opaque/jwt>
-    re.compile(r"\beyJ[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+"),  # JWT
-    re.compile(r"\bsk-[A-Za-z0-9_\-]{16,}"),  # OpenAI / Anthropic style
-    re.compile(r"\bxox[baprs]-[A-Za-z0-9-]{8,}"),  # Slack
-    re.compile(r"\bgh[pousr]_[A-Za-z0-9]{16,}"),  # GitHub
+    re.compile(r"(?i)\bbearer\s{1,16}[A-Za-z0-9._\-]{1,4096}"),  # bearer <opaque/jwt>
+    re.compile(
+        r"(?<![A-Za-z0-9_\-])eyJ[A-Za-z0-9_\-]{1,4096}\.[A-Za-z0-9_\-]{1,4096}"
+        r"\.[A-Za-z0-9_\-]{1,4096}"
+    ),  # JWT
+    re.compile(r"\bsk-[A-Za-z0-9_\-]{16,512}"),  # OpenAI / Anthropic style
+    re.compile(r"\bxox[baprs]-[A-Za-z0-9-]{8,512}"),  # Slack
+    re.compile(r"\bgh[pousr]_[A-Za-z0-9]{16,255}"),  # GitHub
+    # SRW credential lease / driver identity (shared.connectors.leases)
+    re.compile(r"\bs(?:cl|di)_[0-9A-Za-z]{49}\b"),
+    # scheme://user:password@host — the userinfo only, so the line still names
+    # the host. A failed fetch or push logs its credential-bearing remote, and
+    # archived agent logs are served back through get_job_log. Anchored after
+    # `://` and stopping at `/`, `@` and whitespace, so it is linear.
+    re.compile(r"(?<=://)[^\s/@:]{0,256}+:[^\s/@]{0,2048}+(?=@)"),
 ]
 
 
@@ -36,10 +55,18 @@ def redact(text: str) -> str:
     """Mask secret-shaped substrings without introducing quotes or newlines."""
     if not text:
         return text
+    text = _LIFECYCLE_AUTH.sub(lambda m: f"lifecycle_auth{m.group(1)}{REDACTED}", text)
     text = _KV_SECRET.sub(lambda m: f"{m.group(1)}{m.group(2)}{REDACTED}", text)
     for pattern in _STANDALONE:
         text = pattern.sub(REDACTED, text)
     return text
+
+
+class RedactingTextLogFormatter(logging.Formatter):
+    """Format a text record, then mask secrets in its message and traceback."""
+
+    def format(self, record: logging.LogRecord) -> str:
+        return redact(super().format(record))
 
 
 # Promoted to stable top-level keys, in this order, when present.

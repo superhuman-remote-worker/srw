@@ -1,4 +1,4 @@
-import {Component, computed, effect, inject, signal} from '@angular/core';
+import {Component, DestroyRef, computed, effect, inject, signal} from '@angular/core';
 import {Router} from '@angular/router';
 import {TranslocoPipe, TranslocoService} from '@jsverse/transloco';
 import {ApiService} from '../../core/services/api.service';
@@ -17,6 +17,13 @@ import {
   jobStatusLabelKey,
   jobStatusTone as sharedJobStatusTone,
 } from '../../core/util/job-status';
+import {workspaceContractTitle as formatWorkspaceContractTitle} from '../../core/util/workspace-contract-presentation';
+import {
+  checkoutCaptureState,
+  jobCloudAction,
+  jobOutboxRecord,
+  noProjectFolderChanges,
+} from '../../core/util/job-cloud';
 
 interface FrozenJobData {
   freeze_type?: string;    // "phase_boundary" | "job_complete" | "vm_upgrade_required"
@@ -237,6 +244,9 @@ export function selectDeliveryRepository(
                   [title]="workspaceContractTitle()"
                 >{{ workspaceContractSummary() }}</span>
               }
+              @if (job()!.workspace_lifecycle; as lifecycle) {
+                <span class="meta-item" role="status">{{ ('jobs.lifecycle.state.' + lifecycle.state) | transloco }}</span>
+              }
             </div>
           </div>
 
@@ -371,12 +381,34 @@ export function selectDeliveryRepository(
             </div>
           }
 
-          <!-- Cloud folder preview (Mode B "open folder"). Export and open are
-               two separate clicks: the export takes longer than the browser's
-               transient-activation window, so an auto-open after it would be
-               popup-blocked. -->
-          @if (job()!.cloud_review_mode === 'open_folder') {
+          <!-- A project folder copy that goes through review but has no
+               diff: say so, rather than show nothing. -->
+          @if (noProjectFolderChanges(job()!)) {
+            <div class="section project-folder-copy" data-no-project-folder-changes>
+              {{ projectFolderCopyKey() | transloco }}
+            </div>
+          }
+
+          <!-- The job's outbox: its deliverables copied into a cloud folder
+               shared with its owner, re-synced on demand, for any job whose
+               project-folder diff is not waiting for review. Export and open
+               are two separate clicks: the export takes longer than the
+               browser's transient-activation window, so an auto-open after it
+               would be popup-blocked. -->
+          @if (cloudAction() !== 'none') {
             <div class="section cloud-folder">
+              @if (outbox(); as record) {
+                <div class="cloud-folder-state" data-outbox-state [attr.data-state]="record.state">
+                  @if (record.state === 'failed') {
+                    {{ 'jobReview.outbox.failed' | transloco:{ reason: ('jobReview.outbox.reason.' + record.reason) | transloco } }}
+                  } @else {
+                    {{ 'jobReview.outbox.delivered' | transloco:{ count: record.files } }}
+                    @if (record.unshared; as unshared) {
+                      {{ ' ' }}<span data-outbox-unshared>{{ 'jobReview.outbox.unshared.' + unshared | transloco }}</span>
+                    }
+                  }
+                </div>
+              }
               @if (job()!.exported_folder_url) {
                 <app-button
                   variant="info"
@@ -692,6 +724,13 @@ export function selectDeliveryRepository(
         line-height: 1.4;
       }
 
+      .cloud-folder-state,
+      .project-folder-copy {
+        color: var(--text-secondary, var(--text-secondary));
+        font-size: 0.9em;
+        line-height: 1.4;
+      }
+
       /* Actions */
       .actions-section {
         display: flex;
@@ -797,6 +836,7 @@ export class JobReviewComponent {
   private readonly data = inject(DataService);
   private readonly transloco = inject(TranslocoService);
   private readonly router = inject(Router);
+  private readonly destroyRef = inject(DestroyRef);
 
   readonly currentJobId = this.data.currentJobId;
   readonly job = signal<Job | null>(null);
@@ -836,12 +876,7 @@ export class JobReviewComponent {
   }
 
   workspaceContractTitle(): string {
-    const workspace = this.job()?.workspace_contract;
-    if (!workspace) return '';
-    return this.transloco.translate('jobs.workspace.state', {
-      state: workspace.state,
-      failure: workspace.failure ?? this.transloco.translate('jobs.workspace.none'),
-    });
+    return formatWorkspaceContractTitle(this.job(), this.transloco);
   }
   readonly frozenData = signal<FrozenJobData | null>(null);
   readonly isLoading = signal(false);
@@ -853,6 +888,28 @@ export class JobReviewComponent {
   readonly confirmingApprove = signal(false);
   readonly ideLoading = signal(false);
   readonly isExportingToCloud = signal(false);
+  /** The outbox affordance this job offers (core/util/job-cloud). */
+  readonly cloudAction = computed(() => {
+    const job = this.job();
+    return job ? jobCloudAction(job) : 'none';
+  });
+  /** What the latest copy into the job's outbox did. */
+  readonly outbox = computed(() => jobOutboxRecord(this.job()?.context));
+  readonly noProjectFolderChanges = noProjectFolderChanges;
+  /** Why a reviewed project folder copy has no diff, as the completion
+   *  capture recorded it. */
+  readonly projectFolderCopyKey = computed(() => {
+    switch (checkoutCaptureState(this.job()?.context)) {
+      case 'no_changes':
+        return 'jobReview.projectFolder.noChanges';
+      case 'no_baseline':
+        return 'jobReview.projectFolder.noBaseline';
+      case 'head_unreadable':
+        return 'jobReview.projectFolder.headUnreadable';
+      default:
+        return 'jobReview.projectFolder.nothingToReview';
+    }
+  });
   readonly reviewSessionLoading = signal(false);
   private readonly maxIdePollAttempts = 100;
   private idePollAttempts = 0;
@@ -862,6 +919,9 @@ export class JobReviewComponent {
   feedbackText = '';
 
   constructor() {
+    this.destroyRef.onDestroy(() => {
+      if (this.idePollingInterval) clearInterval(this.idePollingInterval);
+    });
     // React to job selection changes
     effect(() => {
       const jobId = this.currentJobId();
@@ -990,6 +1050,7 @@ export class JobReviewComponent {
     if (!currentJob) return false;
     // Hide IDE on subjobs — they share the parent's workspace
     if (currentJob.parent_job_id) return false;
+    if (currentJob.workspace_lifecycle && currentJob.workspace_lifecycle.state !== 'unsupported') return true;
     // Show IDE button if: live VM, snapshot available, or has Gitea repo
     if (currentJob.status === 'processing') return true;
     // context is JSONB and may arrive as a raw JSON string, so it must be
@@ -1006,6 +1067,10 @@ export class JobReviewComponent {
     const currentJob = this.job();
     if (!currentJob) return;
     const jobId = currentJob.id;
+    if (currentJob.workspace_lifecycle && currentJob.workspace_lifecycle.state !== 'unsupported') {
+      this.openVmIde(jobId);
+      return;
+    }
 
     this.ideLoading.set(true);
     this.resultMessage.set(null);
@@ -1058,6 +1123,66 @@ export class JobReviewComponent {
         this.resultIsError.set(true);
       }
       this.ideLoading.set(false);
+    });
+  }
+
+  private openVmIde(jobId: string): void {
+    const tab = window.open('', '_blank');
+    if (!tab) {
+      this.resultMessage.set(this.transloco.translate('jobs.lifecycle.popupBlocked'));
+      this.resultIsError.set(true);
+      return;
+    }
+    tab.opener = null;
+    tab.document.title = this.transloco.translate('jobs.lifecycle.wakingTab');
+    tab.document.body.textContent = this.transloco.translate('jobs.lifecycle.wakingTab');
+    this.ideLoading.set(true);
+    this.api.startIdeSession(jobId).subscribe(start => {
+      const leaseId = start?.access_lease_id;
+      if (!start || !leaseId || start.status === 'unavailable') {
+        tab.close();
+        this.ideLoading.set(false);
+        this.resultMessage.set(this.transloco.translate('jobs.lifecycle.ideUnavailable'));
+        this.resultIsError.set(true);
+        return;
+      }
+      if (start.status === 'active' && start.code_server_url) {
+        tab.location.href = start.code_server_url;
+        this.ideLoading.set(false);
+        return;
+      }
+      if (this.idePollingInterval) clearInterval(this.idePollingInterval);
+      this.idePollAttempts = 0;
+      this.idePollingInterval = setInterval(() => {
+        if (tab.closed || ++this.idePollAttempts > this.maxIdePollAttempts) {
+          if (this.idePollingInterval) clearInterval(this.idePollingInterval);
+          this.idePollingInterval = null;
+          this.ideLoading.set(false);
+          if (!tab.closed) {
+            tab.close();
+            this.resultMessage.set(this.transloco.translate('jobs.lifecycle.wakeTimedOut'));
+            this.resultIsError.set(true);
+          }
+          this.api.closeVmIdeLease(jobId, leaseId).subscribe();
+          return;
+        }
+        this.api.getIdeSession(jobId, leaseId).subscribe(status => {
+          if (status?.status === 'active' && status.code_server_url) {
+            if (this.idePollingInterval) clearInterval(this.idePollingInterval);
+            this.idePollingInterval = null;
+            this.ideLoading.set(false);
+            tab.location.href = status.code_server_url;
+          } else if (!status || status.status === 'unavailable' || status.status === 'failed') {
+            if (this.idePollingInterval) clearInterval(this.idePollingInterval);
+            this.idePollingInterval = null;
+            this.ideLoading.set(false);
+            tab.close();
+            this.api.closeVmIdeLease(jobId, leaseId).subscribe();
+            this.resultMessage.set(this.transloco.translate('jobs.lifecycle.ideUnavailable'));
+            this.resultIsError.set(true);
+          }
+        });
+      }, 3000);
     });
   }
 

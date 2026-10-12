@@ -25,11 +25,17 @@ test('one warning covers login, API, Git and cloud; browser capabilities remain'
   expect(capabilities).toEqual({secureContext: true, digest: 32, randomUuid: true, media: 'function', mediaEnumeration: true, serviceWorkerEnabled: false, externalClientsEnabled: false});
 
   await page.goto(`${target()}/settings`);
+  await expect(page).toHaveURL(`${target()}/settings/general`);
   await expect(page.locator('app-settings')).toBeVisible();
   await expect(page.locator('app-settings a[href*="ssh-keys"]')).toHaveCount(0);
   await expect(page.getByRole('heading', {name: 'MCP Tokens', exact: true})).toHaveCount(0);
+  // Neither page exists without external clients; both send the user back
+  // to General, and the settings rail lists neither.
+  await expect(page.locator('app-sidebar a[href="/settings/ssh-keys"], app-sidebar a[href="/settings/mcp"]')).toHaveCount(0);
   await page.goto(`${target()}/settings/ssh-keys`);
-  await expect(page).toHaveURL(`${target()}/settings`);
+  await expect(page).toHaveURL(`${target()}/settings/general`);
+  await page.goto(`${target()}/settings/mcp`);
+  await expect(page).toHaveURL(`${target()}/settings/general`);
 
   // Follow the real provider links; successful rendered pages after the
   // callback prove that server-side discovery/token exchange also works.

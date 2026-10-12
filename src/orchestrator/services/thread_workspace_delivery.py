@@ -38,16 +38,28 @@ import functools
 import json
 import logging
 import os  # noqa: F401  (used by the moved bodies)
+from collections import OrderedDict
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any, Optional  # noqa: F401  (used by the moved bodies)
 from uuid import UUID
 
 from fastapi import HTTPException
+from shared.session_attach_cleanup_identity import PreSetupWorkspaceIdentity
+from orchestrator.services.model_availability import WHERE_SESSION, ModelUnavailable
 from orchestrator.services.session_workspace_policy import preparation_wait_budget
 
 from orchestrator.security.access import externalize_gitea_url
 from orchestrator.security.access import require_internal as _require_internal
+from orchestrator.services import cloud_mount_status, connector_credential_leases
+from orchestrator.services.cloud_connector_mounts import (
+    outbox_attached,
+    uses_connector_rule,
+)
+from orchestrator.services.cloud_mount_sidecar import (
+    PLAN_CONTEXT_KEY,
+    recorded_sidecar_plan,
+)
 from orchestrator.services.container_provisioner import (
     WORKSPACE_RUNTIME_INCARNATION_KEY,
     WorkspaceRuntimeAttestation,
@@ -62,15 +74,29 @@ from orchestrator.services.session_runtime_admission import (
     thread_runtime_refusal_detail,
 )
 from orchestrator.services.stateless_workspace_gate import thread_metadata_object
+from orchestrator.services.vm_thread_initial import (
+    ensure_initial_thread_vm,
+    initial_vm_startup_view,
+    initial_vm_wait_payload,
+    is_initial_thread_vm_poll,
+    require_current_initial_vm_source,
+)
 from orchestrator.services.workspace_binding import (
     remote_canvas_presentation_available,
     virtual_thread_backing_id,
 )
+from orchestrator.services.in_pod_mount import InPodPlaneSettings
 from orchestrator.services.workspace_lifecycle import WorkspaceOwner
 from orchestrator.services.workspace_suspension import (
     WORKSPACE_SNAPSHOT_RESTORE_REQUIRED_KEY,
 )
 from shared.backend_kinds import LITE_BACKENDS
+from shared.connectors.builtin import needs_knowledge_profile
+from shared.session_subagent_batch import (
+    SESSION_SUBAGENT_BATCH_SETTLE_CONTRACT,
+    SESSION_SUBAGENT_BATCH_SETTLE_CONTRACT_KEY,
+    SESSION_SUBAGENT_FANOUT_KEY,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -127,6 +153,32 @@ class ThreadWorkspaceDeliveryDependencies:
     # dependency object and a caller can substitute it explicitly.
     require_internal: Any = _require_internal
     capture_session_config: Any = None
+    vm_provisioner: Any = None
+    # ``(lane) -> bool``: the operator's session fan-out switch
+    # (``DeploymentSettings.session_subagent_fanout``), read per payload. Off
+    # when a composition does not wire it.
+    session_subagent_fanout: Any = lambda _lane: False
+    # ``thread_mount_rows.resolve_thread_datasource_delivery``: datasources
+    # plus the hidden connector SSH identities from one authorization. A
+    # composition without it delivers ``resolve_thread_datasources`` alone,
+    # and no connector key.
+    resolve_thread_datasource_delivery: Any = None
+    # ``(thread_id) -> None``: the per-folder grants a workspace-side cloud
+    # mount (a VM, an officer, a Pod without the in-pod plane) is made with,
+    # minted before the locked response only looks them up
+    # (``agent_cloud_mounts.prepare_thread_folder_grants``). A composition
+    # without it mints none, and such a folder is left out until one exists.
+    prepare_cloud_folder_grants: Any = None
+    # ``(thread, *, mount_rows) -> [excluded]``: the attached cloud folders a
+    # deployment that syncs instead of mounting does not deliver
+    # (``agent_cloud_mounts.sync_delivery_exclusions``). A composition
+    # without it names none.
+    cloud_sync_exclusions: Any = None
+    # ``(thread, *, mount_rows) -> [excluded]``: every other attached cloud
+    # folder of a protected session, ``beside_protected``
+    # (``agent_cloud_mounts.beside_protected_exclusions``), named on the
+    # in-workspace protected payload. A composition without it names none.
+    beside_protected_exclusions: Any = None
 
 
 def agent_canvas_workspace_capabilities(
@@ -277,6 +329,60 @@ async def attest_pinned_thread_k8s_workspace(
     return attestation
 
 
+async def attest_pinned_thread_vm_workspace(
+    thread_id: str,
+    thread: Mapping[str, Any],
+    vm: Mapping[str, Any],
+    workspace_backend: str | None,
+    *,
+    dependencies: ThreadWorkspaceDeliveryDependencies,
+) -> WorkspaceRuntimeAttestation | None:
+    """Pair the delivered VM snapshot with fresh controller/owner authority."""
+
+    if thread.get("execution_lane") == "stateless" or workspace_backend != "vm":
+        return None
+    if not isinstance(vm, Mapping):
+        raise HTTPException(409, "VM workspace authority is malformed")
+    if vm.get("status") != "ready":
+        return None
+    try:
+        attestation = await dependencies.vm_provisioner.attest_workspace_runtime(
+            thread_id, entity_type="thread"
+        )
+    except Exception as exc:
+        raise HTTPException(
+            status_code=503,
+            detail="VM workspace runtime attestation is unavailable",
+        ) from exc
+    # The adapter attests its own fresh owner read. It must also match the
+    # snapshot used by this delivery, including the admitted host-key pin.
+    if (
+        vm.get("provision_generation") != attestation.workspace_generation
+        or vm.get("active_pod_uid") != attestation.runtime_incarnation
+        or vm.get("ssh_host_key_fingerprint") != attestation.ssh_host_key_fingerprint
+        or vm.get("ssh_host") != attestation.host
+        or str(vm.get("ssh_port")) != str(attestation.port)
+        or vm.get("vm_uid") != attestation.vm_uid
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail="VM workspace authority changed during attach",
+        )
+    refreshed = await dependencies.store.get_thread(thread_id)
+    if refreshed is None:
+        raise HTTPException(status_code=404, detail="Thread not found")
+    if (
+        refreshed.get("execution_lane") != thread.get("execution_lane")
+        or dependencies.thread_workspace_backend(refreshed) != workspace_backend
+        or thread_metadata_object(refreshed).get("vm") != vm
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail="VM workspace authority changed during attach",
+        )
+    return attestation
+
+
 async def require_pinned_workspace_credential_owner(
     thread: dict[str, Any],
     presented_agent_id: str | None,
@@ -397,15 +503,141 @@ async def require_pinned_workspace_credential_owner(
     return parsed_agent_id
 
 
+def _sidecar_holds_grant(
+    metadata: Mapping[str, Any], ro_row: Mapping[str, Any] | None
+) -> bool:
+    """Whether a protected sidecar Pod's lower layer mounts with exactly this
+    reader grant: its plan recorded the grant it was made from (D7)."""
+    plan = recorded_sidecar_plan(metadata)
+    recorded = (plan or {}).get("protected_grant")
+    if not isinstance(recorded, Mapping) or not isinstance(ro_row, Mapping):
+        return False
+    return all(
+        recorded.get(key) and recorded.get(key) == str(ro_row.get(key) or "")
+        for key in ("id", "runtime_generation", "engage_attempt", "reader_id")
+    )
+
+
+async def prepare_agent_thread_workspace(
+    thread_id: str, *, dependencies: ThreadWorkspaceDeliveryDependencies
+) -> None:
+    """The network part of the lease delivery the locked response makes (a
+    driver image, a git swap upstream's DNS and TLS), before the route takes
+    the thread's datasource lock. Never raises."""
+    await connector_credential_leases.prepare_thread_lease_delivery(
+        dependencies.store, thread_id
+    )
+    await _settle_cloud_mount_record(thread_id, dependencies=dependencies)
+    prepare_grants = getattr(dependencies, "prepare_cloud_folder_grants", None)
+    if prepare_grants is not None:
+        try:
+            await prepare_grants(thread_id)
+        except Exception:
+            logger.warning(
+                "Thread %s: its cloud folders' grants were not prepared",
+                thread_id,
+                exc_info=True,
+            )
+
+
+#: Pod UIDs known to record no cloud mount plan (from before the plane), so
+#: their polls cost no Pod read each. Bounded; oldest forgotten first.
+_PODS_WITHOUT_PLAN: "OrderedDict[str, None]" = OrderedDict()
+_PODS_WITHOUT_PLAN_MAX = 4096
+
+
+def _remember_pod_without_plan(uid: str) -> None:
+    _PODS_WITHOUT_PLAN[uid] = None
+    _PODS_WITHOUT_PLAN.move_to_end(uid)
+    while len(_PODS_WITHOUT_PLAN) > _PODS_WITHOUT_PLAN_MAX:
+        _PODS_WITHOUT_PLAN.popitem(last=False)
+
+
+async def _settle_cloud_mount_record(
+    thread_id: str, *, dependencies: ThreadWorkspaceDeliveryDependencies
+) -> None:
+    """The thread's record of its Pod's cloud mounts, before attach reads it
+    (connector drivers D7). Never raises.
+
+    - A ready Pod whose plan never reached the thread (a crash between
+      creating the Pod and publishing its plan) gets it from the Pod's own
+      annotation, the plan's source of truth. A Pod that records none is
+      remembered, so it costs one read, not one per poll.
+    - A sandbox upgraded to a VM drops the Pod's folder state: the VM's
+      folders are its own, and the cockpit must not show the Pod's. A
+      record of no Pod (``fingerprint: null``: the sync driver's, or the
+      in-workspace path's) stays.
+    """
+    if InPodPlaneSettings.from_env() is None:
+        return
+    try:
+        thread = await dependencies.store.get_thread(thread_id)
+        metadata = thread_metadata_object(thread)
+        workspace = metadata.get("workspace_container")
+        vm = metadata.get("vm") or {}
+        vm_ready = isinstance(vm, Mapping) and vm.get("status") == "ready"
+        if vm_ready:
+            status = metadata.get("cloud_mount_status")
+            if isinstance(status, Mapping) and status.get("fingerprint"):
+                clear = getattr(
+                    type(dependencies.store), "set_thread_cloud_mount_status", None
+                )
+                if callable(clear):
+                    await clear(dependencies.store, thread_id, None)
+            return
+        incarnation = (
+            str(workspace.get(WORKSPACE_RUNTIME_INCARNATION_KEY) or "")
+            if isinstance(workspace, Mapping)
+            else ""
+        )
+        if (
+            not incarnation
+            or PLAN_CONTEXT_KEY in workspace
+            or workspace.get("status") != "ready"
+            or workspace.get("provisioner") != "k8s"
+            or incarnation in _PODS_WITHOUT_PLAN
+        ):
+            return
+        recover = getattr(
+            dependencies.container_provisioner, "recover_cloud_mount_plan", None
+        )
+        if not callable(recover):
+            return
+        recovered = await recover(WorkspaceOwner.session(thread_id), incarnation)
+        if recovered is True:
+            logger.warning(
+                "Thread %s: recovered its workspace Pod's cloud mount plan from "
+                "the Pod",
+                thread_id,
+            )
+        elif recovered is False:
+            _remember_pod_without_plan(incarnation)
+    except Exception:
+        logger.warning(
+            "Thread %s: could not settle its cloud mount record",
+            thread_id,
+            exc_info=True,
+        )
+
+
 async def agent_get_thread_workspace_locked(
     thread_id: str,
     *,
     presented_agent_id: str | None = None,
     presented_runtime_generation: str | None = None,
     presented_attach_token: str | None = None,
+    presented_cloud_mount_delivery: str | None = None,
     dependencies: ThreadWorkspaceDeliveryDependencies,
 ) -> dict[str, Any]:
-    """Build a cold-session payload from state fetched under the DS lock."""
+    """Build a cold-session payload from state fetched under the DS lock.
+
+    ``presented_cloud_mount_delivery`` is what the agent sent in
+    ``X-SRW-Cloud-Mount-Delivery``: ``"sidecar"`` from an agent that attaches
+    to in-pod plane mounts (D7). Without it, a Pod whose mounts come from its
+    sidecars gets no cloud payload the agent would misread: no in-workspace
+    mount, no sync and no legacy session folder (the folders are still under
+    /cloud), and ``cloud_mount_agent_outdated`` for the route to record.
+    """
 
     # Bind every collaborator to the name the moved body already uses, so
     # the body below is byte-for-byte what `main` ran.  Two of them are
@@ -447,6 +679,9 @@ async def agent_get_thread_workspace_locked(
     _agent_canvas_workspace_capabilities = agent_canvas_workspace_capabilities
     _attest_pinned_thread_k8s_workspace = functools.partial(
         attest_pinned_thread_k8s_workspace, dependencies=dependencies
+    )
+    _attest_pinned_thread_vm_workspace = functools.partial(
+        attest_pinned_thread_vm_workspace, dependencies=dependencies
     )
     _require_pinned_workspace_credential_owner = functools.partial(
         require_pinned_workspace_credential_owner, dependencies=dependencies
@@ -496,6 +731,8 @@ async def agent_get_thread_workspace_locked(
     authority_vm = vm
     authority_binding = binding
     workspace_backend = _thread_workspace_backend(thread)
+    if workspace_backend == "vm" and not isinstance(vm, dict):
+        raise HTTPException(409, "VM workspace authority is malformed")
     if thread.get("execution_lane") == "stateless" and workspace_backend == "sandbox":
         workspace_status = str(ws.get("status") or "")
         restore_marker_present = WORKSPACE_SNAPSHOT_RESTORE_REQUIRED_KEY in ws
@@ -684,6 +921,9 @@ async def agent_get_thread_workspace_locked(
                 pinned_k8s_attestation.runtime_incarnation
             ),
         }
+    pinned_vm_attestation = await _attest_pinned_thread_vm_workspace(
+        thread_id, thread, vm, workspace_backend
+    )
     workspace_generation: str | None = None
     workspace_runtime_incarnation: str | None = None
     workspace_ssh_host_key_fingerprint: str | None = None
@@ -773,6 +1013,14 @@ async def agent_get_thread_workspace_locked(
         workspace_ssh_host_key_fingerprint = (
             pinned_k8s_attestation.ssh_host_key_fingerprint
         )
+    if pinned_vm_attestation is not None:
+        # VM provision generation and launcher Pod UID are the admitted
+        # physical pair; VM workspaces do not use the Canvas binding.
+        workspace_generation = pinned_vm_attestation.workspace_generation
+        workspace_runtime_incarnation = pinned_vm_attestation.runtime_incarnation
+        workspace_ssh_host_key_fingerprint = (
+            pinned_vm_attestation.ssh_host_key_fingerprint
+        )
     if (
         entry_protected_marker == "on"
         and workspace_backend not in {"virtual", "none"}
@@ -814,10 +1062,24 @@ async def agent_get_thread_workspace_locked(
     project_ids = await _revalidate_thread_project_ids(
         thread, await _thread_project_ids(thread_id)
     )
-    datasources_payload = await _resolve_thread_datasources(
-        thread, metadata, project_ids=project_ids
-    )
+    resolved_ssh_identities: list[dict[str, Any]] | None = None
+    if dependencies.resolve_thread_datasource_delivery is not None:
+        (
+            datasources_payload,
+            resolved_ssh_identities,
+        ) = await dependencies.resolve_thread_datasource_delivery(
+            thread, metadata, project_ids=project_ids
+        )
+    else:
+        datasources_payload = await _resolve_thread_datasources(
+            thread, metadata, project_ids=project_ids
+        )
     mount_rows = await postgres_db.list_thread_mounts(thread_id)
+    cloud_mount_sidecar_cfg: dict[str, Any] | None = None
+    # The attached cloud folders named while none mounts: the ones this
+    # deployment's sync does not deliver, or every one an in-workspace mount
+    # set left out.
+    cloud_folders_excluded: list[dict[str, Any]] = []
     suppress_disposable_cloud = bool(
         thread.get("execution_lane") == "stateless" and workspace_backend == "none"
     )
@@ -835,7 +1097,25 @@ async def agent_get_thread_workspace_locked(
             mount_rows=mount_rows,
             metadata=metadata,
         )
-        if cloud_mount_cfg:
+        if (
+            isinstance(cloud_mount_cfg, dict)
+            and cloud_mount_cfg.get("delivery") == "sidecar"
+        ):
+            cloud_mount_sidecar_cfg, cloud_mount_cfg = cloud_mount_cfg, None
+        elif isinstance(cloud_mount_cfg, dict) and not cloud_mount_cfg.get("protected"):
+            # The in-workspace path (a VM, a Pod without a recorded plan):
+            # what it left out is kept on a record of no Pod, so the session
+            # header names it. With nothing to mount, the folders reach the
+            # agent the way the sync driver's do, and the session folder is
+            # synced as whenever nothing mounts (main cloud, nothing missing
+            # silently).
+            left_out = list(cloud_mount_cfg.get("excluded") or [])
+            await cloud_mount_status.record_sync_exclusions(
+                postgres_db, thread_id, metadata, left_out
+            )
+            if not cloud_mount_cfg.get("mounts"):
+                cloud_folders_excluded, cloud_mount_cfg = left_out, None
+        if cloud_mount_cfg or cloud_mount_sidecar_cfg:
             cloud_sync_cfg = None
         elif metadata.get("protected_cloud"):
             # Protected thread with no engageable protected mount (flag off,
@@ -851,22 +1131,42 @@ async def agent_get_thread_workspace_locked(
             cloud_sync_cfg = _build_agent_cloud_sync(thread, mount_rows=[])
         else:
             cloud_sync_cfg = _build_agent_cloud_sync(thread, mount_rows=mount_rows)
+            # The sync driver delivers no connector's cloud folder: each one
+            # attached is named, for the agent and the session header,
+            # rather than silently missing (main cloud, fix-up 3).
+            if dependencies.cloud_sync_exclusions is not None:
+                cloud_folders_excluded = await dependencies.cloud_sync_exclusions(
+                    thread, mount_rows=mount_rows
+                )
+                await cloud_mount_status.record_sync_exclusions(
+                    postgres_db, thread_id, metadata, cloud_folders_excluded
+                )
     # Issue 13 follow-up: if the main cloud is up but this thread resolved NO
     # sync target (session-folder provisioning failed upstream, or user-home /
     # project-mount resolution produced nothing usable), the agent would
     # otherwise run unsynced with no signal. Flag it so the agent surfaces the
     # same degraded-sync state it shows for a failed initial pull, instead of
     # silently skipping cloud sync for the session's whole life.
+    #
+    # A session under the connector rule has a session folder only for an
+    # attached outbox (main cloud slice 6.1): without one there is no sync
+    # target to miss, and a stateless turn refuses tool work while the sync
+    # is degraded, so such a session is never marked so.
     try:
         _cloud_up = main_cloud_router.active.is_initialized
     except Exception:
         _cloud_up = False
+    expects_sync_target = not uses_connector_rule(metadata) or outbox_attached(metadata)
     cloud_sync_degraded = bool(
         not suppress_disposable_cloud
         and _cloud_up
         and not cloud_mount_cfg
+        and not cloud_mount_sidecar_cfg
         and not cloud_sync_cfg
-        and (metadata.get("protected_cloud") or not thread.get("nc_session_folder"))
+        and (
+            metadata.get("protected_cloud")
+            or (expects_sync_target and not thread.get("nc_session_folder"))
+        )
     )
     # Re-inject credentials in-flight: the persisted config_override is stripped
     # of secrets (redact_config_override at create/hot-swap). This endpoint is
@@ -876,8 +1176,7 @@ async def agent_get_thread_workspace_locked(
     # stripping, so user_settings isn't needed to repopulate the keys.
     co = metadata.get("config_override") or {}
     include_kb_profile = bool(project_ids) or any(
-        str(datasource.get("type") or "").lower() == "kb"
-        for datasource in datasources_payload or []
+        needs_knowledge_profile(datasource) for datasource in datasources_payload or []
     )
     if co or include_kb_profile:
         co = await _inject_thread_dispatch_credentials(
@@ -885,6 +1184,8 @@ async def agent_get_thread_workspace_locked(
             user_id=str(thread["user_id"]) if thread.get("user_id") else None,
             project_id=str(thread["project_id"]) if thread.get("project_id") else None,
             include_kb_profile=include_kb_profile,
+            # The fallback copy; the resolved config below is checked strictly.
+            strict=False,
         )
     # Orchestrator-resolved config for cold/dedicated attach: the agent prefers
     # this fully-resolved, credential-injected blob over the config_override
@@ -892,19 +1193,121 @@ async def agent_get_thread_workspace_locked(
     # Session dispatch PEP (fail closed): a grant denial or resolve error must not
     # fall through to the unvetted config_override — refuse the attach (403).
     _sess_status: dict[str, Any] = {"_capture_manifest": True}
+    denied_cleanup_headers = None
+    if pinned_k8s_attestation is not None:
+        try:
+            denied_cleanup_headers = PreSetupWorkspaceIdentity(
+                thread_id,
+                str(thread.get("runtime_generation") or ""),
+                workspace_generation,
+                workspace_runtime_incarnation,
+            ).headers()
+        except (TypeError, ValueError):
+            # An incomplete identity is never a cleanup/release authorization.
+            pass
     try:
         session_resolved = await _resolve_session_config(
             thread, metadata, status=_sess_status
         )
     except GrantDenied as gd:
         raise HTTPException(
-            status_code=403, detail=_grant_violations_detail(gd.violations)
+            status_code=403,
+            detail=_grant_violations_detail(gd.violations),
+            headers=denied_cleanup_headers,
         )
+    except ModelUnavailable as unavailable:
+        raise HTTPException(
+            status_code=409,
+            detail=unavailable.detail(where=WHERE_SESSION),
+            headers=denied_cleanup_headers,
+        ) from unavailable
     if _sess_status.get("state") == "error":
         raise HTTPException(
             status_code=403,
             detail="capability grants could not be verified for this session config",
+            headers=denied_cleanup_headers,
         )
+    if (
+        thread.get("execution_lane") == "pinned"
+        and thread.get("status") == "created"
+        and dependencies.vm_provisioner is not None
+        and vm.get("status") != "ready"
+    ):
+        from orchestrator.services.vm_thread_retained_resume import (
+            ensure_retained_thread_vm,
+        )
+
+        retained = await ensure_retained_thread_vm(
+            thread,
+            store=postgres_db,
+            provisioner=dependencies.vm_provisioner,
+        )
+        if retained is not None:
+            current = await postgres_db.get_thread(thread_id)
+            if not _thread_accepts_runtime(current):
+                raise HTTPException(409, "Retained VM runtime changed during admission")
+            await _require_pinned_workspace_credential_owner(
+                current,
+                presented_agent_id,
+                presented_runtime_generation,
+                presented_attach_token,
+            )
+            return initial_vm_wait_payload(current)
+
+    if (
+        thread.get("execution_lane") == "pinned"
+        and thread.get("status") == "created"
+        and workspace_backend == "vm"
+        and dependencies.vm_provisioner is not None
+        and vm.get("status") != "ready"
+        and is_initial_thread_vm_poll(thread, vm)
+    ):
+        # Admission follows the real binding and current authorization. A
+        # restart between binding and this poll simply repeats this boundary.
+        # No lifecycle lock may be nested under the caller's datasource lock.
+        if not all(
+            (presented_agent_id, presented_runtime_generation, presented_attach_token)
+        ):
+            raise HTTPException(
+                409, "Initial VM creation requires exact runtime identity"
+            )
+        if metadata.get("vm") is None:
+            current = await ensure_initial_thread_vm(
+                thread,
+                store=postgres_db,
+                provisioner=dependencies.vm_provisioner,
+            )
+        else:
+            if (
+                vm.get("status")
+                not in {
+                    "provisioning",
+                    "created",
+                    "starting",
+                    "ssh_pending",
+                    "failed",
+                    "waiting_capacity",
+                    "waiting_golden",
+                    "waiting_headscale",
+                    "waiting_preparation",
+                }
+                or not vm.get("provision_generation")
+                or vm.get("rootdisk") == "kept"
+            ):
+                raise HTTPException(409, "VM workspace is not an initial creation")
+            current = await postgres_db.get_thread(thread_id)
+        if not _thread_accepts_runtime(current):
+            raise HTTPException(409, "Initial VM runtime changed during admission")
+        await _require_pinned_workspace_credential_owner(
+            current,
+            presented_agent_id,
+            presented_runtime_generation,
+            presented_attach_token,
+        )
+        if thread_metadata_object(current).get("vm") is not None:
+            await require_current_initial_vm_source(current, store=postgres_db)
+        startup = await initial_vm_startup_view(current, store=postgres_db)
+        return initial_vm_wait_payload(current, startup_view=startup)
     # Lite (virtual/none) sessions run with no workspace pod. Attach the
     # object-store mounts in-flight here — the same enrichment
     # _send_session_attach does for the idle-pool path — so a DEDICATED session
@@ -938,6 +1341,11 @@ async def agent_get_thread_workspace_locked(
         runtime_repository_backend = "vm"
     elif ws.get("status") == "ready" and (ws.get("pod_ip") or ws.get("host")):
         runtime_repository_backend = "sandbox"
+    # Connector keys, like repository authority, only ever ride a response
+    # that names a ready shell-capable workspace.
+    workspace_ssh_identities = (
+        resolved_ssh_identities if runtime_repository_backend is not None else None
+    )
     if runtime_repository_backend is not None:
         try:
             (
@@ -990,6 +1398,21 @@ async def agent_get_thread_workspace_locked(
                 status_code=409,
                 detail="Workspace authority changed during attach",
             )
+    if pinned_vm_attestation is not None:
+        latest = await postgres_db.get_thread(thread_id)
+        if latest is None:
+            raise HTTPException(status_code=404, detail="Thread not found")
+        confirmed = await _attest_pinned_thread_vm_workspace(
+            thread_id,
+            latest,
+            thread_metadata_object(latest).get("vm") or {},
+            _thread_workspace_backend(latest),
+        )
+        if confirmed != pinned_vm_attestation:
+            raise HTTPException(
+                status_code=409,
+                detail="VM workspace authority changed during attach",
+            )
     # Complete protected-reader and exact selected-mount validation before the
     # final lifecycle read. The endpoint holds ``thread_datasource_lock`` for
     # this whole function, so selection cannot change after this snapshot;
@@ -1002,7 +1425,7 @@ async def agent_get_thread_workspace_locked(
             return _protected_workspace_wait_payload(state="engaging")
         prepared_ro_row, prepared_mount_rows = await asyncio.gather(
             postgres_db.get_ro_mount_by_thread(thread_id),
-            postgres_db.list_thread_mounts(thread_id),
+            postgres_db.list_protected_selection_rows(thread_id),
         )
         if not _ro_mount_matches_protected_selection(
             prepared_ro_row,
@@ -1020,13 +1443,21 @@ async def agent_get_thread_workspace_locked(
         if prepared_protected_mount is None:
             return _protected_workspace_wait_payload(state="engaging")
 
-    # Everything above this point crosses policy, workspace, repository and
-    # cloud awaits. This is the actual credential-delivery boundary and the
-    # final await before returning coordinates.
+    # Complete all policy, workspace, repository, cloud and startup awaits
+    # before the final lifecycle and credential-delivery checks below.
     if dependencies.capture_session_config is not None:
         session_resolved = await dependencies.capture_session_config(
             thread, session_resolved, _sess_status, project_ids=project_ids
         )
+    startup = None
+    if (
+        authority_vm.get("status") == "ready"
+        and authority_vm.get("creation_request_id")
+        and is_initial_thread_vm_poll(thread, authority_vm)
+    ):
+        startup = await initial_vm_startup_view(thread, store=postgres_db)
+        if startup is None:
+            raise HTTPException(409, "Initial VM startup source changed")
     final_thread = await postgres_db.get_thread(thread_id)
     if not _thread_accepts_runtime(final_thread):
         raise HTTPException(
@@ -1065,6 +1496,13 @@ async def agent_get_thread_workspace_locked(
         final_ws != authority_ws
         or final_vm != authority_vm
         or final_binding != authority_binding
+        or (
+            pinned_vm_attestation is not None
+            and (
+                final_thread.get("execution_lane") != thread.get("execution_lane")
+                or _thread_workspace_backend(final_thread) != workspace_backend
+            )
+        )
     ):
         # Workspace U1 -> U2 is independent of the thread generation. Never
         # splice U1 coordinates/credentials into a response authorized by a
@@ -1088,7 +1526,45 @@ async def agent_get_thread_workspace_locked(
         # only the exact prepared mount may cross the response boundary.
         if prepared_protected_mount is None:
             return _protected_workspace_wait_payload(state="engaging")
-        cloud_mount_cfg = prepared_protected_mount
+        if cloud_mount_sidecar_cfg is not None:
+            # The Pod's sidecars mount the lower with the reader credential
+            # its plan was made from (D7); the credential never reaches the
+            # agent. A grant replaced since then is one the sidecar does not
+            # hold: fail closed rather than run against a dead lower.
+            if not _sidecar_holds_grant(final_metadata, prepared_ro_row):
+                return _protected_workspace_wait_payload(
+                    state="failed", error_code="engage_refused"
+                )
+            cloud_mount_cfg = None
+        else:
+            # Its other attached folders are named, never dropped silently
+            # (slice 5): the prepared mount carries the list the built one
+            # had, else one read now; the session header keeps it too.
+            beside = (
+                cloud_mount_cfg.get("excluded")
+                if isinstance(cloud_mount_cfg, dict)
+                and cloud_mount_cfg.get("protected")
+                else None
+            )
+            if beside is None and dependencies.beside_protected_exclusions is not None:
+                try:
+                    beside = await dependencies.beside_protected_exclusions(
+                        final_thread, mount_rows=mount_rows
+                    )
+                except Exception:
+                    logger.warning(
+                        "Thread %s: could not name the folders beside its "
+                        "protected one",
+                        thread_id,
+                        exc_info=True,
+                    )
+                    beside = None
+            cloud_mount_cfg = dict(prepared_protected_mount)
+            if beside is not None:
+                cloud_mount_cfg["excluded"] = list(beside)
+                await cloud_mount_status.record_sync_exclusions(
+                    postgres_db, thread_id, final_metadata, list(beside)
+                )
         cloud_sync_cfg = None
         cloud_sync_degraded = False
     final_runtime_authority = thread_runtime_authority(final_thread)
@@ -1099,11 +1575,39 @@ async def agent_get_thread_workspace_locked(
             status_code=409,
             detail={"code": "pinned_runtime_generation_unavailable"},
         )
+    # Credential leases (connector drivers C2), after the last authority
+    # check and still under the datasource lock: the thread's lease token
+    # replaces each lease connector's credentials. A pod recycle or a warm
+    # re-attach receives the same token again; only End revokes.
+    try:
+        await connector_credential_leases.deliver_connector_leases_with(
+            postgres_db,
+            datasources_payload,
+            owner=connector_credential_leases.LeaseOwner.thread(thread_id),
+        )
+    except connector_credential_leases.LeaseDeliveryError as exc:
+        raise HTTPException(
+            status_code=409, detail={"code": "connector_lease_unavailable"}
+        ) from exc
 
     return {
         "status": ws.get("status", "none"),
+        **({"vm_startup": startup} if startup is not None else {}),
         "pinned_status_identity_contract": 1,
         "pinned_runtime_generation_contract": 1,
+        # Same advertisements as the pushed pinned attach body
+        # (session_attach_binding): batch settle of a delegation turn, and
+        # the operator's fan-out switch for this thread's lane. A pinned pod
+        # that attaches itself reads both here (the VM wait payloads carry
+        # neither; this ready payload does).
+        SESSION_SUBAGENT_BATCH_SETTLE_CONTRACT_KEY: (
+            SESSION_SUBAGENT_BATCH_SETTLE_CONTRACT
+        ),
+        SESSION_SUBAGENT_FANOUT_KEY: bool(
+            dependencies.session_subagent_fanout(
+                str(final_thread.get("execution_lane") or "")
+            )
+        ),
         "session_runtime_generation": (
             final_runtime_authority.generation
             if final_runtime_authority is not None
@@ -1134,6 +1638,13 @@ async def agent_get_thread_workspace_locked(
         "namespace": ws.get("namespace"),
         "git_remote_url": git_remote_url,
         "managed_repository_credentials": managed_repository_credentials,
+        # Only when there is something to load, so an agent from before C1
+        # (whose allowlists name no such key) sees the response it knew.
+        **(
+            {"workspace_ssh_identities": workspace_ssh_identities}
+            if workspace_ssh_identities
+            else {}
+        ),
         # Public capability only. A ready endpoint without a paired trusted
         # binding must not cause the agent to advertise Canvas tools which can
         # never work.
@@ -1165,7 +1676,9 @@ async def agent_get_thread_workspace_locked(
         # Nextcloud session folder (legacy; preserved one release for back-compat)
         "nc_session_folder": (
             None
-            if suppress_disposable_cloud or final_protected_marker != "off"
+            if suppress_disposable_cloud
+            or final_protected_marker != "off"
+            or cloud_mount_sidecar_cfg is not None
             else final_thread.get("nc_session_folder")
         ),
         # Structured cloud-sync config (backend + webdav URL + auth).
@@ -1174,8 +1687,23 @@ async def agent_get_thread_workspace_locked(
         # Structured lazy cloud mount config. Mutually exclusive with
         # cloud_sync for the same thread response.
         "cloud_mount": cloud_mount_cfg,
+        # The in-pod plane's mounts (D7): no credential, only where each
+        # mount is and how to read its state. An older agent ignores the key
+        # and, seeing no cloud_mount, cloud_sync or session folder, runs with
+        # the folders it finds under /cloud.
+        "cloud_mount_sidecar": cloud_mount_sidecar_cfg,
+        "cloud_mount_agent_outdated": bool(
+            cloud_mount_sidecar_cfg is not None
+            and presented_cloud_mount_delivery != "sidecar"
+        ),
         # True when cloud is up but no sync target resolved (Issue 13 follow-up).
         "cloud_sync_degraded": cloud_sync_degraded,
+        # The attached cloud folders named while none mounts (the ones the
+        # sync driver does not deliver, ``delivery_unsupported``, or every
+        # one an in-workspace mount set left out), for the agent's prompt.
+        "cloud_folders_excluded": (
+            cloud_folders_excluded if final_protected_marker == "off" else []
+        ),
         # Protected Cloud Mode marker (F-C1): tells the agent to fail-close
         # the legacy nc_session_folder sync shim and any cloud_sync
         # consumption rather than falling back to a live WebDAV mount.
@@ -1190,5 +1718,7 @@ __all__ = [
     "agent_canvas_workspace_capabilities",
     "agent_get_thread_workspace_locked",
     "attest_pinned_thread_k8s_workspace",
+    "attest_pinned_thread_vm_workspace",
+    "prepare_agent_thread_workspace",
     "require_pinned_workspace_credential_owner",
 ]

@@ -5,7 +5,7 @@ import { NetworkLedger, sanitizedDiagnostic } from './network-ledger';
 type PageEvent = 'request' | 'response' | 'requestfailed' | 'pageerror' | 'console';
 type PageHandler = (value: unknown) => void;
 
-function ledgerHarness(): {
+function ledgerHarness(applicationOrigin = 'http://srw-e2e.test'): {
   ledger: NetworkLedger;
   handlers: Map<PageEvent, PageHandler>;
 } {
@@ -16,7 +16,7 @@ function ledgerHarness(): {
     },
   } as unknown as Page;
   return {
-    ledger: new NetworkLedger(page, 'http://srw-e2e.test'),
+    ledger: new NetworkLedger(page, applicationOrigin),
     handlers,
   };
 }
@@ -45,6 +45,14 @@ function emitRequestFailed(
     url: () => url,
     failure: () => ({ errorText: failure }),
   } as Request);
+}
+
+function requestForFailure(method: string, url: string, failure: string): Request {
+  return {
+    method: () => method,
+    url: () => url,
+    failure: () => ({ errorText: failure }),
+  } as Request;
 }
 
 function emitResponse(
@@ -89,6 +97,106 @@ describe('network ledger safety and warm-up classification', () => {
     );
 
     expect(ledger.problems()).toEqual([]);
+  });
+
+  it.each([409, 425])('allows HTTP/2 status %s without a reason phrase for an observed owned warm-up poll', (status) => {
+    const { ledger, handlers } = ledgerHarness('https://srw-e2e.test');
+    ledger.registerThread('owned-thread');
+    ledger.setPhase('creating');
+    const url = 'https://srw-e2e.test/api/sessions/owned-thread/connection';
+    emitResponse(handlers, 'GET', url, status);
+    emitConsole(handlers, `Failed to load resource: the server responded with a status of ${status} ()`, url);
+
+    expect(ledger.problems()).toEqual([]);
+  });
+
+  it.each([409, 425])('matches delayed status %s diagnostics across permitted warm-up phases', (status) => {
+    const { ledger, handlers } = ledgerHarness('https://srw-e2e.test');
+    ledger.registerThread('owned-thread');
+    ledger.setPhase('creating');
+    const url = 'https://srw-e2e.test/api/sessions/owned-thread/connection';
+    emitResponse(handlers, 'GET', url, status);
+    ledger.setPhase('turn');
+    emitConsole(handlers, `Failed to load resource: the server responded with a status of ${status} ()`, url);
+    expect(ledger.problems()).toEqual([]);
+  });
+
+  it('requires a distinct observed response for each delayed diagnostic', () => {
+    const { ledger, handlers } = ledgerHarness('https://srw-e2e.test');
+    ledger.registerThread('owned-thread');
+    ledger.setPhase('turn');
+    const url = 'https://srw-e2e.test/api/sessions/owned-thread/connection';
+    emitResponse(handlers, 'GET', url, 425);
+    emitConsole(handlers, 'Failed to load resource: the server responded with a status of 425 ()', url);
+    emitConsole(handlers, 'Failed to load resource: the server responded with a status of 425 ()', url);
+    expect(ledger.problems().filter((problem) => problem.startsWith('console error'))).toHaveLength(1);
+  });
+
+  it('requires the observed response to originate in a warm-up phase', () => {
+    const { ledger, handlers } = ledgerHarness('https://srw-e2e.test');
+    ledger.registerThread('owned-thread');
+    const url = 'https://srw-e2e.test/api/sessions/owned-thread/connection';
+    ledger.setPhase('hydration');
+    emitResponse(handlers, 'GET', url, 425);
+    ledger.setPhase('turn');
+    emitConsole(handlers, 'Failed to load resource: the server responded with a status of 425 ()', url);
+    expect(ledger.problems().some((problem) => problem.startsWith('console error'))).toBe(true);
+  });
+
+  it('keeps each real response available once across warm-up phase changes', () => {
+    const { ledger, handlers } = ledgerHarness('https://srw-e2e.test');
+    ledger.registerThread('owned-thread');
+    const url = 'https://srw-e2e.test/api/sessions/owned-thread/connection';
+    ledger.setPhase('creating');
+    emitResponse(handlers, 'GET', url, 425);
+    emitResponse(handlers, 'GET', url, 425);
+    ledger.setPhase('turn');
+    emitConsole(handlers, 'Failed to load resource: the server responded with a status of 425 ()', url);
+    ledger.setPhase('reload');
+    emitConsole(handlers, 'Failed to load resource: the server responded with a status of 425 ()', url);
+    expect(ledger.problems()).toEqual([]);
+    emitConsole(handlers, 'Failed to load resource: the server responded with a status of 425 ()', url);
+    expect(ledger.problems().filter((problem) => problem.startsWith('console error'))).toHaveLength(1);
+  });
+
+  it('requires the delayed callback to retain the application origin', () => {
+    const { ledger, handlers } = ledgerHarness('https://srw-e2e.test');
+    ledger.registerThread('owned-thread');
+    ledger.setPhase('creating');
+    emitResponse(handlers, 'GET', 'https://srw-e2e.test/api/sessions/owned-thread/connection', 425);
+    ledger.setPhase('turn');
+    emitConsole(handlers, 'Failed to load resource: the server responded with a status of 425 ()',
+      'https://foreign.test/api/sessions/owned-thread/connection');
+    expect(ledger.problems().filter((problem) => problem.startsWith('console error'))).toHaveLength(1);
+  });
+
+  it('refuses a post-warm-up callback even with an unused warm response', () => {
+    const { ledger, handlers } = ledgerHarness('https://srw-e2e.test');
+    ledger.registerThread('owned-thread');
+    const url = 'https://srw-e2e.test/api/sessions/owned-thread/connection';
+    ledger.setPhase('creating');
+    emitResponse(handlers, 'GET', url, 425);
+    ledger.setPhase('hydration');
+    emitConsole(handlers, 'Failed to load resource: the server responded with a status of 425 ()', url);
+    expect(ledger.problems().filter((problem) => problem.startsWith('console error'))).toHaveLength(1);
+  });
+
+  it.each([
+    ['unobserved', 'GET', 425, 'https://srw-e2e.test/api/sessions/owned-thread/connection', 'creating', false],
+    ['wrong status', 'GET', 200, 'https://srw-e2e.test/api/sessions/owned-thread/connection', 'creating', true],
+    ['write method', 'POST', 425, 'https://srw-e2e.test/api/sessions/owned-thread/connection', 'creating', true],
+    ['foreign thread', 'GET', 425, 'https://srw-e2e.test/api/sessions/foreign-thread/connection', 'creating', true],
+    ['foreign origin', 'GET', 425, 'https://foreign.test/api/sessions/owned-thread/connection', 'creating', true],
+    ['unrelated endpoint', 'GET', 425, 'https://srw-e2e.test/api/persistent/threads/owned-thread/input', 'creating', true],
+    ['after warm-up', 'GET', 425, 'https://srw-e2e.test/api/sessions/owned-thread/connection', 'hydration', true],
+  ] as const)('rejects an HTTP/2 resource error for %s', (_, method, status, url, phase, observed) => {
+    const { ledger, handlers } = ledgerHarness('https://srw-e2e.test');
+    ledger.registerThread('owned-thread');
+    ledger.setPhase(phase);
+    if (observed) emitResponse(handlers, method, url, status);
+    emitConsole(handlers, 'Failed to load resource: the server responded with a status of 425 ()', url);
+
+    expect(ledger.problems().some((problem) => problem.startsWith('console error'))).toBe(true);
   });
 
   it('rejects a warm-up response for a foreign thread', () => {
@@ -201,6 +309,187 @@ describe('network ledger safety and warm-up classification', () => {
       'GET',
       'http://srw-e2e.test/api/persistent/threads/owned-thread/stream',
     );
+
+    expect(ledger.problems()).toHaveLength(1);
+  });
+
+  it('accepts an owned connection poll aborted by reload only when it began before navigation', () => {
+    const { ledger, handlers } = ledgerHarness();
+    ledger.registerThread('owned-thread');
+    ledger.setPhase('turn');
+    const request = requestForFailure(
+      'GET', 'http://srw-e2e.test/api/sessions/owned-thread/connection', 'net::ERR_ABORTED',
+    );
+    handlers.get('request')?.(request);
+
+    ledger.setPhase('reload');
+    handlers.get('requestfailed')?.(request);
+
+    expect(ledger.problems()).toEqual([]);
+    expect(ledger.entries()).toContainEqual(
+      expect.objectContaining({
+        kind: 'requestfailed',
+        pathname: '/api/sessions/owned-thread/connection',
+        phase: 'reload',
+        started_phase: 'turn',
+        classification: 'expected-navigation-cancellation',
+      }),
+    );
+  });
+
+  it('accepts an owned thread-detail GET aborted by the explicit reload of its old document', () => {
+    const { ledger, handlers } = ledgerHarness();
+    ledger.registerThread('owned-thread');
+    ledger.setPhase('turn');
+    const request = requestForFailure(
+      'GET', 'http://srw-e2e.test/api/persistent/threads/owned-thread', 'net::ERR_ABORTED',
+    );
+    handlers.get('request')?.(request);
+
+    // session-chat.spec.ts sets this phase immediately before page.reload().
+    ledger.setPhase('reload');
+    handlers.get('requestfailed')?.(request);
+
+    expect(ledger.problems()).toEqual([]);
+    expect(ledger.entries()).toContainEqual(
+      expect.objectContaining({
+        kind: 'requestfailed',
+        pathname: '/api/persistent/threads/owned-thread',
+        phase: 'reload',
+        started_phase: 'turn',
+        classification: 'expected-navigation-cancellation',
+      }),
+    );
+  });
+
+  it.each([
+    ['GET', 'http://srw-e2e.test/api/persistent/threads/foreign', 'net::ERR_ABORTED'],
+    ['POST', 'http://srw-e2e.test/api/persistent/threads/owned-thread', 'net::ERR_ABORTED'],
+    ['GET', 'http://srw-e2e.test/api/persistent/threads/owned-thread', 'net::ERR_CONNECTION_RESET'],
+    ['GET', 'http://srw-e2e.test/api/persistent/threads/owned-thread', 'NS_BINDING_ABORTED'],
+    ['GET', 'http://srw-e2e.test/api/persistent/threads/owned-thread/messages', 'net::ERR_ABORTED'],
+    ['GET', 'http://srw-e2e.test/api/persistent/threads/owned-thread/input', 'net::ERR_ABORTED'],
+  ])('rejects a non-owned-detail reload abort %s %s %s', (method, url, failure) => {
+    const { ledger, handlers } = ledgerHarness();
+    ledger.registerThread('owned-thread');
+    ledger.setPhase('turn');
+    const request = requestForFailure(method, url, failure);
+    handlers.get('request')?.(request);
+    ledger.setPhase('reload');
+    handlers.get('requestfailed')?.(request);
+
+    expect(ledger.problems()).toHaveLength(1);
+  });
+
+  it('rejects an owned thread-detail abort that started after reload began', () => {
+    const { ledger, handlers } = ledgerHarness();
+    ledger.registerThread('owned-thread');
+    ledger.setPhase('reload');
+    const request = requestForFailure(
+      'GET', 'http://srw-e2e.test/api/persistent/threads/owned-thread', 'net::ERR_ABORTED',
+    );
+    handlers.get('request')?.(request);
+    handlers.get('requestfailed')?.(request);
+
+    expect(ledger.problems()).toHaveLength(1);
+  });
+
+  it('rejects a thread-detail abort for an id that was never registered as owned', () => {
+    const { ledger, handlers } = ledgerHarness();
+    ledger.setPhase('turn');
+    const request = requestForFailure(
+      'GET', 'http://srw-e2e.test/api/persistent/threads/unregistered', 'net::ERR_ABORTED',
+    );
+    handlers.get('request')?.(request);
+    ledger.setPhase('reload');
+    handlers.get('requestfailed')?.(request);
+
+    expect(ledger.problems()).toHaveLength(1);
+  });
+
+  it('rejects a thread-detail abort that began before the owned turn', () => {
+    const { ledger, handlers } = ledgerHarness();
+    ledger.registerThread('owned-thread');
+    ledger.setPhase('creating');
+    const request = requestForFailure(
+      'GET', 'http://srw-e2e.test/api/persistent/threads/owned-thread', 'net::ERR_ABORTED',
+    );
+    handlers.get('request')?.(request);
+    ledger.setPhase('reload');
+    handlers.get('requestfailed')?.(request);
+
+    expect(ledger.problems()).toHaveLength(1);
+  });
+
+  it('rejects an owned thread-detail abort without a recorded start or reload window', () => {
+    const { ledger, handlers } = ledgerHarness();
+    ledger.registerThread('owned-thread');
+    ledger.setPhase('reload');
+    emitRequestFailed(
+      handlers,
+      'GET',
+      'http://srw-e2e.test/api/persistent/threads/owned-thread',
+    );
+    expect(ledger.problems()).toHaveLength(1);
+
+    ledger.setPhase('turn');
+    const request = requestForFailure(
+      'GET', 'http://srw-e2e.test/api/persistent/threads/owned-thread', 'net::ERR_ABORTED',
+    );
+    handlers.get('request')?.(request);
+    handlers.get('requestfailed')?.(request);
+    expect(ledger.problems()).toHaveLength(2);
+  });
+
+  it('still rejects an owned connection poll that starts and aborts during reload', () => {
+    const { ledger, handlers } = ledgerHarness();
+    ledger.registerThread('owned-thread');
+    ledger.setPhase('reload');
+    const request = requestForFailure(
+      'GET', 'http://srw-e2e.test/api/sessions/owned-thread/connection', 'net::ERR_ABORTED',
+    );
+    handlers.get('request')?.(request);
+    handlers.get('requestfailed')?.(request);
+
+    expect(ledger.problems()).toEqual([
+      'unexpected network failure during reload: GET /api/sessions/owned-thread/connection (net::ERR_ABORTED)',
+    ]);
+  });
+
+  it('records a missing request start without treating it as navigation cancellation', () => {
+    const { ledger, handlers } = ledgerHarness();
+    ledger.registerThread('owned-thread');
+    ledger.setPhase('reload');
+    emitRequestFailed(
+      handlers,
+      'GET',
+      'http://srw-e2e.test/api/sessions/owned-thread/connection',
+    );
+
+    expect(ledger.entries()).toContainEqual(expect.objectContaining({
+      kind: 'requestfailed',
+      pathname: '/api/sessions/owned-thread/connection',
+      phase: 'reload',
+      started_phase: null,
+      classification: 'unexpected',
+    }));
+    expect(ledger.problems()).toHaveLength(1);
+  });
+
+  it.each([
+    ['GET', 'http://srw-e2e.test/api/sessions/foreign/connection', 'net::ERR_ABORTED'],
+    ['POST', 'http://srw-e2e.test/api/sessions/owned-thread/connection', 'net::ERR_ABORTED'],
+    ['GET', 'http://srw-e2e.test/api/sessions/owned-thread/connection', 'net::ERR_CONNECTION_RESET'],
+    ['GET', 'http://srw-e2e.test/api/sessions/owned-thread/connection', 'NS_BINDING_ABORTED'],
+    ['GET', 'http://srw-e2e.test/api/persistent/threads/owned-thread/input', 'net::ERR_ABORTED'],
+  ])('rejects non-navigation reload failure %s %s %s', (method, url, failure) => {
+    const { ledger, handlers } = ledgerHarness();
+    ledger.registerThread('owned-thread');
+    ledger.setPhase('turn');
+    const request = requestForFailure(method, url, failure);
+    handlers.get('request')?.(request);
+    ledger.setPhase('reload');
+    handlers.get('requestfailed')?.(request);
 
     expect(ledger.problems()).toHaveLength(1);
   });

@@ -1,5 +1,6 @@
 {{/* Render-time validation for the explicit VM topology. Included once by license-gate.yaml. */}}
 {{- define "srw.vmValidate" -}}
+{{- include "srw.vmResourceInventoryValidate" . -}}
 {{- $reasons := list -}}
 {{- $rawMode := .Values.vm.mode | default "off" -}}
 {{- $mode := include "srw.vmMode" . -}}

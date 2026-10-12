@@ -22,14 +22,15 @@ import asyncio
 import pytest
 
 import orchestrator.main
+from orchestrator.application import controls as controls_composition
 
 
 @pytest.fixture(autouse=True)
 def _clear_registry():
     """The registry is module-level; don't leak tasks between tests."""
-    orchestrator.main._late_cloud_setup_tasks.clear()
+    orchestrator.main.app.state.resources.late_cloud_setup_tasks.clear()
     yield
-    orchestrator.main._late_cloud_setup_tasks.clear()
+    orchestrator.main.app.state.resources.late_cloud_setup_tasks.clear()
 
 
 class TestAwaitLateCloudSetup:
@@ -94,7 +95,7 @@ class TestAwaitLateCloudSetup:
         timeout we fall through to the pre-fix behaviour (attach, possibly
         degraded) rather than stranding the user on a spinner."""
         monkeypatch.setattr(
-            orchestrator.main, "LATE_CLOUD_SETUP_ATTACH_TIMEOUT_S", 0.05
+            controls_composition, "LATE_CLOUD_SETUP_ATTACH_TIMEOUT_S", 0.05
         )
 
         task = asyncio.create_task(asyncio.sleep(30))
@@ -113,7 +114,7 @@ class TestAwaitLateCloudSetup:
         A bare ``wait_for(task)`` would cancel it and keep the thread broken
         forever."""
         monkeypatch.setattr(
-            orchestrator.main, "LATE_CLOUD_SETUP_ATTACH_TIMEOUT_S", 0.02
+            controls_composition, "LATE_CLOUD_SETUP_ATTACH_TIMEOUT_S", 0.02
         )
         persisted: dict[str, str] = {}
 
@@ -142,11 +143,11 @@ class TestRegistrySlotDiscipline:
 
         task = asyncio.create_task(_provision())
         control_seams.register_late_cloud_setup("t1", task)
-        assert "t1" in orchestrator.main._late_cloud_setup_tasks
+        assert "t1" in orchestrator.main.app.state.resources.late_cloud_setup_tasks
 
         await task
         await asyncio.sleep(0)  # let the done-callback run
-        assert "t1" not in orchestrator.main._late_cloud_setup_tasks
+        assert "t1" not in orchestrator.main.app.state.resources.late_cloud_setup_tasks
 
     @pytest.mark.asyncio
     async def test_stale_callback_does_not_clobber_a_newer_registration(self):
@@ -171,5 +172,8 @@ class TestRegistrySlotDiscipline:
         await first
         await asyncio.sleep(0)  # first's done-callback fires here
 
-        assert orchestrator.main._late_cloud_setup_tasks.get("t1") is second
+        assert (
+            orchestrator.main.app.state.resources.late_cloud_setup_tasks.get("t1")
+            is second
+        )
         await second

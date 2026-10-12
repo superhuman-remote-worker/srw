@@ -22,9 +22,13 @@ import {
   WorkspaceContractProjection,
 } from '../../core/models/api.model';
 import {JobSummary} from '../../core/models/audit.model';
+import {VMCreationWaitComponent} from '../../core/components/vm-creation-wait.component';
 import {AppBadgeComponent, BadgeTone} from '../../ui/badge';
 import {AppSpinnerComponent} from '../../ui/spinner';
 import {isTerminalJobStatus, jobStatusTone} from '../../core/util/job-status';
+import {workspaceLifecycleReasonKey} from '../../core/util/vm-lifecycle';
+import {subagentStatusTone} from '../../core/util/subagent-status';
+import {workspaceCreationMessageKey} from '../../core/util/workspace-creation';
 
 /** Own spend, or the whole subtree beneath the job. */
 export type UsageScope = 'job' | 'subtree';
@@ -193,18 +197,8 @@ export function subagentElapsedSeconds(sub: JobSubagent, now: number): number | 
   return Math.floor((ended - started) / 1000);
 }
 
-export function subagentStatusTone(status: JobSubagentStatus): BadgeTone {
-  switch (status) {
-    case 'completed': return 'success';
-    case 'running': return 'accent';
-    case 'queued': return 'info';
-    case 'error':
-    case 'cancelled': return 'danger';
-    case 'parked':
-    case 'interrupted':
-    case 'capped': return 'warning';
-  }
-}
+/** Moved to `core/util/subagent-status.ts`; re-exported for existing callers. */
+export {subagentStatusTone};
 
 /** Subjobs still capable of moving on their own. */
 export function liveSubjobCount(subjobs: readonly JobSubjob[]): number {
@@ -236,11 +230,37 @@ export function subjobBlockedKey(
     : 'jobs.detail.waitingNoLiveSubjobs';
 }
 
+/**
+ * Why a job sits in review instead of having sealed, when the server said so.
+ * A seal held because its delivery could not be proven records the reason as
+ * the row's `error_message`; a full-autonomy job there otherwise looks like
+ * any other review item. VM-creation messages already render above.
+ */
+export function heldForReviewReason(
+  job: Pick<JobSummary, 'status' | 'error_message' | 'vm_creation'> | null,
+): string | null {
+  if (!job || job.status !== 'pending_review' || job.vm_creation) return null;
+  const reason = (job.error_message ?? '').trim();
+  return reason || null;
+}
+
+/**
+ * Why a Job failed, when the server said so (e.g. its workspace image could
+ * not be pulled). VM-creation messages already render above.
+ */
+export function failureReason(
+  job: Pick<JobSummary, 'status' | 'error_message' | 'vm_creation'> | null,
+): string | null {
+  if (!job || job.status !== 'failed' || job.vm_creation) return null;
+  const reason = (job.error_message ?? '').trim();
+  return reason || null;
+}
+
 @Component({
   selector: 'app-job-detail-panel',
   standalone: true,
   changeDetection: ChangeDetectionStrategy.OnPush,
-  imports: [RouterLink, DatePipe, TranslocoModule, AppBadgeComponent, AppSpinnerComponent],
+  imports: [RouterLink, DatePipe, TranslocoModule, AppBadgeComponent, AppSpinnerComponent, VMCreationWaitComponent],
   template: `
     <div class="detail-panel">
       @if (job().description) {
@@ -318,6 +338,45 @@ export function subjobBlockedKey(
           @if (recovery.cleanup_pending) {
             <span>{{ 'jobs.recovery.cleanupPending' | transloco }}</span>
           }
+        </section>
+      } @else if (job().vm_creation; as creation) {
+        <section class="recovery-detail vm-creation" [class.attention]="creation.state === 'attention'">
+          @if (creation.wait) {
+            <app-vm-creation-wait [creation]="creation" />
+          } @else {
+            <strong>{{ job().error_message || creation.message }}</strong>
+          }
+        </section>
+      }
+      @if (job().workspace_lifecycle; as lifecycle) {
+        <section class="recovery-detail" role="status">
+          <strong>{{ ('jobs.lifecycle.state.' + lifecycle.state) | transloco }}</strong>
+          @if (lifecycle.idle_expires_at) {
+            <span>{{ 'jobs.lifecycle.idleAt' | transloco }}: {{ lifecycle.idle_expires_at | date:'mediumTime' }}</span>
+          }
+          @if (lifecycle.reason_code) {
+            <span>{{ lifecycleReasonKey(lifecycle.reason_code) | transloco }}</span>
+          }
+          @if (lifecycle.next_retry_at) {
+            <span>{{ 'jobs.lifecycle.nextRetry' | transloco }}: {{ lifecycle.next_retry_at | date:'mediumTime' }}</span>
+          }
+        </section>
+      }
+      @if (workspaceCreation(); as creation) {
+        <section class="recovery-detail" [class.attention]="creation.state === 'attention'" role="status">
+          <strong>{{ workspaceCreationMessageKey(creation) | transloco }}</strong>
+        </section>
+      }
+      @if (!workspaceCreation() && failureReason(job()); as failed) {
+        <section class="recovery-detail attention held-detail">
+          <strong>{{ 'jobs.failureReason' | transloco }}</strong>
+          <span>{{ failed }}</span>
+        </section>
+      }
+      @if (heldForReviewReason(job()); as held) {
+        <section class="recovery-detail attention held-detail">
+          <strong>{{ 'jobs.detail.heldForReview' | transloco }}</strong>
+          <span>{{ held }}</span>
         </section>
       }
 
@@ -636,6 +695,11 @@ export function subjobBlockedKey(
       .recovery-detail.attention {
         border-color: var(--warning);
       }
+      .held-detail span {
+        white-space: pre-wrap;
+        overflow-wrap: anywhere;
+        min-width: 0;
+      }
       .usage-block {
         display: flex;
         flex-direction: column;
@@ -867,9 +931,18 @@ export function subjobBlockedKey(
   ],
 })
 export class JobDetailPanelComponent {
+  readonly lifecycleReasonKey = workspaceLifecycleReasonKey;
+  readonly workspaceCreationMessageKey = workspaceCreationMessageKey;
   readonly job = input.required<JobSummary>();
   /** Null until the lazy load for this job has been kicked off. */
   readonly data = input<JobDetailState | null>(null);
+  /** A returned detail object supersedes the list snapshot, including a null projection. */
+  readonly workspaceCreation = computed(() => {
+    const data = this.data();
+    return data === null || data.loading || !data.detail
+      ? this.job().workspace_creation
+      : data.detail?.workspace_creation;
+  });
   /**
    * Children the SERVER returned for this root — i.e. the ones matching the
    * current filter, not every child that exists. The copy says so; a bare count
@@ -928,6 +1001,8 @@ export class JobDetailPanelComponent {
   }
 
   protected readonly formatCount = formatCount;
+  protected readonly heldForReviewReason = heldForReviewReason;
+  protected readonly failureReason = failureReason;
   protected readonly formatUsd = formatUsd;
   protected readonly shortId = shortJobId;
   protected readonly isTerminal = isTerminalJobStatus;

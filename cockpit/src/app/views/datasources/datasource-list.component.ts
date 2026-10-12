@@ -1,5 +1,4 @@
-import {SidebarToggleComponent} from '../../shell/sidebar-toggle/sidebar-toggle.component';
-import {Component, computed, DestroyRef, inject, OnInit, signal} from '@angular/core';
+import {Component, computed, DestroyRef, inject, isDevMode, OnInit, signal} from '@angular/core';
 import {takeUntilDestroyed} from '@angular/core/rxjs-interop';
 import {forkJoin, timer} from 'rxjs';
 import {TranslocoPipe, TranslocoService} from '@jsverse/transloco';
@@ -11,6 +10,7 @@ import {
     DatasourceConfig,
     DatasourceCreateRequest,
     DatasourceIndexStatus,
+    DatasourceTestEdits,
     DatasourceTestResult,
     DatasourceType,
     DatasourceUpdateRequest,
@@ -35,9 +35,32 @@ import {CapabilitiesService} from '../../core/services/capabilities.service';
 import {AppMenuComponent, AppMenuItemComponent, AppMenuTriggerDirective} from '../../ui/menu';
 import {ViewportService} from '../../core/services/viewport.service';
 import {UserService} from '../../core/services/user.service';
-import {ActivatedRoute} from '@angular/router';
+import {ActivatedRoute, RouterLink} from '@angular/router';
+import {ConnectorDriversService} from '../../core/services/connector-drivers.service';
+import {
+  ConnectorDriver,
+  managedConnectorDrivers,
+  OfferedAccess,
+  offeredAccess,
+  publicReadWrite,
+} from '../../core/models/connector-driver.model';
+import {
+  isPlatformOwned,
+  PROJECT_KB,
+  platformManagedLabelKey,
+  platformOwnedKind,
+} from '../../core/models/platform-connector';
+import {GenericConnectorFormComponent} from './connector-forms/generic-connector-form.component';
+import {CloudRootCardComponent} from './cloud-root-card.component';
+import {bespokeFormFor} from './connector-forms/connector-form-registry';
+import {
+  ConnectorFormError,
+  ExistingConnector,
+  GenericFormValue,
+  connectorFormError,
+} from './connector-forms/schema-form';
 
-type McpTransport = 'http' | 'sse' | 'stdio';
+type McpTransport = 'http' | 'sse';
 type KeyValueRow = {key: string; value: string};
 
 /**
@@ -47,7 +70,7 @@ type KeyValueRow = {key: string; value: string};
   selector: 'app-datasource-list',
   standalone: true,
   imports: [
-    SidebarToggleComponent, TranslocoPipe,
+    TranslocoPipe,
     AppButtonComponent,
     AppIconButtonComponent,
     AppBadgeComponent,
@@ -63,12 +86,14 @@ type KeyValueRow = {key: string; value: string};
     AppMenuComponent,
     AppMenuItemComponent,
     AppMenuTriggerDirective,
+    GenericConnectorFormComponent,
+    RouterLink,
+    CloudRootCardComponent,
   ],
   template: `
     <div class="ds-container" [class.form-open]="showForm()">
       <!-- Header -->
       <div class="header-bar">
-        <app-sidebar-toggle />
         <span class="title">{{ 'datasources.title' | transloco }}</span>
         <div class="filter-chips">
           @for (filter of typeFilters; track filter.value) {
@@ -99,8 +124,20 @@ type KeyValueRow = {key: string; value: string};
           >
             <app-icon size="sm">refresh</app-icon>
           </app-icon-button>
+          <a
+            class="drivers-link"
+            routerLink="/settings/connector-drivers"
+            [title]="'datasources.driversLinkHint' | transloco"
+          >
+            <app-icon size="sm">fact_check</app-icon>
+            <span class="drivers-link-text">{{ 'datasources.driversLink' | transloco }}</span>
+          </a>
         </div>
       </div>
+
+      <!-- The user's own cloud root, a connector SRW keeps for them: its
+           connection is theirs to make, here (main cloud slice 4). -->
+      <app-cloud-root-card />
 
       @if (capabilities.datasourceScopeAutoAttachAvailable()) {
         <div class="catalog-filter-bar">
@@ -234,11 +271,36 @@ type KeyValueRow = {key: string; value: string};
                   </optgroup>
                   <optgroup [label]="'datasources.form.typeGroupMcp' | transloco">
                     <option value="mcp">{{ 'datasources.form.optMcp' | transloco }}</option>
+                    <!-- The managed MCP servers this deployment installs (the
+                         matrix's managed tier): each takes the generic form. -->
+                    @for (driver of managedDrivers(); track driver.name) {
+                      <option [value]="driver.legacy_type">{{ 'datasources.filter.' + driver.legacy_type | transloco }}</option>
+                    }
                   </optgroup>
                 </app-select>
               </app-form-field>
             </div>
 
+            <!-- Development only: render this built-in through the generic
+                 form instead of its bespoke section (connector-form-registry). -->
+            @if (devMode && formDriver() && hasBespokeForm()) {
+              <label class="generic-preview-toggle">
+                <input
+                  type="checkbox"
+                  [checked]="genericFormPreview()"
+                  (change)="setGenericFormPreview($any($event.target).checked)"
+                  [disabled]="isSaving()"
+                >
+                <span>
+                  {{ 'datasources.generic.previewToggle' | transloco }}
+                  <small>{{ 'datasources.generic.previewHint' | transloco }}</small>
+                </span>
+              </label>
+            }
+
+            <!-- Bespoke sections (by driver name, connector-form-registry.ts)
+                 until the description; the generic form replaces them all. -->
+            @if (!useGenericForm()) {
             @if (formData.type === 'mcp') {
               <app-form-field
                 [label]="'datasources.form.mcpTransportLabel' | transloco"
@@ -252,7 +314,6 @@ type KeyValueRow = {key: string; value: string};
                 >
                   <option value="http">{{ 'datasources.form.mcpTransportHttp' | transloco }}</option>
                   <option value="sse">{{ 'datasources.form.mcpTransportSse' | transloco }}</option>
-                  <option value="stdio">{{ 'datasources.form.mcpTransportStdio' | transloco }}</option>
                 </app-select>
               </app-form-field>
             }
@@ -287,6 +348,7 @@ type KeyValueRow = {key: string; value: string};
                 />
               </app-form-field>
             }
+            }
 
             <app-form-field
               [label]="'datasources.form.descriptionLabel' | transloco"
@@ -302,7 +364,17 @@ type KeyValueRow = {key: string; value: string};
               />
             </app-form-field>
 
-            @if (formData.type === 'mcp' && formData.mcpTransport !== 'stdio') {
+            @if (useGenericForm()) {
+              <app-generic-connector-form
+                [driver]="formDriver()!"
+                [editing]="!!editingId()"
+                [disabled]="isSaving()"
+                [existing]="genericFormExisting"
+                [error]="genericFormError()"
+                (valueChange)="genericFormValue.set($event)"
+              />
+            } @else {
+            @if (formData.type === 'mcp') {
               <app-form-field
                 [label]="'datasources.form.mcpTokenLabel' | transloco"
                 [optional]="'datasources.form.optional' | transloco"
@@ -371,93 +443,6 @@ type KeyValueRow = {key: string; value: string};
                   {{ 'datasources.form.mcpCredentialsRetainHint' | transloco }}
                 </div>
               }
-            }
-
-            @if (formData.type === 'mcp' && formData.mcpTransport === 'stdio') {
-              <app-form-field
-                [label]="'datasources.form.mcpCommandLabel' | transloco"
-                [required]="true"
-              >
-                <app-input
-                  size="sm"
-                  class="mono"
-                  [value]="formData.mcpCommand"
-                  (valueChange)="formData.mcpCommand = $event"
-                  [placeholder]="'datasources.form.mcpCommandPlaceholder' | transloco"
-                  [disabled]="isSaving()"
-                />
-              </app-form-field>
-              <app-form-field
-                [label]="'datasources.form.mcpArgsLabel' | transloco"
-                [optional]="'datasources.form.optional' | transloco"
-              >
-                <app-textarea
-                  size="sm"
-                  class="mono"
-                  [value]="formData.mcpArgs"
-                  (valueChange)="formData.mcpArgs = $event"
-                  [placeholder]="'datasources.form.mcpArgsPlaceholder' | transloco"
-                  [rows]="3"
-                  [disabled]="isSaving()"
-                />
-              </app-form-field>
-              <app-form-field
-                [label]="'datasources.form.mcpEnvLabel' | transloco"
-                [optional]="'datasources.form.optional' | transloco"
-              >
-                <div class="env-vars-editor">
-                  @for (envVar of formData.mcpEnv; track $index) {
-                    <div class="env-var-row">
-                      <app-input
-                        size="sm"
-                        class="mono env-key"
-                        [value]="envVar.key"
-                        (valueChange)="envVar.key = $event"
-                        [placeholder]="'datasources.form.envKeyPlaceholder' | transloco"
-                        [disabled]="isSaving()"
-                      />
-                      <span class="env-eq">=</span>
-                      <app-input
-                        size="sm"
-                        type="password"
-                        class="mono env-val"
-                        [value]="envVar.value"
-                        (valueChange)="envVar.value = $event"
-                        [placeholder]="'datasources.form.envValuePlaceholder' | transloco"
-                        [disabled]="isSaving()"
-                      />
-                      <app-icon-button
-                        variant="danger"
-                        size="sm"
-                        [ariaLabel]="'datasources.form.envRemoveTooltip' | transloco"
-                        [tooltip]="'datasources.form.envRemoveTooltip' | transloco"
-                        [disabled]="isSaving()"
-                        (clicked)="removeMcpEnv($index)"
-                      >
-                        <app-icon size="sm">close</app-icon>
-                      </app-icon-button>
-                    </div>
-                  }
-                  <app-button
-                    variant="ghost"
-                    size="sm"
-                    class="btn-add-env"
-                    [disabled]="isSaving()"
-                    (clicked)="addMcpEnv()"
-                  >
-                    <app-icon size="sm">add</app-icon>
-                    {{ 'datasources.form.envAdd' | transloco }}
-                  </app-button>
-                </div>
-              </app-form-field>
-              @if (editingId()) {
-                <div class="credential-retain-hint">
-                  {{ 'datasources.form.mcpCredentialsRetainHint' | transloco }}
-                </div>
-              }
-              <div class="form-hint">
-                {{ 'datasources.form.mcpStdioWarning' | transloco }}
-              </div>
             }
 
             <!-- Generic: CLI hint -->
@@ -610,6 +595,20 @@ type KeyValueRow = {key: string; value: string};
                     <div>{{ 'datasources.form.forgeTokenHintGitea' | transloco }}</div>
                   </div>
                 }
+                @if (formData.type === 'repository') {
+                  <app-form-field [label]="'datasources.form.upstreamCaLabel' | transloco">
+                    <app-textarea
+                      size="sm"
+                      class="mono"
+                      [value]="repoUpstreamCa"
+                      (valueChange)="repoUpstreamCa = $event"
+                      placeholder="-----BEGIN CERTIFICATE-----"
+                      [rows]="2"
+                      [disabled]="isSaving()"
+                    />
+                  </app-form-field>
+                  <div class="form-hint">{{ 'datasources.form.upstreamCaHint' | transloco }}</div>
+                }
               }
               @if (gitAuthMethod === 'ssh') {
                 <app-form-field [label]="'datasources.form.sshKeyLabel' | transloco">
@@ -661,6 +660,20 @@ type KeyValueRow = {key: string; value: string};
                     </app-button>
                   }
                 </div>
+                @if (formData.type === 'repository') {
+                  <app-form-field [label]="'datasources.form.sshKnownHostsLabel' | transloco">
+                    <app-textarea
+                      size="sm"
+                      class="mono"
+                      [value]="sshKnownHosts"
+                      (valueChange)="sshKnownHosts = $event"
+                      placeholder="ssh-ed25519 AAAA..."
+                      [rows]="2"
+                      [disabled]="isSaving()"
+                    />
+                  </app-form-field>
+                  <div class="form-hint">{{ 'datasources.form.sshKnownHostsHint' | transloco }}</div>
+                }
               }
               @if (editingId()) {
                 <div class="credential-retain-hint">
@@ -1002,11 +1015,54 @@ type KeyValueRow = {key: string; value: string};
                 }
               </div>
               <div class="form-hint">{{ 'datasources.form.sshKeyHint' | transloco }}</div>
+              <div class="form-row">
+                <app-form-field class="flex-1" [label]="'datasources.form.sshHostLabel' | transloco">
+                  <app-input
+                    size="sm"
+                    [value]="sshHost"
+                    (valueChange)="onSshEndpointChange('host', $event)"
+                    placeholder="bastion.example.com"
+                    [disabled]="isSaving()"
+                  />
+                </app-form-field>
+                <app-form-field class="flex-1" [label]="'datasources.form.sshUserLabel' | transloco">
+                  <app-input
+                    size="sm"
+                    [value]="sshUser"
+                    (valueChange)="sshUser = $event"
+                    placeholder="deploy"
+                    [disabled]="isSaving() || !sshHost.trim()"
+                  />
+                </app-form-field>
+                <app-form-field [label]="'datasources.form.sshPortLabel' | transloco">
+                  <app-input
+                    size="sm"
+                    [value]="sshPort"
+                    (valueChange)="onSshEndpointChange('port', $event)"
+                    placeholder="22"
+                    [disabled]="isSaving() || !sshHost.trim()"
+                  />
+                </app-form-field>
+              </div>
+              @if (sshHost.trim()) {
+                <app-form-field [label]="'datasources.form.sshKnownHostsLabel' | transloco">
+                  <app-textarea
+                    size="sm"
+                    class="mono"
+                    [value]="sshKnownHosts"
+                    (valueChange)="sshKnownHosts = $event"
+                    placeholder="ssh-ed25519 AAAA..."
+                    [rows]="2"
+                    [disabled]="isSaving()"
+                  />
+                </app-form-field>
+              }
+              <div class="form-hint">{{ 'datasources.form.sshHostHint' | transloco }}</div>
               <div class="trust-notice">
                 <app-icon size="sm">shield</app-icon>
                 <div>
-                  <strong>{{ 'datasources.form.trustNoticeTitle' | transloco }}.</strong>
-                  {{ 'datasources.form.trustNotice' | transloco }}
+                  <strong>{{ 'datasources.form.sshAgentNoticeTitle' | transloco }}.</strong>
+                  {{ 'datasources.form.sshAgentNotice' | transloco }}
                 </div>
               </div>
             }
@@ -1108,6 +1164,7 @@ type KeyValueRow = {key: string; value: string};
                   {{ 'datasources.form.trustNotice' | transloco }}
                 </div>
               </div>
+            }
             }
 
             <!-- Policy controls are rollout-gated. Older orchestrators keep
@@ -1251,12 +1308,8 @@ type KeyValueRow = {key: string; value: string};
             @if (capabilities.canPublishDatasources() && formData.type !== 'email' && formData.type !== 'credentials') {
               <div class="form-row">
                 <app-form-field
+                  class="flex-1"
                   [label]="'datasources.form.visibilityLabel' | transloco"
-                  [hint]="formData.is_global
-                    ? ((formData.type === 'kb'
-                        ? 'datasources.form.visibilityKbHint'
-                        : 'datasources.form.visibilityCredentialHint') | transloco)
-                    : ''"
                 >
                   <div class="visibility-controls">
                     <label class="visibility-toggle">
@@ -1268,23 +1321,43 @@ type KeyValueRow = {key: string; value: string};
                       >
                       {{ 'datasources.form.visibilityPublic' | transloco }}
                     </label>
-                    @if (formData.is_global) {
-                      <div class="access-radio">
-                        <label>
-                          <input type="radio" name="ds-access"
-                            [checked]="formData.read_only"
-                            (change)="formData.read_only = true"
-                            [disabled]="isSaving()">
-                          {{ 'datasources.form.accessReadOnly' | transloco }}
-                        </label>
-                        <label>
-                          <input type="radio" name="ds-access"
-                            [checked]="!formData.read_only"
-                            (change)="formData.read_only = false"
-                            [disabled]="isSaving() || formData.type === 'kb'">
-                          {{ 'datasources.form.accessReadWrite' | transloco }}
-                        </label>
-                      </div>
+                  </div>
+                </app-form-field>
+              </div>
+            }
+
+            <!-- The creator's read-only tag (connector drivers decisions 31
+                 and 32), for every connector and not only a public one: it
+                 decides the tools of everyone who uses the connector, so its
+                 hint says that, and never that writes are impossible. Only
+                 the levels the driver offers (its spec's access levels and
+                 forced_read_only). Email's own tier choice stands in for it. -->
+            @if (showsAccessChoice()) {
+              <div class="form-row">
+                <!-- Full width: the hint below the choice is a sentence. -->
+                <app-form-field
+                  class="flex-1"
+                  [label]="'datasources.form.accessLabel' | transloco"
+                  [hint]="accessHintKey() | transloco"
+                >
+                  <div class="access-radio">
+                    @if (offersReadOnly()) {
+                      <label data-access="read_only">
+                        <input type="radio" name="ds-access"
+                          [checked]="formReadOnly()"
+                          (change)="formData.read_only = true"
+                          [disabled]="isSaving() || !offersReadWrite()">
+                        {{ 'datasources.form.accessReadOnly' | transloco }}
+                      </label>
+                    }
+                    @if (offersReadWrite()) {
+                      <label data-access="read_write">
+                        <input type="radio" name="ds-access"
+                          [checked]="!formReadOnly()"
+                          (change)="formData.read_only = false"
+                          [disabled]="isSaving() || !offersReadOnly()">
+                        {{ 'datasources.form.accessReadWrite' | transloco }}
+                      </label>
                     }
                   </div>
                 </app-form-field>
@@ -1294,7 +1367,7 @@ type KeyValueRow = {key: string; value: string};
 
           <div class="form-footer-bar">
             <div class="form-actions">
-              @if (!isEnvType() && formData.type !== 'repository' && !isCredentialFileType()) {
+              @if (formTestAvailable()) {
                 <app-button
                   variant="secondary"
                   size="sm"
@@ -1337,10 +1410,18 @@ type KeyValueRow = {key: string; value: string};
                 class="test-result"
                 [class.test-ok]="formTestResult()!.status === 'ok'"
                 [class.test-error]="formTestResult()!.status === 'error'"
+                [class.test-unsupported]="formTestResult()!.status === 'unsupported'"
               >
-                <app-icon size="sm">{{ formTestResult()!.status === 'ok' ? 'check_circle' : 'error' }}</app-icon>
+                <app-icon size="sm">{{ testResultIcon(formTestResult()!) }}</app-icon>
                 {{ formTestResult()!.message }}
               </div>
+              @if (testedHostKeyToPin(); as hostKey) {
+                <div class="ssh-key-actions">
+                  <app-button size="sm" variant="secondary" type="button" [disabled]="isSaving()" (clicked)="pinTestedHostKey(hostKey)">
+                    <app-icon size="sm">push_pin</app-icon> {{ 'datasources.form.sshPinHostKey' | transloco }}
+                  </app-button>
+                </div>
+              }
             }
           </div>
         </div>
@@ -1394,6 +1475,12 @@ type KeyValueRow = {key: string; value: string};
                       @if (ds.description) {
                         <span class="ds-desc">{{ ds.description }}</span>
                       }
+                      @if (ds.driver_env_names?.length) {
+                        <span class="ds-desc" data-driver-env>
+                          {{ 'datasources.driverEnvNames' | transloco }}
+                          <code>{{ ds.driver_env_names!.join(', ') }}</code>
+                        </span>
+                      }
                       @if (ds.type === 'kb' && indexStatuses()[ds.id]; as indexStatus) {
                         <div class="index-status-row">
                           <app-badge [tone]="indexStatusTone(indexStatus.status)" size="xs">
@@ -1445,9 +1532,13 @@ type KeyValueRow = {key: string; value: string};
                         <app-badge class="ds-scope-inline" [tone]="scopeTone(ds)" size="xs">
                           {{ scopeLabelKey(ds) | transloco }}
                         </app-badge>
-                        @if (ds.is_global && ds.read_only === false) {
+                        @if (ds.is_global && isPublicReadWrite(ds)) {
                           <app-badge class="ds-scope-inline" tone="warning" size="xs">
                             {{ 'datasources.table.badgeRw' | transloco }}
+                          </app-badge>
+                        } @else if (isPrivateReadOnly(ds)) {
+                          <app-badge class="ds-scope-inline" tone="info" size="xs" data-creator-read-only>
+                            {{ 'datasources.table.badgeRo' | transloco }}
                           </app-badge>
                         }
                         @if (capabilities.datasourceScopeAutoAttachAvailable()) {
@@ -1467,9 +1558,13 @@ type KeyValueRow = {key: string; value: string};
                       <app-badge [tone]="scopeTone(ds)" size="xs">
                         {{ scopeLabelKey(ds) | transloco }}
                       </app-badge>
-                      @if (ds.is_global && ds.read_only === false) {
+                      @if (ds.is_global && isPublicReadWrite(ds)) {
                         <app-badge tone="warning" size="xs">
                           {{ 'datasources.table.badgeRw' | transloco }}
+                        </app-badge>
+                      } @else if (isPrivateReadOnly(ds)) {
+                        <app-badge tone="info" size="xs" data-creator-read-only>
+                          {{ 'datasources.table.badgeRo' | transloco }}
                         </app-badge>
                       }
                     </td>
@@ -1514,12 +1609,16 @@ type KeyValueRow = {key: string; value: string};
                               {{ 'datasources.table.fullReindexTooltip' | transloco }}
                             </app-menu-item>
                           }
-                          <app-menu-item (activated)="openEditForm(ds)">
-                            {{ 'datasources.table.editTooltip' | transloco }}
-                          </app-menu-item>
-                          <app-menu-item tone="danger" (activated)="deleteDatasource(ds)">
-                            {{ 'datasources.table.deleteTooltip' | transloco }}
-                          </app-menu-item>
+                          @if (canEditRow(ds)) {
+                            <app-menu-item (activated)="openEditForm(ds)">
+                              {{ 'datasources.table.editTooltip' | transloco }}
+                            </app-menu-item>
+                          }
+                          @if (canDeleteRow(ds)) {
+                            <app-menu-item tone="danger" (activated)="deleteDatasource(ds)">
+                              {{ 'datasources.table.deleteTooltip' | transloco }}
+                            </app-menu-item>
+                          }
                         </app-menu>
                       } @else if (canManage(ds)) {
                         <app-icon-button
@@ -1554,24 +1653,37 @@ type KeyValueRow = {key: string; value: string};
                             <app-icon size="sm">restart_alt</app-icon>
                           </app-icon-button>
                         }
-                        <app-icon-button
-                          variant="ghost"
-                          size="sm"
-                          [ariaLabel]="'datasources.table.editTooltip' | transloco"
-                          [tooltip]="'datasources.table.editTooltip' | transloco"
-                          (clicked)="openEditForm(ds)"
-                        >
-                          <app-icon size="sm">edit</app-icon>
-                        </app-icon-button>
-                        <app-icon-button
-                          variant="danger"
-                          size="sm"
-                          [ariaLabel]="'datasources.table.deleteTooltip' | transloco"
-                          [tooltip]="'datasources.table.deleteTooltip' | transloco"
-                          (clicked)="deleteDatasource(ds)"
-                        >
-                          <app-icon size="sm">delete</app-icon>
-                        </app-icon-button>
+                        @if (canEditRow(ds)) {
+                          <app-icon-button
+                            variant="ghost"
+                            size="sm"
+                            [ariaLabel]="'datasources.table.editTooltip' | transloco"
+                            [tooltip]="'datasources.table.editTooltip' | transloco"
+                            (clicked)="openEditForm(ds)"
+                          >
+                            <app-icon size="sm">edit</app-icon>
+                          </app-icon-button>
+                        }
+                        @if (canDeleteRow(ds)) {
+                          <app-icon-button
+                            variant="danger"
+                            size="sm"
+                            [ariaLabel]="'datasources.table.deleteTooltip' | transloco"
+                            [tooltip]="'datasources.table.deleteTooltip' | transloco"
+                            (clicked)="deleteDatasource(ds)"
+                          >
+                            <app-icon size="sm">delete</app-icon>
+                          </app-icon-button>
+                        }
+                      }
+                      <!-- SRW provisions and manages a platform-owned row
+                           (a project's knowledge base or cloud folder, a
+                           user's own): nobody deletes or re-points it here. -->
+                      @if (managedLabelKey(ds); as managedKey) {
+                        <span class="managed-note" data-managed>
+                          <app-icon size="xs">lock</app-icon>
+                          {{ managedKey | transloco }}
+                        </span>
                       }
 
                       @if (canManage(ds) && testResults()[ds.id]; as result) {
@@ -1579,9 +1691,10 @@ type KeyValueRow = {key: string; value: string};
                           class="inline-test"
                           [class.test-ok]="result.status === 'ok'"
                           [class.test-error]="result.status === 'error'"
+                          [class.test-unsupported]="result.status === 'unsupported'"
                           title="{{ result.message }}"
                         >
-                          <app-icon size="sm">{{ result.status === 'ok' ? 'check_circle' : 'error' }}</app-icon>
+                          <app-icon size="sm">{{ testResultIcon(result) }}</app-icon>
                         </span>
                       }
                     </td>
@@ -1728,6 +1841,27 @@ type KeyValueRow = {key: string; value: string};
         gap: 6px;
         margin-left: auto;
         align-items: center;
+      }
+
+      .drivers-link {
+        display: inline-flex;
+        align-items: center;
+        gap: 4px;
+        font-size: 12px;
+        color: var(--text-secondary);
+        text-decoration: none;
+        white-space: nowrap;
+      }
+
+      .drivers-link:hover {
+        color: var(--text-primary);
+      }
+
+      /* One responsive layout: the icon alone on a phone header. */
+      @media (max-width: 640px) {
+        .drivers-link-text {
+          display: none;
+        }
       }
 
       .catalog-filter-bar {
@@ -1983,6 +2117,25 @@ type KeyValueRow = {key: string; value: string};
         gap: 20px;
       }
 
+      .generic-preview-toggle {
+        display: flex;
+        align-items: flex-start;
+        gap: 8px;
+        margin: 4px 0 8px;
+        font-size: 12px;
+        color: var(--text-secondary);
+        cursor: pointer;
+      }
+
+      .generic-preview-toggle span {
+        display: flex;
+        flex-direction: column;
+      }
+
+      .generic-preview-toggle small {
+        color: var(--text-muted);
+      }
+
       .availability-section {
         display: flex;
         flex-direction: column;
@@ -2190,6 +2343,11 @@ type KeyValueRow = {key: string; value: string};
         color: var(--danger);
       }
 
+      .test-unsupported {
+        background: var(--info-tint);
+        color: var(--text-secondary);
+      }
+
       /* Center States */
       .center-state {
         display: flex;
@@ -2350,8 +2508,19 @@ type KeyValueRow = {key: string; value: string};
         margin-left: 4px;
       }
 
+      .managed-note {
+        display: inline-flex;
+        align-items: center;
+        gap: 4px;
+        margin-left: 4px;
+        font-size: 12px;
+        color: var(--text-muted);
+        vertical-align: middle;
+      }
+
       .inline-test.test-ok { color: var(--success); }
       .inline-test.test-error { color: var(--danger); }
+      .inline-test.test-unsupported { color: var(--text-muted); }
 
       /* ===== Mobile (≤768px) =====
          This page never had a responsive pass. Mirror the Jobs header (a single
@@ -2483,8 +2652,130 @@ export class DatasourceListComponent implements OnInit {
   protected readonly viewport = inject(ViewportService);
   protected readonly capabilities = inject(CapabilitiesService);
   private readonly destroyRef = inject(DestroyRef);
+  private readonly connectorDrivers = inject(ConnectorDriversService);
   /** Poll cadence for a KB that is still indexing. */
   private readonly INDEX_POLL_MS = 5000;
+
+  // -- Driver specs (connector_drivers.md, D2) ------------------------------
+  // The capability matrix decides which access levels the form offers and
+  // whether the type has a bespoke section; until it loads, the form keeps
+  // its pre-matrix behaviour.
+
+  /** `ng serve` builds offer a built-in through the generic form. */
+  protected readonly devMode = isDevMode();
+  readonly genericFormPreview = signal(false);
+  /** The generic form's latest config, credentials and connection URL. */
+  readonly genericFormValue = signal<GenericFormValue | null>(null);
+  /** The API's refusal, shown inside the generic form at the field it names. */
+  readonly genericFormError = signal<ConnectorFormError | null>(null);
+  /** What the generic form prefills on an edit; set once per open. */
+  genericFormExisting: ExistingConnector | null = null;
+
+  /** The managed MCP servers the matrix installs, offered as types of their
+   *  own: none has a bespoke section, so the generic form renders its spec
+   *  (its config's `access` choice is the driver's own levels). */
+  readonly managedDrivers = computed(() => managedConnectorDrivers(this.connectorDrivers.drivers()));
+
+  /** The installed driver behind the form's type; null until the matrix loads. */
+  formDriver(): ConnectorDriver | null {
+    return this.connectorDrivers.forType(this.formData.type);
+  }
+
+  formAccess(): OfferedAccess | null {
+    return offeredAccess(this.formDriver());
+  }
+
+  offersReadOnly(): boolean {
+    const access = this.formAccess();
+    return access ? access.readOnly !== null : true;
+  }
+
+  offersReadWrite(): boolean {
+    const access = this.formAccess();
+    // Before the matrix loads: the one rule the form always had.
+    return access ? access.readWrite !== null : this.formData.type !== 'kb';
+  }
+
+  /** Whether the form shows the creator's read-only tag: for every type
+   *  whose driver offers a level, but email, whose tier choice is its own,
+   *  and a project's native KB, which its agents write with kb_write. */
+  showsAccessChoice(): boolean {
+    if (this.formData.type === 'email' || this.isNativeProjectConnector()) return false;
+    return this.offersReadOnly() || this.offersReadWrite();
+  }
+
+  /** The creator's read-only tag as the form shows it: the user's choice
+   *  when the driver offers both levels, else the only one it offers. Never
+   *  chosen, a public connector is read-only and a private one is not, as
+   *  the server reads it (decision 32). It decides the tools of everyone
+   *  who uses the connector, together with a project link's read-only. */
+  formReadOnly(): boolean {
+    if (!this.offersReadWrite()) return true;
+    if (!this.offersReadOnly()) return false;
+    return this.formData.read_only ?? this.formData.is_global;
+  }
+
+  /** The `read_only` a save sends: a public connector's always (the
+   *  publish confirmation weighs it), a private one's only once chosen, so
+   *  a connector never touched keeps the server's default. */
+  savedReadOnly(): boolean | undefined {
+    if (this.formData.is_global) return this.formReadOnly();
+    if (!this.showsAccessChoice() || this.formData.read_only === null) return undefined;
+    return this.formReadOnly();
+  }
+
+  /** The hint under the tag. It says what SRW does, that it applies to
+   *  everyone who uses the connector, and that the credential decides what
+   *  is really allowed; it never promises that writes are impossible. */
+  accessHintKey(): string {
+    if (!this.offersReadWrite()) return 'datasources.form.accessKbHint';
+    if (!this.offersReadOnly()) return 'datasources.form.accessReadWriteOnlyHint';
+    if (this.isGithubAppForm()) return 'datasources.form.accessGithubAppHint';
+    // No write tools to remove (env, file, key and kubeconfig delivery): the
+    // tag only tells the agent.
+    const writeTools = this.formAccess()?.readWrite?.tools;
+    return Array.isArray(writeTools) && writeTools.length === 0
+      ? 'datasources.form.accessAdvisoryHint'
+      : 'datasources.form.accessReadOnlyHint';
+  }
+
+  /** Whether the form edits a GitHub App repository connector that keeps
+   *  its App (C5, set up through the API): its read-only is enforced, by
+   *  the contents: read token SRW mints for each execution. */
+  isGithubAppForm(): boolean {
+    if (this.formData.type !== 'repository' || this.editingId() === null) return false;
+    return 'github_app' in this.unrenderedRepositoryConfig();
+  }
+
+  /** Whether a listed public connector reads as read-write. */
+  isPublicReadWrite(ds: Datasource): boolean {
+    return publicReadWrite(ds, this.connectorDrivers.forType(ds.type));
+  }
+
+  /** Whether a listed private connector carries its creator's read-only
+   *  tag, so its owner sees what every user's agents get. Not for a driver
+   *  with one read-write level, which binds every tool whatever the flag. */
+  isPrivateReadOnly(ds: Datasource): boolean {
+    return !ds.is_global && ds.read_only === true && !this.isPublicReadWrite(ds);
+  }
+
+  hasBespokeForm(): boolean {
+    return bespokeFormFor(this.formDriver()?.name) !== null;
+  }
+
+  /** The generic form replaces the bespoke sections for a driver without
+   *  one, or for any built-in under the development preview. */
+  useGenericForm(): boolean {
+    const driver = this.formDriver();
+    if (!driver) return false;
+    return !this.hasBespokeForm() || (this.devMode && this.genericFormPreview());
+  }
+
+  setGenericFormPreview(on: boolean): void {
+    this.genericFormPreview.set(on);
+    this.genericFormValue.set(null);
+    this.genericFormError.set(null);
+  }
 
   // State signals
   readonly datasources = signal<Datasource[]>([]);
@@ -2521,6 +2812,13 @@ export class DatasourceListComponent implements OnInit {
   readonly isTesting = signal(false);
   readonly isSaving = signal(false);
   readonly formTestResult = signal<DatasourceTestResult | null>(null);
+
+  /** A type without a test is neither a pass nor a failure. */
+  testResultIcon(result: DatasourceTestResult): string {
+    if (result.status === 'ok') return 'check_circle';
+    if (result.status === 'unsupported') return 'info';
+    return 'error';
+  }
   readonly successMessage = signal<string | null>(null);
   readonly errorMessage = signal<string | null>(null);
 
@@ -2593,11 +2891,7 @@ export class DatasourceListComponent implements OnInit {
   /** True for types that connect to something with a URL (everything except
    *  credential-files and email, whose endpoints live in credentials.imap/smtp). */
   hasConnectionUrl(): boolean {
-    return (
-      !this.isCredentialFileType() &&
-      this.formData.type !== 'email' &&
-      !(this.formData.type === 'mcp' && this.formData.mcpTransport === 'stdio')
-    );
+    return !this.isCredentialFileType() && this.formData.type !== 'email';
   }
 
   isGitBackedType(type: DatasourceType | string = this.formData.type): boolean {
@@ -2671,6 +2965,10 @@ export class DatasourceListComponent implements OnInit {
         return false;
       }
     }
+    // The generic form holds back an obviously incomplete submit (including
+    // an edit that would wipe stored secrets); the driver's validate is the
+    // authority on the rest, and its refusal shows at the field it names.
+    if (this.useGenericForm()) return this.genericFormValue()?.problems.length === 0;
     if (this.formData.type === 'credentials') {
       return this.editingId() !== null || this.envVars.some(row => row.key.trim() && row.value);
     }
@@ -2710,9 +3008,6 @@ export class DatasourceListComponent implements OnInit {
       if (this.editingId() !== null && !this.mcpCredentialsWereEntered()) {
         return true;
       }
-      if (this.formData.mcpTransport === 'stdio') {
-        return !!this.formData.mcpCommand.trim();
-      }
       return !!this.formData.connection_url.trim();
     }
     if (this.formData.type === 'kb' && this.isNativeProjectConnector()) {
@@ -2747,11 +3042,9 @@ export class DatasourceListComponent implements OnInit {
     mcpTransport: McpTransport;
     mcpToken: string;
     mcpHeaders: KeyValueRow[];
-    mcpCommand: string;
-    mcpArgs: string;
-    mcpEnv: KeyValueRow[];
     is_global: boolean;
-    read_only: boolean;
+    /** The creator's read-only tag; null until chosen (see formReadOnly). */
+    read_only: boolean | null;
     scope_mode: DatasourceScopeMode | null;
     auto_attach: boolean;
     policy_revision: number | null;
@@ -2767,11 +3060,8 @@ export class DatasourceListComponent implements OnInit {
     mcpTransport: 'http',
     mcpToken: '',
     mcpHeaders: [],
-    mcpCommand: '',
-    mcpArgs: '',
-    mcpEnv: [],
     is_global: false,
-    read_only: true,
+    read_only: null,
     scope_mode: null,
     auto_attach: false,
     policy_revision: null,
@@ -2898,6 +3188,63 @@ export class DatasourceListComponent implements OnInit {
   gitAuthMethod: 'token' | 'ssh' = 'token';
   gitSshKey = '';
 
+  // SSH endpoint of an ssh_key connector, and the pinned host keys of it or
+  // of an SSH-key repository. Non-secret config, so it round-trips on edit.
+  sshHost = '';
+  sshUser = '';
+  sshPort = '';
+  sshKnownHosts = '';
+  /** A token repository's upstream CA (PEM) for SRW's git swap driver. */
+  repoUpstreamCa = '';
+
+  /** An SSH connector with an endpoint: Test reaches it and reports its key. */
+  isSshEndpointForm(): boolean {
+    return (
+      (this.formData.type === 'repository' && this.gitAuthMethod === 'ssh') ||
+      (this.formData.type === 'ssh_key' && !!this.sshHost.trim())
+    );
+  }
+
+  /** Whether the form offers Test (SSH connectors report the host key). */
+  formTestAvailable(): boolean {
+    if (this.isSshEndpointForm()) return true;
+    return (
+      !this.isEnvType() &&
+      this.formData.type !== 'repository' &&
+      !this.isCredentialFileType()
+    );
+  }
+
+  /** What Test must reach while editing: the endpoint as typed, unsaved. */
+  private sshTestEdits(): DatasourceTestEdits | undefined {
+    if (!this.isSshEndpointForm()) return undefined;
+    if (this.formData.type === 'repository') {
+      return {connection_url: this.connectionUrlForPayload(), config: this.buildTypeConfig()};
+    }
+    return {config: this.buildTypeConfig()};
+  }
+
+  /** A host or port edit drops the pin: it named the old endpoint. */
+  onSshEndpointChange(field: 'host' | 'port', value: string): void {
+    const previous = field === 'host' ? this.sshHost : this.sshPort;
+    if (field === 'host') this.sshHost = value;
+    else this.sshPort = value;
+    if (value.trim() !== previous.trim()) this.sshKnownHosts = '';
+  }
+
+  /** The host key a Test just reported, when this form can pin it. */
+  testedHostKeyToPin(): string | null {
+    const hostKey = this.formTestResult()?.details?.host_key;
+    if (typeof hostKey !== 'string' || !hostKey) return null;
+    if (!this.isSshEndpointForm() || this.sshKnownHosts.trim() === hostKey) return null;
+    return hostKey;
+  }
+
+  /** Put the tested host key into the known_hosts field; Save persists it. */
+  pinTestedHostKey(hostKey: string): void {
+    this.sshKnownHosts = hostKey;
+  }
+
   // Generic env var editor
   envVars: { key: string; value: string }[] = [];
   private mcpTransportDirty = false;
@@ -2923,6 +3270,7 @@ export class DatasourceListComponent implements OnInit {
         }
       });
     initialising = false;
+    this.connectorDrivers.load();
     this.refresh();
     if (this.capabilities.datasourceScopeAutoAttachAvailable()) {
       this.loadCatalogProjects(true);
@@ -3128,6 +3476,7 @@ export class DatasourceListComponent implements OnInit {
 
   openCreateForm(): void {
     this.resetFormData();
+    this.resetGenericForm(null);
     this.editingId.set(null);
     this.showForm.set(true);
     this.formTestResult.set(null);
@@ -3140,7 +3489,15 @@ export class DatasourceListComponent implements OnInit {
   }
 
   openEditForm(ds: Datasource): void {
+    // Nothing on the form may change a platform-owned row but a project's
+    // knowledge base; the server would refuse the save.
+    if (isPlatformOwned(ds) && platformOwnedKind(ds) !== PROJECT_KB) return;
     this.editingOriginal = ds;
+    this.resetGenericForm({
+      connection_url: ds.connection_url,
+      connection_url_redacted: ds.connection_url_redacted,
+      config: ds.config,
+    });
     this.formData = {
       name: ds.name,
       type: ds.type,
@@ -3159,11 +3516,8 @@ export class DatasourceListComponent implements OnInit {
       mcpTransport: 'http',
       mcpToken: '',
       mcpHeaders: [],
-      mcpCommand: '',
-      mcpArgs: '',
-      mcpEnv: [],
       is_global: ds.is_global ?? false,
-      read_only: ds.read_only ?? true,
+      read_only: ds.read_only ?? null,
       scope_mode: ds.scope_mode ?? 'all',
       auto_attach: ds.auto_attach ?? false,
       policy_revision: ds.policy_revision ?? 1,
@@ -3197,6 +3551,12 @@ export class DatasourceListComponent implements OnInit {
       this.gitAuthMethod = 'token';
       this.gitSshKey = '';
     }
+    // SSH endpoint and pins are non-secret config and round-trip.
+    this.sshHost = ds.config?.host ?? '';
+    this.sshUser = ds.config?.user ?? '';
+    this.sshPort = ds.config?.port ? String(ds.config.port) : '';
+    this.sshKnownHosts = ds.config?.known_hosts ?? '';
+    this.repoUpstreamCa = ds.config?.upstream_ca ?? '';
     // ENV names can round-trip; blank values preserve the saved credentials.
     this.envVars = ds.type === 'credentials'
       ? (ds.env_var_names ?? []).map(key => ({key, value: ''}))
@@ -3235,14 +3595,25 @@ export class DatasourceListComponent implements OnInit {
     this.scopeTargetsLoading.set(false);
     this.scopeTargetsError.set(false);
     this.resetFormData();
+    this.resetGenericForm(null);
+  }
+
+  /** A fresh generic form; `existing` is what an edit prefills (no secrets). */
+  private resetGenericForm(existing: ExistingConnector | null): void {
+    this.genericFormExisting = existing;
+    this.genericFormPreview.set(false);
+    this.genericFormValue.set(null);
+    this.genericFormError.set(null);
   }
 
   onScopeModeChange(mode: DatasourceScopeMode): void {
     this.formData.scope_mode = mode;
   }
 
+  /** A platform-owned connector (a project's own knowledge base or cloud
+   *  folder, a user's own): its policy is SRW's, never the form's. */
   isNativeProjectConnector(ds: Datasource | null = this.editingOriginal): boolean {
-    return !!ds?.config?.native_project_id;
+    return isPlatformOwned(ds);
   }
 
   onProjectSearch(value: string): void {
@@ -3491,8 +3862,9 @@ export class DatasourceListComponent implements OnInit {
   onTypeSelect(value: DatasourceType | null): void {
     if (value) {
       this.formData.type = value;
-      // kb datasources are read-only by architecture (OKF org-vault policy).
-      if (value === 'kb') this.formData.read_only = true;
+      // A driver forced read-only (the KB) saves read-only: formReadOnly().
+      this.genericFormValue.set(null);
+      this.genericFormError.set(null);
       // Mailboxes are private-only; the server rejects is_global for email.
       if (value === 'email') this.formData.is_global = false;
       this.onTypeChange();
@@ -3500,7 +3872,7 @@ export class DatasourceListComponent implements OnInit {
   }
 
   onMcpTransportSelect(value: string | null): void {
-    if (value === 'http' || value === 'sse' || value === 'stdio') {
+    if (value === 'http' || value === 'sse') {
       this.mcpTransportDirty =
         this.mcpTransportDirty || this.formData.mcpTransport !== value;
       this.formData.mcpTransport = value;
@@ -3527,6 +3899,10 @@ export class DatasourceListComponent implements OnInit {
   onConnectionUrlChange(value: string = this.formData.connection_url): void {
     this.connectionUrlDirty = !this.editingOriginal ||
       value !== (this.editingOriginal.connection_url ?? '');
+    if (this.formData.type === 'repository' && value !== this.formData.connection_url) {
+      // A pinned host key names the old URL's host; the server would refuse it.
+      this.sshKnownHosts = '';
+    }
     this.formData.connection_url = value;
     if (this.formData.type === 'repository' && !this.forgeDirty) {
       this.formData.forge = this.inferForgeFromUrl(value);
@@ -3639,8 +4015,10 @@ export class DatasourceListComponent implements OnInit {
     if (!this.formData.is_global) return null;
     const prev = this.editingId() ? this.editingOriginal : null;
     const wasPublic = prev?.is_global === true;
-    const wasRw = wasPublic && prev?.read_only === false;
-    const isRw = !this.formData.read_only && this.formData.type !== 'kb';
+    // A driver with no read-only level (an MCP server) was read-write
+    // whatever its stored flag says; saving the flag to match needs no gate.
+    const wasRw = wasPublic && (prev?.read_only === false || !this.offersReadOnly());
+    const isRw = !this.formReadOnly();
     if (isRw && !wasRw) return 'name';
     if (!wasPublic) return 'warn';
     return null;
@@ -3663,15 +4041,11 @@ export class DatasourceListComponent implements OnInit {
   }
 
   private connectionUrlForPayload(): string | undefined {
+    // Blank there means unchanged on an edit, and none on a create.
+    if (this.useGenericForm()) return this.genericFormValue()?.connection_url;
     if (
       this.editingId() && this.editingOriginal?.connection_url_redacted &&
       !this.connectionUrlDirty
-    ) {
-      return undefined;
-    }
-    if (
-      this.formData.type === 'mcp' &&
-      this.formData.mcpTransport === 'stdio'
     ) {
       return undefined;
     }
@@ -3722,9 +4096,7 @@ export class DatasourceListComponent implements OnInit {
         default_branch: this.formData.default_branch || undefined,
         config: this.buildTypeConfig(),
         is_global: this.formData.is_global,
-        read_only: this.formData.is_global
-          ? (this.formData.type === 'kb' ? true : this.formData.read_only)
-          : undefined,
+        read_only: this.savedReadOnly(),
       };
       const connectionUrl = this.connectionUrlForPayload();
       if (connectionUrl !== undefined) update.connection_url = connectionUrl;
@@ -3746,7 +4118,11 @@ export class DatasourceListComponent implements OnInit {
         next: (result) => {
           this.isSaving.set(false);
           if (result) {
-            this.successMessage.set(this.transloco.translate('datasources.messages.updated'));
+            // What the update changed beyond what was asked (a stored
+            // variable no connector may set, dropped) is the server's text.
+            const notices = (result.notices ?? []).join(' ');
+            const updated = this.transloco.translate('datasources.messages.updated');
+            this.successMessage.set(notices ? `${updated} ${notices}` : updated);
             this.closeForm();
             this.refresh();
           } else {
@@ -3755,6 +4131,7 @@ export class DatasourceListComponent implements OnInit {
         },
         error: (err) => {
           this.isSaving.set(false);
+          if (this.showGenericFormError(err)) return;
           // Surface the server detail (e.g. the publish-capability 403)
           // instead of the generic message — mirrors the create path.
           const detail = err?.error?.detail;
@@ -3774,9 +4151,7 @@ export class DatasourceListComponent implements OnInit {
         default_branch: this.formData.default_branch || undefined,
         config: this.buildTypeConfig(),
         is_global: this.formData.is_global,
-        read_only: this.formData.is_global
-          ? (this.formData.type === 'kb' ? true : this.formData.read_only)
-          : undefined,
+        read_only: this.savedReadOnly(),
         ...this.createAvailabilityPolicy(),
       };
 
@@ -3789,11 +4164,22 @@ export class DatasourceListComponent implements OnInit {
         },
         error: (err) => {
           this.isSaving.set(false);
+          if (this.showGenericFormError(err)) return;
           const detail = err?.error?.detail;
           this.errorMessage.set(detail || this.transloco.translate('datasources.messages.createFailed'));
         },
       });
     }
+  }
+
+  /** In the generic form the API's refusal shows at the field its pointer
+   *  names (or above the form); true when it took the error. */
+  private showGenericFormError(err: unknown): boolean {
+    if (!this.useGenericForm()) return false;
+    const error = connectorFormError(err);
+    if (!error) return false;
+    this.genericFormError.set(error);
+    return true;
   }
 
   testFromForm(): void {
@@ -3802,7 +4188,7 @@ export class DatasourceListComponent implements OnInit {
     if (editId) {
       this.isTesting.set(true);
       this.formTestResult.set(null);
-      this.api.testDatasource(editId).subscribe({
+      this.api.testDatasource(editId, this.sshTestEdits()).subscribe({
         next: (result) => {
           this.isTesting.set(false);
           this.formTestResult.set(result);
@@ -3819,6 +4205,7 @@ export class DatasourceListComponent implements OnInit {
       if (!this.canTestFromForm()) return;
       this.isSaving.set(true);
       this.formTestResult.set(null);
+      this.genericFormError.set(null);
 
       const create: DatasourceCreateRequest = {
         name: this.formData.name,
@@ -3865,8 +4252,9 @@ export class DatasourceListComponent implements OnInit {
             this.errorMessage.set(this.transloco.translate('datasources.messages.createForTestFailed'));
           }
         },
-        error: () => {
+        error: (err) => {
           this.isSaving.set(false);
+          if (this.showGenericFormError(err)) return;
           this.errorMessage.set(this.transloco.translate('datasources.messages.createError'));
         },
       });
@@ -3974,6 +4362,9 @@ export class DatasourceListComponent implements OnInit {
       kubeconfig: 'rocket_launch',
       ssh_key: 'key',
       generic_file: 'description',
+      cloud_folder: 'folder',
+      cloud_folder_checkout: 'folder_copy',
+      cloud_outbox: 'outbox',
     };
     return icons[type] || 'storage';
   }
@@ -3989,6 +4380,24 @@ export class DatasourceListComponent implements OnInit {
   canManage(ds: Datasource): boolean {
     const user = this.userService.currentUser();
     return !!user && (user.is_admin === true || ds.created_by === user.id);
+  }
+
+  /** Edit: a manager's own rows, and of the platform-owned ones only a
+   *  project's knowledge base, whose metadata and root path stay editable
+   *  (the server refuses every other edit of a platform-owned row). */
+  canEditRow(ds: Datasource): boolean {
+    if (!this.canManage(ds)) return false;
+    return !isPlatformOwned(ds) || platformOwnedKind(ds) === PROJECT_KB;
+  }
+
+  /** Delete: never a platform-owned row, which goes with its project or user. */
+  canDeleteRow(ds: Datasource): boolean {
+    return this.canManage(ds) && !isPlatformOwned(ds);
+  }
+
+  /** Who manages a platform-owned row ("Managed by its project"), or null. */
+  managedLabelKey(ds: Datasource): string | null {
+    return platformManagedLabelKey(ds, this.userService.currentUser()?.id ?? null);
   }
 
   indexStatusTone(status: DatasourceIndexStatus['status']): BadgeTone {
@@ -4074,24 +4483,69 @@ export class DatasourceListComponent implements OnInit {
     this.formData.mcpHeaders.splice(index, 1);
   }
 
-  addMcpEnv(): void {
-    this.formData.mcpEnv.push({key: '', value: ''});
-  }
+  /** The repository config keys this form renders (and so decides). */
+  private static readonly REPOSITORY_FORM_CONFIG_KEYS: ReadonlySet<string> = new Set([
+    'forge',
+    'known_hosts',
+    'upstream_ca',
+  ]);
 
-  removeMcpEnv(index: number): void {
-    this.formData.mcpEnv.splice(index, 1);
+  /** The edited repository connector's stored config without the keys the
+   *  form renders: kept as they are on save. A GitHub App's `github_app`
+   *  goes with its credentials, so a new token or key drops it. */
+  private unrenderedRepositoryConfig(): DatasourceConfig {
+    const stored: DatasourceConfig =
+      this.editingId() !== null ? this.editingOriginal?.config ?? {} : {};
+    const kept: Record<string, unknown> = {};
+    for (const [key, value] of Object.entries(stored)) {
+      if (!DatasourceListComponent.REPOSITORY_FORM_CONFIG_KEYS.has(key)) {
+        kept[key] = value;
+      }
+    }
+    const replacing =
+      this.gitAuthMethod === 'ssh' ? !!this.gitSshKey : !!this.formCredentials.password;
+    if (replacing) delete kept['github_app'];
+    return kept as DatasourceConfig;
   }
 
   /** Non-secret, type-specific config for the create/update/test payloads.
    *  `undefined` for types without config so the column stays untouched. */
   private buildTypeConfig(): DatasourceConfig | undefined {
+    if (this.useGenericForm()) {
+      return this.genericFormValue()?.config as DatasourceConfig | undefined;
+    }
     if (this.formData.type === 'kb') {
       return {root_path: this.formData.root_path.trim()};
     }
     if (this.formData.type === 'repository') {
       // canSave() already requires forge to be non-blank before this can be
       // reached from the UI; the `{}` fallback only guards a defensive call.
-      return this.formData.forge ? {forge: this.formData.forge} : {};
+      // The config is replaced as a whole on update: keys this form does not
+      // render (a GitHub App's `github_app`, set through the API) are kept.
+      const config: DatasourceConfig = {
+        ...this.unrenderedRepositoryConfig(),
+        ...(this.formData.forge ? {forge: this.formData.forge} : {}),
+      };
+      if (this.gitAuthMethod === 'ssh' && this.sshKnownHosts.trim()) {
+        config.known_hosts = this.sshKnownHosts.trim();
+      }
+      // The config is replaced as a whole on update: a CA the form did not
+      // send would be dropped.
+      if (this.gitAuthMethod === 'token' && this.repoUpstreamCa.trim()) {
+        config.upstream_ca = this.repoUpstreamCa.trim();
+      }
+      return config;
+    }
+    if (this.formData.type === 'ssh_key') {
+      // Always an object: clearing the host on edit must clear it server-side.
+      const host = this.sshHost.trim();
+      if (!host) return {};
+      const config: DatasourceConfig = {host};
+      if (this.sshUser.trim()) config.user = this.sshUser.trim();
+      const port = this.sshPort.trim();
+      if (port) config.port = /^\d+$/.test(port) ? Number(port) : port;
+      if (this.sshKnownHosts.trim()) config.known_hosts = this.sshKnownHosts.trim();
+      return config;
     }
     if (this.formData.type === 'email') {
       return {
@@ -4119,6 +4573,8 @@ export class DatasourceListComponent implements OnInit {
     // (the API never returns credentials, so the form can't show them
     // back). Returning undefined skips the credentials column in the
     // PUT body so the orchestrator preserves the stored secret.
+    // The generic form applies the same rule per writeOnly field and slot.
+    if (this.useGenericForm()) return this.genericFormValue()?.credentials;
     const isEditing = this.editingId() !== null;
     if (this.isEnvType()) {
       const envVarsObj: Record<string, string> = {};
@@ -4137,16 +4593,6 @@ export class DatasourceListComponent implements OnInit {
       const credentials: Record<string, unknown> = {
         transport: this.formData.mcpTransport,
       };
-      if (this.formData.mcpTransport === 'stdio') {
-        credentials['command'] = this.formData.mcpCommand.trim();
-        credentials['args'] = this.formData.mcpArgs
-          .split('\n')
-          .map((arg) => arg.trim())
-          .filter(Boolean);
-        credentials['env'] = this.kvRowsToObject(this.formData.mcpEnv);
-        return credentials;
-      }
-
       if (this.formData.mcpToken) {
         credentials['auth'] = {
           type: 'bearer',
@@ -4251,10 +4697,23 @@ export class DatasourceListComponent implements OnInit {
     return (
       this.mcpTransportDirty ||
       !!this.formData.mcpToken ||
-      !!this.formData.mcpCommand.trim() ||
-      !!this.formData.mcpArgs.trim() ||
       this.formData.mcpHeaders.some((row) => !!row.key.trim()) ||
-      this.formData.mcpEnv.some((row) => !!row.key.trim())
+      // A stored stdio server is retired (it no longer runs in the agent):
+      // given a URL, it moves to the transport chosen here. REST hides its
+      // transport, so the form's default http is no change of its own.
+      (this.isStoredStdioServer() && !!this.formData.connection_url.trim())
+    );
+  }
+
+  /** The MCP row being edited is a stored stdio server: a remote one
+   *  always has a URL (a redacted one too), a stdio one never had one. */
+  private isStoredStdioServer(): boolean {
+    const original = this.editingOriginal;
+    return (
+      this.editingId() !== null &&
+      original?.type === 'mcp' &&
+      !original.connection_url &&
+      !original.connection_url_redacted
     );
   }
 
@@ -4271,11 +4730,8 @@ export class DatasourceListComponent implements OnInit {
       mcpTransport: 'http',
       mcpToken: '',
       mcpHeaders: [],
-      mcpCommand: '',
-      mcpArgs: '',
-      mcpEnv: [],
       is_global: false,
-      read_only: true,
+      read_only: null,
       scope_mode: null,
       auto_attach: false,
       policy_revision: null,
@@ -4285,6 +4741,11 @@ export class DatasourceListComponent implements OnInit {
     this.emailForm = this.defaultEmailForm();
     this.gitAuthMethod = 'token';
     this.gitSshKey = '';
+    this.sshHost = '';
+    this.sshUser = '';
+    this.sshPort = '';
+    this.sshKnownHosts = '';
+    this.repoUpstreamCa = '';
     this.envVars = [];
     this.mcpTransportDirty = false;
     this.forgeDirty = false;
@@ -4360,5 +4821,6 @@ export class DatasourceListComponent implements OnInit {
   private clearMessages(): void {
     this.successMessage.set(null);
     this.errorMessage.set(null);
+    this.genericFormError.set(null);
   }
 }

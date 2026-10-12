@@ -96,6 +96,7 @@ def _wire(
     from orchestrator.routers.datasources import DatasourcesDependencies as RouteDeps
     from orchestrator.routers.datasources import router
     from orchestrator.services.datasources import DatasourceDependencies as OpDeps
+    from orchestrator.services.connector_drivers import builtin_connector_drivers
     from orchestrator.services.kb_task_registry import KbDatasourceTaskRegistry
     from orchestrator.services.knowledge_index import KnowledgeIndexDependencies
 
@@ -136,6 +137,7 @@ def _wire(
         ),
         mcp_datasources_enabled=lambda: mcp_enabled,
         validate_mcp_datasource=validate_mcp or (lambda _url, _creds: None),
+        connector_drivers=builtin_connector_drivers(),
     )
     deps = RouteDeps(
         store=db,
@@ -372,6 +374,31 @@ def test_eligible_rows_are_redacted():
     assert "credentials" not in body[0]
 
 
+def test_eligible_narrows_to_what_the_execution_kind_attaches():
+    folder = {
+        "id": "00000000-0000-0000-0000-0000000000f1",
+        "name": "Atlas cloud folder",
+        "type": "cloud_folder",
+        "managed_key": f"project-cloud:{PROJECT_ID}",
+    }
+    wire = _wire(
+        store=_store(
+            list_eligible_datasources=AsyncMock(return_value=[dict(SECRET_ROW), folder])
+        )
+    )
+
+    def listed(query: str = "") -> list[str]:
+        response = wire.client.get(f"/api/datasources/eligible{query}")
+        assert response.status_code == 200, response.text
+        return [row["id"] for row in response.json()]
+
+    assert listed() == [DATASOURCE_ID, folder["id"]]
+    assert listed("?execution=session") == [DATASOURCE_ID, folder["id"]]
+    # A cloud folder mounts into sessions: a job form never lists it.
+    assert listed("?execution=job") == [DATASOURCE_ID]
+    assert wire.client.get("/api/datasources/eligible?execution=pod").status_code == 422
+
+
 def test_job_datasources_are_redacted():
     wire = _wire()
     body = wire.client.get(f"/api/jobs/{JOB_ID}/datasources").json()
@@ -543,7 +570,7 @@ def test_delete_refuses_the_project_owned_knowledge_connector():
 def test_probe_of_an_unreachable_postgres_target_is_a_200_error_report():
     wire = _wire()
     with patch(
-        "orchestrator.services.datasources.asyncpg.connect",
+        "orchestrator.services.connector_drivers.managed.asyncpg.connect",
         AsyncMock(side_effect=OSError("connection refused")),
     ):
         body = wire.client.post(f"/api/datasources/{DATASOURCE_ID}/test").json()
@@ -581,7 +608,45 @@ def test_probe_of_an_mcp_connector_is_403_when_the_deployment_disables_them():
     assert response.json()["detail"] == "MCP connectors are disabled on this deployment"
 
 
-def test_probe_of_an_ssh_repository_connector_reports_no_api_probe():
+def test_probe_of_an_ssh_repository_connector_reports_its_host_key(monkeypatch):
+    """C1: no forge API takes a deploy key; Test reaches the SSH endpoint, at
+    the address its name resolved to."""
+    from orchestrator.services import workspace_ssh_connector
+    from orchestrator.services.connector_drivers import provider_http
+    from shared.runtime.utils.ssh_key import generate_ed25519_keypair
+    from tests._provider_fakes import fake_resolver
+
+    host_key = " ".join(generate_ed25519_keypair().public_key.split()[:2])
+
+    async def fetch(host, port):
+        assert (host, port) == ("203.0.113.22", 22)
+        return host_key
+
+    monkeypatch.setitem(
+        provider_http._state,
+        "network",
+        provider_http.ProviderNetwork(
+            resolver=fake_resolver({"github.com": ("203.0.113.22",)})
+        ),
+    )
+    monkeypatch.setattr(workspace_ssh_connector, "fetch_ssh_host_key", fetch)
+    row = dict(
+        SECRET_ROW,
+        type="repository",
+        connection_url="git@github.com:acme/widget.git",
+        credentials={
+            "auth_method": "ssh",
+            "ssh_key": generate_ed25519_keypair().private_key,
+        },
+    )
+    wire = _wire(datasource=row)
+    body = wire.client.post(f"/api/datasources/{DATASOURCE_ID}/test").json()
+    assert body["status"] == "ok"
+    assert body["details"]["host_key"] == f"github.com {host_key}"
+    assert "PRIVATE KEY" not in str(body)
+
+
+def test_probe_of_an_unusable_ssh_repository_connector_is_an_error():
     row = dict(
         SECRET_ROW,
         type="repository",
@@ -590,8 +655,8 @@ def test_probe_of_an_ssh_repository_connector_reports_no_api_probe():
     )
     wire = _wire(datasource=row)
     body = wire.client.post(f"/api/datasources/{DATASOURCE_ID}/test").json()
-    assert body["status"] == "ok"
-    assert "clone at job start is the test" in body["message"]
+    assert body["status"] == "error"
+    assert "Invalid SSH key" in body["message"]
 
 
 def test_probe_surfaces_a_gate_crash_as_a_500_without_its_message():

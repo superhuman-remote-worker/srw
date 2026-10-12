@@ -21,8 +21,10 @@ window — no LLM calls, no I/O. Two callers, two budget shapes, one algorithm:
 
 import logging
 import math
+import threading
+import time
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -127,6 +129,67 @@ class ChunkPlan:
 
 
 _ENCODING_CACHE: Dict[str, Any] = {}
+_ENCODING_LOCK = threading.Lock()
+
+# How long a failed encoding load is remembered before it is tried again. On a
+# cold cache tiktoken fetches its vocab with synchronous HTTP; where that host
+# does not resolve, each attempt blocks its thread for seconds of DNS retries.
+# One failure predicts the next, so counts use the fallback for this long
+# instead of paying the retry once per call (once per KB note, on the live
+# 2026-08-07 stall).
+_ENCODING_RETRY_SECONDS = 300.0
+
+
+@dataclass(frozen=True)
+class _EncodingUnavailable:
+    """Cache marker for a failed load; ``retry_at`` is a ``time.monotonic`` value."""
+
+    retry_at: float
+
+
+def _cached_encoding(key: str) -> Tuple[bool, Any]:
+    """``(True, encoding)`` when the cache answers for ``key``, else ``(False, None)``.
+
+    A failure still inside its cooldown answers with ``None`` (use the fallback).
+    """
+    cached = _ENCODING_CACHE.get(key)
+    if isinstance(cached, _EncodingUnavailable):
+        return time.monotonic() < cached.retry_at, None
+    return cached is not None, cached
+
+
+def _load_encoding(key: str, model: Optional[str]) -> Any:
+    """Return the encoding for ``key``, or None while it is unavailable."""
+    answered, encoding = _cached_encoding(key)
+    if answered:
+        return encoding
+    with _ENCODING_LOCK:
+        # Re-read under the lock: a caller that waited on another thread's
+        # failed load must see that failure, not repeat the download.
+        answered, encoding = _cached_encoding(key)
+        if answered:
+            return encoding
+        try:
+            try:
+                encoding = tiktoken.encoding_for_model(model) if model else None
+            except (KeyError, ValueError):
+                encoding = None
+            if encoding is None:
+                encoding = tiktoken.get_encoding("cl100k_base")
+        except Exception as exc:
+            _ENCODING_CACHE[key] = _EncodingUnavailable(
+                time.monotonic() + _ENCODING_RETRY_SECONDS
+            )
+            logger.warning(
+                "tiktoken encoding for %s unavailable (%r); using the "
+                "conservative estimate for %ds",
+                model or "the default model",
+                exc,
+                int(_ENCODING_RETRY_SECONDS),
+            )
+            return None
+        _ENCODING_CACHE[key] = encoding
+        return encoding
 
 
 def count_text_tokens(text: str, model: Optional[str] = None) -> int:
@@ -135,24 +198,20 @@ def count_text_tokens(text: str, model: Optional[str] = None) -> int:
     The planner must use real token counts: the historical ``len(text) // 4``
     estimate let a 951k-token conversation slip past a 943k gate (it
     under-counts), straight into a 131k summarizer.
+
+    A failed encoding load (no vocab in the cache and no route to its host)
+    uses the fallback too, and is not retried until the cooldown passes.
+    Images bake the vocab, so this is the offline-dev and outage path.
     """
     if not text:
         return 0
     if TIKTOKEN_AVAILABLE:
-        key = model or "_default"
-        encoding = _ENCODING_CACHE.get(key)
-        if encoding is None:
+        encoding = _load_encoding(model or "_default", model)
+        if encoding is not None:
             try:
-                encoding = tiktoken.encoding_for_model(model) if model else None
-            except (KeyError, ValueError):
-                encoding = None
-            if encoding is None:
-                encoding = tiktoken.get_encoding("cl100k_base")
-            _ENCODING_CACHE[key] = encoding
-        try:
-            return len(encoding.encode(text, disallowed_special=()))
-        except Exception:  # pragma: no cover - defensive
-            pass
+                return len(encoding.encode(text, disallowed_special=()))
+            except Exception:  # pragma: no cover - defensive
+                pass
     return math.ceil(len(text) / _FALLBACK_CHARS_PER_TOKEN)
 
 

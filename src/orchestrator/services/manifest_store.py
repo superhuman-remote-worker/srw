@@ -28,6 +28,20 @@ def decoded(row):
     return result
 
 
+INSTALLATION_MANAGED_MESSAGE = (
+    "This template is managed by the installation. Duplicate it to change it."
+)
+#: A resource mirroring a platform-owned connector (``platform_managed``).
+PLATFORM_MANAGED_MESSAGE = (
+    "SRW manages this connector; it cannot be changed or deleted here."
+)
+#: A Connector resource written through from a datasource row.
+LINKED_CONNECTOR_MESSAGE = (
+    "Change or delete this connector on the Connectors page "
+    "(/api/datasources); its resource is written from there."
+)
+
+
 def resource_view(row):
     """Keep the portable document separate from observed database identity."""
     return {
@@ -36,6 +50,8 @@ def resource_view(row):
         "resourceVersion": row["resource_version"],
         "revision": row["revision"],
         "activeRevision": row.get("active_revision"),
+        "installationManaged": bool(row.get("installation_managed")),
+        "platformManaged": row.get("platform_managed"),
     }
 
 
@@ -133,11 +149,43 @@ class ManifestStore:
         managed_by=None,
         expected_version=None,
         uid=None,
+        installation_managed=False,
+        platform_managed=None,
     ):
-        """Call inside transaction_scope, with this identity already locked."""
+        """Call inside transaction_scope, with this identity already locked.
+
+        ``platform_managed`` is the managed key of a platform-owned row this
+        resource mirrors; only that row's write-through passes it.
+        """
         metadata = document["metadata"]
         old = await self.by_name(document["kind"], metadata["scope"], metadata["name"])
         if old:
+            if bool(old.get("installation_managed")) != installation_managed:
+                # The installation's rows and everyone else's never change
+                # hands, in either direction. Check this before the version
+                # comparison below: an admin applying a stale version against a
+                # built-in must see the managed refusal, not a version-changed
+                # retry that only leads back here.
+                raise HTTPException(
+                    409,
+                    INSTALLATION_MANAGED_MESSAGE
+                    if old.get("installation_managed")
+                    else "A resource with this name exists and isn't managed "
+                    "by the installation.",
+                )
+            if old.get("platform_managed") and (
+                old["platform_managed"] != platform_managed
+            ):
+                raise HTTPException(409, PLATFORM_MANAGED_MESSAGE)
+            if (
+                old["kind"] == "Connector"
+                and old.get("linked_id")
+                and str(old["linked_id"]) != str(linked_id or "")
+            ):
+                # Its datasource row decides it until readers move to the
+                # resource; an edit here would be overwritten by the next
+                # write-through, or diverge from what executions bind.
+                raise HTTPException(409, LINKED_CONNECTOR_MESSAGE)
             if (
                 expected_version is not None
                 and old["resource_version"] != expected_version
@@ -197,8 +245,8 @@ class ManifestStore:
                 )
             resource_id, version = UUID(str(uid)) if uid else uuid4(), 1
             row = await self.db.fetchrow(
-                """INSERT INTO srw_resources(id,kind,scope_kind,scope_name,name,owner_id,project_id,linked_id,managed_by,document,resolved,revision,dependencies)
-                VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::jsonb,$11::jsonb,$12,$13::jsonb) RETURNING *""",
+                """INSERT INTO srw_resources(id,kind,scope_kind,scope_name,name,owner_id,project_id,linked_id,managed_by,document,resolved,revision,dependencies,installation_managed,platform_managed)
+                VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::jsonb,$11::jsonb,$12,$13::jsonb,$14,$15) RETURNING *""",
                 resource_id,
                 document["kind"],
                 metadata["scope"]["kind"],
@@ -212,6 +260,8 @@ class ManifestStore:
                 json.dumps(resolved),
                 revision,
                 json.dumps(dependencies),
+                installation_managed,
+                platform_managed,
             )
         await self.db.execute(
             "INSERT INTO srw_resource_revisions(resource_id,resource_version,document,resolved,revision,dependencies) VALUES($1,$2,$3::jsonb,$4::jsonb,$5,$6::jsonb)",
@@ -234,10 +284,18 @@ class ManifestStore:
                     409,
                     "Resource version changed; read the current resource and retry.",
                 )
+            if current.get("installation_managed"):
+                raise HTTPException(409, INSTALLATION_MANAGED_MESSAGE)
             if current.get("managed_by"):
                 raise HTTPException(
                     409, "Remove this resource through its owning Project definition."
                 )
+            if current.get("platform_managed"):
+                raise HTTPException(409, PLATFORM_MANAGED_MESSAGE)
+            if current["kind"] == "Connector" and current.get("linked_id"):
+                # The datasource delete keeps its own semantics: tombstone,
+                # thread scrub, and no wait for running work (decision 12).
+                raise HTTPException(409, LINKED_CONNECTOR_MESSAGE)
             if current["kind"] == "Expert" and current.get("linked_id"):
                 managed_key = await self.db.fetchval(
                     "SELECT managed_key FROM experts WHERE id=$1", current["linked_id"]
@@ -252,26 +310,81 @@ class ManifestStore:
                         409,
                         "Repoint active Expert references and defaults before deleting this resource.",
                     )
-            in_use = await execution_references_block_retirement(
-                self.db,
-                resource_ids=[row["id"]],
-                dependency_ids=[str(row["id"])],
-            )
-            if in_use:
-                raise HTTPException(409, "Resource is referenced by unfinished work.")
-            if await self.db.fetchval(
-                "SELECT EXISTS(SELECT 1 FROM srw_resources WHERE deleted_at IS NULL AND (managed_by=$1 OR dependencies @> $2::jsonb))",
-                row["id"],
-                json.dumps([{"uid": str(row["id"])}]),
-            ):
-                raise HTTPException(
-                    409,
-                    "Resource is still owned or referenced by another saved definition.",
-                )
+            blocker = await self._retirement_blocker(row)
+            if blocker:
+                raise HTTPException(409, blocker)
             await self.db.execute(
                 "UPDATE srw_resources SET deleted_at=now(),updated_at=now(),resource_version=resource_version+1 WHERE id=$1",
                 row["id"],
             )
+            if current["kind"] == "Project" and current.get("linked_id"):
+                from orchestrator.services.project_connector_defaults import (
+                    release_manifest_connector_defaults,
+                )
+                from orchestrator.services.project_workspace_defaults import (
+                    release_manifest_defaults,
+                )
+
+                await release_manifest_defaults(self.db, current["linked_id"])
+                await release_manifest_connector_defaults(self.db, current["linked_id"])
+
+    async def _retirement_blocker(self, row) -> str | None:
+        """Why a resource can't be retired yet, or None."""
+        if await execution_references_block_retirement(
+            self.db,
+            resource_ids=[row["id"]],
+            dependency_ids=[str(row["id"])],
+        ):
+            return "Resource is referenced by unfinished work."
+        if await self.db.fetchval(
+            "SELECT EXISTS(SELECT 1 FROM srw_resources WHERE deleted_at IS NULL AND (managed_by=$1 OR dependencies @> $2::jsonb))",
+            row["id"],
+            json.dumps([{"uid": str(row["id"])}]),
+        ):
+            return "Resource is still owned or referenced by another saved definition."
+        return None
+
+    async def installation_managed(self, kind):
+        rows = await self.db.fetch(
+            "SELECT * FROM srw_resources WHERE kind=$1 AND installation_managed AND deleted_at IS NULL ORDER BY name",
+            kind,
+        )
+        return [decoded(row) for row in rows]
+
+    async def retired_installation_managed(self, kind, scope, name):
+        return decoded(
+            await self.db.fetchrow(
+                "SELECT * FROM srw_resources WHERE kind=$1 AND scope_kind=$2 AND scope_name=$3 AND name=$4 AND installation_managed AND deleted_at IS NOT NULL ORDER BY updated_at DESC LIMIT 1",
+                kind,
+                scope["kind"],
+                scope["name"],
+                name,
+            )
+        )
+
+    async def restore_installation_managed(self, row):
+        """Call inside transaction_scope, with the catalog locked."""
+        return decoded(
+            await self.db.fetchrow(
+                "UPDATE srw_resources SET deleted_at=NULL,updated_at=now(),resource_version=resource_version+1 WHERE id=$1 AND installation_managed RETURNING *",
+                row["id"],
+            )
+        )
+
+    async def retire_installation_managed(self, row) -> bool:
+        """Soft-delete an installation's row unless something still uses it.
+
+        Call inside transaction_scope, with the catalog locked.
+        """
+        if not row.get("installation_managed"):
+            raise ValueError("Only installation-managed resources are retired here.")
+        if await self._retirement_blocker(row):
+            return False
+        await self.db.execute(
+            "UPDATE srw_resources SET deleted_at=now(),updated_at=now(),resource_version=resource_version+1 WHERE id=$1",
+            row["id"],
+        )
+        return True
 
     async def execution(self, work_kind, work_id):
         return decoded(

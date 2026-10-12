@@ -300,6 +300,43 @@ echo '__SRW_TERMINAL_RESIDENTS_ZERO__'
 """
 
 
+#: What the stale-identity cleanup of a sidecar Pod prints when done.
+SIDECAR_RCLONE_ZERO_MARKER = "__SRW_SIDECAR_RCLONE_ZERO__"
+
+
+def _sidecar_stale_rclone_cleanup_command(thread_id: str) -> str:
+    """For a Pod whose folders its sidecars own (D7): prove no rclone of the
+    thread runs in the workspace, then remove the thread's in-workspace
+    rclone directory (identities, and the old rclone.conf with its obscured
+    password). A session from before the deploy, restored onto such
+    a Pod, still has them in its persistent home; the resident zero proof
+    reads one as a live rclone and End would answer 503 forever. Nothing in
+    a sidecar Pod's workspace starts an rclone (an unprotected one has no
+    /dev/fuse), so a process of the thread is a refusal, never removed."""
+
+    thread = shlex.quote(str(UUID(str(thread_id))))
+    return f"""set -eu
+_srw_thread={thread}
+_srw_rclone_base="$HOME/.cache/srw/rclone/$_srw_thread"
+for _srw_cmdline in /proc/[0-9]*/cmdline; do
+  _srw_pid=$(basename "$(dirname "$_srw_cmdline")")
+  if [ ! -r "$_srw_cmdline" ]; then
+    [ ! -e "/proc/$_srw_pid" ] && continue
+    _srw_uid=$(awk '/^Uid:/ {{ print $2; exit }}' "/proc/$_srw_pid/status" 2>/dev/null) || exit 86
+    [ -n "$_srw_uid" ] || exit 86
+    [ "$_srw_uid" != "$(id -u)" ] && continue
+    exit 86
+  fi
+  _srw_args=$(tr '\\0' '\\n' < "$_srw_cmdline" 2>/dev/null || true)
+  if printf '%s\n' "$_srw_args" | grep -F -- "$_srw_rclone_base/" >/dev/null; then exit 85; fi
+done
+# Proven unused: the whole directory goes, its identities and the old
+# rclone.conf with the obscured password included.
+rm -rf -- "$_srw_rclone_base"
+echo '{SIDECAR_RCLONE_ZERO_MARKER}'
+"""
+
+
 def _resident_cleanup_command(thread_id: str) -> str:
     """Gracefully stop browser/IDE owners, then kill their exact process trees."""
 
@@ -368,6 +405,7 @@ async def retire_stateless_workspace_residents(
     """Drain every workspace-resident writer while the remote record is active T."""
 
     from shared.runtime.services.cloud_mount import RcloneMountManager
+    from shared.runtime.services.cloud_mount.sidecar import SidecarMountWatcher
     from shared.runtime.services.cloud_overlay import OverlayMountManager
 
     authority = resolve_shell_retirement_authority(
@@ -401,9 +439,40 @@ async def retire_stateless_workspace_residents(
                     workspace_root="/home/agent-host/workspace",
                 )
                 counters.update(await overlay.retire_existing())
-            mount_manager = RcloneMountManager(
+        if cloud_mount_cfg and cloud_mount_cfg.get("delivery") == "sidecar":
+            # The Pod's sidecars own the folders (D7): nothing of the
+            # session runs in the workspace, but its writes must still
+            # reach the cloud while T is active, so ask for the flush
+            # and require it when a mounted folder has uploads pending.
+            watcher = SidecarMountWatcher(
                 thread_id=authority.thread_id,
                 cloud_cfg=dict(cloud_mount_cfg),
+                workspace_backend=backend,
+                workspace_root="/home/agent-host/workspace",
+                terminal=True,
+            )
+            counters.update(await watcher.retire_existing(drain=True))
+            cleared = await asyncio.to_thread(
+                backend.exec_terminal_claim_resource,
+                _sidecar_stale_rclone_cleanup_command(authority.thread_id),
+                30,
+                operation="stale in-workspace rclone state cleanup",
+            )
+            if SIDECAR_RCLONE_ZERO_MARKER not in str(cleared or ""):
+                raise ShellRetirementUnavailable(
+                    "stale in-workspace rclone state was not cleared"
+                )
+        else:
+            # Without a payload too: whatever an earlier claim mounted in
+            # the workspace and nothing names now is retired, never left to
+            # fail the zero proof below (its identity file) for good.
+            mount_manager = RcloneMountManager(
+                thread_id=authority.thread_id,
+                cloud_cfg=(
+                    dict(cloud_mount_cfg)
+                    if cloud_mount_cfg
+                    else {"driver": "rclone", "mounts": []}
+                ),
                 workspace_backend=backend,
                 workspace_root="/home/agent-host/workspace",
             )
@@ -464,6 +533,8 @@ async def verify_stateless_workspace_residents_retired(
                     overlay._terminal_zero_script(),
                     30,
                 )
+        if cloud_mount_cfg and cloud_mount_cfg.get("delivery") != "sidecar":
+            # A sidecar Pod's folders have no workspace resident to re-prove.
             mount_manager = RcloneMountManager(
                 thread_id=authority.thread_id,
                 cloud_cfg=dict(cloud_mount_cfg),

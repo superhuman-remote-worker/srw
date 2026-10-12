@@ -4,13 +4,16 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Awaitable, Callable, Mapping
+from contextlib import AsyncExitStack, asynccontextmanager
 from dataclasses import dataclass
+from datetime import datetime
 from functools import partial
 import json
 import logging
 import os
 import time
 from typing import Any, Literal
+from uuid import UUID, uuid5
 
 from fastapi import HTTPException
 import httpx
@@ -33,6 +36,7 @@ from orchestrator.services.managed_repository_authority import (
     revoke_and_delete_managed_repository,
 )
 from orchestrator.services.pinned_retirement import PinnedRetirementOperations
+from orchestrator.services.pinned_k8s_effect import PINNED_AUTHORITY_FINALIZER
 from orchestrator.services.session_provisioner import ensure_session_workspace
 from orchestrator.services.session_runtime_admission import thread_runtime_authority
 from orchestrator.services.stateless_workspace_gate import (
@@ -188,6 +192,121 @@ async def thread_turn_in_flight(
         return True
 
 
+async def _exact_stopped_pinned_agent_for_normal_end(
+    thread: Mapping[str, Any], *, dependencies: ThreadRetirementDependencies
+) -> bool:
+    """Admit normal End only for a DB-bound, protected, terminal exact Pod.
+
+    This proves the agent process stopped, not that workspace-local writers
+    stopped. The authorized retirement still needs its usual local-zero receipt.
+    An absent Pod alone never supplies this pre-authorization proof.
+    """
+
+    store = dependencies.store
+
+    async def target(row: Mapping[str, Any]) -> tuple[str, ...] | None:
+        thread_id = str(row.get("id") or "")
+        generation = str(row.get("runtime_generation") or "")
+        agent_id = str(row.get("agent_id") or "")
+        token = str(row.get("runtime_retirement_token") or "")
+        if not thread_id or not generation or not agent_id:
+            return None
+        if not token:
+            binding = await store.get_pinned_session_binding(
+                thread_id, expected_runtime_generation=generation
+            )
+            if (
+                binding is None
+                or binding.agent_id != agent_id
+                or binding.runtime_attach_token
+                != str(row.get("runtime_attach_token") or "")
+            ):
+                return None
+            return (
+                thread_id,
+                generation,
+                "",
+                agent_id,
+                binding.runtime_attach_token,
+                binding.agent_hostname,
+                binding.pod_namespace,
+                binding.pod_uid,
+            )
+
+        context = row.get("runtime_retirement_context") or {}
+        if isinstance(context, str):
+            try:
+                context = json.loads(context)
+            except (TypeError, ValueError):
+                return None
+        if not isinstance(context, Mapping):
+            return None
+        agent = context.get("agent")
+        pod = context.get("agent_pod")
+        if not isinstance(agent, Mapping) or not isinstance(pod, Mapping):
+            return None
+        attach_token = str(context.get("runtime_attach_token") or "")
+        name = str(agent.get("hostname") or "")
+        namespace = str(pod.get("namespace") or "")
+        pod_uid = str(agent.get("pod_uid") or "")
+        if not all((attach_token, name, namespace, pod_uid)) or not (
+            str(context.get("thread_id") or "") == thread_id
+            and str(context.get("generation") or "") == generation
+            and str(context.get("agent_id") or "") == agent_id
+            and str(agent.get("id") or "") == agent_id
+            and str(pod.get("pod_name") or "") == name
+            and str(pod.get("pod_uid") or "") == pod_uid
+            and str(pod.get("protection_protocol") or "") == "finalizer_v1"
+            and (
+                "runtime_attach_token" not in row
+                or str(row.get("runtime_attach_token") or "") == attach_token
+            )
+        ):
+            return None
+        current_agent = await store.get_agent(agent_id)
+        if not current_agent or not (
+            str(current_agent.get("thread_id") or "") == thread_id
+            and str(current_agent.get("hostname") or "") == name
+            and str(current_agent.get("pod_uid") or "") == pod_uid
+        ):
+            return None
+        return (
+            thread_id,
+            generation,
+            token,
+            agent_id,
+            attach_token,
+            name,
+            namespace,
+            pod_uid,
+        )
+
+    try:
+        expected = await target(thread)
+        if expected is None:
+            return False
+        _, _, _, _, _, name, namespace, pod_uid = expected
+        state, pod = await dependencies.agent_provisioner.observe_agent_pod_exact(
+            name, expected_pod_uid=pod_uid, namespace=namespace
+        )
+        if state != "exact_terminal" or pod is None:
+            return False
+        if str(getattr(getattr(pod, "status", None), "phase", "") or "") not in {
+            "Succeeded",
+            "Failed",
+        }:
+            # A Running Pod can briefly have terminated container statuses
+            # before a restart. Only a terminal Pod phase is non-restarting.
+            return False
+        finalizers = getattr(getattr(pod, "metadata", None), "finalizers", None) or []
+        if PINNED_AUTHORITY_FINALIZER not in finalizers:
+            return False
+        current = await store.get_thread(expected[0])
+        return bool(current is not None and await target(current) == expected)
+    except Exception:
+        return False
+
+
 def stateless_retirement_marker(thread: dict[str, Any]) -> dict[str, Any]:
     from shared.session_retirement import stateless_retirement_authority
 
@@ -207,9 +326,10 @@ async def reconcile_stateless_thread_retirement(
     """Converge one already-serialized stateless terminal lifecycle.
 
     Queue closure is the first durable effect. Claimant quiescence, exact
-    remote shell retirement, snapshot/delete, and marker clearance then occur
-    in that order. Every ambiguous boundary leaves the ended thread + closed
-    queue marker intact so End or soft Resume can retry the same token.
+    remote shell retirement and snapshot/delete then occur in that order.
+    The retained-attention variant leaves marker clearance to the full End
+    funnel after its business stand-down. Every ambiguous boundary keeps the
+    ended thread + closed queue marker for the same-token retry.
     """
 
     postgres_db = dependencies.store
@@ -259,6 +379,8 @@ async def reconcile_stateless_thread_retirement(
     # binding/runtime publication, so even a backing-less 404 can follow a
     # crash plus force deletion while the partitioned process still runs.
     workspace_absence_proven = False
+    initial_creation = None
+    retained_startup_attention = None
     preflight_thread = await postgres_db.get_thread(thread_id)
     if preflight_thread is None:
         return {"state": "missing"}
@@ -308,7 +430,49 @@ async def reconcile_stateless_thread_retirement(
                     "workspace reconciliation must publish an exact UID first"
                 ),
             )
-        if creation_pending or restore_pending:
+        if (
+            isinstance(pending_authority, dict)
+            and "initial_creation" in pending_authority
+        ):
+            initial_creation = pending_authority["initial_creation"]
+        elif (
+            isinstance(pending_authority, dict)
+            and "retained_startup_attention" in pending_authority
+        ):
+            retained_startup_attention = pending_authority["retained_startup_attention"]
+        elif creation_pending and not restore_pending:
+            retained_source = (
+                await postgres_db.get_current_retained_startup_attention_source(
+                    thread_id
+                )
+            )
+            capture_retained = getattr(
+                type(container_provisioner),
+                "capture_retained_stateless_startup_attention_retirement",
+                None,
+            )
+            if retained_source is not None and not callable(capture_retained):
+                raise HTTPException(503, "Retained startup capture is unavailable")
+            if retained_source is not None and callable(capture_retained):
+                retained_startup_attention = await capture_retained(
+                    container_provisioner, WorkspaceOwner.session(thread_id)
+                )
+                if retained_startup_attention != retained_source:
+                    raise HTTPException(
+                        503, "Retained startup physical identity changed"
+                    )
+            capture_initial = getattr(
+                type(container_provisioner),
+                "capture_initial_stateless_creation_retirement",
+                None,
+            )
+            if retained_source is None and callable(capture_initial):
+                initial_creation = await capture_initial(
+                    container_provisioner, WorkspaceOwner.session(thread_id)
+                )
+        if (creation_pending or restore_pending) and (
+            initial_creation is None and retained_startup_attention is None
+        ):
             # Cancellation after the one-shot Pod call may leave a published
             # UID but no Ready binding/fingerprint. Terminal retirement cannot
             # infer those fields or mutate the thread to ended first: doing so
@@ -366,6 +530,12 @@ async def reconcile_stateless_thread_retirement(
                     ),
                 )
 
+    if retained_startup_attention is not None and permanent:
+        raise HTTPException(
+            status_code=409,
+            detail="Retained startup attention supports normal soft End only",
+        )
+
     async def _begin_retirement(*, requested_force: bool) -> dict[str, Any]:
         try:
             return await postgres_db.begin_stateless_thread_workspace_retirement(
@@ -373,6 +543,16 @@ async def reconcile_stateless_thread_retirement(
                 force=requested_force,
                 permanent=permanent,
                 workspace_absence_proven=workspace_absence_proven,
+                **(
+                    {"initial_creation": initial_creation}
+                    if initial_creation is not None
+                    else {}
+                ),
+                **(
+                    {"retained_startup_attention": retained_startup_attention}
+                    if retained_startup_attention is not None
+                    else {}
+                ),
             )
         except RuntimeError as exc:
             raise HTTPException(
@@ -407,7 +587,11 @@ async def reconcile_stateless_thread_retirement(
         if permanent:
             backing_id = closure.get("backing_id")
             runtime_incarnation = closure.get("runtime_incarnation")
-            if isinstance(backing_id, str) and backing_id.startswith("k8s-"):
+            if (
+                isinstance(backing_id, str)
+                and backing_id.startswith("k8s-")
+                or "initial_creation" in closure
+            ):
                 # Soft End already proved process zero and removed the exact
                 # Pod. Permanent upgrade creates a new terminal-reclaim
                 # generation: preserve authority cannot authorize PVC deletion.
@@ -466,7 +650,111 @@ async def reconcile_stateless_thread_retirement(
             detail="A different stateless retirement intent is still pending",
         )
 
-    terminal_token = int(closure.get("terminal_token") or 0)
+    raw_terminal_token = closure.get("terminal_token")
+    if raw_terminal_token is None:
+        raw_terminal_token = 0
+    if type(raw_terminal_token) is not int or raw_terminal_token < 0:
+        raise HTTPException(503, "Stateless retirement token is malformed")
+    terminal_token = raw_terminal_token
+    if retained_startup_attention is not None:
+        retained = (
+            await postgres_db.get_stateless_retained_startup_attention_retirement(
+                thread_id
+            )
+        )
+        if retained != retained_startup_attention or not closure.get(
+            "claimant_quiesced"
+        ):
+            raise HTTPException(503, "Retained startup retirement authority changed")
+        if not await postgres_db.get_stateless_retained_startup_attention_retirement(
+            thread_id, require_settled=True
+        ):
+            cancelled = (
+                await container_provisioner.request_workspace_creation_cancellation(
+                    WorkspaceOwner.session(thread_id),
+                    target_disposition="deleted",
+                    reclaim_shared_resources=False,
+                )
+            )
+            if not isinstance(cancelled, dict) or cancelled.get(
+                "reconciliation_outcome"
+            ) not in {"handed_off", "aborted"}:
+                raise HTTPException(
+                    503, "Retained startup cancellation remains incomplete"
+                )
+        cleanup = await container_provisioner.reconcile_workspace_cleanup_intent(
+            WorkspaceOwner.session(thread_id),
+            expected_runtime_incarnation=retained["runtime_incarnation"],
+        )
+        if not isinstance(cleanup, WorkspaceCleanupOutcome) or not cleanup.settled:
+            raise HTTPException(503, "Retained startup cleanup remains incomplete")
+        owner = WorkspaceOwner.session(thread_id)
+        async with container_provisioner._workspace_mutation_guard(
+            owner, scope="workspace_container"
+        ) as owned:
+            if (
+                not owned
+                or not await container_provisioner.retained_startup_attention_stop_is_exact(
+                    owner, retained, _mutation_guard_held=True
+                )
+            ):
+                raise HTTPException(503, "Retained startup storage or stop changed")
+            if not await postgres_db.acknowledge_stateless_thread_runtime_process_zero(
+                thread_id,
+                terminal_token=terminal_token,
+                runtime_incarnation=retained["runtime_incarnation"],
+            ):
+                raise HTTPException(
+                    503, "Retained startup stop proof remains incomplete"
+                )
+            if not await container_provisioner.retained_startup_attention_stop_is_exact(
+                owner, retained, _mutation_guard_held=True
+            ):
+                raise HTTPException(
+                    503, "Retained startup storage changed before settlement"
+                )
+        return {
+            "state": "retained_business_pending",
+            "thread": await postgres_db.get_thread(thread_id),
+            "closure": closure,
+            "retained_startup_attention": retained,
+        }
+    if initial_creation is not None:
+        # No Ready binding ever existed. The captured initial creation may skip
+        # SSH and snapshots, but shell/resident ACKs still require actual stop.
+        initial = await postgres_db.get_stateless_initial_creation_retirement(thread_id)
+        if initial != initial_creation or not closure.get("claimant_quiesced"):
+            raise HTTPException(503, "Initial workspace retirement authority changed")
+        cleanup = await container_provisioner.reconcile_workspace_cleanup_intent(
+            WorkspaceOwner.session(thread_id),
+            expected_runtime_incarnation=initial["runtime_incarnation"],
+        )
+        if not isinstance(cleanup, WorkspaceCleanupOutcome) or not cleanup.settled:
+            raise HTTPException(503, "Initial workspace cleanup remains incomplete")
+        if not await postgres_db.get_stateless_initial_creation_retirement(
+            thread_id,
+            require_settled=True,
+        ) or not await postgres_db.acknowledge_stateless_thread_runtime_process_zero(
+            thread_id,
+            terminal_token=terminal_token,
+            runtime_incarnation=initial["runtime_incarnation"],
+        ):
+            raise HTTPException(503, "Initial workspace stop proof remains incomplete")
+        if (
+            not permanent
+            and not await postgres_db.finish_stateless_thread_workspace_retirement(
+                thread_id
+            )
+        ):
+            raise HTTPException(
+                503, "Initial workspace retirement settlement remains incomplete"
+            )
+        return {
+            "state": "settled",
+            "thread": await postgres_db.get_thread(thread_id),
+            "closure": closure,
+        }
+
     deadline = time.monotonic() + float(
         os.environ.get("STATELESS_TERMINAL_CLAIM_ACK_TIMEOUT_S", "25")
     )
@@ -631,6 +919,18 @@ async def reconcile_stateless_thread_retirement(
                     status_code=503,
                     detail="Workspace resident retirement acknowledgement was ambiguous",
                 )
+        elif runtime_authority == "exact_absent" and (
+            await postgres_db.acknowledge_stateless_thread_runtime_process_zero(
+                thread_id,
+                terminal_token=terminal_token,
+                runtime_incarnation=str(runtime_incarnation),
+            )
+        ):
+            # The Pod left before these proofs, but only after its finalizer
+            # release durably recorded the exact UID's container termination.
+            # That receipt, required inside the acknowledging UPDATE, is the
+            # evidence exact_terminal shows; bare absence still refuses below.
+            pass
         else:
             raise HTTPException(
                 status_code=503,
@@ -719,6 +1019,15 @@ async def reconcile_stateless_thread_retirement(
                 thread_id,
                 terminal_token=terminal_token,
                 runtime_incarnation=str(runtime_incarnation),
+            )
+        elif runtime_authority == "exact_absent":
+            # Same exact-receipt rule as the resident stage above.
+            acknowledged = (
+                await postgres_db.acknowledge_stateless_thread_runtime_process_zero(
+                    thread_id,
+                    terminal_token=terminal_token,
+                    runtime_incarnation=str(runtime_incarnation),
+                )
             )
         else:
             acknowledged = False
@@ -909,13 +1218,57 @@ async def reconcile_stateless_thread_retirement(
                 if marker.get("host_key_fingerprint")
                 else None
             )
+            terminal_snapshot_generation = None
+            terminal_snapshot_created_at = None
+            if requires_snapshot and not snapshot_already_captured:
+                ended_at = current.get("ended_at")
+                workspace_generation = release_authority.get("workspace_generation")
+                namespace = workspace.get("namespace")
+                try:
+                    thread_uuid = UUID(thread_id)
+                    runtime_uuid = UUID(expected_runtime)
+                    generation_uuid = UUID(workspace_generation)
+                except (TypeError, ValueError, AttributeError) as exc:
+                    raise HTTPException(
+                        status_code=503,
+                        detail="Required snapshot identity is malformed",
+                    ) from exc
+                if (
+                    str(thread_uuid) != thread_id
+                    or str(runtime_uuid) != expected_runtime
+                    or str(generation_uuid) != workspace_generation
+                    or type(closure.get("terminal_token")) is not int
+                    or terminal_token <= 0
+                    or current.get("status") != "ended"
+                    or not isinstance(ended_at, datetime)
+                    or ended_at.tzinfo is None
+                    or ended_at.utcoffset() is None
+                    or not expected_fingerprint
+                    or not expected_fingerprint.startswith("SHA256:")
+                    or len(expected_fingerprint) > 128
+                    or any(char.isspace() for char in expected_fingerprint)
+                    or not isinstance(namespace, str)
+                    or not namespace
+                    or ":" in namespace
+                    or backing_id != f"k8s-pod:{namespace}:{expected_runtime}"
+                ):
+                    raise HTTPException(
+                        status_code=503,
+                        detail="Required snapshot identity is malformed",
+                    )
+                terminal_snapshot_generation = str(
+                    uuid5(
+                        thread_uuid,
+                        "srw:session-end-terminal-snapshot:v1:"
+                        f"{terminal_token}:{expected_runtime}",
+                    )
+                )
+                terminal_snapshot_created_at = ended_at.isoformat()
 
-            # Begin may have pre-admitted the terminal cleanup generation in
-            # the same transaction that closed the queue and projected
-            # retiring_process_zero. Claim that exact generation and capture
-            # its Pod/PVC/Service UIDs before release_workspace reads it.
-            # Passing an admitted-but-uncaptured intent directly to the lower
-            # deletion boundary correctly fails closed without issuing DELETE.
+            # Capture the exact physical identity before the archive. For a
+            # required emptyDir snapshot, release_workspace claims the cleanup
+            # intent only after the durable capture ACK; PVC and already-proven
+            # paths keep their existing early intent capture.
             try:
                 teardown_identity = (
                     await container_provisioner.capture_terminal_workspace_identity(
@@ -936,30 +1289,36 @@ async def reconcile_stateless_thread_retirement(
                     status_code=503,
                     detail="Live workspace teardown identity changed",
                 )
-            cleanup_intent = (
-                await container_provisioner.prepare_workspace_cleanup_intent(
-                    WorkspaceOwner.session(thread_id),
-                    expected_runtime_incarnation=expected_runtime,
-                    target_disposition="deleted",
-                    reclaim_shared_resources=permanent,
-                    identity=teardown_identity,
+            if not (requires_snapshot and not snapshot_already_captured):
+                cleanup_intent = (
+                    await container_provisioner.prepare_workspace_cleanup_intent(
+                        WorkspaceOwner.session(thread_id),
+                        expected_runtime_incarnation=expected_runtime,
+                        target_disposition="deleted",
+                        reclaim_shared_resources=permanent,
+                        identity=teardown_identity,
+                    )
                 )
-            )
-            if (
-                not isinstance(cleanup_intent, dict)
-                or cleanup_intent.get("resources_captured_at") is None
-                or bool(cleanup_intent.get("reclaim_shared_resources")) is not permanent
-            ):
-                raise HTTPException(
-                    status_code=503,
-                    detail="Live workspace cleanup authority is incomplete",
-                )
+                if (
+                    not isinstance(cleanup_intent, dict)
+                    or cleanup_intent.get("resources_captured_at") is None
+                    or bool(cleanup_intent.get("reclaim_shared_resources"))
+                    is not permanent
+                ):
+                    raise HTTPException(
+                        status_code=503,
+                        detail="Live workspace cleanup authority is incomplete",
+                    )
 
             async def _snapshot_ack() -> bool:
                 return (
                     await postgres_db.mark_stateless_thread_snapshot_restore_required(
                         thread_id,
                         terminal_token=terminal_token,
+                        expected_runtime_incarnation=expected_runtime,
+                        expected_host_key_fingerprint=expected_fingerprint,
+                        expected_workspace_generation=workspace_generation,
+                        expected_backing_id=backing_id,
                     )
                 )
 
@@ -982,6 +1341,8 @@ async def reconcile_stateless_thread_retirement(
                             requires_snapshot and not snapshot_already_captured
                         ),
                         strict_terminal_snapshot=True,
+                        terminal_snapshot_generation=terminal_snapshot_generation,
+                        terminal_snapshot_created_at=terminal_snapshot_created_at,
                         strict=True,
                         teardown_identity=teardown_identity,
                     ),
@@ -1027,6 +1388,23 @@ async def reconcile_stateless_thread_retirement(
     return {"state": "settled", "thread": current, "closure": closure}
 
 
+SESSION_END_WORKSPACE_HANDOFF_TIMEOUT_S = 30.0
+
+
+@asynccontextmanager
+async def _end_workspace_ownership(store, thread_id: str, *, lane: str, held: bool):
+    if held:
+        yield True
+    elif lane == "pinned":
+        async with store.try_thread_advisory_lock(thread_id) as owned:
+            yield owned
+    else:
+        async with store.stateless_session_workspace_ensure_lock(
+            thread_id, wait=True
+        ) as owned:
+            yield owned
+
+
 async def end_thread_flow(
     thread_id: str,
     thread: dict[str, Any],
@@ -1037,13 +1415,154 @@ async def end_thread_flow(
     officer_post_required: bool = False,
     include_officer_handoff: bool = False,
     expected_runtime_generation: str | None = None,
+    expected_stateless_retirement_token: int | None = None,
+    expected_stateless_retirement_runtime: str | None = None,
     expected_agent_id: str | None = None,
     expected_attach_token: str | None = None,
     require_expected_agent_offline: bool = False,
+    retirement_cause: Literal["runtime_lost"] | None = None,
     settle_status: Literal["ended", "suspended"] = "ended",
     local_runtime_quiesced: bool = False,
     retiring_agent_response_pending: bool = False,
+    require_physical_agent_stop: bool = False,
     dependencies: ThreadRetirementDependencies,
+) -> dict[str, Any]:
+    """Join an active Session creator before admitting a fresh physical End."""
+    options = dict(
+        permanent=permanent,
+        force=force,
+        officer_retire_reason=officer_retire_reason,
+        officer_post_required=officer_post_required,
+        include_officer_handoff=include_officer_handoff,
+        expected_runtime_generation=expected_runtime_generation,
+        expected_stateless_retirement_token=expected_stateless_retirement_token,
+        expected_stateless_retirement_runtime=expected_stateless_retirement_runtime,
+        expected_agent_id=expected_agent_id,
+        expected_attach_token=expected_attach_token,
+        require_expected_agent_offline=require_expected_agent_offline,
+        retirement_cause=retirement_cause,
+        settle_status=settle_status,
+        local_runtime_quiesced=local_runtime_quiesced,
+        retiring_agent_response_pending=retiring_agent_response_pending,
+        require_physical_agent_stop=require_physical_agent_stop,
+        dependencies=dependencies,
+    )
+    store = dependencies.store
+    lane = thread.get("execution_lane")
+    workspace = thread_metadata_object(thread).get("workspace_container")
+    physical_workspace = (
+        isinstance(workspace, Mapping) and workspace.get("provisioner") == "k8s"
+    )
+    signal = getattr(type(store), "session_workspace_observation_yield_request", None)
+    already_authorized = (
+        lane == "pinned"
+        and thread.get("runtime_retirement_token") is not None
+        and thread.get("runtime_retirement_authorized_at") is not None
+    )
+    if (
+        not callable(signal)
+        or lane not in {"pinned", "stateless"}
+        or (
+            declared_thread_workspace_backend(thread) != "sandbox"
+            and not physical_workspace
+        )
+        or already_authorized
+    ):
+        return await _end_thread_flow_owned(thread_id, thread, **options)
+    try:
+        generation = str(UUID(str(thread.get("runtime_generation") or "")))
+    except ValueError as exc:
+        raise HTTPException(409, "Thread runtime generation unavailable") from exc
+    if (
+        expected_runtime_generation is not None
+        and generation != expected_runtime_generation
+    ):
+        raise HTTPException(409, "Thread runtime generation changed")
+
+    captured_actor = (thread.get("agent_id"), thread.get("runtime_attach_token"))
+    deadline = (
+        asyncio.get_running_loop().time() + SESSION_END_WORKSPACE_HANDOFF_TIMEOUT_S
+    )
+    admission_started = False
+    try:
+        async with AsyncExitStack() as ownership:
+            async with signal(
+                store,
+                thread_id,
+                runtime_generation=generation,
+                wait_timeout_s=SESSION_END_WORKSPACE_HANDOFF_TIMEOUT_S,
+            ):
+                remaining = max(0.0, deadline - asyncio.get_running_loop().time())
+                lock = (
+                    store.thread_advisory_lock(thread_id, wait_timeout_s=remaining)
+                    if lane == "pinned"
+                    else store.stateless_session_workspace_ensure_lock(
+                        thread_id, wait=True, wait_timeout_s=remaining
+                    )
+                )
+                # Include the existing lock helper's connection/command wait
+                # in this request's deadline, not just its contention polling.
+                async with asyncio.timeout(remaining):
+                    if not await ownership.enter_async_context(lock):
+                        raise TimeoutError("workspace lifecycle ownership unavailable")
+            # The creator has joined its writes/probes and yielded every
+            # borrowed lock. Drop the scheduling signal before End's own
+            # guarded continuation; only the real lock authorizes Begin.
+            fresh = await store.get_thread(thread_id)
+            if fresh is None:
+                return {"status": "deleted"}
+            if (
+                str(fresh.get("runtime_generation") or "") != generation
+                or fresh.get("execution_lane") != lane
+                or (
+                    fresh.get("status") != "ended"
+                    and (fresh.get("agent_id"), fresh.get("runtime_attach_token"))
+                    != captured_actor
+                )
+            ):
+                raise HTTPException(
+                    409, "Thread runtime identity changed while waiting for End"
+                )
+            admission_started = True
+            return await _end_thread_flow_owned(
+                thread_id, fresh, _workspace_lock_held=True, **options
+            )
+    except TimeoutError as exc:
+        if admission_started:
+            # A cleanup timeout after durable Begin is not a rejected End.
+            raise
+        raise HTTPException(
+            503,
+            detail={
+                "code": "session_workspace_lifecycle_busy",
+                "message": "Workspace work is still owned; End was not accepted. Retry End.",
+            },
+            headers={"Retry-After": "1"},
+        ) from exc
+
+
+async def _end_thread_flow_owned(
+    thread_id: str,
+    thread: dict[str, Any],
+    *,
+    permanent: bool,
+    force: bool,
+    officer_retire_reason: str = "retired",
+    officer_post_required: bool = False,
+    include_officer_handoff: bool = False,
+    expected_runtime_generation: str | None = None,
+    expected_stateless_retirement_token: int | None = None,
+    expected_stateless_retirement_runtime: str | None = None,
+    expected_agent_id: str | None = None,
+    expected_attach_token: str | None = None,
+    require_expected_agent_offline: bool = False,
+    retirement_cause: Literal["runtime_lost"] | None = None,
+    settle_status: Literal["ended", "suspended"] = "ended",
+    local_runtime_quiesced: bool = False,
+    retiring_agent_response_pending: bool = False,
+    require_physical_agent_stop: bool = False,
+    dependencies: ThreadRetirementDependencies,
+    _workspace_lock_held: bool = False,
 ) -> dict[str, Any]:
     """The End funnel body — everything ``end_thread`` does after auth.
 
@@ -1092,6 +1611,9 @@ async def end_thread_flow(
     _revoke_never_delivered_protected_reader = (
         pinned.revoke_never_delivered_protected_reader
     )
+    _fence_never_published_protected_workspace = (
+        pinned.fence_never_published_protected_workspace
+    )
     _reconcile_stateless_thread_retirement = partial(
         reconcile_stateless_thread_retirement, dependencies=dependencies
     )
@@ -1116,11 +1638,33 @@ async def end_thread_flow(
 
     if permanent and settle_status != "ended":
         raise ValueError("permanent retirement cannot settle suspended")
+    if require_physical_agent_stop and (
+        permanent or settle_status != "suspended" or retiring_agent_response_pending
+    ):
+        raise ValueError("idle physical stop requires an orchestrator soft retirement")
     if retiring_agent_response_pending and not local_runtime_quiesced:
         raise ValueError("retiring agent response requires local quiescence")
     stateless = thread.get("execution_lane") == "stateless"
     initial_status = thread.get("status")
     initial_stateless_authority: dict[str, Any] | None = None
+
+    if not stateless and permanent:
+        terminal_join = await postgres_db.reserve_pinned_thread_idle_terminal_end(
+            thread_id,
+        )
+        if terminal_join == "waiting_for_release":
+            return {
+                "status": "ending",
+                "retirement_disposition": "ended",
+                "retirement_permanent": True,
+            }
+        if terminal_join in {"wake_won", "held"}:
+            raise HTTPException(
+                status_code=409,
+                detail={"code": "pinned_idle_terminal_join_held"},
+            )
+        if terminal_join == "missing":
+            return {"status": "deleted"}
 
     async def _stand_down(
         authoritative_thread: dict[str, Any],
@@ -1230,6 +1774,9 @@ async def end_thread_flow(
                 and thread.get("runtime_retirement_authorized_at") is not None
             )
             and await _thread_turn_in_flight(thread)
+            and not await _exact_stopped_pinned_agent_for_normal_end(
+                thread, dependencies=dependencies
+            )
         ):
             # Fast observational no-op for the common non-force refusal.  The
             # locked post-Begin probe below still catches a turn admitted in
@@ -1290,6 +1837,11 @@ async def end_thread_flow(
                 "expected_attach_token": expected_attach_token,
                 "require_agent_offline": require_expected_agent_offline,
             }
+        # Only an orchestrator that lost the runtime names a cause. It is
+        # written once into the immutable context; a person's End writes none
+        # and a later End reusing a pending token inherits the first Begin's.
+        if retirement_cause is not None:
+            begin_identity["cause"] = retirement_cause
         retirement = await _begin_pinned_thread_retirement(
             thread_id,
             permanent=permanent,
@@ -1307,8 +1859,34 @@ async def end_thread_flow(
                 detail={
                     "code": "pinned_retirement_conflict",
                     "reason": retirement.get("reason") or state,
+                    **(
+                        {
+                            "message": "Close active IDE or SSH access, then retry ending this session"
+                        }
+                        if retirement.get("reason") == "active_workspace_access"
+                        else {}
+                    ),
                 },
             )
+        # Idle admission installs this row atomically with the same pinned
+        # retirement token. A watchdog, owner retry or another replica must
+        # recover the physical-Pod-stop requirement from durable authority,
+        # never from the initiating caller's in-memory option.
+        idle_stop = await postgres_db.fetchrow(
+            "SELECT id FROM vm_idle_operations WHERE owner_kind='thread' "
+            "AND owner_id=$1::uuid AND release_kind='pinned_thread' "
+            "AND thread_runtime_generation=$2::uuid "
+            "AND thread_retirement_token=$3::uuid AND closed_at IS NULL",
+            thread_id,
+            retirement["generation"],
+            retirement["token"],
+        )
+        if require_physical_agent_stop and idle_stop is None:
+            raise HTTPException(
+                status_code=409,
+                detail={"code": "pinned_idle_retirement_source_changed"},
+            )
+        require_physical_agent_stop = idle_stop is not None
         already_authorized = retirement.get("authorized_at") is not None
 
         async def _abort_hidden_preflight() -> str:
@@ -1388,9 +1966,11 @@ async def end_thread_flow(
                 )
 
         # The protected-engage producer and every pinned workspace ensure use
-        # this same cross-replica lock. Admission was closed *before* waiting,
-        # so old work can finish/roll back but no replacement may start.
-        async with postgres_db.try_thread_advisory_lock(thread_id) as lock_owner:
+        # this same cross-replica lock. Fresh physical End already owns it;
+        # an admitted retry must still obtain it before further cleanup.
+        async with _end_workspace_ownership(
+            postgres_db, thread_id, lane="pinned", held=_workspace_lock_held
+        ) as lock_owner:
             if not lock_owner:
                 if already_authorized:
                     return _ending_response(retry_after_ms=250)
@@ -1432,6 +2012,9 @@ async def end_thread_flow(
                 not already_authorized
                 and not force
                 and await _thread_turn_in_flight(probe_thread)
+                and not await _exact_stopped_pinned_agent_for_normal_end(
+                    probe_thread, dependencies=dependencies
+                )
             ):
                 abort_outcome = await _abort_hidden_preflight()
                 if abort_outcome == "authorized":
@@ -1668,6 +2251,13 @@ async def end_thread_flow(
                     "retirement_permanent": bool(permanent),
                 }
 
+            if require_physical_agent_stop and local_runtime_quiesced:
+                # The reporting agent's own HTTP response cannot wait for
+                # exact deletion of its Pod. Its durable local-zero ACK is
+                # now visible; the independent idle reconciler stops the
+                # captured Pod and continues this same token after response.
+                return _ending_response(retry_after_ms=250)
+
             try:
                 staged_event: dict[str, Any] | None = None
                 authoritative_metadata = thread_metadata_object(authoritative_thread)
@@ -1738,6 +2328,16 @@ async def end_thread_flow(
                                 # captured attempt before publishing the distinct
                                 # zero-stage receipt.  This deliberately does not
                                 # run the rest of cleanup before mandatory staging.
+                                # A workspace create that never published can
+                                # never stage; exact-stop its Pod (and reader
+                                # sidecar) first so the receipt can prove it.
+                                if await _fence_never_published_protected_workspace(
+                                    retirement
+                                ):
+                                    authoritative_thread = (
+                                        await postgres_db.get_thread(thread_id)
+                                        or authoritative_thread
+                                    )
                                 await _revoke_never_delivered_protected_reader(
                                     retirement,
                                     authoritative_thread,
@@ -1810,17 +2410,27 @@ async def end_thread_flow(
                     if isinstance(context, Mapping)
                     else None
                 )
+                # The retiring agent's own permanent ACK cannot wait for its
+                # Pod to be stopped. Any finalizer-protected Pod (claim-bearing,
+                # claim-less or warm) is handed to the durable retry, which
+                # stops it exactly once the caller exited; deleting the thread
+                # now would leave that Pod Terminating with no owner.
                 agent_workspace_exit_handoff = bool(
                     permanent
                     and retiring_agent_response_pending
                     and runtime_exposed
                     and local_quiescence
-                    and raw_agent_workspace_claim not in (None, {})
+                    and (
+                        raw_agent_workspace_claim not in (None, {})
+                        or pinned.captured_protected_agent_pod(retirement)
+                    )
                 )
                 await _cleanup_pinned_thread_retirement(
                     retirement,
+                    stop_agent_before_workspace=require_physical_agent_stop,
                     cleanup_agent_pod=(
-                        not runtime_exposed
+                        require_physical_agent_stop
+                        or not runtime_exposed
                         or (
                             permanent
                             and not retiring_agent_response_pending
@@ -1893,8 +2503,8 @@ async def end_thread_flow(
     if initial_stateless_authority is None:
         raise HTTPException(status_code=409, detail="Thread lifecycle changed")
     try:
-        async with postgres_db.stateless_session_workspace_ensure_lock(
-            thread_id, wait=True
+        async with _end_workspace_ownership(
+            postgres_db, thread_id, lane="stateless", held=_workspace_lock_held
         ) as cleanup_owner:
             if not cleanup_owner:
                 raise HTTPException(
@@ -1917,6 +2527,62 @@ async def end_thread_flow(
                     ),
                 )
             fresh_metadata = thread_metadata_object(fresh_thread)
+            if expected_stateless_retirement_token is not None:
+                try:
+                    from shared.session_retirement import (
+                        stateless_retirement_authority,
+                        stateless_retirement_release_authorized,
+                        stateless_settled_retirement_authority,
+                    )
+
+                    expected_marker = stateless_retirement_authority(
+                        fresh_metadata
+                    ) or stateless_settled_retirement_authority(fresh_metadata)
+                    if (
+                        expected_stateless_retirement_runtime is not None
+                        and "_stateless_workspace_retirement_pending" in fresh_metadata
+                        and "retained_startup_attention" not in expected_marker
+                    ):
+                        expected_marker = stateless_retirement_release_authorized(
+                            fresh_metadata
+                        )
+                except RuntimeError as exc:
+                    raise HTTPException(
+                        409, "Stateless retirement authority changed"
+                    ) from exc
+                if (
+                    expected_marker is None
+                    or str(fresh_thread.get("runtime_generation"))
+                    != expected_runtime_generation
+                    or type(expected_stateless_retirement_token) is not int
+                    or expected_marker["terminal_token"]
+                    != expected_stateless_retirement_token
+                    or expected_marker["permanent"] is not permanent
+                    or (
+                        expected_stateless_retirement_runtime is None
+                        and "initial_creation" not in expected_marker
+                    )
+                    or (
+                        expected_stateless_retirement_runtime is not None
+                        and (
+                            "initial_creation" in expected_marker
+                            or expected_marker.get("runtime_incarnation")
+                            != expected_stateless_retirement_runtime
+                            or fresh_thread.get("status") != "ended"
+                            or fresh_authority.get("unit_kind") != "session_turn"
+                            or fresh_authority.get("queue_state") != "done"
+                            or fresh_authority.get("leased_by") is not None
+                            or fresh_authority.get("lease_token")
+                            != expected_stateless_retirement_token
+                        )
+                    )
+                ):
+                    raise HTTPException(409, "Stateless retirement authority changed")
+            elif expected_runtime_generation is not None and (
+                str(fresh_thread.get("runtime_generation"))
+                != expected_runtime_generation
+            ):
+                raise HTTPException(409, "Thread runtime generation changed")
             marker_pending = bool(
                 "_stateless_workspace_retirement_pending" in fresh_metadata
             )
@@ -1943,7 +2609,37 @@ async def end_thread_flow(
 
             # These side effects are serialized after the fresh-state check;
             # a stale End can no longer mutate a thread that End->Resume reopened.
-            await _stand_down(fresh_thread)
+            stand_down = await _stand_down(fresh_thread)
+            retained = result.get("retained_startup_attention")
+            if retained is not None:
+                if isinstance(stand_down, dict) and stand_down.get(
+                    "blocked_by_in_flight"
+                ):
+                    raise HTTPException(
+                        status_code=503,
+                        detail="Retained startup business stand-down remains incomplete",
+                    )
+                owner = WorkspaceOwner.session(thread_id)
+                async with container_provisioner._workspace_mutation_guard(
+                    owner, scope="workspace_container"
+                ) as owned:
+                    if (
+                        not owned
+                        or not await container_provisioner.retained_startup_attention_stop_is_exact(
+                            owner, retained, _mutation_guard_held=True
+                        )
+                        or not await postgres_db.finish_stateless_thread_workspace_retirement(
+                            thread_id,
+                            expected_retained_startup_attention=retained,
+                            expected_terminal_token=int(
+                                result["closure"]["terminal_token"]
+                            ),
+                        )
+                    ):
+                        raise HTTPException(
+                            status_code=503,
+                            detail="Retained startup settlement remains incomplete",
+                        )
             if permanent:
                 closure = result.get("closure") or {}
                 terminal_thread = result.get("thread") or fresh_thread
@@ -2044,11 +2740,13 @@ async def archive_and_cleanup_workspace(
     reclaim_volume: bool = True,
     dependencies: ThreadRetirementDependencies,
 ) -> list[str]:
-    """Snapshot workspace to S3, then delete container/VM.
+    """Retire workspace compute under its admitted storage policy.
 
-    Centralized cleanup for all workspace teardown paths (job completion,
-    cancellation, cascade cleanup, thread end). Each provisioner's release
-    method handles snapshot-before-delete internally.
+    Centralized cleanup for job completion, cancellation, cascade cleanup and
+    thread end. Provisioners handle snapshot-before-delete where required.
+    Typed never-Ready VM Cancel retention skips snapshot capture, keeps the
+    exact rootdisk and releases compute; permanent Delete needs separate
+    durable purge authority.
 
     Args:
         entity_id: Job or thread UUID.
@@ -2060,8 +2758,8 @@ async def archive_and_cleanup_workspace(
             that status, and the agent's idle-archive sets it automatically
             after 30 idle minutes), so tearing its volume down would silently
             destroy a workspace the user can still reopen. Only a genuine
-            permanent delete passes True. Jobs keep the default: reclaiming a
-            job's PVC on a terminal state is correct and unchanged.
+            permanent delete passes True. Job storage policy is selected from
+            its cleanup authority, including typed VM Cancel retention.
 
     Returns:
         List of action descriptions for logging.
@@ -2188,23 +2886,161 @@ async def archive_and_cleanup_workspace(
             return actions
         ws_ctx = _get_container_context(job)
         vm_ctx = _get_vm_context(job)
+        terminal_marker = (
+            raw_context.get("_job_terminal_vm_cleanup")
+            if isinstance(raw_context, dict)
+            else None
+        )
+        pinned_ready_cancel = bool(
+            job.get("status") == "cancelled"
+            and job.get("execution_lane") == "pinned"
+            and isinstance(terminal_marker, dict)
+            and terminal_marker.get("retention_policy") == 4
+        )
+        if pinned_ready_cancel and (
+            not isinstance(vm_ctx, dict) or vm_ctx.get("workspace_storage") is not None
+        ):
+            raise RuntimeError("pinned Ready Cancel retention identity remains held")
+
+        never_issued_terminal = False
+        if (
+            job.get("status") == "cancelled"
+            and isinstance(raw_context, dict)
+            and raw_context.get("_vm_job_retained_resume") is not None
+        ):
+            from orchestrator.services.vm_job_retained_resume import (
+                settle_retained_no_compute,
+            )
+
+            absent = await settle_retained_no_compute(postgres_db, entity_id)
+            if absent is False:
+                raise RuntimeError("retained VM Resume terminal remains held")
+            if absent is True:
+                never_issued_terminal = True
+                actions.append("retained vm Resume source absent")
+        if (
+            not never_issued_terminal
+            and job.get("status") == "cancelled"
+            and job.get("execution_lane") == "stateless"
+            and isinstance(raw_context, dict)
+            and raw_context.get("_stateless_cancel_cleanup_pending") is True
+            and isinstance(vm_ctx, dict)
+            and vm_ctx.get("status") == "waiting_creation_configuration"
+            and vm_ctx.get("preparation_request") is None
+            and vm_ctx.get("vm_uid") is None
+            and vm_ctx.get("rootdisk_pvc_uid") is None
+        ):
+            # No controller probe can prove this pre-configuration negative.
+            # The store commits the exact source and parent under the normal
+            # recovery locks; any ambiguity leaves the Cancel marker intact.
+            await recovery_store.settle_never_issued_job_terminal(
+                entity_id,
+                provision_generation=vm_ctx.get("provision_generation"),
+            )
+            never_issued_terminal = True
+            actions.append("never-issued vm generation settled")
+
+        # A controller may have stopped the VM and marked its context deleting
+        # before the parent admission/compute charge committed. Replay that
+        # same exact terminal admission until authenticated absence settles it.
+        pending_terminal_vm_cleanup = False
+        if vm_ctx and not never_issued_terminal and not _vm_needs_release(vm_ctx):
+            async with postgres_db.acquire() as conn:
+                pending_terminal_vm_cleanup = bool(
+                    await conn.fetchval(
+                        "SELECT EXISTS(SELECT 1 FROM vm_workspace_cleanup_admissions "
+                        "WHERE owner_kind='job' AND owner_id=$1::uuid "
+                        "AND source='job_terminal_vm_release' "
+                        "AND pvc_uid::text IS NOT DISTINCT FROM $2::text "
+                        "AND completed_at IS NULL)",
+                        entity_id,
+                        vm_ctx.get("rootdisk_pvc_uid"),
+                    )
+                )
 
         # VM cleanup (snapshot + delete)
-        if _vm_needs_release(vm_ctx):
+        if not never_issued_terminal and (
+            _vm_needs_release(vm_ctx) or pending_terminal_vm_cleanup
+        ):
             if vm_provisioner.lifecycle_available:
                 teardown_identity = await vm_provisioner.capture_vm_teardown_identity(
                     entity_id
                 )
-                cleanup = await acquire_vm_cleanup_permit(
-                    recovery_store,
-                    owner_kind="job",
-                    owner_id=entity_id,
-                    identity=teardown_identity,
-                    source="job_terminal_vm_release",
-                    purge_disk=True,
+                retaining = None
+                if pinned_ready_cancel or (
+                    (
+                        job.get("status") == "cancelled"
+                        or raw_context.get("_vm_job_retained_resume") is not None
+                    )
+                    and job.get("execution_lane") == "stateless"
+                    and not job.get("parent_job_id")
+                    and vm_ctx.get("workspace_storage") is None
+                ):
+                    from orchestrator.services.vm_job_retained_resume import (
+                        acquire_retained_terminal_cleanup,
+                    )
+
+                    retaining = await acquire_retained_terminal_cleanup(
+                        recovery_store,
+                        vm_provisioner,
+                        job_id=entity_id,
+                        identity=teardown_identity,
+                    )
+                    if retaining is not None and not retaining.allowed:
+                        raise RuntimeError("job VM cancel retention remains held")
+                    if pinned_ready_cancel and retaining is None:
+                        raise RuntimeError("pinned Ready Cancel retention remains held")
+                purge_disk = True
+                if retaining is not None:
+                    purge_disk = False
+                elif vm_ctx.get("workspace_storage") is not None:
+                    # The context is a hint; only the durable reservation can
+                    # authorize keeping this rootdisk after terminal compute.
+                    if await vm_provisioner._storage_context(entity_id) is None:
+                        raise RuntimeError(
+                            "VM retained storage authority is unavailable"
+                        )
+                    purge_disk = False
+                from orchestrator.services.vm_idle_lifecycle import (
+                    retained_terminal_rootdisk,
                 )
+
+                if await retained_terminal_rootdisk(
+                    postgres_db,
+                    job_id=entity_id,
+                    generation=teardown_identity.provision_generation,
+                    pvc_uid=teardown_identity.rootdisk_pvc_uid,
+                ):
+                    raise RuntimeError(
+                        "terminal VM rootdisk belongs to idle review release"
+                    )
+                cleanup = retaining
+                if cleanup is None:
+                    cleanup = await acquire_vm_cleanup_permit(
+                        recovery_store,
+                        owner_kind="job",
+                        owner_id=entity_id,
+                        identity=teardown_identity,
+                        source="job_terminal_vm_release",
+                        purge_disk=purge_disk,
+                    )
                 if not cleanup.allowed:
                     raise RuntimeError("job VM cleanup held for workspace recovery")
+                marker = (
+                    raw_context.get("_job_terminal_vm_cleanup")
+                    if isinstance(raw_context, dict)
+                    else None
+                )
+                if (
+                    marker is not None
+                    and not await postgres_db.bind_terminal_vm_cleanup_admission(
+                        entity_id,
+                        expected_generation=teardown_identity.provision_generation,
+                        admission_id=cleanup.admission_id,
+                        pvc_uid=teardown_identity.rootdisk_pvc_uid,
+                    )
+                ):
+                    raise RuntimeError("terminal Job VM cleanup admission changed")
                 disposition = completed_cleanup_outcome(cleanup)
                 if disposition is None:
                     outcome = await vm_provisioner.release_vm_captured(
@@ -2212,7 +3048,10 @@ async def archive_and_cleanup_workspace(
                         teardown_identity,
                         ssh_host=vm_ctx.get("ssh_host"),
                         ssh_port=vm_ctx.get("ssh_port"),
-                        purge_disk=True,
+                        purge_disk=purge_disk,
+                        **(
+                            {"capture_snapshot": False} if retaining is not None else {}
+                        ),
                         **vm_cleanup_kwargs(cleanup),
                     )
                     disposition = outcome.disposition
@@ -2221,10 +3060,63 @@ async def archive_and_cleanup_workspace(
                             recovery_store,
                             cleanup,
                             outcome=disposition,
+                            provisioner=vm_provisioner,
                         )
                 if disposition != "completed":
                     raise RuntimeError("VM exact teardown remains " + str(disposition))
-                actions.append("vm released")
+                actions.append(
+                    "vm compute released; rootdisk retained"
+                    if retaining is not None
+                    else "vm released"
+                )
+
+        if (
+            job.get("execution_lane") == "stateless"
+            and raw_context.get("_stateless_delete_pending") is True
+        ) or (
+            job.get("execution_lane") == "pinned"
+            and raw_context.get("_pinned_retained_delete_pending") is True
+        ):
+            from orchestrator.services.vm_job_retained_disk_purge import (
+                acquire_job_retained_disk_purge,
+                execute_job_retained_disk_purge,
+            )
+
+            from orchestrator.services.vm_job_retained_resume import (
+                complete_retained_cancel,
+                retained_delete_identity,
+            )
+
+            if raw_context.get("_vm_job_retained_resume") is not None:
+                if not await complete_retained_cancel(
+                    postgres_db, entity_id, clear_pending=False
+                ):
+                    raise RuntimeError("retained VM Delete terminal remains held")
+            identity = (
+                await vm_provisioner.capture_vm_teardown_identity(entity_id)
+                if job.get("execution_lane") == "pinned"
+                else await retained_delete_identity(postgres_db, entity_id)
+            )
+            if identity is None and vm_ctx:
+                identity = await vm_provisioner.capture_vm_teardown_identity(entity_id)
+            purge = (
+                None
+                if identity is None
+                else await acquire_job_retained_disk_purge(
+                    recovery_store, job_id=entity_id, identity=identity
+                )
+            )
+            if job.get("execution_lane") == "pinned" and purge is None:
+                raise RuntimeError("pinned Ready retained disk Delete remains held")
+            if purge is not None:
+                await execute_job_retained_disk_purge(
+                    recovery_store,
+                    vm_provisioner,
+                    job_id=entity_id,
+                    identity=identity,
+                    permit=purge,
+                )
+                actions.append("retained vm rootdisk permanently deleted")
 
         # Workspace container cleanup (snapshot + delete)
         if ws_ctx and ws_ctx.get("status") not in (

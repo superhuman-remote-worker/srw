@@ -19,6 +19,12 @@ from fastapi import FastAPI, HTTPException
 
 from orchestrator import main
 from orchestrator.routers.job_reads import router as job_reads_router
+from orchestrator.application import http as http_composition
+from orchestrator.application import jobs as jobs_composition
+from orchestrator.security import access as access_module
+from orchestrator.security import auth as auth_module
+from orchestrator.services import job_queries as job_queries_module
+import functools
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -50,11 +56,13 @@ def row(**fields):
         "branch_name": None,
         "merge_status": None,
         "diff_status": None,
+        "cloud_diff_baseline_commit": None,
         "exported_at": None,
         "exported_folder_handle": None,
         "error_message": None,
         "created_at": STAMP,
         "created_by_thread_id": None,
+        "cloud_checkout": None,
         "snapshot_status": None,
         "project_name": "Contract project",
         "project_has_cloud_folder": False,
@@ -83,19 +91,22 @@ def wire(monkeypatch):
         jobs=[row()], total=1, total_is_capped=False, has_more=False
     )
     db = SimpleNamespace(
-        query_jobs=AsyncMock(side_effect=lambda **kw: copy.deepcopy(result))
+        query_jobs=AsyncMock(side_effect=lambda **kw: copy.deepcopy(result)),
+        container_workspace_creation_views=AsyncMock(return_value={}),
     )
     visible = AsyncMock(return_value=[UUID(PROJECT), UUID(OTHER_PROJECT)])
     audit = SimpleNamespace(
         is_available=False, get_audit_counts=AsyncMock(return_value={})
     )
-    monkeypatch.setattr(main, "postgres_db", db)
-    monkeypatch.setattr(main, "require_approved_user", approved)
-    monkeypatch.setattr(main, "user_visible_project_ids", visible)
-    monkeypatch.setattr(main, "audit_reader", audit)
+    monkeypatch.setattr(main.app.state.resources, "postgres_db", db)
+    monkeypatch.setattr(auth_module, "require_approved_user", approved)
+    monkeypatch.setattr(access_module, "user_visible_project_ids", visible)
+    monkeypatch.setattr(main.app.state.resources, "audit_reader", audit)
     # Mount the production read router, retaining decorator response metadata.
-    app = FastAPI(default_response_class=main.CustomJSONResponse)
-    app.state.job_reads_dependencies_factory = main._job_reads_dependencies
+    app = FastAPI(default_response_class=http_composition.CustomJSONResponse)
+    app.state.job_reads_dependencies_factory = functools.partial(
+        jobs_composition.job_reads_dependencies, main.app.state.resources
+    )
     app.include_router(job_reads_router)
     return SimpleNamespace(
         app=app, user=user, db=db, visible=visible, audit=audit, result=result
@@ -164,6 +175,44 @@ async def test_shared_cockpit_fixture_is_actual_serialized_list_json(wire):
         "offset": 2,
         "include_total": True,
     }
+
+
+@pytest.mark.asyncio
+async def test_job_list_reads_one_authorized_startup_batch(wire):
+    view = {
+        "stage": "scheduling",
+        "state": "waiting_capacity",
+        "reason_code": "scheduler_unschedulable",
+        "readiness_deadline_at": None,
+    }
+    wire.result.jobs[0]["status"] = "processing"
+    wire.result.jobs.append(row(id=UUID(CHILD), is_display_root=False))
+    wire.db.container_workspace_creation_views.return_value = {UUID(JOB): view}
+    response = await get(wire)
+    assert response.status_code == 200
+    body = response.json()
+    assert body["jobs"][0]["workspace_creation"] == view
+    assert body["jobs"][1]["workspace_creation"] is None
+    wire.db.container_workspace_creation_views.assert_awaited_once_with(
+        "job", [JOB, CHILD]
+    )
+    wire.db.container_workspace_creation_views.reset_mock()
+    denied = await get(wire, authenticated=False)
+    assert denied.status_code == 401
+    wire.db.container_workspace_creation_views.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_terminal_job_cannot_render_a_stale_startup_view(wire):
+    wire.db.container_workspace_creation_views.return_value = {
+        UUID(JOB): {
+            "stage": "readiness",
+            "state": "starting",
+            "reason_code": "scheduled",
+            "readiness_deadline_at": STAMP,
+        }
+    }
+    assert (await get(wire)).json()["jobs"][0]["workspace_creation"] is None
 
 
 @pytest.mark.asyncio
@@ -319,6 +368,38 @@ async def test_redaction_preserves_jsonb_shape_and_unmodeled_public_extensions(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
+    ("fields", "expected"),
+    [
+        ({"cloud_checkout": {"access": "reviewed_write_back"}}, "diff"),
+        ({"cloud_checkout": json.dumps({"access": "reviewed_write_back"})}, "diff"),
+        (
+            {
+                "cloud_checkout": {"access": "read_only"},
+                "cloud_diff_baseline_commit": "b",
+            },
+            "open_folder",
+        ),
+        # An older job whose copy was implicit: a baseline, no checkout key.
+        ({"cloud_diff_baseline_commit": "b"}, "diff"),
+        (
+            {"cloud_diff_baseline_commit": "b", "project_has_cloud_folder": False},
+            "open_folder",
+        ),
+    ],
+)
+async def test_global_list_decides_review_mode_like_the_project_list(
+    wire, fields, expected
+):
+    wire.result.jobs[0].update({"project_has_cloud_folder": True, **fields})
+    response = await get(wire)
+    assert response.status_code == 200, response.text
+    item = response.json()["jobs"][0]
+    assert item["cloud_review_mode"] == expected
+    assert "cloud_checkout" not in item
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
     "authenticated,approved,code", [(False, True, 401), (True, False, 403)]
 )
 async def test_refused_identity_never_queries_storage(
@@ -366,7 +447,11 @@ async def test_mcp_project_scope_remains_an_additional_narrowing_filter(wire):
         ({"origin": "all"}, 422, "Unknown job origin"),
         ({"project_id": "typo"}, 422, "not a uuid"),
         ([("project_id", "none"), ("project_id", PROJECT)], 422, "cannot be combined"),
-        ({"offset": main.JOBS_MAX_OFFSET + 1}, 400, "exceeds the maximum"),
+        (
+            {"offset": job_queries_module.JOBS_MAX_OFFSET + 1},
+            400,
+            "exceeds the maximum",
+        ),
     ],
 )
 async def test_handler_error_details_survive_http_and_never_query_storage(

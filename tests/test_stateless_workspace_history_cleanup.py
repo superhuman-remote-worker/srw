@@ -21,6 +21,10 @@ from orchestrator.services.stateless_workspace_history_cleanup import (
 )
 from orchestrator.services.workspace_lifecycle import WorkspaceOwner
 from tests import test_manifest_native_full_schema as full_schema
+from orchestrator.security import access as access_module
+from orchestrator.services import container_provisioner as container_provisioner_module
+from orchestrator.services import officer_conference as officer_conference_module
+from orchestrator.services import snapshot_service as snapshot_service_module
 
 actor = full_schema.actor
 database = full_schema.database
@@ -351,16 +355,24 @@ async def test_permanent_end_replays_current_projection_after_historical_commit(
     )
     assert str(receipts[-1]["runtime_incarnation"]) == first
     assert str(receipts[-2]["runtime_incarnation"]) == second
-    monkeypatch.setattr(main, "postgres_db", database)
-    monkeypatch.setattr(main, "container_provisioner", provisioner)
+    monkeypatch.setattr(main.app.state.resources, "postgres_db", database)
     monkeypatch.setattr(
-        main,
+        container_provisioner_module, "container_provisioner", provisioner
+    )
+    monkeypatch.setattr(
+        access_module,
         "require_thread_owner",
         AsyncMock(return_value=({"sub": str(actor["id"])}, before)),
     )
-    monkeypatch.setattr(main, "snapshot_service", SimpleNamespace(is_available=False))
-    monkeypatch.setattr(main, "gitea_client", SimpleNamespace(is_initialized=False))
-    monkeypatch.setattr(main, "_conclude_conference_if_any", AsyncMock())
+    monkeypatch.setattr(
+        snapshot_service_module, "snapshot_service", SimpleNamespace(is_available=False)
+    )
+    monkeypatch.setattr(
+        main.app.state.resources, "gitea_client", SimpleNamespace(is_initialized=False)
+    )
+    monkeypatch.setattr(
+        officer_conference_module, "conclude_conference_if_any", AsyncMock()
+    )
 
     assert await control_seams.end_thread(
         thread_id, SimpleNamespace(), permanent=True, force=True

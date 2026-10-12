@@ -27,6 +27,35 @@ class WorkspaceRecoveryView(BaseModel):
     cleanup_pending: bool
 
 
+class VMCreationView(BaseModel):
+    """Bounded provisioning progress; Resume advice is not execution authority."""
+
+    request_id: UUID
+    state: str
+    stage: str
+    reason_code: str
+    message: str
+    resumable: bool
+
+
+class WorkspaceLifecycleView(BaseModel):
+    """Safe VM compute state, separate from the human wait or Job status."""
+
+    state: str
+    idle_expires_at: datetime | None = None
+    reason_code: str | None = None
+    next_retry_at: datetime | None = None
+
+
+class WorkspaceCreationView(BaseModel):
+    """Read-only container startup stage for the current exact receipt."""
+
+    stage: str
+    state: str
+    reason_code: str
+    readiness_deadline_at: datetime | None
+
+
 class PublicJobListItem(BaseModel):
     """Current list-row projection; additional public fields remain compatible."""
 
@@ -47,6 +76,7 @@ class PublicJobListItem(BaseModel):
     branch_name: str | None
     merge_status: str | None
     diff_status: str | None
+    cloud_diff_baseline_commit: str | None
     exported_at: datetime | None
     exported_folder_handle: str | None
     error_message: str | None
@@ -66,6 +96,15 @@ class PublicJobListItem(BaseModel):
     )
     workspace_recovery: WorkspaceRecoveryView | None = Field(
         description="Safe unresolved VM workspace recovery state; no controller coordinates or diagnostics."
+    )
+    vm_creation: VMCreationView | None = Field(
+        description="Safe VM creation progress and advisory Resume availability."
+    )
+    workspace_lifecycle: WorkspaceLifecycleView | None = Field(
+        description="Safe VM compute state; no runtime identities, coordinates or other users' leases."
+    )
+    workspace_creation: WorkspaceCreationView | None = Field(
+        description="Current container startup stage; null without an exact active receipt."
     )
     audit_count: int | None = Field(
         description="Null when the optional audit service is unavailable; zero when available with no entries."

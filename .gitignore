@@ -8,6 +8,12 @@ src/orchestrator/workspace/*
 project_documentation/*
 docker/certs/*
 
+# Tool caches. Each tool drops a self-ignoring .gitignore inside its cache, so git
+# already skips them; listing them here lets IDEs (PyCharm) mark them ignored too.
+.import_linter_cache/
+.pytest_cache/
+.ruff_cache/
+
 # SSH keys (generated for workspace/VM access — never commit)
 .dev/
 .local-ssh/
@@ -29,6 +35,7 @@ tilt_modules/
 
 # Python virtual environment
 venv/
+.venv/
 env/
 
 # Local environment

@@ -91,6 +91,9 @@ import {AppFormFieldComponent} from '../../../ui/form-field';
                     }
                   }
                 </app-select>
+                @if (helmFor(kind)?.auto_pinned && admin.defaults()[kind] === helmFor(kind)?.model) {
+                  <p class="default-hint">{{ 'admin.providers.defaults.autoPinned' | transloco }}</p>
+                }
                 @if (kind === 'search_fallback' && searchFallbackMatchesPrimary()) {
                   <p class="default-warning">
                     {{ 'admin.providers.defaults.sameSearchWarning' | transloco }}
@@ -140,6 +143,11 @@ import {AppFormFieldComponent} from '../../../ui/form-field';
     }
     .default-warning {
       color: var(--color-warning, #b45309);
+      font-size: 12px;
+      margin: 6px 0 0;
+    }
+    .default-hint {
+      color: var(--text-muted);
       font-size: 12px;
       margin: 6px 0 0;
     }

@@ -101,6 +101,19 @@
       "review": "{{count}} zur Prüfung",
       "notCreated": "Job wurde nicht erstellt"
     },
+    "delegateBatch": {
+      "title": "{{count}} Subagenten",
+      "finished": "{{done}}/{{total}} beendet",
+      "failed": "{{count}} fehlgeschlagen",
+      "interrupted": "{{count}} unterbrochen",
+      "notStarted": "{{count}} nicht gestartet",
+      "status": {
+        "pending": "Wartet auf Freigabe",
+        "denied": "Abgelehnt",
+        "expired": "Nicht ausgeführt",
+        "notStarted": "Nicht gestartet"
+      }
+    },
     "view": {
       "rendered": "Gerendert",
       "raw": "Quelltext"
@@ -342,9 +355,11 @@
     "saving": "Wird gespeichert...",
     "saved": "Gespeichert",
     "delete": "Löschen",
+    "back": "Zurück",
     "cancel": "Abbrechen",
     "dismiss": "Schließen",
     "edit": "Bearbeiten",
+    "refresh": "Aktualisieren",
     "rename": "Umbenennen",
     "copy": "Kopieren",
     "copied": "Kopiert",
@@ -373,9 +388,6 @@
   "nav": {
     "cockpit": "Cockpit",
     "builder": "Builder",
-    "modeChat": "Chat",
-    "modeJobs": "Jobs",
-    "modeProjects": "Projekte",
     "newChat": "Neuer Chat",
     "searchSessions": "Sitzungen durchsuchen",
     "clearFilter": "Filter löschen",
@@ -389,16 +401,16 @@
     "datasources": "Konnektoren",
     "contacts": "Kontakte",
     "experts": "Experten",
+    "workspaces": "Workspaces",
     "skills": "Skills",
     "automations": "Automationen",
     "create": "Erstellen",
     "workbench": "Workbench",
     "settings": "Einstellungen",
     "logout": "Abmelden",
-    "admin": "Admin",
-    "more": "Mehr",
-    "apiKeys": "API-Schlüssel",
-    "sshKeys": "SSH-Schlüssel",
+    "customize": "Anpassen",
+    "backToApp": "Zurück zur App",
+    "jobsAwaitingReview": "{{count}} Aufträge warten auf deine Prüfung",
     "collapseSidebar": "Seitenleiste einklappen",
     "openSidebar": "Seitenleiste öffnen",
     "resizeSidebar": "Seitenleiste anpassen",
@@ -568,6 +580,7 @@
     "confirmDelete": "Diese Sitzung dauerhaft löschen?",
     "confirmForceDelete": "Der Agent arbeitet in dieser Sitzung noch an einem Zug. Trotzdem löschen? Der laufende Zug geht verloren.",
     "confirmEndMidTurn": "Der Agent arbeitet noch an einem Zug. Sitzung trotzdem beenden? Der laufende Zug und alle eingereihten Eingaben gehen verloren.",
+    "confirmEndStatelessBusy": "Der Agent schließt seinen aktuellen Zug noch ab. Sitzung trotzdem beenden? Der unfertige Zug wird abgebrochen.",
     "turnsOne": "Zug",
     "turnsMany": "Züge",
     "filter": {
@@ -579,6 +592,7 @@
       "sessionFiles": "Sitzungsdateien",
       "resume": "Fortsetzen",
       "delete": "Löschen",
+      "retryDelete": "Löschen erneut versuchen",
       "talk": "Mit dem Offizier sprechen"
     },
     "create": {
@@ -592,11 +606,12 @@
       "configScholar": "Forscher",
       "modelLabel": "Modell",
       "modelConfigDefault": "Konfigurations-Standard",
-      "projectsLabel": "Projekte",
+      "projectsLabel": "Projekt",
+      "noProject": "Kein Projekt",
       "projectsEmpty": "Keine Projekte verfügbar",
       "projectArchived": "(archiviert)",
       "projectArchivedWarning": "Ein archiviertes Projekt ist weiterhin ausgewählt — eine Sitzung darauf wird abgelehnt. Wählen Sie es ab oder heben Sie die Archivierung auf.",
-      "projectsHint": "Projekte für gemeinsamen Wissenszugriff auswählen",
+      "projectsHint": "Wählen Sie das Projekt, in dem diese Sitzung arbeitet.",
       "permissionLabel": "Berechtigungsmodus",
       "permissionSupervised": "Beaufsichtigt",
       "permissionAutoAccept": "Auto-akzeptieren",
@@ -608,9 +623,7 @@
       "expertLabel": "Experte",
       "expertLoading": "Experten werden geladen...",
       "expertSelectedPrefix": "Ausgewählt:",
-      "createSession": "Sitzung erstellen",
-      "protectedCloud": "Geschützte Cloud — Agenten-Änderungen werden zur Überprüfung bereitgestellt",
-      "protectedCloudHint": "Der Agent erhält schreibgeschützten Cloud-Zugriff; seine Änderungen warten im Prüfbereich auf Ihre Freigabe."
+      "createSession": "Sitzung erstellen"
     },
     "configDrift": {
       "title": "Ein Teil der Einrichtung dieser Sitzung ist nicht mehr vorhanden",
@@ -635,6 +648,20 @@
       },
       "countSuffix": " (×{{count}})"
     }
+  },
+  "workspaceCreation": {
+    "title": "Arbeitsbereichsstatus",
+    "unknown": "Der Status des Arbeitsbereichs wird geprüft.",
+    "observing": "Die Einplanung des Arbeitsbereichs wird geprüft; das Ergebnis ist noch nicht bestätigt.",
+    "waitingScheduling": "Warten auf Einplanung. Der Scheduler hat diesen Arbeitsbereich noch nicht platziert.",
+    "insufficientCapacity": "Für den angeforderten Arbeitsbereich ist derzeit nicht genug Kapazität vorhanden.",
+    "starting": "Der eingeplante Arbeitsbereich wird gestartet.",
+    "invalidImage": "Arbeitsbereich benötigt Aufmerksamkeit: Das Image ist ungültig.",
+    "invalidConfiguration": "Arbeitsbereich benötigt Aufmerksamkeit: Die Konfiguration ist ungültig.",
+    "pullDeadline": "Arbeitsbereich benötigt Aufmerksamkeit: Das Image wurde nicht rechtzeitig fertig geladen. Prüfen Sie die Image-Referenz und ob der Cluster aus der zugehörigen Registry laden kann.",
+    "readinessDeadline": "Arbeitsbereich benötigt Aufmerksamkeit: Er wurde nicht rechtzeitig bereit. Wenn er Ihr eigenes Image verwendet, prüfen Sie, ob das Image weiterläuft: Bauen Sie es auf einem SRW-Basis-Image auf (FROM) und überschreiben Sie weder ENTRYPOINT noch USER.",
+    "sshDeadline": "Arbeitsbereich benötigt Aufmerksamkeit: Die Frist für die SSH-Authentifizierung ist abgelaufen.",
+    "legacyHeld": "Eine ältere Arbeitsbereichserstellung wird geprüft; ein Abschlussnachweis fehlt."
   },
   "jobs": {
     "pagination": {
@@ -691,6 +718,8 @@
     "workspace": {
       "summary": "Arbeitsbereich: angefordert {{requested}} · zugewiesen {{assigned}} · wirksam {{effective}}",
       "state": "Arbeitsbereichsstatus: {{state}} · Detail: {{failure}}",
+      "terminalUnavailable": "VM-Arbeitsbereich nicht verfügbar",
+      "terminalUnavailableWithPending": "VM-Arbeitsbereich nicht verfügbar · {{message}}",
       "default": "Standard",
       "unavailable": "nicht verfügbar",
       "none": "keines"
@@ -772,6 +801,7 @@
       "createProject": "Projekt erstellen",
       "exportToCloud": "In die Cloud exportieren",
       "openCloudFolder": "Cloud-Ordner öffnen",
+      "resyncCloudFolder": "Cloud-Ordner neu synchronisieren",
       "exported": "Exportiert",
       "approveRequest": "Anfrage freigeben"
     },
@@ -811,6 +841,30 @@
       "nextCheck": "Nächste Prüfung",
       "cleanupPending": "Bereinigung des Arbeitsbereichs steht weiterhin aus"
     },
+    "lifecycle": {
+      "state": {
+        "warm": "Arbeitsbereich ist noch aktiv",
+        "releasing": "Arbeitsbereich wird pausiert…",
+        "release_held": "Pausieren des Arbeitsbereichs benötigt Aufmerksamkeit",
+        "suspended": "Arbeitsbereich ruht",
+        "waking": "Arbeitsbereich wird gestartet…",
+        "wake_held": "Start des Arbeitsbereichs benötigt Aufmerksamkeit",
+        "ready": "Arbeitsbereich bereit",
+        "unsupported": "Zugriff auf Arbeitsbereich nicht verfügbar"
+      },
+      "reason": {
+        "identity": "Die Identität des Arbeitsbereichs konnte nicht bestätigt werden.",
+        "capacity": "Warten auf freie Kapazität für den Arbeitsbereich.",
+        "access": "Schließen Sie aktive IDE- oder SSH-Verbindungen und versuchen Sie es erneut.",
+        "attention": "Der Arbeitsbereich wartet auf einen sicheren erneuten Versuch."
+      },
+      "idleAt": "Kann pausieren um",
+      "nextRetry": "Nächster Versuch",
+      "wakingTab": "Ihr Arbeitsbereich wird gestartet…",
+      "popupBlocked": "Erlauben Sie Pop-ups für diese Seite und öffnen Sie die IDE erneut.",
+      "wakeTimedOut": "Der Start des Arbeitsbereichs dauert länger. Öffnen Sie die IDE erneut, um den Fortschritt zu prüfen.",
+      "ideUnavailable": "Die IDE des Arbeitsbereichs ist nicht verfügbar. Versuchen Sie es in Kürze erneut."
+    },
     "delegationChildren": "{{count}} Unteraufträge",
     "promote": {
       "namePlaceholder": "Projektname (erforderlich)",
@@ -847,15 +901,13 @@
       "priorityLow": "Niedrig (Backfill)",
       "priorityNormal": "Normal (Standard)",
       "priorityHigh": "Hoch (unterbricht niedrigere)",
-      "cloudStorageLabel": "Cloud-Speicher-Zugriff",
-      "cloudStorageInherit": "Vom Projekt erben",
-      "cloudStorageReadonly": "Nur lesen",
-      "cloudStorageReadwrite": "Lesen & Schreiben",
-      "cloudStorageHint": "Überschreibt den Standard-Cloud-Speicher-Zugriffsmodus des Projekts für diesen Auftrag",
+      "noShellNoteGranted": "Dieser Experte hat keine Shell-Tools, daher kann der Auftrag in diesem Arbeitsbereich keine Befehle ausführen. Um ein Image zu testen, wählen Sie einen Experten mit Shell-Tools, zum Beispiel Engineer.",
+      "noShellNoteNoGrant": "Dieser Experte hat keine Shell-Tools, daher kann der Auftrag in diesem Arbeitsbereich keine Befehle ausführen. Experten mit Shell-Tools benötigen die Freigabe „shell_tools“ Ihres Administrators.",
       "reset": "Zurücksetzen",
       "submit": "Auftrag erstellen",
       "creating": "Wird erstellt...",
-      "uploading": "Wird hochgeladen..."
+      "uploading": "Wird hochgeladen...",
+      "removeFile": "Datei entfernen"
     },
     "detail": {
       "auditSteps": "Audit-Schritte",
@@ -869,6 +921,7 @@
       "costUnpriced": "Erfasst, aber für diese Modelle gibt es keine Preisliste — Tokens sind exakt, die Kosten unbekannt.",
       "duration": "Dauer",
       "expert": "Experte",
+      "heldForReview": "Zur Prüfung angehalten",
       "loading": "Details werden geladen…",
       "model": "Modell",
       "modelDefault": "Experten-Standard",
@@ -906,6 +959,17 @@
       "waitingOnSubjobs": "Wartet auf {{count}} unfertige(n) Unterauftrag — die Arbeit liegt eine Ebene tiefer.",
       "workspace": "Workspace"
     }
+  },
+  "vmWait": {
+    "kind": {
+      "resource": "Wartet auf Ressourcen für diesen Workspace",
+      "count": "Wartet auf die VM-Anzahlgrenze des Controllers",
+      "controller": "Wartet auf Antwort des VM-Controllers",
+      "unknown": "Wartet; Kapazitätsquelle nicht verifizierbar"
+    },
+    "sizeNonfit": "Die angeforderte Größe passt derzeit auf keinen geeigneten Knoten.",
+    "requested": "Angeforderte Größe",
+    "since": "Seit"
   },
   "admin": {
     "helm": {
@@ -951,7 +1015,53 @@
       "colAttempts": "Versuche",
       "colPending": "Offene Eingabe",
       "yes": "ja",
-      "no": "nein"
+      "no": "nein",
+      "vm": {
+        "title": "VM-Workspace-Rechenkapazität",
+        "description": "Ressourcenbilanz installierter Cluster und dauerhafte Belegungen. Verbleibende Ressourcen garantieren keinen Platz für eine bestimmte VM; Warteschlangenposition und Wartezeit werden nicht geschätzt.",
+        "noPolicy": "Keine VM-Ressourcenrichtlinie installiert.",
+        "mode": {"off": "Aus", "shadow": "Nur beobachten", "enforce": "Erzwungen", "drain": "Wird geleert"},
+        "accounted": "Inventar bilanziert",
+        "unavailable": "Bilanzierung nicht verfügbar",
+        "reason": "Diagnosegrund",
+        "inventory": "Inventar",
+        "fresh": "Aktuell",
+        "unknown": "Fehlt oder veraltet",
+        "observed": "Beobachtet",
+        "age": "Alter",
+        "incomplete": "Unvollständige Momentaufnahme",
+        "countBackstop": "VM-Anzahlgrenze",
+        "countDescription": "Beobachtete VMs / Controller-Maximum. Ein Strich bedeutet unbekannt.",
+        "waiting": "Ressourcenwartende",
+        "nonfit": "Größe passt nicht",
+        "oldest": "Längste Wartezeit",
+        "bypasses": "Übersprungen",
+        "protected": "Geschützt",
+        "teardown": "Abbau-Belegungen",
+        "overdue": "überfällig",
+        "unknownAge": "Alter unbekannt",
+        "oldestProgress": "Ältester Fortschritt",
+        "budget": "Konfigurierte Zulassungsbudgets",
+        "budgetDescription": "Die Installationsgrenze gilt für alle Besitzer zusammen; die Grenze pro Besitzer gilt für jeden einzeln. Der Richtlinienmodus oben bestimmt, ob die Zulassung diese Grenzen durchsetzt. Die Werte sind reservierte Kosten, getrennt von den verbleibenden Knotenressourcen.",
+        "budgetInstallation": "Installation (alle Besitzer)",
+        "budgetPerOwner": "Pro Besitzer",
+        "cpuCost": "CPU-Reservierung pro VM: ceil(Gast-vCPUs × {{numerator}} ÷ {{denominator}}) + {{overhead}}m. Die CPU-Anforderung von KubeVirt an den Knoten kann abweichen.",
+        "held": "Dauerhafte Ressourcenbelegungen",
+        "heldDescription": "Bekannte Belegungen bleiben sichtbar, auch wenn das Inventar nicht bilanziert werden kann. Ein Strich bedeutet unbekannt, nicht null.",
+        "accounting": "Clusterbilanz",
+        "accountingUnavailable": "Knoten- und Clusterbilanz nicht verfügbar; die oben gezeigten dauerhaften Belegungen gelten weiter.",
+        "orphaned": "Belegungen auf fehlenden Knoten",
+        "pendingExternal": "Ausstehender externer Bedarf",
+        "separate": "Außerhalb der Knotensummen",
+        "nodes": "Knotendetails",
+        "nodeNote": "Knotenwerte dienen der Diagnose; anfragespezifische Selektoren, Toleranzen und Speichertopologie entscheiden weiterhin über die Platzierung.",
+        "categoryHeading": "Kategorie",
+        "category": {
+          "allocatable": "Zuteilbar", "headroom": "Reserve", "external": "Geplante externe Last", "unbound": "Ungebunden", "bound_reserved": "Gebunden, wartet auf Bereit", "active": "Aktiv", "warm": "Bereitgehalten", "teardown": "Abbau", "available": "Verbleibend", "shortfall": "Fehlbetrag", "total": "Gesamt belegt"
+        },
+        "memory": "Arbeitsspeicher",
+        "storage": "Temporärer Speicher"
+      }
     },
     "config": {
       "messages": {
@@ -1047,6 +1157,7 @@
         "unset": "— nicht gesetzt —",
         "none": "Keine",
         "sameSearchWarning": "Dies entspricht dem primären Suchanbieter; deshalb wird der Laufzeit-Fallback unterdrückt.",
+        "autoPinned": "Automatisch gewählt, weil kein Standard gesetzt war. Wähle ein anderes Modell, um ihn zu ändern.",
         "emptyCatalog": "Der Modellkatalog ist leer. Füge oben einen Anbieter-Key oder Endpunkt hinzu, danach einen Standard auswählen.",
         "auxiliaryGroup": "Hilfsmodelle",
         "kind": {
@@ -1064,6 +1175,9 @@
           "search_fallback": "Such-Fallback",
           "rerank": "Rerank (Sortierung der Memory-Treffer)"
         }
+      },
+      "discovery": {
+        "timeout": "Die Discovery dauert länger als erwartet. Versuche es mit „Rediscover“."
       }
     },
     "viewMode": {
@@ -1075,13 +1189,28 @@
     }
   },
   "emptyCatalog": {
-    "bannerUser": "Noch keine LLMs konfiguriert — füge in Einstellungen → API-Keys einen Key hinzu oder registriere ein eigenes LLM.",
-    "bannerAdmin": "Noch keine LLMs konfiguriert — konfiguriere unter Admin → Anbieter einen Anbieter, um die App zu nutzen.",
+    "bannerUser": "Noch keine LLMs konfiguriert — füge in Einstellungen → Anbieter-Schlüssel einen Key hinzu oder registriere ein eigenes LLM.",
+    "bannerAdmin": "Noch keine LLMs konfiguriert — konfiguriere unter Einstellungen → Modelle → Anbieter einen Anbieter, um die App zu nutzen.",
     "pickerCta": "Konfiguriere einen Anbieter, um diese Auswahl zu aktivieren.",
     "dismiss": "Schließen"
   },
   "settings": {
     "title": "Einstellungen",
+    "nav": {
+      "groupSettings": "Einstellungen",
+      "groupAccess": "Zugang",
+      "groupAdmin": "Administration",
+      "general": "Allgemein",
+      "defaults": "Standardwerte",
+      "providerKeys": "Anbieter-Schlüssel",
+      "notifications": "Benachrichtigungen",
+      "connectorDrivers": "Konnektortreiber",
+      "apiKeys": "API-Schlüssel",
+      "mcp": "MCP-Tokens",
+      "sshKeys": "SSH-Schlüssel",
+      "subscriptions": "KI-Abos",
+      "cloud": "Main Cloud"
+    },
     "appearance": {
       "title": "Erscheinungsbild",
       "desc": "Wählen Sie zwischen hellem und dunklem Modus oder folgen Sie der Systemeinstellung, und legen Sie die Akzentfarbe fest. Beide Einstellungen werden auf diesem Gerät gespeichert.",
@@ -1147,10 +1276,20 @@
       "optionAll": "Alle Daten",
       "optionMe": "Nur eigene Daten"
     },
+    "providerKeys": {
+      "title": "API-Keys für LLM-Anbieter",
+      "desc": "Hinterlege eigene API-Keys für LLM-Anbieter und Tools. Diese haben bei der Ausführung von Aufträgen Vorrang vor den systemweiten Keys.",
+      "empty": "Keine API-Keys hinterlegt. Füge einen hinzu, um eigene Anbieter-Keys zu verwenden.",
+      "colProvider": "Anbieter",
+      "colKey": "Key",
+      "colLabel": "Label",
+      "colUpdated": "Aktualisiert",
+      "addTitle": "Key hinzufügen / aktualisieren",
+      "labelPlaceholder": "Label (optional)",
+      "keyPlaceholder": "API-Key (z. B. sk-...)",
+      "saveButton": "Key speichern"
+    },
     "apiKeys": {
-      "linkTitle": "Personal Access Tokens",
-      "linkDesc": "Bearer-Tokens für n8n, Skripte und andere Automatisierungs-Tools, die die Orchestrator-API aufrufen müssen.",
-      "linkManage": "API-Keys verwalten",
       "title": "Personal Access Tokens",
       "desc": "Bearer-Tokens für Automatisierungs-Tools, die direkt mit der Orchestrator-API kommunizieren. Jedes Token hat eigene Action-Scopes und ein eigenes Ablaufdatum. Verlorene Tokens können nicht wiederhergestellt werden — erstelle einfach ein neues.",
       "existingTitle": "Deine Tokens",
@@ -1188,10 +1327,6 @@
       "usageDesc": "Übergib das Token in einem Authorization-Header. n8n's Header-Auth-Credential funktioniert direkt damit."
     },
     "sshKeys": {
-      "linkTitle": "SSH-Schlüssel",
-      "linkDesc": "Öffentliche Schlüssel, mit denen du dich per SSH mit deinen Sitzungs-Workspaces verbindest.",
-      "linkManage": "SSH-Schlüssel verwalten",
-      "back": "Zurück",
       "title": "SSH-Schlüssel",
       "desc": "Öffentliche Schlüssel, die deine SSH-Verbindungen zu Sitzungs-Workspaces authentifizieren. Ein Schlüssel bestätigt deine Identität erst, wenn du nachgewiesen hast, dass du den passenden privaten Schlüssel besitzt.",
       "existingTitle": "Deine Schlüssel",
@@ -1242,7 +1377,11 @@
       "reasoningHigh": "Hoch",
       "providerLocal": "Lokal",
       "providerOpenrouter": "OpenRouter",
-      "save": "Voreinstellungen speichern"
+      "save": "Voreinstellungen speichern",
+      "unavailable": "nicht verfügbar",
+      "modelUnavailable": "{{model}} ist nicht mehr verfügbar. Neue Arbeit verwendet den Systemstandard, bis Sie ein anderes Modell wählen und speichern.",
+      "unsaved": "Ungespeicherte Änderungen",
+      "saveFailed": "Die Voreinstellungen konnten nicht gespeichert werden."
     },
     "expertDefaults": {
       "title": "Standard-Assistenten",
@@ -1273,12 +1412,8 @@
       "permissionSupervised": "Beaufsichtigt",
       "permissionAutoAccept": "Auto-akzeptieren",
       "permissionAutonomous": "Autonom",
-      "workspaceBackend": "Standard-Arbeitsbereich",
-      "workspaceRecommendation": "Dieser Experte empfiehlt {{tier}}. Du kannst einen anderen Workspace wählen.",
-      "workspaceBackendHint": "Wo neue Sitzungen ihre Dateien ablegen. Virtuell startet in Sekunden und kann während der Sitzung auf einen Container aufgerüstet werden; Container bietet von Anfang an Shell und Git, braucht aber länger zum Bereitstellen.",
-      "workspaceVirtual": "Virtuell — sofort, Dateien im Cloud-Speicher",
-      "workspaceSandbox": "Container — volle Shell & Git, langsamerer Start",
-      "workspaceNone": "Ohne — nur Chat, keine Dateien",
+      "workspaceMoved": "Den Arbeitsbereich für neue Sitzungen legen die Einstellungen deines persönlichen Projekts fest.",
+      "workspaceMovedLink": "Persönliches Projekt öffnen",
       "headlessMode": "Headless-Verhalten",
       "headlessModeDefault": "Standard (Eifrig)",
       "headlessModeEager": "Eifrig — arbeitet weiter, auch ohne offene Sitzung",
@@ -1333,7 +1468,7 @@
     },
     "subscriptions": {
       "title": "KI-Abos",
-      "desc": "Verbinden Sie Abo-Konten über den gemeinsamen Proxy. Modelle werden separat unter Admin → Models registriert.",
+      "desc": "Verbinden Sie Abo-Konten über den gemeinsamen Proxy. Modelle werden separat unter Administration → Modelle registriert.",
       "checking": "Proxy wird geprüft…",
       "connected": "Verbunden",
       "notConnected": "Kein Konto verbunden",
@@ -1414,42 +1549,50 @@
       }
     },
     "cloud": {
-      "title": "Cloud-Speicher (Hauptcloud)",
-      "desc": "Konfigurieren Sie das Hauptcloud-Backend, das für Benutzer-Home-Ordner, Projekt-Ordner und Sitzungs-Ordner verwendet wird. Secrets werden über Umgebungsvariablen (Vault/ESO/.env) verwaltet und hier nur zur Provenienz angezeigt.",
+      "title": "Main Cloud",
+      "desc": "Die Cloud, in der SRW Projekt-, Benutzer- und Sitzungsordner anlegt. Sie wird über Helm konfiguriert (die cloud-Werte des Charts), nicht hier: Diese Seite zeigt, was aktiv ist und was jeder Provider unterstützt.",
       "loading": "Wird geladen…",
-      "active": "Aktiv:",
-      "initialized": "initialisiert",
-      "notInitialized": "nicht initialisiert",
+      "loadFailed": "Die Main Cloud konnte nicht geladen werden.",
+      "retry": "Erneut versuchen",
       "refresh": "Aktualisieren",
-      "backend": "Backend",
-      "baseUrl": "Basis-URL (intern)",
-      "publicUrl": "Öffentliche URL (Browser)",
-      "keycloakIssuer": "Keycloak-Issuer",
-      "keycloakClientId": "Keycloak-Client-ID",
-      "adminRole": "Admin-Rolle / Claim-Wert",
-      "spaceQuota": "Standard-Space-Kontingent (Bytes)",
-      "adminUser": "Admin-Benutzer",
-      "agentUser": "Agent-Benutzer",
-      "credentialsRef": "Credentials-Referenz (optional)",
-      "secretProvenance": "Secret-Provenienz",
-      "secretSet": "gesetzt",
-      "secretUnset": "nicht gesetzt",
-      "testing": "Wird getestet…",
-      "test": "Testen",
-      "saving": "Wird gespeichert…",
-      "saveReload": "Speichern + neu laden",
-      "resetEnv": "Auf Env-Standards zurücksetzen",
-      "persistedOverlayLastSaved": "Persistierte Überlagerung zuletzt gespeichert",
-      "messages": {
-        "loadFailed": "Cloud-Einstellungen konnten nicht geladen werden",
-        "testOk": "Test OK ({{ms}} ms) — fehlerfrei",
-        "testFailed": "Test fehlgeschlagen: {{error}}",
-        "testRequestFailed": "Test-Anfrage fehlgeschlagen",
-        "saved": "Gespeichert — aktives Backend ist jetzt {{backend}}",
-        "savedReloaded": "Gespeichert — aktives Backend ist jetzt {{backend}} (neu geladen)",
-        "saveFailed": "Speichern fehlgeschlagen",
-        "overlayCleared": "Umgebungskonfiguration geprüft und aktiviert; der Backend-Verlauf wurde beibehalten",
-        "resetFailed": "Zurücksetzen fehlgeschlagen"
+      "active": "Aktiv:",
+      "healthy": "erreichbar ({{ms}} ms)",
+      "notInitialized": "nicht initialisiert",
+      "unreachable": "nicht erreichbar",
+      "provider": "Provider",
+      "publicUrl": "Öffentliche URL",
+      "unknown": "unbekannt",
+      "installation": "Installation",
+      "activation": "Aktivierung {{revision}}",
+      "noInstallation": "Keine Installation ist aktiv; Cloud-Aktionen sind deaktiviert.",
+      "configuration": "Konfiguration",
+      "helmOnly": "Helm-Werte",
+      "helm": {
+        "matches": "entsprechen der aktiven Installation",
+        "differs": "weichen von der aktiven Installation ab",
+        "invalid": "unvollständig"
+      },
+      "helmNote": {
+        "differs": "Die cloud-Werte in Helm beschreiben etwas anderes als die aktive Installation. Beim nächsten Start übernimmt der Orchestrator nur, was die Attestierung der Installation belegt (interne URL oder Admin-Account); für alles andere oder eine andere Installation bestätigen Sie mit cloud.replaceInstallation = {{instance}}.",
+        "invalid": "Die cloud-Werte in Helm sind unvollständig (ein erforderliches Secret fehlt), daher bleibt die aktive Installation in Betrieb."
+      },
+      "matrixTitle": "Provider-Unterstützung",
+      "matrixDesc": "Was jeder Provider liefert, deklariert von seinem Adapter. Eine Stufe wird nur angeboten, wo sie durchgesetzt wird; alles andere ist mit Begründung nicht unterstützt.",
+      "connector": "Connector · Ordner · Zugriff",
+      "activeBadge": "aktiv",
+      "status": {
+        "offered": "angeboten",
+        "planned": "geplant (Slice {{slice}})",
+        "unsupported": "nicht unterstützt"
+      },
+      "types": {
+        "cloud_folder": "Cloud-Ordner",
+        "cloud_folder_checkout": "Ordner-Checkout",
+        "cloud_outbox": "Outbox"
+      },
+      "kinds": {
+        "project": "Projekt",
+        "user_root": "Benutzer-Root"
       }
     },
     "helpers": {
@@ -1463,6 +1606,7 @@
   },
   "projectDetail": {
     "loading": "Projekt wird geladen...",
+    "back": "Zurück zu den Projekten",
     "badgePersonal": "Persönlich",
     "tabs": {
       "overview": "Übersicht",
@@ -1563,7 +1707,20 @@
       "accessReadOnly": "Nur lesen",
       "accessReadWrite": "Lesen/Schreiben",
       "accessKbReadOnlyHint": "Externe OKF Knowledge Bases sind in dieser Version für Agenten schreibgeschützt.",
-      "unlink": "Trennen"
+      "accessEnforcedBy": "Durchgesetzt durch:",
+      "accessAdvisory": "Nur ein Hinweis:",
+      "githubAppReadOnly": "das GitHub-App-Token, das SRW für jede Ausführung erzeugt, hat contents: read, daher lehnt GitHub Pushes mit diesem Token ab.",
+      "accessCreatorReadOnly": "Nur Lesen für alle, die ihn nutzen: Sein Ersteller hat ihn so markiert, und ein Projekt-Link kann das nicht aufheben.",
+      "unlink": "Trennen",
+      "cloudFolders": {
+        "title": "Cloud-Ordner",
+        "hint": "Die eigenen Ordner des Projekts in der Haupt-Cloud. Seine Arbeit bindet jeden mit seinem Standardzugriff ein, sofern eine Sitzung keine andere Stufe wählt.",
+        "colAccess": "Standardzugriff",
+        "defaultOption": "Standard ({{level}})",
+        "notOffered": "von dieser Cloud nicht angeboten",
+        "noLevel": "keine",
+        "saveFailed": "Der Standardzugriff konnte nicht gespeichert werden."
+      }
     },
     "repos": {
       "namePlaceholder": "Repo-Name",
@@ -1617,14 +1774,29 @@
       "shareMemoriesDesc": "Wenn aktiviert, sind automatische Erinnerungen aus beliebigen Aufträgen dieses Projekts für alle anderen Aufträge sichtbar.",
       "cloudStorage": "Cloud-Speicher",
       "folder": "Ordner",
-      "readOnlyAgent": "Nur-Lese-Zugriff für Agenten",
-      "readOnlyAgentDesc": "Wenn aktiviert, können Agenten Dateien durchsuchen und herunterladen, aber nicht hochladen, ändern oder löschen.",
+      "cloudAccessHint": "Agenten erhalten diesen Ordner über seinen Konnektor, mit der Stufe aus Konnektoren → Cloud-Ordner (oder der für eine Session gewählten).",
       "cloudUnavailable": "Cloud-Speicher nicht verfügbar — nicht konfiguriert.",
       "workspaceNetwork": "Workspace-Netzwerk",
       "networkTier": "Egress-Stufe",
       "networkTierInternetOnly": "Nur Internet (Standard)",
       "networkTierHomeAllowed": "Home-LAN erlaubt",
       "networkTierDesc": "Steuert, welche Netzwerke die Workspaces dieses Projekts erreichen können. \"Nur Internet\" sperrt clusterinterne Hosts und das Home-LAN. \"Home-LAN erlaubt\" öffnet das Home-LAN wieder — nur für vertrauenswürdige Operator-Projekte im Homelab aktivieren.",
+      "workspaceDefaults": "Arbeitsbereich-Standards",
+      "workspaceDefaultsHint": "Was Jobs und Sitzungen in diesem Projekt bekommen, wenn sie keinen Arbeitsbereich wählen.",
+      "workspaceDefaultsManaged": "Diese Standards verwaltet das Projektmanifest.",
+      "workspaceDefaultsSaveFailed": "Die Arbeitsbereich-Standards konnten nicht gespeichert werden.",
+      "workspaceJobs": "Jobs",
+      "workspaceSessions": "Sitzungen",
+      "workspaceContainerTemplate": "Container-Vorlage",
+      "workspaceVmTemplate": "VM-Vorlage",
+      "installationDefault": "Installationsstandard ({{ value }})",
+      "fromManifest": "Aus dem Projektmanifest",
+      "workspaceMode": {
+        "none": "Keiner (keine Dateien)",
+        "virtual": "Virtuell",
+        "container": "Container",
+        "vm": "VM"
+      },
       "dangerZone": "Gefahrenzone",
       "defaultProjectWarning": "Dies ist Ihr persönliches Standardprojekt und kann nicht archiviert oder gelöscht werden.",
       "archiveTitle": "Projekt archivieren",
@@ -1756,6 +1928,60 @@
       "cloudSyncOff": "Cloud-Sync aus",
       "cloudSyncOffTooltip": "Die Cloud-Synchronisierung konnte für diese Sitzung nicht gestartet werden. Im Arbeitsbereich fehlen möglicherweise Dateien aus der Cloud, und Änderungen werden nicht zurückgespeichert."
     },
+    "cloudFolders": {
+      "regionLabel": "Cloud-Ordner",
+      "title": "Einige Cloud-Ordner dieser Sitzung sind nicht verfügbar",
+      "notAttached": "Ein Cloud-Ordner wurde nicht verbunden",
+      "kind": {
+        "session_folder": "Sitzungsordner",
+        "project": "Projektordner",
+        "project_default": "Cloud-Home",
+        "user_root": "Meine Cloud",
+        "cloud_outbox": "Session-Outbox",
+        "protected_lower": "Geschützter Projektordner"
+      },
+      "state": {
+        "mounted": "eingebunden",
+        "pending": "wird verbunden…"
+      },
+      "review": "Zur Prüfung",
+      "notAttachedKind": {
+        "session_folder": "Der Sitzungsordner wurde nicht verbunden",
+        "project": "Ein Projektordner wurde nicht verbunden",
+        "project_default": "Dein Projektordner wurde nicht verbunden",
+        "user_root": "Meine Cloud wurde nicht verbunden",
+        "cloud_outbox": "Die Session-Outbox wurde nicht verbunden",
+        "protected_lower": "Der geschützte Ordner wurde nicht verbunden"
+      },
+      "protectedTitle": "Geschützte Cloud nicht verfügbar",
+      "protectedMeta": "Diese geschützte Sitzung läuft ohne Cloud-Ordner, nichts, was sie schreibt, erreicht die Cloud. Starte eine neue Sitzung, sobald die Ursache behoben ist.",
+      "agentOutdated": "Der Agent dieser Sitzung ist älter als ihr Arbeitsbereich: Die Cloud-Ordner liegen unter /cloud, werden vom Agenten aber nicht verwaltet. Starte eine neue Sitzung, um alle Cloud-Funktionen zu nutzen.",
+      "reason": {
+        "credential_rejected": "die Cloud hat die Zugangsdaten abgelehnt",
+        "not_found": "den Ordner gibt es in der Cloud nicht mehr",
+        "unreachable": "die Cloud war nicht erreichbar",
+        "timeout": "die Cloud hat nicht rechtzeitig geantwortet",
+        "mount_failed": "der Ordner konnte nicht eingebunden werden",
+        "config_missing": "die Zugangsdaten sind nie beim Cloud-Mount-Dienst angekommen",
+        "sidecar_unavailable": "der Cloud-Einbindungsdienst des Arbeitsbereichs läuft nicht",
+        "unbuildable": "er konnte für diese Sitzung nicht vorbereitet werden",
+        "set_fallback": "ein anderer Ordner dieser Sitzung konnte nicht vorbereitet werden, deshalb ist stattdessen der Sitzungsordner eingebunden",
+        "too_many_mounts": "die Sitzung hat mehr Cloud-Ordner, als ein Arbeitsbereich einbindet",
+        "protected_unavailable": "die geschützte Cloud konnte nicht eingerichtet werden",
+        "access_unavailable": "in dieser Art Arbeitsbereich wird dafür keine Zugriffsstufe angeboten",
+        "config_invalid": "es ist kein Cloud-Ordner, den SRW eingerichtet hat",
+        "not_eligible": "diese Sitzung darf ihn nicht mehr nutzen",
+        "no_session_folder": "SRW hat den Outbox-Ordner dieser Sitzung nicht angelegt",
+        "backend_unavailable": "die Haupt-Cloud war beim Start der Sitzung nicht erreichbar",
+        "beside_protected": "neben einem geschützten Ordner nicht eingebunden: eine geschützte Sitzung bindet nur diesen ein",
+        "grant_unavailable": "sein Konto für diesen Ordner ist noch nicht bereit",
+        "reader_unavailable": "sein Nur-Lese-Konto für diesen Ordner ist noch nicht bereit",
+        "cloud_not_connected": "noch kein Cloud-Konto: verbinde deine Cloud unter Einstellungen → Konnektoren",
+        "cloud_grant_revoked": "die Cloud akzeptiert deine Verbindung nicht mehr: verbinde sie neu unter Einstellungen → Konnektoren",
+        "delivery_unsupported": "diese Installation synchronisiert Dateien, statt sie einzubinden; Cloud-Ordner werden hier nicht bereitgestellt",
+        "mount_unsupported": "dieser Arbeitsbereich kann keine Cloud-Ordner einbinden; sie werden hier nicht bereitgestellt"
+      }
+    },
     "cloudReview": {
       "regionLabel": "Ausstehende Cloud-Prüfung",
       "title": "{{count}} Cloud-Änderungen warten auf deine Prüfung",
@@ -1796,6 +2022,8 @@
         "attachFailed": "Der Agent konnte diese Sitzung nicht wieder aufnehmen.",
         "shutdownCancelled": "Die Antwort wurde durch Wartungsarbeiten unterbrochen.",
         "stopped": "Die Sitzung wurde beendet, bevor diese Nachricht verarbeitet wurde.",
+        "retryExhausted": "Diese Nachricht ist wiederholt auf dieselbe Weise fehlgeschlagen und wurde zurückgestellt.",
+        "modelUnavailable": "Das Modell dieser Sitzung ist nicht mehr verfügbar. Wählen Sie in den Einstellungen dieser Sitzung ein anderes Modell und versuchen Sie es dann erneut.",
         "generic": "Die Sitzung ist auf ein Problem gestoßen, das sie nicht selbst beheben kann — ein Administrator muss sie freigeben, bevor diese Nachricht ausgeführt werden kann."
       }
     },
@@ -1918,7 +2146,15 @@
       "sessionResumed": "Sitzung fortgesetzt",
       "resumeSession": "Sitzung fortsetzen",
       "resuming": "Wird fortgesetzt...",
-      "resumeFailed": "Sitzung konnte nicht fortgesetzt werden"
+      "resumeFailed": "Sitzung konnte nicht fortgesetzt werden",
+      "subagentRecovery": {
+        "resumed": "Fortgesetzt, nachdem der Agentenprozess ersetzt wurde",
+        "finished": "{{done}} von {{total}} Subagenten beendet",
+        "interrupted": "{{count}} unterbrochen",
+        "notStarted": "{{count}} nicht gestartet",
+        "declined": "{{count}} abgelehnt",
+        "retired": "{{count}} abgebrochen"
+      }
     },
     "compaction": {
       "banner": "Kontext zusammengefasst",
@@ -1956,7 +2192,6 @@
       "defaultsFailed": "Sitzungsstandards konnten nicht geladen werden. Vor dem Senden erneut versuchen.",
       "recoveryTitle": "Dein Chat konnte nicht starten",
       "recoveryBody": "Deine Nachrichten wurden noch nicht gesendet. Passe die Optionen unten an und versuche es erneut.",
-      "workspaceDefault": "Projekt- oder Kontostandard verwenden",
       "retrySend": "Erneut senden"
     },
     "ended": {
@@ -1981,6 +2216,10 @@
         "bootingVm": "VM startet (dies kann einige Minuten dauern)",
         "connecting": "Verbindung wird hergestellt"
       }
+    },
+    "stream": {
+      "running": "{{tool}} läuft",
+      "waitingForCommand": "Wartet, bis der Befehl abgeschlossen ist…"
     },
     "thinking": {
       "past": "Hat einen Moment nachgedacht",
@@ -2011,7 +2250,17 @@
       "unavailable": "Diese Steuerung ist in dieser Sitzung nicht verfügbar.",
       "applyFailed": "Die Sitzungseinstellungen konnten nicht übernommen werden.",
       "applyTimeout": "Die Sitzung hat die Einstellungsänderung nicht bestätigt. Öffne die Einstellungen erneut, um den aktuellen Stand zu sehen.",
-      "appliedNextTurn": "Sitzungseinstellungen aktualisiert: {{summary}} — gilt ab der nächsten Antwort."
+      "appliedNextTurn": "Sitzungseinstellungen aktualisiert: {{summary}} — gilt ab der nächsten Antwort.",
+      "compactUnavailable": "Manuelles Komprimieren ist in dieser Sitzung nicht verfügbar. Der Kontext wird automatisch zusammengefasst, sobald die CTX-Anzeige 100 % erreicht.",
+      "compactDeferred": "Das Komprimieren startet nach der aktuellen Antwort.",
+      "compactFailed": "Komprimieren fehlgeschlagen — die Unterhaltung bleibt unverändert. Versuche es später erneut.",
+      "compactBoundaryGone": "Diese Nachricht ist nicht mehr im Arbeitskontext — sie wurde vielleicht schon zusammengefasst.",
+      "compactRejected": "Der Agent konnte diese Sitzung nicht komprimieren. Lade die Seite neu und versuche es erneut.",
+      "undoNothing": "Es gibt keine Dateiänderungen zum Rückgängigmachen.",
+      "undoUnsupported": "Rückgängig machen ist für den Workspace dieser Sitzung nicht verfügbar.",
+      "undoRejected": "Der Agent konnte die letzten Dateiänderungen nicht rückgängig machen.",
+      "containerUpgradeUnavailable": "Container-Upgrades sind in dieser Sitzung nicht verfügbar. Verwende /upgrade-workspace vm oder starte eine neue Sitzung mit einem Container-Workspace.",
+      "upgradeUnavailable": "Workspace-Upgrades sind in dieser Sitzung nicht verfügbar."
     },
     "workspaceOffer": {
       "title": "Workspace-Upgrade angefordert",
@@ -2141,7 +2390,8 @@
       "supervised": "Zu Beaufsichtigt wechseln (alle Schreibvorgänge genehmigen)",
       "autonomous": "Zu Autonom wechseln (nichts genehmigen)",
       "silent": "Reasoning ausblenden und Werkzeug-Details minimieren",
-      "verbose": "Vollständiges Reasoning und Werkzeug-Details anzeigen"
+      "verbose": "Vollständiges Reasoning und Werkzeug-Details anzeigen",
+      "upgradeWorkspace": "Arbeitsbereich aufwerten: ohne Angabe die nächste Stufe, \"vm\" oder ein Vorlagenname"
     },
     "toolLabels": {
       "read_file": "Liest",
@@ -2405,7 +2655,176 @@
     "saveFailed": "Speichern fehlgeschlagen",
     "invalidZip": "Ungültiges Skill-Archiv"
   },
+  "workspaces": {
+    "tier": {"container": "Container", "vm": "VM", "virtual": "Virtuell (Cloud-Dateien)"},
+    "scope": {"mine": "Meine", "shared": "Geteilt", "project": "Projekt: {{name}}"},
+    "vm": {
+      "notInstalled": "VMs sind auf dieser Installation nicht aktiviert.",
+      "notAllowed": "Ihr Konto darf keine VMs verwenden."
+    },
+    "form": {
+      "name": "Name",
+      "nameHint": "Kleinbuchstaben, Ziffern und Bindestriche. Kann später nicht geändert werden.",
+      "saveTo": "Speichern unter",
+      "displayName": "Anzeigename",
+      "description": "Beschreibung",
+      "tier": "Stufe",
+      "image": "Image",
+      "imageHint": "SRW-Images werden vorgeschlagen; jedes Registry-Image funktioniert.",
+      "cpu": "CPU",
+      "memory": "Arbeitsspeicher",
+      "storage": "Speicherplatz",
+      "quantityHint": "Zum Beispiel 512Mi, 4Gi oder 1Ti.",
+      "advanced": "Erweitert",
+      "requestCpu": "Garantierte CPU",
+      "requestMemory": "Garantierter Arbeitsspeicher",
+      "requestHint": "Kubernetes-Request; die Werte oben sind das Maximum.",
+      "pullPolicy": "Pull-Richtlinie",
+      "pullPolicyDefault": "Standard",
+      "setupSteps": "Einrichtungsschritte",
+      "setupStepsHint": "Ein Shell-Befehl pro Zeile, der Reihe nach als Workspace-Benutzer ausgeführt, wenn eine VM erstellt wird.",
+      "preserved": "Diese Vorlage hat Einstellungen, die dieses Formular nicht bearbeiten kann. Beim Speichern bleiben sie unverändert."
+    },
+    "customImage": {
+      "title": "Das ist keines der SRW-Images.",
+      "unprivileged": "Es läuft ohne erhöhte Rechte, sofern Ihr Betreiber es nicht erlaubt; daher gibt es keinen eingebundenen Cloud-Ordner und keine geschützte Cloud.",
+      "digest": "Legen Sie einen Digest fest (image@sha256:…) statt eines Tags, damit jeder Lauf dasselbe Image verwendet.",
+      "jobFirst": "Testen Sie ein neues Image zuerst mit einem Job. Ein Job zeigt mehr darüber, warum sein Arbeitsbereich nicht gestartet ist; eine Sitzung unter Umständen nicht."
+    },
+    "errors": {
+      "name": "1-63 Kleinbuchstaben, Ziffern oder Bindestriche; Anfang und Ende ein Buchstabe oder eine Ziffer.",
+      "image": "Ein Image ist erforderlich.",
+      "cpu": "CPU muss eine Zahl über 0 sein.",
+      "cpuWhole": "VMs brauchen eine ganze Zahl von CPUs.",
+      "quantity": "Eine ganze Zahl gefolgt von Mi, Gi oder Ti.",
+      "requestCpu": "Garantierte CPU muss über 0 und höchstens gleich CPU sein.",
+      "requestMemory": "Garantierter Arbeitsspeicher darf den Arbeitsspeicher nicht überschreiten.",
+      "setupSteps": "Höchstens 32 Einrichtungsschritte.",
+      "loadFailed": "Diese Vorlage konnte nicht geladen werden.",
+      "nameTaken": "Eine Vorlage mit diesem Namen gibt es hier schon. Wählen Sie einen anderen Namen.",
+      "versionConflict": "Diese Vorlage hat sich geändert, seit Sie sie geöffnet haben.",
+      "saveFailed": "Diese Vorlage konnte nicht gespeichert werden.",
+      "deleteFailed": "Diese Vorlage konnte nicht gelöscht werden.",
+      "listFailed": "Diese Vorlagen konnten nicht geladen werden."
+    },
+    "editor": {
+      "newTitle": "Neue Workspace-Vorlage",
+      "editTitle": "Workspace-Vorlage",
+      "back": "Alle Workspaces",
+      "builtin": "Eingebaute Vorlage, von der Installation verwaltet. Duplizieren Sie sie für eine eigene.",
+      "notEditable": "Sie können diese Vorlage nicht bearbeiten. Duplizieren Sie sie für eine eigene.",
+      "duplicate": "Duplizieren",
+      "reload": "Neu laden",
+      "saved": "Gespeichert.",
+      "deleteTitle": "Workspace-Vorlage löschen",
+      "deleteBody": "{{name}} löschen? Bereits gestartete Arbeit behält ihren Workspace."
+    },
+    "list": {
+      "title": "Workspaces",
+      "new": "Neue Vorlage",
+      "chip": {"available": "Für mich verfügbar", "mine": "Meine", "shared": "Geteilt", "project": "Projekt…"},
+      "projectAria": "Vorlagen eines Projekts anzeigen",
+      "group": {"shared": "Geteilt", "mine": "Meine", "project": "Projekt"},
+      "retry": "Erneut versuchen",
+      "empty": "Hier gibt es noch keine Vorlagen.",
+      "builtin": "Eingebaut",
+      "colName": "Name",
+      "colTier": "Stufe",
+      "colImage": "Image",
+      "colSize": "Größe",
+      "colActions": "Aktionen",
+      "moreActions": "Weitere Aktionen"
+    }
+  },
+  "cloudRoot": {
+    "description": "Deine eigenen Dateien in der Haupt-Cloud: alles, was du in Files siehst, auch die Projektordner, zu denen du gehörst. Einmal verbinden, dann binden die Sessions deines persönlichen Projekts sie unter cloud/my_cloud mit vollem Zugriff ein.",
+    "state": {
+      "unsupported": "Nicht verfügbar",
+      "not_connected": "Nicht verbunden",
+      "connecting": "Wird verbunden",
+      "connected": "Verbunden",
+      "revoked": "Getrennt",
+      "failed": "Nicht verbunden"
+    },
+    "detail": {
+      "connected": "Verbunden.",
+      "connectedAs": "Verbunden als {{account}}.",
+      "connecting": "Melde dich im geöffneten Tab bei deiner Cloud an und erlaube SRW den Zugriff. Diese Seite aktualisiert sich von selbst.",
+      "notConnected": "Einmal verbinden, um deine eigenen Dateien in den Sessions deines persönlichen Projekts einzubinden."
+    },
+    "failure": {
+      "wrong_account": "Die E-Mail dieses Cloud-Kontos ist nicht deine. Melde dich mit deinem eigenen Konto an und verbinde erneut.",
+      "admin_account": "Cloud-Administratorkonten können nicht verbunden werden, auch nicht die von Gruppenadministratoren. Melde dich mit deinem eigenen Konto an.",
+      "service_account": "Das ist eines der eigenen Dienstkonten von SRW. Melde dich mit deinem eigenen Konto an.",
+      "identity_mismatch": "Das ist nicht das Cloud-Konto, das SRW bereits als deines kennt. Melde dich mit diesem Konto an oder wende dich an deine Administration.",
+      "account_disabled": "Dieses Cloud-Konto ist deaktiviert.",
+      "verify_failed": "Die Verbindung konnte deine Dateien nicht lesen. Verbinde erneut.",
+      "expired": "Die Anmeldung wurde nicht rechtzeitig abgeschlossen. Verbinde erneut.",
+      "provider_error": "Die Cloud war nicht erreichbar. Versuche es später erneut.",
+      "account_missing": "Dein Cloud-Konto hat noch keine Dateien: öffne einmal Files in der Cloud und verbinde dann erneut.",
+      "error": "Etwas ist schiefgegangen. Verbinde erneut."
+    },
+    "revoked": {
+      "user": "Du hast sie getrennt. Sessions binden sie erst wieder ein, wenn du sie neu verbindest.",
+      "rejected_by_cloud": "Die Cloud akzeptiert diese Verbindung nicht mehr (sie wurde aus deinen Geräten entfernt oder das Konto deaktiviert). Verbinde sie neu."
+    },
+    "unsupported": {
+      "provider_unsupported": "Die Cloud dieser Installation bietet keine persönlichen Cloud-Roots an.",
+      "grant_mode_off": "Persönliche Cloud-Roots sind auf dieser Installation ausgeschaltet.",
+      "no_personal_project": "Du hast noch kein persönliches Projekt, also würde keine Session sie einbinden."
+    },
+    "actions": {
+      "connect": "Verbinden",
+      "reconnect": "Neu verbinden",
+      "cancel": "Abbrechen",
+      "disconnect": "Trennen"
+    },
+    "openLogin": "Anmeldeseite der Cloud öffnen",
+    "disconnectConfirm": "Meine Cloud trennen? Die Cloud wird gebeten, den Zugriff von SRW zu widerrufen, und Sessions binden sie ab ihrem nächsten Start nicht mehr ein.",
+    "revokeIncomplete": "SRW hat die Verbindung vergessen, aber die Cloud konnte nicht gebeten werden, sie zu widerrufen: entferne „{{client}}“ aus den Geräten und Sitzungen deiner Cloud.",
+    "connectLink": "Cloud verbinden",
+    "reconnectLink": "Cloud neu verbinden",
+    "errors": {
+      "unsupported": "Auf dieser Installation gibt es keinen Cloud-Root zum Verbinden.",
+      "startFailed": "Die Cloud konnte die Verbindung nicht starten. Versuche es später erneut.",
+      "cancelFailed": "Die Verbindung konnte nicht abgebrochen werden.",
+      "disconnectFailed": "Meine Cloud konnte nicht getrennt werden. Versuche es erneut."
+    }
+  },
   "datasources": {
+    "driversLink": "Treiber-Fähigkeiten",
+    "driversLinkHint": "Was jeder Konnektortreiber anbietet und was es durchsetzt",
+    "driverEnvNames": "Setzt:",
+    "generic": {
+      "previewToggle": "Diesen Konnektor im generischen Formular anzeigen",
+      "previewHint": "Nur in Entwicklungs-Builds: zeigt die Spezifikation des Treibers statt seines eigenen Formulars.",
+      "connectionUrl": "Verbindungs-URL",
+      "config": "Konfiguration",
+      "keepStored": "Gespeichert — leer lassen, um ihn zu behalten",
+      "loadFile": "Aus Datei laden",
+      "add": "Hinzufügen",
+      "remove": "Entfernen",
+      "key": "Schlüssel",
+      "unset": "—",
+      "variant": "Variante",
+      "jsonHint": "JSON",
+      "slotLevels": "Benötigt für: {{levels}}",
+      "slotKind": {
+        "secret_string": "Geheimnis",
+        "file": "Datei",
+        "ssh_private_key": "Privater SSH-Schlüssel",
+        "oauth2": "OAuth 2",
+        "kubeconfig": "Kubeconfig"
+      },
+      "replaceAll": "Alle Zugangsdaten leer lassen, um die gespeicherten zu behalten. Jede Eingabe ersetzt sie alle, also jedes Geheimnis erneut eingeben.",
+      "problem": {
+        "required": "Erforderlich",
+        "pattern": "Entspricht nicht dem erwarteten Format",
+        "not_a_number": "Keine Zahl",
+        "invalid_json": "Kein gültiges JSON",
+        "too_few": "Mindestens einen Eintrag hinzufügen"
+      }
+    },
     "title": "Konnektoren",
     "new": "Neuer Konnektor",
     "refresh": "Aktualisieren",
@@ -2424,7 +2843,31 @@
       "kubeconfig": "Kubeconfig",
       "ssh_key": "SSH-Schlüssel",
       "generic_file": "Datei",
-      "credentials": "Zugangsdaten"
+      "credentials": "Zugangsdaten",
+      "image_driver": "Registrierter Treiber",
+      "gitea_mcp": "Gitea-MCP (verwaltet)",
+      "cloud_folder": "Cloud-Ordner",
+      "cloud_folder_checkout": "Ordner-Checkout",
+      "cloud_outbox": "Outbox"
+    },
+    "platform": {
+      "kind": {
+        "projectKb": "Knowledge Base",
+        "projectCloud": "Projektordner",
+        "projectCloudCheckout": "Kopie des Projektordners (Jobs)",
+        "userCloudRoot": "Meine Cloud",
+        "cloudOutbox": "Session-Outbox"
+      },
+      "managedByProject": "Vom Projekt verwaltet",
+      "managedForYou": "Von SRW für dich verwaltet",
+      "managedForItsUser": "Von SRW für seinen Benutzer verwaltet",
+      "managedBySrw": "Von SRW verwaltet"
+    },
+    "accessLevel": {
+      "read_only": "Nur lesen",
+      "protected": "Geschützt",
+      "read_write": "Lesen/Schreiben",
+      "reviewed_write_back": "Rückschreiben nach Prüfung"
     },
     "catalog": {
       "search": "Konnektoren durchsuchen…",
@@ -2485,24 +2928,17 @@
       "envValuePlaceholder": "Wert",
       "envRemoveTooltip": "Entfernen",
       "envAdd": "Variable hinzufügen",
-      "envHint": "Anmeldeinformationen werden als Umgebungsvariablen in den Agenten-Arbeitsbereich injiziert. Nur-Lese-Zugriff kann nicht erzwungen werden — verwenden Sie bei Bedarf ein Datenbank-Konto mit eingeschränkten Berechtigungen.",
+      "envHint": "Anmeldeinformationen werden als Umgebungsvariablen in den Agenten-Arbeitsbereich injiziert. Nur-Lese-Zugriff kann nicht erzwungen werden — verwenden Sie bei Bedarf ein Datenbank-Konto mit eingeschränkten Berechtigungen. Namen, die der Arbeitsbereich reserviert (PATH, HOME, SRW_…), und Namen, über die ein Werkzeug Code ausführt (NODE_OPTIONS, GIT_SSH_COMMAND, EDITOR…), werden abgelehnt; Proxys und CA-Bundles sind erlaubt.",
       "mcpTransportLabel": "Transport",
       "mcpTransportHttp": "Remote (HTTP)",
       "mcpTransportSse": "Remote (SSE)",
-      "mcpTransportStdio": "Lokaler Befehl (stdio)",
       "mcpTokenLabel": "Bearer-Token",
       "mcpTokenPlaceholder": "Optional — wird als Authorization: Bearer … gesendet",
       "mcpHeadersLabel": "Benutzerdefinierte Header",
       "mcpHeaderKeyPlaceholder": "Header-Name",
       "mcpHeaderValuePlaceholder": "Wert",
       "mcpHeaderAdd": "Header hinzufügen",
-      "mcpCommandLabel": "Befehl",
-      "mcpCommandPlaceholder": "npx",
-      "mcpArgsLabel": "Argumente (eines pro Zeile)",
-      "mcpArgsPlaceholder": "-y\n@modelcontextprotocol/server-github",
-      "mcpEnvLabel": "Umgebungsvariablen",
       "mcpCredentialsRetainHint": "Verbindungsdaten leer lassen, um die gespeicherte MCP-Konfiguration beizubehalten.",
-      "mcpStdioWarning": "Dieser Befehl wird innerhalb der Agent-Umgebung mit den obigen Variablen ausgeführt. Nur vertrauenswürdige Server hinzufügen.",
       "defaultBranchLabel": "Standard-Branch",
       "defaultBranchPlaceholder": "main",
       "okfRootLabel": "OKF-Stammpfad",
@@ -2535,8 +2971,12 @@
       "visibilityPublic": "Öffentlich — für alle Benutzer sichtbar",
       "accessReadOnly": "Nur Lesen",
       "accessReadWrite": "Lesen & Schreiben",
-      "visibilityCredentialHint": "Nur-Lesen ist deklariert, nicht erzwungen — verwenden Sie Nur-Lese-Zugangsdaten (Deploy-Token / eingeschränktes DB-Konto).",
-      "visibilityKbHint": "Wissensdatenbank-Konnektoren sind immer schreibgeschützt; Zugangsdaten erreichen die Agenten nie.",
+      "accessLabel": "Agentenzugriff",
+      "accessReadOnlyHint": "Nur Lesen heißt: SRW gibt Agenten für diesen Konnektor keine Schreibwerkzeuge, für alle, die ihn nutzen. Was sich wirklich ändern lässt, entscheiden weiterhin die Zugangsdaten: Verwenden Sie Nur-Lese-Zugangsdaten, wenn nichts geändert werden darf.",
+      "accessAdvisoryHint": "Nur Lesen wird dem Agenten nur als Hinweis mitgegeben: Es werden in beiden Fällen dieselben Zugangsdaten ausgeliefert, und sie entscheiden, was sich ändern lässt. Das gilt für alle, die den Konnektor nutzen.",
+      "accessReadWriteOnlyHint": "Für diesen Konnektortyp hat SRW keinen Nur-Lese-Modus: Agenten erhalten alle Werkzeuge, die er anbietet. Was erlaubt ist, entscheiden seine Zugangsdaten, für alle, die den Konnektor nutzen.",
+      "accessKbHint": "Wissensdatenbanken sind für alle, die sie nutzen, immer nur lesbar: SRW indexiert das Repository, und Agenten erhalten Suchwerkzeuge, aber nie seine Zugangsdaten.",
+      "accessGithubAppHint": "Nur Lesen heißt: SRW gibt Agenten für diesen Konnektor keine Schreibwerkzeuge, für alle, die ihn nutzen. Bei einem GitHub-App-Konnektor erzeugt SRW das Token jeder Ausführung zusätzlich mit contents: read, sodass GitHub Pushes mit diesem Token ablehnt.",
       "availabilityTitle": "Verfügbarkeit",
       "scopeEverywhere": "Überall in meiner Arbeit",
       "scopeEverywhereHint": "In allen Projekten und eigenständiger Arbeit verfügbar, vorbehaltlich Freigabe- und öffentlicher Zugriffsregeln.",
@@ -2572,7 +3012,18 @@
       "kubeconfigHint": "Cluster-, Benutzer- und Kontext-Namen werden zur Laufzeit mit dem Slug des Konnektors präfixiert, damit mehrere Kubeconfigs ohne Kollisionen zusammengeführt werden können. Mit `kubectl config get-contexts` im Agenten lässt sich die zusammengeführte Sicht prüfen.",
       "sshKeyContentLabel": "Privater SSH-Schlüssel",
       "sshKeyContentPlaceholder": "-----BEGIN OPENSSH PRIVATE KEY-----\n...\n-----END OPENSSH PRIVATE KEY-----",
-      "sshKeyHint": "Der Schlüssel wird unter ~/.ssh/<slug> mit Modus 0600 materialisiert. Konfigurieren Sie im Agenten einen Host-Block in ~/.ssh/config, um ihn für bestimmte Hosts zu verwenden.",
+      "sshKeyHint": "Der Schlüssel wird in einen eigenen ssh-agent im Arbeitsbereich geladen und nie auf die Festplatte geschrieben. Schlüssel mit Passphrase werden abgelehnt.",
+      "sshHostLabel": "SSH-Host",
+      "sshUserLabel": "SSH-Benutzer",
+      "sshPortLabel": "Port",
+      "sshHostHint": "Optional. Mit einem Host verwendet ein einfaches `ssh <host>` im Arbeitsbereich diesen Schlüssel; ohne Host über den IdentityAgent, den die README des Arbeitsbereichs nennt.",
+      "sshKnownHostsLabel": "Fixierter Host-Schlüssel",
+      "sshKnownHostsHint": "Optional. Fügen Sie den Host-Schlüssel ein (oder testen Sie den Konnektor und fixieren Sie den gemeldeten Schlüssel), damit ein Server mit einem anderen Schlüssel abgelehnt wird. Nicht fixierten Hosts wird beim ersten Kontakt vertraut.",
+      "upstreamCaLabel": "Upstream-CA (optional)",
+      "upstreamCaHint": "Nur für eine Forge hinter einer privaten Zertifizierungsstelle: Fügen Sie deren CA-Zertifikat(e) im PEM-Format ein. Der Git-Swap-Treiber von SRW vertraut der Forge dann nur mit diesen; ohne CA prüft er öffentliche Stammzertifikate. Der Test zeigt, wie das Token zugestellt wird.",
+      "sshPinHostKey": "Diesen Host-Schlüssel fixieren",
+      "sshAgentNoticeTitle": "Nutzbar, nicht lesbar",
+      "sshAgentNotice": "Der Agent kann mit diesem Schlüssel signieren, ihn aber nicht lesen. In einem VM-Arbeitsbereich kann root (nach genehmigtem sudo) es. Verwenden Sie einen eng zugeschnittenen Schlüssel.",
       "uploadFile": "Datei hochladen",
       "trustNoticeTitle": "Vom Agenten lesbares Geheimnis",
       "trustNotice": "Diese Datei wird im Dateisystem des Agenten materialisiert und ist vom Agenten-Prozess lesbar. Verwenden Sie ein eng zugeschnittenes Geheimnis — ein nur-lesendes Kubeconfig, einen projektgebundenen Deploy-Key — wenn der Job keinen weitergehenden Zugriff benötigt.",
@@ -2581,7 +3032,7 @@
       "credFileNameLabel": "Name",
       "credFileNamePlaceholder": "config.json",
       "credFileTargetPathLabel": "Zielpfad",
-      "credFileTargetPathPlaceholder": "~/.config/myapp/config.json",
+      "credFileTargetPathPlaceholder": "~/.srw-files/myapp/token",
       "credFileContentsLabel": "Inhalt",
       "credFileContentsPlaceholder": "Dateiinhalt (nur Text, max. 64 KB)",
       "credFileModeLabel": "Modus",
@@ -2589,7 +3040,7 @@
       "credFileEnvVarLabel": "Env-Variable",
       "credFileEnvVarPlaceholder": "MY_TOKEN_FILE",
       "credFileRemoveTooltip": "Datei entfernen",
-      "credFileGenericHint": "Jede Datei wird unter dem Zielpfad mit dem angegebenen Modus geschrieben. Ist eine \"Env-Variable\" gesetzt, erhält der Agent-Prozess diese Variable mit dem absoluten Pfad. Pfade müssen unter /home/srw, /tmp, /run oder /workspace liegen.",
+      "credFileGenericHint": "Jede Datei wird unter dem Zielpfad mit dem angegebenen Modus geschrieben, nie ausführbar. Zielpfade sind Orte für Zugangsdaten: ~/.kube/, ~/.aws/, ~/.azure/, ~/.docker/, ~/.config/ für doctl, gcloud, hcloud, helm oder sops, ~/.srw-files/, ~/.netrc oder ~/.pgpass. Ist eine \"Env-Variable\" gesetzt, erhält der Arbeitsbereich diese Variable mit dem Pfad der Datei; sie folgt den Regeln für Umgebungsvariablen (kein PATH, NODE_OPTIONS, GIT_SSH_COMMAND…).",
       "emailProviderLabel": "Anbieter",
       "emailProviderCustom": "Eigener / selbst gehostet",
       "emailProviderGmail": "Gmail (privates @gmail.com-Konto)",
@@ -2634,7 +3085,8 @@
       "emailUnattendedSendHint": "Erfordert die vom Admin vergebene Berechtigung email_autonomous_send — andernfalls lehnt der Server dies ab. Ist die Option aus, wird der Direktversand abgelehnt; die geplante Freigabe-Warteschlange ist noch nicht verfügbar, daher sollte ein Entwurf verwendet werden.",
       "emailNotPublishableHint": "E-Mail-Konnektoren können nicht veröffentlicht werden — Postfächer bleiben privat.",
       "optCredentials": "Zugangsdaten (Umgebungsvariablen)",
-      "credentialsEnvHint": "Für Skripte im Workspace und Browser-Anmeldungen. Variablen hinzufügen oder ersetzen; leere Werte behalten vorhandene Zugangsdaten. Nach dem Anhängen bleibt dieser Connector für die Sitzung verbunden. Agent-Ausgaben werden nicht gefiltert. Die Gültigkeitsdauer bestimmt dein Anbieter."
+      "credentialsEnvHint": "Für Skripte im Workspace und Browser-Anmeldungen. Variablen hinzufügen oder ersetzen; leere Werte behalten vorhandene Zugangsdaten. Nach dem Anhängen bleibt dieser Connector für die Sitzung verbunden. Agent-Ausgaben werden nicht gefiltert. Die Gültigkeitsdauer bestimmt dein Anbieter. Namen, die der Arbeitsbereich reserviert (PATH, HOME, SRW_…), und Namen, über die ein Werkzeug Code ausführt (NODE_OPTIONS, GIT_SSH_COMMAND, EDITOR…), werden abgelehnt.",
+      "close": "Schließen"
     },
     "publishDialog": {
       "title": "Konnektor veröffentlichen?",
@@ -2706,6 +3158,94 @@
       "reindexed": "Neuindizierung der OKF Knowledge Base „{{name}}“ abgeschlossen ({{status}})",
       "reindexFailed": "Neuindizierung der OKF Knowledge Base fehlgeschlagen",
       "fileTooLarge": "Datei überschreitet 64 KB — Anmeldedaten-Dateien sind auf 64 KB begrenzt."
+    }
+  },
+  "connectorDrivers": {
+    "title": "Konnektortreiber",
+    "desc": "Jeder installierte Konnektortreiber, aus seiner eigenen Spezifikation: welche Zugriffsstufen er anbietet und was jede durchsetzt, wo er läuft, welche Zugangsdaten er hält und welche Netzwerkziele er deklariert.",
+    "toConnectors": "Zu den Konnektoren",
+    "search": "Treiber filtern",
+    "count": "{{count}} installiert",
+    "loading": "Treiber werden geladen…",
+    "loadFailed": "Die Treiberliste konnte nicht geladen werden.",
+    "retry": "Erneut versuchen",
+    "noMatch": "Kein Treiber passt zum Filter.",
+    "holdsCredentials": "Hält Zugangsdaten zum Zielsystem",
+    "alwaysReadOnly": "Immer nur Lesen",
+    "authorNote": "Dieser Treiber steht nicht auf der Vertrauensliste: Alles hier ist vom Autor des Treibers deklariert und nicht von SRW geprüft.",
+    "declaredByAuthor": "Vom Autor des Treibers deklariert",
+    "accessLevels": "Zugriffsstufen",
+    "noAccessLevels": "Keine Zugriffsstufen: Diese Zustellung kann keine durchsetzen.",
+    "advisory": "Hinweis",
+    "enforced": "Durchgesetzt",
+    "defaultLevel": "Standard",
+    "enforcedBy": "Durchgesetzt durch",
+    "toolsDiscovered": "Jedes Tool, das der Server anbietet",
+    "toolsNone": "Keine eingebauten Tools",
+    "plane": "Läuft",
+    "planes": {
+      "harness": "Im SRW-Prozess",
+      "bind_time": "Beim Binden",
+      "service": "Als Dienst",
+      "in_pod": "Im Workspace-Pod"
+    },
+    "delivery": "Zustellung",
+    "backends": "Workspace-Backends",
+    "trustLabel": "Vertrauen",
+    "trust": {
+      "builtin": "Eingebaut, vertrauenswürdig",
+      "trusted": "Vertrauenswürdiges Image",
+      "custom": "Eigenes, nicht geprüft",
+      "managed": "Von SRW verwaltet, Fremd-Image",
+      "development": "Nur für die Entwicklung, nicht für echte Konnektoren"
+    },
+    "shipsWithSrw": "Wird mit SRW ausgeliefert",
+    "register": {
+      "title": "Treiber-Image registrieren",
+      "desc": "Jedes Image kann ein Treiber sein: SRW liest seine Spezifikation aus dem Image (Label io.srw.driver.spec) und führt es ohne Privilegien in einem eigenen Pod aus. Ein Treiber erhält die Zugangsdaten seiner Konnektoren; registriere nur Images, deren Autoren du vertraust.",
+      "image": "Image-Referenz",
+      "imagePlaceholder": "registry.example/team/driver:1.0 oder …@sha256:…",
+      "scope": "Registrieren in",
+      "scopeAccount": "Meine",
+      "scopeCatalog": "Geteilt (alle)",
+      "submit": "Registrieren",
+      "delete": "Registrierung löschen",
+      "disable": "Deaktivieren",
+      "enable": "Aktivieren",
+      "disabled": "Deaktiviert: bindet nichts Neues",
+      "envNames": "Setzt:",
+      "disableConfirm": "{{image}} deaktivieren? SRW widerruft jetzt seine {{bindings}} aktiven Bindungen über {{connectors}} Konnektor(en) und bindet nichts Neues, bis er wieder aktiviert ist.",
+      "scopeKind": {
+        "Account": "In einem Konto registriert",
+        "Project": "In einem Projekt registriert",
+        "Catalog": "Im geteilten Katalog registriert"
+      }
+    },
+    "credentials": "Zugangsdaten-Slots",
+    "noSlots": "Keine",
+    "slotRequired": "erforderlich",
+    "slotOptional": "optional",
+    "slotDelivery": {
+      "env": "als Umgebungsvariablen zugestellt",
+      "file": "als Datei zugestellt",
+      "ssh_agent": "in einen ssh-agent geladen",
+      "held": "von SRW gehalten"
+    },
+    "egress": "Ausgehender Verkehr",
+    "egressDeclared": "Deklariert:",
+    "egressEnforced": "Durchgesetzt:",
+    "egressInstallation": "Installation:",
+    "egressNone": "Nichts deklariert",
+    "egressNoDriverPod": "Kein Treiber-Pod: Die Verbindungen baut der SRW-Agent, der Orchestrator oder der Workspace auf",
+    "needsDns": "Benötigt DNS: {{reason}}",
+    "egressReason": {
+      "runs_in_srw_process": "Nicht anwendbar: läuft im SRW-Prozess",
+      "driver_hosting_not_available": "Nicht durchgesetzt: SRW betreibt noch keine Treiber-Pods",
+      "service_hosting_disabled": "Nicht durchgesetzt: Diese Installation betreibt keine Service-Treiber-Pods",
+      "pinned_per_pod": "Die NetworkPolicy jedes Treiber-Pods bindet die deklarierten Hosts an die beim Start aufgelösten Adressen (IP-Ebene); kein DNS",
+      "pinned_per_pod_with_dns": "Die NetworkPolicy jedes Treiber-Pods bindet die deklarierten Hosts an die beim Start aufgelösten Adressen (IP-Ebene); der Pod darf den Cluster-Resolver nutzen, Namen sind also nicht eingeschränkt",
+      "start_up_wait_verified": "Namespace-weites Default-Deny und eine Startwartezeit; vom Betreiber auf diesem Cluster verifiziert",
+      "start_up_wait_unverified": "Namespace-weites Default-Deny und eine Startwartezeit; auf diesem Cluster nicht verifiziert"
     }
   },
   "contacts": {
@@ -2856,11 +3396,10 @@
       "memoryEnabled": "Memory aktiviert",
       "budgetTokens": "Budget-Tokens",
       "compactOnArchive": "Beim Archivieren komprimieren",
-      "keepRecentToolResults": "Letzte Tool-Ergebnisse behalten",
       "keepRecentMessages": "Letzte Nachrichten behalten",
       "vmCpuCores": "VM-CPU-Kerne",
-      "vmMemory": "VM-Arbeitsspeicher",
-      "vmDiskSize": "VM-Festplatte",
+      "vmMemory": "VM-Arbeitsspeicher (GiB)",
+      "vmDiskSize": "VM-Festplatte (GiB)",
       "maxReadWords": "Max. Lese-Wörter",
       "maxWriteWords": "Max. Schreib-Wörter",
       "gitVersioning": "Git-Versionierung",
@@ -2887,6 +3426,7 @@
     "hints": {
       "idleDisabled": "0 = deaktiviert",
       "autoPlaceholder": "auto",
+      "vmSizeWholeGiB": "Geben Sie eine ganze Zahl in GiB ein (mindestens 1).",
       "parallelToolCalls": "Die Modellunterstützung variiert — manche Modelle führen unabhängig von dieser Einstellung möglicherweise parallele Tool-Aufrufe aus, während andere sie gar nicht unterstützen.",
       "virtualBackend": "Virtuelle Workspaces laufen ohne Container — Shell-, Browser- und Git-Tools sind deaktiviert. Datei-, Web-, Datenbank- und Wissens-Tools bleiben verfügbar.",
       "noneBackend": "Keiner läuft komplett ohne Workspace — Shell-, Browser-, Git- und Datei-Tools sind deaktiviert. Web-, Datenbank- und Wissens-Tools bleiben verfügbar."
@@ -2938,6 +3478,29 @@
       "openCloudFolder": "Cloud-Ordner öffnen"
     },
     "cloudFolderDisclaimer": "Vorschau – die Ergebnisse werden in einen geteilten Cloud-Ordner kopiert, den du durchsuchen kannst. Nutze das Feedback-Feld unten, um Änderungen anzufordern; direkte Änderungen an diesem Ordner erreichen den Agenten nicht und werden überschrieben, wenn der Job fortgesetzt wird.",
+    "outbox": {
+      "delivered": "{{count}} Datei(en) im Cloud-Ordner des Jobs.",
+      "failed": "Das Kopieren in den Cloud-Ordner des Jobs ist fehlgeschlagen: {{reason}}.",
+      "unshared": {
+        "no_account": "Er ist noch nicht für dich freigegeben: einmal in der Cloud anmelden, dann neu synchronisieren.",
+        "rate_limited": "Er ist noch nicht für dich freigegeben: die Cloud begrenzt gerade neue Freigaben. In ein paar Minuten neu synchronisieren.",
+        "share_failed": "Er ist noch nicht für dich freigegeben: die Freigabe ist fehlgeschlagen. Neu synchronisieren, um es erneut zu versuchen."
+      },
+      "reason": {
+        "backend_unavailable": "keine Haupt-Cloud war erreichbar",
+        "forge_unavailable": "das Repository des Jobs konnte nicht gelesen werden",
+        "folder_failed": "der Cloud-Ordner konnte nicht angelegt werden",
+        "file_missing": "eine zu kopierende Datei fehlt",
+        "copy_failed": "die Dateien konnten nicht kopiert werden",
+        "owner_unavailable": "der Job oder sein Besitzer existiert nicht mehr"
+      }
+    },
+    "projectFolder": {
+      "nothingToReview": "Keine Änderungen an der Kopie des Projektordners zu prüfen.",
+      "noChanges": "Der Job hat seine Kopie des Projektordners nicht geändert, es wird also nichts zurückgeschrieben.",
+      "noBaseline": "Der Projektordner wurde für diesen Job nicht kopiert, es gibt also keine Änderungen zu prüfen.",
+      "headUnreadable": "Die Änderungen des Jobs an seiner Kopie des Projektordners konnten nicht gelesen werden, es gibt also nichts zu prüfen."
+    },
     "reviewSessionHint": "Startet eine beaufsichtigte Sitzung in einem frischen Sandbox-Checkout des bereitgestellten Branches mit Modell, Projekt und Konnektoren dieses Jobs. Job-spezifische Arbeitsbereichs- und Tool-Einstellungen werden nicht kopiert.",
     "vmUpgrade": {
       "title": "Sudo erforderlich",
@@ -3192,6 +3755,72 @@
     }
   },
   "agentSettings": {
+      "manifest": {
+        "title": "Manifest",
+        "jobTitle": "Job-Manifest: was „Erstellen“ sendet",
+        "sessionTitle": "Session-Ausführung: was „Starten“ sendet",
+        "show": "Als Manifest anzeigen",
+        "hide": "Manifest ausblenden"
+      },
+      "sections": {
+        "task": {
+          "title": "Aufgabe",
+          "more": "Weitere Optionen"
+        },
+        "session": {
+          "title": "Session"
+        },
+        "expert": {
+          "title": "Expert",
+          "question": "Wer soll deine KI sein?",
+          "unnamed": "Standard-Expert",
+          "basedOn": "Basiert auf {{name}} · {{n}} geändert. Dieser Lauf bekommt eine eigene vollständige Kopie.",
+          "resetToTemplate": "Auf Vorlage zurücksetzen",
+          "more": "Weitere Einstellungen",
+          "moreChanged": "· {{n}} geändert",
+          "reasoning": "Reasoning {{level}}",
+          "tools": "{{n}} Tools",
+          "toolGroups": "{{n}} Tool-Gruppen",
+          "subagents": "Subagents"
+        },
+        "workspace": {
+          "title": "Workspace",
+          "question": "In welcher Umgebung soll sie arbeiten?"
+        },
+        "connectors": {
+          "title": "Connectors",
+          "question": "Worauf soll sie Zugriff haben?",
+          "none": "Keine verbunden",
+          "summary": "{{n}} verbunden · {{names}}",
+          "summaryMore": "{{n}} verbunden · {{names}} +{{more}} weitere"
+        },
+        "chip": {
+          "partlyLocked": "Teilweise gesperrt",
+          "changes": "{{n}} geändert",
+          "template": "Vorlage",
+          "upgradeOnly": "Nur Upgrade",
+          "default": "Standard",
+          "custom": "Angepasst",
+          "none": "Keiner",
+          "addOrRemove": "Hinzufügen oder entfernen",
+          "changed": "Geändert",
+          "defaults": "Standard"
+        }
+      },
+      "locked": {
+        "atCreation": "Beim Erstellen festgelegt",
+        "project": "Projekt",
+        "templateAndResources": "Vorlage und Ressourcen",
+        "templateAndResourcesHint": "Die Stufe oben lässt sich upgraden. Image und Ressourcen bleiben wie erstellt.",
+        "moreLive": "Diese wurden beim Start der Session festgelegt.",
+        "moreUnavailable": "Die Werte, mit denen diese Session gestartet wurde, konnten nicht geladen werden."
+      },
+      "expertPicker": {
+        "label": "Mit einer Vorlage beginnen",
+        "hint": "Die Auswahl füllt alles darunter aus. Änderungen gelten nur für diesen Lauf.",
+        "loading": "Experts werden geladen…",
+        "empty": "Keine Experts verfügbar."
+      },
     "common": {
       "resetToDefault": "Auf Standard zurücksetzen",
       "noApiKey": "kein API-Schlüssel",
@@ -3199,6 +3828,15 @@
       "deselectAll": "Alle abwählen"
     },
     "datasources": {
+        "searchPlaceholder": "Nach Name oder Typ suchen",
+        "searchLabel": "Connectors durchsuchen",
+        "filterLabel": "Anzeigen",
+        "filterAll": "Alle",
+        "filterAttached": "Verbunden ({{n}})",
+        "countLine": "{{n}} von {{total}} verbunden",
+        "noMatch": "Keine Connectors passen zu „{{query}}“.",
+        "noneAttached": "Keine Connectors verbunden.",
+        "noneAvailable": "Dir stehen noch keine Connectors zur Verfügung.",
       "group": "Konnektoren",
       "loading": "Konnektoren werden geladen…",
       "loadFailed": "Konnektoren konnten für diesen Projektkontext nicht geladen werden. Die Erstellung ist deaktiviert.",
@@ -3209,7 +3847,48 @@
       "notReady": "Noch nicht vollständig indiziert — der Agent sieht möglicherweise unvollständige Ergebnisse.",
       "lockedLive": "Wissensdatenbanken können während einer Session nicht geändert werden",
       "credentialsLocked": "Zugangsdaten bleiben für diese Sitzung verbunden",
-      "credentialsUnavailable": "Dieser Zugangsdaten-Konnektor ist nicht mehr verfügbar. Beende diese Sitzung und starte eine neue, um ihre Konnektoren zu ändern."
+      "credentialsUnavailable": "Dieser Zugangsdaten-Konnektor ist nicht mehr verfügbar. Beende diese Sitzung und starte eine neue, um ihre Konnektoren zu ändern.",
+      "lockedNextStart": "Wirkt erst beim nächsten Start und lässt sich daher während einer Session nicht ändern",
+      "nothingAttached": "Nichts ist verbunden, auch nicht die eigenen Konnektoren dieses Projekts.",
+      "access": {
+        "label": "Zugriff für {{name}}",
+        "notMounted": "Hier nicht eingebunden",
+        "besideProtected": "Neben einem geschützten Ordner nicht eingebunden",
+        "fullAccess": "Voller Zugriff",
+        "fullAccessHint": "Meine Cloud hat nur vollen Zugriff: Das App-Token, das deine Cloud SRW gibt, lässt sich weder auf Nur-Lesen noch auf einen Ordner beschränken.",
+        "origin": {
+          "projectDefault": "Projektstandard",
+          "default": "Standard",
+          "lowered": "abgesenkt: hier nicht erlaubt",
+          "loweredRole": "abgesenkt auf das, was deine Rolle im Projekt erlaubt",
+          "chosen": "gewählt"
+        },
+        "refused": {
+          "notOffered": "hier nicht angeboten",
+          "aboveCeiling": "mehr, als deine Rolle erlaubt",
+          "readOnlyUnavailable": "hier kein Nur-Lesen",
+          "oneProtected": "nur ein Ordner kann geschützt sein"
+        }
+      }
+    },
+    "workspacePicker": {
+      "templateLabel": "Vorlage",
+      "label": "Workspace",
+      "default": "Standard: {{what}} ({{layer}})",
+      "defaultUnknown": "Standard (Projekt oder Installation)",
+      "layer": {"project": "Projektstandard", "installation": "Installationsstandard"},
+      "mode": {"none": "Kein Workspace", "virtual": "Virtuell", "container": "Container", "vm": "VM"},
+      "group": {"shared": "Geteilt", "project": "Dieses Projekt", "mine": "Meine"},
+      "none": "Kein Workspace",
+      "custom": "Angepasst (nur dieser Lauf)",
+      "customize": "Anpassen…",
+      "customizeTitle": "Workspace anpassen",
+      "useOnce": "Für diesen Lauf verwenden",
+      "saveToMine": "Unter „Meine“ speichern",
+      "saveName": "Vorlagenname (für „Unter Meine speichern“)",
+      "summaryNone": "Kein Workspace: keine Dateien und keine Shell.",
+      "recommended": "Empfohlen von {{expert}}.",
+      "recommendedUnavailable": "{{expert}} empfiehlt eine VM, die Ihnen hier nicht zur Verfügung steht."
     },
     "execution": {
       "group": "Ausführung",
@@ -3220,15 +3899,18 @@
       "projectMemory": "Projektgedächtnis",
       "imageQuality": "Bildqualität",
       "workspaceBackend": "Arbeitsbereich",
+      "workspaceRecommended": "Empfohlener Workspace",
       "autonomyDefaultHint": "Legt fest, wann der Agent für eine manuelle Prüfung pausiert",
       "narration": "Erzählmodus",
       "tierCurrent": "aktuell",
+      "tierNext": "die nächste Stufe",
       "tierHint": "Beim Upgrade werden deine Dateien übernommen; innerhalb der Sitzung ist es nicht umkehrbar.",
       "tierUpgrading": "{{tier}} wird bereitgestellt…",
       "tierUnreachable": {
         "downgrade": "Herunterstufen nicht möglich",
         "needsApproval": "Freigabe erforderlich",
-        "unsupported": "von dieser Stufe aus nicht verfügbar"
+        "unsupported": "von dieser Stufe aus nicht verfügbar",
+        "sessionUnsupported": "in dieser Sitzung nicht verfügbar"
       }
     },
     "autonomy": {
@@ -3305,6 +3987,12 @@
       "rosterTitle": "Subagenten, an die dieser Experte delegieren kann",
       "rosterDefault": "(Standard)",
       "rosterEmpty": "Dieser Experte hat keine Subagenten-Riege, delegate_agent hat also nichts auszuführen — jeder Aufruf liefert einen Fehler. Riege beim Experten unter Subagenten hinzufügen.",
+      "sessionCap": {
+        "label": "Subagenten gleichzeitig",
+        "hint": "Wie viele Subagenten gleichzeitig laufen. Weitere Aufrufe warten, bis sie an der Reihe sind.",
+        "inherited": "Geerbt (Standard {{n}})",
+        "invalid": "Geben Sie eine ganze Zahl von {{min}} bis {{max}} ein."
+      },
       "unknownCategory": "Dieser Cockpit-Build hat keine Beschreibung für diese Kategorie."
     },
     "toolCategories": {
@@ -3657,7 +4345,9 @@
       "resumeFailed": "Sitzung konnte nicht fortgesetzt werden.",
       "stillEnding": "Diese Sitzung wird noch beendet. Lass diese Seite geöffnet und versuche Fortsetzen danach erneut.",
       "endFailed": "Sitzung konnte nicht beendet werden.",
+      "endRetryable": "Das Beenden hat begonnen, aber das Workspace-Cleanup ist noch nicht abgeschlossen. Drücke erneut auf „Trennen“, um es noch einmal zu versuchen.",
       "deleteFailed": "Sitzung konnte nicht gelöscht werden.",
+      "deleteRetryable": "Diese Sitzung wird noch heruntergefahren und konnte daher noch nicht gelöscht werden. Nutze gleich „Löschen erneut versuchen“ auf ihrer Karte.",
       "createFailed": "Sitzung konnte nicht erstellt werden.",
       "renameFailed": "Sitzung konnte nicht umbenannt werden.",
       "bindingInvalid": "Diese Sitzungsverbindung ist nicht mehr autoritativ. Warte auf die Wiederherstellung der Sitzung oder wende dich an einen Administrator."
@@ -3690,6 +4380,8 @@
       "replySent": "Antwort gesendet",
       "exportedToCloud": "{{count}} Datei(en) nach {{folder}} exportiert",
       "exportedNotShared": "{{count}} Datei(en) nach {{folder}} exportiert, aber der Ordner ist noch nicht für dich freigegeben — einmal in der Cloud anmelden, dann neu synchronisieren.",
+      "exportedRateLimited": "{{count}} Datei(en) nach {{folder}} exportiert, aber die Cloud begrenzt gerade neue Freigaben — in ein paar Minuten neu synchronisieren, um ihn für dich freizugeben.",
+      "exportedShareFailed": "{{count}} Datei(en) nach {{folder}} exportiert, aber die Freigabe für dich ist fehlgeschlagen — neu synchronisieren, um es erneut zu versuchen.",
       "diffAccepted": "{{applied}} Änderung(en) und {{deleted}} Löschung(en) in den Cloud-Ordner geschrieben.",
       "diffRejected": "Diff verworfen; keine Änderungen in der Cloud."
     },

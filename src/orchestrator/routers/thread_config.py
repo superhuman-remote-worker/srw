@@ -3,7 +3,8 @@
 Extracted from ``orchestrator.main`` (R1.B06 lane B). Five route declarations —
 four internal agent-facing (``X-Internal-Key``; ingress strips those paths) and
 one owner-facing — moved with their handler names, paths, methods, parameter
-order and docstrings intact. The docstring is the published OpenAPI
+order and docstrings intact; a sixth internal one, ``upgrade-availability``,
+was added later (2026-10-07). The docstring is the published OpenAPI
 description, so it is part of the route's identity.
 
 None of the five declarations carried ``tags``, ``response_model``,
@@ -150,6 +151,31 @@ async def agent_upgrade_thread_to_workspace(
         request,
         thread_id,
         body,
+        dependencies=get_thread_config_dependencies(request),
+    )
+
+
+@router.get("/api/agents/threads/{thread_id}/upgrade-availability")
+async def agent_thread_upgrade_availability(
+    request: Request, thread_id: str
+) -> dict[str, Any]:
+    """Whether a workspace upgrade would be accepted now. **Internal** (P4b) —
+    requires ``X-Internal-Key``. Ingress strips this path.
+
+    Read-only: runs the VM upgrade's pre-effect refusals (lane, protected
+    Session, grants and the VM kill switch, the VM provisioner, an upgrade
+    already in progress, the tier rule) and provisions nothing. The pinned
+    agent asks before it offers an upgrade.
+    """
+    # The gate runs here, in the declaration's own body:
+    # `scripts/check_endpoint_auth.py` reads the audited gate from the route
+    # it is declared on and does not follow a call into a service module, so a
+    # handler that only delegates is reported `unscoped` and rewrites
+    # `policy/endpoint_inventory.txt`.
+    await get_thread_config_dependencies(request).require_internal(request)
+    return await thread_config_update.agent_thread_upgrade_availability(
+        request,
+        thread_id,
         dependencies=get_thread_config_dependencies(request),
     )
 

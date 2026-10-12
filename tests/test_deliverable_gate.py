@@ -40,6 +40,7 @@ from orchestrator.services.deliverable_contracts import (  # noqa: E402
     DeliveryContractConflict,
     prepare_delivery_contract,
 )
+from orchestrator.schemas import job_create as job_create_module
 
 # =============================================================================
 # Fixtures
@@ -53,7 +54,10 @@ PR_HEAD_SHA = "d" * 40
 
 
 def repository_datasource(
-    *, read_only: bool = False, project_read_only: bool = False
+    *,
+    read_only: bool | None = False,
+    project_read_only: bool = False,
+    is_global: bool = False,
 ) -> dict:
     return {
         "id": DATASOURCE_ID,
@@ -61,6 +65,7 @@ def repository_datasource(
         "connection_url": "https://github.com/Acme/Widget.git",
         "config": {"forge": "github"},
         "read_only": read_only,
+        "is_global": is_global,
         "project_read_only": project_read_only,
         "policy_revision": 7,
     }
@@ -474,6 +479,8 @@ class TestPullRequestDeliverable:
             None,
             repository_datasource(read_only=True),
             repository_datasource(project_read_only=True),
+            # A public connector with no mode set is read-only (decision 32).
+            repository_datasource(read_only=None, is_global=True),
         ):
             db = make_db()
             configure_pr_contract(db)
@@ -669,6 +676,11 @@ class TestRunGate:
 
         Asserting only ``report["skipped"]`` at the evaluate level would leave
         that ordering unproven.
+
+        Not bouncing is not the same as accepting: the repository does not
+        hold the work, so a ``completed`` seal (which merges that branch) is
+        held for review instead, like the bounce cap does
+        (worker_git_versioning_stops_midjob_seal_pins_stale_revision.md).
         """
         job = make_job(
             manifest=["output/a.md", "output/b.md"],
@@ -691,10 +703,12 @@ class TestRunGate:
         )
 
         assert bounced is False
-        assert new_status == "completed"
+        assert new_status == "pending_review"
         queue_resume.assert_not_awaited()
         stamp = stamped(db)
         assert stamp["skipped"] is True
+        assert stamp["undelivered"] is True
+        assert stamp["reason"] == "The job-ending git push failed at job completion."
 
     @pytest.mark.asyncio
     async def test_pass_seals_and_stamps(self):
@@ -936,6 +950,196 @@ class TestRunGate:
 
 
 # =============================================================================
+# A seal that cannot name its revision is not a delivery
+# =============================================================================
+
+
+class TestUnprovenDeliveryIsNotAccepted:
+    """knowledge-base/knowledge/issues/worker_git_versioning_stops_midjob_seal_pins_stale_revision.md
+
+    VM job afa0004b sealed with ``head_commit: None``: the worker could not
+    read its own HEAD, because its git had stopped working two hours earlier.
+    The gate then found all three manifest files at the branch tip — the
+    phase-3 scaffolds — and passed. Existence at the tip proves nothing when
+    the worker cannot say the tip is what it delivered.
+    """
+
+    MANIFEST = ["output/environment.md", "output/obstacles.md"]
+    # The stale tip really does hold the files: that is what made it pass.
+    STALE_TIP = ["output/environment.md", "output/obstacles.md", "plan.md"]
+
+    @staticmethod
+    def _freeze(**extra) -> dict:
+        return {
+            "freeze_type": "job_complete",
+            "summary": "done",
+            "head_commit": None,
+            "content_tree": None,
+            **extra,
+        }
+
+    @pytest.mark.asyncio
+    async def test_null_head_commit_is_not_accepted_as_delivered(self):
+        job = make_job(manifest=self.MANIFEST, freeze_data=self._freeze())
+
+        report = await evaluate_deliverable_gate(
+            job, db=make_db(), gitea=make_gitea(self.STALE_TIP)
+        )
+
+        assert report.get("passed") is not True
+        assert report["undelivered"] is True
+        assert "head_commit" in report["reason"]
+
+    @pytest.mark.asyncio
+    async def test_null_head_commit_holds_a_completed_seal_for_review(self):
+        """Not bounced (resuming the worker cannot repair its git), and not
+        sealed ``completed`` either — that would merge the stale branch."""
+        job = make_job(manifest=self.MANIFEST, freeze_data=self._freeze())
+        db = make_db()
+        queue_resume = AsyncMock()
+
+        decision = await run_deliverable_gate(
+            job,
+            completion_result(),
+            "completed",
+            db=db,
+            gitea=make_gitea(self.STALE_TIP),
+            queue_resume=queue_resume,
+        )
+        new_status, actions, bounced = decision
+
+        assert (new_status, bounced) == ("pending_review", False)
+        queue_resume.assert_not_awaited()
+        stamp = stamped(db)
+        assert stamp.get("passed") is not True
+        assert stamp["undelivered"] is True
+        assert not any("gate passed" in a for a in actions)
+        assert any("delivery unproven" in a for a in actions)
+        # The completion authority turns this into error_message and the
+        # review notification's reason — a hold must never be silent.
+        assert "head_commit is null" in decision.hold_reason
+
+    @pytest.mark.asyncio
+    async def test_null_head_commit_keeps_a_loop_job_terminal(self):
+        """Same escalation rule as the bounce cap: a parked loop job would
+        wedge its loop, so it resolves terminally with the report stamped."""
+        job = make_job(
+            manifest=self.MANIFEST,
+            context_extra={"loop_id": "some-loop"},
+            freeze_data=self._freeze(),
+        )
+        db = make_db()
+
+        new_status, _, bounced = await run_deliverable_gate(
+            job,
+            completion_result(),
+            "completed",
+            db=db,
+            gitea=make_gitea(self.STALE_TIP),
+            queue_resume=AsyncMock(),
+        )
+
+        assert (new_status, bounced) == ("completed", False)
+        assert stamped(db)["undelivered"] is True
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("status", ["pending_review", "reviewing"])
+    async def test_a_review_bound_seal_keeps_its_lane_but_not_a_pass(self, status):
+        job = make_job(manifest=self.MANIFEST, freeze_data=self._freeze())
+        db = make_db()
+
+        new_status, _, bounced = await run_deliverable_gate(
+            job,
+            completion_result(goal_achieved=False),
+            status,
+            db=db,
+            gitea=make_gitea(self.STALE_TIP),
+            queue_resume=AsyncMock(),
+        )
+
+        assert (new_status, bounced) == (status, False)
+        assert stamped(db).get("passed") is not True
+
+    @pytest.mark.asyncio
+    async def test_a_verified_delivered_commit_is_evaluated_normally(self):
+        """``delivered_commit`` is the worker's positive proof (clean tree,
+        nothing unpushed, HEAD read after the final commit) — a failed
+        pre-commit HEAD read alongside it is only a diagnostic gap."""
+        job = make_job(
+            manifest=self.MANIFEST,
+            freeze_data=self._freeze(delivered_commit="f" * 40),
+        )
+
+        report = await evaluate_deliverable_gate(
+            job, db=make_db(), gitea=make_gitea(self.STALE_TIP)
+        )
+
+        assert report["passed"] is True
+
+    @pytest.mark.asyncio
+    async def test_a_freeze_without_the_key_is_evaluated_normally(self):
+        """Absent is not null: records from writers that never carried the
+        key are judged on the tree alone, as before."""
+        job = make_job(
+            manifest=self.MANIFEST,
+            freeze_data={"freeze_type": "job_complete", "summary": "done"},
+        )
+
+        report = await evaluate_deliverable_gate(
+            job, db=make_db(), gitea=make_gitea(self.STALE_TIP)
+        )
+
+        assert report["passed"] is True
+
+    @pytest.mark.asyncio
+    async def test_a_lite_job_without_git_is_evaluated_normally(self):
+        """Lite tiers have no git at all; a null HEAD is their normal state."""
+        job = make_job(manifest=self.MANIFEST, freeze_data=self._freeze())
+        job["config_override"] = {"workspace": {"backend": "virtual"}}
+
+        report = await evaluate_deliverable_gate(
+            job, db=make_db(), gitea=make_gitea(self.STALE_TIP)
+        )
+
+        assert report["passed"] is True
+
+    @pytest.mark.asyncio
+    async def test_a_job_without_a_repository_still_skips(self):
+        """No repository means nothing was supposed to be pushed; the
+        unresolvable-repo fail-open stands."""
+        job = make_job(
+            manifest=self.MANIFEST, repo_name=None, freeze_data=self._freeze()
+        )
+
+        report = await evaluate_deliverable_gate(
+            job, db=make_db(), gitea=make_gitea(self.STALE_TIP)
+        )
+
+        assert report["skipped"] is True
+        assert report.get("undelivered") is not True
+
+    @pytest.mark.asyncio
+    async def test_a_manifest_outside_the_job_tree_keeps_its_old_handling(self):
+        """Only a manifest naming paths in the job's own tree is a repository
+        deliverable; a KB-only contract never depended on the branch tip."""
+        job = make_job(
+            manifest=["kb:findings"],
+            freeze_data=self._freeze(delivery_failed=True),
+        )
+
+        new_status, _, bounced = await run_deliverable_gate(
+            job,
+            completion_result(),
+            "completed",
+            db=make_db(),
+            gitea=make_gitea(self.STALE_TIP),
+            queue_resume=AsyncMock(),
+        )
+
+        assert (new_status, bounced) == ("completed", False)
+
+
+# =============================================================================
 # Create-path plumbing (JobCreate → context)
 # =============================================================================
 
@@ -944,9 +1148,8 @@ class TestCreatePlumbing:
     def test_jobcreate_accepts_and_normalizes(self):
         """The REST model carries the field; the create path stores the
         normalized manifest into context (both spellings collapse)."""
-        import orchestrator.main as orchestrator_main
 
-        body = orchestrator_main.JobCreate(
+        body = job_create_module.JobCreate(
             description="ship it",
             required_deliverables=["repo/output/a.md", "./output/a.md", "kb:note"],
         )
@@ -1074,10 +1277,41 @@ class TestCreationRefusesClonedRepoManifests:
             )
         assert "pull request" in exc.value.message.lower()
 
-    def test_ordinary_and_kb_deliverables_still_pass(self) -> None:
-        import orchestrator.main as orchestrator_main
+    @pytest.mark.parametrize(
+        "datasource",
+        [
+            # A public connector whose creator never chose a mode (decision 32).
+            repository_datasource(read_only=None, is_global=True),
+            # The creator's read-only tag under a read-write link (decision 31).
+            repository_datasource(read_only=True),
+        ],
+    )
+    def test_a_read_only_bound_repository_cannot_take_a_pr_deliverable(
+        self, datasource
+    ) -> None:
+        with pytest.raises(DeliveryContractConflict) as exc:
+            prepare_delivery_contract(["pr:acme/widget"], datasources=[datasource])
+        assert exc.value.code == "pr_deliverable_read_only"
 
-        body = orchestrator_main.JobCreate(
+    @pytest.mark.parametrize(
+        "datasource",
+        [
+            # A private connector never tagged, and one published read-write.
+            repository_datasource(read_only=None),
+            repository_datasource(read_only=False, is_global=True),
+        ],
+    )
+    def test_an_untagged_repository_still_takes_a_pr_deliverable(
+        self, datasource
+    ) -> None:
+        plan = prepare_delivery_contract(["pr:acme/widget"], datasources=[datasource])
+        assert plan.pr_repositories == ("acme/widget",)
+        assert [binding["datasource_id"] for binding in plan.pr_bindings] == [
+            DATASOURCE_ID
+        ]
+
+    def test_ordinary_and_kb_deliverables_still_pass(self) -> None:
+        body = job_create_module.JobCreate(
             description="ship it",
             required_deliverables=["output/a.md", "repo/output/b.md", "kb:note"],
         )

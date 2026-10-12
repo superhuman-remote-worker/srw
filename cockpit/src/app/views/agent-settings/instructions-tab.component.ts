@@ -25,7 +25,7 @@ import {AppButtonComponent} from '../../ui/button';
         class="instructions-editor"
         [ngModel]="content()"
         (ngModelChange)="onEdit($event)"
-        rows="16"
+        [rows]="rows()"
         placeholder="Select an expert to pre-fill instructions, or type custom instructions..."
         [disabled]="disabled() || loadingExpert()"
       ></textarea>
@@ -59,7 +59,7 @@ import {AppButtonComponent} from '../../ui/button';
     }
     .instructions-editor {
       flex: 1;
-      min-height: 200px;
+      min-height: 8rem;
       padding: 12px 14px;
       border: 1px solid var(--border-color, var(--surface-1));
       border-radius: var(--radius-control);
@@ -91,6 +91,8 @@ import {AppButtonComponent} from '../../ui/button';
 export class InstructionsTabComponent {
   disabled = input(false);
   loadingExpert = input(false);
+  /** Visible height of the editor. */
+  rows = input(16);
 
   contentChange = output<string | null>();
 

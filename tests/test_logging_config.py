@@ -1,6 +1,7 @@
 """Shared logging behaviour and application adapter policy remain compatible."""
 
 import asyncio
+import io
 import json
 import logging
 import subprocess
@@ -10,6 +11,7 @@ import warnings
 from pathlib import Path
 
 import pytest
+import httpx
 
 from orchestrator import logging_config as orch_log
 from agent.core import logging_config as agent_log
@@ -281,6 +283,68 @@ for prefix in ["shared.runtime", "langchain", "langchain_core", "langgraph", *sy
 
 
 class TestRedaction:
+    @pytest.mark.parametrize("log_format", ["text", "json"])
+    @pytest.mark.asyncio
+    async def test_httpx_lifecycle_signature_is_masked_without_losing_diagnostics(
+        self, monkeypatch, log_format
+    ):
+        monkeypatch.setenv("LOG_FORMAT", log_format)
+        output = io.StringIO()
+        handler = logging.StreamHandler(output)
+        handler.setFormatter(orch_log.build_formatter())
+        logger = logging.getLogger("httpx")
+        old_level, old_propagate = logger.level, logger.propagate
+        logger.addHandler(handler)
+        logger.setLevel(logging.INFO)
+        logger.propagate = False
+        try:
+            async with httpx.AsyncClient(
+                transport=httpx.MockTransport(lambda _: httpx.Response(200))
+            ) as client:
+                response = await client.get(
+                    "http://controller.test/vms/job-1",
+                    params={
+                        "provision_generation": "generation-2",
+                        "lifecycle_auth": "synthetic-signature-123",
+                        "lifecycle_auth_issued_at": "123",
+                        "lifecycle_auth_request_id": "request-1",
+                    },
+                )
+        finally:
+            logger.removeHandler(handler)
+            logger.setLevel(old_level)
+            logger.propagate = old_propagate
+        assert response.status_code == 200
+        assert response.request.url.params["lifecycle_auth"] == (
+            "synthetic-signature-123"
+        )
+        line = output.getvalue()
+        if log_format == "json":
+            line = json.loads(line)["message"]
+        assert "synthetic-signature-123" not in line
+        assert "GET" in line
+        assert "/vms/job-1?provision_generation=generation-2" in line
+        assert "lifecycle_auth=***REDACTED***" in line
+        assert "lifecycle_auth_issued_at=123" in line
+        assert "lifecycle_auth_request_id=request-1" in line
+        assert "200" in line
+
+    def test_lifecycle_signature_redacts_parameterized_message_and_exception(self, mod):
+        url = (
+            "/vms/job-1?lifecycle_auth=synthetic-signature-123"
+            "&provision_generation=generation-2"
+        )
+        try:
+            raise ValueError(f"request failed: {url}")
+        except ValueError:
+            exc_info = sys.exc_info()
+        record = _record("request %s", url, exc_info=exc_info)
+        for formatter in (mod.JsonLogFormatter(), mod.TextLogFormatter()):
+            line = formatter.format(record)
+            assert "synthetic-signature-123" not in line
+            assert "lifecycle_auth=***REDACTED***" in line
+            assert "provision_generation=generation-2" in line
+
     @pytest.mark.parametrize(
         "secret",
         [
@@ -301,6 +365,38 @@ class TestRedaction:
 
     def test_non_secret_text_untouched(self, mod):
         msg = "job job-123 completed in 4200ms with status ok"
+        assert mod.redact(msg) == msg
+
+    def test_credential_bearing_remote_keeps_its_host(self, mod):
+        # A failed push logs its remote; archived logs are read back by
+        # get_job_log (workspace_git_credentials_in_tool_and_audit_output).
+        token = "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b"
+        out = mod.redact(
+            f"Tool git_push failed: fatal: unable to access "
+            f"'https://oauth2:{token}@gitea.local/org/repo.git/': error 403"
+        )
+        assert token not in out and "oauth2" not in out
+        assert f"https://{mod._REDACTED}@gitea.local/org/repo.git/" in out
+        # A password-only userinfo is still a credential.
+        assert "s3cretPass9" not in mod.redact("redis://:s3cretPass9@cache:6379/0")
+
+    def test_a_hostile_jwt_run_is_linear(self, mod):
+        # `\b` treats `-` as a boundary, so `eyJ-eyJ-…` started a JWT match at
+        # every repetition and each rescanned the record: 0.85 s for 80 KB.
+        import time
+
+        best = float("inf")
+        for _ in range(3):
+            started = time.perf_counter()
+            mod.redact("eyJ-" * 20_000)
+            best = min(best, time.perf_counter() - started)
+        assert best < 0.1
+
+    def test_plain_remotes_are_untouched(self, mod):
+        msg = (
+            "cloned https://gitea.local/org/repo.git and "
+            "ssh://git@gitea.local:2222/org/repo.git"
+        )
         assert mod.redact(msg) == msg
 
     def test_json_message_is_redacted(self, mod):

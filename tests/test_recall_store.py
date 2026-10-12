@@ -816,7 +816,11 @@ class TestAssembly:
         assert RecallStore.assemble_memory_block([]) == ""
 
     def test_format_memory_pinned(self):
-        """format_memory() shows pinned status with TTL."""
+        """format_memory() carries no per-turn TTL text (D11).
+
+        A pinned memory renders like any other: the "pinned, N turns left"
+        clause went with append-only context injection 2e.
+        """
         memory = MemoryRecord(
             content="Important pinned memory.",
             importance=0.9,
@@ -824,8 +828,8 @@ class TestAssembly:
         )
 
         result = RecallStore.format_memory(memory, 1)
-        assert "pinned, 7 turns left" in result
-        assert "importance: 0.9" in result
+        assert "turns left" not in result
+        assert result == "[1] (importance: 0.9)\nImportant pinned memory."
 
     def test_assemble_memory_block_mixed(self):
         """assemble_memory_block() separates pinned from retrieved."""

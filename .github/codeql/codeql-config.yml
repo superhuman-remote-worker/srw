@@ -1,0 +1,9 @@
+name: srw CodeQL config
+
+# tests/ and scripts/ never ship: test fixtures (local TLS servers, URLs
+# asserted in responses) and the operator k3d gate scripts, whose report
+# lines name Secrets and Keycloak clients and pass real secrets through
+# _scrub(). Scanning them buried the production alerts in false positives.
+paths-ignore:
+  - tests
+  - scripts

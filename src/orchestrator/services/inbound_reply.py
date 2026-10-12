@@ -40,6 +40,8 @@ from uuid import uuid4
 
 from fastapi import HTTPException
 
+from shared.operator_pause_hold import operator_pause_hold_present
+
 logger = logging.getLogger(__name__)
 
 
@@ -237,6 +239,15 @@ async def route_inbound_reply(
             ),
         )
 
+    async def _resumed_strategy(strategy: str) -> str:
+        # An operator pause hold survives the internal resume: the message is
+        # queued behind it and reaches the worker only after an explicit
+        # resume, so report that instead of an immediate delivery.
+        resumed = await dependencies.store.get_job(job_id)
+        if resumed and operator_pause_hold_present(resumed.get("context")):
+            return "queued_until_resume"
+        return strategy
+
     # Resolve user_id from sender email or job owner
     user_id = None
     if sender_email:
@@ -301,7 +312,7 @@ async def route_inbound_reply(
             actor_id=resolver_id or user_id,
             dependencies=dependencies,
         )
-        return await _delivered("immediate_resume")
+        return await _delivered(await _resumed_strategy("immediate_resume"))
 
     # Officer-aware follow-ups (officer_message_routing.md §5.3): consult the
     # thread's route ONCE. Threads without a route (all pre-officer traffic)
@@ -400,7 +411,7 @@ async def route_inbound_reply(
         if strategy:
             return await _delivered(strategy)
         await _resume_reply_or_conflict(reason=URGENT_RESUME_REASON)
-        return await _delivered("immediate_interrupt")
+        return await _delivered(await _resumed_strategy("immediate_interrupt"))
 
     # Check user's async reply preference (same semantics as urgent above)
     async_pref = user_prefs.get("async_reply", "next_strategic_phase")
@@ -411,7 +422,7 @@ async def route_inbound_reply(
         if strategy:
             return await _delivered(strategy)
         await _resume_reply_or_conflict(reason=URGENT_RESUME_REASON)
-        return await _delivered("immediate_interrupt")
+        return await _delivered(await _resumed_strategy("immediate_interrupt"))
 
     # LLM triage: let auxiliary model decide guidance-now vs queue
     if async_pref == "llm_triage" and job.get("status") == "processing":

@@ -311,6 +311,8 @@ def db():
     db.create_job = AsyncMock(return_value={"id": CREATED_JOB_ID, "status": "created"})
     db.get_datasource = AsyncMock(return_value=None)
     db.link_datasource_to_job = AsyncMock()
+    # No project_workspace_defaults row: the installation decides the tier.
+    db.fetchrow = AsyncMock(return_value=None)
     return db
 
 
@@ -323,28 +325,45 @@ def _application_default():
     )
 
 
-async def _rest_create(db, fake_request, body, resolver):
+async def _rest_create(db, fake_request, body, resolver, preview=None):
     from tests._b09_control_seams import create_job
 
+    # The work-default preview dry-runs the snapshot renderer, which lives
+    # inside the (mocked) postgres create_job; stand in for its verdict.
+    preview = preview or AsyncMock(return_value=[])
     patches = [
-        patch("orchestrator.main.postgres_db", db),
+        patch("orchestrator.main.app.state.resources.postgres_db", db),
         patch(
-            "orchestrator.main.require_approved_user",
+            "orchestrator.services.job_admission_work_expert.preview_expert_refusals",
+            preview,
+        ),
+        patch(
+            "orchestrator.security.auth.require_approved_user",
             AsyncMock(return_value={"id": USER_ID, "is_admin": False}),
         ),
-        patch("orchestrator.main.require_project_member", AsyncMock(return_value=None)),
         patch(
-            "orchestrator.main._enforce_readiness_gate", AsyncMock(return_value=None)
-        ),
-        patch(
-            "orchestrator.main._require_job_project_access",
+            "orchestrator.security.access.require_project_member",
             AsyncMock(return_value=None),
         ),
-        patch("orchestrator.main._is_experts_db_enabled", MagicMock(return_value=True)),
-        patch("orchestrator.main._user_experts_enabled", AsyncMock(return_value=True)),
-        patch("orchestrator.main.resolve_root_expert", resolver),
         patch(
-            "orchestrator.main._authorize_thread_datasource_selection",
+            "orchestrator.application.access.enforce_readiness_gate",
+            AsyncMock(return_value=None),
+        ),
+        patch(
+            "orchestrator.application.jobs.require_job_project_access",
+            AsyncMock(return_value=None),
+        ),
+        patch(
+            "orchestrator.services.deployment_gates.is_experts_db_enabled",
+            MagicMock(return_value=True),
+        ),
+        patch(
+            "orchestrator.services.grant_enforcement.user_experts_enabled",
+            AsyncMock(return_value=True),
+        ),
+        patch("orchestrator.services.default_experts.resolve_root_expert", resolver),
+        patch(
+            "orchestrator.services.thread_datasource_authorization.authorize_thread_datasource_selection",
             AsyncMock(side_effect=lambda _actor, ids, **_kw: (list(ids), {})),
         ),
         patch(
@@ -352,14 +371,15 @@ async def _rest_create(db, fake_request, body, resolver):
             AsyncMock(return_value=([], {})),
         ),
         patch(
-            "orchestrator.main._enforce_job_create_grants", AsyncMock(return_value=None)
+            "orchestrator.services.grant_enforcement.enforce_job_create_grants",
+            AsyncMock(return_value=None),
         ),
         patch("orchestrator.services.job_provisioning.provision_job_repo", AsyncMock()),
         patch(
-            "orchestrator.main.subjob_completion_operations.spawn_scholar_subjob",
+            "orchestrator.services.subjob_completion.spawn_scholar_subjob",
             AsyncMock(return_value=None),
         ),
-        patch("orchestrator.main._trigger_dispatch", MagicMock()),
+        patch("orchestrator.services.job_dispatcher.trigger_dispatch", MagicMock()),
     ]
     with ExitStack() as stack:
         for item in patches:
@@ -382,7 +402,7 @@ class TestExplicitBundledExpertVersusApplicationDefault:
     async def test_naming_nobody_still_gets_the_application_default(
         self, db, fake_request
     ):
-        from orchestrator.main import JobCreate
+        from orchestrator.schemas.job_create import JobCreate
 
         resolver = AsyncMock(return_value=_application_default())
         kwargs = await _rest_create(
@@ -401,7 +421,7 @@ class TestExplicitBundledExpertVersusApplicationDefault:
     async def test_an_explicit_bundled_expert_suppresses_the_default(
         self, db, fake_request
     ):
-        from orchestrator.main import JobCreate
+        from orchestrator.schemas.job_create import JobCreate
 
         resolver = AsyncMock(return_value=_application_default())
         kwargs = await _rest_create(
@@ -425,7 +445,7 @@ class TestExplicitBundledExpertVersusApplicationDefault:
     async def test_an_explicit_db_expert_is_validated_not_defaulted(
         self, db, fake_request
     ):
-        from orchestrator.main import JobCreate
+        from orchestrator.schemas.job_create import JobCreate
         from orchestrator.services.default_experts import ExpertSelection
 
         resolver = AsyncMock(
@@ -455,7 +475,7 @@ class TestExplicitBundledExpertVersusApplicationDefault:
         (tests/test_db_backed_default_experts.py), and the funnel persists it
         as the `worker_base` + overlay pair — `resolve_config` re-roots the
         session fragment onto the worker overlay at dispatch."""
-        from orchestrator.main import JobCreate
+        from orchestrator.schemas.job_create import JobCreate
         from orchestrator.services.default_experts import ExpertSelection
 
         resolver = AsyncMock(
@@ -484,7 +504,7 @@ class TestExplicitBundledExpertVersusApplicationDefault:
     ):
         """A typo in ``expert`` used to buy a job that only fails at dispatch."""
         from fastapi import HTTPException
-        from orchestrator.main import JobCreate
+        from orchestrator.schemas.job_create import JobCreate
 
         resolver = AsyncMock(return_value=_application_default())
         with pytest.raises(HTTPException) as excinfo:
@@ -501,7 +521,7 @@ class TestExplicitBundledExpertVersusApplicationDefault:
     @pytest.mark.asyncio
     async def test_the_rest_body_refuses_two_experts_too(self, db, fake_request):
         from fastapi import HTTPException
-        from orchestrator.main import JobCreate
+        from orchestrator.schemas.job_create import JobCreate
 
         resolver = AsyncMock(return_value=_application_default())
         with pytest.raises(HTTPException) as excinfo:
@@ -518,3 +538,88 @@ class TestExplicitBundledExpertVersusApplicationDefault:
             )
 
         assert excinfo.value.status_code == 400
+
+
+class TestWorkCategoryStaffsAnUnnamedWorker:
+    """The same funnel, one tier further down the precedence: a job that names
+    no expert but carries a work category is staffed by that category's
+    default rather than the application default. See
+    knowledge-base/knowledge/issues/category_expert_default_skipped_on_direct_dispatch.md."""
+
+    @pytest.mark.asyncio
+    async def test_an_executor_reaches_create_job_as_its_default_expert(
+        self, db, fake_request
+    ):
+        from orchestrator.schemas.job_create import JobCreate
+        from orchestrator.services.work_categories import default_expert
+
+        resolver = AsyncMock(return_value=_application_default())
+        preview = AsyncMock(return_value=[])
+        kwargs = await _rest_create(
+            db,
+            fake_request,
+            JobCreate(
+                description="build it", project_id=PROJECT_ID, work_category="executor"
+            ),
+            resolver,
+            preview,
+        )
+
+        # Bound to the application store and asked about the exact
+        # override creation will persist.
+        assert preview.await_args.args == (db,)
+        assert preview.await_args.kwargs["config_name"] == default_expert("executor")
+        assert preview.await_args.kwargs["owner_id"] == USER_ID
+        assert kwargs["config_name"] == default_expert("executor")
+        assert kwargs["expert_id"] is None
+        assert kwargs["context"]["expert_selection"] == {
+            "source": "category",
+            "category": "executor",
+            "expert": default_expert("executor"),
+        }
+
+    @pytest.mark.asyncio
+    async def test_a_named_expert_still_outranks_the_category(self, db, fake_request):
+        from orchestrator.schemas.job_create import JobCreate
+
+        resolver = AsyncMock(return_value=_application_default())
+        kwargs = await _rest_create(
+            db,
+            fake_request,
+            JobCreate(
+                description="look first",
+                project_id=PROJECT_ID,
+                expert="scholar",
+                work_category="executor",
+            ),
+            resolver,
+        )
+
+        resolver.assert_not_awaited()
+        assert (kwargs["config_name"], kwargs["expert_id"]) == ("scholar", None)
+        assert kwargs["context"]["expert_selection"]["source"] == "bundled"
+
+    @pytest.mark.asyncio
+    async def test_a_refused_category_default_keeps_the_application_default(
+        self, db, fake_request
+    ):
+        from orchestrator.schemas.job_create import JobCreate
+
+        resolver = AsyncMock(return_value=_application_default())
+        kwargs = await _rest_create(
+            db,
+            fake_request,
+            JobCreate(
+                description="build it", project_id=PROJECT_ID, work_category="executor"
+            ),
+            resolver,
+            AsyncMock(return_value=["shell_tools: tools.shell requires it"]),
+        )
+
+        assert (kwargs["config_name"], kwargs["expert_id"]) == (
+            BASE_WORKER_CONFIG,
+            DB_EXPERT,
+        )
+        selection = kwargs["context"]["expert_selection"]
+        assert selection["source"] == "application"
+        assert selection["denied_defaults"][0]["expert"] == "engineer"

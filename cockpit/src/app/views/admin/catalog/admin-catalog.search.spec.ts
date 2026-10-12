@@ -110,17 +110,17 @@ describe('AdminCatalogComponent search/fetch form', () => {
     }));
   });
 
-  it('limits Crawl4AI rows to extract and crawl', () => {
+  it('limits Crawl4AI rows to extract, crawl and map', () => {
     const fixture = TestBed.createComponent(AdminCatalogComponent);
     const component = fixture.componentInstance;
     component.formSearchOps.set(['search', 'extract', 'crawl', 'map']);
 
     component.onSearchProviderChange('crawl4ai');
 
-    expect(component.formSearchOps()).toEqual(['extract', 'crawl']);
+    expect(component.formSearchOps()).toEqual(['extract', 'crawl', 'map']);
     expect(component.isResearchOpSupported('extract')).toBe(true);
     expect(component.isResearchOpSupported('crawl')).toBe(true);
+    expect(component.isResearchOpSupported('map')).toBe(true);
     expect(component.isResearchOpSupported('search')).toBe(false);
-    expect(component.isResearchOpSupported('map')).toBe(false);
   });
 });

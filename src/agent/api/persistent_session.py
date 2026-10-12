@@ -12,6 +12,7 @@ import hashlib
 import json
 import logging
 import os
+import threading
 import time
 from dataclasses import asdict as _dc_asdict
 from dataclasses import dataclass, field
@@ -19,12 +20,13 @@ from dataclasses import is_dataclass as _dc_is_dataclass
 from dataclasses import replace as _dc_replace
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Literal, Optional
 
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import BaseMessage
 
 from agent.core.context import ContextConfig, ContextManager
+from agent.core.summarizer import load_summarizer_prompt
 from shared.runtime.core.loader import (
     AgentConfig,
     FileResolver,
@@ -54,6 +56,7 @@ from shared.runtime.services.memory_prompts import (
     resolve_citation_verification_prompt,
     resolve_memory_extraction_prompt,
 )
+from agent.services.cloud_sync.protected_lower import is_protected_reader_transport
 from agent.tools import ToolContext, load_tools, apply_instruction_enforcement
 from agent.tools.context import SessionRuntimeFacts
 from agent.tools.description_manager import apply_description_overrides
@@ -179,6 +182,68 @@ def _canvas_enabled(config: Any) -> bool:
     return extra.get(_CANVAS_DISABLED_KEY) is not True
 
 
+def _in_workspace_cloud_folders(
+    cloud_mount_cfg: Dict[str, Any], manager: Any
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """``(mounted, unavailable)`` prompt rows of an in-workspace mount set:
+    each folder ``manager`` mounted under workspace/cloud, and each attached
+    folder the orchestrator left out (main cloud slice 3)."""
+    from shared.runtime.services.cloud_mount.sidecar import (
+        describe_mounted,
+        excluded_row,
+    )
+
+    access = {
+        str(mount.get("mount_id")): str(mount.get("access") or "read_write")
+        for mount in cloud_mount_cfg.get("mounts") or []
+        if isinstance(mount, dict)
+    }
+    shared = cloud_mount_cfg.get("outbox_shared")
+    mounted = [
+        {
+            "name": state.workspace_name,
+            "path": f"workspace/cloud/{state.workspace_name}",
+            "kind": state.mount_kind,
+            "state": "mounted",
+            "text": describe_mounted(
+                state.mount_kind,
+                access.get(state.mount_id, "read_write"),
+                shared=shared if isinstance(shared, bool) else None,
+            ),
+        }
+        for state in getattr(manager, "mounts", None) or []
+    ]
+    unavailable = [
+        excluded_row(entry)
+        for entry in cloud_mount_cfg.get("excluded") or []
+        if isinstance(entry, dict)
+    ]
+    return mounted, unavailable
+
+
+def _config_with_cloud_folders(
+    config: Any,
+    mounted: list[dict[str, Any]],
+    unavailable: list[dict[str, Any]],
+) -> Any:
+    """``config`` keeping a session's cloud folders for its system prompt:
+    what is mounted, what is not (``cloud_mount_system_floor``). A copy,
+    never an in-place write: the config may be the pod-wide singleton a
+    later session reuses."""
+    if (not mounted and not unavailable) or not (
+        _dc_is_dataclass(config) and hasattr(config, "extra")
+    ):
+        return config
+    return _dc_replace(
+        config,
+        extra={
+            **config.extra,
+            "_cloud_mounts_mounted": mounted,
+            "_cloud_mounts_unavailable": unavailable,
+        },
+    )
+
+
 @dataclass
 class PersistentSession:
     """State for an interactive persistent agent session.
@@ -200,6 +265,13 @@ class PersistentSession:
     # generation/incarnation/SSH identity and terminal cleanup must produce the
     # tier-specific local zero-writer proof before settlement can be ACKed.
     pinned_runtime_identity_required: bool = False
+    # Exact terminal-owner checkpoints. These never constitute remote zero.
+    terminal_finalization_attempted: bool = False
+    terminal_memory_capture_attempted: bool = False
+    terminal_vm_shell_drained: bool = False
+    terminal_vm_drain_complete: bool = False
+    terminal_actuator_request: dict[str, Any] | None = None
+    terminal_actuator_request_accepted: bool = False
 
     # U5 session-parent delegation.  These are injected by persistent_app so
     # this state object never imports process-global owner/lease machinery.
@@ -208,7 +280,19 @@ class PersistentSession:
     subagent_provider_admission: Optional[Callable[[], bool]] = None
     subagent_effect_authority: Optional[Callable[[], Any]] = None
     subagent_settlement_authority: Optional[Callable[[], Any]] = None
+    # Reads, after a refused child write, whether the orchestrator authorized
+    # this life's retirement (``SessionHost.retirement_authorized``).
+    subagent_retirement_authorized: Optional[Callable[[], Any]] = None
     subagent_event_callback: Optional[Callable[[str], Any]] = None
+    # The orchestrator's per-claim advertisement (parallel_subagents.md §12):
+    # it can settle an interrupted delegation batch
+    # (``session_subagent_batch_settle_contract`` == 1), and its operator
+    # switch lets this session's lane fan out (``session_subagent_fanout``).
+    # Set at attach; a warm stateless session gets both again at every claim
+    # through ``apply_subagent_fanout_advertisement``, never through a fresh
+    # attach.
+    subagent_batch_settle_contract: bool = False
+    subagent_fanout: bool = False
 
     # Permission mode (switchable at runtime)
     permission_mode: str = "supervised"
@@ -294,6 +378,12 @@ class PersistentSession:
     # Lazy rclone cloud mounts (initialized from cloud_mount payload)
     cloud_mount_manager: Optional[Any] = None
     cloud_mount_error: Optional[str] = None
+    # The watcher of a Pod's sidecar folders (D7), kept for reporting their
+    # state even when no cloud manager is active.
+    sidecar_mount_watcher: Optional[Any] = None
+    # Decision 42: a protected session whose sidecar cloud layer did not come
+    # up runs with no cloud folder at all; the closed reason, else None.
+    protected_cloud_unavailable: Optional[str] = None
     # Capture overlay stacked on the RO lower for protected sessions (B9)
     overlay_mount_manager: Optional[Any] = None
     # Exact physical workspace identity that authorized this protected
@@ -332,6 +422,17 @@ class PersistentSession:
     # (live_session_settings.md Slice B). Set at attach; replaced by
     # resetup_datasources().
     datasource_configs: List[Dict[str, Any]] = field(default_factory=list)
+    # One live datasource change at a time: its checkouts clone off the event
+    # loop (minutes for a git swap repository's first clone, C3), and the next
+    # change must diff against what the last one applied. A backend swap (the
+    # VM upgrade) takes it too: it re-delivers the applied connectors.
+    _live_connector_lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
+    # The running live change's cancel event (a ``threading.Event``), set by
+    # cleanup so its clone thread stops with the session.
+    _live_change_cancel: Optional[Any] = field(default=None, repr=False)
+    # ``{authority_id: status}`` of the connector SSH identities loaded into
+    # workspace ssh-agents (C1); credential-free. Set at setup, updated live.
+    workspace_ssh_identity_status: Dict[str, str] = field(default_factory=dict)
 
     # Per-tool-call approval decisions (tool_call_id -> 'approved'|'denied').
     # Populated by the WS permission_check; consumed at turn save so the
@@ -372,6 +473,9 @@ class PersistentSession:
         managed_repository_credentials = workspace_override.pop(
             "managed_repository_credentials", None
         )
+        workspace_ssh_identities = workspace_override.pop(
+            "workspace_ssh_identities", None
+        )
         self._llm = llm
         self.auxiliary_llm = auxiliary_llm
         self.postgres_conn = postgres_conn
@@ -409,6 +513,7 @@ class PersistentSession:
                 workspace_override=workspace_override,
                 git_remote_url=git_remote_url,
                 managed_repository_credentials=(managed_repository_credentials),
+                workspace_ssh_identities=workspace_ssh_identities,
                 cloud_mount_cfg=cloud_mount_cfg,
             )
         finally:
@@ -430,6 +535,7 @@ class PersistentSession:
         git_remote_url: Optional[str],
         cloud_mount_cfg: Optional[Dict[str, Any]],
         managed_repository_credentials: Optional[List[Dict[str, Any]]] = None,
+        workspace_ssh_identities: Optional[List[Dict[str, Any]]] = None,
     ) -> None:
         """The ordered setup steps of :meth:`setup` (see its docstring).
 
@@ -453,6 +559,7 @@ class PersistentSession:
             workspace_override=workspace_override,
             git_remote_url=git_remote_url,
             managed_repository_credentials=managed_repository_credentials,
+            workspace_ssh_identities=workspace_ssh_identities,
         )
         await self._seed_workspace_baseline_commit(postgres_conn)
         _steps["workspace"] = time.perf_counter() - _t
@@ -461,6 +568,12 @@ class PersistentSession:
         # 2. Set up lazy cloud mounts before shell/tools so `/workspace/cloud`
         #    exists when the agent starts using the workspace.
         await self._setup_cloud_mount(cloud_mount_cfg)
+        if not cloud_mount_cfg:
+            # No cloud folder mounts (a deployment that syncs files instead,
+            # or every attached folder left out); the orchestrator names each.
+            self._note_undelivered_cloud_folders(
+                (workspace_override or {}).get("cloud_folders_excluded")
+            )
         _steps["cloud_mount"] = time.perf_counter() - _t
         _t = time.perf_counter()
 
@@ -519,12 +632,16 @@ class PersistentSession:
             model=self.config.llm.model or "",
             tool_names=[t.name for t in self.tools] if self.tools else None,
             prompt_type="interactive",
+            # A stateless session cannot run a background child; the
+            # delegation floor must not offer one (same test as the lane).
+            delegation_background_available=self.shell_owner_token is None,
         )
         _steps["prompt"] = time.perf_counter() - _t
         _t = time.perf_counter()
 
         # 9. Set up memory (RecallStore) if enabled
         self._setup_memory(postgres_conn, vector_conn)
+        await self._hydrate_pending_memory()
         self._refresh_runtime_facts()
         _steps["memory"] = time.perf_counter() - _t
 
@@ -648,6 +765,7 @@ class PersistentSession:
         workspace_override: Optional[Dict[str, Any]] = None,
         git_remote_url: Optional[str] = None,
         managed_repository_credentials: Optional[List[Dict[str, Any]]] = None,
+        workspace_ssh_identities: Optional[List[Dict[str, Any]]] = None,
     ) -> None:
         """Create workspace using a remote backend (required).
 
@@ -863,6 +981,21 @@ class PersistentSession:
             managed_repository_credentials, workspace_backend
         )
         del managed_repository_credentials
+        from agent.connectors import RuntimeContext, connector_registry
+
+        # Per-identity and never fatal: a broken connector key degrades only
+        # its own connector (the clone at attach skips it). Off the event
+        # loop: each identity is a blocking round trip to the workspace. A
+        # session owns its workspace, so identities it no longer delivers
+        # are retired here (agent.connectors.ssh_identity).
+        identities = RuntimeContext(
+            execution="session",
+            backend=workspace_backend,
+            ssh_identities=workspace_ssh_identities,
+        )
+        del workspace_ssh_identities
+        await connector_registry().initialize_workspace(identities, offload=True)
+        self.workspace_ssh_identity_status = identities.ssh_identity_status or {}
         if repository_url_has_credentials(git_remote_url):
             raise ManagedRepositoryMaterializationError(
                 "credentialed_managed_repository_url_refused"
@@ -1016,6 +1149,7 @@ class PersistentSession:
                 "protected-cloud mount contract is missing or malformed"
             )
         if not cloud_mount_cfg:
+            await self._retire_unplanned_cloud_mounts()
             return
         # Background officer (officer_knowledge_plane.md §4): the project/cloud
         # folder is object plane — never mounted for a commissioned officer,
@@ -1039,6 +1173,9 @@ class PersistentSession:
                 raise WorkspaceUnavailableError(
                     "cloud mount requires an attached workspace"
                 )
+            return
+        if cloud_mount_cfg.get("delivery") == "sidecar":
+            await self._setup_sidecar_cloud_mount(cloud_mount_cfg)
             return
         from shared.runtime.services.cloud_mount import (
             RcloneMountCleanFailure,
@@ -1084,6 +1221,73 @@ class PersistentSession:
                 raise
             return
 
+        if not cloud_mount_cfg.get("protected"):
+            self.config = _config_with_cloud_folders(
+                self.config,
+                *_in_workspace_cloud_folders(cloud_mount_cfg, self.cloud_mount_manager),
+            )
+        await self._finish_protected_cloud(cloud_mount_cfg)
+
+    async def _retire_unplanned_cloud_mounts(self) -> None:
+        """No folder is mounted into this claim's workspace: a resident an
+        earlier claim mounted, for a folder detached, revoked or left out
+        since, is stopped and its rclone config with its credential removed
+        (``RcloneMountManager.retire_unplanned_sync``). Best effort, never
+        raises: what stays is retried at the next claim and at End."""
+        backend = getattr(self.workspace_manager, "backend", None)
+        if backend is None or not all(
+            callable(getattr(backend, name, None))
+            for name in ("exec_command", "write_home_file", "resolve_home_path")
+        ):
+            return
+        from shared.runtime.services.cloud_mount import RcloneMountManager
+
+        try:
+            manager = RcloneMountManager(
+                thread_id=self.thread_id,
+                cloud_cfg={"driver": "rclone", "mounts": []},
+                workspace_backend=backend,
+                workspace_root=self.workspace_manager.path,
+            )
+            await asyncio.to_thread(manager.retire_unplanned_sync, [])
+        except Exception:
+            logger.warning(
+                "Could not retire cloud mounts outside this claim's set",
+                exc_info=True,
+            )
+
+    def _note_undelivered_cloud_folders(self, excluded: Any) -> None:
+        """Name in the prompt each attached cloud folder the orchestrator
+        lists while none mounts (``cloud_folders_excluded``, main cloud): the
+        ones this deployment's sync does not deliver
+        (``delivery_unsupported``), or every one an in-workspace mount set
+        left out, so the agent never says work is saved where nothing is
+        mounted. Not for a background officer, whose cloud is object plane,
+        nor a protected session, whose cloud has its own contract."""
+        if (
+            not isinstance(excluded, list)
+            or not excluded
+            or self.protected_cloud_required
+        ):
+            return
+        from agent.tools.registry import officer_ceiling_active
+        from shared.runtime.services.cloud_mount.sidecar import excluded_row
+
+        if officer_ceiling_active(getattr(self.config, "officer", None)):
+            return
+        self.config = _config_with_cloud_folders(
+            self.config,
+            [],
+            [excluded_row(entry) for entry in excluded if isinstance(entry, dict)],
+        )
+
+    async def _finish_protected_cloud(self, cloud_mount_cfg: Dict[str, Any]) -> None:
+        """Mount the capture overlay on the protected lower and prove both.
+
+        The lower is the in-workspace rclone's or, for a sidecar Pod (D7),
+        the sidecars'; either way the overlay runs in the workspace and the
+        session refuses to run half-protected.
+        """
         if cloud_mount_cfg.get("protected") and cloud_mount_cfg.get("overlay"):
             try:
                 from shared.runtime.services.cloud_overlay import OverlayMountManager
@@ -1207,12 +1411,138 @@ class PersistentSession:
                 "protected-cloud lower and capture overlay are not both active"
             )
 
+    async def _setup_sidecar_cloud_mount(self, cloud_mount_cfg: Dict[str, Any]) -> None:
+        """Attach to the cloud folders the Pod's sidecars mounted (D7).
+
+        Nothing is started here: the folders were mounted when the Pod was
+        created. The watcher waits, bounded, for each to settle, links the
+        mounted ones into workspace/cloud, and keeps what did not come up
+        (with its reason) for the prompt and srw_cloud_status. A folder that
+        did not mount never fails the attach.
+        """
+        from shared.runtime.services.cloud_mount.sidecar import SidecarMountWatcher
+
+        watcher = SidecarMountWatcher(
+            thread_id=self.thread_id,
+            cloud_cfg=cloud_mount_cfg,
+            workspace_backend=self.workspace_manager.backend,
+            workspace_root=self.workspace_manager.path,
+        )
+        try:
+            await watcher.start_all()
+        except Exception as e:
+            # The folders may well be mounted; the session goes on without
+            # links or a fresh state read rather than without its workspace.
+            self.cloud_mount_error = f"cloud folders: {type(e).__name__}"
+            logger.warning("Could not attach to the sidecar cloud folders: %s", e)
+        self.cloud_mount_manager = watcher
+        self.sidecar_mount_watcher = watcher
+        if cloud_mount_cfg.get("protected") and cloud_mount_cfg.get("overlay"):
+            reason = None
+            if not watcher.active:
+                rows = watcher.report()
+                reason = next(
+                    (row["reason"] for row in rows if row.get("reason")),
+                    # Still coming up after the wait: it did not answer in
+                    # time; no status file at all: the service is not there.
+                    "timeout"
+                    if any(row["state"] == "pending" for row in rows)
+                    else "sidecar_unavailable",
+                )
+            else:
+                try:
+                    await self._finish_protected_cloud(cloud_mount_cfg)
+                except Exception as exc:
+                    # The overlay failed and was rolled back (the lower is
+                    # read-only and stays the sidecars').
+                    logger.warning(
+                        "Protected cloud overlay did not mount: %s", type(exc).__name__
+                    )
+                    reason = "protected_unavailable"
+            if reason is not None:
+                await self._run_protected_without_cloud(
+                    watcher, reason, cloud_mount_cfg["overlay"]
+                )
+        unavailable = watcher.unavailable()
+        if unavailable:
+            if self.protected_cloud_unavailable is not None:
+                # No workspace/cloud exists in this state: say what the user
+                # sees, never a path.
+                self.cloud_mount_error = watcher.status()
+            else:
+                self.cloud_mount_error = "; ".join(
+                    f"{row['path'] or row.get('title') or 'a folder'}: {row['text']}"
+                    for row in unavailable
+                )
+        self.config = _config_with_cloud_folders(
+            self.config, watcher.mounted(), unavailable
+        )
+        logger.info(
+            "Sidecar cloud folders: %d mounted, %d unavailable",
+            len(watcher.mounts),
+            len(unavailable),
+        )
+
+    async def _run_protected_without_cloud(
+        self, watcher: Any, reason: str, overlay_cfg: Dict[str, Any]
+    ) -> None:
+        """Decision 42: a protected session whose cloud layer did not come up
+        starts with no cloud folder at all, so nothing reaches the cloud
+        unreviewed, and says why (the closed ``reason``) in its state, its
+        prompt and the cockpit, rather than failing the attach.
+
+        No cloud folder at all means: a capture overlay an earlier attach or
+        claim left (its lower now dead, or this attach's own failed one) is
+        unmounted, the upper with the captured changes staying for the next
+        attach; and a workspace/cloud link to its merged view is removed,
+        or writes would land in the sidecars' small memory volume and be
+        lost. Decision 42 covers the in-pod plane only: the in-workspace
+        protected path (_setup_cloud_mount) and a delivery-level
+        engage_refused keep failing closed, as before D7."""
+        logger.warning(
+            "Protected session %s runs without its cloud: %s", self.thread_id, reason
+        )
+        from shared.runtime.services.cloud_overlay import OverlayMountManager
+
+        try:
+            leftover = OverlayMountManager(
+                thread_id=self.thread_id,
+                overlay_cfg=dict(overlay_cfg),
+                workspace_backend=self.workspace_manager.backend,
+                workspace_root=self.workspace_manager.path,
+            )
+            # A stateless claim proves the mount gone (strict), as End does.
+            await asyncio.to_thread(
+                leftover.unmount, strict=self.shell_owner_token is not None
+            )
+        except Exception as exc:
+            logger.warning(
+                "A leftover capture overlay did not unmount: %s", type(exc).__name__
+            )
+        try:
+            await asyncio.to_thread(watcher.remove_link_to, str(overlay_cfg["merged"]))
+        except Exception as exc:
+            logger.warning(
+                "Could not remove the workspace/cloud link to the capture overlay: %s",
+                type(exc).__name__,
+            )
+        watcher.mark_unavailable(reason)
+        self.protected_cloud_unavailable = reason
+        self.cloud_mount_manager = None
+        self.overlay_mount_manager = None
+        self._protected_mount_id = None
+        self._protected_cloud_health_ready = False
+
     @staticmethod
     def _protected_cloud_config_valid(payload: Any) -> bool:
         """Validate every protected field that can drive mount/delete work."""
 
         if not isinstance(payload, dict):
             return False
+        if payload.get("delivery") == "sidecar":
+            from agent.api.session_workspace import protected_sidecar_mount_valid
+
+            return protected_sidecar_mount_valid(payload)
         overlay = payload.get("overlay")
         mounts = payload.get("mounts")
         if (
@@ -1237,35 +1567,30 @@ class PersistentSession:
         lower = mounts[0]
         if not isinstance(lower, dict):
             return False
-        source = lower.get("source")
-        source_config = source.get("config") if isinstance(source, dict) else None
-        auth = lower.get("auth")
         return bool(
             isinstance(lower.get("mount_id"), str)
             and lower.get("mount_id")
             and lower.get("mount_kind") == "protected_lower"
-            and lower.get("backend") == "nextcloud"
             and lower.get("target_path") == "/cloud/lower"
             and lower.get("workspace_name") == "lower"
             and lower.get("access") == "read_only"
-            and isinstance(source, dict)
-            and source.get("type") == "webdav"
-            and isinstance(source_config, dict)
-            and source_config.get("vendor") == "nextcloud"
-            and isinstance(source_config.get("url"), str)
-            and source_config.get("url")
-            and isinstance(source_config.get("user"), str)
-            and source_config.get("user")
-            and isinstance(auth, dict)
-            and auth.get("type") == "basic"
-            and isinstance(auth.get("password"), str)
-            and auth.get("password")
+            and is_protected_reader_transport(lower)
         )
 
     def protected_cloud_ready(self) -> bool:
-        """Joined lower-controller + overlay readiness invariant."""
+        """Joined lower-controller + overlay readiness invariant.
+
+        Also ready when a protected session runs without its cloud on
+        purpose (decision 42): with no cloud manager and no overlay there is
+        no path by which anything reaches the cloud unreviewed."""
 
         if not self.protected_cloud_required:
+            return True
+        if (
+            self.protected_cloud_unavailable is not None
+            and self.cloud_mount_manager is None
+            and self.overlay_mount_manager is None
+        ):
             return True
         manager = self.cloud_mount_manager
         overlay = self.overlay_mount_manager
@@ -1447,11 +1772,10 @@ class PersistentSession:
         else:  # Lightweight test/config adapters may not be real dataclasses.
             self.config.extra = next_extra
             self.config.instruction_files = instruction_files
-        if self.tool_context is not None:
-            # use_skill authorizes by the CURRENT scoped menu, not by stale
-            # workspace bytes. Keep its long-lived ToolContext synchronized on
-            # every backend/config rebind.
-            self.tool_context.config["_resolved_skills"] = scoped
+        # use_skill authorizes by the CURRENT scoped menu, not by stale
+        # workspace bytes. Keep its long-lived ToolContext synchronized on
+        # every backend/config rebind — the whole dict, not just the menu.
+        self.refresh_tool_context_config()
 
     def _deploy_catalog_skill_files(
         self, only_names: Optional[set[str]] = None
@@ -1714,6 +2038,11 @@ class PersistentSession:
                 deployment_dir=self.config._deployment_dir,
                 framework_dir=templates_dir,
             )
+        resolved_instructions = (
+            self.config.extra.get("_resolved_instructions", {}) or {}
+        )
+        missing_bound_skills: list[str] = []
+        undeliverable_files: list[str] = []
         for entry in self.config.instruction_files:
             try:
                 if entry.skill:
@@ -1723,13 +2052,13 @@ class PersistentSession:
                     # workspaces, which would redeploy (clobber) on resume.
                     if self.workspace_manager.exists(entry.path):
                         continue  # don't overwrite on session resume
-                    content = self.config.extra.get("_resolved_instructions", {}).get(
-                        entry.skill
-                    )
+                    content = resolved_instructions.get(entry.skill)
                     if not content:
                         logger.warning(
                             f"Bound skill content missing from blob: {entry.skill}"
                         )
+                        if entry.skill not in missing_bound_skills:
+                            missing_bound_skills.append(entry.skill)
                         continue
                     content = render_instruction_content(
                         content, [], origin=f"bound skill {entry.skill!r}"
@@ -1744,13 +2073,19 @@ class PersistentSession:
                 # Backend-aware for the same reason as the skill branch above.
                 if self.workspace_manager.exists(entry.file):
                     continue
-                if file_resolver is None:
-                    logger.warning(
-                        f"Cannot deploy instruction file {entry.file}: "
-                        "no deployment dir"
-                    )
-                    continue
-                content = file_resolver.load(Path(entry.file).name)
+                # The frozen blob first, as the worker does: resolution froze
+                # the file from the expert directory, and a session never has
+                # a deployment dir of its own.
+                content = resolved_instructions.get(Path(entry.file).stem)
+                if not content:
+                    if file_resolver is None:
+                        logger.warning(
+                            f"Cannot deploy instruction file {entry.file}: not in "
+                            "the frozen blob and no deployment dir"
+                        )
+                        undeliverable_files.append(entry.file)
+                        continue
+                    content = file_resolver.load(Path(entry.file).name)
                 content = render_instruction_content(
                     content, [], origin=f"instruction file {entry.file!r}"
                 )
@@ -1762,8 +2097,41 @@ class PersistentSession:
                 logger.debug(f"Deployed instruction file to workspace: {entry.file}")
             except FileNotFoundError:
                 logger.warning(f"Instruction file not found: {entry.file}")
+                undeliverable_files.append(entry.file)
             except Exception as e:
                 logger.warning(f"Failed to deploy instruction file {entry.file}: {e}")
+
+        if undeliverable_files:
+            # A gate on a file that never reached the workspace cannot open:
+            # read_file reports "not found" and the gated tool refuses every
+            # call (session 2c6d3e06 lost write_file to design_guide.md this
+            # way). Drop such bindings, as subagents do
+            # (drop_missing_before_tool_bindings), so the tool keeps working.
+            kept = [
+                entry
+                for entry in self.config.instruction_files
+                if entry.skill or entry.file not in undeliverable_files
+            ]
+            logger.warning(
+                "Dropped instruction binding(s) whose file could not be delivered: %s",
+                ", ".join(sorted(set(undeliverable_files))),
+            )
+            if _dc_is_dataclass(self.config):
+                self.config = _dc_replace(self.config, instruction_files=kept)
+            else:  # Lightweight test/config adapters may not be real dataclasses.
+                self.config.instruction_files = kept
+
+        if missing_bound_skills:
+            # Fail closed when a fresh session needs a bound skill the frozen
+            # blob cannot supply. Otherwise the gate bricks the tool while
+            # read_file can only report "not found" — an unbounded loop.
+            # Retained files on resume keep their historical skip above.
+            raise RuntimeError(
+                "Bound skill content missing from frozen blob: "
+                f"{sorted(missing_bound_skills)}. The session's mandatory "
+                "instruction gate cannot be satisfied without it; failing "
+                "closed rather than demanding an impossible read."
+            )
 
     def _enforce_officer_knowledge_invariant(self) -> None:
         """Fail the attach when a background officer is mis-bound (K1, §3.1).
@@ -1905,11 +2273,15 @@ class PersistentSession:
             # Neo4j is optional: do not mark vector search/read as degraded.
             logger.warning(f"Failed to initialize Neo4j Graph tier (non-fatal): {e}")
 
-    def _setup_tools(self, postgres_conn: Optional[Any]) -> None:
-        """Load tools from config, excluding phase-specific ones."""
+    def _tool_config(self) -> Dict[str, Any]:
+        """The plain dict tools read through ``ToolContext.get_config``.
+
+        Derived from the CURRENT ``self.config`` and runtime managers, so
+        ``refresh_tool_context_config`` can re-derive it after a live update.
+        """
         from agent.tools.registry import officer_ceiling_active
 
-        tool_config = {
+        return {
             **self.config.extra,
             # Background-officer runtime fact (officer_knowledge_plane.md §4):
             # lets tools that survive the capability ceiling trim object-plane
@@ -1920,6 +2292,10 @@ class PersistentSession:
             ),
             "agent_id": self.config.agent_id,
             "multimodal": self.config.llm.multimodal,
+            # Whether the parent model may send several tool calls per message
+            # (matrix `parallel_tool_calls`): the delegate_agent description
+            # offers session fan-out only to a model that can issue it.
+            "parallel_tool_calls": self.config.llm.parallel_tool_calls,
             # Lets bulk readers cap a single tool result relative to the main
             # model's window (session_silent_failure_audit.md #5).
             "model_max_context_tokens": self.config.limits.model_max_context_tokens,
@@ -1940,13 +2316,192 @@ class PersistentSession:
                 "root": "/cloud",
                 "workspace_entry": "/workspace/cloud",
                 "scan_guard": self.config.extra.get("cloud_scan_guard", "block"),
-                "_manager": self.cloud_mount_manager,
+                # A protected session without its cloud (decision 42) keeps
+                # only the sidecar watcher, for srw_cloud_status to say why.
+                "_manager": self.cloud_mount_manager or self.sidecar_mount_watcher,
                 "protected": bool(
                     self.overlay_mount_manager and self.overlay_mount_manager.active
                 ),
                 "_overlay_manager": self.overlay_mount_manager,
             },
         }
+
+    def refresh_tool_context_config(self) -> None:
+        """Re-derive ``tool_context.config`` from the CURRENT ``self.config``.
+
+        A live update replaces ``self.config``, but ``_setup_tools`` built this
+        dict once. The bind is the intersection of the name list (read from
+        ``self.config``) and what each factory builds (read from this dict), so
+        a stale copy silently empties a category — a persistent-mode name list
+        against a stateless shell factory binds no executor, and a ticked
+        Delegation binds nothing because ``delegation.enabled`` is still the
+        boot value. See
+        knowledge-base/knowledge/issues/live_config_update_buries_extra_and_empties_the_shell_group.md.
+
+        Updated in place without dropping a key that survives: tools share the
+        dict by reference and one may be reading it mid-turn.
+        """
+        if self.tool_context is None:
+            return
+        fresh = self._tool_config()
+        current = self.tool_context.config
+        current.update(fresh)
+        for key in [key for key in current if key not in fresh]:
+            del current[key]
+
+    def apply_subagent_fanout_advertisement(
+        self, *, batch_settle_contract: bool, fanout: bool
+    ) -> bool:
+        """Apply one claim's fan-out advertisement in place. Returns True when
+        either value changed.
+
+        The stateless executor calls this at every claim, warm reuse
+        included, so the orchestrator's operator switch reaches the next claim
+        of a warm session without a detach and re-attach
+        (parallel_subagents.md §12). A change republishes both flags on the
+        tool context and rebuilds the ``delegate_agent`` description when its
+        text moved. Only a literal ``True`` sets either flag.
+
+        A failed rebuild never fails the claim: the flags just published are
+        what the gate and the runtime read, so only the description could be
+        stale, and the next change rebuilds it again.
+        """
+        settle = batch_settle_contract is True
+        switch = fanout is True
+        changed = (
+            self.subagent_batch_settle_contract is not settle
+            or self.subagent_fanout is not switch
+        )
+        self.subagent_batch_settle_contract = settle
+        self.subagent_fanout = switch
+        if self.tool_context is not None:
+            self.tool_context._session_subagent_batch_settle_contract = settle
+            self.tool_context._session_subagent_fanout = switch
+        if changed:
+            try:
+                self.refresh_delegation_description()
+            except Exception:  # noqa: BLE001 - the flags already govern
+                logger.warning(
+                    "delegate_agent description rebuild failed after a fan-out "
+                    "advertisement change (settle=%s fanout=%s)",
+                    settle,
+                    switch,
+                    exc_info=True,
+                )
+        return changed
+
+    def apply_pending_memory(self, stored: Any) -> bool:
+        """Take the thread's durable pending memory set in (WP4, D32).
+
+        ``stored`` is the set saved in ``threads.metadata`` at the end of an
+        earlier turn (the idle-time prefetch), as the stateless claim bundle
+        carries it beside ``attach`` (B9) or the pinned setup reads it. It
+        becomes the memory manager's pending set, which the first provider
+        call of the next turn takes in. A set the manager already holds or
+        has taken in is not taken again (a warm session at its next claim).
+        append_only only; returns True when the set was taken in.
+        """
+        if stored is None or self.memory_service is None:
+            return False
+        from shared.runtime.core.context_entries import is_append_only
+
+        if not is_append_only(self.config):
+            return False
+        seed = getattr(self.memory_service, "seed_prefetch", None)
+        if seed is None:
+            return False
+        from agent.services.memory.pending_set import deserialize_pending_set
+
+        result = deserialize_pending_set(stored)
+        if result is None:
+            return False
+        taken = bool(seed(result))
+        if taken:
+            logger.info(
+                "Pending memory set %s taken in for thread %s: %d memories, %d notes",
+                result.pending_id,
+                self.thread_id,
+                len(result.records("memory")),
+                len(result.records("knowledge")),
+            )
+        return taken
+
+    async def _hydrate_pending_memory(self) -> None:
+        """Pinned setup: read the durable pending memory set (WP4, D32).
+
+        A pinned session in a fresh process continues the set the previous
+        process saved. The stateless lane gets it from the claim bundle at
+        every claim instead (B9), so it reads nothing here.
+        """
+        if (
+            self.shell_owner_token is not None
+            or self.memory_service is None
+            or self.postgres_conn is None
+        ):
+            return
+        from shared.runtime.core.context_entries import is_append_only
+
+        if not is_append_only(self.config):
+            return
+        reader = getattr(self.postgres_conn, "get_thread_pending_memory", None)
+        if reader is None:
+            return
+        try:
+            stored = await reader(self.thread_id)
+        except Exception as e:
+            logger.warning(
+                "Could not read the pending memory set of thread %s "
+                "(non-fatal): %s: %s",
+                self.thread_id,
+                type(e).__name__,
+                e,
+            )
+            return
+        self.apply_pending_memory(stored)
+
+    def refresh_delegation_description(self) -> bool:
+        """Rebuild the tools when the bound ``delegate_agent`` description no
+        longer matches the live config. Returns True when it rebuilt.
+
+        The description states the cap, the fan-out mode and whether the
+        model can send parallel calls; the runtime re-reads the same cap at
+        every admission (``agent.tools.delegation.fanout``). An llm-only or a
+        delegation-only live update reloads no tools, so without this the two
+        would disagree after a model switch (parallel_subagents.md §6.4).
+        Call after ``refresh_tool_context_config``.
+
+        It also hands a raised cap to children already queued behind the
+        runtime's limit, which would otherwise wait for a running child to
+        finish.
+        """
+        if self.tool_context is None:
+            return False
+        refresh_concurrency = getattr(
+            getattr(self.tool_context, "subagent_runtime", None),
+            "refresh_concurrency",
+            None,
+        )
+        if callable(refresh_concurrency):
+            refresh_concurrency()
+        if not self.tools:
+            return False
+        bound = next(
+            (t for t in self.tools if getattr(t, "name", None) == "delegate_agent"),
+            None,
+        )
+        if bound is None:
+            return False
+        from agent.tools.delegation.delegate_agent import create_delegate_agent_tools
+
+        fresh = create_delegate_agent_tools(self.tool_context)
+        if fresh and fresh[0].description == getattr(bound, "description", None):
+            return False
+        self.resetup_tools_for_backend()
+        return True
+
+    def _setup_tools(self, postgres_conn: Optional[Any]) -> None:
+        """Load tools from config, excluding phase-specific ones."""
+        tool_config = self._tool_config()
         # Initialize session task manager
         from agent.managers.session_tasks import SessionTaskManager
 
@@ -1982,6 +2537,16 @@ class PersistentSession:
         # ensure_runtime must fail closed instead of constructing WorkerHost
         # from the session's legacy `_job_id = thread_id` alias.
         self.tool_context._subagent_parent_kind = "session"
+        self.tool_context._subagent_execution_lane = (
+            "stateless" if self.shell_owner_token is not None else "pinned"
+        )
+        # The orchestrator's two fan-out inputs (agent.tools.delegation.fanout),
+        # published with the kind and lane so the delegate_agent description
+        # and the runtime cap see them from the first tool build.
+        self.tool_context._session_subagent_batch_settle_contract = (
+            self.subagent_batch_settle_contract is True
+        )
+        self.tool_context._session_subagent_fanout = self.subagent_fanout is True
         self.tool_context._session_parent_authority_provider = (
             self.session_parent_authority_provider
         )
@@ -2067,6 +2632,7 @@ class PersistentSession:
             admission_fn=self.subagent_provider_admission,
             effect_authority_fn=self.subagent_effect_authority,
             settlement_authority_fn=self.subagent_settlement_authority,
+            retirement_authorized_fn=self.subagent_retirement_authorized,
             event_fn=self.subagent_event_callback,
         )
         context._parent_host = host
@@ -2120,6 +2686,29 @@ class PersistentSession:
             if not callable(quiesce):
                 raise RuntimeError("session subagent runtime has no quiesce boundary")
             await quiesce(reason)
+        self._subagent_runtime_quiesced = True
+
+    async def leave_subagents_to_retirement(self, reason: str) -> None:
+        """Close child work under a retirement authorized for this life.
+
+        A retirement the orchestrator authorizes itself (End, an Officer
+        decommission, the idle stand-down) installs its token before this
+        runtime hears of it, which takes the authority ``quiesce_subagents``
+        settles with. Children are left to the retirement with no durable
+        write (``SubagentRuntime.leave_to_retirement``); this life never
+        resumes.
+        """
+
+        if self._subagent_runtime_quiesced:
+            return
+        runtime = getattr(self.tool_context, "subagent_runtime", None)
+        if runtime is not None:
+            leave = getattr(runtime, "leave_to_retirement", None)
+            if not callable(leave):
+                raise RuntimeError(
+                    "session subagent runtime cannot be left to its retirement"
+                )
+            await leave(reason)
         self._subagent_runtime_quiesced = True
 
     async def resume_subagents(self) -> None:
@@ -2200,27 +2789,50 @@ class PersistentSession:
                 }
             )
         )
+        # What the attached connectors' drivers deliver, from their specs:
+        # the tool categories (the mailbox is the email category's
+        # connector, the same key SessionRuntimeFacts checks) and whether a
+        # knowledge index is attached.
+        from agent.connectors import deliveries_from_payload
+        from agent.connectors.slots import slot_for_category
+        from agent.core.datasource_setup import (
+            EMAIL_TIER_ORDER,
+            email_effective_access,
+        )
+
+        deliveries = deliveries_from_payload(self.datasource_configs)
+        tool_categories = tuple(
+            sorted(
+                {
+                    delivery.spec.tool_category
+                    for delivery in deliveries
+                    if delivery.spec is not None and delivery.spec.tool_category
+                }
+            )
+        )
+        knowledge_index_attached = any(
+            delivery.routes_to("knowledge_index") for delivery in deliveries
+        )
+        email_category = "email"
         email_configs = [
-            item
-            for item in self.datasource_configs
-            if isinstance(item, dict) and item.get("type") == "email"
+            delivery
+            for delivery in deliveries
+            if delivery.spec is not None
+            and delivery.spec.tool_category == email_category
         ]
+        email_connection = (
+            self.datasources.get(slot_for_category(email_category))
+            if email_configs
+            else None
+        )
         email_tier = None
         if email_configs:
-            from agent.core.datasource_setup import (
-                EMAIL_TIER_ORDER,
-                email_effective_access,
-            )
-
+            # The tier tool binding uses (datasource_tool_categories).
             email_tier = max(
-                (email_effective_access(item) for item in email_configs),
+                (email_effective_access(delivery.entry) for delivery in email_configs),
                 key=EMAIL_TIER_ORDER.index,
             )
-            live_email_tier = getattr(
-                self.datasources.get("email"),
-                "access",
-                None,
-            )
+            live_email_tier = getattr(email_connection, "access", None)
             if live_email_tier in EMAIL_TIER_ORDER:
                 email_tier = live_email_tier
 
@@ -2308,17 +2920,15 @@ class PersistentSession:
                     getattr(backend, "supports_canvas_shared_browser", False)
                 ),
                 attached_datasource_types=datasource_types,
+                attached_tool_categories=tool_categories,
+                knowledge_index_attached=knowledge_index_attached,
                 email_access_tier=email_tier,
                 email_connection_failed=bool(
-                    email_configs and self.datasources.get("email") is None
+                    email_configs and email_connection is None
                 ),
                 email_direct_send_enabled=bool(
                     email_configs
-                    and getattr(
-                        self.datasources.get("email"),
-                        "unattended_send",
-                        False,
-                    )
+                    and getattr(email_connection, "unattended_send", False)
                 ),
                 knowledge_binding_available=bool(self.knowledge_bindings),
                 knowledge_store_available=self.knowledge_store is not None,
@@ -2490,7 +3100,14 @@ class PersistentSession:
         if not _canvas_enabled(self.config):
             tool_names = [name for name in tool_names if name not in canvas_tools]
 
-        if self.cloud_mount_manager and self.cloud_mount_manager.active:
+        # Also for sidecar folders that did not mount, and a protected session
+        # that runs without its cloud: the tool is how the agent learns why
+        # (D7).
+        cloud_manager = self.cloud_mount_manager or self.sidecar_mount_watcher
+        if cloud_manager is not None and (
+            getattr(cloud_manager, "active", False)
+            or getattr(type(cloud_manager), "delivery", None) == "sidecar"
+        ):
             if "srw_cloud_status" not in tool_names:
                 tool_names.append("srw_cloud_status")
 
@@ -2534,6 +3151,16 @@ class PersistentSession:
         tool_names = filter_tools_by_backend(
             tool_names, getattr(self.workspace_manager, "backend", None)
         )
+
+        # Stateless lane: the upgrade's accept is a socket verb that lane has no
+        # transport for, so its offer card could never be accepted and the agent
+        # would wait on a human decision that cannot arrive. Stripped whichever
+        # source admitted it (config tool list or the lite-tier append above)
+        # (session_slash_commands_and_stateless_compact.md §2).
+        if os.environ.get("STATELESS_EXECUTOR", "").strip() == "1":
+            tool_names = [
+                name for name in tool_names if name != "request_workspace_upgrade"
+            ]
 
         # Background-officer capability ceiling
         # (knowledge-base/knowledge/features/officer_knowledge_plane.md §4, K3): a commissioned
@@ -2726,6 +3353,9 @@ class PersistentSession:
         self.tool_context.shell_manager = self.shell_manager
         # The WorkspaceManager object is unchanged by swap_backend (only its
         # ._backend flips), so tool_context.workspace_manager stays valid.
+        # The factories must read the config the name list is about to be
+        # derived from (a live update or remounted cloud replaced it).
+        self.refresh_tool_context_config()
         self._load_tools_for_backend()
         self._bind_tools()
         if self.system_prompt:
@@ -2738,6 +3368,7 @@ class PersistentSession:
                 model=self.config.llm.model or "",
                 tool_names=[tool.name for tool in self.tools],
                 prompt_type="interactive",
+                delegation_background_available=self.shell_owner_token is None,
             )
         backend_name = type(getattr(self.workspace_manager, "backend", None)).__name__
         logger.info(
@@ -2745,20 +3376,47 @@ class PersistentSession:
         )
 
     async def resetup_datasources(
-        self, new_datasources: List[Dict[str, Any]]
+        self,
+        new_datasources: List[Dict[str, Any]],
+        workspace_ssh_identities: Optional[List[Dict[str, Any]]] = None,
+    ) -> Dict[str, Any]:
+        """Apply a live datasource selection change, one at a time
+        (:meth:`_resetup_datasources`).
+
+        The event loop keeps running meanwhile (the checkouts clone in a
+        worker thread), so a second change could otherwise start before the
+        first one has applied: it waits, then diffs against what the first
+        applied.
+        """
+        async with self._live_connector_lock:
+            return await self._resetup_datasources(
+                new_datasources, workspace_ssh_identities
+            )
+
+    async def _resetup_datasources(
+        self,
+        new_datasources: List[Dict[str, Any]],
+        workspace_ssh_identities: Optional[List[Dict[str, Any]]] = None,
     ) -> Dict[str, Any]:
         """Apply a live datasource selection change (live_session_settings.md
         Slice B).
 
-        Rebuilds the type-keyed connection registry from the NEW full payload
-        through the same path attach takes (``process_datasources`` sorts
-        read-only first, so a read-write entry wins a mixed same-type slot and
-        multi-same-type stays correct by construction), applies the derived
-        tool categories directly to ``config.tools`` (the validated session
-        tools override's closed vocabulary silently drops sql/graph/mongodb/
-        webdav, so they must never ride ``config.update``), clones added
-        repositories, rewrites the README.md workspace-facts block, and re-derives +
-        rebinds the toolset — which also rebuilds the system prompt for the
+        Runs the connector registry's live update (``agent.connectors``): the
+        current env connectors are installed again (merged into what earlier
+        installs left, which v1 keeps), detached SSH connectors (repository or
+        ``ssh_key``) have exactly their own workspace ssh-agent retired (the
+        session owns its workspace, so nothing else can still be using that
+        identity) and the rest are re-proven or loaded from
+        ``workspace_ssh_identities`` before any clone, and the type-keyed
+        connection registry is rebuilt from the NEW full payload through the
+        same path attach takes (read-only first, so a read-write entry wins
+        a mixed same-type slot). The new registry is swapped in place and the
+        derived tool categories are applied directly to ``config.tools`` (the
+        validated session tools override's closed vocabulary silently drops
+        sql/graph/mongodb/webdav, so they must never ride ``config.update``).
+        Then added repositories are cloned and removed ones unregistered, the
+        README.md workspace-facts block is rewritten, and the toolset is
+        re-derived + rebound — which also rebuilds the system prompt for the
         per-turn ``messages[0]`` refresh (P0.1).
 
         The REPLACED connections are NOT closed here because a tool call may
@@ -2769,38 +3427,36 @@ class PersistentSession:
         ``stale_connections`` / ``stale_clients`` and the caller closes them
         once no turn is executing.
 
-        kb-type datasources are out of scope for live changes (v1): their
+        A changed KB selection takes effect on the next attach (v1): its
         knowledge bindings wire into memory/KB machinery that ToolContext
-        holds a copy of. Existing kb entries pass through untouched; a changed
-        kb selection takes effect on the next attach.
-
-        Repository removals keep their clone + SSH key on the workspace
-        (cheap honesty — scrubbing is not a security boundary) but drop the
-        ``source_repos`` registration. A live repository ADD whose clone name
-        collides with an existing clone fails that one clone with a warning
-        (the existing clone is never touched); a resume re-resolves suffixed
-        names over the full list.
+        holds a copy of. Existing kb entries pass through untouched.
 
         Args:
             new_datasources: Full datasource payload for the thread, as
                 returned by ``GET /api/agents/threads/{id}/workspace``.
+            workspace_ssh_identities: The same response's hidden connector
+                keys; consumed (keys popped and zeroed) here.
 
         Returns:
             Summary dict: ``added``/``removed`` display names (transcript
             stamp), ``stale_connections``/``stale_clients`` (caller's
             deferred close), ``kb_deferred`` when a kb change was skipped.
         """
+        from agent.connectors import (
+            RuntimeContext,
+            connector_registry,
+            deliveries_from_payload,
+        )
         from agent.core.datasource_setup import (
-            clone_repository_datasources,
             datasource_tool_categories,
             inject_workspace_facts,
-            install_workspace_credentials,
-            process_datasources,
-            resolve_repo_clone_names,
         )
 
         if not self.tool_context:
             logger.warning("resetup_datasources called before tool setup — skipping")
+            for identity in workspace_ssh_identities or []:
+                if isinstance(identity, dict):
+                    identity.pop("private_key", None)
             return {
                 "added": [],
                 "removed": [],
@@ -2810,9 +3466,6 @@ class PersistentSession:
 
         new_configs = list(new_datasources or [])
         old_configs = list(self.datasource_configs or [])
-        await asyncio.to_thread(
-            install_workspace_credentials, new_configs, self.workspace_manager
-        )
 
         # The internal payload strips datasource ids, so identity for the
         # add/remove summary is (type, name) — unique enough for display and
@@ -2825,62 +3478,51 @@ class PersistentSession:
         added = [ds for ds in new_configs if _key(ds) not in old_keys]
         removed = [ds for ds in old_configs if _key(ds) not in new_keys]
 
-        kb_changed = any(ds.get("type") == "kb" for ds in added + removed)
-        if kb_changed:
-            logger.warning(
-                "kb-type datasource selection changed live — knowledge "
-                "bindings apply on the next attach, not mid-session"
-            )
-
-        non_repo = [
-            ds for ds in new_configs if ds.get("type") not in ("repository", "kb")
-        ]
-        new_conns, new_clients, cli_ds_types = process_datasources(non_repo)
-
+        from agent.connectors.mcp import MCP_SLOT
         from agent.tools.registry import register_mcp_tools
 
-        mcp_manager = new_conns.get("mcp")
-        if mcp_manager is not None:
-            try:
-                await mcp_manager.connect_all()
-            except Exception as e:
-                logger.warning(
-                    "Unexpected live MCP discovery failure (%s); continuing",
-                    type(e).__name__,
-                )
-            mcp_manager.annotate_configs()
-        register_mcp_tools(mcp_manager)
+        stale: Dict[str, Dict[str, Any]] = {}
+        new_connection_count = 0
 
-        stale_connections = dict(self.datasources)
-        stale_clients = dict(self._datasource_clients)
-        # ToolContext shares this dict by REFERENCE — mutate in place, never
-        # rebind, or live tools keep reading the orphaned old registry.
-        self.datasources.clear()
-        self.datasources.update(new_conns)
-        self._datasource_clients = new_clients
+        def _swap_harness(connections: Dict[str, Any], clients: Dict[str, Any]) -> None:
+            nonlocal new_connection_count
+            register_mcp_tools(connections.get(MCP_SLOT))
+            stale["connections"] = dict(self.datasources)
+            stale["clients"] = dict(self._datasource_clients)
+            # ToolContext shares this dict by REFERENCE — mutate in place,
+            # never rebind, or live tools keep reading the orphaned old
+            # registry.
+            self.datasources.clear()
+            self.datasources.update(connections)
+            self._datasource_clients = clients
+            new_connection_count = len(connections)
+            for category, names in datasource_tool_categories(new_configs).items():
+                setattr(self.config.tools, category, list(names))
 
-        for category, names in datasource_tool_categories(new_configs).items():
-            setattr(self.config.tools, category, list(names))
-        self.config.extra["_cli_datasources"] = cli_ds_types
-
-        added_repos = [ds for ds in added if ds.get("type") == "repository"]
-        removed_repos = {_key(ds) for ds in removed if ds.get("type") == "repository"}
-        if added_repos and self.workspace_manager:
-            try:
-                clone_repository_datasources(added_repos, self.workspace_manager)
-            except Exception as e:
-                logger.warning("Live repository clone failed: %s", e)
-        if removed_repos and self.workspace_manager:
-            # Resolve clone names over the OLD full repo list (payload order)
-            # so collision suffixes match what attach actually registered.
-            old_repos = [ds for ds in old_configs if ds.get("type") == "repository"]
-            for ds, clone_name in zip(old_repos, resolve_repo_clone_names(old_repos)):
-                if _key(ds) in removed_repos:
-                    self.workspace_manager.source_repos.pop(clone_name, None)
-                    # source_repo_meta holds the repository's plaintext token;
-                    # leaving it behind keeps a detached credential live on the
-                    # workspace manager for the rest of the session.
-                    self.workspace_manager.source_repo_meta.pop(clone_name, None)
+        # Set when this change is no longer wanted (its task cancelled, the
+        # session's cleanup): its clone in a worker thread stops at the next
+        # step boundary instead of running on after the session.
+        cancel = threading.Event()
+        connector_runtime = RuntimeContext(
+            execution="session",
+            workspace_manager=self.workspace_manager,
+            ssh_identities=workspace_ssh_identities,
+            ssh_identity_status=self.workspace_ssh_identity_status,
+            cancel=cancel,
+        )
+        del workspace_ssh_identities
+        self._live_change_cancel = cancel
+        try:
+            await connector_registry().replace_live(
+                deliveries_from_payload(old_configs),
+                deliveries_from_payload(new_configs),
+                connector_runtime,
+                on_harness_replaced=_swap_harness,
+            )
+        finally:
+            self._live_change_cancel = None
+        if connector_runtime.ssh_identity_status is not None:
+            self.workspace_ssh_identity_status = connector_runtime.ssh_identity_status
 
         self.datasource_configs = new_configs
         self._refresh_runtime_facts()
@@ -2894,6 +3536,7 @@ class PersistentSession:
                     new_configs,
                     self.workspace_manager,
                     expert=getattr(self.config, "display_name", None),
+                    ssh_identity_status=self.workspace_ssh_identity_status,
                 )
             except Exception as e:
                 logger.warning("Failed to rewrite workspace facts: %s", e)
@@ -2903,10 +3546,10 @@ class PersistentSession:
         summary: Dict[str, Any] = {
             "added": [ds.get("name", "unnamed") for ds in added],
             "removed": [ds.get("name", "unnamed") for ds in removed],
-            "stale_connections": stale_connections,
-            "stale_clients": stale_clients,
+            "stale_connections": stale.get("connections", {}),
+            "stale_clients": stale.get("clients", {}),
         }
-        if kb_changed:
+        if "knowledge_index" in connector_runtime.deferred:
             summary["kb_deferred"] = True
         logger.info(
             "Datasources re-set up live: %d attached (%d added, %d removed), "
@@ -2914,7 +3557,7 @@ class PersistentSession:
             len(new_configs),
             len(added),
             len(removed),
-            len(new_conns),
+            new_connection_count,
         )
         return summary
 
@@ -2986,7 +3629,6 @@ class PersistentSession:
             summarization_threshold_tokens=lim.context_threshold_tokens,
             message_count_threshold=lim.message_count_threshold,
             message_count_min_tokens=lim.message_count_min_tokens,
-            keep_recent_tool_results=ctx.keep_recent_tool_results,
             keep_recent_messages=ctx.keep_recent_messages,
             keep_window_max_tool_result_chars=ctx.keep_window_max_tool_result_chars,
             # Safety-layer constant (model-aware; see loader fractions).
@@ -2995,6 +3637,9 @@ class PersistentSession:
             model_max_context_tokens=lim.model_max_context_tokens,
             # Per-family image-token estimator (matrix settings.image_tokens).
             image_tokens=lim.image_tokens,
+            # Native compaction where the family uses it (WP6); a model swap
+            # rebuilds this from the new model's config.
+            compaction=getattr(cfg.llm, "compaction", None),
         )
 
     def _setup_context_manager(self) -> None:
@@ -3018,6 +3663,7 @@ class PersistentSession:
             # window must keep its ids and turn stamps, or the turn-end
             # reconcile cannot find this turn's rows after a mid-turn summary.
             preserve_message_identity=True,
+            summarization_prompt=load_summarizer_prompt(self.config),
         )
 
     def refresh_context_limits(self) -> None:
@@ -3304,6 +3950,7 @@ class PersistentSession:
                         extraction_prompt=self.memory_extraction_prompt,
                         assembler_prompt=None,  # persistent mode has no assembler
                         job_id=self.thread_id,
+                        agent_type=self.config.agent_id,
                         project_id=self.project_id,
                         project_ids=list(self.project_ids),
                         # The legacy persistent path bounds each store call at
@@ -3347,6 +3994,12 @@ class PersistentSession:
                         "the config or drop the plugin from memory.pipeline."
                     ) from e
 
+        # memory_search (append-only context injection, D25/D34) was bound with
+        # the other tools before this manager existed; it resolves the manager's
+        # extension from here at call time.
+        if self.tool_context is not None:
+            self.tool_context.memory_service = self.memory_service
+
         # Ingestion verdicts + bi-temporal supersede (overhaul Phase 4). Wired
         # onto the store independently of the manager cutover — a write-path
         # change behind memory.ingestion.enabled, used by legacy + seam writers.
@@ -3388,11 +4041,11 @@ class PersistentSession:
 
         # ENV files belong to the physical workspace. Restore the bindings on
         # the new host before retiring the old one or exposing its tools.
-        from shared.credential_connectors import collect_credential_env
+        from agent.connectors import connector_registry, deliveries_from_payload
 
-        credential_env = collect_credential_env(self.datasource_configs or [])
-        if credential_env:
-            new_backend.install_credential_environment(credential_env)
+        connector_registry().on_backend_swap(
+            deliveries_from_payload(self.datasource_configs), new_backend
+        )
 
         # This is a genuine backend retirement, not a queue-claim detach. The
         # deterministic tmux session belongs to the old workspace and must not
@@ -3485,7 +4138,8 @@ class PersistentSession:
         *,
         preserve_shell: bool = False,
         preserve_workspace_daemons: bool = False,
-    ) -> None:
+        allow_vm_actuator_handoff: bool = False,
+    ) -> Literal["actuator_required"] | None:
         """Clean up agent-local resources and disconnect the backend transport.
 
         ``preserve_shell`` is the queue-claim/ownership handoff disposition:
@@ -3505,6 +4159,11 @@ class PersistentSession:
         # or remote cleanup. The monitor/controller active flags may remain
         # true until their teardown completes.
         self._protected_cloud_health_ready = False
+        # A live connector change still cloning in a worker thread stops at
+        # its next step boundary (its task may already be cancelled).
+        live_change = getattr(self, "_live_change_cancel", None)
+        if live_change is not None:
+            live_change.set()
         if not preserve_shell and not preserve_workspace_daemons:
             self.local_quiescence_protocol = ""
         if preserve_workspace_daemons and self.shell_owner_token is None:
@@ -3544,6 +4203,11 @@ class PersistentSession:
         strict_sandbox_cleanup = bool(
             strict_pinned_physical_cleanup and self.workspace_backend_tier == "sandbox"
         )
+        vm_actuator_handoff = bool(
+            allow_vm_actuator_handoff
+            and strict_pinned_physical_cleanup
+            and self.workspace_backend_tier in {"vm", "remote"}
+        )
         strict_terminal_cleanup = bool(
             self.shell_owner_token is not None or exact_pinned_terminal
         )
@@ -3570,6 +4234,15 @@ class PersistentSession:
             )
             if retire_shell_owner is not None:
                 retire_shell_owner()
+
+        if vm_actuator_handoff and (
+            backend_for_cleanup is None
+            or self.shell_manager is None
+            or not callable(getattr(backend_for_cleanup, "retire", None))
+        ):
+            raise WorkspaceUnavailableError(
+                "VM local drain lacks a strict shell/backend"
+            )
 
         # Belt for partial-attach and non-standard cleanup call sites. The
         # ordinary app teardown invokes this before its journal closes; this
@@ -3644,6 +4317,16 @@ class PersistentSession:
                     logger.debug("overlay cleanup failed", exc_info=True)
                     self.overlay_mount_manager = None
 
+        if self.sidecar_mount_watcher is not None and self.cloud_mount_manager is None:
+            # A protected session without its cloud (decision 42) keeps only
+            # the watcher: stop its monitor; nothing of it runs in the
+            # workspace, so there is nothing to retire there.
+            try:
+                await self.sidecar_mount_watcher.detach_for_handoff()
+            except Exception:
+                logger.debug("sidecar watcher cleanup failed", exc_info=True)
+            self.sidecar_mount_watcher = None
+
         if self.cloud_mount_manager:
             if strict_resident_cleanup and resident_cleanup_error is not None:
                 logger.error(
@@ -3674,12 +4357,18 @@ class PersistentSession:
                         logger.warning(f"Cloud mount cleanup error: {exc}")
                         self.cloud_mount_manager = None
 
-        if self.shell_manager and not preserve_shell:
+        if (
+            self.shell_manager
+            and not preserve_shell
+            and not (vm_actuator_handoff and self.terminal_vm_shell_drained)
+        ):
             try:
                 if strict_pinned_physical_cleanup:
                     self.shell_manager.cleanup(strict=True)
                 else:
                     self.shell_manager.cleanup()
+                if vm_actuator_handoff:
+                    self.terminal_vm_shell_drained = True
             except Exception as e:
                 if strict_terminal_cleanup:
                     # Stateless and protected terminal teardown are
@@ -3690,7 +4379,7 @@ class PersistentSession:
                     logger.error("Session shell retirement was not acknowledged: %s", e)
                 else:
                     logger.warning(f"Shell cleanup error: {e}")
-        elif self.shell_manager:
+        elif self.shell_manager and preserve_shell:
             logger.info(
                 "Preserving remote shell for session handoff: thread=%s",
                 self.thread_id,
@@ -3727,7 +4416,7 @@ class PersistentSession:
                 shell_retirement_error = WorkspaceUnavailableError(
                     "Sandbox workspace process-zero proof is unavailable"
                 )
-            else:
+            elif not vm_actuator_handoff:
                 # VM/remote process-zero belongs to the orchestrator actuator,
                 # which can prove the exact VM generation/UID after this live
                 # agent is absent. Never forge that stronger proof locally.
@@ -3737,9 +4426,15 @@ class PersistentSession:
 
         # Close datasource connections
         if self.datasources or self._datasource_clients:
-            from agent.core.datasource_setup import close_datasource_connections
+            from agent.connectors import RuntimeContext, connector_registry
 
-            close_datasource_connections(self.datasources, self._datasource_clients)
+            connector_registry().release(
+                RuntimeContext(
+                    execution="session",
+                    connections=self.datasources,
+                    clients=self._datasource_clients,
+                )
+            )
             self.datasources = {}
             self._datasource_clients = {}
 
@@ -3759,6 +4454,7 @@ class PersistentSession:
             backend_for_cleanup is not None
             and resident_cleanup_error is None
             and local_handoff_error is None
+            and (not vm_actuator_handoff or browser_shutdown_error is None)
         ):
             backend = backend_for_cleanup
             if shell_retirement_error is not None:
@@ -3844,6 +4540,7 @@ class PersistentSession:
         if (
             exact_pinned_terminal
             and not self.local_quiescence_protocol
+            and not vm_actuator_handoff
             and shell_retirement_error is None
             and browser_shutdown_error is None
             and resident_cleanup_error is None
@@ -3876,3 +4573,6 @@ class PersistentSession:
             raise WorkspaceUnavailableError(
                 "Session backend retirement remains unacknowledged"
             ) from backend_retirement_error
+        if vm_actuator_handoff:
+            self.terminal_vm_drain_complete = True
+            return "actuator_required"

@@ -49,7 +49,7 @@ class TestRetryCloudSyncStart:
 
         with (
             patch.object(papp, "_session", session),
-            patch.object(papp, "_thread_id", "t1"),
+            patch.object(papp._session_identity, "_thread_id", "t1"),
             patch.object(
                 papp, "_orchestrator_client", _client_stub({"cloud_sync": {"v": 2}})
             ),
@@ -77,7 +77,7 @@ class TestRetryCloudSyncStart:
 
         with (
             patch.object(papp, "_session", session),
-            patch.object(papp, "_thread_id", "t1"),
+            patch.object(papp._session_identity, "_thread_id", "t1"),
             patch.object(
                 papp,
                 "_orchestrator_client",
@@ -104,7 +104,7 @@ class TestRetryCloudSyncStart:
 
         with (
             patch.object(papp, "_session", session),
-            patch.object(papp, "_thread_id", "t1"),
+            patch.object(papp._session_identity, "_thread_id", "t1"),
             patch.object(papp, "_orchestrator_client", _client_stub({})),
             patch.object(papp, "_cloud_sync_retry_pending", True),
             patch.object(papp, "_broadcast", lambda k, p: events.append((k, p))),
@@ -126,7 +126,7 @@ class TestRetryCloudSyncStart:
 
         with (
             patch.object(papp, "_session", session),
-            patch.object(papp, "_thread_id", "t1"),
+            patch.object(papp._session_identity, "_thread_id", "t1"),
             patch.object(
                 papp,
                 "_orchestrator_client",
@@ -155,7 +155,7 @@ class TestRetryCloudSyncStart:
 
         with (
             patch.object(papp, "_session", session),
-            patch.object(papp, "_thread_id", "t1"),
+            patch.object(papp._session_identity, "_thread_id", "t1"),
             patch.object(
                 papp, "_orchestrator_client", _client_stub({"cloud_sync": {"v": 2}})
             ),
@@ -182,7 +182,7 @@ class TestRetryCloudSyncStart:
 
         with (
             patch.object(papp, "_session", session),
-            patch.object(papp, "_thread_id", "t1"),
+            patch.object(papp._session_identity, "_thread_id", "t1"),
             patch.object(papp, "_orchestrator_client", client),
             patch.object(papp, "_cloud_sync_retry_pending", True),
             patch.object(papp, "_broadcast", lambda k, p: None),

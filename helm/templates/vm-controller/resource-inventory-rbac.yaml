@@ -1,0 +1,91 @@
+{{- $policy := .Values.vm.resourceAdmission | default dict -}}
+{{- if and (include "srw.vmSameCluster" .) $policy.observerEnabled $policy.clusterWidePodReadAcknowledged }}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "srw.vmControllerName" . }}-resource-observer
+  labels:
+    {{- include "srw.componentLabels" (dict "context" . "component" "vm-controller") | nindent 4 }}
+rules:
+  - apiGroups: [""]
+    resources: ["nodes", "pods", "persistentvolumes"]
+    verbs: ["list"]
+  - apiGroups: ["storage.k8s.io"]
+    resources: ["storageclasses"]
+    verbs: ["list"]
+{{- if $policy.launcherProfile }}
+  # The final whole-launcher proof reads exact selected PV and StorageClass objects.
+  - apiGroups: [""]
+    resources: ["persistentvolumes"]
+    verbs: ["get"]
+  - apiGroups: ["storage.k8s.io"]
+    resources: ["storageclasses"]
+    verbs: ["get"]
+{{- end }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ include "srw.vmControllerName" . }}-resource-observer
+  labels:
+    {{- include "srw.componentLabels" (dict "context" . "component" "vm-controller") | nindent 4 }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "srw.vmControllerName" . }}
+    namespace: {{ include "srw.vmControllerNamespace" . }}
+roleRef:
+  kind: ClusterRole
+  name: {{ include "srw.vmControllerName" . }}-resource-observer
+  apiGroup: rbac.authorization.k8s.io
+{{- if $policy.launcherProfile }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "srw.vmControllerName" . }}-resource-installation
+  namespace: {{ $policy.inventory.kubevirtNamespace | quote }}
+rules:
+  - apiGroups: ["kubevirt.io"]
+    resources: ["kubevirts"]
+    resourceNames: [{{ $policy.inventory.kubevirtName | quote }}]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "srw.vmControllerName" . }}-resource-installation
+  namespace: {{ $policy.inventory.kubevirtNamespace | quote }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "srw.vmControllerName" . }}
+    namespace: {{ include "srw.vmControllerNamespace" . }}
+roleRef:
+  kind: Role
+  name: {{ include "srw.vmControllerName" . }}-resource-installation
+  apiGroup: rbac.authorization.k8s.io
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "srw.vmControllerName" . }}-resource-limitranges
+  namespace: {{ include "srw.vmControllerNamespace" . }}
+rules:
+  - apiGroups: [""]
+    resources: ["limitranges"]
+    verbs: ["list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "srw.vmControllerName" . }}-resource-limitranges
+  namespace: {{ include "srw.vmControllerNamespace" . }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "srw.vmControllerName" . }}
+    namespace: {{ include "srw.vmControllerNamespace" . }}
+roleRef:
+  kind: Role
+  name: {{ include "srw.vmControllerName" . }}-resource-limitranges
+  apiGroup: rbac.authorization.k8s.io
+{{- end }}
+{{- end }}

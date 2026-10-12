@@ -8,9 +8,12 @@ import {
   formatCount,
   formatDurationSeconds,
   formatUsd,
+  failureReason,
+  heldForReviewReason,
   jobModelLabel,
   liveSubjobCount,
   JobDetailPanelComponent,
+  type JobDetailState,
   shortJobId,
   subagentElapsedSeconds,
   subagentStatusTone,
@@ -109,6 +112,187 @@ describe('workspace recovery detail', () => {
     expect(text).toContain('Workspace cleanup remains pending');
     expect(text).not.toContain('10.0.0.9');
     expect(text).not.toContain('controller credential material');
+  });
+});
+
+describe('typed workspace creation detail', () => {
+  beforeAll(async () => {
+    await ɵresolveComponentResources(() => Promise.resolve(''));
+  });
+  afterEach(() => TestBed.resetTestingModule());
+
+  function renderPanel(job: Partial<JobSummary>) {
+    TestBed.configureTestingModule({
+      imports: [JobDetailPanelComponent, TranslocoTestingModule.forRoot({
+        langs: {en}, translocoConfig: {availableLangs: ['en'], defaultLang: 'en'},
+      })],
+      providers: [provideRouter([])],
+    });
+    const transloco = TestBed.inject(TranslocoService);
+    transloco.setTranslation(en, 'en');
+    transloco.setActiveLang('en');
+    const fixture = TestBed.createComponent(JobDetailPanelComponent);
+    Object.defineProperty(fixture.componentInstance, 'job', {value: signal({
+      id: 'job-startup', description: 'Start workspace', status: 'created',
+      created_at: '2026-09-28T08:00:00Z', ...job,
+    } as JobSummary)});
+    const data = signal<JobDetailState | null>(null);
+    Object.defineProperty(fixture.componentInstance, 'data', {value: data});
+    fixture.detectChanges();
+    return {fixture, data};
+  }
+
+  function loadedDetail(workspace_creation?: Job['workspace_creation']): JobDetailState {
+    return {
+      loading: false, error: false,
+      detail: {id: 'job-startup', status: 'created', workspace_creation} as Job,
+      usage: null, progress: null, usageSubtree: null, loadingSubtree: false,
+      subtreeAttempted: false, subjobs: null, subagents: null,
+    };
+  }
+
+  const observing = {stage: 'scheduling', state: 'observing',
+    reason_code: 'observation_pending', readiness_deadline_at: null} as const;
+  const attention = {stage: 'readiness', state: 'attention',
+    reason_code: 'invalid_image', readiness_deadline_at: null} as const;
+
+  it('replaces the list observation with newer attention from the loaded detail', () => {
+    const {fixture, data} = renderPanel({workspace_creation: observing});
+    expect((fixture.nativeElement as HTMLElement).textContent).toContain('Checking workspace scheduling');
+
+    data.set(loadedDetail(attention));
+    fixture.detectChanges();
+    const text = (fixture.nativeElement as HTMLElement).textContent ?? '';
+    expect(text).toContain('Workspace needs attention: its image is invalid.');
+    expect(text).not.toContain('Checking workspace scheduling');
+  });
+
+  it('shows typed creation supplied only by the loaded detail', () => {
+    const {fixture, data} = renderPanel({});
+    data.set(loadedDetail(attention));
+    fixture.detectChanges();
+    expect((fixture.nativeElement as HTMLElement).textContent)
+      .toContain('Workspace needs attention: its image is invalid.');
+  });
+
+  it.each(['null', 'omitted'] as const)(
+    'clears stale list creation when the fresh detail projection is %s',
+    (kind) => {
+      const {fixture, data} = renderPanel({workspace_creation: observing});
+      expect((fixture.nativeElement as HTMLElement).textContent).toContain('Checking workspace scheduling');
+      const state = loadedDetail(kind === 'null' ? null : undefined);
+      if (kind === 'omitted') delete state.detail!.workspace_creation;
+      data.set(state);
+      fixture.detectChanges();
+      expect((fixture.nativeElement as HTMLElement).textContent)
+        .not.toContain('Checking workspace scheduling');
+    },
+  );
+
+  it.each([true, false])(
+    'retains the list observation when the detail GET fails and panel error is %s',
+    (error) => {
+      const {fixture, data} = renderPanel({workspace_creation: observing});
+      data.set({...loadedDetail(), detail: null, error, usage: error ? null : usage()});
+      fixture.detectChanges();
+      expect((fixture.nativeElement as HTMLElement).textContent)
+        .toContain('Checking workspace scheduling');
+    },
+  );
+
+  it('shows scheduler uncertainty without exposing raw diagnostics or hiding legacy VM state', () => {
+    TestBed.configureTestingModule({
+      imports: [JobDetailPanelComponent, TranslocoTestingModule.forRoot({
+        langs: {en}, translocoConfig: {availableLangs: ['en'], defaultLang: 'en'},
+      })],
+      providers: [provideRouter([])],
+    });
+    const transloco = TestBed.inject(TranslocoService);
+    transloco.setTranslation(en, 'en');
+    transloco.setActiveLang('en');
+    const fixture = TestBed.createComponent(JobDetailPanelComponent);
+    Object.defineProperty(fixture.componentInstance, 'job', {value: signal({
+      id: 'job-startup', description: 'Start workspace', status: 'created',
+      created_at: '2026-09-28T08:00:00Z',
+      workspace_creation: {stage: 'scheduling', state: 'waiting_capacity',
+        reason_code: 'scheduler_unschedulable', readiness_deadline_at: null,
+        private_diagnostic: '0/3 nodes had taint secret'},
+      vm_creation: {state: 'observing', message: 'VM observation', resumable: true},
+    } as unknown as JobSummary)});
+    Object.defineProperty(fixture.componentInstance, 'data', {value: signal(null)});
+
+    fixture.detectChanges();
+    const text = (fixture.nativeElement as HTMLElement).textContent ?? '';
+    expect(text).toContain('Waiting for scheduling');
+    expect(text).not.toContain('insufficient capacity');
+    expect(text).not.toContain('0/3 nodes');
+    expect(text).toContain('VM observation');
+  });
+});
+
+describe('held-for-review reason', () => {
+  const reason = 'Delivery unproven: the final commit did not land, so deliverable path(s) output/report.md are not in the pushed revision.';
+
+  it('names why a job is waiting on review instead of sealed', () => {
+    expect(heldForReviewReason({status: 'pending_review', error_message: reason})).toBe(reason);
+  });
+
+  it('stays silent for ordinary review items and other statuses', () => {
+    expect(heldForReviewReason({status: 'pending_review', error_message: null})).toBeNull();
+    expect(heldForReviewReason({status: 'pending_review', error_message: '  '})).toBeNull();
+    // A failed job's reason already renders on the row itself.
+    expect(heldForReviewReason({status: 'failed', error_message: reason})).toBeNull();
+    expect(heldForReviewReason(null)).toBeNull();
+  });
+
+  it('defers to the VM-creation block, which already shows error_message', () => {
+    expect(
+      heldForReviewReason({
+        status: 'pending_review',
+        error_message: reason,
+        vm_creation: {state: 'attention', message: 'x'} as unknown as JobSummary['vm_creation'],
+      }),
+    ).toBeNull();
+  });
+
+  describe('rendered', () => {
+    beforeAll(async () => {
+      await ɵresolveComponentResources(() => Promise.resolve(''));
+    });
+    afterEach(() => TestBed.resetTestingModule());
+
+    it('shows the hold on the panel', () => {
+      TestBed.configureTestingModule({
+        imports: [
+          JobDetailPanelComponent,
+          TranslocoTestingModule.forRoot({
+            langs: {en},
+            translocoConfig: {availableLangs: ['en'], defaultLang: 'en'},
+          }),
+        ],
+        providers: [provideRouter([])],
+      });
+      const transloco = TestBed.inject(TranslocoService);
+      transloco.setTranslation(en, 'en');
+      transloco.setActiveLang('en');
+      const fixture = TestBed.createComponent(JobDetailPanelComponent);
+      Object.defineProperty(fixture.componentInstance, 'job', {
+        value: signal({
+          id: 'job-2',
+          description: 'Probe the stack',
+          status: 'pending_review',
+          created_at: '2026-09-16T08:00:00Z',
+          error_message: reason,
+        } as unknown as JobSummary),
+      });
+      Object.defineProperty(fixture.componentInstance, 'data', {value: signal(null)});
+
+      fixture.detectChanges();
+
+      const text = (fixture.nativeElement as HTMLElement).textContent ?? '';
+      expect(text).toContain('Held for review');
+      expect(text).toContain('output/report.md are not in the pushed revision');
+    });
   });
 });
 
@@ -604,5 +788,23 @@ describe('prompt clamp', () => {
   it('renders no description block at all when the job has no prompt', () => {
     const root = render('').nativeElement as HTMLElement;
     expect(root.querySelector('.description-block')).toBeNull();
+  });
+});
+
+describe('failure reason', () => {
+  const reason = 'Workspace image `x:1` could not be pulled: not found';
+
+  it('names why a failed job failed', () => {
+    expect(failureReason({status: 'failed', error_message: ` ${reason}\n`})).toBe(reason);
+  });
+
+  it('stays silent for blanks, other statuses, and VM-creation failures', () => {
+    expect(failureReason({status: 'failed', error_message: null})).toBeNull();
+    expect(failureReason({status: 'failed', error_message: '  '})).toBeNull();
+    expect(failureReason({status: 'running', error_message: reason})).toBeNull();
+    expect(failureReason({status: 'pending_review', error_message: reason})).toBeNull();
+    expect(failureReason(null)).toBeNull();
+    const vm = {state: 'attention'} as never;
+    expect(failureReason({status: 'failed', error_message: reason, vm_creation: vm})).toBeNull();
   });
 });

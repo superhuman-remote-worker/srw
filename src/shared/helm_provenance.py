@@ -37,6 +37,13 @@ SOURCES: frozenset[str] = frozenset({SOURCE_DEFAULT, SOURCE_HELM, SOURCE_UI})
 # (pinned by a test) so provenance can be derived from the breadcrumb alone.
 HELM_SEED_BREADCRUMB = "helm:llm.seed"
 
+# ``updated_by`` breadcrumb on a required-capability default pin the system
+# chose on its own (``orchestrator.services.readiness.auto_pin_required_defaults``).
+# ``source`` is ``default``; the breadcrumb is what tells the seed Job it may
+# replace the pin with a declared ``llm.seed.defaults`` entry and tells the
+# admin UI to label it as automatic. An admin re-selecting it clears the mark.
+AUTO_PIN_BREADCRUMB = "auto:required-default"
+
 # system_settings key holding the reconcile manifest the seed Job writes.
 RECONCILE_MANIFEST_KEY = "helm.reconcile"
 

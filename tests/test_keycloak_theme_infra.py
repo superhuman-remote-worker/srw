@@ -146,6 +146,24 @@ def test_header_wrapper_colour_is_forced() -> None:
     assert "!important" in found.group(0)
 
 
+def test_card_is_a_panel_not_patternfly_white_or_grey() -> None:
+    """PatternFly paints the card #fff (light) and #26292d (dark). Routing it
+    through BackgroundColor--100 puts it on panel-bg in both modes, which the
+    palette tests above already pin.
+
+    Scoped to the bare .pf-v5-c-login block: PatternFly sets the variable on
+    that selector in both modes, so a rule anywhere else loses or leaks.
+    """
+    rules = _css_rules(LOGIN_CSS.read_text())
+    found = re.search(r"(?:^|\})\s*\.pf-v5-c-login\s*\{[^}]*\}", rules)
+    assert found, "no bare .pf-v5-c-login rule block"
+    assert re.search(
+        r"--pf-v5-c-login__main--BackgroundColor:\s*"
+        r"var\(--pf-v5-global--BackgroundColor--100\)",
+        found.group(0),
+    )
+
+
 def test_no_external_font_dependency() -> None:
     """The login page must work when everything else is down, and must not leak
     every login attempt's IP to a third party."""
@@ -176,6 +194,9 @@ def test_light_tokens_match_the_shared_brand_palette() -> None:
         "--pf-v5-global--Color--200": brand.TRAVERTINE["text-secondary"],
         "--pf-v5-global--BorderColor--100": brand.TRAVERTINE["border-color"],
         "--keycloak-card-top-color": brand.TRAVERTINE["accent-color"],
+        # Read inside PatternFly's light-surface components (the inputs).
+        "--pf-v5-global--primary-color--dark-100": brand.TRAVERTINE["accent-color"],
+        "--pf-v5-global--link--Color--dark": brand.TRAVERTINE["accent-color"],
     }
     for token, want in expected.items():
         found = re.search(rf"{re.escape(token)}:\s*(#[0-9a-fA-F]{{3,8}})", root)
@@ -230,12 +251,17 @@ def test_dark_tokens_match_the_shared_senate_palette() -> None:
     expected = {
         "--pf-v5-global--primary-color--100": senate["accent-color"],
         "--pf-v5-global--primary-color--200": senate["accent-hover"],
+        # The dark Sign In button reads --300; it stayed PatternFly blue
+        # while only --100/--200 were set.
+        "--pf-v5-global--primary-color--300": senate["accent-color"],
         "--pf-v5-global--BackgroundColor--100": senate["panel-bg"],
         "--pf-v5-global--BackgroundColor--200": senate["app-bg"],
         "--pf-v5-global--Color--100": senate["text-primary"],
         "--pf-v5-global--Color--200": senate["text-secondary"],
         "--pf-v5-global--BorderColor--100": senate["border-color"],
         "--keycloak-card-top-color": senate["accent-color"],
+        "--pf-v5-global--primary-color--dark-100": senate["accent-color"],
+        "--pf-v5-global--link--Color--dark": senate["accent-color"],
     }
     for token, want in expected.items():
         found = re.search(
@@ -244,6 +270,43 @@ def test_dark_tokens_match_the_shared_senate_palette() -> None:
         assert found, f"{token} missing from the .pf-v5-theme-dark block"
         assert brand.normalize_hex(found.group(1)) == want, (
             f"{token} is {found.group(1)}, $senate-theme says {want}"
+        )
+
+
+def test_each_mode_logo_wears_that_modes_default_accent() -> None:
+    """The logo is a static file, so no token reaches it. It stayed porphyry
+    red for two weeks after the accent went Tyrian, above a purple button.
+
+    Resolves each block's --keycloak-logo-url to the file it names, so a
+    rename that leaves the CSS pointing at a missing file fails here too.
+    """
+    from orchestrator.services import brand
+
+    from tests.test_brand_palette import default_accent_block
+
+    scss = (ROOT / brand.SCSS_TOKEN_SOURCE).read_text()
+    rules = _css_rules(LOGIN_CSS.read_text())
+    blocks = {
+        "travertine": re.search(r":root\s*\{[^}]*\}", rules),
+        "senate": re.search(r"\.pf-v5-theme-dark\s*\{[^}]*\}", rules),
+    }
+    for mode, block in blocks.items():
+        assert block, f"no {mode} rule block in the login CSS"
+        url = re.search(r"--keycloak-logo-url:\s*url\('([^']+)'\)", block.group(0))
+        assert url, f"the {mode} block sets no --keycloak-logo-url"
+        logo = (LOGIN_CSS.parent / url.group(1)).resolve()
+        assert logo.is_file(), f"{url.group(1)} does not exist"
+
+        accent = re.search(
+            r"'accent-color':\s*(#[0-9a-fA-F]{3,8})", default_accent_block(scss, mode)
+        )
+        want = brand.normalize_hex(accent.group(1))
+        fills = {
+            brand.normalize_hex(f)
+            for f in re.findall(r'fill="(#[0-9a-fA-F]{3,8})"', logo.read_text())
+        }
+        assert fills == {want}, (
+            f"{logo.name} fills {sorted(fills)}, {mode} accent is {want}"
         )
 
 
@@ -431,6 +494,30 @@ def test_local_kubernetes_dev_credentials_match_the_chart() -> None:
         "Local Kubernetes dev-credentials table is out of sync with "
         "keycloak.devUsers in helm/values.yaml.\n"
         f"  guide: {guide}\n  chart:  {chart}"
+    )
+
+
+def test_local_kubernetes_dev_account_snippet_matches_the_chart() -> None:
+    """The guide's snippet for adding the accounts to an existing realm repeats
+    the passwords and roles; a drifted line creates an account the table lies
+    about."""
+    values = yaml.safe_load((ROOT / "helm/values.yaml").read_text())
+    chart = {
+        u["username"]: (u["password"], "admin user" if u["admin"] else "user")
+        for u in values["keycloak"]["devUsers"]["users"]
+    }
+    snippet = {
+        name: (password, roles)
+        for name, password, roles in re.findall(
+            r"^(dev-[a-z0-9-]+) (\S+) ([a-z ]+)$",
+            (ROOT / "docs/local-kubernetes.md").read_text(),
+            re.M,
+        )
+    }
+    assert snippet == chart, (
+        "Local Kubernetes dev-account snippet is out of sync with "
+        "keycloak.devUsers in helm/values.yaml.\n"
+        f"  snippet: {snippet}\n  chart:   {chart}"
     )
 
 

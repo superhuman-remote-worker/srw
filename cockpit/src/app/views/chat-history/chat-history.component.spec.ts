@@ -76,7 +76,9 @@ describe('legacy classification helpers', () => {
       ['instruction_inject_ab12cd34', 'instruction'],
       ['memory_inject_ab12cd34', 'memory'],
       ['knowledge_inject_ab12cd34', 'knowledge'],
+      ['charter_inject_ab12cd34', 'charter'],
       ['citation_feedback_inject_ab12cd34', 'citation_feedback'],
+      ['guidance_inject_ab12cd34', 'guidance'],
     ] as const) {
       expect(
         legacyInjectKind({type: 'tool', tool_call_id: id, content_preview: ''}),

@@ -18,13 +18,14 @@ import binascii
 import hashlib
 import logging
 import posixpath
+import re
 import shlex
 import shutil
 import subprocess
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, List, Optional
+from typing import Iterable, List, Optional, Sequence
 from uuid import UUID
 
 logger = logging.getLogger(__name__)
@@ -50,6 +51,15 @@ _UNDO_PREPARE_TRAILER = "SRW-Undo-Prepare"
 _UNDO_SOURCE_TRAILER = "SRW-Undo-Source"
 _UNDO_TARGET_TRAILER = "SRW-Undo-Target"
 _GIT_NUL_INTEGRITY_FRAME = "SRW-Git-NUL-Integrity"
+
+# One `git status --porcelain` (v1) entry: two status columns, a space, the
+# path. The backend shell strips the whole output's leading whitespace, so the
+# FIRST line alone may have lost a blank index column (` M x` -> `M x`).
+# Nothing else is an entry: the remote backend merges stderr into stdout, and
+# `warning: could not open directory 'pgdata/'` (a docker volume owned by
+# another uid) is git saying what it skipped, not a change it left behind.
+_PORCELAIN_ENTRY = re.compile(r"^[ MTADRCU?!]{2} (.+)$")
+_PORCELAIN_STRIPPED_FIRST_ENTRY = re.compile(r"^[MTADRCU?!] (.+)$")
 
 
 @dataclass(frozen=True, slots=True)
@@ -120,7 +130,13 @@ class GitManager:
     DEFAULT_MAX_LINES = 500
     DEFAULT_MAX_WORDS = 10000
 
-    def __init__(self, workspace_path: Path, backend=None, remote_cwd=None):
+    def __init__(
+        self,
+        workspace_path: Path,
+        backend=None,
+        remote_cwd=None,
+        shell_tab: str = "git",
+    ):
         """Initialize GitManager for a workspace directory.
 
         Args:
@@ -133,10 +149,19 @@ class GitManager:
                 git working directory. Used for auxiliary repos cloned into
                 subdirectories (e.g. "repos/my-repo"). When None, commands
                 run in the backend's root directory.
+            shell_tab: The backend shell tab git commands run on. ``git``
+                unless a caller needs its git kept apart from everyone
+                else's (a live connector clone in a worker thread: the
+                backend serializes each tab's commands, so on ``git`` it
+                would hold up the event loop's own git calls).
         """
         self._workspace_path = Path(workspace_path)
+        self.shell_tab = shell_tab
         self._backend = backend
         self._remote_cwd = remote_cwd
+        # Why the most recent push() returned False (None after a success), so
+        # a caller can tell a refusal that will repeat from a blip.
+        self.last_push_error: Optional[str] = None
         self._use_backend = backend is not None and getattr(
             backend, "supports_shell", False
         )
@@ -951,6 +976,80 @@ class GitManager:
         except Exception:
             return False
 
+    def uncommitted_paths(self) -> Optional[list[str]]:
+        """Paths whose state is not in HEAD — staged, unstaged or untracked.
+
+        ``has_uncommitted_changes`` answers False when git cannot run, the
+        right default for a progress probe and the wrong one for a seal: a
+        status that cannot be read must not read as clean. This returns None
+        for "unknown" (inactive repo, failed command) so the caller decides.
+
+        Only porcelain v1 entries count (``XY path``, both sides of a rename);
+        any other line (a merged-in stderr warning) is logged and ignored. A
+        status that ran is an answer — only a failed command is None.
+
+        ``--ignore-submodules=dirty``: an embedded repository (an agent's own
+        ``git clone`` into a non-ignored directory) with edits inside it reads
+        `` M <dir>`` forever — ``add -A`` can only stage its HEAD, never its
+        working tree. A moved nested HEAD is still reported until committed.
+        """
+        if not self.is_active:
+            return None
+        try:
+            result = self._run_git(
+                ["status", "--porcelain", "--ignore-submodules=dirty"]
+            )
+        except Exception:
+            return None
+        if result.returncode != 0:
+            return None
+        paths: list[str] = []
+        ignored: list[str] = []
+        for index, line in enumerate(result.stdout.splitlines()):
+            if not line.strip():
+                continue
+            entry = _PORCELAIN_ENTRY.match(line) or (
+                _PORCELAIN_STRIPPED_FIRST_ENTRY.match(line) if index == 0 else None
+            )
+            if entry is None:
+                ignored.append(line.strip())
+                continue
+            # A rename/copy names both sides; either may be a deliverable.
+            for side in entry.group(1).split(" -> "):
+                side = side.strip()
+                if len(side) >= 2 and side[0] == side[-1] == '"':
+                    side = side[1:-1]  # core.quotePath quoting, label only
+                if side:
+                    paths.append(side)
+        if ignored:
+            logger.warning(
+                "git status printed %d non-entry line(s), ignored: %s",
+                len(ignored),
+                "; ".join(ignored[:3]),
+            )
+        return paths
+
+    def tracked_tree_matches_head(self) -> Optional[bool]:
+        """Whether tracked files match HEAD, decided by exit code alone.
+
+        ``git diff --quiet`` answers through its exit status (0 same, 1
+        different), which survives a transport that loses stdout. Untracked
+        files are not considered. None when git could not answer.
+        """
+        if not self.is_active:
+            return None
+        try:
+            result = self._run_git(
+                ["diff", "--quiet", "--ignore-submodules=dirty", "HEAD", "--"]
+            )
+        except Exception:
+            return None
+        if result.returncode == 0:
+            return True
+        if result.returncode == 1:
+            return False
+        return None
+
     def tag(self, tag_name: str, message: Optional[str] = None) -> bool:
         """Create a git tag at current HEAD (create-once, never moved).
 
@@ -1296,6 +1395,13 @@ class GitManager:
             return None
         return result.stdout.strip() or None
 
+    def remote_reachable(self, name: str = "origin", timeout: int = 30) -> bool:
+        """Whether ``git ls-remote`` reaches ``name`` (transport and auth)."""
+        if not self.is_active:
+            return False
+        result = self._run_git(["ls-remote", "--quiet", name, "HEAD"], timeout=timeout)
+        return result.returncode == 0
+
     def add_remote(self, name: str, url: str) -> bool:
         """Add or update a git remote.
 
@@ -1358,10 +1464,13 @@ class GitManager:
         Returns:
             True if push succeeded, False otherwise
         """
+        self.last_push_error = None
         if not self.is_active:
-            logger.warning(f"push skipped — git not active: {self._inactive_reason()}")
+            self.last_push_error = f"git not active: {self._inactive_reason()}"
+            logger.warning(f"push skipped — {self.last_push_error}")
             return False
         if not self.has_remote(remote):
+            self.last_push_error = f"no '{remote}' remote configured"
             logger.warning(
                 f"push skipped — no '{remote}' remote configured "
                 f"(at {self._remote_cwd or self._workspace_path})"
@@ -1380,6 +1489,9 @@ class GitManager:
                 result = self._run_git(["branch", "--show-current"])
                 detected = result.stdout.strip() if result.returncode == 0 else ""
                 if not detected:
+                    self.last_push_error = (
+                        "HEAD is detached, or the current branch could not be read"
+                    )
                     logger.warning(
                         "push refused — HEAD is detached (or the current "
                         "branch could not be read) at "
@@ -1395,6 +1507,7 @@ class GitManager:
                 timeout=120,
             )
             if result.returncode != 0:
+                self.last_push_error = result.stderr or "git push failed"
                 logger.warning(f"git push failed: {result.stderr}")
                 return False
 
@@ -1412,6 +1525,7 @@ class GitManager:
             return True
 
         except Exception as e:
+            self.last_push_error = str(e) or type(e).__name__
             logger.warning(f"Push failed: {e}")
             return False
 
@@ -1538,6 +1652,8 @@ class GitManager:
         target_path: Path,
         backend=None,
         remote_cwd=None,
+        config: Sequence[str] = (),
+        shell_tab: str = "git",
     ) -> Optional["GitManager"]:
         """Clone a repository to a target path.
 
@@ -1549,6 +1665,11 @@ class GitManager:
             remote_cwd: Relative path within backend root for the clone
                 target (e.g. "repos/my-repo"). When None, clones into
                 the backend's root directory.
+            config: ``key=value`` settings for the clone command only
+                (``git -c``), never secrets: a command line is visible.
+                Backend clones only.
+            shell_tab: The backend shell tab the clone (and the returned
+                manager's git) runs on; ``git`` by default.
 
         Returns:
             GitManager instance for the cloned repo, or None on failure
@@ -1563,23 +1684,32 @@ class GitManager:
                 else:
                     remote_target = backend.root
 
-                cmd = f"git clone {shlex.quote(url)} {shlex.quote(remote_target)}"
+                options = "".join(f"-c {shlex.quote(item)} " for item in config)
+                cmd = (
+                    f"git {options}clone {shlex.quote(url)} "
+                    f"{shlex.quote(remote_target)}"
+                )
                 output = backend.shell_run(
-                    cmd, timeout=_CLONE_SHELL_TIMEOUT_SECONDS, tab_name="git"
+                    cmd, timeout=_CLONE_SHELL_TIMEOUT_SECONDS, tab_name=shell_tab
                 )
 
                 first_line = output.split("\n", 1)[0].strip()
                 if not first_line.startswith("Exit code: 0"):
                     if cls._clone_in_flight(output):
                         if not cls._wait_for_remote_clone(
-                            backend, remote_target, masked
+                            backend, remote_target, masked, shell_tab=shell_tab
                         ):
                             return None
                     else:
                         logger.warning(f"git clone failed for {masked}: {output}")
                         return None
 
-                mgr = cls(target_path, backend=backend, remote_cwd=remote_cwd)
+                mgr = cls(
+                    target_path,
+                    backend=backend,
+                    remote_cwd=remote_cwd,
+                    shell_tab=shell_tab,
+                )
                 mgr._run_git(["config", "user.email", "agent@workspace.local"])
                 mgr._run_git(["config", "user.name", "Agent"])
 
@@ -1606,8 +1736,10 @@ class GitManager:
         return _COLLIDING_MARKER in output and "NOT executed" in output
 
     @classmethod
-    def _wait_for_remote_clone(cls, backend, remote_target: str, masked: str) -> bool:
-        """Wait for an in-flight clone on the 'git' tab to finish, then verify.
+    def _wait_for_remote_clone(
+        cls, backend, remote_target: str, masked: str, *, shell_tab: str = "git"
+    ) -> bool:
+        """Wait for an in-flight clone on its tab to finish, then verify.
 
         Polls with a probe that the busy tab rejects until the clone exits;
         once it runs, the probe's answer — is there a git repo at the target —
@@ -1621,7 +1753,7 @@ class GitManager:
         )
         while time.monotonic() < deadline:
             time.sleep(_CLONE_POLL_INTERVAL_SECONDS)
-            output = backend.shell_run(probe, timeout=60, tab_name="git")
+            output = backend.shell_run(probe, timeout=60, tab_name=shell_tab)
             if cls._clone_in_flight(output):
                 continue
             first_line = output.split("\n", 1)[0].strip()
@@ -1754,7 +1886,7 @@ class GitManager:
                 output = self._backend.shell_run(
                     cmd_str,
                     timeout=timeout,
-                    tab_name="git",
+                    tab_name=self.shell_tab,
                     working_dir=self._remote_cwd,
                 )
                 return self._parse_shell_run_output(output, args)
@@ -1844,7 +1976,7 @@ class GitManager:
                 output = self._backend.shell_run(
                     encoded_cmd,
                     timeout=timeout,
-                    tab_name="git",
+                    tab_name=self.shell_tab,
                     working_dir=self._remote_cwd,
                 )
                 encoded_result = self._parse_shell_run_output(output, args)

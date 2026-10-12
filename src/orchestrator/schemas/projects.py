@@ -1,7 +1,16 @@
 """Project, membership, repository and promotion request contracts."""
 
 from typing import Any, Literal
-from pydantic import BaseModel, Field, SecretStr, field_validator, model_validator
+from uuid import UUID
+
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    SecretStr,
+    field_validator,
+    model_validator,
+)
 
 
 class ExternalKnowledgeBase(BaseModel):
@@ -105,9 +114,46 @@ class ProjectUpdate(BaseModel):
     status: Literal["active", "archived"] | None = None
     default_config_name: str | None = None
     default_config_override: dict[str, Any] | None = None
-    cloud_storage_read_only: bool | None = None
     # Workspace egress tier. Admin-only — see PATCH /api/projects/{id}.
     network_tier: str | None = None
+
+
+WorkspaceMode = Literal["none", "virtual", "container", "vm"]
+
+
+class WorkspaceTemplateRef(BaseModel):
+    """A template by name and scope, e.g. {kind: Catalog, name: shared}."""
+
+    model_config = ConfigDict(extra="forbid")
+    name: str = Field(min_length=1, max_length=63)
+    scope: dict[str, str]
+
+
+class ProjectWorkspaceDefaultsUpdate(BaseModel):
+    """Body for PUT /api/projects/{id}/workspace-defaults. A null field falls
+    through to the installation."""
+
+    model_config = ConfigDict(extra="forbid")
+    jobs: WorkspaceMode | None = None
+    sessions: WorkspaceMode | None = None
+    container: WorkspaceTemplateRef | None = None
+    vm: WorkspaceTemplateRef | None = None
+
+
+class ProjectConnectorDefaultsUpdate(BaseModel):
+    """Body for PUT /api/projects/{id}/connector-defaults: the linked
+    connectors new work in the Project attaches when it takes its defaults.
+    The project's own connectors (knowledge base, cloud folder) are always
+    defaults and are not listed."""
+
+    model_config = ConfigDict(extra="forbid")
+    connector_ids: list[UUID] = Field(
+        default_factory=list,
+        description=(
+            "Connector ids (their Connector uids), each linked to the Project, "
+            "in order."
+        ),
+    )
 
 
 class ProjectMemberAdd(BaseModel):

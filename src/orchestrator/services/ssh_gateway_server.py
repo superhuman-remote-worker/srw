@@ -62,6 +62,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import secrets
 import uuid
 from dataclasses import dataclass
@@ -159,6 +160,7 @@ async def drain_background_tasks(timeout: float = DRAIN_TIMEOUT_SECONDS) -> int:
 # ceiling rather than by this one, and by a Kubernetes
 # terminationGracePeriodSeconds either way.
 UPSTREAM_CLOSE_TIMEOUT_SECONDS = 3.0
+VM_RENEW_INTERVAL_SECONDS = 30.0
 
 
 async def _await_upstream_closed(connection) -> None:
@@ -226,6 +228,10 @@ class GatewayContext:
     # Defaulted, unlike its five siblings, only because it was added after
     # the field order above was already being constructed positionally.
     mark_key_used: Optional[Callable] = None
+    vm_admit: Optional[Callable] = None
+    vm_renew: Optional[Callable] = None
+    vm_close: Optional[Callable] = None
+    native_first_use: Optional[Callable] = None
 
     # Not every field is optional in the same sense, and the uniform
     # ``Optional[Callable]`` typing hides that. ``resolve``, ``limiter`` and
@@ -397,6 +403,9 @@ class GatewaySSHServer(asyncssh.SSHServer):
         # Set by connection_lost, read by _open_attachment_record. See the
         # latter for the window this closes.
         self._connection_closed = False
+        self._authenticated = False
+        self._vm_renew_task: asyncio.Task | None = None
+        self._vm_access_closed = False
 
     # --- observable state (read by tests and by Task 8's logging) ---------
 
@@ -507,6 +516,7 @@ class GatewaySSHServer(asyncssh.SSHServer):
         Every failure is swallowed: a bookkeeping write must never tear down
         a session that already authenticated.
         """
+        self._authenticated = True
         bump = self._context.mark_key_used
         if bump is None or not self.presented_fingerprint:
             return
@@ -603,6 +613,48 @@ class GatewaySSHServer(asyncssh.SSHServer):
             self._channel_closed()
         self._release_attachment()
         self._close_upstream()
+        if self._vm_renew_task is not None:
+            self._vm_renew_task.cancel()
+        self._close_vm_access()
+
+    def _close_vm_access(self) -> None:
+        target = self._target
+        if (
+            self._vm_access_closed
+            or target is None
+            or target.backend != "vm"
+            or self._context.vm_close is None
+        ):
+            return
+        self._vm_access_closed = True
+        self._schedule(
+            self._context.vm_close(
+                connection_id=self._connection_id,
+                handle=self.handle,
+                fingerprint=self.presented_fingerprint,
+                target=target,
+            )
+        )
+
+    async def _renew_vm_access(self, target: SshTarget) -> None:
+        """Only a still-attached upstream may keep its own bounded lease."""
+        while not self._connection_closed and self._upstream_conn is not None:
+            await asyncio.sleep(VM_RENEW_INTERVAL_SECONDS)
+            if self._connection_closed or self._upstream_conn is None:
+                return
+            try:
+                valid = await self._context.vm_renew(
+                    connection_id=self._connection_id,
+                    handle=self.handle,
+                    fingerprint=self.presented_fingerprint,
+                    target=target,
+                )
+            except Exception:
+                valid = False
+            if not valid:
+                self._close_upstream()
+                self._close_vm_access()
+                return
 
     def _close_upstream(self) -> None:
         """Drop this connection's SSH connection to the workspace.
@@ -694,7 +746,55 @@ class GatewaySSHServer(asyncssh.SSHServer):
         except GatewayMisconfigured:
             self._refuse(process, MISCONFIGURED_MESSAGE, MISCONFIGURED_EXIT_CODE)
             return
-        await proxy_session(process, upstream)
+        target = self._target
+        if target is None or target.execution_lane not in {"pinned", "stateless"}:
+            self._refuse(
+                process,
+                "workspace native access needs a current target; reconnect in a moment",
+                75,
+            )
+            return
+        if target.no_boot_watchdog:
+            await proxy_session(process, upstream)
+            return
+        if target.native_recipient is None or self._context.native_first_use is None:
+            self._refuse(
+                process,
+                "workspace native confirmation is unavailable; reconnect in a moment",
+                75,
+            )
+            return
+
+        event_id = uuid.uuid4().hex
+        channel_kind = "sftp" if process.subsystem == "sftp" else "ssh_session"
+
+        def still_live() -> bool:
+            channel = getattr(process, "_chan", None)
+            return bool(
+                self._authenticated
+                and not self._connection_closed
+                and self._target is target
+                and self._conn is not None
+                and not self._conn.is_closed()
+                and channel is not None
+                and not channel.is_closing()
+            )
+
+        async def on_first_use() -> bool:
+            if not still_live():
+                return False
+            acknowledged = await self._context.native_first_use(
+                target,
+                event_id=event_id,
+                connection_id=self._connection_id,
+                channel_kind=channel_kind,
+                handle=self.handle,
+                fingerprint=self.presented_fingerprint,
+                still_live=still_live,
+            )
+            return bool(acknowledged and still_live())
+
+        await proxy_session(process, upstream, on_first_use=on_first_use)
 
     def _refuse(self, process, message: str, code: int) -> None:
         """Optimistic-SUCCESS refusal: stderr, then an exit code.
@@ -764,9 +864,20 @@ class GatewaySSHServer(asyncssh.SSHServer):
             if self._target is not None:
                 return self._target
 
-            target = await self._context.resolve(
-                self.handle, self.presented_fingerprint
-            )
+            try:
+                target = await self._context.resolve(
+                    self.handle, self.presented_fingerprint
+                )
+            except TargetUnavailable as exc:
+                if exc.state != "vm_unsupported" or not self._authenticated:
+                    raise
+                if self._context.vm_admit is None:
+                    raise
+                target = await self._context.vm_admit(
+                    connection_id=self._connection_id,
+                    handle=self.handle,
+                    fingerprint=self.presented_fingerprint,
+                )
             if not self._context.limiter.try_attach(target.thread_id):
                 raise AttachmentLimitReached(target.thread_id)
             self._attached_workspace = target.thread_id
@@ -793,6 +904,7 @@ class GatewaySSHServer(asyncssh.SSHServer):
             # same moment.
             if self._connection_closed:
                 self._release_attachment()
+                self._close_vm_access()
         return self._target
 
     async def _open_attachment_record(self) -> None:
@@ -848,6 +960,8 @@ class GatewaySSHServer(asyncssh.SSHServer):
         the pod answering) rather than an outage.
         """
         connection = self._upstream_conn
+        if self._vm_access_closed:
+            raise TargetUnavailable("stale_binding")
         if connection is not None:
             return connection
         if self._connection_closed:
@@ -876,6 +990,7 @@ class GatewaySSHServer(asyncssh.SSHServer):
                     target.thread_id,
                     exc,
                 )
+                self._close_vm_access()
                 raise TargetUnavailable("unreachable") from exc
             except Exception as exc:
                 logger.warning(
@@ -883,6 +998,7 @@ class GatewaySSHServer(asyncssh.SSHServer):
                     target.thread_id,
                     exc,
                 )
+                self._close_vm_access()
                 raise TargetUnavailable("unreachable") from exc
 
             if self._connection_closed:
@@ -900,6 +1016,8 @@ class GatewaySSHServer(asyncssh.SSHServer):
                 raise TargetUnavailable("unreachable")
 
             self._upstream_conn = connection
+            if target.backend == "vm" and self._context.vm_renew is not None:
+                self._vm_renew_task = asyncio.create_task(self._renew_vm_access(target))
             return connection
 
     def _forward_connection(self, dest_host: str, dest_port: int):
@@ -1042,8 +1160,24 @@ async def connect_upstream(context: GatewayContext, target: SshTarget):
     # The certificate's PRINCIPAL is this specific workspace's thread id --
     # not WORKSPACE_PRINCIPAL, which names only the shared Unix login user
     # passed as `username` below. See WORKSPACE_PRINCIPAL's docstring.
-    key, cert = context.ca.mint(target.thread_id)
     expected = target.host_key_fingerprint
+    if target.backend == "vm":
+        key_path = os.environ.get("SSH_KEY_PATH", "")
+        if not key_path or not os.path.isfile(key_path):
+            raise TargetUnavailable("unreachable")
+        return await asyncssh.connect(
+            target.pod_ip,
+            port=target.pod_port,
+            username=WORKSPACE_PRINCIPAL,
+            client_keys=[key_path],
+            known_hosts=EMPTY_KNOWN_HOSTS,
+            server_host_key_algs=["ssh-ed25519"],
+            client_factory=lambda: _PinnedClient(expected),
+            encoding=None,
+            connect_timeout=UPSTREAM_CONNECT_TIMEOUT_SECONDS,
+            login_timeout=UPSTREAM_LOGIN_TIMEOUT_SECONDS,
+        )
+    key, cert = context.ca.mint(target.thread_id)
     return await asyncssh.connect(
         target.pod_ip,
         port=target.pod_port,

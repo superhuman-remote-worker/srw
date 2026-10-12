@@ -15,4 +15,5 @@ from agent.services.memory.plugins import bounded  # noqa: F401  (import-time re
 from agent.services.memory.plugins import gate  # noqa: F401  (import-time registration)
 from agent.services.memory.plugins import legacy  # noqa: F401  (import-time registration)
 from agent.services.memory.plugins import legacy_writers  # noqa: F401  (import-time registration)
+from agent.services.memory.plugins import memory_search  # noqa: F401  (import-time registration)
 from agent.services.memory.plugins import reranker  # noqa: F401  (import-time registration)

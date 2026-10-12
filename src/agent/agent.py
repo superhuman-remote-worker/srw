@@ -13,6 +13,9 @@ Key Features:
 """
 
 import asyncio
+from copy import deepcopy
+import hashlib
+import json
 import logging
 import math
 import os
@@ -22,17 +25,21 @@ from dataclasses import asdict, replace as _dc_replace
 from datetime import datetime
 from pathlib import Path
 from typing import Any, AsyncIterator, Callable, Dict, List, Optional, Tuple
+from uuid import UUID
 
 import aiosqlite
 from langchain_core.language_models import BaseChatModel
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 from langgraph.checkpoint.base import BaseCheckpointSaver
+from langgraph.errors import NodeCancelledError
 
+from shared.worker_errors import worker_error_cause
 from shared.runtime.core.loader import (
     AgentConfig,
     LLMConfig,
     load_agent_config,
     load_config_from_resolved,
+    create_auxiliary_llms,
     create_llm,
     get_all_tool_names,
     resolve_config_path,
@@ -51,6 +58,7 @@ from shared.runtime.core.workspace_backend import WorkspaceUnavailableError
 from agent.graph import (
     WORKER_BATCH_MIN_WALL_SECONDS,
     build_phase_alternation_graph,
+    checkpoint_completion_report,
     hydrate_todo_manager_from_state,
     run_graph_with_streaming,
 )
@@ -133,6 +141,27 @@ def _stateless_worker_remote_authority(
         worker_lease_token,
         backend="sandbox",
     )
+
+
+def _job_owns_its_workspace(metadata: Dict[str, Any], job_id: Any) -> bool:
+    """False for a child job that runs on its parent's workspace.
+
+    The orchestrator marks such a child with ``inherits_parent_workspace``
+    (or ``provisions_parent_workspace`` for a scholar that provisions the
+    parent's pod) in its context, and attests ``workspace_owner_id`` as the
+    parent where it attests an owner at all. Anything that is the owner's to
+    decide about the shared home (retiring pre-agent key files a parent on an
+    older image may still use) stays with the owner.
+    """
+
+    context = metadata.get("context")
+    context = context if isinstance(context, dict) else {}
+    if context.get("inherits_parent_workspace") in (True, "true") or context.get(
+        "provisions_parent_workspace"
+    ):
+        return False
+    owner_id = metadata.get("workspace_owner_id")
+    return not owner_id or str(owner_id) == str(job_id)
 
 
 # >>> TEMPORARY QUICKFIX (2026-07-30) — delete with the upstream fix.
@@ -352,6 +381,7 @@ class UniversalAgent:
         # Non-None only while the stateless worker driver owns an immutable
         # worker_batch lease.  The saver and remote shell both bind to it.
         self._worker_lease_token: Optional[int] = None
+        self._worker_thread_config: Optional[Dict[str, Any]] = None
         self._defer_job_cleanup = False
         self._worker_checkpoint_post_commit = None
         self._worker_env_restore: Dict[str, Optional[str]] = {}
@@ -414,10 +444,9 @@ class UniversalAgent:
         self._datasource_clients: Dict[
             str, Any
         ] = {}  # Parent clients for cleanup (e.g. MongoClient)
-        # Manifest of materialized credential files (kubeconfig / ssh_key /
-        # generic_file). Populated by process_credential_files() at job start;
-        # consumed by cleanup_credential_files() at job end.
-        self._datasource_files_manifest: Optional[Dict[str, Any]] = None
+        # ``{authority_id: status}`` of the connector SSH identities loaded
+        # into workspace ssh-agents for this job (C1); credential-free.
+        self._workspace_ssh_identity_status: Dict[str, str] = {}
 
         # Orchestrator client (injected by app layer for delegation/reporting)
         self._orchestrator_client = None
@@ -545,7 +574,14 @@ class UniversalAgent:
         # with the tiers.
         self._model_config_warnings: List[str] = []
 
-        self._llm = create_llm(llm_config, limits=limits)
+        # A per-job conversation key keeps a job's turns on one proxy account
+        # and one provider cache (LLMConfig.prompt_cache_key). Only the main
+        # client carries it; the boot-time build has no job yet.
+        main_config = llm_config
+        job_id = getattr(self, "_current_job_id", None)
+        if job_id:
+            main_config = _dc_replace(llm_config, prompt_cache_key=f"srw-job-{job_id}")
+        self._llm = create_llm(main_config, limits=limits)
         self._strategic_llm = self._llm
         self._tactical_llm = self._llm
         logger.info(f"Created LLM for all phases: {llm_config.model}")
@@ -619,22 +655,10 @@ class UniversalAgent:
             model_settings = resolve_model_settings(
                 aux_config.model, self.config._deployment_dir
             )
-            # AuxiliaryConfig fields (temperature) take precedence;
-            # settings matrix provides top_p, top_k, model_max_context_tokens
-            aux_llm_config = LLMConfig(
-                model=aux_config.model,
-                base_url=aux_config.base_url,
-                api_key=aux_config.api_key,
-                provider=aux_config.provider,
-                extra_headers=aux_config.extra_headers,
-                temperature=aux_config.temperature,
-                top_p=model_settings.get("top_p"),
-                top_k=model_settings.get("top_k"),
-                model_max_context_tokens=model_settings.get("model_max_context_tokens"),
-                extra_body=model_settings.get("extra_body"),
-                max_retries=1,
-            )
-            aux_llm = create_llm(aux_llm_config, limits=limits)
+            aux_clients = create_auxiliary_llms(aux_config, model_settings, limits)
+            aux_llm_config = aux_clients.config
+            aux_llm = aux_clients.llm
+            aux_summarization_llm = aux_clients.summarization_llm
             aux_window = aux_llm_config.model_max_context_tokens or main_window
             # Drop-in fallback for a dead/unreachable dedicated aux model: the
             # summarization LLM (main working model). Keeps compaction + memory
@@ -645,7 +669,8 @@ class UniversalAgent:
                 f"Created auxiliary LLM: {aux_config.model}"
                 f" (settings matrix: top_p={aux_llm_config.top_p},"
                 f" top_k={aux_llm_config.top_k},"
-                f" max_ctx={aux_llm_config.model_max_context_tokens})"
+                f" max_ctx={aux_llm_config.model_max_context_tokens};"
+                f" summarization reasoning={aux_config.summarization_reasoning_level})"
             )
             aux_structured_output_method = model_settings.get(
                 "structured_output_method", "json_schema"
@@ -657,6 +682,7 @@ class UniversalAgent:
             # aux already IS the main model — nothing to fall back to.
             aux_fallback = None
             aux_fallback_method = None
+            aux_summarization_llm = None
             aux_structured_output_method = summarization_structured_output_method
             logger.info("AuxiliaryLLM: reusing summarization LLM")
 
@@ -668,6 +694,7 @@ class UniversalAgent:
             fallback_llm=aux_fallback,
             structured_output_method=aux_structured_output_method,
             fallback_structured_output_method=aux_fallback_method,
+            summarization_llm=aux_summarization_llm,
         )
         self._wire_aux_job_context(_prev_aux, self._auxiliary_llm)
 
@@ -910,11 +937,13 @@ class UniversalAgent:
             ):
                 raise ValueError("worker batch target must be positive")
             self._worker_lease_token = int(worker_lease_token)
+            self._worker_thread_config = None
             self._defer_job_cleanup = bool(defer_cleanup)
             self._worker_checkpoint_post_commit = worker_checkpoint_post_commit
             self._worker_shell_admission_retired = False
         else:
             self._worker_lease_token = None
+            self._worker_thread_config = None
             self._defer_job_cleanup = False
             self._worker_checkpoint_post_commit = None
 
@@ -1074,6 +1103,8 @@ class UniversalAgent:
                 tool_context=self._tool_context,
                 postgres_db=self.postgres_conn,
             )
+            self._retain_compiled_worker_checkpointer()
+            self._publish_memory_service()
 
             # Execute graph
             # Use job_id as thread_id (new format), with fallback to legacy format for old jobs
@@ -1084,6 +1115,8 @@ class UniversalAgent:
                 },
                 "recursion_limit": 1000000,  # Effectively unlimited
             }
+            if stateless_worker:
+                self._worker_thread_config = deepcopy(thread_config)
 
             # Check if we should resume from phase snapshot or use checkpoint directly
             # Graceful stops (cancel/pause/review) have a valid checkpoint.db with current todos,
@@ -1734,7 +1767,13 @@ class UniversalAgent:
                 "checkpoint; suppressing further graph work",
                 job_id,
             )
+            prior_cause = worker_error_cause(error)
             return {
+                **{
+                    key: values[key]
+                    for key in ("client_report_id", "completion_report_payload")
+                    if key in values
+                },
                 "job_id": job_id,
                 "should_stop": True,
                 "goal_achieved": False,
@@ -1742,6 +1781,7 @@ class UniversalAgent:
                     "type": "worker_retry_budget_exhausted",
                     "recoverable": True,
                     "message": "worker queue retry budget exhausted",
+                    **({"cause": prior_cause} if prior_cause is not None else {}),
                 },
             }
 
@@ -1844,6 +1884,174 @@ class UniversalAgent:
             cap,
         )
         return None
+
+    def _retain_compiled_worker_checkpointer(self) -> None:
+        """Keep the exact fenced saver actually installed by strict compile.
+
+        LangGraph derives a serializer allowlist by shallow-cloning its saver.
+        Only the same claim, connection, lock and write policy may replace our
+        source reference; terminal reporting still requires object identity.
+        """
+        if getattr(self, "_worker_lease_token", None) is None:
+            return
+        from agent.api.lease_context import LeaseLostError
+        from agent.core.fenced_checkpointer import FencedAsyncPostgresSaver
+
+        source = self._checkpointer
+        compiled = getattr(self._graph, "checkpointer", None)
+        if (
+            not isinstance(source, FencedAsyncPostgresSaver)
+            or type(compiled) is not type(source)
+            or getattr(source, "unit_id", None) != self._current_job_id
+            or getattr(source, "lease_token", None) != self._worker_lease_token
+            or getattr(compiled, "unit_id", None) != source.unit_id
+            or getattr(compiled, "lease_token", None) != source.lease_token
+        ):
+            raise LeaseLostError("Compiled worker checkpoint ownership is unproven")
+        if compiled is not source and (
+            not all(
+                hasattr(saver, field)
+                for saver in (source, compiled)
+                for field in (
+                    "conn",
+                    "lock",
+                    "post_commit",
+                    "retry_attempts",
+                    "retry_base_seconds",
+                )
+            )
+            or compiled.conn is not source.conn
+            or compiled.lock is not source.lock
+            or compiled.post_commit is not source.post_commit
+            or compiled.retry_attempts != source.retry_attempts
+            or compiled.retry_base_seconds != source.retry_base_seconds
+        ):
+            raise LeaseLostError("Compiled worker checkpoint ownership is unproven")
+        source._bound_handle()
+        compiled._bound_handle()
+        self._checkpointer = compiled
+
+    async def checkpoint_worker_retry_exhaustion(
+        self,
+        *,
+        job_id: str,
+        lease_token: int,
+        terminal_state: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """Seal a native give-up at END before reporting its distinct operation.
+
+        The prior report remains provenance (identity + payload digest); it is
+        never reused for changed semantics. A successor adopts the durable new
+        pair rather than minting another identity or executing graph work.
+        """
+        from agent.api.lease_context import LeaseLostError
+        from agent.core.fenced_checkpointer import FencedAsyncPostgresSaver
+
+        saver = self._checkpointer
+        config = getattr(self, "_worker_thread_config", None)
+        # Fixed predicate names diagnose a refused binding without exposing
+        # owner identifiers, lease tokens, saver details or configuration.
+        failed = []
+        if self._current_job_id != job_id:
+            failed.append("current_job")
+        if self._worker_lease_token != lease_token:
+            failed.append("current_token")
+        if not isinstance(saver, FencedAsyncPostgresSaver):
+            failed.append("fenced_saver")
+        else:
+            if getattr(saver, "unit_id", None) != job_id:
+                failed.append("saver_job")
+            if getattr(saver, "lease_token", None) != lease_token:
+                failed.append("saver_token")
+        if self._graph is None:
+            failed.append("graph_present")
+        elif getattr(self._graph, "checkpointer", None) is not saver:
+            failed.append("graph_saver")
+        if not isinstance(config, dict):
+            failed.append("thread_config")
+        else:
+            configurable = config.get("configurable")
+            if (
+                not isinstance(configurable, dict)
+                or configurable.get("thread_id") != job_id
+            ):
+                failed.append("thread_id")
+        if failed:
+            raise LeaseLostError(
+                "Worker give-up checkpoint ownership is unproven: " + ",".join(failed)
+            )
+        saver._bound_handle()
+        snapshot = await self._graph.aget_state(config)
+        values = dict(snapshot.values or {})
+        payload = values.get("completion_report_payload")
+        report_id = values.get("client_report_id")
+        fields = {"should_stop", "goal_achieved", "error", "freeze_data"}
+        if (
+            snapshot.next
+            or not isinstance(payload, dict)
+            or set(payload) != fields
+            or not isinstance(report_id, str)
+            or str(UUID(report_id)) != report_id
+        ):
+            raise RuntimeError("Worker give-up requires a sealed canonical END")
+
+        freeze = payload.get("freeze_data")
+        freeze_type = freeze.get("freeze_type") if isinstance(freeze, dict) else None
+        error = payload.get("error")
+        recoverable = bool(
+            (isinstance(error, dict) and error.get("recoverable") is True)
+            or freeze_type in AUTO_CONTINUE_FREEZE_TYPES
+        )
+        human_freeze = bool(
+            freeze_type and freeze_type not in AUTO_CONTINUE_FREEZE_TYPES
+        )
+        if payload.get("goal_achieved") is True or (
+            payload.get("should_stop") is True and (human_freeze or not recoverable)
+        ):
+            # Includes an already durable give-up, genuine success and human
+            # ENDs. Preserve their exact operation, including above the cap.
+            saver._bound_handle()
+            return values
+        if report_id != terminal_state.get("client_report_id"):
+            raise RuntimeError("Worker give-up source report changed")
+        terminal_error = terminal_state.get("error")
+        terminal_freeze = terminal_state.get("freeze_data")
+        if (
+            terminal_state.get("should_stop") is not True
+            or terminal_state.get("goal_achieved") is not False
+            or not isinstance(terminal_error, dict)
+            or terminal_error.get("type") != "worker_retry_exhausted"
+            or terminal_error.get("recoverable") is not False
+            or not isinstance(terminal_freeze, dict)
+            or terminal_freeze.get("freeze_type") != "worker_retry_exhausted"
+        ):
+            raise RuntimeError("Worker give-up report is unproven")
+        updates = {key: deepcopy(terminal_state[key]) for key in fields}
+        updates["freeze_data"].update(
+            prior_client_report_id=report_id,
+            prior_report_payload_sha256=hashlib.sha256(
+                json.dumps(
+                    payload,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    ensure_ascii=True,
+                    allow_nan=False,
+                ).encode()
+            ).hexdigest(),
+            prior_freeze=deepcopy(freeze),
+        )
+        updates.update(client_report_id=None, completion_report_payload=None)
+        updates.update(checkpoint_completion_report(updates))
+        await self._graph.aupdate_state(
+            config, updates, as_node="checkpoint_completion_report"
+        )
+        persisted = await self._graph.aget_state(config)
+        if persisted.next or any(
+            persisted.values.get(key) != value for key, value in updates.items()
+        ):
+            raise RuntimeError("Worker give-up checkpoint read-back is unproven")
+        saver._bound_handle()
+        return dict(persisted.values)
 
     async def _make_checkpointer(self, job_id: str) -> None:
         """Create the LangGraph checkpointer for this job per CHECKPOINTER_BACKEND.
@@ -1949,11 +2157,12 @@ class UniversalAgent:
     def _capture_worker_environment(self, metadata: Dict[str, Any]) -> None:
         """Snapshot every per-job env key before this worker can overwrite it.
 
-        A stateless process serves unrelated jobs sequentially.  Config
-        ``env_keys`` are intentionally open-ended, while managed datasource
-        CLIs populate a small fixed set.  Recording the pre-claim values lets
-        teardown restore the pod baseline instead of leaking one tenant's
-        credentials into the next claim.
+        A stateless process serves unrelated jobs sequentially, and config
+        ``env_keys`` are intentionally open-ended.  Recording the pre-claim
+        values lets teardown restore the pod baseline instead of leaking one
+        tenant's credentials into the next claim.  Managed connectors hold a
+        connection rather than environment variables, and credential files
+        and connector variables live in the workspace, never this process.
         """
 
         self._restore_worker_environment()
@@ -1963,14 +2172,6 @@ class UniversalAgent:
                 "env_keys"
             )
         keys = set(env_keys) if isinstance(env_keys, dict) else set()
-        datasource_env = {
-            "postgresql": {"PGHOST", "PGPORT", "PGUSER", "PGPASSWORD", "PGDATABASE"},
-            "neo4j": {"NEO4J_URI", "NEO4J_USERNAME", "NEO4J_PASSWORD"},
-            "mongodb": {"MONGOSH_URI"},
-        }
-        for datasource in metadata.get("datasources") or []:
-            if isinstance(datasource, dict):
-                keys.update(datasource_env.get(str(datasource.get("type")), set()))
         self._worker_env_restore = {key: os.environ.get(key) for key in keys}
 
     def _restore_worker_environment(self) -> None:
@@ -2176,7 +2377,6 @@ class UniversalAgent:
                 "_knowledge_graph",
                 "_datasource_connections",
                 "_datasource_clients",
-                "_datasource_files_manifest",
             )
         ):
             self._close_datasource_connections()
@@ -2192,6 +2392,7 @@ class UniversalAgent:
         self._tool_context = None
         self._tools = None
         self._graph = None
+        self._worker_thread_config = None
         self._worker_checkpoint_post_commit = None
         self._defer_job_cleanup = False
 
@@ -2497,11 +2698,21 @@ class UniversalAgent:
                 )
             else:
                 logger.error(f"Job {job_id} failed mid-stream: {e}", exc_info=True)
-            yield {
+            error_state = {
                 "job_id": job_id,
                 "error": error,
                 "should_stop": True,
             }
+            if getattr(self, "_defer_job_cleanup", False) and isinstance(
+                e, NodeCancelledError
+            ):
+                # LangGraph distinguishes a node raising CancelledError from
+                # cancellation of the serving task. Preserve that provenance
+                # locally: its unfinished checkpoint cannot prove safe replay
+                # or terminal completion. The worker consumes this field; it
+                # is never a checkpoint or completion-protocol write.
+                error_state["_worker_node_cancelled"] = True
+            yield error_state
         finally:
             # The worker driver does not report/rotate until it observes this
             # generator's StopAsyncIteration (and explicitly closes it on every
@@ -2543,7 +2754,7 @@ class UniversalAgent:
     ) -> Optional[Dict[str, Any]]:
         """Poll the orchestrator for a running job's upgraded-workspace readiness.
 
-        The worker analogue of ``persistent_app._poll_workspace_ready`` (sandbox
+        The worker analogue of ``session_workspace.poll_workspace_ready`` (sandbox
         only — the worker MVP upgrades ``virtual → sandbox``; ``vm`` is the
         operator-gated re-dispatch path). Returns the
         ``{"backend":"sandbox","remote":{...}}`` block, or None on
@@ -2761,11 +2972,26 @@ class UniversalAgent:
             tool_context=self._tool_context,
             postgres_db=self.postgres_conn,
         )
+        self._retain_compiled_worker_checkpointer()
+        self._publish_memory_service()
         logger.info(
             f"[{job_id}] Workspace upgraded to {target_tier}; graph rebuilt with "
             f"shell/git tools — resuming in process"
         )
         return True
+
+    def _publish_memory_service(self) -> None:
+        """Hand the graph's MemoryManager to the tools (``memory_search``).
+
+        The manager is bound inside the graph build, after the tools were
+        loaded and bound to the LLM, so memory tools resolve it at call time
+        from ``ToolContext.memory_service`` (append-only context injection,
+        D25/D34). None when memory or the manager seam is off.
+        """
+        if self._tool_context is not None:
+            self._tool_context.memory_service = getattr(
+                self._graph, "_srw_memory_service", None
+            )
 
     def _load_workspace_template(self) -> str:
         """Load the workspace.md template for the nested loop graph.
@@ -2992,6 +3218,10 @@ class UniversalAgent:
         managed_repository_credentials = metadata.pop(
             "managed_repository_credentials", None
         )
+        # Connector SSH keys (C1) are the same kind of bearer: popped before
+        # anything can copy metadata into graph state or a log line.
+        workspace_ssh_identities = metadata.pop("workspace_ssh_identities", None)
+        self._workspace_ssh_identity_status = {}
         # Fresh capture per job: files we write on top of the pod's git clone,
         # re-asserted if a pod re-provision drops them (see the reconnect hook).
         self._agent_seed_files = {}
@@ -3235,7 +3465,18 @@ class UniversalAgent:
 
         apply_kb_embedding_env(env_keys)
         if env_keys:
-            for k, v in env_keys.items():
+            from shared.runtime.core.transport_resolution import exportable_env_keys
+
+            # Only the names the orchestrator's dispatch injectors write reach
+            # os.environ; any other name (an arbitrary SDK variable) is dropped.
+            exportable, dropped = exportable_env_keys(env_keys)
+            if dropped:
+                logger.warning(
+                    "Ignored %d env key(s) outside the dispatch allow-list: %s",
+                    len(dropped),
+                    dropped,
+                )
+            for k, v in exportable.items():
                 if k not in KB_EMBEDDING_ENV_KEYS:
                     _os.environ[k] = v
             # Log the key NAMES (never values) so a missing credential — e.g.
@@ -3426,6 +3667,18 @@ class UniversalAgent:
             managed_repository_credentials, workspace_backend
         )
         del managed_repository_credentials
+        from agent.connectors import RuntimeContext, connector_registry
+
+        # Per-identity and never fatal: a broken connector key degrades only
+        # its own connector (the clone that follows skips it).
+        identities = RuntimeContext(
+            execution="worker",
+            backend=workspace_backend,
+            ssh_identities=workspace_ssh_identities,
+        )
+        del workspace_ssh_identities
+        await connector_registry().initialize_workspace(identities)
+        self._workspace_ssh_identity_status = identities.ssh_identity_status or {}
         primary_url = metadata.get("git_remote_url")
         if repository_url_has_credentials(primary_url):
             raise ManagedRepositoryMaterializationError(
@@ -4024,73 +4277,64 @@ class UniversalAgent:
         Also creates datasource connections from job metadata (sent by orchestrator)
         and injects them into the ToolContext.
         """
-        # Process datasources from job metadata (sent by orchestrator)
-        from agent.core.datasource_setup import (
-            clone_repository_datasources,
-            inject_workspace_facts,
-            install_workspace_credentials,
-            process_credential_files,
-            process_datasources,
+        # Deliver the connectors in the job's payload (sent by the
+        # orchestrator), in the worker order: environment, managed
+        # connections, MCP discovery, repository checkouts and credential
+        # files (onto the workspace backend, never the agent pod).
+        from agent.connectors import (
+            RuntimeContext,
+            connector_registry,
+            deliveries_from_payload,
         )
+        from agent.core.datasource_setup import inject_workspace_facts
 
         ds_configs = (
             self._job_metadata.get("datasources", []) if self._job_metadata else []
         )
         ws = self._workspace_manager
-        install_workspace_credentials(ds_configs, ws)
-
-        # Repository datasources clone onto the workspace backend — never
-        # locally in the agent pod (the subprocess git-clone branch was
-        # removed; see knowledge-base/knowledge/features/no_workspace_agent_mode.md §9.4).
-        repo_datasources = [ds for ds in ds_configs if ds.get("type") == "repository"]
-        kb_datasources = [ds for ds in ds_configs if ds.get("type") == "kb"]
-        non_repo_datasources = [
-            ds for ds in ds_configs if ds.get("type") not in ("repository", "kb")
-        ]
-
-        datasources_dict, client_registry, cli_ds_types = process_datasources(
-            non_repo_datasources
+        deliveries = deliveries_from_payload(ds_configs)
+        connectors = RuntimeContext(
+            execution="worker",
+            workspace_manager=ws,
+            ssh_identity_status=getattr(self, "_workspace_ssh_identity_status", None),
+            # A child job sees only its own repositories, on a home its
+            # parent (perhaps still on a pre-agent image) owns.
+            legacy_key_files=(
+                "sweep"
+                if _job_owns_its_workspace(
+                    self._job_metadata or {}, self._current_job_id
+                )
+                else "keep"
+            ),
         )
-        # Track connections for cleanup
-        self._datasource_connections.update(datasources_dict)
-        self._datasource_clients.update(client_registry)
+        try:
+            await connector_registry().setup_worker(deliveries, connectors)
+        finally:
+            # Tracked for cleanup, including what a failed step left open;
+            # _close_datasource_connections() closes them. The environment
+            # and the credential files live in the workspace, as long as it.
+            self._datasource_connections.update(connectors.connections)
+            self._datasource_clients.update(connectors.clients)
+        datasources_dict = connectors.connections
 
         from agent.tools.registry import register_mcp_tools
 
-        # Discovery must finish before rendering the README.md facts block and loading
-        # tools. MCPManager degrades individual server failures internally.
-        mcp_manager = datasources_dict.get("mcp")
+        # Discovery finished above; its tools load with the rest. Loop-mode
+        # workers are process-reused, so a job without MCP clears the prior
+        # job's dynamic registry entries.
+        from agent.connectors.mcp import MCP_SLOT
+
+        mcp_manager = datasources_dict.get(MCP_SLOT)
         if mcp_manager is not None:
             try:
-                await mcp_manager.connect_all()
-            except Exception as e:
-                logger.warning(
-                    "Unexpected MCP discovery failure (%s); continuing without MCP",
-                    type(e).__name__,
-                )
-            try:
                 register_mcp_tools(mcp_manager)
-                mcp_manager.annotate_configs()
             except Exception as e:
                 logger.warning(
                     "Could not register MCP tools (%s); continuing without MCP",
                     type(e).__name__,
                 )
         else:
-            # Loop-mode workers are process-reused; do not retain the prior
-            # job's dynamic registry entries.
             register_mcp_tools(None)
-
-        if repo_datasources:
-            clone_repository_datasources(repo_datasources, ws)
-
-        # Materialize credential files (kubeconfig, ssh_key, generic_file).
-        # Tracked in a manifest so _close_datasource_connections() can undo it.
-        try:
-            self._datasource_files_manifest = process_credential_files(ds_configs)
-        except Exception as e:
-            logger.warning("Failed to materialize credential files: %s", e)
-            self._datasource_files_manifest = None
 
         # README.md workspace-facts block (connectors, materials, layout).
         # Regenerated on every init — resume included — so it reflects the
@@ -4107,12 +4351,12 @@ class UniversalAgent:
                 ws,
                 project_name=project_name,
                 expert=getattr(self.config, "display_name", None),
+                ssh_identity_status=getattr(
+                    self, "_workspace_ssh_identity_status", None
+                ),
             )
             if readme:
                 self._agent_seed_files["README.md"] = readme
-
-        if cli_ds_types:
-            self.config.extra["_cli_datasources"] = cli_ds_types
 
         # Create tool context with dependencies
         # Merge agent_id and LLM settings into config for tools
@@ -4148,7 +4392,6 @@ class UniversalAgent:
             "repo_name": (self._job_metadata or {}).get("repo_name"),
         }
 
-        from agent.services.knowledge.bindings import build_knowledge_bindings
         from shared.runtime_actor import RuntimeActorContext
 
         raw_project_id = (
@@ -4158,9 +4401,9 @@ class UniversalAgent:
         runtime_actor = RuntimeActorContext.from_payload(
             self._job_metadata.get("runtime_actor") if self._job_metadata else None
         )
-        knowledge_bindings = build_knowledge_bindings(
+        knowledge_bindings = connector_registry().knowledge_bindings(
+            deliveries,
             project_ids=native_project_ids,
-            datasources=kb_datasources,
             runtime_actor=runtime_actor,
         )
 
@@ -4684,7 +4927,9 @@ class UniversalAgent:
             logger.warning(f"Failed to initialize Neo4j Graph tier (non-fatal): {e}")
 
     async def _hydrate_job_brief(self, job_id: str) -> None:
-        """Backfill description/required_deliverables/kickoff_message.
+        """Backfill description/required_deliverables/kickoff_message and
+        the cloud connectors block's two keys (cloud_connectors,
+        cloud_baseline).
 
         ``JobResumeRequest`` carries none of them, so a resumed job would
         serve an empty virtual ``task_brief.md`` for the rest of its life.
@@ -4714,6 +4959,8 @@ class UniversalAgent:
                     "description": (job or {}).get("description"),
                     "required_deliverables": ctx.get("required_deliverables"),
                     "kickoff_message": ctx.get("kickoff_message"),
+                    "cloud_connectors": ctx.get("cloud_connectors"),
+                    "cloud_baseline": ctx.get("cloud_baseline"),
                 }
             except Exception as e:
                 logger.warning(f"[{job_id}] brief hydration via DB failed: {e}")
@@ -4726,7 +4973,7 @@ class UniversalAgent:
             return
         if self._job_metadata is None:
             self._job_metadata = {}
-        for key in keys:
+        for key in (*keys, "cloud_connectors", "cloud_baseline"):
             if row.get(key) and not self._job_metadata.get(key):
                 self._job_metadata[key] = row[key]
         logger.info(
@@ -4814,7 +5061,10 @@ class UniversalAgent:
         # the exists()-probe precedence dance and the "rewrite if it vanished"
         # repair path — a virtual file cannot go missing.
         from agent.core.virtual_dirs import build_instruction_providers
-        from agent.core.deliverables import format_deliverable_contract_block
+        from agent.core.deliverables import (
+            format_cloud_connectors_block,
+            format_deliverable_contract_block,
+        )
 
         # Providers read self._job_metadata LIVE (not a bound alias): resume
         # hydration may replace or backfill it after these closures are
@@ -4852,6 +5102,14 @@ class UniversalAgent:
             )
             if contract_block:
                 parts.append(contract_block)
+            # The job's main-cloud connectors: where the project folder's copy
+            # is and what happens to edits there, and whether the deliverables
+            # reach a shared folder. Empty string when the job has none.
+            cloud_block = format_cloud_connectors_block(
+                meta.get("cloud_connectors"), meta.get("cloud_baseline")
+            )
+            if cloud_block:
+                parts.append(cloud_block)
             return "".join(parts)
 
         instruction_providers = build_instruction_providers(
@@ -4882,8 +5140,11 @@ class UniversalAgent:
                 deployment_dir=self.config._deployment_dir,
                 framework_dir=templates_dir,
             )
-            resolved_instructions = self.config.extra.get("_resolved_instructions", {})
+            resolved_instructions = (
+                self.config.extra.get("_resolved_instructions", {}) or {}
+            )
             deployed_paths: set[str] = set()
+            missing_bound_skills: list[str] = []
             for entry in self.config.instruction_files:
                 if entry.path in deployed_paths:
                     continue
@@ -4898,6 +5159,8 @@ class UniversalAgent:
                             logger.warning(
                                 f"Bound skill content missing from blob: {entry.skill}"
                             )
+                            if entry.skill not in missing_bound_skills:
+                                missing_bound_skills.append(entry.skill)
                             continue
                         content = render_instruction_content(
                             content,
@@ -4933,6 +5196,21 @@ class UniversalAgent:
                     )
                 except FileNotFoundError:
                     logger.warning(f"Instruction file not found: {entry.file}")
+
+            if missing_bound_skills:
+                # Fail closed with an actionable bounded error, not an endless
+                # missing-file loop. The gate would otherwise demand a read of
+                # a path that can never appear, while read_file can only ever
+                # report "not found". Surfaces as a terminal job_error via the
+                # existing completion payload; never silent completion.
+                raise RuntimeError(
+                    "Bound skill content missing from frozen blob: "
+                    f"{sorted(missing_bound_skills)}. The job's mandatory "
+                    "instruction gate cannot be satisfied without it; failing "
+                    "closed rather than demanding an impossible read. "
+                    "Re-dispatch with a frozen config that includes the skill, "
+                    "or remove the binding."
+                )
 
         # Skill directories (Slice 2): materialize in-scope skills into
         # skills/<name>/<path> so use_skill (L2) and read_file/run_command (L3)
@@ -5046,37 +5324,6 @@ class UniversalAgent:
                 f"Auto-registration of input documents failed (non-fatal): {e}"
             )
 
-    def _inject_typed_env_vars(self, ds_type: str, ds: Dict[str, Any]) -> None:
-        """Inject well-known environment variables for managed connector CLI access."""
-        url = ds.get("connection_url", "")
-        creds = ds.get("credentials") or {}
-
-        if ds_type == "postgresql":
-            # Parse connection URL into PG* env vars
-            from urllib.parse import urlparse
-
-            parsed = urlparse(url)
-            if parsed.hostname:
-                os.environ["PGHOST"] = parsed.hostname
-            if parsed.port:
-                os.environ["PGPORT"] = str(parsed.port)
-            if parsed.username:
-                os.environ["PGUSER"] = parsed.username
-            password = parsed.password or creds.get("password", "")
-            if password:
-                os.environ["PGPASSWORD"] = password
-            db_name = parsed.path.lstrip("/").split("?")[0]
-            if db_name:
-                os.environ["PGDATABASE"] = db_name
-
-        elif ds_type == "neo4j":
-            os.environ["NEO4J_URI"] = url
-            os.environ["NEO4J_USERNAME"] = creds.get("username", "neo4j")
-            os.environ["NEO4J_PASSWORD"] = creds.get("password", "")
-
-        elif ds_type == "mongodb":
-            os.environ["MONGOSH_URI"] = url
-
     def _close_datasource_connections(self) -> None:
         """Close all datasource connections opened for the current job."""
         # Close knowledge graph connection (inline curation)
@@ -5088,33 +5335,18 @@ class UniversalAgent:
                 logger.warning(f"Error closing knowledge graph: {e}")
             self._knowledge_graph = None
 
-        for ds_type, conn in self._datasource_connections.items():
-            try:
-                if hasattr(conn, "close"):
-                    conn.close()
-                    logger.debug(f"Closed {ds_type} datasource connection")
-            except Exception as e:
-                logger.warning(f"Error closing {ds_type} datasource: {e}")
+        # The connections and parent clients (e.g. MongoClient).
+        from agent.connectors import RuntimeContext, connector_registry
+
+        connector_registry().release(
+            RuntimeContext(
+                execution="worker",
+                connections=self._datasource_connections,
+                clients=self._datasource_clients,
+            )
+        )
         self._datasource_connections = {}
-        # Close parent clients (e.g. MongoClient) that aren't in _datasource_connections
-        for ds_type, client in self._datasource_clients.items():
-            try:
-                if hasattr(client, "close"):
-                    client.close()
-                    logger.debug(f"Closed {ds_type} datasource client")
-            except Exception as e:
-                logger.warning(f"Error closing {ds_type} datasource client: {e}")
         self._datasource_clients = {}
-
-        # Remove credential files materialized for this job (best-effort).
-        if self._datasource_files_manifest:
-            try:
-                from agent.core.datasource_setup import cleanup_credential_files
-
-                cleanup_credential_files(self._datasource_files_manifest)
-            except Exception as e:
-                logger.warning(f"Error cleaning up credential files: {e}")
-            self._datasource_files_manifest = None
 
     async def _resume_from_checkpoint(
         self,

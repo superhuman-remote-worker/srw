@@ -15,6 +15,7 @@ from typing import Any, Protocol, TYPE_CHECKING
 from fastapi import HTTPException
 
 from shared.helm_provenance import (
+    AUTO_PIN_BREADCRUMB,
     RECONCILE_MANIFEST_KEY,
     SOURCE_UI,
     annotate,
@@ -31,6 +32,7 @@ from orchestrator.schemas.provider_catalog import (
     VALID_SYSTEM_API_KEY_PROVIDERS,
 )
 from shared.subscription_routing import is_subscription_endpoint
+from orchestrator.services.readiness import try_auto_pin_required_defaults
 
 if TYPE_CHECKING:
     from orchestrator.services.llm_endpoint_probe import ProbeResult
@@ -113,6 +115,13 @@ class ProviderCatalogStore(Protocol):
         seeded_from: str | None = None,
         on_conflict_do_nothing: bool = False,
     ) -> dict[str, Any] | None: ...
+    async def list_default_pin_capabilities(self) -> list[str]: ...
+    async def list_models_by_capability_alphabetical(
+        self, capability: str
+    ) -> list[dict[str, Any]]: ...
+    async def pin_default_llm_model_if_unset(
+        self, kind: str, model: str, *, updated_by: str, source: str
+    ) -> bool: ...
 
 
 class EndpointProbe(Protocol):
@@ -175,6 +184,24 @@ def _validate_llm_endpoint_url(base_url: str, allow_insecure: bool) -> str:
             ),
         )
     return parsed.geturl()
+
+
+def _service_adapter(row: Mapping[str, Any]) -> str | None:
+    """The non-OpenAI adapter a catalog row is served through, if any.
+
+    Search/fetch providers (SearXNG, Tavily, Crawl4AI) and ElevenLabs TTS share
+    the endpoint table with model servers but speak their own APIs; their rows
+    name the adapter in ``params_json.provider``. ``openai`` names the
+    OpenAI-compatible shape itself, so it is not a separate adapter.
+    """
+    params = row.get("params_json")
+    provider = params.get("provider") if isinstance(params, Mapping) else None
+    if not isinstance(provider, str):
+        return None
+    provider = provider.strip()
+    if not provider or provider.lower() == "openai":
+        return None
+    return provider
 
 
 def _serialize_endpoint(
@@ -520,6 +547,28 @@ class ProviderCatalogService:
             result = await self._subscription_discovery(endpoint)
             return {"subscription": True, "status": None, **result.to_public()}
 
+        # A search/fetch/TTS service has no /models route; probing it only
+        # returns the service's own 404 page. An endpoint without rows yet is
+        # still probed — that is the add-endpoint-then-discover flow.
+        catalog_rows = await self.store.list_models(
+            provider_kind="endpoint", provider_ref=str(endpoint["id"])
+        )
+        adapters = [_service_adapter(row) for row in catalog_rows]
+        if adapters and all(adapters):
+            names = ", ".join(sorted({a for a in adapters if a}))
+            return {
+                "subscription": False,
+                "ok": False,
+                "status": None,
+                "error": (
+                    f"{endpoint['label']} is served by the {names} adapter, not an "
+                    "OpenAI-compatible model server, so it has no model list to "
+                    "discover."
+                ),
+                "probe_url": None,
+                "models": [],
+            }
+
         result = await self.probe(
             base_url=endpoint["base_url"],
             api_key=endpoint.get("api_key"),
@@ -569,7 +618,10 @@ class ProviderCatalogService:
             candidates=result.candidates,
             requested_ids=body.model_ids,
             include_review=body.include_needs_review,
+            context_window_cap=body.context_window_cap,
         )
+        if outcome.created:
+            await try_auto_pin_required_defaults(self.store)
         return outcome.to_public()
 
     async def list_provider_defaults(self) -> dict[str, str | None]:
@@ -645,6 +697,11 @@ class ProviderCatalogService:
                 manifest=manifest,
                 section="defaults",
                 identity=kind,
+            )
+            # The system chose this pin (readiness auto-pin), not an admin
+            # or the chart; Admin → Defaults labels it so.
+            defaults[kind]["auto_pinned"] = bool(model) and (
+                (setting or {}).get("updated_by") == AUTO_PIN_BREADCRUMB
             )
         return {
             "manifest": manifest

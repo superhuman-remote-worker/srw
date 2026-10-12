@@ -166,10 +166,12 @@ limits:
 phase_settings:
   min_todos: 2
   # Raised 20 -> 30 for the fewer-larger-phases model: a single execution phase
-  # now covers work that used to be split across several. Note the cost — todo
-  # bodies are injected verbatim on EVERY turn (see the ~15k/turn floor in
-  # knowledge-base/knowledge/issues/phase_model_overhead_amnesia_loop.md F3), so this cap is also a
-  # per-turn token budget. Prefer coarser todos over more of them.
+  # now covers work that used to be split across several. Note the cost — the
+  # full list (todo bodies verbatim) is in every todo_complete result, so this
+  # cap also bounds the history each completion adds (it used to be re-sent on
+  # every turn: the ~15k/turn floor in
+  # knowledge-base/knowledge/issues/phase_model_overhead_amnesia_loop.md F3).
+  # Prefer coarser todos over more of them.
   max_todos: 30
 
 context_management:

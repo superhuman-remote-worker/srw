@@ -1,0 +1,24 @@
+# =============================================================================
+# srw-driver-mcp-test — a DEVELOPMENT managed MCP server image (D5a)
+# =============================================================================
+# The image behind srw.mcp-test/v1, which the k3d gate
+# (scripts/k3d-managed-mcp-gate.py) runs behind SRW's front to prove a managed
+# MCP pod: a streamable HTTP MCP server on 127.0.0.1:8091 whose tools report
+# (and try to leak) the credential the front injected. Built by Tilt only;
+# never published.
+# =============================================================================
+FROM --platform=$BUILDPLATFORM golang:1.26.8-alpine3.24@sha256:8ac98ca534ac3f51e1f420a1dd2c15e74c75cfa0f23f3ad27eb5d7236c349a0c AS build
+
+ARG TARGETOS
+ARG TARGETARCH
+
+WORKDIR /src
+COPY drivers/mcp-test/ ./
+RUN CGO_ENABLED=0 GOOS="${TARGETOS:-linux}" \
+        GOARCH="${TARGETARCH:-$(go env GOARCH)}" \
+        go build -trimpath -ldflags "-s -w" -o /out/srw-mcp-test .
+
+FROM scratch
+COPY --from=build /out/srw-mcp-test /srw-mcp-test
+USER 65532:65532
+ENTRYPOINT ["/srw-mcp-test"]

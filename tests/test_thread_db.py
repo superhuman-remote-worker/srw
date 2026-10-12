@@ -27,6 +27,9 @@ import pytest
 from orchestrator.database.postgres import PostgresDB
 
 
+_RESUME_THREAD_ID = "aaaaaaaa-1111-4222-8333-444444444444"
+
+
 # =============================================================================
 # Fixtures
 # =============================================================================
@@ -1003,6 +1006,13 @@ class TestEndThread:
             reason="force_end",
             epoch_already_bumped=False,
         )
+        # End revokes the session's credential leases in this transaction (C2).
+        (revoke,) = [
+            call
+            for call in conn.fetch.await_args_list
+            if "UPDATE connector_credential_leases" in call.args[0]
+        ]
+        assert revoke.args[1:] == ("tid-1", "session_end")
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("permanent", [False, True])
@@ -1192,7 +1202,7 @@ class TestEndThread:
                 "terminal_token": 1,
                 "cleanup_complete": True,
                 "permanent": False,
-                "backing_id": "rclone:threads/tid-1",
+                "backing_id": f"rclone:threads/{_RESUME_THREAD_ID}",
                 "runtime_incarnation": None,
                 "snapshot_restore_required": False,
             },
@@ -1201,6 +1211,7 @@ class TestEndThread:
         conn = _mock_conn()
         conn.fetchrow = AsyncMock(
             side_effect=[
+                {"pvc": None},
                 {
                     "status": "ended",
                     "execution_lane": "stateless",
@@ -1211,34 +1222,51 @@ class TestEndThread:
                 {"unit_kind": "session_turn"},
             ]
         )
-        conn.fetchval = AsyncMock(side_effect=[12, "tid-1", "tid-1"])
+        conn.fetchval = AsyncMock(
+            side_effect=[12, _RESUME_THREAD_ID, _RESUME_THREAD_ID]
+        )
         db = _make_db_with_conn(conn)
 
-        assert await db.resume_thread("tid-1") is True
+        assert await db.resume_thread(_RESUME_THREAD_ID) is True
+        locator_call = conn.fetchrow.await_args_list[0]
+        assert "source.expected_pvc_uid" in locator_call.args[0]
+        assert locator_call.args[1:] == (UUID(_RESUME_THREAD_ID),)
+        conn.execute.assert_any_await(
+            "SELECT pg_advisory_xact_lock(hashtextextended($1,0))",
+            f"workspace-recovery:thread:{_RESUME_THREAD_ID}",
+        )
         pending_sql = " ".join(conn.fetchval.await_args_list[0].args[0].split())
         assert "FROM thread_input_deliveries" in pending_sql
         queue_sql = " ".join(conn.fetchval.await_args_list[1].args[0].split())
         assert "input_seq > COALESCE(consumed_seq, -1)" in queue_sql
         assert "THEN 'queued' ELSE 'done'" in queue_sql
-        assert conn.fetchval.await_args_list[1].args[1:] == ("tid-1", 12)
+        assert conn.fetchval.await_args_list[1].args[1:] == (_RESUME_THREAD_ID, 12)
 
     @pytest.mark.asyncio
     async def test_resume_clears_agent_and_control_capability(self):
         conn = _mock_conn()
         conn.fetchrow = AsyncMock(
-            return_value={
-                "status": "ended",
-                "execution_lane": "pinned",
-                "runtime_generation": None,
-                "runtime_retirement_token": None,
-                "metadata": {},
-            }
+            side_effect=[
+                {"pvc": None},
+                {
+                    "status": "ended",
+                    "execution_lane": "pinned",
+                    "runtime_generation": None,
+                    "runtime_retirement_token": None,
+                    "metadata": {},
+                },
+            ]
         )
-        conn.fetchval = AsyncMock(return_value="tid-1")
+        # First read proves no open workspace creation intent before Resume.
+        conn.fetchval = AsyncMock(side_effect=[False, _RESUME_THREAD_ID])
         db = _make_db_with_conn(conn)
 
-        assert await db.resume_thread("tid-1") is True
+        assert await db.resume_thread(_RESUME_THREAD_ID) is True
 
+        assert (
+            "thread_workspace_provision_intents"
+            in conn.fetchval.await_args_list[0].args[0]
+        )
         sql = " ".join(conn.fetchval.call_args[0][0].split())
         assert "status = 'created'" in sql
         assert "agent_id = NULL" in sql
@@ -1248,40 +1276,47 @@ class TestEndThread:
     async def test_resume_refuses_ownerless_historical_thread(self):
         conn = _mock_conn()
         conn.fetchrow = AsyncMock(
-            return_value={
-                "status": "ended",
-                "user_id": None,
-                "execution_lane": "pinned",
-                "runtime_generation": None,
-                "runtime_retirement_token": None,
-                "metadata": {},
-            }
+            side_effect=[
+                {"pvc": None},
+                {
+                    "status": "ended",
+                    "user_id": None,
+                    "execution_lane": "pinned",
+                    "runtime_generation": None,
+                    "runtime_retirement_token": None,
+                    "metadata": {},
+                },
+            ]
         )
         db = _make_db_with_conn(conn)
 
-        assert await db.resume_thread("tid-1") is False
+        assert await db.resume_thread(_RESUME_THREAD_ID) is False
         conn.fetchval.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_stateless_retirement_marker_fences_resume_until_settled(self):
         pending_conn = _mock_conn()
         pending_conn.fetchrow = AsyncMock(
-            return_value={
-                "status": "ended",
-                "execution_lane": "stateless",
-                "runtime_generation": None,
-                "runtime_retirement_token": None,
-                "metadata": {"_stateless_workspace_retirement_pending": True},
-            }
+            side_effect=[
+                {"pvc": None},
+                {
+                    "status": "ended",
+                    "execution_lane": "stateless",
+                    "runtime_generation": None,
+                    "runtime_retirement_token": None,
+                    "metadata": {"_stateless_workspace_retirement_pending": True},
+                },
+            ]
         )
         pending_db = _make_db_with_conn(pending_conn)
 
-        assert await pending_db.resume_thread("tid-1") is False
+        assert await pending_db.resume_thread(_RESUME_THREAD_ID) is False
         pending_conn.fetchval.assert_not_awaited()
 
         settled_conn = _mock_conn()
         settled_conn.fetchrow = AsyncMock(
             side_effect=[
+                {"pvc": None},
                 {
                     "status": "ended",
                     "execution_lane": "stateless",
@@ -1301,10 +1336,12 @@ class TestEndThread:
                 {"unit_kind": "session_turn"},
             ]
         )
-        settled_conn.fetchval = AsyncMock(side_effect=[None, "tid-1", "tid-1"])
+        settled_conn.fetchval = AsyncMock(
+            side_effect=[None, _RESUME_THREAD_ID, _RESUME_THREAD_ID]
+        )
         settled_db = _make_db_with_conn(settled_conn)
 
-        assert await settled_db.resume_thread("tid-1") is True
+        assert await settled_db.resume_thread(_RESUME_THREAD_ID) is True
         update_call = settled_conn.fetchval.await_args_list[-1]
         update_sql = " ".join(update_call.args[0].split())
         assert "metadata = $2::jsonb" in update_sql
@@ -1318,44 +1355,50 @@ class TestEndThread:
     ):
         conn = _mock_conn()
         conn.fetchrow = AsyncMock(
-            return_value={
-                "status": "ended",
-                "execution_lane": "stateless",
-                "runtime_generation": None,
-                "runtime_retirement_token": None,
-                "metadata": {"_stateless_workspace_retirement_pending": malformed},
-            }
+            side_effect=[
+                {"pvc": None},
+                {
+                    "status": "ended",
+                    "execution_lane": "stateless",
+                    "runtime_generation": None,
+                    "runtime_retirement_token": None,
+                    "metadata": {"_stateless_workspace_retirement_pending": malformed},
+                },
+            ]
         )
         db = _make_db_with_conn(conn)
 
-        assert await db.resume_thread("tid-1") is False
+        assert await db.resume_thread(_RESUME_THREAD_ID) is False
         conn.fetchval.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_permanent_settled_intent_never_revives_queue(self):
         conn = _mock_conn()
         conn.fetchrow = AsyncMock(
-            return_value={
-                "status": "ended",
-                "execution_lane": "stateless",
-                "runtime_generation": None,
-                "runtime_retirement_token": None,
-                "metadata": {
-                    "_stateless_workspace_retirement_settled": {
-                        "terminal_token": 7,
-                        "cleanup_complete": True,
-                        "permanent": True,
-                        "backing_id": None,
-                        "runtime_incarnation": None,
-                        "snapshot_restore_required": False,
-                    }
+            side_effect=[
+                {"pvc": None},
+                {
+                    "status": "ended",
+                    "execution_lane": "stateless",
+                    "runtime_generation": None,
+                    "runtime_retirement_token": None,
+                    "metadata": {
+                        "_stateless_workspace_retirement_settled": {
+                            "terminal_token": 7,
+                            "cleanup_complete": True,
+                            "permanent": True,
+                            "backing_id": None,
+                            "runtime_incarnation": None,
+                            "snapshot_restore_required": False,
+                        }
+                    },
                 },
-            }
+            ]
         )
         db = _make_db_with_conn(conn)
 
-        assert await db.resume_thread("tid-1") is False
-        assert conn.fetchrow.await_count == 1
+        assert await db.resume_thread(_RESUME_THREAD_ID) is False
+        assert conn.fetchrow.await_count == 2
         conn.fetchval.assert_not_awaited()
 
     @pytest.mark.asyncio
@@ -1465,6 +1508,7 @@ class TestEndThread:
         conn = _mock_conn()
         conn.fetchrow = AsyncMock(
             side_effect=[
+                {"pvc": None},
                 {
                     "status": "ended",
                     "execution_lane": "stateless",
@@ -1479,11 +1523,11 @@ class TestEndThread:
         # exact generation in a second statement (0197/0198).
         resumed_generation = "33333333-3333-4333-8333-333333333333"
         conn.fetchval = AsyncMock(
-            side_effect=[None, "tid-1", resumed_generation, "tid-1"]
+            side_effect=[None, _RESUME_THREAD_ID, resumed_generation, _RESUME_THREAD_ID]
         )
         db = _make_db_with_conn(conn)
 
-        assert await db.resume_thread("tid-1")
+        assert await db.resume_thread(_RESUME_THREAD_ID)
 
         stored = json.loads(conn.fetchval.await_args_list[-1].args[2])
         assert "_stateless_workspace_retirement_settled" not in stored
@@ -1514,17 +1558,20 @@ class TestEndThread:
         }
         conn = _mock_conn()
         conn.fetchrow = AsyncMock(
-            return_value={
-                "status": "ended",
-                "execution_lane": "stateless",
-                "runtime_generation": None,
-                "runtime_retirement_token": None,
-                "metadata": metadata,
-            }
+            side_effect=[
+                {"pvc": None},
+                {
+                    "status": "ended",
+                    "execution_lane": "stateless",
+                    "runtime_generation": None,
+                    "runtime_retirement_token": None,
+                    "metadata": metadata,
+                },
+            ]
         )
         db = _make_db_with_conn(conn)
 
-        assert await db.resume_thread("tid-1") is False
+        assert await db.resume_thread(_RESUME_THREAD_ID) is False
         conn.fetchval.assert_not_awaited()
 
 

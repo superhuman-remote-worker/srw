@@ -16,8 +16,10 @@ special-cases sftp and runs a *local* sftp server instead of forwarding.
 
 from __future__ import annotations
 
+import asyncio
 import inspect
 import logging
+from collections.abc import Awaitable, Callable
 
 import asyncssh
 from asyncssh.constants import EXTENDED_DATA_STDERR
@@ -36,6 +38,20 @@ ALLOWED_SUBSYSTEMS = frozenset({"sftp"})
 # generally retryable. Mirrors e16cdc13's own reasoning for reclassifying
 # stale_binding the same way in ssh_gateway_client.REFUSAL_MESSAGES.
 UPSTREAM_FAILURE_EXIT_CODE = 75
+NATIVE_CONFIRMATION_FAILURE = (
+    b"srw: native session confirmation unavailable; command may already have started. "
+    b"Check its outcome before retrying\n"
+)
+
+
+async def _close_started_process(upstream_process) -> None:
+    """Bound cleanup of the exact process; never start or replay a command."""
+
+    try:
+        upstream_process.close()
+        await asyncio.wait_for(upstream_process.wait_closed(), timeout=3.0)
+    except Exception:
+        logger.warning("ssh gateway: started upstream process did not close promptly")
 
 
 class ProxyProcess(asyncssh.SSHServerProcess):
@@ -70,12 +86,18 @@ class ProxyProcess(asyncssh.SSHServerProcess):
             self._conn.create_task(handler, self._chan.logger)
 
 
-async def proxy_session(process, upstream) -> None:
+async def proxy_session(
+    process,
+    upstream,
+    *,
+    on_first_use: Callable[[], Awaitable[bool]] | None = None,
+) -> None:
     """Open the matching upstream process and mirror it back down.
 
     Exit status and exit signal are mirrored explicitly because asyncssh omits
     both when forwarding; without this the client never sees the channel close.
     """
+    upstream_process = None
     try:
         upstream_process = await upstream.create_process(
             command=process.command,
@@ -91,9 +113,25 @@ async def proxy_session(process, upstream) -> None:
             # doing that, this hardcoded None must be revisited alongside it.
             encoding=None,
             stdin=process.stdin,
-            stdout=process.stdout,
-            stderr=process.stderr,
+            stdout=process.stdout if on_first_use is None else None,
+            stderr=process.stderr if on_first_use is None else None,
         )
+        if on_first_use is not None:
+            # A short command may finish before native confirmation. Keep
+            # output open until this proxy sends its final status, preserving
+            # the uncertainty warning even when EOF was already buffered.
+            # Configure output separately so normal input EOF still reaches
+            # commands and SFTP servers when their client finishes.
+            await upstream_process.redirect(
+                stdout=process.stdout,
+                stderr=process.stderr,
+                send_eof=False,
+                recv_eof=False,
+            )
+    except asyncio.CancelledError:
+        if upstream_process is not None:
+            await _close_started_process(upstream_process)
+        raise
     except Exception:
         # Ruling G16: asyncssh's own forwarder lets this escape uncaught, so
         # the downstream channel never closes and `ssh gw cmd` hangs forever
@@ -109,13 +147,15 @@ async def proxy_session(process, upstream) -> None:
         # line and an exit code -- an operability regression, not a wash.
         # Not deferred to Task 8's module logger: wiring this now is the
         # pattern this plan already had to un-defer elsewhere.
-        logger.exception(
-            "ssh gateway: failed to start upstream session (command=%r, subsystem=%r)",
-            process.command,
-            process.subsystem,
-        )
+        logger.exception("ssh gateway: failed to start or forward upstream session")
+        if upstream_process is not None:
+            await _close_started_process(upstream_process)
         try:
-            process.stderr.write(b"srw: failed to start the session on the workspace\n")
+            process.stderr.write(
+                NATIVE_CONFIRMATION_FAILURE
+                if upstream_process is not None
+                else b"srw: failed to start the session on the workspace\n"
+            )
         except Exception:
             # The downstream client can disconnect in this same window --
             # SSHWriter.write raises BrokenPipeError once the channel has
@@ -125,7 +165,33 @@ async def proxy_session(process, upstream) -> None:
         process.exit(UPSTREAM_FAILURE_EXIT_CODE)
         return
 
-    await upstream_process.wait_closed()
+    if on_first_use is not None:
+        try:
+            acknowledged = await on_first_use()
+        except asyncio.CancelledError:
+            await _close_started_process(upstream_process)
+            raise
+        except Exception:
+            logger.warning(
+                "ssh gateway: native first-use acknowledgement failed", exc_info=True
+            )
+            acknowledged = False
+        if not acknowledged:
+            # create_process may already have started a command. Close this
+            # exact process and report uncertainty; never replay its command.
+            await _close_started_process(upstream_process)
+            try:
+                process.stderr.write(NATIVE_CONFIRMATION_FAILURE)
+            except Exception:
+                pass
+            process.exit(UPSTREAM_FAILURE_EXIT_CODE)
+            return
+
+    try:
+        await upstream_process.wait_closed()
+    except asyncio.CancelledError:
+        await _close_started_process(upstream_process)
+        raise
 
     if upstream_process.exit_signal:
         process.exit_with_signal(*upstream_process.exit_signal)

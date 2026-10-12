@@ -1,0 +1,15 @@
+apiVersion: srw/v1alpha1
+kind: WorkspaceTemplate
+metadata:
+  name: srw-container-workspace
+spec:
+  backend: sandbox
+  resources:
+    cpu: 2
+    memory: 4Gi
+    storage: 30Gi
+  environment:
+    # A placeholder: replace it with your own image, built FROM an SRW base
+    # image and pinned by digest. See container-workspace-templates.md.
+    image: registry.example/team/workspace@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+    pullPolicy: IfNotPresent

@@ -2,6 +2,7 @@
 
 from copy import deepcopy
 
+from shared.runtime.core.delegation_settings import FAMILY_SESSION_MAX_CONCURRENT_KEY
 from shared.runtime.core.loader import (
     _apply_settings_matrix,
     deep_merge,
@@ -76,6 +77,18 @@ def patch_frozen_session(blob, policy, override, *, deployment_dir=None):
                 section
             ].keys():
                 delta[section][key] = None
+        # The session delegation cap has a per-family slot the matrix just
+        # re-derived (or removed). Carry only that slot: the rest of the
+        # delegation block is authored and grant-checked.
+        before = (blob["agent"].get("delegation") or {}).get(
+            FAMILY_SESSION_MAX_CONCURRENT_KEY
+        )
+        after = (agent.get("delegation") or {}).get(FAMILY_SESSION_MAX_CONCURRENT_KEY)
+        if after != before:
+            delta_delegation = delta.get("delegation")
+            if not isinstance(delta_delegation, dict):
+                delta_delegation = delta["delegation"] = {}
+            delta_delegation[FAMILY_SESSION_MAX_CONCURRENT_KEY] = after
     for group, marker in {
         "orchestrator": "_fleet_management_disabled",
         "job_control": "_job_control_disabled",

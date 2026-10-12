@@ -28,6 +28,7 @@ from fastapi import HTTPException
 
 from orchestrator.services.cloud import MainCloudRouter
 from orchestrator.services.cloud.errors import FeatureNotAvailable
+from orchestrator.application import projects as projects_composition
 
 
 INSTANCE_ID = "4e72e665-1f70-4b69-9804-d981b51416e6"
@@ -112,33 +113,37 @@ class TestGetProjectOnLegacyRow:
         project_a["main_cloud_backend_instance_id"] = None
         project_a["main_cloud_folder_handle"] = "nextcloud:12345"
 
-        from orchestrator.main import _projects_dependencies
+        import orchestrator.main
         from orchestrator.routers.projects import get_project
 
         real_router = _router()
         with (
             patch(
-                "orchestrator.main.require_approved_user",
+                "orchestrator.security.auth.require_approved_user",
                 AsyncMock(return_value=user_a),
             ),
             patch(
                 "orchestrator.security.access.require_approved_user",
                 AsyncMock(return_value=user_a),
             ),
-            patch("orchestrator.main.postgres_db", fake_db),
+            patch("orchestrator.main.app.state.resources.postgres_db", fake_db),
             patch(
                 "orchestrator.services.projects.project_provisioning"
                 ".ensure_project_cloud_resources",
                 AsyncMock(side_effect=lambda p, **_kwargs: p),
             ),
-            patch("orchestrator.main.main_cloud_router", real_router),
+            patch(
+                "orchestrator.main.app.state.resources.main_cloud_router", real_router
+            ),
         ):
             # main's own factory, so the patched module globals above are what
             # the handler is wired to — exactly as in production.
             result = await get_project(
                 fake_request,
                 str(project_a["id"]),
-                dependencies=_projects_dependencies(),
+                dependencies=projects_composition.projects_dependencies(
+                    orchestrator.main.app.state.resources
+                ),
             )
 
         assert result["id"] == project_a["id"]
@@ -166,7 +171,7 @@ class TestAddMemberOnLegacyRow:
         project_a["main_cloud_backend"] = "nextcloud"
         project_a["main_cloud_backend_instance_id"] = None
 
-        from orchestrator.main import _projects_dependencies
+        import orchestrator.main
         from orchestrator.routers.projects import add_project_member
         from orchestrator.schemas.projects import ProjectMemberAdd
 
@@ -175,18 +180,20 @@ class TestAddMemberOnLegacyRow:
         )
         with (
             patch(
-                "orchestrator.main.require_project_owner",
+                "orchestrator.security.access.require_project_owner",
                 AsyncMock(return_value=(user_a, project_a)),
             ),
-            patch("orchestrator.main.postgres_db", fake_db),
-            patch("orchestrator.main.main_cloud_router", _router()),
+            patch("orchestrator.main.app.state.resources.postgres_db", fake_db),
+            patch("orchestrator.main.app.state.resources.main_cloud_router", _router()),
         ):
             with pytest.raises(HTTPException) as exc:
                 await add_project_member(
                     str(project_a["id"]),
                     ProjectMemberAdd(user_id=str(user_b["id"]), role="editor"),
                     fake_request,
-                    dependencies=_projects_dependencies(),
+                    dependencies=projects_composition.projects_dependencies(
+                        orchestrator.main.app.state.resources
+                    ),
                 )
 
         assert exc.value.status_code == 409

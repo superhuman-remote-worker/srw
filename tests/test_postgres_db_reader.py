@@ -1,9 +1,10 @@
+import json
 from contextlib import asynccontextmanager
 from unittest.mock import AsyncMock
 
 import pytest
 
-from agent.database.postgres_db import PostgresDB
+from agent.database.postgres_db import _CONTEXT_ROW_KWARGS_PROJECTION, PostgresDB
 
 
 @pytest.mark.asyncio
@@ -46,12 +47,15 @@ async def test_agent_db_terminal_status_closes_control_admission():
 @pytest.mark.asyncio
 async def test_history_projects_only_resume_fields():
     """HF-7 thread-read diet: the resume reader returns exactly what the resume
-    consumers use — id/role/content/tool_calls/tool_call_id/turn_number — and does
+    consumers use — id/role/content/tool_calls/tool_call_id/turn_number, plus
+    the delivery's admitted_turn_number that orders the conversation — and does
     NOT fetch the resume-unused component columns (thinking/reasoning/
     tool_results/provider*/response_metadata/additional_kwargs/metrics/
     created_at). Those are never read on resume; the rebuilt AIMessage doesn't
     carry them. Stable message IDs are retained for exact subagent-call
-    correlation across recovery."""
+    correlation across recovery. The one allowed exception is
+    additional_kwargs for role='context' rows, through exactly one CASE
+    expression; a non-context row gets no additional_kwargs key."""
     db = PostgresDB.__new__(PostgresDB)  # bypass __init__/connection
     db.fetch = AsyncMock(
         return_value=[
@@ -73,6 +77,7 @@ async def test_history_projects_only_resume_fields():
         "tool_calls": None,
         "tool_call_id": "call_1",
         "turn_number": 2,
+        "admitted_turn_number": None,
     }
     # The tool-result link survives (so _db_rows_to_lc_messages need not fall
     # back to positional pairing).
@@ -82,6 +87,13 @@ async def test_history_projects_only_resume_fields():
     # projection clause between SELECT and FROM.)
     sql = " ".join(db.fetch.call_args[0][0].split())
     projection = sql.split("FROM")[0]
+    # Exactly one role-scoped read of additional_kwargs, and nothing else.
+    assert _CONTEXT_ROW_KWARGS_PROJECTION == (
+        "CASE WHEN message.role = 'context' "
+        "THEN message.additional_kwargs END AS additional_kwargs"
+    )
+    assert projection.count(_CONTEXT_ROW_KWARGS_PROJECTION) == 1
+    projection = projection.replace(_CONTEXT_ROW_KWARGS_PROJECTION, "")
     for dropped in (
         "reasoning",
         "tool_results",
@@ -93,6 +105,40 @@ async def test_history_projects_only_resume_fields():
         "created_at",
     ):
         assert dropped not in projection, f"resume reader must not fetch {dropped}"
+
+
+@pytest.mark.asyncio
+async def test_history_reads_additional_kwargs_for_context_rows_only():
+    """A context row hands its schema to restore; every other row keeps the
+    HF-7 shape (no additional_kwargs key), whatever the column holds."""
+    meta = {"v": 1, "kind": "memory", "section": "memory"}
+    db = PostgresDB.__new__(PostgresDB)
+    db.fetch = AsyncMock(
+        return_value=[
+            {
+                "id": "00000000-0000-0000-0000-000000000001",
+                "role": "tool",
+                "content": "result",
+                "tool_calls": None,
+                "tool_call_id": "call_1",
+                "turn_number": 2,
+                "additional_kwargs": None,
+            },
+            {
+                "id": "00000000-0000-0000-0000-000000000002",
+                "role": "context",
+                "content": '<srw_context kind="memory">\nx\n</srw_context>',
+                "tool_calls": None,
+                "tool_call_id": None,
+                "turn_number": 2,
+                # asyncpg hands jsonb back as text without a codec.
+                "additional_kwargs": json.dumps({"srw_injection": meta}),
+            },
+        ]
+    )
+    rows = await db.get_thread_messages_history("t1")
+    assert "additional_kwargs" not in rows[0]
+    assert rows[1]["additional_kwargs"] == {"srw_injection": meta}
 
 
 @pytest.mark.asyncio
@@ -219,6 +265,21 @@ async def test_history_seq_gt_filters_and_orders_by_seq():
     assert "ORDER BY seq ASC" in sql, "seq cursor must order by seq, not turn"
     assert "role NOT IN ('summary', 'error')" in sql, "summary exclusion preserved"
     assert 42 in db.fetch.call_args[0][1:], "boundary seq must be a bound param"
+
+
+@pytest.mark.asyncio
+async def test_history_seq_gt_follows_the_conversation_order_of_the_boundary():
+    """Input typed during a tool call has a lower seq than the rest of its turn
+    and belongs to the next one, so a summary that covered that turn never saw
+    it. The cursor keeps every row written after the boundary row and adds
+    every row of a later turn than the boundary row's."""
+    db = PostgresDB.__new__(PostgresDB)
+    db.fetch = AsyncMock(return_value=[])
+    await db.get_thread_messages_history("t1", limit=None, seq_gt=42)
+    sql = " ".join(db.fetch.call_args[0][0].split())
+    row_turn = "COALESCE(delivery.admitted_turn_number, message.turn_number)"
+    assert "boundary_message.seq = $2" in sql
+    assert f"AND (seq > $2 OR {row_turn} > boundary.turn)" in sql
 
 
 @pytest.mark.asyncio

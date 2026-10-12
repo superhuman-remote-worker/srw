@@ -80,7 +80,9 @@ def _store(**over):
         return_value={"result": "applied"}
     )
     db.create_session_subagent_thread = AsyncMock(return_value={"thread_id": CHILD_ID})
-    db.list_live_session_subagent_threads = AsyncMock(return_value=[_child_row()])
+    db.list_live_session_subagent_recovery = AsyncMock(
+        return_value={"subagents": [_child_row()], "recovery_turns": []}
+    )
     db.get_session_subagent_thread = AsyncMock(return_value=_child_row())
     db.get_session_subagent_thread_by_call = AsyncMock(return_value=_child_row())
     db.reopen_session_subagent_thread = AsyncMock(return_value={"result": "reopened"})
@@ -154,7 +156,7 @@ def test_every_child_route_fails_closed_without_an_internal_key(path, payload):
     store.create_thread.assert_not_awaited()
     store.save_thread_message.assert_not_awaited()
     store.list_live_subagent_threads.assert_not_awaited()
-    store.list_live_session_subagent_threads.assert_not_awaited()
+    store.list_live_session_subagent_recovery.assert_not_awaited()
 
 
 def test_the_internal_guard_runs_after_body_validation():
@@ -217,7 +219,7 @@ def test_live_and_by_call_are_not_parsed_as_child_thread_ids():
         ).status_code
         == 200
     )
-    store.list_live_session_subagent_threads.assert_awaited_once()
+    store.list_live_session_subagent_recovery.assert_awaited_once()
 
     assert (
         client.post(

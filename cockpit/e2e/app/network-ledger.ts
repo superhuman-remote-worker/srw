@@ -25,6 +25,7 @@ interface FailureEntry {
   method: string;
   pathname: string;
   phase: JourneyPhase;
+  started_phase: JourneyPhase | null;
   failure: string;
   classification: 'expected-navigation-cancellation' | 'expected-warmup-reconnect' | 'unexpected';
 }
@@ -48,6 +49,7 @@ interface ConsoleErrorEntry {
 export type NetworkEntry = ResponseEntry | FailureEntry | PageErrorEntry | ConsoleErrorEntry;
 
 const THREAD_STREAM = /^\/api\/persistent\/threads\/([^/]+)\/stream$/;
+const THREAD_DETAIL = /^\/api\/persistent\/threads\/([^/]+)$/;
 const CONNECTION = /^\/api\/sessions\/([^/]+)\/connection$/;
 const CONTROL_WEBSOCKET = /^\/p\/([^/]+)\/ws$/;
 const GLOBAL_SSE = new Set(['/api/notifications/events', '/api/sudo/events']);
@@ -106,6 +108,7 @@ export class NetworkLedger {
   private readonly ownedThreadIds = new Set<string>();
   private readonly records: NetworkEntry[] = [];
   private pendingWarmupStreamReconnects = 0;
+  private readonly claimedWarmupConsoleResponses = new WeakSet<ResponseEntry>();
 
   constructor(
     page: Page,
@@ -178,12 +181,16 @@ export class NetworkLedger {
     const pathname = safePathname(request.url());
     if (!pathname) return;
     const reason = sanitizedDiagnostic(request.failure()?.errorText ?? 'unknown network failure');
-    const classification = this.cancellationClassification(request.method(), pathname, reason);
+    const startedPhase = this.started.get(request)?.phase ?? null;
+    const classification = this.cancellationClassification(
+      request.method(), pathname, reason, startedPhase,
+    );
     this.records.push({
       kind: 'requestfailed',
       method: request.method(),
       pathname,
       phase: this.phase,
+      started_phase: startedPhase,
       failure: reason,
       classification,
     });
@@ -193,6 +200,7 @@ export class NetworkLedger {
     method: string,
     pathname: string,
     reason: string,
+    startedPhase: JourneyPhase | null,
   ): FailureEntry['classification'] {
     if (method !== 'GET' || !ABORT_REASON.test(reason)) return 'unexpected';
 
@@ -209,6 +217,18 @@ export class NetworkLedger {
       return 'expected-warmup-reconnect';
     }
     if (this.phase === 'list-navigation' && ownedThreadStream) {
+      return 'expected-navigation-cancellation';
+    }
+    const oldDocumentReadMatch = pathname.match(CONNECTION) ?? pathname.match(THREAD_DETAIL);
+    // A Chrome reload cancels an owned read from the old document. Keep
+    // failures of reads started by the new document visible to the guard.
+    if (
+      this.phase === 'reload' &&
+      startedPhase === 'turn' &&
+      reason === 'net::ERR_ABORTED' &&
+      oldDocumentReadMatch !== null &&
+      this.ownedThreadIds.has(decodeURIComponent(oldDocumentReadMatch[1]))
+    ) {
       return 'expected-navigation-cancellation';
     }
     if (this.phase === 'reload' || this.phase === 'closing') {
@@ -265,14 +285,29 @@ export class NetworkLedger {
     if (!pathname || !location) return false;
     const applicationUrl = new URL(this.applicationOrigin);
     const connectionMatch = pathname.match(CONNECTION);
+    // HTTPS/HTTP2 resource errors may omit the reason phrase. Classify only
+    // an owned GET response actually observed during permitted warm-up.
+    const statusMatch = message.match(/(?:409 \((?:Conflict)?\)|425 \((?:Too Early)?\))$/i);
+    const status = statusMatch ? Number.parseInt(statusMatch[0], 10) : null;
     const expectedConnectionFailure =
       location.origin === this.applicationOrigin &&
       WARM_PHASES.has(this.phase) &&
       connectionMatch !== null &&
       this.ownedThreadIds.has(decodeURIComponent(connectionMatch[1])) &&
       /Failed to load resource/i.test(message) &&
-      /(?:409 \(Conflict\)|425 \(Too Early\))/i.test(message);
-    if (expectedConnectionFailure) return true;
+      status !== null;
+    if (expectedConnectionFailure) {
+      // Chrome can report a response's diagnostic after the journey advances
+      // to another warm phase. Retain its observed GET proof exactly once.
+      const response = this.responses('GET', pathname).find(
+        (entry) => entry.status === status && WARM_PHASES.has(entry.phase) &&
+          !this.claimedWarmupConsoleResponses.has(entry),
+      );
+      if (response) {
+        this.claimedWarmupConsoleResponses.add(response);
+        return true;
+      }
+    }
 
     const socketMatch = pathname.match(CONTROL_WEBSOCKET);
     return (

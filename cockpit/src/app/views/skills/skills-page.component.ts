@@ -1,12 +1,14 @@
 import {Component} from '@angular/core';
 import {SkillsListComponent} from './skills-list.component';
+import {CustomizeTabsComponent} from '../../shell/customize-tabs/customize-tabs.component';
 
 @Component({
   selector: 'app-skills-page',
   standalone: true,
-  imports: [SkillsListComponent],
+  imports: [SkillsListComponent, CustomizeTabsComponent],
   template: `
     <div class="page">
+      <app-customize-tabs />
       <main class="page-content">
         <app-skills-list />
       </main>

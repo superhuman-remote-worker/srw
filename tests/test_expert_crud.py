@@ -19,6 +19,10 @@ from orchestrator.services import expert_catalog as expert_catalog_module
 
 import pytest
 from fastapi import HTTPException
+from orchestrator.security import access as access_module
+from orchestrator.security import auth as auth_module
+from orchestrator.services import deployment_gates as deployment_gates_module
+from orchestrator.services import grant_enforcement as grant_enforcement_module
 
 
 # --- T1: request models + save-time hard-deny gate ---
@@ -260,10 +264,10 @@ def test_validate_fragment_runs_the_tool_gate_on_roster_entries():
 async def test_db_refs_must_be_visible_to_the_author(monkeypatch):
     visible, hidden = str(uuid.uuid4()), str(uuid.uuid4())
     monkeypatch.setattr(
-        main_module, "user_visible_project_ids", AsyncMock(return_value="all")
+        access_module, "user_visible_project_ids", AsyncMock(return_value="all")
     )
     monkeypatch.setattr(
-        main_module.postgres_db,
+        main_module.app.state.resources.postgres_db,
         "get_expert_visible_by_id",
         AsyncMock(
             side_effect=lambda ref, **kw: {"id": ref} if ref == visible else None
@@ -293,18 +297,20 @@ async def test_create_adds_role_tag(monkeypatch):
     duplicates and blanks dropped, authored order kept."""
 
     monkeypatch.setattr(
-        main_module, "_is_experts_db_enabled", MagicMock(return_value=True)
+        deployment_gates_module, "is_experts_db_enabled", MagicMock(return_value=True)
     )
     monkeypatch.setattr(
-        main_module,
+        auth_module,
         "require_approved_user",
         AsyncMock(return_value={"id": str(uuid.uuid4()), "is_admin": False}),
     )
     monkeypatch.setattr(
-        main_module, "_enforce_expert_save", AsyncMock(return_value=None)
+        grant_enforcement_module, "enforce_expert_save", AsyncMock(return_value=None)
     )
     created = AsyncMock(side_effect=lambda **kw: {"id": "new", **kw})
-    monkeypatch.setattr(main_module.postgres_db, "create_expert", created)
+    monkeypatch.setattr(
+        main_module.app.state.resources.postgres_db, "create_expert", created
+    )
 
     row = await catalogue_route(expert_routes.create_expert)(
         MagicMock(),
@@ -331,18 +337,18 @@ async def test_create_adds_role_tag(monkeypatch):
 async def test_update_keeps_the_role_tag(monkeypatch):
     expert_id, owner = str(uuid.uuid4()), str(uuid.uuid4())
     monkeypatch.setattr(
-        main_module, "_is_experts_db_enabled", MagicMock(return_value=True)
+        deployment_gates_module, "is_experts_db_enabled", MagicMock(return_value=True)
     )
     monkeypatch.setattr(
-        main_module,
+        auth_module,
         "require_approved_user",
         AsyncMock(return_value={"id": owner, "is_admin": False}),
     )
     monkeypatch.setattr(
-        main_module, "_enforce_expert_save", AsyncMock(return_value=None)
+        grant_enforcement_module, "enforce_expert_save", AsyncMock(return_value=None)
     )
     monkeypatch.setattr(
-        main_module.postgres_db,
+        main_module.app.state.resources.postgres_db,
         "get_expert_by_id",
         AsyncMock(
             return_value={
@@ -354,7 +360,9 @@ async def test_update_keeps_the_role_tag(monkeypatch):
         ),
     )
     updated = AsyncMock(side_effect=lambda expert_id, **kw: {"id": expert_id, **kw})
-    monkeypatch.setattr(main_module.postgres_db, "update_expert", updated)
+    monkeypatch.setattr(
+        main_module.app.state.resources.postgres_db, "update_expert", updated
+    )
 
     await catalogue_route(expert_routes.update_expert)(
         MagicMock(), expert_id, expert_schemas.ExpertUpdate(tags=["coding"])
@@ -377,15 +385,15 @@ async def test_list_type_filter_matches_tag(monkeypatch):
     monkeypatch.setattr(catalogue_state(), "experts", None)
     monkeypatch.setattr(catalogue_state(), "library", None)
     monkeypatch.setattr(
-        main_module, "_is_experts_db_enabled", MagicMock(return_value=True)
+        deployment_gates_module, "is_experts_db_enabled", MagicMock(return_value=True)
     )
     monkeypatch.setattr(
-        main_module,
+        auth_module,
         "require_approved_user",
         AsyncMock(return_value={"id": str(uuid.uuid4()), "is_admin": False}),
     )
     monkeypatch.setattr(
-        main_module, "user_visible_project_ids", AsyncMock(return_value="all")
+        access_module, "user_visible_project_ids", AsyncMock(return_value="all")
     )
 
     def row(name, expert_type, tags):
@@ -410,7 +418,9 @@ async def test_list_type_filter_matches_tag(monkeypatch):
             row("dual", "session", ["session", "worker"]),
         ]
     )
-    monkeypatch.setattr(main_module.postgres_db, "list_experts_visible", listed)
+    monkeypatch.setattr(
+        main_module.app.state.resources.postgres_db, "list_experts_visible", listed
+    )
 
     def by_name(result):
         return {r["name"]: r for r in result}

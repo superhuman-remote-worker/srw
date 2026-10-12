@@ -129,3 +129,12 @@ class SubscriptionModelImport(BaseModel):
             "Chat Completions protocol."
         ),
     )
+    context_window_cap: int | None = Field(
+        None,
+        gt=0,
+        description=(
+            "Upper bound for the imported rows' context window. Each row gets "
+            "the smaller of this and the model's advertised maximum. Omit to "
+            "store the advertised maximum unchanged."
+        ),
+    )

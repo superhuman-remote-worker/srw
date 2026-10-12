@@ -547,13 +547,11 @@ class TestOfficerCloudMountRefusal:
         manager = MagicMock()
         manager.start_all = started
         manager.mounts = []
-        with patch.dict(
-            "sys.modules",
-            {
-                "shared.runtime.services.cloud_mount": MagicMock(
-                    RcloneMountManager=MagicMock(return_value=manager)
-                )
-            },
+        # Keep the real cloud_mount package importable: setup also resolves
+        # its sidecar helpers when it builds the mounted-folder view.
+        with patch(
+            "shared.runtime.services.cloud_mount.RcloneMountManager",
+            return_value=manager,
         ):
             await session._setup_cloud_mount({"mounts": [{"mount_id": "m1"}]})
         started.assert_awaited()

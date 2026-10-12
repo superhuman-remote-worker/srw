@@ -53,14 +53,14 @@ import { JobContextService } from '../../../core/services/job-context.service';
   `,
   styles: [
     `
+      /* Surface and bottom border come from the workbench header this bar
+         sits in, which also carries the sidebar toggle and layout controls. */
       .timeline {
         display: flex;
         align-items: center;
         gap: 16px;
         height: 60px;
         padding: 0 20px;
-        background: var(--timeline-bg);
-        border-bottom: 1px solid var(--border-color);
       }
 
       .play-button {

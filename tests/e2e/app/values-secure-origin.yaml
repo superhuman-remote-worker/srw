@@ -1,0 +1,33 @@
+# Secure-origin overlay for owned live acceptance (R3.2 follow-up).
+#
+# The owned stack otherwise serves plain http://srw-e2e.test, which is not a
+# browser secure context (no crypto.randomUUID) and has no TLS entrypoint for
+# the wss:// session URL the orchestrator mints. This overlay turns on the
+# chart's normal multi-host TLS path — the production default — against a
+# run-owned certificate:
+#
+# - every Ingress terminates TLS on Traefik's websecure entrypoint with the
+#   harness-minted Secrets named below (`<release>-<host>-tls`);
+# - the per-session Ingress for /p/<thread> joins the same entrypoint with its
+#   own `tls:` block, so the Cockpit reaches the session Pod at the socket URL
+#   it is given, through the real ingress path;
+# - BFF cookies become Secure, as on any HTTPS deployment.
+#
+# harness.py mints the certificate (a run-owned CA signs one leaf for
+# srw-e2e.test and *.srw-e2e.test), applies the Secrets over stdin before
+# Helm runs, keeps only the public CA certificate in the run directory, and
+# never retains the CA key. Compose it after the profile's other overlays.
+ingress:
+  tls:
+    enabled: true
+    issuerName: ""
+
+auth:
+  bff:
+    cookieSecure: "1"
+
+sessionRouter:
+  tlsSecretName: srw-e2e-session-tls
+  annotations:
+    traefik.ingress.kubernetes.io/router.entrypoints: websecure
+    traefik.ingress.kubernetes.io/router.tls: "true"

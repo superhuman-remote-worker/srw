@@ -50,6 +50,7 @@ def thread_runtime_is_preparable(thread: Mapping[str, Any] | None) -> bool:
         thread_runtime_status(thread) in PREPARABLE_THREAD_STATUSES
         and bool(thread)
         and thread.get("runtime_retirement_token") is None
+        and thread.get("pinned_idle_terminal_intent_at") is None
     )
 
 

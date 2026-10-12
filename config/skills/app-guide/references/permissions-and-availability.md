@@ -59,14 +59,15 @@ the applicable policy.
 
 For non-admin users, effective grants combine global, project, and user scope.
 More specific grants cannot widen a restriction imposed above them, and when
-several attached projects contribute values the most restrictive result wins.
+several values apply the most restrictive result wins. A session belongs to one
+project or none.
 Admins bypass this grant policy, but not deployment kill switches, missing
 services, ownership checks, or other operation-specific authorization.
 
 The current grant catalog covers:
 
 - `personal_default_experts` — set or fork personal default experts;
-- `vm_workspace` — select or upgrade to a VM workspace;
+- `vm_workspace` — select or upgrade to a VM workspace (VM templates need it);
 - `shell_tools` — load shell tools;
 - `delegation` — enable subagent delegation;
 - `public_datasources` — publish a connector to all users;
@@ -101,10 +102,15 @@ provisioning, dispatch, and individual actions recheck the applicable policy.
 
 ## Choose the workspace for the work
 
-The account default is under
-**Settings → Persistent Agent → Default Workspace**. A new session can override
-it under **Sessions → New Session → Agent Settings → Settings → Workspace**.
-The platform default is Virtual.
+Workspace templates are edited under **Customize → Workspaces**: Shared templates
+by admins only. A project's templates can be changed by admins and by project
+members with the editor role, and not in an archived project. VM templates need
+VM permission.
+
+A new session or job picks its workspace in the **Workspace** field of
+**Sessions → New Session** or **Jobs → New Job**. Its **Default** entry follows
+the project's default, then the installation default. The shipped installation
+default is Container for jobs and Virtual for sessions; an operator can change it.
 
 | Workspace | What it provides | Important limits |
 |---|---|---|
@@ -115,19 +121,25 @@ The platform default is Virtual.
 
 A running session's header **Settings** panel shows **Workspace** in its main
 **Settings** tab. On narrow screens, use the header's three-dot menu →
-**Settings**. Choose **Container** to upgrade a Virtual session, then confirm
+**Settings**. A running Virtual session can upgrade to a VM when its owner has
+the `vm_workspace` grant and VMs are enabled: choose **VM**, then confirm
 **Upgrade**. The session keeps its conversation and carries existing files
 over. Wait for provisioning to complete before checking the newly available
-tools. Virtual or Container can offer VM when allowed. None currently shows
-a fixed workspace value in this selector; start a new Container session when
-no upgrade action is offered.
+tools. A running session can't upgrade to a Container; its Container choice
+says **not available in this session**. Start a new Container session for
+that. None currently shows a fixed workspace value in this selector; start a
+new Container session when no upgrade action is offered. Some sessions cannot
+change workspace in place at all: their Workspace choices say **not available
+in this session** and `/upgrade-workspace` is refused. Start a new session with
+the needed workspace then.
 
 Workspace changes are upgrade-only: to move down to Virtual or None, start a
 new session. A workspace upgrade does not automatically enable a missing tool
 category. If `request_workspace_upgrade` is currently visible, the agent can
-use it to present an upgrade request for the user's decision. It does not
-provision the workspace or automatically resume work; the user can send a
-follow-up message after the upgrade completes.
+use it to present a VM upgrade request for the user's decision; when SRW would
+refuse a VM upgrade, the tool says why and nothing is shown to the user. It
+does not provision the workspace or automatically resume work; the user can
+send a follow-up message after the upgrade completes.
 
 ## Tool selection and live changes
 
@@ -157,7 +169,7 @@ with the updated tools. Changing the model, tools, or connectors can reset the
 conversation's prompt cache, making the next response slower. A checked group
 is a request to load its tools, not proof that every operation is ready.
 
-Expert, attached projects, and Protected Cloud mode remain creation-time
+Expert, project, and Protected Cloud mode remain creation-time
 choices. Connector-specific live limits are in `datasources`.
 
 ## Diagnose a missing capability

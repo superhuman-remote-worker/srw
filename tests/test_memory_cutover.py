@@ -56,6 +56,7 @@ from agent.services.memory import (
     MemoryRuntime,
 )
 from agent.tools.context import ToolContext
+from shared.runtime.core.message_markers import is_compaction_summary
 from tests._fs_backend import FilesystemTestBackend
 from tests._memory_fixtures import (
     PROJECT_ID,
@@ -161,9 +162,6 @@ class FakeContextMgr:
     async def ensure_within_limits(self, messages, *args, **kwargs):
         if self._ensure_hook is not None:
             return self._ensure_hook(messages, self)
-        return messages
-
-    def clear_old_tool_results(self, messages):
         return messages
 
 
@@ -460,6 +458,10 @@ def _worker_state():
 @pytest.fixture
 def execute_env(worker_config, workspace_manager):
     """Real config/managers, mock LLM, recording manager, legacy-store spies."""
+    # The recording manager serves the synchronous ``assemble`` path these
+    # tests pin, i.e. the legacy injection mode; the bundled default is
+    # append_only (tests/test_execute_prepared_layout.py covers that layout).
+    worker_config.context_management.injection_mode = "legacy"
     todo_manager = TodoManager(workspace_manager)
     todo_manager.add("Do the task")
 
@@ -522,27 +524,16 @@ def _count_text(request, text: str) -> int:
 
 
 def _mock_aux():
-    """AuxiliaryLLM whose structured summariser returns a fixed short summary."""
-    from agent.core.context import ConversationSummary
+    """AuxiliaryLLM whose summariser writes a fixed short checkpoint."""
     from shared.runtime.services.auxiliary import AuxiliaryLLM
 
-    parsed = ConversationSummary(
-        summary="Summary of the work so far.",
-        tasks_completed="- read files",
-        key_decisions="",
-        current_state="mid-phase",
-        blockers="",
-    )
-    structured = AsyncMock()
-    structured.ainvoke = AsyncMock(
-        return_value={
-            "raw": AIMessage(content="s"),
-            "parsed": parsed,
-            "parsing_error": None,
-        }
-    )
     llm = MagicMock()
-    llm.with_structured_output = MagicMock(return_value=structured)
+    llm.ainvoke = AsyncMock(
+        return_value=AIMessage(
+            content="## Objective\n- Summary of the work so far.\n\n"
+            "## Work State\n- read files"
+        )
+    )
     return AuxiliaryLLM(llm=llm, max_context_tokens=15_000)
 
 
@@ -606,18 +597,19 @@ class TestWorkerExecuteWiring:
         # Second turn: nothing re-delivered, ledger untouched.
         assert "phase_instruction_injections" not in second
         assert not any(is_protected_message(m) for m in second["messages"])
-        # It is history: it sits before the transient tail (todos last).
-        todo_idx = next(
-            i
-            for i, m in enumerate(requests[1])
-            if isinstance(m, HumanMessage)
-            and str(m.content).startswith(TODOS_INJECTION_CONTENT_PREFIX)
-        )
+        # It is history: it sits before the transient tail (the memory pair
+        # payload; the todo list is no longer part of the tail, D17).
+        payload_idx = requests[1].index(env["service"].payload.messages()[0])
         block_idx = next(
             i for i, m in enumerate(requests[1]) if is_protected_message(m)
         )
-        assert block_idx < todo_idx
+        assert block_idx < payload_idx
         assert requests[1][block_idx] is state["messages"][1]
+        assert not any(
+            str(m.content).startswith(TODOS_INJECTION_CONTENT_PREFIX)
+            for request in requests
+            for m in request
+        )
 
         # Phase 4 gets its own block; phase 2's stays in uncompacted history.
         assert len(_phase_blocks(requests[2], "4:tactical")) == 1
@@ -715,13 +707,13 @@ class TestWorkerExecuteWiring:
         ]
 
     @pytest.mark.asyncio
-    async def test_phase_block_is_present_exactly_once_after_each_strategy(
+    async def test_phase_block_is_present_exactly_once_after_summarisation(
         self, execute_env
     ):
-        """Acceptance (a): over the same history, tool-result clearing,
-        trimming and summarisation each leave exactly one phase block —
-        and summarisation seats it right after the summary, before the
-        kept window."""
+        """Acceptance (a): summarisation leaves exactly one phase block and
+        seats it right after the summary, before the kept window. (Tool-result
+        clearing and trimming, the other two strategies this once covered,
+        were retired: they rewrote history and broke the prompt cache.)"""
         from agent.core.context import ContextConfig, ContextManager
 
         env = execute_env
@@ -768,7 +760,6 @@ class TestWorkerExecuteWiring:
                 compaction_threshold_tokens=500,
                 summarization_threshold_tokens=500,
                 keep_recent_messages=3,
-                keep_recent_tool_results=2,
                 model_max_context_tokens=4000,
             )
         )
@@ -777,21 +768,9 @@ class TestWorkerExecuteWiring:
         def protected(messages):
             return [m for m in messages if is_protected_message(m)]
 
-        cleared = mgr.clear_old_tool_results(history)
-        assert protected(cleared) == [block]
-        assert cleared[1] is block
-
-        trimmed = mgr.trim_messages(history, keep_recent=3)
-        assert protected(trimmed) == [block]
-        assert trimmed[1] is block  # after the task, before the window
-
         summarised = await mgr.summarize_and_compact(history, _mock_aux())
         kept = [m for m in summarised if not isinstance(m, RemoveMessage)]
-        summary_idx = next(
-            i
-            for i, m in enumerate(kept)
-            if isinstance(m, SystemMessage) and "[Summary of prior work]" in m.content
-        )
+        summary_idx = next(i for i, m in enumerate(kept) if is_compaction_summary(m))
         blocks = protected(kept)
         assert len(blocks) == 1
         assert kept.index(blocks[0]) == summary_idx + 1
@@ -881,18 +860,16 @@ class TestWorkerExecuteWiring:
         assert req.model == env["config"].llm.model
 
         # -- transient block spliced at the tail (after the conversation, for
-        # prompt-cache prefix stability): payload pairs first, todos message
-        # LAST (query-at-end)
+        # prompt-cache prefix stability): the payload pairs end the request;
+        # no todo message (the list is history, D17)
         prepared = env["llm"].ainvoke.call_args[0][0]
-        todo_idx = next(
-            i
-            for i, m in enumerate(prepared)
-            if isinstance(m, HumanMessage)
-            and str(m.content).startswith(TODOS_INJECTION_CONTENT_PREFIX)
-        )
         payload_msgs = service.payload.messages()
-        assert todo_idx == len(prepared) - 1
-        assert prepared[todo_idx - len(payload_msgs) : todo_idx] == payload_msgs
+        assert prepared[-len(payload_msgs) :] == payload_msgs
+        assert not any(
+            isinstance(m, HumanMessage)
+            and str(m.content).startswith(TODOS_INJECTION_CONTENT_PREFIX)
+            for m in prepared
+        )
 
         # -- legacy direct-store path skipped entirely
         env["ctx"].recall_store.decrement_ttl.assert_not_called()
@@ -1268,6 +1245,45 @@ def _archive_session(service: RecordingManager) -> MagicMock:
 
 
 class TestTeardownWiring:
+    @pytest.fixture(autouse=True)
+    def _memory_lifecycle(self, monkeypatch):
+        """These legacy memory tests own no exact remote runtime obligation."""
+        from agent.api import persistent_app as pa
+        from agent.api.session_identity import SessionIdentityRuntime
+        from agent.api.session_input import SessionInputRuntime
+        from agent.api.session_termination import SessionTerminationCoordinator
+
+        old_identity = pa._session_identity
+        old_termination = pa._session_termination
+        old_input = pa._session_input
+        monkeypatch.setattr(
+            pa, "_session_identity", SessionIdentityRuntime(old_identity._ports)
+        )
+        monkeypatch.setattr(
+            pa,
+            "_session_termination",
+            SessionTerminationCoordinator(
+                old_termination._ports,
+                logger=old_termination._logger,
+                termination_queue_sentinel=old_termination.termination_queue_sentinel,
+            ),
+        )
+        monkeypatch.setattr(pa, "_session_input", SessionInputRuntime(old_input._ports))
+        for name in (
+            "_session",
+            "_loop_task",
+            "_event_writer",
+            "_orchestrator_client",
+            "_control_owner_agent_id",
+            "_heartbeat_task",
+        ):
+            monkeypatch.setattr(pa, name, None)
+        for name in ("_tool_inflight", "_turn_event_open"):
+            monkeypatch.setattr(pa, name, False)
+        monkeypatch.setattr(pa, "_announced_permission_rows", {})
+        monkeypatch.delenv("SESSION_BOUND_THREAD_ID", raising=False)
+        monkeypatch.delenv("STATELESS_EXECUTOR", raising=False)
+
     @pytest.mark.asyncio
     async def test_archive_captures_session_end(self):
         from agent.api.persistent_app import _handle_archive
@@ -1278,13 +1294,13 @@ class TestTeardownWiring:
 
         with (
             patch("agent.api.persistent_app._session", session),
-            patch("agent.api.persistent_app._thread_id", "tid"),
+            patch("agent.api.persistent_app._session_identity._thread_id", "tid"),
             patch(
                 "agent.api.persistent_app._update_thread_status",
                 new=AsyncMock(return_value=True),
             ),
             patch(
-                "agent.api.persistent_app._terminate_session",
+                "agent.api.persistent_app._session_termination.terminate",
                 new=AsyncMock(),
             ),
         ):
@@ -1310,13 +1326,13 @@ class TestTeardownWiring:
 
         with (
             patch("agent.api.persistent_app._session", session),
-            patch("agent.api.persistent_app._thread_id", "tid"),
+            patch("agent.api.persistent_app._session_identity._thread_id", "tid"),
             patch(
                 "agent.api.persistent_app._update_thread_status",
                 new=AsyncMock(return_value=True),
             ),
             patch(
-                "agent.api.persistent_app._terminate_session",
+                "agent.api.persistent_app._session_termination.terminate",
                 new=AsyncMock(),
             ),
         ):
@@ -1341,16 +1357,16 @@ class TestTeardownWiring:
         session.quiesce_subagents = AsyncMock()
         session.resume_subagents = AsyncMock()
         persistent_app._session = session
-        persistent_app._thread_id = "tid-b11-1"
-        persistent_app._terminating = False
+        persistent_app._session_identity._thread_id = "tid-b11-1"
+        persistent_app._session_termination.terminating = False
         persistent_app._loop_task = None
-        persistent_app._max_sessions_per_process = 0
+        persistent_app._session_termination.max_sessions_per_process = 0
 
         with (
             patch.object(persistent_app, "_update_thread_status", new=AsyncMock()),
-            patch.object(persistent_app, "_stop_watchdogs"),
+            patch.object(persistent_app._session_termination, "stop_watchdogs"),
         ):
-            await persistent_app._terminate_session("rest_detach")
+            await persistent_app._session_termination.terminate("rest_detach")
 
         assert [e.kind for e in service.captures] == ["session_end"]
         assert persistent_app._session is None
@@ -1368,19 +1384,21 @@ class TestTeardownWiring:
         ws = AsyncMock()
 
         persistent_app._session = session
-        persistent_app._thread_id = "tid-b11-2"
-        persistent_app._terminating = False
+        persistent_app._session_identity._thread_id = "tid-b11-2"
+        persistent_app._session_termination.terminating = False
         persistent_app._loop_task = None
-        persistent_app._max_sessions_per_process = 0
+        persistent_app._session_termination.max_sessions_per_process = 0
 
         with (
             patch.object(persistent_app, "_update_thread_status", new=AsyncMock()),
-            patch.object(persistent_app, "_stop_watchdogs"),
+            patch.object(persistent_app._session_termination, "stop_watchdogs"),
         ):
             # _handle_archive reads the patched-in module globals directly
-            with patch("agent.api.persistent_app._thread_id", "tid-b11-2"):
+            with patch(
+                "agent.api.persistent_app._session_identity._thread_id", "tid-b11-2"
+            ):
                 await _handle_archive(ws)
-            await persistent_app._terminate_session("loop_complete")
+            await persistent_app._session_termination.terminate("loop_complete")
 
         # One capture total: archive's. Terminate honoured the guard flag.
         assert [e.kind for e in service.captures] == ["session_end"]

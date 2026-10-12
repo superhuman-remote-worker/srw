@@ -63,6 +63,9 @@ from shared.worker_queue import claim_worker_batch
 from tests._previous_release_seed import (
     seed_previous_release_row as _seed_previous_release_row,
 )
+from orchestrator.application import jobs as jobs_composition
+from orchestrator.application import workflows as workflows_composition
+import functools
 
 SCHEMA_FILE = (
     Path(__file__).resolve().parents[1]
@@ -853,7 +856,7 @@ async def test_dispatch_claim_requires_atomic_workspace_authority_marker(db):
         for private in ("host", "port", "token", "credential", "key")
     )
 
-    public = orch_main._redact_job_config_override(stored)
+    public = jobs_composition.redact_job_config_override(stored)
     assert WORKSPACE_DISPATCH_AUTHORITY_CONTEXT_KEY not in repr(public)
     assert WORKSPACE_CONTRACT_CONTEXT_KEY not in repr(public.get("context"))
 
@@ -3267,7 +3270,7 @@ async def test_database_funnel_strips_raw_claim_context_from_ordinary_jobs(db):
 @pytest.mark.parametrize("internal", [False, True], ids=["public", "internal"])
 async def test_http_creation_paths_cannot_persist_raw_claim_context(db, internal):
     import orchestrator.security.access as access_module
-    from orchestrator.main import JobCreate
+    from orchestrator.schemas.job_create import JobCreate
     from tests._b09_control_seams import create_job
 
     user_id = uuid4()
@@ -3305,33 +3308,37 @@ async def test_http_creation_paths_cannot_persist_raw_claim_context(db, internal
     )
     principal = {"id": user_id, "is_admin": False}
     patches = (
-        patch("orchestrator.main.postgres_db", db),
+        patch("orchestrator.main.app.state.resources.postgres_db", db),
         patch(
-            "orchestrator.main.require_approved_user", AsyncMock(return_value=principal)
+            "orchestrator.security.auth.require_approved_user",
+            AsyncMock(return_value=principal),
         ),
         patch(
-            "orchestrator.main._enforce_readiness_gate", AsyncMock(return_value=None)
-        ),
-        patch(
-            "orchestrator.main._require_job_project_access",
+            "orchestrator.application.access.enforce_readiness_gate",
             AsyncMock(return_value=None),
         ),
         patch(
-            "orchestrator.main._is_experts_db_enabled", MagicMock(return_value=False)
+            "orchestrator.application.jobs.require_job_project_access",
+            AsyncMock(return_value=None),
         ),
         patch(
-            "orchestrator.main._inherit_parent_datasource_ids",
+            "orchestrator.services.deployment_gates.is_experts_db_enabled",
+            MagicMock(return_value=False),
+        ),
+        patch(
+            "orchestrator.services.job_datasource_selection.inherit_parent_datasource_ids",
             AsyncMock(return_value=[]),
         ),
         patch(
-            "orchestrator.main._enforce_job_create_grants", AsyncMock(return_value=None)
+            "orchestrator.services.grant_enforcement.enforce_job_create_grants",
+            AsyncMock(return_value=None),
         ),
         patch("orchestrator.services.job_provisioning.provision_job_repo", AsyncMock()),
         patch(
-            "orchestrator.main.subjob_completion_operations.spawn_scholar_subjob",
+            "orchestrator.services.subjob_completion.spawn_scholar_subjob",
             AsyncMock(return_value=None),
         ),
-        patch("orchestrator.main._trigger_dispatch", MagicMock()),
+        patch("orchestrator.services.job_dispatcher.trigger_dispatch", MagicMock()),
     )
     with ExitStack() as stack:
         stack.enter_context(
@@ -3409,18 +3416,19 @@ async def test_delete_response_reports_only_an_actual_durable_claim(db, claimed)
     )
 
     with (
-        patch("orchestrator.main.postgres_db", db),
+        patch("orchestrator.main.app.state.resources.postgres_db", db),
         patch.object(db, "job_has_durable_ticket_claim", post_commit_lookup),
         patch(
-            "orchestrator.main.require_job_access", AsyncMock(return_value=(admin, job))
+            "orchestrator.security.access.require_job_access",
+            AsyncMock(return_value=(admin, job)),
         ),
         patch(
-            "orchestrator.main.thread_retirement_operations.ThreadRetirementOperations.archive_and_cleanup_workspace",
+            "orchestrator.services.thread_retirement.ThreadRetirementOperations.archive_and_cleanup_workspace",
             AsyncMock(return_value=[]),
         ),
-        patch("orchestrator.main.gitea_client", gitea),
-        patch("orchestrator.main.snapshot_service", snapshots),
-        patch("orchestrator.main.vector_db", vector),
+        patch("orchestrator.main.app.state.resources.gitea_client", gitea),
+        patch("orchestrator.services.snapshot_service.snapshot_service", snapshots),
+        patch("orchestrator.main.app.state.resources.vector_db", vector),
     ):
         result = await delete_job(
             SimpleNamespace(headers={}, query_params={}), str(created["id"])
@@ -3554,11 +3562,13 @@ def _officer_post_request():
     route declarations keeps the owner/member gates in the picture.
     """
     request = MagicMock()
-    request.app.state.officer_post_lifecycle_dependencies_factory = (
-        orch_main._officer_post_lifecycle_dependencies
+    request.app.state.officer_post_lifecycle_dependencies_factory = functools.partial(
+        workflows_composition.officer_post_lifecycle_dependencies,
+        orch_main.app.state.resources,
     )
-    request.app.state.officer_post_view_dependencies_factory = (
-        orch_main._officer_post_view_dependencies
+    request.app.state.officer_post_view_dependencies_factory = functools.partial(
+        workflows_composition.officer_post_view_dependencies,
+        orch_main.app.state.resources,
     )
     return request
 
@@ -3566,8 +3576,12 @@ def _officer_post_request():
 @pytest.mark.asyncio
 async def test_bp01_controls_round_trip_and_survive_recommission(db, monkeypatch):
     seed = await _seed_post(db)
-    monkeypatch.setattr(orch_main, "postgres_db", db)
-    monkeypatch.setattr(orch_main, "OFFICER_AUTO_PULL_RELEASE_ENABLED", True)
+    monkeypatch.setattr(orch_main.app.state.resources, "postgres_db", db)
+    monkeypatch.setattr(
+        orch_main.app.state.resources.settings,
+        "officer_auto_pull_release_enabled",
+        True,
+    )
     monkeypatch.setattr(
         officers_router,
         "require_project_owner",
@@ -3711,7 +3725,7 @@ async def test_bp11_whole_roster_replaces_post_thread_admission_and_recommission
     )
 
     survivor = {"scout": original["scout"]}
-    monkeypatch.setattr(orch_main, "postgres_db", db)
+    monkeypatch.setattr(orch_main.app.state.resources, "postgres_db", db)
     monkeypatch.setattr(
         officers_router,
         "require_project_owner",
@@ -4398,6 +4412,108 @@ async def test_no_force_officer_refusal_keeps_preflight_hidden_and_abortable(db)
         str((await db.get_project_officer(seed["project_id"]))["thread_id"])
         == seed["thread_id"]
     )
+    assert await db.abort_pinned_thread_retirement(
+        seed["thread_id"],
+        token=retirement["token"],
+        generation=retirement["generation"],
+    )
+
+
+async def _officer_lease(db: PostgresDB, thread_id: str):
+    """A lease probe connector and the Officer session's credential lease."""
+    from orchestrator.security.crypto import encrypt
+    from orchestrator.services import connector_credential_leases as leases
+
+    connector_id = uuid4()
+    async with db.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO datasources (id, name, type, scope_mode, policy_revision, "
+            "credentials, config) VALUES ($1, $2, 'lease_probe', 'all', 1, "
+            "$3::jsonb, '{}'::jsonb)",
+            connector_id,
+            f"officer-probe-{str(connector_id)[:8]}",
+            json.dumps(encrypt(json.dumps({"secret": "officer-secret"}))),
+        )
+        lease = await leases.issue_or_redeliver(
+            conn,
+            owner=leases.LeaseOwner.thread(thread_id),
+            connector_id=str(connector_id),
+            driver="srw.lease-probe/v1",
+            access="ReadWrite",
+        )
+    return lease
+
+
+async def _lease_row(db: PostgresDB, lease_id: str):
+    async with db.acquire() as conn:
+        return await conn.fetchrow(
+            "SELECT revoked_at, revoke_reason FROM connector_credential_leases "
+            "WHERE id = $1",
+            UUID(lease_id),
+        )
+
+
+@pytest.mark.asyncio
+async def test_an_authorized_officer_decommission_revokes_the_session_leases(db):
+    """The decommission is the Officer's retirement authorization edge
+    (connector drivers C2): its transaction revokes the session's leases.
+    The Begin before it is a hidden preflight and revokes nothing."""
+    seed = await _seed_post(db)
+    lease = await _officer_lease(db, seed["thread_id"])
+    retirement = await db.begin_pinned_thread_retirement(
+        seed["thread_id"], permanent=False, settle_status="ended"
+    )
+    assert (await _lease_row(db, lease.id))["revoked_at"] is None
+
+    result = await db.decommission_project_officer(
+        seed["project_id"],
+        seed["thread_id"],
+        reason="retired with a lease",
+        retirement_token=retirement["token"],
+        retirement_generation=retirement["generation"],
+        retirement_settle_status="ended",
+    )
+
+    assert result["transitioned"] is True
+    row = await _lease_row(db, lease.id)
+    assert row["revoked_at"] is not None
+    assert row["revoke_reason"] == "session_end"
+    async with db.acquire() as conn:
+        audited = await conn.fetchval(
+            "SELECT count(*) FROM security_events "
+            "WHERE event_type = 'connector_lease_revoked' AND resource_id = $1",
+            lease.id,
+        )
+    assert audited == 1
+
+
+@pytest.mark.asyncio
+async def test_a_refused_officer_decommission_leaves_the_session_lease_live(db):
+    seed = await _seed_post(db)
+    await _seed_officer_job(
+        db,
+        seed,
+        thread_id=seed["thread_id"],
+        status="processing",
+        label="in-flight lease proof",
+    )
+    lease = await _officer_lease(db, seed["thread_id"])
+    retirement = await db.begin_pinned_thread_retirement(
+        seed["thread_id"], permanent=False, settle_status="ended"
+    )
+
+    result = await db.decommission_project_officer(
+        seed["project_id"],
+        seed["thread_id"],
+        reason="no-force refusal with a lease",
+        force=False,
+        retirement_token=retirement["token"],
+        retirement_generation=retirement["generation"],
+        retirement_settle_status="ended",
+    )
+
+    assert result["blocked_by_in_flight"] is True
+    assert (await _lease_row(db, lease.id))["revoked_at"] is None
     assert await db.abort_pinned_thread_retirement(
         seed["thread_id"],
         token=retirement["token"],

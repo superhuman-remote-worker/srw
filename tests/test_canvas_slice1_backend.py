@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import stat
+import subprocess
 import asyncio
 from contextlib import asynccontextmanager
 from dataclasses import replace
@@ -35,6 +36,9 @@ from orchestrator.services.canvas_files import (
     canonical_workspace_path,
     validate_canvas_bytes,
 )
+from orchestrator.application import jobs as jobs_composition
+from orchestrator.services import session_tool_policy as session_tool_policy_module
+import fastapi as fastapi_module
 
 THREAD_ID = "a3333333-3333-3333-3333-333333333333"
 USER_ID = "b4444444-4444-4444-8444-444444444444"
@@ -940,6 +944,50 @@ async def test_virtual_materialization_saturation_fails_boundedly(monkeypatch) -
     finally:
         saturated.release()
     assert error.value.code == "canvas_capacity_exhausted"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("result", "status", "code"),
+    [
+        (
+            subprocess.CompletedProcess([], 3, b"", b"directory not found"),
+            404,
+            "canvas_file_not_found",
+        ),
+        (
+            subprocess.CompletedProcess([], 1, b"", b"remote not found"),
+            409,
+            "workspace_unavailable",
+        ),
+        (
+            subprocess.CompletedProcess(
+                [], 0, b'{"IsDir":false,"Size":999999999}', b""
+            ),
+            413,
+            "canvas_file_too_large",
+        ),
+    ],
+)
+async def test_virtual_canvas_exact_read_maps_absence_size_and_transport(
+    monkeypatch, result, status, code
+) -> None:
+    from orchestrator.services import canvas_files
+    from orchestrator.services.workspace_binding import virtual_thread_backing_id
+    from shared.runtime.core.backends.rclone import RcloneObjectStore
+
+    spec = {"type": "s3", "root": "bucket/canvas"}
+    thread = _thread(backend="virtual")
+    thread["metadata"]["_workspace_binding"]["backing_id"] = virtual_thread_backing_id(
+        THREAD_ID, spec
+    )
+    monkeypatch.setattr(canvas_files, "virtual_workspace_rclone_spec", lambda: spec)
+    monkeypatch.setattr(canvas_files.shutil, "which", lambda _name: "/usr/bin/rclone")
+    monkeypatch.setattr(RcloneObjectStore, "_run", lambda *_args, **_kwargs: result)
+
+    with pytest.raises(CanvasFileError) as error:
+        await canvas_files._read_virtual_default(thread, "output/report.md", GENERATION)
+    assert (error.value.status_code, error.value.code) == (status, code)
 
 
 @pytest.mark.asyncio
@@ -2592,7 +2640,7 @@ async def test_workspace_binding_is_idempotent_and_status_merges_do_not_rotate()
 
 
 def test_private_workspace_binding_is_removed_from_public_thread_shapes() -> None:
-    import orchestrator.main
+    from orchestrator.services.thread_projection import redact_thread_metadata
 
     private = _thread()["metadata"]["_workspace_binding"]
     for metadata in (
@@ -2622,9 +2670,7 @@ def test_private_workspace_binding_is_removed_from_public_thread_shapes() -> Non
             }
         ),
     ):
-        redacted = orchestrator.main._redact_thread_metadata(
-            {"id": THREAD_ID, "metadata": metadata}
-        )
+        redacted = redact_thread_metadata({"id": THREAD_ID, "metadata": metadata})
         serialized = json.dumps(redacted)
         assert "_workspace_binding" not in serialized
         assert "SHA256:test" not in serialized
@@ -2637,8 +2683,6 @@ def test_private_workspace_binding_is_removed_from_public_thread_shapes() -> Non
 
 
 def test_private_workspace_lease_is_removed_from_public_job_shapes() -> None:
-    import orchestrator.main
-
     context = json.dumps(
         {
             # Top-level repo identity is the public half of the job context and
@@ -2656,7 +2700,7 @@ def test_private_workspace_lease_is_removed_from_public_job_shapes() -> None:
             },
         }
     )
-    redacted = orchestrator.main._redact_job_config_override(
+    redacted = jobs_composition.redact_job_config_override(
         {"id": "job", "context": context, "config_override": None}
     )
     assert isinstance(redacted["context"], str)
@@ -3392,6 +3436,11 @@ async def test_trusted_dev_cleanup_requires_and_pins_inventory_identity(
     assert "ssh-add -D" not in connection.command
     assert "rm -rf -- /home/agent-host/.ssh/srw-managed" in connection.command
     assert "test ! -e /home/agent-host/.ssh/srw-managed" in connection.command
+    assert (
+        "rm -rf -- /home/agent-host/.srw-credentials /home/agent-host/.ssh/repo_*;"
+        in connection.command
+    )
+    assert "test ! -e /home/agent-host/.srw-credentials" in connection.command
     assert "rm -rf -- /home/agent-host/workspace" in connection.command
     assert "install -d -m 700 /home/agent-host/workspace" in connection.command
     assert "test ! -L /home/agent-host/workspace" in connection.command
@@ -3631,10 +3680,10 @@ async def test_docker_release_revokes_canvas_before_static_host_reset(
 
 
 def test_canvas_session_create_override_is_closed() -> None:
-    import orchestrator.main
+    from orchestrator.services import session_tool_policy
 
-    with pytest.raises(orchestrator.main.HTTPException) as exc:
-        orchestrator.main._validated_tool_overrides(
+    with pytest.raises(fastapi_module.HTTPException) as exc:
+        session_tool_policy.validated_tool_overrides(
             {"tools": {"canvas": ["run_command"]}}
         )
     assert exc.value.status_code == 400
@@ -3642,11 +3691,11 @@ def test_canvas_session_create_override_is_closed() -> None:
     # ``shell`` is no longer discarded — every category the request names is
     # honoured now (Defect 2). The canvas group is still closed against a
     # foreign name, which is the part this test exists for.
-    accepted = orchestrator.main._validated_tool_overrides(
+    accepted = session_tool_policy.validated_tool_overrides(
         {"tools": {"canvas": [], "shell": ["shell_execute"]}}
     )
     assert accepted == {"canvas": [], "shell": ["shell_execute"]}
-    assert orchestrator.main._session_tool_group_disabled_markers(
+    assert session_tool_policy_module.session_tool_group_disabled_markers(
         {"tools": {"canvas": []}}
     ) == {"_canvas_disabled": True}
 

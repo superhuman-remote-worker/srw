@@ -61,7 +61,11 @@ from shared.runtime.core.product_capabilities import (
 )
 from shared.runtime.core.runtime_provenance import merge_product_provenance
 
-from agent.tools.context import SessionRuntimeFacts, ToolContext
+from agent.tools.context import (
+    EMAIL_TOOL_CATEGORY,
+    SessionRuntimeFacts,
+    ToolContext,
+)
 
 from shared.tool_catalog.definitions import (
     PRODUCT_CAPABILITY_TOOLS_METADATA as PRODUCT_CAPABILITY_TOOLS_METADATA,
@@ -575,7 +579,7 @@ def _email_session(
     definition: CapabilityDefinition,
     facts: SessionRuntimeFacts,
 ) -> SessionEvaluation:
-    if "email" not in facts.attached_datasource_types:
+    if EMAIL_TOOL_CATEGORY not in facts.attached_tool_categories:
         return _session_result(
             SessionState.NEEDS_ATTACHMENT,
             ReasonCode.DATASOURCE_NOT_ATTACHED,
@@ -631,7 +635,7 @@ def _resolve_live_session(
         return _email_session(definition, facts)
 
     if key is CapabilityResolverKey.DATASOURCE_OKF:
-        if "kb" not in facts.attached_datasource_types:
+        if not facts.knowledge_index_attached:
             return _session_result(
                 SessionState.NEEDS_ATTACHMENT,
                 ReasonCode.DATASOURCE_NOT_ATTACHED,
@@ -781,7 +785,7 @@ def _action_flags(
 
     if key is CapabilityResolverKey.DATASOURCE_EMAIL:
         return (
-            "email" in facts.attached_datasource_types
+            EMAIL_TOOL_CATEGORY in facts.attached_tool_categories
             and not facts.email_connection_failed
             and "email_read" in loaded,
             False,

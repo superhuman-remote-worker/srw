@@ -41,6 +41,9 @@ works through a goal on its own and comes back with results; **projects** tie
 them together with shared knowledge, connectors, and (optionally) a
 self-improving loop. Everything else hangs off that triangle.
 
+Where things live: **Customize → Workspaces**: workspace templates (the machine a job or
+session runs on).
+
 ## The answer
 
 **1. Make a coverage decision, then route.** Match the user's requested

@@ -10,7 +10,7 @@ import {CUSTOM_ELEMENTS_SCHEMA, Pipe, signal, ɵresolveComponentResources} from 
 import {TestBed} from '@angular/core/testing';
 import {afterEach, beforeAll, beforeEach, describe, expect, it, vi} from 'vitest';
 import {of, throwError} from 'rxjs';
-import {SettingsComponent} from './settings.component';
+import {SettingsComponent, type SettingsSection} from './settings.component';
 import {SettingsService} from '../../core/services/settings.service';
 import {UserService} from '../../core/services/user.service';
 import {McpTokenService} from '../../core/services/mcp-token.service';
@@ -20,9 +20,11 @@ import {ViewModeService} from '../../core/services/view-mode.service';
 import {CapabilitiesService} from '../../core/services/capabilities.service';
 import {I18nService} from '../../core/services/i18n.service';
 import {TranslocoService} from '@jsverse/transloco';
-import {Router} from '@angular/router';
+import {ActivatedRoute, Router} from '@angular/router';
 import {SubscriptionLogin, SubscriptionsStatus} from '../../core/models/api.model';
 import {environment} from '../../core/environment';
+import de from '../../../assets/i18n/de-DE.json';
+import en from '../../../assets/i18n/en.json';
 
 function status(overrides: Partial<SubscriptionsStatus> = {}): SubscriptionsStatus {
   return {
@@ -83,6 +85,7 @@ function makeSettingsService() {
     apiKeys: signal([]),
     preferences: signal({}),
     resolvedDefaults: signal({}),
+    unavailablePreferences: signal({}),
     loadApiKeys: vi.fn(),
     loadPreferences: vi.fn(),
     updatePreferences: vi.fn(() => of({status: 'ok'})),
@@ -96,19 +99,7 @@ function makeSettingsService() {
     pollSubscriptionLogin: vi.fn(() => of(login())),
     submitSubscriptionCallback: vi.fn(() => of(login({status: 'verifying'}))),
     cancelSubscriptionLogin: vi.fn(() => of(login({status: 'cancelled'}))),
-    getMainCloudSettings: vi.fn(() =>
-      of({
-        effective: {backend_id: 'nextcloud', is_initialized: false, is_configured: false},
-        activation_revision: 0,
-        backend_instance: null,
-        overlay: {present: false, value: {}, credentials_ref: null, updated_at: null, updated_by: null},
-        secrets: {},
-        allowed_backends: ['nextcloud'],
-      }),
-    ),
-    putMainCloudSettings: vi.fn(() => of({})),
-    testMainCloudSettings: vi.fn(() => of({})),
-    deleteMainCloudSettings: vi.fn(() => of({})),
+    getMainCloud: vi.fn(() => of(null)),
   };
 }
 
@@ -117,7 +108,13 @@ class TestTranslocoPipe {
   transform(key: string): string { return key; }
 }
 
-function setup(service: ReturnType<typeof makeSettingsService>, renderTemplate = false) {
+/** Each Settings section is its own route; most cases here exercise the
+ * subscriptions one, so that is the default. */
+function setup(
+  service: ReturnType<typeof makeSettingsService>,
+  renderTemplate = false,
+  section: SettingsSection = 'subscriptions',
+) {
   TestBed.resetTestingModule();
   TestBed.configureTestingModule({
     imports: [SettingsComponent],
@@ -170,9 +167,10 @@ function setup(service: ReturnType<typeof makeSettingsService>, renderTemplate =
         provide: TranslocoService,
         // Echo the key back: the component treats "translation === key" as
         // "no translation", which is exactly the fallback path we want here.
-        useValue: {translate: (key: string) => key},
+        useValue: {translate: (key: string) => key, getActiveLang: () => 'en'},
       },
-      {provide: Router, useValue: {navigate: vi.fn()}},
+      {provide: Router, useValue: {navigate: vi.fn(), navigateByUrl: vi.fn()}},
+      {provide: ActivatedRoute, useValue: {snapshot: {data: {section}}}},
     ],
   });
   TestBed.overrideComponent(SettingsComponent, {
@@ -205,9 +203,11 @@ describe('SettingsComponent — AI Subscriptions', () => {
     const previous = environment.externalClientsEnabled;
     environment.externalClientsEnabled = false;
     try {
-      const component = setup(makeSettingsService()).componentInstance;
+      const component = setup(makeSettingsService(), false, 'mcp').componentInstance;
       expect(component.externalClientsEnabled).toBe(false);
       expect(TestBed.inject(McpTokenService).loadTokens).not.toHaveBeenCalled();
+      // No external clients, no MCP page — same rule as the SSH keys page.
+      expect(TestBed.inject(Router).navigateByUrl).toHaveBeenCalledWith('/settings/general');
       expect(component.mcpJsonSnippet()).toBe('');
       expect(component.mcpServerUrl()).toBe('');
     } finally {
@@ -215,17 +215,16 @@ describe('SettingsComponent — AI Subscriptions', () => {
     }
   });
 
-  it.each([false, true])('renders MCP and SSH setup only when external clients are enabled (%s)', (enabled) => {
+  it.each([false, true])('renders MCP setup only when external clients are enabled (%s)', (enabled) => {
     const previous = environment.externalClientsEnabled;
     environment.externalClientsEnabled = enabled;
     try {
       // Keep the actual template and its control flow; only unrelated child
       // controls/translations are shallow stubs in this component test.
-      const fixture = setup(makeSettingsService(), true);
+      const fixture = setup(makeSettingsService(), true, 'mcp');
       const headings = [...fixture.nativeElement.querySelectorAll('h2')]
         .map((node: any) => node.textContent.trim());
       expect(headings.includes('settings.mcp.title')).toBe(enabled);
-      expect(fixture.nativeElement.textContent.includes('settings.sshKeys.linkTitle')).toBe(enabled);
       fixture.destroy();
     } finally {
       environment.externalClientsEnabled = previous;
@@ -405,5 +404,120 @@ describe('SettingsComponent — AI Subscriptions', () => {
     expect(component.formatResetIn(720)).toBe('12m');
     expect(component.formatResetIn(9120)).toBe('2h 32m');
     expect(component.formatResetIn(360000)).toBe('4d 4h');
+  });
+});
+
+// The provider-key card used to borrow the PAT page's settings.apiKeys.title /
+// .desc / .empty and reference seven settings.apiKeys.* keys that no longer
+// existed, so /settings showed "Personal Access Tokens" twice and never named
+// the LLM-provider card (issues/settings_menu_dead_and_unwired_controls.md §9).
+describe('SettingsComponent — LLM provider key card', () => {
+  beforeAll(async () => {
+    await ɵresolveComponentResources(() => Promise.resolve(''));
+  });
+
+  it('names itself rather than the PAT page and renders its own column and form keys', () => {
+    const service = makeSettingsService();
+    service.apiKeys.set([
+      {id: 'k1', provider: 'openai', key_prefix: 'sk-ab', label: null, updated_at: '2026-09-01T00:00:00Z'},
+    ] as never);
+    const fixture = setup(service, true, 'provider-keys');
+    const el = fixture.nativeElement as HTMLElement;
+    const text = (root: Element, sel: string) =>
+      [...root.querySelectorAll(sel)].map((node) => node.textContent!.trim()).filter(Boolean);
+
+    const headings = text(el, 'h2');
+    expect(headings).toContain('settings.providerKeys.title');
+    // The PAT heading belongs to the PAT page alone.
+    expect(headings).not.toContain('settings.apiKeys.title');
+    const card = [...el.querySelectorAll('section')].find(
+      (section) => section.querySelector('h2')?.textContent?.trim() === 'settings.providerKeys.title',
+    )!;
+    expect(text(card, '.section-desc')).toEqual(['settings.providerKeys.desc']);
+    expect(text(card, '.key-header span')).toEqual([
+      'settings.providerKeys.colProvider',
+      'settings.providerKeys.colKey',
+      'settings.providerKeys.colLabel',
+      'settings.providerKeys.colUpdated',
+    ]);
+    expect(text(card, '.form-title')).toEqual(['settings.providerKeys.addTitle']);
+    fixture.destroy();
+  });
+
+  it('carries copy distinct from the PAT card in both locales', () => {
+    for (const locale of [en, de]) {
+      const {providerKeys, apiKeys} = locale.settings;
+      expect(providerKeys.title).not.toBe(apiKeys.title);
+      expect(providerKeys.desc).not.toBe(apiKeys.desc);
+      expect(providerKeys.empty).not.toBe(apiKeys.empty);
+    }
+  });
+});
+
+// navigation_fixed_rail.md F5: one route per section, and each renders — and
+// fetches for — only its own cards.
+describe('SettingsComponent — sections', () => {
+  beforeAll(async () => {
+    await ɵresolveComponentResources(() => Promise.resolve(''));
+  });
+
+  const headingsOf = (fixture: ReturnType<typeof setup>) =>
+    [...(fixture.nativeElement as HTMLElement).querySelectorAll('h2')].map((node) =>
+      node.textContent!.trim(),
+    );
+
+  it.each<[SettingsSection, string[]]>([
+    ['general', ['settings.appearance.title', 'settings.language.title', 'settings.dataVisibility.title']],
+    ['defaults', ['settings.expertDefaults.title', 'settings.preferences.title', 'settings.persistent.title']],
+    ['provider-keys', ['settings.providerKeys.title']],
+    ['notifications', ['settings.communication.title']],
+    ['subscriptions', ['settings.subscriptions.title']],
+    ['cloud', ['settings.cloud.title']],
+  ])('renders only the %s cards', (section, expected) => {
+    const fixture = setup(makeSettingsService(), true, section);
+    expect(headingsOf(fixture)).toEqual(expected);
+    fixture.destroy();
+  });
+
+  it.each<[SettingsSection, string]>([
+    ['general', 'settings.nav.general'],
+    ['provider-keys', 'settings.nav.providerKeys'],
+    ['cloud', 'settings.nav.cloud'],
+  ])('titles the %s page with its rail label', (section, key) => {
+    const fixture = setup(makeSettingsService(), true, section);
+    expect(fixture.nativeElement.querySelector('h1').textContent.trim()).toBe(key);
+    fixture.destroy();
+  });
+
+  it('asks the proxy for subscription status only on the subscriptions page', () => {
+    const general = makeSettingsService();
+    setup(general, false, 'general');
+    expect(general.getSubscriptionsStatus).not.toHaveBeenCalled();
+    expect(general.getMainCloud).not.toHaveBeenCalled();
+
+    const subscriptions = makeSettingsService();
+    setup(subscriptions, false, 'subscriptions');
+    expect(subscriptions.getSubscriptionsStatus).toHaveBeenCalled();
+    expect(subscriptions.getMainCloud).not.toHaveBeenCalled();
+  });
+
+  it('renders the read-only Main cloud page, with no form, on the cloud page', () => {
+    const service = makeSettingsService();
+    const fixture = setup(service, true, 'cloud');
+    const host = fixture.nativeElement as HTMLElement;
+    expect(host.querySelector('app-main-cloud-settings')).not.toBeNull();
+    expect(host.querySelectorAll('input, select, app-input, app-select').length).toBe(0);
+    expect(service.getSubscriptionsStatus).not.toHaveBeenCalled();
+    fixture.destroy();
+  });
+
+  it('loads provider keys only on their own page', () => {
+    const elsewhere = makeSettingsService();
+    setup(elsewhere, false, 'general');
+    expect(elsewhere.loadApiKeys).not.toHaveBeenCalled();
+
+    const own = makeSettingsService();
+    setup(own, false, 'provider-keys');
+    expect(own.loadApiKeys).toHaveBeenCalled();
   });
 });

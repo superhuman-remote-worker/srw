@@ -1,0 +1,7 @@
+{
+  "config": {"file": true},
+  "credentials": {"token": "a-test-token"},
+  "access": "ReadWrite",
+  "execution": {"kind": "session", "id": "srw-driver-test", "workspace_backend": "sandbox"},
+  "expect_check": "SUCCEEDED"
+}

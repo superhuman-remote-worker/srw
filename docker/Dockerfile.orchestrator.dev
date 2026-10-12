@@ -57,6 +57,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY --from=builder /usr/local/lib/python3.11/site-packages /usr/local/lib/python3.11/site-packages
 COPY --from=builder /usr/local/bin /usr/local/bin
 
+# Bake the same tokenizer assets as production: k3d pods cannot resolve the
+# public vocab host, and a lazy download is synchronous HTTP in this process.
+# Offline `verify` certifies the non-root runtime user, so it runs only in the
+# production image; `prepare` already cold-loads every encoding it writes.
+ENV TIKTOKEN_CACHE_DIR=/opt/tiktoken-cache
+COPY --chmod=0644 docker/prepare-tokenizer-cache.py /usr/local/bin/prepare-tokenizer-cache.py
+RUN python /usr/local/bin/prepare-tokenizer-cache.py prepare
+
 # Preserve the same installed package layout as the production image.
 COPY src/orchestrator/ /app/src/orchestrator/
 COPY src/shared/ /app/src/shared/
@@ -86,6 +94,13 @@ RUN python -c "import orchestrator.services.session_memory_executor"
 RUN python -c "from orchestrator.services.cloud_push_recovery import build_cloud_push_bundle"
 # Keep the manifest schema available with the same lean dependencies as production.
 RUN --network=none python -I -c "from shared.manifests import load_schema; assert load_schema()['properties']['apiVersion']['const'] == 'srw/v1alpha1'"
+# The VM inventory router needs shared.vm_resource_inventory_settings at
+# runtime (deferred import), so prove the shared tree is complete and stays
+# importable under this image's lean locked set — same family as the probes
+# above. Limit: these guards live in the watched tree, so a wholesale tree
+# swap can replace them too; branch-changing work belongs in a separate
+# worktree (see Tiltfile operational rule).
+RUN --network=none python -I -c "import shared.vm_resource_inventory_settings"
 
 EXPOSE 8085
 

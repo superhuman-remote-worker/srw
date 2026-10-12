@@ -698,3 +698,45 @@ def test_a_rebound_factory_is_observed_by_the_next_request():
 
     state["deps"] = _dependencies(_thread(protected=False))
     assert client.get(BASE).status_code == 404
+
+
+@pytest.mark.parametrize(
+    ("role", "applied"),
+    [("owner", True), ("editor", True), ("viewer", False), (None, False)],
+)
+def test_apply_needs_an_owner_or_editor_of_the_folders_project(
+    monkeypatch, role, applied
+):
+    """Main cloud slice 5: a protected folder may be another project's; its
+    staged changes are written only by an owner or editor of that project,
+    now (an administrator outside it included)."""
+    from orchestrator.services.cloud_staging import apply as apply_module
+
+    folder_project = "abababab-abab-4bab-8bab-abababababab"
+    calls: list[dict] = []
+
+    async def _run(**kwargs):
+        calls.append(kwargs)
+        return {"written": 1}
+
+    monkeypatch.setattr(apply_module, "apply_staged_diff", _run)
+    store = _store(
+        get_ro_mount_by_thread=AsyncMock(
+            return_value={"source_binding": {"source_ref": folder_project}}
+        ),
+        get_user_project_roles=AsyncMock(
+            return_value={folder_project: role} if role else {}
+        ),
+    )
+    wired = _wire(store=store)
+
+    response = wired.client.post(f"{BASE}/apply", json={"epoch": 3})
+
+    if applied:
+        assert response.status_code == 200, response.text
+        assert len(calls) == 1
+    else:
+        assert response.status_code == 403
+        assert response.json()["detail"]["code"] == "protected_cloud_apply_not_member"
+        assert calls == []
+    store.get_user_project_roles.assert_awaited_once_with(USER["id"], [folder_project])

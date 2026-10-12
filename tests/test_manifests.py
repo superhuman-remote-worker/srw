@@ -302,14 +302,15 @@ def test_project_defaults_apply_only_to_omitted_fields_and_owned_children_get_pr
     project, job = project_bundle()
     result = preview_documents([project, job])
     execution = result["resolved"][1]["spec"]["execution"]
-    assert execution["workspace"]["template"]["inline"]["backend"] == "sandbox"
+    # defaults.workspace is not copied: admission resolves the defaults chain.
+    assert "workspace" not in execution
     assert (
         execution["connectors"]["source"]["inline"]["credentials"]["key"]["secretRef"][
             "scope"
         ]
         == PROJECT
     )
-    assert len(result["defaults"]) == 3
+    assert len(result["defaults"]) == 2
     job["spec"]["execution"].update(workspace=None, connectors={})
     result = preview_documents([project, job])
     assert result["resolved"][1]["spec"]["execution"]["workspace"] is None

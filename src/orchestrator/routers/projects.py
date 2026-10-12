@@ -30,12 +30,14 @@ from fastapi import APIRouter, Depends, Query, Request
 from orchestrator.schemas.datasources import ProjectDatasourceSettings
 from orchestrator.schemas.projects import (
     ExternalKnowledgeBase,
+    ProjectConnectorDefaultsUpdate,
     ProjectCreate,
     ProjectMemberAdd,
     ProjectMemberUpdate,
     ProjectRepositoryCreate,
     ProjectRepositoryUpdate,
     ProjectUpdate,
+    ProjectWorkspaceDefaultsUpdate,
     PromoteRequest,
 )
 from orchestrator.security.access import (
@@ -226,6 +228,81 @@ async def update_project(
         project=project,
         escalate_admin=escalate_admin,
         dependencies=dependencies.operations,
+    )
+
+
+@router.get("/api/projects/{project_id}/workspace-defaults")
+async def get_project_workspace_defaults(
+    project_id: str,
+    request: Request,
+    *,
+    dependencies: ProjectsDependencies = Depends(get_projects_dependencies),
+) -> dict[str, Any]:
+    """The Project's workspace defaults: stored, effective, and any problems."""
+    from orchestrator.services import project_workspace_defaults_view
+
+    user, project = await dependencies.require_project_member(
+        request, dependencies.store, project_id
+    )
+    return await project_workspace_defaults_view.read_view(
+        dependencies.store, project, user
+    )
+
+
+@router.put("/api/projects/{project_id}/workspace-defaults")
+async def put_project_workspace_defaults(
+    project_id: str,
+    body: ProjectWorkspaceDefaultsUpdate,
+    request: Request,
+    *,
+    dependencies: ProjectsDependencies = Depends(get_projects_dependencies),
+) -> dict[str, Any]:
+    """Save the Project's workspace defaults. Caller must be a project owner
+    or admin, the same rule as PATCH /api/projects/{project_id}."""
+    from orchestrator.services import project_workspace_defaults_view
+
+    user, project = await dependencies.require_project_owner(
+        request, dependencies.store, project_id, allow_archived=False
+    )
+    return await project_workspace_defaults_view.update_view(
+        dependencies.store, project, user, body
+    )
+
+
+@router.get("/api/projects/{project_id}/connector-defaults")
+async def get_project_connector_defaults(
+    project_id: str,
+    request: Request,
+    *,
+    dependencies: ProjectsDependencies = Depends(get_projects_dependencies),
+) -> dict[str, Any]:
+    """The Project's connector defaults: stored, and what new work attaches
+    when it takes its defaults (the project knowledge base first)."""
+    from orchestrator.services import project_connector_defaults
+
+    user, project = await dependencies.require_project_member(
+        request, dependencies.store, project_id
+    )
+    return await project_connector_defaults.read_view(dependencies.store, project, user)
+
+
+@router.put("/api/projects/{project_id}/connector-defaults")
+async def put_project_connector_defaults(
+    project_id: str,
+    body: ProjectConnectorDefaultsUpdate,
+    request: Request,
+    *,
+    dependencies: ProjectsDependencies = Depends(get_projects_dependencies),
+) -> dict[str, Any]:
+    """Save the Project's connector defaults: linked connectors only. Caller
+    must be a project owner or admin, the same rule as the workspace defaults."""
+    from orchestrator.services import project_connector_defaults
+
+    user, project = await dependencies.require_project_owner(
+        request, dependencies.store, project_id, allow_archived=False
+    )
+    return await project_connector_defaults.update_view(
+        dependencies.store, project, user, body.connector_ids
     )
 
 

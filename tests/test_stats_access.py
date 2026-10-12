@@ -33,12 +33,17 @@ from orchestrator.security.access import (
     user_visible_project_ids,
 )
 from orchestrator.services import usage_reporting as usage_reporting_service
+from orchestrator.application import jobs as jobs_composition
+from orchestrator.application import workspace as workspace_composition
 
 
 def _patch_caller_and_db(user: dict, db):
     stack = ExitStack()
     stack.enter_context(
-        patch("orchestrator.main.require_approved_user", AsyncMock(return_value=user))
+        patch(
+            "orchestrator.security.auth.require_approved_user",
+            AsyncMock(return_value=user),
+        )
     )
     stack.enter_context(
         patch(
@@ -46,7 +51,7 @@ def _patch_caller_and_db(user: dict, db):
             AsyncMock(return_value=user),
         )
     )
-    stack.enter_context(patch("orchestrator.main.postgres_db", db))
+    stack.enter_context(patch("orchestrator.main.app.state.resources.postgres_db", db))
     return stack
 
 
@@ -106,13 +111,15 @@ _STATS_JOBS_DEFAULTS: dict = {
 
 
 async def _stats_jobs(fake_request, **overrides):
-    from orchestrator.main import _job_reads_dependencies
+    import orchestrator.main
     from orchestrator.routers.job_reads import get_job_statistics
 
     return await get_job_statistics(
         fake_request,
         **{**_STATS_JOBS_DEFAULTS, **overrides},
-        dependencies=_job_reads_dependencies(),
+        dependencies=jobs_composition.job_reads_dependencies(
+            orchestrator.main.app.state.resources
+        ),
     )
 
 
@@ -219,21 +226,23 @@ class TestStatsJobs:
 
     @pytest.mark.asyncio
     async def test_unauthenticated_baseline(self, fake_db, fake_request):
-        from orchestrator.main import _job_reads_dependencies
+        import orchestrator.main
         from orchestrator.routers.job_reads import get_job_statistics
 
         with (
             patch(
-                "orchestrator.main.require_approved_user",
+                "orchestrator.security.auth.require_approved_user",
                 AsyncMock(side_effect=HTTPException(status_code=401)),
             ),
-            patch("orchestrator.main.postgres_db", fake_db),
+            patch("orchestrator.main.app.state.resources.postgres_db", fake_db),
         ):
             with pytest.raises(HTTPException) as exc:
                 await get_job_statistics(
                     fake_request,
                     **_STATS_JOBS_DEFAULTS,
-                    dependencies=_job_reads_dependencies(),
+                    dependencies=jobs_composition.job_reads_dependencies(
+                        orchestrator.main.app.state.resources
+                    ),
                 )
         assert exc.value.status_code == 401
 
@@ -359,33 +368,39 @@ class TestStatsAdminOnly:
 
     @pytest.mark.asyncio
     async def test_snapshot_stats_non_admin_403(self, user_a, fake_db, fake_request):
-        from orchestrator.main import _workspace_access_dependencies
+        import orchestrator.main
         from orchestrator.routers.workspace_access import get_snapshot_stats
 
         sentinel = MagicMock(side_effect=AssertionError("snapshot called past gate"))
         with (
             _patch_caller_and_db(user_a, fake_db),
-            patch("orchestrator.main.snapshot_service", sentinel),
+            patch("orchestrator.services.snapshot_service.snapshot_service", sentinel),
         ):
             with pytest.raises(HTTPException) as exc:
                 await get_snapshot_stats(
-                    fake_request, dependencies=_workspace_access_dependencies()
+                    fake_request,
+                    dependencies=workspace_composition.workspace_access_dependencies(
+                        orchestrator.main.app.state.resources
+                    ),
                 )
         assert exc.value.status_code == 403
 
     @pytest.mark.asyncio
     async def test_snapshot_stats_admin_passes(self, user_admin, fake_db, fake_request):
-        from orchestrator.main import _workspace_access_dependencies
+        import orchestrator.main
         from orchestrator.routers.workspace_access import get_snapshot_stats
 
         fake_svc = MagicMock()
         fake_svc.get_storage_stats = AsyncMock(return_value={"total_bytes": 0})
         with (
             _patch_caller_and_db(user_admin, fake_db),
-            patch("orchestrator.main.snapshot_service", fake_svc),
+            patch("orchestrator.services.snapshot_service.snapshot_service", fake_svc),
         ):
             result = await get_snapshot_stats(
-                fake_request, dependencies=_workspace_access_dependencies()
+                fake_request,
+                dependencies=workspace_composition.workspace_access_dependencies(
+                    orchestrator.main.app.state.resources
+                ),
             )
         assert result == {"total_bytes": 0}
 

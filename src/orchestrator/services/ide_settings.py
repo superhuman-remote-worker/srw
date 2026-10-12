@@ -1852,3 +1852,146 @@ class IdeSettingsStore:
     async def set_ext_signature(self, user_id: str, sig: str) -> None:
         """Record the cache signature without replacing items or pointers."""
         await self._merge_component(user_id, "extensions", {"sig": sig})
+
+
+async def code_server_settings_sweeper(
+    shutdown_event: asyncio.Event,
+    *,
+    db,
+    container_provisioner,
+    snapshot_service,
+    vm_provisioner,
+) -> None:
+    """Background loop: reconcile per-user code-server IDE settings.
+
+    Workspaces are network-isolated from the orchestrator (egress is denied), so
+    instead of the workspace pushing changes, the orchestrator pulls inward on a
+    ~10-minute cycle: it reads each active workspace's code-server config files
+    (settings.json, keybindings.json, snippets) over SSH and merges any newer
+    edits into the owning user's stored settings (``users.settings['ide']``).
+    Conflict resolution is by filesystem mtime — newest wins, per file — so the
+    cycle order across a user's workspaces doesn't matter. See
+    orchestrator/services/ide_settings.py.
+    """
+    if os.environ.get("IDE_SETTINGS_SYNC_ENABLED", "true").lower() not in (
+        "1",
+        "true",
+        "yes",
+    ):
+        # Park instead of returning: run_when_leader re-creates a loop that
+        # exits on its next poll (~1s), which would respawn+log this every
+        # second for the whole leadership tenure.
+        logger.info("Code-server settings sweeper disabled (IDE_SETTINGS_SYNC_ENABLED)")
+        await shutdown_event.wait()
+        return
+
+    interval = float(os.environ.get("IDE_SETTINGS_SYNC_INTERVAL_S", "600"))
+    store = IdeSettingsStore(db)
+    classifier = OpenVsxClassifier()  # cache persists across cycles for this process
+    logger.info("Code-server settings sweeper started (interval=%.0fs)", interval)
+    while not shutdown_event.is_set():
+        try:
+            workspaces = await db.list_active_ide_workspaces()
+            vm_workspaces = [
+                workspace
+                for workspace in workspaces
+                if is_vm_capture_context(workspace.get("context"))
+            ]
+            workspaces = [
+                workspace
+                for workspace in workspaces
+                if not is_vm_capture_context(workspace.get("context"))
+            ]
+            workspaces = await evict_dead_workspaces(
+                workspaces, container_provisioner, db
+            )
+            if workspaces or vm_workspaces:
+                # Dial-target visibility: stable Service DNS survives pod
+                # restarts; raw IPs are legacy rows predating the headless
+                # Service and go stale with the pod.
+                _dns_dials = sum(
+                    1
+                    for w in workspaces
+                    if str(
+                        (
+                            (_coerce_context(w.get("context")) or {}).get(
+                                "workspace_container"
+                            )
+                            or {}
+                        ).get("host")
+                        or ""
+                    ).endswith(".svc.cluster.local")
+                )
+                logger.info(
+                    "IDE settings sweeper: %d workspace(s), %d dialed via "
+                    "stable service DNS",
+                    len(workspaces),
+                    _dns_dials,
+                )
+                count = await reconcile_ide_settings(store, workspaces, pull_ide_config)
+                if count:
+                    logger.info("IDE settings sweeper: synced %d file(s)", count)
+                try:
+                    ext_changed = await reconcile_extensions(
+                        store, workspaces, list_ide_extensions, classifier
+                    )
+                    if ext_changed:
+                        logger.info(
+                            "IDE settings sweeper: synced %d extension(s)", ext_changed
+                        )
+                except Exception as e:  # noqa: BLE001
+                    logger.error("Error reconciling extensions: %s", e)
+
+                # Capture license/globalStorage + non-Open-VSX bytes to S3 when a
+                # workspace's content signature changed (Phase B). Signature-gated
+                # inside capture_ide_profile so most cycles are a cheap no-op.
+                if snapshot_service.is_available:
+                    from orchestrator.services.ide_profile_store import IdeProfileStore
+
+                    profile = IdeProfileStore(
+                        snapshot_service._s3, snapshot_service._bucket
+                    )
+                    for ws in workspaces:
+                        uid = ws.get("user_id")
+                        if not uid:
+                            continue
+                        tgt = resolve_ssh_target(_coerce_context(ws.get("context")))
+                        if not tgt:
+                            continue
+                        try:
+                            await capture_ide_profile(
+                                store, str(uid), tgt[0], tgt[1], profile
+                            )
+                        except Exception as e:  # noqa: BLE001
+                            logger.warning("ide profile capture failed: %s", e)
+                    for ws in vm_workspaces:
+                        try:
+                            await reconcile_vm_ide_workspace(
+                                store=store,
+                                workspace=ws,
+                                db=db,
+                                vm_provisioner=vm_provisioner,
+                                classifier=classifier,
+                                profile_store=profile,
+                            )
+                        except Exception as e:  # noqa: BLE001
+                            logger.warning("VM IDE capture failed: %s", e)
+                else:
+                    for ws in vm_workspaces:
+                        await reconcile_vm_ide_workspace(
+                            store=store,
+                            workspace=ws,
+                            db=db,
+                            vm_provisioner=vm_provisioner,
+                            classifier=classifier,
+                        )
+        except Exception as e:
+            logger.error("Error in code-server settings sweeper: %s", e)
+
+        try:
+            await asyncio.wait_for(shutdown_event.wait(), timeout=interval)
+            break
+        except asyncio.TimeoutError:
+            pass
+
+    logger.info("Code-server settings sweeper stopped")

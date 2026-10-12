@@ -4,9 +4,12 @@ Tests cover explicit VM mode selection and the external/HTTP lifecycle paths.
 """
 
 import asyncio
+import json
 import os
+from contextlib import asynccontextmanager
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import asyncpg
 import pytest
 
 PROVISION_GENERATION = "00000000-0000-4000-8000-000000000001"
@@ -56,6 +59,9 @@ def mock_db():
     db.merge_thread_vm_context = AsyncMock()
     db.begin_pinned_thread_vm_provisioning = AsyncMock(return_value=True)
     db.merge_vm_context_if_provision_generation = AsyncMock(return_value=True)
+    db.capture_vm_creation_request_if_generation = AsyncMock(
+        side_effect=lambda _job, _generation, snapshot: snapshot
+    )
     db.merge_thread_vm_context_if_provision_generation = AsyncMock(return_value=True)
     db.managed_repository_workspace_process_zero_is_current = AsyncMock(
         return_value=True
@@ -64,6 +70,24 @@ def mock_db():
     db.record_managed_repository_workspace_process_zero = AsyncMock(return_value=True)
     db.get_job = AsyncMock(return_value={"context": {"vm": _ready_vm_context()}})
     db.get_thread = AsyncMock(return_value={"metadata": {"vm": _ready_vm_context()}})
+
+    # These legacy lifecycle cases have no typed retained-Job Resume lineage.
+    # Model the native lookup instead of bypassing the provisioner's guard.
+    conn = MagicMock()
+    conn.fetchval = AsyncMock(return_value=True)
+    conn.fetchrow = AsyncMock(return_value=None)
+    conn.execute = AsyncMock()
+
+    @asynccontextmanager
+    async def transaction():
+        yield
+
+    @asynccontextmanager
+    async def acquire():
+        yield conn
+
+    conn.transaction = transaction
+    db.acquire = acquire
     return db
 
 
@@ -99,10 +123,360 @@ def provisioner_with_nats(mock_nats_bridge, mock_db):
                 ),
                 "rootdisk_identity_known": True,
                 "credential_runtime_started": False,
+                "vmi_absent": deleted,
+                "launcher_absent": deleted,
+                "runtime_absence_known": deleted,
             }
 
         mock_nats_bridge.query_vm_status.side_effect = _query_exact_vm
-        yield prov
+        # Legacy external-mode fixture IDs are placeholders. The new
+        # PostgreSQL-backed stop intent does not exist in this fixture.
+        with patch(
+            "orchestrator.services.vm_pre_ssh_stop_store.VMPreSSHStopStore.has_intent",
+            new_callable=AsyncMock,
+            return_value=False,
+        ):
+            yield prov
+
+
+@pytest.mark.parametrize(
+    "vmi_absent,launcher_absent",
+    [
+        (False, True),
+        (True, False),
+        (False, False),
+    ],
+)
+def test_captured_vm_404_with_runtime_remnant_is_not_cleanup_completion(
+    vmi_absent,
+    launcher_absent,
+):
+    from orchestrator.services.vm_provisioner import (
+        VMProvisioner,
+        VMTeardownIdentity,
+        _VMTeardownProbe,
+    )
+
+    identity = VMTeardownIdentity(
+        provision_generation=PROVISION_GENERATION,
+        vm_uid="captured-vm-uid",
+        rootdisk_pvc_uid="captured-root-uid",
+    )
+    probe = _VMTeardownProbe(
+        "absent",
+        VMTeardownIdentity(
+            provision_generation=PROVISION_GENERATION,
+            vm_uid=None,
+            rootdisk_pvc_uid=None,
+        ),
+        rootdisk_identity_known=True,
+        runtime_absence_known=vmi_absent and launcher_absent,
+        vmi_absent=vmi_absent,
+        launcher_absent=launcher_absent,
+    )
+    assert (
+        VMProvisioner._classify_captured_probe(
+            probe,
+            identity,
+            purge_disk=True,
+        )
+        == "unknown"
+    )
+
+
+@pytest.mark.asyncio
+async def test_cleanup_stop_attestation_requires_exact_runtime_and_pvc_disposition(
+    provisioner_with_nats,
+    mock_nats_bridge,
+):
+    from uuid import uuid4
+
+    ids = {
+        key: str(uuid4())
+        for key in ("job_id", "vm_uid", "vmi_uid", "launcher_uid", "pvc_uid")
+    }
+    candidate = {
+        **ids,
+        "provision_generation": PROVISION_GENERATION,
+        "purge_disk": True,
+    }
+    reply = {
+        "_identity_authenticated": True,
+        "status": "not_found",
+        "provision_generation": PROVISION_GENERATION,
+        "rootdisk_identity_known": True,
+        "vmi_absent": True,
+        "launcher_absent": False,
+        "runtime_absence_known": False,
+    }
+    mock_nats_bridge.query_vm_status.side_effect = None
+    mock_nats_bridge.query_vm_status.return_value = reply
+    assert await provisioner_with_nats.attest_vm_cleanup_stop(candidate) is None
+    mock_nats_bridge.query_vm_status.return_value = {
+        **reply,
+        "vmi_absent": True,
+        "launcher_absent": True,
+        "runtime_absence_known": True,
+        "rootdisk_pvc_uid": ids["pvc_uid"],
+    }
+    assert await provisioner_with_nats.attest_vm_cleanup_stop(candidate) is None
+    mock_nats_bridge.query_vm_status.return_value = {
+        **reply,
+        "vmi_absent": True,
+        "launcher_absent": True,
+        "runtime_absence_known": True,
+    }
+    proof = await provisioner_with_nats.attest_vm_cleanup_stop(candidate)
+    assert proof is not None
+    assert proof["vm_uid"] == ids["vm_uid"]
+    assert proof["pvc_disposition"] == "purged"
+
+
+@pytest.mark.asyncio
+async def test_retained_exact_absence_nats_queries_captured_workspace_pvc(
+    provisioner_with_nats, mock_nats_bridge
+):
+    """A default Job-rootdisk 404 cannot certify a retained workspace purge."""
+    binding = {
+        "uid": "00000000-0000-4000-8000-000000000322",
+        "generation": 2,
+        "pvc_uid": "00000000-0000-4000-8000-000000000323",
+        "owner_id": "00000000-0000-4000-8000-000000000321",
+        "owner_kind": "job",
+    }
+    provisioner_with_nats._storage_context = AsyncMock(return_value=binding)
+    mock_nats_bridge.query_vm_status.side_effect = None
+    mock_nats_bridge.query_vm_status.return_value = {
+        "_identity_authenticated": True,
+        "status": "not_found",
+        "provision_generation": PROVISION_GENERATION,
+        "rootdisk_identity_known": True,
+        "runtime_absence_known": True,
+        "vmi_absent": True,
+        "launcher_absent": True,
+        "rootdisk_pvc_uid": binding["pvc_uid"],
+        "retained_storage_probe": binding,
+    }
+
+    probe = await provisioner_with_nats._probe_vm_teardown_identity(
+        binding["owner_id"], PROVISION_GENERATION
+    )
+
+    assert probe.identity.rootdisk_pvc_uid == binding["pvc_uid"]
+    assert (
+        mock_nats_bridge.query_vm_status.await_args.kwargs["workspace_storage"]
+        == binding
+    )
+
+
+@pytest.mark.asyncio
+async def test_retained_purge_attestation_refuses_missing_or_changed_captured_binding(
+    provisioner_with_nats, mock_nats_bridge
+):
+    from uuid import uuid4
+
+    ids = {
+        key: str(uuid4())
+        for key in (
+            "job_id",
+            "vm_uid",
+            "vmi_uid",
+            "launcher_uid",
+            "pvc_uid",
+            "workspace_uid",
+        )
+    }
+    binding = {
+        "uid": ids["workspace_uid"],
+        "generation": 2,
+        "pvc_uid": ids["pvc_uid"],
+        "owner_id": ids["job_id"],
+        "owner_kind": "job",
+    }
+    candidate = {
+        **{
+            key: ids[key]
+            for key in ("job_id", "vm_uid", "vmi_uid", "launcher_uid", "pvc_uid")
+        },
+        "provision_generation": PROVISION_GENERATION,
+        "purge_disk": True,
+        "binding_kind": "bound",
+        "captured_workspace_storage": binding,
+        "controller_scope": {
+            "version": 1,
+            "namespace": "agent-vms",
+            "cluster_id": "test-cluster",
+        },
+    }
+    provisioner_with_nats._storage_context = AsyncMock(return_value=None)
+    assert await provisioner_with_nats.attest_vm_cleanup_stop(candidate) is None
+    mock_nats_bridge.query_vm_status.assert_not_awaited()
+
+    provisioner_with_nats._storage_context.return_value = {**binding, "generation": 3}
+    assert await provisioner_with_nats.attest_vm_cleanup_stop(candidate) is None
+    mock_nats_bridge.query_vm_status.assert_not_awaited()
+
+    provisioner_with_nats._storage_context.return_value = binding
+    mock_nats_bridge.query_vm_status.side_effect = None
+    mock_nats_bridge.query_vm_status.return_value = {
+        "_identity_authenticated": True,
+        "status": "not_found",
+        "provision_generation": PROVISION_GENERATION,
+        "rootdisk_identity_known": True,
+        "runtime_absence_known": True,
+        "vmi_absent": True,
+        "launcher_absent": True,
+        "rootdisk_pvc_uid": None,
+    }
+    assert await provisioner_with_nats.attest_vm_cleanup_stop(candidate) is None
+    mock_nats_bridge.query_vm_status.return_value["retained_storage_probe"] = binding
+    assert await provisioner_with_nats.attest_vm_cleanup_stop(candidate) is None
+    for wrong_scope in (
+        {"version": True, "namespace": "agent-vms", "cluster_id": "test-cluster"},
+        {"version": 1, "namespace": "other-vms", "cluster_id": "test-cluster"},
+        {"version": 1, "namespace": "agent-vms", "cluster_id": "other-cluster"},
+        {"version": 2, "namespace": "agent-vms", "cluster_id": "test-cluster"},
+    ):
+        mock_nats_bridge.query_vm_status.return_value["controller_scope"] = wrong_scope
+        assert await provisioner_with_nats.attest_vm_cleanup_stop(candidate) is None
+    mock_nats_bridge.query_vm_status.return_value["controller_scope"] = candidate[
+        "controller_scope"
+    ]
+    proof = await provisioner_with_nats.attest_vm_cleanup_stop(candidate)
+    assert proof is not None
+    assert proof["captured_workspace_storage"] == binding
+    assert proof["controller_scope"] == candidate["controller_scope"]
+    assert (
+        mock_nats_bridge.query_vm_status.await_args.kwargs["workspace_storage"]
+        == binding
+    )
+    mock_nats_bridge.query_vm_status.return_value["rootdisk_pvc_uid"] = binding[
+        "pvc_uid"
+    ]
+    assert await provisioner_with_nats.attest_vm_cleanup_stop(candidate) is None
+
+
+@pytest.mark.asyncio
+async def test_unbound_retained_purge_refuses_a_new_workspace_binding(
+    provisioner_with_nats, mock_nats_bridge
+):
+    from uuid import uuid4
+
+    ids = {
+        key: str(uuid4())
+        for key in ("job_id", "vm_uid", "vmi_uid", "launcher_uid", "pvc_uid")
+    }
+    provisioner_with_nats._storage_context = AsyncMock(
+        return_value={
+            "uid": str(uuid4()),
+            "generation": 1,
+            "pvc_uid": ids["pvc_uid"],
+            "owner_id": ids["job_id"],
+            "owner_kind": "job",
+        }
+    )
+    candidate = {
+        **ids,
+        "provision_generation": PROVISION_GENERATION,
+        "purge_disk": True,
+        "binding_kind": "unbound",
+        "captured_workspace_storage": None,
+    }
+    mock_nats_bridge.query_vm_status.reset_mock()
+    assert await provisioner_with_nats.attest_vm_cleanup_stop(candidate) is None
+    mock_nats_bridge.query_vm_status.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_retained_exact_absence_http_signs_captured_workspace_binding(
+    provisioner_with_nats, mock_nats_bridge
+):
+    from vm_controller.lifecycle_auth import sign_payload
+
+    binding = {
+        "uid": "00000000-0000-4000-8000-000000000322",
+        "generation": 2,
+        "pvc_uid": "00000000-0000-4000-8000-000000000323",
+        "owner_id": "00000000-0000-4000-8000-000000000321",
+        "owner_kind": "job",
+    }
+    secret = b"retained-status-test-secret-at-least-32-bytes"
+    provisioner_with_nats._storage_context = AsyncMock(return_value=binding)
+    provisioner_with_nats._controller_url = "http://vm-controller:8080"
+    provisioner_with_nats._lifecycle_hmac_secret = secret
+    client = MagicMock()
+    pvc_status = {"uid": None}
+    echoed_target = {"enabled": False}
+    scope = {"version": 1, "namespace": "agent-vms", "cluster_id": "test-cluster"}
+    actual_scope = {"enabled": False}
+
+    async def _get(_path, *, params, timeout):
+        assert json.loads(params["workspace_storage"]) == binding
+        response = MagicMock(status_code=200)
+        response.raise_for_status = MagicMock()
+        response.json.return_value = sign_payload(
+            {
+                "status": "not_found",
+                "provision_generation": PROVISION_GENERATION,
+                "rootdisk_identity_known": True,
+                "runtime_absence_known": True,
+                "vmi_absent": True,
+                "launcher_absent": True,
+                "rootdisk_pvc_uid": pvc_status["uid"],
+                **(
+                    {"retained_storage_probe": binding}
+                    if echoed_target["enabled"]
+                    else {}
+                ),
+                **({"controller_scope": scope} if actual_scope["enabled"] else {}),
+            },
+            direction="response",
+            operation="status",
+            secret=secret,
+            correlation_id=params["lifecycle_auth_request_id"],
+        )
+        return response
+
+    client.get = AsyncMock(side_effect=_get)
+    provisioner_with_nats._http_client = client
+    mock_nats_bridge.is_available = False
+    with patch.dict(os.environ, {"VM_MODE": "same-cluster"}):
+        unbound_response = await provisioner_with_nats._probe_vm_teardown_identity(
+            binding["owner_id"], PROVISION_GENERATION, workspace_storage=binding
+        )
+        assert unbound_response.disposition == "unknown"
+        echoed_target["enabled"] = True
+        missing_scope = await provisioner_with_nats._probe_vm_teardown_identity(
+            binding["owner_id"],
+            PROVISION_GENERATION,
+            workspace_storage=binding,
+            controller_scope=scope,
+        )
+        assert missing_scope.disposition == "unknown"
+        actual_scope["enabled"] = True
+        probe = await provisioner_with_nats._probe_vm_teardown_identity(
+            binding["owner_id"],
+            PROVISION_GENERATION,
+            workspace_storage=binding,
+            controller_scope=scope,
+        )
+    assert probe.disposition == "absent"
+    assert probe.rootdisk_identity_known is True
+    pvc_status["uid"] = binding["pvc_uid"]
+    candidate = {
+        "job_id": binding["owner_id"],
+        "provision_generation": PROVISION_GENERATION,
+        "vm_uid": "00000000-0000-4000-8000-000000000324",
+        "vmi_uid": "00000000-0000-4000-8000-000000000325",
+        "launcher_uid": "00000000-0000-4000-8000-000000000326",
+        "pvc_uid": binding["pvc_uid"],
+        "purge_disk": True,
+        "binding_kind": "bound",
+        "captured_workspace_storage": binding,
+        "controller_scope": scope,
+    }
+    with patch.dict(os.environ, {"VM_MODE": "same-cluster"}):
+        assert await provisioner_with_nats.attest_vm_cleanup_stop(candidate) is None
 
 
 @pytest.fixture
@@ -118,6 +492,91 @@ def provisioner_disabled():
         prov = VMProvisioner()
         prov._db = None
         yield prov
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("owner_kind", ["job", "thread"])
+async def test_idle_stop_receipt_needs_authenticated_vm_vmi_launcher_absence(
+    provisioner_with_nats, mock_nats_bridge, mock_db, owner_kind
+):
+    """An authenticated VM 404 without VMI/launcher proof cannot free compute."""
+    from uuid import uuid4
+
+    ids = {
+        key: str(uuid4())
+        for key in (
+            "id",
+            "owner_id",
+            "generation",
+            "vm_uid",
+            "vmi_uid",
+            "launcher_uid",
+            "pvc_uid",
+        )
+    }
+    operation = {
+        "id": ids["id"],
+        "owner_id": ids["owner_id"],
+        "owner_kind": owner_kind,
+        "provision_generation": ids["generation"],
+        "vm_uid": ids["vm_uid"],
+        "vmi_uid": ids["vmi_uid"],
+        "launcher_uid": ids["launcher_uid"],
+        "pvc_uid": ids["pvc_uid"],
+    }
+    mock_db.get_job.return_value = {
+        "context": {"vm": {"provision_generation": ids["generation"]}}
+    }
+    mock_db.get_thread.return_value = {
+        "metadata": {"vm": {"provision_generation": ids["generation"]}}
+    }
+    reply = {
+        "_identity_authenticated": True,
+        "status": "not_found",
+        "provision_generation": ids["generation"],
+        "rootdisk_identity_known": True,
+        "rootdisk_pvc_uid": ids["pvc_uid"],
+        "vmi_absent": False,
+        "launcher_absent": True,
+        "runtime_absence_known": False,
+    }
+    mock_nats_bridge.query_vm_status.side_effect = None
+    mock_nats_bridge.query_vm_status.return_value = reply
+    assert await provisioner_with_nats.attest_vm_idle_stop(operation) is None
+    mock_nats_bridge.query_vm_status.return_value = {
+        **reply,
+        "vmi_absent": True,
+        "runtime_absence_known": True,
+    }
+    evidence = await provisioner_with_nats.attest_vm_idle_stop(operation)
+    assert evidence is not None
+    assert evidence["operation_id"] == ids["id"]
+    assert evidence["pvc_uid"] == ids["pvc_uid"]
+    assert evidence["controller_authenticated"] is True
+
+
+@pytest.mark.asyncio
+async def test_authenticated_status_retains_exact_vmi_uid_for_idle_release(
+    provisioner_with_db, mock_db
+):
+    """Without the observed VMI UID, idle release must hold the VM running."""
+    from uuid import uuid4
+
+    vmi_uid = str(uuid4())
+    assert await provisioner_with_db._persist_status_identity(
+        "job",
+        "job-1",
+        {
+            "_identity_authenticated": True,
+            "provision_generation": PROVISION_GENERATION,
+            "vm_uid": "captured-vm-uid",
+            "vmi_uid": vmi_uid,
+        },
+    )
+    assert (
+        mock_db.merge_vm_context_if_provision_generation.await_args.args[2]["vmi_uid"]
+        == vmi_uid
+    )
 
 
 @pytest.fixture
@@ -337,11 +796,14 @@ class TestVmWorkspaceRuntimeAttestation:
     async def test_matching_live_incarnation_returns_endpoint_pair_and_pin(
         self, mock_db
     ):
+        from uuid import uuid4
+
+        vmi_uid, pvc_uid = str(uuid4()), str(uuid4())
         with patch.dict(os.environ, {"VM_MODE": "same-cluster"}):
             provisioner = self._provisioner(
                 mock_db,
-                self._context(),
-                self._status(),
+                self._context(vmi_uid=vmi_uid, rootdisk_pvc_uid=pvc_uid),
+                self._status(vmi_uid=vmi_uid, rootdisk_pvc_uid=pvc_uid),
             )
             attested = await provisioner.attest_workspace_runtime("job-1")
 
@@ -352,6 +814,8 @@ class TestVmWorkspaceRuntimeAttestation:
         assert attested.host == "10.42.1.23"
         assert attested.pod_ip == "10.42.1.23"
         assert attested.port == 22
+        assert attested.vmi_uid == vmi_uid
+        assert attested.rootdisk_pvc_uid == pvc_uid
         provisioner._query_http.assert_awaited_once_with(
             "job-1",
             provision_generation=PROVISION_GENERATION,
@@ -1455,6 +1919,68 @@ class TestPurgeDiskIntent:
 
 class TestCapturedVmTeardown:
     @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("constraint", "expected_busy"),
+        [
+            ("active_vm_remote_operation_rebind", True),
+            ("unrelated_object_in_use", False),
+            (None, False),
+        ],
+    )
+    async def test_initial_retirement_claim_remote_lease_busy_is_before_effects(
+        self, provisioner_with_db, mock_db, constraint, expected_busy
+    ):
+        from orchestrator.services.vm_provisioner import VMTeardownResult
+
+        identity = self._identity()
+        probe = self._probe(
+            "present",
+            vm_uid=identity.vm_uid,
+            root_uid=identity.rootdisk_pvc_uid,
+            credential_runtime_started=True,
+        )
+        provisioner_with_db._probe_vm_teardown_identity = AsyncMock(return_value=probe)
+        provisioner_with_db.delete_vm_captured = AsyncMock()
+        mock_db.managed_repository_workspace_process_zero_is_current.return_value = (
+            False
+        )
+        error = (
+            asyncpg.ObjectInUseError("VM lifecycle identity is leased")
+            if constraint is not None
+            else RuntimeError("unrelated claim failure")
+        )
+        if constraint is not None:
+            error.constraint_name = constraint
+        mock_db.claim_managed_repository_workspace_retirement.side_effect = error
+
+        with patch(
+            "orchestrator.services.vm_provisioner.retire_managed_repository_processes",
+            new_callable=AsyncMock,
+        ) as retire:
+            if expected_busy:
+                result = await provisioner_with_db.release_vm_captured(
+                    "job-1", identity, capture_snapshot=False
+                )
+                assert result == VMTeardownResult("remote_operation_busy", False)
+            else:
+                with pytest.raises(type(error)) as raised:
+                    await provisioner_with_db.release_vm_captured(
+                        "job-1", identity, capture_snapshot=False
+                    )
+                assert raised.value is error
+
+        mock_db.claim_managed_repository_workspace_retirement.assert_awaited_once_with(
+            "job-1",
+            owner_kind="job",
+            scope="vm",
+            provisioner="vm",
+            runtime_incarnation=identity.provision_generation,
+        )
+        retire.assert_not_awaited()
+        provisioner_with_db.delete_vm_captured.assert_not_awaited()
+        mock_db.record_managed_repository_workspace_process_zero.assert_not_awaited()
+
+    @pytest.mark.asyncio
     @pytest.mark.parametrize("entity_type", ["job", "thread"])
     @pytest.mark.parametrize("retirement_succeeds", [True, False])
     async def test_late_boot_retires_through_controller_endpoint_without_promotion(
@@ -1633,6 +2159,9 @@ class TestCapturedVmTeardown:
                 credential_runtime_started=credential_runtime_started,
             ),
             rootdisk_identity_known=known,
+            runtime_absence_known=disposition == "absent" and known,
+            vmi_absent=disposition == "absent" and known,
+            launcher_absent=disposition == "absent" and known,
         )
 
     @pytest.mark.asyncio
@@ -1824,6 +2353,82 @@ class TestCapturedVmTeardown:
         )
         mock_db.record_managed_repository_workspace_process_zero.assert_not_awaited()
         provisioner_with_db.delete_vm_captured.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("entity_type", "purge_disk", "parent_cleanup", "expected_stop"),
+        [
+            ("job", False, {"admission_id": "exact-parent"}, True),
+            ("job", True, {"admission_id": "exact-parent"}, False),
+            ("job", False, None, False),
+            ("thread", False, {"admission_id": "exact-parent"}, False),
+        ],
+    )
+    async def test_pre_ssh_stop_requires_job_retained_cleanup_and_bound_zero(
+        self,
+        provisioner_with_db,
+        mock_db,
+        monkeypatch,
+        entity_type,
+        purge_disk,
+        parent_cleanup,
+        expected_stop,
+    ):
+        from orchestrator.services.vm_provisioner import VMTeardownResult
+
+        monkeypatch.setenv("VM_MODE", "same-cluster")
+        identity = self._identity()
+        present = self._probe(
+            "present",
+            vm_uid="captured-vm-uid",
+            root_uid="captured-root-uid",
+            credential_runtime_started=True,
+        )
+        provisioner_with_db._probe_vm_teardown_identity = AsyncMock(
+            return_value=present
+        )
+        mock_db.managed_repository_workspace_process_zero_is_current.return_value = (
+            False
+        )
+        provisioner_with_db._attempt_pre_ssh_positive_stop = AsyncMock(
+            return_value=True
+        )
+        provisioner_with_db._release_pre_ssh_stop_finalizer = AsyncMock(
+            return_value=True
+        )
+        provisioner_with_db.delete_vm_captured = AsyncMock(
+            return_value=VMTeardownResult("completed", True)
+        )
+
+        result = await provisioner_with_db.release_vm_captured(
+            "job-1",
+            identity,
+            entity_type=entity_type,
+            purge_disk=purge_disk,
+            capture_snapshot=False,
+            parent_cleanup=parent_cleanup,
+        )
+
+        if expected_stop:
+            assert result == VMTeardownResult("completed", True)
+            provisioner_with_db._attempt_pre_ssh_positive_stop.assert_awaited_once_with(
+                "job-1", identity, parent_cleanup
+            )
+            provisioner_with_db._release_pre_ssh_stop_finalizer.assert_awaited_once_with(
+                "job-1", PROVISION_GENERATION, parent_cleanup
+            )
+            provisioner_with_db.delete_vm_captured.assert_awaited_once_with(
+                "job-1",
+                identity,
+                purge_disk=False,
+                entity_type="job",
+                parent_cleanup=parent_cleanup,
+            )
+        else:
+            assert result == VMTeardownResult("process_zero_unproven", False)
+            provisioner_with_db._attempt_pre_ssh_positive_stop.assert_not_awaited()
+            provisioner_with_db.delete_vm_captured.assert_not_awaited()
+        mock_db.record_managed_repository_workspace_process_zero.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_delete_acceptance_waits_for_exact_vm_and_rootdisk_absence(
@@ -2121,3 +2726,58 @@ class TestCreateVmDiskSize:
         )
         payload = prov._http_client.post.await_args.kwargs["json"]
         assert "disk_size" not in payload
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bound", [True, False])
+@pytest.mark.parametrize("purge_disk", [True, False])
+async def test_thread_cleanup_attestation_uses_thread_owner_and_whole_runtime_absence(
+    provisioner_with_nats,
+    mock_nats_bridge,
+    bound,
+    purge_disk,
+):
+    from uuid import uuid4
+
+    candidate = {
+        "owner_kind": "thread",
+        "owner_id": str(uuid4()),
+        "provision_generation": PROVISION_GENERATION,
+        "vm_uid": str(uuid4()),
+        "pvc_uid": str(uuid4()),
+        "vmi_uid": str(uuid4()) if bound else None,
+        "launcher_uid": str(uuid4()) if bound else None,
+        "purge_disk": purge_disk,
+    }
+    reply = {
+        "_identity_authenticated": True,
+        "status": "not_found",
+        "provision_generation": PROVISION_GENERATION,
+        "rootdisk_identity_known": True,
+        "runtime_absence_known": True,
+        "vmi_absent": True,
+        "launcher_absent": True,
+        "rootdisk_pvc_uid": None if purge_disk else candidate["pvc_uid"],
+    }
+    mock_nats_bridge.query_vm_status.side_effect = None
+    for missing in (
+        "_identity_authenticated",
+        "runtime_absence_known",
+        "rootdisk_identity_known",
+        "vmi_absent",
+        "launcher_absent",
+    ):
+        mock_nats_bridge.query_vm_status.return_value = {**reply, missing: False}
+        assert await provisioner_with_nats.attest_vm_cleanup_stop(candidate) is None
+    mock_nats_bridge.query_vm_status.return_value = {
+        **reply,
+        "rootdisk_pvc_uid": str(uuid4()),
+    }
+    assert await provisioner_with_nats.attest_vm_cleanup_stop(candidate) is None
+    mock_nats_bridge.query_vm_status.return_value = reply
+    proof = await provisioner_with_nats.attest_vm_cleanup_stop(candidate)
+    assert (
+        proof["owner_kind"] == "thread" and proof["owner_id"] == candidate["owner_id"]
+    )
+    assert proof["vmi_uid"] == candidate["vmi_uid"]
+    assert proof["pvc_disposition"] == ("purged" if purge_disk else "retained")

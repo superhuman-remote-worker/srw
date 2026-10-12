@@ -120,6 +120,8 @@ tools:
   core: []
   canvas: []
   communication: []
+  # No memory of its own (memory.enabled: false below), so no memory_search.
+  memory: []
   webdav: []
   job_control: []
   job_inspection: []

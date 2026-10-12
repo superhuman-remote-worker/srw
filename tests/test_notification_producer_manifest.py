@@ -51,6 +51,26 @@ def test_empty_source_discovery_is_an_error(monkeypatch):
         script.collect_sites()
 
 
+def test_application_composition_package_is_scanned(tmp_path, monkeypatch):
+    """main.py shrinks to an entrypoint; its code moves into application/."""
+    script = _load_script()
+    (tmp_path / "application" / "nested").mkdir(parents=True)
+    for relative in (
+        "main.py",
+        "application/__init__.py",
+        "application/routes.py",
+        "application/nested/lifespan.py",
+    ):
+        (tmp_path / relative).write_text("")
+    monkeypatch.setattr(script, "ORCHESTRATOR", tmp_path)
+    assert script._roots() == [
+        tmp_path / "main.py",
+        tmp_path / "application" / "__init__.py",
+        tmp_path / "application" / "nested" / "lifespan.py",
+        tmp_path / "application" / "routes.py",
+    ]
+
+
 def test_manifest_matches_code():
     """The committed manifest must reflect the current tree."""
     script = _load_script()

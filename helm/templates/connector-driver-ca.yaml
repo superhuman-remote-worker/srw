@@ -1,0 +1,39 @@
+{{- /*
+SRW's connector driver certificate authority (connector drivers C3).
+
+The orchestrator signs each TLS service driver pod's certificate with it
+(the git swap driver's), and a workspace trusts it for that driver's URL
+only (http.<driver-url>.sslCAInfo), never globally. Created at install and
+kept: an upgrade reuses the stored authority (lookup), and an uninstall
+leaves it (resource-policy keep), so a reinstall does not invalidate the
+authority running pods and workspaces already trust. Only the orchestrator
+mounts it. An operator who manages it elsewhere (Vault, ESO) names their own
+Secret, with tls.crt and tls.key, in connectors.drivers.ca.secretName.
+*/ -}}
+{{- if and .Values.connectors.drivers.gitSwap.enabled (not .Values.connectors.drivers.ca.secretName) }}
+{{- $name := include "srw.connectorDriverCaSecretName" . }}
+{{- $existing := lookup "v1" "Secret" .Release.Namespace $name }}
+{{- $certificate := "" }}
+{{- $key := "" }}
+{{- if and $existing $existing.data (index $existing.data "tls.crt") (index $existing.data "tls.key") }}
+{{- $certificate = index $existing.data "tls.crt" | b64dec }}
+{{- $key = index $existing.data "tls.key" | b64dec }}
+{{- else }}
+{{- $authority := genCA "srw-connector-drivers" (int .Values.connectors.drivers.ca.validityDays) }}
+{{- $certificate = $authority.Cert }}
+{{- $key = $authority.Key }}
+{{- end }}
+apiVersion: v1
+kind: Secret
+metadata:
+  name: {{ $name }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "srw.componentLabels" (dict "context" . "component" "connector-driver-ca") | nindent 4 }}
+  annotations:
+    "helm.sh/resource-policy": keep
+type: kubernetes.io/tls
+data:
+  tls.crt: {{ $certificate | b64enc | quote }}
+  tls.key: {{ $key | b64enc | quote }}
+{{- end }}

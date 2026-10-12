@@ -71,6 +71,10 @@ COMPLETION_EFFECT_PLAN: tuple[CompletionEffectSpec, ...] = (
     # S16 keeps its shipped group identity for in-flight compatibility.  It is
     # diagnostic diff capture, not one of step 4's three product deliveries.
     CompletionEffectSpec("mode_a_diff_capture", "delivery", "S16"),
+    # The job outbox (main cloud slice 6.2): a best-effort copy of a root
+    # job's deliverables into its owner's shared folder. Additive vocabulary:
+    # an in-flight command without it simply runs it on resume.
+    CompletionEffectSpec("job_outbox_delivery", "delivery", "S16b"),
     CompletionEffectSpec("main_status_write", "job_disposition", "S17"),
     CompletionEffectSpec("clear_assigned_agent_on_pause", "job_disposition", "S18"),
     CompletionEffectSpec("stash_and_clear_freeze", "job_disposition", "S19"),

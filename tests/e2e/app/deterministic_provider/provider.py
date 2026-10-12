@@ -12,6 +12,7 @@ Its diagnostic records contain only run/model/endpoint/stream/outcome metadata.
 from __future__ import annotations
 
 import asyncio
+import copy
 import hashlib
 import hmac
 import json
@@ -27,7 +28,7 @@ from typing import Any, AsyncIterator, Final, Literal
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 CHAT_MODEL_ID = os.environ.get("E2E_CHAT_MODEL_ID", "e2e-chat")
@@ -41,13 +42,16 @@ SUPPORTED_SCENARIOS = frozenset(
     {
         "reply",
         "slow-stream",
+        "slow-nonstream",
         "error-once",
         "tool-call",
         "numbered-stream",
         "search-job",
         "fetch-job",
         "worker-job",
+        "retained-sentinel-worker",
         "prepared-workspace-job",
+        "delegation-batch",
     }
 )
 _RUN_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{2,127}$")
@@ -56,6 +60,13 @@ _CORRELATION_RE = re.compile(
 )
 _DIAGNOSTIC_MODELS = frozenset({CHAT_MODEL_ID, EMBEDDING_MODEL_ID, RERANK_MODEL_ID})
 _MAX_UNSCOPED_DIAGNOSTICS: Final = 4096
+# EmbeddingService.verify_dimensions() embeds exactly this text at every
+# session attach (and worker memory initialisation), without any run
+# correlation. Only this exact request shape can be absorbed by a probe window.
+STARTUP_PROBE_INPUT: Final = "dimension probe"
+_STARTUP_PROBE_KEYS: Final = frozenset({"model", "input", "encoding_format"})
+_STARTUP_PROBE_FORMATS: Final = frozenset({"base64", "float"})
+_MAX_PROBE_WINDOWS: Final = 256
 
 
 class ArmScenarioRequest(BaseModel):
@@ -66,16 +77,63 @@ class ArmScenarioRequest(BaseModel):
     scenario: Literal[
         "reply",
         "slow-stream",
+        "slow-nonstream",
         "error-once",
         "tool-call",
         "numbered-stream",
         "search-job",
         "fetch-job",
         "worker-job",
+        "retained-sentinel-worker",
         "prepared-workspace-job",
+        "delegation-batch",
     ] = "reply"
     required_responses: int = Field(default=1, ge=1, le=100)
     chunk_delay_ms: int = Field(default=100, ge=0, le=2_000)
+    nonstream_delay_ms: int | None = Field(default=None, ge=15_000, le=30_000)
+    sentinel_sha256: str | None = Field(default=None, pattern=r"^[a-f0-9]{64}$")
+
+    @model_validator(mode="after")
+    def require_explicit_nonstream_delay(self) -> "ArmScenarioRequest":
+        if (self.scenario == "slow-nonstream") != (self.nonstream_delay_ms is not None):
+            raise ValueError("slow-nonstream requires an exclusive bounded delay")
+        if self.scenario == "slow-nonstream" and self.required_responses != 1:
+            raise ValueError("slow-nonstream requires exactly one response")
+        return self
+
+
+class ArmProbeWindowRequest(BaseModel):
+    """Expect a bounded number of startup dimension probes from one operation."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    expected_probes: int = Field(ge=1, le=32)
+
+
+class AdvanceScenarioRequest(ArmScenarioRequest):
+    """Add a phase without resetting the correlation, history or budgets."""
+
+    expected_cancelled: int = Field(default=0, ge=0, le=100)
+
+
+class CloseScenarioRequest(BaseModel):
+    """Confirm attributed cancellations while preserving the exact run life."""
+
+    model_config = ConfigDict(extra="forbid")
+    expected_cancelled: int = Field(default=0, ge=0, le=100)
+
+
+@dataclass
+class ProbeWindow:
+    """One operation's startup-probe budget; never erased once armed."""
+
+    window_id: str
+    expected_probes: int
+    armed_at: str
+    consumed_probes: int = 0
+    excess_probes: int = 0
+    closed: bool = False
+    calls: list[dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -97,6 +155,7 @@ class ToolCallSpec:
 
     name: str
     arguments: str
+    following: tuple[ToolCallSpec, ...] = ()
 
 
 @dataclass
@@ -111,12 +170,15 @@ class RunState:
     scenario: str
     required_responses: int
     chunk_delay_ms: int
+    nonstream_delay_ms: int | None = None
     consumed_required_responses: int = 0
     unexpected_calls: int = 0
     error_once_emitted: bool = False
     search_job_tool_steps: int = 0
     fetch_job_tool_steps: int = 0
     worker_job_tool_steps: int = 0
+    sentinel_sha256: str | None = None
+    completion_release: asyncio.Event = field(default_factory=asyncio.Event, repr=False)
     next_sequence: int = 1
     counters: Counter[tuple[str, str, bool, str]] = field(default_factory=Counter)
     calls: list[dict[str, Any]] = field(default_factory=list)
@@ -156,12 +218,132 @@ class ScenarioStore:
     def __init__(self) -> None:
         self._lock = asyncio.Lock()
         self._runs: dict[str, RunState] = {}
+        self._closed_runs: dict[str, dict[str, Any]] = {}
         self._unscoped_unexpected_calls = 0
         self._unscoped_calls: list[dict[str, Any]] = []
+        self._probe_windows: dict[str, ProbeWindow] = {}
+        self._active_probe_window: str | None = None
+
+    async def arm_probe_window(
+        self, window_id: str, request: ArmProbeWindowRequest
+    ) -> dict[str, Any]:
+        """Open the only active window; windows are serial and never reused."""
+
+        _validate_run_id(window_id)
+        async with self._lock:
+            if window_id in self._probe_windows:
+                raise ScenarioError(
+                    409,
+                    "probe_window_exists",
+                    "This probe window id was already used.",
+                )
+            if self._active_probe_window is not None:
+                raise ScenarioError(
+                    409,
+                    "probe_window_active",
+                    "Another probe window is still open; close it first.",
+                )
+            if len(self._probe_windows) >= _MAX_PROBE_WINDOWS:
+                raise ScenarioError(
+                    409, "probe_window_limit", "Too many probe windows were armed."
+                )
+            window = ProbeWindow(
+                window_id=window_id,
+                expected_probes=request.expected_probes,
+                armed_at=_observed_at(),
+            )
+            self._probe_windows[window_id] = window
+            self._active_probe_window = window_id
+            return self._serialize_window(window)
+
+    async def probe_window_state(self, window_id: str) -> dict[str, Any]:
+        _validate_run_id(window_id)
+        async with self._lock:
+            window = self._probe_windows.get(window_id)
+            if window is None:
+                raise ScenarioError(
+                    404, "probe_window_not_found", "No such probe window."
+                )
+            return self._serialize_window(window)
+
+    async def close_probe_window(self, window_id: str) -> dict[str, Any]:
+        """Stop absorbing probes; the record (and any failure) is retained."""
+
+        _validate_run_id(window_id)
+        async with self._lock:
+            window = self._probe_windows.get(window_id)
+            if window is None:
+                raise ScenarioError(
+                    404, "probe_window_not_found", "No such probe window."
+                )
+            window.closed = True
+            if self._active_probe_window == window_id:
+                self._active_probe_window = None
+            return self._serialize_window(window)
+
+    async def absorb_startup_probe(self, payload: dict[str, Any]) -> bool | None:
+        """Account an exact startup probe against the open window.
+
+        ``True``: consumed within budget. ``False``: an excess probe, recorded
+        as a failure on the window. ``None``: not a windowed probe — the
+        ordinary run-correlation rules (and their failures) apply unchanged.
+        """
+
+        if not _is_startup_probe(payload):
+            return None
+        async with self._lock:
+            window_id = self._active_probe_window
+            if window_id is None:
+                return None
+            window = self._probe_windows[window_id]
+            within_budget = window.consumed_probes < window.expected_probes
+            if within_budget:
+                window.consumed_probes += 1
+            else:
+                window.excess_probes += 1
+            window.calls.append(
+                {
+                    "window_id": window_id,
+                    "sequence": len(window.calls) + 1,
+                    "observed_at": _observed_at(),
+                    "endpoint": "embeddings",
+                    "model": EMBEDDING_MODEL_ID,
+                    "outcome": "success"
+                    if within_budget
+                    else "unexpected_excess_probe",
+                }
+            )
+            return within_budget
+
+    @staticmethod
+    def _serialize_window(window: ProbeWindow) -> dict[str, Any]:
+        return {
+            "window_id": window.window_id,
+            "expected_probes": window.expected_probes,
+            "consumed_probes": window.consumed_probes,
+            "excess_probes": window.excess_probes,
+            "armed_at": window.armed_at,
+            "closed": window.closed,
+            "settled": window.consumed_probes == window.expected_probes
+            and window.excess_probes == 0,
+            "calls": list(window.calls),
+        }
 
     async def arm(self, run_id: str, request: ArmScenarioRequest) -> dict[str, Any]:
         _validate_run_id(run_id)
+        if (request.scenario == "retained-sentinel-worker") != (
+            request.sentinel_sha256 is not None
+        ):
+            raise ScenarioError(
+                422,
+                "sentinel_contract_invalid",
+                "Sentinel hash is required only for retained worker scenario.",
+            )
         async with self._lock:
+            if run_id in self._closed_runs:
+                raise ScenarioError(
+                    409, "scenario_closed", "This run life was already closed."
+                )
             if run_id in self._runs:
                 raise ScenarioError(
                     409,
@@ -173,21 +355,168 @@ class ScenarioStore:
                 scenario=request.scenario,
                 required_responses=request.required_responses,
                 chunk_delay_ms=request.chunk_delay_ms,
+                nonstream_delay_ms=request.nonstream_delay_ms,
+                sentinel_sha256=request.sentinel_sha256,
             )
             return self._serialize(self._runs[run_id])
 
     async def reset(self, run_id: str) -> bool:
         _validate_run_id(run_id)
         async with self._lock:
-            return self._runs.pop(run_id, None) is not None
+            if run_id in self._closed_runs:
+                raise ScenarioError(
+                    409, "scenario_closed", "Closed accounting cannot be reset."
+                )
+            state = self._runs.pop(run_id, None)
+            if state is not None:
+                state.completion_release.set()
+            return state is not None
+
+    async def close(self, run_id: str, request: CloseScenarioRequest) -> dict[str, Any]:
+        """Archive settled accounting atomically; never erase or reuse its ID."""
+
+        _validate_run_id(run_id)
+        async with self._lock:
+            closed = self._closed_runs.get(run_id)
+            if closed is not None:
+                if closed["expected_cancelled"] != request.expected_cancelled:
+                    raise ScenarioError(
+                        409,
+                        "close_accounting_changed",
+                        "Close cancellation accounting changed.",
+                    )
+                return copy.deepcopy(closed)
+            state = self._runs.get(run_id)
+            if state is None:
+                raise ScenarioError(404, "scenario_not_found", "No scenario is armed.")
+            cancelled = sum(
+                n
+                for (_, _, _, outcome), n in state.counters.items()
+                if outcome == "cancelled"
+            )
+            cancelled_required = sum(
+                call["outcome"] == "cancelled" and call.get("consume_required") is True
+                for call in state.calls
+            )
+            observed = Counter(
+                (call["model"], call["endpoint"], call["stream"], call["outcome"])
+                for call in state.calls
+            )
+            sequences = [call["sequence"] for call in state.calls]
+            if (
+                state.pending
+                or state.remaining_required_responses > cancelled_required
+                or state.unexpected_calls != request.expected_cancelled
+                or cancelled != request.expected_cancelled
+                or observed != state.counters
+                or sorted(sequences) != list(range(1, state.next_sequence))
+            ):
+                raise ScenarioError(
+                    409,
+                    "close_unsettled",
+                    "The run has unfinished or unaccounted work.",
+                )
+            closed = copy.deepcopy(self._serialize(state))
+            closed.update(
+                closed=True,
+                closed_at=_observed_at(),
+                expected_cancelled=request.expected_cancelled,
+            )
+            self._closed_runs[run_id] = closed
+            del self._runs[run_id]
+            return copy.deepcopy(closed)
+
+    async def advance(
+        self, run_id: str, request: AdvanceScenarioRequest
+    ) -> dict[str, Any]:
+        _validate_run_id(run_id)
+        if (
+            request.sentinel_sha256 is not None
+            or request.scenario == "retained-sentinel-worker"
+        ):
+            raise ScenarioError(
+                422, "advance_unsupported", "Retained worker phases cannot be advanced."
+            )
+        async with self._lock:
+            state = self._runs.get(run_id)
+            if state is None:
+                raise ScenarioError(404, "scenario_not_found", "No scenario is armed.")
+            cancelled = sum(
+                n
+                for (_, _, _, outcome), n in state.counters.items()
+                if outcome == "cancelled"
+            )
+            if (
+                state.pending
+                or state.remaining_required_responses > request.expected_cancelled
+                or state.unexpected_calls != request.expected_cancelled
+                or cancelled != request.expected_cancelled
+            ):
+                raise ScenarioError(
+                    409,
+                    "phase_unsettled",
+                    "The preceding phase has unfinished or unaccounted work.",
+                )
+            if state.required_responses + request.required_responses > 100:
+                raise ScenarioError(
+                    422,
+                    "phase_budget_exceeded",
+                    "Cumulative required responses exceed the run bound.",
+                )
+            state.scenario = request.scenario
+            state.required_responses += request.required_responses
+            state.chunk_delay_ms = request.chunk_delay_ms
+            return self._serialize(state)
 
     async def state(self, run_id: str) -> dict[str, Any]:
         _validate_run_id(run_id)
         async with self._lock:
             state = self._runs.get(run_id)
             if state is None:
+                if run_id in self._closed_runs:
+                    return copy.deepcopy(self._closed_runs[run_id])
                 raise ScenarioError(404, "scenario_not_found", "No scenario is armed.")
             return self._serialize(state)
+
+    async def release_retained_completion(self, run_id: str) -> dict[str, Any]:
+        """Release only a validated sentinel run before its terminal tool."""
+        _validate_run_id(run_id)
+        async with self._lock:
+            state = self._runs.get(run_id)
+            if state is None:
+                raise ScenarioError(404, "scenario_not_found", "No scenario is armed.")
+            if (
+                state.scenario != "retained-sentinel-worker"
+                or not 8 <= state.worker_job_tool_steps <= 10
+                or state.unexpected_calls != 0
+                or state.completion_release.is_set()
+            ):
+                raise ScenarioError(
+                    409,
+                    "completion_proof_missing",
+                    "Retained completion is not releasable.",
+                )
+            state.completion_release.set()
+            return self._serialize(state)
+
+    async def wait_retained_completion_release(self, run_id: str) -> None:
+        _validate_run_id(run_id)
+        async with self._lock:
+            state = self._runs.get(run_id)
+            if state is None or state.scenario != "retained-sentinel-worker":
+                raise ScenarioError(409, "scenario_changed", "Retained run changed.")
+            event = state.completion_release
+        try:
+            await asyncio.wait_for(event.wait(), timeout=90)
+        except asyncio.TimeoutError:
+            raise ScenarioError(
+                409,
+                "completion_barrier_timeout",
+                "Retained completion was not released.",
+            ) from None
+        async with self._lock:
+            if self._runs.get(run_id) is not state:
+                raise ScenarioError(409, "scenario_changed", "Retained run changed.")
 
     async def overview(self) -> dict[str, Any]:
         async with self._lock:
@@ -195,12 +524,21 @@ class ScenarioStore:
                 "runs": [
                     self._serialize(self._runs[key]) for key in sorted(self._runs)
                 ],
+                "closed_runs": [
+                    copy.deepcopy(self._closed_runs[key])
+                    for key in sorted(self._closed_runs)
+                ],
                 "unscoped_unexpected_calls": self._unscoped_unexpected_calls,
                 "unscoped_calls_truncated": max(
                     0,
                     self._unscoped_unexpected_calls - len(self._unscoped_calls),
                 ),
                 "unscoped_calls": list(self._unscoped_calls),
+                "active_probe_window": self._active_probe_window,
+                "probe_windows": [
+                    self._serialize_window(window)
+                    for window in self._probe_windows.values()
+                ],
             }
 
     def _record_unscoped_locked(
@@ -219,9 +557,7 @@ class ScenarioStore:
         diagnostic = {
             "sequence": sequence,
             "correlation_id": f"unscoped:{sequence}",
-            "observed_at": datetime.now(timezone.utc)
-            .isoformat(timespec="milliseconds")
-            .replace("+00:00", "Z"),
+            "observed_at": _observed_at(),
             "endpoint": endpoint,
             "model": _diagnostic_model(model),
             "stream": stream if isinstance(stream, bool) else False,
@@ -510,7 +846,8 @@ class ScenarioStore:
                 state.fetch_job_tool_steps += 1
             if (
                 outcome == "success"
-                and decision.scenario in {"worker-job", "prepared-workspace-job"}
+                and decision.scenario
+                in {"worker-job", "prepared-workspace-job", "retained-sentinel-worker"}
                 and decision.tool_phase
             ):
                 state.worker_job_tool_steps += 1
@@ -529,6 +866,7 @@ class ScenarioStore:
                     "endpoint": decision.endpoint,
                     "stream": decision.stream,
                     "outcome": outcome,
+                    "consume_required": decision.consume_required,
                     "duration_ms": duration_ms,
                 }
             )
@@ -557,6 +895,7 @@ class ScenarioStore:
                 "endpoint": endpoint,
                 "stream": stream,
                 "outcome": outcome,
+                "consume_required": False,
                 "duration_ms": 0,
             }
         )
@@ -576,7 +915,7 @@ class ScenarioStore:
                 state.counters.items(), key=lambda item: item[0]
             )
         ]
-        return {
+        result = {
             "run_id": state.run_id,
             "scenario": state.scenario,
             "required_responses": state.required_responses,
@@ -586,11 +925,16 @@ class ScenarioStore:
             "search_job_tool_steps": state.search_job_tool_steps,
             "fetch_job_tool_steps": state.fetch_job_tool_steps,
             "worker_job_tool_steps": state.worker_job_tool_steps,
+            "sentinel_sha256": state.sentinel_sha256,
+            "completion_released": state.completion_release.is_set(),
             "unexpected_count": state.unexpected_calls,
             "pending_calls": len(state.pending),
             "counters": counters,
             "calls": list(state.calls),
         }
+        if state.scenario == "slow-nonstream":
+            result["nonstream_delay_ms"] = state.nonstream_delay_ms
+        return result
 
 
 def create_inference_app(
@@ -706,6 +1050,14 @@ def create_inference_app(
                 )
 
             state = await store.state(run_id)
+            if (
+                state["scenario"] == "retained-sentinel-worker"
+                and state["worker_job_tool_steps"] >= 10
+            ):
+                # The worker's next reply would be job_complete. Hold it
+                # until the host proves the real claimant and pinned file.
+                await store.wait_retained_completion_release(run_id)
+                state = await store.state(run_id)
             tool_call: ToolCallSpec | None = None
             if structured_name is None and state["scenario"] == "tool-call":
                 has_tool_result = any(
@@ -716,6 +1068,66 @@ def create_inference_app(
                     tool_call = ToolCallSpec(
                         name=_first_tool_name(payload) or "e2e_tool",
                         arguments="{}",
+                    )
+            elif structured_name is None and state["scenario"] == "delegation-batch":
+                tool_names = _tool_names(payload)
+                has_tool_result = any(
+                    isinstance(m, dict) and m.get("role") == "tool" for m in messages
+                )
+                has_delegated = any(
+                    isinstance(m, dict)
+                    and any(
+                        isinstance(call, dict)
+                        and (call.get("function") or {}).get("name") == "delegate_agent"
+                        for call in m.get("tool_calls", [])
+                    )
+                    for m in messages
+                )
+                if (
+                    "delegate_agent" in tool_names
+                    and not has_tool_result
+                    and tool_names & {"shell_execute", "run_command"}
+                ):
+                    name = (
+                        "shell_execute"
+                        if "shell_execute" in tool_names
+                        else "run_command"
+                    )
+                    tool_call = ToolCallSpec(
+                        name,
+                        json.dumps(
+                            {"command": "printf 'R33C_SHELL_READY\\n'", "timeout": 10}
+                        ),
+                    )
+                elif not has_delegated and "delegate_agent" in tool_names:
+                    calls = tuple(
+                        ToolCallSpec(
+                            name="delegate_agent",
+                            arguments=json.dumps(
+                                {
+                                    "description": f"Lifecycle probe {index}",
+                                    "subagent_type": "probe",
+                                    "prompt": f"E2E-{run_id} lifecycle child {index}: run sleep 300 with timeout 390, then report.",
+                                    "run_in_background": False,
+                                }
+                            ),
+                        )
+                        for index in (1, 2)
+                    )
+                    tool_call = ToolCallSpec(
+                        calls[0].name, calls[0].arguments, following=calls[1:]
+                    )
+                elif not has_tool_result and tool_names & {
+                    "shell_execute",
+                    "run_command",
+                }:
+                    name = (
+                        "shell_execute"
+                        if "shell_execute" in tool_names
+                        else "run_command"
+                    )
+                    tool_call = ToolCallSpec(
+                        name, json.dumps({"command": "sleep 300", "timeout": 390})
                     )
             elif structured_name is None and state["scenario"] == "search-job":
                 tool_names = _tool_names(payload)
@@ -745,6 +1157,7 @@ def create_inference_app(
                     )
             elif structured_name is None and state["scenario"] in {
                 "worker-job",
+                "retained-sentinel-worker",
                 "prepared-workspace-job",
             }:
                 tool_names = _tool_names(payload)
@@ -753,10 +1166,18 @@ def create_inference_app(
                     "todo_complete",
                     "next_phase_todos",
                     "job_complete",
+                    "run_command",
                 }:
                     if state["scenario"] == "prepared-workspace-job":
                         tool_call = _prepared_workspace_tool_call(
                             state["worker_job_tool_steps"], run_id, messages
+                        )
+                    elif state["scenario"] == "retained-sentinel-worker":
+                        tool_call = _retained_sentinel_tool_call(
+                            state["worker_job_tool_steps"],
+                            run_id,
+                            state["sentinel_sha256"],
+                            messages,
                         )
                     else:
                         tool_call = _worker_job_tool_call(
@@ -806,6 +1227,20 @@ def create_inference_app(
 
             tool_phase = tool_call is not None
             consume_required = structured_name is None and not tool_phase
+            if state["scenario"] == "slow-nonstream" and consume_required and stream:
+                await _account_rejection(
+                    store,
+                    run_id=run_id,
+                    endpoint="chat.completions",
+                    model=model,
+                    stream=stream,
+                    outcome="unexpected_stream_mode",
+                )
+                raise ScenarioError(
+                    422,
+                    "stream_not_supported",
+                    "The slow-nonstream ordinary reply requires stream=false.",
+                )
             decision = await store.begin_call(
                 run_id=run_id,
                 endpoint="chat.completions",
@@ -842,14 +1277,29 @@ def create_inference_app(
                     },
                 )
 
-            response = _non_stream_completion(
-                decision=decision,
-                content=content,
-                finish_reason=finish_reason,
-                tool_call=tool_call,
-            )
-            await store.finish_call(decision, "success")
-            return response
+            try:
+                if decision.scenario == "slow-nonstream" and decision.consume_required:
+                    if not await _wait_nonstream_delay(
+                        request, state["nonstream_delay_ms"]
+                    ):
+                        await store.finish_call(decision, "cancelled")
+                        return _error_response(
+                            499, "client_disconnected", "Client disconnected."
+                        )
+                response = _non_stream_completion(
+                    decision=decision,
+                    content=content,
+                    finish_reason=finish_reason,
+                    tool_call=tool_call,
+                )
+                await store.finish_call(decision, "success")
+                return response
+            except asyncio.CancelledError:
+                await asyncio.shield(store.finish_call(decision, "cancelled"))
+                raise
+            except Exception:
+                await store.finish_call(decision, "fixture_error")
+                raise
         except ScenarioError as exc:
             return _scenario_error_response(exc)
 
@@ -859,6 +1309,26 @@ def create_inference_app(
             payload = await _accounted_json_object(
                 request, store=store, endpoint="embeddings"
             )
+            probe = await store.absorb_startup_probe(payload)
+            if probe is False:
+                raise ScenarioError(
+                    409,
+                    "probe_window_exhausted",
+                    "The open probe window already received every expected probe.",
+                )
+            if probe is True:
+                return {
+                    "object": "list",
+                    "data": [
+                        {
+                            "object": "embedding",
+                            "embedding": _stable_embedding(STARTUP_PROBE_INPUT),
+                            "index": 0,
+                        }
+                    ],
+                    "model": EMBEDDING_MODEL_ID,
+                    "usage": {"prompt_tokens": 0, "total_tokens": 0},
+                }
             run_id = await store.resolve_run(payload, endpoint="embeddings")
             try:
                 model = _required_string(payload, "model")
@@ -987,6 +1457,20 @@ def create_control_app(store: ScenarioStore, *, control_token: str) -> FastAPI:
         except ScenarioError as exc:
             return _scenario_error_response(exc)
 
+    @app.post("/control/scenarios/{run_id}/advance")
+    async def advance(run_id: str, advance_request: AdvanceScenarioRequest):
+        try:
+            return await store.advance(run_id, advance_request)
+        except ScenarioError as exc:
+            return _scenario_error_response(exc)
+
+    @app.post("/control/scenarios/{run_id}/release-completion")
+    async def release_completion(run_id: str):
+        try:
+            return await store.release_retained_completion(run_id)
+        except ScenarioError as exc:
+            return _scenario_error_response(exc)
+
     @app.delete("/control/scenarios/{run_id}")
     async def reset(run_id: str):
         try:
@@ -996,6 +1480,34 @@ def create_control_app(store: ScenarioStore, *, control_token: str) -> FastAPI:
         if not removed:
             return _error_response(404, "scenario_not_found", "No scenario is armed.")
         return {"run_id": run_id, "reset": True}
+
+    @app.post("/control/scenarios/{run_id}/close")
+    async def close(run_id: str, close_request: CloseScenarioRequest):
+        try:
+            return await store.close(run_id, close_request)
+        except ScenarioError as exc:
+            return _scenario_error_response(exc)
+
+    @app.post("/control/probe-windows/{window_id}/arm", status_code=201)
+    async def arm_probe_window(window_id: str, arm_request: ArmProbeWindowRequest):
+        try:
+            return await store.arm_probe_window(window_id, arm_request)
+        except ScenarioError as exc:
+            return _scenario_error_response(exc)
+
+    @app.get("/control/probe-windows/{window_id}")
+    async def probe_window_state(window_id: str):
+        try:
+            return await store.probe_window_state(window_id)
+        except ScenarioError as exc:
+            return _scenario_error_response(exc)
+
+    @app.delete("/control/probe-windows/{window_id}")
+    async def close_probe_window(window_id: str):
+        try:
+            return await store.close_probe_window(window_id)
+        except ScenarioError as exc:
+            return _scenario_error_response(exc)
 
     return app
 
@@ -1084,6 +1596,26 @@ def _required_string(payload: dict[str, Any], key: str) -> str:
     return value
 
 
+def _observed_at() -> str:
+    return (
+        datetime.now(timezone.utc)
+        .isoformat(timespec="milliseconds")
+        .replace("+00:00", "Z")
+    )
+
+
+def _is_startup_probe(payload: dict[str, Any]) -> bool:
+    """The exact uncorrelated request ``verify_dimensions()`` makes."""
+
+    raw_input = payload.get("input")
+    return bool(
+        set(payload) <= _STARTUP_PROBE_KEYS
+        and payload.get("model") == EMBEDDING_MODEL_ID
+        and (raw_input == STARTUP_PROBE_INPUT or raw_input == [STARTUP_PROBE_INPUT])
+        and payload.get("encoding_format", "float") in _STARTUP_PROBE_FORMATS
+    )
+
+
 def _validate_run_id(run_id: str) -> None:
     if not _RUN_ID_RE.fullmatch(run_id):
         raise ScenarioError(
@@ -1140,17 +1672,32 @@ _MODELLED_SCHEMAS: Final = frozenset(
         "ConversationTitle",
         "ExtractedMemories",
         "AssemblyResult",
-        "ConversationSummary",
+        "ConversationCheckpoint",
         "CurationResult",
         "KnowledgeAssemblyResult",
     }
 )
 
 
+def _is_checkpoint_request(payload: dict[str, Any]) -> bool:
+    """Context compaction (``SummarizeTask``, text mode): a transcript in
+    ``<conversation>`` tags followed by the closing checkpoint instruction."""
+    messages = payload.get("messages")
+    last = messages[-1] if isinstance(messages, list) and messages else None
+    content = last.get("content") if isinstance(last, dict) else None
+    return (
+        isinstance(content, str)
+        and "<conversation>" in content
+        and "Write the checkpoint now" in content
+    )
+
+
 def _structured_output_name(payload: dict[str, Any]) -> str | None:
     response_format = payload.get("response_format")
     if not isinstance(response_format, dict):
-        return None
+        # Compaction asks for Markdown, not JSON, but it is still an
+        # auxiliary answer this fixture models, never a scenario reply.
+        return "ConversationCheckpoint" if _is_checkpoint_request(payload) else None
     response_type = response_format.get("type")
     if response_type not in {"json_schema", "json_object"}:
         return None
@@ -1198,27 +1745,17 @@ def _structured_content(schema_name: str, run_id: str) -> str:
             },
             separators=(",", ":"),
         )
-    if schema_name == "ConversationSummary":
+    if schema_name == "ConversationCheckpoint":
         # Context compaction (`SummarizeTask`) folds a long worker conversation
-        # through this schema. A loop member that runs long enough to compact
-        # asked for it and got a 422, which the agent retried three times and
-        # then degraded to trimming — real behaviour change, and two
-        # `unexpected_schema` rejections that hide a genuine unexpected call.
-        # The deterministic answer is a valid, content-free summary.
-        return json.dumps(
-            {
-                "summary": f"E2E-{run_id} deterministic conversation summary.",
-                "tasks_completed": "",
-                "tasks_in_progress": "",
-                "key_decisions": "",
-                "current_state": "",
-                "blockers": "",
-                "critical_facts": "",
-                "state_changes": "",
-                "pinned_instructions": "",
-                "identity_anchor": "",
-            },
-            separators=(",", ":"),
+        # into a Markdown checkpoint. Answering it with a scenario reply would
+        # consume the scenario's script and fail the agent's section check,
+        # which retries three times and then keeps the history uncompacted.
+        # The deterministic answer is a valid, content-free checkpoint.
+        return (
+            "## Objective\n"
+            f"- E2E-{run_id} deterministic conversation summary.\n\n"
+            "## Work State\n"
+            "### Completed\n- (none)\n### Active\n- (none)\n### Blocked\n- (none)"
         )
     if schema_name == "CurationResult":
         return json.dumps(
@@ -1308,23 +1845,10 @@ async def _stream_completion(
                             "index": 0,
                             "delta": {
                                 "tool_calls": [
-                                    {
-                                        "index": 0,
-                                        "id": f"call_{decision.sequence}",
-                                        "type": "function",
-                                        "function": {
-                                            "name": (
-                                                tool_call.name
-                                                if tool_call is not None
-                                                else "e2e_tool"
-                                            ),
-                                            "arguments": (
-                                                tool_call.arguments
-                                                if tool_call is not None
-                                                else "{}"
-                                            ),
-                                        },
-                                    }
+                                    dict(index=i, **call)
+                                    for i, call in enumerate(
+                                        _wire_tool_calls(decision, tool_call)
+                                    )
                                 ]
                             },
                             "finish_reason": None,
@@ -1373,6 +1897,23 @@ async def _stream_completion(
         await store.finish_call(decision, "success")
 
 
+async def _wait_nonstream_delay(request: Request, delay_ms: int) -> bool:
+    """Bound one nonstream response on the ASGI disconnect channel.
+
+    The body is already read. Starlette exposes the underlying receive channel;
+    a disconnected client produces ``http.disconnect``. A deadline ends the
+    wait even when the client remains connected and sends no further events.
+    """
+    try:
+        async with asyncio.timeout(delay_ms / 1_000):
+            while True:
+                message = await request.receive()
+                if message.get("type") == "http.disconnect":
+                    return False
+    except TimeoutError:
+        return True
+
+
 def _non_stream_completion(
     *,
     decision: CallDecision,
@@ -1383,18 +1924,7 @@ def _non_stream_completion(
     message: dict[str, Any] = {"role": "assistant", "content": content}
     if decision.tool_phase:
         message["content"] = None
-        message["tool_calls"] = [
-            {
-                "id": f"call_{decision.sequence}",
-                "type": "function",
-                "function": {
-                    "name": tool_call.name if tool_call is not None else "e2e_tool",
-                    "arguments": (
-                        tool_call.arguments if tool_call is not None else "{}"
-                    ),
-                },
-            }
-        ]
+        message["tool_calls"] = _wire_tool_calls(decision, tool_call)
     return {
         "id": _response_id("chatcmpl"),
         "object": "chat.completion",
@@ -1409,6 +1939,24 @@ def _non_stream_completion(
         ],
         "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
     }
+
+
+def _wire_tool_calls(
+    decision: CallDecision, tool_call: ToolCallSpec | None
+) -> list[dict[str, Any]]:
+    calls = (
+        (tool_call, *tool_call.following)
+        if tool_call is not None
+        else (ToolCallSpec("e2e_tool", "{}"),)
+    )
+    return [
+        {
+            "id": f"call_{decision.sequence}" + (f"_{index}" if index else ""),
+            "type": "function",
+            "function": {"name": call.name, "arguments": call.arguments},
+        }
+        for index, call in enumerate(calls)
+    ]
 
 
 def _first_tool_name(payload: dict[str, Any]) -> str | None:
@@ -1582,6 +2130,51 @@ def _prepared_workspace_tool_call(
                 422,
                 "workspace_proof_missing",
                 "Prepared workspace execution did not return the required proof.",
+            )
+    return _worker_job_tool_call(step if step < 6 else step - 1, run_id)
+
+
+def _retained_sentinel_tool_call(
+    step: int, run_id: str, digest: str, messages: list[dict[str, Any]]
+) -> ToolCallSpec:
+    """Read the exact run-owned file in the real worker before completion."""
+    if step == 6:
+        path = f".srw-a1-gate/{run_id}/sentinel"
+        command = "\n".join(
+            (
+                "set -eu",
+                f"test -f {shlex.quote(path)}",
+                f"actual=$(sha256sum {shlex.quote(path)})",
+                f'test "${{actual%% *}}" = {shlex.quote(digest)}',
+                f"printf '%s\\n' {shlex.quote('SRW_A1_SENTINEL_PASS:' + run_id)}",
+            )
+        )
+        return ToolCallSpec(
+            name="run_command",
+            arguments=json.dumps(
+                {"command": command, "working_dir": ".", "timeout": 30},
+                separators=(",", ":"),
+            ),
+        )
+    if step == 7:
+        previous = next(
+            (
+                message
+                for message in reversed(messages)
+                if isinstance(message, dict) and message.get("role") == "tool"
+            ),
+            {},
+        )
+        output = previous.get("content")
+        if (
+            not isinstance(output, str)
+            or "Exit code: 0" not in output.splitlines()
+            or f"SRW_A1_SENTINEL_PASS:{run_id}" not in output.splitlines()
+        ):
+            raise ScenarioError(
+                422,
+                "workspace_proof_missing",
+                "Retained sentinel command did not return the required proof.",
             )
     return _worker_job_tool_call(step if step < 6 else step - 1, run_id)
 

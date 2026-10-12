@@ -10,6 +10,7 @@ process-wide lookup.
 from __future__ import annotations
 
 import contextlib
+import json
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
@@ -33,6 +34,7 @@ USER = {"id": "55555555-5555-4555-8555-555555555555", "is_admin": False}
 def _thread(**over: Any) -> dict[str, Any]:
     row = {
         "id": THREAD,
+        "user_id": USER["id"],
         "execution_lane": "pinned",
         "status": "created",
         "metadata": {},
@@ -71,14 +73,21 @@ def _admission_deps(**over: Any) -> ta.ThreadAdmissionDependencies:
         get_officer_thread_for_project=AsyncMock(return_value=None),
         register_project_officer_thread=AsyncMock(return_value={}),
         decommission_project_officer=AsyncMock(),
-        replace_thread_mounts=AsyncMock(),
         list_thread_mounts=AsyncMock(return_value=[]),
-        list_thread_mounts_bulk=AsyncMock(return_value={}),
         list_threads=AsyncMock(return_value=[]),
+        container_workspace_creation_views=AsyncMock(return_value={}),
         merge_thread_workspace_context=AsyncMock(),
         bind_thread_managed_repository=AsyncMock(return_value=True),
         update_thread_main_cloud=AsyncMock(),
         thread_advisory_lock=_lock(),
+        # The policy reads behind an omitted connector list (the session's
+        # own connectors): an approved member with none.
+        get_user=AsyncMock(return_value={"id": "u", "is_approved": True}),
+        user_is_member_of_projects=AsyncMock(return_value=True),
+        list_default_datasource_candidates=AsyncMock(return_value=[]),
+        # The selection's connectors with access levels (main cloud slice 5).
+        resolve_datasources_for_thread=AsyncMock(return_value=[]),
+        get_user_project_roles=AsyncMock(return_value={}),
     )
     for key, value in store_over.items():
         setattr(store, key, value)
@@ -107,8 +116,6 @@ def _admission_deps(**over: Any) -> ta.ThreadAdmissionDependencies:
         resolve_session_account_defaults=AsyncMock(return_value={}),
         prefetch_roster_refs=AsyncMock(return_value=None),
         resolve_thread_execution_lane=MagicMock(return_value="pinned"),
-        build_thread_mount_rows=AsyncMock(return_value=[]),
-        should_skip_session_folder=MagicMock(return_value=False),
         enforce_session_create_grants=AsyncMock(),
         check_vm_permission=AsyncMock(),
         resolve_cloud_session_url=MagicMock(return_value=None),
@@ -127,6 +134,8 @@ def _admission_deps(**over: Any) -> ta.ThreadAdmissionDependencies:
         send_session_attach=AsyncMock(return_value=True),
         provision_or_assign=AsyncMock(),
         redact_thread_metadata=MagicMock(side_effect=lambda t: t),
+        bundled_expert_exists=MagicMock(return_value=True),
+        srw_image=MagicMock(return_value="installed:1"),
     )
     fields.update(over)
     return ta.ThreadAdmissionDependencies(**fields)
@@ -145,6 +154,7 @@ def _config_deps(**over: Any) -> tcu.ThreadConfigUpdateDependencies:
             return_value={"delivery_override": {"llm": {"api_key": "sk-live"}}}
         ),
         merge_thread_vm_context=AsyncMock(),
+        get_user=AsyncMock(return_value=USER),
     )
     for key, value in store_over.items():
         setattr(store, key, value)
@@ -162,17 +172,37 @@ def _config_deps(**over: Any) -> tcu.ThreadConfigUpdateDependencies:
             in_cluster=True,
             create_pinned_thread_workspace=AsyncMock(return_value=True),
         ),
-        apply_thread_config_update_locked=AsyncMock(
-            return_value=({"llm": {"model": "m"}}, ["d1"])
-        ),
         enforce_workspace_upgrade_grants=AsyncMock(),
         require_internal=AsyncMock(),
         require_thread_owner=AsyncMock(return_value=(USER, _thread())),
+        thread_project_ids=AsyncMock(return_value=[]),
+        authorize_thread_datasource_selection=AsyncMock(return_value=([], {})),
+        build_datasource_tool_override=MagicMock(return_value={}),
+        datasource_selection_provenance=AsyncMock(return_value={}),
+        enforce_session_create_grants=AsyncMock(),
+        inject_model_credentials=AsyncMock(),
+        log_security_event=AsyncMock(),
     )
     fields.update(over)
     return tcu.ThreadConfigUpdateDependencies(
         recovery_store=SimpleNamespace(), **fields
     )
+
+
+@pytest.fixture(autouse=True)
+def shipped_chart(monkeypatch) -> None:
+    """Upgrades resolve the shipped chain: no built-ins declared."""
+    monkeypatch.delenv("WORKSPACE_DEFAULTS", raising=False)
+    monkeypatch.delenv("WORKSPACE_BUILTIN_TEMPLATES", raising=False)
+
+
+@pytest.fixture(autouse=True)
+def locked_commit_core(monkeypatch) -> AsyncMock:
+    """The commit core is characterized in test_b12_thread_config_update_policy;
+    here it is stubbed at its owner so these tests pin only the wire."""
+    core = AsyncMock(return_value=({"llm": {"model": "m"}}, ["d1"]))
+    monkeypatch.setattr(tcu, "apply_thread_config_update_locked", core)
+    return core
 
 
 def _client(admission=None, config=None) -> TestClient:
@@ -190,6 +220,8 @@ def _client(admission=None, config=None) -> TestClient:
 
 class TestRouteInventory:
     def test_the_seven_declarations_keep_their_identity(self):
+        """Pins the declarations' identity. The eighth, the GET
+        upgrade-availability route (added 2026-10-07), is pinned here too."""
         app = FastAPI()
         app.include_router(admission_routes.router)
         app.include_router(config_routes.router)
@@ -231,6 +263,11 @@ class TestRouteInventory:
                 "/api/agents/threads/{thread_id}/upgrade-to-workspace",
                 "POST",
                 "agent_upgrade_thread_to_workspace",
+            ),
+            (
+                "/api/agents/threads/{thread_id}/upgrade-availability",
+                "GET",
+                "agent_thread_upgrade_availability",
             ),
         }
         for route in moved:
@@ -276,9 +313,17 @@ class TestCreationPreview:
 
     @pytest.mark.parametrize("backend", ["virtual", "none", "sandbox", "vm"])
     def test_defaults_follow_effective_workspace_and_scope_without_creating_work(
-        self, backend
+        self, backend, monkeypatch
     ):
-        deps, repository = self.dependencies(backend)
+        # Slice A2b: an unpinned Session's tier comes from the defaults chain
+        # (here the installation), no longer from the account preference.
+        from shared.workspace_defaults import backend_mode
+
+        monkeypatch.setenv(
+            "WORKSPACE_DEFAULTS", json.dumps({"sessions": backend_mode(backend)})
+        )
+        monkeypatch.delenv("WORKSPACE_BUILTIN_TEMPLATES", raising=False)
+        deps, repository = self.dependencies()
         response = _client(admission=deps).post(
             "/api/persistent/threads/preview", json={"use_datasource_defaults": True}
         )
@@ -293,7 +338,6 @@ class TestCreationPreview:
             ),
         }
         deps.store.create_thread.assert_not_awaited()
-        deps.store.replace_thread_mounts.assert_not_awaited()
         deps.provision_or_assign.assert_not_awaited()
         deps.send_session_attach.assert_not_awaited()
         deps.schedule_stateless_workspace_ensure.assert_not_called()
@@ -323,7 +367,21 @@ class TestCreationPreview:
             "active_project_resource",
             AsyncMock(return_value=project),
         )
+        # Slice A2b: activation writes the manifest's defaults into
+        # project_workspace_defaults; selection reads only that row.
+        from shared.manifests.workspace_defaults import project_workspace_defaults
+
+        values = project_workspace_defaults(project["resolved"]["spec"])
+        row = {
+            "jobs_mode": values["jobs"],
+            "sessions_mode": values["sessions"],
+            "container_template": values["container"],
+            "vm_template": values["vm"],
+            "source": "manifest",
+            "manifest_revision": project["revision"],
+        }
         deps, repository = self.dependencies()
+        deps.store.fetchrow = AsyncMock(return_value=row)
         client = _client(admission=deps)
         body = {"project_ids": [THREAD], "use_datasource_defaults": True}
         response = client.post("/api/persistent/threads/preview", json=body)
@@ -366,7 +424,10 @@ class TestCreationPreview:
         )
         assert rejected.status_code == 400
         assert rejected.json() == {
-            "detail": "Repository and credential connectors require a sandbox or VM workspace"
+            "detail": (
+                "Connectors that need a shell (repositories, credential and "
+                "generic environments, SSH keys) require a sandbox or VM workspace"
+            )
         }
         empty = client.post(
             "/api/persistent/threads/preview", json={"datasource_ids": []}
@@ -446,9 +507,29 @@ class TestCreate:
         assert response.json()["detail"]["missing_chat_model"] is True
 
     def test_a_protected_cloud_tier_mismatch_keeps_its_error_code(self):
-        response = _client().post(
+        project = "33333333-3333-4333-8333-333333333333"
+        folder = "66666666-6666-4666-8666-666666666666"
+        row = {
+            "id": folder,
+            "type": "cloud_folder",
+            "managed_key": f"project-cloud:{project}",
+            "config": {
+                "folder_kind": "project",
+                "project_id": project,
+                "backend_id": "nextcloud",
+                "backend_instance_id": GENERATION,
+                "folder_handle": "nextcloud:7",
+            },
+        }
+        deps = _admission_deps(
+            store={"resolve_datasources_for_thread": AsyncMock(return_value=[row])},
+            authorize_thread_project_ids=AsyncMock(side_effect=lambda _u, ids: ids),
+        )
+        response = _client(admission=deps).post(
             "/api/persistent/threads",
             json={
+                "project_id": project,
+                "datasource_ids": [folder],
                 "protected_cloud": True,
                 "config_override": {"workspace": {"backend": "virtual"}},
             },
@@ -457,6 +538,70 @@ class TestCreate:
         assert (
             response.json()["detail"]["code"] == "protected_cloud_unsupported_workspace"
         )
+
+
+class TestInlineExpertWire:
+    """`expert` accepts a selector or ``{"inline": ExpertSpec}`` on both routes."""
+
+    INLINE = {
+        "inline": {
+            "runtime": {
+                "adapter": "srw/v1",
+                "config": {
+                    "config": {"llm": {"temperature": 0.3}},
+                    "prompts": {"persona": "Plain."},
+                },
+            }
+        }
+    }
+
+    @pytest.mark.parametrize(
+        "path", ["/api/persistent/threads", "/api/persistent/threads/preview"]
+    )
+    def test_an_inline_expert_is_accepted(self, path):
+        deps = _admission_deps()
+        response = _client(admission=deps).post(
+            path, json={"expert": self.INLINE, "expert_based_on": "assistant"}
+        )
+        assert response.status_code == 200, response.text
+        if path.endswith("/preview"):
+            deps.store.create_thread.assert_not_awaited()
+            return
+        kwargs = deps.store.create_thread.await_args.kwargs
+        assert kwargs["expert_row"]["config"] == {"llm": {"temperature": 0.3}}
+        assert kwargs["initial_metadata"]["expert_based_on"] == "assistant"
+
+    @pytest.mark.parametrize(
+        "body,status",
+        [
+            ({"expert_id": "66666666-6666-4666-8666-666666666666"}, 400),
+            ({"config_name": "scholar"}, 400),
+        ],
+    )
+    def test_an_inline_expert_beside_a_selector_is_400(self, body, status):
+        deps = _admission_deps()
+        response = _client(admission=deps).post(
+            "/api/persistent/threads", json={"expert": self.INLINE, **body}
+        )
+        assert response.status_code == status
+        deps.store.create_thread.assert_not_awaited()
+
+    def test_a_foreign_image_is_refused(self):
+        expert = json.loads(json.dumps(self.INLINE))
+        expert["inline"]["runtime"]["image"] = "example.invalid/other:1"
+        deps = _admission_deps()
+        response = _client(admission=deps).post(
+            "/api/persistent/threads", json={"expert": expert}
+        )
+        assert response.status_code == 422
+        assert "installed harness" in response.text
+        deps.store.create_thread.assert_not_awaited()
+
+    def test_a_custom_launch_envelope_is_a_validation_error(self):
+        expert = json.loads(json.dumps(self.INLINE))
+        expert["inline"]["runtime"]["command"] = ["sh", "-c", "id"]
+        response = _client().post("/api/persistent/threads", json={"expert": expert})
+        assert response.status_code == 422
 
 
 class TestList:
@@ -471,6 +616,9 @@ class TestList:
         assert response.json() == {"threads": []}
         deps.store.list_threads.assert_awaited_once_with(
             user_id=USER["id"], project_id="p-1", status="ended"
+        )
+        deps.store.container_workspace_creation_views.assert_awaited_once_with(
+            "thread", []
         )
 
 

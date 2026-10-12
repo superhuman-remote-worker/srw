@@ -1,0 +1,65 @@
+name: Docker Hub pull mirror
+description: >-
+  Route this runner's Docker Hub pulls through mirror.gcr.io, Google's
+  anonymous Docker Hub cache, so they stop counting against Docker Hub's
+  per-IP anonymous pull limit.
+
+# Hosted runners share their egress IPs, and Docker Hub rate-limits anonymous
+# pulls per IP. On 2026-10-09 a runner arrived with that quota already spent:
+# testcontainers could not pull postgres/pgvector and ~1,500 tests errored with
+# `toomanyrequests`, which skipped every image build and the deploy. The image
+# build jobs already avoid this with a buildkit mirror; this does the same for
+# the runner's Docker engine, which testcontainers, `docker pull`, `docker run`
+# and the e2e harness's `docker build` all go through.
+#
+# The engine tries the mirror first and falls back to Docker Hub when the mirror
+# misses or errors, so the worst case is the old behaviour. Only docker.io is
+# mirrored; ghcr.io, quay.io and mcr.microsoft.com pulls are untouched.
+#
+# Restarting the engine stops running containers, so use this before anything
+# starts one. It cannot reach a job's `services:` containers either: the runner
+# starts those before the first step. Reference such an image through
+# mirror.gcr.io directly instead (see db-migrations.yml).
+#
+# Self-hosted runners skip this: their pulls leave from the homelab's own IP,
+# and editing their engine config is the runner image's business.
+
+runs:
+  using: composite
+  steps:
+    - name: Route Docker Hub pulls through mirror.gcr.io
+      if: runner.environment == 'github-hosted'
+      shell: bash
+      env:
+        MIRROR: https://mirror.gcr.io
+      run: |
+        set -euo pipefail
+        config=/etc/docker/daemon.json
+        backup="$(mktemp)"
+        # Hosted runners ship a daemon.json (cgroup settings), so merge into it
+        # rather than replace it.
+        if sudo test -s "$config"; then
+          sudo cp "$config" "$backup"
+        else
+          echo '{}' > "$backup"
+        fi
+        jq --arg mirror "$MIRROR" \
+          '.["registry-mirrors"] = ([$mirror] + ((.["registry-mirrors"] // []) - [$mirror]))' \
+          "$backup" | sudo tee "$config" > /dev/null
+
+        if ! sudo systemctl restart docker; then
+          # e.g. a future runner image that passes --registry-mirror as a flag:
+          # dockerd refuses to start when a setting is both a flag and a config
+          # key. Put the original back so the job runs as it did before.
+          echo "::warning::Docker did not restart with the Docker Hub mirror; restoring the runner's engine config and pulling from Docker Hub directly"
+          sudo cp "$backup" "$config"
+          sudo systemctl restart docker
+          exit 0
+        fi
+
+        mirrors="$(docker info --format '{{json .RegistryConfig.Mirrors}}')"
+        echo "Docker registry mirrors: $mirrors"
+        case "$mirrors" in
+          *mirror.gcr.io*) ;;
+          *) echo "::warning::Docker restarted without the Docker Hub mirror; pulls go to Docker Hub directly" ;;
+        esac

@@ -12,6 +12,7 @@ import time
 from typing import Any, Optional
 from uuid import UUID, uuid4
 
+import asyncpg
 import httpx
 
 from orchestrator.services.workspace_binding import CANVAS_WORKSPACE_GENERATION_KEY
@@ -74,6 +75,10 @@ class _VMTeardownProbe:
     disposition: str
     identity: VMTeardownIdentity | None = None
     rootdisk_identity_known: bool = False
+    runtime_absence_known: bool = False
+    vmi_absent: bool = False
+    launcher_absent: bool = False
+    retained_rootdisk: Mapping[str, Any] | None = None
 
 
 def _provision_generation(value: object) -> str | None:
@@ -185,6 +190,7 @@ class VMProvisioner:
 
     def __init__(self):
         self._db: Optional[Any] = None
+        self._phase_store = None
         self._snapshot_service: Optional[Any] = None
         self._vm_namespace: str = os.environ.get("VM_NAMESPACE", "agent-vms")
         self._default_vm_image: str = os.environ.get(
@@ -340,7 +346,12 @@ class VMProvisioner:
         )
 
     async def _persist_status_identity(
-        self, entity_type: str, entity_id: str, data: Mapping[str, Any]
+        self,
+        entity_type: str,
+        entity_id: str,
+        data: Mapping[str, Any],
+        *,
+        phase_token=None,
     ) -> bool:
         """Persist query-discovered identities only from authenticated evidence."""
 
@@ -364,6 +375,8 @@ class VMProvisioner:
             )
         if (root_uid := _safe_vm_uid(data.get("rootdisk_pvc_uid"))) is not None:
             updates["rootdisk_pvc_uid"] = root_uid
+        if (vmi_uid := _provision_generation(data.get("vmi_uid"))) is not None:
+            updates["vmi_uid"] = vmi_uid
         if (
             fingerprint := _safe_ssh_host_key_fingerprint(
                 data.get("ssh_host_key_fingerprint")
@@ -372,12 +385,22 @@ class VMProvisioner:
             updates["ssh_host_key_fingerprint"] = fingerprint
         if type(data.get("credential_runtime_started")) is bool:
             updates["credential_runtime_started"] = data["credential_runtime_started"]
-        merged = await self._set_context_if_generation(
-            entity_type,
-            entity_id,
-            generation,
-            updates,
-        )
+        if entity_type == "job" and self._phase_store is not None:
+            if phase_token is None:
+                return False
+            disposition = await self._phase_store.apply_status(
+                phase_token,
+                data,
+                identity_updates=updates,
+            )
+            merged = disposition in {"observed", "unproven"}
+        else:
+            merged = await self._set_context_if_generation(
+                entity_type,
+                entity_id,
+                generation,
+                updates,
+            )
 
         if merged and entity_type == "job" and root_uid is not None:
             binding = await self._storage_context(entity_id)
@@ -410,6 +433,12 @@ class VMProvisioner:
         """
         self._db = db
         self._snapshot_service = snapshot_service
+        if getattr(db, "supports_vm_phase_observations", False) is True:
+            from orchestrator.services.vm_provisioning_phases import (
+                VMProvisioningPhaseStore,
+            )
+
+            self._phase_store = VMProvisioningPhaseStore(db)
 
         if self._http_available:
             self._http_client = httpx.AsyncClient(
@@ -609,6 +638,35 @@ class VMProvisioner:
         if launcher_uid != expected_launcher_uid:
             raise WorkspaceRuntimeAuthorityError("VM launcher Pod UID changed")
 
+        observed_vmi_uid = _provision_generation(observed.get("vmi_uid"))
+        expected_vmi_uid = _provision_generation(context.get("vmi_uid"))
+        if (
+            observed_vmi_uid is not None
+            and expected_vmi_uid is not None
+            and observed_vmi_uid != expected_vmi_uid
+        ):
+            raise WorkspaceRuntimeRecoveryRequired(
+                "VM VMI UID changed",
+                recovery_code=WorkspaceRecoveryCode.REPLACEMENT_OBSERVED,
+            )
+        exact_vmi_uid = (
+            observed_vmi_uid if observed_vmi_uid == expected_vmi_uid else None
+        )
+        observed_pvc_uid = _provision_generation(observed.get("rootdisk_pvc_uid"))
+        expected_pvc_uid = _provision_generation(context.get("rootdisk_pvc_uid"))
+        if (
+            observed_pvc_uid is not None
+            and expected_pvc_uid is not None
+            and observed_pvc_uid != expected_pvc_uid
+        ):
+            raise WorkspaceRuntimeRecoveryRequired(
+                "VM rootdisk PVC UID changed",
+                recovery_code=WorkspaceRecoveryCode.REPLACEMENT_OBSERVED,
+            )
+        exact_pvc_uid = (
+            observed_pvc_uid if observed_pvc_uid == expected_pvc_uid else None
+        )
+
         observed_pod_ip = observed.get("pod_ip")
         if (
             not isinstance(observed_pod_ip, str)
@@ -678,6 +736,9 @@ class VMProvisioner:
             != generation
             or _safe_vm_uid(current.get("vm_uid")) != expected_vm_uid
             or _provision_generation(current.get("active_pod_uid")) != launcher_uid
+            or _provision_generation(current.get("vmi_uid")) != expected_vmi_uid
+            or _provision_generation(current.get("rootdisk_pvc_uid"))
+            != expected_pvc_uid
             or current.get("ssh_registration_id") != expected_registration_id
             or _safe_ssh_host_key_fingerprint(current.get("ssh_host_key_fingerprint"))
             != fingerprint
@@ -696,6 +757,8 @@ class VMProvisioner:
             port=port,
             vm_uid=expected_vm_uid,
             launcher_pod_uid=launcher_uid,
+            vmi_uid=exact_vmi_uid,
+            rootdisk_pvc_uid=exact_pvc_uid,
         )
 
     async def _storage_context(self, job_id):
@@ -874,6 +937,8 @@ class VMProvisioner:
         initialization: dict | None = None,
         workspace_storage: dict | None = None,
         preparation: dict | None = None,
+        network_profile: dict | None = None,
+        idle_wake_id: str | None = None,
     ) -> bool | dict[str, Any]:
         """Create a VM for a job.
 
@@ -901,10 +966,140 @@ class VMProvisioner:
             The controller response when HTTP accepted the request, otherwise
             the transport's boolean acknowledgement.
         """
+        protocol_enabled = (
+            self.mode == "same-cluster"
+            and os.getenv("VM_CREATION_RETRY_ENABLED", "false").lower() == "true"
+        )
+        if idle_wake_id is not None and (not protocol_enabled or not fresh):
+            from orchestrator.services.vm_creation_retry_store import (
+                VMCreationRetryConflict,
+            )
+
+            raise VMCreationRetryConflict("idle_wake_unproven")
+        if protocol_enabled or (
+            self.mode == "same-cluster"
+            and getattr(self._db, "supports_vm_creation_retry", False) is True
+        ):
+            from orchestrator.services.vm_creation_preflight import (
+                VMCreationPreflightStore,
+                _preflight,
+                creation_preflight_response,
+                idle_wake_predecessor,
+                idle_wake_request,
+                idle_wake_source_request,
+            )
+            from orchestrator.services.vm_creation_retry_store import (
+                VMCreationRetryConflict,
+            )
+            from orchestrator.services.vm_creation_request import (
+                build_vm_creation_request,
+            )
+
+            if self._db is None:
+                raise VMCreationRetryConflict("creation_request_unproven")
+            job = await self._db.get_job(job_id)
+            context = (job.get("context") or {}) if isinstance(job, Mapping) else None
+            context = json.loads(context) if isinstance(context, str) else context
+            if not isinstance(context, Mapping):
+                raise VMCreationRetryConflict("creation_request_unproven")
+            vm = context.get("vm") or {}
+            if not isinstance(vm, dict):
+                raise VMCreationRetryConflict("creation_request_unproven")
+            previous = _preflight(vm)
+            if idle_wake_id is None and (
+                vm.get("status") in {"suspending", "suspended"}
+                or vm.get("_suspend_remote_io_closed") is not None
+                or vm.get("idle_wake_operation_id") is not None
+            ):
+                raise VMCreationRetryConflict("idle_wake_unproven")
+            if idle_wake_id is not None:
+                try:
+                    wake_uuid = UUID(idle_wake_id)
+                    if str(wake_uuid) != idle_wake_id:
+                        raise ValueError
+                except (TypeError, ValueError) as exc:
+                    raise VMCreationRetryConflict("idle_wake_unproven") from exc
+                async with self._db.acquire() as conn:
+                    wake = await conn.fetchrow(
+                        "SELECT wake_generation,wake_request_id,pvc_uid FROM vm_idle_operations "
+                        "WHERE id=$1 AND owner_kind='job' AND owner_id=$2 "
+                        "AND phase IN ('waking','wake_held') AND closed_at IS NULL",
+                        wake_uuid,
+                        UUID(job_id),
+                    )
+                if wake is None or wake["wake_generation"] is None:
+                    raise VMCreationRetryConflict("idle_wake_unproven")
+                generation = str(wake["wake_generation"])
+                if vm.get("idle_wake_operation_id") == idle_wake_id:
+                    if (
+                        previous is None
+                        or previous["request"]["provision_generation"] != generation
+                        or previous["request_id"] != str(wake["wake_request_id"])
+                    ):
+                        raise VMCreationRetryConflict("idle_wake_unproven")
+                    request = previous["request"]
+                else:
+                    if (
+                        vm.get("status") != "suspended"
+                        or vm.get("idle_wake_operation_id") is not None
+                    ):
+                        raise VMCreationRetryConflict("idle_wake_unproven")
+                    current_storage = None
+                    if (
+                        previous
+                        and previous["request"].get("workspace_storage") is not None
+                    ):
+                        from orchestrator.services.retained_vm_workspaces import (
+                            provision_binding,
+                        )
+
+                        current_storage = await provision_binding(self._db, job_id)
+                    prior = idle_wake_predecessor(
+                        vm,
+                        job_id=job_id,
+                        pvc_uid=str(wake["pvc_uid"]),
+                        max_attempts=int(os.getenv("VM_PROVISION_MAX_ATTEMPTS", "3")),
+                        current_storage=current_storage,
+                    )
+                    async with self._db.acquire() as conn:
+                        source = await conn.fetchrow(
+                            "SELECT * FROM vm_creation_retries "
+                            "WHERE job_id=$1 AND provision_generation=$2",
+                            UUID(job_id),
+                            UUID(vm["provision_generation"]),
+                        )
+                    request = idle_wake_request(
+                        prior,
+                        resolved_request=idle_wake_source_request(vm, source),
+                        generation=generation,
+                        current_storage=current_storage,
+                    )
+                fresh_context = self._fresh_provision_ctx()
+                fresh_context["provision_generation"] = generation
+                preflight = await VMCreationPreflightStore(self._db).begin(
+                    job_id=job_id,
+                    request=request,
+                    fresh_context=fresh_context,
+                    max_attempts=int(os.getenv("VM_PROVISION_MAX_ATTEMPTS", "3")),
+                    idle_wake_id=idle_wake_id,
+                )
+                return creation_preflight_response(preflight)
+            if previous and (vm.get("status") != "deleted" or not protocol_enabled):
+                if vm.get("idle_wake_operation_id") is not None:
+                    raise VMCreationRetryConflict("idle_wake_unproven")
+                # Existing operations keep their own authority even if admission
+                # was disabled or today's defaults differ. No queue mutation.
+                return creation_preflight_response(previous)
+            if not protocol_enabled and (
+                "_vm_creation_pending" in context or vm.get("creation_request_id")
+            ):
+                raise VMCreationRetryConflict("retry_protocol_unavailable")
+            if protocol_enabled and not fresh:
+                raise VMCreationRetryConflict("creation_request_unproven")
         if preparation is not None:
             preparation = await self._validate_preparation(job_id, "job", preparation)
         if workspace_storage is not None:
-            from orchestrator.services.retained_vm_workspaces import provision_binding
+            from orchestrator.services.retained_vm_workspaces import provision_authority
             from shared.vm_workspace_storage import storage_binding
 
             workspace_storage = storage_binding(workspace_storage)
@@ -912,7 +1107,12 @@ class VMProvisioner:
                 raise ValueError(
                     "Retained workspaces require authenticated same-cluster VM hosting."
                 )
-            if await provision_binding(self._db, job_id) != workspace_storage:
+            authority = await provision_authority(self._db, job_id)
+            if (
+                authority is None
+                or authority["storage"] != workspace_storage
+                or authority.get("network_profile") != network_profile
+            ):
                 raise ValueError("Retained workspace attachment authority changed.")
         if initialization is not None:
             from shared.workspace_initialization import validate_initialization_request
@@ -928,6 +1128,36 @@ class VMProvisioner:
             # not leave a durable row pretending an unusable VM is pending.
             logger.warning("VM create refused: %s", self.unavailable_reason)
             return False
+        if protocol_enabled:
+            fresh_context = self._fresh_provision_ctx()
+            network_tier = (
+                await self._db.get_workspace_network_tier(job_id, "job")
+                or DEFAULT_NETWORK_TIER
+            )
+            request = build_vm_creation_request(
+                job_id=job_id,
+                agent_config=agent_config,
+                vm_image=vm_image,
+                cpu_cores=cpu_cores,
+                memory=memory,
+                description=description,
+                network_tier=network_tier,
+                provision_generation=fresh_context["provision_generation"],
+                orchestrator_url=os.getenv("ORCHESTRATOR_URL"),
+                disk_size=disk_size,
+                initialization=initialization,
+                workspace_storage=workspace_storage,
+                preparation=preparation,
+                network_profile=network_profile,
+            )
+            preflight = await VMCreationPreflightStore(self._db).begin(
+                job_id=job_id,
+                request=request,
+                fresh_context=fresh_context,
+                max_attempts=int(os.getenv("VM_PROVISION_MAX_ATTEMPTS", "3")),
+                idle_wake_id=idle_wake_id,
+            )
+            return creation_preflight_response(preflight)
         # A (re)provisioned VM must start with a CLEAN reap counter and no stale
         # SSH endpoint. context.vm is *merged* (not replaced) across provisions,
         # so a prior incarnation's snapshot_attempts — which reaches the reaper's
@@ -1116,26 +1346,59 @@ class VMProvisioner:
         self,
         job_id: str,
         generation: str,
+        *,
+        workspace_storage: Mapping[str, Any] | None = None,
+        controller_scope: Mapping[str, Any] | None = None,
     ) -> _VMTeardownProbe:
         """Probe the exact backend without collapsing absence into transport loss."""
 
         result: Mapping[str, Any] | None
+        binding = await self._storage_context(job_id)
+        if workspace_storage is not None:
+            from shared.vm_workspace_storage import storage_binding
+
+            try:
+                captured = storage_binding(workspace_storage)
+            except (KeyError, TypeError, ValueError):
+                return _VMTeardownProbe("unknown")
+            if binding != captured:
+                return _VMTeardownProbe("unknown")
+            binding = captured
         if self._nats_available:
             result = await nats_bridge.query_vm_status(
                 job_id,
                 provision_generation=generation,
                 exact_absence=True,
+                **({"workspace_storage": binding} if binding is not None else {}),
             )
         elif self._http_available:
             result = await self._query_http(
                 job_id,
                 provision_generation=generation,
                 exact_absence=True,
+                **({"workspace_storage": binding} if binding is not None else {}),
             )
         else:
             return _VMTeardownProbe("unknown")
 
         if not isinstance(result, Mapping):
+            return _VMTeardownProbe("unknown")
+        if controller_scope is not None:
+            reported_scope = result.get("controller_scope")
+            if (
+                not isinstance(reported_scope, Mapping)
+                or set(reported_scope) != {"version", "namespace", "cluster_id"}
+                or type(reported_scope["version"]) is not int
+                or reported_scope["version"] != 1
+                or reported_scope != controller_scope
+            ):
+                # The signed controller must identify the namespace and cluster
+                # it actually queried; the request cannot supply this witness.
+                return _VMTeardownProbe("unknown")
+        if binding is not None and result.get("retained_storage_probe") != binding:
+            # A signed older controller could ignore the new binding and
+            # truthfully report the *default* Job rootdisk absent. Only a
+            # response naming the queried retained target can prove its purge.
             return _VMTeardownProbe("unknown")
         if result.get("_identity_authenticated") is not True:
             return _VMTeardownProbe("unknown")
@@ -1189,6 +1452,10 @@ class VMProvisioner:
                 "absent",
                 identity,
                 rootdisk_identity_known=rootdisk_known,
+                runtime_absence_known=result.get("runtime_absence_known") is True,
+                vmi_absent=result.get("vmi_absent") is True,
+                launcher_absent=result.get("launcher_absent") is True,
+                retained_rootdisk=result.get("retained_rootdisk"),
             )
         if status in {"query_failed", "delete_failed"} or identity.vm_uid is None:
             return _VMTeardownProbe("unknown")
@@ -1197,6 +1464,770 @@ class VMProvisioner:
             identity,
             rootdisk_identity_known=rootdisk_known,
         )
+
+    async def attest_vm_idle_stop(
+        self, operation: Mapping[str, Any]
+    ) -> dict[str, Any] | None:
+        """Return exact physical-absence evidence from an authenticated controller probe."""
+
+        try:
+            from uuid import UUID
+
+            fields = {
+                key: str(UUID(str(operation[key])))
+                for key in (
+                    "id",
+                    "owner_id",
+                    "provision_generation",
+                    "vm_uid",
+                    "vmi_uid",
+                    "launcher_uid",
+                    "pvc_uid",
+                )
+            }
+            if any(fields[key] != str(operation[key]) for key in fields):
+                return None
+        except (KeyError, TypeError, ValueError, AttributeError):
+            return None
+        owner_kind = operation.get("owner_kind")
+        if owner_kind not in {"job", "thread"} or (
+            await self._current_provision_generation(owner_kind, fields["owner_id"])
+            != fields["provision_generation"]
+        ):
+            return None
+        probe = await self._probe_vm_teardown_identity(
+            fields["owner_id"], fields["provision_generation"]
+        )
+        if (
+            probe.disposition != "absent"
+            or not probe.rootdisk_identity_known
+            or not probe.runtime_absence_known
+            or not probe.vmi_absent
+            or not probe.launcher_absent
+            or probe.identity is None
+            or probe.identity.rootdisk_pvc_uid != fields["pvc_uid"]
+        ):
+            return None
+        return {
+            "version": 1,
+            "kind": "vm_idle_physical_stop",
+            "operation_id": fields["id"],
+            "generation": fields["provision_generation"],
+            "vm_uid": fields["vm_uid"],
+            "vmi_uid": fields["vmi_uid"],
+            "launcher_uid": fields["launcher_uid"],
+            "pvc_uid": fields["pvc_uid"],
+            "vm_absent": True,
+            "vmi_absent": True,
+            "launcher_absent": True,
+            "same_generation_replacement": False,
+            "retained_pvc": True,
+            "controller_authenticated": True,
+        }
+
+    async def qualify_retained_ready_stop(
+        self, candidate: Mapping[str, Any]
+    ) -> dict[str, Any] | None:
+        """Read a signed Ready storage witness before any SSH or VM effect."""
+        from shared.vm_cancel_retention import (
+            valid_ready_retention_candidate,
+            valid_ready_retention_preflight,
+        )
+
+        if (
+            self._lifecycle_hmac_secret is None
+            or not valid_ready_retention_candidate(candidate)
+            or not self.lifecycle_available
+        ):
+            return None
+        job_id = candidate["job_id"]
+        generation = candidate["provision_generation"]
+        if await self._storage_context(job_id) is not None:
+            return None
+        if self._nats_available:
+            observed = await nats_bridge.query_vm_status(
+                job_id,
+                provision_generation=generation,
+                retained_ready_stop_candidate=candidate,
+            )
+        elif self._http_available:
+            observed = await self._query_http(
+                job_id,
+                provision_generation=generation,
+                retained_ready_stop_candidate=candidate,
+            )
+        else:
+            return None
+        if (
+            not isinstance(observed, Mapping)
+            or observed.get("_identity_authenticated") is not True
+            or observed.get("job_id") != job_id
+            or observed.get("provision_generation") != generation
+            or (
+                type(observed.get("ready")) is not bool
+                if candidate["kind"] == "vm_job_initial_ready_stop_candidate_v1"
+                else observed.get("ready") is not True
+            )
+            or observed.get("vm_uid") != candidate["vm_uid"]
+            or observed.get("vmi_uid") != candidate["vmi_uid"]
+            or observed.get("active_pod_uid") != candidate["launcher_uid"]
+        ):
+            return None
+        proof = observed.get("retention_preflight")
+        return (
+            dict(proof) if valid_ready_retention_preflight(proof, candidate) else None
+        )
+
+    async def attest_vm_cleanup_stop(
+        self, candidate: Mapping[str, Any]
+    ) -> dict[str, Any] | None:
+        """Probe an ordinary cleanup's exact compute absence outside SQL locks."""
+
+        owner_kind = candidate.get("owner_kind", "job")
+        if owner_kind not in {"job", "thread"}:
+            return None
+        owner_key = "owner_id" if owner_kind == "thread" else "job_id"
+        try:
+            fields = {
+                key: str(UUID(str(candidate[key])))
+                for key in (
+                    owner_key,
+                    "provision_generation",
+                    "vm_uid",
+                    "pvc_uid",
+                )
+            }
+            for key in ("vmi_uid", "launcher_uid"):
+                fields[key] = (
+                    None
+                    if owner_kind == "thread" and candidate.get(key) is None
+                    else str(UUID(str(candidate[key])))
+                )
+            if (fields["vmi_uid"] is None) != (fields["launcher_uid"] is None):
+                return None
+            if any(fields[key] != candidate[key] for key in fields):
+                return None
+        except (KeyError, TypeError, ValueError, AttributeError):
+            return None
+        if type(candidate.get("purge_disk")) is not bool:
+            return None
+        retention_preflight = candidate.get("retention_preflight")
+        if "retention_preflight" in candidate:
+            from shared.vm_cancel_retention import (
+                valid_ready_retention_preflight,
+                valid_retention_preflight,
+            )
+
+            if (
+                owner_kind != "job"
+                or candidate["purge_disk"] is not False
+                or not isinstance(retention_preflight, Mapping)
+                or not (
+                    (
+                        retention_preflight.get("kind")
+                        == "vm_cancel_retention_preflight_v1"
+                        and valid_retention_preflight(
+                            retention_preflight, retention_preflight.get("frozen")
+                        )
+                    )
+                    or (
+                        retention_preflight.get("kind")
+                        in {
+                            "vm_job_retained_ready_preflight_v1",
+                            "vm_job_initial_ready_preflight_v1",
+                        }
+                        and valid_ready_retention_preflight(
+                            retention_preflight, retention_preflight.get("frozen")
+                        )
+                    )
+                )
+                or any(
+                    retention_preflight["frozen"].get(key) != value
+                    for key, value in fields.items()
+                )
+                or await self._storage_context(fields[owner_key]) is not None
+            ):
+                return None
+        binding_kind = candidate.get("binding_kind")
+        if binding_kind not in {None, "bound", "unbound"}:
+            return None
+        controller_scope = candidate.get("controller_scope")
+        if binding_kind is not None:
+            if (
+                not isinstance(controller_scope, Mapping)
+                or set(controller_scope) != {"version", "namespace", "cluster_id"}
+                or type(controller_scope["version"]) is not int
+                or controller_scope["version"] != 1
+                or any(
+                    not isinstance(controller_scope[key], str)
+                    or not controller_scope[key]
+                    or controller_scope[key] != controller_scope[key].strip()
+                    for key in ("namespace", "cluster_id")
+                )
+            ):
+                return None
+        elif controller_scope is not None:
+            return None
+        captured_binding = candidate.get("captured_workspace_storage")
+        if binding_kind == "bound" and captured_binding is None:
+            return None
+        if binding_kind == "unbound" and captured_binding is not None:
+            return None
+        if binding_kind == "unbound":
+            if (
+                owner_kind != "job"
+                or await self._storage_context(fields[owner_key]) is not None
+            ):
+                return None
+        if captured_binding is not None:
+            if owner_kind != "job" or candidate["purge_disk"] is not True:
+                return None
+            from shared.vm_workspace_storage import storage_binding
+
+            try:
+                captured_binding = storage_binding(captured_binding)
+            except (KeyError, TypeError, ValueError):
+                return None
+            if (
+                captured_binding["owner_id"] != fields[owner_key]
+                or captured_binding["pvc_uid"] != fields["pvc_uid"]
+            ):
+                return None
+        typed_purge = None
+        if owner_kind == "job" and candidate["purge_disk"] is True:
+            try:
+                typed_purge = await self._current_retained_purge(
+                    fields[owner_key],
+                    fields["provision_generation"],
+                    fields["vm_uid"],
+                    fields["pvc_uid"],
+                    candidate=candidate,
+                )
+            except Exception:
+                logger.warning(
+                    "Retained purge attestation authority is held", exc_info=True
+                )
+                return None
+        if typed_purge is None and (
+            await self._current_provision_generation(owner_kind, fields[owner_key])
+            != fields["provision_generation"]
+        ):
+            return None
+        probe = await self._probe_vm_teardown_identity(
+            fields[owner_key],
+            fields["provision_generation"],
+            **(
+                {"controller_scope": controller_scope}
+                if controller_scope is not None
+                else {}
+            ),
+            **(
+                {"workspace_storage": captured_binding}
+                if captured_binding is not None
+                else {}
+            ),
+        )
+        if (
+            probe.disposition != "absent"
+            or probe.identity is None
+            or not probe.rootdisk_identity_known
+            or not probe.runtime_absence_known
+            or not probe.vmi_absent
+            or not probe.launcher_absent
+            or probe.identity.rootdisk_pvc_uid
+            != (None if candidate["purge_disk"] else fields["pvc_uid"])
+        ):
+            return None
+        retained = {}
+        if "retention_preflight" in candidate:
+            from shared.vm_cancel_retention import valid_retained_rootdisk
+
+            if not valid_retained_rootdisk(
+                probe.retained_rootdisk, retention_preflight
+            ):
+                return None
+            retained["retained_rootdisk"] = dict(probe.retained_rootdisk)
+        return {
+            "version": 1,
+            "kind": "vm_cleanup_physical_stop",
+            **retained,
+            **fields,
+            **({"owner_kind": "thread"} if owner_kind == "thread" else {}),
+            **(
+                {"captured_workspace_storage": captured_binding}
+                if captured_binding is not None
+                else {}
+            ),
+            **(
+                {"controller_scope": dict(controller_scope)}
+                if controller_scope is not None
+                else {}
+            ),
+            "vm_absent": True,
+            "vmi_absent": True,
+            "launcher_absent": True,
+            "same_generation_replacement": False,
+            "pvc_disposition": ("purged" if candidate["purge_disk"] else "retained"),
+            "controller_authenticated": True,
+        }
+
+    async def _request_pre_ssh_stop(
+        self, payload: Mapping[str, Any]
+    ) -> dict[str, Any] | None:
+        """Call only the new signed stop-only controller route."""
+
+        if (
+            self._lifecycle_hmac_secret is None
+            or payload.get("action")
+            not in {
+                "inspect",
+                "inspect_initial_ready",
+                "inspect_never_app_ready_retained",
+                "stop",
+                "release",
+            }
+            or _provision_generation(payload.get("provision_generation")) is None
+            or not isinstance(payload.get("job_id"), str)
+        ):
+            return None
+        if self._nats_available:
+            return await nats_bridge.request_vm_pre_ssh_stop(payload)
+        if not self._http_available or self._http_client is None:
+            return None
+        signed = sign_payload(
+            dict(payload),
+            direction="request",
+            operation="pre-ssh-stop",
+            secret=self._lifecycle_hmac_secret,
+        )
+        auth = signed.get(AUTH_FIELD)
+        request_id = auth.get("request_id") if isinstance(auth, Mapping) else None
+        try:
+            response = await self._http_client.post("/vm-pre-ssh-stop", json=signed)
+            response.raise_for_status()
+            data = response.json()
+            if not isinstance(data, Mapping) or not verify_payload(
+                data,
+                direction="response",
+                operation="pre-ssh-stop",
+                secret=self._lifecycle_hmac_secret,
+                expected_correlation_id=request_id,
+            ):
+                return None
+            result = unsigned_payload(data)
+            if (
+                result.get("job_id") != payload["job_id"]
+                or result.get("provision_generation") != payload["provision_generation"]
+            ):
+                return None
+            return {**result, "_identity_authenticated": True}
+        except Exception:
+            logger.debug(
+                "VM pre-SSH stop request inconclusive for job %s",
+                payload.get("job_id"),
+            )
+            return None
+
+    async def _attempt_pre_ssh_positive_stop(
+        self,
+        job_id: str,
+        identity: VMTeardownIdentity,
+        parent_cleanup: Mapping[str, Any],
+        *,
+        require_existing_intent: Mapping[str, Any] | None = None,
+    ) -> bool:
+        """Persist intent before physical stop, and zero only after signed proof."""
+
+        from orchestrator.services.vm_pre_ssh_stop_store import (
+            VMPreSSHStopConflict,
+            VMPreSSHStopStore,
+        )
+        from shared.vm_pre_ssh_stop import valid_frozen_stop_candidate
+
+        if (
+            self._db is None
+            or self.mode != "same-cluster"
+            or identity.vm_uid is None
+            or identity.rootdisk_pvc_uid is None
+        ):
+            return False
+        store = VMPreSSHStopStore(self._db)
+        preflight = parent_cleanup.get("retention_preflight")
+        initial_ready = (
+            isinstance(preflight, Mapping)
+            and preflight.get("kind") == "vm_job_initial_ready_preflight_v1"
+        )
+        try:
+            if initial_ready and not await self._ready_parent_is_current(
+                parent_cleanup,
+                job_id=job_id,
+                generation=identity.provision_generation,
+                expected_vm_uid=identity.vm_uid,
+                expected_pvc_uid=identity.rootdisk_pvc_uid,
+                entity_type="job",
+            ):
+                return False
+            retention_required = await store.requires_retention_preflight(
+                parent_cleanup
+            )
+            intent = await store.current_intent(
+                job_id, identity.provision_generation, parent_cleanup
+            )
+            if (
+                require_existing_intent is not None
+                and intent != require_existing_intent
+            ):
+                return False
+            if intent is None:
+                inspected = await self._request_pre_ssh_stop(
+                    {
+                        "action": "inspect_initial_ready"
+                        if initial_ready
+                        else "inspect",
+                        **(
+                            {"parent_cleanup": dict(parent_cleanup)}
+                            if initial_ready
+                            else {}
+                        ),
+                        "job_id": job_id,
+                        "provision_generation": identity.provision_generation,
+                        "expected_vm_uid": identity.vm_uid,
+                        "expected_pvc_uid": identity.rootdisk_pvc_uid,
+                    }
+                )
+                frozen = inspected.get("frozen") if inspected else None
+                preflight = inspected.get("retention_preflight") if inspected else None
+                from shared.vm_cancel_retention import valid_retention_preflight
+
+                if (
+                    inspected is None
+                    or inspected.get("_identity_authenticated") is not True
+                    or inspected.get("status") != "candidate"
+                    or not valid_frozen_stop_candidate(frozen)
+                    or (
+                        retention_required
+                        and not valid_retention_preflight(preflight, frozen)
+                    )
+                ):
+                    return False
+                intent = await store.admit_intent(
+                    job_id,
+                    identity.provision_generation,
+                    parent_cleanup,
+                    frozen,
+                    **(
+                        {"retention_preflight": preflight} if retention_required else {}
+                    ),
+                )
+                if initial_ready:
+                    # A caller's outer transaction can turn admission into a
+                    # savepoint. Require the persisted intent's commit fence
+                    # before sending the physical stop, not only before proof.
+                    committed = await store.current_intent(
+                        job_id, identity.provision_generation, parent_cleanup
+                    )
+                    if committed != intent:
+                        return False
+                    intent = committed
+            if retention_required:
+                from shared.vm_cancel_retention import valid_retention_preflight
+
+                if not valid_retention_preflight(
+                    intent.get("retention_preflight"), intent.get("frozen")
+                ):
+                    return False
+            if initial_ready and not await self._ready_parent_is_current(
+                parent_cleanup,
+                job_id=job_id,
+                generation=identity.provision_generation,
+                expected_vm_uid=identity.vm_uid,
+                expected_pvc_uid=identity.rootdisk_pvc_uid,
+                entity_type="job",
+            ):
+                return False
+            stopped = await self._request_pre_ssh_stop(
+                {
+                    "action": "stop",
+                    "job_id": job_id,
+                    "provision_generation": identity.provision_generation,
+                    **intent,
+                }
+            )
+            if (
+                stopped is None
+                or stopped.get("_identity_authenticated") is not True
+                or stopped.get("status") != "positive_terminal_proof"
+                or not isinstance(stopped.get("terminal_evidence"), Mapping)
+            ):
+                return False
+            await store.commit_positive_proof(
+                job_id,
+                identity.provision_generation,
+                parent_cleanup,
+                stopped["terminal_evidence"],
+            )
+            return True
+        except VMPreSSHStopConflict:
+            return False
+        except Exception:
+            logger.exception("VM pre-SSH stop proof unavailable for job %s", job_id)
+            return False
+
+    async def _release_pre_ssh_stop_finalizer(
+        self,
+        job_id: str,
+        generation: str,
+        parent_cleanup: Mapping[str, Any],
+    ) -> bool:
+        """Release the held Pod only after the immutable proof/zero pair."""
+
+        from orchestrator.services.vm_pre_ssh_stop_store import VMPreSSHStopStore
+
+        if self._db is None:
+            return False
+        try:
+            committed = await VMPreSSHStopStore(self._db).committed_proof(
+                job_id, generation, parent_cleanup
+            )
+            if committed is None:
+                return False
+            held_fields = {}
+            if committed["frozen"].get("kind") == (
+                "vm_job_never_app_ready_retained_stop_candidate_v1"
+            ):
+                from orchestrator.services.vm_job_cancel_retention import (
+                    current_policy1_stop_authority,
+                )
+                from shared.vm_cancel_retention import (
+                    never_app_ready_retention_authority_matches,
+                )
+
+                frozen = committed["frozen"]
+                authority = await current_policy1_stop_authority(
+                    self._db,
+                    parent_cleanup,
+                    job_id=job_id,
+                    generation=generation,
+                    vm_uid=frozen["vm_uid"],
+                    pvc_uid=frozen["pvc_uid"],
+                )
+                if not never_app_ready_retention_authority_matches(
+                    authority, parent_cleanup, frozen
+                ):
+                    return False
+                held_fields = {
+                    "held_stop_authority": authority,
+                    "parent_cleanup": dict(parent_cleanup),
+                }
+            result = await self._request_pre_ssh_stop(
+                {
+                    "action": "release",
+                    "job_id": job_id,
+                    "provision_generation": generation,
+                    **held_fields,
+                    "frozen": committed["frozen"],
+                    "frozen_digest": committed["frozen_digest"],
+                    "terminal_evidence": committed["terminal_evidence"],
+                    "process_zero_receipt_id": committed["process_zero_receipt_id"],
+                    "evidence_digest": committed["evidence_digest"],
+                    **(
+                        {"retention_preflight": committed["retention_preflight"]}
+                        if "retention_preflight" in committed
+                        else {}
+                    ),
+                }
+            )
+            return bool(
+                result is not None
+                and result.get("_identity_authenticated") is True
+                and result.get("status") == "finalizer_released"
+            )
+        except Exception:
+            logger.exception("VM pre-SSH finalizer remains held for job %s", job_id)
+            return False
+
+    async def _attempt_never_app_ready_retained_stop(
+        self,
+        job_id: str,
+        identity: VMTeardownIdentity,
+        parent_cleanup: Mapping[str, Any],
+    ) -> bool:
+        """Replay the exact held stop; never spend the older zero as proof."""
+        from orchestrator.services.vm_job_cancel_retention import (
+            current_policy1_stop_authority,
+        )
+        from orchestrator.services.vm_pre_ssh_stop_store import VMPreSSHStopStore
+        from shared.vm_cancel_retention import (
+            never_app_ready_retention_authority_matches,
+            valid_retention_preflight,
+        )
+
+        if (
+            self._db is None
+            or identity.vm_uid is None
+            or identity.rootdisk_pvc_uid is None
+        ):
+            return False
+        generation = identity.provision_generation
+        store = VMPreSSHStopStore(self._db)
+
+        async def authority():
+            return await current_policy1_stop_authority(
+                self._db,
+                parent_cleanup,
+                job_id=job_id,
+                generation=generation,
+                vm_uid=identity.vm_uid,
+                pvc_uid=identity.rootdisk_pvc_uid,
+            )
+
+        try:
+            current_authority = await authority()
+            if current_authority is None:
+                return False
+            proof = await store.committed_proof(job_id, generation, parent_cleanup)
+            if proof is not None:
+                return proof["frozen"].get("kind") == (
+                    "vm_job_never_app_ready_retained_stop_candidate_v1"
+                )
+            intent = await store.current_intent(job_id, generation, parent_cleanup)
+            if intent is None:
+                inspected = await self._request_pre_ssh_stop(
+                    {
+                        "action": "inspect_never_app_ready_retained",
+                        "job_id": job_id,
+                        "provision_generation": generation,
+                        "expected_vm_uid": identity.vm_uid,
+                        "expected_pvc_uid": identity.rootdisk_pvc_uid,
+                        "held_stop_authority": current_authority,
+                        "parent_cleanup": dict(parent_cleanup),
+                    }
+                )
+                frozen = inspected.get("frozen") if inspected else None
+                preflight = inspected.get("retention_preflight") if inspected else None
+                if (
+                    inspected is None
+                    or inspected.get("_identity_authenticated") is not True
+                    or inspected.get("status") != "candidate"
+                    or not never_app_ready_retention_authority_matches(
+                        current_authority, parent_cleanup, frozen
+                    )
+                    or not valid_retention_preflight(preflight, frozen)
+                ):
+                    return False
+                zero = await self._db.fetchrow(
+                    "SELECT id FROM managed_repository_process_zero_receipts "
+                    "WHERE owner_kind='job' AND owner_id=$1 AND scope='vm' "
+                    "AND provisioner='vm' AND runtime_incarnation=$2",
+                    UUID(job_id),
+                    generation,
+                )
+                intent = await store.admit_intent(
+                    job_id,
+                    generation,
+                    parent_cleanup,
+                    frozen,
+                    retention_preflight=preflight,
+                    prior_zero_receipt_id=str(zero["id"]) if zero else None,
+                )
+            frozen = intent.get("frozen")
+            if not never_app_ready_retention_authority_matches(
+                current_authority, parent_cleanup, frozen
+            ) or not valid_retention_preflight(
+                intent.get("retention_preflight"), frozen
+            ):
+                return False
+            # A nested admission transaction is only a savepoint. Read the
+            # committed intent again before any physical stop request.
+            committed = await store.current_intent(job_id, generation, parent_cleanup)
+            if committed != intent:
+                return False
+            current_authority = await authority()
+            if not never_app_ready_retention_authority_matches(
+                current_authority, parent_cleanup, frozen
+            ):
+                return False
+            stopped = await self._request_pre_ssh_stop(
+                {
+                    "action": "stop",
+                    "job_id": job_id,
+                    "provision_generation": generation,
+                    "held_stop_authority": current_authority,
+                    "parent_cleanup": dict(parent_cleanup),
+                    **committed,
+                }
+            )
+            if (
+                stopped is None
+                or stopped.get("_identity_authenticated") is not True
+                or stopped.get("status") != "positive_terminal_proof"
+                or not isinstance(stopped.get("terminal_evidence"), Mapping)
+            ):
+                return False
+            await store.commit_positive_proof(
+                job_id, generation, parent_cleanup, stopped["terminal_evidence"]
+            )
+            return (
+                await store.committed_proof(job_id, generation, parent_cleanup)
+                is not None
+            )
+        except Exception:
+            logger.exception("Held retained stop remains unproven for job %s", job_id)
+            return False
+
+    async def _policy1_stop_settlement_replay(
+        self,
+        job_id: str,
+        identity: VMTeardownIdentity,
+        parent_cleanup: Mapping[str, Any],
+    ) -> bool:
+        """Use a committed stop and fresh full absence for settlement only."""
+        from orchestrator.services.vm_pre_ssh_stop_store import VMPreSSHStopStore
+
+        if self._db is None:
+            return False
+        try:
+            proof = await VMPreSSHStopStore(
+                self._db
+            ).committed_policy1_settlement_proof(
+                job_id, identity.provision_generation, parent_cleanup
+            )
+            if proof is None:
+                return False
+            frozen = proof["frozen"]
+            if (
+                frozen["vm_uid"] != identity.vm_uid
+                or frozen["pvc_uid"] != identity.rootdisk_pvc_uid
+            ):
+                return False
+            evidence = await self.attest_vm_cleanup_stop(
+                {
+                    key: frozen[key]
+                    for key in (
+                        "job_id",
+                        "provision_generation",
+                        "vm_uid",
+                        "vmi_uid",
+                        "launcher_uid",
+                        "pvc_uid",
+                    )
+                }
+                | {
+                    "purge_disk": False,
+                    "retention_preflight": proof["retention_preflight"],
+                }
+            )
+            return bool(
+                evidence is not None
+                and evidence.get("controller_authenticated") is True
+                and evidence.get("vm_absent") is True
+                and evidence.get("vmi_absent") is True
+                and evidence.get("launcher_absent") is True
+                and evidence.get("pvc_disposition") == "retained"
+            )
+        except Exception:
+            logger.exception("Policy-1 settled stop replay unavailable for %s", job_id)
+            return False
 
     async def revalidate_vm_teardown_identity(
         self,
@@ -1242,9 +2273,22 @@ class VMProvisioner:
                     return "unknown"
                 if identity.rootdisk_pvc_uid is None:
                     return "unknown"
+                if current.rootdisk_pvc_uid is None:
+                    # The controller deletes compute and disk asynchronously.
+                    # A known-absent disk with the captured VM still present is
+                    # incomplete teardown, never evidence of a replacement UID.
+                    # Leave admission open until the whole runtime is proven gone.
+                    return "unknown"
                 if current.rootdisk_pvc_uid != identity.rootdisk_pvc_uid:
                     return "superseded"
             return "matched"
+        # A VM 404 can race KubeVirt VMI and virt-launcher deletion. Cleanup
+        # completion must prove the whole runtime absent before callers may
+        # settle a permit or debit a compute reservation.
+        if not (
+            probe.runtime_absence_known and probe.vmi_absent and probe.launcher_absent
+        ):
+            return "unknown"
         if not probe.rootdisk_identity_known:
             return "unknown"
         if current.rootdisk_pvc_uid is None:
@@ -1276,22 +2320,36 @@ class VMProvisioner:
             return VMTeardownResult("identity_invalid", False)
         if entity_type not in {"job", "thread"}:
             return VMTeardownResult("identity_invalid", False)
-        current_generation = await self._current_provision_generation(
-            entity_type, job_id
-        )
-        if current_generation != generation:
-            return VMTeardownResult("identity_superseded", False)
-        if (
-            not self._db
-            or not await self._db.managed_repository_workspace_process_zero_is_current(
-                job_id,
-                owner_kind=entity_type,
-                scope="vm",
-                provisioner="vm",
-                runtime_incarnation=generation,
+        typed_purge = None
+        if entity_type == "job" and purge_disk:
+            try:
+                typed_purge = await self._current_retained_purge(
+                    job_id,
+                    generation,
+                    identity.vm_uid,
+                    identity.rootdisk_pvc_uid,
+                    parent_cleanup=parent_cleanup,
+                )
+            except Exception:
+                logger.warning("Retained purge authority is held", exc_info=True)
+                return VMTeardownResult("retained_purge_unproven", False)
+        if typed_purge is None:
+            current_generation = await self._current_provision_generation(
+                entity_type, job_id
             )
-        ):
-            return VMTeardownResult("process_zero_unproven", False)
+            if current_generation != generation:
+                return VMTeardownResult("identity_superseded", False)
+            if (
+                not self._db
+                or not await self._db.managed_repository_workspace_process_zero_is_current(
+                    job_id,
+                    owner_kind=entity_type,
+                    scope="vm",
+                    provisioner="vm",
+                    runtime_incarnation=generation,
+                )
+            ):
+                return VMTeardownResult("process_zero_unproven", False)
         probe = await self._probe_vm_teardown_identity(job_id, generation)
         classification = self._classify_captured_probe(
             probe, identity, purge_disk=purge_disk
@@ -1501,6 +2559,87 @@ class VMProvisioner:
             },
         )
 
+    async def _ready_parent_is_current(
+        self,
+        parent_cleanup: Mapping[str, Any] | None,
+        *,
+        job_id: str,
+        generation: str | None,
+        expected_vm_uid: str | None,
+        expected_pvc_uid: str | None,
+        entity_type: str,
+    ) -> bool:
+        """Recheck immutable Ready authority outside and after SQL lock windows."""
+        if entity_type != "job":
+            return True
+        preflight = (
+            parent_cleanup.get("retention_preflight")
+            if isinstance(parent_cleanup, Mapping)
+            else None
+        )
+        if (
+            isinstance(parent_cleanup, Mapping)
+            and "retention_preflight" in parent_cleanup
+        ):
+            from shared.vm_cancel_retention import valid_retention_preflight
+
+            if not isinstance(preflight, Mapping):
+                return False
+            if preflight.get("kind") == "vm_cancel_retention_preflight_v1":
+                if not valid_retention_preflight(preflight, preflight.get("frozen")):
+                    return False
+            elif preflight.get("kind") not in {
+                "vm_job_retained_ready_preflight_v1",
+                "vm_job_initial_ready_preflight_v1",
+            }:
+                return False
+        supplied_ready = isinstance(preflight, Mapping) and preflight.get("kind") in {
+            "vm_job_retained_ready_preflight_v1",
+            "vm_job_initial_ready_preflight_v1",
+        }
+        # Existing legacy callers can carry non-UUID test/administrative IDs.
+        # A protected continuation is a UUID-backed Job by construction, so
+        # such an ID cannot name the new Ready authority.
+        try:
+            canonical_job = isinstance(job_id, str) and str(UUID(job_id)) == job_id
+        except (TypeError, ValueError, AttributeError):
+            canonical_job = False
+        typed_parent = (
+            isinstance(parent_cleanup, Mapping)
+            and isinstance(parent_cleanup.get("intent"), Mapping)
+            and parent_cleanup["intent"].get("source") == "job_terminal_vm_release"
+        )
+        if not canonical_job:
+            return not supplied_ready and not typed_parent
+        if self._db is None:
+            return not supplied_ready and not typed_parent
+        from shared.vm_cancel_retention import valid_ready_retention_preflight
+
+        try:
+            from orchestrator.services.vm_job_retained_resume import (
+                read_current_ready_preflight,
+            )
+
+            persisted = await read_current_ready_preflight(
+                self._db, parent_cleanup or {}, job_id=job_id, generation=generation
+            )
+            if persisted is None:
+                return not supplied_ready
+            frozen = preflight.get("frozen") if isinstance(preflight, Mapping) else None
+            return bool(
+                valid_ready_retention_preflight(preflight, frozen)
+                and persisted == preflight
+                and frozen["job_id"] == job_id
+                and frozen["provision_generation"] == generation
+                and frozen["vm_uid"] == expected_vm_uid
+                and frozen["pvc_uid"] == expected_pvc_uid
+            )
+        except Exception:
+            logger.debug(
+                "Ready retention parent revalidation unavailable for %s", job_id
+            )
+            return False
+
     async def release_vm_captured(
         self,
         job_id: str,
@@ -1525,6 +2664,15 @@ class VMProvisioner:
             return VMTeardownResult("identity_invalid", False)
         if await self._current_provision_generation(entity_type, job_id) != generation:
             return VMTeardownResult("identity_superseded", False)
+        if not await self._ready_parent_is_current(
+            parent_cleanup,
+            job_id=job_id,
+            generation=generation,
+            expected_vm_uid=identity.vm_uid,
+            expected_pvc_uid=identity.rootdisk_pvc_uid,
+            entity_type=entity_type,
+        ):
+            return VMTeardownResult("retention_preflight_unproven", False)
         if (
             ssh_host is not None
             and identity.ssh_host is not None
@@ -1547,6 +2695,97 @@ class VMProvisioner:
         )
         if classification == "superseded":
             return VMTeardownResult("identity_superseded", False)
+        policy1_retention = "other"
+        if (
+            entity_type == "job"
+            and self.mode == "same-cluster"
+            and purge_disk is False
+            and _provision_generation(job_id) is not None
+        ):
+            from orchestrator.services.vm_job_cancel_retention import (
+                current_policy1_retention_parent,
+            )
+
+            policy1_retention = await current_policy1_retention_parent(
+                self._db,
+                parent_cleanup,
+                job_id=job_id,
+                generation=generation,
+                vm_uid=identity.vm_uid,
+                pvc_uid=identity.rootdisk_pvc_uid,
+            )
+            if policy1_retention is None:
+                return VMTeardownResult("retention_preflight_unproven", False)
+        if policy1_retention == "settled" and classification != "completed":
+            return VMTeardownResult("retention_preflight_unproven", False)
+        if policy1_retention == "open":
+            if classification not in {"matched", "completed"}:
+                return VMTeardownResult("identity_unknown", False)
+            if classification == "completed":
+                proven = await self._policy1_stop_settlement_replay(
+                    job_id, identity, parent_cleanup
+                )
+                return VMTeardownResult(
+                    "completed" if proven else "process_zero_unproven", proven
+                )
+            if (
+                classification == "matched"
+                and not await self._db.claim_managed_repository_workspace_retirement(
+                    job_id,
+                    owner_kind="job",
+                    scope="vm",
+                    provisioner="vm",
+                    runtime_incarnation=generation,
+                )
+            ):
+                return VMTeardownResult("process_zero_unproven", False)
+            from orchestrator.services.vm_pre_ssh_stop_store import VMPreSSHStopStore
+
+            store = VMPreSSHStopStore(self._db)
+            try:
+                existing = await store.current_intent(
+                    job_id, generation, parent_cleanup
+                )
+            except Exception:
+                return VMTeardownResult("process_zero_unproven", False)
+            if existing is not None and existing["frozen"].get("kind") == (
+                "vm_pre_ssh_stop_candidate_v1"
+            ):
+                try:
+                    proof = await store.committed_proof(
+                        job_id, generation, parent_cleanup
+                    )
+                except Exception:
+                    return VMTeardownResult("process_zero_unproven", False)
+                if proof is None and not await self._attempt_pre_ssh_positive_stop(
+                    job_id,
+                    identity,
+                    parent_cleanup,
+                    require_existing_intent=existing,
+                ):
+                    return VMTeardownResult("process_zero_unproven", False)
+                if proof is not None and proof["frozen"] != existing["frozen"]:
+                    return VMTeardownResult("process_zero_unproven", False)
+            elif existing is None or existing["frozen"].get("kind") == (
+                "vm_job_never_app_ready_retained_stop_candidate_v1"
+            ):
+                if not await self._attempt_never_app_ready_retained_stop(
+                    job_id, identity, parent_cleanup
+                ):
+                    return VMTeardownResult("process_zero_unproven", False)
+            else:
+                return VMTeardownResult("process_zero_unproven", False)
+            if not await self._release_pre_ssh_stop_finalizer(
+                job_id, generation, parent_cleanup
+            ):
+                return VMTeardownResult("process_zero_unproven", False)
+            return await self.delete_vm_captured(
+                job_id,
+                identity,
+                purge_disk=False,
+                entity_type="job",
+                parent_cleanup=parent_cleanup,
+            )
         if classification == "completed":
             contained = bool(
                 self._db
@@ -1558,7 +2797,7 @@ class VMProvisioner:
                     runtime_incarnation=generation,
                 )
             )
-            if not contained:
+            if not contained and policy1_retention != "settled":
                 contained = await self._retire_unallocated_preparation(
                     job_id, entity_type, identity, probe
                 )
@@ -1581,6 +2820,18 @@ class VMProvisioner:
                 runtime_incarnation=generation,
             )
         ):
+            if entity_type == "job":
+                from orchestrator.services.vm_pre_ssh_stop_store import (
+                    VMPreSSHStopStore,
+                )
+
+                if await VMPreSSHStopStore(self._db).has_intent(job_id, generation):
+                    if not isinstance(
+                        parent_cleanup, Mapping
+                    ) or not await self._release_pre_ssh_stop_finalizer(
+                        job_id, generation, parent_cleanup
+                    ):
+                        return VMTeardownResult("process_zero_unproven", False)
             return await self.delete_vm_captured(
                 job_id,
                 identity,
@@ -1663,16 +2914,21 @@ class VMProvisioner:
             ):
                 return VMTeardownResult("identity_superseded", False)
 
-        if (
-            self._db is None
-            or not await self._db.claim_managed_repository_workspace_retirement(
+        if self._db is None:
+            return VMTeardownResult("process_zero_unproven", False)
+        try:
+            claimed = await self._db.claim_managed_repository_workspace_retirement(
                 job_id,
                 owner_kind=entity_type,
                 scope="vm",
                 provisioner="vm",
                 runtime_incarnation=generation,
             )
-        ):
+        except asyncpg.ObjectInUseError as exc:
+            if exc.constraint_name != "active_vm_remote_operation_rebind":
+                raise
+            return VMTeardownResult("remote_operation_busy", False)
+        if not claimed:
             return VMTeardownResult("process_zero_unproven", False)
         current_identity = probe.identity
         never_started = bool(
@@ -1680,6 +2936,17 @@ class VMProvisioner:
             and current_identity.credential_runtime_started is False
         )
         discovered_endpoint = False
+        initial_ready_stop = bool(
+            entity_type == "job"
+            and self.mode == "same-cluster"
+            and not purge_disk
+            and current_identity is not None
+            and current_identity.credential_runtime_started is True
+            and isinstance(parent_cleanup, Mapping)
+            and isinstance(parent_cleanup.get("retention_preflight"), Mapping)
+            and parent_cleanup["retention_preflight"].get("kind")
+            == "vm_job_initial_ready_preflight_v1"
+        )
         if not never_started:
             if (
                 not effective_ssh_host
@@ -1697,6 +2964,36 @@ class VMProvisioner:
                 or not effective_ssh_port
                 or not identity.ssh_host_key_fingerprint
             ):
+                if (
+                    entity_type == "job"
+                    and self.mode == "same-cluster"
+                    and current_identity is not None
+                    and current_identity.credential_runtime_started is True
+                    and (
+                        initial_ready_stop
+                        or (not effective_ssh_host and not effective_ssh_port)
+                    )
+                    and not purge_disk
+                    and isinstance(parent_cleanup, Mapping)
+                    and not (
+                        isinstance(parent_cleanup.get("retention_preflight"), Mapping)
+                        and parent_cleanup["retention_preflight"].get("kind")
+                        == "vm_job_retained_ready_preflight_v1"
+                    )
+                    and await self._attempt_pre_ssh_positive_stop(
+                        job_id, identity, parent_cleanup
+                    )
+                ):
+                    if await self._release_pre_ssh_stop_finalizer(
+                        job_id, generation, parent_cleanup
+                    ):
+                        return await self.delete_vm_captured(
+                            job_id,
+                            identity,
+                            purge_disk=False,
+                            entity_type="job",
+                            parent_cleanup=parent_cleanup,
+                        )
                 return VMTeardownResult("process_zero_unproven", False)
             # Never learn a new host key from the candidate endpoint. The SSH
             # actuator authenticates the captured, controller-admitted pin.
@@ -1707,6 +3004,19 @@ class VMProvisioner:
                 operation="VM managed repository process retirement",
             )
             if not retired:
+                if initial_ready_stop and await self._attempt_pre_ssh_positive_stop(
+                    job_id, identity, parent_cleanup
+                ):
+                    if await self._release_pre_ssh_stop_finalizer(
+                        job_id, generation, parent_cleanup
+                    ):
+                        return await self.delete_vm_captured(
+                            job_id,
+                            identity,
+                            purge_disk=False,
+                            entity_type="job",
+                            parent_cleanup=parent_cleanup,
+                        )
                 return VMTeardownResult("process_zero_unproven", False)
         reprobe = await self._probe_vm_teardown_identity(job_id, generation)
         if (
@@ -1830,6 +3140,32 @@ class VMProvisioner:
         )
         return outcome.disposition == "completed"
 
+    async def _current_retained_purge(
+        self,
+        job_id,
+        generation,
+        vm_uid,
+        pvc_uid,
+        *,
+        parent_cleanup=None,
+        candidate=None,
+    ):
+        if self._db is None:
+            return None
+        from orchestrator.services.vm_job_retained_disk_purge import (
+            read_current_retained_purge,
+        )
+
+        return await read_current_retained_purge(
+            self._db,
+            job_id=job_id,
+            generation=generation,
+            vm_uid=vm_uid,
+            pvc_uid=pvc_uid,
+            parent_cleanup=parent_cleanup,
+            candidate=candidate,
+        )
+
     async def _delete_vm_with_identity(
         self,
         job_id: str,
@@ -1842,6 +3178,29 @@ class VMProvisioner:
         parent_cleanup: Mapping[str, Any] | None = None,
     ) -> bool:
         generation = _provision_generation(provision_generation)
+        if entity_type == "job" and purge_disk:
+            try:
+                await self._current_retained_purge(
+                    job_id,
+                    generation,
+                    expected_vm_uid,
+                    expected_rootdisk_pvc_uid,
+                    parent_cleanup=parent_cleanup,
+                )
+            except Exception:
+                logger.warning(
+                    "Retained purge transport authority is held", exc_info=True
+                )
+                return False
+        if not await self._ready_parent_is_current(
+            parent_cleanup,
+            job_id=job_id,
+            generation=generation,
+            expected_vm_uid=expected_vm_uid,
+            expected_pvc_uid=expected_rootdisk_pvc_uid,
+            entity_type=entity_type,
+        ):
+            return False
         if self._nats_available:
             kwargs: dict[str, Any] = {
                 "purge_disk": purge_disk,
@@ -1992,6 +3351,17 @@ class VMProvisioner:
             Status dict or None if unavailable.
         """
         generation = await self._current_provision_generation(entity_type, job_id)
+        phase_token = None
+        if entity_type == "job" and self._phase_store is not None:
+            try:
+                phase_token = await self._phase_store.capture(job_id, generation)
+            except Exception:
+                logger.exception(
+                    "Could not capture VM phase observation for %s", job_id
+                )
+                return None
+            if phase_token is None:
+                return None
         result: Optional[dict]
         if self._nats_available:
             result = await nats_bridge.query_vm_status(
@@ -2013,7 +3383,12 @@ class VMProvisioner:
             if result.get("status") == "not_found":
                 return None
             authenticated = result.get("_identity_authenticated") is True
-            current = await self._persist_status_identity(entity_type, job_id, result)
+            current = await self._persist_status_identity(
+                entity_type,
+                job_id,
+                result,
+                **({"phase_token": phase_token} if phase_token is not None else {}),
+            )
             if authenticated and not current:
                 return None
             result.pop("_identity_authenticated", None)
@@ -2128,9 +3503,28 @@ class VMProvisioner:
             return observation
         from orchestrator.services.vm_readiness import qualify_recovery_successor
 
+        frozen = context.get("creation_preflight") or {}
+        frozen = json.loads(frozen) if isinstance(frozen, str) else frozen
+        frozen_request = frozen.get("request") if isinstance(frozen, Mapping) else None
+        network_profile = (
+            frozen_request.get("network_profile")
+            if isinstance(frozen_request, Mapping)
+            else None
+        )
+        if (
+            owner_kind == "job"
+            and network_profile is None
+            and context.get("rootdisk_pvc_uid")
+        ):
+            observation["network_qualification"] = {
+                "qualified": False,
+                "reason": "retained_network_profile_unproven",
+            }
+            return observation
         qualified = await qualify_recovery_successor(
             successor,
             host_key_fingerprint=fingerprint,
+            network_profile=network_profile,
         )
         if qualified is None:
             return observation
@@ -2214,55 +3608,81 @@ class VMProvisioner:
         if self._http_client is None:
             return False
 
-        network_tier = DEFAULT_NETWORK_TIER
-        if self._db is not None:
-            try:
-                network_tier = (
-                    await self._db.get_workspace_network_tier(job_id, entity_type)
-                    or DEFAULT_NETWORK_TIER
-                )
-            except Exception:
-                logger.exception(
-                    "Failed to resolve network_tier for %s=%s; using default",
-                    entity_type,
-                    job_id,
-                )
+        from orchestrator.services.vm_creation_request import (
+            build_vm_creation_request,
+            capture_vm_creation_request,
+        )
 
-        payload: dict[str, Any] = {
-            "job_id": job_id,
-            "entity_type": entity_type,
-            "agent_config": agent_config,
-            "cpu_cores": cpu_cores,
-            "memory": memory,
-            "description": description,
-            "nats_url": "",  # No NATS in same-cluster mode
-            "network_tier": network_tier,
-        }
-        if orchestrator_url := os.getenv("ORCHESTRATOR_URL"):
-            payload["orchestrator_url"] = orchestrator_url
-        if workspace_storage is not None:
-            payload["workspace_storage"] = workspace_storage
-        if preparation is not None:
-            payload["preparation"] = preparation
-        if disk_size:
-            payload["disk_size"] = disk_size
-        if initialization is not None:
-            from shared.workspace_initialization import validate_initialization_request
-
-            payload["initialization"] = validate_initialization_request(initialization)
         generation = _provision_generation(provision_generation)
         if self._lifecycle_hmac_secret is not None and generation is None:
+            logger.error("Refusing authenticated HTTP VM create without a generation")
+            return False
+        # Only Job creates with a durable store participate in snapshot capture.
+        # Legacy no-store and thread transports retain their existing behavior.
+        capture_request = (
+            entity_type == "job" and generation is not None and self._db is not None
+        )
+        snapshot = None
+        try:
+            if capture_request:
+                snapshot = await capture_vm_creation_request(
+                    self._db,
+                    job_id=job_id,
+                    generation=generation,
+                )
+            if snapshot is None:
+                network_tier = DEFAULT_NETWORK_TIER
+                if self._db is not None:
+                    try:
+                        network_tier = (
+                            await self._db.get_workspace_network_tier(
+                                job_id, entity_type
+                            )
+                            or DEFAULT_NETWORK_TIER
+                        )
+                    except Exception:
+                        logger.exception(
+                            "Failed to resolve network_tier for %s=%s; using default",
+                            entity_type,
+                            job_id,
+                        )
+                payload = build_vm_creation_request(
+                    job_id=job_id,
+                    agent_config=agent_config,
+                    vm_image=vm_image,
+                    cpu_cores=cpu_cores,
+                    memory=memory,
+                    description=description,
+                    entity_type=entity_type,
+                    network_tier=network_tier,
+                    provision_generation=generation,
+                    orchestrator_url=os.getenv("ORCHESTRATOR_URL"),
+                    disk_size=disk_size,
+                    initialization=initialization,
+                    workspace_storage=workspace_storage,
+                    preparation=preparation,
+                )
+                if capture_request:
+                    snapshot = await capture_vm_creation_request(
+                        self._db,
+                        job_id=job_id,
+                        generation=generation,
+                        request=payload,
+                        initial_request=set_provisioning,
+                    )
+                    if snapshot is None:
+                        return False
+            if snapshot is not None:
+                payload = snapshot["request"]
+                preparation = payload.get("preparation")
+                workspace_storage = payload.get("workspace_storage")
+        except Exception:
+            # Capture failure cannot degrade into an uncaptured create. Do not
+            # log option values (initialization/description may contain secrets).
             logger.error(
-                "Refusing authenticated HTTP VM create for %s %s without a "
-                "current provision generation",
-                entity_type,
-                job_id,
+                "VM creation request capture refused for %s %s", entity_type, job_id
             )
             return False
-        if generation is not None:
-            payload["provision_generation"] = generation
-        if vm_image:
-            payload["vm_image"] = vm_image
         payload = sign_payload(
             payload,
             direction="request",
@@ -2276,15 +3696,24 @@ class VMProvisioner:
             else None
         )
 
+        response_authenticated = False
+        observation = {
+            "version": 1,
+            "provision_generation": generation,
+            "outcome": "response_unproven",
+            "authenticated": False,
+        }
         try:
             if set_provisioning:
                 if generation is not None:
-                    await self._set_context_if_generation(
+                    persisted = await self._set_context_if_generation(
                         entity_type,
                         job_id,
                         generation,
                         {"status": "provisioning"},
                     )
+                    if self._db is not None and not persisted:
+                        return False
                 else:
                     await self._set_context(
                         entity_type, job_id, {"status": "provisioning"}
@@ -2301,8 +3730,17 @@ class VMProvisioner:
                 raise RuntimeError(
                     "VM controller create response authentication failed"
                 )
-            resp.raise_for_status()
             data = unsigned_payload(data)
+            response_authenticated = (
+                self._lifecycle_hmac_secret is not None
+                and generation is not None
+                and data.get("provision_generation") == generation
+            )
+            observation.update(
+                authenticated=response_authenticated,
+                outcome="observed" if response_authenticated else "response_unproven",
+            )
+            resp.raise_for_status()
             if preparation is not None and data.get("status") == "created":
                 receipt = data.get("preparation") or {}
                 if (
@@ -2327,6 +3765,7 @@ class VMProvisioner:
                 "vm_name": data.get("vm_name"),
                 "namespace": data.get("namespace"),
                 "provisioned_by": "http",
+                "creation_observation": observation,
             }
             # New controllers return the immutable admitted VM UID. During a
             # rolling upgrade an older controller may omit it; the fresh
@@ -2466,10 +3905,15 @@ class VMProvisioner:
                 job_id,
                 error,
             )
+            observation.update(
+                outcome="rejected" if response_authenticated else "response_unproven",
+                http_status=e.response.status_code,
+            )
             failure = {
                 "status": "failed",
                 "error": error,
                 "provisioned_by": "http",
+                "creation_observation": observation,
             }
             if generation is not None:
                 await self._set_context_if_generation(
@@ -2479,12 +3923,14 @@ class VMProvisioner:
                 await self._set_context(entity_type, job_id, failure)
             return False
         except httpx.RequestError:
+            observation.update(outcome="transport_unknown", authenticated=False)
             if preparation is not None and generation is not None:
                 # The controller may already have persisted the build or VM.
                 # Poll the SAME admitted allocation; a lost reply is neither a
                 # successful build nor permission for another disk writer.
                 waiting = {
                     "status": "waiting_preparation",
+                    "creation_observation": observation,
                     "preparation": {
                         "allocationId": preparation["allocationId"],
                         "phase": "Pending",
@@ -2499,6 +3945,7 @@ class VMProvisioner:
                 "status": "failed",
                 "error": "VM controller transport unavailable",
                 "provisioned_by": "http",
+                "creation_observation": observation,
             }
             if generation is not None:
                 await self._set_context_if_generation(
@@ -2508,11 +3955,13 @@ class VMProvisioner:
                 await self._set_context(entity_type, job_id, failure)
             return False
         except Exception as e:
+            observation["outcome"] = "response_unproven"
             logger.error("HTTP create failed for %s %s: %s", entity_type, job_id, e)
             failure = {
                 "status": "failed",
                 "error": str(e),
                 "provisioned_by": "http",
+                "creation_observation": observation,
             }
             if generation is not None:
                 await self._set_context_if_generation(
@@ -2639,6 +4088,8 @@ class VMProvisioner:
         provision_generation: str | None = None,
         *,
         exact_absence: bool = False,
+        workspace_storage: Mapping[str, Any] | None = None,
+        retained_ready_stop_candidate: Mapping[str, Any] | None = None,
     ) -> Optional[dict]:
         """Query VM status via the co-located VM controller."""
         if self._http_client is None:
@@ -2657,7 +4108,33 @@ class VMProvisioner:
         if exact_absence:
             signed_payload["exact_absence"] = True
             params["exact_absence"] = "true"
+        if retained_ready_stop_candidate is not None:
+            from shared.vm_cancel_retention import valid_ready_retention_candidate
+
+            if (
+                self._lifecycle_hmac_secret is None
+                or not valid_ready_retention_candidate(retained_ready_stop_candidate)
+                or retained_ready_stop_candidate["job_id"] != job_id
+                or retained_ready_stop_candidate["provision_generation"] != generation
+            ):
+                return None
+            encoded = json.dumps(
+                dict(retained_ready_stop_candidate),
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            signed_payload["retained_ready_stop_candidate"] = encoded
+            params["retained_ready_stop_candidate"] = encoded
         binding = await self._storage_context(job_id)
+        if workspace_storage is not None:
+            from shared.vm_workspace_storage import storage_binding
+
+            try:
+                captured = storage_binding(workspace_storage)
+            except (KeyError, TypeError, ValueError):
+                return None
+            if binding != captured:
+                return None
         if binding is not None:
             signed_payload["workspace_storage"] = json.dumps(
                 binding, sort_keys=True, separators=(",", ":")
@@ -2790,8 +4267,16 @@ class VMProvisioner:
             # A PVC name is reusable.  Only the newly admitted immutable UID
             # may authenticate this incarnation's rootdisk for metering.
             "rootdisk_pvc_uid": None,
+            "network_profile_evidence": None,
             "identity_authenticated": False,
             "identity_provision_generation": None,
+            "creation_request": None,
+            "creation_observation": None,
+            "admission_accounting_version": 1,
+            "provision_admission": None,
+            "provisioning": None,
+            "provisioning_revision": 0,
+            "provisioning_attention_reason": None,
             # Opaque incarnation nonce. Controller identities are merged only
             # through a DB-side compare-and-merge against this exact value.
             "provision_generation": str(uuid4()),
@@ -2847,11 +4332,15 @@ class VMProvisioner:
         disk_size: Optional[str] = None,
         initialization: dict | None = None,
         preparation: dict | None = None,
+        network_profile: dict | None = None,
         expected_runtime_generation: str | None = None,
         expected_agent_id: str | None = None,
         expected_attach_token: str | None = None,
         expected_vm_context: Mapping[str, Any] | None = None,
+        wake_operation_id: str | None = None,
+        retained_resume_id: str | None = None,
         poll: bool = False,
+        initial_creation: Mapping[str, Any] | None = None,
     ) -> bool | dict[str, Any]:
         """Create a VM for a persistent thread.
 
@@ -2861,6 +4350,10 @@ class VMProvisioner:
         Returns:
             True if the request was accepted, False otherwise.
         """
+        if (wake_operation_id is not None or retained_resume_id is not None) and (
+            poll or preparation is not None or initialization is not None
+        ):
+            return False
         if preparation is not None:
             preparation = await self._validate_preparation(
                 thread_id, "thread", preparation
@@ -2888,6 +4381,7 @@ class VMProvisioner:
                 expected_agent_id=expected_agent_id,
                 expected_attach_token=expected_attach_token,
                 expected_vm_context=expected_vm_context,
+                **({"initial_creation": initial_creation} if initial_creation else {}),
             )
             if preparation_context is None:
                 return waiting
@@ -2897,6 +4391,51 @@ class VMProvisioner:
         # request.  A stale route read, End, Resume, rebind, or DB failure is a
         # hard refusal with zero external calls.
         fresh_context = self._fresh_provision_ctx()
+        retained = None
+        if retained_resume_id is not None:
+            if self._db is None or wake_operation_id is not None:
+                return False
+            from orchestrator.services.vm_thread_retained_resume import (
+                operation_on_conn,
+            )
+
+            async with self._db.acquire() as conn:
+                retained = await operation_on_conn(conn, retained_resume_id, thread_id)
+            if retained is None:
+                return False
+            fresh_context["provision_generation"] = str(
+                retained["provision_generation"]
+            )
+            fresh_context["retained_resume_id"] = str(retained["id"])
+            fresh_context["rootdisk"] = None
+
+        if wake_operation_id is not None:
+            try:
+                wake_id = UUID(str(wake_operation_id))
+            except (TypeError, ValueError):
+                return False
+            wake = (
+                await self._db.fetchrow(
+                    "SELECT wake_generation,wake_request_id,pvc_uid FROM "
+                    "vm_idle_operations WHERE id=$1 AND owner_kind='thread' "
+                    "AND owner_id=$2 AND release_kind='pinned_thread' "
+                    "AND closed_at IS NULL",
+                    wake_id,
+                    UUID(thread_id),
+                )
+                if self._db is not None
+                else None
+            )
+            if (
+                wake is None
+                or wake["wake_generation"] is None
+                or wake["wake_request_id"] is None
+            ):
+                return False
+            fresh_context["provision_generation"] = str(wake["wake_generation"])
+            fresh_context["idle_wake_operation_id"] = str(wake_id)
+            fresh_context["idle_wake_request_id"] = str(wake["wake_request_id"])
+            fresh_context["idle_predecessor_pvc_uid"] = str(wake["pvc_uid"])
         fresh_context.update(
             initialization=initialization,
             preparation_request=preparation,
@@ -2937,6 +4476,208 @@ class VMProvisioner:
         begin_impl = getattr(self._db, "begin_pinned_thread_vm_provisioning", None)
         if not callable(begin_impl):
             return False
+        from shared.vm_resource_policy import configured_enforcement_required
+
+        try:
+            resource_enforced = configured_enforcement_required()
+        except ValueError:
+            return False
+        if (
+            not resource_enforced
+            and os.getenv("VM_NETWORK_PROFILE_ENABLED", "false").lower() == "true"
+        ):
+            return False
+        if retained is not None and not resource_enforced and not retained["nonquota"]:
+            return False
+        # Durable creation authority is a lifecycle requirement independent of
+        # optional resource quotas. Retry-enabled thread VMs must use the same
+        # immutable request/effect protocol as jobs even when quotas are off.
+        durable_creation = resource_enforced or (
+            self.mode == "same-cluster"
+            and os.getenv("VM_CREATION_RETRY_ENABLED", "false").lower() == "true"
+        )
+        if retained is not None and not durable_creation:
+            return False
+        creation_source = None
+        if durable_creation:
+            # A claimed immutable source is the only route to a v3 effect. A
+            # polling caller reuses its durable request; it never installs a
+            # second source or replays a legacy POST/NATS create.
+            if (
+                self.mode != "same-cluster"
+                or os.getenv("VM_CREATION_RETRY_ENABLED", "false").lower() != "true"
+                or self._http_client is None
+                or self._lifecycle_hmac_secret is None
+            ):
+                return False
+            if poll:
+                request_id = (expected_vm_context or {}).get("creation_request_id")
+                if request_id is None:
+                    return False
+                try:
+                    source = await self._db.fetchrow(
+                        "SELECT owner_kind,thread_id,thread_runtime_generation,"
+                        "thread_agent_id,thread_attach_token,provision_generation "
+                        "FROM vm_creation_retries WHERE request_id=$1",
+                        UUID(request_id),
+                    )
+                except (TypeError, ValueError):
+                    return False
+                exact_source = bool(
+                    source
+                    and source["owner_kind"] == "thread"
+                    and str(source["thread_id"]) == thread_id
+                    and str(source["thread_runtime_generation"])
+                    == expected_runtime_generation
+                    and str(source["provision_generation"]) == generation
+                    and (
+                        str(source["thread_agent_id"])
+                        if source["thread_agent_id"]
+                        else None
+                    )
+                    == expected_agent_id
+                    and (
+                        str(source["thread_attach_token"])
+                        if source["thread_attach_token"]
+                        else None
+                    )
+                    == expected_attach_token
+                )
+                if exact_source:
+                    return True
+                from orchestrator.services.vm_thread_network import (
+                    confirmed_pre_setup_source,
+                )
+
+                return await confirmed_pre_setup_source(
+                    self._db,
+                    thread_id=thread_id,
+                    request_id=request_id,
+                    generation=generation,
+                    runtime_generation=expected_runtime_generation,
+                    agent_id=expected_agent_id,
+                    attach_token=expected_attach_token,
+                )
+            from orchestrator.services.vm_creation_request import (
+                build_vm_creation_request,
+            )
+            from orchestrator.services.vm_creation_transport import (
+                CreationConfigurationUnavailable,
+                resolve_vm_creation_configuration,
+            )
+
+            try:
+                from shared.vm_network_profile import selected_profile
+
+                if retained is not None:
+                    prior_request = retained["request"]
+                    if vm_image not in (None, prior_request.get("vm_image")) or (
+                        network_profile is not None
+                        and network_profile != prior_request.get("network_profile")
+                    ):
+                        return False
+                    vm_image = prior_request.get("vm_image")
+                    network_profile = prior_request.get("network_profile")
+                elif wake_operation_id is not None:
+                    from orchestrator.services.vm_thread_network import (
+                        document,
+                        profile_enabled,
+                    )
+
+                    predecessor = await self._db.fetchrow(
+                        "SELECT canonical_request FROM vm_creation_retries "
+                        "WHERE owner_kind='thread' AND thread_id=$1 "
+                        "AND provision_generation=$2",
+                        UUID(thread_id),
+                        UUID(
+                            str((expected_vm_context or {}).get("provision_generation"))
+                        ),
+                    )
+                    prior_request = (
+                        document(predecessor["canonical_request"])
+                        if (predecessor is not None)
+                        else None
+                    )
+                    inherited = (
+                        prior_request.get("network_profile")
+                        if (prior_request is not None)
+                        else None
+                    )
+                    if prior_request is None and profile_enabled():
+                        return False
+                    if network_profile is not None and network_profile != inherited:
+                        return False
+                    network_profile = inherited
+                    if inherited is not None:
+                        if vm_image not in (None, prior_request.get("vm_image")):
+                            return False
+                        vm_image = prior_request.get("vm_image")
+                else:
+                    selected = selected_profile(
+                        vm_image,
+                        prepared=(
+                            preparation is not None
+                            or (expected_vm_context or {}).get("rootdisk_pvc_uid")
+                            is not None
+                        ),
+                    )
+                    if network_profile is not None and network_profile != selected:
+                        return False
+                    network_profile = selected
+                network_tier = (
+                    await self._db.get_workspace_network_tier(thread_id, "thread")
+                    or DEFAULT_NETWORK_TIER
+                )
+                request = build_vm_creation_request(
+                    job_id=thread_id,
+                    entity_type="thread",
+                    agent_config=agent_config,
+                    vm_image=vm_image,
+                    cpu_cores=cpu_cores,
+                    memory=memory,
+                    description=description,
+                    network_tier=network_tier,
+                    provision_generation=generation,
+                    orchestrator_url=os.getenv("ORCHESTRATOR_URL"),
+                    disk_size=disk_size,
+                    initialization=initialization,
+                    preparation=preparation,
+                    network_profile=network_profile,
+                )
+                resolved = await resolve_vm_creation_configuration(
+                    self._http_client,
+                    request,
+                    secret=self._lifecycle_hmac_secret,
+                )
+                configuration_version = resolved["controller_configuration"].get(
+                    "version"
+                )
+                if (
+                    configuration_version not in {1, 3}
+                    or resource_enforced
+                    and configuration_version != 3
+                ):
+                    return False
+                from shared.vm_creation_retry import canonical_request_digest
+                from shared.vm_creation_issuance import canonical_configuration_digest
+
+                frozen_request = resolved["request"]
+                frozen_config = resolved["controller_configuration"]
+                creation_source = {
+                    "request_id": (
+                        str(retained["request_id"]) if retained is not None else None
+                    )
+                    or fresh_context.get("idle_wake_request_id")
+                    or str(uuid4()),
+                    "request": frozen_request,
+                    "request_digest": canonical_request_digest(frozen_request),
+                    "controller_configuration": frozen_config,
+                    "controller_configuration_digest": canonical_configuration_digest(
+                        frozen_config
+                    ),
+                }
+            except (CreationConfigurationUnavailable, ValueError, TypeError, KeyError):
+                return False
         try:
             persisted = await begin_impl(
                 thread_id,
@@ -2945,7 +4686,15 @@ class VMProvisioner:
                 expected_attach_token=expected_attach_token,
                 expected_vm_context=expected_vm_context,
                 provision_context=fresh_context,
+                wake_operation_id=wake_operation_id,
+                **(
+                    {"retained_resume_id": retained_resume_id}
+                    if retained_resume_id is not None
+                    else {}
+                ),
+                **({"creation_source": creation_source} if creation_source else {}),
                 **({"poll": True} if poll else {}),
+                **({"initial_creation": initial_creation} if initial_creation else {}),
                 **(
                     {"expected_preparation_context": preparation_context}
                     if preparation_context is not None
@@ -2960,6 +4709,11 @@ class VMProvisioner:
             return False
         if not persisted:
             return False
+
+        if durable_creation:
+            # The controller retry service owns every subsequent POST and
+            # observation. A boolean here means durable source admission only.
+            return True
 
         result: bool | dict[str, Any]
         if self._nats_available:

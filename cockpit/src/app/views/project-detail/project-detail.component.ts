@@ -1,5 +1,6 @@
 import {ChangeDetectionStrategy, Component, computed, DestroyRef, inject, OnDestroy, OnInit, signal} from '@angular/core';
 import {takeUntilDestroyed} from '@angular/core/rxjs-interop';
+import {forkJoin} from 'rxjs';
 import {ActivatedRoute, Router} from '@angular/router';
 import {TranslocoPipe, TranslocoService} from '@jsverse/transloco';
 import {MarkdownComponent} from 'ngx-markdown';
@@ -7,6 +8,20 @@ import {stripMarkdown} from '../../core/util/strip-markdown';
 import {effectiveJobStatus} from '../../core/util/job-status';
 import {ApiService} from '../../core/services/api.service';
 import {CapabilitiesService} from '../../core/services/capabilities.service';
+import {ConnectorDriversService} from '../../core/services/connector-drivers.service';
+import {
+  ConnectorAccessLevel,
+  offeredAccess,
+  strictAccess,
+  strictAccessLevel,
+} from '../../core/models/connector-driver.model';
+import {
+  accessLevelLabelKey,
+  isCloudConnectorType,
+  isPlatformOwned,
+  platformKindLabelKey,
+  platformManagedLabelKey,
+} from '../../core/models/platform-connector';
 import {ErrorMessageService} from '../../core/services/error-message.service';
 import {UserService} from '../../core/services/user.service';
 import {ViewportService} from '../../core/services/viewport.service';
@@ -28,6 +43,7 @@ import {ProjectOfficerComponent} from './project-officer.component';
 import {ProjectBacklogComponent} from './project-backlog.component';
 import {ExternalImageDirective} from '../../ui/external-image';
 import {
+    ConnectorAccessChoiceLevel,
     Datasource,
     Expert,
     Job,
@@ -42,8 +58,29 @@ import {
     ProjectRepoRole,
     ProjectRepository,
     ProjectStatus,
+    ProjectWorkspaceDefaults,
     User,
+    WorkspaceMode,
+    WorkspaceTemplateRef,
 } from '../../core/models/api.model';
+
+/** A stored template selection (`ProjectWorkspaceDefaults.stored.container`
+ *  or `.vm`) is `{"ref": {...}}` for a Settings row or `{"inline": {...}}`
+ *  for one the manifest owns; only a `ref` maps to one of this tab's own
+ *  `<option>` values. */
+function templateKey(selection: Record<string, unknown> | null): string | null {
+  const ref = selection?.['ref'] as WorkspaceTemplateRef | undefined;
+  return ref ? `${ref.scope.kind}/${ref.scope.name}/${ref.name}` : null;
+}
+
+/** Inverse of the option `key` built in `loadWorkspaceDefaults`
+ *  (`${scope.kind}/${scope.name}/${name}`) — split on the first two slashes
+ *  only, since a template name may itself contain one. */
+function templateRef(key: string | null): WorkspaceTemplateRef | null {
+  if (!key) return null;
+  const [kind, name, ...rest] = key.split('/');
+  return {name: rest.join('/'), scope: {kind, name}};
+}
 
 type Tab = 'overview' | 'jobs' | 'knowledge' | 'datasources' | 'repos' | 'experts' | 'members' | 'loop' | 'centurion' | 'settings';
 
@@ -599,9 +636,83 @@ type Tab = 'overview' | 'jobs' | 'knowledge' | 'datasources' | 'repos' | 'expert
                 </div>
               }
 
+              <!-- The project's own cloud folders, and any link whose driver
+                   has strict levels: the link holds a default level its
+                   work binds at when it chooses none (main cloud slice 5),
+                   never the read-only switch. -->
+              @if (cloudFolderLinks().length) {
+                <div class="cloud-folder-links" data-cloud-folders>
+                  <h3 class="settings-heading">{{ 'projectDetail.datasources.cloudFolders.title' | transloco }}</h3>
+                  <p class="cloud-folder-hint">{{ 'projectDetail.datasources.cloudFolders.hint' | transloco }}</p>
+                  @if (cloudFolderError(); as message) {
+                    <div class="cloud-folder-error" role="alert">{{ message }}</div>
+                  }
+                  <div class="table-scroll">
+                  <table class="data-table app-table">
+                    <thead>
+                      <tr>
+                        <th>{{ 'projectDetail.datasources.colName' | transloco }}</th>
+                        <th>{{ 'projectDetail.datasources.colType' | transloco }}</th>
+                        <th>{{ 'projectDetail.datasources.cloudFolders.colAccess' | transloco }}</th>
+                        <th>{{ 'projectDetail.datasources.colActions' | transloco }}</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      @for (ds of cloudFolderLinks(); track ds.id + ':' + linkAccessRevision()) {
+                        <tr data-cloud-folder-link>
+                          <td>{{ ds.name }}</td>
+                          <td>
+                            <span class="role-badge" [class]="'role-' + ds.type">
+                              {{ linkKindLabelKey(ds) | transloco }}
+                            </span>
+                          </td>
+                          <td>
+                            <app-select
+                              size="sm"
+                              [value]="ds.project_access ?? ''"
+                              [disabled]="savingLinkAccess() === ds.id"
+                              (changed)="updateLinkAccess(ds.id, $event ?? '')"
+                            >
+                              <option value="">{{ 'projectDetail.datasources.cloudFolders.defaultOption' | transloco:{ level: levelLabel(linkDefaultLevel(ds)) | transloco } }}</option>
+                              @for (level of linkLevels(ds); track level.id) {
+                                <option [value]="level.id" [disabled]="!level.offered" [attr.title]="level.detail || null">
+                                  {{ levelLabel(level.id) | transloco }}
+                                  @if (!level.offered) {
+                                    · {{ 'projectDetail.datasources.cloudFolders.notOffered' | transloco }}
+                                  }
+                                </option>
+                              }
+                            </app-select>
+                            @if (linkLevelEnforcedBy(ds); as line) {
+                              <div class="link-enforced" [attr.data-level]="linkLevel(ds)">
+                                <strong>{{ 'projectDetail.datasources.accessEnforcedBy' | transloco }}</strong>
+                                {{ line }}
+                              </div>
+                            }
+                          </td>
+                          <td>
+                            @if (managedLabelKey(ds); as managedKey) {
+                              <span class="link-managed" data-managed>
+                                <app-icon size="xs">lock</app-icon>
+                                {{ managedKey | transloco }}
+                              </span>
+                            } @else {
+                              <app-button variant="danger" size="sm" (clicked)="unlinkDatasource(ds.id)">
+                                {{ 'projectDetail.datasources.unlink' | transloco }}
+                              </app-button>
+                            }
+                          </td>
+                        </tr>
+                      }
+                    </tbody>
+                  </table>
+                  </div>
+                </div>
+              }
+
               @if (projectDatasources().length === 0) {
                 <div class="empty-inline">{{ 'projectDetail.datasources.empty' | transloco }}</div>
-              } @else {
+              } @else if (otherLinks().length) {
                 <div class="table-scroll">
                 <table class="data-table app-table">
                   <thead>
@@ -614,7 +725,7 @@ type Tab = 'overview' | 'jobs' | 'knowledge' | 'datasources' | 'repos' | 'expert
                     </tr>
                   </thead>
                   <tbody>
-                    @for (ds of projectDatasources(); track ds.id) {
+                    @for (ds of otherLinks(); track ds.id) {
                       <tr>
                         <td>{{ ds.name }}</td>
                         <td>
@@ -631,30 +742,81 @@ type Tab = 'overview' | 'jobs' | 'knowledge' | 'datasources' | 'repos' | 'expert
                           />
                         </td>
                         <td>
-                          @if (ds.type === 'kb') {
-                            <app-badge
-                              tone="info"
-                              size="sm"
-                              [title]="'projectDetail.datasources.accessKbReadOnlyHint' | transloco"
-                            >
-                              {{ 'projectDetail.datasources.accessReadOnly' | transloco }}
-                            </app-badge>
+                          <!-- Only the levels the connector's driver offers
+                               (capability matrix): one level is shown, not
+                               chosen. The bound level is the stricter of the
+                               link and the creator's read-only tag, so the
+                               bound level's line shows here; a tag the link
+                               cannot lift replaces the switch and says why. -->
+                          @if (linkAccessManaged(ds)) {
+                            <!-- A platform-owned link (the project's own
+                                 cloud folder) is not this table's to set: it
+                                 shows the level it binds at. -->
+                            @if (linkAccessLevel(ds); as level) {
+                              <app-badge tone="neutral" size="sm" data-managed-access [attr.data-level]="level.id">
+                                @if (accessLevelKey(level.id); as key) {
+                                  {{ key | transloco }}
+                                } @else {
+                                  {{ level.id }}
+                                }
+                              </app-badge>
+                            }
                           } @else {
-                            <app-select
-                              size="sm"
-                              [value]="boolToText(ds.project_read_only)"
-                              (changed)="updateDatasourceReadOnly(ds.id, $event ?? '')"
-                            >
-                              <option value="">{{ 'projectDetail.datasources.accessDefault' | transloco }}</option>
-                              <option value="true">{{ 'projectDetail.datasources.accessReadOnly' | transloco }}</option>
-                              <option value="false">{{ 'projectDetail.datasources.accessReadWrite' | transloco }}</option>
-                            </app-select>
+                          @switch (linkAccessShown(ds)) {
+                            @case ('read_only') {
+                              <app-badge
+                                tone="info"
+                                size="sm"
+                                [title]="linkAccessLevel(ds) ? '' : ('projectDetail.datasources.accessKbReadOnlyHint' | transloco)"
+                              >
+                                {{ 'projectDetail.datasources.accessReadOnly' | transloco }}
+                              </app-badge>
+                              @if (creatorReadOnly(ds)) {
+                                <div class="link-creator" data-creator-read-only>
+                                  {{ 'projectDetail.datasources.accessCreatorReadOnly' | transloco }}
+                                </div>
+                              }
+                            }
+                            @case ('read_write') {
+                              <app-badge tone="neutral" size="sm">
+                                {{ 'projectDetail.datasources.accessReadWrite' | transloco }}
+                              </app-badge>
+                            }
+                            @default {
+                              <app-select
+                                size="sm"
+                                [value]="boolToText(ds.project_read_only)"
+                                (changed)="updateDatasourceReadOnly(ds.id, $event ?? '')"
+                              >
+                                <option value="">{{ 'projectDetail.datasources.accessDefault' | transloco }}</option>
+                                <option value="true">{{ 'projectDetail.datasources.accessReadOnly' | transloco }}</option>
+                                <option value="false">{{ 'projectDetail.datasources.accessReadWrite' | transloco }}</option>
+                              </app-select>
+                            }
+                          }
+                          }
+                          @if (linkAccessLevel(ds); as level) {
+                            <div class="link-enforced" [class.link-advisory]="level.advisory" [attr.data-level]="level.id">
+                              <strong>{{ (level.advisory ? 'projectDetail.datasources.accessAdvisory' : 'projectDetail.datasources.accessEnforcedBy') | transloco }}</strong>
+                              @if (githubAppReadOnly(ds)) {
+                                {{ 'projectDetail.datasources.githubAppReadOnly' | transloco }}
+                              } @else {
+                                {{ level.enforced_by }}
+                              }
+                            </div>
                           }
                         </td>
                         <td>
-                          <app-button variant="danger" size="sm" (clicked)="unlinkDatasource(ds.id)">
-                            {{ 'projectDetail.datasources.unlink' | transloco }}
-                          </app-button>
+                          @if (managedLabelKey(ds); as managedKey) {
+                            <span class="link-managed" data-managed>
+                              <app-icon size="xs">lock</app-icon>
+                              {{ managedKey | transloco }}
+                            </span>
+                          } @else {
+                            <app-button variant="danger" size="sm" (clicked)="unlinkDatasource(ds.id)">
+                              {{ 'projectDetail.datasources.unlink' | transloco }}
+                            </app-button>
+                          }
                         </td>
                       </tr>
                     }
@@ -992,6 +1154,111 @@ type Tab = 'overview' | 'jobs' | 'knowledge' | 'datasources' | 'repos' | 'expert
                 </div>
               }
 
+              <!-- Workspace defaults: what Jobs and Sessions in this Project
+                   get when they don't pick a workspace (spec §6). Read-only
+                   while archived, manifest-owned, or the caller isn't an
+                   owner/admin — canEditWorkspaceDefaults() covers all three,
+                   the fields stay visible either way. -->
+              @if (workspaceDefaults(); as wd) {
+                <div class="settings-group">
+                  <h3 class="settings-heading">{{ 'projectDetail.settings.workspaceDefaults' | transloco }}</h3>
+                  <p class="text-muted setting-desc">
+                    {{ 'projectDetail.settings.workspaceDefaultsHint' | transloco }}
+                  </p>
+                  @if (wd.managed_by_manifest) {
+                    <p class="archived-note" role="note">
+                      {{ 'projectDetail.settings.workspaceDefaultsManaged' | transloco }}
+                    </p>
+                  }
+                  @for (problem of wd.installation_problems; track problem) {
+                    <p class="edit-error" role="alert">{{ problem }}</p>
+                  }
+                  <app-form-field [label]="'projectDetail.settings.workspaceJobs' | transloco">
+                    <app-select
+                      [value]="wdJobs() ?? ''"
+                      [disabled]="!canEditWorkspaceDefaults()"
+                      (changed)="wdJobs.set($any($event) || null)"
+                    >
+                      <option value="">{{
+                        'projectDetail.settings.installationDefault' | transloco: { value: modeLabel(wd.installation.jobs) }
+                      }}</option>
+                      @for (mode of workspaceModes(); track mode) {
+                        <option [value]="mode">{{ modeLabel(mode) }}</option>
+                      }
+                    </app-select>
+                  </app-form-field>
+                  <app-form-field [label]="'projectDetail.settings.workspaceSessions' | transloco">
+                    <app-select
+                      [value]="wdSessions() ?? ''"
+                      [disabled]="!canEditWorkspaceDefaults()"
+                      (changed)="wdSessions.set($any($event) || null)"
+                    >
+                      <option value="">{{
+                        'projectDetail.settings.installationDefault' | transloco: { value: modeLabel(wd.installation.sessions) }
+                      }}</option>
+                      @for (mode of workspaceModes(); track mode) {
+                        <option [value]="mode">{{ modeLabel(mode) }}</option>
+                      }
+                    </app-select>
+                  </app-form-field>
+                  <app-form-field
+                    [label]="'projectDetail.settings.workspaceContainerTemplate' | transloco"
+                    [hint]="wd.template_problems.container ?? ''"
+                  >
+                    <app-select
+                      [value]="wd.managed_by_manifest && wd.stored.container ? 'manifest' : (wdContainer() ?? '')"
+                      [disabled]="!canEditWorkspaceDefaults()"
+                      (changed)="wdContainer.set($event || null)"
+                    >
+                      <option value="">{{
+                        'projectDetail.settings.installationDefault' | transloco: { value: wd.installation.container ?? modeLabel('container') }
+                      }}</option>
+                      @if (wd.managed_by_manifest && wd.stored.container) {
+                        <option value="manifest">{{ 'projectDetail.settings.fromManifest' | transloco }}</option>
+                      }
+                      @for (t of containerTemplates(); track t.key) {
+                        <option [value]="t.key">{{ t.label }}</option>
+                      }
+                    </app-select>
+                  </app-form-field>
+                  @if (wd.vm_available) {
+                    <app-form-field
+                      [label]="'projectDetail.settings.workspaceVmTemplate' | transloco"
+                      [hint]="wd.template_problems.vm ?? ''"
+                    >
+                      <app-select
+                        [value]="wd.managed_by_manifest && wd.stored.vm ? 'manifest' : (wdVm() ?? '')"
+                        [disabled]="!canEditWorkspaceDefaults()"
+                        (changed)="wdVm.set($event || null)"
+                      >
+                        <option value="">{{
+                          'projectDetail.settings.installationDefault' | transloco: { value: wd.installation.vm ?? modeLabel('vm') }
+                        }}</option>
+                        @if (wd.managed_by_manifest && wd.stored.vm) {
+                          <option value="manifest">{{ 'projectDetail.settings.fromManifest' | transloco }}</option>
+                        }
+                        @for (t of vmTemplates(); track t.key) {
+                          <option [value]="t.key">{{ t.label }}</option>
+                        }
+                      </app-select>
+                    </app-form-field>
+                  }
+                  @if (canEditWorkspaceDefaults()) {
+                    <div class="settings-actions">
+                      <app-button
+                        variant="primary"
+                        size="sm"
+                        [loading]="isSavingWorkspaceDefaults()"
+                        [disabled]="isSavingWorkspaceDefaults()"
+                        (clicked)="saveWorkspaceDefaults()"
+                      >
+                        {{ 'projectDetail.settings.save' | transloco }}
+                      </app-button>
+                    </div>
+                  }
+                </div>
+              }
+
               <!-- Cloud Storage -->
               <div class="settings-group">
                 <h3 class="settings-heading">{{ 'projectDetail.settings.cloudStorage' | transloco }}</h3>
@@ -1003,15 +1270,11 @@ type Tab = 'overview' | 'jobs' | 'knowledge' | 'datasources' | 'repos' | 'expert
                       <app-icon size="xs">open_in_new</app-icon>
                     </a>
                   </div>
-                  <app-checkbox
-                    [checked]="settingsCloudReadOnly()"
-                    [disabled]="isArchived()"
-                    (changed)="toggleCloudReadOnly($event)"
-                  >
-                    {{ 'projectDetail.settings.readOnlyAgent' | transloco }}
-                  </app-checkbox>
-                  <p class="text-muted setting-desc">
-                    {{ 'projectDetail.settings.readOnlyAgentDesc' | transloco }}
+                  <!-- What an agent may do in the folder is its connector's
+                       level now (main cloud slices 5 and 8), not a project
+                       switch. -->
+                  <p class="text-muted setting-desc" data-cloud-access-hint>
+                    {{ 'projectDetail.settings.cloudAccessHint' | transloco }}
                   </p>
                 } @else {
                   <p class="text-muted setting-desc">
@@ -1379,6 +1642,48 @@ type Tab = 'overview' | 'jobs' | 'knowledge' | 'datasources' | 'repos' | 'expert
     .role-jobs { background: var(--accent-color); color: var(--app-bg); }
     .role-source { background: var(--success-tint); color: var(--success); }
     .role-reference { background: var(--warning-tint); color: var(--warning); }
+
+    /* What a connector link's access level is enforced by (capability matrix),
+       and why a creator's read-only tag stands over the link. */
+    .link-enforced,
+    .link-creator {
+      max-width: 36ch;
+      margin-top: 4px;
+      font-size: 11px;
+      line-height: 1.35;
+      color: var(--text-muted);
+    }
+
+    .link-enforced.link-advisory { color: var(--warning); }
+
+    .cloud-folder-links {
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+    .cloud-folder-links .settings-heading { margin: 0; }
+    .cloud-folder-hint {
+      margin: 0;
+      font-size: 12px;
+      color: var(--text-muted);
+    }
+    .cloud-folder-error {
+      padding: 8px 10px;
+      border-radius: var(--radius-control);
+      background: var(--danger-tint);
+      color: var(--danger);
+      font-size: 12px;
+    }
+
+    /* A platform-owned link: SRW keeps it, so no Unlink. */
+    .link-managed {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      font-size: 12px;
+      color: var(--text-muted);
+      white-space: nowrap;
+    }
 
     /* Inline form */
     .inline-form {
@@ -1901,6 +2206,7 @@ export class ProjectDetailPageComponent implements OnInit, OnDestroy {
   private readonly transloco = inject(TranslocoService);
   private readonly errors = inject(ErrorMessageService);
   private readonly destroyRef = inject(DestroyRef);
+  private readonly connectorDrivers = inject(ConnectorDriversService);
   protected readonly viewport = inject(ViewportService);
   readonly effectiveJobStatus = effectiveJobStatus;
 
@@ -1970,6 +2276,23 @@ export class ProjectDetailPageComponent implements OnInit, OnDestroy {
 
   // Datasources tab
   readonly projectDatasources = signal<ProjectDatasource[]>([]);
+  /** Links whose driver has strict levels (the project's cloud folder and
+   *  its copy for jobs): a default level each, listed on their own. */
+  readonly cloudFolderLinks = computed(() =>
+    this.projectDatasources().filter((ds) => this.strictLink(ds)),
+  );
+  /** Every other link, with the read-only switch where its driver has one. */
+  readonly otherLinks = computed(() =>
+    this.projectDatasources().filter((ds) => !this.strictLink(ds)),
+  );
+  /** The levels each strict link may default to, as the eligible list
+   *  offers them for this project (its provider's, on any tier); a link
+   *  missing here falls back to its driver's levels. */
+  readonly linkLevelOffers = signal<Record<string, ConnectorAccessChoiceLevel[]>>({});
+  readonly cloudFolderError = signal<string | null>(null);
+  /** The link whose default level is being saved. */
+  readonly savingLinkAccess = signal<string | null>(null);
+  readonly linkAccessRevision = signal(0);
   readonly allDatasources = signal<Datasource[]>([]);
   readonly dsLinkId = signal('');
   readonly datasourceCandidateSearch = signal('');
@@ -1999,7 +2322,6 @@ export class ProjectDetailPageComponent implements OnInit, OnDestroy {
   // Settings tab
   readonly settingsName = signal('');
   readonly settingsConfigName = signal('');
-  readonly settingsCloudReadOnly = signal(false);
   readonly settingsNetworkTier = signal<'internet-only' | 'home-allowed'>('internet-only');
   readonly isSavingSettings = signal(false);
   /** Admin-only fields (e.g. workspace network tier) are hidden unless this is true. */
@@ -2015,6 +2337,31 @@ export class ProjectDetailPageComponent implements OnInit, OnDestroy {
     const defaultVal = (defaults?.['memory'] as any)?.['project_scoped'];
     return typeof defaultVal === 'boolean' ? defaultVal : true;
   });
+
+  // Settings tab: workspace defaults
+  readonly workspaceDefaults = signal<ProjectWorkspaceDefaults | null>(null);
+  readonly wdJobs = signal<WorkspaceMode | null>(null);
+  readonly wdSessions = signal<WorkspaceMode | null>(null);
+  readonly wdContainer = signal<string | null>(null);
+  readonly wdVm = signal<string | null>(null);
+  readonly isSavingWorkspaceDefaults = signal(false);
+  readonly workspaceTemplates = signal<{key: string; label: string; backend: string}[]>([]);
+  readonly containerTemplates = computed(() => this.workspaceTemplates().filter((t) => t.backend === 'sandbox'));
+  readonly vmTemplates = computed(() => this.workspaceTemplates().filter((t) => t.backend === 'vm'));
+  /** Manifest-owned rows, archived Projects and non-owner/non-admin members
+   *  all render the same read-only fields (spec §6, Project page Settings
+   *  tab) — one gate for the template and the save button alike. The server
+   *  decides `can_edit` (role, manifest ownership); `isArchived()` is kept
+   *  here too for instant feedback the moment this page archives the
+   *  Project, before a fresh defaults GET lands. */
+  readonly canEditWorkspaceDefaults = computed(
+    () => !this.isArchived() && this.workspaceDefaults()?.can_edit === true,
+  );
+  readonly workspaceModes = computed<WorkspaceMode[]>(() =>
+    this.workspaceDefaults()?.vm_available === false
+      ? ['none', 'virtual', 'container']
+      : ['none', 'virtual', 'container', 'vm'],
+  );
 
   // Knowledge tab
   readonly kbSummary = signal<KnowledgeSummary | null>(null);
@@ -2111,9 +2458,9 @@ export class ProjectDetailPageComponent implements OnInit, OnDestroy {
       if (p) {
         this.settingsName.set(p.name);
         this.settingsConfigName.set(p.default_config_name ?? '');
-        this.settingsCloudReadOnly.set(p.cloud_storage_read_only ?? false);
         this.settingsNetworkTier.set(p.network_tier ?? 'internet-only');
       }
+      this.loadWorkspaceDefaults();
     });
     this.loadJobs();
     this.loadRepos();
@@ -2201,11 +2548,108 @@ export class ProjectDetailPageComponent implements OnInit, OnDestroy {
 
   // Datasources
   loadProjectDatasources(): void {
+    this.connectorDrivers.load();
     this.api.getProjectDatasources(this.projectId).subscribe((ds) => {
       this.projectDatasources.set(ds);
       this.reconcileDatasourceSelection();
+      if (ds.some((row) => this.strictLink(row))) this.loadLinkLevelOffers();
     });
     this.loadDatasourceCandidates();
+  }
+
+  /** Which levels a strict link may default to here: the eligible list's
+   *  access object for this project (no execution kind, any tier). */
+  private loadLinkLevelOffers(): void {
+    this.api.getEligibleDatasources([this.projectId]).subscribe({
+      next: (rows) => {
+        const offers: Record<string, ConnectorAccessChoiceLevel[]> = {};
+        for (const row of rows) {
+          if (row.access?.levels?.length) offers[row.id] = row.access.levels;
+        }
+        this.linkLevelOffers.set(offers);
+      },
+      // The driver's own levels then; the server refuses one it does not offer.
+      error: () => this.linkLevelOffers.set({}),
+    });
+  }
+
+  /** Whether a link holds a default level rather than the read-only switch:
+   *  its driver's levels say what they let through. Before the matrix
+   *  loads, the main cloud's types. */
+  strictLink(ds: Pick<Datasource, 'type'>): boolean {
+    const driver = this.connectorDrivers.forType(ds.type);
+    return driver ? strictAccess(driver) : isCloudConnectorType(ds.type);
+  }
+
+  /** The levels a strict link's select offers, lowest first. */
+  linkLevels(ds: Pick<Datasource, 'id' | 'type'>): ConnectorAccessChoiceLevel[] {
+    const offered = this.linkLevelOffers()[ds.id];
+    if (offered?.length) return [...offered].sort((a, b) => a.rank - b.rank);
+    const driver = this.connectorDrivers.forType(ds.type);
+    return [...(driver?.access_levels ?? [])]
+      .sort((a, b) => a.rank - b.rank)
+      .map((level) => ({
+        id: level.id,
+        rank: level.rank,
+        writes: level.writes ?? null,
+        enforced_by: level.enforced_by,
+        offered: true,
+      }));
+  }
+
+  /** The level a strict link binds at when it holds none: its driver's
+   *  default, else its highest offered level. */
+  linkDefaultLevel(ds: Pick<Datasource, 'id' | 'type'>): string | null {
+    const offered = this.linkLevels(ds).filter((level) => level.offered);
+    const fallback = this.connectorDrivers.forType(ds.type)?.default_access ?? null;
+    if (fallback && offered.some((level) => level.id === fallback)) return fallback;
+    return offered.length ? offered[offered.length - 1].id : fallback;
+  }
+
+  /** The level a strict link's work binds at unchosen. */
+  linkLevel(ds: ProjectDatasource): string | null {
+    return ds.project_access ?? this.linkDefaultLevel(ds);
+  }
+
+  /** What makes that level true, in one line. */
+  linkLevelEnforcedBy(ds: ProjectDatasource): string | null {
+    const level = this.linkLevel(ds);
+    return this.linkLevels(ds).find((entry) => entry.id === level)?.enforced_by ?? null;
+  }
+
+  levelLabel(level: string | null): string {
+    return accessLevelLabelKey(level) ?? 'projectDetail.datasources.cloudFolders.noLevel';
+  }
+
+  linkKindLabelKey(ds: Datasource): string {
+    return platformKindLabelKey(ds) ?? 'datasources.filter.' + ds.type;
+  }
+
+  /** Set a strict link's default level (`PATCH {access}`; '' clears it to
+   *  the driver's default). The server refuses a level the connector is
+   *  not offered, and says which ones are. */
+  updateLinkAccess(datasourceId: string, value: string): void {
+    const ds = this.projectDatasources().find((row) => row.id === datasourceId);
+    if (!ds || !this.strictLink(ds)) return;
+    const access = value || null;
+    if ((ds.project_access ?? null) === access) return;
+    this.cloudFolderError.set(null);
+    this.savingLinkAccess.set(datasourceId);
+    this.api.setProjectDatasourceAccess(this.projectId, datasourceId, access).subscribe({
+      next: () => {
+        this.savingLinkAccess.set(null);
+        this.loadProjectDatasources();
+      },
+      error: (err) => {
+        this.savingLinkAccess.set(null);
+        this.cloudFolderError.set(
+          this.errors.translate(err, 'projectDetail.datasources.cloudFolders.saveFailed'),
+        );
+        // Render the row again: its select shows the stored level, not the
+        // refused choice.
+        this.linkAccessRevision.update((n) => n + 1);
+      },
+    });
   }
 
   /** Load connector candidates from the rollout-appropriate contract. V1 is
@@ -2319,7 +2763,8 @@ export class ProjectDetailPageComponent implements OnInit, OnDestroy {
    * authoritative, while the legacy list was only visibility-filtered. These
    * mirror the connector-side link rules before a row becomes selectable. */
   private canLinkDatasourceCandidate(datasource: Datasource): boolean {
-    if (datasource.config?.native_project_id) return false;
+    // A project's own connector (or a user's) is never linked anywhere else.
+    if (isPlatformOwned(datasource)) return false;
     const user = this.userService.currentUser();
     if (!user) return false;
     if (user.is_admin || datasource.created_by === user.id) return true;
@@ -2334,7 +2779,7 @@ export class ProjectDetailPageComponent implements OnInit, OnDestroy {
       this.dsLinkId.set('');
       return;
     }
-    const settings = datasource?.type === 'kb' ? {read_only: true} : {};
+    const settings = this.linkAccess(datasource) === 'read_only' ? {read_only: true} : {};
     this.api.linkProjectDatasource(this.projectId, dsId, settings).subscribe((res) => {
       if (res) {
         this.dsLinkId.set('');
@@ -2351,8 +2796,117 @@ export class ProjectDetailPageComponent implements OnInit, OnDestroy {
     });
   }
 
+  /** Who keeps a platform-owned link (its project, or SRW for a user), or
+   *  null for a link the project's members may remove. */
+  managedLabelKey(ds: Datasource): string | null {
+    return platformManagedLabelKey(ds, this.userService.currentUser()?.id ?? null);
+  }
+
+  /** Whether a link's access is the platform's, not this table's: a
+   *  platform-owned row whose driver would otherwise offer the read-only
+   *  switch (a cloud folder). It shows the level it binds at instead.
+   *  Slice 5 of main_cloud_as_connectors gives the project folder a
+   *  default-access select of its own. */
+  linkAccessManaged(ds: Datasource): boolean {
+    return isPlatformOwned(ds) && this.linkAccessShown(ds) === 'choice';
+  }
+
+  accessLevelKey(level: string): string | null {
+    return accessLevelLabelKey(level);
+  }
+
+  /** A link's access choice: one fixed level, or the read-only switch.
+   *  Before the capability matrix loads, the KB rule the page always had. */
+  linkAccess(ds: Pick<Datasource, 'type'>): 'read_only' | 'read_write' | 'choice' {
+    const access = offeredAccess(this.connectorDrivers.forType(ds.type));
+    if (!access) return ds.type === 'kb' ? 'read_only' : 'choice';
+    if (access.readOnly && access.readWrite) return 'choice';
+    if (access.readWrite) return 'read_write';
+    return access.readOnly ? 'read_only' : 'choice';
+  }
+
+  /** Whether the connector's creator tagged it read-only: its own flag, or
+   *  public with none set (decisions 31 and 32). Every user's executions
+   *  then bind it read-only, whatever a project link says. */
+  connectorReadOnly(ds: Partial<Pick<Datasource, 'read_only' | 'is_global'>>): boolean {
+    return ds.read_only === true || (ds.read_only == null && ds.is_global === true);
+  }
+
+  /** Whether the creator's tag stands over a link that could otherwise
+   *  choose: the switch cannot lift it, so the row shows read-only. */
+  creatorReadOnly(ds: Pick<Datasource, 'type'> & Partial<Pick<Datasource, 'read_only' | 'is_global'>>): boolean {
+    return this.linkAccess(ds) === 'choice' && this.connectorReadOnly(ds);
+  }
+
+  /** The access a link row shows: its driver's choice, unless the creator's
+   *  tag fixes it at read-only. */
+  linkAccessShown(
+    ds: Pick<Datasource, 'type'> & Partial<Pick<Datasource, 'read_only' | 'is_global'>>,
+  ): 'read_only' | 'read_write' | 'choice' {
+    return this.creatorReadOnly(ds) ? 'read_only' : this.linkAccess(ds);
+  }
+
+  /** The level a link binds the connector at, with what enforces it; null
+   *  until the matrix loads. A read-only link or the creator's read-only
+   *  tag, either, floors the connector at its lowest level. Otherwise it
+   *  keeps its own: the top one for a read/read-write driver, or, for a
+   *  tiered one (email), the tier its config stores, else the driver's
+   *  default. A strict driver (its levels say what they let through) binds
+   *  read-only only at a level that writes nothing, and null stands for the
+   *  binding the server refuses. */
+  linkAccessLevel(
+    ds: Pick<Datasource, 'type' | 'config'> &
+      Partial<Pick<Datasource, 'read_only' | 'is_global'>> & {project_read_only?: boolean | null},
+  ): ConnectorAccessLevel | null {
+    const driver = this.connectorDrivers.forType(ds.type);
+    const access = offeredAccess(driver);
+    if (!driver || !access) return null;
+    if (this.githubAppReadOnly(ds) && access.readOnly) {
+      // Enforced, not advisory: the token SRW mints has contents: read.
+      return {...access.readOnly, advisory: false};
+    }
+    if (strictAccess(driver)) {
+      return strictAccessLevel(driver, {
+        readOnly: ds.project_read_only === true || this.connectorReadOnly(ds),
+        config: ds.config,
+      });
+    }
+    if (
+      access.readOnly &&
+      (!access.readWrite || ds.project_read_only === true || this.connectorReadOnly(ds))
+    ) {
+      return access.readOnly;
+    }
+    if (driver.access_levels.length > 2) {
+      const own = (ds.config as {access?: unknown} | undefined)?.access ?? driver.default_access;
+      return driver.access_levels.find((level) => level.id === own) ?? access.readWrite;
+    }
+    return access.readWrite;
+  }
+
+  /** Whether a GitHub App repository connector (C5) binds read-only here:
+   *  its link is read-only, or the connector itself is (its own flag, or
+   *  public with none set). The token SRW mints for it has contents: read,
+   *  so GitHub refuses pushes made with that token. */
+  githubAppReadOnly(
+    ds: Pick<Datasource, 'type' | 'config'> &
+      Partial<Pick<Datasource, 'read_only' | 'is_global'>> & {project_read_only?: boolean | null},
+  ): boolean {
+    const config = ds.config as {github_app?: unknown} | undefined;
+    if (ds.type !== 'repository' || !config?.github_app) return false;
+    return ds.project_read_only === true || this.connectorReadOnly(ds);
+  }
+
   updateDatasourceReadOnly(datasourceId: string, value: string): void {
-    if (this.projectDatasources().some((ds) => ds.id === datasourceId && ds.type === 'kb')) {
+    if (
+      this.projectDatasources().some(
+        (ds) =>
+          ds.id === datasourceId &&
+          (this.linkAccessShown(ds) !== 'choice' ||
+            this.linkAccessManaged(ds) ||
+            this.strictLink(ds)),
+      )
+    ) {
       return;
     }
     const readOnly = value === '' ? null : value === 'true';
@@ -2528,20 +3082,6 @@ export class ProjectDetailPageComponent implements OnInit, OnDestroy {
     });
   }
 
-  toggleCloudReadOnly(checked: boolean): void {
-    if (this.isArchived()) return;
-    const previous = this.settingsCloudReadOnly();
-    this.settingsCloudReadOnly.set(checked);
-    this.editError.set(null);
-    this.api.updateProjectFields(this.projectId, { cloud_storage_read_only: checked }).subscribe({
-      next: () => this.api.getProject(this.projectId).subscribe((proj) => this.project.set(proj)),
-      error: (err: unknown) => {
-        this.settingsCloudReadOnly.set(previous);
-        this.reportEditFailure(err);
-      },
-    });
-  }
-
   onNetworkTierChange(value: string): void {
     if (value !== 'internet-only' && value !== 'home-allowed') return;
     if (this.isArchived()) return;
@@ -2558,6 +3098,89 @@ export class ProjectDetailPageComponent implements OnInit, OnDestroy {
         this.reportEditFailure(err);
       },
     });
+  }
+
+  /** Workspace defaults: the Project's row in the chain (spec §6, Project
+   *  page Settings tab). Loads the stored/effective/installation view, then
+   *  the templates this Project may pick from, in the Catalog, Project and
+   *  (per the view's `account_templates` flag) Account scopes. Templates
+   *  load only once the view answers, since only it knows which scopes this
+   *  caller may see. */
+  loadWorkspaceDefaults(): void {
+    this.api.getProjectWorkspaceDefaults(this.projectId).subscribe({
+      next: (wd) => {
+        this.applyWorkspaceDefaults(wd);
+        const scopes: [string, string][] = [
+          ['Catalog', 'shared'],
+          ['Project', this.projectId],
+        ];
+        // The server's account_templates flag decides whether this Project's
+        // caller may see their own personal Account templates.
+        if (wd.account_templates) scopes.push(['Account', 'me']);
+        const me = this.userService.currentUser()?.id ?? 'me';
+        forkJoin(scopes.map(([kind, name]) => this.api.listWorkspaceTemplates(kind, name))).subscribe((lists) =>
+          this.workspaceTemplates.set(
+            lists.flatMap((list) =>
+              list.resources.map(({resource}) => {
+                const scope = resource.metadata.scope;
+                // The option list keys an Account scope to the caller's own id,
+                // not the literal 'me' sent in the query, so a stored personal-
+                // project Account ref (normalized to the caller's id server-side)
+                // matches an option here — see templateKey above.
+                const scopeName = scope.kind === 'Account' ? me : scope.name;
+                return {
+                  key: `${scope.kind}/${scopeName}/${resource.metadata.name}`,
+                  label: resource.metadata.annotations?.['srw.io/display-name'] ?? resource.metadata.name,
+                  backend: resource.spec.backend ?? '',
+                };
+              }),
+            ),
+          ),
+        );
+      },
+      error: () => this.workspaceDefaults.set(null),
+    });
+  }
+
+  private applyWorkspaceDefaults(wd: ProjectWorkspaceDefaults): void {
+    this.workspaceDefaults.set(wd);
+    this.wdJobs.set(wd.stored.jobs);
+    this.wdSessions.set(wd.stored.sessions);
+    this.wdContainer.set(templateKey(wd.stored.container));
+    this.wdVm.set(templateKey(wd.stored.vm));
+  }
+
+  saveWorkspaceDefaults(): void {
+    if (!this.canEditWorkspaceDefaults()) return;
+    // Without VMs the VM fields are hidden and the server refuses VM values
+    // (422): a VM mode or template kept from before goes back to the default.
+    const vms = this.workspaceDefaults()?.vm_available !== false;
+    const mode = (value: WorkspaceMode | null) => (vms || value !== 'vm' ? value : null);
+    this.isSavingWorkspaceDefaults.set(true);
+    this.editError.set(null);
+    this.api
+      .putProjectWorkspaceDefaults(this.projectId, {
+        jobs: mode(this.wdJobs()),
+        sessions: mode(this.wdSessions()),
+        container: templateRef(this.wdContainer()),
+        vm: vms ? templateRef(this.wdVm()) : null,
+      })
+      .subscribe({
+        next: (wd) => {
+          this.applyWorkspaceDefaults(wd);
+          this.isSavingWorkspaceDefaults.set(false);
+        },
+        error: (err: unknown) => {
+          this.editError.set(this.errors.translate(err, 'projectDetail.settings.workspaceDefaultsSaveFailed'));
+          this.isSavingWorkspaceDefaults.set(false);
+        },
+      });
+  }
+
+  /** Renders a `WorkspaceMode` ('none' | 'virtual' | 'container' | 'vm') as
+   *  its translated label, for the "Installation default (…)" option text. */
+  modeLabel(mode: string | null | undefined): string {
+    return mode ? this.transloco.translate(`projectDetail.settings.workspaceMode.${mode}`) : '';
   }
 
   /** One place for "the server refused this edit". The 409 an archived project
@@ -2596,7 +3219,11 @@ export class ProjectDetailPageComponent implements OnInit, OnDestroy {
         this.lifecycleBusy.set(false);
         this.pendingLifecycle.set(null);
         if (status === 'archived') this.archiveReport.set(this.describeArchive(report));
-        this.api.getProject(this.projectId).subscribe((p) => this.project.set(p));
+        this.api.getProject(this.projectId).subscribe((p) => {
+          this.project.set(p);
+          // can_edit follows the archive/unarchive without a page reload.
+          this.loadWorkspaceDefaults();
+        });
       },
       error: (err: unknown) => {
         this.lifecycleBusy.set(false);

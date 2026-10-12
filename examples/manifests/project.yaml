@@ -39,6 +39,7 @@ spec:
   defaults:
     expert: developer
     workspace: development
+    # or per role and tier: {jobs: container, sessions: virtual, container: development}
     connectors: [source]
   team:
     state: Held

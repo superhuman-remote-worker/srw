@@ -16,6 +16,9 @@ data:
     request-retry: {{ .Values.codexProxy.requestRetry | int }}
     request-log: {{ .Values.codexProxy.requestLog }}
     debug: {{ .Values.codexProxy.debug }}
+    routing:
+      session-affinity: {{ .Values.codexProxy.sessionAffinity }}
+      session-affinity-ttl: {{ .Values.codexProxy.sessionAffinityTtl | quote }}
 ---
 apiVersion: v1
 kind: PersistentVolumeClaim

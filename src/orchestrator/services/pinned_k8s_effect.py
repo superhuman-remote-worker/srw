@@ -95,13 +95,17 @@ def with_authority_finalizer(metadata: dict[str, Any]) -> dict[str, Any]:
 
 
 def finalizer_release_patch(
-    *, uid: str, resource_version: str, finalizers: list[str]
+    *,
+    uid: str,
+    resource_version: str,
+    finalizers: list[str],
+    finalizer: str = PINNED_AUTHORITY_FINALIZER,
 ) -> list[dict[str, Any]] | None:
-    """Build an exact JSON Patch that removes only SRW's finalizer."""
+    """Build an exact JSON Patch that removes only one SRW finalizer."""
 
-    if PINNED_AUTHORITY_FINALIZER not in finalizers:
+    if finalizer not in finalizers:
         return None
-    retained = [value for value in finalizers if value != PINNED_AUTHORITY_FINALIZER]
+    retained = [value for value in finalizers if value != finalizer]
     return [
         {"op": "test", "path": "/metadata/uid", "value": uid},
         {
@@ -150,14 +154,18 @@ async def retire_terminal_claimant_pod(
     pod_uid: str,
     namespace: str,
     expected_labels: dict[str, str],
-    pvc_name: str,
+    pvc_name: str | None,
     known_successor_uids: frozenset[str] = frozenset(),
+    require_nonrestartable: bool = False,
 ) -> bool:
-    """Retire one historically authorized, terminal PVC claimant.
+    """Retire one historically authorized, terminal dedicated agent Pod.
 
     This is not process-zero recovery for an active actor. The caller must
-    possess immutable settlement/handoff proof and current retirement authority.
+    possess immutable settlement/handoff proof and current retirement authority,
+    or the exact pre-setup abort of a released, nonrestartable, claim-less life.
     A UID/RV patch binds all finalizer preconditions to the same fresh Pod read.
+    ``pvc_name`` is the claim a claimant must still mount; ``None`` is a
+    claim-less dedicated Pod, identified by its UID and labels alone.
     """
 
     async def read():
@@ -172,14 +180,31 @@ async def retire_terminal_claimant_pod(
         return (
             str(getattr(metadata, "uid", "")) == pod_uid
             and all(labels.get(key) == value for key, value in expected_labels.items())
-            and any(
-                getattr(
-                    getattr(volume, "persistent_volume_claim", None), "claim_name", None
+            and (
+                pvc_name is None
+                or any(
+                    getattr(
+                        getattr(volume, "persistent_volume_claim", None),
+                        "claim_name",
+                        None,
+                    )
+                    == pvc_name
+                    for volume in volumes
                 )
-                == pvc_name
-                for volume in volumes
             )
             and pod_containers_are_terminal(pod)
+            and (
+                not require_nonrestartable
+                or (
+                    getattr(getattr(pod, "spec", None), "restart_policy", None)
+                    == "Never"
+                    and pvc_name is None
+                    and not any(
+                        getattr(volume, "persistent_volume_claim", None) is not None
+                        for volume in volumes
+                    )
+                )
+            )
         )
 
     try:
@@ -742,6 +767,7 @@ async def release_planned_pinned_pod_authority(
     pod_name: str,
     expected_pod_uid: str,
     expected_labels: dict[str, str],
+    terminal_only: bool = False,
 ) -> dict[str, Any] | None:
     """Remove SRW's finalizer from one exact released warm-binding Pod.
 
@@ -762,12 +788,22 @@ async def release_planned_pinned_pod_authority(
     if state == "exact_absent":
         return {"outcome": "exact_absent_v1", "agent_present": False}
     if state == "replacement":
-        return {"outcome": "exact_replacement_v1", "agent_present": False}
+        return (
+            None
+            if terminal_only
+            else {"outcome": "exact_replacement_v1", "agent_present": False}
+        )
+    if terminal_only and state not in {"exact_live", "exact_terminal"}:
+        return None
     if state not in {"exact_live", "exact_terminal"}:
         return None
-    if state == "exact_live" and not observed.get("finalizer_present"):
+    if (
+        state == "exact_live"
+        and not terminal_only
+        and not observed.get("finalizer_present")
+    ):
         return {"outcome": "exact_live_unprotected_v1", "agent_present": True}
-    if not observed.get("finalizer_present"):
+    if state == "exact_terminal" and not observed.get("finalizer_present"):
         # A terminal deleting object without our finalizer is on its way to
         # physical absence. Do not return its dead actor to the warm pool.
         return None
@@ -782,7 +818,56 @@ async def release_planned_pinned_pod_authority(
     )
     if exact is None:
         return None
-    _, evidence = exact
+    pod, evidence = exact
+    if terminal_only:
+        if str(getattr(getattr(pod, "status", None), "phase", "") or "") not in {
+            "Succeeded",
+            "Failed",
+        } or not pod_containers_are_terminal(pod):
+            return None
+        if getattr(getattr(pod, "metadata", None), "deletion_timestamp", None) is None:
+            # The deleted owner cannot issue a later Pod DELETE. Claim only
+            # the captured terminal UID, then re-read before touching the
+            # finalizer; an unknown or same-name successor remains held.
+            try:
+                await run_bounded_k8s_mutation(
+                    core_api.delete_namespaced_pod,
+                    name=pod_name,
+                    namespace=namespace,
+                    body={"preconditions": {"uid": expected_pod_uid}},
+                )
+            except Exception as exc:
+                if getattr(exc, "status", None) == 404:
+                    return {"outcome": "exact_absent_v1", "agent_present": False}
+                if getattr(exc, "status", None) == 409:
+                    return None
+                raise
+            exact = await _read_exact_object(
+                core_api.read_namespaced_pod,
+                name=pod_name,
+                namespace=namespace,
+                expected_uid=expected_pod_uid,
+                expected_labels=expected_labels,
+                allow_terminal_deleting=True,
+            )
+            if exact is None:
+                confirmed = await observe_planned_pinned_pod_authority(
+                    core_api,
+                    namespace=namespace,
+                    pod_name=pod_name,
+                    expected_pod_uid=expected_pod_uid,
+                    expected_labels=expected_labels,
+                )
+                if confirmed.get("state") == "exact_absent":
+                    return {"outcome": "exact_absent_v1", "agent_present": False}
+                return None
+            pod, evidence = exact
+        if getattr(
+            getattr(pod, "metadata", None), "deletion_timestamp", None
+        ) is None or not pod_containers_are_terminal(pod):
+            return None
+        if PINNED_AUTHORITY_FINALIZER not in evidence["finalizers"]:
+            return None
     patch = finalizer_release_patch(
         uid=evidence["uid"],
         resource_version=evidence["resource_version"],
@@ -812,9 +897,17 @@ async def release_planned_pinned_pod_authority(
     if confirmed_state == "exact_absent":
         return {"outcome": "exact_absent_v1", "agent_present": False}
     if confirmed_state == "replacement":
-        return {"outcome": "exact_replacement_v1", "agent_present": False}
+        return (
+            None
+            if terminal_only
+            else {"outcome": "exact_replacement_v1", "agent_present": False}
+        )
     if confirmed_state == "exact_live" and not confirmed.get("finalizer_present"):
-        return {"outcome": "exact_live_unprotected_v1", "agent_present": True}
+        return (
+            None
+            if terminal_only
+            else {"outcome": "exact_live_unprotected_v1", "agent_present": True}
+        )
     if mutation_error is not None:
         raise mutation_error
     return None

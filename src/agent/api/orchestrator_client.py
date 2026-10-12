@@ -38,8 +38,16 @@ from shared.session_subagent_authority import (
     coerce_session_parent_authority,
     session_subagent_delivery_id,
 )
+from shared.session_subagent_batch import session_subagent_batch_delivery_id
+from shared.session_attach_cleanup_identity import PreSetupWorkspaceIdentity
 
 logger = logging.getLogger(__name__)
+
+# The verdicts of a batch settle that are successes (orchestrator
+# ``agent_settle_session_subagent_batch``); a ``stale`` verdict is a 409.
+_BATCH_SETTLE_RESULTS = frozenset(
+    {"applied", "idempotent", "already_delivered", "nothing_to_recover"}
+)
 
 _COMPLETION_REPORT_PAYLOAD_FIELDS = (
     "should_stop",
@@ -79,9 +87,36 @@ class SessionGrantDenied(Exception):
     swallow it. See knowledge-base/knowledge/issues/session_permission_mode_grant_denied_ready_timeout.md.
     """
 
+    def __init__(
+        self, detail: Any, *, cleanup_identity: PreSetupWorkspaceIdentity | None = None
+    ) -> None:
+        super().__init__(detail)
+        self.cleanup_identity = cleanup_identity
+
 
 class SessionEnded(Exception):
     """Typed terminal response from the workspace credential boundary."""
+
+
+class SessionEnding(SessionEnded):
+    """The session life's retirement has begun (409 ``session_ending``).
+
+    Raised only to callers that opt in (an attach waiting for its workspace):
+    the life can no longer become ready, and the retirement that settles it
+    waits for this runtime to leave. ``runtime_generation`` is the generation
+    the refusal names, if any.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        runtime_generation: Any = None,
+        retirement_disposition: Any = None,
+    ) -> None:
+        super().__init__(message)
+        self.runtime_generation = runtime_generation
+        self.retirement_disposition = retirement_disposition
 
 
 class ThreadConfigUpdateDenied(Exception):
@@ -117,12 +152,36 @@ class ClaimBundleError(Exception):
         *,
         code: WorkspaceRecoveryCode | None = None,
         recovery: WorkspaceRecoveryDisposition | None = None,
+        model_unavailable_message: str | None = None,
     ) -> None:
         self.status_code = status_code
         self.detail = detail
         self.code = code
         self.recovery = recovery
+        # The orchestrator refused the turn because a configured model cannot
+        # run; the user-facing text (unavailable_model_handling.md §5).
+        self.model_unavailable_message = model_unavailable_message
         super().__init__(f"claim-bundle {status_code}: {detail[:200]}")
+
+
+MODEL_UNAVAILABLE_CODE = "model.unavailable"
+
+
+def _model_unavailable_message(response: httpx.Response) -> str | None:
+    """The refusal text of a 409 ``{detail: {code: "model.unavailable",
+    message}}``, else ``None``."""
+    try:
+        detail = response.json().get("detail")
+        if (
+            isinstance(detail, dict)
+            and detail.get("code") == MODEL_UNAVAILABLE_CODE
+            and isinstance(detail.get("message"), str)
+            and detail["message"]
+        ):
+            return detail["message"]
+    except (ValueError, TypeError, AttributeError):
+        return None
+    return None
 
 
 def _workspace_recovery_receipt(
@@ -1185,6 +1244,26 @@ class OrchestratorClient:
     ) -> list[dict[str, Any]]:
         """Return generation-bearing session child recovery candidates."""
 
+        listed = await self.list_live_session_subagent_recovery(
+            parent_thread_id, parent_authority=parent_authority
+        )
+        return listed["subagents"]
+
+    async def list_live_session_subagent_recovery(
+        self,
+        parent_thread_id: str,
+        *,
+        parent_authority: SessionParentAuthority,
+    ) -> dict[str, Any]:
+        """The recovery candidates and the orchestrator's per-turn plans.
+
+        ``subagents`` are the validated candidate rows. ``recovery_turns`` is
+        the list of per-turn plans (one per parent turn of a candidate, every
+        ``delegate_agent`` call of the turn with its class), or ``None`` from
+        an orchestrator that predates batch settle, and for a malformed list:
+        plans never fail the listing.
+        """
+
         parsed = _session_subagent_authority_for_thread(
             parent_authority, parent_thread_id
         )
@@ -1203,7 +1282,8 @@ class OrchestratorClient:
                 raise SubagentPersistenceError(
                     "session-live-list", int(response.status_code)
                 )
-            rows = response.json().get("subagents")
+            data = response.json()
+            rows = data.get("subagents")
             if not isinstance(rows, list) or not all(
                 isinstance(row, dict) for row in rows
             ):
@@ -1216,11 +1296,106 @@ class OrchestratorClient:
             ]
             if len({row["thread_id"] for row in normalized}) != len(normalized):
                 raise SubagentPersistenceError("session-live-list-payload")
-            return normalized
+            plans = data.get("recovery_turns")
+            if plans is not None and (
+                not isinstance(plans, list)
+                or not all(isinstance(plan, dict) for plan in plans)
+            ):
+                # Plans are additive. A malformed list never fails the
+                # candidates: every child then recovers on its own.
+                logger.warning(
+                    "Ignoring malformed session recovery plans for thread %s",
+                    parent_thread_id,
+                )
+                plans = None
+            return {
+                "subagents": normalized,
+                "recovery_turns": (
+                    [dict(plan) for plan in plans] if plans is not None else None
+                ),
+            }
         except (SessionParentAuthorityRefused, SubagentPersistenceError):
             raise
         except Exception as exc:
             raise SubagentPersistenceError("session-live-list") from exc
+
+    async def settle_session_subagent_batch(
+        self,
+        parent_thread_id: str,
+        *,
+        parent_authority: SessionParentAuthority,
+        parent_input_message_id: str,
+        parent_iteration: int,
+        members: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        """Settle one abandoned delegation turn in one orchestrator transaction.
+
+        Returns the verdict: ``applied``, ``idempotent``, ``already_delivered``
+        or ``nothing_to_recover``, or the server's view with ``result: stale``
+        when the members differ from the ones it would settle (nothing was
+        written). The id of a continuation written now is recomputed here and
+        a mismatch is refused, as for the single-child delivery id. An
+        ``idempotent`` verdict names whichever continuation already supersedes
+        the input: this settle's own from an earlier attempt, or one a
+        single-child recovery wrote.
+        """
+
+        parsed = _session_subagent_authority_for_thread(
+            parent_authority, parent_thread_id
+        )
+        input_id = str(UUID(str(parent_input_message_id)))
+        if (
+            isinstance(parent_iteration, bool)
+            or not isinstance(parent_iteration, int)
+            or parent_iteration <= 0
+        ):
+            raise ValueError("a batch settle needs the exact parent turn")
+        expected_delivery = str(
+            session_subagent_batch_delivery_id(parent_thread_id, input_id)
+        )
+        if not self._client:
+            await self.connect()
+        url = (
+            f"{self.orchestrator_url}/api/agents/threads/"
+            f"{parent_thread_id}/subagents/settle-batch"
+        )
+        payload = {
+            "parent_authority": parsed.to_wire(),
+            "parent_input_message_id": input_id,
+            "parent_iteration": parent_iteration,
+            "members": [dict(member) for member in members],
+        }
+        try:
+            response = await self._client.post(url, json=payload)
+            _raise_session_subagent_authority_refusal(response)
+            data = response.json()
+            if response.status_code == 409:
+                detail = data.get("detail") if isinstance(data, dict) else None
+                if isinstance(detail, dict) and detail.get("result") == "stale":
+                    return dict(detail)
+                raise SubagentPersistenceError("session-batch-settle", 409)
+            if response.status_code != 200:
+                raise SubagentPersistenceError(
+                    "session-batch-settle", int(response.status_code)
+                )
+            result = data.get("result")
+            if (
+                result not in _BATCH_SETTLE_RESULTS
+                or str(UUID(str(data.get("parent_input_message_id")))) != input_id
+                or data.get("parent_iteration") != parent_iteration
+            ):
+                raise SubagentPersistenceError("session-batch-settle-payload")
+            if result in {"applied", "idempotent"}:
+                delivery_id = str(UUID(str(data.get("delivery_id"))))
+                if (
+                    result == "applied" and delivery_id != expected_delivery
+                ) or not str(data.get("delivery_state") or "").strip():
+                    raise SubagentPersistenceError("session-batch-settle-payload")
+            return dict(data)
+        except (SessionParentAuthorityRefused, SubagentPersistenceError):
+            raise
+        except Exception as exc:
+            raise SubagentPersistenceError("session-batch-settle") from exc
 
     async def get_session_subagent_thread(
         self,
@@ -1563,10 +1738,14 @@ class OrchestratorClient:
             return False
 
     async def request_thread_workspace_upgrade(
-        self, thread_id: str, target_tier: str = "sandbox"
-    ) -> bool:
+        self,
+        thread_id: str,
+        target_tier: str | None = "sandbox",
+        template: str | None = None,
+    ) -> tuple[bool, str | None]:
         """Provision a real workspace container for a lite thread (upgrade from
-        ``virtual``/``none`` to the ``sandbox`` tier).
+        ``virtual``/``none`` to the ``sandbox`` tier), or hand the orchestrator
+        a ``template`` name to upgrade to whatever tier that template requires.
 
         The session-side analogue of ``request_thread_vm_upgrade``: kicks off
         container provisioning, after which the caller polls
@@ -1575,7 +1754,9 @@ class OrchestratorClient:
         operator-gated ``request_thread_vm_upgrade`` path.
 
         Returns:
-            True if accepted (or already in progress), False on failure.
+            ``(True, None)`` if accepted (or already in progress); otherwise
+            ``(False, detail)``, where ``detail`` is the orchestrator's
+            refusal text (its JSON ``{"detail": ...}`` body) when it sent one.
         """
         if not self._client:
             await self.connect()
@@ -1584,7 +1765,11 @@ class OrchestratorClient:
             f"{self.orchestrator_url}"
             f"/api/agents/threads/{thread_id}/upgrade-to-workspace"
         )
-        payload = {"target_tier": target_tier}
+        payload = {
+            key: value
+            for key, value in (("target_tier", target_tier), ("template", template))
+            if value is not None
+        }
 
         try:
             response = await self._client.post(url, json=payload)
@@ -1593,19 +1778,26 @@ class OrchestratorClient:
                     f"Workspace upgrade ({target_tier}) requested for thread "
                     f"{thread_id}"
                 )
-                return True
-            else:
-                logger.error(
-                    f"Workspace upgrade request failed: "
-                    f"{response.status_code} - {response.text}"
-                )
-                return False
+                return True, None
+            logger.error(
+                f"Workspace upgrade request failed: "
+                f"{response.status_code} - {response.text}"
+            )
+            try:
+                detail = response.json().get("detail")
+            except ValueError:
+                detail = None
+            return False, detail if isinstance(detail, str) else None
         except Exception as e:
             logger.error(f"Workspace upgrade request error: {e}")
-            return False
+            return False, None
 
     async def get_thread_workspace(
-        self, thread_id: str, *, raise_on_denied: bool = False
+        self,
+        thread_id: str,
+        *,
+        raise_on_denied: bool = False,
+        raise_on_ending: bool = False,
     ) -> dict | None:
         """Poll workspace container status for a thread.
 
@@ -1619,6 +1811,11 @@ class OrchestratorClient:
         to ``None``, so the attach path can fail with the real reason rather than
         the misleading 'No workspace container provisioned'. Other failures stay
         ``None`` (transient — keep polling).
+
+        A 409 ``session_ended`` always raises :class:`SessionEnded`. With
+        ``raise_on_ending=True``, a 409 ``session_ending`` (the life's
+        retirement has begun) raises :class:`SessionEnding` instead of
+        collapsing to ``None``.
         """
         if not self._client:
             await self.connect()
@@ -1628,8 +1825,11 @@ class OrchestratorClient:
             # New pinned runtimes bind credential delivery to their exact
             # reciprocal thread/agent ownership. Older orchestrators ignore
             # this additive header; compatibility mode still permits old
-            # agents until REQUIRE_PINNED_STATUS_IDENTITY is enabled.
-            headers: dict[str, str] = {}
+            # agents until REQUIRE_PINNED_STATUS_IDENTITY is enabled. This
+            # agent also attaches to the cloud folders a Pod's sidecars
+            # mounted (D7); an older one does not say so and gets no cloud
+            # payload it would misread.
+            headers: dict[str, str] = {"X-SRW-Cloud-Mount-Delivery": "sidecar"}
             if self.agent_id:
                 headers["X-Agent-ID"] = self.agent_id
             if self.session_runtime_generation:
@@ -1649,7 +1849,14 @@ class OrchestratorClient:
                     detail = response.json().get("detail") or detail
                 except Exception:
                     pass
-                raise SessionGrantDenied(detail)
+                # A denial still refuses every config/credential. The attested
+                # identifiers name this captured life's pre-setup obligation only.
+                cleanup_identity = PreSetupWorkspaceIdentity.from_headers(
+                    response.headers,
+                    expected_thread_id=thread_id,
+                    expected_session_generation=self.session_runtime_generation,
+                )
+                raise SessionGrantDenied(detail, cleanup_identity=cleanup_identity)
             if response.status_code == 409:
                 try:
                     detail = response.json().get("detail")
@@ -1657,6 +1864,16 @@ class OrchestratorClient:
                     detail = None
                 if isinstance(detail, dict) and detail.get("code") == "session_ended":
                     raise SessionEnded("session ended before workspace attach")
+                if (
+                    raise_on_ending
+                    and isinstance(detail, dict)
+                    and detail.get("code") == "session_ending"
+                ):
+                    raise SessionEnding(
+                        "session retirement began before workspace attach",
+                        runtime_generation=detail.get("session_runtime_generation"),
+                        retirement_disposition=detail.get("retirement_disposition"),
+                    )
             return None
         except (SessionGrantDenied, SessionEnded):
             raise
@@ -1674,7 +1891,7 @@ class OrchestratorClient:
         (``X-Internal-Key`` attached by :meth:`connect`). The 200 body carries
         ``unit_id``/``thread_id``/``unit_kind``/``execution_lane``, the
         ``watermarks`` pair, and the ``attach`` object — the existing
-        ``/session/attach`` body, fed to ``_attach_session`` unchanged.
+        ``/session/attach`` body, fed to the attach coordinator unchanged.
 
         Raises :class:`ClaimBundleError` on any non-200; network errors
         propagate as httpx exceptions (the caller treats both as bundle
@@ -1709,7 +1926,38 @@ class OrchestratorClient:
             detail,
             code=recovery.code if recovery else None,
             recovery=recovery,
+            model_unavailable_message=(
+                _model_unavailable_message(response)
+                if response.status_code == 409 and recovery is None
+                else None
+            ),
         )
+
+    async def report_cloud_mount_status(
+        self,
+        thread_id: str,
+        *,
+        fingerprint: str,
+        pod_uid: str,
+        mounts: list[dict[str, Any]],
+    ) -> bool:
+        """Report the state of the cloud folders a Pod's sidecars mounted
+        (connector drivers D7). The orchestrator keeps it only for the Pod
+        ``pod_uid`` and its plan ``fingerprint`` name. Best effort: False on
+        any failure."""
+        if not self._client:
+            await self.connect()
+        try:
+            response = await self._client.post(
+                f"{self.orchestrator_url}/api/agents/threads/{thread_id}"
+                "/cloud-mount-status",
+                json={"fingerprint": fingerprint, "pod_uid": pod_uid, "mounts": mounts},
+                timeout=15.0,
+            )
+        except Exception as e:
+            logger.debug("Failed to report cloud mount status: %s", e)
+            return False
+        return response.status_code == 200
 
     async def report_workspace_recovery(
         self,
@@ -2300,6 +2548,86 @@ class OrchestratorClient:
                 "Thread retirement begin failed (non-fatal): %s", type(exc).__name__
             )
             return None
+
+    async def request_thread_retirement_actuator(
+        self,
+        thread_id: str,
+        *,
+        pinned_agent_id: str,
+        pod_uid: str,
+        process_generation: str,
+        session_runtime_generation: str,
+        session_runtime_attach_token: str,
+        session_runtime_retirement_token: str,
+        retirement_disposition: str,
+        retirement_permanent: bool,
+        workspace_generation: str,
+        workspace_runtime_incarnation: str,
+    ) -> dict[str, Any] | None:
+        """Publish/reconcile a frozen local-drain request, never an End ACK."""
+        coordinates = (
+            thread_id,
+            pinned_agent_id,
+            session_runtime_generation,
+            session_runtime_attach_token,
+            session_runtime_retirement_token,
+            workspace_generation,
+            workspace_runtime_incarnation,
+        )
+        if (
+            not self._client
+            or not pod_uid
+            or not process_generation.strip()
+            or retirement_disposition != "ended"
+            or type(retirement_permanent) is not bool
+            or any(_canonical_runtime_uuid(value) != value for value in coordinates)
+        ):
+            return None
+        body = {
+            "agent_id": pinned_agent_id,
+            "pod_uid": pod_uid,
+            "process_generation": process_generation,
+            "session_runtime_generation": session_runtime_generation,
+            "session_runtime_attach_token": session_runtime_attach_token,
+            "session_runtime_retirement_token": session_runtime_retirement_token,
+            "retirement_disposition": retirement_disposition,
+            "retirement_permanent": retirement_permanent,
+            "workspace_generation": workspace_generation,
+            "workspace_runtime_incarnation": workspace_runtime_incarnation,
+        }
+        marker = {
+            "kind": "vm_local_drain_complete_v1",
+            "thread_id": thread_id,
+            "agent_id": pinned_agent_id,
+            "pod_uid": pod_uid,
+            "process_generation": process_generation,
+            "runtime_generation": session_runtime_generation,
+            "runtime_attach_token": session_runtime_attach_token,
+            "retirement_token": session_runtime_retirement_token,
+            "disposition": retirement_disposition,
+            "permanent": retirement_permanent,
+            "workspace_generation": workspace_generation,
+            "workspace_runtime_incarnation": workspace_runtime_incarnation,
+        }
+        try:
+            response = await self._client.post(
+                f"{self.orchestrator_url}/api/agents/threads/{thread_id}/retirement-actuator",
+                json=body,
+            )
+            if response.status_code != 200:
+                return None
+            payload = response.json()
+        except Exception as exc:
+            logger.warning("VM retirement handoff unavailable: %s", type(exc).__name__)
+            return None
+        if (
+            not isinstance(payload, dict)
+            or payload.get("status")
+            not in {"actuator_requested", "settled_or_superseded"}
+            or payload.get("actuator_request") != marker
+        ):
+            return None
+        return payload
 
     async def get_thread_retirement_outcome(
         self,
@@ -3458,6 +3786,20 @@ class OrchestratorClient:
             payload["agent_id"] = str(agent_id)
         if client_report_id is not None:
             payload["client_report_id"] = str(client_report_id)
+        if getattr(self, "pinned_delivery_job_id", None) == job_id:
+            payload.update(
+                {
+                    "pinned_delivery_id": getattr(self, "pinned_delivery_id", None),
+                    "pinned_projection_digest": getattr(
+                        self, "pinned_projection_digest", None
+                    ),
+                    "pinned_delivery_proof": getattr(
+                        self, "pinned_delivery_proof", None
+                    ),
+                    "pinned_process_generation": self.dispatch_process_generation,
+                    "pinned_pod_uid": os.environ.get("POD_UID"),
+                }
+            )
 
         try:
             # Stateless terminal handling can include workspace/archive and

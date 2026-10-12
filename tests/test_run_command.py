@@ -93,6 +93,44 @@ class TestModeToggle:
         assert "shell_execute" not in tool_names
 
 
+class TestFactoryFollowsTheResolvedNameList:
+    """``shell.mode`` is resolved ONCE, by ``get_all_tool_names``' aliasing.
+
+    The bind is the intersection of that name list and what the factory
+    builds; while the factory re-read the mode from its own config, a
+    disagreement bound no executor at all (the ``shell_read``-only session in
+    knowledge-base/knowledge/issues/live_config_update_buries_extra_and_empties_the_shell_group.md,
+    item 5). ``load_tools`` now hands the factory the resolved names.
+    """
+
+    @pytest.mark.parametrize(
+        ("config_mode", "requested"),
+        [
+            ("stateless", ["shell_execute", "shell_read"]),
+            ("persistent", ["cancel_command", "run_command", "shell_read"]),
+        ],
+        ids=["persistent-names", "stateless-names"],
+    )
+    def test_load_tools_binds_every_resolved_name(
+        self, manager, config_mode, requested
+    ):
+        from agent.tools.registry import load_tools
+
+        context = _make_context(manager, mode=config_mode)
+        names = {t.name for t in load_tools(requested, context)}
+        assert names == set(requested)
+
+    @pytest.mark.parametrize("mode", ["stateless", "persistent"])
+    def test_names_without_one_executor_leave_the_mode_to_config(self, manager, mode):
+        context = _make_context(manager, mode=mode)
+        executor = "shell_execute" if mode == "persistent" else "run_command"
+        for requested in (["shell_read"], ["run_command", "shell_execute"]):
+            names = {
+                t.name for t in create_shell_tools(context, requested_names=requested)
+            }
+            assert executor in names
+
+
 class TestCancelCommand:
     """cancel_command exposes a Ctrl+C/abort for the stateless tool set."""
 

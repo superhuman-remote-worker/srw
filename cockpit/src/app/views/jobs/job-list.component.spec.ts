@@ -1,4 +1,5 @@
-import {signal, ɵresolveComponentResources} from '@angular/core';
+import {CUSTOM_ELEMENTS_SCHEMA, Pipe, PipeTransform, signal, ɵresolveComponentResources} from '@angular/core';
+import {DatePipe} from '@angular/common';
 import {TestBed} from '@angular/core/testing';
 import {ActivatedRoute, Router} from '@angular/router';
 import {TranslocoService, TranslocoTestingModule} from '@jsverse/transloco';
@@ -16,8 +17,19 @@ import {JobListComponent, jobCloudAction} from './job-list.component';
 // the i18n parity gate and ships as the raw key string.
 import en from '../../../assets/i18n/en.json';
 
+@Pipe({name: 'transloco', standalone: true})
+class WorkspaceCreationTranslocoPipe implements PipeTransform {
+  transform(key: string): string {
+    if (key.startsWith('workspaceCreation.')) {
+      return (en.workspaceCreation as Record<string, string>)[key.split('.')[1]] ?? key;
+    }
+    return key;
+  }
+}
+
 /**
- * The template is replaced with an empty one for every spec here.
+ * Most logic specs replace the template with an empty one. The typed startup
+ * tests below render the actual row while stubbing unrelated UI children.
  *
  * Not laziness — the JIT compiler vitest runs cannot see initializer-based
  * inputs (`input()`/`model()`), so property-binding any signal input in a
@@ -29,6 +41,7 @@ import en from '../../../assets/i18n/en.json';
 function mountLogic(overrides: {
   api?: Partial<ApiService>;
   params?: BehaviorSubject<ReturnType<typeof paramMap>>;
+  rendered?: boolean;
 } = {}) {
   const navigate = vi.fn().mockResolvedValue(true);
   const api = {
@@ -72,13 +85,57 @@ function mountLogic(overrides: {
       },
     ],
   });
-  TestBed.overrideComponent(JobListComponent, {set: {template: '', imports: []}});
+  TestBed.overrideComponent(JobListComponent, overrides.rendered
+    ? {set: {imports: [WorkspaceCreationTranslocoPipe, DatePipe], schemas: [CUSTOM_ELEMENTS_SCHEMA]}}
+    : {set: {template: '', imports: []}});
   const transloco = TestBed.inject(TranslocoService);
   transloco.setTranslation(en, 'en');
   transloco.setActiveLang('en');
   const fixture = TestBed.createComponent(JobListComponent);
   return {fixture, component: fixture.componentInstance, api, navigate};
 }
+
+describe('typed workspace creation on job rows', () => {
+  beforeAll(async () => {
+    await ɵresolveComponentResources(() => Promise.resolve(''));
+  });
+  afterEach(() => TestBed.resetTestingModule());
+
+  it('renders waiting for scheduling with the native Cancel control', async () => {
+    const {fixture, component} = mountLogic({rendered: true, api: {
+      getJobsPage: vi.fn().mockReturnValue(of(page([job('startup', {
+        status: 'created', workspace_creation: {stage: 'scheduling', state: 'waiting_capacity',
+          reason_code: 'scheduler_unschedulable', readiness_deadline_at: null},
+      })]))),
+    }});
+    fixture.detectChanges();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    fixture.detectChanges();
+    const row = (fixture.nativeElement as HTMLElement).querySelector('tr:not(.detail-row) .prompt-cell') as HTMLElement;
+    expect(row.textContent).toContain('Waiting for scheduling');
+    const cancel = [...(fixture.nativeElement as HTMLElement).querySelectorAll('app-menu-item')]
+      .find((item) => item.textContent?.includes('jobs.action.cancel'));
+    expect(cancel).toBeTruthy();
+    cancel!.dispatchEvent(new CustomEvent('activated'));
+    expect(component.confirmCancelOpen()).toBe(true);
+  });
+
+  it('shows typed attention without echoing a failed job raw scheduler diagnostic', async () => {
+    const {fixture} = mountLogic({rendered: true, api: {
+      getJobsPage: vi.fn().mockReturnValue(of(page([job('failed-startup', {
+        status: 'failed', error_message: '0/3 nodes had a private taint',
+        workspace_creation: {stage: 'readiness', state: 'attention',
+          reason_code: 'invalid_configuration', readiness_deadline_at: null},
+      })]))),
+    }});
+    fixture.detectChanges();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    fixture.detectChanges();
+    const text = (fixture.nativeElement as HTMLElement).textContent ?? '';
+    expect(text).toContain('Workspace needs attention');
+    expect(text).not.toContain('0/3 nodes');
+  });
+});
 
 function paramMap(values: Record<string, string | string[]>) {
   const normalised = new Map<string, string[]>(
@@ -123,6 +180,38 @@ describe('JobListComponent — server-resolved tree', () => {
   });
   afterEach(() => TestBed.resetTestingModule());
 
+  it('opens a suspended VM IDE from the click and uses the admitted URL', () => {
+    const startIdeSession = vi.fn().mockReturnValue(of({
+      status: 'active', access_lease_id: 'lease-1',
+      code_server_url: 'https://example.test/api/ide/vm/proxy/_vm/lease-1/',
+    }));
+    const getIdeSession = vi.fn();
+    const {fixture, component} = mountLogic({
+      api: {startIdeSession, getIdeSession} as Partial<ApiService>,
+    });
+    fixture.detectChanges();
+    const vm = job('vm', {
+      status: 'waiting', workspace_lifecycle: {state: 'suspended'},
+    }) as JobSummary;
+    component.jobs.set([vm]);
+    const tab = {
+      opener: null, document: {title: '', body: {textContent: ''}},
+      location: {href: ''}, close: vi.fn(), closed: false,
+    };
+    const opened = vi.spyOn(window, 'open').mockReturnValue(tab as unknown as Window);
+    try {
+      expect(component.canOpenIde(vm)).toBe(true);
+      component.openIde('vm');
+      expect(opened).toHaveBeenCalledWith('', '_blank');
+      expect(startIdeSession).toHaveBeenCalledWith('vm');
+      expect(getIdeSession).not.toHaveBeenCalled();
+      expect(tab.location.href).toContain('/api/ide/vm/proxy/_vm/lease-1/');
+      expect(tab.close).not.toHaveBeenCalled();
+    } finally {
+      opened.mockRestore();
+    }
+  });
+
   it('keeps blocked/undelivered distinct from cancellation and non-actionable', () => {
     const {fixture, component} = mountLogic();
     fixture.detectChanges();
@@ -135,6 +224,22 @@ describe('JobListComponent — server-resolved tree', () => {
     expect(component.isBlockedUndelivered(blocked)).toBe(true);
     expect(component.jobStatusTone(component.effectiveJobStatus(blocked))).toBe('warning');
     expect(en.jobs.status.blocked_undelivered).toBe('Blocked / undelivered');
+  });
+
+  it('does not send stale Resume after creation advice becomes non-resumable', () => {
+    const {fixture, component, api} = mountLogic();
+    fixture.detectChanges();
+    component.jobs.set([job('creation-job', {
+      status: 'paused', vm_creation: {
+        request_id: 'creation-id', state: 'reconciling', stage: 'creation',
+        reason_code: 'capacity_wait', message: 'Waiting for VM capacity.', resumable: false,
+      },
+    }) as JobSummary]);
+    component.resumeJob('creation-job');
+    expect(api.resumeJob).not.toHaveBeenCalled();
+    component.jobs.update(rows => rows.map(row => ({...row, vm_creation: {...row.vm_creation!, resumable: true}})));
+    component.resumeJob('creation-job');
+    expect(api.resumeJob).toHaveBeenCalledWith('creation-job');
   });
 
   it('routes paused workspace recovery through Retry and keeps Cancel available', () => {
@@ -747,6 +852,92 @@ describe('JobListComponent — server-resolved tree', () => {
     );
     expect(component.workspaceContractSummary(workspaceJob)).not.toContain('ssh');
   });
+
+  it('describes a terminal VM without a runtime without claiming cleanup finished', () => {
+    const {fixture, component} = mountLogic();
+    fixture.detectChanges();
+    const missingRuntime = {
+      requested_backend: 'vm' as const,
+      assigned_backend: 'vm' as const,
+      effective_backend: null,
+      state: 'waiting',
+      failure: 'vm_runtime_not_ready',
+    };
+    const disposed = job('disposed', {
+      status: 'cancelled', workspace_contract: missingRuntime,
+    }) as JobSummary;
+    const cleanupHeld = job('held', {
+      status: 'cancelled', workspace_contract: missingRuntime,
+      vm_creation: {
+        request_id: 'd4c87f23-fa0b-4d5a-93dc-2a37b2e4a6a9',
+        stage: 'creation', state: 'cancel_requested', reason_code: 'job_cancelled',
+        message: 'Waiting for VM creation cancellation to be reconciled.',
+        resumable: false,
+      },
+    }) as JobSummary;
+
+    expect(component.workspaceContractTitle(disposed)).toBe('VM workspace unavailable');
+    for (const status of ['completed', 'failed']) {
+      expect(component.workspaceContractTitle(job(status, {
+        status, workspace_contract: missingRuntime,
+      }) as JobSummary)).toBe('VM workspace unavailable');
+    }
+    expect(component.workspaceContractTitle(job('blocked', {
+      status: 'cancelled', completion_outcome_kind: 'blocked_undelivered',
+      workspace_contract: missingRuntime,
+    }) as JobSummary)).toBe('VM workspace unavailable');
+    expect(component.workspaceContractTitle(cleanupHeld)).toBe(
+      'VM workspace unavailable · Waiting for VM creation cancellation to be reconciled.',
+    );
+    expect(component.workspaceContractSummary(disposed)).toBe(
+      'Workspace: requested vm · assigned vm · effective unavailable',
+    );
+  });
+
+  it('keeps active waits and terminal retained runtimes in their existing workspace states', () => {
+    const {fixture, component} = mountLogic();
+    fixture.detectChanges();
+    const waiting = {
+      requested_backend: 'vm' as const,
+      assigned_backend: 'vm' as const,
+      effective_backend: null,
+      state: 'waiting',
+      failure: 'vm_runtime_not_ready',
+    };
+
+    for (const status of ['processing', 'paused', 'pending_review']) {
+      expect(component.workspaceContractTitle(job(status, {
+        status, workspace_contract: waiting,
+      }) as JobSummary)).toBe('Workspace state: waiting · detail: vm_runtime_not_ready');
+    }
+    expect(component.workspaceContractTitle(job('capacity', {
+      status: 'paused', workspace_contract: waiting,
+      vm_creation: {
+        request_id: 'd4c87f23-fa0b-4d5a-93dc-2a37b2e4a6a9',
+        stage: 'creation', state: 'reconciling', reason_code: 'capacity_wait',
+        message: 'Waiting for VM capacity.', resumable: false,
+      },
+    }) as JobSummary)).toBe('Workspace state: waiting · detail: vm_runtime_not_ready');
+    expect(component.workspaceContractTitle(job('retained', {
+      status: 'completed',
+      workspace_contract: {...waiting, state: 'ready', failure: null, effective_backend: 'vm'},
+    }) as JobSummary)).toBe('Workspace state: ready · detail: none');
+    expect(component.workspaceContractTitle(job('recovering', {
+      status: 'cancelled', workspace_contract: waiting,
+      workspace_recovery: {
+        operation_id: '22222222-bbbb-4222-8222-222222222222',
+        state: 'recovering', reason_code: 'prior_runtime_unfenced',
+        message: 'Workspace recovery is running.',
+        started_at: '2026-09-16T08:00:00Z',
+        deadline_at: '2026-09-16T08:15:00Z',
+        next_check_at: null, retryable: false, cleanup_pending: true,
+      },
+    }) as JobSummary)).toBe('Workspace state: waiting · detail: vm_runtime_not_ready');
+    expect(component.workspaceContractTitle(job('sandbox', {
+      status: 'cancelled',
+      workspace_contract: {...waiting, assigned_backend: 'sandbox', failure: 'sandbox_runtime_not_ready'},
+    }) as JobSummary)).toBe('Workspace state: waiting · detail: sandbox_runtime_not_ready');
+  });
 });
 
 describe('JobListComponent — filters drive the URL', () => {
@@ -966,9 +1157,19 @@ describe('JobListComponent — live refresh', () => {
 describe('jobCloudAction', () => {
   const base = {status: 'completed', cloud_review_mode: 'open_folder'} as Partial<JobSummary>;
 
-  it('offers nothing until the job is completed and in folder mode', () => {
+  it('offers nothing until the output is stable, or while its diff waits for review', () => {
     expect(jobCloudAction({...base, status: 'processing'} as JobSummary)).toBe('none');
-    expect(jobCloudAction({...base, cloud_review_mode: 'diff'} as JobSummary)).toBe('none');
+    expect(jobCloudAction({...base, status: 'failed'} as JobSummary)).toBe('none');
+    expect(jobCloudAction({...base, diff_status: 'pending'} as JobSummary)).toBe('none');
+  });
+
+  it("offers the outbox for a cloud project's job and a job in review too", () => {
+    // The outbox is the job's deliverables; the project folder's copy has
+    // its own diff review.
+    expect(jobCloudAction({...base, cloud_review_mode: 'diff'} as JobSummary)).toBe('export');
+    expect(jobCloudAction({...base, cloud_review_mode: 'diff', diff_status: 'accepted'} as JobSummary)).toBe('export');
+    expect(jobCloudAction({...base, status: 'pending_review'} as JobSummary)).toBe('export');
+    expect(jobCloudAction({...base, status: 'reviewing'} as JobSummary)).toBe('export');
   });
 
   it('offers export first, then the folder once a URL exists', () => {

@@ -173,7 +173,10 @@ config/
 │   ├── persona_glm_5_3.txt                 # GLM-5.3 / Flash persona
 │   ├── systemprompt_muse_spark_1_3.txt     # Muse Spark 1.3 worker prompt
 │   ├── systemprompt_interactive_muse_spark_1_3.txt # Muse Spark 1.3 chat prompt
-│   └── persona_muse_spark_1_3.txt          # Muse Spark 1.3 persona
+│   ├── persona_muse_spark_1_3.txt          # Muse Spark 1.3 persona
+│   ├── systemprompt_kimi_k3.txt            # Kimi K3 worker prompt
+│   ├── systemprompt_interactive_kimi_k3.txt # Kimi K3 chat prompt
+│   └── persona_kimi_k3.txt                 # Kimi K3 persona
 └── templates/                   # Instruction templates (non-prompt files)
     ├── instructions.md                  # Default agent instructions
     ├── instructions_minimax.md          # MiniMax M2.7-optimized instructions
@@ -622,7 +625,6 @@ limits:
 
 context_management:
   compact_on_archive: true
-  keep_recent_tool_results: 150
   keep_recent_messages: 10
 ```
 
@@ -750,6 +752,109 @@ The separately selected `meta/muse-spark-1.3-contributor` also uses this family;
 family detection preserves the selected model ID and tier. Adding the family
 does not register a catalog row. Audio/video input transport is outside this
 family configuration change.
+
+## Moonshot Kimi K3
+
+The `kimi-k3` family supplies worker/chat/persona prompts, image input, a
+1,048,576-token context window, and a 131,072-token response budget including
+reasoning (Moonshot's own `max_completion_tokens` default). Only K3 is matched:
+K2.x rows keep the `default` family, since they take a `thinking` toggle instead
+of an effort field and have a 256K window.
+
+Reasoning is always on and cannot be disabled. `reasoning_effort` accepts `low`,
+`high`, and `max`; the family defaults to `max`, the
+[provider default](https://platform.kimi.ai/docs/guide/use-reasoning-effort).
+Moonshot warns that changing the level mid-conversation invalidates prefix-cache
+hits. The native API
+[fixes the sampling parameters](https://platform.kimi.ai/docs/api/models-overview):
+temperature 1.0 (the family's value), top_p 0.95 (left unset), and both penalties at 0.
+
+Structured output uses `json_schema`. Do not switch the family to
+`function_calling`: forcing a named tool returns HTTP 400 while thinking is on.
+Moonshot also asks for each assistant message's `reasoning_content` to be sent
+back on later turns. SRW's OpenAI-compatible transport does not do that, so the
+K3 prompts ask the model for a one-line visible intent before each tool call.
+
+In **Admin → Models**, add `moonshotai/kimi-k3` with your OpenRouter provider, or
+`kimi-k3` on an OpenAI-compatible endpoint at `https://api.moonshot.ai/v1`. The
+native API accepts images only as base64 or `ms://` file IDs, not public URLs.
+The family is detected automatically, including `openrouter/` and `moonshotai/`
+prefixes. Adding the family does not register a catalog row.
+
+## Qwen3.8-27B
+
+The `qwen3.8-27b` family is settings-only (default prompts): image and video
+input, a 262,144-token native context, and the model card's thinking-mode
+sampling (temperature 1.0, top_p 0.95, top_k 20). Only the 27B is matched.
+Qwen3.8 Max has its own family (below), Qwen3.8 Flash stays on `default`, and
+`qwen3-8b` is the older Qwen3 8B.
+
+Reasoning effort is `low`, `medium`, or `xhigh` (default, Qwen's recommendation
+for multi-turn agent work). The official chat template raises an error on any
+other value, so a requested `high` is sent as `medium` and `max` as `xhigh`. The
+template also rejects a system message anywhere but first. The family therefore
+sets `single_system_message: true`, which folds each request to one leading
+system message before it is sent (later system messages become user messages).
+Families without the setting are unchanged.
+
+Self-host with vLLM using `--reasoning-parser qwen3 --enable-auto-tool-choice
+--tool-call-parser qwen3_xml` ([recipe](https://recipes.vllm.ai/Qwen/Qwen3.8-27B)),
+then add the served model in **Admin → Models** on an OpenAI-compatible endpoint.
+Via OpenRouter, add `qwen/qwen3.8-27b`. The family is detected automatically;
+pick it by hand if the served model name does not contain `qwen3.8-27b`.
+
+## Qwen3.8 Max
+
+The `qwen3.8-max` family covers Qwen3.8 Max and Max Prime (the same model on a
+higher-throughput SKU). It is settings-only: image and video input, a 1,000,000
+token window, a 131,072-token response cap, and temperature 1.0, top_p 0.95,
+top_k 20. The open-weight Qwen3.8-2.4T-A95B is not matched: it is text-only,
+and its chat template raises an error on images.
+
+Reasoning effort is `low`, `medium`, or `xhigh` (default). The
+[API](https://www.alibabacloud.com/help/en/model-studio/deep-thinking) maps
+`high` and `max` to `xhigh`, so the family offers only the levels that differ.
+Like the 27B, the family sets `single_system_message: true`: Alibaba documents
+no rule for later system messages, and the open variant's template rejects them.
+Structured output stays on `json_schema`, because thinking mode cannot force a
+tool call.
+
+In **Admin → Models**, add `qwen3.8-max` on an OpenAI-compatible endpoint at
+Alibaba Model Studio, or `qwen/qwen3.8-max-0902` / `qwen/qwen3.8-max-prime` with
+your OpenRouter provider. Expect long outputs: Artificial Analysis measured
+about twice the median token use.
+
+## xAI Grok 4.7
+
+The `grok-4.7` family is settings-only: image input, a 500,000-token window,
+and temperature 0.7 / top_p 0.95. Reasoning is always on; effort is `low`,
+`medium`, `high` (default), or `xhigh`
+([xAI docs](https://docs.x.ai/developers/model-capabilities/text/reasoning.md)).
+Only 4.7 is matched; older 4.x rows differ in effort ladder and window and keep
+`default`. The xAI API rejects `stop`, `presence_penalty`, and
+`frequency_penalty` on reasoning models, and SRW sends none of them.
+
+xAI bills every token in a request at double rate once the prompt reaches
+200,000 tokens. With the full window, compaction starts at 400,000, so long jobs
+pay double for most late turns. To stay under that tier, set the model's
+`context_window` to 250,000 in **Admin → Models**.
+
+Add `grok-4.7` on an OpenAI-compatible endpoint at `https://api.x.ai/v1`,
+`x-ai/grok-4.7` with your OpenRouter provider, or connect the Grok Build
+subscription.
+
+## Claude Sonnet 5 / 5.5
+
+The `claude-sonnet-5` family covers Sonnet 5 and 5.5. Both accept all five
+effort levels (`low` to `max`, default `high`), while 4.x Sonnet keeps the
+`claude-sonnet` family and `low`/`medium`/`high`. The other settings match the
+Opus 5 families: 1M context, image input at the high-resolution cap, parallel
+tool calls, and temperature 1.0.
+
+Sonnet 5.5 returns HTTP 400 for forced tool use, for disabling thinking, and for
+any non-default sampling value. SRW sends none of these: structured output uses
+`json_schema`, and 1.0 is Anthropic's default temperature. Do not switch the
+family to `function_calling`.
 
 ## Schema Validation
 

@@ -15,7 +15,9 @@ ROOT = Path(__file__).resolve().parents[1]
 CHART = ROOT / "helm"
 
 
-def _render(*settings: str, show_only: str | None = None) -> list[dict]:
+def _render(
+    *settings: str, show_only: str | None = None, namespace: str | None = None
+) -> list[dict]:
     command = [
         "helm",
         "template",
@@ -32,6 +34,8 @@ def _render(*settings: str, show_only: str | None = None) -> list[dict]:
     ]
     if show_only:
         command.extend(["--show-only", show_only])
+    if namespace:
+        command.extend(["--namespace", namespace])
     for setting in settings:
         command.extend(["--set", setting])
     rendered = subprocess.run(
@@ -299,6 +303,88 @@ def test_stateless_executor_grace_exceeds_shutdown_and_abort_budget() -> None:
     assert (
         deployment["spec"]["template"]["spec"]["terminationGracePeriodSeconds"] == 360
     )
+
+
+@pytest.mark.skipif(shutil.which("helm") is None, reason="Helm is not installed")
+def test_stateless_executor_pods_are_born_with_the_process_zero_finalizer() -> None:
+    """Without it the claimant-loss hold is a race the reconciler loses.
+
+    The kubelet removes a finalizer-free Pod object ~0.7 s after its
+    containers terminate; the reconciler ticks every 15 s and (by design)
+    never accepts a 404 as process-zero proof, so a stolen claim's debt
+    became unsettleable. The finalizer keeps the exact terminal UID
+    readable until the orchestrator has recorded proof and releases it.
+    """
+    from orchestrator.services.agent_provisioner import (
+        STATELESS_EXECUTOR_PROCESS_ZERO_FINALIZER,
+    )
+
+    def finalizers(*settings: str) -> list[str] | None:
+        deployment = _only_kind(
+            _render(
+                "agent.stateless.enabled=true",
+                *settings,
+                show_only="templates/agent/stateless-deployment.yaml",
+            ),
+            "Deployment",
+        )
+        return deployment["spec"]["template"]["metadata"].get("finalizers")
+
+    assert finalizers() == [STATELESS_EXECUTOR_PROCESS_ZERO_FINALIZER]
+    assert finalizers("agent.stateless.processZeroFinalizer=false") is None
+
+
+@pytest.mark.skipif(shutil.which("helm") is None, reason="Helm is not installed")
+def test_executor_retention_may_read_nodes_and_nothing_else_cluster_wide() -> None:
+    """Lost-node executors are released on Node 404 / out-of-service taint."""
+
+    def node_observer(*settings: str) -> list[dict]:
+        return [
+            document
+            for document in _render(
+                *settings, show_only="templates/orchestrator/rbac.yaml"
+            )
+            if document.get("kind") in {"ClusterRole", "ClusterRoleBinding"}
+        ]
+
+    role, binding = sorted(
+        node_observer("agent.stateless.enabled=true"), key=lambda d: d["kind"]
+    )
+    assert role["rules"] == [
+        {"apiGroups": [""], "resources": ["nodes"], "verbs": ["get"]}
+    ]
+    assert binding["roleRef"]["name"] == role["metadata"]["name"]
+    assert binding["subjects"][0]["kind"] == "ServiceAccount"
+    assert node_observer("agent.stateless.enabled=false") == []
+    assert (
+        node_observer(
+            "agent.stateless.enabled=true",
+            "agent.stateless.processZeroFinalizer=false",
+        )
+        == []
+    )
+
+
+@pytest.mark.skipif(shutil.which("helm") is None, reason="Helm is not installed")
+def test_node_observer_cluster_role_is_unique_per_release_namespace() -> None:
+    """Cluster-scoped names must not collide between two same-named releases
+    in different namespaces — the second install would fail on ownership."""
+
+    def names(namespace: str) -> set[str]:
+        return {
+            document["metadata"]["name"]
+            for document in _render(
+                "agent.stateless.enabled=true",
+                show_only="templates/orchestrator/rbac.yaml",
+                namespace=namespace,
+            )
+            if document.get("kind") in {"ClusterRole", "ClusterRoleBinding"}
+        }
+
+    first, second = names("srw-a"), names("srw-b")
+    assert first and second
+    assert first.isdisjoint(second)
+    assert all(len(name) <= 63 for name in first | second)
 
 
 @pytest.mark.skipif(shutil.which("helm") is None, reason="Helm is not installed")

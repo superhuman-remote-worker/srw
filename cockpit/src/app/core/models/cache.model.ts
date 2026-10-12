@@ -126,6 +126,8 @@ export interface CachedThreadMessage {
   turn_number: number | null;
   tool_call_id?: string | null;
   thinking?: string | null;
+  /** The row's `metrics` JSON (carries the subagent recovery marker). */
+  metrics?: Record<string, unknown> | null;
   /** ISO-8601; lexicographically sortable — the `[threadId+created_at]` index. */
   created_at: string | null;
 }

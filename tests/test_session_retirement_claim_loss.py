@@ -87,7 +87,7 @@ def _eviction_materializing_db(metadata, queue):
     return conn
 
 
-def _metadata(*, uid="uid-a", intended="queued"):
+def _metadata(*, uid="uid-a", intended="queued", **hold_extra):
     return {
         "kept": True,
         "_stateless_claim_losses": {
@@ -99,6 +99,7 @@ def _metadata(*, uid="uid-a", intended="queued"):
             "attempts_since_completion": 2,
             "queued_at": "2026-08-11T12:00:00+00:00",
             "run_after": "2026-08-11T12:00:03+00:00",
+            **hold_extra,
         },
     }
 
@@ -374,6 +375,49 @@ async def test_exact_uid_ack_removes_debt_and_restores_intended_state():
     )
     assert "ELSE $6::text::timestamptz END" in queue_update.args[0]
     assert "THEN NULL" not in queue_update.args[0]
+    # The hold's own claim_loss_hold reason leaves with it: a row that is not
+    # parked carries no park reason (nor park time) once the hold is gone.
+    assert queue_update.args[7] is None
+    sql = " ".join(queue_update.args[0].split())
+    assert (
+        "park_reason = CASE WHEN $3::text = 'parked' THEN COALESCE($7::text, "
+        "'reaper_max_attempts') ELSE NULL END" in sql
+    )
+    assert "parked_at = CASE WHEN $3::text = 'parked' THEN parked_at ELSE NULL END" in (
+        sql
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("hold_extra", "reason"),
+    [
+        ({"park_reason": "reaper_max_attempts"}, "reaper_max_attempts"),
+        # A hold stored before it kept the reason: the SQL default applies,
+        # the only park a steal installs before its hold.
+        ({}, None),
+    ],
+)
+async def test_ack_of_a_max_attempts_park_restores_its_reason(hold_extra, reason):
+    conn = _db(_metadata(intended="parked", **hold_extra), _queue())
+
+    assert await acknowledge_session_claim_quiesced(
+        conn,
+        thread_id=THREAD_ID,
+        previous_lease_token=8,
+        leased_by="pod-a",
+        pod_uid="uid-a",
+    )
+
+    queue_update = conn.fetchval.await_args_list[1]
+    assert queue_update.args[3] == "parked"
+    assert queue_update.args[7] == reason
+
+
+@pytest.mark.parametrize("reason", ["", "  ", 7, ["reaper_max_attempts"]])
+def test_a_malformed_held_park_reason_is_refused(reason):
+    with pytest.raises(RuntimeError, match="claim-loss hold"):
+        claim_loss_hold(_metadata(intended="parked", park_reason=reason))
 
 
 @pytest.mark.asyncio

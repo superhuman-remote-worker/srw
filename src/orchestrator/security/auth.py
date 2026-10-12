@@ -23,6 +23,7 @@ from datetime import datetime, timedelta, UTC
 from typing import Any
 
 from fastapi import HTTPException, Request
+from orchestrator.security import token_scopes
 from orchestrator.security.account_approval import require_account_approved
 from orchestrator.security.kc_client import KeycloakClientError, kc_bff_client
 from orchestrator.security.oidc import oidc_validator
@@ -339,6 +340,10 @@ async def _resolve_user_from_claims(claims: dict, db) -> dict:
             logger.info(
                 "Updated user %s from OIDC claims: %s", sub, list(needs_update.keys())
             )
+            if needs_update.get("is_approved"):
+                # Admitted on this request: the user's own session outbox and
+                # cloud root.
+                await _ensure_user_cloud_connectors(db, user.get("id"))
             if needs_update.get("is_admin"):
                 # Promotion to admin: seed max-level grants so the grants data
                 # (and UI) reflect the bypass instead of an empty list that
@@ -372,7 +377,9 @@ async def _resolve_user_from_claims(claims: dict, db) -> dict:
     )
     if effective_approved:
         # Approved on first login (admin, or a legacy `user` role-holder):
-        # pre-provision cloud + Gitea so their first thread/repo finds them.
+        # pre-provision cloud + Gitea so their first thread/repo finds them,
+        # and give them their session outbox and cloud root.
+        await _ensure_user_cloud_connectors(db, user.get("id"))
         asyncio.create_task(
             _ensure_cloud_user(
                 sub=sub,
@@ -477,6 +484,12 @@ async def _resolve_pat(token: str, request: Request, db) -> dict:
     introspection. Admission flows from the user row (``is_approved``): the
     force-True is gone so that suspending a user also kills their PATs — if
     the owner is no longer approved, the token stops working on the next call.
+
+    Action scopes are enforced here, against the route FastAPI matched, so
+    every PAT request passes the check whichever gate its handler calls (see
+    ``security.token_scopes``). Admin reach is itself a scope: without
+    ``admin`` the owner's admin flag is dropped for this request, so admin-only
+    gates refuse and admin visibility narrows to the owner's own rows.
     """
     digest = hashlib.sha256(token.encode("ascii")).hexdigest()
     row = await db.get_auth_token_by_hash(digest)
@@ -488,9 +501,28 @@ async def _resolve_pat(token: str, request: Request, db) -> dict:
     asyncio.create_task(
         db.touch_auth_token(str(row["id"]), _client_ip(request)),
     )
-    user["auth_method"] = "pat"
+    user["auth_method"] = token_scopes.PAT_AUTH_METHOD
     user["scopes"] = list(row.get("scopes") or [])
     user["token_id"] = str(row["id"])
+    if token_scopes.ADMIN_SCOPE not in user["scopes"]:
+        user["is_admin"] = False
+    try:
+        token_scopes.enforce_route_scopes(request, user)
+    except HTTPException as exc:
+        # Lazy: security.access imports this module.
+        from orchestrator.security.access import log_security_event
+
+        route = token_scopes.route_identity(request)
+        await log_security_event(
+            db,
+            event_type="token_scope_denied",
+            user=user,
+            resource_type="api_route",
+            resource_id=route[1] if route else None,
+            detail=f"{exc.detail} (token scopes: {sorted(map(str, user['scopes']))})",
+            request=request,
+        )
+        raise
     return user
 
 
@@ -579,6 +611,28 @@ def _resolve_provisioning_backend(
         )
         return None
     return provider()
+
+
+async def _ensure_user_cloud_connectors(db: Any, user_id: Any) -> None:
+    """An admitted user's own main-cloud connectors: their session outbox
+    while a main cloud is configured (main cloud slice 6.1), and their cloud
+    root ("My cloud", not connected yet) where the main cloud has user roots
+    (slice 4). Never fails the login: a failure is logged and the startup
+    backfill retries it."""
+    try:
+        from orchestrator.services.cloud_outbox_connectors import (
+            ensure_outbox_if_cloud,
+        )
+        from orchestrator.services.cloud_user_root import ensure_user_root_if_cloud
+
+        main_cloud_router = _resolve_provisioning_backend(
+            _cloud_router_provider, "main-cloud"
+        )
+        if main_cloud_router is not None:
+            await ensure_outbox_if_cloud(db, main_cloud_router, user_id)
+            await ensure_user_root_if_cloud(db, main_cloud_router, user_id)
+    except Exception as e:
+        logger.warning("Cloud connectors for user %s not ensured: %s", user_id, e)
 
 
 async def _ensure_cloud_user(

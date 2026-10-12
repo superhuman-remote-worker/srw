@@ -22,6 +22,7 @@ from fastmcp import FastMCP
 from starlette.responses import JSONResponse
 
 # Shared-surface imports resolve through the installed package in every environment.
+from shared.connectors import LEGACY_TYPE_IDS
 from shared.expert_reference import (
     ExpertReferenceConflict,
     resolve_expert_selection,
@@ -29,22 +30,15 @@ from shared.expert_reference import (
 from shared.orch_surface import formatters as fmt
 from shared.orch_surface.client import AsyncCockpitClient, MutationOutcomeUnknown
 from shared.orch_surface.jobs import AUTH_CONTEXT_FAILURE_NOTICE, CallerCtx
+from shared.orch_surface.workspace_choice import (
+    WorkspaceArgumentError,
+    workspace_field,
+)
 from shared.sudo_command_line import render_sudo_command_line
 
-DatasourceType = Literal[
-    "generic",
-    "repository",
-    "kb",
-    "postgresql",
-    "neo4j",
-    "mongodb",
-    "webdav",
-    "email",
-    "mcp",
-    "kubeconfig",
-    "ssh_key",
-    "generic_file",
-]
+# Derived from the built-in driver specs, so the MCP tools offer every type the
+# API accepts (a hand-kept copy here once lacked ``credentials``).
+DatasourceType = Literal[LEGACY_TYPE_IDS]  # type: ignore[valid-type]
 DatasourceScopeMode = Literal["all", "projects"]
 DatasourceVisibility = Literal["public", "private"]
 DatasourceOwnership = Literal["mine", "shared"]
@@ -206,7 +200,12 @@ def _format_action_error(action: str, target: str, error: Exception) -> str:
 # "12": one expert selector — create_job / create_project_job take `expert`
 # (a bundled expert id or a DB expert UUID, exactly as list_experts prints
 # it); config_name and expert_id stay as deprecated single-store aliases.
-MCP_TOOL_SCHEMA_REVISION = "13"
+# "14": create_job / create_project_job / create_persistent_thread take `workspace`
+# (a template name, "none", or a {"template": {"ref": ...}} binding; inline
+# recipes are refused: Slice A3, shared/orch_surface/workspace_choice.py).
+# "15": list_connector_drivers, the connector driver capability matrix
+# (connector drivers D2).
+MCP_TOOL_SCHEMA_REVISION = "15"
 _tool_schema_cache: tuple[list[dict[str, Any]], str] | None = None
 
 
@@ -774,6 +773,26 @@ async def list_datasources(
         return f"{rendered}\n\nNext cursor: {page.get('next_cursor') or 'none'}"
     except Exception as e:
         return fmt.format_monitoring_error("list connectors", e)
+
+
+@mcp_tool
+async def list_connector_drivers() -> str:
+    """List the installed connector drivers and what each one enforces.
+
+    The generated capability matrix: per driver, its access levels and the
+    mechanism enforcing each (advisory levels are only told to the agent),
+    where it runs, workspace backends, trust, credential slots (never
+    values) and declared egress. Use it to choose a connector type and
+    access level before create_datasource.
+
+    Returns:
+        Every installed driver with its access levels and enforcement
+    """
+    client = _get_client()
+    try:
+        return fmt.format_connector_drivers(await client.list_connector_drivers())
+    except Exception as e:
+        return fmt.format_monitoring_error("list connector drivers", e)
 
 
 @mcp_tool
@@ -1492,6 +1511,7 @@ async def create_project_job(
     datasource_ids: list[str] = None,  # type: ignore[assignment]
     priority: int = 5,
     required_deliverables: list[str] | None = None,
+    workspace: str | dict[str, Any] | None = None,
 ) -> str:
     """Create a job within a project context.
 
@@ -1525,6 +1545,11 @@ async def create_project_job(
             slugs that must exist before a completion claiming success may
             seal. Shown to the worker at dispatch; missing deliverables
             bounce the seal back to the worker with the precise list.
+        workspace: The workspace this job runs in. Omit it to use the project's
+            default (or, without a project, the installation's). "none" runs the
+            job with no workspace. A template name such as "container-minimal",
+            or one listed by manifest_list kind=WorkspaceTemplate, is looked up
+            in the project, then your own templates, then the shared catalog.
 
     Returns:
         Created job summary with ID
@@ -1538,6 +1563,12 @@ async def create_project_job(
     except ExpertReferenceConflict as conflict:
         return f"Refusing to create job: {conflict}"
     client = _get_client()
+    try:
+        workspace_supplied, workspace_binding = await workspace_field(
+            client, workspace, project_id=project_id
+        )
+    except WorkspaceArgumentError as problem:
+        return f"Refusing to create job: {problem}"
     result = await client.create_project_job(
         project_id=project_id,
         description=description,
@@ -1550,6 +1581,8 @@ async def create_project_job(
         datasource_ids=datasource_ids,
         priority=priority,
         required_deliverables=required_deliverables,
+        workspace=workspace_binding,
+        workspace_supplied=workspace_supplied,
     )
     return fmt.format_created_job(result, choice.config_name, expert=choice.reference)
 
@@ -1596,7 +1629,17 @@ async def update_project(
         default_config_override=default_config_override,
     )
     s = result.get("status", "unknown")
-    return f"Project {project_id} updated ({s})."
+    message = f"Project {project_id} updated ({s})."
+    dropped = result.get("dropped_hidden_keys") or []
+    if dropped:
+        # get_project serves the override redacted; a write that changed an
+        # endpoint (or a section) kept none of these stored secrets.
+        message += (
+            " Stored secrets NOT kept (send them again to restore): "
+            + ", ".join(dropped)
+            + "."
+        )
+    return message
 
 
 @mcp_tool
@@ -1781,8 +1824,8 @@ async def create_datasource(
 ) -> str:
     """Create a new connector.
 
-    Supports generic, repository, kb, PostgreSQL, Neo4j, MongoDB, WebDAV,
-    email, MCP, and credential-file connectors. New connectors are canonical
+    Supports generic, credentials, repository, kb, PostgreSQL, Neo4j, MongoDB,
+    WebDAV, email, MCP, and credential-file connectors. New connectors are canonical
     user-owned resources; job-scoped connector creation is no longer
     supported. Global publication is controlled separately by is_global and
     requires the server-side public_datasources capability.
@@ -1801,7 +1844,10 @@ async def create_datasource(
             access/folders/drafts_folder/from_address/recipient_allowlist/
             unattended_send; and repository options. MCP connectors reject it.
         is_global: Publish to all users (capability-gated; default false)
-        read_only: Declarative read-only setting (public defaults true; kb always true)
+        read_only: Creator's read-only tag: agents get no write tools for this
+            connector, for everyone who uses it (public defaults true; kb always
+            true; a remote MCP connector still gets every tool its server
+            lists). The credential still decides what is really allowed.
         scope_mode: Availability scope. ``all`` allows every otherwise-authorized
             work context; ``projects`` restricts use to project_ids.
         project_ids: Full initial project scope. Omit for all scope; projects
@@ -1862,7 +1908,9 @@ async def update_datasource(
         default_branch: New default branch (optional)
         config: New non-secret type-specific config (optional)
         is_global: Publish/unpublish. Publishing is capability-gated (optional)
-        read_only: New declarative read-only setting (optional)
+        read_only: New read-only tag: true gives agents no write tools for
+            this connector, for everyone who uses it; a remote MCP connector
+            still gets every tool its server lists (optional)
         scope_mode: New availability scope; omit to preserve it.
         project_ids: Desired full project set. Omit to preserve links; pass []
             to remove all links (valid only with resulting all scope).
@@ -1902,6 +1950,9 @@ async def update_datasource(
     if result.get("project_ids") is not None:
         projects = ", ".join(str(value) for value in result["project_ids"]) or "none"
         lines.append(f"Projects: {projects}")
+    # What the update changed beyond what was asked (a stored variable no
+    # connector may set, dropped).
+    lines += [f"Notice: {notice}" for notice in result.get("notices") or ()]
     return "\n".join(lines)
 
 
@@ -2406,6 +2457,8 @@ async def create_persistent_thread(
     datasource_ids: list[str] = None,  # type: ignore[assignment]
     model: str | None = None,
     temperature: float | None = None,
+    workspace: str | dict[str, Any] | None = None,
+    datasource_access: dict[str, str] | None = None,
 ) -> str:
     """Create a new persistent thread (interactive agent session).
 
@@ -2428,17 +2481,51 @@ async def create_persistent_thread(
         title: Human-readable session title
         config_name: Agent config to use (default: "session_base")
         permission_mode: Tool approval mode (supervised, auto_accept, autonomous)
-        project_id: Single project UUID to scope (legacy)
-        project_ids: List of project UUIDs to scope
+        project_id: The session's project UUID. A session has one project or
+            none; omit for none (a project-scoped MCP token uses its own
+            project).
+        project_ids: Deprecated, prefer project_id. At most one project UUID;
+            a second project is refused.
         datasource_ids: Connector selection. Omit to use automatic defaults;
             pass [] for none, or IDs for exactly that authorized selection.
+        datasource_access: The access level of attached connectors that have
+            levels, by connector id: a cloud folder's "read_only",
+            "protected" (writes wait for the owner's review; one folder at
+            most) or "read_write". Each id must be attached; a level it cannot
+            have is refused. Omit for each link's default.
         model: LLM model override (e.g. "RedHatAI/gemma-4-31B-it-FP8-Dynamic")
         temperature: Temperature override
+        workspace: The session's workspace. Omit it to use the project's default
+            (without a project, the installation's). "none" means no workspace;
+            a template name is looked up in the project, your own templates, then
+            the shared catalog. Inline recipes are refused, deliberately, for the
+            same reason this tool has no config_override.
 
     Returns:
         Created thread ID and status
     """
     client = _get_client()
+    # Same rule and words as the orchestrator's 422, checked here first so the
+    # workspace lookup below never searches without the session's project.
+    # Unlike the server, this runs before the token-scope 403 on purpose: both
+    # checks read only the caller's own input, so neither order leaks anything.
+    if len({*(project_ids or []), *([project_id] if project_id else [])}) > 1:
+        return (
+            "Refusing to create the session: A Session can belong to one "
+            "project at most. Pick one project, or none."
+        )
+    single_project = project_id or (project_ids[0] if project_ids else None)
+    try:
+        workspace_supplied, workspace_binding = await workspace_field(
+            client, workspace, project_id=single_project
+        )
+    except WorkspaceArgumentError as problem:
+        return f"Refusing to create the session: {problem}"
+    extra = (
+        {"workspace": workspace_binding, "workspace_supplied": True}
+        if workspace_supplied
+        else {}
+    )
     try:
         result = await client.create_persistent_thread(
             config_name=config_name,
@@ -2449,6 +2536,8 @@ async def create_persistent_thread(
             datasource_ids=datasource_ids,
             model=model,
             temperature=temperature,
+            **extra,
+            **({"datasource_access": datasource_access} if datasource_access else {}),
         )
         return fmt.format_created_thread(result, config_name, title)
     except Exception as e:

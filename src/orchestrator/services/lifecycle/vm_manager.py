@@ -31,7 +31,7 @@ import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Any, AsyncIterator
-from uuid import NAMESPACE_URL, UUID, uuid5
+from uuid import UUID
 
 from orchestrator.services.completion_lifecycle import (
     CompletionLifecycleOwnership,
@@ -48,7 +48,9 @@ from orchestrator.services.vm_workspace_recovery_store import (
     vm_cleanup_kwargs,
     cleanup_intent_digest,
     completed_cleanup_outcome,
+    lifecycle_vm_cleanup_identity,
 )
+from shared.vm_resource_admission import ResourceAdmissionError
 
 from orchestrator.services.lifecycle.types import Instance
 from orchestrator.services.lifecycle.workspace_manager import (
@@ -629,6 +631,137 @@ class VMInstanceManager:
                 return
             permit.complete()
 
+    async def resume_pending_cleanup(self, inst: Instance) -> str:
+        """Settle only an already-open exact Job VM purge before reaper fallback.
+
+        The original controller delete may have removed its child disk before
+        the parent stop receipt was persisted.  A later dirty reap must finish
+        that parent, never reinterpret the same request ID as a kept disk.
+        """
+        if (
+            inst.metadata.get("scope") != "job"
+            or _is_stateless_instance(inst)
+            or not inst.bound_to
+            or not self._provisioner_available()
+        ):
+            return "none"
+        permit = inst.metadata.get("_completion_lifecycle_permit")
+
+        def known_hold(reason: str) -> str:
+            # A rejected read/proof made no external delete call. Release only
+            # this lifecycle claim so a later tick can retry the same parent.
+            if isinstance(permit, LifecycleActionPermit):
+                permit.skip(reason, settled=True)
+            return "held"
+
+        external_attempted = False
+        try:
+            try:
+                owner_id = UUID(str(inst.bound_to))
+            except (TypeError, ValueError, AttributeError):
+                # Legacy imported rows and test doubles retain their former
+                # lifecycle path; durable Job cleanup owners are UUID-backed.
+                return "none"
+            if not await self._workspace_recovery_store.has_open_lifecycle_vm_delete(
+                owner_id
+            ):
+                return "none"
+            if isinstance(
+                permit, LifecycleActionPermit
+            ) and not await self._permit_external(permit):
+                return "held"
+            identity = inst.metadata.get("_completion_lifecycle_vm_identity")
+            if not isinstance(identity, VMTeardownIdentity):
+                async with asyncio.timeout(LIFECYCLE_EXTERNAL_TIMEOUT_SECONDS):
+                    identity = await self._provisioner.capture_vm_teardown_identity(
+                        str(owner_id), entity_type="job"
+                    )
+            canonical_owner, pvc_uid, request_id, intent = (
+                lifecycle_vm_cleanup_identity(
+                    owner_kind="job",
+                    owner_id=str(owner_id),
+                    identity=identity,
+                    source="delete",
+                    purge_disk=True,
+                )
+            )
+            if canonical_owner != owner_id or pvc_uid is None:
+                return known_hold("vm_cleanup_identity_unproven")
+            cleanup = (
+                await self._workspace_recovery_store.resume_open_lifecycle_vm_delete(
+                    owner_id=owner_id,
+                    identity=identity,
+                    request_id=request_id,
+                    intent_digest=cleanup_intent_digest(intent),
+                )
+            )
+            if cleanup is None or not cleanup.allowed:
+                return known_hold("vm_cleanup_parent_unavailable")
+            bound = bind_vm_cleanup_permit(
+                cleanup, request_id=request_id, intent=intent
+            )
+            from orchestrator.services.vm_workspace_recovery_store import (
+                complete_vm_cleanup_permit,
+                prepare_vm_cleanup_resource,
+            )
+
+            await prepare_vm_cleanup_resource(self._workspace_recovery_store, bound)
+            if isinstance(
+                permit, LifecycleActionPermit
+            ) and not await self._permit_external(permit):
+                return "held"
+            # Resource preparation fences a charged cleanup; it is not a
+            # physical stop receipt. The first attempt may have stopped at a
+            # remote-operation lease before sending the original purge, so
+            # replay that exact signed parent for charged and legacy owners.
+            external_attempted = True
+            async with asyncio.timeout(LIFECYCLE_EXTERNAL_TIMEOUT_SECONDS):
+                outcome = await self._provisioner.release_vm_captured(
+                    str(owner_id),
+                    identity,
+                    purge_disk=True,
+                    entity_type="job",
+                    capture_snapshot=False,
+                    **vm_cleanup_kwargs(bound),
+                )
+            if outcome.disposition == "remote_operation_busy":
+                return known_hold("vm_remote_operation_busy")
+            if outcome.disposition == "retry_pending":
+                # The exact guarded delete attempt did not prove absence.
+                # Release this lifecycle term so the next tick can recheck
+                # physical completion promptly.
+                return known_hold("vm_cleanup_delete_pending")
+            if outcome.disposition != "completed":
+                return "held"
+            if isinstance(
+                permit, LifecycleActionPermit
+            ) and not await self._permit_external(permit):
+                # The controller may have accepted the exact purge, but a
+                # lost lifecycle term cannot authorize parent settlement.
+                return "held"
+            await complete_vm_cleanup_permit(
+                self._workspace_recovery_store,
+                bound,
+                outcome="completed",
+                provisioner=self._provisioner,
+                claim_current=(
+                    (lambda: self._permit_external(permit))
+                    if isinstance(permit, LifecycleActionPermit)
+                    else None
+                ),
+            )
+            return "completed"
+        except ResourceAdmissionError:
+            logger.info("Open VM purge stop proof held for job %s", inst.bound_to)
+            return (
+                "held" if external_attempted else known_hold("vm_cleanup_stop_unproven")
+            )
+        except Exception:
+            logger.exception(
+                "Open VM purge could not be settled for job %s", inst.bound_to
+            )
+            return "held"
+
     async def snapshot(self, inst: Instance) -> str | None:
         if self._completion_lifecycle is None:
             return await self._snapshot_owned(inst)
@@ -871,16 +1004,19 @@ class VMInstanceManager:
                 if isinstance(permit, LifecycleActionPermit):
                     permit.skip("vm_identity_superseded", settled=True)
                 return True
-            if outcome.disposition == "retry_pending":
+            if outcome.disposition in {"retry_pending", "remote_operation_busy"}:
                 if isinstance(permit, LifecycleActionPermit):
-                    # The controller accepted the exact-generation delete and
-                    # the immediate absence probe still saw it terminating.
-                    # This is a conclusive incomplete attempt, not ambiguous
-                    # ownership: release the term so the next lifecycle tick
-                    # or authorized control can retry promptly.
-                    permit.skip("vm_retirement_retry_pending", settled=True)
+                    # Both outcomes conclusively left this attempt incomplete:
+                    # the remote-operation collision precedes external delete,
+                    # while retry_pending is an accepted exact-generation delete.
+                    permit.skip(
+                        "vm_remote_operation_busy"
+                        if outcome.disposition == "remote_operation_busy"
+                        else "vm_retirement_retry_pending",
+                        settled=True,
+                    )
                 return False
-            if outcome.disposition == "completed" and replayed is None:
+            if outcome.disposition == "completed":
                 await self._complete_destructive_cleanup(cleanup, outcome="completed")
             return bool(outcome.deleted)
         except Exception:
@@ -991,7 +1127,7 @@ class VMInstanceManager:
                             purge_disk=True,
                             **vm_cleanup_kwargs(cleanup),
                         )
-                if replayed is None and outcome.disposition in {
+                if outcome.disposition in {
                     "completed",
                     "identity_superseded",
                 }:
@@ -1041,6 +1177,15 @@ class VMInstanceManager:
                         WHERE status = ANY($1::text[])
                           AND context->'vm'->>'rootdisk' = 'kept'
                           AND execution_lane IS DISTINCT FROM 'stateless'
+                          AND COALESCE(context->'_job_terminal_vm_cleanup'->>'retention_policy','') <> '4'
+                          AND NOT EXISTS (SELECT 1 FROM vm_job_cancel_retention_authorities a
+                              WHERE a.job_id=jobs.id AND a.policy_version=4 AND NOT
+                              public.vm_job_cancel_retention_discharged(a.cleanup_admission_id))
+                          AND NOT EXISTS (SELECT 1 FROM vm_idle_operations retained
+                              WHERE retained.owner_kind='job' AND retained.owner_id=jobs.id
+                                AND retained.provision_generation::text=jobs.context->'vm'->>'provision_generation'
+                                AND retained.pvc_uid::text=jobs.context->'vm'->>'rootdisk_pvc_uid'
+                                AND retained.storage_disposition='retention_unknown')
                         LIMIT 100
                         """,
                         list(_TERMINAL_JOB_STATUSES),
@@ -1055,6 +1200,15 @@ class VMInstanceManager:
                         WHERE status = ANY($1::text[])
                           AND context->'vm'->>'rootdisk' = 'kept'
                           AND execution_lane IS DISTINCT FROM 'stateless'
+                          AND COALESCE(context->'_job_terminal_vm_cleanup'->>'retention_policy','') <> '4'
+                          AND NOT EXISTS (SELECT 1 FROM vm_job_cancel_retention_authorities a
+                              WHERE a.job_id=jobs.id AND a.policy_version=4 AND NOT
+                              public.vm_job_cancel_retention_discharged(a.cleanup_admission_id))
+                          AND NOT EXISTS (SELECT 1 FROM vm_idle_operations retained
+                              WHERE retained.owner_kind='job' AND retained.owner_id=jobs.id
+                                AND retained.provision_generation::text=jobs.context->'vm'->>'provision_generation'
+                                AND retained.pvc_uid::text=jobs.context->'vm'->>'rootdisk_pvc_uid'
+                                AND retained.storage_disposition='retention_unknown')
                         LIMIT 100
                         """,
                         list(_TERMINAL_JOB_STATUSES),
@@ -1103,7 +1257,7 @@ class VMInstanceManager:
                                 capture_snapshot=False,
                                 **vm_cleanup_kwargs(cleanup),
                             )
-                    if replayed is None and outcome.disposition in {
+                    if outcome.disposition in {
                         "completed",
                         "identity_superseded",
                     }:
@@ -1162,7 +1316,7 @@ class VMInstanceManager:
                                 purge_disk=True,
                                 **vm_cleanup_kwargs(cleanup),
                             )
-                    if replayed is None and outcome.disposition in {
+                    if outcome.disposition in {
                         "completed",
                         "identity_superseded",
                     }:
@@ -1201,39 +1355,42 @@ class VMInstanceManager:
     ) -> Any | None:
         """Serialize an exact VM delete/prune before controller side effects."""
 
-        try:
-            parsed_owner_id = UUID(str(owner_id))
-        except (TypeError, ValueError, AttributeError):
-            # Lifecycle's production owners are UUID-backed rows. Keeping a
-            # deterministic fallback makes old test doubles and imported rows
-            # serialize consistently without weakening real UUID ownership.
-            parsed_owner_id = uuid5(
-                NAMESPACE_URL, f"workspace-cleanup-owner:{owner_kind}:{owner_id}"
-            )
-        try:
-            parsed_pvc_uid = (
-                UUID(str(identity.rootdisk_pvc_uid))
-                if identity.rootdisk_pvc_uid is not None
-                else None
-            )
-        except (TypeError, ValueError, AttributeError):
-            parsed_pvc_uid = None
-        request_id = uuid5(
-            NAMESPACE_URL,
-            "workspace-cleanup:"
-            f"{source}:{owner_kind}:{owner_id}:{identity.provision_generation}:"
-            f"{identity.vm_uid}:{identity.rootdisk_pvc_uid}",
+        pinned_retention_held = getattr(
+            type(self._db), "pinned_ready_cancel_retention_held", None
         )
-        resource_intent = {
-            "owner_kind": owner_kind,
-            "owner_id": str(parsed_owner_id),
-            "provision_generation": identity.provision_generation,
-            "vm_uid": identity.vm_uid or "",
-            "pvc_uid": str(parsed_pvc_uid or ""),
-            "purge_disk": bool(purge_disk),
-            "resource": "vm_workspace",
-            "source": f"lifecycle_vm_{source}"[:64],
-        }
+        if (
+            purge_disk
+            and owner_kind == "job"
+            and pinned_retention_held
+            and await pinned_retention_held(self._db, owner_id)
+        ):
+            return None
+
+        if purge_disk and owner_kind == "job":
+            from orchestrator.services.vm_idle_lifecycle import (
+                retained_terminal_rootdisk,
+            )
+
+            if await retained_terminal_rootdisk(
+                self._db,
+                job_id=owner_id,
+                generation=identity.provision_generation,
+                pvc_uid=identity.rootdisk_pvc_uid,
+            ):
+                logger.info(
+                    "Kept rootdisk purge held for terminal review job %s", owner_id
+                )
+                return None
+
+        parsed_owner_id, parsed_pvc_uid, request_id, resource_intent = (
+            lifecycle_vm_cleanup_identity(
+                owner_kind=owner_kind,
+                owner_id=owner_id,
+                identity=identity,
+                source=source,
+                purge_disk=purge_disk,
+            )
+        )
         try:
             cleanup = await self._workspace_recovery_store.acquire_cleanup_permit(
                 owner_kind=owner_kind,
@@ -1253,9 +1410,19 @@ class VMInstanceManager:
                 permit.skip("workspace_cleanup_admission_unavailable", settled=True)
             return None
         if cleanup.allowed:
-            return bind_vm_cleanup_permit(
+            bound = bind_vm_cleanup_permit(
                 cleanup, request_id=request_id, intent=resource_intent
             )
+            if owner_kind == "job":
+                from orchestrator.services.vm_workspace_recovery_store import (
+                    prepare_vm_cleanup_resource,
+                )
+
+                await prepare_vm_cleanup_resource(
+                    self._workspace_recovery_store,
+                    bound,
+                )
+            return bound
         logger.info(
             "VM cleanup held for %s %s (%s)",
             owner_kind,
@@ -1273,16 +1440,24 @@ class VMInstanceManager:
         if admission_id is None:
             return
         try:
-            await self._workspace_recovery_store.complete_cleanup_permit(
-                admission_id, outcome=outcome
+            from orchestrator.services.vm_workspace_recovery_store import (
+                complete_vm_cleanup_permit,
+            )
+
+            await complete_vm_cleanup_permit(
+                self._workspace_recovery_store,
+                cleanup,
+                outcome=outcome,
+                provisioner=self._provisioner,
             )
         except Exception:
-            # The controller result is already conclusive. Leaving the durable
-            # admission open is the safe failure mode and keeps later recovery
-            # or pruning from racing an unrecorded cleanup result.
+            # Physical deletion does not settle the durable permit or charge.
+            # Preserve the owner's context and incomplete lifecycle action on
+            # native guard/connection failures as well as domain refusals.
             logger.exception(
                 "VM cleanup admission %s could not be completed", admission_id
             )
+            raise
 
     # -------------------------------------------------------------------------
     # Internals
@@ -1341,6 +1516,8 @@ class VMInstanceManager:
             # Mirror get_dispatchable_jobs: created/paused + unassigned +
             # freeze-free == the dispatcher owns this VM's bring-up. Carried to
             # is_reapable so the reaper hands off a resuming VM (see there).
+            # Deliberately NOT mirrored: the operator pause hold. A held job
+            # is waiting for its explicit resume, which must land on this VM.
             dispatchable = (
                 r.get("status") in ("created", "paused")
                 and bool(r.get("unassigned"))

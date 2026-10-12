@@ -52,6 +52,9 @@ can open:
 
 Same single sign-on as the app.
 
+Workspaces on a custom image (not one of SRW's) run unprivileged, so they have no cloud-folder
+mount unless your operator sets the Helm value `workspace.customImages.privileged`.
+
 A normal writable session mount is live. On deployments that enable it,
 **Protected Cloud** is a separate creation-time session mode: an eligible
 Nextcloud project folder is exposed through a private staging layer, and the

@@ -101,6 +101,19 @@
       "review": "{{count}} awaiting review",
       "notCreated": "Job was not created"
     },
+    "delegateBatch": {
+      "title": "{{count}} subagents",
+      "finished": "{{done}}/{{total}} finished",
+      "failed": "{{count}} failed",
+      "interrupted": "{{count}} interrupted",
+      "notStarted": "{{count}} not started",
+      "status": {
+        "pending": "Awaiting approval",
+        "denied": "Denied",
+        "expired": "Not run",
+        "notStarted": "Not started"
+      }
+    },
     "view": {
       "rendered": "Rendered",
       "raw": "Raw"
@@ -342,9 +355,11 @@
     "saving": "Saving...",
     "saved": "Saved",
     "delete": "Delete",
+    "back": "Back",
     "cancel": "Cancel",
     "dismiss": "Dismiss",
     "edit": "Edit",
+    "refresh": "Refresh",
     "rename": "Rename",
     "copy": "Copy",
     "copied": "Copied",
@@ -373,9 +388,6 @@
   "nav": {
     "cockpit": "Cockpit",
     "builder": "Builder",
-    "modeChat": "Chat",
-    "modeJobs": "Jobs",
-    "modeProjects": "Projects",
     "newChat": "New chat",
     "searchSessions": "Search sessions",
     "clearFilter": "Clear filter",
@@ -389,16 +401,16 @@
     "datasources": "Connectors",
     "contacts": "Contacts",
     "experts": "Experts",
+    "workspaces": "Workspaces",
     "skills": "Skills",
     "automations": "Automations",
     "create": "Create",
     "workbench": "Workbench",
     "settings": "Settings",
     "logout": "Logout",
-    "admin": "Admin",
-    "more": "More",
-    "apiKeys": "API keys",
-    "sshKeys": "SSH keys",
+    "customize": "Customize",
+    "backToApp": "Back to app",
+    "jobsAwaitingReview": "{{count}} jobs awaiting your review",
     "collapseSidebar": "Collapse sidebar",
     "openSidebar": "Open sidebar",
     "resizeSidebar": "Resize sidebar",
@@ -568,6 +580,7 @@
     "confirmDelete": "Delete this session permanently?",
     "confirmForceDelete": "The agent is still working on a turn in this session. Delete anyway? The in-flight turn will be lost.",
     "confirmEndMidTurn": "The agent is still working on a turn. End the session anyway? The in-flight turn and any queued input will be lost.",
+    "confirmEndStatelessBusy": "The agent is still finishing its current turn. End the session anyway? The unfinished turn will be stopped.",
     "turnsOne": "turn",
     "turnsMany": "turns",
     "filter": {
@@ -579,6 +592,7 @@
       "sessionFiles": "Session Files",
       "resume": "Resume",
       "delete": "Delete",
+      "retryDelete": "Retry delete",
       "talk": "Talk to the officer"
     },
     "create": {
@@ -592,11 +606,12 @@
       "configScholar": "Scholar",
       "modelLabel": "Model",
       "modelConfigDefault": "Config default",
-      "projectsLabel": "Projects",
+      "projectsLabel": "Project",
+      "noProject": "No project",
       "projectsEmpty": "No projects available",
       "projectArchived": "(archived)",
       "projectArchivedWarning": "An archived project is still selected — creating a session against it will be refused. Deselect it, or unarchive the project.",
-      "projectsHint": "Select projects for shared knowledge access",
+      "projectsHint": "Choose the project this session works in.",
       "permissionLabel": "Permission Mode",
       "permissionSupervised": "Supervised",
       "permissionAutoAccept": "Auto-accept",
@@ -608,9 +623,7 @@
       "expertLabel": "Expert",
       "expertLoading": "Loading experts...",
       "expertSelectedPrefix": "Selected:",
-      "createSession": "Create Session",
-      "protectedCloud": "Protected cloud — agent writes are staged for your review",
-      "protectedCloudHint": "The agent gets read-only cloud access; its changes wait for your approval in the review panel."
+      "createSession": "Create Session"
     },
     "configDrift": {
       "title": "Some of this session's setup is gone",
@@ -635,6 +648,20 @@
       },
       "countSuffix": " (×{{count}})"
     }
+  },
+  "workspaceCreation": {
+    "title": "Workspace status",
+    "unknown": "Workspace status is being checked.",
+    "observing": "Checking workspace scheduling; the result is not yet confirmed.",
+    "waitingScheduling": "Waiting for scheduling. The scheduler has not placed this workspace yet.",
+    "insufficientCapacity": "The requested workspace currently has insufficient capacity.",
+    "starting": "Starting the scheduled workspace.",
+    "invalidImage": "Workspace needs attention: its image is invalid.",
+    "invalidConfiguration": "Workspace needs attention: its configuration is invalid.",
+    "pullDeadline": "Workspace needs attention: its image didn't finish pulling in time. Check the image reference and that the cluster can pull from its registry.",
+    "readinessDeadline": "Workspace needs attention: it didn't become ready in time. If it uses your own image, check that the image keeps running: build it FROM an SRW base image and don't override its ENTRYPOINT or USER.",
+    "sshDeadline": "Workspace needs attention: SSH authentication grace expired.",
+    "legacyHeld": "Checking an older workspace creation; completion evidence is unavailable."
   },
   "jobs": {
     "pagination": {
@@ -691,6 +718,8 @@
     "workspace": {
       "summary": "Workspace: requested {{requested}} · assigned {{assigned}} · effective {{effective}}",
       "state": "Workspace state: {{state}} · detail: {{failure}}",
+      "terminalUnavailable": "VM workspace unavailable",
+      "terminalUnavailableWithPending": "VM workspace unavailable · {{message}}",
       "default": "default",
       "unavailable": "unavailable",
       "none": "none"
@@ -772,6 +801,7 @@
       "createProject": "Create Project",
       "exportToCloud": "Export to cloud",
       "openCloudFolder": "Open cloud folder",
+      "resyncCloudFolder": "Re-sync cloud folder",
       "exported": "Exported",
       "approveRequest": "Approve request"
     },
@@ -811,6 +841,30 @@
       "nextCheck": "Next check",
       "cleanupPending": "Workspace cleanup remains pending"
     },
+    "lifecycle": {
+      "state": {
+        "warm": "Workspace warm",
+        "releasing": "Pausing workspace…",
+        "release_held": "Workspace pause needs attention",
+        "suspended": "Workspace asleep",
+        "waking": "Starting workspace…",
+        "wake_held": "Workspace start needs attention",
+        "ready": "Workspace ready",
+        "unsupported": "Workspace access unavailable"
+      },
+      "reason": {
+        "identity": "Workspace identity could not be verified.",
+        "capacity": "Waiting for workspace capacity.",
+        "access": "Close active IDE or SSH access, then try again.",
+        "attention": "The workspace is waiting for a safe retry."
+      },
+      "idleAt": "May pause at",
+      "nextRetry": "Next retry",
+      "wakingTab": "Starting your workspace…",
+      "popupBlocked": "Allow popups for this site, then open the IDE again.",
+      "wakeTimedOut": "The workspace is taking longer to start. Open the IDE again to check its progress.",
+      "ideUnavailable": "The workspace IDE is unavailable. Try opening it again shortly."
+    },
     "delegationChildren": "{{count}} children",
     "promote": {
       "namePlaceholder": "Project name (required)",
@@ -847,15 +901,13 @@
       "priorityLow": "Low (backfill)",
       "priorityNormal": "Normal (default)",
       "priorityHigh": "High (preempts lower)",
-      "cloudStorageLabel": "Cloud Storage Access",
-      "cloudStorageInherit": "Inherit from project",
-      "cloudStorageReadonly": "Read Only",
-      "cloudStorageReadwrite": "Read & Write",
-      "cloudStorageHint": "Override the project's default cloud storage access mode for this job",
+      "noShellNoteGranted": "This Expert has no shell tools, so the Job can't run commands in this workspace. To try an image, pick an Expert with the shell tools, such as Engineer.",
+      "noShellNoteNoGrant": "This Expert has no shell tools, so the Job can't run commands in this workspace. Experts with the shell tools need the shell_tools grant from your administrator.",
       "reset": "Reset",
       "submit": "Create Job",
       "creating": "Creating...",
-      "uploading": "Uploading..."
+      "uploading": "Uploading...",
+      "removeFile": "Remove file"
     },
     "detail": {
       "auditSteps": "Audit steps",
@@ -869,6 +921,7 @@
       "costUnpriced": "Metered, but no rate card covers these models — tokens are exact, cost is unknown.",
       "duration": "Duration",
       "expert": "Expert",
+      "heldForReview": "Held for review",
       "loading": "Loading details…",
       "model": "Model",
       "modelDefault": "Expert default",
@@ -906,6 +959,17 @@
       "waitingOnSubjobs": "Parked on {{count}} unfinished sub-job(s) — the work is one level down.",
       "workspace": "Workspace"
     }
+  },
+  "vmWait": {
+    "kind": {
+      "resource": "Waiting for this workspace's resources",
+      "count": "Waiting for the VM controller's count limit",
+      "controller": "Waiting for the VM controller to respond",
+      "unknown": "Waiting; capacity source cannot be verified"
+    },
+    "sizeNonfit": "The requested size currently fits no eligible node.",
+    "requested": "Requested size",
+    "since": "Since"
   },
   "admin": {
     "helm": {
@@ -951,7 +1015,53 @@
       "colAttempts": "Attempts",
       "colPending": "Pending input",
       "yes": "yes",
-      "no": "no"
+      "no": "no",
+      "vm": {
+        "title": "VM workspace compute",
+        "description": "Installed cluster accounting and durable holds. Remaining resources do not guarantee that a particular VM can be placed; no queue position or wait time is estimated.",
+        "noPolicy": "No VM resource policy is installed.",
+        "mode": {"off": "Off", "shadow": "Observe only", "enforce": "Enforced", "drain": "Draining"},
+        "accounted": "Inventory accounted",
+        "unavailable": "Accounting unavailable",
+        "reason": "Diagnostic reason",
+        "inventory": "Inventory",
+        "fresh": "Fresh",
+        "unknown": "Missing or stale",
+        "observed": "Observed",
+        "age": "Age",
+        "incomplete": "Incomplete snapshot",
+        "countBackstop": "VM count backstop",
+        "countDescription": "Observed VMs / controller maximum. A dash means unknown.",
+        "waiting": "Resource waiters",
+        "nonfit": "size nonfit",
+        "oldest": "Oldest wait",
+        "bypasses": "Bypasses",
+        "protected": "Protected",
+        "teardown": "Teardown holds",
+        "overdue": "overdue",
+        "unknownAge": "Unknown age",
+        "oldestProgress": "Oldest progress age",
+        "budget": "Configured admission budgets",
+        "budgetDescription": "The installation limit covers all owners; the per-owner limit applies to each owner separately. The policy mode above determines whether admission enforces them. These are reserved costs, separate from node remaining capacity.",
+        "budgetInstallation": "Installation (all owners)",
+        "budgetPerOwner": "Per owner",
+        "cpuCost": "CPU reservation per VM: ceil(guest vCPUs × {{numerator}} ÷ {{denominator}}) + {{overhead}}m. KubeVirt's node CPU request can differ.",
+        "held": "Durable resource holds",
+        "heldDescription": "Known holds remain visible when inventory cannot be accounted. A dash is unknown, not zero.",
+        "accounting": "Cluster accounting",
+        "accountingUnavailable": "Node and cluster accounting is unavailable; durable holds above remain in force.",
+        "orphaned": "Holds on missing nodes",
+        "pendingExternal": "Pending external demand",
+        "separate": "Outside node totals",
+        "nodes": "Node details",
+        "nodeNote": "Node values are diagnostics; request-specific selectors, tolerations and storage topology still determine placement.",
+        "categoryHeading": "Category",
+        "category": {
+          "allocatable": "Allocatable", "headroom": "Headroom", "external": "Scheduled external", "unbound": "Unbound", "bound_reserved": "Bound, awaiting Ready", "active": "Active", "warm": "Warm", "teardown": "Teardown", "available": "Remaining", "shortfall": "Shortfall", "total": "Total held"
+        },
+        "memory": "Memory",
+        "storage": "Ephemeral storage"
+      }
     },
     "config": {
       "messages": {
@@ -1047,6 +1157,7 @@
         "unset": "— not set —",
         "none": "None",
         "sameSearchWarning": "This matches the primary search provider, so runtime failover is suppressed.",
+        "autoPinned": "Picked automatically because no default was set. Choose another model to change it.",
         "emptyCatalog": "No models in the catalog yet. Add a provider key or endpoint above, then pick a default.",
         "auxiliaryGroup": "Auxiliary (helper)",
         "kind": {
@@ -1064,6 +1175,9 @@
           "search_fallback": "Search fallback",
           "rerank": "Rerank (memory recall ordering)"
         }
+      },
+      "discovery": {
+        "timeout": "Discovery is taking longer than expected. Try Rediscover."
       }
     },
     "viewMode": {
@@ -1075,13 +1189,28 @@
     }
   },
   "emptyCatalog": {
-    "bannerUser": "No LLMs configured yet — add an API key in Settings → API Keys, or register a custom LLM, to use the app.",
-    "bannerAdmin": "No LLMs configured yet — configure a provider in Admin → Providers to use the app.",
+    "bannerUser": "No LLMs configured yet — add an API key in Settings → Provider keys, or register a custom LLM, to use the app.",
+    "bannerAdmin": "No LLMs configured yet — configure a provider in Settings → Models → Providers to use the app.",
     "pickerCta": "Configure a provider to enable this picker.",
     "dismiss": "Dismiss"
   },
   "settings": {
     "title": "Settings",
+    "nav": {
+      "groupSettings": "Settings",
+      "groupAccess": "Access",
+      "groupAdmin": "Administration",
+      "general": "General",
+      "defaults": "Defaults",
+      "providerKeys": "Provider keys",
+      "notifications": "Notifications",
+      "connectorDrivers": "Connector drivers",
+      "apiKeys": "API keys",
+      "mcp": "MCP tokens",
+      "sshKeys": "SSH keys",
+      "subscriptions": "Subscriptions",
+      "cloud": "Main cloud"
+    },
     "appearance": {
       "title": "Appearance",
       "desc": "Choose between light and dark mode, or follow your system setting, and pick the accent colour. Both choices are saved on this device.",
@@ -1147,10 +1276,20 @@
       "optionAll": "All data",
       "optionMe": "Only my data"
     },
+    "providerKeys": {
+      "title": "LLM Provider Keys",
+      "desc": "Set your own API keys for LLM providers and tools. These take priority over system-wide keys when running jobs.",
+      "empty": "No API keys configured. Add one to use your own provider keys.",
+      "colProvider": "Provider",
+      "colKey": "Key",
+      "colLabel": "Label",
+      "colUpdated": "Updated",
+      "addTitle": "Add / Update Key",
+      "labelPlaceholder": "Label (optional)",
+      "keyPlaceholder": "API key (e.g. sk-...)",
+      "saveButton": "Save Key"
+    },
     "apiKeys": {
-      "linkTitle": "Personal Access Tokens",
-      "linkDesc": "Bearer tokens for n8n, scripts, and other automation tools that need to call the orchestrator API.",
-      "linkManage": "Manage API Keys",
       "title": "Personal Access Tokens",
       "desc": "Bearer tokens for automation tools that talk to the orchestrator API directly. Each token has its own action scopes and expiry. Lost tokens cannot be recovered — generate a new one.",
       "existingTitle": "Your tokens",
@@ -1188,10 +1327,6 @@
       "usageDesc": "Pass the token in an Authorization header. n8n's Header Auth credential type works out of the box."
     },
     "sshKeys": {
-      "linkTitle": "SSH Keys",
-      "linkDesc": "Public keys that let you connect to your session workspaces over SSH.",
-      "linkManage": "Manage SSH Keys",
-      "back": "Back",
       "title": "SSH Keys",
       "desc": "Public keys that authenticate your SSH connections into session workspaces. A key only proves who you are once you've shown you hold the matching private key.",
       "existingTitle": "Your keys",
@@ -1242,7 +1377,11 @@
       "reasoningHigh": "High",
       "providerLocal": "Local",
       "providerOpenrouter": "OpenRouter",
-      "save": "Save Preferences"
+      "save": "Save Preferences",
+      "unavailable": "unavailable",
+      "modelUnavailable": "{{model}} is no longer available. New work uses the system default until you choose another model and save.",
+      "unsaved": "Unsaved changes",
+      "saveFailed": "Preferences could not be saved."
     },
     "expertDefaults": {
       "title": "Default assistants",
@@ -1273,12 +1412,8 @@
       "permissionSupervised": "Supervised",
       "permissionAutoAccept": "Auto-accept",
       "permissionAutonomous": "Autonomous",
-      "workspaceBackend": "Default Workspace",
-      "workspaceRecommendation": "This Expert recommends {{tier}}. You can choose another workspace.",
-      "workspaceBackendHint": "Where new sessions keep their files. Virtual starts in seconds and can be upgraded to a container mid-session; Container has full shell and git from the start but takes longer to provision.",
-      "workspaceVirtual": "Virtual — instant, cloud file storage",
-      "workspaceSandbox": "Container — full shell & git, slower start",
-      "workspaceNone": "None — chat only, no files",
+      "workspaceMoved": "The workspace for new Sessions is set in your personal project's settings.",
+      "workspaceMovedLink": "Open your personal project",
       "headlessMode": "Headless Behavior",
       "headlessModeDefault": "Default (Eager)",
       "headlessModeEager": "Eager — keep working while untethered",
@@ -1333,7 +1468,7 @@
     },
     "subscriptions": {
       "title": "AI Subscriptions",
-      "desc": "Connect subscription accounts through the shared proxy. Models are registered separately in Admin → Models.",
+      "desc": "Connect subscription accounts through the shared proxy. Models are registered separately under Administration → Models.",
       "checking": "Checking proxy…",
       "connected": "Connected",
       "notConnected": "No account connected",
@@ -1414,42 +1549,50 @@
       }
     },
     "cloud": {
-      "title": "Cloud Storage (Main Cloud)",
-      "desc": "Configure the main-cloud backend used for user home folders, project folders, and session folders. Secrets are managed via environment variables (Vault/ESO/.env) and are shown here as provenance only.",
+      "title": "Main cloud",
+      "desc": "The cloud SRW creates project, user and session folders on. It is configured by Helm (the chart's cloud values), not here: this page shows what is active and what each provider supports.",
       "loading": "Loading…",
-      "active": "Active:",
-      "initialized": "initialized",
-      "notInitialized": "not initialized",
+      "loadFailed": "Could not load the main cloud.",
+      "retry": "Retry",
       "refresh": "Refresh",
-      "backend": "Backend",
-      "baseUrl": "Base URL (internal)",
-      "publicUrl": "Public URL (browser)",
-      "keycloakIssuer": "Keycloak issuer",
-      "keycloakClientId": "Keycloak client id",
-      "adminRole": "Admin role / claim value",
-      "spaceQuota": "Default Space quota (bytes)",
-      "adminUser": "Admin user",
-      "agentUser": "Agent user",
-      "credentialsRef": "Credentials ref (optional)",
-      "secretProvenance": "Secret provenance",
-      "secretSet": "set",
-      "secretUnset": "unset",
-      "testing": "Testing…",
-      "test": "Test",
-      "saving": "Saving…",
-      "saveReload": "Save + Reload",
-      "resetEnv": "Reset to env defaults",
-      "persistedOverlayLastSaved": "Persisted overlay last saved",
-      "messages": {
-        "loadFailed": "Failed to load cloud settings",
-        "testOk": "Test OK ({{ms}} ms) — healthy",
-        "testFailed": "Test failed: {{error}}",
-        "testRequestFailed": "Test request failed",
-        "saved": "Saved — active backend is now {{backend}}",
-        "savedReloaded": "Saved — active backend is now {{backend}} (reloaded)",
-        "saveFailed": "Save failed",
-        "overlayCleared": "Environment configuration attested and activated; backend history was retained",
-        "resetFailed": "Reset failed"
+      "active": "Active:",
+      "healthy": "healthy ({{ms}} ms)",
+      "notInitialized": "not initialized",
+      "unreachable": "unreachable",
+      "provider": "Provider",
+      "publicUrl": "Public URL",
+      "unknown": "unknown",
+      "installation": "Installation",
+      "activation": "activation {{revision}}",
+      "noInstallation": "No installation is active; cloud effects are disabled.",
+      "configuration": "Configuration",
+      "helmOnly": "Helm values",
+      "helm": {
+        "matches": "match the active installation",
+        "differs": "differ from the active installation",
+        "invalid": "incomplete"
+      },
+      "helmNote": {
+        "differs": "Helm's cloud values describe something other than the active installation. At its next start the orchestrator adopts only what attesting the installation proves (its internal URL or admin account); for anything else, or a different installation, set cloud.replaceInstallation to {{instance}} to confirm.",
+        "invalid": "Helm's cloud values are incomplete (a required secret is unset), so the active installation keeps serving."
+      },
+      "matrixTitle": "Provider support",
+      "matrixDesc": "What each provider delivers, declared by its adapter. A level is offered only where it is enforced; anything else is unsupported, with the reason.",
+      "connector": "Connector · folder · access",
+      "activeBadge": "active",
+      "status": {
+        "offered": "offered",
+        "planned": "planned (slice {{slice}})",
+        "unsupported": "unsupported"
+      },
+      "types": {
+        "cloud_folder": "Cloud folder",
+        "cloud_folder_checkout": "Folder checkout",
+        "cloud_outbox": "Outbox"
+      },
+      "kinds": {
+        "project": "project",
+        "user_root": "user root"
       }
     },
     "helpers": {
@@ -1463,6 +1606,7 @@
   },
   "projectDetail": {
     "loading": "Loading project...",
+    "back": "Back to projects",
     "badgePersonal": "Personal",
     "tabs": {
       "overview": "Overview",
@@ -1563,7 +1707,20 @@
       "accessReadOnly": "Read-only",
       "accessReadWrite": "Read-write",
       "accessKbReadOnlyHint": "External OKF Knowledge Bases are read-only to agents in this release.",
-      "unlink": "Unlink"
+      "accessEnforcedBy": "Enforced by:",
+      "accessAdvisory": "Advisory only:",
+      "githubAppReadOnly": "the GitHub App token SRW mints for each execution has contents: read, so GitHub refuses pushes made with that token.",
+      "accessCreatorReadOnly": "Read-only for everyone who uses it: its creator tagged it so, and a project link cannot lift that.",
+      "unlink": "Unlink",
+      "cloudFolders": {
+        "title": "Cloud folders",
+        "hint": "The project's own folders in the main cloud. Its work binds each one at its default access unless a session chooses another level.",
+        "colAccess": "Default access",
+        "defaultOption": "Default ({{level}})",
+        "notOffered": "not offered by this cloud",
+        "noLevel": "none",
+        "saveFailed": "The default access could not be saved."
+      }
     },
     "repos": {
       "namePlaceholder": "Repo name",
@@ -1617,14 +1774,29 @@
       "shareMemoriesDesc": "When enabled, automatic memories from any job in this project are visible to all other jobs.",
       "cloudStorage": "Cloud Storage",
       "folder": "Folder",
-      "readOnlyAgent": "Read-only agent access",
-      "readOnlyAgentDesc": "When enabled, agents can browse and download files but cannot upload, modify, or delete.",
+      "cloudAccessHint": "Agents get this folder through its connector, at the level set under Connectors → Cloud folders (or chosen for a session).",
       "cloudUnavailable": "Cloud storage unavailable — not configured.",
       "workspaceNetwork": "Workspace Network",
       "networkTier": "Egress Tier",
       "networkTierInternetOnly": "Internet only (default)",
       "networkTierHomeAllowed": "Home LAN allowed",
       "networkTierDesc": "Controls which networks this project's workspaces can reach. \"Internet only\" denies cluster-internal hosts and the home LAN. \"Home LAN allowed\" adds the home LAN back — only enable for trusted operator projects on the homelab.",
+      "workspaceDefaults": "Workspace defaults",
+      "workspaceDefaultsHint": "What Jobs and Sessions in this Project get when they don't pick a workspace.",
+      "workspaceDefaultsManaged": "These defaults are managed by the Project manifest.",
+      "workspaceDefaultsSaveFailed": "The workspace defaults couldn't be saved.",
+      "workspaceJobs": "Jobs",
+      "workspaceSessions": "Sessions",
+      "workspaceContainerTemplate": "Container template",
+      "workspaceVmTemplate": "VM template",
+      "installationDefault": "Installation default ({{ value }})",
+      "fromManifest": "From the Project manifest",
+      "workspaceMode": {
+        "none": "None (no files)",
+        "virtual": "Virtual",
+        "container": "Container",
+        "vm": "VM"
+      },
       "dangerZone": "Danger Zone",
       "defaultProjectWarning": "This is your default personal project and cannot be archived or deleted.",
       "archiveTitle": "Archive Project",
@@ -1756,6 +1928,60 @@
       "cloudSyncOff": "Cloud sync off",
       "cloudSyncOffTooltip": "Cloud sync could not start for this session. The workspace may be missing files from the cloud, and changes won't be saved back to it."
     },
+    "cloudFolders": {
+      "regionLabel": "Cloud folders",
+      "title": "Some cloud folders of this session are not available",
+      "notAttached": "A cloud folder was not attached",
+      "kind": {
+        "session_folder": "Session folder",
+        "project": "Project folder",
+        "project_default": "Cloud home",
+        "user_root": "My cloud",
+        "cloud_outbox": "Session outbox",
+        "protected_lower": "Protected project folder"
+      },
+      "state": {
+        "mounted": "mounted",
+        "pending": "connecting…"
+      },
+      "review": "Go to the review",
+      "notAttachedKind": {
+        "session_folder": "The session folder was not attached",
+        "project": "A project folder was not attached",
+        "project_default": "Your project folder was not attached",
+        "user_root": "My cloud was not attached",
+        "cloud_outbox": "The session outbox was not attached",
+        "protected_lower": "The protected folder was not attached"
+      },
+      "protectedTitle": "Protected cloud unavailable",
+      "protectedMeta": "This protected session runs without a cloud folder, so nothing it writes reaches the cloud. Start a new session once the cause is fixed.",
+      "agentOutdated": "This session's agent is older than its workspace: its cloud folders are under /cloud, but the agent does not manage them. Start a new session to get the full cloud features.",
+      "reason": {
+        "credential_rejected": "the cloud refused its credential",
+        "not_found": "the folder no longer exists in the cloud",
+        "unreachable": "the cloud could not be reached",
+        "timeout": "the cloud did not answer in time",
+        "mount_failed": "the folder could not be mounted",
+        "config_missing": "its credential never reached the cloud mount service",
+        "sidecar_unavailable": "the workspace's cloud mount service is not running",
+        "unbuildable": "it could not be prepared for this session",
+        "set_fallback": "another folder of this session could not be prepared, so the session folder is mounted instead",
+        "too_many_mounts": "the session has more cloud folders than a workspace mounts",
+        "protected_unavailable": "the protected cloud could not be set up",
+        "access_unavailable": "no access level is offered for it in this kind of workspace",
+        "config_invalid": "it is not a cloud folder SRW set up",
+        "not_eligible": "this session may no longer use it",
+        "no_session_folder": "SRW has not created this session's outbox folder",
+        "backend_unavailable": "the main cloud was not reachable when the session started",
+        "beside_protected": "not mounted beside a protected folder: a protected session mounts only that one",
+        "grant_unavailable": "its account for this folder is not ready yet",
+        "reader_unavailable": "its read-only account for this folder is not ready yet",
+        "cloud_not_connected": "no cloud account yet: connect your cloud under Settings → Connectors",
+        "cloud_grant_revoked": "the cloud no longer accepts your connection: reconnect it under Settings → Connectors",
+        "delivery_unsupported": "this deployment syncs files instead of mounting them; cloud folders aren't delivered here",
+        "mount_unsupported": "this workspace can't mount cloud folders; they aren't delivered here"
+      }
+    },
     "cloudReview": {
       "regionLabel": "Pending cloud review",
       "title": "{{count}} cloud changes are waiting for your review",
@@ -1796,6 +2022,8 @@
         "attachFailed": "The agent couldn't pick this session back up.",
         "shutdownCancelled": "The reply was interrupted by maintenance.",
         "stopped": "The session stopped before this message was handled.",
+        "retryExhausted": "This message kept failing the same way, so it was set aside.",
+        "modelUnavailable": "This session's model is no longer available. Choose another model in this session's settings, then retry.",
         "generic": "The session hit a problem it can't clear on its own — an administrator has to release it before this message can run."
       }
     },
@@ -1918,7 +2146,15 @@
       "sessionResumed": "Session resumed",
       "resumeSession": "Resume Session",
       "resuming": "Resuming...",
-      "resumeFailed": "Failed to resume session"
+      "resumeFailed": "Failed to resume session",
+      "subagentRecovery": {
+        "resumed": "Resumed after the agent process was replaced",
+        "finished": "{{done}} of {{total}} subagents finished",
+        "interrupted": "{{count}} interrupted",
+        "notStarted": "{{count}} not started",
+        "declined": "{{count}} declined",
+        "retired": "{{count}} cancelled"
+      }
     },
     "compaction": {
       "banner": "Context summarized",
@@ -1956,7 +2192,6 @@
       "defaultsFailed": "Your session defaults could not be loaded. Retry before sending.",
       "recoveryTitle": "Your chat could not start",
       "recoveryBody": "Your messages have not been sent. Adjust the options below, then retry.",
-      "workspaceDefault": "Use project or account default",
       "retrySend": "Retry sending"
     },
     "ended": {
@@ -1981,6 +2216,10 @@
         "bootingVm": "Booting VM (this can take a few minutes)",
         "connecting": "Establishing connection"
       }
+    },
+    "stream": {
+      "running": "Running {{tool}}",
+      "waitingForCommand": "Waiting for the command to finish…"
     },
     "thinking": {
       "past": "Thought for a moment",
@@ -2011,7 +2250,17 @@
       "unavailable": "This control is not available in this session.",
       "applyFailed": "The session settings could not be applied.",
       "applyTimeout": "The session did not confirm the settings change. Reopen the settings to see what is in effect.",
-      "appliedNextTurn": "Session settings updated: {{summary}} — applies from the next response."
+      "appliedNextTurn": "Session settings updated: {{summary}} — applies from the next response.",
+      "compactUnavailable": "Manual compaction isn't available in this session. Context is summarized automatically when the CTX bar reaches 100%.",
+      "compactDeferred": "Compaction will run after the current response.",
+      "compactFailed": "Compaction failed — the conversation was kept intact. Try again later.",
+      "compactBoundaryGone": "That message is no longer in working context — it may already be summarized.",
+      "compactRejected": "The agent could not compact this session. Reload and try again.",
+      "undoNothing": "There are no file changes to undo.",
+      "undoUnsupported": "Undo isn't available for this session's workspace.",
+      "undoRejected": "The agent could not undo the last file changes.",
+      "containerUpgradeUnavailable": "Container upgrades aren't available in this session. Use /upgrade-workspace vm, or start a new session with a container workspace.",
+      "upgradeUnavailable": "Workspace upgrades aren't available in this session."
     },
     "workspaceOffer": {
       "title": "Workspace upgrade requested",
@@ -2141,7 +2390,8 @@
       "supervised": "Switch to supervised mode (approve all writes)",
       "autonomous": "Switch to autonomous mode (approve nothing)",
       "silent": "Hide reasoning and minimize tool detail",
-      "verbose": "Show full reasoning and tool detail"
+      "verbose": "Show full reasoning and tool detail",
+      "upgradeWorkspace": "Upgrade the workspace: no argument for the next tier, \"vm\", or a template name"
     },
     "toolLabels": {
       "read_file": "Reading",
@@ -2405,7 +2655,176 @@
     "saveFailed": "Save failed",
     "invalidZip": "Invalid skill archive"
   },
+  "workspaces": {
+    "tier": {"container": "Container", "vm": "VM", "virtual": "Virtual (cloud files)"},
+    "scope": {"mine": "Mine", "shared": "Shared", "project": "Project: {{name}}"},
+    "vm": {
+      "notInstalled": "VMs aren't enabled on this installation.",
+      "notAllowed": "Your account can't use VMs."
+    },
+    "form": {
+      "name": "Name",
+      "nameHint": "Lowercase letters, digits and hyphens. Can't be changed later.",
+      "saveTo": "Save to",
+      "displayName": "Display name",
+      "description": "Description",
+      "tier": "Tier",
+      "image": "Image",
+      "imageHint": "SRW's images are suggested; any registry image works.",
+      "cpu": "CPU",
+      "memory": "Memory",
+      "storage": "Disk",
+      "quantityHint": "For example 512Mi, 4Gi or 1Ti.",
+      "advanced": "Advanced",
+      "requestCpu": "Guaranteed CPU",
+      "requestMemory": "Guaranteed memory",
+      "requestHint": "Kubernetes request; the numbers above are the maximum.",
+      "pullPolicy": "Pull policy",
+      "pullPolicyDefault": "Default",
+      "setupSteps": "Setup steps",
+      "setupStepsHint": "One shell command per line, run in order as the workspace user when a VM is created.",
+      "preserved": "This template has settings this form can't edit. Saving keeps them unchanged."
+    },
+    "customImage": {
+      "title": "This isn't one of SRW's images.",
+      "unprivileged": "It runs without elevated privileges unless your operator allows it, so there is no cloud-folder mount and no protected cloud.",
+      "digest": "Pin a digest (image@sha256:…) rather than a tag, so every run uses the same image.",
+      "jobFirst": "Try a new image with a Job first. A Job shows more about why its workspace didn't start; a Session may not."
+    },
+    "errors": {
+      "name": "Use 1-63 lowercase letters, digits or hyphens, starting and ending with a letter or digit.",
+      "image": "An image is required.",
+      "cpu": "CPU must be a number above 0.",
+      "cpuWhole": "VMs need a whole number of CPUs.",
+      "quantity": "Use a whole number followed by Mi, Gi or Ti.",
+      "requestCpu": "Guaranteed CPU must be above 0 and no more than CPU.",
+      "requestMemory": "Guaranteed memory can't exceed memory.",
+      "setupSteps": "At most 32 setup steps.",
+      "loadFailed": "This template couldn't be loaded.",
+      "nameTaken": "A template with this name already exists here. Choose another name.",
+      "versionConflict": "This template changed since you opened it.",
+      "saveFailed": "This template couldn't be saved.",
+      "deleteFailed": "This template couldn't be deleted.",
+      "listFailed": "These templates couldn't be loaded."
+    },
+    "editor": {
+      "newTitle": "New workspace template",
+      "editTitle": "Workspace template",
+      "back": "All workspaces",
+      "builtin": "Built-in template, managed by the installation. Duplicate it to make your own.",
+      "notEditable": "You can't edit this template. Duplicate it to make your own.",
+      "duplicate": "Duplicate",
+      "reload": "Reload",
+      "saved": "Saved.",
+      "deleteTitle": "Delete workspace template",
+      "deleteBody": "Delete {{name}}? Work that already started keeps its workspace."
+    },
+    "list": {
+      "title": "Workspaces",
+      "new": "New template",
+      "chip": {"available": "Available to me", "mine": "Mine", "shared": "Shared", "project": "Project…"},
+      "projectAria": "Show a project's templates",
+      "group": {"shared": "Shared", "mine": "Mine", "project": "Project"},
+      "retry": "Retry",
+      "empty": "No templates here yet.",
+      "builtin": "Built-in",
+      "colName": "Name",
+      "colTier": "Tier",
+      "colImage": "Image",
+      "colSize": "Size",
+      "colActions": "Actions",
+      "moreActions": "More actions"
+    }
+  },
+  "cloudRoot": {
+    "description": "Your own files in the main cloud: everything you see in Files, project folders you belong to included. Connect it once, and your personal project's sessions mount it at cloud/my_cloud with full access.",
+    "state": {
+      "unsupported": "Not available",
+      "not_connected": "Not connected",
+      "connecting": "Connecting",
+      "connected": "Connected",
+      "revoked": "Disconnected",
+      "failed": "Not connected"
+    },
+    "detail": {
+      "connected": "Connected.",
+      "connectedAs": "Connected as {{account}}.",
+      "connecting": "Sign in to your cloud in the tab that opened and allow SRW access. This page updates on its own.",
+      "notConnected": "Connect it once to mount your own files in your personal project's sessions."
+    },
+    "failure": {
+      "wrong_account": "That cloud account's e-mail isn't yours. Sign in with your own account and connect again.",
+      "admin_account": "Cloud administrator accounts can't be connected, group admins included. Sign in with your own account.",
+      "service_account": "That is one of SRW's own service accounts. Sign in with your own account.",
+      "identity_mismatch": "That isn't the cloud account SRW already knows as yours. Sign in with that account, or ask your administrator.",
+      "account_disabled": "That cloud account is disabled.",
+      "verify_failed": "The connection could not read your files. Connect again.",
+      "expired": "You didn't finish signing in in time. Connect again.",
+      "provider_error": "The cloud could not be reached. Try again later.",
+      "account_missing": "Your cloud account has no files yet: open Files in the cloud once, then connect again.",
+      "error": "Something went wrong. Connect again."
+    },
+    "revoked": {
+      "user": "You disconnected it. Sessions don't mount it until you connect it again.",
+      "rejected_by_cloud": "The cloud no longer accepts this connection (it was removed from your devices, or the account was disabled). Reconnect it."
+    },
+    "unsupported": {
+      "provider_unsupported": "This deployment's cloud doesn't offer personal cloud roots.",
+      "grant_mode_off": "Personal cloud roots are turned off on this deployment.",
+      "no_personal_project": "You have no personal project yet, so no session would mount it."
+    },
+    "actions": {
+      "connect": "Connect",
+      "reconnect": "Reconnect",
+      "cancel": "Cancel",
+      "disconnect": "Disconnect"
+    },
+    "openLogin": "Open the cloud's sign-in page",
+    "disconnectConfirm": "Disconnect My cloud? The cloud is asked to revoke SRW's access, and sessions stop mounting it at their next start.",
+    "revokeIncomplete": "SRW forgot the connection, but the cloud could not be asked to revoke it: remove “{{client}}” from your cloud's devices and sessions.",
+    "connectLink": "Connect your cloud",
+    "reconnectLink": "Reconnect your cloud",
+    "errors": {
+      "unsupported": "There is no cloud root to connect on this deployment.",
+      "startFailed": "The cloud could not start the connection. Try again later.",
+      "cancelFailed": "The connection could not be cancelled.",
+      "disconnectFailed": "My cloud could not be disconnected. Try again."
+    }
+  },
   "datasources": {
+    "driversLink": "Driver capabilities",
+    "driversLinkHint": "What each connector driver offers, and what enforces it",
+    "driverEnvNames": "Sets:",
+    "generic": {
+      "previewToggle": "Show this connector through the generic form",
+      "previewHint": "Development builds only: renders the driver's spec instead of its bespoke form.",
+      "connectionUrl": "Connection URL",
+      "config": "Configuration",
+      "keepStored": "Stored — leave blank to keep",
+      "loadFile": "Load from file",
+      "add": "Add",
+      "remove": "Remove",
+      "key": "Key",
+      "unset": "—",
+      "variant": "Variant",
+      "jsonHint": "JSON",
+      "slotLevels": "Needed for: {{levels}}",
+      "slotKind": {
+        "secret_string": "Secret",
+        "file": "File",
+        "ssh_private_key": "SSH private key",
+        "oauth2": "OAuth 2",
+        "kubeconfig": "Kubeconfig"
+      },
+      "replaceAll": "Leave every credential blank to keep the stored ones. Entering any replaces them all, so enter every secret again.",
+      "problem": {
+        "required": "Required",
+        "pattern": "Does not match the expected format",
+        "not_a_number": "Not a number",
+        "invalid_json": "Not valid JSON",
+        "too_few": "Add at least one entry"
+      }
+    },
     "title": "Connectors",
     "new": "New Connector",
     "refresh": "Refresh",
@@ -2424,7 +2843,31 @@
       "kubeconfig": "Kubeconfig",
       "ssh_key": "SSH Key",
       "generic_file": "File",
-      "credentials": "Credentials"
+      "credentials": "Credentials",
+      "image_driver": "Registered driver",
+      "gitea_mcp": "Gitea MCP (managed)",
+      "cloud_folder": "Cloud folder",
+      "cloud_folder_checkout": "Folder checkout",
+      "cloud_outbox": "Outbox"
+    },
+    "platform": {
+      "kind": {
+        "projectKb": "Knowledge base",
+        "projectCloud": "Project folder",
+        "projectCloudCheckout": "Project folder copy (jobs)",
+        "userCloudRoot": "My cloud",
+        "cloudOutbox": "Session outbox"
+      },
+      "managedByProject": "Managed by its project",
+      "managedForYou": "Managed by SRW for you",
+      "managedForItsUser": "Managed by SRW for its user",
+      "managedBySrw": "Managed by SRW"
+    },
+    "accessLevel": {
+      "read_only": "Read-only",
+      "protected": "Protected",
+      "read_write": "Read-write",
+      "reviewed_write_back": "Reviewed write-back"
     },
     "catalog": {
       "search": "Search connectors…",
@@ -2485,24 +2928,17 @@
       "envValuePlaceholder": "value",
       "envRemoveTooltip": "Remove",
       "envAdd": "Add variable",
-      "envHint": "Credentials are injected as environment variables into the agent workspace. Read-only access cannot be enforced — use a database account with restricted permissions if needed.",
+      "envHint": "Credentials are injected as environment variables into the agent workspace. Read-only access cannot be enforced — use a database account with restricted permissions if needed. Names the workspace reserves (PATH, HOME, SRW_…) and names that make a tool run code (NODE_OPTIONS, GIT_SSH_COMMAND, EDITOR…) are refused; proxies and CA bundles are fine.",
       "mcpTransportLabel": "Transport",
       "mcpTransportHttp": "Remote (HTTP)",
       "mcpTransportSse": "Remote (SSE)",
-      "mcpTransportStdio": "Local command (stdio)",
       "mcpTokenLabel": "Bearer Token",
       "mcpTokenPlaceholder": "Optional — sent as Authorization: Bearer …",
       "mcpHeadersLabel": "Custom Headers",
       "mcpHeaderKeyPlaceholder": "Header-Name",
       "mcpHeaderValuePlaceholder": "value",
       "mcpHeaderAdd": "Add header",
-      "mcpCommandLabel": "Command",
-      "mcpCommandPlaceholder": "npx",
-      "mcpArgsLabel": "Arguments (one per line)",
-      "mcpArgsPlaceholder": "-y\n@modelcontextprotocol/server-github",
-      "mcpEnvLabel": "Environment Variables",
       "mcpCredentialsRetainHint": "Leave connection credentials blank to retain the stored MCP configuration.",
-      "mcpStdioWarning": "This command runs inside the agent environment with the variables above. Only add servers you trust.",
       "defaultBranchLabel": "Default Branch",
       "defaultBranchPlaceholder": "main",
       "okfRootLabel": "OKF Root Path",
@@ -2535,8 +2971,12 @@
       "visibilityPublic": "Public — visible to all users",
       "accessReadOnly": "Read-only",
       "accessReadWrite": "Read-write",
-      "visibilityCredentialHint": "Read-only is declared, not enforced — use read-only credentials (deploy token / restricted DB account).",
-      "visibilityKbHint": "Knowledge-base connectors are always read-only; credentials never reach agents.",
+      "accessLabel": "Agent access",
+      "accessReadOnlyHint": "Read-only means SRW gives agents no write tools for this connector, for everyone who uses it. The credential still decides what can really be changed: use a read-only one if nothing may change.",
+      "accessAdvisoryHint": "Read-only is only passed on to the agent as a note: the same credentials are delivered either way, so they decide what can be changed. This applies to everyone who uses the connector.",
+      "accessReadWriteOnlyHint": "SRW has no read-only mode for this connector type: agents get every tool it offers. Its credential decides what is allowed, for everyone who uses the connector.",
+      "accessKbHint": "Knowledge bases are always read-only, for everyone who uses them: SRW indexes the repository, and agents get search tools but never its credentials.",
+      "accessGithubAppHint": "Read-only means SRW gives agents no write tools for this connector, for everyone who uses it. For a GitHub App connector SRW also mints each run's token with contents: read, so pushes made with that token are refused by GitHub.",
       "availabilityTitle": "Availability",
       "scopeEverywhere": "Everywhere in my work",
       "scopeEverywhereHint": "Available in all projects and standalone work, subject to sharing and public-access rules.",
@@ -2572,7 +3012,18 @@
       "kubeconfigHint": "Cluster, user, and context names will be prefixed with the connector slug at runtime so multiple kubeconfigs can be merged without collisions. Try `kubectl config get-contexts` inside the agent to see the merged view.",
       "sshKeyContentLabel": "SSH Private Key",
       "sshKeyContentPlaceholder": "-----BEGIN OPENSSH PRIVATE KEY-----\n...\n-----END OPENSSH PRIVATE KEY-----",
-      "sshKeyHint": "The key is materialized at ~/.ssh/<slug> with mode 0600. Configure a host block in ~/.ssh/config inside the agent to use it for specific hosts.",
+      "sshKeyHint": "The key is loaded into its own ssh-agent in the workspace and never written to disk. Passphrase-protected keys are refused.",
+      "sshHostLabel": "SSH host",
+      "sshUserLabel": "SSH user",
+      "sshPortLabel": "Port",
+      "sshHostHint": "Optional. With a host, a plain `ssh <host>` in the workspace uses this key; without one, use it through the IdentityAgent the workspace README names.",
+      "sshKnownHostsLabel": "Pinned host key",
+      "sshKnownHostsHint": "Optional. Paste the host key (or Test the connector and pin the key it reports) to refuse a server that presents another key. Unpinned hosts are trusted on first use.",
+      "sshPinHostKey": "Pin this host key",
+      "upstreamCaLabel": "Upstream CA (optional)",
+      "upstreamCaHint": "Only for a forge behind a private certificate authority: paste its CA certificate(s) in PEM. SRW's git swap driver then trusts the forge with these alone; without one it checks public roots. Test shows how the token is delivered.",
+      "sshAgentNoticeTitle": "Usable, not readable",
+      "sshAgentNotice": "The agent can sign with this key but cannot read it. On a VM workspace, root (after an approved sudo) can. Use a scoped, least-privilege key.",
       "uploadFile": "Upload file",
       "trustNoticeTitle": "Agent-readable credential",
       "trustNotice": "This file is materialized in the agent's filesystem and is readable by the agent process. Use a scoped, least-privilege credential — read-only kubeconfig, project-scoped deploy key — for jobs that don't need broader access.",
@@ -2581,7 +3032,7 @@
       "credFileNameLabel": "Name",
       "credFileNamePlaceholder": "config.json",
       "credFileTargetPathLabel": "Target path",
-      "credFileTargetPathPlaceholder": "~/.config/myapp/config.json",
+      "credFileTargetPathPlaceholder": "~/.srw-files/myapp/token",
       "credFileContentsLabel": "Contents",
       "credFileContentsPlaceholder": "File contents (text only, max 64 KB)",
       "credFileModeLabel": "Mode",
@@ -2589,7 +3040,7 @@
       "credFileEnvVarLabel": "Env var",
       "credFileEnvVarPlaceholder": "MY_TOKEN_FILE",
       "credFileRemoveTooltip": "Remove file",
-      "credFileGenericHint": "Each file is written at the target path with the requested mode. If \"Env var\" is set, the agent's process gets that variable pointing at the absolute path. Paths must resolve under /home/srw, /tmp, /run, or /workspace.",
+      "credFileGenericHint": "Each file is written at the target path with the requested mode, never executable. Target paths are credential locations: ~/.kube/, ~/.aws/, ~/.azure/, ~/.docker/, ~/.config/ for doctl, gcloud, hcloud, helm or sops, ~/.srw-files/, ~/.netrc or ~/.pgpass. If \"Env var\" is set, the workspace gets that variable pointing at the file; it follows the environment variable rules (no PATH, NODE_OPTIONS, GIT_SSH_COMMAND…).",
       "emailProviderLabel": "Provider",
       "emailProviderCustom": "Custom / self-hosted",
       "emailProviderGmail": "Gmail (personal @gmail.com)",
@@ -2634,7 +3085,8 @@
       "emailUnattendedSendHint": "Requires the admin-granted email_autonomous_send permission — the server rejects this otherwise. When off, direct sending is refused; the planned human-approval queue is not available yet, so use Draft.",
       "emailNotPublishableHint": "Email connectors cannot be published — mailboxes stay private to their owner.",
       "optCredentials": "Credentials (environment variables)",
-      "credentialsEnvHint": "Available to workspace scripts and browser login forms. Add or replace variables; blank values keep existing credentials. Once attached, this connector stays for the session. Agent output is not filtered. Expiration is controlled by your provider."
+      "credentialsEnvHint": "Available to workspace scripts and browser login forms. Add or replace variables; blank values keep existing credentials. Once attached, this connector stays for the session. Agent output is not filtered. Expiration is controlled by your provider. Names the workspace reserves (PATH, HOME, SRW_…) and names that make a tool run code (NODE_OPTIONS, GIT_SSH_COMMAND, EDITOR…) are refused.",
+      "close": "Close"
     },
     "publishDialog": {
       "title": "Publish connector?",
@@ -2706,6 +3158,94 @@
       "reindexed": "OKF Knowledge Base \"{{name}}\" reindex finished ({{status}})",
       "reindexFailed": "Failed to reindex the OKF Knowledge Base",
       "fileTooLarge": "File exceeds 64 KB — credential files are capped at 64 KB."
+    }
+  },
+  "connectorDrivers": {
+    "title": "Connector drivers",
+    "desc": "Every installed connector driver, from its own specification: the access levels it offers and what enforces each, where it runs, the credentials it holds, and the network destinations it declares.",
+    "toConnectors": "Go to Connectors",
+    "search": "Filter drivers",
+    "count": "{{count}} installed",
+    "loading": "Loading drivers…",
+    "loadFailed": "The driver list could not be loaded.",
+    "retry": "Retry",
+    "noMatch": "No driver matches the filter.",
+    "holdsCredentials": "Holds upstream credentials",
+    "alwaysReadOnly": "Always read-only",
+    "authorNote": "This driver is not on the trusted list: everything below is declared by the driver's author and not verified by SRW.",
+    "declaredByAuthor": "Declared by the driver's author",
+    "accessLevels": "Access levels",
+    "noAccessLevels": "No access levels: this delivery cannot enforce one.",
+    "advisory": "Advisory",
+    "enforced": "Enforced",
+    "defaultLevel": "Default",
+    "enforcedBy": "Enforced by",
+    "toolsDiscovered": "Every tool the server lists",
+    "toolsNone": "No built-in tools",
+    "plane": "Runs",
+    "planes": {
+      "harness": "In the SRW process",
+      "bind_time": "At bind time",
+      "service": "As a service",
+      "in_pod": "In the workspace pod"
+    },
+    "delivery": "Delivery",
+    "backends": "Workspace backends",
+    "trustLabel": "Trust",
+    "trust": {
+      "builtin": "Built-in, trusted",
+      "trusted": "Trusted image",
+      "custom": "Custom, not verified",
+      "managed": "Managed by SRW, third-party image",
+      "development": "Development only, not for real connectors"
+    },
+    "shipsWithSrw": "Ships with SRW",
+    "register": {
+      "title": "Register a driver image",
+      "desc": "Any image may be a driver: SRW reads its specification from the image (the io.srw.driver.spec label) and runs it unprivileged in its own pod. A driver receives its connectors' credentials, so register only images whose authors you trust.",
+      "image": "Image reference",
+      "imagePlaceholder": "registry.example/team/driver:1.0 or …@sha256:…",
+      "scope": "Register in",
+      "scopeAccount": "Mine",
+      "scopeCatalog": "Shared (everyone)",
+      "submit": "Register",
+      "delete": "Delete registration",
+      "disable": "Disable",
+      "enable": "Enable",
+      "disabled": "Disabled: binds nothing new",
+      "envNames": "Sets:",
+      "disableConfirm": "Disable {{image}}? SRW revokes its {{bindings}} live binding(s) now, across {{connectors}} connector(s), and binds nothing new until it is enabled again.",
+      "scopeKind": {
+        "Account": "Registered in an account",
+        "Project": "Registered in a project",
+        "Catalog": "Registered in the shared catalog"
+      }
+    },
+    "credentials": "Credential slots",
+    "noSlots": "None",
+    "slotRequired": "required",
+    "slotOptional": "optional",
+    "slotDelivery": {
+      "env": "delivered as environment variables",
+      "file": "delivered as a file",
+      "ssh_agent": "loaded into an ssh-agent",
+      "held": "held by SRW"
+    },
+    "egress": "Egress",
+    "egressDeclared": "Declared:",
+    "egressEnforced": "Enforced:",
+    "egressInstallation": "Installation:",
+    "egressNone": "None declared",
+    "egressNoDriverPod": "No driver pod: SRW's agent or orchestrator, or the workspace, makes the connections",
+    "needsDns": "Needs DNS: {{reason}}",
+    "egressReason": {
+      "runs_in_srw_process": "Not applicable: runs in the SRW process",
+      "driver_hosting_not_available": "Not enforced: SRW does not host driver pods yet",
+      "service_hosting_disabled": "Not enforced: this installation hosts no service driver pods",
+      "pinned_per_pod": "Each driver pod's NetworkPolicy pins the declared hosts to the addresses resolved when it started (IP level); no DNS",
+      "pinned_per_pod_with_dns": "Each driver pod's NetworkPolicy pins the declared hosts to the addresses resolved when it started (IP level); the pod may use the cluster resolver, so names are unrestricted",
+      "start_up_wait_verified": "Namespace default deny and a start-up wait; the operator verified this cluster enforces them",
+      "start_up_wait_unverified": "Namespace default deny and a start-up wait; not verified on this cluster"
     }
   },
   "contacts": {
@@ -2856,11 +3396,10 @@
       "memoryEnabled": "Memory enabled",
       "budgetTokens": "Budget tokens",
       "compactOnArchive": "Compact on archive",
-      "keepRecentToolResults": "Keep recent tool results",
       "keepRecentMessages": "Keep recent messages",
       "vmCpuCores": "VM CPU cores",
-      "vmMemory": "VM memory",
-      "vmDiskSize": "VM disk",
+      "vmMemory": "VM memory (GiB)",
+      "vmDiskSize": "VM disk (GiB)",
       "maxReadWords": "Max read words",
       "maxWriteWords": "Max write words",
       "gitVersioning": "Git versioning",
@@ -2887,6 +3426,7 @@
     "hints": {
       "idleDisabled": "0 = disabled",
       "autoPlaceholder": "auto",
+      "vmSizeWholeGiB": "Enter a whole number of GiB (at least 1).",
       "parallelToolCalls": "Model support varies — some models may still make parallel tool calls regardless of this setting, while others may not support them at all.",
       "virtualBackend": "Virtual workspaces run with no container — shell, browser, and git tools are disabled. File, web, database, and knowledge tools remain available.",
       "noneBackend": "None runs with no workspace at all — shell, browser, git, and file tools are disabled. Web, database, and knowledge tools remain available."
@@ -2938,6 +3478,29 @@
       "openCloudFolder": "Open cloud folder"
     },
     "cloudFolderDisclaimer": "Preview — results are copied to a shared cloud folder you can browse. Use the feedback box below to request changes; edits made directly in this folder won't reach the agent and will be replaced when the job continues.",
+    "outbox": {
+      "delivered": "{{count}} file(s) in the job's cloud folder.",
+      "failed": "The copy into the job's cloud folder failed: {{reason}}.",
+      "unshared": {
+        "no_account": "It isn't shared with you yet: sign in to the cloud once, then re-sync.",
+        "rate_limited": "It isn't shared with you yet: the cloud is limiting new shares. Re-sync in a few minutes.",
+        "share_failed": "It isn't shared with you yet: sharing it failed. Re-sync to try again."
+      },
+      "reason": {
+        "backend_unavailable": "no main cloud was reachable",
+        "forge_unavailable": "the job's repository could not be read",
+        "folder_failed": "the cloud folder could not be created",
+        "file_missing": "a file it should copy is missing",
+        "copy_failed": "the files could not be copied",
+        "owner_unavailable": "the job or its owner is gone"
+      }
+    },
+    "projectFolder": {
+      "nothingToReview": "No changes to the project folder copy to review.",
+      "noChanges": "The job made no changes to its copy of the project folder, so nothing will be written back.",
+      "noBaseline": "The project folder was not copied for this job, so there are no changes to review.",
+      "headUnreadable": "The job's changes to its copy of the project folder could not be read, so there is nothing to review."
+    },
     "reviewSessionHint": "Starts a supervised session in a fresh sandbox checkout of the delivered branch with this job's model, project, and connectors. Job-only workspace and tool settings are not copied.",
     "vmUpgrade": {
       "title": "Sudo Required",
@@ -3192,6 +3755,72 @@
     }
   },
   "agentSettings": {
+      "manifest": {
+        "title": "Manifest",
+        "jobTitle": "Job manifest: what Create sends",
+        "sessionTitle": "Session execution: what Start sends",
+        "show": "View as manifest",
+        "hide": "Hide manifest"
+      },
+      "sections": {
+        "task": {
+          "title": "Task",
+          "more": "More options"
+        },
+        "session": {
+          "title": "Session"
+        },
+        "expert": {
+          "title": "Expert",
+          "question": "Who should your AI be?",
+          "unnamed": "Default expert",
+          "basedOn": "Based on {{name}} · {{n}} changed. This run gets its own full copy.",
+          "resetToTemplate": "Reset to template",
+          "more": "More settings",
+          "moreChanged": "· {{n}} changed",
+          "reasoning": "reasoning {{level}}",
+          "tools": "{{n}} tools",
+          "toolGroups": "{{n}} tool groups",
+          "subagents": "subagents"
+        },
+        "workspace": {
+          "title": "Workspace",
+          "question": "What environment will it work in?"
+        },
+        "connectors": {
+          "title": "Connectors",
+          "question": "What should it have access to?",
+          "none": "None attached",
+          "summary": "{{n}} attached · {{names}}",
+          "summaryMore": "{{n}} attached · {{names}} +{{more}} more"
+        },
+        "chip": {
+          "partlyLocked": "Some settings locked",
+          "changes": "{{n}} changed",
+          "template": "Template",
+          "upgradeOnly": "Upgrade only",
+          "default": "Default",
+          "custom": "Custom",
+          "none": "None",
+          "addOrRemove": "Add or remove",
+          "changed": "Changed",
+          "defaults": "Defaults"
+        }
+      },
+      "locked": {
+        "atCreation": "Fixed at creation",
+        "project": "Project",
+        "templateAndResources": "Template and resources",
+        "templateAndResourcesHint": "The tier above can be upgraded. Image and resources stay as created.",
+        "moreLive": "These were fixed when the session started.",
+        "moreUnavailable": "The values this session was started with could not be loaded."
+      },
+      "expertPicker": {
+        "label": "Start from a template",
+        "hint": "Picking one fills in everything below. Changes stay with this run.",
+        "loading": "Loading experts…",
+        "empty": "No experts available."
+      },
     "common": {
       "resetToDefault": "Reset to default",
       "noApiKey": "no API key",
@@ -3199,6 +3828,15 @@
       "deselectAll": "Deselect all"
     },
     "datasources": {
+        "searchPlaceholder": "Search by name or type",
+        "searchLabel": "Search connectors",
+        "filterLabel": "Show",
+        "filterAll": "All",
+        "filterAttached": "Attached ({{n}})",
+        "countLine": "{{n}} of {{total}} attached",
+        "noMatch": "No connectors match “{{query}}”.",
+        "noneAttached": "No connectors attached.",
+        "noneAvailable": "No connectors are available to you yet.",
       "group": "Connectors",
       "loading": "Loading connectors...",
       "loadFailed": "Connectors could not be loaded for this project context. Creation is disabled.",
@@ -3209,7 +3847,48 @@
       "notReady": "Not fully indexed yet — the agent may see incomplete results.",
       "lockedLive": "Knowledge bases can't be changed during a session",
       "credentialsLocked": "Credentials stay attached for this session",
-      "credentialsUnavailable": "This credential connector is no longer available. End this session and start another to change its connectors."
+      "credentialsUnavailable": "This credential connector is no longer available. End this session and start another to change its connectors.",
+      "lockedNextStart": "Takes effect only at the next start, so it can't be changed during a session",
+      "nothingAttached": "Nothing is attached, not even this project's own connectors.",
+      "access": {
+        "label": "Access for {{name}}",
+        "notMounted": "Not mounted here",
+        "besideProtected": "Not mounted beside a protected folder",
+        "fullAccess": "Full access",
+        "fullAccessHint": "My cloud has full access only: the app token your cloud gives SRW can be limited neither to read-only nor to one folder.",
+        "origin": {
+          "projectDefault": "project default",
+          "default": "default",
+          "lowered": "lowered: not allowed here",
+          "loweredRole": "lowered to what your role in its project allows",
+          "chosen": "chosen"
+        },
+        "refused": {
+          "notOffered": "not offered here",
+          "aboveCeiling": "more than your role allows",
+          "readOnlyUnavailable": "no read-only here",
+          "oneProtected": "only one folder can be protected"
+        }
+      }
+    },
+    "workspacePicker": {
+      "templateLabel": "Template",
+      "label": "Workspace",
+      "default": "Default: {{what}} ({{layer}})",
+      "defaultUnknown": "Default (project or installation)",
+      "layer": {"project": "project default", "installation": "installation default"},
+      "mode": {"none": "No workspace", "virtual": "Virtual", "container": "Container", "vm": "VM"},
+      "group": {"shared": "Shared", "project": "This project", "mine": "Mine"},
+      "none": "No workspace",
+      "custom": "Custom (this run only)",
+      "customize": "Customize…",
+      "customizeTitle": "Customize the workspace",
+      "useOnce": "Use for this run",
+      "saveToMine": "Save to Mine",
+      "saveName": "Template name (for Save to Mine)",
+      "summaryNone": "No workspace: no files and no shell.",
+      "recommended": "Recommended by {{expert}}.",
+      "recommendedUnavailable": "{{expert}} recommends a VM, which isn't available to you here."
     },
     "execution": {
       "group": "Execution",
@@ -3221,14 +3900,17 @@
       "projectMemory": "Project memory",
       "imageQuality": "Image Quality",
       "workspaceBackend": "Workspace",
+      "workspaceRecommended": "Recommended workspace",
       "autonomyDefaultHint": "Controls when the agent pauses for human review",
       "tierCurrent": "current",
+      "tierNext": "the next tier",
       "tierHint": "Upgrades carry your files over and cannot be reversed within the session.",
       "tierUpgrading": "Provisioning {{tier}}…",
       "tierUnreachable": {
         "downgrade": "can't move down a tier",
         "needsApproval": "needs approval",
-        "unsupported": "not available from this tier"
+        "unsupported": "not available from this tier",
+        "sessionUnsupported": "not available in this session"
       }
     },
     "narrationModes": {
@@ -3314,6 +3996,12 @@
       "rosterTitle": "Subagents this expert can delegate to",
       "rosterDefault": "(default)",
       "rosterEmpty": "This expert has no subagent roster, so delegate_agent has nothing to run — every call will return an error. Add a roster to the expert under Subagents.",
+      "sessionCap": {
+        "label": "Subagents at once",
+        "hint": "How many subagents run at the same time. More calls wait their turn.",
+        "inherited": "Inherited (default {{n}})",
+        "invalid": "Enter a whole number from {{min}} to {{max}}."
+      },
       "unknownCategory": "This cockpit build has no description for this category."
     },
     "toolCategories": {
@@ -3657,7 +4345,9 @@
       "resumeFailed": "Couldn't resume the session.",
       "stillEnding": "This session is still finishing. Keep this page open, then try Resume again.",
       "endFailed": "Couldn't end the session.",
+      "endRetryable": "Ending has started, but workspace cleanup has not finished yet. Press Disconnect again to retry.",
       "deleteFailed": "Couldn't delete the session.",
+      "deleteRetryable": "This session is still shutting down, so it couldn't be deleted yet. Use Retry delete on its card in a moment.",
       "createFailed": "Couldn't create the session.",
       "renameFailed": "Couldn't rename the session.",
       "bindingInvalid": "This session connection is no longer authoritative. Wait for the session to recover or contact an administrator."
@@ -3690,6 +4380,8 @@
       "replySent": "Reply sent",
       "exportedToCloud": "Exported {{count}} file(s) to {{folder}}",
       "exportedNotShared": "Exported {{count}} file(s) to {{folder}}, but it isn't shared with you yet — sign in to the cloud once, then re-sync.",
+      "exportedRateLimited": "Exported {{count}} file(s) to {{folder}}, but the cloud is limiting new shares right now — re-sync in a few minutes to share it with you.",
+      "exportedShareFailed": "Exported {{count}} file(s) to {{folder}}, but sharing it with you failed — re-sync to try again.",
       "diffAccepted": "Applied {{applied}} change(s), {{deleted}} deletion(s) to the cloud folder.",
       "diffRejected": "Diff rejected; no cloud changes were made."
     },

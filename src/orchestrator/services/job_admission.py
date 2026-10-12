@@ -14,6 +14,7 @@ from typing import Any, Awaitable, Callable
 from fastapi import HTTPException
 
 from orchestrator.schemas.job_create import JobCreate
+from orchestrator.services.connector_refs import refuse_connector_selector_conflict
 from orchestrator.services.datasource_policy_errors import (
     DatasourceMaterializationAuthorizationError,
     DatasourcePolicyConflictError,
@@ -31,6 +32,9 @@ from orchestrator.services.job_admission_config import (
 from orchestrator.services.job_admission_officer import (
     JobAdmissionOfficerDependencies,
     prepare_job_admission_officer,
+)
+from orchestrator.services.job_admission_work_expert import (
+    apply_work_expert_default,
 )
 from orchestrator.services.job_admission_workspace import (
     JobAdmissionWorkspaceDependencies,
@@ -81,6 +85,7 @@ async def admit_job(
     command.config_override = dependencies.validate_tool_overrides(
         command.config_override
     )
+    refuse_connector_selector_conflict(command)
     await dependencies.enforce_readiness()
     try:
         scope = await prepare_job_admission_scope(
@@ -89,17 +94,28 @@ async def admit_job(
             origin=origin,
             dependencies=dependencies.scope(),
         )
+        config_dependencies = dependencies.config()
         config = await prepare_job_admission_config(
             command=command,
             scope=scope,
             origin=origin,
-            dependencies=dependencies.config(),
+            dependencies=config_dependencies,
         )
         officer = await prepare_job_admission_officer(
             command=command,
             config=config,
             dependencies=dependencies.officer(),
         )
+        if config.expert_source != "caller":
+            # The ticket's pin and the slot's category exist only after the
+            # Officer stage; see job_admission_work_expert.
+            config, officer = await apply_work_expert_default(
+                config,
+                officer,
+                requested_category=command.work_category,
+                owner_id=scope.user_id,
+                preview_refusals=config_dependencies.preview_expert_refusals,
+            )
         workspace_selection = config.workspace_selection
         if workspace_selection and workspace_selection.get("project_revision"):
             from orchestrator.services.manifest_workspace_selection import (
@@ -132,6 +148,8 @@ async def admit_job(
             internal_call=origin == "internal_rest",
             internal_origin_bound=scope.origin_bound,
             dependencies=dependencies.datasources(),
+            # An officer's ticket is unattended: no outbox among its defaults.
+            unattended=officer.preparation is not None,
         )
         delivery = await prepare_job_admission_delivery(
             command=command,
@@ -148,6 +166,7 @@ async def admit_job(
                 context=officer.context,
                 config_name=config.config_name,
                 expert_id=config.expert_id,
+                expert_row=config.expert_row,
                 config_override=officer.config_override,
                 requested_workspace_backend=config.requested_workspace_backend,
                 workspace_selection=workspace_selection,

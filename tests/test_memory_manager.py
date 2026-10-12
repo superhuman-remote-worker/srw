@@ -317,6 +317,31 @@ class TestAssemble:
         assert by_kind["memory"].items[0]["retriever"] == "recall"
 
     @pytest.mark.asyncio
+    async def test_blocks_carry_their_store_records_in_rank_order(self):
+        # Append-only context injection renders its own entries from the
+        # records; the legacy content/messages stay as they were.
+        mem = make_candidate(kind="memory", text="m-fact", record_id="m1")
+        kb1 = make_candidate(kind="knowledge", text="k-one", record_id="k1")
+        kb2 = make_candidate(kind="knowledge", text="k-two", record_id="k2")
+        manager = MemoryManager(
+            MemoryRuntime(),
+            retrievers=[
+                ("recall", FakeRetriever([mem])),
+                ("kb", FakeRetriever([kb1, kb2])),
+            ],
+        )
+        payload = await manager.assemble(AssembleRequest(query_text="q"))
+
+        by_kind = {b.kind: b for b in payload.blocks}
+        assert by_kind["memory"].records == [mem.record]
+        assert by_kind["knowledge"].records == [kb1.record, kb2.record]
+        assert by_kind["memory"].content
+        assert len(by_kind["memory"].messages) == 2
+
+    def test_injection_block_records_default_empty(self):
+        assert InjectionBlock(kind="memory").records == []
+
+    @pytest.mark.asyncio
     async def test_retriever_failure_contained(self):
         good = make_candidate()
         manager = MemoryManager(

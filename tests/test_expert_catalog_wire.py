@@ -14,6 +14,9 @@ from fastapi.testclient import TestClient
 
 from tests._mounted_router import mount_router
 from orchestrator.schemas.expert_catalog import ExpertInfo
+from orchestrator.application import catalogue as catalogue_composition
+from orchestrator.services import config_overrides as config_overrides_module
+from orchestrator.services import session_tool_policy as session_tool_policy_module
 
 
 USER_ID = "00000000-0000-0000-0000-000000000101"
@@ -85,14 +88,14 @@ def catalogue_wire(monkeypatch):
         ExpertCatalogDependencies(
             store=store,
             state=state,
-            get_config_dir=main._get_config_dir,
+            get_config_dir=catalogue_composition.get_config_dir,
             load_settings_matrix=main.app.state.catalogue_resources.load_settings_matrix,
             experts_enabled=lambda: settings.experts_enabled,
             skills_enabled=lambda: settings.skills_enabled,
             account_defaults_layer=AsyncMock(return_value={}),
             visible_project_ids=AsyncMock(return_value=[]),
-            with_validated_tool_overrides=main._with_validated_tool_overrides,
-            looks_like_uuid=main._looks_like_uuid,
+            with_validated_tool_overrides=session_tool_policy_module.with_validated_tool_overrides,
+            looks_like_uuid=config_overrides_module.looks_like_uuid,
             forge=None,
         )
     )
@@ -332,7 +335,11 @@ def test_skill_import_then_export_preserves_archive_payload(catalogue_wire):
     )
     assert imported.status_code == 200
     assert env.store.create_skill.await_args.kwargs["files"] == files
-    env.store.get_skill_by_id.return_value = {"id": SKILL_ID, "name": "quiet-helper"}
+    env.store.get_skill_by_id.return_value = {
+        "id": SKILL_ID,
+        "name": "quiet-helper",
+        "owner_id": USER_ID,
+    }
     env.store.get_skill_files.return_value = deepcopy(files)
     exported = env.client.get(f"/api/skills/{SKILL_ID}/export")
     assert exported.status_code == 200
@@ -362,9 +369,11 @@ def test_skill_bad_archive_is_422_after_identity_without_write(catalogue_wire):
 
 def test_skill_owner_refusal_precedes_bundle_parse(catalogue_wire):
     env = catalogue_wire
+    # Global, so visible to the caller: the refusal under test is ownership.
     env.store.get_skill_by_id.return_value = {
         "id": SKILL_ID,
         "owner_id": "other",
+        "is_global": True,
         "name": "quiet-helper",
     }
     response = env.client.put(
@@ -372,6 +381,230 @@ def test_skill_owner_refusal_precedes_bundle_parse(catalogue_wire):
     )
     assert response.status_code == 403
     env.store.update_skill.assert_not_awaited()
+
+
+OTHER_USER_ID = "00000000-0000-0000-0000-000000000102"
+SKILL_FILES = {"SKILL.md": SKILL_TEXT, "references/private.md": "owner's notes\n"}
+
+
+def skill_row(**extra):
+    return {
+        "id": UUID(SKILL_ID),
+        "name": "quiet-helper",
+        "display_name": "Quiet helper",
+        "description": "A local helper.",
+        "owner_id": UUID(OTHER_USER_ID),
+        "is_global": False,
+        "icon": "extension",
+        "color": "#6B7280",
+        "tags": [],
+        **extra,
+    }
+
+
+class TestSkillByIdVisibility:
+    """A DB skill read by UUID follows the listing's visibility rule (owned or
+    global) plus admins; anything else is 404, the way experts-by-id are. Before
+    this, every by-id read served any row to any approved caller who held the
+    UUID — cookie sessions and tokens alike."""
+
+    @pytest.fixture
+    def env(self, catalogue_wire):
+        catalogue_wire.store.get_skill_by_id.return_value = skill_row()
+        catalogue_wire.store.get_skill_files.return_value = deepcopy(SKILL_FILES)
+        return catalogue_wire
+
+    @pytest.mark.parametrize(
+        ("method", "suffix"),
+        [
+            ("get", ""),
+            ("get", "/export"),
+            ("post", "/duplicate"),
+            ("put", ""),
+            ("delete", ""),
+        ],
+    )
+    def test_another_users_private_skill_is_404_on_every_by_id_route(
+        self, env, method, suffix
+    ):
+        kwargs = {"json": {"description": "hijack"}} if method == "put" else {}
+        response = getattr(env.client, method)(
+            f"/api/skills/{SKILL_ID}{suffix}", **kwargs
+        )
+        assert response.status_code == 404
+        assert "owner's notes" not in response.text
+        env.store.get_skill_files.assert_not_awaited()
+        env.store.create_skill.assert_not_awaited()
+        env.store.update_skill.assert_not_awaited()
+        env.store.delete_skill.assert_not_awaited()
+
+    def test_owner_reads_and_exports_own_private_skill(self, env):
+        env.store.get_skill_by_id.return_value = skill_row(owner_id=UUID(USER_ID))
+        detail = env.client.get(f"/api/skills/{SKILL_ID}")
+        assert detail.status_code == 200
+        assert detail.json()["files"] == SKILL_FILES
+        assert detail.json()["source"] == "user"
+        exported = env.client.get(f"/api/skills/{SKILL_ID}/export")
+        assert exported.status_code == 200
+        with ZipFile(BytesIO(exported.content)) as packed:
+            assert (
+                packed.read("quiet-helper/references/private.md") == b"owner's notes\n"
+            )
+
+    def test_admin_reads_another_users_private_skill(self, env):
+        env.user["is_admin"] = True
+        assert env.client.get(f"/api/skills/{SKILL_ID}").status_code == 200
+        assert env.client.get(f"/api/skills/{SKILL_ID}/export").status_code == 200
+
+    def test_global_skill_stays_visible_but_not_editable(self, env):
+        env.store.get_skill_by_id.return_value = skill_row(is_global=True)
+        detail = env.client.get(f"/api/skills/{SKILL_ID}")
+        assert detail.status_code == 200
+        assert detail.json()["source"] == "global"
+        assert env.client.get(f"/api/skills/{SKILL_ID}/export").status_code == 200
+        # Visible, so the refusal is the ownership one, not a 404.
+        response = env.client.put(
+            f"/api/skills/{SKILL_ID}", json={"description": "hijack"}
+        )
+        assert response.status_code == 403
+        env.store.update_skill.assert_not_awaited()
+
+    def test_bundled_skill_stays_visible(self, env):
+        detail = env.client.get("/api/skills/word-count")
+        assert detail.status_code == 200
+        assert detail.json()["source"] == "bundled"
+        assert env.client.get("/api/skills/word-count/export").status_code == 200
+        env.store.get_skill_by_id.assert_not_awaited()
+
+
+class TestSkillGlobalPublication:
+    """A global skill outranks a bundled one of the same name in EVERY user's
+    menu (``resolve_skill_menu``), so publishing one is an admin act. Before
+    this, any owner could PUT ``is_global: true`` onto their own skill."""
+
+    @pytest.fixture
+    def env(self, catalogue_wire):
+        catalogue_wire.store.get_skill_by_id.return_value = skill_row(
+            owner_id=UUID(USER_ID)
+        )
+        catalogue_wire.store.update_skill.return_value = skill_row(
+            owner_id=UUID(USER_ID)
+        )
+        return catalogue_wire
+
+    def test_an_owner_cannot_publish_their_skill_globally(self, env):
+        response = env.client.put(f"/api/skills/{SKILL_ID}", json={"is_global": True})
+        assert response.status_code == 403
+        assert "admin" in response.json()["detail"]
+        env.store.update_skill.assert_not_awaited()
+
+    def test_an_admin_can_publish_a_skill_globally(self, env):
+        env.user["is_admin"] = True
+        response = env.client.put(f"/api/skills/{SKILL_ID}", json={"is_global": True})
+        assert response.status_code == 200
+        assert env.store.update_skill.await_args.kwargs["is_global"] is True
+
+    def test_an_owner_may_still_unpublish_and_edit(self, env):
+        env.store.get_skill_by_id.return_value = skill_row(
+            owner_id=UUID(USER_ID), is_global=True
+        )
+        response = env.client.put(
+            f"/api/skills/{SKILL_ID}", json={"is_global": False, "tags": ["x"]}
+        )
+        assert response.status_code == 200
+        kwargs = env.store.update_skill.await_args.kwargs
+        assert kwargs["is_global"] is False
+        assert kwargs["tags"] == ["x"]
+
+    def test_create_cannot_publish_at_all(self, env):
+        """``SkillCreate`` has no ``is_global``: the flag is dropped, not honoured."""
+        env.store.create_skill.return_value = {"id": SKILL_ID, "name": "quiet-helper"}
+        response = env.client.post(
+            "/api/skills", json={"files": {"SKILL.md": SKILL_TEXT}, "is_global": True}
+        )
+        assert response.status_code == 200
+        assert "is_global" not in env.store.create_skill.await_args.kwargs
+
+
+PROJECT_SHARED = {
+    "llm": {"api_key": "sk-project-shared"},
+    "env_keys": {"EMBEDDING_API_KEY": "sk-embed-shared", "EMBEDDING_MODEL": "e5"},
+    "workspace": {"remote": {"host": "10.0.0.7"}},
+}
+PROJECT_LINK = {"llm": {"api_key": "sk-link-override"}, "settings": {"last": True}}
+LAYER_SECRETS = ("sk-project-shared", "sk-embed-shared", "10.0.0.7", "sk-link-override")
+
+
+def managed_child_row():
+    """A Project's managed child Expert as ``hydrate_expert_row`` serves it:
+    the composed spec's ``runtime.config.layers`` are the project's shared
+    override and the link override, verbatim, on both ``manifest`` and
+    ``harness_config_layers``. It is linked to the project, so every member
+    sees it by id."""
+    from orchestrator.services.manifest_experts import (
+        expert_manifest,
+        project_expert_resource,
+    )
+    from orchestrator.services.manifest_projects import compose_srw_expert
+    from shared.manifests.resolution import content_revision
+
+    raw = expert_row(config={"settings": {"expert": True}}, tags=["worker"])
+    document = compose_srw_expert(
+        expert_manifest(raw, image="trusted/srw:v1"),
+        shared=PROJECT_SHARED,
+        linked=PROJECT_LINK,
+    )
+    return project_expert_resource(
+        raw,
+        {
+            "id": UUID(int=7),
+            "document": document,
+            "revision": content_revision(document["spec"]),
+            "resource_version": 1,
+        },
+    )
+
+
+class TestLinkedExpertDetailRedaction:
+    """The expert detail a project member reads carries the project's
+    override layers twice — merged into ``config`` and inside ``manifest`` —
+    and ``/api/projects/{id}/experts/{name}`` merges the link override on top.
+    They leave by the job API's policy, like the project row itself."""
+
+    @pytest.fixture
+    def env(self, catalogue_wire):
+        row = managed_child_row()
+        store = catalogue_wire.store
+        store.get_expert_visible_by_id.return_value = row
+        store.get_expert_by_id.return_value = row
+        store.get_project_linked_expert = AsyncMock(
+            return_value={
+                **row,
+                "default_for": "worker",
+                "project_config_override": {"llm": {"api_key": "sk-link-override"}},
+            }
+        )
+        store.get_user_settings = AsyncMock(return_value={})
+        store.resolve_default_for_capability = AsyncMock(return_value=None)
+        return catalogue_wire
+
+    def test_expert_detail_hides_the_project_layers(self, env):
+        response = env.client.get(f"/api/experts/{EXPERT_ID}")
+        assert response.status_code == 200
+        for secret in LAYER_SECRETS:
+            assert secret not in response.text
+        body = response.json()
+        assert body["config"]["settings"] == {"expert": True, "last": True}
+        assert body["config"]["env_keys"]["EMBEDDING_MODEL"] == "e5"
+        layers = body["manifest"]["spec"]["runtime"]["config"]["layers"]
+        assert layers[1] == {"llm": {}, "settings": {"last": True}}
+
+    def test_project_expert_detail_hides_layers_and_link_override(self, env):
+        response = env.client.get(f"/api/projects/{PROJECT_ID}/experts/quiet-worker")
+        assert response.status_code == 200
+        for secret in LAYER_SECRETS:
+            assert secret not in response.text
+        assert response.json()["source"] == "project"
 
 
 def test_two_mounted_apps_keep_store_identity_and_reload_cache_separate(

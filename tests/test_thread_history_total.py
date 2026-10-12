@@ -10,11 +10,12 @@ get_thread_message_count on the hot paths:
                                         may want the true total)
 """
 
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from orchestrator.main import get_thread_messages_history
+from orchestrator.routers import thread_history
+from orchestrator.routers.thread_history import get_thread_messages_history
 
 
 class _AsyncContext:
@@ -28,8 +29,8 @@ class _AsyncContext:
         return False
 
 
-def _patched(db):
-    """Patch the endpoint's module-level deps: auth + the db singleton."""
+def _dependencies(db):
+    """The router's application collaborators: the owner gate and the store."""
     owner = AsyncMock(return_value=({"id": "u1"}, {"id": "t1", "user_id": "u1"}))
     conn = MagicMock()
     conn.transaction.return_value = _AsyncContext()
@@ -37,9 +38,10 @@ def _patched(db):
         return_value={"events_epoch": 2, "conversation_revision": 3}
     )
     db.acquire.return_value = _AsyncContext(conn)
-    return (
-        patch("orchestrator.main.require_thread_owner", owner),
-        patch("orchestrator.main.postgres_db", db),
+    return thread_history.ThreadHistoryDependencies(
+        store=db,
+        vector_db=None,  # the history read never touches the vector store
+        require_thread_owner=owner,
     )
 
 
@@ -48,9 +50,9 @@ async def test_full_load_skips_count():
     db = MagicMock()
     db.get_thread_messages_history = AsyncMock(return_value=[{"id": "a"}, {"id": "b"}])
     db.get_thread_message_count = AsyncMock(return_value=999)
-    p_owner, p_db = _patched(db)
-    with p_owner, p_db:
-        result = await get_thread_messages_history("t1", MagicMock())
+    result = await get_thread_messages_history(
+        "t1", MagicMock(), dependencies=_dependencies(db)
+    )
     # total comes free from the full transcript, not a COUNT(*).
     assert result["total"] == 2
     assert result["events_epoch"] == 2
@@ -63,11 +65,12 @@ async def test_cursor_window_skips_count():
     db = MagicMock()
     db.get_thread_messages_page = AsyncMock(return_value=([{"id": "a"}], False))
     db.get_thread_message_count = AsyncMock(return_value=999)
-    p_owner, p_db = _patched(db)
-    with p_owner, p_db:
-        result = await get_thread_messages_history(
-            "t1", MagicMock(), after="2026-07-03T00:00:00Z"
-        )
+    result = await get_thread_messages_history(
+        "t1",
+        MagicMock(),
+        after="2026-07-03T00:00:00Z",
+        dependencies=_dependencies(db),
+    )
     assert result["total"] == 1
     assert result["has_more"] is False
     assert db.get_thread_message_count.call_count == 0, "no COUNT on a cursor window"
@@ -78,10 +81,32 @@ async def test_explicit_paged_read_keeps_true_count():
     db = MagicMock()
     db.get_thread_messages_history = AsyncMock(return_value=[{"id": "a"}, {"id": "b"}])
     db.get_thread_message_count = AsyncMock(return_value=57)
-    p_owner, p_db = _patched(db)
-    with p_owner, p_db:
-        result = await get_thread_messages_history("t1", MagicMock(), limit=2)
+    result = await get_thread_messages_history(
+        "t1", MagicMock(), limit=2, dependencies=_dependencies(db)
+    )
     # A paginating client asked for a window -> the true total is still served.
     assert result["total"] == 57
     assert result["has_more"] is True  # full page implies more
     assert db.get_thread_message_count.call_count == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "cursor",
+    [
+        {"before": "not-a-timestamp"},
+        {"after": "2026-13-45T00:00:00Z"},
+        {"before": "2026-07-03T00:00:00Z", "after": "2026-07-03T00:00:00Z"},
+    ],
+)
+async def test_a_bad_cursor_is_a_400_before_any_read(cursor):
+    """Unparseable or conflicting cursors are refused before the snapshot read."""
+    from fastapi import HTTPException
+
+    db = MagicMock()
+    with pytest.raises(HTTPException) as exc:
+        await get_thread_messages_history(
+            "t1", MagicMock(), dependencies=_dependencies(db), **cursor
+        )
+    assert exc.value.status_code == 400
+    db.acquire.assert_not_called()

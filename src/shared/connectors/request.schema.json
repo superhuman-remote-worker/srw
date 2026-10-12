@@ -1,0 +1,136 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://srw.dev/schemas/connectors/request/v1",
+  "title": "SRW connector driver request",
+  "type": "object",
+  "required": [
+    "protocol_version",
+    "operation",
+    "connector",
+    "credentials"
+  ],
+  "properties": {
+    "protocol_version": {
+      "type": "string",
+      "pattern": "^(?:1)\\.(0|[1-9][0-9]*)$"
+    },
+    "operation": {
+      "enum": [
+        "spec",
+        "check",
+        "bind",
+        "revoke",
+        "renew",
+        "discover",
+        "gc",
+        "status",
+        "reindex"
+      ]
+    },
+    "binding_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "connector": {
+      "type": "object",
+      "required": [
+        "config"
+      ],
+      "properties": {
+        "config": {
+          "type": "object"
+        },
+        "access": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    "credentials": {
+      "type": "object"
+    },
+    "driver_state": {
+      "type": "string"
+    },
+    "execution": {
+      "type": "object",
+      "required": [
+        "kind",
+        "id"
+      ],
+      "properties": {
+        "kind": {
+          "enum": [
+            "job",
+            "session"
+          ]
+        },
+        "id": {
+          "type": "string"
+        },
+        "project_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "workspace_backend": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    "live_binding_ids": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "operation": {
+            "enum": [
+              "bind",
+              "renew",
+              "revoke"
+            ]
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "binding_id"
+        ],
+        "properties": {
+          "binding_id": {
+            "type": "string",
+            "minLength": 1
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "operation": {
+            "const": "gc"
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "live_binding_ids"
+        ]
+      }
+    }
+  ]
+}

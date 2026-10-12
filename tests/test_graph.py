@@ -21,6 +21,7 @@ project_root = Path(__file__).parent.parent
 from agent.core.workspace import WorkspaceManager  # noqa: E402
 from agent.core.state import create_initial_state  # noqa: E402
 from agent.managers import TodoManager, PlanManager, MemoryManager  # noqa: E402
+from agent.managers.todo import TODO_LIST_RESTATEMENT_LEAD  # noqa: E402
 from tests._fs_backend import FilesystemTestBackend  # noqa: E402
 from agent.graph import (  # noqa: E402
     WORKER_BATCH_MIN_WALL_SECONDS,
@@ -48,6 +49,7 @@ from agent.core.phase import (  # noqa: E402
     validate_todos_yaml,
     TodosYamlValidationError,
 )
+from shared.runtime.core.message_markers import is_compaction_summary  # noqa: E402
 
 
 @pytest.fixture
@@ -649,6 +651,12 @@ class TestRestoreTodoStateNode:
 
         result = node(state)
 
+        # The history does not show the list, so the resume restates it once
+        # (append-only context injection, D17-D19).
+        (restated,) = result.pop("messages")
+        assert restated.content.startswith(TODO_LIST_RESTATEMENT_LEAD)
+        assert managers["todo"].format_for_injection() in restated.content
+
         # Node always clears stop flags on resume
         assert result == {
             "should_stop": False,
@@ -725,6 +733,48 @@ class TestRestoreTodoStateNode:
         assert result["is_strategic_phase"] is False
         assert result["should_stop"] is False
         assert managers["todo"].is_strategic_phase is False
+        # The applied list enters the history once, as the tactical list.
+        (restated,) = result["messages"]
+        assert "Current Tasks — Phase 1 (Tactical)" in restated.content
+        assert "todo_1: Staged Task 1" in restated.content
+
+    def test_no_restatement_when_the_history_shows_the_list(self, managers):
+        """A resume whose history already carries the current rendering (a
+        todo tool result, a phase-start message) appends nothing."""
+        from agent.graph import create_restore_todo_state_node
+
+        todos = [
+            {
+                "id": "todo_1",
+                "content": "Task 1",
+                "status": "pending",
+                "priority": "medium",
+                "notes": [],
+            }
+        ]
+        managers["todo"].restore_state(
+            {"todos": todos, "phase_number": 3, "is_strategic_phase": False}
+        )
+        shown = ToolMessage(
+            content=f"Completed: x\n\n{managers['todo'].format_for_injection()}",
+            tool_call_id="c1",
+            name="todo_complete",
+        )
+        node = create_restore_todo_state_node(managers["todo"])
+
+        result = node(
+            {
+                "job_id": "test-123",
+                "phase_number": 3,
+                "is_strategic_phase": False,
+                "todos": todos,
+                "staged_todos": [],
+                "todo_next_id": 2,
+                "messages": [shown],
+            }
+        )
+
+        assert "messages" not in result
 
     def test_restores_staged_todos_with_active_todos(self, managers):
         """Test that staged todos are preserved when active todos also exist.
@@ -762,7 +812,11 @@ class TestRestoreTodoStateNode:
 
         result = node(state)
 
-        # Should clear stop flags but not trigger phase-boundary resume
+        # Should clear stop flags but not trigger phase-boundary resume (the
+        # active list is restated: the history does not show it)
+        (restated,) = result.pop("messages")
+        assert "Active Task" in restated.content
+        assert "Staged Task" not in restated.content
         assert result == {"should_stop": False, "goal_achieved": False}
         # Staged todos should remain staged
         assert managers["todo"].has_staged_todos()
@@ -928,14 +982,9 @@ class TestArchivePhaseNode:
             AIMessage,
             HumanMessage,
             RemoveMessage,
-            SystemMessage,
         )
 
-        from agent.core.context import (
-            ContextConfig,
-            ContextManager,
-            ConversationSummary,
-        )
+        from agent.core.context import ContextConfig, ContextManager
         from shared.runtime.core.message_markers import (
             PROTECTED_KEY,
             is_protected_message,
@@ -959,29 +1008,17 @@ class TestArchivePhaseNode:
                 message_count_threshold=1000,
                 message_count_min_tokens=100,
                 keep_recent_messages=2,
-                keep_recent_tool_results=2,
                 model_max_context_tokens=4000,
             )
         )
         context_mgr.set_current_phase("tactical", phase_key="2:tactical")
 
-        parsed = ConversationSummary(
-            summary="Phase 2 work.",
-            tasks_completed="- Task 1",
-            key_decisions="",
-            current_state="phase ended",
-            blockers="",
-        )
-        structured = AsyncMock()
-        structured.ainvoke = AsyncMock(
-            return_value={
-                "raw": AIMessage(content="s"),
-                "parsed": parsed,
-                "parsing_error": None,
-            }
-        )
         aux_llm = MagicMock()
-        aux_llm.with_structured_output = MagicMock(return_value=structured)
+        aux_llm.ainvoke = AsyncMock(
+            return_value=AIMessage(
+                content="## Objective\n- Phase 2 work.\n\n## Work State\n- Task 1"
+            )
+        )
         auxiliary = AuxiliaryLLM(llm=aux_llm, max_context_tokens=15_000)
 
         block = create_phase_instruction_message(
@@ -1038,11 +1075,7 @@ class TestArchivePhaseNode:
         )
         assert not any("TACTICAL GUIDANCE" in str(m.content) for m in kept)
         # ...while the generic pin is re-seated right after the summary.
-        summary_idx = next(
-            i
-            for i, m in enumerate(kept)
-            if isinstance(m, SystemMessage) and "[Summary of prior work]" in m.content
-        )
+        summary_idx = next(i for i, m in enumerate(kept) if is_compaction_summary(m))
         assert kept[summary_idx + 1].content == "GENERIC PIN"
         assert is_protected_message(kept[summary_idx + 1])
         assert kept[summary_idx + 1].id is None
@@ -2238,23 +2271,10 @@ class TestEnsureWithinLimits:
         from langchain_core.messages import AIMessage
 
         llm = MagicMock()
-        # with_structured_output(include_raw=True) returns dict with raw/parsed/parsing_error
-        parsed = MagicMock(
-            summary="Test summary",
-            tasks_completed="- Task 1",
-            key_decisions="- Decision 1",
-            current_state="In progress",
-            blockers="",
+        # Text mode: the model writes the Markdown checkpoint itself.
+        llm.ainvoke = AsyncMock(
+            return_value=AIMessage(content="## Objective\n- Test summary")
         )
-        structured_llm = MagicMock()
-        structured_llm.ainvoke = AsyncMock(
-            return_value={
-                "raw": AIMessage(content="structured output"),
-                "parsed": parsed,
-                "parsing_error": None,
-            }
-        )
-        llm.with_structured_output = MagicMock(return_value=structured_llm)
         return AuxiliaryLLM(llm=llm)
 
     @pytest.mark.asyncio

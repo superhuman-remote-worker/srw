@@ -1,0 +1,113 @@
+@use '../../../styles/variables' as v;
+@use '../../../styles/shape-recipes' as shape;
+
+:host {
+  display: block;
+
+  @include shape.surface;
+
+  border: 1px solid var(--border-hairline);
+  background: var(--panel-bg);
+  color: var(--text-primary);
+  overflow: hidden;
+}
+
+.expander-heading {
+  margin: 0;
+  font: inherit;
+}
+
+.expander-trigger {
+  display: flex;
+  align-items: flex-start;
+  gap: v.$space-12;
+  width: 100%;
+  min-height: 44px;
+  padding: v.$space-md v.$space-md;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+
+  &:hover {
+    background: var(--hover);
+  }
+
+  &:focus-visible {
+    outline: none;
+    box-shadow: inset 0 0 0 3px var(--ring);
+  }
+}
+
+.expander-icon {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 2.25rem;
+  height: 2.25rem;
+  border-radius: var(--radius-full);
+  background: color-mix(in srgb, var(--accent-color) 12%, transparent);
+  color: var(--accent-color);
+}
+
+.expander-text {
+  flex: 1 1 auto;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.expander-title-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: v.$space-xs v.$space-sm;
+}
+
+.expander-title {
+  font-size: 1.0625rem;
+  font-weight: 600;
+  line-height: 1.3;
+}
+
+.expander-question {
+  font-size: v.$font-size-control;
+  color: var(--text-muted);
+}
+
+.expander-summary {
+  font-size: v.$font-size-sm;
+  color: var(--text-secondary);
+  overflow-wrap: anywhere;
+}
+
+.expander-chevron {
+  flex: 0 0 auto;
+  display: inline-flex;
+  margin-top: 0.4rem;
+  color: var(--text-secondary);
+  transition: transform 0.15s ease;
+}
+
+:host([data-expanded]) .expander-chevron {
+  transform: rotate(180deg);
+}
+
+.expander-body {
+  padding: v.$space-md;
+  border-top: 1px solid var(--border-hairline);
+
+  &[hidden] {
+    display: none;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .expander-chevron {
+    transition: none;
+  }
+}

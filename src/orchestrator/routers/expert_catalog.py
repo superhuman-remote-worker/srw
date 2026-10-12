@@ -356,9 +356,11 @@ async def reload_skills(request: Request, *, deps: CatalogDeps) -> dict[str, Any
 async def get_skill(
     request: Request, skill_id: str, *, deps: CatalogDeps
 ) -> dict[str, Any]:
-    """Full skill detail (metadata + file tree). DB skill by UUID, else bundled."""
-    await deps.require_approved_user(request)
-    return await deps.catalog.get_skill(skill_id=skill_id)
+    """Full skill detail (metadata + file tree). DB skill by UUID, else bundled.
+    A DB skill the caller may not see (not owned, not global, caller not admin)
+    is 404, like a missing one."""
+    user = await deps.require_approved_user(request)
+    return await deps.catalog.get_skill(skill_id=skill_id, user=user)
 
 
 @router.put("/api/skills/{skill_id}")
@@ -399,8 +401,8 @@ async def export_skill(
 ) -> Response:
     """Serialize a skill to a native zipped directory (drops into .claude/skills)."""
     deps.catalog.require_skills_db()
-    await deps.require_approved_user(request)
-    archive = await deps.authoring.export_skill(skill_id=skill_id)
+    user = await deps.require_approved_user(request)
+    archive = await deps.authoring.export_skill(skill_id=skill_id, user=user)
     return Response(
         content=archive.content,
         media_type="application/zip",

@@ -13,6 +13,7 @@ import yaml
 from .errors import fail, pointer
 from .parsing import ManifestLoader
 from .validation import API_VERSION, MAX_NODES, check_json_value, validate_documents
+from .workspace_defaults import project_workspace_defaults
 
 _RESOURCE_MAPS = {
     "experts": "Expert",
@@ -161,6 +162,17 @@ class _Bundle:
                 kind, deepcopy(selection["inline"]), scope, number, (*path, "inline")
             )
             return {"inline": spec}
+        if "access" in selection:
+            # A Session's create request chooses a connector's level; a
+            # manifest execution binds at the link's level, and says so
+            # rather than drop the field.
+            fail(
+                "UnsupportedField",
+                "A connector's access level is chosen by a Session's create "
+                "request; this execution binds it at its project link's level.",
+                document=number,
+                path=pointer((*path, "access")),
+            )
         ref = selection["ref"]
         target_scope = ref.get("scope", scope)
         key = _key(kind, target_scope, ref["name"])
@@ -234,6 +246,39 @@ class _Bundle:
                         )
         elif kind == "WorkspaceTemplate":
             spec.setdefault("retention", "Delete")
+            resources = spec.get("resources", {})
+            requests = resources.get("requests", {})
+            if requests and spec["backend"] != "sandbox":
+                fail(
+                    "UnsupportedWorkspace",
+                    "Only container workspaces support resources.requests.",
+                    document=number,
+                    path=pointer((*path, "resources", "requests")),
+                )
+            for field in ("cpu", "memory"):
+                if field not in requests:
+                    continue
+                request_path = (*path, "resources", "requests", field)
+                if field not in resources:
+                    fail(
+                        "InvalidResources",
+                        "A resource request needs its maximum in the same template.",
+                        document=number,
+                        path=pointer(request_path),
+                    )
+                request, limit = requests[field], resources[field]
+                if field == "memory":
+                    request = _quantity(request, number=number, path=request_path)
+                    limit = _quantity(
+                        limit, number=number, path=(*path, "resources", field)
+                    )
+                if request > limit:
+                    fail(
+                        "InvalidResources",
+                        "Resource request exceeds its limit.",
+                        document=number,
+                        path=pointer(request_path),
+                    )
             if spec["backend"] == "virtual" and (
                 spec.get("environment")
                 or spec.get("initialize")
@@ -276,6 +321,15 @@ class _Bundle:
         policy = spec.get("team", {}).get("jobPolicy")
         if policy is not None:
             policy.setdefault("retry", {"maxAttempts": 1})
+        try:
+            project_workspace_defaults(spec)
+        except ValueError as exc:
+            fail(
+                "WorkspaceDefaultBackendMismatch",
+                str(exc),
+                document=number,
+                path=pointer((*path, "defaults", "workspace")),
+            )
 
     def _job(self, spec, scope, number, path):
         execution = spec["execution"]
@@ -285,31 +339,24 @@ class _Bundle:
         if (
             scope["kind"] == "Project"
             and project is None
-            and any(
-                field not in execution
-                for field in ("expert", "workspace", "connectors")
-            )
+            and any(field not in execution for field in ("expert", "connectors"))
         ):
             fail(
                 "UnresolvedProjectDefaults",
-                "Supply the Project definition or explicitly select expert, workspace and connectors.",
+                "Supply the Project definition or explicitly select expert and connectors.",
                 document=number,
                 path=pointer((*path, "execution")),
             )
         defaults = project["spec"].get("defaults", {}) if project else {}
         resources = project["spec"]["resources"] if project else {}
-        for field in ("expert", "workspace", "connectors"):
+        # An omitted workspace stays omitted: admission resolves the workspace
+        # defaults chain (Project row, installation, built-in) for it.
+        for field in ("expert", "connectors"):
             if field in execution or field not in defaults:
                 continue
             value = defaults[field]
             if field == "expert":
                 execution[field] = resources["experts"][value]
-            elif field == "workspace":
-                execution[field] = (
-                    None
-                    if value is None
-                    else {"template": resources["workspaces"][value]}
-                )
             else:
                 execution[field] = {
                     alias: resources["connectors"][alias] for alias in value
@@ -331,8 +378,7 @@ class _Bundle:
         execution["expert"] = self._selection(
             "Expert", execution["expert"], scope, number, (*path, "execution", "expert")
         )
-        execution.setdefault("workspace", None)
-        workspace = execution["workspace"]
+        workspace = execution.get("workspace")
         if workspace is not None and "template" in workspace:
             workspace["template"] = self._selection(
                 "WorkspaceTemplate",

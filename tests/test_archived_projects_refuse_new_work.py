@@ -85,7 +85,10 @@ def _patch_caller_and_db(user: dict, db):
     """Stack the patches every endpoint test needs (see test_project_access)."""
     stack = ExitStack()
     stack.enter_context(
-        patch("orchestrator.main.require_approved_user", AsyncMock(return_value=user))
+        patch(
+            "orchestrator.security.auth.require_approved_user",
+            AsyncMock(return_value=user),
+        )
     )
     stack.enter_context(
         patch(
@@ -93,7 +96,7 @@ def _patch_caller_and_db(user: dict, db):
             AsyncMock(return_value=user),
         )
     )
-    stack.enter_context(patch("orchestrator.main.postgres_db", db))
+    stack.enter_context(patch("orchestrator.main.app.state.resources.postgres_db", db))
     return stack
 
 
@@ -228,7 +231,7 @@ class TestCreateJobRefusesArchivedProjects:
     ):
         """This is the path that matters: MCP and agent delegation live here,
         and they skip ``require_project_member`` entirely."""
-        from orchestrator.main import JobCreate
+        from orchestrator.schemas.job_create import JobCreate
         from tests._b09_control_seams import create_job
 
         fake_request.headers = {
@@ -241,17 +244,17 @@ class TestCreateJobRefusesArchivedProjects:
 
         with (
             patch.object(access_module, "_INTERNAL_KEY", "secret"),
-            patch("orchestrator.main.postgres_db", fake_db),
+            patch("orchestrator.main.app.state.resources.postgres_db", fake_db),
             patch(
-                "orchestrator.main.require_approved_user",
+                "orchestrator.security.auth.require_approved_user",
                 AsyncMock(return_value=user_a),
             ),
             patch(
-                "orchestrator.main._enforce_readiness_gate",
+                "orchestrator.application.access.enforce_readiness_gate",
                 AsyncMock(return_value=None),
             ),
             patch(
-                "orchestrator.main.require_project_member",
+                "orchestrator.security.access.require_project_member",
                 AsyncMock(side_effect=AssertionError("the guard is skipped here")),
             ),
             pytest.raises(HTTPException) as exc,
@@ -266,7 +269,7 @@ class TestCreateJobRefusesArchivedProjects:
     async def test_cockpit_caller_gets_the_same_refusal(
         self, user_a, archived, fake_db, fake_request
     ):
-        from orchestrator.main import JobCreate
+        from orchestrator.schemas.job_create import JobCreate
         from tests._b09_control_seams import create_job
 
         fake_request.headers = {}
@@ -276,9 +279,9 @@ class TestCreateJobRefusesArchivedProjects:
 
         with (
             patch.object(access_module, "_INTERNAL_KEY", "secret"),
-            patch("orchestrator.main.postgres_db", fake_db),
+            patch("orchestrator.main.app.state.resources.postgres_db", fake_db),
             patch(
-                "orchestrator.main.require_approved_user",
+                "orchestrator.security.auth.require_approved_user",
                 AsyncMock(return_value=user_a),
             ),
             patch(
@@ -286,7 +289,7 @@ class TestCreateJobRefusesArchivedProjects:
                 AsyncMock(return_value=user_a),
             ),
             patch(
-                "orchestrator.main._enforce_readiness_gate",
+                "orchestrator.application.access.enforce_readiness_gate",
                 AsyncMock(return_value=None),
             ),
             pytest.raises(HTTPException) as exc,
@@ -300,7 +303,7 @@ class TestCreateJobRefusesArchivedProjects:
     @pytest.mark.asyncio
     async def test_a_projectless_job_is_unaffected(self, user_a, fake_db, fake_request):
         """No project, no lifecycle question — and no extra DB round-trip."""
-        from orchestrator.main import JobCreate
+        from orchestrator.schemas.job_create import JobCreate
         from tests._b09_control_seams import create_job
 
         fake_request.headers = {}
@@ -322,15 +325,19 @@ class TestCreateJobRefusesArchivedProjects:
         body = JobCreate(description="personal job")
 
         with (
-            patch("orchestrator.main.postgres_db", fake_db),
+            patch("orchestrator.main.app.state.resources.postgres_db", fake_db),
             patch(
-                "orchestrator.main.require_approved_user", AsyncMock(return_value=user)
+                "orchestrator.security.auth.require_approved_user",
+                AsyncMock(return_value=user),
             ),
             patch(
-                "orchestrator.main._enforce_readiness_gate",
+                "orchestrator.application.access.enforce_readiness_gate",
                 AsyncMock(return_value=None),
             ),
-            patch("orchestrator.main._is_experts_db_enabled", lambda: False),
+            patch(
+                "orchestrator.services.deployment_gates.is_experts_db_enabled",
+                lambda: False,
+            ),
         ):
             await create_job(fake_request, body)
 
@@ -543,7 +550,7 @@ class TestAgentSubjobFromAThreadOnAnArchivedProject:
     async def test_the_archived_409_is_not_flattened_into_the_generic_403(
         self, user_a, archived, fake_db, fake_request, thread_a
     ):
-        from orchestrator.main import JobCreate
+        from orchestrator.schemas.job_create import JobCreate
         from tests._b09_control_seams import create_job
 
         fake_request.headers = {"X-Internal-Key": "secret"}
@@ -557,13 +564,13 @@ class TestAgentSubjobFromAThreadOnAnArchivedProject:
 
         with (
             patch.object(access_module, "_INTERNAL_KEY", "secret"),
-            patch("orchestrator.main.postgres_db", fake_db),
+            patch("orchestrator.main.app.state.resources.postgres_db", fake_db),
             patch(
-                "orchestrator.main._enforce_readiness_gate",
+                "orchestrator.application.access.enforce_readiness_gate",
                 AsyncMock(return_value=None),
             ),
             patch(
-                "orchestrator.main._thread_project_ids",
+                "orchestrator.services.thread_mount_rows.thread_project_ids",
                 AsyncMock(return_value=[str(archived["id"])]),
             ),
             pytest.raises(HTTPException) as exc,
@@ -579,7 +586,7 @@ class TestAgentSubjobFromAThreadOnAnArchivedProject:
         self, fake_db, fake_request
     ):
         """The non-disclosure the wrapper exists for must survive intact."""
-        from orchestrator.main import JobCreate
+        from orchestrator.schemas.job_create import JobCreate
         from tests._b09_control_seams import create_job
 
         fake_request.headers = {"X-Internal-Key": "secret"}
@@ -587,9 +594,9 @@ class TestAgentSubjobFromAThreadOnAnArchivedProject:
 
         with (
             patch.object(access_module, "_INTERNAL_KEY", "secret"),
-            patch("orchestrator.main.postgres_db", fake_db),
+            patch("orchestrator.main.app.state.resources.postgres_db", fake_db),
             patch(
-                "orchestrator.main._enforce_readiness_gate",
+                "orchestrator.application.access.enforce_readiness_gate",
                 AsyncMock(return_value=None),
             ),
             pytest.raises(HTTPException) as exc,

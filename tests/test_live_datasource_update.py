@@ -23,7 +23,7 @@ core (redacted response, connected-session 409 gate), and the
 
 import json
 import uuid
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, contextmanager
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -35,6 +35,14 @@ import pytest
 # they steered before.
 from orchestrator.services import thread_config_update  # noqa: E402
 from fastapi import HTTPException
+from orchestrator.application import sessions as sessions_composition
+from orchestrator.schemas import thread_config as thread_config_module
+from orchestrator.security import access as access_module
+from orchestrator.services import dispatch_credentials as dispatch_credentials_module
+from orchestrator.services import grant_enforcement as grant_enforcement_module
+from orchestrator.services import thread_config_update as thread_config_update_module
+from orchestrator.services import thread_mount_rows as thread_mount_rows_module
+import fastapi as fastapi_module
 
 THREAD_ID = "11111111-2222-3333-4444-555555555555"
 USER_ID = "aaaaaaaa-1111-4111-8111-111111111111"
@@ -141,7 +149,9 @@ class TestSetThreadDatasourceIds:
         assert patch["datasource_ids"] == []
         assert patch["datasource_selection"]["policy_revisions"] == {}
         conn.fetch.assert_awaited_once()
-        assert "d.type = 'credentials'" in conn.fetch.await_args.args[0]
+        # The detach lock is the specs' live_detach="refused" set: credentials.
+        assert "d.type = ANY($3::text[])" in conn.fetch.await_args.args[0]
+        assert conn.fetch.await_args.args[3] == ["credentials"]
         assert db._test_datasource_lock_keys
         conn.transaction.assert_called_once()
 
@@ -290,21 +300,33 @@ def patched_main(monkeypatch):
         )
 
     db.thread_configuration_transaction = transaction_scope
+
+    @asynccontextmanager
+    async def acquire():
+        # A live detach revokes any lease of every removed connector (a git
+        # swap repository's included): none here.
+        yield SimpleNamespace(fetch=AsyncMock(return_value=[]))
+
+    db.acquire = acquire
     db.refresh_session_execution = AsyncMock(
         side_effect=lambda _thread_id, *, conn, config_override: {
             "delivery_override": config_override
         }
     )
-    monkeypatch.setattr(main, "postgres_db", db)
-    monkeypatch.setattr(main, "require_internal", AsyncMock())
-    monkeypatch.setattr(main, "_thread_project_ids", AsyncMock(return_value=[]))
+    monkeypatch.setattr(main.app.state.resources, "postgres_db", db)
+    monkeypatch.setattr(access_module, "require_internal", AsyncMock())
+    monkeypatch.setattr(
+        thread_mount_rows_module, "thread_project_ids", AsyncMock(return_value=[])
+    )
     grants = AsyncMock()
-    monkeypatch.setattr(main, "_enforce_session_create_grants", grants)
+    monkeypatch.setattr(
+        grant_enforcement_module, "enforce_session_create_grants", grants
+    )
     return main, db, grants
 
 
 def _body(main, config_override=None, datasource_ids=None):
-    return main.AgentThreadConfigUpdateRequest(
+    return thread_config_module.AgentThreadConfigUpdateRequest(
         config_override=config_override or {}, datasource_ids=datasource_ids
     )
 
@@ -317,12 +339,14 @@ class TestAgentPatchDatasourceIds:
         db.get_thread.return_value = _thread_row(
             metadata_extra={"datasource_ids": [DATASOURCE_A_ID]}
         )
-        with pytest.raises(main.HTTPException) as caught:
+        with pytest.raises(fastapi_module.HTTPException) as caught:
             await thread_config_update.agent_update_thread_config(
                 MagicMock(),
                 THREAD_ID,
                 _body(main, datasource_ids=[]),
-                dependencies=main._thread_config_update_dependencies(),
+                dependencies=sessions_composition.thread_config_update_dependencies(
+                    main.app.state.resources
+                ),
             )
         assert caught.value.status_code == 409
         assert "stay attached" in caught.value.detail
@@ -342,15 +366,17 @@ class TestAgentPatchDatasourceIds:
             "is_global": True,
         }
 
-        with pytest.raises(main.HTTPException) as exc:
+        with pytest.raises(fastapi_module.HTTPException) as exc:
             await thread_config_update.agent_update_thread_config(
                 MagicMock(),
                 THREAD_ID,
                 _body(main, datasource_ids=[REPOSITORY_ID]),
-                dependencies=main._thread_config_update_dependencies(),
+                dependencies=sessions_composition.thread_config_update_dependencies(
+                    main.app.state.resources
+                ),
             )
         assert exc.value.status_code == 400
-        assert "repository" in exc.value.detail.lower()
+        assert "repositories" in exc.value.detail.lower()
         db.set_thread_datasource_ids.assert_not_awaited()
 
     @pytest.mark.asyncio
@@ -364,7 +390,9 @@ class TestAgentPatchDatasourceIds:
             MagicMock(),
             THREAD_ID,
             _body(main, datasource_ids=[DATASOURCE_A_ID]),
-            dependencies=main._thread_config_update_dependencies(),
+            dependencies=sessions_composition.thread_config_update_dependencies(
+                main.app.state.resources
+            ),
         )
 
         fragment = grants.await_args.args[0]
@@ -381,14 +409,18 @@ class TestAgentPatchDatasourceIds:
     @pytest.mark.asyncio
     async def test_grant_denial_prevents_persist(self, patched_main):
         main, db, grants = patched_main
-        grants.side_effect = main.HTTPException(status_code=422, detail="denied")
+        grants.side_effect = fastapi_module.HTTPException(
+            status_code=422, detail="denied"
+        )
 
-        with pytest.raises(main.HTTPException) as exc:
+        with pytest.raises(fastapi_module.HTTPException) as exc:
             await thread_config_update.agent_update_thread_config(
                 MagicMock(),
                 THREAD_ID,
                 _body(main, datasource_ids=[DATASOURCE_A_ID]),
-                dependencies=main._thread_config_update_dependencies(),
+                dependencies=sessions_composition.thread_config_update_dependencies(
+                    main.app.state.resources
+                ),
             )
         assert exc.value.status_code == 422
         db.set_thread_datasource_ids.assert_not_awaited()
@@ -409,7 +441,9 @@ class TestAgentPatchDatasourceIds:
                 MagicMock(),
                 THREAD_ID,
                 _body(main, datasource_ids=[DATASOURCE_A_ID]),
-                dependencies=main._thread_config_update_dependencies(),
+                dependencies=sessions_composition.thread_config_update_dependencies(
+                    main.app.state.resources
+                ),
             )
 
         assert exc.value.status_code == 409
@@ -426,7 +460,9 @@ class TestAgentPatchDatasourceIds:
             MagicMock(),
             THREAD_ID,
             _body(main, datasource_ids=[DATASOURCE_A_ID]),
-            dependencies=main._thread_config_update_dependencies(),
+            dependencies=sessions_composition.thread_config_update_dependencies(
+                main.app.state.resources
+            ),
         )
 
         merged = db.merge_thread_config_override.await_args.args[1]
@@ -446,7 +482,9 @@ class TestAgentPatchDatasourceIds:
                 MagicMock(),
                 THREAD_ID,
                 _body(main, datasource_ids=[DATASOURCE_A_ID]),
-                dependencies=main._thread_config_update_dependencies(),
+                dependencies=sessions_composition.thread_config_update_dependencies(
+                    main.app.state.resources
+                ),
             )
 
         assert exc.value.status_code == 403
@@ -467,7 +505,9 @@ class TestAgentPatchDatasourceIds:
             MagicMock(),
             THREAD_ID,
             _body(main, datasource_ids=[DATASOURCE_A_ID]),
-            dependencies=main._thread_config_update_dependencies(),
+            dependencies=sessions_composition.thread_config_update_dependencies(
+                main.app.state.resources
+            ),
         )
 
         grants.assert_not_awaited()
@@ -484,7 +524,9 @@ class TestAgentPatchDatasourceIds:
             MagicMock(),
             THREAD_ID,
             _body(main, config_override={"llm": {"temperature": 0.5}}),
-            dependencies=main._thread_config_update_dependencies(),
+            dependencies=sessions_composition.thread_config_update_dependencies(
+                main.app.state.resources
+            ),
         )
 
         db.set_thread_datasource_ids.assert_not_awaited()
@@ -498,7 +540,9 @@ class TestAgentPatchDatasourceIds:
             MagicMock(),
             THREAD_ID,
             _body(main, datasource_ids=[]),
-            dependencies=main._thread_config_update_dependencies(),
+            dependencies=sessions_composition.thread_config_update_dependencies(
+                main.app.state.resources
+            ),
         )
 
         persisted = db.set_thread_datasource_ids.await_args
@@ -520,19 +564,22 @@ def patched_owner(patched_main, monkeypatch):
     require_owner = AsyncMock(
         side_effect=lambda request, _db, tid: (owner_user, db.get_thread.return_value)
     )
-    monkeypatch.setattr(main, "require_thread_owner", require_owner)
+    monkeypatch.setattr(access_module, "require_thread_owner", require_owner)
 
-    async def fake_inject(*, section, model_id, user_id, resolved_keys):
+    async def fake_inject(*, section, model_id, user_id, resolved_keys, dependencies):
         # Enrichment resolves transport; the api_key is the secret that must
-        # never reach the browser-facing response.
+        # never reach the browser-facing response. R1.B12: the composition
+        # binds this owner, so the call also carries its ``dependencies``.
         section["api_key"] = "sk-secret"
 
-    monkeypatch.setattr(main, "_inject_model_credentials", fake_inject)
+    monkeypatch.setattr(
+        dispatch_credentials_module, "inject_model_credentials", fake_inject
+    )
     return main, db, require_owner
 
 
 def _patch_body(main, config_override=None, datasource_ids=None):
-    return main.ThreadConfigPatchRequest(
+    return thread_config_module.ThreadConfigPatchRequest(
         config_override=config_override or {}, datasource_ids=datasource_ids
     )
 
@@ -545,12 +592,14 @@ class TestOwnerConfigPatch:
         row.update(agent_id="agent-1", status="active")
         db.get_thread.return_value = row
 
-        with pytest.raises(main.HTTPException) as exc:
+        with pytest.raises(fastapi_module.HTTPException) as exc:
             await thread_config_update.update_thread_config(
                 THREAD_ID,
                 _patch_body(main, {"llm": {"temperature": 0.2}}),
                 MagicMock(),
-                dependencies=main._thread_config_update_dependencies(),
+                dependencies=sessions_composition.thread_config_update_dependencies(
+                    main.app.state.resources
+                ),
             )
         assert exc.value.status_code == 409
         db.merge_thread_config_override.assert_not_awaited()
@@ -569,7 +618,9 @@ class TestOwnerConfigPatch:
             THREAD_ID,
             _patch_body(main, {"llm": {"temperature": 0.2}}),
             MagicMock(),
-            dependencies=main._thread_config_update_dependencies(),
+            dependencies=sessions_composition.thread_config_update_dependencies(
+                main.app.state.resources
+            ),
         )
         assert result["status"] == "updated"
         assert result["effective"] == "next_attach"
@@ -592,7 +643,9 @@ class TestOwnerConfigPatch:
             THREAD_ID,
             _patch_body(main, {"llm": {"reasoning_level": "max"}}),
             MagicMock(),
-            dependencies=main._thread_config_update_dependencies(),
+            dependencies=sessions_composition.thread_config_update_dependencies(
+                main.app.state.resources
+            ),
         )
         assert result["status"] == "updated"
         assert result["effective"] == "next_turn"
@@ -621,19 +674,23 @@ class TestOwnerConfigPatch:
                 },
             ),
             MagicMock(),
-            dependencies=main._thread_config_update_dependencies(),
+            dependencies=sessions_composition.thread_config_update_dependencies(
+                main.app.state.resources
+            ),
         )
         assert result["config_override"]["delegation"] == {"enabled": True}
         merged = db.merge_thread_config_override.await_args.args[1]
         assert merged["delegation"] == {"enabled": True}
         assert merged["tools"]["delegation"] == ["delegate_agent"]
 
-        with pytest.raises(main.HTTPException) as exc:
+        with pytest.raises(fastapi_module.HTTPException) as exc:
             await thread_config_update.update_thread_config(
                 THREAD_ID,
                 _patch_body(main, {"delegation": {"enabled": "yes"}}),
                 MagicMock(),
-                dependencies=main._thread_config_update_dependencies(),
+                dependencies=sessions_composition.thread_config_update_dependencies(
+                    main.app.state.resources
+                ),
             )
         assert exc.value.status_code == 400
 
@@ -651,7 +708,9 @@ class TestOwnerConfigPatch:
             THREAD_ID,
             _patch_body(main, {"llm": {"model": "minimax-m3"}}),
             MagicMock(),
-            dependencies=main._thread_config_update_dependencies(),
+            dependencies=sessions_composition.thread_config_update_dependencies(
+                main.app.state.resources
+            ),
         )
 
         assert "api_key" not in result["config_override"]["llm"]
@@ -674,12 +733,14 @@ class TestOwnerConfigPatch:
             "is_global": True,
         }
 
-        with pytest.raises(main.HTTPException) as exc:
+        with pytest.raises(fastapi_module.HTTPException) as exc:
             await thread_config_update.update_thread_config(
                 THREAD_ID,
                 _patch_body(main, datasource_ids=[REPOSITORY_ID]),
                 MagicMock(),
-                dependencies=main._thread_config_update_dependencies(),
+                dependencies=sessions_composition.thread_config_update_dependencies(
+                    main.app.state.resources
+                ),
             )
         assert exc.value.status_code == 400
         db.set_thread_datasource_ids.assert_not_awaited()
@@ -692,7 +753,9 @@ class TestOwnerConfigPatch:
             THREAD_ID,
             _patch_body(main, datasource_ids=[DATASOURCE_A_ID]),
             MagicMock(),
-            dependencies=main._thread_config_update_dependencies(),
+            dependencies=sessions_composition.thread_config_update_dependencies(
+                main.app.state.resources
+            ),
         )
         persisted = db.set_thread_datasource_ids.await_args
         assert persisted.args == (THREAD_ID, [DATASOURCE_A_ID])
@@ -702,12 +765,14 @@ class TestOwnerConfigPatch:
     @pytest.mark.asyncio
     async def test_empty_body_rejected(self, patched_owner):
         main, db, _ = patched_owner
-        with pytest.raises(main.HTTPException) as exc:
+        with pytest.raises(fastapi_module.HTTPException) as exc:
             await thread_config_update.update_thread_config(
                 THREAD_ID,
                 _patch_body(main),
                 MagicMock(),
-                dependencies=main._thread_config_update_dependencies(),
+                dependencies=sessions_composition.thread_config_update_dependencies(
+                    main.app.state.resources
+                ),
             )
         assert exc.value.status_code == 400
         db.merge_thread_config_override.assert_not_awaited()
@@ -715,16 +780,18 @@ class TestOwnerConfigPatch:
     @pytest.mark.asyncio
     async def test_owner_denial_propagates_before_any_write(self, patched_owner):
         main, db, require_owner = patched_owner
-        require_owner.side_effect = main.HTTPException(
+        require_owner.side_effect = fastapi_module.HTTPException(
             status_code=403, detail="Not your thread"
         )
 
-        with pytest.raises(main.HTTPException) as exc:
+        with pytest.raises(fastapi_module.HTTPException) as exc:
             await thread_config_update.update_thread_config(
                 THREAD_ID,
                 _patch_body(main, {"llm": {"temperature": 0.1}}),
                 MagicMock(),
-                dependencies=main._thread_config_update_dependencies(),
+                dependencies=sessions_composition.thread_config_update_dependencies(
+                    main.app.state.resources
+                ),
             )
         assert exc.value.status_code == 403
         db.merge_thread_config_override.assert_not_awaited()
@@ -743,7 +810,9 @@ class TestConfigChangeAudit:
                 datasource_ids=[DATASOURCE_A_ID],
             ),
             MagicMock(),
-            dependencies=main._thread_config_update_dependencies(),
+            dependencies=sessions_composition.thread_config_update_dependencies(
+                main.app.state.resources
+            ),
         )
 
         kwargs = db.record_security_event.await_args.kwargs
@@ -765,7 +834,9 @@ class TestConfigChangeAudit:
             MagicMock(),
             THREAD_ID,
             _body(main, config_override={"llm": {"temperature": 0.4}}),
-            dependencies=main._thread_config_update_dependencies(),
+            dependencies=sessions_composition.thread_config_update_dependencies(
+                main.app.state.resources
+            ),
         )
 
         kwargs = db.record_security_event.await_args.kwargs
@@ -776,37 +847,63 @@ class TestConfigChangeAudit:
     @pytest.mark.asyncio
     async def test_denied_update_records_no_config_audit(self, patched_main):
         main, db, grants = patched_main
-        grants.side_effect = main.HTTPException(status_code=422, detail="denied")
+        grants.side_effect = fastapi_module.HTTPException(
+            status_code=422, detail="denied"
+        )
 
-        with pytest.raises(main.HTTPException):
+        with pytest.raises(fastapi_module.HTTPException):
             await thread_config_update.agent_update_thread_config(
                 MagicMock(),
                 THREAD_ID,
                 _body(main, datasource_ids=[DATASOURCE_A_ID]),
-                dependencies=main._thread_config_update_dependencies(),
+                dependencies=sessions_composition.thread_config_update_dependencies(
+                    main.app.state.resources
+                ),
             )
         db.record_security_event.assert_not_awaited()
 
 
 class TestConfigChangeSummary:
     def test_flattens_one_level_and_counts_datasources(self):
-        import orchestrator.main as main
-
-        detail = main._config_change_summary(
+        detail = thread_config_update_module.config_change_summary(
             {"llm": {"model": "x", "temperature": 0.1}, "narration": "full"},
             ["a", "b"],
         )
         assert detail == "keys=llm.model,llm.temperature,narration datasource_ids=2"
 
     def test_empty_change(self):
-        import orchestrator.main as main
-
-        assert main._config_change_summary({}, None) == "empty"
+        assert thread_config_update_module.config_change_summary({}, None) == "empty"
 
 
 # ---------------------------------------------------------------------------
 # PersistentSession.resetup_datasources
 # ---------------------------------------------------------------------------
+
+
+@contextmanager
+def _harness(connections=None, clients=None):
+    """Stand in for the live harness rebuild: the managed-connection step
+    fills the fresh slots with these, and the MCP step constructs nothing
+    (an ``mcp`` slot here still gets discovered). Yields the entries each
+    managed-connection step received."""
+    seen = []
+
+    def _materialize(self, deliveries, rt):
+        seen.append([delivery.entry for delivery in deliveries])
+        rt.connections.update(connections or {})
+        rt.clients.update(clients or {})
+
+    with (
+        patch(
+            "agent.connectors.connections.ManagedConnectionMaterializer.materialize",
+            _materialize,
+        ),
+        patch(
+            "agent.connectors.mcp.McpClientMaterializer.materialize",
+            lambda self, deliveries, rt: None,
+        ),
+    ):
+        yield seen
 
 
 def _make_session(datasource_configs=None, datasources=None, clients=None):
@@ -858,10 +955,7 @@ class TestResetupDatasources:
             if tool.name == "email_send"
         )
 
-        with patch(
-            "agent.core.datasource_setup.process_datasources",
-            return_value=({}, {}, []),
-        ):
+        with _harness():
             await session.resetup_datasources([])
 
         result = bound_send.invoke(
@@ -887,21 +981,18 @@ class TestResetupDatasources:
             },
         }
 
-        with patch(
-            "agent.core.datasource_setup.process_datasources",
-            return_value=({}, {}, []),
-        ):
+        with _harness():
             await session.resetup_datasources([email])
         failed = session.tool_context.session_runtime_facts
         assert failed.attached_datasource_types == ("email",)
+        # What the capabilities ask: the spec's tool category, not the type.
+        assert failed.attached_tool_categories == ("email",)
+        assert failed.knowledge_index_attached is False
         assert failed.email_access_tier == "send"
         assert failed.email_connection_failed is True
 
         connection = SimpleNamespace(access="send", unattended_send=True)
-        with patch(
-            "agent.core.datasource_setup.process_datasources",
-            return_value=({"email": connection}, {}, []),
-        ):
+        with _harness({"email": connection}):
             await session.resetup_datasources([email])
         ready = session.tool_context.session_runtime_facts
         assert ready.attached_datasource_types == ("email",)
@@ -917,13 +1008,11 @@ class TestResetupDatasources:
         clamped = session.tool_context.session_runtime_facts
         assert clamped.email_access_tier == "read"
 
-        with patch(
-            "agent.core.datasource_setup.process_datasources",
-            return_value=({}, {}, []),
-        ):
+        with _harness():
             await session.resetup_datasources([])
         removed = session.tool_context.session_runtime_facts
         assert removed.attached_datasource_types == ()
+        assert removed.attached_tool_categories == ()
         assert removed.email_access_tier is None
         assert removed.email_connection_failed is False
         assert removed.email_direct_send_enabled is False
@@ -946,10 +1035,7 @@ class TestResetupDatasources:
         )
         registry_ref = session.datasources
         new_conn = MagicMock()
-        with patch(
-            "agent.core.datasource_setup.process_datasources",
-            return_value=({"webdav": new_conn}, {}, []),
-        ):
+        with _harness({"webdav": new_conn}):
             summary = await session.resetup_datasources([_ds("webdav", "Cloud")])
 
         assert session.datasources is registry_ref
@@ -965,16 +1051,13 @@ class TestResetupDatasources:
         """sql/graph/mongodb/webdav ride config.tools directly — the validated
         session tools override's closed vocabulary would drop them."""
         session = _make_session(datasource_configs=[_ds("postgresql", "PG")])
-        with patch(
-            "agent.core.datasource_setup.process_datasources",
-            return_value=({}, {}, []),
-        ):
+        with _harness():
             await session.resetup_datasources([_ds("webdav", "Cloud")])
 
         assert "webdav_write" in session.config.tools.webdav
         # Removed type stripped — stale sql tools must not survive.
         assert session.config.tools.sql == []
-        assert session.config.extra["_cli_datasources"] == []
+        assert "_cli_datasources" not in session.config.extra
         session.resetup_tools_for_backend.assert_called_once()
 
     @pytest.mark.asyncio
@@ -984,10 +1067,7 @@ class TestResetupDatasources:
         written)."""
         session = _make_session()
         session.config.tools.canvas = []  # user disabled Canvas live
-        with patch(
-            "agent.core.datasource_setup.process_datasources",
-            return_value=({}, {}, []),
-        ):
+        with _harness():
             await session.resetup_datasources([_ds("postgresql", "PG")])
 
         assert session.config.tools.canvas == []
@@ -997,10 +1077,7 @@ class TestResetupDatasources:
         session = _make_session(
             datasource_configs=[_ds("postgresql", "Keep"), _ds("webdav", "Drop")]
         )
-        with patch(
-            "agent.core.datasource_setup.process_datasources",
-            return_value=({}, {}, []),
-        ):
+        with _harness():
             summary = await session.resetup_datasources(
                 [_ds("postgresql", "Keep"), _ds("mongodb", "Add")]
             )
@@ -1011,15 +1088,12 @@ class TestResetupDatasources:
     @pytest.mark.asyncio
     async def test_kb_entries_skip_processing_and_flag_deferred(self):
         session = _make_session()
-        with patch(
-            "agent.core.datasource_setup.process_datasources",
-            return_value=({}, {}, []),
-        ) as process:
+        with _harness() as process:
             summary = await session.resetup_datasources(
                 [{"type": "kb", "name": "Docs KB", "datasource_id": "kb-1"}]
             )
 
-        assert process.call_args.args[0] == []  # kb never opens a connector
+        assert process == [[]]  # kb never opens a connector
         assert summary["kb_deferred"] is True
 
     @pytest.mark.asyncio
@@ -1027,10 +1101,7 @@ class TestResetupDatasources:
         session = _make_session(datasource_configs=[_ds("postgresql", "PG")])
         new_list = [_ds("postgresql", "PG"), {"type": "kb", "name": "KB"}]
         with (
-            patch(
-                "agent.core.datasource_setup.process_datasources",
-                return_value=({}, {}, []),
-            ),
+            _harness(),
             patch("agent.core.datasource_setup.inject_workspace_facts") as inject,
         ):
             await session.resetup_datasources(new_list)
@@ -1054,16 +1125,39 @@ class TestResetupDatasources:
         session = _make_session(datasource_configs=[repo_old])
         session.workspace_manager.source_repos = {"old-repo": MagicMock()}
         with (
-            patch(
-                "agent.core.datasource_setup.process_datasources",
-                return_value=({}, {}, []),
-            ),
-            patch("agent.core.datasource_setup.clone_repository_datasources") as clone,
+            _harness(),
+            patch("agent.connectors.checkout.clone_repository_datasources") as clone,
             patch("agent.core.datasource_setup.inject_workspace_facts"),
         ):
             await session.resetup_datasources([repo_new])
 
-        clone.assert_called_once_with([repo_new], session.workspace_manager)
+        [call] = clone.call_args_list
+        staged, cancel = call.args[1], call.kwargs["cancel"]
+        clone.assert_called_once_with(
+            [repo_new],
+            staged,
+            ssh_identity_status=session.workspace_ssh_identity_status,
+            # A live add sees only the added repositories: no key sweep.
+            legacy_key_files="own",
+            # Named over the full new list (C3 re-review S4).
+            clone_names=["new-repo"],
+            # Its git on a tab of its own, stoppable with the session.
+            shell_tab="srw-live-checkout",
+            cancel=cancel,
+        )
+        assert not cancel.is_set()
+        session.workspace_manager.backend.shell_ensure_tab.assert_called_once_with(
+            "srw-live-checkout"
+        )
+        session.workspace_manager.backend.shell_close_tab.assert_called_once_with(
+            "srw-live-checkout"
+        )
+        # It clones onto the session's workspace, into a staging registry
+        # that is swapped in once cloned (live_connector_add_clones_on_the_
+        # event_loop).
+        assert staged is not session.workspace_manager
+        assert staged.backend is session.workspace_manager.backend
+        assert staged.path is session.workspace_manager.path
         # Removal keeps the clone on disk (documented) but drops the
         # session-side registration.
         assert "old-repo" not in session.workspace_manager.source_repos
@@ -1087,11 +1181,8 @@ class TestResetupDatasources:
             "old-repo": {"forge": "gitea", "token": "sekrit"}
         }
         with (
-            patch(
-                "agent.core.datasource_setup.process_datasources",
-                return_value=({}, {}, []),
-            ),
-            patch("agent.core.datasource_setup.clone_repository_datasources"),
+            _harness(),
+            patch("agent.connectors.checkout.clone_repository_datasources"),
             patch("agent.core.datasource_setup.inject_workspace_facts"),
         ):
             await session.resetup_datasources([])
@@ -1108,10 +1199,7 @@ class TestResetupDatasources:
         manager.statuses = {"MCP": "connected"}
 
         with (
-            patch(
-                "agent.core.datasource_setup.process_datasources",
-                return_value=({"mcp": manager}, {}, []),
-            ),
+            _harness({"mcp": manager}),
             patch("agent.core.datasource_setup.inject_workspace_facts"),
             patch("agent.tools.registry.register_mcp_tools") as register,
         ):
@@ -1132,10 +1220,7 @@ class TestResetupDatasources:
         )
 
         with (
-            patch(
-                "agent.core.datasource_setup.process_datasources",
-                return_value=({}, {}, []),
-            ),
+            _harness(),
             patch("agent.core.datasource_setup.inject_workspace_facts"),
             patch("agent.tools.registry.register_mcp_tools") as register,
         ):
@@ -1150,9 +1235,79 @@ class TestResetupDatasources:
     async def test_noop_before_tool_setup(self):
         session = _make_session()
         session.tool_context = None
-        summary = await session.resetup_datasources([_ds("postgresql", "PG")])
+        identity = {"authority_id": "a", "private_key": "secret"}
+        summary = await session.resetup_datasources(
+            [_ds("postgresql", "PG")], workspace_ssh_identities=[identity]
+        )
         assert summary["added"] == []
+        assert "private_key" not in identity
         session.resetup_tools_for_backend.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_live_detach_retires_exactly_the_detached_ssh_identity(self):
+        """C1: a session owns its workspace, so detach retires that agent."""
+
+        def ssh(name, authority):
+            return {
+                **_ds("ssh_key", name),
+                "ssh_identity": {
+                    "alias": f"srw-repo-{authority}",
+                    "authority_id": authority,
+                },
+            }
+
+        kept, detached = ssh("Kept", "kept-id"), ssh("Detached", "detached-id")
+        session = _make_session(datasource_configs=[kept, detached])
+        session.workspace_ssh_identity_status = {
+            "kept-id": "ready",
+            "detached-id": "ready",
+        }
+        delivered = [{"authority_id": "kept-id", "private_key": "secret"}]
+        with (
+            _harness(),
+            patch("agent.core.datasource_setup.inject_workspace_facts"),
+            patch(
+                "shared.runtime.core.workspace_ssh_identity."
+                "retire_workspace_ssh_identities",
+                return_value=True,
+            ) as retire,
+            patch(
+                "shared.runtime.core.workspace_ssh_identity."
+                "materialize_workspace_ssh_identities",
+                return_value={"kept-id": "ready"},
+            ) as materialize,
+        ):
+            await session.resetup_datasources(
+                [kept], workspace_ssh_identities=delivered
+            )
+
+        retire.assert_called_once_with(
+            ["detached-id"], session.workspace_manager.backend
+        )
+        materialize.assert_called_once_with(
+            delivered, session.workspace_manager.backend
+        )
+        assert session.workspace_ssh_identity_status == {"kept-id": "ready"}
+
+    @pytest.mark.asyncio
+    async def test_rename_keeps_the_identity(self):
+        """Identity follows the connector id, not its (type, name) key."""
+        before = {
+            **_ds("ssh_key", "Old name"),
+            "ssh_identity": {"authority_id": "same-id"},
+        }
+        after = {**before, "name": "New name"}
+        session = _make_session(datasource_configs=[before])
+        with (
+            _harness(),
+            patch("agent.core.datasource_setup.inject_workspace_facts"),
+            patch(
+                "shared.runtime.core.workspace_ssh_identity."
+                "retire_workspace_ssh_identities"
+            ) as retire,
+        ):
+            await session.resetup_datasources([after])
+        retire.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
@@ -1218,3 +1373,51 @@ class TestWorkspaceFactsRewrite:
         assert "Gone" not in content
         assert "## Connectors" in content
         assert "_No connectors attached._" in content
+
+
+@pytest.mark.parametrize(
+    ("configs", "categories", "knowledge"),
+    [
+        ([], (), False),
+        (
+            [{"type": "kb", "name": "Notes", "datasource_id": "kb-1"}],
+            (),
+            True,
+        ),
+        (
+            [
+                _ds("postgresql", "PG"),
+                {"type": "email", "name": "Mail", "config": {"access": "read"}},
+                {"type": "mcp", "name": "Docs", "credentials": {"transport": "http"}},
+            ],
+            ("email", "mcp", "sql"),
+            False,
+        ),
+    ],
+    ids=["none", "knowledge index", "tool categories"],
+)
+def test_runtime_facts_carry_what_the_drivers_deliver(configs, categories, knowledge):
+    """The capabilities read the specs' tool categories and knowledge index."""
+    session = _make_session(datasource_configs=configs)
+    session._refresh_runtime_facts()
+    facts = session.tool_context.session_runtime_facts
+    assert facts.attached_tool_categories == categories
+    assert facts.knowledge_index_attached is knowledge
+
+
+def test_the_mailbox_tier_is_the_one_tool_binding_uses():
+    """email_effective_access, as datasource_tool_categories ranks it."""
+    session = _make_session(
+        datasource_configs=[
+            {"type": "email", "name": "A", "config": {"access": "read"}},
+            {"type": "email", "name": "B", "config": {"access": "draft"}},
+            {
+                "type": "email",
+                "name": "C",
+                "config": {"access": "send"},
+                "project_read_only": True,
+            },
+        ]
+    )
+    session._refresh_runtime_facts()
+    assert session.tool_context.session_runtime_facts.email_access_tier == "draft"

@@ -145,24 +145,12 @@ export type TierReachability =
   | 'ok'
   | 'downgrade'
   | 'needsApproval'
-  | 'unsupported';
+  | 'unsupported'
+  | 'sessionUnsupported';
 
 /** Deep-read a nested path from a config object. */
 export function readConfigPath(config: Record<string, unknown>, path: string): unknown {
   return path.split('.').reduce((obj: any, key) => obj?.[key], config) ?? null;
-}
-
-/** Deep-set a nested path on a config object, creating intermediate objects. */
-export function setConfigPath(obj: Record<string, unknown>, path: string, value: unknown): void {
-  const keys = path.split('.');
-  let current: any = obj;
-  for (let i = 0; i < keys.length - 1; i++) {
-    if (current[keys[i]] === undefined || typeof current[keys[i]] !== 'object') {
-      current[keys[i]] = {};
-    }
-    current = current[keys[i]];
-  }
-  current[keys[keys.length - 1]] = value;
 }
 
 /**
@@ -183,17 +171,23 @@ export function detectModelFamily(model: string): string {
   }
   if (name.startsWith('openai/')) name = name.slice('openai/'.length);
 
-  // Opus 5 before the generic Opus rule — mirrors family_of() in
-  // src/shared/runtime/core/model_registry.py (Opus 5 is the only Opus with
-  // the full xhigh/max effort ladder, so it has its own matrix family).
+  // Opus 5.5 before Opus 5, Opus 5 before the generic Opus rule — mirrors
+  // family_of() in src/shared/runtime/core/model_registry.py (Opus 5.x is the
+  // only Opus with the full xhigh/max effort ladder, and 5.5 moved the default
+  // effort, so each has its own matrix family). 5.5 matches the hyphen and
+  // OpenRouter's dotted form; the digit guard keeps dated Opus 5 ids on 5.
+  if (/^claude-opus-5[.-]5(?!\d)/.test(name)) return 'claude-opus-5-5';
   if (name.startsWith('claude-opus-5')) return 'claude-opus-5';
   if (name.startsWith('claude-opus')) return 'claude-opus';
+  // Sonnet 5 and 5.5 share one family (full effort ladder) — mirrors family_of().
+  if (name.startsWith('claude-sonnet-5')) return 'claude-sonnet-5';
   if (name.startsWith('claude-sonnet')) return 'claude-sonnet';
   if (name.startsWith('claude-haiku')) return 'claude-haiku';
   // Fable 5 and 5.1 share one family — mirrors family_of() on the server.
   if (name.startsWith('claude-fable')) return 'claude-fable';
   if (name.includes('codex-spark')) return 'codex-spark';
   if (name.includes('codex') && (name.startsWith('gpt-5') || name.startsWith('gpt-6'))) return 'codex';
+  if (/^gpt-6\.1-sol(?:$|[-:])/.test(name)) return 'gpt-6.1-sol';
   // GPT-6 (Astra). Mirrors family_of() in src/shared/runtime/core/model_registry.py:
   // below the codex checks, above the gpt-5 prefixes.
   if (name.startsWith('gpt-6')) return 'gpt-6';
@@ -206,11 +200,19 @@ export function detectModelFamily(model: string): string {
   if (name.includes('glm-5.3')) return 'glm-5.3';
   if (name.includes('glm')) return 'glm';
   if (/(?:^|\/)muse-spark-1\.3(?:$|[-:])/.test(name)) return 'muse-spark-1.3';
+  // K3 only; K2.x stays on default — mirrors family_of() on the server.
+  if (/(?:^|\/)kimi-k3(?![\w.])/.test(name)) return 'kimi-k3';
+  // Grok 4.7 only; older 4.x stays on default — mirrors family_of() on the server.
+  if (/(?:^|\/)grok-4\.7(?![\w.])/.test(name)) return 'grok-4.7';
   if (
     name.startsWith('mistral') || name.startsWith('codestral') || name.startsWith('magistral') ||
     name.startsWith('ministral') || name.startsWith('devstral') || name.startsWith('pixtral') ||
     name.startsWith('voxtral')
   ) return 'mistral';
+  // Qwen3.8-27B only — mirrors family_of(); the dot keeps qwen3-8b generic.
+  if (/(?:^|\/)qwen3\.8-27b(?![\w.])/.test(name)) return 'qwen3.8-27b';
+  // Qwen3.8 Max and Max Prime; not the text-only open 2.4T-A95B.
+  if (/(?:^|\/)qwen3\.8-max(?![\w.])/.test(name)) return 'qwen3.8-max';
   if (name.includes('qwen') || name.includes('qwq')) return 'qwen';
   if (name.includes('llama')) return 'llama';
   if (name.startsWith('gemini')) return 'gemini';

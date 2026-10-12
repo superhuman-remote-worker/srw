@@ -31,6 +31,7 @@ from orchestrator.schemas.provider_catalog import (
     VALID_SYSTEM_API_KEY_PROVIDERS,
 )
 from orchestrator.services.provider_catalog import EndpointProbe
+from orchestrator.services.readiness import try_auto_pin_required_defaults
 from typing import Protocol
 
 if TYPE_CHECKING:
@@ -73,6 +74,13 @@ class ModelCatalogStore(Protocol):
         self, model_id: str, **fields: Any
     ) -> dict[str, Any] | None: ...
     async def delete_model(self, model_id: str) -> bool: ...
+    async def list_default_pin_capabilities(self) -> list[str]: ...
+    async def list_models_by_capability_alphabetical(
+        self, capability: str
+    ) -> list[dict[str, Any]]: ...
+    async def pin_default_llm_model_if_unset(
+        self, kind: str, model: str, *, updated_by: str, source: str
+    ) -> bool: ...
 
 
 def _catalog_routing(row: Mapping[str, Any]):
@@ -321,6 +329,9 @@ class ModelCatalogService:
             raise HTTPException(
                 status_code=500, detail="Catalog insert returned no row."
             )
+        # The first model for a required capability becomes its default, so
+        # a fresh install is ready without a separate Defaults step.
+        await try_auto_pin_required_defaults(self.store)
         manifest, labels = await self._provenance_context()
         return self._serialize_catalog_model(
             row, manifest=manifest, endpoint_labels=labels
@@ -372,6 +383,9 @@ class ModelCatalogService:
             raise
         if row is None:
             raise HTTPException(status_code=404, detail="Catalog row not found")
+        # Enabling a row or adding a capability can give a required
+        # capability its first model.
+        await try_auto_pin_required_defaults(self.store)
         manifest, labels = await self._provenance_context()
         return self._serialize_catalog_model(
             row, manifest=manifest, endpoint_labels=labels

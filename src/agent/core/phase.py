@@ -12,6 +12,8 @@ todos from todos.yaml.
 """
 
 import logging
+import re
+import time
 from dataclasses import dataclass
 from pathlib import Path
 import json
@@ -20,6 +22,13 @@ from datetime import datetime
 
 import yaml
 from langchain_core.messages import HumanMessage
+
+from shared.deliverable_contract import (
+    KB_DELIVERABLE_PREFIX,
+    PR_DELIVERABLE_PREFIX,
+    normalize_deliverable,
+    parse_required_deliverables,
+)
 
 if TYPE_CHECKING:
     from shared.runtime.core.loader import AgentConfig
@@ -765,11 +774,38 @@ def _finalize_with_verdict(
     )
 
 
-# Set on a freeze/completion record when the job-ending push did not land.
+# Set on a freeze/completion record when the job-ending push did not land, or
+# (completion only) the seal could not show the work is in what it pushed.
 # ABSENT means delivered — nothing ever writes these False, so a reader can
 # treat presence as the signal without worrying about which writer ran.
 DELIVERY_FAILED_KEY = "delivery_failed"
 DELIVERY_ERROR_KEY = "delivery_error"
+# Set on a completion record only when the seal PROVED delivery: the commit the
+# remote holds, read after the final commit+push. Unlike ``head_commit`` (read
+# before that commit, diagnostic) this is what the orchestrator's deliverable
+# gate may treat as the revision.
+DELIVERED_COMMIT_KEY = "delivered_commit"
+# Leftovers that did not block the seal (stray logs a background process kept
+# writing, a status that could not be re-read): recorded so a reviewer can see
+# them, never read as a failure.
+DELIVERY_WARNINGS_KEY = "delivery_warnings"
+
+# The one retry a job-ending commit or push gets. Short on purpose: it exists
+# for the blip (a Gitea restart, a progress commit still holding index.lock),
+# and the pod is waiting to be reclaimed.
+_JOB_ENDING_RETRY_DELAY_SECONDS = 5.0
+
+# A push refusal that repeats verbatim on retry: credentials, permissions, a
+# branch the remote protects, a non-fast-forward, a repository that is not
+# there, or no remote to push to at all. Anything else gets its one retry.
+_DETERMINISTIC_PUSH_FAILURE = re.compile(
+    r"\b40[13]\b|authentication failed|could not read (?:username|password)"
+    r"|terminal prompts disabled|permission denied|access denied|not authorized"
+    r"|protected branch|pre-receive hook declined|\[remote rejected\]"
+    r"|\[rejected\]|non-fast-forward|repository not found"
+    r"|does not appear to be a git repository|remote configured|git not active",
+    re.IGNORECASE,
+)
 
 
 def _push_job_ending_state(
@@ -788,13 +824,15 @@ def _push_job_ending_state(
     that way, 26 times, invisibly, for a day
     (knowledge-history/done/git_push_fails_silently_via_workspace_backend.md).
 
-    The push is deliberately NOT retried: ``push()`` already logs its own
-    reason, and the pod is going away either way. The point is that the failure
-    reaches the freeze record the ORCHESTRATOR stores, so the critic, the
-    deliverable gate and the cockpit can distinguish "the repository is empty
-    because delivery failed" from "the repository is empty because the agent
-    produced nothing" — two states that look identical from outside and call
-    for opposite responses.
+    A failed push gets ONE retry after a short delay (re-committing anything
+    written since, never an empty commit) — unless the failure is one that
+    would repeat verbatim (``_DETERMINISTIC_PUSH_FAILURE``). A failure is now a
+    held seal rather than a footnote, so a single network blip must not cost a
+    human review. What survives the retry reaches the freeze record the
+    ORCHESTRATOR stores, so the critic, the deliverable gate and the cockpit
+    can distinguish "the repository is empty because delivery failed" from
+    "the repository is empty because the agent produced nothing" — two states
+    that look identical from outside and call for opposite responses.
 
     ``push()`` returns False for three different reasons and only one is a lost
     deliverable, so the other two are screened out first. Marking a job with no
@@ -822,19 +860,368 @@ def _push_job_ending_state(
     if git_mgr.push():
         return True
 
+    reason = getattr(git_mgr, "last_push_error", None)
+    deterministic = isinstance(reason, str) and bool(
+        _DETERMINISTIC_PUSH_FAILURE.search(reason)
+    )
+    if not deterministic:
+        logger.warning(
+            f"[{job_id}] {label}: the final git push failed; retrying once in "
+            f"{_JOB_ENDING_RETRY_DELAY_SECONDS:g}s"
+        )
+        time.sleep(_JOB_ENDING_RETRY_DELAY_SECONDS)
+        try:
+            git_mgr.commit(f"{label}: retry delivery", allow_empty=False)
+            if git_mgr.push():
+                logger.info(f"[{job_id}] {label}: the final git push landed on retry")
+                return True
+        except Exception as e:  # noqa: BLE001 — the retry is best-effort
+            logger.warning(f"[{job_id}] {label}: push retry failed: {e}")
+
     logger.error(
-        f"[{job_id}] {label}: the final git push did NOT land. The workspace is "
-        f"now the only copy of this job's deliverables, and its pod is about to "
-        f"be reclaimed. The reason is in the git push warning logged just above."
+        f"[{job_id}] {label}: the final git push did NOT land"
+        f"{' (the remote refused it; not retried)' if deterministic else ', retried once'}"
+        f". The workspace is now the only copy of this job's deliverables, and "
+        f"its pod is about to be reclaimed. The reason is in the git push warning "
+        f"logged just above."
     )
     if record is not None:
         record[DELIVERY_FAILED_KEY] = True
         record[DELIVERY_ERROR_KEY] = (
-            f"The job-ending git push failed at {label}. Deliverables were not "
-            f"delivered to the job repository, so the repository is empty or "
-            f"stale by failure — not because none were produced."
+            f"The job-ending git push failed at {label}"
+            f"{' (the remote refused it)' if deterministic else ' (retried once)'}. "
+            f"Deliverables were not delivered to the job repository, so the "
+            f"repository is empty or stale by failure — not because none were "
+            f"produced."
         )
     return False
+
+
+def _commit_job_ending_state(git_mgr, job_id: str, message: str, label: str) -> bool:
+    """The last-chance commit, with the same single retry the push gets.
+
+    Its result used to be discarded, which is how afa0004b's push reported
+    "Everything up-to-date" over a tree holding the whole final report.
+    """
+    if git_mgr.commit(message, allow_empty=True):
+        return True
+    logger.warning(
+        f"[{job_id}] {label}: the final commit failed; retrying once in "
+        f"{_JOB_ENDING_RETRY_DELAY_SECONDS:g}s"
+    )
+    time.sleep(_JOB_ENDING_RETRY_DELAY_SECONDS)
+    return bool(git_mgr.commit(message, allow_empty=True))
+
+
+def _record_delivery_failure(
+    record: Optional[dict], job_id: str, label: str, detail: str
+) -> None:
+    """Mark ``record`` undelivered with a reason an operator can act on."""
+    logger.error(
+        f"[{job_id}] {label}: {detail} The workspace may now hold the only "
+        f"copy of this job's latest work; recover it before the pod is reaped."
+    )
+    if record is not None:
+        record[DELIVERY_FAILED_KEY] = True
+        record[DELIVERY_ERROR_KEY] = (
+            f"At {label}, {detail} The job repository cannot be shown to hold "
+            f"the work: its branch tip may be an older revision, stale by "
+            f"failure — not because nothing was produced."
+        )
+
+
+def _record_delivery_warning(
+    record: Optional[dict], job_id: str, label: str, detail: str
+) -> None:
+    logger.warning(f"[{job_id}] {label}: {detail}")
+    if record is not None:
+        record.setdefault(DELIVERY_WARNINGS_KEY, []).append(detail)
+
+
+def _expects_repository_delivery(workspace, git_mgr, active: bool) -> bool:
+    """Whether this job's work is supposed to reach a remote repository.
+
+    The configured job-repo URL is the authority: it is what the orchestrator
+    handed the agent, and it survives the git channel dying — which is exactly
+    when ``has_remote()`` stops being able to answer. A manager attached to an
+    existing clone (reattach, pod handoff) can carry an origin the config does
+    not name, so a live ``origin`` counts too. Strict ``is True`` / ``str``
+    checks because a mock config would otherwise read as configured.
+    """
+    config = getattr(workspace, "config", None)
+    url = getattr(config, "git_remote_url", None)
+    if getattr(config, "git_versioning", None) is True and (
+        isinstance(url, str) and url.strip()
+    ):
+        return True
+    return bool(active and git_mgr.has_remote("origin") is True)
+
+
+def _canonical_tree_path(path: Any, roots: Tuple[str, ...] = ()) -> Optional[str]:
+    """A workspace path in the deliverable contract's canonical spelling.
+
+    ``roots`` are absolute workspace-root prefixes to strip: agents often
+    declare ``/home/agent-host/workspace/output/x.md``, the spelling their
+    write results print, while git status speaks root-relative paths.
+    """
+    if not isinstance(path, str):
+        return None
+    candidate = path.strip()
+    for root in roots:
+        if root and candidate.startswith(root):
+            candidate = candidate[len(root) :]
+            break
+    # normalize_deliverable refuses a trailing slash; a directory keeps its
+    # meaning through the prefix match in _deliverables_left_behind instead.
+    canonical = normalize_deliverable(candidate.rstrip("/"))
+    if not canonical or canonical.startswith(
+        (KB_DELIVERABLE_PREFIX, PR_DELIVERABLE_PREFIX)
+    ):
+        return None
+    return canonical
+
+
+def _workspace_roots(workspace) -> Tuple[str, ...]:
+    roots = []
+    for value in (
+        getattr(getattr(workspace, "backend", None), "root", None),
+        getattr(workspace, "path", None),
+    ):
+        if isinstance(value, (str, Path)) and str(value).strip("/"):
+            roots.append(str(value).rstrip("/") + "/")
+    return tuple(roots)
+
+
+def _deliverables_left_behind(pending: List[str], wanted: set) -> List[str]:
+    """The uncommitted status entries that ARE (or contain) a deliverable.
+
+    Porcelain collapses a wholly untracked directory to ``dir/``, so an entry
+    covers a deliverable beneath it; a deliverable naming a directory covers
+    the entries beneath it.
+    """
+    hits = []
+    for entry in pending:
+        canonical = _canonical_tree_path(entry)
+        if not canonical:
+            continue
+        if any(
+            canonical == want
+            or want.startswith(canonical + "/")
+            or canonical.startswith(want + "/")
+            for want in wanted
+        ):
+            hits.append(entry)
+    return hits
+
+
+def _names_workspace_path(workspace, canonical: str) -> bool:
+    """Whether a declared deliverable names a path that exists (either
+    ``repo/`` spelling). An unanswerable probe counts as no: this only ever
+    decides whether a FAILED commit may pass, so doubt must refuse."""
+    from agent.core.deliverables import resolve_workspace_deliverable
+
+    try:
+        return resolve_workspace_deliverable(workspace, canonical)[1] is True
+    except Exception:  # noqa: BLE001 — see docstring
+        return False
+
+
+def _seal_deliverables(final_data: Any, metadata: Any) -> List[str]:
+    """What this seal promises: the declared deliverables plus the manifest."""
+    declared = final_data.get("deliverables") if isinstance(final_data, dict) else None
+    paths = (
+        [d for d in declared if isinstance(d, str)]
+        if isinstance(declared, list)
+        else []
+    )
+    return paths + parse_required_deliverables(
+        metadata if isinstance(metadata, dict) else None
+    )
+
+
+def _verify_job_ending_delivery(
+    workspace: "WorkspaceManager",
+    record: Optional[dict],
+    job_id: str,
+    label: str,
+    *,
+    committed: bool,
+    pushed: bool,
+    head_before: Optional[str],
+    deliverables: List[str],
+) -> None:
+    """After the job-ending commit+push, prove what the remote now holds.
+
+    A push that lands proves only that the remote holds HEAD, not that HEAD
+    holds the work. On VM job afa0004b versioning stopped mid-job, the final
+    commit never landed, and the push that followed reported "Everything
+    up-to-date" — so the seal pinned a two-hour-old tip, the freeze carried
+    ``head_commit: None``, and the deliverable gate passed on the scaffolds
+    sitting there
+    (knowledge-base/knowledge/issues/worker_git_versioning_stops_midjob_seal_pins_stale_revision.md).
+
+    The verdict rests on three facts: did the final commit land (``commit()``
+    succeeded and HEAD moved past ``head_before``), does the remote hold HEAD
+    (the tracking ref equals HEAD, or this seal's own push landed), and is any
+    DELIVERABLE still uncommitted. Leftover dirt elsewhere is not a refusal:
+    job repos are created without a ``.gitignore``, so a background process
+    appending to ``nohup.out`` between ``add -A`` and this check is normal, and
+    holding a finished job for review over it would be a fleet-wide false
+    alarm. That dirt is recorded as a ``delivery_warnings`` entry instead, and
+    the revision is still named.
+
+    It does not refuse to finish — the graph never decides job status — it
+    records what the seal could not establish (``delivery_failed``) so the
+    orchestrator holds the seal instead of passing a stale revision.
+    Configurations that deliver nothing (versioning off, no job repository)
+    are screened out as before. Never raises.
+    """
+    if record is None or record.get(DELIVERY_FAILED_KEY):
+        return  # the push itself failed and already said so
+    git_mgr = getattr(workspace, "git_manager", None) if workspace else None
+    try:
+        active = bool(git_mgr) and git_mgr.is_active is True
+        if not _expects_repository_delivery(workspace, git_mgr, active):
+            return
+        if not active:
+            why = git_mgr._inactive_reason() if git_mgr else "no git manager"
+            _record_delivery_failure(
+                record,
+                job_id,
+                label,
+                f"workspace git versioning was not active ({why}), so nothing "
+                f"since the last push was committed or pushed.",
+            )
+            return
+        if git_mgr.has_remote("origin") is not True:
+            _record_delivery_failure(
+                record,
+                job_id,
+                label,
+                "the workspace repository had no readable 'origin' remote (not "
+                "configured, or git on the workspace is failing), so the final "
+                "push never ran.",
+            )
+            return
+        head = git_mgr.get_current_commit()
+        if not (isinstance(head, str) and head):
+            _record_delivery_failure(
+                record,
+                job_id,
+                label,
+                "HEAD could not be read after the final commit, so the seal "
+                "cannot name the revision it delivered.",
+            )
+            return
+        # Does the remote hold HEAD? The tracking ref is what the last push
+        # left behind locally; absent (never pushed, or a refspec that does not
+        # map the job branch), this seal's own push result decides.
+        branch = git_mgr.current_branch()
+        tracked = git_mgr.rev_parse(f"refs/remotes/origin/{branch}") if branch else None
+        if isinstance(tracked, str) and tracked:
+            if tracked != head:
+                _record_delivery_failure(
+                    record,
+                    job_id,
+                    label,
+                    f"the remote branch is at {tracked[:12]}, not the sealed "
+                    f"HEAD {head[:12]}: the final push did not deliver it.",
+                )
+                return
+        elif not pushed and git_mgr.has_unpushed_commits() is not False:
+            _record_delivery_failure(
+                record,
+                job_id,
+                label,
+                "the final push did not run, and local commits are not on the remote.",
+            )
+            return
+        commit_landed = committed is True and head != head_before
+        pending = git_mgr.uncommitted_paths()
+        if not commit_landed and pending == []:
+            # "The tree already matched HEAD" is the one reading that lets a
+            # FAILED commit pass, and status output can go missing in transit
+            # (the workspace pane drops stdout once its scrollback fills). The
+            # exit code of a tracked-tree diff cannot, so it must agree.
+            if git_mgr.tracked_tree_matches_head() is not True:
+                pending = None
+    except Exception as e:  # noqa: BLE001 — unverifiable is itself the finding
+        _record_delivery_failure(
+            record, job_id, label, f"delivery could not be verified ({e})."
+        )
+        return
+
+    if pending is None:
+        if not commit_landed:
+            _record_delivery_failure(
+                record,
+                job_id,
+                label,
+                "the final commit did not land and the workspace state could "
+                "not be confirmed, so nothing shows the work is in the pushed "
+                "revision.",
+            )
+            return
+        _record_delivery_warning(
+            record,
+            job_id,
+            label,
+            "the workspace git status could not be re-read after the final "
+            "commit; the delivered revision is the commit that landed.",
+        )
+    elif pending:
+        roots = _workspace_roots(workspace)
+        wanted = {
+            canonical
+            for canonical in (_canonical_tree_path(d, roots) for d in deliverables)
+            if canonical
+        }
+        if not commit_landed:
+            # A declaration only vouches for the rest of the tree if it names a
+            # real path: prose ("Final report (output/r.md)") or a bare name
+            # ("r.md") matches nothing, and would otherwise let a failed commit
+            # seal a stale tip on a warning.
+            wanted = {w for w in wanted if _names_workspace_path(workspace, w)}
+        left_behind = _deliverables_left_behind(pending, wanted)
+        sample = ", ".join((left_behind or pending)[:5])
+        count = len(left_behind or pending)
+        more = f" and {count - 5} more" if count > 5 else ""
+        if left_behind:
+            _record_delivery_failure(
+                record,
+                job_id,
+                label,
+                f"the final commit did not land, so deliverable path(s) "
+                f"{sample}{more} are not in the pushed revision."
+                if not commit_landed
+                else f"deliverable path(s) {sample}{more} changed again after "
+                f"the final commit, so the pushed revision does not hold their "
+                f"final state.",
+            )
+            return
+        if not commit_landed and not wanted:
+            # Nothing names what the work is, and the final commit failed with
+            # changes left behind — the afa0004b signature. Refuse rather than
+            # guess that none of it mattered.
+            _record_delivery_failure(
+                record,
+                job_id,
+                label,
+                f"the final commit did not land and {count} path(s) were left "
+                f"uncommitted ({sample}{more}); no deliverable was declared "
+                f"as an existing path that would show the rest is safe to "
+                f"ignore.",
+            )
+            return
+        _record_delivery_warning(
+            record,
+            job_id,
+            label,
+            f"{count} path(s) outside the declared deliverables were "
+            f"uncommitted at the seal ({sample}{more})"
+            + ("; the final commit did not land." if not commit_landed else "."),
+        )
+    record[DELIVERED_COMMIT_KEY] = head
 
 
 def _capture_content_tree(workspace: "WorkspaceManager") -> Optional[str]:
@@ -1047,20 +1434,33 @@ def finalize_job(
 
         # Final git commit and push
         git_mgr = workspace.git_manager
+        committed = pushed = False
         if git_mgr and git_mgr.is_active:
             try:
-                git_mgr.commit("Job completed (autonomy=full)", allow_empty=True)
+                committed = _commit_job_ending_state(
+                    git_mgr, job_id, "Job completed (autonomy=full)", "job completion"
+                )
                 phase_num = state.get("phase_number", 0)
                 short_id = job_id[:8]
                 tag_name = f"{short_id}-job-completed-phase-{phase_num}"
                 tag_ok = git_mgr.tag(tag_name, "Job auto-completed (full autonomy)")
-                _push_job_ending_state(
+                pushed = _push_job_ending_state(
                     git_mgr, job_id, completion_data, "job completion"
                 )
                 if tag_ok:
                     git_mgr.push_ref(f"refs/tags/{tag_name}")
             except Exception as e:
                 logger.warning(f"[{job_id}] Final git push failed: {e}")
+        _verify_job_ending_delivery(
+            workspace,
+            completion_data,
+            job_id,
+            "job completion",
+            committed=committed,
+            pushed=pushed,
+            head_before=head_commit,
+            deliverables=_seal_deliverables(final_data, metadata),
+        )
 
         # AFTER the final commit/push, so the hash covers what was actually
         # delivered. See _capture_content_tree for why it is not in the file.
@@ -1125,18 +1525,31 @@ def finalize_job(
 
     # Final git commit and push for workspace delivery
     git_mgr = workspace.git_manager
+    committed = pushed = False
     if git_mgr and git_mgr.is_active:
         try:
-            git_mgr.commit("Job frozen for review", allow_empty=True)
+            committed = _commit_job_ending_state(
+                git_mgr, job_id, "Job frozen for review", "job freeze"
+            )
             phase_num = state.get("phase_number", 0)
             short_id = job_id[:8]
             tag_name = f"{short_id}-job-frozen-phase-{phase_num}"
             tag_ok = git_mgr.tag(tag_name, "Job frozen for human review")
-            _push_job_ending_state(git_mgr, job_id, freeze_data, "job freeze")
+            pushed = _push_job_ending_state(git_mgr, job_id, freeze_data, "job freeze")
             if tag_ok:
                 git_mgr.push_ref(f"refs/tags/{tag_name}")
         except Exception as e:
             logger.warning(f"[{job_id}] Final git push failed: {e}")
+    _verify_job_ending_delivery(
+        workspace,
+        freeze_data,
+        job_id,
+        "job freeze",
+        committed=committed,
+        pushed=pushed,
+        head_before=head_commit,
+        deliverables=_seal_deliverables(final_data, metadata),
+    )
 
     # AFTER the final commit/push, so the hash covers what was actually
     # delivered. See _capture_content_tree for why it is not in the file.
@@ -1278,6 +1691,27 @@ def push_evidence_snapshot(
         return False
 
 
+def _with_todo_list(
+    text: str,
+    todo_manager: "TodoManager",
+    *,
+    is_strategic: bool,
+    phase_number: int,
+) -> str:
+    """Append the incoming phase's todo list to its phase-start message.
+
+    The list is not re-sent with every request (append-only context
+    injection, D17-D19); it enters the history once, here, where it changes.
+    The manager's phase fields are synced first so the rendering matches what
+    ``TodoManager.format_for_injection`` returns for the rest of the phase
+    (``handle_transition`` sets the same values after a successful
+    transition), which is what ``TodoManager.list_restatement`` looks for.
+    """
+    todo_manager.is_strategic_phase = is_strategic
+    todo_manager.phase_number = phase_number
+    return f"{text}\n\n{todo_manager.format_for_injection()}"
+
+
 def on_strategic_phase_complete(
     state: "UniversalAgentState",
     workspace: "WorkspaceManager",
@@ -1300,7 +1734,7 @@ def on_strategic_phase_complete(
     3. This function checks for staged todos and applies them
 
     On success:
-    - Injects phase boundary marker message
+    - Injects phase boundary marker message carrying the new todo list
     - Applies staged todos to TodoManager
     - Flips to tactical phase
     - Increments phase_number
@@ -1398,12 +1832,17 @@ def on_strategic_phase_complete(
 
     model = config.llm.model if (config and config.llm) else None
     phase_marker = HumanMessage(
-        content=format_nudge(
-            "phase_transition_strategic_to_tactical",
-            model=model,
+        content=_with_todo_list(
+            format_nudge(
+                "phase_transition_strategic_to_tactical",
+                model=model,
+                phase_number=phase_number + 1,
+                phase_name=phase_name,
+                todo_count=todo_count,
+            ),
+            todo_manager,
+            is_strategic=False,
             phase_number=phase_number + 1,
-            phase_name=phase_name,
-            todo_count=todo_count,
         )
     )
 
@@ -1434,7 +1873,7 @@ def on_tactical_phase_complete(
     It transitions to strategic phase with predefined todos.
 
     On success:
-    - Injects phase boundary marker message
+    - Injects phase boundary marker message carrying the new todo list
     - Loads predefined strategic todos
     - Flips to strategic phase
     - Increments phase_number
@@ -1493,9 +1932,14 @@ def on_tactical_phase_complete(
 
     model = config.llm.model if (config and config.llm) else None
     phase_marker = HumanMessage(
-        content=format_nudge(
-            "phase_transition_tactical_to_strategic",
-            model=model,
+        content=_with_todo_list(
+            format_nudge(
+                "phase_transition_tactical_to_strategic",
+                model=model,
+                phase_number=phase_number + 1,
+            ),
+            todo_manager,
+            is_strategic=True,
             phase_number=phase_number + 1,
         )
     )

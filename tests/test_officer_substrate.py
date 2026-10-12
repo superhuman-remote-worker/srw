@@ -22,6 +22,44 @@ from agent.tools.context import ToolContext
 from agent.tools.core.officer import OFFICER_TOOLS_METADATA, create_officer_tools
 
 
+@pytest.fixture(autouse=True)
+def _officer_runtime_owners(monkeypatch, tmp_path):
+    """Legacy Officer tests own no earlier file's exact lifecycle obligation."""
+    from agent.api import persistent_app as pa
+    from agent.api.session_identity import SessionIdentityRuntime
+    from agent.api.session_input import SessionInputRuntime
+    from agent.api.session_termination import SessionTerminationCoordinator
+
+    old_identity, old_termination, old_input = (
+        pa._session_identity,
+        pa._session_termination,
+        pa._session_input,
+    )
+    monkeypatch.setattr(
+        pa, "_session_identity", SessionIdentityRuntime(old_identity._ports)
+    )
+    termination = SessionTerminationCoordinator(
+        old_termination._ports,
+        logger=old_termination._logger,
+        termination_queue_sentinel=old_termination.termination_queue_sentinel,
+    )
+    termination.termination_sentinel_path = tmp_path / "no-termination"
+    monkeypatch.setattr(pa, "_session_termination", termination)
+    monkeypatch.setattr(pa, "_session_input", SessionInputRuntime(old_input._ports))
+    for name in (
+        "_session",
+        "_orchestrator_client",
+        "_loop_task",
+        "_event_writer",
+        "_heartbeat_task",
+        "_control_owner_agent_id",
+    ):
+        monkeypatch.setattr(pa, name, None)
+    for name in ("_tool_inflight", "_turn_event_open"):
+        monkeypatch.setattr(pa, name, False)
+    monkeypatch.setattr(pa, "_subscribers", {})
+
+
 def _watchdog_deps(db, provisioner, recycler, *, reconciliation):
     """What the watchdog task carries. The recycler is a callable because the
     application assigns that global during startup and the tick re-reads it;
@@ -300,14 +338,14 @@ def _reset_agent_globals():
     import agent.api.persistent_app as mod
 
     mod._session = None
-    mod._thread_id = None
-    mod._pinned_status_identity_enabled = False
-    mod._pinned_runtime_generation_enabled = False
-    mod._session_runtime_generation = None
-    mod._session_runtime_attach_token = None
+    mod._session_identity._thread_id = None
+    mod._session_identity._status_contract = False
+    mod._session_identity._runtime_contract = False
+    mod._session_identity._session_generation = None
+    mod._session_identity._attach_token = None
     mod._orchestrator_client = None
     mod._subscribers.clear()
-    mod._loop_user_queue = None
+    mod._session_input._queue = None
 
 
 def _install_officer_session(*, officer_cfg, turn_count: int = 2):
@@ -321,12 +359,12 @@ def _install_officer_session(*, officer_cfg, turn_count: int = 2):
     session.config.officer = officer_cfg
     session.tool_context = None
     mod._session = session
-    mod._thread_id = "thread-test-uuid"
+    mod._session_identity._thread_id = "thread-test-uuid"
     client = AsyncMock()
     client.update_thread_status = AsyncMock(return_value=True)
     client.file_officer_wake = AsyncMock(return_value=True)
     mod._orchestrator_client = client
-    mod._loop_user_queue = asyncio.Queue()
+    mod._session_input._queue = asyncio.Queue()
     return session, client
 
 
@@ -350,9 +388,9 @@ class TestOfficerInputWait:
         session.tool_context.consume_officer_sleep = MagicMock(
             return_value={"minutes": 500, "reason": "long haul"}
         )
-        await mod._loop_user_queue.put({"content": "hi", "role": "human"})
+        await mod._session_input.queue.put({"content": "hi", "role": "human"})
 
-        item = await mod._loop_get_user_input()
+        item = await mod._session_input.get_user_input()
 
         assert item["content"] == "hi"
         # Filing runs as a task — let it complete.
@@ -377,7 +415,7 @@ class TestOfficerInputWait:
         )
 
         try:
-            item = await mod._loop_get_user_input()
+            item = await mod._session_input.get_user_input()
         except IdleTimeoutError:  # pragma: no cover - the regression this pins
             pytest.fail("officer session must never raise IdleTimeoutError")
 
@@ -392,9 +430,9 @@ class TestOfficerInputWait:
             officer_cfg=OfficerConfig(enabled=True), turn_count=3
         )
         assert not mod._subscribers  # untethered — the flip condition
-        await mod._loop_user_queue.put({"content": "x", "role": "human"})
+        await mod._session_input.queue.put({"content": "x", "role": "human"})
 
-        await mod._loop_get_user_input()
+        await mod._session_input.get_user_input()
         await asyncio.sleep(0)
 
         client.update_thread_status.assert_not_awaited()
@@ -408,9 +446,9 @@ class TestOfficerInputWait:
         )
         session.tool_context = MagicMock()
         session.tool_context.consume_officer_sleep = MagicMock(return_value=None)
-        await mod._loop_user_queue.put({"content": "x", "role": "human"})
+        await mod._session_input.queue.put({"content": "x", "role": "human"})
 
-        await mod._loop_get_user_input()
+        await mod._session_input.get_user_input()
         await asyncio.sleep(0)
 
         # The watchdog files implicit sleep_max — the transport must not.
@@ -632,20 +670,22 @@ class TestBootWsWatchdogOfficerExemption:
 
         _reset_agent_globals()
         _install_officer_session(officer_cfg=OfficerConfig(enabled=True))
-        mod._ws_connected_event = asyncio.Event()  # never set
+        mod._session_termination.ws_connected_event = asyncio.Event()  # never set
         terminated = []
 
         async def _fake_terminate(reason):
             terminated.append(reason)
 
-        original = mod._terminate_session
-        mod._terminate_session = _fake_terminate
+        original = mod._session_termination.terminate
+        mod._session_termination.terminate = _fake_terminate
         try:
             # Watchdog must return immediately — a 0-second timeout would
             # otherwise terminate on the spot.
-            await asyncio.wait_for(mod._boot_ws_watchdog(0), timeout=1.0)
+            await asyncio.wait_for(
+                mod._session_termination.boot_ws_watchdog(0), timeout=1.0
+            )
         finally:
-            mod._terminate_session = original
+            mod._session_termination.terminate = original
             _reset_agent_globals()
         assert terminated == []
 
@@ -655,20 +695,22 @@ class TestBootWsWatchdogOfficerExemption:
 
         _reset_agent_globals()
         _install_officer_session(officer_cfg=OfficerConfig(enabled=False))
-        mod._ws_connected_event = asyncio.Event()
+        mod._session_termination.ws_connected_event = asyncio.Event()
         terminated = []
 
         async def _fake_terminate(reason):
             terminated.append(reason)
 
-        original_terminate = mod._terminate_session
-        original_exit = mod._schedule_exit
-        mod._terminate_session = _fake_terminate
-        mod._schedule_exit = lambda delay=0: None
+        original_terminate = mod._session_termination.terminate
+        original_exit = mod._session_termination.schedule_exit
+        mod._session_termination.terminate = _fake_terminate
+        mod._session_termination.schedule_exit = lambda delay=0: None
         try:
-            await asyncio.wait_for(mod._boot_ws_watchdog(0), timeout=5.0)
+            await asyncio.wait_for(
+                mod._session_termination.boot_ws_watchdog(0), timeout=5.0
+            )
         finally:
-            mod._terminate_session = original_terminate
-            mod._schedule_exit = original_exit
+            mod._session_termination.terminate = original_terminate
+            mod._session_termination.schedule_exit = original_exit
             _reset_agent_globals()
         assert terminated == ["boot_ws_timeout"]

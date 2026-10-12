@@ -39,6 +39,18 @@ def _make_db(conn: AsyncMock) -> PostgresDB:
 
     conn.transaction = MagicMock(side_effect=transaction)
     db.acquire = acquire
+
+    # The Connector write-through (tests/test_manifest_connectors*.py) runs
+    # around these row writes; here only the row SQL is pinned.
+    @asynccontextmanager
+    async def transaction_scope():
+        yield conn
+
+    db.transaction_scope = transaction_scope
+    db._lock_connector_catalog = AsyncMock()
+    db._persist_connector_resource = AsyncMock(return_value="unchanged")
+    db._connector_link_projects = AsyncMock(return_value=set())
+    db._refresh_connector_projects = AsyncMock()
     return db
 
 
@@ -131,26 +143,45 @@ async def test_update_datasource_visibility_advances_policy_revision():
 
     assert await db.update_datasource(DATASOURCE_ID, is_global=False)
 
-    sql = conn.execute.await_args.args[0]
+    sql = conn.execute.await_args_list[0].args[0]
     assert "is_global = $1" in sql
     assert "policy_revision = policy_revision + 1" in sql
+    # Visibility decides an untagged connector's bound access, which its
+    # project notes state (decision 32), so they are projected again.
+    assert (
+        "datasource_project_reconcile_queue" in conn.execute.await_args_list[1].args[0]
+    )
 
 
 @pytest.mark.asyncio
-async def test_update_datasource_can_explicitly_clear_connection_url():
+async def test_update_datasource_read_only_tag_reprojects_the_notes():
+    """The creator's read-only tag changes what the notes say an execution
+    binds (decision 31)."""
     conn = AsyncMock()
     conn.execute.return_value = "UPDATE 1"
     db = _make_db(conn)
 
-    assert await db.update_datasource(
-        DATASOURCE_ID,
-        connection_url=None,
-        connection_url_set=True,
+    assert await db.update_datasource(DATASOURCE_ID, read_only=True)
+
+    sql = conn.execute.await_args_list[0].args[0]
+    assert "read_only = $1" in sql
+    assert (
+        "datasource_project_reconcile_queue" in conn.execute.await_args_list[1].args[0]
     )
 
-    sql, *params = conn.execute.await_args_list[0].args
-    assert "connection_url = $1" in sql
-    assert params[0] is None
+
+@pytest.mark.asyncio
+async def test_update_datasource_leaves_an_omitted_connection_url_alone():
+    """No connector clears its URL any more: the MCP stdio servers that did
+    are retired (connector drivers D5b)."""
+    conn = AsyncMock()
+    conn.execute.return_value = "UPDATE 1"
+    db = _make_db(conn)
+
+    assert await db.update_datasource(DATASOURCE_ID, name="Renamed")
+
+    sql = conn.execute.await_args_list[0].args[0]
+    assert "connection_url" not in sql
 
 
 @pytest.mark.asyncio

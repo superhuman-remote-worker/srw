@@ -14,6 +14,7 @@ from typing import Any, Literal
 from fastapi import HTTPException
 import yaml
 
+from orchestrator.security.config_redaction import redact_public_config_override
 from orchestrator.schemas.expert_catalog import (
     ExpertInfo,
     SkillInfo,
@@ -42,6 +43,7 @@ from shared.runtime.core.srw_manifest_config import (
 )
 
 from orchestrator.services.expert_catalog_contracts import ExpertCatalogDependencies
+from orchestrator.services.model_availability import stale_account_model_reason
 
 logger = logging.getLogger(__name__)
 
@@ -252,6 +254,20 @@ def skill_row_to_meta(row: dict[str, Any]) -> dict[str, Any]:
         "version": row.get("version"),
         "owner_id": str(row["owner_id"]) if row.get("owner_id") else None,
     }
+
+
+def skill_row_visible(row: dict[str, Any], user: dict[str, Any]) -> bool:
+    """Whether ``user`` may read a DB skill row by id.
+
+    The listing's rule (``list_skills_visible``: owned or global) plus admins,
+    who may already edit and delete any row. Skills have no project junction
+    (0031), so project membership grants nothing here.
+    """
+    return (
+        bool(user.get("is_admin"))
+        or row.get("is_global") is True
+        or str(row.get("owner_id") or "") == str(user["id"])
+    )
 
 
 def db_expert_to_bundle_src(row: dict[str, Any]) -> dict[str, Any]:
@@ -515,9 +531,28 @@ class ExpertCatalogService:
             settings = await self.store.get_user_settings(str(user_id)) or {}
             account_default = settings.get("default_model")
         system_default = await self.store.resolve_default_for_capability("chat")
-        return effective_models_from_layers(
+        # Same rule as dispatch (resolve_default_models): a stored default that
+        # can no longer run gives way to the system default, so the form shows
+        # what will actually run — and which preference was skipped.
+        skipped: dict[str, str] | None = None
+        if account_default and system_default:
+            reason = await stale_account_model_reason(
+                str(account_default),
+                user_id=str(user_id) if user_id else None,
+                capability="chat",
+                store=self.store,
+            )
+            if reason is not None:
+                skipped = {"model": str(account_default), "reason": reason}
+                account_default = None
+        effective = effective_models_from_layers(
             expert_llm, account_default, system_default, expert_subagents
         )
+        if skipped:
+            for slot in effective.values():
+                if slot.get("source") == "system_default":
+                    slot["skipped_account_default"] = dict(skipped)
+        return effective
 
     async def load_expert_detail(
         self,
@@ -568,7 +603,7 @@ class ExpertCatalogService:
             ):
                 return {
                     "id": str(row["id"]),
-                    "manifest": row["manifest"],
+                    "manifest": redact_public_config_override(row["manifest"]),
                     "harness_adapter": row["harness_adapter"],
                     "config": {},
                     "settings_matrix": {},
@@ -680,9 +715,12 @@ class ExpertCatalogService:
                 "workspace_preference": (row.get("manifest") or {})
                 .get("spec", {})
                 .get("workspacePreference"),
-                "manifest": row.get("manifest"),
+                # A Project's managed child carries the project's override and
+                # its link override verbatim as layers — merged into ``config``
+                # and inside ``manifest`` — and every project member reads this.
+                "manifest": redact_public_config_override(row.get("manifest")),
                 "harness_adapter": row.get("harness_adapter", SRW_HARNESS_ADAPTER),
-                "config": merged,
+                "config": redact_public_config_override(merged),
                 "instructions": asset_prompts.get("instructions"),
                 "persona": asset_prompts.get("persona"),
                 "enumerate_only": enumerate_only_members(),
@@ -1189,12 +1227,21 @@ class ExpertCatalogService:
     def bundled_skill_bundle(self, skill_name: str) -> dict[str, Any] | None:
         """Read a bundled skill's full directory into a metadata + files dict."""
         from shared.runtime.core.skill_format import (
+            SkillFormatError,
             parse_skill_md,
+            skill_dir_under,
             skill_identity,
             validate_skill_path,
         )
 
-        skill_dir = self.deps.get_config_dir() / "skills" / skill_name
+        # ``skill_name`` is a route's non-UUID skill id: a name that is no
+        # skill slug is simply not a bundled skill.
+        try:
+            skill_dir = skill_dir_under(
+                self.deps.get_config_dir() / "skills", skill_name
+            )
+        except SkillFormatError:
+            return None
         skill_md = skill_dir / "SKILL.md"
         if not skill_dir.is_dir() or not skill_md.exists():
             return None
@@ -1384,10 +1431,20 @@ class ExpertCatalogService:
         self.state.skills = self.scan_skills()
         return {"status": "reloaded", "count": len(self.state.skills)}
 
-    async def get_skill(self, skill_id: str) -> dict[str, Any]:
+    async def get_visible_skill_row(
+        self, skill_id: str, *, user: dict[str, Any]
+    ) -> dict[str, Any] | None:
+        """A DB skill row by UUID, or None when it is missing OR invisible to
+        ``user``. The two are deliberately indistinguishable — every by-id skill
+        route answers 404 for both, as expert reads by id do — so holding a UUID
+        is neither a read grant nor an existence oracle."""
+        row = await self.store.get_skill_by_id(skill_id)
+        return row if row and skill_row_visible(row, user) else None
+
+    async def get_skill(self, skill_id: str, *, user: dict[str, Any]) -> dict[str, Any]:
         """Full skill detail (metadata + file tree). DB skill by UUID, else bundled."""
         if self.deps.skills_enabled() and self.deps.looks_like_uuid(skill_id):
-            row = await self.store.get_skill_by_id(skill_id)
+            row = await self.get_visible_skill_row(skill_id, user=user)
             if not row:
                 raise HTTPException(
                     status_code=404, detail=f"Skill not found: {skill_id}"
@@ -1506,8 +1563,8 @@ class ExpertCatalogService:
                 except (json.JSONDecodeError, TypeError):
                     project_override = {}
             if isinstance(project_override, dict) and project_override:
-                detail["config"] = deep_merge_dicts(
-                    detail.get("config") or {}, project_override
+                detail["config"] = redact_public_config_override(
+                    deep_merge_dicts(detail.get("config") or {}, project_override)
                 )
             detail["name"] = linked["name"]
             detail["source"] = "project"

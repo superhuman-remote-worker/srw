@@ -95,8 +95,9 @@ asyncio.run(main())
 
 def test_every_registered_tool_has_exactly_one_capability_contract() -> None:
     assert _registered_tool_names() == set(TOOL_CAPABILITIES)
-    # 115 existing tools plus seven native manifest/resource operations.
-    assert len(TOOL_CAPABILITIES) == 122
+    # 115 existing tools, seven native manifest/resource operations and the
+    # connector driver capability matrix.
+    assert len(TOOL_CAPABILITIES) == 123
 
 
 def test_capability_contract_records_required_risk_and_transport_fields() -> None:
@@ -159,11 +160,11 @@ def test_health_build_info_reports_digest_provenance_and_artifact_match(
 
     info = _build_info(artifact)
 
-    assert info["tool_schema_revision"] == "13"
+    assert info["tool_schema_revision"] == "15"
     assert info["tool_schema_digest"] == schema["digest"]
     assert info["schema_artifact_digest"] == schema["digest"]
     assert info["schema_artifact_status"] == "match"
-    assert info["tool_count"] == 122
+    assert info["tool_count"] == 123
     assert info["source_revision"] == "source-test-revision"
     assert info["release_version"] == "test-release"
     assert info["artifact_digest"] == "sha256:image-test-digest"
@@ -184,9 +185,14 @@ def test_priority_job_project_and_connector_schema_drift_is_closed() -> None:
     assert "paused" in list_status["anyOf"][0]["enum"]
 
     job_fields = tools["create_job"]["inputSchema"]["properties"]
-    assert {"expert_id", "kickoff_message", "priority", "context", "slot"} <= set(
-        job_fields
-    )
+    assert {
+        "expert_id",
+        "kickoff_message",
+        "priority",
+        "context",
+        "slot",
+        "workspace",
+    } <= set(job_fields)
     # project_id is deliberately model-visible on both lanes (explicit value
     # wins over the hidden lineage default); the rest of the lineage stays
     # server-bound.
@@ -207,12 +213,14 @@ def test_priority_job_project_and_connector_schema_drift_is_closed() -> None:
         "priority",
         "context",
         "required_deliverables",
+        "workspace",
     } <= set(project_job_fields)
     assert project_job_fields["datasource_ids"]["type"] == "array"
     assert "anyOf" not in project_job_fields["datasource_ids"]
 
     persistent_thread_schema = tools["create_persistent_thread"]["inputSchema"]
     persistent_thread_fields = persistent_thread_schema["properties"]
+    assert "workspace" in persistent_thread_fields
     assert persistent_thread_fields["datasource_ids"]["type"] == "array"
     assert "anyOf" not in persistent_thread_fields["datasource_ids"]
     assert "datasource_ids" not in persistent_thread_schema.get("required", [])
@@ -222,20 +230,12 @@ def test_priority_job_project_and_connector_schema_drift_is_closed() -> None:
         assert "default_config_override" in properties
 
     connector = tools["create_datasource"]["inputSchema"]["properties"]
-    assert set(connector["type"]["enum"]) == {
-        "generic",
-        "repository",
-        "kb",
-        "postgresql",
-        "neo4j",
-        "mongodb",
-        "webdav",
-        "email",
-        "mcp",
-        "kubeconfig",
-        "ssh_key",
-        "generic_file",
-    }
+    # Every type the API accepts, from the driver specs; ``credentials`` was
+    # once missing from a hand-kept copy.
+    from shared.runtime.core.datasource_catalog import DATASOURCE_TYPE_IDS
+
+    assert connector["type"]["enum"] == list(DATASOURCE_TYPE_IDS)
+    assert "credentials" in connector["type"]["enum"]
     assert {
         "config",
         "is_global",

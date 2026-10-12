@@ -5,13 +5,32 @@ import {TranslocoService} from '@jsverse/transloco';
 import {of, Subject, throwError} from 'rxjs';
 import {afterEach, describe, expect, it, vi} from 'vitest';
 
-import {Datasource, Job, ProjectDatasource} from '../../core/models/api.model';
+import {
+  Datasource,
+  Job,
+  ProjectDatasource,
+  ProjectMemberRole,
+  ProjectWorkspaceDefaults,
+} from '../../core/models/api.model';
 import {ApiService} from '../../core/services/api.service';
 import {CapabilitiesService} from '../../core/services/capabilities.service';
 import {ErrorMessageService} from '../../core/services/error-message.service';
 import {UserService} from '../../core/services/user.service';
 import {ViewportService} from '../../core/services/viewport.service';
 import {ProjectDetailPageComponent} from './project-detail.component';
+import {ConnectorDriversService} from '../../core/services/connector-drivers.service';
+import {
+  ConnectorDriver,
+  ConnectorDriverMatrix,
+  driverForType,
+} from '../../core/models/connector-driver.model';
+// The API's own capability matrix for the built-in drivers.
+import driversFixture from '../../core/models/fixtures/connector-drivers.json';
+// The real catalogue, so these specs also prove the keys they name exist.
+import en from '../../../assets/i18n/en.json';
+import de from '../../../assets/i18n/de-DE.json';
+
+const BUILTIN_DRIVERS = (driversFixture as unknown as ConnectorDriverMatrix).drivers;
 
 function datasource(id: string, overrides: Partial<Datasource> = {}): Datasource {
   return {
@@ -41,7 +60,47 @@ function linkedDatasource(id: string): ProjectDatasource {
   };
 }
 
-function createComponent(policyAvailable = true) {
+/** The GET's shape for a bare installation, no Project row, VMs on: what a
+ *  freshly-created project's "Workspace defaults" section renders. */
+const WORKSPACE_DEFAULTS: ProjectWorkspaceDefaults = {
+  stored: {jobs: null, sessions: null, container: null, vm: null},
+  managed_by_manifest: false,
+  can_edit: true,
+  account_templates: false,
+  effective: {
+    jobs: {mode: 'container', source: 'installation'},
+    sessions: {mode: 'virtual', source: 'installation'},
+    container: {template_name: 'container-full', source: 'builtin'},
+    vm: {template_name: 'vm-full', source: 'builtin'},
+  },
+  installation: {jobs: 'container', sessions: 'virtual', container: 'container-full', vm: 'vm-full'},
+  template_problems: {},
+  installation_problems: [],
+  vm_available: true,
+};
+
+/** `createComponent(false)` (a bare boolean) keeps its old meaning:
+ *  `datasourceScopeAutoAttachAvailable`. An options object adds `userRole`,
+ *  which switches the stubbed project from the suite's default (archived —
+ *  see the "archived read-only settings" describe below) to an active one.
+ *  `GET /api/projects/{id}` never returns `user_role` (only the list
+ *  endpoints do), so the mock no longer carries it; the workspace-defaults
+ *  tests drive edit/template access through the `getProjectWorkspaceDefaults`
+ *  mock's `can_edit`/`account_templates` instead — see WORKSPACE_DEFAULTS. */
+function createComponent(
+  options:
+    | boolean
+    | {policyAvailable?: boolean; userRole?: ProjectMemberRole; drivers?: ConnectorDriver[] | null} = true,
+) {
+  const opts = typeof options === 'boolean' ? {policyAvailable: options} : options;
+  // null: the capability matrix has not loaded, so the pre-matrix rules hold.
+  const drivers = 'drivers' in opts ? (opts.drivers ?? null) : null;
+  const connectorDrivers = {
+    drivers: signal(drivers),
+    load: vi.fn(),
+    forType: (type: string) => driverForType(drivers, type),
+  };
+  const policyAvailable = opts.policyAvailable ?? true;
   const api = {
     getProjectDatasources: vi.fn().mockReturnValue(of([])),
     getLinkableProjectDatasources: vi.fn().mockReturnValue(
@@ -53,13 +112,22 @@ function createComponent(policyAvailable = true) {
     getProjectRepositories: vi.fn().mockReturnValue(of([])),
     attachProjectKnowledgeRepository: vi.fn().mockReturnValue(of({status: 'attached'})),
     getKnowledgeSummary: vi.fn().mockReturnValue(of(null)),
-    getProject: vi.fn().mockReturnValue(of({id: 'project-a', status: 'archived'})),
+    getProject: vi.fn().mockReturnValue(
+      of(
+        opts.userRole
+          ? {id: 'project-a', status: 'active', is_default: false}
+          : {id: 'project-a', status: 'archived'},
+      ),
+    ),
     setProjectStatus: vi.fn().mockReturnValue(of({archived: true})),
     updateProject: vi.fn().mockReturnValue(of({status: 'updated'})),
     updateProjectFields: vi.fn().mockReturnValue(of({status: 'updated'})),
     getProjectJobs: vi.fn().mockReturnValue(of([])),
     getProjectMembers: vi.fn().mockReturnValue(of([])),
     getProjectExperts: vi.fn().mockReturnValue(of([])),
+    getProjectWorkspaceDefaults: vi.fn().mockReturnValue(of(WORKSPACE_DEFAULTS)),
+    putProjectWorkspaceDefaults: vi.fn().mockReturnValue(of(WORKSPACE_DEFAULTS)),
+    listWorkspaceTemplates: vi.fn().mockReturnValue(of({resources: []})),
   };
   const currentUser = signal({id: 'user-1', is_admin: false});
   const injector = Injector.create({
@@ -83,6 +151,7 @@ function createComponent(policyAvailable = true) {
       // a 409 body reaching the sentence the user reads.
       {provide: ErrorMessageService, useClass: ErrorMessageService, deps: []},
       {provide: ViewportService, useValue: {isMobile: signal(false)}},
+      {provide: ConnectorDriversService, useValue: connectorDrivers},
     ],
   });
   const component = runInInjectionContext(
@@ -90,7 +159,7 @@ function createComponent(policyAvailable = true) {
     () => new ProjectDetailPageComponent(),
   );
   (component as unknown as {projectId: string}).projectId = 'project-a';
-  return {api, component, currentUser};
+  return {api, component, currentUser, connectorDrivers};
 }
 
 describe('ProjectDetailPageComponent connector candidates', () => {
@@ -148,7 +217,15 @@ describe('ProjectDetailPageComponent connector candidates', () => {
           is_global: true,
           scope_mode: 'projects',
         }),
-        datasource('native', {config: {native_project_id: 'project-b'}}),
+        datasource('native', {type: 'kb', config: {native_project_id: 'project-b'}}),
+        datasource('native-folder', {
+          type: 'cloud_folder',
+          managed_key: 'project-cloud:22222222-2222-2222-2222-222222222222',
+        }),
+        datasource('my-outbox', {
+          type: 'cloud_outbox',
+          managed_key: 'cloud-outbox:33333333-3333-3333-3333-333333333333',
+        }),
         datasource('already-linked'),
       ],
       next_cursor: null,
@@ -389,6 +466,18 @@ describe('ProjectDetailPageComponent archive lifecycle', () => {
     expect(component.lifecycleError()).toBeNull();
   });
 
+  it('reloads workspace defaults after the project refetch succeeds', () => {
+    // can_edit follows an archive or unarchive without a page reload.
+    const {api, component} = createComponent();
+    api.setProjectStatus.mockReturnValue(of({archived: true}));
+    api.getProjectWorkspaceDefaults.mockClear();
+
+    component.confirmArchive();
+    component.applyLifecycle();
+
+    expect(api.getProjectWorkspaceDefaults).toHaveBeenCalledWith('project-a');
+  });
+
   it('unarchives through the same path', () => {
     const {api, component} = createComponent();
     api.setProjectStatus.mockReturnValue(of({archived: false}));
@@ -430,7 +519,6 @@ describe('ProjectDetailPageComponent archived read-only settings', () => {
     status: 'archived' as const,
     is_default: false,
     default_config_name: 'developer',
-    cloud_storage_read_only: false,
     network_tier: 'internet-only' as const,
   };
 
@@ -473,7 +561,6 @@ describe('ProjectDetailPageComponent archived read-only settings', () => {
     component.saveSettings();
     component.onRenameProject('Renamed');
     component.toggleProjectMemory(true);
-    component.toggleCloudReadOnly(true);
     component.onNetworkTierChange('home-allowed');
 
     expect(api.updateProjectFields).not.toHaveBeenCalled();
@@ -551,11 +638,481 @@ describe('ProjectDetailPageComponent archived read-only settings', () => {
       throwError(() => new HttpErrorResponse({status: 409, error: {detail: 'refused'}})),
     );
 
-    component.toggleCloudReadOnly(true);
     component.onNetworkTierChange('home-allowed');
 
-    expect(component.settingsCloudReadOnly()).toBe(false);
     expect(component.settingsNetworkTier()).toBe('internet-only');
     expect(component.editError()).toBe('refused');
+  });
+});
+
+describe('ProjectDetailPageComponent project-memory toggle', () => {
+  it('writes back the override it read with only memory.project_scoped changed', () => {
+    // GET /api/projects/{id} serves default_config_override redacted (no
+    // api_key, rclone_spec or workspace.remote) and the PATCH restores those
+    // values only into sections the write leaves unchanged. So the toggle must
+    // send every section it read, as read: dropping or reshaping one deletes
+    // the stored secrets under it.
+    const {api, component} = createComponent();
+    const override = {
+      memory: {project_scoped: true, recall_limit: 5},
+      llm: {model: 'openrouter/some-model', base_url: 'https://openrouter.ai/api/v1'},
+      workspace: {backend: 'sandbox', mounts: [{name: 'drive', path: '/mnt/d'}]},
+    };
+    component.project.set({
+      id: 'project-a',
+      name: 'P',
+      status: 'active',
+      default_config_override: override,
+    } as never);
+
+    component.toggleProjectMemory(false);
+
+    expect(api.updateProjectFields).toHaveBeenCalledWith('project-a', {
+      default_config_override: {
+        ...override,
+        memory: {project_scoped: false, recall_limit: 5},
+      },
+    });
+  });
+});
+
+describe('ProjectDetailPageComponent workspace defaults', () => {
+  it('loads the defaults with the project', () => {
+    const {api, component} = createComponent();
+    component.loadAll();
+    expect(api.getProjectWorkspaceDefaults).toHaveBeenCalledWith('project-a');
+    expect(component.workspaceDefaults()?.installation.jobs).toBe('container');
+    expect(component.wdJobs()).toBeNull();
+  });
+
+  it('lets an owner save template references', () => {
+    const {api, component} = createComponent({userRole: 'owner'});
+    component.loadAll();
+    component.wdJobs.set('container');
+    component.wdContainer.set('Catalog/shared/container-minimal');
+    component.saveWorkspaceDefaults();
+    expect(api.putProjectWorkspaceDefaults).toHaveBeenCalledWith('project-a', {
+      jobs: 'container',
+      sessions: null,
+      container: {name: 'container-minimal', scope: {kind: 'Catalog', name: 'shared'}},
+      vm: null,
+    });
+  });
+
+  it('can_edit: false makes the section read-only, even for an admin', () => {
+    const {api, component, currentUser} = createComponent({userRole: 'owner'});
+    currentUser.set({id: 'user-1', is_admin: true});
+    api.getProjectWorkspaceDefaults.mockReturnValue(of({...WORKSPACE_DEFAULTS, can_edit: false}));
+    component.loadAll();
+    expect(component.canEditWorkspaceDefaults()).toBe(false);
+  });
+
+  it('can_edit: true makes it editable for a non-admin', () => {
+    const {component} = createComponent({userRole: 'owner'});
+    component.loadAll();
+    expect(component.canEditWorkspaceDefaults()).toBe(true);
+  });
+
+  it('can_edit: true on an archived Project stays read-only', () => {
+    const {api, component} = createComponent();
+    api.getProjectWorkspaceDefaults.mockReturnValue(of({...WORKSPACE_DEFAULTS, can_edit: true}));
+    component.loadAll();
+    expect(component.canEditWorkspaceDefaults()).toBe(false);
+  });
+
+  it('lists no templates when the defaults GET fails', () => {
+    const {api, component} = createComponent({userRole: 'owner'});
+    api.getProjectWorkspaceDefaults.mockReturnValue(
+      throwError(() => new HttpErrorResponse({status: 500})),
+    );
+    component.loadAll();
+    expect(component.workspaceDefaults()).toBeNull();
+    expect(api.listWorkspaceTemplates).not.toHaveBeenCalled();
+  });
+
+  it('hides VM choices when VMs are unavailable', () => {
+    const {api, component} = createComponent({userRole: 'owner'});
+    api.getProjectWorkspaceDefaults.mockReturnValue(of({...WORKSPACE_DEFAULTS, vm_available: false}));
+    component.loadAll();
+    expect(component.workspaceModes()).toEqual(['none', 'virtual', 'container']);
+  });
+
+  it('saves no VM values while VMs are unavailable', () => {
+    // A row saved while VMs were on still carries them; the fields are
+    // hidden now, and the server refuses VM values (422).
+    const {api, component} = createComponent({userRole: 'owner'});
+    api.getProjectWorkspaceDefaults.mockReturnValue(
+      of({
+        ...WORKSPACE_DEFAULTS,
+        stored: {
+          jobs: 'vm',
+          sessions: 'vm',
+          container: null,
+          vm: {ref: {name: 'vm-full', scope: {kind: 'Catalog', name: 'shared'}}},
+        },
+        vm_available: false,
+      }),
+    );
+    component.loadAll();
+    component.wdContainer.set('Catalog/shared/container-minimal');
+    component.saveWorkspaceDefaults();
+    expect(api.putProjectWorkspaceDefaults).toHaveBeenCalledWith('project-a', {
+      jobs: null,
+      sessions: null,
+      container: {name: 'container-minimal', scope: {kind: 'Catalog', name: 'shared'}},
+      vm: null,
+    });
+  });
+
+  function personalProject(accountTemplates: boolean) {
+    const created = createComponent({userRole: 'owner'});
+    created.api.getProject.mockReturnValue(
+      of({id: 'project-a', status: 'active', is_default: true}),
+    );
+    created.api.getProjectWorkspaceDefaults.mockReturnValue(
+      of({...WORKSPACE_DEFAULTS, account_templates: accountTemplates}),
+    );
+    created.component.loadAll();
+    return created.api.listWorkspaceTemplates.mock.calls.map(([kind, name]) => `${kind}/${name}`);
+  }
+
+  it('account_templates: true lists Account/me', () => {
+    expect(personalProject(true)).toEqual(['Catalog/shared', 'Project/project-a', 'Account/me']);
+  });
+
+  it("account_templates: false does not list Account/me, even when the Project is_default", () => {
+    expect(personalProject(false)).toEqual(['Catalog/shared', 'Project/project-a']);
+  });
+});
+
+describe('ProjectDetailPageComponent link access from the capability matrix', () => {
+  it('offers the read-only switch only where the driver has both levels', () => {
+    const {component} = createComponent({drivers: BUILTIN_DRIVERS});
+    expect(component.linkAccess({type: 'postgresql'})).toBe('choice');
+    expect(component.linkAccess({type: 'kb'})).toBe('read_only');
+    // An MCP server binds every tool it lists: there is no read-only level.
+    expect(component.linkAccess({type: 'mcp'})).toBe('read_write');
+  });
+
+  it('names what enforces the level a link binds, which is where it is true', () => {
+    const {component} = createComponent({drivers: BUILTIN_DRIVERS});
+    const level = (type: Datasource['type'], readOnly: boolean | null, config?: object) =>
+      component.linkAccessLevel({type, project_read_only: readOnly, config});
+    // A read-only link floors the connector: Postgres's READ ONLY transaction.
+    expect(level('postgresql', true)?.enforced_by).toContain('READ ONLY transaction');
+    expect(level('postgresql', null)?.id).toBe('ReadWrite');
+    expect(level('postgresql', false)?.id).toBe('ReadWrite');
+    expect(level('mcp', null)?.enforced_by).toContain('MCP server');
+    expect(level('kb', null)?.enforced_by).toContain('never the URL');
+    // The read-only of a declared-only driver is advisory, and says so.
+    expect(level('generic', true)?.advisory).toBe(true);
+    // A tiered driver keeps its stored tier, else the driver's default.
+    expect(level('email', true)?.id).toBe('read');
+    expect(level('email', null, {access: 'send'})?.id).toBe('send');
+    expect(level('email', null)?.id).toBe('draft');
+  });
+
+  it('says a GitHub App connector\'s read-only is enforced, at its own rule too', () => {
+    const {component} = createComponent({drivers: BUILTIN_DRIVERS});
+    const app = {forge: 'github', github_app: {app_id: '1', installation_id: '2'}};
+    const level = (over: object) =>
+      component.linkAccessLevel({type: 'repository', config: app, ...over});
+    // A read-only link: enforced (the token's contents: read), not advisory.
+    expect(level({project_read_only: true})).toMatchObject({id: 'ReadOnly', advisory: false});
+    // The connector's own read-only, or public with the flag never set.
+    expect(level({read_only: true})?.id).toBe('ReadOnly');
+    expect(level({is_global: true, read_only: null})?.id).toBe('ReadOnly');
+    // Published read-write by its owner, on a read-write link.
+    expect(level({is_global: true, read_only: false})?.id).toBe('ReadWrite');
+    expect(component.githubAppReadOnly({type: 'repository', config: app, read_only: true})).toBe(true);
+    // A token repository keeps the declared-only line.
+    expect(
+      component.linkAccessLevel({type: 'repository', config: {forge: 'github'}, project_read_only: true})
+        ?.advisory,
+    ).toBe(true);
+    expect(component.githubAppReadOnly({type: 'repository', config: {forge: 'github'}, read_only: true})).toBe(false);
+  });
+
+  it('binds a strict driver read-only only at a level that writes nothing', () => {
+    const postgres = BUILTIN_DRIVERS.find((driver) => driver.name === 'srw.postgresql/v1')!;
+    const level = (id: string, rank: number, writes: 'none' | 'reviewed' | 'direct') => ({
+      id,
+      rank,
+      tools: [],
+      enforced_by: `${id} line`,
+      advisory: false,
+      writes,
+    });
+    const strict = (levels: ReturnType<typeof level>[]): ConnectorDriver => ({
+      ...postgres,
+      name: 'acme.folder/v1',
+      legacy_type: 'folder',
+      default_access: null,
+      access_levels: levels,
+    });
+    const folder = 'folder' as Datasource['type'];
+    const full = strict([
+      level('read_only', 10, 'none'),
+      level('protected', 20, 'reviewed'),
+      level('read_write', 30, 'direct'),
+    ]);
+    let created = createComponent({drivers: [...BUILTIN_DRIVERS, full]});
+    expect(created.component.linkAccess({type: folder})).toBe('choice');
+    expect(created.component.linkAccessLevel({type: folder, project_read_only: true})?.id).toBe('read_only');
+    expect(created.component.linkAccessLevel({type: folder, read_only: true})?.id).toBe('read_only');
+    expect(created.component.linkAccessLevel({type: folder, project_read_only: false})?.id).toBe('read_write');
+    // Without a level that writes nothing, a read-only link binds nothing:
+    // no "read-only" that is really reviewed writes.
+    const noReader = strict([level('protected', 20, 'reviewed'), level('read_write', 30, 'direct')]);
+    created = createComponent({drivers: [...BUILTIN_DRIVERS, noReader]});
+    expect(created.component.linkAccess({type: folder})).toBe('read_write');
+    expect(created.component.linkAccessLevel({type: folder, project_read_only: true})).toBeNull();
+    expect(created.component.linkAccessLevel({type: folder})?.id).toBe('read_write');
+  });
+
+  it("binds the stricter of the link and the creator's read-only tag", () => {
+    const {component} = createComponent({drivers: BUILTIN_DRIVERS});
+    const row = (over: object) => ({type: 'postgresql' as const, config: {}, ...over});
+    // A read-write link cannot lift the creator's tag (decision 31) ...
+    expect(component.linkAccessLevel(row({read_only: true, project_read_only: false}))?.id)
+      .toBe('ReadOnly');
+    // ... nor a public connector's with no mode set (decision 32).
+    expect(component.linkAccessLevel(row({is_global: true, read_only: null}))?.id).toBe('ReadOnly');
+    // Published read-write, the link decides.
+    expect(component.linkAccessLevel(row({is_global: true, read_only: false}))?.id).toBe('ReadWrite');
+    expect(
+      component.linkAccessLevel(row({is_global: true, read_only: false, project_read_only: true}))?.id,
+    ).toBe('ReadOnly');
+    expect(component.linkAccessLevel(row({read_only: false}))?.id).toBe('ReadWrite');
+  });
+
+  it("shows a creator's read-only tag instead of the switch, and says why", () => {
+    const {component} = createComponent({drivers: BUILTIN_DRIVERS});
+    const tagged = {type: 'postgresql' as const, read_only: true};
+    expect(component.creatorReadOnly(tagged)).toBe(true);
+    expect(component.linkAccessShown(tagged)).toBe('read_only');
+    expect(component.creatorReadOnly({type: 'postgresql', is_global: true, read_only: null})).toBe(true);
+    expect(component.creatorReadOnly({type: 'postgresql', read_only: false})).toBe(false);
+    expect(component.linkAccessShown({type: 'postgresql'})).toBe('choice');
+    // A driver that is read-only anyway needs no note.
+    expect(component.creatorReadOnly({type: 'kb', read_only: true})).toBe(false);
+    const enText = (en as {projectDetail: {datasources: Record<string, string>}})
+      .projectDetail.datasources['accessCreatorReadOnly'];
+    const deText = (de as {projectDetail: {datasources: Record<string, string>}})
+      .projectDetail.datasources['accessCreatorReadOnly'];
+    expect(enText).toMatch(/everyone who uses it/);
+    expect(deText).toMatch(/alle, die ihn nutzen/);
+  });
+
+  it("ignores a link change the creator's tag would override", () => {
+    const {api, component} = createComponent({drivers: BUILTIN_DRIVERS});
+    const updateProjectDatasource = vi.fn().mockReturnValue(of({status: 'updated'}));
+    (api as unknown as {updateProjectDatasource: unknown}).updateProjectDatasource =
+      updateProjectDatasource;
+    component.projectDatasources.set([
+      {
+        ...datasource('pg-1'),
+        read_only: true,
+        linked_at: '',
+        project_read_only: null,
+        project_description: null,
+      },
+    ]);
+    component.updateDatasourceReadOnly('pg-1', 'false');
+    expect(updateProjectDatasource).not.toHaveBeenCalled();
+  });
+
+  it('keeps the KB rule until the matrix loads', () => {
+    const {component} = createComponent({drivers: null});
+    expect(component.linkAccess({type: 'kb'})).toBe('read_only');
+    expect(component.linkAccess({type: 'mcp'})).toBe('choice');
+    expect(component.linkAccessLevel({type: 'kb'})).toBeNull();
+  });
+
+  it('ignores a read-only change for a link with one level', () => {
+    const {api, component} = createComponent({drivers: BUILTIN_DRIVERS});
+    const updateProjectDatasource = vi.fn().mockReturnValue(of({status: 'updated'}));
+    (api as unknown as {updateProjectDatasource: unknown}).updateProjectDatasource =
+      updateProjectDatasource;
+    component.projectDatasources.set([
+      {...datasource('mcp-1', {type: 'mcp'}), linked_at: '', project_read_only: null, project_description: null},
+      {...datasource('pg-1'), linked_at: '', project_read_only: null, project_description: null},
+    ]);
+    component.updateDatasourceReadOnly('mcp-1', 'true');
+    expect(updateProjectDatasource).not.toHaveBeenCalled();
+    component.updateDatasourceReadOnly('pg-1', 'true');
+    expect(updateProjectDatasource).toHaveBeenCalledWith('project-a', 'pg-1', {read_only: true});
+  });
+
+  it('loads the matrix with the linked connectors', () => {
+    const {component, connectorDrivers} = createComponent({drivers: BUILTIN_DRIVERS});
+    component.loadProjectDatasources();
+    expect(connectorDrivers.load).toHaveBeenCalled();
+  });
+});
+
+describe('ProjectDetailPageComponent cloud storage settings', () => {
+  it('has no project read-only switch: the folder has its connector level', () => {
+    // The server dropped projects.cloud_storage_read_only (main cloud slice 8).
+    const {component} = createComponent();
+    expect('toggleCloudReadOnly' in component).toBe(false);
+    expect('settingsCloudReadOnly' in component).toBe(false);
+    expect(en.projectDetail.settings.cloudAccessHint).toContain('Cloud folders');
+    expect(de.projectDetail.settings.cloudAccessHint).toBeTruthy();
+    expect('readOnlyAgent' in en.projectDetail.settings).toBe(false);
+  });
+});
+
+describe("ProjectDetailPageComponent the project's own connectors", () => {
+  const PROJECT = '11111111-1111-1111-1111-111111111111';
+
+  function linked(id: string, overrides: Partial<Datasource> = {}): ProjectDatasource {
+    return {
+      ...datasource(id, overrides),
+      linked_at: '',
+      project_read_only: null,
+      project_description: null,
+    };
+  }
+
+  const FOLDER = linked('folder', {
+    type: 'cloud_folder',
+    connection_url: null,
+    config: {},
+    managed_key: `project-cloud:${PROJECT}`,
+  });
+
+  it('keeps the link: no Unlink, the project manages it', () => {
+    const {component} = createComponent({drivers: BUILTIN_DRIVERS});
+    expect(component.managedLabelKey(FOLDER)).toBe('datasources.platform.managedByProject');
+    // Written before the key: the older marker on the knowledge base.
+    expect(
+      component.managedLabelKey(linked('kb', {type: 'kb', config: {native_project_id: PROJECT}})),
+    ).toBe('datasources.platform.managedByProject');
+    expect(component.managedLabelKey(linked('pg'))).toBeNull();
+  });
+
+  it('shows the level the folder binds at instead of the read-only switch', () => {
+    const {component} = createComponent({drivers: BUILTIN_DRIVERS});
+    // A cloud folder's driver offers read-only and read-write ...
+    expect(component.linkAccessShown(FOLDER)).toBe('choice');
+    // ... but the project's own link is not this table's to set.
+    expect(component.linkAccessManaged(FOLDER)).toBe(true);
+    expect(component.linkAccessLevel(FOLDER)?.id).toBe('read_write');
+    expect(component.accessLevelKey('read_write')).toBe('datasources.accessLevel.read_write');
+    expect(en.datasources.accessLevel.read_write).toBe('Read-write');
+    // A user's own link keeps its switch, and the KB its fixed level.
+    expect(component.linkAccessManaged(linked('pg'))).toBe(false);
+    expect(
+      component.linkAccessManaged(linked('kb', {type: 'kb', managed_key: `project-kb:${PROJECT}`})),
+    ).toBe(false);
+  });
+
+  it('shows no switch before the matrix loads either', () => {
+    const {component} = createComponent({drivers: null});
+    expect(component.linkAccessManaged(FOLDER)).toBe(true);
+    expect(component.linkAccessLevel(FOLDER)).toBeNull();
+  });
+
+  it('lists the cloud folder links on their own, with a default level each', () => {
+    const {component} = createComponent({drivers: BUILTIN_DRIVERS});
+    const copy = linked('copy', {
+      type: 'cloud_folder_checkout',
+      connection_url: null,
+      config: {},
+      managed_key: `project-cloud-checkout:${PROJECT}`,
+    });
+    component.projectDatasources.set([FOLDER, copy, linked('pg')]);
+    expect(component.cloudFolderLinks().map((ds) => ds.id)).toEqual(['folder', 'copy']);
+    expect(component.otherLinks().map((ds) => ds.id)).toEqual(['pg']);
+    // Without a level of its own, the driver's default, else its highest.
+    expect(component.linkDefaultLevel(FOLDER)).toBe('read_write');
+    expect(component.linkLevel({...FOLDER, project_access: 'protected'})).toBe('protected');
+    expect(component.linkLevelEnforcedBy({...FOLDER, project_access: 'read_only'})).toContain('reader account');
+    expect(component.linkKindLabelKey(FOLDER)).toBe('datasources.platform.kind.projectCloud');
+    expect(component.linkKindLabelKey(copy)).toBe('datasources.platform.kind.projectCloudCheckout');
+  });
+
+  it('offers the levels the eligible list says this cloud offers', () => {
+    const {api, component} = createComponent({drivers: BUILTIN_DRIVERS});
+    api.getProjectDatasources.mockReturnValue(of([FOLDER, linked('pg')]));
+    api.getEligibleDatasources.mockReturnValue(of([
+      {
+        ...FOLDER,
+        default_selected: true,
+        access: {
+          levels: [
+            {id: 'read_only', rank: 10, writes: 'none', offered: false, reason: 'level_not_offered', detail: 'no reader here'},
+            {id: 'protected', rank: 20, writes: 'reviewed', offered: false, reason: 'level_not_offered'},
+            {id: 'read_write', rank: 30, writes: 'direct', offered: true},
+          ],
+          default: 'read_write',
+          default_origin: 'driver_default',
+        },
+      },
+    ]));
+    component.loadProjectDatasources();
+    // One read for the project, no execution kind and any tier.
+    expect(api.getEligibleDatasources).toHaveBeenCalledWith(['project-a']);
+    expect(component.linkLevels(FOLDER).map((level) => [level.id, level.offered])).toEqual([
+      ['read_only', false],
+      ['protected', false],
+      ['read_write', true],
+    ]);
+    expect(component.linkDefaultLevel(FOLDER)).toBe('read_write');
+  });
+
+  it('reads no levels for a project without cloud folders', () => {
+    const {api, component} = createComponent({drivers: BUILTIN_DRIVERS});
+    api.getProjectDatasources.mockReturnValue(of([linked('pg')]));
+    component.loadProjectDatasources();
+    expect(api.getEligibleDatasources).not.toHaveBeenCalled();
+  });
+
+  it('saves a default level, and clears it back to the driver default', () => {
+    const {api, component} = createComponent({drivers: BUILTIN_DRIVERS});
+    const setAccess = vi.fn().mockReturnValue(of({status: 'updated'}));
+    (api as unknown as {setProjectDatasourceAccess: unknown}).setProjectDatasourceAccess = setAccess;
+    component.projectDatasources.set([FOLDER]);
+    component.updateLinkAccess('folder', 'protected');
+    expect(setAccess).toHaveBeenCalledWith('project-a', 'folder', 'protected');
+    expect(api.getProjectDatasources).toHaveBeenCalled();
+    component.projectDatasources.set([{...FOLDER, project_access: 'protected'}]);
+    component.updateLinkAccess('folder', '');
+    expect(setAccess).toHaveBeenLastCalledWith('project-a', 'folder', null);
+    // Nothing to save, and never for a link with the read-only switch.
+    setAccess.mockClear();
+    component.projectDatasources.set([FOLDER, linked('pg')]);
+    component.updateLinkAccess('folder', '');
+    component.updateLinkAccess('pg', 'read_only');
+    expect(setAccess).not.toHaveBeenCalled();
+  });
+
+  it("says why a level was refused, and shows the stored one again", () => {
+    const {api, component} = createComponent({drivers: BUILTIN_DRIVERS});
+    (api as unknown as {setProjectDatasourceAccess: unknown}).setProjectDatasourceAccess = vi
+      .fn()
+      .mockReturnValue(throwError(() => new HttpErrorResponse({
+        status: 422,
+        error: {detail: {code: 'link_access_not_offered', message: "Cloud folder does not offer the access level 'protected'"}},
+      })));
+    component.projectDatasources.set([FOLDER]);
+    const revision = component.linkAccessRevision();
+    component.updateLinkAccess('folder', 'protected');
+    expect(component.cloudFolderError()).toBeTruthy();
+    expect(component.linkAccessRevision()).toBe(revision + 1);
+    expect(component.savingLinkAccess()).toBeNull();
+    expect(en.projectDetail.datasources.cloudFolders.saveFailed).toBeTruthy();
+    expect(de.projectDetail.datasources.cloudFolders.saveFailed).toBeTruthy();
+  });
+
+  it('never sends a link access change for it', () => {
+    const {api, component} = createComponent({drivers: BUILTIN_DRIVERS});
+    const updateProjectDatasource = vi.fn().mockReturnValue(of({status: 'updated'}));
+    (api as unknown as {updateProjectDatasource: unknown}).updateProjectDatasource =
+      updateProjectDatasource;
+    component.projectDatasources.set([FOLDER]);
+    component.updateDatasourceReadOnly('folder', 'true');
+    expect(updateProjectDatasource).not.toHaveBeenCalled();
   });
 });

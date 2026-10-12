@@ -47,6 +47,56 @@ def allocation_name(request):
     )
 
 
+def creation_held(allocation):
+    """A delivered protocol source stays held until exact clone disposition."""
+    if allocation.state.get("workspace_source_issued") is False:
+        return False
+    binding = allocation.state.get("creation_binding")
+    source = allocation.state.get("creation_source")
+    binding_has_target = isinstance(binding, dict) and "target" in binding
+    source_has_target = isinstance(source, dict) and "target" in source
+    # Missing binding metadata cannot downgrade an already delivered workspace
+    # source to an ordinary allocation, including the legacy no-binding path.
+    if binding_has_target != source_has_target or (
+        binding_has_target and binding["target"] != source["target"]
+    ):
+        return True
+    if "creation_disposition" in allocation.state:
+        from shared.vm_creation_source_disposition import validate_prepared_disposition
+
+        try:
+            validate_prepared_disposition(
+                allocation.state["creation_disposition"],
+                request=allocation.request,
+                state=allocation.state,
+                allocation_uid=allocation.uid,
+            )
+            return False
+        except (ValueError, TypeError, KeyError, AttributeError):
+            return True
+    if "creation_binding" not in allocation.state:
+        return False
+    from shared.vm_preparation_target import creation_root_name
+
+    try:
+        expected = creation_root_name(
+            allocation.state["creation_binding"], allocation.request
+        )
+    except (ValueError, TypeError, KeyError):
+        return True
+    root = allocation.state.get("creation_root")
+    if (
+        not isinstance(root, dict)
+        or set(root) != {"name", "dv_uid", "pvc_uid"}
+        or root["name"] != expected
+    ):
+        return True
+    try:
+        return any(str(UUID(root[key])) != root[key] for key in ("dv_uid", "pvc_uid"))
+    except (ValueError, TypeError, AttributeError):
+        return True
+
+
 class VMWorkspacePreparation:
     def __init__(
         self, controller, *, namespace, storage_class, settings, resolver=None
@@ -64,8 +114,17 @@ class VMWorkspacePreparation:
         self.builder_image = None
         self.last_allocation_sweep = 0.0
 
-    async def prepare(self, value):
+    async def prepare(self, value, *, creation=None):
         request = validate_request(value)
+        if creation is not None:
+            from shared.vm_preparation_target import creation_root_name
+
+            try:
+                creation_root_name(creation, request, namespace=self.store.namespace)
+            except (ValueError, TypeError, KeyError) as exc:
+                raise PreparationConflict(
+                    "Creation allocation binding is invalid."
+                ) from exc
         if not self.settings.enabled:
             raise PreparationConflict("VM workspace preparation is not enabled.")
         self.resolver.permitted(request["image"])
@@ -80,6 +139,22 @@ class VMWorkspacePreparation:
                     "expires_at": now() + self.settings.wait_budget + 300,
                 },
             )
+            bound = allocation.state.get("creation_binding")
+            if "creation_binding" in allocation.state and (
+                bound is None or bound != creation
+            ):
+                raise PreparationConflict(
+                    "Preparation source belongs to another creation request."
+                )
+            if creation is not None and bound is None:
+                if allocation.state.get("workspace_source_issued") is not False:
+                    raise PreparationConflict(
+                        "Existing preparation delivery is unproven."
+                    )
+                await self.store.save(
+                    allocation,
+                    {**allocation.state, "creation_binding": deepcopy(creation)},
+                )
             if allocation.state["phase"] in {"Cancelled", "Failed"}:
                 return self._result(allocation, None)
             if not allocation.state.get("artifact"):
@@ -103,7 +178,9 @@ class VMWorkspacePreparation:
                     allocation,
                     {
                         **allocation.state,
-                        "phase": "Failed",
+                        "phase": allocation.state["phase"]
+                        if creation_held(allocation)
+                        else "Failed",
                         "error": "PreparedArtifactLost",
                     },
                 )
@@ -117,7 +194,9 @@ class VMWorkspacePreparation:
                     allocation,
                     {
                         **allocation.state,
-                        "phase": "Failed",
+                        "phase": allocation.state["phase"]
+                        if creation_held(allocation)
+                        else "Failed",
                         "error": artifact.state.get(
                             "error", "PreparedArtifactUnavailable"
                         ),
@@ -623,9 +702,25 @@ class VMWorkspacePreparation:
             "preparation": payload,
         }, None
 
-    async def mark_allocated(self, request, *, rootdisk, pvc_uid):
+    async def mark_allocated(
+        self,
+        request,
+        *,
+        rootdisk,
+        pvc_uid,
+        creation=None,
+        creation_source=None,
+        rootdisk_dv_uid=None,
+    ):
         """Release the cache pin only after CDI has finished the workspace clone."""
         request = validate_request(request)
+        from shared.vm_preparation_target import creation_root_name
+
+        expected_root = (
+            creation_root_name(creation, request, namespace=self.store.namespace)
+            if creation is not None
+            else None
+        )
         async with self.lock:
             allocation = await self.store.get(allocation_name(request))
             if (
@@ -634,12 +729,31 @@ class VMWorkspacePreparation:
                 or allocation.state["phase"] != "Cloning"
             ):
                 return
+            bound = "creation_binding" in allocation.state
+            if bound and creation is None:
+                # Legacy owner/name observation cannot release a protocol hold.
+                return
+            if creation is not None and (
+                not bound
+                or allocation.state["creation_binding"] != creation
+                or allocation.state.get("creation_source") != creation_source
+                or creation_source is None
+                or creation_source["allocation"]["uid"] != allocation.uid
+                or not rootdisk_dv_uid
+                or rootdisk != expected_root
+            ):
+                raise PreparationConflict("Prepared completion authority changed.")
             dv, pvc = await self.store.dv(rootdisk), await self.store.pvc(rootdisk)
             if (
                 not dv
                 or not pvc
                 or pvc.metadata.uid != pvc_uid
                 or dv.get("status", {}).get("phase") != "Succeeded"
+                or bound
+                and (
+                    dv["metadata"].get("uid") != rootdisk_dv_uid
+                    or getattr(pvc.status, "phase", None) != "Bound"
+                )
             ):
                 return
             artifact = await self.store.get(allocation.state["artifact"])
@@ -660,6 +774,17 @@ class VMWorkspacePreparation:
                     "phase": "Allocated",
                     "rootdisk": rootdisk,
                     "rootdisk_uid": pvc_uid,
+                    **(
+                        {
+                            "creation_root": {
+                                "name": rootdisk,
+                                "dv_uid": rootdisk_dv_uid,
+                                "pvc_uid": pvc_uid,
+                            }
+                        }
+                        if bound
+                        else {}
+                    ),
                 },
             )
 
@@ -676,6 +801,121 @@ class VMWorkspacePreparation:
 
     async def cancel(self, value):
         return (await self.cancel_with_receipt(value))["cancelled"]
+
+    async def mark_source_disposed(
+        self, value, *, plan, source_dv=None, source_observation=None
+    ):
+        """Close only an existing exact allocation after its source-DV CAS."""
+        from shared.vm_creation_source_disposition import validate_prepared_disposition
+        from shared.vm_creation_source_completion import validate_source_observation
+        from vm_controller.creation_sources import pins
+
+        request = validate_request(value)
+        async with self.lock:
+            allocation = await self.store.get(allocation_name(request))
+            source = plan["source"]
+            if (
+                allocation is None
+                or allocation.request != request
+                or allocation.uid != source["allocation"]["uid"]
+            ):
+                raise PreparationConflict(
+                    "Prepared source disposition identity changed."
+                )
+            gone = source_observation is not None
+            if gone:
+                if (
+                    validate_source_observation(plan, source_observation)
+                    != "source_identity_gone"
+                ):
+                    raise PreparationConflict(
+                        "Prepared source still needs a CAS fence."
+                    )
+            elif (
+                source_dv is None
+                or source_dv["metadata"].get("uid") != source["dv_uid"]
+                or source_dv["metadata"].get("namespace") != source["namespace"]
+                or source_dv["metadata"].get("name") != source["name"]
+                or pins(source_dv).get(plan["request_id"]) != plan["tombstone"]
+            ):
+                raise PreparationConflict(
+                    "Prepared source disposition identity changed."
+                )
+            receipt = allocation.state.get("creation_disposition")
+            if receipt is None:
+                receipt = {
+                    "version": 1,
+                    "kind": "prepared_source_identity_gone"
+                    if gone
+                    else "prepared_source_disposed",
+                    "plan": deepcopy(plan),
+                    **(
+                        {"source_observation": deepcopy(source_observation)}
+                        if gone
+                        else {
+                            "source_resource_version": source_dv["metadata"][
+                                "resourceVersion"
+                            ]
+                        }
+                    ),
+                }
+            if receipt.get("plan") != plan:
+                raise PreparationConflict("Prepared source disposition intent changed.")
+            validate_prepared_disposition(
+                receipt,
+                request=request,
+                state=allocation.state,
+                allocation_uid=allocation.uid,
+            )
+            if "creation_disposition" not in allocation.state:
+                await self.store.save(
+                    allocation, {**allocation.state, "creation_disposition": receipt}
+                )
+            return await self._abandon(allocation, "Cancelled", "BuildCancelled")
+
+    async def mark_source_never_delivered(self, value, *, plan):
+        """Fence an existing undelivered allocation; never recreate one as proof."""
+        request = validate_request(value)
+        expected = plan["source"]["allocation"]
+        async with self.lock:
+            allocation = await self.store.get(allocation_name(request))
+            if (
+                allocation is None
+                or allocation.uid != expected["uid"]
+                or allocation.request != request
+                or request != expected["request"]
+                or allocation.state.get("workspace_source_issued") is not False
+                or allocation.state.get("creation_binding")
+                != expected["state"].get("creation_binding")
+                or any(
+                    allocation.state.get(key) is not None
+                    for key in (
+                        "creation_source",
+                        "creation_root",
+                        "rootdisk",
+                        "rootdisk_uid",
+                    )
+                )
+            ):
+                raise PreparationConflict("Preparation non-delivery evidence changed.")
+            receipt = {
+                "version": 1,
+                "kind": "prepared_source_never_delivered",
+                "plan": deepcopy(plan),
+            }
+            if allocation.state.get("creation_disposition") not in (None, receipt):
+                raise PreparationConflict("Preparation disposition receipt changed.")
+            if allocation.state.get("creation_disposition") is None:
+                await self.store.save(
+                    allocation,
+                    {
+                        **allocation.state,
+                        "creation_disposition": receipt,
+                        "phase": "Cancelled",
+                        "error": "BuildCancelled",
+                    },
+                )
+            return await self._abandon(allocation, "Cancelled", "BuildCancelled")
 
     async def cancel_with_receipt(self, value):
         """Fence future source delivery and report durable non-issuance proof."""
@@ -723,6 +963,8 @@ class VMWorkspacePreparation:
             }
 
     async def _abandon(self, allocation, phase, error):
+        if creation_held(allocation):
+            return False
         await self.store.save(
             allocation, {**allocation.state, "phase": phase, "error": error}
         )
@@ -769,7 +1011,8 @@ class VMWorkspacePreparation:
         return [
             a
             for a in await self.store.records("allocation", artifact_uid=artifact.uid)
-            if a.state.get("artifact_uid") == artifact.uid and a.state["phase"] in HELD
+            if a.state.get("artifact_uid") == artifact.uid
+            and (a.state["phase"] in HELD or creation_held(a))
         ]
 
     async def _remove(self, artifact, *, allow_failed_holders=False):
@@ -777,6 +1020,8 @@ class VMWorkspacePreparation:
             return False
         holders = await self._holders(artifact)
         if holders:
+            if any(creation_held(allocation) for allocation in holders):
+                return False
             if artifact.state["phase"] != "Failed" or not allow_failed_holders:
                 return False
             for allocation in holders:
@@ -904,6 +1149,15 @@ class VMWorkspacePreparation:
                     elif (
                         allocation.state["phase"]
                         in {"Allocated", "Failed", "Cancelled"}
+                        and (
+                            "creation_binding" not in allocation.state
+                            or allocation.state.get("workspace_source_issued") is False
+                        )
+                        # Keep cancellation's logical-name fence: a delayed
+                        # original ensure/POST must still see Cancelled, even
+                        # when no source was ever delivered. Malformed evidence
+                        # preserves the hold; it never authorizes its erasure.
+                        and "creation_disposition" not in allocation.state
                         and now() > expires + 7 * 86400
                     ):
                         await self.store.delete_record(allocation)

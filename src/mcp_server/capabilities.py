@@ -177,6 +177,7 @@ _READ_CAPABILITIES = (
     _read("get_skill", "GET /api/skills/{skill_id}"),
     _read("list_models", "GET /api/models"),
     _read("list_datasources", "GET /api/datasources/catalog"),
+    _read("list_connector_drivers", "GET /api/datasources/drivers"),
     _read("get_datasource", "GET /api/datasources/{datasource_id}"),
     _read("list_tables", "GET /api/tables", authorization=_ADMIN_AUTH),
     _read("query_table", "GET /api/tables/{table_name}", authorization=_ADMIN_AUTH),

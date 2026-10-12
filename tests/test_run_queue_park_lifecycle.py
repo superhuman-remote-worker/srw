@@ -25,7 +25,9 @@ from shared.run_queue import (
     PARK_REASON_ATTACH_FAILED,
     PARK_REASON_CLAIM_LOSS_HOLD,
     PARK_REASON_COMPLETION_CAS_FAILED,
+    PARK_REASON_MODEL_UNAVAILABLE,
     PARK_REASON_REAPER_MAX_ATTEMPTS,
+    PARK_REASON_RETRY_EXHAUSTED,
     PARK_REASON_SHUTDOWN_CANCELLED,
     RETRYABLE_PARK_REASONS,
     ClaimedUnit,
@@ -33,6 +35,7 @@ from shared.run_queue import (
     list_parked,
     queue_state_for,
     record_attach_failure,
+    release_unit,
 )
 from shared.run_queue import queries as q
 from shared.session_retirement import (
@@ -110,8 +113,14 @@ def test_retryable_set_and_refusal_order():
         PARK_REASON_SHUTDOWN_CANCELLED,
         PARK_REASON_COMPLETION_CAS_FAILED,
         PARK_REASON_REAPER_MAX_ATTEMPTS,
+        PARK_REASON_RETRY_EXHAUSTED,
+        PARK_REASON_MODEL_UNAVAILABLE,
     }
     assert sqs.park_retry_refusal(PARK_REASON_ATTACH_FAILED, {}) is None
+    assert sqs.park_retry_refusal(PARK_REASON_RETRY_EXHAUSTED, {}) is None
+    # Refused at claim for an unavailable model: pre-effect, owner-retryable
+    # once the model is switched (unavailable_model_handling.md §5).
+    assert sqs.park_retry_refusal(PARK_REASON_MODEL_UNAVAILABLE, {}) is None
     assert sqs.park_retry_refusal(PARK_REASON_ATTACH_FAILED, None) is None
     assert (
         sqs.park_retry_refusal("some_executor_reason", {})
@@ -152,15 +161,29 @@ def test_queue_block_shapes_parked_and_idle():
         "attempts": 3,
         "pending_input": True,
     }
-    block = sqs.queue_block(parked, {})
+    block = sqs.queue_block({**parked, "last_error": "internal trace"}, {})
     assert block == {
         "state": "parked",
         "park_reason": PARK_REASON_ATTACH_FAILED,
+        # Internal error text is never shown for an ordinary park.
+        "park_message": None,
         "parked_at": NOW.isoformat(),
         "retryable": True,
         "attempts": 3,
         "pending_input": True,
     }
+    refused = sqs.queue_block(
+        {
+            **parked,
+            "park_reason": PARK_REASON_MODEL_UNAVAILABLE,
+            "last_error": "The model `MiniMax-M3` (main model) is no longer available.",
+        },
+        {},
+    )
+    assert refused["park_message"] == (
+        "The model `MiniMax-M3` (main model) is no longer available."
+    )
+    assert refused["retryable"] is True
     held = sqs.queue_block(parked, {CLAIM_LOSS_HOLD_KEY: {}})
     assert held["retryable"] is False
     idle = sqs.queue_block({"state": "done", "park_reason": "stale", "attempts": 0}, {})
@@ -187,6 +210,110 @@ def test_record_attach_failure_sql_contract():
     assert "park_reason = CASE WHEN verdict.will_park THEN 'attach_failed'" in sql
     assert "run_after = now() + make_interval(secs => $5::float8)" in sql
     assert "RETURNING queue.state, queue.attempts_since_completion" in sql
+
+
+def test_deterministic_release_sql_parks_at_the_rows_own_budget():
+    sql = q._RELEASE_DETERMINISTIC_SQL
+    # Same exact-lease fence as every other disposition CAS.
+    assert "lease_token = $2::bigint AND state = 'leased'" in sql
+    # The budget is deterministic FAILURES, never claims: attempts (which
+    # hand-backs and transient releases also bump) neither park nor count.
+    assert "attempts_since_completion" not in sql
+    assert "last_error_signature IS NOT DISTINCT FROM $8::text" in sql
+    assert "THEN attach_failures + 1 ELSE 1 END AS failures" in sql
+    assert sql.count("WHEN cur.failures >= cur.max_attempts") == 3
+    assert "THEN 'parked' ELSE 'queued' END" in sql
+    assert "THEN $6::text ELSE queue.park_reason END" in sql
+    assert "last_error = COALESCE($7::text, queue.last_error)" in sql
+    # The attach-failure spacing (5/15/45/135 s): a fail-closed 409 streak
+    # behind a dependency blip must outlast it before it parks.
+    assert "$5::float8 * power(3::float8, cur.failures - 1))" in sql
+    assert "LEAST($9::float8," in sql
+    # The unbounded statement stays for transients and shutdown hand-backs,
+    # and never touches the failure record the budget reads.
+    for untouched in ("max_attempts", "attach_failures", "last_error_signature"):
+        assert untouched not in q._RELEASE_SQL
+
+
+def test_transient_release_backoff_doubles_and_caps():
+    assert [q.transient_release_backoff_seconds(n) for n in range(1, 8)] == [
+        5.0,
+        10.0,
+        20.0,
+        40.0,
+        60.0,
+        60.0,
+        60.0,
+    ]
+    assert q.transient_release_backoff_seconds(0) == 5.0
+    assert q.transient_release_backoff_seconds(10_000) == 60.0
+
+
+def test_every_release_site_reason_is_classified():
+    """A new ``_release`` reason must choose: deterministic (counts toward the
+    park budget) or transient (re-queues forever with backoff)."""
+    import inspect
+    import re
+
+    source = inspect.getsource(te)
+    sites = re.findall(r"self\._release\(", source)
+    calls = re.findall(r'self\._release\(\s*\w+,\s*reason=(f?)"([^"]+)"\s*\)', source)
+    # Every site must pass a string reason this test can read; a reason held
+    # in a variable would escape classification, so it fails here instead.
+    assert len(calls) == len(sites) > 0
+    literal = {reason for prefix, reason in calls if not prefix}
+    templated = {reason for prefix, reason in calls if prefix}
+    assert templated == {"bundle_{e.status_code}"}
+    classified = te._DETERMINISTIC_RELEASE_REASONS | te._TRANSIENT_RELEASE_REASONS
+    assert not te._DETERMINISTIC_RELEASE_REASONS & te._TRANSIENT_RELEASE_REASONS
+    assert literal - classified == set()
+    assert classified - literal == set()  # no stale entries either
+    # The templated bundle reason is classified by status.
+    assert te._release_is_deterministic("bundle_409")
+    assert te._release_is_deterministic("bundle_403")
+    assert te._release_is_deterministic("bundle_401")
+    for transient in ("bundle_500", "bundle_502", "bundle_503", "bundle_429"):
+        assert not te._release_is_deterministic(transient), transient
+    assert not te._release_is_deterministic("bundle_error")
+    assert te._release_is_deterministic("loop_died")
+    assert not te._release_is_deterministic("some_future_reason")
+
+
+@pytest.mark.asyncio
+async def test_release_unit_routes_only_budgeted_callers_to_the_bounded_sql():
+    class _ValConn:
+        def __init__(self):
+            self.calls = []
+
+        async def fetchval(self, query, *args):
+            self.calls.append((query, args))
+            return "queued"
+
+    conn = _ValConn()
+    await release_unit(conn, unit_id=UNIT, lease_token=7, error=True)
+    await release_unit(
+        conn,
+        unit_id=UNIT,
+        lease_token=7,
+        error=True,
+        park_reason=PARK_REASON_RETRY_EXHAUSTED,
+        last_error="bundle_409",
+    )
+    assert conn.calls[0] == (q._RELEASE_SQL, (UNIT, 7, 0.0, True, 5.0))
+    assert conn.calls[1] == (
+        q._RELEASE_DETERMINISTIC_SQL,
+        (
+            UNIT,
+            7,
+            0.0,
+            True,
+            5.0,
+            PARK_REASON_RETRY_EXHAUSTED,
+            "bundle_409",
+            q.DETERMINISTIC_RELEASE_SIGNATURE,
+            ATTACH_FAILURE_BACKOFF_CAP_SECONDS,
+        ),
+    )
 
 
 def test_park_unpark_complete_and_reaper_sql_carry_the_lifecycle():
@@ -343,13 +470,50 @@ def _claim(
     )
 
 
+class _TxConn:
+    """A bare connection for the thread-locked release transaction.
+
+    The queue statements and the frame append are patched per test; this
+    answers only the thread lock (a stateless thread) and the epoch bump.
+    """
+
+    def __init__(self):
+        self.transactions = 0
+        self.bumped = 0
+
+    def transaction(self):
+        conn = self
+
+        class _Tx:
+            async def __aenter__(self):
+                conn.transactions += 1
+
+            async def __aexit__(self, *exc):
+                return False
+
+        return _Tx()
+
+    async def fetchrow(self, query, *args):
+        if query == te._LOCK_RELEASE_THREAD_SQL:
+            return {"execution_lane": "stateless", "agent_id": None, "metadata": {}}
+        if "SET events_epoch = events_epoch + 1" in query:
+            self.bumped += 1
+            return {"events_epoch": 4}
+        return None
+
+    async def fetch(self, query, *args):
+        return []  # no permission prompt pending under the parked token
+
+
 @pytest.fixture
 def executor(monkeypatch):
     ex = te.StatelessTurnExecutor(pod_name="test-pod")
-    # ``_db`` resolves the agent's pool through the persistent app; the
-    # statements are patched below, so any sentinel will do.
+    # ``_db`` resolves the agent's pool through the persistent app; the queue
+    # statements are patched below, so a bare transaction-capable stand-in
+    # will do (real-Postgres proofs: test_session_release_budget_real_postgres).
+    ex.test_conn = _TxConn()
     monkeypatch.setattr(
-        te.StatelessTurnExecutor, "_db", property(lambda self: object())
+        te.StatelessTurnExecutor, "_db", property(lambda self: self.test_conn)
     )
     monkeypatch.setattr(te, "_pa", lambda: MagicMock())
     monkeypatch.setattr(ex, "_quiesce_claim_before_transition", AsyncMock())
@@ -418,6 +582,85 @@ async def test_attach_failure_park_journals_turn_parked(executor, monkeypatch):
     assert kwargs["payload"]["retryable"] is True
     assert kwargs["payload"]["error"] == "subagent 400"
     assert kwargs["payload"]["parked_by"] == "test-pod"
+    # Same transaction as the CAS, on a fresh epoch edge.
+    assert journal.await_args.args == (executor.test_conn,)
+    assert record.await_args.args == (executor.test_conn,)
+    assert executor.test_conn.transactions == 1
+    assert executor.test_conn.bumped == 1
+
+
+@pytest.mark.asyncio
+async def test_exhausted_error_release_parks_and_journals_retry_exhausted(
+    executor, monkeypatch
+):
+    release = AsyncMock(return_value="parked")
+    journal = AsyncMock(return_value=(4, 1))
+    monkeypatch.setattr(te, "release_unit", release)
+    monkeypatch.setattr(te, "append_system_frame", journal)
+
+    await executor._release(_claim(attempts=5), reason="bundle_409")
+
+    kwargs = release.await_args.kwargs
+    assert kwargs["park_reason"] == PARK_REASON_RETRY_EXHAUSTED
+    assert kwargs["last_error"] == "bundle_409" and kwargs["error"] is True
+    payload = journal.await_args.kwargs["payload"]
+    assert payload == {
+        "reason": PARK_REASON_RETRY_EXHAUSTED,
+        "release_reason": "bundle_409",
+        "attempts": 5,
+        "retryable": True,
+        "parked_by": "test-pod",
+        "lease_token": 7,
+    }
+    assert executor.test_conn.transactions == 1
+    assert executor.test_conn.bumped == 1
+    executor._ack_terminal_claim_loss.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_model_unavailable_parks_at_once_with_the_message(executor, monkeypatch):
+    """A claim refused because a configured model cannot run parks on its
+    first attempt — no retry budget spent — with the refusal as last_error,
+    journalled like every park (unavailable_model_handling.md §5)."""
+    park = AsyncMock(return_value="parked")
+    release = AsyncMock()
+    journal = AsyncMock(return_value=(0, 1))
+    monkeypatch.setattr(te, "park_unit", park)
+    monkeypatch.setattr(te, "release_unit", release)
+    monkeypatch.setattr(te, "append_system_frame", journal)
+    message = "The model `MiniMax-M3` (main model) is no longer available."
+
+    await executor._park_model_unavailable(_claim(attempts=1), message)
+
+    release.assert_not_awaited()
+    kwargs = park.await_args.kwargs
+    assert kwargs["reason"] == PARK_REASON_MODEL_UNAVAILABLE
+    assert kwargs["last_error"] == message
+    assert kwargs["lease_token"] == 7
+    payload = journal.await_args.kwargs["payload"]
+    assert payload["reason"] == PARK_REASON_MODEL_UNAVAILABLE
+    assert payload["retryable"] is True
+    assert payload["error"] == message
+    assert executor.test_conn.transactions == 1
+    executor._clear_claim_tool_effect.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_transient_error_release_never_asks_to_park(executor, monkeypatch):
+    release = AsyncMock(return_value="queued")
+    monkeypatch.setattr(te, "release_unit", release)
+    journal = AsyncMock()
+    monkeypatch.setattr(te, "append_system_frame", journal)
+
+    await executor._release(_claim(attempts=3), reason="bundle_503")
+
+    kwargs = release.await_args.kwargs
+    assert "park_reason" not in kwargs
+    assert kwargs["error"] is True
+    assert kwargs["backoff_seconds"] == 20.0  # 5 s x 2^(3-1)
+    journal.assert_not_awaited()
+    assert executor.test_conn.bumped == 0
+    executor._clear_claim_tool_effect.assert_called_once()
 
 
 @pytest.mark.asyncio

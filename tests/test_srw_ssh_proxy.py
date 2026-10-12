@@ -199,6 +199,35 @@ def test_fetch_attach_token_reports_unauthorized_distinctly():
     assert "PAT" in message
 
 
+def test_fetch_attach_token_names_the_missing_scope():
+    """A valid PAT minted without chat:write is a different fix from a bad
+    one; the orchestrator's detail says which scope, so the helper does too."""
+    body = b'{"detail": "Insufficient token scope: requires chat:write"}'
+    conn_cls = _connection_returning(403, body)
+    with pytest.raises(SystemExit) as excinfo:
+        proxy.fetch_attach_token("api.srw.works", "pat-value", connection_cls=conn_cls)
+    message = str(excinfo.value)
+    assert "token exchange refused (403): PAT lacks the chat:write scope" in message
+    assert "unscoped" not in message
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        b'{"detail": "Invalid token"}',
+        b'{"detail": "Insufficient token scope: personal access tokens cannot '
+        b'use this endpoint"}',
+        b"not json",
+        b"[]",
+    ],
+)
+def test_fetch_attach_token_other_refusals_keep_the_generic_hint(body):
+    conn_cls = _connection_returning(403, body)
+    with pytest.raises(SystemExit) as excinfo:
+        proxy.fetch_attach_token("api.srw.works", "pat-value", connection_cls=conn_cls)
+    assert "bad or unscoped PAT" in str(excinfo.value)
+
+
 def test_fetch_attach_token_reports_connection_errors_distinctly():
     conn_cls = _connection_raising(OSError("Name or service not known"))
     with pytest.raises(SystemExit) as excinfo:

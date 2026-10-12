@@ -218,7 +218,7 @@ class TestExtractMemoriesTask:
         assert context == ""
 
     @patch(
-        "shared.runtime.core.workspace_injection.is_workspace_injection_message",
+        "shared.runtime.core.context_entries.is_context_injection",
         return_value=True,
     )
     def test_build_context_skips_injections(self, mock_is_injection):
@@ -719,6 +719,96 @@ class TestMessageFormatting:
         assert "Real content" in result
         # Only one message should be in the output
         assert result.count("[") == 1
+
+    def test_format_skips_typed_context_entries(self):
+        from shared.runtime.core.context_entries import make_context_entry
+
+        messages = [
+            HumanMessage(content="We chose Postgres."),
+            make_context_entry("memory", "ENTRY_MEMORY", section="memory"),
+            make_context_entry("guidance", "ENTRY_GUIDANCE", section="guidance"),
+        ]
+        result = _format_messages_for_extraction(messages)
+        assert result == "[User] We chose Postgres."
+
+
+class TestObservationWindowFiltersBeforeCap:
+    """Injected context is filtered BEFORE the 40-message window cap.
+
+    Capping first let injections use up the window: 5 real messages followed
+    by 40 injections left the extractor nothing to read (WP0 survey B4).
+    """
+
+    @staticmethod
+    def _history():
+        from agent.core.memory_injection import create_memory_injection_messages
+        from shared.runtime.core.context_entries import make_context_entry
+
+        real = [
+            HumanMessage(content=f"real {i}")
+            if i % 2 == 0
+            else AIMessage(content=f"real {i}")
+            for i in range(5)
+        ]
+        injected = []
+        for i in range(10):
+            injected.extend(create_memory_injection_messages(f"--- legacy {i} ---"))
+            injected.append(
+                make_context_entry("memory", f"entry {i}", section="memory")
+            )
+            injected.append(
+                make_context_entry("knowledge", f"note {i}", section="knowledge")
+            )
+        assert len(injected) == 40
+        return real, real + injected
+
+    @pytest.mark.asyncio
+    async def test_extraction_window_keeps_the_real_messages(self):
+        from shared.runtime.services.auxiliary import extract_and_store_memories
+
+        real, history = self._history()
+        aux = MagicMock()
+        aux.chain = AsyncMock(return_value=ExtractedMemories(memories=[]))
+
+        await extract_and_store_memories(aux, MagicMock(), history, "prompt")
+
+        task = aux.chain.call_args[0][0]
+        assert task.messages == real
+
+    @pytest.mark.asyncio
+    async def test_assembler_window_keeps_the_real_messages(self):
+        from shared.runtime.services.auxiliary import assemble_memories
+
+        real, history = self._history()
+        aux = MagicMock()
+        aux.agent = AsyncMock(
+            return_value=MagicMock(actions_taken=[], gaps_identified=[], summary="")
+        )
+
+        with patch(
+            "shared.runtime.services.assembler_tools.create_assembler_tools",
+            return_value=[],
+        ):
+            await assemble_memories(aux, MagicMock(), history, "", "prompt")
+
+        task = aux.agent.call_args[0][0]
+        assert task.recent_context == _format_messages_for_extraction(real)
+        assert "real 0" in task.recent_context
+
+    @pytest.mark.asyncio
+    async def test_all_injections_means_no_extraction(self):
+        from shared.runtime.services.auxiliary import extract_and_store_memories
+
+        _, history = self._history()
+        aux = MagicMock()
+        aux.chain = AsyncMock()
+
+        stored = await extract_and_store_memories(
+            aux, MagicMock(), history[5:], "prompt"
+        )
+
+        assert stored == 0
+        aux.chain.assert_not_called()
 
 
 # =============================================================================

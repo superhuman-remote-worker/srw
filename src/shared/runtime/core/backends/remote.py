@@ -25,6 +25,7 @@ import time
 import uuid
 import weakref
 from collections import OrderedDict
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -46,6 +47,8 @@ from shared.runtime.core.shell_protocol import (
     SUDO_FREEZE_SENTINEL,
     build_sentinel_command,
     compute_no_change_state,
+    new_start_marker,
+    start_marker_command,
 )
 from shared.runtime.core.workspace_backend import (
     SEARCH_RESULT_HARD_CAP,
@@ -57,6 +60,14 @@ from shared.runtime.core.workspace_backend import (
 )
 
 logger = logging.getLogger(__name__)
+
+#: Bytes a command may have to be typed into a pane with ``tmux send-keys``.
+#: tmux refuses a longer message ("command too long", about 16 KiB), and the
+#: guard script's trailing Enter still succeeded, so the pane guard waited for
+#: a command the shell never received and the tab refused every later command
+#: (dev session 2c6d3e06, 16.7 KB and 23.4 KB heredocs). A longer command runs
+#: from a workspace file instead (``_spill_long_command``).
+_SEND_KEYS_INLINE_LIMIT = 8 * 1024
 
 # Stall/timeout constants, interactive-prompt patterns and message templates
 # are shared from shell_protocol (imported above) to keep the local and remote
@@ -77,6 +88,10 @@ _AUTH_ERROR_MARKERS = (
 # channel keeps draining so the remote command can finish. Guards agent RAM.
 _EXEC_MAX_OUTPUT_BYTES = 5 * 1024 * 1024
 _EXEC_POLL_SECONDS = 0.05
+
+# A preceding terminal cleanup transport may still have a closing sshd process.
+# Read-only zero proofs briefly wait for it without weakening the proof.
+_TERMINAL_PROOF_SETTLE_SECONDS = 5.0
 
 # Session-channel opens refused by sshd on a LIVE transport (MaxSessions) are
 # transient concurrency refusals, not workspace death: retry briefly, then
@@ -275,6 +290,7 @@ _PENDING_GUARD_STALE_SECONDS = 15 * 60
 _STALE_GUARD_CLEARED_MARKER = "__SRW_STALE_GUARD_CLEARED__"
 _TMUX_PANE_ID_PATTERN = re.compile(r"^%(?:0|[1-9][0-9]*)$")
 _TMUX_PENDING_PATTERN = re.compile(r"^__DONE_[0-9a-f]{12}__$")
+_START_MARKER_PATTERN = re.compile(r"^__SRW_START_[0-9a-f]{12}__$")
 _TMUX_PROMPT_TOKEN_PATTERN = re.compile(r"^[0-9a-f]{32}$")
 _TMUX_STATE_VERSION = "1"
 _TMUX_LEGACY_INCARNATION_STATE_VERSION = "2"
@@ -346,6 +362,16 @@ def _parse_shell_completion_record(
     if not cwd.startswith("/"):
         return None
     return exit_code, cwd
+
+
+def _is_shell_completion_record(line: str) -> bool:
+    """Whether ``line`` is any command's exact completion record."""
+    head = line.strip().split(maxsplit=1)
+    return bool(
+        head
+        and _TMUX_PENDING_PATTERN.fullmatch(head[0])
+        and _parse_shell_completion_record(line, head[0]) is not None
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -458,6 +484,8 @@ class RemoteBackend(WorkspaceBackend):
         self._remote_root = workspace_path.rstrip("/")
         self._job_id = job_id
         self._credential_env_path: str | None = None
+        #: The last credential-file sync's report (paths and names only).
+        self.credential_files_report: dict[str, Any] | None = None
         self._scrollback_limit = scrollback_limit
         self._default_timeout = default_timeout
         self._no_change_timeout = no_change_timeout
@@ -903,8 +931,11 @@ class RemoteBackend(WorkspaceBackend):
         # could match the very tag being scanned. It also handles /proc stat
         # names with spaces and excludes the complete verifier ancestor chain
         # (entrypoint/sshd/flock/sh), while still finding disowned siblings.
+        # A refusal ends the enclosing script: a caller may append its own
+        # proof after this scan, and that command's success must never be
+        # reported in place of the scan's 85/86.
         return f"""
-python3 - {shlex.quote(env_name)} {tag_argument} {mode} <<'__SRW_PROCESS_ZERO_PY__'
+python3 - {shlex.quote(env_name)} {tag_argument} {mode} <<'__SRW_PROCESS_ZERO_PY__' || exit $?
 import os
 import signal
 import sys
@@ -925,6 +956,45 @@ while pid >= 1 and pid not in ancestors:
     except (OSError, ValueError, IndexError):
         break
 
+UNSETTLED = object()
+
+def environment(name):
+    # Every thread of a group shares one mm and so one environment. A
+    # leader without an mm (a zombie, an exiting task, or a dead main
+    # thread whose siblings still run) opens with ESRCH on Linux 6.16+ and
+    # reads empty before it, so ESRCH alone never proves the group stopped:
+    # read through the tasks, where any task holding the mm is exact.
+    try:
+        values = open(f"/proc/{{name}}/environ", "rb").read()
+    except ProcessLookupError:
+        values = b""
+    if values:
+        return values.split(b"\\0")
+    for _ in range(5):
+        try:
+            listed = os.listdir(f"/proc/{{name}}/task")
+            for tid in listed:
+                try:
+                    values = open(f"/proc/{{name}}/task/{{tid}}/environ", "rb").read()
+                except (FileNotFoundError, ProcessLookupError):
+                    continue
+                if values:
+                    return values.split(b"\\0")
+            relisted = os.listdir(f"/proc/{{name}}/task")
+        except ProcessLookupError:
+            # The task directory can open just before reaping and then
+            # readdir raises ESRCH. Repeat the complete observation: ESRCH
+            # alone proves neither absence nor that no live sibling exists.
+            # Persistent inability to inspect still returns UNSETTLED.
+            time.sleep(0.005)
+            continue
+        # No listed task holds an mm with an environment. A thread created
+        # meanwhile appears in a second listing; without one, no task of
+        # the group carries a tag it can still act on.
+        if set(relisted) <= set(listed):
+            return None
+    return UNSETTLED
+
 def matching():
     found = []
     ambiguous = False
@@ -935,7 +1005,7 @@ def matching():
         if candidate in ancestors:
             continue
         try:
-            values = open(f"/proc/{{name}}/environ", "rb").read().split(b"\\0")
+            values = environment(name)
         except FileNotFoundError:
             continue
         except PermissionError:
@@ -952,7 +1022,9 @@ def matching():
             continue
         except OSError:
             raise SystemExit(86)
-        if tag in values:
+        if values is UNSETTLED:
+            ambiguous = True
+        elif values is not None and tag in values:
             found.append(candidate)
     return found, ambiguous
 
@@ -1036,7 +1108,10 @@ def process_identity(name):
             uid_line = next(line for line in status if line.startswith("Uid:"))
             real_uid = int(uid_line.split()[1])
             state_line = next(line for line in status if line.startswith("State:"))
-            return real_uid, state_line.split()[1]
+            threads_line = next(
+                line for line in status if line.startswith("Threads:")
+            )
+            return real_uid, state_line.split()[1], int(threads_line.split()[1])
         except FileNotFoundError:
             return None
         except (PermissionError, OSError, StopIteration, ValueError, IndexError):
@@ -1062,12 +1137,15 @@ def same_uid_processes():
         identity = process_identity(name)
         if identity is None:
             continue
-        real_uid, state = identity
-        # A zombie has already lost every userspace execution capability and
-        # cannot mutate the workspace.  Its parent/reaper may need the exact
-        # cleanup SSH ancestry to stay alive long enough to collect it, so a
-        # zombie must not make the process-zero proof self-deadlock.
-        if real_uid == workspace_uid and state != "Z":
+        real_uid, state, threads = identity
+        # A zombie whose thread group has otherwise exited has lost every
+        # userspace execution capability and cannot mutate the workspace.
+        # Its parent/reaper may need the exact cleanup SSH ancestry to stay
+        # alive long enough to collect it, so it must not make the
+        # process-zero proof self-deadlock.  ``Threads`` counts every thread
+        # until it is released, so a ``Z`` leader with more than one is a
+        # dead main thread whose siblings still execute as this UID.
+        if real_uid == workspace_uid and not (state == "Z" and threads == 1):
             found.append(candidate)
     return found
 
@@ -1199,8 +1277,48 @@ __SRW_WORKSPACE_UID_ZERO_PY__
         """
 
         del operation  # retained for call-site audit symmetry
+        returncode, _output = self._claim_resource_secret_stdin_exec(
+            command, secret, timeout=timeout, keep_stdout=False
+        )
+        return returncode == 0
+
+    def execute_claim_resource_with_secret_stdin_output(
+        self,
+        command: str,
+        secret: str | bytes | bytearray,
+        *,
+        timeout: int = 30,
+        operation: str = "workspace secret resource mutation",
+    ) -> tuple[int, str]:
+        """The claim-fenced secret-stdin run, returning ``(exit code, stdout)``.
+
+        Only for a server-authored program whose stdout is a credential-free
+        report; stderr is still discarded.
+        """
+
+        del operation  # retained for call-site audit symmetry
+        return self._claim_resource_secret_stdin_exec(
+            command, secret, timeout=timeout, keep_stdout=True
+        )
+
+    def _claim_resource_secret_stdin_exec(
+        self,
+        command: str,
+        secret: str | bytes | bytearray,
+        *,
+        timeout: int,
+        keep_stdout: bool,
+    ) -> tuple[int, str]:
+        def run(text: str) -> tuple[int, str]:
+            if keep_stdout:
+                return self.execute_with_secret_stdin_output(
+                    text, secret, timeout=timeout
+                )
+            ok = self.execute_with_secret_stdin(text, secret, timeout=timeout)
+            return (0 if ok else 1), ""
+
         if self._shell_owner_token is None:
-            return self.execute_with_secret_stdin(command, secret, timeout=timeout)
+            return run(command)
         with self._claim_resource_io_lock:
             if self._claim_resource_retired:
                 raise WorkspaceUnavailableError(
@@ -1216,11 +1334,7 @@ __SRW_WORKSPACE_UID_ZERO_PY__
                 + (process_tag + "\n" if process_tag else "")
                 + command
             )
-            return self.execute_with_secret_stdin(
-                self._tmux_lock_command(inner, shell="bash"),
-                secret,
-                timeout=timeout,
-            )
+            return run(self._tmux_lock_command(inner, shell="bash"))
 
     def exec_terminal_claim_resource(
         self,
@@ -1242,9 +1356,12 @@ __SRW_WORKSPACE_UID_ZERO_PY__
         It never creates a missing tmux session.  A missing marker is accepted
         only when the exact tmux name is also absent; an active marker with a
         missing tmux is promoted in place so resident daemons can still be
-        drained.  The record remains ``active`` at ``T`` on success (and on a
-        command failure), allowing :meth:`shell_cleanup` to be the sole writer
-        of the terminal ``retired`` acknowledgement afterward.
+        drained.  A marker naming another runtime is the retired predecessor's
+        record on a Resume-reused volume: like :meth:`shell_cleanup`'s stale
+        branch it is replaced only at or below ``T`` and only while the exact
+        tmux name is absent.  The record remains ``active`` at ``T`` on success
+        (and on a command failure), allowing :meth:`shell_cleanup` to be the
+        sole writer of the terminal ``retired`` acknowledgement afterward.
         """
 
         if self._shell_owner_token is None or not self.workspace_incarnation_fenced:
@@ -1294,11 +1411,33 @@ __SRW_WORKSPACE_UID_ZERO_PY__
                 )
             inner = self._stateless_retired_resource_fence_shell() + command
             with self._shell_io_lock:
-                output, exit_code = self._exec_with_status(
-                    self._tmux_lock_command(inner, shell="bash"),
-                    timeout=timeout,
-                    retain_tail=True,
+                self._close_sftp_before_process_zero_proof()
+                command = self._tmux_lock_command(inner, shell="bash")
+                started = time.monotonic()
+                deadline = started + timeout
+                settle_deadline = min(
+                    deadline, started + _TERMINAL_PROOF_SETTLE_SECONDS
                 )
+                remaining = timeout
+                while True:
+                    output, exit_code = self._exec_with_status(
+                        command, timeout=remaining, retain_tail=True
+                    )
+                    # OpenSSH can leave the previous cleanup connection's
+                    # non-dumpable same-UID sshd alive after local close. Keep
+                    # this transport, with SFTP closed, and repeat the entire
+                    # read-only fence + zero proof. Rebuilding the terminal
+                    # cleanup backend on every retry perpetuates that race.
+                    # Actual writers (85), stale authority and other failures
+                    # still refuse immediately; persistent ambiguity remains
+                    # held. Repeated commands share the caller's command budget.
+                    now = time.monotonic()
+                    if exit_code != 86 or now >= settle_deadline:
+                        break
+                    time.sleep(min(0.1, settle_deadline - now))
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        break
             if exit_code != 0:
                 raise WorkspaceUnavailableError(
                     f"Terminal-fenced {operation} failed with exit code {exit_code}"
@@ -1339,28 +1478,268 @@ __SRW_WORKSPACE_UID_ZERO_PY__
         Existing processes keep their environment. Removed field names remain
         in the workspace; this method intentionally does not promise scrubbing.
         """
-        import hashlib
         import json
 
         from shared.credential_connectors import normalize_credential_env
-        from shared.runtime.core.credential_env import INSTALL_CREDENTIAL_ENV
+        from shared.runtime.core.credential_env import (
+            INSTALL_CREDENTIAL_ENV,
+            WORKSPACE_PYTHON,
+        )
 
         values = normalize_credential_env(values)
         if not values:
             return
         self._init_shell()
-        identity = hashlib.sha256(
-            (self._job_id or self._session_name).encode("utf-8")
-        ).hexdigest()
-        path = self._resolve_home_path(f".srw-credentials/{identity}.sh")
+        path = self._resolve_home_path(
+            f".srw-credentials/{self._credential_identity()}.sh"
+        )
         command = (
-            f"python3 -c {shlex.quote(INSTALL_CREDENTIAL_ENV)} {shlex.quote(path)}"
+            f"{WORKSPACE_PYTHON} -c {shlex.quote(INSTALL_CREDENTIAL_ENV)} "
+            f"{shlex.quote(path)}"
         )
         if not self.execute_claim_resource_with_secret_stdin(
             command, json.dumps(values), timeout=30
         ):
             raise WorkspaceUnavailableError("Could not install workspace credentials")
         self._credential_env_path = path
+
+    def unset_credential_environment(self, names: Sequence[str]) -> None:
+        """Unset variables an earlier install set, for every command from now
+        on (a detached registered driver's, connector drivers D6). Running
+        processes keep their environment."""
+        import json
+
+        from shared.connectors.env_names import connector_env_problem
+        from shared.runtime.core.credential_env import (
+            INSTALL_CREDENTIAL_ENV,
+            WORKSPACE_PYTHON,
+        )
+
+        # Only a name a connector may set was ever installed: never unset
+        # one of the workspace's own.
+        stale = {name: None for name in names if connector_env_problem(name) is None}
+        if not stale:
+            return
+        self._init_shell()
+        path = self._resolve_home_path(
+            f".srw-credentials/{self._credential_identity()}.sh"
+        )
+        command = (
+            f"{WORKSPACE_PYTHON} -c {shlex.quote(INSTALL_CREDENTIAL_ENV)} "
+            f"{shlex.quote(path)}"
+        )
+        if not self.execute_claim_resource_with_secret_stdin(
+            command, json.dumps(stale), timeout=30
+        ):
+            raise WorkspaceUnavailableError("Could not update workspace credentials")
+        self._credential_env_path = path
+
+    def _credential_identity(self) -> str:
+        """The work item's name under ``~/.srw-credentials`` (job or session)."""
+        return hashlib.sha256(
+            (self._job_id or self._session_name).encode("utf-8")
+        ).hexdigest()
+
+    def install_credential_files(
+        self,
+        files: Sequence[Mapping[str, Any]],
+        env: Sequence[Mapping[str, Any]] = (),
+    ) -> dict[str, Any]:
+        """Sync this work item's credential files into the workspace home.
+
+        ``files`` is the whole current set, each ``{"name", "content",
+        "mode", "link"}``: the contents go into a private store under
+        ``~/.srw-credentials/`` (which a snapshot never captures) with their
+        mode (never an execute bit), and ``link`` (home-relative, optional)
+        becomes a symlink to the file. ``env`` names the variables that
+        point at stored files (``{"name", "files", "prepend"}``); they go into
+        the work item's environment file, which every command sources.
+        Contents travel on the secret stdin channel, never tmux or argv.
+        What an earlier sync placed or set and this one does not is removed
+        or emptied; an empty set removes everything.
+
+        Returns the program's credential-free report (``store``, ``linked``,
+        ``skipped``, ``env``, ``env_skipped``, ``env_retired``), which is
+        also kept as :attr:`credential_files_report` for the README.
+        """
+        import json
+
+        from shared.runtime.core.credential_env import (
+            INSTALL_CREDENTIAL_FILES,
+            WORKSPACE_PYTHON,
+        )
+
+        self._init_shell()
+        home = self._get_home_dir()
+        identity = self._credential_identity()
+        command = (
+            f"{WORKSPACE_PYTHON} -c {shlex.quote(INSTALL_CREDENTIAL_FILES)} "
+            f"{shlex.quote(home)} {shlex.quote(f'files-{identity}')} sync"
+        )
+        payload = {
+            "files": [
+                {
+                    "name": str(item["name"]),
+                    "content": str(item["content"]),
+                    "mode": int(item.get("mode", 0o600)),
+                    "link": item.get("link") or None,
+                }
+                for item in files
+            ],
+            "env": [
+                {
+                    "name": str(item["name"]),
+                    "files": [str(name) for name in item.get("files") or ()],
+                    "prepend": item.get("prepend") or None,
+                }
+                for item in env
+            ],
+        }
+        returncode, output = self.execute_claim_resource_with_secret_stdin_output(
+            command, json.dumps(payload), timeout=30
+        )
+        if returncode != 0:
+            raise WorkspaceUnavailableError(
+                "Could not install workspace credential files"
+            )
+        try:
+            report = json.loads(output.strip().splitlines()[-1])
+        except (IndexError, ValueError) as exc:
+            raise WorkspaceUnavailableError(
+                "The workspace credential-file sync gave no report"
+            ) from exc
+        if not isinstance(report, dict):
+            raise WorkspaceUnavailableError(
+                "The workspace credential-file sync gave no report"
+            )
+        if report.get("env_file"):
+            self._credential_env_path = posixpath.join(
+                home, ".srw-credentials", f"{identity}.sh"
+            )
+        self.credential_files_report = report
+        return report
+
+    def _credential_files_retirement_shell(self) -> str:
+        """Remove this work item's credential files and environment file.
+
+        Appended to the terminal shell retirement (:meth:`shell_cleanup`),
+        after every check of that script has passed: a genuine session End,
+        a job's terminal status, or the retired side of a tier swap. Every
+        attach delivers again, so nothing needs them afterwards. It never
+        changes the script's exit status.
+        """
+        from shared.runtime.core.credential_env import (
+            INSTALL_CREDENTIAL_FILES,
+            WORKSPACE_PYTHON,
+        )
+
+        store = f"files-{self._credential_identity()}"
+        return (
+            "_srw_files_rc=$?\n"
+            f"{WORKSPACE_PYTHON} -c {shlex.quote(INSTALL_CREDENTIAL_FILES)} "
+            f'"$HOME" {shlex.quote(store)} retire </dev/null >/dev/null 2>&1 '
+            "|| true\n"
+            '(exit "$_srw_files_rc")\n'
+        )
+
+    def install_connector_lease(self, connector_id: str, token: str) -> str:
+        """Write one connector's lease token to its 0600 file; return the path.
+
+        The token travels on the secret stdin channel only, never in a
+        command line, the environment or tmux (slice C2).
+        """
+        from shared.connectors.leases import lease_file_name
+        from shared.runtime.core.credential_env import (
+            CONNECTOR_LEASE_FILE,
+            WORKSPACE_PYTHON,
+        )
+
+        if not token:
+            raise ValueError("A lease token is required")
+        self._init_shell()
+        path = self._resolve_home_path(lease_file_name(connector_id))
+        command = (
+            f"{WORKSPACE_PYTHON} -c {shlex.quote(CONNECTOR_LEASE_FILE)} install "
+            f"{shlex.quote(path)}"
+        )
+        if not self.execute_claim_resource_with_secret_stdin(
+            command, token, timeout=30
+        ):
+            raise WorkspaceUnavailableError("Could not install a connector lease")
+        return path
+
+    def remove_connector_lease(self, connector_id: str) -> None:
+        """Remove one connector's lease token file, if it exists."""
+        from shared.connectors.leases import lease_file_name
+        from shared.runtime.core.credential_env import (
+            CONNECTOR_LEASE_FILE,
+            WORKSPACE_PYTHON,
+        )
+
+        path = self._resolve_home_path(lease_file_name(connector_id))
+        command = (
+            f"{WORKSPACE_PYTHON} -c {shlex.quote(CONNECTOR_LEASE_FILE)} remove "
+            f"{shlex.quote(path)}"
+        )
+        if not self.execute_claim_resource_with_secret_stdin(command, "", timeout=30):
+            raise WorkspaceUnavailableError("Could not remove a connector lease")
+
+    def install_git_swap_wiring(
+        self,
+        bindings: Sequence[Mapping[str, str]],
+        *,
+        remove: Sequence[str] = (),
+        prune: bool = False,
+    ) -> dict[str, Any]:
+        """Install the git swap driver's wiring under ``~/.srw-credentials/git``.
+
+        Everything travels on the secret stdin channel, never in a command
+        line or tmux (C3); returns the program's report (binding ids only).
+        """
+        import json
+
+        from shared.runtime.core.credential_env import (
+            GIT_SWAP_CREDENTIAL_HELPER,
+            GIT_SWAP_WIRING,
+            WORKSPACE_PYTHON,
+        )
+
+        self._init_shell()
+        home = self._get_home_dir()
+        command = (
+            f"{WORKSPACE_PYTHON} -c {shlex.quote(GIT_SWAP_WIRING)} "
+            f"{shlex.quote(home)} sync"
+        )
+        payload = {
+            "helper": GIT_SWAP_CREDENTIAL_HELPER,
+            "bindings": [
+                {
+                    "id": str(item["id"]),
+                    "include": str(item["include"]),
+                    "ca": str(item["ca"]),
+                    **({"gitdir": str(item["gitdir"])} if item.get("gitdir") else {}),
+                }
+                for item in bindings
+            ],
+            "remove": [str(item) for item in remove],
+            "prune": bool(prune),
+        }
+        returncode, output = self.execute_claim_resource_with_secret_stdin_output(
+            command, json.dumps(payload), timeout=30
+        )
+        if returncode != 0:
+            raise WorkspaceUnavailableError(
+                "Could not install the git swap driver's wiring"
+            )
+        try:
+            report = json.loads(output.strip().splitlines()[-1])
+        except (IndexError, ValueError) as exc:
+            raise WorkspaceUnavailableError(
+                "The git swap wiring gave no report"
+            ) from exc
+        if not isinstance(report, dict):
+            raise WorkspaceUnavailableError("The git swap wiring gave no report")
+        return report
 
     def open_forward_channel(self, dest_host: str = "127.0.0.1", dest_port: int = 8080):
         """Open a ``direct-tcpip`` channel to a loopback port on the workspace.
@@ -1796,8 +2175,14 @@ __SRW_WORKSPACE_UID_ZERO_PY__
         *,
         retain_tail: bool = False,
         sensitive: bool = False,
+        keep_stdout: bool = False,
     ) -> tuple[str, int]:
-        """Drain stdout/stderr until exit under a wall-clock deadline."""
+        """Drain stdout/stderr until exit under a wall-clock deadline.
+
+        ``sensitive`` drops everything the command prints; with
+        ``keep_stdout`` its stdout is kept (stderr never is), for a program
+        whose stdout is a credential-free report.
+        """
         out_chunks: list[bytes] = []
         err_chunks: list[bytes] = []
         out_size = 0
@@ -1812,7 +2197,7 @@ __SRW_WORKSPACE_UID_ZERO_PY__
             # BOTH buffers went momentarily empty.
             while chan.recv_ready() and time.monotonic() <= deadline:
                 chunk = chan.recv(65536)
-                if sensitive:
+                if sensitive and not keep_stdout:
                     pass
                 elif retain_tail:
                     out_chunks.append(chunk)
@@ -1853,7 +2238,9 @@ __SRW_WORKSPACE_UID_ZERO_PY__
             time.sleep(_EXEC_POLL_SECONDS)
         exit_code = chan.recv_exit_status()  # ready — returns immediately
         output = (
-            "" if sensitive else b"".join(out_chunks).decode("utf-8", errors="replace")
+            ""
+            if sensitive and not keep_stdout
+            else b"".join(out_chunks).decode("utf-8", errors="replace")
         )
         if truncated:
             notice = "[output truncated at 5 MiB]"
@@ -2039,6 +2426,32 @@ __SRW_WORKSPACE_UID_ZERO_PY__
         must never interpolate the secret into it.
         """
 
+        returncode, _output = self._secret_stdin_exec(
+            command, secret, timeout=timeout, keep_stdout=False
+        )
+        return returncode == 0
+
+    def execute_with_secret_stdin_output(
+        self, command: str, secret: str | bytes | bytearray, *, timeout: int = 30
+    ) -> tuple[int, str]:
+        """:meth:`execute_with_secret_stdin`, returning ``(exit code, stdout)``.
+
+        Only for a server-authored program whose stdout is a credential-free
+        report; stderr is still discarded.
+        """
+
+        return self._secret_stdin_exec(
+            command, secret, timeout=timeout, keep_stdout=True
+        )
+
+    def _secret_stdin_exec(
+        self,
+        command: str,
+        secret: str | bytes | bytearray,
+        *,
+        timeout: int,
+        keep_stdout: bool,
+    ) -> tuple[int, str]:
         self._ensure_connected()
         if isinstance(secret, bytearray):
             payload = secret
@@ -2059,14 +2472,15 @@ __SRW_WORKSPACE_UID_ZERO_PY__
                 stdin.flush()
                 stdin.channel.shutdown_write()
                 payload[:] = b"\x00" * len(payload)
-                _output, returncode = self._drain_exec_channel(
+                output, returncode = self._drain_exec_channel(
                     stdout.channel,
                     command,
                     timeout,
                     retain_tail=False,
                     sensitive=True,
+                    keep_stdout=keep_stdout,
                 )
-                return returncode == 0
+                return returncode, output
             except (paramiko.SSHException, socket.error, EOFError, OSError) as exc:
                 raise WorkspaceUnavailableError(
                     "Remote secret bootstrap transport failed"
@@ -2160,10 +2574,16 @@ __SRW_WORKSPACE_UID_ZERO_PY__
         self._ensure_connected()
         remote_path = self._resolve(path)
 
-        # Build grep command
+        # Build grep command. -F: the query is literal text, as on every other
+        # backend — without it grep read a basic regex, so ``x[0]`` never found
+        # ``x[0]`` and ``a.c`` also hit ``abc``. -H: GNU grep prints no filename
+        # for a single-file ``path`` even with -r, which the ``file:line:``
+        # parser below silently dropped as malformed.
+        # knowledge-base/knowledge/issues/search_files_literal_query_contract.md
         flags = "-rn"
         if not case_sensitive:
             flags += "i"
+        flags += " -F -H"
 
         # Escape single quotes in query
         safe_query = query.replace("'", "'\\''")
@@ -2182,9 +2602,13 @@ __SRW_WORKSPACE_UID_ZERO_PY__
                 for d in exclude_dirs
             )
 
+        # The path is model-supplied: quote it as ONE word. Unquoted, a space
+        # split it into extra operands resolved from the SSH user's home
+        # (outside the workspace root), and ; $() ` ran commands — on tiers
+        # whose experts are granted no shell tool at all.
         cmd = (
-            f"grep {flags} {excludes} {exclude_dir_flags} -- '{safe_query}' {remote_path} "
-            "2>/dev/null "
+            f"grep {flags} {excludes} {exclude_dir_flags} -- '{safe_query}' "
+            f"{shlex.quote(remote_path)} 2>/dev/null "
             f"| head -n {SEARCH_RESULT_HARD_CAP} || true"
         )
         output = self._exec(cmd, timeout=60)
@@ -2572,15 +2996,24 @@ __SRW_WORKSPACE_UID_ZERO_PY__
         return (
             self._tmux_state_shell()
             + "if _srw_load_state; then\n"
-            + "  _srw_marker=present\n"
             + '  [ "$_srw_process_tagged" = true ] || exit 81\n'
-            + f'  [ "$_srw_workspace_generation" = {expected_workspace} ] '
-            + "|| exit 80\n"
-            + f'  [ "$_srw_runtime_incarnation" = {expected_runtime} ] '
-            + "|| exit 80\n"
-            + '  [ "$_srw_status" = active ] || '
+            + f'  if [ "$_srw_workspace_generation" = {expected_workspace} ] && '
+            + f'[ "$_srw_runtime_incarnation" = {expected_runtime} ]; then\n'
+            + "    _srw_marker=present\n"
+            + '    [ "$_srw_status" = active ] || '
             + '[ "$_srw_status" = creating ] || exit 75\n'
-            + f'  [ "$_srw_token" -le {token} ] || exit 75\n'
+            + f'    [ "$_srw_token" -le {token} ] || exit 75\n'
+            + "  else\n"
+            # The PVC-resident record of a retired predecessor runtime: a
+            # Resume reuses the volume, and only a new turn rewrites it.
+            # Mirror shell_cleanup's stale branch: never behind End's token,
+            # never beside a same-name tmux it cannot explain, otherwise
+            # re-stamped below under this exact runtime.
+            + f'    [ "$_srw_token" -le {token} ] || exit 75\n'
+            + f"    ! tmux has-session -t {target} 2>/dev/null || exit 80\n"
+            + "    _srw_marker=absent\n"
+            + f"    _srw_generation={fallback_generation}\n"
+            + "  fi\n"
             + "else\n"
             + '  _srw_rc=$?; [ "$_srw_rc" -eq 1 ] || exit "$_srw_rc"\n'
             + "  _srw_marker=absent\n"
@@ -2645,6 +3078,33 @@ __SRW_WORKSPACE_UID_ZERO_PY__
             + self._stateless_terminal_process_zero_shell(terminate=False)
         )
 
+    def _close_sftp_before_process_zero_proof(self) -> None:
+        """Close this backend's own SFTP channel before a process-zero proof.
+
+        The stateless process-zero scan intentionally refuses unreadable
+        same-UID processes. ``connect()`` opens an SFTP subsystem whose server
+        is a sibling of the exec channel, not an ancestor the scan can
+        exclude, and OpenSSH's ``sftp-server`` makes itself non-dumpable, so
+        the workspace user cannot inspect it. Close this terminal backend's
+        own writer channel before opening the proof exec; the still-active
+        SSH transport is sufficient for that exec and ``_ensure_connected()``
+        will not recreate SFTP. ``$HOME`` is resolved through this channel,
+        so cache it first: later terminal scripts on this backend still build
+        their paths from it.
+        """
+        self._ensure_connected()
+        with self._sftp_lock:
+            sftp = self._sftp
+            self._sftp = None
+            if sftp is not None:
+                if self._home_dir is None:
+                    try:
+                        self._home_dir = sftp.normalize(".")
+                    except (OSError, paramiko.SSHException):
+                        # Uncached, a later home-relative path fails closed.
+                        pass
+                sftp.close()
+
     def _tmux_exec_checked(
         self,
         command: str,
@@ -2671,19 +3131,7 @@ __SRW_WORKSPACE_UID_ZERO_PY__
                     "Remote shell owner has been retired from this backend"
                 )
             if close_sftp:
-                # The final stateless process-zero scan intentionally refuses
-                # unreadable same-UID processes. ``connect()`` opens an SFTP
-                # subsystem whose server is a sibling of the exec channel,
-                # not an ancestor the scan can exclude. Close this terminal
-                # backend's own writer channel before opening the proof exec;
-                # the still-active SSH transport is sufficient for that exec
-                # and `_ensure_connected()` will not recreate SFTP.
-                self._ensure_connected()
-                with self._sftp_lock:
-                    sftp = self._sftp
-                    self._sftp = None
-                    if sftp is not None:
-                        sftp.close()
+                self._close_sftp_before_process_zero_proof()
             # tmux completion sentinels and the attested prompt live at the end
             # of capture-pane output. Keep a bounded tail so scrollback over the
             # generic 5 MiB SSH cap cannot make a finished command look busy.
@@ -2973,6 +3421,14 @@ __SRW_WORKSPACE_UID_ZERO_PY__
         command: str,
     ) -> None:
         """CAS the pane guard and type a command under one remote lock."""
+        if len(command.encode("utf-8")) > 2 * _SEND_KEYS_INLINE_LIMIT - 1024:
+            # The guard is set in the same script as the send; a send tmux
+            # refuses would leave the tab waiting for a command it never got.
+            raise ValueError(
+                f"Command too long to type into tab {tab_name!r} "
+                f"({len(command.encode('utf-8'))} bytes); write it to a file "
+                "and run the file instead."
+            )
         pane = self._tmux_pane_target(tab_name)
         expected_value = expected or ""
         output = self._tmux_mutate_checked(
@@ -3767,9 +4223,13 @@ __SRW_WORKSPACE_UID_ZERO_PY__
                 raise WorkspaceUnavailableError(
                     "Remote tmux protocol is current but setup is incomplete"
                 )
+            # HISTFILE=/dev/null in the session environment reaches every window
+            # created from here on, including ssh/repl tabs that get no setup
+            # preamble; shell tabs also unset it after .bashrc (shell_protocol).
             self._tmux_mutate_checked(
                 f"tmux set-option -t {self._tmux_target()} "
-                f"history-limit {self._scrollback_limit}",
+                f"history-limit {self._scrollback_limit} "
+                f"\\; set-environment -t {self._tmux_target()} HISTFILE /dev/null",
                 operation="set history limit",
             )
 
@@ -3845,6 +4305,11 @@ __SRW_WORKSPACE_UID_ZERO_PY__
 
     def _tmux_send_keys(self, tab_name: str, text: str, enter: bool = True) -> None:
         """Send keys to a remote tmux pane."""
+        if len(text.encode("utf-8")) > _SEND_KEYS_INLINE_LIMIT:
+            raise ValueError(
+                f"Input too long to type into tab {tab_name!r} "
+                f"({len(text.encode('utf-8'))} bytes); write it to a file instead."
+            )
         pane = self._tmux_pane_target(tab_name)
         tab = self._tabs[tab_name]
         assert tab.pane_id is not None
@@ -3950,16 +4415,32 @@ __SRW_WORKSPACE_UID_ZERO_PY__
                 self._tab_sync_locks[tab_name] = lock
             return lock
 
+    def _spill_long_command(self, command: str) -> str:
+        """``command``, or a short line that runs it from a workspace file.
+
+        A command over ``_SEND_KEYS_INLINE_LIMIT`` is written over SFTP and
+        sourced in the same shell, so its cwd and variables behave as if it
+        had been typed. The file is removed afterwards and the command's exit
+        status is kept for the completion record.
+        """
+        if len(command.encode("utf-8")) <= _SEND_KEYS_INLINE_LIMIT:
+            return command
+        relative = posixpath.join(".srw", "shell", f"cmd-{uuid.uuid4().hex[:12]}.sh")
+        self.write_file(relative, command if command.endswith("\n") else command + "\n")
+        path = shlex.quote(self._resolve(relative))
+        return f". {path}; _srw_spill_rc=$?; rm -f {path}; (exit $_srw_spill_rc)"
+
     def _build_guarded_shell_command(
         self,
         command: str,
         sentinel: str,
         working_dir: Optional[str],
-    ) -> Tuple[str, Optional[str]]:
+        start_marker: Optional[str] = None,
+    ) -> str:
         """Build one command whose sentinel follows any requested cwd restore."""
-        command = self._with_credential_environment(command)
+        command = self._with_credential_environment(self._spill_long_command(command))
         if not working_dir:
-            return build_sentinel_command(command, sentinel)
+            return build_sentinel_command(command, sentinel, start_marker)
 
         full_dir = posixpath.normpath(
             posixpath.join(self._sandbox_cwd, working_dir)
@@ -3968,24 +4449,20 @@ __SRW_WORKSPACE_UID_ZERO_PY__
         )
         if "\n" in command:
             outer_delim = f"SRW_DELIM_{uuid.uuid4().hex[:12]}"
-            start_marker = f"__SRW_START_{uuid.uuid4().hex[:12]}__"
-            user_command = (
-                f'bash << "{outer_delim}"\n'
-                f'echo "{start_marker}"\n'
-                f"{command}\n"
-                f"{outer_delim}"
-            )
+            user_command = f'bash << "{outer_delim}"\n{command}\n{outer_delim}'
         else:
-            start_marker = None
             user_command = command
+        # The marker prints before the cd, so a failed cd's error is output
+        # too. Bash reads a heredoc body before it runs the line, so the
+        # body's echoed lines still come before the marker.
+        mark = f"{start_marker_command(start_marker)}; " if start_marker else ""
         root_dir = self._sandbox_cwd or self._remote_root
-        full_command = (
-            f"cd {shlex.quote(full_dir)} && {user_command}\n"
+        return (
+            f"{mark}cd {shlex.quote(full_dir)} && {user_command}\n"
             '_srw_rc=$?; _srw_cwd="$PWD"; '
             f"cd {shlex.quote(root_dir)} && "
             f'printf \'\\n{sentinel} %s %s\\n\' "$_srw_rc" "$_srw_cwd"'
         )
-        return full_command, start_marker
 
     def shell_run(
         self,
@@ -4071,10 +4548,12 @@ __SRW_WORKSPACE_UID_ZERO_PY__
             # Build the sentinel-suffixed command. When working_dir is set the
             # cwd enter, user command, root restore and sentinel stay inside
             # this one remotely reserved send.
-            full_cmd, start_marker = self._build_guarded_shell_command(
+            start_marker = new_start_marker()
+            full_cmd = self._build_guarded_shell_command(
                 command,
                 sentinel,
                 working_dir,
+                start_marker,
             )
             # Persist ownership before typing the command. If this agent dies
             # immediately afterward, the next claimant blocks a colliding
@@ -4117,36 +4596,12 @@ __SRW_WORKSPACE_UID_ZERO_PY__
                     # Command finished — tab is no longer busy.
                     self._clear_tab_pending_if_current(tab_name, sentinel)
 
-                    if start_marker is not None:
-                        # Multi-line wrap path: locate the start marker output
-                        # line and extract everything between it and the sentinel.
-                        start_idx = None
-                        for i in range(sentinel_line_idx - 1, -1, -1):
-                            if all_lines[i].strip() == start_marker:
-                                start_idx = i
-                                break
-                        if start_idx is not None:
-                            new_lines = all_lines[start_idx + 1 : sentinel_line_idx]
-                            output_lines = [
-                                ol
-                                for ol in new_lines
-                                if start_marker not in ol and sentinel not in ol
-                            ]
-                        else:
-                            new_lines = all_lines[pre_count:sentinel_line_idx]
-                            output_lines = [
-                                ol for ol in new_lines if sentinel not in ol
-                            ]
-                    else:
-                        new_lines = all_lines[pre_count:sentinel_line_idx]
-                        output_lines = [ol for ol in new_lines if sentinel not in ol]
-                        # Skip prompt/command echo lines
-                        while output_lines and (
-                            command.split()[0] in output_lines[0]
-                            or output_lines[0].strip().endswith("$")
-                        ):
-                            output_lines = output_lines[1:]
-
+                    output_lines = self._extract_shell_output(
+                        all_lines[:sentinel_line_idx],
+                        start_marker=start_marker,
+                        sentinel=sentinel,
+                        pre_lines=pre_lines,
+                    )
                     output_text = "\n".join(output_lines).strip()
                     break
 
@@ -4156,7 +4611,7 @@ __SRW_WORKSPACE_UID_ZERO_PY__
                     prompt_type = self._detect_interactive_prompt(all_lines)
                     if prompt_type:
                         terminal_state = self._capture_terminal_state(
-                            tab_name, sentinel, pre_count
+                            tab_name, sentinel, pre_count, start_marker
                         )
                         # Command owns the pane; don't cwd-restore into it.
                         tab.pending_sentinel = sentinel
@@ -4178,7 +4633,7 @@ __SRW_WORKSPACE_UID_ZERO_PY__
                     )
                     if timed_out:
                         terminal_state = self._capture_terminal_state(
-                            tab_name, sentinel, pre_count
+                            tab_name, sentinel, pre_count, start_marker
                         )
                         # Leave it running; don't cwd-restore into a busy pane.
                         tab.pending_sentinel = sentinel
@@ -4193,7 +4648,7 @@ __SRW_WORKSPACE_UID_ZERO_PY__
             # Hard timeout: loop exited without the sentinel -> still running.
             if exit_code is None:
                 terminal_state = self._capture_terminal_state(
-                    tab_name, sentinel, pre_count
+                    tab_name, sentinel, pre_count, start_marker
                 )
                 tab.pending_sentinel = sentinel
                 tab.last_activity = datetime.now(timezone.utc)
@@ -4215,12 +4670,76 @@ __SRW_WORKSPACE_UID_ZERO_PY__
 
             return "\n".join(parts)
 
+    def _extract_shell_output(
+        self,
+        lines: List[str],
+        *,
+        start_marker: str,
+        sentinel: str,
+        pre_lines: List[str],
+    ) -> List[str]:
+        """Return what a finished command printed before its completion record.
+
+        The output starts after the command's own start-marker line. A line
+        carrying the sentinel is the echo of the typed cwd-restore line; when
+        the output did not end in a newline, the output's last line precedes
+        that echo's prompt on the same line.
+        """
+        prompt = self._prompt_marker
+        first = None
+        for i in range(len(lines) - 1, -1, -1):
+            if lines[i].strip() == start_marker:
+                first = i + 1
+                break
+        if first is None:
+            # The marker never printed (bash rejected a working_dir command
+            # line) or is gone (the output overflowed the scrollback, or moved
+            # the cursor or the screen over it). Output then starts after the
+            # last line the shell wrote: this command's echo, a prompt, or an
+            # earlier command's start marker or completion record. With none
+            # left, it is all output.
+            echo = start_marker_command(start_marker)
+            first = 0
+            for i in range(len(lines) - 1, -1, -1):
+                line = lines[i]
+                if (
+                    echo in line
+                    or (prompt and line.startswith(prompt) and sentinel not in line)
+                    or _START_MARKER_PATTERN.fullmatch(line.strip())
+                    or _is_shell_completion_record(line)
+                ):
+                    first = i + 1
+                    break
+            # Lines the capture still shares with the pre-command capture,
+            # from the top, are older history unless they scrolled away.
+            shared = 0
+            for before, after in zip(pre_lines, lines):
+                if before != after:
+                    break
+                shared += 1
+            first = max(first, shared)
+        output = []
+        for line in lines[first:]:
+            if sentinel not in line:
+                output.append(line)
+            elif prompt and line.find(prompt) > 0:
+                output.append(line[: line.find(prompt)])
+        return output
+
     def _capture_terminal_state(
-        self, tab_name: str, sentinel: str, pre_count: int
+        self,
+        tab_name: str,
+        sentinel: str,
+        pre_count: int,
+        start_marker: Optional[str] = None,
     ) -> str:
         """Capture terminal state for timeout/stall reporting."""
         try:
-            all_lines = self._tmux_capture(tab_name)
+            all_lines = [
+                line
+                for line in self._tmux_capture(tab_name)
+                if not start_marker or line.strip() != start_marker
+            ]
             post_lines = all_lines[pre_count:]
             clean_lines = [line for line in post_lines if sentinel not in line]
             if not clean_lines:
@@ -4292,7 +4811,7 @@ __SRW_WORKSPACE_UID_ZERO_PY__
                 # v2 durable guard says the shell is idle. Only a response sent
                 # while an existing guard is present is raw foreground input.
                 sentinel = f"__DONE_{uuid.uuid4().hex[:12]}__"
-                guarded_command, _ = self._build_guarded_shell_command(
+                guarded_command = self._build_guarded_shell_command(
                     text,
                     sentinel,
                     working_dir,
@@ -4571,7 +5090,7 @@ __SRW_WORKSPACE_UID_ZERO_PY__
         if command:
             if tab_type == "shell":
                 sentinel = f"__DONE_{uuid.uuid4().hex[:12]}__"
-                guarded_command, _ = self._build_guarded_shell_command(
+                guarded_command = self._build_guarded_shell_command(
                     command,
                     sentinel,
                     None,
@@ -4758,6 +5277,7 @@ __SRW_WORKSPACE_UID_ZERO_PY__
                         if self.workspace_incarnation_fenced
                         else ""
                     )
+                    + self._credential_files_retirement_shell()
                 )
                 self._tmux_exec_checked(
                     self._tmux_lock_command(inner),
@@ -4837,6 +5357,7 @@ __SRW_WORKSPACE_UID_ZERO_PY__
                 + f"  tmux kill-session -t {self._tmux_target()} || exit 77\n"
                 + "fi\n"
                 + process_zero
+                + self._credential_files_retirement_shell()
             )
             self._tmux_exec_checked(
                 self._tmux_lock_command(inner),

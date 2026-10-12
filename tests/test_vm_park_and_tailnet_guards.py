@@ -17,6 +17,8 @@ import os
 from unittest.mock import AsyncMock, patch
 
 import pytest
+from orchestrator.application import preparation as preparation_composition
+from orchestrator.services import job_workspace_runtime as job_workspace_runtime_module
 
 os.environ.setdefault("VECTOR_DB_URL", "postgresql://test@localhost/test")
 
@@ -165,11 +167,18 @@ class TestFailVmParkedJob:
         import orchestrator.main
 
         update = AsyncMock()
-        monkeypatch.setattr(orchestrator.main.postgres_db, "update_job_status", update)
+        monkeypatch.setattr(
+            orchestrator.main.app.state.resources.postgres_db,
+            "update_job_status",
+            update,
+        )
 
-        await orchestrator.main._fail_vm_parked_job(
+        await job_workspace_runtime_module.fail_vm_parked_job(
             "job-parked",
             "provisioning exhausted after 3 attempts (never reached 'ready')",
+            dependencies=preparation_composition.job_workspace_runtime_dependencies(
+                orchestrator.main.app.state.resources
+            ),
         )
 
         update.assert_awaited_once()

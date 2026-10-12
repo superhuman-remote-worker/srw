@@ -179,6 +179,46 @@ class TestSitrepBuild:
         assert patch["sitrep"]["fingerprints"][JOB_B]["status"] == "failed"
 
     @pytest.mark.asyncio
+    async def test_a_job_held_for_review_says_why(self):
+        """Officer backlog jobs run at full autonomy; a seal held because its
+        delivery could not be proven must not reach the officer as a bare
+        "processing → pending_review" (worker_git_versioning_stops_midjob_
+        seal_pins_stale_revision.md)."""
+        prior = {
+            "watermark": (
+                datetime.now(timezone.utc) - timedelta(minutes=30)
+            ).isoformat(),
+            "fingerprints": {
+                JOB_A: {"status": "processing", "steps": 12},
+                JOB_B: {"status": "processing", "steps": 4},
+            },
+        }
+        jobs = [
+            {
+                "id": JOB_A,
+                "status": "pending_review",
+                "description": "probe the stack",
+                "error_message": "Delivery unproven: the final commit did not "
+                "land, so deliverable path(s) output/obstacles.md are not in "
+                "the pushed revision.",
+            },
+            # An ordinary review item carries no reason, and gets none.
+            {"id": JOB_B, "status": "pending_review", "description": "plain"},
+        ]
+        text, _patch = await sitrep.build_wake_message(
+            _fake_db(jobs=jobs),
+            _officer_thread(prior_sitrep=prior),
+            [TIMER_ROW],
+            audit_reader=_audit(),
+            usage_ledger=None,
+        )
+        line_a = next(ln for ln in text.splitlines() if JOB_A[:8] in ln)
+        line_b = next(ln for ln in text.splitlines() if JOB_B[:8] in ln)
+        assert "processing → pending_review" in line_a
+        assert "held: Delivery unproven" in line_a
+        assert "held:" not in line_b
+
+    @pytest.mark.asyncio
     async def test_jobs_failure_preserves_baseline_and_degrades(self):
         prior = {
             "watermark": datetime.now(timezone.utc).isoformat(),

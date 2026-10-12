@@ -1,7 +1,7 @@
 import {describe, expect, it, vi} from 'vitest';
 import {Injector, runInInjectionContext} from '@angular/core';
 import {HttpClient} from '@angular/common/http';
-import {of, throwError} from 'rxjs';
+import {of, Subject, throwError} from 'rxjs';
 import {SessionListService} from './session-list.service';
 import type {Thread} from '../models/api.model';
 
@@ -80,6 +80,26 @@ describe('SessionListService', () => {
 
     expect(service.threads().map((t) => t.id)).toEqual(['a']);
     expect(service.loading()).toBe(false);
+  });
+
+  it('keeps the newer typed workspace state when an older refresh finishes later', async () => {
+    const {service, http} = create([]);
+    const older = new Subject<{threads: Thread[]}>();
+    const newer = new Subject<{threads: Thread[]}>();
+    http.get.mockReturnValueOnce(older).mockReturnValueOnce(newer);
+    const first = service.refresh();
+    const second = service.refresh();
+    newer.next({threads: [{...thread('a', new Date().toISOString()),
+      workspace_creation: {stage: 'readiness', state: 'attention',
+        reason_code: 'invalid_image', readiness_deadline_at: null}}]});
+    newer.complete();
+    await second;
+    older.next({threads: [{...thread('a', new Date().toISOString()),
+      workspace_creation: {stage: 'scheduling', state: 'observing',
+        reason_code: 'observation_pending', readiness_deadline_at: null}}]});
+    older.complete();
+    await first;
+    expect(service.threads()[0].workspace_creation?.state).toBe('attention');
   });
 
   it('an empty thread list produces no groups', async () => {

@@ -50,6 +50,16 @@ VM_SESSION_ATTACH = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
 VM_OPERATION_ID = "cccccccc-cccc-4ccc-8ccc-cccccccccccc"
 
 
+@pytest.fixture(autouse=True)
+def legacy_resource_cleanup(monkeypatch):
+    """Synthetic suspension fixtures intentionally have no v3 charge."""
+    import orchestrator.services.vm_workspace_recovery_store as recovery
+
+    monkeypatch.setattr(
+        recovery, "prepare_vm_cleanup_resource", AsyncMock(return_value=None)
+    )
+
+
 # =============================================================================
 # Fixtures
 # =============================================================================
@@ -145,8 +155,11 @@ def make_service(*, s3_available=True, k8s_available=True):
         return_value=creation_result
     )
 
-    async def claim_restore_work(_owner, *, claimant, lease_seconds=300):
+    async def claim_restore_work(
+        _owner, *, claimant, lease_seconds=300, expected_runtime_incarnation
+    ):
         assert lease_seconds == 300
+        assert expected_runtime_incarnation == SUCCESSOR_RUNTIME
         return {
             **creation_result,
             "restore_work_claimed_by": claimant,
@@ -615,9 +628,12 @@ class TestRestoreWorkspace:
         second._container_provisioner = shared
         claimed = False
 
-        async def claim(_owner, *, claimant, lease_seconds=300):
+        async def claim(
+            _owner, *, claimant, lease_seconds=300, expected_runtime_incarnation
+        ):
             nonlocal claimed
             assert lease_seconds == 300
+            assert expected_runtime_incarnation == SUCCESSOR_RUNTIME
             if claimed:
                 return None
             claimed = True
@@ -657,8 +673,11 @@ class TestRestoreWorkspace:
         configure_job_restore(svc)
         observed_claimant = None
 
-        async def reclaim(_owner, *, claimant, lease_seconds=300):
+        async def reclaim(
+            _owner, *, claimant, lease_seconds=300, expected_runtime_incarnation
+        ):
             nonlocal observed_claimant
+            assert expected_runtime_incarnation == SUCCESSOR_RUNTIME
             observed_claimant = claimant
             return {
                 **svc._container_provisioner.get_workspace_creation_result.return_value,
@@ -2054,6 +2073,37 @@ class TestVmSuspendRidesThePersistentRootdisk:
         assert merged.get("rootdisk") == "kept"
 
     @pytest.mark.asyncio
+    async def test_stopped_vm_projection_failure_stays_suspending(self, monkeypatch):
+        monkeypatch.setenv("VM_PERSISTENT_ROOTDISK", "true")
+        svc, vm_prov = make_vm_service()
+        svc._db.get_thread = AsyncMock(return_value=make_vm_thread())
+        initial_attestation = vm_prov.attest_workspace_runtime.return_value
+
+        async def attest_until_stopped(*_args, **_kwargs):
+            if vm_prov.delete_thread_vm.await_count:
+                raise RuntimeError("VM absent after stop")
+            return initial_attestation
+
+        vm_prov.attest_workspace_runtime.side_effect = attest_until_stopped
+        svc._db.merge_thread_vm_context_if_provision_generation.side_effect = [
+            True,
+            True,
+            False,
+        ]
+
+        assert await svc.suspend_thread_workspace("tid-vm") is False
+        vm_prov.delete_thread_vm.assert_awaited_once_with(
+            "tid-vm",
+            purge_disk=False,
+        )
+        projected = [
+            call.args[2]
+            for call in svc._db.merge_thread_vm_context_if_provision_generation.await_args_list
+        ]
+        assert projected[0]["status"] == "suspending"
+        assert not any(item.get("status") == "ready" for item in projected[1:])
+
+    @pytest.mark.asyncio
     async def test_flag_off_stays_fail_closed(self, monkeypatch):
         """Without the controller-side flag the disk cascade-deletes, so a
         failed snapshot must still keep the workspace alive — suspending would
@@ -2812,8 +2862,11 @@ class TestStrictTerminalSessionRestore:
             )
         )
 
-        async def claim_restore_work(_owner, *, claimant, lease_seconds=300):
+        async def claim_restore_work(
+            _owner, *, claimant, lease_seconds=300, expected_runtime_incarnation
+        ):
             assert lease_seconds == 300
+            assert expected_runtime_incarnation == authority.runtime_incarnation
             return {
                 **creation,
                 "restore_work_claimed_by": claimant,
@@ -2825,6 +2878,47 @@ class TestStrictTerminalSessionRestore:
             claim_restore_work
         )
         return svc
+
+    @pytest.mark.asyncio
+    async def test_observation_yield_cannot_consume_a_stale_restore_receipt(self):
+        from orchestrator.services.workspace_lifecycle import (
+            SessionWorkspaceObservationYielded,
+        )
+
+        svc = self._service()
+        svc._container_provisioner.create_workspace.side_effect = (
+            SessionWorkspaceObservationYielded("End waiting")
+        )
+
+        assert await self._restore_new(svc) is False
+
+        svc._container_provisioner.create_workspace.assert_awaited_once()
+        svc._container_provisioner.get_workspace_creation_result.assert_not_awaited()
+        svc._extract_snapshot.assert_not_awaited()
+        svc._commit_strict_thread_restore_ready.assert_not_awaited()
+        svc._db.merge_thread_workspace_context_if_runtime.assert_not_awaited()
+        svc._db.merge_thread_workspace_context.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_pinned_observation_yield_does_not_mark_restore_failed(self):
+        from orchestrator.services.workspace_lifecycle import (
+            SessionWorkspaceObservationYielded,
+        )
+
+        before = self._before()
+        before["execution_lane"] = "pinned"
+        svc = self._service(before=before)
+        svc._db.get_thread = AsyncMock(return_value=before)
+        svc._container_provisioner.create_pinned_thread_workspace = AsyncMock(
+            side_effect=SessionWorkspaceObservationYielded("End waiting")
+        )
+
+        assert await svc.restore_thread_workspace(self.THREAD_ID) is False
+
+        svc._container_provisioner.create_pinned_thread_workspace.assert_awaited_once()
+        svc._extract_snapshot.assert_not_awaited()
+        svc._db.merge_thread_workspace_context_if_runtime.assert_not_awaited()
+        svc._db.merge_thread_workspace_context.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_extract_is_pinned_and_exact_tuple_is_reproved_then_committed(self):
@@ -3122,3 +3216,37 @@ class TestRestoreWithChangedBacking:
         svc._extract_snapshot.assert_awaited_once()
         svc._db.merge_thread_workspace_context_if_runtime.assert_not_awaited()
         svc._container_provisioner.complete_workspace_restore_work.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_a_pinned_restore_awaits_the_protected_grant_before_its_lock():
+    """The engage minting a protected reader grant takes the thread's
+    advisory lock: a restore (resume) awaits it before taking that lock, as
+    create does, so its plan can read the grant (connector drivers D7)."""
+    order: list[str] = []
+
+    class _Lock:
+        def __init__(self, db, thread_id):
+            pass
+
+        async def __aenter__(self):
+            order.append("lock")
+            return True
+
+        async def __aexit__(self, *exc):
+            return False
+
+    class _Db:
+        thread_advisory_lock = _Lock
+        get_thread = AsyncMock(
+            side_effect=[{"id": "t1", "execution_lane": "pinned"}, None]
+        )
+
+    async def await_grant(thread_id):
+        order.append(f"grant:{thread_id}")
+
+    svc = WorkspaceSuspensionService()
+    svc._db = _Db()
+    svc._container_provisioner = MagicMock(await_cloud_mount_grant=await_grant)
+    assert await svc.restore_thread_workspace("t1", wake_operation_id="w-1") is False
+    assert order == ["grant:t1", "lock"]

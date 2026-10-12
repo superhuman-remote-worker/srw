@@ -1,11 +1,13 @@
 """HTTP adapter for the agent-facing thread and subagent-child routes.
 
 Extracted from ``orchestrator.main`` (R1.B06, lane C, census group
-``S_CHILD``). Thirteen routes, declared in their pre-extraction order.
+``S_CHILD``). Thirteen routes, declared in their pre-extraction order, plus
+the session batch settle (``…/subagents/settle-batch``) added beside them.
 
 **That order is load-bearing.** Starlette matches in registration order, so
-``…/subagents/live`` and ``…/subagents/by-call`` must stay declared *before*
-``…/subagents/{thread_id}`` — flip them and ``live`` becomes a thread id.
+``…/subagents/live``, ``…/subagents/by-call`` and ``…/subagents/settle-batch``
+must stay declared *before* ``…/subagents/{thread_id}`` — flip them and
+``live`` becomes a thread id.
 
 No ``tags=``, no ``operation_id=``, no ``status_code=``, no route-level
 ``dependencies=``: the declarations this replaces carried none, and each would
@@ -27,6 +29,7 @@ from uuid import UUID
 from fastapi import APIRouter, Request
 
 from orchestrator.schemas.agent_child_threads import (
+    AgentSessionSubagentBatchSettleRequest,
     AgentSessionSubagentByCallRequest,
     AgentSessionSubagentCreateRequest,
     AgentSessionSubagentQueryRequest,
@@ -197,6 +200,21 @@ async def agent_get_session_subagent_thread_by_call(
     )
 
 
+@router.post("/api/agents/threads/{parent_thread_id}/subagents/settle-batch")
+async def agent_settle_session_subagent_batch(
+    request: Request,
+    parent_thread_id: str,
+    body: AgentSessionSubagentBatchSettleRequest,
+) -> dict[str, Any]:
+    """Settle one abandoned session delegation turn atomically. Internal only."""
+
+    dependencies = get_agent_child_thread_dependencies(request)
+    await dependencies.require_internal(request)
+    return await agent_child_threads.agent_settle_session_subagent_batch(
+        request, parent_thread_id, body, dependencies=dependencies
+    )
+
+
 @router.post("/api/agents/threads/{parent_thread_id}/subagents/{thread_id}")
 async def agent_get_session_subagent_thread(
     request: Request,
@@ -275,6 +293,7 @@ __all__ = [
     "agent_reopen_session_subagent_thread",
     "agent_reopen_subagent_thread",
     "agent_save_message",
+    "agent_settle_session_subagent_batch",
     "agent_terminalize_session_subagent_thread",
     "agent_terminalize_subagent_thread",
     "get_agent_child_thread_dependencies",

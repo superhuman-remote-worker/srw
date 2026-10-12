@@ -1,0 +1,239 @@
+{
+  "provider": {
+    "backend_id": "nextcloud",
+    "title": "Nextcloud",
+    "public_url": "https://cloud.localhost",
+    "backend_instance_id": "4e72e665-1f70-4b69-9804-d981b51416e6",
+    "activation_revision": 1,
+    "activated_at": "2026-10-08T00:00:00+00:00",
+    "initialized": true
+  },
+  "health": {
+    "ok": true,
+    "latency_ms": 12.3,
+    "detail": "status=200"
+  },
+  "configuration": {
+    "source": "helm",
+    "helm": {
+      "state": "matches",
+      "backend_id": "nextcloud",
+      "detail": ""
+    },
+    "replace_installation": null
+  },
+  "matrix": {
+    "providers": [
+      {
+        "backend_id": "nextcloud",
+        "title": "Nextcloud",
+        "active": true
+      },
+      {
+        "backend_id": "opencloud",
+        "title": "OpenCloud",
+        "active": false
+      }
+    ],
+    "rows": [
+      {
+        "connector_type": "cloud_folder",
+        "folder_kind": "project",
+        "access": "read_only",
+        "cells": {
+          "nextcloud": {
+            "status": "offered",
+            "note": "a reader account allowed to read only this folder; on a VM its credential sits in the workspace's rclone config",
+            "workspace_backends": [
+              "sandbox",
+              "vm"
+            ],
+            "slice": null
+          },
+          "opencloud": {
+            "status": "unsupported",
+            "note": "the read-only reader code exists, but nothing calls it yet",
+            "workspace_backends": [],
+            "slice": null
+          }
+        }
+      },
+      {
+        "connector_type": "cloud_folder",
+        "folder_kind": "project",
+        "access": "read_write",
+        "cells": {
+          "nextcloud": {
+            "status": "offered",
+            "note": "a writer account per project member that can read and write only this project's folder",
+            "workspace_backends": [
+              "sandbox"
+            ],
+            "slice": null
+          },
+          "opencloud": {
+            "status": "offered",
+            "note": "the orchestrator's Keycloak service account, a member of every project Space; the workspace holds only its short-lived tokens, which reach every project Space while they last",
+            "workspace_backends": [
+              "sandbox"
+            ],
+            "slice": null
+          }
+        }
+      },
+      {
+        "connector_type": "cloud_folder",
+        "folder_kind": "project",
+        "access": "protected",
+        "cells": {
+          "nextcloud": {
+            "status": "offered",
+            "note": "the reader grant as a read-only lower layer; writes stay in an overlay until the owner approves them in review",
+            "workspace_backends": [
+              "sandbox"
+            ],
+            "slice": null
+          },
+          "opencloud": {
+            "status": "unsupported",
+            "note": "the protected review lane is built for Nextcloud only",
+            "workspace_backends": [],
+            "slice": null
+          }
+        }
+      },
+      {
+        "connector_type": "cloud_folder",
+        "folder_kind": "user_root",
+        "access": "read_write",
+        "cells": {
+          "nextcloud": {
+            "status": "offered",
+            "note": "a per-user app token for the user's own files, granted once by the user (Connect your cloud); it cannot be limited to read-only or to one folder",
+            "workspace_backends": [
+              "sandbox"
+            ],
+            "slice": null
+          },
+          "opencloud": {
+            "status": "unsupported",
+            "note": "works today only through deprecated Keycloak impersonation, so it is not offered",
+            "workspace_backends": [],
+            "slice": null
+          }
+        }
+      },
+      {
+        "connector_type": "cloud_folder",
+        "folder_kind": "user_root",
+        "access": "read_only",
+        "cells": {
+          "nextcloud": {
+            "status": "unsupported",
+            "note": "an app token cannot be restricted to read-only or to one path",
+            "workspace_backends": [],
+            "slice": null
+          },
+          "opencloud": {
+            "status": "unsupported",
+            "note": "no per-user read-only credential exists",
+            "workspace_backends": [],
+            "slice": null
+          }
+        }
+      },
+      {
+        "connector_type": "cloud_folder",
+        "folder_kind": "user_root",
+        "access": "protected",
+        "cells": {
+          "nextcloud": {
+            "status": "unsupported",
+            "note": "an app token cannot be restricted to read-only or to one path",
+            "workspace_backends": [],
+            "slice": null
+          },
+          "opencloud": {
+            "status": "unsupported",
+            "note": "no per-user read-only credential exists",
+            "workspace_backends": [],
+            "slice": null
+          }
+        }
+      },
+      {
+        "connector_type": "cloud_folder_checkout",
+        "folder_kind": "project",
+        "access": "read_only",
+        "cells": {
+          "nextcloud": {
+            "status": "offered",
+            "note": "the folder is copied into the job's repository before it starts; SRW never applies the copy's changes",
+            "workspace_backends": [
+              "sandbox",
+              "vm"
+            ],
+            "slice": null
+          },
+          "opencloud": {
+            "status": "offered",
+            "note": "the folder is copied into the job's repository before it starts; SRW never applies the copy's changes",
+            "workspace_backends": [
+              "sandbox",
+              "vm"
+            ],
+            "slice": null
+          }
+        }
+      },
+      {
+        "connector_type": "cloud_folder_checkout",
+        "folder_kind": "project",
+        "access": "reviewed_write_back",
+        "cells": {
+          "nextcloud": {
+            "status": "offered",
+            "note": "the folder is copied into the job's repository; SRW writes back only a diff an owner or editor of the job's project (or an administrator) accepts, and refuses one whose files changed in the cloud since the copy was made",
+            "workspace_backends": [
+              "sandbox",
+              "vm"
+            ],
+            "slice": null
+          },
+          "opencloud": {
+            "status": "offered",
+            "note": "the folder is copied into the job's repository; SRW writes back only a diff an owner or editor of the job's project (or an administrator) accepts, and refuses one whose files changed in the cloud since the copy was made",
+            "workspace_backends": [
+              "sandbox",
+              "vm"
+            ],
+            "slice": null
+          }
+        }
+      },
+      {
+        "connector_type": "cloud_outbox",
+        "folder_kind": null,
+        "access": "read_write",
+        "cells": {
+          "nextcloud": {
+            "status": "offered",
+            "note": "a folder SRW creates in the agent-service account's home and shares with the execution's owner; a session mounts it with agent-service's credential (which can still write every project folder, until slice 7b), so not on a root VM",
+            "workspace_backends": [
+              "sandbox"
+            ],
+            "slice": null
+          },
+          "opencloud": {
+            "status": "offered",
+            "note": "a folder SRW creates in its agent-home Space and shares with the execution's owner; a session's workspace holds short-lived tokens of the orchestrator's service account",
+            "workspace_backends": [
+              "sandbox"
+            ],
+            "slice": null
+          }
+        }
+      }
+    ]
+  }
+}

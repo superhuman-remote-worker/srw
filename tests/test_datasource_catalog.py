@@ -16,7 +16,7 @@ from shared.runtime.core.datasource_catalog import (
     DATASOURCE_TYPE_IDS,
     DATASOURCE_TYPES,
 )
-from agent.core.datasource_setup import CREDENTIAL_FILE_TYPES, DATASOURCE_TOOL_MAP
+from agent.core.datasource_setup import DATASOURCE_TOOL_MAP
 
 _ROOT = Path(__file__).resolve().parents[1]
 _GUIDE = _ROOT / "config" / "skills" / "app-guide"
@@ -33,10 +33,21 @@ def test_datasource_catalog_is_unique_and_complete():
 
 
 def test_datasource_catalog_matches_agent_consumers():
+    from shared.connectors.builtin import legacy_types_with_slot
+
+    # Files delivered to the agent pod. An ssh_key's key goes into the
+    # workspace's ssh-agent instead (C1), so it is catalogued as an SSH
+    # identity; the orchestrator still treats its stored credentials as a
+    # files[] list, and the agent's README lists it with the credential files.
     credential_types = {
         definition.type_id
         for definition in DATASOURCE_TYPE_CATALOG
         if definition.runtime_kind == "credential_file"
+    }
+    ssh_identity_types = {
+        definition.type_id
+        for definition in DATASOURCE_TYPE_CATALOG
+        if definition.runtime_kind == "ssh_identity"
     }
     # "repository" keeps its own runtime_kind — it clones onto the workspace
     # instead of opening a connection — but it is tool-backed too now (the
@@ -48,16 +59,38 @@ def test_datasource_catalog_matches_agent_consumers():
         in {"managed_tools", "email_tools", "mcp_tools", "repository"}
     }
 
-    assert credential_types == CREDENTIAL_FILE_TYPES
-    assert credential_types == ORCHESTRATOR_CREDENTIAL_FILE_TYPES
+    assert credential_types == {"kubeconfig", "generic_file"}
+    assert ssh_identity_types == {"ssh_key"}
+    files_types = legacy_types_with_slot("files")
+    assert files_types == credential_types | ssh_identity_types
+    assert ORCHESTRATOR_CREDENTIAL_FILE_TYPES == files_types
+    # The agent keeps no copy: it routes deliveries by the spec's forms.
+    from agent.connectors import deliveries_from_payload
+
+    routed = {
+        delivery.entry["type"]
+        for delivery in deliveries_from_payload(
+            [{"type": type_id} for type_id in DATASOURCE_TYPE_IDS]
+        )
+        if delivery.primary_form in {"credential_file", "ssh_identity"}
+    }
+    assert routed == files_types
     assert tool_types == set(DATASOURCE_TOOL_MAP)
 
 
+def test_datasource_catalog_matches_the_mcp_server():
+    import typing
+
+    from mcp_server.server import DatasourceType
+
+    assert typing.get_args(DatasourceType) == DATASOURCE_TYPE_IDS
+
+
 def test_orchestrator_validation_consumes_the_catalog():
-    # R1.B03 moved the connector CRUD out of ``main.py`` into this service, so
-    # the slice terminator moved with it: the service module carries no
-    # ``@app.`` decorators, and the next declaration after ``create_datasource``
-    # is ``update_datasource``.
+    # Create accepts exactly the types the installed drivers serve, and the
+    # built-in drivers serve the catalogue's types in catalogue order.
+    from orchestrator.services.connector_drivers import builtin_connector_drivers
+
     source = (_ROOT / "src" / "orchestrator" / "services" / "datasources.py").read_text(
         encoding="utf-8"
     )
@@ -65,7 +98,8 @@ def test_orchestrator_validation_consumes_the_catalog():
         "\n\nasync def update_datasource(", 1
     )[0]
 
-    assert "valid_types = DATASOURCE_TYPES" in create_route
+    assert "dependencies.connector_drivers.for_type(body.type)" in create_route
+    assert builtin_connector_drivers().type_ids() == DATASOURCE_TYPE_IDS
     assert (
         DatasourceCreate.model_json_schema()["properties"]["type"]["description"]
         == f"Connector type: {', '.join(DATASOURCE_TYPE_IDS)}"

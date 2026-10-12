@@ -450,6 +450,25 @@ class TestHeartbeatReturnsBoundThread:
             status="ready",
         )
         assert result["thread_id"] is None
+        assert result["execution_lane"] is None
+
+    @pytest.mark.asyncio
+    async def test_bound_thread_lane_is_returned(self):
+        """The handler advertises a pinned session's fan-out switch from it
+        (parallel_subagents.md §14.2 P5), off the same row read."""
+        db, conn = _make_db_with_mocked_acquire(prev_status="ready")
+        conn.fetchrow.return_value.update(
+            {
+                "thread_id": "22222222-2222-2222-2222-222222222222",
+                "execution_lane": "stateless",
+            }
+        )
+        result = await db.heartbeat(
+            agent_id="00000000-0000-0000-0000-000000000001",
+            status="ready",
+        )
+        assert result["execution_lane"] == "stateless"
+        assert "execution_lane" in conn.fetchrow.call_args[0][0]
 
 
 class TestHeartbeatReturnsIntents:

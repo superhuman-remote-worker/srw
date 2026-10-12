@@ -140,6 +140,194 @@ def rerank_role_violation(
 
 
 # ---------------------------------------------------------------------------
+# Env-key endpoint names
+# ---------------------------------------------------------------------------
+#
+# Every env name a reader consults for the endpoint of a ``{PREFIX}_*`` flat
+# capability, in reader precedence order. The dispatch injector derives its
+# "a key follows its endpoint" guard from this same table, so a reader that
+# grows a new alias cannot drift away from the guard.
+ENV_ENDPOINT_ALIASES: dict[str, tuple[str, ...]] = {
+    "CITATION_LLM": ("CITATION_LLM_BASE_URL", "CITATION_LLM_URL"),
+}
+
+
+_DEFAULT_PORTS = {"http": 80, "https": 443}
+
+
+def endpoint_origin(url: Optional[str]) -> Optional[tuple[str, str, int]]:
+    """``(scheme, host, port)`` of ``url``, lower-cased with default ports
+    filled in; ``None`` for an empty or unparseable URL. Path, query and case
+    are ignored, so ``https://OpenRouter.ai/api`` and
+    ``https://openrouter.ai/api/v1/`` share one origin."""
+    if not url or not str(url).strip():
+        return None
+    raw = str(url).strip()
+    if "://" not in raw:
+        raw = "https://" + raw
+    try:
+        parts = urlsplit(raw)
+        port = parts.port
+    except ValueError:
+        return None
+    scheme = (parts.scheme or "").lower()
+    host = (parts.hostname or "").lower()
+    if not host:
+        return None
+    return scheme, host, port if port is not None else _DEFAULT_PORTS.get(scheme, 0)
+
+
+OPENAI_CANONICAL_BASE_URL = "https://api.openai.com/v1"
+NO_KEY_SENTINEL = "not-needed"
+
+
+class ModelRouteMissing(RuntimeError):
+    """An OpenAI-factory client was asked to call a model it has no route for.
+
+    The client was built with no ``base_url`` (or OpenAI's own) and only the
+    ``not-needed`` key sentinel — a request would go to api.openai.com and be
+    refused with an opaque 401. The orchestrator refuses such a model before
+    delivery (unavailable_model_handling.md); this is the agent-side backstop
+    (D6), raised when the client is *called*, never when it is built (the
+    boot-time auxiliary client is legitimately built from the base YAML's
+    placeholder). The retry layer treats it as permanent by class name.
+    """
+
+    def __init__(self, model: str):
+        self.model = model
+        super().__init__(
+            f"Model `{model}` has no configured endpoint. Choose another "
+            "model, or ask your administrator to check Admin → Models."
+        )
+
+
+def openai_route_missing(base_url: Optional[str], keys: list[str]) -> bool:
+    """Whether an OpenAI-factory client with ``base_url`` and ``keys`` can
+    never be served: it targets OpenAI's own endpoint with no real key."""
+    if base_url and not same_endpoint(base_url, OPENAI_CANONICAL_BASE_URL):
+        return False
+    return all(key == NO_KEY_SENTINEL for key in keys)
+
+
+def same_endpoint(a: Optional[str], b: Optional[str]) -> bool:
+    """True when two URLs name the same origin (scheme + host + port).
+
+    The canonical-host check behind "a key follows its endpoint": the chat
+    factories' env fallback compares a configured URL with a provider's own
+    origin, where any path on that origin reaches the provider. Two-URL
+    comparisons on possibly shared hosts use :func:`endpoint_within`, which
+    also compares paths. Two unset URLs are the same (both the provider
+    default).
+    """
+    origin_a, origin_b = endpoint_origin(a), endpoint_origin(b)
+    if origin_a is None or origin_b is None:
+        return origin_a is None and origin_b is None
+    return origin_a == origin_b
+
+
+def _normalised_path(url: str) -> tuple[str, ...]:
+    raw = str(url).strip()
+    if "://" not in raw:
+        raw = "https://" + raw
+    try:
+        path = urlsplit(raw).path
+    except ValueError:
+        path = ""
+    segments = tuple(seg for seg in path.lower().split("/") if seg)
+    # A leading or trailing ``/v1`` is the API-version marker, optional by
+    # convention; a ``v1`` anywhere else is part of the tenant path.
+    if segments and segments[0] == "v1":
+        segments = segments[1:]
+    if segments and segments[-1] == "v1":
+        segments = segments[:-1]
+    return segments
+
+
+def endpoint_within(candidate: Optional[str], parent: Optional[str]) -> bool:
+    """True when ``candidate`` is the ``parent`` endpoint or below it.
+
+    For the two-URL comparisons — an overlay/child/reranker URL against the
+    endpoint whose key it would reuse. Shared hosts tenant by path (e.g. an
+    AI gateway's ``/v1/<account>/<gateway>/``), so the same origin is not
+    enough: the candidate's normalised path (lower-case, trailing slash and a
+    trailing ``/v1`` stripped) must equal or extend the parent's. A sibling
+    path never matches. Two unset URLs match (both the provider default).
+    """
+    if not same_endpoint(candidate, parent):
+        return False
+    if candidate is None or parent is None or not str(candidate).strip():
+        return True
+    cand, base = _normalised_path(candidate), _normalised_path(parent)
+    return cand[: len(base)] == base
+
+
+def env_endpoint_names(prefix: str) -> tuple[str, ...]:
+    """Env names that carry the endpoint for ``prefix`` (reader order)."""
+    return ENV_ENDPOINT_ALIASES.get(prefix, (f"{prefix}_BASE_URL",))
+
+
+# The flat capabilities the orchestrator's dispatch injectors write into a
+# delivered ``env_keys`` block — the only names an agent may export from it
+# into its process environment. Anything else (an arbitrary SDK variable) is
+# dropped at the export seam.
+_DISPATCH_ENV_PREFIXES = (
+    "EMBEDDING",
+    "KB_EMBEDDING",
+    "RERANK",
+    "VISION",
+    "WHISPER",
+    "TTS",
+    "CITATION_LLM",
+)
+_DISPATCH_ENV_SUFFIXES = (
+    "MODEL",
+    "BASE_URL",
+    "API_KEY",
+    "PROVIDER",
+    "PROFILE_ID",
+    "DIMENSIONS",
+)
+# Non-secret tuning an owner may set through a project override's env_keys.
+# Each carries neither a key nor a URL, so it cannot move a credential.
+_TUNING_ENV_KEY_NAMES = frozenset(
+    {
+        "WHISPER_LANGUAGE",
+        "WHISPER_TIMEOUT",
+        "VISION_TIMEOUT",
+        "EMBEDDING_MAX_BATCH",
+        "EMBEDDING_MAX_BATCH_SIZE",
+        "CITATION_REASONING_REQUIRED",
+        "OPENROUTER_REFERER",
+        "OPENROUTER_TITLE",
+    }
+)
+DISPATCH_ENV_KEY_NAMES = frozenset(
+    {f"{p}_{s}" for p in _DISPATCH_ENV_PREFIXES for s in _DISPATCH_ENV_SUFFIXES}
+    | {name for names in ENV_ENDPOINT_ALIASES.values() for name in names}
+    | {"OPENROUTER_API_KEY"}
+    | _TUNING_ENV_KEY_NAMES
+)
+
+
+def exportable_env_keys(
+    env_keys: Optional[Mapping],
+) -> tuple[dict[str, str], list[str]]:
+    """Split a delivered ``env_keys`` block into (exportable, dropped names).
+
+    Only :data:`DISPATCH_ENV_KEY_NAMES` with a string value are exportable.
+    The dropped list carries names only, for a log line.
+    """
+    kept: dict[str, str] = {}
+    dropped: list[str] = []
+    for name, value in (env_keys or {}).items():
+        if name in DISPATCH_ENV_KEY_NAMES and isinstance(value, str):
+            kept[name] = value
+        else:
+            dropped.append(str(name))
+    return kept, sorted(dropped)
+
+
+# ---------------------------------------------------------------------------
 # Citation LLM credential isolation
 # ---------------------------------------------------------------------------
 #
@@ -220,18 +408,15 @@ def resolve_citation_transport(env: Optional[Mapping] = None) -> CitationTranspo
         import os
 
         env = os.environ
-    base_url = env.get("CITATION_LLM_BASE_URL") or env.get("CITATION_LLM_URL") or None
+    names = env_endpoint_names("CITATION_LLM")
+    url_var = next((name for name in names if env.get(name)), names[-1])
+    base_url = env.get(url_var) or None
     dedicated = env.get("CITATION_LLM_API_KEY") or None
     if dedicated:
         return CitationTransport(
             base_url=base_url, api_key=dedicated, key_source="CITATION_LLM_API_KEY"
         )
     if not is_openai_default_endpoint(base_url):
-        url_var = (
-            "CITATION_LLM_BASE_URL"
-            if env.get("CITATION_LLM_BASE_URL")
-            else "CITATION_LLM_URL"
-        )
         raise CitationTransportError(
             f"{url_var}={base_url!r} names a non-OpenAI endpoint but "
             "CITATION_LLM_API_KEY is unset; refusing to send OPENAI_API_KEY "

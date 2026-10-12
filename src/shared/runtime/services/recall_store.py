@@ -38,7 +38,14 @@ import logging
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Sequence, Tuple
+
+from shared.runtime.core.context_entries import (
+    ENTRY_SEPARATOR,
+    UPDATED_ITEM_MARKER,
+    memory_handle,
+    normalize_memory_handle,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -258,6 +265,31 @@ class MemoryRecord:
             superseded_by=row.get("superseded_by"),
             similarity=row.get("similarity"),
         )
+
+
+#: Topics the up-front memory summary lists (D35: "about 5-10").
+MEMORY_SUMMARY_MAX_TOPICS = 8
+#: Longer keywords are noise (a sentence the extractor put in the list), not
+#: a topic; the summary skips them.
+MEMORY_SUMMARY_MAX_TOPIC_CHARS = 40
+
+
+@dataclass(frozen=True)
+class MemorySummaryStats:
+    """What a memory scope holds, for the up-front memory summary (D35).
+
+    Only memories retrieval can serve count: currently valid
+    (``valid_to IS NULL``, so superseded rows are out) and at or above the
+    retrieval importance floor. ``by_type`` is ``(memory_type, count)``,
+    largest first, ties by type name; ``topics`` are the most frequent
+    keywords (by how many memories carry them, ties alphabetical, C
+    collation), lowercased and whitespace-collapsed. The same memory set
+    always gives the same stats.
+    """
+
+    total: int = 0
+    by_type: Tuple[Tuple[str, int], ...] = ()
+    topics: Tuple[str, ...] = ()
 
 
 # Sleep between access-stat write retries after a deadlock. Module-level so
@@ -1287,6 +1319,39 @@ class RecallStore:
                 )
                 return
 
+    async def get_by_handle(self, handle: str) -> Optional[MemoryRecord]:
+        """The valid memory in scope whose display handle is ``handle`` (D30).
+
+        A handle is ``m:`` plus the first 6 hex digits of sha256 of the row
+        id (``context_entries.memory_handle``). It is one-way, so the row is
+        found by recomputing it over the scope's currently valid rows. That
+        is 24 bits per scope; on a collision the newest row wins. ``handle``
+        may be written ``m:3f9a2c``, ``[m:3f9a2c]`` or ``3f9a2c``; anything
+        else finds nothing. A fetch counts as an access, like a search hit.
+        """
+        normalized = normalize_memory_handle(handle)
+        if normalized is None:
+            return None
+        scope_clause, scope_val = self._scope_where(1)
+        row = await self.db.fetchrow(
+            f"""
+            SELECT *
+            FROM memories
+            WHERE {scope_clause}
+              AND valid_to IS NULL
+              AND left(encode(sha256(convert_to(id::text, 'UTF8')), 'hex'), 6) = $2
+            ORDER BY created_at DESC
+            LIMIT 1
+            """,
+            scope_val,
+            normalized.removeprefix("m:"),
+        )
+        if not row:
+            return None
+        record = MemoryRecord.from_row(dict(row))
+        await self._record_access_stats([record.id])
+        return record
+
     async def retrieve(
         self,
         context_text: str,
@@ -1358,19 +1423,31 @@ class RecallStore:
     # =========================================================================
 
     @staticmethod
-    def format_memory(memory: MemoryRecord, index: int) -> str:
+    def format_memory(
+        memory: MemoryRecord,
+        index: int,
+        *,
+        handle: Optional[str] = None,
+        updated: bool = False,
+    ) -> str:
         """Format a single memory for injection.
+
+        The text is static (D11): it carries no per-turn data, so the same
+        memory renders to the same bytes whatever its remaining TTL.
+        Importance is a retrieval-time value frozen into the rendered text.
 
         Args:
             memory: MemoryRecord to format
-            index: Display index (1-based)
+            index: Display index (1-based), the label when no handle is given
+            handle: Display handle (``m:3f9a2c``, D30); labels the memory
+                as ``[m:3f9a2c]`` instead of its index
+            updated: Mark the memory as a newer version of one already in
+                the history (D5)
 
         Returns:
             Formatted memory string
         """
         meta_parts = []
-        if memory.remaining_turns is not None and memory.remaining_turns > 0:
-            meta_parts.append(f"pinned, {memory.remaining_turns} turns left")
         if memory.importance is not None:
             meta_parts.append(f"importance: {memory.importance:.1f}")
         if memory.source_phase is not None:
@@ -1378,8 +1455,95 @@ class RecallStore:
         if memory.memory_type and memory.memory_type != "factual":
             meta_parts.append(memory.memory_type)
 
+        label = handle if handle else index
         meta = f" ({', '.join(meta_parts)})" if meta_parts else ""
-        return f"[{index}]{meta}\n{memory.content}"
+        marker = f" {UPDATED_ITEM_MARKER}" if updated else ""
+        return f"[{label}]{meta}{marker}\n{memory.content}"
+
+    @classmethod
+    def render_memory_entry(
+        cls,
+        items: Sequence[Tuple[MemoryRecord, Optional[str], bool]],
+        model: Optional[str] = None,
+    ) -> str:
+        """Body of one append-only memory entry (append-only injection, D2).
+
+        Unlike :meth:`assemble_memory_block` there is no pinned/retrieved
+        split and no token footer: an appended entry stays in the history
+        unchanged, so it carries nothing that varies per turn (D11).
+
+        Args:
+            items: ``(memory, handle, updated)`` per memory, in rank order
+            model: Model id used to resolve the family's header nudge
+
+        Returns:
+            The entry body, or "" when there is nothing to render
+        """
+        if not items:
+            return ""
+
+        from shared.runtime.services.guardrails import format_nudge
+
+        parts = [format_nudge("memory_entry_header", model=model)]
+        for index, (memory, handle, updated) in enumerate(items, 1):
+            parts.append(
+                cls.format_memory(memory, index, handle=handle, updated=updated)
+            )
+        return "\n\n".join(parts)
+
+    @classmethod
+    def render_memory_list(cls, memories: Sequence[MemoryRecord]) -> str:
+        """Memories as the ``memory_search`` tool returns them (D25, D30).
+
+        One :meth:`format_memory` block per memory, in rank order, labelled
+        by its display handle and joined like the blocks of an appended
+        memory entry: static text with no TTL or score (D11).
+        :func:`~shared.runtime.core.context_entries.memory_list_items` reads
+        the handles and content hashes back from the tool result, which is
+        how a fetched memory counts as present and is not pushed again (D3).
+        A memory without a row id has no handle and keeps its index label.
+        """
+        blocks = []
+        for index, memory in enumerate(memories, 1):
+            handle = memory_handle(memory.id) if memory.id is not None else None
+            blocks.append(cls.format_memory(memory, index, handle=handle))
+        return ENTRY_SEPARATOR.join(blocks)
+
+    @staticmethod
+    def render_memory_summary(
+        stats: MemorySummaryStats, model: Optional[str] = None
+    ) -> str:
+        """Body of the up-front memory summary entry (D35).
+
+        One small block: how many memories the scope holds, the count per
+        type, the most frequent topics and a one-line hint to call
+        ``memory_search``. Static text (D11): no timestamps, no per-turn
+        data, so the same stats always render the same bytes. The caller
+        renders it only when ``memory_search`` is bound, since the hint is
+        what the summary is for.
+
+        Returns:
+            The entry body, or "" when the scope holds no memory
+        """
+        if stats.total <= 0:
+            return ""
+
+        from shared.runtime.services.guardrails import format_nudge
+
+        count = (
+            f"{stats.total} memory" if stats.total == 1 else f"{stats.total} memories"
+        )
+        lines = [format_nudge("memory_summary_header", model=model, count=count)]
+        if stats.by_type:
+            lines.append(
+                "By type: "
+                + ", ".join(f"{n} {memory_type}" for memory_type, n in stats.by_type)
+                + "."
+            )
+        if stats.topics:
+            lines.append("Frequent topics: " + ", ".join(stats.topics) + ".")
+        lines.append(format_nudge("memory_summary_hint", model=model))
+        return "\n".join(lines)
 
     @classmethod
     def assemble_memory_block(
@@ -1482,3 +1646,64 @@ class RecallStore:
         if row:
             return dict(row)
         return {"total": 0, "total_tokens": 0}
+
+    async def summary_stats(
+        self, *, max_topics: int = MEMORY_SUMMARY_MAX_TOPICS
+    ) -> MemorySummaryStats:
+        """Counts by type and the top topics of the scope (D35), read-only.
+
+        Two aggregate reads over the rows retrieval can serve: in scope
+        (project or job, as every query here), currently valid and at or
+        above ``retrieval_importance_floor``. Nothing is written, not even
+        the access stats a search hit records. Topics are the keywords most
+        memories carry, normalised (lowercase, whitespace collapsed),
+        non-empty and at most :data:`MEMORY_SUMMARY_MAX_TOPIC_CHARS` long;
+        ties break alphabetically in C collation, so the order does not
+        depend on the server's locale.
+        """
+        scope_clause, scope_val = self._scope_where(1)
+        floor = float(self.retrieval_importance_floor)
+        type_rows = await self.db.fetch(
+            f"""
+            SELECT memory_type, COUNT(*) AS n
+            FROM memories
+            WHERE {scope_clause} AND valid_to IS NULL AND importance >= $2
+            GROUP BY memory_type
+            """,
+            scope_val,
+            floor,
+        )
+        counts: Dict[str, int] = {}
+        for row in type_rows:
+            memory_type = row["memory_type"] or DEFAULT_MEMORY_TYPE
+            counts[memory_type] = counts.get(memory_type, 0) + int(row["n"])
+        total = sum(counts.values())
+        if total == 0:
+            return MemorySummaryStats()
+
+        topic_rows = await self.db.fetch(
+            f"""
+            SELECT topic, COUNT(DISTINCT id) AS n
+            FROM (
+                SELECT id,
+                       regexp_replace(lower(btrim(keyword)), '[[:space:]]+', ' ', 'g')
+                           AS topic
+                FROM memories, unnest(keywords) AS keyword
+                WHERE {scope_clause} AND valid_to IS NULL AND importance >= $2
+            ) AS tagged
+            WHERE topic <> '' AND char_length(topic) <= $4
+            GROUP BY topic
+            ORDER BY n DESC, topic COLLATE "C"
+            LIMIT $3
+            """,
+            scope_val,
+            floor,
+            max(0, int(max_topics)),
+            MEMORY_SUMMARY_MAX_TOPIC_CHARS,
+        )
+        by_type = tuple(sorted(counts.items(), key=lambda kv: (-kv[1], kv[0])))
+        return MemorySummaryStats(
+            total=total,
+            by_type=by_type,
+            topics=tuple(str(row["topic"]) for row in topic_rows),
+        )

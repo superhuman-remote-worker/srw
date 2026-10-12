@@ -247,10 +247,11 @@ class TestRepositoryUrls:
     "case", ["tilde_fence", "quoted_links", "code_widths", "gardener_links"]
 )
 def test_remaining_hostile_shapes_have_bounded_growth(case):
-    """A subprocess bounds a regression's runtime instead of hanging pytest.
+    """A subprocess bounds wall time; process CPU measures parser growth.
 
-    The 100ms floor absorbs timer noise on fast fixed implementations; the
-    ratios distinguish repeated scans once timings become significant.
+    The worker can be descheduled while CI runs other tests, which must not
+    inflate one growth sample. The 100ms floor absorbs timer noise on fast
+    fixed implementations; ratios still distinguish repeated scans.
     """
     import json
     import subprocess
@@ -276,9 +277,9 @@ def test_remaining_hostile_shapes_have_bounded_growth(case):
             else:
                 text = ''.join('`' * i + 'x' for i in range(1, n)) + 'a' * (n*n)
                 fn = lambda text: em._sub_code_spans(text, lambda inner: inner)
-            start = time.perf_counter()
+            start = time.process_time()
             fn(text)
-            samples.append([len(text), time.perf_counter() - start])
+            samples.append([len(text), time.process_time() - start])
         print(json.dumps(samples))
     """)
     result = subprocess.run(

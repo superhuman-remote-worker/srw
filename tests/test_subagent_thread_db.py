@@ -710,9 +710,16 @@ class TestDeleteJobEndsLiveChildren:
             return "UPDATE 0"
 
         conn.execute = AsyncMock(side_effect=execute)
-        conn.fetchrow = AsyncMock(
-            return_value={"status": "processing", "completion_outcome_kind": None}
-        )
+
+        async def fetchrow(sql, *args):
+            text = _compact(sql)
+            if text.startswith("SELECT * FROM vm_job_creation_owners"):
+                # This ordinary Job has no VM creation history.
+                return None
+            assert text.startswith("SELECT status, completion_outcome_kind,")
+            return {"status": "processing", "completion_outcome_kind": None}
+
+        conn.fetchrow = AsyncMock(side_effect=fetchrow)
         conn.fetchval = AsyncMock(return_value=None)
         db = _orchestrator_db(conn)
 

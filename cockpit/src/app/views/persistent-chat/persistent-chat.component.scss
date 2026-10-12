@@ -60,6 +60,14 @@
 
       /* Header */
 
+      .vm-lifecycle {
+        padding: 6px 16px;
+        border-bottom: 1px solid var(--border-color, var(--surface-0));
+        color: var(--text-secondary);
+        background: var(--panel-bg);
+        font-size: 12px;
+      }
+
       .chat-header {
         display: flex;
         align-items: center;

@@ -1,4 +1,4 @@
-import type { WorkspaceContractProjection, WorkspaceRecoveryView } from './api.model';
+import type { VMCreationView, WorkspaceContractProjection, WorkspaceCreationView, WorkspaceLifecycleView, WorkspaceRecoveryView } from './api.model';
 
 /**
  * Audit step types from MongoDB agent_audit collection.
@@ -121,6 +121,9 @@ export interface JobSummary {
   created_at: string;
   audit_count?: number | null;
   snapshot_status?: string | null;
+  /** The project-folder diff's review state: `pending` while it waits for
+   *  review (the outbox re-sync waits for it), null without one. */
+  diff_status?: 'pending' | 'accepted' | 'rejected' | null;
   /** Mode B export marker — set when "Export to shared folder" succeeds. */
   exported_at?: string | null;
   /**
@@ -169,6 +172,9 @@ export interface JobSummary {
   /** Safe requested/assigned/effective workspace tier observation. */
   workspace_contract?: WorkspaceContractProjection;
   workspace_recovery?: WorkspaceRecoveryView | null;
+  workspace_lifecycle?: WorkspaceLifecycleView | null;
+  vm_creation?: VMCreationView | null;
+  workspace_creation?: WorkspaceCreationView | null;
 }
 
 /**

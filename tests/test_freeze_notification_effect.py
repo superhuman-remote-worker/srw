@@ -18,8 +18,9 @@ import pytest
 
 from tests import b08_completion_helpers as b08_helpers
 
-import orchestrator.main
 from orchestrator.services.notification_service import RecordResult
+from orchestrator.services import completion_effects as completion_effects_module
+from orchestrator.services import notification_service as notification_service_module
 
 JOB_ID = str(uuid.uuid4())
 USER_ID = str(uuid.uuid4())
@@ -29,7 +30,9 @@ SUDO_ID = str(uuid.uuid4())
 @pytest.fixture
 def record(monkeypatch):
     mock = AsyncMock(return_value=RecordResult("n-1", True, {"in_app": True}))
-    monkeypatch.setattr(orchestrator.main.notification_service, "record", mock)
+    monkeypatch.setattr(
+        notification_service_module.notification_service, "record", mock
+    )
     return mock
 
 
@@ -64,6 +67,50 @@ class TestNotifyOperatorFreeze:
         assert kwargs["payload"]["freeze_type"] == "job_complete"
         assert kwargs["payload"]["phase_number"] == 3
         assert "awaiting review" in kwargs["body"]
+
+    @pytest.mark.asyncio
+    async def test_a_held_seal_says_why_before_anyone_reads_the_branch(self, record):
+        """worker_git_versioning_stops_midjob_seal_pins_stale_revision.md: a
+        seal held because delivery could not be proven is still a review item,
+        but the reviewer must learn the branch may be stale first."""
+        await b08_helpers.notify_operator_freeze(
+            _job(),
+            JOB_ID,
+            "job_complete",
+            {
+                "summary": "three reports",
+                "confidence": 0.9,
+                "delivery_hold": (
+                    "At job completion, the final commit did not land, so "
+                    "deliverable path(s) output/obstacles.md are not in the "
+                    "pushed revision."
+                ),
+            },
+            dedup_key="freeze_notification:cmd-hold",
+        )
+        kwargs = record.call_args.kwargs
+        assert kwargs["category"] == "review_queue"
+        assert "delivery unproven" in kwargs["subject"]
+        assert "output/obstacles.md are not in the pushed revision" in kwargs["body"]
+        assert kwargs["payload"]["delivery_hold"].startswith("At job completion")
+
+    @pytest.mark.asyncio
+    async def test_the_agents_own_delivery_error_is_named_too(self, record):
+        await b08_helpers.notify_operator_freeze(
+            _job(),
+            JOB_ID,
+            "job_complete",
+            {
+                "summary": "done",
+                "delivery_failed": True,
+                "delivery_error": "The job-ending git push failed at job freeze "
+                "(retried once).",
+            },
+            dedup_key="freeze_notification:cmd-df",
+        )
+        kwargs = record.call_args.kwargs
+        assert "delivery unproven" in kwargs["subject"]
+        assert "(retried once)" in kwargs["body"]
 
     @pytest.mark.asyncio
     async def test_vm_upgrade_points_at_the_sudo_request(self, record):
@@ -123,25 +170,20 @@ class TestNotifyOperatorFreeze:
 class TestCompletionEffectDedupKey:
     def test_journalled_effect_uses_the_command_id(self):
         runner = SimpleNamespace(command_id="cmd-42")
-        key = (
-            orchestrator.main.completion_effect_operations.completion_effect_dedup_key(
-                runner, "freeze_notification", JOB_ID
-            )
+        key = completion_effects_module.completion_effect_dedup_key(
+            runner, "freeze_notification", JOB_ID
         )
         assert key == "freeze_notification:cmd-42"
         # Stable across retries and restarts of the same command.
-        assert (
-            key
-            == orchestrator.main.completion_effect_operations.completion_effect_dedup_key(
-                runner, "freeze_notification", JOB_ID
-            )
+        assert key == completion_effects_module.completion_effect_dedup_key(
+            runner, "freeze_notification", JOB_ID
         )
 
     def test_runner_less_route_gets_a_fresh_key_each_time(self):
-        a = orchestrator.main.completion_effect_operations.completion_effect_dedup_key(
+        a = completion_effects_module.completion_effect_dedup_key(
             None, "freeze_notification", JOB_ID
         )
-        b = orchestrator.main.completion_effect_operations.completion_effect_dedup_key(
+        b = completion_effects_module.completion_effect_dedup_key(
             None, "freeze_notification", JOB_ID
         )
         assert a != b

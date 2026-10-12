@@ -32,6 +32,7 @@ import pytest_asyncio
 from testcontainers.postgres import PostgresContainer
 
 from orchestrator.database.postgres import PostgresDB
+from tests._container_recovery_schema import create_empty_container_recovery_ledger
 
 JOB = "4435994d-b029-444d-8a3c-26c64abd456a"
 OTHER_JOB = "c6dd288d-25d0-41f0-a66e-79a8624f06ab"
@@ -81,6 +82,7 @@ async def db(pg_dsn):
             )
             """
         )
+        await create_empty_container_recovery_ledger(conn)
         await conn.execute("TRUNCATE jobs")
         # A recovered job: back to 'created', unassigned, but still carrying the
         # failure record from the run that died.

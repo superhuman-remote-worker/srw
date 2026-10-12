@@ -47,6 +47,7 @@ from orchestrator.schemas.datasources import (
     ProjectDatasourceSettings,
 )
 from orchestrator.security import access
+from orchestrator.services import datasource_config as datasource_config_module
 
 
 # =============================================================================
@@ -80,9 +81,12 @@ def _ds_deps(user: dict, db):
     the dataclass default, i.e. the real function from
     ``orchestrator.security.access``.
     """
-    from orchestrator.main import _mcp_datasources_enabled, _validate_mcp_datasource
+    from orchestrator.services.deployment_gates import (
+        mcp_datasources_enabled as _mcp_datasources_enabled,
+    )
     from orchestrator.routers.datasources import DatasourcesDependencies
     from orchestrator.services.datasources import DatasourceDependencies
+    from orchestrator.services.connector_drivers import builtin_connector_drivers
     from orchestrator.services.kb_task_registry import KbDatasourceTaskRegistry
     from orchestrator.services.knowledge_index import KnowledgeIndexDependencies
 
@@ -100,7 +104,8 @@ def _ds_deps(user: dict, db):
                 inject_system_kb_embedding_profile=AsyncMock(return_value=None),
             ),
             mcp_datasources_enabled=_mcp_datasources_enabled,
-            validate_mcp_datasource=_validate_mcp_datasource,
+            validate_mcp_datasource=datasource_config_module.validate_mcp_datasource,
+            connector_drivers=builtin_connector_drivers(),
         ),
         require_approved_user=AsyncMock(return_value=user),
     )
@@ -221,6 +226,42 @@ class TestRedactDatasource:
 
         assert out["connection_url"] == value
         assert "connection_url_redacted" not in out
+
+    def test_a_credentials_connector_shows_its_variable_names_only(self):
+        out = access.redact_datasource(
+            {
+                "type": "credentials",
+                "credentials": {"env_vars": {"B_TOKEN": "b-secret", "A_KEY": "a"}},
+            }
+        )
+        assert out["env_var_names"] == ["A_KEY", "B_TOKEN"]
+        assert "credentials" not in out
+        assert "b-secret" not in repr(out)
+
+    def test_a_generic_connector_shows_no_names(self):
+        out = access.redact_datasource(
+            {"type": "generic", "credentials": {"env_vars": {"TOKEN": "secret"}}}
+        )
+        assert "env_var_names" not in out
+
+    @pytest.mark.parametrize(
+        "stored",
+        [
+            # A string or a list where the object should be: no names, and
+            # none of its characters or items.
+            {"env_vars": "API_KEY=s3cret-value"},
+            {"env_vars": ["API_KEY=s3cret-value", "OTHER=x"]},
+            {"env_vars": None},
+            {},
+            "an-encrypted-blob-that-did-not-decrypt",
+            ["s3cret-value"],
+            None,
+        ],
+    )
+    def test_a_malformed_slot_leaks_nothing(self, stored):
+        out = access.redact_datasource({"type": "credentials", "credentials": stored})
+        assert out["env_var_names"] == []
+        assert "s3cret" not in repr(out)
 
 
 # =============================================================================
@@ -821,6 +862,7 @@ class TestEligibleDatasourcesEndpoint:
         with _patch_caller(user_a):
             rows = await list_eligible_datasources(
                 fake_request,
+                execution=None,
                 project_id=[str(project_a["id"])],
                 dependencies=_ds_deps(user_a, fake_db),
             )
@@ -840,6 +882,7 @@ class TestEligibleDatasourcesEndpoint:
             with pytest.raises(HTTPException) as exc:
                 await list_eligible_datasources(
                     fake_request,
+                    execution=None,
                     project_id=[str(project_a["id"])],
                     dependencies=_ds_deps(user_b, fake_db),
                 )
@@ -855,7 +898,10 @@ class TestEligibleDatasourcesEndpoint:
         )
         with _patch_caller(user_a):
             rows = await list_eligible_datasources(
-                fake_request, project_id=None, dependencies=_ds_deps(user_a, fake_db)
+                fake_request,
+                execution=None,
+                project_id=None,
+                dependencies=_ds_deps(user_a, fake_db),
             )
         assert len(rows) == 2
         fake_db.list_eligible_datasources.assert_awaited_once()
@@ -874,7 +920,10 @@ class TestEligibleDatasourcesEndpoint:
 
         with _patch_caller(scoped):
             await list_eligible_datasources(
-                fake_request, project_id=None, dependencies=_ds_deps(scoped, fake_db)
+                fake_request,
+                execution=None,
+                project_id=None,
+                dependencies=_ds_deps(scoped, fake_db),
             )
 
         assert fake_db.list_eligible_datasources.await_args.args[1] == [
@@ -900,12 +949,39 @@ class TestEligibleDatasourcesEndpoint:
                 with pytest.raises(HTTPException) as exc:
                     await list_eligible_datasources(
                         fake_request,
+                        execution=None,
                         project_id=requested,
                         dependencies=_ds_deps(scoped, fake_db),
                     )
                 assert exc.value.status_code == 403
 
         fake_db.list_eligible_datasources.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_a_job_picker_never_lists_a_session_only_connector(
+        self, user_a, project_a, datasource_a, fake_db, fake_request
+    ):
+        folder = {
+            "id": "00000000-0000-4000-8000-0000000000f1",
+            "name": "Atlas cloud folder",
+            "type": "cloud_folder",
+            "managed_key": f"project-cloud:{project_a['id']}",
+        }
+        fake_db.list_eligible_datasources = AsyncMock(
+            return_value=[datasource_a, folder]
+        )
+        listed = {}
+        for execution in (None, "session", "job"):
+            with _patch_caller(user_a):
+                rows = await list_eligible_datasources(
+                    fake_request,
+                    execution=execution,
+                    project_id=[str(project_a["id"])],
+                    dependencies=_ds_deps(user_a, fake_db),
+                )
+            listed[execution] = {row["id"] for row in rows}
+        assert listed[None] == listed["session"] == {datasource_a["id"], folder["id"]}
+        assert listed["job"] == {datasource_a["id"]}
 
 
 # =============================================================================

@@ -23,12 +23,18 @@ import pytest
 from fastapi import HTTPException
 
 from orchestrator.database.postgres import JobQueryResult
+from orchestrator.application import jobs as jobs_composition
+from orchestrator.application import sessions as sessions_composition
+import functools
 
 
 def _patch_caller_and_db(user: dict, db):
     stack = ExitStack()
     stack.enter_context(
-        patch("orchestrator.main.require_approved_user", AsyncMock(return_value=user))
+        patch(
+            "orchestrator.security.auth.require_approved_user",
+            AsyncMock(return_value=user),
+        )
     )
     stack.enter_context(
         patch(
@@ -36,7 +42,7 @@ def _patch_caller_and_db(user: dict, db):
             AsyncMock(return_value=user),
         )
     )
-    stack.enter_context(patch("orchestrator.main.postgres_db", db))
+    stack.enter_context(patch("orchestrator.main.app.state.resources.postgres_db", db))
     return stack
 
 
@@ -59,7 +65,10 @@ class TestAgentsAdminOnly:
         import orchestrator.main as _orch_main
 
         fake_request.app.state.agent_registration_dependencies_factory = (
-            _orch_main._agent_registration_dependencies
+            functools.partial(
+                sessions_composition.agent_registration_dependencies,
+                _orch_main.app.state.resources,
+            )
         )
 
         fake_db.list_agents = AsyncMock(
@@ -76,7 +85,10 @@ class TestAgentsAdminOnly:
         import orchestrator.main as _orch_main
 
         fake_request.app.state.agent_registration_dependencies_factory = (
-            _orch_main._agent_registration_dependencies
+            functools.partial(
+                sessions_composition.agent_registration_dependencies,
+                _orch_main.app.state.resources,
+            )
         )
 
         fake_db.list_agents = AsyncMock(
@@ -92,7 +104,10 @@ class TestAgentsAdminOnly:
         import orchestrator.main as _orch_main
 
         fake_request.app.state.agent_registration_dependencies_factory = (
-            _orch_main._agent_registration_dependencies
+            functools.partial(
+                sessions_composition.agent_registration_dependencies,
+                _orch_main.app.state.resources,
+            )
         )
 
         fake_db.get_agent = AsyncMock(
@@ -109,7 +124,10 @@ class TestAgentsAdminOnly:
         import orchestrator.main as _orch_main
 
         fake_request.app.state.agent_registration_dependencies_factory = (
-            _orch_main._agent_registration_dependencies
+            functools.partial(
+                sessions_composition.agent_registration_dependencies,
+                _orch_main.app.state.resources,
+            )
         )
 
         fake_db.get_agent = AsyncMock(return_value={"id": "agent-1"})
@@ -125,7 +143,10 @@ class TestAgentsAdminOnly:
         import orchestrator.main as _orch_main
 
         fake_request.app.state.agent_registration_dependencies_factory = (
-            _orch_main._agent_registration_dependencies
+            functools.partial(
+                sessions_composition.agent_registration_dependencies,
+                _orch_main.app.state.resources,
+            )
         )
 
         fake_db.get_agent = AsyncMock(
@@ -142,7 +163,10 @@ class TestAgentsAdminOnly:
         import orchestrator.main as _orch_main
 
         fake_request.app.state.agent_registration_dependencies_factory = (
-            _orch_main._agent_registration_dependencies
+            functools.partial(
+                sessions_composition.agent_registration_dependencies,
+                _orch_main.app.state.resources,
+            )
         )
 
         fake_db.delete_agent = AsyncMock(
@@ -159,7 +183,10 @@ class TestAgentsAdminOnly:
         import orchestrator.main as _orch_main
 
         fake_request.app.state.agent_registration_dependencies_factory = (
-            _orch_main._agent_registration_dependencies
+            functools.partial(
+                sessions_composition.agent_registration_dependencies,
+                _orch_main.app.state.resources,
+            )
         )
 
         fake_db.delete_agent = AsyncMock(return_value=True)
@@ -177,21 +204,29 @@ class TestAgentsAdminOnly:
         import orchestrator.main as _orch_main
 
         fake_request.app.state.agent_registration_dependencies_factory = (
-            _orch_main._agent_registration_dependencies
+            functools.partial(
+                sessions_composition.agent_registration_dependencies,
+                _orch_main.app.state.resources,
+            )
         )
 
         fake_db.delete_agent = AsyncMock(return_value=True)
         with ExitStack() as stack:
             stack.enter_context(
-                patch("orchestrator.main.is_internal_call", lambda request: True)
+                patch(
+                    "orchestrator.security.access.is_internal_call",
+                    lambda request: True,
+                )
             )
             stack.enter_context(
                 patch(
-                    "orchestrator.main.require_approved_user",
+                    "orchestrator.security.auth.require_approved_user",
                     AsyncMock(side_effect=AssertionError("user auth consulted")),
                 )
             )
-            stack.enter_context(patch("orchestrator.main.postgres_db", fake_db))
+            stack.enter_context(
+                patch("orchestrator.main.app.state.resources.postgres_db", fake_db)
+            )
             result = await delete_agent(fake_request, "agent-1")
         assert result == {"status": "deleted"}
         fake_db.delete_agent.assert_awaited_once_with("agent-1")
@@ -207,7 +242,7 @@ class TestListMyActiveJobs:
     async def test_non_admin_filters_to_active_statuses(
         self, user_a, fake_db, fake_request
     ):
-        from orchestrator.main import _job_inspection_dependencies
+        import orchestrator.main
         from orchestrator.routers.job_inspection import list_my_active_jobs
 
         # Mix of in-flight and terminal — gate should drop completed/failed.
@@ -222,7 +257,11 @@ class TestListMyActiveJobs:
         fake_db.query_jobs = AsyncMock(return_value=JobQueryResult(jobs=rows))
         with _patch_caller_and_db(user_a, fake_db):
             result = await list_my_active_jobs(
-                fake_request, limit=100, dependencies=_job_inspection_dependencies()
+                fake_request,
+                limit=100,
+                dependencies=jobs_composition.job_inspection_dependencies(
+                    orchestrator.main.app.state.resources
+                ),
             )
         kept_ids = {r["id"] for r in result}
         assert kept_ids == {"j1", "j3", "j5", "j6"}
@@ -231,13 +270,17 @@ class TestListMyActiveJobs:
     async def test_non_admin_uses_visibility_or_clause(
         self, user_a, fake_db, fake_request
     ):
-        from orchestrator.main import _job_inspection_dependencies
+        import orchestrator.main
         from orchestrator.routers.job_inspection import list_my_active_jobs
 
         fake_db.query_jobs = AsyncMock(return_value=JobQueryResult(jobs=[]))
         with _patch_caller_and_db(user_a, fake_db):
             await list_my_active_jobs(
-                fake_request, limit=100, dependencies=_job_inspection_dependencies()
+                fake_request,
+                limit=100,
+                dependencies=jobs_composition.job_inspection_dependencies(
+                    orchestrator.main.app.state.resources
+                ),
             )
         kwargs = fake_db.query_jobs.call_args.kwargs
         assert kwargs["owner_user_id"] == str(user_a["id"])
@@ -250,13 +293,17 @@ class TestListMyActiveJobs:
         self, user_admin, fake_db, fake_request
     ):
         """Admin gets their personal active set (not the full fleet) — for that they use /api/agents."""
-        from orchestrator.main import _job_inspection_dependencies
+        import orchestrator.main
         from orchestrator.routers.job_inspection import list_my_active_jobs
 
         fake_db.query_jobs = AsyncMock(return_value=JobQueryResult(jobs=[]))
         with _patch_caller_and_db(user_admin, fake_db):
             await list_my_active_jobs(
-                fake_request, limit=100, dependencies=_job_inspection_dependencies()
+                fake_request,
+                limit=100,
+                dependencies=jobs_composition.job_inspection_dependencies(
+                    orchestrator.main.app.state.resources
+                ),
             )
         fake_db.query_jobs.assert_awaited_once()
         kwargs = fake_db.query_jobs.call_args.kwargs
@@ -266,19 +313,23 @@ class TestListMyActiveJobs:
 
     @pytest.mark.asyncio
     async def test_unauthenticated_baseline(self, fake_db, fake_request):
-        from orchestrator.main import _job_inspection_dependencies
+        import orchestrator.main
         from orchestrator.routers.job_inspection import list_my_active_jobs
 
         with (
             patch(
-                "orchestrator.main.require_approved_user",
+                "orchestrator.security.auth.require_approved_user",
                 AsyncMock(side_effect=HTTPException(status_code=401)),
             ),
-            patch("orchestrator.main.postgres_db", fake_db),
+            patch("orchestrator.main.app.state.resources.postgres_db", fake_db),
         ):
             with pytest.raises(HTTPException) as exc:
                 await list_my_active_jobs(
-                    fake_request, limit=100, dependencies=_job_inspection_dependencies()
+                    fake_request,
+                    limit=100,
+                    dependencies=jobs_composition.job_inspection_dependencies(
+                        orchestrator.main.app.state.resources
+                    ),
                 )
         assert exc.value.status_code == 401
 
@@ -286,14 +337,18 @@ class TestListMyActiveJobs:
     async def test_mcp_project_scope_narrows(
         self, user_a, project_a, fake_db, fake_request
     ):
-        from orchestrator.main import _job_inspection_dependencies
+        import orchestrator.main
         from orchestrator.routers.job_inspection import list_my_active_jobs
 
         scoped = _scoped(user_a, f"project:{project_a['id']}")
         fake_db.query_jobs = AsyncMock(return_value=JobQueryResult(jobs=[]))
         with _patch_caller_and_db(scoped, fake_db):
             await list_my_active_jobs(
-                fake_request, limit=100, dependencies=_job_inspection_dependencies()
+                fake_request,
+                limit=100,
+                dependencies=jobs_composition.job_inspection_dependencies(
+                    orchestrator.main.app.state.resources
+                ),
             )
         kwargs = fake_db.query_jobs.call_args.kwargs
         assert kwargs["scope_project_id"] == str(project_a["id"])
@@ -303,14 +358,18 @@ class TestListMyActiveJobs:
         self, user_admin, project_a, fake_db, fake_request
     ):
         """Admin with MCP scope keeps the admin path but gains scope_project_id."""
-        from orchestrator.main import _job_inspection_dependencies
+        import orchestrator.main
         from orchestrator.routers.job_inspection import list_my_active_jobs
 
         scoped = _scoped(user_admin, f"project:{project_a['id']}")
         fake_db.query_jobs = AsyncMock(return_value=JobQueryResult(jobs=[]))
         with _patch_caller_and_db(scoped, fake_db):
             await list_my_active_jobs(
-                fake_request, limit=100, dependencies=_job_inspection_dependencies()
+                fake_request,
+                limit=100,
+                dependencies=jobs_composition.job_inspection_dependencies(
+                    orchestrator.main.app.state.resources
+                ),
             )
         kwargs = fake_db.query_jobs.call_args.kwargs
         assert kwargs["scope_project_id"] == str(project_a["id"])

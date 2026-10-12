@@ -271,18 +271,36 @@ class TestOpenRouterLLMCreation:
 
     @patch.dict(os.environ, {"OPENROUTER_API_KEY": "sk-or-test-key"}, clear=False)
     @patch("shared.runtime.core.loader.ReasoningChatOpenAI")
-    def test_explicit_base_url_overrides(self, mock_chat):
-        """Explicit config.base_url should override the default OpenRouter URL."""
+    def test_explicit_base_url_overrides_with_own_key(self, mock_chat):
+        """A pinned base_url is honoured when the config brings its own key
+        (BYO). The env OPENROUTER_API_KEY belongs to openrouter.ai and must not
+        be sent to the pinned host — a key follows its endpoint."""
         mock_chat.return_value = MagicMock()
         config = _make_config(
             model="openrouter/openai/gpt-4o",
             base_url="https://custom-proxy.example.com/v1",
+            api_key="sk-or-byo-key",
         )
 
         _create_openrouter_llm(config, limits=None)
 
         call_kwargs = mock_chat.call_args[1]
         assert call_kwargs["base_url"] == "https://custom-proxy.example.com/v1"
+        assert call_kwargs["api_key"] == "sk-or-byo-key"
+
+    @patch.dict(os.environ, {"OPENROUTER_API_KEY": "sk-or-test-key"}, clear=False)
+    @patch("shared.runtime.core.loader.ReasoningChatOpenAI")
+    def test_env_key_not_sent_to_pinned_foreign_host(self, mock_chat):
+        """A base_url pinned away from openrouter.ai with no config key must NOT
+        inherit the deployment's OPENROUTER_API_KEY (the exfiltration class)."""
+        mock_chat.return_value = MagicMock()
+        config = _make_config(
+            model="openrouter/openai/gpt-4o",
+            base_url="https://custom-proxy.example.com/v1",
+        )
+
+        with pytest.raises(ValueError, match="OPENROUTER_API_KEY"):
+            _create_openrouter_llm(config, limits=None)
 
     @patch.dict(
         os.environ,
@@ -583,6 +601,52 @@ class TestClaudeOpus5Reasoning:
         assert call_kwargs["model_kwargs"]["reasoning_effort"] == "high"
 
 
+class TestClaudeOpus55Reasoning:
+    """claude-opus-5-5 splits off claude-opus-5 for its default: Anthropic
+    calibrated 5.5 to `medium` (every other effort model defaults to `high`),
+    and it thinks more per turn at a given level. Ladder and settings are
+    otherwise Opus 5's."""
+
+    def test_capability_defaults_to_medium_on_the_full_ladder(self):
+        cap = reasoning_capability("claude-opus-5-5")
+        assert cap["method"] == "effort_enum"
+        assert cap["default"] == "medium"
+        assert cap["options"] == ["low", "medium", "high", "xhigh", "max"]
+
+    def test_openrouter_dotted_id_resolves_the_same_capability(self):
+        assert reasoning_capability("openrouter/anthropic/claude-opus-5.5") == (
+            reasoning_capability("claude-opus-5-5")
+        )
+
+    def test_opus_5_keeps_its_high_default(self):
+        # Regression guard: the split must not leak medium back onto Opus 5.
+        assert reasoning_capability("claude-opus-5")["default"] == "high"
+
+    def test_settings_match_opus_5(self):
+        # A family block falls through to `default`, never to a sibling — if the
+        # settings were dropped here Opus 5.5 would silently become
+        # non-multimodal with a 128k window.
+        from shared.runtime.core.loader import _apply_settings_matrix
+
+        five_five = {"llm": {"model": "claude-opus-5-5"}}
+        five = {"llm": {"model": "claude-opus-5"}}
+        _apply_settings_matrix(five_five, expert_llm_keys=set())
+        _apply_settings_matrix(five, expert_llm_keys=set())
+        five_five["llm"].pop("model")
+        five["llm"].pop("model")
+        assert five_five == five
+
+    @patch("shared.runtime.core.loader.ReasoningChatOpenAI")
+    def test_max_survives_the_chat_completions_factory(self, mock_chat):
+        mock_chat.return_value = MagicMock()
+        config = _make_config(model="claude-opus-5-5", reasoning_level="max")
+
+        _create_openai_llm(config, limits=None)
+
+        call_kwargs = mock_chat.call_args[1]
+        assert call_kwargs["model_kwargs"]["reasoning_effort"] == "max"
+
+
 class TestClaudeFableReasoning:
     """claude-fable covers Fable 5 and 5.1 in one family: identical matrix
     knobs, and the full effort ladder on both."""
@@ -618,6 +682,75 @@ class TestClaudeFableReasoning:
 
         call_kwargs = mock_chat.call_args[1]
         assert call_kwargs["model_kwargs"]["reasoning_effort"] == "max"
+
+
+class TestClaudeProxyAsksForVisibleReasoning:
+    """From CLIProxyAPI v7.3.17 a Chat `reasoning_effort` no longer makes the
+    proxy return Claude's thinking; `include_reasoning: true` does. Measured on
+    dev (v7.3.20, 2026-09-29): without it opus-5-5 and opus-5 came back
+    REDACTED, with it VISIBLE, header or not."""
+
+    PROXY_URL = "http://srw-codex-proxy:8317/v1"
+
+    @patch("shared.runtime.core.loader.ReasoningChatOpenAI")
+    def test_claude_on_the_proxy_asks_for_its_reasoning(self, mock_chat):
+        mock_chat.return_value = MagicMock()
+        config = _make_config(
+            model="claude-opus-5-5", base_url=self.PROXY_URL, reasoning_level="medium"
+        )
+
+        _create_openai_llm(config, limits=None)
+
+        call_kwargs = mock_chat.call_args[1]
+        assert call_kwargs["model_kwargs"]["reasoning_effort"] == "medium"
+        assert call_kwargs["extra_body"]["include_reasoning"] is True
+
+    @patch("shared.runtime.core.loader.ReasoningChatOpenAI")
+    def test_no_effort_means_no_visibility_request(self, mock_chat):
+        # An explicit summary request switches thinking on by itself on the
+        # proxy, so it must never ride on a call that asked for no reasoning.
+        mock_chat.return_value = MagicMock()
+        config = _make_config(
+            model="claude-opus-5-5", base_url=self.PROXY_URL, reasoning_level="none"
+        )
+
+        _create_openai_llm(config, limits=None)
+
+        call_kwargs = mock_chat.call_args[1]
+        assert "reasoning_effort" not in call_kwargs.get("model_kwargs", {})
+        assert "include_reasoning" not in call_kwargs.get("extra_body", {})
+
+    @pytest.mark.parametrize(
+        "model, base_url",
+        [
+            ("gpt-6-sol", "http://srw-codex-proxy:8317/v1"),
+            ("claude-opus-5-5", "https://claude-fixture.invalid/v1"),
+        ],
+    )
+    @patch("shared.runtime.core.loader.ReasoningChatOpenAI")
+    def test_other_models_and_endpoints_are_untouched(self, mock_chat, model, base_url):
+        mock_chat.return_value = MagicMock()
+        config = _make_config(model=model, base_url=base_url, reasoning_level="high")
+
+        _create_openai_llm(config, limits=None)
+
+        call_kwargs = mock_chat.call_args[1]
+        assert "include_reasoning" not in call_kwargs.get("extra_body", {})
+
+    @patch("shared.runtime.core.loader.ReasoningChatOpenAI")
+    def test_a_declared_value_wins(self, mock_chat):
+        mock_chat.return_value = MagicMock()
+        config = _make_config(
+            model="claude-opus-5-5",
+            base_url=self.PROXY_URL,
+            reasoning_level="high",
+            extra_body={"include_reasoning": False},
+        )
+
+        _create_openai_llm(config, limits=None)
+
+        call_kwargs = mock_chat.call_args[1]
+        assert call_kwargs["extra_body"]["include_reasoning"] is False
 
 
 class TestFallThroughLadderIncludesXhigh:

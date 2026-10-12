@@ -28,6 +28,74 @@ class FakeRunner(harness.CommandRunner):
         return self.responses.pop(0)
 
 
+@pytest.mark.parametrize("stage", ("archive", "import"))
+def test_image_transfer_timeout_keeps_partial_diagnostics_and_removes_archive(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, stage: str
+) -> None:
+    state_root = tmp_path / "state"
+    store = harness.StateStore(state_root)
+    ledger = store.initialize("20260928-032500-ab12cd34")
+    ledger["source_revision"] = "a" * 40
+    saved_refs: list[str] = []
+    monkeypatch.setattr(harness, "DEPENDENCY_IMAGES", ())
+
+    def timeout(argv, **kwargs):
+        assert kwargs["timeout"] == 1800
+        raise subprocess.TimeoutExpired(
+            argv,
+            1800,
+            output=b"copying layer sha256:123\nAuthorization: Bearer secret-value\n",
+            stderr=b"waiting for node import\xff\n",
+        )
+
+    monkeypatch.setattr(harness.subprocess, "run", timeout)
+    monkeypatch.setattr(
+        harness,
+        "docker_archive_config_ids",
+        lambda _: {
+            harness.canonical_containerd_tag(ref): "sha256:" + "b" * 64
+            for ref in saved_refs
+        },
+    )
+
+    class ImageRunner(harness.CommandRunner):
+        def run(self, argv, **kwargs):
+            if argv[:2] == ["docker", "version"]:
+                return harness.CommandResult(0, "linux/amd64\n")
+            if argv[:2] == ["docker", "build"]:
+                return harness.CommandResult(0)
+            if argv[:3] == ["docker", "image", "inspect"]:
+                return harness.CommandResult(
+                    0, f"sha256:{'b' * 64}|{ledger['run_id']}|{'a' * 40}\n"
+                )
+            if argv[:3] == ["docker", "image", "save"]:
+                archive = Path(argv[argv.index("--output") + 1])
+                archive.write_bytes(b"partial archive")
+                saved_refs.extend(argv[argv.index("--output") + 2 :])
+                if stage == "archive":
+                    return super().run(argv, **kwargs)
+                return harness.CommandResult(0, "archive saved\n")
+            if argv[:3] == ["k3d", "image", "import"]:
+                return super().run(argv, **kwargs)
+            raise AssertionError(f"unexpected test operation: {kwargs.get('label')}")
+
+    application = harness.ApplicationE2EHarness(state_root, ImageRunner())
+    with pytest.raises(harness.HarnessError, match="bounded timeout") as raised:
+        application.build_and_import_images(ledger)
+
+    run_dir = Path(ledger["run_dir"])
+    artifact = run_dir / "image-import-application.txt"
+    diagnostic = artifact.read_text()
+    assert "copying layer sha256:123" in diagnostic
+    assert "waiting for node import" in diagnostic
+    assert "bounded timeout" in diagnostic
+    assert "secret-value" not in diagnostic
+    assert "secret-value" not in str(raised.value)
+    assert "[REDACTED" in diagnostic
+    assert not (run_dir / ".image-import-application.tar").exists()
+    assert stat.S_IMODE(artifact.stat().st_mode) == 0o600
+
+
 def test_cluster_name_guard_never_accepts_shared_or_lookalike_names() -> None:
     assert (
         harness.validate_cluster_name("srw-e2e-20260824-123456-ab12cd34")
@@ -597,10 +665,13 @@ def test_dependency_images_use_host_platform_archives_before_k3d_import(
         assert command[-2:] == ["--mode", "direct"]
 
 
-def test_k3d_profile_configures_http_with_a_dynamic_host_port() -> None:
+def test_k3d_profile_configures_http_and_https_with_dynamic_host_ports() -> None:
     profile = yaml.safe_load(harness.K3D_TEMPLATE.read_text(encoding="utf-8"))
 
-    assert profile["ports"] == [{"port": "0:80", "nodeFilters": ["loadbalancer"]}]
+    assert profile["ports"] == [
+        {"port": "0:80", "nodeFilters": ["loadbalancer"]},
+        {"port": "0:443", "nodeFilters": ["loadbalancer"]},
+    ]
 
 
 @pytest.mark.parametrize(
@@ -1092,7 +1163,7 @@ def test_cleanup_rejects_nonexact_ledger_ids_before_any_request(
         application.cleanup(ledger)
 
 
-def test_provider_cleanup_waits_for_required_background_work_before_reset(
+def test_provider_cleanup_waits_for_work_and_retains_closed_readback(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, cleanup_clock
 ) -> None:
     run_id = "provider-cleanup-run"
@@ -1130,15 +1201,26 @@ def test_provider_cleanup_waits_for_required_background_work_before_reset(
         "unscoped_calls": [],
     }
     requests: list[tuple[str, str]] = []
+    closed = {**states[-1], "run_id": run_id, "closed": True, "expected_cancelled": 0}
+    did_close = False
 
     def fake_request(url: str, **kwargs):
+        nonlocal did_close
         method = kwargs.get("method", "GET")
         requests.append((method, url))
         if method == "DELETE":
             return 200, b"{}"
+        if method == "POST" and url.endswith("/close"):
+            did_close = True
+            return 200, json.dumps(closed).encode()
         if url.endswith(f"/{run_id}"):
-            return 200, json.dumps(states.pop(0)).encode()
-        return 200, json.dumps(overview).encode()
+            return 200, json.dumps(
+                closed if did_close else states.pop(0) if len(states) > 1 else states[0]
+            ).encode()
+        current = (
+            {**overview, "runs": [], "closed_runs": [closed]} if did_close else overview
+        )
+        return 200, json.dumps(current).encode()
 
     application = harness.ApplicationE2EHarness(tmp_path / "state")
     monkeypatch.setattr(
@@ -1150,9 +1232,67 @@ def test_provider_cleanup_waits_for_required_background_work_before_reset(
     monkeypatch.setenv("APP_E2E_PROVIDER_SETTLE_SECONDS", "1")
     application._cleanup_provider_run(ledger, resource_ledger)
 
-    assert requests[-1][0] == "DELETE"
+    assert not any(method == "DELETE" for method, _ in requests)
+    assert any(
+        method == "POST" and url.endswith(f"/{run_id}/close")
+        for method, url in requests
+    )
     receipt = json.loads((run_dir / "provider-cleanup-state.json").read_text())
-    assert receipt == {"scenario": overview["runs"][0], "overview": overview}
+    assert receipt["scenario"] == closed
+    assert receipt["overview"]["runs"] == []
+    assert receipt["overview"]["closed_runs"] == [closed]
+
+
+@pytest.mark.parametrize(
+    "fault",
+    [
+        "wrong-life",
+        "not-closed",
+        "counter-reset",
+        "changed-readback",
+        "missing-readback",
+    ],
+)
+def test_retaining_provider_close_refuses_lost_or_changed_evidence(monkeypatch, fault):
+    rid = "retained-harness-guard"
+    prior = {
+        "run_id": rid,
+        "pending_calls": 0,
+        "unexpected_count": 0,
+        "remaining_required_responses": 0,
+        "counters": [{"count": 1}],
+        "calls": [{"sequence": 1}],
+    }
+    closed = {**prior, "closed": True, "expected_cancelled": 0}
+    if fault == "wrong-life":
+        closed["run_id"] = "successor-life"
+    elif fault == "not-closed":
+        closed["closed"] = False
+    elif fault == "counter-reset":
+        closed["counters"] = []
+    reads = 0
+
+    def request(url, **kwargs):
+        nonlocal reads
+        if kwargs.get("method") == "POST":
+            return 200, json.dumps(closed).encode()
+        reads += 1
+        if reads == 1:
+            return 200, json.dumps(prior).encode()
+        observed = (
+            {**closed, "calls": []}
+            if fault == "changed-readback"
+            else {}
+            if fault == "missing-readback"
+            else closed
+        )
+        return 200, json.dumps(observed).encode()
+
+    monkeypatch.setattr(harness, "_http_request", request)
+    with pytest.raises(harness.HarnessError, match="cumulative accounting"):
+        harness._close_provider_scope(
+            "http://provider.test/control/scenarios/" + rid, headers={}, run_id=rid
+        )
 
 
 def test_provider_cleanup_refuses_global_unscoped_rejections(
@@ -1195,6 +1335,67 @@ def test_provider_cleanup_refuses_global_unscoped_rejections(
     monkeypatch.setenv("APP_E2E_PROVIDER_SETTLE_SECONDS", "0")
 
     with pytest.raises(harness.HarnessError, match="rejected or unscoped requests"):
+        application._cleanup_provider_run(ledger, {"run_id": run_id})
+    assert "DELETE" not in requests
+
+
+@pytest.mark.parametrize(
+    "probe_state",
+    [
+        pytest.param({"active_probe_window": "attach-001"}, id="still-open"),
+        pytest.param(
+            {
+                "probe_windows": [
+                    {"window_id": "attach-001", "closed": True, "settled": False}
+                ]
+            },
+            id="unsettled",
+        ),
+    ],
+)
+def test_provider_cleanup_refuses_unsettled_startup_probe_windows(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, cleanup_clock, probe_state
+) -> None:
+    run_id = "provider-probe-run"
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    ledger = {
+        "kubeconfig": str(tmp_path / "kubeconfig.yaml"),
+        "run_dir": str(run_dir),
+    }
+    settled = {
+        "pending_calls": 0,
+        "remaining_required_responses": 0,
+        "unexpected_count": 0,
+        "calls": [{"outcome": "success"}],
+    }
+    overview = {
+        "runs": [settled],
+        "unscoped_unexpected_calls": 0,
+        "unscoped_calls_truncated": 0,
+        "unscoped_calls": [],
+        "active_probe_window": None,
+        "probe_windows": [],
+        **probe_state,
+    }
+    requests: list[str] = []
+
+    def fake_request(url: str, **kwargs):
+        requests.append(kwargs.get("method", "GET"))
+        if url.endswith(f"/{run_id}"):
+            return 200, json.dumps(settled).encode()
+        return 200, json.dumps(overview).encode()
+
+    application = harness.ApplicationE2EHarness(tmp_path / "state")
+    monkeypatch.setattr(
+        application,
+        "_load_secrets",
+        lambda _ledger: type("Secrets", (), {"provider_control_token": "token"})(),
+    )
+    monkeypatch.setattr(harness, "_http_request", fake_request)
+    monkeypatch.setenv("APP_E2E_PROVIDER_SETTLE_SECONDS", "0")
+
+    with pytest.raises(harness.HarnessError, match="startup-probe windows"):
         application._cleanup_provider_run(ledger, {"run_id": run_id})
     assert "DELETE" not in requests
 
@@ -1413,6 +1614,10 @@ def test_stateless_sandbox_profile_renders_current_executor_and_workspace_images
         "forge-sandbox",
         "cloud-sandbox",
         "officer-watchdog",
+        "session-attention",
+        "session-transport",
+        "session-transport-secure",
+        "pinned-secure",
     ],
 )
 def test_session_profiles_do_not_render_an_extra_catalog_provider(
@@ -1449,6 +1654,279 @@ def test_session_profiles_do_not_render_an_extra_catalog_provider(
     # catalogue check, even if its service were omitted from the chart.
     environment = research_seed["spec"]["template"]["spec"]["containers"][0]["env"]
     assert "SEARXNG_BASE_URL" not in {item["name"] for item in environment}
+
+
+@pytest.mark.skipif(shutil.which("helm") is None, reason="Helm is not installed")
+def test_session_transport_profile_adds_only_one_warm_dual_pool_agent() -> None:
+    """R3.2's live gate composes session-attention and changes only the pool.
+
+    One warm pool agent (dual mode) serves the first session; with no idle
+    buffer the next session gets a dedicated persistent pod.
+    """
+    attention = harness.resolve_profile("session-attention")
+    profile = harness.resolve_profile("session-transport")
+    assert profile.values_files[:-1] == attention.values_files
+    assert profile.values_files[-1] == harness.DUAL_POOL_VALUES_FILE
+    assert profile.additional_deployments == attention.additional_deployments
+    assert profile.additional_statefulsets == attention.additional_statefulsets
+
+    def _config(values_files):
+        command = [
+            "helm",
+            "template",
+            "srw-e2e",
+            str(harness.REPO_ROOT / "helm"),
+            "-n",
+            harness.NAMESPACE,
+        ]
+        for values_file in values_files:
+            command.extend(("-f", str(values_file)))
+        rendered = subprocess.run(
+            command, check=True, capture_output=True, text=True, timeout=120
+        ).stdout
+        return next(
+            document
+            for document in yaml.safe_load_all(rendered)
+            if document
+            and document.get("kind") == "ConfigMap"
+            and document.get("metadata", {}).get("name") == "srw-e2e-config"
+        )["data"]
+
+    base = _config(attention.values_files)
+    transport = _config(profile.values_files)
+    assert transport["MIN_AGENTS"] == "1"
+    assert transport["AGENT_BUFFER"] == "0"
+    assert transport["MAX_AGENTS"] == "4"
+    changed = {
+        key
+        for key in base.keys() | transport.keys()
+        if base.get(key) != transport.get(key)
+    }
+    # The base e2e profile already pins AGENT_BUFFER to "0"; the overlay
+    # restates it so the one-warm-agent intent does not depend on that.
+    assert changed == {"MIN_AGENTS", "MAX_AGENTS"}
+
+
+def _render_documents(values_files) -> list[dict]:
+    command = [
+        "helm",
+        "template",
+        "srw-e2e",
+        str(harness.REPO_ROOT / "helm"),
+        "-n",
+        harness.NAMESPACE,
+    ]
+    for values_file in values_files:
+        command.extend(("-f", str(values_file)))
+    rendered = subprocess.run(
+        command, check=True, capture_output=True, text=True, timeout=120
+    ).stdout
+    return [document for document in yaml.safe_load_all(rendered) if document]
+
+
+def test_fixture_endpoint_is_the_in_namespace_service_name() -> None:
+    """Host DNS search domains must not sit on the provider's lookup path."""
+
+    values = yaml.safe_load(harness.VALUES_FILE.read_text(encoding="utf-8"))
+    endpoints = values["llm"]["seed"]["systemEndpoints"]
+    assert [endpoint["baseUrl"] for endpoint in endpoints] == [
+        harness.PROVIDER_SERVICE_BASE
+    ]
+    host = harness.PROVIDER_SERVICE_BASE.split("//", 1)[1].split(":", 1)[0]
+    assert "." not in host
+
+
+def test_secure_profiles_add_only_the_secure_origin_overlay() -> None:
+    transport = harness.resolve_profile("session-transport")
+    secure = harness.resolve_profile("session-transport-secure")
+    assert secure.values_files == (
+        *transport.values_files,
+        harness.SECURE_ORIGIN_VALUES_FILE,
+    )
+    assert secure.secure_origin and not transport.secure_origin
+    assert secure.base_url == "https://srw-e2e.test"
+    assert transport.base_url == harness.BASE_URL
+    assert (
+        dataclasses.replace(
+            secure,
+            name=transport.name,
+            values_files=transport.values_files,
+            secure_origin=False,
+        )
+        == transport
+    )
+
+    pinned = harness.resolve_profile("pinned-secure")
+    assert pinned.values_files == (
+        harness.VALUES_FILE,
+        harness.DUAL_POOL_VALUES_FILE,
+        harness.SECURE_ORIGIN_VALUES_FILE,
+    )
+    assert (pinned.workspace_backend, pinned.execution_lane) == ("virtual", "pinned")
+    assert pinned.secure_origin and not pinned.stateless_agents
+    # Its worker jobs run on the current-SHA workspace image.
+    assert pinned.include_workspace_image is True
+
+
+@pytest.mark.skipif(shutil.which("helm") is None, reason="Helm is not installed")
+@pytest.mark.parametrize(
+    "profile_name,pvc_enabled",
+    [("session-transport-secure", "true"), ("pinned-secure", "false")],
+)
+def test_secure_profiles_render_tls_ingress_and_session_socket_origin(
+    profile_name: str, pvc_enabled: str
+) -> None:
+    documents = _render_documents(harness.resolve_profile(profile_name).values_files)
+    config = next(
+        document["data"]
+        for document in documents
+        if document.get("kind") == "ConfigMap"
+        and document.get("metadata", {}).get("name") == "srw-e2e-config"
+    )
+    assert config["WORKSPACE_PVC_ENABLED"] == pvc_enabled
+    ingresses = [
+        document for document in documents if document.get("kind") == "Ingress"
+    ]
+    assert ingresses
+    for ingress in ingresses:
+        annotations = ingress["metadata"].get("annotations") or {}
+        assert (
+            annotations.get("traefik.ingress.kubernetes.io/router.entrypoints")
+            == "websecure"
+        ), ingress["metadata"]["name"]
+        for block in ingress["spec"].get("tls") or []:
+            assert block["secretName"] in harness.SECURE_ORIGIN_TLS_SECRETS
+    orchestrator = next(
+        document
+        for document in documents
+        if document.get("kind") == "Deployment"
+        and document.get("metadata", {}).get("name") == "srw-e2e-orchestrator"
+    )
+    environment = {
+        item["name"]: item.get("value")
+        for container in orchestrator["spec"]["template"]["spec"]["containers"]
+        for item in container.get("env") or []
+    }
+    assert environment["SESSION_INGRESS_HOST"] == "srw-e2e.test"
+    assert environment["SESSION_INGRESS_TLS_SECRET"] == "srw-e2e-session-tls"
+    assert json.loads(environment["SESSION_INGRESS_ANNOTATIONS"]) == {
+        "traefik.ingress.kubernetes.io/router.entrypoints": "websecure",
+        "traefik.ingress.kubernetes.io/router.tls": "true",
+    }
+    assert "https://srw-e2e.test" in json.dumps(config)
+
+
+def test_secure_origin_certificate_is_run_scoped_and_verifiable() -> None:
+    from cryptography import x509
+    from cryptography.hazmat.primitives.asymmetric import ec
+    from cryptography.x509.oid import ExtendedKeyUsageOID
+
+    ca_pem, chain_pem, key_pem = harness.mint_secure_origin_certificate(
+        "20260926-000000-abcdef12"
+    )
+    ca = x509.load_pem_x509_certificate(ca_pem.encode())
+    chain = x509.load_pem_x509_certificates(chain_pem.encode())
+    leaf = chain[0]
+    assert chain[1] == ca
+    leaf.verify_directly_issued_by(ca)
+    assert ca.extensions.get_extension_for_class(x509.BasicConstraints).value.ca
+    names = leaf.extensions.get_extension_for_class(
+        x509.SubjectAlternativeName
+    ).value.get_values_for_type(x509.DNSName)
+    assert names == ["srw-e2e.test", "*.srw-e2e.test"]
+    assert leaf.extensions.get_extension_for_class(
+        x509.ExtendedKeyUsage
+    ).value == x509.ExtendedKeyUsage([ExtendedKeyUsageOID.SERVER_AUTH])
+    assert (leaf.not_valid_after_utc - leaf.not_valid_before_utc).days <= 8
+    assert "PRIVATE KEY" in key_pem and "PRIVATE KEY" not in chain_pem + ca_pem
+    from cryptography.hazmat.primitives import serialization
+
+    key = serialization.load_pem_private_key(key_pem.encode(), password=None)
+    assert isinstance(key, ec.EllipticCurvePrivateKey)
+    assert key.public_key() == leaf.public_key()
+    # A second run never shares a CA.
+    other_ca, _, _ = harness.mint_secure_origin_certificate("20260926-000000-abcdef13")
+    assert other_ca != ca_pem
+
+
+def test_secure_origin_tls_goes_to_secrets_over_stdin_and_keeps_only_the_ca(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: list[tuple[list[str], str | None]] = []
+
+    class Runner:
+        def run(self, command, *, input_text=None, **_kwargs):
+            calls.append((list(command), input_text))
+
+    application = harness.ApplicationE2EHarness(tmp_path / "state")
+    application.runner = Runner()
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    ledger = {
+        "run_id": "20260926-000000-abcdef12",
+        "kubeconfig": str(tmp_path / "kubeconfig.yaml"),
+        "run_dir": str(run_dir),
+    }
+    monkeypatch.setattr(application, "_run_dir", lambda _ledger: run_dir)
+    monkeypatch.setattr(application, "_kubectl", lambda _ledger, *args: list(args))
+
+    application._install_secure_origin_tls(ledger)
+
+    applied = [json.loads(text) for _command, text in calls]
+    assert [secret["metadata"]["name"] for secret in applied] == list(
+        harness.SECURE_ORIGIN_TLS_SECRETS
+    )
+    assert all(secret["type"] == "kubernetes.io/tls" for secret in applied)
+    assert all(command == ["apply", "-f", "-"] for command, _ in calls)
+    kept = sorted(path.name for path in run_dir.iterdir())
+    assert kept == ["secure-origin-ca.pem"]
+    assert "PRIVATE KEY" not in (run_dir / "secure-origin-ca.pem").read_text()
+
+
+@pytest.mark.skipif(shutil.which("helm") is None, reason="Helm is not installed")
+def test_session_attention_profile_renders_a_mail_sink_audit_tier_and_store() -> None:
+    """R1.B10's live gate composes the forge profile and adds only its needs.
+
+    SMTP must point at the in-cluster GreenMail sink and nowhere else, the audit
+    StatefulSet the harness waits on must render, and so must the object store
+    that enables workspace suspension.
+    """
+    forge = harness.resolve_profile("forge-sandbox")
+    profile = harness.resolve_profile("session-attention")
+    assert profile.values_files[: len(forge.values_files)] == forge.values_files
+    assert profile.values_files[-1] == harness.SESSION_ATTENTION_VALUES_FILE
+
+    command = [
+        "helm",
+        "template",
+        "srw-e2e",
+        str(harness.REPO_ROOT / "helm"),
+        "-n",
+        harness.NAMESPACE,
+    ]
+    for values_file in profile.values_files:
+        command.extend(("-f", str(values_file)))
+    rendered = subprocess.run(
+        command, check=True, capture_output=True, text=True, timeout=120
+    ).stdout
+    documents = [document for document in yaml.safe_load_all(rendered) if document]
+    names = {
+        (document.get("kind"), document.get("metadata", {}).get("name"))
+        for document in documents
+    }
+    for deployment in profile.additional_deployments:
+        assert ("Deployment", deployment) in names
+    for statefulset in profile.additional_statefulsets:
+        assert ("StatefulSet", statefulset) in names
+    config = next(
+        document
+        for document in documents
+        if document.get("kind") == "ConfigMap"
+        and document.get("metadata", {}).get("name") == "srw-e2e-config"
+    )
+    assert config["data"]["SMTP_HOST"] == "srw-e2e-greenmail"
+    assert config["data"]["SMTP_PORT"] == "3025"
+    assert config["data"]["SMTP_USE_TLS"] == "false"
 
 
 def test_forge_sandbox_profile_composes_the_sandbox_overlay_and_adds_the_forge() -> (

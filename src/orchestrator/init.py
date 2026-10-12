@@ -717,6 +717,43 @@ async def _backfill_encrypt_datasource_credentials(db) -> None:
 # =============================================================================
 
 
+async def _upsert_seeded_datasource(
+    db,
+    drivers,
+    *,
+    name: str,
+    ds_type: str,
+    connection_url: str,
+    credentials: dict | None = None,
+) -> bool:
+    """Validate a seeded row with its connector driver, then upsert it.
+
+    ``False`` (and an error in the log) when the driver refuses it.
+    """
+    from orchestrator.services.connector_drivers.platform import (
+        validate_platform_connector,
+    )
+
+    try:
+        normalized = await validate_platform_connector(
+            drivers,
+            ds_type,
+            name=name,
+            connection_url=connection_url,
+            credentials=credentials,
+        )
+    except ValueError as exc:
+        logger.error("    Default datasource %s (%s) refused: %s", ds_type, name, exc)
+        return False
+    await db.upsert_default_datasource(
+        name=name,
+        ds_type=ds_type,
+        connection_url=normalized.connection_url,
+        credentials=normalized.credentials,
+    )
+    return True
+
+
 async def _seed_default_datasources(db) -> None:
     """Seed global datasources from DEFAULT_DS_* environment variables.
 
@@ -727,20 +764,31 @@ async def _seed_default_datasources(db) -> None:
         DEFAULT_DS_POSTGRESQL_URL, DEFAULT_DS_POSTGRESQL_NAME, DEFAULT_DS_POSTGRESQL_READ_ONLY
         DEFAULT_DS_NEO4J_URL, DEFAULT_DS_NEO4J_USERNAME, DEFAULT_DS_NEO4J_PASSWORD, DEFAULT_DS_NEO4J_NAME, DEFAULT_DS_NEO4J_READ_ONLY
         DEFAULT_DS_MONGODB_URL, DEFAULT_DS_MONGODB_NAME, DEFAULT_DS_MONGODB_READ_ONLY
+
+    Each row goes through its connector driver's validation first, as a
+    create would; a refused one is logged and not seeded.
     """
+    from orchestrator.services.connector_drivers import builtin_connector_drivers
+    from orchestrator.services.legacy_cloud_datasources import (
+        is_nextcloud_admin_home_url,
+    )
+
+    drivers = builtin_connector_drivers()
     seeded = 0
 
     # PostgreSQL datasource
     pg_url = os.getenv("DEFAULT_DS_POSTGRESQL_URL")
     if pg_url:
         name = os.getenv("DEFAULT_DS_POSTGRESQL_NAME", "Default PostgreSQL")
-        await db.upsert_default_datasource(
+        if await _upsert_seeded_datasource(
+            db,
+            drivers,
             name=name,
             ds_type="postgresql",
             connection_url=pg_url,
-        )
-        logger.info(f"    Seeded default datasource: postgresql ({name})")
-        seeded += 1
+        ):
+            logger.info(f"    Seeded default datasource: postgresql ({name})")
+            seeded += 1
 
     # Neo4j datasource
     neo4j_url = os.getenv("DEFAULT_DS_NEO4J_URL")
@@ -753,30 +801,44 @@ async def _seed_default_datasources(db) -> None:
             credentials["username"] = username
         if password:
             credentials["password"] = password
-        await db.upsert_default_datasource(
+        if await _upsert_seeded_datasource(
+            db,
+            drivers,
             name=name,
             ds_type="neo4j",
             connection_url=neo4j_url,
             credentials=credentials if credentials else None,
-        )
-        logger.info(f"    Seeded default datasource: neo4j ({name})")
-        seeded += 1
+        ):
+            logger.info(f"    Seeded default datasource: neo4j ({name})")
+            seeded += 1
 
     # MongoDB datasource
     mongo_url = os.getenv("DEFAULT_DS_MONGODB_URL")
     if mongo_url:
         name = os.getenv("DEFAULT_DS_MONGODB_NAME", "Default MongoDB")
-        await db.upsert_default_datasource(
+        if await _upsert_seeded_datasource(
+            db,
+            drivers,
             name=name,
             ds_type="mongodb",
             connection_url=mongo_url,
-        )
-        logger.info(f"    Seeded default datasource: mongodb ({name})")
-        seeded += 1
+        ):
+            logger.info(f"    Seeded default datasource: mongodb ({name})")
+            seeded += 1
 
-    # WebDAV datasource (Nextcloud or any WebDAV server)
+    # WebDAV datasource (an external WebDAV server, cloud.externalBackend:
+    # webdav). Never Nextcloud admin's own home: the chart's bundled-Nextcloud
+    # branch seeded that as a global row holding admin's credentials, and the
+    # startup pass retires it (main cloud slice 8), so an old ConfigMap still
+    # naming it must not seed it again.
     webdav_url = os.getenv("DEFAULT_DS_WEBDAV_URL")
-    if webdav_url:
+    if webdav_url and is_nextcloud_admin_home_url(webdav_url):
+        logger.warning(
+            "    Default datasource webdav refused: %s is Nextcloud admin's "
+            "home, which no seeded connector may reach",
+            webdav_url,
+        )
+    elif webdav_url:
         name = os.getenv("DEFAULT_DS_WEBDAV_NAME", "Default WebDAV")
         credentials = {}
         username = os.getenv("DEFAULT_DS_WEBDAV_USERNAME")
@@ -785,14 +847,16 @@ async def _seed_default_datasources(db) -> None:
             credentials["username"] = username
         if password:
             credentials["password"] = password
-        await db.upsert_default_datasource(
+        if await _upsert_seeded_datasource(
+            db,
+            drivers,
             name=name,
             ds_type="webdav",
             connection_url=webdav_url,
             credentials=credentials if credentials else None,
-        )
-        logger.info(f"    Seeded default datasource: webdav ({name})")
-        seeded += 1
+        ):
+            logger.info(f"    Seeded default datasource: webdav ({name})")
+            seeded += 1
 
     if seeded > 0:
         logger.info(f"  Seeded {seeded} default datasource(s)")
@@ -1148,12 +1212,7 @@ async def _backfill_cloud_folders(db) -> None:
                 group_id=group_name,
             )
             if folder_handle is not None:
-                legacy_folder_id: int | None = None
-                if backend.backend_id == "nextcloud":
-                    try:
-                        legacy_folder_id = int(folder_handle.native_id)
-                    except ValueError:
-                        legacy_folder_id = None
+                legacy_folder_id = backend.legacy_folder_id(folder_handle)
                 await db.update_project(
                     project_id,
                     main_cloud_backend=backend.backend_id,

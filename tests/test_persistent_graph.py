@@ -348,6 +348,57 @@ class TestRunPersistentLoopSystemPrompt:
         assert _prompt_body(messages[0].content) == "attach-time prompt"
 
     @pytest.mark.asyncio
+    async def test_checkpoint_restore_keeps_its_summary_beside_the_prompt(self):
+        """A restore from a compaction checkpoint starts with the summary.
+
+        The summary is a SystemMessage too; mistaking it for the prompt slot
+        skipped the prompt insert and the per-turn refresh then overwrote the
+        summary with the prompt, so every restored session lost all history
+        before its kept tail (live on main-dev: 0 of 71 calls carried it).
+        """
+        summary = SystemMessage(content="[Summary of prior work]\nThe cat is Ash.")
+        tail = HumanMessage(content="What is my cat called?")
+        messages: List[BaseMessage] = [summary, tail]
+        seen: list[list[BaseMessage]] = []
+
+        call_count = 0
+
+        async def _input():
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                return "hi"
+            raise asyncio.CancelledError
+
+        llm = _make_streaming_llm(_make_llm_response())
+
+        async def _astream(sent, **kw):
+            seen.append(list(sent))
+            yield _make_llm_response()
+
+        llm.astream = _astream
+
+        await run_persistent_loop(
+            llm_with_tools=llm,
+            tools=[],
+            context_manager=AsyncMock(
+                ensure_within_limits=AsyncMock(side_effect=lambda m, *a, **kw: m)
+            ),
+            config=_make_config(),
+            system_prompt="attach-time prompt",
+            callbacks=_make_callbacks(get_user_input=_input),
+            messages=messages,
+            get_current_system_prompt=lambda: "rebuilt prompt",
+        )
+
+        assert _prompt_body(messages[0].content) == "rebuilt prompt"
+        assert messages[1] is summary
+        assert summary.content == "[Summary of prior work]\nThe cat is Ash."
+        assert seen, "the turn reached the model"
+        sent_text = [getattr(m, "content", "") for m in seen[0]]
+        assert "[Summary of prior work]\nThe cat is Ash." in sent_text
+
+    @pytest.mark.asyncio
     async def test_system_prompt_carries_current_date(self):
         """Every turn's system message states today's date and weekday.
 
@@ -3483,7 +3534,7 @@ class TestToolExecutionLoop:
         async def authorize_end_after_provider(*_args):
             state["retirement_authorized"] = True
             # The delayed lifecycle watchdog has not installed the local latch.
-            assert pa._retirement_admission_identity is None
+            assert pa._session_termination.retirement_admission_identity is None
 
         callbacks = _make_callbacks(
             before_provider_execution=pa._loop_runtime_effect_authority_current,
@@ -3493,16 +3544,20 @@ class TestToolExecutionLoop:
 
         with (
             patch.object(pa, "_session", session),
-            patch.object(pa, "_thread_id", "thread-a"),
+            patch.object(pa._session_identity, "_thread_id", "thread-a"),
             patch.object(
                 pa, "_orchestrator_client", SimpleNamespace(agent_id=agent_id)
             ),
-            patch.object(pa, "_pinned_runtime_generation_enabled", True),
-            patch.object(pa, "_input_runtime_generation", generation),
-            patch.object(pa, "_session_runtime_generation", generation),
-            patch.object(pa, "_session_runtime_attach_token", attach_token),
-            patch.object(pa, "_retirement_admission_identity", None),
-            patch.object(pa, "_termination_admission_fenced", False),
+            patch.object(pa._session_identity, "_runtime_contract", True),
+            patch.object(pa._session_identity, "_process_generation", generation),
+            patch.object(pa._session_identity, "_session_generation", generation),
+            patch.object(pa._session_identity, "_attach_token", attach_token),
+            patch.object(
+                pa._session_termination, "retirement_admission_identity", None
+            ),
+            patch.object(
+                pa._session_termination, "termination_admission_fenced", False
+            ),
             patch.object(pa, "_tool_inflight", False),
             patch.dict(pa.os.environ, {"POD_UID": "pod-uid-a"}),
         ):
@@ -3596,7 +3651,7 @@ class TestToolExecutionLoop:
         with (
             patch.object(pa, "_session", session),
             patch.object(pa, "_tool_inflight", False),
-            patch.object(pa, "_schedule_protected_input_reclaim"),
+            patch.object(pa._session_input, "schedule_protected_reclaim"),
             patch.object(pa, "_broadcast"),
         ):
             with pytest.raises(WorkspaceUnavailableError, match="protected cloud"):
@@ -3642,7 +3697,7 @@ class TestToolExecutionLoop:
         try:
             with (
                 patch.object(pa, "_session", SimpleNamespace(turn_count=1)),
-                patch.object(pa, "_thread_id", "wrong-thread"),
+                patch.object(pa._session_identity, "_thread_id", "wrong-thread"),
                 patch.object(pa, "_turn_tool_execution_identity", None),
                 patch.object(
                     pa,
@@ -3695,7 +3750,7 @@ class TestToolExecutionLoop:
         try:
             with (
                 patch.object(pa, "_session", SimpleNamespace(turn_count=1)),
-                patch.object(pa, "_thread_id", "claimed-thread"),
+                patch.object(pa._session_identity, "_thread_id", "claimed-thread"),
                 patch.object(pa, "_turn_tool_execution_identity", None),
                 patch.object(pa, "_turn_tool_execution_external_hook", None),
             ):

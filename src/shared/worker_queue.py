@@ -18,6 +18,7 @@ from __future__ import annotations
 import json
 import logging
 import math
+import os
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime
@@ -40,9 +41,16 @@ from shared.workspace_contract import (
     WORKSPACE_CONTRACT_CONTEXT_KEY,
     WORKSPACE_DISPATCH_AUTHORITY_CONTEXT_KEY,
     WorkspaceContractError,
+    configured_workspace_backend,
     resolve_workspace_contract,
     stateless_worker_backend_admissible,
     vm_mode_from_env,
+    workspace_runtime_authority_digest,
+)
+from shared.operator_pause_hold import (
+    operator_pause_held_ancestor_sql,
+    operator_pause_hold_present,
+    operator_pause_hold_present_sql,
 )
 from shared.workspace_recovery import RecoveryAttemptDisposition
 
@@ -72,14 +80,15 @@ CASE
 END
 """
 
-_LOCK_JOB_SQL = """
+_LOCK_JOB_SQL = f"""
 SELECT job.status::text AS status,
        job.execution_lane,
        job.assigned_agent_id,
        job.freeze_data,
        job.context,
        job.config_override,
-       queue.max_attempts AS queue_max_attempts
+       queue.max_attempts AS queue_max_attempts,
+       {operator_pause_held_ancestor_sql("$1::uuid")} AS operator_pause_held_ancestor
 FROM jobs AS job
 JOIN run_queue AS queue ON queue.unit_id = job.id
 WHERE job.id = $1::uuid
@@ -126,6 +135,11 @@ WHERE id = $1::uuid
   AND execution_lane = 'stateless'
   AND assigned_agent_id IS NULL
   AND ($2::text <> 'paused' OR freeze_data IS NULL)
+  -- An operator-paused job runs again only after an explicit resume lifts
+  -- the hold; no stale wake, rotation or recovery requeue may cross it. Nor
+  -- may a child of a held job, which waits behind its parent's hold.
+  AND NOT {operator_pause_hold_present_sql("context")}
+  AND NOT {operator_pause_held_ancestor_sql("$1::uuid")}
 RETURNING id
 """
 
@@ -335,7 +349,7 @@ _CLOSE_WORKER_PREFLIGHT_SQL = """
 UPDATE run_queue
 SET state = 'done',
     lease_token = lease_token + CASE WHEN state = 'leased' THEN 1 ELSE 0 END,
-    attempts_since_completion = 0,
+    attempts_since_completion = CASE WHEN $2::boolean THEN attempts_since_completion ELSE 0 END,
     leased_by = NULL,
     last_leased_by = NULL,
     leased_until = NULL,
@@ -478,7 +492,13 @@ async def get_worker_attempt_disposition(
 
 
 async def record_worker_bundle_authorized(
-    conn: Any, *, job_id: UUID | str, lease_token: int, authority_digest: str
+    conn: Any,
+    *,
+    job_id: UUID | str,
+    lease_token: int,
+    authority_digest: str,
+    vm_mode: str | None = None,
+    vm_binding_required: bool | None = None,
 ) -> bool:
     """Serialize the authority boundary with holds using queue-before-attempt locks."""
     async with conn.transaction():
@@ -492,6 +512,89 @@ async def record_worker_bundle_authorized(
         )
         if current is None:
             return False
+        if vm_binding_required is False:
+            return (
+                await conn.fetchval(
+                    "UPDATE worker_batch_attempts SET bundle_authorized_at=clock_timestamp(), "
+                    "authority_digest=$3 WHERE job_id=$1 AND lease_token=$2 "
+                    "AND bundle_authorized_at IS NULL AND authority_digest IS NULL "
+                    "AND refunded_at IS NULL AND recovery_id IS NULL RETURNING 1",
+                    _uuid(job_id),
+                    lease_token,
+                    authority_digest,
+                )
+                is not None
+            )
+        job = await conn.fetchrow(
+            "SELECT * FROM jobs WHERE id=$1 FOR SHARE",
+            _uuid(job_id),
+        )
+        if job is None:
+            return False
+        # Preserve the existing authorization path for non-VM and inherited
+        # workers, including pre-contract legacy sandbox children. Only an
+        # own root VM Job needs the new retained generation binding.
+        try:
+            configured_backend = configured_workspace_backend(
+                job.get("config_override")
+            )
+        except WorkspaceContractError:
+            return False
+        contract = _json_object(_json_object(job["context"]).get("_workspace_contract"))
+        own_vm = job.get("parent_job_id") is None and (
+            configured_backend == "vm" or contract.get("assigned_backend") == "vm"
+        )
+        if vm_binding_required is True and not own_vm:
+            return False
+        if own_vm:
+            try:
+                if resolve_workspace_contract(job).assigned_backend != "vm":
+                    return False
+            except WorkspaceContractError:
+                return False
+            current_digest = workspace_runtime_authority_digest(
+                job,
+                vm_mode=vm_mode or vm_mode_from_env(),
+            )
+            vm = _json_object(_json_object(job["context"]).get("vm"))
+            if (
+                current_digest is None
+                or current_digest != authority_digest
+                or not (
+                    vm.get("status") == "ready"
+                    and vm.get("identity_authenticated") is True
+                    and vm.get("identity_provision_generation")
+                    == vm.get("provision_generation")
+                    and vm.get("vm_uid")
+                    and vm.get("rootdisk_pvc_uid")
+                )
+            ):
+                return False
+            source = await conn.fetchrow(
+                "SELECT request_id,provision_generation,observed_vm_uid,observed_pvc_uid "
+                "FROM vm_creation_retries WHERE owner_kind='job' AND job_id=$1 "
+                "AND provision_generation=$2 AND state='succeeded' "
+                "AND observed_vm_uid=$3 AND observed_pvc_uid=$4 "
+                "AND creation_admission_id IS NOT NULL FOR SHARE",
+                _uuid(job_id),
+                _uuid(vm["provision_generation"]),
+                _uuid(vm["vm_uid"]),
+                _uuid(vm["rootdisk_pvc_uid"]),
+            )
+            if source is None:
+                return False
+            await conn.execute(
+                "INSERT INTO vm_job_worker_delivery_bindings "
+                "(job_id,lease_token,request_id,provision_generation,vm_uid,pvc_uid,"
+                "authority_digest) VALUES($1,$2,$3,$4,$5,$6,$7)",
+                _uuid(job_id),
+                lease_token,
+                source["request_id"],
+                source["provision_generation"],
+                source["observed_vm_uid"],
+                source["observed_pvc_uid"],
+                authority_digest,
+            )
         return (
             await conn.fetchval(
                 "UPDATE worker_batch_attempts SET bundle_authorized_at=clock_timestamp(), "
@@ -786,6 +889,7 @@ async def hold_worker_batch_for_preflight(
     conn: Any,
     *,
     job_id: UUID | str,
+    preserve_attempts: bool = False,
 ) -> None:
     """Make a workspace-reprovisioning job non-runnable under the queue lock.
 
@@ -795,7 +899,8 @@ async def hold_worker_batch_for_preflight(
     lease also advances its token so the predecessor's saver and completion
     report fail closed immediately. When no row exists, create and close one
     inside the same transaction so concurrent admission cannot pass between
-    queue and jobs updates.
+    queue and jobs updates. ``preserve_attempts=True`` retains genuine worker
+    failures while VM creation preflight waits; the legacy default resets them.
     """
 
     job_uuid = _uuid(job_id)
@@ -807,7 +912,9 @@ async def hold_worker_batch_for_preflight(
         )
     if current is None:
         await enqueue_worker_batch(conn, job_id=job_uuid)
-    closed = await conn.fetchrow(_CLOSE_WORKER_PREFLIGHT_SQL, job_uuid)
+    closed = await conn.fetchrow(
+        _CLOSE_WORKER_PREFLIGHT_SQL, job_uuid, preserve_attempts
+    )
     if closed is None:
         raise RuntimeError(f"worker preflight lost queue unit {job_uuid}")
 
@@ -924,6 +1031,49 @@ async def claim_worker_batch(
                     )
             prior_status = str(job["status"]) if job is not None else None
             job_context = _json_object(job.get("context")) if job is not None else {}
+            vm_context = _json_object(job_context.get("vm"))
+            if (
+                job is not None
+                and (
+                    os.getenv("WORKSPACE_IDLE_RELEASE_ENABLED", "false").lower()
+                    == "true"
+                    or vm_context.get("_suspend_remote_io_closed")
+                    or vm_context.get("idle_wake_operation_id")
+                )
+                and await conn.fetchval(
+                    "SELECT to_regclass('public.vm_idle_operations') IS NOT NULL"
+                )
+                and await conn.fetchval(
+                    "SELECT EXISTS(SELECT 1 FROM vm_idle_operations WHERE owner_kind='job' "
+                    "AND owner_id=$1 AND closed_at IS NULL AND wake_ready_at IS NULL)",
+                    unit.unit_id,
+                )
+            ):
+                # A reply may enqueue while the VM is physically absent. The
+                # durable wake operation will enqueue again after attested
+                # readiness; this tentative claim cannot run on the old VM.
+                await conn.fetchrow(_CLOSE_WORKER_PREFLIGHT_SQL, unit.unit_id, True)
+                await conn.execute(
+                    "UPDATE run_queue SET attempts_since_completion=attempts_since_completion-1 "
+                    "WHERE unit_id=$1",
+                    unit.unit_id,
+                )
+                return None
+            behind_operator_pause = job is not None and (
+                operator_pause_hold_present(job_context)
+                or bool(job.get("operator_pause_held_ancestor"))
+            )
+            if "_vm_creation_pending" in job_context:
+                # A stale enqueuer may reopen the held row. Close it under our
+                # queue/job locks so it cannot starve the next runnable job.
+                # Undo only this tentative claim's increment, retaining every
+                # genuine prior worker attempt and publishing no worker lease.
+                await conn.fetchrow(_CLOSE_WORKER_PREFLIGHT_SQL, unit.unit_id, True)
+                await conn.execute(
+                    "UPDATE run_queue SET attempts_since_completion=attempts_since_completion-1 WHERE unit_id=$1",
+                    unit.unit_id,
+                )
+                return None
             resume_id_value = job_context.get("worker_resume_id")
             resume_id = (
                 str(resume_id_value)
@@ -944,6 +1094,14 @@ async def claim_worker_batch(
                 # freeze before enqueueing, matching the existing partial
                 # dispatch-index contract.
                 and (prior_status != "paused" or job.get("freeze_data") is None)
+                # An operator pause hold outlives the pause itself. A unit
+                # requeued behind it (a wake during the stopped turn, a
+                # rotation, a recovery release, an urgent reply to a child of
+                # the held job) is consumed below instead of resuming the job
+                # or lingering as runnable-looking queue depth; the explicit
+                # resume that lifts the hold (or admission once the parent
+                # runs again) enqueues anew.
+                and not behind_operator_pause
                 # A worker claimant may beat the defensive dispatcher repair
                 # to the queue lock. Reject the explicit VM marker before the
                 # jobs CAS so the row never becomes a processing worker loop.
@@ -993,6 +1151,17 @@ async def claim_worker_batch(
                 lease_token=unit.lease_token,
                 consumed_seq=unit.input_seq,
             )
+            if behind_operator_pause:
+                # Expected, not an anomaly: the job waits for its resume.
+                logger.info(
+                    "worker_batch unit closed behind an operator pause hold: "
+                    "unit=%s token=%d job_status=%s queue_state=%s",
+                    unit.unit_id,
+                    unit.lease_token,
+                    prior_status,
+                    discarded,
+                )
+                return None
             logger.error(
                 "worker_batch claim rejected and reconciled: unit=%s token=%d "
                 "job_status=%s lane=%s assigned=%s queue_state=%s",
@@ -1127,6 +1296,36 @@ async def release_worker_batch(
         bool(park_on_exhaustion),
         float(backoff_base_seconds),
     )
+
+
+async def hold_failed_container_worker_report(
+    db: Any, *, unit_id: UUID | str, lease_token: int
+) -> str:
+    """Restrict a failed typed report; never claim completion or stop proof."""
+    from shared.worker_execution_hold import hold_container_worker_attempt
+
+    async with _connection(db) as conn:
+        return await hold_container_worker_attempt(
+            conn,
+            job_id=unit_id,
+            lease_token=lease_token,
+            reason="typed_report_unaccepted",
+        )
+
+
+async def hold_interrupted_container_worker(
+    db: Any, *, unit_id: UUID | str, lease_token: int
+) -> str:
+    """Restrict an interrupted node without reporting completion or stop proof."""
+    from shared.worker_execution_hold import hold_container_worker_attempt
+
+    async with _connection(db) as conn:
+        return await hold_container_worker_attempt(
+            conn,
+            job_id=unit_id,
+            lease_token=lease_token,
+            reason="node_execution_interrupted",
+        )
 
 
 async def rotate_worker_batch(

@@ -7,6 +7,7 @@ request validation and response serialization.
 from datetime import datetime
 from enum import Enum
 from typing import Any, Dict, List, Literal, Optional
+from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, StrictBool, StrictInt
 
@@ -298,6 +299,21 @@ class JobStartRequest(BaseModel):
     """Request from orchestrator to start a job."""
 
     job_id: str = Field(..., description="Job UUID assigned by orchestrator")
+    pinned_delivery_id: Optional[UUID] = Field(
+        default=None,
+        description="Exact server-frozen pinned Job delivery intent",
+    )
+    pinned_projection_digest: Optional[str] = Field(
+        default=None,
+        pattern=r"^sha256:[0-9a-f]{64}$",
+        description="Digest of the accepted pinned Job wire projection",
+    )
+    pinned_delivery_proof: Optional[str] = Field(
+        default=None,
+        repr=False,
+        pattern=r"^[0-9a-f]{64}$",
+        description="Hidden proof to echo only in authenticated agent reports",
+    )
     description: str = Field(
         ..., description="Job description - what the agent should accomplish"
     )
@@ -367,6 +383,11 @@ class JobStartRequest(BaseModel):
         repr=False,
         description="Hidden server-owned repository authority transport",
     )
+    workspace_ssh_identities: Optional[List[Dict[str, Any]]] = Field(
+        default=None,
+        repr=False,
+        description="Hidden connector SSH keys for workspace ssh-agents",
+    )
     branch_name: Optional[str] = Field(
         default=None,
         description="Git branch for job workspace",
@@ -428,6 +449,8 @@ class JobStartResponse(BaseModel):
     """Response after accepting a job from orchestrator."""
 
     job_id: str = Field(..., description="Accepted job ID")
+    pinned_delivery_id: Optional[UUID] = None
+    pinned_projection_digest: Optional[str] = None
     status: str = Field(default="accepted", description="Acceptance status")
     message: str = Field(
         default="Job processing started",
@@ -453,6 +476,21 @@ class JobResumeRequest(BaseModel):
     """Request to resume a job from last completed phase snapshot."""
 
     job_id: str = Field(..., description="Job ID to resume")
+    pinned_delivery_id: Optional[UUID] = Field(
+        default=None,
+        description="Exact server-frozen pinned Job delivery intent",
+    )
+    pinned_projection_digest: Optional[str] = Field(
+        default=None,
+        pattern=r"^sha256:[0-9a-f]{64}$",
+        description="Digest of the accepted pinned Job wire projection",
+    )
+    pinned_delivery_proof: Optional[str] = Field(
+        default=None,
+        repr=False,
+        pattern=r"^[0-9a-f]{64}$",
+        description="Hidden proof to echo only in authenticated agent reports",
+    )
     config_name: Optional[str] = Field(
         default=None,
         description="Job's config name (for validation that agent has correct config)",
@@ -486,6 +524,10 @@ class JobResumeRequest(BaseModel):
             "the [FEEDBACK_RESUME] banner; omitted -> honest generic fallback."
         ),
     )
+    delegation_results: Optional[List[Dict[str, Any]]] = Field(
+        default=None,
+        description="Completed delegated job results for the resumed parent",
+    )
     datasources: Optional[List[Dict[str, Any]]] = Field(
         default=None,
         description="Resolved connector details (set by orchestrator)",
@@ -498,6 +540,11 @@ class JobResumeRequest(BaseModel):
         default=None,
         repr=False,
         description="Hidden server-owned repository authority transport",
+    )
+    workspace_ssh_identities: Optional[List[Dict[str, Any]]] = Field(
+        default=None,
+        repr=False,
+        description="Hidden connector SSH keys for workspace ssh-agents",
     )
     project_id: Optional[str] = Field(
         default=None,

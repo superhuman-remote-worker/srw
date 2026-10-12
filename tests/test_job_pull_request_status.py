@@ -9,12 +9,16 @@ from fastapi import HTTPException
 
 import orchestrator.main
 from shared.runtime.services.forge import ForgeError
+from orchestrator.application import workspace as workspace_composition
 
 
 def _authorized(user: dict, db):
     stack = ExitStack()
     stack.enter_context(
-        patch("orchestrator.main.require_approved_user", AsyncMock(return_value=user))
+        patch(
+            "orchestrator.security.auth.require_approved_user",
+            AsyncMock(return_value=user),
+        )
     )
     stack.enter_context(
         patch(
@@ -22,7 +26,7 @@ def _authorized(user: dict, db):
             AsyncMock(return_value=user),
         )
     )
-    stack.enter_context(patch("orchestrator.main.postgres_db", db))
+    stack.enter_context(patch("orchestrator.main.app.state.resources.postgres_db", db))
     return stack
 
 
@@ -70,7 +74,9 @@ class TestJobPullRequestStatusEndpoint:
             await get_job_pull_request_status(
                 fake_request,
                 str(job_a["id"]),
-                dependencies=orchestrator.main._job_review_dependencies(),
+                dependencies=workspace_composition.job_review_dependencies(
+                    orchestrator.main.app.state.resources
+                ),
             )
 
         assert exc.value.status_code == 404
@@ -104,7 +110,9 @@ class TestJobPullRequestStatusEndpoint:
             result = await get_job_pull_request_status(
                 fake_request,
                 str(job_a["id"]),
-                dependencies=orchestrator.main._job_review_dependencies(),
+                dependencies=workspace_composition.job_review_dependencies(
+                    orchestrator.main.app.state.resources
+                ),
             )
 
         target, number = read_status.await_args.args
@@ -138,7 +146,9 @@ class TestJobPullRequestStatusEndpoint:
                 await get_job_pull_request_status(
                     fake_request,
                     str(job_a["id"]),
-                    dependencies=orchestrator.main._job_review_dependencies(),
+                    dependencies=workspace_composition.job_review_dependencies(
+                        orchestrator.main.app.state.resources
+                    ),
                 )
 
         assert exc.value.status_code == 403
@@ -166,7 +176,9 @@ class TestJobPullRequestStatusEndpoint:
                 await get_job_pull_request_status(
                     fake_request,
                     str(job_a["id"]),
-                    dependencies=orchestrator.main._job_review_dependencies(),
+                    dependencies=workspace_composition.job_review_dependencies(
+                        orchestrator.main.app.state.resources
+                    ),
                 )
 
         assert exc.value.status_code == 409
@@ -191,7 +203,9 @@ class TestJobPullRequestStatusEndpoint:
                 await get_job_pull_request_status(
                     fake_request,
                     str(job_a["id"]),
-                    dependencies=orchestrator.main._job_review_dependencies(),
+                    dependencies=workspace_composition.job_review_dependencies(
+                        orchestrator.main.app.state.resources
+                    ),
                 )
 
         assert exc.value.status_code == 502

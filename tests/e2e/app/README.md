@@ -48,6 +48,10 @@ the journey's determinism contract when SearXNG was tried there — the browser
 asserts exactly one provider endpoint and exactly two enabled models — so a new
 dependency belongs in an overlay.
 
+The browser bootstrap selects container sessions through the generated journey
+user's personal Project workspace defaults. Account preferences no longer select
+a workspace backend. Attach mode only verifies the existing Project selection.
+
 `cloud-sandbox` turns `agent.protectedCloudModeEnabled` on, which is a separate
 decision from binding a backend: with a backend but no mode, every protected
 route answers the "disabled" refusal and the mount builders are never asked for

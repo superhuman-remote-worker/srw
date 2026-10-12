@@ -30,6 +30,11 @@ from uuid import UUID
 
 import pytest
 from fastapi import HTTPException
+from orchestrator.services import job_controls as job_controls_module
+from orchestrator.services import job_dispatcher as job_dispatcher_module
+from orchestrator.services import job_workspace_runtime as job_workspace_runtime_module
+from orchestrator.services import sudo_gate as sudo_gate_module
+from orchestrator.services import workspace as workspace_module
 
 os.environ.setdefault("VECTOR_DB_URL", "postgresql://test@localhost/test")
 
@@ -110,8 +115,12 @@ class TestApplyVmUpgradeDecision:
         blocked = AsyncMock(side_effect=HTTPException(409, "completion finalizing"))
 
         with (
-            patch.object(orch_main, "sudo_gate", gate),
-            patch.object(orch_main._completion_control_boundary, "guard", blocked),
+            patch.object(sudo_gate_module, "sudo_gate", gate),
+            patch.object(
+                orch_main.app.state.resources.completion_control_boundary,
+                "guard",
+                blocked,
+            ),
         ):
             with pytest.raises(HTTPException) as exc:
                 await control_seams.apply_vm_upgrade_decision(
@@ -136,9 +145,9 @@ class TestApplyVmUpgradeDecision:
         )
         upgrade = AsyncMock(return_value={"status": "approved_vm_upgrade"})
         with (
-            patch.object(orch_main, "sudo_gate", gate),
+            patch.object(sudo_gate_module, "sudo_gate", gate),
             patch.object(
-                orch_main.job_control_operations.JobControlOperations,
+                job_controls_module.JobControlOperations,
                 "_upgrade_job_to_vm_internal",
                 upgrade,
             ),
@@ -162,9 +171,9 @@ class TestApplyVmUpgradeDecision:
         )
         no_vm = AsyncMock(return_value={"status": "denied_vm_upgrade"})
         with (
-            patch.object(orch_main, "sudo_gate", gate),
+            patch.object(sudo_gate_module, "sudo_gate", gate),
             patch.object(
-                orch_main.job_control_operations.JobControlOperations,
+                job_controls_module.JobControlOperations,
                 "_resume_job_without_vm_internal",
                 no_vm,
             ),
@@ -186,7 +195,7 @@ class TestApplyVmUpgradeDecision:
         gate = MagicMock()
         gate.approve_request = AsyncMock()
         with (
-            patch.object(orch_main, "sudo_gate", gate),
+            patch.object(sudo_gate_module, "sudo_gate", gate),
             pytest.raises(HTTPException) as exc,
         ):
             await control_seams.apply_vm_upgrade_decision(
@@ -202,9 +211,9 @@ class TestApplyVmUpgradeDecision:
         db.get_job = AsyncMock(return_value={"id": JOB_ID, "freeze_data": None})
         upgrade = AsyncMock()
         with (
-            patch.object(orch_main, "postgres_db", db),
+            patch.object(orch_main.app.state.resources, "postgres_db", db),
             patch.object(
-                orch_main.job_control_operations.JobControlOperations,
+                job_controls_module.JobControlOperations,
                 "_upgrade_job_to_vm_internal",
                 upgrade,
             ),
@@ -224,9 +233,9 @@ class TestApplyVmUpgradeDecision:
         db.get_job = AsyncMock(return_value=_frozen_job())
         upgrade = AsyncMock(return_value={"status": "approved_vm_upgrade"})
         with (
-            patch.object(orch_main, "postgres_db", db),
+            patch.object(orch_main.app.state.resources, "postgres_db", db),
             patch.object(
-                orch_main.job_control_operations.JobControlOperations,
+                job_controls_module.JobControlOperations,
                 "_upgrade_job_to_vm_internal",
                 upgrade,
             ),
@@ -256,9 +265,9 @@ class TestApplyVmUpgradeDecision:
         db.get_job = AsyncMock(return_value=_frozen_job())
         no_vm = AsyncMock(return_value={"status": "denied_vm_upgrade"})
         with (
-            patch.object(orch_main, "postgres_db", db),
+            patch.object(orch_main.app.state.resources, "postgres_db", db),
             patch.object(
-                orch_main.job_control_operations.JobControlOperations,
+                job_controls_module.JobControlOperations,
                 "_resume_job_without_vm_internal",
                 no_vm,
             ),
@@ -276,7 +285,7 @@ class TestApplyVmUpgradeDecision:
             return_value={"error": "Request status is 'denied', not 'pending'"}
         )
         with (
-            patch.object(orch_main, "sudo_gate", gate),
+            patch.object(sudo_gate_module, "sudo_gate", gate),
             pytest.raises(HTTPException) as exc,
         ):
             await control_seams.apply_vm_upgrade_decision(
@@ -325,9 +334,11 @@ class TestResumeWithoutVm:
         ws = MagicMock()
         ws.base_path = tmp_path
         with (
-            patch.object(orch_main, "postgres_db", db),
-            patch.object(orch_main, "workspace_service", ws),
-            patch.object(orch_main, "_trigger_dispatch", MagicMock()) as trigger,
+            patch.object(orch_main.app.state.resources, "postgres_db", db),
+            patch.object(workspace_module, "workspace_service", ws),
+            patch.object(
+                job_dispatcher_module, "trigger_dispatch", MagicMock()
+            ) as trigger,
             pytest.raises(HTTPException) as exc,
         ):
             await control_seams.resume_job_without_vm_internal(JOB_ID)
@@ -343,9 +354,9 @@ class TestResumeWithoutVm:
         ws.base_path = tmp_path
         trigger = MagicMock()
         with (
-            patch.object(orch_main, "postgres_db", db),
-            patch.object(orch_main, "workspace_service", ws),
-            patch.object(orch_main, "_trigger_dispatch", trigger),
+            patch.object(orch_main.app.state.resources, "postgres_db", db),
+            patch.object(workspace_module, "workspace_service", ws),
+            patch.object(job_dispatcher_module, "trigger_dispatch", trigger),
         ):
             result = await control_seams.resume_job_without_vm_internal(
                 JOB_ID, decided_by="alice", reason="not needed", denied=True
@@ -370,9 +381,9 @@ class TestResumeWithoutVm:
         ws = MagicMock()
         ws.base_path = tmp_path
         with (
-            patch.object(orch_main, "postgres_db", db),
-            patch.object(orch_main, "workspace_service", ws),
-            patch.object(orch_main, "_trigger_dispatch", MagicMock()),
+            patch.object(orch_main.app.state.resources, "postgres_db", db),
+            patch.object(workspace_module, "workspace_service", ws),
+            patch.object(job_dispatcher_module, "trigger_dispatch", MagicMock()),
         ):
             result = await control_seams.resume_job_without_vm_internal(
                 JOB_ID, decided_by="alice", reason="", denied=False
@@ -388,8 +399,8 @@ class TestResumeWithoutVm:
         ws = MagicMock()
         ws.base_path = tmp_path
         with (
-            patch.object(orch_main, "postgres_db", db),
-            patch.object(orch_main, "workspace_service", ws),
+            patch.object(orch_main.app.state.resources, "postgres_db", db),
+            patch.object(workspace_module, "workspace_service", ws),
             pytest.raises(HTTPException) as exc,
         ):
             await control_seams.resume_job_without_vm_internal(JOB_ID)
@@ -411,11 +422,19 @@ class TestResumeWithoutVm:
         ws.base_path = tmp_path
 
         with (
-            patch.object(orch_main, "COMPLETION_COMMANDS_ENABLED", True),
-            patch.object(orch_main, "postgres_db", db),
-            patch.object(orch_main, "workspace_service", ws),
-            patch.object(orch_main._completion_control_boundary, "guard", guard),
-            patch.object(orch_main, "_trigger_dispatch", MagicMock()),
+            patch.object(
+                orch_main.app.state.resources.settings,
+                "completion_commands_enabled",
+                True,
+            ),
+            patch.object(orch_main.app.state.resources, "postgres_db", db),
+            patch.object(workspace_module, "workspace_service", ws),
+            patch.object(
+                orch_main.app.state.resources.completion_control_boundary,
+                "guard",
+                guard,
+            ),
+            patch.object(job_dispatcher_module, "trigger_dispatch", MagicMock()),
         ):
             result = await control_seams.resume_job_without_vm_internal(
                 JOB_ID,
@@ -451,11 +470,19 @@ class TestResumeWithoutVm:
         ws.base_path = tmp_path
 
         with (
-            patch.object(orch_main, "COMPLETION_COMMANDS_ENABLED", True),
-            patch.object(orch_main, "postgres_db", db),
-            patch.object(orch_main, "workspace_service", ws),
-            patch.object(orch_main._completion_control_boundary, "guard", guard),
-            patch.object(orch_main, "_trigger_dispatch", MagicMock()),
+            patch.object(
+                orch_main.app.state.resources.settings,
+                "completion_commands_enabled",
+                True,
+            ),
+            patch.object(orch_main.app.state.resources, "postgres_db", db),
+            patch.object(workspace_module, "workspace_service", ws),
+            patch.object(
+                orch_main.app.state.resources.completion_control_boundary,
+                "guard",
+                guard,
+            ),
+            patch.object(job_dispatcher_module, "trigger_dispatch", MagicMock()),
         ):
             await control_seams.resume_job_without_vm_internal(
                 JOB_ID,
@@ -495,29 +522,37 @@ class TestApplyStickySudoDenial:
         }
 
     def test_denial_flips_gate_to_reasoned_block(self):
-        co = orch_main._apply_sticky_sudo_denial(self._job_with_denial(), {})
+        co = job_workspace_runtime_module.apply_sticky_sudo_denial(
+            self._job_with_denial(), {}
+        )
         assert co["shell"]["sudo_action"] == "block"
         assert "alice" in co["shell"]["sudo_block_message"]
         assert "policy" in co["shell"]["sudo_block_message"]
 
     def test_vm_backend_untouched(self):
         co = {"workspace": {"backend": "vm"}, "shell": {"sudo_action": "allow"}}
-        out = orch_main._apply_sticky_sudo_denial(self._job_with_denial(), co)
+        out = job_workspace_runtime_module.apply_sticky_sudo_denial(
+            self._job_with_denial(), co
+        )
         assert out["shell"]["sudo_action"] == "allow"
 
     def test_no_denial_untouched(self):
         co = {"shell": {"sudo_action": "freeze"}}
-        out = orch_main._apply_sticky_sudo_denial({"id": JOB_ID, "context": {}}, co)
+        out = job_workspace_runtime_module.apply_sticky_sudo_denial(
+            {"id": JOB_ID, "context": {}}, co
+        )
         assert out["shell"]["sudo_action"] == "freeze"
 
     def test_none_override_created_when_denied(self):
-        out = orch_main._apply_sticky_sudo_denial(self._job_with_denial(), None)
+        out = job_workspace_runtime_module.apply_sticky_sudo_denial(
+            self._job_with_denial(), None
+        )
         assert out["shell"]["sudo_action"] == "block"
 
     def test_str_context_parsed(self):
         job = self._job_with_denial()
         job["context"] = json.dumps(job["context"])
-        out = orch_main._apply_sticky_sudo_denial(job, {})
+        out = job_workspace_runtime_module.apply_sticky_sudo_denial(job, {})
         assert out["shell"]["sudo_action"] == "block"
 
 
@@ -569,7 +604,7 @@ class TestFailExpiredVmUpgradeJobs:
         ctx.__aenter__ = AsyncMock(return_value=conn)
         ctx.__aexit__ = AsyncMock(return_value=False)
         db.acquire = MagicMock(return_value=ctx)
-        with patch.object(orch_main, "postgres_db", db):
+        with patch.object(orch_main.app.state.resources, "postgres_db", db):
             count = await control_seams.fail_expired_vm_upgrade_jobs()
         assert count == 1
         sql = conn.execute.await_args.args[0]
@@ -586,7 +621,7 @@ class TestFailExpiredVmUpgradeJobs:
         ctx.__aenter__ = AsyncMock(return_value=conn)
         ctx.__aexit__ = AsyncMock(return_value=False)
         db.acquire = MagicMock(return_value=ctx)
-        with patch.object(orch_main, "postgres_db", db):
+        with patch.object(orch_main.app.state.resources, "postgres_db", db):
             assert await control_seams.fail_expired_vm_upgrade_jobs() == 0
         conn.execute.assert_not_called()
 
@@ -601,8 +636,12 @@ class TestFailExpiredVmUpgradeJobs:
         ctx.__aexit__ = AsyncMock(return_value=False)
         db.acquire = MagicMock(return_value=ctx)
         with (
-            patch.object(orch_main, "postgres_db", db),
-            patch.object(orch_main, "COMPLETION_COMMANDS_ENABLED", enabled),
+            patch.object(orch_main.app.state.resources, "postgres_db", db),
+            patch.object(
+                orch_main.app.state.resources.settings,
+                "completion_commands_enabled",
+                enabled,
+            ),
         ):
             assert await control_seams.fail_expired_vm_upgrade_jobs() == 1
 

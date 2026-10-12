@@ -594,6 +594,62 @@ async def test_malformed_frozen_identity_is_permanent(
         )(_effect(**{field: value}))
 
 
+_CONTEXT_TEXT = '<srw_context kind="memory">\n[m:3f9a2c] injected fact\n</srw_context>'
+
+
+class _ContextRowConnection(_ExecutorConnection):
+    """A frozen window with typed context entries, ending on one
+    (append-only context injection: the entries of a turn are its rows)."""
+
+    async def fetch(self, sql: str, *args: object) -> list[dict]:
+        human, ai = await super().fetch(sql, *args)
+
+        def context(seq: int, row_id: str) -> dict:
+            return {
+                "id": UUID(row_id),
+                "seq": seq,
+                "role": "context",
+                "content": _CONTEXT_TEXT,
+                "tool_calls": None,
+                "tool_call_id": None,
+                "turn_number": 7,
+                "rewound_at": None,
+            }
+
+        return [
+            human,
+            context(102, "77777777-1111-4777-8777-777777777777"),
+            {**ai, "seq": 103},
+            context(104, "88888888-2222-4888-8888-888888888888"),
+        ]
+
+
+@pytest.mark.asyncio
+async def test_context_rows_in_the_frozen_window_are_skipped() -> None:
+    """Context rows are harness context, not conversation: the drain skips
+    them instead of failing permanently on an unknown role, and a window
+    that ends on one still matches its frozen end."""
+    from orchestrator.services.session_memory_executor import _identity
+
+    executor = SessionMemoryEffectExecutor(
+        _AppDB(_ContextRowConnection()), _VectorDB(), AsyncMock()
+    )
+
+    source = await executor._load_source(_identity(_effect(end_seq=104)))
+
+    assert [type(m).__name__ for m in source.messages] == ["HumanMessage", "AIMessage"]
+    assert [m.content for m in source.messages] == ["remember this", "done"]
+    assert all(_CONTEXT_TEXT not in str(m.content) for m in source.messages)
+
+
+def test_unknown_roles_still_fail_permanently() -> None:
+    from orchestrator.services.session_memory_executor import _messages_from_rows
+
+    assert _messages_from_rows([{"role": "context", "content": "x"}]) == ()
+    with pytest.raises(SessionMemoryEffectPermanentError, match="unsupported"):
+        _messages_from_rows([{"role": "mystery", "content": "x"}])
+
+
 def test_embedding_profile_is_explicit_and_does_not_touch_process_env() -> None:
     before = dict(os.environ)
     config = SimpleNamespace(

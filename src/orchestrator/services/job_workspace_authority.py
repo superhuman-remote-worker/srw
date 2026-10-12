@@ -438,6 +438,41 @@ async def resolve_subjob_inherited_workspace(
         )
         return ("wait", None)
 
+    result = project_inherited_workspace(job, parent)
+    if result[0] == "proceed":
+        dependencies.logger.info(
+            "Dispatcher: subjob %s inheriting parent %s runtime — "
+            "resolved live at dispatch",
+            job.get("id"),
+            parent_id,
+        )
+    return result
+
+
+def project_inherited_workspace(
+    job: dict[str, Any], parent: dict[str, Any] | None
+) -> tuple[str, str | None]:
+    """Apply the existing inheritance contract to already-read rows only.
+
+    This mutates only the caller's in-memory child projection. Adoption and
+    external runtime proofs remain the async resolver's responsibility; the
+    dispatcher can repeat these same contract/phase checks on fresh rows at
+    its claim boundary without doing remote work under its assignment lock.
+    """
+    parent_id = job.get("parent_job_id")
+    ctx = job.get("context") or {}
+    if isinstance(ctx, str):
+        try:
+            ctx = json.loads(ctx)
+        except (TypeError, ValueError):
+            return ("fail", "Child workspace context is invalid.")
+    if (
+        not parent_id
+        or not isinstance(ctx, dict)
+        or not ctx.get("inherits_parent_workspace")
+    ):
+        return ("fail", "Child has no parent workspace inheritance authority.")
+
     if not parent:
         return (
             "fail",
@@ -489,23 +524,11 @@ async def resolve_subjob_inherited_workspace(
         ctx["workspace_container"] = parent_container
         ctx.pop("vm", None)
         job["context"] = ctx
-        dependencies.logger.info(
-            "Dispatcher: subjob %s inheriting parent %s sandbox runtime — "
-            "resolved live at dispatch",
-            job.get("id"),
-            parent_id,
-        )
         return ("proceed", None)
     if inherited_backend == "vm" and parent_vm.get("status") == "ready":
         ctx["vm"] = parent_vm
         ctx.pop("workspace_container", None)
         job["context"] = ctx
-        dependencies.logger.info(
-            "Dispatcher: subjob %s inheriting parent %s VM runtime — resolved "
-            "live at dispatch",
-            job.get("id"),
-            parent_id,
-        )
         return ("proceed", None)
 
     # Parent workspace is dead (reaped/failed) or the parent itself reached a
@@ -608,6 +631,7 @@ async def fail_subjob_and_unblock_parent(
     job: dict,
     message: str,
     *,
+    expected_status: str | None = None,
     dependencies: JobWorkspaceAuthorityDependencies,
 ) -> None:
     """Fail a subjob at dispatch time AND unblock the parent it was holding.
@@ -622,25 +646,29 @@ async def fail_subjob_and_unblock_parent(
     knowledge-base/knowledge/issues/scholar_selfprovisioned_workspace_misclassified_as_inherited.md).
     Mirror ``complete_job``'s terminal-subjob unblock here so any dispatch-path
     failure is self-healing, not just today's inherit-timeout.
+
+    A stateless row is always failed with a CAS on its scanned status. A caller
+    that needs the same precondition for a pinned row passes
+    ``expected_status``; without it a pinned row is failed unconditionally.
     """
     job_id = str(job["id"])
-    stateless_worker = job.get("execution_lane") == "stateless"
+    if expected_status is None and job.get("execution_lane") == "stateless":
+        expected_status = str(job.get("status"))
     updated = await dependencies.store.update_job_status(
         job_id,
         status="failed",
         error_message=message,
-        expected_status=(str(job.get("status")) if stateless_worker else None),
+        expected_status=expected_status,
     )
-    if stateless_worker and not updated:
+    if expected_status is not None and not updated:
         # The dispatcher row is a stale snapshot. A control verb may have
         # cancelled/completed the child while workspace inheritance was being
         # resolved; never overwrite that winner or unblock the parent from a
         # failure disposition that did not commit.
         dependencies.logger.info(
-            "Dispatcher: skipped stale stateless subjob failure for %s "
-            "(expected_status=%s)",
+            "Dispatcher: skipped stale subjob failure for %s (expected_status=%s)",
             job_id,
-            job.get("status"),
+            expected_status,
         )
         return
     # The unblock handlers classify the outcome from job['status']; the in-memory
@@ -707,24 +735,11 @@ async def provision_parent_workspace_for_scholar(
             parent_ctx = {}
     parent_container = parent_ctx.get("workspace_container") or {}
 
-    parent_co = parent.get("config_override") or {}
-    if isinstance(parent_co, str):
-        try:
-            parent_co = json.loads(parent_co)
-        except (json.JSONDecodeError, ValueError):
-            parent_co = {}
-    ws_cfg = (parent_co.get("workspace") or {}).get("container") or {}
-
     res = await dependencies.ensure_workspace(
         WorkspaceOwner.job(parent_id),
         provisioner=dependencies.workspace_provisioner,
         suspension=dependencies.workspace_suspension,
         current_status=parent_container.get("status"),
-        ws_config={
-            k: ws_cfg[k]
-            for k in ("cpu", "memory", "cpu_limit", "memory_limit", "image")
-            if k in ws_cfg
-        },
     )
     if res.outcome is EnsureOutcome.FAILED:
         # create_workspace records the concrete failure in the parent's

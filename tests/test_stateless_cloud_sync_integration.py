@@ -8,6 +8,9 @@ push.
 
 from __future__ import annotations
 
+from agent.api import session_attach
+from agent.api import session_workspace
+from orchestrator.services.workspace_lifecycle import WorkspaceOwner
 import asyncio
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -28,6 +31,27 @@ from shared.cloud_sync_generations import (
     EMPTY_BASELINE_SHA256,
     CloudSyncRequirement,
 )
+from orchestrator.application import preparation as preparation_composition
+from orchestrator.services import agent_cloud_mounts as agent_cloud_mounts_module
+from orchestrator.services import container_provisioner as container_provisioner_module
+from orchestrator.services import dispatch_credentials as dispatch_credentials_module
+from orchestrator.services import (
+    session_config_resolution as session_config_resolution_module,
+)
+from orchestrator.services import session_provisioner as session_provisioner_module
+from orchestrator.services import (
+    stateless_workspace_scheduler as stateless_workspace_scheduler_module,
+)
+from orchestrator.services import thread_mount_rows as thread_mount_rows_module
+from orchestrator.services import (
+    thread_project_authorization as thread_project_authorization_module,
+)
+from orchestrator.services import (
+    thread_workspace_delivery as thread_workspace_delivery_module,
+)
+from orchestrator.services import virtual_workspace as virtual_workspace_module
+from orchestrator.services import workspace_tier_policy as workspace_tier_policy_module
+import fastapi as fastapi_module
 
 
 THREAD_ID = "11111111-1111-4111-8111-111111111111"
@@ -78,15 +102,14 @@ def _restore_loop_primitives():
     global consumer runs next (e.g. `_wait_for_permission_resolution`)."""
 
     names = (
-        "_loop_user_queue",
-        "_loop_interrupt_flag",
-        "_loop_last_user_content",
+        "_queue",
+        "_interrupt_mode",
         "_hard_interrupt_event",
     )
-    saved = {name: getattr(papp, name) for name in names}
+    saved = {name: getattr(papp._session_input, name) for name in names}
     yield
     for name, value in saved.items():
-        setattr(papp, name, value)
+        setattr(papp._session_input, name, value)
 
 
 @pytest.mark.asyncio
@@ -142,7 +165,7 @@ async def test_stateless_start_recovers_then_strict_pulls_then_arms(monkeypatch)
     try:
         with (
             patch.object(papp, "_session", session),
-            patch.object(papp, "_thread_id", THREAD_ID),
+            patch.object(papp._session_identity, "_thread_id", THREAD_ID),
             patch(
                 "shared.cloud_sync_generations.cloud_sync_lease_is_current",
                 AsyncMock(return_value=True),
@@ -201,7 +224,7 @@ async def test_stateless_pull_failure_blocks_arm_and_turn_start(monkeypatch):
     try:
         with (
             patch.object(papp, "_session", session),
-            patch.object(papp, "_thread_id", THREAD_ID),
+            patch.object(papp._session_identity, "_thread_id", THREAD_ID),
             patch(
                 "shared.cloud_sync_generations.cloud_sync_lease_is_current",
                 AsyncMock(return_value=True),
@@ -238,7 +261,7 @@ async def test_stateless_turn_refuses_unrecovered_cloud_setup(monkeypatch):
 
     with (
         patch.object(papp, "_session", session),
-        patch.object(papp, "_thread_id", THREAD_ID),
+        patch.object(papp._session_identity, "_thread_id", THREAD_ID),
         patch.object(papp, "_cloud_sync_retry_pending", True),
         patch.object(papp, "_retry_cloud_sync_start", retry),
         patch.object(papp, "_broadcast"),
@@ -328,7 +351,7 @@ async def test_turn_end_task_captures_token_and_requirement_snapshot(monkeypatch
     try:
         with (
             patch.object(papp, "_session", session),
-            patch.object(papp, "_thread_id", THREAD_ID),
+            patch.object(papp._session_identity, "_thread_id", THREAD_ID),
             patch.object(papp, "_retire_announced_permission_rows", AsyncMock()),
             patch.object(papp, "_wire_session_aux_archiver"),
             patch.object(papp, "_save_turn_ai_messages", AsyncMock()),
@@ -401,21 +424,21 @@ async def test_teardown_skips_raw_sync_only_for_stateless(stateless: bool):
 
     with (
         patch.object(papp, "_session", session),
-        patch.object(papp, "_thread_id", THREAD_ID),
+        patch.object(papp._session_identity, "_thread_id", THREAD_ID),
         patch.object(papp, "_loop_task", None),
         patch.object(papp, "_event_writer", None),
         patch.object(papp, "_control_owner_agent_id", None),
         patch.object(papp, "_registered_pinned_agent_id", return_value=None),
         patch.object(papp, "_stateless_mode", return_value=stateless),
-        patch.object(papp, "_stop_watchdogs"),
+        patch.object(papp._session_termination, "stop_watchdogs"),
         patch.object(papp, "_stop_thread_control_watcher", AsyncMock()),
         patch.object(papp, "_await_pending_cloud_push", AsyncMock()),
-        patch.object(papp, "_clear_all_canvas_awareness"),
+        patch.object(papp._canvas_control, "clear_all"),
         patch.object(papp, "_subscribers", {}),
-        patch.object(papp, "_sessions_served", 0),
-        patch.object(papp, "_max_sessions_per_process", 0),
+        patch.object(papp._session_termination, "sessions_served", 0),
+        patch.object(papp._session_termination, "max_sessions_per_process", 0),
     ):
-        await papp._terminate_session_inner("test", mark_thread=False)
+        await papp._session_termination._terminate_inner("test", mark_thread=False)
 
     if stateless:
         sync.push_all.assert_not_awaited()
@@ -452,14 +475,16 @@ async def test_workspace_poll_preserves_generation(
         get_thread_workspace=AsyncMock(return_value=workspace_response)
     )
 
-    result = await papp._poll_workspace_ready(client, THREAD_ID, timeout=1)
+    result = await session_workspace.poll_workspace_ready(
+        client, THREAD_ID, timeout=1, session_runtime_generation=None
+    )
 
     assert result is not None
     assert result["backend"] == expected_backend
     assert result["workspace_generation"] == WORKSPACE_GENERATION
     assert result["workspace_runtime_incarnation"] == WORKSPACE_RUNTIME_INCARNATION
     assert result["workspace_ssh_host_key_fingerprint"] == (
-        WORKSPACE_SSH_HOST_KEY_FINGERPRINT if expected_backend == "sandbox" else None
+        WORKSPACE_SSH_HOST_KEY_FINGERPRINT
     )
 
 
@@ -493,31 +518,37 @@ async def test_internal_workspace_payload_exposes_private_binding_generation():
     }
     with (
         patch.object(
-            orch_main.postgres_db,
+            orch_main.app.state.resources.postgres_db,
             "get_thread",
             AsyncMock(return_value=thread),
         ),
         patch.object(
-            orch_main.postgres_db,
+            orch_main.app.state.resources.postgres_db,
             "list_thread_mounts",
             AsyncMock(return_value=[]),
         ),
         patch.object(
-            orch_main.postgres_db,
+            orch_main.app.state.resources.postgres_db,
             "pinned_thread_agent_is_reciprocal",
             AsyncMock(return_value=True),
         ),
-        patch.object(orch_main, "_thread_project_ids", AsyncMock(return_value=[])),
         patch.object(
-            orch_main,
-            "_revalidate_thread_project_ids",
+            thread_mount_rows_module, "thread_project_ids", AsyncMock(return_value=[])
+        ),
+        patch.object(
+            thread_project_authorization_module,
+            "revalidate_thread_project_ids",
             AsyncMock(return_value=[]),
         ),
         patch.object(
-            orch_main, "_resolve_thread_datasources", AsyncMock(return_value=None)
+            thread_mount_rows_module,
+            "resolve_thread_datasources",
+            AsyncMock(return_value=None),
         ),
         patch.object(
-            orch_main, "_resolve_thread_repositories", AsyncMock(return_value=None)
+            thread_mount_rows_module,
+            "resolve_thread_repositories",
+            AsyncMock(return_value=None),
         ),
         patch.object(
             thread_workspace_delivery,
@@ -525,37 +556,45 @@ async def test_internal_workspace_payload_exposes_private_binding_generation():
             return_value=(False, False, False),
         ),
         patch.object(
-            orch_main, "_build_agent_cloud_mount", AsyncMock(return_value=None)
+            agent_cloud_mounts_module,
+            "_build_agent_cloud_mount",
+            AsyncMock(return_value=None),
         ),
-        patch.object(orch_main, "_build_agent_cloud_sync", return_value=None),
-        patch.object(orch_main, "_cloud_workspace_driver", return_value="sync"),
         patch.object(
-            orch_main,
+            agent_cloud_mounts_module, "_build_agent_cloud_sync", return_value=None
+        ),
+        patch.object(
+            preparation_composition, "cloud_workspace_driver", return_value="sync"
+        ),
+        patch.object(
+            orch_main.app.state.resources,
             "main_cloud_router",
             SimpleNamespace(active=SimpleNamespace(is_initialized=False)),
         ),
         patch.object(
-            orch_main, "_resolve_session_config", AsyncMock(return_value=None)
+            session_config_resolution_module,
+            "resolve_session_config",
+            AsyncMock(return_value=None),
         ),
         patch.object(
-            orch_main,
-            "_inject_thread_dispatch_credentials",
+            dispatch_credentials_module,
+            "inject_thread_dispatch_credentials",
             AsyncMock(side_effect=lambda value, **_kwargs: value),
         ),
         patch.object(
-            orch_main,
-            "_inject_lite_workspace_config",
+            workspace_tier_policy_module,
+            "inject_lite_workspace_config",
             side_effect=lambda value, **_kwargs: value,
         ),
     ):
-        response = (
-            await orch_main.thread_workspace_delivery.agent_get_thread_workspace_locked(
-                THREAD_ID,
-                presented_agent_id=AGENT_ID,
-                presented_runtime_generation=RUNTIME_GENERATION,
-                presented_attach_token=RUNTIME_ATTACH_TOKEN,
-                dependencies=orch_main._thread_workspace_delivery_dependencies(),
-            )
+        response = await thread_workspace_delivery_module.agent_get_thread_workspace_locked(
+            THREAD_ID,
+            presented_agent_id=AGENT_ID,
+            presented_runtime_generation=RUNTIME_GENERATION,
+            presented_attach_token=RUNTIME_ATTACH_TOKEN,
+            dependencies=preparation_composition.thread_workspace_delivery_dependencies(
+                orch_main.app.state.resources
+            ),
         )
 
     assert response["workspace_generation"] == WORKSPACE_GENERATION
@@ -564,7 +603,7 @@ async def test_internal_workspace_payload_exposes_private_binding_generation():
 
 
 def test_owner_payload_redacts_private_workspace_runtime_incarnation():
-    import orchestrator.main as orch_main
+    from orchestrator.services.thread_projection import redact_thread_metadata
 
     record = {
         "metadata": {
@@ -576,11 +615,27 @@ def test_owner_payload_redacts_private_workspace_runtime_incarnation():
         }
     }
 
-    redacted = orch_main._redact_nested_workspace_state(record, field="metadata")
+    redacted = redact_thread_metadata(record)
 
     workspace = redacted["metadata"]["workspace_container"]
     assert "_canvas_workspace_generation" not in workspace
     assert "_runtime_incarnation" not in workspace
+
+
+def _assert_reconcile_scheduled(schedule) -> None:
+    """The workspace reconcile was scheduled once, for this thread, with this
+    application's store and ensure registry (the owner now receives its
+    dependencies from the composition)."""
+
+    import orchestrator.main as orch_main
+
+    resources = orch_main.app.state.resources
+    schedule.assert_called_once()
+    assert schedule.call_args.args == (THREAD_ID,)
+    assert set(schedule.call_args.kwargs) == {"dependencies"}
+    dependencies = schedule.call_args.kwargs["dependencies"]
+    assert dependencies.store is resources.postgres_db
+    assert dependencies.registry is resources.stateless_workspace_ensure_registry
 
 
 async def _internal_workspace_response_for_lite_thread(
@@ -619,31 +674,37 @@ async def _internal_workspace_response_for_lite_thread(
     pinned = thread.get("execution_lane") == "pinned"
     with (
         patch.object(
-            orch_main.postgres_db,
+            orch_main.app.state.resources.postgres_db,
             "get_thread",
             get_thread,
         ),
         patch.object(
-            orch_main.postgres_db,
+            orch_main.app.state.resources.postgres_db,
             "list_thread_mounts",
             AsyncMock(return_value=[]),
         ),
         patch.object(
-            orch_main.postgres_db,
+            orch_main.app.state.resources.postgres_db,
             "pinned_thread_agent_is_reciprocal",
             AsyncMock(return_value=True),
         ),
-        patch.object(orch_main, "_thread_project_ids", AsyncMock(return_value=[])),
         patch.object(
-            orch_main,
-            "_revalidate_thread_project_ids",
+            thread_mount_rows_module, "thread_project_ids", AsyncMock(return_value=[])
+        ),
+        patch.object(
+            thread_project_authorization_module,
+            "revalidate_thread_project_ids",
             AsyncMock(return_value=[]),
         ),
         patch.object(
-            orch_main, "_resolve_thread_datasources", AsyncMock(return_value=None)
+            thread_mount_rows_module,
+            "resolve_thread_datasources",
+            AsyncMock(return_value=None),
         ),
         patch.object(
-            orch_main, "_resolve_thread_repositories", AsyncMock(return_value=None)
+            thread_mount_rows_module,
+            "resolve_thread_repositories",
+            AsyncMock(return_value=None),
         ),
         patch.object(
             thread_workspace_delivery,
@@ -651,39 +712,47 @@ async def _internal_workspace_response_for_lite_thread(
             return_value=(False, False, False),
         ),
         patch.object(
-            orch_main,
+            agent_cloud_mounts_module,
             "_build_agent_cloud_mount",
             AsyncMock(return_value=cloud_mount),
         ),
-        patch.object(orch_main, "_build_agent_cloud_sync", return_value=cloud_sync),
-        patch.object(orch_main, "_cloud_workspace_driver", return_value="sync"),
         patch.object(
-            orch_main,
+            agent_cloud_mounts_module,
+            "_build_agent_cloud_sync",
+            return_value=cloud_sync,
+        ),
+        patch.object(
+            preparation_composition, "cloud_workspace_driver", return_value="sync"
+        ),
+        patch.object(
+            orch_main.app.state.resources,
             "main_cloud_router",
             SimpleNamespace(active=SimpleNamespace(is_initialized=False)),
         ),
         patch.object(
-            orch_main, "_resolve_session_config", AsyncMock(return_value=None)
+            session_config_resolution_module,
+            "resolve_session_config",
+            AsyncMock(return_value=None),
         ),
         patch.object(
-            orch_main,
-            "_inject_thread_dispatch_credentials",
+            dispatch_credentials_module,
+            "inject_thread_dispatch_credentials",
             AsyncMock(side_effect=lambda value, **_kwargs: value),
         ),
         patch.object(
-            orch_main,
-            "_inject_lite_workspace_config",
+            workspace_tier_policy_module,
+            "inject_lite_workspace_config",
             side_effect=lambda value, **_kwargs: value,
         ),
     ):
-        return (
-            await orch_main.thread_workspace_delivery.agent_get_thread_workspace_locked(
-                THREAD_ID,
-                presented_agent_id=AGENT_ID if pinned else None,
-                presented_runtime_generation=RUNTIME_GENERATION if pinned else None,
-                presented_attach_token=RUNTIME_ATTACH_TOKEN if pinned else None,
-                dependencies=orch_main._thread_workspace_delivery_dependencies(),
-            )
+        return await thread_workspace_delivery_module.agent_get_thread_workspace_locked(
+            THREAD_ID,
+            presented_agent_id=AGENT_ID if pinned else None,
+            presented_runtime_generation=RUNTIME_GENERATION if pinned else None,
+            presented_attach_token=RUNTIME_ATTACH_TOKEN if pinned else None,
+            dependencies=preparation_composition.thread_workspace_delivery_dependencies(
+                orch_main.app.state.resources
+            ),
         )
 
 
@@ -718,13 +787,19 @@ def _stateless_sandbox_thread() -> dict:
 
 @pytest.mark.asyncio
 async def test_internal_workspace_ready_requires_exact_live_runtime_uid():
-    import orchestrator.main as orch_main
-
     probe = AsyncMock(return_value=True)
     schedule = MagicMock()
     with (
-        patch.object(orch_main.container_provisioner, "workspace_pod_live", probe),
-        patch.object(orch_main, "_schedule_stateless_workspace_ensure", schedule),
+        patch.object(
+            container_provisioner_module.container_provisioner,
+            "workspace_pod_live",
+            probe,
+        ),
+        patch.object(
+            stateless_workspace_scheduler_module,
+            "schedule_stateless_workspace_ensure",
+            schedule,
+        ),
     ):
         response = await _internal_workspace_response_for_lite_thread(
             _stateless_sandbox_thread()
@@ -747,19 +822,26 @@ async def test_internal_workspace_ready_requires_exact_live_runtime_uid():
 @pytest.mark.asyncio
 async def test_internal_workspace_restore_intent_suppresses_ready_credentials():
     """A newly created pod is not attachable until snapshot extraction acks."""
-    import orchestrator.main as orch_main
 
     thread = _stateless_sandbox_thread()
     thread["metadata"]["workspace_container"]["_snapshot_restore_required"] = True
     schedule = MagicMock()
     probe = AsyncMock(side_effect=AssertionError("restore intent precedes UID probe"))
     with (
-        patch.object(orch_main.container_provisioner, "workspace_pod_live", probe),
-        patch.object(orch_main, "_schedule_stateless_workspace_ensure", schedule),
+        patch.object(
+            container_provisioner_module.container_provisioner,
+            "workspace_pod_live",
+            probe,
+        ),
+        patch.object(
+            stateless_workspace_scheduler_module,
+            "schedule_stateless_workspace_ensure",
+            schedule,
+        ),
     ):
         response = await _internal_workspace_response_for_lite_thread(thread)
 
-    schedule.assert_called_once_with(THREAD_ID)
+    _assert_reconcile_scheduled(schedule)
     probe.assert_not_awaited()
     assert response["status"] == "restoring"
     assert response["pod_ip"] is None
@@ -773,17 +855,23 @@ async def test_internal_workspace_restore_intent_suppresses_ready_credentials():
 async def test_internal_workspace_malformed_restore_marker_refuses_credentials(
     malformed,
 ):
-    import orchestrator.main as orch_main
-
     thread = _stateless_sandbox_thread()
     thread["metadata"]["workspace_container"]["_snapshot_restore_required"] = malformed
     schedule = MagicMock()
     probe = AsyncMock(side_effect=AssertionError("malformed marker precedes probe"))
     with (
-        patch.object(orch_main.container_provisioner, "workspace_pod_live", probe),
-        patch.object(orch_main, "_schedule_stateless_workspace_ensure", schedule),
+        patch.object(
+            container_provisioner_module.container_provisioner,
+            "workspace_pod_live",
+            probe,
+        ),
+        patch.object(
+            stateless_workspace_scheduler_module,
+            "schedule_stateless_workspace_ensure",
+            schedule,
+        ),
     ):
-        with pytest.raises(orch_main.HTTPException) as exc_info:
+        with pytest.raises(fastapi_module.HTTPException) as exc_info:
             await _internal_workspace_response_for_lite_thread(thread)
 
     assert exc_info.value.status_code == 503
@@ -793,12 +881,10 @@ async def test_internal_workspace_malformed_restore_marker_refuses_credentials(
 
 @pytest.mark.asyncio
 async def test_internal_workspace_ready_authority_requires_host_fingerprint():
-    import orchestrator.main as orch_main
-
     thread = _stateless_sandbox_thread()
     thread["metadata"]["_workspace_binding"].pop("ssh_host_key_fingerprint")
     with patch.object(
-        orch_main.container_provisioner,
+        container_provisioner_module.container_provisioner,
         "workspace_pod_live",
         AsyncMock(return_value=True),
     ):
@@ -826,16 +912,22 @@ async def test_internal_workspace_stale_ready_is_local_nonready_and_single_fligh
     probe = AsyncMock(return_value=False)
     ensure = AsyncMock(side_effect=_ensure)
     # R1.B05 moved the module dict into an application-owned registry.
-    orch_main._stateless_workspace_ensure_registry.discard(THREAD_ID)
+    orch_main.app.state.resources.stateless_workspace_ensure_registry.discard(THREAD_ID)
     with (
-        patch.object(orch_main.container_provisioner, "workspace_pod_live", probe),
-        patch.object(orch_main, "ensure_session_workspace", ensure),
+        patch.object(
+            container_provisioner_module.container_provisioner,
+            "workspace_pod_live",
+            probe,
+        ),
+        patch.object(session_provisioner_module, "ensure_session_workspace", ensure),
     ):
         first = await _internal_workspace_response_for_lite_thread(
             _stateless_sandbox_thread()
         )
         await started.wait()
-        task = orch_main._stateless_workspace_ensure_registry.get(THREAD_ID)
+        task = orch_main.app.state.resources.stateless_workspace_ensure_registry.get(
+            THREAD_ID
+        )
         assert task is not None
         second = await _internal_workspace_response_for_lite_thread(
             _stateless_sandbox_thread()
@@ -855,21 +947,26 @@ async def test_internal_workspace_stale_ready_is_local_nonready_and_single_fligh
         await task
         await asyncio.sleep(0)
 
-    assert orch_main._stateless_workspace_ensure_registry.get(THREAD_ID) is None
+    assert (
+        orch_main.app.state.resources.stateless_workspace_ensure_registry.get(THREAD_ID)
+        is None
+    )
 
 
 @pytest.mark.asyncio
 async def test_internal_workspace_unknown_probe_never_returns_cached_endpoint():
-    import orchestrator.main as orch_main
-
     schedule = MagicMock()
     with (
         patch.object(
-            orch_main.container_provisioner,
+            container_provisioner_module.container_provisioner,
             "workspace_pod_live",
             AsyncMock(return_value=None),
         ),
-        patch.object(orch_main, "_schedule_stateless_workspace_ensure", schedule),
+        patch.object(
+            stateless_workspace_scheduler_module,
+            "schedule_stateless_workspace_ensure",
+            schedule,
+        ),
     ):
         response = await _internal_workspace_response_for_lite_thread(
             _stateless_sandbox_thread()
@@ -888,8 +985,6 @@ async def test_internal_workspace_rechecks_row_after_delayed_live_probe():
     """A delayed U1 probe cannot publish U1 after durable state moved to U2."""
     import copy
 
-    import orchestrator.main as orch_main
-
     old = _stateless_sandbox_thread()
     replacement = copy.deepcopy(old)
     replacement_ws = replacement["metadata"]["workspace_container"]
@@ -902,11 +997,15 @@ async def test_internal_workspace_rechecks_row_after_delayed_live_probe():
     schedule = MagicMock()
     with (
         patch.object(
-            orch_main.container_provisioner,
+            container_provisioner_module.container_provisioner,
             "workspace_pod_live",
             AsyncMock(return_value=True),
         ),
-        patch.object(orch_main, "_schedule_stateless_workspace_ensure", schedule),
+        patch.object(
+            stateless_workspace_scheduler_module,
+            "schedule_stateless_workspace_ensure",
+            schedule,
+        ),
     ):
         response = await _internal_workspace_response_for_lite_thread(
             old,
@@ -928,8 +1027,6 @@ async def test_internal_workspace_final_read_rejects_real_nonready_replacement()
     """Response redaction must not weaken the final durable U1 -> U2 fence."""
     import copy
 
-    import orchestrator.main as orch_main
-
     old = _stateless_sandbox_thread()
     old["metadata"]["workspace_container"]["status"] = "creating"
     replacement = copy.deepcopy(old)
@@ -945,7 +1042,11 @@ async def test_internal_workspace_final_read_rejects_real_nonready_replacement()
     schedule = MagicMock()
 
     with (
-        patch.object(orch_main, "_schedule_stateless_workspace_ensure", schedule),
+        patch.object(
+            stateless_workspace_scheduler_module,
+            "schedule_stateless_workspace_ensure",
+            schedule,
+        ),
         pytest.raises(HTTPException) as exc_info,
     ):
         await _internal_workspace_response_for_lite_thread(
@@ -955,7 +1056,7 @@ async def test_internal_workspace_final_read_rejects_real_nonready_replacement()
 
     assert exc_info.value.status_code == 409
     assert exc_info.value.detail == {"code": "workspace_runtime_identity_changed"}
-    schedule.assert_called_once_with(THREAD_ID)
+    _assert_reconcile_scheduled(schedule)
 
 
 @pytest.mark.asyncio
@@ -967,19 +1068,26 @@ async def test_internal_workspace_nonready_claim_restarts_reconcile_without_endp
     workspace_status,
 ):
     """A durable pending input needs no second user action after lifecycle drift."""
-    import orchestrator.main as orch_main
 
     thread = _stateless_sandbox_thread()
     thread["metadata"]["workspace_container"]["status"] = workspace_status
     schedule = MagicMock()
     probe = AsyncMock(side_effect=AssertionError("non-ready rows need no live probe"))
     with (
-        patch.object(orch_main.container_provisioner, "workspace_pod_live", probe),
-        patch.object(orch_main, "_schedule_stateless_workspace_ensure", schedule),
+        patch.object(
+            container_provisioner_module.container_provisioner,
+            "workspace_pod_live",
+            probe,
+        ),
+        patch.object(
+            stateless_workspace_scheduler_module,
+            "schedule_stateless_workspace_ensure",
+            schedule,
+        ),
     ):
         response = await _internal_workspace_response_for_lite_thread(thread)
 
-    schedule.assert_called_once_with(THREAD_ID)
+    _assert_reconcile_scheduled(schedule)
     probe.assert_not_awaited()
     assert response["status"] == workspace_status
     assert response["pod_ip"] is None
@@ -991,12 +1099,10 @@ async def test_internal_workspace_nonready_claim_restarts_reconcile_without_endp
 
 @pytest.mark.asyncio
 async def test_internal_workspace_pinned_sandbox_requires_exact_live_authority():
-    import orchestrator.main as orch_main
-
     thread = _stateless_sandbox_thread()
     thread["execution_lane"] = "pinned"
     probe = AsyncMock(side_effect=AssertionError("pinned route must not attest UID"))
-    attestation = orch_main.WorkspaceRuntimeAttestation(
+    attestation = container_provisioner_module.WorkspaceRuntimeAttestation(
         backing_id="k8s-pvc:agent-workspaces:pvc-uid",
         workspace_generation=WORKSPACE_GENERATION,
         runtime_incarnation=WORKSPACE_RUNTIME_INCARNATION,
@@ -1008,20 +1114,28 @@ async def test_internal_workspace_pinned_sandbox_requires_exact_live_authority()
     attest = AsyncMock(return_value=attestation)
     schedule = MagicMock()
     with (
-        patch.object(orch_main.container_provisioner, "workspace_pod_live", probe),
         patch.object(
-            orch_main.container_provisioner,
+            container_provisioner_module.container_provisioner,
+            "workspace_pod_live",
+            probe,
+        ),
+        patch.object(
+            container_provisioner_module.container_provisioner,
             "attest_workspace_runtime",
             attest,
         ),
-        patch.object(orch_main, "_schedule_stateless_workspace_ensure", schedule),
+        patch.object(
+            stateless_workspace_scheduler_module,
+            "schedule_stateless_workspace_ensure",
+            schedule,
+        ),
     ):
         response = await _internal_workspace_response_for_lite_thread(thread)
 
     probe.assert_not_awaited()
     assert attest.await_count == 2
     assert all(
-        call.args == (orch_main.WorkspaceOwner.session(THREAD_ID),)
+        call.args == (WorkspaceOwner.session(THREAD_ID),)
         for call in attest.await_args_list
     )
     schedule.assert_not_called()
@@ -1107,8 +1221,6 @@ async def test_stateless_virtual_workspace_without_binding_fails_attach_payload(
 async def test_stateless_virtual_workspace_wrong_backing_fails_closed():
     """A UUID from an old object-store namespace is not an attestation."""
 
-    import orchestrator.main as orch_main
-
     current_spec = {
         "type": "s3",
         "root": "current-bucket",
@@ -1132,7 +1244,9 @@ async def test_stateless_virtual_workspace_wrong_backing_fails_closed():
 
     with (
         patch.object(
-            orch_main, "_virtual_workspace_rclone_spec", return_value=current_spec
+            virtual_workspace_module,
+            "virtual_workspace_rclone_spec",
+            return_value=current_spec,
         ),
         pytest.raises(HTTPException) as exc_info,
     ):
@@ -1148,7 +1262,6 @@ async def test_stateless_virtual_workspace_wrong_backing_fails_closed():
 async def test_stateless_virtual_workspace_exact_backing_exposes_generation():
     """The current deterministic namespace may attest its binding UUID."""
 
-    import orchestrator.main as orch_main
     from orchestrator.services.workspace_binding import virtual_thread_backing_id
 
     current_spec = {
@@ -1173,7 +1286,9 @@ async def test_stateless_virtual_workspace_exact_backing_exposes_generation():
     }
 
     with patch.object(
-        orch_main, "_virtual_workspace_rclone_spec", return_value=current_spec
+        virtual_workspace_module,
+        "virtual_workspace_rclone_spec",
+        return_value=current_spec,
     ):
         response = await _internal_workspace_response_for_lite_thread(
             thread,
@@ -1247,40 +1362,45 @@ async def test_none_agent_cloud_suppression_is_stateless_only(
 
     with (
         patch.object(papp, "_session", None),
-        patch.object(papp, "_thread_id", None),
+        patch.object(papp._session_identity, "_thread_id", None),
         patch.object(papp, "_event_writer", None),
         patch.object(papp, "_agent", agent),
         patch.object(papp, "_orchestrator_client", client),
         patch.object(papp, "PersistentSession", FakeSession),
-        patch.object(papp, "_session_backend_is_lite", return_value=True),
+        patch.object(session_attach, "session_backend_is_lite", return_value=True),
         patch.object(
             papp, "_build_sync_coordinator", return_value=workspace_sync
         ) as build_sync,
         patch.object(papp, "_restore_session_messages", AsyncMock()),
         patch.object(
-            papp,
-            "_reclaim_pending_pinned_inputs",
+            papp._session_input,
+            "reclaim_pending",
             AsyncMock(return_value=set()),
         ) as reclaim_pinned,
+        patch.object(
+            papp._session_attach,
+            "_reserve_stale_pinned_admissions",
+            AsyncMock(),
+        ) as reserve_pinned,
         patch.object(
             papp, "_resolve_event_journal_epoch", AsyncMock(return_value=(1, 0))
         ),
         patch.object(papp, "_OrderedPersistentEventWriter") as writer_cls,
         patch.object(papp, "_update_thread_status", AsyncMock()),
-        patch.object(papp, "_start_watchdogs"),
+        patch.object(papp._session_termination, "start_watchdogs"),
         patch.object(papp, "_officer_cfg", return_value=None),
-        patch.object(papp, "_apply_session_embedding_env"),
+        patch.object(session_attach, "apply_session_embedding_env"),
     ):
         lease_reset = None
         try:
             if stateless:
                 _, lease_reset = _install_lease()
-            await papp._attach_session(THREAD_ID, config_override={})
+            await papp._session_attach.attach(THREAD_ID, config_override={})
         finally:
             if lease_reset is not None:
                 current_lease.reset(lease_reset)
             papp._session = None
-            papp._thread_id = None
+            papp._session_identity._thread_id = None
 
     if expects_sync:
         build_sync.assert_called_once()
@@ -1291,8 +1411,10 @@ async def test_none_agent_cloud_suppression_is_stateless_only(
         workspace_sync.pull_all.assert_not_awaited()
     if stateless:
         reclaim_pinned.assert_not_awaited()
+        reserve_pinned.assert_not_awaited()
     else:
         reclaim_pinned.assert_awaited_once_with()
+        reserve_pinned.assert_awaited_once_with()
     writer_cls.assert_called_once()
 
 
@@ -1356,20 +1478,22 @@ async def test_late_workspace_fetch_retains_generation_without_coordinator():
 
     with (
         patch.object(papp, "_session", None),
-        patch.object(papp, "_thread_id", None),
+        patch.object(papp._session_identity, "_thread_id", None),
         patch.object(papp, "_event_writer", None),
         patch.object(papp, "_agent", agent),
         patch.object(papp, "_orchestrator_client", client),
         patch.object(papp, "PersistentSession", FakeSession),
-        patch.object(papp, "_poll_workspace_ready", AsyncMock(return_value=readiness)),
+        patch.object(
+            session_workspace, "poll_workspace_ready", AsyncMock(return_value=readiness)
+        ),
         patch.object(papp, "_build_sync_coordinator") as build_sync,
         patch.object(papp, "_restore_session_messages", AsyncMock()),
         patch.object(papp, "_update_thread_status", AsyncMock()),
-        patch.object(papp, "_start_watchdogs"),
+        patch.object(papp._session_termination, "start_watchdogs"),
         patch.object(papp, "_officer_cfg", return_value=None),
-        patch.object(papp, "_apply_session_embedding_env"),
+        patch.object(session_attach, "apply_session_embedding_env"),
     ):
-        await papp._attach_session(THREAD_ID, config_override={})
+        await papp._session_attach.attach(THREAD_ID, config_override={})
 
     assert client.get_thread_workspace.await_count == 2
     assert len(instances) == 1

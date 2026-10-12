@@ -47,6 +47,7 @@ def attempt_render(
     chart: Chart,
     *overrides: str,
     api_versions: tuple[str, ...] = (),
+    namespace: str = RELEASE_NAMESPACE,
 ) -> subprocess.CompletedProcess[str]:
     cmd = [
         "helm",
@@ -54,7 +55,7 @@ def attempt_render(
         "t",
         str(ROOT / chart.path),
         "--namespace",
-        RELEASE_NAMESPACE,
+        namespace,
         "-f",
         str(ROOT / chart.values),
     ]
@@ -69,8 +70,11 @@ def render_chart(
     chart: Chart,
     *overrides: str,
     api_versions: tuple[str, ...] = (),
+    namespace: str = RELEASE_NAMESPACE,
 ) -> str:
-    result = attempt_render(chart, *overrides, api_versions=api_versions)
+    result = attempt_render(
+        chart, *overrides, api_versions=api_versions, namespace=namespace
+    )
     assert result.returncode == 0, result.stderr
     return result.stdout
 
@@ -213,6 +217,49 @@ def test_mode_controls_same_cluster_object_set(
                 assert doc["metadata"].get("namespace") == RELEASE_NAMESPACE
     else:
         assert not controller_docs, f"{mode} unexpectedly rendered {kinds}"
+
+
+@pytest.mark.parametrize("namespace", ("superhuman-remote-worker", "vm-runtime"))
+def test_vm_controller_datavolume_source_cas_permission_is_namespaced(
+    namespace: str,
+) -> None:
+    rendered = documents(render_chart(MAIN, namespace=namespace))
+    role = next(
+        doc
+        for doc in rendered
+        if doc.get("kind") == "Role"
+        and doc["metadata"]["name"].endswith("-vm-controller")
+    )
+    assert role["metadata"]["namespace"] == namespace
+    datavolume_rules = [
+        rule
+        for rule in role["rules"]
+        if rule["apiGroups"] == ["cdi.kubevirt.io"]
+        and rule["resources"] == ["datavolumes"]
+    ]
+    assert len(datavolume_rules) == 1
+    assert set(datavolume_rules[0]["verbs"]) == {
+        "get",
+        "list",
+        "create",
+        "delete",
+        "patch",
+        "update",
+    }
+    binding = next(
+        doc
+        for doc in rendered
+        if doc.get("kind") == "RoleBinding"
+        and doc["metadata"]["name"] == role["metadata"]["name"]
+    )
+    assert binding["metadata"]["namespace"] == namespace
+    assert binding["subjects"][0]["namespace"] == namespace
+    assert all(
+        "datavolumes" not in rule.get("resources", [])
+        for doc in rendered
+        if doc.get("kind") == "ClusterRole"
+        for rule in doc["rules"]
+    )
 
 
 def test_same_cluster_controller_env_is_literal_and_http_only() -> None:
@@ -736,3 +783,70 @@ def test_cloud_init_sanity_budget(chart: Chart, limit: int) -> None:
         text = text.replace(f"${{{name}}}", "x" * width)
     assert not placeholders(text)
     assert len(text.encode()) <= limit
+
+
+def test_network_profile_is_default_off_and_same_policy_reaches_both_components() -> (
+    None
+):
+    def environments(rendered: str) -> list[dict[str, str]]:
+        return [
+            {entry["name"]: entry.get("value") for entry in container.get("env", [])}
+            for doc in documents(rendered)
+            if doc.get("kind") == "Deployment"
+            for container in doc["spec"]["template"]["spec"]["containers"]
+            if any(
+                item["name"] == "VM_NETWORK_PROFILE_ENABLED"
+                for item in container.get("env", [])
+            )
+        ]
+
+    default = environments(render_chart(MAIN))
+    assert len(default) == 2
+    assert all(
+        env["VM_NETWORK_PROFILE_ENABLED"] == "false"
+        and env["VM_NETWORK_PROFILE_IMAGE_ALLOWLIST"] == ""
+        for env in default
+    )
+    image = "registry.example/srw-vm@sha256:" + "a" * 64
+    selected = environments(
+        render_chart(
+            MAIN,
+            "vmController.networkProfile.enabled=true",
+            f"vmController.networkProfile.imageAllowlist[0]={image}",
+        )
+    )
+    assert len(selected) == 2
+    assert all(
+        env["VM_NETWORK_PROFILE_ENABLED"] == "true"
+        and env["VM_NETWORK_PROFILE_IMAGE_ALLOWLIST"] == image
+        for env in selected
+    )
+
+
+def test_disposable_recovery_gate_receives_its_exact_pinned_vm_image() -> None:
+    image = "registry.example/srw-vm@sha256:" + "a" * 64
+    rendered = render_chart(
+        MAIN,
+        "orchestrator.vmWorkspaceRecovery.enabled=true",
+        "orchestrator.vmWorkspaceRecovery.replacementEnabled=true",
+        "orchestrator.vmWorkspaceRecoveryAcceptanceGate.enabled=true",
+        "orchestrator.vmProvisioning.creationRetryEnabled=true",
+        "vmController.networkProfile.enabled=true",
+        f"vmController.networkProfile.imageAllowlist[0]={image}",
+        f"vmController.defaultVmImage={image}",
+    )
+    orchestrator = next(
+        doc
+        for doc in documents(rendered)
+        if doc.get("kind") == "Deployment"
+        and doc["metadata"]["name"].endswith("orchestrator")
+    )
+    env = {
+        item["name"]: item.get("value")
+        for container in orchestrator["spec"]["template"]["spec"]["containers"]
+        for item in container.get("env", [])
+    }
+    assert env["VM_CREATION_RETRY_ENABLED"] == "true"
+    assert env["VM_NETWORK_PROFILE_ENABLED"] == "true"
+    assert env["VM_NETWORK_PROFILE_IMAGE_ALLOWLIST"] == image
+    assert env["VM_WORKSPACE_RECOVERY_GATE_VM_IMAGE"] == image

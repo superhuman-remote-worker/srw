@@ -23,6 +23,7 @@ from uuid import UUID
 from fastapi import HTTPException, Request
 
 from orchestrator.schemas.job_runtime import JobCompleteRequest
+from orchestrator.services import connector_credential_leases
 from orchestrator.services.container_provisioner import (
     WORKSPACE_RUNTIME_INCARNATION_KEY,
     WorkspaceCleanupOutcome,
@@ -36,6 +37,35 @@ from orchestrator.services.vm_workspace_recovery_store import (
 
 
 CompletionCallback = Callable[..., Any]
+#: Terminal statuses whose status write revokes the Job's credential leases.
+_LEASE_REVOKING_STATUSES = {
+    "completed": "job_completed",
+    "failed": "job_failed",
+    "cancelled": "job_cancelled",
+}
+
+
+def _string_or_none(value: Any) -> str | None:
+    return value if isinstance(value, str) and value else None
+
+
+def _job_outbox_attached(job: dict[str, Any]) -> bool:
+    """Whether admission named the owner's outbox among the job's cloud
+    connectors (``context.cloud_connectors``)."""
+    from orchestrator.services.job_cloud_checkout import job_context
+    from shared.job_cloud_connectors import OUTBOX_KIND, connector_entry
+
+    return connector_entry(job_context(job), OUTBOX_KIND) is not None
+
+
+def _checkout_capture_applies(job: dict[str, Any]) -> bool:
+    """Whether completion captures the project folder copy's diff: a
+    checkout at reviewed write-back, or an older job's implicit copy
+    (``job_cloud_checkout.capture_applies``). A read-only copy's changes are
+    never captured."""
+    from orchestrator.services.job_cloud_checkout import capture_applies
+
+    return capture_applies(job)
 
 
 @dataclass(frozen=True, slots=True)
@@ -207,8 +237,10 @@ async def complete_job_legacy(
         determine_job_status,
         handle_pod_workspace_recovery,
         is_curation_enabled,
+        is_container_worker_workspace_exhaustion,
         is_late_completion_report,
         is_verification_enabled,
+        refused_resume_keeps_workspace,
         should_persist_completion_freeze,
         should_reset_recovery_counter,
         unmerged_pr_seal_status,
@@ -644,7 +676,7 @@ async def complete_job_legacy(
         # the job paused-but-invisible to the dispatcher
         # (knowledge-base/knowledge/issues/recovery_pause_repersists_stale_freeze_invisible_job.md).
         if result.get("freeze_data"):
-            if should_persist_completion_freeze(result):
+            if should_persist_completion_freeze(result, job=job):
                 job["freeze_data"] = result["freeze_data"]
 
                 async def _persist_reported_freeze() -> dict[str, Any]:
@@ -869,7 +901,12 @@ async def complete_job_legacy(
             if infra_pause_outcome is not None:
                 return infra_pause_outcome
 
-        if isinstance(error, dict) and error.get("type") == "workspace_unavailable":
+        worker_workspace_exhausted = is_container_worker_workspace_exhaustion(
+            job, error
+        )
+        if (
+            isinstance(error, dict) and error.get("type") == "workspace_unavailable"
+        ) or worker_workspace_exhausted:
             # Decide on the ORIGINAL job (before any stamp): a pod/sandbox job has
             # no vm.requested, so _job_needs_vm is False and it recovers via PVC
             # reattach; only a true VM job takes the legacy VM path below.
@@ -928,6 +965,7 @@ async def complete_job_legacy(
                         error,
                         db=postgres_db,
                         delete_workspace=_delete_pod,
+                        cleanup_service=container_provisioner,
                         trigger_dispatch=_trigger_dispatch,
                         completion_command_id=(
                             _effect_runner.command_id
@@ -1032,7 +1070,15 @@ async def complete_job_legacy(
                                     dependencies.workspace.recovery_store,
                                     cleanup,
                                     outcome=disposition,
+                                    provisioner=vm_provisioner,
                                 )
+                        elif disposition == "completed":
+                            await complete_vm_cleanup_permit(
+                                dependencies.workspace.recovery_store,
+                                cleanup,
+                                outcome=disposition,
+                                provisioner=vm_provisioner,
+                            )
                         vm_deleted = disposition == "completed"
                     except Exception:
                         vm_deleted = False
@@ -1088,7 +1134,7 @@ async def complete_job_legacy(
         # clear a lingering recovery strike so an old blip cannot make a later,
         # unrelated one exhaust the cap early.
         # knowledge-base/knowledge/issues/maxsessions_parallel_tools_false_workspace_death.md (D).
-        if should_reset_recovery_counter(_get_container_context(job), error):
+        if should_reset_recovery_counter(_get_container_context(job), error, job=job):
 
             async def _reset_recovery_strikes() -> dict[str, Any]:
                 try:
@@ -1150,6 +1196,14 @@ async def complete_job_legacy(
                 new_status = entry_resolution
                 if new_status != "failed":
                     error_message = None
+
+        from orchestrator.services.workspace_idle_completion_events import (
+            completion_wait_branch,
+        )
+
+        completion_idle_branch = completion_wait_branch(
+            getattr(_effect_runner, "command", None), new_status
+        )
 
         # 1·mem. Memory/KB-unavailable bounded retry. determine_job_status has
         # already enforced the cap (paused under MEMORY_RETRY_CAP, failed at it).
@@ -1458,6 +1512,13 @@ async def complete_job_legacy(
                 # return the historical three-tuple. Absence means the old
                 # ordinary outcome, never an inferred blocked result.
                 "outcome_kind": getattr(gate_decision, "outcome_kind", None),
+                "preserves_human_wait": getattr(
+                    gate_decision, "preserves_human_wait", False
+                )
+                is True,
+                "hold_reason": _string_or_none(
+                    getattr(gate_decision, "hold_reason", None)
+                ),
             }
 
         gate_result = await _run_completion_effect(
@@ -1470,6 +1531,13 @@ async def complete_job_legacy(
         _gate_actions = list(gate_result["actions"])
         _gate_bounced = bool(gate_result["bounced"])
         completion_outcome_kind = gate_result.get("outcome_kind")
+        if (
+            new_status != "pending_review"
+            or gate_result.get("preserves_human_wait") is not True
+            or _gate_bounced
+            or completion_outcome_kind is not None
+        ):
+            completion_idle_branch = None
         actions.extend(_gate_actions)
         if _gate_bounced:
             # Refused seal: the job is already parked paused with
@@ -1489,6 +1557,12 @@ async def complete_job_legacy(
                 "Delivery contract could not be satisfied; work ended "
                 "blocked/undelivered without a verified pull request."
             )
+        # A seal held because its delivery could not be proven says why, on
+        # the row every surface reads (job list, officer sitrep, get_job) —
+        # a full-autonomy hold would otherwise sit in pending_review silently.
+        delivery_hold_reason = gate_result.get("hold_reason")
+        if delivery_hold_reason and not error_message:
+            error_message = f"Delivery unproven: {delivery_hold_reason}"[:1000]
 
         # 1·evidence (E4, officer_supervision_surface §3.3): a completion
         # CLAIM that survived the gate gets its typed evidence manifest —
@@ -1575,6 +1649,8 @@ async def complete_job_legacy(
         from orchestrator.services.project_loops import job_loop_id
 
         _completion_loop_id = job_loop_id(job)
+        if _completion_loop_id:
+            completion_idle_branch = None
         if _completion_loop_id and new_status == "completed":
 
             async def _deliver_loop_project_cloud() -> dict[str, Any]:
@@ -1703,18 +1779,27 @@ async def complete_job_legacy(
             actions.append(str(loop_delivery_result["action"]))
         elif (
             job.get("cloud_diff_baseline_commit")
-            and new_status in ("completed", "pending_review")
+            # ``reviewing``: a job whose critic runs first is captured now; the
+            # critic's approval then lands on pending_review while the diff
+            # waits (verification_workflow.critic_verdict_transition).
+            and new_status in ("completed", "pending_review", "reviewing")
             and gitea_client.is_initialized
             and not _completion_loop_id
+            and _checkout_capture_applies(job)
         ):
 
             async def _capture_mode_a_diff() -> dict[str, Any]:
+                from orchestrator.services.job_cloud_checkout import (
+                    CHECKOUT_CONTEXT_KEY,
+                    checkout_context,
+                )
+
                 try:
                     from orchestrator.services.job_cloud_baseline import (
-                        capture_diff_for_mode_a_job,
+                        capture_checkout_diff,
                     )
 
-                    captured = await capture_diff_for_mode_a_job(
+                    capture = await capture_checkout_diff(
                         job=job,
                         postgres_db=postgres_db,
                         gitea_client=gitea_client,
@@ -1727,7 +1812,30 @@ async def complete_job_legacy(
                         exc,
                     )
                     return {"captured": False, "error": str(exc)}
-                return {"captured": bool(captured)}
+                # What the capture found, beside the checkout it belongs to.
+                # An older job's implicit copy was reviewed write-back.
+                checkout = checkout_context(job) or {
+                    "access": "reviewed_write_back",
+                    "origin": "legacy",
+                }
+                checkout["capture"] = {
+                    "state": capture["state"],
+                    "files": capture["files"],
+                }
+                try:
+                    await postgres_db.merge_job_context(
+                        job_id, {CHECKOUT_CONTEXT_KEY: checkout}
+                    )
+                except Exception:
+                    logger.warning(
+                        "Mode A: could not record job %s's capture state",
+                        job_id,
+                        exc_info=True,
+                    )
+                return {
+                    "captured": capture["state"] == "captured",
+                    "state": capture["state"],
+                }
 
             mode_a_capture = await _run_completion_effect(
                 _effect_runner,
@@ -1735,9 +1843,80 @@ async def complete_job_legacy(
                 "delivery",
                 _capture_mode_a_diff,
             )
+            if mode_a_capture["captured"]:
+                completion_idle_branch = None
             if mode_a_capture["captured"] and new_status == "completed":
                 new_status = "pending_review"
                 actions.append("mode A diff captured -> pending_review")
+
+        # 1b. The job outbox (S16b): a root job whose owner's outbox is
+        # attached gets its deliverables copied into a folder shared with the
+        # owner, at completion and in review alike. Best-effort: the copy's
+        # outcome lands in context.job_outbox and never changes the status; a
+        # failure or an unshared folder is re-synced from the job's page.
+        if (
+            not job.get("parent_job_id")
+            and not _completion_loop_id
+            and new_status in ("completed", "pending_review", "reviewing")
+            and _job_outbox_attached(job)
+        ):
+
+            async def _deliver_job_outbox() -> dict[str, Any]:
+                if delivery_control_claim_id is not None:
+                    await _effect_runner.assert_delivery_control(
+                        completion_entry_status
+                    )
+                try:
+                    from orchestrator.services.job_export import (
+                        JobExportDependencies,
+                        run_job_outbox_effect,
+                    )
+                    from orchestrator.services.subjob_output import (
+                        SubjobOutputDependencies,
+                        resolve_job_repo,
+                    )
+
+                    repo_dependencies = SubjobOutputDependencies(
+                        store=postgres_db, forge=gitea_client
+                    )
+
+                    async def _resolve_repo(target: str) -> tuple[str, str | None]:
+                        return await resolve_job_repo(
+                            target, dependencies=repo_dependencies
+                        )
+
+                    return await run_job_outbox_effect(
+                        job_id=job_id,
+                        dependencies=JobExportDependencies(
+                            store=postgres_db,
+                            forge=gitea_client,
+                            cloud_router=main_cloud_router,
+                            resolve_job_repo=_resolve_repo,
+                        ),
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "Job outbox delivery failed for job %s (%s); the status "
+                        "is unchanged",
+                        job_id,
+                        exc,
+                        exc_info=True,
+                    )
+                    return {"state": "failed", "error": str(exc)[:500]}
+
+            outbox_delivery = await _run_completion_effect(
+                _effect_runner,
+                "job_outbox_delivery",
+                "delivery",
+                _deliver_job_outbox,
+            )
+            if outbox_delivery.get("state") == "delivered":
+                actions.append(
+                    f"job outbox delivered ({outbox_delivery.get('files', 0)} "
+                    f"file(s), shared={bool(outbox_delivery.get('shared'))})"
+                )
+            else:
+                actions.append("job outbox delivery failed (status unchanged)")
 
         # A job whose deliverable is a pull request is not done while that PR is
         # open. Routed to human review rather than refused, because refusing a
@@ -1985,6 +2164,34 @@ async def complete_job_legacy(
                         current_status,
                     )
                     await _raise_completion_control_race(current_status)
+                if new_status in _LEASE_REVOKING_STATUSES:
+                    # The terminal status write revokes the Job's credential
+                    # leases (connector drivers C2), in this effect's
+                    # transaction. ``pending_review`` and ``paused`` keep the
+                    # workspace and let the leases lapse instead.
+                    async with postgres_db.acquire() as conn:
+                        await connector_credential_leases.revoke_execution_leases(
+                            conn,
+                            job_id=job_id,
+                            reason=_LEASE_REVOKING_STATUSES[new_status],
+                        )
+                if (
+                    _effect_runner is not None
+                    and new_status == "pending_review"
+                    and completion_idle_branch is not None
+                ):
+                    from orchestrator.services.workspace_idle_completion_events import (
+                        record_completion_wait_on_conn,
+                    )
+
+                    async with postgres_db.acquire() as conn:
+                        await record_completion_wait_on_conn(
+                            conn,
+                            job_id=job_id,
+                            command_id=_effect_runner.command_id,
+                            finalizing_by=_effect_runner.owner,
+                            branch=completion_idle_branch,
+                        )
                 return {
                     "new_status": new_status,
                     "had_assigned_agent": had_assigned_agent,
@@ -2175,6 +2382,18 @@ async def complete_job_legacy(
             if isinstance(fd, str):
                 fd = json.loads(fd)
             ft = fd.get("freeze_type")
+            if (
+                ft is None
+                and new_status == "pending_review"
+                and fd.get("status") == "job_completed"
+            ):
+                # A full-autonomy completion carries no freeze_type. One that
+                # lands on review anyway (a seal held as undelivered, the
+                # deliverable-gate bounce cap) waits on a human exactly like a
+                # job_complete freeze — and would otherwise wait unannounced.
+                ft = "job_complete"
+            if delivery_hold_reason:
+                fd = {**fd, "delivery_hold": delivery_hold_reason}
             if ft in _NOTIFIABLE_FREEZE_TYPES:
                 sudo_request_id = None
                 auto_denied = False
@@ -2766,10 +2985,23 @@ async def complete_job_legacy(
             _kick_dispatch,
         )
 
-        # 7. Archive workspace (snapshot to S3) and clean up VM/container
-        if job.get("status") in ("completed", "failed") or (
-            job.get("status") == "cancelled"
-            and completion_outcome_kind == "blocked_undelivered"
+        # 7. Archive workspace (snapshot to S3) and clean up VM/container.
+        # A refused resume keeps the paused job's workspace (connector
+        # drivers decision 34): its claim owner says so in the report, and
+        # only a report the orchestrator admitted (origin 'dispatch') counts.
+        if (
+            job.get("status") in ("completed", "failed")
+            or (
+                job.get("status") == "cancelled"
+                and completion_outcome_kind == "blocked_undelivered"
+            )
+        ) and not refused_resume_keeps_workspace(
+            completion_result,
+            origin=(
+                (getattr(_effect_runner, "command", None) or {}).get("origin")
+                if _effect_runner is not None
+                else None
+            ),
         ):
             workspace_cleanup = await _run_completion_workspace_teardown(
                 job_id,

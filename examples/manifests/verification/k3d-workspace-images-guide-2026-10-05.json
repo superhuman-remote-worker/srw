@@ -1,0 +1,179 @@
+{
+  "date": "2026-10-05",
+  "slice": "A4 workspace-images guide",
+  "commit": "a60f54dbc (guide) on develop",
+  "stack": "local k3d (context k3d-srw, namespace srw), Tilt-built images; Podman 5.8 build/run/push, Docker 29.8 syntax spot-checks only",
+  "caller": "cockpit https://localhost as test/test (admin@localhost 6ed1b6f4-4931-461f-ba92-1d98f062af10) via Node Playwright for steps 1 and 5; REST through the orchestrator pod with X-Internal-Key + X-MCP-User-Id impersonation for the Job and cleanup",
+  "image": {
+    "base": "localhost:5005/srw-workspace-minimal:tilt-7e7d19b52f06906a (in cluster srw-registry:5000/...)",
+    "built": "localhost:5005/a4-guide-tools:1.0",
+    "digest": "sha256:d3ac9b48831e8157da92eff19cd144ec2c44a72fc8d5e983e02a203ea162b919",
+    "templateRef": "srw-registry:5000/a4-guide-tools@sha256:d3ac9b48831e8157da92eff19cd144ec2c44a72fc8d5e983e02a203ea162b919"
+  },
+  "checks": [
+    {
+      "step": "1 pick a base",
+      "how": "Playwright: Customize -> Workspaces -> Container (minimal); also GET /api/resources Catalog/shared",
+      "observed": "Image field shows srw-registry:5000/srw-workspace-minimal:tilt-7e7d19b52f06906a; matches the API; list column shows the short form only",
+      "result": "pass"
+    },
+    {
+      "step": "2 Dockerfile",
+      "how": "Guide's Dockerfile verbatim",
+      "observed": "ok",
+      "result": "pass"
+    },
+    {
+      "step": "3.1 build",
+      "how": "podman build --tls-verify=false --build-arg BASE=localhost:5005/srw-workspace-minimal:tilt-7e7d19b52f06906a -t localhost:5005/a4-guide-tools:1.0 .",
+      "observed": "base pulled from localhost:5005; shellcheck + yamllint installed; assert-workspace-contract printed 'SRW workspace contract OK.'; 1m12s",
+      "result": "pass"
+    },
+    {
+      "step": "3.2 run + still running",
+      "how": "podman run -d --name workspace-test; sleep 10; podman inspect --format '{{.State.Status}}'",
+      "observed": "running; log: 'code-server NOT started: no workspace credential was injected', sshd listening on 30022",
+      "result": "pass"
+    },
+    {
+      "step": "3.3 tools as agent-host",
+      "how": "podman exec --user agent-host workspace-test shellcheck --version / yamllint --version",
+      "observed": "ShellCheck version 0.9.0; yamllint 1.38.0",
+      "result": "pass"
+    },
+    {
+      "step": "3.4 remove",
+      "how": "podman rm -f workspace-test",
+      "observed": "removed after a 10 s SIGTERM wait and a StopSignal warning (finding G1)",
+      "result": "pass with finding"
+    },
+    {
+      "step": "4 push + digest",
+      "how": "podman push --tls-verify=false --digestfile image-digest.txt; echo ${IMAGE%:*}@$(cat image-digest.txt)",
+      "observed": "localhost:5005/a4-guide-tools@sha256:d3ac9b48831e8157da92eff19cd144ec2c44a72fc8d5e983e02a203ea162b919",
+      "result": "pass"
+    },
+    {
+      "step": "4 docker syntax",
+      "how": "docker push/inspect/build/run/exec/rm --help",
+      "observed": "docker inspect --format, build --build-arg and --platform, exec --user, run -d --name, rm -f all exist; docker commands not executed",
+      "result": "pass"
+    },
+    {
+      "step": "5 create template (cockpit)",
+      "how": "New template; Name a4-guide-tools; Save to Mine (default); Image = srw-registry:5000/a4-guide-tools@sha256:d3ac9b48831e8157da92eff19cd144ec2c44a72fc8d5e983e02a203ea162b919; CPU 1; Memory 2Gi; Disk 10Gi; Save",
+      "observed": "not-an-SRW-image notice appeared; saved; GET /api/resources Account scope shows the template with the same image and resources",
+      "result": "pass"
+    },
+    {
+      "step": "6 use it (Job)",
+      "how": "POST /api/jobs with workspace.template.ref {a4-guide-tools, Account/<user>}, scholar disabled",
+      "observed": "Job 1ec4b61d-51fc-43b4-b33b-56c193098316; config_override.workspace.sandbox.image = the digest reference; pod workspace-1ec4b61d-51f Pending 3 s then Ready within 18 s; Job went processing, then pending_review after about 10 min",
+      "result": "pass"
+    },
+    {
+      "step": "6 pod image",
+      "how": "kubectl get pod workspace-1ec4b61d-51f -o jsonpath",
+      "observed": "spec image and imageID both srw-registry:5000/a4-guide-tools@sha256:d3ac9b48831e8157da92eff19cd144ec2c44a72fc8d5e983e02a203ea162b919; Ready=True; securityContext without privileged (drop ALL, add 9 caps)",
+      "result": "pass"
+    },
+    {
+      "step": "6 tools in the workspace",
+      "how": "kubectl exec pod -- su -s /bin/bash agent-host -c 'shellcheck --version; yamllint --version; python3 -c import yamllint'",
+      "observed": "ShellCheck 0.9.0; yamllint 1.38.0; yamllint module at /usr/local/lib/python3.12/dist-packages/yamllint/__init__.py",
+      "result": "pass"
+    },
+    {
+      "step": "6 agent's own shell",
+      "how": "Job result",
+      "observed": "default Expert worker_base has tools.shell [] so the agent reported NOT EXECUTED; exec check used instead (finding G2)",
+      "result": "not exercised (no shell tool)"
+    },
+    {
+      "step": "troubleshooting row 1 negative",
+      "how": "extra tag with ENTRYPOINT [\"true\"]; run -d; sleep 10; inspect",
+      "observed": "exited, exit code 0. With CMD [\"true\"] instead: running",
+      "result": "pass"
+    },
+    {
+      "step": "not exercised",
+      "how": "Workspace picker in New Job/New Session, project Workspace defaults, Duplicate button, the 600 s startup-boundary Job, pull-failure rows, /cloud mount rows (ls /cloud printed nothing)",
+      "observed": "-",
+      "result": "not run"
+    }
+  ],
+  "guideFindings": [
+    {
+      "id": "G1",
+      "guideLines": "114-127, 136-140 (step 3.2 and 3.4)",
+      "what": "podman rm -f workspace-test took 10 s and printed 'StopSignal SIGTERM failed to stop container ... resorting to SIGKILL': the base entrypoint ignores SIGTERM. Harmless, but looks like an error to a first reader. docker rm -f uses SIGKILL and has no delay.",
+      "oldText": "podman rm -f workspace-test",
+      "newText": "podman rm -f -t 0 workspace-test",
+      "extra": "Optionally add after the code block: 'Podman waits 10 seconds for the entrypoint to stop and then kills it; -t 0 skips the wait.' Docker: docker rm -f has no wait."
+    },
+    {
+      "id": "G2",
+      "guideLines": "249-251 (step 6, last paragraph)",
+      "what": "The Job ran on the custom image and reached Ready in about 18 s, but the default Expert (worker_base, tools.shell = []) has no shell tool. The agent searched its workspace, found none, and reported 'no shell-execution tool is bound ... NOT EXECUTED' for all three commands. A reader who follows the guide's claim that 'the agent's own shell does [have your tools]' and asks the default Expert to run a tool will see this and think the image is broken.",
+      "oldText": "A Job's IDE terminal runs in a separate pod with the installation's image, so it doesn't have your tools; the agent's own shell does.",
+      "newText": "A Job's IDE terminal runs in a separate pod with the installation's image, so it doesn't have your tools. The agent's own shell does, but only for an Expert that has the shell tool group; the default Expert has no shell tool, so a Job that is meant to run your tools needs an Expert with it.",
+      "extra": "Needs the exact name of a shipped Expert that has the shell group (not verified here). Product note, not a guide bug: a Job that cannot use the custom image's tools completes with a low-confidence 'NOT EXECUTED' report instead of failing, so a try-it Job on a new image proves little unless the Expert has a shell."
+    },
+    {
+      "id": "G3",
+      "guideLines": "262-263 (When it doesn't start, last paragraph)",
+      "what": "The guide says 'workspace-<first 12 characters of the Job ID>'. The real pod was workspace-1ec4b61d-51f for Job 1ec4b61d-51fc-...: 12 characters of the ID including the hyphen. kubectl describe with 13 characters (workspace-1ec4b61d-51fc) returns NotFound. The guide is correct; the brief's '8 characters' is not.",
+      "oldText": "kubectl describe pod workspace-<first 12 characters of the Job ID>",
+      "newText": "kubectl describe pod workspace-<first 12 characters of the Job ID, hyphen included>",
+      "extra": "For example Job 1ec4b61d-51fc-43b4-... has the pod workspace-1ec4b61d-51f. Optional clarification only."
+    },
+    {
+      "id": "G4",
+      "guideLines": "37-45 (step 1, Customize -> Workspaces)",
+      "what": "Works as written: Customize shows the Workspaces tab; the Shared group lists Container (minimal); opening it shows an Image input with the full reference (srw-registry:5000/srw-workspace-minimal:tilt-7e7d19b52f06906a). The inputs are disabled (greyed), not read-only. The list's Image column drops the registry (shows srw-workspace-minimal:tilt-7e7d19b52f06906a), so the list alone isn't enough: opening the row is needed. The Duplicate button exists (not clicked).",
+      "oldText": "2. Open the one you want to build on. Its **Image** field shows the full\n   reference, for example",
+      "newText": "2. Open the one you want to build on; the list's Image column leaves out the registry. Its **Image** field shows the full\n   reference, for example",
+      "extra": "Optional. On a local k3d installation the reference starts with srw-registry:5000/, which step 4's last paragraph already explains."
+    },
+    {
+      "id": "G5",
+      "guideLines": "153-154 (step 4, Podman digest command)",
+      "what": "podman push --digestfile worked and the echo printed localhost:5005/a4-guide-tools@sha256:d3ac9b48.... ${IMAGE%:*} strips the tag only when IMAGE has a tag; without a tag, a registry port (localhost:5005/name) would be cut. The guide's example always has a tag, so this is correct as written. On the local registry the guide's Podman commands needed --tls-verify=false on build (for the base pull) and push, exactly as step 4 says; podman run/exec/rm needed none.",
+      "oldText": "(none)",
+      "newText": "(none; confirmed)",
+      "extra": "No edit needed."
+    },
+    {
+      "id": "G6",
+      "guideLines": "92-94, 257 (Don't set ENTRYPOINT, CMD or USER)",
+      "what": "Negative check: with ENTRYPOINT [\"true\"] appended, podman run -d then sleep 10 and podman inspect printed 'exited' (exit code 0), so the guide's check catches it. With CMD [\"true\"] the container stayed 'running': the base entrypoint ignores CMD. So the guide's rule is right for ENTRYPOINT and USER, but a CMD override doesn't break the base.",
+      "oldText": "- **Don't set `ENTRYPOINT`, `CMD` or `USER`.** The base's entrypoint runs as\n  root, starts sshd and keeps the container running.",
+      "newText": "- **Don't set `ENTRYPOINT`, `CMD` or `USER`.** The base's entrypoint runs as\n  root, starts sshd and keeps the container running. (The entrypoint ignores its arguments, so a `CMD` has no effect, but it can mislead whoever reads the Dockerfile.)",
+      "extra": "Optional wording; the rule itself is safe."
+    },
+    {
+      "id": "G7",
+      "guideLines": "194-196 (step 5.4)",
+      "what": "Confirmed: after pasting the digest reference into Image, the notice reads 'This isn't one of SRW's images. It runs without elevated privileges unless your operator allows it, so there is no cloud-folder mount and no protected cloud. Pin a digest (image@sha256:...) rather than a tag, so every run uses the same image.' All labels in the guide (New template, Name, Save to, Tier, Image, CPU, Memory, Disk, Save) exist. Save to defaults to Mine. After Save the page stays on the editor at /workspaces/<uid> rather than returning to the list.",
+      "oldText": "(none)",
+      "newText": "(none; confirmed)",
+      "extra": "No edit needed. Product note: the form labels are not programmatically associated with their inputs (getByLabel found nothing), an accessibility gap."
+    }
+  ],
+  "productNotes": [
+    "Job with no shell tool on a custom image completes (pending_review) with a low-confidence NOT EXECUTED report rather than failing.",
+    "Template editor labels are not associated with their inputs (accessibility)."
+  ],
+  "envNotes": [
+    "Substituted localhost:5005 for the push/pull host and srw-registry:5000 in the template (same registry, same digest), as step 4's local paragraph describes.",
+    "podman --tls-verify=false needed for build (base pull) and push.",
+    "Template created through the cockpit form; the Job and cleanup through REST impersonation.",
+    "DELETE /api/jobs right after PUT /cancel: cancel returned 503 'Workspace authority retirement is incomplete' (job was already pending_review); the delete then returned 200 on the first try. The brief's POST cancel is wrong: the route is PUT."
+  ],
+  "cleanup": {
+    "job": "deleted (404 afterwards), workspace pod gone",
+    "template": "a4-guide-tools deleted (Account list empty)",
+    "local": "containers workspace-test, workspace-test-neg, workspace-test-cmd removed; images a4-guide-tools:1.0, :neg-entrypoint, :neg-cmd removed with podman rmi",
+    "leftBehind": "localhost:5005/a4-guide-tools:1.0 (digest sha256:d3ac9b48831e8157da92eff19cd144ec2c44a72fc8d5e983e02a203ea162b919) stays in the k3d registry; the ~3 GB base image stays in the local Podman store; scratch files in the session scratchpad"
+  }
+}

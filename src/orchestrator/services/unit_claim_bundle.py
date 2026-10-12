@@ -46,9 +46,12 @@ from shared.workspace_recovery import (
 
 from orchestrator.security.access import vm_workspaces_on_pod_network
 from orchestrator.services import (
+    connector_bind_time,
+    connector_credential_leases,
     dispatch_credentials,
     job_start_bundle,
     job_workspace_authority,
+    refused_workspace_credentials,
     session_attach_payload,
 )
 from orchestrator.services.job_workspace_runtime import (
@@ -58,13 +61,23 @@ from orchestrator.services.job_workspace_runtime import (
     inject_vm_workspace_config,
     stateless_worker_workspace_owner,
 )
+from orchestrator.services.model_availability import WHERE_SESSION, ModelUnavailable
 from orchestrator.services.session_class_policy import require_stateless_workspace
 from orchestrator.services.stateless_workspace_gate import (
     stateless_session_workspace_check,
 )
 from orchestrator.services.vm_provisioner import vm_provisioner
 from shared.runtime.core.loader import canonical_config_name
+from shared.session_pending_memory import (
+    SESSION_PENDING_MEMORY_KEY,
+    pending_memory_from_metadata,
+)
 from shared.session_retirement import STATELESS_STOP_KEYS, stateless_stop_markers
+from shared.session_subagent_batch import (
+    SESSION_SUBAGENT_BATCH_SETTLE_CONTRACT,
+    SESSION_SUBAGENT_BATCH_SETTLE_CONTRACT_KEY,
+    SESSION_SUBAGENT_FANOUT_KEY,
+)
 from shared.workspace_contract import (
     WorkspaceContractError,
     resolve_workspace_contract,
@@ -101,7 +114,23 @@ class UnitClaimBundleDependencies:
     job_workspace_authority_dependencies: Callable[[], Any]
     job_start_bundle_dependencies: Callable[[], Any]
     dispatch_credential_dependencies: Callable[[], Any]
+    #: Fails a worker job whose start was refused for good through the
+    #: completion-command path, fenced by the claimant's lease
+    #: (``job_completion.refuse_job_start``, connector drivers decision 34).
+    #: It admits nothing while completion commands are off.
+    refuse_job_start: Callable[..., Awaitable[bool]]
+    #: Whether completion commands own job status, read at each refusal: only
+    #: then is a refused worker start failed through the ledger.
+    completion_commands_enabled: Callable[[], bool]
     recovery_store: Any = None
+    #: Read-only pooled-executor attestation (K8s Pod UID + pool membership).
+    #: Injected so routes/services stay testable without a cluster. ``None``
+    #: is unknown authority (503), never success.
+    attest_stateless_claimant: Callable[[str, str], Awaitable[None]] | None = None
+    #: The operator's session fan-out switch for a lane
+    #: (``DeploymentSettings.session_subagent_fanout``), read at every claim.
+    #: The default keeps fan-out off for a composition that does not wire it.
+    session_subagent_fanout: Callable[[str], bool] = lambda _lane: False
 
 
 class _WorkspaceRecoveryRefusal(HTTPException):
@@ -112,6 +141,86 @@ class _WorkspaceRecoveryRefusal(HTTPException):
     ):
         super().__init__(409, detail)
         self.code = code
+
+
+class _ClaimLeasesRefused(HTTPException):
+    """A claim refused because a lease could not be delivered; ``cause`` is
+    the delivery error, for a caller that tells for-good from transient."""
+
+    def __init__(self, detail: str, cause: BaseException):
+        super().__init__(409, detail)
+        self.cause = cause
+
+
+async def _deliver_claim_leases(
+    conn: Any,
+    entries: Any,
+    *,
+    owner: connector_credential_leases.LeaseOwner,
+    refusal: str,
+) -> None:
+    """Put lease tokens into a claim's datasources, in its transaction.
+
+    A lease that cannot be delivered refuses the claim with the lane's
+    generic detail (the reason stays in the server log), so the transaction
+    rolls back and no bundle crosses the credential boundary.
+    """
+    if not connector_credential_leases.needs_leases(entries):
+        return
+    try:
+        await connector_credential_leases.deliver_connector_leases(
+            conn, entries, owner=owner
+        )
+    except connector_credential_leases.LeaseDeliveryError as exc:
+        logger.warning(
+            "Claim refused: connector leases unavailable for %s %s (%s)",
+            owner.kind,
+            owner.id,
+            exc,
+        )
+        raise _ClaimLeasesRefused(refusal, exc) from exc
+
+
+async def _refuse_worker_start(
+    unit_id: str,
+    *,
+    reason: str,
+    message: str,
+    lease_token: int,
+    job: dict[str, Any],
+    attestation: Any,
+    dependencies: UnitClaimBundleDependencies,
+) -> None:
+    """Fail a worker job whose start was refused for good, under this lease.
+
+    Only while completion commands own job status; otherwise the claimant
+    keeps its retries. A job with a checkpoint has run before, so this claim
+    resumed it and its workspace is kept (scrubbed of SRW's credentials when
+    the refusal revokes access, through the endpoint this claim attested); a
+    first start's workspace is torn down. The pinned lane's resume test,
+    ``resume_lane_applies``, asks the same question.
+    """
+    if not dependencies.completion_commands_enabled():
+        return
+    plan = refused_workspace_credentials.RefusedResume(keep_workspace=False)
+    if await dependencies.db.job_has_checkpoint(unit_id):
+        plan = refused_workspace_credentials.plan_refused_resume(
+            reason,
+            job=job,
+            target=refused_workspace_credentials.attested_scrub_target(
+                attestation, shell_owner_token=lease_token
+            ),
+        )
+    if await dependencies.refuse_job_start(
+        unit_id,
+        reason=reason,
+        message=message,
+        resume=plan.keep_workspace,
+        lease_token=lease_token,
+    ):
+        await refused_workspace_credentials.scrub_refused_workspace(
+            dependencies.db, unit_id, reason=reason, plan=plan
+        )
 
 
 def _digest(value: Any) -> str:
@@ -166,11 +275,20 @@ async def get_workspace_recovery_disposition(
     )
 
 
-async def _validate_worker_identity(
+async def _validate_worker_lease(
     conn: Any, *, unit_id: str, lease_token: int, pod_name: str, pod_uid: str
 ) -> None:
+    """Exact database lease proof for a pooled worker claimant.
+
+    Checks a valid UID shape, the exact leased queue token, and the matching
+    ``leased_by`` pod name in one short read. This is the database half of
+    worker admission; the Kubernetes executor-Pod observation is separate
+    (``_attest_worker_claimant``) and always happens outside write-lock
+    transactions. No ``agents`` registration is required: pooled executors
+    intentionally never create one.
+    """
     try:
-        UUID(pod_uid)
+        UUID(str(pod_uid))
     except (ValueError, TypeError, AttributeError):
         raise HTTPException(403, "Lease validation failed") from None
     row = await conn.fetchrow(
@@ -186,12 +304,36 @@ async def _validate_worker_identity(
         and row["leased_by"] == pod_name
     ):
         raise HTTPException(403, "Lease validation failed")
-    if not await conn.fetchval(
-        "SELECT EXISTS (SELECT 1 FROM agents WHERE hostname=$1 AND pod_uid=$2)",
-        pod_name,
-        pod_uid,
-    ):
-        raise HTTPException(403, "Lease validation failed")
+
+
+async def _attest_worker_claimant(
+    *, pod_name: str, pod_uid: str, dependencies: UnitClaimBundleDependencies
+) -> None:
+    """Read-only executor-Pod attestation for a pooled worker claimant.
+
+    The slow Kubernetes read stays outside database transactions; callers
+    re-read the exact lease under the existing short transactional boundary
+    after it returns. ``None`` (unwired collaborator) is unknown authority,
+    never success.
+    """
+    attestor = getattr(dependencies, "attest_stateless_claimant", None)
+    if attestor is None:
+        raise HTTPException(503, "Claimant authority unavailable")
+    await attestor(str(pod_name or ""), str(pod_uid or ""))
+
+
+# Retained alias for suites that still resolve the pre-fix validator name.
+# It now performs only the database lease half; attestation is separate.
+async def _validate_worker_identity(
+    conn: Any, *, unit_id: str, lease_token: int, pod_name: str, pod_uid: str
+) -> None:
+    await _validate_worker_lease(
+        conn,
+        unit_id=unit_id,
+        lease_token=lease_token,
+        pod_name=pod_name,
+        pod_uid=pod_uid,
+    )
 
 
 async def report_workspace_recovery(
@@ -206,6 +348,8 @@ async def report_workspace_recovery(
     intent_digest = _digest({"unit_id": unit_id, **report.model_dump(mode="json")})
     # The accepted request is checked before current authority: admission
     # rotates the token and the response can be lost after that commit.
+    # Matching accepted replay is idempotent and must not demand a current
+    # lease or a live Pod; conflicting intent stays refused.
     async with dependencies.db.acquire() as conn:
         try:
             prior = await store._accepted_request(
@@ -220,13 +364,21 @@ async def report_workspace_recovery(
             return prior
         if not workspace_recovery_enabled():
             raise HTTPException(409, "Workspace recovery is unavailable")
-        await _validate_worker_identity(
+        await _validate_worker_lease(
             conn,
             unit_id=unit_id,
             lease_token=report.lease_token,
             pod_name=report.pod_name,
             pod_uid=str(report.pod_uid),
         )
+    # Slow executor-Pod observation outside the database connection. The
+    # locked lease CAS inside ``admit_hold`` rechecks exact currency before
+    # any hold commits, so a lease stolen during this read cannot admit.
+    await _attest_worker_claimant(
+        pod_name=report.pod_name,
+        pod_uid=str(report.pod_uid),
+        dependencies=dependencies,
+    )
     job = await dependencies.db.get_job(unit_id)
     try:
         contract = resolve_workspace_contract(job) if job else None
@@ -415,15 +567,22 @@ async def _assemble_claim_bundle(
                 status_code=403, detail="Lease validation failed"
             ) from None
     if row["unit_kind"] == UNIT_KIND_WORKER_BATCH:
-        if workspace_recovery_enabled():
-            async with dependencies.db.acquire() as conn:
-                await _validate_worker_identity(
-                    conn,
-                    unit_id=unit_id,
-                    lease_token=lease_token,
-                    pod_name=pod_name,
-                    pod_uid=pod_uid,
-                )
+        # Initial worker admission before expensive credential assembly.
+        # Unconditional with respect to VM_WORKSPACE_RECOVERY_ENABLED: lease
+        # plus pooled-executor attestation admits the bundle in both flag
+        # states. The slow Pod observation stays outside any write lock; the
+        # final authorization below re-observes both claimant and lease.
+        async with dependencies.db.acquire() as conn:
+            await _validate_worker_lease(
+                conn,
+                unit_id=unit_id,
+                lease_token=lease_token,
+                pod_name=pod_name,
+                pod_uid=pod_uid,
+            )
+        await _attest_worker_claimant(
+            pod_name=pod_name, pod_uid=pod_uid, dependencies=dependencies
+        )
         job = await dependencies.db.get_job(unit_id)
         if not job or job.get("execution_lane") != LANE_STATELESS:
             raise HTTPException(
@@ -599,8 +758,24 @@ async def _assemble_claim_bundle(
         job_start = await job_start_bundle.build_job_start_request(
             attested_job,
             persist_dispatch_state=False,
+            deliver_connector_leases=False,
             dependencies=dependencies.job_start_bundle_dependencies(),
         )
+        if isinstance(job_start, job_start_bundle.JobStartRefusal):
+            # The build stays read-only for a stale claimant; the refusal is
+            # admitted as this lease's terminal report instead. The lease
+            # fence decides, and an admitted report closes the unit, so the
+            # job ends failed with its message and is not claimed again.
+            await _refuse_worker_start(
+                unit_id,
+                reason=job_start.reason,
+                message=job_start.message,
+                lease_token=lease_token,
+                job=job,
+                attestation=initial_attestation,
+                dependencies=dependencies,
+            )
+            raise HTTPException(status_code=409, detail="Job bundle assembly refused")
         if job_start is None:
             raise HTTPException(status_code=409, detail="Job bundle assembly refused")
         job_start = job_start.model_copy(
@@ -617,10 +792,22 @@ async def _assemble_claim_bundle(
             }
         )
 
-        # Credential/config assembly above can take seconds. Repeat the full
-        # control-plane + host-key attestation so a Pod/PVC/Service replacement
-        # during that window never crosses the response boundary under stale
-        # workspace authority.
+        # Credential/config assembly above can take seconds, and the final
+        # claimant observation below is itself a slow external wait. Run that
+        # observation FIRST so the workspace/job/lease/repository revalidation
+        # after it is fresh: an authority change landing mid-claimant-wait
+        # must not ride through on checks that already ran. The residual
+        # cross-system window (claimant replaced during the revalidation reads
+        # themselves) is unavoidable — Kubernetes and Postgres are not one
+        # atomic transaction — and is documented, not hidden; the short
+        # transactional lease recheck before authorization narrows it to
+        # milliseconds for the lease half.
+        await _attest_worker_claimant(
+            pod_name=pod_name, pod_uid=pod_uid, dependencies=dependencies
+        )
+        # Repeat the full control-plane + host-key attestation so a
+        # Pod/PVC/Service replacement during assembly or the claimant wait
+        # never crosses the response boundary under stale workspace authority.
         if assigned_backend == "vm":
             confirmed_attestation = await _attest_recoverable_vm(
                 workspace_owner,
@@ -750,25 +937,77 @@ async def _assemble_claim_bundle(
 
         # Execution evidence is independent of admission policy: a later flag
         # change must never turn an issued bundle into pre-bundle refund debt.
+        # Authorization accounting stays unconditional with respect to
+        # VM_WORKSPACE_RECOVERY_ENABLED.
         if dependencies.recovery_store is None:
             raise HTTPException(503, "Worker bundle authorization is unavailable")
-        async with dependencies.db.acquire() as conn:
-            async with conn.transaction():
-                await _validate_worker_identity(
-                    conn,
-                    unit_id=unit_id,
+        # The fresh claimant observation already ran above, before the final
+        # workspace/job/lease/repository revalidation. Recheck the exact lease
+        # once more under the short transactional boundary below before any
+        # authorization writes: a successful observation before slow work must
+        # not authorize a later stolen lease, and the transactional recheck
+        # keeps that window to milliseconds. The Kubernetes/DB observations
+        # are not one atomic transaction.
+        # A service driver's image is looked up before the claim
+        # transaction opens (D5): inside it the delivery only applies it.
+        # A job's binds were waited for by the dispatcher's preflight (D6),
+        # and its provider-minted credentials minted (C5): the claim never
+        # waits on either.
+        await connector_credential_leases.prepare_lease_delivery(
+            dependencies.db,
+            job_start.datasources,
+            owner=connector_credential_leases.job_lease_owner(job),
+            bind_wait=0,
+        )
+        try:
+            async with dependencies.db.acquire() as conn:
+                async with conn.transaction():
+                    await _validate_worker_lease(
+                        conn,
+                        unit_id=unit_id,
+                        lease_token=lease_token,
+                        pod_name=pod_name,
+                        pod_uid=pod_uid,
+                    )
+                    authorized = (
+                        await dependencies.recovery_store.record_bundle_authorized(
+                            conn,
+                            job_id=UUID(unit_id),
+                            lease_token=lease_token,
+                            authority_digest=initial_runtime_digest,
+                            vm_mode=vm_provisioner.mode,
+                            vm_binding_required=(
+                                assigned_backend == "vm"
+                                and job.get("parent_job_id") is None
+                            ),
+                        )
+                    )
+                    if not authorized:
+                        raise HTTPException(403, "Lease validation failed")
+                    # Credential leases (connector drivers C2), in the claim
+                    # transaction: only the claimant whose run_queue lease was
+                    # just re-checked receives a lease token.
+                    await _deliver_claim_leases(
+                        conn,
+                        job_start.datasources,
+                        owner=connector_credential_leases.job_lease_owner(job),
+                        refusal="Job bundle assembly refused",
+                    )
+        except _ClaimLeasesRefused as refused:
+            # The claim transaction rolled back. A bind or provider mint that
+            # failed for good fails the job, as on the pinned lane; a pending
+            # one and any other delivery error leave the claimant to retry.
+            if isinstance(refused.cause, connector_bind_time.BindTimeRefused):
+                await _refuse_worker_start(
+                    unit_id,
+                    reason="connector_bind_refused",
+                    message=str(refused.cause)[:1000],
                     lease_token=lease_token,
-                    pod_name=pod_name,
-                    pod_uid=pod_uid,
+                    job=job,
+                    attestation=initial_attestation,
+                    dependencies=dependencies,
                 )
-                authorized = await dependencies.recovery_store.record_bundle_authorized(
-                    conn,
-                    job_id=UUID(unit_id),
-                    lease_token=lease_token,
-                    authority_digest=initial_runtime_digest,
-                )
-                if not authorized:
-                    raise HTTPException(403, "Lease validation failed")
+            raise
         return {
             "unit_id": unit_id,
             "job_id": unit_id,
@@ -844,6 +1083,8 @@ async def _assemble_claim_bundle(
         user_id=str(thread["user_id"]) if thread.get("user_id") else None,
         project_id=str(thread["project_id"]) if thread.get("project_id") else None,
         include_kb_profile=include_kb_profile,
+        # The fallback copy; the assembly below checks the resolved config.
+        strict=False,
         dependencies=dependencies.dispatch_credential_dependencies(),
     )
     config_name = canonical_config_name(thread.get("config_name") or "session_base")
@@ -852,12 +1093,19 @@ async def _assemble_claim_bundle(
     # Same serialization the pinned sender takes (_send_session_attach): the
     # assembly must not race a live connector-selection update.
     async with dependencies.db.thread_datasource_lock(unit_id):
-        attach = await session_attach_payload.assemble_session_attach_payload(
-            unit_id,
-            config_override=co,
-            config_name=config_name,
-            dependencies=dependencies.session_attach_payload_dependencies(),
-        )
+        try:
+            attach = await session_attach_payload.assemble_session_attach_payload(
+                unit_id,
+                config_override=co,
+                config_name=config_name,
+                dependencies=dependencies.session_attach_payload_dependencies(),
+            )
+        except ModelUnavailable as unavailable:
+            # Not generic: the agent parks the unit at once with this message
+            # instead of retrying (unavailable_model_handling.md §5).
+            raise HTTPException(
+                status_code=409, detail=unavailable.detail(where=WHERE_SESSION)
+            ) from unavailable
     if attach is None:
         # Generic by design — refusal reasons live in the server log only.
         raise HTTPException(status_code=409, detail="Attach assembly refused")
@@ -873,6 +1121,14 @@ async def _assemble_claim_bundle(
     )
 
     lease_still_current = False
+    pending_memory: dict[str, Any] | None = None
+    # A service driver's image is looked up before the claim transaction
+    # opens and outside the datasource lock (D5).
+    await connector_credential_leases.prepare_lease_delivery(
+        dependencies.db,
+        attach.get("datasources"),
+        owner=connector_credential_leases.LeaseOwner.thread(unit_id),
+    )
     async with dependencies.db.acquire() as conn:
         async with conn.transaction():
             final_thread = await conn.fetchrow(
@@ -964,6 +1220,19 @@ async def _assemble_claim_bundle(
                         claimant_uid,
                     )
                     lease_still_current = bool(stamped)
+                    # Read under the same row lock as the claim stamp: the
+                    # set the previous turn saved (only a lease holder
+                    # writes it, and this claim now holds the lease).
+                    pending_memory = pending_memory_from_metadata(final_metadata)
+                if lease_still_current:
+                    # Credential leases (C2), under the same thread row lock
+                    # and claim stamp: the same token on every turn.
+                    await _deliver_claim_leases(
+                        conn,
+                        attach.get("datasources"),
+                        owner=connector_credential_leases.LeaseOwner.thread(unit_id),
+                        refusal="Attach assembly refused",
+                    )
     if not lease_still_current:
         raise HTTPException(status_code=403, detail="Lease validation failed")
     _t_end = time.perf_counter()
@@ -977,7 +1246,7 @@ async def _assemble_claim_bundle(
         _t_end - _t_start,
     )
 
-    return {
+    bundle: dict[str, Any] = {
         "unit_id": unit_id,
         "thread_id": unit_id,
         "unit_kind": UNIT_KIND_SESSION_TURN,
@@ -986,5 +1255,28 @@ async def _assemble_claim_bundle(
             "input_seq": row["input_seq"],
             "consumed_seq": row["consumed_seq"],
         },
+        # ``attach`` is splatted into the agent's ``_attach_session``, which
+        # has no ``**kwargs``: a key it does not know fails every claim of an
+        # agent image that predates it. Capabilities therefore ride beside
+        # it; this one says the orchestrator settles an abandoned delegation
+        # turn as one batch (parallel_subagents.md §12).
+        SESSION_SUBAGENT_BATCH_SETTLE_CONTRACT_KEY: (
+            SESSION_SUBAGENT_BATCH_SETTLE_CONTRACT
+        ),
+        # The operator's fan-out switch for this lane, read now: the agent
+        # applies it to a warm session at every claim, so turning the setting
+        # off reaches the next claim of every stateless session (§12).
+        SESSION_SUBAGENT_FANOUT_KEY: bool(
+            dependencies.session_subagent_fanout(LANE_STATELESS)
+        ),
         "attach": attach,
     }
+    if pending_memory is not None:
+        # The thread's pending memory set (append-only context injection
+        # WP4, D32/B9): the idle-time prefetch an earlier turn saved, for the
+        # first request of this turn on whichever pod claims it. Beside
+        # ``attach``, never inside it: the set changes at every turn end and
+        # must not change the attach fingerprint (a warm session reads it
+        # from here too, since a warm turn re-reads nothing else).
+        bundle[SESSION_PENDING_MEMORY_KEY] = pending_memory
+    return bundle

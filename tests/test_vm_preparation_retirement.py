@@ -220,8 +220,17 @@ async def test_unallocated_preparation_retirement_requires_positive_receipt(
     provisioner = VMProvisioner()
     provisioner._db = db
     identity = VMTeardownIdentity(generation, None, None)
+    # Absence completes only with whole-runtime proof: a VM 404 alone can race
+    # KubeVirt VMI and virt-launcher deletion.
     provisioner._probe_vm_teardown_identity = AsyncMock(
-        return_value=_VMTeardownProbe("absent", identity, rootdisk_identity_known=True)
+        return_value=_VMTeardownProbe(
+            "absent",
+            identity,
+            rootdisk_identity_known=True,
+            runtime_absence_known=True,
+            vmi_absent=True,
+            launcher_absent=True,
+        )
     )
     provisioner.preparation_operation = AsyncMock(
         return_value={"cancelled": cancelled, "workspaceNeverIssued": proof}

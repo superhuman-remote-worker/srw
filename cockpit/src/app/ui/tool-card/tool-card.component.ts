@@ -103,7 +103,7 @@ export function canvasToolCardContext(
         @if (!view().canvasPresentation && view().subtitle) {
           <span class="tc__hint" [title]="view().subtitle">{{ view().subtitle }}</span>
         }
-        <span class="tc__status" [class]="'tc__status--' + status()">
+        <span class="tc__status" [class]="statusClass()">
           <app-icon size="xs" class="tc__status-icon">{{ statusIcon() }}</app-icon>
           {{ statusLabel() }}
         </span>
@@ -313,12 +313,29 @@ export class AppToolCardComponent implements OnDestroy {
         return this.tr(`toolCard.titles.${this.view().tool}`, this.view().title);
     });
 
+    /** Tone class of the pill: an outcome's tone, else the status's own. */
+    protected readonly statusClass = computed(() => {
+        const outcome = this.view().outcome;
+        return outcome ? `tc__status--tone-${outcome.tone}` : `tc__status--${this.status()}`;
+    });
+
     protected readonly statusLabel = computed(() => {
         this.lang();
+        const outcome = this.view().outcome;
+        if (outcome) return this.transloco.translate(outcome.labelKey);
         return this.tr(`toolCard.status.${this.status()}`, this.status());
     });
 
     protected readonly statusIcon = computed(() => {
+        switch (this.view().outcome?.tone) {
+            case 'neutral':
+                // Never ran: the icon of a gate that went unanswered.
+                return 'do_not_disturb_on';
+            case 'warning':
+                return 'warning';
+            case 'danger':
+                return 'cancel';
+        }
         switch (this.status()) {
             case 'ok':
                 return 'check_circle';

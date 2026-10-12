@@ -1,0 +1,2414 @@
+"""Durable VM creation intent composed with existing cleanup and job authority.
+
+All controller observations are trusted internal inputs after lifecycle MAC and
+correlation validation by the transport adapter. No method performs network I/O.
+"""
+
+from __future__ import annotations
+
+from datetime import timedelta
+import hashlib
+import hmac
+import json
+import random
+import re
+import secrets
+from uuid import UUID, uuid4, uuid5, NAMESPACE_URL
+
+from orchestrator.services.vm_workspace_recovery_store import (
+    VMWorkspaceRecoveryStore,
+    _job_workspace_owner,
+    cleanup_intent_digest,
+)
+from shared.vm_creation_retry import canonical_request_digest, retry_delay_seconds
+from shared.vm_creation_issuance import canonical_configuration_digest
+from shared.vm_creation_unused_grant import (
+    RETRYABLE_NOT_ATTEMPTED_REASON,
+    not_attempted_evidence,
+)
+from shared.worker_queue import hold_worker_batch_for_preflight
+
+
+class VMCreationRetryConflict(RuntimeError):
+    def __init__(self, reason: str):
+        self.reason = reason
+        super().__init__(reason)
+
+
+def _json(value):
+    return json.loads(value) if isinstance(value, str) else value
+
+
+def _record(row):
+    if row is None:
+        return None
+    result = dict(row)
+    # Pre-0278 Job schemas do not carry typed source columns. Keep their
+    # historical Job identity when exercising the unchanged retry protocol.
+    result.setdefault("owner_kind", "job")
+    result.setdefault("thread_id", None)
+    for key in (
+        "canonical_request",
+        "predecessor_evidence",
+        "controller_configuration",
+    ):
+        if key in result:
+            result[key] = _json(result[key])
+    return result
+
+
+def _creation_intent(row):
+    """Complete immutable source-specific identity, including explicit new disk."""
+    if row["owner_kind"] == "thread":
+        return {
+            "owner_kind": "thread",
+            "owner_id": str(row["thread_id"]),
+            "runtime_generation": str(row["thread_runtime_generation"]),
+            "agent_id": str(row["thread_agent_id"]) if row["thread_agent_id"] else None,
+            "attach_token": str(row["thread_attach_token"])
+            if row["thread_attach_token"]
+            else None,
+            "wake_operation_id": str(row["thread_wake_operation_id"])
+            if row["thread_wake_operation_id"]
+            else None,
+            "provision_generation": str(row["provision_generation"]),
+            "request_digest": row["request_digest"],
+            "controller_configuration_digest": row["controller_configuration_digest"],
+            "expected_pvc_uid": str(row["expected_pvc_uid"])
+            if row["expected_pvc_uid"]
+            else None,
+            "source": "controller_vm_create",
+            "request_id": str(row["request_id"]),
+        }
+    return {
+        "job_id": str(row["job_id"]),
+        "provision_generation": str(row["provision_generation"]),
+        "request_digest": row["request_digest"],
+        "controller_configuration_digest": row["controller_configuration_digest"],
+        "expected_pvc_uid": str(row["expected_pvc_uid"])
+        if row["expected_pvc_uid"]
+        else None,
+        "source": "controller_vm_create",
+        "request_id": str(row["request_id"]),
+    }
+
+
+class VMCreationRetryStore:
+    def __init__(self, db, *, _resource_waiter_writer=None):
+        self.db = db
+        self.cleanup = VMWorkspaceRecoveryStore(db)
+        self._resource_waiter_writer = _resource_waiter_writer
+
+    async def _thread_scope(
+        self,
+        conn,
+        source,
+        *,
+        pvc_uid=None,
+        allow_terminal=False,
+    ):
+        """Lock owner, disk, then pinned thread before retry/resource rows."""
+        await conn.execute(
+            "SELECT pg_advisory_xact_lock(hashtextextended($1,0))",
+            f"workspace-recovery:thread:{source['thread_id']}",
+        )
+        if pvc_uid is None:
+            pvc_uid = source["expected_pvc_uid"] or source["observed_pvc_uid"]
+        if pvc_uid is not None:
+            await conn.execute(
+                "SELECT pg_advisory_xact_lock(hashtextextended($1,0))",
+                f"workspace-recovery-pvc:{pvc_uid}",
+            )
+        thread = await conn.fetchrow(
+            "SELECT * FROM threads WHERE id=$1 FOR UPDATE",
+            source["thread_id"],
+        )
+        if thread is None or thread["execution_lane"] != "pinned":
+            raise VMCreationRetryConflict("thread_changed")
+        if allow_terminal:
+            # Only an already-issued effect observer uses this historical
+            # scope. It records public API facts and cannot issue another
+            # effect or reactivate the retired runtime.
+            return {**dict(thread), "context": _json(thread["metadata"]), "priority": 0}
+        metadata = _json(thread["metadata"])
+        vm = metadata.get("vm") if isinstance(metadata, dict) else None
+        if (
+            not isinstance(vm, dict)
+            or thread["runtime_generation"] != source["thread_runtime_generation"]
+            or thread["runtime_retirement_token"] is not None
+            or thread["agent_id"] != source["thread_agent_id"]
+            or thread["runtime_attach_token"] != source["thread_attach_token"]
+            or vm.get("provision_generation") != str(source["provision_generation"])
+            or vm.get("creation_request_id") != str(source["request_id"])
+            or vm.get("status") in {"suspending", "suspended", "deleting", "deleted"}
+            or (
+                not allow_terminal
+                and thread["pinned_idle_terminal_intent_at"] is not None
+            )
+        ):
+            raise VMCreationRetryConflict("thread_changed")
+        inverse_agents = await conn.fetch(
+            "SELECT id FROM agents WHERE thread_id=$1 FOR SHARE",
+            source["thread_id"],
+        )
+        if (
+            source["thread_agent_id"] is None
+            and inverse_agents
+            or source["thread_agent_id"] is not None
+            and (
+                len(inverse_agents) != 1
+                or inverse_agents[0]["id"] != source["thread_agent_id"]
+            )
+        ):
+            raise VMCreationRetryConflict("thread_agent_changed")
+        if source.get(
+            "thread_retained_resume_id"
+        ) is not None and not await conn.fetchval(
+            "SELECT public.valid_vm_thread_retained_resume_source(s) FROM vm_creation_retries s WHERE request_id=$1",
+            source["request_id"],
+        ):
+            raise VMCreationRetryConflict("thread_retained_resume_changed")
+        if source["thread_wake_operation_id"] is not None:
+            operation = await conn.fetchrow(
+                "SELECT * FROM vm_idle_operations WHERE id=$1 FOR SHARE",
+                source["thread_wake_operation_id"],
+            )
+            if (
+                operation is None
+                or operation["owner_kind"] != "thread"
+                or operation["owner_id"] != source["thread_id"]
+                or operation["release_kind"] != "pinned_thread"
+                or operation["wake_request_id"] != source["request_id"]
+                or operation["wake_generation"] != source["provision_generation"]
+                or operation["pvc_uid"] != source["expected_pvc_uid"]
+                or operation["stop_verified_at"] is None
+                or operation["thread_terminal_intent_at"] is not None
+                or operation["closed_at"] is not None
+            ):
+                raise VMCreationRetryConflict("thread_wake_changed")
+        competing = await conn.fetchval(
+            "SELECT EXISTS(SELECT 1 FROM vm_workspace_cleanup_admissions "
+            "WHERE completed_at IS NULL AND id IS DISTINCT FROM $2 "
+            "AND ((owner_kind='thread' AND owner_id=$1) "
+            "OR ($3::uuid IS NOT NULL AND pvc_uid=$3)))",
+            source["thread_id"],
+            source["creation_admission_id"],
+            pvc_uid,
+        )
+        if competing:
+            raise VMCreationRetryConflict("workspace_cleanup_already_admitted")
+        recovery = await conn.fetchval(
+            "SELECT EXISTS(SELECT 1 FROM vm_workspace_recoveries r "
+            "LEFT JOIN vm_workspace_recovery_retention_pins p "
+            "ON p.recovery_id=r.id AND p.released_at IS NULL "
+            "WHERE r.resolved_at IS NULL AND "
+            "((r.owner_kind='thread' AND r.owner_id=$1) "
+            "OR ($2::uuid IS NOT NULL AND p.pvc_uid=$2)))",
+            source["thread_id"],
+            pvc_uid,
+        )
+        if recovery:
+            raise VMCreationRetryConflict("workspace_recovery_held")
+        return {**dict(thread), "context": metadata, "priority": 0}
+
+    async def _scope(
+        self, conn, job_id, pvc_uid, *, own_admission=None, hold_queue=True
+    ):
+        """Owner/PVC -> cleanup/recovery -> queue -> job, never retry -> job."""
+        membership = await conn.fetchrow(
+            "SELECT parent_job_id,context FROM jobs WHERE id=$1", job_id
+        )
+        from orchestrator.services.vm_creation_lineage import discover
+
+        lineage = await discover(conn, job_id)
+        owners = {UUID(v) for v in lineage["owners"]} if lineage else {job_id}
+        if lineage and str(pvc_uid) != lineage["binding"]["pvc_uid"]:
+            raise VMCreationRetryConflict("retained_disk_changed")
+        if membership and membership["parent_job_id"]:
+            owners.add(membership["parent_job_id"])
+        for owner in sorted(owners):
+            await conn.execute(
+                "SELECT pg_advisory_xact_lock(hashtextextended($1,0))",
+                f"workspace-recovery:job:{owner}",
+            )
+        if pvc_uid:
+            await conn.execute(
+                "SELECT pg_advisory_xact_lock(hashtextextended($1,0))",
+                f"workspace-recovery-pvc:{pvc_uid}",
+            )
+        current = await conn.fetchrow(
+            "SELECT parent_job_id,context,execution_lane FROM jobs WHERE id=$1", job_id
+        )
+        if current is None:
+            raise VMCreationRetryConflict("job_changed")
+        owner, ambiguous = _job_workspace_owner(job_id, current)
+        if ambiguous or owner != job_id:
+            raise VMCreationRetryConflict("workspace_owner_changed")
+        guard_owners = sorted(owners if lineage else {job_id})
+        cleanups = await conn.fetch(
+            "SELECT * FROM vm_workspace_cleanup_admissions WHERE completed_at IS NULL "
+            "AND ((owner_kind='job' AND owner_id=ANY($1::uuid[])) OR ($2::uuid IS NOT NULL AND pvc_uid=$2)) ORDER BY id FOR UPDATE",
+            guard_owners,
+            pvc_uid,
+        )
+        competing = [row for row in cleanups if row["id"] != own_admission]
+        if competing:
+            from orchestrator.services.vm_creation_disposition_cleanup import (
+                exact_root_child,
+            )
+
+            disposition = (
+                await conn.fetchval(
+                    "SELECT cancellation_disposition FROM vm_creation_retries WHERE creation_admission_id=$1 AND job_id=$2 AND state='cancel_requested'",
+                    own_admission,
+                    job_id,
+                )
+                if own_admission is not None
+                else None
+            )
+            if disposition is None or any(
+                not exact_root_child(row, _json(disposition)) for row in competing
+            ):
+                raise VMCreationRetryConflict("workspace_cleanup_already_admitted")
+        recovery = await conn.fetchval(
+            "SELECT r.id FROM vm_workspace_recoveries r LEFT JOIN vm_workspace_recovery_retention_pins p "
+            "ON p.recovery_id=r.id AND p.released_at IS NULL WHERE r.resolved_at IS NULL AND "
+            "((r.owner_kind='job' AND r.owner_id=ANY($1::uuid[])) OR ($2::uuid IS NOT NULL AND p.pvc_uid=$2)) LIMIT 1 FOR UPDATE OF r",
+            guard_owners,
+            pvc_uid,
+        )
+        if recovery or await conn.fetchval(
+            "SELECT EXISTS(SELECT 1 FROM vm_workspace_recovery_jobs WHERE job_id=ANY($1::uuid[]) AND resolved_at IS NULL)",
+            guard_owners,
+        ):
+            raise VMCreationRetryConflict("workspace_recovery_held")
+        if lineage:
+            await conn.fetch(
+                "SELECT unit_id FROM run_queue WHERE unit_id=ANY($1::uuid[]) ORDER BY unit_id FOR UPDATE",
+                sorted(owners),
+            )
+        queue = await conn.fetchrow(
+            "SELECT state FROM run_queue WHERE unit_id=$1 FOR UPDATE", job_id
+        )
+        if hold_queue and queue and queue["state"] == "leased":
+            raise VMCreationRetryConflict("worker_lease_active")
+        if current["execution_lane"] == "stateless" and hold_queue:
+            await hold_worker_batch_for_preflight(
+                conn, job_id=job_id, preserve_attempts=True
+            )
+        if lineage:
+            await conn.fetch(
+                "SELECT id FROM jobs WHERE id=ANY($1::uuid[]) ORDER BY id FOR UPDATE",
+                sorted(owners),
+            )
+            await conn.fetch(
+                "SELECT id FROM srw_execution_specs WHERE work_kind='Job' AND work_id=ANY($1::uuid[]) ORDER BY id FOR SHARE",
+                sorted(owners),
+            )
+            if await discover(conn, job_id) != lineage:
+                raise VMCreationRetryConflict("creation_attachment_lineage_unproven")
+            if await conn.fetchval(
+                "SELECT EXISTS(SELECT 1 FROM vm_workspace_recovery_jobs WHERE job_id=ANY($1::uuid[]) AND resolved_at IS NULL)",
+                sorted(owners),
+            ):
+                raise VMCreationRetryConflict("workspace_recovery_held")
+        locked = await conn.fetchrow(
+            "SELECT * FROM jobs WHERE id=$1 FOR UPDATE", job_id
+        )
+        owner, ambiguous = _job_workspace_owner(job_id, locked)
+        if ambiguous or owner != job_id:
+            raise VMCreationRetryConflict("workspace_owner_changed")
+        return (
+            {**dict(locked), "_creation_lineage_scope": lineage} if lineage else locked
+        )
+
+    async def _current(self, conn, job, generation, *, retry=None):
+        if retry is not None and retry.get("owner_kind") == "thread":
+            context = _json(job["context"])
+            vm = context.get("vm") if isinstance(context, dict) else None
+            if (
+                not isinstance(vm, dict)
+                or vm.get("provision_generation") != str(generation)
+                or job["status"]
+                not in {"created", "active", "awaiting_user", "suspended"}
+            ):
+                raise VMCreationRetryConflict("thread_changed")
+            return context, vm, None
+        context = _json(job["context"]) or {}
+        if not isinstance(context, dict):
+            raise VMCreationRetryConflict("creation_request_unproven")
+        vm = context.get("vm") or {}
+        if not isinstance(vm, dict):
+            raise VMCreationRetryConflict("creation_request_unproven")
+        if vm.get("provision_generation") != str(generation):
+            raise VMCreationRetryConflict("generation_changed")
+        if job["status"] in {"completed", "cancelled"} or any(
+            key in context
+            for key in (
+                "_stateless_delete_pending",
+                "_stateless_cancel_cleanup_pending",
+            )
+        ):
+            raise VMCreationRetryConflict("job_cancelled")
+        if vm.get("retirement_cleanup_pending") is True or vm.get("status") in {
+            "retiring_process_zero",
+            "retired",
+            "deleting",
+            "deleted",
+            "delete_failed",
+        }:
+            raise VMCreationRetryConflict("vm_retirement_pending")
+        from orchestrator.database.postgres import _completion_control_active_sql
+
+        if await conn.fetchval(
+            "SELECT ("
+            + _completion_control_active_sql("context")
+            + ") FROM jobs WHERE id=$1",
+            job["id"],
+        ):
+            raise VMCreationRetryConflict("job_control_busy")
+        if await self.db._completion_resume_blocked_on_conn(conn, job["id"]):
+            raise VMCreationRetryConflict("job_completion_pending")
+        execution = await conn.fetchrow(
+            "SELECT *,CASE WHEN resolved->'spec'->>'timeoutSeconds' IS NULL THEN NULL "
+            "ELSE created_at+((resolved->'spec'->>'timeoutSeconds')::double precision * interval '1 second') END AS deadline "
+            "FROM srw_execution_specs WHERE work_kind='Job' AND work_id=$1 FOR SHARE",
+            job["id"],
+        )
+        if not execution or execution["harness_adapter"] != "srw/v1":
+            raise VMCreationRetryConflict("creation_request_unproven")
+        if retry and (
+            execution["id"] != retry["execution_id"]
+            or execution["revision"] != retry["execution_revision"]
+            or execution["generation"] != retry["execution_generation"]
+            or execution["deadline"] != retry["admission_deadline"]
+        ):
+            raise VMCreationRetryConflict("execution_manifest_changed")
+        # A SELECT target expression can run before its FOR UPDATE/SHARE wait.
+        # Read the clock separately after every relevant row is locked.
+        database_now = await conn.fetchval("SELECT clock_timestamp()")
+        if execution["deadline"] and execution["deadline"] <= database_now:
+            raise VMCreationRetryConflict("job_admission_expired")
+        return context, vm, execution
+
+    async def _predecessor(self, conn, job, pvc_uid, proposal):
+        from orchestrator.services.vm_job_retained_resume import (
+            retained_resume_predecessor_on_conn,
+        )
+
+        retained = await retained_resume_predecessor_on_conn(conn, job)
+        if retained is not None:
+            if (
+                str(pvc_uid) != retained["expected_pvc_uid"]
+                or proposal.get("predecessor_cleanup_admission_id")
+                != retained["predecessor_cleanup_admission_id"]
+                or proposal.get("predecessor_evidence")
+                != retained["predecessor_evidence"]
+            ):
+                raise VMCreationRetryConflict("retained_resume_predecessor_changed")
+            return retained["predecessor_evidence"], UUID(
+                retained["predecessor_cleanup_admission_id"]
+            )
+        evidence = proposal.get("predecessor_evidence") or {}
+        old = (_json(job["context"]) or {}).get("last_vm") or {}
+        lineage = job.get("_creation_lineage_scope")
+        if lineage:
+            if old:
+                from orchestrator.services.vm_creation_replacement import (
+                    prove_replacement,
+                )
+
+                return await prove_replacement(
+                    conn,
+                    job=job,
+                    binding=lineage["binding"],
+                    expected=evidence,
+                    cleanup_id=proposal.get("predecessor_cleanup_admission_id"),
+                )
+            from orchestrator.services.vm_creation_lineage import prove
+
+            proof, cleanup_id = await prove(
+                conn,
+                job_id=job["id"],
+                binding=lineage["binding"],
+                scope=lineage,
+                expected=evidence,
+            )
+            if str(cleanup_id) != proposal.get("predecessor_cleanup_admission_id"):
+                raise VMCreationRetryConflict("creation_attachment_lineage_unproven")
+            return proof, cleanup_id
+        return await self._own_predecessor(conn, job, pvc_uid, proposal)
+
+    @staticmethod
+    async def _own_predecessor(conn, job, pvc_uid, proposal):
+        """Existing per-Job process-zero and exact retain-cleanup authority."""
+        evidence = proposal.get("predecessor_evidence") or {}
+        old = (_json(job["context"]) or {}).get("last_vm") or {}
+        if pvc_uid is None:
+            if (
+                old.get("rootdisk_pvc_uid")
+                or evidence
+                or proposal.get("predecessor_cleanup_admission_id")
+            ):
+                raise VMCreationRetryConflict("retained_disk_changed")
+            return {}, None
+        # Evidence must match durable predecessor context, receipt and the full
+        # completed cleanup intent, not a same-name disk or arbitrary receipt.
+        if (
+            old.get("identity_authenticated") is not True
+            or old.get("identity_provision_generation")
+            != old.get("provision_generation")
+            or old.get("rootdisk_pvc_uid") != str(pvc_uid)
+        ):
+            raise VMCreationRetryConflict("creation_request_unproven")
+        if evidence.get("provision_generation") != old.get(
+            "provision_generation"
+        ) or evidence.get("vm_uid") != old.get("vm_uid"):
+            raise VMCreationRetryConflict("creation_request_unproven")
+        receipt = await conn.fetchval(
+            "SELECT id FROM managed_repository_process_zero_receipts WHERE owner_kind='job' AND owner_id=$1 AND scope='vm' AND provisioner='vm' AND runtime_incarnation=$2",
+            job["id"],
+            evidence["provision_generation"],
+        )
+        try:
+            cleanup_id = UUID(str(proposal.get("predecessor_cleanup_admission_id")))
+        except ValueError as exc:
+            raise VMCreationRetryConflict("creation_request_unproven") from exc
+        cleanup = await conn.fetchrow(
+            "SELECT * FROM vm_workspace_cleanup_admissions WHERE id=$1", cleanup_id
+        )
+        if (
+            not receipt
+            or not cleanup
+            or cleanup["completed_at"] is None
+            or cleanup["outcome"] != "completed"
+            or cleanup["owner_kind"] != "job"
+            or cleanup["owner_id"] != job["id"]
+            or cleanup["pvc_uid"] != pvc_uid
+        ):
+            raise VMCreationRetryConflict("predecessor_cleanup_pending")
+        intent = {
+            "owner_kind": "job",
+            "owner_id": str(job["id"]),
+            "provision_generation": evidence["provision_generation"],
+            "vm_uid": evidence["vm_uid"],
+            "pvc_uid": str(pvc_uid),
+            "purge_disk": False,
+            "resource": "vm_workspace",
+            "source": cleanup["source"],
+        }
+        if cleanup_intent_digest(intent) != cleanup["intent_digest"]:
+            raise VMCreationRetryConflict("creation_request_unproven")
+        return {**intent, "receipt_id": str(receipt)}, cleanup_id
+
+    async def admit_on_conn(
+        self,
+        conn,
+        *,
+        job_id: str,
+        expected_generation: str,
+        request_id: str,
+        proposal: dict,
+        lift_operator_pause_hold: str | None = None,
+        resume_context_merge: dict | None = None,
+    ) -> dict:
+        """Admit inside the caller transaction, before any protocol-on initial I/O.
+
+        ``proposal`` is constructed by the trusted initial-create or Resume
+        adapter. Origin alone is not proof that a legacy create never issued;
+        only an existing ledger row supports subsequent same-generation Resume.
+        """
+        job_uuid, generation, request_uuid = (
+            UUID(job_id),
+            UUID(expected_generation),
+            UUID(request_id),
+        )
+        pvc_uid = (
+            UUID(str(proposal["expected_pvc_uid"]))
+            if proposal.get("expected_pvc_uid")
+            else None
+        )
+        prior = await conn.fetchrow(
+            "SELECT * FROM vm_creation_retries WHERE job_id=$1 AND provision_generation=$2",
+            job_uuid,
+            generation,
+        )
+        scope_pvc = pvc_uid or (prior["observed_pvc_uid"] if prior else None)
+        job = await self._scope(
+            conn,
+            job_uuid,
+            scope_pvc,
+            own_admission=prior["creation_admission_id"] if prior else None,
+            hold_queue=not prior or prior["state"] != "succeeded",
+        )
+        context, vm, execution = await self._current(conn, job, generation, retry=prior)
+        if proposal.get("origin") == "resume":
+            await self._validate_resume_on_conn(conn, job, request_uuid)
+        existing = _record(
+            await conn.fetchrow(
+                "SELECT * FROM vm_creation_retries WHERE job_id=$1 AND provision_generation=$2 FOR UPDATE",
+                job_uuid,
+                generation,
+            )
+        )
+        snapshot = vm.get("creation_request") or {}
+        if not isinstance(snapshot, dict):
+            raise VMCreationRetryConflict("creation_request_unproven")
+        payload = snapshot.get("request")
+        digest = proposal.get("request_digest")
+        config_digest = proposal.get("controller_configuration_digest")
+        if (
+            not isinstance(payload, dict)
+            or type(snapshot.get("version")) is not int
+            or snapshot.get("version") != 1
+            or snapshot.get("provision_generation") != str(generation)
+            or payload.get("job_id") != str(job_uuid)
+            or payload.get("entity_type") != "job"
+            or payload.get("provision_generation") != str(generation)
+            or snapshot.get("request_digest") != digest
+            or canonical_request_digest(payload) != digest
+            or snapshot.get("controller_configuration_authenticated") is not True
+            or snapshot.get("controller_configuration_digest") != config_digest
+            or not config_digest
+        ):
+            raise VMCreationRetryConflict("creation_request_unproven")
+        configuration = snapshot.get("controller_configuration")
+        if (
+            configuration is not None
+            and canonical_configuration_digest(configuration) != config_digest
+        ):
+            raise VMCreationRetryConflict("creation_configuration_changed")
+        resource_writer = self._resource_waiter_writer
+        if resource_writer is None:
+            from orchestrator.services.vm_resource_job_runtime import (
+                installed_job_resource_store,
+            )
+
+            resource_writer = await installed_job_resource_store(
+                conn,
+                self.db,
+                configuration,
+            )
+        storage = payload.get("workspace_storage")
+        if job.get("_creation_lineage_scope") and (
+            storage != job["_creation_lineage_scope"]["binding"]
+        ):
+            raise VMCreationRetryConflict("creation_attachment_lineage_unproven")
+        if storage is not None and (
+            not isinstance(storage, dict)
+            or storage.get("pvc_uid") != (str(pvc_uid) if pvc_uid else None)
+        ):
+            raise VMCreationRetryConflict("retained_disk_changed")
+        # Ordinary per-job retained rootdisks have no workspace_storage binding.
+        # Their expected PVC still requires the exact predecessor receipt and
+        # cleanup chain checked below; absence of a binding is not new-disk proof.
+        if existing:
+            if (
+                existing["observed_pvc_uid"]
+                and existing["observed_pvc_uid"] != scope_pvc
+            ):
+                raise VMCreationRetryConflict("retry_identity_changed")
+            await self._current(conn, job, generation, retry=existing)
+            if (
+                existing["request_digest"] != digest
+                or existing["controller_configuration_digest"] != config_digest
+                or existing["expected_pvc_uid"] != pvc_uid
+            ):
+                raise VMCreationRetryConflict("creation_request_changed")
+            if existing["state"] in {"cancel_requested", "settled"}:
+                raise VMCreationRetryConflict("job_cancelled")
+            if proposal.get("origin") == "resume" and existing["state"] == "succeeded":
+                raise VMCreationRetryConflict("creation_already_adopted")
+            if existing["state"] == "attention":
+                existing = _record(
+                    await conn.fetchrow(
+                        "UPDATE vm_creation_retries SET state='queued',revision=revision+1,next_probe_at=clock_timestamp(),transport_outage_started_at=NULL,reason=NULL,backoff_attempt=0,updated_at=clock_timestamp() WHERE request_id=$1 RETURNING *",
+                        existing["request_id"],
+                    )
+                )
+            if existing["state"] != "succeeded":
+                if resource_writer is not None:
+                    await resource_writer._write_waiter_on_conn(
+                        conn, retry=existing, job=job, create=False
+                    )
+                if proposal.get("idle_wake_id") is not None:
+                    await self._validate_idle_wake_on_conn(
+                        conn,
+                        job,
+                        proposal["idle_wake_id"],
+                        generation,
+                        request_uuid,
+                    )
+                else:
+                    await self._resume_on_conn(
+                        conn,
+                        job,
+                        existing["request_id"],
+                        lift_operator_pause_hold=lift_operator_pause_hold,
+                        context_merge=resume_context_merge,
+                    )
+            return existing
+        from orchestrator.services.vm_job_retained_resume import operation_on_conn
+
+        retained_resume = await operation_on_conn(conn, job)
+        if (
+            proposal.get("origin")
+            != ("resume" if retained_resume is not None else "initial")
+            or snapshot.get("initial_request") is not True
+        ):
+            raise VMCreationRetryConflict("creation_request_unproven")
+        if job["status"] != proposal.get("expected_status"):
+            raise VMCreationRetryConflict("job_changed")
+        if proposal.get("idle_wake_id") is not None:
+            await self._validate_idle_wake_on_conn(
+                conn,
+                job,
+                proposal["idle_wake_id"],
+                generation,
+                request_uuid,
+            )
+        predecessor, predecessor_id = await self._predecessor(
+            conn, job, pvc_uid, proposal
+        )
+        if job.get("_creation_lineage_scope"):
+            from orchestrator.services.vm_creation_prepared_lineage import (
+                validate_prepared_request,
+            )
+
+            validate_prepared_request(predecessor, payload, configuration)
+
+        retained_columns = (
+            ",job_retained_resume_id" if retained_resume is not None else ""
+        )
+        retained_values = ",$15" if retained_resume is not None else ""
+        origin = "resume" if retained_resume is not None else "initial"
+        row = await conn.fetchrow(
+            "INSERT INTO vm_creation_retries(request_id,job_id,provision_generation,origin,request_digest,canonical_request,controller_configuration_digest,execution_id,execution_revision,execution_generation,admission_deadline,expected_pvc_uid,predecessor_evidence,predecessor_cleanup_admission_id,controller_configuration"
+            + retained_columns
+            + ") "
+            + f"VALUES($1,$2,$3,'{origin}',$4,$5::jsonb,$6,$7,$8,$9,$10,$11,$12::jsonb,$13,$14::jsonb{retained_values}) RETURNING *",
+            request_uuid,
+            job_uuid,
+            generation,
+            digest,
+            json.dumps(payload),
+            config_digest,
+            execution["id"],
+            execution["revision"],
+            execution["generation"],
+            execution["deadline"],
+            pvc_uid,
+            json.dumps(predecessor),
+            predecessor_id,
+            json.dumps(configuration) if configuration is not None else None,
+            *([retained_resume["id"]] if retained_resume is not None else []),
+        )
+        retry = _record(row)
+        if resource_writer is not None:
+            await resource_writer._write_waiter_on_conn(
+                conn, retry=retry, job=job, create=True
+            )
+        if proposal.get("idle_wake_id") is None:
+            await self._resume_on_conn(conn, job, request_uuid)
+        return retry
+
+    async def _validate_idle_wake_on_conn(
+        self, conn, job, operation_id, generation, request_id
+    ):
+        """A human-wait create is permitted only by its exact stopped operation."""
+        try:
+            operation_uuid = UUID(str(operation_id))
+            if str(operation_uuid) != operation_id:
+                raise ValueError
+        except (TypeError, ValueError) as exc:
+            raise VMCreationRetryConflict("idle_wake_unproven") from exc
+        context = _json(job["context"]) or {}
+        vm = context.get("vm") or {}
+        old = context.get("last_vm") or {}
+        operation = await conn.fetchrow(
+            "SELECT * FROM vm_idle_operations WHERE id=$1 AND owner_kind='job' "
+            "AND owner_id=$2 AND closed_at IS NULL FOR UPDATE",
+            operation_uuid,
+            job["id"],
+        )
+        if (
+            operation is None
+            or operation["phase"] not in {"waking", "wake_held"}
+            or operation["stop_verified_at"] is None
+            or operation["wake_generation"] != generation
+            or operation["wake_request_id"] != request_id
+            or job["status"] not in {"waiting_for_reply", "pending_review", "paused"}
+            or job["assigned_agent_id"] is not None
+            or vm.get("idle_wake_operation_id") != operation_id
+            or vm.get("provision_generation") != str(generation)
+            or old.get("provision_generation") != str(operation["provision_generation"])
+            or old.get("vm_uid") != str(operation["vm_uid"])
+            or old.get("rootdisk_pvc_uid") != str(operation["pvc_uid"])
+            or context.get("_vm_creation_pending") != str(request_id)
+        ):
+            raise VMCreationRetryConflict("idle_wake_unproven")
+
+    async def _validate_resume_on_conn(self, conn, job, request_uuid):
+        """Recheck public Resume authority after the canonical scope/job wait."""
+        if (
+            job["status"] not in {"created", "paused", "failed"}
+            or job["assigned_agent_id"] is not None
+        ):
+            raise VMCreationRetryConflict("job_changed")
+        if (_json(job["context"]) or {}).get("_vm_creation_pending") != str(
+            request_uuid
+        ):
+            raise VMCreationRetryConflict("creation_request_unproven")
+        # A foreign owner's recovery may enroll this participant while _scope
+        # waits for its job row. Read after that wait before requeueing anything.
+        if await conn.fetchval(
+            "SELECT EXISTS(SELECT 1 FROM vm_workspace_recovery_jobs WHERE job_id=$1 AND resolved_at IS NULL)",
+            job["id"],
+        ):
+            raise VMCreationRetryConflict("workspace_recovery_held")
+
+    async def _resume_on_conn(
+        self,
+        conn,
+        job,
+        request_uuid,
+        *,
+        lift_operator_pause_hold: str | None = None,
+        context_merge: dict | None = None,
+    ):
+        queued = await self.db._queue_job_for_resume_on_conn(
+            conn,
+            job["id"],
+            {**(context_merge or {}), "_vm_creation_pending": str(request_uuid)},
+            void_completion_decision=False,
+            stateless_only=job["execution_lane"] == "stateless",
+            expected_status=str(job["status"]),
+            completion_commands_enabled=True,
+            lift_operator_pause_hold=lift_operator_pause_hold,
+        )
+        if queued is None:
+            raise VMCreationRetryConflict("job_control_busy")
+
+    async def claim_due(self, *, limit: int) -> list[dict]:
+        if type(limit) is not int or not 1 <= limit <= 100:
+            raise ValueError("Invalid creation claim batch size")
+        async with self.db.acquire() as conn:
+            async with conn.transaction():
+                rows = await conn.fetch(
+                    "SELECT request_id FROM vm_creation_retries WHERE state IN ('queued','reconciling','cancel_requested') AND next_probe_at<=clock_timestamp() AND (claim_expires_at IS NULL OR claim_expires_at<=clock_timestamp()) ORDER BY next_probe_at,request_id LIMIT $1 FOR UPDATE SKIP LOCKED",
+                    limit,
+                )
+                result = []
+                for row in rows:
+                    result.append(
+                        _record(
+                            await conn.fetchrow(
+                                "UPDATE vm_creation_retries SET state=CASE WHEN state='cancel_requested' THEN state ELSE 'reconciling' END,revision=revision+1,claim_token=$2,claim_expires_at=clock_timestamp()+interval '60 seconds',updated_at=clock_timestamp() WHERE request_id=$1 RETURNING *",
+                                row["request_id"],
+                                uuid4(),
+                            )
+                        )
+                    )
+                return result
+
+    async def idle_wake_access_scope_on_conn(
+        self,
+        conn,
+        *,
+        owner_id,
+        pvc_uid,
+        reservation_request_id,
+        intent_digest,
+    ):
+        """Prove the one native successor whose waiting access cannot use old compute.
+
+        Caller already owns the canonical owner/PVC and Job locks. Derive all
+        authority from persisted rows; a source label alone grants no exemption.
+        """
+        from orchestrator.services.vm_creation_preflight import (
+            _preflight,
+            _execution_binding,
+        )
+
+        job = await conn.fetchrow("SELECT * FROM jobs WHERE id=$1", owner_id)
+        if job is None:
+            return None
+        try:
+            context = _json(job["context"]) or {}
+            vm = context.get("vm") or {}
+            prior = _preflight(vm)
+            if not prior or prior["state"] != "admitted" or pvc_uid is None:
+                return None
+            row = _record(
+                await conn.fetchrow(
+                    "SELECT * FROM vm_creation_retries WHERE request_id=$1",
+                    UUID(prior["request_id"]),
+                )
+            )
+            now = await conn.fetchval("SELECT clock_timestamp()")
+            if (
+                row is None
+                or row["owner_kind"] != "job"
+                or row["job_id"] != owner_id
+                or row["state"] != "reconciling"
+                or row["claim_token"] is None
+                or row["claim_expires_at"] is None
+                or row["claim_expires_at"] <= now
+                or row["expected_pvc_uid"] != pvc_uid
+                or prior.get("expected_pvc_uid") != str(pvc_uid)
+                or prior["request"] != row["canonical_request"]
+                or prior["request_digest"] != row["request_digest"]
+                or canonical_request_digest(row["canonical_request"])
+                != row["request_digest"]
+                or canonical_configuration_digest(row["controller_configuration"])
+                != row["controller_configuration_digest"]
+                or _execution_binding(prior)
+                != {
+                    key: row[key]
+                    for key in (
+                        "execution_id",
+                        "execution_revision",
+                        "execution_generation",
+                        "admission_deadline",
+                    )
+                }
+                or reservation_request_id
+                != uuid5(NAMESPACE_URL, "vm-create:" + str(row["request_id"]))
+                or cleanup_intent_digest(_creation_intent(row)) != intent_digest
+            ):
+                return None
+            await self._current(conn, job, row["provision_generation"], retry=row)
+            operation_id = vm.get("idle_wake_operation_id")
+            await self._validate_idle_wake_on_conn(
+                conn,
+                job,
+                operation_id,
+                row["provision_generation"],
+                row["request_id"],
+            )
+            operation = await conn.fetchrow(
+                "SELECT * FROM vm_idle_operations WHERE id=$1",
+                UUID(operation_id),
+            )
+            old = context.get("last_vm") or {}
+            evidence = _json(operation["stop_evidence"]) or {}
+            expected = {
+                "operation_id": str(operation["id"]),
+                "generation": str(operation["provision_generation"]),
+                "vm_uid": str(operation["vm_uid"]),
+                "vmi_uid": str(operation["vmi_uid"]),
+                "launcher_uid": str(operation["launcher_uid"]),
+                "pvc_uid": str(operation["pvc_uid"]),
+            }
+            if (
+                operation["wake_id"] is None
+                or operation["pvc_uid"] != pvc_uid
+                or operation["retained_kind"] != "rootdisk"
+                or operation["wake_ready_at"] is not None
+                or old.get("status") != "suspended"
+                or old.get("rootdisk") != "kept"
+                or evidence.get("version") != 1
+                or evidence.get("kind") != "vm_idle_physical_stop"
+                or any(evidence.get(key) != value for key, value in expected.items())
+                or any(
+                    evidence.get(key) is not True
+                    for key in (
+                        "vm_absent",
+                        "vmi_absent",
+                        "launcher_absent",
+                        "retained_pvc",
+                        "controller_authenticated",
+                    )
+                )
+                or evidence.get("same_generation_replacement") is not False
+            ):
+                return None
+            predecessor, cleanup_id = await self._own_predecessor(
+                conn, job, pvc_uid, prior
+            )
+            if (
+                predecessor != row["predecessor_evidence"]
+                or cleanup_id != row["predecessor_cleanup_admission_id"]
+            ):
+                return None
+            return {
+                key: operation[key]
+                for key in ("wake_id", "provision_generation", "vm_uid")
+            }
+        except (
+            VMCreationRetryConflict,
+            ValueError,
+            KeyError,
+            TypeError,
+            AttributeError,
+        ):
+            return None
+
+    async def authorize_controller(
+        self, *, request_id: str, claim_token: str, observed: dict
+    ) -> dict:
+        try:
+            async with self.db.acquire() as conn:
+                async with conn.transaction():
+                    row = _record(
+                        await conn.fetchrow(
+                            "SELECT * FROM vm_creation_retries WHERE request_id=$1",
+                            UUID(request_id),
+                        )
+                    )
+                    if row is None:
+                        raise VMCreationRetryConflict("retry_request_missing")
+                    if row["state"] != "reconciling":
+                        raise VMCreationRetryConflict("retry_claim_changed")
+                    scope_pvc = row["expected_pvc_uid"] or row["observed_pvc_uid"]
+                    job = (
+                        await self._thread_scope(conn, row)
+                        if row["owner_kind"] == "thread"
+                        else await self._scope(
+                            conn,
+                            row["job_id"],
+                            scope_pvc,
+                            own_admission=row["creation_admission_id"],
+                        )
+                    )
+                    await self._current(
+                        conn, job, row["provision_generation"], retry=row
+                    )
+                    row = _record(
+                        await conn.fetchrow(
+                            "SELECT * FROM vm_creation_retries WHERE request_id=$1 FOR UPDATE",
+                            UUID(request_id),
+                        )
+                    )
+                    if (
+                        row["expected_pvc_uid"] or row["observed_pvc_uid"]
+                    ) != scope_pvc:
+                        raise VMCreationRetryConflict("retry_identity_changed")
+                    database_now = await conn.fetchval("SELECT clock_timestamp()")
+                    if (
+                        row["state"] != "reconciling"
+                        or row["claim_token"] != UUID(claim_token)
+                        or row["claim_expires_at"] <= database_now
+                    ):
+                        raise VMCreationRetryConflict("retry_claim_changed")
+                    expected = {
+                        "job_id": str(
+                            row["thread_id"]
+                            if row["owner_kind"] == "thread"
+                            else row["job_id"]
+                        ),
+                        "provision_generation": str(row["provision_generation"]),
+                        "request_digest": row["request_digest"],
+                        "controller_configuration_digest": row[
+                            "controller_configuration_digest"
+                        ],
+                        "expected_pvc_uid": str(row["expected_pvc_uid"])
+                        if row["expected_pvc_uid"]
+                        else None,
+                    }
+                    if any(
+                        key not in observed or observed[key] != value
+                        for key, value in expected.items()
+                    ):
+                        raise VMCreationRetryConflict("creation_request_changed")
+                    from orchestrator.services.vm_resource_job_runtime import (
+                        installed_job_resource_store,
+                    )
+                    from shared.vm_resource_admission import ResourceAdmissionError
+
+                    try:
+                        resource = await installed_job_resource_store(
+                            conn,
+                            self.db,
+                            row["controller_configuration"],
+                        )
+                        resource_grant = (
+                            await resource.grant_on_conn(
+                                conn,
+                                retry=row,
+                                job=job,
+                            )
+                            if resource is not None
+                            else None
+                        )
+                    except ResourceAdmissionError as exc:
+                        raise VMCreationRetryConflict(str(exc)) from None
+                    # _scope already owns all owner/PVC and cleanup/recovery locks.
+                    # The helper reacquires those same locks, never another scope.
+                    intent = _creation_intent(row)
+                    reservation_request = uuid5(
+                        NAMESPACE_URL, "vm-create:" + request_id
+                    )
+                    permit = await self.cleanup.acquire_cleanup_permit_on_conn(
+                        conn,
+                        owner_kind=row["owner_kind"],
+                        owner_id=(
+                            row["thread_id"]
+                            if row["owner_kind"] == "thread"
+                            else row["job_id"]
+                        ),
+                        pvc_uid=scope_pvc,
+                        request_id=reservation_request,
+                        source="controller_vm_create",
+                        intent_digest=cleanup_intent_digest(intent),
+                        revalidate_completed=True,
+                    )
+                    if not permit.allowed or permit.completed_outcome is not None:
+                        raise VMCreationRetryConflict(
+                            permit.reason or "creation_reservation_completed"
+                        )
+                    # The composed permit helper can itself wait for a row.
+                    # Expiry here must roll back its tentative admission too.
+                    database_now = await conn.fetchval("SELECT clock_timestamp()")
+                    if row["claim_expires_at"] <= database_now:
+                        raise VMCreationRetryConflict("retry_claim_changed")
+                    if (
+                        row["admission_deadline"]
+                        and row["admission_deadline"] <= database_now
+                    ):
+                        raise VMCreationRetryConflict("job_admission_expired")
+                    await conn.execute(
+                        "UPDATE vm_creation_retries SET creation_admission_id=$2,updated_at=clock_timestamp() WHERE request_id=$1",
+                        row["request_id"],
+                        permit.admission_id,
+                    )
+                    return {
+                        "allowed": True,
+                        "admission_id": permit.admission_id,
+                        "request_id": str(reservation_request),
+                        "intent_digest": cleanup_intent_digest(intent),
+                        **(
+                            {"resource_grant": resource_grant} if resource_grant else {}
+                        ),
+                    }
+        except VMCreationRetryConflict as exc:
+            return {"allowed": False, "reason": exc.reason}
+
+    async def request_cancel_on_conn(
+        self, conn, *, job_id: str, expected_generation: str
+    ) -> bool:
+        return await conn.fetchval(
+            "SELECT request_vm_creation_retry_cancel($1,$2)",
+            UUID(job_id),
+            expected_generation,
+        )
+
+    async def apply_observation(
+        self,
+        *,
+        request_id: str,
+        claim_token: str,
+        expected_revision: int,
+        observation: dict,
+    ) -> bool:
+        # Scheduling observations retain authority. Exact effect settlement is
+        # separate and cannot be inferred from this observer's transport reply.
+        outcome = observation.get("outcome")
+        if outcome not in {
+            "transport_unknown",
+            "capacity_wait",
+            "dependency_wait",
+            "observation_wait",
+            "blocked",
+        }:
+            raise ValueError(
+                "Creation settlement requires authenticated controller integration"
+            )
+        async with self.db.acquire() as conn:
+            async with conn.transaction():
+                row = await conn.fetchrow(
+                    "SELECT * FROM vm_creation_retries WHERE request_id=$1 FOR UPDATE",
+                    UUID(request_id),
+                )
+                database_now = await conn.fetchval("SELECT clock_timestamp()")
+                if (
+                    not row
+                    or row["claim_token"] != UUID(claim_token)
+                    or row["revision"] != expected_revision
+                    or row["claim_expires_at"] <= database_now
+                    or row["state"] not in {"reconciling", "cancel_requested"}
+                ):
+                    return False
+                attempt = row["backoff_attempt"] + 1
+                outage = (
+                    (row["transport_outage_started_at"] or database_now)
+                    if outcome == "transport_unknown"
+                    else None
+                )
+                attention = outcome == "blocked" or (
+                    outage is not None
+                    and database_now - outage >= timedelta(seconds=900)
+                )
+                state = (
+                    "cancel_requested"
+                    if row["state"] == "cancel_requested"
+                    else "attention"
+                    if attention
+                    else "reconciling"
+                    if outcome == "transport_unknown"
+                    else "queued"
+                )
+                reason = {
+                    "transport_unknown": "controller_unavailable",
+                    "capacity_wait": "capacity_wait",
+                    "dependency_wait": "creation_dependency_pending",
+                    "observation_wait": "creation_observation_pending",
+                    "blocked": "vm_creation_retry_blocked",
+                }[outcome]
+                if outcome == "capacity_wait":
+                    # This producer sees the signed controller result or the
+                    # local resource admission result. Keep only the bounded
+                    # source. Historical `capacity_wait` rows lack provenance
+                    # and must remain unknown in the owner projection.
+                    if observation.get("source") == "resource_admission":
+                        reason = (
+                            "resource_wait"
+                            if observation.get("reason") == "resource_wait"
+                            else "resource_unavailable"
+                        )
+                    elif observation.get("reason") == "capacity_wait":
+                        reason = "controller_count_wait"
+                if outcome == "dependency_wait" and observation.get("reason") in (
+                    "golden_wait",
+                    "preparation_wait",
+                    "headscale_wait",
+                    "disk_wait",
+                ):
+                    reason = observation["reason"]
+                await conn.execute(
+                    "UPDATE vm_creation_retries SET state=$2,revision=revision+1,claim_token=CASE WHEN $7 THEN claim_token ELSE NULL END,claim_expires_at=CASE WHEN $7 THEN claim_expires_at ELSE NULL END,backoff_attempt=$3,transport_outage_started_at=$4,reason=$5,next_probe_at=clock_timestamp()+$6*interval '1 second',updated_at=clock_timestamp() WHERE request_id=$1",
+                    row["request_id"],
+                    state,
+                    attempt,
+                    outage,
+                    reason,
+                    retry_delay_seconds(attempt, random.uniform(0, 0.2)),
+                    state == "reconciling",
+                )
+                return True
+
+    @staticmethod
+    def _carrier(carrier):
+        from shared.vm_creation_issuance import verify_creation_carrier
+        from shared.vm_lifecycle_auth import configured_secret
+
+        return verify_creation_carrier(carrier, secret=configured_secret())
+
+    async def _effect_scope(
+        self,
+        conn,
+        request_id,
+        *,
+        observed_pvc=None,
+        allow_terminal=False,
+    ):
+        row = _record(
+            await conn.fetchrow(
+                "SELECT * FROM vm_creation_retries WHERE request_id=$1",
+                UUID(request_id),
+            )
+        )
+        if row is None:
+            raise VMCreationRetryConflict("retry_request_missing")
+        scope_pvc = row["expected_pvc_uid"] or row["observed_pvc_uid"] or observed_pvc
+        job = (
+            await self._thread_scope(
+                conn,
+                row,
+                pvc_uid=scope_pvc,
+                allow_terminal=allow_terminal,
+            )
+            if row["owner_kind"] == "thread"
+            else await self._scope(
+                conn,
+                row["job_id"],
+                scope_pvc,
+                own_admission=row["creation_admission_id"],
+                hold_queue=False,
+            )
+        )
+        locked = _record(
+            await conn.fetchrow(
+                "SELECT * FROM vm_creation_retries WHERE request_id=$1 FOR UPDATE",
+                row["request_id"],
+            )
+        )
+        if (
+            locked["observed_pvc_uid"] and locked["observed_pvc_uid"] != scope_pvc
+        ) or locked["creation_admission_id"] != row["creation_admission_id"]:
+            raise VMCreationRetryConflict("retry_identity_changed")
+        if not (allow_terminal and row["owner_kind"] == "thread") and (
+            ((_json(job["context"]) or {}).get("vm") or {}).get("provision_generation")
+            != str(row["provision_generation"])
+        ):
+            raise VMCreationRetryConflict("generation_changed")
+        return locked, job
+
+    async def _check_carrier(
+        self, conn, row, carrier, values, *, allow_completed=False
+    ):
+        from shared.vm_workspace_storage import storage_name
+
+        configuration = row["controller_configuration"]
+        if configuration is None:
+            raise VMCreationRetryConflict("creation_configuration_unproven")
+        if configuration.get("persistent_rootdisk") is not True:
+            raise VMCreationRetryConflict("retry_protocol_unavailable")
+        if (
+            canonical_configuration_digest(configuration)
+            != row["controller_configuration_digest"]
+            or configuration["namespace"] != carrier["metadata"]["namespace"]
+        ):
+            raise VMCreationRetryConflict("creation_configuration_changed")
+        if (configuration["version"] == 3) != (values["version"] in (4, 5)):
+            raise VMCreationRetryConflict("resource_carrier_changed")
+        if values["version"] in (3, 5):
+            from shared.vm_creation_attachment import validate_attachment_intent
+
+            try:
+                validate_attachment_intent(
+                    values["workspace_attachment"],
+                    request=row["canonical_request"],
+                    expected_pvc_uid=str(row["expected_pvc_uid"])
+                    if row["expected_pvc_uid"]
+                    else None,
+                )
+            except (ValueError, KeyError, TypeError) as exc:
+                raise VMCreationRetryConflict("creation_attachment_changed") from exc
+            original = await conn.fetchval(
+                "SELECT carrier_intent FROM vm_creation_effects WHERE request_id=$1 ORDER BY effect_number LIMIT 1",
+                row["request_id"],
+            )
+            if (
+                original
+                and _json(original).get("workspace_attachment")
+                != values["workspace_attachment"]
+            ):
+                raise VMCreationRetryConflict("creation_attachment_changed")
+        if (
+            values["version"] in (2, 3, 4, 5)
+            and values["effect_kind"] != "workspace_attach"
+        ):
+            from shared.vm_creation_issuance import validate_rootdisk_source
+
+            try:
+                validate_rootdisk_source(
+                    values["rootdisk_source"],
+                    request=row["canonical_request"],
+                    configuration=configuration,
+                    expected_pvc_uid=str(row["expected_pvc_uid"])
+                    if row["expected_pvc_uid"]
+                    else None,
+                )
+            except (ValueError, KeyError, TypeError) as exc:
+                raise VMCreationRetryConflict(
+                    "creation_rootdisk_source_changed"
+                ) from exc
+            source = values["rootdisk_source"]
+            from orchestrator.services.vm_creation_prepared_lineage import (
+                prepared_origin,
+            )
+
+            origin = prepared_origin(row["predecessor_evidence"])
+            if origin is not None or source.get("inherited_origin") is not None:
+                from shared.vm_inherited_preparation import retained_prepared_source
+
+                if origin is None or source != retained_prepared_source(origin):
+                    raise VMCreationRetryConflict("creation_rootdisk_source_changed")
+            if (
+                source.get("kind") == "prepared"
+                and source.get("mode") == "retained"
+                and source["retained_root"]["dv_uid"] != values["retained_dv_uid"]
+            ):
+                raise VMCreationRetryConflict("creation_rootdisk_source_changed")
+            original = await conn.fetchval(
+                "SELECT carrier_intent FROM vm_creation_effects WHERE request_id=$1 AND effect_kind='rootdisk' ORDER BY effect_number LIMIT 1",
+                row["request_id"],
+            )
+            if (
+                original
+                and _json(original).get("rootdisk_source") != values["rootdisk_source"]
+            ):
+                raise VMCreationRetryConflict("creation_rootdisk_source_changed")
+        expected = {
+            "retry_request_id": str(row["request_id"]),
+            "job_id": str(
+                row["thread_id"] if row["owner_kind"] == "thread" else row["job_id"]
+            ),
+            "provision_generation": str(row["provision_generation"]),
+            "request_digest": row["request_digest"],
+            "controller_configuration_digest": row["controller_configuration_digest"],
+            "expected_pvc_uid": str(row["expected_pvc_uid"])
+            if row["expected_pvc_uid"]
+            else None,
+        }
+        if row["owner_kind"] == "thread":
+            expected.update(
+                owner_kind="thread",
+                thread_runtime_generation=str(row["thread_runtime_generation"]),
+                thread_agent_id=str(row["thread_agent_id"])
+                if row["thread_agent_id"]
+                else None,
+                thread_attach_token=str(row["thread_attach_token"])
+                if row["thread_attach_token"]
+                else None,
+                thread_wake_operation_id=str(row["thread_wake_operation_id"])
+                if row["thread_wake_operation_id"]
+                else None,
+            )
+        elif values.get("owner_kind") is not None:
+            raise VMCreationRetryConflict("creation_carrier_changed")
+        if any(values[key] != value for key, value in expected.items()) or values[
+            "admission_id"
+        ] != str(row["creation_admission_id"]):
+            raise VMCreationRetryConflict("creation_carrier_changed")
+        permit = await self._creation_permit_on_conn(
+            conn, row, allow_completed=allow_completed
+        )
+        if (
+            values["reservation_request_id"] != str(permit["request_id"])
+            or values["intent_digest"] != permit["intent_digest"]
+        ):
+            raise VMCreationRetryConflict("creation_reservation_changed")
+        metadata = carrier["metadata"]
+        if row["creation_carrier_uid"] is not None and (
+            str(row["creation_carrier_uid"]) != metadata["uid"]
+            or row["creation_carrier_namespace"] != metadata["namespace"]
+        ):
+            raise VMCreationRetryConflict("creation_carrier_changed")
+        binding = row["canonical_request"].get("workspace_storage")
+        name = (
+            storage_name(binding)
+            if binding
+            else f"agent-vm-{row['thread_id'] if row['owner_kind'] == 'thread' else row['job_id']}-rootdisk"
+        )
+        if (
+            values["effect_kind"] in {"rootdisk", "workspace_attach"}
+            and values["object_name"] != name
+        ):
+            raise VMCreationRetryConflict("retained_disk_changed")
+        return permit
+
+    async def _creation_permit_on_conn(self, conn, row, *, allow_completed=False):
+        """Validate the original source admission; never allocate another permit."""
+        permit = await conn.fetchrow(
+            "SELECT * FROM vm_workspace_cleanup_admissions WHERE id=$1",
+            row["creation_admission_id"],
+        )
+        # Agreement between two supplied hashes is not authority. Recompute the
+        # complete source-specific reservation intent from immutable DB fields.
+        intent = _creation_intent(row)
+        reservation_request = uuid5(
+            NAMESPACE_URL, "vm-create:" + str(row["request_id"])
+        )
+        if (
+            not permit
+            or (permit["completed_at"] is not None and not allow_completed)
+            or permit["source"] != "controller_vm_create"
+            or permit["owner_kind"] != row["owner_kind"]
+            or permit["owner_id"]
+            != (row["thread_id"] if row["owner_kind"] == "thread" else row["job_id"])
+            or permit["pvc_uid"] != (row["expected_pvc_uid"] or row["observed_pvc_uid"])
+            or permit["request_id"] != reservation_request
+            or permit["intent_digest"] != cleanup_intent_digest(intent)
+        ):
+            raise VMCreationRetryConflict("creation_reservation_changed")
+        if row.get("job_retained_resume_id") is not None and not await conn.fetchval(
+            "SELECT c.retained_resume_admitted_xact_id<>pg_current_xact_id() "
+            "AND r.job_retained_resume_admitted_xact_id<>pg_current_xact_id() "
+            "AND op.admitted_xact_id<>pg_current_xact_id() "
+            "FROM vm_workspace_cleanup_admissions c JOIN vm_creation_retries r "
+            "ON r.creation_admission_id=c.id JOIN vm_job_retained_resumes op "
+            "ON op.id=r.job_retained_resume_id WHERE c.id=$1 AND r.request_id=$2",
+            permit["id"],
+            row["request_id"],
+        ):
+            raise VMCreationRetryConflict("retained_resume_authority_not_committed")
+        return permit
+
+    async def begin_effect(
+        self, *, request_id: str, claim_token: str, carrier: dict
+    ) -> dict:
+        """One successful CAS grants one actuation; repeats only permit observation."""
+        from shared.vm_creation_attachment import attachment_effect_kinds
+
+        values = self._carrier(carrier)
+        async with self.db.acquire() as conn:
+            async with conn.transaction():
+                row, job = await self._effect_scope(conn, request_id)
+                await self._current(conn, job, row["provision_generation"], retry=row)
+                await self._check_carrier(conn, row, carrier, values)
+                latest = await conn.fetchrow(
+                    "SELECT * FROM vm_creation_effects WHERE request_id=$1 ORDER BY effect_number DESC LIMIT 1 FOR UPDATE",
+                    row["request_id"],
+                )
+                prior = await conn.fetchrow(
+                    "SELECT * FROM vm_creation_effects WHERE effect_nonce=$1",
+                    UUID(values["effect_nonce"]),
+                )
+                database_now = await conn.fetchval("SELECT clock_timestamp()")
+                if (
+                    row["state"] != "reconciling"
+                    or row["claim_token"] != UUID(claim_token)
+                    or row["claim_expires_at"] <= database_now
+                ):
+                    raise VMCreationRetryConflict("retry_claim_changed")
+                if (
+                    row["admission_deadline"]
+                    and row["admission_deadline"] <= database_now
+                ):
+                    raise VMCreationRetryConflict("job_admission_expired")
+                if prior:
+                    if (
+                        prior["request_id"] != row["request_id"]
+                        or _json(prior["carrier_intent"]) != values
+                        or str(prior["carrier_uid"]) != carrier["metadata"]["uid"]
+                        or prior["carrier_namespace"]
+                        != carrier["metadata"]["namespace"]
+                    ):
+                        raise VMCreationRetryConflict("creation_effect_changed")
+                    return {
+                        "actuation_allowed": False,
+                        "disposition": "observe_only",
+                        "effect_state": prior["state"],
+                    }
+                from orchestrator.services.vm_resource_job_runtime import (
+                    installed_job_resource_store,
+                )
+                from shared.vm_resource_admission import ResourceAdmissionError
+
+                try:
+                    resource = await installed_job_resource_store(
+                        conn,
+                        self.db,
+                        row["controller_configuration"],
+                    )
+                    if resource is not None and (
+                        values.get("resource_grant")
+                        != await resource.grant_on_conn(conn, retry=row, job=job)
+                    ):
+                        raise ResourceAdmissionError("resource_reservation_changed")
+                except ResourceAdmissionError as exc:
+                    raise VMCreationRetryConflict(str(exc)) from None
+                stages = attachment_effect_kinds(row["canonical_request"])
+                if row["canonical_request"].get("workspace_storage") is not None:
+                    if (
+                        values["version"] not in (3, 5)
+                        or values["workspace_attachment"]["action"] == "observe"
+                    ):
+                        raise VMCreationRetryConflict(
+                            "creation_attachment_authority_unproven"
+                        )
+                    from orchestrator.services.vm_creation_attachment_store import (
+                        attachment_instance_on_conn,
+                    )
+
+                    await attachment_instance_on_conn(conn, row)
+                    prior_lease = values["workspace_attachment"]["prior"]
+                    prior_job = str(row["job_id"])
+                    lineage = row["predecessor_evidence"]
+                    if lineage.get("kind") == "retained_attachment_handoff":
+                        prior_job = lineage["previous_job_id"]
+                        if values["workspace_attachment"]["action"] != "replace":
+                            raise VMCreationRetryConflict(
+                                "creation_attachment_lineage_unproven"
+                            )
+                    if lineage.get("kind") == "retained_attachment_replacement":
+                        from orchestrator.services.vm_creation_replacement import (
+                            validate_replacement_claim,
+                        )
+
+                        validate_replacement_claim(
+                            lineage, values["workspace_attachment"]
+                        )
+                    if prior_lease and prior_lease["execution_id"] != prior_job:
+                        raise VMCreationRetryConflict(
+                            "creation_attachment_lineage_unproven"
+                        )
+                    if values["effect_kind"] != "workspace_attach":
+                        attachment = _json(
+                            await conn.fetchval(
+                                "SELECT evidence FROM vm_creation_effects WHERE request_id=$1 AND effect_kind='workspace_attach' AND state='observed' ORDER BY effect_number DESC LIMIT 1",
+                                row["request_id"],
+                            )
+                        )
+                        if (
+                            not attachment
+                            or values["current_attachment_uid"] != attachment["uid"]
+                        ):
+                            raise VMCreationRetryConflict("creation_attachment_changed")
+                # Historical v1 effects remain observable above and through
+                # observe/settle, but cannot mint a fresh source-less grant for
+                # modes that require a frozen clone/retained-source document.
+                if values["version"] not in (2, 3, 4, 5) and (
+                    row["controller_configuration"]["golden_enabled"]
+                    or row["canonical_request"].get("preparation") is not None
+                ):
+                    raise VMCreationRetryConflict("creation_rootdisk_source_required")
+                if latest and latest["state"] == "issued":
+                    raise VMCreationRetryConflict("creation_effect_unresolved")
+                if latest is None:
+                    expected_kind = stages[0]
+                elif latest["state"] == "rejected":
+                    expected_kind = latest["effect_kind"]
+                elif latest["effect_kind"] == "vm":
+                    raise VMCreationRetryConflict("creation_already_admitted")
+                else:
+                    expected_kind = stages[stages.index(latest["effect_kind"]) + 1]
+                if values["effect_kind"] != expected_kind:
+                    raise VMCreationRetryConflict("creation_effect_out_of_order")
+                if expected_kind not in {"rootdisk", "workspace_attach"}:
+                    rootdisk = _json(
+                        await conn.fetchval(
+                            "SELECT evidence FROM vm_creation_effects WHERE request_id=$1 AND effect_kind='rootdisk' AND state='observed' ORDER BY effect_number DESC LIMIT 1",
+                            row["request_id"],
+                        )
+                    )
+                    if (
+                        not rootdisk
+                        or values["current_dv_uid"] != rootdisk["uid"]
+                        or values["current_pvc_uid"] != rootdisk["pvc_uid"]
+                    ):
+                        raise VMCreationRetryConflict("retained_disk_changed")
+                elif (
+                    values["current_pvc_uid"] != values["expected_pvc_uid"]
+                    or values["current_dv_uid"] != values["retained_dv_uid"]
+                ):
+                    raise VMCreationRetryConflict("retained_disk_changed")
+                if expected_kind == "vm":
+                    cloud_init = _json(
+                        await conn.fetchval(
+                            "SELECT evidence FROM vm_creation_effects WHERE request_id=$1 AND effect_kind='cloud_init' AND state='observed' ORDER BY effect_number DESC LIMIT 1",
+                            row["request_id"],
+                        )
+                    )
+                    if (
+                        not cloud_init
+                        or values["current_secret_uid"] != cloud_init["uid"]
+                    ):
+                        raise VMCreationRetryConflict("creation_secret_changed")
+                database_now = await conn.fetchval("SELECT clock_timestamp()")
+                if row["claim_expires_at"] <= database_now:
+                    raise VMCreationRetryConflict("retry_claim_changed")
+                if (
+                    row["admission_deadline"]
+                    and row["admission_deadline"] <= database_now
+                ):
+                    raise VMCreationRetryConflict("job_admission_expired")
+                # A new stage advances creation; a replacement nonce after a
+                # definitive API rejection is another attempt at the same
+                # stage and must retain its accumulated retry backoff.
+                advances_stage = latest is None or latest["state"] == "observed"
+                await conn.execute(
+                    "UPDATE vm_creation_retries SET creation_carrier_uid=$2,creation_carrier_namespace=$3,"
+                    "backoff_attempt=CASE WHEN $4 THEN 0 ELSE backoff_attempt END,"
+                    "next_probe_at=CASE WHEN $4 THEN LEAST(next_probe_at,clock_timestamp()+$5*interval '1 second') ELSE next_probe_at END,"
+                    "updated_at=clock_timestamp() WHERE request_id=$1",
+                    row["request_id"],
+                    UUID(carrier["metadata"]["uid"]),
+                    carrier["metadata"]["namespace"],
+                    advances_stage,
+                    retry_delay_seconds(1),
+                )
+                await conn.execute(
+                    "INSERT INTO vm_creation_effects(effect_nonce,request_id,effect_number,effect_kind,carrier_uid,carrier_namespace,carrier_intent,issuer_receipt_sha256) VALUES($1,$2,$3,$4,$5,$6,$7::jsonb,$8)",
+                    UUID(values["effect_nonce"]),
+                    row["request_id"],
+                    latest["effect_number"] + 1 if latest else 1,
+                    values["effect_kind"],
+                    UUID(carrier["metadata"]["uid"]),
+                    carrier["metadata"]["namespace"],
+                    json.dumps(values),
+                    hashlib.sha256(receipt := secrets.token_bytes(32)).digest(),
+                )
+                return {
+                    "actuation_allowed": True,
+                    "disposition": "issued",
+                    "effect_nonce": values["effect_nonce"],
+                    "issuer_receipt": receipt.hex(),
+                }
+
+    async def _unused_grant_owner_locks(self, conn, row):
+        """Take issuance's owner/PVC advisory order without current-owner proofs."""
+        if row["owner_kind"] == "thread":
+            await conn.execute(
+                "SELECT pg_advisory_xact_lock(hashtextextended($1,0))",
+                f"workspace-recovery:thread:{row['thread_id']}",
+            )
+        else:
+            owners = {row["job_id"]}
+            bound = await conn.fetch(
+                "SELECT j.id,j.parent_job_id FROM jobs j "
+                "JOIN srw_execution_specs s ON s.work_kind='Job' AND s.work_id=j.id "
+                "JOIN srw_execution_workspace_bindings b ON b.execution_id=s.id "
+                "WHERE b.instance_id IN ("
+                "SELECT b2.instance_id FROM srw_execution_workspace_bindings b2 "
+                "JOIN srw_execution_specs s2 ON s2.id=b2.execution_id "
+                "WHERE s2.work_kind='Job' AND s2.work_id=$1)",
+                row["job_id"],
+            )
+            for member in bound:
+                owners.add(member["id"])
+                if member["parent_job_id"]:
+                    owners.add(member["parent_job_id"])
+            parent = await conn.fetchval(
+                "SELECT parent_job_id FROM jobs WHERE id=$1",
+                row["job_id"],
+            )
+            if parent:
+                owners.add(parent)
+            for owner in sorted(owners):
+                await conn.execute(
+                    "SELECT pg_advisory_xact_lock(hashtextextended($1,0))",
+                    f"workspace-recovery:job:{owner}",
+                )
+        pvc_uid = row["expected_pvc_uid"] or row["observed_pvc_uid"]
+        if pvc_uid is not None:
+            await conn.execute(
+                "SELECT pg_advisory_xact_lock(hashtextextended($1,0))",
+                f"workspace-recovery-pvc:{pvc_uid}",
+            )
+
+    @staticmethod
+    def _unused_grant_effect_identity(
+        effect, request_id, nonce, carrier, values, digest, evidence
+    ):
+        metadata = carrier["metadata"]
+        if (
+            effect is None
+            or effect["request_id"] != request_id
+            or effect["effect_nonce"] != nonce
+            or values["effect_nonce"] != str(nonce)
+            or _json(effect["carrier_intent"]) != values
+            or str(effect["carrier_uid"]) != metadata["uid"]
+            or effect["carrier_namespace"] != metadata["namespace"]
+            or effect["issuer_receipt_sha256"] is None
+            or not hmac.compare_digest(bytes(effect["issuer_receipt_sha256"]), digest)
+        ):
+            raise VMCreationRetryConflict("creation_effect_changed")
+        if effect["state"] != "issued":
+            if effect["state"] != "rejected" or _json(effect["evidence"]) != evidence:
+                raise VMCreationRetryConflict("creation_effect_changed")
+            return True
+        return False
+
+    async def _unused_grant_retry_identity(self, conn, row, carrier, values):
+        configuration = row["controller_configuration"]
+        if (
+            configuration is None
+            or canonical_configuration_digest(configuration)
+            != row["controller_configuration_digest"]
+            or configuration["namespace"] != carrier["metadata"]["namespace"]
+        ):
+            raise VMCreationRetryConflict("creation_configuration_changed")
+        expected = {
+            "retry_request_id": str(row["request_id"]),
+            "job_id": str(
+                row["thread_id"] if row["owner_kind"] == "thread" else row["job_id"]
+            ),
+            "provision_generation": str(row["provision_generation"]),
+            "request_digest": row["request_digest"],
+            "controller_configuration_digest": row["controller_configuration_digest"],
+            "expected_pvc_uid": str(row["expected_pvc_uid"])
+            if row["expected_pvc_uid"]
+            else None,
+            "admission_id": str(row["creation_admission_id"]),
+        }
+        if row["owner_kind"] == "thread":
+            expected.update(
+                owner_kind="thread",
+                thread_runtime_generation=str(row["thread_runtime_generation"]),
+                thread_agent_id=str(row["thread_agent_id"])
+                if row["thread_agent_id"]
+                else None,
+                thread_attach_token=str(row["thread_attach_token"])
+                if row["thread_attach_token"]
+                else None,
+                thread_wake_operation_id=str(row["thread_wake_operation_id"])
+                if row["thread_wake_operation_id"]
+                else None,
+            )
+        elif values.get("owner_kind") is not None:
+            raise VMCreationRetryConflict("creation_carrier_changed")
+        if any(values.get(key) != value for key, value in expected.items()):
+            raise VMCreationRetryConflict("creation_carrier_changed")
+        permit = await self._creation_permit_on_conn(conn, row, allow_completed=True)
+        if (
+            values["reservation_request_id"] != str(permit["request_id"])
+            or values["intent_digest"] != permit["intent_digest"]
+        ):
+            raise VMCreationRetryConflict("creation_reservation_changed")
+
+    async def record_not_attempted(
+        self,
+        *,
+        request_id: str,
+        effect_nonce: str,
+        carrier: dict,
+        issuer_receipt: str,
+        reason: str,
+    ) -> dict:
+        """Resolve only an unused grant proved by its winning issuer receipt."""
+        if (
+            type(issuer_receipt) is not str
+            or re.fullmatch(r"[0-9a-f]{64}", issuer_receipt) is None
+        ):
+            raise ValueError("Invalid issuer receipt")
+        evidence = not_attempted_evidence(reason)
+        request_uuid = UUID(request_id)
+        nonce = UUID(effect_nonce)
+        if str(request_uuid) != request_id or str(nonce) != effect_nonce:
+            raise ValueError("Invalid effect identity")
+        values = self._carrier(carrier)
+        digest = hashlib.sha256(bytes.fromhex(issuer_receipt)).digest()
+        result = {"recorded": True, "effect_state": "rejected"}
+        async with self.db.acquire() as conn:
+            async with conn.transaction():
+                effect = await conn.fetchrow(
+                    "SELECT * FROM vm_creation_effects WHERE effect_nonce=$1",
+                    nonce,
+                )
+                if self._unused_grant_effect_identity(
+                    effect,
+                    request_uuid,
+                    nonce,
+                    carrier,
+                    values,
+                    digest,
+                    evidence,
+                ):
+                    return result
+                candidate = _record(
+                    await conn.fetchrow(
+                        "SELECT * FROM vm_creation_retries WHERE request_id=$1",
+                        request_uuid,
+                    )
+                )
+                if candidate is None:
+                    raise VMCreationRetryConflict("retry_request_missing")
+                await self._unused_grant_owner_locks(conn, candidate)
+                row = _record(
+                    await conn.fetchrow(
+                        "SELECT * FROM vm_creation_retries WHERE request_id=$1 FOR UPDATE",
+                        request_uuid,
+                    )
+                )
+                if (row["expected_pvc_uid"] or row["observed_pvc_uid"]) != (
+                    candidate["expected_pvc_uid"] or candidate["observed_pvc_uid"]
+                ):
+                    raise VMCreationRetryConflict("retry_identity_changed")
+                effect = await conn.fetchrow(
+                    "SELECT * FROM vm_creation_effects WHERE effect_nonce=$1 FOR UPDATE",
+                    nonce,
+                )
+                if self._unused_grant_effect_identity(
+                    effect,
+                    request_uuid,
+                    nonce,
+                    carrier,
+                    values,
+                    digest,
+                    evidence,
+                ):
+                    return result
+                if row["state"] in {"succeeded", "settled"}:
+                    raise VMCreationRetryConflict("retry_already_settled")
+                await self._unused_grant_retry_identity(conn, row, carrier, values)
+                changed = await conn.fetchrow(
+                    "UPDATE public.vm_creation_effects "
+                    "SET state='rejected',evidence=$3::jsonb,resolved_at=clock_timestamp() "
+                    "WHERE effect_nonce=$1 AND state='issued' AND issuer_receipt_sha256=$2 "
+                    "RETURNING effect_nonce",
+                    nonce,
+                    digest,
+                    json.dumps(evidence),
+                )
+                if changed is None:
+                    raise VMCreationRetryConflict("creation_effect_changed")
+                if row["state"] in {"reconciling", "queued"}:
+                    retryable = reason == RETRYABLE_NOT_ATTEMPTED_REASON
+                    attempt = row["backoff_attempt"] + 1
+                    await conn.execute(
+                        "UPDATE vm_creation_retries SET state=$2,reason=$3,"
+                        "revision=revision+1,claim_token=NULL,claim_expires_at=NULL,"
+                        "backoff_attempt=CASE WHEN $4 THEN $5 ELSE backoff_attempt END,"
+                        "next_probe_at=CASE WHEN $4 THEN clock_timestamp()+$6*interval '1 second' ELSE next_probe_at END,"
+                        "updated_at=clock_timestamp() WHERE request_id=$1",
+                        request_uuid,
+                        "queued" if retryable else "attention",
+                        "resource_inventory_unavailable"
+                        if retryable
+                        else "vm_creation_retry_blocked",
+                        retryable,
+                        attempt,
+                        retry_delay_seconds(attempt, random.uniform(0, 0.2)),
+                    )
+                else:
+                    await conn.execute(
+                        "UPDATE vm_creation_retries SET revision=revision+1,"
+                        "claim_token=NULL,claim_expires_at=NULL,updated_at=clock_timestamp() "
+                        "WHERE request_id=$1",
+                        request_uuid,
+                    )
+                return result
+
+    async def settle_never_issued(self, *, request_id: str) -> dict:
+        """Definitive DB non-issuance: cancellation won before any possible effect."""
+        async with self.db.acquire() as conn:
+            async with conn.transaction():
+                candidate = await conn.fetchrow(
+                    "SELECT * FROM vm_creation_retries WHERE request_id=$1",
+                    UUID(request_id),
+                )
+                if candidate is None:
+                    raise VMCreationRetryConflict("retry_request_missing")
+                if candidate.get("owner_kind", "job") == "thread":
+                    # Cancellation may have retired this runtime already.
+                    # No-effect settlement needs the historical immutable
+                    # source, not permission to resume the old owner.
+                    thread = await conn.fetchrow(
+                        "SELECT * FROM threads WHERE id=$1 FOR UPDATE",
+                        candidate["thread_id"],
+                    )
+                    row = _record(
+                        await conn.fetchrow(
+                            "SELECT * FROM vm_creation_retries WHERE request_id=$1 "
+                            "FOR UPDATE",
+                            UUID(request_id),
+                        )
+                    )
+                    if thread is None or row["thread_id"] != thread["id"]:
+                        raise VMCreationRetryConflict("thread_changed")
+                else:
+                    row, _ = await self._effect_scope(conn, request_id)
+                if row["state"] == "settled":
+                    if row["reason"] != "creation_never_issued":
+                        raise VMCreationRetryConflict("creation_already_settled")
+                    return {"settled": True, "disposition": "never_issued"}
+                if row["state"] != "cancel_requested":
+                    raise VMCreationRetryConflict("job_not_cancelled")
+                if row["owner_kind"] == "thread" and not await conn.fetchval(
+                    "SELECT public.valid_thread_vm_creation_retirement_source(r,true) "
+                    "FROM vm_creation_retries r WHERE r.request_id=$1",
+                    row["request_id"],
+                ):
+                    raise VMCreationRetryConflict("thread_retirement_source_changed")
+                if (
+                    row["cancellation_disposition"] is not None
+                    or row["canonical_request"].get("workspace_storage") is not None
+                ):
+                    return {"settled": False, "reason": "creation_disposition_pending"}
+                if await conn.fetchval(
+                    "SELECT EXISTS(SELECT 1 FROM vm_creation_effects WHERE request_id=$1 AND state IN ('issued','observed'))",
+                    row["request_id"],
+                ):
+                    return {"settled": False, "reason": "creation_effect_unresolved"}
+                if row["creation_admission_id"]:
+                    from orchestrator.services.vm_creation_disposition_store import (
+                        source_resolution,
+                    )
+
+                    # Source pin/allocation publication precedes the rootdisk
+                    # grant. An empty/rejected effect ledger cannot release it.
+                    if source_resolution(row, None) != "not_required":
+                        return {
+                            "settled": False,
+                            "reason": "creation_source_unresolved",
+                        }
+                if row["creation_admission_id"]:
+                    permit = await conn.fetchrow(
+                        "SELECT * FROM vm_workspace_cleanup_admissions WHERE id=$1",
+                        row["creation_admission_id"],
+                    )
+                    if (
+                        not permit
+                        or permit["source"] != "controller_vm_create"
+                        or permit["owner_kind"] != row["owner_kind"]
+                        or permit["owner_id"]
+                        != (
+                            row["thread_id"]
+                            if row["owner_kind"] == "thread"
+                            else row["job_id"]
+                        )
+                        or permit["pvc_uid"] != row["expected_pvc_uid"]
+                        or permit["request_id"]
+                        != uuid5(NAMESPACE_URL, "vm-create:" + str(row["request_id"]))
+                        or permit["intent_digest"]
+                        != cleanup_intent_digest(_creation_intent(row))
+                        or permit["completed_at"] is not None
+                    ):
+                        raise VMCreationRetryConflict("creation_reservation_changed")
+                    await conn.execute(
+                        "UPDATE vm_workspace_cleanup_admissions SET completed_at=clock_timestamp(),outcome='never_issued' WHERE id=$1",
+                        permit["id"],
+                    )
+                from orchestrator.services.vm_resource_job_runtime import (
+                    installed_job_resource_store,
+                )
+
+                resource = await installed_job_resource_store(
+                    conn,
+                    self.db,
+                    row["controller_configuration"],
+                    fresh=False,
+                )
+                if resource is not None:
+                    await resource.release_never_issued_on_conn(conn, retry=row)
+                await conn.execute(
+                    "UPDATE vm_creation_retries SET state='settled',revision=revision+1,claim_token=NULL,claim_expires_at=NULL,resolved_at=clock_timestamp(),reason='creation_never_issued',updated_at=clock_timestamp() WHERE request_id=$1",
+                    row["request_id"],
+                )
+                if row["owner_kind"] == "thread":
+                    cleared = await conn.fetchval(
+                        "UPDATE threads SET metadata=metadata-'vm' "
+                        "WHERE id=$1 AND runtime_generation=$2 "
+                        "AND runtime_retirement_token IS NOT NULL "
+                        "AND runtime_retirement_authorized_at IS NOT NULL "
+                        "AND runtime_retirement_context->'vm_creation_source'->>'request_id'=$3 "
+                        "AND runtime_retirement_context->'vm_creation_source'->>'request_digest'=$4 "
+                        "AND metadata->'vm'=runtime_retirement_context->'vm_creation_source'->'captured_vm' "
+                        "AND metadata->'vm'->>'vm_uid' IS NULL "
+                        "AND metadata->'vm'->>'rootdisk_pvc_uid' IS NULL "
+                        "RETURNING id",
+                        row["thread_id"],
+                        thread["runtime_generation"],
+                        str(row["request_id"]),
+                        row["request_digest"],
+                    )
+                    if cleared is None:
+                        raise VMCreationRetryConflict(
+                            "thread_retirement_source_changed"
+                        )
+                return {"settled": True, "disposition": "never_issued"}
+
+    async def prepare_disposition(self, *, request_id: str) -> dict:
+        from orchestrator.services.vm_creation_disposition_store import (
+            VMCreationDispositionStore,
+        )
+
+        return await VMCreationDispositionStore(self).prepare(request_id=request_id)
+
+    async def freeze_disposition(self, *, request_id: str, carrier: dict) -> dict:
+        from orchestrator.services.vm_creation_disposition_store import (
+            VMCreationDispositionStore,
+        )
+
+        return await VMCreationDispositionStore(self).freeze(
+            request_id=request_id, carrier=carrier
+        )
+
+    async def authorize_disposition(self, **payload) -> dict:
+        from orchestrator.services.vm_creation_disposition_store import (
+            VMCreationDispositionStore,
+        )
+
+        return await VMCreationDispositionStore(self).authorize(**payload)
+
+    async def record_disposition(self, **payload) -> dict:
+        from orchestrator.services.vm_creation_disposition_store import (
+            VMCreationDispositionStore,
+        )
+
+        return await VMCreationDispositionStore(self).record(**payload)
+
+    async def settle_disposition(self, *, request_id: str, carrier: dict) -> dict:
+        from orchestrator.services.vm_creation_disposition_store import (
+            VMCreationDispositionStore,
+        )
+
+        return await VMCreationDispositionStore(self).settle(
+            request_id=request_id, carrier=carrier
+        )
+
+    async def observe_effect(
+        self, *, request_id: str, carrier: dict, observation: dict
+    ) -> dict:
+        """Record exact late facts even after cancellation; never grant actuation."""
+        from shared.vm_creation_issuance import public_effect_observation
+
+        values = self._carrier(carrier)
+        observed_pvc = None
+        if (
+            values["effect_kind"] == "rootdisk"
+            and observation.get("outcome") == "observed"
+        ):
+            # Obtain the disk scope before any job/retry lock. Validation below
+            # still checks the complete authenticated evidence and effect nonce.
+            observed_pvc = UUID(str(observation["pvc"]["metadata"]["uid"]))
+        async with self.db.acquire() as conn:
+            async with conn.transaction():
+                row, _ = await self._effect_scope(
+                    conn,
+                    request_id,
+                    observed_pvc=observed_pvc,
+                    allow_terminal=True,
+                )
+                await self._check_carrier(conn, row, carrier, values)
+                effect = await conn.fetchrow(
+                    "SELECT * FROM vm_creation_effects WHERE effect_nonce=$1 FOR UPDATE",
+                    UUID(values["effect_nonce"]),
+                )
+                if (
+                    not effect
+                    or effect["request_id"] != row["request_id"]
+                    or _json(effect["carrier_intent"]) != values
+                    or str(effect["carrier_uid"]) != carrier["metadata"]["uid"]
+                    or effect["carrier_namespace"] != carrier["metadata"]["namespace"]
+                ):
+                    raise VMCreationRetryConflict("creation_effect_changed")
+                rootdisk = await conn.fetchval(
+                    "SELECT evidence FROM vm_creation_effects WHERE request_id=$1 AND effect_kind='rootdisk' AND state='observed' ORDER BY effect_number DESC LIMIT 1",
+                    row["request_id"],
+                )
+                cloud_init = await conn.fetchval(
+                    "SELECT evidence FROM vm_creation_effects WHERE request_id=$1 AND effect_kind='cloud_init' AND state='observed' ORDER BY effect_number DESC LIMIT 1",
+                    row["request_id"],
+                )
+                evidence = public_effect_observation(
+                    values,
+                    carrier,
+                    observation,
+                    rootdisk=_json(rootdisk),
+                    cloud_init=_json(cloud_init),
+                    network_profile=row["canonical_request"].get("network_profile"),
+                )
+                state = "rejected" if evidence["outcome"] == "rejected" else "observed"
+                if effect["state"] != "issued":
+                    if (
+                        effect["state"] != state
+                        or _json(effect["evidence"]) != evidence
+                    ):
+                        raise VMCreationRetryConflict("creation_effect_changed")
+                    return {"recorded": True, "effect_state": state}
+                if state == "observed" and values["effect_kind"] == "rootdisk":
+                    if (
+                        row["observed_pvc_uid"]
+                        and str(row["observed_pvc_uid"]) != evidence["pvc_uid"]
+                    ):
+                        raise VMCreationRetryConflict("retained_disk_changed")
+                    await conn.execute(
+                        "UPDATE vm_creation_retries SET observed_pvc_uid=$2,updated_at=clock_timestamp() WHERE request_id=$1",
+                        row["request_id"],
+                        UUID(evidence["pvc_uid"]),
+                    )
+                    # Extend this same owner reservation to the now-known PVC;
+                    # never acquire a competing cleanup admission for adoption.
+                    await conn.execute(
+                        "UPDATE vm_workspace_cleanup_admissions SET pvc_uid=$2 WHERE id=$1 AND (pvc_uid IS NULL OR pvc_uid=$2)",
+                        row["creation_admission_id"],
+                        UUID(evidence["pvc_uid"]),
+                    )
+                if state == "observed" and values["effect_kind"] == "vm":
+                    await conn.execute(
+                        "UPDATE vm_creation_retries SET observed_vm_uid=$2,updated_at=clock_timestamp() WHERE request_id=$1",
+                        row["request_id"],
+                        UUID(evidence["uid"]),
+                    )
+                await conn.execute(
+                    "UPDATE vm_creation_effects SET state=$2,evidence=$3::jsonb,resolved_at=clock_timestamp() WHERE effect_nonce=$1",
+                    effect["effect_nonce"],
+                    state,
+                    json.dumps(evidence),
+                )
+                if state == "observed":
+                    # Only a new, exactly recorded effect advances creation.
+                    # Duplicate observation and definitive API rejection keep
+                    # their existing backoff; an unexpired claim still gates
+                    # claim_due even when the next probe is brought forward.
+                    await conn.execute(
+                        "UPDATE vm_creation_retries SET backoff_attempt=0,"
+                        "next_probe_at=LEAST(next_probe_at,clock_timestamp()+$2*interval '1 second'),"
+                        "updated_at=clock_timestamp() WHERE request_id=$1",
+                        row["request_id"],
+                        retry_delay_seconds(1),
+                    )
+                return {"recorded": True, "effect_state": state}
+
+    async def inspect(self, *, request_id: str) -> dict:
+        """Authenticated controller read; never returns an observer or actuation grant."""
+        from orchestrator.services.vm_creation_prepared_lineage import prepared_origin
+
+        async with self.db.acquire() as conn:
+            async with conn.transaction(isolation="repeatable_read", readonly=True):
+                row = _record(
+                    await conn.fetchrow(
+                        "SELECT * FROM vm_creation_retries WHERE request_id=$1",
+                        UUID(request_id),
+                    )
+                )
+                if row is None:
+                    raise VMCreationRetryConflict("retry_request_missing")
+                effects = await conn.fetch(
+                    "SELECT carrier_intent,state,evidence FROM vm_creation_effects WHERE request_id=$1 ORDER BY effect_number",
+                    row["request_id"],
+                )
+                return {
+                    **{
+                        key: str(row[key]) if isinstance(row[key], UUID) else row[key]
+                        for key in (
+                            "request_id",
+                            "job_id",
+                            "provision_generation",
+                            "request_digest",
+                            "controller_configuration_digest",
+                            "expected_pvc_uid",
+                            "state",
+                            "reason",
+                            "creation_admission_id",
+                            "creation_carrier_uid",
+                        )
+                    },
+                    "disposition_carrier_uid": (
+                        str(row["disposition_carrier_uid"])
+                        if row.get("disposition_carrier_uid")
+                        else None
+                    ),
+                    **(
+                        {
+                            "job_id": str(row["thread_id"]),
+                            "owner_kind": "thread",
+                            "thread_runtime_generation": str(
+                                row["thread_runtime_generation"]
+                            ),
+                            "thread_agent_id": str(row["thread_agent_id"])
+                            if row["thread_agent_id"]
+                            else None,
+                            "thread_attach_token": str(row["thread_attach_token"])
+                            if row["thread_attach_token"]
+                            else None,
+                            "thread_wake_operation_id": str(
+                                row["thread_wake_operation_id"]
+                            )
+                            if row["thread_wake_operation_id"]
+                            else None,
+                        }
+                        if row["owner_kind"] == "thread"
+                        else {}
+                    ),
+                    "request": row["canonical_request"],
+                    "controller_configuration": row["controller_configuration"],
+                    "cancellation_disposition": _json(row["cancellation_disposition"]),
+                    "cancellation_progress": _json(row["cancellation_progress"]),
+                    "cancellation_completion": _json(row["cancellation_completion"]),
+                    **(
+                        {
+                            "prepared_origin": prepared_origin(
+                                row["predecessor_evidence"]
+                            )
+                        }
+                        if prepared_origin(row["predecessor_evidence"]) is not None
+                        else {}
+                    ),
+                    "effects": [
+                        {
+                            "carrier_intent": _json(effect["carrier_intent"]),
+                            "state": effect["state"],
+                            "evidence": _json(effect["evidence"]),
+                        }
+                        for effect in effects
+                    ],
+                }
+
+    async def settle_adopted(
+        self, *, request_id: str, carrier: dict, observations: dict
+    ) -> dict:
+        """Adopt an exactly reobserved single VM and release its own create permit.
+
+        Late accepted facts remain useful after observer expiry or cancellation.
+        This is not Ready release and does not authorize any new controller I/O.
+        """
+        from shared.vm_creation_issuance import (
+            public_effect_observation,
+            seal_creation_carrier,
+        )
+        from shared.vm_lifecycle_auth import configured_secret
+
+        values = self._carrier(carrier)
+        expected_kinds = {"rootdisk", "cloud_init", "vm"}
+        if values["version"] in (3, 5):
+            expected_kinds.add("workspace_attach")
+        if values["effect_kind"] != "vm" or set(observations) != expected_kinds:
+            raise VMCreationRetryConflict("creation_adoption_unproven")
+        async with self.db.acquire() as conn:
+            async with conn.transaction():
+                retained = await conn.fetchval(
+                    "SELECT (to_jsonb(r)->>'thread_retained_resume_id') IS NOT NULL FROM vm_creation_retries r WHERE request_id=$1",
+                    UUID(request_id),
+                )
+                row, job = await self._effect_scope(
+                    conn, request_id, allow_terminal=bool(retained)
+                )
+                terminal_handoff = bool(
+                    retained and job["runtime_retirement_token"] is not None
+                )
+                if retained and not terminal_handoff:
+                    job = await self._thread_scope(conn, row)
+                if terminal_handoff and not await conn.fetchval(
+                    "SELECT public.valid_thread_vm_creation_retirement_source(r,$2) FROM vm_creation_retries r WHERE request_id=$1",
+                    row["request_id"],
+                    row["state"] != "settled",
+                ):
+                    raise VMCreationRetryConflict("thread_retirement_source_changed")
+                permit = await self._check_carrier(
+                    conn, row, carrier, values, allow_completed=True
+                )
+                effects = await conn.fetch(
+                    "SELECT * FROM vm_creation_effects WHERE request_id=$1 ORDER BY effect_number FOR UPDATE",
+                    row["request_id"],
+                )
+                proven = {}
+                for effect in effects:
+                    if effect["state"] == "rejected":
+                        continue
+                    if effect["state"] != "observed":
+                        raise VMCreationRetryConflict("creation_effect_unresolved")
+                    intent = _json(effect["carrier_intent"])
+                    kind = effect["effect_kind"]
+                    if (
+                        kind in proven
+                        or str(effect["carrier_uid"]) != carrier["metadata"]["uid"]
+                        or effect["carrier_namespace"]
+                        != carrier["metadata"]["namespace"]
+                    ):
+                        raise VMCreationRetryConflict("creation_effect_changed")
+                    historical = seal_creation_carrier(
+                        intent,
+                        namespace=effect["carrier_namespace"],
+                        uid=str(effect["carrier_uid"]),
+                        resource_version=carrier["metadata"]["resourceVersion"],
+                        secret=configured_secret(),
+                    )
+                    actual = public_effect_observation(
+                        intent,
+                        historical,
+                        observations[kind],
+                        rootdisk=proven.get("rootdisk"),
+                        cloud_init=proven.get("cloud_init"),
+                        network_profile=row["canonical_request"].get("network_profile"),
+                    )
+                    if actual != _json(effect["evidence"]):
+                        raise VMCreationRetryConflict(
+                            "creation_observed_object_changed"
+                        )
+                    proven[kind] = actual
+                if (
+                    set(proven) != expected_kinds
+                    or _json(effects[-1]["carrier_intent"]) != values
+                ):
+                    raise VMCreationRetryConflict("creation_adoption_unproven")
+                vm = proven["vm"]
+                if (
+                    str(row["observed_vm_uid"]) != vm["uid"]
+                    or str(row["observed_pvc_uid"]) != vm["pvc_uid"]
+                ):
+                    raise VMCreationRetryConflict("creation_adoption_changed")
+                if terminal_handoff:
+                    from orchestrator.services.vm_thread_retained_resume import (
+                        handoff_on_conn,
+                    )
+
+                    return await handoff_on_conn(self, conn, row, job, permit)
+                result = {"settled": True, "disposition": "adopted"}
+                context = _json(job["context"]) or {}
+                current = dict(context.get("vm") or {})
+                if current.get("vm_uid") not in (None, vm["uid"]) or current.get(
+                    "rootdisk_pvc_uid"
+                ) not in (None, vm["pvc_uid"]):
+                    raise VMCreationRetryConflict("creation_adoption_changed")
+                if permit["completed_at"] is not None:
+                    if (
+                        row["state"] not in {"succeeded", "settled"}
+                        or row["reason"] != "creation_adopted"
+                        or permit["outcome"] != "adopted"
+                    ):
+                        raise VMCreationRetryConflict("creation_reservation_changed")
+                    return result
+                if row["canonical_request"].get("workspace_storage") is not None:
+                    from orchestrator.services.vm_creation_attachment_store import (
+                        record_attachment_adoption_on_conn,
+                    )
+
+                    await record_attachment_adoption_on_conn(
+                        conn, row, pvc_uid=vm["pvc_uid"], namespace=vm["namespace"]
+                    )
+                    current["workspace_storage"] = {
+                        **row["canonical_request"]["workspace_storage"],
+                        "pvc_uid": vm["pvc_uid"],
+                    }
+                cancelled = row["state"] == "cancel_requested"
+                if row["state"] not in {
+                    "queued",
+                    "reconciling",
+                    "attention",
+                    "cancel_requested",
+                }:
+                    raise VMCreationRetryConflict("creation_adoption_changed")
+                attempts = current.get("provision_attempts", 0)
+                if type(attempts) is not int or attempts < 0:
+                    raise VMCreationRetryConflict("creation_attempts_unproven")
+                current.update(
+                    {
+                        "vm_uid": vm["uid"],
+                        "vm_name": vm["name"],
+                        "namespace": vm["namespace"],
+                        "rootdisk_pvc_uid": vm["pvc_uid"],
+                        "cloud_init_secret_uid": vm["cloud_init_uid"],
+                        "ssh_host_key_fingerprint": vm["ssh_host_key_fingerprint"],
+                        "identity_authenticated": True,
+                        "identity_provision_generation": str(
+                            row["provision_generation"]
+                        ),
+                        "creation_request_id": str(row["request_id"]),
+                        "provisioned_by": "http",
+                        "provision_attempts": attempts
+                        + (0 if row["boot_counted"] else 1),
+                    }
+                )
+                source = values.get("rootdisk_source", {})
+                if source.get("kind") == "prepared":
+                    from shared.vm_creation_issuance import prepared_source_metadata
+
+                    current["preparation"] = prepared_source_metadata(source)
+                    current["preparation_request"] = row["canonical_request"][
+                        "preparation"
+                    ]
+                if not cancelled:
+                    current["status"] = "created"
+                context["vm"] = current
+                if row["owner_kind"] == "thread":
+                    # The pinned session owns this exact runtime and create
+                    # generation. Its metadata is the projection; no Job row
+                    # or worker queue may be synthesized for the session.
+                    if current.get("provision_generation") != str(
+                        row["provision_generation"]
+                    ) or current.get("creation_request_id") != str(row["request_id"]):
+                        raise VMCreationRetryConflict("thread_changed")
+                    updated = await conn.execute(
+                        "UPDATE threads SET metadata=$2::jsonb,last_activity=clock_timestamp() "
+                        "WHERE id=$1 AND runtime_generation=$3 AND "
+                        "runtime_retirement_token IS NULL",
+                        row["thread_id"],
+                        json.dumps(context),
+                        row["thread_runtime_generation"],
+                    )
+                    if updated != "UPDATE 1":
+                        raise VMCreationRetryConflict("thread_changed")
+                else:
+                    # Queue hold and Job control context remain intact. The
+                    # cancellation trigger may touch this retry before its
+                    # terminal update; locks are in the standard order.
+                    await conn.execute(
+                        "UPDATE jobs SET context=$2::jsonb,updated_at=clock_timestamp() WHERE id=$1",
+                        row["job_id"],
+                        json.dumps(context),
+                    )
+                await conn.execute(
+                    "UPDATE vm_workspace_cleanup_admissions SET completed_at=clock_timestamp(),outcome='adopted' WHERE id=$1",
+                    row["creation_admission_id"],
+                )
+                await conn.execute(
+                    "UPDATE vm_creation_retries SET state=$2,reason='creation_adopted',boot_counted=true,revision=revision+1,claim_token=NULL,claim_expires_at=NULL,resolved_at=clock_timestamp(),updated_at=clock_timestamp() WHERE request_id=$1",
+                    row["request_id"],
+                    "settled" if cancelled else "succeeded",
+                )
+                return result

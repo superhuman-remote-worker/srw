@@ -475,7 +475,7 @@ const DISCOVERABLE_PROVIDERS: ReadonlySet<string> = new Set([
                   @if (isCodexEndpoint(endpoint.label)) {
                     <span class="codex-aside">
                       ·
-                      <a routerLink="/settings" class="catalog-hint-link">
+                      <a routerLink="/admin/subscriptions" class="catalog-hint-link">
                         Manage subscriptions
                       </a>
                     </span>

@@ -658,6 +658,56 @@ class SessionSubagentLedger:
         rows = await self.client.list_live_session_subagent_threads(
             self.parent_thread_id, parent_authority=authority
         )
+        return self._adopt_listed(rows)
+
+    async def list_live_recovery(self, parent_thread_id: str) -> Dict[str, Any]:
+        """The candidates (adopted, as :meth:`list_live`) and the per-turn plans.
+
+        ``recovery_turns`` is ``None`` when the orchestrator predates batch
+        settle or sent them malformed; the caller then recovers every
+        candidate on its own.
+        """
+
+        authority = await self._authority(parent_thread_id=str(parent_thread_id))
+        listed = await self.client.list_live_session_subagent_recovery(
+            self.parent_thread_id, parent_authority=authority
+        )
+        if not isinstance(listed, Mapping):
+            raise SubagentPersistenceRefused("live session child roster is not a map")
+        plans = listed.get("recovery_turns")
+        if plans is not None and not isinstance(plans, list):
+            logger.warning(
+                "Ignoring session recovery plans that are not a list (thread %s)",
+                self.parent_thread_id,
+            )
+            plans = None
+        return {
+            "subagents": self._adopt_listed(listed.get("subagents")),
+            "recovery_turns": plans,
+        }
+
+    async def settle_batch(
+        self,
+        *,
+        parent_input_message_id: str,
+        parent_iteration: int,
+        members: Sequence[Mapping[str, Any]],
+    ) -> Dict[str, Any]:
+        """Settle one abandoned delegation turn under a fresh exact authority."""
+
+        authority = await self._authority()
+        result = await self.client.settle_session_subagent_batch(
+            self.parent_thread_id,
+            parent_authority=authority,
+            parent_input_message_id=str(parent_input_message_id),
+            parent_iteration=int(parent_iteration),
+            members=[dict(member) for member in members],
+        )
+        if not isinstance(result, Mapping):
+            raise SubagentPersistenceRefused("session batch settle gave no verdict")
+        return dict(result)
+
+    def _adopt_listed(self, rows: Any) -> list[Dict[str, Any]]:
         if not isinstance(rows, list):
             raise SubagentPersistenceRefused("live session child roster is not a list")
         normalized: list[Dict[str, Any]] = []

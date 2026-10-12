@@ -17,9 +17,10 @@ the agent works, you see everything as it happens. **Assistant** is the initial
 application session default, but an explicit selection, project default,
 personal default, or operator-chosen application default can replace it.
 
-Start one from **Sessions → New Session**: pick a title, projects to attach,
-an expert, and adjust the agent settings (model, permission mode, tools,
-connectors) if the defaults don't fit. Eligible deployments also offer a
+Start one from **Sessions → New Session**: pick a title, a **Project** (a
+session has one project or none; choose **No project** for none), an expert,
+and adjust the agent settings (model, permission mode, tools, connectors) if
+the defaults don't fit. Eligible deployments also offer a
 creation-time **Protected cloud** checkbox for staging changes to a
 non-default Nextcloud project; use its focused guide before relying on it.
 
@@ -78,9 +79,18 @@ deployment authorization.
 ## The chat view
 
 - **Composer**: attach files (documents, images, audio, video — drag-and-drop
-  and paste work too; on mobile you can take a photo), and use slash commands:
-  `/compact` (condense the conversation), `/done` (end the session), `/undo`,
-  `/auto`, `/supervised`, `/autonomous`, `/silent`, `/verbose`.
+  and paste work too; on mobile you can take a photo), and use slash commands.
+  Typing `/` opens a menu that lists only the commands this session supports:
+  `/compact` (condense the conversation), `/done` (end the session), `/undo`
+  (revert the last turn's file changes; needs a workspace with file history),
+  `/auto`, `/supervised`, `/autonomous`, `/silent`, `/verbose`, and `/rewind`
+  where the session offers it.
+  `/compact` takes optional focus text (`/compact keep the pricing decisions`).
+  Sent while the agent is still replying, it waits and runs after that reply.
+  Compaction also happens automatically when the **CTX** bar above the
+  composer reaches 100%, and the summary stays part of the conversation after
+  reloads and resumes. A "Nothing to compact" notice means there was not
+  enough older conversation to fold.
   Compaction is a context-window operation, not a durable-recording answer;
   questions about future recall or preserving a project decision require the
   focused **Memory and knowledge** guide.
@@ -116,14 +126,18 @@ deployment authorization.
    that response. Check any reported error, wait for a workspace upgrade to
    complete if requested, then send the agent a follow-up to continue.
 
-For a Virtual session that needs a browser or shell, choose **Container** in
-**Workspace** and confirm **Upgrade**. Existing files carry over; then check
-the needed tool category under **Tools**. Use the focused
+For a Virtual session that needs a shell, choose **VM** in **Workspace** when
+VMs are allowed and confirm **Upgrade**; existing files carry over. A running
+session can't upgrade to a Container, so start a new Container session when you
+need one (for example, for the direct or shared browser). Then check
+the needed tool category under **Tools**. If the Workspace choices say **not
+available in this session**, this session cannot change workspace in place:
+start a new session with the needed workspace instead. Use the focused
 `permissions-and-availability` guide for grants, other tiers, and locked
 controls, and `canvas-and-browser` for browser setup and shared login.
 
 Workspace changes are upgrade-only; use a new session to move down to Virtual
-or None. Expert, projects, and Protected Cloud mode are set at creation.
+or None. Expert, project, and Protected Cloud mode are set at creation.
 Most eligible connectors can be added or removed live; some attachments are
 fixed for the session. Read `datasources` for attachment limits. Session
 Settings changes this conversation; account defaults for future sessions

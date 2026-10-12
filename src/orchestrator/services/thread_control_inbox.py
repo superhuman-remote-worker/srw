@@ -8,7 +8,9 @@ serving owner applied and journalled it. The owner makes the scalar visible only
 while finalizing its durable journal receipt. Workspace undo is a
 stateless-sandbox-only effect: admission requires an idle queue so it cannot
 race a live turn, and the claimant records an idempotency marker in Git before
-writing the same owner-fenced journal receipt.
+writing the same owner-fenced journal receipt. Manual ``compact`` follows
+the same idle-only rule: the claimant summarizes the attached conversation
+and its fenced checkpoint row plus journal receipt are the effect.
 """
 
 from __future__ import annotations
@@ -53,6 +55,12 @@ class ControlAdmissionNotReady(ControlAdmissionError):
 
 
 WORKSPACE_UNDO_VERB = "workspace.undo"
+COMPACT_VERB = "compact"
+#: Effectful stateless-only controls: they change the workspace tree or the
+#: conversation the next turn runs on, so they are admitted only while no turn
+#: holds the lease and no committed human input is waiting ahead of them.
+IDLE_ONLY_VERBS = frozenset({WORKSPACE_UNDO_VERB, COMPACT_VERB})
+_COMPACT_PAYLOAD_KEYS = frozenset({"focus", "boundary_message_id"})
 
 
 def _json_object(value: Any) -> dict[str, Any]:
@@ -203,6 +211,15 @@ async def admit_thread_control(
                 raise ControlAdmissionError(
                     "workspace.undo does not accept a control payload"
                 )
+            if verb == COMPACT_VERB and (
+                not set(payload) <= _COMPACT_PAYLOAD_KEYS
+                or not all(
+                    isinstance(value, str) and value for value in payload.values()
+                )
+            ):
+                raise ControlAdmissionError(
+                    "compact accepts only a non-empty focus and boundary_message_id"
+                )
 
             lane = str(thread["execution_lane"] or "")
             current_generation = thread.get("runtime_generation")
@@ -226,6 +243,11 @@ async def admit_thread_control(
                 raise ControlAdmissionError(
                     "Workspace undo uses the live session transport on the "
                     "pinned execution lane"
+                )
+            if verb == COMPACT_VERB and lane != LANE_STATELESS:
+                raise ControlAdmissionError(
+                    "Compaction uses the live session transport on the pinned "
+                    "execution lane"
                 )
             accepted_agent_id: UUID | None
             if lane == LANE_PINNED:
@@ -281,15 +303,19 @@ async def admit_thread_control(
                     raise ControlAdmissionError(
                         "Session queue is parked; unpark it before sending controls"
                     )
-                if verb == WORKSPACE_UNDO_VERB and queue_state == STATE_LEASED:
-                    # Unlike scalar controls, undo changes the workspace tree.
-                    # Never wake the mid-turn watcher and race an active tool;
+                effect_label = (
+                    "workspace undo" if verb == WORKSPACE_UNDO_VERB else "compaction"
+                )
+                if verb in IDLE_ONLY_VERBS and queue_state == STATE_LEASED:
+                    # Unlike scalar controls, undo changes the workspace tree
+                    # and compact rewrites the conversation the turn runs on.
+                    # Never wake the mid-turn watcher and race an active turn;
                     # 425 directs the caller to retry this UUID once the current
                     # owner has released the turn lease.
                     raise ControlAdmissionNotReady(
-                        "Session is completing a turn; retry workspace undo"
+                        f"Session is completing a turn; retry {effect_label}"
                     )
-                if verb == WORKSPACE_UNDO_VERB and queue is not None:
+                if verb in IDLE_ONLY_VERBS and queue is not None:
                     input_seq = queue["input_seq"]
                     consumed_seq = queue["consumed_seq"]
                     if input_seq is not None and (
@@ -300,7 +326,7 @@ async def admit_thread_control(
                         # that was committed first.  A queued row with equal
                         # watermarks is control-only and remains admissible.
                         raise ControlAdmissionNotReady(
-                            "Session has pending input; retry workspace undo "
+                            f"Session has pending input; retry {effect_label} "
                             "after that turn completes"
                         )
                 if queue_state not in {
@@ -324,7 +350,12 @@ async def admit_thread_control(
                 raise ControlAdmissionError("Session execution lane is unavailable")
 
             request_seq = int(thread["control_seq_hwm"] or 0) + 1
-            if verb not in {"mode.set", "narration.set", WORKSPACE_UNDO_VERB}:
+            if verb not in {
+                "mode.set",
+                "narration.set",
+                WORKSPACE_UNDO_VERB,
+                COMPACT_VERB,
+            }:
                 # Caller validation is not an authorization boundary.
                 raise ControlAdmissionError("Unsupported control verb")
             await conn.execute(

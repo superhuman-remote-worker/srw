@@ -320,7 +320,6 @@ const server = createServer(async (req, res) => {
         id: PROJECT_ID,
         name: 'Protected Docs',
         cloud_storage_url: 'https://cloud.example.invalid/apps/files/?dir=/Protected%20Docs',
-        cloud_storage_read_only: true,
         main_cloud_backend: 'nextcloud',
       });
     }

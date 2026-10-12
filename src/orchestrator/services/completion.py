@@ -23,6 +23,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
+from shared.worker_errors import worker_workspace_exhaustion_cause
+from shared.workspace_contract import WorkspaceContractError, resolve_workspace_contract
 from shared.job_freeze_types import (
     CONTINUE_AS_NEW_FREEZE_TYPES,
     ERROR_IMMUNE_FREEZE_TYPES,
@@ -382,6 +384,41 @@ def is_teardown_infra_error(message: str | None) -> bool:
     return any(pattern in low for pattern in _TEARDOWN_ERROR_PATTERNS)
 
 
+#: ``error.type`` of the terminal report a refused job start is admitted as
+#: (connector drivers decision 34, ``job_completion.refuse_job_start``).
+START_REFUSED_ERROR_TYPE = "start_refused"
+
+
+#: The completion-command origin of a report the orchestrator itself admitted
+#: for a claim (``job_completion.refuse_job_start``); an agent's is ``agent``.
+DISPATCH_COMMAND_ORIGIN = "dispatch"
+
+
+def refused_resume_keeps_workspace(
+    result: dict[str, Any], *, origin: str | None
+) -> bool:
+    """True for a start refusal its claim owner reported for a resume.
+
+    The owner's decision (2026-10-10): a refused resume fails the job but
+    keeps the paused job's workspace, as the provisioner keeps a refused
+    job's pod with completion commands off. A refused fresh start still
+    tears down what was provisioned for it. The claim owner states which
+    claim it was in ``error.resume``; nothing here infers it.
+
+    ``origin`` is the completion command's: only a report the orchestrator
+    admitted (``dispatch``) is honoured. An agent's report, or any report
+    with completion commands off, never keeps a workspace this way, whatever
+    its error says.
+    """
+    error = result.get("error")
+    return (
+        origin == DISPATCH_COMMAND_ORIGIN
+        and isinstance(error, dict)
+        and error.get("type") == START_REFUSED_ERROR_TYPE
+        and error.get("resume") is True
+    )
+
+
 async def probe_workspace_ssh(host: str, port: int, timeout: float = 3.0) -> bool:
     """TCP-probe the workspace sshd; True means something accepted the connect.
 
@@ -407,7 +444,26 @@ async def probe_workspace_ssh(host: str, port: int, timeout: float = 3.0) -> boo
     return True
 
 
-def should_reset_recovery_counter(container_ctx: dict[str, Any], error: Any) -> bool:
+def is_container_worker_workspace_exhaustion(
+    job: dict[str, Any] | None, error: Any
+) -> bool:
+    """This retention protocol is qualified only for stateless Kubernetes containers."""
+    if not isinstance(job, dict) or job.get("execution_lane") != "stateless":
+        return False
+    if (
+        worker_workspace_exhaustion_cause(error) is None
+        or _get_ctx(job).get("provisioner") != "k8s"
+    ):
+        return False
+    try:
+        return resolve_workspace_contract(job).assigned_backend == "sandbox"
+    except WorkspaceContractError:
+        return False
+
+
+def should_reset_recovery_counter(
+    container_ctx: dict[str, Any], error: Any, *, job: dict[str, Any] | None = None
+) -> bool:
     """True when a handled completion should zero ``recovery_attempts``.
 
     The counter only ever incremented before, so a single recovered blip
@@ -417,12 +473,16 @@ def should_reset_recovery_counter(container_ctx: dict[str, Any], error: Any) -> 
     """
     if int(container_ctx.get("recovery_attempts") or 0) <= 0:
         return False
-    if isinstance(error, dict) and error.get("type") == "workspace_unavailable":
+    if (
+        isinstance(error, dict) and error.get("type") == "workspace_unavailable"
+    ) or is_container_worker_workspace_exhaustion(job, error):
         return False
     return True
 
 
-def should_persist_completion_freeze(result: dict[str, Any]) -> bool:
+def should_persist_completion_freeze(
+    result: dict[str, Any], *, job: dict[str, Any] | None = None
+) -> bool:
     """False when a completion report's freeze_data must NOT be persisted.
 
     An agent that dies before its graph runs (``workspace_unavailable``) can
@@ -436,7 +496,8 @@ def should_persist_completion_freeze(result: dict[str, Any]) -> bool:
     """
     error = result.get("error")
     return not (
-        isinstance(error, dict) and error.get("type") == "workspace_unavailable"
+        (isinstance(error, dict) and error.get("type") == "workspace_unavailable")
+        or is_container_worker_workspace_exhaustion(job, error)
     )
 
 
@@ -452,20 +513,18 @@ async def handle_pod_workspace_recovery(
     completion_command_id: str | None = None,
     completion_finalizing_by: str | None = None,
     expected_status: str | None = None,
+    cleanup_service: Any | None = None,
 ) -> dict[str, Any]:
     """G1 pod (sandbox/PVC) workspace recovery — the ``workspace_unavailable``
     arm of the completion endpoint, extracted for testability.
 
-    Re-dispatch through the POD arm: ensure_workspace → _create →
-    create_workspace 409-reuses the deterministic PVC (= reattach), and the
-    agent resumes from the Postgres checkpoint on the intact files. Bounded:
-    at the cap, fail LOUD instead of looping back into the same grave — and
-    delete the last-provisioned pod so it does not leak.
+    A dead transport leaves the interrupted command outcome unknown. Durable
+    reports atomically hold the Job and admit exact preserve cleanup; legacy
+    reports get a hold without cleanup. Explicit Resume requires native cleanup
+    settlement and the retained PVC. Exhaustion also holds without deletion.
 
-    Probe-before-punch: a TCP probe of the workspace sshd guards the delete.
-    A live pod is kept warm (its context stays ``ready`` so the re-dispatch
-    adopts it); only a dead probe tears the pod down. The attempts counter
-    increments either way so a pathological report-loop stays bounded.
+    A live probe retains the runtime under a no-cleanup attention hold; TCP
+    liveness does not establish that an interrupted tool had no effects.
     See knowledge-base/knowledge/features/workspace_pvc_branch_a_implementation.md (G1) and
     knowledge-base/knowledge/issues/maxsessions_parallel_tools_false_workspace_death.md (D).
 
@@ -493,10 +552,76 @@ async def handle_pod_workspace_recovery(
             # historical best-effort contract.
             raise RuntimeError("durable workspace recovery delete did not complete")
 
+    async def _hold_dead_workspace() -> dict[str, Any]:
+        disposition = await db.prepare_dead_workspace_recovery(
+            job_id,
+            expected_workspace=container_ctx,
+            expected_agent_id=job.get("assigned_agent_id"),
+            error_detail=error.get("message") or "workspace_unavailable",
+            completion_command_id=completion_command_id,
+            completion_finalizing_by=completion_finalizing_by,
+        )
+        if disposition is None:
+            # A stateless flag-off report has no durable cleanup authority.
+            # Do not acknowledge a no-op while its Job still owns work.
+            if (
+                completion_command_id is not None
+                or job.get("execution_lane") == "stateless"
+            ):
+                raise RuntimeError(
+                    "workspace recovery lost its cleanup disposition term"
+                )
+            return {
+                "status": "handled",
+                "job_id": job_id,
+                "new_status": "paused",
+                "paused": False,
+                "actions": [],
+            }
+        receipt = disposition.pop("cleanup_receipt", None)
+        if not disposition.get("cleanup_pending"):
+            return disposition
+        # A durable pending receipt is not the pure hold acknowledgement used
+        # for exhaustion. The service may continue only its already-admitted
+        # exact preserve intent; the database independently verifies settlement.
+        if receipt is None or cleanup_service is None:
+            raise RuntimeError("workspace recovery cleanup is pending")
+        await cleanup_service.reconcile_workspace_recovery_cleanup(receipt)
+        completed = await db.complete_workspace_recovery_cleanup(
+            receipt,
+            completion_finalizing_by=completion_finalizing_by,
+        )
+        if completed is None:
+            raise RuntimeError("workspace recovery cleanup is pending")
+        return completed
+
+    if "recovery_cleanup" in container_ctx:
+        return await _hold_dead_workspace()
+
     if completion_command_id is not None and (
         container_ctx.get("recovery_completion_command_id") == completion_command_id
     ):
         stored_outcome = container_ctx.get("recovery_completion_outcome")
+        if (
+            isinstance(stored_outcome, dict)
+            and stored_outcome.get("held_for_resume") is True
+        ):
+            # Re-read the committed receipt. Replay has no probe, dispatch or
+            # cleanup effect, including after an explicit Resume or Cancel.
+            replay = await db.hold_exhausted_workspace_recovery(
+                job_id,
+                expected_workspace=container_ctx,
+                expected_agent_id=job.get("assigned_agent_id"),
+                recovery_cap=int(
+                    os.environ.get("WORKSPACE_RECOVERY_MAX_ATTEMPTS", "3")
+                ),
+                error_detail=error.get("message") or "workspace_unavailable",
+                completion_command_id=completion_command_id,
+                completion_finalizing_by=completion_finalizing_by,
+            )
+            if replay is None:
+                raise RuntimeError("workspace recovery lost its committed hold outcome")
+            return replay
         if isinstance(stored_outcome, dict):
             # The processing→paused/failed disposition and this exact-command
             # marker are one jobs-row UPDATE.  A crash before the generic
@@ -540,286 +665,61 @@ async def handle_pod_workspace_recovery(
         0 if same_command_attempt else 1
     )
     cap = int(os.environ.get("WORKSPACE_RECOVERY_MAX_ATTEMPTS", "3"))
-    if attempts > cap:
-        logger.error(
-            f"Job {job_id}: workspace recovery exhausted after "
-            f"{cap} attempts — failing loud"
-        )
-        outcome = {
-            "status": "handled",
-            "job_id": job_id,
-            "new_status": "failed",
-            "actions": [
-                f"workspace recovery exhausted after {cap} attempts — failed loud"
-            ],
-        }
-        update_kwargs: dict[str, Any] = {}
-        if expected_status is not None:
-            update_kwargs["expected_status"] = expected_status
-        if completion_command_id is not None:
-            update_kwargs = {
-                "expected_status": str(job.get("status") or "processing"),
-                "completion_command_id": completion_command_id,
-                "completion_finalizing_by": completion_finalizing_by,
-                "workspace_context_updates": {
-                    "recovery_attempt_command_id": completion_command_id,
-                    "recovery_attempts": attempts,
-                    "recovery_completion_command_id": completion_command_id,
-                    "recovery_completion_outcome": outcome,
-                },
-            }
-        updated = await db.update_job_status(
+    worker_exhausted = is_container_worker_workspace_exhaustion(job, error)
+    if attempts > cap or worker_exhausted:
+        outcome = await db.hold_exhausted_workspace_recovery(
             job_id,
-            status="failed",
-            error_message=(
-                f"workspace unavailable; recovery exhausted after "
-                f"{cap} attempts: {error.get('message') or ''}"
-            ).strip(),
-            freeze_data={
-                "freeze_type": "workspace_unavailable",
-                "recovery_attempts": attempts,
-                "detail": error.get("message"),
-            },
-            **update_kwargs,
+            expected_workspace=container_ctx,
+            expected_agent_id=job.get("assigned_agent_id"),
+            recovery_cap=cap,
+            error_detail=error.get("message") or "workspace_unavailable",
+            completion_command_id=completion_command_id,
+            completion_finalizing_by=completion_finalizing_by,
+            **({"worker_queue_exhausted": True} if worker_exhausted else {}),
         )
-        if completion_command_id is not None and not updated:
-            raise RuntimeError("workspace recovery lost its finalizer disposition term")
-        if expected_status is not None and not updated:
-            return {**outcome, "paused": False}
-        # No leak on fail-loud: the pod provisioned by the previous attempt
-        # would otherwise run orphaned forever (PVC is never touched here).
-        try:
-            await _delete_for_recovery()
-        except Exception:
-            logger.exception(
-                f"Job {job_id}: error deleting workspace pod after "
-                f"exhausted recovery (job already failed)"
-            )
+        if outcome is None:
             if completion_command_id is not None:
-                # Legacy completion deliberately treated cleanup as
-                # best-effort.  The durable arm has a replay owner, so do not
-                # journal a failed external delete as complete.
-                raise
+                raise RuntimeError(
+                    "workspace recovery lost its finalizer disposition term"
+                )
+            return {
+                "status": "handled",
+                "job_id": job_id,
+                "new_status": "paused",
+                "actions": [],
+                "paused": False,
+            }
         return outcome
 
     host = container_ctx.get("host")
     port = int(container_ctx.get("port") or 30022)
     pod_alive = bool(host) and await probe(host, port)
+    if not pod_alive:
+        return await _hold_dead_workspace()
 
-    if completion_command_id is not None or expected_status is not None:
+    # A responsive sshd says nothing about an interrupted command's effects.
+    # Retain this live runtime, but require an explicit Resume decision.
+    outcome = await db.hold_unavailable_workspace_recovery(
+        job_id,
+        expected_workspace=container_ctx,
+        expected_agent_id=job.get("assigned_agent_id"),
+        error_detail=error.get("message") or "workspace_unavailable",
+        completion_command_id=completion_command_id,
+        completion_finalizing_by=completion_finalizing_by,
+    )
+    if outcome is None:
         if (
             completion_command_id is not None
-            and not pod_alive
-            and not container_ctx.get("_runtime_incarnation")
+            or job.get("execution_lane") == "stateless"
         ):
-            raise RuntimeError(
-                "durable workspace recovery is missing the captured Pod UID"
-            )
-        if pod_alive:
-            logger.warning(
-                f"Job {job_id}: workspace reported unavailable but sshd probe on "
-                f"{host}:{port} succeeded — keeping pod, re-dispatch "
-                f"(attempt {attempts}/{cap})"
-            )
-            container_updates = {
-                "recovery_attempts": attempts,
-                "previous_error": error.get("message") or "workspace_unavailable",
-            }
-            action = (
-                f"workspace recovery: pod alive on probe — kept, re-dispatch "
-                f"(attempt {attempts}/{cap})"
-            )
-        else:
-            logger.warning(
-                f"Job {job_id}: workspace unavailable — pod recovery "
-                f"attempt {attempts}/{cap} (PVC reattach)"
-            )
-            container_updates = {
-                "status": "deleted",
-                "pod_ip": None,
-                "recovery_attempts": attempts,
-                "previous_error": error.get("message") or "workspace_unavailable",
-            }
-            action = (
-                f"workspace recovery: dead pod deleted (PVC kept), "
-                f"re-dispatch for reattach (attempt {attempts}/{cap})"
-            )
-
-        outcome = {
+            raise RuntimeError("workspace recovery lost its attention disposition term")
+        return {
             "status": "handled",
             "job_id": job_id,
             "new_status": "paused",
-            "actions": [action],
-            "paused": True,
+            "paused": False,
+            "actions": [],
         }
-        pause_kwargs: dict[str, Any] = {}
-        if completion_command_id is not None:
-            container_updates.update(
-                {
-                    "recovery_attempt_command_id": completion_command_id,
-                    "recovery_delete_pending": not pod_alive,
-                    "recovery_completion_command_id": completion_command_id,
-                    "recovery_completion_outcome": outcome,
-                }
-            )
-            pause_kwargs = {
-                "completion_command_id": completion_command_id,
-                "completion_finalizing_by": completion_finalizing_by,
-            }
-        # The same processing->paused CAS must win before either mode can
-        # invalidate runtime context or retire the captured pod. The legacy
-        # completion has no durable command and must not write its markers.
-        paused = await db.pause_job_shed_freeze(
-            job_id,
-            workspace_context_updates=container_updates,
-            **pause_kwargs,
-        )
-        if not paused:
-            outcome["paused"] = False
-            return outcome
-
-        if not pod_alive:
-            try:
-                await _delete_for_recovery()
-            except Exception:
-                logger.exception("Job %s: error deleting dead workspace pod", job_id)
-                if completion_command_id is not None:
-                    raise
-            if completion_command_id is not None:
-                cleared = await db.merge_workspace_container_context(
-                    job_id,
-                    {"recovery_delete_pending": False},
-                    completion_command_id=completion_command_id,
-                    completion_finalizing_by=completion_finalizing_by,
-                )
-                if not cleared:
-                    raise RuntimeError(
-                        "workspace recovery lost its delete-complete term"
-                    )
-        trigger_dispatch()
-        if completion_command_id is None:
-            outcome.pop("paused")
-        return outcome
-
-    if pod_alive:
-        # The workspace answers — the report was a misclassification or a
-        # transient. Keep the warm pod (context stays ready → the re-dispatch
-        # adopts it); only record the attempt + discriminating cause.
-        logger.warning(
-            f"Job {job_id}: workspace reported unavailable but sshd probe on "
-            f"{host}:{port} succeeded — keeping pod, re-dispatch "
-            f"(attempt {attempts}/{cap})"
-        )
-        container_updates = {
-            "recovery_attempts": attempts,
-            "previous_error": error.get("message") or "workspace_unavailable",
-        }
-        if completion_command_id is not None:
-            container_updates["recovery_attempt_command_id"] = completion_command_id
-        merge_kwargs = (
-            {
-                "completion_command_id": completion_command_id,
-                "completion_finalizing_by": completion_finalizing_by,
-            }
-            if completion_command_id is not None
-            else {}
-        )
-        merged = await db.merge_workspace_container_context(
-            job_id, container_updates, **merge_kwargs
-        )
-        if completion_command_id is not None and not merged:
-            raise RuntimeError("workspace recovery lost its counter-update term")
-        action = (
-            f"workspace recovery: pod alive on probe — kept, re-dispatch "
-            f"(attempt {attempts}/{cap})"
-        )
-    else:
-        logger.warning(
-            f"Job {job_id}: workspace unavailable — pod recovery "
-            f"attempt {attempts}/{cap} (PVC reattach)"
-        )
-        # Invalidate the stale container so the re-dispatch RECREATES it
-        # (and reattaches the PVC) instead of reusing the dead pod:
-        #   * status="deleted" — `_job_needs_sandbox` returns False while
-        #     status=="ready", short-circuiting before ensure_workspace's
-        #     drift probe; and delete_workspace's 404/"already deleted"
-        #     branch does NOT set the status, so we must set it here.
-        #   * pod_ip=None — drop the dead IP the resume path would dial.
-        container_updates = {
-            "status": "deleted",
-            "pod_ip": None,
-            "recovery_attempts": attempts,
-            "previous_error": error.get("message") or "workspace_unavailable",
-        }
-        if completion_command_id is not None:
-            container_updates["recovery_attempt_command_id"] = completion_command_id
-        merge_kwargs = (
-            {
-                "completion_command_id": completion_command_id,
-                "completion_finalizing_by": completion_finalizing_by,
-            }
-            if completion_command_id is not None
-            else {}
-        )
-        merged = await db.merge_workspace_container_context(
-            job_id, container_updates, **merge_kwargs
-        )
-        if completion_command_id is not None and not merged:
-            raise RuntimeError("workspace recovery lost its counter-update term")
-        # Delete the dead pod so create_workspace does not ADOPT the Failed
-        # tombstone (restartPolicy:Never → not "terminating"). The PVC is
-        # retained (delete_workspace never touches it) and reattaches by
-        # name on recreate.
-        try:
-            await _delete_for_recovery()
-        except Exception:
-            logger.exception(
-                f"Job {job_id}: error deleting dead workspace pod "
-                f"(continuing to re-dispatch)"
-            )
-            if completion_command_id is not None:
-                # Re-dispatching before the exact pod is gone can make the
-                # deterministic workspace name adopt a failed tombstone.  A
-                # durable command must retry the fenced delete instead.
-                raise
-        action = (
-            f"workspace recovery: dead pod deleted (PVC kept), "
-            f"re-dispatch for reattach (attempt {attempts}/{cap})"
-        )
-
-    # The pause clears the agent + flips to paused (→ resume=True on
-    # re-dispatch) AND sheds any row-level freeze into
-    # context.last_freeze_data: paused + freeze_data set is invisible to
-    # get_dispatchable_jobs, so a freeze surviving this transition would park
-    # the job forever
-    # (knowledge-base/knowledge/issues/recovery_pause_repersists_stale_freeze_invisible_job.md).
-    # Gate the dispatch on the processing→paused transition so a duplicate
-    # completion can't double-dispatch.
-    outcome: dict[str, Any] = {
-        "status": "handled",
-        "job_id": job_id,
-        "new_status": "paused",
-        "actions": [action],
-    }
-    if completion_command_id is not None:
-        # Internal replay discriminator only.  Keeping it off the legacy arm
-        # preserves the exact pre-flag response contract.
-        outcome["paused"] = True
-    pause_kwargs: dict[str, Any] = {}
-    if completion_command_id is not None or completion_finalizing_by is not None:
-        pause_kwargs = {
-            "completion_command_id": completion_command_id,
-            "completion_finalizing_by": completion_finalizing_by,
-            "workspace_context_updates": {
-                "recovery_completion_command_id": completion_command_id,
-                "recovery_completion_outcome": outcome,
-            },
-        }
-    paused = await db.pause_job_shed_freeze(job_id, **pause_kwargs)
-    if paused:
-        trigger_dispatch()
-    if completion_command_id is not None and not paused:
-        outcome["paused"] = False
     return outcome
 
 

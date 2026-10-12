@@ -26,6 +26,9 @@ from fastapi import HTTPException
 import orchestrator.main
 from orchestrator.database.postgres import PostgresDB
 from orchestrator.routers import job_diff as job_diff_routes
+from orchestrator.application import completion as completion_composition
+from orchestrator.application import workspace as workspace_composition
+from orchestrator.schemas import job_runtime as job_runtime_module
 
 JOB_ID = "11111111-1111-1111-1111-111111111111"
 AGENT_ID = "22222222-2222-2222-2222-222222222222"
@@ -412,6 +415,12 @@ class _EndpointDB(PostgresDB):
             async def fetchval(self, _sql: str, *_args):
                 return db.job.get("execution_lane", "pinned")
 
+            async def fetch(self, sql: str, *args):
+                # The terminal status write revokes credential leases (C2);
+                # this Job holds none.
+                db.statements.append((sql, args))
+                return []
+
         yield _Connection()
 
     async def get_job(self, job_id: str) -> dict:
@@ -473,18 +482,50 @@ def _job(*, freeze_data: dict | None = None, **overrides) -> dict:
 
 
 def _patch_completion(stack: ExitStack, db: _EndpointDB) -> None:
+    # The completion composition builds its recovery stores per call; inject an
+    # idle one through both dependency factories that carry one.
+    recovery_store = idle_recovery_store()
+    effect_dependencies = completion_composition.completion_effect_dependencies
+    legacy_dependencies = completion_composition.legacy_completion_dependencies
+
+    def idle_effect_dependencies(resources):
+        return dataclasses.replace(
+            effect_dependencies(resources), recovery_store=recovery_store
+        )
+
+    def idle_legacy_dependencies(resources):
+        resolved = legacy_dependencies(resources)
+        return dataclasses.replace(
+            resolved,
+            workspace=dataclasses.replace(
+                resolved.workspace, recovery_store=recovery_store
+            ),
+        )
+
     stack.enter_context(
-        patch(
-            "orchestrator.main.VMWorkspaceRecoveryStore",
-            return_value=idle_recovery_store(),
+        patch.object(
+            completion_composition,
+            "completion_effect_dependencies",
+            idle_effect_dependencies,
         )
     )
-    stack.enter_context(patch("orchestrator.main.require_internal", AsyncMock()))
-    stack.enter_context(patch("orchestrator.main.postgres_db", db))
+    stack.enter_context(
+        patch.object(
+            completion_composition,
+            "legacy_completion_dependencies",
+            idle_legacy_dependencies,
+        )
+    )
+    stack.enter_context(
+        patch("orchestrator.security.access.require_internal", AsyncMock())
+    )
+    stack.enter_context(patch("orchestrator.main.app.state.resources.postgres_db", db))
     gitea = MagicMock()
     gitea.is_initialized = False
-    stack.enter_context(patch("orchestrator.main.gitea_client", gitea))
-    stack.enter_context(patch("orchestrator.main.vector_db", None))
+    stack.enter_context(
+        patch("orchestrator.main.app.state.resources.gitea_client", gitea)
+    )
+    stack.enter_context(patch("orchestrator.main.app.state.resources.vector_db", None))
     stack.enter_context(
         patch(
             "orchestrator.services.completion.apply_deliverable_gate",
@@ -500,12 +541,12 @@ def _patch_completion(stack: ExitStack, db: _EndpointDB) -> None:
         )
     )
     for target in (
-        "orchestrator.main.verification_operations.handle_critic_verdict_on_complete",
-        "orchestrator.main.subjob_completion_operations.handle_scholar_completion",
-        "orchestrator.main.subjob_completion_operations.handle_delegation_child_completion",
-        "orchestrator.main.verification_operations.trigger_verification_on_complete",
-        "orchestrator.main.project_loop_advance_service.advance_project_loop",
-        "orchestrator.main.maybe_wake_session",
+        "orchestrator.services.verification_workflow.handle_critic_verdict_on_complete",
+        "orchestrator.services.subjob_completion.handle_scholar_completion",
+        "orchestrator.services.subjob_completion.handle_delegation_child_completion",
+        "orchestrator.services.verification_workflow.trigger_verification_on_complete",
+        "orchestrator.services.project_loop_advance.advance_project_loop",
+        "orchestrator.services.session_wake.maybe_wake_session",
     ):
         stack.enter_context(patch(target, AsyncMock(return_value=[])))
     stack.enter_context(
@@ -516,9 +557,11 @@ def _patch_completion(stack: ExitStack, db: _EndpointDB) -> None:
         )
     )
     stack.enter_context(
-        patch("orchestrator.main._kick_session_wake_drain", MagicMock())
+        patch("orchestrator.services.session_wake.kick_drain", MagicMock())
     )
-    stack.enter_context(patch("orchestrator.main._trigger_dispatch", MagicMock()))
+    stack.enter_context(
+        patch("orchestrator.services.job_dispatcher.trigger_dispatch", MagicMock())
+    )
 
 
 class TestCompleteJobClassA:
@@ -526,7 +569,7 @@ class TestCompleteJobClassA:
     async def test_stale_stateless_token_rejected_before_late_callback_guard(self):
         job = _job(status="completed", execution_lane="stateless")
         db = _EndpointDB(job)
-        body = orchestrator.main.JobCompleteRequest(
+        body = job_runtime_module.JobCompleteRequest(
             should_stop=True,
             goal_achieved=True,
             lease_token=6,
@@ -551,7 +594,7 @@ class TestCompleteJobClassA:
     async def test_exact_stateless_token_retry_reaches_benign_late_guard(self):
         job = _job(status="completed", execution_lane="stateless")
         db = _EndpointDB(job)
-        body = orchestrator.main.JobCompleteRequest(
+        body = job_runtime_module.JobCompleteRequest(
             should_stop=True,
             goal_achieved=True,
             lease_token=7,
@@ -576,7 +619,7 @@ class TestCompleteJobClassA:
     async def test_pinned_job_ignores_optional_stateless_lease_token(self):
         job = _job(status="completed", execution_lane="pinned")
         db = _EndpointDB(job)
-        body = orchestrator.main.JobCompleteRequest(
+        body = job_runtime_module.JobCompleteRequest(
             should_stop=True,
             goal_achieved=False,
             lease_token=7,
@@ -607,7 +650,7 @@ class TestCompleteJobClassA:
     ):
         job = _job(status=status, execution_lane="stateless")
         db = _EndpointDB(job)
-        body = orchestrator.main.JobCompleteRequest(
+        body = job_runtime_module.JobCompleteRequest(
             should_stop=True,
             goal_achieved=status == "failed",
             lease_token=7,
@@ -633,7 +676,7 @@ class TestCompleteJobClassA:
     async def test_stateless_disposition_cas_cannot_overwrite_winning_cancel(self):
         job = _job(execution_lane="stateless")
         db = _EndpointDB(job)
-        body = orchestrator.main.JobCompleteRequest(
+        body = job_runtime_module.JobCompleteRequest(
             should_stop=True,
             goal_achieved=True,
             lease_token=7,
@@ -671,7 +714,7 @@ class TestCompleteJobClassA:
             context={"queued_replies": [{"reply": "keep until checkpoint ack"}]},
         )
         db = _EndpointDB(job)
-        body = orchestrator.main.JobCompleteRequest(
+        body = job_runtime_module.JobCompleteRequest(
             should_stop=True,
             goal_achieved=True,
             lease_token=7,
@@ -694,7 +737,7 @@ class TestCompleteJobClassA:
     async def test_completed_disposition_is_one_jobs_update(self):
         job = _job()
         db = _EndpointDB(job)
-        body = orchestrator.main.JobCompleteRequest(
+        body = job_runtime_module.JobCompleteRequest(
             should_stop=True,
             goal_achieved=True,
             freeze_data={"status": "job_completed", "summary": "done"},
@@ -718,6 +761,36 @@ class TestCompleteJobClassA:
         assert job["completed_at"] == "set"
 
     @pytest.mark.asyncio
+    async def test_the_terminal_status_write_revokes_the_jobs_leases(self):
+        """Connector drivers C2: completion revokes the Job's credential
+        leases right after its status write, in the same effect."""
+        job = _job()
+        db = _EndpointDB(job)
+        body = job_runtime_module.JobCompleteRequest(
+            should_stop=True,
+            goal_achieved=True,
+            freeze_data={"status": "job_completed", "summary": "done"},
+        )
+
+        with ExitStack() as stack:
+            _patch_completion(stack, db)
+            await b08_helpers.complete_job(MagicMock(), JOB_ID, body)
+
+        statements = [_normalized(sql) for sql, _ in db.statements]
+        revokes = [
+            (index, args)
+            for index, (sql, args) in enumerate(db.statements)
+            if "UPDATE connector_credential_leases" in sql
+        ]
+        assert [args for _, args in revokes] == [(JOB_ID, "job_completed")]
+        status_write = next(
+            index
+            for index, sql in enumerate(statements)
+            if sql.startswith("UPDATE jobs SET status = $1")
+        )
+        assert revokes[0][0] > status_write
+
+    @pytest.mark.asyncio
     async def test_strict_delivery_cap_terminalizes_blocked_in_one_class_a_write(
         self,
     ):
@@ -727,7 +800,7 @@ class TestCompleteJobClassA:
             context={"required_deliverables": ["pr:acme/widget"]},
         )
         db = _EndpointDB(job)
-        body = orchestrator.main.JobCompleteRequest(
+        body = job_runtime_module.JobCompleteRequest(
             should_stop=True,
             goal_achieved=False,
             freeze_data={"status": "job_completed", "summary": "no PR produced"},
@@ -750,7 +823,7 @@ class TestCompleteJobClassA:
             )
             verification = stack.enter_context(
                 patch(
-                    "orchestrator.main.verification_operations.trigger_verification_on_complete",
+                    "orchestrator.services.verification_workflow.trigger_verification_on_complete",
                     AsyncMock(),
                 )
             )
@@ -767,13 +840,76 @@ class TestCompleteJobClassA:
         verification.assert_not_awaited()
 
     @pytest.mark.asyncio
+    async def test_a_held_full_autonomy_seal_is_neither_silent_nor_unexplained(
+        self,
+    ):
+        """worker_git_versioning_stops_midjob_seal_pins_stale_revision.md.
+
+        A full-autonomy completion carries no freeze_type, so a seal the gate
+        held as delivery-unproven used to land in pending_review with no
+        notification and no reason anywhere a human or officer reads. The
+        reason now rides the same status write as error_message, and the
+        owner gets a review-queue item that names it.
+        """
+        from orchestrator.services.deliverable_gate import DeliverableGateResult
+
+        reason = (
+            "the worker could not read its workspace HEAD when it sealed "
+            "(head_commit is null)"
+        )
+        job = _job(context={"required_deliverables": ["output/report.md"]})
+        db = _EndpointDB(job)
+        body = job_runtime_module.JobCompleteRequest(
+            should_stop=True,
+            goal_achieved=True,
+            freeze_data={
+                "status": "job_completed",
+                "summary": "done",
+                "head_commit": None,
+            },
+        )
+        notify = AsyncMock()
+
+        with ExitStack() as stack:
+            _patch_completion(stack, db)
+            stack.enter_context(
+                patch(
+                    "orchestrator.services.completion.apply_deliverable_gate",
+                    AsyncMock(
+                        return_value=DeliverableGateResult(
+                            "pending_review",
+                            [f"deliverable gate: delivery unproven ({reason})"],
+                            False,
+                            hold_reason=reason,
+                        )
+                    ),
+                )
+            )
+            stack.enter_context(
+                patch(
+                    "orchestrator.services.job_freeze_notifications.notify_operator_freeze",
+                    notify,
+                )
+            )
+            handled = await b08_helpers.complete_job(MagicMock(), JOB_ID, body)
+
+        assert handled["new_status"] == "pending_review"
+        [(_sql, args)] = db.class_a_statements()
+        assert args[0] == "pending_review"
+        assert f"Delivery unproven: {reason}" in args
+        notify.assert_awaited_once()
+        _job_arg, _job_id, freeze_type, freeze_arg = notify.await_args.args[:4]
+        assert freeze_type == "job_complete"
+        assert freeze_arg["delivery_hold"] == reason
+
+    @pytest.mark.asyncio
     async def test_evidence_record_failure_never_persists_private_coordinates(
         self, caplog
     ):
         private_detail = "victim-private-repo/private/report.png"
         job = _job()
         db = _EndpointDB(job)
-        body = orchestrator.main.JobCompleteRequest(
+        body = job_runtime_module.JobCompleteRequest(
             should_stop=True,
             goal_achieved=True,
             freeze_data={"status": "job_completed", "summary": "done"},
@@ -802,7 +938,7 @@ class TestCompleteJobClassA:
         }
         job = _job()
         db = _EndpointDB(job, fail_initial_freeze_write=True)
-        body = orchestrator.main.JobCompleteRequest(
+        body = job_runtime_module.JobCompleteRequest(
             should_stop=True,
             goal_achieved=False,
             freeze_data=freeze,
@@ -838,7 +974,7 @@ class TestCompleteJobClassA:
         }
         job = _job()
         db = _EndpointDB(job)
-        body = orchestrator.main.JobCompleteRequest(
+        body = job_runtime_module.JobCompleteRequest(
             should_stop=True,
             goal_achieved=False,
             freeze_data=freeze,
@@ -851,17 +987,20 @@ class TestCompleteJobClassA:
         with ExitStack() as stack:
             _patch_completion(stack, db)
             stack.enter_context(
-                patch("orchestrator.main._check_vm_permission", AsyncMock())
+                patch(
+                    "orchestrator.services.vm_workspace_policy.check_vm_permission",
+                    AsyncMock(),
+                )
             )
             stack.enter_context(
                 patch(
-                    "orchestrator.main.sudo_gate.insert_vm_upgrade_request",
+                    "orchestrator.services.sudo_gate.sudo_gate.insert_vm_upgrade_request",
                     AsyncMock(return_value=None),
                 )
             )
             stack.enter_context(
                 patch(
-                    "orchestrator.main.job_freeze_notification_service.notify_operator_freeze",
+                    "orchestrator.services.job_freeze_notifications.notify_operator_freeze",
                     AsyncMock(),
                 )
             )
@@ -874,7 +1013,7 @@ class TestCompleteJobClassA:
             )
             stack.enter_context(
                 patch(
-                    "orchestrator.main.asyncio.create_task",
+                    "asyncio.create_task",
                     MagicMock(side_effect=close_capture),
                 )
             )
@@ -893,6 +1032,67 @@ class TestCompleteJobClassA:
         ]
         assert "freeze stashed to context (auto-redispatch)" not in handled["actions"]
         assert job["freeze_data"] == freeze
+
+
+class TestJobOutboxDelivery:
+    """S16b: a root job with its owner's outbox gets its deliverables copied
+    at completion, best-effort; the copy never changes the status."""
+
+    _OUTBOX = {"cloud_connectors": [{"kind": "cloud_outbox", "datasource_id": "o"}]}
+
+    async def _complete(self, job, *, effect):
+        db = _EndpointDB(job)
+        body = job_runtime_module.JobCompleteRequest(
+            should_stop=True,
+            goal_achieved=True,
+            freeze_data={"status": "job_completed", "summary": "done"},
+        )
+        with ExitStack() as stack:
+            _patch_completion(stack, db)
+            stack.enter_context(
+                patch("orchestrator.services.job_export.run_job_outbox_effect", effect)
+            )
+            return await b08_helpers.complete_job(MagicMock(), JOB_ID, body)
+
+    @pytest.mark.asyncio
+    async def test_a_root_job_with_its_outbox_is_copied_and_completes(self):
+        effect = AsyncMock(
+            return_value={"state": "delivered", "files": 2, "shared": False}
+        )
+        handled = await self._complete(_job(context=dict(self._OUTBOX)), effect=effect)
+
+        effect.assert_awaited_once()
+        assert effect.await_args.kwargs["job_id"] == JOB_ID
+        assert handled["new_status"] == "completed"
+        assert "job outbox delivered (2 file(s), shared=False)" in handled["actions"]
+
+    @pytest.mark.asyncio
+    async def test_a_failed_copy_leaves_the_status_alone(self):
+        effect = AsyncMock(side_effect=RuntimeError("cloud down"))
+        handled = await self._complete(_job(context=dict(self._OUTBOX)), effect=effect)
+
+        assert handled["new_status"] == "completed"
+        assert "job outbox delivery failed (status unchanged)" in handled["actions"]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "overrides",
+        [
+            {"context": {}},
+            {
+                "context": dict(_OUTBOX),
+                "parent_job_id": "55555555-5555-4555-8555-555555555555",
+            },
+            {"context": {**_OUTBOX, "loop_id": "l1"}},
+        ],
+        ids=["no-outbox", "subjob", "loop"],
+    )
+    async def test_no_outbox_a_subjob_or_a_loop_is_not_copied(self, overrides):
+        effect = AsyncMock()
+
+        await self._complete(_job(**overrides), effect=effect)
+
+        effect.assert_not_awaited()
 
 
 class TestDiffDecisionClassA:
@@ -919,10 +1119,18 @@ class TestDiffDecisionClassA:
         router.for_backend.return_value = backend
 
         with ExitStack() as stack:
-            stack.enter_context(patch("orchestrator.main.postgres_db", db))
-            stack.enter_context(patch("orchestrator.main.gitea_client", gitea))
-            stack.enter_context(patch("orchestrator.main.main_cloud_router", router))
-            stack.enter_context(patch("orchestrator.main.vector_db", None))
+            stack.enter_context(
+                patch("orchestrator.main.app.state.resources.postgres_db", db)
+            )
+            stack.enter_context(
+                patch("orchestrator.main.app.state.resources.gitea_client", gitea)
+            )
+            stack.enter_context(
+                patch("orchestrator.main.app.state.resources.main_cloud_router", router)
+            )
+            stack.enter_context(
+                patch("orchestrator.main.app.state.resources.vector_db", None)
+            )
             stack.enter_context(
                 patch(
                     "orchestrator.services.job_cloud_baseline.get_diff_summary",
@@ -962,8 +1170,18 @@ class TestDiffDecisionClassA:
                 MagicMock(),
                 JOB_ID,
                 dependencies=dataclasses.replace(
-                    orchestrator.main._job_diff_dependencies(),
-                    require_job_access=AsyncMock(return_value=({}, job)),
+                    workspace_composition.job_diff_dependencies(
+                        orchestrator.main.app.state.resources
+                    ),
+                    require_job_access=AsyncMock(
+                        return_value=(
+                            {
+                                "id": "00000000-0000-4000-8000-0000000000ad",
+                                "is_admin": True,
+                            },
+                            job,
+                        )
+                    ),
                 ),
             )
 
@@ -987,9 +1205,15 @@ class TestDiffDecisionClassA:
         gitea = MagicMock()
 
         with ExitStack() as stack:
-            stack.enter_context(patch("orchestrator.main.postgres_db", db))
-            stack.enter_context(patch("orchestrator.main.gitea_client", gitea))
-            stack.enter_context(patch("orchestrator.main.vector_db", None))
+            stack.enter_context(
+                patch("orchestrator.main.app.state.resources.postgres_db", db)
+            )
+            stack.enter_context(
+                patch("orchestrator.main.app.state.resources.gitea_client", gitea)
+            )
+            stack.enter_context(
+                patch("orchestrator.main.app.state.resources.vector_db", None)
+            )
             stack.enter_context(
                 patch(
                     "orchestrator.services.completion.apply_terminal_job_side_effects",
@@ -1000,8 +1224,18 @@ class TestDiffDecisionClassA:
                 MagicMock(),
                 JOB_ID,
                 dependencies=dataclasses.replace(
-                    orchestrator.main._job_diff_dependencies(),
-                    require_job_access=AsyncMock(return_value=({}, job)),
+                    workspace_composition.job_diff_dependencies(
+                        orchestrator.main.app.state.resources
+                    ),
+                    require_job_access=AsyncMock(
+                        return_value=(
+                            {
+                                "id": "00000000-0000-4000-8000-0000000000ad",
+                                "is_admin": True,
+                            },
+                            job,
+                        )
+                    ),
                 ),
             )
 

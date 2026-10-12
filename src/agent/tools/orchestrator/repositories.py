@@ -151,7 +151,10 @@ async def _fetch_internal_repositories(
     if not context.thread_id:
         return []
     resp = await client.get(
-        f"{base_url}/api/agents/threads/{context.thread_id}/workspace"
+        f"{base_url}/api/agents/threads/{context.thread_id}/workspace",
+        # Only the repositories are read; the header keeps the poll from
+        # being taken for an agent older than the in-pod plane (D7).
+        headers={"X-SRW-Cloud-Mount-Delivery": "sidecar"},
     )
     resp.raise_for_status()
     data = resp.json()

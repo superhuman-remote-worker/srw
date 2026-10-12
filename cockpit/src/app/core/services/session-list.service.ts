@@ -20,6 +20,7 @@ export class SessionListService {
 
   private readonly _threads = signal<Thread[]>([]);
   private readonly _loading = signal(false);
+  private refreshSerial = 0;
 
   readonly threads = this._threads.asReadonly();
   readonly loading = this._loading.asReadonly();
@@ -49,15 +50,18 @@ export class SessionListService {
   }
 
   refresh(): Promise<void> {
+    const serial = ++this.refreshSerial;
     this._loading.set(true);
     return firstValueFrom(
       this.http.get<{threads: Thread[]}>(`${environment.apiUrl}/persistent/threads`),
     ).then(
       (r) => {
+        if (serial !== this.refreshSerial) return;
         this._threads.set(r?.threads ?? []);
         this._loading.set(false);
       },
       () => {
+        if (serial !== this.refreshSerial) return;
         // Leave _threads untouched: a transient failure should not blank
         // whatever was already on screen (or, for a first-ever load, it's
         // already the empty initial value — either way there's nothing to

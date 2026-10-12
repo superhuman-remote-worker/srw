@@ -207,6 +207,241 @@ async def test_pending_tools_resume_restores_phase_before_instruction_gate(confi
     assert context.check_tool_enforcement("todo_complete") is not None
 
 
+@pytest.mark.asyncio
+async def test_audited_node_receipt_survives_reconstruction_and_invalidates(
+    config, tmp_path
+):
+    """A valid skill-read receipt survives worker reconstruction via the real
+    audited tool node and real persisted-checkpoint wiring — and nothing more.
+
+    Claim 1 executes real reads through a real saver-backed audited-tool
+    subgraph (no ToolNode mock, no provider call) under one thread ID. Claim 2
+    reconstructs a fresh worker (new workspace manager over the same bytes,
+    new ToolContext, new compiled graph on the same saver) and restores from
+    the values retrieved through the successor graph's ``aget_state`` — the
+    same production path as ``snapshot.values``: the gated action then
+    succeeds with no further read. Changed content, a new concrete phase, and
+    an expired turn window each legitimately re-arm the gate until one fresh
+    read. An ordinary file read through the same node grants local
+    read-before-write authority yet never enters the saved receipts and never
+    crosses the lease as write authority — in either direction.
+    """
+    from typing import Annotated
+
+    from langchain_core.tools import tool as langchain_tool
+    from langgraph.checkpoint.memory import InMemorySaver
+    from langgraph.graph import START, END, StateGraph
+    from langgraph.graph.message import add_messages
+    from typing_extensions import TypedDict
+
+    from agent.agent import UniversalAgent  # noqa: E402
+    from agent.core.workspace import WorkspaceManager  # noqa: E402
+    from agent.tools.registry import apply_instruction_enforcement  # noqa: E402
+    from agent.tools.workspace.files import create_file_tools  # noqa: E402
+    from tests._fs_backend import FilesystemTestBackend  # noqa: E402
+
+    SKILL_PATH = "skills/verify-before-done/SKILL.md"
+    BODY_V1 = "---\nname: verify-before-done\n---\nNODE-RESUME-BODY-v1\n"
+    BODY_V2 = "---\nname: verify-before-done\n---\nNODE-RESUME-BODY-v2\n"
+
+    class _NodeState(TypedDict, total=False):
+        messages: Annotated[list, add_messages]
+        job_id: str
+        iteration: int
+        is_strategic_phase: bool
+        phase_number: int
+        turn_count: int
+        metadata: dict
+        instruction_read_receipts: dict
+
+    def _binding():
+        return InstructionFileEntry(
+            trigger="before_tool:verify_probe",
+            skill="verify-before-done",
+            enforce=True,
+            phases=["tactical"],
+            read_scope="phase",
+            max_read_age_turns=20,
+        )
+
+    def _workspace():
+        return WorkspaceManager(
+            job_id="t", base_path=tmp_path, backend=FilesystemTestBackend(tmp_path)
+        )
+
+    def _context_and_tools(workspace):
+        ctx = ToolContext(workspace_manager=workspace)
+        ctx._stateless_worker = True
+        ctx._instruction_files = [_binding()]
+        ctx._llm_config = None
+        file_tools = {t.name: t for t in create_file_tools(ctx)}
+
+        @langchain_tool
+        def verify_probe() -> str:
+            """Gated probe with no phase metadata."""
+            return "GATED-OK"
+
+        apply_instruction_enforcement([verify_probe], ctx)
+        return ctx, file_tools["read_file"], verify_probe
+
+    def _compile(audited, checkpointer=None):
+        workflow = StateGraph(_NodeState)
+        workflow.add_node("audited_tools", audited)
+        workflow.add_edge(START, "audited_tools")
+        workflow.add_edge("audited_tools", END)
+        return workflow.compile(checkpointer=checkpointer)
+
+    def _state(tool_calls, phase_number, turn_count):
+        return {
+            "messages": [AIMessage(content="", tool_calls=tool_calls)],
+            "job_id": "test-job",
+            "iteration": 1,
+            "is_strategic_phase": False,
+            "phase_number": phase_number,
+            "turn_count": turn_count,
+            "metadata": {},
+        }
+
+    def _content(result, call_id):
+        messages = [
+            m
+            for m in result.get("messages", [])
+            if getattr(m, "tool_call_id", None) == call_id
+        ]
+        assert len(messages) == 1
+        return messages[0].content or ""
+
+    def _restore(context, values):
+        agent = UniversalAgent.__new__(UniversalAgent)
+        agent._tool_context = context
+        return agent._restore_worker_instruction_reads(values)
+
+    # ---- claim 1: gate blocks, then real reads persist receipts ----
+    saver = InMemorySaver()
+    thread_config = {"configurable": {"thread_id": "node-resume-test"}}
+    ws1 = _workspace()
+    ws1.backend.mkdir("skills/verify-before-done")
+    ws1.backend.mkdir("notes")
+    ws1.write_file(SKILL_PATH, BODY_V1)
+    ws1.write_file("notes/ordinary.md", "ordinary bytes")
+    ctx1, read_tool_1, probe_1 = _context_and_tools(ws1)
+    app1 = _compile(
+        create_audited_tool_node([read_tool_1, probe_1], config, tool_context=ctx1),
+        checkpointer=saver,
+    )
+
+    blocked = await app1.ainvoke(
+        _state([make_tool_call("verify_probe", {}, "c-probe-0")], 2, 5),
+        config=thread_config,
+    )
+    assert "must read" in _content(blocked, "c-probe-0").lower()
+
+    first = await app1.ainvoke(
+        _state([make_tool_call("read_file", {"path": SKILL_PATH}, "c-read-1")], 2, 5),
+        config=thread_config,
+    )
+    assert "NODE-RESUME-BODY-v1" in _content(first, "c-read-1")
+    assert SKILL_PATH in (first.get("instruction_read_receipts") or {})
+
+    # The ordinary file goes through the same real node before the successor
+    # ever reads the checkpoint: locally recorded, granting local
+    # read-before-write authority — yet never an instruction receipt.
+    ordinary = await app1.ainvoke(
+        _state(
+            [make_tool_call("read_file", {"path": "notes/ordinary.md"}, "c-read-ord")],
+            2,
+            5,
+        ),
+        config=thread_config,
+    )
+    assert "ordinary bytes" in _content(ordinary, "c-read-ord")
+    assert ctx1.recent_read_matches("notes/ordinary.md", "ordinary bytes")
+    assert "notes/ordinary.md" not in ctx1.export_instruction_read_receipts()
+
+    # ---- claim 2: persisted checkpoint restores enforcement, not authority ----
+    ctx2, read_tool_2, probe_2 = _context_and_tools(_workspace())
+    app2 = _compile(
+        create_audited_tool_node([read_tool_2, probe_2], config, tool_context=ctx2),
+        checkpointer=saver,
+    )
+    snapshot = await app2.aget_state(thread_config)
+    saved_values = snapshot.values
+    assert saved_values, "expected a persisted checkpoint for the thread"
+    assert SKILL_PATH in (saved_values.get("instruction_read_receipts") or {})
+    assert "notes/ordinary.md" not in (
+        saved_values.get("instruction_read_receipts") or {}
+    )
+    assert _restore(ctx2, saved_values) == 1
+    second = await app2.ainvoke(
+        _state([make_tool_call("verify_probe", {}, "c-probe-2")], 2, 6),
+        config=thread_config,
+    )
+    assert "GATED-OK" in _content(second, "c-probe-2")
+    # Neither the ordinary read nor the restored skill receipt grants write
+    # authority on the new lease.
+    assert not ctx2.recent_read_matches("notes/ordinary.md", "ordinary bytes")
+    assert not ctx2.recent_read_matches(SKILL_PATH, BODY_V1)
+
+    # ---- changed content fails closed until one fresh read ----
+    _workspace().write_file(SKILL_PATH, BODY_V2)
+    ctx3, read_tool_3, probe_3 = _context_and_tools(_workspace())
+    assert _restore(ctx3, first) == 0
+    app3 = _compile(
+        create_audited_tool_node([read_tool_3, probe_3], config, tool_context=ctx3)
+    )
+    stale = await app3.ainvoke(
+        _state([make_tool_call("verify_probe", {}, "c-probe-3")], 2, 6)
+    )
+    assert "must read" in _content(stale, "c-probe-3").lower()
+    reread = await app3.ainvoke(
+        _state([make_tool_call("read_file", {"path": SKILL_PATH}, "c-read-3")], 2, 6)
+    )
+    assert "NODE-RESUME-BODY-v2" in _content(reread, "c-read-3")
+    fixed = await app3.ainvoke(
+        _state([make_tool_call("verify_probe", {}, "c-probe-3b")], 2, 7)
+    )
+    assert "GATED-OK" in _content(fixed, "c-probe-3b")
+
+    # ---- a new concrete phase re-arms the gate until one fresh read ----
+    _workspace().write_file(SKILL_PATH, BODY_V1)
+    ctx4, read_tool_4, probe_4 = _context_and_tools(_workspace())
+    assert _restore(ctx4, first) == 1
+    app4 = _compile(
+        create_audited_tool_node([read_tool_4, probe_4], config, tool_context=ctx4)
+    )
+    moved = await app4.ainvoke(
+        _state([make_tool_call("verify_probe", {}, "c-probe-4")], 4, 9)
+    )
+    assert "must read" in _content(moved, "c-probe-4").lower()
+    reread4 = await app4.ainvoke(
+        _state([make_tool_call("read_file", {"path": SKILL_PATH}, "c-read-4")], 4, 9)
+    )
+    assert "NODE-RESUME-BODY-v1" in _content(reread4, "c-read-4")
+    fixed4 = await app4.ainvoke(
+        _state([make_tool_call("verify_probe", {}, "c-probe-4b")], 4, 10)
+    )
+    assert "GATED-OK" in _content(fixed4, "c-probe-4b")
+
+    # ---- an expired turn window re-arms the gate until one fresh read ----
+    ctx5, read_tool_5, probe_5 = _context_and_tools(_workspace())
+    assert _restore(ctx5, first) == 1
+    app5 = _compile(
+        create_audited_tool_node([read_tool_5, probe_5], config, tool_context=ctx5)
+    )
+    expired = await app5.ainvoke(
+        _state([make_tool_call("verify_probe", {}, "c-probe-5")], 2, 30)
+    )
+    assert "must read" in _content(expired, "c-probe-5").lower()
+    reread5 = await app5.ainvoke(
+        _state([make_tool_call("read_file", {"path": SKILL_PATH}, "c-read-5")], 2, 30)
+    )
+    assert "NODE-RESUME-BODY-v1" in _content(reread5, "c-read-5")
+    fixed5 = await app5.ainvoke(
+        _state([make_tool_call("verify_probe", {}, "c-probe-5b")], 2, 31)
+    )
+    assert "GATED-OK" in _content(fixed5, "c-probe-5b")
+
+
 # =============================================================================
 # Test: Fingerprint-based loop detection -> soft warnings (never blocks)
 # =============================================================================

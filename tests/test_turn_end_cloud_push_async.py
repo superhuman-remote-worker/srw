@@ -112,7 +112,7 @@ class TestTurnCompleteSpawnsPush:
 
         with (
             patch.object(papp, "_session", session),
-            patch.object(papp, "_thread_id", "t1"),
+            patch.object(papp._session_identity, "_thread_id", "t1"),
             patch.object(papp, "_retire_announced_permission_rows", AsyncMock()),
             patch.object(papp, "_broadcast", lambda k, p: events.append(k)),
         ):
@@ -136,7 +136,7 @@ class TestTurnCompleteSpawnsPush:
 
         with (
             patch.object(papp, "_session", session),
-            patch.object(papp, "_thread_id", "t1"),
+            patch.object(papp._session_identity, "_thread_id", "t1"),
             patch.object(papp, "_retire_announced_permission_rows", AsyncMock()),
             patch.object(papp, "_broadcast", lambda k, p: None),
         ):
@@ -164,7 +164,7 @@ class TestTurnStartAwaitsPush:
 
         with (
             patch.object(papp, "_session", session),
-            patch.object(papp, "_thread_id", "t1"),
+            patch.object(papp._session_identity, "_thread_id", "t1"),
             patch.object(papp, "_cloud_sync_retry_pending", False),
             patch.object(papp, "_broadcast", lambda k, p: None),
         ):
@@ -182,7 +182,7 @@ class TestTurnStartAwaitsPush:
 
         with (
             patch.object(papp, "_session", session),
-            patch.object(papp, "_thread_id", "t1"),
+            patch.object(papp._session_identity, "_thread_id", "t1"),
             patch.object(papp, "_cloud_sync_retry_pending", False),
             patch.object(papp, "_broadcast", lambda k, p: None),
         ):

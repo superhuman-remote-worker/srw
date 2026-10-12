@@ -130,14 +130,23 @@ def _project_aliases(doc, number):
             ("sessionExpert", "experts"),
             ("workspace", "workspaces"),
         ):
-            alias = binding.get(field)
-            if alias is not None and alias not in resources.get(kind, {}):
-                fail(
-                    "UnknownAlias",
-                    "Binding names an undeclared project resource.",
-                    document=number,
-                    path=pointer((*path, field)),
-                )
+            value = binding.get(field)
+            if field == "workspace" and isinstance(value, dict):
+                aliases = [
+                    ((*path, field, tier), value[tier])
+                    for tier in ("container", "vm")
+                    if tier in value
+                ]
+            else:
+                aliases = [((*path, field), value)] if value is not None else []
+            for alias_path, alias in aliases:
+                if alias not in resources.get(kind, {}):
+                    fail(
+                        "UnknownAlias",
+                        "Binding names an undeclared project resource.",
+                        document=number,
+                        path=pointer(alias_path),
+                    )
         if any(
             alias not in resources.get("connectors", {})
             for alias in binding.get("connectors", [])

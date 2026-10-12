@@ -48,8 +48,7 @@ is in.
 Memory scope follows the effective configuration:
 
 - With **Share memories across jobs** / `project_scoped` enabled and a project
-  attached, retrieval uses that project (or the attached projects for a
-  multi-project session).
+  attached, retrieval uses that project. A session has one project or none.
 - With project sharing disabled, or without a project scope, memory stays with
   the current job or session thread.
 

@@ -1,4 +1,5 @@
 import {beforeEach, describe, expect, it, vi} from 'vitest';
+import {signal} from '@angular/core';
 
 import {
     canComposeDuringSession,
@@ -31,7 +32,7 @@ import {
     sshWorkspaceReachable,
     pickCurrentStartupStep,
     pickRewindCandidates,
-    pickRunningCommandCard,
+    pickRunningCommandCards,
     pickWorkspaceOfferCard,
     PersistentChatComponent,
     readingWidthToCss,
@@ -40,6 +41,7 @@ import {
     shouldFoldToolRun,
     shouldPin,
     shouldSendOnEnter,
+    shouldShowReconnectBanner,
     textSizeToCss,
     uploadStageAnnounceKey,
     uploadStageFor,
@@ -89,6 +91,21 @@ describe('isStartupBannerVisible', () => {
     it('hides the banner once the session is no longer starting', () => {
         expect(isStartupBannerVisible(false, 3)).toBe(false);
         expect(isStartupBannerVisible(false, 0)).toBe(false);
+    });
+});
+
+describe('shouldShowReconnectBanner', () => {
+    it('offers manual recovery for a ready created thread with a closed journal', () => {
+        expect(shouldShowReconnectBanner('connecting', 'created', true, 1, 0)).toBe(true);
+        expect(shouldShowReconnectBanner('error', 'active', true, 1, 0)).toBe(true);
+    });
+
+    it('keeps End and startup controls separate', () => {
+        expect(shouldShowReconnectBanner('disconnected', 'ended', true, 1, 3)).toBe(false);
+        expect(shouldShowReconnectBanner('connecting', 'created', false, 1, 0)).toBe(false);
+        expect(shouldShowReconnectBanner('connected', 'active', true, 1, 3)).toBe(false);
+        expect(shouldShowReconnectBanner('error', 'active', true, 0, 3)).toBe(false);
+        expect(shouldShowReconnectBanner('disconnected', 'active', true, 0, 3)).toBe(true);
     });
 });
 
@@ -156,6 +173,22 @@ describe('canComposeDuringSession', () => {
     it('still blocks a mid-session reconnect once the extra states are false', () => {
         // Guard against the new params quietly turning the reconnect gate off.
         expect(canComposeDuringSession(false, false, false, false, false)).toBe(false);
+    });
+
+    it('closes the composer on a live session whose unit is parked', () => {
+        // Input into a parked unit is recorded but never claimed until a Retry
+        // or an operator unpark revives it: an open box only swallowed it.
+        expect(canComposeDuringSession(true, false, false, false, false, true)).toBe(false);
+        expect(canComposeDuringSession(false, true, false, false, false, true)).toBe(false);
+        expect(canComposeDuringSession(true, false, false, false, false, false)).toBe(true);
+    });
+
+    it('leaves an ended or resuming session open despite a parked block', () => {
+        // End and suspension settle the unit (the End funnel closes a parked
+        // one to done), so the block is stale there and sending still resumes;
+        // mid-resume /connection is about to re-derive it.
+        expect(canComposeDuringSession(false, false, false, true, false, true)).toBe(true);
+        expect(canComposeDuringSession(false, false, false, false, true, true)).toBe(true);
     });
 });
 
@@ -365,39 +398,47 @@ describe('pickCurrentStartupStep', () => {
     });
 });
 
-describe('pickRunningCommandCard', () => {
+describe('pickRunningCommandCards', () => {
     const rt = {id: 'tc1', tool: 'run_command', args: {command: 'sleep 99'}};
+    const runningTurn = (...ids: string[]): AssistantTurn => ({
+        kind: 'assistant',
+        id: 't1',
+        status: 'streaming',
+        startedAt: 0,
+        events: ids.map((id) => ({
+            kind: 'tool_call' as const,
+            id,
+            tool: 'run_command',
+            args: {},
+            status: 'running' as const,
+            startedAt: 0,
+        })),
+    });
 
-    it('returns null when nothing is running', () => {
-        expect(pickRunningCommandCard(null, [])).toBeNull();
+    it('returns nothing when nothing is running', () => {
+        expect(pickRunningCommandCards([], [])).toEqual([]);
     });
 
     it('surfaces the running tool when it is not yet in any turn (cold reattach mid-turn)', () => {
         // Cold reload mid-turn: REST history lacks the in-flight turn, so the
         // only signal is the welcome frame's running_tool — show the card.
-        expect(pickRunningCommandCard(rt, [])).toEqual(rt);
+        expect(pickRunningCommandCards([rt], [])).toEqual([rt]);
     });
 
     it('suppresses the card when the tool call is already in a visible turn (warm reconnect)', () => {
         // Warm reconnect: the turn (with its own tool card) is still on screen,
         // so the standalone card would double-render — suppress it.
-        const turn: AssistantTurn = {
-            kind: 'assistant',
-            id: 't1',
-            status: 'streaming',
-            startedAt: 0,
-            events: [
-                {
-                    kind: 'tool_call',
-                    id: 'tc1',
-                    tool: 'run_command',
-                    args: {},
-                    status: 'running',
-                    startedAt: 0,
-                },
-            ],
-        };
-        expect(pickRunningCommandCard(rt, [turn])).toBeNull();
+        expect(pickRunningCommandCards([rt], [runningTurn('tc1')])).toEqual([]);
+    });
+
+    it('shows one card per in-flight call of a parallel batch, minus the ones on screen', () => {
+        // A subagent fan-out blocks on several calls at once. The single-valued
+        // snapshot showed one child of N after a cold reload.
+        const a = {id: 'd1', tool: 'delegate_agent', args: {}};
+        const b = {id: 'd2', tool: 'delegate_agent', args: {}};
+        const c = {id: 'd3', tool: 'delegate_agent', args: {}};
+        expect(pickRunningCommandCards([a, b, c], [])).toEqual([a, b, c]);
+        expect(pickRunningCommandCards([a, b, c], [runningTurn('d2')])).toEqual([a, c]);
     });
 });
 
@@ -558,6 +599,78 @@ describe('onRenameSession', () => {
     });
 });
 
+/**
+ * R1 follow-up: the header End (disconnectAndLeave) leaves for /sessions only
+ * when the End request is finished with. A declined stateless force prompt
+ * (`kept`: the session is still running) and a retryable fence (`retryable`:
+ * cleanup has not finished; End is the retry) keep the user on the session.
+ * Same .call() convention as onRenameSession above.
+ */
+describe('disconnectAndLeave', () => {
+    function makeHost(endSession: () => Promise<unknown>) {
+        const isDisconnecting = signal(false);
+        const navigate = vi.fn().mockResolvedValue(true);
+        const danger = vi.fn();
+        const warning = vi.fn();
+        const host = {
+            isDisconnecting,
+            chat: {endSession: vi.fn(endSession)},
+            router: {navigate},
+            toast: {danger, warning},
+            errors: {translate: (_e: unknown, fallback?: string) => fallback},
+            transloco: {translate: (key: string) => key},
+        } as unknown as PersistentChatComponent;
+        return {host, isDisconnecting, navigate, danger, warning};
+    }
+
+    it('stays on a stateless session whose End the user declined, with no toast', async () => {
+        const {host, isDisconnecting, navigate, danger, warning} = makeHost(() =>
+            Promise.resolve('kept'),
+        );
+
+        await PersistentChatComponent.prototype.disconnectAndLeave.call(host);
+
+        expect(navigate).not.toHaveBeenCalled();
+        expect(danger).not.toHaveBeenCalled();
+        expect(warning).not.toHaveBeenCalled();
+        expect(isDisconnecting()).toBe(false);
+    });
+
+    it('stays and warns when End met a retryable fence, keeping End usable', async () => {
+        const {host, isDisconnecting, navigate, danger, warning} = makeHost(() =>
+            Promise.resolve('retryable'),
+        );
+
+        await PersistentChatComponent.prototype.disconnectAndLeave.call(host);
+
+        expect(warning).toHaveBeenCalledWith('errors.sessions.endRetryable');
+        expect(danger).not.toHaveBeenCalled();
+        expect(navigate).not.toHaveBeenCalled();
+        expect(isDisconnecting()).toBe(false);
+    });
+
+    it('leaves after an accepted End', async () => {
+        const done = makeHost(() => Promise.resolve('done'));
+        await PersistentChatComponent.prototype.disconnectAndLeave.call(done.host);
+        expect(done.navigate).toHaveBeenCalledWith(['/sessions']);
+        expect(done.danger).not.toHaveBeenCalled();
+        expect(done.warning).not.toHaveBeenCalled();
+
+    });
+
+    it.each([0, 409, 503, 500])('keeps failed End visible and retryable for HTTP %s', async (status) => {
+        const failed = makeHost(() => Promise.reject({status}));
+        await PersistentChatComponent.prototype.disconnectAndLeave.call(failed.host);
+        expect(failed.danger).toHaveBeenCalledWith('errors.sessions.endFailed');
+        expect(failed.warning).not.toHaveBeenCalled();
+        expect(failed.navigate).not.toHaveBeenCalled();
+        expect(failed.isDisconnecting()).toBe(false);
+        failed.host.chat.endSession = vi.fn().mockResolvedValue('done');
+        await PersistentChatComponent.prototype.disconnectAndLeave.call(failed.host);
+        expect(failed.navigate).toHaveBeenCalledWith(['/sessions']);
+    });
+});
+
 describe('pickCodeServerUrlToOpen', () => {
     // The pre-flight-then-open wiring (HTTP through the auth interceptor,
     // window.open, idle-session 401 → re-login) is exercised by Playwright on
@@ -586,6 +699,10 @@ describe('pickCodeServerUrlToOpen', () => {
 });
 
 describe('sshWorkspaceReachable', () => {
+    it('offers SSH wake for a suspended VM and hides unsupported VM access', () => {
+        expect(sshWorkspaceReachable({status: 'ready', code_server_url: null}, {state: 'suspended'})).toBe(true);
+        expect(sshWorkspaceReachable({status: 'active', code_server_url: 'https://api/x/proxy/'}, {state: 'unsupported'})).toBe(false);
+    });
     // The SSH button used to render off capabilities.sshGateway() alone, so it
     // appeared on sessions whose workspace SSH cannot reach (a virtual-tier
     // session answers `srw: this session has no workspace yet`). The gate is

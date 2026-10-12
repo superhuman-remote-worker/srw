@@ -120,6 +120,103 @@ Usage: {{ include "srw.imageRef" (dict "image" .Values.image.agent) }}
 {{- end }}
 
 {{/*
+The pull policy Kubernetes gives a container that sets none: Always for an
+image without a digest whose tag is `latest` or empty, else IfNotPresent. The
+container built-ins carry it so a default workspace pulls exactly as the
+untemplated workspace pod did; the chart's pullPolicy values don't decide it.
+Usage: {{ include "srw.defaultPullPolicy" (dict "image" .Values.image.workspace) }}
+*/}}
+{{- define "srw.defaultPullPolicy" -}}
+{{- $tag := default "" .image.tag -}}
+{{- if and (not (default "" .image.digest)) (or (eq $tag "") (eq $tag "latest")) -}}
+Always
+{{- else -}}
+IfNotPresent
+{{- end -}}
+{{- end }}
+
+{{/*
+Default VM image. The VM controller and the vm-full built-in template both use
+this, so they always name the same image.
+*/}}
+{{- define "srw.defaultVmImage" -}}
+{{- .Values.vmController.defaultVmImage | default (printf "ghcr.io/superhuman-remote-worker/srw-agent-vm-base:v%s" .Chart.AppVersion) -}}
+{{- end }}
+
+{{/*
+Built-in Catalog WorkspaceTemplates as a JSON list of manifest documents. The
+orchestrator reconciles its Catalog against this list at startup; an empty list
+retires the built-ins. container-full uses the very reference WORKSPACE_IMAGE
+uses, so a workspace on it is the installation image in every respect.
+*/}}
+{{- define "srw.builtinWorkspaceTemplatesJson" -}}
+{{- $templates := list -}}
+{{- if .Values.workspace.builtinTemplates.enabled -}}
+{{- $scope := dict "kind" "Catalog" "name" "shared" -}}
+{{- $sizes := .Values.workspace.builtinTemplates.containerResources -}}
+{{- $vmSizes := .Values.workspace.builtinTemplates.vmResources -}}
+{{- $templates = append $templates (dict
+    "apiVersion" "srw/v1alpha1"
+    "kind" "WorkspaceTemplate"
+    "metadata" (dict "name" "virtual" "scope" $scope "annotations" (dict
+      "srw.io/display-name" "Virtual"
+      "srw.io/description" "A workspace without a container or a VM."))
+    "spec" (dict "backend" "virtual")) -}}
+{{- $minimalEnvironment := dict
+    "image" (include "srw.imageRef" (dict "image" .Values.image.workspaceMinimal))
+    "pullPolicy" (include "srw.defaultPullPolicy" (dict "image" .Values.image.workspaceMinimal)) -}}
+{{- $templates = append $templates (dict
+    "apiVersion" "srw/v1alpha1"
+    "kind" "WorkspaceTemplate"
+    "metadata" (dict "name" "container-minimal" "scope" $scope "annotations" (dict
+      "srw.io/display-name" "Container (minimal)"
+      "srw.io/description" "SRW tools, a browser and the IDE. The base for your own image."))
+    "spec" (dict
+      "backend" "sandbox"
+      "environment" $minimalEnvironment
+      "resources" $sizes)) -}}
+{{- $fullEnvironment := dict
+    "image" (include "srw.imageRef" (dict "image" .Values.image.workspace))
+    "pullPolicy" (include "srw.defaultPullPolicy" (dict "image" .Values.image.workspace)) -}}
+{{- $templates = append $templates (dict
+    "apiVersion" "srw/v1alpha1"
+    "kind" "WorkspaceTemplate"
+    "metadata" (dict "name" "container-full" "scope" $scope "annotations" (dict
+      "srw.io/display-name" "Container (full)"
+      "srw.io/description" "Minimal plus Node.js, compilers, database clients and document tools."))
+    "spec" (dict
+      "backend" "sandbox"
+      "environment" $fullEnvironment
+      "resources" $sizes)) -}}
+{{- if ne (include "srw.vmMode" .) "off" -}}
+{{- $templates = append $templates (dict
+    "apiVersion" "srw/v1alpha1"
+    "kind" "WorkspaceTemplate"
+    "metadata" (dict "name" "vm-full" "scope" $scope "annotations" (dict
+      "srw.io/display-name" "Virtual machine (full)"
+      "srw.io/description" "A full virtual machine with sudo, Docker and Kubernetes tooling."))
+    "spec" (dict
+      "backend" "vm"
+      "environment" (dict "image" (include "srw.defaultVmImage" .))
+      "resources" (dict
+        "cpu" (int $vmSizes.cpu)
+        "memory" $vmSizes.memory
+        "storage" $vmSizes.storage))) -}}
+{{- end -}}
+{{- end -}}
+{{- $templates | toJson -}}
+{{- end }}
+
+{{/*
+Workspace defaults (Slice A2b) as the JSON object the orchestrator reads from
+WORKSPACE_DEFAULTS. Empty template names mean the built-in for the tier.
+*/}}
+{{- define "srw.workspaceDefaultsJson" -}}
+{{- $d := .Values.workspace.defaults | default dict -}}
+{{- dict "jobs" ($d.jobs | default "container") "sessions" ($d.sessions | default "virtual") "container" ($d.container | default "") "vm" ($d.vm | default "") | toJson -}}
+{{- end }}
+
+{{/*
 Bounded public deployment provenance consumed by the orchestrator and
 dynamically provisioned agents. The image digest comes only from the same
 value that srw.imageRef uses, so a tag can never be reported as an artifact
@@ -563,6 +660,53 @@ true
 {{- fail (printf "gitea.database.type must be \"postgres\" or \"sqlite3\", got %q" $type) -}}
 {{- end -}}
 {{- end }}
+
+{{/*
+Initial SRW realm administrator for the bundled Keycloak. The realm ConfigMap
+has always put this user first. Keep its identity when the value is omitted on
+an upgrade, and reject explicit changes: realm import skips an existing realm.
+The caller supplies lookup's result so selection/validation also works offline.
+*/}}
+{{- define "srw.keycloakBootstrapAdminUsername" -}}
+{{- $ctx := .context -}}
+{{- $settings := $ctx.Values.keycloak.bootstrapAdmin | default dict -}}
+{{- $requested := get $settings "username" -}}
+{{- if not (kindIs "string" $requested) -}}
+{{- fail "keycloak.bootstrapAdmin.username must be a string" -}}
+{{- end -}}
+{{- $username := default "test" $requested -}}
+{{- if .existingRealmConfigMap -}}
+  {{- $data := .existingRealmConfigMap.data | default dict -}}
+  {{- $realm := get $data "srw-realm.json" | default "{}" | fromJson -}}
+  {{- $users := get $realm "users" | default list -}}
+  {{- if or (hasKey $realm "Error") (not (kindIs "slice" $users)) (empty $users) -}}
+    {{- fail "keycloak.bootstrapAdmin.username: cannot read existing bootstrap username from the Keycloak realm ConfigMap; restore its original srw-realm.json before upgrading" -}}
+  {{- end -}}
+  {{- $firstUser := first $users -}}
+  {{- if not (kindIs "map" $firstUser) -}}
+    {{- fail "keycloak.bootstrapAdmin.username: cannot read existing bootstrap username from the Keycloak realm ConfigMap" -}}
+  {{- end -}}
+  {{- $existing := get $firstUser "username" -}}
+  {{- if or (not (kindIs "string" $existing)) (empty $existing) -}}
+    {{- fail "keycloak.bootstrapAdmin.username: cannot read existing bootstrap username from the Keycloak realm ConfigMap" -}}
+  {{- end -}}
+  {{- if and (ne $requested "") (ne $requested $existing) -}}
+    {{- fail (printf "keycloak.bootstrapAdmin.username is for the initial install only; the existing bootstrap username is %q. Keep that value or leave it empty; manage additional administrators through SRW." $existing) -}}
+  {{- end -}}
+  {{- $username = $existing -}}
+{{- end -}}
+{{- if not (regexMatch "^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$" $username) -}}
+  {{- fail "keycloak.bootstrapAdmin.username must be 1-64 ASCII letters, digits, dots, underscores or hyphens, starting with a letter or digit" -}}
+{{- end -}}
+{{- if $ctx.Values.keycloak.devUsers.enabled -}}
+  {{- range $ctx.Values.keycloak.devUsers.users -}}
+    {{- if eq (lower .username) (lower $username) -}}
+      {{- fail "keycloak.bootstrapAdmin.username must not duplicate a username in keycloak.devUsers.users (case-insensitive)" -}}
+    {{- end -}}
+  {{- end -}}
+{{- end -}}
+{{- $username -}}
+{{- end -}}
 
 {{/*
 Resources for the Keycloak bootstrap Job.
@@ -1495,9 +1639,18 @@ Emits nothing.
 {{- if empty $gw.hostKeyNames -}}
 {{- fail "sshGateway.enabled requires a non-empty sshGateway.hostKeyNames; with no names neither the gateway's SSH_GATEWAY_HOST_KEYS nor the orchestrator's SSH_GATEWAY_PUBLIC_HOST_KEYS has anything to point at" -}}
 {{- end -}}
+{{- if gt (len $gw.hostKeyNames) 4 -}}
+{{- fail "sshGateway.hostKeyNames accepts at most four Ed25519 keys for native proof verification" -}}
+{{- end -}}
+{{- if ne (len (uniq $gw.hostKeyNames)) (len $gw.hostKeyNames) -}}
+{{- fail "sshGateway.hostKeyNames must not contain duplicate keys" -}}
+{{- end -}}
 {{- range $gw.hostKeyNames -}}
 {{- if regexMatch "(?i)(rsa|ecdsa|dss|dsa)" . -}}
 {{- fail (printf "sshGateway.hostKeyNames entry %q is not an Ed25519 host key. _require_ed25519_host_key (services/ssh_gateway_config.py) raises on any algorithm that is not ssh-ed25519, so the gateway would refuse to start -- a crash-loop three files away from this value. Use ssh_host_ed25519_key. (Naming-convention tripwire only; the load-time check is the real enforcement.)" .) -}}
+{{- end -}}
+{{- if or (not (regexMatch "^[A-Za-z0-9._-]{1,249}$" .)) (eq . ".") (hasPrefix ".." .) (hasSuffix ".pub" .) -}}
+{{- fail (printf "sshGateway.hostKeyNames entry %q must be a safe Secret key basename without a .pub suffix" .) -}}
 {{- end -}}
 {{- end -}}
 {{- if eq (trim $gw.userCaSecret) "" -}}
@@ -1518,4 +1671,25 @@ Emits nothing.
 {{- if and $gw.networkPolicy.enabled (or (empty $gw.networkPolicy.edgeNamespaceSelector) (empty $gw.networkPolicy.edgePodSelector)) -}}
 {{- fail "sshGateway.networkPolicy.enabled requires non-empty edgeNamespaceSelector and edgePodSelector; an empty selector matches everything, which is not a policy" -}}
 {{- end -}}
+{{- end }}
+
+{{/*
+The connector driver namespace (connector drivers D5, "The driver namespace
+baseline"): connectors.servicePods.namespace, else the lease exchange's
+orchestrator.connectorLeases.networkPolicy.driverNamespace, else
+<fullname>-connectors. One answer for the namespace and its baseline, the
+exchange's ingress policy and the static egress rules into it.
+*/}}
+{{- define "srw.connectorsNamespace" -}}
+{{- $explicit := .Values.connectors.servicePods.namespace | default .Values.orchestrator.connectorLeases.networkPolicy.driverNamespace -}}
+{{- $explicit | default (printf "%s-connectors" (include "srw.fullname" . | trunc 52 | trimSuffix "-")) -}}
+{{- end }}
+
+{{/*
+SRW's connector driver certificate authority (connector drivers C3): the
+operator's Secret (connectors.drivers.ca.secretName), else the one the chart
+generates once and keeps (templates/connector-driver-ca.yaml).
+*/}}
+{{- define "srw.connectorDriverCaSecretName" -}}
+{{- .Values.connectors.drivers.ca.secretName | default (printf "%s-connector-driver-ca" (include "srw.fullname" . | trunc 42 | trimSuffix "-")) -}}
 {{- end }}

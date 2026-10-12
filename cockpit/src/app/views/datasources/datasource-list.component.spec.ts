@@ -1,6 +1,6 @@
 import {Injector, runInInjectionContext, signal} from '@angular/core';
 import {TranslocoService} from '@jsverse/transloco';
-import {of} from 'rxjs';
+import {of, throwError} from 'rxjs';
 import {describe, expect, it, vi} from 'vitest';
 
 import {Datasource, DatasourceIndexStatus} from '../../core/models/api.model';
@@ -10,9 +10,20 @@ import {UserService} from '../../core/services/user.service';
 import {ViewportService} from '../../core/services/viewport.service';
 import {ActivatedRoute} from '@angular/router';
 import {DatasourceListComponent} from './datasource-list.component';
+import {ConnectorDriversService} from '../../core/services/connector-drivers.service';
+import {
+  ConnectorDriver,
+  ConnectorDriverMatrix,
+  driverForType,
+} from '../../core/models/connector-driver.model';
+// The API's own capability matrix for the built-in drivers.
+import driversFixture from '../../core/models/fixtures/connector-drivers.json';
+// The rows the managed MCP servers add where the chart installs them.
+import managedFixture from '../../core/models/fixtures/connector-drivers-managed.json';
 
 // The real catalogue, so these specs also prove the keys they name exist.
 import en from '../../../assets/i18n/en.json';
+import de from '../../../assets/i18n/de-DE.json';
 
 function emailDatasource(overrides: Partial<Datasource> = {}): Datasource {
   return {
@@ -57,7 +68,15 @@ function kbDatasource(overrides: Partial<Datasource> = {}): Datasource {
   };
 }
 
-function createComponent(policyAvailable = true, contextProjectId: string | null = null) {
+const BUILTIN_DRIVERS = (driversFixture as unknown as ConnectorDriverMatrix).drivers;
+const MANAGED_DRIVERS = (managedFixture as unknown as ConnectorDriverMatrix).drivers;
+
+/** `drivers: null` is the matrix not (yet) loaded: the pre-matrix rules. */
+function createComponent(
+  policyAvailable = true,
+  contextProjectId: string | null = null,
+  drivers: ConnectorDriver[] | null = null,
+) {
   const ds = kbDatasource();
   const api = {
     getDatasources: vi.fn().mockReturnValue(of([])),
@@ -90,6 +109,14 @@ function createComponent(policyAvailable = true, contextProjectId: string | null
       },
       {provide: ViewportService, useValue: {isMobile: signal(false)}},
       {provide: UserService, useValue: {currentUser}},
+      {
+        provide: ConnectorDriversService,
+        useValue: {
+          drivers: signal(drivers),
+          load: vi.fn(),
+          forType: (type: string) => driverForType(drivers, type),
+        },
+      },
       {
         provide: ActivatedRoute,
         useValue: {
@@ -238,6 +265,16 @@ describe('Credentials connector', () => {
       type: 'credentials',
       credentials: {env_vars: {API_KEY: 'synthetic-key'}},
     }));
+  });
+
+  it('shows what an update dropped from the stored variables', () => {
+    const {component, api} = createComponent(false);
+    const dropped = 'Dropped from the stored variables: NODE_OPTIONS is not a variable';
+    api.updateDatasource.mockReturnValue(of({id: 'email-1', notices: [dropped]}));
+    component.openEditForm(emailDatasource({type: 'credentials', env_var_names: ['API_KEY']}));
+    component.envVars = [{key: 'API_KEY', value: 'rotated'}];
+    component.saveForm();
+    expect(component.successMessage()).toContain(dropped);
   });
 
   it('keeps stored credentials on an edit without replacement values', () => {
@@ -411,30 +448,60 @@ describe('DatasourceListComponent MCP support', () => {
     );
   });
 
-  it('builds stdio credentials with args split per line', () => {
-    const {api, component} = createComponent();
+  it('offers no stdio transport: a stdio server no longer runs in the agent', () => {
+    const {component} = createComponent();
     component.openCreateForm();
-    component.formData.name = 'GitHub tools';
     component.onTypeSelect('mcp');
-    component.formData.mcpTransport = 'stdio';
-    component.formData.mcpCommand = 'npx';
-    component.formData.mcpArgs =
-      '-y\n@modelcontextprotocol/server-github\n\n';
+    component.onMcpTransportSelect('stdio');
+    expect(component.formData.mcpTransport).toBe('http');
+    component.onMcpTransportSelect('sse');
+    expect(component.formData.mcpTransport).toBe('sse');
+  });
 
+  const storedStdio = (): Datasource => ({
+    ...kbDatasource(),
+    id: 'mcp-stdio',
+    name: 'Local tools',
+    type: 'mcp',
+    connection_url: null,
+    config: {},
+    is_global: true,
+    read_only: true,
+  });
+
+  it('moves a stored stdio server to plain http with its transport', () => {
+    // REST hides the stored transport, so the form shows http: re-choosing
+    // it is no change of the form's own, and the URL alone must carry it.
+    const {api, component} = createComponent(false, null, BUILTIN_DRIVERS);
+    component.openEditForm(storedStdio());
+    component.onConnectionUrlChange('https://mcp.example.com/mcp');
+    component.formData.connection_url = 'https://mcp.example.com/mcp';
     component.saveForm();
+    const update = api.updateDatasource.mock.calls[0][1];
+    expect(update.connection_url).toBe('https://mcp.example.com/mcp');
+    expect(update.credentials).toEqual({transport: 'http'});
+  });
 
-    expect(api.createDatasource).toHaveBeenCalledWith(
-      expect.objectContaining({
-        type: 'mcp',
-        connection_url: undefined,
-        credentials: {
-          transport: 'stdio',
-          command: 'npx',
-          args: ['-y', '@modelcontextprotocol/server-github'],
-          env: {},
-        },
-      }),
-    );
+  it('unpublishes a stored stdio server without touching its server', () => {
+    const {api, component} = createComponent(false, null, BUILTIN_DRIVERS);
+    component.openEditForm(storedStdio());
+    component.formData.is_global = false;
+    component.saveForm();
+    const update = api.updateDatasource.mock.calls[0][1];
+    expect(update.is_global).toBe(false);
+    expect(update.credentials).toBeUndefined();
+    expect(update.connection_url).toBeUndefined();
+  });
+
+  it('keeps a remote server\'s stored credentials when only its URL changes', () => {
+    const {api, component} = createComponent(false, null, BUILTIN_DRIVERS);
+    component.openEditForm({...storedStdio(), connection_url: 'https://old.example.com/mcp'});
+    component.onConnectionUrlChange('https://new.example.com/mcp');
+    component.formData.connection_url = 'https://new.example.com/mcp';
+    component.saveForm();
+    const update = api.updateDatasource.mock.calls[0][1];
+    expect(update.connection_url).toBe('https://new.example.com/mcp');
+    expect(update.credentials).toBeUndefined();
   });
 });
 
@@ -678,6 +745,244 @@ describe('DatasourceListComponent repository forge selection', () => {
       ds.id,
       expect.objectContaining({config: {forge: 'github'}}),
     );
+  });
+
+  // A GitHub App connector (C5) is set up through the API; editing it in the
+  // form must keep the config keys the form does not render.
+  const githubApp = {app_id: '4242', installation_id: '9090'};
+
+  it('keeps a GitHub App config the form does not render on an edit', () => {
+    const {api, component, ds} = createComponent();
+    component.openEditForm({
+      ...ds,
+      type: 'repository',
+      connection_url: 'https://github.com/acme/widget.git',
+      config: {forge: 'github', github_app: githubApp},
+    });
+    component.formData.name = 'renamed';
+
+    component.saveForm();
+
+    expect(api.updateDatasource).toHaveBeenCalledWith(
+      ds.id,
+      expect.objectContaining({config: {forge: 'github', github_app: githubApp}}),
+    );
+  });
+
+  it('says a GitHub App connector\'s read-only is enforced, until a token replaces it', () => {
+    const {component, ds} = createComponent();
+    component.openEditForm({
+      ...ds,
+      type: 'repository',
+      connection_url: 'https://github.com/acme/widget.git',
+      config: {forge: 'github', github_app: githubApp},
+    });
+    expect(component.isGithubAppForm()).toBe(true);
+    expect(component.accessHintKey()).toBe('datasources.form.accessGithubAppHint');
+    component.gitAuthMethod = 'token';
+    component.formCredentials.password = 'ghp_replacement';
+    expect(component.isGithubAppForm()).toBe(false);
+    expect(component.accessHintKey()).toBe('datasources.form.accessReadOnlyHint');
+  });
+
+  it('drops the GitHub App config when a token replaces the App', () => {
+    const {api, component, ds} = createComponent();
+    component.openEditForm({
+      ...ds,
+      type: 'repository',
+      connection_url: 'https://github.com/acme/widget.git',
+      config: {forge: 'github', github_app: githubApp, later_option: 'kept'},
+    });
+    component.gitAuthMethod = 'token';
+    component.formCredentials.password = 'ghp_replacement';
+
+    component.saveForm();
+
+    expect(api.updateDatasource).toHaveBeenCalledWith(
+      ds.id,
+      expect.objectContaining({config: {forge: 'github', later_option: 'kept'}}),
+    );
+  });
+});
+
+describe('DatasourceListComponent SSH connector host keys', () => {
+  const hostKey = 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl';
+
+  it('sends an ssh_key connector its host, user, port and pin', () => {
+    const {api, component} = createComponent();
+    component.openCreateForm();
+    component.onScopeModeChange('all');
+    component.formData.name = 'Bastion';
+    component.formData.type = 'ssh_key';
+    component.gitSshKey = '-----BEGIN OPENSSH PRIVATE KEY-----\nAAAA\n-----END OPENSSH PRIVATE KEY-----';
+    component.sshHost = ' bastion.example.com ';
+    component.sshUser = 'deploy';
+    component.sshPort = '2200';
+    component.sshKnownHosts = hostKey;
+
+    component.doSave();
+
+    expect(api.createDatasource.mock.calls[0][0].config).toEqual({
+      host: 'bastion.example.com',
+      user: 'deploy',
+      port: 2200,
+      known_hosts: hostKey,
+    });
+  });
+
+  it('round-trips the endpoint on edit and clears it when the host is removed', () => {
+    const {api, component, ds} = createComponent();
+    component.openEditForm({
+      ...ds,
+      type: 'ssh_key',
+      connection_url: null,
+      config: {host: 'bastion.example.com', port: 2200, known_hosts: hostKey},
+    });
+    expect(component.sshHost).toBe('bastion.example.com');
+    expect(component.sshPort).toBe('2200');
+    expect(component.sshKnownHosts).toBe(hostKey);
+
+    component.sshHost = '';
+    component.saveForm();
+
+    expect(api.updateDatasource).toHaveBeenCalledWith(
+      ds.id,
+      expect.objectContaining({config: {}}),
+    );
+  });
+
+  it('edits the host, tests the edited host, and pins what Test reports', () => {
+    const {api, component, ds} = createComponent();
+    component.openEditForm({
+      ...ds,
+      type: 'ssh_key',
+      connection_url: null,
+      config: {host: 'bastion.example.com', known_hosts: `bastion.example.com ${hostKey}`},
+    });
+    expect(component.formTestAvailable()).toBe(true);
+
+    // The old pin named the old host: editing the host drops it.
+    component.onSshEndpointChange('host', 'new-bastion.example.com');
+    component.onSshEndpointChange('port', '2200');
+    expect(component.sshKnownHosts).toBe('');
+
+    const reported = `[new-bastion.example.com]:2200 ${hostKey}`;
+    api.testDatasource.mockReturnValue(
+      of({status: 'ok', message: 'Reached', details: {host_key: reported}}),
+    );
+    component.testFromForm();
+
+    // Test reached the endpoint being typed, not the saved one.
+    expect(api.testDatasource).toHaveBeenCalledWith(ds.id, {
+      config: {host: 'new-bastion.example.com', port: 2200},
+    });
+    expect(component.testedHostKeyToPin()).toBe(reported);
+    component.pinTestedHostKey(component.testedHostKeyToPin()!);
+    expect(component.testedHostKeyToPin()).toBeNull();
+
+    component.saveForm();
+    expect(api.updateDatasource).toHaveBeenCalledWith(
+      ds.id,
+      expect.objectContaining({
+        config: {host: 'new-bastion.example.com', port: 2200, known_hosts: reported},
+      }),
+    );
+  });
+
+  it('offers Test for SSH-key repositories and sends the edited URL', () => {
+    const {api, component, ds} = createComponent();
+    component.openEditForm({
+      ...ds,
+      type: 'repository',
+      connection_url: 'ssh://git@git.example.com:2222/acme/widget.git',
+      cli_hint: 'git over ssh',
+      config: {forge: 'gitea', known_hosts: `[git.example.com]:2222 ${hostKey}`},
+    });
+    expect(component.gitAuthMethod).toBe('ssh');
+    expect(component.formTestAvailable()).toBe(true);
+
+    component.onConnectionUrlChange('ssh://git@git2.example.com:2222/acme/widget.git');
+    expect(component.sshKnownHosts).toBe('');
+    component.onForgeSelect('gitea');
+    component.testFromForm();
+    expect(api.testDatasource).toHaveBeenCalledWith(ds.id, {
+      connection_url: 'ssh://git@git2.example.com:2222/acme/widget.git',
+      config: {forge: 'gitea'},
+    });
+
+    component.gitAuthMethod = 'token';
+    expect(component.formTestAvailable()).toBe(false);
+  });
+
+  it('offers no Test for an ssh_key without a host', () => {
+    const {component, ds} = createComponent();
+    component.openEditForm({...ds, type: 'ssh_key', connection_url: null, config: {}});
+    expect(component.formTestAvailable()).toBe(false);
+  });
+
+  it.each([
+    ['ssh', {forge: 'github', known_hosts: hostKey}],
+    ['token', {forge: 'github'}],
+  ] as const)('sends the pin only with an SSH-key repository (%s)', (auth, config) => {
+    const {api, component} = createComponent();
+    component.openCreateForm();
+    component.onScopeModeChange('all');
+    component.formData.name = 'Widget';
+    component.formData.type = 'repository';
+    component.onConnectionUrlChange('https://github.com/acme/widget');
+    component.sshKnownHosts = hostKey;
+    component.gitAuthMethod = auth;
+    component.gitSshKey = 'key';
+    component.formCredentials.password = 'tok';
+
+    component.doSave();
+
+    expect(api.createDatasource.mock.calls[0][0].config).toEqual(config);
+  });
+
+  it('keeps a token repository\'s upstream CA across an edit, and only for a token', () => {
+    const ca = '-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----';
+    const {api, component, ds} = createComponent();
+    component.openEditForm({
+      ...ds,
+      type: 'repository',
+      connection_url: 'https://git.corp.example/acme/widget.git',
+      config: {forge: 'gitlab', upstream_ca: ca},
+    });
+    expect(component.repoUpstreamCa).toBe(ca);
+    component.doSave();
+    expect(api.updateDatasource.mock.calls[0][1].config).toEqual({forge: 'gitlab', upstream_ca: ca});
+
+    component.openCreateForm();
+    expect(component.repoUpstreamCa).toBe('');
+    component.onScopeModeChange('all');
+    component.formData.name = 'Widget';
+    component.formData.type = 'repository';
+    component.onConnectionUrlChange('https://github.com/acme/widget');
+    component.repoUpstreamCa = ca;
+    component.gitAuthMethod = 'ssh';
+    component.gitSshKey = 'key';
+    component.doSave();
+    expect(api.createDatasource.mock.calls[0][0].config).toEqual({forge: 'github'});
+  });
+
+  it('names every new string in the catalogue', () => {
+    const form = (en as {datasources: {form: Record<string, string>}}).datasources.form;
+    for (const key of [
+      'upstreamCaLabel',
+      'upstreamCaHint',
+      'sshHostLabel',
+      'sshUserLabel',
+      'sshPortLabel',
+      'sshHostHint',
+      'sshKnownHostsLabel',
+      'sshKnownHostsHint',
+      'sshPinHostKey',
+      'sshAgentNoticeTitle',
+      'sshAgentNotice',
+    ]) {
+      expect(form[key], key).toBeTruthy();
+    }
   });
 });
 
@@ -1020,6 +1325,91 @@ describe('DatasourceListComponent availability policy', () => {
 });
 
 
+describe('DatasourceListComponent platform-owned connectors', () => {
+  const PROJECT = '11111111-1111-1111-1111-111111111111';
+
+  function cloudFolder(overrides: Partial<Datasource> = {}): Datasource {
+    return {
+      id: 'folder-1',
+      name: 'Acme cloud folder',
+      description: null,
+      type: 'cloud_folder',
+      connection_url: null,
+      cli_hint: null,
+      default_branch: null,
+      config: {},
+      job_id: null,
+      created_by: 'user-1',
+      managed_key: `project-cloud:${PROJECT}`,
+      scope_mode: 'projects',
+      project_ids: [PROJECT],
+      auto_attach: true,
+      created_at: '',
+      updated_at: '',
+      ...overrides,
+    };
+  }
+
+  it("treats a project's cloud folder as managed: no edit, no delete, no policy", () => {
+    const {component} = createComponent();
+    const folder = cloudFolder();
+    expect(component.isNativeProjectConnector(folder)).toBe(true);
+    // Its creator (the project's owner) can still not change it.
+    expect(component.canManage(folder)).toBe(true);
+    expect(component.canEditRow(folder)).toBe(false);
+    expect(component.canDeleteRow(folder)).toBe(false);
+    expect(component.managedLabelKey(folder)).toBe('datasources.platform.managedByProject');
+    expect(en.datasources.platform.managedByProject).toBe('Managed by its project');
+    // The form never opens for it: the server would refuse the save.
+    component.openEditForm(folder);
+    expect(component.showForm()).toBe(false);
+  });
+
+  it("keeps a project's knowledge base editable but never deletable", () => {
+    const {component, ds} = createComponent();
+    for (const kb of [
+      {...ds, managed_key: `project-kb:${PROJECT}`},
+      // Written before the key: the older marker alone.
+      {...ds, config: {root_path: 'vault', native_project_id: PROJECT}},
+    ]) {
+      expect(component.isNativeProjectConnector(kb)).toBe(true);
+      expect(component.canEditRow(kb)).toBe(true);
+      expect(component.canDeleteRow(kb)).toBe(false);
+      expect(component.managedLabelKey(kb)).toBe('datasources.platform.managedByProject');
+    }
+    component.openEditForm({...ds, managed_key: `project-kb:${PROJECT}`});
+    expect(component.showForm()).toBe(true);
+    // Its policy block stays the project's.
+    expect(component.isNativeProjectConnector()).toBe(true);
+  });
+
+  it("says SRW manages a user's own connector, for that user", () => {
+    const {component, currentUser} = createComponent();
+    const outbox = cloudFolder({type: 'cloud_outbox', managed_key: 'cloud-outbox:user-1'});
+    expect(component.managedLabelKey(outbox)).toBe('datasources.platform.managedForYou');
+    expect(en.datasources.platform.managedForYou).toBe('Managed by SRW for you');
+    currentUser.set({id: 'admin-1', is_admin: true});
+    expect(component.managedLabelKey(outbox)).toBe('datasources.platform.managedForItsUser');
+    // An administrator manages ordinary rows, never a platform-owned one.
+    expect(component.canEditRow(outbox)).toBe(false);
+    expect(component.canDeleteRow(outbox)).toBe(false);
+  });
+
+  it('leaves a user-created row as it was', () => {
+    const {component, ds} = createComponent();
+    expect(component.isNativeProjectConnector(ds)).toBe(false);
+    expect(component.canEditRow(ds)).toBe(true);
+    expect(component.canDeleteRow(ds)).toBe(true);
+    expect(component.managedLabelKey(ds)).toBeNull();
+    // The cloud types have type labels in both catalogues.
+    for (const type of ['cloud_folder', 'cloud_folder_checkout', 'cloud_outbox'] as const) {
+      expect(en.datasources.filter[type]).toBeTruthy();
+      expect(de.datasources.filter[type]).toBeTruthy();
+      expect(component.getTypeIcon(type)).not.toBe('storage');
+    }
+  });
+});
+
 describe('DatasourceListComponent token permission guidance', () => {
   // A PAT with the wrong permissions fails at first use, in an agent run,
   // with a forge error nobody sees. The form is where that is cheap to fix.
@@ -1053,5 +1443,433 @@ describe('DatasourceListComponent token permission guidance', () => {
     component.formData.type = 'postgresql';
     component.gitAuthMethod = 'token';
     expect(component.patScopeHintKey()).toBe('');
+  });
+});
+
+describe('DatasourceListComponent Test connection results', () => {
+  it('shows a type without a test as neither a pass nor a failure', () => {
+    const {component} = createComponent();
+
+    expect(component.testResultIcon({status: 'ok', message: 'Connected'})).toBe('check_circle');
+    expect(component.testResultIcon({status: 'error', message: 'refused'})).toBe('error');
+    expect(
+      component.testResultIcon({status: 'unsupported', message: 'no connection test'}),
+    ).toBe('info');
+  });
+
+  it('keeps an unsupported answer as it came from the API', () => {
+    const {api, component} = createComponent();
+    const answer = {
+      status: 'unsupported' as const,
+      message: 'Kubeconfig connectors have no connection test',
+    };
+    api.testDatasource.mockReturnValue(of(answer));
+
+    component.testDatasource('kube-1');
+
+    expect(component.testResults()['kube-1']).toEqual(answer);
+  });
+});
+
+describe('DatasourceListComponent access levels from the capability matrix', () => {
+  function create(type: Datasource['type'], drivers: ConnectorDriver[] | null = BUILTIN_DRIVERS) {
+    const created = createComponent(false, null, drivers);
+    created.component.openCreateForm();
+    created.component.formData.name = 'Org connector';
+    created.component.onTypeSelect(type);
+    created.component.formData.is_global = true;
+    return created;
+  }
+
+  it('offers both levels for a driver that has both, and says what read-only does', () => {
+    const {component} = create('postgresql');
+    expect(component.offersReadOnly()).toBe(true);
+    expect(component.offersReadWrite()).toBe(true);
+    // The creator's tag removes the write tools for everyone (decision 31):
+    // the hint says so, and no "enforced by" claim sits under it.
+    expect(component.accessHintKey()).toBe('datasources.form.accessReadOnlyHint');
+    expect('publicAccessLevel' in component).toBe(false);
+    // Published with no mode chosen: read-only (decision 32).
+    expect(component.formReadOnly()).toBe(true);
+    component.formData.read_only = false;
+    expect(component.formReadOnly()).toBe(false);
+  });
+
+  it('names what the tag does for each kind of driver', () => {
+    for (const type of ['repository', 'postgresql', 'neo4j', 'mongodb', 'webdav'] as const) {
+      expect(create(type).component.accessHintKey(), type).toBe('datasources.form.accessReadOnlyHint');
+    }
+    // Their read-only only tells the agent: the same credential is delivered.
+    for (const type of ['generic', 'credentials', 'kubeconfig', 'ssh_key', 'generic_file'] as const) {
+      expect(create(type).component.accessHintKey(), type).toBe('datasources.form.accessAdvisoryHint');
+    }
+    expect(create('mcp').component.accessHintKey()).toBe('datasources.form.accessReadWriteOnlyHint');
+    expect(create('kb').component.accessHintKey()).toBe('datasources.form.accessKbHint');
+  });
+
+  it('hides read-write for a driver forced read-only and saves it read-only', () => {
+    const {api, component} = create('kb');
+    expect(component.offersReadOnly()).toBe(true);
+    expect(component.offersReadWrite()).toBe(false);
+    component.formData.read_only = false;
+    expect(component.formReadOnly()).toBe(true);
+    expect(component.publishConfirmTier()).toBe('warn');
+    component.doSave();
+    expect(api.createDatasource.mock.calls[0][0].read_only).toBe(true);
+  });
+
+  it('hides read-only for a driver with one level and saves what it binds', () => {
+    const {api, component} = create('mcp');
+    expect(component.offersReadOnly()).toBe(false);
+    expect(component.offersReadWrite()).toBe(true);
+    // Nothing chosen, which a public connector reads as read-only; an MCP
+    // server is bound read-write all the same.
+    expect(component.formData.read_only).toBeNull();
+    expect(component.formReadOnly()).toBe(false);
+    expect(component.publishConfirmTier()).toBe('name');
+    component.formData.mcpTransport = 'http';
+    component.formData.connection_url = 'https://mcp.example.com';
+    component.doSave();
+    expect(api.createDatasource.mock.calls[0][0].read_only).toBe(false);
+  });
+
+  it('edits a stored public MCP row without the read-write gate, though its flag is fixed up', () => {
+    const {api, component} = createComponent(false, null, BUILTIN_DRIVERS);
+    component.openEditForm({
+      ...kbDatasource(),
+      id: 'mcp-1',
+      type: 'mcp',
+      connection_url: 'https://mcp.example.com',
+      config: {},
+      is_global: true,
+      read_only: true,
+    });
+    component.formData.description = 'Only the description changed';
+    expect(component.publishConfirmTier()).toBeNull();
+    component.saveForm();
+    expect(component.showPublishConfirm()).toBe(false);
+    expect(api.updateDatasource.mock.calls[0][1].read_only).toBe(false);
+  });
+
+  it('badges a listed public row by what its driver binds, not a contradicting flag', () => {
+    const {component} = createComponent(false, null, BUILTIN_DRIVERS);
+    const row = (type: Datasource['type'], readOnly: boolean) => ({
+      ...kbDatasource(), type, is_global: true, read_only: readOnly,
+    });
+    expect(component.isPublicReadWrite(row('mcp', true))).toBe(true);
+    expect(component.isPublicReadWrite(row('kb', false))).toBe(false);
+    expect(component.isPublicReadWrite(row('postgresql', true))).toBe(false);
+    expect(component.isPublicReadWrite(row('postgresql', false))).toBe(true);
+  });
+
+  it('keeps the pre-matrix rule until the matrix loads', () => {
+    const kb = create('kb', null).component;
+    expect(kb.offersReadWrite()).toBe(false);
+    expect(kb.accessHintKey()).toBe('datasources.form.accessKbHint');
+    const mcp = create('mcp', null).component;
+    expect(mcp.offersReadOnly()).toBe(true);
+    expect(mcp.offersReadWrite()).toBe(true);
+    expect(mcp.isPublicReadWrite({...kbDatasource(), type: 'mcp', read_only: true})).toBe(false);
+  });
+});
+
+describe("DatasourceListComponent the creator's read-only tag", () => {
+  function createPrivate(type: Datasource['type'] = 'postgresql') {
+    const created = createComponent(false, null, BUILTIN_DRIVERS);
+    created.component.openCreateForm();
+    created.component.formData.name = 'Orders DB';
+    created.component.onTypeSelect(type);
+    created.component.formData.connection_url = 'postgresql://reader@db/orders';
+    return created;
+  }
+
+  it('is offered on a private connector too, read-write until chosen', () => {
+    const {api, component} = createPrivate();
+    expect(component.formData.is_global).toBe(false);
+    expect(component.showsAccessChoice()).toBe(true);
+    expect(component.formReadOnly()).toBe(false);
+    expect(component.publishConfirmTier()).toBeNull();
+    component.doSave();
+    // Never chosen: nothing is sent, so the server's default stands.
+    expect(api.createDatasource.mock.calls[0][0].read_only).toBeUndefined();
+  });
+
+  it("saves a private connector's read-only tag once its creator chooses it", () => {
+    const {api, component} = createPrivate();
+    component.formData.read_only = true;
+    expect(component.formReadOnly()).toBe(true);
+    // Read-only is exposure-reducing: no confirmation for a private save.
+    expect(component.publishConfirmTier()).toBeNull();
+    component.doSave();
+    expect(api.createDatasource.mock.calls[0][0].read_only).toBe(true);
+  });
+
+  it('shows a stored tag on an edit and lets its creator lift it', () => {
+    const {api, component, ds} = createComponent(false, null, BUILTIN_DRIVERS);
+    component.openEditForm({
+      ...ds,
+      type: 'postgresql',
+      connection_url: 'postgresql://reader@db/orders',
+      config: {},
+      is_global: false,
+      read_only: true,
+    });
+    expect(component.formReadOnly()).toBe(true);
+    component.formData.read_only = false;
+    component.saveForm();
+    expect(api.updateDatasource.mock.calls[0][1].read_only).toBe(false);
+  });
+
+  it('leaves an untagged stored connector untouched on an edit', () => {
+    const {api, component, ds} = createComponent(false, null, BUILTIN_DRIVERS);
+    component.openEditForm({
+      ...ds,
+      type: 'postgresql',
+      connection_url: 'postgresql://reader@db/orders',
+      config: {},
+      is_global: false,
+      read_only: null,
+    });
+    expect(component.formReadOnly()).toBe(false);
+    component.saveForm();
+    expect(api.updateDatasource.mock.calls[0][1].read_only).toBeUndefined();
+  });
+
+  it("is not offered for a project's native KB, which its agents write with kb_write", () => {
+    const {api, component} = createComponent(false, null, BUILTIN_DRIVERS);
+    component.openEditForm(
+      kbDatasource({config: {root_path: 'vault', native_project_id: 'project-a'}}),
+    );
+    expect(component.isNativeProjectConnector()).toBe(true);
+    expect(component.showsAccessChoice()).toBe(false);
+    component.saveForm();
+    expect(api.updateDatasource.mock.calls[0][1].read_only).toBeUndefined();
+  });
+
+  it('badges a private connector its creator tagged read-only in the list', () => {
+    const {component} = createComponent(false, null, BUILTIN_DRIVERS);
+    const row = (type: Datasource['type'], over: Partial<Datasource>) =>
+      kbDatasource({type, ...over});
+    expect(component.isPrivateReadOnly(row('postgresql', {read_only: true}))).toBe(true);
+    expect(component.isPrivateReadOnly(row('postgresql', {read_only: false}))).toBe(false);
+    expect(component.isPrivateReadOnly(row('postgresql', {read_only: null}))).toBe(false);
+    // A public row keeps its RW badge rule.
+    expect(
+      component.isPrivateReadOnly(row('postgresql', {read_only: true, is_global: true})),
+    ).toBe(false);
+    // An MCP server binds every tool whatever the flag says.
+    expect(component.isPrivateReadOnly(row('mcp', {read_only: true}))).toBe(false);
+  });
+
+  it('is not offered for email, whose tier choice is its own', () => {
+    const {component} = createPrivate('email');
+    expect(component.showsAccessChoice()).toBe(false);
+    component.formData.read_only = true;
+    expect(component.savedReadOnly()).toBeUndefined();
+  });
+
+  it('says in both languages what the tag does, for everyone, and promises nothing', () => {
+    const keys = [
+      'accessReadOnlyHint',
+      'accessAdvisoryHint',
+      'accessReadWriteOnlyHint',
+      'accessKbHint',
+      'accessGithubAppHint',
+    ];
+    const enForm = (en as {datasources: {form: Record<string, string>}}).datasources.form;
+    const deForm = (de as {datasources: {form: Record<string, string>}}).datasources.form;
+    expect(enForm['accessLabel']).toBeTruthy();
+    expect(deForm['accessLabel']).toBeTruthy();
+    for (const key of keys) {
+      expect(enForm[key], key).toMatch(/everyone who uses/);
+      expect(deForm[key], key).toMatch(/alle, die/);
+      // SRW assists and never guarantees (decision 18).
+      expect(enForm[key], key).not.toMatch(/enforced|guarantee|impossible|cannot write/i);
+      expect(deForm[key], key).not.toMatch(/erzwungen|garantiert|unmöglich/i);
+    }
+    // What a read-only tag does, in plain words, and who still decides.
+    expect(enForm['accessReadOnlyHint']).toMatch(/no write tools/);
+    expect(enForm['accessReadOnlyHint']).toMatch(/credential still decides/);
+    expect(deForm['accessReadOnlyHint']).toMatch(/keine Schreibwerkzeuge/);
+    // The hints that said a public flag was only declared are gone.
+    for (const old of ['visibilityCredentialHint', 'visibilityKbHint', 'visibilityGithubAppHint']) {
+      expect(enForm[old], old).toBeUndefined();
+      expect(deForm[old], old).toBeUndefined();
+    }
+  });
+});
+
+describe('DatasourceListComponent bespoke and generic forms', () => {
+  const IMAGE_DRIVER: ConnectorDriver = {
+    ...BUILTIN_DRIVERS.find((driver) => driver.name === 'srw.generic/v1')!,
+    name: 'community.ticketing/v1',
+    legacy_type: 'generic',
+  };
+
+  it('uses the bespoke section of every built-in, and the generic form only in the dev preview', () => {
+    const {component} = createComponent(false, null, BUILTIN_DRIVERS);
+    component.openCreateForm();
+    component.onTypeSelect('postgresql');
+    expect(component.hasBespokeForm()).toBe(true);
+    expect(component.useGenericForm()).toBe(false);
+    component.setGenericFormPreview(true);
+    expect(component.useGenericForm()).toBe(true);
+    component.closeForm();
+    expect(component.genericFormPreview()).toBe(false);
+  });
+
+  it('keeps the bespoke form while the matrix is unknown', () => {
+    const {component} = createComponent(false, null, null);
+    component.openCreateForm();
+    component.setGenericFormPreview(true);
+    expect(component.useGenericForm()).toBe(false);
+  });
+
+  it('gives a driver without a bespoke form the generic form', () => {
+    const {component} = createComponent(false, null, [IMAGE_DRIVER]);
+    component.openCreateForm();
+    component.onTypeSelect('generic');
+    expect(component.hasBespokeForm()).toBe(false);
+    expect(component.useGenericForm()).toBe(true);
+  });
+
+  it('submits what the generic form holds once it has no problem left, and lets the API decide', () => {
+    const {api, component} = createComponent(false, null, BUILTIN_DRIVERS);
+    component.openCreateForm();
+    component.formData.name = 'Graph';
+    component.onTypeSelect('neo4j');
+    component.setGenericFormPreview(true);
+    expect(component.canSave()).toBe(false);
+    // An edit that would wipe the stored password holds back Save.
+    component.genericFormValue.set({
+      credentials: {username: 'neo'},
+      problems: [{pointer: '/credentials/password', reason: 'required'}],
+    });
+    expect(component.canSave()).toBe(false);
+    component.genericFormValue.set({
+      connection_url: 'bolt://graph:7687',
+      credentials: {username: 'neo', password: 'pw'},
+      problems: [],
+    });
+    expect(component.canSave()).toBe(true);
+    component.doSave();
+    expect(api.createDatasource).toHaveBeenCalledWith(
+      expect.objectContaining({
+        type: 'neo4j',
+        connection_url: 'bolt://graph:7687',
+        credentials: {username: 'neo', password: 'pw'},
+        config: undefined,
+      }),
+    );
+  });
+
+  it("shows the API's refusal in the generic form, at the field it names", () => {
+    const {api, component} = createComponent(false, null, BUILTIN_DRIVERS);
+    api.createDatasource.mockReturnValue(
+      throwError(() => ({error: {detail: {message: 'bad host', field: '/config/host'}}})),
+    );
+    component.openCreateForm();
+    component.formData.name = 'Box';
+    component.onTypeSelect('ssh_key');
+    component.setGenericFormPreview(true);
+    component.genericFormValue.set({config: {host: '-oProxyCommand=x'}, problems: []});
+    component.doSave();
+    expect(component.genericFormError()).toEqual({message: 'bad host', field: '/config/host'});
+    expect(component.errorMessage()).toBeNull();
+  });
+
+  it('keeps the bespoke error banner outside the generic form', () => {
+    const {api, component} = createComponent(false, null, BUILTIN_DRIVERS);
+    api.createDatasource.mockReturnValue(throwError(() => ({error: {detail: 'refused'}})));
+    component.openCreateForm();
+    component.formData.name = 'Graph';
+    component.onTypeSelect('neo4j');
+    component.formData.connection_url = 'bolt://graph:7687';
+    component.doSave();
+    expect(component.errorMessage()).toBe('refused');
+    expect(component.genericFormError()).toBeNull();
+  });
+
+  it('prefills the generic form on an edit from config and URL only', () => {
+    const {component} = createComponent(false, null, BUILTIN_DRIVERS);
+    const email = emailDatasource();
+    component.openEditForm(email);
+    expect(component.genericFormExisting).toEqual({
+      connection_url: null,
+      connection_url_redacted: undefined,
+      config: email.config,
+    });
+  });
+});
+
+describe('DatasourceListComponent managed MCP servers', () => {
+  const INSTALLED = [...BUILTIN_DRIVERS, ...MANAGED_DRIVERS];
+  const gitea = MANAGED_DRIVERS.find((driver) => driver.legacy_type === 'gitea_mcp')!;
+
+  function create(drivers: ConnectorDriver[] | null = INSTALLED) {
+    const created = createComponent(false, null, drivers);
+    created.component.openCreateForm();
+    created.component.formData.name = 'Forge';
+    created.component.onTypeSelect('gitea_mcp' as Datasource['type']);
+    return created;
+  }
+
+  it('offers each managed server the matrix installs as a type, and no other', () => {
+    expect(gitea).toBeTruthy();
+    expect(createComponent(false, null, INSTALLED).component.managedDrivers()).toEqual(MANAGED_DRIVERS);
+    // Not installed (the chart names no image), or the matrix not loaded yet.
+    expect(createComponent(false, null, BUILTIN_DRIVERS).component.managedDrivers()).toEqual([]);
+    expect(createComponent(false, null, null).component.managedDrivers()).toEqual([]);
+    // A development MCP server is in no catalogue, though it runs the same way.
+    const testServer: ConnectorDriver = {
+      ...gitea,
+      name: 'srw.mcp-test/v1',
+      legacy_type: 'mcp_test',
+      trust: {...gitea.trust, tier: 'development'},
+    };
+    expect(
+      createComponent(false, null, [...INSTALLED, testServer]).component.managedDrivers(),
+    ).toEqual(MANAGED_DRIVERS);
+  });
+
+  it('labels every managed type in both languages', () => {
+    const enTypes = en.datasources.filter as Record<string, string>;
+    const deTypes = de.datasources.filter as Record<string, string>;
+    for (const driver of MANAGED_DRIVERS) {
+      expect(enTypes[driver.legacy_type!], driver.name).toBeTruthy();
+      expect(deTypes[driver.legacy_type!], driver.name).toBeTruthy();
+    }
+  });
+
+  it("renders one through the generic form, offering the driver's own levels", () => {
+    const {component} = create();
+    expect(component.formDriver()).toBe(gitea);
+    expect(component.hasBespokeForm()).toBe(false);
+    expect(component.useGenericForm()).toBe(true);
+    // Both of its levels, with what the read-only tag does.
+    component.formData.is_global = true;
+    expect(component.offersReadOnly()).toBe(true);
+    expect(component.offersReadWrite()).toBe(true);
+    expect(component.accessHintKey()).toBe('datasources.form.accessReadOnlyHint');
+  });
+
+  it('creates it from what the generic form holds: config and token, no connection URL', () => {
+    const {api, component} = create();
+    expect(component.canSave()).toBe(false);
+    component.genericFormValue.set({
+      config: {url: 'https://gitea.example.com', access: 'ReadOnly'},
+      credentials: {token: 'gitea-token'},
+      problems: [],
+    });
+    expect(component.canSave()).toBe(true);
+    component.doSave();
+    expect(api.createDatasource).toHaveBeenCalledWith(
+      expect.objectContaining({
+        type: 'gitea_mcp',
+        connection_url: undefined,
+        config: {url: 'https://gitea.example.com', access: 'ReadOnly'},
+        credentials: {token: 'gitea-token'},
+      }),
+    );
   });
 });

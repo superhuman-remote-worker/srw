@@ -9,11 +9,19 @@ hand-maintained copies disagreed on read-write managed connectors
 (agent: write tools; orchestrator: CLI-only).
 """
 
+import logging
+
 import pytest
 
 from agent.core.datasource_setup import (
     DATASOURCE_TOOL_MAP,
     datasource_tool_categories,
+)
+from tests._connector_runtime import open_harness
+from orchestrator.application import preparation as preparation_composition
+from orchestrator.application.resources import bound
+from orchestrator.services import (
+    agent_datasource_payload as agent_datasource_payload_module,
 )
 
 
@@ -149,10 +157,16 @@ class TestRepoCategorySurvivesTheRealFunnel:
     """
 
     def _config_for(self, datasources):
-        from orchestrator.main import _build_datasource_tool_override
+        import orchestrator.main
         from shared.runtime.core.loader import load_config_from_resolved
 
-        override = _build_datasource_tool_override(datasources, None)
+        override = agent_datasource_payload_module.build_datasource_tool_override(
+            datasources,
+            None,
+            dependencies=preparation_composition.datasource_payload_dependencies(
+                orchestrator.main.app.state.resources
+            ),
+        )
         resolved = {
             "agent": {
                 "agent_id": "a",
@@ -280,9 +294,13 @@ class TestOrchestratorDelegation:
 
     @pytest.fixture(scope="class")
     def build_override(self):
-        from orchestrator.main import _build_datasource_tool_override
+        import orchestrator.main
 
-        return _build_datasource_tool_override
+        return bound(
+            agent_datasource_payload_module.build_datasource_tool_override,
+            preparation_composition.datasource_payload_dependencies,
+            orchestrator.main.app.state.resources,
+        )
 
     def test_wrapper_matches_shared_function(self, build_override):
         datasources = [
@@ -307,8 +325,8 @@ class TestApplyDatasourceEnrichmentToResolved:
     config_override merge — the enrichment must be folded into the blob
     (dedicated-pod parity with warm-pool, live_session_settings.md P0.2)."""
 
-    def test_folds_categories_and_cli_types_into_agent_dict(self):
-        from agent.api.persistent_app import _apply_datasource_enrichment_to_resolved
+    def test_folds_categories_into_agent_dict(self):
+        from agent.api.session_attach import apply_datasource_enrichment_to_resolved
 
         resolved = {
             "agent": {
@@ -318,26 +336,20 @@ class TestApplyDatasourceEnrichmentToResolved:
             "prompts": {},
         }
         cats = {"sql": ["sql_query", "sql_schema"], "graph": []}
-        _apply_datasource_enrichment_to_resolved(resolved, cats, ["postgresql"])
+        apply_datasource_enrichment_to_resolved(resolved, cats)
 
         agent = resolved["agent"]
         # Categories merged; unrelated categories preserved; stale replaced.
         assert agent["tools"]["sql"] == ["sql_query", "sql_schema"]
         assert agent["tools"]["graph"] == []
         assert agent["tools"]["core"] == ["read_file"]
-        # _cli_datasources goes at the TOP level of the agent dict —
-        # serialize_resolved_config flattens extra there, and
-        # load_agent_config_from_dict folds unknown top-level keys back
-        # into config.extra (which loader.py reads at prompt render).
-        assert agent["_cli_datasources"] == ["postgresql"]
         assert "extra" not in agent
 
-    def test_top_level_cli_key_reaches_config_extra_via_loader(self):
+    def test_categories_reach_config_tools_via_loader(self):
         """End-to-end through the real loader: the enrichment written by
         _apply_datasource_enrichment_to_resolved must surface as
-        config.extra['_cli_datasources'] and config.tools.sql after
-        load_config_from_resolved."""
-        from agent.api.persistent_app import _apply_datasource_enrichment_to_resolved
+        config.tools.sql after load_config_from_resolved."""
+        from agent.api.session_attach import apply_datasource_enrichment_to_resolved
         from shared.runtime.core.loader import load_config_from_resolved
 
         resolved = {
@@ -345,102 +357,155 @@ class TestApplyDatasourceEnrichmentToResolved:
             "prompts": {},
             "instructions": {},
         }
-        _apply_datasource_enrichment_to_resolved(
-            resolved, {"sql": ["sql_query", "sql_schema"]}, ["postgresql"]
+        apply_datasource_enrichment_to_resolved(
+            resolved, {"sql": ["sql_query", "sql_schema"]}
         )
         config = load_config_from_resolved(resolved)
-        assert config.extra["_cli_datasources"] == ["postgresql"]
+        assert "_cli_datasources" not in config.extra
         assert config.tools.sql == ["sql_query", "sql_schema"]
 
     def test_noop_on_missing_or_malformed_blob(self):
-        from agent.api.persistent_app import _apply_datasource_enrichment_to_resolved
+        from agent.api.session_attach import apply_datasource_enrichment_to_resolved
 
         # None blob: nothing to do, must not raise.
-        _apply_datasource_enrichment_to_resolved(None, {"sql": []}, ["postgresql"])
+        apply_datasource_enrichment_to_resolved(None, {"sql": []})
 
         # Malformed agent key: left untouched.
         resolved = {"agent": "not-a-dict"}
-        _apply_datasource_enrichment_to_resolved(resolved, {"sql": []}, ["x"])
+        apply_datasource_enrichment_to_resolved(resolved, {"sql": []})
         assert resolved == {"agent": "not-a-dict"}
 
-    def test_no_cli_types_leaves_top_level_unset(self):
-        from agent.api.persistent_app import _apply_datasource_enrichment_to_resolved
+    def test_no_cli_key_is_written(self):
+        from agent.api.session_attach import apply_datasource_enrichment_to_resolved
 
         resolved = {"agent": {"agent_id": "a", "tools": {}}}
-        _apply_datasource_enrichment_to_resolved(resolved, {"sql": []}, [])
+        apply_datasource_enrichment_to_resolved(resolved, {"sql": []})
         assert "_cli_datasources" not in resolved["agent"]
 
 
-class TestProcessDatasourcesConnectionRouting:
-    """Read-write managed connectors get real connections now — the CLI-mode
-    routing (env injection, no connection) is retired
-    (knowledge-base/knowledge/issues/datasource_cli_mode_dead_on_remote.md, direction 1)."""
+class TestManagedConnectionRouting:
+    """Read-write managed connectors get real connections; the CLI mode
+    (env injection, no connection) is deleted
+    (knowledge-history/done/datasource_cli_mode_dead_on_remote.md).
+
+    The connection factories receive the binding value, which carries no
+    connector name, so these entries name themselves in their URL."""
+
+    @staticmethod
+    def _entry(ds_type, read_only, name):
+        return {**_ds(ds_type, read_only=read_only, name=name), "connection_url": name}
 
     @pytest.fixture
     def spies(self, monkeypatch):
-        """Spy on connection creation + the retired CLI injectors."""
-        import agent.core.datasource_setup as mod
+        """Spy on connection creation."""
+        import agent.connectors.connections as mod
         from unittest.mock import MagicMock
 
         created = []
 
-        def _fake_create(ds):
-            conn = MagicMock(name=f"conn-{ds['name']}")
-            conn.ds_name = ds["name"]
-            created.append(ds)
+        def _fake_open(value):
+            conn = MagicMock(name=f"conn-{value['url']}")
+            conn.ds_name = value["url"]
+            created.append(value)
             return conn, None
 
-        monkeypatch.setattr(mod, "create_datasource_connection", _fake_create)
-        cli_spies = {}
-        for fn in (
-            "inject_postgresql_services",
-            "inject_mongodb_env_vars",
-            "inject_neo4j_env_vars",
-        ):
-            spy = MagicMock(name=fn)
-            monkeypatch.setattr(mod, fn, spy)
-            cli_spies[fn] = spy
-        return created, cli_spies
+        monkeypatch.setattr(mod, "open_connection", _fake_open)
+        return created
 
-    def test_read_write_connector_gets_connection_not_cli(self, spies):
-        from agent.core.datasource_setup import process_datasources
-
-        created, cli_spies = spies
-        connections, clients, cli_types = process_datasources(
-            [_ds("postgresql", read_only=False, name="rw-db")]
+    def test_read_write_connector_gets_connection(self, spies):
+        created = spies
+        connections, clients = open_harness(
+            [self._entry("postgresql", read_only=False, name="rw-db")]
         )
 
         assert "postgresql" in connections
-        assert [ds["name"] for ds in created] == ["rw-db"]
-        assert cli_types == []
-        for fn, spy in cli_spies.items():
-            spy.assert_not_called()
+        assert [value["url"] for value in created] == ["rw-db"]
 
     def test_read_only_connector_unchanged(self, spies):
-        from agent.core.datasource_setup import process_datasources
-
-        created, _ = spies
-        connections, clients, cli_types = process_datasources(
-            [_ds("neo4j", read_only=True, name="ro-graph")]
+        connections, clients = open_harness(
+            [self._entry("neo4j", read_only=True, name="ro-graph")]
         )
         assert "neo4j" in connections
-        assert cli_types == []
+
+    @pytest.mark.parametrize("ds_type", ["kubeconfig", "generic_file", "ssh_key"])
+    def test_credential_files_never_reach_the_connection_factories(
+        self, ds_type, spies, caplog
+    ):
+        """They used to fall through to create_datasource_connection and log
+        a spurious 'Failed to connect' warning each."""
+        with caplog.at_level(logging.WARNING):
+            connections, clients = open_harness(
+                [self._entry(ds_type, read_only=False, name="file")]
+            )
+        assert connections == {} and clients == {}
+        assert spies == []
+        assert "Failed to connect" not in caplog.text
 
     def test_mixed_same_type_read_write_connection_wins_registry(self, spies):
         """The registry is TYPE-keyed last-one-wins, and the category map
         grants write tools when ANY of a type is RW — so the RW connection
         must win the slot regardless of input order (write tools must never
         bind to the read-only-linked connection)."""
-        from agent.core.datasource_setup import process_datasources
-
         for order in (["rw", "ro"], ["ro", "rw"]):
-            connections, _, _ = process_datasources(
+            connections, _ = open_harness(
                 [
-                    _ds("postgresql", read_only=(label == "ro"), name=label)
+                    self._entry("postgresql", read_only=(label == "ro"), name=label)
                     for label in order
                 ]
             )
             assert connections["postgresql"].ds_name == "rw", order
+
+    @pytest.mark.parametrize("ds_type", ["neo4j", "webdav", "mongodb"])
+    def test_the_replaced_read_only_connection_is_closed(self, ds_type, monkeypatch):
+        """The read-write connection takes the slot; the read-only one it
+        replaces (and its parent client) is closed, not leaked."""
+        import agent.connectors.connections as mod
+        from unittest.mock import MagicMock
+
+        opened = {}
+
+        def _fake_open(value):
+            conn = MagicMock(name=f"conn-{value['url']}")
+            client = MagicMock(name=f"client-{value['url']}")
+            opened[value["url"]] = (conn, client)
+            return conn, client
+
+        monkeypatch.setattr(mod, "open_connection", _fake_open)
+        connections, clients = open_harness(
+            [
+                self._entry(ds_type, read_only=False, name="rw"),
+                self._entry(ds_type, read_only=True, name="ro"),
+            ]
+        )
+        ro_conn, ro_client = opened["ro"]
+        rw_conn, rw_client = opened["rw"]
+        assert connections[ds_type] is rw_conn
+        assert clients[ds_type] is rw_client
+        ro_conn.close.assert_called_once_with()
+        ro_client.close.assert_called_once_with()
+        rw_conn.close.assert_not_called()
+        rw_client.close.assert_not_called()
+
+    def test_a_failed_replacement_keeps_the_open_connection(self, monkeypatch):
+        import agent.connectors.connections as mod
+        from unittest.mock import MagicMock
+
+        ro_conn = MagicMock(name="conn-ro")
+
+        def _fake_open(value):
+            if value["url"] == "rw":
+                raise ConnectionError("refused")
+            return ro_conn, None
+
+        monkeypatch.setattr(mod, "open_connection", _fake_open)
+        connections, _ = open_harness(
+            [
+                self._entry("neo4j", read_only=False, name="rw"),
+                self._entry("neo4j", read_only=True, name="ro"),
+            ]
+        )
+        assert connections["neo4j"] is ro_conn
+        ro_conn.close.assert_not_called()
 
 
 class TestDatasourceIndexNotes:

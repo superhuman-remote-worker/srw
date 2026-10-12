@@ -659,6 +659,7 @@ async def _process_orchestrator_job(
     datasources: Optional[list] = None,
     repositories: Optional[list] = None,
     managed_repository_credentials: Optional[list] = None,
+    workspace_ssh_identities: Optional[list] = None,
     branch_name: Optional[str] = None,
     project_id: Optional[str] = None,
     runtime_actor: Optional[Dict[str, Any]] = None,
@@ -716,6 +717,8 @@ async def _process_orchestrator_job(
             metadata["repositories"] = repositories
         if managed_repository_credentials:
             metadata["managed_repository_credentials"] = managed_repository_credentials
+        if workspace_ssh_identities:
+            metadata["workspace_ssh_identities"] = workspace_ssh_identities
         if branch_name:
             metadata["branch_name"] = branch_name
         if project_id:
@@ -1068,11 +1071,19 @@ def create_app(config_path: Optional[str] = None) -> FastAPI:
         if _shutdown_requested:
             raise HTTPException(status_code=503, detail="Agent is shutting down")
 
+        from agent.api.pinned_delivery import accepted_pinned_job_delivery
+
         if _current_job_id == request.job_id:
+            acknowledgement = accepted_pinned_job_delivery(
+                request,
+                _orchestrator_client,
+                retry=True,
+            )
             return JobStartResponse(
                 job_id=request.job_id,
                 status="accepted",
                 message="Job was already accepted by this runtime",
+                **acknowledgement,
             )
 
         try:
@@ -1090,6 +1101,12 @@ def create_app(config_path: Optional[str] = None) -> FastAPI:
                 status_code=409,
                 detail=f"Agent is busy processing job {_current_job_id}",
             )
+
+        acknowledgement = accepted_pinned_job_delivery(
+            request,
+            _orchestrator_client,
+            retry=False,
+        )
 
         # Accept the job — reset stop state
         _current_job_id = request.job_id
@@ -1128,6 +1145,7 @@ def create_app(config_path: Optional[str] = None) -> FastAPI:
                 datasources=request.datasources,
                 repositories=request.repositories,
                 managed_repository_credentials=(request.managed_repository_credentials),
+                workspace_ssh_identities=(request.workspace_ssh_identities),
                 branch_name=request.branch_name,
                 project_id=request.project_id,
                 runtime_actor=request.runtime_actor,
@@ -1140,6 +1158,7 @@ def create_app(config_path: Optional[str] = None) -> FastAPI:
             job_id=request.job_id,
             status="accepted",
             message="Job processing started",
+            **acknowledgement,
         )
 
     @app.post(
@@ -1303,11 +1322,22 @@ def create_app(config_path: Optional[str] = None) -> FastAPI:
         if _shutdown_requested:
             raise HTTPException(status_code=503, detail="Agent is shutting down")
 
+        from agent.api.pinned_delivery import (
+            accepted_pinned_job_delivery,
+            resume_feedback_with_delegation,
+        )
+
         if _current_job_id == request.job_id:
+            acknowledgement = accepted_pinned_job_delivery(
+                request,
+                _orchestrator_client,
+                retry=True,
+            )
             return JobStartResponse(
                 job_id=request.job_id,
                 status="accepted",
                 message="Job resume was already accepted by this runtime",
+                **acknowledgement,
             )
 
         try:
@@ -1334,10 +1364,19 @@ def create_app(config_path: Optional[str] = None) -> FastAPI:
             )
 
         # Accept the resume request
+        acknowledgement = accepted_pinned_job_delivery(
+            request,
+            _orchestrator_client,
+            retry=False,
+        )
         _current_job_id = request.job_id
 
         # Capture for closure
-        feedback = request.feedback
+        feedback, feedback_reason = resume_feedback_with_delegation(
+            request.feedback,
+            request.feedback_reason,
+            request.delegation_results,
+        )
         config_name = request.config_name
         previous_status = request.previous_status
 
@@ -1357,10 +1396,16 @@ def create_app(config_path: Optional[str] = None) -> FastAPI:
             resume_metadata["managed_repository_credentials"] = (
                 request.managed_repository_credentials
             )
+        if request.workspace_ssh_identities:
+            resume_metadata["workspace_ssh_identities"] = (
+                request.workspace_ssh_identities
+            )
         if request.project_id:
             resume_metadata["project_id"] = request.project_id
         if request.runtime_actor:
             resume_metadata["runtime_actor"] = request.runtime_actor
+        if request.delegation_results:
+            resume_metadata["delegation_results"] = request.delegation_results
         resume_metadata["workspace_runtime"] = request.workspace_runtime
         for field in (
             "workspace_provisioner",
@@ -1392,6 +1437,7 @@ def create_app(config_path: Optional[str] = None) -> FastAPI:
                     metadata=resume_metadata if resume_metadata else None,
                     resume=True,
                     feedback=feedback,
+                    feedback_reason=feedback_reason,
                     original_config_name=config_name,
                     previous_status=previous_status,
                     stream=True,
@@ -1492,6 +1538,7 @@ def create_app(config_path: Optional[str] = None) -> FastAPI:
             job_id=request.job_id,
             status="accepted",
             message="Job resume started",
+            **acknowledgement,
         )
 
     @app.get("/job/current", tags=["Orchestrator"])

@@ -241,6 +241,12 @@ async def acquire_reader_env(
     # config, llm_config, citation_engine) then swap workspace + shell and reset
     # per-reader state so the reader never touches the parent's undo/freeze/reads.
     reader_context = copy.copy(parent_context)
+    # The child's workspace is new and knows none of the parent's repository
+    # tokens, yet its shell reaches the same clones: carry the parent's known
+    # credentials over so its tool output is redacted as the parent's is.
+    from agent.core.tool_output_redaction import workspace_secrets
+
+    reader_context.redaction_secrets = tuple(workspace_secrets(parent_context))
     reader_context.workspace_manager = reader_ws
     reader_context.shell_manager = reader_shell
     reader_context._snapshot_callback = None

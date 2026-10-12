@@ -284,8 +284,8 @@ function timings() {
   const now = Date.now();
   if (state.scenario === 'lease-expiry') {
     return {
-      bootstrap_expires_at: new Date(now + 3_000).toISOString(),
-      expires_at: new Date(now + 5_000).toISOString(),
+      bootstrap_expires_at: new Date(now + 30_000).toISOString(),
+      expires_at: new Date(now + 60_000).toISOString(),
       renew_after: new Date(now + 1_200).toISOString(),
     };
   }

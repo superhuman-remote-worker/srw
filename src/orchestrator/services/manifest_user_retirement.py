@@ -8,6 +8,7 @@ from orchestrator.services.manifest_execution_retirement import (
     execution_references_block_retirement,
     lock_manifest_execution_catalog,
 )
+from shared.connectors.platform import native_project_sql, user_managed_keys
 
 
 async def retire_user_manifests(conn, user_id: UUID) -> bool:
@@ -154,40 +155,47 @@ async def retire_user_manifests(conn, user_id: UUID) -> bool:
     await conn.execute(
         "UPDATE srw_resource_secrets SET owner_id=NULL WHERE owner_id=$1", user_id
     )
-    # A native KB connector is owned by its project, not by the user who
-    # happened to create that project.  Its ``created_by`` column is audit
-    # provenance, but the historical FK is restrictive.  Detach only the
-    # exact synthetic shape that project deletion itself owns: one valid
-    # native project marker with one reciprocal project link and no others.
-    # Personal/shared connectors keep their creator and continue to refuse
-    # account deletion until their ownership is handled explicitly.
+    # A project's own connector (its knowledge base, its cloud folder) is
+    # owned by its project, not by the user who happened to create that
+    # project.  Its ``created_by`` column is audit provenance, but the
+    # historical FK is restrictive.  Detach only the exact synthetic shape
+    # that project deletion itself owns: one project named by its managed key
+    # (or a knowledge base's older marker) with one reciprocal project link
+    # and no others.  Personal/shared connectors keep their creator and
+    # continue to refuse account deletion until their ownership is handled
+    # explicitly.
+    native_project = native_project_sql("datasource")
     await conn.execute(
-        """
+        f"""
         UPDATE datasources AS datasource
            SET created_by = NULL,
                updated_at = now()
          WHERE datasource.created_by = $1
-           AND datasource.type = 'kb'
            AND datasource.scope_mode = 'projects'
            AND COALESCE(datasource.is_global, false) = false
            AND datasource.job_id IS NULL
-           AND COALESCE(datasource.config->>'native_project_id', '') ~*
-               '^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$'
+           AND {native_project} IS NOT NULL
            AND EXISTS (
                SELECT 1
                  FROM project_datasources AS link
                 WHERE link.datasource_id = datasource.id
-                  AND link.project_id =
-                      (datasource.config->>'native_project_id')::uuid
+                  AND link.project_id::text = {native_project}
            )
            AND NOT EXISTS (
                SELECT 1
                  FROM project_datasources AS other_link
                 WHERE other_link.datasource_id = datasource.id
-                  AND other_link.project_id <>
-                      (datasource.config->>'native_project_id')::uuid
+                  AND other_link.project_id::text <> {native_project}
            )
         """,
         user_id,
+    )
+    # A user's own connectors (their session outbox, their cloud root) are
+    # theirs alone: nobody else may attach them, so they go with the account
+    # rather than outlive it as ownerless platform rows. Their links, leases
+    # and job links cascade.
+    await conn.execute(
+        "DELETE FROM datasources WHERE managed_key = ANY($1::text[])",
+        user_managed_keys(user_id),
     )
     return True

@@ -64,6 +64,8 @@ from __future__ import annotations
 
 from typing import Any, Iterable, Mapping, Optional, Sequence
 
+from shared.connectors.builtin import tool_categories
+
 #: Wire-format version of the agent's report.  Bumped when the payload shape
 #: changes incompatibly; the orchestrator refuses to read a version it does not
 #: know rather than mis-parsing it into a confident wrong answer.
@@ -120,9 +122,7 @@ GRANT_GATED_CATEGORIES: dict[str, frozenset[str]] = {
     "shell_tools": frozenset({"shell"}),
     "browser": frozenset({"browser_direct"}),
     "delegation": frozenset({"delegation"}),
-    "datasource_tools": frozenset(
-        {"sql", "mongodb", "graph", "webdav", "email", "mcp", "repo"}
-    ),
+    "datasource_tools": frozenset(tool_categories()),
     "catalog_authoring": frozenset({"catalog_authoring"}),
 }
 

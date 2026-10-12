@@ -295,6 +295,11 @@ async def send_officer_routed_message(
                 expected_lane=lane,
                 lease_token=request.lease_token,
                 agent_id=request.agent_id,
+                pinned_delivery_id=request.pinned_delivery_id,
+                pinned_projection_digest=request.pinned_projection_digest,
+                pinned_delivery_proof=request.pinned_delivery_proof,
+                pinned_process_generation=request.pinned_process_generation,
+                pinned_pod_uid=request.pinned_pod_uid,
                 completion_commands_enabled=dependencies.completion_commands_enabled(),
             )
         except Exception:
@@ -941,6 +946,11 @@ async def send_agent_message(
                     expected_lane=str(job.get("execution_lane") or "pinned"),
                     lease_token=request.lease_token,
                     agent_id=request.agent_id,
+                    pinned_delivery_id=request.pinned_delivery_id,
+                    pinned_projection_digest=request.pinned_projection_digest,
+                    pinned_delivery_proof=request.pinned_delivery_proof,
+                    pinned_process_generation=request.pinned_process_generation,
+                    pinned_pod_uid=request.pinned_pod_uid,
                     completion_commands_enabled=dependencies.completion_commands_enabled(),
                 )
             except Exception:

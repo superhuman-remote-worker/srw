@@ -207,12 +207,13 @@ def _read_bundled_skill(
 
     from shared.runtime.core.skill_format import (
         parse_skill_md,
+        skill_dir_under,
         skill_identity,
         validate_skill_path,
     )
 
     root = skills_root or Path(__file__).resolve().parents[4] / "config" / "skills"
-    skill_dir = root / skill_name
+    skill_dir = skill_dir_under(root, skill_name)
     bundled_files: dict[str, str] = {}
     for path in sorted(skill_dir.rglob("*")):
         if not path.is_file():

@@ -17,6 +17,7 @@ from orchestrator.routers.preferences import (
     router,
 )
 from orchestrator.security import auth
+from orchestrator.routers import preferences as preferences_module
 
 
 PATH = "/api/settings/preferences"
@@ -96,7 +97,10 @@ async def test_two_concurrent_apps_keep_identity_settings_and_defaults_independe
                 == f"registry-{index}-auxiliary"
             )
             assert body["_resolved"]["default_tts_model"] == f"registry-{index}-tts"
-            assert body["_resolved"]["default_vision_model"] == f"vision-{index}"
+            # The registry wins over this app's VISION_MODEL, as at dispatch.
+            assert (
+                body["_resolved"]["default_vision_model"] == f"registry-{index}-vision"
+            )
             assert body["_resolved"]["default_autonomy"] == f"autonomy-{index}"
             assert body["_resolved"]["default_reasoning_level"] == f"reasoning-{index}"
             assert (
@@ -188,13 +192,12 @@ sys.meta_path.insert(0, Blocker())
 from orchestrator.routers.preferences import UserSettingsUpdate, router
 from orchestrator.services.preference_defaults import resolve_preference_defaults
 from orchestrator.services.session_workspace_policy import (
-    SESSION_WORKSPACE_BACKENDS, SESSION_DEFAULT_WORKSPACE_BACKEND,
+    SESSION_WORKSPACE_BACKENDS,
     SESSION_CREATE_WORKSPACE_BACKENDS,
 )
 
 assert UserSettingsUpdate(language="de-DE").language == "de-DE"
 assert SESSION_WORKSPACE_BACKENDS == ("sandbox", "virtual", "none")
-assert SESSION_DEFAULT_WORKSPACE_BACKEND == "virtual"
 assert SESSION_CREATE_WORKSPACE_BACKENDS == ("sandbox", "virtual", "none", "vm")
 assert len(router.routes) == 2
 assert not [name for name in sys.modules if is_forbidden(name)]
@@ -208,15 +211,18 @@ assert not [name for name in sys.modules if is_forbidden(name)]
     assert result.returncode == 0, result.stdout + result.stderr
 
 
-def test_main_keeps_existing_model_and_workspace_policy_exports():
+def test_workspace_policy_constants_are_consumed_from_their_owner():
+    """R1.B12: ``orchestrator.main`` is only the entrypoint and re-exports
+    nothing; the tier constants must not be duplicated there. Slice A2b
+    retired the ``workspace_backend`` preference, so neither the preferences
+    router nor the defaults resolver import the tier constants any more."""
     from orchestrator import main
     from orchestrator.routers.preferences import UserSettingsUpdate
-    from orchestrator.services import session_workspace_policy
 
-    assert main.UserSettingsUpdate is UserSettingsUpdate
+    assert preferences_module.UserSettingsUpdate is UserSettingsUpdate
     for name in (
         "SESSION_WORKSPACE_BACKENDS",
         "SESSION_DEFAULT_WORKSPACE_BACKEND",
         "SESSION_CREATE_WORKSPACE_BACKENDS",
     ):
-        assert getattr(main, name) is getattr(session_workspace_policy, name)
+        assert not hasattr(main, name)

@@ -12,6 +12,10 @@ export function queueParkReasonKey(reason: string | null | undefined): string {
     case 'completion_cas_failed':
     case 'reaper_max_attempts':
       return 'chat.parked.reason.stopped';
+    case 'retry_exhausted':
+      return 'chat.parked.reason.retryExhausted';
+    case 'model_unavailable':
+      return 'chat.parked.reason.modelUnavailable';
     default:
       return 'chat.parked.reason.generic';
   }

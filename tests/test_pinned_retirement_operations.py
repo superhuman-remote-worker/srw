@@ -23,6 +23,8 @@ RUNTIME_GENERATION = "11111111-1111-4111-8111-111111111111"
 ATTACH_TOKEN = "22222222-2222-4222-8222-222222222222"
 RETIREMENT_TOKEN = "33333333-3333-4333-8333-333333333333"
 VM_GENERATION = "44444444-4444-4444-8444-444444444444"
+VM_UID = "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee"
+ROOTDISK_UID = "ffffffff-ffff-4fff-8fff-ffffffffffff"
 CLAIM_ID = "66666666-6666-4666-8666-666666666666"
 CLAIM_ATTEMPT = "77777777-7777-4777-8777-777777777777"
 CLAIM_GENERATION = "88888888-8888-4888-8888-888888888888"
@@ -241,6 +243,7 @@ def _vm_retirement() -> dict[str, object]:
         "permanent": True,
         "context": {
             "thread_id": THREAD_ID,
+            "generation": RUNTIME_GENERATION,
             "entry_status": "active",
             "settle_status": "ended",
             "runtime_authority_exposed": True,
@@ -254,16 +257,18 @@ def _vm_retirement() -> dict[str, object]:
                 "namespace": "agents-a",
                 "protection_protocol": "finalizer_v1",
             },
-            "workspace_container": {},
+            "workspace_container": {
+                "repo_name": "srw",
+                "git_remote_url": "https://example.invalid/srw.git",
+            },
             "workspace_binding": {},
             "workspace_provision_intent": {},
             "vm": {
                 "provision_generation": VM_GENERATION,
                 "identity_provision_generation": VM_GENERATION,
                 "identity_authenticated": True,
-                "vm_uid": "vm-uid-a",
-                "_runtime_incarnation": "vm-uid-a",
-                "rootdisk_pvc_uid": "rootdisk-uid-a",
+                "vm_uid": VM_UID,
+                "rootdisk_pvc_uid": ROOTDISK_UID,
                 "ssh_host": "vm.internal",
                 "ssh_port": 22,
                 "ssh_host_key_fingerprint": "SHA256:" + ("A" * 43),
@@ -281,18 +286,29 @@ def _current_vm_thread() -> dict[str, object]:
         "runtime_retirement_token": RETIREMENT_TOKEN,
         "runtime_retirement_permanent": True,
         "runtime_retirement_authorized_at": "authorized",
+        "runtime_retirement_context": _vm_retirement()["context"],
         "runtime_retirement_local_quiescence": None,
         "metadata": {},
     }
 
 
+def _non_retained_vm_purge(monkeypatch):
+    """These legacy actuator tests have no retained Resume operation/source."""
+    from orchestrator.services import vm_thread_retained_disk_purge as retained
+
+    selector = AsyncMock(return_value=None)
+    monkeypatch.setattr(retained, "acquire_retained_disk_purge", selector)
+    return selector
+
+
 @pytest.mark.asyncio
-async def test_vm_recovery_stops_exact_pod_before_releasing_captured_vm() -> None:
+async def test_vm_recovery_stops_exact_pod_before_releasing_captured_vm(
+    monkeypatch,
+) -> None:
+    retained_selector = _non_retained_vm_purge(monkeypatch)
     events: list[str] = []
     store = MagicMock()
-    store.get_thread = AsyncMock(
-        side_effect=[_current_vm_thread(), _current_vm_thread()]
-    )
+    store.get_thread = AsyncMock(return_value=_current_vm_thread())
 
     @asynccontextmanager
     async def lifecycle_lock(_thread_id: str):
@@ -351,8 +367,8 @@ async def test_vm_recovery_stops_exact_pod_before_releasing_captured_vm() -> Non
     ]
     identity = VMTeardownIdentity(
         provision_generation=VM_GENERATION,
-        vm_uid="vm-uid-a",
-        rootdisk_pvc_uid="rootdisk-uid-a",
+        vm_uid=VM_UID,
+        rootdisk_pvc_uid=ROOTDISK_UID,
         ssh_host="vm.internal",
         ssh_port=22,
         ssh_host_key_fingerprint="SHA256:" + ("A" * 43),
@@ -376,17 +392,156 @@ async def test_vm_recovery_stops_exact_pod_before_releasing_captured_vm() -> Non
         expected_settle_status="ended",
         expected_quiescence_protocol="workspace_actuator_zero_v1",
         expected_workspace_generation=VM_GENERATION,
-        expected_workspace_runtime_incarnation="vm-uid-a",
+        expected_workspace_runtime_incarnation=VM_UID,
         quiescence_actor="orchestrator",
+    )
+
+    # A duplicate recovery sees the exact durable receipt and the already
+    # absent Pod, so it must not issue another VM release.
+    completed = {
+        **_current_vm_thread(),
+        "runtime_retirement_local_quiescence": {
+            "version": 1,
+            "runtime_generation": RUNTIME_GENERATION,
+            "retirement_token": RETIREMENT_TOKEN,
+            "agent_id": AGENT_ID,
+            "runtime_attach_token": ATTACH_TOKEN,
+            "settle_status": "ended",
+            "quiescence_protocol": "workspace_actuator_zero_v1",
+            "quiescence_actor": "orchestrator",
+            "workspace_generation": VM_GENERATION,
+            "workspace_runtime_incarnation": VM_UID,
+        },
+    }
+    store.get_thread.side_effect = [completed, completed]
+    agent_provisioner.agent_pod_authority.side_effect = [
+        "exact_absent",
+        "exact_absent",
+    ]
+    assert await operations.recover_captured_process_zero(_vm_retirement())
+    vm_provisioner.release_vm_captured.assert_awaited_once()
+    store.acknowledge_pinned_thread_local_quiescence.assert_awaited_once()
+    retained_selector.assert_awaited_once_with(
+        operations.dependencies.recovery_store,
+        thread_id=THREAD_ID,
+        identity=identity,
+        generation=RUNTIME_GENERATION,
+        token=RETIREMENT_TOKEN,
     )
 
 
 @pytest.mark.asyncio
-async def test_vm_recovery_hold_blocks_pinned_retirement_vm_release() -> None:
+async def test_idle_soft_retirement_stops_captured_pod_before_vm_effect() -> None:
+    events: list[str] = []
+    retirement = _vm_retirement()
+    retirement["permanent"] = False
+    retirement["context"]["generation"] = RUNTIME_GENERATION
+    retirement["context"]["settle_status"] = "suspended"
     store = MagicMock()
     store.get_thread = AsyncMock(
-        side_effect=[_current_vm_thread(), _current_vm_thread()]
+        return_value={
+            **_current_vm_thread(),
+            "runtime_retirement_permanent": False,
+        }
     )
+    actor = MagicMock()
+    actor.is_available = True
+
+    async def delete_pod(*_args, **_kwargs):
+        events.append("agent_stop")
+        return True
+
+    async def release_vm(*_args, **_kwargs):
+        events.append("vm_stop")
+        return VMTeardownResult("completed", True)
+
+    actor.delete_agent_pod_exact = AsyncMock(side_effect=delete_pod)
+    actor.agent_pod_authority = AsyncMock(
+        side_effect=["exact_terminal", "exact_absent"]
+    )
+    actor.release_agent_pod_finalizer_exact = AsyncMock(return_value=True)
+    vm = MagicMock()
+    vm.lifecycle_available = True
+    vm.release_vm_captured = AsyncMock(side_effect=release_vm)
+    operations = _operations(
+        store=store,
+        agent_provisioner=actor,
+        vm_provisioner=vm,
+    )
+    operations.dependencies.session_router.teardown_route = AsyncMock(
+        return_value=True,
+    )
+    with (
+        patch.object(
+            PinnedRetirementOperations,
+            "_reconcile_workspace_provision_intent_for_retirement",
+            AsyncMock(return_value=False),
+        ),
+        patch.object(
+            PinnedRetirementOperations,
+            "_admit_vm_cleanup",
+            AsyncMock(return_value=SimpleNamespace(allowed=True)),
+        ),
+        patch.object(
+            PinnedRetirementOperations,
+            "_complete_vm_cleanup",
+            AsyncMock(),
+        ),
+        patch.object(
+            PinnedRetirementOperations,
+            "_reconcile_agent_workspace_claim_for_retirement",
+            AsyncMock(),
+        ),
+    ):
+        await operations.cleanup_pinned_thread_retirement(
+            retirement,
+            cleanup_agent_pod=True,
+            stop_agent_before_workspace=True,
+        )
+    assert events == ["agent_stop", "vm_stop"]
+    actor.delete_agent_pod_exact.assert_awaited_once_with(
+        "srw-agent-pinned",
+        expected_pod_uid="55555555-5555-4555-8555-555555555555",
+        namespace="agents-a",
+    )
+
+
+@pytest.mark.asyncio
+async def test_direct_vm_end_refuses_conflicting_alias_before_vm_effect() -> None:
+    retirement = _vm_retirement()
+    retirement["context"]["vm"]["_runtime_incarnation"] = "different-vm-uid"
+    store = MagicMock()
+    store.get_thread = AsyncMock(return_value=_current_vm_thread())
+    store.pinned_retirement_external_cleanup_complete = AsyncMock(return_value=False)
+    vm = MagicMock()
+    vm.lifecycle_available = True
+    vm.release_vm_captured = AsyncMock(
+        side_effect=AssertionError("conflicting VM authority reached actuator")
+    )
+    operations = _operations(store=store, vm_provisioner=vm)
+
+    with patch.object(
+        PinnedRetirementOperations,
+        "_reconcile_workspace_provision_intent_for_retirement",
+        AsyncMock(return_value=False),
+    ):
+        with pytest.raises(
+            RuntimeError, match="exact VM cleanup authority is incomplete"
+        ):
+            await operations.cleanup_pinned_thread_retirement(
+                retirement,
+                cleanup_agent_pod=False,
+            )
+    vm.release_vm_captured.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_vm_recovery_hold_blocks_pinned_retirement_vm_release(
+    monkeypatch,
+) -> None:
+    retained_selector = _non_retained_vm_purge(monkeypatch)
+    store = MagicMock()
+    store.get_thread = AsyncMock(return_value=_current_vm_thread())
 
     @asynccontextmanager
     async def lifecycle_lock(_thread_id: str):
@@ -419,6 +574,15 @@ async def test_vm_recovery_hold_blocks_pinned_retirement_vm_release() -> None:
 
     assert not await operations.recover_captured_process_zero(_vm_retirement())
 
+    retained_selector.assert_awaited_once_with(
+        recovery_store,
+        thread_id=THREAD_ID,
+        identity=operations._captured_vm_recovery_identity(
+            _vm_retirement()["context"], permanent=True
+        ),
+        generation=RUNTIME_GENERATION,
+        token=RETIREMENT_TOKEN,
+    )
     recovery_store.acquire_cleanup_permit.assert_awaited_once()
     vm_provisioner.release_vm_captured.assert_not_awaited()
 
@@ -458,3 +622,112 @@ async def test_vm_recovery_refuses_incomplete_or_contradictory_authority(
     agent_provisioner.delete_agent_pod_exact.assert_not_awaited()
     vm_provisioner.release_vm_captured.assert_not_awaited()
     store.acknowledge_pinned_thread_local_quiescence.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("context_field", "value"),
+    [
+        ("vm", {"_runtime_incarnation": "different-vm-uid"}),
+        ("workspace_container", {"status": "ready"}),
+        ("workspace_container", {"pod_name": "competing-workspace"}),
+        ("workspace_binding", {"kind": "remote", "generation": VM_GENERATION}),
+    ],
+)
+async def test_vm_recovery_refuses_explicit_competing_physical_authority_before_pod_stop(
+    context_field: str,
+    value: dict[str, object],
+) -> None:
+    retirement = _vm_retirement()
+    retirement["context"][context_field].update(value)
+    store = MagicMock()
+    store.get_thread = AsyncMock(return_value=_current_vm_thread())
+    pod = MagicMock()
+    pod.is_available = True
+    pod.delete_agent_pod_exact = AsyncMock()
+    vm = MagicMock()
+    vm.lifecycle_available = True
+    vm.release_vm_captured = AsyncMock()
+    operations = _operations(store=store, agent_provisioner=pod, vm_provisioner=vm)
+
+    assert not await operations.recover_captured_process_zero(retirement)
+    pod.delete_agent_pod_exact.assert_not_awaited()
+    vm.release_vm_captured.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_vm_recovery_accepts_explicit_null_redundant_alias() -> None:
+    retirement = _vm_retirement()
+    retirement["context"]["vm"]["_runtime_incarnation"] = None
+    operations = _operations()
+
+    identity = operations._captured_vm_recovery_identity(
+        retirement["context"], permanent=True
+    )
+    assert identity is not None
+    assert identity.vm_uid == VM_UID
+
+
+@pytest.mark.asyncio
+async def test_vm_recovery_requires_rootdisk_uid_only_for_permanent_end() -> None:
+    retirement = _vm_retirement()
+    retirement["context"]["vm"]["rootdisk_pvc_uid"] = None
+    operations = _operations()
+
+    assert (
+        operations._captured_vm_recovery_identity(retirement["context"], permanent=True)
+        is None
+    )
+    soft_identity = operations._captured_vm_recovery_identity(
+        retirement["context"], permanent=False
+    )
+    assert soft_identity is not None
+    assert soft_identity.rootdisk_pvc_uid is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("recognized", [True, False])
+async def test_retained_disk_refusal_never_falls_through_to_ordinary_cleanup(
+    monkeypatch, recognized
+):
+    from orchestrator.services import vm_thread_retained_disk_purge as retained
+    from orchestrator.services import pinned_retirement as retirement_module
+    from orchestrator.services.vm_workspace_recovery_store import CleanupPermit
+
+    operation = _operations()
+    current = {
+        "generation": "new-generation",
+        "token": "new-permanent-token",
+        "context": {"entry_status": "ended"},
+    }
+    identity = object()
+    ordinary = CleanupPermit(allowed=True)
+
+    async def retained_boundary(
+        store, *, thread_id, identity: object, generation, token
+    ):
+        assert thread_id == "owner"
+        assert generation == "new-generation" and token == "new-permanent-token"
+        return (
+            CleanupPermit(allowed=False, reason="predecessor_unproven")
+            if recognized
+            else None
+        )
+
+    async def ordinary_boundary(*args, **kwargs):
+        if recognized:
+            raise AssertionError(
+                "recognized retained-disk refusal reached ordinary cleanup"
+            )
+        return ordinary
+
+    monkeypatch.setattr(retained, "acquire_retained_disk_purge", retained_boundary)
+    monkeypatch.setattr(
+        retirement_module,
+        "acquire_pinned_thread_retirement_cleanup_permit",
+        ordinary_boundary,
+    )
+    result = await operation._admit_vm_cleanup(
+        "owner", identity, purge_disk=True, retirement=current
+    )
+    assert result is (None if recognized else ordinary)

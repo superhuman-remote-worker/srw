@@ -78,12 +78,16 @@ References without a scope resolve in the selected Project, or in the Account
 for a standalone execution. The example explicitly selects an Account resource;
 Jobs can acquire a default Project even when no project ID is submitted.
 
-Omission inherits the active Project default, then account/role defaults. Explicit
-null selects no workspace. `config_override.workspace.backend` remains an
-explicit compatibility input; supplying both forms is rejected. Referenced
+Omission uses the [workspace defaults](container-workspace-templates.md#workspace-defaults):
+the Project's mode for the role and its template for that tier, then the
+installation's, then the built-in template. A generic-image Job (`adapter:
+generic`) that omits `workspace` gets only its Project's container template, when
+the Project's Jobs mode is `container` and one is set; otherwise it has no
+workspace. Explicit null selects no workspace. `config_override.workspace.backend`
+remains an explicit compatibility input; supplying both forms is rejected. Referenced
 workspace revisions are frozen in execution snapshots, including across Session
 configuration edits and End/Resume. Unattended Project loops, automations and
-Officer dispatch also resolve the Project workspace before connector selection.
+Officer dispatch also resolve the workspace defaults before connector selection.
 
 The SRW provisioner accepts backend-only templates and prebuilt VM templates
 with `Delete` retention, plus retained same-cluster VM instances for Jobs.
@@ -95,8 +99,10 @@ Use immutable image digests: an existing cached golden disk is keyed by the full
 image reference, so changing the contents behind a tag does not invalidate it.
 Enabled same-cluster VM preparation supports `prepare`, all three pull policies
 and `Reuse`/`Rebuild` caching. See [prepared VM workspaces](workspace-preparation.md)
-and [the example](srw-prepared-development-vm.yaml). Image/resource settings on the SRW sandbox
-and virtual backends are also rejected instead of discarded.
+and [the example](srw-prepared-development-vm.yaml). SRW sandbox templates accept an image, pull policy, CPU, memory and storage; see
+[container workspace templates](container-workspace-templates.md). Sandbox
+`prepare`, `cache: Rebuild` and `initialize`, and image/resource settings on the
+virtual backend, are rejected instead of discarded.
 
 Same-cluster SRW VM templates also accept ordered `initialize` commands. See
 [srw-initialized-development-vm.yaml](srw-initialized-development-vm.yaml).
@@ -504,7 +510,7 @@ startup-isolation verification requirement.
 Authored network profiles and VM/virtual workspaces for generic harnesses
 currently fail admission explicitly. Preparation/cache builds are supported by
 the same-cluster SRW VM adapter when enabled; generic builders remain unsupported. The reference SRW adapter keeps its
-existing workspace provisioner (backend selection, prebuilt VM images/resources,
+existing workspace provisioner (backend selection, sandbox images/resources/storage, prebuilt VM images/resources,
 same-cluster VM preparation, initialization and retained Job instances, Reported completion,
 one attempt). Custom initialized/retained sandbox recipes use generic hosting. Existing
 Officer kit/policy updates publish an atomic Project revision; automatic team

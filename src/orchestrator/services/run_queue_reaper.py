@@ -38,7 +38,7 @@ import asyncio
 import json
 import logging
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from enum import Enum
 from typing import Any
 
@@ -76,6 +76,14 @@ logger = logging.getLogger(__name__)
 STALE_INTERRUPT_RETRY_MAX_THREADS = 25
 STALE_PERMISSION_RETRY_MAX_THREADS = 25
 CLAIM_LOSS_RECONCILE_MAX_THREADS = 25
+RETAINED_EXECUTOR_RELEASE_MAX_PODS = 50
+
+# (thread, token, pod uid) debts already reported as absent-without-proof, so a
+# wedged hold is loud once per orchestrator process rather than every tick.
+_ABSENT_CLAIMANT_ANOMALIES: set[tuple[str, int, str]] = set()
+_ABSENT_CLAIMANT_ANOMALY_LIMIT = 4096
+# Last thread id reconciled when a page filled up; see _next_claim_loss_hold_page.
+_CLAIM_LOSS_RECONCILE_CURSOR: str | None = None
 
 
 class JournalStealResult(str, Enum):
@@ -107,7 +115,7 @@ FOR UPDATE
 _LOCK_QUEUE_UNIT_SQL = """
 SELECT unit_kind, state, lease_token, leased_by, last_leased_by,
        leased_until, max_attempts, attempts_since_completion,
-       queued_at, run_after,
+       queued_at, run_after, park_reason,
        input_seq, consumed_seq,
        control_input_seq, control_consumed_seq
        , interrupt_admission_lease_token, interrupt_admission_turn_id
@@ -152,6 +160,9 @@ RETURNING id
 """
 
 
+# The hold replaces the row's disposition while the lost claimant may still
+# write. The metadata hold keeps the intended one (a parked row keeps its park
+# reason there), and ``acknowledge_session_claim_quiesced`` restores it.
 _PARK_CLAIM_LOSS_HOLD_SQL = """
 UPDATE run_queue
 SET state = 'parked',
@@ -321,14 +332,44 @@ FOR UPDATE OF request
 """
 
 
+# Keyset page after ``$2`` (NULL = from the start). The reconciler rotates a
+# cursor through every held thread, so a batch of permanently unsettleable
+# holds (404 Pods from before the executor finalizer) cannot starve newer ones.
 _CLAIM_LOSS_HOLD_CANDIDATES_SQL = """
 SELECT id, metadata
 FROM threads
 WHERE execution_lane = 'stateless'
   AND agent_id IS NULL
   AND COALESCE(metadata, '{}'::jsonb) ? '_stateless_claim_losses'
-ORDER BY last_activity, id
+  AND ($2::uuid IS NULL OR id > $2::uuid)
+ORDER BY id
 LIMIT $1::integer
+"""
+
+# One statement, one snapshot. The steal and End convert "leased by pod" into
+# "ledger names uid" atomically, so reading the two predicates in separate
+# statements could observe neither. A malformed ledger that merely mentions the
+# UID still blocks release: unparseable authority is never absence. Each source
+# is scanned once however many candidates a rollout produces.
+_UNREFERENCED_EXECUTOR_UIDS_SQL = """
+WITH leased AS MATERIALIZED (
+    SELECT DISTINCT leased_by
+    FROM run_queue
+    WHERE unit_kind = 'session_turn'
+      AND leased_by IS NOT NULL
+), ledgers AS MATERIALIZED (
+    SELECT (metadata -> '_stateless_claim_losses')::text AS ledger
+    FROM threads
+    WHERE COALESCE(metadata, '{}'::jsonb) ? '_stateless_claim_losses'
+)
+SELECT candidate.pod_uid
+FROM unnest($1::text[], $2::text[]) AS candidate(pod_uid, pod_name)
+WHERE NOT EXISTS (
+        SELECT 1 FROM leased WHERE leased.leased_by = candidate.pod_name
+      )
+  AND NOT EXISTS (
+        SELECT 1 FROM ledgers WHERE strpos(ledgers.ledger, candidate.pod_uid) > 0
+      )
 """
 
 _TERMINALIZE_STOLEN_INTERRUPT_SQL = """
@@ -827,7 +868,8 @@ async def _steal_session_with_claim_loss(
     unresolved-only thread ledger therefore commits in the same
     ``threads -> run_queue`` transaction as the token bump.  End must drain
     every ledger entry before touching workspace bytes; the exact old claimant
-    (or a Kubernetes absence proof) removes its own entry later.
+    (or the reconciler observing its finalizer-retained Pod UID with every
+    container terminated) removes its own entry later.
     """
 
     thread_id = str(candidate["unit_id"])
@@ -957,7 +999,7 @@ async def _steal_session_with_claim_loss(
             }
         if raw_ledger:
             metadata[CLAIM_LOSS_LEDGER_KEY] = raw_ledger
-            metadata[CLAIM_LOSS_HOLD_KEY] = {
+            hold = {
                 "lease_token": int(unit.lease_token),
                 "intended_state": str(settled_queue["state"]),
                 "attempts_since_completion": int(
@@ -966,6 +1008,12 @@ async def _steal_session_with_claim_loss(
                 "queued_at": _json_timestamp(settled_queue["queued_at"]),
                 "run_after": _json_timestamp(settled_queue["run_after"]),
             }
+            if str(settled_queue["state"]) == "parked":
+                # The hold overwrites the reason below. Keep the steal's own
+                # (``reaper_max_attempts``) so the release restores the reason
+                # the owner sees, and the owner's retry, with the state.
+                hold["park_reason"] = settled_queue["park_reason"]
+            metadata[CLAIM_LOSS_HOLD_KEY] = hold
         else:
             metadata.pop(CLAIM_LOSS_LEDGER_KEY, None)
             metadata.pop(CLAIM_LOSS_HOLD_KEY, None)
@@ -1305,6 +1353,26 @@ async def retry_stale_interrupt_requests(
     return reconciled
 
 
+async def _next_claim_loss_hold_page(conn: Any, limit: int) -> list[Any]:
+    """Return the next ``limit`` held threads, wrapping around the id space.
+
+    The cursor is leader-process memory only: losing it on restart merely
+    restarts the rotation, and every held thread is still visited within
+    ``ceil(held / limit)`` reaper ticks.
+    """
+
+    global _CLAIM_LOSS_RECONCILE_CURSOR
+    cursor = _CLAIM_LOSS_RECONCILE_CURSOR
+    rows = list(await conn.fetch(_CLAIM_LOSS_HOLD_CANDIDATES_SQL, limit, cursor))
+    if cursor is not None and len(rows) < limit:
+        seen = {str(row["id"]) for row in rows}
+        wrapped = await conn.fetch(_CLAIM_LOSS_HOLD_CANDIDATES_SQL, limit, None)
+        rows.extend(row for row in wrapped if str(row["id"]) not in seen)
+        rows = rows[:limit]
+    _CLAIM_LOSS_RECONCILE_CURSOR = str(rows[-1]["id"]) if len(rows) >= limit else None
+    return rows
+
+
 async def reconcile_claim_loss_holds(
     conn: Any,
     *,
@@ -1326,7 +1394,7 @@ async def reconcile_claim_loss_holds(
         mark_session_claim_eviction_requested,
     )
 
-    candidates = await conn.fetch(_CLAIM_LOSS_HOLD_CANDIDATES_SQL, int(max_threads))
+    candidates = await _next_claim_loss_hold_page(conn, int(max_threads))
     settled = 0
     for candidate in candidates:
         thread_id = str(candidate["id"])
@@ -1356,14 +1424,20 @@ async def reconcile_claim_loss_holds(
                     # stopped the old credential-bearing process.  Only the
                     # claimant's local drain ACK or an observed exact UID with
                     # all containers terminated may clear this debt.
+                    if pod_state in {"exact_absent", "replacement"}:
+                        _report_absent_claimant(thread_id, token, authority, pod_state)
                     continue
+                # The executor's process-zero finalizer keeps this exact
+                # terminal object readable; the ACK and its receipt commit
+                # before release_retained_executor_pods may let it go.
                 if await acknowledge_session_claim_quiesced(
                     conn,
                     thread_id=thread_id,
                     previous_lease_token=token,
                     leased_by=authority.pod,
                     pod_uid=authority.pod_uid,
-                    quiesced_by="pod_absent",
+                    quiesced_by="pod_terminal",
+                    receipt={"evidence": "exact_terminal"},
                 ):
                     settled += 1
         except asyncio.CancelledError:
@@ -1377,33 +1451,196 @@ async def reconcile_claim_loss_holds(
     return settled
 
 
+def _report_absent_claimant(
+    thread_id: str, token: int, authority: ClaimantAuthority, pod_state: str
+) -> None:
+    """Log, once, a claimant debt whose exact Pod vanished without proof.
+
+    With the executor process-zero finalizer the object outlives its
+    containers, so a 404 means a force delete, node GC or a pre-finalizer
+    Pod, never the steady state. Only an operator can settle it.
+    """
+
+    key = (thread_id, int(token), authority.pod_uid)
+    if key in _ABSENT_CLAIMANT_ANOMALIES:
+        return
+    if len(_ABSENT_CLAIMANT_ANOMALIES) >= _ABSENT_CLAIMANT_ANOMALY_LIMIT:
+        _ABSENT_CLAIMANT_ANOMALIES.clear()
+    _ABSENT_CLAIMANT_ANOMALIES.add(key)
+    logger.error(
+        "run_queue reaper: claimant pod %s uid=%s of unit %s (token %d) is %s "
+        "without process-zero proof; the claim-loss hold cannot settle "
+        "automatically. Once the process is confirmed gone: POST "
+        "/api/admin/run-queue/%s/attest-claimant-gone",
+        authority.pod,
+        authority.pod_uid,
+        thread_id,
+        int(token),
+        pod_state,
+        thread_id,
+    )
+
+
+async def unreferenced_executor_uids(conn: Any, pods: dict[str, str]) -> set[str]:
+    """Return the ``{uid: name}`` candidates no claimant authority names.
+
+    Callers must observe the Pods BEFORE this read. A durable reference is
+    created only by a live claimant process holding a session lease (the
+    claim-bundle stamp, then the steal/End conversion into ledger debt), so a
+    process already observed stopped cannot create one after this snapshot.
+    """
+
+    if not pods:
+        return set()
+    uids = sorted(pods)
+    rows = await conn.fetch(
+        _UNREFERENCED_EXECUTOR_UIDS_SQL,
+        uids,
+        [pods[uid] for uid in uids],
+    )
+    return {str(row["pod_uid"]) for row in rows}
+
+
+async def release_retained_executor_pods(
+    conn: Any,
+    *,
+    max_pods: int = RETAINED_EXECUTOR_RELEASE_MAX_PODS,
+) -> int:
+    """Release the process-zero finalizer from settled executor Pods.
+
+    Every pool executor is born with the chart's retention finalizer so the
+    claimant-loss reconciler can observe its exact terminal UID. Release
+    requires, in order: one Kubernetes LIST, per-Pod evidence evaluated on
+    that snapshot, one database snapshot proving no session lease is held by
+    the Pod's name and no claim-loss ledger names its UID, then a
+    UID/resourceVersion-tested patch. Evidence is either process-zero
+    (containers terminated, or the executor never started) or, once the
+    termination grace has passed, a lost node: Node 404 or the
+    ``out-of-service`` taint, where no kubelet will ever report terminal
+    statuses. A released object can never weaken settlement (a 404 still
+    settles nothing); the database check is what keeps an unsettled UID
+    readable. ``max_pods`` bounds patches, never candidates, so referenced
+    Pods cannot starve releasable ones. Rollouts, scale-downs, crash
+    replacements and never-claimed Pods therefore leave nothing behind.
+    Stateless by design: an orchestrator restart or a missed tick defers
+    release to the next pass.
+    """
+
+    from orchestrator.services.agent_provisioner import (
+        agent_provisioner,
+        stateless_executor_process_zero,
+    )
+
+    try:
+        retained = await agent_provisioner.list_retained_stateless_executor_pods()
+        if not retained:
+            return 0
+        now = datetime.now(timezone.utc)
+        node_lost: dict[str, bool] = {}
+        candidates: dict[str, tuple[Any, bool]] = {}
+        names: dict[str, str] = {}
+        for pod in retained:
+            process_zero = stateless_executor_process_zero(pod)
+            if not process_zero:
+                node_name = str(getattr(pod.spec, "node_name", None) or "")
+                deadline = pod.metadata.deletion_timestamp
+                if isinstance(deadline, datetime) and deadline.tzinfo is None:
+                    deadline = deadline.replace(tzinfo=timezone.utc)
+                if (
+                    not node_name
+                    or not isinstance(deadline, datetime)
+                    or deadline > now
+                ):
+                    continue
+                if node_name not in node_lost:
+                    node_lost[
+                        node_name
+                    ] = await agent_provisioner.stateless_executor_node_lost(node_name)
+                if not node_lost[node_name]:
+                    continue
+            uid = str(pod.metadata.uid)
+            candidates[uid] = (pod, process_zero)
+            names[uid] = str(pod.metadata.name)
+        released = 0
+        for uid in sorted(await unreferenced_executor_uids(conn, names)):
+            if released >= max_pods:
+                break
+            pod, process_zero = candidates[uid]
+            if not process_zero:
+                logger.warning(
+                    "run_queue reaper: releasing executor %s uid=%s on lost-node "
+                    "evidence (node %s absent or out-of-service); no claim names it",
+                    pod.metadata.name,
+                    uid,
+                    pod.spec.node_name,
+                )
+            if await agent_provisioner.release_stateless_executor_finalizer_exact(
+                pod, require_process_zero=process_zero
+            ):
+                released += 1
+        return released
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        logger.exception(
+            "run_queue reaper: retained executor finalizer release failed "
+            "(contained; retried next cycle)"
+        )
+        return 0
+
+
 async def _try_steal_worker_with_recovery(
     conn: Any, *, candidate: Any, backoff_seconds: float, grace_seconds: float
 ) -> StolenUnit | None:
     """Let exact recovery evidence decide before the ordinary exhaustion CAS."""
     try:
-        store = VMWorkspaceRecoveryStore(conn)
-        disposition = await store.get_attempt_disposition(
-            conn, job_id=candidate["unit_id"], lease_token=candidate["lease_token"]
-        )
-        # Admission owns canonical workspace -> queue -> job locking and
-        # revalidates both expiry and attempt evidence after those locks.
-        if await store.admit_hold_from_reaper(
+        from shared.worker_execution_hold import hold_container_worker_attempt
+
+        decision = await hold_container_worker_attempt(
             conn,
-            disposition=disposition,
             job_id=candidate["unit_id"],
             lease_token=candidate["lease_token"],
+            reason="post_bundle_executor_loss",
             grace_seconds=grace_seconds,
-        ):
-            return None
-        # Non-VM workers retain the queue-only steal and exhaustion behavior.
-        row = await conn.fetchrow(
-            _REAP_STEAL_SQL,
-            candidate["unit_id"],
-            candidate["lease_token"],
-            backoff_seconds,
-            grace_seconds,
         )
+        if decision != "not_applicable":
+            return None
+        if workspace_recovery_enabled():
+            store = VMWorkspaceRecoveryStore(conn)
+            disposition = await store.get_attempt_disposition(
+                conn, job_id=candidate["unit_id"], lease_token=candidate["lease_token"]
+            )
+            # Admission owns canonical workspace -> queue -> job locking and
+            # revalidates both expiry and attempt evidence after those locks.
+            if await store.admit_hold_from_reaper(
+                conn,
+                disposition=disposition,
+                job_id=candidate["unit_id"],
+                lease_token=candidate["lease_token"],
+                grace_seconds=grace_seconds,
+            ):
+                return None
+        # A bundle may have been issued since the first classification. Keep
+        # this final classification's queue/Job locks through the ordinary
+        # steal; otherwise pre-bundle proof could authorize post-bundle replay.
+        # VM recovery above retains its existing canonical lock order.
+        async with conn.transaction():
+            decision = await hold_container_worker_attempt(
+                conn,
+                job_id=candidate["unit_id"],
+                lease_token=candidate["lease_token"],
+                reason="post_bundle_executor_loss",
+                grace_seconds=grace_seconds,
+            )
+            if decision != "not_applicable":
+                return None
+            row = await conn.fetchrow(
+                _REAP_STEAL_SQL,
+                candidate["unit_id"],
+                candidate["lease_token"],
+                backoff_seconds,
+                grace_seconds,
+            )
         if row is None:
             return None
         return StolenUnit(
@@ -1438,16 +1675,11 @@ async def reap_cycle(
     opens its own transaction. Per-row errors are contained so one bad unit
     never blocks the rest of the pass.
     """
-    recovery_options = (
-        {"worker_steal": _try_steal_worker_with_recovery}
-        if workspace_recovery_enabled()
-        else {}
-    )
     stolen = await reap_expired(
         conn,
         grace_seconds=grace_seconds,
         session_steal=_try_steal_session_with_claim_loss,
-        **recovery_options,
+        worker_steal=_try_steal_worker_with_recovery,
     )
     for unit in stolen:
         # Greppable ops line — one per steal (M6 fault-injection anchors on it).
@@ -1484,6 +1716,9 @@ async def reap_cycle(
     await retry_stale_interrupt_requests(conn)
     await retry_stale_permission_requests(conn)
     await reconcile_claim_loss_holds(conn)
+    # After settlement, so a UID the reconciler just proved terminal is
+    # released in the same cycle and never before its receipt is durable.
+    await release_retained_executor_pods(conn)
     return len(stolen)
 
 

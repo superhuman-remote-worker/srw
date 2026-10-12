@@ -35,7 +35,14 @@ _RC_CORE = "__SRW_RCLONE_RC_CORE__"
 _RC_VFS = "__SRW_RCLONE_RC_VFS__"
 _RESIDENT_ADOPTED = "__SRW_RCLONE_RESIDENT_ADOPTED__"
 _RESIDENT_HEAL = "__SRW_RCLONE_RESIDENT_HEAL__"
+#: A resident of this mount's config and target whose rc address is not the
+#: one its index now gives it (a folder ahead of it left the set).
+_RESIDENT_RC = "__SRW_RCLONE_RESIDENT_RC__"
 _RESIDENT_IDENTITY_VERSION = "1"
+#: How long (0.5 s rounds) a resident no longer in the set is given to upload
+#: what it holds before it is stopped: at a claim, and at End.
+_UNPLANNED_DRAIN_ROUNDS_CLAIM = 20
+_UNPLANNED_DRAIN_ROUNDS_TERMINAL = 60
 _TERMINAL_DRAIN_STATUS_PY = (
     "import json,sys; c=json.loads(sys.argv[1]); v=json.loads(sys.argv[2]); "
     'd=v.get("diskCache") if isinstance(v,dict) else None; '
@@ -126,6 +133,55 @@ compile_cloudignore() {
   ' "$src" >> "$dest"
 }
 """
+
+
+#: Non-secret source keys that may join a resident mount's identity
+#: (``nextcloud_chunk_size`` is "0" for a Nextcloud Group Folder).
+_IDENTITY_SOURCE_KEYS = frozenset(
+    {"url", "vendor", "user", "encoding", "nextcloud_chunk_size"}
+)
+#: The auth keys a resident's identity reads; none is a secret.
+_IDENTITY_AUTH_KEYS = ("type", "issuer", "client_id", "target_user_sub")
+
+
+def mount_state_name(workspace_name: str, index: int = 0) -> str:
+    """The state directory (and rclone remote suffix) a mount's workspace
+    name maps to: lowercase letters and digits, anything else ``-``. Two
+    names that map to one would share a config, a cache and a remote, so a
+    set's names must map to distinct ones."""
+    safe = "".join(ch.lower() if ch.isalnum() else "-" for ch in workspace_name)
+    return safe.strip("-") or f"mount-{index}"
+
+
+def resident_spec_record(mount: dict[str, Any]) -> dict[str, Any]:
+    """A delivered in-workspace mount without its secrets.
+
+    It rebuilds the resident's identity (``_state_for_mount``: its
+    non-secret spec digest, state dir, remote and rc address) exactly, so
+    the orchestrator may keep it on the thread and End retire what was
+    delivered rather than what the selection says now. A secret source key
+    keeps its name with an empty value (its presence decides whether the
+    resident is adoptable); the auth keeps only the keys the identity
+    reads; provider flags only that there were some."""
+    source = dict(mount.get("source") or {})
+    config = dict(source.get("config") or {})
+    auth = dict(mount.get("auth") or {})
+    record = {
+        key: value
+        for key, value in mount.items()
+        if key not in {"source", "auth", "provider_flags"}
+    }
+    record["source"] = {
+        **{key: value for key, value in source.items() if key != "config"},
+        "config": {
+            str(key): value if str(key) in _IDENTITY_SOURCE_KEYS else ""
+            for key, value in config.items()
+        },
+    }
+    record["auth"] = {key: auth[key] for key in _IDENTITY_AUTH_KEYS if key in auth}
+    if mount.get("provider_flags"):
+        record["provider_flags"] = ["--redacted"]
+    return record
 
 
 class RcloneMountError(RuntimeError):
@@ -582,6 +638,11 @@ echo "{_OK}"
         if self.cloud_cfg.get("driver") != "rclone":
             raise RcloneMountError("cloud_mount driver must be 'rclone'")
         if not self.cloud_cfg.get("mounts"):
+            # Nothing is planned now: what an earlier claim mounted goes.
+            if hasattr(self.workspace_backend, "exec_command") and hasattr(
+                self.workspace_backend, "write_home_file"
+            ):
+                self.retire_unplanned_sync([])
             return
         if not hasattr(self.workspace_backend, "exec_command"):
             raise RcloneMountError(
@@ -590,14 +651,22 @@ echo "{_OK}"
         if not hasattr(self.workspace_backend, "write_home_file"):
             raise RcloneMountError("rclone cloud_mount requires remote home writes")
 
+        mounts = list(self.cloud_cfg.get("mounts") or [])
+        planned = [
+            self._state_for_mount(mount, index) for index, mount in enumerate(mounts)
+        ]
+        # A resident of a folder no longer in the set (detached, revoked,
+        # renamed) is stopped first: it frees its rc port for the set, and
+        # its credential leaves the workspace.
+        self.retire_unplanned_sync(planned)
         states: list[RcloneMountState] = []
         attempted_states: list[RcloneMountState] = []
         adopted_states: list[RcloneMountState] = []
         mounts_by_id: dict[str, dict[str, Any]] = {}
         mount_index_by_id: dict[str, int] = {}
         try:
-            for index, mount in enumerate(self.cloud_cfg.get("mounts") or []):
-                state = self._state_for_mount(mount, index)
+            for index, mount in enumerate(mounts):
+                state = planned[index]
                 started = time.perf_counter()
                 state, disposition = self._start_or_adopt_mount(
                     mount,
@@ -679,6 +748,19 @@ echo "{_OK}"
         ]
 
         def _retire() -> None:
+            # Every resident the payload does not name, or names with
+            # another spec (a folder left the set or changed since it was
+            # mounted), goes first; otherwise its identity file alone would
+            # fail the zero proof below for as long as the workspace lives.
+            self._run_terminal_remote_script(
+                "terminal_retire_unplanned_rclone.sh",
+                self._unplanned_retirement_script(
+                    expected,
+                    drain_rounds=(_UNPLANNED_DRAIN_ROUNDS_TERMINAL if drain else 0),
+                    retire_changed=True,
+                ),
+                timeout=300,
+            )
             for state in reversed(expected):
                 self._run_terminal_remote_script(
                     f"terminal_unmount_{state.remote_name}.sh",
@@ -693,6 +775,217 @@ echo "{_OK}"
 
         await asyncio.to_thread(_retire)
         return {"rclone_mounts": len(expected), "rclone_processes": 0}
+
+    def retire_unplanned_sync(self, planned: list[RcloneMountState]) -> bool:
+        """Stop and remove every resident of this thread's workspace that
+        ``planned`` does not name: its rclone process (given a short while
+        to upload what it holds), its mount, its link under workspace/cloud
+        and its state directory, rclone.conf with its credential included.
+        A folder detached, revoked or renamed since an earlier claim mounted
+        it is then gone from the workspace, not left running beside the set.
+
+        Best effort at a claim (a resident that would not stop is retried at
+        the next claim and at End, whose own pass is strict); True when the
+        workspace holds none. Never raises."""
+        try:
+            output = self._run_remote_script(
+                "retire_unplanned_rclone.sh",
+                self._unplanned_retirement_script(
+                    planned,
+                    drain_rounds=_UNPLANNED_DRAIN_ROUNDS_CLAIM,
+                    retire_changed=False,
+                ),
+                timeout=120,
+                require_ok=False,
+            )
+        except Exception:
+            logger.warning(
+                "rclone residents outside the planned set were not retired: thread=%s",
+                self.thread_id,
+                exc_info=True,
+            )
+            return False
+        if _OK not in output:
+            logger.warning(
+                "rclone residents outside the planned set were not retired: "
+                "thread=%s output=%s",
+                self.thread_id,
+                _compact_rc(output),
+            )
+            return False
+        return True
+
+    def _unplanned_retirement_script(
+        self,
+        planned: list[RcloneMountState],
+        *,
+        drain_rounds: int,
+        retire_changed: bool,
+    ) -> str:
+        """The script of :meth:`retire_unplanned_sync` and End's first pass.
+
+        A resident is found by what it is, not by its identity file (which a
+        pinned mount never wrote): an rclone ``mount`` process whose argv
+        names a state directory's rclone.conf, and any mount whose source is
+        that directory's remote (a dead process's stale FUSE target). The
+        planned directories are kept; with ``retire_changed`` (End) one
+        whose resident identity has another spec digest goes too. Each
+        resident gets ``drain_rounds`` half-second rounds to report no
+        upload in flight before it is stopped. The directory is removed only
+        once no process and no mount of it is left; one that stays is
+        reported (exit 85) and retried."""
+        base = self.workspace_backend.resolve_home_path(
+            f".cache/srw/rclone/{self.thread_id}"
+        )
+        keep_names = " ".join(sorted({Path(state.state_dir).name for state in planned}))
+        keep_specs = " ".join(
+            sorted(
+                {
+                    f"{Path(state.state_dir).name}={state.resident_spec_digest}"
+                    for state in planned
+                }
+            )
+        )
+        prefix = f"srw-{self.thread_id[:8]}-"
+        return f"""#!/usr/bin/env bash
+set -u
+base={shlex.quote(base)}
+workspace={shlex.quote(self.workspace_root)}
+prefix={shlex.quote(prefix)}
+keep_names={shlex.quote(keep_names)}
+keep_specs={shlex.quote(keep_specs)}
+retire_changed={"yes" if retire_changed else "no"}
+drain_rounds={int(drain_rounds)}
+if [ ! -d "$base" ]; then echo "{_OK}"; exit 0; fi
+_srw_keep() {{
+  case " $keep_names " in *" $1 "*) ;; *) return 1 ;; esac
+  [ "$retire_changed" = yes ] || return 0
+  [ -f "$2/resident.identity" ] || return 0
+  _srw_spec=$(head -n1 "$2/resident.identity" 2>/dev/null | cut -d'|' -f2)
+  case " $keep_specs " in *" $1=$_srw_spec "*) return 0 ;; esac
+  return 1
+}}
+_srw_arg_after() {{
+  printf '%s\\n' "$1" | awk -v flag="$2" 'take {{ print; exit }} $0 == flag {{ take = 1 }}'
+}}
+_srw_target_of() {{
+  # rclone ... mount <remote:root> <target> ...
+  printf '%s\\n' "$1" | awk 'seen == 2 {{ print; exit }} seen == 1 {{ seen = 2; next }} $0 == "mount" {{ seen = 1 }}'
+}}
+_srw_procs_of() {{
+  for _srw_cmdline in /proc/[0-9]*/cmdline; do
+    # argv[0] without a fork: only an rclone is read further.
+    IFS= read -r -d '' _srw_argv0 < "$_srw_cmdline" 2>/dev/null || continue
+    [ "${{_srw_argv0##*/}}" = rclone ] || continue
+    _srw_args=$(tr '\\0' '\\n' < "$_srw_cmdline" 2>/dev/null) || continue
+    printf '%s\\n' "$_srw_args" | grep -Fqx -- mount || continue
+    printf '%s\\n' "$_srw_args" | grep -Fqx -- "$1" || continue
+    _srw_found=${{_srw_cmdline#/proc/}}
+    printf '%s\\n' "${{_srw_found%/cmdline}}"
+  done
+}}
+_srw_runs() {{
+  [ -r "/proc/$1/cmdline" ] && tr '\\0' '\\n' < "/proc/$1/cmdline" 2>/dev/null | grep -Fqx -- "$2"
+}}
+_srw_mount_table() {{
+  if command -v findmnt >/dev/null 2>&1; then
+    findmnt -rn -o SOURCE,TARGET 2>/dev/null
+  else
+    awk '{{ print $1 " " $2 }}' /proc/mounts 2>/dev/null
+  fi
+}}
+_srw_targets_of() {{
+  _srw_mount_table | awk -v remote="$1:" 'index($1, remote) == 1 {{ print $2 }}'
+}}
+_srw_mounted() {{
+  _srw_mount_table | awk -v target="$1" '$2 == target {{ found = 1 }} END {{ exit !found }}'
+}}
+_srw_detach() {{
+  timeout 10 fusermount3 -u "$1" >/dev/null 2>&1 || timeout 10 fusermount -u "$1" >/dev/null 2>&1 || true
+  if _srw_mounted "$1"; then
+    timeout 10 fusermount3 -uz "$1" >/dev/null 2>&1 || timeout 10 fusermount -uz "$1" >/dev/null 2>&1 || true
+  fi
+  if _srw_mounted "$1"; then
+    timeout 10 sudo -n umount -l -- "$1" >/dev/null 2>&1 || true
+  fi
+}}
+_srw_unlink() {{
+  # Only a link of workspace/cloud that points at exactly this target.
+  _srw_link_entry="$workspace/cloud"
+  if [ -L "$_srw_link_entry" ]; then
+    [ "$(readlink "$_srw_link_entry")" = "$1" ] && rm -f -- "$_srw_link_entry"
+    return 0
+  fi
+  [ -d "$_srw_link_entry" ] || return 0
+  for _srw_link in "$_srw_link_entry"/*; do
+    [ -L "$_srw_link" ] || continue
+    [ "$(readlink "$_srw_link")" = "$1" ] && rm -f -- "$_srw_link"
+  done
+  return 0
+}}
+_srw_retire_dir() {{
+  _srw_dir="$1"
+  _srw_conf="$1/rclone.conf"
+  _srw_remote="$prefix$2"
+  _srw_targets=
+  for _srw_pid in $(_srw_procs_of "$_srw_conf"); do
+    _srw_args=$(tr '\\0' '\\n' < "/proc/$_srw_pid/cmdline" 2>/dev/null) || continue
+    _srw_targets="$_srw_targets
+$(_srw_target_of "$_srw_args")"
+    _srw_addr=$(_srw_arg_after "$_srw_args" --rc-addr)
+    _srw_user=$(_srw_arg_after "$_srw_args" --rc-user)
+    _srw_pass=$(_srw_arg_after "$_srw_args" --rc-pass)
+    if [ -n "$_srw_addr" ]; then
+      _srw_round=0
+      while [ "$_srw_round" -lt "$drain_rounds" ]; do
+        if _srw_core=$(timeout 5 rclone rc --rc-addr "$_srw_addr" --rc-user "$_srw_user" --rc-pass "$_srw_pass" core/stats 2>/dev/null) &&
+           _srw_vfs=$(timeout 5 rclone rc --rc-addr "$_srw_addr" --rc-user "$_srw_user" --rc-pass "$_srw_pass" vfs/stats 2>/dev/null) &&
+           python3 -c {shlex.quote(_TERMINAL_DRAIN_STATUS_PY)} "$_srw_core" "$_srw_vfs" 2>/dev/null; then
+          break
+        fi
+        _srw_round=$((_srw_round + 1))
+        sleep 0.5
+      done
+      timeout 10 rclone rc --rc-addr "$_srw_addr" --rc-user "$_srw_user" --rc-pass "$_srw_pass" core/quit >/dev/null 2>&1 || true
+    fi
+    for _srw_i in $(seq 1 20); do _srw_runs "$_srw_pid" "$_srw_conf" || break; sleep 0.1; done
+    if _srw_runs "$_srw_pid" "$_srw_conf"; then kill "$_srw_pid" 2>/dev/null || true; fi
+    for _srw_i in $(seq 1 20); do _srw_runs "$_srw_pid" "$_srw_conf" || break; sleep 0.1; done
+    if _srw_runs "$_srw_pid" "$_srw_conf"; then kill -9 "$_srw_pid" 2>/dev/null || true; fi
+    for _srw_i in $(seq 1 20); do _srw_runs "$_srw_pid" "$_srw_conf" || break; sleep 0.1; done
+  done
+  _srw_targets="$_srw_targets
+$(_srw_targets_of "$_srw_remote")"
+  while IFS= read -r _srw_target; do
+    [ -n "$_srw_target" ] && _srw_detach "$_srw_target"
+  done <<EOF
+$_srw_targets
+EOF
+  [ -z "$(_srw_procs_of "$_srw_conf")" ] || return 1
+  [ -z "$(_srw_targets_of "$_srw_remote")" ] || return 1
+  while IFS= read -r _srw_target; do
+    [ -n "$_srw_target" ] && _srw_unlink "$_srw_target"
+  done <<EOF
+$_srw_targets
+/cloud/$2
+EOF
+  rm -rf -- "$_srw_dir"
+}}
+_srw_failed=
+for _srw_entry in "$base"/*/; do
+  [ -d "$_srw_entry" ] || continue
+  _srw_entry=${{_srw_entry%/}}
+  _srw_name=${{_srw_entry##*/}}
+  [ "$_srw_name" = scripts ] && continue
+  _srw_keep "$_srw_name" "$_srw_entry" && continue
+  _srw_retire_dir "$_srw_entry" "$_srw_name" || _srw_failed="$_srw_failed $_srw_name"
+done
+if [ -n "$_srw_failed" ]; then
+  echo "rclone residents outside the set did not stop:$_srw_failed" >&2
+  exit 85
+fi
+echo "{_OK}"
+"""
 
     def _start_or_adopt_mount(
         self,
@@ -770,7 +1063,7 @@ echo "{_OK}"
 
         source = mount.get("source") or {}
         source_keys = {str(key) for key in dict(source.get("config") or {})}
-        if source_keys - {"url", "vendor", "user", "encoding"}:
+        if source_keys - _IDENTITY_SOURCE_KEYS:
             return False
         if mount.get("provider_flags"):
             return False
@@ -841,7 +1134,25 @@ _srw_pid_matches() {{
     printf '%s\\n' "$_srw_args" | grep -Fqx -- "$_srw_expected" || return 1
   done
 }}
+_srw_moved_rc() {{
+  # The exact resident of this config and target, mounted when this folder
+  # had another place in the set: its rc address, for an exact stop.
+  [ -r "/proc/$_srw_pid/cmdline" ] || return 1
+  _srw_args=$(tr '\\0' '\\n' < "/proc/$_srw_pid/cmdline") || return 1
+  [ "$(basename "$(printf '%s\\n' "$_srw_args" | head -n1)")" = rclone ] || return 1
+  for _srw_expected in mount {shlex.quote(state.config_path)} {shlex.quote(state.target_path)}; do
+    printf '%s\\n' "$_srw_args" | grep -Fqx -- "$_srw_expected" || return 1
+  done
+  _srw_rc=$(printf '%s\\n' "$_srw_args" | awk 'take {{ print; exit }} $0 == "--rc-addr" {{ take = 1 }}')
+  printf %s "$_srw_rc" | grep -Eq '^127\\.0\\.0\\.1:[0-9]{{1,5}}$' || return 1
+  printf %s "$_srw_rc"
+}}
 if ! _srw_pid_matches; then
+  if _srw_rc=$(_srw_moved_rc); then
+    printf '%s\\t%s\\n' {_RESIDENT_RC} "$_srw_rc"
+    printf '%s\\t%s\\t%s\\t%s\\t%s\\n' {_RESIDENT_HEAL} "$_srw_spec" "$_srw_generation" "$_srw_pid" "$_srw_pass"
+    exit 0
+  fi
   mountpoint -q "$target" && exit 85
   printf '%s\\t%s\\t%s\\t%s\\t%s\\n' {_RESIDENT_HEAL} "$_srw_spec" "$_srw_generation" "$_srw_pid" "$_srw_pass"
   exit 0
@@ -912,12 +1223,22 @@ fi
                 return None
             raise RcloneMountError("resident rclone probe returned no disposition")
         spec_digest, generation, _pid, rc_pass = fields
-        return replace(
+        healed = replace(
             state,
             resident_spec_digest=spec_digest,
             resident_generation=generation,
             rc_pass=rc_pass,
         )
+        for line in output.splitlines():
+            parts = line.split("\t")
+            if len(parts) == 2 and parts[0] == _RESIDENT_RC:
+                if not re.fullmatch(r"127\.0\.0\.1:[0-9]{1,5}", parts[1]):
+                    raise RcloneMountError(
+                        "resident rclone probe returned a malformed rc address"
+                    )
+                # Stopped at the address it runs with; remounted at its own.
+                healed = replace(healed, rc_addr=parts[1])
+        return healed
 
     def _rollback_start_sync(
         self,
@@ -1003,10 +1324,7 @@ fi
         cache = self._cache_for_mount(mount)
         mount_id = str(mount.get("mount_id") or f"mount-{index}")
         workspace_name = str(mount.get("workspace_name") or f"mount-{index}")
-        safe_name = "".join(
-            ch.lower() if ch.isalnum() else "-" for ch in workspace_name
-        ).strip("-")
-        safe_name = safe_name or f"mount-{index}"
+        safe_name = mount_state_name(workspace_name, index)
         remote_name = f"srw-{self.thread_id[:8]}-{safe_name}"
         state_rel = f".cache/srw/rclone/{self.thread_id}/{safe_name}"
         state_dir = self.workspace_backend.resolve_home_path(state_rel)
@@ -1034,7 +1352,7 @@ fi
         source_config = {
             str(key): value
             for key, value in dict(source.get("config") or {}).items()
-            if str(key) in {"url", "vendor", "user", "encoding"}
+            if str(key) in _IDENTITY_SOURCE_KEYS
         }
         auth = mount.get("auth") or {}
         safe_spec = {

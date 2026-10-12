@@ -1,0 +1,66 @@
+#!/usr/bin/env bash
+# Formats the staged Python files under src/ and tests/ before they are
+# committed, so develop never holds code that main's blocking lint
+# (`ruff format --check src/ tests/`) refuses. Install once per clone:
+#
+#   git config core.hooksPath scripts/git-hooks
+#
+# A fully staged file is formatted in place and re-staged. A file with
+# unstaged edits as well is only checked: formatting it would stage those
+# edits too, so an unformatted one stops the commit. `git commit <paths>`
+# commits from a temporary index and then rewrites the real one from the
+# pre-hook files, so a file re-staged here would leave the real index
+# behind HEAD; in that mode every file is only checked. `git commit
+# --no-verify` skips this hook.
+set -euo pipefail
+
+check_only=false
+[[ ${GIT_INDEX_FILE:-} == */next-index-*.lock ]] && check_only=true
+
+mapfile -d '' staged < <(
+  git diff --cached --name-only --diff-filter=ACMR -z -- 'src/*.py' 'tests/*.py'
+)
+((${#staged[@]})) || exit 0
+
+top=$(git rev-parse --show-toplevel)
+ruff=""
+for candidate in "$top/.venv/bin/ruff" "$top/venv/bin/ruff"; do
+  if [[ -x $candidate ]]; then
+    ruff=$candidate
+    break
+  fi
+done
+ruff=${ruff:-$(command -v ruff || true)}
+if [[ -z $ruff ]]; then
+  echo "pre-commit: ruff not found, so nothing was formatted; develop's lint will flag it" >&2
+  exit 0
+fi
+
+pinned=$(grep -oP 'pip install ruff==\K[0-9.]+' "$top/.github/workflows/main.yml" | head -n 1 || true)
+installed=$("$ruff" --version | awk '{print $2}')
+if [[ -n $pinned && $installed != "$pinned" ]]; then
+  echo "pre-commit: ruff $installed is not CI's $pinned; its formatting may differ" >&2
+fi
+
+whole=()
+unformatted=()
+for path in "${staged[@]}"; do
+  if ! $check_only && git diff --quiet -- "$path"; then
+    whole+=("$path")
+  elif ! git show ":$path" | "$ruff" format --force-exclude --check --quiet \
+    --stdin-filename "$path" - >/dev/null; then
+    unformatted+=("$path")
+  fi
+done
+
+if ((${#whole[@]})); then
+  "$ruff" format --force-exclude -- "${whole[@]}"
+  git add -- "${whole[@]}"
+fi
+
+if ((${#unformatted[@]})); then
+  echo "pre-commit: the content being committed is not formatted:" >&2
+  printf '  %s\n' "${unformatted[@]}" >&2
+  echo "Run '$ruff format' on them, 'git add' them whole, then 'git commit' again." >&2
+  exit 1
+fi

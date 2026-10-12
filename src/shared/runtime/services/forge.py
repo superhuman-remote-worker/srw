@@ -8,13 +8,17 @@ A per-repository token is the universal credential here — every forge
 supports one, unlike GitHub Apps which are GitHub-only.
 """
 
+import json
 import logging
 import os
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Any, Optional
 from urllib.parse import quote, urlparse
 
 import httpx
+
+from shared.repo_path_safety import REPO_NAME_RE, check_repo_path_shape
 
 logger = logging.getLogger(__name__)
 
@@ -26,6 +30,73 @@ _transport: Optional[httpx.BaseTransport] = None
 
 class ForgeError(RuntimeError):
     """Raised when a forge API call fails or is misconfigured."""
+
+
+class ForgePathError(ForgeError, ValueError):
+    """A connector-shaped owner, repository name or ref refused at the sink.
+
+    Raised before any request leaves the process. ``owner``/``repo`` come from
+    the connector's own URL (``parse_owner_repo``), and httpx normalises dot
+    segments before sending: an unchecked ``..`` re-targets the request at a
+    neighbouring repository and a raw ``?``/``#`` cuts the REST path short.
+    Not a privilege boundary -- the token is the connector's own, so a
+    traversal only reaches what it already reaches (unlike the admin Gitea
+    client, ``orchestrator/services/gitea.py``) -- but a request must land on
+    the repository the connector names or on none. A ``ForgeError``, so every
+    existing caller already handles it.
+    """
+
+
+#: GitLab's path limit; GitHub and Gitea stop at 100, so no real name is longer.
+_MAX_FORGE_NAME_LENGTH = 255
+
+
+def validate_forge_name(name: str, *, kind: str = "repository") -> str:
+    """Return ``name`` unchanged if it is a usable forge owner/repository name.
+
+    The shared owner/repository charset (``REPO_NAME_RE``) admits exactly one
+    URL path segment with nothing to encode, and ``.``/``..`` are the two
+    spellings in it that are still dot segments. Unlike the admin Gitea sink,
+    a name that merely *contains* ``..`` (``a..b``) passes: it is not a dot
+    segment, and a connector names someone else's repository, not one SRW
+    chose. ``kind`` only labels the error.
+    """
+    if not isinstance(name, str) or not name:
+        raise ForgePathError(f"Forge {kind} name must be a non-empty string")
+    if (
+        len(name) > _MAX_FORGE_NAME_LENGTH
+        or not REPO_NAME_RE.fullmatch(name)
+        or name in (".", "..")
+    ):
+        raise ForgePathError(f"Forge {kind} name {name[:100]!r} is not allowed")
+    return name
+
+
+def _encode_ref(ref: str) -> str:
+    """Validate a git ref and encode it as exactly one URL path segment.
+
+    ``quote`` never encodes ``.``, so ``quote("..", safe="")`` is still a live
+    dot segment: the shape has to be refused first (git itself forbids
+    ``..``, control characters and empty components in ref names, so no
+    legitimate ref is). Slashes then become ``%2F`` -- GitHub's
+    ``git/trees/{sha}``, ``branches/{branch}`` and ``tarball/{ref}`` take the
+    ref as one parameter.
+    """
+    if not isinstance(ref, str) or not ref:
+        raise ForgePathError("Git ref must be a non-empty string")
+    check_repo_path_shape(ref, what="Git ref", error=ForgePathError)
+    return quote(ref, safe="")
+
+
+def _repo_api_url(target: "ForgeRepo") -> str:
+    """``{api_base}/repos/{owner}/{repo}`` -- the one GitHub/Gitea formatter.
+
+    Re-validates the names rather than trusting ``ForgeRepo`` construction,
+    so a descriptor forced past ``__post_init__`` still cannot reach a URL.
+    """
+    owner = validate_forge_name(target.owner, kind="owner")
+    repo = validate_forge_name(target.repo)
+    return f"{target.api_base}/repos/{owner}/{repo}"
 
 
 def _hostname(value: str) -> str | None:
@@ -83,6 +154,12 @@ class ForgeRepo:
     # traceback, and tracebacks reach logs and the agent transcript.
     token: str = field(repr=False)
 
+    def __post_init__(self) -> None:
+        # Refuse an unusable descriptor outright, so no URL builder -- present
+        # or future -- ever sees one. Frozen: validate, never normalise.
+        validate_forge_name(self.owner, kind="owner")
+        validate_forge_name(self.repo)
+
 
 class GitHubClient:
     """KB-sized GitHub API client with the native Gitea client's call shape.
@@ -106,11 +183,15 @@ class GitHubClient:
         }
 
     def _repo_api(self) -> str:
-        return (
-            f"{self._target.api_base}/repos/"
-            f"{quote(self._target.owner, safe='')}/"
-            f"{quote(self._target.repo, safe='')}"
-        )
+        return _repo_api_url(self._target)
+
+    @staticmethod
+    def _ref_segment(ref: str) -> str | None:
+        try:
+            return _encode_ref(ref)
+        except ForgePathError:
+            logger.warning("GitHub KB client refused an unusable git ref")
+            return None
 
     def _matches_repo(self, repo_name: str) -> bool:
         if str(repo_name) == self._target.repo:
@@ -121,21 +202,21 @@ class GitHubClient:
     @staticmethod
     def _content_path(path: str) -> str | None:
         candidate = str(path or "")
-        parts = candidate.split("/")
-        if (
-            not candidate
-            or candidate.startswith("/")
-            or "\\" in candidate
-            or any(part in {"", ".", ".."} for part in parts)
-        ):
+        if not candidate:
             return None
-        return quote(candidate, safe="/")
+        try:
+            check_repo_path_shape(candidate, what="Content path", error=ForgePathError)
+        except ForgePathError:
+            return None
+        return "/".join(quote(part, safe="") for part in candidate.split("/"))
 
     async def list_tree(self, repo_name: str, ref: str) -> list[dict[str, str]] | None:
         """Return GitHub's recursive tree normalized to path/type/sha."""
         if not self._matches_repo(repo_name):
             return None
-        safe_ref = quote(str(ref), safe="")
+        safe_ref = self._ref_segment(ref)
+        if safe_ref is None:
+            return None
         try:
             async with httpx.AsyncClient(timeout=30.0, transport=_transport) as client:
                 response = await client.get(
@@ -321,7 +402,9 @@ class GitHubClient:
         """Return the commit SHA at a GitHub branch head."""
         if not self._matches_repo(repo_name):
             return None
-        safe_branch = quote(str(branch), safe="")
+        safe_branch = self._ref_segment(branch)
+        if safe_branch is None:
+            return None
         try:
             async with httpx.AsyncClient(timeout=30.0, transport=_transport) as client:
                 response = await client.get(
@@ -351,7 +434,9 @@ class GitHubClient:
         """Stream a GitHub tarball for ``ref`` to ``dest_path``."""
         if not self._matches_repo(repo_name):
             return False
-        safe_ref = quote(str(ref), safe="")
+        safe_ref = self._ref_segment(ref)
+        if safe_ref is None:
+            return False
         try:
             async with httpx.AsyncClient(
                 timeout=httpx.Timeout(30.0, read=120.0),
@@ -393,7 +478,16 @@ def parse_owner_repo(url: str) -> tuple[str, str]:
         raise ForgeError(f"Cannot parse owner/repo from URL: {url!r}")
     # Trailing pair handles GitLab subgroups (group/sub/repo → sub, repo);
     # subgroup projects need the full path, handled in _gitlab_project_path.
-    return parts[-2], parts[-1]
+    # A connector URL that yields ``..`` or ``x?y`` is misconfigured: refuse
+    # it wherever it is parsed (save, probe, dispatch), not when a PR opens.
+    return (
+        validate_forge_name(parts[-2], kind="owner"),
+        validate_forge_name(parts[-1]),
+    )
+
+
+#: Characters an scp-style host (``user@host:path``) may not carry.
+_SCP_HOST_REFUSED = frozenset("?#[]@/\\%")
 
 
 def resolve_api_base(url: str, forge: str) -> str:
@@ -407,6 +501,14 @@ def resolve_api_base(url: str, forge: str) -> str:
     scp_host = None
     if "://" not in raw and separator and "/" in scp_path and "/" not in prefix:
         scp_host = prefix.rsplit("@", 1)[-1]
+        # The host becomes an API origin as written: a '#', '?' or '@'
+        # would move the request's path or authority (``git@h#:o/r`` ->
+        # ``https://h#/api/v1``), brackets and whitespace are no host.
+        if not scp_host or any(
+            ch in _SCP_HOST_REFUSED or ch.isspace() or not ch.isprintable()
+            for ch in scp_host
+        ):
+            raise ForgeError(f"Cannot parse host from URL: {url!r}")
 
     parsed = urlparse(raw)
     hostname = scp_host or parsed.hostname
@@ -431,8 +533,12 @@ def _gitlab_project_path(owner: str, repo: str) -> str:
     """URL-encode ``owner/repo`` into a single path segment.
 
     GitLab's project endpoint takes an ID or a fully URL-encoded path. Passing
-    it as two path segments silently 404s.
+    it as two path segments silently 404s. Collapsing the pair into one
+    segment keeps ``..`` from normalising by accident, not by intent, so the
+    halves get the same name check as the GitHub/Gitea pair.
     """
+    owner = validate_forge_name(owner, kind="owner")
+    repo = validate_forge_name(repo)
     return quote(f"{owner}/{repo}", safe="")
 
 
@@ -454,7 +560,7 @@ def _request_for(
         }
         return url, headers, payload
 
-    url = f"{target.api_base}/repos/{target.owner}/{target.repo}/pulls"
+    url = f"{_repo_api_url(target)}/pulls"
     scheme = "token" if target.forge == "gitea" else "Bearer"
     headers = {
         "Authorization": f"{scheme} {target.token}",
@@ -477,7 +583,7 @@ def _status_request_for(target: ForgeRepo, number: int) -> tuple[str, dict[str, 
             headers["PRIVATE-TOKEN"] = target.token
         return url, headers
 
-    url = f"{target.api_base}/repos/{target.owner}/{target.repo}/pulls/{number}"
+    url = f"{_repo_api_url(target)}/pulls/{number}"
     headers = {"Accept": "application/json"}
     if target.token:
         scheme = "token" if target.forge == "gitea" else "Bearer"
@@ -654,16 +760,83 @@ def _probe_requests_for(
         "Authorization": f"{scheme} {target.token}",
         "Accept": "application/json",
     }
-    repo_url = f"{target.api_base}/repos/{target.owner}/{target.repo}"
+    repo_url = _repo_api_url(target)
     return (f"{target.api_base}/user", headers), (repo_url, headers)
 
 
-async def probe_repository_access(target: ForgeRepo, *, timeout: float = 10.0) -> dict:
+@dataclass(frozen=True)
+class ProbeAnswer:
+    """One forge answer as :func:`probe_repository_access` reads it: the
+    status, the headers by lower-case name and the (capped) body."""
+
+    status: int
+    headers: Mapping[str, str] = field(default_factory=dict)
+    body: bytes = field(default=b"", repr=False)
+
+    def json(self) -> Any:
+        """The body as JSON; ``ValueError`` when it is not."""
+        return json.loads(self.body.decode("utf-8"))
+
+
+#: One GET of a probe: ``(url, headers) -> ProbeAnswer``. It raises
+#: :class:`ForgeError` with a fixed text when no answer came (the forge did
+#: not resolve or answer, its address was refused, its certificate did not
+#: verify); never the exception's or the forge's own words.
+ProbeFetch = Callable[[str, dict[str, str]], Awaitable[ProbeAnswer]]
+
+
+def _probe_detail(answer: ProbeAnswer) -> str:
+    """A refusal's ``message`` for the server log only: printable, capped."""
+    try:
+        data = answer.json()
+    except ValueError:
+        return ""
+    if not isinstance(data, dict):
+        return ""
+    text = str(data.get("message") or data.get("error") or "")
+    return " ".join("".join(ch if ch.isprintable() else " " for ch in text).split())[
+        :200
+    ]
+
+
+def _probe_refusal(target: ForgeRepo, step: str, answer: ProbeAnswer) -> ForgeError:
+    """A probe answer SRW did not expect, named by its status only: the
+    forge's own words go to the log (they may be anything an address
+    answers)."""
+    logger.info(
+        "Repository probe: %s answered the %s with HTTP %d: %s",
+        target.forge,
+        step,
+        answer.status,
+        _probe_detail(answer),
+    )
+    if 300 <= answer.status < 400:
+        return ForgeError(
+            f"{target.forge} answered the {step} with a redirect "
+            f"(HTTP {answer.status}), which SRW does not follow"
+        )
+    if step == "token check":
+        return ForgeError(
+            f"{target.forge} could not identify the token (HTTP {answer.status})"
+        )
+    return ForgeError(
+        f"{target.forge} refused the repository read (HTTP {answer.status})"
+    )
+
+
+async def probe_repository_access(target: ForgeRepo, *, fetch: ProbeFetch) -> dict:
     """Authenticate the connector token and report who it is and what it may do.
 
     Two reads, nothing written: the token's own principal (``/user``) and the
     repository's permission view. Raises :class:`ForgeError` when the token
-    is rejected, the repository is invisible, or the forge is unreachable.
+    is rejected, the repository is invisible, or the forge is unreachable;
+    its text is fixed (an HTTP status at most), never the forge's own words.
+
+    ``fetch`` makes each GET. The forge's address comes from a connector, so
+    the caller decides where it may go: the orchestrator's Test passes one
+    that checks and pins the address
+    (``orchestrator.services.connector_drivers.repository``). There is no
+    default, so no caller probes an address unchecked by accident.
 
     The facts exist so an operator can verify a connector without ever
     reading the token: which account the agent will act as, whether that
@@ -679,38 +852,26 @@ async def probe_repository_access(target: ForgeRepo, *, timeout: float = 10.0) -
         raise ForgeError("Repository connector has no token to probe")
 
     (user_url, user_headers), (repo_url, repo_headers) = _probe_requests_for(target)
-    try:
-        async with httpx.AsyncClient(timeout=timeout, transport=_transport) as client:
-            user_resp = await client.get(user_url, headers=user_headers)
-            if user_resp.status_code == 401:
-                raise ForgeError(f"{target.forge} rejected the token (HTTP 401)")
-            if user_resp.status_code != 200:
-                detail = _response_error_detail(user_resp)
-                raise ForgeError(
-                    f"{target.forge} could not identify the token "
-                    f"(HTTP {user_resp.status_code}){': ' + detail if detail else ''}"
-                )
-            repo_resp = await client.get(repo_url, headers=repo_headers)
-    except httpx.HTTPError as exc:
-        raise ForgeError(f"Could not reach {target.forge}: {exc}") from exc
-
-    if repo_resp.status_code == 404:
+    user_resp = await fetch(user_url, user_headers)
+    if user_resp.status == 401:
+        raise ForgeError(f"{target.forge} rejected the token (HTTP 401)")
+    if user_resp.status != 200:
+        raise _probe_refusal(target, "token check", user_resp)
+    repo_resp = await fetch(repo_url, repo_headers)
+    if repo_resp.status == 404:
         raise ForgeError(
             f"{target.owner}/{target.repo} not found on {target.forge}, or the "
             "token cannot see it (HTTP 404)"
         )
-    if repo_resp.status_code != 200:
-        detail = _response_error_detail(repo_resp)
-        raise ForgeError(
-            f"{target.forge} refused the repository read "
-            f"(HTTP {repo_resp.status_code}){': ' + detail if detail else ''}"
-        )
+    if repo_resp.status != 200:
+        raise _probe_refusal(target, "repository read", repo_resp)
 
     try:
         user = user_resp.json()
         repo = repo_resp.json()
-    except ValueError as exc:
-        raise ForgeError(f"{target.forge} returned a non-JSON probe response") from exc
+    except ValueError:
+        # Never chained: a JSONDecodeError carries the whole body.
+        raise ForgeError(f"{target.forge} returned a non-JSON probe response") from None
     if not isinstance(user, dict) or not isinstance(repo, dict):
         raise ForgeError(f"{target.forge} returned an unexpected probe response shape")
 

@@ -12,7 +12,7 @@ and agents operate with unrestricted sudo (the pre-gate default).
 """
 
 import asyncio
-from collections.abc import Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 import json
 import logging
@@ -23,6 +23,7 @@ from fnmatch import fnmatch
 from typing import Any, Optional
 from uuid import UUID
 
+from shared.content_redaction import sanitize_data, sanitize_text
 from shared.sudo_command_line import render_sudo_command_line
 
 logger = logging.getLogger(__name__)
@@ -1078,9 +1079,14 @@ class SudoGateService:
                 owner = (thread or {}).get("user_id")
             if not owner:
                 return
-            full = render_sudo_command_line(
-                event.get("command"), event.get("arguments")
+            # The command line is the agent's (audit OC-05) and can carry a
+            # token it read: redacted for the body AND the payload the feed
+            # row and SSE frame ship. Approval acts on the request row, whose
+            # command stays exact — only this notice is a view.
+            full = sanitize_text(
+                render_sudo_command_line(event.get("command"), event.get("arguments"))
             )
+            event = sanitize_data(dict(event)).value
             expires_at = event.get("expires_at")
             await notification_service.record(
                 recipient_id=str(owner),
@@ -1239,3 +1245,37 @@ class SudoGateService:
 
 # Singleton instance
 sudo_gate = SudoGateService()
+
+
+async def sudo_expiration_sweeper(
+    shutdown_event: asyncio.Event,
+    *,
+    gate: SudoGateService,
+    fail_expired_vm_upgrade_jobs: Callable[[], Awaitable[Any]],
+) -> None:
+    """Background task that denies expired sudo approval requests.
+
+    Runs every 15 seconds. For each expired request, publishes a denial
+    to the stored NATS reply subject so the daemon unblocks. Expired
+    vm_upgrade requests additionally fail their frozen job loudly
+    (``vm_upgrade_expired``) instead of leaving it invisibly wedged.
+    """
+    logger.info("Sudo expiration sweeper started")
+    while not shutdown_event.is_set():
+        try:
+            await gate.sweep_expired()
+        except Exception as e:
+            logger.error("Error in sudo expiration sweeper: %s", e)
+
+        try:
+            await fail_expired_vm_upgrade_jobs()
+        except Exception as e:
+            logger.error("Error failing expired vm_upgrade jobs: %s", e)
+
+        try:
+            await asyncio.wait_for(shutdown_event.wait(), timeout=15.0)
+            break
+        except asyncio.TimeoutError:
+            pass
+
+    logger.info("Sudo expiration sweeper stopped")

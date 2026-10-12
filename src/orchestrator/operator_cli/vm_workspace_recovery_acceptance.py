@@ -15,7 +15,8 @@ from __future__ import annotations
 import argparse
 import asyncio
 from collections.abc import Mapping, Sequence
-from contextlib import asynccontextmanager, suppress
+from copy import deepcopy
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 import hashlib
 import json
@@ -235,6 +236,11 @@ class LiveScenario:
         self.provisioner = VMProvisioner()
         self.namespace = os.environ.get("VM_NAMESPACE", "agent-vms")
         self.settings = VMWorkspaceRecoverySettings.from_env()
+        self.protocol_fixture = os.environ.get("VM_CREATION_RETRY_ENABLED") == "true"
+        self.profiled_fixture = os.environ.get("VM_NETWORK_PROFILE_ENABLED") == "true"
+        self.fixture_image = (
+            os.environ.get("VM_WORKSPACE_RECOVERY_GATE_VM_IMAGE") or None
+        )
         self.slow_boot_delay_seconds = int(
             os.environ.get("VM_WORKSPACE_RECOVERY_GATE_SLOW_BOOT_SECONDS", "15")
         )
@@ -243,6 +249,7 @@ class LiveScenario:
                 "slow-boot gate delay must be between 1 and 60 seconds"
             )
         self.job_id: UUID | None = None
+        self.gate_user_id: UUID | None = None
         self._core: Any = None
         self._custom: Any = None
 
@@ -252,12 +259,17 @@ class LiveScenario:
         await self.db.connect()
         self.provisioner.connect(self.db)
         config.load_incluster_config()
-        self._core = client.CoreV1Api()
-        self._custom = client.CustomObjectsApi()
+        configuration = client.Configuration.get_default_copy()
+        configuration.retries = 0
+        self._gate_api_client = client.ApiClient(configuration=configuration)
+        self._core = client.CoreV1Api(self._gate_api_client)
+        self._custom = client.CustomObjectsApi(self._gate_api_client)
 
     async def close(self) -> None:
         await self.provisioner.disconnect()
         await self.db.close()
+        if getattr(self, "_gate_api_client", None) is not None:
+            self._gate_api_client.close()
 
     @asynccontextmanager
     async def _gate_owned_reconciler(self, label: str):
@@ -332,36 +344,297 @@ class LiveScenario:
             row = await conn.fetchrow(query, *values)
         return dict(row) if row is not None else {}
 
-    async def _create_job(self) -> tuple[UUID, int]:
+    async def _ensure_gate_user(self) -> UUID:
+        """Create one approved non-admin principal for the disposable gate."""
+
+        if self.gate_user_id is not None:
+            return self.gate_user_id
+        user_id = uuid4()
+        async with self.db.acquire() as conn, conn.transaction():
+            if getattr(self, "protocol_fixture", False):
+                await conn.execute(
+                    "INSERT INTO users(id,display_name,is_approved,is_admin,can_use_vm) "
+                    "VALUES ($1,$2,true,false,true)",
+                    user_id,
+                    f"VM recovery gate {self.run_id}",
+                )
+                await conn.execute(
+                    "INSERT INTO capability_grants(scope_kind,scope_id,key,value_json) "
+                    "VALUES ('user',$1,'vm_workspace','true'::jsonb)",
+                    user_id,
+                )
+            else:
+                await conn.execute(
+                    "INSERT INTO users(id,display_name,is_approved,is_admin) "
+                    "VALUES ($1,$2,true,false)",
+                    user_id,
+                    f"VM recovery gate {self.run_id}",
+                )
+        self.gate_user_id = user_id
+        return user_id
+
+    async def _create_job(self) -> UUID:
+        gate_user_id = await self._ensure_gate_user()
         job_id = uuid4()
-        lease_token = 27
+        options: dict[str, Any] = {}
+        if getattr(self, "protocol_fixture", False):
+            if getattr(self, "fixture_image", None):
+                options["config_override"] = {
+                    "workspace": {
+                        "backend": "vm",
+                        "vm": {
+                            "image": self.fixture_image,
+                            "cpu_cores": 2,
+                            "memory": "2Gi",
+                            "disk_size": "12Gi",
+                        },
+                    }
+                }
+                options["requested_workspace_backend"] = "vm"
         created = await self.db.create_job(
             description=f"[vm-recovery-gate:{self.run_id}] retained disk fixture",
             context={"vm_workspace_recovery_acceptance_gate": self.run_id},
             origin="lifecycle",
-            status="processing",
+            status="processing"
+            if not getattr(self, "protocol_fixture", False)
+            else "paused",
             execution_lane="stateless",
+            user_id=str(gate_user_id),
             job_id=job_id,
+            **options,
         )
         if UUID(str(created["id"])) != job_id:
             raise AcceptanceFailure("job helper changed the preallocated fixture ID")
+        self.job_id = job_id
+        return job_id
+
+    def _require_fixture_configuration(self) -> None:
+        from shared.vm_network_profile import compatible_image
+
+        if self.profiled_fixture and not self.protocol_fixture:
+            raise AcceptanceFailure(
+                "profiled recovery gate requires VM_CREATION_RETRY_ENABLED=true"
+            )
+        if self.protocol_fixture and (
+            self.provisioner.mode != "same-cluster" or not self.fixture_image
+        ):
+            raise AcceptanceFailure(
+                "creation-retry recovery gate requires same-cluster mode and "
+                "vmController.defaultVmImage"
+            )
+        if self.profiled_fixture and not compatible_image(self.fixture_image):
+            raise AcceptanceFailure(
+                "profiled recovery gate image must be an exact allowlisted digest"
+            )
+
+    async def _require_creation_ack(self, job_id: UUID, created: object) -> None:
+        from orchestrator.services.manifest_execution_snapshot import (
+            read_execution,
+            srw_snapshot_config,
+        )
+        from orchestrator.services.vm_creation_preflight import _preflight
+        from shared.vm_network_profile import NETWORK_PROFILE
+
+        if not isinstance(created, Mapping) or (
+            created.get("creation_retry_protocol") != 1
+            or created.get("status") != "creation_pending"
+            or created.get("job_id") != str(job_id)
+        ):
+            raise AcceptanceFailure(
+                "fixture did not enter durable VM creation preflight"
+            )
+        context = _object(
+            (await self._row("SELECT context FROM jobs WHERE id=$1", job_id)).get(
+                "context"
+            )
+        )
+        vm = _object(context.get("vm"))
+        preflight = _preflight(vm)
+        request = preflight["request"] if preflight else {}
+        snapshot = await read_execution(self.db, "Job", str(job_id))
+        try:
+            if snapshot is None:
+                raise ValueError("execution snapshot missing")
+            _, policy = srw_snapshot_config(snapshot)
+            frozen_image = (policy.get("workspace") or {}).get("vm", {}).get("image")
+        except (TypeError, KeyError, ValueError) as exc:
+            raise AcceptanceFailure("fixture has no frozen VM workspace image") from exc
+        if (
+            preflight is None
+            or preflight["request_id"] != created.get("request_id")
+            or request.get("provision_generation")
+            != created.get("provision_generation")
+            or request.get("job_id") != str(job_id)
+            or request.get("vm_image") != self.fixture_image
+            or frozen_image != self.fixture_image
+            or str(snapshot.get("id")) != preflight["execution_id"]
+            or snapshot.get("revision") != preflight["execution_revision"]
+            or snapshot.get("generation") != preflight["execution_generation"]
+            or snapshot.get("work_kind") != "Job"
+            or snapshot.get("work_id") != job_id
+            or snapshot.get("owner_id") != self.gate_user_id
+            or (
+                self.profiled_fixture
+                and request.get("network_profile") != NETWORK_PROFILE
+            )
+            or context.get("_vm_creation_pending") != preflight["request_id"]
+        ):
+            raise AcceptanceFailure("fixture frozen creation image/profile changed")
+        self.fixture_request_id = preflight["request_id"]
+        self.fixture_generation = request["provision_generation"]
+
+    async def _issue_fixture_lease(
+        self, job_id: UUID, identity: Mapping[str, Any] | None = None
+    ) -> int:
+        """Issue the synthetic worker lease only after VM and SSH readiness."""
+
+        lease_token = 27
+        worker = f"vm-recovery-gate:{self.run_id}"
         async with self.db.acquire() as conn, conn.transaction():
-            await conn.execute(
+            if getattr(self, "protocol_fixture", False):
+                from shared.worker_queue import _CAS_JOB_SQL
+
+                # Preflight installed this hold. Reusing it preserves the
+                # monotonic queue token and closes the dispatch gap.
+                queue = await conn.fetchrow(
+                    "SELECT * FROM run_queue WHERE unit_id=$1 FOR UPDATE", job_id
+                )
+                current = await conn.fetchrow(
+                    "SELECT id,status,execution_lane,assigned_agent_id,user_id,"
+                    "context,config_override,freeze_data,lease_expires_at "
+                    "FROM jobs WHERE id=$1 FOR UPDATE",
+                    job_id,
+                )
+                retry = await conn.fetchrow(
+                    "SELECT request_id,job_id,provision_generation,state,reason,ready_at,"
+                    "canonical_request,request_digest,controller_configuration_digest,observed_vm_uid,"
+                    "observed_pvc_uid,execution_id,"
+                    "execution_revision,execution_generation "
+                    "FROM vm_creation_retries "
+                    "WHERE request_id=$1",
+                    UUID(self.fixture_request_id),
+                )
+                if (
+                    identity is None
+                    or queue is None
+                    or current is None
+                    or queue["unit_kind"] != "worker_batch"
+                    or queue["state"] != "done"
+                    or queue["leased_by"] is not None
+                    or queue["leased_until"] is not None
+                    or queue["last_leased_by"] is not None
+                    or queue["attempts_since_completion"] != 0
+                    or queue["lease_token"] != 0
+                    or queue["input_seq"] is not None
+                    or queue["consumed_seq"] is not None
+                    or queue["control_input_seq"] != 0
+                    or queue["control_consumed_seq"] != 0
+                    or queue["interrupt_admission_lease_token"] is not None
+                    or queue["interrupt_admission_turn_id"] is not None
+                    or queue["input_delivery_capable_lease_token"] is not None
+                    or queue["park_reason"] is not None
+                    or queue["parked_at"] is not None
+                    or current["freeze_data"] is not None
+                    or current["lease_expires_at"] is not None
+                    or not self._fixture_authority_matches(
+                        job_id, dict(current), dict(retry) if retry else {}, identity
+                    )
+                    or await conn.fetchval(
+                        "SELECT EXISTS(SELECT 1 FROM worker_batch_attempts WHERE job_id=$1) "
+                        "OR EXISTS(SELECT 1 FROM vm_workspace_recovery_jobs "
+                        "WHERE job_id=$1 AND resolved_at IS NULL) "
+                        "OR EXISTS(SELECT 1 FROM job_completion_sweep_exclusions "
+                        "WHERE job_id=$1)",
+                        job_id,
+                    )
+                ):
+                    raise AcceptanceFailure(
+                        "synthetic worker lease could not be issued after readiness"
+                    )
+                leased_until = await conn.fetchval(
+                    "UPDATE run_queue SET state='leased',lease_token=$2,leased_by=$3,"
+                    "last_leased_by=$3,leased_until=clock_timestamp()+interval '5 minutes',"
+                    "run_after=clock_timestamp(),input_seq=1,consumed_seq=0,"
+                    "attempts_since_completion=1 "
+                    "WHERE unit_id=$1 AND unit_kind='worker_batch' AND state='done' "
+                    "AND lease_token=0 AND leased_by IS NULL AND leased_until IS NULL "
+                    "AND last_leased_by IS NULL AND attempts_since_completion=0 "
+                    "AND input_seq IS NULL AND consumed_seq IS NULL "
+                    "AND control_input_seq=0 AND control_consumed_seq=0 "
+                    "AND interrupt_admission_lease_token IS NULL "
+                    "AND interrupt_admission_turn_id IS NULL "
+                    "AND input_delivery_capable_lease_token IS NULL "
+                    "AND park_reason IS NULL AND parked_at IS NULL "
+                    "RETURNING leased_until",
+                    job_id,
+                    lease_token,
+                    worker,
+                )
+                if (
+                    leased_until is None
+                    or await conn.fetchval(
+                        _CAS_JOB_SQL,
+                        job_id,
+                        "paused",
+                        worker,
+                        lease_token,
+                        leased_until,
+                    )
+                    != job_id
+                ):
+                    raise AcceptanceFailure(
+                        "synthetic worker lease could not be issued after readiness"
+                    )
+                await conn.execute(
+                    "INSERT INTO worker_batch_attempts "
+                    "(job_id,lease_token,claimed_attempt) VALUES ($1,$2,1)",
+                    job_id,
+                    lease_token,
+                )
+                return lease_token
+            current = await conn.fetchrow(
+                "SELECT status,execution_lane,user_id,"
+                "context->>'vm_workspace_recovery_acceptance_gate' AS gate_run "
+                "FROM jobs WHERE id=$1 FOR UPDATE",
+                job_id,
+            )
+            if (
+                current is None
+                or current["status"] != "processing"
+                or current["execution_lane"] != "stateless"
+                or current["user_id"] != self.gate_user_id
+                or current["gate_run"] != self.run_id
+            ):
+                raise AcceptanceFailure(
+                    "synthetic worker lease could not be issued after readiness"
+                )
+            issued = await conn.fetchval(
                 "INSERT INTO run_queue (unit_id,unit_kind,state,lease_token,"
-                "leased_by,leased_until,input_seq,consumed_seq,attempts_since_completion) "
-                "VALUES ($1,'worker_batch','leased',$2,$3,clock_timestamp()+interval '5 minutes',1,0,1)",
+                "leased_by,leased_until,input_seq,consumed_seq,"
+                "attempts_since_completion) SELECT "
+                "$1,'worker_batch','leased',$2,$3,"
+                "clock_timestamp()+interval '5 minutes',1,0,1 "
+                "FROM jobs WHERE id=$1 AND status='processing' AND user_id=$4 "
+                "AND context->>'vm_workspace_recovery_acceptance_gate'=$5 "
+                "AND NOT EXISTS (SELECT 1 FROM run_queue WHERE unit_id=$1) "
+                "RETURNING lease_token",
                 job_id,
                 lease_token,
-                f"vm-recovery-gate:{self.run_id}",
+                worker,
+                self.gate_user_id,
+                self.run_id,
             )
+            if issued != lease_token:
+                raise AcceptanceFailure(
+                    "synthetic worker lease could not be issued after readiness"
+                )
             await conn.execute(
                 "INSERT INTO worker_batch_attempts "
                 "(job_id,lease_token,claimed_attempt) VALUES ($1,$2,1)",
                 job_id,
                 lease_token,
             )
-        self.job_id = job_id
-        return job_id, lease_token
+        return lease_token
 
     async def _wait(self, label: str, probe: Any, timeout: float = 900) -> Any:
         stop = time.monotonic() + timeout
@@ -382,13 +655,35 @@ class LiveScenario:
         row = await self._row("SELECT context FROM jobs WHERE id=$1", job_id)
         context = _object(_object(row.get("context")).get("vm"))
         status = dict(status or {})
+        live_provisioning = _object(status.get("provisioning"))
+        stored_provisioning = _object(context.get("provisioning"))
+        stored_identity = _object(stored_provisioning.get("identity"))
+        live_vmi_uid = live_provisioning.get("vmi_uid")
+        live_mac = status.get("interface_mac")
+        if (
+            not live_vmi_uid
+            or stored_identity.get("vmi_uid") != live_vmi_uid
+            or status.get("vmi_uid") != live_vmi_uid
+            or not isinstance(live_mac, str)
+            or re.fullmatch(r"(?:[0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}", live_mac) is None
+            or any(
+                status.get(key) != context.get(key)
+                for key in (
+                    "provision_generation",
+                    "vm_uid",
+                    "rootdisk_pvc_uid",
+                    "active_pod_uid",
+                )
+            )
+        ):
+            return None
         identity = {
             "owner_kind": "job",
             "owner_id": str(job_id),
             "provision_generation": context.get("provision_generation"),
             "namespace": context.get("namespace") or self.namespace,
             "vm_uid": context.get("vm_uid") or status.get("vm_uid"),
-            "prior_vmi_uid": context.get("active_vmi_uid") or status.get("vmi_uid"),
+            "prior_vmi_uid": live_vmi_uid,
             "prior_launcher_uid": context.get("active_pod_uid")
             or status.get("active_pod_uid"),
             "root_pvc_uid": context.get("rootdisk_pvc_uid")
@@ -398,6 +693,9 @@ class LiveScenario:
             or status.get("ssh_registration_id"),
             "ssh_host_key_fingerprint": context.get("ssh_host_key_fingerprint")
             or status.get("ssh_host_key_fingerprint"),
+            # VMI status is the observed MAC source; the Job receipt currently
+            # binds the same VMI/launcher but does not itself carry a MAC.
+            "interface_mac": live_mac,
         }
         required = (
             "provision_generation",
@@ -421,16 +719,211 @@ class LiveScenario:
             "root_pvc_uid",
         ):
             _require_uuid(identity[key], key)
+        receipt = context.get("network_profile_evidence")
+        if receipt is not None or getattr(self, "profiled_fixture", False):
+            from shared.vm_network_profile import (
+                NETWORK_PROFILE,
+                reusable_profile_evidence,
+            )
+
+            if not reusable_profile_evidence(
+                receipt,
+                NETWORK_PROFILE,
+                provision_generation=identity["provision_generation"],
+                vm_uid=identity["vm_uid"],
+                pvc_uid=identity["root_pvc_uid"],
+                vmi_uid=identity["prior_vmi_uid"],
+                launcher_uid=identity["prior_launcher_uid"],
+            ):
+                return None
+            receipt_mac = receipt.get("interface_mac")
+            if receipt_mac is not None and (
+                not isinstance(receipt_mac, str)
+                or receipt_mac.lower() != live_mac.lower()
+            ):
+                return None
+        identity["network_profile_receipt"] = (
+            dict(receipt) if isinstance(receipt, Mapping) else None
+        )
         return identity
+
+    async def _fixture_ready_identity(self, job_id: UUID) -> dict[str, Any] | None:
+        identity = await self._ready_identity(job_id)
+        if identity is None or not getattr(self, "protocol_fixture", False):
+            return identity
+        live = _object(await self.provisioner.query_status(str(job_id), timeout=10))
+        if (
+            live.get("ready") is not True
+            or live.get("provision_generation") != identity["provision_generation"]
+            or live.get("vm_uid") != identity["vm_uid"]
+            or live.get("rootdisk_pvc_uid") != identity["root_pvc_uid"]
+            or live.get("active_pod_uid") != identity["prior_launcher_uid"]
+            or _object(live.get("provisioning")).get("vmi_uid")
+            != identity["prior_vmi_uid"]
+        ):
+            return None
+        job = await self._row(
+            "SELECT id,status,execution_lane,assigned_agent_id,user_id,context,"
+            "config_override,freeze_data,lease_expires_at FROM jobs WHERE id=$1",
+            job_id,
+        )
+        retry = await self._row(
+            "SELECT request_id,job_id,provision_generation,state,reason,ready_at,"
+            "canonical_request,request_digest,controller_configuration_digest,observed_vm_uid,"
+            "observed_pvc_uid,execution_id,"
+            "execution_revision,execution_generation FROM vm_creation_retries "
+            "WHERE request_id=$1",
+            UUID(self.fixture_request_id),
+        )
+        if retry.get("ready_at") is None:
+            from orchestrator.operator_cli.vm_fixture_readiness import (
+                settle_owned_fixture_ready,
+            )
+
+            if not self._fixture_authority_matches(
+                job_id,
+                job,
+                retry,
+                identity,
+                require_ready=False,
+            ) or not await settle_owned_fixture_ready(
+                db=self.db,
+                job_id=str(job_id),
+                owner_id=str(self.gate_user_id),
+                run_id=self.run_id,
+                marker_key="vm_workspace_recovery_acceptance_gate",
+                request_id=self.fixture_request_id,
+                generation=self.fixture_generation,
+                vm_uid=identity["vm_uid"],
+                pvc_uid=identity["root_pvc_uid"],
+            ):
+                return None
+            # Re-read both rows and current runtime after the production
+            # release so the ordinary fixture checks see the new receipt.
+            return await self._fixture_ready_identity(job_id)
+        return (
+            identity
+            if self._fixture_authority_matches(job_id, job, retry, identity)
+            else None
+        )
+
+    def _fixture_authority_matches(
+        self,
+        job_id: UUID,
+        job: Mapping[str, Any],
+        retry: Mapping[str, Any],
+        identity: Mapping[str, Any],
+        *,
+        require_ready: bool = True,
+    ) -> bool:
+        """Match one frozen, authenticated Ready result to this gate Job."""
+        from orchestrator.services.vm_creation_preflight import _preflight
+        from orchestrator.operator_cli.vm_fixture_readiness import (
+            creation_source_matches,
+        )
+        from shared.vm_network_profile import NETWORK_PROFILE, reusable_profile_evidence
+
+        context = _object(job.get("context"))
+        vm = _object(context.get("vm"))
+        contract = _object(context.get("_workspace_contract"))
+        workspace = _object(_object(job.get("config_override")).get("workspace"))
+        vm_config = _object(workspace.get("vm"))
+        preflight = _preflight(vm)
+        if (
+            job.get("id") != job_id
+            or job.get("status") != "paused"
+            or job.get("execution_lane") != "stateless"
+            or job.get("assigned_agent_id") is not None
+            or job.get("user_id") != self.gate_user_id
+            or context.get("vm_workspace_recovery_acceptance_gate") != self.run_id
+            or contract.get("version") != 1
+            or contract.get("assigned_backend") != "vm"
+            or contract.get("requested_backend") != "vm"
+            or workspace.get("backend") != "vm"
+            or vm_config.get("image") != self.fixture_image
+            or vm_config.get("cpu_cores") != 2
+            or vm_config.get("memory") != "2Gi"
+            or vm_config.get("disk_size") != "12Gi"
+            or any(
+                key in context
+                for key in (
+                    "_workspace_dispatch_authority",
+                    "_completion_control_claim",
+                    "_stateless_control_claim",
+                    "_operator_pause_hold",
+                )
+            )
+            or context.get("_vm_creation_pending")
+            != (None if require_ready else self.fixture_request_id)
+            or vm.get("status") != "ready"
+            or preflight is None
+            or preflight["request_id"] != self.fixture_request_id
+            or preflight["request"].get("provision_generation")
+            != self.fixture_generation
+            or preflight["request"].get("vm_image") != self.fixture_image
+            or preflight["request"].get("disk_size") != vm_config.get("disk_size")
+            or vm.get("creation_request_id") != self.fixture_request_id
+            or vm.get("identity_authenticated") is not True
+            or vm.get("identity_provision_generation") != self.fixture_generation
+            or identity.get("owner_kind") != "job"
+            or identity.get("owner_id") != str(job_id)
+            or identity.get("provision_generation") != self.fixture_generation
+            or vm.get("vm_uid") != identity.get("vm_uid")
+            or vm.get("rootdisk_pvc_uid") != identity.get("root_pvc_uid")
+            or vm.get("active_pod_uid") != identity.get("prior_launcher_uid")
+            or _object(_object(vm.get("provisioning")).get("identity")).get("vmi_uid")
+            != identity.get("prior_vmi_uid")
+        ):
+            return False
+        if (
+            str(retry.get("request_id")) != self.fixture_request_id
+            or retry.get("job_id") != job_id
+            or str(retry.get("provision_generation")) != self.fixture_generation
+            or retry.get("state") != "succeeded"
+            or retry.get("reason") != "creation_adopted"
+            or (retry.get("ready_at") is not None) != require_ready
+            or str(retry.get("observed_vm_uid")) != identity["vm_uid"]
+            or str(retry.get("observed_pvc_uid")) != identity["root_pvc_uid"]
+            or not creation_source_matches(vm, preflight, retry)
+            or str(retry.get("execution_id")) != preflight["execution_id"]
+            or retry.get("execution_revision") != preflight["execution_revision"]
+            or retry.get("execution_generation") != preflight["execution_generation"]
+        ):
+            return False
+        canonical = _object(retry.get("canonical_request"))
+        if getattr(self, "profiled_fixture", False) and (
+            canonical.get("network_profile") != NETWORK_PROFILE
+            or not reusable_profile_evidence(
+                vm.get("network_profile_evidence"),
+                NETWORK_PROFILE,
+                provision_generation=self.fixture_generation,
+                vm_uid=identity["vm_uid"],
+                pvc_uid=identity["root_pvc_uid"],
+                vmi_uid=identity["prior_vmi_uid"],
+                launcher_uid=identity["prior_launcher_uid"],
+            )
+        ):
+            return False
+        return True
 
     async def _application_api_evidence(self, job_id: UUID) -> dict[str, Any]:
         import httpx
 
         base = os.environ.get("ORCHESTRATOR_URL", "http://127.0.0.1:8085").rstrip("/")
         key = os.environ.get("MCP_INTERNAL_KEY", "")
+        user_id = await self._ensure_gate_user()
+        owner = await self._row("SELECT user_id FROM jobs WHERE id=$1", job_id)
+        if str(owner.get("user_id") or "") != str(user_id):
+            raise AcceptanceFailure("recovery gate user does not own the fixture job")
+        if not key:
+            raise AcceptanceFailure("MCP_INTERNAL_KEY is not configured")
         async with httpx.AsyncClient(timeout=10) as client:
             response = await client.get(
-                f"{base}/api/jobs/{job_id}", headers={"X-Internal-Key": key}
+                f"{base}/api/jobs/{job_id}",
+                headers={
+                    "X-Internal-Key": key,
+                    "X-MCP-User-Id": str(user_id),
+                },
             )
         return {
             "status_code": response.status_code,
@@ -535,15 +1028,50 @@ class LiveScenario:
         )
 
     async def _reset_lease(self, job_id: UUID) -> int:
+        from shared.worker_queue import _CAS_JOB_SQL
+
+        worker = f"vm-recovery-gate:{self.run_id}"
         async with self.db.acquire() as conn, conn.transaction():
-            token = await conn.fetchval(
+            queue = await conn.fetchrow(
                 "UPDATE run_queue SET state='leased',lease_token=lease_token+1,"
                 "leased_by=$2,leased_until=clock_timestamp()+interval '5 minutes',"
                 "run_after=clock_timestamp(),park_reason=NULL,parked_at=NULL "
-                "WHERE unit_id=$1 RETURNING lease_token",
+                "WHERE unit_id=$1 AND unit_kind='worker_batch' "
+                "AND state IN ('queued','parked') "
+                "AND leased_by IS NULL AND leased_until IS NULL "
+                "AND (park_reason IS NULL OR park_reason='workspace_recovery') "
+                "RETURNING lease_token,leased_until",
                 job_id,
-                f"vm-recovery-gate:{self.run_id}",
+                worker,
             )
+            job = await conn.fetchrow(
+                "SELECT status,context FROM jobs WHERE id=$1 FOR UPDATE", job_id
+            )
+            if (
+                queue is None
+                or job is None
+                or job["status"] not in {"created", "processing", "paused"}
+                or _object(job["context"]).get("vm_workspace_recovery_acceptance_gate")
+                != self.run_id
+                or await conn.fetchval(
+                    "SELECT EXISTS(SELECT 1 FROM vm_workspace_recovery_jobs "
+                    "WHERE job_id=$1 AND resolved_at IS NULL)",
+                    job_id,
+                )
+                or await conn.fetchval(
+                    _CAS_JOB_SQL,
+                    job_id,
+                    job["status"],
+                    worker,
+                    queue["lease_token"],
+                    queue["leased_until"],
+                )
+                != job_id
+            ):
+                raise AcceptanceFailure(
+                    "fixture lease reset lacks current claim authority"
+                )
+            token = queue["lease_token"]
             await conn.execute(
                 "INSERT INTO worker_batch_attempts (job_id,lease_token,claimed_attempt) "
                 "VALUES ($1,$2,1) ON CONFLICT DO NOTHING",
@@ -571,7 +1099,7 @@ class LiveScenario:
                 operation_id,
             )
             await conn.execute(
-                "UPDATE jobs SET freeze_data=NULL,status='processing' WHERE id=$1",
+                "UPDATE jobs SET freeze_data=NULL,status='paused' WHERE id=$1",
                 job_id,
             )
 
@@ -588,33 +1116,160 @@ class LiveScenario:
         row = await self._operation(operation_id)
         return row if row.get("phase") in phases else None
 
-    async def _crash_launcher(self, identity: Mapping[str, Any]) -> None:
-        from kubernetes.stream import stream
+    @asynccontextmanager
+    async def _positive_stop_retention(self, identity, operation_id):
+        from orchestrator.operator_cli.vm_recovery_gate_stop_control import (
+            GateStopControl,
+            GateStopError,
+            GateStopStore,
+            KubernetesStopObjects,
+            joined_call,
+            validate_document,
+        )
 
-        pods = await asyncio.to_thread(
+        if (
+            identity.get("owner_kind") != "job"
+            or identity.get("namespace") != self.namespace
+        ):
+            raise GateStopError("stop_fixture_changed")
+        pods = await joined_call(
             self._core.list_namespaced_pod,
             namespace=self.namespace,
             label_selector=f"vm.kubevirt.io/name=agent-vm-{identity['owner_id']}",
+            _request_timeout=(3, 5),
         )
-        candidates = [
-            pod
-            for pod in pods.items
-            if str(pod.metadata.uid) == str(identity["prior_launcher_uid"])
-        ]
-        if len(candidates) != 1:
-            raise AcceptanceFailure("exact launcher pod is unavailable")
-        await asyncio.to_thread(
-            stream,
-            self._core.connect_get_namespaced_pod_exec,
-            candidates[0].metadata.name,
-            self.namespace,
-            container="compute",
-            command=["/bin/sh", "-c", "kill -TERM 1"],
-            stderr=True,
-            stdin=False,
-            stdout=True,
-            tty=False,
+        if (
+            len(pods.items) != 1
+            or str(pods.items[0].metadata.uid) != identity["prior_launcher_uid"]
+        ):
+            raise GateStopError("stop_launcher_ambiguous")
+        doc = {
+            "version": 1,
+            "run_id": self.run_id,
+            "user_id": str(self.gate_user_id),
+            "job_id": identity["owner_id"],
+            "operation_id": str(operation_id),
+            "generation": identity["provision_generation"],
+            "namespace": self.namespace,
+            "vm_name": "agent-vm-" + identity["owner_id"],
+            "vm_uid": identity["vm_uid"],
+            "vmi_name": "agent-vm-" + identity["owner_id"],
+            "vmi_uid": identity["prior_vmi_uid"],
+            "pod_name": pods.items[0].metadata.name,
+            "pod_uid": identity["prior_launcher_uid"],
+            "pvc_uid": identity["root_pvc_uid"],
+            "original_strategy": "RerunOnFailure",
+            "stage": "planned",
+        }
+        validate_document(doc)
+        store = GateStopStore(self.db, self.run_id)
+        control = GateStopControl(KubernetesStopObjects(self._core), store)
+        original_error = None
+        try:
+            await control.prepare(doc)
+            self._gate_stop = (control, doc)
+            yield control, doc
+        except BaseException as exc:
+            original_error = exc
+            raise
+        finally:
+            self._gate_stop = None
+
+            # A failed write-ahead creates no object effects. A lost save reply
+            # is settled from SQL rather than the in-memory stage.
+            async def abort_unfinished():
+                stored = next(
+                    (
+                        item
+                        for item in await store.load()
+                        if item["operation_id"] == doc["operation_id"]
+                    ),
+                    None,
+                )
+                if stored and stored["stage"] not in {"restored", "aborted"}:
+                    await control.abort(stored)
+                    return True
+                return False
+
+            try:
+                # Shield the SQL reconstruction too, not only Kubernetes cleanup.
+                cleanup = asyncio.create_task(abort_unfinished())
+                while not cleanup.done():
+                    try:
+                        await asyncio.shield(cleanup)
+                    except asyncio.CancelledError:
+                        continue
+                aborted = cleanup.result()
+                if aborted and original_error is None:
+                    raise GateStopError("stop_control_not_restored")
+            except BaseException as cleanup_error:
+                if original_error is None:
+                    raise
+                original_error.add_note(
+                    "Gate stop-retention cleanup failed; rerun --cleanup-only for this run. "
+                    + type(cleanup_error).__name__
+                )
+
+    async def _cleanup_stop_retention(self):
+        from orchestrator.operator_cli.vm_recovery_gate_stop_control import (
+            GateStopControl,
+            GateStopStore,
+            KubernetesStopObjects,
         )
+
+        store = GateStopStore(self.db, self.run_id)
+        control = GateStopControl(KubernetesStopObjects(self._core), store)
+        for doc in await store.load():
+            if doc["stage"] not in {"restored", "aborted"}:
+                await control.abort(doc)
+
+    async def _crash_launcher(self, identity: Mapping[str, Any]) -> None:
+        from kubernetes.stream import stream
+        from orchestrator.operator_cli.vm_recovery_gate_stop_control import (
+            FINALIZER,
+            GateStopError,
+            joined_call,
+        )
+
+        pair = getattr(self, "_gate_stop", None)
+        if pair is None:
+            raise GateStopError("stop_retention_missing")
+        control, doc = pair
+        if identity["prior_launcher_uid"] != doc["pod_uid"]:
+            raise GateStopError("stop_launcher_changed")
+        async with control.store.authorized(doc) as check:
+            await control.kube.assert_quiet(doc)
+            vm = control._exact(doc, "vm", await control.kube.read(doc, "vm"))
+            if (
+                vm is None
+                or vm.get("spec", {}).get("runStrategy") != "Manual"
+                or vm.get("status", {}).get("stateChangeRequests")
+                or type(vm.get("metadata", {}).get("generation")) is not int
+                or vm.get("status", {}).get("desiredGeneration")
+                != vm["metadata"]["generation"]
+            ):
+                raise GateStopError("stop_strategy_changed")
+            for kind in ("vmi", "pod"):
+                obj = control._exact(doc, kind, await control.kube.read(doc, kind))
+                if obj is None or FINALIZER not in obj["metadata"].get(
+                    "finalizers", []
+                ):
+                    raise GateStopError("stop_retention_missing")
+            if check is not None:
+                await check()
+            await joined_call(
+                stream,
+                self._core.connect_get_namespaced_pod_exec,
+                doc["pod_name"],
+                self.namespace,
+                container="compute",
+                command=["/bin/sh", "-c", "kill -TERM 1"],
+                stderr=True,
+                stdin=False,
+                stdout=True,
+                tty=False,
+                _request_timeout=8,
+            )
 
     async def _force_delete_vmi(self, job_id: UUID) -> None:
         from kubernetes.client import V1DeleteOptions
@@ -1245,14 +1900,30 @@ class LiveScenario:
     async def execute(self) -> dict[str, Any]:
         from shared.workspace_recovery import WorkspaceRecoveryCode
 
-        job_id, lease_token = await self._create_job()
+        if getattr(self, "profiled_fixture", False) or getattr(
+            self, "protocol_fixture", False
+        ):
+            self._require_fixture_configuration()
+        job_id = await self._create_job()
         created = await self.provisioner.create_vm(
-            str(job_id), cpu_cores=2, memory="2Gi", disk_size="12Gi"
+            str(job_id),
+            cpu_cores=2,
+            memory="2Gi",
+            disk_size="12Gi",
+            **(
+                {"vm_image": self.fixture_image}
+                if getattr(self, "protocol_fixture", False)
+                else {}
+            ),
         )
         if not created:
             raise AcceptanceFailure("controller refused the real VM fixture")
+        if getattr(self, "protocol_fixture", False):
+            await self._require_creation_ack(job_id, created)
         identity = await self._wait(
-            "initial VM readiness", lambda: self._ready_identity(job_id), timeout=1200
+            "initial VM readiness",
+            lambda: self._fixture_ready_identity(job_id),
+            timeout=1200,
         )
         application_api_evidence = await self._application_api_evidence(job_id)
         if application_api_evidence["job_visible"] is not True:
@@ -1271,6 +1942,10 @@ class LiveScenario:
         await self._ssh_file(identity, marker_path, marker)
         await self._ssh_file(identity, checkpoint_path, checkpoint)
 
+        if getattr(self, "protocol_fixture", False):
+            lease_token = await self._issue_fixture_lease(job_id, identity)
+        else:
+            lease_token = await self._issue_fixture_lease(job_id)
         request_id = uuid4()
         disposition = await self._admit(
             identity=identity,
@@ -1316,35 +1991,41 @@ class LiveScenario:
         recovery_started = time.monotonic()
         executor_occupancy_samples = [await self._executor_occupied(job_id)]
         await self._sync_gate_retention_pins("replacement", disposition.operation_id)
-        await self._crash_launcher(identity)
-        async with self._gate_owned_reconciler("replacement"):
-            stop_receipt = await self._wait(
-                "exact stop receipt",
-                lambda: self._row(
-                    "SELECT id,evidence_digest,accepted_claim_token,vm_uid,vmi_uid,"
-                    "launcher_uid,root_pvc_uid,container_id,controller_identity "
-                    "FROM vm_workspace_recovery_stop_receipts "
-                    "WHERE recovery_id=$1 ORDER BY accepted_at DESC LIMIT 1",
-                    disposition.operation_id,
-                ),
-                timeout=180,
-            )
-            # A gate-only patch keeps the real KubeVirt VM halted long enough to
-            # exercise recovery waiting without occupying the fenced queue lease.
-            await self._set_vm_run_strategy(job_id, "Halted")
-            await asyncio.sleep(self.slow_boot_delay_seconds)
-            executor_occupancy_samples.append(await self._executor_occupied(job_id))
-            await self._set_vm_run_strategy(job_id, "RerunOnFailure")
-            recovered = await self._wait(
-                "replacement recovery",
-                lambda: self._wait_phase(disposition.operation_id, {"recovered"}),
-                timeout=1200,
-            )
+        async with self._positive_stop_retention(
+            identity, disposition.operation_id
+        ) as (stop_control, stop_document):
+            await self._crash_launcher(identity)
+            async with self._gate_owned_reconciler("replacement"):
+                stop_receipt = await self._wait(
+                    "exact stop receipt",
+                    lambda: self._row(
+                        "SELECT id,evidence_digest,accepted_claim_token,vm_uid,vmi_uid,"
+                        "launcher_uid,root_pvc_uid,container_id,controller_identity "
+                        "FROM vm_workspace_recovery_stop_receipts "
+                        "WHERE recovery_id=$1 ORDER BY accepted_at DESC LIMIT 1",
+                        disposition.operation_id,
+                    ),
+                    timeout=180,
+                )
+                # A gate-only patch keeps the real KubeVirt VM halted long enough to
+                # exercise recovery waiting without occupying the fenced queue lease.
+                await stop_control.release(stop_document)
+                await asyncio.sleep(self.slow_boot_delay_seconds)
+                executor_occupancy_samples.append(await self._executor_occupied(job_id))
+                await stop_control.restore(stop_document)
+                recovered = await self._wait(
+                    "replacement recovery",
+                    lambda: self._wait_phase(disposition.operation_id, {"recovered"}),
+                    timeout=1200,
+                )
         replacement_identity = await self._wait(
             "replacement VM readiness",
             lambda: self._ready_identity(job_id),
             timeout=600,
         )
+        # Later negative scenarios observe another VMI. Keep the actual first
+        # replacement paired with this stop/resume receipt and guest check.
+        first_replacement_identity = deepcopy(replacement_identity)
         executor_occupancy_samples.append(await self._executor_occupied(job_id))
         marker_after = await self._ssh_file(replacement_identity, marker_path, None)
         checkpoint_after = await self._ssh_file(
@@ -1530,6 +2211,8 @@ class LiveScenario:
         longhorn = await self._longhorn_volume_evidence(
             job_id, str(replacement_identity["root_pvc_uid"])
         )
+        # This general authority sample is the final, post-deletion runtime.
+        # The replacement case below uses the first recovery's frozen sample.
         authority_evidence = {
             "application_api": application_api_evidence,
             "kubernetes_api": {
@@ -1569,8 +2252,17 @@ class LiveScenario:
             },
             "replacement": {
                 "state": recovered["phase"],
+                "profiled_fixture": bool(getattr(self, "profiled_fixture", False)),
                 "pvc_uid_before": identity["root_pvc_uid"],
-                "pvc_uid_after": replacement_identity["root_pvc_uid"],
+                "pvc_uid_after": first_replacement_identity["root_pvc_uid"],
+                "vmi_uid_before": identity["prior_vmi_uid"],
+                "vmi_uid_after": first_replacement_identity["prior_vmi_uid"],
+                "interface_mac_before": identity["interface_mac"],
+                "interface_mac_after": first_replacement_identity["interface_mac"],
+                "network_profile_receipt_before": identity["network_profile_receipt"],
+                "network_profile_receipt_after": first_replacement_identity[
+                    "network_profile_receipt"
+                ],
                 "marker_before": marker,
                 "marker_after": marker_after,
                 "checkpoint_before": checkpoint,
@@ -1593,16 +2285,25 @@ class LiveScenario:
         }
 
     async def cleanup(self) -> None:
+        await self._cleanup_stop_retention()
         rows: list[dict[str, Any]] = []
         async with self.db.acquire() as conn:
             records = await conn.fetch(
-                "SELECT id FROM jobs WHERE description LIKE $1",
-                f"[vm-recovery-gate:{self.run_id}]%",
+                "SELECT j.id FROM jobs j JOIN users u ON u.id=j.user_id "
+                "WHERE j.description=$1 AND j.execution_lane='stateless' "
+                "AND j.context->>'vm_workspace_recovery_acceptance_gate'=$2 "
+                "AND u.display_name=$3 AND u.is_admin=false",
+                f"[vm-recovery-gate:{self.run_id}] retained disk fixture",
+                self.run_id,
+                f"VM recovery gate {self.run_id}",
             )
             rows = [dict(record) for record in records]
         for row in rows:
             job_id = row["id"]
             async with self.db.acquire() as conn, conn.transaction():
+                await self._fixture_controller_pin_rows(
+                    conn, job_id, released_required=False, lock=True
+                )
                 await conn.execute(
                     "UPDATE vm_workspace_recovery_jobs SET participation='cancelled',"
                     "resolved_at=COALESCE(resolved_at,clock_timestamp()) "
@@ -1612,7 +2313,8 @@ class LiveScenario:
                 await conn.execute(
                     "UPDATE vm_workspace_recoveries r SET phase='cancelled',"
                     "resolved_at=COALESCE(r.resolved_at,clock_timestamp()) "
-                    "WHERE r.id IN (SELECT recovery_id FROM vm_workspace_recovery_jobs "
+                    "WHERE r.resolved_at IS NULL AND r.id IN "
+                    "(SELECT recovery_id FROM vm_workspace_recovery_jobs "
                     "WHERE job_id=$1)",
                     job_id,
                 )
@@ -1623,8 +2325,157 @@ class LiveScenario:
                     "FROM vm_workspace_recovery_jobs WHERE job_id=$1)",
                     job_id,
                 )
-            with suppress(Exception):
-                await self.provisioner.delete_vm(str(job_id), purge_disk=True)
+            await self._release_fixture_controller_pins(job_id)
+            await self._purge_fixture(job_id)
+
+    async def _fixture_controller_pin_rows(
+        self, conn: Any, job_id: UUID, *, released_required: bool, lock: bool = False
+    ) -> list[Any]:
+        rows = await conn.fetch(
+            "SELECT r.id AS recovery_id,pin.recovery_id AS pin_recovery_id,"
+            "pin.pvc_uid,pin.provision_generation,"
+            "pin.released_at,pin.controller_pinned_at,pin.controller_pin_uid,"
+            "pin.controller_pin_resource_version,pin.controller_released_at,"
+            "r.owner_kind,r.owner_id,r.namespace,r.root_pvc_uid,"
+            "r.provision_generation AS recovery_generation,"
+            "r.original_cause,j.context "
+            "FROM vm_workspace_recovery_jobs part "
+            "JOIN vm_workspace_recoveries r ON r.id=part.recovery_id "
+            "LEFT JOIN vm_workspace_recovery_retention_pins pin "
+            "ON pin.recovery_id=r.id "
+            "JOIN jobs j ON j.id=part.job_id "
+            "WHERE part.job_id=$1 ORDER BY r.id"
+            + (" FOR UPDATE OF j,part,r" if lock else ""),
+            job_id,
+        )
+        for row in rows:
+            context = _object(row["context"])
+            vm = _object(context.get("vm"))
+            if (
+                context.get("vm_workspace_recovery_acceptance_gate") != self.run_id
+                or _object(row["original_cause"]) != {"gate": self.run_id}
+                or row["owner_kind"] != "job"
+                or row["owner_id"] != job_id
+                or row["namespace"] != self.namespace
+                or str(row["root_pvc_uid"]) != vm.get("rootdisk_pvc_uid")
+                or str(row["recovery_generation"]) != vm.get("provision_generation")
+                or row["pin_recovery_id"] != row["recovery_id"]
+                or row["pvc_uid"] != row["root_pvc_uid"]
+                or row["provision_generation"] != row["recovery_generation"]
+                or (released_required and row["released_at"] is None)
+                or row["controller_pinned_at"] is None
+                or not row["controller_pin_uid"]
+                or not row["controller_pin_resource_version"]
+            ):
+                raise AcceptanceFailure("fixture controller retention pin changed")
+        return rows
+
+    async def _release_fixture_controller_pins(self, job_id: UUID) -> None:
+        """Acknowledge only this gate fixture's durable pins before disk purge."""
+
+        from orchestrator.services.vm_workspace_recovery import (
+            VMWorkspaceRecoveryService,
+        )
+        from orchestrator.services.vm_workspace_recovery_store import (
+            RetentionPinCommand,
+            VMWorkspaceRecoveryStore,
+        )
+
+        async with self.db.acquire() as conn:
+            rows = await self._fixture_controller_pin_rows(
+                conn, job_id, released_required=True
+            )
+        commands: list[RetentionPinCommand] = []
+        for row in rows:
+            if row["controller_released_at"] is None:
+                commands.append(
+                    RetentionPinCommand(
+                        recovery_id=row["recovery_id"],
+                        pvc_uid=row["pvc_uid"],
+                        provision_generation=row["provision_generation"],
+                        desired_state="released",
+                        owner_kind="job",
+                        owner_id=job_id,
+                        namespace=self.namespace,
+                        controller_pin_uid=row["controller_pin_uid"],
+                        controller_pin_resource_version=row[
+                            "controller_pin_resource_version"
+                        ],
+                    )
+                )
+        if not commands:
+            return
+        service = VMWorkspaceRecoveryService(
+            VMWorkspaceRecoveryStore(
+                self.db, worker_id=f"gate-pin-release:{self.run_id}"
+            ),
+            self.provisioner,
+            probe_timeout_seconds=self.settings.external_call_timeout_seconds,
+        )
+        for command in commands:
+            if not await service._sync_retention_pin(command):
+                raise AcceptanceFailure(
+                    "fixture controller retention pin was not acknowledged"
+                )
+            async with self.db.acquire() as conn:
+                acknowledged = await conn.fetchval(
+                    "SELECT controller_released_at IS NOT NULL "
+                    "FROM vm_workspace_recovery_retention_pins "
+                    "WHERE recovery_id=$1 AND pvc_uid=$2 "
+                    "AND provision_generation=$3 AND released_at IS NOT NULL "
+                    "AND controller_pin_uid=$4",
+                    command.recovery_id,
+                    command.pvc_uid,
+                    command.provision_generation,
+                    command.controller_pin_uid,
+                )
+            if acknowledged is not True:
+                raise AcceptanceFailure(
+                    "fixture controller retention pin was not acknowledged"
+                )
+
+    async def _purge_fixture(self, job_id):
+        from orchestrator.operator_cli.vm_recovery_gate_stop_control import (
+            GateFixturePurge,
+            GateStopError,
+            KubernetesStopObjects,
+        )
+
+        # Capture before Kubernetes inventory. The later normal release must
+        # use this identity, never recapture a same-name replacement.
+        try:
+            identity = await self.provisioner.capture_vm_teardown_identity(str(job_id))
+        except Exception:
+            identity = None
+        anchor = (
+            {
+                "generation": identity.provision_generation,
+                "vm": identity.vm_uid,
+                "pvc": identity.rootdisk_pvc_uid,
+            }
+            if identity is not None
+            else None
+        )
+
+        async def release_captured(job, *, purge_disk):
+            if identity is None:
+                raise GateStopError("purge_identity_unproven")
+            result = await self.provisioner.release_vm_captured(
+                job,
+                identity,
+                purge_disk=purge_disk,
+                capture_snapshot=False,
+            )
+            return result.disposition == "completed"
+
+        await GateFixturePurge(
+            self.db,
+            KubernetesStopObjects(self._core),
+            release_captured,
+            self.run_id,
+            self.namespace,
+            anchor=anchor,
+        ).run(job_id)
 
 
 def _output_path(value: str) -> Path:

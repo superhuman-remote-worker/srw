@@ -20,6 +20,7 @@ router = APIRouter()
 class CapacityDependencies:
     snapshot: Callable[[], Awaitable[dict[str, Any]]]
     require_admin: Callable[[Request], Awaitable[dict[str, Any]]]
+    vm_snapshot: Callable[[], Awaitable[dict[str, Any]]] | None = None
 
 
 def get_capacity_dependencies(request: Request) -> CapacityDependencies:
@@ -38,4 +39,7 @@ async def get_capacity(
     API is unreachable; the queue numbers always come from ``run_queue``.
     """
     await dependencies.require_admin(request)
-    return await dependencies.snapshot()
+    result = await dependencies.snapshot()
+    if dependencies.vm_snapshot is not None:
+        result = {**result, "vm": await dependencies.vm_snapshot()}
+    return result

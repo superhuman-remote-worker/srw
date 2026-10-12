@@ -46,6 +46,11 @@ from uuid import UUID, uuid4
 import httpx
 
 from orchestrator.services.agent_cloud_mounts import _build_protected_cloud_mount
+from orchestrator.services.cloud import (
+    PROTECTED_PROJECT_FOLDER,
+    protected_provider,
+    provider_offers,
+)
 from orchestrator.services.cloud.protected_reader_authority import (
     ProtectedNextcloudReaderGrantPlan,
 )
@@ -137,7 +142,7 @@ def _ro_mount_matches_protected_selection(
         return False
     if not isinstance(ro_row.get("etag_baseline"), dict):
         return False
-    if str(ro_row.get("backend") or "") != "nextcloud":
+    if not provider_offers(ro_row.get("backend"), PROTECTED_PROJECT_FOLDER):
         return False
     if str(ro_row.get("auth_kind") or "") != "basic":
         return False
@@ -185,15 +190,16 @@ async def _resolve_protected_reader_backend(
 ):
     """Resolve the immutable installation captured by a protected attempt."""
 
+    expected_backend_id = protected_provider(plan.backend)
     try:
         return dependencies.cloud_router.for_backend_instance(
             plan.backend_instance_id,
-            expected_backend_id="nextcloud",
+            expected_backend_id=expected_backend_id,
         )
     except Exception:
         authority = await dependencies.store.get_main_cloud_backend_instance(
             plan.backend_instance_id,
-            expected_backend_id="nextcloud",
+            expected_backend_id=expected_backend_id,
         )
         if authority is None:
             raise RuntimeError("protected reader backend installation is unavailable")
@@ -277,7 +283,7 @@ async def _protected_cloud_delivery_state(
         return "engaging", None
     row, mount_rows = await asyncio.gather(
         dependencies.store.get_ro_mount_by_thread(thread_id),
-        dependencies.store.list_thread_mounts(thread_id),
+        dependencies.store.list_protected_selection_rows(thread_id),
     )
     if not _ro_mount_matches_protected_selection(
         row,
@@ -357,15 +363,17 @@ async def _await_protected_cloud_runtime_ready(
         ):
             user_id = thread.get("user_id")
             if user_id:
-                mount_rows = await dependencies.store.list_thread_mounts(thread_id)
+                mount_rows = await dependencies.store.list_protected_selection_rows(
+                    thread_id
+                )
                 current = await dependencies.store.get_thread(thread_id)
                 if not same_thread_runtime_authority(current, runtime_authority):
                     return False
                 current_metadata = thread_metadata_object(current)
                 if protected_cloud_marker_state(current_metadata) != "on":
                     return False
-                current_mount_rows = await dependencies.store.list_thread_mounts(
-                    thread_id
+                current_mount_rows = (
+                    await dependencies.store.list_protected_selection_rows(thread_id)
                 )
                 if _protected_mount_selection_identity(
                     select_protected_mount(mount_rows)
@@ -457,11 +465,15 @@ async def _engage_protected_cloud_for_thread(
 ) -> None:
     """Engage protected cloud mode ONCE at thread create (design §3.3/§11.4).
 
-    Picks the first Nextcloud-backed project mount, provisions an attempt-scoped
-    reader + group, and runs the fail-closed probe via
-    ``engage_ro_mount`` — persisting a ``cloud_ro_mounts`` row on success. On
-    refusal, records ``metadata.protected_cloud_error`` so the session boots
-    with NO cloud mount (never a live one) and the agent can say why."""
+    Protects the session's protected folder (``mount_rows``: its
+    ``thread_protected_sources`` row, the folder its connector binds at
+    protected; ``list_protected_selection_rows``), provisions an
+    attempt-scoped reader + group, and runs the fail-closed probe via
+    ``engage_ro_mount`` — persisting a ``cloud_ro_mounts`` row on success.
+    The session's owner must still be an owner or editor of the folder's
+    project (:func:`protected_source_admissible`). On refusal, records
+    ``metadata.protected_cloud_error`` so the session boots with NO cloud
+    mount (never a live one) and the agent can say why."""
     postgres_db = dependencies.store
     thread = await postgres_db.get_thread(thread_id)
     runtime_authority = thread_runtime_authority(thread)
@@ -503,7 +515,16 @@ async def _engage_protected_cloud_for_thread(
             dependencies=dependencies,
         )
         return
-    current_mount_rows = await postgres_db.list_thread_mounts(thread_id)
+    if not await protected_source_admissible(user_id, row, store=dependencies.store):
+        await _record_protected_error(
+            thread_id,
+            "the session's owner may no longer write the protected folder's project",
+            code="engage_refused",
+            expected_runtime_generation=runtime_generation,
+            dependencies=dependencies,
+        )
+        return
+    current_mount_rows = await postgres_db.list_protected_selection_rows(thread_id)
     current_selected = select_protected_mount(current_mount_rows)
     if (
         expected_selection is None
@@ -525,7 +546,7 @@ async def _engage_protected_cloud_for_thread(
             current_metadata = thread_metadata_object(current)
             if protected_cloud_marker_state(current_metadata) != "on":
                 return False
-            latest_mounts = await postgres_db.list_thread_mounts(thread_id)
+            latest_mounts = await postgres_db.list_protected_selection_rows(thread_id)
             latest_selected = select_protected_mount(latest_mounts)
             return expected_selection == _protected_mount_selection_identity(
                 latest_selected
@@ -675,6 +696,28 @@ async def _engage_protected_cloud_for_thread(
             expected_runtime_generation=runtime_generation,
             dependencies=dependencies,
         )
+
+
+#: The project roles that may protect a folder: a viewer may only read it.
+PROTECTED_SOURCE_ROLES = frozenset({"owner", "editor"})
+
+
+async def protected_source_admissible(
+    user_id: str | None,
+    source: Mapping[str, Any] | None,
+    *,
+    store: Any,
+) -> bool:
+    """Whether ``user_id`` may protect ``source`` now: an owner or editor of
+    the folder's project (``source_ref``), whichever project the session
+    belongs to (main cloud slice 5: a member of B may protect B's folder
+    from a session of A). A protected review writes into that folder, so a
+    viewer, a former member and an administrator outside it may not."""
+    project_id = str((source or {}).get("source_ref") or "")
+    if not user_id or not project_id:
+        return False
+    roles = await store.get_user_project_roles(str(user_id), [project_id])
+    return roles.get(project_id) in PROTECTED_SOURCE_ROLES
 
 
 async def _record_protected_error(

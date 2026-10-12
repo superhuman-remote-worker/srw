@@ -4,6 +4,8 @@ import { TestBed } from '@angular/core/testing';
 import { ActivatedRoute, Router, convertToParamMap } from '@angular/router';
 import { of, throwError } from 'rxjs';
 import { Expert, JobCreateRequest, Project } from '../../core/models/api.model';
+import { SessionToolGroupsResponse } from '../../core/services/api.service';
+import { WorkspaceChoice } from '../../core/models/workspace-template.model';
 import { ApiService } from '../../core/services/api.service';
 import { CapabilitiesService } from '../../core/services/capabilities.service';
 import { ErrorMessageService } from '../../core/services/error-message.service';
@@ -256,6 +258,8 @@ describe('JobCreateComponent project picker', () => {
       getExperts: vi.fn().mockReturnValue(of([])),
       getExpertDetail: vi.fn().mockReturnValue(of(null)),
       previewToolGroups: vi.fn().mockReturnValue(of(null)),
+      listWorkspaceTemplates: vi.fn().mockReturnValue(of({resources: []})),
+      getProjectWorkspaceDefaults: vi.fn().mockReturnValue(of(null)),
       createJob: vi.fn().mockReturnValue(of({id: 'job-1'})),
     };
     TestBed.resetTestingModule();
@@ -302,6 +306,20 @@ describe('JobCreateComponent project picker', () => {
   } as Project;
 
   afterEach(() => TestBed.resetTestingModule());
+
+  it('sends no cloud storage override: the folder copy binds at its link level', () => {
+    // The project folder now reaches a job as its checkout connector, at the
+    // level its project link holds (main cloud slice 6).
+    const {component} = setup(null);
+    expect(component.buildRequest().context?.['cloud_storage_read_only']).toBeUndefined();
+  });
+
+  it("asks for a job's eligible connectors, for the selected project", () => {
+    // A project's cloud folder mounts in sessions only: the job list must
+    // never offer it.
+    const {api} = setup(null);
+    expect(api.getEligibleDatasources).toHaveBeenLastCalledWith(['proj-1'], 'job');
+  });
 
   it('offers active projects only', () => {
     const {component, api} = setup(null);
@@ -358,6 +376,7 @@ describe('JobCreateComponent project picker', () => {
     component.selectedPriority.set(7);
     component.kickoffMessage = '  Start here  ';
     component.agentSettings = {
+      vmSizingValid: () => true,
       getOverrides: () => ({llm: {model: 'selected-model'}}),
       getInstructions: () => 'Instructions',
       getSelectedDatasourceIds: () => ['connector-1'],
@@ -371,6 +390,216 @@ describe('JobCreateComponent project picker', () => {
       instructions: 'Instructions', kickoff_message: 'Start here', datasource_ids: ['connector-1'],
       priority: 7, project_id: 'proj-1', user_id: 'user-1',
     });
+  });
+
+  // creation_ui_expert_workspace_connectors.md D2: no overrides on a baseline.
+  const TEMPLATE = {
+    runtimeConfig: {
+      config_name: 'worker_base',
+      asset_name: 'developer',
+      config: {llm: {model: 'opus-5-5', reasoning_level: 'high'}, tools: {shell: ['run_command']}},
+      prompts: {persona: 'You write code.', instructions: 'Ship small changes.'},
+    },
+    workspacePreference: {backend: 'sandbox'},
+  };
+
+  function expertSettings(options: {changed: boolean; instructionsModified?: boolean}) {
+    return {
+      vmSizingValid: () => true,
+      hasExpertChanges: () => options.changed,
+      getExpertOverrides: () => ({llm: {model: 'sonnet-5-5'}, tools: {browser: true}}),
+      getTaskOverrides: () => ({autonomy: 'full'}),
+      getOverrides: () => ({autonomy: 'full', llm: {model: 'sonnet-5-5'}, tools: {browser: true}}),
+      getInstructions: () => 'Edited instructions',
+      instructionsTab: {isModified: () => options.instructionsModified ?? false},
+      getSelectedDatasourceIds: () => ['connector-1'],
+      resetAll: vi.fn(),
+    } as unknown as JobCreateComponent['agentSettings'];
+  }
+
+  it('a changed template is sent as a complete inline copy, settings beside it', async () => {
+    const {component, api} = setup(null);
+    component.formData.description = 'Fix the flaky test';
+    component.selectedExpert.set({id: 'developer', storage_kind: 'bundled'} as Expert);
+    component.expertTemplate.set(TEMPLATE);
+    component.agentSettings = expertSettings({changed: true, instructionsModified: true});
+
+    await component.onSubmit();
+
+    const request = api.createJob.mock.calls.at(-1)![0];
+    expect(request).not.toHaveProperty('config_name');
+    expect(request).not.toHaveProperty('expert_id');
+    expect(request).not.toHaveProperty('instructions');
+    expect(request.expert_based_on).toBe('developer');
+    expect(request.expert).toEqual({inline: {
+      runtime: {adapter: 'srw/v1', config: {
+        config_name: 'worker_base',
+        asset_name: 'developer',
+        config: {llm: {model: 'sonnet-5-5', reasoning_level: 'high'}, tools: {shell: ['run_command'], browser: true}},
+        prompts: {persona: 'You write code.', instructions: 'Edited instructions'},
+      }},
+      workspacePreference: {backend: 'sandbox'},
+    }});
+    expect(request.config_override).toEqual({autonomy: 'full'});
+  });
+
+  it('an untouched template sends its selector and only the job-level settings', async () => {
+    const {component, api} = setup(null);
+    component.formData.description = 'Fix the flaky test';
+    component.selectedExpert.set({id: 'developer', storage_kind: 'bundled'} as Expert);
+    component.expertTemplate.set(TEMPLATE);
+    component.agentSettings = expertSettings({changed: false});
+
+    await component.onSubmit();
+
+    const request = api.createJob.mock.calls.at(-1)![0];
+    expect(request.config_name).toBe('developer');
+    expect(request).not.toHaveProperty('expert');
+    expect(request).not.toHaveProperty('instructions');
+    expect(request.config_override).toEqual({autonomy: 'full'});
+  });
+
+  it('without a readable template a changed template falls back to selector + overrides', async () => {
+    const {component, api} = setup(null);
+    component.formData.description = 'Fix the flaky test';
+    component.selectedExpert.set({id: 'developer', storage_kind: 'bundled'} as Expert);
+    component.agentSettings = expertSettings({changed: true});
+
+    await component.onSubmit();
+
+    const request = api.createJob.mock.calls.at(-1)![0];
+    expect(request.config_name).toBe('developer');
+    expect(request.config_override).toEqual({autonomy: 'full', llm: {model: 'sonnet-5-5'}, tools: {browser: true}});
+    expect(request.instructions).toBe('Edited instructions');
+  });
+
+  it('the manifest view shows the same request as a Job document', () => {
+    const {component} = setup(null);
+    component.formData.description = 'Fix the flaky test';
+    component.selectedExpert.set({id: 'developer', storage_kind: 'bundled'} as Expert);
+    component.expertTemplate.set(TEMPLATE);
+    component.agentSettings = expertSettings({changed: true});
+    component.toggleManifest();
+    const yaml = component.manifestText();
+    expect(yaml).toContain('kind: Job');
+    expect(yaml).toContain('inline:');
+    expect(yaml).toContain('adapter: srw/v1');
+    expect(yaml).toContain('text: Fix the flaky test');
+  });
+
+  it('sends the picked template in the preview and the create, never config_override.workspace', async () => {
+    const {component, api} = setup(null);
+    const choice = {kind: 'ref' as const, ref: {name: 'container-minimal', scope: {kind: 'Catalog' as const, name: 'shared'}}, backend: 'sandbox' as const, label: 'container-minimal'};
+    component.onWorkspaceChoice(choice);
+    const previewBody = api.previewToolGroups.mock.calls.at(-1)![0];
+    expect(previewBody.workspace).toEqual({template: {ref: {name: 'container-minimal', scope: {kind: 'Catalog', name: 'shared'}}}});
+    expect(previewBody).not.toHaveProperty('workspace_preference');
+    component.formData.description = 'Do it';
+    await component.onSubmit();
+    const request = api.createJob.mock.calls.at(-1)![0];
+    expect(request.workspace).toEqual(previewBody.workspace);
+    expect(request.config_override?.['workspace']).toBeUndefined();
+  });
+
+  it('resetForm sets the workspace choice back to Default and resets the picker', () => {
+    const {component} = setup(null);
+    const reset = vi.fn();
+    component.picker = {reset} as unknown as JobCreateComponent['picker'];
+    component.workspaceChoice.set({kind: 'none'});
+    component.resetForm();
+    expect(component.workspaceChoice()).toEqual({kind: 'default'});
+    expect(reset).toHaveBeenCalledOnce();
+  });
+
+  describe('no-shell note', () => {
+    const REF = {
+      kind: 'ref' as const, ref: {name: 'container-full', scope: {kind: 'Catalog' as const, name: 'shared'}},
+      backend: 'sandbox' as const, label: 'container-full',
+    };
+    const preview = (shell: 'on' | 'off' | 'unavailable' | null, backend = 'sandbox') => ({
+      thread_id: '', source: 'resolved', tool_groups: null,
+      workspace: {backend, source: 'default', binding: null},
+      categories: shell ? {shell: {state: shell, reason: null, settable: true, decided_by: 'config', tools: []}} : {},
+    }) as unknown as SessionToolGroupsResponse;
+    const GRANTED = 'jobs.create.noShellNoteGranted';
+    const NOT_GRANTED = 'jobs.create.noShellNoteNoGrant';
+
+    function noteFor(choice: WorkspaceChoice, tp: SessionToolGroupsResponse | null, grants: Record<string, unknown> | null = null) {
+      const {component} = setup(null);
+      component.workspaceChoice.set(choice);
+      component.toolPreview.set(tp);
+      (component.capabilities as unknown as {grants: ReturnType<typeof signal>}).grants.set(grants);
+      return component.noShellNoteKey();
+    }
+
+    it('is shown for a shell-less Expert and a picked container template', () => {
+      expect(noteFor(REF, preview('off'))).toBe(GRANTED);
+      expect(noteFor(REF, preview('unavailable'))).toBe(GRANTED);
+    });
+
+    it('is shown for a picked inline recipe and a picked VM template', () => {
+      expect(noteFor({kind: 'inline', spec: {backend: 'sandbox'}}, preview('off'))).toBe(GRANTED);
+      expect(noteFor({...REF, backend: 'vm'}, preview('off', 'vm'))).toBe(GRANTED);
+    });
+
+    it('is hidden for the Default choice', () => {
+      expect(noteFor({kind: 'default'}, preview('off'))).toBeNull();
+    });
+
+    it('is hidden for an Expert whose preview has a shell', () => {
+      expect(noteFor(REF, preview('on'))).toBeNull();
+    });
+
+    it('is hidden for the virtual tier and for none', () => {
+      expect(noteFor({...REF, backend: 'virtual' as never}, preview('off', 'virtual'))).toBeNull();
+      expect(noteFor({kind: 'none'}, preview('off'))).toBeNull();
+    });
+
+    it('is hidden while the preview for a new choice or Expert is loading', () => {
+      const {component} = setup(null);
+      component.workspaceChoice.set(REF);
+      component.toolPreview.set(preview('off'));
+      expect(component.noShellNoteKey()).toBe(GRANTED);
+      component.loadingWorkspacePreview.set(true);
+      expect(component.noShellNoteKey()).toBeNull();
+      component.loadingWorkspacePreview.set(false);
+      component.isLoadingExpertDetail.set(true);
+      expect(component.noShellNoteKey()).toBeNull();
+    });
+
+    it('is hidden when the user switched Shell off themselves', () => {
+      const tp = preview('off');
+      tp.categories!['shell'].decided_by = 'request';
+      expect(noteFor(REF, tp)).toBeNull();
+    });
+
+    it('is hidden until a preview names the shell category', () => {
+      expect(noteFor(REF, null)).toBeNull();
+      expect(noteFor(REF, preview(null))).toBeNull();
+    });
+
+    it('names the administrator when the user lacks the shell_tools grant', () => {
+      expect(noteFor(REF, preview('off'), {shell_tools: false})).toBe(NOT_GRANTED);
+      expect(noteFor(REF, preview('off'), {shell_tools: true})).toBe(GRANTED);
+    });
+  });
+
+  it('omits workspace entirely for the default choice', async () => {
+    const {component, api} = setup(null);
+    component.formData.description = 'Do it';
+    await component.onSubmit();
+    expect(api.createJob.mock.calls.at(-1)![0]).not.toHaveProperty('workspace');
+  });
+
+  it('does not create a job while VM sizing is invalid', async () => {
+    const {component, api} = setup(null);
+    component.formData.description = 'Run on a VM';
+    component.agentSettings = {vmSizingValid: () => false} as JobCreateComponent['agentSettings'];
+
+    await component.onSubmit();
+
+    expect(api.createJob).not.toHaveBeenCalled();
+    expect(component.formData.description).toBe('Run on a VM');
   });
 
   it('real onSubmit preserves selections and forwards the server error to translation', async () => {

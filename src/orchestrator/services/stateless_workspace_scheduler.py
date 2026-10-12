@@ -27,6 +27,8 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any
 
+from orchestrator.services.application_tasks import drain_task_mapping
+
 logger = logging.getLogger(__name__)
 
 
@@ -65,6 +67,17 @@ class StatelessWorkspaceEnsureRegistry:
     def in_flight(self) -> dict[str, "asyncio.Task[None]"]:
         """A snapshot, for shutdown drain and for tests."""
         return dict(self._tasks)
+
+    async def drain(self) -> None:
+        """Cancel and await every in-flight reconcile, then empty the registry.
+
+        R1.B12: the application calls this at shutdown, before its stores
+        close. A cancelled reconcile is not handed over: the next input,
+        resume or internal workspace poll schedules one again (see
+        :func:`schedule_stateless_workspace_ensure`). Safe to call again; the
+        registry stays usable.
+        """
+        await drain_task_mapping(self._tasks)
 
 
 @dataclass(frozen=True)

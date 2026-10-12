@@ -9,9 +9,45 @@ from orchestrator.services.vm_workspace_recovery_store import (
     acquire_vm_cleanup_permit,
     complete_vm_cleanup_permit,
     completed_cleanup_outcome,
+    vm_cleanup_kwargs,
 )
 
 logger = logging.getLogger(__name__)
+
+
+async def handle_provisioning_wait(
+    decision: str,
+    job_id: str,
+    vm: dict[str, Any],
+    *,
+    db: Any,
+    provisioner: Any,
+    recovery_store: Any,
+    now: float,
+    boot_timeout_s: float = 600,
+    rootdisk_stall_timeout_s: float = 2700,
+) -> bool:
+    """Consume a wait/attention/cleanup decision before execution dispatch."""
+    from orchestrator.services.dispatch_guards import VM_ATTENTION, VM_RECYCLE, VM_WAIT
+
+    if decision in {VM_WAIT, VM_ATTENTION}:
+        return True
+    if decision == VM_RECYCLE:
+        await recycle_provisioning_vm(
+            job_id,
+            vm,
+            db=db,
+            provisioner=provisioner,
+            recovery_store=recovery_store,
+            now=now,
+            phase_timeout=vm.get("retirement_cleanup_pending") is not True
+            and vm.get("status")
+            not in {"deleting", "delete_failed", "retiring_process_zero"},
+            boot_timeout_s=boot_timeout_s,
+            rootdisk_stall_timeout_s=rootdisk_stall_timeout_s,
+        )
+        return True
+    return False
 
 
 async def recycle_provisioning_vm(
@@ -22,6 +58,9 @@ async def recycle_provisioning_vm(
     provisioner: Any,
     recovery_store: Any,
     now: float,
+    phase_timeout: bool = False,
+    boot_timeout_s: float = 600,
+    rootdisk_stall_timeout_s: float = 2700,
 ) -> str:
     """Retire one captured generation, retaining its disk and any cleanup hold.
 
@@ -38,22 +77,50 @@ async def recycle_provisioning_vm(
         )
         if identity.provision_generation != generation:
             return "identity_superseded"
+        if phase_timeout:
+            from orchestrator.services.vm_provisioning_phases import (
+                VMProvisioningPhaseStore,
+            )
+
+            cleanup = await VMProvisioningPhaseStore(db).admit_boot_cleanup(
+                job_id,
+                vm,
+                identity=identity,
+                boot_timeout_s=boot_timeout_s,
+                rootdisk_stall_timeout_s=rootdisk_stall_timeout_s,
+            )
+            if cleanup is None:
+                return "authority_changed"
         # Write before acquiring the durable permit: a rejected CAS must not
         # strand an admission for a generation the dispatcher no longer owns.
         # The delete transport can publish `deleted` before physical absence;
         # this marker keeps replacement fenced until admission completion.
-        if not await db.merge_vm_context_if_provision_generation(
-            job_id, generation, {"retirement_cleanup_pending": True}
-        ):
-            return "authority_changed"
-        cleanup = await acquire_vm_cleanup_permit(
-            recovery_store,
-            owner_kind="job",
-            owner_id=job_id,
-            identity=identity,
-            source="dispatcher_vm_recycle",
-            purge_disk=False,
-        )
+        else:
+            if vm.get("status") == "ready":
+                # A deliberate recycle of a Ready VM must exclude a worker
+                # Resume that won the queue first. Ordinary provisioning
+                # cleanup retains its existing generation-only CAS.
+                admitted = await db.begin_ready_vm_retirement_if_quiescent(
+                    job_id,
+                    provision_generation=generation,
+                    vm_uid=identity.vm_uid,
+                    pvc_uid=identity.rootdisk_pvc_uid,
+                )
+            else:
+                admitted = await db.merge_vm_context_if_provision_generation(
+                    job_id, generation, {"retirement_cleanup_pending": True}
+                )
+            if not admitted:
+                return "authority_changed"
+        if not phase_timeout:
+            cleanup = await acquire_vm_cleanup_permit(
+                recovery_store,
+                owner_kind="job",
+                owner_id=job_id,
+                identity=identity,
+                source="dispatcher_vm_recycle",
+                purge_disk=False,
+            )
         if not cleanup.allowed:
             disposition = "recovery_held"
         else:
@@ -65,12 +132,23 @@ async def recycle_provisioning_vm(
                     entity_type="job",
                     purge_disk=False,
                     capture_snapshot=False,
+                    **vm_cleanup_kwargs(cleanup),
                 )
                 disposition = outcome.disposition
                 if disposition in {"completed", "identity_superseded"}:
                     await complete_vm_cleanup_permit(
-                        recovery_store, cleanup, outcome=disposition
+                        recovery_store,
+                        cleanup,
+                        outcome=disposition,
+                        provisioner=provisioner,
                     )
+            elif disposition == "completed":
+                await complete_vm_cleanup_permit(
+                    recovery_store,
+                    cleanup,
+                    outcome=disposition,
+                    provisioner=provisioner,
+                )
             if disposition in {"completed", "identity_superseded"}:
                 await db.merge_vm_context_if_provision_generation(
                     job_id,

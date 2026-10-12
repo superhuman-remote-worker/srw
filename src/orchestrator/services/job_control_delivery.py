@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from dataclasses import dataclass
 from typing import Any, Callable
 
@@ -16,20 +17,89 @@ from orchestrator.security.access import (
     externalize_gitea_url,
     vm_workspaces_on_pod_network,
 )
+from orchestrator.services import (
+    connector_bind_time,
+    connector_credential_leases,
+    refused_workspace_credentials,
+)
 from orchestrator.services.config_resolver import (
     inject_blob_credentials,
     resolve_config,
 )
 from orchestrator.services.container_provisioner import WorkspaceRuntimeAuthorityError
+from orchestrator.services.datasource_policy import SHELL_WORKSPACE_DETAIL
 from orchestrator.services.grant_enforcement import GrantDenied
+from orchestrator.services.job_start_bundle import JobStartRefusal
+from orchestrator.services.model_availability import WHERE_JOB, ModelUnavailable
 from orchestrator.services.managed_repository_authority import (
     ManagedRepositoryAuthorityError,
 )
 from orchestrator.services.manifest_runtime_ownership import uses_srw_runtime
 from orchestrator.services.workspace_tier_policy import LiteWorkspaceConfigError
 from shared.backend_kinds import LITE_BACKENDS
+from shared.connectors.builtin import needs_knowledge_profile
 from shared.runtime.core.loader import canonical_config_name
 from shared.workspace_contract import WORKSPACE_RUNTIME_CONTEXT_KEY
+from shared.pinned_job_delivery import (
+    pinned_job_delivery_proof,
+    pinned_job_projection_digest,
+)
+from shared.vm_lifecycle_auth import (
+    LifecycleAuthConfigurationError,
+    configured_secret,
+)
+
+
+async def _pinned_vm_delivery_intent(
+    dependencies: "JobDeliveryDependencies",
+    *,
+    job_id: str,
+    agent_id: str,
+    recipient: Any,
+    payload: dict[str, Any],
+    consumed_context: dict[str, Any] | None = None,
+) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+    """Add a replayable exact delivery ID only for a supported VM recipient."""
+
+    if (
+        os.getenv("WORKSPACE_IDLE_RELEASE_ENABLED", "false").lower() != "true"
+        or not isinstance(payload.get("workspace_runtime"), dict)
+        or payload["workspace_runtime"].get("assigned_backend") != "vm"
+        or payload["workspace_runtime"].get("effective_backend") != "vm"
+        or payload["workspace_runtime"].get("state") != "ready"
+        or not getattr(recipient, "expected_pod_uid", None)
+    ):
+        return payload, None
+    try:
+        secret = configured_secret()
+    except LifecycleAuthConfigurationError:
+        secret = None
+    if secret is None:
+        return payload, None
+    digest = pinned_job_projection_digest(payload)
+    intent = await dependencies.store.prepare_pinned_job_delivery(
+        job_id,
+        agent_id,
+        recipient=recipient,
+        projection_digest=digest,
+        consumed_context=consumed_context,
+    )
+    if intent is None:
+        return None, None
+    proof = pinned_job_delivery_proof(
+        secret,
+        delivery_id=str(intent["id"]),
+        agent_id=agent_id,
+        process_generation=recipient.expected_process_generation,
+        pod_uid=recipient.expected_pod_uid,
+        projection_digest=digest,
+    )
+    return {
+        **payload,
+        "pinned_delivery_id": str(intent["id"]),
+        "pinned_projection_digest": digest,
+        "pinned_delivery_proof": proof,
+    }, intent
 
 
 @dataclass(frozen=True, slots=True)
@@ -54,6 +124,7 @@ class JobDeliveryDependencies:
     resolve_authorized_job_datasources: Callable[..., Any]
     apply_cloud_storage_override: Callable[..., Any]
     build_datasources_payload: Callable[..., Any]
+    build_workspace_ssh_identities: Callable[..., Any]
     job_project_repositories: Callable[..., Any]
     build_datasource_tool_override: Callable[..., Any]
     inject_matching_workspace_config: Callable[..., Any]
@@ -62,7 +133,7 @@ class JobDeliveryDependencies:
     authorize_job_repository_transport: Callable[..., Any]
     apply_sticky_sudo_denial: Callable[..., Any]
     backend_from_override: Callable[..., Any]
-    repository_datasource_names: Callable[..., Any]
+    shell_connector_names: Callable[..., Any]
     inject_lite_workspace_config: Callable[..., Any]
     is_experts_db_enabled: Callable[..., Any]
     user_experts_enabled: Callable[..., Any]
@@ -75,6 +146,10 @@ class JobDeliveryDependencies:
     grant_violations_detail: Callable[..., Any]
     mint_worker_runtime_actor: Callable[..., Any]
     resume_reject_should_requeue: Callable[..., Any]
+    #: Fails a claimed job whose start was refused through the completion-
+    #: command path (``job_completion.refuse_job_start``, connector drivers
+    #: decision 34). Used only while completion commands own job status.
+    refuse_job_start: Callable[..., Any]
 
 
 class JobDeliveryOperations:
@@ -156,6 +231,18 @@ async def dispatch_job_to_agent(
             job,
             persist_dispatch_state=not dependencies.completion_commands_enabled(),
         )
+        if isinstance(job_start, JobStartRefusal):
+            # Completion commands own the status, so the refusal fails the job
+            # through the ledger under this claim's fence. Left to the lease,
+            # it would be claimed again on a fresh agent at every expiry.
+            await dependencies.refuse_job_start(
+                job_id,
+                reason=job_start.reason,
+                message=job_start.message,
+                resume=False,
+                agent_id=agent_id,
+            )
+            return False
         if job_start is None:
             return False
 
@@ -208,13 +295,22 @@ async def dispatch_job_to_agent(
         if target is None:
             return False
         job_start = job_start.model_copy(update={"recipient": target.recipient})
+        delivery_payload, delivery_intent = await _pinned_vm_delivery_intent(
+            dependencies,
+            job_id=job_id,
+            agent_id=agent_id,
+            recipient=target.recipient,
+            payload=job_start.model_dump(mode="json", exclude_none=True),
+        )
+        if delivery_payload is None:
+            return False
         agent_url = (
             f"http://{target.agent['pod_ip']}:{target.agent['pod_port']}/job/start"
         )
         async with dependencies.http_client_factory(timeout=30.0) as client:
             response = await client.post(
                 agent_url,
-                json=job_start.model_dump(exclude_none=True),
+                json=delivery_payload,
             )
         if response.status_code not in (200, 202):
             dependencies.logger.warning(
@@ -225,9 +321,36 @@ async def dispatch_job_to_agent(
             )
             return False
 
+        accepted_delivery_id = None
+        if delivery_intent is not None:
+            try:
+                acknowledgement = response.json()
+            except (ValueError, TypeError):
+                acknowledgement = {}
+            if (
+                isinstance(acknowledgement, dict)
+                and acknowledgement.get("pinned_delivery_id")
+                == str(delivery_intent["id"])
+                and acknowledgement.get("pinned_projection_digest")
+                == delivery_payload["pinned_projection_digest"]
+            ):
+                accepted_delivery_id = str(delivery_intent["id"])
+            else:
+                dependencies.logger.warning(
+                    "Dispatch: pinned delivery acknowledgment unavailable for job %s",
+                    job_id,
+                )
+
         if dependencies.completion_commands_enabled():
             if not await dependencies.store.confirm_pinned_job_dispatch(
-                job_id, agent_id
+                job_id,
+                agent_id,
+                pinned_delivery_id=accepted_delivery_id,
+                pinned_projection_digest=(
+                    delivery_payload.get("pinned_projection_digest")
+                    if accepted_delivery_id
+                    else None
+                ),
             ):
                 dependencies.logger.warning(
                     "Dispatch: stale success from agent %s for job %s; "
@@ -236,12 +359,21 @@ async def dispatch_job_to_agent(
                     job_id,
                 )
                 return False
-        else:
-            await dependencies.store.update_job_status(
-                job_id=job_id,
-                status="processing",
-                assigned_agent_id=agent_id,
+        elif not await dependencies.store.update_job_status(
+            job_id=job_id,
+            status="processing",
+            assigned_agent_id=agent_id,
+            # The pre-POST claim already wrote this. A pause or cancel that
+            # won while the start was in flight must not be overwritten.
+            expected_status="processing",
+        ):
+            dependencies.logger.warning(
+                "Dispatch: job %s changed while agent %s accepted it; not "
+                "reasserting processing",
+                job_id,
+                agent_id,
             )
+            return False
         await dependencies.store.heartbeat(
             agent_id=agent_id,
             status="working",
@@ -265,6 +397,78 @@ async def dispatch_job_to_agent(
         return False
     finally:
         dependencies.reset_log_context(_log_token)
+
+
+async def _refuse_resume(
+    job: dict[str, Any],
+    *,
+    reason: str,
+    message: str,
+    agent_id: str,
+    dependencies: Any,
+    workspace_authority: Any = None,
+) -> None:
+    """Fail a claimed job whose resume was refused, through the ledger.
+
+    A refused resume keeps the paused job's workspace; one that revokes
+    access has SRW's credentials scrubbed from it once the refusal is
+    admitted, or, with no attested endpoint to reach it, is torn down
+    instead (:mod:`orchestrator.services.refused_workspace_credentials`).
+    """
+
+    job_id = str(job["id"])
+    target = (
+        refused_workspace_credentials.attested_scrub_target(
+            workspace_authority.attestation
+        )
+        if workspace_authority is not None
+        else refused_workspace_credentials.vm_scrub_target(job)
+    )
+    plan = refused_workspace_credentials.plan_refused_resume(
+        reason, job=job, target=target
+    )
+    if await dependencies.refuse_job_start(
+        job_id,
+        reason=reason,
+        message=message,
+        resume=plan.keep_workspace,
+        agent_id=agent_id,
+    ):
+        await refused_workspace_credentials.scrub_refused_workspace(
+            dependencies.store, job_id, reason=reason, plan=plan
+        )
+
+
+async def _refuse_unavailable_model_resume(
+    job: dict[str, Any],
+    unavailable: ModelUnavailable,
+    dependencies: Any,
+    *,
+    agent_id: str,
+) -> None:
+    """Refuse a resume whose configured model cannot run, naming it
+    (unavailable_model_handling.md §5). Mirrors the grant-denial branch: the
+    job fails with the message, through the completion-command path while
+    completion commands own job status."""
+    dependencies.logger.warning(
+        "Resume refused for job %s: unavailable model slot(s) %s",
+        job.get("id"),
+        [entry.as_dict() for entry in unavailable.entries],
+    )
+    if not dependencies.completion_commands_enabled():
+        await dependencies.store.update_job_status(
+            str(job["id"]),
+            status="failed",
+            error_message=unavailable.message(where=WHERE_JOB),
+        )
+    else:
+        await _refuse_resume(
+            job,
+            reason="model_unavailable",
+            message=unavailable.message(where=WHERE_JOB),
+            agent_id=agent_id,
+            dependencies=dependencies,
+        )
 
 
 async def resume_job_on_agent(
@@ -378,10 +582,19 @@ async def resume_job_on_agent(
                     status="failed",
                     error_message="connector_unavailable",
                 )
+            else:
+                await _refuse_resume(
+                    job,
+                    reason="connector_unavailable",
+                    message="connector_unavailable",
+                    agent_id=agent_id,
+                    workspace_authority=workspace_authority,
+                    dependencies=dependencies,
+                )
             return False
 
         has_knowledge_scope = bool(job.get("project_id")) or any(
-            str(ds.get("type") or "").lower() == "kb" for ds in (resolved_ds or [])
+            needs_knowledge_profile(ds) for ds in (resolved_ds or [])
         )
         job_context = job.get("context") or {}
         if isinstance(job_context, str):
@@ -432,6 +645,23 @@ async def resume_job_on_agent(
                 job_id,
                 workspace_decision.reason or workspace_decision.state,
             )
+            if dependencies.completion_commands_enabled() and (
+                workspace_decision.state in {"invalid", "failed", "mismatch"}
+            ):
+                # Only ``invalid`` gets here: resume_missing_workspace has
+                # already sent a failed or missing workspace back to the
+                # dispatcher. Definitive, as on the fresh path.
+                await _refuse_resume(
+                    job,
+                    reason="workspace_contract",
+                    message=(
+                        "Workspace contract refused dispatch: "
+                        f"{workspace_decision.reason or workspace_decision.state}"
+                    ),
+                    agent_id=agent_id,
+                    workspace_authority=workspace_authority,
+                    dependencies=dependencies,
+                )
             return False
         if workspace_decision.effective_backend == "vm":
             dependencies.logger.info(
@@ -469,6 +699,12 @@ async def resume_job_on_agent(
                 exc.code,
             )
             return False
+        # Connector keys only ever reach a shell-capable workspace.
+        workspace_ssh_identities = (
+            dependencies.build_workspace_ssh_identities(resolved_ds)
+            if workspace_decision.effective_backend in {"sandbox", "vm"}
+            else None
+        )
         if workspace_decision.effective_backend == "vm":
             if not vm_workspaces_on_pod_network():
                 if git_remote_url and not git_remote_url.startswith("ssh://srw-repo-"):
@@ -489,14 +725,14 @@ async def resume_job_on_agent(
         # paused row only carries the bare backend — without this a resumed
         # `virtual` job would reach the agent with no mounts and fail to build
         # its backend. (Same rationale as the credential re-injection above.)
-        if dependencies.backend_from_override(config_override) in LITE_BACKENDS:
-            repo_names = dependencies.repository_datasource_names(resolved_ds)
-            if repo_names:
+        lite_backend = dependencies.backend_from_override(config_override)
+        if lite_backend in LITE_BACKENDS:
+            shell_names = dependencies.shell_connector_names(resolved_ds, lite_backend)
+            if shell_names:
                 msg = (
                     "workspace.backend is a lite tier (virtual/none) but a "
-                    f"connector requiring a shell is attached ({', '.join(repo_names)}). "
-                    "Repository and credential connectors need a full workspace — use "
-                    "backend='sandbox' or 'vm'."
+                    f"connector requiring a shell is attached ({', '.join(shell_names)}). "
+                    f"{SHELL_WORKSPACE_DETAIL} — use backend='sandbox' or 'vm'."
                 )
                 dependencies.logger.error(
                     "Resume dispatch: job %s rejected — %s", job_id, msg
@@ -504,6 +740,15 @@ async def resume_job_on_agent(
                 if not dependencies.completion_commands_enabled():
                     await dependencies.store.update_job_status(
                         job_id=job_id, status="failed", error_message=msg
+                    )
+                else:
+                    await _refuse_resume(
+                        job,
+                        reason="lite_shell_connector",
+                        message=msg,
+                        agent_id=agent_id,
+                        workspace_authority=workspace_authority,
+                        dependencies=dependencies,
                     )
                 return False
             try:
@@ -517,6 +762,15 @@ async def resume_job_on_agent(
                 if not dependencies.completion_commands_enabled():
                     await dependencies.store.update_job_status(
                         job_id=job_id, status="failed", error_message=str(exc)
+                    )
+                else:
+                    await _refuse_resume(
+                        job,
+                        reason="lite_config",
+                        message=str(exc),
+                        agent_id=agent_id,
+                        workspace_authority=workspace_authority,
+                        dependencies=dependencies,
                     )
                 return False
 
@@ -581,6 +835,20 @@ async def resume_job_on_agent(
                 )
             except GrantDenied as gd:
                 dependencies.logger.warning("Resume denied for job %s: %s", job_id, gd)
+                if dependencies.completion_commands_enabled():
+                    await _refuse_resume(
+                        job,
+                        reason="grant_denied",
+                        message=dependencies.grant_violations_detail(gd.violations),
+                        agent_id=agent_id,
+                        workspace_authority=workspace_authority,
+                        dependencies=dependencies,
+                    )
+                return False
+            except ModelUnavailable as unavailable:
+                await _refuse_unavailable_model_resume(
+                    job, unavailable, dependencies, agent_id=agent_id
+                )
                 return False
         elif resolved_resume_supported or user_experts_enabled:
             try:
@@ -658,6 +926,20 @@ async def resume_job_on_agent(
                             gd.violations
                         ),
                     )
+                else:
+                    await _refuse_resume(
+                        job,
+                        reason="grant_denied",
+                        message=dependencies.grant_violations_detail(gd.violations),
+                        agent_id=agent_id,
+                        workspace_authority=workspace_authority,
+                        dependencies=dependencies,
+                    )
+                return False
+            except ModelUnavailable as unavailable:
+                await _refuse_unavailable_model_resume(
+                    job, unavailable, dependencies, agent_id=agent_id
+                )
                 return False
 
         # The blob and flat fallback are mutually exclusive on the wire. Inject
@@ -665,11 +947,17 @@ async def resume_job_on_agent(
         # inject_blob_credentials for the preferred path, the legacy flat
         # override only when resolved-config delivery is disabled.
         if resolved_config is None:
-            config_override = await dependencies.inject_dispatch_credentials(
-                job,
-                config_override,
-                include_kb_profile=has_knowledge_scope,
-            )
+            try:
+                config_override = await dependencies.inject_dispatch_credentials(
+                    job,
+                    config_override,
+                    include_kb_profile=has_knowledge_scope,
+                )
+            except ModelUnavailable as unavailable:
+                await _refuse_unavailable_model_resume(
+                    job, unavailable, dependencies, agent_id=agent_id
+                )
+                return False
             injected_env_keys = (config_override.get("env_keys") or {}).keys()
         else:
             injected_env_keys = (
@@ -688,9 +976,31 @@ async def resume_job_on_agent(
         job_context = job.get("context") or {}
         if isinstance(job_context, str):
             job_context = json.loads(job_context)
+        original_context = dict(job_context)
         queued_feedback = job_context.pop("queued_feedback", None)
         queued_feedback_reason = job_context.pop("queued_feedback_reason", None)
         delegation_results = job_context.pop("delegation_results", None)
+        consumed_context = {}
+        if queued_feedback:
+            consumed_context.update(
+                {
+                    key: original_context[key]
+                    for key in (
+                        "queued_feedback",
+                        "queued_feedback_reason",
+                        "queued_feedback_delivery_id",
+                    )
+                    if key in original_context
+                }
+            )
+        if delegation_results:
+            consumed_context.update(
+                {
+                    key: original_context[key]
+                    for key in ("delegation_results", "delegation_results_delivery_id")
+                    if key in original_context
+                }
+            )
 
         # The per-job Gitea remote. Without it the agent's pod-handoff clone
         # (resume onto a fresh workspace with no snapshot) can never fire and
@@ -755,6 +1065,51 @@ async def resume_job_on_agent(
                 resume_payload["feedback_reason"] = queued_feedback_reason
         if delegation_results:
             resume_payload["delegation_results"] = delegation_results
+        if workspace_ssh_identities:
+            # Present only when there is something to load: a pinned agent
+            # from before C1 hashes the projection it parsed, so an always-
+            # present key would fail every resume as pinned_projection_mismatch.
+            resume_payload["workspace_ssh_identities"] = workspace_ssh_identities
+
+        # The second credential path (connector drivers C2): a paused Job's
+        # leases lapsed while it waited, so resume issues new ones; a lease
+        # still live is delivered again. In place, in ``datasources``.
+        try:
+            lease_owner = connector_credential_leases.job_lease_owner(job)
+            # Never waits for a registered driver's bind or a provider's mint:
+            # the dispatcher's preflight (or the operator resume's own gate)
+            # held the job until it was bound (D6) and minted (C5).
+            await connector_credential_leases.prepare_lease_delivery(
+                dependencies.store,
+                datasources_payload,
+                owner=lease_owner,
+                bind_wait=0,
+            )
+            await connector_credential_leases.deliver_connector_leases_with(
+                dependencies.store,
+                datasources_payload,
+                owner=lease_owner,
+            )
+        except connector_credential_leases.LeaseDeliveryError as exc:
+            dependencies.logger.warning(
+                "Resume dispatch: connector leases unavailable for job %s (%s)",
+                job_id,
+                exc,
+            )
+            if dependencies.completion_commands_enabled() and isinstance(
+                exc, connector_bind_time.BindTimeRefused
+            ):
+                # A bind or provider mint that failed for good, as on the
+                # fresh path; a pending one and any other delivery error wait.
+                await _refuse_resume(
+                    job,
+                    reason="connector_bind_refused",
+                    message=str(exc)[:1000],
+                    agent_id=agent_id,
+                    workspace_authority=workspace_authority,
+                    dependencies=dependencies,
+                )
+            return False
 
         if not await dependencies.pinned_k8s_job_workspace_authority_is_current(
             durable_job, workspace_authority
@@ -790,13 +1145,23 @@ async def resume_job_on_agent(
         if target is None:
             return False
         resume_payload["recipient"] = target.recipient.model_dump(mode="json")
+        delivery_payload, delivery_intent = await _pinned_vm_delivery_intent(
+            dependencies,
+            job_id=job_id,
+            agent_id=agent_id,
+            recipient=target.recipient,
+            payload={k: v for k, v in resume_payload.items() if v is not None},
+            consumed_context=consumed_context,
+        )
+        if delivery_payload is None:
+            return False
         agent_url = (
             f"http://{target.agent['pod_ip']}:{target.agent['pod_port']}/job/resume"
         )
         async with dependencies.http_client_factory(timeout=30.0) as client:
             response = await client.post(
                 agent_url,
-                json={k: v for k, v in resume_payload.items() if v is not None},
+                json=delivery_payload,
             )
 
         if response.status_code not in (200, 202):
@@ -825,26 +1190,41 @@ async def resume_job_on_agent(
                     )
             return False
 
-        # Agent accepted — now atomically drop the keys we consumed so a future
-        # resume won't re-inject them. `context - text[]` (not a full-dict
-        # rewrite) preserves any concurrent merge into other context keys.
-        consumed_keys = [
-            key
-            for key, value in (
-                ("queued_feedback", queued_feedback),
-                ("queued_feedback_reason", queued_feedback_reason),
-                ("delegation_results", delegation_results),
-            )
-            if value
-        ]
-        if consumed_keys and not dependencies.completion_commands_enabled():
-            await dependencies.store.delete_job_context_keys(job_id, consumed_keys)
+        accepted_delivery_id = None
+        if delivery_intent is not None:
+            try:
+                acknowledgement = response.json()
+            except (ValueError, TypeError):
+                acknowledgement = {}
+            if (
+                isinstance(acknowledgement, dict)
+                and acknowledgement.get("pinned_delivery_id")
+                == str(delivery_intent["id"])
+                and acknowledgement.get("pinned_projection_digest")
+                == delivery_payload["pinned_projection_digest"]
+            ):
+                accepted_delivery_id = str(delivery_intent["id"])
+            else:
+                dependencies.logger.warning(
+                    "Resume dispatch: pinned delivery acknowledgment unavailable for job %s",
+                    job_id,
+                )
 
+        # Agent accepted — drop the keys we consumed, once ownership is
+        # confirmed below, so a future resume won't re-inject them.
+        # `context - text[]` (not a full-dict rewrite) preserves any concurrent
+        # merge into other context keys.
         if dependencies.completion_commands_enabled():
             if not await dependencies.store.confirm_pinned_job_dispatch(
                 job_id,
                 agent_id,
-                consumed_context_keys=consumed_keys,
+                consumed_context=consumed_context,
+                pinned_delivery_id=accepted_delivery_id,
+                pinned_projection_digest=(
+                    delivery_payload.get("pinned_projection_digest")
+                    if accepted_delivery_id
+                    else None
+                ),
             ):
                 dependencies.logger.warning(
                     "Resume dispatch: stale success from agent %s for job %s; "
@@ -853,12 +1233,26 @@ async def resume_job_on_agent(
                     job_id,
                 )
                 return False
-        else:
-            # Update job status and assign to agent
-            await dependencies.store.update_job_status(
-                job_id=job_id,
-                status="processing",
-                assigned_agent_id=agent_id,
+        elif not await dependencies.store.update_job_status(
+            job_id=job_id,
+            status="processing",
+            assigned_agent_id=agent_id,
+            # The pre-POST claim already wrote this. An operator pause (or a
+            # cancel) that won while the resume was in flight keeps its row.
+            expected_status="processing",
+        ):
+            dependencies.logger.warning(
+                "Resume dispatch: job %s changed while agent %s accepted it; "
+                "not reasserting processing",
+                job_id,
+                agent_id,
+            )
+            return False
+        elif consumed_context:
+            # Consumed only once ownership is confirmed, like the command
+            # path: a lost CAS leaves the feedback for the next resume.
+            await dependencies.store.delete_job_context_keys(
+                job_id, list(consumed_context)
             )
 
         await dependencies.store.heartbeat(

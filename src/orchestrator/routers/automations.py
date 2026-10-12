@@ -36,6 +36,10 @@ from orchestrator.services.cron_dispatcher import (
     validate_cron_expr,
     validate_timezone,
 )
+from orchestrator.services.config_overrides import (
+    refuse_caller_transport_keys,
+    refuse_execution_owned_workspace_keys,
+)
 from orchestrator.services.default_experts import ExpertSelectionError
 from orchestrator.services.session_tool_policy import with_validated_tool_overrides
 from shared.runtime.core.loader import canonical_config_name
@@ -192,7 +196,11 @@ async def create_automation(
     # db.create_job by create_job_from_automation — it never crosses
     # POST /api/jobs, so the validator there does not see it, and every cron
     # fire re-plants whatever is stored. Validate it at the only boundary it
-    # does cross: this one.
+    # does cross: this one. Transport/credential keys are refused here too —
+    # a standing order that re-plants a caller base_url on every fire would
+    # otherwise pair it with the deployment's stored key at each dispatch.
+    refuse_caller_transport_keys(body.config_override)
+    refuse_execution_owned_workspace_keys(body.config_override)
     validated_override = with_validated_tool_overrides(body.config_override)
 
     if body.project_id:
@@ -215,6 +223,7 @@ async def create_automation(
             project_id=body.project_id,
             expert=body.expert,
             expert_id=body.expert_id,
+            caller_is_admin=bool(caller.get("is_admin")),
         )
     except ExpertSelectionError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
@@ -312,6 +321,8 @@ async def update_automation(
     # Same reason as create: this override is replayed into db.create_job on
     # every fire, bypassing the POST /api/jobs validator entirely.
     if "config_override" in fields:
+        refuse_caller_transport_keys(fields["config_override"])
+        refuse_execution_owned_workspace_keys(fields["config_override"])
         fields["config_override"] = with_validated_tool_overrides(
             fields["config_override"]
         )
@@ -345,6 +356,7 @@ async def update_automation(
                 project_id=str(row["project_id"]) if row.get("project_id") else None,
                 expert=effective_expert,
                 expert_id=effective_expert_id,
+                caller_is_admin=bool(caller.get("is_admin")),
             )
         except ExpertSelectionError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc

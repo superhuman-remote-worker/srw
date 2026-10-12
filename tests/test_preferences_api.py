@@ -27,17 +27,16 @@ EXPECTED_DEFAULTS = {
     "default_autonomy": "full",
     "default_reasoning_level": "medium",
     "default_auxiliary_model": "registry-aux",
-    "default_vision_model": "env-vision",
+    "default_vision_model": "registry-vision",
     "default_whisper_model": "env-whisper",
     "default_tts_model": "registry-tts",
-    "default_embedding_model": "env-embedding",
+    "default_embedding_model": "registry-embedding",
     "embedding_provider": "env-provider",
     "admin_view_mode": "all",
     "persistent_agent": {
         "model": "registry-chat",
         "permission_mode": "supervised",
         "idle_timeout_minutes": 30,
-        "workspace_backend": "virtual",
     },
 }
 
@@ -59,7 +58,10 @@ def preferences_api(monkeypatch, user_a):
             side_effect={
                 "chat": "registry-chat",
                 "auxiliary": "registry-aux",
+                "vision": "registry-vision",
                 "tts": "registry-tts",
+                "embedding": "registry-embedding",
+                # No whisper default: WHISPER_MODEL is the fallback.
             }.get
         ),
     )
@@ -136,15 +138,31 @@ async def test_get_preserves_saved_preferences_and_registry_defaults(preferences
         "language": "de-DE",
         "legacy": {"retained": True},
         "_resolved": EXPECTED_DEFAULTS,
+        "_unavailable": {},
     }
     api.db.get_user_settings.assert_awaited_once_with(str(api.user["id"]))
     assert api.roles.call_args_list == [call("worker"), call("session")]
     assert api.db.resolve_default_for_capability.await_args_list == [
         call("chat"),
         call("auxiliary"),
+        call("vision"),
+        call("whisper"),
         call("tts"),
+        call("embedding"),
     ]
     api.db.update_user_settings.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_get_hides_the_retired_workspace_backend(preferences_api):
+    api = preferences_api
+    api.db.get_user_settings.side_effect = None
+    api.db.get_user_settings.return_value = {
+        "persistent_agent": {"model": "p", "workspace_backend": "sandbox"}
+    }
+    response = await request(api, "GET")
+    assert response.json()["persistent_agent"] == {"model": "p"}
+    assert "workspace_backend" not in response.json()["_resolved"]["persistent_agent"]
 
 
 @pytest.mark.asyncio
@@ -153,7 +171,7 @@ async def test_get_overwrites_stored_resolved_but_does_not_persist_it(preference
     api.db.get_user_settings.side_effect = None
     api.db.get_user_settings.return_value = {"_resolved": {"forged": True}}
     response = await request(api, "GET")
-    assert response.json() == {"_resolved": EXPECTED_DEFAULTS}
+    assert response.json() == {"_resolved": EXPECTED_DEFAULTS, "_unavailable": {}}
     api.db.update_user_settings.assert_not_awaited()
 
 
@@ -167,7 +185,9 @@ async def test_registry_miss_falls_back_to_role_and_helper_environment(preferenc
     expected.update(
         default_model="yaml-worker",
         default_auxiliary_model="yaml-aux",
+        default_vision_model="env-vision",
         default_tts_model="env-tts",
+        default_embedding_model="env-embedding",
     )
     expected["persistent_agent"]["model"] = "yaml-session"
     assert response.json()["_resolved"] == expected
@@ -197,10 +217,11 @@ async def test_empty_role_defaults_preserve_none_and_platform_fallbacks(
         default_autonomy=None,
         default_reasoning_level=None,
         default_auxiliary_model=None,
-        default_vision_model="gpt-4o",
-        default_whisper_model="whisper-1",
-        default_tts_model="tts-1",
-        default_embedding_model="qwen3-embedding-8b",
+        # No registry default and no env: no model name is invented.
+        default_vision_model=None,
+        default_whisper_model=None,
+        default_tts_model=None,
+        default_embedding_model=None,
         embedding_provider="local",
     )
     expected["persistent_agent"]["model"] = None
@@ -224,11 +245,14 @@ async def test_empty_role_defaults_preserve_none_and_platform_fallbacks(
             },
             {
                 "persistent_agent": {
-                    "workspace_backend": "none",
                     "greeting": "legacy",
                     "future": 7,
                 }
             },
+        ),
+        (
+            {"persistent_agent": {"model": "p", "workspace_backend": "sandbox"}},
+            {"persistent_agent": {"model": "p"}},
         ),
         (
             {"communication": {"channels": {"email": False}, "future": 7}},
@@ -300,8 +324,6 @@ async def test_empty_or_only_unknown_patch_remains_400_after_auth(
 @pytest.mark.parametrize(
     "body,field",
     [
-        ({"persistent_agent": {"workspace_backend": "vm"}}, "persistent_agent"),
-        ({"persistent_agent": {"workspace_backend": "bogus"}}, "persistent_agent"),
         ({"read_aloud": {"reasoning_level": "ultra"}}, "read_aloud"),
         ({"read_aloud": {"custom_prompt": "x" * 1001}}, "read_aloud"),
         ({"communication": {"channels": {"email": "false"}}}, "communication"),
@@ -398,3 +420,90 @@ def test_focused_openapi_contract(preferences_api):
     assert (
         "communication" in schema["properties"] and "language" in schema["properties"]
     )
+
+
+# ---------------------------------------------------------------------------
+# Unavailable model preferences (unavailable_model_handling.md §7)
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def stale_registry(monkeypatch):
+    """A live registry that knows only ``gpt-6-astra``; ``MiniMax-M3`` is a
+    disabled catalog row."""
+    from shared.runtime.core import model_registry
+    from shared.runtime.core.model_registry import UnknownModelError
+
+    async def resolve(model_id, user_id=None, capability="chat"):
+        if model_id == "gpt-6-astra":
+            return object()
+        raise UnknownModelError(model_id)
+
+    monkeypatch.setattr(model_registry, "lookups_registered", lambda: True)
+    monkeypatch.setattr(model_registry, "resolve_model", AsyncMock(side_effect=resolve))
+
+
+@pytest.mark.asyncio
+async def test_patch_refuses_a_newly_chosen_unavailable_model(
+    preferences_api, stale_registry
+):
+    api = preferences_api
+    api.db.catalog_model_states = AsyncMock(
+        return_value=[{"enabled": False, "capabilities": ["chat"]}]
+    )
+    response = await request(api, "PATCH", {"default_model": "MiniMax-M3"})
+    assert response.status_code == 400
+    detail = response.json()["detail"]
+    assert detail["code"] == "model.unavailable"
+    assert "`MiniMax-M3` (main model) is no longer available" in detail["message"]
+    assert "Settings → Preferences" in detail["message"]
+    api.db.update_user_settings.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_patch_lets_an_unchanged_stale_default_ride_along(
+    preferences_api, stale_registry
+):
+    """The page saves every field at once: an already-stale stored default
+    must not block an unrelated change."""
+    api = preferences_api
+    api.db.catalog_model_states = AsyncMock(
+        return_value=[{"enabled": False, "capabilities": ["chat"]}]
+    )
+    api.db.get_user_settings.side_effect = None
+    api.db.get_user_settings.return_value = {"default_model": "MiniMax-M3"}
+    response = await request(
+        api, "PATCH", {"default_model": "MiniMax-M3", "language": "en"}
+    )
+    assert response.status_code == 200
+    api.db.update_user_settings.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_patch_accepts_a_runnable_model_and_clearing(
+    preferences_api, stale_registry
+):
+    api = preferences_api
+    assert (
+        await request(api, "PATCH", {"default_model": "gpt-6-astra"})
+    ).status_code == 200
+    assert (await request(api, "PATCH", {"default_model": None})).status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_get_flags_a_stored_unavailable_model(preferences_api, stale_registry):
+    api = preferences_api
+    api.db.catalog_model_states = AsyncMock(
+        return_value=[{"enabled": False, "capabilities": ["chat", "auxiliary"]}]
+    )
+    api.db.get_user_settings.side_effect = None
+    api.db.get_user_settings.return_value = {
+        "default_model": "MiniMax-M3",
+        "default_auxiliary_model": "gpt-6-astra",
+        "persistent_agent": {"model": "MiniMax-M3"},
+    }
+    response = await request(api, "GET")
+    assert response.json()["_unavailable"] == {
+        "default_model": "disabled",
+        "persistent_agent.model": "disabled",
+    }

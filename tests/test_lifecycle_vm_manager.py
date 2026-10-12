@@ -12,6 +12,7 @@ from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
+import asyncpg
 import pytest
 
 from orchestrator.services.lifecycle import (
@@ -23,6 +24,17 @@ from orchestrator.services.lifecycle import (
     expected_vm_shas,
 )
 from orchestrator.services.vm_provisioner import VMTeardownIdentity, VMTeardownResult
+from orchestrator.services.vm_workspace_recovery_store import CleanupPermit
+
+
+@pytest.fixture(autouse=True)
+def legacy_resource_cleanup(monkeypatch):
+    """These synthetic lifecycle owners have no v3 creation/retry charge."""
+    import orchestrator.services.vm_workspace_recovery_store as recovery
+
+    monkeypatch.setattr(
+        recovery, "prepare_vm_cleanup_resource", AsyncMock(return_value=None)
+    )
 
 
 # =============================================================================
@@ -1009,6 +1021,58 @@ class TestSignalDrainPending:
 
 class TestDelete:
     @pytest.mark.asyncio
+    async def test_known_remote_operation_busy_releases_lifecycle_claim(
+        self, monkeypatch
+    ):
+        import orchestrator.services.vm_workspace_recovery_store as recovery
+        from orchestrator.services.completion_lifecycle import (
+            LifecycleActionPermit,
+            LifecycleRouteDecision,
+        )
+
+        mgr, provisioner, *_ = _make_manager()
+        provisioner.release_vm_captured.return_value = VMTeardownResult(
+            "remote_operation_busy", False
+        )
+        completed = AsyncMock()
+        monkeypatch.setattr(recovery, "complete_vm_cleanup_permit", completed)
+        claim = LifecycleActionPermit(LifecycleRouteDecision("job-1", "claimed"))
+        inst = Instance(
+            kind="vm",
+            id="agent-vm-job-1",
+            bound_to="job-1",
+            metadata={"scope": "job", "_completion_lifecycle_permit": claim},
+        )
+
+        assert not await mgr._delete_owned(inst, purge_disk=True)
+
+        assert claim.completed and claim.skip_reason == "vm_remote_operation_busy"
+        provisioner.release_vm_captured.assert_awaited_once()
+        completed.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "failure", [asyncpg.CheckViolationError, asyncpg.ConnectionDoesNotExistError]
+    )
+    async def test_settlement_failure_cannot_report_deleted_then_exact_replay_succeeds(
+        self, monkeypatch, failure
+    ):
+        import orchestrator.services.vm_workspace_recovery_store as recovery
+
+        mgr, provisioner, *_ = _make_manager()
+        inst = Instance(kind="vm", id="x", bound_to="job-1", metadata={"scope": "job"})
+        settle = AsyncMock(side_effect=[failure("settlement refused"), None])
+        monkeypatch.setattr(recovery, "complete_vm_cleanup_permit", settle)
+
+        assert not await mgr._delete_owned(inst, purge_disk=True)
+        provisioner.release_vm_captured.assert_awaited_once()
+        assert await mgr._delete_owned(inst, purge_disk=True)
+        assert settle.await_count == 2
+        assert {call.args[1].admission_id for call in settle.await_args_list} == {
+            "cleanup-1"
+        }
+
+    @pytest.mark.asyncio
     async def test_job_vm_uses_exact_retirement_release(self):
         mgr, provisioner, *_ = _make_manager()
         inst = Instance(kind="vm", id="x", bound_to="job-1", metadata={"scope": "job"})
@@ -1722,6 +1786,410 @@ class TestChurnRegression:
 # =============================================================================
 
 
+class TestOpenPurgeReplay:
+    @pytest.mark.asyncio
+    async def test_charged_open_purge_retry_pending_releases_claim(self, monkeypatch):
+        from uuid import uuid4
+
+        import orchestrator.services.vm_workspace_recovery_store as recovery
+        from orchestrator.services.completion_lifecycle import (
+            LifecycleActionPermit,
+            LifecycleRouteDecision,
+        )
+
+        owner, generation, vm_uid, pvc_uid = (uuid4() for _ in range(4))
+        store = MagicMock()
+        store.has_open_lifecycle_vm_delete = AsyncMock(return_value=True)
+        store.resume_open_lifecycle_vm_delete = AsyncMock(
+            return_value=CleanupPermit(allowed=True, admission_id=uuid4())
+        )
+        mgr, provisioner, _, _, _ = _make_manager(workspace_recovery_store=store)
+        provisioner.capture_vm_teardown_identity.return_value = VMTeardownIdentity(
+            str(generation), str(vm_uid), str(pvc_uid)
+        )
+        provisioner.release_vm_captured.return_value = VMTeardownResult(
+            "retry_pending", False
+        )
+        monkeypatch.setattr(
+            recovery, "prepare_vm_cleanup_resource", AsyncMock(return_value=object())
+        )
+        complete = AsyncMock()
+        monkeypatch.setattr(recovery, "complete_vm_cleanup_permit", complete)
+        claim = LifecycleActionPermit(LifecycleRouteDecision(str(owner), "claimed"))
+        inst = Instance(
+            kind="vm",
+            id=f"agent-vm-{owner}",
+            bound_to=str(owner),
+            metadata={
+                "scope": "job",
+                "execution_lane": "pinned",
+                "_completion_lifecycle_permit": claim,
+            },
+        )
+
+        assert await mgr.resume_pending_cleanup(inst) == "held"
+
+        assert claim.completed and claim.skip_reason == "vm_cleanup_delete_pending"
+        provisioner.release_vm_captured.assert_awaited_once()
+        complete.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("charged", [False, True])
+    async def test_open_purge_lost_claim_during_preparation_blocks_release(
+        self, monkeypatch, charged
+    ):
+        from uuid import uuid4
+
+        import orchestrator.services.vm_workspace_recovery_store as recovery
+        from orchestrator.services.completion_lifecycle import (
+            LifecycleActionPermit,
+            LifecycleRouteDecision,
+        )
+
+        owner, generation, vm_uid, pvc_uid = (uuid4() for _ in range(4))
+        store = MagicMock()
+        store.has_open_lifecycle_vm_delete = AsyncMock(return_value=True)
+        store.resume_open_lifecycle_vm_delete = AsyncMock(
+            return_value=CleanupPermit(allowed=True, admission_id=uuid4())
+        )
+        mgr, provisioner, _, _, _ = _make_manager(workspace_recovery_store=store)
+        provisioner.capture_vm_teardown_identity.return_value = VMTeardownIdentity(
+            str(generation), str(vm_uid), str(pvc_uid)
+        )
+        claim = LifecycleActionPermit(LifecycleRouteDecision(str(owner), "claimed"))
+
+        async def prepare(*_args):
+            claim.lost.set()
+            return object() if charged else None
+
+        monkeypatch.setattr(recovery, "prepare_vm_cleanup_resource", prepare)
+        complete = AsyncMock()
+        monkeypatch.setattr(recovery, "complete_vm_cleanup_permit", complete)
+        inst = Instance(
+            kind="vm",
+            id=f"agent-vm-{owner}",
+            bound_to=str(owner),
+            metadata={
+                "scope": "job",
+                "execution_lane": "pinned",
+                "_completion_lifecycle_permit": claim,
+            },
+        )
+
+        assert await mgr.resume_pending_cleanup(inst) == "held"
+
+        provisioner.release_vm_captured.assert_not_awaited()
+        complete.assert_not_awaited()
+        assert not claim.completed
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "failure",
+        [VMTeardownResult("identity_unknown", False), RuntimeError("lost reply")],
+    )
+    async def test_charged_open_purge_ambiguous_release_keeps_claim(
+        self, monkeypatch, failure
+    ):
+        from uuid import uuid4
+
+        import orchestrator.services.vm_workspace_recovery_store as recovery
+        from orchestrator.services.completion_lifecycle import (
+            LifecycleActionPermit,
+            LifecycleRouteDecision,
+        )
+
+        owner, generation, vm_uid, pvc_uid = (uuid4() for _ in range(4))
+        store = MagicMock()
+        store.has_open_lifecycle_vm_delete = AsyncMock(return_value=True)
+        store.resume_open_lifecycle_vm_delete = AsyncMock(
+            return_value=CleanupPermit(allowed=True, admission_id=uuid4())
+        )
+        mgr, provisioner, _, _, _ = _make_manager(workspace_recovery_store=store)
+        provisioner.capture_vm_teardown_identity.return_value = VMTeardownIdentity(
+            str(generation), str(vm_uid), str(pvc_uid)
+        )
+        if isinstance(failure, BaseException):
+            provisioner.release_vm_captured.side_effect = failure
+        else:
+            provisioner.release_vm_captured.return_value = failure
+        monkeypatch.setattr(
+            recovery, "prepare_vm_cleanup_resource", AsyncMock(return_value=object())
+        )
+        complete = AsyncMock()
+        monkeypatch.setattr(recovery, "complete_vm_cleanup_permit", complete)
+        claim = LifecycleActionPermit(LifecycleRouteDecision(str(owner), "claimed"))
+        inst = Instance(
+            kind="vm",
+            id=f"agent-vm-{owner}",
+            bound_to=str(owner),
+            metadata={
+                "scope": "job",
+                "execution_lane": "pinned",
+                "_completion_lifecycle_permit": claim,
+            },
+        )
+
+        assert await mgr.resume_pending_cleanup(inst) == "held"
+
+        assert not claim.completed and claim.skip_reason is None
+        provisioner.release_vm_captured.assert_awaited_once()
+        complete.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_charged_open_purge_replays_original_delete_before_stop(
+        self, monkeypatch
+    ):
+        from uuid import uuid4
+
+        import orchestrator.services.vm_workspace_recovery_store as recovery
+        from orchestrator.services.completion_lifecycle import (
+            LifecycleActionPermit,
+            LifecycleRouteDecision,
+        )
+
+        owner, generation, vm_uid, pvc_uid = (uuid4() for _ in range(4))
+        store = MagicMock()
+        store.has_open_lifecycle_vm_delete = AsyncMock(return_value=True)
+        parent = CleanupPermit(allowed=True, admission_id=uuid4())
+        store.resume_open_lifecycle_vm_delete = AsyncMock(return_value=parent)
+        mgr, provisioner, _, _, _ = _make_manager(workspace_recovery_store=store)
+        identity = VMTeardownIdentity(str(generation), str(vm_uid), str(pvc_uid))
+        provisioner.capture_vm_teardown_identity.return_value = identity
+        provisioner.release_vm_captured.side_effect = [
+            VMTeardownResult("remote_operation_busy", False),
+            VMTeardownResult("completed", True),
+        ]
+        prepare = AsyncMock(return_value=object())
+        complete = AsyncMock()
+        monkeypatch.setattr(recovery, "prepare_vm_cleanup_resource", prepare)
+        monkeypatch.setattr(recovery, "complete_vm_cleanup_permit", complete)
+        mgr.is_reapable = AsyncMock(return_value=True)
+        mgr.is_dirty = AsyncMock(return_value=True)
+        mgr.give_up = AsyncMock()
+        inst = Instance(
+            kind="vm",
+            id=f"agent-vm-{owner}",
+            bound_to=str(owner),
+            metadata={"scope": "job", "execution_lane": "pinned"},
+        )
+        first_claim = LifecycleActionPermit(
+            LifecycleRouteDecision(str(owner), "claimed")
+        )
+        inst.metadata["_completion_lifecycle_permit"] = first_claim
+        stats = {"reaped": 0, "reap_forced": 0, "reap_attempts": 0}
+
+        await InstanceLifecycleReconciler([mgr])._reap(mgr, inst, stats)
+
+        assert first_claim.completed
+        assert first_claim.skip_reason == "vm_remote_operation_busy"
+        complete.assert_not_awaited()
+        mgr.is_dirty.assert_not_awaited()
+        mgr.give_up.assert_not_awaited()
+        assert stats == {"reaped": 0, "reap_forced": 0, "reap_attempts": 0}
+
+        next_claim = LifecycleActionPermit(
+            LifecycleRouteDecision(str(owner), "claimed")
+        )
+        inst.metadata["_completion_lifecycle_permit"] = next_claim
+        await InstanceLifecycleReconciler([mgr])._reap(mgr, inst, stats)
+
+        assert provisioner.release_vm_captured.await_count == 2
+        assert all(
+            call.kwargs["purge_disk"] is True
+            and call.kwargs["parent_cleanup"]["admission_id"]
+            == str(parent.admission_id)
+            for call in provisioner.release_vm_captured.await_args_list
+        )
+        complete.assert_awaited_once()
+        assert stats["reaped"] == 1
+
+    @pytest.mark.asyncio
+    async def test_uncharged_replay_lost_claim_after_controller_keeps_parent_open(
+        self, monkeypatch
+    ):
+        from uuid import uuid4
+
+        import orchestrator.services.vm_workspace_recovery_store as recovery
+        from orchestrator.services.completion_lifecycle import (
+            LifecycleActionPermit,
+            LifecycleRouteDecision,
+        )
+
+        owner, generation, vm_uid, pvc_uid = (uuid4() for _ in range(4))
+        store = MagicMock()
+        store.has_open_lifecycle_vm_delete = AsyncMock(return_value=True)
+        store.resume_open_lifecycle_vm_delete = AsyncMock(
+            return_value=CleanupPermit(allowed=True, admission_id=uuid4())
+        )
+        mgr, provisioner, _, _, _ = _make_manager(workspace_recovery_store=store)
+        provisioner.capture_vm_teardown_identity.return_value = VMTeardownIdentity(
+            str(generation), str(vm_uid), str(pvc_uid)
+        )
+        mgr._permit_external = AsyncMock(side_effect=[True, True, False])
+        monkeypatch.setattr(
+            recovery, "prepare_vm_cleanup_resource", AsyncMock(return_value=None)
+        )
+        complete = AsyncMock()
+        monkeypatch.setattr(recovery, "complete_vm_cleanup_permit", complete)
+        mgr.is_reapable = AsyncMock(return_value=True)
+        mgr.is_dirty = AsyncMock(return_value=True)
+        mgr.give_up = AsyncMock()
+        inst = Instance(
+            kind="vm",
+            id=f"agent-vm-{owner}",
+            bound_to=str(owner),
+            metadata={
+                "scope": "job",
+                "execution_lane": "pinned",
+                "_completion_lifecycle_permit": LifecycleActionPermit(
+                    LifecycleRouteDecision(str(owner), "claimed")
+                ),
+            },
+        )
+        stats = {"reaped": 0, "reap_forced": 0, "reap_attempts": 0}
+
+        await InstanceLifecycleReconciler([mgr])._reap(mgr, inst, stats)
+
+        provisioner.release_vm_captured.assert_awaited_once()
+        complete.assert_not_awaited()
+        mgr.give_up.assert_not_awaited()
+        assert stats["reaped"] == 0
+
+    @pytest.mark.asyncio
+    async def test_uncharged_open_purge_uses_original_signed_controller_path(
+        self, monkeypatch
+    ):
+        from uuid import uuid4
+
+        import orchestrator.services.vm_workspace_recovery_store as recovery
+
+        owner, generation, vm_uid, pvc_uid = (uuid4() for _ in range(4))
+        store = MagicMock()
+        store.has_open_lifecycle_vm_delete = AsyncMock(return_value=True)
+        store.resume_open_lifecycle_vm_delete = AsyncMock(
+            return_value=CleanupPermit(allowed=True, admission_id=uuid4())
+        )
+        mgr, provisioner, _, _, _ = _make_manager(workspace_recovery_store=store)
+        identity = VMTeardownIdentity(str(generation), str(vm_uid), str(pvc_uid))
+        provisioner.capture_vm_teardown_identity.return_value = identity
+        monkeypatch.setattr(
+            recovery, "prepare_vm_cleanup_resource", AsyncMock(return_value=None)
+        )
+        complete = AsyncMock()
+        monkeypatch.setattr(recovery, "complete_vm_cleanup_permit", complete)
+        inst = Instance(
+            kind="vm",
+            id=f"agent-vm-{owner}",
+            bound_to=str(owner),
+            metadata={"scope": "job", "execution_lane": "pinned"},
+        )
+
+        assert await mgr.resume_pending_cleanup(inst) == "completed"
+
+        args = provisioner.release_vm_captured.await_args
+        assert args.args == (str(owner), identity)
+        assert args.kwargs["purge_disk"] is True
+        assert args.kwargs["entity_type"] == "job"
+        assert args.kwargs["capture_snapshot"] is False
+        assert args.kwargs["parent_cleanup"]["admission_id"] == str(
+            store.resume_open_lifecycle_vm_delete.return_value.admission_id
+        )
+        complete.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_reaper_completes_open_purge_before_dirty_give_up(self, monkeypatch):
+        from uuid import uuid4
+
+        import orchestrator.services.vm_workspace_recovery_store as recovery
+
+        owner, generation, vm_uid, pvc_uid = (uuid4() for _ in range(4))
+        store = MagicMock()
+        store.has_open_lifecycle_vm_delete = AsyncMock(return_value=True)
+        original = CleanupPermit(allowed=True, admission_id=uuid4())
+        store.resume_open_lifecycle_vm_delete = AsyncMock(return_value=original)
+        mgr, provisioner, _, _, _ = _make_manager(workspace_recovery_store=store)
+        provisioner.capture_vm_teardown_identity.return_value = VMTeardownIdentity(
+            str(generation), str(vm_uid), str(pvc_uid)
+        )
+        mgr.is_reapable = AsyncMock(return_value=True)
+        mgr.is_dirty = AsyncMock(return_value=True)
+        mgr.give_up = AsyncMock()
+        mgr.snapshot = AsyncMock()
+        prepare = AsyncMock(return_value=object())
+        complete = AsyncMock()
+        monkeypatch.setattr(recovery, "prepare_vm_cleanup_resource", prepare)
+        monkeypatch.setattr(recovery, "complete_vm_cleanup_permit", complete)
+        inst = Instance(
+            kind="vm",
+            id=f"agent-vm-{owner}",
+            bound_to=str(owner),
+            metadata={"scope": "job", "execution_lane": "pinned"},
+        )
+        stats = {"reaped": 0, "reap_forced": 0, "reap_attempts": 0}
+
+        await InstanceLifecycleReconciler([mgr])._reap(mgr, inst, stats)
+
+        mgr.is_dirty.assert_not_awaited()
+        mgr.give_up.assert_not_awaited()
+        provisioner.release_vm_captured.assert_awaited_once()
+        complete.assert_awaited_once()
+        assert stats["reaped"] == 1
+
+    @pytest.mark.asyncio
+    async def test_open_purge_without_stop_proof_holds_before_give_up(
+        self, monkeypatch
+    ):
+        from uuid import uuid4
+
+        import orchestrator.services.vm_workspace_recovery_store as recovery
+        from orchestrator.services.completion_lifecycle import (
+            LifecycleActionPermit,
+            LifecycleRouteDecision,
+        )
+        from shared.vm_resource_admission import ResourceAdmissionError
+
+        owner, generation, vm_uid, pvc_uid = (uuid4() for _ in range(4))
+        store = MagicMock()
+        store.has_open_lifecycle_vm_delete = AsyncMock(return_value=True)
+        store.resume_open_lifecycle_vm_delete = AsyncMock(
+            return_value=CleanupPermit(allowed=True, admission_id=uuid4())
+        )
+        mgr, provisioner, _, _, _ = _make_manager(workspace_recovery_store=store)
+        provisioner.capture_vm_teardown_identity.return_value = VMTeardownIdentity(
+            str(generation), str(vm_uid), str(pvc_uid)
+        )
+        mgr.is_reapable = AsyncMock(return_value=True)
+        mgr.is_dirty = AsyncMock(return_value=True)
+        mgr.give_up = AsyncMock()
+        monkeypatch.setattr(
+            recovery, "prepare_vm_cleanup_resource", AsyncMock(return_value=object())
+        )
+        monkeypatch.setattr(
+            recovery,
+            "complete_vm_cleanup_permit",
+            AsyncMock(
+                side_effect=ResourceAdmissionError("resource_cleanup_stop_unproven")
+            ),
+        )
+        inst = Instance(
+            kind="vm",
+            id=f"agent-vm-{owner}",
+            bound_to=str(owner),
+            metadata={"scope": "job", "execution_lane": "pinned"},
+        )
+        claim = LifecycleActionPermit(LifecycleRouteDecision(str(owner), "claimed"))
+        inst.metadata["_completion_lifecycle_permit"] = claim
+        stats = {"reaped": 0, "reap_forced": 0, "reap_attempts": 0}
+
+        await InstanceLifecycleReconciler([mgr])._reap(mgr, inst, stats)
+
+        mgr.is_dirty.assert_not_awaited()
+        mgr.give_up.assert_not_awaited()
+        provisioner.release_vm_captured.assert_awaited_once()
+        assert stats["reaped"] == stats["reap_forced"] == 0
+        assert not claim.completed and claim.skip_reason is None
+
+
 class TestReapOrphans:
     """A VM whose jobs/threads row is gone never surfaces as an Instance
     (list_instances reads FROM the rows), so only the backend inventory
@@ -1904,6 +2372,29 @@ class TestKeptDiskSweep:
         return mgr, provisioner, db
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "failure", [asyncpg.CheckViolationError, asyncpg.ConnectionDoesNotExistError]
+    )
+    async def test_settlement_failure_preserves_kept_disk_marker_until_exact_replay(
+        self, monkeypatch, failure
+    ):
+        import orchestrator.services.vm_workspace_recovery_store as recovery
+
+        mgr, provisioner, db = self._mgr_with_kept([{"id": "job-1"}])
+        settle = AsyncMock(side_effect=[failure("settlement refused"), None])
+        monkeypatch.setattr(recovery, "complete_vm_cleanup_permit", settle)
+
+        assert await mgr.purge_kept_disks() == 0
+        db.merge_vm_context.assert_not_awaited()
+        provisioner.release_vm_captured.assert_awaited_once()
+        assert await mgr.purge_kept_disks() == 1
+        db.merge_vm_context.assert_awaited_once_with("job-1", {"rootdisk": None})
+        assert settle.await_count == 2
+        assert {call.args[1].admission_id for call in settle.await_args_list} == {
+            "cleanup-1"
+        }
+
+    @pytest.mark.asyncio
     async def test_terminal_job_kept_disk_is_purged(self):
         mgr, provisioner, db = self._mgr_with_kept([{"id": "job-1"}])
 
@@ -1954,7 +2445,11 @@ class TestKeptDiskSweep:
         recovery_store.acquire_cleanup_permit.assert_awaited_once()
         provisioner.release_vm_captured.assert_not_awaited()
         db.merge_vm_context.assert_awaited_once_with("job-1", {"rootdisk": None})
-        recovery_store.complete_cleanup_permit.assert_not_awaited()
+        # Recheck durable admission authority even when the caller carries a
+        # completed hint; this acknowledges completion without another purge.
+        recovery_store.complete_cleanup_permit.assert_awaited_once_with(
+            "cleanup-1", outcome="completed"
+        )
 
     @pytest.mark.asyncio
     async def test_control_marker_blocks_kept_disk_destructive_recheck(self):

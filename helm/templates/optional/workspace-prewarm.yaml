@@ -60,6 +60,22 @@ spec:
             limits:
               cpu: "100m"
               memory: "64Mi"
+        {{- if .Values.connectors.inPodPlane.enabled }}
+        # The in-pod plane's supervisor image (rclone, ~35 MB) starts in every
+        # session Pod that mounts. The opener image is ~1 MB and has no
+        # shell to run a no-op with, so it is not warmed.
+        - name: pull-cloud-mount
+          image: {{ include "srw.imageRef" (dict "image" .Values.connectors.inPodPlane.rclone.image) | quote }}
+          imagePullPolicy: Always
+          command: ["true"]
+          resources:
+            requests:
+              cpu: "1m"
+              memory: "8Mi"
+            limits:
+              cpu: "100m"
+              memory: "64Mi"
+        {{- end }}
       containers:
         - name: pause
           image: {{ .Values.workspace.prewarm.pauseImage | default "registry.k8s.io/pause:3.10" | quote }}

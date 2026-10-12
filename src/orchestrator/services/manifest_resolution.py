@@ -10,10 +10,14 @@ from uuid import UUID, uuid4
 from fastapi import HTTPException
 
 from orchestrator.services.manifest_store import resource_key
+from orchestrator.services.project_connectors import datasource_binding
 from shared.manifests import API_VERSION, preview_documents, validate_documents
 from shared.manifests.resolution import content_revision
 from shared.manifests.validation import MAX_NODES, check_json_value
 
+REFERENCE_MISSING = (
+    "Referenced resource or requested immutable revision does not exist."
+)
 RESOURCE_MAPS = {
     "experts": "Expert",
     "workspaces": "WorkspaceTemplate",
@@ -31,6 +35,7 @@ class LiveManifestResolver:
         self.prepared = {}
         self.observed = {}
         self.secrets = {}
+        self.linked_connectors = {}
         self.expansion_budget = [MAX_NODES]
 
     async def scope(self, value, *, write=False):
@@ -114,6 +119,11 @@ class LiveManifestResolver:
         if row:
             await self.authority.resource(row, write=True)
             self.observe(row)
+            if row["kind"] == "Connector" and row.get("linked_id"):
+                # An edit of a datasource's Connector names that Connector's
+                # own secret; the store then refuses the edit itself, and the
+                # caller who could write it is let through to that refusal.
+                self.linked_connectors[key] = row
 
     def observe(self, row):
         self.observed[resource_key(row["document"])] = {
@@ -145,9 +155,12 @@ class LiveManifestResolver:
         target_scope = deepcopy(ref.get("scope", scope))
         # A saved Expert may have an explicit global/project grant while its
         # authored identity remains in its owner's Account scope. Resolve the
-        # identity first, then consult that domain grant in resource().
+        # identity first, then consult that domain grant in resource(). A
+        # datasource's Connector is shared the same way (public, or linked to
+        # a project), by the connector policy, in an Account or a Project.
+        connector = kind == "Connector" and target_scope["kind"] != "Catalog"
         if (
-            kind == "Expert"
+            kind in ("Expert", "Connector")
             and target_scope["kind"] == "Account"
             and target_scope["name"] not in ("me", "personal")
         ):
@@ -157,6 +170,11 @@ class LiveManifestResolver:
                 raise HTTPException(
                     422, "Live Account resource references require a UUID."
                 ) from None
+            ref["scope"] = target_scope
+        elif connector and target_scope["kind"] == "Project":
+            target_scope["name"] = self.project_aliases.get(
+                target_scope["name"], target_scope["name"]
+            )
             ref["scope"] = target_scope
         else:
             ref["scope"] = await self.scope(target_scope)
@@ -173,12 +191,23 @@ class LiveManifestResolver:
             kind, ref["scope"], ref["name"], revision=ref.get("revision")
         )
         if not row:
-            raise HTTPException(
-                422,
-                "Referenced resource or requested immutable revision does not exist.",
-            )
-        await self.authority.resource(row)
+            raise HTTPException(422, REFERENCE_MISSING)
+        try:
+            await self.authority.resource(row, reference=connector)
+        except HTTPException as exc:
+            # A Connector the caller may not see answers as one that does not
+            # exist: a ref is never a probe for someone else's connectors.
+            if not connector or exc.status_code != 403:
+                raise
+            raise HTTPException(422, REFERENCE_MISSING) from None
         self.observe(row)
+        if kind == "Connector" and row.get("linked_id"):
+            # A datasource's Connector binds as its datasource, the form the
+            # SRW snapshot records: re-authorized by the connector policy
+            # wherever work uses it, never frozen as a dependency (decision
+            # 12: deleting it never waits for work), its credentials the
+            # datasource's, delivered under that policy.
+            return datasource_binding(row["linked_id"])
         await self.authorize_dependencies(row["dependencies"])
         dependencies.append(
             {
@@ -190,19 +219,29 @@ class LiveManifestResolver:
         )
         dependencies.extend(deepcopy(row["dependencies"]))
         # Recheck credential scope/key existence today, even for an old revision.
+        # (A datasource's Connector returned above: its secret is never read
+        # here, only by its delivery, under the connector policy.)
         return {
             "inline": await self.spec(
                 kind, deepcopy(row["resolved"]["spec"]), ref["scope"], dependencies
             )
         }
 
-    async def secret_values(self, values, scope):
+    async def secret_values(
+        self, values, scope, *, connector=None, project_ids=(), edit=False
+    ):
         for value in values.values():
             if not isinstance(value, dict) or "secretRef" not in value:
                 continue
             ref = value["secretRef"]
-            ref["scope"] = await self.scope(ref.get("scope", scope))
-            await self.authority.secret(ref["scope"])
+            if connector is None:
+                ref["scope"] = await self.scope(ref.get("scope", scope))
+                await self.authority.secret(ref["scope"], name=ref["name"])
+            else:
+                ref["scope"] = deepcopy(ref.get("scope", scope))
+                await self.authority.connector_secret(
+                    ref, connector, project_ids=project_ids, edit=edit
+                )
             row = await self.store.db.fetchrow(
                 "SELECT id,version,keys FROM srw_resource_secrets WHERE scope_kind=$1 AND scope_name=$2 AND name=$3",
                 ref["scope"]["kind"],
@@ -246,11 +285,28 @@ class LiveManifestResolver:
         dependencies.extend(deepcopy(active["dependencies"]))
         return deepcopy(active["resolved"]["spec"])
 
-    async def spec(self, kind, spec, scope, dependencies, *, project_id=None):
+    async def spec(
+        self,
+        kind,
+        spec,
+        scope,
+        dependencies,
+        *,
+        project_id=None,
+        connector=None,
+        project_ids=(),
+        edit=False,
+    ):
         if kind == "Expert":
             await self.secret_values(spec["runtime"].get("env", {}), scope)
         elif kind == "Connector":
-            await self.secret_values(spec.get("credentials", {}), scope)
+            await self.secret_values(
+                spec.get("credentials", {}),
+                scope,
+                connector=connector,
+                project_ids=project_ids,
+                edit=edit,
+            )
         elif kind == "WorkspaceTemplate":
             if "network" in spec:
                 ref = spec["network"]["profileRef"]
@@ -278,17 +334,13 @@ class LiveManifestResolver:
             if project:
                 defaults = project.get("defaults", {})
                 resources = project["resources"]
+                # defaults.workspace is not copied: an omitted workspace
+                # resolves the workspace defaults chain at admission.
                 for field, value in defaults.items():
                     if field in execution:
                         continue
                     if field == "expert":
                         execution[field] = deepcopy(resources["experts"][value])
-                    elif field == "workspace":
-                        execution[field] = (
-                            {"template": deepcopy(resources["workspaces"][value])}
-                            if value is not None
-                            else None
-                        )
                     elif field == "connectors":
                         execution[field] = {
                             alias: deepcopy(resources["connectors"][alias])
@@ -302,7 +354,7 @@ class LiveManifestResolver:
             execution["expert"] = await self.selection(
                 "Expert", execution["expert"], scope, dependencies
             )
-            workspace = execution.setdefault("workspace", None)
+            workspace = execution.get("workspace")
             if workspace and "template" in workspace:
                 workspace["template"] = await self.selection(
                     "WorkspaceTemplate", workspace["template"], scope, dependencies
@@ -358,12 +410,16 @@ class LiveManifestResolver:
             else None
         )
         resolved = deepcopy(doc)
+        scope = doc["metadata"]["scope"]
         resolved["spec"] = await self.spec(
             doc["kind"],
             deepcopy(doc["spec"]),
-            doc["metadata"]["scope"],
+            scope,
             dependencies,
             project_id=project_id,
+            connector=self.linked_connectors.get(key),
+            project_ids=[scope["name"]] if scope["kind"] == "Project" else [],
+            edit=key in self.linked_connectors,
         )
         result = {
             "document": deepcopy(doc),

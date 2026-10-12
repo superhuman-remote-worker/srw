@@ -2,12 +2,17 @@
 
 from __future__ import annotations
 
+from agent.api import session_contract
+from agent.api import session_attach
+from agent.api import session_workspace
 import copy
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 from uuid import UUID
 
 import pytest
+
+from tests._session_termination_adapter import termination_target
 
 from agent.api import persistent_app
 
@@ -115,12 +120,12 @@ def _normalized_ready(payload: dict | None = None) -> dict:
     ],
 )
 def test_ordinary_workspace_shapes_remain_ordinary(payload):
-    assert persistent_app._protected_workspace_delivery(payload) == "off"
+    assert session_workspace.protected_workspace_delivery(payload) == "off"
 
 
 def test_protected_refusal_is_a_workspace_not_ready_failure():
     assert issubclass(
-        persistent_app.ProtectedCloudUnavailable,
+        session_contract.ProtectedCloudUnavailable,
         persistent_app.WorkspaceNotReady,
     )
 
@@ -130,8 +135,8 @@ def test_every_present_non_boolean_marker_fails_closed(marker):
     payload = _ready_payload()
     payload["protected_cloud"] = marker
 
-    with pytest.raises(persistent_app.ProtectedCloudUnavailable):
-        persistent_app._protected_workspace_delivery(payload)
+    with pytest.raises(session_contract.ProtectedCloudUnavailable):
+        session_workspace.protected_workspace_delivery(payload)
 
 
 @pytest.mark.parametrize("protected_value", [True, 1, "true", None, {}])
@@ -141,8 +146,8 @@ def test_off_marker_rejects_non_exact_false_protected_mount_flag(protected_value
         "cloud_mount": {"protected": protected_value, "mounts": []},
     }
 
-    with pytest.raises(persistent_app.ProtectedCloudUnavailable):
-        persistent_app._protected_workspace_delivery(payload)
+    with pytest.raises(session_contract.ProtectedCloudUnavailable):
+        session_workspace.protected_workspace_delivery(payload)
 
 
 @pytest.mark.parametrize(
@@ -156,8 +161,8 @@ def test_off_marker_rejects_non_exact_false_protected_mount_flag(protected_value
     ],
 )
 def test_off_marker_rejects_every_other_protected_only_mount_shape(mount):
-    with pytest.raises(persistent_app.ProtectedCloudUnavailable):
-        persistent_app._protected_workspace_delivery(
+    with pytest.raises(session_contract.ProtectedCloudUnavailable):
+        session_workspace.protected_workspace_delivery(
             {"protected_cloud": False, "cloud_mount": mount}
         )
 
@@ -169,7 +174,7 @@ def test_engaging_response_is_coordinate_free_and_retryable():
         "protected_cloud_error_code": None,
         "status": "creating",
     }
-    assert persistent_app._protected_workspace_delivery(payload) == "engaging"
+    assert session_workspace.protected_workspace_delivery(payload) == "engaging"
 
 
 @pytest.mark.parametrize(
@@ -188,6 +193,7 @@ def test_engaging_response_is_coordinate_free_and_retryable():
         "workspace_ssh_host_key_fingerprint",
         "git_remote_url",
         "managed_repository_credentials",
+        "workspace_ssh_identities",
         "repositories",
         "resolved_config",
         "config_override",
@@ -210,8 +216,8 @@ def test_non_ready_response_rejects_each_coordinate_or_credential(field, state, 
         field: "secret-sentinel",
     }
 
-    with pytest.raises(persistent_app.ProtectedCloudUnavailable) as exc:
-        persistent_app._protected_workspace_delivery(payload)
+    with pytest.raises(session_contract.ProtectedCloudUnavailable) as exc:
+        session_workspace.protected_workspace_delivery(payload)
     assert "secret-sentinel" not in str(exc.value)
 
 
@@ -230,8 +236,8 @@ def test_inconsistent_protected_state_and_workspace_status_fail(state, status):
     payload["protected_cloud_state"] = state
     payload["status"] = status
 
-    with pytest.raises(persistent_app.ProtectedCloudUnavailable):
-        persistent_app._protected_workspace_delivery(payload)
+    with pytest.raises(session_contract.ProtectedCloudUnavailable):
+        session_workspace.protected_workspace_delivery(payload)
 
 
 def test_failed_error_code_is_allowlisted_and_secret_never_reflected():
@@ -242,14 +248,14 @@ def test_failed_error_code_is_allowlisted_and_secret_never_reflected():
         "status": "failed",
     }
 
-    with pytest.raises(persistent_app.ProtectedCloudUnavailable) as exc:
-        persistent_app._protected_workspace_delivery(payload)
+    with pytest.raises(session_contract.ProtectedCloudUnavailable) as exc:
+        session_workspace.protected_workspace_delivery(payload)
     assert "secret-sentinel" not in str(exc.value)
     assert "engage_failed" in str(exc.value)
 
 
 def test_exact_ready_contract_is_accepted():
-    assert persistent_app._protected_workspace_delivery(_ready_payload()) == "ready"
+    assert session_workspace.protected_workspace_delivery(_ready_payload()) == "ready"
 
 
 @pytest.mark.parametrize(
@@ -271,8 +277,8 @@ def test_ready_contract_requires_exact_workspace_and_runtime_identity(field, val
     payload = _ready_payload()
     payload[field] = value
 
-    with pytest.raises(persistent_app.ProtectedCloudUnavailable):
-        persistent_app._protected_workspace_delivery(payload)
+    with pytest.raises(session_contract.ProtectedCloudUnavailable):
+        session_workspace.protected_workspace_delivery(payload)
 
 
 def test_ready_remote_must_match_attested_pod_tuple_exactly():
@@ -285,7 +291,7 @@ def test_ready_remote_must_match_attested_pod_tuple_exactly():
         "key_path": payload["ssh_key_path"],
         "workspace_path": "/home/agent-host/workspace",
     }
-    assert persistent_app._protected_workspace_delivery(payload) == "ready"
+    assert session_workspace.protected_workspace_delivery(payload) == "ready"
 
     for field, value in (
         ("host", "10.42.0.99"),
@@ -296,8 +302,8 @@ def test_ready_remote_must_match_attested_pod_tuple_exactly():
     ):
         changed = copy.deepcopy(payload)
         changed["remote"][field] = value
-        with pytest.raises(persistent_app.ProtectedCloudUnavailable):
-            persistent_app._protected_workspace_delivery(changed)
+        with pytest.raises(session_contract.ProtectedCloudUnavailable):
+            session_workspace.protected_workspace_delivery(changed)
 
 
 @pytest.mark.asyncio
@@ -312,16 +318,17 @@ async def test_workspace_poll_waits_for_engage_then_preserves_ready_contract():
         get_thread_workspace=AsyncMock(side_effect=[engaging, _ready_payload()])
     )
 
-    normalized = await persistent_app._poll_workspace_ready(
+    normalized = await session_workspace.poll_workspace_ready(
         client,
         "thread-protected",
         timeout=1,
         poll_interval=0,
         raise_on_denied=True,
+        session_runtime_generation=None,
     )
 
     assert normalized is not None
-    assert persistent_app._protected_workspace_delivery(normalized) == "ready"
+    assert session_workspace.protected_workspace_delivery(normalized) == "ready"
     assert normalized["status"] == "ready"
     assert normalized["pod_ip"] == "10.42.0.10"
     assert normalized["remote"]["host"] == "10.42.0.10"
@@ -342,14 +349,15 @@ async def test_workspace_poll_treats_failed_engage_as_terminal_without_construct
     )
 
     with pytest.raises(
-        persistent_app.ProtectedCloudUnavailable, match="engage_refused"
+        session_contract.ProtectedCloudUnavailable, match="engage_refused"
     ):
-        await persistent_app._poll_workspace_ready(
+        await session_workspace.poll_workspace_ready(
             client,
             "thread-protected",
             timeout=1,
             poll_interval=0,
             raise_on_denied=True,
+            session_runtime_generation=None,
         )
     assert client.get_thread_workspace.await_count == 1
 
@@ -378,16 +386,16 @@ def test_ready_contract_rejects_unsupported_or_malformed_backend_shapes(path, va
     payload = _ready_payload()
     _set_path(payload, path, value)
 
-    with pytest.raises(persistent_app.ProtectedCloudUnavailable):
-        persistent_app._protected_workspace_delivery(payload)
+    with pytest.raises(session_contract.ProtectedCloudUnavailable):
+        session_workspace.protected_workspace_delivery(payload)
 
 
 def test_ready_contract_requires_at_least_one_exact_sandbox_declaration():
     payload = _ready_payload()
     payload.pop("backend")
 
-    with pytest.raises(persistent_app.ProtectedCloudUnavailable):
-        persistent_app._protected_workspace_delivery(payload)
+    with pytest.raises(session_contract.ProtectedCloudUnavailable):
+        session_workspace.protected_workspace_delivery(payload)
 
 
 @pytest.mark.parametrize(
@@ -397,8 +405,8 @@ def test_ready_contract_rejects_legacy_live_write_surfaces(field, value):
     payload = _ready_payload()
     payload[field] = value
 
-    with pytest.raises(persistent_app.ProtectedCloudUnavailable):
-        persistent_app._protected_workspace_delivery(payload)
+    with pytest.raises(session_contract.ProtectedCloudUnavailable):
+        session_workspace.protected_workspace_delivery(payload)
 
 
 @pytest.mark.parametrize(
@@ -437,8 +445,8 @@ def test_each_mount_field_that_drives_mount_or_cleanup_is_exact(path, value):
     _set_path(mount, path, value)
     payload["cloud_mount"] = mount
 
-    with pytest.raises(persistent_app.ProtectedCloudUnavailable):
-        persistent_app._protected_workspace_delivery(payload)
+    with pytest.raises(session_contract.ProtectedCloudUnavailable):
+        session_workspace.protected_workspace_delivery(payload)
 
 
 def test_protected_mount_rejects_a_second_live_cloud_surface():
@@ -453,8 +461,8 @@ def test_protected_mount_rejects_a_second_live_cloud_surface():
         }
     )
 
-    with pytest.raises(persistent_app.ProtectedCloudUnavailable):
-        persistent_app._protected_workspace_delivery(payload)
+    with pytest.raises(session_contract.ProtectedCloudUnavailable):
+        session_workspace.protected_workspace_delivery(payload)
 
 
 @pytest.mark.asyncio
@@ -488,25 +496,25 @@ async def test_mixed_off_marker_aborts_before_session_or_manager_construction(
     monkeypatch.setattr(persistent_app, "_agent", fake_agent)
     monkeypatch.setattr(persistent_app, "_orchestrator_client", client)
     monkeypatch.setattr(persistent_app, "_session", None)
-    monkeypatch.setattr(persistent_app, "_thread_id", None)
+    monkeypatch.setattr(persistent_app._session_identity, "_thread_id", None)
 
     with (
         patch.object(
-            persistent_app,
-            "_poll_workspace_ready",
+            session_workspace,
+            "poll_workspace_ready",
             new=AsyncMock(return_value=payload),
         ),
         patch.object(persistent_app, "PersistentSession", session_constructor),
     ):
-        with pytest.raises(persistent_app.ProtectedCloudUnavailable):
-            await persistent_app._attach_session(
+        with pytest.raises(session_contract.ProtectedCloudUnavailable):
+            await persistent_app._session_attach.attach(
                 "thread-mixed",
                 config_override={"workspace": {"backend": "sandbox"}},
             )
 
     session_constructor.assert_not_called()
     assert persistent_app._session is None
-    assert persistent_app._thread_id is None
+    assert persistent_app._session_identity.thread_id is None
 
 
 def _runtime_client(workspace_responses: list[dict]):
@@ -569,22 +577,28 @@ async def test_dedicated_attach_initial_engaging_polls_to_ready(monkeypatch):
         ("_agent", fake_agent),
         ("_orchestrator_client", client),
         ("_session", None),
-        ("_thread_id", None),
         ("_event_writer", None),
-        ("_loop_user_queue", None),
-        ("_loop_interrupt_flag", None),
-        ("_loop_interrupt_target_turn_id", None),
-        ("_hard_interrupt_event", None),
-        ("_input_runtime_generation", None),
-        ("_session_runtime_generation", None),
-        ("_session_runtime_attach_token", None),
         ("_session_side_tasks", set()),
     ):
-        monkeypatch.setattr(persistent_app, name, value)
+        monkeypatch.setattr(*termination_target(persistent_app, name), value)
+    for name in (
+        "_thread_id",
+        "_process_generation",
+        "_session_generation",
+        "_attach_token",
+    ):
+        monkeypatch.setattr(persistent_app._session_identity, name, None)
+    for name in (
+        "_queue",
+        "_interrupt_mode",
+        "_interrupt_target_turn_id",
+        "_hard_interrupt_event",
+    ):
+        monkeypatch.setattr(persistent_app._session_input, name, None)
 
     with (
         patch.object(persistent_app, "PersistentSession", constructor),
-        patch.object(persistent_app, "_apply_session_embedding_env"),
+        patch.object(session_attach, "apply_session_embedding_env"),
         patch.object(persistent_app, "_wire_session_aux_archiver"),
         patch.object(persistent_app, "_restore_session_messages", new=AsyncMock()),
         patch.object(
@@ -592,8 +606,8 @@ async def test_dedicated_attach_initial_engaging_polls_to_ready(monkeypatch):
             "_update_thread_status",
             new=AsyncMock(return_value=True),
         ) as update_status,
-        patch.object(persistent_app, "_reclaim_pending_pinned_inputs", new=AsyncMock()),
-        patch.object(persistent_app, "_start_watchdogs"),
+        patch.object(persistent_app._session_input, "reclaim_pending", new=AsyncMock()),
+        patch.object(persistent_app._session_termination, "start_watchdogs"),
         patch.object(persistent_app, "_officer_cfg", return_value=None),
         patch.object(persistent_app, "_broadcast"),
         patch("agent.tools.registry.register_mcp_tools"),
@@ -602,7 +616,7 @@ async def test_dedicated_attach_initial_engaging_polls_to_ready(monkeypatch):
             return_value=[],
         ),
     ):
-        await persistent_app._attach_session(
+        await persistent_app._session_attach.attach(
             "thread-protected",
             pinned_runtime_generation_contract=1,
             session_runtime_generation=client.session_runtime_generation,
@@ -621,8 +635,11 @@ async def test_dedicated_attach_initial_engaging_polls_to_ready(monkeypatch):
     )
     update_status.assert_awaited_once_with("active")
     assert persistent_app._session is session
-    assert UUID(str(persistent_app._input_runtime_generation))
-    assert persistent_app._input_runtime_generation != client.session_runtime_generation
+    assert UUID(str(persistent_app._session_identity.process_generation))
+    assert (
+        persistent_app._session_identity.process_generation
+        != client.session_runtime_generation
+    )
 
     # This is a successful live attach, so invoking the delivered-attach abort
     # protocol here would now (correctly) require a real workspace process-zero
@@ -633,25 +650,25 @@ async def test_dedicated_attach_initial_engaging_polls_to_ready(monkeypatch):
 def test_strict_pinned_input_identity_keeps_process_generation_separate(monkeypatch):
     client = _runtime_client([])
     monkeypatch.setattr(persistent_app, "_orchestrator_client", client)
-    monkeypatch.setattr(persistent_app, "_pinned_runtime_generation_enabled", True)
+    monkeypatch.setattr(persistent_app._session_identity, "_runtime_contract", True)
     monkeypatch.setattr(
-        persistent_app,
-        "_session_runtime_generation",
+        persistent_app._session_identity,
+        "_session_generation",
         client.session_runtime_generation,
     )
     monkeypatch.setattr(
-        persistent_app,
-        "_session_runtime_attach_token",
+        persistent_app._session_identity,
+        "_attach_token",
         client.session_runtime_attach_token,
     )
     monkeypatch.setattr(
-        persistent_app,
-        "_input_runtime_generation",
+        persistent_app._session_identity,
+        "_process_generation",
         "ffffffff-ffff-4fff-8fff-ffffffffffff",
     )
     monkeypatch.setenv("POD_UID", "pod-uid")
 
-    assert persistent_app._pinned_input_runtime_identity() == (
+    assert persistent_app._session_input.pinned_identity() == (
         client.agent_id,
         "pod-uid",
         "ffffffff-ffff-4fff-8fff-ffffffffffff",
@@ -673,28 +690,26 @@ async def test_dedicated_attach_initial_engaging_timeout_fails_closed(monkeypatc
     poll = AsyncMock(return_value=None)
     monkeypatch.setattr(persistent_app, "_orchestrator_client", client)
     monkeypatch.setattr(persistent_app, "_session", None)
-    monkeypatch.setattr(persistent_app, "_thread_id", None)
+    monkeypatch.setattr(persistent_app._session_identity, "_thread_id", None)
     monkeypatch.setattr(persistent_app, "_event_writer", None)
-    monkeypatch.setattr(persistent_app, "_session_runtime_generation", None)
-    monkeypatch.setattr(persistent_app, "_session_runtime_attach_token", None)
-    monkeypatch.setattr(persistent_app, "_failed_attach_release_receipt", None)
-    monkeypatch.setattr(
-        persistent_app, "_failed_attach_workspace_cleanup_context", None
-    )
+    monkeypatch.setattr(persistent_app._session_identity, "_session_generation", None)
+    monkeypatch.setattr(persistent_app._session_identity, "_attach_token", None)
+    monkeypatch.setattr(persistent_app._session_attach, "_release_receipt", None)
+    monkeypatch.setattr(persistent_app._session_attach, "_cleanup_context", None)
     # A real delivered runtime always has this Kubernetes identity. It is part
     # of the exact pre-setup abort receipt, so omitting it would correctly keep
     # the new cleanup owner retrying instead of returning the original timeout.
     monkeypatch.setenv("POD_UID", "pod-uid-protected-timeout")
 
     with (
-        patch.object(persistent_app, "_poll_workspace_ready", new=poll),
+        patch.object(session_workspace, "poll_workspace_ready", new=poll),
         patch.object(persistent_app, "PersistentSession", constructor),
     ):
         with pytest.raises(
             persistent_app.WorkspaceNotReady,
             match="No workspace container provisioned",
         ):
-            await persistent_app._attach_session(
+            await persistent_app._session_attach.attach(
                 "thread-protected",
                 pinned_runtime_generation_contract=1,
                 session_runtime_generation=client.session_runtime_generation,
@@ -704,7 +719,11 @@ async def test_dedicated_attach_initial_engaging_timeout_fails_closed(monkeypatc
     poll.assert_awaited_once()
     constructor.assert_not_called()
     assert persistent_app._session is None
-    assert persistent_app._thread_id is None
+    # The unconfirmed release still owns this exact life. Clearing identity
+    # here would strand its retry and stop valid booting/ready heartbeats.
+    assert persistent_app._session_identity.thread_id == "thread-protected"
+    assert persistent_app._session_attach._release_receipt is not None
+    client.clear_session_runtime_identity.assert_not_called()
 
 
 def test_advertised_pinned_runtime_contract_requires_exact_attach_token(monkeypatch):
@@ -712,21 +731,21 @@ def test_advertised_pinned_runtime_contract_requires_exact_attach_token(monkeypa
     client = _runtime_client([])
     client.session_runtime_attach_token = None
     monkeypatch.setattr(persistent_app, "_orchestrator_client", client)
-    monkeypatch.setattr(persistent_app, "_session_runtime_generation", None)
-    monkeypatch.setattr(persistent_app, "_session_runtime_attach_token", None)
+    monkeypatch.setattr(persistent_app._session_identity, "_session_generation", None)
+    monkeypatch.setattr(persistent_app._session_identity, "_attach_token", None)
 
     with pytest.raises(
         persistent_app.WorkspaceNotReady,
         match="generation or attach token",
     ):
-        persistent_app._adopt_attached_runtime_identity(
+        persistent_app._session_identity.adopt(
             client.session_runtime_generation,
             None,
             contract_advertised=True,
         )
 
-    assert persistent_app._session_runtime_generation is None
-    assert persistent_app._session_runtime_attach_token is None
+    assert persistent_app._session_identity.session_generation is None
+    assert persistent_app._session_identity.attach_token is None
 
 
 def test_stateless_claim_uses_generation_without_pinned_attach_token(monkeypatch):
@@ -734,19 +753,20 @@ def test_stateless_claim_uses_generation_without_pinned_attach_token(monkeypatch
     client = _runtime_client([])
     client.session_runtime_attach_token = None
     monkeypatch.setattr(persistent_app, "_orchestrator_client", client)
-    monkeypatch.setattr(persistent_app, "_session_runtime_generation", None)
-    monkeypatch.setattr(persistent_app, "_session_runtime_attach_token", None)
+    monkeypatch.setattr(persistent_app._session_identity, "_session_generation", None)
+    monkeypatch.setattr(persistent_app._session_identity, "_attach_token", None)
 
-    persistent_app._adopt_attached_runtime_identity(
+    persistent_app._session_identity.adopt(
         client.session_runtime_generation,
         None,
         contract_advertised=True,
     )
 
     assert (
-        persistent_app._session_runtime_generation == client.session_runtime_generation
+        persistent_app._session_identity.session_generation
+        == client.session_runtime_generation
     )
-    assert persistent_app._session_runtime_attach_token is None
+    assert persistent_app._session_identity.attach_token is None
 
 
 @pytest.mark.asyncio
@@ -770,26 +790,24 @@ async def test_workspace_identity_change_before_constructor_fails_closed(monkeyp
     monkeypatch.setattr(persistent_app, "_agent", fake_agent)
     monkeypatch.setattr(persistent_app, "_orchestrator_client", client)
     monkeypatch.setattr(persistent_app, "_session", None)
-    monkeypatch.setattr(persistent_app, "_thread_id", None)
-    monkeypatch.setattr(persistent_app, "_failed_attach_release_receipt", None)
-    monkeypatch.setattr(
-        persistent_app, "_failed_attach_workspace_cleanup_context", None
-    )
+    monkeypatch.setattr(persistent_app._session_identity, "_thread_id", None)
+    monkeypatch.setattr(persistent_app._session_attach, "_release_receipt", None)
+    monkeypatch.setattr(persistent_app._session_attach, "_cleanup_context", None)
     monkeypatch.setenv("POD_UID", "pod-uid-identity-before")
 
     with (
         patch.object(
-            persistent_app,
-            "_poll_workspace_ready",
+            session_workspace,
+            "poll_workspace_ready",
             new=AsyncMock(return_value=initial),
         ),
         patch.object(persistent_app, "PersistentSession", constructor),
     ):
         with pytest.raises(
-            persistent_app.ProtectedCloudUnavailable,
+            session_contract.ProtectedCloudUnavailable,
             match="identity changed before setup",
         ):
-            await persistent_app._attach_session(
+            await persistent_app._session_attach.attach(
                 "thread-protected",
                 config_override={"workspace": {"backend": "sandbox"}},
                 pinned_runtime_generation_contract=1,
@@ -835,17 +853,15 @@ async def test_workspace_identity_change_during_setup_rolls_back(monkeypatch):
     monkeypatch.setattr(persistent_app, "_agent", fake_agent)
     monkeypatch.setattr(persistent_app, "_orchestrator_client", client)
     monkeypatch.setattr(persistent_app, "_session", None)
-    monkeypatch.setattr(persistent_app, "_thread_id", None)
-    monkeypatch.setattr(persistent_app, "_failed_attach_release_receipt", None)
-    monkeypatch.setattr(
-        persistent_app, "_failed_attach_workspace_cleanup_context", None
-    )
+    monkeypatch.setattr(persistent_app._session_identity, "_thread_id", None)
+    monkeypatch.setattr(persistent_app._session_attach, "_release_receipt", None)
+    monkeypatch.setattr(persistent_app._session_attach, "_cleanup_context", None)
     monkeypatch.setenv("POD_UID", "pod-uid-identity-during")
 
     with (
         patch.object(
-            persistent_app,
-            "_poll_workspace_ready",
+            session_workspace,
+            "poll_workspace_ready",
             new=AsyncMock(return_value=initial),
         ),
         patch.object(persistent_app, "PersistentSession", constructor),
@@ -861,10 +877,10 @@ async def test_workspace_identity_change_during_setup_rolls_back(monkeypatch):
         patch("shared.runtime.core.loader.create_llm", return_value=object()),
     ):
         with pytest.raises(
-            persistent_app.ProtectedCloudUnavailable,
+            session_contract.ProtectedCloudUnavailable,
             match="authority changed during setup",
         ):
-            await persistent_app._attach_session(
+            await persistent_app._session_attach.attach(
                 "thread-protected",
                 resolved_config={"agent": {}},
                 pinned_runtime_generation_contract=1,

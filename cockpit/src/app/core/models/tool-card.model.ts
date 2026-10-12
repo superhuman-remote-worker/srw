@@ -1,3 +1,4 @@
+import type {BadgeTone} from '../../ui/badge/badge.component';
 import {DiffLine} from '../util/line-diff';
 
 /**
@@ -12,6 +13,20 @@ import {DiffLine} from '../util/line-diff';
  */
 
 export type ToolCardStatus = 'pending' | 'running' | 'ok' | 'error' | 'denied' | 'expired';
+
+/**
+ * An outcome the six {@link ToolCardStatus} values cannot state, shown in the
+ * card's status pill in their place. Today only a lone `delegate_agent` call
+ * whose result a delegation-batch recovery wrote: interrupted, not started,
+ * cancelled — with the label and tone the same call has as a batch-card row
+ * (`recoveredDelegateCallOutcome` in `delegate-batch.model.ts`). `status`
+ * stays the call's own, so everything else about the card is unchanged.
+ */
+export interface ToolCardOutcome {
+    /** Transloco key of the pill label. */
+    readonly labelKey: string;
+    readonly tone: BadgeTone;
+}
 
 /** How a result/param body should be presented. */
 export type ToolResultKind =
@@ -126,6 +141,14 @@ export const SLEEP_TOOL = 'sleep';
  */
 export const JOB_TOOL = 'create_job';
 
+/**
+ * The session tool that runs a roster subagent. Two or more calls carried by
+ * one assistant message are a fan-out and group into a `delegate_batch` — see
+ * `groupEvents` in `core/models/turn.model.ts`. A lone call keeps the ordinary
+ * card and folds like any other finished tool call.
+ */
+export const DELEGATE_TOOL = 'delegate_agent';
+
 export type NotifyUrgency = 'log' | 'digest' | 'page';
 
 /**
@@ -159,6 +182,8 @@ export interface ToolCardView {
     /** Short, single-line, ellipsized collapsed-row hint. May be empty. */
     subtitle?: string;
     status: ToolCardStatus;
+    /** Replaces the pill's status label and tone when set; see {@link ToolCardOutcome}. */
+    outcome?: ToolCardOutcome;
     params: ToolParam[];
     result?: ToolResult;
     details: ToolDetail[];

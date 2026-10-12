@@ -88,8 +88,10 @@ def merged_session_tool_groups(
     - ``base_defaults`` (``_resolve_session_account_defaults``) emits only
       ``llm``/``auxiliary``/``interactive``/``headless``/``workspace``, and
       the settings matrix its model choice feeds
-      (``src/core/loader._apply_settings_matrix``) writes only ``llm``,
-      ``limits`` and ``shell.mode``. Saves 2 round trips.
+      (``shared.runtime.core.loader._apply_settings_matrix``) writes only
+      ``llm``, ``limits``, ``shell.mode`` and the family's session cap
+      (``delegation.family_session_max_concurrent``, never a tool gate).
+      Saves 2 round trips.
     - ``_seed_registry_model_overrides`` only ``setdefault``s ``llm.*``.
     - ``skills`` is written to the returned blob AFTER ``resolve_config`` takes
       the ``capture`` deepcopy, so it cannot appear in the merged fragment.

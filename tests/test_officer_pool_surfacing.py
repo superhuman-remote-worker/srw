@@ -501,10 +501,14 @@ class TestReadyDepth:
 class TestPrecedenceLaw:
     """§6: the slot's category decides the contract; a mismatch is named."""
 
-    def _main(self):
-        import orchestrator.main
+    def _compose(self, *args, **kwargs):
+        # The officer admission service owns the kickoff composition (the
+        # former ``main._compose_category_kickoff`` was a re-export of it).
+        from orchestrator.services.job_admission_officer import (
+            compose_category_kickoff,
+        )
 
-        return orchestrator.main
+        return compose_category_kickoff(*args, **kwargs)
 
     def test_a_pool_slot_resolves_its_category(self):
         assert officer_slot_category(META, "researchers") == "researcher"
@@ -516,24 +520,19 @@ class TestPrecedenceLaw:
         assert officer_slot_category(META, None) is None
 
     def test_the_contract_leads_and_the_officer_brief_follows(self):
-        main = self._main()
-        text = main._compose_category_kickoff("researcher", "Work ticket feature-a.")
+        text = self._compose("researcher", "Work ticket feature-a.")
         assert text.startswith("Your deliverable is an ANSWER")
         assert text.rstrip().endswith("Work ticket feature-a.")
 
     def test_a_matching_category_adds_no_noise(self):
-        main = self._main()
-        text = main._compose_category_kickoff(
-            "researcher", "brief", requested_category="researcher"
-        )
+        text = self._compose("researcher", "brief", requested_category="researcher")
         assert "NOTE:" not in text
 
     def test_a_cross_category_dispatch_is_named_not_refused(self):
         # Warn-not-forbid. The worker must never read an executor's delivery
         # contract while sitting in a researcher slot with no way to tell which
         # one the officer meant.
-        main = self._main()
-        text = main._compose_category_kickoff(
+        text = self._compose(
             "researcher",
             "brief",
             requested_category="executor",
@@ -545,8 +544,7 @@ class TestPrecedenceLaw:
         assert "say so in your completion report" in text
 
     def test_no_kickoff_still_yields_the_contract(self):
-        main = self._main()
-        assert "ANSWER" in main._compose_category_kickoff("researcher", None)
+        assert "ANSWER" in self._compose("researcher", None)
 
 
 class TestBacklogDoctrineMatchesTheMachinery:

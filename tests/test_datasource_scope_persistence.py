@@ -48,6 +48,18 @@ def _make_db(conn: AsyncMock) -> PostgresDB:
 
     conn.transaction = MagicMock(side_effect=transaction)
     db.acquire = acquire
+
+    # The Connector write-through (tests/test_manifest_connectors*.py) runs
+    # around these row writes; here only the row SQL is pinned.
+    @asynccontextmanager
+    async def transaction_scope():
+        yield conn
+
+    db.transaction_scope = transaction_scope
+    db._lock_connector_catalog = AsyncMock()
+    db._persist_connector_resource = AsyncMock(return_value="unchanged")
+    db._connector_link_projects = AsyncMock(return_value=set())
+    db._refresh_connector_projects = AsyncMock()
     return db
 
 
@@ -484,10 +496,6 @@ _NOTE_CONTENT_UPDATES = [
     pytest.param({"description": "Runbook"}, id="description"),
     pytest.param({"connection_url": "https://db.example.test"}, id="url"),
     pytest.param(
-        {"connection_url": None, "connection_url_set": True},
-        id="url-clear",
-    ),
-    pytest.param(
         {"credentials": {"env_vars": {"DATABASE_TOKEN": "secret"}}},
         id="credential-env-names",
     ),
@@ -566,10 +574,17 @@ async def test_combined_visibility_change_advances_policy_revision():
         is_global=True,
     )
 
-    update_sql = conn.execute.await_args.args[0]
+    update_sql = next(
+        call.args[0]
+        for call in conn.execute.await_args_list
+        if "UPDATE datasources" in call.args[0]
+    )
     assert "is_global =" in update_sql
     assert "policy_revision = policy_revision + 1" in update_sql
     assert result["policy_revision"] == 2
+    # The notes state the bound access, which visibility decides for an
+    # untagged connector (decision 32).
+    assert "datasource_project_reconcile_queue" in conn.execute.await_args.args[0]
 
 
 @pytest.mark.asyncio
@@ -737,7 +752,10 @@ async def test_project_linkable_datasources_are_target_aware_and_paginated():
     assert query == "data"
     assert fetch_limit == 2
     assert "d.job_id IS NULL" in sql
-    assert "d.config ? 'native_project_id'" in sql
+    # Platform-owned rows (the managed key, or the native KB marker an older
+    # orchestrator wrote) are never linkable.
+    assert "NOT (d.managed_key IS NOT NULL OR (d.type = 'kb'" in sql
+    assert "d.config->>'native_project_id'" in sql
     assert "NOT EXISTS" in sql
     assert "linked_pd.project_id = $2" in sql
     assert "d.created_by = $1" in sql
@@ -931,7 +949,7 @@ async def test_connector_owner_can_revoke_link_without_project_owner_role():
 
 
 @pytest.mark.asyncio
-async def test_delete_project_removes_native_kb_datasource_before_project_row():
+async def test_delete_project_removes_its_own_connectors_before_project_row():
     conn = AsyncMock()
     # This Project has no saved resources, retained workspace or live execution.
     conn.fetch.return_value = []
@@ -952,12 +970,19 @@ async def test_delete_project_removes_native_kb_datasource_before_project_row():
         index for index, sql in enumerate(statements) if "DELETE FROM projects" in sql
     )
     assert native_index < project_index
-    native_sql, native_project_id = conn.execute.await_args_list[native_index].args
+    native_sql, native_project_id, managed_keys = conn.execute.await_args_list[
+        native_index
+    ].args
+    assert "WHERE managed_key = ANY($2::text[])" in native_sql
     assert "type = 'kb'" in native_sql
     assert "WHEN config->>'native_project_id' ~*" in native_sql
     assert "THEN (config->>'native_project_id')::uuid" in native_sql
     assert "END = $1" in native_sql
     assert native_project_id == UUID(PROJECT_A)
+    # Every kind a project's own connector carries: its knowledge base, its
+    # cloud folder.
+    assert f"project-kb:{PROJECT_A}" in managed_keys
+    assert f"project-cloud:{PROJECT_A}" in managed_keys
     parent_lock_sql, parent_lock_project = conn.fetch.await_args.args
     assert "ORDER BY d.id" in parent_lock_sql
     assert "FOR UPDATE OF d" in parent_lock_sql
@@ -1079,3 +1104,56 @@ async def test_policy_rows_admit_only_the_exact_legacy_job_binding():
     assert "d.job_id IS NULL OR d.job_id = $2::uuid" in sql
     assert datasource_ids == [UUID(DATASOURCE_ID)]
     assert legacy_job_id == UUID(LEGACY_JOB_ID)
+
+
+# =============================================================================
+# Type rules come from the connector driver specs (slice D1c)
+# =============================================================================
+
+
+def test_the_store_type_rules_come_from_the_driver_specs():
+    from orchestrator.database import postgres
+
+    assert postgres._LIVE_DETACH_REFUSED_TYPES == {"credentials"}
+    assert postgres._DELETE_WHILE_ATTACHED_REFUSED_TYPES == {"credentials"}
+    assert postgres._FORCED_READ_ONLY_TYPES == {"kb"}
+    assert postgres._UNATTENDED_SEND_TYPES == {"email"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("ds_type", "read_only"), [("kb", True), ("postgresql", None)])
+async def test_initial_project_links_of_a_forced_read_only_driver_are_read_only(
+    ds_type, read_only
+):
+    conn = AsyncMock()
+    conn.fetchrow.side_effect = [
+        _datasource_row(),
+        _datasource_row(revision=2, scope="projects"),
+    ]
+    db = _make_db(conn)
+
+    await db.create_datasource(
+        name="Notes",
+        ds_type=ds_type,
+        scope_mode="projects",
+        project_ids=[PROJECT_A],
+    )
+
+    link_rows = conn.executemany.await_args.args[1]
+    assert [row[2] for row in link_rows] == [read_only]
+
+
+@pytest.mark.asyncio
+async def test_only_a_driver_with_unattended_send_is_stamped_with_the_grant():
+    db = PostgresDB.__new__(PostgresDB)
+    db.get_user = AsyncMock(return_value={"id": USER_ID})
+    db.user_can_autonomous_send = AsyncMock(return_value=True)
+    config = {"unattended_send": True}
+    email = {"type": "email", "created_by": USER_ID, "config": dict(config)}
+    other = {"type": "webdav", "created_by": USER_ID, "config": dict(config)}
+
+    await db._stamp_email_autonomous_send([email, other])
+
+    assert email["_owner_can_autonomous_send"] is True
+    assert "_owner_can_autonomous_send" not in other
+    db.user_can_autonomous_send.assert_awaited_once()

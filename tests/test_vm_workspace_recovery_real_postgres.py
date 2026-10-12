@@ -2,26 +2,36 @@
 
 from __future__ import annotations
 
+import dataclasses
+
 import asyncio
 import json
 import os
 from contextlib import asynccontextmanager, suppress
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from uuid import UUID, uuid4
+from types import SimpleNamespace
 from urllib.parse import urlsplit
+from uuid import UUID, uuid4
 
 import asyncpg
 import pytest
 import pytest_asyncio
 from testcontainers.community.postgres import PostgresContainer
 
-from orchestrator.services.vm_workspace_recovery_store import VMWorkspaceRecoveryStore
-from orchestrator.services.vm_workspace_recovery_store import (
-    WorkspaceRecoveryControlConflict,
-)
-from orchestrator.database.postgres import PostgresDB
 import shared.worker_queue as worker_queue
+from orchestrator.database.postgres import PostgresDB
+from orchestrator.services import (
+    vm_workspace_recovery_store as vm_workspace_recovery_store_module,
+)
+from orchestrator.services.vm_workspace_recovery_store import (
+    VMWorkspaceRecoveryStore,
+    WorkspaceRecoveryControlConflict,
+    acquire_pinned_thread_retirement_cleanup_permit,
+    acquire_vm_cleanup_permit,
+    pinned_thread_purge_successor_request_id,
+    vm_cleanup_request_identity,
+)
 from shared.run_queue import reap_expired, unpark_unit
 from shared.workspace_recovery import (
     RecoveryAttemptDisposition,
@@ -29,7 +39,6 @@ from shared.workspace_recovery import (
     WorkspaceRecoveryDisposition,
     workspace_recovery_enabled,
 )
-
 
 SCHEMA_FILE = (
     Path(__file__).resolve().parents[1]
@@ -109,6 +118,15 @@ async def _schema_applied(pg_dsn: str) -> None:
         if os.getenv("VM_RECOVERY_TEST_DSN"):
             await conn.execute("DROP SCHEMA public CASCADE; CREATE SCHEMA public")
         await conn.execute(SCHEMA_FILE.read_text())
+        if not await conn.fetchval(
+            "SELECT to_regclass('public.vm_job_cancel_retention_authorities') IS NOT NULL"
+        ):
+            await conn.execute(
+                (
+                    SCHEMA_FILE.parent
+                    / "migrations/app/0338_vm_job_cancel_retention.sql"
+                ).read_text()
+            )
     finally:
         await conn.close()
 
@@ -139,6 +157,7 @@ async def insert_recovery(
     phase: str = "recovering",
     first_observed_offset: timedelta = timedelta(0),
     deadline_offset: timedelta = timedelta(minutes=15),
+    original_cause: dict | None = None,
 ) -> UUID:
     async with app_pg.acquire() as conn:
         first = await conn.fetchval("SELECT clock_timestamp()")
@@ -149,10 +168,12 @@ async def insert_recovery(
                 owner_kind, owner_id, workspace_contract_digest,
                 provision_generation, cluster_name, namespace, vm_uid,
                 prior_vmi_uid, prior_launcher_uid, root_pvc_uid, phase,
-                first_observed_at, deadline_at, next_check_at, reason_code
+                first_observed_at, deadline_at, next_check_at, reason_code,
+                original_cause
             ) VALUES (
                 'job', $1, 'sha256:contract', $2, 'test-cluster', 'workers', $3,
-                $4, $5, $6, $7, $8, $9, $8, 'workspace_runtime_not_ready'
+                $4, $5, $6, $7, $8, $9, $8, 'workspace_runtime_not_ready',
+                $10::jsonb
             ) RETURNING id
             """,
             owner_id,
@@ -164,6 +185,7 @@ async def insert_recovery(
             phase,
             first,
             first + deadline_offset,
+            json.dumps(original_cause if original_cause is not None else {}),
         )
 
 
@@ -197,6 +219,18 @@ async def insert_leased_job(
                 lease_token,
             )
     return job_id, lease_token
+
+
+async def insert_cleanup_owner_job(app_pg) -> UUID:
+    """A cleanup admission for a Job needs a live owner, even without a retry."""
+    job_id = uuid4()
+    async with app_pg.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO jobs (id, description, status, execution_lane) "
+            "VALUES ($1, 'cleanup owner', 'processing', 'stateless')",
+            job_id,
+        )
+    return job_id
 
 
 async def prepare_checkpoint_rows(
@@ -289,6 +323,25 @@ async def wait_for_checkpoint_cleanup_admission(app_pg, job_id: UUID) -> None:
             return
         await asyncio.sleep(0.01)
     raise AssertionError("checkpoint cleanup did not publish its durable admission")
+
+
+async def wait_for_checkpoint_prune_row_lock(app_pg) -> None:
+    """Return once the prune holds the owner lock and waits on a checkpoint row.
+
+    The admission commits before the prune's own transaction takes the owner
+    lock, so a visible admission alone does not prove the lock is held yet.
+    """
+    for _ in range(500):
+        async with app_pg.acquire() as conn:
+            blocked = await conn.fetchval(
+                "SELECT EXISTS (SELECT 1 FROM pg_stat_activity "
+                "WHERE datname=current_database() AND wait_event_type='Lock' "
+                "AND query LIKE 'DELETE FROM checkpoints %')"
+            )
+        if blocked:
+            return
+        await asyncio.sleep(0.01)
+    raise AssertionError("checkpoint prune did not reach the checkpoint row lock")
 
 
 async def checkpoint_cleanup_outcome(app_pg, job_id: UUID, source: str) -> str | None:
@@ -425,7 +478,7 @@ async def test_committed_hold_blocks_controller_cleanup_before_pin_publication(
 @pytest.mark.asyncio
 async def test_cleanup_replay_rejects_changed_resource_intent(app_pg) -> None:
     store = VMWorkspaceRecoveryStore(app_pg, worker_id="test-worker")
-    owner_id = uuid4()
+    owner_id = await insert_cleanup_owner_job(app_pg)
     request_id = uuid4()
     first_pvc = uuid4()
     permit = await store.acquire_cleanup_permit(
@@ -466,7 +519,7 @@ async def test_cleanup_replay_binds_keep_vs_purge_and_returns_completed_outcome(
     app_pg,
 ) -> None:
     store = VMWorkspaceRecoveryStore(app_pg, worker_id="test-worker")
-    owner_id = uuid4()
+    owner_id = await insert_cleanup_owner_job(app_pg)
     request_id = uuid4()
     pvc_uid = uuid4()
     keep_intent = "sha256:keep-exact-vm-and-pvc"
@@ -507,9 +560,178 @@ async def test_cleanup_replay_binds_keep_vs_purge_and_returns_completed_outcome(
 
 
 @pytest.mark.asyncio
+async def test_open_lifecycle_vm_purge_resumes_only_exact_authenticated_parent(app_pg):
+    """An open purge may settle after its controller child; no keep is admitted."""
+    from uuid import NAMESPACE_URL, uuid5
+
+    from orchestrator.services.vm_provisioner import VMTeardownIdentity
+    from orchestrator.services.vm_workspace_recovery_store import cleanup_intent_digest
+
+    store = VMWorkspaceRecoveryStore(app_pg, worker_id="test-worker")
+    owner_id = await insert_cleanup_owner_job(app_pg)
+    generation, vm_uid, pvc_uid = (uuid4() for _ in range(3))
+    identity = VMTeardownIdentity(str(generation), str(vm_uid), str(pvc_uid))
+    request_id = uuid5(
+        NAMESPACE_URL,
+        f"workspace-cleanup:delete:job:{owner_id}:{generation}:{vm_uid}:{pvc_uid}",
+    )
+    intent = {
+        "owner_kind": "job",
+        "owner_id": str(owner_id),
+        "provision_generation": str(generation),
+        "vm_uid": str(vm_uid),
+        "pvc_uid": str(pvc_uid),
+        "purge_disk": True,
+        "resource": "vm_workspace",
+        "source": "lifecycle_vm_delete",
+    }
+    digest = cleanup_intent_digest(intent)
+    await app_pg.execute(
+        "UPDATE jobs SET context=jsonb_build_object('vm',jsonb_build_object("
+        "'provision_generation',$2::text,'identity_authenticated',true,"
+        "'identity_provision_generation',$2::text,'vm_uid',$3::text,"
+        "'rootdisk_pvc_uid',$4::text)) WHERE id=$1",
+        owner_id,
+        str(generation),
+        str(vm_uid),
+        str(pvc_uid),
+    )
+    original = await store.acquire_cleanup_permit(
+        owner_kind="job",
+        owner_id=owner_id,
+        pvc_uid=pvc_uid,
+        request_id=request_id,
+        source="lifecycle_vm_delete",
+        intent_digest=digest,
+    )
+    assert original.allowed
+    # A later keep would collide. The resumed permit must be the original row.
+    with pytest.raises(WorkspaceRecoveryControlConflict):
+        await store.acquire_cleanup_permit(
+            owner_kind="job",
+            owner_id=owner_id,
+            pvc_uid=pvc_uid,
+            request_id=request_id,
+            source="lifecycle_vm_delete",
+            intent_digest=cleanup_intent_digest({**intent, "purge_disk": False}),
+        )
+    resumed = await store.resume_open_lifecycle_vm_delete(
+        owner_id=owner_id,
+        identity=identity,
+        request_id=request_id,
+        intent_digest=digest,
+    )
+    assert resumed is not None and resumed.allowed
+    assert resumed.admission_id == original.admission_id
+    assert (
+        await app_pg.fetchval(
+            "SELECT count(*) FROM vm_workspace_cleanup_admissions WHERE owner_id=$1",
+            owner_id,
+        )
+        == 1
+    )
+
+    for changed in (
+        {"request_id": uuid4()},
+        {"intent_digest": "sha256:" + "0" * 64},
+        {"identity": VMTeardownIdentity(str(uuid4()), str(vm_uid), str(pvc_uid))},
+        {"identity": VMTeardownIdentity(str(generation), str(uuid4()), str(pvc_uid))},
+        {"identity": VMTeardownIdentity(str(generation), str(vm_uid), str(uuid4()))},
+        {"owner_id": uuid4()},
+    ):
+        result = await store.resume_open_lifecycle_vm_delete(
+            **{
+                "owner_id": owner_id,
+                "identity": identity,
+                "request_id": request_id,
+                "intent_digest": digest,
+                **changed,
+            }
+        )
+        assert result is None or not result.allowed
+    await app_pg.execute(
+        "UPDATE jobs SET context=jsonb_set(context,'{vm,identity_authenticated}',"
+        "'false'::jsonb) WHERE id=$1",
+        owner_id,
+    )
+    refused = await store.resume_open_lifecycle_vm_delete(
+        owner_id=owner_id,
+        identity=identity,
+        request_id=request_id,
+        intent_digest=digest,
+    )
+    assert refused is not None and not refused.allowed
+    for key, wrong in (
+        ("identity_provision_generation", str(uuid4())),
+        ("vm_uid", str(uuid4())),
+        ("rootdisk_pvc_uid", str(uuid4())),
+    ):
+        await app_pg.execute(
+            "UPDATE jobs SET context=jsonb_set(jsonb_set(context,"
+            "'{vm,identity_authenticated}','true'::jsonb),"
+            "ARRAY['vm',$2],to_jsonb($3::text)) WHERE id=$1",
+            owner_id,
+            key,
+            wrong,
+        )
+        changed = await store.resume_open_lifecycle_vm_delete(
+            owner_id=owner_id,
+            identity=identity,
+            request_id=request_id,
+            intent_digest=digest,
+        )
+        assert changed is not None and not changed.allowed
+        await app_pg.execute(
+            "UPDATE jobs SET context=jsonb_set(context,ARRAY['vm',$2],"
+            "to_jsonb($3::text)) WHERE id=$1",
+            owner_id,
+            key,
+            {
+                "identity_provision_generation": str(generation),
+                "vm_uid": str(vm_uid),
+                "rootdisk_pvc_uid": str(pvc_uid),
+            }[key],
+        )
+
+    other_owner = await insert_cleanup_owner_job(app_pg)
+    other_pvc = uuid4()
+    await app_pg.execute(
+        "UPDATE jobs SET context=jsonb_set((SELECT context FROM jobs WHERE id=$1),"
+        "'{vm,rootdisk_pvc_uid}',to_jsonb($3::text)) WHERE id=$2",
+        owner_id,
+        other_owner,
+        str(other_pvc),
+    )
+    other_identity = VMTeardownIdentity(str(generation), str(vm_uid), str(other_pvc))
+    other_request = uuid5(
+        NAMESPACE_URL,
+        f"workspace-cleanup:delete:job:{other_owner}:{generation}:{vm_uid}:{other_pvc}",
+    )
+    other_digest = cleanup_intent_digest(
+        {**intent, "owner_id": str(other_owner), "pvc_uid": str(other_pvc)}
+    )
+    wrong_source = await store.acquire_cleanup_permit(
+        owner_kind="job",
+        owner_id=other_owner,
+        pvc_uid=other_pvc,
+        request_id=other_request,
+        source="lifecycle_vm_give_up",
+        intent_digest=other_digest,
+    )
+    assert wrong_source.allowed
+    selected = await store.resume_open_lifecycle_vm_delete(
+        owner_id=other_owner,
+        identity=other_identity,
+        request_id=other_request,
+        intent_digest=other_digest,
+    )
+    assert selected is not None and not selected.allowed
+
+
+@pytest.mark.asyncio
 async def test_controller_cleanup_reservation_resumes_only_while_open(app_pg) -> None:
     store = VMWorkspaceRecoveryStore(app_pg, worker_id="controller-boundary")
-    owner_id = uuid4()
+    owner_id = await insert_cleanup_owner_job(app_pg)
     request_id = uuid4()
     intent_digest = "sha256:failed-dv-recreate-g1-old-dv-old-pvc"
     permit = await store.acquire_cleanup_permit(
@@ -581,8 +803,54 @@ async def test_controller_cleanup_reservation_resumes_only_while_open(app_pg) ->
 
 
 @pytest.mark.asyncio
+async def test_first_cleanup_writer_rechecks_owner_created_during_job_lock_wait(
+    app_pg,
+) -> None:
+    job_id = await insert_cleanup_owner_job(app_pg)
+
+    async def insert_cleanup() -> UUID:
+        async with app_pg.acquire() as conn:
+            return await conn.fetchval(
+                "INSERT INTO vm_workspace_cleanup_admissions "
+                "(id,owner_kind,owner_id,source,request_id,intent_digest) "
+                "VALUES($1,'job',$2,'public_vm_delete',$3,$4) RETURNING id",
+                uuid4(),
+                job_id,
+                uuid4(),
+                "sha256:first-cleanup-owner-race",
+            )
+
+    async with app_pg.acquire() as blocker, blocker.transaction():
+        await blocker.fetchrow("SELECT id FROM jobs WHERE id=$1 FOR UPDATE", job_id)
+        pending = asyncio.create_task(insert_cleanup())
+        for _ in range(100):
+            async with app_pg.acquire() as observer:
+                waiting = await observer.fetchval(
+                    "SELECT EXISTS(SELECT 1 FROM pg_stat_activity "
+                    "WHERE wait_event_type='Lock' "
+                    "AND query LIKE 'INSERT INTO vm_workspace_cleanup_admissions%')"
+                )
+            if waiting:
+                break
+            await asyncio.sleep(0.01)
+        assert waiting and not pending.done()
+        await blocker.execute(
+            "INSERT INTO vm_job_creation_owners(job_id,live_job_id) VALUES($1,$1)",
+            job_id,
+        )
+    admission_id = await asyncio.wait_for(pending, 3)
+    assert admission_id is not None
+    async with app_pg.acquire() as conn:
+        assert await conn.fetchval(
+            "SELECT live_job_id=$1 FROM vm_job_creation_owners WHERE job_id=$1",
+            job_id,
+        )
+
+
+@pytest.mark.asyncio
 async def test_nested_vm_cleanup_child_survives_parent_completion(app_pg) -> None:
     from types import SimpleNamespace
+
     from orchestrator.services.vm_workspace_recovery_store import (
         acquire_vm_cleanup_permit,
     )
@@ -1144,7 +1412,7 @@ async def test_terminal_checkpoint_prune_serializes_cleanup_before_recovery(
     prune_task = asyncio.create_task(db.delete_checkpoint_thread(str(job_id)))
     hold_task = None
     try:
-        await wait_for_checkpoint_cleanup_admission(app_pg, job_id)
+        await wait_for_checkpoint_prune_row_lock(app_pg)
         hold_task = asyncio.create_task(
             store.admit_hold(**admission_kwargs(job_id, lease_token))
         )
@@ -1221,7 +1489,7 @@ async def test_global_checkpoint_prune_serializes_cleanup_before_recovery(
     prune_task = asyncio.create_task(db.prune_checkpoints_keep_last(1))
     hold_task = None
     try:
-        await wait_for_checkpoint_cleanup_admission(app_pg, job_id)
+        await wait_for_checkpoint_prune_row_lock(app_pg)
         hold_task = asyncio.create_task(
             store.admit_hold(**admission_kwargs(job_id, lease_token))
         )
@@ -1315,6 +1583,300 @@ async def test_terminal_checkpoint_prune_resumes_cancelled_open_admission(
 
 
 @pytest.mark.asyncio
+async def test_cancelled_stateless_vm_replays_only_exact_open_terminal_parent(
+    app_pg,
+) -> None:
+    """A quiesced Cancel can retire its own parent before retrying strict prune."""
+
+    job_id, generation, vm_uid, pvc_uid = (uuid4() for _ in range(4))
+    vm = {
+        "status": "retiring_process_zero",
+        "provision_generation": str(generation),
+        "identity_authenticated": True,
+        "identity_provision_generation": str(generation),
+        "vm_uid": str(vm_uid),
+        "rootdisk_pvc_uid": str(pvc_uid),
+    }
+    async with app_pg.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO jobs (id, description, status, execution_lane, context) "
+            "VALUES ($1, 'cancel terminal replay', 'cancelled', 'stateless', $2::jsonb)",
+            job_id,
+            json.dumps({"vm": vm, "_stateless_cancel_cleanup_pending": True}),
+        )
+        await conn.execute(
+            "INSERT INTO run_queue(unit_id,unit_kind,state,lease_token) "
+            "VALUES ($1,'worker_batch','done',3)",
+            job_id,
+        )
+    store = VMWorkspaceRecoveryStore(app_pg)
+    identity = SimpleNamespace(
+        provision_generation=str(generation),
+        vm_uid=str(vm_uid),
+        rootdisk_pvc_uid=str(pvc_uid),
+    )
+    parent = await acquire_vm_cleanup_permit(
+        store,
+        owner_kind="job",
+        owner_id=job_id,
+        identity=identity,
+        source="job_terminal_vm_release",
+        purge_disk=True,
+    )
+    assert parent.allowed and parent.admission_id is not None
+    db = postgres_db(app_pg)
+    assert await db.quiesce_cancelled_stateless_vm_parent(str(job_id)) is True
+
+    # The selector does not wait behind the normal cleanup lock order. Its
+    # snapshot ends before archive reacquires exact authority to do effects.
+    blocker = await app_pg.acquire()
+    block_tx = blocker.transaction()
+    await block_tx.start()
+    try:
+        await blocker.fetchrow(
+            "SELECT id FROM vm_workspace_cleanup_admissions WHERE id=$1 FOR UPDATE",
+            parent.admission_id,
+        )
+        await blocker.fetchrow(
+            "SELECT unit_id FROM run_queue WHERE unit_id=$1 FOR UPDATE",
+            job_id,
+        )
+        assert (
+            await asyncio.wait_for(
+                db.quiesce_cancelled_stateless_vm_parent(str(job_id)),
+                timeout=1,
+            )
+            is True
+        )
+    finally:
+        await block_tx.rollback()
+        await app_pg.release(blocker)
+
+    # A same-owner Resume cannot insert a successor while the cancellation
+    # marker persists, including between the selector and archive.
+    async with app_pg.acquire() as conn, conn.transaction():
+        assert (
+            await db._queue_job_for_resume_on_conn(
+                conn,
+                job_id,
+                None,
+                void_completion_decision=True,
+                stateless_only=True,
+                expected_status="cancelled",
+            )
+            is None
+        )
+
+    # A parked worker is closed by the old queue-first finalizer; the next
+    # sweep may then replay the already-admitted terminal VM parent.
+    async with app_pg.acquire() as conn:
+        await conn.execute(
+            "UPDATE run_queue SET state='parked' WHERE unit_id=$1", job_id
+        )
+    assert await db.quiesce_cancelled_stateless_vm_parent(str(job_id)) is False
+    with pytest.raises(RuntimeError, match="blocked by workspace recovery authority"):
+        await db.finalize_cancelled_stateless_job(str(job_id))
+    async with app_pg.acquire() as conn:
+        assert (
+            await conn.fetchval(
+                "SELECT state FROM run_queue WHERE unit_id=$1",
+                job_id,
+            )
+            == "done"
+        )
+    assert await db.quiesce_cancelled_stateless_vm_parent(str(job_id)) is True
+
+    # Neither an active worker nor live workspace access takes this path.
+    async with app_pg.acquire() as conn:
+        await conn.execute(
+            "UPDATE run_queue SET state='leased' WHERE unit_id=$1", job_id
+        )
+    assert await db.quiesce_cancelled_stateless_vm_parent(str(job_id)) is False
+    async with app_pg.acquire() as conn:
+        await conn.execute("UPDATE run_queue SET state='done' WHERE unit_id=$1", job_id)
+        lease_id = uuid4()
+        await conn.execute(
+            "INSERT INTO vm_idle_access_leases "
+            "(id,owner_kind,owner_id,provision_generation,vm_uid,kind,claimed_by,"
+            "expires_at,max_expires_at) VALUES "
+            "($1,'job',$2,$3,$4,'ide','w6-test',"
+            "clock_timestamp()+interval '2 minutes',"
+            "clock_timestamp()+interval '1 hour')",
+            lease_id,
+            job_id,
+            generation,
+            vm_uid,
+        )
+    assert await db.quiesce_cancelled_stateless_vm_parent(str(job_id)) is False
+    async with app_pg.acquire() as conn:
+        await conn.execute(
+            "UPDATE vm_idle_access_leases SET closed_at=clock_timestamp() WHERE id=$1",
+            lease_id,
+        )
+    assert await db.quiesce_cancelled_stateless_vm_parent(str(job_id)) is True
+    # A newly committed recovery hold cannot borrow the completed queue fence.
+    recovery_id = await insert_recovery(app_pg, owner_id=job_id)
+    assert await db.quiesce_cancelled_stateless_vm_parent(str(job_id)) is False
+    async with app_pg.acquire() as conn:
+        await conn.execute(
+            "UPDATE vm_workspace_recoveries SET phase='cancelled',"
+            "resolved_at=clock_timestamp() "
+            "WHERE id=$1",
+            recovery_id,
+        )
+        await conn.execute(
+            "UPDATE vm_workspace_cleanup_admissions SET completed_at=clock_timestamp(),"
+            "outcome='completed' WHERE id=$1",
+            parent.admission_id,
+        )
+    assert await db.quiesce_cancelled_stateless_vm_parent(str(job_id)) is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "stale_field",
+    [
+        "provision_generation",
+        "vm_uid",
+        "rootdisk_pvc_uid",
+        "workspace_storage",
+        "request_id",
+        "intent_digest",
+    ],
+)
+async def test_cancelled_stateless_vm_refuses_stale_terminal_parent(
+    app_pg,
+    stale_field,
+) -> None:
+    """A predecessor or mismatched parent cannot retire a current successor."""
+
+    job_id, generation, vm_uid, pvc_uid = (uuid4() for _ in range(4))
+    vm = {
+        "status": "retiring_process_zero",
+        "provision_generation": str(generation),
+        "identity_authenticated": True,
+        "identity_provision_generation": str(generation),
+        "vm_uid": str(vm_uid),
+        "rootdisk_pvc_uid": str(pvc_uid),
+    }
+    stale = dict(vm)
+    if stale_field == "workspace_storage":
+        vm["workspace_storage"] = {"uid": str(uuid4())}
+    else:
+        stale[stale_field] = str(uuid4())
+    async with app_pg.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO jobs (id, description, status, execution_lane, context) "
+            "VALUES ($1, 'cancel predecessor', 'cancelled', 'stateless', $2::jsonb)",
+            job_id,
+            json.dumps({"vm": vm, "_stateless_cancel_cleanup_pending": True}),
+        )
+        await conn.execute(
+            "INSERT INTO run_queue(unit_id,unit_kind,state,lease_token) "
+            "VALUES ($1,'worker_batch','done',3)",
+            job_id,
+        )
+    identity = SimpleNamespace(
+        provision_generation=stale["provision_generation"],
+        vm_uid=stale["vm_uid"],
+        rootdisk_pvc_uid=stale["rootdisk_pvc_uid"],
+    )
+    store = VMWorkspaceRecoveryStore(app_pg)
+    if stale_field in {"request_id", "intent_digest"}:
+        _, expected_pvc, request_id, digest, _ = vm_cleanup_request_identity(
+            owner_kind="job",
+            owner_id=job_id,
+            identity=identity,
+            source="job_terminal_vm_release",
+            purge_disk=True,
+        )
+        parent = await store.acquire_cleanup_permit(
+            owner_kind="job",
+            owner_id=job_id,
+            pvc_uid=expected_pvc,
+            request_id=uuid4() if stale_field == "request_id" else request_id,
+            source="job_terminal_vm_release",
+            intent_digest=(
+                "sha256:wrong-terminal-intent"
+                if stale_field == "intent_digest"
+                else digest
+            ),
+        )
+    else:
+        parent = await acquire_vm_cleanup_permit(
+            store,
+            owner_kind="job",
+            owner_id=job_id,
+            identity=identity,
+            source="job_terminal_vm_release",
+            purge_disk=True,
+        )
+    assert parent.allowed
+    assert (
+        await postgres_db(app_pg).quiesce_cancelled_stateless_vm_parent(str(job_id))
+        is False
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("inherits", [True, False])
+async def test_cancelled_child_uses_canonical_workspace_owner(
+    app_pg,
+    inherits,
+) -> None:
+    parent_id, child_id, generation, vm_uid, pvc_uid = (uuid4() for _ in range(5))
+    vm = {
+        "status": "retiring_process_zero",
+        "provision_generation": str(generation),
+        "identity_authenticated": True,
+        "identity_provision_generation": str(generation),
+        "vm_uid": str(vm_uid),
+        "rootdisk_pvc_uid": str(pvc_uid),
+    }
+    async with app_pg.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO jobs(id,description,status,execution_lane,context) "
+            "VALUES($1,'parent','cancelled','stateless',$2::jsonb)",
+            parent_id,
+            json.dumps({"vm": vm} if inherits else {}),
+        )
+        await conn.execute(
+            "INSERT INTO jobs(id,description,status,execution_lane,parent_job_id,context) "
+            "VALUES($1,'child','cancelled','stateless',$2,$3::jsonb)",
+            child_id,
+            parent_id,
+            json.dumps(
+                {
+                    "vm": vm,
+                    "inherits_parent_workspace": inherits,
+                    "_stateless_cancel_cleanup_pending": True,
+                }
+            ),
+        )
+        await conn.execute(
+            "INSERT INTO run_queue(unit_id,unit_kind,state,lease_token) "
+            "VALUES($1,'worker_batch','done',3)",
+            child_id,
+        )
+    parent = await acquire_vm_cleanup_permit(
+        VMWorkspaceRecoveryStore(app_pg),
+        owner_kind="job",
+        owner_id=parent_id if inherits else child_id,
+        identity=SimpleNamespace(
+            provision_generation=str(generation),
+            vm_uid=str(vm_uid),
+            rootdisk_pvc_uid=str(pvc_uid),
+        ),
+        source="job_terminal_vm_release",
+        purge_disk=True,
+    )
+    assert parent.allowed
+    assert await postgres_db(app_pg).quiesce_cancelled_stateless_vm_parent(
+        str(child_id)
+    ) is (not inherits)
+
+
+@pytest.mark.asyncio
 async def test_global_checkpoint_prune_resumes_cancelled_generation_then_advances(
     app_pg, monkeypatch
 ) -> None:
@@ -1369,6 +1931,88 @@ async def test_orphan_uuid_checkpoints_prune_without_stranding_authority(
         row["outcome"] == "completed"
         for row in await checkpoint_cleanup_admissions(app_pg, job_id)
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "mutated",
+    [
+        "source",
+        "digest",
+        "pvc",
+        "parent",
+        "recovery",
+        "prior_cleanup",
+        "prior_forged_checkpoint",
+        "retired_owner",
+    ],
+)
+async def test_orphan_checkpoint_exception_cannot_acquire_vm_or_retired_obligation(
+    app_pg, mutated
+) -> None:
+    from orchestrator.database.postgres import _checkpoint_prune_intent_digest
+
+    job_id = uuid4()
+    source = "terminal_checkpoint_prune"
+    digest = _checkpoint_prune_intent_digest(str(job_id), {"mode": "delete_thread"})
+    if mutated == "recovery":
+        await insert_recovery(app_pg, owner_id=job_id)
+    elif mutated in {"prior_cleanup", "prior_forged_checkpoint", "retired_owner"}:
+        async with app_pg.acquire() as conn, conn.transaction():
+            await conn.execute(
+                "INSERT INTO jobs(id,description,status,execution_lane) "
+                "VALUES($1,'former checkpoint owner','completed','stateless')",
+                job_id,
+            )
+            if mutated in {"prior_cleanup", "prior_forged_checkpoint"}:
+                await conn.execute(
+                    "INSERT INTO vm_workspace_cleanup_admissions "
+                    "(id,owner_kind,owner_id,source,request_id,intent_digest,"
+                    "completed_at,outcome) VALUES($1,'job',$2,$3,$4,$5,"
+                    "clock_timestamp(),'completed')",
+                    uuid4(),
+                    job_id,
+                    "terminal_checkpoint_prune"
+                    if mutated == "prior_forged_checkpoint"
+                    else "public_vm_delete",
+                    uuid4(),
+                    "sha256:forged"
+                    if mutated == "prior_forged_checkpoint"
+                    else "sha256:former-cleanup",
+                )
+            else:
+                await conn.execute(
+                    "INSERT INTO vm_job_creation_owners(job_id,live_job_id) VALUES($1,$1)",
+                    job_id,
+                )
+                receipt = {
+                    "job_id": str(job_id),
+                    "generations": [],
+                    "worker_attempts": [],
+                    "worker_delivery_bindings": [],
+                    "workspace_recoveries": [],
+                }
+                await conn.execute(
+                    "UPDATE vm_job_creation_owners SET deleted_at=clock_timestamp(),"
+                    "deletion_receipt=$2::jsonb WHERE job_id=$1",
+                    job_id,
+                    json.dumps(receipt),
+                )
+            await conn.execute("DELETE FROM jobs WHERE id=$1", job_id)
+    async with app_pg.acquire() as conn:
+        with pytest.raises(asyncpg.CheckViolationError):
+            await conn.execute(
+                "INSERT INTO vm_workspace_cleanup_admissions "
+                "(id,owner_kind,owner_id,pvc_uid,source,request_id,intent_digest,"
+                "parent_admission_id) VALUES($1,'job',$2,$3,$4,$5,$6,$7)",
+                uuid4(),
+                job_id,
+                uuid4() if mutated == "pvc" else None,
+                "checkpoint_retention_prune:forged" if mutated == "source" else source,
+                uuid4(),
+                "sha256:forged" if mutated == "digest" else digest,
+                uuid4() if mutated == "parent" else None,
+            )
 
 
 @pytest.mark.asyncio
@@ -1825,6 +2469,7 @@ async def test_reporter_and_active_sibling_replay_exact_committed_hold(
     app_pg, missing_attempt
 ):
     from types import SimpleNamespace
+
     from orchestrator.services.unit_claim_bundle import (
         get_workspace_recovery_disposition,
     )
@@ -1898,19 +2543,30 @@ async def test_disabled_bundle_then_enabled_hold_never_refunds_executable_attemp
     app_pg, monkeypatch
 ):
     import httpx
-    from orchestrator import main as orch_main
+
     from tests.test_claim_bundle import (
-        recovery_protocol_app,
-        UNIT_ID,
         POD_NAME,
         POD_UID,
+        UNIT_ID,
+        recovery_protocol_app,
     )
 
     app, db, _ = recovery_protocol_app(monkeypatch, ready=True)
     db.acquire = app_pg.acquire
     store = VMWorkspaceRecoveryStore(app_pg)
-    monkeypatch.setattr(orch_main, "VMWorkspaceRecoveryStore", lambda db: store)
+    # The workspace-recovery routes construct their store from the owner at
+    # call time; the claim bundle takes the one its dependency factory builds,
+    # which ``recovery_protocol_app`` replaced with a protocol double — restore
+    # the real store on both paths.
+    monkeypatch.setattr(
+        vm_workspace_recovery_store_module, "VMWorkspaceRecoveryStore", lambda db: store
+    )
+    protocol_claim_dependencies = app.state.unit_claim_bundle_dependencies_factory
+    app.state.unit_claim_bundle_dependencies_factory = lambda: dataclasses.replace(
+        protocol_claim_dependencies(), recovery_store=store
+    )
     job_id = UUID(UNIT_ID)
+    vm = db._job["context"]["vm"]
     async with app_pg.acquire() as conn:
         await conn.execute(
             "INSERT INTO jobs (id,description,status,execution_lane,context,config_override) VALUES ($1,'disabled bundle','processing','stateless',$2::jsonb,$3::jsonb)",
@@ -1927,10 +2583,55 @@ async def test_disabled_bundle_then_enabled_hold_never_refunds_executable_attemp
             "INSERT INTO worker_batch_attempts (job_id,lease_token,claimed_attempt) VALUES ($1,7,1)",
             job_id,
         )
+        # A root VM bundle now binds to an exact succeeded creation source.
+        # Keep this source separate from the attempt being tested: the flag
+        # transition concerns refund accounting after a real VM bundle.
+        execution_id, admission_id = uuid4(), uuid4()
         await conn.execute(
-            "INSERT INTO agents (config_name,hostname,pod_uid) VALUES ('test',$1,$2)",
-            POD_NAME,
-            POD_UID,
+            "INSERT INTO srw_execution_specs "
+            "(id,work_kind,work_id,document,resolved,revision,harness_adapter) "
+            "VALUES($1,'Job',$2,'{}','{}','bundle-source','srw/v1')",
+            execution_id,
+            job_id,
+        )
+        await conn.execute(
+            "INSERT INTO vm_workspace_cleanup_admissions "
+            "(id,owner_kind,owner_id,source,request_id,intent_digest,"
+            "completed_at,outcome) "
+            "VALUES($1,'job',$2,'controller_vm_create',$3,'sha256:bundle-source',"
+            "clock_timestamp(),'created')",
+            admission_id,
+            job_id,
+            uuid4(),
+        )
+        await conn.execute(
+            "INSERT INTO vm_creation_retries "
+            "(request_id,job_id,provision_generation,origin,request_digest,"
+            "canonical_request,controller_configuration_digest,execution_id,"
+            "execution_revision,execution_generation,creation_admission_id,state,"
+            "boot_counted,observed_vm_uid,observed_pvc_uid,ready_at,resolved_at) "
+            "VALUES($1,$2,$3,'initial',$4,'{}',$5,$6,'bundle-source',1,$7,"
+            "'succeeded',true,$8,$9,clock_timestamp(),clock_timestamp())",
+            uuid4(),
+            job_id,
+            UUID(vm["provision_generation"]),
+            "sha256:" + "a" * 64,
+            "sha256:" + "b" * 64,
+            execution_id,
+            admission_id,
+            UUID(vm["vm_uid"]),
+            UUID(vm["rootdisk_pvc_uid"]),
+        )
+        # Live stateless contract: pooled executors never register. The
+        # bundle must authorize without an agents row; assert its absence
+        # before exercising disabled-then-enabled accounting.
+        assert (
+            await conn.fetchval(
+                "SELECT count(*) FROM agents WHERE hostname=$1 AND pod_uid=$2",
+                POD_NAME,
+                POD_UID,
+            )
+            == 0
         )
     monkeypatch.setenv("VM_WORKSPACE_RECOVERY_ENABLED", "false")
     async with httpx.AsyncClient(
@@ -1952,7 +2653,7 @@ async def test_disabled_bundle_then_enabled_hold_never_refunds_executable_attemp
                 "code": "workspace_transport_unavailable",
             },
         )
-        assert hold.status_code == 200
+        assert hold.status_code == 200, hold.text
         assert hold.json()["recovery"]["action"] == "hold_committed"
     async with app_pg.acquire() as conn:
         attempt = await conn.fetchrow(
@@ -1967,6 +2668,15 @@ async def test_disabled_bundle_then_enabled_hold_never_refunds_executable_attemp
                 job_id,
             )
             == 1
+        )
+        # No registration was created as a side effect of the repair.
+        assert (
+            await conn.fetchval(
+                "SELECT count(*) FROM agents WHERE hostname=$1 AND pod_uid=$2",
+                POD_NAME,
+                POD_UID,
+            )
+            == 0
         )
 
 
@@ -2889,6 +3599,9 @@ async def test_concurrent_identical_admissions_return_one_receipt(app_pg) -> Non
 async def test_store_admits_idempotent_hold_and_releases_exact_queue_token(
     app_pg,
 ) -> None:
+    from shared.vm_provisioning_phases import observe_provisioning
+    from tests.test_vm_provisioning_phases import running
+
     job_id = uuid4()
     attempt_token = 27
     request_id = uuid4()
@@ -2897,6 +3610,22 @@ async def test_store_admits_idempotent_hold_and_releases_exact_queue_token(
     vmi_uid = uuid4()
     launcher_uid = uuid4()
     pvc_uid = uuid4()
+    async with app_pg.acquire() as conn:
+        phase_now = await conn.fetchval(
+            "SELECT extract(epoch FROM clock_timestamp())::double precision"
+        )
+    phase = observe_provisioning(
+        None,
+        running(
+            owner_id=str(job_id),
+            namespace="workers",
+            provision_generation=str(provision_generation),
+            vm_uid=str(vm_uid),
+            vmi_uid=str(vmi_uid),
+            rootdisk_pvc_uid=str(pvc_uid),
+        ),
+        now=phase_now,
+    )
     async with app_pg.acquire() as conn:
         await conn.execute(
             "INSERT INTO jobs (id, description, status, execution_lane) "
@@ -2921,13 +3650,18 @@ async def test_store_admits_idempotent_hold_and_releases_exact_queue_token(
             attempt_token,
         )
         await conn.execute(
-            "UPDATE jobs SET context=jsonb_build_object('vm',jsonb_build_object("
-            "'provision_generation',$2::text,'vm_uid',$3::text,"
-            "'rootdisk_pvc_uid',$4::text)) WHERE id=$1",
+            "UPDATE jobs SET context=jsonb_build_object('vm',$2::jsonb) WHERE id=$1",
             job_id,
-            str(provision_generation),
-            str(vm_uid),
-            str(pvc_uid),
+            json.dumps(
+                {
+                    "provision_generation": str(provision_generation),
+                    "vm_uid": str(vm_uid),
+                    "vmi_uid": str(vmi_uid),
+                    "rootdisk_pvc_uid": str(pvc_uid),
+                    "provisioning": phase,
+                    "provisioning_revision": 6,
+                }
+            ),
         )
 
     store = VMWorkspaceRecoveryStore(app_pg, worker_id="reconciler-a")
@@ -3012,12 +3746,20 @@ async def test_store_admits_idempotent_hold_and_releases_exact_queue_token(
     assert (job["status"], job["freeze_data"]) == ("paused", None)
     vm = job["vm"] if isinstance(job["vm"], dict) else json.loads(job["vm"])
     assert vm["ssh_registration_id"] == "52" * 16
+    assert vm["provisioning"] == phase
+    assert vm["provisioning_revision"] == 7
     assert operation["phase"] == "recovered"
     assert operation["resolved_at"] is not None
 
 
 @pytest.mark.asyncio
-async def test_final_recovery_cas_binds_successor_and_releases_once(app_pg) -> None:
+async def test_final_recovery_cas_binds_successor_and_releases_once(
+    app_pg, monkeypatch
+) -> None:
+    from orchestrator.services.vm_provisioning_phases import VMProvisioningPhaseStore
+    from shared.vm_provisioning_phases import observe_provisioning
+    from tests.test_vm_provisioning_phase_store import provisioner_with_response, status
+
     job_id, lease_token = await insert_leased_job(app_pg)
     generation = uuid4()
     vm_uid = uuid4()
@@ -3026,16 +3768,46 @@ async def test_final_recovery_cas_binds_successor_and_releases_once(app_pg) -> N
     pvc_uid = uuid4()
     successor_vmi_uid = uuid4()
     successor_launcher_uid = uuid4()
+    predecessor_status = status(
+        str(job_id),
+        str(generation),
+        boot=True,
+        namespace="workers",
+        vm_uid=str(vm_uid),
+        vmi_uid=str(old_vmi_uid),
+        rootdisk_pvc_uid=str(pvc_uid),
+    )
+    async with app_pg.acquire() as conn:
+        phase_now = await conn.fetchval(
+            "SELECT extract(epoch FROM clock_timestamp())::double precision"
+        )
+    predecessor_phase = observe_provisioning(
+        None, predecessor_status["provisioning"], now=phase_now
+    )
+    budget = {"boot_attempts": 3, "provision_attempts": 5}
     async with app_pg.acquire() as conn:
         await conn.execute(
-            "UPDATE jobs SET context=jsonb_build_object('vm',jsonb_build_object("
-            "'provision_generation',$2::text,'vm_uid',$3::text,"
-            "'rootdisk_pvc_uid',$4::text,'status','ssh_pending')) WHERE id=$1",
+            "UPDATE jobs SET context=jsonb_build_object('vm',$2::jsonb) WHERE id=$1",
             job_id,
-            str(generation),
-            str(vm_uid),
-            str(pvc_uid),
+            json.dumps(
+                {
+                    "provision_generation": str(generation),
+                    "vm_uid": str(vm_uid),
+                    "vmi_uid": str(old_vmi_uid),
+                    "rootdisk_pvc_uid": str(pvc_uid),
+                    "vm_name": f"agent-vm-{job_id}",
+                    "namespace": "workers",
+                    "status": "ssh_pending",
+                    "provisioning": predecessor_phase,
+                    "provisioning_revision": 4,
+                    **budget,
+                }
+            ),
         )
+    db = postgres_db(app_pg)
+    phase_store = VMProvisioningPhaseStore(db)
+    stale_token = await phase_store.capture(str(job_id), str(generation))
+    assert stale_token is not None and stale_token.revision == 4
     store = VMWorkspaceRecoveryStore(app_pg, worker_id="leader-a")
     admitted = await store.admit_hold(
         **(
@@ -3061,7 +3833,6 @@ async def test_final_recovery_cas_binds_successor_and_releases_once(app_pg) -> N
         "vm_uid": str(vm_uid),
         "root_pvc_uid": str(pvc_uid),
         "prior_runtime": "stopped",
-        "stop_receipt_digest": "sha256:exact-stop",
         "remote_operations": "settled",
         "continuation": "safe",
         "successor": {
@@ -3076,6 +3847,35 @@ async def test_final_recovery_cas_binds_successor_and_releases_once(app_pg) -> N
             "guest_network": recovery_guest_network(),
         },
     }
+    stopped_at = datetime.now(timezone.utc).isoformat()
+    receipt = {
+        "protocol_version": 1,
+        "vm_uid": str(vm_uid),
+        "vmi_uid": str(old_vmi_uid),
+        "launcher_uid": str(old_launcher_uid),
+        "container_id": "containerd://old-compute",
+        "root_pvc_uid": str(pvc_uid),
+        "controller_identity": "controller/pod-1",
+        "observed_at": stopped_at,
+        "containers": [
+            {
+                "name": "compute",
+                "kind": "regular",
+                "container_id": "containerd://old-compute",
+                "terminated_container_id": "containerd://old-compute",
+                "restart_count": 0,
+                "state": "terminated",
+                "last_state": None,
+                "finished_at": stopped_at,
+                "reason": "Completed",
+            }
+        ],
+        "declared_containers": {"regular": ["compute"], "init": []},
+        "pod_terminal": {"phase": "Succeeded", "restart_policy": "Never"},
+    }
+    digest = await store.accept_stop_evidence(claimed, receipt)
+    assert digest is not None
+    observation["stop_receipt_digest"] = digest
     staged = await store.stage_observation(
         operation_id=claimed.operation_id,
         version=claimed.version,
@@ -3084,25 +3884,6 @@ async def test_final_recovery_cas_binds_successor_and_releases_once(app_pg) -> N
         observation=observation,
     )
     assert staged is not None
-    async with app_pg.acquire() as conn:
-        await conn.execute(
-            """
-            INSERT INTO vm_workspace_recovery_stop_receipts (
-                recovery_id,accepted_claim_token,vm_uid,vmi_uid,launcher_uid,
-                container_id,root_pvc_uid,controller_identity,observed_at,
-                evidence,evidence_digest
-            ) VALUES ($1,$2,$3,$4,$5,'container://old',$6,'controller/test',
-                      clock_timestamp(),'{"stopped":true}'::jsonb,$7)
-            """,
-            admitted.operation_id,
-            staged.claim_token,
-            vm_uid,
-            old_vmi_uid,
-            old_launcher_uid,
-            pvc_uid,
-            "sha256:exact-stop",
-        )
-
     assert await store.release_recovered(
         operation_id=staged.operation_id,
         version=staged.version,
@@ -3134,8 +3915,215 @@ async def test_final_recovery_cas_binds_successor_and_releases_once(app_pg) -> N
     assert tuple(queue) == ("queued", lease_token + 1)
     assert vm["active_pod_uid"] == str(successor_launcher_uid)
     assert vm["vmi_uid"] == str(successor_vmi_uid)
+    assert vm["provisioning"]["identity"]["vmi_uid"] == str(successor_vmi_uid)
+    assert vm["provisioning_revision"] == 5
+    assert {key: vm[key] for key in budget} == budget
+    assert {
+        key: value for key, value in vm["provisioning"].items() if key != "identity"
+    } == {key: value for key, value in predecessor_phase.items() if key != "identity"}
     assert vm["pod_ip"] == "10.42.0.90"
     assert pin_released is True
+    successor_status = status(
+        str(job_id),
+        str(generation),
+        boot=True,
+        namespace="workers",
+        vm_uid=str(vm_uid),
+        vmi_uid=str(successor_vmi_uid),
+        rootdisk_pvc_uid=str(pvc_uid),
+    )
+    successor_status["namespace"] = "workers"
+    successor_status["vmi_uid"] = str(successor_vmi_uid)
+    assert await phase_store.apply_status(stale_token, successor_status) == "stale"
+
+    async def reply(_request):
+        return successor_status
+
+    provisioner = await provisioner_with_response(db, monkeypatch, reply)
+    try:
+        assert await provisioner.query_status(str(job_id)) is not None
+    finally:
+        await provisioner._http_client.aclose()
+    async with app_pg.acquire() as conn:
+        post_query_phase = await conn.fetchval(
+            "SELECT context->'vm'->'provisioning' FROM jobs WHERE id=$1", job_id
+        )
+    if isinstance(post_query_phase, str):
+        post_query_phase = json.loads(post_query_phase)
+    assert (
+        post_query_phase["first_guest_started_at"]
+        == predecessor_phase["first_guest_started_at"]
+    )
+    assert post_query_phase["phase_started_at"] == predecessor_phase["phase_started_at"]
+
+    # A later worker lease can recover the already replaced runtime again.
+    # Its predecessor phase is the first successor, not the original VMI.
+    async with app_pg.acquire() as conn:
+        phase_before_second = await conn.fetchval(
+            "SELECT context->'vm'->'provisioning' FROM jobs WHERE id=$1", job_id
+        )
+        await conn.execute(
+            "UPDATE run_queue SET state='leased',lease_token=$2,leased_by='worker-a',"
+            "leased_until=clock_timestamp()+interval '1 minute' WHERE unit_id=$1",
+            job_id,
+            lease_token + 2,
+        )
+        await conn.execute(
+            "INSERT INTO worker_batch_attempts(job_id,lease_token,claimed_attempt) "
+            "SELECT unit_id,lease_token,attempts_since_completion FROM run_queue "
+            "WHERE unit_id=$1",
+            job_id,
+        )
+    if isinstance(phase_before_second, str):
+        phase_before_second = json.loads(phase_before_second)
+    second_successor_vmi = uuid4()
+    second_successor_launcher = uuid4()
+    second_admitted = await store.admit_hold(
+        **(
+            admission_kwargs(job_id, lease_token + 2)
+            | {
+                "provision_generation": generation,
+                "vm_uid": vm_uid,
+                "prior_vmi_uid": successor_vmi_uid,
+                "prior_launcher_uid": successor_launcher_uid,
+                "root_pvc_uid": pvc_uid,
+            }
+        )
+    )
+    second_claim = await store.claim_due(second_admitted.operation_id)
+    assert second_claim is not None, second_admitted
+    second_receipt = {
+        **receipt,
+        "vmi_uid": str(successor_vmi_uid),
+        "launcher_uid": str(successor_launcher_uid),
+        "observed_at": datetime.now(timezone.utc).isoformat(),
+    }
+    second_digest = await store.accept_stop_evidence(second_claim, second_receipt)
+    assert second_digest is not None
+    second_observation = {
+        **observation,
+        "stop_receipt_digest": second_digest,
+        "successor": {
+            **observation["successor"],
+            "vmi_uid": str(second_successor_vmi),
+            "launcher_uid": str(second_successor_launcher),
+        },
+    }
+    second_stage = await store.stage_observation(
+        operation_id=second_claim.operation_id,
+        version=second_claim.version,
+        claim_token=second_claim.claim_token,
+        phase="attesting",
+        observation=second_observation,
+    )
+    assert second_stage is not None
+    assert await store.release_recovered(
+        operation_id=second_stage.operation_id,
+        version=second_stage.version,
+        claim_token=second_stage.claim_token,
+        initial_observation=second_observation,
+        final_observation=second_observation.copy(),
+        resume_receipt={"kind": "workspace_recovery"},
+    )
+    async with app_pg.acquire() as conn:
+        second_vm = await conn.fetchval(
+            "SELECT context->'vm' FROM jobs WHERE id=$1", job_id
+        )
+    if isinstance(second_vm, str):
+        second_vm = json.loads(second_vm)
+    assert second_vm["vmi_uid"] == str(second_successor_vmi)
+    assert second_vm["provisioning"]["identity"]["vmi_uid"] == str(second_successor_vmi)
+    assert {
+        key: value
+        for key, value in second_vm["provisioning"].items()
+        if key != "identity"
+    } == {key: value for key, value in phase_before_second.items() if key != "identity"}
+    assert second_vm["provisioning_revision"] == vm["provisioning_revision"] + 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "invalid",
+    ["wrong_predecessor", "malformed_clock", "invalid_revision", "top_vmi_changed"],
+)
+async def test_recovery_phase_conflict_keeps_exact_hold(app_pg, invalid) -> None:
+    from shared.vm_provisioning_phases import observe_provisioning
+    from tests.test_vm_provisioning_phases import running
+
+    job_id, lease_token = await insert_leased_job(app_pg)
+    kwargs = admission_kwargs(job_id, lease_token)
+    async with app_pg.acquire() as conn:
+        phase_now = await conn.fetchval(
+            "SELECT extract(epoch FROM clock_timestamp())::double precision"
+        )
+    phase = observe_provisioning(
+        None,
+        running(
+            owner_id=str(job_id),
+            namespace="workers",
+            provision_generation=str(kwargs["provision_generation"]),
+            vm_uid=str(kwargs["vm_uid"]),
+            vmi_uid=str(kwargs["prior_vmi_uid"]),
+            rootdisk_pvc_uid=str(kwargs["root_pvc_uid"]),
+        ),
+        now=phase_now,
+    )
+    revision = 4
+    if invalid == "wrong_predecessor":
+        phase["identity"]["vmi_uid"] = str(uuid4())
+    elif invalid == "malformed_clock":
+        phase["first_guest_started_at"] = -1
+    else:
+        revision = 2**63 - 2
+    vm = {
+        "provision_generation": str(kwargs["provision_generation"]),
+        "vm_uid": str(kwargs["vm_uid"]),
+        "vmi_uid": str(kwargs["prior_vmi_uid"]),
+        "rootdisk_pvc_uid": str(kwargs["root_pvc_uid"]),
+        "provisioning": phase,
+        "provisioning_revision": revision,
+    }
+    if invalid == "top_vmi_changed":
+        vm["vmi_uid"] = str(uuid4())
+    async with app_pg.acquire() as conn:
+        await conn.execute(
+            "UPDATE jobs SET context=jsonb_build_object('vm',$2::jsonb) WHERE id=$1",
+            job_id,
+            json.dumps(vm),
+        )
+    store = VMWorkspaceRecoveryStore(app_pg, worker_id="leader-a")
+    admitted = await store.admit_hold(**kwargs)
+    claimed = await store.claim_due(admitted.operation_id)
+    assert claimed is not None
+    observation = same_runtime_observation(job_id, kwargs)
+    assert not await store.release_recovered(
+        operation_id=claimed.operation_id,
+        version=claimed.version,
+        claim_token=claimed.claim_token,
+        initial_observation=observation,
+        final_observation=observation.copy(),
+        resume_receipt={"kind": "same_runtime_ready"},
+    )
+    async with app_pg.acquire() as conn:
+        actual_vm = await conn.fetchval(
+            "SELECT context->'vm' FROM jobs WHERE id=$1", job_id
+        )
+        queue = await conn.fetchrow(
+            "SELECT state,lease_token,park_reason FROM run_queue WHERE unit_id=$1",
+            job_id,
+        )
+        operation = await conn.fetchrow(
+            "SELECT phase,reason_code,resolved_at FROM vm_workspace_recoveries "
+            "WHERE id=$1",
+            admitted.operation_id,
+        )
+    if isinstance(actual_vm, str):
+        actual_vm = json.loads(actual_vm)
+    assert actual_vm == vm
+    assert tuple(queue) == ("parked", admitted.hold_lease_token, "workspace_recovery")
+    assert operation["phase"] == "paused_attention"
+    assert operation["reason_code"] == WorkspaceRecoveryCode.IDENTITY_CONFLICT.value
+    assert operation["resolved_at"] is None
 
 
 @pytest.mark.asyncio
@@ -3892,3 +4880,174 @@ async def test_admission_rechecks_canonical_membership_shape(
                 "SELECT state, lease_token FROM run_queue WHERE unit_id=$1", reporter_id
             )
         ) == ("parked", 28)
+
+
+# ---------------------------------------------------------------------------
+# Legacy pinned thread retirement: keep, then purge of the same VM identity
+# ---------------------------------------------------------------------------
+
+
+def _legacy_thread_vm():
+    return SimpleNamespace(
+        provision_generation=str(uuid4()),
+        vm_uid=str(uuid4()),
+        rootdisk_pvc_uid=str(uuid4()),
+    )
+
+
+def _thread_cleanup_ids(thread_id, identity):
+    return {
+        purge: vm_cleanup_request_identity(
+            owner_kind="thread",
+            owner_id=thread_id,
+            identity=identity,
+            source="pinned_thread_retirement",
+            purge_disk=purge,
+        )
+        for purge in (False, True)
+    }
+
+
+async def _thread_admissions(app_pg, owner):
+    rows = await app_pg.fetch(
+        "SELECT id,request_id,intent_digest,completed_at,outcome "
+        "FROM vm_workspace_cleanup_admissions WHERE owner_kind='thread' "
+        "AND owner_id=$1 ORDER BY admitted_at",
+        owner,
+    )
+    return [dict(row) for row in rows]
+
+
+@pytest.mark.asyncio
+async def test_pinned_thread_purge_after_keep_takes_its_own_stable_request_id(
+    app_pg,
+) -> None:
+    store = VMWorkspaceRecoveryStore(app_pg, worker_id="test-worker")
+    thread_id, identity = str(uuid4()), _legacy_thread_vm()
+    ids = _thread_cleanup_ids(thread_id, identity)
+    owner, _, shared_id, keep_digest, _ = ids[False]
+    purge_digest = ids[True][3]
+
+    keep = await acquire_pinned_thread_retirement_cleanup_permit(
+        store, thread_id=thread_id, identity=identity, purge_disk=False
+    )
+    assert keep.allowed
+    # Retrying the same soft End keeps the historical request ID.
+    again = await acquire_pinned_thread_retirement_cleanup_permit(
+        store, thread_id=thread_id, identity=identity, purge_disk=False
+    )
+    assert again.admission_id == keep.admission_id
+    assert await store.complete_cleanup_permit(keep.admission_id, outcome="completed")
+    keep_row = (await _thread_admissions(app_pg, owner))[0]
+    assert (keep_row["request_id"], keep_row["intent_digest"]) == (
+        shared_id,
+        keep_digest,
+    )
+
+    purge = await acquire_pinned_thread_retirement_cleanup_permit(
+        store, thread_id=thread_id, identity=identity, purge_disk=True
+    )
+    assert purge.allowed and purge.admission_id != keep.admission_id
+    successor = pinned_thread_purge_successor_request_id(shared_id)
+    assert purge.parent_cleanup["request_id"] == str(successor)
+    assert purge.parent_cleanup["intent"]["purge_disk"] is True
+    # Interrupted and repeated Deletes reuse the purge's own admission.
+    for _ in range(2):
+        retry = await acquire_pinned_thread_retirement_cleanup_permit(
+            store, thread_id=thread_id, identity=identity, purge_disk=True
+        )
+        assert retry.admission_id == purge.admission_id
+    assert await store.complete_cleanup_permit(purge.admission_id, outcome="completed")
+    replay = await acquire_pinned_thread_retirement_cleanup_permit(
+        store, thread_id=thread_id, identity=identity, purge_disk=True
+    )
+    assert replay.admission_id == purge.admission_id
+    assert replay.completed_outcome == "completed"
+    rows = await _thread_admissions(app_pg, owner)
+    assert rows[0] == keep_row
+    assert [(row["request_id"], row["intent_digest"]) for row in rows[1:]] == [
+        (successor, purge_digest)
+    ]
+
+
+@pytest.mark.asyncio
+async def test_pinned_thread_purge_waits_for_an_open_keep(app_pg) -> None:
+    store = VMWorkspaceRecoveryStore(app_pg, worker_id="test-worker")
+    thread_id, identity = str(uuid4()), _legacy_thread_vm()
+    owner = _thread_cleanup_ids(thread_id, identity)[False][0]
+    keep = await acquire_pinned_thread_retirement_cleanup_permit(
+        store, thread_id=thread_id, identity=identity, purge_disk=False
+    )
+    before = await _thread_admissions(app_pg, owner)
+
+    purge = await acquire_pinned_thread_retirement_cleanup_permit(
+        store, thread_id=thread_id, identity=identity, purge_disk=True
+    )
+
+    assert not purge.allowed
+    assert purge.reason == "workspace_cleanup_already_admitted"
+    assert purge.admission_id == keep.admission_id
+    assert await _thread_admissions(app_pg, owner) == before
+
+
+@pytest.mark.asyncio
+async def test_pinned_thread_purge_refuses_a_mismatched_shared_request(
+    app_pg,
+) -> None:
+    """Only this identity's exact keep admission earns the purge successor."""
+
+    store = VMWorkspaceRecoveryStore(app_pg, worker_id="test-worker")
+    thread_id, identity = str(uuid4()), _legacy_thread_vm()
+    owner, pvc_uid, shared_id, _, _ = _thread_cleanup_ids(thread_id, identity)[False]
+    unknown = await store.acquire_cleanup_permit(
+        owner_kind="thread",
+        owner_id=owner,
+        pvc_uid=pvc_uid,
+        request_id=shared_id,
+        source="pinned_thread_retirement",
+        intent_digest="sha256:unreviewed-intent",
+    )
+    assert await store.complete_cleanup_permit(
+        unknown.admission_id, outcome="completed"
+    )
+    before = await _thread_admissions(app_pg, owner)
+
+    with pytest.raises(WorkspaceRecoveryControlConflict) as refused:
+        await acquire_pinned_thread_retirement_cleanup_permit(
+            store, thread_id=thread_id, identity=identity, purge_disk=True
+        )
+
+    assert refused.value.code == "cleanup_request_id_reused"
+    assert await _thread_admissions(app_pg, owner) == before
+
+
+@pytest.mark.asyncio
+async def test_pinned_thread_purge_without_keep_keeps_the_historical_request_id(
+    app_pg,
+) -> None:
+    """A live session's Delete, or a purge admitted before this contract."""
+
+    store = VMWorkspaceRecoveryStore(app_pg, worker_id="test-worker")
+    thread_id, identity = str(uuid4()), _legacy_thread_vm()
+    owner, _, shared_id, purge_digest, _ = _thread_cleanup_ids(thread_id, identity)[
+        True
+    ]
+    historical = await acquire_vm_cleanup_permit(
+        store,
+        owner_kind="thread",
+        owner_id=thread_id,
+        identity=identity,
+        source="pinned_thread_retirement",
+        purge_disk=True,
+    )
+
+    purge = await acquire_pinned_thread_retirement_cleanup_permit(
+        store, thread_id=thread_id, identity=identity, purge_disk=True
+    )
+
+    assert purge.admission_id == historical.admission_id
+    assert purge.parent_cleanup["request_id"] == str(shared_id)
+    assert [
+        (row["request_id"], row["intent_digest"])
+        for row in await _thread_admissions(app_pg, owner)
+    ] == [(shared_id, purge_digest)]

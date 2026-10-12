@@ -17,7 +17,7 @@ import inspect
 import logging
 import time
 import uuid as _uuid
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from enum import Enum
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Sequence, Union
 
@@ -33,9 +33,28 @@ from langchain_core.messages import (
 from agent.core.context import (
     ContextManager,
     extract_summary_text,
+    is_compaction_summary,
+    keep_window_start,
     repair_tool_call_arguments,
     repair_tool_pairing,
     scrub_history_tool_call_arguments,
+    strip_unreplayable_blocks,
+)
+from agent.core.context_injection import (
+    ContextSources,
+    max_memories_per_entry,
+    plan_context_entries,
+)
+from agent.core.memory_summary import (
+    conversation_memory_summary,
+    memory_summary_enabled,
+)
+from shared.runtime.core.context_entries import (
+    entry_kind,
+    fold_context_entries,
+    has_folded_carrier,
+    is_append_only,
+    last_user_text,
 )
 from shared.runtime.core.llm_retry import _classify_llm_error, _extract_rate_limit_delay
 from shared.runtime.core.loader import with_current_date
@@ -46,6 +65,7 @@ from shared.runtime.core.message_markers import (
     unpin_turn_input,
 )
 from agent.core.summarizer import count_text_tokens
+from agent.core.tool_output_redaction import redact_tool_result
 from shared.runtime.core.workspace_backend import WorkspaceUnavailableError
 from shared.tool_arg_coercion import coerce_tool_args
 from shared.runtime.core.workspace_injection import find_tail_injection_anchor
@@ -66,6 +86,16 @@ from agent.services.image_content import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _holds_system_prompt(message: BaseMessage) -> bool:
+    """Whether ``message`` is the loop's system-prompt slot (``messages[0]``).
+
+    A legacy compaction summary is a SystemMessage too (the current one is a
+    HumanMessage) and can be what a checkpoint restore puts first; it must
+    never be mistaken for (or overwritten as) the prompt.
+    """
+    return isinstance(message, SystemMessage) and not is_compaction_summary(message)
 
 
 def _injection_anchor_index(messages: List[BaseMessage]) -> int:
@@ -156,23 +186,31 @@ def _charter_injection_enabled(config: Any) -> bool:
     )
 
 
-def _active_subagents_block(tool_context: Optional[Any]) -> str:
-    """Render one transient parent-tail status block, or ``""`` when idle.
+def _active_subagents_state(tool_context: Optional[Any]) -> Optional[str]:
+    """The active-subagent status block, as the append-only planner reads it.
 
-    The runtime mirror is deliberately best-effort prompt context.  Durable
-    child state remains in the subagent ledger, so a renderer failure must not
-    fail the parent turn or leak a half-updated message into session history.
+    None when there is no subagent runtime or rendering failed (the planner
+    leaves the section alone); ``""`` when none is live (the cleared
+    rendering, once, if the history still shows an older status). The
+    runtime mirror is deliberately best-effort prompt context.  Durable child
+    state remains in the subagent ledger, so a renderer failure must not fail
+    the parent turn or leak a half-updated message into session history.
     """
     runtime = getattr(tool_context, "subagent_runtime", None)
     render = getattr(runtime, "active_subagents_block", None)
     if not callable(render):
-        return ""
+        return None
     try:
         value = render()
     except Exception:
         logger.debug("Failed to render active subagent status", exc_info=True)
-        return ""
+        return None
     return str(value or "").strip()
+
+
+def _active_subagents_block(tool_context: Optional[Any]) -> str:
+    """Render one transient parent-tail status block, or ``""`` when idle."""
+    return _active_subagents_state(tool_context) or ""
 
 
 def _inject_context_pairs(
@@ -599,10 +637,21 @@ class PersistentLoopCallbacks:
     # value behaves like "graceful" (preserves partial response).
     check_interrupt: Callable[[], Optional[str]]
 
+    # Read-only: who asked for the pending interrupt of the current turn,
+    # without consuming it. ``"user"`` (``USER_INTERRUPT_CAUSE``) is a person's
+    # Stop; any other value is the platform's own abort (a stateless executor
+    # shutting down or losing its lease). Only the delegation batch reads it:
+    # it stops its children for a person and leaves a platform abort pending,
+    # so the batch keeps running, writes nothing when the turn is then
+    # cancelled, and the successor settles it (parallel_subagents.md §8).
+    # Optional: None ⇒ every interrupt counts as a person's Stop (previous
+    # behaviour).
+    peek_interrupt_cause: Optional[Callable[[], Optional[str]]] = None
+
     # Notify the client that a workspace upgrade is available. Fires for BOTH a
     # sandbox sudo intercept asking for a VM (freeze_type=vm_upgrade_required)
-    # and a lite agent's request_workspace_upgrade asking for a sandbox
-    # (freeze_type=workspace_upgrade_required, workspace_tier_upgrade.md §4.2 S5).
+    # and a lite agent's request_workspace_upgrade asking for an upgrade (a VM in
+    # a Session, a container in a Job) (freeze_type=workspace_upgrade_required, workspace_tier_upgrade.md §4.2 S5).
     # The freeze_data carries freeze_type + (target_tier|command) + reason.
     on_workspace_upgrade_needed: Optional[
         Callable[[Dict[str, Any]], Awaitable[None]]
@@ -746,6 +795,22 @@ class PersistentLoopCallbacks:
     # that may already have produced external side effects. UI on_tool_start is
     # intentionally insufficient because it also renders unbound tool errors.
     on_tool_execution_start: Optional[Callable[[str, str], Awaitable[None]]] = None
+
+    # Idle-time memory prefetch (append-only context injection WP4; D24,
+    # D32, D33). Both unset: no prefetch (tests, other transports).
+    # ``idle_input_arrived`` answers, while the prefetch runs after a turn,
+    # whether the thread has new input that must not wait for it (stateless:
+    # the claim's ``run_queue.input_seq`` rose under its lease; pinned: the
+    # input runtime holds or can claim a delivery). Truthy cancels it.
+    idle_input_arrived: Optional[Callable[[], Awaitable[Any]]] = None
+    # Save the conversation's pending memory set with the conversation
+    # (``threads.metadata``, atomic ``jsonb_set``, fenced like the turn's
+    # other writes): ``(payload, None)`` writes the set, ``(None,
+    # expected_id)`` clears the stored set with that id. True when the
+    # statement ran.
+    save_pending_memory: Optional[
+        Callable[[Optional[Dict[str, Any]], Optional[str]], Awaitable[bool]]
+    ] = None
 
     def __post_init__(self) -> None:
         # Back-compat: callers that still pass the deprecated on_vm_upgrade_needed
@@ -979,6 +1044,239 @@ async def _await_or_hard_interrupt(
     return None, True
 
 
+# ---------------------------------------------------------------------------
+# Session delegation batch (parallel_subagents.md §6.3, §6.4, §8)
+# ---------------------------------------------------------------------------
+
+#: How often a running delegation batch polls ``check_interrupt``. A Stop that
+#: lands while a tool runs is "graceful", which sets no event to wait on.
+_DELEGATION_INTERRUPT_POLL_S = 0.25
+#: ``PersistentLoopCallbacks.peek_interrupt_cause`` of a person's Stop. Equal
+#: to ``agent.api.session_input.INTERRUPT_CAUSE_USER`` (pinned by a test; the
+#: loop does not import the transport layer).
+USER_INTERRUPT_CAUSE = "user"
+#: Strict persistence of one delegation result. The write is an upsert by the
+#: message id, so a retry can never produce a second row.
+_DELEGATION_RESULT_PERSIST_ATTEMPTS = 3
+_DELEGATION_RESULT_PERSIST_RETRY_S = 0.5
+
+#: First line of a call cancelled because its batch could not go on.
+DELEGATION_CANCELLED_HEADER = "[delegate_agent: CANCELLED - no final report]"
+_WORKSPACE_UNAVAILABLE_REASON = "the workspace became unavailable"
+
+
+class DelegationResultNotDurable(RuntimeError):
+    """A delegation result could not be saved to the parent transcript.
+
+    The result is the delivery fact of its child. The turn stops before any
+    further provider call, so no final answer can make the batch look
+    delivered; the turn-end reconcile retries the same rows (by id), and a
+    successor's settle writes whatever is still missing.
+    """
+
+
+def _session_fanout_allowed(tool_context: Optional[Any]) -> bool:
+    """``fanout.session_fanout_allowed``, read live and never fatal."""
+    if tool_context is None:
+        return False
+    from agent.tools.delegation import fanout
+
+    try:
+        return fanout.session_fanout_allowed(tool_context) is True
+    except Exception:
+        logger.warning(
+            "Session fan-out gate unreadable; treating as off", exc_info=True
+        )
+        return False
+
+
+def _delegation_max_calls_per_turn(tool_context: Any) -> int:
+    from agent.tools.delegation import fanout
+
+    return max(1, int(fanout.delegation_max_calls_per_turn(tool_context)))
+
+
+def _delegation_over_limit_text(limit: int) -> str:
+    """Result of a call above the per-turn maximum (§6.4). Not retryable."""
+    return (
+        "Error: delegate_agent call refused: this turn has reached its maximum "
+        f"of {limit} delegate_agent calls. This subagent did not run. Do not "
+        "retry it in this turn: work with the reports you have, or do the rest "
+        "yourself."
+    )
+
+
+def _delegation_not_started_text(exc: BaseException) -> str:
+    """Result of a call whose effect boundary refused to start it."""
+    return (
+        "Error: delegate_agent did not start this subagent "
+        f"({type(exc).__name__}: {exc}). It did no work and changed nothing."
+    )
+
+
+def _delegation_cancelled_text(reason: str) -> str:
+    """Result of a call the batch cancelled because it could not go on."""
+    return "\n".join(
+        [
+            DELEGATION_CANCELLED_HEADER,
+            f"This subagent was cancelled before it finished, because {reason}. "
+            "It produced no final report. If it had already started, anything "
+            "it changed in the workspace is still there and may be incomplete.",
+            "If this work is still needed, first check the workspace for what "
+            "it already produced, then delegate only what is still missing.",
+        ]
+    )
+
+
+@dataclass
+class _DelegationSlot:
+    """One ``delegate_agent`` call of a batch, in provider order."""
+
+    tool: Any
+    args: Dict[str, Any]
+    tool_call_id: str
+    #: ``approved`` | ``declined`` | ``over_limit``
+    decision: str
+    #: Crossed ``on_tool_execution_start`` (the child may have started).
+    started: bool = False
+    content: str = ""
+    is_error: bool = False
+    #: The result written before any child started (declined, over limit).
+    message: Optional[ToolMessage] = None
+
+
+@dataclass
+class _DelegationBatchOutcome:
+    stopped: bool = False
+    fatal: Optional[BaseException] = None
+    cancelled_by_batch: set = field(default_factory=set)
+
+
+async def _await_turn_interrupt(
+    check_interrupt: Callable[[], Any],
+    hard_event: Optional[asyncio.Event],
+    peek_cause: Optional[Callable[[], Optional[str]]] = None,
+) -> str:
+    """Poll the turn's one-shot interrupt flag; return its mode once set.
+
+    Only a person's Stop is consumed. An interrupt the platform raised
+    (``peek_cause`` names anything but ``USER_INTERRUPT_CAUSE``) stays pending
+    and unconsumed: the batch keeps running, and the executor that raised it
+    cancels the turn next, which writes no result (§8). The peek and the
+    consume run with no await between them. Without ``peek_cause`` every
+    interrupt is a person's.
+    """
+    while True:
+        cause = peek_cause() if peek_cause is not None else None
+        if cause is None or cause == USER_INTERRUPT_CAUSE:
+            mode = check_interrupt()
+            if mode:
+                return mode if isinstance(mode, str) else "graceful"
+        if hard_event is not None and not hard_event.is_set():
+            try:
+                await asyncio.wait_for(
+                    hard_event.wait(), timeout=_DELEGATION_INTERRUPT_POLL_S
+                )
+            except asyncio.TimeoutError:
+                pass
+        else:
+            await asyncio.sleep(_DELEGATION_INTERRUPT_POLL_S)
+
+
+async def _supervise_delegation_batch(
+    tasks: Sequence["asyncio.Task[Any]"],
+    *,
+    check_interrupt: Callable[[], Any],
+    hard_interrupt_event: Optional[asyncio.Event],
+    stop_children: Callable[[], Awaitable[Any]],
+    peek_interrupt_cause: Optional[Callable[[], Optional[str]]] = None,
+) -> _DelegationBatchOutcome:
+    """Wait until every call task of a delegation batch has ended.
+
+    - Stop (the turn's interrupt flag) is raced against the batch (D4):
+      ``stop_children`` runs once and the batch keeps waiting, so every call
+      still ends with its own result. Only a person's Stop counts; an
+      interrupt the platform raised (``peek_interrupt_cause``) is left
+      pending and the batch keeps running (§8).
+    - A call that fails on its own is its own outcome; the siblings keep
+      running. A ``WorkspaceUnavailableError`` is the exception: the siblings
+      share the dead workspace, so they are cancelled and each is reported
+      as cancelled. The failure the turn ends with is returned as ``fatal``:
+      a ``WorkspaceUnavailableError`` whenever one occurred (its message
+      tells the user how to recover), else the first failure.
+    - A cancellation — of the turn task (shutdown, drain) or of a call task
+      by itself — is never an outcome: every task is cancelled and joined,
+      nothing is reported, and ``CancelledError`` propagates. The successor
+      settles the batch (§5.3).
+    """
+    outcome = _DelegationBatchOutcome()
+    pending = set(tasks)
+    watcher = asyncio.ensure_future(
+        _await_turn_interrupt(
+            check_interrupt, hard_interrupt_event, peek_interrupt_cause
+        )
+    )
+    try:
+        while pending:
+            waiting = set(pending)
+            if not watcher.done():
+                waiting.add(watcher)
+            done, _ = await asyncio.wait(waiting, return_when=asyncio.FIRST_COMPLETED)
+            if watcher in done:
+                done.discard(watcher)
+                if watcher.cancelled():
+                    pass
+                elif watcher.exception() is not None:
+                    logger.warning(
+                        "Interrupt poll failed during a delegation batch: %s",
+                        watcher.exception(),
+                    )
+                else:
+                    outcome.stopped = True
+                    logger.info(
+                        "Interrupt received during a delegation batch — "
+                        "stopping its children"
+                    )
+                    try:
+                        await stop_children()
+                    except Exception:
+                        logger.warning(
+                            "Stopping the delegation batch failed", exc_info=True
+                        )
+            for task in done:
+                pending.discard(task)
+                if task.cancelled():
+                    if task in outcome.cancelled_by_batch:
+                        continue
+                    raise asyncio.CancelledError()
+                exc = task.exception()
+                if exc is None:
+                    continue
+                if not isinstance(exc, Exception):
+                    raise exc
+                workspace_lost = isinstance(exc, WorkspaceUnavailableError)
+                if outcome.fatal is None or (
+                    workspace_lost
+                    and not isinstance(outcome.fatal, WorkspaceUnavailableError)
+                ):
+                    outcome.fatal = exc
+                if workspace_lost:
+                    for sibling in pending:
+                        outcome.cancelled_by_batch.add(sibling)
+                        sibling.cancel()
+    except BaseException:
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        watcher.cancel()
+        await asyncio.gather(*tasks, watcher, return_exceptions=True)
+        raise
+    if not watcher.done():
+        watcher.cancel()
+        await asyncio.gather(watcher, return_exceptions=True)
+    return outcome
+
+
 async def run_persistent_loop(
     llm_with_tools: BaseChatModel,
     tools: List[Any],
@@ -1078,7 +1376,13 @@ async def run_persistent_loop(
     # Send system prompt as first message if not already present. Re-stamp the
     # date: a resumed session's prompt was built whenever the session was
     # created, which may be many days ago.
-    if not messages or not isinstance(messages[0], SystemMessage):
+    #
+    # A checkpoint restore starts with the compaction SUMMARY, which is also a
+    # SystemMessage. Treating it as the prompt slot skipped the prompt insert,
+    # and the per-turn refresh below then overwrote the summary with the prompt
+    # — every restored session silently lost all history before its kept tail
+    # (session_slash_commands_and_stateless_compact.md §6).
+    if not messages or not _holds_system_prompt(messages[0]):
         messages.insert(0, SystemMessage(content=with_current_date(system_prompt)))
 
     logger.info(
@@ -1173,7 +1477,7 @@ async def run_persistent_loop(
         current_prompt = (
             get_current_system_prompt() if get_current_system_prompt else None
         )
-        if not current_prompt and messages and isinstance(messages[0], SystemMessage):
+        if not current_prompt and messages and _holds_system_prompt(messages[0]):
             current_prompt = messages[0].content
         # Restored history can in principle carry list-shaped content; date
         # stamping is a nicety and must never take the session loop down.
@@ -1181,7 +1485,7 @@ async def run_persistent_loop(
             current_prompt = with_current_date(current_prompt)
             if (
                 messages
-                and isinstance(messages[0], SystemMessage)
+                and _holds_system_prompt(messages[0])
                 and messages[0].content != current_prompt
             ):
                 messages[0].content = current_prompt
@@ -1452,11 +1756,17 @@ async def run_persistent_loop(
                 # stamp.  This is process-local context only; the session
                 # transcript remains the durable source of the turn number.
                 tool_context._current_turn_count = turn_id
+                # A recovery turn's input is its continuation event: children
+                # it delegates name the event as their parent input, and a
+                # crash in this turn is settled against it (§7).
                 tool_context._current_input_message_id = str(user_msg.id)
                 tool_context._current_ai_message_id = None
+                # D3: a session allowed to fan out may delegate again in its
+                # recovery turn. Otherwise the ban stays as it was.
                 tool_context._stateless_subagent_recovery_active = bool(
                     input_delivery_source == "subagent"
                     and input_supersedes_seq is not None
+                    and not _session_fanout_allowed(tool_context)
                 )
             try:
                 result = await _execute_turn(
@@ -1768,6 +2078,23 @@ async def run_persistent_loop(
                             f"Turn {turn_id}: workspace git push raised",
                             exc_info=True,
                         )
+            # Idle-time memory prefetch, stateless lane (WP4, D33, B8): the
+            # reply is out and the turn reconciled; the claim still holds its
+            # slot, its interrupt window and its workspace until the settled
+            # edge below, and new input cancels the step within one poll.
+            if defer_memory_extraction_to_outbox and _idle_prefetch_allowed(
+                result,
+                input_removed=input_delivery_removed_from_context,
+                priority_input=priority_user_input,
+                deferred_errors=deferred_errors,
+            ):
+                await _idle_memory_prefetch(
+                    memory_service=memory_service,
+                    config=config,
+                    messages=messages,
+                    callbacks=callbacks,
+                    turn_id=turn_id,
+                )
         finally:
             if callbacks.on_turn_settled is not None:
                 await callbacks.on_turn_settled(turn_id)
@@ -1803,6 +2130,24 @@ async def run_persistent_loop(
 
         if halt_after_turn:
             return
+
+        # Idle-time memory prefetch, pinned lane (WP4, D33): after the turn
+        # and its input delivery settled, before the loop parks for input. A
+        # pinned pod keeps its session; new input (accepted or claimable)
+        # cancels the step within one poll.
+        if not defer_memory_extraction_to_outbox and _idle_prefetch_allowed(
+            result,
+            input_removed=input_delivery_removed_from_context,
+            priority_input=priority_user_input,
+            deferred_errors=deferred_errors,
+        ):
+            await _idle_memory_prefetch(
+                memory_service=memory_service,
+                config=config,
+                messages=messages,
+                callbacks=callbacks,
+                turn_id=turn_id,
+            )
 
         logger.info(
             f"Turn {turn_id} complete: {tool_calls_this_turn} tool calls, "
@@ -1880,6 +2225,245 @@ async def _emit_reasoning_content(response, callbacks, *, message_id) -> bool:
     return True
 
 
+#: ``memory.prefetch_budget_s`` when the config carries no number (WP4).
+_DEFAULT_PREFETCH_BUDGET_S = 3.0
+
+
+def _prefetch_budget_seconds(config: Any) -> float:
+    """``memory.prefetch_budget_s``; the default for a config without one."""
+    value = getattr(getattr(config, "memory", None), "prefetch_budget_s", None)
+    if isinstance(value, (int, float)) and not isinstance(value, bool) and value >= 0:
+        return float(value)
+    return _DEFAULT_PREFETCH_BUDGET_S
+
+
+def _idle_prefetch_allowed(
+    result: Optional["TurnResult"],
+    *,
+    input_removed: bool,
+    priority_input: Any,
+    deferred_errors: Sequence[Any],
+) -> bool:
+    """Whether a finished turn ends with the idle-time prefetch (WP4).
+
+    Only a turn that ran to its answer: not one that failed, was stopped,
+    lost its admission or its input, and not when a reclaimed input is
+    already waiting to run next.
+    """
+    return (
+        result is not None
+        and not result.interrupted
+        and not result.admission_closed
+        and result.error is None
+        and not input_removed
+        and priority_input is None
+        and not deferred_errors
+    )
+
+
+def _absent_from(messages: List[BaseMessage]) -> Callable[[str, Any], bool]:
+    """``keep(kind, record)``: True when the history lacks the record as is.
+
+    The prefetch keeps only memories and notes the next request would
+    append (D3), so an unchanged set is neither stored nor taken in again.
+    """
+    from agent.core.context_injection import knowledge_item, memory_item, scan_presence
+
+    presence = scan_presence(messages)
+
+    def keep(kind: str, record: Any) -> bool:
+        if kind == "memory":
+            item = memory_item(record)
+        elif kind == "knowledge":
+            item = knowledge_item(record)
+        else:
+            return True
+        return presence.item_hash(kind, item) != item.hash
+
+    return keep
+
+
+async def _save_pending_memory_set(
+    memory_service: Any,
+    save: Callable[[Optional[Dict[str, Any]], Optional[str]], Awaitable[bool]],
+    turn_id: int,
+) -> str:
+    """Bring the durable pending set in line with the manager's (D32).
+
+    Write first, clear second: a new set is written over the stored one; a
+    stored set the turn took in is cleared only when no new set replaces
+    it. A replay after a crash in between is harmless (D3). Best-effort:
+    a failure is logged and the turn ends normally. Returns what happened.
+    """
+    from agent.services.memory.pending_set import serialize_pending_set
+
+    pending = getattr(memory_service, "pending_prefetch", None)
+    durable = getattr(memory_service, "durable_pending_id", None)
+    try:
+        if pending is not None:
+            if pending.pending_id == durable:
+                return "unchanged"
+            payload = serialize_pending_set(pending, turn=turn_id)
+            if payload is not None:
+                if await save(payload, None):
+                    memory_service.note_pending_saved(pending.pending_id)
+                    return "written"
+                return "not_written"
+        if durable is not None:
+            if await save(None, durable):
+                memory_service.note_pending_saved(None)
+                return "cleared"
+            return "not_cleared"
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        logger.warning(
+            "Saving the pending memory set failed (non-fatal): %s: %s",
+            type(e).__name__,
+            e,
+        )
+        return "failed"
+    return "none"
+
+
+async def _idle_memory_prefetch(
+    *,
+    memory_service: Any,
+    config: Any,
+    messages: List[BaseMessage],
+    callbacks: "PersistentLoopCallbacks",
+    turn_id: int,
+) -> None:
+    """The last step of a session turn: retrieve in the idle time (WP4).
+
+    append_only only (D24, D32, D33). After the reply has been delivered
+    and the turn reconciled, one retrieval runs with the latest exchange
+    (the user's message and the final answer) as its query, under the hard
+    budget ``memory.prefetch_budget_s`` and without retries. New input (or
+    an interrupt, or a closing admission) cancels it at the next poll, so
+    the next turn waits at most one poll interval. A result becomes the
+    pending set the next turn's first request takes in, and is saved with
+    the conversation so another process can continue it; a set this turn
+    took in is cleared when nothing replaces it. The stateless lane runs
+    this before it settles the turn (the slot is still held, Stop still
+    works, the workspace is still attached); the pinned lane after.
+
+    The slot time is logged and audited (``memory_prefetch``). Never raises,
+    except a cancellation of the loop.
+    """
+    probe_input = callbacks.idle_input_arrived
+    save = callbacks.save_pending_memory
+    prefetch = getattr(memory_service, "prefetch", None)
+    if (
+        not is_append_only(config)
+        or memory_service is None
+        or probe_input is None
+        or save is None
+        or prefetch is None
+    ):
+        return
+    from agent.services.memory import AssembleRequest, PrefetchOutcome
+    from agent.services.memory.query import build_exchange_query_text
+    from agent.services.memory.types import PREFETCH_SKIPPED
+
+    started = time.monotonic()
+    budget = _prefetch_budget_seconds(config)
+
+    async def _should_cancel() -> Optional[str]:
+        event = callbacks.hard_interrupt_event
+        if event is not None and event.is_set():
+            return "interrupt"
+        peek = callbacks.peek_interrupt_cause
+        if peek is not None and peek() is not None:
+            return "interrupt"
+        gate = callbacks.before_provider_admission
+        if gate is not None and not gate():
+            return "admission_closed"
+        return "new_input" if await probe_input() else None
+
+    query = build_exchange_query_text(messages)
+    try:
+        if query:
+            outcome = await prefetch(
+                AssembleRequest(
+                    query_text=query,
+                    model=getattr(getattr(config, "llm", None), "model", None),
+                    retries=False,
+                    ttl_tick=False,
+                ),
+                budget_s=budget,
+                should_cancel=_should_cancel,
+                keep=_absent_from(messages),
+            )
+        else:
+            outcome = PrefetchOutcome(status=PREFETCH_SKIPPED, reason="no_exchange")
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:  # pragma: no cover - prefetch contains its failures
+        logger.warning(
+            "Idle memory prefetch failed (non-fatal): %s: %s", type(e).__name__, e
+        )
+        return
+    saved = await _save_pending_memory_set(memory_service, save, turn_id)
+    slot_ms = (time.monotonic() - started) * 1000.0
+    logger.info(
+        "Idle memory prefetch: turn=%d status=%s reason=%s prefetch=%.0fms "
+        "slot=%.0fms memories=%d knowledge=%d pending_set=%s",
+        turn_id,
+        outcome.status,
+        outcome.reason,
+        outcome.duration_ms,
+        slot_ms,
+        outcome.memories,
+        outcome.knowledge,
+        saved,
+    )
+    audit = getattr(memory_service, "audit_prefetch", None)
+    if audit is not None:
+        audit(
+            outcome,
+            turn=turn_id,
+            budget_s=budget,
+            slot_ms=round(slot_ms, 1),
+            pending_set=saved,
+        )
+
+
+def _take_in_retrieval(
+    memory_service: Any, sources: ContextSources, *, bound_knowledge: bool
+) -> ContextSources:
+    """append_only (WP3, D8): the latest finished retrieval as planner input.
+
+    A finished result replaces the records the turn held so far and serves
+    the turn's later provider calls too, so a mid-turn compaction gets its
+    evicted memory appended again without a new retrieval (WP2 spec §E.5).
+    Its knowledge records are used only without bound KBs, which keep the
+    turn-start chunk retrieval. Nothing finished: the sources stay as they
+    are.
+    """
+    result = memory_service.take_retrieval()
+    if result is None:
+        return sources
+    memory: List[Any] = []
+    knowledge: List[Any] = []
+    for block in result.payload.blocks:
+        records = getattr(block, "records", None) or []
+        if block.kind == "memory":
+            memory.extend(records)
+        elif block.kind == "knowledge":
+            knowledge.extend(records)
+    logger.debug(
+        "Memory retrieval %s taken in %.0f ms after it finished: %d memories, %d notes",
+        result.seq,
+        result.age_ms(),
+        len(memory),
+        len(knowledge),
+    )
+    if bound_knowledge:
+        return replace(sources, memory_records=memory)
+    return replace(sources, memory_records=memory, knowledge_records=knowledge)
+
+
 async def _execute_turn(
     llm_with_tools: BaseChatModel,
     tool_map: Dict[str, Any],
@@ -1911,6 +2495,17 @@ async def _execute_turn(
     tool_calls_made = 0
     messages_added = 0
     first_provider_admitted = False
+    # delegate_agent calls of this turn within the per-turn maximum, across
+    # all its batches (enforced only for a session allowed to fan out).
+    delegate_calls_admitted = 0
+    # Append-only context injection (WP2 spec §I, §F.5): read per turn, since
+    # a session hot-swaps its config between turns. ``legacy`` rebuilds the
+    # transient tail on every provider call exactly as before; ``append_only``
+    # appends charter, memory, knowledge, citation feedback, the subagent
+    # status and the App Guide turn boundary to the history once, as typed
+    # context entries persisted as ``role='context'`` rows, and folds them
+    # into their carrier.
+    append_only = is_append_only(config)
 
     def _adopt(msg: Any) -> Any:
         """Stamp a message this turn appends with the turn's membership."""
@@ -1968,6 +2563,44 @@ async def _execute_turn(
             return await callbacks.persist_message(msg)
         return None
 
+    async def _persist_delegation_result(msg: Any) -> None:
+        """Persist one delegation result strictly: it is the delivery fact.
+
+        Only a transport that promises durable acknowledgements
+        (``require_delegation_persistence``) is held to it; a bounded retry
+        rewrites the same row. A result that stays unsaved raises
+        :class:`DelegationResultNotDurable`. A cancellation propagates.
+        """
+        if (
+            not callbacks.require_delegation_persistence
+            or callbacks.persist_message is None
+        ):
+            await _persist(msg)
+            return
+        last_error: Optional[BaseException] = None
+        for attempt in range(1, _DELEGATION_RESULT_PERSIST_ATTEMPTS + 1):
+            try:
+                if await callbacks.persist_message(msg) is True:
+                    return
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                last_error = exc
+            logger.warning(
+                "delegate_agent result %s not saved (attempt %d/%d)",
+                getattr(msg, "tool_call_id", "?"),
+                attempt,
+                _DELEGATION_RESULT_PERSIST_ATTEMPTS,
+            )
+            if attempt < _DELEGATION_RESULT_PERSIST_ATTEMPTS:
+                await asyncio.sleep(_DELEGATION_RESULT_PERSIST_RETRY_S * attempt)
+        raise DelegationResultNotDurable(
+            "A subagent result could not be saved to the conversation, so this "
+            "turn stopped before continuing. The subagents have ended and their "
+            "reports are kept under .subagents/ in the workspace. Send a "
+            "message to continue."
+        ) from last_error
+
     async def _record_unexecuted_tool_batch(
         tool_calls: Sequence[dict[str, Any]], *, reason: str
     ) -> None:
@@ -2001,6 +2634,17 @@ async def _execute_turn(
     knowledge_block = ""
     citation_feedback_block = ""
     charter_block = ""
+    # append_only: the store records behind each kind, in rank order (the
+    # planner's input, WP2 spec §C). With the memory manager they come from
+    # the asynchronous retrieval (WP3) and serve every later provider call
+    # of the turn; the direct-store reads below stay synchronous.
+    memory_records: List[Any] = []
+    knowledge_records: List[Any] = []
+    knowledge_bindings: Optional[List[Any]] = None
+    knowledge_watermarks: Optional[Dict[str, Optional[str]]] = None
+    # None = no citation engine or the lookup failed (leave the section
+    # alone); [] = none failed (the cleared rendering, O6).
+    failed_citations: Optional[List[Any]] = None
 
     from agent.core.knowledge_injection import selected_knowledge_bindings
     from shared.runtime.core.skill_resolution import (
@@ -2037,6 +2681,17 @@ async def _execute_turn(
     # tests/test_memory_persistent_equivalence.py). The per-store 5 s guard
     # lives in the manager's runtime (retrieval_timeout).
     manager_injection: List[BaseMessage] = []
+    # append_only (WP3, D6, D7, D10): the turn's retrieval runs off the
+    # request path, owned by the manager, with the query the turn-start
+    # retrieval always used; it is never awaited. Each provider call of the
+    # turn takes in the latest finished result before it plans (D8), and
+    # starts the turn's retrieval there if an earlier one was still in
+    # flight here (single flight). The first call goes out without memory
+    # when nothing has finished yet (D6); the idle-time prefetch is WP4.
+    # Without the manager (memory.manager.enabled false) the direct-store
+    # reads below stay synchronous in both modes.
+    turn_retrieval: Optional[Any] = None
+    turn_retrieval_started = False
     if memory_service is not None:
         if _provider_admission_closed():
             return _closed_result()
@@ -2056,32 +2711,36 @@ async def _execute_turn(
             )
         else:
             _query_text = build_persistent_query_text(messages)
-        _payload = await memory_service.assemble(
-            AssembleRequest(
-                query_text=_query_text,
-                model=getattr(config.llm, "model", None),
-            )
+        _request = AssembleRequest(
+            query_text=_query_text,
+            model=getattr(config.llm, "model", None),
         )
-        manager_injection = _payload.messages()
-        if kb_bindings:
-            # Multi-KB retrieval below owns the knowledge budget. Preserve the
-            # manager's memory messages while fencing its legacy note-level KB
-            # retriever to prevent duplicate native injection.
-            manager_injection = [
-                message
-                for block in _payload.blocks
-                if block.kind != "knowledge"
-                for message in block.messages
-            ]
-        for _block in _payload.blocks:
-            if _block.kind == "memory" and _block.items:
-                logger.debug(
-                    f"Memory injection: {len(_block.items)} memories retrieved"
-                )
-            elif _block.kind == "knowledge" and _block.items:
-                logger.debug(
-                    f"Knowledge injection: {len(_block.items)} notes retrieved"
-                )
+        if append_only:
+            turn_retrieval = _request
+            turn_retrieval_started = memory_service.start_retrieval(_request)
+        else:
+            _payload = await memory_service.assemble(_request)
+            manager_injection = _payload.messages()
+            if kb_bindings:
+                # Multi-KB retrieval below owns the knowledge budget. Preserve
+                # the manager's memory messages while fencing its legacy
+                # note-level KB retriever to prevent duplicate native
+                # injection.
+                manager_injection = [
+                    message
+                    for block in _payload.blocks
+                    if block.kind != "knowledge"
+                    for message in block.messages
+                ]
+            for _block in _payload.blocks:
+                if _block.kind == "memory" and _block.items:
+                    logger.debug(
+                        f"Memory injection: {len(_block.items)} memories retrieved"
+                    )
+                elif _block.kind == "knowledge" and _block.items:
+                    logger.debug(
+                        f"Knowledge injection: {len(_block.items)} notes retrieved"
+                    )
 
     if memory_service is None and recall_store:
         try:
@@ -2094,15 +2753,7 @@ async def _execute_turn(
         try:
             if _provider_admission_closed():
                 return _closed_result()
-            context_text = ""
-            for msg in reversed(messages):
-                if isinstance(msg, HumanMessage):
-                    context_text = (
-                        msg.content
-                        if isinstance(msg.content, str)
-                        else str(msg.content)
-                    )
-                    break
+            context_text = last_user_text(messages)
 
             memories = await asyncio.wait_for(
                 recall_store.retrieve(context_text), timeout=_RETRIEVAL_TIMEOUT
@@ -2110,9 +2761,12 @@ async def _execute_turn(
             if memories:
                 from shared.runtime.services.recall_store import RecallStore as _RS
 
-                memory_block = _RS.assemble_memory_block(
-                    memories, model=getattr(config.llm, "model", None)
-                )
+                if append_only:
+                    memory_records = list(memories)
+                else:
+                    memory_block = _RS.assemble_memory_block(
+                        memories, model=getattr(config.llm, "model", None)
+                    )
                 logger.debug(f"Memory injection: {len(memories)} memories retrieved")
         except asyncio.TimeoutError:
             logger.warning("Memory retrieval timed out — skipping injection")
@@ -2132,15 +2786,7 @@ async def _execute_turn(
         try:
             if _provider_admission_closed():
                 return _closed_result()
-            kb_context = ""
-            for msg in reversed(messages):
-                if isinstance(msg, HumanMessage):
-                    kb_context = (
-                        msg.content
-                        if isinstance(msg.content, str)
-                        else str(msg.content)
-                    )
-                    break
+            kb_context = last_user_text(messages)
 
             from agent.core.knowledge_injection import retrieve_bound_knowledge
             from shared.runtime.services.knowledge_store import KnowledgeStore as _KS
@@ -2152,12 +2798,17 @@ async def _execute_turn(
                 timeout=_RETRIEVAL_TIMEOUT,
             )
             if selection.notes:
-                knowledge_block = _KS.assemble_knowledge_block(
-                    selection.notes,
-                    model=getattr(config.llm, "model", None),
-                    bindings=selection.bindings,
-                    external_watermarks=selection.external_watermarks,
-                )
+                if append_only:
+                    knowledge_records = list(selection.notes)
+                    knowledge_bindings = list(selection.bindings or [])
+                    knowledge_watermarks = dict(selection.external_watermarks or {})
+                else:
+                    knowledge_block = _KS.assemble_knowledge_block(
+                        selection.notes,
+                        model=getattr(config.llm, "model", None),
+                        bindings=selection.bindings,
+                        external_watermarks=selection.external_watermarks,
+                    )
                 logger.debug(
                     "Knowledge injection: %s notes retrieved by binding=%s",
                     len(selection.notes),
@@ -2173,15 +2824,7 @@ async def _execute_turn(
         try:
             if _provider_admission_closed():
                 return _closed_result()
-            kb_context = ""
-            for msg in reversed(messages):
-                if isinstance(msg, HumanMessage):
-                    kb_context = (
-                        msg.content
-                        if isinstance(msg.content, str)
-                        else str(msg.content)
-                    )
-                    break
+            kb_context = last_user_text(messages)
 
             kb_notes = await asyncio.wait_for(
                 knowledge_store.hybrid_search(
@@ -2196,9 +2839,12 @@ async def _execute_turn(
                     KnowledgeStore as _KS,
                 )
 
-                knowledge_block = _KS.assemble_knowledge_block(
-                    kb_notes, model=getattr(config.llm, "model", None)
-                )
+                if append_only:
+                    knowledge_records = list(kb_notes)
+                else:
+                    knowledge_block = _KS.assemble_knowledge_block(
+                        kb_notes, model=getattr(config.llm, "model", None)
+                    )
                 logger.debug(f"Knowledge injection: {len(kb_notes)} notes retrieved")
         except asyncio.TimeoutError:
             logger.warning("Knowledge retrieval timed out — skipping injection")
@@ -2266,7 +2912,9 @@ async def _execute_turn(
                 _cit_engine.list_citations(verification_status="failed"),
                 timeout=_RETRIEVAL_TIMEOUT,
             )
-            if _failed_cites:
+            if append_only:
+                failed_citations = list(_failed_cites or [])
+            elif _failed_cites:
                 from agent.core.citation_feedback_injection import (
                     format_failed_citations,
                 )
@@ -2284,6 +2932,37 @@ async def _execute_turn(
                 type(e).__name__,
                 e,
             )
+
+    # The up-front memory summary (D35): loaded once per session runtime,
+    # only with memory_search bound, and not at all while the (restored)
+    # history holds it; append_only only.
+    memory_summary = ""
+    if append_only and memory_summary_enabled(memory_service, tool_map):
+        if _provider_admission_closed():
+            return _closed_result()
+        memory_summary = await conversation_memory_summary(
+            memory_service,
+            messages,
+            tool_names=tool_map,
+            model=getattr(config.llm, "model", None),
+        )
+
+    # append_only (WP2 spec §C): the turn-start payload as the planner's
+    # input. Every provider call of the turn plans against it after
+    # compaction, so what a compaction evicted is appended again (D4, D21)
+    # without a new retrieval (§E.5); only the subagent status is read per
+    # call, as the legacy tail read it. Sessions carry no supervisor guidance.
+    context_sources = ContextSources(
+        charter=charter_block,
+        memory_summary=memory_summary,
+        memory_records=memory_records,
+        knowledge_records=knowledge_records,
+        knowledge_bindings=knowledge_bindings,
+        external_watermarks=knowledge_watermarks,
+        failed_citations=failed_citations,
+        turn_boundary=product_guide_turn_nudge,
+        turn=turn_id if turn_id > 0 else None,
+    )
 
     ended_by_sleep = False
 
@@ -2362,10 +3041,10 @@ async def _execute_turn(
         ):
             from agent.services.memory import CaptureEvent
 
+            # The slice the summary will cover: the keep window counts
+            # non-entries, as compaction does (keep_window_start).
             keep_recent = context_manager.config.keep_recent_messages
-            evicted = (
-                list(messages[:-keep_recent]) if keep_recent > 0 else list(messages)
-            )
+            evicted = list(messages[: keep_window_start(messages, keep_recent)])
             if evicted:
                 memory_service.capture_nowait(
                     CaptureEvent(kind="pre_compaction", messages=evicted, phase=0)
@@ -2382,6 +3061,9 @@ async def _execute_turn(
                 max_summary_length=getattr(
                     config.context_management, "max_summary_length", 10000
                 ),
+                # Before the next main call: native where the family is
+                # (compaction WP6).
+                allow_native=True,
             ),
             callbacks.hard_interrupt_event,
         )
@@ -2464,26 +3146,72 @@ async def _execute_turn(
         # below never touch the durable list.
         prepared = list(bounded)
 
-        # Transient context injection (memory / knowledge / MemoryManager
-        # seam). Anchored at the TAIL — after the conversation — so the stable
-        # history prefix stays byte-identical between turns and provider
-        # prompt caches reuse it (the block changes every turn; placed ahead
-        # of the history it broke the cache for the whole conversation each
-        # request). The anchor still satisfies providers that enforce
-        # function-call turn ordering (Gemini rejects a function-call turn not
-        # preceded by a user/function-response turn): it sits after the last
-        # Human/Tool message, which is normally the very end of the history.
-        # See _injection_anchor_index. The same message objects may be reused
-        # each inner-loop iteration; pair ids are only prefix-checked
-        # downstream.
-        _inject_context_pairs(
-            prepared,
-            manager_injection,
-            memory_block,
-            knowledge_block,
-            citation_feedback_block,
-            charter_block=charter_block,
-        )
+        if append_only:
+            # Append what is new or changed since the history last showed it
+            # (WP2 spec §C, §F.5). Only once the input is admitted: a context
+            # row never precedes the admission of the turn it belongs to
+            # (O15). Each entry is history from here on: stamped with the
+            # turn, appended to the durable list and persisted BEFORE the
+            # provider call (write first), so a restore replays exactly the
+            # bytes this request sends. Planned against the compacted history,
+            # so what a compaction evicted is appended again (D4).
+            if _provider_admission_closed():
+                return _closed_result()
+            if not await _admit_first_provider():
+                return _closed_result()
+            if turn_retrieval is not None:
+                context_sources = _take_in_retrieval(
+                    memory_service, context_sources, bound_knowledge=bool(kb_bindings)
+                )
+                if not turn_retrieval_started:
+                    turn_retrieval_started = memory_service.start_retrieval(
+                        turn_retrieval
+                    )
+            planned = plan_context_entries(
+                prepared,
+                replace(
+                    context_sources,
+                    subagents=_active_subagents_state(tool_context),
+                ),
+                model=getattr(config.llm, "model", None),
+                max_memories=max_memories_per_entry(config),
+            )
+            if planned.entries:
+                logger.info(
+                    "Context entries appended: %s (memories %d new/changed, "
+                    "%d already present)",
+                    [entry_kind(entry) for entry in planned.entries],
+                    planned.memory_appended,
+                    planned.memory_present,
+                )
+            for entry in planned.entries:
+                entry = _adopt(_ensure_msg_id(entry))
+                messages.append(entry)
+                prepared.append(entry)
+                messages_added += 1
+                await _persist(entry)
+        else:
+            # Transient context injection (memory / knowledge / MemoryManager
+            # seam). Anchored at the TAIL — after the conversation — so the
+            # stable history prefix stays byte-identical between turns and
+            # provider prompt caches reuse it (the block changes every turn;
+            # placed ahead of the history it broke the cache for the whole
+            # conversation each request). The anchor still satisfies
+            # providers that enforce function-call turn ordering (Gemini
+            # rejects a function-call turn not preceded by a
+            # user/function-response turn): it sits after the last Human/Tool
+            # message, which is normally the very end of the history. See
+            # _injection_anchor_index. The same message objects may be reused
+            # each inner-loop iteration; pair ids are only prefix-checked
+            # downstream.
+            _inject_context_pairs(
+                prepared,
+                manager_injection,
+                memory_block,
+                knowledge_block,
+                citation_feedback_block,
+                charter_block=charter_block,
+            )
 
         # Repair tool-call pairing before the LLM call. Compaction thrash, an
         # interrupted turn, or streamed parallel-tool corruption (langchain
@@ -2494,31 +3222,44 @@ async def _execute_turn(
         # repairs on restore (persistent_app). This is the equivalent guard for
         # the live turn loop, which previously had none.
         provider_attempt_input: Optional[List[BaseMessage]] = None
+        # The same request before the carrier fold: the archiver's chat delta
+        # reads it (WP2 spec §D 7c, §F.6).
+        provider_attempt_history: Optional[List[BaseMessage]] = None
         provider_attempt_started_at: Optional[float] = None
         completed_provider_attempts: list[
-            tuple[List[BaseMessage], AIMessage, dict, bool]
+            tuple[List[BaseMessage], AIMessage, dict, bool, List[BaseMessage]]
         ] = []
         archived_provider_attempts = 0
         published_provider_attempts = 0
         last_provider_metrics: Optional[dict] = None
 
         def _provider_input() -> List[BaseMessage]:
-            """Return repaired input plus freshly rendered transient tail."""
+            """Return repaired input plus freshly rendered transient tail.
 
-            nonlocal provider_attempt_input, provider_attempt_started_at
+            append_only has no per-call tail: the subagent status and the App
+            Guide boundary were appended as entries above when they changed.
+            """
+
+            nonlocal provider_attempt_input, provider_attempt_history
+            nonlocal provider_attempt_started_at
             messages[:] = repair_tool_pairing(messages)
             prepared[:] = scrub_history_tool_call_arguments(
                 repair_tool_pairing(prepared)
             )
             provider_messages = list(prepared)
-            _inject_context_pairs(
-                provider_messages,
-                [],
-                "",
-                "",
-                active_subagents_block=_active_subagents_block(tool_context),
-                product_guide_turn_boundary=product_guide_turn_nudge,
-            )
+            if not append_only:
+                _inject_context_pairs(
+                    provider_messages,
+                    [],
+                    "",
+                    "",
+                    active_subagents_block=_active_subagents_block(tool_context),
+                    product_guide_turn_boundary=product_guide_turn_nudge,
+                )
+            provider_attempt_history = provider_messages
+            # Typed context entries ride their carriers (D27). The identity
+            # while the history holds none, so legacy requests are unchanged.
+            provider_messages = fold_context_entries(provider_messages)
             provider_attempt_input = provider_messages
             provider_attempt_started_at = time.monotonic()
             return provider_messages
@@ -2530,8 +3271,8 @@ async def _execute_turn(
         ) -> Optional[dict]:
             """Bind one completed response to its exact transient input."""
 
-            nonlocal provider_attempt_input, provider_attempt_started_at
-            nonlocal last_provider_metrics
+            nonlocal provider_attempt_input, provider_attempt_history
+            nonlocal provider_attempt_started_at, last_provider_metrics
             if (
                 attempt_response is None
                 or provider_attempt_input is None
@@ -2558,9 +3299,26 @@ async def _execute_turn(
                     attempt_response,
                     attempt_metrics or {"latency_ms": latency_ms},
                     attempt_metrics is not None,
+                    provider_attempt_history or provider_attempt_input,
                 )
             )
+            # Keep the answered request for a native compaction (WP5): as
+            # sent, and unfolded (it holds every history object it was built
+            # from; the reply joins `messages` only after this).
+            record_request = getattr(context_manager, "record_main_request", None)
+            if callable(record_request):
+                try:
+                    record_request(
+                        provider_attempt_input,
+                        llm_with_tools,
+                        history=provider_attempt_history or (),
+                        input_tokens=(attempt_metrics or {}).get("input_tokens"),
+                        timeout=llm_timeout,
+                    )
+                except Exception as e:  # never fail a turn over it
+                    logger.debug(f"record_main_request failed (non-fatal): {e}")
             provider_attempt_input = None
+            provider_attempt_history = None
             provider_attempt_started_at = None
             return attempt_metrics
 
@@ -2569,17 +3327,26 @@ async def _execute_turn(
 
             nonlocal archived_provider_attempts
             while archived_provider_attempts < len(completed_provider_attempts):
-                provider_input, attempt_response, metrics, _has_usage = (
+                provider_input, attempt_response, metrics, _has_usage, history = (
                     completed_provider_attempts[archived_provider_attempts]
                 )
                 archived_provider_attempts += 1
                 if callbacks.archive_llm_call is None:
                     continue
+                # The unfolded request goes along whenever the fold folded
+                # something (WP2 spec §F.6): the chat delta then archives an
+                # entry as context, not as part of its carrier; llm_requests
+                # keeps the folded request the provider got. A request without
+                # entries keeps the historical three-argument call.
+                extra: Dict[str, Any] = {}
+                if append_only or has_folded_carrier(provider_input):
+                    extra["history_messages"] = history
                 try:
                     callbacks.archive_llm_call(
                         provider_input,
                         attempt_response,
                         metrics,
+                        **extra,
                     )
                 except Exception as e:
                     logger.debug(f"LLM call archive failed (non-fatal): {e}")
@@ -2589,7 +3356,7 @@ async def _execute_turn(
 
             nonlocal published_provider_attempts
             while published_provider_attempts < len(completed_provider_attempts):
-                _provider_input_snapshot, _attempt_response, metrics, has_usage = (
+                _provider_input_snapshot, _attempt_response, metrics, has_usage, _ = (
                     completed_provider_attempts[published_provider_attempts]
                 )
                 published_provider_attempts += 1
@@ -2751,8 +3518,12 @@ async def _execute_turn(
                         break
                     chunks.append(chunk)
                     _chunk_meta = getattr(chunk, "response_metadata", None) or {}
-                    if _chunk_meta.get("finish_reason"):
-                        stream_finish_reason = _chunk_meta["finish_reason"]
+                    # Anthropic reports stop_reason ("max_tokens" when capped).
+                    _chunk_finish = _chunk_meta.get("finish_reason") or _chunk_meta.get(
+                        "stop_reason"
+                    )
+                    if _chunk_finish:
+                        stream_finish_reason = _chunk_finish
                     # Extract and stream text content
                     if hasattr(chunk, "content") and chunk.content:
                         content = chunk.content
@@ -2928,6 +3699,10 @@ async def _execute_turn(
                             response.tool_calls = []
                         if hasattr(response, "invalid_tool_calls"):
                             response.invalid_tool_calls = []
+                        if hasattr(response, "content"):
+                            response.content = strip_unreplayable_blocks(
+                                response.content, set()
+                            )
                         final = finalize_streamed_response(response)
                         if final is not None:
                             messages.append(_adopt(final))
@@ -3075,7 +3850,9 @@ async def _execute_turn(
             _resolve_max_output_tokens,
         )
 
-        _finish_reason = stream_finish_reason or meta.get("finish_reason")
+        _finish_reason = (
+            stream_finish_reason or meta.get("finish_reason") or meta.get("stop_reason")
+        )
         _is_length = _is_output_truncated(_finish_reason)
         _output_cap = (
             _resolve_max_output_tokens(config.llm, config.limits)
@@ -3372,36 +4149,65 @@ async def _execute_turn(
                 await _persist(rejected)
             continue
 
+        # A delegation-only batch runs as one fan-out (below). A session
+        # allowed to fan out is held to its per-turn maximum across all the
+        # batches of this turn (§6.4): the calls above it are refused before
+        # they are announced or gated, and do not run.
+        _execute_delegation_batch = (
+            _delegation_only_batch and "delegate_agent" in tool_map
+        )
+        _delegation_limit: Optional[int] = None
+        _delegation_room = len(response.tool_calls)
+        if _execute_delegation_batch and _session_fanout_allowed(tool_context):
+            _delegation_limit = _delegation_max_calls_per_turn(tool_context)
+            _delegation_room = max(0, _delegation_limit - delegate_calls_admitted)
+
         # Announce the whole batch up front so the client can show every
         # pending call at once. Names that resolve to no tool are filtered out:
         # they are rejected below without ever reaching the gate, so announcing
         # one would raise an approval card asking the user to authorize a tool
-        # that cannot run whatever they answer. Soft-fail: if this breaks, the
-        # per-call gate path below still inserts and prompts exactly as before.
-        # Still called when the filtered list is empty: the announce hook also
-        # retires any previous batch's pending rows, and skipping it outright
-        # would leave those behind.
+        # that cannot run whatever they answer. Delegation calls above the
+        # per-turn maximum are filtered out for the same reason. Soft-fail: if
+        # this breaks, the per-call gate path below still inserts and prompts
+        # exactly as before. Still called when the filtered list is empty: the
+        # announce hook also retires any previous batch's pending rows, and
+        # skipping it outright would leave those behind.
         if callbacks.announce_permission_batch is not None:
-            gateable = [tc for tc in response.tool_calls if tc.get("name") in tool_map]
+            gateable = [
+                tc
+                for index, tc in enumerate(response.tool_calls)
+                if tc.get("name") in tool_map
+                and not (_execute_delegation_batch and index >= _delegation_room)
+            ]
             try:
                 await callbacks.announce_permission_batch(gateable)
             except Exception as e:
                 logger.warning("Permission batch announce failed: %s", e)
 
-        _execute_delegation_batch = (
-            _delegation_only_batch and "delegate_agent" in tool_map
-        )
+        # A tool's image rides a follow-up HumanMessage, held until every call
+        # of the batch has its result. Anthropic rejects anything between two
+        # results of one batch ("tool_use ids were found without tool_result
+        # blocks immediately after"); the worker graph appends after the batch
+        # the same way.
+        batch_images: List[BaseMessage] = []
+
+        async def _flush_batch_images(*, persist: bool = True) -> int:
+            flushed = len(batch_images)
+            for image_message in batch_images:
+                messages.append(_adopt(image_message))
+                if persist:
+                    await _persist(image_message)
+            batch_images.clear()
+            return flushed
+
         if _execute_delegation_batch:
             # Permission decisions stay serial (the transport owns their
             # durable/card lifecycle), but no child starts until the whole
             # batch has been admitted.  Once admitted, invoke every child in
             # its own task; the runtime semaphore applies the configured cap
-            # and turns a wider fan-out into waves.  asyncio.gather preserves
-            # input order, so ToolMessages remain paired in provider order
-            # even when a later child finishes first.
-            _delegation_decisions: list[
-                tuple[Any, dict[str, Any], str, PermissionOutcome]
-            ] = []
+            # and turns a wider fan-out into waves.  Results are emitted in
+            # provider order, even when a later child finishes first.
+            _slots: list[_DelegationSlot] = []
             for i, tool_call in enumerate(response.tool_calls):
                 if callbacks.check_interrupt():
                     logger.info("Interrupt received before delegation batch")
@@ -3431,6 +4237,11 @@ async def _execute_turn(
                         ", ".join(_repaired),
                     )
                 tool_call_id = str(tool_call.get("id") or "")
+                if i >= _delegation_room:
+                    _slots.append(
+                        _DelegationSlot(tool, tool_args, tool_call_id, "over_limit")
+                    )
+                    continue
                 outcome = PermissionOutcome.coerce(
                     await callbacks.permission_check(
                         "delegate_agent", tool_args, tool_call_id
@@ -3447,7 +4258,16 @@ async def _execute_turn(
                         messages_added=messages_added,
                         tool_calls_made=tool_calls_made,
                     )
-                _delegation_decisions.append((tool, tool_args, tool_call_id, outcome))
+                _slots.append(
+                    _DelegationSlot(
+                        tool,
+                        tool_args,
+                        tool_call_id,
+                        "approved"
+                        if outcome is PermissionOutcome.APPROVED
+                        else "declined",
+                    )
+                )
 
             # The last supervised decision may take minutes.  Close the final
             # approval→effect race before constructing the runtime or any task:
@@ -3466,17 +4286,63 @@ async def _execute_turn(
                     interrupted=True,
                 )
 
-            _approved_delegations = [
-                (tool, tool_args, tool_call_id)
-                for tool, tool_args, tool_call_id, outcome in _delegation_decisions
-                if outcome is PermissionOutcome.APPROVED
-            ]
+            delegate_calls_admitted += min(len(_slots), _delegation_room)
+            _approved_slots = [slot for slot in _slots if slot.decision == "approved"]
 
-            if _approved_delegations:
+            # Every decision is known. Write the result of each call that will
+            # not run before any child starts: a crash during the batch must
+            # not turn a decline into "not started" (§5.2).
+            try:
+                for slot in _slots:
+                    if slot.decision == "approved":
+                        continue
+                    if slot.decision == "declined":
+                        slot.content = "User declined this tool call."
+                    else:
+                        slot.content = _delegation_over_limit_text(
+                            _delegation_limit or 0
+                        )
+                        slot.is_error = True
+                        await callbacks.on_tool_start(
+                            "delegate_agent", slot.args, slot.tool_call_id
+                        )
+                    slot.message = _adopt(
+                        _ensure_msg_id(
+                            ToolMessage(
+                                content=slot.content, tool_call_id=slot.tool_call_id
+                            )
+                        )
+                    )
+                    await _persist_delegation_result(slot.message)
+                    if slot.decision == "over_limit":
+                        await callbacks.on_tool_result(
+                            "delegate_agent",
+                            slot.content,
+                            slot.tool_call_id,
+                            is_error=True,
+                        )
+            except DelegationResultNotDurable as unsaved:
+                # No child has started. Keep what exists for the turn-end
+                # reconcile and stop before any further provider call. The
+                # shared message says the subagents ended; here none started.
+                for slot in _slots:
+                    if slot.message is not None:
+                        messages.append(slot.message)
+                        messages_added += 1
+                raise DelegationResultNotDurable(
+                    "A delegate_agent result could not be saved to the "
+                    "conversation, so this turn stopped before any subagent "
+                    "started. No subagent ran. Send a message to continue."
+                ) from unsaved.__cause__
+
+            _batch = _DelegationBatchOutcome()
+            _delegation_tasks: list[asyncio.Task[Any]] = []
+            if _approved_slots:
                 # The fork source must be the durable parent list, including
                 # this assistant tool-call turn.  Install/resolve the runtime
                 # once before concurrent StructuredTool invocations so two
                 # first calls cannot race through lazy runtime construction.
+                runtime = None
                 if tool_context is not None:
                     tool_context._fork_source = messages
                     runtime = getattr(tool_context, "subagent_runtime", None)
@@ -3488,29 +4354,28 @@ async def _execute_turn(
                         runtime = _ensure_subagent_runtime(tool_context)
                     begin_batch = getattr(runtime, "begin_batch", None)
                     if callable(begin_batch):
-                        begin_batch(len(_approved_delegations))
+                        begin_batch(len(_approved_slots))
 
-                async def _invoke_delegation(
-                    tool: Any, tool_args: dict[str, Any], tool_call_id: str
-                ) -> tuple[str, bool]:
+                async def _invoke_delegation(slot: _DelegationSlot) -> tuple[str, bool]:
                     await callbacks.on_tool_start(
-                        "delegate_agent", tool_args, tool_call_id
+                        "delegate_agent", slot.args, slot.tool_call_id
                     )
                     if callbacks.on_tool_execution_start is not None:
                         await callbacks.on_tool_execution_start(
-                            "delegate_agent", tool_call_id
+                            "delegate_agent", slot.tool_call_id
                         )
+                    slot.started = True
                     try:
                         # InjectedToolCallId is populated only when a
                         # StructuredTool receives the full model ToolCall.
                         # Ordinary session tools intentionally retain the old
                         # args-only invocation path below.
-                        result = await tool.ainvoke(
+                        result = await slot.tool.ainvoke(
                             {
                                 "type": "tool_call",
                                 "name": "delegate_agent",
-                                "args": tool_args,
-                                "id": tool_call_id,
+                                "args": slot.args,
+                                "id": slot.tool_call_id,
                             }
                         )
                         if isinstance(result, ToolMessage):
@@ -3522,55 +4387,71 @@ async def _execute_turn(
                         logger.warning("Tool delegate_agent failed: %s", exc)
                         return (f"Tool execution error: {exc}", True)
 
+                async def _stop_delegation_children() -> None:
+                    # D4: Stop reaches the children. Running ones get
+                    # graceful_stop and return STOPPED; queued ones return
+                    # NOT STARTED. Every call still returns its result.
+                    stop = getattr(runtime, "stop_foreground_batch", None)
+                    if callable(stop):
+                        stopping = stop()
+                        if inspect.isawaitable(stopping):
+                            await stopping
+
                 _delegation_tasks = [
                     asyncio.create_task(
-                        _invoke_delegation(tool, tool_args, tool_call_id),
+                        _invoke_delegation(slot),
                         name=f"session-delegate-{index}",
                     )
-                    for index, (tool, tool_args, tool_call_id) in enumerate(
-                        _approved_delegations
-                    )
+                    for index, slot in enumerate(_approved_slots)
                 ]
-                try:
-                    _delegation_results = await asyncio.gather(*_delegation_tasks)
-                except BaseException:
-                    # gather propagates the first WorkspaceUnavailableError or
-                    # CancelledError without joining siblings.  No failed turn
-                    # may return while another child can still spend or mutate.
-                    for task in _delegation_tasks:
-                        if not task.done():
-                            task.cancel()
-                    await asyncio.gather(
-                        *_delegation_tasks,
-                        return_exceptions=True,
-                    )
-                    raise
-            else:
-                _delegation_results = []
+                # A cancellation of this turn (shutdown, drain) propagates from
+                # here after every child task is cancelled and joined, and no
+                # result is written: the successor settles the batch. The
+                # executor's own shutdown abort is not a Stop: it stays
+                # pending until that cancellation arrives.
+                _batch = await _supervise_delegation_batch(
+                    _delegation_tasks,
+                    check_interrupt=callbacks.check_interrupt,
+                    hard_interrupt_event=callbacks.hard_interrupt_event,
+                    stop_children=_stop_delegation_children,
+                    peek_interrupt_cause=callbacks.peek_interrupt_cause,
+                )
+                for slot, task in zip(_approved_slots, _delegation_tasks):
+                    if task.cancelled():
+                        # Only a sibling the batch cancelled itself gets here.
+                        slot.content = _delegation_cancelled_text(
+                            _WORKSPACE_UNAVAILABLE_REASON
+                        )
+                        slot.is_error = True
+                        continue
+                    exc = task.exception()
+                    if exc is None:
+                        slot.content, slot.is_error = task.result()
+                    elif slot.started:
+                        slot.content = f"Tool execution error: {exc}"
+                        slot.is_error = True
+                    else:
+                        slot.content = _delegation_not_started_text(exc)
+                        slot.is_error = True
 
             # Emit results in the provider's exact tool-call order, not task
             # completion order (and not "declines first" when a supervised
-            # batch contains both approved and declined calls).
-            _approved_results = iter(_delegation_results)
-            for _tool, tool_args, tool_call_id, outcome in _delegation_decisions:
-                if outcome is PermissionOutcome.DECLINED:
-                    declined = _ensure_msg_id(
-                        ToolMessage(
-                            content="User declined this tool call.",
-                            tool_call_id=tool_call_id,
-                        )
-                    )
-                    messages.append(_adopt(declined))
+            # batch contains both approved and declined calls). Every call has
+            # exactly one result; the ones written before the children started
+            # are only placed here.
+            _persist_failure: Optional[DelegationResultNotDurable] = None
+            for slot in _slots:
+                if slot.message is not None:
+                    messages.append(slot.message)
                     messages_added += 1
-                    await _persist(declined)
                     continue
 
-                result_str, is_error = next(_approved_results)
-                cleaned_str, extracted_images = extract_image_tags(result_str)
+                cleaned_str, extracted_images = extract_image_tags(slot.content)
+                cleaned_str = redact_tool_result(cleaned_str, tool_context)
                 tool_message = _ensure_msg_id(
                     ToolMessage(
                         content=cleaned_str,
-                        tool_call_id=tool_call_id,
+                        tool_call_id=slot.tool_call_id,
                     )
                 )
                 messages.append(_adopt(tool_message))
@@ -3578,31 +4459,37 @@ async def _execute_turn(
                 tool_calls_made += 1
                 if officer_max_actions:
                     try:
-                        fingerprint = ("delegate_agent", repr(tool_args))
+                        fingerprint = ("delegate_agent", repr(slot.args))
                     except Exception:
                         fingerprint = ("delegate_agent", "<unrepresentable>")
                     guard_fingerprints[fingerprint] = (
                         guard_fingerprints.get(fingerprint, 0) + 1
                     )
-                await _persist(tool_message)
+                # The result is the child's delivery fact (F5). Once one could
+                # not be saved, the rest stay in memory for the turn-end
+                # reconcile, which retries every row of the turn by its id.
+                if _persist_failure is None:
+                    try:
+                        await _persist_delegation_result(tool_message)
+                    except DelegationResultNotDurable as exc:
+                        _persist_failure = exc
 
                 if extracted_images:
-                    image_message = _ensure_msg_id(
-                        make_multimodal_user_message(
-                            text=f"Image content from tool call {tool_call_id}:",
-                            images=extracted_images,
-                            max_edge=resolve_image_max_edge(config),
+                    batch_images.append(
+                        _ensure_msg_id(
+                            make_multimodal_user_message(
+                                text=f"Image content from tool call {slot.tool_call_id}:",
+                                images=extracted_images,
+                                max_edge=resolve_image_max_edge(config),
+                            )
                         )
                     )
-                    messages.append(_adopt(image_message))
-                    messages_added += 1
-                    await _persist(image_message)
 
                 await callbacks.on_tool_result(
                     "delegate_agent",
                     cleaned_str,
-                    tool_call_id,
-                    is_error=is_error,
+                    slot.tool_call_id,
+                    is_error=slot.is_error,
                 )
 
                 if tool_context and callbacks.on_workspace_upgrade_needed:
@@ -3613,9 +4500,31 @@ async def _execute_turn(
                     ):
                         await callbacks.on_workspace_upgrade_needed(freeze_req)
 
-            # All calls were either executed or paired with explicit declines.
-            # Skip the ordinary sequential executor below and proceed to the
-            # shared post-batch sleep/guard checks.
+            messages_added += await _flush_batch_images(
+                persist=_persist_failure is None
+            )
+
+            # Every call now has its result. A batch that could not go on ends
+            # the turn with its error, and an unsaved result ends it before any
+            # further provider call; neither leaves a call without a result.
+            if _batch.fatal is not None:
+                raise _batch.fatal
+            if _persist_failure is not None:
+                raise _persist_failure
+            if _batch.stopped:
+                # Stop reached the batch: the turn ends here, without a final
+                # answer (§8). The next turn sees one result per call.
+                logger.info("Delegation batch stopped — ending the turn")
+                return TurnResult(
+                    turn_id=0,
+                    messages_added=messages_added,
+                    tool_calls_made=tool_calls_made,
+                    interrupted=True,
+                )
+
+            # All calls have their results. Skip the ordinary sequential
+            # executor below and proceed to the shared post-batch sleep/guard
+            # checks.
 
         # --- Execute tool calls ---
         for i, tool_call in enumerate(
@@ -3624,6 +4533,7 @@ async def _execute_turn(
             # Check for interrupt before each tool
             if callbacks.check_interrupt():
                 logger.info(f"Interrupt received before tool {tool_call['name']}")
+                messages_added += await _flush_batch_images()
                 await _record_unexecuted_tool_batch(
                     list(response.tool_calls[i:]),
                     reason="interrupted before tool execution",
@@ -3728,6 +4638,7 @@ async def _execute_turn(
                     tool_call_id,
                     len(response.tool_calls) - i,
                 )
+                messages_added += await _flush_batch_images()
                 return TurnResult(
                     turn_id=0,
                     messages_added=messages_added,
@@ -3763,6 +4674,11 @@ async def _execute_turn(
             # image as a real provider content block on a follow-up
             # HumanMessage so multimodal primary models actually see it.
             cleaned_str, extracted_images = extract_image_tags(result_str)
+            # One string feeds the transcript, the persisted row and the
+            # on_tool_result frame/audit below: redact it once, here
+            # (tool_output_redaction.py). Error text included — a failed
+            # fetch or push echoes the credential-bearing remote.
+            cleaned_str = redact_tool_result(cleaned_str, tool_context)
 
             messages.append(
                 _adopt(
@@ -3787,19 +4703,15 @@ async def _execute_turn(
             await _persist(messages[-1])
 
             if extracted_images:
-                messages.append(
-                    _adopt(
-                        _ensure_msg_id(
-                            make_multimodal_user_message(
-                                text=(f"Image content from tool call {tool_call_id}:"),
-                                images=extracted_images,
-                                max_edge=resolve_image_max_edge(config),
-                            )
+                batch_images.append(
+                    _ensure_msg_id(
+                        make_multimodal_user_message(
+                            text=(f"Image content from tool call {tool_call_id}:"),
+                            images=extracted_images,
+                            max_edge=resolve_image_max_edge(config),
                         )
                     )
                 )
-                messages_added += 1
-                await _persist(messages[-1])
 
             await callbacks.on_tool_result(
                 tool_name, cleaned_str, tool_call_id, is_error=is_error
@@ -3807,7 +4719,8 @@ async def _execute_turn(
 
             # Check for a freeze request — a sudo intercept asking for a VM
             # (vm_upgrade_required) or a lite agent's request_workspace_upgrade
-            # asking for a sandbox (workspace_upgrade_required, §4.2 S5). Both
+            # asking for an upgrade (a VM in a Session, a container in a Job)
+            # (workspace_upgrade_required, §4.2 S5). Both
             # surface as an upgrade OFFER; the agent only requests, never flips
             # the tier (§4.4 Sec-4).
             if tool_context and callbacks.on_workspace_upgrade_needed:
@@ -3817,6 +4730,8 @@ async def _execute_turn(
                     "workspace_upgrade_required",
                 ):
                     await callbacks.on_workspace_upgrade_needed(freeze_req)
+
+        messages_added += await _flush_batch_images()
 
         # Officer sleep: the sleep tool parked a wake request — end the turn
         # after the batch instead of paying another LLM iteration. Peek only;

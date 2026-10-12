@@ -110,6 +110,13 @@ def catalogue(monkeypatch, tmp_path):
         "delete_config_override",
     ):
         setattr(store, name, AsyncMock())
+    # The readiness auto-pin runs after catalog writes; with every required
+    # kind pinned it is a no-op unless a test clears the pins.
+    store.list_default_pin_capabilities = AsyncMock(
+        return_value=["chat", "auxiliary", "embedding", "rerank"]
+    )
+    store.list_models_by_capability_alphabetical = AsyncMock(return_value=[])
+    store.pin_default_llm_model_if_unset = AsyncMock(return_value=True)
     resolve_user = AsyncMock(
         return_value={"id": ADMIN_ID, "is_admin": False, "real_is_admin": True}
     )
@@ -482,6 +489,58 @@ async def test_plain_discovery_keeps_plain_shape_and_refuses_bulk_import(catalog
 
 
 @pytest.mark.asyncio
+async def test_service_endpoint_discovery_explains_instead_of_probing(catalogue):
+    catalogue.store.get_system_llm_endpoint.return_value = endpoint_row(
+        label="SearXNG", base_url="http://srw-searxng:8080"
+    )
+    catalogue.store.list_models.return_value = [
+        model_row(
+            model_id="searxng",
+            capabilities=["search"],
+            params_json={"provider": "searxng", "ops": ["search"]},
+        )
+    ]
+    response = await catalogue.request(
+        "POST", f"/api/admin/providers/endpoints/{ROW_ID}/discover"
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["subscription"] is False
+    assert body["ok"] is False
+    assert body["models"] == []
+    assert body["probe_url"] is None
+    assert "SearXNG is served by the searxng adapter" in body["error"]
+    catalogue.store.list_models.assert_awaited_once_with(
+        provider_kind="endpoint", provider_ref=ROW_ID
+    )
+    catalogue.probe.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_endpoint_with_a_model_row_is_still_probed(catalogue):
+    catalogue.store.get_system_llm_endpoint.return_value = endpoint_row()
+    catalogue.store.list_models.return_value = [
+        model_row(
+            model_id="searxng",
+            capabilities=["search"],
+            params_json={"provider": "searxng", "ops": ["search"]},
+        ),
+        model_row(model_id="qwen3-32b", capabilities=["chat"]),
+        model_row(
+            model_id="tts-1",
+            capabilities=["tts"],
+            params_json={"provider": "openai"},
+        ),
+    ]
+    response = await catalogue.request(
+        "POST", f"/api/admin/providers/endpoints/{ROW_ID}/discover"
+    )
+    assert response.status_code == 200
+    assert response.json()["ok"] is True
+    catalogue.probe.assert_awaited_once()
+
+
+@pytest.mark.asyncio
 async def test_model_subscription_routing_metadata_survives_projection(catalogue):
     from shared.subscription_routing import (
         PROTOCOL_OPENAI_RESPONSES,
@@ -534,6 +593,7 @@ async def test_subscription_import_passes_selection_and_keeps_partial_outcome(
         json={
             "model_ids": ["new-model", "existing-model", "video-model"],
             "include_needs_review": True,
+            "context_window_cap": 200_000,
         },
     )
     assert response.status_code == 200
@@ -544,7 +604,64 @@ async def test_subscription_import_passes_selection_and_keeps_partial_outcome(
         candidates=result.candidates,
         requested_ids=["new-model", "existing-model", "video-model"],
         include_review=True,
+        context_window_cap=200_000,
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cap", [0, -1])
+async def test_subscription_import_refuses_a_non_positive_context_cap(catalogue, cap):
+    from shared.subscription_routing import SUBSCRIPTION_PROXY_TRANSPORT
+
+    catalogue.store.get_system_llm_endpoint.return_value = endpoint_row(
+        transport_kind=SUBSCRIPTION_PROXY_TRANSPORT
+    )
+    response = await catalogue.request(
+        "POST",
+        f"/api/admin/providers/endpoints/{ROW_ID}/models/import",
+        json={"context_window_cap": cap},
+    )
+    assert response.status_code == 422
+    catalogue.subscription_import.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("created", [["new-model"], []])
+async def test_subscription_import_auto_pins_only_when_it_created_rows(
+    catalogue, created
+):
+    from orchestrator.services.subscription_discovery import (
+        DiscoveryResult,
+        ImportOutcome,
+    )
+    from shared.subscription_routing import SUBSCRIPTION_PROXY_TRANSPORT
+
+    catalogue.store.get_system_llm_endpoint.return_value = endpoint_row(
+        transport_kind=SUBSCRIPTION_PROXY_TRANSPORT
+    )
+    catalogue.subscription_discover.return_value = DiscoveryResult(
+        True, "https://models.invalid/v1/models"
+    )
+    catalogue.subscription_import.return_value = ImportOutcome(created=created)
+    catalogue.store.list_default_pin_capabilities.return_value = []
+    catalogue.store.list_models_by_capability_alphabetical.side_effect = lambda cap: (
+        [{"model_id": "new-model"}] if cap in ("chat", "auxiliary") else []
+    )
+
+    response = await catalogue.request(
+        "POST", f"/api/admin/providers/endpoints/{ROW_ID}/models/import", json={}
+    )
+
+    assert response.status_code == 200
+    pinned = [
+        c.args[:2]
+        for c in catalogue.store.pin_default_llm_model_if_unset.await_args_list
+    ]
+    if created:
+        assert pinned == [("chat", "new-model"), ("auxiliary", "new-model")]
+    else:
+        assert pinned == []
+        catalogue.store.list_default_pin_capabilities.assert_not_awaited()
 
 
 @pytest.mark.asyncio

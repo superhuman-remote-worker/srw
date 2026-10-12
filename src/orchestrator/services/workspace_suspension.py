@@ -8,6 +8,7 @@ Requires both ContainerProvisioner (K8s) and SnapshotService (S3) to be
 available. Gracefully degrades: when S3 is unavailable, containers stay alive.
 """
 
+import inspect
 import json
 import logging
 import os
@@ -50,7 +51,10 @@ from orchestrator.services.vm_workspace_recovery_store import (
     completed_cleanup_outcome,
     complete_vm_cleanup_permit,
 )
-from orchestrator.services.workspace_lifecycle import WorkspaceOwner
+from orchestrator.services.workspace_lifecycle import (
+    SessionWorkspaceObservationYielded,
+    WorkspaceOwner,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -138,7 +142,7 @@ def _settled_restore_runtime(
     runtime = _captured_workspace_runtime(workspace)
     try:
         receipt_runtime = _canonical_uuid(
-            creation.get("runtime_incarnation"), label="restore runtime"
+            str(creation.get("runtime_incarnation") or ""), label="restore runtime"
         )
     except RuntimeError:
         return None
@@ -461,6 +465,7 @@ class WorkspaceSuspensionService:
                         owner,
                         claimant=claimant,
                         lease_seconds=300,
+                        expected_runtime_incarnation=runtime_incarnation,
                     )
                 )
             except Exception:
@@ -1007,7 +1012,15 @@ class WorkspaceSuspensionService:
                             self._workspace_recovery_store,
                             cleanup,
                             outcome=outcome.disposition,
+                            provisioner=self._vm_provisioner,
                         )
+                if replayed == "completed":
+                    await complete_vm_cleanup_permit(
+                        self._workspace_recovery_store,
+                        cleanup,
+                        outcome=replayed,
+                        provisioner=self._vm_provisioner,
+                    )
                 if (
                     not isinstance(outcome, VMTeardownResult)
                     or outcome.disposition != "completed"
@@ -1756,6 +1769,7 @@ class WorkspaceSuspensionService:
         expected_runtime_incarnation: str | None = None,
         stateless_creation_generation: str | None = None,
         allow_stateless_create: bool = False,
+        wake_operation_id: str | None = None,
         _pinned_runtime_lock_held: bool = False,
     ) -> bool:
         """Owner-keyed restore: job -> restore_workspace, session -> restore_thread_workspace."""
@@ -1764,6 +1778,7 @@ class WorkspaceSuspensionService:
                 expected_runtime_incarnation is not None
                 or stateless_creation_generation is not None
                 or allow_stateless_create
+                or wake_operation_id is not None
             ):
                 return False
             return await self.restore_workspace(owner.id)
@@ -1772,11 +1787,23 @@ class WorkspaceSuspensionService:
             and stateless_creation_generation is None
             and not allow_stateless_create
         ):
-            if not _pinned_runtime_lock_held:
-                return await self.restore_thread_workspace(owner.id)
-            return await self.restore_thread_workspace(
-                owner.id, _pinned_runtime_lock_held=True
+            wake_kwargs = (
+                {"wake_operation_id": wake_operation_id}
+                if wake_operation_id is not None
+                else {}
             )
+            if not _pinned_runtime_lock_held:
+                return await self.restore_thread_workspace(
+                    owner.id,
+                    **wake_kwargs,
+                )
+            return await self.restore_thread_workspace(
+                owner.id,
+                **wake_kwargs,
+                _pinned_runtime_lock_held=True,
+            )
+        if wake_operation_id is not None:
+            return False
         if stateless_creation_generation is None and not allow_stateless_create:
             kwargs: dict[str, Any] = {
                 "expected_runtime_incarnation": expected_runtime_incarnation
@@ -2093,11 +2120,26 @@ class WorkspaceSuspensionService:
         except Exception:
             logger.exception("Failed to suspend workspace for thread %s", thread_id)
             try:
-                await self._db.merge_thread_vm_context_if_provision_generation(
+                # A completed delete followed by a lost projection response
+                # must never advertise the stopped guest as Ready. Restore
+                # that state only from a fresh controller-attested exact live
+                # VM/VMI/launcher and unchanged retained PVC.
+                ready = await self._vm_provisioner.attest_workspace_runtime(
                     thread_id,
-                    vm_identity.provision_generation,
-                    {"status": "ready", "_suspend_remote_io_closed": None},
+                    entity_type="thread",
                 )
+                if (
+                    ready.workspace_generation == vm_identity.provision_generation
+                    and ready.vm_uid == vm_identity.vm_uid
+                    and ready.rootdisk_pvc_uid == vm_identity.rootdisk_pvc_uid
+                    and ready.vmi_uid == vm_attestation.vmi_uid
+                    and ready.launcher_pod_uid == vm_attestation.launcher_pod_uid
+                ):
+                    await self._db.merge_thread_vm_context_if_provision_generation(
+                        thread_id,
+                        vm_identity.provision_generation,
+                        {"status": "ready", "_suspend_remote_io_closed": None},
+                    )
             except Exception:
                 pass
             return False
@@ -2109,6 +2151,7 @@ class WorkspaceSuspensionService:
         expected_runtime_incarnation: str | None = None,
         stateless_creation_generation: str | None = None,
         allow_stateless_create: bool = False,
+        wake_operation_id: str | None = None,
         _pinned_runtime_lock_held: bool = False,
     ) -> bool:
         """Provision a fresh workspace and extract the S3 snapshot into it.
@@ -2117,7 +2160,7 @@ class WorkspaceSuspensionService:
 
         Returns True if provisioning + snapshot extraction succeeded.
         """
-        if not self.is_enabled or not self._db:
+        if not self._db or (wake_operation_id is None and not self.is_enabled):
             return False
 
         thread = await self._db.get_thread(thread_id)
@@ -2127,6 +2170,16 @@ class WorkspaceSuspensionService:
         if thread.get("execution_lane") == "pinned" and not _pinned_runtime_lock_held:
             lock_impl = getattr(type(self._db), "thread_advisory_lock", None)
             if callable(lock_impl):
+                # A protected session's reader grant is minted by an engage
+                # that takes the same lock: let it land first, as create does
+                # (connector drivers D7); the restore's plan only reads it.
+                await_grant = getattr(
+                    self._container_provisioner, "await_cloud_mount_grant", None
+                )
+                if callable(await_grant):
+                    waiting = await_grant(thread_id)
+                    if inspect.isawaitable(waiting):
+                        await waiting
                 async with lock_impl(self._db, thread_id) as lock_acquired:
                     if lock_acquired is not True:
                         logger.error(
@@ -2140,6 +2193,7 @@ class WorkspaceSuspensionService:
                         expected_runtime_incarnation=expected_runtime_incarnation,
                         stateless_creation_generation=stateless_creation_generation,
                         allow_stateless_create=allow_stateless_create,
+                        wake_operation_id=wake_operation_id,
                         _pinned_runtime_lock_held=True,
                     )
             logger.error(
@@ -2175,6 +2229,22 @@ class WorkspaceSuspensionService:
         # create_thread_vm, by which point this key reflects the new VM's
         # lifecycle rather than the suspend that put the thread here.
         rootdisk_kept = vm_ctx.get("rootdisk") == "kept"
+        if (
+            rootdisk_kept
+            and thread.get("execution_lane") == "pinned"
+            and callable(getattr(type(self._db), "fetchval", None))
+        ):
+            open_idle = await self._db.fetchval(
+                "SELECT id FROM vm_idle_operations WHERE owner_kind='thread' "
+                "AND owner_id=$1::uuid AND closed_at IS NULL",
+                thread_id,
+            )
+            if open_idle is not None and str(open_idle) != wake_operation_id:
+                return False
+        if wake_operation_id is not None and (
+            not is_vm or not rootdisk_kept or thread.get("execution_lane") != "pinned"
+        ):
+            return False
 
         # Same "read it first" rule, container tier: create_workspace rebinds
         # _workspace_binding to whatever the new pod mounts, so the identity of
@@ -2268,17 +2338,32 @@ class WorkspaceSuspensionService:
             else:
                 retired_runtime = _captured_workspace_runtime(ws_ctx)
                 if (
-                    retired_runtime is None
-                    or ws_ctx.get("status") != "suspended"
-                    or ws_ctx.get(WORKSPACE_SNAPSHOT_RESTORE_REQUIRED_KEY) is not True
+                    strict_terminal_snapshot
+                    and ws_ctx.get("status") == "deleted"
+                    and retired_runtime is None
+                    and stateless_creation_generation is not None
                 ):
-                    return False
-                suspension = (
-                    await self._container_provisioner.get_settled_workspace_suspension(
+                    # Metadata alone never authorizes this UID-less shape.
+                    # Resolve the original suspension through its exact derived
+                    # cleanup receipt and current unattempted restore marker.
+                    suspension = await self._db.get_stateless_thread_workspace_restore_predecessor(
+                        thread_id, generation=stateless_creation_generation
+                    )
+                    if not isinstance(suspension, dict):
+                        return False
+                    retired_runtime = str(suspension["runtime_incarnation"])
+                else:
+                    if (
+                        retired_runtime is None
+                        or ws_ctx.get("status") != "suspended"
+                        or ws_ctx.get(WORKSPACE_SNAPSHOT_RESTORE_REQUIRED_KEY)
+                        is not True
+                    ):
+                        return False
+                    suspension = await self._container_provisioner.get_settled_workspace_suspension(
                         owner,
                         expected_runtime_incarnation=retired_runtime,
                     )
-                )
                 if not isinstance(suspension, dict):
                     return False
                 try:
@@ -2310,6 +2395,13 @@ class WorkspaceSuspensionService:
                     thread,
                     fallback=metadata.get("config_override"),
                 )
+                if wake_operation_id is not None:
+                    # Reattach the retained disk; first-create preparation
+                    # and initialization are not replayed over user data.
+                    options.pop("preparation", None)
+                    options.pop("initialization", None)
+                if wake_operation_id is not None:
+                    options["wake_operation_id"] = wake_operation_id
                 ok = await self._vm_provisioner.create_thread_vm(
                     thread_id,
                     **options,
@@ -2330,13 +2422,14 @@ class WorkspaceSuspensionService:
                     logger.error(
                         "Failed to create VM for restore of thread %s", thread_id
                     )
-                    await self._db.merge_thread_vm_context(
-                        thread_id,
-                        {
-                            "status": "failed",
-                            "error": "VM creation failed on restore",
-                        },
-                    )
+                    if wake_operation_id is None:
+                        await self._db.merge_thread_vm_context(
+                            thread_id,
+                            {
+                                "status": "failed",
+                                "error": "VM creation failed on restore",
+                            },
+                        )
                     return False
 
                 # Kept rootdisk: the restore IS the create. The reattached disk
@@ -2397,6 +2490,8 @@ class WorkspaceSuspensionService:
                                 operation_id=restore_operation_id,
                                 **create_kwargs,
                             )
+                        except SessionWorkspaceObservationYielded:
+                            return False
                         except Exception:
                             logger.warning(
                                 "Workspace restore create response was ambiguous for "
@@ -2647,6 +2742,8 @@ class WorkspaceSuspensionService:
             )
             return True
 
+        except SessionWorkspaceObservationYielded:
+            return False
         except Exception:
             logger.exception("Failed to restore workspace for thread %s", thread_id)
             if strict_terminal_snapshot:

@@ -705,9 +705,22 @@ async def resolve_target(
     A resolvable-but-not-live workspace returns a non-live ``state`` and
     ``pod_ip: None``, so the gateway can print a readable reason.
     """
+    thread = await dependencies.store.get_thread(thread_id)
+    return resolve_target_from_thread(
+        thread=thread, thread_id=thread_id, user=user, dependencies=dependencies
+    )
+
+
+def resolve_target_from_thread(
+    *,
+    thread: dict[str, Any] | None,
+    thread_id: str,
+    user: dict[str, Any],
+    dependencies: SshAccessDependencies,
+) -> dict[str, Any]:
+    """Project the provided Thread snapshot; the native route also describes it."""
     opaque = HTTPException(status_code=404, detail="No such workspace")
 
-    thread = await dependencies.store.get_thread(thread_id)
     if not thread:
         raise opaque
     metadata = thread_metadata_object(thread)

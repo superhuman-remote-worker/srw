@@ -22,11 +22,28 @@ import pytest_asyncio
 from testcontainers.postgres import PostgresContainer
 
 from orchestrator.database.postgres import PostgresDB
+from tests._container_recovery_schema import (
+    create_empty_container_recovery_ledger,
+    create_undischarged_pinned_cancel_retention_ledger,
+)
 from orchestrator.services.job_completion_commands import (
     CompletionFenceRejected,
     accept_completion_command,
 )
 from orchestrator.services import session_config_resolution  # noqa: E402
+from orchestrator.application import access as access_composition
+from orchestrator.application import catalogue as catalogue_composition
+from orchestrator.application import sessions as sessions_composition
+from orchestrator.schemas import agent_child_threads as agent_child_threads_module
+from orchestrator.schemas import thread_admission as schemas_thread_admission_module
+from orchestrator.security import access as access_module
+from orchestrator.security import auth as auth_module
+from orchestrator.services import deployment_gates as deployment_gates_module
+from orchestrator.services import grant_enforcement as grant_enforcement_module
+from orchestrator.services import thread_admission as thread_admission_module
+from orchestrator.services import (
+    thread_project_authorization as thread_project_authorization_module,
+)
 
 
 WORK = "22222222-2222-4222-8222-222222222222"
@@ -46,22 +63,26 @@ async def test_generic_expert_is_refused_before_interactive_loader(
         get_application_expert_default=AsyncMock(return_value=expert),
         create_thread=AsyncMock(side_effect=AssertionError("Generic session inserted")),
     )
-    monkeypatch.setattr(main, "postgres_db", db)
-    monkeypatch.setattr(main, "_enforce_readiness_gate", AsyncMock())
-    monkeypatch.setattr(main, "require_internal", AsyncMock())
+    monkeypatch.setattr(main.app.state.resources, "postgres_db", db)
+    monkeypatch.setattr(access_composition, "enforce_readiness_gate", AsyncMock())
+    monkeypatch.setattr(access_module, "require_internal", AsyncMock())
     monkeypatch.setattr(
-        main, "require_approved_user", AsyncMock(return_value={"id": USER})
+        auth_module, "require_approved_user", AsyncMock(return_value={"id": USER})
     )
     monkeypatch.setattr(
-        main, "_authorize_thread_project_ids", AsyncMock(return_value=[])
+        thread_project_authorization_module,
+        "authorize_thread_project_ids",
+        AsyncMock(return_value=[]),
     )
     monkeypatch.setattr(
         session_config_resolution,
         "resolve_session_account_defaults",
         AsyncMock(return_value={}),
     )
-    monkeypatch.setattr(main, "_is_experts_db_enabled", lambda: True)
-    monkeypatch.setattr(main, "_user_experts_enabled", AsyncMock(return_value=True))
+    monkeypatch.setattr(deployment_gates_module, "is_experts_db_enabled", lambda: True)
+    monkeypatch.setattr(
+        grant_enforcement_module, "user_experts_enabled", AsyncMock(return_value=True)
+    )
     monkeypatch.setattr(
         thread_admission,
         "resolve_root_expert",
@@ -76,11 +97,19 @@ async def test_generic_expert_is_refused_before_interactive_loader(
         if internal:
             await agent_child_threads.agent_create_thread(
                 None,
-                main.AgentThreadCreateRequest(),
-                dependencies=main._agent_child_threads_dependencies(),
+                agent_child_threads_module.AgentThreadCreateRequest(),
+                dependencies=sessions_composition.agent_child_threads_dependencies(
+                    main.app.state.resources
+                ),
             )
         else:
-            await main.create_thread(main.ThreadCreateRequest(expert_id=WORK), None)
+            await thread_admission_module.create_thread(
+                schemas_thread_admission_module.ThreadCreateRequest(expert_id=WORK),
+                None,
+                dependencies=sessions_composition.thread_admission_dependencies(
+                    main.app.state.resources
+                ),
+            )
     assert denied.value.status_code == 409
     assert "Interactive sessions require the SRW adapter" in denied.value.detail
     db.create_thread.assert_not_awaited()
@@ -113,17 +142,21 @@ async def test_legacy_mutations_refuse_generic_before_effects(monkeypatch, opera
         "execution_harness_adapter": "generic",
     }
     db = SimpleNamespace(get_job=AsyncMock(return_value=deepcopy(work)))
-    monkeypatch.setattr(main, "postgres_db", db)
+    monkeypatch.setattr(main.app.state.resources, "postgres_db", db)
     monkeypatch.setattr(
-        main,
+        access_module,
         "require_internal_or_job_access",
         AsyncMock(return_value=({"id": USER}, work)),
     )
     monkeypatch.setattr(
-        main, "require_job_access", AsyncMock(return_value=({"id": USER}, work))
+        access_module,
+        "require_job_access",
+        AsyncMock(return_value=({"id": USER}, work)),
     )
     monkeypatch.setattr(
-        main, "require_thread_owner", AsyncMock(return_value=({"id": USER}, work))
+        access_module,
+        "require_thread_owner",
+        AsyncMock(return_value=({"id": USER}, work)),
     )
     if operation == "resume":
         call = control_seams.resume_job_internal(WORK, user={"id": USER}, job=work)
@@ -164,7 +197,7 @@ async def test_legacy_direct_delivery_and_internal_resume_leave_generic_alone(
 
     job = {"id": WORK, "execution_harness_adapter": "generic"}
     db = SimpleNamespace(get_job=AsyncMock(return_value=job))
-    monkeypatch.setattr(main, "postgres_db", db)
+    monkeypatch.setattr(main.app.state.resources, "postgres_db", db)
     assert await control_seams.dispatch_job_to_agent(job, {"id": USER}) is False
     assert await control_seams.resume_job_on_agent(job, {"id": USER}) is False
     assert await control_seams.internal_resume_job(WORK, "feedback") is False
@@ -178,9 +211,11 @@ async def test_descendant_cancel_uses_generic_controller(monkeypatch):
     job = {"id": WORK, "execution_harness_adapter": "generic", "status": "processing"}
     db = SimpleNamespace(get_descendant_jobs=AsyncMock(return_value=[job]))
     cancel = AsyncMock(return_value=True)
-    monkeypatch.setattr(main, "postgres_db", db)
+    monkeypatch.setattr(main.app.state.resources, "postgres_db", db)
     monkeypatch.setattr(
-        main, "_manifest_execution_service", lambda: SimpleNamespace(cancel=cancel)
+        catalogue_composition,
+        "manifest_execution_service",
+        lambda _resources: SimpleNamespace(cancel=cancel),
     )
     assert await control_seams.cascade_cancel_to_children(USER) is True
     cancel.assert_awaited_once_with(WORK)
@@ -202,6 +237,9 @@ async def runtime_db(pg_url):
         CREATE TABLE IF NOT EXISTS jobs(
             id uuid PRIMARY KEY, project_id uuid, user_id uuid, status text,
             execution_lane text DEFAULT 'pinned', assigned_agent_id uuid,
+            parent_job_id uuid, resolved_config jsonb,
+            workspace_idle_revision bigint NOT NULL DEFAULT 0,
+            workspace_idle_episode jsonb,
             lease_expires_at timestamptz, updated_at timestamptz DEFAULT now(),
             context jsonb DEFAULT '{}', freeze_data jsonb, priority integer DEFAULT 0,
             config_override jsonb DEFAULT '{"workspace":{"backend":"none"}}',
@@ -218,8 +256,21 @@ async def runtime_db(pg_url):
             owner_kind text, owner_id uuid, status text, quarantine_reason text,
             updated_at timestamptz
         );
-        TRUNCATE jobs, agents, srw_execution_specs, run_queue;
+        -- Delete checks for VM history before enforcing harness ownership.
+        -- These generic/non-VM Jobs have no stable VM audit owner.
+        CREATE TABLE IF NOT EXISTS vm_job_creation_owners(
+            job_id uuid PRIMARY KEY, live_job_id uuid, deleted_at timestamptz
+        );
+        -- Pinned resume paths fence on an open idle operation (0270).
+        CREATE TABLE IF NOT EXISTS vm_idle_operations(
+            owner_kind text NOT NULL, owner_id uuid NOT NULL, closed_at timestamptz
+        );
+        TRUNCATE jobs, agents, srw_execution_specs, run_queue, vm_idle_operations,
+                 vm_job_creation_owners;
     """)
+    async with db.acquire() as conn:
+        await create_empty_container_recovery_ledger(conn)
+        await create_undischarged_pinned_cancel_retention_ledger(conn)
     yield db
     await db.disconnect()
 

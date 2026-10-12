@@ -13,6 +13,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from orchestrator.services.snapshot_service import (
+    CREDENTIAL_EXCLUDE_PATTERNS,
     SnapshotService,
     _read_stream_tail,
     _snapshot_tar_pipeline,
@@ -237,6 +238,8 @@ async def test_strict_capture_uses_pipefail_keeps_git_and_stamps_digest() -> Non
     assert "--exclude=.git/objects" not in ssh_command
     assert "--exclude=*/repos/*" not in ssh_command
     assert "/usr/local/" not in ssh_command
+    for pattern in CREDENTIAL_EXCLUDE_PATTERNS:
+        assert f"{pattern} " in ssh_command
     manifest = service.upload_snapshot.await_args.kwargs["manifest"]
     assert manifest["strict_terminal"] is True
     assert manifest["captured_paths"] == ["/home/agent-host/"]
@@ -292,6 +295,77 @@ def test_strict_archive_round_trip_preserves_git_objects_and_repo_state(
         restored_repo = next(restored.rglob("repos/project/state.txt"))
         assert restored_git.read_bytes() == b"durable-git-object"
         assert restored_repo.read_text(encoding="utf-8") == "undo-authority"
+
+
+def test_strict_archive_omits_connector_credentials_and_keeps_user_ssh(
+    tmp_path: Path,
+) -> None:
+    """The sole durable copy of an emptyDir home holds no connector credential.
+
+    Env connector files, the managed ssh-agent namespace and legacy external
+    repository keys are rewritten on every attach; the user's own ``~/.ssh``
+    content must survive the terminal snapshot.
+    """
+    with tempfile.TemporaryDirectory(
+        prefix="snapshot-credentials-", dir=Path.home()
+    ) as root:
+        home = Path(root) / "agent-host"
+        fixture = {
+            ".srw-credentials/0123abcd.sh": "export C0=env-secret\n",
+            ".srw-credentials/0123abcd.json": "{}",
+            ".ssh/srw-managed/config.d/srw-repo-x.conf": "Host srw-repo-x\n",
+            ".ssh/srw-managed/agents/srw-repo-x.state": "pid=1\n",
+            ".ssh/srw-managed/known_hosts": "gitea ssh-ed25519 AAAA\n",
+            ".ssh/repo_github": "legacy-private-key\n",
+            ".ssh/config": "Include ~/.ssh/srw-managed/config.d/*.conf\n",
+            ".ssh/id_ed25519": "user-private-key\n",
+            ".ssh/known_hosts": "example ssh-ed25519 AAAA\n",
+            ".ssh/repository-notes": "user file with a similar name\n",
+            "workspace/repos/project/state.txt": "undo-authority",
+            ".cache/srw/rclone/t1/workspace/rclone.conf": "pass = obscured\n",
+            ".cache/srw/rclone/t1/workspace/bearer.token": "bearer\n",
+            ".cache/srw/rclone/t1/workspace/bearer.token.new.0a1b": "bearer\n",
+            ".cache/srw/rclone/t1/workspace/.bearer.token.Xy12AbCd": "bearer\n",
+            ".cache/srw/rclone/t1/workspace/bearer-helper.sh": "exec cat token\n",
+            ".cache/srw/rclone/t1/workspace/vfs-cache/vfs/r/notes.md": "cached\n",
+        }
+        for relative, content in fixture.items():
+            path = home / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(content, encoding="utf-8")
+        archive = tmp_path / "home.tar.zst"
+
+        command = _snapshot_tar_pipeline([str(home)], strict_terminal=True)
+        with archive.open("wb") as output:
+            completed = subprocess.run(
+                ["bash", "-c", command],
+                stdout=output,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+        assert completed.returncode == 0, completed.stderr.decode(errors="replace")
+
+    listing = subprocess.run(
+        ["bash", "-o", "pipefail", "-c", f"zstd -dc -- {archive} | tar -tf -"],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.splitlines()
+    assert not [m for m in listing if "/.srw-credentials" in m]
+    assert not [m for m in listing if "/.ssh/srw-managed" in m]
+    assert not [m for m in listing if "/.ssh/repo_" in m]
+    assert not [m for m in listing if m.endswith("/rclone.conf")]
+    assert not [m for m in listing if "bearer.token" in m]
+    for kept in (
+        ".cache/srw/rclone/t1/workspace/bearer-helper.sh",
+        ".cache/srw/rclone/t1/workspace/vfs-cache/vfs/r/notes.md",
+        ".ssh/config",
+        ".ssh/id_ed25519",
+        ".ssh/known_hosts",
+        ".ssh/repository-notes",
+        "workspace/repos/project/state.txt",
+    ):
+        assert any(m.endswith(f"agent-host/{kept}") for m in listing), kept
 
 
 @pytest.mark.asyncio
@@ -742,3 +816,64 @@ async def test_failed_recapture_keeps_an_available_snapshot() -> None:
     last = service._set_snapshot_context.await_args_list[-1].args[1]
     assert last["status"] == "available"
     assert "rc=255" in last["last_capture_error"]
+
+
+@pytest.mark.parametrize("auth_type", ["basic", "keycloak_client_credentials"])
+def test_every_mount_start_rewrites_the_excluded_rclone_files(auth_type) -> None:
+    """A home restored without rclone.conf and bearer.token still mounts.
+
+    The snapshot excludes both files; every mount start recreates the state
+    directory, writes the bearer token (Keycloak auth) and creates the rclone
+    config before rclone first reads either.
+    """
+    from types import SimpleNamespace
+
+    from shared.runtime.services.cloud_mount import RcloneMountManager
+
+    home = "/home/agent-host"
+    backend = SimpleNamespace(
+        resolve_home_path=lambda relative: f"{home}/{relative}",
+        claim_resource_fenced=False,
+        root=f"{home}/workspace",
+    )
+    auth = (
+        {"type": "basic", "password": "reader-secret"}
+        if auth_type == "basic"
+        else {
+            "type": auth_type,
+            "issuer": "https://auth.example.test/realms/srw",
+            "client_id": "srw-agent",
+            "client_secret": "client-secret",
+        }
+    )
+    mount = {
+        "mount_id": "m1",
+        "workspace_name": "workspace",
+        "target_path": "/cloud/workspace",
+        "source": {
+            "type": "webdav",
+            "config": {"url": "https://cloud.example.test/dav", "user": "reader"},
+        },
+        "auth": auth,
+    }
+    manager = RcloneMountManager(
+        thread_id="t1",
+        cloud_cfg={"driver": "rclone", "mounts": [mount]},
+        workspace_backend=backend,
+        workspace_root=Path(f"{home}/workspace"),
+    )
+    state = manager._state_for_mount(mount, 0)
+    script = manager._mount_script(
+        mount, state, initial_token=None if auth_type == "basic" else "bearer"
+    )
+
+    # The layout the snapshot fixtures above exclude.
+    assert state.config_path == f"{home}/.cache/srw/rclone/t1/workspace/rclone.conf"
+    assert state.token_path == f"{home}/.cache/srw/rclone/t1/workspace/bearer.token"
+    mkdir = script.index(f"mkdir -p {state.state_dir} ")
+    create = script.index(f"rclone --config {state.config_path} config create")
+    first_read = script.index(f"rclone --config {state.config_path} cat")
+    assert mkdir < create < first_read
+    if auth_type != "basic":
+        token = script.index(f"cat > {state.token_path} <<")
+        assert mkdir < token < create

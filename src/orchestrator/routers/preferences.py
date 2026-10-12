@@ -9,10 +9,33 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, field_validator
 
 from orchestrator.security.auth import require_approved_user
+from orchestrator.services.model_availability import (
+    MODEL_UNAVAILABLE_CODE,
+    WHERE_ACCOUNT,
+    UnavailableModel,
+    render_unavailable_message,
+    stale_account_model_reason,
+)
 from orchestrator.services.preference_defaults import resolve_preference_defaults
-from orchestrator.services.session_workspace_policy import SESSION_WORKSPACE_BACKENDS
 
 router = APIRouter(prefix="/api/settings/preferences")
+
+# The account model preferences checked against the registry
+# (unavailable_model_handling.md §7): (path, slot, capability).
+_MODEL_PREFERENCES = (
+    (("default_model",), "llm", "chat"),
+    (("default_auxiliary_model",), "auxiliary", "auxiliary"),
+    (("persistent_agent", "model"), "llm", "chat"),
+)
+
+
+def _preference_value(settings: Mapping[str, Any] | None, path: tuple[str, ...]) -> Any:
+    value: Any = settings or {}
+    for key in path:
+        if not isinstance(value, Mapping):
+            return None
+        value = value.get(key)
+    return value
 
 
 @dataclass
@@ -62,12 +85,12 @@ class UserSettingsUpdate(BaseModel):
     # header (orchestrator/security/auth.py), this just persists the choice.
     admin_view_mode: Literal["me", "all"] | None = None
     # persistent_agent sub-object: model, permission_mode,
-    # idle_timeout_minutes, headless_mode, headless_attention_sleep_minutes,
-    # and workspace_backend (the user's default session workspace tier).
+    # idle_timeout_minutes, headless_mode and headless_attention_sleep_minutes.
     # Patch-replaces the whole sub-object. Free-form by design, so legacy keys
     # from removed controls (greeting, command_allowlist,
     # notification_channels) still round-trip harmlessly if a stored blob
-    # carries them — nothing reads them any more.
+    # carries them — nothing reads them any more. The retired workspace_backend
+    # is the exception: it is dropped (see _validate_persistent_agent).
     persistent_agent: dict[str, Any] | None = None
     # Read-aloud rewrite preferences: {reasoning_level, custom_prompt}. Controls
     # how the auxiliary LLM rewrites a message for speech — reasoning_level (off
@@ -96,19 +119,17 @@ class UserSettingsUpdate(BaseModel):
     def _validate_persistent_agent(
         cls, v: dict[str, Any] | None
     ) -> dict[str, Any] | None:
-        """Guard the persistent_agent sub-object: workspace_backend must be a
-        create-time-selectable tier — a typo here would otherwise misconfigure
-        every future session created from the user's defaults. Other keys stay
-        free-form (Phase 6 contract)."""
+        """Guard the persistent_agent sub-object. ``workspace_backend`` is a
+        retired preference (Slice A2b: a Session's tier now comes only from
+        the workspace defaults chain) — accepted from a stale cockpit and
+        silently dropped, rather than 422ing, so an old client's PATCH still
+        succeeds for its other fields. Other keys stay free-form (Phase 6
+        contract)."""
         if v is None:
             return v
         if not isinstance(v, dict):
             raise ValueError("persistent_agent must be an object")
-        backend = v.get("workspace_backend")
-        if backend is not None and backend not in SESSION_WORKSPACE_BACKENDS:
-            raise ValueError(
-                f"workspace_backend must be one of {list(SESSION_WORKSPACE_BACKENDS)}"
-            )
+        v = {key: value for key, value in v.items() if key != "workspace_backend"}
         return v
 
     @field_validator("read_aloud")
@@ -233,9 +254,32 @@ async def get_user_preferences(
     """
     user = await dependencies.require_approved_user(request, dependencies.db)
     prefs = await dependencies.db.get_user_settings(str(user["id"]))
+    # persistent_agent.workspace_backend is a retired preference (Slice A2b):
+    # hide it on read even though a stored row may still carry it. The startup
+    # backfill copies it into the personal project and leaves it in place; the
+    # next preferences PATCH that replaces persistent_agent drops it.
+    if isinstance(prefs.get("persistent_agent"), dict):
+        prefs["persistent_agent"] = {
+            key: value
+            for key, value in prefs["persistent_agent"].items()
+            if key != "workspace_backend"
+        }
     prefs["_resolved"] = await resolve_preference_defaults(
         dependencies.db, role_base=dependencies.role_base, environ=dependencies.environ
     )
+    # A stored model preference that can no longer run, keyed by its dotted
+    # path, so the page can show it as unavailable instead of a blank select.
+    unavailable: dict[str, str] = {}
+    for path, _slot, capability in _MODEL_PREFERENCES:
+        model = _preference_value(prefs, path)
+        if not model or not isinstance(model, str):
+            continue
+        reason = await stale_account_model_reason(
+            model, user_id=str(user["id"]), capability=capability, store=dependencies.db
+        )
+        if reason is not None:
+            unavailable[".".join(path)] = reason
+    prefs["_unavailable"] = unavailable
     return prefs
 
 
@@ -255,5 +299,52 @@ async def update_user_preferences(
     }
     if not settings:
         raise HTTPException(status_code=400, detail="No settings provided")
+    await _refuse_unavailable_model_preferences(user, settings, dependencies)
     await dependencies.db.update_user_settings(str(user["id"]), settings)
     return {"status": "updated"}
+
+
+async def _refuse_unavailable_model_preferences(
+    user: Mapping[str, Any],
+    settings: Mapping[str, Any],
+    dependencies: PreferencesDependencies,
+) -> None:
+    """Refuse saving a model preference that cannot run (400, the model named).
+
+    Only a value that differs from the stored one is checked: the page saves
+    every field together, and an already-stale stored default must not block
+    an unrelated change. Clearing (``null``) is always allowed.
+    """
+    candidates = [
+        (path, slot, capability, model)
+        for path, slot, capability in _MODEL_PREFERENCES
+        if path[0] in settings
+        and isinstance(model := _preference_value(settings, path), str)
+        and model
+    ]
+    stored: Mapping[str, Any] | None = None
+    entries: list[UnavailableModel] = []
+    for path, slot, capability, model in candidates:
+        reason = await stale_account_model_reason(
+            model, user_id=str(user["id"]), capability=capability, store=dependencies.db
+        )
+        if reason is None:
+            continue
+        if stored is None:
+            stored = await dependencies.db.get_user_settings(str(user["id"])) or {}
+        if model == _preference_value(stored, path):
+            continue
+        entries.append(UnavailableModel(slot=slot, model=model, reason=reason))
+    if entries:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": MODEL_UNAVAILABLE_CODE,
+                "message": render_unavailable_message(
+                    entries,
+                    where=WHERE_ACCOUNT,
+                    is_admin=bool(user.get("is_admin")),
+                ),
+                "entries": [entry.as_dict() for entry in entries],
+            },
+        )

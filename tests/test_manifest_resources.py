@@ -16,7 +16,9 @@ from testcontainers.postgres import PostgresContainer
 
 from orchestrator.database.postgres import PostgresDB
 from orchestrator.services.manifest_resources import ManifestResourceService
-from orchestrator.services.manifest_store import resource_key
+from orchestrator.services.manifest_store import resource_key, ManifestStore
+from orchestrator.services.project_workspace_defaults import read_project_defaults
+from shared.workspace_defaults import ProjectDefaults
 
 
 @pytest.fixture(scope="module")
@@ -124,12 +126,40 @@ async def database(pg_url, monkeypatch):
         CREATE TABLE jobs(id uuid PRIMARY KEY, status text DEFAULT 'created', error_message text,
             assigned_agent_id uuid, lease_expires_at timestamptz, execution_lane text DEFAULT 'pinned');
         CREATE TABLE threads(id uuid PRIMARY KEY, status text DEFAULT 'created');
+        CREATE TABLE datasources(id uuid PRIMARY KEY, type text,
+            config jsonb DEFAULT '{}', managed_key text, policy_revision integer DEFAULT 1);
+        CREATE TABLE project_datasources(project_id uuid, datasource_id uuid,
+            read_only boolean, description text, PRIMARY KEY(project_id, datasource_id));
     """)
     migration = (
         Path(__file__).resolve().parents[1]
         / "src/orchestrator/database/migrations/app/0234_manifest_resources.sql"
     )
     await db.execute(migration.read_text())
+    await db.execute(
+        migration.with_name("0307_installation_managed_resources.sql").read_text()
+    )
+    await db.execute(
+        migration.with_name("0308_project_workspace_defaults.sql").read_text()
+    )
+    # A Project activation owns or releases its connector defaults (D3c).
+    await db.execute(
+        migration.with_name("0380_project_connector_defaults.sql").read_text()
+    )
+    # A final retire revokes the execution's credential leases (C2) and its
+    # provider-minted credentials (C5).
+    await db.execute(
+        migration.with_name("0347_connector_credential_leases.sql").read_text()
+    )
+    await db.execute(
+        migration.with_name("0430_connector_minted_credentials.sql").read_text()
+    )
+    # 0350's srw_resources columns; that migration also alters datasources,
+    # which this fixture does not create.
+    await db.execute(
+        "ALTER TABLE srw_resources ADD COLUMN platform_managed TEXT, "
+        "ADD COLUMN linked_updated_at TIMESTAMPTZ"
+    )
     yield db
     await db.disconnect()
 
@@ -329,6 +359,261 @@ async def test_project_activation_is_atomic_and_defaults_use_pinned_content(
 
 
 @pytest.mark.asyncio
+async def test_project_manifest_owns_and_releases_workspace_defaults(database, actor):
+    service = ManifestResourceService(database)
+    # A standalone, Account-scoped WorkspaceTemplate referenced by alias: an
+    # inline alias would become a managed child of the Project, and a managed
+    # child can only be removed by re-applying its owning Project (never by
+    # deleting the Project itself), which would confuse this test's own
+    # store-delete release path with the activation release path.
+    workspace = {
+        "apiVersion": "srw/v1alpha1",
+        "kind": "WorkspaceTemplate",
+        "metadata": {"name": "box"},
+        "spec": {"backend": "vm"},
+    }
+    await apply(service, workspace, actor)
+    project = {
+        "apiVersion": "srw/v1alpha1",
+        "kind": "Project",
+        "metadata": {"name": "team"},
+        "spec": {
+            "resources": {
+                "workspaces": {
+                    "box": {
+                        "ref": {
+                            "name": "box",
+                            "scope": {"kind": "Account", "name": str(actor["id"])},
+                        }
+                    }
+                }
+            },
+            "defaults": {"workspace": {"jobs": "vm", "vm": "box"}},
+        },
+    }
+    initial = await apply(service, project, actor)
+    project_row = next(
+        item for item in initial["resources"] if item["resource"]["kind"] == "Project"
+    )
+    project_id = await database.fetchval(
+        "SELECT linked_id FROM srw_resources WHERE id=$1", UUID(project_row["uid"])
+    )
+    row = await read_project_defaults(database, project_id)
+    assert row.jobs == "vm"
+    assert row.source == "manifest"
+    assert row.manifest_revision == project_row["revision"]
+
+    store = ManifestStore(database)
+    resource = await store.by_link("Project", project_id)
+    await store.delete(resource, expected_version=resource["resource_version"])
+    assert await read_project_defaults(database, project_id) == ProjectDefaults()
+
+
+async def manifest_project(database, actor, spec):
+    initial = await apply(
+        ManifestResourceService(database),
+        {
+            "apiVersion": "srw/v1alpha1",
+            "kind": "Project",
+            "metadata": {"name": "team"},
+            "spec": spec,
+        },
+        actor,
+    )
+    project_row = next(
+        item for item in initial["resources"] if item["resource"]["kind"] == "Project"
+    )
+    return await database.fetchval(
+        "SELECT linked_id FROM srw_resources WHERE id=$1", UUID(project_row["uid"])
+    )
+
+
+async def admit_generic_project_job(database, actor, monkeypatch, project_id):
+    """Admit a generic-image Job that omits its workspace; record create_job."""
+    from orchestrator.services.manifest_execution import ManifestExecutionService
+    from orchestrator.services.connector_drivers import builtin_connector_drivers
+    from orchestrator.services.manifest_execution_snapshot import read_execution
+    from orchestrator.services.manifest_workspaces import ManifestWorkspaceService
+
+    created = []
+    create_job = database.create_job
+
+    async def recording_create_job(**kwargs):
+        created.append(kwargs)
+        return await create_job(**kwargs)
+
+    monkeypatch.setattr(database, "create_job", recording_create_job)
+    workspaces = ManifestWorkspaceService(
+        database,
+        WorkspaceProcessRuntime(),
+        namespace="ws",
+        harness_namespace="agents",
+        default_image="workspace:test",
+    )
+    execution = ManifestExecutionService(
+        database,
+        runtime=ProcessRuntime(),
+        namespace="agents",
+        workspace=workspaces,
+        native_hosting_enabled=True,
+        connector_drivers=builtin_connector_drivers(),
+    )
+    resources = ManifestResourceService(database, admit_job=execution.admit)
+    assignment = job(expert={"inline": expert()["spec"]})
+    assignment["metadata"]["scope"] = {"kind": "Project", "name": str(project_id)}
+    result = await apply(resources, assignment, actor)
+    work_id = next(iter(result["executions"].values()))
+    snapshot = await read_execution(database, "Job", work_id)
+    # The authored document keeps the omission; admission fills the snapshot.
+    assert "workspace" not in snapshot["document"]["spec"]["execution"]
+    return snapshot, created[0]
+
+
+@pytest.mark.asyncio
+async def test_generic_job_without_workspace_gets_the_project_container_template(
+    database, actor, monkeypatch
+):
+    from orchestrator.services.workspace_defaults_resolution import (
+        workspace_sources_record,
+    )
+
+    # The shorthand to a sandbox alias: Jobs mode container plus that template
+    # (the shape of the published conformance fixture's generic Job).
+    recipe = {
+        "backend": "sandbox",
+        "environment": {"image": "example/ssh-workspace:1"},
+        "initialize": [{"command": ["mkdir", "-p", "project"]}],
+        "retention": "Retain",
+    }
+    project_id = await manifest_project(
+        database,
+        actor,
+        {
+            "resources": {"workspaces": {"development": {"inline": recipe}}},
+            "defaults": {"workspace": "development"},
+        },
+    )
+    row = await read_project_defaults(database, project_id)
+    assert (row.jobs, row.source) == ("container", "manifest")
+    assert "inline" in row.container
+    snapshot, created = await admit_generic_project_job(
+        database, actor, monkeypatch, project_id
+    )
+    template = snapshot["resolved"]["spec"]["execution"]["workspace"]["template"]
+    assert template["inline"]["backend"] == "sandbox"
+    assert template["inline"]["retention"] == "Retain"
+    assert template["inline"]["environment"]["image"] == "example/ssh-workspace:1"
+    assert created["config_override"] == {"workspace": {"backend": "sandbox"}}
+    assert workspace_sources_record(created["workspace_selection"]) == {
+        "tier": "project",
+        "template": "project",
+        "template_name": None,
+    }
+    # Reserved like an authored binding.
+    assert (
+        await database.fetchval(
+            "SELECT count(*) FROM srw_execution_workspace_bindings WHERE execution_id=$1",
+            snapshot["id"],
+        )
+        == 1
+    )
+
+
+@pytest.mark.asyncio
+async def test_generic_job_resolves_a_settings_row_template_reference(
+    database, actor, monkeypatch
+):
+    from orchestrator.services.project_workspace_defaults import (
+        save_settings_defaults,
+    )
+
+    await apply(
+        ManifestResourceService(database),
+        {
+            "apiVersion": "srw/v1alpha1",
+            "kind": "WorkspaceTemplate",
+            "metadata": {"name": "tools"},
+            "spec": {
+                "backend": "sandbox",
+                "environment": {"image": "example/tools-workspace:2"},
+            },
+        },
+        actor,
+    )
+    project_id = await manifest_project(database, actor, {"resources": {}})
+    reference = {
+        "ref": {"name": "tools", "scope": {"kind": "Account", "name": str(actor["id"])}}
+    }
+    await save_settings_defaults(
+        database,
+        project_id,
+        ProjectDefaults(jobs="container", container=reference),
+        actor_id=str(actor["id"]),
+    )
+    snapshot, created = await admit_generic_project_job(
+        database, actor, monkeypatch, project_id
+    )
+    template = snapshot["resolved"]["spec"]["execution"]["workspace"]["template"]
+    assert template["inline"]["environment"]["image"] == "example/tools-workspace:2"
+    assert created["config_override"] == {"workspace": {"backend": "sandbox"}}
+    assert created["workspace_selection"]["template_name"] == "tools"
+    assert any(
+        dependency.get("key", "").endswith("/tools")
+        for dependency in snapshot["dependencies"]
+    )
+
+
+@pytest.mark.asyncio
+async def test_generic_job_names_a_missing_project_container_template(
+    database, actor, monkeypatch
+):
+    from orchestrator.services.project_workspace_defaults import (
+        save_settings_defaults,
+    )
+
+    project_id = await manifest_project(database, actor, {"resources": {}})
+    missing = {
+        "ref": {"name": "gone", "scope": {"kind": "Account", "name": str(actor["id"])}}
+    }
+    await save_settings_defaults(
+        database,
+        project_id,
+        ProjectDefaults(jobs="container", container=missing),
+        actor_id=str(actor["id"]),
+    )
+    with pytest.raises(HTTPException) as refused:
+        await admit_generic_project_job(database, actor, monkeypatch, project_id)
+    assert refused.value.status_code == 409
+    assert refused.value.detail == (
+        "This Project's container template 'gone' no longer exists."
+    )
+    assert await database.fetchval("SELECT count(*) FROM jobs") == 0
+
+
+@pytest.mark.asyncio
+async def test_generic_job_without_workspace_ignores_a_project_vm_default(
+    database, actor, monkeypatch
+):
+    project_id = await manifest_project(
+        database,
+        actor,
+        {
+            "resources": {"workspaces": {"box": {"inline": {"backend": "vm"}}}},
+            "defaults": {"workspace": {"jobs": "vm", "vm": "box"}},
+        },
+    )
+    assert (await read_project_defaults(database, project_id)).jobs == "vm"
+    snapshot, created = await admit_generic_project_job(
+        database, actor, monkeypatch, project_id
+    )
+    # A generic image can't use a VM tier: it keeps "omitted means none".
+    assert snapshot["resolved"]["spec"]["execution"]["workspace"] is None
+    assert created["config_override"] == {"workspace": {"backend": "none"}}
+    assert created["requested_workspace_backend"] == "none"
+    assert created["workspace_selection"] is None
+
+
+@pytest.mark.asyncio
 async def test_secrets_are_encrypted_and_plans_never_deliver_them(database, actor):
     service = ManifestResourceService(database)
     secret = await service.put_secret(
@@ -426,10 +711,15 @@ class ProcessRuntime:
 
 async def native_execution(database, actor, *, max_attempts=1, mode="ProcessExit"):
     from orchestrator.services.manifest_execution import ManifestExecutionService
+    from orchestrator.services.connector_drivers import builtin_connector_drivers
 
     process = ProcessRuntime()
     execution = ManifestExecutionService(
-        database, runtime=process, namespace="test", native_hosting_enabled=True
+        database,
+        runtime=process,
+        namespace="test",
+        native_hosting_enabled=True,
+        connector_drivers=builtin_connector_drivers(),
     )
     resources = ManifestResourceService(database, admit_job=execution.admit)
     assignment = job(expert={"inline": expert()["spec"]})
@@ -724,9 +1014,15 @@ async def test_unverified_network_profile_blocks_generic_admission_without_effec
     database, actor
 ):
     from orchestrator.services.manifest_execution import ManifestExecutionService
+    from orchestrator.services.connector_drivers import builtin_connector_drivers
 
     processes = ProcessRuntime()
-    execution = ManifestExecutionService(database, runtime=processes, namespace="test")
+    execution = ManifestExecutionService(
+        database,
+        runtime=processes,
+        namespace="test",
+        connector_drivers=builtin_connector_drivers(),
+    )
     resources = ManifestResourceService(database, admit_job=execution.admit)
     with pytest.raises(HTTPException) as unavailable:
         await apply(resources, job(expert={"inline": expert()["spec"]}), actor)
@@ -745,10 +1041,15 @@ async def test_unverified_network_profile_blocks_generic_admission_without_effec
 @pytest.mark.asyncio
 async def test_reapply_job_keeps_original_referenced_generation(database, actor):
     from orchestrator.services.manifest_execution import ManifestExecutionService
+    from orchestrator.services.connector_drivers import builtin_connector_drivers
 
     process = ProcessRuntime()
     execution = ManifestExecutionService(
-        database, runtime=process, namespace="test", native_hosting_enabled=True
+        database,
+        runtime=process,
+        namespace="test",
+        native_hosting_enabled=True,
+        connector_drivers=builtin_connector_drivers(),
     )
     resources = ManifestResourceService(database, admit_job=execution.admit)
     authored = [expert(), job()]
@@ -826,6 +1127,7 @@ async def native_workspace_execution(
     database, actor, *, retention="Retain", mode="ProcessExit", attempts=2
 ):
     from orchestrator.services.manifest_execution import ManifestExecutionService
+    from orchestrator.services.connector_drivers import builtin_connector_drivers
     from orchestrator.services.manifest_workspaces import ManifestWorkspaceService
 
     processes, workspace_processes = ProcessRuntime(), WorkspaceProcessRuntime()
@@ -842,6 +1144,7 @@ async def native_workspace_execution(
         namespace="agents",
         workspace=workspaces,
         native_hosting_enabled=True,
+        connector_drivers=builtin_connector_drivers(),
     )
     resources = ManifestResourceService(database, admit_job=executions.admit)
     recipe = {

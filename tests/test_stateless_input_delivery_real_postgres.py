@@ -123,14 +123,15 @@ async def _seed_thread(
     return user_id, thread_id
 
 
-async def _seed_pinned_thread(db: PostgresDB) -> tuple[UUID, UUID, UUID]:
+async def _seed_pinned_thread(
+    db: PostgresDB, *, pod_uid: str = "pod-pinned"
+) -> tuple[UUID, UUID, UUID]:
     user_id = uuid4()
     thread_id = uuid4()
     agent_id = uuid4()
     provision_attempt = uuid4()
     runtime_attach_token = uuid4()
     pod_name = "pinned-input-pod"
-    pod_uid = "pod-pinned"
     namespace = "agents-a"
     async with db.acquire() as conn:
         await conn.execute(

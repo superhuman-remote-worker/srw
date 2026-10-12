@@ -6,13 +6,18 @@ from unittest.mock import AsyncMock, Mock
 import pytest
 
 import agent.api.persistent_app as app
+from agent.api import session_transport, session_websocket
+
+
+def test_session_socket_keeps_its_idle_ping_policy():
+    # Shorter than Cockpit's control-socket watchdog and edge idle timeouts.
+    assert session_websocket.WS_PING_INTERVAL_S == 20.0
 
 
 @pytest.mark.asyncio
 async def test_idle_ping_then_queued_frame_are_direct_and_send_failure_stops_pump(
     monkeypatch,
 ):
-    monkeypatch.setattr(app, "_WS_PING_INTERVAL_S", 0.005)
     journal = Mock(side_effect=AssertionError("Direct pump output entered the journal"))
     monkeypatch.setattr(app, "_broadcast_frame", journal)
     queue = asyncio.Queue()
@@ -27,7 +32,10 @@ async def test_idle_ping_then_queued_frame_are_direct_and_send_failure_stops_pum
             raise OSError("closed socket")
 
     ws = Mock(send_json=AsyncMock(side_effect=send))
-    await asyncio.wait_for(app._run_subscriber_pump(ws, "client", queue), timeout=2)
+    await asyncio.wait_for(
+        session_transport.run_subscriber_pump(ws, queue, ping_interval=0.005),
+        timeout=2,
+    )
     assert sent == [{"method": "ws.ping", "params": {}}, frame]
     assert sent[1] is frame
     journal.assert_not_called()
@@ -55,7 +63,11 @@ async def test_cancelled_send_is_joined_without_unsubscribing_or_cancelling_loop
             settled.set()
 
     ws = Mock(send_json=AsyncMock(side_effect=send))
-    pump = asyncio.create_task(app._run_subscriber_pump(ws, "client", queue))
+    pump = asyncio.create_task(
+        session_transport.run_subscriber_pump(
+            ws, queue, ping_interval=session_websocket.WS_PING_INTERVAL_S
+        )
+    )
     try:
         await asyncio.wait_for(sending.wait(), timeout=2)
         pump.cancel()
@@ -97,7 +109,11 @@ async def test_cancelled_idle_pump_joins_queue_get_without_owning_lifecycle(
     monkeypatch.setattr(app, "_subscribers", subscribers)
     monkeypatch.setattr(app, "_loop_task", loop_owner)
     ws = Mock(send_json=AsyncMock())
-    pump = asyncio.create_task(app._run_subscriber_pump(ws, "idle", queue))
+    pump = asyncio.create_task(
+        session_transport.run_subscriber_pump(
+            ws, queue, ping_interval=session_websocket.WS_PING_INTERVAL_S
+        )
+    )
     try:
         await asyncio.wait_for(entered.wait(), timeout=2)
         pump.cancel()

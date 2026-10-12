@@ -4,117 +4,39 @@ import logging
 import re
 from typing import Any, Dict, List, Tuple
 
+from shared.connectors.builtin import (
+    EMAIL_SPEC,
+    spec_for_type,
+    tool_map,
+    tool_map_entry,
+)
+
 logger = logging.getLogger(__name__)
 
 # Cumulative email access tiers (``config.access``): each tier includes every
 # tool of the tiers below it (knowledge-base/knowledge/features/email_datasource.md). Order in
-# EMAIL_TIER_ORDER is the escalation order used for clamping/maxing.
-EMAIL_TIER_ORDER: Tuple[str, ...] = ("read", "read_write", "draft", "send")
-EMAIL_TIER_TOOLS: Dict[str, List[str]] = {
-    "read": [
-        "email_list_folders",
-        "email_list",
-        "email_search",
-        "email_read",
-    ],
-    "read_write": [
-        "email_list_folders",
-        "email_list",
-        "email_search",
-        "email_read",
-        "email_move",
-        "email_flag",
-    ],
-    "draft": [
-        "email_list_folders",
-        "email_list",
-        "email_search",
-        "email_read",
-        "email_move",
-        "email_flag",
-        "email_draft",
-    ],
-    "send": [
-        "email_list_folders",
-        "email_list",
-        "email_search",
-        "email_read",
-        "email_move",
-        "email_flag",
-        "email_draft",
-        "email_send",
-    ],
-}
+# EMAIL_TIER_ORDER is the escalation order used for clamping/maxing. Both come
+# from the email driver's access levels.
+EMAIL_TIER_ORDER: Tuple[str, ...] = EMAIL_SPEC.ranked_access_ids()
+EMAIL_TIER_TOOLS: Dict[str, List[str]] = tool_map_entry(EMAIL_SPEC)["tiers"]
 
-# Datasource type → tool category + read/write tool sets. Single source of
-# truth for BOTH trust boundaries: the orchestrator's
+# Datasource type → tool category + read/write tool sets, derived from the
+# built-in driver specs (shared.connectors.builtin). Single source of truth
+# for BOTH trust boundaries: the orchestrator's
 # _build_datasource_tool_override (job dispatch, thread create/resume) and the
 # agent's session attach path delegate to datasource_tool_categories() below.
 # These were previously two hand-maintained copies that disagreed on
 # read-write managed connectors (agent: write tools; orchestrator: CLI-only).
-DATASOURCE_TOOL_MAP: Dict[str, Dict[str, Any]] = {
-    "neo4j": {
-        "category": "graph",
-        "read": ["cypher_query", "get_database_schema"],
-        "write": ["cypher_query", "cypher_execute", "get_database_schema"],
-    },
-    "postgresql": {
-        "category": "sql",
-        "read": ["sql_query", "sql_schema"],
-        "write": ["sql_query", "sql_schema", "sql_execute"],
-    },
-    "mongodb": {
-        "category": "mongodb",
-        "read": ["mongo_query", "mongo_aggregate", "mongo_schema"],
-        "write": [
-            "mongo_query",
-            "mongo_aggregate",
-            "mongo_schema",
-            "mongo_insert",
-            "mongo_update",
-        ],
-    },
-    "webdav": {
-        "category": "webdav",
-        "read": ["webdav_list", "webdav_read", "webdav_info"],
-        "write": [
-            "webdav_list",
-            "webdav_read",
-            "webdav_info",
-            "webdav_write",
-            "webdav_delete",
-        ],
-    },
-    "repository": {
-        "category": "repo",
-        "read": ["repo_pull", "repo_pr_status"],
-        "write": [
-            "repo_checkout",
-            "repo_commit",
-            "repo_push",
-            "repo_pull",
-            "repo_open_pr",
-            "repo_pr_status",
-        ],
-    },
-    # Email is tier-keyed (config.access), not binary read/write — see
-    # EMAIL_TIER_TOOLS and knowledge-base/knowledge/features/email_datasource.md.
-    "email": {
-        "category": "email",
-        "tiers": EMAIL_TIER_TOOLS,
-    },
-    # MCP tool names are discovered only after the agent connects. The
-    # wildcard is expanded against the runtime registry before tool loading.
-    "mcp": {
-        "category": "mcp",
-        "dynamic": True,
-    },
-}
+# Email is tier-keyed (config.access), not binary read/write; MCP tool names
+# are discovered only after the agent connects, and its wildcard is expanded
+# against the runtime registry before tool loading.
+DATASOURCE_TOOL_MAP: Dict[str, Dict[str, Any]] = tool_map()
 
 
 def email_effective_access(ds: Dict[str, Any]) -> str:
     """Effective email tier: ``config.access`` (default ``draft``), clamped
-    to ``read`` by a read-only project link.
+    to ``read`` by ``project_read_only`` (a read-only project link, or the
+    creator's read-only tag the orchestrator's payload folds into it).
 
     Unknown values fail closed to ``read``. The clamp never empties
     credentials — email needs a live IMAP login at every tier
@@ -135,9 +57,11 @@ def datasource_tool_categories(
 
     - type not attached → category stripped (``[]``) so stale tools from a
       previously attached datasource never survive,
-    - ALL datasources of a type read-only → read tools,
+    - ALL datasources of a type read-only (``project_read_only``: the
+      project link or, in the orchestrator's forwarded rows and payload
+      entries, the creator's read-only tag) → read tools,
     - any read-write → write tools, backed by the real connection
-      process_datasources() now creates for read-write connectors too,
+      the managed-connection materializer opens for read-write connectors too,
     - tier-keyed types (email): highest effective tier across attached
       datasources of the type (the "any read-write → write" analog);
       per-datasource tiers come from ``config.access`` clamped by
@@ -177,6 +101,20 @@ def datasource_tool_categories(
             categories[category] = list(tool_info["read"])
         else:
             categories[category] = list(tool_info["write"])
+    # Drivers outside the tool map whose tools are discovered at runtime
+    # (managed MCP servers, D5a) attach their category's sentinel too. Their
+    # access level is enforced at the server's front, which lists only the
+    # tools the binding may call.
+    for ds_type in by_type:
+        if ds_type in DATASOURCE_TOOL_MAP:
+            continue
+        spec = spec_for_type(ds_type)
+        if (
+            spec is not None
+            and spec.tool_category
+            and any(level.tools == "*" for level in spec.access_levels)
+        ):
+            categories[spec.tool_category] = ["*"]
     return categories
 
 

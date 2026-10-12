@@ -281,10 +281,56 @@ def format_job_detail(job: dict[str, Any]) -> str:
     if job.get("audit_count") is not None:
         lines.append(f"Audit entries: {job['audit_count']}")
     lines.extend(_freeze_lines(job))
+    lines.extend(_operator_pause_hold_lines(job))
     error_message = job.get("error_message") or job.get("error")
     if error_message:
         lines.append(f"Error: {truncate_text(error_message, limit=300)}")
     return "\n".join(lines)
+
+
+def _operator_pause_hold_lines(job: dict[str, Any]) -> list[str]:
+    """Say so when an operator pause holds the job until an explicit resume."""
+    from shared.worker_execution_hold import (
+        WORKER_EXECUTION_HOLD_KEY,
+        WORKER_EXECUTION_HOLD_MESSAGE,
+    )
+
+    context = job.get("context")
+    if isinstance(context, str):
+        try:
+            context = json.loads(context)
+        except (json.JSONDecodeError, ValueError):
+            return []
+    if isinstance(context, dict) and WORKER_EXECUTION_HOLD_KEY in context:
+        return ["Worker execution hold: " + WORKER_EXECUTION_HOLD_MESSAGE]
+    hold = context.get("_operator_pause_hold") if isinstance(context, dict) else None
+    if hold is None:
+        return []
+    detail = hold if isinstance(hold, dict) else {}
+    if detail.get("source") == "workspace_recovery_unavailable":
+        workspace = context.get("workspace_container") or {}
+        receipt = (
+            workspace.get("recovery_cleanup") if isinstance(workspace, dict) else None
+        )
+        gate = (
+            "; cleanup must settle before Resume"
+            if isinstance(receipt, dict) and receipt.get("phase") != "settled"
+            else "; explicit Resume required"
+        )
+        return [
+            "Workspace recovery hold: interrupted command outcome is unknown; "
+            "workspace storage and checkpoints retained" + gate
+        ]
+    if detail.get("source") == "workspace_recovery_exhausted":
+        return [
+            "Workspace recovery hold: retries exhausted; workspace and checkpoints "
+            "retained until an explicit Resume or Cancel"
+        ]
+    return [
+        "Operator pause hold: held until an explicit resume "
+        f"(paused_by={detail.get('paused_by') or 'internal'}, "
+        f"since {detail.get('paused_at') or 'unknown'})"
+    ]
 
 
 def _format_audit_entry(entry: dict[str, Any]) -> str:
@@ -391,15 +437,24 @@ def format_audit_bulk(data: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
-# Transient-injection markers, mirrored from src/core/*_injection.py (the MCP
-# image doesn't ship src/): legacy chat_history rows stored the re-injected
-# block verbatim as human/tool inputs; newer rows store type="context"
-# descriptors. Both collapse to one [context] line per turn.
+# Injection markers, mirrored from src/shared/runtime/core/injection_markers.py
+# (this lightweight package may not import shared.runtime): legacy
+# chat_history rows stored the re-injected block verbatim as human/tool
+# inputs; newer rows store type="context" descriptors. Both collapse to one
+# [context] line per turn.
 _INJECT_KIND_BY_PREFIX = (
     ("instruction_inject_", "instruction"),
     ("memory_inject_", "memory"),
     ("knowledge_inject_", "knowledge"),
+    ("charter_inject_", "charter"),
     ("citation_feedback_inject_", "citation_feedback"),
+    ("guidance_inject_", "guidance"),
+)
+# Transient HumanMessages of the legacy tail, by content prefix.
+_INJECT_KIND_BY_HUMAN_PREFIX = (
+    ("<active_tasks>", "todos"),
+    ("<active_subagents>", "subagents"),
+    ("<managed_product_guide_turn_boundary", "turn_boundary"),
 )
 
 
@@ -410,8 +465,10 @@ def _context_label(msg: dict[str, Any]) -> str | None:
         return str(kind) if kind else "context"
     if msg.get("type") == "human":
         content = msg.get("content_preview") or msg.get("content") or ""
-        if isinstance(content, str) and content.startswith("<active_tasks>"):
-            return "todos"
+        if isinstance(content, str):
+            for prefix, k in _INJECT_KIND_BY_HUMAN_PREFIX:
+                if content.startswith(prefix):
+                    return k
         # Persistent phase instruction block (src/core/message_markers.py):
         # newer archivers store it as type="context" kind="phase_instruction";
         # this prefix catches a row stored verbatim by an older writer.
@@ -448,7 +505,7 @@ def _format_chat_entry(entry: dict[str, Any], turn_number: int) -> list[str]:
             preview = str(content)[:300]
         lines.append(f"[{role}]: {preview}")
     if context_kinds:
-        lines.append(f"[context]: {', '.join(context_kinds)} (re-injected each turn)")
+        lines.append(f"[context]: {', '.join(context_kinds)} (injected context)")
 
     # Response
     response = entry.get("response", {})
@@ -840,7 +897,12 @@ def format_shell_state(job_id: str, data: dict[str, Any]) -> str:
         name = tab.get("name", "?")
         tab_type = tab.get("type", "?")
         total = tab.get("total_lines", "?")
-        lines.append(f"  [{name}] type={tab_type} lines={total}")
+        withheld = (
+            f" ({tab['redacted_count']} secret-shaped value(s) redacted)"
+            if tab.get("redacted")
+            else ""
+        )
+        lines.append(f"  [{name}] type={tab_type} lines={total}{withheld}")
         output = tab.get("recent_output", "")
         if output:
             # Show last 20 lines, indented
@@ -1089,7 +1151,8 @@ def format_datasource_test(datasource_id: str, result: dict[str, Any]) -> str:
     """Format a connector test result."""
     status = result.get("status", "unknown")
     message = result.get("message", "")
-    icon = "OK" if status == "ok" else "FAILED"
+    # "unsupported" means the connector type has no test, not that it failed.
+    icon = {"ok": "OK", "unsupported": "NOT TESTABLE"}.get(status, "FAILED")
     lines = [
         f"Connector test: {icon}",
         f"Connector ID: {datasource_id}",
@@ -1532,6 +1595,13 @@ def format_evidence_read(job_id: str, evidence_id: str, data: dict[str, Any]) ->
         note = data.get("note")
         if note:
             window.append(f"[{note}]")
+        if data.get("redacted"):
+            # The API has always said so; the officer's text view did not, so
+            # a withheld value read exactly like one the worker never wrote.
+            window.append(
+                f"[{data.get('redacted_count')} secret-shaped value(s) redacted "
+                "from this page]"
+            )
         return "\n".join(header + window)
     # Binary / screenshot: bytes are a typed attachment and are deliberately
     # never interpolated into ordinary formatter text.
@@ -1570,6 +1640,11 @@ def format_completion_report(job_id: str, data: dict[str, Any]) -> str:
         lines.append(f"Notes:\n{report['notes']}")
     if not (report.get("summary") or deliverables):
         lines.append("(report carries no summary or deliverables)")
+    if data.get("redacted"):
+        lines.append(
+            f"[{data.get('redacted_count')} secret-shaped value(s) redacted from "
+            "this report]"
+        )
     return "\n".join(lines)
 
 
@@ -1894,6 +1969,77 @@ def format_datasources(
         if job_id:
             lines.append(f"    Job: {job_id}")
 
+    return "\n".join(lines)
+
+
+def format_connector_drivers(data: dict[str, Any]) -> str:
+    """Format the connector driver capability matrix (no credential values)."""
+    drivers = data.get("drivers") or []
+    if not drivers:
+        return "No connector drivers installed."
+
+    lines = [
+        f"Connector drivers ({len(drivers)}), driver protocol "
+        f"{data.get('protocol_version', 'unknown')}:\n"
+    ]
+    for driver in drivers:
+        trust = driver.get("trust") or {}
+        legacy = driver.get("legacy_type")
+        lines.append(
+            f"  {driver.get('name', 'unknown')}  {driver.get('title', '')}"
+            + (f" (type {legacy})" if legacy else "")
+        )
+        lines.append(
+            f"    Plane: {driver.get('plane')}  "
+            f"Delivery: {', '.join(driver.get('delivery_forms') or []) or 'none'}  "
+            f"Backends: {', '.join(driver.get('supported_backends') or []) or 'none'}"
+        )
+        author = " (every claim declared by its author)"
+        lines.append(
+            f"    Trust: {trust.get('tier', 'unknown')}"
+            f"{author if trust.get('claims_declared_by_author') else ''}  "
+            f"Holds upstream credentials: "
+            f"{bool(driver.get('holds_upstream_credentials'))}"
+        )
+        levels = driver.get("access_levels") or []
+        if not levels:
+            lines.append("    Access: none (this delivery cannot enforce a level)")
+        for level in levels:
+            kind = "advisory" if level.get("advisory") else "enforced"
+            lines.append(
+                f"    Access {level.get('id')} [{kind}]: {level.get('enforced_by')}"
+            )
+        slots = driver.get("credential_slots") or []
+        if slots:
+            lines.append(
+                "    Credential slots: "
+                + ", ".join(
+                    f"{slot.get('name')} ({slot.get('kind')}, "
+                    f"{'required' if slot.get('required') else 'optional'})"
+                    for slot in slots
+                )
+            )
+        egress = driver.get("egress") or {}
+        rules = (egress.get("declared") or {}).get("rules") or []
+        declared = ", ".join(
+            f"{rule.get('host')}:{','.join(str(p) for p in rule.get('ports') or [])}"
+            f"/{rule.get('protocol')}"
+            for rule in rules
+        )
+        enforced = egress.get("enforced") or {}
+        if not declared and enforced.get("reason") == "runs_in_srw_process":
+            # No driver pod: SRW's agent or orchestrator, or the workspace,
+            # opens the connections, so the driver itself declares none.
+            lines.append(
+                "    Egress: no driver pod; SRW's agent or orchestrator, or the "
+                "workspace, makes the connections"
+            )
+            continue
+        lines.append(
+            f"    Egress declared: {declared or 'none'}  "
+            f"enforced: {enforced.get('status', 'unknown')} "
+            f"({enforced.get('reason', '')})"
+        )
     return "\n".join(lines)
 
 

@@ -51,6 +51,7 @@ from orchestrator.services.verification_ledger import (
     validate_verdict_call,
 )
 from shared.run_queue import unpark_unit
+from shared.pinned_job_delivery import stamp_pinned_resume_input_ids
 from shared.worker_queue import enqueue_worker_batch_wake, reset_worker_batch_attempts
 
 logger = logging.getLogger(__name__)
@@ -209,9 +210,13 @@ def critic_verdict_transition(
         "curation_enabled": bool(is_curation_enabled(target_job)),
     }
     if outcome == "approved":
+        # A project-folder diff captured while the critic ran still waits for
+        # its owner: the approval cannot complete a job whose copy's changes
+        # nobody accepted yet, whatever the autonomy.
         transition["new_status"] = (
             "completed"
             if get_autonomy_level(target_job) == "full"
+            and target_job.get("diff_status") != "pending"
             else "pending_review"
         )
     elif outcome == "returned":
@@ -340,7 +345,7 @@ async def materialize_critic_verdict_transactional(
                     resume_context = (
                         dependencies.transaction.stateless_resume_context(resume_values)
                         if queue_first
-                        else resume_values
+                        else stamp_pinned_resume_input_ids(resume_values)
                     )
                     if queue_first:
                         if (

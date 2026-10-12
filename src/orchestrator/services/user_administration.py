@@ -11,10 +11,10 @@ Grant values are validated against the catalog before they are stored, so a
 malformed enum cannot later crash ``meet()``/``resolve_grants`` at dispatch
 time — a write-time refusal instead of a dispatch-time crash.
 
-Nothing here returns credential material. ``create_user`` provisions a personal
-WebDAV datasource from the cloud backend's own credentials; those are handed
-straight to the datasource store and never appear in the response, which is the
-user row.
+Nothing here returns credential material. ``create_user`` gives the new user
+their own main-cloud connectors (the session outbox, and the cloud root, which
+holds no credential until its user connects it); ``delete_user`` revokes the
+cloud root's credential once the account is gone.
 """
 
 from __future__ import annotations
@@ -26,6 +26,11 @@ from typing import Any, Optional, Protocol
 
 from fastapi import HTTPException
 
+from orchestrator.services.cloud_outbox_connectors import ensure_outbox_if_cloud
+from orchestrator.services.cloud_user_root import (
+    ensure_user_root_if_cloud,
+    retirement_revoke,
+)
 from shared.runtime.core import capability_grants
 
 from orchestrator.schemas.users import (
@@ -89,10 +94,9 @@ class UserAdministrationDependencies:
 
     store: Any
     logger: UserAdministrationLogger
-    #: Cloud router; ``for_owner(user)`` selects the owner's backend instance.
+    #: Cloud router: the active installation's user connectors (outbox,
+    #: cloud root) are ensured through it.
     main_cloud_router: Any
-    #: ``services.cloud`` newtype wrapping a cloud username.
-    user_id_type: Callable[[str], Any]
     #: Seeds the default project's knowledge base for a freshly created user.
     provision_default_project_knowledge: Callable[
         [Mapping[str, Any], Mapping[str, Any]], Awaitable[None]
@@ -324,37 +328,17 @@ async def create_user(
         )
         user["is_approved"] = True
         await dependencies.provision_default_project_knowledge(user, project)
+        # The user's own session outbox (main cloud slice 6.1).
+        await ensure_outbox_if_cloud(
+            store, dependencies.main_cloud_router, user["id"], log=dependencies.logger
+        )
 
-        # Create personal WebDAV datasource for the default project.
-        # Fresh owner provisioning — resolve via the owner seam (Issue 16).
-        backend = dependencies.main_cloud_router.for_owner(user)
-        if backend.is_initialized and body.email:
-            try:
-                # Phase 1: the Nextcloud adapter treats the email as the
-                # username (legacy behavior — OIDC-backed setups where the NC
-                # username differs from the email are broken here, inherited
-                # bug from the pre-refactor code). Phase 2 resolves via
-                # resolve_user_identity + get_user_home().handle.
-                home = await backend.get_user_home(
-                    dependencies.user_id_type(body.email)
-                )
-                webdav_url = home.webdav_url if home else None
-                if webdav_url:
-                    await store.create_datasource(
-                        name="Cloud Storage (Personal)",
-                        ds_type="webdav",
-                        connection_url=webdav_url,
-                        description="Personal cloud storage",
-                        credentials=backend.webdav_credentials,
-                        scope_mode="projects",
-                        auto_attach=False,
-                        project_ids=[str(project["id"])],
-                    )
-            except Exception as e:
-                dependencies.logger.warning(
-                    f"Failed to create personal cloud storage for user "
-                    f"{user['id']}: {e}"
-                )
+        # Their own cloud root, "My cloud", not connected until they connect
+        # it themselves (main cloud slice 4); it replaced the "Cloud Storage
+        # (Personal)" WebDAV row, which carried the service account.
+        await ensure_user_root_if_cloud(
+            store, dependencies.main_cloud_router, user["id"], log=dependencies.logger
+        )
 
         return user
     except Exception as e:
@@ -388,9 +372,15 @@ async def delete_user(
     explicit handling of orphaned jobs/threads/project_members. Add a
     separate endpoint if/when the cockpit needs it.
     """
+    # The user's cloud root goes with the account; its credential is revoked
+    # in the cloud once the delete succeeded (main cloud slice 4).
+    revoke_cloud_root = await retirement_revoke(
+        dependencies.store, dependencies.main_cloud_router, user_id
+    )
     success = await dependencies.store.delete_user(user_id)
     if not success:
         raise HTTPException(status_code=404, detail=f"User '{user_id}' not found")
+    await revoke_cloud_root()
     return {"status": "deleted"}
 
 
@@ -446,6 +436,18 @@ async def admin_patch_user(
         row = await dependencies.store.get_user(user_id)
         if row:
             await dependencies.ensure_user_provisioned(row)
+            await ensure_outbox_if_cloud(
+                dependencies.store,
+                dependencies.main_cloud_router,
+                user_id,
+                log=dependencies.logger,
+            )
+            await ensure_user_root_if_cloud(
+                dependencies.store,
+                dependencies.main_cloud_router,
+                row,
+                log=dependencies.logger,
+            )
     return {"status": "updated"}
 
 
@@ -471,6 +473,18 @@ async def admin_bulk_approve_users(
         row = await dependencies.store.get_user(uid)
         if row:
             await dependencies.ensure_user_provisioned(row)
+            await ensure_outbox_if_cloud(
+                dependencies.store,
+                dependencies.main_cloud_router,
+                uid,
+                log=dependencies.logger,
+            )
+            await ensure_user_root_if_cloud(
+                dependencies.store,
+                dependencies.main_cloud_router,
+                row,
+                log=dependencies.logger,
+            )
         # Every admin's "new user pending approval" row is settled by whoever
         # approved (D6: resolution is a property of the source).
         await dependencies.notification_service.resolve_source(

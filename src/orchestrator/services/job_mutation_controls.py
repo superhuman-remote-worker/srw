@@ -14,12 +14,70 @@ from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, Protocol
 from uuid import UUID
 
+import asyncpg
 from fastapi import HTTPException
+from typing_extensions import NotRequired, TypedDict
 
+from shared.operator_pause_hold import operator_pause_hold_present
+from orchestrator.database.postgres import JobVMAuditNotReady
 from orchestrator.services.manifest_runtime_ownership import (
     require_srw_runtime,
     uses_srw_runtime,
 )
+from orchestrator.services.vm_workspace_policy import vm_needs_release
+from orchestrator.services.completion_teardown_replay import (
+    CancelledContainerCompletionReplay,
+)
+
+TERMINAL_VM_CLEANUP_TIMEOUT_SECONDS = 900
+
+
+class JobCancelResponse(TypedDict):
+    status: str
+    cleanup_pending: NotRequired[bool]
+
+
+def _terminal_vm_needs_release(job: dict[str, Any]) -> bool:
+    context = job.get("context") or {}
+    if isinstance(context, str):
+        try:
+            context = json.loads(context)
+        except (TypeError, ValueError):
+            return False
+    if (
+        isinstance(context, dict)
+        and job.get("parent_job_id")
+        and context.get("inherits_parent_workspace") is True
+    ):
+        return False
+    return bool(
+        isinstance(context, dict)
+        and vm_needs_release(
+            context.get("vm") if isinstance(context.get("vm"), dict) else None
+        )
+    )
+
+
+def _terminal_vm_cleanup_marked(job: dict[str, Any]) -> bool:
+    context = job.get("context") or {}
+    if isinstance(context, str):
+        try:
+            context = json.loads(context)
+        except (TypeError, ValueError):
+            return False
+    return bool(
+        isinstance(context, dict)
+        and isinstance(context.get("vm"), dict)
+        and context["vm"]
+        and not (
+            job.get("parent_job_id")
+            and context.get("inherits_parent_workspace") is True
+        )
+        and (
+            context.get("_stateless_cancel_cleanup_pending") is True
+            or isinstance(context.get("_job_terminal_vm_cleanup"), dict)
+        )
+    )
 
 
 class CompletionControlPort(Protocol):
@@ -29,6 +87,8 @@ class CompletionControlPort(Protocol):
         *,
         source: str,
         expected_agent_id: str | None,
+        operator_hold: bool = False,
+        paused_by: str | None = None,
     ) -> Any: ...
 
     async def abort(self, claim: Any) -> None: ...
@@ -61,6 +121,9 @@ class JobControlDependencies:
     gitea_client: Any
     revoke_and_delete_managed_repository: Callable[..., Awaitable[bool]]
     vector_db: Any
+    replay_completion_workspace_teardown: (
+        Callable[[CancelledContainerCompletionReplay], Awaitable[bool]] | None
+    ) = None
 
 
 class JobControlOperations:
@@ -68,10 +131,170 @@ class JobControlOperations:
 
     def __init__(self, dependencies: JobControlDependencies) -> None:
         self.dependencies = dependencies
+        self._terminal_vm_cleanup_cursor: str | None = None
 
     @property
     def commands_enabled(self) -> bool:
         return self.dependencies.completion_commands_enabled()
+
+    async def reconcile_terminal_vm_cleanups(self, *, limit: int = 4) -> int:
+        """Replay terminal Job teardown from the durable row after caller loss.
+
+        The existing stateless cleanup marker and advisory lock own worker
+        quiescence. Other terminal jobs use that same per-Job session lock to
+        keep snapshot and exact admission replay single-flight across replicas.
+        """
+        d = self.dependencies
+        candidates = await d.store.list_terminal_vm_cleanup_jobs(
+            limit=limit,
+            after_id=self._terminal_vm_cleanup_cursor,
+        )
+        if not candidates and self._terminal_vm_cleanup_cursor is not None:
+            self._terminal_vm_cleanup_cursor = None
+            candidates = await d.store.list_terminal_vm_cleanup_jobs(
+                limit=limit,
+                after_id=None,
+            )
+        if not candidates:
+            return 0
+        self._terminal_vm_cleanup_cursor = str(candidates[-1]["id"])
+        # Distinct rows have distinct per-Job locks. A slow snapshot must not
+        # delay another candidate in this bounded batch.
+        return sum(
+            await asyncio.gather(
+                *(
+                    self._reconcile_terminal_vm_cleanup_bounded(candidate)
+                    for candidate in candidates
+                )
+            )
+        )
+
+    async def _reconcile_terminal_vm_cleanup_bounded(
+        self,
+        candidate: dict[str, Any],
+    ) -> int:
+        try:
+            return await asyncio.wait_for(
+                self._reconcile_terminal_vm_cleanup(candidate),
+                timeout=TERMINAL_VM_CLEANUP_TIMEOUT_SECONDS,
+            )
+        except asyncio.TimeoutError:
+            self.dependencies.logger.warning(
+                "Terminal Job VM cleanup timed out for %s; durable intent remains",
+                candidate["id"],
+            )
+            return 0
+
+    async def _reconcile_terminal_vm_cleanup(self, candidate: dict[str, Any]) -> int:
+        d = self.dependencies
+        job_id = str(candidate["id"])
+        try:
+            job = await d.store.get_job(job_id)
+            if not job or job.get("status") not in {"completed", "failed", "cancelled"}:
+                return 0
+            context = job.get("context") or {}
+            if isinstance(context, str):
+                context = json.loads(context)
+            if not isinstance(context, dict):
+                return 0
+            marker = context.get("_job_terminal_vm_cleanup")
+            if marker is not None:
+                vm = context.get("vm")
+                if (
+                    not isinstance(marker, dict)
+                    or marker.get("version") != 1
+                    or marker.get("source")
+                    != ("cancel" if job["status"] == "cancelled" else "approve")
+                    or not isinstance(vm, dict)
+                    or marker.get("provision_generation")
+                    != vm.get("provision_generation")
+                ):
+                    d.logger.warning(
+                        "Terminal Job VM cleanup marker changed for %s",
+                        job_id,
+                    )
+                    return 0
+            if (
+                job.get("status") == "cancelled"
+                and job.get("execution_lane") == "stateless"
+                and context.get("_stateless_cancel_cleanup_pending") is True
+            ):
+                if not await self.cascade_cancel_to_children(job_id):
+                    return 0
+                if await self.wait_for_stateless_cancel_settle(
+                    job_id,
+                    timeout_seconds=0,
+                ):
+                    return 1
+                return 0
+            async with d.store.stateless_cancel_cleanup_lock(job_id) as owner:
+                if not owner:
+                    return 0
+                fresh = await d.store.get_job(job_id)
+                if not fresh or fresh.get("status") not in {
+                    "completed",
+                    "failed",
+                    "cancelled",
+                }:
+                    return 0
+                fresh_context = fresh.get("context") or {}
+                if isinstance(fresh_context, str):
+                    fresh_context = json.loads(fresh_context)
+                if not isinstance(fresh_context, dict):
+                    return 0
+                if (
+                    marker is not None
+                    and fresh_context.get("_job_terminal_vm_cleanup") != marker
+                ):
+                    return 0
+                if (
+                    marker is not None
+                    and await d.store.complete_terminal_vm_cleanup_marker(
+                        job_id,
+                        expected_generation=marker["provision_generation"],
+                    )
+                ):
+                    # A completed exact parent may have survived a crash just
+                    # before marker finalization. Never restart its teardown.
+                    return 1
+                if (
+                    marker is not None
+                    and fresh["status"] == "completed"
+                    and fresh.get("execution_lane") == "pinned"
+                    and isinstance(fresh_context.get("vm"), dict)
+                    and fresh_context["vm"].get("status") == "deleted"
+                ):
+                    # A physically completed lifecycle purge needs its exact
+                    # terminal packet, not another workspace teardown. A
+                    # changed or missing packet keeps this marker held.
+                    if marker.get("admission_id") is None:
+                        return int(
+                            await d.store.complete_lifecycle_terminal_vm_cleanup_marker(
+                                job_id,
+                                expected_generation=marker["provision_generation"],
+                            )
+                        )
+                    return 0
+                if fresh["status"] == "cancelled":
+                    if not await self.cascade_cancel_to_children(job_id):
+                        return 0
+                    if fresh.get("execution_lane") == "pinned":
+                        # A terminal fence already detached the old agent.
+                        # Checkpoint pruning precedes workspace retirement.
+                        await d.store.delete_checkpoint_thread(job_id)
+                await d.archive_and_cleanup_workspace(job_id)
+                if (
+                    marker is not None
+                    and not await d.store.complete_terminal_vm_cleanup_marker(
+                        job_id,
+                        expected_generation=marker["provision_generation"],
+                    )
+                ):
+                    return 0
+                return 1
+        except Exception:
+            d.logger.exception("Terminal Job VM cleanup remains pending for %s", job_id)
+        return 0
 
     async def authorize_delete(
         self, caller: dict[str, Any], job: dict[str, Any]
@@ -119,9 +342,38 @@ class JobControlOperations:
                     status_code=409,
                     detail="Stateless job changed while deletion was being prepared",
                 )
+            if job.get("execution_lane") == "pinned":
+                prepare_pinned = getattr(
+                    store, "prepare_pinned_retained_job_for_delete", None
+                )
+                if prepare_pinned is not None:
+                    context = job.get("context") or {}
+                    if isinstance(context, str):
+                        context = json.loads(context)
+                    marker = context.get("_job_terminal_vm_cleanup")
+                    if isinstance(marker, dict) and marker.get("retention_policy") == 4:
+                        await store.complete_terminal_vm_cleanup_marker(
+                            job_id,
+                            expected_generation=marker.get("provision_generation"),
+                        )
+                    pinned_prepared = await prepare_pinned(job_id)
+                    if pinned_prepared is False:
+                        raise HTTPException(
+                            status_code=503,
+                            detail="Pinned Ready retained stop or Delete authority is incomplete",
+                        )
 
             try:
                 await d.archive_and_cleanup_workspace(job_id)
+                select_vm = getattr(
+                    store, "quiesce_cancelled_stateless_vm_parent", None
+                )
+                if (
+                    stateless
+                    and select_vm is not None
+                    and await select_vm(job_id, retention_only=True) is True
+                ):
+                    await store.delete_checkpoint_thread(job_id, strict=True)
             except Exception as exc:
                 d.logger.warning(
                     "Workspace cleanup is incomplete for job %s: %s", job_id, exc
@@ -230,6 +482,18 @@ class JobControlOperations:
                     else "Job deleted. This job had no durable backlog-ticket claim."
                 ),
             }
+        except JobVMAuditNotReady as exc:
+            raise HTTPException(
+                status_code=503,
+                detail="VM Job terminal audit authority is incomplete; retry deletion",
+            ) from exc
+        except asyncpg.CheckViolationError as exc:
+            if exc.constraint_name == "managed_repository_cleanup_required":
+                raise HTTPException(
+                    status_code=503,
+                    detail="Repository containment changed; retry deletion",
+                ) from exc
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
         except HTTPException:
             raise
         except Exception as exc:
@@ -242,6 +506,7 @@ class JobControlOperations:
         action: str,
         *,
         reason: str | None = None,
+        timeout_seconds: float = 130.0,
     ) -> tuple[bool, int | None]:
         d = self.dependencies
         target = await d.prepare_pinned_mutation_target(
@@ -256,7 +521,7 @@ class JobControlOperations:
             payload["reason"] = reason
         url = f"http://{target.agent['pod_ip']}:{target.agent['pod_port']}/job/{action}"
         try:
-            async with d.http_client_factory(timeout=130.0) as client:
+            async with d.http_client_factory(timeout=timeout_seconds) as client:
                 response = await client.post(url, json=payload)
             return response.status_code == 200, response.status_code
         except Exception as exc:
@@ -450,12 +715,54 @@ class JobControlOperations:
                         if pending is False:
                             return True
                         if pending is not None:
+                            # An admitted VM terminal parent may still be open
+                            # after its initial physical delete returned
+                            # retry_pending. Replaying strict checkpoint prune
+                            # first would be refused by that same parent; the
+                            # Job/PVC/generation/request/digest and queue-done
+                            # proof selects only the original cleanup to
+                            # finish before the ordinary prune.
+                            prior_vm_cleanup = False
+                            quiesce_parent = getattr(
+                                d.store,
+                                "quiesce_cancelled_stateless_vm_parent",
+                                None,
+                            )
+                            if quiesce_parent is not None:
+                                prior_vm_cleanup = (
+                                    await quiesce_parent(job_id)
+                                ) is True
+                            if prior_vm_cleanup:
+                                await d.archive_and_cleanup_workspace(job_id)
+                            prior_completion_cleanup = False
+                            select_completion = getattr(
+                                d.store, "cancelled_container_completion_replay", None
+                            )
+                            replay_completion = getattr(
+                                d, "replay_completion_workspace_teardown", None
+                            )
+                            if not prior_vm_cleanup and select_completion is not None:
+                                completion_replay = await select_completion(job_id)
+                                if completion_replay is not None:
+                                    if (
+                                        replay_completion is None
+                                        or await replay_completion(completion_replay)
+                                        is not True
+                                    ):
+                                        raise RuntimeError(
+                                            "original completion teardown remains pending"
+                                        )
+                                    prior_completion_cleanup = True
                             settled = await d.store.finalize_cancelled_stateless_job(
                                 job_id
                             )
                         if settled:
                             try:
-                                await d.archive_and_cleanup_workspace(job_id)
+                                if (
+                                    not prior_vm_cleanup
+                                    and not prior_completion_cleanup
+                                ):
+                                    await d.archive_and_cleanup_workspace(job_id)
                             except Exception as exc:
                                 d.logger.warning(
                                     "Workspace cleanup failed for cancelled stateless job %s: %s",
@@ -480,28 +787,66 @@ class JobControlOperations:
                 return False
             await asyncio.sleep(min(max(0.01, poll_seconds), remaining))
 
-    async def cancel(self, job_id: str, *, job: dict[str, Any]) -> dict[str, str]:
+    async def _raise_cancel_rejection(
+        self, job_id: str, refreshed: dict[str, Any] | None
+    ) -> None:
+        if not refreshed or refreshed.get("status") == "completed":
+            raise HTTPException(
+                status_code=400,
+                detail="Job cannot be cancelled (already completed or cancelled)",
+            )
+        # A CAS refusal may be a live access fence, or that access may already
+        # have closed. Neither makes this still-live Job a terminal owner.
+        active_access = await self.dependencies.store.has_active_job_workspace_access(
+            job_id
+        )
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Close active workspace access, then retry cancellation"
+                if active_access
+                else "Job cancellation blocked because workspace state changed"
+            ),
+        )
+
+    async def cancel(
+        self, job_id: str, *, job: dict[str, Any], expected_execution_deadline=None
+    ) -> JobCancelResponse:
         """Cancel already-authorized work through runtime and cleanup fences."""
         d = self.dependencies
-        if getattr(d.store, "manifests_ready", False) is True:
+        deadline_guard = (
+            {"expected_execution_deadline": expected_execution_deadline}
+            if expected_execution_deadline is not None
+            else {}
+        )
+        if deadline_guard and job.get("execution_lane") not in {"pinned", "stateless"}:
+            return {"status": "unchanged"}
+        if not deadline_guard and getattr(d.store, "manifests_ready", False) is True:
             if await d.manifest_cancel(job_id):
                 return {"status": "cancelled"}
         pinned_cancel_committed = False
         try:
             if job.get("execution_lane") == "stateless":
                 success, _ = await d.store.cancel_stateless_job(
-                    job_id, **d.completion_control.dispatch_guard_kwargs()
+                    job_id,
+                    **d.completion_control.dispatch_guard_kwargs(),
+                    **deadline_guard,
                 )
                 if not success:
+                    if deadline_guard:
+                        return {"status": "unchanged"}
                     refreshed = await d.store.get_job(job_id)
+                    # asyncpg returns JSONB as text. A rejected cancellation
+                    # must inspect the decoded marker before reporting its
+                    # authority conflict, just like the successful path.
+                    refreshed_context = refreshed.get("context") if refreshed else None
+                    if isinstance(refreshed_context, str):
+                        refreshed_context = json.loads(refreshed_context)
                     if refreshed and refreshed.get("execution_lane") == "pinned":
                         job = refreshed
                     elif (
-                        refreshed
-                        and (refreshed.get("context") or {}).get(
-                            "_stateless_delete_pending"
-                        )
-                        is True
+                        isinstance(refreshed_context, dict)
+                        and refreshed_context.get("_stateless_delete_pending") is True
                     ):
                         raise HTTPException(
                             status_code=409,
@@ -517,11 +862,16 @@ class JobControlOperations:
                             detail=d.completion_control.claim_detail(refreshed),
                         )
                     elif not refreshed or refreshed.get("status") != "cancelled":
-                        raise HTTPException(
-                            status_code=400,
-                            detail="Job cannot be cancelled (already completed or cancelled)",
-                        )
+                        await self._raise_cancel_rejection(job_id, refreshed)
+                    else:
+                        job = refreshed
                 if job.get("execution_lane") == "stateless":
+                    if _terminal_vm_needs_release(job) or _terminal_vm_cleanup_marked(
+                        job
+                    ):
+                        job["status"] = "cancelled"
+                        await self._finish_cancel(job_id, job)
+                        return {"status": "cancelled", "cleanup_pending": True}
                     if not await self.cascade_cancel_to_children(job_id):
                         raise HTTPException(
                             status_code=503,
@@ -540,8 +890,11 @@ class JobControlOperations:
                     job_id,
                     expected_status=str(job.get("status") or ""),
                     completion_commands_enabled=self.commands_enabled,
+                    **deadline_guard,
                 )
                 if not pinned_cancel_committed:
+                    if deadline_guard:
+                        return {"status": "unchanged"}
                     refreshed = await d.store.get_job(job_id)
                     if (
                         self.commands_enabled
@@ -554,11 +907,23 @@ class JobControlOperations:
                             detail=d.completion_control.claim_detail(refreshed),
                         )
                     if not refreshed or refreshed.get("status") != "cancelled":
-                        raise HTTPException(
-                            status_code=400,
-                            detail="Job cannot be cancelled (already completed or cancelled)",
-                        )
+                        await self._raise_cancel_rejection(job_id, refreshed)
                     pinned_cancel_committed = True
+                    job = refreshed
+
+            if _terminal_vm_needs_release(job) or _terminal_vm_cleanup_marked(job):
+                assigned_agent_id = job.get("assigned_agent_id")
+                if assigned_agent_id:
+                    await self._signal(
+                        job_id,
+                        str(assigned_agent_id),
+                        "cancel",
+                        reason="Cancelled via cockpit",
+                        timeout_seconds=5,
+                    )
+                job["status"] = "cancelled"
+                await self._finish_cancel(job_id, job)
+                return {"status": "cancelled", "cleanup_pending": True}
 
             assigned_agent_id = job.get("assigned_agent_id")
             if assigned_agent_id:
@@ -595,10 +960,7 @@ class JobControlOperations:
             if not success:
                 refreshed = await d.store.get_job(job_id)
                 if not refreshed or refreshed.get("status") != "cancelled":
-                    raise HTTPException(
-                        status_code=400,
-                        detail="Job cannot be cancelled (already completed or cancelled)",
-                    )
+                    await self._raise_cancel_rejection(job_id, refreshed)
             if pinned_cancel_committed:
                 try:
                     await d.store.delete_checkpoint_thread(job_id)
@@ -610,6 +972,18 @@ class JobControlOperations:
         except HTTPException:
             raise
         except Exception as exc:
+            if getattr(exc, "sqlstate", None) == "40001" and str(exc) in {
+                "Workspace mutation is still in progress",
+                "IDE mutation is still in progress",
+            }:
+                # The terminal-owner transaction rolled back while a joined
+                # physical write still owns its guard. Nothing was accepted;
+                # use the existing control-conflict retry response.
+                raise HTTPException(
+                    status_code=409,
+                    detail=str(exc),
+                    headers={"Retry-After": "1"},
+                ) from exc
             raise HTTPException(status_code=500, detail=str(exc)) from exc
 
     async def _finish_cancel(self, job_id: str, job: dict[str, Any]) -> None:
@@ -625,11 +999,39 @@ class JobControlOperations:
         d.trigger_dispatch()
         await d.resolve_job_notifications(job_id, user=None, hook="cancel")
 
-    async def pause(self, job_id: str, *, job: dict[str, Any]) -> dict[str, str]:
-        """Pause already-authorized work, retaining ambiguous control holds."""
+    async def pause(
+        self,
+        job_id: str,
+        *,
+        job: dict[str, Any],
+        paused_by: str | None = None,
+    ) -> dict[str, str]:
+        """Pause already-authorized work, retaining ambiguous control holds.
+
+        Both lanes also write the durable operator pause hold, so the parked
+        row is not redispatched or re-admitted until an explicit resume lifts
+        it. Cascaded children and system pauses never write one.
+        """
         d = self.dependencies
         require_srw_runtime(job)
         try:
+            if job["status"] == "paused" and not operator_pause_hold_present(
+                job.get("context")
+            ):
+                # A system pause (agent release, lease recovery, preemption)
+                # beat this operator pause to the row; it is still the
+                # operator's pause, so hold the job where it is instead of
+                # refusing and letting it redispatch.
+                if await d.store.hold_paused_job(job_id, paused_by=paused_by):
+                    d.logger.info(
+                        "Operator pause hold set on already-paused job %s "
+                        "(paused_by=%s)",
+                        job_id,
+                        paused_by or "internal",
+                    )
+                    await self.cascade_pause_to_children(job_id)
+                    return {"status": "paused", "job_id": job_id}
+                job = await d.store.get_job(job_id) or job
             if job["status"] != "processing":
                 raise HTTPException(
                     status_code=400,
@@ -637,7 +1039,10 @@ class JobControlOperations:
                 )
             if job.get("execution_lane") == "stateless":
                 success = await d.store.pause_stateless_job(
-                    job_id, **d.completion_control.dispatch_guard_kwargs()
+                    job_id,
+                    operator_hold=True,
+                    paused_by=paused_by,
+                    **d.completion_control.dispatch_guard_kwargs(),
                 )
                 if not success:
                     refreshed = await d.store.get_job(job_id)
@@ -663,6 +1068,8 @@ class JobControlOperations:
                         if job.get("assigned_agent_id")
                         else None
                     ),
+                    operator_hold=True,
+                    paused_by=paused_by,
                 )
                 if self.commands_enabled
                 else None
@@ -677,11 +1084,19 @@ class JobControlOperations:
                         d.logger.warning(
                             "Pause timed out for job %s; retaining control hold", job_id
                         )
-                if claim is None and not await d.store.pause_job(job_id):
+                if claim is None and not await d.store.pause_job(
+                    job_id, operator_hold=True, paused_by=paused_by
+                ):
                     raise HTTPException(
                         status_code=400,
                         detail="Job cannot be paused (status may have changed)",
                     )
+                d.logger.info(
+                    "Operator pause hold set for job %s (paused_by=%s); held until "
+                    "an explicit resume",
+                    job_id,
+                    paused_by or "internal",
+                )
             finally:
                 if claim is not None and quiescent:
                     await d.completion_control.abort(claim)

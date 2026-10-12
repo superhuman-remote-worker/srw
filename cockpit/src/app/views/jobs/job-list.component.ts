@@ -12,12 +12,15 @@ import {
 } from '@angular/core';
 import {takeUntilDestroyed} from '@angular/core/rxjs-interop';
 import {forkJoin} from 'rxjs';
+import {DatePipe} from '@angular/common';
 import {ActivatedRoute, ParamMap, Router} from '@angular/router';
 import {ApiService} from '../../core/services/api.service';
 import {DataService} from '../../core/services/data.service';
 import {UserService} from '../../core/services/user.service';
 import {environment} from '../../core/environment';
 import {JobSummary} from '../../core/models/audit.model';
+import {workspaceContractTitle as formatWorkspaceContractTitle} from '../../core/util/workspace-contract-presentation';
+import {VMCreationWaitComponent} from '../../core/components/vm-creation-wait.component';
 import {
   JobDetailPanelComponent,
   type JobDetailState,
@@ -39,6 +42,8 @@ import {
   jobStatusTone as sharedJobStatusTone,
 } from '../../core/util/job-status';
 import {JobListParams} from '../../core/models/audit.model';
+import {workspaceLifecycleReasonKey} from '../../core/util/vm-lifecycle';
+import {workspaceCreationMessageKey} from '../../core/util/workspace-creation';
 import {MultiSelectOption} from '../../ui/multi-select';
 import {JobFilterBarComponent} from './job-filter-bar.component';
 import {JobFilterPanelComponent} from './job-filter-panel.component';
@@ -58,6 +63,7 @@ import {
   removeFilterToken,
   setPageSize,
 } from './job-filters';
+import {JobCloudAction, jobCloudAction} from '../../core/util/job-cloud';
 
 /**
  * Angular's ParamMap keeps repeated keys, which is how multi-value filters
@@ -87,28 +93,11 @@ interface JobRow {
   kind: 'job' | 'detail';
 }
 
-/**
- * Which Mode B cloud affordance a row offers, if any.
- *
- * `'export'` and `'open'` are deliberately two separate actions rather than one
- * button that exports-then-opens: the export routinely runs longer than the ~5s
- * of transient user activation a browser grants a click, so opening from its
- * completion callback gets swallowed by the popup blocker. `'exported'` is the
- * degraded state — the export happened but the cloud backend can't currently
- * hand us a URL, so there's nothing to link to.
- */
-export type JobCloudAction = 'none' | 'export' | 'open' | 'exported';
-
-/** Pure decision helper for the above — exported for unit tests, and shared by
- *  the wide-layout button row and the narrow-layout overflow menu so the two
- *  can't drift. */
-export function jobCloudAction(job: JobSummary): JobCloudAction {
-  if (job.status !== 'completed' || job.cloud_review_mode !== 'open_folder') {
-    return 'none';
-  }
-  if (!job.exported_at) return 'export';
-  return job.exported_folder_url ? 'open' : 'exported';
-}
+// The outbox affordance (re-sync a job's deliverables into its owner's cloud
+// folder) lives in core/util/job-cloud, shared with the job review page;
+// re-exported here for this component's callers and specs.
+export {jobCloudAction};
+export type {JobCloudAction};
 
 /**
  * Job List component that displays jobs with filtering and actions.
@@ -117,7 +106,7 @@ export function jobCloudAction(job: JobSummary): JobCloudAction {
   selector: 'app-job-list',
   standalone: true,
   imports: [
-    SidebarToggleComponent, TranslocoPipe,
+    SidebarToggleComponent, TranslocoPipe, DatePipe,
     AppButtonComponent,
     AppBadgeComponent,
     AppInputComponent,
@@ -132,6 +121,7 @@ export function jobCloudAction(job: JobSummary): JobCloudAction {
     JobFilterPanelComponent,
     JobListFooterComponent,
     JobDetailPanelComponent,
+    VMCreationWaitComponent,
   ],
   template: `
     <div class="job-list-container">
@@ -336,6 +326,17 @@ export function jobCloudAction(job: JobSummary): JobCloudAction {
                         {{ workspaceContractSummary(row.job) }}
                       </div>
                     }
+                    @if (row.job.workspace_lifecycle; as lifecycle) {
+                      <div class="workspace-recovery" [style.padding-left.px]="row.isChild ? 16 : 0" role="status">
+                        {{ ('jobs.lifecycle.state.' + lifecycle.state) | transloco }}
+                        @if (lifecycle.idle_expires_at) {
+                          · {{ lifecycle.idle_expires_at | date:'shortTime' }}
+                        }
+                        @if (lifecycle.reason_code) {
+                          · {{ lifecycleReasonKey(lifecycle.reason_code) | transloco }}
+                        }
+                      </div>
+                    }
                     @if (row.job.workspace_recovery) {
                       <div
                         class="workspace-recovery"
@@ -344,8 +345,26 @@ export function jobCloudAction(job: JobSummary): JobCloudAction {
                       >
                         {{ row.job.workspace_recovery.message }}
                       </div>
+                    } @else if (row.job.vm_creation; as creation) {
+                      <div
+                        class="workspace-recovery vm-creation"
+                        [class.attention]="creation.state === 'attention'"
+                        [style.padding-left.px]="row.isChild ? 16 : 0"
+                      >
+                        @if (creation.wait) {
+                          <app-vm-creation-wait [creation]="creation" />
+                        } @else {
+                          {{ row.job.error_message || creation.message }}
+                        }
+                      </div>
                     }
-                    @if (row.job.status === 'failed' && row.job.error_message) {
+                    @if (row.job.workspace_creation; as creation) {
+                      <div class="workspace-recovery" [class.attention]="creation.state === 'attention'"
+                           [style.padding-left.px]="row.isChild ? 16 : 0" role="status">
+                        {{ workspaceCreationMessageKey(creation) | transloco }}
+                      </div>
+                    }
+                    @if (row.job.status === 'failed' && row.job.error_message && !row.job.vm_creation && !row.job.workspace_creation) {
                       <div class="job-error" [style.padding-left.px]="row.isChild ? 16 : 0" [title]="row.job.error_message">
                         {{ 'jobs.failureReason' | transloco }}: {{ row.job.error_message }}
                       </div>
@@ -431,7 +450,7 @@ export function jobCloudAction(job: JobSummary): JobCloudAction {
                         >
                           {{ 'jobs.action.retryRecovery' | transloco }}
                         </app-button>
-                      } @else if (!row.job.workspace_recovery && !isBlockedUndelivered(row.job) && (row.job.status === 'failed' || row.job.status === 'cancelled' || row.job.status === 'paused' || row.job.status === 'created')) {
+                      } @else if (!row.job.workspace_recovery && (!row.job.vm_creation || row.job.vm_creation.resumable) && !isBlockedUndelivered(row.job) && (row.job.status === 'failed' || row.job.status === 'cancelled' || row.job.status === 'paused' || row.job.status === 'created')) {
                         <app-button
                           variant="success"
                           size="sm"
@@ -461,7 +480,7 @@ export function jobCloudAction(job: JobSummary): JobCloudAction {
                         <app-menu-item (activated)="retryWorkspaceRecovery(row.job)">{{ 'jobs.action.retryRecovery' | transloco }}</app-menu-item>
                       } @else if (row.job.status === 'processing') {
                         <app-menu-item (activated)="pauseJob(row.job.id)">{{ 'jobs.action.pause' | transloco }}</app-menu-item>
-                      } @else if (!row.job.workspace_recovery && !isBlockedUndelivered(row.job) && (row.job.status === 'failed' || row.job.status === 'cancelled' || row.job.status === 'paused' || row.job.status === 'created')) {
+                      } @else if (!row.job.workspace_recovery && (!row.job.vm_creation || row.job.vm_creation.resumable) && !isBlockedUndelivered(row.job) && (row.job.status === 'failed' || row.job.status === 'cancelled' || row.job.status === 'paused' || row.job.status === 'created')) {
                         <app-menu-item (activated)="resumeJob(row.job.id)">{{ 'jobs.action.resume' | transloco }}</app-menu-item>
                       }
                       @if (getWorkspaceUrl(row.job)) {
@@ -488,6 +507,10 @@ export function jobCloudAction(job: JobSummary): JobCloudAction {
                         }
                         @case ('open') {
                           <app-menu-item (activated)="openExportedFolder(row.job)">{{ 'jobs.action.openCloudFolder' | transloco }}</app-menu-item>
+                          <app-menu-item (activated)="exportJobToSharedFolder(row.job.id)">{{ 'jobs.action.resyncCloudFolder' | transloco }}</app-menu-item>
+                        }
+                        @case ('exported') {
+                          <app-menu-item (activated)="exportJobToSharedFolder(row.job.id)">{{ 'jobs.action.resyncCloudFolder' | transloco }}</app-menu-item>
                         }
                       }
                       @if (row.job.status !== 'processing' && row.job.status !== 'paused' && row.job.status !== 'reviewing' && row.job.status !== 'waiting') {
@@ -1192,6 +1215,7 @@ export function jobCloudAction(job: JobSummary): JobCloudAction {
   ],
 })
 export class JobListComponent implements OnInit, OnDestroy {
+  readonly workspaceCreationMessageKey = workspaceCreationMessageKey;
   private readonly api = inject(ApiService);
   private readonly data = inject(DataService);
   private readonly userService = inject(UserService);
@@ -1673,12 +1697,7 @@ export class JobListComponent implements OnInit, OnDestroy {
   }
 
   workspaceContractTitle(job: JobSummary): string {
-    const workspace = job.workspace_contract;
-    if (!workspace) return '';
-    return this.transloco.translate('jobs.workspace.state', {
-      state: workspace.state,
-      failure: workspace.failure ?? this.transloco.translate('jobs.workspace.none'),
-    });
+    return formatWorkspaceContractTitle(job, this.transloco);
   }
 
   selectJob(jobId: string): void {
@@ -1840,10 +1859,16 @@ export class JobListComponent implements OnInit, OnDestroy {
     // Show IDE button only on root jobs (subjobs share the parent's workspace)
     if (job.parent_job_id) return false;
     // Show if: live VM, snapshot available, or has Gitea repo
-    return this.hasLiveVm(job) || job.snapshot_status === 'available' || !!job.repo_name;
+    return (job.workspace_lifecycle != null && job.workspace_lifecycle.state !== 'unsupported') ||
+      this.hasLiveVm(job) || job.snapshot_status === 'available' || !!job.repo_name;
   }
 
   openIde(jobId: string): void {
+    const job = this.jobs().find(item => item.id === jobId);
+    if (job?.workspace_lifecycle && job.workspace_lifecycle.state !== 'unsupported') {
+      this.openVmIde(jobId);
+      return;
+    }
     // Mark as loading
     const next = new Set(this.ideLoadingJobIds());
     next.add(jobId);
@@ -1891,6 +1916,69 @@ export class JobListComponent implements OnInit, OnDestroy {
       if (result.error) this.toast.warning(result.error);
     });
   }
+
+  /** A VM wake can outlast popup activation; reserve its tab in the click. */
+  private openVmIde(jobId: string): void {
+    const tab = window.open('', '_blank');
+    if (!tab) {
+      this.toast.warning(this.transloco.translate('jobs.lifecycle.popupBlocked'));
+      return;
+    }
+    tab.opener = null;
+    tab.document.title = this.transloco.translate('jobs.lifecycle.wakingTab');
+    tab.document.body.textContent = this.transloco.translate('jobs.lifecycle.wakingTab');
+    const next = new Set(this.ideLoadingJobIds());
+    next.add(jobId);
+    this.ideLoadingJobIds.set(next);
+    this.api.startIdeSession(jobId).subscribe(result => {
+      const leaseId = result?.access_lease_id;
+      if (!result || !leaseId || result.status === 'unavailable' || result.status === 'failed') {
+        tab.close();
+        this.removeIdeLoading(jobId);
+        this.toast.warning(this.transloco.translate('jobs.lifecycle.ideUnavailable'));
+        return;
+      }
+      if (result.status === 'active' && result.code_server_url) {
+        tab.location.href = result.code_server_url;
+        this.removeIdeLoading(jobId);
+        return;
+      }
+      let attempts = 0;
+      const prior = this.idePollingIntervals.get(jobId);
+      if (prior) clearInterval(prior);
+      const interval = setInterval(() => {
+        if (tab.closed || ++attempts > 100) {
+          clearInterval(interval);
+          this.idePollingIntervals.delete(jobId);
+          this.removeIdeLoading(jobId);
+          if (!tab.closed) {
+            tab.close();
+            this.toast.warning(this.transloco.translate('jobs.lifecycle.wakeTimedOut'));
+          }
+          this.api.closeVmIdeLease(jobId, leaseId).subscribe();
+          return;
+        }
+        this.api.getIdeSession(jobId, leaseId).subscribe(status => {
+          if (status?.status === 'active' && status.code_server_url) {
+            clearInterval(interval);
+            this.idePollingIntervals.delete(jobId);
+            this.removeIdeLoading(jobId);
+            tab.location.href = status.code_server_url;
+          } else if (!status || status.status === 'unavailable' || status.status === 'failed') {
+            clearInterval(interval);
+            this.idePollingIntervals.delete(jobId);
+            this.removeIdeLoading(jobId);
+            tab.close();
+            this.api.closeVmIdeLease(jobId, leaseId).subscribe();
+            this.toast.warning(this.transloco.translate('jobs.lifecycle.ideUnavailable'));
+          }
+        });
+      }, 3000);
+      this.idePollingIntervals.set(jobId, interval);
+    });
+  }
+
+  readonly lifecycleReasonKey = workspaceLifecycleReasonKey;
 
   private pollIdeSession(jobId: string): void {
     // Clear any existing poll for this job
@@ -2025,6 +2113,8 @@ export class JobListComponent implements OnInit, OnDestroy {
   }
 
   resumeJob(jobId: string): void {
+    const job = this.jobs().find(row => row.id === jobId);
+    if (job?.vm_creation && !job.vm_creation.resumable) return;
     this.api.resumeJob(jobId).subscribe((result) => {
       if (result) {
         this.refresh();

@@ -285,6 +285,18 @@ def register_system_lookup(fn: Optional[SystemLookup]) -> None:
     _system_lookup = fn
 
 
+def lookups_registered() -> bool:
+    """Whether any registry source is installed — i.e. whether
+    :func:`resolve_model` can answer at all. ``False`` before orchestrator
+    startup registers them (and in unit tests that never do): a caller judging
+    a stored preference must not read "no source" as "unavailable"."""
+    return (
+        _custom_lookup is not None
+        or _system_lookup is not None
+        or _catalog_lookup is not None
+    )
+
+
 def register_catalog_lookup(fn: Optional[CatalogLookup]) -> None:
     """Install (or clear) the DB-backed catalog lookup callable.
 
@@ -310,6 +322,11 @@ def family_of(model_id: str, default: str = "default") -> str:
     known family names. Deliberately minimal and explicit-loss: returns
     ``default`` on any miss rather than inventing new families.
     """
+    # A non-string id is a miss, not an error: the matcher below uses
+    # ``re.match``, and restore paths that swallow exceptions as non-fatal
+    # would otherwise drop a session's messages over a family lookup.
+    if not isinstance(model_id, str):
+        return default
     name = model_id.lower()
     for prefix in ("openrouter/", "groq/", "codex/"):
         if name.startswith(prefix):
@@ -320,13 +337,22 @@ def family_of(model_id: str, default: str = "default") -> str:
     if name.startswith("openai/"):
         name = name[len("openai/") :]
 
-    # Opus 5 before the generic Opus rule: it is the only Opus that takes the
-    # full effort ladder (xhigh/max), so it carries its own matrix family.
+    # Opus 5.5 before Opus 5, Opus 5 before the generic Opus rule: 5.x is the
+    # only Opus that takes the full effort ladder (xhigh/max), and 5.5 moved
+    # the default effort, so each carries its own matrix family. 5.5 takes the
+    # hyphen form (Anthropic, CLIProxyAPI) and OpenRouter's dotted form; the
+    # digit guard keeps a dated Opus 5 snapshot (claude-opus-5-2026...) on 5.
     # family_matcher.detect_family orders its rules the same way.
+    if re.match(r"claude-opus-5[.-]5(?!\d)", name):
+        return "claude-opus-5-5"
     if name.startswith("claude-opus-5"):
         return "claude-opus-5"
     if name.startswith("claude-opus"):
         return "claude-opus"
+    # Sonnet 5 and 5.5 share one family: both take the full effort ladder,
+    # which 4.x Sonnet does not.
+    if name.startswith("claude-sonnet-5"):
+        return "claude-sonnet-5"
     if name.startswith("claude-sonnet"):
         return "claude-sonnet"
     if name.startswith("claude-haiku"):
@@ -339,6 +365,10 @@ def family_of(model_id: str, default: str = "default") -> str:
         return "codex-spark"
     if "codex" in name and name.startswith(("gpt-5", "gpt-6")):
         return "codex"
+    # Sol 6.1 has dedicated prompts and medium default effort. Keep dated and
+    # batch IDs, while rejecting near-matches such as gpt-6.1-solstice.
+    if re.match(r"gpt-6\.1-sol(?:$|[-:])", name):
+        return "gpt-6.1-sol"
     # GPT-6 (Astra) — a single flagship row today, no tier suffixes. Must sit
     # below the codex checks (which now also cover a future gpt-6 codex
     # variant) so the two resolvers agree; family_matcher.detect_family orders
@@ -366,6 +396,15 @@ def family_of(model_id: str, default: str = "default") -> str:
     # Version-specific: older Muse releases must not inherit 1.3 capabilities.
     if re.search(r"(?:^|/)muse-spark-1\.3(?:$|[-:])", name):
         return "muse-spark-1.3"
+    # K3 only: K2.x rows take a `thinking` toggle and no effort field, so they
+    # stay on default. The guard rejects kimi-k30 / kimi-k3.5 but keeps
+    # moonshotai/kimi-k3, kimi-k3:batch and Claude Code's kimi-k3[1m].
+    if re.search(r"(?:^|/)kimi-k3(?![\w.])", name):
+        return "kimi-k3"
+    # Grok 4.7 only; older 4.x rows take other effort ladders and windows. The
+    # guard rejects grok-4.70 / grok-4.7.1 but keeps x-ai/grok-4.7 and dated ids.
+    if re.search(r"(?:^|/)grok-4\.7(?![\w.])", name):
+        return "grok-4.7"
     if name.startswith(
         (
             "mistral",
@@ -381,6 +420,13 @@ def family_of(model_id: str, default: str = "default") -> str:
         # (mistral-large-latest, codestral-latest); the openrouter/ prefix is
         # stripped above. All share the `mistral` matrix family.
         return "mistral"
+    # Qwen3.8-27B only (the API Max/Flash rows take another effort ladder).
+    # The dot keeps the older Qwen3 8B (qwen3-8b) on the generic rule.
+    if re.search(r"(?:^|/)qwen3\.8-27b(?![\w.])", name):
+        return "qwen3.8-27b"
+    # Max and Max Prime (and dated Max snapshots); not the open 2.4T-A95B.
+    if re.search(r"(?:^|/)qwen3\.8-max(?![\w.])", name):
+        return "qwen3.8-max"
     if "qwen" in name or "qwq" in name:
         return "qwen"
     if "llama" in name:

@@ -74,6 +74,7 @@ from __future__ import annotations
 import logging
 from typing import Any, Awaitable, Callable
 
+from orchestrator.services.cloud import protected_provider
 from orchestrator.services.diff_source import UpperdirDiffSource
 from orchestrator.services.job_cloud_baseline import (
     detect_external_mods_against_baseline,
@@ -149,15 +150,23 @@ async def apply_staged_diff(
         )
     ):
         raise StagedApplyError(409, {"code": "staged_source_invalid"})
+    expected_backend_id: str | None = None
     try:
+        # A source whose provider offers no protected level refuses like an
+        # unavailable installation (409), never as an unhandled error.
+        expected_backend_id = protected_provider(source.backend)
         backend = main_cloud_router.for_backend_instance(
             source.backend_instance_id,
-            expected_backend_id="nextcloud",
+            expected_backend_id=expected_backend_id,
         )
     except Exception:
-        authority = await postgres_db.get_main_cloud_backend_instance(
-            source.backend_instance_id,
-            expected_backend_id="nextcloud",
+        authority = (
+            await postgres_db.get_main_cloud_backend_instance(
+                source.backend_instance_id,
+                expected_backend_id=expected_backend_id,
+            )
+            if expected_backend_id is not None
+            else None
         )
         if authority is None:
             raise StagedApplyError(

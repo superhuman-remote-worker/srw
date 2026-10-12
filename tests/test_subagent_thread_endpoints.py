@@ -27,6 +27,12 @@ import pytest
 import orchestrator.main as m
 from orchestrator.routers import agent_child_threads as _child_routes
 from orchestrator.routers import job_inspection as job_inspection_routes
+from orchestrator.application import jobs as jobs_composition
+from orchestrator.application import sessions as sessions_composition
+from orchestrator.schemas import agent_child_threads as agent_child_threads_module
+from orchestrator.security import access as access_module
+from shared import subagent_parent_authority as subagent_parent_authority_module
+import fastapi as fastapi_module
 
 UTC = timezone.utc
 NOW = datetime(2026, 8, 29, 12, 0, 0, tzinfo=UTC)
@@ -50,12 +56,14 @@ def _child_thread_routes_resolve_from_main(monkeypatch):
     monkeypatch.setattr(
         _child_routes,
         "get_agent_child_thread_dependencies",
-        lambda request: m._agent_child_threads_dependencies(),
+        lambda request: sessions_composition.agent_child_threads_dependencies(
+            m.app.state.resources
+        ),
     )
 
 
 def _authority(job_id: str):
-    return m.ParentExecutionAuthority(
+    return subagent_parent_authority_module.ParentExecutionAuthority(
         execution_lane="pinned",
         parent_job_id=job_id,
         agent_id=AGENT,
@@ -135,14 +143,14 @@ def create_env(monkeypatch):
         )
     )
     gate = AsyncMock(return_value=None)
-    monkeypatch.setattr(m, "postgres_db", db)
-    monkeypatch.setattr(m, "require_internal", gate)
+    monkeypatch.setattr(m.app.state.resources, "postgres_db", db)
+    monkeypatch.setattr(access_module, "require_internal", gate)
 
     def body(**kw):
         kw.setdefault("parent_authority", _authority(job_id))
         kw.setdefault("handle", "explorer-7f3a")
         kw.setdefault("subagent_type", "explorer")
-        return m.AgentSubagentThreadCreateRequest(**kw)
+        return agent_child_threads_module.AgentSubagentThreadCreateRequest(**kw)
 
     async def call(**kw):
         return await _child_routes.agent_create_subagent_thread(
@@ -163,8 +171,10 @@ class TestCreateEndpoint:
 
     @pytest.mark.asyncio
     async def test_the_internal_key_is_checked_before_anything(self, create_env):
-        create_env.gate.side_effect = m.HTTPException(status_code=401, detail="no")
-        with pytest.raises(m.HTTPException) as excinfo:
+        create_env.gate.side_effect = fastapi_module.HTTPException(
+            status_code=401, detail="no"
+        )
+        with pytest.raises(fastapi_module.HTTPException) as excinfo:
             await create_env.call()
         assert excinfo.value.status_code == 401
         create_env.db.create_subagent_thread.assert_not_awaited()
@@ -176,24 +186,26 @@ class TestCreateEndpoint:
         header is 401 either way."""
         from orchestrator.security.access import require_internal
 
-        monkeypatch.setattr(m, "require_internal", require_internal)
+        monkeypatch.setattr(access_module, "require_internal", require_internal)
         monkeypatch.setattr(
-            m, "postgres_db", SimpleNamespace(create_subagent_thread=AsyncMock())
+            m.app.state.resources,
+            "postgres_db",
+            SimpleNamespace(create_subagent_thread=AsyncMock()),
         )
         request = MagicMock()
         request.headers = {}
-        with pytest.raises(m.HTTPException) as excinfo:
+        with pytest.raises(fastapi_module.HTTPException) as excinfo:
             await _child_routes.agent_create_subagent_thread(
                 request,
                 str(uuid.uuid4()),
-                m.AgentSubagentThreadCreateRequest(
+                agent_child_threads_module.AgentSubagentThreadCreateRequest(
                     parent_authority=_authority(str(uuid.uuid4())),
                     handle="explorer-7f3a",
                     subagent_type="explorer",
                 ),
             )
         assert excinfo.value.status_code == 401
-        m.postgres_db.create_subagent_thread.assert_not_awaited()
+        m.app.state.resources.postgres_db.create_subagent_thread.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_every_body_field_reaches_the_accessor_and_the_id_comes_back(
@@ -271,27 +283,29 @@ class TestCreateEndpoint:
     @pytest.mark.asyncio
     async def test_a_missing_job_is_404(self, create_env):
         create_env.db.create_subagent_thread.return_value = None
-        with pytest.raises(m.HTTPException) as excinfo:
+        with pytest.raises(fastapi_module.HTTPException) as excinfo:
             await create_env.call()
         assert excinfo.value.status_code == 404
 
     @pytest.mark.asyncio
     async def test_a_value_error_is_400_and_anything_else_500(self, create_env):
         create_env.db.create_subagent_thread.side_effect = ValueError("bad")
-        with pytest.raises(m.HTTPException) as excinfo:
+        with pytest.raises(fastapi_module.HTTPException) as excinfo:
             await create_env.call()
         assert excinfo.value.status_code == 400
         create_env.db.create_subagent_thread.side_effect = RuntimeError("down")
-        with pytest.raises(m.HTTPException) as excinfo:
+        with pytest.raises(fastapi_module.HTTPException) as excinfo:
             await create_env.call()
         assert excinfo.value.status_code == 500
 
     @pytest.mark.asyncio
     async def test_stale_parent_execution_is_a_typed_409(self, create_env):
         create_env.db.create_subagent_thread.side_effect = (
-            m.ParentExecutionAuthorityRefused("pinned_process_not_current")
+            subagent_parent_authority_module.ParentExecutionAuthorityRefused(
+                "pinned_process_not_current"
+            )
         )
-        with pytest.raises(m.HTTPException) as excinfo:
+        with pytest.raises(fastapi_module.HTTPException) as excinfo:
             await create_env.call()
         assert excinfo.value.status_code == 409
         assert excinfo.value.detail == {
@@ -316,10 +330,12 @@ class TestGenerationEndpoints:
             get_subagent_thread=AsyncMock(return_value=row),
         )
         gate = AsyncMock(return_value=None)
-        monkeypatch.setattr(m, "postgres_db", db)
-        monkeypatch.setattr(m, "require_internal", gate)
+        monkeypatch.setattr(m.app.state.resources, "postgres_db", db)
+        monkeypatch.setattr(access_module, "require_internal", gate)
 
-        query = m.AgentSubagentThreadQueryRequest(parent_authority=_authority(job_id))
+        query = agent_child_threads_module.AgentSubagentThreadQueryRequest(
+            parent_authority=_authority(job_id)
+        )
         live = await _child_routes.agent_list_live_subagent_threads(
             SimpleNamespace(), job_id, query
         )
@@ -354,9 +370,11 @@ class TestGenerationEndpoints:
                 }
             )
         )
-        monkeypatch.setattr(m, "postgres_db", db)
-        monkeypatch.setattr(m, "require_internal", AsyncMock(return_value=None))
-        body = m.AgentSubagentThreadReopenRequest(
+        monkeypatch.setattr(m.app.state.resources, "postgres_db", db)
+        monkeypatch.setattr(
+            access_module, "require_internal", AsyncMock(return_value=None)
+        )
+        body = agent_child_threads_module.AgentSubagentThreadReopenRequest(
             runtime_generation=GENERATION,
             parent_authority=_authority(job_id),
         )
@@ -377,7 +395,7 @@ class TestGenerationEndpoints:
             "thread_id": str(child_id),
             "runtime_generation": str(NEXT_GENERATION),
         }
-        with pytest.raises(m.HTTPException) as excinfo:
+        with pytest.raises(fastapi_module.HTTPException) as excinfo:
             await _child_routes.agent_reopen_subagent_thread(
                 SimpleNamespace(), job_id, child_id, body
             )
@@ -399,9 +417,11 @@ class TestGenerationEndpoints:
         db = SimpleNamespace(
             terminalize_subagent_thread_and_enqueue=AsyncMock(return_value=applied)
         )
-        monkeypatch.setattr(m, "postgres_db", db)
-        monkeypatch.setattr(m, "require_internal", AsyncMock(return_value=None))
-        body = m.AgentSubagentThreadTerminalRequest(
+        monkeypatch.setattr(m.app.state.resources, "postgres_db", db)
+        monkeypatch.setattr(
+            access_module, "require_internal", AsyncMock(return_value=None)
+        )
+        body = agent_child_threads_module.AgentSubagentThreadTerminalRequest(
             runtime_generation=GENERATION,
             parent_authority=_authority(job_id),
             delivery_id=DELIVERY,
@@ -445,9 +465,11 @@ class TestGenerationEndpoints:
                 return_value={"result": "stale"}
             )
         )
-        monkeypatch.setattr(m, "postgres_db", db)
-        monkeypatch.setattr(m, "require_internal", AsyncMock(return_value=None))
-        body = m.AgentSubagentThreadTerminalRequest(
+        monkeypatch.setattr(m.app.state.resources, "postgres_db", db)
+        monkeypatch.setattr(
+            access_module, "require_internal", AsyncMock(return_value=None)
+        )
+        body = agent_child_threads_module.AgentSubagentThreadTerminalRequest(
             runtime_generation=GENERATION,
             parent_authority=_authority(job_id),
             delivery_id=DELIVERY,
@@ -455,14 +477,14 @@ class TestGenerationEndpoints:
             timestamp=NOW,
             subagent_status="completed",
         )
-        with pytest.raises(m.HTTPException) as excinfo:
+        with pytest.raises(fastapi_module.HTTPException) as excinfo:
             await _child_routes.agent_terminalize_subagent_thread(
                 SimpleNamespace(), job_id, child_id, body
             )
         assert excinfo.value.status_code == 409
 
         db.terminalize_subagent_thread_and_enqueue.side_effect = ValueError("bad")
-        with pytest.raises(m.HTTPException) as excinfo:
+        with pytest.raises(fastapi_module.HTTPException) as excinfo:
             await _child_routes.agent_terminalize_subagent_thread(
                 SimpleNamespace(), job_id, child_id, body
             )
@@ -480,12 +502,16 @@ def roster_env(monkeypatch):
     job = {"id": job_id, "status": "processing", "created_at": NOW}
     db = SimpleNamespace(list_subagent_threads=AsyncMock(return_value=[]))
     guard = AsyncMock(return_value=({"id": "u"}, job))
-    monkeypatch.setattr(m, "postgres_db", db)
-    monkeypatch.setattr(m, "require_job_access", guard)
+    monkeypatch.setattr(m.app.state.resources, "postgres_db", db)
+    monkeypatch.setattr(access_module, "require_job_access", guard)
 
     async def call():
         return await job_inspection_routes.get_job_subagents(
-            SimpleNamespace(), job_id, dependencies=m._job_inspection_dependencies()
+            SimpleNamespace(),
+            job_id,
+            dependencies=jobs_composition.job_inspection_dependencies(
+                m.app.state.resources
+            ),
         )
 
     return SimpleNamespace(job_id=job_id, db=db, guard=guard, call=call)
@@ -607,7 +633,7 @@ class TestRosterShape:
     @pytest.mark.asyncio
     async def test_a_broken_walk_is_a_500_not_an_empty_roster(self, roster_env):
         roster_env.db.list_subagent_threads.side_effect = RuntimeError("lost")
-        with pytest.raises(m.HTTPException) as excinfo:
+        with pytest.raises(fastapi_module.HTTPException) as excinfo:
             await roster_env.call()
         assert excinfo.value.status_code == 500
 
@@ -622,15 +648,21 @@ class TestRosterAuthorization:
         # and which one ``orchestrator.main`` bound is an import-order fact.
         # Awaited INSIDE the patches — a returned coroutine would run after
         # they were undone.
-        gate_module = importlib.import_module(m.require_job_access.__module__)
+        gate_module = importlib.import_module(
+            access_module.require_job_access.__module__
+        )
         with (
             patch.object(
                 gate_module, "require_approved_user", AsyncMock(return_value=user)
             ),
-            patch.object(m, "postgres_db", db),
+            patch.object(m.app.state.resources, "postgres_db", db),
         ):
             return await job_inspection_routes.get_job_subagents(
-                MagicMock(), job_id, dependencies=m._job_inspection_dependencies()
+                MagicMock(),
+                job_id,
+                dependencies=jobs_composition.job_inspection_dependencies(
+                    m.app.state.resources
+                ),
             )
 
     @pytest.mark.asyncio
@@ -645,7 +677,7 @@ class TestRosterAuthorization:
         self, user_b, job_a, fake_db
     ):
         fake_db.list_subagent_threads = AsyncMock(return_value=[_row()])
-        with pytest.raises(m.HTTPException) as excinfo:
+        with pytest.raises(fastapi_module.HTTPException) as excinfo:
             await self._run(user_b, fake_db, str(job_a["id"]))
         assert excinfo.value.status_code == 403
         fake_db.list_subagent_threads.assert_not_awaited()
@@ -664,7 +696,7 @@ class TestRosterAuthorization:
     @pytest.mark.asyncio
     async def test_an_unknown_job_is_404(self, user_a, fake_db):
         fake_db.list_subagent_threads = AsyncMock(return_value=[])
-        with pytest.raises(m.HTTPException) as excinfo:
+        with pytest.raises(fastapi_module.HTTPException) as excinfo:
             await self._run(user_a, fake_db, str(uuid.uuid4()))
         assert excinfo.value.status_code == 404
         fake_db.list_subagent_threads.assert_not_awaited()

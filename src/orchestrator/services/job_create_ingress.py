@@ -23,6 +23,10 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
     # referenced by name at runtime and imported only for type checking.
     from orchestrator.schemas.job_create import JobCreate
 
+from shared.operator_pause_hold import (
+    LAST_OPERATOR_PAUSE_HOLD_CONTEXT_KEY,
+    OPERATOR_PAUSE_HOLD_CONTEXT_KEY,
+)
 from shared.workspace_contract import (
     WORKSPACE_CONTRACT_CONTEXT_KEY,
     WORKSPACE_DISPATCH_AUTHORITY_CONTEXT_KEY,
@@ -45,6 +49,7 @@ _SERVER_OWNED_REPOSITORY_CONTEXT_KEYS = {
     "git_remote_url",
     "repo_name",
     "managed_repository_credentials",
+    "workspace_ssh_identities",
     "managed_repository_authority",
     "repository_auth",
     "repository_credentials",
@@ -68,6 +73,16 @@ _SERVER_OWNED_RAW_CREATE_CONTEXT_KEYS = (
         "workspace_backend",
         "vm",
         "workspace_container",
+        # Only a public pause mints the hold and only an explicit resume lifts
+        # it; a seeded one would park a job (or an agent's child) forever.
+        OPERATOR_PAUSE_HOLD_CONTEXT_KEY,
+        LAST_OPERATOR_PAUSE_HOLD_CONTEXT_KEY,
+        # The main cloud's checkout and outbox are decided by admission from
+        # the attached connectors (services.job_cloud_checkout); a seeded
+        # checkout would copy and capture a folder no connector granted.
+        "cloud_checkout",
+        "cloud_connectors",
+        "job_outbox",
     }
 )
 
@@ -91,6 +106,11 @@ PUBLIC_JOB_CONTEXT_RESERVED_KEYS = {
     "automation_name",
     "automation_trigger",
     "cloud_baseline",
+    # Admission's main-cloud decision and the completion copy's record
+    # (services.job_cloud_checkout).
+    "cloud_checkout",
+    "cloud_connectors",
+    "job_outbox",
     "delegation_results",
     "datasource_selection",
     "delegation_timed_out",
@@ -129,6 +149,8 @@ PUBLIC_JOB_CONTEXT_RESERVED_KEYS = {
     "verification_target",
     "vm",
     "workspace_container",
+    OPERATOR_PAUSE_HOLD_CONTEXT_KEY,
+    LAST_OPERATOR_PAUSE_HOLD_CONTEXT_KEY,
 }
 
 PUBLIC_JOB_CONFIG_RESERVED_KEYS = {

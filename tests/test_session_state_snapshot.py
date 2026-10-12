@@ -30,7 +30,7 @@ class _SnapshotConn:
         *,
         thread: dict | None,
         lifecycle: dict | None = None,
-        running: dict | None = None,
+        running: dict | list[dict] | None = None,
         permissions: list[dict] | None = None,
         tasks: list[dict] | None = None,
         control_receipts: list[dict] | None = None,
@@ -40,7 +40,9 @@ class _SnapshotConn:
     ) -> None:
         self.thread = thread
         self.lifecycle = lifecycle
-        self.running = running
+        # Rows of the unmatched ``tool.started`` SELECT, newest first (its
+        # ORDER BY seq DESC). A single dict is one running call.
+        self.running = [running] if isinstance(running, dict) else running or []
         self.permissions = permissions or []
         self.tasks = tasks or []
         self.control_receipts = control_receipts or []
@@ -63,8 +65,6 @@ class _SnapshotConn:
             return self.thread
         if "AS latest_kind" in sql:
             return self.lifecycle
-        if "SELECT started.payload" in sql:
-            return self.running
         raise AssertionError(f"unexpected fetchrow query: {sql}")
 
     async def fetchval(self, sql: str, *args):
@@ -77,6 +77,9 @@ class _SnapshotConn:
 
     async def fetch(self, sql: str, *args):
         self.calls.append((sql, args))
+        if "SELECT started.payload" in sql:
+            assert "ORDER BY started.seq DESC" in sql
+            return self.running[: args[3]]
         if "FROM thread_permission_requests" in sql:
             return self.permissions
         if "FROM thread_session_tasks" in sql:
@@ -242,6 +245,13 @@ async def test_snapshot_has_full_lane_free_shape_and_normalizes_durable_rows():
             "tool": "run_command",
             "args": {"cmd": "ls"},
         },
+        "running_tools": [
+            {
+                "id": "tool-7",
+                "tool": "run_command",
+                "args": {"cmd": "ls"},
+            }
+        ],
         "pending_permissions": [
             {
                 "id": "tool-8",
@@ -660,6 +670,70 @@ async def test_stale_queue_row_never_clears_a_pinned_runtime_snapshot():
 
 
 @pytest.mark.asyncio
+async def test_every_running_call_of_a_parallel_batch_is_reported():
+    """parallel_subagents.md F17: a session delegation batch journals one
+    ``tool.started`` per call. ``running_tools`` lists every unmatched one in
+    journal order (the Cockpit's ``parseRunningTools`` prefers it);
+    ``running_tool`` keeps its old meaning, the latest unmatched call."""
+    conn = _SnapshotConn(
+        thread=_thread(execution_lane="stateless", queue_state="leased"),
+        lifecycle={
+            "latest_kind": "turn.started",
+            "latest_turn_id": "4",
+            "latest_turn_start_seq": 30,
+        },
+        # Newest first, as the SELECT returns them.
+        running=[
+            {
+                "payload": json.dumps(
+                    {"id": "d2", "tool": "delegate_agent", "args": {"brief": "b"}}
+                )
+            },
+            {"payload": {"id": "d1", "tool": "delegate_agent", "args": {"brief": "a"}}},
+        ],
+        live_turn_count=4,
+    )
+
+    result = await build_session_state_snapshot(_SnapshotDB(conn), "thread-1")
+
+    assert result is not None
+    assert result["running_tools"] == [
+        {"id": "d1", "tool": "delegate_agent", "args": {"brief": "a"}},
+        {"id": "d2", "tool": "delegate_agent", "args": {"brief": "b"}},
+    ]
+    assert result["running_tool"] == {
+        "id": "d2",
+        "tool": "delegate_agent",
+        "args": {"brief": "b"},
+    }
+    (running_call,) = [c for c in conn.calls if "SELECT started.payload" in c[0]]
+    assert running_call[1][3] == 64  # bounded by the widest possible batch
+
+
+@pytest.mark.asyncio
+async def test_an_idle_runtime_reports_no_running_calls():
+    conn = _SnapshotConn(
+        thread=_thread(execution_lane="stateless", queue_state="done"),
+        lifecycle={
+            "latest_kind": "turn.started",
+            "latest_turn_id": "4",
+            "latest_turn_start_seq": 30,
+        },
+        running=[
+            {"payload": {"id": "d2", "tool": "delegate_agent", "args": {}}},
+            {"payload": {"id": "d1", "tool": "delegate_agent", "args": {}}},
+        ],
+        live_turn_count=4,
+    )
+
+    result = await build_session_state_snapshot(_SnapshotDB(conn), "thread-1")
+
+    assert result is not None
+    assert result["running_tools"] == []
+    assert result["running_tool"] is None
+
+
+@pytest.mark.asyncio
 async def test_unknown_stateless_queue_state_never_claims_runtime_is_idle():
     conn = _SnapshotConn(
         thread=_thread(execution_lane="stateless", queue_state="future-state"),
@@ -788,9 +862,29 @@ async def test_config_resolver_receives_the_row_captured_with_the_event_cursor()
     assert "secret" not in json.dumps(result)
 
 
+def _route_dependencies(*, store, require_thread_owner, resolve_session_config):
+    """The session-state route's collaborators; everything else must stay unused."""
+    from types import SimpleNamespace
+
+    from orchestrator.routers.thread_session import ThreadSessionDependencies
+
+    async def _unused(*_args, **_kwargs):
+        raise AssertionError("the session-state read must not reach this")
+
+    return ThreadSessionDependencies(
+        store=store,
+        require_thread_owner=require_thread_owner,
+        require_approved_user=_unused,
+        resolve_cloud_session_url=_unused,
+        resolve_session_config=resolve_session_config,
+        enforce_session_create_grants=_unused,
+        tool_view=SimpleNamespace(),
+    )
+
+
 @pytest.mark.asyncio
 async def test_owner_gated_route_resolves_only_safe_display_config():
-    import orchestrator.main as orchestrator_main
+    from orchestrator.routers import thread_session
 
     thread = _thread(
         id="thread-1",
@@ -819,16 +913,20 @@ async def test_owner_gated_route_resolves_only_safe_display_config():
         return snapshot
 
     build = AsyncMock(side_effect=_build_with_captured_resolver)
+    store = MagicMock(name="store")
 
-    with (
-        patch.object(orchestrator_main, "require_thread_owner", owner),
-        patch.object(orchestrator_main, "_resolve_session_config", resolve),
-        patch.object(orchestrator_main, "build_session_state_snapshot", build),
-    ):
+    with patch.object(thread_session, "build_session_state_snapshot", build):
         response = MagicMock()
         response.headers = {}
-        result = await orchestrator_main.get_thread_session_state(
-            "thread-1", MagicMock(), response
+        result = await thread_session.get_thread_session_state(
+            "thread-1",
+            MagicMock(),
+            response,
+            dependencies=_route_dependencies(
+                store=store,
+                require_thread_owner=owner,
+                resolve_session_config=resolve,
+            ),
         )
 
     assert result is snapshot
@@ -839,7 +937,7 @@ async def test_owner_gated_route_resolves_only_safe_display_config():
         {"config_override": {"llm": {"model": "captured"}}},
     )
     build.assert_awaited_once_with(
-        orchestrator_main.postgres_db,
+        store,
         "thread-1",
         config_resolver=ANY,
     )
@@ -847,27 +945,24 @@ async def test_owner_gated_route_resolves_only_safe_display_config():
 
 @pytest.mark.asyncio
 async def test_owner_gated_route_returns_404_if_thread_vanishes_after_auth():
-    import orchestrator.main as orchestrator_main
+    from orchestrator.routers import thread_session
 
-    with (
-        patch.object(
-            orchestrator_main,
-            "require_thread_owner",
-            AsyncMock(return_value=({"id": "user-1"}, _thread())),
-        ),
-        patch.object(
-            orchestrator_main,
-            "_resolve_session_config",
-            AsyncMock(return_value=None),
-        ),
-        patch.object(
-            orchestrator_main,
-            "build_session_state_snapshot",
-            AsyncMock(return_value=None),
-        ),
+    with patch.object(
+        thread_session,
+        "build_session_state_snapshot",
+        AsyncMock(return_value=None),
     ):
         with pytest.raises(HTTPException) as exc:
-            await orchestrator_main.get_thread_session_state(
-                "thread-gone", MagicMock(), MagicMock()
+            await thread_session.get_thread_session_state(
+                "thread-gone",
+                MagicMock(),
+                MagicMock(),
+                dependencies=_route_dependencies(
+                    store=MagicMock(name="store"),
+                    require_thread_owner=AsyncMock(
+                        return_value=({"id": "user-1"}, _thread())
+                    ),
+                    resolve_session_config=AsyncMock(return_value=None),
+                ),
             )
     assert exc.value.status_code == 404

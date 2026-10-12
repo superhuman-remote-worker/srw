@@ -11,7 +11,6 @@ import pytest
 import agent.agent as agent_module
 import agent.api.persistent_app as persistent_app
 from agent.agent import UniversalAgent
-from agent.api.lease_context import LeaseHandle
 from agent.api.turn_executor import StatelessTurnExecutor
 from shared.subagent_lifecycle import (
     SubagentAbandonError,
@@ -274,10 +273,8 @@ async def test_lease_loss_abandons_before_worker_cleanup(monkeypatch):
     )
     monkeypatch.setattr(persistent_app, "_agent", agent)
 
-    executor = StatelessTurnExecutor.__new__(StatelessTurnExecutor)
-    executor._worker_retirement_lock = asyncio.Lock()
+    executor = StatelessTurnExecutor(audit_writer=None)
     executor._worker_workspace_backend = "sandbox"
-    executor._lease = LeaseHandle()
     executor._lease.update("job-1", 7)
     executor._lease.mark_lost()
 

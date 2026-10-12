@@ -305,6 +305,48 @@ class TestScenarioABF:
         ]
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("mode", ["legacy", "append_only"])
+    async def test_the_child_reads_the_injection_mode_from_its_config(
+        self, parent, mode
+    ):
+        """A child runs the session loop, so it reads
+        ``context_management.injection_mode`` from its own config: in
+        append_only mode the archive receives the unfolded request
+        (``history_messages``) for the chat delta; legacy calls are unchanged.
+        A child has no charter, memory, knowledge or subagent runtime, so it
+        appends no entries and both requests carry the same messages."""
+        parent_ctx, _ = parent
+        driver, fake, build = await make_driver(
+            parent_ctx,
+            [
+                tool_turn("read_file", {"path": "notes/hello.md"}, "c1"),
+                text_turn(SECRET),
+            ],
+        )
+        build.config.context_management.injection_mode = mode
+        try:
+            await driver.run("read it")
+            for _ in range(20):
+                if len(driver.archived) >= 2:
+                    break
+                await asyncio.sleep(0.02)
+        finally:
+            await driver.close()
+        assert len(driver.archived) == 2
+        for row in driver.archived:
+            if mode == "legacy":
+                assert "history_messages" not in row
+            else:
+                assert [m.content for m in row["history_messages"]] == [
+                    m.content for m in row["messages"]
+                ]
+        assert not any(
+            (getattr(m, "additional_kwargs", None) or {}).get(PERSIST_ROLE_KEY)
+            == "context"
+            for _sid, m, _turn in driver.ledger.messages
+        )
+
+    @pytest.mark.asyncio
     async def test_tool_calls_are_audited_under_the_parent_with_subagent_tags(
         self, parent
     ):

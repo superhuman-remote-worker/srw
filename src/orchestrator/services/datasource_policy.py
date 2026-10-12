@@ -11,13 +11,25 @@ and only then use the ordinary explicit datasource resolver to deliver secrets.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Iterable
+from typing import Any, Iterable, Literal, Mapping
 from uuid import UUID
 
+from shared.connectors.builtin import spec_for_row
+from shared.connectors.contract import read_only_ceiling
+from shared.connectors.platform import (
+    CLOUD_OUTBOX,
+    managed_kind,
+    native_cloud_project,
+    native_project,
+    native_user,
+)
 
 LITE_WORKSPACE_BACKENDS = frozenset({"virtual", "none"})
-NATIVE_PROJECT_CONFIG_KEY = "native_project_id"
 GENERIC_UNAVAILABLE_DETAIL = "One or more selected connectors are unavailable"
+SHELL_WORKSPACE_DETAIL = (
+    "Connectors that need a shell (repositories, credential and generic "
+    "environments, SSH keys) require a sandbox or VM workspace"
+)
 
 
 class DatasourceUnavailableError(PermissionError):
@@ -28,7 +40,13 @@ class DatasourceUnavailableError(PermissionError):
 
 
 class DatasourceWorkspaceTierError(ValueError):
-    """An explicit clone-based repository cannot run on a lite workspace."""
+    """An explicit connector whose driver needs a shell cannot run on a lite
+    workspace (repositories, credential and generic environments, SSH keys)."""
+
+
+class DatasourceExecutionKindError(ValueError):
+    """An explicit connector whose driver serves another kind of execution
+    (a cloud folder mounts into sessions only); the message says which."""
 
 
 def _normalized_ids(values: Iterable[str] | None) -> list[str]:
@@ -51,30 +69,61 @@ def _row_project_ids(row: dict[str, Any]) -> set[str]:
 
 
 def _native_project_id(row: dict[str, Any]) -> str | None:
-    if str(row.get("type") or "").lower() != "kb":
-        return None
-    config = row.get("config") or {}
-    if not isinstance(config, dict):
-        return None
-    raw = config.get(NATIVE_PROJECT_CONFIG_KEY)
-    if not raw:
-        return None
-    try:
-        return str(UUID(str(raw)))
-    except (TypeError, ValueError):
-        # A malformed server-owned marker is never treated as a portable
-        # ordinary connector. Migration 0082 leaves it restricted/unavailable.
-        return None
+    # The project whose own connector this is: its knowledge base, its cloud
+    # folder. A malformed server-owned marker names no project, so the row is
+    # never treated as a portable ordinary connector either: migration 0082
+    # leaves it restricted and unavailable.
+    return native_project(row)
 
 
-def _scope_matches(row: dict[str, Any], target_project_ids: set[str]) -> bool:
+def _user_kind_refuses(row: Mapping[str, Any], owner_id: str | None) -> bool:
+    """Whether a user's own connector (a ``USER_KINDS`` managed key) is
+    another's to attach.
+
+    Only its user's work may: no administrator override, project link,
+    membership or trusted inheritance reaches it, and ownerless work never
+    does.
+    """
+    user = native_user(row)
+    if user is None:
+        return False
+    return not (
+        owner_id is not None
+        and user == owner_id
+        and str(row.get("created_by") or "") == owner_id
+    )
+
+
+def _native_default(
+    row: Mapping[str, Any], owner_id: str, target_project_ids: set[str]
+) -> bool:
+    """Whether the row is the work's own: a target project's own connector
+    (its knowledge base, its cloud folder) or the owner's own (a user kind).
+    These attach whenever work takes no explicit list."""
+    project = native_project(row)
+    if project is not None:
+        return project in target_project_ids
+    return native_user(row) == owner_id
+
+
+def _scope_matches(
+    row: dict[str, Any],
+    target_project_ids: set[str],
+    member_projects: Iterable[str] = (),
+) -> bool:
     native_project_id = _native_project_id(row)
     if native_project_id is not None:
-        # Native KB management rows represent one binding per project. In a
+        # A project's own connectors represent one binding per project. In a
         # multi-project session each selected project's native binding is
         # independently valid, rather than requiring one synthetic row to be
-        # linked to every project.
-        return native_project_id in target_project_ids
+        # linked to every project. A project's cloud folder alone reaches
+        # past its project: into any work of a member of its project
+        # (``member_projects``: the owner's projects), never as a default.
+        if native_project_id in target_project_ids:
+            return True
+        return native_cloud_project(row) is not None and (
+            native_project_id in set(member_projects)
+        )
     if row.get("scope_mode") == "all":
         return True
     if row.get("scope_mode") != "projects" or not target_project_ids:
@@ -82,11 +131,79 @@ def _scope_matches(row: dict[str, Any], target_project_ids: set[str]) -> bool:
     return target_project_ids.issubset(_row_project_ids(row))
 
 
-def _is_lite_repository(row: dict[str, Any], workspace_backend: str | None) -> bool:
+def _cloud_folder_refuses(
+    row: Mapping[str, Any], owner_id: str | None, owner_roles: Mapping[str, str]
+) -> bool:
+    """Whether a project's cloud folder is out of the owner's reach: only a
+    member of its project reaches it, an administrator included (no admin
+    bypass, as the protected lane's ``protected_source_admissible`` and the
+    grant sweep, which revokes a non-member's grant). Work with no owner is
+    not asked here."""
+    project = native_cloud_project(row)
+    return project is not None and owner_id is not None and project not in owner_roles
+
+
+def access_ceiling_for(row: Mapping[str, Any], role: str | None) -> str | None:
+    """The highest level the owner may bind ``row`` at, from the owner's
+    role in the row's project, or ``None`` for no ceiling.
+
+    Only a project's cloud folder has one: a viewer of its project gets at
+    most its read-only level (``read_only_ceiling``), in its own project's
+    work and another's alike; an editor or owner gets every level. A
+    non-member, an administrator too, gets none: the folder is refused
+    outright (:func:`_cloud_folder_refuses`). Every other connector keeps
+    its policy (``None``).
+    """
+    if native_cloud_project(row) is None or role != "viewer":
+        return None
+    spec = spec_for_row(row)
+    # A strict spec always has a level that writes nothing; one that does
+    # not leaves a viewer no level at all, never a write.
+    return (read_only_ceiling(spec) if spec is not None else None) or "none"
+
+
+def execution_kind_detail(row: Mapping[str, Any], execution_kind: str) -> str:
+    """Why an explicit selection of ``row`` is refused for ``execution_kind``,
+    in the words of its driver's spec."""
+    spec = spec_for_row(row)
+    title = spec.title if spec is not None else "These"
+    served = " and ".join(f"{kind}s" for kind in (spec.executions if spec else ()))
     return (
-        str(row.get("type") or "").lower() in {"repository", "credentials"}
-        and str(workspace_backend or "").lower() in LITE_WORKSPACE_BACKENDS
+        f"{title} connectors attach to {served or 'no execution'} only; "
+        f"a {execution_kind} cannot attach one"
     )
+
+
+def execution_kind_refuses(row: Mapping[str, Any], execution_kind: str | None) -> bool:
+    """Whether the connector cannot be attached to this kind of execution.
+
+    The connector's driver names the executions it serves
+    (``spec.executions``: a cloud folder mounts into sessions only). ``None``
+    asks nothing; a type no driver serves refuses nothing.
+    """
+    if execution_kind is None:
+        return False
+    spec = spec_for_row(row)
+    return spec is not None and execution_kind not in spec.executions
+
+
+def workspace_tier_refuses(
+    row: Mapping[str, Any], workspace_backend: str | None
+) -> bool:
+    """Whether a lite workspace tier cannot serve this connector.
+
+    The connector's driver names the workspace backends it works with
+    (``spec.supported_backends``): repositories, credential and generic
+    environments, SSH keys and credential files need a shell, which the lite
+    tiers (virtual, none) do not have. Only a lite tier is ever refused here; the attach-time
+    revalidation passes no backend at all. The one rule behind create-time
+    authorization, implicit-default filtering and dispatch.
+    """
+    backend = str(workspace_backend or "").lower()
+    if backend not in LITE_WORKSPACE_BACKENDS:
+        return False
+    spec = spec_for_row(row)
+    return spec is not None and backend not in spec.supported_backends
 
 
 async def _validate_effective_owner(
@@ -123,11 +240,17 @@ async def _validate_effective_owner(
 @dataclass(frozen=True)
 class ItemVerdict:
     """One connector's availability decision, for callers that must report
-    rather than deny. ``reason`` is None exactly when ``denied`` is False."""
+    rather than deny. ``reason`` is None exactly when ``denied`` is False;
+    ``detail`` is a sentence a person can read, for a refusal that may say
+    why (``execution_kind``). ``access_ceiling`` is the highest level an
+    allowed connector may be bound at for the owner (``access_ceiling_for``:
+    a project viewer's cloud folder), ``None`` for no ceiling."""
 
     datasource_id: str
     denied: bool
     reason: str | None = None
+    detail: str | None = None
+    access_ceiling: str | None = None
 
 
 async def classify_datasource_selection(
@@ -140,6 +263,7 @@ async def classify_datasource_selection(
     allow_admin_explicit_override: bool = False,
     trusted_system_inheritance: bool = False,
     legacy_job_id: str | None = None,
+    execution_kind: str | None = None,
 ) -> tuple[list[ItemVerdict], dict[str, int]]:
     """Per-item availability verdicts plus the policy snapshot of allowed rows.
 
@@ -182,6 +306,16 @@ async def classify_datasource_selection(
             legacy_job_id=normalized_legacy_job_id,
         )
     by_id = {str(row["id"]): row for row in rows}
+    # The owner's role in the project of every project cloud folder named:
+    # a member of its project may attach it in any work, a viewer read-only.
+    cloud_projects = sorted(
+        {project for row in rows if (project := native_cloud_project(row)) is not None}
+    )
+    owner_roles: dict[str, str] = (
+        await db.get_user_project_roles(owner_id, cloud_projects)
+        if owner_id is not None and cloud_projects
+        else {}
+    )
 
     actor_is_admin = bool(actor and actor.get("is_admin"))
     admin_override = allow_admin_explicit_override and actor_is_admin
@@ -193,7 +327,7 @@ async def classify_datasource_selection(
         if row is None:
             verdicts.append(ItemVerdict(datasource_id, True, "deleted"))
             continue
-        if not _scope_matches(row, target_set):
+        if not _scope_matches(row, target_set, owner_roles):
             verdicts.append(ItemVerdict(datasource_id, True, "out_of_scope"))
             continue
 
@@ -204,7 +338,13 @@ async def classify_datasource_selection(
         native_access = bool(
             owner_is_authoritative
             and native_target is not None
-            and native_target in target_set
+            and (
+                native_target in target_set
+                or (
+                    native_cloud_project(row) is not None
+                    and native_target in owner_roles
+                )
+            )
         )
         legacy_job_binding = bool(
             normalized_legacy_job_id
@@ -219,11 +359,25 @@ async def classify_datasource_selection(
             or native_access
             or admin_override
         )
-        if not execution_authorized:
+        if (
+            not execution_authorized
+            or _user_kind_refuses(row, owner_id)
+            or _cloud_folder_refuses(row, owner_id, owner_roles)
+        ):
             verdicts.append(ItemVerdict(datasource_id, True, "revoked"))
             continue
-        if _is_lite_repository(row, workspace_backend):
+        if workspace_tier_refuses(row, workspace_backend):
             verdicts.append(ItemVerdict(datasource_id, True, "workspace_tier"))
+            continue
+        if execution_kind_refuses(row, execution_kind):
+            verdicts.append(
+                ItemVerdict(
+                    datasource_id,
+                    True,
+                    "execution_kind",
+                    execution_kind_detail(row, str(execution_kind)),
+                )
+            )
             continue
         try:
             policy_revision = int(row["policy_revision"])
@@ -233,7 +387,16 @@ async def classify_datasource_selection(
             verdicts.append(ItemVerdict(datasource_id, True, "corrupt_revision"))
             continue
         revisions[datasource_id] = policy_revision
-        verdicts.append(ItemVerdict(datasource_id, False, None))
+        verdicts.append(
+            ItemVerdict(
+                datasource_id,
+                False,
+                None,
+                access_ceiling=access_ceiling_for(
+                    row, owner_roles.get(native_target or "")
+                ),
+            )
+        )
     return verdicts, revisions
 
 
@@ -247,6 +410,7 @@ async def authorize_datasource_selection(
     allow_admin_explicit_override: bool = False,
     trusted_system_inheritance: bool = False,
     legacy_job_id: str | None = None,
+    execution_kind: str | None = None,
 ) -> tuple[list[str], dict[str, int]]:
     """Authorize a complete selection and return its exact policy snapshot.
 
@@ -255,7 +419,9 @@ async def authorize_datasource_selection(
     non-enumerating exception. ``trusted_system_inheritance`` is narrowly for
     internal reuse of an already materialized selection: it bypasses user
     execution access, but never scope or workspace-tier checks and never scans
-    for ambient defaults.
+    for ambient defaults. ``execution_kind`` (``session`` or ``job``) refuses
+    a connector its driver serves only for the other kind, with
+    :class:`DatasourceExecutionKindError`; ``None`` asks nothing.
     """
     verdicts, revisions = await classify_datasource_selection(
         db,
@@ -267,6 +433,7 @@ async def authorize_datasource_selection(
         allow_admin_explicit_override=allow_admin_explicit_override,
         trusted_system_inheritance=trusted_system_inheritance,
         legacy_job_id=legacy_job_id,
+        execution_kind=execution_kind,
     )
     # Missing rows were rejected by a len() check that ran BEFORE the per-item
     # loop, so "deleted" is position-independent and outranks everything else.
@@ -278,9 +445,9 @@ async def authorize_datasource_selection(
         if not verdict.denied:
             continue
         if verdict.reason == "workspace_tier":
-            raise DatasourceWorkspaceTierError(
-                "Repository and credential connectors require a sandbox or VM workspace"
-            )
+            raise DatasourceWorkspaceTierError(SHELL_WORKSPACE_DETAIL)
+        if verdict.reason == "execution_kind":
+            raise DatasourceExecutionKindError(verdict.detail)
         raise DatasourceUnavailableError()
     return [v.datasource_id for v in verdicts], revisions
 
@@ -316,13 +483,29 @@ async def default_datasource_selection(
     effective_work_owner_id: str | None,
     target_project_ids: list[str] | None,
     workspace_backend: str | None,
+    *,
+    execution_kind: Literal["session", "job"],
+    native_only: bool = False,
+    unattended: bool = False,
 ) -> tuple[list[str], dict[str, int]]:
     """Return default IDs and the policy revisions used to select them.
 
     Shared/public connector publisher preferences never affect another user.
-    Native project KB rows are the sole v1 project-managed exception. Clone-
-    based repositories are silently omitted on lite workspace tiers because
-    this is an implicit default rather than an explicit user requirement.
+    The work's own connectors (``_native_default``: a target project's
+    knowledge base and cloud folder, the owner's own) are the project-managed
+    exception, and a project admin's connector defaults
+    (``project_connector_defaults``, slice D3c) add the connectors linked to
+    every target project that the project chose (candidate rows flagged
+    ``project_default``), whatever their owner's own ``auto_attach``.
+    ``native_only`` keeps only the work's own connectors: what work that
+    names no connector list attaches when the deployment does not attach
+    defaults on omission. Connectors a lite workspace tier cannot serve
+    (``workspace_tier_refuses``), or this kind of execution cannot attach
+    (``execution_kind_refuses``: a cloud folder is a session's), are silently
+    omitted because this is an implicit default rather than an explicit user
+    requirement. ``unattended`` work (a loop's iteration, an automation's
+    fire, an officer's auto-pulled ticket) leaves the owner's outbox out:
+    nobody started it to receive its deliverables in a shared folder.
 
     The revision snapshot comes from the exact candidate rows used for the
     decision. Callers pass both values to the atomic creation API, which locks
@@ -337,20 +520,42 @@ async def default_datasource_selection(
     owner_id = str(UUID(str(effective_work_owner_id)))
     target_set = set(normalized_projects)
     rows = await db.list_default_datasource_candidates(owner_id, normalized_projects)
+    cloud_projects = sorted(
+        {project for row in rows if (project := native_cloud_project(row)) is not None}
+    )
+    owner_roles: dict[str, str] = (
+        await db.get_user_project_roles(owner_id, cloud_projects)
+        if cloud_projects
+        else {}
+    )
 
     selected: list[str] = []
     revisions: dict[str, int] = {}
     for row in rows:
-        if not row.get("auto_attach") or not _scope_matches(row, target_set):
+        if (
+            not _scope_matches(row, target_set)
+            or _user_kind_refuses(row, owner_id)
+            or _cloud_folder_refuses(row, owner_id, owner_roles)
+        ):
             continue
-        native_project_id = _native_project_id(row)
         owned = str(row.get("created_by") or "") == owner_id
-        native_default = (
-            native_project_id is not None and native_project_id in target_set
-        )
-        if not (owned or native_default):
+        native_default = _native_default(row, owner_id, target_set)
+        if native_only and not native_default:
             continue
-        if _is_lite_repository(row, workspace_backend):
+        project_default = (
+            bool(row.get("project_default"))
+            and bool(target_set)
+            and target_set.issubset(_row_project_ids(row))
+        )
+        if not (
+            (row.get("auto_attach") and (owned or native_default)) or project_default
+        ):
+            continue
+        if workspace_tier_refuses(row, workspace_backend):
+            continue
+        if execution_kind_refuses(row, execution_kind):
+            continue
+        if unattended and managed_kind(row) == CLOUD_OUTBOX:
             continue
         try:
             datasource_id = str(UUID(str(row["id"])))
@@ -370,6 +575,9 @@ async def default_datasource_ids(
     effective_work_owner_id: str | None,
     target_project_ids: list[str] | None,
     workspace_backend: str | None,
+    *,
+    execution_kind: Literal["session", "job"],
+    native_only: bool = False,
 ) -> list[str]:
     """Compatibility wrapper returning only creation-time default IDs."""
     selected, _revisions = await default_datasource_selection(
@@ -377,18 +585,26 @@ async def default_datasource_ids(
         effective_work_owner_id,
         target_project_ids,
         workspace_backend,
+        execution_kind=execution_kind,
+        native_only=native_only,
     )
     return selected
 
 
 __all__ = [
+    "DatasourceExecutionKindError",
     "DatasourceUnavailableError",
     "DatasourceWorkspaceTierError",
     "GENERIC_UNAVAILABLE_DETAIL",
+    "SHELL_WORKSPACE_DETAIL",
     "ItemVerdict",
+    "access_ceiling_for",
     "authorize_datasource_ids",
     "authorize_datasource_selection",
     "classify_datasource_selection",
     "default_datasource_ids",
     "default_datasource_selection",
+    "execution_kind_detail",
+    "execution_kind_refuses",
+    "workspace_tier_refuses",
 ]

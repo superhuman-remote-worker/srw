@@ -368,6 +368,7 @@ data:
   # gate. Recovery budgets remain visible even while automation is disabled so
   # an enable is one coordinated Pod rollout rather than an implicit default.
   VM_WORKSPACE_RECOVERY_ENABLED: {{ $vmRecovery.enabled | quote }}
+  VM_JOB_CANCEL_RETENTION_ENABLED: {{ (.Values.orchestrator.vmJobCancelRetention | default dict).enabled | default false | quote }}
   VM_WORKSPACE_REPLACEMENT_RECOVERY_ENABLED: {{ $vmRecovery.replacementEnabled | quote }}
   VM_WORKSPACE_RECOVERY_DEADLINE_SECONDS: {{ $vmRecovery.deadlineSeconds | quote }}
   VM_WORKSPACE_RECOVERY_MAX_GLOBAL_PROBES: {{ $vmRecovery.maxGlobalProbes | quote }}
@@ -391,6 +392,9 @@ data:
   # BP-01 owner control ships dark until the unattended-release scorecard is
   # complete. This gates new pulls even if unsupported JSON already says true.
   OFFICER_AUTO_PULL_RELEASE_ENABLED: {{ .Values.orchestrator.officerAutoPullReleaseEnabled | default false | quote }}
+  # Session subagent fan-out lanes. Consumed only by the orchestrator, which
+  # advertises the per-lane switch at every claim/attach; empty is off.
+  SESSION_SUBAGENT_FANOUT_LANES: {{ .Values.orchestrator.sessionSubagentFanoutLanes | default "" | quote }}
   WORKER_BATCH_MIN_WALL_SECONDS: {{ .Values.agent.stateless.worker.batchMinWallSeconds | default 300 | quote }}
 
   # Reject pickle fallback in LangGraph checkpoint serialization. This is
@@ -444,6 +448,7 @@ data:
   # Explicit operations and generations already admitted by the database can
   # still converge while this is false.
   WORKSPACE_CLEANUP_RECONCILIATION_ENABLED: {{ .Values.orchestrator.workspaceCleanupReconciliationEnabled | default false | quote }}
+  CONTAINER_STARTUP_STAGE_AUTHORITY_ENABLED: {{ get (.Values.orchestrator.containerStartupStageAuthority | default dict) "enabled" | default false | quote }}
   # Reclaim-on-idle (Task 7, opt-in, fail-safe): drop a session's workspace
   # PVC on idle-suspend once its S3 snapshot verifies restorable. Default off
   # keeps today's retain-on-idle behavior. See workspace_suspension.py and
@@ -478,10 +483,13 @@ data:
   # Separate default-off canary for the persistent-session capability tool.
   # Agent pods inherit it through envFrom; it does not enable the endpoint.
   PRODUCT_CAPABILITIES_TOOL_ENABLED: {{ .Values.agent.productCapabilitiesToolEnabled | default "false" | quote }}
-  # User-added MCP servers. stdio is separately gated because it runs
-  # third-party commands inside dynamically provisioned agent pods.
+  # User-added MCP servers (http or sse). A stdio server no longer runs in
+  # agent pods (connector drivers D5b): its image runs as a managed MCP server.
+  {{- /* Any value that reads as on (true, "True", "yes", 1, "on"...). */}}
+  {{- if has (lower (trim (toString (.Values.agent.mcpStdioEnabled | default "false")))) (list "true" "1" "yes" "y" "on") }}
+  {{- fail "agent.mcpStdioEnabled was removed (connector drivers D5b): stdio MCP servers no longer run in agent pods. Run a stdio server's image as a managed MCP server (connectors.drivers), or connect the server by URL" }}
+  {{- end }}
   MCP_DATASOURCES_ENABLED: {{ .Values.agent.mcpDatasourcesEnabled | default "false" | quote }}
-  MCP_STDIO_ENABLED: {{ .Values.agent.mcpStdioEnabled | default "false" | quote }}
   # Compatibility gate for omitted datasource_ids on root REST/session work.
   DATASOURCE_DEFAULTS_ON_OMISSION: {{ .Values.agent.datasourceDefaultsOnOmission | default "false" | quote }}
   # Capability-advertisement gate for datasource project scope + auto-attach.
@@ -722,11 +730,9 @@ data:
   NEXTCLOUD_PROTECTED_EFFECT_URL: {{ printf "http://%s" (include "srw.nextcloudProtectedEffectName" .) | quote }}
   NEXTCLOUD_PROTECTED_EFFECT_CONFIG_SHA256: {{ include "srw.nextcloudProtectedEffectConfigSha256" . | quote }}
   {{- end }}
-
-  # Nextcloud / WebDAV datasource (optional)
-  DEFAULT_DS_WEBDAV_URL: {{ printf "http://%s/remote.php/dav/files/admin/" (include "srw.serviceName" (dict "context" . "component" "nextcloud")) | quote }}
-  DEFAULT_DS_WEBDAV_NAME: {{ "Nextcloud" | quote }}
-  DEFAULT_DS_WEBDAV_READ_ONLY: {{ "false" | quote }}
+  {{- /* No default WebDAV datasource for the bundled Nextcloud: it was a
+       global row at Nextcloud admin's home (main cloud slice 8). Project
+       folders, user roots and outboxes are the main cloud's own connectors. */}}
   {{- end }}
 
   # Main-cloud workspace data plane. "sync" preserves the legacy eager clone
@@ -745,9 +751,6 @@ data:
   VIRTUAL_WORKSPACE_S3_ENDPOINT: {{ include "srw.effectiveVwEndpoint" . | quote }}
   VIRTUAL_WORKSPACE_S3_REGION: {{ .Values.virtualWorkspace.s3.region | default "us-east-1" | quote }}
   VIRTUAL_WORKSPACE_S3_PROVIDER: {{ include "srw.effectiveVwProvider" . | quote }}
-  {{- if .Values.cloud.nextcloudRcloneUserHomeUsername }}
-  NEXTCLOUD_RCLONE_USER_HOME_USERNAME: {{ .Values.cloud.nextcloudRcloneUserHomeUsername | quote }}
-  {{- end }}
 
   # Cloud backend — opencloud (bundled), nextcloud (bundled), external, or unset
   {{- if .Values.opencloud.enabled }}
@@ -779,11 +782,17 @@ data:
   DEFAULT_DS_WEBDAV_READ_ONLY: {{ "false" | quote }}
   {{- end }}
   {{- end }}
+  {{- with .Values.cloud.replaceInstallation }}
+  # The operator's confirmation that the installation Helm describes may
+  # replace this active main-cloud instance (main cloud: Helm only).
+  MAIN_CLOUD_REPLACE_INSTALLATION: {{ . | quote }}
+  {{- end }}
 
   # NATS — when nats.internal=true, points at the in-cluster Service;
   # otherwise the user-supplied .Values.nats.url (empty disables VM lifecycle).
   NATS_URL: {{ include "srw.natsUrl" . | quote }}
   VM_MODE: {{ include "srw.vmMode" . | quote }}
+  WORKSPACE_IDLE_RELEASE_ENABLED: {{ (.Values.orchestrator.vmIdleRelease | default dict).enabled | default false | quote }}
   {{- if eq (include "srw.vmMode" .) "external" }}
   # Per-orchestrator id used to scope vm.lifecycle.* NATS subjects. Must match
   # the paired VM controller chart's orchestratorId.
@@ -822,6 +831,13 @@ data:
   WORKSPACE_NAMESPACE: {{ .Release.Namespace | quote }}
   WORKSPACE_FUSE_ENABLED: {{ ternary "true" "false" .Values.workspace.fuse.enabled | quote }}
   WORKSPACE_FUSE_PRIVILEGED: {{ ternary "true" "false" .Values.workspace.fuse.privileged | quote }}
+  # The minimal image is SRW's own, like image.workspace, so it keeps the FUSE
+  # profile. The orchestrator reduces every entry to its repository.
+  WORKSPACE_TRUSTED_IMAGE_REPOSITORIES: {{ append (.Values.workspace.images.trustedRepositories | default (list)) (include "srw.imageRef" (dict "image" .Values.image.workspaceMinimal)) | toJson | quote }}
+  WORKSPACE_BUILTIN_TEMPLATES: {{ include "srw.builtinWorkspaceTemplatesJson" . | quote }}
+  WORKSPACE_DEFAULTS: {{ include "srw.workspaceDefaultsJson" . | quote }}
+  WORKSPACE_CUSTOM_IMAGES_PRIVILEGED: {{ ternary "true" "false" .Values.workspace.customImages.privileged | quote }}
+  WORKSPACE_IMAGE_PULL_TIMEOUT_SECONDS: {{ .Values.workspace.imagePullTimeoutSeconds | int | quote }}
 
   # PR 3 — one-time seed knob for the homelab operator. Empty in SaaS deployments.
   # When set, orchestrator init flips this user's default project from

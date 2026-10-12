@@ -36,7 +36,10 @@ from orchestrator.services.completion_lifecycle import (
     LifecycleActionPermit,
     LifecycleRouteDecision,
 )
-from orchestrator.services.workspace_lifecycle import WorkspaceOwner
+from orchestrator.services.workspace_lifecycle import (
+    SessionWorkspaceObservationYielded,
+    WorkspaceOwner,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -443,6 +446,14 @@ class WorkspaceInstanceManager:
             # stateless session workspace.  In particular, a Failed pod must
             # not take the reconciler's immediate unhealthy-delete shortcut.
             return True
+        if (
+            inst.metadata.get("job_status") == "created"
+            and inst.metadata.get("execution_lane") == "stateless"
+            and inst.metadata.get("workspace_status") == "creating"
+        ):
+            # Startup and explicit cancellation own this runtime. A failed
+            # pre-Ready Pod must not acquire a competing lifecycle delete claim.
+            return True
         if inst.metadata.get("completion_lifecycle_deferred"):
             # Live commands stand down; expired/parked commands have already
             # been nudged into the shared durable router.  Neither path may use
@@ -751,23 +762,55 @@ class WorkspaceInstanceManager:
                     listed_uid = inst.metadata.get("pod_uid")
                     listed_pod_ip = inst.metadata.get("pod_ip")
                     identity: WorkspaceTeardownIdentity | None = None
+                    # Identity capture and attestation are read-only probes.
+                    # Their failure (e.g. a ws_client handshake error) proves
+                    # no teardown I/O ran under this claim, so it settles the
+                    # claim: retaining it would fence the job's dispatch and
+                    # controls for the whole lifecycle lease over a failed
+                    # read (lifecycle_reap_failure_parks_running_stateless_job).
+                    # The next tick retries; nothing is torn down meanwhile.
+                    probe_error: Exception | None = None
                     if source == "orphan_pvc":
                         # Detached-resource GC has no live runtime from which
                         # to prepare process zero. Keep exact resource capture
                         # under the completion claim; runtime teardown itself
                         # prepares durable cleanup before resource observation.
-                        async with asyncio.timeout(LIFECYCLE_EXTERNAL_TIMEOUT_SECONDS):
-                            identity = await self._provisioner.capture_workspace_teardown_identity(
-                                owner
-                            )
+                        try:
+                            async with asyncio.timeout(
+                                LIFECYCLE_EXTERNAL_TIMEOUT_SECONDS
+                            ):
+                                identity = await self._provisioner.capture_workspace_teardown_identity(
+                                    owner
+                                )
+                        except Exception as exc:
+                            probe_error = exc
                     elif needs_snapshot_authority:
                         if not await self._permit_external(permit):
                             yield permit
                             return
-                        async with asyncio.timeout(LIFECYCLE_EXTERNAL_TIMEOUT_SECONDS):
-                            attestation = (
-                                await self._provisioner.attest_workspace_runtime(owner)
-                            )
+                        try:
+                            async with asyncio.timeout(
+                                LIFECYCLE_EXTERNAL_TIMEOUT_SECONDS
+                            ):
+                                attestation = (
+                                    await self._provisioner.attest_workspace_runtime(
+                                        owner
+                                    )
+                                )
+                        except Exception as exc:
+                            probe_error = exc
+                    if probe_error is not None:
+                        logger.warning(
+                            "Workspace identity probe failed for %s (source=%s); "
+                            "releasing the lifecycle claim without teardown",
+                            inst.id,
+                            source,
+                            exc_info=probe_error,
+                        )
+                        permit.skip("workspace_identity_probe_failed", settled=True)
+                        yield permit
+                        return
+                    if needs_snapshot_authority:
                         if (
                             listed_uid is None
                             or attestation.runtime_incarnation != str(listed_uid)
@@ -918,6 +961,8 @@ class WorkspaceInstanceManager:
                         await self._provisioner.create_pinned_thread_workspace(owner.id)
                     else:
                         await self._provisioner.create_workspace(owner)
+                except SessionWorkspaceObservationYielded:
+                    return
                 except Exception:
                     logger.exception("PVC give_up recreate failed for %s", inst.id)
             return
@@ -953,6 +998,8 @@ class WorkspaceInstanceManager:
                             await self._provisioner.create_workspace(owner)
                     if not await self._permit_external(permit):
                         return
+                except SessionWorkspaceObservationYielded:
+                    return
                 except Exception:
                     logger.exception("PVC give_up recreate failed for %s", inst.id)
                     return

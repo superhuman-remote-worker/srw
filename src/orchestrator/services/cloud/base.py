@@ -20,6 +20,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Literal, Optional, Protocol, runtime_checkable
 
+from orchestrator.services.cloud.capabilities import ProviderCapabilities
 from orchestrator.services.cloud.handles import (
     GroupId,
     ProjectFolderEntry,
@@ -54,15 +55,22 @@ class UserHome:
 
 @dataclass(frozen=True, slots=True)
 class CloudMountSubject:
-    """Identity context for a user-scoped cloud mount.
+    """Identity context for a cloud mount.
 
-    Backends use this only when the remote they are exposing belongs to a
-    specific user rather than to a service/project space.
+    Backends use it when the remote they expose is reached as a specific
+    principal rather than as the service account: a user's own account, or
+    a per-folder grant's principal (``username``) with its password
+    (``credential``, never printed).
     """
 
     user_id: Optional[str] = None
     user_sub: Optional[str] = None
     username: Optional[str] = None
+    credential: Optional[str] = field(default=None, repr=False)
+    #: End's reconstruction of a mount the old rule made in the workspace
+    #: with the service account, byte for byte, so its resident process can
+    #: be adopted and removed. Never set for a delivery.
+    legacy_service_account: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -121,6 +129,13 @@ class MainCloudBackend(Protocol):
     """
 
     backend_id: str
+    #: The provider support matrix this adapter declares (``capabilities.py``):
+    #: what code outside the adapters asks instead of naming a provider.
+    capabilities: ProviderCapabilities
+    #: The routing keys and secret-reference fields ``ensure_initialized``
+    #: proves; a change to any other field is adopted from Helm only on the
+    #: operator's confirmation (``instance_registry``).
+    attested_fields: frozenset[str]
 
     @property
     def backend_instance_id(self) -> Optional[str]:
@@ -307,7 +322,7 @@ class MainCloudBackend(Protocol):
 
     # ------------------------------------------------------------- Session folders
     async def ensure_session_folder(
-        self, *, session_id: str
+        self, *, session_id: str, exclusive: bool = False
     ) -> SessionFolderHandle: ...
 
     async def delete_session_folder(
@@ -360,6 +375,20 @@ class MainCloudBackend(Protocol):
         """Credentials the agent uses for WebDAV access, or ``{}`` if the
         backend does not speak WebDAV (e.g. Microsoft Graph).
         """
+        ...
+
+    def cloud_sync_config(
+        self, webdav_url: str, *, target_user_sub: Optional[str] = None
+    ) -> Optional[dict[str, Any]]:
+        """The agent's ``cloud_sync`` entry ``{backend, webdav_url, auth}`` for
+        one folder, or ``None`` when no credential resolves. ``target_user_sub``
+        names the owner of a user-home folder for providers that act as them.
+        """
+        ...
+
+    def legacy_folder_id(self, handle: ProjectFolderHandle) -> Optional[int]:
+        """The pre-abstraction ``projects.nextcloud_folder_id`` for ``handle``,
+        or ``None`` for a provider that never had one."""
         ...
 
 
@@ -419,6 +448,20 @@ class CanaryFixture:
 
 
 @runtime_checkable
+class SupportsProtectedLower(Protocol):
+    """Optional capability of a provider that offers the ``protected`` level:
+    the transport of a protected mount's read-only lower layer, built from an
+    active ``cloud_ro_mounts`` reader grant (never the agent-service
+    credential). Checked on the adapter class; a provider whose declaration
+    offers ``protected`` without it gets no protected mount (fail closed)."""
+
+    @staticmethod
+    def protected_lower_transport(row: dict[str, Any]) -> dict[str, Any]:
+        """``{"backend", "source", "auth"}`` of the lower rclone mount."""
+        ...
+
+
+@runtime_checkable
 class SupportsRoReader(Protocol):
     """Optional capability: provision a dedicated low-privilege read-only
     reader identity + per-mount grant for protected cloud mode (design §3.3,
@@ -453,4 +496,71 @@ class SupportsRoReader(Protocol):
         self, handle: ProjectFolderHandle, fixture: CanaryFixture
     ) -> None:
         """Remove the canary file seeded by ``seed_canary_fixture``."""
+        ...
+
+
+#: The two per-folder grant kinds: a principal that may only read one
+#: folder, and one that may read and write it (never share it).
+FolderGrantKind = Literal["reader", "writer"]
+
+
+@runtime_checkable
+class SupportsFolderGrant(Protocol):
+    """Optional capability: a principal of the provider's own, granted one
+    project folder and nothing else, per connector, member and kind (main
+    cloud slices 5 and 7, "Per-folder grants"). A project mount of such a
+    provider is made as that principal, never as the service account.
+
+    The principal and group ids are the caller's (derived from its durable
+    grant row), and so is the password, generated and stored before the
+    first call so every retry uses the same one. Checked on the adapter
+    with ``isinstance``; a provider without it keeps its service account.
+    """
+
+    backend_id: str
+
+    def folder_grant_webdav_url(
+        self, handle: ProjectFolderHandle, principal_id: str
+    ) -> Optional[str]:
+        """The internal WebDAV URL of ``handle``'s folder as ``principal_id``,
+        or ``None`` when the handle names no folder."""
+        ...
+
+    async def ensure_folder_principal(
+        self,
+        handle: ProjectFolderHandle,
+        *,
+        principal_id: str,
+        group_id: str,
+        password: str,
+        kind: FolderGrantKind,
+    ) -> None:
+        """Idempotently create the principal with ``password``, its group,
+        the group's grant on the folder at ``kind``'s permissions (set before
+        the principal joins the group, so it never sees more), and its
+        membership; then prove the principal can read the folder, resetting
+        its password to ``password`` once if the provider refused it.
+        ``CloudBackendError`` on any failure."""
+        ...
+
+    async def revoke_folder_principal(
+        self, *, principal_id: str, group_id: str
+    ) -> None:
+        """Remove the group (and with it the folder grant), then the
+        principal. Idempotent: an already-absent one is not an error."""
+        ...
+
+    def folder_principal_client(self, principal_id: str, password: str) -> Any:
+        """An ``httpx.AsyncClient`` authenticated as the principal, for the
+        caller's read-only probe. The caller closes it."""
+        ...
+
+    async def seed_canary_fixture(self, handle: ProjectFolderHandle) -> CanaryFixture:
+        """See :meth:`SupportsRoReader.seed_canary_fixture`."""
+        ...
+
+    async def remove_canary_fixture(
+        self, handle: ProjectFolderHandle, fixture: CanaryFixture
+    ) -> None:
+        """See :meth:`SupportsRoReader.remove_canary_fixture`."""
         ...

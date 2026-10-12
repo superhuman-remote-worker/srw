@@ -107,6 +107,7 @@ async def test_explicit_presence_wins_over_thread_inheritance_and_defaults(
         effective_work_owner_id=USER,
         trusted_system_inheritance=False,
         legacy_job_id=parent,
+        execution_kind="job",
     )
     deps.inherit_parent_ids.assert_not_awaited()
     deps.filter_implicit_lite_ids.assert_not_awaited()
@@ -118,7 +119,7 @@ async def test_explicit_presence_wins_over_thread_inheritance_and_defaults(
 @pytest.mark.parametrize(
     "thread,parent,requested_defaults,omission_defaults,origin,flag_reads",
     [
-        (None, None, False, False, "omitted_compat", 1),
+        (None, None, False, False, "native_default", 1),
         (None, None, False, True, "default", 1),
         (None, None, True, False, "default", 0),
         (THREAD, None, False, False, "inherited", 0),
@@ -162,19 +163,65 @@ async def test_dispatch_defaults_do_not_widen_parented_delegation(
             legacy_job_id=parent,
         )
         deps.default_selection.assert_not_awaited()
-    elif origin == "default":
+    else:
+        # Omission: the job's own connectors, and every other default when
+        # asked for or attached on omission.
         assert (result.datasource_ids, result.policy_revisions) == (
             [OTHER],
             {OTHER: 11},
         )
-        deps.default_selection.assert_awaited_once_with(USER, [PROJECT], "virtual")
+        deps.default_selection.assert_awaited_once_with(
+            USER,
+            [PROJECT],
+            "virtual",
+            execution_kind="job",
+            native_only=origin == "native_default",
+            unattended=False,
+        )
         deps.inherit_parent_ids.assert_not_awaited()
         deps.authorize_selection.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("defaults", [False, True])
+async def test_unattended_work_asks_its_defaults_without_the_outbox(deps, defaults):
+    # An officer's ticket: whatever defaults it gets leave the owner's outbox
+    # out, as the officer's auto-pull does.
+    result = await prepare(
+        deps,
+        fields={"thread_id": THREAD, "use_datasource_defaults": defaults},
+        unattended=True,
+    )
+    if defaults:
+        assert result.provenance["origin"] == "default"
+        deps.default_selection.assert_awaited_once_with(
+            USER,
+            [PROJECT],
+            "virtual",
+            execution_kind="job",
+            native_only=False,
+            unattended=True,
+        )
     else:
-        assert result.datasource_ids == [] and result.policy_revisions == {}
-        deps.inherit_parent_ids.assert_not_awaited()
-        deps.authorize_selection.assert_not_awaited()
+        # Without defaults the thread's own selection is inherited; it is
+        # what the officer chose, so nothing is narrowed here.
+        assert result.provenance["origin"] == "inherited"
         deps.default_selection.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_an_inherited_selection_drops_what_a_job_cannot_attach(deps):
+    # The session's cloud folder (OTHER) mounts into sessions only.
+    drop = AsyncMock(side_effect=lambda ids, kind: [v for v in ids if v != OTHER])
+    deps = replace(
+        deps,
+        filter_implicit_lite_ids=AsyncMock(side_effect=lambda ids, _b: ids),
+        filter_execution_kind_ids=drop,
+    )
+    result = await prepare(deps, fields={"thread_id": THREAD})
+    assert result.provenance["origin"] == "inherited"
+    assert result.datasource_ids == [CONNECTOR]
+    drop.assert_awaited_once_with([CONNECTOR, OTHER], "job")
 
 
 @pytest.mark.asyncio
@@ -414,8 +461,13 @@ async def test_concurrent_preparations_keep_their_dependencies_and_scope(deps):
     waiting = asyncio.Event()
     release = asyncio.Event()
 
-    async def suspended_default(owner, projects, backend):
+    async def suspended_default(owner, projects, backend, **kinds):
         assert (owner, projects, backend) == (USER, [PROJECT], "virtual")
+        assert kinds == {
+            "execution_kind": "job",
+            "native_only": False,
+            "unattended": False,
+        }
         waiting.set()
         await release.wait()
         return [CONNECTOR], {CONNECTOR: 23}

@@ -8,6 +8,7 @@ import pytest
 from fastapi import HTTPException
 
 from orchestrator.services.datasource_policy import (
+    DatasourceExecutionKindError,
     DatasourceUnavailableError,
     DatasourceWorkspaceTierError,
     ItemVerdict,
@@ -16,7 +17,17 @@ from orchestrator.services.datasource_policy import (
     classify_datasource_selection,
     default_datasource_ids,
     default_datasource_selection,
+    execution_kind_refuses,
+    workspace_tier_refuses,
 )
+from orchestrator.application import preparation as preparation_composition
+from orchestrator.services import (
+    job_datasource_selection as job_datasource_selection_module,
+)
+from orchestrator.services import (
+    thread_datasource_authorization as thread_datasource_authorization_module,
+)
+from orchestrator.services import thread_mount_rows as thread_mount_rows_module
 
 
 OWNER = "11111111-1111-4111-8111-111111111111"
@@ -43,6 +54,7 @@ def _row(
     config: dict | None = None,
     revision: int = 1,
     job_id: str | None = None,
+    managed_key: str | None = None,
 ) -> dict:
     return {
         "id": datasource_id,
@@ -55,10 +67,11 @@ def _row(
         "job_id": job_id,
         "project_ids": list(projects),
         "config": config or {},
+        "managed_key": managed_key,
     }
 
 
-def _db(rows: list[dict], *, member: bool = True):
+def _db(rows: list[dict], *, member: bool = True, roles: dict | None = None):
     by_id = {row["id"]: row for row in rows}
     db = AsyncMock()
     db.get_user = AsyncMock(
@@ -68,6 +81,15 @@ def _db(rows: list[dict], *, member: bool = True):
         }
     )
     db.user_is_member_of_projects = AsyncMock(return_value=member)
+    # The owner's role per project, for a project cloud folder's ceiling and
+    # its reach past its own project.
+    db.get_user_project_roles = AsyncMock(
+        side_effect=lambda _user, projects: {
+            project: role
+            for project, role in (roles or {}).items()
+            if project in projects
+        }
+    )
 
     def policy_rows(ids, *, legacy_job_id=None):
         return [
@@ -109,6 +131,49 @@ async def test_credentials_require_shell_workspace(backend):
         await authorize_datasource_ids(
             db, {"id": OWNER}, OWNER, [DS_OWNED], [], backend
         )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("backend", ["none", "virtual"])
+@pytest.mark.parametrize(
+    "ds_type", ["generic", "ssh_key", "kubeconfig", "generic_file"]
+)
+async def test_every_driver_needing_a_shell_is_refused_on_a_lite_tier(backend, ds_type):
+    """The lite-tier rule is the drivers' supported_backends, not a type list:
+    a generic environment used to pass admission and fail at setup."""
+    db = _db([_row(DS_OWNED, ds_type=ds_type)])
+    with pytest.raises(DatasourceWorkspaceTierError):
+        await authorize_datasource_ids(
+            db, {"id": OWNER}, OWNER, [DS_OWNED], [], backend
+        )
+
+
+@pytest.mark.parametrize(
+    ("ds_type", "backend", "refused"),
+    [
+        ("repository", "virtual", True),
+        ("credentials", "none", True),
+        ("generic", "virtual", True),
+        ("ssh_key", "none", True),
+        # Credential files land in the workspace home (D1d).
+        ("kubeconfig", "virtual", True),
+        ("generic_file", "none", True),
+        ("repository", "VIRTUAL", True),
+        # Types match exactly, like the driver registry.
+        ("Repository", "virtual", False),
+        ("kb", "virtual", False),
+        ("postgresql", "none", False),
+        ("email", "virtual", False),
+        ("unknown-type", "virtual", False),
+        ("repository", "sandbox", False),
+        ("repository", "vm", False),
+        ("repository", "remote", False),
+        # The attach-time revalidation passes no backend: never refused.
+        ("repository", None, False),
+    ],
+)
+def test_workspace_tier_refuses_follows_supported_backends(ds_type, backend, refused):
+    assert workspace_tier_refuses({"type": ds_type}, backend) is refused
 
 
 @pytest.mark.asyncio
@@ -196,7 +261,10 @@ async def test_public_publishers_cannot_set_another_users_defaults():
         ]
     )
 
-    assert await default_datasource_ids(db, OWNER, [], "sandbox") == []
+    assert (
+        await default_datasource_ids(db, OWNER, [], "sandbox", execution_kind="session")
+        == []
+    )
 
 
 @pytest.mark.asyncio
@@ -213,8 +281,347 @@ async def test_native_project_kb_is_project_managed_default():
     db = _db([native])
 
     assert await default_datasource_ids(
-        db, OWNER, [PROJECT_A, PROJECT_B], "sandbox"
+        db, OWNER, [PROJECT_A, PROJECT_B], "sandbox", execution_kind="session"
     ) == [DS_NATIVE]
+
+
+@pytest.mark.asyncio
+async def test_native_project_cloud_folder_is_project_managed_default():
+    # A key-only row (no config marker): the project's own cloud folder.
+    native = _row(
+        DS_NATIVE,
+        owner=OTHER,
+        scope="projects",
+        projects=(PROJECT_A,),
+        automatic=True,
+        ds_type="cloud_folder",
+        managed_key=f"project-cloud:{PROJECT_A}",
+    )
+    db = _db([native], roles={PROJECT_A: "editor"})
+
+    assert await default_datasource_ids(
+        db, OWNER, [PROJECT_A], "sandbox", execution_kind="session"
+    ) == [DS_NATIVE]
+    # Another project's work never defaults to it; a non-member of its
+    # project may not name it there.
+    assert (
+        await default_datasource_ids(
+            db, OWNER, [PROJECT_B], "sandbox", execution_kind="session"
+        )
+        == []
+    )
+    with pytest.raises(DatasourceUnavailableError):
+        await authorize_datasource_ids(
+            _db([native]), {"id": OWNER}, OWNER, [DS_NATIVE], [PROJECT_B], "sandbox"
+        )
+    # A member of its project may name it, though another user created it.
+    assert await authorize_datasource_ids(
+        db, {"id": OWNER}, OWNER, [DS_NATIVE], [PROJECT_A], "sandbox"
+    ) == [DS_NATIVE]
+
+
+@pytest.mark.asyncio
+async def test_a_project_cloud_folder_is_its_members_alone_an_admin_included():
+    """No admin bypass: an administrator who is no member of the folder's
+    project neither defaults to it nor may name it, in that project's own
+    work too, with or without the admin override (as the grant sweep, which
+    revokes a non-member's grant, and the protected lane decide)."""
+    native = _row(
+        DS_NATIVE,
+        owner=OTHER,
+        scope="projects",
+        projects=(PROJECT_A,),
+        automatic=True,
+        ds_type="cloud_folder",
+        managed_key=f"project-cloud:{PROJECT_A}",
+    )
+    kb = _row(
+        DS_SHARED,
+        owner=None,
+        scope="projects",
+        projects=(PROJECT_A,),
+        automatic=True,
+        ds_type="kb",
+        managed_key=f"project-kb:{PROJECT_A}",
+    )
+    db = _db([native, kb], member=False)
+    db.get_user = AsyncMock(
+        side_effect=lambda user_id: {
+            "id": user_id,
+            "is_approved": True,
+            "is_admin": True,
+        }
+    )
+    admin = {"id": OWNER, "is_admin": True}
+    assert await default_datasource_ids(
+        db, OWNER, [PROJECT_A], "sandbox", execution_kind="session"
+    ) == [DS_SHARED]
+    for override in (False, True):
+        with pytest.raises(DatasourceUnavailableError):
+            await authorize_datasource_ids(
+                db,
+                admin,
+                OWNER,
+                [DS_NATIVE],
+                [PROJECT_A],
+                "sandbox",
+                allow_admin_explicit_override=override,
+            )
+    verdicts, _ = await classify_datasource_selection(
+        db, admin, OWNER, [DS_NATIVE, DS_SHARED], [PROJECT_A], "sandbox"
+    )
+    assert [(v.datasource_id, v.denied) for v in verdicts] == [
+        (DS_NATIVE, True),
+        (DS_SHARED, False),
+    ]
+    # As a member, even a viewer, it is theirs (read-only for a viewer).
+    member = _db([native], member=False, roles={PROJECT_A: "viewer"})
+    member.get_user = db.get_user
+    verdicts, _ = await classify_datasource_selection(
+        member, admin, OWNER, [DS_NATIVE], [PROJECT_A], "sandbox"
+    )
+    assert [(v.denied, v.access_ceiling) for v in verdicts] == [(False, "read_only")]
+
+
+def _user_root(owner: str = OWNER, **over) -> dict:
+    return _row(
+        DS_NATIVE,
+        owner=owner,
+        automatic=True,
+        ds_type="cloud_folder",
+        managed_key=f"user-cloud-root:{owner}",
+        **over,
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_users_own_connector_is_its_users_alone():
+    db = _db([_user_root(public=True, scope="projects", projects=(PROJECT_A,))])
+
+    assert await authorize_datasource_ids(
+        db, {"id": OWNER}, OWNER, [DS_NATIVE], [PROJECT_A], "sandbox"
+    ) == [DS_NATIVE]
+    # Not for an administrator's own work, not through a project link or
+    # trusted inheritance, and not for ownerless work.
+    for kwargs in (
+        {"allow_admin_explicit_override": True},
+        {"trusted_system_inheritance": True},
+    ):
+        verdicts, _ = await classify_datasource_selection(
+            db,
+            {"id": OTHER, "is_admin": True},
+            OTHER,
+            [DS_NATIVE],
+            [PROJECT_A],
+            "sandbox",
+            **kwargs,
+        )
+        assert verdicts == [ItemVerdict(DS_NATIVE, True, "revoked")]
+    verdicts, _ = await classify_datasource_selection(
+        db,
+        None,
+        None,
+        [DS_NATIVE],
+        [PROJECT_A],
+        "sandbox",
+        trusted_system_inheritance=True,
+    )
+    assert verdicts == [ItemVerdict(DS_NATIVE, True, "revoked")]
+
+
+@pytest.mark.asyncio
+async def test_a_users_own_connector_defaults_only_for_its_user():
+    # Even a project's chosen default (were it linked) never reaches another
+    # user's work, and a key naming one user on another's row reaches nobody.
+    root = _user_root(scope="projects", projects=(PROJECT_A,))
+    root["project_default"] = True
+    db = _db([root])
+    assert await default_datasource_ids(
+        db, OWNER, [PROJECT_A], "sandbox", execution_kind="session"
+    ) == [DS_NATIVE]
+    assert (
+        await default_datasource_ids(
+            db, OTHER, [PROJECT_A], "sandbox", execution_kind="session"
+        )
+        == []
+    )
+    mismatched = _user_root()
+    mismatched["created_by"] = OTHER
+    assert (
+        await default_datasource_ids(
+            _db([mismatched]), OTHER, [], "sandbox", execution_kind="session"
+        )
+        == []
+    )
+
+
+@pytest.mark.asyncio
+async def test_native_only_keeps_the_works_own_and_jobs_never_get_a_folder():
+    kb = _row(
+        DS_NATIVE,
+        owner=None,
+        scope="projects",
+        projects=(PROJECT_A,),
+        automatic=True,
+        ds_type="kb",
+        managed_key=f"project-kb:{PROJECT_A}",
+    )
+    folder = _row(
+        DS_SHARED,
+        owner=OTHER,
+        scope="projects",
+        projects=(PROJECT_A,),
+        automatic=True,
+        ds_type="cloud_folder",
+        managed_key=f"project-cloud:{PROJECT_A}",
+    )
+    other_folder = _row(
+        DS_REPOSITORY,
+        owner=OTHER,
+        scope="projects",
+        projects=(PROJECT_B,),
+        automatic=True,
+        ds_type="cloud_folder",
+        managed_key=f"project-cloud:{PROJECT_B}",
+    )
+    owned = _row(DS_OWNED, automatic=True)
+    db = _db([kb, folder, other_folder, owned], roles={PROJECT_A: "editor"})
+
+    async def defaults(kind, *, native_only):
+        return set(
+            await default_datasource_ids(
+                db,
+                OWNER,
+                [PROJECT_A],
+                "sandbox",
+                execution_kind=kind,
+                native_only=native_only,
+            )
+        )
+
+    assert await defaults("session", native_only=True) == {DS_NATIVE, DS_SHARED}
+    assert await defaults("session", native_only=False) == {
+        DS_NATIVE,
+        DS_SHARED,
+        DS_OWNED,
+    }
+    assert await defaults("job", native_only=True) == {DS_NATIVE}
+    assert await defaults("job", native_only=False) == {DS_NATIVE, DS_OWNED}
+
+
+@pytest.mark.asyncio
+async def test_an_explicit_job_naming_a_cloud_folder_is_told_why():
+    folder = _row(
+        DS_NATIVE,
+        owner=OTHER,
+        scope="projects",
+        projects=(PROJECT_A,),
+        automatic=True,
+        ds_type="cloud_folder",
+        managed_key=f"project-cloud:{PROJECT_A}",
+    )
+    db = _db([folder, _row(DS_OWNED)], roles={PROJECT_A: "editor"})
+
+    for kind in (None, "session"):
+        selected, _ = await authorize_datasource_selection(
+            db,
+            {"id": OWNER},
+            OWNER,
+            [DS_OWNED, DS_NATIVE],
+            [PROJECT_A],
+            "sandbox",
+            execution_kind=kind,
+        )
+        assert selected == [DS_OWNED, DS_NATIVE]
+    with pytest.raises(DatasourceExecutionKindError) as refused:
+        await authorize_datasource_selection(
+            db,
+            {"id": OWNER},
+            OWNER,
+            [DS_OWNED, DS_NATIVE],
+            [PROJECT_A],
+            "sandbox",
+            execution_kind="job",
+        )
+    assert str(refused.value) == (
+        "Cloud folder connectors attach to sessions only; a job cannot attach one"
+    )
+    verdicts, _ = await classify_datasource_selection(
+        db,
+        {"id": OWNER},
+        OWNER,
+        [DS_NATIVE],
+        [PROJECT_A],
+        "sandbox",
+        execution_kind="job",
+    )
+    assert [(v.denied, v.reason) for v in verdicts] == [(True, "execution_kind")]
+    # Authority first: another project's folder stays the generic refusal,
+    # so the reason never tells a caller what it may not see.
+    with pytest.raises(DatasourceUnavailableError):
+        await authorize_datasource_selection(
+            _db([folder, _row(DS_OWNED)]),
+            {"id": OWNER},
+            OWNER,
+            [DS_NATIVE],
+            [PROJECT_B],
+            "sandbox",
+            execution_kind="job",
+        )
+
+
+@pytest.mark.asyncio
+async def test_the_thread_funnel_answers_400_with_the_reason():
+    folder = _row(
+        DS_NATIVE,
+        scope="projects",
+        projects=(PROJECT_A,),
+        ds_type="cloud_folder",
+        managed_key=f"project-cloud:{PROJECT_A}",
+    )
+    dependencies = thread_datasource_authorization_module.ThreadDatasourceAuthorizationDependencies(
+        store=_db([folder], roles={PROJECT_A: "editor"}),
+        thread_project_ids=AsyncMock(return_value=[]),
+    )
+    with pytest.raises(HTTPException) as refused:
+        await thread_datasource_authorization_module.authorize_thread_datasource_selection(
+            {"id": OWNER},
+            [DS_NATIVE],
+            workspace_backend="sandbox",
+            target_project_ids=[PROJECT_A],
+            execution_kind="job",
+            dependencies=dependencies,
+        )
+    assert refused.value.status_code == 400
+    assert "sessions only" in refused.value.detail
+
+
+@pytest.mark.asyncio
+async def test_an_inherited_selection_keeps_what_the_job_can_attach():
+    folder = _row(DS_NATIVE, ds_type="cloud_folder")
+    db = _db([folder, _row(DS_OWNED)])
+    dependencies = job_datasource_selection_module.JobDatasourceSelectionDependencies(
+        store=db,
+        authorize_thread_datasource_selection=AsyncMock(),
+        backend_from_override=lambda _override: None,
+        revalidate_selection=AsyncMock(),
+    )
+    assert await job_datasource_selection_module.filter_execution_kind_datasource_ids(
+        [DS_NATIVE, DS_OWNED, DS_SHARED], "job", dependencies=dependencies
+    ) == [DS_OWNED, DS_SHARED]
+    assert await job_datasource_selection_module.filter_execution_kind_datasource_ids(
+        [DS_NATIVE, DS_OWNED], "session", dependencies=dependencies
+    ) == [DS_NATIVE, DS_OWNED]
+
+
+def test_the_driver_names_the_executions_a_connector_serves():
+    folder = _row(DS_NATIVE, ds_type="cloud_folder")
+    assert execution_kind_refuses(folder, "job")
+    assert not execution_kind_refuses(folder, "session")
+    assert not execution_kind_refuses(folder, None)
+    assert not execution_kind_refuses(_row(DS_OWNED), "job")
+    # A type no driver serves refuses nothing.
+    assert not execution_kind_refuses(_row(DS_OWNED, ds_type="unknown"), "job")
 
 
 @pytest.mark.asyncio
@@ -226,7 +633,10 @@ async def test_lite_tier_filters_implicit_repository_but_rejects_explicit_one():
     )
     db = _db([repository])
 
-    assert await default_datasource_ids(db, OWNER, [], "virtual") == []
+    assert (
+        await default_datasource_ids(db, OWNER, [], "virtual", execution_kind="session")
+        == []
+    )
     with pytest.raises(DatasourceWorkspaceTierError):
         await authorize_datasource_ids(
             db,
@@ -254,6 +664,7 @@ async def test_default_selection_returns_revisions_from_decision_rows():
         OWNER,
         [],
         "virtual",
+        execution_kind="session",
     )
 
     assert selected == [DS_OWNED]
@@ -262,22 +673,44 @@ async def test_default_selection_returns_revisions_from_decision_rows():
 
 
 @pytest.mark.asyncio
+async def test_unattended_work_leaves_the_owners_outbox_out():
+    outbox = _row(
+        DS_NATIVE,
+        automatic=True,
+        ds_type="cloud_outbox",
+        managed_key=f"cloud-outbox:{OWNER}",
+    )
+    db = _db([outbox, _row(DS_OWNED, automatic=True)])
+
+    attended, _ = await default_datasource_selection(
+        db, OWNER, [], "sandbox", execution_kind="job"
+    )
+    unattended, revisions = await default_datasource_selection(
+        db, OWNER, [], "sandbox", execution_kind="job", unattended=True
+    )
+
+    assert attended == [DS_NATIVE, DS_OWNED]
+    assert unattended == [DS_OWNED]
+    assert revisions == {DS_OWNED: 1}
+
+
+@pytest.mark.asyncio
 async def test_named_owner_membership_loss_fails_closed():
     db = _db([_row(DS_OWNED, automatic=True)], member=False)
 
     with pytest.raises(DatasourceUnavailableError):
-        await default_datasource_ids(db, OWNER, [PROJECT_A], "sandbox")
+        await default_datasource_ids(
+            db, OWNER, [PROJECT_A], "sandbox", execution_kind="session"
+        )
 
 
 def test_delivery_snapshot_rejects_missing_or_revision_changed_rows():
-    import orchestrator.main as main
-
     for resolved in (
         [],
         [{"id": DS_OWNED, "policy_revision": 8}],
     ):
         with pytest.raises(HTTPException) as exc:
-            main._require_exact_datasource_resolution(
+            job_datasource_selection_module.require_exact_datasource_resolution(
                 [DS_OWNED], {DS_OWNED: 9}, resolved
             )
         assert exc.value.status_code == 403
@@ -285,11 +718,9 @@ def test_delivery_snapshot_rejects_missing_or_revision_changed_rows():
 
 
 def test_delivery_snapshot_rejects_duplicate_resolver_rows():
-    import orchestrator.main as main
-
     row = {"id": DS_OWNED, "policy_revision": 9}
     with pytest.raises(HTTPException):
-        main._require_exact_datasource_resolution(
+        job_datasource_selection_module.require_exact_datasource_resolution(
             [DS_OWNED], {DS_OWNED: 9}, [row, dict(row)]
         )
 
@@ -302,16 +733,19 @@ async def test_job_delivery_authorizes_and_resolves_as_one_exact_snapshot(
 
     db = AsyncMock()
     db.resolve_datasources_for_job = AsyncMock(return_value=[])
-    monkeypatch.setattr(main, "postgres_db", db)
+    monkeypatch.setattr(main.app.state.resources, "postgres_db", db)
     monkeypatch.setattr(
-        main,
-        "_revalidate_job_datasource_selection",
+        job_datasource_selection_module,
+        "revalidate_job_datasource_selection",
         AsyncMock(return_value=([DS_OWNED], {DS_OWNED: 3})),
     )
 
     with pytest.raises(HTTPException):
-        await main._resolve_authorized_job_datasources(
-            {"id": LEGACY_JOB, "project_id": PROJECT_A}
+        await job_datasource_selection_module.resolve_authorized_job_datasources(
+            {"id": LEGACY_JOB, "project_id": PROJECT_A},
+            dependencies=preparation_composition.job_datasource_selection_dependencies(
+                main.app.state.resources
+            ),
         )
 
     db.resolve_datasources_for_job.assert_awaited_once_with(
@@ -327,18 +761,21 @@ async def test_cold_thread_resolution_rejects_silent_deleted_connector(
 
     db = AsyncMock()
     db.resolve_datasources_for_thread = AsyncMock(return_value=[])
-    monkeypatch.setattr(main, "postgres_db", db)
+    monkeypatch.setattr(main.app.state.resources, "postgres_db", db)
     monkeypatch.setattr(
-        main.thread_datasource_authorization_service,
+        thread_datasource_authorization_module,
         "revalidate_thread_datasource_selection",
         AsyncMock(return_value=([DS_OWNED], {DS_OWNED: 3})),
     )
 
     with pytest.raises(HTTPException):
-        await main._resolve_thread_datasources(
+        await thread_mount_rows_module.resolve_thread_datasources(
             {"id": "99999999-9999-4999-8999-999999999999"},
             {"datasource_ids": [DS_OWNED]},
             project_ids=[PROJECT_A],
+            dependencies=preparation_composition.thread_mount_dependencies(
+                main.app.state.resources
+            ),
         )
 
 
@@ -364,11 +801,15 @@ async def test_parent_inheritance_rejects_deleted_materialized_connector(
     # FK CASCADE after connector deletion removed the junction row.  The
     # immutable context still proves that [] is a reduction, not an opt-out.
     db.list_job_datasource_ids = AsyncMock(return_value=[])
-    monkeypatch.setattr(main, "postgres_db", db)
+    monkeypatch.setattr(main.app.state.resources, "postgres_db", db)
 
     with pytest.raises(HTTPException) as exc:
-        await main._inherit_parent_datasource_ids(
-            thread_id=None, parent_job_id=LEGACY_JOB
+        await job_datasource_selection_module.inherit_parent_datasource_ids(
+            thread_id=None,
+            parent_job_id=LEGACY_JOB,
+            dependencies=preparation_composition.job_datasource_selection_dependencies(
+                main.app.state.resources
+            ),
         )
 
     assert exc.value.status_code == 403
@@ -380,12 +821,15 @@ async def test_parent_inheritance_propagates_database_failures(monkeypatch):
 
     db = AsyncMock()
     db.get_thread = AsyncMock(side_effect=RuntimeError("database unavailable"))
-    monkeypatch.setattr(main, "postgres_db", db)
+    monkeypatch.setattr(main.app.state.resources, "postgres_db", db)
 
     with pytest.raises(RuntimeError, match="database unavailable"):
-        await main._inherit_parent_datasource_ids(
+        await job_datasource_selection_module.inherit_parent_datasource_ids(
             thread_id="99999999-9999-4999-8999-999999999999",
             parent_job_id=LEGACY_JOB,
+            dependencies=preparation_composition.job_datasource_selection_dependencies(
+                main.app.state.resources
+            ),
         )
 
 
@@ -397,7 +841,9 @@ async def test_admin_effective_owner_uses_project_acl_without_membership_row():
         return_value={"id": OWNER, "is_approved": True, "is_admin": True}
     )
 
-    assert await default_datasource_ids(db, OWNER, [PROJECT_A], "sandbox") == [DS_OWNED]
+    assert await default_datasource_ids(
+        db, OWNER, [PROJECT_A], "sandbox", execution_kind="session"
+    ) == [DS_OWNED]
 
 
 @pytest.mark.asyncio

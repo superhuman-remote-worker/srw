@@ -28,6 +28,9 @@ from shared.runtime.core.workspace_backend import (  # noqa: E402
     WorkspaceUnavailableError,
 )
 from shared.runtime.core.backends.remote import WorkspaceHostIdentityMismatch  # noqa: E402
+from tests._process_zero_namespace import (  # noqa: E402
+    run_scenario as run_process_zero_scenario,
+)
 
 
 # =============================================================================
@@ -369,11 +372,49 @@ class TestRemoteShellCompletionRecords:
     def test_wrapped_or_malformed_command_echo_never_completes(self, line):
         assert _parse_shell_completion_record(line, self._SENTINEL) is None
 
+    def test_a_long_command_runs_from_a_workspace_file(self, remote_backend):
+        # tmux refuses a send-keys message over ~16 KiB; the pane guard then
+        # waited for a command it never received (dev session 2c6d3e06).
+        backend, _, _ = remote_backend
+        long_command = "cat > page.html <<'EOF'\n" + "<p>x</p>\n" * 3000 + "EOF"
+        with patch.object(backend, "write_file") as write_file:
+            command = backend._build_guarded_shell_command(
+                long_command, self._SENTINEL, None
+            )
+
+        (relative, content), _ = write_file.call_args
+        assert relative.startswith(".srw/shell/cmd-")
+        assert content == long_command + "\n"
+        assert len(command.encode()) < 1024
+        assert f". /home/agent-host/workspace/{relative};" in command
+        assert "(exit $_srw_spill_rc)" in command
+
+    def test_a_short_command_is_typed_as_is(self, remote_backend):
+        backend, _, _ = remote_backend
+        with patch.object(backend, "write_file") as write_file:
+            command = backend._build_guarded_shell_command(
+                "echo ok", self._SENTINEL, None
+            )
+
+        write_file.assert_not_called()
+        assert "echo ok" in command
+
+    def test_a_command_tmux_cannot_type_never_sets_the_guard(self, remote_backend):
+        backend, _, _ = remote_backend
+        with patch.object(backend, "_tmux_mutate_checked") as mutate:
+            with pytest.raises(ValueError, match="too long"):
+                backend._reserve_and_send_shell_command(
+                    "default",
+                    expected=None,
+                    sentinel=self._SENTINEL,
+                    command="x" * 20000,
+                )
+
+        mutate.assert_not_called()
+
     def test_only_exact_newline_separated_record_completes(self, remote_backend):
         backend, _, _ = remote_backend
-        command, _ = backend._build_guarded_shell_command(
-            "echo ok", self._SENTINEL, None
-        )
+        command = backend._build_guarded_shell_command("echo ok", self._SENTINEL, None)
 
         assert f"printf '\\n{self._SENTINEL}" in command
         assert _parse_shell_completion_record(
@@ -2070,9 +2111,12 @@ class TestRemoteBackendTmuxFences:
 
     def test_retired_resource_verification_uses_bash_for_zero_script(self):
         backend = self._incarnation_backend(token=48)
-        with patch.object(
-            backend, "_exec_with_status", return_value=("zero-ok", 0)
-        ) as execute:
+        with (
+            patch.object(backend, "_ensure_connected"),
+            patch.object(
+                backend, "_exec_with_status", return_value=("zero-ok", 0)
+            ) as execute,
+        ):
             assert (
                 backend.verify_terminal_claim_resources_retired(
                     "set -euo pipefail\nprintf '__SRW_RESOURCE_ZERO__\\n'",
@@ -2089,6 +2133,133 @@ class TestRemoteBackendTmuxFences:
         assert '"$_srw_process_tagged" = true' in command
         assert "exit 81" in command
         assert execute.call_args.kwargs == {"timeout": 29, "retain_tail": True}
+
+    def test_retired_resource_verification_closes_its_own_sftp_before_the_proof(
+        self,
+    ):
+        """The proof's own SFTP server is a non-dumpable same-UID sibling.
+
+        OpenSSH's ``sftp-server`` disables tracing on itself, so the workspace
+        user cannot read its environment and the read-only zero scan correctly
+        refuses (86) beside it. Like the terminate proof in ``shell_cleanup``,
+        the verification closes this backend's SFTP channel first and runs over
+        the still-active transport.
+        """
+        backend = self._incarnation_backend(token=48)
+        sftp = MagicMock()
+        backend._sftp = sftp
+        seen_at_exec = []
+
+        def execute(command, **kwargs):
+            seen_at_exec.append((backend._sftp, sftp.close.called))
+            return "zero-ok", 0
+
+        with (
+            patch.object(backend, "_ensure_connected"),
+            patch.object(backend, "_exec_with_status", side_effect=execute),
+        ):
+            backend.verify_terminal_claim_resources_retired(":", 30)
+
+        assert seen_at_exec == [(None, True)]
+
+    def test_retired_resource_proof_waits_for_previous_ssh_process_to_exit(self):
+        """A closed transport can leave an unreadable sshd sibling briefly."""
+        backend = self._incarnation_backend(token=48)
+        with (
+            patch.object(backend, "_close_sftp_before_process_zero_proof") as close,
+            patch.object(
+                backend,
+                "_exec_with_status",
+                side_effect=[("", 86), ("", 86), ("zero", 0)],
+            ) as execute,
+            patch("shared.runtime.core.backends.remote.time.sleep"),
+        ):
+            assert backend.verify_terminal_claim_resources_retired(":", 30) == "zero"
+        assert execute.call_count == 3
+        close.assert_called_once_with()
+        assert len({call.args[0] for call in execute.call_args_list}) == 1
+
+    @pytest.mark.parametrize("refusal", [75, 78, 79, 80, 81, 85])
+    def test_retired_resource_proof_does_not_retry_authority_or_writer_refusal(
+        self, refusal
+    ):
+        backend = self._incarnation_backend(token=48)
+        with (
+            patch.object(backend, "_close_sftp_before_process_zero_proof"),
+            patch.object(
+                backend, "_exec_with_status", return_value=("", refusal)
+            ) as execute,
+        ):
+            with pytest.raises(WorkspaceUnavailableError, match=f"exit code {refusal}"):
+                backend.verify_terminal_claim_resources_retired(":", 30)
+        execute.assert_called_once()
+
+    def test_retired_resource_proof_rechecks_authority_after_ambiguous_process(self):
+        backend = self._incarnation_backend(token=48)
+        with (
+            patch.object(backend, "_close_sftp_before_process_zero_proof"),
+            patch.object(
+                backend, "_exec_with_status", side_effect=[("", 86), ("", 75)]
+            ) as execute,
+            patch("shared.runtime.core.backends.remote.time.sleep"),
+        ):
+            with pytest.raises(WorkspaceUnavailableError, match="exit code 75"):
+                backend.verify_terminal_claim_resources_retired(":", 30)
+        assert execute.call_count == 2
+
+    @pytest.mark.parametrize("budget", [0.15, 30])
+    def test_retired_resource_proof_keeps_unreadable_processes_held_with_bounded_wait(
+        self, budget
+    ):
+        backend = self._incarnation_backend(token=48)
+        now = [100.0]
+
+        def sleep(seconds):
+            now[0] += seconds
+
+        with (
+            patch.object(backend, "_close_sftp_before_process_zero_proof") as close,
+            patch.object(
+                backend, "_exec_with_status", return_value=("", 86)
+            ) as execute,
+            patch(
+                "shared.runtime.core.backends.remote.time.monotonic",
+                side_effect=lambda: now[0],
+            ),
+            patch("shared.runtime.core.backends.remote.time.sleep", side_effect=sleep),
+        ):
+            with pytest.raises(WorkspaceUnavailableError, match="exit code 86"):
+                backend.verify_terminal_claim_resources_retired(":", budget)
+        assert 1 < execute.call_count <= 52
+        assert now[0] - 100 <= min(budget, 5) + 0.00001
+        close.assert_called_once_with()
+        timeouts = [call.kwargs["timeout"] for call in execute.call_args_list]
+        assert timeouts[0] == budget
+        assert all(0 < value <= budget for value in timeouts)
+        assert timeouts[-1] < timeouts[0]
+
+    def test_home_paths_still_resolve_after_the_verification_closed_sftp(self):
+        """The post-shell re-proof runs once per resident kind on one backend.
+
+        Between those calls the cloud mount and overlay managers build their
+        zero scripts from ``resolve_home_path``, whose ``$HOME`` comes from
+        SFTP. Closing the proof's own channel must not take that away.
+        """
+        backend = self._incarnation_backend(token=48)
+        sftp = MagicMock()
+        sftp.normalize.return_value = "/home/agent-host"
+        backend._sftp = sftp
+
+        with (
+            patch.object(backend, "_ensure_connected"),
+            patch.object(backend, "_exec_with_status", return_value=("zero-ok", 0)),
+        ):
+            backend.verify_terminal_claim_resources_retired(":", 30)
+            resolved = backend.resolve_home_path(".cache/srw/rclone/thread")
+            backend.verify_terminal_claim_resources_retired(":", 30)
+
+        assert resolved == "/home/agent-host/.cache/srw/rclone/thread"
+        assert backend._sftp is None
 
     def test_tmux_lock_command_defaults_to_sh_and_rejects_other_shells(self):
         backend = self._incarnation_backend()
@@ -2461,6 +2632,13 @@ if os.path.exists(sentinel):
         assert "_srw_retire_incarnation=absent" not in command
 
     def test_shared_child_process_zero_leaves_parent_tagged_process_alive(self):
+        """Run in a private PID namespace, where a zero proof is exact.
+
+        On a shared host the whole-``/proc`` scan legitimately refuses (86)
+        beside same-UID processes it cannot inspect, so a host run could only
+        ever show the refusal. See ``tests/_process_zero_namespace.py``.
+        """
+
         child_id = "cccccccc-cccc-4ccc-8ccc-cccccccccccc"
         parent_id = "dddddddd-dddd-4ddd-8ddd-dddddddddddd"
         backend = RemoteBackend(
@@ -2475,73 +2653,72 @@ if os.path.exists(sentinel):
         generation = "c" * 32
         shell_tag = backend._shell_process_tag(generation)
         workspace_tag = backend._workspace_process_tag()
-        child = subprocess.Popen(
-            ["sh", "-c", "trap 'exit 0' TERM; while :; do sleep 1; done"],
-            env={
-                **os.environ,
-                "SRW_WORKSPACE_PROCESS_TAG": workspace_tag,
-                "SRW_SHELL_PROCESS_TAG": shell_tag,
-            },
-            start_new_session=True,
-        )
-        parent = subprocess.Popen(
-            ["sh", "-c", "trap 'exit 0' TERM; while :; do sleep 1; done"],
-            env={**os.environ, "SRW_WORKSPACE_PROCESS_TAG": workspace_tag},
-            start_new_session=True,
+        command = (
+            f"_srw_generation={generation}\n"
+            + backend._stateless_terminal_process_zero_shell(terminate=True)
         )
         try:
-            command = (
-                f"_srw_generation={generation}\n"
-                + backend._stateless_terminal_process_zero_shell(terminate=True)
+            result = run_process_zero_scenario(
+                command=command,
+                tag_env="SRW_SHELL_PROCESS_TAG",
+                fixtures=[
+                    {
+                        "name": "child",
+                        "kind": "term_logger",
+                        "env": {
+                            "SRW_WORKSPACE_PROCESS_TAG": workspace_tag,
+                            "SRW_SHELL_PROCESS_TAG": shell_tag,
+                        },
+                    },
+                    {
+                        "name": "parent",
+                        "kind": "term_logger",
+                        "env": {"SRW_WORKSPACE_PROCESS_TAG": workspace_tag},
+                    },
+                ],
             )
-            completed = subprocess.run(
-                ["bash", "-c", command],
-                text=True,
-                capture_output=True,
-                timeout=15,
-                check=False,
-            )
-            assert completed.returncode in {0, 86}, completed.stderr
-            child.wait(timeout=3)
-            assert parent.poll() is None
-        finally:
-            for process in (child, parent):
-                if process.poll() is None:
-                    process.kill()
-                    process.wait(timeout=3)
+        except LookupError as exc:
+            pytest.skip(str(exc))
+
+        scan = result["scans"][0]
+        assert scan["returncode"] == 0, scan
+        child, parent = result["after"]["child"], result["after"]["parent"]
+        assert not child["executing"] and child["log"] == ["TERM"]
+        assert parent["executing"] and parent["log"] == []
 
     def test_terminal_process_zero_kills_disowned_tagged_child_and_excludes_ancestors(
         self,
     ):
+        """The scan carries the tag itself, as it does inside the workspace.
+
+        A zero proof (exit 0) is only possible if the scan excluded its own
+        tagged ancestry and still retired the disowned, session-leading child.
+        """
+
         backend = self._incarnation_backend()
         tag = backend._workspace_process_tag()
         command = backend._stateless_workspace_process_zero_shell(terminate=True)
         assert "\x00" not in command
-
-        child = subprocess.Popen(
-            ["sh", "-c", "trap 'exit 0' TERM; while :; do sleep 1; done"],
-            env={**os.environ, "SRW_WORKSPACE_PROCESS_TAG": tag},
-            start_new_session=True,
-        )
         try:
-            completed = subprocess.run(
-                ["bash", "-c", command],
-                env={**os.environ, "SRW_WORKSPACE_PROCESS_TAG": tag},
-                text=True,
-                capture_output=True,
-                timeout=15,
-                check=False,
+            result = run_process_zero_scenario(
+                command=command,
+                scan_env={"SRW_WORKSPACE_PROCESS_TAG": tag},
+                fixtures=[
+                    {
+                        "name": "child",
+                        "kind": "term_logger",
+                        "env": {"SRW_WORKSPACE_PROCESS_TAG": tag},
+                    }
+                ],
             )
-            # The shared test host can contain same-UID, non-dumpable sibling
-            # processes. Production correctly treats those as ambiguous (86)
-            # rather than a zero proof, but must still retire every readable
-            # exact-tag child before refusing.
-            assert completed.returncode in {0, 86}, completed.stderr
-            child.wait(timeout=3)
-        finally:
-            if child.poll() is None:
-                child.kill()
-                child.wait(timeout=3)
+        except LookupError as exc:
+            pytest.skip(str(exc))
+
+        scan = result["scans"][0]
+        assert scan["returncode"] == 0, scan
+        assert result["before"]["child"]["executing"]
+        child = result["after"]["child"]
+        assert not child["executing"] and child["log"] == ["TERM"]
 
     def test_replacement_runtime_supersedes_stale_marker_only_without_live_tmux(self):
         backend = self._incarnation_backend(token=22)
@@ -3718,6 +3895,63 @@ class TestRemoteBackendShellOperations:
         assert backend._tabs["default"].tab_type == "shell"
         assert backend._tabs["default"].pane_id == "%1"
 
+    @pytest.mark.parametrize("disposition", ["created", "existing"])
+    def test_agent_shells_keep_no_history_file(self, remote_backend, disposition):
+        """A typed token clone URL must never reach ~/.bash_history.
+
+        Killing the session SIGHUPs bash, which writes history into the home
+        that snapshots and the PVC keep. The session environment covers every
+        later window (ssh/repl tabs included), and the setup preamble unsets
+        HISTFILE after .bashrc in every shell tab, fresh or opened later.
+        """
+        backend, _, _ = remote_backend
+        backend.connect()
+
+        with (
+            patch.object(
+                backend, "_create_or_observe_tmux_session", return_value=disposition
+            ),
+            patch.object(backend, "_promote_tmux_owner_token"),
+            patch.object(backend, "_attest_tmux_owner"),
+            patch.object(backend, "_ensure_prompt_token"),
+            patch.object(
+                backend,
+                "_read_tmux_session_option",
+                side_effect=lambda option: (
+                    _TMUX_SETUP_COMPLETE
+                    if option == _TMUX_SETUP_OPTION and disposition == "existing"
+                    else _TMUX_SETUP_PENDING
+                    if option == _TMUX_SETUP_OPTION
+                    else ""
+                ),
+            ),
+            patch.object(backend, "_rehydrate_tabs"),
+            patch.object(backend, "_discover_single_pane", return_value="%1"),
+            patch.object(backend, "_set_tmux_window_option"),
+            patch.object(backend, "_set_tmux_session_option"),
+            patch.object(backend, "_send_and_wait") as setup,
+            patch.object(backend, "_install_prompt_marker"),
+            patch.object(backend, "_tmux_mutate_checked") as mutate,
+        ):
+            backend._init_shell()
+            if disposition == "created":
+                backend.shell_open_tab("git")
+
+        assert any(
+            "set-environment" in call_.args[0] and "HISTFILE /dev/null" in call_.args[0]
+            for call_ in mutate.call_args_list
+        )
+        preambles = [call_.args[1] for call_ in setup.call_args_list]
+        if disposition == "created":
+            assert [call_.args[0] for call_ in setup.call_args_list] == [
+                "default",
+                "git",
+            ]
+            assert all("; unset HISTFILE" in p for p in preambles)
+        else:
+            # Reattach never types into a live pane.
+            assert preambles == []
+
     def test_reattach_restores_persisted_tab_type_and_pending_sentinel(
         self, remote_backend
     ):
@@ -4485,6 +4719,324 @@ class TestRemoteBackendShellRun:
         assert "CWD: /tmp" in second
         assert all(sent.args[1] != f"cd {self._ROOT}" for sent in send.call_args_list)
         assert len(reserve.call_args_list) == 2
+
+
+class TestRemoteBackendShellRunOutput:
+    """shell_run returns exactly what the command printed.
+
+    The fake pane looks like a real one: the typed command is echoed onto the
+    prompt line the pre-command capture ended with, so it sits before
+    ``pre_count``. Only the command's start marker tells output from echo.
+    """
+
+    _ROOT = "/home/agent-host/workspace"
+    _SENTINEL = "__DONE_0123456789ab__"
+    _MARKER = "__SRW_START_0123456789ab__"
+    _PROMPT = "__SRW_PROMPT_0123456789abcdef0123456789abcdef__ "
+    _HISTORY = ["$ make", "earlier output"]
+
+    def _run(self, backend, command, pane_after, *, working_dir=None):
+        """Run ``command``; ``pane_after(typed_lines)`` is the pane it leaves."""
+        backend._shell_initialized = True
+        backend._tabs["default"] = _RemoteTab("default", pane_id="%1")
+        sent = {}
+
+        def reserve(_tab_name, *, sentinel, command, **_kwargs):
+            sent["command"] = command
+            backend._tabs["default"].pending_sentinel = sentinel
+
+        def capture(_tab_name):
+            if "command" not in sent:
+                return [*self._HISTORY, self._PROMPT]
+            return pane_after(sent["command"].split("\n"))
+
+        with (
+            patch("shared.runtime.core.backends.remote.uuid.uuid4") as uuid4,
+            patch("shared.runtime.core.backends.remote.time.sleep"),
+            patch.object(backend, "_tmux_capture", side_effect=capture),
+            patch.object(
+                backend, "_reserve_and_send_shell_command", side_effect=reserve
+            ),
+            patch.object(backend, "_clear_tab_pending"),
+        ):
+            uuid4.return_value.hex = "0123456789abcdef"
+            result = backend.shell_run(command, working_dir=working_dir)
+        return result, sent["command"]
+
+    def _bash_pane(self, output, *, rc=0):
+        def pane_after(typed):
+            echo = [self._PROMPT + typed[0]] + [f"> {line}" for line in typed[1:]]
+            return [
+                *self._HISTORY,
+                *echo,
+                self._MARKER,
+                *output,
+                "",
+                f"{self._SENTINEL} {rc} {self._ROOT}",
+                self._PROMPT,
+            ]
+
+        return pane_after
+
+    @pytest.mark.parametrize(
+        ("command", "output"),
+        (
+            (
+                "git remote -v",
+                [
+                    "origin\thttps://git.example/acme/repo.git (fetch)",
+                    "origin\thttps://git.example/acme/repo.git (push)",
+                ],
+            ),
+            (
+                "git config --get remote.origin.url",
+                ["https://git.example/acme/repo.git"],
+            ),
+            ("cat notes.txt", ["the cat sat on the mat", "second line"]),
+            ("ls", ["tools.py", "lstrip.py", "README.md"]),
+            ("python report.py", ["python 3.13 report", "total: 5$"]),
+            ("cat prompt.txt", ["agent@host:~$", "user$", "after"]),
+        ),
+    )
+    def test_output_lines_naming_the_command_are_kept(
+        self, remote_backend, command, output
+    ):
+        backend, _, _ = remote_backend
+
+        result, _ = self._run(backend, command, self._bash_pane(output))
+
+        assert result == (
+            f"Exit code: 0\nCWD: {self._ROOT}\n--- stdout ---\n" + "\n".join(output)
+        )
+        assert "__SRW_" not in result and "printf" not in result
+
+    def test_working_dir_output_keeps_lines_and_drops_the_restore_echo(
+        self, remote_backend
+    ):
+        backend, _, _ = remote_backend
+        output = ["origin\thttps://git.example/acme/repo.git (fetch)"]
+
+        def pane_after(typed):
+            assert len(typed) == 2
+            return [
+                *self._HISTORY,
+                self._PROMPT + typed[0],
+                self._MARKER,
+                *output,
+                self._PROMPT + typed[1],
+                "",
+                f"{self._SENTINEL} 0 {self._ROOT}/repo",
+                self._PROMPT,
+            ]
+
+        result, _ = self._run(
+            backend, "git remote -v", pane_after, working_dir=f"{self._ROOT}/repo"
+        )
+
+        assert result.endswith("--- stdout ---\n" + "\n".join(output))
+
+    def test_multiline_output_is_kept_after_the_heredoc_echo(self, remote_backend):
+        backend, _, _ = remote_backend
+        output = ["git version 2.47.0", "python3 ok"]
+
+        result, typed = self._run(
+            backend,
+            "git --version\npython3 -c 'print(\"python3 ok\")'",
+            self._bash_pane(output),
+        )
+
+        assert typed.startswith('bash << "SRW_DELIM_')
+        assert result.endswith("--- stdout ---\n" + "\n".join(output))
+
+    def test_output_overflowing_the_scrollback_is_all_kept(self, remote_backend):
+        backend, _, _ = remote_backend
+        tail = [f"line {i}" for i in range(4990, 5000)]
+
+        def pane_after(_typed):
+            # Marker and echo scrolled out of the capture with older history.
+            return [*tail, "", f"{self._SENTINEL} 0 {self._ROOT}", self._PROMPT]
+
+        result, _ = self._run(backend, "seq 5000", pane_after)
+
+        assert result.endswith("--- stdout ---\n" + "\n".join(tail))
+
+    def test_rejected_command_line_reports_only_what_bash_printed(self, remote_backend):
+        backend, _, _ = remote_backend
+        error = "bash: syntax error near unexpected token `)'"
+
+        def pane_after(typed):
+            # Bash refused line one, so no marker; line two still completes.
+            return [
+                *self._HISTORY,
+                self._PROMPT + typed[0],
+                error,
+                self._PROMPT + typed[1],
+                "",
+                f"{self._SENTINEL} 2 {self._ROOT}",
+                self._PROMPT,
+            ]
+
+        result, _ = self._run(backend, "echo )", pane_after, working_dir=self._ROOT)
+
+        assert result == (f"Exit code: 2\nCWD: {self._ROOT}\n--- stdout ---\n{error}")
+
+    def test_working_dir_output_without_a_final_newline_is_kept(self, remote_backend):
+        backend, _, _ = remote_backend
+        backend._prompt_marker = self._PROMPT.strip()
+
+        def pane_after(typed):
+            # Bash prints the restore line's prompt right after the output.
+            return [
+                *self._HISTORY,
+                self._PROMPT + typed[0],
+                self._MARKER,
+                "first\tline",
+                "no newline" + self._PROMPT + typed[1],
+                "",
+                f"{self._SENTINEL} 0 {self._ROOT}",
+                self._PROMPT,
+            ]
+
+        result, _ = self._run(
+            backend,
+            "printf 'first\\tline\\nno newline'",
+            pane_after,
+            working_dir=self._ROOT,
+        )
+
+        assert result.endswith("--- stdout ---\nfirst\tline\nno newline")
+
+    @pytest.mark.parametrize(
+        ("pane", "output"),
+        (
+            # The command moved the cursor up over its echo and marker.
+            (
+                [
+                    "ancient history",
+                    "__SRW_PROMPT_0123456789abcdef0123456789abcdef__ ls",
+                    "tools.py",
+                    "",
+                    "__DONE_aaaaaaaaaaaa__ 0 /home/agent-host/workspace",
+                    "after",
+                ],
+                "after",
+            ),
+            # A killed TUI left the alternate screen on: the capture is the
+            # normal screen's history, cut inside the previous output, then
+            # the alternate screen.
+            (
+                [
+                    "ancient history",
+                    "__SRW_PROMPT_0123456789abcdef0123456789abcdef__ ls",
+                    "tools.py",
+                    "",
+                    "rc=137",
+                ],
+                "tools.py\n\nrc=137",
+            ),
+            # The command left an alternate screen its predecessor entered
+            # after printing its own marker.
+            (
+                [
+                    "__SRW_PROMPT_0123456789abcdef0123456789abcdef__ echo x",
+                    "__SRW_START_aaaaaaaaaaaa__",
+                    "back",
+                ],
+                "back",
+            ),
+        ),
+    )
+    def test_missing_marker_never_reports_history_before_the_shell_lines(
+        self, remote_backend, pane, output
+    ):
+        backend, _, _ = remote_backend
+        backend._prompt_marker = self._PROMPT.strip()
+
+        def pane_after(_typed):
+            return [*pane, "", f"{self._SENTINEL} 0 {self._ROOT}", self._PROMPT]
+
+        result, _ = self._run(backend, "printf '\\033[5A\\033[J'", pane_after)
+
+        assert result.endswith("--- stdout ---\n" + output)
+
+    def test_missing_marker_skips_lines_the_pane_already_showed(self, remote_backend):
+        backend, _, _ = remote_backend
+        backend._prompt_marker = self._PROMPT.strip()
+
+        def pane_after(_typed):
+            # A killed TUI left the alternate screen on. Nothing scrolled, so
+            # the capture is the earlier history, then the alternate screen.
+            return [
+                *self._HISTORY,
+                "TUI",
+                "",
+                "rc=137",
+                "",
+                f"{self._SENTINEL} 137 {self._ROOT}",
+                self._PROMPT,
+            ]
+
+        result, _ = self._run(backend, "timeout -s KILL 1 top", pane_after)
+
+        assert result.endswith("--- stdout ---\nTUI\n\nrc=137")
+
+    def test_still_running_state_shows_the_pane_not_the_marker(self, remote_backend):
+        backend, _, _ = remote_backend
+        backend._tabs["default"] = _RemoteTab("default", pane_id="%1")
+        echo = self._PROMPT + "printf '__SRW_START_%s__\\n' 0123456789ab; sleep 30"
+        with patch.object(
+            backend,
+            "_tmux_capture",
+            return_value=[*self._HISTORY, echo, self._MARKER],
+        ):
+            state = backend._capture_terminal_state(
+                "default", self._SENTINEL, len(self._HISTORY) + 1, self._MARKER
+            )
+
+        assert self._MARKER not in state.splitlines()
+        assert state.splitlines()[-1] == echo
+
+    @pytest.mark.parametrize(
+        ("command", "working_dir"),
+        (
+            ("cat notes.txt; ls", None),
+            ("cat notes.txt; ls", "sub"),
+            ("cat notes.txt\nls", None),
+            ("cat notes.txt\nls", "sub"),
+        ),
+    )
+    def test_bash_prints_the_marker_the_extraction_looks_for(
+        self, remote_backend, tmp_path, command, working_dir
+    ):
+        backend, _, _ = remote_backend
+        backend._sandbox_cwd = str(tmp_path)
+        sub = tmp_path / "sub"
+        sub.mkdir()
+        for directory in (tmp_path, sub):
+            (directory / "notes.txt").write_text("cat: first line\nsecond line\n")
+        cwd = str(sub if working_dir else tmp_path)
+
+        def pane_after(typed):
+            ran = subprocess.run(
+                ["bash", "--norc", "--noprofile"],
+                input="\n".join(typed) + "\n",
+                cwd=str(tmp_path),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                check=True,
+                timeout=10,
+            )
+            echo = [self._PROMPT + typed[0]] + [f"> {line}" for line in typed[1:]]
+            return [*self._HISTORY, *echo, *ran.stdout.splitlines(), self._PROMPT]
+
+        result, _ = self._run(backend, command, pane_after, working_dir=working_dir)
+
+        assert result == (
+            f"Exit code: 0\nCWD: {cwd}\n--- stdout ---\n"
+            "cat: first line\nsecond line\nnotes.txt"
+            + ("\nsub" if not working_dir else "")
+        )
 
 
 class TestRemoteBackendShellSend:

@@ -6,6 +6,8 @@ import pytest
 # R1.B06: this operation moved to services/run_queue_admin.
 from orchestrator.services import run_queue_admin  # noqa: E402
 from fastapi import HTTPException
+from orchestrator.application import access as access_composition
+from orchestrator.application import sessions as sessions_composition
 
 
 def _valid_sandbox_thread(**metadata_overrides):
@@ -395,13 +397,15 @@ async def test_present_falsey_stop_marker_refuses_admin_unpark(marker_key, value
     db = MagicMock()
     db.acquire = _acquire
     with (
-        patch.object(main, "postgres_db", db),
-        patch.object(main, "_require_admin", AsyncMock()),
+        patch.object(main.app.state.resources, "postgres_db", db),
+        patch.object(access_composition, "require_admin", AsyncMock()),
         pytest.raises(HTTPException) as exc,
     ):
         await run_queue_admin.unpark_run_queue_unit(
             "11111111-1111-4111-8111-111111111111",
-            dependencies=main._run_queue_admin_dependencies(),
+            dependencies=sessions_composition.run_queue_admin_dependencies(
+                main.app.state.resources
+            ),
         )
 
     assert exc.value.status_code == 409

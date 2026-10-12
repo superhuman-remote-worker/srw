@@ -29,9 +29,13 @@ Three properties this module exists to keep, stated so they stay testable:
    transport and deliberately replaces a stale persisted one; the resolved key
    map is the last resort. Selection order for a *model* is: the section's own
    pin, then the user setting, then the system capability default.
-3. **The fallback is a fallback.** :func:`dispatch_llm_provider_fallback` and
-   :func:`provider_of_model` are consulted only where registry resolution
-   produced nothing.
+3. **No model is routed by its name.** A model slot the registry cannot
+   resolve gets no route and is reported (``inject_model_credentials`` returns
+   the reason; the injectors raise ``ModelUnavailable``) — see
+   ``knowledge-base/knowledge/features/unavailable_model_handling.md``.
+   :func:`provider_of_model` is left only for the env-key capabilities
+   (vision / whisper / tts / embedding / rerank) and
+   :func:`dispatch_llm_provider_fallback` only for a job that names no model.
 
 Collaborators that the application rebinds during ``lifespan`` (the store, the
 logger) arrive through :class:`DispatchCredentialDependencies`, built per
@@ -45,8 +49,21 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any
 
-from shared.runtime.core.loader import INHERIT_MODEL, canonical_config_name
+from orchestrator.services.model_availability import (
+    ModelUnavailable,
+    UnavailableModel,
+    keeps_explicit_transport,
+    model_slots,
+    stale_account_model_reason,
+    unresolved_model_reason,
+)
+from shared.runtime.core.loader import (
+    INHERIT_MODEL,
+    ROSTER_INHERIT_MARKER,
+    canonical_config_name,
+)
 from shared.runtime.core.model_registry import UnknownModelError
+from shared.runtime.core.transport_resolution import env_endpoint_names
 from shared.subscription_routing import subscription_request_headers
 
 
@@ -118,33 +135,15 @@ def nested_model_slots(
     the agent lifts model + transport together at its own seam (u1_plan D.5).
     Shared by ``_inject_dispatch_credentials`` (jobs) and
     :func:`inject_thread_dispatch_credentials` (sessions) so the two cannot
-    drift. Only mappings are returned; the callers skip a slot with no model
-    and the ``inherit`` sentinel.
+    drift; the walk itself is ``model_availability.model_slots``, which the
+    delivery checks use too. Only mappings are returned; the callers skip a
+    slot with no model and the ``inherit`` sentinel.
     """
-    out: list[tuple[str, Any, str]] = []
-    llm = config_override.get("llm")
-    if isinstance(llm, dict):
-        for key in ("strategic", "tactical", "summarization"):
-            out.append((f"llm.{key}", llm.get(key), "chat"))
-    subagents = config_override.get("subagents")
-    if isinstance(subagents, dict):
-        out.append(("subagents.llm", subagents.get("llm"), "chat"))
-        roster = subagents.get("roster")
-        if isinstance(roster, dict):
-            for name, entry in roster.items():
-                if not isinstance(entry, dict):
-                    continue
-                entry_llm = entry.get("llm")
-                out.append((f"subagents.roster.{name}.llm", entry_llm, "chat"))
-                if isinstance(entry_llm, dict):
-                    out.append(
-                        (
-                            f"subagents.roster.{name}.llm.summarization",
-                            entry_llm.get("summarization"),
-                            "chat",
-                        )
-                    )
-    return [(label, sect, cap) for label, sect, cap in out if isinstance(sect, dict)]
+    return [
+        (slot.label, slot.section, slot.capability)
+        for slot in model_slots(config_override)
+        if slot.label not in ("llm", "auxiliary")
+    ]
 
 
 def dispatch_llm_provider_fallback(
@@ -247,18 +246,25 @@ async def inject_model_credentials(
     resolved_keys: dict[str, str] | None,
     capability: str = "chat",
     dependencies: DispatchCredentialDependencies,
-) -> None:
+) -> str | None:
     """Populate a config-override section with the right base_url + api_key
-    for a given model ID.
+    for a given model ID. Returns ``None`` when the model is routed, else why
+    it cannot run (``model_availability.REASON_*``) — the section is then left
+    untouched and the caller reports it.
 
     For endpoint-backed models (``origin`` in {``custom``, ``system``}):
     looks up the endpoint row and inlines its ``base_url`` + ``api_key``.
     Custom endpoints are user-scoped; system endpoints are helm-seeded or
     managed via Admin → Providers. Both live in llm_endpoints.
 
-    For built-ins: injects the named provider's key from ``resolved_keys``
-    (the user > project > env resolution chain). No base_url injection —
-    the agent's own registry handles env-driven base URLs for local models.
+    For system-anchored catalog rows: injects the row's provider key from
+    ``resolved_keys`` (the user > project > env resolution chain).
+
+    A model the registry cannot resolve is never routed by guessing a provider
+    from its name (unavailable_model_handling.md D1). The one exception is a
+    route the section itself names — an explicit ``provider`` or ``base_url``
+    for a model the registry does not know; a disabled catalog model is
+    refused even then (``keeps_explicit_transport``).
 
     Endpoint-backed models use the endpoint row as the transport authority. That
     intentionally replaces stale persisted transports when a session or paused
@@ -271,6 +277,17 @@ async def inject_model_credentials(
         )
     except UnknownModelError:
         meta = None
+
+    if meta is None:
+        reason = await unresolved_model_reason(dependencies.store, model_id)
+        if not keeps_explicit_transport(section, reason):
+            dependencies.logger.warning(
+                "Dispatch: %s model %r cannot run (%s); no route injected.",
+                capability,
+                model_id,
+                reason,
+            )
+            return reason
 
     transport_complete = "base_url" in section and "api_key" in section
 
@@ -297,9 +314,9 @@ async def inject_model_credentials(
         section["provider"] = meta.provider
 
     # Transport headers the resolved route needs. Only the subscription proxy
-    # uses this today: its Claude executor decides thinking visibility from the
-    # inbound Anthropic-Beta header, so a Claude-Code-served model without it
-    # returns empty thinking blocks (billed, unreadable). Written on every
+    # uses this today: below v7.3.x its Claude executor decides thinking
+    # visibility from the inbound Anthropic-Beta header, so a Claude-Code-served
+    # model without it returns empty thinking blocks (billed, unreadable). Written on every
     # injection — including as `{}` — for the same reason `provider` is: a
     # session hot-swap deep-merges this section over the previous model's, and
     # a header left behind would describe the model that is no longer running.
@@ -317,7 +334,7 @@ async def inject_model_credentials(
         section["extra_headers"] = _route_headers or None
 
     if transport_complete and not (meta is not None and meta.endpoint_id):
-        return
+        return None
 
     if (
         meta is not None
@@ -330,18 +347,31 @@ async def inject_model_credentials(
                 section["base_url"] = endpoint_row["base_url"]
             if endpoint_row.get("api_key"):
                 section["api_key"] = endpoint_row["api_key"]
-        return
+        return None
 
-    provider = meta.api_key_ref if meta is not None else provider_of_model(model_id)
-    if meta is None and provider:
-        section.setdefault("provider", provider)
-    if (
-        provider
-        and resolved_keys
-        and provider in resolved_keys
-        and "api_key" not in section
-    ):
+    # The provider whose stored key this section may carry: the catalog row's,
+    # or — for an unresolved model with an explicit route — the provider the
+    # section names itself. Never one inferred from the model name.
+    provider = meta.api_key_ref if meta is not None else section.get("provider")
+    # A provider-key row carries no endpoint of its own: the resolved key
+    # belongs to the provider's canonical endpoint, not to a ``base_url`` the
+    # caller pinned in this section. Withhold the stored key when a caller
+    # base_url is present so a system/project/user credential is never sent to
+    # a caller-chosen host (the exfiltration in the credential-leak review).
+    if provider and resolved_keys and provider in resolved_keys:
+        if "api_key" in section:
+            return None
+        if section.get("base_url"):
+            dependencies.logger.warning(
+                "Dispatch: %s model %r has a pinned base_url; withholding the "
+                "resolved %s key so it is not sent to that endpoint.",
+                capability,
+                model_id,
+                provider,
+            )
+            return None
         section["api_key"] = resolved_keys[provider]
+    return None
 
 
 async def inject_env_key_credentials(
@@ -360,11 +390,21 @@ async def inject_env_key_credentials(
     flat env vars (vision, whisper, tts, ...) rather than structured config
     sections. Endpoint-backed models (origin in {'custom','system','catalog'}
     with an endpoint_id) contribute the inline base_url+api_key from the
-    endpoint row; built-ins and system-anchored catalog rows resolve the
-    api_key via ``resolved_keys[provider]``. All writes are setdefault so
-    caller / earlier overrides win.
+    endpoint row, which overwrites any pre-set endpoint name; built-ins and
+    system-anchored catalog rows resolve the api_key via
+    ``resolved_keys[provider]`` (setdefault), withheld when an endpoint name
+    for the prefix is already set.
     """
     env_keys.setdefault(f"{prefix}_MODEL", model_id)
+
+    # A complete caller-supplied pair (an endpoint name AND its key, e.g. a
+    # project owner's BYO EMBEDDING_BASE_URL + EMBEDDING_API_KEY) involves no
+    # stored credential: leave it intact rather than overwrite half of it with
+    # a catalog row that belongs to a different model.
+    if env_keys.get(f"{prefix}_API_KEY") and any(
+        env_keys.get(name) for name in env_endpoint_names(prefix)
+    ):
+        return
 
     meta = None
     try:
@@ -399,15 +439,38 @@ async def inject_env_key_credentials(
                     prefix,
                 )
                 return
+            # The endpoint row is authoritative for its own transport, exactly
+            # like the model-section branch: overwrite, never setdefault, so a
+            # pre-set endpoint name (under any alias a reader consults) cannot
+            # survive next to this row's key.
             if base_url:
-                env_keys.setdefault(f"{prefix}_BASE_URL", base_url)
+                names = env_endpoint_names(prefix)
+                for alias in names[1:]:
+                    env_keys.pop(alias, None)
+                env_keys[names[0]] = base_url
             if api_key:
-                env_keys.setdefault(f"{prefix}_API_KEY", api_key)
+                env_keys[f"{prefix}_API_KEY"] = api_key
         return
 
     provider = meta.api_key_ref if meta is not None else provider_of_model(model_id)
+    # Same contract as the model-section injector: a provider-key row has no
+    # endpoint of its own, so the resolved key belongs to the provider's
+    # canonical endpoint. If any endpoint name for this prefix is already set
+    # (the endpoint-backed branch above returned for real endpoint rows),
+    # withhold the key so a stored credential is not sent to that host.
     if provider and resolved_keys and provider in resolved_keys:
-        env_keys.setdefault(f"{prefix}_API_KEY", resolved_keys[provider])
+        pinned = [name for name in env_endpoint_names(prefix) if env_keys.get(name)]
+        if pinned:
+            dependencies.logger.warning(
+                "Dispatch: %s model %r has a pinned endpoint (%s); withholding "
+                "the resolved %s key so it is not sent to that endpoint.",
+                prefix,
+                model_id,
+                ", ".join(pinned),
+                provider,
+            )
+        else:
+            env_keys.setdefault(f"{prefix}_API_KEY", resolved_keys[provider])
 
 
 async def inject_search_credentials(
@@ -554,6 +617,17 @@ async def inject_system_kb_embedding_profile(
         # per-user model and filtered every indexed chunk out.
         from shared.runtime.services.embedding_service import EmbeddingService
 
+        provider = os.getenv("EMBEDDING_PROVIDER", "local").lower()
+        fallback_key = (
+            os.getenv("OPENROUTER_API_KEY")
+            if provider == "openrouter"
+            else os.getenv("EMBEDDING_API_KEY") or os.getenv("OPENAI_API_KEY")
+        )
+        # The SDK rejects missing credentials during construction, before the
+        # old fallback.api_key guard could run. A fresh install has no provider
+        # yet: leave the KB sweep idle without constructing a broken client.
+        if not fallback_key:
+            return None
         fallback = EmbeddingService()
         if not fallback.api_key:
             return None
@@ -616,10 +690,17 @@ async def inject_thread_dispatch_credentials(
     project_id: str | None = None,
     user_settings: dict[str, Any] | None = None,
     include_kb_profile: bool = False,
+    strict: bool = True,
     dependencies: DispatchCredentialDependencies,
 ) -> dict[str, Any]:
     """Resolve + inject LLM / auxiliary / embedding credentials into a thread's
     ``config_override`` IN PLACE (creating sections as needed). Returns the dict.
+
+    Raises :class:`ModelUnavailable` naming every model slot whose model cannot
+    run (a slot inheriting its parent's model excepted) once all slots are
+    injected. ``strict=False`` only logs them: for the flat fallback copies the
+    attach paths build next to the resolved blob, which is checked strictly
+    where it is delivered (``inject_blob_credentials``).
 
     The persistent-session sibling of the worker-job ``_inject_dispatch_credentials``.
     Secrets travel **in-flight only** — at thread create, and re-injected at session
@@ -664,20 +745,42 @@ async def inject_thread_dispatch_credentials(
                 "Thread dispatch: injected system default chat model: %s",
                 system_chat_model,
             )
+    unavailable: list[UnavailableModel] = []
     if llm_section.get("model"):
-        await inject_model_credentials(
+        reason = await inject_model_credentials(
             section=llm_section,
             model_id=llm_section["model"],
             user_id=user_id,
             resolved_keys=resolved_keys,
             dependencies=dependencies,
         )
+        if reason:
+            unavailable.append(
+                UnavailableModel(slot="llm", model=llm_section["model"], reason=reason)
+            )
         config_override["llm"] = llm_section
 
     # Auxiliary slot (title generation, memory extraction, knowledge curation).
     aux_section = config_override.get("auxiliary") or {}
     if not aux_section.get("model"):
         aux_model = user_settings.get("default_auxiliary_model")
+        if aux_model and (
+            await stale_account_model_reason(
+                str(aux_model),
+                user_id=user_id,
+                capability="auxiliary",
+                store=dependencies.store,
+            )
+            is not None
+        ):
+            # A stale account preference falls back to the system default
+            # (unavailable_model_handling.md D2).
+            dependencies.logger.warning(
+                "Thread dispatch: account default_auxiliary_model %r cannot "
+                "run; using the system default",
+                aux_model,
+            )
+            aux_model = None
         if not aux_model:
             aux_model = await dependencies.store.resolve_default_for_capability(
                 "auxiliary"
@@ -688,7 +791,7 @@ async def inject_thread_dispatch_credentials(
                 "Thread dispatch: injected auxiliary model: %s", aux_model
             )
     if aux_section.get("model"):
-        await inject_model_credentials(
+        reason = await inject_model_credentials(
             section=aux_section,
             model_id=aux_section["model"],
             user_id=user_id,
@@ -696,6 +799,12 @@ async def inject_thread_dispatch_credentials(
             capability="auxiliary",
             dependencies=dependencies,
         )
+        if reason:
+            unavailable.append(
+                UnavailableModel(
+                    slot="auxiliary", model=aux_section["model"], reason=reason
+                )
+            )
         config_override["auxiliary"] = aux_section
 
     # Nested model slots (U1): `llm.summarization`, the roster-wide
@@ -711,7 +820,7 @@ async def inject_thread_dispatch_credentials(
         _model = _section.get("model")
         if not _model or _model == INHERIT_MODEL:
             continue
-        await inject_model_credentials(
+        reason = await inject_model_credentials(
             section=_section,
             model_id=_model,
             user_id=user_id,
@@ -719,6 +828,12 @@ async def inject_thread_dispatch_credentials(
             capability=_capability,
             dependencies=dependencies,
         )
+        # An inheriting roster entry runs on its parent's live LLM
+        # (overlay_live_llm), so its copied model name is never refused.
+        if reason and not _section.get(ROSTER_INHERIT_MARKER):
+            unavailable.append(
+                UnavailableModel(slot=_label, model=str(_model), reason=reason)
+            )
         dependencies.logger.info(
             "Thread dispatch: injected credentials for %s: %s", _label, _model
         )
@@ -796,6 +911,13 @@ async def inject_thread_dispatch_credentials(
         dependencies=dependencies,
     )
 
+    if unavailable:
+        if strict:
+            raise ModelUnavailable(unavailable)
+        dependencies.logger.warning(
+            "Thread dispatch: unavailable model slot(s) in a fallback copy: %s",
+            [entry.as_dict() for entry in unavailable],
+        )
     return config_override
 
 

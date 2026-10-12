@@ -62,10 +62,9 @@ spec:
       ports:
         - protocol: TCP
           port: 8085
-    # Workspace sshd, the inner hop. 30022 only: VM-tier workspaces are
-    # refused upstream by services/ssh_gateway_targets (vm_unsupported), so
-    # opening port 22 would be an unused hole in an internet-facing pod's
-    # egress.
+    # Workspace sshd, the inner hop. Container workspaces use 30022;
+    # attested same-cluster VM workspaces use 22. Keep this symmetric with
+    # workspace ingress and scoped to labeled workspaces in this namespace.
     - to:
         - podSelector:
             matchLabels:
@@ -73,6 +72,10 @@ spec:
       ports:
         - protocol: TCP
           port: 30022
+        {{- if include "srw.vmSameCluster" . }}
+        - protocol: TCP
+          port: 22
+        {{- end }}
     {{- with $network.extraEgress }}
     # Deployment-specific targets. Name the narrowest possible
     # namespace/CIDR and destination port.

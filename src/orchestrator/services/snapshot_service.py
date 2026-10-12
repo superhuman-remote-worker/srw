@@ -132,6 +132,28 @@ async def _joined_blocking_call(func, /, *args, **kwargs):
     return await joined_blocking_call(func, *args, **kwargs)
 
 
+# Credentials materialized in the workspace home: env connector files and
+# credential-file connector contents (both under ``.srw-credentials``; a
+# credential file's target path holds only a symlink into it, which a
+# snapshot keeps without the bytes), the managed-repository ssh-agent
+# namespace, the legacy external-repository key files, and each cloud
+# mount's rclone config (obscured, reversible password) and bearer token
+# files. Every attach or mount start writes them again from the dispatch
+# payload, so no restore needs them, and a snapshot must never become a
+# second copy of them. The rest of ``.ssh/``, the mount's helper script and
+# its VFS cache stay. GNU tar matches these unanchored, after any ``/`` of
+# the member name, and ``*`` also matches ``/``.
+CREDENTIAL_EXCLUDE_PATTERNS = (
+    "--exclude=.srw-credentials",
+    "--exclude=.ssh/srw-managed",
+    # The legacy key-file naming also excludes a user's own ~/.ssh/repo_* files.
+    "--exclude=.ssh/repo_*",
+    "--exclude=.cache/srw/rclone/*/rclone.conf",
+    "--exclude=.cache/srw/rclone/*/bearer.token*",
+    "--exclude=.cache/srw/rclone/*/.bearer.token.*",
+)
+
+
 def _snapshot_tar_pipeline(include_dirs: list[str], *, strict_terminal: bool) -> str:
     """Build the remote archive pipeline used by workspace snapshots.
 
@@ -149,6 +171,7 @@ def _snapshot_tar_pipeline(include_dirs: list[str], *, strict_terminal: bool) ->
         "--exclude=node_modules/.cache",
         "--exclude=*/lost+found",
         "--exclude=*/node_modules/*",
+        *CREDENTIAL_EXCLUDE_PATTERNS,
     ]
     if not strict_terminal:
         exclude_patterns.extend(
@@ -904,6 +927,7 @@ class SnapshotService:
                 # Workspace content re-cloned/regenerated on restore
                 "--exclude=*/repos/*",
                 "--exclude=*/node_modules/*",
+                *CREDENTIAL_EXCLUDE_PATTERNS,
             ]
             if strict_terminal:
                 # This is the sole durable copy of an emptyDir workspace.
@@ -2372,3 +2396,32 @@ class SnapshotService:
 
 # Module-level singleton
 snapshot_service = SnapshotService()
+
+
+async def snapshot_gc_sweeper(
+    shutdown_event: asyncio.Event, *, snapshots: SnapshotService
+) -> None:
+    """Background task that runs snapshot garbage collection daily.
+
+    Applies retention policies, soft-deletes expired snapshots, and
+    purges items past the 7-day grace period.
+    """
+    logger.info("Snapshot GC sweeper started")
+    gc_interval = 24 * 3600  # 24 hours
+
+    while not shutdown_event.is_set():
+        try:
+            if snapshots.is_available:
+                stats = await snapshots.run_gc()
+                if stats.get("soft_deleted") or stats.get("purged"):
+                    logger.info("Snapshot GC: %s", stats)
+        except Exception as e:
+            logger.error("Error in snapshot GC sweeper: %s", e)
+
+        try:
+            await asyncio.wait_for(shutdown_event.wait(), timeout=gc_interval)
+            break
+        except asyncio.TimeoutError:
+            pass
+
+    logger.info("Snapshot GC sweeper stopped")

@@ -102,4 +102,30 @@ describe('AdminDefaultsComponent search providers', () => {
         ?.textContent,
     ).toContain('runtime failover is suppressed');
   });
+
+  it('labels a pin the system chose until the admin picks another', () => {
+    const autoPin = {model: 'qwen3-reranker-8b', source: 'default' as const, managed_by_helm: false, helm_drift: false, auto_pinned: true};
+    helmManaged.set({
+      manifest: {systemApiKeys: [], systemEndpoints: [], models: [], defaults: []},
+      applied_at: null,
+      keys: [],
+      endpoints: [],
+      models: [],
+      defaults: {rerank: autoPin},
+    });
+    defaults.update((current) => ({...current, rerank: 'qwen3-reranker-8b'}));
+    const fixture = TestBed.createComponent(AdminDefaultsComponent);
+    fixture.detectChanges();
+    const hints = () => (fixture.nativeElement as HTMLElement).querySelectorAll('.default-hint');
+    expect(hints().length).toBe(1);
+    expect(hints()[0].textContent).toContain('Picked automatically');
+
+    // The selection moved off the auto pin: the label goes with it.
+    defaults.update((current) => ({...current, rerank: 'other-reranker'}));
+    fixture.detectChanges();
+    expect(hints().length).toBe(0);
+
+    helmManaged.set(null);
+    defaults.update((current) => ({...current, rerank: null}));
+  });
 });

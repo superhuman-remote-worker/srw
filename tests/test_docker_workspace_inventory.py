@@ -143,6 +143,9 @@ class _InventoryConnection:
                     "completion_outcome_kind": None,
                 }
             )
+        if sql.startswith("SELECT * FROM vm_job_creation_owners"):
+            # The inventory fixture represents Docker workspaces only.
+            return None
         if "AS workspace FROM threads" in sql:
             workspace = self.threads.get(str(args[0]))
             return (
@@ -188,14 +191,23 @@ class _InventoryConnection:
 
     async def fetch(self, query: str, *args):
         sql = _compact(query)
-        if "FROM completion_effects" in sql or sql.startswith(
-            "SELECT id FROM agents WHERE thread_id="
+        if (
+            "FROM completion_effects" in sql
+            or sql.startswith("SELECT id FROM agents WHERE thread_id=")
+            # delete_job revokes the Job's credential leases (C2) and its
+            # provider-minted credentials (C5): none here.
+            or sql.startswith("UPDATE connector_credential_leases")
+            or sql.startswith("UPDATE connector_minted_credentials")
         ):
             return []
         raise AssertionError(f"unexpected fetch: {sql}")
 
     async def fetchval(self, query: str, *args):
         sql = _compact(query)
+        if sql.startswith("SELECT EXISTS(SELECT 1 FROM vm_job_creation_owners"):
+            return False
+        if sql.startswith("SELECT jsonb_typeof(context->'vm')='object'"):
+            return False
         if "FROM managed_repository_process_zero_receipts" in sql:
             kind, owner_id, lease_id = args
             return (str(kind), str(owner_id), str(lease_id)) in (

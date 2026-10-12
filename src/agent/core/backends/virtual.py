@@ -31,7 +31,7 @@ import fnmatch
 import logging
 import posixpath
 
-from shared.runtime.core.workspace_backend import WorkspaceBackend
+from shared.runtime.core.workspace_backend import WorkspaceBackend, search_excludes
 from shared.runtime.core.backends.object_store import InMemoryObjectStore, ObjectStore
 
 logger = logging.getLogger(__name__)
@@ -387,12 +387,13 @@ class VirtualWorkspaceBackend(WorkspaceBackend):
         case_sensitive: bool = False,
         exclude_dirs: list[str] | None = None,
     ) -> list[dict]:
-        # Bounded content search (hydration guard): binary extensions skipped,
-        # per-file byte cap. Name/path search is implicit via list_dir.
+        # Bounded literal content search (hydration guard): binary extensions
+        # skipped, per-file byte cap. Name/path search is implicit via list_dir.
         if self.is_file(path):
             keys = [self._object_key(path)]
         else:
             keys = [info.key for info in self._store.list(self._dir_prefix(path))]
+        root = self._normalize_rel(path)
 
         needle = query if case_sensitive else query.lower()
         results: list[dict] = []
@@ -403,6 +404,11 @@ class VirtualWorkspaceBackend(WorkspaceBackend):
             ext = posixpath.splitext(name)[1].lower()
             if ext in _BINARY_SEARCH_EXTS:
                 continue
+            rel = self._strip_prefix(key)
+            # Keys were listed under root + "/"; a single-file root has nothing below.
+            below = rel[len(root) + 1 :] if root and rel.startswith(root + "/") else ""
+            if search_excludes(below if root else rel, exclude_dirs):
+                continue
             size = self._store.head(key)
             if size is None or size > self._search_file_bytes:
                 continue
@@ -410,7 +416,6 @@ class VirtualWorkspaceBackend(WorkspaceBackend):
                 content = self._store.get(key).decode("utf-8")
             except (UnicodeDecodeError, FileNotFoundError):
                 continue
-            rel = self._strip_prefix(key)
             for i, line in enumerate(content.splitlines(), 1):
                 hay = line if case_sensitive else line.lower()
                 if needle in hay:

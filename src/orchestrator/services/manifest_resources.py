@@ -6,7 +6,12 @@ from uuid import UUID, uuid4
 
 from fastapi import HTTPException
 
+from orchestrator.security.config_redaction import redact_public_config_override
 from orchestrator.security.crypto import encrypt
+from orchestrator.services.connector_secrets import (
+    CONNECTOR_SECRET_DETAIL,
+    is_connector_secret_name,
+)
 from orchestrator.services.datasource_policy_errors import (
     DatasourceMaterializationAuthorizationError,
     DatasourceProjectAuthorizationError,
@@ -32,6 +37,38 @@ class ManifestResourceService:
         self.admit_job = admit_job
         self.project_activation = project_activation
 
+    async def full_fidelity(self, row, user):
+        """Whether ``user`` reads ``row``'s stored document unredacted.
+
+        An admin, or the owner of the scope the resource lives in: the Account
+        itself, or the Project's owner role (a Project row answers to its
+        linked project, not the Account scope its document was authored in).
+        Export and re-apply need that fidelity. Every reader below owner — a
+        Project viewer or editor, a caller who only sees an Expert — gets the
+        view ``public_project`` serves, through the same redactor, because a
+        migrated project's documents carry its config override verbatim.
+        """
+        if user.get("is_admin"):
+            return True
+        if row["kind"] == "Project" and row.get("linked_id"):
+            scope = {"kind": "Project", "name": str(row["linked_id"])}
+        else:
+            scope = row["document"]["metadata"].get("scope") or {}
+        if scope.get("kind") == "Account":
+            return str(scope.get("name")) == str(user["id"])
+        if scope.get("kind") == "Project":
+            role = await self.db.get_user_role_in_project(
+                str(scope["name"]), str(user["id"])
+            )
+            return role == "owner"
+        return False
+
+    async def reader_view(self, row, user, **extra):
+        view = {**resource_view(row), **extra}
+        if not await self.full_fidelity(row, user):
+            view["resource"] = redact_public_config_override(view["resource"])
+        return view
+
     async def resolve(self, documents, user, *, request=None, default_scope=None):
         authority = ManifestAuthority(self.db, user, request=request)
         resolver = LiveManifestResolver(self.store, authority)
@@ -46,16 +83,22 @@ class ManifestResourceService:
             request=request,
             default_scope=default_scope,
         )
+        resolved = [
+            resolver.prepared[resource_key(doc)]["resolved"]
+            for doc in resolver.documents
+        ]
+        if not user.get("is_admin"):
+            # Resolution inlines every referenced stored resource after only a
+            # READ check, so a viewer's preview could carry another scope's
+            # override layers. The caller's own ``documents`` are unchanged.
+            resolved = [redact_public_config_override(doc) for doc in resolved]
         return {
             "apiVersion": API_VERSION,
             "operation": "preview",
             "resolution": "stored",
             "admissionReady": False,
             "documents": resolver.documents,
-            "resolved": [
-                resolver.prepared[resource_key(doc)]["resolved"]
-                for doc in resolver.documents
-            ],
+            "resolved": resolved,
             "dependencies": resolver.observed,
             "planRevision": resolver.plan_revision(default_scope),
             "pendingChecks": [
@@ -116,6 +159,10 @@ class ManifestResourceService:
                                 409, "An operation resource has since been deleted."
                             )
                         await authority.resource(current)
+                        if not await self.full_fidelity(current, user):
+                            item["resource"] = redact_public_config_override(
+                                item["resource"]
+                            )
                     return result
             resolver = await self.resolve(
                 documents, user, request=request, default_scope=default_scope
@@ -157,6 +204,19 @@ class ManifestResourceService:
                         422,
                         "Active team reconciliation is not available on this installation.",
                     )
+                if project_id not in resolver.authority.new_projects:
+                    # Connector defaults are the Project owner's (slice D3c).
+                    from orchestrator.services.project_connectors import (
+                        require_connector_defaults_authority,
+                    )
+
+                    await require_connector_defaults_authority(
+                        self.db,
+                        prepared["document"],
+                        user,
+                        project_id=project_id,
+                        previous=old_rows[resource_key(project)],
+                    )
                 if project_id in resolver.authority.new_projects:
                     await self.db.create_project(
                         project["metadata"]["name"],
@@ -192,6 +252,14 @@ class ManifestResourceService:
                         dependency["uid"] = str(identities[dependency["key"]])
                     if dependency not in dependencies:
                         dependencies.append(dependency)
+                if doc["kind"] == "Project":
+                    # What this person applied (slice D3c): later refreshes
+                    # tell their entries from it, the next apply compares to it.
+                    from orchestrator.services.project_connectors import (
+                        applied_dependency,
+                    )
+
+                    dependencies.append(applied_dependency(doc, user["id"]))
                 prepared["dependencies"] = dependencies
                 expected = expected_versions.get(key)
                 if manager_key and old:
@@ -242,6 +310,11 @@ class ManifestResourceService:
                 row, _ = saved[key]
                 prepared = resolver.prepared[key]
                 await sync_project_identity(self.db, row)
+                from orchestrator.services.project_workspace_defaults import (
+                    sync_manifest_defaults,
+                )
+
+                await sync_manifest_defaults(self.db, row)
                 if self.project_activation:
                     await self.project_activation(
                         prepared, user, request=request, validate_only=False
@@ -265,6 +338,29 @@ class ManifestResourceService:
                     row["revision"],
                 )
                 row["active_revision"] = row["revision"]
+                # A Project's connector entries are its links (slice D3c):
+                # link what it names, unlink what it dropped, then list any
+                # link it leaves out (its knowledge base, which stays).
+                from orchestrator.services.project_connector_defaults import (
+                    sync_manifest_connector_defaults,
+                )
+                from orchestrator.services.project_connectors import (
+                    refresh_project,
+                    sync_project_connector_links,
+                )
+
+                await sync_project_connector_links(
+                    self.db, row, user, previous=old_rows[key]
+                )
+                _, refreshed = await refresh_project(
+                    self.db, project_id, author=str(user["id"])
+                )
+                if refreshed is not None:
+                    row = refreshed
+                    saved[key] = (row, True)
+                await sync_manifest_connector_defaults(
+                    self.db, row, author=str(user["id"])
+                )
 
             executions = {}
             for key, (row, _) in saved.items():
@@ -321,14 +417,20 @@ class ManifestResourceService:
                 request_revision,
                 json.dumps(result),
             )
-            return result
+            return {
+                **result,
+                "resources": [
+                    await self.reader_view(row, user, changed=changed)
+                    for row, changed in saved.values()
+                ],
+            }
 
     async def get(self, resource_id, user, *, request=None):
         row = await self.store.by_id(resource_id)
         if not row:
             raise HTTPException(404, "Resource does not exist.")
         await ManifestAuthority(self.db, user, request=request).resource(row)
-        result = resource_view(row)
+        result = await self.reader_view(row, user)
         if row["kind"] == "Job":
             job = await self.db.fetchrow(
                 "SELECT j.id,j.status,j.error_message FROM srw_execution_specs s JOIN jobs j ON s.work_id=j.id WHERE s.resource_id=$1",
@@ -379,7 +481,7 @@ class ManifestResourceService:
                 if error.status_code in (403, 404):
                     continue
                 raise
-            visible.append(resource_view(row))
+            visible.append(await self.reader_view(row, user))
         return {"resources": visible}
 
     async def delete(self, resource_id, user, *, expected_version, request=None):
@@ -416,6 +518,10 @@ class ManifestResourceService:
         authority = ManifestAuthority(self.db, user, request=request)
         scope = await authority.scope(scope, write=True)
         await authority.secret(scope)
+        if is_connector_secret_name(name):
+            # A Connector's secret is written with its datasource row, and
+            # must stay what that row holds (connector_secrets).
+            raise HTTPException(409, CONNECTOR_SECRET_DETAIL)
         async with self.db.transaction_scope():
             await self.store.lock_catalog()
             old = await self.db.fetchrow(

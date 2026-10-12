@@ -46,16 +46,12 @@ def test_memory_and_remote_support_work_without_agent_runtime_imports():
                 )
                 from agent.services.memory.extraction_engine import MemoryExtractionEngine
 
-                schema = SummarizeTask("conversation", "summarize").output_schema
-                summary = schema(
-                    summary="retained",
-                    tasks_completed=[],
-                    key_decisions=[],
-                    current_state="running",
-                    identity_anchor={"agent_role": "worker"},
+                task = SummarizeTask(
+                    "conversation", "## Objective", prior_summary="retained"
                 )
-                assert summary.summary == "retained"
-                assert summary.identity_anchor.agent_role == "worker"
+                assert task.asks_for_sections
+                context = task.build_context()
+                assert "<prior-summary>" in context and "retained" in context
                 assert RemoteBackend is not None
                 assert MemoryExtractionEngine is not None
 

@@ -172,6 +172,8 @@ jobs:
             --build-arg "SRW_DOCUMENTATION_URL=${{ env.SRW_DOCUMENTATION_URL }}"
           )
           for T in "${TAGS[@]}"; do BUILD_ARGS+=(-t "$T"); done
+          STAGE1_INPUTS=$(python3 ../../scripts/vm_stage1_image.py)
+          BUILD_ARGS+=(--build-arg "SRW_STAGE1_INPUTS=${STAGE1_INPUTS}")
           docker build "${BUILD_ARGS[@]}" -f Dockerfile.containerDisk-stage1 .
           for T in "${TAGS[@]}"; do docker push "$T"; done
           printf 'Pushed stage1 [%s]:\n' "${{ matrix.ref }}"; printf '  %s\n' "${TAGS[@]}"

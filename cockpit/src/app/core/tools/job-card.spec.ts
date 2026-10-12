@@ -214,4 +214,11 @@ describe('job status vocabulary', () => {
         expect(effectiveJobStatus({status: 'failed'})).toBe('failed');
         expect(canResumeJob({status: 'failed'})).toBe(true);
     });
+
+    it('uses creation resume advice even for a paused or created job', () => {
+        expect(canResumeJob({status: 'failed', vm_creation: {resumable: false}})).toBe(false);
+        expect(canResumeJob({status: 'paused', vm_creation: {resumable: true}})).toBe(true);
+        expect(canResumeJob({status: 'created', vm_creation: {resumable: true}})).toBe(true);
+        expect(canResumeJob({status: 'cancelled', vm_creation: {resumable: true}})).toBe(false);
+    });
 });

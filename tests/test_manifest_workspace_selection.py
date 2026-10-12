@@ -122,7 +122,8 @@ def test_generic_settings_and_preference_do_not_select_a_workspace():
     resolved = preview_documents(
         [doc], default_scope={"kind": "Catalog", "name": "shared"}
     )["resolved"][0]
-    assert resolved["spec"]["execution"]["workspace"] is None
+    # Still omitted: only admission resolves it (the workspace defaults chain).
+    assert "workspace" not in resolved["spec"]["execution"]
     assert (
         resolved["spec"]["execution"]["expert"]["inline"]["runtime"]["config"]
         == selected["runtime"]["config"]
@@ -302,6 +303,55 @@ async def test_other_account_template_and_unsupported_recipes_fail_before_creati
     assert unsupported.value.status_code == 422
     assert await database.fetchval("SELECT count(*) FROM jobs") == 0
     assert await database.fetchval("SELECT count(*) FROM threads") == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "workspace,message",
+    [
+        (
+            {
+                "template": {
+                    "inline": {
+                        "backend": "virtual",
+                        "environment": {"image": "registry.example/x:1"},
+                    }
+                }
+            },
+            "Virtual workspaces do not support OS images",
+        ),
+        (
+            {
+                "template": {
+                    "inline": {
+                        "backend": "sandbox",
+                        "resources": {"memory": "1Gi", "requests": {"memory": "2Gi"}},
+                    }
+                }
+            },
+            "Resource request exceeds its limit.",
+        ),
+        (
+            {"template": {"inline": {"backend": "none", "resources": {"cpu": 1}}}},
+            "workspace must be null or a manifest template/instanceRef binding",
+        ),
+    ],
+)
+async def test_invalid_template_selection_is_a_client_error(
+    database, actor, workspace, message
+):
+    """The resolver's and the binding schema's refusals are 422s, never 500s."""
+    with pytest.raises(HTTPException) as refused:
+        await select_execution_workspace(
+            database,
+            actor,
+            role="worker",
+            project_id=None,
+            workspace=workspace,
+            supplied=True,
+        )
+    assert refused.value.status_code == 422
+    assert message in refused.value.detail
 
 
 @pytest.mark.asyncio

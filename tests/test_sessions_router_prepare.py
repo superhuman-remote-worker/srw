@@ -563,6 +563,181 @@ async def test_do_prepare_emits_phases_for_warm_thread(monkeypatch, metadata):
     assert observed_ready["require_protected_cloud"] is False
 
 
+@pytest.mark.asyncio
+async def test_prepare_keeps_exact_vm_wait_then_accepts_active_ready(monkeypatch):
+    """The shared observer lets /prepare outlast 960 s and accept real Ready."""
+    import asyncio
+
+    from orchestrator.routers import sessions as sessions_mod
+    from orchestrator.services import session_lifecycle as lifecycle
+
+    monkeypatch.setenv("VM_WS_READY_TIMEOUT_S", "960")
+    clock = {"now": 0.0}
+    loop = asyncio.get_running_loop()
+    monkeypatch.setattr(loop, "time", lambda: clock["now"])
+    original_sleep = asyncio.sleep
+
+    async def advance(_seconds):
+        clock["now"] += 30.0
+        await original_sleep(0)
+
+    monkeypatch.setattr(lifecycle.asyncio, "sleep", advance)
+    initial = {
+        **_connection_thread(),
+        "metadata": {"config_override": {"workspace": {"backend": "vm"}}},
+    }
+    db = AsyncMock()
+    db.get_thread = AsyncMock(
+        side_effect=lambda _tid: {
+            **initial,
+            "status": "active" if clock["now"] >= 1860 else "created",
+        }
+    )
+    db.get_pinned_session_binding.return_value = _connection_binding()
+    lock_cm = AsyncMock()
+    lock_cm.__aenter__.return_value = None
+    lock_cm.__aexit__.return_value = False
+    db.thread_advisory_lock = MagicMock(return_value=lock_cm)
+    ports = _fake_main(db)
+    ports.session_router = AsyncMock()
+    source = {
+        "contract_version": 1,
+        "phase": "resource_wait",
+        "request_id": "66666666-6666-4666-8666-666666666666",
+        "provision_generation": "77777777-7777-4777-8777-777777777777",
+        "runtime_generation": CONNECTION_GENERATION,
+    }
+
+    async def startup_view(thread, *, store):
+        assert store is db
+        if thread["status"] == "active":
+            return None
+        if clock["now"] < 1830:
+            return source
+        return {**source, "phase": "admitted", "admission_elapsed_s": 30.0}
+
+    async def probe(*_args, **_kwargs):
+        return clock["now"] >= 1860
+
+    monkeypatch.setattr(lifecycle, "initial_vm_startup_view", startup_view)
+    monkeypatch.setattr(lifecycle, "probe_ready", probe)
+    events = []
+    monkeypatch.setattr(
+        sessions_mod,
+        "lifecycle_emit",
+        lambda _uid, _tid, state, **_extra: events.append(state),
+    )
+    await sessions_mod._do_prepare(
+        thread_id=CONNECTION_THREAD_ID,
+        user_id="u1",
+        config_name="session_base",
+        config_override=None,
+        runtime_authority=sessions_mod.ThreadRuntimeAuthority(
+            CONNECTION_THREAD_ID, CONNECTION_GENERATION
+        ),
+        dependencies=ports.dependencies,
+    )
+    assert clock["now"] >= 1860
+    assert events == ["provisioning", "booting", "ready"]
+
+
+@pytest.mark.asyncio
+async def test_prepare_drops_timeout_for_rotated_physical_binding(monkeypatch):
+    from dataclasses import replace
+
+    from orchestrator.routers import sessions as sessions_mod
+
+    db = AsyncMock()
+    db.get_thread.return_value = _connection_thread()
+    db.get_pinned_session_binding.side_effect = [
+        _connection_binding(),
+        replace(_connection_binding(), pod_ip="10.0.0.99"),
+    ]
+    lock_cm = AsyncMock()
+    lock_cm.__aenter__.return_value = None
+    lock_cm.__aexit__.return_value = False
+    db.thread_advisory_lock = MagicMock(return_value=lock_cm)
+    ports = _fake_main(db)
+    monkeypatch.setattr(sessions_mod, "wait_for_ready", AsyncMock(return_value=False))
+    events = []
+    monkeypatch.setattr(
+        sessions_mod,
+        "lifecycle_emit",
+        lambda _uid, _tid, state, **_extra: events.append(state),
+    )
+    await sessions_mod._do_prepare(
+        thread_id=CONNECTION_THREAD_ID,
+        user_id="u1",
+        config_name="session_base",
+        config_override=None,
+        runtime_authority=sessions_mod.ThreadRuntimeAuthority(
+            CONNECTION_THREAD_ID, CONNECTION_GENERATION
+        ),
+        dependencies=ports.dependencies,
+    )
+    assert events == ["provisioning", "booting"]
+
+
+@pytest.mark.parametrize("mutation_phase", ["post_ready", "post_route"])
+@pytest.mark.asyncio
+async def test_do_prepare_end_intent_fences_route_and_ready(
+    monkeypatch,
+    mutation_phase,
+):
+    from orchestrator.routers import sessions as sessions_mod
+
+    db = AsyncMock()
+    thread = _connection_thread()
+    db.get_thread.return_value = thread
+    db.get_pinned_session_binding.return_value = _connection_binding()
+    lock_cm = AsyncMock()
+    lock_cm.__aenter__.return_value = None
+    lock_cm.__aexit__.return_value = False
+    db.thread_advisory_lock = MagicMock(return_value=lock_cm)
+    fake_main = _fake_main(db)
+
+    async def ready_probe(*_args, **_kwargs):
+        if mutation_phase == "post_ready":
+            thread["pinned_idle_terminal_intent_at"] = "end-intent"
+        return True
+
+    async def ensure_route(**_kwargs):
+        if mutation_phase == "post_route":
+            thread["pinned_idle_terminal_intent_at"] = "end-intent"
+
+    monkeypatch.setattr(sessions_mod, "wait_for_ready", ready_probe)
+    fake_main.session_router = MagicMock()
+    fake_main.session_router.ensure_route = AsyncMock(side_effect=ensure_route)
+    fake_main.session_router.teardown_route = AsyncMock(return_value=True)
+    emitted = []
+    monkeypatch.setattr(
+        sessions_mod,
+        "lifecycle_emit",
+        lambda _uid, _tid, state, **_extra: emitted.append(state),
+    )
+    assert (
+        await sessions_mod._do_prepare(
+            thread_id=CONNECTION_THREAD_ID,
+            user_id="u1",
+            config_name="session_base",
+            config_override=None,
+            runtime_authority=sessions_mod.ThreadRuntimeAuthority(
+                thread_id=CONNECTION_THREAD_ID,
+                generation=CONNECTION_GENERATION,
+            ),
+            dependencies=fake_main.dependencies,
+        )
+        is None
+    )
+    assert emitted == ["provisioning", "booting"]
+    if mutation_phase == "post_ready":
+        fake_main.session_router.ensure_route.assert_not_awaited()
+        fake_main.session_router.teardown_route.assert_not_awaited()
+    else:
+        fake_main.session_router.ensure_route.assert_awaited_once()
+        fake_main.session_router.teardown_route.assert_awaited_once()
+
+
 @pytest.mark.parametrize("mutation_phase", ["post_ready", "post_route"])
 @pytest.mark.parametrize(
     "changed_binding",
@@ -722,6 +897,59 @@ async def test_do_prepare_cleans_partial_route_on_every_exception(
         expected_runtime_generation=CONNECTION_GENERATION,
         expected_owner_uid=CONNECTION_POD_UID,
     )
+
+
+@pytest.mark.asyncio
+async def test_do_prepare_does_not_teardown_sibling_after_failed_atomic_pod_patch(
+    monkeypatch,
+):
+    from orchestrator.routers import sessions as sessions_mod
+    from orchestrator.services.session_router import SessionRouteAuthorityError
+
+    original = _connection_binding()
+    db = AsyncMock()
+    db.get_thread.return_value = _connection_thread()
+    db.get_pinned_session_binding.side_effect = [original, original]
+    lock_cm = AsyncMock()
+    lock_cm.__aenter__.return_value = None
+    lock_cm.__aexit__.return_value = False
+    db.thread_advisory_lock = MagicMock(return_value=lock_cm)
+    fake_main = _fake_main(db)
+    monkeypatch.setattr(
+        sessions_mod, "wait_for_ready", AsyncMock(return_value=True), raising=True
+    )
+    error = SessionRouteAuthorityError(
+        "session Pod changed before route publication", no_route_effect=True
+    )
+    fake_main.session_router = MagicMock()
+    fake_main.session_router.ensure_route = AsyncMock(side_effect=error)
+    fake_main.session_router.teardown_route = AsyncMock(return_value=True)
+    emitted: list[dict] = []
+    monkeypatch.setattr(
+        sessions_mod,
+        "lifecycle_emit",
+        lambda _uid, _tid, state, **extra: emitted.append({"state": state, **extra}),
+        raising=True,
+    )
+
+    await sessions_mod._do_prepare(
+        thread_id=CONNECTION_THREAD_ID,
+        user_id="u1",
+        config_name="persistent_defaults",
+        config_override=None,
+        runtime_authority=sessions_mod.ThreadRuntimeAuthority(
+            thread_id=CONNECTION_THREAD_ID,
+            generation=CONNECTION_GENERATION,
+        ),
+        dependencies=fake_main.dependencies,
+    )
+
+    fake_main.session_router.teardown_route.assert_not_awaited()
+    assert [event["state"] for event in emitted] == [
+        "provisioning",
+        "booting",
+        "failed",
+    ]
 
 
 @pytest.mark.asyncio
@@ -1287,6 +1515,43 @@ def test_connection_returns_ws_url_and_token_when_ready(
     )
 
 
+def test_pinned_connection_without_token_service_refuses_before_route_mutation(
+    monkeypatch,
+):
+    """A Ready pinned session cannot create a route when tokens are unavailable."""
+    from orchestrator.routers import sessions as sessions_mod
+
+    _install_fake_auth(monkeypatch)
+    fake_db = AsyncMock()
+    fake_db.get_thread.return_value = _connection_thread()
+    fake_db.get_pinned_session_binding.return_value = _connection_binding()
+    fake_main = _fake_main(fake_db)
+    fake_main.session_tokens = None
+    fake_main.session_router.ensure_route = AsyncMock()
+    fake_main.session_router.teardown_route = AsyncMock()
+    probe = AsyncMock(return_value=True)
+    monkeypatch.setattr(sessions_mod, "probe_ready", probe, raising=True)
+
+    fastapi_app = FastAPI()
+    fastapi_app.state.sessions_dependencies_factory = lambda: fake_main.dependencies
+    fastapi_app.include_router(sessions_mod.router)
+    response = TestClient(fastapi_app, raise_server_exceptions=False).get(
+        f"/api/sessions/{CONNECTION_THREAD_ID}/connection"
+    )
+
+    assert response.status_code == 503
+    assert response.json() == {
+        "detail": {
+            "code": "session_token_service_unavailable",
+            "message": "Session control is unavailable: configure SESSION_JWT_SECRET",
+        }
+    }
+    probe.assert_awaited_once()
+    assert fake_db.get_pinned_session_binding.await_count == 2
+    fake_main.session_router.ensure_route.assert_not_awaited()
+    fake_main.session_router.teardown_route.assert_not_awaited()
+
+
 @pytest.mark.parametrize("mutation_phase", ["post_probe", "post_route"])
 @pytest.mark.parametrize(
     "changed_binding",
@@ -1420,6 +1685,52 @@ def test_connection_cleans_partial_route_on_every_exception(
     )
 
 
+@pytest.mark.parametrize("no_route_effect", [False, True])
+def test_connection_preserves_sibling_after_failed_atomic_pod_patch(
+    monkeypatch, no_route_effect
+):
+    from orchestrator.routers import sessions as sessions_mod
+    from orchestrator.services.session_router import SessionRouteAuthorityError
+
+    fastapi_app = FastAPI()
+    _install_fake_auth(monkeypatch)
+    original = _connection_binding()
+    fake_db = AsyncMock()
+    fake_db.get_thread.return_value = _connection_thread()
+    fake_db.get_pinned_session_binding.side_effect = [original, original]
+    fake_main = _fake_main(fake_db)
+    monkeypatch.setattr(
+        sessions_mod, "probe_ready", AsyncMock(return_value=True), raising=True
+    )
+    fake_main.session_tokens = MagicMock()
+    fake_main.session_router = MagicMock()
+    fake_main.session_router.ensure_route = AsyncMock(
+        side_effect=SessionRouteAuthorityError(
+            "session Pod changed before route publication",
+            no_route_effect=no_route_effect,
+        )
+    )
+    fake_main.session_router.teardown_route = AsyncMock(return_value=True)
+    fastapi_app.state.sessions_dependencies_factory = lambda: fake_main.dependencies
+    fastapi_app.include_router(sessions_mod.router)
+
+    response = TestClient(fastapi_app).get(
+        f"/api/sessions/{CONNECTION_THREAD_ID}/connection"
+    )
+
+    assert response.status_code == 425
+    fake_main.session_tokens.mint.assert_not_called()
+    if no_route_effect:
+        fake_main.session_router.teardown_route.assert_not_awaited()
+    else:
+        fake_main.session_router.teardown_route.assert_awaited_once_with(
+            CONNECTION_THREAD_ID,
+            expected_namespace="srw",
+            expected_runtime_generation=CONNECTION_GENERATION,
+            expected_owner_uid=CONNECTION_POD_UID,
+        )
+
+
 @pytest.mark.parametrize(
     ("cleanup_failure", "message"),
     [
@@ -1534,6 +1845,7 @@ def test_connection_reports_stateless_ready_without_a_socket(monkeypatch):
         lane="stateless", agent_id=None
     )
     fake_main = _fake_main(fake_db)
+    fake_main.session_tokens = None
     fastapi_app.state.sessions_dependencies_factory = lambda: fake_main.dependencies
     fastapi_app.include_router(sessions_mod.router)
 
@@ -1551,12 +1863,13 @@ def test_connection_reports_stateless_ready_without_a_socket(monkeypatch):
         "pinned_runtime_generation_contract": 1,
         "session_runtime_generation": CONNECTION_GENERATION,
         # Declared per verb, never inferred from the lane: config edits ride
-        # the owner PATCH, the scalars + undo ride the control inbox, and the
-        # verbs with no stateless transport are ABSENT (not mapped to a
-        # socket that will never open).
+        # the owner PATCH, the scalars + undo + manual compaction ride the
+        # control inbox, and the verbs with no stateless transport are ABSENT
+        # (not mapped to a socket that will never open).
         "controls": {
             "config.update": "rest",
             "workspace.undo": "rest",
+            "compact": "rest",
             "mode.set": "rest",
             "narration.set": "rest",
         },
@@ -1627,9 +1940,14 @@ def test_stateless_controls_never_advertise_a_socket_verb():
     from orchestrator.routers.sessions import PINNED_CONTROLS, STATELESS_CONTROLS
 
     assert "websocket" not in STATELESS_CONTROLS.values()
-    for verb in ("compact", "archive", "rewind", "upgrade-to-workspace"):
+    for verb in ("archive", "rewind", "upgrade-to-workspace"):
         assert verb not in STATELESS_CONTROLS
         assert PINNED_CONTROLS[verb] == "websocket"
+    # Manual compaction exists on both lanes over different transports: the
+    # pinned socket verb, and the stateless control inbox (applied by the
+    # claimant's drain, session_slash_commands_and_stateless_compact.md §3).
+    assert PINNED_CONTROLS["compact"] == "websocket"
+    assert STATELESS_CONTROLS["compact"] == "rest"
     # Both lanes agree on the durable scalars.
     for verb in ("mode.set", "narration.set"):
         assert PINNED_CONTROLS[verb] == STATELESS_CONTROLS[verb] == "rest"

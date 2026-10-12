@@ -1,0 +1,15 @@
+[Unit]
+Description=SRW on-demand VM IDE
+After=network-online.target
+Wants=network-online.target
+
+# Deliberately no [Install] section: an authenticated owner access request
+# starts this user unit after exact VM/host-key attestation.  It never starts
+# automatically at guest boot and requires no privileged systemctl command.
+[Service]
+Type=simple
+ExecStart=/usr/bin/code-server --config /etc/code-server/config.yaml /home/agent-host/workspace
+Restart=on-failure
+RestartSec=2
+StandardOutput=journal
+StandardError=journal

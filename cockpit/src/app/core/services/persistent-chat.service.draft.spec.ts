@@ -127,6 +127,7 @@ function createService(opts: {
     (globalThis as any).WebSocket = MockWebSocketCtor;
 
     const mockNotifications: any = {
+        isConnected: signal(false),
         lifecycleEvent: signal<{thread_id: string; state: string; reason?: string} | null>(null),
         cloudDiffStagedEvent: signal(null),
     };
@@ -243,16 +244,45 @@ describe('PersistentChatService — instant-landing draft sessions', () => {
         expect(ctx.service.outbox().length).toBe(0);
     });
 
-    it('selects no connector defaults while the rollout capability is unavailable', async () => {
+    it("previews the work's own connectors while the rollout capability is unavailable", async () => {
+        // An omitted selection attaches the personal project's own (My cloud,
+        // the owner's outbox) and no other default; the server names them.
         const ctx = createService({
             policyAvailable: false,
             projects: [{id: 'p-def', is_default: true}],
-            datasourceIds: ['auto'],
+            datasourceIds: ['my-cloud', 'outbox'],
         });
         ctx.service.enterDraftSession();
         await flushTick();
 
         expect(ctx.mockHttp.post).toHaveBeenCalledWith(
+            expect.stringContaining('/persistent/threads/preview'),
+            {project_ids: ['p-def']},
+        );
+        expect(ctx.service.draftDatasourceIds()).toEqual(['my-cloud', 'outbox']);
+
+        // The create sends the reviewed ids, never an omission.
+        await ctx.service.sendMessage('hello');
+        await flushTick();
+        expect(createPosts(ctx)[0][1]).toEqual({
+            title: 'hello',
+            project_ids: ['p-def'],
+            datasource_ids: ['my-cloud', 'outbox'],
+        });
+    });
+
+    it('keeps an explicit empty selection when the user removed every connector', async () => {
+        const ctx = createService({
+            policyAvailable: false,
+            projects: [{id: 'p-def', is_default: true}],
+            datasourceIds: ['my-cloud'],
+        });
+        ctx.service.enterDraftSession();
+        await flushTick();
+        ctx.service.setDraftConnectorsEnabled(false);
+        await flushTick();
+
+        expect(ctx.mockHttp.post).toHaveBeenLastCalledWith(
             expect.stringContaining('/persistent/threads/preview'),
             {project_ids: ['p-def'], datasource_ids: []},
         );
@@ -366,7 +396,8 @@ describe('PersistentChatService — instant-landing draft sessions', () => {
     });
 
     it('shows a 400 refusal and retries the retained message once after changing workspace', async () => {
-        const detail = 'Repository and credential connectors require a sandbox or VM workspace';
+        const detail = 'Connectors that need a shell (repositories, credential and generic '
+            + 'environments, SSH keys) require a sandbox or VM workspace';
         const opts = {createFails: true, createError: new HttpErrorResponse({status: 400, error: {detail}})};
         const ctx = createService(opts);
         ctx.service.enterDraftSession();
@@ -376,16 +407,16 @@ describe('PersistentChatService — instant-landing draft sessions', () => {
         expect(ctx.service.error()).toBe(detail);
         expect(ctx.service.threadId()).toBeNull();
 
-        ctx.service.setDraftWorkspaceBackend('sandbox');
+        ctx.service.setDraftWorkspaceChoice({kind: 'ref', ref: {name: 'container-minimal', scope: {kind: 'Catalog', name: 'shared'}}, backend: 'sandbox', label: 'container-minimal'});
         await flushTick();
         expect(ctx.mockHttp.post).toHaveBeenCalledWith(
             expect.stringContaining('/persistent/threads/preview'),
-            {config_override: {workspace: {backend: 'sandbox'}}, use_datasource_defaults: true},
+            {workspace: {template: {ref: {name: 'container-minimal', scope: {kind: 'Catalog', name: 'shared'}}}}, use_datasource_defaults: true},
         );
         opts.createFails = false;
         await Promise.all([ctx.service.retryDraftSession(), ctx.service.retryDraftSession()]);
         expect(createPosts(ctx)).toHaveLength(2); // one refusal, one successful creation
-        expect(createPosts(ctx)[1][1]).toMatchObject({config_override: {workspace: {backend: 'sandbox'}}});
+        expect(createPosts(ctx)[1][1]).toMatchObject({workspace: {template: {ref: {name: 'container-minimal', scope: {kind: 'Catalog', name: 'shared'}}}}});
         expect(ctx.service.error()).toBeNull();
         expect(ctx.service.outbox().map(i => i.displayContent)).toEqual(['inspect my repository']);
         fireSseOpen(ctx.sseInstances[0]);
@@ -460,7 +491,7 @@ describe('PersistentChatService — instant-landing draft sessions', () => {
         ctx.mockHttp.post.mockReturnValueOnce(oldPreview).mockReturnValueOnce(newPreview);
         ctx.service.enterDraftSession();
         await flushTick();
-        ctx.service.setDraftWorkspaceBackend('sandbox');
+        ctx.service.setDraftWorkspaceChoice({kind: 'ref', ref: {name: 'container-minimal', scope: {kind: 'Catalog', name: 'shared'}}, backend: 'sandbox', label: 'container-minimal'});
         await flushTick();
         newPreview.next({project_ids: [], workspace_backend: 'sandbox', datasource_ids: ['repo']});
         await flushTick();
@@ -468,6 +499,18 @@ describe('PersistentChatService — instant-landing draft sessions', () => {
         await flushTick();
         expect(ctx.service.draftDatasourceIds()).toEqual(['repo']);
         expect(ctx.service.draftDefaultsLoading()).toBe(false);
+    });
+
+    it('flags a VM create from the picked tier', async () => {
+        const ctx = createService();
+        ctx.service.enterDraftSession();
+        await flushTick();
+        ctx.service.setDraftWorkspaceChoice({kind: 'inline', spec: {backend: 'vm'}});
+        await flushTick();
+        await ctx.service.sendMessage('hello');
+        await flushTick();
+        expect(createPosts(ctx)).toHaveLength(1);
+        expect(ctx.service.isVmSession()).toBe(true);
     });
 
     it('connecting to a real thread leaves draft mode', async () => {

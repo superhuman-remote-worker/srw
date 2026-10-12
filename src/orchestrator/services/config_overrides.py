@@ -22,6 +22,62 @@ from orchestrator.services.agent_pod_entrypoint import (
     InvalidConfigNameError,
     validate_config_name,
 )
+from shared.orch_surface.jobs._utils import transport_key_paths
+
+
+def refuse_caller_transport_keys(config_override: Any) -> None:
+    """422 if a caller-authored ``config_override`` pins transport/credentials.
+
+    The single write-boundary vocabulary — shared by REST job create, its
+    bypass layers (automations, bench) and any other funnel that hands a
+    caller-authored override to ``db.create_job`` / ``admit_job`` — mirroring
+    the MCP create tool (``shared.orch_surface.jobs.control``). Routing is
+    resolved server-side from the model ID and credentials are injected only
+    in-flight at dispatch, so a pinned ``base_url`` / ``api_key`` / ``env_keys``
+    (or ``*_api_key``) would otherwise have the deployment's stored key sent to
+    a caller-chosen endpoint. A self-hosted model is routed through its catalog
+    endpoint (Admin -> Models), never an inline transport key.
+    """
+    offending = transport_key_paths(config_override)
+    if offending:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "config_override may not set credential or transport keys ("
+                + ", ".join(sorted(offending))
+                + "). Routing is resolved server-side from the model ID — pass "
+                '{"llm": {"model": "<id>"}} and pin any custom endpoint in the '
+                "model catalog (Admin -> Models)."
+            ),
+        )
+
+
+EXECUTION_OWNED_WORKSPACE_KEYS = ("container", "sandbox")
+
+
+def refuse_execution_owned_workspace_keys(config_override: Any) -> None:
+    """422 if a caller-authored override sizes or images a container directly.
+
+    Container image and resources come only from the selected WorkspaceTemplate,
+    which admission validates and freezes. ``workspace.container`` was the old
+    unvalidated side door; ``workspace.sandbox`` is the template's rendered form.
+    """
+    workspace = (
+        config_override.get("workspace") if isinstance(config_override, dict) else None
+    )
+    if not isinstance(workspace, dict):
+        return
+    offending = [key for key in EXECUTION_OWNED_WORKSPACE_KEYS if key in workspace]
+    if offending:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                ", ".join(f"config_override.workspace.{key}" for key in offending)
+                + " are no longer supported. Put the image and resources in a "
+                "WorkspaceTemplate (environment.image, resources) and select it "
+                "with `workspace`."
+            ),
+        )
 
 
 def deep_merge_dicts(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:

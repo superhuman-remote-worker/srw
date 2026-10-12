@@ -37,6 +37,7 @@ from uuid import UUID
 
 from orchestrator.services.cloud.protected_reader_authority import (
     ProtectedNextcloudReaderGrantPlan,
+    readerless_protected_life,
 )
 from orchestrator.services.cloud_staging.source_identity import (
     ProtectedMountSourceIdentity,
@@ -161,21 +162,31 @@ def _retirement_stage_event_from_receipt(
             thread,
             row,
             require_current_revoked=True,
+        ) or bool(
+            # A life that minted no reader receipts zero even after its agent
+            # ran; the receipt names the earlier row Begin captured.
+            context.get("protected_cloud") is True
+            and str(thread.get("runtime_generation") or "")
+            == str(retirement.get("generation") or "")
+            and readerless_protected_life(
+                captured_ro,
+                row,
+                thread_id=str(context.get("thread_id") or ""),
+                runtime_generation=str(retirement.get("generation") or ""),
+            )
         )
-        captured_ro_is_never_delivered = bool(
+        names_captured_reader = bool(
             current_ro_proves_unpublished and isinstance(captured_ro, Mapping)
         )
         expected_mount_id = (
-            str(captured_ro.get("id")) if captured_ro_is_never_delivered else None
+            str(captured_ro.get("id")) if names_captured_reader else None
         )
         expected_attempt = (
-            str(captured_ro.get("engage_attempt"))
-            if captured_ro_is_never_delivered
-            else None
+            str(captured_ro.get("engage_attempt")) if names_captured_reader else None
         )
         captured_plan = (
             ProtectedNextcloudReaderGrantPlan.from_ro_mount_row(captured_ro)
-            if captured_ro_is_never_delivered
+            if names_captured_reader
             else None
         )
         expected_source_sha256 = (

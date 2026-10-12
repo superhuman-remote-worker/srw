@@ -1,0 +1,363 @@
+# Production operation from d7174c32a; used solely to rehearse legitimate pre-fix rows.
+async def release_session_attach_binding(
+    agent_id: str,
+    thread_id: str,
+    *,
+    expected_runtime_generation: str,
+    expected_attach_token: str,
+    pre_delivery: bool = False,
+    expected_agent_pod_uid: str | None = None,
+    local_runtime_quiesced: bool = False,
+    local_quiescence_protocol: str | None = None,
+    workspace_generation: str | None = None,
+    workspace_runtime_incarnation: str | None = None,
+    dependencies: SessionAttachBindingDependencies,
+) -> SessionAttachReleaseOutcome:
+    """Abort one exact failed attach before it can admit paid/user work.
+
+    Clearing pointers inside G1 is an ABA: the same pool process/thread pair
+    can recur and a delayed failure can then clear G2. Successful abort rotates
+    the thread generation and resets the monotonic exposure bit in one
+    proof-bearing transaction. ``pre_delivery`` is server-only and means the
+    HTTP payload never crossed; the agent route must instead present strict
+    process-zero proof bound to the captured physical workspace.
+    """
+
+    class _AttachAbortCASLost(RuntimeError):
+        pass
+
+    store = dependencies.store
+    warm_release_id: str | None = None
+    try:
+        async with store.acquire() as conn:
+            async with conn.transaction():
+                thread = await conn.fetchrow(
+                    "SELECT agent_id, status, metadata, runtime_generation, "
+                    "runtime_attach_token, runtime_retirement_token, "
+                    "runtime_authority_exposed FROM threads "
+                    "WHERE id = $1 FOR UPDATE",
+                    thread_id,
+                )
+                agent = await conn.fetchrow(
+                    "SELECT thread_id, current_job_id, status, agent_mode, hostname, pod_uid "
+                    "FROM agents "
+                    "WHERE id = $1 FOR UPDATE",
+                    agent_id,
+                )
+                prior = await conn.fetchrow(
+                    "SELECT successor_generation FROM "
+                    "thread_runtime_attach_abort_outcomes "
+                    "WHERE thread_id=$1::uuid AND runtime_generation=$2::uuid "
+                    "AND runtime_attach_token=$3::uuid AND agent_id=$4::uuid",
+                    thread_id,
+                    expected_runtime_generation,
+                    expected_attach_token,
+                    agent_id,
+                )
+                if prior is not None:
+                    return "already_detached"
+                # Everything below intentionally remains inside the same
+                # transaction as the two FOR UPDATE reads.  The generation
+                # rotation, reciprocal agent release, and durable outcome are
+                # one indivisible authority transition; a failure at any
+                # point rolls all three back.
+                thread_matches = bool(
+                    thread is not None
+                    and str(thread.get("agent_id") or "") == agent_id
+                    and str(thread.get("runtime_generation") or "")
+                    == expected_runtime_generation
+                    and str(thread.get("runtime_attach_token") or "")
+                    == expected_attach_token
+                    and thread.get("runtime_retirement_token") is None
+                )
+                agent_matches = bool(
+                    agent is not None and str(agent.get("thread_id") or "") == thread_id
+                )
+                if not thread_matches or not agent_matches:
+                    return "unsafe"
+                if (
+                    str(thread.get("status") or "") != "created"
+                    or thread.get("runtime_authority_exposed") is not True
+                    or agent.get("current_job_id") is not None
+                ):
+                    return "unsafe"
+                current_pod_uid = str(agent.get("pod_uid") or "")
+                if not current_pod_uid or (
+                    not pre_delivery
+                    and current_pod_uid != str(expected_agent_pod_uid or "")
+                ):
+                    return "unsafe"
+
+                metadata = thread.get("metadata") or {}
+                if isinstance(metadata, str):
+                    try:
+                        metadata = json.loads(metadata)
+                    except (TypeError, ValueError):
+                        return "unsafe"
+                if not isinstance(metadata, dict):
+                    return "unsafe"
+                updated_metadata = dict(metadata)
+                agent_pod_marker = metadata.get("agent_pod")
+                if agent_pod_marker not in (None, {}):
+                    if not (
+                        isinstance(agent_pod_marker, dict)
+                        and str(agent_pod_marker.get("pod_name") or "")
+                        == str(agent.get("hostname") or "")
+                        and str(agent_pod_marker.get("pod_uid") or "")
+                        == current_pod_uid
+                    ):
+                        return "unsafe"
+                    # The exact G1 Pod is released back to its agent-side
+                    # lifecycle; it is not G2 thread authority. Clear only
+                    # the marker proven reciprocal to the captured agent in
+                    # this same rotation transaction—never UID-delete it.
+                    updated_metadata.pop("agent_pod", None)
+                # Dedicated actors advertise booting/ready before setup. Only
+                # their exact protected create-intent Pod plus a monotonic
+                # pre-setup proof may release that delivered life. Other status
+                # mismatches still refuse; zero-admission is repeated below.
+                observed_status = str(agent.get("status") or "")
+                dedicated_pre_setup = bool(
+                    not pre_delivery
+                    and local_runtime_quiesced
+                    and local_quiescence_protocol == "agent_attach_not_started_v1"
+                    and observed_status in {"booting", "ready"}
+                    and str(agent.get("agent_mode") or "") == "persistent"
+                    and isinstance(agent_pod_marker, dict)
+                    and agent_pod_marker.get("protection_protocol") == "finalizer_v1"
+                    and str(agent_pod_marker.get("runtime_generation") or "")
+                    == expected_runtime_generation
+                    and not agent_pod_marker.get("warm_binding_protection")
+                )
+                if dedicated_pre_setup:
+                    # Provisioner ownership lives in the immutable create
+                    # intent, not in the published Pod marker.
+                    dedicated_pre_setup = bool(
+                        await conn.fetchval(
+                            "SELECT EXISTS (SELECT 1 FROM thread_agent_pod_provision_intents "
+                            "WHERE attempt_id::text=$1 AND thread_id=$2::uuid "
+                            "AND runtime_generation=$3::uuid AND provisioner='persistent' "
+                            "AND status='published' AND pod_name=$4 AND pod_uid=$5 "
+                            "AND namespace=$6 AND protection_protocol='finalizer_v1')",
+                            str(agent_pod_marker.get("provision_attempt") or ""),
+                            thread_id,
+                            expected_runtime_generation,
+                            str(agent.get("hostname") or ""),
+                            current_pod_uid,
+                            str(agent_pod_marker.get("namespace") or ""),
+                        )
+                    )
+                if observed_status != "session" and not dedicated_pre_setup:
+                    return "unsafe"
+                warm_binding = None
+                if isinstance(agent_pod_marker, dict) and str(
+                    agent_pod_marker.get("warm_binding_protection") or ""
+                ):
+                    try:
+                        warm_release_id = str(
+                            UUID(str(agent_pod_marker.get("warm_binding_protection")))
+                        )
+                    except (TypeError, ValueError):
+                        return "unsafe"
+                    warm_binding = await conn.fetchrow(
+                        "SELECT * FROM "
+                        "thread_agent_warm_binding_protections "
+                        "WHERE protection_id=$1::uuid FOR UPDATE",
+                        warm_release_id,
+                    )
+                    if not (
+                        warm_binding is not None
+                        and str(warm_binding["status"]) == "bound"
+                        and str(warm_binding["source"]) == "attach"
+                        and str(warm_binding["thread_id"]) == thread_id
+                        and str(warm_binding["runtime_generation"])
+                        == expected_runtime_generation
+                        and str(warm_binding["runtime_attach_token"])
+                        == expected_attach_token
+                        and str(warm_binding["agent_id"]) == agent_id
+                        and str(warm_binding["pod_name"])
+                        == str(agent.get("hostname") or "")
+                        and str(warm_binding["pod_uid"]) == current_pod_uid
+                        and str(warm_binding["namespace"])
+                        == str(agent_pod_marker.get("namespace") or "")
+                    ):
+                        return "unsafe"
+                config = metadata.get("config_override") or {}
+                workspace_cfg = (
+                    config.get("workspace") if isinstance(config, dict) else {}
+                )
+                backend = (
+                    str(
+                        (workspace_cfg or {}).get("backend")
+                        if isinstance(workspace_cfg, dict)
+                        else ""
+                    )
+                    or "sandbox"
+                )
+                ws = metadata.get("workspace_container") or {}
+                binding = metadata.get("_workspace_binding") or {}
+                if not isinstance(ws, dict) or not isinstance(binding, dict):
+                    return "unsafe"
+                captured_workspace_generation = str(binding.get("generation") or "")
+                captured_workspace_runtime = str(
+                    (
+                        ws.get("_docker_workspace_lease_id")
+                        if ws.get("provisioner") == "docker"
+                        else ws.get(WORKSPACE_RUNTIME_INCARNATION_KEY)
+                    )
+                    or ""
+                )
+                if bool(captured_workspace_generation) != bool(
+                    captured_workspace_runtime
+                ):
+                    return "unsafe"
+                if pre_delivery:
+                    release_kind = "server_pre_delivery"
+                    proof_protocol = "pre_delivery_no_payload_v1"
+                else:
+                    if not local_runtime_quiesced:
+                        return "unsafe"
+                    release_kind = "process_zero"
+                    if local_quiescence_protocol == "agent_attach_not_started_v1":
+                        # The dual agent may reject the delivered claim before
+                        # its monotonic setup-started latch flips (for example,
+                        # runtime-actor bind refusal).  No session/backend/task
+                        # exists to run workspace cleanup yet. The agent route
+                        # owns that one-way local latch; the DB additionally
+                        # proves this G admitted no input/control authority.
+                        proof_protocol = "agent_attach_not_started_v1"
+                    elif backend == "sandbox" and captured_workspace_generation:
+                        proof_protocol = "workspace_process_zero_v1"
+                    elif backend in {"sandbox", "virtual", "none"} and not (
+                        captured_workspace_generation or captured_workspace_runtime
+                    ):
+                        proof_protocol = "agent_runtime_zero_v1"
+                    else:
+                        # VM/remote cleanup requires the orchestrator's exact
+                        # actuator stop/snapshot proof, never an agent assertion.
+                        return "unsafe"
+                    if local_quiescence_protocol != proof_protocol:
+                        return "unsafe"
+                    if str(workspace_generation or "") != captured_workspace_generation:
+                        return "unsafe"
+                    if (
+                        str(workspace_runtime_incarnation or "")
+                        != captured_workspace_runtime
+                    ):
+                        return "unsafe"
+
+                admitted_input = await conn.fetchval(
+                    "SELECT EXISTS (SELECT 1 FROM thread_input_deliveries "
+                    "WHERE thread_id=$1::uuid AND owner_agent_id=$2::uuid "
+                    "AND owner_pod_uid=$3 "
+                    "AND (state IN ('admitted','settled') OR "
+                    "($4::boolean AND state IN ('owned','queued'))))",
+                    thread_id,
+                    agent_id,
+                    current_pod_uid,
+                    proof_protocol == "agent_attach_not_started_v1",
+                )
+                admitted_control = await conn.fetchval(
+                    "SELECT EXISTS (SELECT 1 FROM thread_control_requests "
+                    "WHERE thread_id=$1::uuid AND runtime_generation=$2::uuid)",
+                    thread_id,
+                    expected_runtime_generation,
+                )
+                if admitted_input or admitted_control:
+                    return "unsafe"
+
+                successor_generation = str(uuid4())
+                receipt = {
+                    "version": 1,
+                    "runtime_generation": expected_runtime_generation,
+                    "successor_generation": successor_generation,
+                    "agent_id": agent_id,
+                    "runtime_attach_token": expected_attach_token,
+                    "agent_pod_uid": current_pod_uid,
+                    "release_kind": release_kind,
+                    "quiescence_protocol": proof_protocol,
+                    "workspace_generation": captured_workspace_generation or None,
+                    "workspace_runtime_incarnation": (
+                        captured_workspace_runtime or None
+                    ),
+                }
+                if warm_binding is not None:
+                    releasing = await conn.execute(
+                        "UPDATE thread_agent_warm_binding_protections SET "
+                        "status='releasing',"
+                        "release_started_at=transaction_timestamp() "
+                        "WHERE protection_id=$1::uuid AND status='bound'",
+                        warm_release_id,
+                    )
+                    if releasing != "UPDATE 1":
+                        raise _AttachAbortCASLost
+                thread_updated = await conn.execute(
+                    "UPDATE threads SET agent_id=NULL, runtime_attach_token=NULL, "
+                    "control_admission_agent_id=NULL, "
+                    "runtime_generation=$5::uuid, runtime_authority_exposed=false, "
+                    "runtime_attach_abort_receipt=$6::jsonb, metadata=$7::jsonb "
+                    "WHERE id=$1::uuid AND agent_id=$2::uuid "
+                    "AND status='created' AND runtime_generation=$3::uuid "
+                    "AND runtime_attach_token=$4::uuid "
+                    "AND runtime_retirement_token IS NULL",
+                    thread_id,
+                    agent_id,
+                    expected_runtime_generation,
+                    expected_attach_token,
+                    successor_generation,
+                    json.dumps(receipt, sort_keys=True, separators=(",", ":")),
+                    json.dumps(updated_metadata, sort_keys=True, separators=(",", ":")),
+                )
+                agent_updated = await conn.execute(
+                    "UPDATE agents SET thread_id=NULL, status=$4 "
+                    "WHERE id=$1::uuid AND thread_id=$2::uuid "
+                    "AND pod_uid=$3 AND current_job_id IS NULL AND status::text=$5",
+                    agent_id,
+                    thread_id,
+                    current_pod_uid,
+                    "draining" if warm_binding is not None else "ready",
+                    observed_status,
+                )
+                if thread_updated != "UPDATE 1" or agent_updated != "UPDATE 1":
+                    raise _AttachAbortCASLost
+                outcome_inserted = await conn.execute(
+                    "INSERT INTO thread_runtime_attach_abort_outcomes ("
+                    "thread_id, runtime_generation, runtime_attach_token, "
+                    "agent_id, agent_pod_uid, successor_generation, release_kind, "
+                    "quiescence_protocol, workspace_generation, "
+                    "workspace_runtime_incarnation) VALUES ("
+                    "$1::uuid,$2::uuid,$3::uuid,$4::uuid,$5,$6::uuid,$7,$8,"
+                    "$9::uuid,$10::uuid) ON CONFLICT DO NOTHING",
+                    thread_id,
+                    expected_runtime_generation,
+                    expected_attach_token,
+                    agent_id,
+                    current_pod_uid,
+                    successor_generation,
+                    release_kind,
+                    proof_protocol,
+                    captured_workspace_generation or None,
+                    captured_workspace_runtime or None,
+                )
+                if outcome_inserted != "INSERT 0 1":
+                    raise _AttachAbortCASLost
+        if warm_release_id is not None:
+            try:
+                await dependencies.release_pinned_warm_binding_protection(
+                    store,
+                    protection_id=warm_release_id,
+                    agent_provisioner=dependencies.agent_provisioner,
+                    persistent_provisioner=dependencies.persistent_provisioner,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception(
+                    "Warm Pod finalizer release remains durable after attach "
+                    "abort (thread=%s protection=%s)",
+                    thread_id,
+                    warm_release_id,
+                )
+        return "released"
+    except _AttachAbortCASLost:
+        return "unsafe"

@@ -45,6 +45,8 @@ from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable, Mapping
 from uuid import uuid4
 
+from shared.content_redaction import sanitize_text
+
 logger = logging.getLogger(__name__)
 
 
@@ -418,6 +420,11 @@ async def notify_loop_event(
     owner_id = loop.get("owner_id")
     if not owner_id:
         return
+    # Loop agents write these (a KB note title, a job's error) — audit OC-05.
+    # Redacted before the replay bound cuts them, and deterministically, so a
+    # durable replay still renders byte-identical text.
+    subject = sanitize_text(subject)
+    message = sanitize_text(message)
     loop_id = str(loop.get("id") or "")
     project_id = str(loop.get("project_id")) if loop.get("project_id") else None
     if dedup_turn_identity is not None:

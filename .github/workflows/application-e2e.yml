@@ -48,6 +48,8 @@ jobs:
         with:
           persist-credentials: false
 
+      - uses: ./.github/actions/docker-hub-mirror
+
       - name: Free disk space on hosted fallback
         if: runner.environment == 'github-hosted'
         run: |

@@ -63,19 +63,38 @@ def canonical_key(key: str) -> str:
 # Credential surfaces that must NEVER come from user content (decision 10).
 _DENY_KEYS = {"apikey", "apikeys", "envkeys"}
 _DENY_PATHS = {("connections",), ("workspace", "remote")}
+# Endpoint keys authored config must NOT pin: routing lives in the model
+# catalog (Admin -> Models), and an inline base_url would pair a stored key
+# with a chosen host at dispatch. Matched by canonical suffix so every alias a
+# reader consults is covered (base_url, {PREFIX}_BASE_URL, CITATION_LLM_URL).
+# Guarded by value: a bundled ``base_url: null`` (expert_base.yaml) is "use the
+# default" and stays legal.
+_DENY_ENDPOINT_SUFFIXES = ("baseurl", "url")
+# Any credential-bearing key, not only the bare ``api_key`` block: a nested
+# ``citation_llm_api_key`` is as much a secret as ``api_key`` itself.
+_DENY_KEY_SUFFIXES = ("apikey",)
+
+
+def _is_denied_key(canonical: str, value: Any) -> bool:
+    if canonical in _DENY_KEYS or canonical.endswith(_DENY_KEY_SUFFIXES):
+        return True
+    # Endpoint keys deny only a concrete host (null/empty = "use the default").
+    if canonical.endswith(_DENY_ENDPOINT_SUFFIXES) and value not in (None, ""):
+        return True
+    return False
 
 
 def hard_deny_scan(config: Any, _path: tuple[str, ...] = ()) -> list[str]:
-    """Return dotted paths of any credential key present in a fragment. Empty
-    list = clean. Recurses objects AND list elements (a credential can hide in a
-    list of dicts)."""
+    """Return dotted paths of any credential/transport key present in a
+    fragment. Empty list = clean. Recurses objects AND list elements (a
+    credential can hide in a list of dicts)."""
     offending: list[str] = []
     if isinstance(config, dict):
         for raw_key, value in config.items():
             ck = canonical_key(str(raw_key))
             path = _path + (str(raw_key),)
             canon_path = tuple(canonical_key(p) for p in path)
-            if ck in _DENY_KEYS or canon_path in _DENY_PATHS:
+            if _is_denied_key(ck, value) or canon_path in _DENY_PATHS:
                 offending.append(".".join(path))
             offending.extend(hard_deny_scan(value, path))
     elif isinstance(config, list):

@@ -25,6 +25,21 @@ SRW_ADAPTER = "srw/v1"
 SNAPSHOT_FORMAT = "srw/resolved-config-v1"
 
 
+class ExecutionGrantDenied(HTTPException):
+    """The rendered policy exceeds the runner's grants.
+
+    Wire-identical to the plain 422 every caller already handles; the
+    violations stay structured for callers that must name the missing grants
+    (job admission's default-expert preview).
+    """
+
+    def __init__(self, violations: list[str]):
+        from orchestrator.services.grant_enforcement import grant_violations_detail
+
+        super().__init__(422, grant_violations_detail(violations))
+        self.violations = list(violations)
+
+
 def object_value(value: Any) -> dict[str, Any]:
     if isinstance(value, str):
         value = json.loads(value)
@@ -208,7 +223,6 @@ async def prepare_srw_snapshot(
         seed_registry_model_overrides,
     )
     from orchestrator.services.grant_enforcement import (
-        grant_violations_detail,
         resolve_runner_grants,
         user_experts_enabled,
     )
@@ -365,7 +379,7 @@ async def prepare_srw_snapshot(
         if grants is not None:
             violations = evaluate(policy, grants)
             if violations:
-                raise HTTPException(422, grant_violations_detail(violations))
+                raise ExecutionGrantDenied(violations)
     dependencies = []
     if (expert or {}).get("project_dependency"):
         dependencies.append(deepcopy(expert["project_dependency"]))
@@ -580,16 +594,21 @@ async def prepare_srw_session_patch(
             .get("backend", "none")
         )
 
-    if backend_of(old_workspace) == backend_of(new_workspace):
-        _, old_policy = srw_snapshot_config(current)
-        if (policy.get("workspace") or {}).get("vm") != (
+    # Checked on every patch, whatever the backend transition: only admission
+    # validates these blocks, so a tier change may bind a bare backend only.
+    _, old_policy = srw_snapshot_config(current)
+    captured_messages = {
+        "vm": "Session settings cannot change the captured VM image or "
+        "resources; create a new session with the selected workspace.",
+        "sandbox": "Session settings cannot change the captured container "
+        "image or resources; create a new session with the selected workspace.",
+    }
+    for captured, message in captured_messages.items():
+        if (policy.get("workspace") or {}).get(captured) != (
             old_policy.get("workspace") or {}
-        ).get("vm"):
-            raise HTTPException(
-                422,
-                "Session settings cannot change the captured VM image or resources; "
-                "create a new session with the selected workspace.",
-            )
+        ).get(captured):
+            raise HTTPException(422, message)
+    if backend_of(old_workspace) == backend_of(new_workspace):
         for key in ("document", "resolved"):
             prepared[key]["spec"]["execution"]["workspace"] = deepcopy(
                 current[key]["spec"]["execution"]["workspace"]

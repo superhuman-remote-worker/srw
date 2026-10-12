@@ -1,0 +1,139 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://srw.dev/schemas/connectors/output-line/v1",
+  "title": "SRW connector driver output line",
+  "type": "object",
+  "required": [
+    "type"
+  ],
+  "oneOf": [
+    {
+      "properties": {
+        "type": {
+          "const": "result"
+        },
+        "result": {
+          "type": "object"
+        },
+        "driver_state": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "result"
+      ]
+    },
+    {
+      "properties": {
+        "type": {
+          "const": "log"
+        },
+        "level": {
+          "enum": [
+            "debug",
+            "info",
+            "warning",
+            "error"
+          ]
+        },
+        "message": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "level",
+        "message"
+      ]
+    },
+    {
+      "properties": {
+        "type": {
+          "const": "error"
+        },
+        "error": {
+          "type": "object",
+          "required": [
+            "class",
+            "message"
+          ],
+          "properties": {
+            "class": {
+              "enum": [
+                "config",
+                "credentials",
+                "permission",
+                "transient",
+                "unsupported",
+                "system"
+              ]
+            },
+            "message": {
+              "type": "string",
+              "minLength": 1
+            },
+            "detail": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "field": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "retry_after_s": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "minimum": 0
+            }
+          }
+        }
+      },
+      "required": [
+        "error"
+      ]
+    },
+    {
+      "properties": {
+        "type": {
+          "const": "update"
+        },
+        "target": {
+          "const": "credential"
+        },
+        "slot": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "target",
+        "slot",
+        "value"
+      ]
+    },
+    {
+      "properties": {
+        "type": {
+          "const": "update"
+        },
+        "target": {
+          "const": "config"
+        },
+        "value": {
+          "type": "object"
+        }
+      },
+      "required": [
+        "target",
+        "value"
+      ]
+    }
+  ]
+}

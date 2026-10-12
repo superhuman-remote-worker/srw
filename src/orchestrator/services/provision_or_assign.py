@@ -32,6 +32,7 @@ from orchestrator.services.session_config_resolution import (
 )
 from orchestrator.services.session_runtime_identity import thread_accepts_runtime
 from orchestrator.services.session_workspace_policy import session_ready_timeout_s
+from orchestrator.services.vm_thread_initial import initial_thread_vm_blocks_runtime
 from shared.pinned_session_identity import PinnedSessionBinding
 
 logger = logging.getLogger(__name__)
@@ -128,6 +129,8 @@ async def provision_or_assign(
     async def _same_runtime(current: dict | None = None) -> bool:
         if current is None:
             current = await postgres_db.get_thread(tid)
+        if initial_thread_vm_blocks_runtime(current):
+            return False
         if expected_runtime is None:
             # Direct mixed-version/test callers retain the historical status
             # gate. The production scheduler always passes a generation.
@@ -399,12 +402,33 @@ async def provision_or_assign(
             expected_session_identity_fingerprint=(
                 binding.session_identity_fingerprint
             ),
+            **(
+                {
+                    "vm_store": postgres_db,
+                    "vm_thread_id": tid,
+                    "vm_runtime_generation": expected_runtime.generation,
+                    "vm_binding": binding,
+                }
+                if _is_vm
+                else {}
+            ),
         ):
             cur = await postgres_db.get_thread(tid)
-            if await _same_runtime(cur):
+            current_binding = await postgres_db.get_pinned_session_binding(
+                tid,
+                expected_runtime_generation=expected_runtime.generation,
+            )
+            if (
+                await _same_runtime(cur)
+                and current_binding is not None
+                and current_binding.target_key == binding.target_key
+                and current_binding.agent_status in startup_statuses
+            ):
                 await _safe_emit("failed", reason="agent /ready timeout")
             return
 
+        if not await _same_runtime():
+            return
         current_binding: (
             PinnedSessionBinding | None
         ) = await postgres_db.get_pinned_session_binding(

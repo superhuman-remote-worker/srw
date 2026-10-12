@@ -17,6 +17,7 @@ big to fit and must be cut mid-section; clean heading boundaries need none.
 
 from __future__ import annotations
 
+import asyncio
 import math
 import os
 import re
@@ -319,7 +320,12 @@ async def embed_note_chunks(
     chunk-less — note row consistently.
     """
     version = embedding_version_for_service(embedding_service, chunker_version)
-    chunks = chunk_note(body, target_tokens=target_tokens, token_counter=token_counter)
+    # Off the event loop: tokenizing is CPU work that scales with the note, and
+    # a cold tiktoken cache makes the first count a synchronous vocab download.
+    # The loop also answers health probes and agent heartbeats.
+    chunks = await asyncio.to_thread(
+        chunk_note, body, target_tokens=target_tokens, token_counter=token_counter
+    )
     if not chunks:
         return [], version
 

@@ -15,16 +15,33 @@ detail strings move with the code rather than being re-derived by a caller.
 
 from __future__ import annotations
 
+import json
+from collections.abc import Mapping
 from typing import Any
 from urllib.parse import urlparse
 
 from fastapi import HTTPException
 
-from orchestrator.services.deployment_gates import mcp_stdio_enabled
+from shared.connectors.builtin import MCP_STDIO_RETIRED
 from shared.runtime.utils.ssh_key import (
     InvalidSSHKeyError,
     validate_private_key as _validate_ssh_private_key,
 )
+
+
+def stored_json_object(value: Any) -> dict[str, Any]:
+    """A stored JSONB value as a dict.
+
+    asyncpg hands JSONB back as text unless a codec is registered, and a test
+    double hands back a dict: a JSON string is parsed, and anything that is
+    not an object (junk, null, a list) is an empty dict.
+    """
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except ValueError:
+            return {}
+    return dict(value) if isinstance(value, Mapping) else {}
 
 
 def normalize_datasource_credentials(
@@ -162,6 +179,19 @@ def normalize_repository_config(
         )
 
     out["forge"] = forge
+    # The git swap driver's roots for a forge behind a private CA (C3).
+    from orchestrator.services.connector_git_swap_delivery import (  # noqa: PLC0415
+        validate_upstream_ca,
+    )
+
+    try:
+        upstream_ca = validate_upstream_ca(out.get("upstream_ca"))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from None
+    if upstream_ca is None:
+        out.pop("upstream_ca", None)
+    else:
+        out["upstream_ca"] = upstream_ca
     return out
 
 
@@ -204,10 +234,9 @@ def validate_kb_repository_auth(
 # ---------------------------------------------------------------------------
 # MCP server connectors
 #
-# Moved verbatim from ``orchestrator.main`` (R1.B05 lane P). The stdio branch
-# consults ``deployment_gates.mcp_stdio_enabled`` on every call rather than
-# taking the answer as an argument: the gate is a pure ``os.getenv`` read, and
-# every caller of this validator already steers it with the environment.
+# Moved verbatim from ``orchestrator.main`` (R1.B05 lane P). A stdio server is
+# refused: stdio servers no longer run in the agent pod (connector drivers
+# D5b); a stdio image runs as a managed MCP server instead.
 #
 # The refusal shape is the contract. Every rejection here is
 # ``HTTPException(400)`` with a message that names the offending FIELD and
@@ -228,55 +257,13 @@ def validate_mcp_datasource(
     if not isinstance(raw_transport, str):
         raise HTTPException(status_code=400, detail="MCP transport must be a string")
     transport = raw_transport.lower().strip()
-    if transport not in ("http", "sse", "stdio"):
+    if transport == "stdio":
+        raise HTTPException(status_code=400, detail=MCP_STDIO_RETIRED)
+    if transport not in ("http", "sse"):
         raise HTTPException(
             status_code=400,
-            detail="Invalid MCP transport (expected http, sse, or stdio)",
+            detail="Invalid MCP transport (expected http or sse)",
         )
-
-    if transport == "stdio":
-        if not mcp_stdio_enabled():
-            raise HTTPException(
-                status_code=400,
-                detail="stdio MCP servers are disabled on this deployment",
-            )
-        unknown = sorted(set(credentials) - {"transport", "command", "args", "env"})
-        if unknown:
-            raise HTTPException(
-                status_code=400,
-                detail="Unknown stdio MCP credential field(s)",
-            )
-        command = credentials.get("command")
-        if not isinstance(command, str) or not command.strip() or "\x00" in command:
-            raise HTTPException(
-                status_code=400,
-                detail="stdio MCP servers require a valid credentials.command",
-            )
-        args = credentials.get("args") or []
-        if (
-            not isinstance(args, list)
-            or not all(isinstance(arg, str) for arg in args)
-            or any("\x00" in arg for arg in args)
-        ):
-            raise HTTPException(
-                status_code=400,
-                detail="MCP credentials.args must be a list of valid strings",
-            )
-        env = credentials.get("env") or {}
-        if not isinstance(env, dict) or not all(
-            isinstance(key, str)
-            and bool(key)
-            and "=" not in key
-            and "\x00" not in key
-            and isinstance(value, str)
-            and "\x00" not in value
-            for key, value in env.items()
-        ):
-            raise HTTPException(
-                status_code=400,
-                detail="MCP credentials.env must map valid names to string values",
-            )
-        return
 
     unknown = sorted(set(credentials) - {"transport", "auth"})
     if unknown:

@@ -106,8 +106,8 @@ Distinguishes three failure surfaces:
 Usage:
     GEMMA_API_KEY=sk-... python tests/manual_test_gemma_reasoning.py
 
-If GEMMA_API_KEY is unset, the script uses the key embedded below. Pass
---model to test a single model:
+GEMMA_API_KEY is required (no key is embedded). Pass --model to test a
+single model:
 
     python tests/manual_test_gemma_reasoning.py --model gemma-4-moe
 
@@ -129,7 +129,7 @@ from typing import Any
 import httpx
 
 BASE_URL = "https://ai.h4ll.app/v1"
-DEFAULT_API_KEY = "sk-PASTE-980c6c2862deebb2aa5963b1c72379c6-admin"
+DEFAULT_API_KEY = ""  # never embed a key here — pass GEMMA_API_KEY
 DEFAULT_MODELS = ["gemma-4-moe", "gemma-4-31b"]
 
 # Patterns that should NEVER appear in `content` if vLLM's parsers are doing
@@ -1712,7 +1712,7 @@ def main() -> int:
 
     api_key = os.environ.get("GEMMA_API_KEY") or DEFAULT_API_KEY
     if not api_key or api_key.startswith("sk-PASTE-PLACEHOLDER"):
-        print("ERROR: set GEMMA_API_KEY env var or edit DEFAULT_API_KEY")
+        print("ERROR: set the GEMMA_API_KEY env var")
         return 2
 
     with httpx.Client() as client:

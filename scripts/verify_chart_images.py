@@ -27,7 +27,14 @@ COMPONENTS = (
     "workspace",
     "vm-controller",
     "vm-preparer",
+    "driver-shim",
+    "driver-mcp-front",
+    "driver-git-swap",
+    "fuse-opener",
 )
+# Images that another component's job builds from the same inputs. They share
+# that component's identity and rebuild decision and have no job of their own.
+COBUILT = {"workspace-minimal": "workspace", "cloud-mount": "fuse-opener"}
 _SHA = re.compile(r"[0-9a-f]{40}\Z")
 _DIGEST = re.compile(r"sha256:[0-9a-f]{64}\Z")
 
@@ -67,6 +74,11 @@ def expected_images(
                 "refusing publication"
             )
         refs[component] = f"{repository}-{component}:sha-{sha[:7]}"
+
+    for image, component in COBUILT.items():
+        refs[image] = refs[component].replace(
+            f"{repository}-{component}:", f"{repository}-{image}:", 1
+        )
     return refs
 
 

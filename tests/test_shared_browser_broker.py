@@ -591,14 +591,20 @@ class TestStatelessColdStartLifecycle:
         assert result == {"generation": "g1"}
 
 
-def _ws_app():
+def _ws_app(db):
+    """A minimal app whose stream route relays with this application's store.
+
+    The production route (``routers/ide.py``) passes its per-request
+    dependencies' ``store``; the harness publishes ``db`` the same way, on its
+    own ``app.state``, and the route reads it per connection.
+    """
+
     app = FastAPI()
+    app.state.store = db
 
     @app.websocket("/stream/{thread_id}")
     async def stream(ws: WebSocket, thread_id: str):
-        from orchestrator.main import postgres_db
-
-        await broker.relay_browser_stream(ws, thread_id, db=postgres_db)
+        await broker.relay_browser_stream(ws, thread_id, db=ws.app.state.store)
 
     return app
 
@@ -702,8 +708,7 @@ def _install_hanging_relay(monkeypatch, *, db: _RelayDB | None = None):
     monkeypatch.setattr(broker, "exec_stream_info", fake_info)
     monkeypatch.setattr(broker, "_get_canvas_record", fake_record)
     monkeypatch.setattr(broker, "_open_loopback", fake_open)
-    app = _ws_app()
-    monkeypatch.setattr("orchestrator.main.postgres_db", db, raising=False)
+    app = _ws_app(db)
     return app, db, writer
 
 
@@ -729,8 +734,7 @@ class TestRelayAuthGates:
 
     def test_missing_origin_closes_4403_before_feature_gate(self, monkeypatch):
         monkeypatch.delenv("CANVAS_SHARED_BROWSER_ENABLED", raising=False)
-        app = _ws_app()
-        monkeypatch.setattr("orchestrator.main.postgres_db", object(), raising=False)
+        app = _ws_app(object())
 
         assert (
             _connect_and_capture_close(TestClient(app), "/stream/t1", headers={})
@@ -747,8 +751,7 @@ class TestRelayAuthGates:
     )
     def test_bad_origin_closes_4403_before_feature_gate(self, monkeypatch, origin):
         monkeypatch.delenv("CANVAS_SHARED_BROWSER_ENABLED", raising=False)
-        app = _ws_app()
-        monkeypatch.setattr("orchestrator.main.postgres_db", object(), raising=False)
+        app = _ws_app(object())
 
         assert (
             _connect_and_capture_close(
@@ -762,8 +765,7 @@ class TestRelayAuthGates:
     def test_duplicate_origin_closes_4403_before_feature_gate(self, monkeypatch):
         monkeypatch.delenv("CANVAS_SHARED_BROWSER_ENABLED", raising=False)
         headers = httpx.Headers([("origin", _VALID_ORIGIN), ("origin", _VALID_ORIGIN)])
-        app = _ws_app()
-        monkeypatch.setattr("orchestrator.main.postgres_db", object(), raising=False)
+        app = _ws_app(object())
 
         assert (
             _connect_and_capture_close(
@@ -776,16 +778,14 @@ class TestRelayAuthGates:
 
     def test_disabled_closes_4404(self, monkeypatch):
         monkeypatch.delenv("CANVAS_SHARED_BROWSER_ENABLED", raising=False)
-        app = _ws_app()
-        monkeypatch.setattr("orchestrator.main.postgres_db", object(), raising=False)
+        app = _ws_app(object())
 
         assert _connect_and_capture_close(TestClient(app), "/stream/t1") == 4404
 
     def test_allowed_environment_origin_reaches_feature_gate(self, monkeypatch):
         monkeypatch.delenv("CANVAS_SHARED_BROWSER_ENABLED", raising=False)
         monkeypatch.setenv("CORS_ORIGINS", "https://cockpit.example.test")
-        app = _ws_app()
-        monkeypatch.setattr("orchestrator.main.postgres_db", object(), raising=False)
+        app = _ws_app(object())
 
         assert (
             _connect_and_capture_close(
@@ -803,8 +803,7 @@ class TestRelayAuthGates:
             return None
 
         monkeypatch.setattr(broker, "resolve_ws_user", no_user)
-        app = _ws_app()
-        monkeypatch.setattr("orchestrator.main.postgres_db", object(), raising=False)
+        app = _ws_app(object())
 
         assert _connect_and_capture_close(TestClient(app), "/stream/t1") == 4401
 
@@ -830,8 +829,7 @@ class TestRelayAuthGates:
         monkeypatch.setattr(broker, "resolve_ws_user", fake_user)
         monkeypatch.setattr(broker, "exec_stream_info", fake_info)
         monkeypatch.setattr(broker, "_get_canvas_record", fake_record)
-        app = _ws_app()
-        monkeypatch.setattr("orchestrator.main.postgres_db", FakeDB(), raising=False)
+        app = _ws_app(FakeDB())
 
         assert _connect_and_capture_close(TestClient(app), "/stream/t1") == 4409
         assert broker._ACTIVE_VIEWERS == {}
@@ -1107,8 +1105,7 @@ class TestRelayHappyPath:
         monkeypatch.setattr(broker, "exec_stream_info", fake_info)
         monkeypatch.setattr(broker, "_get_canvas_record", fake_record)
         monkeypatch.setattr(broker, "_open_loopback", fake_open)
-        app = _ws_app()
-        monkeypatch.setattr("orchestrator.main.postgres_db", FakeDB(), raising=False)
+        app = _ws_app(FakeDB())
 
         with TestClient(app).websocket_connect(
             "/stream/t1",

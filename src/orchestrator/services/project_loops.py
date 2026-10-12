@@ -25,6 +25,8 @@ from collections.abc import Awaitable, Callable
 from datetime import datetime, timezone
 from typing import Any
 
+from fastapi import HTTPException
+
 from orchestrator.security.access import project_is_archived
 
 # The legacy name remains the loop path's import surface while the safe
@@ -56,6 +58,18 @@ _S33_CURATED_AUDIT_PR_EFFECT = "s33-curated-audit-pr"
 
 class TerminalMergeReconciliationError(RuntimeError):
     """A durable PR merge could not be reconciled without guessing."""
+
+
+class LoopWorkspaceRefused(HTTPException):
+    """The workspace defaults chain refused a loop job (Slice A2b, spec §7).
+
+    Still an HTTPException with the refusal's status, so completion handlers
+    keep answering it as before. ``str()`` is the refusal text alone, so the
+    spawn paths that stop the loop put exactly that message in ``last_error``.
+    """
+
+    def __str__(self) -> str:
+        return str(self.detail)
 
 
 # Every loop role gets an isolated job repository seeded from the project cloud
@@ -507,6 +521,12 @@ def _role_contract_category(role: str | None) -> str | None:
 # same pool; Critic verifies at the GOAL level against the Definition of Done
 # and always selects the next improvement (the loop is unconditional — there is
 # no goal-met stop); the executor implements what the Critic chose.
+#: Where a role block names the project folder's copy; build_loop_kickoff
+#: puts the real ``projects/<slug>/`` there (the seed's slug,
+#: ``job_cloud_baseline.slugify_project_name``). A guessed slug never matches
+#: the copy, and its diff then delivers nothing.
+_PROJECT_FOLDER = "`projects/<project-slug>/`"
+
 _ROLE_BLOCKS: dict[str, str] = {
     "scholar": (
         "FIRST ground yourself: you MUST research the target/competitor system "
@@ -579,7 +599,7 @@ _ROLE_BLOCKS: dict[str, str] = {
         "independent diff review to `reviewer`; read the diff yourself before "
         "completion. Write directly when the change is small or cross-cutting. "
         "The current durable project "
-        "files are seeded under `projects/<project-slug>/` in this isolated "
+        f"files are seeded under {_PROJECT_FOLDER} in this isolated "
         "workspace. When you finish, the "
         "orchestrator applies a conflict-free diff to the project cloud folder; "
         "a conflict pauses the loop for review instead of overwriting newer "
@@ -615,7 +635,7 @@ _ROLE_BLOCKS: dict[str, str] = {
 _ROLE_BLOCK_DEFAULT = (
     "Advance the goal acting as '{role}'. Build on the KB, validate your work "
     "against the Definition of Done before declaring done, and put durable "
-    "project files under `projects/<project-slug>/` so a conflict-free diff can "
+    f"project files under {_PROJECT_FOLDER} so a conflict-free diff can "
     "be applied to the project cloud folder. Record what you did and what the "
     "next agent should do."
 )
@@ -834,6 +854,7 @@ def build_loop_kickoff(
     extra_context: dict[str, Any] | None = None,
     backlog_block: str | None = None,
     history_block: str | None = None,
+    project_slug: str | None = None,
 ) -> str:
     """Assemble the loop-aware kickoff *message* for one job.
 
@@ -859,6 +880,9 @@ def build_loop_kickoff(
     VERBATIM: this function stays pure and does no I/O, so the caller fetches
     it. Passing None (start-up paths, tests) simply omits the section.
     ``history_block`` follows the same pattern for structured job records.
+    ``project_slug`` is the slug the project folder's copy is seeded under
+    (``projects/<slug>/``); without one the role block points at the task
+    brief, which names the copy's path.
     """
     goal = (loop.get("goal") or "").strip() or (
         "(no explicit goal set — make useful, self-directed progress and record "
@@ -878,7 +902,14 @@ def build_loop_kickoff(
     # loop with no officer still gets the doctrine the pools were built to
     # carry — an answer is a deliverable, a screenshot is evidence, tests are
     # regression rails and never the score.
-    identity_block = _ROLE_BLOCKS.get(role) or _ROLE_BLOCK_DEFAULT.format(role=role)
+    identity_block = (
+        _ROLE_BLOCKS.get(role) or _ROLE_BLOCK_DEFAULT.format(role=role)
+    ).replace(
+        _PROJECT_FOLDER,
+        f"`projects/{project_slug}/`"
+        if project_slug
+        else "the project folder's copy (its path is in the task brief)",
+    )
     contract_category = _role_contract_category(role)
     role_block = (
         f"{category_block(contract_category)}\n\n{identity_block}"
@@ -1014,6 +1045,7 @@ async def create_loop_job(
     """
     loop_id = str(loop["id"])
     project_id = str(loop["project_id"]) if loop.get("project_id") else None
+    project: dict[str, Any] | None = None
 
     # An archived project takes no new work (§4.3 of
     # knowledge-base/knowledge/features/project_and_job_list_filtering.md).
@@ -1096,6 +1128,8 @@ async def create_loop_job(
         config_override["tools"] = {"loop": ["loop_plan"]}
 
     description = build_loop_description(loop, role=role, iteration=iteration)
+    from orchestrator.services.job_cloud_baseline import slugify_project_name
+
     kickoff = build_loop_kickoff(
         loop,
         role=role,
@@ -1103,6 +1137,11 @@ async def create_loop_job(
         extra_context=extra_context,
         backlog_block=backlog_block,
         history_block=history_block,
+        project_slug=(
+            slugify_project_name(str(project.get("name") or "project"))
+            if project
+            else None
+        ),
     )
     context = {
         "loop_id": loop_id,
@@ -1193,15 +1232,24 @@ async def create_loop_job(
     target_project_ids = [project_id] if project_id else []
 
     from orchestrator.services.manifest_workspace_selection import (
+        WorkspaceSelectionRace,
         select_project_workspace_default,
     )
 
-    config_override, workspace_selection = await select_project_workspace_default(
-        db,
-        owner_id,
-        project_id,
-        config_override,
-    )
+    try:
+        (
+            config_override,
+            workspace_selection,
+        ) = await select_project_workspace_default(
+            db,
+            owner_id,
+            project_id,
+            config_override,
+        )
+    except WorkspaceSelectionRace:
+        raise  # transient: propagates unchanged, as before
+    except HTTPException as exc:
+        raise LoopWorkspaceRefused(exc.status_code, exc.detail) from exc
     if workspace_selection is not None:
         workspace_backend = config_override["workspace"]["backend"]
 
@@ -1219,6 +1267,8 @@ async def create_loop_job(
             owner_id,
             target_project_ids,
             str(workspace_backend) if workspace_backend else None,
+            execution_kind="job",
+            unattended=True,
         )
         datasource_origin = "default"
     else:

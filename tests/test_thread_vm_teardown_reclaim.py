@@ -14,14 +14,29 @@ See knowledge-base/knowledge/issues/vm_reliability_assessment.md P1-7.
 
 from __future__ import annotations
 
-from tests import _b09_control_seams as control_seams
-
+from contextlib import asynccontextmanager
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 import pytest
 
 import orchestrator.main as orch_main
+from orchestrator.services import container_provisioner as container_provisioner_module
+from orchestrator.services import vm_provisioner as vm_provisioner_module
+from orchestrator.services import (
+    vm_workspace_recovery_store as vm_workspace_recovery_store_module,
+)
+from tests import _b09_control_seams as control_seams
+
+
+@pytest.fixture(autouse=True)
+def legacy_resource_cleanup(monkeypatch):
+    """These synthetic teardown owners have no v3 creation/retry charge."""
+    import orchestrator.services.vm_workspace_recovery_store as recovery
+
+    monkeypatch.setattr(
+        recovery, "prepare_vm_cleanup_resource", AsyncMock(return_value=None)
+    )
 
 
 def _allow_cleanup_store():
@@ -54,16 +69,18 @@ async def _cleanup_thread(status):
     )
     with (
         patch.object(
-            orch_main,
+            orch_main.app.state.resources,
             "postgres_db",
             SimpleNamespace(get_thread=AsyncMock(return_value=_thread_with_vm(status))),
         ),
-        patch.object(orch_main, "vm_provisioner", vm_provisioner),
+        patch.object(vm_provisioner_module, "vm_provisioner", vm_provisioner),
         patch.object(
-            orch_main, "container_provisioner", SimpleNamespace(is_available=False)
+            container_provisioner_module,
+            "container_provisioner",
+            SimpleNamespace(is_available=False),
         ),
         patch.object(
-            orch_main,
+            vm_workspace_recovery_store_module,
             "VMWorkspaceRecoveryStore",
             return_value=_allow_cleanup_store(),
         ),
@@ -132,18 +149,20 @@ class TestThreadVmReleasedOnTeardown:
         )
         with (
             patch.object(
-                orch_main,
+                orch_main.app.state.resources,
                 "postgres_db",
                 SimpleNamespace(
                     get_thread=AsyncMock(return_value=_thread_with_vm("ready"))
                 ),
             ),
-            patch.object(orch_main, "vm_provisioner", vm_provisioner),
+            patch.object(vm_provisioner_module, "vm_provisioner", vm_provisioner),
             patch.object(
-                orch_main, "container_provisioner", SimpleNamespace(is_available=False)
+                container_provisioner_module,
+                "container_provisioner",
+                SimpleNamespace(is_available=False),
             ),
             patch.object(
-                orch_main,
+                vm_workspace_recovery_store_module,
                 "VMWorkspaceRecoveryStore",
                 return_value=_allow_cleanup_store(),
             ),
@@ -161,7 +180,16 @@ async def _cleanup_job(status):
         if status is not None
         else {}
     )
-    identity = object()
+    identity = SimpleNamespace(
+        provision_generation="8d6f28f4-cc40-4adc-9ad3-343831f7874d",
+        rootdisk_pvc_uid="8d6f28f4-cc40-4adc-9ad3-343831f7874e",
+    )
+    conn = SimpleNamespace(fetchval=AsyncMock(return_value=False))
+
+    @asynccontextmanager
+    async def acquire():
+        yield conn
+
     vm_provisioner = SimpleNamespace(
         is_available=True,
         lifecycle_available=True,
@@ -172,18 +200,21 @@ async def _cleanup_job(status):
     )
     with (
         patch.object(
-            orch_main,
+            orch_main.app.state.resources,
             "postgres_db",
             SimpleNamespace(
-                get_job=AsyncMock(return_value={"id": "j1", "context": context})
+                get_job=AsyncMock(return_value={"id": "j1", "context": context}),
+                acquire=acquire,
             ),
         ),
-        patch.object(orch_main, "vm_provisioner", vm_provisioner),
+        patch.object(vm_provisioner_module, "vm_provisioner", vm_provisioner),
         patch.object(
-            orch_main, "container_provisioner", SimpleNamespace(is_available=False)
+            container_provisioner_module,
+            "container_provisioner",
+            SimpleNamespace(is_available=False),
         ),
         patch.object(
-            orch_main,
+            vm_workspace_recovery_store_module,
             "VMWorkspaceRecoveryStore",
             return_value=_allow_cleanup_store(),
         ),

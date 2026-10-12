@@ -80,6 +80,8 @@ export interface Expert {
   /** 'worker' | 'session' — the expert's identity role (a library entry
    *  reports its `$extends` chain root, `worker` by default). */
   expert_type?: string;
+  /** The Expert's manifest resource — what a changed template is copied from. */
+  manifest_uid?: string | null;
 }
 
 // ---- Subagent roster (`config.subagents`, universal_experts_and_subagents.md §1.1) ----
@@ -337,7 +339,12 @@ export type DatasourceType =
   | 'mcp'
   | 'kubeconfig'
   | 'ssh_key'
-  | 'generic_file';
+  | 'generic_file'
+  // Platform-owned, from the main cloud (main_cloud_as_connectors.md): SRW
+  // creates these for what it provisions; no form creates one.
+  | 'cloud_folder'
+  | 'cloud_folder_checkout'
+  | 'cloud_outbox';
 
 /**
  * Access tier for an ``email`` datasource (see knowledge-base/knowledge/features/email_datasource.md).
@@ -371,7 +378,9 @@ export interface CredentialFileEntry {
 
 /** Non-secret, type-specific datasource configuration. */
 export interface DatasourceConfig {
-  /** Server-owned marker for a project's native knowledge connector. */
+  /** The older server-owned marker for a project's native knowledge
+   *  connector; `Datasource.managed_key` replaces it (a row written before
+   *  the key carries only this). */
   native_project_id?: string;
   /** Repository-relative POSIX root containing OKF Markdown notes. */
   root_path?: string;
@@ -390,6 +399,30 @@ export interface DatasourceConfig {
   /** Email: skip the human send-approval freeze (needs the
    *  ``email_autonomous_send`` grant; the server rejects it otherwise). */
   unattended_send?: boolean;
+  /** ssh_key: the host a plain ``ssh <host>`` in the workspace reaches. */
+  host?: string;
+  /** ssh_key: login name on ``host``. */
+  user?: string;
+  /** ssh_key: SSH port on ``host`` (22 when unset). The form sends what was
+   *  typed when it is not a number, so the server's 400 names the problem. */
+  port?: number | string;
+  /** ssh_key and SSH-key repository: pinned host keys (``<type> <base64>``
+   *  or known_hosts lines). Unpinned hosts are trusted on first use. */
+  known_hosts?: string;
+  /** Token repository: PEM certificates SRW's git swap driver alone trusts
+   *  the forge with (a forge behind a private CA). Not a secret. */
+  upstream_ca?: string;
+  /** GitHub App repository (C5): the App and its installation, and a GitHub
+   *  Enterprise Server's API base. Set through the API; the form keeps it. */
+  github_app?: {app_id: string; installation_id: string; api_base?: string};
+  /** Kubeconfig (C5): TokenRequest minting for one ServiceAccount. Set
+   *  through the API; the form never sends a kubeconfig's config. */
+  token_request?: {
+    namespace: string;
+    service_account: string;
+    expiration_seconds?: number;
+    audiences?: string[];
+  };
 }
 
 export type DatasourceIndexState =
@@ -453,16 +486,30 @@ export interface Datasource {
   credentials?: Record<string, unknown>;
   /** Configured names only; values are never returned by connector reads. */
   env_var_names?: string[];
+  /** A registered image driver's connector (D6): the variables its driver
+   *  declares its bind sets in the workspace, shown before it is attached. */
+  driver_env_names?: string[];
+  /** What an update changed beyond what was asked (an update response only):
+   *  e.g. a stored variable no connector may set, dropped. */
+  notices?: string[];
   cli_hint: string | null;
   default_branch: string | null;
   config?: DatasourceConfig;
   job_id: string | null;
   /** Creator id is used only to gate owner/admin management actions in Cockpit. */
   created_by?: string | null;
+  /** Set on a connector SRW provisions and manages itself: `<kind>:<uuid>`,
+   *  e.g. `project-cloud:<project>` (core/models/platform-connector.ts).
+   *  Null for everything a user created. An orchestrator that predates it
+   *  omits the field; a native knowledge base then carries only
+   *  `config.native_project_id`. */
+  managed_key?: string | null;
   /** Whether the datasource is visible to all users (vs owner/project only). */
   is_global?: boolean;
-  /** Declared read-only flag for public datasources (null = not applicable).
-   *  Declarative — credentials are the enforcement boundary. */
+  /** The creator's read-only tag: when set, agents get no write tools for
+   *  the connector, for everyone who uses it. Null = never chosen, which a
+   *  public connector reads as read-only. The credential still decides what
+   *  is really allowed. */
   read_only?: boolean | null;
   /** Execution-context restriction. `all` includes projectless work. */
   scope_mode?: DatasourceScopeMode;
@@ -481,11 +528,63 @@ export interface Datasource {
   updated_at: string;
 }
 
+/** Why an execution may not choose a level, or binds a connector at none
+ *  (`shared.connectors.contract.ACCESS_REFUSALS`). */
+export type ConnectorAccessRefusal =
+  | 'read_only_unavailable'
+  | 'level_not_offered'
+  | 'no_level_offered'
+  | 'above_ceiling';
+
+/** Where an unchosen level came from (`ACCESS_ORIGINS`): the project link's
+ *  default, the connector config's, the driver's, or a default lowered to
+ *  what is allowed here (`clamped`). */
+export type ConnectorAccessOrigin =
+  | 'explicit'
+  | 'materialized'
+  | 'link_default'
+  | 'config'
+  | 'driver_default'
+  | 'clamped';
+
+/** One level of a {@link ConnectorAccessChoice}: a driver level, and
+ *  whether an execution may choose it here (and, when not, why). */
+export interface ConnectorAccessChoiceLevel {
+  id: string;
+  rank: number;
+  writes?: 'none' | 'reviewed' | 'direct' | null;
+  enforced_by?: string;
+  offered: boolean;
+  /** A closed code when not offered. */
+  reason?: ConnectorAccessRefusal | string | null;
+  /** The refusal in a line a person can read (the server's words). */
+  detail?: string | null;
+}
+
+/** A strict connector's access as the eligible list offers it
+ *  (`connector_access.access_choice`: a cloud folder's `read_only` /
+ *  `protected` / `read_write`, a folder copy's `read_only` /
+ *  `reviewed_write_back`), for the execution kind and workspace tier the
+ *  list was asked for: every level, lowest first, the level it binds at
+ *  unchosen (`default`; null mounts nothing) and where that came from, and
+ *  the owner's ceiling (a viewer of the folder's project: `read_only`). */
+export interface ConnectorAccessChoice {
+  levels: ConnectorAccessChoiceLevel[];
+  default: string | null;
+  default_origin?: ConnectorAccessOrigin | string | null;
+  /** Why the default was lowered, or why there is none. */
+  default_reason?: string | null;
+  ceiling?: string | null;
+}
+
 /** Execution-context row. Consumers must seed from `default_selected`, not
  * from `auto_attach`: shared/public connectors can be automatic for their
- * owner while remaining manual for the current caller. */
+ * owner while remaining manual for the current caller. A platform-owned row
+ * (`managed_key`) is `default_selected` for its own project's (or user's)
+ * work, whatever the rollout gate for other defaults says. */
 export interface EligibleDatasource extends Datasource {
   default_selected: boolean;
+  access?: ConnectorAccessChoice | null;
 }
 
 export interface DatasourceCatalogResponse {
@@ -520,7 +619,8 @@ export interface DatasourceCreateRequest {
   config?: DatasourceConfig;
   /** Publish org-wide; requires the public_datasources capability. */
   is_global?: boolean;
-  /** Declared read-only flag; defaults to true server-side on publish. */
+  /** The creator's read-only tag (no write tools for anyone who uses the
+   *  connector); defaults to true server-side on publish. */
   read_only?: boolean;
   scope_mode?: DatasourceScopeMode;
   project_ids?: string[];
@@ -540,7 +640,7 @@ export interface DatasourceUpdateRequest {
   config?: DatasourceConfig;
   /** Publish (true) / unpublish (false); publishing requires the capability. */
   is_global?: boolean;
-  /** Declared read-only flag (kb: always true). */
+  /** The creator's read-only tag (kb: always true). */
   read_only?: boolean;
   scope_mode?: DatasourceScopeMode;
   project_ids?: string[];
@@ -569,8 +669,9 @@ export interface LinkableDatasourceProjectsResponse {
 }
 
 /** Cursor page of connectors that may be newly linked to one target project.
- * The server excludes existing links, native project knowledge connectors,
- * and rows the caller is not authorized to add. */
+ * The server excludes existing links, platform-owned connectors (a
+ * project's own knowledge base and cloud folder, a user's own), and rows
+ * the caller is not authorized to add. */
 export interface LinkableProjectDatasourcesResponse {
   items: Datasource[];
   next_cursor: string | null;
@@ -588,15 +689,35 @@ export interface LinkableProjectDatasourceFilters {
 export interface ProjectDatasource extends Datasource {
   linked_at: string;
   project_read_only: boolean | null;
+  /** The link's default level, for a connector whose driver has strict
+   *  levels (a cloud folder); null = its driver's default. Such a link has
+   *  no `project_read_only`. Absent on orchestrators before main cloud
+   *  slice 5. */
+  project_access?: string | null;
   project_description: string | null;
 }
 
 /**
  * Result from testing a datasource connection.
  */
+/** The SSH endpoint a connector form is editing; Test reaches it unsaved. */
+export interface DatasourceTestEdits {
+  connection_url?: string | null;
+  config?: DatasourceConfig;
+}
+
 export interface DatasourceTestResult {
-  status: 'ok' | 'error';
+  /** 'unsupported': the connector type has no connection test. */
+  status: 'ok' | 'error' | 'unsupported';
   message: string;
+  /** Probe-specific facts; an SSH connector reports the host key it saw. */
+  details?: {
+    /** A host-qualified known_hosts line (``host type key`` or
+     *  ``[host]:port type key``), the form the ``known_hosts`` field pins. */
+    host_key?: string;
+    host_key_fingerprint?: string;
+    [key: string]: unknown;
+  };
 }
 
 /**
@@ -767,7 +888,7 @@ export interface LlmEndpointDiscoveryResult {
   ok: boolean;
   status: number | null;
   error: string | null;
-  probe_url: string;
+  probe_url: string | null;
   models: LlmEndpointDiscoveredModel[];
 }
 
@@ -916,10 +1037,12 @@ export interface ResolvedDefaults {
   default_autonomy?: string;
   default_reasoning_level?: string;
   default_auxiliary_model?: string;
-  default_vision_model?: string;
-  default_whisper_model?: string;
-  default_tts_model?: string;
-  default_embedding_model?: string;
+  /** Registry default for the capability (as dispatch resolves it), else the
+   * env fallback; null when neither names a model. */
+  default_vision_model?: string | null;
+  default_whisper_model?: string | null;
+  default_tts_model?: string | null;
+  default_embedding_model?: string | null;
   embedding_provider?: string;
   persistent_agent?: {
     model?: string;
@@ -952,6 +1075,10 @@ export interface UserSettings {
   /** How the aux LLM rewrites messages for read-aloud (reasoning + custom prompt). */
   read_aloud?: ReadAloudSettings | null;
   _resolved?: ResolvedDefaults;
+  /** Stored model preferences that can no longer run, keyed by dotted path
+   * (`default_model`, `default_auxiliary_model`, `persistent_agent.model`) →
+   * reason. New work falls back to the system default for these. */
+  _unavailable?: Record<string, string>;
 }
 
 /** A read-aloud reasoning level. 'off' (default) keeps the fast rewrite path;
@@ -1287,7 +1414,6 @@ export interface Project {
   default_config_name?: string | null;
   default_config_override?: Record<string, unknown> | null;
   nextcloud_folder_id?: number | null;
-  cloud_storage_read_only?: boolean;
   cloud_storage_url?: string | null;
   main_cloud_backend?: string | null;
   network_tier?: ProjectNetworkTier;
@@ -1764,9 +1890,60 @@ export interface ProjectUpdateRequest {
   status?: ProjectStatus;
   default_config_name?: string;
   default_config_override?: Record<string, unknown>;
-  cloud_storage_read_only?: boolean;
   network_tier?: ProjectNetworkTier;
 }
+
+/** What Jobs or Sessions get when nothing more specific picks a workspace. */
+export type WorkspaceMode = 'none' | 'virtual' | 'container' | 'vm';
+
+/** A named template, scoped to a Catalog, a Project or an Account. */
+export interface WorkspaceTemplateRef {
+  name: string;
+  scope: {kind: string; name: string};
+}
+
+/**
+ * `GET /api/projects/{id}/workspace-defaults`: the Project's stored row (if
+ * any), the effective values with where each came from, and whether the
+ * Project manifest owns the row (making it read-only in the cockpit).
+ */
+export interface ProjectWorkspaceDefaults {
+  stored: {
+    jobs: WorkspaceMode | null;
+    sessions: WorkspaceMode | null;
+    container: Record<string, unknown> | null;
+    vm: Record<string, unknown> | null;
+  };
+  managed_by_manifest: boolean;
+  /** Whether this caller may edit these defaults: admin or Project owner,
+   *  Project not archived, row not manifest-owned — computed server-side. */
+  can_edit: boolean;
+  /** Whether this caller may pick their own Account templates here: true
+   *  only when this Project is the caller's own personal project. */
+  account_templates: boolean;
+  effective: {
+    jobs: {mode: WorkspaceMode; source: string};
+    sessions: {mode: WorkspaceMode; source: string};
+    container: {template_name: string | null; source: string};
+    vm: {template_name: string | null; source: string};
+  };
+  installation: {jobs: WorkspaceMode; sessions: WorkspaceMode; container: string | null; vm: string | null};
+  template_problems: Partial<Record<'container' | 'vm', string>>;
+  installation_problems: string[];
+  vm_available: boolean;
+}
+
+/** Request body for `PUT /api/projects/{id}/workspace-defaults`. */
+export interface ProjectWorkspaceDefaultsUpdate {
+  jobs: WorkspaceMode | null;
+  sessions: WorkspaceMode | null;
+  container: WorkspaceTemplateRef | null;
+  vm: WorkspaceTemplateRef | null;
+}
+
+/** `GET /api/resources?...&kind=WorkspaceTemplate`: the visible templates for
+ *  a scope, used to populate the Settings tab's template pickers. */
+export type WorkspaceTemplateList = import('./workspace-template.model').WorkspaceTemplateItems;
 
 /**
  * Project member with user info.
@@ -1896,6 +2073,76 @@ export interface ThreadMount {
   backend_id: string | null;
 }
 
+/** What `GET /api/me/cloud-root` says of the caller's own cloud root
+ *  ("My cloud", main cloud slice 4): whether their main cloud has one, and
+ *  where its connection stands. Never a credential. */
+export type CloudRootState =
+  | 'unsupported'
+  | 'not_connected'
+  | 'connecting'
+  | 'connected'
+  | 'revoked'
+  | 'failed';
+
+/** Why there is no root to connect. */
+export type CloudRootUnsupportedReason =
+  | 'no_main_cloud'
+  | 'provider_unsupported'
+  | 'grant_mode_off'
+  | 'no_personal_project';
+
+/** Why a connect attempt stored nothing. */
+export type CloudRootFailureReason =
+  | 'wrong_account'
+  | 'admin_account'
+  | 'service_account'
+  | 'identity_mismatch'
+  | 'account_disabled'
+  | 'verify_failed'
+  | 'expired'
+  | 'provider_error'
+  | 'account_missing'
+  | 'error';
+
+export interface CloudRootStatus {
+  supported: boolean;
+  reason: CloudRootUnsupportedReason | string | null;
+  state: CloudRootState;
+  connector_id: string | null;
+  name: string;
+  /** The cloud account it is connected as (connected only). */
+  account_id: string | null;
+  granted_at: string | null;
+  /** The name the credential carries in the cloud's device list. */
+  client_name: string | null;
+  revoked_at: string | null;
+  /** `user`: its user disconnected it; `rejected_by_cloud`: the cloud
+   *  refused it (revoked in its device list, the account disabled). */
+  revoked_reason: 'user' | 'rejected_by_cloud' | string | null;
+  failure: {reason: CloudRootFailureReason | string; at: string | null} | null;
+  /** The running "Connect your cloud" flow, when there is one. */
+  connecting: {login_url: string; expires_at: string} | null;
+  /** A disconnect's answer only: whether the cloud revoked the credential
+   *  (false: it could not be asked; null: there was none). */
+  provider_revoked?: boolean | null;
+}
+
+/** `POST /api/me/cloud-root/connect`. */
+export interface CloudRootConnectStart {
+  state: 'connecting';
+  connector_id: string;
+  login_url: string;
+  expires_at: string;
+}
+
+/** `Thread.protected_source`. */
+export interface ThreadProtectedSource {
+  datasource_id: string | null;
+  /** The folder's project id. */
+  source_ref: string;
+  target_path: string;
+}
+
 /**
  * Persistent agent session thread.
  */
@@ -1913,10 +2160,21 @@ export interface Thread {
   created_at: string;
   last_activity: string;
   ended_at?: string | null;
-  /** Safe, derived public projection of an in-progress pinned retirement.
+  /** Absent on orchestrators predating the stateless lane. */
+  execution_lane?: 'pinned' | 'stateless';
+  /** Safe, derived public projection of an in-progress retirement: a pinned
+   *  one, or a stateless End/Delete a retryable fence left pending.
    *  Raw retirement tokens/context never belong in an owner payload. */
   runtime_retirement_pending?: boolean;
+  /** Non-secret identity of this life, including starting/ended sessions. */
+  session_runtime_generation?: string | null;
   retirement_disposition?: 'ended' | 'suspended' | null;
+  /** True only while a retirement is pending AND it is a permanent Delete. */
+  retirement_permanent?: boolean;
+  workspace_lifecycle?: WorkspaceLifecycleView | null;
+  /** Bounded progress for this exact pinned VM creation source. */
+  vm_creation?: VMCreationView | null;
+  workspace_creation?: WorkspaceCreationView | null;
   total_turns: number;
   total_tokens: number;
   nc_session_folder?: string | null;
@@ -1929,6 +2187,11 @@ export interface Thread {
   /** Attached remote folders, ordered by `target_path`. Absent on the list
    *  endpoint's projection and on older orchestrators. */
   mounts?: ThreadMount[];
+  /** A protected session's folder (main cloud slice 5): the connector it
+   *  bound at protected (null for a session protected before connectors),
+   *  the folder's project (`source_ref`) and where it is mounted. Null for
+   *  every other session; absent on older orchestrators. */
+  protected_source?: ThreadProtectedSource | null;
   /** Derived: `source_ref` of every `mount_kind === 'project'` row. */
   project_ids?: string[];
   /** Child-thread identity. All fields are absent on ordinary sessions and on
@@ -2200,6 +2463,43 @@ export interface WorkspaceRecoveryView {
   cleanup_pending: boolean;
 }
 
+export interface VMCreationView {
+  request_id: string;
+  state: string;
+  stage: 'configuration' | 'creation' | 'readiness';
+  reason_code: string;
+  message: string;
+  wait?: {
+    kind: 'resource' | 'count' | 'controller' | 'unknown';
+    since: string | null;
+    size_nonfit: boolean;
+    guest_vcpus: number | null;
+    guest_memory_bytes: number | null;
+  } | null;
+  resumable: boolean;
+}
+
+/** Safe owner projection of container workspace startup. No scheduler text or authority lives here. */
+export interface WorkspaceCreationView {
+  stage: 'scheduling' | 'readiness';
+  state: 'observing' | 'waiting_capacity' | 'starting' | 'attention';
+  reason_code:
+    | 'observation_pending' | 'scheduler_unschedulable' | 'scheduling_other'
+    | 'scheduled' | 'invalid_image' | 'invalid_configuration'
+    | 'pull_deadline' | 'readiness_deadline' | 'ssh_deadline'
+    | 'legacy_receipt_held' | 'insufficient_capacity';
+  /** Frozen boot/pull hard boundary. SSH authentication has a separate grace. */
+  readiness_deadline_at: string | null;
+}
+
+/** VM compute state beside the human wait or Job/session status. */
+export interface WorkspaceLifecycleView {
+  state: 'warm' | 'releasing' | 'release_held' | 'suspended' | 'waking' | 'wake_held' | 'ready' | 'unsupported';
+  idle_expires_at?: string | null;
+  reason_code?: string | null;
+  next_retry_at?: string | null;
+}
+
 export interface Job {
   id: string;
   description: string;
@@ -2278,12 +2578,47 @@ export interface Job {
   workspace_contract?: WorkspaceContractProjection;
   /** Safe recovery state; controller coordinates and raw diagnostics are never included. */
   workspace_recovery?: WorkspaceRecoveryView | null;
+  vm_creation?: VMCreationView | null;
+  workspace_creation?: WorkspaceCreationView | null;
+  workspace_lifecycle?: WorkspaceLifecycleView | null;
 }
 
 /**
  * Public job-create projection owned by orchestrator.schemas.job_create.
  * Keep view state and internal delegation/identity commands outside this type.
  */
+/** An Expert template's authored content, as a create form copies it when the
+ *  user changes the template: the SRW runtime private config of its manifest
+ *  resource (`spec.runtime.config`) — `config_name`, `asset_name`, the authored
+ *  `config` fragment, `prompts`, `layers` — never the merged result. */
+export interface ExpertTemplateSource {
+  runtimeConfig: {
+    config_name?: string;
+    asset_name?: string;
+    config: Record<string, unknown>;
+    prompts?: Record<string, unknown>;
+    layers?: unknown[];
+  };
+  workspacePreference?: {backend: string} | null;
+}
+
+/** The portable bundle `GET /api/experts/{id}/export` returns: an Expert's
+ *  authored fragment, never its merged result. */
+export interface ExpertExportBundle {
+  name?: string;
+  display_name?: string;
+  description?: string;
+  expert_type?: string;
+  tags?: string[];
+  config: Record<string, unknown>;
+  prompts: Record<string, unknown>;
+}
+
+/** A Connector resource by name in a scope (omitted: the execution's own), or by uid. */
+export type ConnectorRef =
+  | {name: string; scope?: {kind: 'Account' | 'Project' | 'Catalog'; name: string}}
+  | {uid: string};
+
 export interface JobCreateRequest {
   workspace?: Record<string, unknown> | null;
   description: string;
@@ -2292,8 +2627,12 @@ export interface JobCreateRequest {
   instructions_upload_id?: string;
   document_path?: string;
   document_dir?: string;
-  /** Unified selector: bundled expert ID or DB expert UUID; omission uses the server default. */
-  expert?: string;
+  /** Unified selector: bundled expert ID or DB expert UUID; omission uses the server default.
+   *  Or a complete inline Expert (`{inline: ExpertSpec}`) when the form changed a template —
+   *  creation_ui_expert_workspace_connectors.md D2. */
+  expert?: string | {inline: Record<string, unknown>};
+  /** Display-only provenance for an inline Expert: the template it was copied from. */
+  expert_based_on?: string;
   /** Legacy bundled/deployment-config alias. Conflicting expert selectors are refused. */
   config_name?: string;
   /** Legacy DB-expert UUID alias; resolves over worker_base, not another bundled expert. */
@@ -2308,6 +2647,9 @@ export interface JobCreateRequest {
   datasource_ids?: string[];
   /** Mutually exclusive with datasource_ids, including an explicit empty array. */
   use_datasource_defaults?: boolean;
+  /** Connectors by manifest ref (`{alias: {ref: {name, scope?} | {uid}}}`), authorized like
+   *  datasource_ids. Combining it with datasource_ids or use_datasource_defaults is a 400. */
+  execution?: {connectors: Record<string, {ref: ConnectorRef}>};
   /** Ignored compatibility input; the server derives ownership from the authenticated caller. */
   user_id?: string;
   project_id?: string;
@@ -2317,19 +2659,25 @@ export interface JobCreateRequest {
 }
 
 /**
- * Result of the Mode B export (`POST /api/jobs/{id}/export-to-shared-folder`).
- * See knowledge-history/done/job_cloud_export.md §3.2.
+ * Result of the outbox re-sync (`POST /api/jobs/{id}/export-to-shared-folder`):
+ * the job's deliverables copied into a cloud folder shared with its owner.
+ * See knowledge-history/done/job_cloud_export.md §3.2 and
+ * main_cloud_as_connectors.md, slice 6.2.
  */
 export interface JobCloudExportResult {
   job_id: string;
   files_copied: number;
   /**
-   * False = the files were copied but the folder could not be shared with the
-   * caller, because the cloud backend has no account for them yet (Nextcloud
-   * provisions on first OIDC login). The export is real, the folder just
-   * isn't visible to them until they've signed in to the cloud once.
+   * False = the files were copied but the folder is not shared with the
+   * caller yet; `unshared` says why. The export is real, and a re-sync
+   * shares it.
    */
   shared: boolean;
+  /** Why the copy is not shared yet: no cloud account for the caller until
+   *  their first sign-in (`no_account`), the cloud's share rate limit
+   *  (`rate_limited`), or a share error (`share_failed`). Absent when
+   *  shared, and on orchestrators before main cloud slice 6. */
+  unshared?: 'no_account' | 'rate_limited' | 'share_failed';
   folder: {
     name: string;
     /** Path within the caller's own cloud drive — the share lands at its root,
@@ -2657,6 +3005,19 @@ export interface JobSubagentRoster {
   subagents: JobSubagent[];
 }
 
+/**
+ * `GET /api/persistent/threads/{thread_id}/subagents` — the children one
+ * session delegated, in spawn order. Same row projection as the job roster
+ * (`subagent_thread_payload`); `parent_tool_call_id` joins a row to the
+ * `delegate_agent` call that spawned it. A call still queued behind the
+ * concurrency cap has no row yet.
+ */
+export interface ThreadSubagentRoster {
+  parent_thread_id: string;
+  count: number;
+  subagents: JobSubagent[];
+}
+
 export type JobUsageState = 'measured' | 'no_usage' | 'predates_ledger' | 'unavailable';
 
 /** `GET /api/jobs/{job_id}/usage` — see per_job_cost_and_token_accounting.md §7. */
@@ -2910,6 +3271,8 @@ export type SessionQueueParkReason =
   | 'shutdown_cancelled'
   | 'completion_cas_failed'
   | 'reaper_max_attempts'
+  | 'retry_exhausted'
+  | 'model_unavailable'
   | string;
 
 /**
@@ -2921,6 +3284,9 @@ export type SessionQueueParkReason =
 export interface SessionQueueState {
   state: string;
   park_reason: SessionQueueParkReason | null;
+  /** The owner-facing text of a `model_unavailable` park (the server's
+   * refusal naming the model); null for every other reason. */
+  park_message?: string | null;
   parked_at: string | null;
   retryable: boolean;
   attempts: number;
@@ -2941,6 +3307,65 @@ export interface AdminCapacityParkedRow {
 }
 
 /** GET /api/admin/capacity — what the KEDA scaler sees, plus the parked worklist. */
+export interface VMResourceVector {
+  cpu_millicores: number | null;
+  memory_bytes: number | null;
+  ephemeral_storage_bytes: number | null;
+  kvm_devices: number | null;
+  tun_devices: number | null;
+  vhost_net_devices: number | null;
+}
+
+export type VMResourceCategory =
+  | 'allocatable' | 'headroom' | 'external' | 'unbound' | 'bound_reserved'
+  | 'active' | 'warm' | 'teardown' | 'available' | 'shortfall';
+
+export interface AdminVMClusterCapacity {
+  cluster_id: string;
+  namespace: string;
+  mode: 'off' | 'shadow' | 'enforce' | 'drain';
+  policy_digest: string;
+  available: boolean;
+  reason: string | null;
+  inventory: {
+    observed_at: string;
+    received_at: string;
+    age_seconds: number | null;
+    complete: boolean;
+    fresh: boolean;
+    stale_after_seconds: number;
+  } | null;
+  held: Record<'unbound' | 'bound_reserved' | 'active' | 'warm' | 'teardown' | 'total', VMResourceVector>;
+  waiting: {count: number; nonfit: number; oldest_age_seconds: number | null; bypasses: number; protected: number};
+  teardown: {count: number; unknown_age: number; overdue: number; oldest_progress_age_seconds: number | null; overdue_after_seconds: number};
+  totals: Record<VMResourceCategory, VMResourceVector> | null;
+  nodes: Array<{
+    name: string;
+    general_exclusion: string | null;
+    request_fit_required: true;
+    resources: Record<VMResourceCategory, VMResourceVector>;
+  }> | null;
+  orphaned_held: {count: number; resources: VMResourceVector} | null;
+  pending_external: VMResourceVector | null;
+  admission_budget: {
+    installation: VMResourceVector;
+    per_owner: VMResourceVector;
+    cpu_cost: {
+      millicores_per_vcpu_numerator: number;
+      millicores_per_vcpu_denominator: number;
+      launcher_overhead_millicores: number;
+    };
+  } | null;
+  count_backstop: {maximum: number | null; observed: number | null; reason: string | null};
+}
+
+export interface AdminVMCapacity {
+  available: boolean;
+  reason: string | null;
+  observed_at: string;
+  clusters: AdminVMClusterCapacity[];
+}
+
 export interface AdminCapacity {
   observed_at: string;
   executors: { total: number | null; ready: number | null; busy: number };
@@ -2949,6 +3374,7 @@ export interface AdminCapacity {
   desired: number;
   params: { min_replicas: number; reserve: number };
   parked?: AdminCapacityParkedRow[];
+  vm?: AdminVMCapacity;
 }
 
 /** POST /api/admin/run-queue/{unit}/unpark */

@@ -693,11 +693,13 @@ async def test_partial_multi_mount_start_rolls_back_in_reverse_order():
         await manager.start_all()
 
     commands = [command for command, _timeout in backend.commands]
-    assert len(commands) == 4
-    assert "mount_srw-thread-1-home.sh" in commands[0]
-    assert "mount_srw-thread-1-second.sh" in commands[1]
-    assert "unmount_srw-thread-1-second.sh" in commands[2]
-    assert "unmount_srw-thread-1-home.sh" in commands[3]
+    assert len(commands) == 5
+    # What is not in the set goes first, then the set mounts.
+    assert "retire_unplanned_rclone.sh" in commands[0]
+    assert "mount_srw-thread-1-home.sh" in commands[1]
+    assert "mount_srw-thread-1-second.sh" in commands[2]
+    assert "unmount_srw-thread-1-second.sh" in commands[3]
+    assert "unmount_srw-thread-1-home.sh" in commands[4]
     assert manager.active is False
     assert manager.mounts == []
     assert manager._mounts_by_id == {}
@@ -1469,3 +1471,344 @@ def test_staged_script_has_remote_kill_budget_before_ssh_timeout():
     command, ssh_timeout = backend.commands[-1]
     assert "timeout --signal=TERM --kill-after=5s 17s bash" in command
     assert ssh_timeout == 57
+
+
+def test_a_group_folder_mount_stays_adoptable():
+    """``nextcloud_chunk_size`` is not a secret: a Group Folder mount (which
+    sets it to 0) may still adopt its resident rclone."""
+    cfg = _cloud_mount_cfg()
+    mount = cfg["mounts"][0]
+    mount["source"]["config"]["nextcloud_chunk_size"] = "0"
+    assert RcloneMountManager._resident_adoption_safe(mount) is True
+    mount["source"]["config"]["bearer_token"] = "t"
+    assert RcloneMountManager._resident_adoption_safe(mount) is False
+
+
+# --------------------------------------------------------------------------- #
+# A resident the set no longer names (main cloud fix-up P1-3)
+# --------------------------------------------------------------------------- #
+
+
+class _TmpHomeBackend(FakeFencedRemoteBackend):
+    def __init__(self, home: Path) -> None:
+        super().__init__()
+        self.home = home
+
+    def resolve_home_path(self, relative_path: str) -> str:
+        return str(self.home / relative_path)
+
+
+def _sweep_env(tmp_path: Path, mounts: list[tuple[str, str]]) -> dict[str, str]:
+    """A mount table (``findmnt -rn -o SOURCE,TARGET``) the stubs read and
+    fusermount3 edits, and the other commands made inert."""
+    table = tmp_path / "mounts"
+    table.write_text("".join(f"{source} {target}\n" for source, target in mounts))
+    bash_env = tmp_path / "bash-env"
+    bash_env.write_text(
+        """
+findmnt() { cat "$SRW_TEST_MOUNTS"; }
+fusermount3() {
+  [ -n "${SRW_TEST_STUCK:-}" ] && return 1
+  _t="${@: -1}"
+  grep -v " $_t\\$" "$SRW_TEST_MOUNTS" > "$SRW_TEST_MOUNTS.new" || true
+  mv "$SRW_TEST_MOUNTS.new" "$SRW_TEST_MOUNTS"
+}
+fusermount() { return 1; }
+sudo() { return 1; }
+sleep() { :; }
+timeout() { shift; "$@"; }
+export -f findmnt fusermount3 fusermount sudo sleep timeout
+"""
+    )
+    return {
+        **os.environ,
+        "BASH_ENV": str(bash_env),
+        "SRW_TEST_MOUNTS": str(table),
+    }
+
+
+def _fake_rclone(config: str, target: str, rc_addr: str) -> subprocess.Popen:
+    """A process whose argv is what the mount script starts rclone with."""
+    resident = subprocess.Popen(
+        [
+            "rclone",
+            "-c",
+            "while :; do sleep 1; done",
+            "--config",
+            config,
+            "--cache-dir",
+            "/tmp/cache",
+            "mount",
+            "srw-thread-1-x:",
+            target,
+            "--rc",
+            "--rc-addr",
+            rc_addr,
+            "--rc-user",
+            "srw-thread-1",
+            "--rc-pass",
+            "residentPass_123456789012345",
+        ],
+        executable="/bin/bash",
+        start_new_session=True,
+    )
+    for _ in range(100):
+        if Path(f"/proc/{resident.pid}/cmdline").read_bytes().startswith(b"rclone\0"):
+            break
+        time.sleep(0.01)
+    return resident
+
+
+def _run_script(tmp_path: Path, name: str, body: str, env: dict[str, str]):
+    path = tmp_path / name
+    path.write_text(body)
+    return subprocess.run(["bash", str(path)], env=env, text=True, capture_output=True)
+
+
+def test_a_resident_no_longer_in_the_set_is_stopped_unmounted_and_removed(tmp_path):
+    """At a claim: the old fallback's ``home`` (the service account's
+    password in its rclone.conf) beside the converted ``outbox``. The home
+    rclone is stopped, its mount detached, its link and its state directory
+    (credential included) removed; the set's own resident, its link and the
+    script staging directory stay."""
+    home = tmp_path / "home"
+    workspace = tmp_path / "workspace"
+    cfg = _cloud_mount_cfg()
+    cfg["mounts"][0].update(
+        {"workspace_name": "outbox", "target_path": "/cloud/outbox"}
+    )
+    manager = RcloneMountManager(
+        thread_id="thread-12345678",
+        cloud_cfg=cfg,
+        workspace_backend=_TmpHomeBackend(home),
+        workspace_root=workspace,
+    )
+    planned = [manager._state_for_mount(cfg["mounts"][0], 0)]
+    base = home / ".cache/srw/rclone/thread-12345678"
+    for name in ("outbox", "home", "scripts"):
+        (base / name).mkdir(parents=True)
+    (base / "home/rclone.conf").write_text("[x]\npass = agent-service-secret\n")
+    (base / "home/resident.identity").write_text("1|" + "a" * 64 + "|active\n")
+    (base / "outbox/rclone.conf").write_text("[y]\n")
+    old_target = str(tmp_path / "cloud-home")
+    (workspace / "cloud").mkdir(parents=True)
+    (workspace / "cloud/home").symlink_to(old_target)
+    (workspace / "cloud/outbox").symlink_to("/cloud/outbox")
+    env = _sweep_env(
+        tmp_path,
+        [
+            ("srw-thread-1-home:", old_target),
+            ("srw-thread-1-outbox:", "/cloud/outbox"),
+        ],
+    )
+    resident = _fake_rclone(str(base / "home/rclone.conf"), old_target, "127.0.0.1:1")
+    try:
+        result = _run_script(
+            tmp_path,
+            "sweep.sh",
+            manager._unplanned_retirement_script(
+                planned, drain_rounds=2, retire_changed=False
+            ),
+            env,
+        )
+        resident.wait(timeout=5)
+    finally:
+        if resident.poll() is None:
+            os.killpg(resident.pid, signal.SIGKILL)
+            resident.wait(timeout=2)
+    assert result.returncode == 0, result.stderr
+    assert "__SRW_RCLONE_MOUNT_OK__" in result.stdout
+    assert not (base / "home").exists()
+    assert (base / "outbox/rclone.conf").exists() and (base / "scripts").is_dir()
+    assert not (workspace / "cloud/home").is_symlink()
+    assert (workspace / "cloud/outbox").is_symlink()
+    assert (tmp_path / "mounts").read_text() == "srw-thread-1-outbox: /cloud/outbox\n"
+
+
+def test_a_resident_whose_mount_will_not_detach_is_kept_and_reported(tmp_path):
+    home = tmp_path / "home"
+    manager = RcloneMountManager(
+        thread_id="thread-12345678",
+        cloud_cfg={"driver": "rclone", "mounts": []},
+        workspace_backend=_TmpHomeBackend(home),
+        workspace_root=tmp_path / "workspace",
+    )
+    base = home / ".cache/srw/rclone/thread-12345678"
+    (base / "docs").mkdir(parents=True)
+    (base / "docs/rclone.conf").write_text("[x]\n")
+    env = {
+        **_sweep_env(tmp_path, [("srw-thread-1-docs:", "/cloud/docs")]),
+        "SRW_TEST_STUCK": "1",
+    }
+    result = _run_script(
+        tmp_path,
+        "sweep.sh",
+        manager._unplanned_retirement_script([], drain_rounds=0, retire_changed=False),
+        env,
+    )
+    assert result.returncode == 85
+    assert "docs" in result.stderr
+    assert (base / "docs/rclone.conf").exists()
+
+
+def test_end_also_retires_a_planned_folder_whose_resident_has_another_spec(tmp_path):
+    """End's pass: a planned directory whose identity names another spec
+    (the folder changed since it was mounted) is retired as well, so the
+    exact terminal unmount after it finds nothing it must refuse. A claim
+    keeps it: its own probe heals it."""
+    home = tmp_path / "home"
+    cfg = _cloud_mount_cfg()
+    second = copy.deepcopy(cfg["mounts"][0])
+    second.update(
+        {"mount_id": "docs", "workspace_name": "docs", "target_path": "/cloud/docs"}
+    )
+    cfg["mounts"].append(second)
+    manager = RcloneMountManager(
+        thread_id="thread-12345678",
+        cloud_cfg=cfg,
+        workspace_backend=_TmpHomeBackend(home),
+        workspace_root=tmp_path / "workspace",
+    )
+    planned = [manager._state_for_mount(m, i) for i, m in enumerate(cfg["mounts"])]
+    base = home / ".cache/srw/rclone/thread-12345678"
+    for state, spec in zip(planned, (planned[0].resident_spec_digest, "b" * 64)):
+        directory = Path(state.state_dir)
+        directory.mkdir(parents=True)
+        (directory / "resident.identity").write_text(f"1|{spec}|active|x|0|p\n")
+    env = _sweep_env(tmp_path, [])
+    end = manager._unplanned_retirement_script(
+        planned, drain_rounds=0, retire_changed=True
+    )
+    assert _run_script(tmp_path, "end.sh", end, env).returncode == 0
+    assert (base / "home/resident.identity").exists()
+    assert not (base / "docs").exists()
+    Path(planned[1].state_dir).mkdir()
+    (Path(planned[1].state_dir) / "resident.identity").write_text(
+        "1|" + "b" * 64 + "|active\n"
+    )
+    claim = manager._unplanned_retirement_script(
+        planned, drain_rounds=0, retire_changed=False
+    )
+    assert _run_script(tmp_path, "claim.sh", claim, env).returncode == 0
+    assert (base / "docs/resident.identity").exists()
+
+
+@pytest.mark.asyncio
+async def test_end_retires_the_unplanned_before_the_exact_set():
+    backend = FakeFencedRemoteBackend()
+    ran: list[str] = []
+
+    def terminal(command, timeout, operation):
+        ran.append(operation)
+        return "__SRW_RCLONE_MOUNT_OK__\n"
+
+    backend.exec_terminal_claim_resource = terminal
+    manager = RcloneMountManager(
+        thread_id="thread-12345678",
+        cloud_cfg=_cloud_mount_cfg(),
+        workspace_backend=backend,
+        workspace_root=Path("/workspace"),
+    )
+    await manager.retire_existing(drain=True)
+    assert ran == [
+        "terminal rclone cleanup terminal_retire_unplanned_rclone.sh",
+        "terminal rclone cleanup terminal_unmount_srw-thread-1-home.sh",
+        "terminal rclone cleanup terminal_verify_rclone_zero.sh",
+    ]
+    sweep = next(
+        body
+        for path, body in backend.files.items()
+        if path.endswith("terminal_retire_unplanned_rclone.sh")
+    )
+    assert "retire_changed=yes" in sweep and "drain_rounds=60" in sweep
+
+
+@pytest.mark.asyncio
+async def test_a_claim_with_nothing_planned_still_retires_what_an_earlier_one_mounted():
+    backend = FakeFencedRemoteBackend()
+    manager = RcloneMountManager(
+        thread_id="thread-12345678",
+        cloud_cfg={"driver": "rclone", "mounts": []},
+        workspace_backend=backend,
+        workspace_root=Path("/workspace"),
+    )
+    await manager.start_all()
+    assert backend.resource_operations == [
+        "run rclone script retire_unplanned_rclone.sh"
+    ]
+    assert manager.active is False
+    # A pass that cannot finish never fails the claim; the next one retries.
+    backend.outputs_by_script["retire_unplanned_rclone.sh"] = "stuck\n"
+    await manager.start_all()
+    assert manager.active is False
+
+
+def test_a_resident_that_moved_in_the_set_is_stopped_at_its_own_rc_address(tmp_path):
+    """A folder ahead of this one left the set, so this mount's index (and
+    its rc port) moved: the probe finds the exact resident of its config and
+    target running at the old address and reports it, so the heal stops it
+    exactly before remounting at the new one."""
+    home = tmp_path / "home"
+    manager = RcloneMountManager(
+        thread_id="thread-12345678",
+        cloud_cfg=_cloud_mount_cfg(),
+        workspace_backend=_TmpHomeBackend(home),
+        workspace_root=tmp_path / "workspace",
+    )
+    mount = _cloud_mount_cfg()["mounts"][0]
+    target = tmp_path / "target"
+    target.mkdir()
+    state = replace(manager._state_for_mount(mount, 0), target_path=str(target))
+    Path(state.state_dir).mkdir(parents=True)
+    old_rc = "127.0.0.1:43999"
+    assert old_rc != state.rc_addr
+    env = _sweep_env(tmp_path, [])
+    (tmp_path / "bash-env").write_text(
+        (tmp_path / "bash-env").read_text()
+        + "\nmountpoint() { return 0; }\nexport -f mountpoint\n"
+    )
+    resident = _fake_rclone(state.config_path, state.target_path, old_rc)
+    try:
+        Path(state.identity_file).write_text(
+            f"1|{state.resident_spec_digest}|active|{'c' * 32}|{resident.pid}|"
+            "residentPass_123456789012345\n"
+        )
+        result = _run_script(
+            tmp_path, "probe.sh", manager._resident_probe_script(mount, state), env
+        )
+    finally:
+        os.killpg(resident.pid, signal.SIGKILL)
+        resident.wait(timeout=2)
+    assert result.returncode == 0, result.stderr
+    healed = manager._resident_state_from_probe(state, result.stdout)
+    assert healed.rc_addr == old_rc
+    assert healed.resident_generation == "c" * 32
+    # The exact stop then matches the resident it found.
+    assert old_rc in manager._unmount_script(healed)
+
+
+def test_the_delivered_record_rebuilds_the_residents_identity_without_secrets():
+    from shared.runtime.services.cloud_mount import resident_spec_record
+
+    manager = RcloneMountManager(
+        thread_id="thread-12345678",
+        cloud_cfg=_cloud_mount_cfg(),
+        workspace_backend=FakeFencedRemoteBackend(),
+        workspace_root=Path("/workspace"),
+    )
+    for cfg in (_cloud_mount_cfg(), _opencloud_mount_cfg()):
+        mount = cfg["mounts"][0]
+        mount["source"]["config"]["bearer_token"] = "t0ken"
+        mount["provider_flags"] = ["--webdav-headers=Authorization,hidden"]
+        record = resident_spec_record(mount)
+        text = json.dumps(record)
+        for secret in ("app-pass", "kc-secret", "t0ken", "hidden"):
+            assert secret not in text
+        original = manager._state_for_mount(mount, 1)
+        rebuilt = manager._state_for_mount(record, 1)
+        assert rebuilt.resident_spec_digest == original.resident_spec_digest
+        assert (rebuilt.state_dir, rebuilt.rc_addr, rebuilt.remote_name) == (
+            original.state_dir,
+            original.rc_addr,
+            original.remote_name,
+        )

@@ -9,7 +9,16 @@ from orchestrator.security.access import (
     _role_satisfies,
     _scope_permits_project,
     mcp_scope_project_id,
+    user_can_access_datasource,
 )
+from orchestrator.services.connector_secrets import (
+    CATALOG_SECRET_DETAIL,
+    FOREIGN_CONNECTOR_SECRET_DETAIL,
+    connector_policy_authorizes,
+    is_connector_secret_name,
+    is_own_connector_secret,
+)
+from orchestrator.services.datasource_policy import GENERIC_UNAVAILABLE_DETAIL
 from orchestrator.services.project_status import project_is_archived
 
 
@@ -18,6 +27,7 @@ class ManifestAuthority:
         self.db, self.user, self.request = db, user, request
         self.account = {"kind": "Account", "name": str(user["id"])}
         self.new_projects = set()
+        self._connector_policies = {}
 
     async def deny(self, detail):
         raise await _denied(
@@ -85,7 +95,9 @@ class ManifestAuthority:
                 )
         return scope
 
-    async def resource(self, row, *, write=False):
+    async def resource(self, row, *, write=False, reference=False):
+        """Authority over a resource row: read (default), write, or with
+        ``reference`` naming it from another document."""
         if row["kind"] == "Expert" and row.get("linked_id") and not write:
             token_project = mcp_scope_project_id(self.user)
             if token_project:
@@ -113,6 +125,30 @@ class ManifestAuthority:
                         "The selected Expert is outside this token's Project scope."
                     )
             return
+        if (
+            row["kind"] == "Connector"
+            and row.get("linked_id")
+            and reference
+            and not write
+        ):
+            # A datasource's Connector may be referenced by the connector
+            # policy, as its datasource is visible to the link API: by its
+            # owner, an administrator, everyone when public, and the members
+            # of a project it is linked to; never as a Catalog resource (a
+            # datasource's Connector is never one). Reading the resource
+            # itself stays with its scope, as for any resource: its config
+            # holds what the datasource API shows only its owner.
+            datasource = (
+                None
+                if row.get("scope_kind") == "Catalog"
+                else await self.db.get_datasource(str(row["linked_id"]))
+            )
+            if not datasource or not (
+                datasource.get("is_global")
+                or await user_can_access_datasource(self.user, self.db, datasource)
+            ):
+                await self.deny("The selected connector is not visible to this caller.")
+            return
         # Projects retain their actual membership authority, even when the
         # portable Project document is in its creator's Account scope.
         if row["kind"] == "Project" and row.get("linked_id"):
@@ -122,10 +158,59 @@ class ManifestAuthority:
         else:
             await self.scope(row["document"]["metadata"]["scope"], write=write)
 
-    async def secret(self, scope):
+    async def secret(self, scope, *, name=None):
+        """Authority to attach the secret ``name`` in ``scope`` to a process.
+
+        A Connector's own secret (``connector-<32 hex>``) is never lent this
+        way: only its Connector uses it (:meth:`connector_secret`), so a
+        reference from another resource cannot bypass the connector policy
+        or carry a credential the connector's driver never forwards.
+        """
         if scope["kind"] == "Catalog":
-            await self.deny(
-                "Shared catalog definitions cannot distribute catalog credentials."
-            )
+            await self.deny(CATALOG_SECRET_DETAIL)
+        if is_connector_secret_name(name):
+            await self.deny(FOREIGN_CONNECTOR_SECRET_DETAIL)
         # Reading the manifest is weaker than attaching credentials to a process.
         return await self.scope(scope, write=True)
+
+    async def connector_secret(self, ref, connector, *, project_ids=(), edit=False):
+        """Authority to use a linked Connector's own credentials (decision 11).
+
+        A connector shared with other users (public, or linked to their
+        project) lends its creator's credentials to their executions, as a
+        datasource always did.  So when ``ref`` names ``connector``'s own
+        resource secret, in the Connector's own scope, the connector policy
+        is the authority, and the only one: the secret is usable by work in
+        ``project_ids`` the policy authorizes this caller to attach the
+        connector to, whoever can write the secret's scope.  The owner's
+        ``scope_mode=projects`` connector outside its projects and a
+        project's knowledge base outside its project are refused, as their
+        delivery is.
+
+        ``edit`` is a manifest apply of the Connector's own document: the
+        store refuses that edit itself (a datasource's Connector is written
+        from its row), and the ordinary rule (:meth:`secret`) lets the
+        caller who could write it reach that refusal.  A reference to any
+        other secret is :meth:`secret`'s, which refuses a connector's; a
+        Catalog secret is refused either way.
+        """
+        scope = ref["scope"]
+        if scope["kind"] == "Catalog":
+            await self.deny(CATALOG_SECRET_DETAIL)
+        if not is_own_connector_secret(ref, connector):
+            return await self.secret(scope, name=ref.get("name"))
+        if await self._connector_policy(connector["linked_id"], project_ids):
+            return dict(scope)
+        if edit:
+            return await self.secret(scope)
+        return await self.deny(GENERIC_UNAVAILABLE_DETAIL)
+
+    async def _connector_policy(self, connector_id, project_ids):
+        """The connector policy's answer for this caller, once per connector
+        and set of projects."""
+        key = (str(connector_id), tuple(sorted(str(p) for p in project_ids)))
+        if key not in self._connector_policies:
+            self._connector_policies[key] = await connector_policy_authorizes(
+                self.db, self.user, connector_id, project_ids
+            )
+        return self._connector_policies[key]

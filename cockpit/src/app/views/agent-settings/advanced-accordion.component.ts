@@ -9,6 +9,24 @@ import {reasoningOptionsForModel} from './reasoning-options';
 import {ModelService} from '../../core/services/model.service';
 import {liftLegacyTiers} from '../experts/expert-config';
 
+const GIB_BYTES = 1024 ** 3;
+const VM_SIZE_UNITS: Record<string, number> = {
+  Ki: 1024, Mi: 1024 ** 2, Gi: GIB_BYTES, Ti: 1024 ** 4,
+  K: 1000, M: 1000 ** 2, G: 1000 ** 3, T: 1000 ** 4,
+};
+
+function vmQuantityInGiB(value: unknown): number | null {
+  if (typeof value !== 'string') return null;
+  const match = /^(\d+)(Ki|Mi|Gi|Ti|K|M|G|T)$/.exec(value.trim());
+  if (!match) return null;
+  const gib = Number(match[1]) * VM_SIZE_UNITS[match[2]] / GIB_BYTES;
+  return Number.isFinite(gib) && gib > 0 ? gib : null;
+}
+
+function validVmSizeGiB(value: number | null): value is number {
+  return value !== null && Number.isSafeInteger(value) && value > 0;
+}
+
 /**
  * Advanced settings tab: collapsible accordion sections for power-user settings.
  * One level of accordion only (no nesting).
@@ -18,17 +36,21 @@ import {liftLegacyTiers} from '../experts/expert-config';
   standalone: true,
     imports: [FormsModule, TranslocoPipe, AppIconComponent, AppTooltipDirective, PinOnInteractDirective],
   template: `
-    <div class="advanced-container">
+    <div class="advanced-container" [class.flat]="flat()">
       <!-- Inference Parameters -->
-      <div class="accordion-section" [class.expanded]="expanded().has('inference')">
-        <button type="button" class="accordion-header" (click)="toggleSection('inference')">
-          <app-icon size="md" class="accordion-icon">{{ expanded().has('inference') ? 'expand_less' : 'expand_more' }}</app-icon>
+      <div class="accordion-section" [class.expanded]="isOpen('inference')">
+        @if (!flat()) {
+        <button type="button" class="accordion-header" (click)="toggleSection('inference')" [attr.aria-expanded]="isOpen('inference')">
+          <app-icon size="md" class="accordion-icon">{{ isOpen('inference') ? 'expand_less' : 'expand_more' }}</app-icon>
           {{ 'advanced.sections.inference' | transloco }}
           @if (inferenceModifiedCount() > 0) {
             <span class="modified-badge">{{ inferenceModifiedCount() }}</span>
           }
         </button>
-        @if (expanded().has('inference')) {
+        } @else {
+          <h4 class="flat-heading">{{ 'advanced.sections.inference' | transloco }}</h4>
+        }
+        @if (isOpen('inference')) {
           <div class="accordion-body">
             <!-- One model runs the whole job since U1, so there is ONE
                  inference section (the per-phase strategic/tactical pair is
@@ -150,12 +172,16 @@ import {liftLegacyTiers} from '../experts/expert-config';
       </div>
 
       <!-- Limits & Safety -->
-      <div class="accordion-section" [class.expanded]="expanded().has('limits')">
-        <button type="button" class="accordion-header" (click)="toggleSection('limits')">
-          <app-icon size="md" class="accordion-icon">{{ expanded().has('limits') ? 'expand_less' : 'expand_more' }}</app-icon>
+      <div class="accordion-section" [class.expanded]="isOpen('limits')">
+        @if (!flat()) {
+        <button type="button" class="accordion-header" (click)="toggleSection('limits')" [attr.aria-expanded]="isOpen('limits')">
+          <app-icon size="md" class="accordion-icon">{{ isOpen('limits') ? 'expand_less' : 'expand_more' }}</app-icon>
           {{ 'advanced.sections.limits' | transloco }}
         </button>
-        @if (expanded().has('limits')) {
+        } @else {
+          <h4 class="flat-heading">{{ 'advanced.sections.limits' | transloco }}</h4>
+        }
+        @if (isOpen('limits')) {
           <div class="accordion-body">
             <div class="field-row" [class.modified]="messageCountThreshold() !== null">
               <label class="field-label">{{ 'advanced.labels.messageCountThreshold' | transloco }}</label>
@@ -210,12 +236,16 @@ import {liftLegacyTiers} from '../experts/expert-config';
       </div>
 
       <!-- Memory Tuning -->
-      <div class="accordion-section" [class.expanded]="expanded().has('memory')">
-        <button type="button" class="accordion-header" (click)="toggleSection('memory')">
-          <app-icon size="md" class="accordion-icon">{{ expanded().has('memory') ? 'expand_less' : 'expand_more' }}</app-icon>
+      <div class="accordion-section" [class.expanded]="isOpen('memory')">
+        @if (!flat()) {
+        <button type="button" class="accordion-header" (click)="toggleSection('memory')" [attr.aria-expanded]="isOpen('memory')">
+          <app-icon size="md" class="accordion-icon">{{ isOpen('memory') ? 'expand_less' : 'expand_more' }}</app-icon>
           {{ 'advanced.sections.memory' | transloco }}
         </button>
-        @if (expanded().has('memory')) {
+        } @else {
+          <h4 class="flat-heading">{{ 'advanced.sections.memory' | transloco }}</h4>
+        }
+        @if (isOpen('memory')) {
           <div class="accordion-body">
             <div class="field-row toggle-row" [class.modified]="memoryEnabled() !== null">
               <label class="toggle-label">
@@ -246,12 +276,16 @@ import {liftLegacyTiers} from '../experts/expert-config';
       </div>
 
       <!-- Context Management -->
-      <div class="accordion-section" [class.expanded]="expanded().has('context')">
-        <button type="button" class="accordion-header" (click)="toggleSection('context')">
-          <app-icon size="md" class="accordion-icon">{{ expanded().has('context') ? 'expand_less' : 'expand_more' }}</app-icon>
+      <div class="accordion-section" [class.expanded]="isOpen('context')">
+        @if (!flat()) {
+        <button type="button" class="accordion-header" (click)="toggleSection('context')" [attr.aria-expanded]="isOpen('context')">
+          <app-icon size="md" class="accordion-icon">{{ isOpen('context') ? 'expand_less' : 'expand_more' }}</app-icon>
           {{ 'advanced.sections.context' | transloco }}
         </button>
-        @if (expanded().has('context')) {
+        } @else {
+          <h4 class="flat-heading">{{ 'advanced.sections.context' | transloco }}</h4>
+        }
+        @if (isOpen('context')) {
           <div class="accordion-body">
             <div class="field-row toggle-row" [class.modified]="compactOnArchive() !== null">
               <label class="toggle-label">
@@ -264,18 +298,6 @@ import {liftLegacyTiers} from '../experts/expert-config';
               @if (compactOnArchive() !== null) {
                 <button type="button" class="reset-btn" (click)="compactOnArchive.set(null); emitChange()"><app-icon size="xs">close</app-icon></button>
               }
-            </div>
-            <div class="field-row" [class.modified]="keepRecentToolResults() !== null">
-              <label class="field-label">{{ 'advanced.labels.keepRecentToolResults' | transloco }}</label>
-              <div class="field-control">
-                <input type="number" class="form-input compact-input" min="0"
-                  [ngModel]="keepRecentToolResults() ?? resolvedKeepRecentToolResults()"
-                  (ngModelChange)="keepRecentToolResults.set($event); emitChange()"
-                  [disabled]="disabled()">
-                @if (keepRecentToolResults() !== null) {
-                  <button type="button" class="reset-btn" (click)="keepRecentToolResults.set(null); emitChange()"><app-icon size="xs">close</app-icon></button>
-                }
-              </div>
             </div>
             <div class="field-row" [class.modified]="keepRecentMessages() !== null">
               <label class="field-label">{{ 'advanced.labels.keepRecentMessages' | transloco }}</label>
@@ -294,12 +316,16 @@ import {liftLegacyTiers} from '../experts/expert-config';
       </div>
 
       <!-- Workspace -->
-      <div class="accordion-section" [class.expanded]="expanded().has('workspace')">
-        <button type="button" class="accordion-header" (click)="toggleSection('workspace')">
-          <app-icon size="md" class="accordion-icon">{{ expanded().has('workspace') ? 'expand_less' : 'expand_more' }}</app-icon>
+      <div class="accordion-section" [class.expanded]="isOpen('workspace')">
+        @if (!flat()) {
+        <button type="button" class="accordion-header" (click)="toggleSection('workspace')" [attr.aria-expanded]="isOpen('workspace')">
+          <app-icon size="md" class="accordion-icon">{{ isOpen('workspace') ? 'expand_less' : 'expand_more' }}</app-icon>
           {{ 'advanced.sections.workspace' | transloco }}
         </button>
-        @if (expanded().has('workspace')) {
+        } @else {
+          <h4 class="flat-heading">{{ 'advanced.sections.workspace' | transloco }}</h4>
+        }
+        @if (isOpen('workspace')) {
           <div class="accordion-body">
             <!-- The backend selector itself is a level-1 control, in the
                  Settings tab's EXECUTION group. This section keeps the tuning
@@ -307,7 +333,7 @@ import {liftLegacyTiers} from '../experts/expert-config';
             @if (isLiteBackend()) {
               <p class="field-hint lite-hint">{{ (isNoneBackend() ? 'advanced.hints.noneBackend' : 'advanced.hints.virtualBackend') | transloco }}</p>
             }
-            @if (effectiveBackend() === 'vm') {
+            @if (vmSizing() && effectiveBackend() === 'vm') {
               <div class="field-row" [class.modified]="vmCpuCores() !== null">
                 <label class="field-label">{{ 'advanced.labels.vmCpuCores' | transloco }}</label>
                 <div class="field-control">
@@ -323,26 +349,34 @@ import {liftLegacyTiers} from '../experts/expert-config';
               <div class="field-row" [class.modified]="vmMemory() !== null">
                 <label class="field-label">{{ 'advanced.labels.vmMemory' | transloco }}</label>
                 <div class="field-control">
-                  <input type="text" class="form-input compact-input" placeholder="16Gi"
+                  <input type="number" class="form-input compact-input" step="any" placeholder="16"
                     [ngModel]="vmMemory() ?? resolvedVmMemory()"
                     (ngModelChange)="vmMemory.set($event); emitChange()"
+                    [attr.aria-invalid]="vmMemoryInvalid()"
                     [disabled]="disabled()">
                   @if (vmMemory() !== null) {
                     <button type="button" class="reset-btn" (click)="vmMemory.set(null); emitChange()"><app-icon size="xs">close</app-icon></button>
                   }
                 </div>
+                @if (vmMemoryInvalid()) {
+                  <span class="field-hint size-error" role="alert">{{ 'advanced.hints.vmSizeWholeGiB' | transloco }}</span>
+                }
               </div>
               <div class="field-row" [class.modified]="vmDiskSize() !== null">
                 <label class="field-label">{{ 'advanced.labels.vmDiskSize' | transloco }}</label>
                 <div class="field-control">
-                  <input type="text" class="form-input compact-input" placeholder="20Gi"
+                  <input type="number" class="form-input compact-input" step="any" placeholder="20"
                     [ngModel]="vmDiskSize() ?? resolvedVmDiskSize()"
                     (ngModelChange)="vmDiskSize.set($event); emitChange()"
+                    [attr.aria-invalid]="vmDiskSizeInvalid()"
                     [disabled]="disabled()">
                   @if (vmDiskSize() !== null) {
                     <button type="button" class="reset-btn" (click)="vmDiskSize.set(null); emitChange()"><app-icon size="xs">close</app-icon></button>
                   }
                 </div>
+                @if (vmDiskSizeInvalid()) {
+                  <span class="field-hint size-error" role="alert">{{ 'advanced.hints.vmSizeWholeGiB' | transloco }}</span>
+                }
               </div>
             }
             <div class="field-row" [class.modified]="maxReadWords() !== null">
@@ -386,12 +420,16 @@ import {liftLegacyTiers} from '../experts/expert-config';
       </div>
 
       <!-- Shell -->
-      <div class="accordion-section" [class.expanded]="expanded().has('shell')">
-        <button type="button" class="accordion-header" (click)="toggleSection('shell')">
-          <app-icon size="md" class="accordion-icon">{{ expanded().has('shell') ? 'expand_less' : 'expand_more' }}</app-icon>
+      <div class="accordion-section" [class.expanded]="isOpen('shell')">
+        @if (!flat()) {
+        <button type="button" class="accordion-header" (click)="toggleSection('shell')" [attr.aria-expanded]="isOpen('shell')">
+          <app-icon size="md" class="accordion-icon">{{ isOpen('shell') ? 'expand_less' : 'expand_more' }}</app-icon>
           {{ 'advanced.sections.shell' | transloco }}
         </button>
-        @if (expanded().has('shell')) {
+        } @else {
+          <h4 class="flat-heading">{{ 'advanced.sections.shell' | transloco }}</h4>
+        }
+        @if (isOpen('shell')) {
           <div class="accordion-body">
             <div class="field-row" [class.modified]="shellMode() !== null">
               <label class="field-label">{{ 'advanced.labels.mode' | transloco }}</label>
@@ -455,12 +493,16 @@ import {liftLegacyTiers} from '../experts/expert-config';
       </div>
 
       <!-- Research -->
-      <div class="accordion-section" [class.expanded]="expanded().has('research')">
-        <button type="button" class="accordion-header" (click)="toggleSection('research')">
-          <app-icon size="md" class="accordion-icon">{{ expanded().has('research') ? 'expand_less' : 'expand_more' }}</app-icon>
+      <div class="accordion-section" [class.expanded]="isOpen('research')">
+        @if (!flat()) {
+        <button type="button" class="accordion-header" (click)="toggleSection('research')" [attr.aria-expanded]="isOpen('research')">
+          <app-icon size="md" class="accordion-icon">{{ isOpen('research') ? 'expand_less' : 'expand_more' }}</app-icon>
           {{ 'advanced.sections.research' | transloco }}
         </button>
-        @if (expanded().has('research')) {
+        } @else {
+          <h4 class="flat-heading">{{ 'advanced.sections.research' | transloco }}</h4>
+        }
+        @if (isOpen('research')) {
           <div class="accordion-body">
             <div class="field-row toggle-row" [class.modified]="proxyEnabled() !== null">
               <label class="toggle-label">
@@ -479,12 +521,16 @@ import {liftLegacyTiers} from '../experts/expert-config';
       </div>
 
       <!-- Auxiliary LLM -->
-      <div class="accordion-section" [class.expanded]="expanded().has('auxiliary')">
-        <button type="button" class="accordion-header" (click)="toggleSection('auxiliary')">
-          <app-icon size="md" class="accordion-icon">{{ expanded().has('auxiliary') ? 'expand_less' : 'expand_more' }}</app-icon>
+      <div class="accordion-section" [class.expanded]="isOpen('auxiliary')">
+        @if (!flat()) {
+        <button type="button" class="accordion-header" (click)="toggleSection('auxiliary')" [attr.aria-expanded]="isOpen('auxiliary')">
+          <app-icon size="md" class="accordion-icon">{{ isOpen('auxiliary') ? 'expand_less' : 'expand_more' }}</app-icon>
           {{ 'advanced.sections.auxiliary' | transloco }}
         </button>
-        @if (expanded().has('auxiliary')) {
+        } @else {
+          <h4 class="flat-heading">{{ 'advanced.sections.auxiliary' | transloco }}</h4>
+        }
+        @if (isOpen('auxiliary')) {
           <div class="accordion-body">
             <div class="field-row toggle-row" [class.modified]="auxEnabled() !== null">
               <label class="toggle-label">
@@ -535,12 +581,16 @@ import {liftLegacyTiers} from '../experts/expert-config';
 
       <!-- Session-specific: idle timeout -->
       @if (mode() === 'session') {
-        <div class="accordion-section" [class.expanded]="expanded().has('session')">
-          <button type="button" class="accordion-header" (click)="toggleSection('session')">
-            <app-icon size="md" class="accordion-icon">{{ expanded().has('session') ? 'expand_less' : 'expand_more' }}</app-icon>
+        <div class="accordion-section" [class.expanded]="isOpen('session')">
+          @if (!flat()) {
+          <button type="button" class="accordion-header" (click)="toggleSection('session')" [attr.aria-expanded]="isOpen('session')">
+            <app-icon size="md" class="accordion-icon">{{ isOpen('session') ? 'expand_less' : 'expand_more' }}</app-icon>
             {{ 'advanced.sections.session' | transloco }}
           </button>
-          @if (expanded().has('session')) {
+          } @else {
+            <h4 class="flat-heading">{{ 'advanced.sections.session' | transloco }}</h4>
+          }
+          @if (isOpen('session')) {
             <div class="accordion-body">
               <div class="field-row" [class.modified]="idleTimeout() !== null">
                 <label class="field-label">{{ 'advanced.labels.idleTimeout' | transloco }}</label>
@@ -610,6 +660,51 @@ import {liftLegacyTiers} from '../experts/expert-config';
       padding: 12px 14px;
       background: var(--panel-bg, var(--panel-bg));
     }
+    /* Flat: plain headings, and the fields flow into as many columns as the
+       width allows — the same component sits in a page column and in a
+       narrow side pane. */
+    .advanced-container.flat {
+      gap: 16px;
+    }
+    .flat .accordion-section,
+    .flat .accordion-section.expanded {
+      border: 0;
+      border-radius: 0;
+      overflow: visible;
+    }
+    .flat-heading {
+      margin: 0 0 8px;
+      padding-bottom: 4px;
+      border-bottom: 1px solid var(--border-hairline);
+      font-size: 11px;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+      color: var(--text-muted);
+    }
+    .flat .accordion-body {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0 16px;
+      padding: 0;
+      background: transparent;
+    }
+    .flat .accordion-body > .field-row,
+    .flat .accordion-body > .shared-params > .field-row {
+      flex: 1 1 14rem;
+      min-width: 0;
+    }
+    .flat .accordion-body > .lite-hint {
+      flex: 1 1 100%;
+    }
+    .flat .shared-params {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0 16px;
+      flex: 1 1 100%;
+      padding-top: 0;
+      border-top: 0;
+    }
     .shared-params {
       padding-top: 8px;
       border-top: 1px solid var(--border-color, var(--surface-0));
@@ -641,6 +736,7 @@ import {liftLegacyTiers} from '../experts/expert-config';
       color: var(--text-muted);
       margin-top: 2px;
     }
+    .size-error { color: var(--danger); }
     .info-icon {
       color: var(--text-muted);
       cursor: help;
@@ -743,6 +839,14 @@ export class AdvancedAccordionComponent {
    *  in ExecutionGroupComponent; this section reads it to grey the tools a lite
    *  tier cannot run and to scope what its own `getOverrides()` emits. */
   backendOverride = input<string | null>(null);
+  /** Render every section open under a plain heading instead of as a
+   *  collapsible accordion — the three-section host already puts this whole
+   *  component behind one "More settings" disclosure, and a second level of
+   *  collapsing inside it would be a third level overall. */
+  flat = input(false);
+  /** False when a create form's workspace picker owns the workspace (Slice A3):
+   *  templates carry their sizes, so the legacy VM sizing neither shows nor emits. */
+  vmSizing = input(true);
 
   change = output<void>();
 
@@ -771,14 +875,13 @@ export class AdvancedAccordionComponent {
 
   // --- Context ---
   readonly compactOnArchive = signal<boolean | null>(null);
-  readonly keepRecentToolResults = signal<number | null>(null);
   readonly keepRecentMessages = signal<number | null>(null);
 
   // --- Workspace ---
   private readonly modelService = inject(ModelService);
   readonly vmCpuCores = signal<number | null>(null);
-  readonly vmMemory = signal<string | null>(null);
-  readonly vmDiskSize = signal<string | null>(null);
+  readonly vmMemory = signal<number | null>(null);
+  readonly vmDiskSize = signal<number | null>(null);
   readonly maxReadWords = signal<number | null>(null);
   readonly maxWriteWords = signal<number | null>(null);
   readonly gitVersioning = signal<boolean | null>(null);
@@ -844,15 +947,21 @@ export class AdvancedAccordionComponent {
   readonly resolvedMemoryBudget = computed(() => (this.r('memory.budget_tokens') ?? 10000) as number);
 
   readonly resolvedCompactOnArchive = computed(() => (this.r('context_management.compact_on_archive') ?? true) as boolean);
-  readonly resolvedKeepRecentToolResults = computed(() => (this.r('context_management.keep_recent_tool_results') ?? 150) as number);
   readonly resolvedKeepRecentMessages = computed(() => (this.r('context_management.keep_recent_messages') ?? 10) as number);
 
   readonly resolvedWorkspaceBackend = computed(() => (this.r('workspace.backend') ?? 'sandbox') as string);
   readonly resolvedVmCpuCores = computed(() => (this.r('workspace.vm.cpu_cores') ?? 8) as number);
-  readonly resolvedVmMemory = computed(() => (this.r('workspace.vm.memory') ?? '16Gi') as string);
+  readonly resolvedVmMemory = computed(() => vmQuantityInGiB(this.r('workspace.vm.memory') ?? '16Gi'));
   // Empty means "the deployment's controller default" — the orchestrator omits
   // disk_size from the VM create payload unless a job sets it.
-  readonly resolvedVmDiskSize = computed(() => (this.r('workspace.vm.disk_size') ?? '') as string);
+  readonly resolvedVmDiskSize = computed(() => vmQuantityInGiB(this.r('workspace.vm.disk_size')));
+  readonly vmMemoryInvalid = computed(() => this.vmMemory() === null
+    ? this.resolvedVmMemory() === null : !validVmSizeGiB(this.vmMemory()));
+  readonly vmDiskSizeInvalid = computed(() => this.vmDiskSize() === null
+    ? this.r('workspace.vm.disk_size') != null && this.r('workspace.vm.disk_size') !== '' && this.resolvedVmDiskSize() === null
+    : !validVmSizeGiB(this.vmDiskSize()));
+  readonly vmSizingValid = computed(() => !this.vmSizing() || this.effectiveBackend() !== 'vm'
+    || (!this.vmMemoryInvalid() && !this.vmDiskSizeInvalid()));
   readonly resolvedMaxReadWords = computed(() => (this.r('workspace.max_read_words') ?? 25000) as number);
   readonly resolvedMaxWriteWords = computed(() => (this.r('workspace.max_write_words') ?? 10000) as number);
   readonly resolvedGitVersioning = computed(() => {
@@ -905,6 +1014,10 @@ export class AdvancedAccordionComponent {
   });
 
   // ===== Event handlers =====
+  isOpen(section: string): boolean {
+    return this.flat() || this.expanded().has(section);
+  }
+
   toggleSection(section: string): void {
     const next = new Set(this.expanded());
     if (next.has(section)) {
@@ -977,7 +1090,6 @@ export class AdvancedAccordionComponent {
     // Context
     const ctx: Record<string, unknown> = {};
     if (this.compactOnArchive() !== null) ctx['compact_on_archive'] = this.compactOnArchive();
-    if (this.keepRecentToolResults() !== null) ctx['keep_recent_tool_results'] = this.keepRecentToolResults();
     if (this.keepRecentMessages() !== null) ctx['keep_recent_messages'] = this.keepRecentMessages();
     if (Object.keys(ctx).length) o['context_management'] = ctx;
 
@@ -989,11 +1101,11 @@ export class AdvancedAccordionComponent {
     // selector; the host deep-merges the two `workspace` fragments.
     const lite = this.isLiteBackend();
     const ws: Record<string, unknown> = {};
-    if (this.effectiveBackend() === 'vm') {
+    if (this.vmSizing() && this.effectiveBackend() === 'vm') {
       const vm: Record<string, unknown> = {};
       if (this.vmCpuCores() !== null) vm['cpu_cores'] = this.vmCpuCores();
-      if (this.vmMemory() !== null) vm['memory'] = this.vmMemory();
-      if (this.vmDiskSize() !== null && this.vmDiskSize() !== '') vm['disk_size'] = this.vmDiskSize();
+      if (validVmSizeGiB(this.vmMemory())) vm['memory'] = `${this.vmMemory()}Gi`;
+      if (validVmSizeGiB(this.vmDiskSize())) vm['disk_size'] = `${this.vmDiskSize()}Gi`;
       if (Object.keys(vm).length) ws['vm'] = vm;
     }
     if (!this.isNoneBackend()) {
@@ -1066,7 +1178,6 @@ export class AdvancedAccordionComponent {
     this.memoryEnabled.set(null);
     this.memoryBudget.set(null);
     this.compactOnArchive.set(null);
-    this.keepRecentToolResults.set(null);
     this.keepRecentMessages.set(null);
     this.vmCpuCores.set(null);
     this.vmMemory.set(null);

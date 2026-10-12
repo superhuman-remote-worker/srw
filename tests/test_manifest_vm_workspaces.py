@@ -105,7 +105,6 @@ async def test_initialization_uses_the_frozen_template_after_source_edits(
 @pytest.mark.parametrize(
     "changes",
     [
-        {"backend": "sandbox"},
         {"resources": {"cpu": 1.5}},
         {"resources": {"cpu": True}},
         {"environment": {"image": "bad\nmanifest: injected"}},

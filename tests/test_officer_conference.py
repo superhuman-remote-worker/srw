@@ -30,6 +30,12 @@ from orchestrator.services.officer_post_views import (
 )
 from orchestrator.services.officer_watchdog import OfficerWatchdogDependencies
 from orchestrator.services.session_create_overrides import validated_reasoning_level
+from orchestrator.application import workflows as workflows_composition
+from orchestrator.services import officer_conference as officer_conference_module
+from orchestrator.services import (
+    persistent_provisioner as persistent_provisioner_module,
+)
+from orchestrator.services import session_wake as session_wake_module
 
 OFFICER_TID = str(uuid.uuid4())
 CONF_TID = str(uuid.uuid4())
@@ -97,7 +103,7 @@ def _view_deps(db, *, conference=None) -> OfficerPostViewDependencies:
         usage_ledger=None,
         # The card's own provisioner, exactly as the application binds it:
         # these cases never stood one up, so its real availability decides.
-        persistent_provisioner=orchestrator.main.persistent_provisioner,
+        persistent_provisioner=persistent_provisioner_module.persistent_provisioner,
         auto_pull_release_enabled=lambda: False,
         persistent_agent_reconciliation_enabled=lambda: False,
         find_open_conference_thread=AsyncMock(return_value=conference),
@@ -130,12 +136,18 @@ class TestHoldStamp:
         # Deliberately through ``main``'s surviving wrapper: B06's create funnel
         # stamps the hold through this name, and its factory reads
         # ``postgres_db`` per call — so this rebind still steers the operation.
-        monkeypatch.setattr(orchestrator.main, "postgres_db", db)
+        monkeypatch.setattr(orchestrator.main.app.state.resources, "postgres_db", db)
         from orchestrator.services import session_wake as sw
 
         monkeypatch.setattr(sw, "_resolve_live_agent", AsyncMock(return_value=None))
 
-        await orchestrator.main._hold_officer_for_conference(PROJECT_ID, CONF_TID)
+        await officer_conference_module.hold_officer_for_conference(
+            PROJECT_ID,
+            CONF_TID,
+            dependencies=workflows_composition.officer_conference_dependencies(
+                orchestrator.main.app.state.resources
+            ),
+        )
         db.set_project_officer_hold.assert_awaited_once()
         args, kwargs = db.set_project_officer_hold.await_args
         assert args == (PROJECT_ID,)
@@ -181,12 +193,15 @@ class TestConferenceConclude:
         # Deliberately through ``main``'s surviving wrapper: B06's thread-status
         # service and B09's End flow conclude through this name, and its factory
         # reads both globals per call — so both rebinds still steer.
-        monkeypatch.setattr(orchestrator.main, "postgres_db", db)
+        monkeypatch.setattr(orchestrator.main.app.state.resources, "postgres_db", db)
         kick = MagicMock()
-        monkeypatch.setattr(orchestrator.main, "_kick_officer_event_drain", kick)
+        monkeypatch.setattr(session_wake_module, "kick_event_drain", kick)
 
-        await orchestrator.main._conclude_conference_if_any(
-            _conference_row(status="ended")
+        await officer_conference_module.conclude_conference_if_any(
+            _conference_row(status="ended"),
+            dependencies=workflows_composition.officer_conference_dependencies(
+                orchestrator.main.app.state.resources
+            ),
         )
 
         db.set_project_officer_hold.assert_awaited_once_with(
@@ -633,7 +648,9 @@ class TestOpenConferenceAction:
         )
 
         notification_action_service.register_notification_actions(
-            dependencies=orchestrator.main._notification_action_dependencies()
+            dependencies=workflows_composition.notification_action_dependencies(
+                orchestrator.main.app.state.resources
+            )
         )
         handler = action_handler(category, "open_conference")
         assert handler is not None, f"{category} lost its open_conference action"

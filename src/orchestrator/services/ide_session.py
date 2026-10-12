@@ -28,7 +28,6 @@ from orchestrator.services.managed_repository_authority import (
 )
 
 from orchestrator.services import resolve_ssh_key_path
-from orchestrator.services.blocking_effect import joined_async_call
 from orchestrator.services.container_provisioner import (
     WORKSPACE_CREATION_CLAIM_TOKEN_CONTEXT_KEY,
     WORKSPACE_CREATION_RESERVATION_CONTEXT_KEY,
@@ -65,11 +64,39 @@ from shared.runtime.core.managed_repository import (
     managed_repository_agent_launch_command,
     managed_repository_agent_retirement_command,
     managed_repository_agent_zero_command,
+    managed_ssh_config_include_command,
+    render_ssh_identity_config,
 )
 
 logger = logging.getLogger(__name__)
 
 _VM_READY_TIMEOUT_SECONDS = 420
+_IDE_GIT_DIAGNOSTIC_PHASES = frozenset(
+    {
+        "authority",
+        "host_key",
+        "child_exit",
+        "child_timeout",
+        "child_spawn_error",
+        "child_io_error",
+    }
+)
+
+
+def _log_ide_git_setup_failure(
+    phase: str, *, job_id: str | None, exit_code: int | None = None
+) -> None:
+    """Record a fixed stage and child code, never key, command, or stderr."""
+
+    safe_phase = phase if phase in _IDE_GIT_DIAGNOSTIC_PHASES else "unknown"
+    safe_job = _canonical_runtime(job_id) or "-"
+    safe_code = exit_code if type(exit_code) is int else "-"
+    logger.warning(
+        "IDE scoped Git diagnostic job=%s phase=%s exit_code=%s",
+        safe_job,
+        safe_phase,
+        safe_code,
+    )
 
 
 def _canonical_runtime(value: Any) -> str | None:
@@ -102,7 +129,10 @@ def _settled_ide_restore_runtime(
     ):
         return None
     runtime = _canonical_runtime(session.get(WORKSPACE_RUNTIME_INCARNATION_KEY))
-    receipt_runtime = _canonical_runtime(creation.get("runtime_incarnation"))
+    receipt_runtime_value = creation.get("runtime_incarnation")
+    if isinstance(receipt_runtime_value, UUID):
+        receipt_runtime_value = str(receipt_runtime_value)
+    receipt_runtime = _canonical_runtime(receipt_runtime_value)
     if runtime is None or runtime != receipt_runtime or runtime == retired_runtime:
         return None
     return runtime
@@ -401,8 +431,35 @@ class IdeSessionService:
                 return current
             resumed = await self._current_ide_restore_runtime(job_id)
             if resumed is None:
-                # A restoring projection without an exact settled receipt is
-                # not authority to repeat external work.
+                # An unsettled exact attempt may outlive its issuing process.
+                # Read only the owner-named reservation; the shared helper
+                # reacquires its expired lease under the database owner lock.
+                if session_ctx.get("_restore_attempt_id"):
+                    reservation = (
+                        await self._db.get_current_unsettled_ide_restore_attempt(job_id)
+                    )
+                elif (
+                    _canonical_runtime(
+                        session_ctx.get(WORKSPACE_RUNTIME_INCARNATION_KEY)
+                    )
+                    is not None
+                ):
+                    # Pre-0300 runtime-bound IDEs have no attempt marker. A
+                    # current Pod UID and exact owner-named reservation are
+                    # required; UID-less historical projections stay held.
+                    reservation = await self._container_provisioner.get_current_ide_creation_result(
+                        job_id
+                    )
+                else:
+                    reservation = None
+                if isinstance(reservation, dict):
+                    await self._continue_unsettled_ide_restore(
+                        job_id,
+                        job,
+                        session_ctx,
+                        reservation,
+                        claimant_prefix="ide-post",
+                    )
                 return current
             resumed_runtime, _pod_ip = resumed
             source = str(session_ctx.get("source") or "")
@@ -469,7 +526,10 @@ class IdeSessionService:
             retired_runtime = _canonical_runtime(
                 session_ctx.get(WORKSPACE_RUNTIME_INCARNATION_KEY)
             )
-            if retired_runtime is None or not managed_k8s_restore:
+            # A UID-less expired projection is retryable only when the
+            # atomic admission below proves its exact zero-effect abort.
+            # Missing/stale receipts remain held by that database guard.
+            if not managed_k8s_restore:
                 return {
                     "status": "unavailable",
                     "error": "Retired IDE runtime cannot be restored safely",
@@ -485,8 +545,40 @@ class IdeSessionService:
         # retired A (or a retry already observing B's receipt) cannot be
         # rewritten in place: its reservation publishes B first, then a
         # runtime-guarded merge records restoring on B only.
+        creation_reservation = None
         if retired_runtime is None and not current_receipt:
-            await self._set_session_context(job_id, restore_context)
+            if managed_k8s_restore:
+                plan = await self._container_provisioner._ide_creation_plan(
+                    job_id,
+                    cpu="250m",
+                    memory="512Mi",
+                    cpu_limit="1000m",
+                    memory_limit="2Gi",
+                )
+                admission = await self._db.begin_managed_ide_restore_attempt(
+                    job_id,
+                    attempt_id=str(uuid4()),
+                    proposed_context={
+                        **restore_context,
+                        "restore_type": "k8s_container",
+                    },
+                    desired_manifest_digest=str(plan["digest"]),
+                    claimant=f"ide-issuer:{uuid4()}",
+                )
+                if admission.get("disposition") != "accepted":
+                    # A concurrent POST may have committed the exact winner
+                    # while this caller waited on the owner row. Report its
+                    # current public state without creating another task.
+                    observed = await self.get_session_status(job_id)
+                    if observed.get("status") == "restoring":
+                        return observed
+                    return {
+                        "status": "unavailable",
+                        "error": "IDE restore admission is unavailable",
+                    }
+                creation_reservation = admission["reservation"]
+            else:
+                await self._set_session_context(job_id, restore_context)
 
         # Start async restore (VM provisioning + snapshot extraction)
         # This runs in the background — the cockpit polls GET /ide for updates
@@ -499,6 +591,7 @@ class IdeSessionService:
             restore_operation_id=retired_runtime,
             restore_context=restore_context,
             expected_restore_runtime=None,
+            creation_reservation=creation_reservation,
         )
 
         return {
@@ -527,6 +620,7 @@ class IdeSessionService:
         restore_operation_id: str | None,
         restore_context: dict[str, Any] | None,
         expected_restore_runtime: str | None,
+        creation_reservation: dict[str, Any] | None = None,
     ) -> None:
         """Start at most one local restore for a durable IDE generation."""
 
@@ -535,6 +629,9 @@ class IdeSessionService:
 
         async def run() -> None:
             try:
+                kwargs: dict[str, Any] = {}
+                if creation_reservation is not None:
+                    kwargs["creation_reservation"] = creation_reservation
                 await self._restore_session(
                     job_id,
                     job,
@@ -544,6 +641,7 @@ class IdeSessionService:
                     restore_operation_id=restore_operation_id,
                     restore_context=restore_context,
                     expected_restore_runtime=expected_restore_runtime,
+                    **kwargs,
                 )
             finally:
                 current = asyncio.current_task()
@@ -551,6 +649,216 @@ class IdeSessionService:
                     self._restore_tasks.pop(job_id, None)
 
         self._restore_tasks[job_id] = asyncio.create_task(run())
+
+    async def _continue_unsettled_ide_restore(
+        self,
+        job_id: str,
+        job: dict[str, Any],
+        ide: dict[str, Any],
+        reservation: dict[str, Any],
+        *,
+        claimant_prefix: str,
+    ) -> bool:
+        """Reclaim only an expired exact IDE generation, for POST or maintenance."""
+
+        if self._restore_task_is_active(job_id) or not self._container_provisioner:
+            return False
+        source = ide.get("source")
+        snapshot_type = ide.get("snapshot_type")
+        if (
+            ide.get("status") != "restoring"
+            or ide.get("restore_type") != "k8s_container"
+            or (source, snapshot_type)
+            not in {
+                ("gitea", "gitea"),
+                ("snapshot", "pod"),
+            }
+            or str(reservation.get("owner_kind") or "") != "job"
+            or str(reservation.get("owner_id") or "") != job_id
+            or str(reservation.get("scope") or "") != "ide"
+            or str(reservation.get("operation_kind") or "") != "restore"
+            or str(reservation.get("id") or "")
+            != ide.get(WORKSPACE_CREATION_RESERVATION_CONTEXT_KEY)
+            or str(reservation.get("claim_token") or "")
+            != ide.get(WORKSPACE_CREATION_CLAIM_TOKEN_CONTEXT_KEY)
+            or reservation.get("settled_at") is not None
+            or reservation.get("cancel_requested_at") is not None
+            or reservation.get("result_kind") is not None
+            or reservation.get("phase") not in {"reserved", "mutating", "runtime_bound"}
+        ):
+            return False
+        attempt_id = ide.get("_restore_attempt_id")
+        fingerprint = reservation.get("lifecycle_fingerprint")
+        if isinstance(fingerprint, str):
+            try:
+                fingerprint = json.loads(fingerprint)
+            except json.JSONDecodeError:
+                return False
+        if not isinstance(fingerprint, dict):
+            return False
+        current_runtime = _canonical_runtime(ide.get(WORKSPACE_RUNTIME_INCARNATION_KEY))
+        raw_reservation_runtime = reservation.get("runtime_incarnation")
+        reservation_runtime = _canonical_runtime(
+            str(raw_reservation_runtime)
+            if raw_reservation_runtime is not None
+            else None
+        )
+        if attempt_id is not None:
+            # 0300 attempt: the whole signed source and persisted marker must
+            # match. A Pod may exist even before the UID reached the owner.
+            if (
+                current_runtime is not None and current_runtime != reservation_runtime
+            ) or (
+                fingerprint.get("restore_attempt_id") != attempt_id
+                or fingerprint.get("restore_source") != source
+                or fingerprint.get("restore_snapshot_type") != snapshot_type
+            ):
+                return False
+        elif (
+            current_runtime is None
+            or reservation_runtime != current_runtime
+            or reservation.get("phase") != "runtime_bound"
+            or "restore_attempt_id" in fingerprint
+        ):
+            # The legacy arm cannot infer authority from a UID-less intent.
+            return False
+
+        plan = await self._container_provisioner._ide_creation_plan(
+            job_id,
+            cpu="250m",
+            memory="512Mi",
+            cpu_limit="1000m",
+            memory_limit="2Gi",
+        )
+        digest = str(plan.get("digest") or "")
+        if digest != str(reservation.get("desired_manifest_digest") or ""):
+            return False
+        try:
+            token = int(reservation["claim_token"])
+        except (TypeError, ValueError, KeyError):
+            return False
+        kwargs: dict[str, Any] = {}
+        if attempt_id is not None:
+            kwargs["expected_restore_attempt_id"] = str(attempt_id)
+        claimed = await self._db.reserve_managed_repository_workspace_creation(
+            job_id,
+            owner_kind="job",
+            scope="ide",
+            claimant=f"{claimant_prefix}:{uuid4()}",
+            lease_seconds=1800,
+            operation_kind="restore",
+            desired_manifest_digest=digest,
+            expected_existing_reservation_id=str(reservation["id"]),
+            expected_existing_claim_token=token,
+            **kwargs,
+        )
+        if (
+            not isinstance(claimed, dict)
+            or claimed.get("id") != reservation["id"]
+            or claimed.get("reservation_generation")
+            != reservation.get("reservation_generation")
+            or claimed.get("desired_manifest_digest") != digest
+            or _canonical_runtime(
+                str(claimed["runtime_incarnation"])
+                if claimed.get("runtime_incarnation") is not None
+                else None
+            )
+            != reservation_runtime
+        ):
+            return False
+        self._schedule_restore_task(
+            job_id,
+            job,
+            str(source),
+            int(ide.get("cpu_cores") or 8),
+            str(ide.get("memory") or "16Gi"),
+            restore_operation_id=None,
+            restore_context={"snapshot_type": snapshot_type},
+            expected_restore_runtime=None,
+            creation_reservation=claimed,
+        )
+        return True
+
+    async def reconcile_pending_ide_restore_attempts(self, *, limit: int = 25) -> int:
+        """Continue expired, exact IDE attempts without a second owner POST."""
+
+        if self._db is None or self._container_provisioner is None:
+            return 0
+        if not getattr(self._container_provisioner, "is_available", False):
+            return 0
+        if type(limit) is not int or not 1 <= limit <= 100:
+            return 0
+        cursor = getattr(self, "_ide_restore_reconcile_cursor", 0)
+        rows = await self._db.list_pending_ide_restore_attempts(
+            limit=limit, after_generation=cursor
+        )
+        if not rows and cursor:
+            cursor = 0
+            rows = await self._db.list_pending_ide_restore_attempts(
+                limit=limit, after_generation=0
+            )
+        if rows:
+            self._ide_restore_reconcile_cursor = int(rows[-1]["reservation_generation"])
+        else:
+            self._ide_restore_reconcile_cursor = cursor
+
+        scheduled = 0
+        for row in rows:
+            job_id = str(row["owner_id"])
+            if self._restore_task_is_active(job_id):
+                continue
+            job = await self._get_job(job_id)
+            if not isinstance(job, dict):
+                continue
+            ide = self._parse_context(job).get("ide_session")
+            fingerprint = row.get("lifecycle_fingerprint")
+            if isinstance(fingerprint, str):
+                try:
+                    fingerprint = json.loads(fingerprint)
+                except json.JSONDecodeError:
+                    continue
+            if (
+                not isinstance(ide, dict)
+                or not isinstance(fingerprint, dict)
+                or ide.get("status") != "restoring"
+                or ide.get("restore_type") != "k8s_container"
+                or ide.get("_restore_attempt_id")
+                != fingerprint.get("restore_attempt_id")
+                or ide.get("_creation_reservation_id") != str(row["id"])
+                or ide.get("_creation_claim_token") != str(row["claim_token"])
+            ):
+                continue
+            source = str(ide.get("source") or "")
+            if source not in {"gitea", "snapshot"}:
+                continue
+            if row.get("result_kind") == "settled":
+                raw_runtime = row.get("runtime_incarnation")
+                runtime = _canonical_runtime(
+                    str(raw_runtime) if raw_runtime is not None else None
+                )
+                if runtime is None or ide.get("_runtime_incarnation") != runtime:
+                    continue
+                self._schedule_restore_task(
+                    job_id,
+                    job,
+                    source,
+                    int(ide.get("cpu_cores") or 8),
+                    str(ide.get("memory") or "16Gi"),
+                    restore_operation_id=None,
+                    restore_context={"snapshot_type": ide.get("snapshot_type")},
+                    expected_restore_runtime=runtime,
+                )
+                scheduled += 1
+                continue
+            if await self._continue_unsettled_ide_restore(
+                job_id,
+                job,
+                ide,
+                row,
+                claimant_prefix="ide-maintenance",
+            ):
+                scheduled += 1
+        return scheduled
 
     async def stop_session(self, job_id: str) -> dict[str, Any]:
         """Manually tear down an active IDE session.
@@ -565,13 +873,53 @@ class IdeSessionService:
         ctx = self._parse_context(job)
         session_ctx = ctx.get("ide_session", {})
         status = session_ctx.get("status")
-
-        if status not in ("active", "idle", "restoring", "cleanup_pending", "failed"):
-            return {"status": "no_active_session"}
-
         restore_type = session_ctx.get("restore_type", "vm")
         expected_runtime_incarnation = session_ctx.get("_runtime_incarnation")
-        stale_target_settled = False
+        retrying_exact_cleanup = (
+            status == "retiring_process_zero"
+            and restore_type == "k8s_container"
+            and isinstance(session_ctx.get("container_name"), str)
+            and bool(session_ctx["container_name"])
+            and _canonical_runtime(expected_runtime_incarnation) is not None
+        )
+
+        if (
+            status not in ("active", "idle", "restoring", "cleanup_pending", "failed")
+            and not retrying_exact_cleanup
+        ):
+            return {"status": "no_active_session"}
+
+        if (
+            status == "restoring"
+            and restore_type == "k8s_container"
+            and expected_runtime_incarnation is None
+            and session_ctx.get("_restore_attempt_id")
+            and session_ctx.get("_creation_reservation_id")
+            and session_ctx.get("_creation_claim_token")
+            and self._container_provisioner is not None
+        ):
+            try:
+                token = int(session_ctx["_creation_claim_token"])
+            except (TypeError, ValueError):
+                return {
+                    "status": "cleanup_pending",
+                    "job_id": job_id,
+                    "retryable": True,
+                }
+            cancelled = await self._container_provisioner.cancel_ide_restore_attempt(
+                job_id,
+                attempt_id=str(session_ctx["_restore_attempt_id"]),
+                reservation_id=str(session_ctx["_creation_reservation_id"]),
+                claim_token=token,
+            )
+            if (
+                isinstance(cancelled, dict)
+                and cancelled.get("reconciliation_outcome") == "aborted"
+            ):
+                return {"status": "stopped", "job_id": job_id}
+            # A started effect needs the native same-generation reconciler.
+            # A refused claim cannot prove that Pod/process effects are gone.
+            return {"status": "cleanup_pending", "job_id": job_id, "retryable": True}
 
         if restore_type in ("container", "k8s_container"):
             container_name = session_ctx.get("container_name")
@@ -580,8 +928,45 @@ class IdeSessionService:
                     job_id,
                     expected_runtime_incarnation=expected_runtime_incarnation,
                 )
-                deleted = outcome.current_deleted
-                stale_target_settled = outcome.stale_target_settled
+                pending = {
+                    "status": "cleanup_pending",
+                    "job_id": job_id,
+                    "retryable": True,
+                }
+                if not (outcome.current_deleted or outcome.stale_target_settled):
+                    return pending
+                reconcile = getattr(
+                    type(self._container_provisioner),
+                    "reconcile_ide_cleanup_intent",
+                    None,
+                )
+                if _canonical_runtime(
+                    expected_runtime_incarnation
+                ) is None or not callable(reconcile):
+                    return pending
+                try:
+                    cleanup = (
+                        await self._container_provisioner.reconcile_ide_cleanup_intent(
+                            job_id,
+                            expected_runtime_incarnation=expected_runtime_incarnation,
+                        )
+                    )
+                    if cleanup.superseded:
+                        return {
+                            "status": "superseded",
+                            "job_id": job_id,
+                            "retryable": False,
+                        }
+                    if not cleanup.settled:
+                        return pending
+                except Exception:
+                    logger.exception(
+                        "Failed to settle exact IDE cleanup for job %s", job_id
+                    )
+                    return pending
+                # Native settlement atomically closes the intent and projects
+                # expired. Never overwrite its retiring state on interruption.
+                deleted = True
             else:
                 deleted = bool(
                     container_name
@@ -601,31 +986,19 @@ class IdeSessionService:
                     deleted = await self._delete_ide_vm(job_id, vm_name)
                 except Exception as e:
                     logger.warning("Failed to delete IDE VM %s: %s", vm_name, e)
-        if stale_target_settled:
-            return {
-                "status": "superseded",
-                "job_id": job_id,
-                "retryable": False,
-            }
         if not deleted:
+            if restore_type == "k8s_container":
+                return {
+                    "status": "cleanup_pending",
+                    "job_id": job_id,
+                    "retryable": True,
+                }
             updates = {
                 "status": "cleanup_pending",
                 "code_server_url": None,
                 "cleanup_failure": "managed_repository_process_zero_unproven",
             }
-            if restore_type == "k8s_container":
-                if not await self._set_session_context_if_runtime(
-                    job_id,
-                    updates,
-                    expected_runtime_incarnation=expected_runtime_incarnation,
-                ):
-                    return {
-                        "status": "superseded",
-                        "job_id": job_id,
-                        "retryable": False,
-                    }
-            else:
-                await self._set_session_context(job_id, updates)
+            await self._set_session_context(job_id, updates)
             return {"status": "cleanup_pending", "job_id": job_id, "retryable": True}
 
         updates = {
@@ -809,6 +1182,7 @@ class IdeSessionService:
                     job_id,
                     claimant=claimant,
                     lease_seconds=300,
+                    expected_runtime_incarnation=runtime_incarnation,
                 )
             except Exception:
                 logger.warning(
@@ -941,22 +1315,73 @@ class IdeSessionService:
         job_id: str,
         *,
         operation_id: str | None,
+        creation_reservation: dict[str, Any] | None = None,
+        replacement_restore_context: dict[str, Any] | None = None,
+        expected_runtime: str | None = None,
     ) -> tuple[str, str] | None:
         """Create B, or resume the exact B after a committed/lost response."""
 
         if not self._container_provisioner:
             return None
+        if expected_runtime is not None:
+            if creation_reservation is not None:
+                reserved_runtime = creation_reservation.get("runtime_incarnation")
+                if (
+                    _canonical_runtime(
+                        str(reserved_runtime) if reserved_runtime is not None else None
+                    )
+                    != expected_runtime
+                ):
+                    return None
+            elif operation_id is not None:
+                return None
         if operation_id is None:
-            current = await self._current_ide_restore_runtime(job_id)
+            if creation_reservation is not None:
+                current_creation = (
+                    await self._container_provisioner.get_current_ide_creation_result(
+                        job_id
+                    )
+                )
+                if current_creation is not None and (
+                    str(current_creation.get("id") or "")
+                    != str(creation_reservation.get("id") or "")
+                    or str(current_creation.get("claim_token") or "")
+                    != str(creation_reservation.get("claim_token") or "")
+                ):
+                    return None
+                current = (
+                    await self._current_ide_restore_runtime(
+                        job_id, creation=current_creation
+                    )
+                    if current_creation is not None
+                    else None
+                )
+            else:
+                current = await self._current_ide_restore_runtime(job_id)
+            if expected_runtime is not None and creation_reservation is None:
+                # An unbound maintenance callback may only continue its
+                # already-settled B; it must never create successor C.
+                if current is None or current[0] != expected_runtime:
+                    return None
             if current is not None:
                 return current
         try:
             if operation_id is None:
-                await self._container_provisioner.create_ide_pod(job_id)
+                if creation_reservation is not None:
+                    await self._container_provisioner.create_ide_pod(
+                        job_id, creation_reservation=creation_reservation
+                    )
+                else:
+                    await self._container_provisioner.create_ide_pod(job_id)
             else:
                 await self._container_provisioner.create_ide_pod(
                     job_id,
                     operation_id=operation_id,
+                    **(
+                        {"replacement_restore_context": replacement_restore_context}
+                        if replacement_restore_context is not None
+                        else {}
+                    ),
                 )
         except Exception:
             logger.warning(
@@ -992,6 +1417,7 @@ class IdeSessionService:
         restore_operation_id: str | None = None,
         restore_context: dict[str, Any] | None = None,
         expected_restore_runtime: str | None = None,
+        creation_reservation: dict[str, Any] | None = None,
     ) -> None:
         """Background task: provision environment and start code-server.
 
@@ -1018,10 +1444,27 @@ class IdeSessionService:
                 restored = await self._create_or_resume_k8s_ide(
                     job_id,
                     operation_id=restore_operation_id,
+                    creation_reservation=creation_reservation,
+                    expected_runtime=expected_restore_runtime,
+                    replacement_restore_context=(
+                        {
+                            **(restore_context or {}),
+                            "status": "restoring",
+                            "source": source,
+                            "snapshot_type": snapshot_type,
+                        }
+                        if restore_operation_id is not None
+                        else None
+                    ),
                 )
                 if restored is None:
                     return
                 runtime, _pod_ip = restored
+                if (
+                    expected_restore_runtime is not None
+                    and runtime != expected_restore_runtime
+                ):
+                    return
                 managed_restore_claim = await self._claim_ide_restore_work(
                     job_id,
                     runtime_incarnation=runtime,
@@ -1334,19 +1777,13 @@ class IdeSessionService:
             raise ManagedRepositoryAuthorityError("repository_authority_invalid")
         managed_root = f"{home_path}/.ssh/srw-managed"
         socket_path = f"{managed_root}/sockets/{authority_id}.sock"
-        ssh_config_path = f"{home_path}/.ssh/config"
-        config = (
-            f"Host {alias}\n"
-            f"  HostName {host}\n"
-            f"  Port {port}\n"
-            "  User git\n"
-            f"  IdentityAgent {socket_path}\n"
-            # The dedicated agent contains exactly this authority's key. Do
-            # not set IdentitiesOnly without an IdentityFile: OpenSSH would
-            # suppress the agent-only identity we intentionally keep off disk.
-            "  BatchMode yes\n"
-            "  StrictHostKeyChecking accept-new\n"
-            f"  UserKnownHostsFile {managed_root}/known_hosts\n"
+        config = render_ssh_identity_config(
+            alias=alias,
+            socket_path=socket_path,
+            known_hosts_path=f"{managed_root}/known_hosts",
+            host=host,
+            port=port,
+            user="git",
         )
         quoted_workspace = shlex.quote(workspace_path)
         quoted_url = shlex.quote(clone_url)
@@ -1379,12 +1816,8 @@ class IdeSessionService:
             f"{shlex.quote(managed_root + '/sockets')} "
             f"{shlex.quote(managed_root + '/agents')}; "
             f"exec 8>{shlex.quote(managed_root + '/setup.lock')}; flock -x 8; "
-            f"touch {shlex.quote(ssh_config_path)}; "
-            "grep -qxF 'Include ~/.ssh/srw-managed/config.d/*.conf' "
-            f"{shlex.quote(ssh_config_path)} || "
-            "printf '\\nInclude ~/.ssh/srw-managed/config.d/*.conf\\n' "
-            f">> {shlex.quote(ssh_config_path)}; "
-            f"chmod 600 {shlex.quote(ssh_config_path)}; "
+            + managed_ssh_config_include_command(home_path=home_path)
+            + " || exit 1; "
             + launch_agent
             + "; "
             + f"mkdir -p {quoted_workspace}; "
@@ -1398,7 +1831,11 @@ class IdeSessionService:
 
     @staticmethod
     async def _run_secret_stdin_process(
-        command: list[str], secret: bytearray, *, timeout: float = 120.0
+        command: list[str],
+        secret: bytearray,
+        *,
+        timeout: float = 120.0,
+        diagnostic_job_id: str | None = None,
     ) -> bool:
         """Run a trusted command without retaining or reporting its output."""
 
@@ -1420,11 +1857,24 @@ class IdeSessionService:
                     process.stdin.write(secret)
                     await process.stdin.drain()
                     process.stdin.close()
+                    # drain() only waits for backpressure; uvloop can retain
+                    # this bytearray until its queued write is flushed. Wait
+                    # for stdin closure before erasing the same buffer.
+                    await process.stdin.wait_closed()
                     secret[:] = b"\x00" * len(secret)
-                    await process.wait()
-                    return process.returncode == 0
+                    exit_code = await process.wait()
+                    if exit_code != 0:
+                        _log_ide_git_setup_failure(
+                            "child_exit",
+                            job_id=diagnostic_job_id,
+                            exit_code=exit_code,
+                        )
+                    return exit_code == 0
 
-            return bool(await joined_async_call(_complete()))
+            # The owned subprocess is cancellable: let lease loss interrupt
+            # drain/wait, then terminate and reap below before releasing it.
+            # Shielding the whole command would defer revocation until timeout.
+            return await _complete()
         except asyncio.CancelledError:
             # Durable restore-work lease loss cancels the owner task. Reap the
             # SSH transport before returning the token so no old replica keeps
@@ -1432,9 +1882,16 @@ class IdeSessionService:
             if process is not None and process.returncode is None:
                 await stop_and_reap(process)
             raise
-        except (OSError, asyncio.TimeoutError):
+        except asyncio.TimeoutError:
             if process is not None and process.returncode is None:
                 await stop_and_reap(process)
+            _log_ide_git_setup_failure("child_timeout", job_id=diagnostic_job_id)
+            return False
+        except OSError:
+            phase = "child_io_error" if process is not None else "child_spawn_error"
+            if process is not None and process.returncode is None:
+                await stop_and_reap(process)
+            _log_ide_git_setup_failure(phase, job_id=diagnostic_job_id)
             return False
         finally:
             for index in range(len(secret)):
@@ -1481,11 +1938,17 @@ class IdeSessionService:
                     expected_host_key_fingerprint=(expected_host_key_fingerprint),
                 ) as ssh_command:
                     return await self._run_secret_stdin_process(
-                        ssh_command, private_key
+                        ssh_command,
+                        private_key,
+                        diagnostic_job_id=job_id,
                     )
             finally:
                 private_key[:] = b"\x00" * len(private_key)
-        except (ManagedRepositoryAuthorityError, SSHHostKeyVerificationError):
+        except ManagedRepositoryAuthorityError:
+            _log_ide_git_setup_failure("authority", job_id=job_id)
+            return False
+        except SSHHostKeyVerificationError:
+            _log_ide_git_setup_failure("host_key", job_id=job_id)
             return False
 
     async def _restore_k8s_ide_container(
@@ -1759,6 +2222,7 @@ class IdeSessionService:
                             git_command,
                         ],
                         private_key,
+                        diagnostic_job_id=job_id,
                     )
             except ManagedRepositoryAuthorityError:
                 installed = False
@@ -2440,7 +2904,15 @@ class IdeSessionService:
                             self._workspace_recovery_store,
                             permit,
                             outcome=disposition,
+                            provisioner=self._vm_provisioner,
                         )
+                elif disposition == "completed":
+                    await complete_vm_cleanup_permit(
+                        self._workspace_recovery_store,
+                        permit,
+                        outcome=disposition,
+                        provisioner=self._vm_provisioner,
+                    )
                 return disposition == "completed"
             except Exception:
                 logger.exception("IDE VM cleanup authority failed for job %s", job_id)
@@ -2806,3 +3278,38 @@ class IdeSessionService:
 
 # Module-level singleton
 ide_session_service = IdeSessionService()
+
+
+async def ide_session_ttl_sweeper(
+    shutdown_event: asyncio.Event, *, ide_sessions: IdeSessionService
+) -> None:
+    """Background task that expires IDE sessions past their TTL.
+
+    Runs every 60 seconds. Checks active/idle sessions for:
+    - Max lifetime exceeded (default: 4 hours)
+    - Idle timeout exceeded (default: 30 minutes, only for 'idle' status)
+    """
+    logger.info("IDE session TTL sweeper started")
+    while not shutdown_event.is_set():
+        try:
+            continued = await ide_sessions.reconcile_pending_ide_restore_attempts(
+                limit=25
+            )
+            if continued:
+                logger.info("IDE restore maintenance continued %d attempts", continued)
+        except Exception:
+            logger.exception("Error continuing pending IDE restore attempts")
+        try:
+            expired = await ide_sessions.check_ttl_all()
+            if expired:
+                logger.info("IDE session sweeper: expired %d sessions", expired)
+        except Exception as e:
+            logger.error("Error in IDE session TTL sweeper: %s", e)
+
+        try:
+            await asyncio.wait_for(shutdown_event.wait(), timeout=60.0)
+            break
+        except asyncio.TimeoutError:
+            pass
+
+    logger.info("IDE session TTL sweeper stopped")
