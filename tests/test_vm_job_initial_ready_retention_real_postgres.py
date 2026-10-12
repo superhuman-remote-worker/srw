@@ -743,10 +743,59 @@ async def test_pinned_ready_owner_job_delete_uses_typed_disk_purge(pinned_ready_
     assert result["status"] == "deleted"
     assert len(purge_parents) == 1
     assert await db.get_job(state["job_id"]) is None
-    assert await db.fetchval(
-        "SELECT deletion_receipt IS NOT NULL FROM vm_job_creation_owners WHERE job_id=$1",
+    request_id = await db.fetchval(
+        "SELECT request_id FROM vm_creation_retries WHERE job_id=$1",
         UUID(state["job_id"]),
     )
+    packet = await db.fetchrow(
+        "SELECT terminal_kind,evidence FROM vm_job_creation_terminal_packets "
+        "WHERE request_id=$1",
+        request_id,
+    )
+    assert packet["terminal_kind"] == "retained_late_purge"
+    evidence = packet["evidence"]
+    if isinstance(evidence, str):
+        evidence = json.loads(evidence)
+    assert evidence["cleanup_admission_id"] == purge_parents[0]
+    assert evidence["old_cleanup_admission_id"] == str(state["retention"].admission_id)
+    assert (
+        await db.fetchval(
+            "SELECT vm_job_terminal_prior_packet_evidence($1)", request_id
+        )
+        is None
+    )
+    original_stop = await db.fetchrow(
+        "SELECT s.stop_evidence->>'pvc_disposition' AS disposition, "
+        "v.state AS reservation_state FROM vm_resource_cleanup_stop_receipts s "
+        "JOIN vm_resource_reservations v ON v.id=s.reservation_id "
+        "WHERE s.cleanup_admission_id=$1",
+        state["retention"].admission_id,
+    )
+    assert original_stop["disposition"] == "retained"
+    assert original_stop["reservation_state"] == "released"
+    predecessor = await db.fetchrow(
+        "SELECT source_request_id,old_cleanup_admission_id "
+        "FROM vm_job_retained_disk_purge_predecessors "
+        "WHERE cleanup_admission_id=$1",
+        UUID(purge_parents[0]),
+    )
+    assert predecessor["source_request_id"] == request_id
+    assert predecessor["old_cleanup_admission_id"] == state["retention"].admission_id
+    assert (
+        await db.fetchval(
+            "SELECT chain_digest FROM vm_job_retained_disk_purge_receipts "
+            "WHERE cleanup_admission_id=$1",
+            UUID(purge_parents[0]),
+        )
+        == evidence["chain_digest"]
+    )
+    owner_receipt = await db.fetchval(
+        "SELECT deletion_receipt FROM vm_job_creation_owners WHERE job_id=$1",
+        UUID(state["job_id"]),
+    )
+    if isinstance(owner_receipt, str):
+        owner_receipt = json.loads(owner_receipt)
+    assert owner_receipt["generations"] == [evidence]
 
 
 def ready_root_witness(candidate):
