@@ -9,6 +9,7 @@ import os
 from contextlib import asynccontextmanager
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import asyncpg
 import pytest
 
 PROVISION_GENERATION = "00000000-0000-4000-8000-000000000001"
@@ -1917,6 +1918,68 @@ class TestPurgeDiskIntent:
 
 
 class TestCapturedVmTeardown:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("constraint", "expected_busy"),
+        [
+            ("active_vm_remote_operation_rebind", True),
+            ("unrelated_object_in_use", False),
+            (None, False),
+        ],
+    )
+    async def test_initial_retirement_claim_remote_lease_busy_is_before_effects(
+        self, provisioner_with_db, mock_db, constraint, expected_busy
+    ):
+        from orchestrator.services.vm_provisioner import VMTeardownResult
+
+        identity = self._identity()
+        probe = self._probe(
+            "present",
+            vm_uid=identity.vm_uid,
+            root_uid=identity.rootdisk_pvc_uid,
+            credential_runtime_started=True,
+        )
+        provisioner_with_db._probe_vm_teardown_identity = AsyncMock(return_value=probe)
+        provisioner_with_db.delete_vm_captured = AsyncMock()
+        mock_db.managed_repository_workspace_process_zero_is_current.return_value = (
+            False
+        )
+        error = (
+            asyncpg.ObjectInUseError("VM lifecycle identity is leased")
+            if constraint is not None
+            else RuntimeError("unrelated claim failure")
+        )
+        if constraint is not None:
+            error.constraint_name = constraint
+        mock_db.claim_managed_repository_workspace_retirement.side_effect = error
+
+        with patch(
+            "orchestrator.services.vm_provisioner.retire_managed_repository_processes",
+            new_callable=AsyncMock,
+        ) as retire:
+            if expected_busy:
+                result = await provisioner_with_db.release_vm_captured(
+                    "job-1", identity, capture_snapshot=False
+                )
+                assert result == VMTeardownResult("remote_operation_busy", False)
+            else:
+                with pytest.raises(type(error)) as raised:
+                    await provisioner_with_db.release_vm_captured(
+                        "job-1", identity, capture_snapshot=False
+                    )
+                assert raised.value is error
+
+        mock_db.claim_managed_repository_workspace_retirement.assert_awaited_once_with(
+            "job-1",
+            owner_kind="job",
+            scope="vm",
+            provisioner="vm",
+            runtime_incarnation=identity.provision_generation,
+        )
+        retire.assert_not_awaited()
+        provisioner_with_db.delete_vm_captured.assert_not_awaited()
+        mock_db.record_managed_repository_workspace_process_zero.assert_not_awaited()
+
     @pytest.mark.asyncio
     @pytest.mark.parametrize("entity_type", ["job", "thread"])
     @pytest.mark.parametrize("retirement_succeeds", [True, False])

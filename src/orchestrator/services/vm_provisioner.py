@@ -12,6 +12,7 @@ import time
 from typing import Any, Optional
 from uuid import UUID, uuid4
 
+import asyncpg
 import httpx
 
 from orchestrator.services.workspace_binding import CANVAS_WORKSPACE_GENERATION_KEY
@@ -2913,16 +2914,21 @@ class VMProvisioner:
             ):
                 return VMTeardownResult("identity_superseded", False)
 
-        if (
-            self._db is None
-            or not await self._db.claim_managed_repository_workspace_retirement(
+        if self._db is None:
+            return VMTeardownResult("process_zero_unproven", False)
+        try:
+            claimed = await self._db.claim_managed_repository_workspace_retirement(
                 job_id,
                 owner_kind=entity_type,
                 scope="vm",
                 provisioner="vm",
                 runtime_incarnation=generation,
             )
-        ):
+        except asyncpg.ObjectInUseError as exc:
+            if exc.constraint_name != "active_vm_remote_operation_rebind":
+                raise
+            return VMTeardownResult("remote_operation_busy", False)
+        if not claimed:
             return VMTeardownResult("process_zero_unproven", False)
         current_identity = probe.identity
         never_started = bool(
