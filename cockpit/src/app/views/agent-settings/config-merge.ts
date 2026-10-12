@@ -1,18 +1,22 @@
 /**
- * Pure config-merge helpers shared by the agent-settings groups and the expert
- * editor. `deepMergeConfig` mirrors the private `deepMerge` in
+ * Pure config-merge helpers shared by the agent-settings form, its groups and
+ * the expert editor. `deepMergeConfig` mirrors the private `deepMerge` in
  * `agent-settings.types.ts` (override replaces arrays + scalars, recurses
  * nested plain objects) but is exported + immutable for use in `computed()`.
  */
 
 /** Deep-merge two plain config objects immutably. Override replaces arrays and
- *  scalars; nested plain objects are merged recursively. */
+ *  scalars; nested plain objects are merged recursively. `__proto__`,
+ *  `constructor` and `prototype` are never config keys and are skipped: an
+ *  own `__proto__` key (JSON.parse makes one) would otherwise replace the
+ *  merged object's prototype. */
 export function deepMergeConfig(
   base: Record<string, unknown>,
   override: Record<string, unknown>,
 ): Record<string, unknown> {
   const result: Record<string, unknown> = {...base};
   for (const key of Object.keys(override)) {
+    if (key === '__proto__' || key === 'constructor' || key === 'prototype') continue;
     const sv = override[key];
     const tv = result[key];
     if (

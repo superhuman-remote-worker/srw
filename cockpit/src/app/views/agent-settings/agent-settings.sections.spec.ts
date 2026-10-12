@@ -150,3 +150,52 @@ describe('AgentSettingsComponent — three sections', () => {
     expect(expert.querySelector('app-advanced-accordion')).not.toBeNull();
   });
 });
+
+describe("AgentSettingsComponent — merging the groups' overrides", () => {
+  beforeAll(async () => {
+    await ɵresolveComponentResources(() => Promise.resolve(''));
+  });
+
+  const GROUPS = [
+    'executionGroup',
+    'executionMoreGroup',
+    'executionExpertGroup',
+    'executionWorkspaceGroup',
+    'modelGroup',
+    'toolsGroup',
+    'advancedAccordion',
+  ];
+
+  /** Every group answers with the given overrides, or none. */
+  function stubbed(overrides: Record<string, Record<string, unknown>>) {
+    const {host} = mount({});
+    for (const name of GROUPS) {
+      (host as unknown as Record<string, unknown>)[name] = {getOverrides: () => overrides[name] ?? {}};
+    }
+    return host;
+  }
+
+  it('deep-merges groups that share a key and changes none of their objects', () => {
+    const model = {llm: {model: 'm1'}};
+    const advanced = {llm: {temperature: 0.2}, interactive: {idle_timeout_minutes: 30}};
+    const host = stubbed({modelGroup: model, advancedAccordion: advanced});
+    expect(host.getExpertOverrides()).toEqual({llm: {model: 'm1', temperature: 0.2}});
+    expect(host.getOverrides()).toEqual({
+      llm: {model: 'm1', temperature: 0.2},
+      interactive: {idle_timeout_minutes: 30},
+    });
+    expect(model).toEqual({llm: {model: 'm1'}});
+    expect(advanced).toEqual({llm: {temperature: 0.2}, interactive: {idle_timeout_minutes: 30}});
+  });
+
+  it('puts the idle timeout beside the task groups in the task overrides', () => {
+    const host = stubbed({
+      executionGroup: {autonomy: 'full', interactive: {narration: 'on'}},
+      advancedAccordion: {interactive: {idle_timeout_minutes: 30}},
+    });
+    expect(host.getTaskOverrides()).toEqual({
+      autonomy: 'full',
+      interactive: {narration: 'on', idle_timeout_minutes: 30},
+    });
+  });
+});

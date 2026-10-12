@@ -153,19 +153,6 @@ export function readConfigPath(config: Record<string, unknown>, path: string): u
   return path.split('.').reduce((obj: any, key) => obj?.[key], config) ?? null;
 }
 
-/** Deep-set a nested path on a config object, creating intermediate objects. */
-export function setConfigPath(obj: Record<string, unknown>, path: string, value: unknown): void {
-  const keys = path.split('.');
-  let current: any = obj;
-  for (let i = 0; i < keys.length - 1; i++) {
-    if (current[keys[i]] === undefined || typeof current[keys[i]] !== 'object') {
-      current[keys[i]] = {};
-    }
-    current = current[keys[i]];
-  }
-  current[keys[keys.length - 1]] = value;
-}
-
 /**
  * Detect model family from model name for settings_matrix resolution.
  * TypeScript port of src/core/loader.py:detect_model_family().

@@ -27,6 +27,18 @@ describe('deepMergeConfig', () => {
     expect(base).toEqual({a: {x: 1}});
     expect(over).toEqual({a: {y: 2}});
   });
+
+  it('skips prototype keys, so neither the result nor Object.prototype changes', () => {
+    const over = JSON.parse(
+      '{"__proto__": {"polluted": true}, "constructor": {"prototype": {"polluted": true}}, ' +
+        '"llm": {"__proto__": {"polluted": true}, "model": "m"}}',
+    );
+    const merged = deepMergeConfig({llm: {temperature: 1}}, over);
+    expect(merged).toEqual({llm: {temperature: 1, model: 'm'}});
+    expect(Object.getPrototypeOf(merged)).toBe(Object.prototype);
+    expect(Object.getPrototypeOf(merged['llm'])).toBe(Object.prototype);
+    expect(({} as Record<string, unknown>)['polluted']).toBeUndefined();
+  });
 });
 
 describe('pickKeys / omitKeys', () => {

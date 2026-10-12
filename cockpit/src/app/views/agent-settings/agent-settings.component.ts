@@ -7,6 +7,7 @@ import type {
     SessionToolGroupsResponse,
 } from '../../core/services/api.service';
 import {readConfigPath, SettingsMode, TierReachability, WORKSPACE_BACKENDS} from './agent-settings.types';
+import {deepMergeConfig} from './config-merge';
 import {ExecutionGroupComponent} from './execution-group.component';
 import {ModelGroupComponent} from './model-group.component';
 import {delegationCapScopeForMode, ToolsGroupComponent} from './tools-group.component';
@@ -740,10 +741,7 @@ export class AgentSettingsComponent {
       this.mode() === 'live' ? {} : (this.advancedAccordion?.getOverrides() ?? {}),
     ];
 
-    const result: Record<string, unknown> = {};
-    for (const part of parts) {
-      deepMerge(result, part);
-    }
+    const result = mergeAll(parts);
     return Object.keys(result).length > 0 ? result : {};
   }
 
@@ -751,14 +749,15 @@ export class AgentSettingsComponent {
    *  memory, permission and narration mode, idle timeout. Not Expert content:
    *  the create forms send these beside the Expert, never inside it. */
   getTaskOverrides(): Record<string, unknown> {
-    const result: Record<string, unknown> = {};
-    deepMerge(result, this.executionGroup?.getOverrides() ?? {});
-    deepMerge(result, this.executionMoreGroup?.getOverrides() ?? {});
+    const parts = [
+      this.executionGroup?.getOverrides() ?? {},
+      this.executionMoreGroup?.getOverrides() ?? {},
+    ];
     const idle = readConfigPath(this.advancedAccordion?.getOverrides() ?? {}, 'interactive.idle_timeout_minutes');
     if (idle !== undefined && idle !== null) {
-      deepMerge(result, {interactive: {idle_timeout_minutes: idle}});
+      parts.push({interactive: {idle_timeout_minutes: idle}});
     }
-    return result;
+    return mergeAll(parts);
   }
 
   /** The form's Expert content: model, tools, delegation and Expert → More.
@@ -772,16 +771,12 @@ export class AgentSettingsComponent {
       if (Object.keys(rest).length) advanced['interactive'] = rest;
       else delete advanced['interactive'];
     }
-    const result: Record<string, unknown> = {};
-    for (const part of [
+    return mergeAll([
       this.executionExpertGroup?.getOverrides() ?? {},
       this.modelGroup?.getOverrides() ?? {},
       this.toolsGroup?.getOverrides() ?? {},
       advanced,
-    ]) {
-      deepMerge(result, part);
-    }
-    return result;
+    ]);
   }
 
   /** True when the Expert section differs from the template it started from
@@ -900,19 +895,10 @@ export class AgentSettingsComponent {
   }
 }
 
-function deepMerge(target: Record<string, unknown>, source: Record<string, unknown>): void {
-  for (const key of Object.keys(source)) {
-    const sv = source[key];
-    const tv = target[key];
-    if (
-      typeof sv === 'object' && sv !== null && !Array.isArray(sv) &&
-      typeof tv === 'object' && tv !== null && !Array.isArray(tv)
-    ) {
-      deepMerge(tv as Record<string, unknown>, sv as Record<string, unknown>);
-    } else {
-      target[key] = sv;
-    }
-  }
+/** Deep-merge the parts in order into a new object; a later part wins. No part
+ *  is mutated, so a group's own overrides object never changes under it. */
+function mergeAll(parts: Record<string, unknown>[]): Record<string, unknown> {
+  return parts.reduce<Record<string, unknown>>((merged, part) => deepMergeConfig(merged, part), {});
 }
 
 function capitalize(text: string): string {
