@@ -25216,12 +25216,14 @@ BEGIN
     -- identity includes the generation, VM, PVC and purge intent.
     SELECT * INTO a FROM public.vm_workspace_cleanup_admissions
     WHERE owner_kind='job' AND owner_id=r.job_id
-      AND source IN ('job_terminal_vm_release','public_vm_delete')
+      AND source IN ('job_terminal_vm_release','public_vm_delete','lifecycle_vm_delete')
       AND parent_admission_id IS NULL AND pvc_uid=r.observed_pvc_uid
       AND request_id=public.uuid_generate_v5(public.uuid_ns_url(),
-          'vm-workspace-cleanup:' || source || ':job:' || r.job_id::text || ':' ||
-          r.provision_generation::text || ':' || r.observed_vm_uid::text || ':' ||
-          r.observed_pvc_uid::text)
+          (CASE WHEN source='lifecycle_vm_delete'
+              THEN 'workspace-cleanup:delete:job:'
+              ELSE 'vm-workspace-cleanup:' || source || ':job:' END) ||
+          r.job_id::text || ':' || r.provision_generation::text || ':' ||
+          r.observed_vm_uid::text || ':' || r.observed_pvc_uid::text)
       AND completed_at IS NOT NULL AND outcome='completed'
     ORDER BY completed_at DESC LIMIT 1;
     IF NOT FOUND THEN RETURN NULL; END IF;
