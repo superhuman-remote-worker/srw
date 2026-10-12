@@ -1423,13 +1423,14 @@ async def test_markerless_cancel_archive_never_falls_back_to_purge(
 @pytest.mark.parametrize("already_settled", [False, True])
 @pytest.mark.parametrize("lost_reply", [False, True])
 async def test_permanent_job_delete_reuses_retention_then_typed_purge(
-    db, already_settled, lost_reply
+    db, monkeypatch, already_settled, lost_reply
 ):
     import logging
     from functools import partial
     from types import SimpleNamespace
     from unittest.mock import AsyncMock
     from orchestrator.services import thread_retirement
+    from orchestrator.services import vm_job_retained_disk_purge as purge_module
     from orchestrator.services.job_mutation_controls import JobControlOperations
     from orchestrator.services.vm_workspace_policy import vm_needs_release
 
@@ -1439,6 +1440,12 @@ async def test_permanent_job_delete_reuses_retention_then_typed_purge(
         assert await db.complete_stateless_cancel_cleanup(state["job_id"])
     effects = []
     purge_parents = []
+    disk_proven = not lost_reply
+    if lost_reply:
+        # A lost reply with no authenticated absence still needs an ordinary
+        # owner retry after the bounded observation window expires.
+        monkeypatch.setattr(purge_module, "RETAINED_PURGE_OBSERVE_TIMEOUT_S", 0.05)
+        monkeypatch.setattr(purge_module, "RETAINED_PURGE_OBSERVE_INTERVAL_S", 0.01)
 
     async def release(_job_id, _identity, **kwargs):
         assert kwargs["purge_disk"] is False
@@ -1463,6 +1470,8 @@ async def test_permanent_job_delete_reuses_retention_then_typed_purge(
     async def attest(candidate):
         if not candidate["purge_disk"]:
             return state["evidence"]
+        if not disk_proven:
+            return None
         return {
             **{
                 key: value
@@ -1519,6 +1528,7 @@ async def test_permanent_job_delete_reuses_retention_then_typed_purge(
         assert lost.value.status_code == 503
         assert await db.get_job(state["job_id"]) is not None
         job = await db.get_job(state["job_id"])
+        disk_proven = True
     result = await control.delete(
         state["job_id"], caller={"id": job["user_id"]}, job=job
     )

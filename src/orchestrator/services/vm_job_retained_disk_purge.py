@@ -6,6 +6,7 @@ complete retained predecessor chain and the final signed purge receipt.
 
 from __future__ import annotations
 
+import asyncio
 import json
 from collections.abc import Mapping
 from uuid import UUID
@@ -18,6 +19,9 @@ from orchestrator.services.vm_workspace_recovery_store import (
     cleanup_intent_digest,
     vm_cleanup_request_identity,
 )
+
+RETAINED_PURGE_OBSERVE_TIMEOUT_S = 15.0
+RETAINED_PURGE_OBSERVE_INTERVAL_S = 0.5
 
 
 def _json(value):
@@ -62,11 +66,50 @@ async def execute_job_retained_disk_purge(
             disposition = outcome.disposition
         else:
             raise ResourceAdmissionError("retained_disk_binding_unproven")
+        if disposition == "retry_pending":
+            await _observe_pending_job_retained_disk_purge(
+                store, provisioner, permit, candidate
+            )
+            return
         if disposition != "completed":
             raise ResourceAdmissionError("retained_disk_physical_purge_pending")
         await complete_job_retained_disk_purge(
             store, permit, outcome=disposition, provisioner=provisioner
         )
+
+
+async def _observe_pending_job_retained_disk_purge(
+    store, provisioner, permit, candidate
+):
+    """Wait for the exact child and signed absence without reissuing Delete."""
+    deadline = asyncio.get_running_loop().time() + RETAINED_PURGE_OBSERVE_TIMEOUT_S
+    try:
+        async with asyncio.timeout_at(deadline):
+            while True:
+                await asyncio.sleep(RETAINED_PURGE_OBSERVE_INTERVAL_S)
+                if await provisioner.attest_vm_cleanup_stop(candidate) is None:
+                    continue
+                async with store.db.acquire() as conn:
+                    child_open = await conn.fetchval(
+                        "SELECT EXISTS(SELECT 1 FROM vm_workspace_cleanup_admissions "
+                        "WHERE parent_admission_id=$1 AND owner_kind='job' "
+                        "AND owner_id=$2 AND pvc_uid=$3 "
+                        "AND source='controller_rootdisk_delete' "
+                        "AND completed_at IS NULL)",
+                        permit.admission_id,
+                        UUID(candidate["job_id"]),
+                        UUID(candidate["pvc_uid"]),
+                    )
+                if child_open:
+                    continue
+                # Re-read the immutable candidate and attest again in the
+                # existing completer; its SQL trigger fences child races.
+                await complete_job_retained_disk_purge(
+                    store, permit, outcome="completed", provisioner=provisioner
+                )
+                return
+    except TimeoutError as exc:
+        raise ResourceAdmissionError("retained_disk_physical_purge_pending") from exc
 
 
 async def acquire_job_retained_disk_purge(store, *, job_id: str, identity):

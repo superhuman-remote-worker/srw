@@ -1,11 +1,12 @@
 """Initial Ready owner Cancel uses exact retained custody, never a purge hint."""
 
 import asyncio
+import hashlib
 import json
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
-from uuid import UUID, uuid4
+from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
 import asyncpg
 import pytest
@@ -855,6 +856,454 @@ async def test_pinned_ready_owner_job_delete_uses_typed_disk_purge(
     if isinstance(owner_receipt, str):
         owner_receipt = json.loads(owner_receipt)
     assert owner_receipt["generations"] == [evidence]
+
+
+def _pending_purge_owner_delete(db, state, provisioner):
+    from contextlib import asynccontextmanager
+    from functools import partial
+    import logging
+
+    from orchestrator.services.job_mutation_controls import JobControlOperations
+    from orchestrator.services.thread_retirement import archive_and_cleanup_workspace
+    from orchestrator.services.vm_workspace_policy import vm_needs_release
+
+    @asynccontextmanager
+    async def vectors():
+        yield SimpleNamespace(execute=AsyncMock())
+
+    return JobControlOperations(
+        SimpleNamespace(
+            store=db,
+            logger=logging.getLogger(__name__),
+            archive_and_cleanup_workspace=partial(
+                archive_and_cleanup_workspace,
+                dependencies=SimpleNamespace(
+                    store=db,
+                    vm_provisioner=provisioner,
+                    recovery_store=state["recovery"],
+                    container_provisioner=None,
+                    docker_provisioner=None,
+                    get_container_context=lambda _: {},
+                    get_vm_context=lambda job: json.loads(job["context"])["vm"],
+                    vm_needs_release=vm_needs_release,
+                ),
+            ),
+            snapshot_service=SimpleNamespace(is_available=False),
+            vector_db=SimpleNamespace(acquire=vectors),
+            resolve_job_notifications=AsyncMock(),
+        )
+    )
+
+
+async def _admit_controller_purge_child(state, parent):
+    owner = UUID(state["job_id"])
+    pvc = UUID(state["frozen"]["pvc_uid"])
+    identity = {
+        "source": "controller_rootdisk_delete",
+        "owner_kind": "job",
+        "owner_id": str(owner),
+        "pvc_uid": str(pvc),
+        "dv_uid": "aaaaaaaa-1111-4222-8333-bbbbbbbbbbbb",
+        "provision_generation": state["generation"],
+    }
+    canonical = json.dumps(identity, sort_keys=True, separators=(",", ":"))
+    request_id = uuid5(
+        NAMESPACE_URL,
+        f"srw-controller-cleanup:{canonical}:parent:{parent['admission_id']}",
+    )
+    digest = "sha256:" + hashlib.sha256(canonical.encode()).hexdigest()
+    child = await state["recovery"].acquire_cleanup_permit(
+        owner_kind="job",
+        owner_id=owner,
+        pvc_uid=pvc,
+        request_id=request_id,
+        source="controller_rootdisk_delete",
+        intent_digest=digest,
+        parent_cleanup=parent,
+        parent_provision_generation=state["generation"],
+        expected_vm_uid=state["frozen"]["vm_uid"],
+    )
+    assert child.allowed and child.admission_id is not None
+    return child, request_id, digest
+
+
+async def _complete_controller_purge_child(state, child):
+    permit, request_id, digest = child
+    assert await state["recovery"].complete_cleanup_permit(
+        permit.admission_id,
+        outcome="deleted",
+        request_id=request_id,
+        intent_digest=digest,
+    )
+
+
+@pytest.mark.asyncio
+async def test_pinned_ready_owner_delete_observes_delayed_exact_disk_purge(
+    pinned_ready_db, monkeypatch
+):
+    from orchestrator.services import vm_job_retained_disk_purge as purge_module
+    from orchestrator.services.vm_provisioner import (
+        VMProvisioner,
+        VMTeardownIdentity,
+        _VMTeardownProbe,
+    )
+
+    monkeypatch.setattr(
+        purge_module, "RETAINED_PURGE_OBSERVE_TIMEOUT_S", 1.0, raising=False
+    )
+    monkeypatch.setattr(
+        purge_module, "RETAINED_PURGE_OBSERVE_INTERVAL_S", 0.01, raising=False
+    )
+    db = pinned_ready_db
+    state = await pinned_ready_settled(db)
+    provisioner = VMProvisioner()
+    provisioner._db = db
+    provisioner._controller_url = "http://controller.invalid"
+    disk_absent = asyncio.Event()
+    absence_observed = asyncio.Event()
+    delete_started = asyncio.Event()
+    children = []
+
+    async def probe(job_id, generation, **kwargs):
+        assert job_id == state["job_id"] and generation == state["generation"]
+        if disk_absent.is_set():
+            absence_observed.set()
+        return _VMTeardownProbe(
+            "absent",
+            VMTeardownIdentity(
+                generation,
+                None,
+                None if disk_absent.is_set() else state["frozen"]["pvc_uid"],
+            ),
+            rootdisk_identity_known=True,
+            runtime_absence_known=True,
+            vmi_absent=True,
+            launcher_absent=True,
+        )
+
+    async def delete(job_id, **kwargs):
+        assert job_id == state["job_id"] and kwargs["purge_disk"] is True
+        children.append(
+            await _admit_controller_purge_child(state, kwargs["parent_cleanup"])
+        )
+        delete_started.set()
+        return True
+
+    provisioner._probe_vm_teardown_identity = AsyncMock(side_effect=probe)
+    provisioner._delete_http = AsyncMock(side_effect=delete)
+    control = _pending_purge_owner_delete(db, state, provisioner)
+    job = await db.get_job(state["job_id"])
+    original_stop = await db.fetchrow(
+        "SELECT s.stop_evidence, v.state AS reservation_state "
+        "FROM vm_resource_cleanup_stop_receipts s "
+        "JOIN vm_resource_reservations v ON v.id=s.reservation_id "
+        "WHERE s.cleanup_admission_id=$1",
+        state["retention"].admission_id,
+    )
+    assert original_stop["reservation_state"] == "released"
+
+    async def finish_controller_child():
+        await delete_started.wait()
+        await asyncio.sleep(0.02)
+        disk_absent.set()
+        await asyncio.wait_for(absence_observed.wait(), timeout=0.5)
+        await _complete_controller_purge_child(state, children[0])
+
+    closer = asyncio.create_task(finish_controller_child())
+    try:
+        result = await control.delete(
+            state["job_id"], caller={"id": job["user_id"]}, job=job
+        )
+    except BaseException:
+        closer.cancel()
+        await asyncio.gather(closer, return_exceptions=True)
+        raise
+    await closer
+    assert result["status"] == "deleted"
+    assert provisioner._delete_http.await_count == 1
+    assert len(children) == 1
+    assert await db.get_job(state["job_id"]) is None
+    request_id = await db.fetchval(
+        "SELECT request_id FROM vm_creation_retries WHERE job_id=$1",
+        UUID(state["job_id"]),
+    )
+    packet = await db.fetchrow(
+        "SELECT terminal_kind,evidence FROM vm_job_creation_terminal_packets "
+        "WHERE request_id=$1",
+        request_id,
+    )
+    assert packet["terminal_kind"] == "retained_late_purge"
+    evidence = packet["evidence"]
+    if isinstance(evidence, str):
+        evidence = json.loads(evidence)
+    child_parent = await db.fetchval(
+        "SELECT parent_admission_id FROM vm_workspace_cleanup_admissions WHERE id=$1",
+        children[0][0].admission_id,
+    )
+    assert evidence["cleanup_admission_id"] == str(child_parent)
+    assert evidence["old_cleanup_admission_id"] == str(state["retention"].admission_id)
+    assert (
+        await db.fetchval(
+            "SELECT chain_digest FROM vm_job_retained_disk_purge_receipts "
+            "WHERE cleanup_admission_id=$1",
+            UUID(evidence["cleanup_admission_id"]),
+        )
+        == evidence["chain_digest"]
+    )
+    final_stop = await db.fetchrow(
+        "SELECT s.stop_evidence, v.state AS reservation_state "
+        "FROM vm_resource_cleanup_stop_receipts s "
+        "JOIN vm_resource_reservations v ON v.id=s.reservation_id "
+        "WHERE s.cleanup_admission_id=$1",
+        state["retention"].admission_id,
+    )
+    assert dict(final_stop) == dict(original_stop)
+
+
+@pytest.mark.asyncio
+async def test_pinned_ready_owner_delete_times_out_then_reuses_exact_purge(
+    pinned_ready_db, monkeypatch
+):
+    from fastapi import HTTPException
+
+    from orchestrator.services import vm_job_retained_disk_purge as purge_module
+    from orchestrator.services.vm_provisioner import (
+        VMProvisioner,
+        VMTeardownIdentity,
+        _VMTeardownProbe,
+    )
+
+    monkeypatch.setattr(
+        purge_module, "RETAINED_PURGE_OBSERVE_TIMEOUT_S", 0.05, raising=False
+    )
+    monkeypatch.setattr(
+        purge_module, "RETAINED_PURGE_OBSERVE_INTERVAL_S", 0.01, raising=False
+    )
+    db = pinned_ready_db
+    state = await pinned_ready_settled(db)
+    provisioner = VMProvisioner()
+    provisioner._db = db
+    provisioner._controller_url = "http://controller.invalid"
+    disk_absent = False
+    children = []
+    parents = []
+
+    async def probe(job_id, generation, **kwargs):
+        assert job_id == state["job_id"] and generation == state["generation"]
+        return _VMTeardownProbe(
+            "absent",
+            VMTeardownIdentity(
+                generation,
+                None,
+                None if disk_absent else state["frozen"]["pvc_uid"],
+            ),
+            rootdisk_identity_known=True,
+            runtime_absence_known=True,
+            vmi_absent=True,
+            launcher_absent=True,
+        )
+
+    async def delete(job_id, **kwargs):
+        assert job_id == state["job_id"] and kwargs["purge_disk"] is True
+        parents.append(kwargs["parent_cleanup"]["admission_id"])
+        children.append(
+            await _admit_controller_purge_child(state, kwargs["parent_cleanup"])
+        )
+        return True
+
+    provisioner._probe_vm_teardown_identity = AsyncMock(side_effect=probe)
+    provisioner._delete_http = AsyncMock(side_effect=delete)
+    control = _pending_purge_owner_delete(db, state, provisioner)
+    job = await db.get_job(state["job_id"])
+    with pytest.raises(HTTPException) as pending:
+        await control.delete(state["job_id"], caller={"id": job["user_id"]}, job=job)
+    assert pending.value.status_code == 503
+    assert len(parents) == 1 and provisioner._delete_http.await_count == 1
+    assert await db.get_job(state["job_id"]) is not None
+    assert await db.fetchval(
+        "SELECT completed_at IS NULL FROM vm_workspace_cleanup_admissions WHERE id=$1",
+        UUID(parents[0]),
+    )
+    assert not await db.fetchval(
+        "SELECT EXISTS(SELECT 1 FROM vm_job_retained_disk_purge_receipts "
+        "WHERE cleanup_admission_id=$1)",
+        UUID(parents[0]),
+    )
+
+    await _complete_controller_purge_child(state, children[0])
+    disk_absent = True
+    fresh = await db.get_job(state["job_id"])
+    result = await control.delete(
+        state["job_id"], caller={"id": fresh["user_id"]}, job=fresh
+    )
+    assert result["status"] == "deleted"
+    assert provisioner._delete_http.await_count == 1
+    assert await db.get_job(state["job_id"]) is None
+    assert await db.fetchval(
+        "SELECT completed_at IS NOT NULL AND outcome='completed' "
+        "FROM vm_workspace_cleanup_admissions WHERE id=$1",
+        UUID(parents[0]),
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bad_observation", ["unknown", "foreign_pvc"])
+async def test_pinned_ready_owner_delete_keeps_parent_for_invalid_purge_proof(
+    pinned_ready_db, monkeypatch, bad_observation
+):
+    from fastapi import HTTPException
+
+    from orchestrator.services import vm_job_retained_disk_purge as purge_module
+    from orchestrator.services.vm_provisioner import (
+        VMProvisioner,
+        VMTeardownIdentity,
+        _VMTeardownProbe,
+    )
+
+    monkeypatch.setattr(
+        purge_module, "RETAINED_PURGE_OBSERVE_TIMEOUT_S", 0.05, raising=False
+    )
+    monkeypatch.setattr(
+        purge_module, "RETAINED_PURGE_OBSERVE_INTERVAL_S", 0.01, raising=False
+    )
+    db = pinned_ready_db
+    state = await pinned_ready_settled(db)
+    provisioner = VMProvisioner()
+    provisioner._db = db
+    provisioner._controller_url = "http://controller.invalid"
+    transport_sent = False
+    post_transport_probes = 0
+    parents = []
+
+    async def probe(job_id, generation, **kwargs):
+        nonlocal post_transport_probes
+        assert job_id == state["job_id"] and generation == state["generation"]
+        if transport_sent:
+            post_transport_probes += 1
+            if post_transport_probes > 1:
+                if bad_observation == "unknown":
+                    return _VMTeardownProbe("unknown")
+                return _VMTeardownProbe(
+                    "absent",
+                    VMTeardownIdentity(
+                        generation, None, "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee"
+                    ),
+                    rootdisk_identity_known=True,
+                    runtime_absence_known=True,
+                    vmi_absent=True,
+                    launcher_absent=True,
+                )
+        return _VMTeardownProbe(
+            "absent",
+            VMTeardownIdentity(generation, None, state["frozen"]["pvc_uid"]),
+            rootdisk_identity_known=True,
+            runtime_absence_known=True,
+            vmi_absent=True,
+            launcher_absent=True,
+        )
+
+    async def delete(job_id, **kwargs):
+        nonlocal transport_sent
+        assert job_id == state["job_id"] and kwargs["purge_disk"] is True
+        parent = kwargs["parent_cleanup"]
+        child = await _admit_controller_purge_child(state, parent)
+        await _complete_controller_purge_child(state, child)
+        parents.append(parent["admission_id"])
+        transport_sent = True
+        return True
+
+    provisioner._probe_vm_teardown_identity = AsyncMock(side_effect=probe)
+    provisioner._delete_http = AsyncMock(side_effect=delete)
+    control = _pending_purge_owner_delete(db, state, provisioner)
+    job = await db.get_job(state["job_id"])
+    with pytest.raises(HTTPException) as pending:
+        await control.delete(state["job_id"], caller={"id": job["user_id"]}, job=job)
+    assert pending.value.status_code == 503
+    assert provisioner._delete_http.await_count == 1
+    assert post_transport_probes > 1
+    assert await db.get_job(state["job_id"]) is not None
+    assert await db.fetchval(
+        "SELECT completed_at IS NULL FROM vm_workspace_cleanup_admissions WHERE id=$1",
+        UUID(parents[0]),
+    )
+    assert not await db.fetchval(
+        "SELECT EXISTS(SELECT 1 FROM vm_job_retained_disk_purge_receipts "
+        "WHERE cleanup_admission_id=$1)",
+        UUID(parents[0]),
+    )
+
+
+@pytest.mark.asyncio
+async def test_pinned_ready_owner_delete_cancellation_keeps_pending_purge(
+    pinned_ready_db, monkeypatch
+):
+    from orchestrator.services import vm_job_retained_disk_purge as purge_module
+    from orchestrator.services.vm_provisioner import (
+        VMProvisioner,
+        VMTeardownIdentity,
+        _VMTeardownProbe,
+    )
+
+    monkeypatch.setattr(
+        purge_module, "RETAINED_PURGE_OBSERVE_TIMEOUT_S", 1.0, raising=False
+    )
+    monkeypatch.setattr(
+        purge_module, "RETAINED_PURGE_OBSERVE_INTERVAL_S", 0.01, raising=False
+    )
+    db = pinned_ready_db
+    state = await pinned_ready_settled(db)
+    provisioner = VMProvisioner()
+    provisioner._db = db
+    provisioner._controller_url = "http://controller.invalid"
+    reprobed = asyncio.Event()
+    transport_sent = False
+    parents = []
+
+    async def probe(job_id, generation, **kwargs):
+        assert job_id == state["job_id"] and generation == state["generation"]
+        if transport_sent:
+            reprobed.set()
+        return _VMTeardownProbe(
+            "absent",
+            VMTeardownIdentity(generation, None, state["frozen"]["pvc_uid"]),
+            rootdisk_identity_known=True,
+            runtime_absence_known=True,
+            vmi_absent=True,
+            launcher_absent=True,
+        )
+
+    async def delete(job_id, **kwargs):
+        nonlocal transport_sent
+        assert job_id == state["job_id"] and kwargs["purge_disk"] is True
+        parent = kwargs["parent_cleanup"]
+        parents.append(parent["admission_id"])
+        await _admit_controller_purge_child(state, parent)
+        transport_sent = True
+        return True
+
+    provisioner._probe_vm_teardown_identity = AsyncMock(side_effect=probe)
+    provisioner._delete_http = AsyncMock(side_effect=delete)
+    control = _pending_purge_owner_delete(db, state, provisioner)
+    job = await db.get_job(state["job_id"])
+    deleting = asyncio.create_task(
+        control.delete(state["job_id"], caller={"id": job["user_id"]}, job=job)
+    )
+    await asyncio.wait_for(reprobed.wait(), timeout=1.0)
+    await asyncio.sleep(0.03)
+    deleting.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await deleting
+    assert provisioner._delete_http.await_count == 1
+    assert await db.get_job(state["job_id"]) is not None
+    assert await db.fetchval(
+        "SELECT completed_at IS NULL FROM vm_workspace_cleanup_admissions WHERE id=$1",
+        UUID(parents[0]),
+    )
+    assert not await db.fetchval(
+        "SELECT EXISTS(SELECT 1 FROM vm_job_retained_disk_purge_receipts "
+        "WHERE cleanup_admission_id=$1)",
+        UUID(parents[0]),
+    )
 
 
 def ready_root_witness(candidate):
