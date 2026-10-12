@@ -761,7 +761,7 @@ async def retention_preflight_on_conn(conn, admission_id):
     if await installed(conn):
         proof = await conn.fetchval(
             "SELECT ready_retention_preflight FROM vm_job_cancel_retention_authorities "
-            "WHERE cleanup_admission_id=$1 AND policy_version IN (2,3)",
+            "WHERE cleanup_admission_id=$1 AND policy_version IN (2,3,4)",
             admission_id,
         )
         if proof is not None:

@@ -93,15 +93,41 @@ async def initial_ready_retention_candidate(db, *, job_id, identity):
             source="job_terminal_vm_release",
             purge_disk=False,
         )
+        pinned = await conn.fetchval(
+            "SELECT execution_lane='pinned' AND "
+            "context->'_job_terminal_vm_cleanup'->>'retention_policy'='4' "
+            "FROM jobs WHERE id=$1",
+            owner,
+        )
+        candidate_function = (
+            "vm_job_pinned_ready_retention_candidate"
+            if pinned
+            else "vm_job_initial_ready_retention_candidate"
+        )
+        lookup_request_id = request_id
+        if pinned:
+            if not await conn.fetchval(
+                "SELECT to_regprocedure('public.vm_job_pinned_ready_retention_candidate"
+                "(uuid,uuid,uuid,uuid,uuid,uuid,boolean)') IS NOT NULL"
+            ):
+                return None
+            _, _, old_request, _, _ = vm_cleanup_request_identity(
+                owner_kind="job",
+                owner_id=owner,
+                identity=identity,
+                source="job_terminal_vm_release",
+                purge_disk=True,
+            )
+            lookup_request_id = old_request
         old = await conn.fetchrow(
             "SELECT id FROM vm_workspace_cleanup_admissions WHERE owner_kind='job' "
             "AND owner_id=$1 AND request_id=$2 FOR UPDATE",
             owner,
-            request_id,
+            lookup_request_id,
         )
         candidate = _json(
             await conn.fetchval(
-                "SELECT public.vm_job_initial_ready_retention_candidate($1,$2,$3,$4,$5)",
+                f"SELECT public.{candidate_function}($1,$2,$3,$4,$5)",
                 owner,
                 _uuid(identity.provision_generation),
                 _uuid(identity.vm_uid),
@@ -121,7 +147,7 @@ async def initial_ready_retention_candidate(db, *, job_id, identity):
 async def read_current_initial_ready_preflight(
     db, parent_cleanup, *, job_id, generation
 ):
-    """Recognize immutable policy3 before any proof/SSH fallback; end locks here."""
+    """Recognize immutable initial Ready custody before external stop I/O."""
     from shared.vm_cancel_retention import valid_ready_retention_preflight
 
     owner = _uuid(job_id)
@@ -134,7 +160,7 @@ async def read_current_initial_ready_preflight(
         )
         locator = await conn.fetchrow(
             "SELECT a.pvc_uid FROM vm_job_cancel_retention_authorities a JOIN jobs j ON j.id=a.job_id "
-            "WHERE a.job_id=$1 AND a.policy_version=3 AND NOT j.context ? '_vm_job_retained_resume'",
+            "WHERE a.job_id=$1 AND a.policy_version IN (3,4) AND NOT j.context ? '_vm_job_retained_resume'",
             owner,
         )
         if locator is None:
@@ -151,7 +177,7 @@ async def read_current_initial_ready_preflight(
             "SELECT a.*,c.completed_at,a.admitted_xact_id<>pg_current_xact_id() AS committed "
             "FROM vm_job_cancel_retention_authorities a JOIN vm_workspace_cleanup_admissions c "
             "ON c.id=a.cleanup_admission_id JOIN jobs j ON j.id=a.job_id "
-            "WHERE a.job_id=$1 AND a.policy_version=3 AND NOT j.context ? '_vm_job_retained_resume' "
+            "WHERE a.job_id=$1 AND a.policy_version IN (3,4) AND NOT j.context ? '_vm_job_retained_resume' "
             "AND j.context->'vm'->>'provision_generation'=a.provision_generation::text "
             "AND j.context->'vm'->>'vm_uid'=a.vm_uid::text "
             "AND j.context->'vm'->>'rootdisk_pvc_uid'=a.pvc_uid::text",
@@ -533,20 +559,23 @@ async def retention_settlement_is_current_on_conn(
         return False
     ready_scope = "r.ready_at IS NULL"
     if await _initial_ready_installed(conn):
-        ready_scope = "((a.policy_version=1 AND r.ready_at IS NULL) OR (a.policy_version=3 AND r.ready_at IS NOT NULL AND r.job_retained_resume_id IS NULL))"
+        ready_scope = "((a.policy_version=1 AND r.ready_at IS NULL) OR (a.policy_version IN (3,4) AND r.ready_at IS NOT NULL AND r.job_retained_resume_id IS NULL))"
     return bool(
         await conn.fetchval(
             "SELECT EXISTS(SELECT 1 FROM vm_job_cancel_retention_authorities a "
-            "JOIN jobs j ON j.id=a.job_id JOIN run_queue q ON q.unit_id=j.id "
+            "JOIN jobs j ON j.id=a.job_id LEFT JOIN run_queue q ON q.unit_id=j.id "
             "JOIN vm_creation_retries r ON r.request_id=a.creation_request_id "
             "WHERE a.cleanup_admission_id=$1 AND a.job_id=$2 AND a.provision_generation=$3 "
-            "AND j.status='cancelled' AND j.execution_lane='stateless' "
+            "AND j.status='cancelled' AND ((a.policy_version=4 AND j.execution_lane='pinned') "
+            "OR (a.policy_version IN (1,3) AND j.execution_lane='stateless')) "
             "AND j.parent_job_id IS NULL AND j.assigned_agent_id IS NULL "
             "AND j.context->'vm'->>'provision_generation'=a.provision_generation::text "
             "AND j.context->'vm'->>'vm_uid'=a.vm_uid::text "
             "AND j.context->'vm'->>'rootdisk_pvc_uid'=a.pvc_uid::text "
-            "AND q.unit_kind='worker_batch' AND q.state='done' "
-            "AND q.leased_by IS NULL AND q.leased_until IS NULL "
+            "AND ((a.policy_version=4 AND (q.unit_id IS NULL OR "
+            "(q.state='done' AND q.leased_by IS NULL AND q.leased_until IS NULL))) "
+            "OR (a.policy_version IN (1,3) AND q.unit_kind='worker_batch' "
+            "AND q.state='done' AND q.leased_by IS NULL AND q.leased_until IS NULL)) "
             f"AND {ready_scope} AND (r.state='succeeded' OR ("
             "a.policy_version=1 AND r.state='settled' "
             "AND r.reason='creation_adopted' AND r.resolved_at IS NOT NULL "
@@ -841,10 +870,21 @@ async def acquire_cancel_retention(
         job = await conn.fetchrow("SELECT * FROM jobs WHERE id=$1", owner)
         context = _json(job["context"]) if job else None
         vm = context.get("vm") if isinstance(context, dict) else None
+        marker = (
+            context.get("_job_terminal_vm_cleanup")
+            if isinstance(context, dict)
+            else None
+        )
+        pinned_ready = bool(
+            job is not None
+            and job["execution_lane"] == "pinned"
+            and isinstance(marker, dict)
+            and marker.get("retention_policy") == 4
+        )
         if prior is None and (
             job is None
             or job["status"] != "cancelled"
-            or job["execution_lane"] != "stateless"
+            or (job["execution_lane"] != "stateless" and not pinned_ready)
             or not isinstance(vm, dict)
         ):
             return None
@@ -873,6 +913,7 @@ async def acquire_cancel_retention(
         )
         if (
             prior is None
+            and not pinned_ready
             and await _installed(conn)
             and await _ready_purge_replay_on_conn(
                 conn,
@@ -923,7 +964,7 @@ async def acquire_cancel_retention(
                 request_id=prior["cleanup_request_id"],
                 intent=_json(prior["retaining_intent"]),
             )
-            if prior["policy_version"] == 3:
+            if prior["policy_version"] in (3, 4):
                 permit = replace(
                     permit,
                     parent_cleanup={
@@ -941,6 +982,13 @@ async def acquire_cancel_retention(
                 allowed=False, reason="cancel_retention_schema_unavailable"
             )
         if ready_root and not await _initial_ready_installed(conn):
+            return CleanupPermit(
+                allowed=False, reason="cancel_retention_schema_unavailable"
+            )
+        if pinned_ready and not await conn.fetchval(
+            "SELECT to_regprocedure('public.vm_job_pinned_ready_retention_candidate"
+            "(uuid,uuid,uuid,uuid,uuid,uuid,boolean)') IS NOT NULL"
+        ):
             return CleanupPermit(
                 allowed=False, reason="cancel_retention_schema_unavailable"
             )
@@ -994,7 +1042,9 @@ async def acquire_cancel_retention(
                 conn, store, job=job, identity=identity
             )
         candidate_function = (
-            "vm_job_initial_ready_retention_candidate"
+            "vm_job_pinned_ready_retention_candidate"
+            if pinned_ready
+            else "vm_job_initial_ready_retention_candidate"
             if ready_root
             else "vm_job_cancel_retention_candidate"
         )
@@ -1072,7 +1122,7 @@ async def acquire_cancel_retention(
             json.dumps(intent),
             old["request_id"] if old else None,
             old["intent_digest"] if old else None,
-            3 if ready_root else 1,
+            4 if pinned_ready else 3 if ready_root else 1,
             json.dumps(retention_preflight) if ready_root else None,
         )
         if old is not None:

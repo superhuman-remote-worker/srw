@@ -914,6 +914,19 @@ class JobControlOperations:
         require_srw_runtime(job)
         if worker_execution_held(job.get("context")):
             raise HTTPException(409, WORKER_EXECUTION_HOLD_MESSAGE)
+        pinned_retention_held = getattr(
+            type(self.dependencies.store), "pinned_ready_cancel_retention_held", None
+        )
+        if pinned_retention_held is not None and await pinned_retention_held(
+            self.dependencies.store, job_id
+        ):
+            raise HTTPException(
+                409,
+                {
+                    "code": "pinned_ready_cancel_retention_held",
+                    "message": "This cancelled VM Job has retained storage awaiting permanent Delete.",
+                },
+            )
         # An explicit resume is the authority that lifts an operator pause
         # hold, but only the hold on the row this request was authorized
         # against: every pinned re-queue/claim below CASes on it, so a pause

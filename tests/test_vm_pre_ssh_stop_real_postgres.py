@@ -81,6 +81,7 @@ async def db(pre_ssh_schema, _db_fixture):  # noqa: F811
 async def seeded_stop(
     db,
     *,
+    lane="stateless",
     cleanup_source="dispatcher_vm_recycle",
     purge_disk=False,
     retiring=True,
@@ -88,7 +89,7 @@ async def seeded_stop(
     cancel_before_adoption=False,
 ):
     policy, inventory, snapshot, demand = await environment(db, installation_count=2)
-    retry = await waiter(db, policy, inventory, lane="stateless", user_id=uuid4())
+    retry = await waiter(db, policy, inventory, lane=lane, user_id=uuid4())
     admitted = await policy.admit(request_id=str(retry["request_id"]))
     assert admitted["action"] == "admitted"
     claim = (await VMCreationRetryStore(db).claim_due(limit=1))[0]
