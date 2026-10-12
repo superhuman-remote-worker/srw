@@ -165,4 +165,11 @@ class TestFailureIsLoud:
 
         assert await db.delete_checkpoint_thread("thread-1", strict=True) == 0
         assert conn.execute.await_count == len(_TABLES)
-        assert conn.fetchval.await_count == len(_TABLES)
+        # Strict delete checks each table within the prune transaction, then
+        # again after the authority settles to catch a late checkpoint write.
+        checked = [call.args for call in conn.fetchval.await_args_list]
+        assert checked == [
+            (f"SELECT EXISTS (SELECT 1 FROM {table} WHERE thread_id = $1)", "thread-1")
+            for _phase in range(2)
+            for table in _TABLES
+        ]
