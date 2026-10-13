@@ -178,8 +178,8 @@ class TestPopulation:
         # (memory_search, append-only context injection WP5a): expert_base
         # grants it, the subagent overlay and the seven library entries
         # restate it empty (a child has no memory of its own); 208 with the
-        # phone-desk expert (workspace, research, browser_direct and git
-        # restated empty for a call without a workspace, plus delegation,
+        # phone-desk (voice desk) expert (workspace, research, browser_direct
+        # and git restated empty for a session without a workspace, plus delegation,
         # citation and graph).
         assert len(_DECLARATIONS) == 208, (
             f"expected 208 raw declarations, got {len(_DECLARATIONS)}"

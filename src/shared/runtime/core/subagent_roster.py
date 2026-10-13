@@ -63,6 +63,7 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 
 import yaml
 
+from shared.runtime.core.expert_resolution import validate_live_voice_placeholders
 from shared.runtime.core.loader import (
     IGNORE_KEYS_DIRECTIVE,
     INHERIT_MODEL,
@@ -233,6 +234,7 @@ def validate_roster_fragment(subagents: Any) -> Set[str]:
                 f"subagents.roster.{name}: entry must be a mapping (inline keys or "
                 f"{{$ref: <expert>}}), got {type(raw).__name__}"
             )
+        _validate_live_entry(name, raw)
         if "$ref" not in raw:
             continue
         ref = raw.get("$ref")
@@ -247,6 +249,78 @@ def validate_roster_fragment(subagents: Any) -> Set[str]:
         path, _kind, _directory = _locate_disk_ref(name, ref)
         _guard_extends_chain(name, ref, path)
     return db_refs
+
+
+#: The only ``driver`` a roster entry may name; absent = an LLM child.
+LIVE_DRIVER = "live"
+_LIVE_TEXT_KEYS = ("fallback", "follow_up", "goodbye")
+_LIVE_FILE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+
+
+def _validate_live_entry(name: str, raw: Dict[str, Any]) -> None:
+    """The shape of a live voice entry (``driver: live`` + ``live``).
+
+    Mirrors ``$defs/subagentRosterEntry`` in ``config/schema.json``. The
+    orchestrator builds the voice's instructions from the ``live`` block and
+    reads a ``persona_file`` / ``facts_file`` from the expert's directory, so a
+    file is a bare name there; its prose must be plain text like a persona.
+    """
+    where = f"subagents.roster.{name}"
+    driver = raw.get("driver")
+    if driver is not None and str(driver) != LIVE_DRIVER:
+        raise RosterResolutionError(
+            f"{where}.driver: {driver!r} is not a driver (the only one is "
+            f"{LIVE_DRIVER!r}; omit it for an LLM subagent)"
+        )
+    live = raw.get("live")
+    if live is None:
+        return
+    if driver != LIVE_DRIVER:
+        raise RosterResolutionError(f"{where}.live: requires driver: {LIVE_DRIVER}")
+    if not isinstance(live, dict):
+        raise RosterResolutionError(
+            f"{where}.live: expected a mapping, got {type(live).__name__}"
+        )
+    for text_key, file_key in (("persona", "persona_file"), ("facts", "facts_file")):
+        if live.get(text_key) is not None and live.get(file_key) is not None:
+            raise RosterResolutionError(
+                f"{where}.live: give {text_key} or {file_key}, not both"
+            )
+        file_name = live.get(file_key)
+        if file_name is not None and (
+            not isinstance(file_name, str) or not _LIVE_FILE_RE.match(file_name)
+        ):
+            raise RosterResolutionError(
+                f"{where}.live.{file_key}: a file name in the expert's directory, "
+                f"got {file_name!r}"
+            )
+    for key in ("persona", "facts", "greeting", "voice"):
+        value = live.get(key)
+        if value is not None and not isinstance(value, str):
+            raise RosterResolutionError(f"{where}.live.{key}: expected a string")
+    timeout = live.get("answer_timeout_s")
+    if timeout is not None and (
+        isinstance(timeout, bool)
+        or not isinstance(timeout, (int, float))
+        or not 1 <= timeout <= 600
+    ):
+        raise RosterResolutionError(
+            f"{where}.live.answer_timeout_s: seconds between 1 and 600"
+        )
+    texts = live.get("texts")
+    if texts is not None:
+        if not isinstance(texts, dict) or any(
+            key not in _LIVE_TEXT_KEYS or not isinstance(value, str)
+            for key, value in texts.items()
+        ):
+            raise RosterResolutionError(
+                f"{where}.live.texts: a mapping of strings with keys "
+                f"{', '.join(_LIVE_TEXT_KEYS)}"
+            )
+    try:
+        validate_live_voice_placeholders({"roster": {name: raw}})
+    except ValueError as exc:
+        raise RosterResolutionError(str(exc)) from None
 
 
 def _lookup_row(db_refs: Dict[str, Any], ref: str) -> Optional[Dict[str, Any]]:

@@ -2007,6 +2007,12 @@
           "default": 30,
           "description": "Maximum todos allowed for a strategic->tactical transition"
         },
+        "strategic_tools": {
+          "type": "array",
+          "items": { "type": "string" },
+          "uniqueItems": true,
+          "description": "Tactical-only tools this expert may also call in the strategic phase (each one when it is bound). For an expert whose strategic phase acts, not only plans — the voice desk does a live session's follow-ups with its datasource tools there."
+        },
         "prompt_mode": {
           "type": "string",
           "enum": ["skills", "legacy"],
@@ -2366,6 +2372,67 @@
           "type": "string",
           "enum": ["summary", "structured", "evidence", "diff"],
           "description": "U3: the shape of what the child hands back to the parent."
+        },
+        "driver": {
+          "type": "string",
+          "enum": ["live"],
+          "description": "What drives the child; absent = an LLM subagent. `live`: the voice subagent of a live-session job — its session (a call on a live connector) attaches it, `delegate_agent` never starts it, `wait_agent` returns its questions, `message_agent(reply_to=…)` answers them and `stop_agent` hangs up. A live job's expert needs one such entry."
+        },
+        "live": {
+          "type": "object",
+          "description": "The live voice entry's session settings (with `driver: live`). The orchestrator builds the voice's instructions from `persona` + `facts` + the framework's voice rules and `texts.fallback`, and its first words from `greeting`; the job's voice subagent reads `answer_timeout_s`, `texts.follow_up` and `texts.goodbye`. Persona and facts are plain text: the six assembler placeholders are rejected. Keep customer content in a DB expert, not in a bundled one.",
+          "properties": {
+            "persona": {
+              "type": "string",
+              "description": "Who the voice is and how it speaks (plain prose)."
+            },
+            "persona_file": {
+              "type": "string",
+              "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$",
+              "description": "The persona in a file of the expert's directory, instead of `persona`."
+            },
+            "facts": {
+              "type": "string",
+              "description": "What the voice may answer by itself (plain prose); everything else it hands to the job."
+            },
+            "facts_file": {
+              "type": "string",
+              "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$",
+              "description": "The facts in a file of the expert's directory, instead of `facts`."
+            },
+            "greeting": {
+              "type": "string",
+              "description": "The exact first words, including the AI disclosure."
+            },
+            "voice": {
+              "type": "string",
+              "description": "The voice engine's voice, e.g. `marin`."
+            },
+            "answer_timeout_s": {
+              "type": "number",
+              "minimum": 1,
+              "maximum": 600,
+              "default": 25,
+              "description": "How long the job has to answer a handed-over question before the caller is told it is noted and it becomes a follow-up."
+            },
+            "texts": {
+              "type": "object",
+              "description": "What the voice is told to say: `fallback` (the connector's answer while no job is attached), `follow_up` (an answer came too late), `goodbye` (before `stop_agent` hangs up). Defaults are short English instructions; the voice speaks in the caller's language.",
+              "properties": {
+                "fallback": { "type": "string" },
+                "follow_up": { "type": "string" },
+                "goodbye": { "type": "string" }
+              },
+              "additionalProperties": false
+            }
+          },
+          "not": {
+            "anyOf": [
+              { "required": ["persona", "persona_file"] },
+              { "required": ["facts", "facts_file"] }
+            ]
+          },
+          "additionalProperties": false
         }
       },
       "additionalProperties": true

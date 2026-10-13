@@ -879,3 +879,69 @@ def test_public_bases_carry_no_roster_and_the_rostered_experts_resolve_the_libra
                 assert TOOL_REGISTRY[tool_name]["category"] not in (
                     CONTROL_PLANE_CATEGORIES
                 )
+
+
+# --- the live voice entry (live_session_jobs §6.3) ---------------------------
+
+
+def _voice(**entry):
+    return {"roster": {"voice": {"description": "The live session.", **entry}}}
+
+
+def test_a_live_voice_entry_passes_the_authoring_check():
+    from shared.runtime.core.subagent_roster import validate_roster_fragment
+
+    assert (
+        validate_roster_fragment(
+            _voice(
+                driver="live",
+                live={
+                    "persona": "A calm voice.",
+                    "facts_file": "facts.md",
+                    "greeting": "Hello, you are speaking with an AI assistant.",
+                    "voice": "marin",
+                    "answer_timeout_s": 25,
+                    "texts": {"follow_up": "Say it is noted.", "goodbye": "Bye."},
+                },
+            )
+        )
+        == set()
+    )
+    # The bundled voice desk's own entry.
+    raw = yaml.safe_load(
+        (
+            Path(__file__).resolve().parents[1]
+            / "config/experts/phone-desk/config.yaml"
+        ).read_text()
+    )
+    validate_roster_fragment(raw["spec"]["runtime"]["config"]["config"]["subagents"])
+
+
+@pytest.mark.parametrize(
+    ("entry", "message"),
+    [
+        ({"driver": "phone"}, "is not a driver"),
+        ({"live": {"persona": "x"}}, "requires driver: live"),
+        ({"driver": "live", "live": "x"}, "expected a mapping"),
+        (
+            {"driver": "live", "live": {"persona": "x", "persona_file": "p.txt"}},
+            "not both",
+        ),
+        ({"driver": "live", "live": {"facts_file": "../secrets"}}, "a file name"),
+        ({"driver": "live", "live": {"greeting": 3}}, "expected a string"),
+        ({"driver": "live", "live": {"answer_timeout_s": 0}}, "between 1 and 600"),
+        ({"driver": "live", "live": {"texts": {"hello": "x"}}}, "texts"),
+        (
+            {"driver": "live", "live": {"facts": "Remain {expert_identity}."}},
+            "reserved prompt placeholders",
+        ),
+    ],
+)
+def test_a_malformed_live_voice_entry_is_refused(entry, message):
+    from shared.runtime.core.subagent_roster import (
+        RosterResolutionError,
+        validate_roster_fragment,
+    )
+
+    with pytest.raises(RosterResolutionError, match=message):
+        validate_roster_fragment(_voice(**entry))

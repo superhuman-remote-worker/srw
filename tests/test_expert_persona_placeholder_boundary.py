@@ -226,6 +226,35 @@ async def test_personal_default_fork_returns_422_for_a_legacy_source(monkeypatch
     fake.fork_and_set_user_expert_default.assert_not_awaited()
 
 
+@pytest.mark.parametrize("key", ["persona", "facts"])
+def test_live_voice_prose_is_content_too(key: str):
+    """A live voice entry's persona and facts become the voice's
+    instructions (live_session_jobs §6.3): the same six tokens are refused."""
+    config = {
+        "subagents": {
+            "roster": {
+                "voice": {"driver": "live", "live": {key: "Be {expert_identity}."}}
+            }
+        }
+    }
+    with pytest.raises(ValueError, match="reserved prompt placeholders"):
+        validate_expert_persona_placeholders({"persona": "plain"}, config=config)
+
+
+def test_bundled_live_voice_prose_is_plain_text():
+    for path in sorted((ROOT / "config" / "experts").glob("*/config.yaml")):
+        text = path.read_text(encoding="utf-8")
+        if "driver: live" not in text:
+            continue
+        import yaml
+
+        raw = yaml.safe_load(text)
+        config = (
+            raw.get("spec", {}).get("runtime", {}).get("config", {}).get("config", raw)
+        )
+        validate_expert_persona_placeholders(None, config=config)
+
+
 def test_managed_seed_rejects_a_reserved_persona_token(tmp_path):
     expert_dir = tmp_path / "experts" / "legacy-seed"
     expert_dir.mkdir(parents=True)
