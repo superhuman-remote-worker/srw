@@ -66,7 +66,13 @@ async def execute_job_retained_disk_purge(
             disposition = outcome.disposition
         else:
             raise ResourceAdmissionError("retained_disk_binding_unproven")
-        if disposition == "retry_pending":
+        if disposition == "retry_pending" or (
+            disposition == "completed"
+            and await _exact_controller_purge_child_open(store, permit, candidate)
+        ):
+            # The physical PVC can disappear before the Controller commits its
+            # exact child completion. The signed parent receipt must wait for
+            # that child even when the immediate absence probe succeeded.
             await _observe_pending_job_retained_disk_purge(
                 store, provisioner, permit, candidate
             )
@@ -89,18 +95,7 @@ async def _observe_pending_job_retained_disk_purge(
                 await asyncio.sleep(RETAINED_PURGE_OBSERVE_INTERVAL_S)
                 if await provisioner.attest_vm_cleanup_stop(candidate) is None:
                     continue
-                async with store.db.acquire() as conn:
-                    child_open = await conn.fetchval(
-                        "SELECT EXISTS(SELECT 1 FROM vm_workspace_cleanup_admissions "
-                        "WHERE parent_admission_id=$1 AND owner_kind='job' "
-                        "AND owner_id=$2 AND pvc_uid=$3 "
-                        "AND source='controller_rootdisk_delete' "
-                        "AND completed_at IS NULL)",
-                        permit.admission_id,
-                        UUID(candidate["job_id"]),
-                        UUID(candidate["pvc_uid"]),
-                    )
-                if child_open:
+                if await _exact_controller_purge_child_open(store, permit, candidate):
                     continue
                 # Re-read the immutable candidate and attest again in the
                 # existing completer; its SQL trigger fences child races.
@@ -110,6 +105,22 @@ async def _observe_pending_job_retained_disk_purge(
                 return
     except TimeoutError as exc:
         raise ResourceAdmissionError("retained_disk_physical_purge_pending") from exc
+
+
+async def _exact_controller_purge_child_open(store, permit, candidate):
+    async with store.db.acquire() as conn:
+        return bool(
+            await conn.fetchval(
+                "SELECT EXISTS(SELECT 1 FROM vm_workspace_cleanup_admissions "
+                "WHERE parent_admission_id=$1 AND owner_kind='job' "
+                "AND owner_id=$2 AND pvc_uid=$3 "
+                "AND source='controller_rootdisk_delete' "
+                "AND completed_at IS NULL)",
+                permit.admission_id,
+                UUID(candidate["job_id"]),
+                UUID(candidate["pvc_uid"]),
+            )
+        )
 
 
 async def acquire_job_retained_disk_purge(store, *, job_id: str, identity):

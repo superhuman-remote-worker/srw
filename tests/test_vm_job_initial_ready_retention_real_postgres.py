@@ -938,6 +938,104 @@ async def _complete_controller_purge_child(state, child):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("child_settles", [True, False])
+async def test_pinned_ready_owner_delete_waits_for_open_child_after_physical_absence(
+    pinned_ready_db, monkeypatch, child_settles
+):
+    """Physical absence may precede the Controller's exact child settlement."""
+    from orchestrator.services import vm_job_retained_disk_purge as purge_module
+    from orchestrator.services.vm_job_retained_disk_purge import (
+        acquire_job_retained_disk_purge,
+        execute_job_retained_disk_purge,
+    )
+
+    monkeypatch.setattr(purge_module, "RETAINED_PURGE_OBSERVE_TIMEOUT_S", 1.0)
+    monkeypatch.setattr(purge_module, "RETAINED_PURGE_OBSERVE_INTERVAL_S", 0.01)
+    state = await pinned_ready_settled(pinned_ready_db)
+    permit = await acquire_job_retained_disk_purge(
+        state["recovery"], job_id=state["job_id"], identity=state["identity"]
+    )
+    assert permit is not None and permit.allowed
+    child = await _admit_controller_purge_child(state, permit.parent_cleanup)
+    observed = asyncio.Event()
+
+    async def attest(candidate):
+        observed.set()
+        return {
+            **{k: v for k, v in state["evidence"].items() if k != "retained_rootdisk"},
+            "pvc_disposition": "purged",
+            "controller_scope": candidate["controller_scope"],
+        }
+
+    provisioner = SimpleNamespace(
+        delete_vm_captured=AsyncMock(
+            return_value=SimpleNamespace(disposition="completed")
+        ),
+        attest_vm_cleanup_stop=AsyncMock(side_effect=attest),
+    )
+
+    async def settle_child():
+        await observed.wait()
+        await asyncio.sleep(0.05)
+        await _complete_controller_purge_child(state, child)
+
+    settlement = asyncio.create_task(settle_child()) if child_settles else None
+    try:
+        if child_settles:
+            await execute_job_retained_disk_purge(
+                state["recovery"],
+                provisioner,
+                job_id=state["job_id"],
+                identity=state["identity"],
+                permit=permit,
+            )
+        else:
+            from shared.vm_resource_admission import ResourceAdmissionError
+
+            with pytest.raises(
+                ResourceAdmissionError, match="retained_disk_physical_purge_pending"
+            ):
+                await execute_job_retained_disk_purge(
+                    state["recovery"],
+                    provisioner,
+                    job_id=state["job_id"],
+                    identity=state["identity"],
+                    permit=permit,
+                )
+    finally:
+        if settlement is not None:
+            settlement.cancel()
+            await asyncio.gather(settlement, return_exceptions=True)
+    assert provisioner.delete_vm_captured.await_count == 1
+    assert (
+        await pinned_ready_db.fetchval(
+            "SELECT completed_at IS NOT NULL AND outcome='completed' "
+            "FROM vm_workspace_cleanup_admissions WHERE id=$1",
+            permit.admission_id,
+        )
+        is child_settles
+    )
+    assert (
+        bool(
+            await pinned_ready_db.fetchval(
+                "SELECT EXISTS(SELECT 1 FROM vm_job_retained_disk_purge_receipts "
+                "WHERE cleanup_admission_id=$1)",
+                permit.admission_id,
+            )
+        )
+        is child_settles
+    )
+    original = await pinned_ready_db.fetchrow(
+        "SELECT s.stop_evidence->>'pvc_disposition' AS disposition,v.state "
+        "FROM vm_resource_cleanup_stop_receipts s "
+        "JOIN vm_resource_reservations v ON v.id=s.reservation_id "
+        "WHERE s.cleanup_admission_id=$1",
+        state["retention"].admission_id,
+    )
+    assert original["disposition"] == "retained" and original["state"] == "released"
+
+
+@pytest.mark.asyncio
 async def test_pinned_ready_owner_delete_observes_delayed_exact_disk_purge(
     pinned_ready_db, monkeypatch
 ):
