@@ -3248,6 +3248,24 @@ class UniversalAgent:
 
         return False
 
+    def _initialize_fresh_workspace(self, metadata: Dict[str, Any]) -> None:
+        """Lay out a fresh workspace: clone the job's repositories, or not.
+
+        A lite tier (virtual/none) has no shell to clone with, and its git
+        versioning is already forced off for the same reason. Admission gives
+        every root job a job repository, a live-session job without a
+        workspace included, so its repositories are left alone here.
+        """
+        from agent.core.backends.factory import LITE_BACKENDS
+
+        if (
+            metadata.get("repositories")
+            and self.config.workspace.backend not in LITE_BACKENDS
+        ):
+            self._workspace_manager.initialize_project_workspace()
+        else:
+            self._workspace_manager.initialize()
+
     async def _setup_job_workspace(
         self,
         job_id: str,
@@ -4049,10 +4067,7 @@ class UniversalAgent:
                 f"reattached tree, no clonable job repo, and no phase "
                 f"snapshot; starting from an empty workspace"
             )
-        if metadata.get("repositories"):
-            self._workspace_manager.initialize_project_workspace()
-        else:
-            self._workspace_manager.initialize()
+        self._initialize_fresh_workspace(metadata)
 
         # instructions.md / task_brief.md are virtual
         # (knowledge-base/knowledge/features/virtual_directories.md): served live by providers
