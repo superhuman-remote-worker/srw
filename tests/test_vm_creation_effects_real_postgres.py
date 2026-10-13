@@ -130,6 +130,192 @@ async def test_two_replicas_receive_only_one_effect_grant(db, monkeypatch):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("deadline_seconds", [40, 3600])
+async def test_new_effect_refreshes_exact_claim_within_admission_deadline(
+    db, monkeypatch, deadline_seconds
+):
+    store, row, claim, carrier = await reserved(
+        db, monkeypatch, timeout=deadline_seconds
+    )
+    async with db.acquire() as conn:
+        before = await conn.fetchrow(
+            "UPDATE vm_creation_retries SET claim_expires_at=clock_timestamp()+interval '5 seconds' "
+            "WHERE request_id=$1 RETURNING claim_token,claim_expires_at,revision,backoff_attempt,admission_deadline",
+            row["request_id"],
+        )
+    assert (
+        await store.begin_effect(
+            request_id=str(row["request_id"]),
+            claim_token=str(claim["claim_token"]),
+            carrier=carrier,
+        )
+    )["actuation_allowed"] is True
+    async with db.acquire() as conn:
+        after = await conn.fetchrow(
+            "SELECT claim_token,claim_expires_at,revision,backoff_attempt,"
+            "admission_deadline,clock_timestamp() AS observed_at "
+            "FROM vm_creation_retries WHERE request_id=$1",
+            row["request_id"],
+        )
+        effects = await conn.fetchval(
+            "SELECT count(*) FROM vm_creation_effects WHERE request_id=$1",
+            row["request_id"],
+        )
+    assert effects == 1
+    assert after["claim_token"] == before["claim_token"] == claim["claim_token"]
+    assert after["revision"] == before["revision"]
+    assert after["backoff_attempt"] == before["backoff_attempt"] == 0
+    assert after["claim_expires_at"] > before["claim_expires_at"]
+    assert after["claim_expires_at"] <= after["admission_deadline"]
+    if deadline_seconds == 40:
+        assert after["claim_expires_at"] == after["admission_deadline"]
+    else:
+        remaining = (after["claim_expires_at"] - after["observed_at"]).total_seconds()
+        assert 55 < remaining <= 60
+
+
+@pytest.mark.asyncio
+async def test_vm_stage_renews_near_expiry_after_exact_disk_and_secret(db, monkeypatch):
+    store, row, carrier, observations = await observed_creation(
+        db, monkeypatch, stop_after="cloud_init"
+    )
+    values = verify_creation_carrier(carrier, secret=SECRET)
+    vm_carrier = seal_creation_carrier(
+        {
+            **values,
+            "effect_kind": "vm",
+            "effect_nonce": str(uuid4()),
+            "object_name": f"agent-vm-{row['job_id']}",
+            "current_secret_uid": observations["cloud_init"]["object"]["metadata"][
+                "uid"
+            ],
+        },
+        namespace="agent-vms",
+        uid=carrier["metadata"]["uid"],
+        resource_version="4",
+        secret=SECRET,
+    )
+    async with db.acquire() as conn:
+        claim = await conn.fetchrow(
+            "UPDATE vm_creation_retries SET claim_expires_at=clock_timestamp()+interval '5 seconds' "
+            "WHERE request_id=$1 RETURNING claim_token,revision",
+            row["request_id"],
+        )
+    grant = await store.begin_effect(
+        request_id=str(row["request_id"]),
+        claim_token=str(claim["claim_token"]),
+        carrier=vm_carrier,
+    )
+    assert grant["actuation_allowed"] is True
+    async with db.acquire() as conn:
+        after = await conn.fetchrow(
+            "SELECT claim_token,claim_expires_at,revision,clock_timestamp() AS observed_at "
+            "FROM vm_creation_retries WHERE request_id=$1",
+            row["request_id"],
+        )
+        effects = await conn.fetch(
+            "SELECT effect_kind,state FROM vm_creation_effects WHERE request_id=$1 "
+            "ORDER BY effect_number",
+            row["request_id"],
+        )
+    assert [effect["effect_kind"] for effect in effects] == [
+        "rootdisk",
+        "cloud_init",
+        "vm",
+    ]
+    assert [effect["state"] for effect in effects] == ["observed", "observed", "issued"]
+    assert after["claim_token"] == claim["claim_token"]
+    assert after["revision"] == claim["revision"]
+    assert 55 < (after["claim_expires_at"] - after["observed_at"]).total_seconds() <= 60
+
+
+@pytest.mark.asyncio
+async def test_prior_and_unresolved_effect_do_not_refresh_claim(db, monkeypatch):
+    store, row, claim, carrier = await reserved(db, monkeypatch)
+    assert (
+        await store.begin_effect(
+            request_id=str(row["request_id"]),
+            claim_token=str(claim["claim_token"]),
+            carrier=carrier,
+        )
+    )["actuation_allowed"] is True
+    async with db.acquire() as conn:
+        expiry = await conn.fetchval(
+            "UPDATE vm_creation_retries SET claim_expires_at=clock_timestamp()+interval '5 seconds' "
+            "WHERE request_id=$1 RETURNING claim_expires_at",
+            row["request_id"],
+        )
+    repeated = await store.begin_effect(
+        request_id=str(row["request_id"]),
+        claim_token=str(claim["claim_token"]),
+        carrier=carrier,
+    )
+    assert repeated["actuation_allowed"] is False
+    assert repeated["disposition"] == "observe_only"
+    values = verify_creation_carrier(carrier, secret=SECRET)
+    new_nonce = seal_creation_carrier(
+        {**values, "effect_nonce": str(uuid4())},
+        namespace="agent-vms",
+        uid=carrier["metadata"]["uid"],
+        resource_version="3",
+        secret=SECRET,
+    )
+    with pytest.raises(VMCreationRetryConflict, match="creation_effect_unresolved"):
+        await store.begin_effect(
+            request_id=str(row["request_id"]),
+            claim_token=str(claim["claim_token"]),
+            carrier=new_nonce,
+        )
+    async with db.acquire() as conn:
+        assert (
+            await conn.fetchval(
+                "SELECT claim_expires_at FROM vm_creation_retries WHERE request_id=$1",
+                row["request_id"],
+            )
+            == expiry
+        )
+        assert (
+            await conn.fetchval(
+                "SELECT count(*) FROM vm_creation_effects WHERE request_id=$1",
+                row["request_id"],
+            )
+            == 1
+        )
+
+
+@pytest.mark.asyncio
+async def test_foreign_claim_cannot_refresh_or_issue_effect(db, monkeypatch):
+    store, row, _claim, carrier = await reserved(db, monkeypatch)
+    async with db.acquire() as conn:
+        expiry = await conn.fetchval(
+            "UPDATE vm_creation_retries SET claim_expires_at=clock_timestamp()+interval '5 seconds' "
+            "WHERE request_id=$1 RETURNING claim_expires_at",
+            row["request_id"],
+        )
+    with pytest.raises(VMCreationRetryConflict, match="retry_claim_changed"):
+        await store.begin_effect(
+            request_id=str(row["request_id"]),
+            claim_token=str(uuid4()),
+            carrier=carrier,
+        )
+    async with db.acquire() as conn:
+        assert (
+            await conn.fetchval(
+                "SELECT claim_expires_at FROM vm_creation_retries WHERE request_id=$1",
+                row["request_id"],
+            )
+            == expiry
+        )
+        assert (
+            await conn.fetchval(
+                "SELECT count(*) FROM vm_creation_effects WHERE request_id=$1",
+                row["request_id"],
+            )
+            == 0
+        )
+
+
+@pytest.mark.asyncio
 async def test_receipt_surrenders_only_its_issued_effect_and_schedules_failure(
     db, monkeypatch
 ):
@@ -1036,11 +1222,35 @@ async def test_unknown_issuance_survives_claim_expiry_and_cancellation(db, monke
 async def test_cancel_before_effect_grant_can_settle_never_issued(db, monkeypatch):
     store, row, claim, carrier = await reserved(db, monkeypatch)
     await db.linearize_pinned_cancel(str(row["job_id"]), expected_status="paused")
+    async with db.acquire() as conn:
+        before = dict(
+            await conn.fetchrow(
+                "SELECT claim_token,claim_expires_at FROM vm_creation_retries WHERE request_id=$1",
+                row["request_id"],
+            )
+        )
     with pytest.raises(VMCreationRetryConflict, match="job_cancelled"):
         await store.begin_effect(
             request_id=str(row["request_id"]),
             claim_token=str(claim["claim_token"]),
             carrier=carrier,
+        )
+    async with db.acquire() as conn:
+        assert (
+            dict(
+                await conn.fetchrow(
+                    "SELECT claim_token,claim_expires_at FROM vm_creation_retries WHERE request_id=$1",
+                    row["request_id"],
+                )
+            )
+            == before
+        )
+        assert (
+            await conn.fetchval(
+                "SELECT count(*) FROM vm_creation_effects WHERE request_id=$1",
+                row["request_id"],
+            )
+            == 0
         )
     assert await store.settle_never_issued(request_id=str(row["request_id"])) == {
         "settled": True,
@@ -1414,6 +1624,10 @@ async def test_begin_effect_expiry_after_lock_wait_creates_no_grant(
                 "UPDATE vm_creation_retries SET claim_expires_at=clock_timestamp()+interval '1 second' WHERE request_id=$1",
                 row["request_id"],
             )
+        original_expiry = await conn.fetchval(
+            "SELECT claim_expires_at FROM vm_creation_retries WHERE request_id=$1",
+            row["request_id"],
+        )
         async with conn.transaction():
             await conn.execute(
                 "SELECT id FROM jobs WHERE id=$1 FOR UPDATE", row["job_id"]
@@ -1440,6 +1654,13 @@ async def test_begin_effect_expiry_after_lock_wait_creates_no_grant(
                 row["request_id"],
             )
             == 0
+        )
+        assert (
+            await conn.fetchval(
+                "SELECT claim_expires_at FROM vm_creation_retries WHERE request_id=$1",
+                row["request_id"],
+            )
+            == original_expiry
         )
 
 
