@@ -97,6 +97,29 @@ def test_pricing_sync_skips_live_voice_rows():
     assert pairs == [("gpt-6", None)]
 
 
-def test_0547_prices_voice_seconds():
-    sql = " ".join((MIGRATIONS / "0547_live_voice_usage_rate.sql").read_text().split())
-    assert "'llm', 'gpt-live-1', 'live-voice-second', 0.05 / 60" in sql
+@pytest.mark.asyncio
+async def test_the_ledger_prices_gpt_live_until_a_rate_is_configured():
+    from datetime import datetime, timezone
+    from decimal import Decimal
+    from unittest.mock import AsyncMock, Mock
+
+    from orchestrator.services.live.ledger import record_session_usage
+
+    session = {
+        "id": "00000000-0000-0000-0000-0000000000aa",
+        "model": "gpt-live-1",
+        "usage_seconds": 60,
+        "ended_at": datetime(2026, 10, 13, tzinfo=timezone.utc),
+        "job_id": None,
+    }
+    ledger = Mock(is_available=True)
+    ledger.resolve_rate = AsyncMock(return_value=None)
+    ledger.record_events = AsyncMock(return_value=1)
+    assert await record_session_usage(ledger, Mock(), session) == 1
+    event = ledger.record_events.await_args.args[0][0]
+    assert event.unit == "live-voice-second" and event.cost_usd == Decimal("0.05")
+
+    ledger.resolve_rate = AsyncMock(return_value=Decimal("0.001"))
+    await record_session_usage(ledger, Mock(), session)
+    event = ledger.record_events.await_args.args[0][0]
+    assert event.rate_usd is None  # the configured rate is snapshotted

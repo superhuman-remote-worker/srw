@@ -5,12 +5,18 @@ one ``usage_events`` row is written: source ``live``, the session id as its
 source id, the end time as its timestamp (deterministic, so a repeated
 report collides on the ledger's dedupe key), billed to the job's project and
 owner as an ``llm`` resource priced per ``live-voice-second``.
+
+``usage_rates`` ships empty (an admin or the price sync fills it), and no
+public price list serves live voice seconds, so an engine's published list
+price (:data:`DEFAULT_RATES`) prices the row while no rate is configured for
+it; a configured rate always wins.
 """
 
 from __future__ import annotations
 
 import logging
 from datetime import datetime, timezone
+from decimal import Decimal
 from typing import Any
 
 from orchestrator.services.usage_ledger import UsageEvent
@@ -19,6 +25,9 @@ logger = logging.getLogger(__name__)
 
 SOURCE = "live"
 UNIT = "live-voice-second"
+#: List prices per voice second (OpenAI: gpt-live-1 is $0.05 per minute,
+#: billed per second).
+DEFAULT_RATES: dict[str, Decimal] = {"gpt-live-1": Decimal("0.05") / Decimal(60)}
 
 
 def usage_event(
@@ -63,6 +72,17 @@ async def record_session_usage(ledger: Any, db: Any, session: dict[str, Any]) ->
     event = usage_event(session, job)
     if event is None:
         return 0
+    default = DEFAULT_RATES.get(event.resource)
+    if default is not None:
+        try:
+            configured = await ledger.resolve_rate(
+                event.category, event.resource, event.unit, event.ts
+            )
+        except Exception:
+            configured = None
+        if configured is None:
+            event.rate_usd = default
+            event.cost_usd = Decimal(str(event.quantity)) * default
     try:
         return await ledger.record_events([event])
     except Exception:

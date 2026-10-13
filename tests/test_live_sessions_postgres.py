@@ -894,15 +894,14 @@ class TestLiveAutomations:
                 )
 
     @pytest.mark.asyncio
-    async def test_the_live_voice_rate_is_seeded(self, db):
+    async def test_no_rate_is_seeded(self, db):
+        # usage_rates ships empty; the live ledger prices gpt-live-1 with its
+        # list price until an admin configures a rate (services/live/ledger).
         async with db.acquire() as conn:
             rate = await conn.fetchval(
-                "SELECT rate_usd FROM usage_rates WHERE category='llm' "
-                "AND resource=$1 AND unit='live-voice-second'",
-                MODEL,
+                "SELECT rate_usd FROM usage_rates WHERE unit='live-voice-second'"
             )
-        assert rate is not None
-        assert abs(float(rate) - 0.05 / 60) < 1e-9
+        assert rate is None
 
 
 # =============================================================================
