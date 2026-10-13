@@ -61,11 +61,12 @@ from agent.subagents.envelope import build_envelope, build_replay_envelope, repo
 from agent.subagents.fork import seed_fork_history
 from agent.subagents.host import ParentHost, ParentRef
 from agent.subagents.limiter import LiveConcurrencyLimit
-from agent.subagents.phone import (
+from agent.subagents.live import (
+    NOT_DELEGATED,
     PARENT_STOP_REASON,
-    PhoneCallSettings,
-    PhoneDriver,
-    is_phone_entry,
+    LiveSessionSettings,
+    LiveVoiceDriver,
+    is_live_entry,
 )
 from agent.subagents.ledger import (
     SUBAGENT_STATUSES,
@@ -199,6 +200,9 @@ class SubagentCall:
     fork: bool = False
     owned_paths: List[str] = field(default_factory=list)
     run_in_background: bool = False
+    #: Set only by ``attach_live_session``: the job's own session attaching
+    #: its live voice entry, which ``delegate_agent`` may never start.
+    live_attach: bool = False
 
 
 @dataclass
@@ -251,9 +255,31 @@ class BackgroundRun:
     revived: bool = False
     reviving: bool = False
     revival_task: Optional[asyncio.Task] = None
-    #: Phone children only: the questions the call handed to the parent
-    #: (``PhoneDriver`` owns each dict; ``wait_agent`` surfaces open ones).
+    #: Live voice children only: the questions the session handed to the
+    #: parent (``LiveVoiceDriver`` owns each dict; ``wait_agent`` surfaces
+    #: open ones).
     questions: List[Dict[str, Any]] = field(default_factory=list)
+    #: The voice subagent of the job's own session (``config.live_session``):
+    #: its session's end turns the parent strategic (``_live_session_over``).
+    live_primary: bool = False
+    #: Handles of the live runs this one replaced after a parent restart.
+    replaces: List[str] = field(default_factory=list)
+
+
+def _live_note(run: Any) -> str:
+    """The ``<active_subagents>`` line's note for a live voice run: what it
+    is, and after a restart which run it replaced (the reconnect note)."""
+    if not is_live_entry(getattr(run, "entry", None)):
+        return ""
+    note = " — live voice session; wait_agent returns its questions"
+    replaces = getattr(run, "replaces", None)
+    if replaces:
+        note += (
+            ". Reconnected to the live session after a restart (replaces "
+            + ", ".join(replaces)
+            + ")"
+        )
+    return note
 
 
 def _handle_base(subagent_type: str) -> str:
@@ -363,6 +389,11 @@ class SubagentRuntime:
         self._abandoning = False
         self._persistence_abandoned = False
         self._recovery_complete = False
+        # Live voice runs a restart superseded (``recover_orphans``), waiting
+        # for the job's re-attach, and each superseded handle's successor:
+        # the parent still holds the old handle in its history.
+        self._superseded_live: List[str] = []
+        self._live_successors: Dict[str, str] = {}
 
     # ------------------------------------------------------------------
     # Construction
@@ -742,11 +773,8 @@ class SubagentRuntime:
             name, entry = self.resolve_entry(call.subagent_type)
         except SpawnRefused as refused:
             return f"Error: {refused}"
-        if is_phone_entry(entry):
-            return (
-                f"Error: {name} is a phone call; delegate it with "
-                "run_in_background=true and follow it with wait_agent"
-            )
+        if is_live_entry(entry):
+            return f"Error: {name}: {NOT_DELEGATED}"
 
         if key is None:
             return await self._spawn(key, name, entry, call)
@@ -1195,10 +1223,27 @@ class SubagentRuntime:
                 return answer
 
             isolation = str(call.isolation or entry.get("isolation") or "shared")
-            if is_phone_entry(entry) and (call.fork or isolation != "shared"):
+            if is_live_entry(entry) and not call.live_attach:
+                answer = f"Error: {name}: {NOT_DELEGATED}"
+                return answer
+            if call.live_attach:
+                # Once per session: a second attach finds the running one.
+                async with self._state_lock:
+                    current = next(
+                        (
+                            r
+                            for r in self._background.values()
+                            if r.live_primary and r.status in {"queued", "running"}
+                        ),
+                        None,
+                    )
+                if current is not None:
+                    answer = current.receipt
+                    return answer
+            if is_live_entry(entry) and (call.fork or isolation != "shared"):
                 answer = (
-                    f"Error: {name} is a phone call; it takes no fork and no "
-                    "worktree isolation"
+                    f"Error: {name} is a live voice subagent; it takes no fork "
+                    "and no worktree isolation"
                 )
                 return answer
             if isolation not in {"shared", "worktree"}:
@@ -1280,8 +1325,14 @@ class SubagentRuntime:
                 receipt=receipt,
                 key=key,
                 batch_size=self._batch_size,
+                live_primary=bool(call.live_attach),
             )
             async with self._state_lock:
+                if run.live_primary:
+                    run.replaces = list(self._superseded_live)
+                    self._superseded_live.clear()
+                    for old in run.replaces:
+                        self._live_successors[old] = handle
                 self._background_reservations -= 1
                 reserved = False
                 admission_lost = not self._accepting
@@ -1359,7 +1410,7 @@ class SubagentRuntime:
                     run.call.isolation or run.entry.get("isolation") or "shared"
                 )
                 try:
-                    if is_phone_entry(run.entry):
+                    if is_live_entry(run.entry):
                         build = None
                     else:
                         build = await build_child(
@@ -1390,7 +1441,7 @@ class SubagentRuntime:
                     terminal_outcome = "error"
                 else:
                     if build is None:
-                        driver = self._make_phone_driver(run)
+                        driver = self._make_live_driver(run)
                     else:
                         messages = None
                         messages_already_persisted = False
@@ -1549,13 +1600,48 @@ class SubagentRuntime:
             run.status = "delivery_pending"
             run.delivery_pending = True
         await self._commit_background_terminal(run)
+        if run.live_primary:
+            ended = driver.end_reason if isinstance(driver, LiveVoiceDriver) else None
+            if ended is None and terminal_status == "error":
+                # The voice subagent failed: the job has lost its session.
+                ended = "the voice subagent failed"
+            if ended is not None:
+                self._live_session_over(ended)
         await self._notify_changed()
 
-    def _make_phone_driver(self, run: BackgroundRun) -> PhoneDriver:
-        """The driver of a phone child: the live call named in ``config.telephony``."""
+    def _live_session_over(self, reason: str) -> None:
+        """The job's own session ended: its phase ends for the strategic one.
+
+        Before the wake-up of ``wait_agent``, so the ``check_todos`` after
+        that tool call already finds the request. Only the primary session's
+        voice subagent does this (a hang-up, the line's maximum duration,
+        ``stop_agent``, a session that failed or never connected, a voice
+        subagent that failed); a detach never does.
+        """
+        end = getattr(self.parent_context, "end_live_session", None)
+        if callable(end):
+            end(reason)
+            return
+        replan = getattr(self.parent_context, "request_replan", None)
+        if callable(replan):
+            replan(f"live session ended: {reason}")
+
+    def _make_live_driver(self, run: BackgroundRun) -> LiveVoiceDriver:
+        """The driver of a live voice child: the session in ``config.live_session``.
+
+        The lease comes from the job payload the parent holds in process
+        (``ToolContext._live_lease``), never from config.
+        """
 
         config = getattr(self.parent_context, "config", None) or {}
-        settings = PhoneCallSettings.from_config(config, run.entry)
+        lease = getattr(self.parent_context, "_live_lease", None)
+        if lease is None:
+            logger.warning(
+                "live subagent %s: the job payload carries no lease for its "
+                "connector; the pod will refuse it",
+                run.handle,
+            )
+        settings = LiveSessionSettings.from_config(config, run.entry, lease)
         parent = self._parent_ref()
 
         async def on_question(question: Dict[str, Any]) -> None:
@@ -1563,7 +1649,7 @@ class SubagentRuntime:
                 run.questions.append(question)
             await self._notify_changed()
 
-        return PhoneDriver(
+        return LiveVoiceDriver(
             settings,
             handle=run.handle,
             subagent_type=run.subagent_type,
@@ -1849,7 +1935,7 @@ class SubagentRuntime:
     ) -> Dict[str, Any]:
         """Condition-backed wait for one child (or any current live child)."""
         timeout = min(3600.0, max(10.0, float(timeout_s)))
-        selected = str(handle or "").strip() or None
+        selected = self._live_handle(str(handle or "").strip()) or None
         async with self._state_lock:
             if selected is not None and selected not in self._background:
                 return {"result": "not_found", "handle": selected}
@@ -1929,25 +2015,25 @@ class SubagentRuntime:
     ) -> Dict[str, Any]:
         """Steer a live child or durably revive one terminal generation.
 
-        For a phone child, ``reply_to`` answers one of its questions (the
+        For a live voice child, ``reply_to`` answers one of its questions (the
         voice speaks ``message``), no ``reply_to`` steers the voice, and
-        ``call_action="transfer"`` hands the call to the line's human after
-        ``message`` is spoken. A finished call is never revived.
+        ``call_action="transfer"`` hands the caller to a person after
+        ``message`` is spoken. A finished session is never revived.
         """
-        name = str(handle or "").strip()
+        name = self._live_handle(str(handle or "").strip())
         text = str(message or "").strip()
         if not text:
             return {"result": "invalid", "handle": name, "error": "empty message"}
 
         async with self._state_lock:
-            phone_run = self._background.get(name)
-        if phone_run is not None and is_phone_entry(phone_run.entry):
-            return await self._message_phone(phone_run, text, reply_to, call_action)
+            live_run = self._background.get(name)
+        if live_run is not None and is_live_entry(live_run.entry):
+            return await self._message_live(live_run, text, reply_to, call_action)
         if reply_to or call_action:
             return {
                 "result": "invalid",
                 "handle": name,
-                "error": "reply_to and call_action apply to phone subagents only",
+                "error": "reply_to and call_action apply to live voice subagents only",
             }
 
         async with self._state_lock:
@@ -1965,11 +2051,11 @@ class SubagentRuntime:
                 }
         if run is None:
             return {"result": "not_found", "handle": name}
-        if is_phone_entry(run.entry):
+        if is_live_entry(run.entry):
             return {
-                "result": "call_ended",
+                "result": "session_ended",
                 **self._status_view(run),
-                "error": "a finished call cannot be revived; handle it as a follow-up",
+                "error": "a finished session cannot be revived; handle it as a follow-up",
             }
 
         notify = False
@@ -2025,7 +2111,7 @@ class SubagentRuntime:
         assert revival_task is not None
         return await asyncio.shield(revival_task)
 
-    async def _message_phone(
+    async def _message_live(
         self,
         run: BackgroundRun,
         text: str,
@@ -2033,11 +2119,11 @@ class SubagentRuntime:
         call_action: Optional[str],
     ) -> Dict[str, Any]:
         driver = run.driver
-        if not isinstance(driver, PhoneDriver) or not driver.running:
+        if not isinstance(driver, LiveVoiceDriver) or not driver.running:
             return {
-                "result": "call_ended",
+                "result": "session_ended",
                 **self._status_view(run),
-                "error": "the call is over; handle this as a follow-up after the call",
+                "error": "the session is over; handle this as a follow-up",
             }
         if call_action not in (None, "", "transfer"):
             return {
@@ -2371,7 +2457,7 @@ class SubagentRuntime:
 
     async def stop_agent(self, handle: str, grace_s: float) -> Dict[str, Any]:
         """Stop one child with a bounded tool-less partial attempt."""
-        name = str(handle or "").strip()
+        name = self._live_handle(str(handle or "").strip())
         grace = min(300.0, max(0.1, float(grace_s)))
         async with self._state_lock:
             run = self._background.get(name)
@@ -2436,7 +2522,7 @@ class SubagentRuntime:
             return ""
         lines = ["<active_subagents>"]
         lines.extend(
-            f"- {run.handle} ({run.subagent_type}): {run.status}"
+            f"- {run.handle} ({run.subagent_type}): {run.status}" + _live_note(run)
             for run in live[: self.max_concurrent]
         )
         lines.extend(
@@ -2446,6 +2532,14 @@ class SubagentRuntime:
             ]
         )
         return "\n".join(lines)
+
+    def _live_handle(self, handle: str) -> str:
+        """A superseded live handle's current successor (else ``handle``)."""
+        seen = set()
+        while handle in self._live_successors and handle not in seen:
+            seen.add(handle)
+            handle = self._live_successors[handle]
+        return handle
 
     def has_completion_blockers(self) -> bool:
         """True while work or a locally undrained committed report remains."""
@@ -2535,6 +2629,32 @@ class SubagentRuntime:
                     )
                 self._handles.add(handle)
                 background = row.get("run_in_background") is True
+                if background and is_live_entry(self.roster.get(subagent_type)):
+                    # A live voice run is neither resumed nor reported as
+                    # interrupted: its session goes on at the pod, and the job
+                    # attaches a new run that reads the session's journal from
+                    # the start (``attach_live_session``). The old row ends
+                    # superseded, without a delivery.
+                    await self._strict_ledger_update(
+                        subagent_id,
+                        status="interrupted",
+                        outcome="interrupted:superseded",
+                        turns=_orphan_row_counter(row, "turns"),
+                        tokens=_orphan_row_counter(row, "tokens"),
+                        error="superseded by a new attach to the live session",
+                    )
+                    self._settled_handles.add(handle)
+                    self._superseded_live.append(handle)
+                    recovered.append(
+                        {
+                            "handle": handle,
+                            "thread_id": subagent_id,
+                            "status": "interrupted",
+                            "outcome": "interrupted:superseded",
+                            "run_in_background": True,
+                        }
+                    )
+                    continue
                 if not background:
                     delivery_channel = str(
                         getattr(self.host, "delivery_channel", "lane_b") or "lane_b"
