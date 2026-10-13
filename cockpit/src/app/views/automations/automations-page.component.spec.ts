@@ -1,13 +1,19 @@
-import {afterEach, describe, expect, it, vi} from 'vitest';
-import {Injector, runInInjectionContext, signal} from '@angular/core';
-import {ActivatedRoute, Router, convertToParamMap} from '@angular/router';
-import {of} from 'rxjs';
-import {TranslocoService} from '@jsverse/transloco';
+import {afterEach, beforeAll, describe, expect, it, vi} from 'vitest';
+import {readFileSync} from 'node:fs';
+import {TestBed} from '@angular/core/testing';
+import {DatePipe} from '@angular/common';
+import {CUSTOM_ELEMENTS_SCHEMA, ɵresolveComponentResources, Injector, runInInjectionContext, signal} from '@angular/core';
+import {ActivatedRoute, Router, RouterLink, convertToParamMap} from '@angular/router';
+import {of, throwError} from 'rxjs';
+import {Automation} from '../../core/services/automations.service';
+import en from '../../../assets/i18n/en.json';
+import {TranslocoPipe, TranslocoService, TranslocoTestingModule} from '@jsverse/transloco';
 
 import {
   AutomationsPageComponent,
   derivePresetCron,
   inferPresetFromCron,
+  connectorBindings,
 } from './automations-page.component';
 import {ApiService} from '../../core/services/api.service';
 import {AutomationsService} from '../../core/services/automations.service';
@@ -39,6 +45,7 @@ function createComponent(queryParams: Record<string, string> = {}) {
     getExperts: vi.fn().mockReturnValue(
       of([{id: 'scholar', display_name: 'Scholar'}]),
     ),
+    getEligibleDatasources: vi.fn().mockReturnValue(of([])),
     getProject: vi.fn().mockReturnValue(of(null)),
   };
 
@@ -48,7 +55,8 @@ function createComponent(queryParams: Record<string, string> = {}) {
   };
 
   const translocoMock = {
-    translate: (key: string) => key,
+    translate: (key: string, params?: {name?: string}) => key === 'automations.errors.liveConnectorTaken'
+      ? en.automations.errors.liveConnectorTaken.replace('{{name}}', params?.name ?? '') : key,
     langChanges$: of('en'),
     getActiveLang: () => 'en',
   };
@@ -305,5 +313,157 @@ describe('AutomationsPageComponent', () => {
         }),
       );
     });
+  });
+});
+
+
+describe('live automations', () => {
+  const line = {id: 'phone-1', name: 'Empfang', type: 'gpt_live_sip'};
+  const extra = {id: 'kb-1', name: 'Empfang', type: 'kb'};
+  function setup() {
+    const result = createComponent();
+    result.apiServiceMock.getEligibleDatasources.mockReturnValue(of([line, extra]));
+    result.component.ngOnInit();
+    result.component.openNewEditor();
+    result.component.updateEditor('triggerType', 'live');
+    result.component.updateEditor('name', 'Incoming clinic enquiry');
+    result.component.updateEditor('prompt', 'Help the caller');
+    result.component.updateEditor('preset', 'custom');
+    result.component.updateEditor('customCron', '');
+    result.component.setConnectorIds(['phone-1', 'kb-1']);
+    return result;
+  }
+
+  it.each(['default', 'none', 'inline'] as const)('creates a live trigger without cron and with %s workspace', (kind) => {
+    const {component, automationsServiceMock} = setup();
+    component.updateEditor('workspaceChoice', kind === 'inline' ? {kind, spec: {backend: 'virtual'}} : {kind});
+    component.saveEditor();
+    const body = automationsServiceMock.create.mock.calls[0][0];
+    expect(body).toMatchObject({trigger_type: 'live', primary_connector: 'empfang', job_shape: {
+      execution: {connectors: {empfang: {ref: {uid: 'phone-1'}}, 'empfang-2': {ref: {uid: 'kb-1'}}}},
+    }});
+    expect(body).not.toHaveProperty('cron_expr');
+    expect(body).not.toHaveProperty('timezone');
+    expect(body).not.toHaveProperty('catchup_window_seconds');
+    if (kind === 'default') expect(body.job_shape).not.toHaveProperty('workspace');
+    if (kind === 'none') expect(body.job_shape.workspace).toBeNull();
+    if (kind === 'inline') expect(body.job_shape.workspace).toEqual({template: {inline: {backend: 'virtual'}}});
+  });
+
+  it('requires a selected live primary connector and defaults to the first', () => {
+    const {component, automationsServiceMock} = setup();
+    expect(component.editor()?.primaryConnectorId).toBe('phone-1');
+    component.setConnectorIds(['kb-1']);
+    component.saveEditor();
+    expect(automationsServiceMock.create).not.toHaveBeenCalled();
+    expect(component.errorMessage()).toBe('automations.editor.liveConnectorRequired');
+  });
+
+  it('shows the conflict holder on create, patch and resume', () => {
+    const {component, automationsServiceMock} = setup();
+    const refusal = throwError(() => ({status: 409, error: {detail: {
+      code: 'live_connector_taken', automation_name: 'Clinic reception', automation_id: 'holder',
+    }}}));
+    automationsServiceMock.create.mockReturnValue(refusal);
+    component.saveEditor();
+    expect(component.errorMessage()).toBe('Already used by automation Clinic reception');
+    const row = {...component.editor(), id: 'automation-1', enabled: false, trigger_type: 'live'} as unknown as Automation;
+    automationsServiceMock.resume.mockReturnValue(refusal);
+    component.toggleEnabled(row);
+    expect(component.errorMessage()).toBe('Already used by automation Clinic reception');
+    component.updateEditor('mode', 'edit');
+    component.updateEditor('id', row.id);
+    automationsServiceMock.update.mockReturnValue(refusal);
+    component.saveEditor();
+    expect(component.errorMessage()).toBe('Already used by automation Clinic reception');
+  });
+
+  it('preserves aliases and workspace refs on patch without changing the trigger', () => {
+    const {component, automationsServiceMock} = setup();
+    component.openEditor({id: 'a-1', trigger_type: 'live', trigger_connector_id: 'phone-1', name: 'Live',
+      expert: 'scholar', prompt: 'Help', enabled: true, autonomy: 'review', priority: 5, max_fires_per_day: 100,
+      catchup_window_seconds: 0, project_id: null, job_shape: {
+        primary_connector: 'original', execution: {connectors: {original: {ref: {uid: 'phone-1'}}}},
+        workspace: {template: {ref: {name: 'clinic', scope: {kind: 'Account', name: 'me'}}}},
+      }} as Automation);
+    component.updateEditor('triggerType', 'cron');
+    expect(component.editor()?.triggerType).toBe('live');
+    component.saveEditor();
+    const body = automationsServiceMock.update.mock.calls[0][1];
+    expect(body).not.toHaveProperty('trigger_type');
+    expect(body.primary_connector).toBe('original');
+    expect(body.job_shape.workspace).toEqual({template: {ref: {name: 'clinic', scope: {kind: 'Account', name: 'me'}}}});
+  });
+
+  it('labels a live row with its connector and never runs it manually', () => {
+    const {component, automationsServiceMock} = setup();
+    const row = {id: 'a-1', trigger_type: 'live', trigger_connector_id: 'phone-1'} as Automation;
+    expect(component.connectorLabel(row)).toBe('Empfang');
+    component.runNow(row);
+    expect(automationsServiceMock.runNow).not.toHaveBeenCalled();
+  });
+
+  it('creates unique bounded aliases for unicode, punctuation and colliding long names', () => {
+    const names = ['Ärzte & Empfang', 'Ärzte / Empfang', '!!!', 'a'.repeat(90), 'a'.repeat(90)];
+    const rows = names.map((name, i) => ({id: String(i), name}));
+    const result = connectorBindings(rows.map((r) => r.id), rows);
+    expect(Object.keys(result.connectors)).toHaveLength(5);
+    for (const alias of Object.keys(result.connectors)) expect(alias).toMatch(/^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/);
+    expect(result.aliases['0']).toBe('arzte-empfang');
+    expect(result.aliases['1']).toBe('arzte-empfang-2');
+  });
+});
+
+
+describe('live automation rendering', () => {
+  beforeAll(async () => { await ɵresolveComponentResources(() => Promise.resolve('')); });
+  afterEach(() => TestBed.resetTestingModule());
+  function mount() {
+    const {automationsServiceMock: service, apiServiceMock: api} = createComponent();
+    api.getEligibleDatasources.mockReturnValue(of([{id: 'phone-1', name: 'Empfang', type: 'gpt_live_sip'}]));
+    TestBed.configureTestingModule({imports: [AutomationsPageComponent,
+      TranslocoTestingModule.forRoot({langs: {en}, translocoConfig: {availableLangs: ['en'], defaultLang: 'en'}, preloadLangs: true})],
+      providers: [
+        {provide: AutomationsService, useValue: service}, {provide: ApiService, useValue: api},
+        {provide: Router, useValue: {navigate: vi.fn()}},
+        {provide: ActivatedRoute, useValue: {snapshot: {queryParamMap: convertToParamMap({})}}},
+      ]});
+    TestBed.overrideComponent(AutomationsPageComponent, {set: {
+      template: readFileSync('src/app/views/automations/automations-page.component.html', 'utf8'),
+      templateUrl: undefined, styles: [], styleUrl: undefined, styleUrls: [],
+      imports: [DatePipe, TranslocoPipe], schemas: [CUSTOM_ELEMENTS_SCHEMA],
+    }});
+    const fixture = TestBed.createComponent(AutomationsPageComponent);
+    fixture.detectChanges();
+    return {fixture, component: fixture.componentInstance, host: fixture.nativeElement as HTMLElement, service};
+  }
+
+  it('switches from schedule fields to live connectors and the workspace picker', () => {
+    const {fixture, component, host} = mount();
+    component.openNewEditor();
+    fixture.detectChanges();
+    expect(host.querySelector('app-cron-preview')).not.toBeNull();
+    component.updateEditor('triggerType', 'live');
+    component.updateEditor('showAdvanced', true);
+    fixture.detectChanges();
+    expect(host.querySelector('app-cron-preview')).toBeNull();
+    expect(host.querySelector('input[type="time"]')).toBeNull();
+    expect(host.textContent).not.toContain(en.automations.editor.timezone);
+    expect(host.textContent).not.toContain(en.automations.editor.catchupHours);
+    expect(host.querySelector('app-workspace-picker')).not.toBeNull();
+    expect(host.querySelectorAll('app-datasources-group')).toHaveLength(2);
+    const pickers = host.querySelectorAll('app-datasources-group');
+    expect((pickers[0] as unknown as {datasources: unknown[]}).datasources).toEqual([{id: 'phone-1', name: 'Empfang', type: 'gpt_live_sip'}]);
+  });
+
+  it('renders Live plus the connector name and omits Run-now on live rows', () => {
+    const {fixture, component, host, service} = mount();
+    service.automations.set([{id: 'a-1', name: 'Clinic', trigger_type: 'live', trigger_connector_id: 'phone-1', enabled: true}]);
+    fixture.detectChanges();
+    expect(host.querySelector('.row-meta')?.textContent).toContain('Live · Empfang');
+    expect(host.querySelector('.row-actions')?.textContent).not.toContain(en.automations.list.runNow);
+    service.automations.set([{id: 'a-2', name: 'Scheduled', trigger_type: 'cron', cron_expr: '0 9 * * *', enabled: true}]);
+    fixture.detectChanges();
+    expect(host.querySelector('.row-actions')?.textContent).toContain(en.automations.list.runNow);
   });
 });

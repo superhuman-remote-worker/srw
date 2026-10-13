@@ -1,12 +1,18 @@
-import { Call, CallEvent } from '../call.model';
+import { LiveSession, LiveSessionEvent } from '../live-session.model';
 
 /** Synthetic clinic enquiry; no real caller data. */
-export function callFixture(overrides: Partial<Call> = {}): Call {
+export function liveSessionFixture(overrides: Partial<LiveSession> = {}): LiveSession {
   return {
-    id: 'call-1',
-    session_id: 'live_demo',
-    line_id: 'line-1',
-    line_name: 'Empfang',
+    id: 'session-1',
+    connector_id: 'connector-1',
+    provider_session_id: 'live_demo',
+    family: 'gpt-live',
+    transport: 'sip',
+    origin: 'phone',
+    automation_id: 'automation-1',
+    project_id: null,
+    model: 'gpt-live-1',
+    error: null,
     direction: 'inbound',
     status: 'active',
     from_number: '+4917600000000',
@@ -22,10 +28,10 @@ export function callFixture(overrides: Partial<Call> = {}): Call {
   };
 }
 
-export function callEventFixture(id: number, overrides: Partial<CallEvent> = {}): CallEvent {
+export function liveSessionEventFixture(id: number, overrides: Partial<LiveSessionEvent> = {}): LiveSessionEvent {
   return {
     id,
-    call_id: 'call-1',
+    event_id: `event-${id}`,
     kind: 'transcript',
     speaker: 'caller',
     text: 'Haben Sie ein Schwimmbad?',

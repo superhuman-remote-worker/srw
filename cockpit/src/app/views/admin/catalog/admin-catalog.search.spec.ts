@@ -1,12 +1,13 @@
 import {CUSTOM_ELEMENTS_SCHEMA, signal, ɵresolveComponentResources} from '@angular/core';
 import {TestBed} from '@angular/core/testing';
-import {TranslocoService} from '@jsverse/transloco';
+import {TranslocoPipe, TranslocoTestingModule, TranslocoService} from '@jsverse/transloco';
 import {beforeAll, beforeEach, describe, expect, it, vi} from 'vitest';
 import {of, Subject} from 'rxjs';
 import {AdminModelsService} from '../../../core/services/admin-models.service';
 import {AdminProvidersService} from '../../../core/services/admin-providers.service';
 import {AdminModelsCoordinatorService} from '../models/admin-models-coordinator.service';
 import {AdminCatalogComponent} from './admin-catalog.component';
+import en from '../../../../assets/i18n/en.json';
 
 const createModel = vi.fn(() => of({} as never));
 
@@ -52,9 +53,8 @@ describe('AdminCatalogComponent search/fetch form', () => {
   beforeEach(() => {
     createModel.mockClear();
     TestBed.configureTestingModule({
-      imports: [AdminCatalogComponent],
+      imports: [AdminCatalogComponent, TranslocoTestingModule.forRoot({langs: {en}, translocoConfig: {availableLangs: ['en'], defaultLang: 'en'}, preloadLangs: true})],
       providers: [
-        {provide: TranslocoService, useValue: {translate: vi.fn((key: string) => key)}},
         {provide: AdminModelsService, useValue: models},
         {provide: AdminProvidersService, useValue: providers},
         {
@@ -64,8 +64,40 @@ describe('AdminCatalogComponent search/fetch form', () => {
       ],
     });
     TestBed.overrideComponent(AdminCatalogComponent, {
-      set: {imports: [], schemas: [CUSTOM_ELEMENTS_SCHEMA]},
+      set: {imports: [TranslocoPipe], schemas: [CUSTOM_ELEMENTS_SCHEMA]},
     });
+  });
+
+  it('offers live voice alone, hides chat fields and writes adapter and optional voice', () => {
+    const fixture = TestBed.createComponent(AdminCatalogComponent);
+    const c = fixture.componentInstance;
+    c.toggleFormCapability('live_voice', true);
+    expect(c.formCapabilities()).toEqual(['live_voice']);
+    c.formProviderKey.set('system:openai');
+    c.formModelId.set('gpt-live-1');
+    c.formDisplayLabel.set('GPT-Live');
+    c.formFamily.set('');
+    c.formVoice.set('marin');
+    fixture.detectChanges();
+    expect(fixture.nativeElement.querySelector('.chat-model-config')).toBeNull();
+    expect(fixture.nativeElement.querySelector('.research-config')).toBeNull();
+    expect(fixture.nativeElement.querySelector('.live-voice-config')).not.toBeNull();
+    expect(c.canSubmit()).toBe(true);
+    c.submit();
+    expect(createModel).toHaveBeenCalledWith(expect.objectContaining({capabilities: ['live_voice'],
+      family: 'default', context_window: null, params_json: {adapter: 'openai-live', voice: 'marin'}}));
+    c.toggleFormCapability('chat', true);
+    expect(c.formCapabilities()).toEqual(['chat']);
+  });
+
+  it('rejects mixed live voice capabilities even if discovery sets them directly', () => {
+    const c = TestBed.createComponent(AdminCatalogComponent).componentInstance;
+    c.formProviderKey.set('system:openai');
+    c.formCapabilities.set(['live_voice', 'chat']);
+    expect(c.canSubmit()).toBe(false);
+    c.submit();
+    expect(createModel).not.toHaveBeenCalled();
+    expect(c.formError()).toBe(en.admin.catalog.liveVoice.onlyCapability);
   });
 
   it('hides chat-only fields and offers only registered adapter names', () => {

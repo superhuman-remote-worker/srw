@@ -3,19 +3,21 @@ import { CUSTOM_ELEMENTS_SCHEMA, signal, ɵresolveComponentResources } from '@an
 import { TestBed } from '@angular/core/testing';
 import { TranslocoModule, TranslocoService, TranslocoTestingModule } from '@jsverse/transloco';
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
-import { Call, CallEvent } from '../../core/models/call.model';
+import { LiveSession, LiveSessionEvent } from '../../core/models/live-session.model';
 import {
-  callEventFixture as event,
-  callFixture as call,
-} from '../../core/models/fixtures/call.fixture';
-import { CallService } from '../../core/services/call.service';
+  liveSessionEventFixture as event,
+  liveSessionFixture as session,
+} from '../../core/models/fixtures/live-session.fixture';
+import { of } from 'rxjs';
+import { ApiService } from '../../core/services/api.service';
+import { LiveSessionService } from '../../core/services/live-session.service';
 import { ViewportService } from '../../core/services/viewport.service';
-import { JobCallCardComponent, JobCallPanelComponent } from './job-call-panel.component';
-import { callDuration, projectCallTimeline } from './call-timeline';
+import { JobLiveSessionCardComponent, JobLiveSessionPanelComponent } from './job-live-session-panel.component';
+import { sessionDuration, projectCallTimeline } from './live-session-timeline';
 import en from '../../../assets/i18n/en.json';
 import de from '../../../assets/i18n/de-DE.json';
 
-describe('call timeline projection', () => {
+describe('session timeline projection', () => {
   it('orders/deduplicates deltas, merges partial words and separates speakers', () => {
     const rows = [
       event(3, { speaker: 'assistant', text: 'Ja.' }),
@@ -87,7 +89,7 @@ describe('call timeline projection', () => {
     expect(result.timeline[0]).toMatchObject({ state: 'followUp' });
   });
 
-  it('shows unanswered fallback requests in the post-call summary', () => {
+  it('shows unanswered fallback requests in the post-session summary', () => {
     const result = projectCallTimeline([
       event(1, { kind: 'question', delegation_id: 'a', text: 'Termin?' }),
       event(2, { kind: 'fallback', delegation_id: 'a', text: 'Wir rufen zurück.' }),
@@ -96,12 +98,12 @@ describe('call timeline projection', () => {
     expect(result.followUps).toEqual([{ id: 1, text: 'Termin?' }]);
   });
 
-  it('does not merge caller bubbles across steering or hidden usage rows', () => {
+  it('does not merge caller bubbles across steering or hidden thinking rows', () => {
     const result = projectCallTimeline([
       event(1),
       event(2, { kind: 'instruction', speaker: 'job', text: 'Kurz antworten.' }),
       event(3),
-      event(4, { kind: 'usage', text: '' }),
+      event(4, { kind: 'thinking', text: '' }),
       event(5),
     ]);
     expect(result.timeline.filter((item) => item.type === 'transcript')).toHaveLength(3);
@@ -109,24 +111,24 @@ describe('call timeline projection', () => {
   });
 
   it('formats live, final, long and missing durations', () => {
-    expect(callDuration(call(), Date.parse('2026-10-12T08:01:07Z'))).toBe('1:02');
-    expect(callDuration(call({ status: 'ended', ended_at: '2026-10-12T08:00:47Z' }), 0)).toBe(
+    expect(sessionDuration(session(), Date.parse('2026-10-12T08:01:07Z'))).toBe('1:02');
+    expect(sessionDuration(session({ status: 'ended', ended_at: '2026-10-12T08:00:47Z' }), 0)).toBe(
       '0:42',
     );
-    expect(callDuration(call({ status: 'ended', accepted_at: null }), 0)).toBe('0:42');
-    expect(callDuration(call({ status: 'ended', accepted_at: null, usage_seconds: 3661 }), 0)).toBe(
+    expect(sessionDuration(session({ status: 'ended', accepted_at: null }), 0)).toBe('0:42');
+    expect(sessionDuration(session({ status: 'ended', accepted_at: null, usage_seconds: 3661 }), 0)).toBe(
       '1:01:01',
     );
-    expect(callDuration(call({ status: 'ringing' }), 0)).toBeNull();
-    expect(callDuration(call({ accepted_at: null }), 0)).toBeNull();
-    expect(callDuration(call({ accepted_at: 'invalid' }), 0)).toBeNull();
-    expect(callDuration(call(), 0)).toBe('0:00');
+    expect(sessionDuration(session({ status: 'ringing' }), 0)).toBeNull();
+    expect(sessionDuration(session({ accepted_at: null }), 0)).toBeNull();
+    expect(sessionDuration(session({ accepted_at: 'invalid' }), 0)).toBeNull();
+    expect(sessionDuration(session(), 0)).toBe('0:00');
   });
 });
 
-describe('JobCallPanelComponent / JobCallCardComponent', () => {
+describe('JobLiveSessionPanelComponent / JobLiveSessionCardComponent', () => {
   beforeAll(async () => {
-    const template = readFileSync('src/app/views/jobs/job-call-card.component.html', 'utf8');
+    const template = readFileSync('src/app/views/jobs/job-live-session-card.component.html', 'utf8');
     await ɵresolveComponentResources((url) =>
       Promise.resolve(url.endsWith('.html') ? template : ''),
     );
@@ -134,9 +136,9 @@ describe('JobCallPanelComponent / JobCallCardComponent', () => {
   beforeEach(() => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date('2026-10-12T08:00:47Z'));
-    TestBed.overrideComponent(JobCallCardComponent, {
+    TestBed.overrideComponent(JobLiveSessionCardComponent, {
       set: {
-        template: readFileSync('src/app/views/jobs/job-call-card.component.html', 'utf8'),
+        template: readFileSync('src/app/views/jobs/job-live-session-card.component.html', 'utf8'),
         templateUrl: undefined,
         styleUrl: undefined,
         styleUrls: [],
@@ -151,29 +153,30 @@ describe('JobCallPanelComponent / JobCallCardComponent', () => {
     vi.useRealTimers();
   });
 
-  function mount(rows: CallEvent[] = [], initial: Call = call(), locale = 'en') {
+  function mount(rows: LiveSessionEvent[] = [], initial: LiveSession = session(), locale = 'en') {
     const watch = {
-      call: signal(initial),
+      session: signal(initial),
       events: signal(rows),
       connected: signal(true),
       loading: signal(false),
       error: signal(false),
-      updateCall: vi.fn(),
+      updateSession: vi.fn(),
       refresh: vi.fn().mockResolvedValue(true),
       destroy: vi.fn(),
     };
-    const watchCall = vi.fn().mockReturnValue(watch);
+    const watchSession = vi.fn().mockReturnValue(watch);
     const mobile = signal(false);
     TestBed.configureTestingModule({
       imports: [
-        JobCallCardComponent,
+        JobLiveSessionCardComponent,
         TranslocoTestingModule.forRoot({
           langs: { en, 'de-DE': de },
           translocoConfig: { availableLangs: ['en', 'de-DE'], defaultLang: locale },
         }),
       ],
       providers: [
-        { provide: CallService, useValue: { watchCall } },
+        { provide: ApiService, useValue: {getDatasource: vi.fn().mockReturnValue(of({name: 'Empfang'}))} },
+        { provide: LiveSessionService, useValue: { watchSession } },
         { provide: ViewportService, useValue: { isMobile: mobile } },
       ],
     });
@@ -184,16 +187,16 @@ describe('JobCallPanelComponent / JobCallCardComponent', () => {
     transloco.setTranslation(en, 'en');
     transloco.setTranslation(de, 'de-DE');
     transloco.setActiveLang(locale);
-    const fixture = TestBed.createComponent(JobCallCardComponent);
+    const fixture = TestBed.createComponent(JobLiveSessionCardComponent);
     const initialInput = signal(initial);
-    Object.defineProperty(fixture.componentInstance, 'initialCall', { value: initialInput });
+    Object.defineProperty(fixture.componentInstance, 'initialSession', { value: initialInput });
     Object.defineProperty(fixture.componentInstance, 'jobId', { value: signal('job-1') });
     fixture.detectChanges();
     // Initializer-based viewChild queries need the same signal mock as inputs
     // in this JIT harness. DOM geometry is set explicitly in the scroll specs.
     Object.defineProperty(fixture.componentInstance, 'transcript', {
       value: signal({
-        nativeElement: (fixture.nativeElement as HTMLElement).querySelector('.call-transcript'),
+        nativeElement: (fixture.nativeElement as HTMLElement).querySelector('.session-transcript'),
       }),
     });
     return {
@@ -201,7 +204,7 @@ describe('JobCallPanelComponent / JobCallCardComponent', () => {
       component: fixture.componentInstance,
       root: fixture.nativeElement as HTMLElement,
       watch,
-      watchCall,
+      watchSession,
       mobile,
       initialInput,
     };
@@ -213,6 +216,9 @@ describe('JobCallPanelComponent / JobCallCardComponent', () => {
       event(2, { text: 'bad?' }),
       event(3, { speaker: 'assistant', text: 'Ich frage nach.' }),
     ]);
+    expect(root.querySelector('h3')?.textContent).toBe('+4917600000000');
+    expect(root.textContent).toContain('Empfang');
+    expect(root.textContent).toContain('Usage: 42 s');
     expect(root.querySelectorAll('.transcript-bubble')).toHaveLength(2);
     expect(root.querySelector('.transcript-bubble')?.textContent).toContain(
       'Haben Sie ein Schwimmbad?',
@@ -250,61 +256,61 @@ describe('JobCallPanelComponent / JobCallCardComponent', () => {
         event(4, { kind: 'follow_up', delegation_id: 'b', text: 'Kosten ermitteln' }),
         event(5, { kind: 'instruction', speaker: 'job', text: 'Höflich bleiben.' }),
       ],
-      call({ status: 'ended', ended_at: '2026-10-12T08:00:47Z' }),
+      session({ status: 'ended', ended_at: '2026-10-12T08:00:47Z' }),
       'de-DE',
     );
     expect(root.textContent).toContain('Rückfrage an das Backoffice');
     expect(root.textContent).toContain('Notiert');
     expect(root.textContent).toContain('Follow-up');
     expect(root.querySelector('.system-line')?.textContent).toContain('Steuerung:');
-    expect(root.querySelector('.call-follow-ups')?.textContent).toContain('Termin?');
-    expect(root.querySelectorAll('.call-follow-ups li')).toHaveLength(2);
+    expect(root.querySelector('.session-follow-ups')?.textContent).toContain('Termin?');
+    expect(root.querySelectorAll('.session-follow-ups li')).toHaveLength(2);
   });
 
-  it('keeps post-call follow-ups out of the active-call footer', () => {
+  it('keeps post-session follow-ups out of the active-session footer', () => {
     const { root } = mount([event(1, { kind: 'follow_up', text: 'Termin vereinbaren' })]);
     expect(root.querySelector('.backoffice-card')?.textContent).toContain('Follow-up');
-    expect(root.querySelector('.call-follow-ups')).toBeNull();
+    expect(root.querySelector('.session-follow-ups')).toBeNull();
   });
 
   it('renders a live status, direction and advancing duration, then freezes after hang-up', async () => {
     const { fixture, component, root, watch } = mount();
-    expect(root.querySelector('.call-state')?.textContent).toContain('Live');
+    expect(root.querySelector('.session-state')?.textContent).toContain('Live');
     expect(root.querySelector('.live-dot')).not.toBeNull();
     expect(root.querySelector('.direction-icon')?.textContent).toContain('call_received');
-    expect(root.querySelector('.call-duration')?.textContent).toBe('0:42');
+    expect(root.querySelector('.session-duration')?.textContent).toBe('0:42');
     expect(component.tone()).toBe('success');
     await vi.advanceTimersByTimeAsync(1000);
     fixture.detectChanges();
-    expect(root.querySelector('.call-duration')?.textContent).toBe('0:43');
-    watch.call.set(
-      call({ status: 'ended', ended_at: '2026-10-12T08:00:48Z', close_reason: 'remote_hangup' }),
+    expect(root.querySelector('.session-duration')?.textContent).toBe('0:43');
+    watch.session.set(
+      session({ status: 'ended', ended_at: '2026-10-12T08:00:48Z', close_reason: 'remote_hangup' }),
     );
     fixture.detectChanges();
     await vi.advanceTimersByTimeAsync(5000);
     fixture.detectChanges();
     expect(root.querySelector('.live-dot')).toBeNull();
-    expect(root.querySelector('.call-state')?.textContent).toContain('Ended');
+    expect(root.querySelector('.session-state')?.textContent).toContain('Ended');
     expect(root.querySelector('.close-reason')?.textContent).toContain('Caller hung up');
-    expect(root.querySelector('.call-duration')?.textContent).toBe('0:43');
+    expect(root.querySelector('.session-duration')?.textContent).toBe('0:43');
   });
 
   it.each(['ringing', 'failed', 'rejected'] as const)(
     'renders the %s pill without the live pulse',
     (status) => {
-      const { root } = mount([], call({ status, direction: 'outbound' }));
-      expect(root.querySelector('.call-state')?.textContent).toContain(
-        en.jobs.calls.status[status],
+      const { root } = mount([], session({ status, direction: 'outbound' }));
+      expect(root.querySelector('.session-state')?.textContent).toContain(
+        en.jobs.liveSessions.status[status],
       );
       expect(root.querySelector('.live-dot')).toBeNull();
       expect(root.querySelector('.direction-icon')?.textContent).toContain('call_made');
-      if (status === 'ringing') expect(root.querySelector('.call-duration')).toBeNull();
+      if (status === 'ringing') expect(root.querySelector('.session-duration')).toBeNull();
     },
   );
 
   it('pauses scroll following when the reader scrolls up, then jumps to latest', () => {
     const { fixture, component, root, watch } = mount([event(1)]);
-    const transcript = root.querySelector('.call-transcript') as HTMLElement;
+    const transcript = root.querySelector('.session-transcript') as HTMLElement;
     Object.defineProperty(transcript, 'scrollHeight', { value: 1000, configurable: true });
     Object.defineProperty(transcript, 'clientHeight', { value: 200 });
     transcript.scrollTop = 300;
@@ -323,7 +329,7 @@ describe('JobCallPanelComponent / JobCallCardComponent', () => {
 
   it('automatically follows new transcript text while the reader is at the bottom', () => {
     const { fixture, root, watch } = mount([event(1)]);
-    const transcript = root.querySelector('.call-transcript') as HTMLElement;
+    const transcript = root.querySelector('.session-transcript') as HTMLElement;
     Object.defineProperty(transcript, 'scrollHeight', { value: 1000 });
     watch.events.update((rows) => [...rows, event(2)]);
     fixture.detectChanges();
@@ -331,11 +337,11 @@ describe('JobCallPanelComponent / JobCallCardComponent', () => {
   });
 
   it('keeps the same stream owner on a job-detail refresh and disposes it on close', () => {
-    const { fixture, watchCall, initialInput, watch } = mount();
-    initialInput.set(call({ usage_seconds: 45 }));
+    const { fixture, watchSession, initialInput, watch } = mount();
+    initialInput.set(session({ usage_seconds: 45 }));
     fixture.detectChanges();
-    expect(watchCall).toHaveBeenCalledOnce();
-    expect(watch.updateCall).toHaveBeenLastCalledWith(call({ usage_seconds: 45 }));
+    expect(watchSession).toHaveBeenCalledOnce();
+    expect(watch.updateSession).toHaveBeenLastCalledWith(session({ usage_seconds: 45 }));
     fixture.destroy();
     expect(watch.destroy).toHaveBeenCalledOnce();
     expect(vi.getTimerCount()).toBe(0);
@@ -345,8 +351,8 @@ describe('JobCallPanelComponent / JobCallCardComponent', () => {
     const { fixture, root, mobile } = mount();
     mobile.set(true);
     fixture.detectChanges();
-    expect(root.querySelector('.call-card--mobile')).not.toBeNull();
-    expect(root.querySelectorAll('.call-transcript')).toHaveLength(1);
+    expect(root.querySelector('.session-card--mobile')).not.toBeNull();
+    expect(root.querySelectorAll('.session-transcript')).toHaveLength(1);
   });
 
   it('renders transcript text as text, including untrusted markup', () => {
@@ -357,12 +363,12 @@ describe('JobCallPanelComponent / JobCallCardComponent', () => {
     expect(root.querySelector('img')).toBeNull();
   });
 
-  it('hides the panel when the job has no calls', () => {
-    TestBed.configureTestingModule({ imports: [JobCallPanelComponent] });
-    const fixture = TestBed.createComponent(JobCallPanelComponent);
-    Object.defineProperty(fixture.componentInstance, 'calls', { value: signal([]) });
+  it('hides the panel when the job has no sessions', () => {
+    TestBed.configureTestingModule({ imports: [JobLiveSessionPanelComponent] });
+    const fixture = TestBed.createComponent(JobLiveSessionPanelComponent);
+    Object.defineProperty(fixture.componentInstance, 'sessions', { value: signal([]) });
     fixture.detectChanges();
-    expect((fixture.nativeElement as HTMLElement).querySelector('.job-call-panel')).toBeNull();
-    expect((fixture.nativeElement as HTMLElement).querySelector('app-job-call-card')).toBeNull();
+    expect((fixture.nativeElement as HTMLElement).querySelector('.job-live-session-panel')).toBeNull();
+    expect((fixture.nativeElement as HTMLElement).querySelector('app-job-live-session-card')).toBeNull();
   });
 });

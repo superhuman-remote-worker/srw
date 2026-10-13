@@ -45,6 +45,8 @@ export interface JsonSchema {
   /** Siblings sharing a group render under one heading. */
   'x-srw-group'?: string;
   'x-srw-multiline'?: boolean;
+  /** Select a model from this capability's helper bucket. */
+  'x-srw-model-capability'?: string;
 }
 
 export interface ConnectorAccessLevel {

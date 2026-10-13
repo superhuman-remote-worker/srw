@@ -503,7 +503,7 @@
   },
   "automations": {
     "title": "Automations",
-    "subtitle": "Run jobs on a schedule. Use the API for everything else.",
+    "subtitle": "Run jobs on a schedule or when a live session arrives.",
     "new": "New automation",
     "list": {
       "empty": "No automations yet",
@@ -523,7 +523,8 @@
         "label": "Scoped to {{name}} · {{count}} automation(s)",
         "fallbackName": "this project",
         "clear": "Show all"
-      }
+      },
+      "live": "Live · {{name}}"
     },
     "editor": {
       "titleCreate": "New automation",
@@ -549,7 +550,15 @@
       "catchupHours": "Catchup window (hours)",
       "create": "Create automation",
       "save": "Save changes",
-      "requiredMissing": "Name, expert, prompt, and a valid cron expression are required."
+      "requiredMissing": "Name, expert, and prompt are required. Scheduled automations also need a valid cron expression.",
+      "trigger": "Trigger",
+      "schedule": "Schedule",
+      "incomingLive": "Incoming live session",
+      "liveConnectors": "Live connectors",
+      "primaryConnector": "Primary connector",
+      "additionalConnectors": "Additional connectors (optional)",
+      "noLiveConnectors": "No eligible live connectors. Add a phone line under Connectors.",
+      "liveConnectorRequired": "Select a primary live connector."
     },
     "preview": {
       "timezoneNote": "Times are shown in {{tz}}. The orchestrator stores schedules in UTC and applies DST automatically.",
@@ -563,7 +572,8 @@
       "createKey": "Create API key"
     },
     "errors": {
-      "generic": "Something went wrong. Please try again."
+      "generic": "Something went wrong. Please try again.",
+      "liveConnectorTaken": "Already used by automation {{name}}"
     }
   },
   "sessions": {
@@ -664,10 +674,10 @@
     "legacyHeld": "Checking an older workspace creation; completion evidence is unavailable."
   },
   "jobs": {
-    "calls": {
-      "title": "Phone calls",
+    "liveSessions": {
+      "title": "Live sessions",
       "to": "to",
-      "duration": "Call duration",
+      "duration": "Session duration",
       "transcript": "Live transcript",
       "loading": "Loading transcript…",
       "waiting": "Waiting for the conversation…",
@@ -676,7 +686,7 @@
       "jumpLatest": "Jump to latest",
       "backoffice": "Question for the back office",
       "steering": "Steering:",
-      "followUps": "Follow-ups after the call",
+      "followUps": "Follow-ups after the session",
       "direction": {
         "inbound": "Incoming",
         "outbound": "Outgoing"
@@ -692,7 +702,7 @@
         "caller": "Caller",
         "assistant": "Voice assistant",
         "job": "Back office",
-        "recorder": "Call system",
+        "recorder": "Session system",
         "unknown": "Speaker"
       },
       "backofficeState": {
@@ -708,7 +718,9 @@
         "content": "Call ended after the conversation",
         "connection_lost": "Connection lost",
         "recorder_lost": "Call recorder disconnected"
-      }
+      },
+      "connector": "Connector",
+      "usage": "Usage: {{seconds}} s"
     },
     "pagination": {
       "label": "Pagination",
@@ -1219,7 +1231,8 @@
           "search": "Search (primary)",
           "fetch": "Web fetch",
           "search_fallback": "Search fallback",
-          "rerank": "Rerank (memory recall ordering)"
+          "rerank": "Rerank (memory recall ordering)",
+          "live_voice": "Live voice"
         }
       },
       "discovery": {
@@ -1231,6 +1244,13 @@
         "text": "You're viewing all users' data.",
         "showMine": "Show only mine",
         "tooltip": "Switch to viewing only your own data"
+      }
+    },
+    "catalog": {
+      "liveVoice": {
+        "adapter": "Live voice adapter",
+        "voice": "Voice (optional)",
+        "onlyCapability": "Live voice must be the only capability."
       }
     }
   },
@@ -2894,7 +2914,8 @@
       "gitea_mcp": "Gitea MCP (managed)",
       "cloud_folder": "Cloud folder",
       "cloud_folder_checkout": "Folder checkout",
-      "cloud_outbox": "Outbox"
+      "cloud_outbox": "Outbox",
+      "gpt_live_sip": "Phone line (GPT-Live over SIP)"
     },
     "platform": {
       "kind": {
@@ -3204,6 +3225,13 @@
       "reindexed": "OKF Knowledge Base \"{{name}}\" reindex finished ({{status}})",
       "reindexFailed": "Failed to reindex the OKF Knowledge Base",
       "fileTooLarge": "File exceeds 64 KB — credential files are capped at 64 KB."
+    },
+    "liveWebhook": {
+      "label": "Webhook URL for OpenAI",
+      "help": "Register this URL as the webhook in your OpenAI project, then paste its signing secret (whsec_…) into the webhook secret field.",
+      "copy": "Copy URL",
+      "copied": "Copied",
+      "copyFailed": "Copy failed. Select and copy the URL manually."
     }
   },
   "connectorDrivers": {

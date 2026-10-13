@@ -2,30 +2,30 @@ import { HttpClient } from '@angular/common/http';
 import { Injectable, NgZone, Signal, inject, signal } from '@angular/core';
 import { Observable, Subject, firstValueFrom, takeUntil, timeout } from 'rxjs';
 import { environment } from '../environment';
-import { Call, CallEvent, CallEventsPage, isLiveCall } from '../models/call.model';
+import { LiveSession, LiveSessionEvent, LiveSessionEventsPage, isActiveLiveSession } from '../models/live-session.model';
 import { classifySseProbeFailure, sseRetryDelayMs } from './sse-recovery';
 
-export interface CallWatch {
-  readonly call: Signal<Call>;
-  readonly events: Signal<CallEvent[]>;
+export interface LiveSessionWatch {
+  readonly session: Signal<LiveSession>;
+  readonly events: Signal<LiveSessionEvent[]>;
   readonly connected: Signal<boolean>;
   readonly loading: Signal<boolean>;
   readonly error: Signal<boolean>;
   /** Also used by the job-detail panel's existing 30 second refresh. */
-  updateCall(call: Call): void;
+  updateSession(session: LiveSession): void;
   refresh(): Promise<boolean>;
   destroy(): void;
 }
 
 @Injectable({ providedIn: 'root' })
-export class CallService {
+export class LiveSessionService {
   private readonly http = inject(HttpClient);
   private readonly zone = inject(NgZone);
   private readonly baseUrl = environment.apiUrl;
 
-  getCalls(jobId: string): Observable<{ calls: Call[] }> {
-    return this.http.get<{ calls: Call[] }>(
-      `${this.baseUrl}/jobs/${encodeURIComponent(jobId)}/calls`,
+  getSessions(jobId: string): Observable<{ sessions: LiveSession[] }> {
+    return this.http.get<{ sessions: LiveSession[] }>(
+      `${this.baseUrl}/jobs/${encodeURIComponent(jobId)}/live-sessions`,
       {
         withCredentials: true,
         headers: { 'ngsw-bypass': '1' },
@@ -33,18 +33,18 @@ export class CallService {
     );
   }
 
-  getEvents(jobId: string, callId: string, afterId = 0, limit = 500): Observable<CallEventsPage> {
-    return this.http.get<CallEventsPage>(`${this.callUrl(jobId, callId)}/events`, {
+  getEvents(jobId: string, sessionId: string, afterId = 0, limit = 500): Observable<LiveSessionEventsPage> {
+    return this.http.get<LiveSessionEventsPage>(`${this.sessionUrl(jobId, sessionId)}/events`, {
       withCredentials: true,
       headers: { 'ngsw-bypass': '1' },
       params: { after_id: String(afterId), limit: String(Math.min(500, Math.max(1, limit))) },
     });
   }
 
-  /** One stream owner per mounted call. No global cache survives panel closure. */
-  watchCall(jobId: string, initial: Call): CallWatch {
-    const call = signal(initial);
-    const events = signal<CallEvent[]>([]);
+  /** One stream owner per mounted session. No global cache survives panel closure. */
+  watchSession(jobId: string, initial: LiveSession): LiveSessionWatch {
+    const session = signal(initial);
+    const events = signal<LiveSessionEvent[]>([]);
     const connected = signal(false);
     const loading = signal(true);
     const error = signal(false);
@@ -59,10 +59,10 @@ export class CallService {
     let refreshAgain = false;
     const disposed = new Subject<void>();
 
-    const merge = (rows: CallEvent[]) => {
+    const merge = (rows: LiveSessionEvent[]) => {
       const byId = new Map(events().map((row) => [row.id, row]));
       for (const row of rows) {
-        if (row.call_id === initial.id && Number.isSafeInteger(row.id) && row.id > 0) {
+        if (Number.isSafeInteger(row.id) && row.id > 0) {
           byId.set(row.id, row);
         }
       }
@@ -103,7 +103,7 @@ export class CallService {
               next < cursor ||
               (page.events.length >= 500 && next === cursor)
             ) {
-              throw new Error('Call events cursor did not advance');
+              throw new Error('LiveSession events cursor did not advance');
             }
             afterId = cursor = next;
             if (page.events.length < 500) break;
@@ -137,33 +137,33 @@ export class CallService {
     };
 
     const startPolling = () => {
-      if (stopped || halted || !isLiveCall(call()) || pollTimer !== null) return;
+      if (stopped || halted || !isActiveLiveSession(session()) || pollTimer !== null) return;
       pollTimer = setInterval(() => {
         void refresh();
       }, 2_000);
     };
     const scheduleRetry = () => {
-      if (stopped || halted || !isLiveCall(call()) || retryTimer !== null) return;
+      if (stopped || halted || !isActiveLiveSession(session()) || retryTimer !== null) return;
       retryTimer = setTimeout(async () => {
         retryTimer = null;
         // EventSource hides HTTP status. Probe through the authenticated REST
         // path before reopening, just like the notification SSE owner.
         const recovered = await refresh();
-        if (stopped || halted || !isLiveCall(call())) return;
+        if (stopped || halted || !isActiveLiveSession(session())) return;
         if (recovered) openStream();
         else scheduleRetry();
       }, sseRetryDelayMs(retryAttempt++));
     };
-    const updateCall = (next: Call) => {
+    const updateSession = (next: LiveSession) => {
       if (stopped || next.id !== initial.id || next.job_id !== jobId) return;
       // A list poll begun before hang-up must not resurrect a closed stream.
-      if (!isLiveCall(call()) && isLiveCall(next)) return;
-      call.set(next);
-      if (!isLiveCall(next)) stopTransport();
+      if (!isActiveLiveSession(session()) && isActiveLiveSession(next)) return;
+      session.set(next);
+      if (!isActiveLiveSession(next)) stopTransport();
       void refresh();
     };
     const openStream = () => {
-      if (stopped || halted || !isLiveCall(call()) || source) return;
+      if (stopped || halted || !isActiveLiveSession(session()) || source) return;
       if (typeof EventSource === 'undefined') {
         startPolling();
         return;
@@ -172,7 +172,7 @@ export class CallService {
       try {
         // Cookie BFF authentication; no bearer tokens in URLs. Bypass ngsw so
         // the service worker cannot buffer the streaming response.
-        es = new EventSource(`${this.callUrl(jobId, initial.id)}/stream?ngsw-bypass=true`, {
+        es = new EventSource(`${this.sessionUrl(jobId, initial.id)}/stream?after_id=${afterId}&ngsw-bypass=true`, {
           withCredentials: true,
         });
       } catch {
@@ -181,12 +181,12 @@ export class CallService {
         return;
       }
       source = es;
-      es.addEventListener('call_event', (frame: MessageEvent) =>
+      es.addEventListener('session_event', (frame: MessageEvent) =>
         this.zone.run(() => {
           if (stopped || source !== es) return;
           try {
-            const row = JSON.parse(frame.data) as CallEvent;
-            if (row && row.call_id === initial.id && typeof row.kind === 'string') {
+            const row = JSON.parse(frame.data) as LiveSessionEvent;
+            if (row && typeof row.kind === 'string') {
               merge([row]);
               if (connected() && !refreshInFlight && Number.isSafeInteger(row.id)) {
                 afterId = Math.max(afterId, row.id);
@@ -197,19 +197,19 @@ export class CallService {
           }
         }),
       );
-      es.addEventListener('call', (frame: MessageEvent) =>
+      es.addEventListener('session', (frame: MessageEvent) =>
         this.zone.run(() => {
           if (stopped || source !== es) return;
           try {
-            const next = JSON.parse(frame.data) as Call;
+            const next = JSON.parse(frame.data) as LiveSession;
             if (
               next &&
               ['ringing', 'active', 'ended', 'rejected', 'failed'].includes(next.status)
             ) {
-              updateCall(next);
+              updateSession(next);
             }
           } catch {
-            /* A malformed row cannot close a valid call. */
+            /* A malformed row cannot close a valid session. */
           }
         }),
       );
@@ -236,7 +236,7 @@ export class CallService {
     };
     const wake = () => {
       if (typeof document !== 'undefined' && document.visibilityState === 'hidden') return;
-      if (!source && isLiveCall(call())) scheduleRetry();
+      if (!source && isActiveLiveSession(session())) scheduleRetry();
     };
     if (typeof window !== 'undefined') window.addEventListener('online', wake);
     if (typeof document !== 'undefined') document.addEventListener('visibilitychange', wake);
@@ -244,12 +244,12 @@ export class CallService {
     void refresh();
 
     return {
-      call: call.asReadonly(),
+      session: session.asReadonly(),
       events: events.asReadonly(),
       connected: connected.asReadonly(),
       loading: loading.asReadonly(),
       error: error.asReadonly(),
-      updateCall,
+      updateSession,
       refresh,
       destroy: () => {
         stopped = true;
@@ -262,7 +262,7 @@ export class CallService {
     };
   }
 
-  private callUrl(jobId: string, callId: string): string {
-    return `${this.baseUrl}/jobs/${encodeURIComponent(jobId)}/calls/${encodeURIComponent(callId)}`;
+  private sessionUrl(jobId: string, sessionId: string): string {
+    return `${this.baseUrl}/jobs/${encodeURIComponent(jobId)}/live-sessions/${encodeURIComponent(sessionId)}`;
   }
 }

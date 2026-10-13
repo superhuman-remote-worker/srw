@@ -5,6 +5,7 @@ import {
   computed,
   inject,
   signal,
+  viewChild,
 } from '@angular/core';
 import {ActivatedRoute, Router, RouterLink} from '@angular/router';
 import {DatePipe} from '@angular/common';
@@ -32,7 +33,11 @@ import {
   AutomationsService,
   CreateAutomationRequest,
 } from '../../core/services/automations.service';
-import {Expert, Project} from '../../core/models/api.model';
+import {WorkspaceChoice, WorkspaceBinding} from '../../core/models/workspace-template.model';
+import {WorkspacePickerComponent} from '../agent-settings/workspace-picker.component';
+import {DatasourcesGroupComponent} from '../agent-settings/datasources-group.component';
+import {choiceRequestFields} from '../workspaces/workspace-template-utils';
+import {Expert, Project, EligibleDatasource} from '../../core/models/api.model';
 import {CronPreviewComponent} from './cron-preview.component';
 import {EscapeHatchPanelComponent} from './escape-hatch-panel.component';
 
@@ -46,6 +51,11 @@ type CronPreset =
 
 interface EditorState {
   mode: 'create' | 'edit';
+  triggerType: 'cron' | 'live';
+  connectorIds: string[];
+  connectorAliases: Record<string, string>;
+  primaryConnectorId: string;
+  workspaceChoice: WorkspaceChoice;
   id: string | null;
   name: string;
   description: string;
@@ -86,6 +96,8 @@ const SOFT_CAP = 20;
     SidebarToggleComponent,
     CronPreviewComponent,
     EscapeHatchPanelComponent,
+    WorkspacePickerComponent,
+    DatasourcesGroupComponent,
   ],
   templateUrl: './automations-page.component.html',
   styleUrl: './automations-page.component.scss',
@@ -102,6 +114,67 @@ export class AutomationsPageComponent implements OnInit {
   readonly experts = signal<Expert[]>([]);
   readonly errorMessage = signal<string | null>(null);
   readonly editor = signal<EditorState | null>(null);
+  readonly connectors = signal<EligibleDatasource[]>([]);
+  readonly connectorsLoading = signal(false);
+  readonly connectorsError = signal(false);
+  readonly connectorContext = signal('');
+  private connectorRequest = 0;
+  private editorGeneration = 0;
+  readonly livePicker = viewChild<DatasourcesGroupComponent>('livePicker');
+  readonly additionalPicker = viewChild<DatasourcesGroupComponent>('additionalPicker');
+  readonly liveConnectors = computed(() => this.connectors().filter((c) => c.type === 'gpt_live_sip'));
+  readonly additionalConnectors = computed(() => this.connectors().filter((c) => c.type !== 'gpt_live_sip'));
+  readonly selectedLiveConnectors = computed(() => {
+    const selected = new Set(this.editor()?.connectorIds ?? []);
+    return this.liveConnectors().filter((c) => selected.has(c.id));
+  });
+
+  private loadConnectors(projectId: string | null): void {
+    const request = ++this.connectorRequest;
+    this.connectorsLoading.set(true);
+    this.connectorsError.set(false);
+    this.api.getEligibleDatasources(projectId ? [projectId] : [], 'job').subscribe({
+      next: (rows) => {
+        if (request !== this.connectorRequest) return;
+        this.connectors.set(rows);
+        this.connectorsLoading.set(false);
+      },
+      error: () => {
+        if (request !== this.connectorRequest) return;
+        this.connectors.set([]);
+        this.connectorsLoading.set(false);
+        this.connectorsError.set(true);
+      },
+    });
+  }
+
+  retryConnectors(): void {
+    this.loadConnectors(this.editor()?.projectId ?? this.projectFilter());
+  }
+
+  onConnectorChange(): void {
+    const current = this.editor();
+    if (!current) return;
+    const ids = [
+      ...(this.livePicker()?.getSelectedIds() ?? current.connectorIds.filter((id) => this.liveConnectors().some((c) => c.id === id))),
+      ...(this.additionalPicker()?.getSelectedIds() ?? current.connectorIds.filter((id) => this.additionalConnectors().some((c) => c.id === id))),
+    ];
+    this.setConnectorIds(ids);
+  }
+
+  setConnectorIds(ids: string[]): void {
+    const current = this.editor();
+    if (!current) return;
+    const selected = this.liveConnectors().filter((c) => ids.includes(c.id));
+    const primary = selected.some((c) => c.id === current.primaryConnectorId)
+      ? current.primaryConnectorId : selected[0]?.id ?? '';
+    this.editor.set({...current, connectorIds: [...new Set(ids)], primaryConnectorId: primary});
+  }
+
+  connectorLabel(row: Automation): string {
+    const id = row.trigger_connector_id;
+    return this.connectors().find((c) => c.id === id)?.name ?? id ?? '';
+  }
 
   /** Active project filter (from ?project=<uuid>). null when unscoped. */
   readonly projectFilter = signal<string | null>(null);
@@ -160,6 +233,7 @@ export class AutomationsPageComponent implements OnInit {
     // button defaults to creating inside the scoped project; after-save
     // refresh stays scoped via loadByProject.
     const pending = this.route.snapshot.queryParamMap.get('project');
+    this.loadConnectors(pending);
     if (pending) {
       this.projectFilter.set(pending);
       this.service.loadByProject(pending);
@@ -208,6 +282,7 @@ export class AutomationsPageComponent implements OnInit {
       replaceUrl: true,
     });
     this.service.loadMine();
+    this.loadConnectors(null);
   }
 
   /** Open the create editor; honors the active project filter when set. */
@@ -227,10 +302,18 @@ export class AutomationsPageComponent implements OnInit {
   }
 
   openEditor(automation: Automation | null, prefillProjectId: string | null = null): void {
+    this.errorMessage.set(null);
+    this.connectorContext.set(`automation:${++this.editorGeneration}`);
+    this.loadConnectors(automation?.project_id ?? prefillProjectId);
     if (automation) {
       const {preset, time} = inferPresetFromCron(automation.cron_expr ?? '');
       this.editor.set({
         mode: 'edit',
+        triggerType: automation.trigger_type ?? 'cron',
+        connectorIds: Object.values(automation.job_shape?.execution?.connectors ?? {}).map((c) => c.ref.uid),
+        connectorAliases: Object.fromEntries(Object.entries(automation.job_shape?.execution?.connectors ?? {}).map(([alias, c]) => [c.ref.uid, alias])),
+        primaryConnectorId: automation.trigger_connector_id ?? automation.job_shape?.execution?.connectors?.[automation.job_shape?.primary_connector ?? '']?.ref.uid ?? '',
+        workspaceChoice: workspaceChoiceOf(automation.job_shape?.workspace),
         id: automation.id,
         name: automation.name,
         description: automation.description ?? '',
@@ -251,6 +334,11 @@ export class AutomationsPageComponent implements OnInit {
     } else {
       this.editor.set({
         mode: 'create',
+        triggerType: 'cron',
+        connectorIds: [],
+        connectorAliases: {},
+        primaryConnectorId: '',
+        workspaceChoice: {kind: 'default'},
         id: null,
         name: '',
         description: '',
@@ -279,6 +367,7 @@ export class AutomationsPageComponent implements OnInit {
   updateEditor<K extends keyof EditorState>(field: K, value: EditorState[K]): void {
     const current = this.editor();
     if (!current) return;
+    if (field === 'triggerType' && current.mode === 'edit') return;
     this.editor.set({...current, [field]: value});
   }
 
@@ -286,7 +375,7 @@ export class AutomationsPageComponent implements OnInit {
     const e = this.editor();
     if (!e) return;
     const cron = this.cronExpr();
-    if (!cron || !e.name.trim() || !e.expert || !e.prompt.trim()) {
+    if ((e.triggerType === 'cron' && !cron) || !e.name.trim() || !e.expert || !e.prompt.trim()) {
       this.errorMessage.set(this.transloco.translate('automations.editor.requiredMissing'));
       return;
     }
@@ -294,9 +383,6 @@ export class AutomationsPageComponent implements OnInit {
     const body: CreateAutomationRequest = {
       name: e.name.trim(),
       description: e.description.trim() || null,
-      cron_expr: cron,
-      timezone: e.timezone,
-      catchup_window_seconds: Math.max(0, e.catchupWindowHours * 3600),
       expert: expertSelection.expert,
       expert_id: expertSelection.expert_id,
       prompt: e.prompt.trim(),
@@ -306,6 +392,20 @@ export class AutomationsPageComponent implements OnInit {
       max_fires_per_day: e.maxFiresPerDay,
       project_id: e.projectId,
     };
+    if (e.triggerType === 'live') {
+      if (this.connectorsLoading() || this.connectorsError() || !this.selectedLiveConnectors().some((c) => c.id === e.primaryConnectorId)) {
+        this.errorMessage.set(this.transloco.translate('automations.editor.liveConnectorRequired'));
+        return;
+      }
+      const bindings = connectorBindings(e.connectorIds, this.connectors(), e.connectorAliases);
+      body.primary_connector = bindings.aliases[e.primaryConnectorId];
+      body.job_shape = {execution: {connectors: bindings.connectors}, ...choiceRequestFields(e.workspaceChoice)};
+    } else {
+      body.cron_expr = cron;
+      body.timezone = e.timezone;
+      body.catchup_window_seconds = Math.max(0, e.catchupWindowHours * 3600);
+    }
+    if (e.mode === 'create') body.trigger_type = e.triggerType;
     this.errorMessage.set(null);
     const op$ =
       e.mode === 'create'
@@ -330,6 +430,7 @@ export class AutomationsPageComponent implements OnInit {
   }
 
   runNow(row: Automation): void {
+    if (row.trigger_type === 'live') return;
     this.service.runNow(row.id).subscribe({
       next: () => this.refreshList(),
       error: (err) => this.errorMessage.set(this._formatError(err)),
@@ -396,6 +497,10 @@ export class AutomationsPageComponent implements OnInit {
     ) {
       const detail = (err as {error: {detail?: unknown}}).error.detail;
       if (typeof detail === 'string') return detail;
+      if (detail && typeof detail === 'object' && 'code' in detail && detail.code === 'live_connector_taken') {
+        const holder = detail as {automation_name?: string};
+        return this.transloco.translate('automations.errors.liveConnectorTaken', {name: holder.automation_name ?? ''});
+      }
     }
     return this.transloco.translate('automations.errors.generic');
   }
@@ -452,4 +557,45 @@ export function inferPresetFromCron(expr: string): {preset: CronPreset; time: st
     return {preset: 'every_month_first', time: `${hour}:${minute}`};
   }
   return {preset: 'custom', time: `${hour}:${minute}`};
+}
+
+
+/** Keep stored aliases stable; new ones are bounded DNS-style name slugs. */
+export function connectorBindings(
+  ids: string[],
+  rows: {id: string; name: string}[],
+  stored: Record<string, string> = {},
+) {
+  const aliases: Record<string, string> = {};
+  const used = new Set(ids.map((id) => stored[id]).filter(Boolean));
+  for (const id of ids) {
+    if (stored[id]) {
+      aliases[id] = stored[id];
+      continue;
+    }
+    const name = rows.find((c) => c.id === id)?.name ?? 'connector';
+    const base = name.normalize('NFKD')
+      .replace(/[\u0300-\u036f]/g, '')
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, '-')
+      .replace(/^-+|-+$/g, '')
+      .slice(0, 63)
+      .replace(/-+$/g, '') || 'connector';
+    let alias = base;
+    let suffix = 2;
+    while (used.has(alias)) {
+      const tail = `-${suffix++}`;
+      alias = `${base.slice(0, 63 - tail.length).replace(/-+$/g, '')}${tail}`;
+    }
+    used.add(alias);
+    aliases[id] = alias;
+  }
+  return {aliases, connectors: Object.fromEntries(ids.map((id) => [aliases[id], {ref: {uid: id}}]))};
+}
+
+function workspaceChoiceOf(binding: WorkspaceBinding | undefined): WorkspaceChoice {
+  if (binding === undefined) return {kind: 'default'};
+  if (binding === null) return {kind: 'none'};
+  if ('inline' in binding.template) return {kind: 'inline', spec: binding.template.inline};
+  return {kind: 'ref', ref: binding.template.ref, backend: 'sandbox', label: binding.template.ref.name};
 }

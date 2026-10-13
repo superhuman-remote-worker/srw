@@ -4,6 +4,7 @@ import {
   effect,
   EventEmitter,
   Input,
+  inject,
   linkedSignal,
   Output,
   signal,
@@ -16,6 +17,7 @@ import {AppIconComponent} from '../../../ui/icon';
 import {AppInputComponent} from '../../../ui/input';
 import {AppSelectComponent} from '../../../ui/select';
 import {AppTextareaComponent} from '../../../ui/textarea';
+import {ModelService, HelperModel} from '../../../core/services/model.service';
 import {ConnectorDriver} from '../../../core/models/connector-driver.model';
 import {
   ChoiceState,
@@ -218,7 +220,16 @@ import {
               />
             }
             @case ('text') {
-              @if (field.widget === 'textarea' || field.widget === 'file') {
+              @if (field.modelCapability) {
+                <app-select size="sm" [value]="text(path)"
+                  (changed)="set(path, $event ?? '', pointer)"
+                  [disabled]="locked()" [ariaLabel]="field.label">
+                  <option value="">{{ 'datasources.generic.unset' | transloco }}</option>
+                  @for (model of modelsFor(field.modelCapability); track model.id) {
+                    <option [value]="model.id" [disabled]="!model.configured">{{ model.label }}</option>
+                  }
+                </app-select>
+              } @else if (field.widget === 'textarea' || field.widget === 'file') {
                 <app-textarea
                   size="sm"
                   class="mono"
@@ -525,6 +536,7 @@ import {
   `,
 })
 export class GenericConnectorFormComponent {
+  private readonly models = inject(ModelService);
   // Decorator inputs and output feeding signals: this repo's vitest JIT
   // harness wires neither signal inputs nor output() (see
   // helm-managed-badge.component.ts), and the spec drives them.
@@ -598,6 +610,10 @@ export class GenericConnectorFormComponent {
 
   constructor() {
     effect(() => {
+      const schema = this.driverSpec()?.config_schema;
+      if (schema && JSON.stringify(schema).includes('"x-srw-model-capability"')) this.models.load();
+    });
+    effect(() => {
       const value = this.value();
       if (value) this.valueChange.emit(value);
     });
@@ -667,6 +683,21 @@ export class GenericConnectorFormComponent {
       element.value = '';
     };
     reader.readAsText(file);
+  }
+
+  protected modelsFor(capability: string): HelperModel[] {
+    switch (capability) {
+      case 'live_voice': return this.models.liveVoiceModels();
+      case 'rerank': return this.models.rerankModels();
+      case 'tts': return this.models.ttsModels();
+      case 'whisper': return this.models.whisperModels();
+      case 'vision': return this.models.visionModels();
+      case 'embedding': return this.models.embeddingModels();
+      case 'auxiliary': return this.models.auxiliaryModels();
+      case 'search': return this.models.searchModels();
+      case 'fetch': return this.models.fetchModels();
+      default: return [];
+    }
   }
 
   protected optionLabel(option: unknown): string {

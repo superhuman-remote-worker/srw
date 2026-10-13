@@ -1,9 +1,9 @@
-import { Call, CallEvent } from '../../core/models/call.model';
+import { LiveSession, LiveSessionEvent } from '../../core/models/live-session.model';
 
 export interface TranscriptBubble {
   type: 'transcript';
   id: number;
-  speaker: CallEvent['speaker'];
+  speaker: LiveSessionEvent['speaker'];
   text: string;
 }
 
@@ -29,13 +29,13 @@ export interface CallFollowUp {
   text: string;
 }
 
-function requestText(event: CallEvent): string {
+function requestText(event: LiveSessionEvent): string {
   const request = event.payload?.['request'];
   return typeof request === 'string' && request ? request : event.text;
 }
 
 /** Rebuild from the ordered journal so replay/live ordering yields the same UI. */
-export function projectCallTimeline(events: readonly CallEvent[]): {
+export function projectCallTimeline(events: readonly LiveSessionEvent[]): {
   timeline: CallTimelineEntry[];
   followUps: CallFollowUp[];
 } {
@@ -46,7 +46,7 @@ export function projectCallTimeline(events: readonly CallEvent[]): {
   const cards = new Map<string, BackOfficeCard>();
   const explicitFollowUps: CallFollowUp[] = [];
   const followUpKeys = new Set<string>();
-  let previous: CallEvent | null = null;
+  let previous: LiveSessionEvent | null = null;
 
   for (const event of ordered) {
     if (event.kind === 'transcript') {
@@ -115,7 +115,7 @@ export function projectCallTimeline(events: readonly CallEvent[]): {
         text: event.text,
       });
     }
-    // Even a hidden recorder/usage row breaks consecutive transcript deltas.
+    // Even a hidden journal row breaks consecutive transcript deltas.
     previous = event;
   }
   const unanswered = [...cards.entries()]
@@ -124,7 +124,7 @@ export function projectCallTimeline(events: readonly CallEvent[]): {
   return { timeline, followUps: [...explicitFollowUps, ...unanswered].sort((a, b) => a.id - b.id) };
 }
 
-export function callDuration(call: Call, now: number): string | null {
+export function sessionDuration(call: LiveSession, now: number): string | null {
   let seconds: number;
   if (call.status === 'ringing') return null;
   if (call.status === 'active') {

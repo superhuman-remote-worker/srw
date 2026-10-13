@@ -50,6 +50,7 @@ import {
   platformManagedLabelKey,
   platformOwnedKind,
 } from '../../core/models/platform-connector';
+import {LiveConnectorWebhookComponent} from './live-connector-webhook.component';
 import {GenericConnectorFormComponent} from './connector-forms/generic-connector-form.component';
 import {CloudRootCardComponent} from './cloud-root-card.component';
 import {bespokeFormFor} from './connector-forms/connector-form-registry';
@@ -87,6 +88,7 @@ type KeyValueRow = {key: string; value: string};
     AppMenuItemComponent,
     AppMenuTriggerDirective,
     GenericConnectorFormComponent,
+    LiveConnectorWebhookComponent,
     RouterLink,
     CloudRootCardComponent,
   ],
@@ -364,6 +366,9 @@ type KeyValueRow = {key: string; value: string};
               />
             </app-form-field>
 
+            @if (formData.type === 'gpt_live_sip' && editingId()) {
+              <app-live-connector-webhook [connectorId]="editingId()!" />
+            }
             @if (useGenericForm()) {
               <app-generic-connector-form
                 [driver]="formDriver()!"

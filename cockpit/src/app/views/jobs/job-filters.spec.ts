@@ -53,6 +53,7 @@ describe('constants', () => {
       'user',
       'session',
       'automation',
+      'telephony',
       'loop',
       'officer',
       'subjob',

@@ -1,8 +1,9 @@
 import {beforeAll, beforeEach, describe, expect, it, vi} from 'vitest';
-import {CUSTOM_ELEMENTS_SCHEMA, ɵresolveComponentResources} from '@angular/core';
+import {CUSTOM_ELEMENTS_SCHEMA, signal, ɵresolveComponentResources} from '@angular/core';
 import {NgTemplateOutlet} from '@angular/common';
 import {ComponentFixture, TestBed} from '@angular/core/testing';
 import {TranslocoPipe, TranslocoTestingModule} from '@jsverse/transloco';
+import {ModelService} from '../../../core/services/model.service';
 import {GenericConnectorFormComponent} from './generic-connector-form.component';
 import {
   ConnectorDriver,
@@ -115,6 +116,10 @@ describe('GenericConnectorFormComponent', () => {
 
   beforeEach(async () => {
     TestBed.configureTestingModule({
+      providers: [{provide: ModelService, useValue: {load: vi.fn(), liveVoiceModels: signal([
+        {id: 'gpt-live-1', label: 'GPT-Live', configured: true},
+        {id: 'unconfigured', label: 'Needs credentials', configured: false},
+      ])}}],
       imports: [
         GenericConnectorFormComponent,
         TranslocoTestingModule.forRoot({
@@ -374,5 +379,39 @@ describe('GenericConnectorFormComponent', () => {
       const {host} = render(HOSTED, {error: {message: 'Connector name already exists', field: null}});
       expect(host.querySelector('.gf-form-error')?.textContent).toContain('Connector name already exists');
     });
+  });
+});
+
+
+describe('model capability hint', () => {
+  beforeAll(async () => { await ɵresolveComponentResources(() => Promise.resolve('')); });
+  it('renders live_voice_models as a select and writes the model id; hides readOnly keys', () => {
+    const load = vi.fn();
+    TestBed.configureTestingModule({imports: [GenericConnectorFormComponent,
+      TranslocoTestingModule.forRoot({langs: {en}, translocoConfig: {availableLangs: ['en'], defaultLang: 'en'}})],
+      providers: [{provide: ModelService, useValue: {load, liveVoiceModels: signal([
+        {id: 'gpt-live-1', label: 'GPT-Live', configured: true},
+        {id: 'unconfigured', label: 'Needs credentials', configured: false},
+      ])}}]});
+    TestBed.overrideComponent(GenericConnectorFormComponent, {
+      set: {imports: [NgTemplateOutlet, TranslocoPipe], schemas: [CUSTOM_ELEMENTS_SCHEMA]},
+    });
+    const driver = imageDriver({type: 'object', required: ['model'], properties: {
+      model: {type: 'string', 'x-srw-model-capability': 'live_voice'},
+      api_host: {type: 'string', readOnly: true}, api_port: {type: 'integer', readOnly: true},
+    }});
+    const {host, type, last} = render(driver);
+    expect(load).toHaveBeenCalled();
+    expect(field(host, '/config/model').querySelector('app-select')).not.toBeNull();
+    expect(field(host, '/config/model').querySelector('app-input')).toBeNull();
+    const options = field(host, '/config/model').querySelectorAll('option');
+    expect(options[1].value).toBe('gpt-live-1');
+    expect(options[1].textContent).toBe('GPT-Live');
+    expect(options[2].disabled).toBe(true);
+    expect(host.querySelector('[data-pointer="/config/api_host"]')).toBeNull();
+    expect(host.querySelector('[data-pointer="/config/api_port"]')).toBeNull();
+    type('config/model', '/config/model', 'gpt-live-1');
+    expect(last().config).toEqual({model: 'gpt-live-1'});
+    expect(last().problems).toEqual([]);
   });
 });

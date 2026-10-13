@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { Injector, NgZone, PLATFORM_ID, runInInjectionContext, signal } from '@angular/core';
+import { DestroyRef, Injector, NgZone, PLATFORM_ID, runInInjectionContext, signal } from '@angular/core';
 import Dexie from 'dexie';
 import { TestBed } from '@angular/core/testing';
 import { HttpClient } from '@angular/common/http';
@@ -266,6 +266,10 @@ function createService(
     ],
   });
   const service = TestBed.inject(PersistentChatService);
+  // Manual TestBed construction must retire transport timers as well as DOM
+  // listeners. Otherwise an earlier service can open a stream through the
+  // next test's global EventSource mock when its real watchdog clock fires.
+  TestBed.inject(DestroyRef).onDestroy(() => service.disconnect());
   const threadTransport = TestBed.inject(PersistentThreadTransportBridge);
   const canvas = TestBed.inject(CanvasService);
   return {

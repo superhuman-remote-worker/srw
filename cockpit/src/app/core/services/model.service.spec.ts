@@ -19,6 +19,7 @@ function createService(mockHttp?: any) {
       search_models: [{id: 'tavily', label: 'Tavily', configured: true}],
       fetch_models: [{id: 'tavily', label: 'Tavily', configured: true}],
       rerank_models: [{id: 'qwen3-reranker-8b', label: 'Qwen3 Reranker', configured: true}],
+      live_voice_models: [{id: 'gpt-live-1', label: 'GPT-Live', configured: true}],
       configured_providers: ['openai'],
     })),
   };
@@ -44,6 +45,7 @@ describe('ModelService', () => {
       expect(service.embeddingModels()).toEqual([]);
       expect(service.searchModels()).toEqual([]);
       expect(service.fetchModels()).toEqual([]);
+      expect(service.liveVoiceModels()).toEqual([]);
       expect(service.providers()).toEqual([]);
       expect(service.loaded()).toBe(false);
       expect(service.loading()).toBe(false);
@@ -65,6 +67,7 @@ describe('ModelService', () => {
       expect(service.searchModels()).toHaveLength(1);
       expect(service.fetchModels()).toHaveLength(1);
       expect(service.rerankModels()).toHaveLength(1);
+      expect(service.liveVoiceModels()).toHaveLength(1);
       expect(service.embeddingModels()[0].dimensions).toBe(1536);
       expect(service.providers()).toEqual(['openai']);
       expect(service.loaded()).toBe(true);
@@ -173,6 +176,7 @@ describe('ModelService', () => {
       expect(service.embeddingModels()).toEqual([]);
       expect(service.searchModels()).toEqual([]);
       expect(service.fetchModels()).toEqual([]);
+      expect(service.liveVoiceModels()).toEqual([]);
     });
   });
 });

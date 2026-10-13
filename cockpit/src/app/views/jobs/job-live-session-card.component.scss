@@ -5,7 +5,7 @@
   min-width: 0;
 }
 
-.call-card {
+.session-card {
   @include shape.surface;
 
   overflow: hidden;
@@ -14,7 +14,7 @@
   color: var(--text-primary);
 }
 
-.call-header {
+.session-header {
   display: flex;
   flex-wrap: wrap;
   align-items: center;
@@ -25,11 +25,22 @@
   background: var(--surface-1);
 }
 
-.call-identity {
+.session-identity {
   display: flex;
   align-items: center;
   gap: 12px;
   min-width: 0;
+}
+
+.session-identity > div {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.session-connector,
+.session-usage {
+  color: var(--text-secondary);
+  font-size: 12px;
 }
 
 .direction-icon {
@@ -53,7 +64,7 @@ h4 {
   font-weight: 600;
 }
 
-.call-route {
+.session-route {
   display: flex;
   flex-wrap: wrap;
   gap: 6px;
@@ -67,13 +78,13 @@ h4 {
   margin-right: 6px;
 }
 
-.call-state {
+.session-state {
   display: flex;
   align-items: center;
   gap: 12px;
 }
 
-.call-duration {
+.session-duration {
   font-size: 15px;
   font-variant-numeric: tabular-nums;
 }
@@ -92,7 +103,7 @@ h4 {
   height: 6px;
   margin-right: 5px;
   background: var(--success);
-  animation: call-pulse 1.8s ease-in-out infinite;
+  animation: session-pulse 1.8s ease-in-out infinite;
 }
 
 .transcript-heading {
@@ -107,7 +118,7 @@ h4 {
   font-size: 12px;
 }
 
-.call-transcript {
+.session-transcript {
   display: flex;
   flex-direction: column;
   gap: 14px;
@@ -214,7 +225,7 @@ h4 {
   padding: 0 20px 14px;
 }
 
-.call-follow-ups {
+.session-follow-ups {
   padding: 16px 20px;
   border-top: 1px solid var(--border-color);
 
@@ -240,13 +251,13 @@ h4 {
   white-space: nowrap;
 }
 
-.call-card--mobile {
-  .call-header,
-  .call-follow-ups {
+.session-card--mobile {
+  .session-header,
+  .session-follow-ups {
     padding: 14px 12px;
   }
 
-  .call-transcript {
+  .session-transcript {
     padding: 14px 12px;
     max-height: 360px;
   }
@@ -259,12 +270,12 @@ h4 {
     max-width: 92%;
   }
 
-  .call-state {
+  .session-state {
     margin-left: 36px;
   }
 }
 
-@keyframes call-pulse {
+@keyframes session-pulse {
   50% {
     opacity: 0.35;
   }

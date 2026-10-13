@@ -982,6 +982,7 @@ export class DatasourcesGroupComponent {
   getTypeIcon(type: DatasourceType | string): string {
     const icons: Record<string, string> = {
       credentials: 'key',
+      gpt_live_sip: 'phone',
       postgresql: 'database',
       neo4j: 'hub',
       mongodb: 'eco',
