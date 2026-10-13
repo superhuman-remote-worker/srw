@@ -376,7 +376,7 @@ APP_INPUT_DELIVERY_CONSTRAINTS_NOT_VALID = (
     / "src/orchestrator/database/migrations/app/0213_input_delivery_constraints_not_valid.sql"
 )
 APP_CURRENT_MIGRATION_HEAD = (
-    ROOT / "src/orchestrator/database/migrations/app/0535_call_events_cursor.notx.sql"
+    ROOT / "src/orchestrator/database/migrations/app/0547_live_voice_usage_rate.sql"
 )
 AUDIT_EXPANSION = (
     ROOT
