@@ -96,6 +96,7 @@ VALID_DEFAULT_MODEL_KINDS = {
     "fetch",
     "search_fallback",
     "rerank",
+    "live_voice",
 }
 
 

@@ -56312,6 +56312,9 @@ class PostgresDB:
                 out.append(c)
         if not out:
             raise ValueError("capabilities must be non-empty")
+        if "live_voice" in out and len(out) > 1:
+            # A live voice model is bound by a phone-line connector only.
+            raise ValueError("live_voice must be the only capability of a catalog row")
         return out
 
     async def list_models(
@@ -56805,6 +56808,7 @@ class PostgresDB:
             "search",
             "fetch",
             "rerank",
+            "live_voice",
         }
     )
 

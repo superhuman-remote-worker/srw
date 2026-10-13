@@ -510,8 +510,8 @@ class ModelCatalogService:
         - ``groups`` (chat-capability rows, grouped by provider)
         - ``auxiliary_models`` / ``vision_models`` / ``embedding_models`` /
           ``whisper_models`` / ``tts_models`` / ``search_models`` /
-          ``fetch_models`` / ``rerank_models`` (one helper list per
-          capability)
+          ``fetch_models`` / ``rerank_models`` / ``live_voice_models`` (one
+          helper list per capability)
 
         Every row carries ``configured: true`` because the catalog only
         contains rows whose transport (system_api_keys row or system endpoint)
@@ -542,6 +542,7 @@ class ModelCatalogService:
         search: list[dict[str, Any]] = []
         fetch: list[dict[str, Any]] = []
         rerank: list[dict[str, Any]] = []
+        live_voice: list[dict[str, Any]] = []
 
         configured_providers: set[str] = set()
 
@@ -575,6 +576,8 @@ class ModelCatalogService:
                 fetch.append(helper_entry)
             if "rerank" in capabilities_set:
                 rerank.append(helper_entry)
+            if "live_voice" in capabilities_set:
+                live_voice.append(helper_entry)
             # Chat-only path: register the row in its provider group. Embedding-/
             # whisper-/tts-only rows skip this path so the chat dropdowns don't
             # show non-chat models.
@@ -634,6 +637,7 @@ class ModelCatalogService:
             "fetch_models": fetch,
             "embedding_models": embedding,
             "rerank_models": rerank,
+            "live_voice_models": live_voice,
             "configured_providers": sorted(configured_providers),
             "reasoning_by_model": reasoning_by_model,
         }

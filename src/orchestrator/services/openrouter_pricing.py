@@ -288,6 +288,10 @@ def _catalog_pricing_pairs(
         mid = m.get("model_id")
         if not mid:
             continue
+        if "live_voice" in (m.get("capabilities") or ()):
+            # Billed per voice second (migration 0544), not per token:
+            # OpenRouter has no price for it.
+            continue
         params = m.get("params_json") or {}
         pairs.append((str(mid), params.get("pricing_id")))
     return pairs
