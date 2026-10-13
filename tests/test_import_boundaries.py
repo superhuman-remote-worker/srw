@@ -143,7 +143,8 @@ def test_allowed_runtime_and_lightweight_dependencies_pass(boundary_tree):
     # 32 since D1a kept the connector driver contract on the standard library;
     # 33 since D1c kept the drivers' internal rules to the drivers;
     # 34 since D1b fenced the agent's connector materializers off the runtime.
-    assert "Contracts: 34 kept, 0 broken" in result.stdout
+    # 35 since P2 fenced the phone front and routes off application composition.
+    assert "Contracts: 35 kept, 0 broken" in result.stdout
 
 
 @pytest.mark.parametrize(

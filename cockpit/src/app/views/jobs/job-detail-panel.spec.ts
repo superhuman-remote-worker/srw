@@ -1,4 +1,4 @@
-import {signal, ɵresolveComponentResources} from '@angular/core';
+import {CUSTOM_ELEMENTS_SCHEMA, signal, ɵresolveComponentResources} from '@angular/core';
 import {TestBed} from '@angular/core/testing';
 import {provideRouter} from '@angular/router';
 import {TranslocoService, TranslocoTestingModule} from '@jsverse/transloco';
@@ -24,6 +24,9 @@ import {
 import type {Job, JobSubagent, JobSubjob, JobUsage} from '../../core/models/api.model';
 import type {JobSummary} from '../../core/models/audit.model';
 import en from '../../../assets/i18n/en.json';
+import {JobCallPanelComponent} from './job-call-panel.component';
+import {Call} from '../../core/models/call.model';
+import {callFixture} from '../../core/models/fixtures/call.fixture';
 
 /**
  * The panel's job is to be honest about what it does not know, so that is what
@@ -59,6 +62,53 @@ function usage(over: Partial<JobUsage> = {}): JobUsage {
     ...over,
   };
 }
+
+describe('calls above the subagent roster', () => {
+  beforeAll(async () => {
+    await ɵresolveComponentResources(() => Promise.resolve(''));
+  });
+  afterEach(() => TestBed.resetTestingModule());
+
+  function render(calls: Call[] | null, origin = 'user') {
+    TestBed.configureTestingModule({
+      imports: [JobDetailPanelComponent, TranslocoTestingModule.forRoot({
+        langs: {en}, translocoConfig: {availableLangs: ['en'], defaultLang: 'en'},
+      })], providers: [provideRouter([])],
+    });
+    // Exercise the real parent placement/visibility; child behavior is covered
+    // in job-call-panel.component.spec.ts. AOT checks its signal input binding.
+    TestBed.overrideComponent(JobDetailPanelComponent, {
+      remove: {imports: [JobCallPanelComponent]}, add: {schemas: [CUSTOM_ELEMENTS_SCHEMA]},
+    });
+    const transloco = TestBed.inject(TranslocoService);
+    transloco.setTranslation(en, 'en');
+    transloco.setActiveLang('en');
+    const fixture = TestBed.createComponent(JobDetailPanelComponent);
+    Object.defineProperty(fixture.componentInstance, 'job', {value: signal({
+      id: 'job-1', status: 'processing', origin, created_at: '2026-10-12T08:00:00Z',
+    } as JobSummary)});
+    Object.defineProperty(fixture.componentInstance, 'data', {value: signal({
+      loading: false, error: false, detail: null, usage: null, progress: null,
+      usageSubtree: null, loadingSubtree: false, subtreeAttempted: false, subjobs: [], calls,
+      subagents: [{thread_id: 'thread-1', handle: 'phone', status: 'running',
+        subagent_type: 'phone', started_at: '2026-10-12T08:00:00Z'} as JobSubagent],
+    } satisfies JobDetailState)});
+    fixture.detectChanges();
+    return fixture.nativeElement as HTMLElement;
+  }
+
+  it.each([[], null])('hides the call panel when the call list is %s, even for telephony jobs', calls => {
+    expect(render(calls as Call[] | null, 'telephony').querySelector('app-job-call-panel')).toBeNull();
+  });
+
+  it('shows calls on any origin job immediately above the subagents table', () => {
+    const root = render([callFixture()]);
+    const panel = root.querySelector('app-job-call-panel');
+    const roster = root.querySelector('.detail-subagents');
+    expect(panel).not.toBeNull();
+    expect(panel?.nextElementSibling).toBe(roster);
+  });
+});
 
 describe('workspace recovery detail', () => {
   beforeAll(async () => {

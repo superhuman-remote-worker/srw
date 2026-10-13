@@ -60,6 +60,8 @@ if TYPE_CHECKING:
     from orchestrator.services.usage_ledger import UsageLedger
     from orchestrator.services.usage_rollup import UsageRollup
 
+from orchestrator.services.telephony.recorder import TelephonyTaskRegistry
+
 T = TypeVar("T")
 
 
@@ -124,6 +126,10 @@ class ApplicationResources:
     #: slice 4); drained at shutdown.
     cloud_root_connect_flows: CloudRootConnectFlows = field(
         default_factory=_cloud_root_connect_flows
+    )
+
+    telephony_tasks: TelephonyTaskRegistry = field(
+        default_factory=TelephonyTaskRegistry
     )
 
     # -- completion: one runtime and one control boundary per application,

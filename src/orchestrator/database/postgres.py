@@ -600,6 +600,7 @@ KNOWN_JOB_ORIGINS: frozenset[str] = frozenset(
         "user",
         "session",
         "automation",
+        "telephony",
         "loop",
         "officer",
         "subjob",

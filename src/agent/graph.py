@@ -621,6 +621,7 @@ def create_init_strategic_todos_node(
     todo_manager: TodoManager,
     config: AgentConfig,
     tool_names: Optional[List[str]] = None,
+    tool_context: Optional[ToolContext] = None,
 ) -> Callable[[UniversalAgentState], Dict[str, Any]]:
     """Create the init_strategic_todos node for phase alternation.
 
@@ -726,9 +727,16 @@ def create_init_strategic_todos_node(
         # re-sent with every request (append-only context injection, D17).
         content_parts.append(todo_manager.format_for_injection())
         message = HumanMessage(content="\n\n".join(content_parts))
+        messages: List[Any] = [message]
+        # A phone-mode job starts with its call attached: the delegate_agent
+        # call and receipt that ``attach_job_call`` produced follow the task.
+        exchange = getattr(tool_context, "_initial_tool_exchange", None)
+        if exchange:
+            messages.extend(exchange)
+            tool_context._initial_tool_exchange = None
 
         return {
-            "messages": [message],
+            "messages": messages,
             "initialized": True,
             "is_strategic_phase": True,
             "phase_number": 0,
@@ -5443,7 +5451,16 @@ def create_audited_tool_node(
 
     _all_tool_names = [t.name for t in tools]
     _phase_allowed: Dict[str, set] = {
-        "strategic": set(_filter_phase(_all_tool_names, "strategic")),
+        "strategic": set(_filter_phase(_all_tool_names, "strategic"))
+        | (
+            set(
+                getattr(
+                    getattr(config, "phase_settings", None), "strategic_tools", None
+                )
+                or ()
+            )
+            & set(_all_tool_names)
+        ),
         "tactical": set(_filter_phase(_all_tool_names, "tactical")),
     }
     # Only gate tools that have phase metadata in the registry.
@@ -6379,7 +6396,11 @@ def build_phase_alternation_graph(
         memory_manager, workspace_template, config
     )
     init_strategic_todos = create_init_strategic_todos_node(
-        workspace, todo_manager, config, tool_names=_tool_names
+        workspace,
+        todo_manager,
+        config,
+        tool_names=_tool_names,
+        tool_context=tool_context,
     )
     restore_todo_state = create_restore_todo_state_node(todo_manager)
     restore_from_feedback = create_restore_from_feedback_node(

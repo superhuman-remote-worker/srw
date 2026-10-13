@@ -724,7 +724,11 @@ def test_retired_phase_mode_override_keys_are_ignored_and_floor_is_kept():
             }
         },
     )
-    assert set(blob["agent"]["phase_settings"]) == {"min_todos", "max_todos"}
+    assert set(blob["agent"]["phase_settings"]) == {
+        "min_todos",
+        "max_todos",
+        "strategic_tools",
+    }
     assert blob["agent"]["phase_settings"]["min_todos"] == 2
     assert len(_phase_bindings(blob["agent"]["instruction_files"])) == 2
     hydrated = load_config_from_resolved(blob)
@@ -734,7 +738,11 @@ def test_retired_phase_mode_override_keys_are_ignored_and_floor_is_kept():
 
 def test_new_worker_blob_has_no_phase_prompt_segments_or_mode_keys():
     blob = resolve_config(base_config_name="developer", expert_type="worker")
-    assert set(blob["agent"]["phase_settings"]) == {"min_todos", "max_todos"}
+    assert set(blob["agent"]["phase_settings"]) == {
+        "min_todos",
+        "max_todos",
+        "strategic_tools",
+    }
     assert "strategic" not in blob["prompts"]
     assert "tactical" not in blob["prompts"]
     assert len(_phase_bindings(blob["agent"]["instruction_files"])) == 2

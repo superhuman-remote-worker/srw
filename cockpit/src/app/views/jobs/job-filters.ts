@@ -54,6 +54,7 @@ export const KNOWN_JOB_ORIGINS: readonly string[] = Object.freeze([
   'user',
   'session',
   'automation',
+  'telephony',
   'loop',
   'officer',
   'subjob',

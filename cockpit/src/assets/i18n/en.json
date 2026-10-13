@@ -664,6 +664,52 @@
     "legacyHeld": "Checking an older workspace creation; completion evidence is unavailable."
   },
   "jobs": {
+    "calls": {
+      "title": "Phone calls",
+      "to": "to",
+      "duration": "Call duration",
+      "transcript": "Live transcript",
+      "loading": "Loading transcript…",
+      "waiting": "Waiting for the conversation…",
+      "empty": "No transcript recorded.",
+      "loadError": "Transcript could not be refreshed.",
+      "jumpLatest": "Jump to latest",
+      "backoffice": "Question for the back office",
+      "steering": "Steering:",
+      "followUps": "Follow-ups after the call",
+      "direction": {
+        "inbound": "Incoming",
+        "outbound": "Outgoing"
+      },
+      "status": {
+        "ringing": "Ringing",
+        "active": "Live",
+        "ended": "Ended",
+        "rejected": "Rejected",
+        "failed": "Failed"
+      },
+      "speaker": {
+        "caller": "Caller",
+        "assistant": "Voice assistant",
+        "job": "Back office",
+        "recorder": "Call system",
+        "unknown": "Speaker"
+      },
+      "backofficeState": {
+        "pending": "Awaiting answer",
+        "answered": "Answered",
+        "noted": "Noted",
+        "followUp": "Follow-up"
+      },
+      "reason": {
+        "remote_hangup": "Caller hung up",
+        "close_requested": "Call ended by request",
+        "expired": "Call time limit reached",
+        "content": "Call ended after the conversation",
+        "connection_lost": "Connection lost",
+        "recorder_lost": "Call recorder disconnected"
+      }
+    },
     "pagination": {
       "label": "Pagination",
       "current": "Page {{page}}",

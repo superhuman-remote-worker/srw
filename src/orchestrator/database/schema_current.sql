@@ -26676,6 +26676,77 @@ CREATE TABLE public.bench_runs (
 
 
 --
+-- Name: call_events; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.call_events (
+    id bigint NOT NULL,
+    call_id uuid NOT NULL,
+    event_id text,
+    kind text NOT NULL,
+    speaker text,
+    text text,
+    start_ms integer,
+    end_ms integer,
+    delegation_id text,
+    payload jsonb DEFAULT '{}'::jsonb NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT call_events_kind_check CHECK ((kind = ANY (ARRAY['transcript'::text, 'delegation'::text, 'answer'::text, 'instruction'::text, 'thinking'::text, 'fallback'::text, 'question'::text, 'follow_up'::text, 'transfer'::text, 'hangup'::text, 'dtmf'::text, 'usage'::text, 'closed'::text, 'error'::text, 'system'::text])))
+);
+
+
+--
+-- Name: call_events_id_seq; Type: SEQUENCE; Schema: public; Owner: -
+--
+
+CREATE SEQUENCE public.call_events_id_seq
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+
+--
+-- Name: call_events_id_seq; Type: SEQUENCE OWNED BY; Schema: public; Owner: -
+--
+
+ALTER SEQUENCE public.call_events_id_seq OWNED BY public.call_events.id;
+
+
+--
+-- Name: calls; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.calls (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    session_id text NOT NULL,
+    webhook_id text,
+    settings_id uuid NOT NULL,
+    line_id uuid,
+    project_id uuid,
+    job_id uuid,
+    direction text NOT NULL,
+    status text NOT NULL,
+    from_number text,
+    to_number text,
+    sip_headers jsonb DEFAULT '[]'::jsonb NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    accepted_at timestamp with time zone,
+    attached_at timestamp with time zone,
+    ended_at timestamp with time zone,
+    close_reason text,
+    usage_seconds numeric,
+    error text,
+    recorder_owner text,
+    recorder_lease_until timestamp with time zone,
+    metadata jsonb DEFAULT '{}'::jsonb NOT NULL,
+    CONSTRAINT calls_direction_check CHECK ((direction = ANY (ARRAY['inbound'::text, 'outbound'::text]))),
+    CONSTRAINT calls_status_check CHECK ((status = ANY (ARRAY['ringing'::text, 'active'::text, 'ended'::text, 'rejected'::text, 'failed'::text])))
+);
+
+
+--
 -- Name: canvas_editor_awareness; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -31958,6 +32029,60 @@ CREATE TABLE public.system_settings (
 
 
 --
+-- Name: telephony_lines; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.telephony_lines (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    settings_id uuid NOT NULL,
+    project_id uuid NOT NULL,
+    owner_user_id uuid NOT NULL,
+    name text NOT NULL,
+    number text,
+    is_default boolean DEFAULT false NOT NULL,
+    enabled boolean DEFAULT true NOT NULL,
+    engine text DEFAULT 'gpt_live'::text NOT NULL,
+    model text DEFAULT 'gpt-live-1'::text NOT NULL,
+    voice text DEFAULT 'marin'::text NOT NULL,
+    expert text DEFAULT 'phone-desk'::text NOT NULL,
+    persona text DEFAULT ''::text NOT NULL,
+    greeting text NOT NULL,
+    fact_sheet text DEFAULT ''::text NOT NULL,
+    transfer_target text,
+    max_duration_s integer DEFAULT 900 NOT NULL,
+    answer_timeout_s integer DEFAULT 25 NOT NULL,
+    no_job_fallback_s integer DEFAULT 8 NOT NULL,
+    goodbye text,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT telephony_lines_answer_timeout_s_check CHECK ((answer_timeout_s > 0)),
+    CONSTRAINT telephony_lines_engine_check CHECK ((engine = 'gpt_live'::text)),
+    CONSTRAINT telephony_lines_max_duration_s_check CHECK ((max_duration_s > 0)),
+    CONSTRAINT telephony_lines_no_job_fallback_s_check CHECK ((no_job_fallback_s > 0))
+);
+
+
+--
+-- Name: telephony_settings; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.telephony_settings (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    name text NOT NULL,
+    project_id uuid,
+    openai_project_id text NOT NULL,
+    api_base text DEFAULT 'https://api.openai.com/v1'::text NOT NULL,
+    ws_base text DEFAULT 'wss://api.openai.com/v1'::text NOT NULL,
+    extra_headers jsonb DEFAULT '{}'::jsonb NOT NULL,
+    webhook_secret_encrypted text NOT NULL,
+    api_key_encrypted text,
+    enabled boolean DEFAULT true NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL
+);
+
+
+--
 -- Name: thread_agent_k8s_authority_adoptions; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -34437,6 +34562,13 @@ ALTER SEQUENCE public.workspace_intervals_id_seq OWNED BY public.workspace_inter
 
 
 --
+-- Name: call_events id; Type: DEFAULT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.call_events ALTER COLUMN id SET DEFAULT nextval('public.call_events_id_seq'::regclass);
+
+
+--
 -- Name: message_delivery_attempts attempt_id; Type: DEFAULT; Schema: public; Owner: -
 --
 
@@ -34518,6 +34650,38 @@ ALTER TABLE ONLY public.automations
 
 ALTER TABLE ONLY public.bench_runs
     ADD CONSTRAINT bench_runs_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: call_events call_events_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.call_events
+    ADD CONSTRAINT call_events_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: calls calls_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.calls
+    ADD CONSTRAINT calls_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: calls calls_session_id_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.calls
+    ADD CONSTRAINT calls_session_id_key UNIQUE (session_id);
+
+
+--
+-- Name: calls calls_webhook_id_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.calls
+    ADD CONSTRAINT calls_webhook_id_key UNIQUE (webhook_id);
 
 
 --
@@ -36272,6 +36436,22 @@ ALTER TABLE ONLY public.system_settings
 
 
 --
+-- Name: telephony_lines telephony_lines_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.telephony_lines
+    ADD CONSTRAINT telephony_lines_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: telephony_settings telephony_settings_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.telephony_settings
+    ADD CONSTRAINT telephony_settings_pkey PRIMARY KEY (id);
+
+
+--
 -- Name: thread_agent_k8s_authority_adoptions thread_agent_k8s_authority_adoptions_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -37664,6 +37844,34 @@ CREATE INDEX agent_metering_pod_identity_state_owner_idx ON public.agent_meterin
 --
 
 CREATE INDEX agent_metering_pod_identity_state_pod_uid_idx ON public.agent_metering_pod_identity_state USING btree (pod_uid, agent_id) WHERE (agent_present AND (pod_uid IS NOT NULL));
+
+
+--
+-- Name: call_events_cursor; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX call_events_cursor ON public.call_events USING btree (call_id, id);
+
+
+--
+-- Name: call_events_engine_event; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX call_events_engine_event ON public.call_events USING btree (call_id, event_id) WHERE (event_id IS NOT NULL);
+
+
+--
+-- Name: calls_job; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX calls_job ON public.calls USING btree (job_id);
+
+
+--
+-- Name: calls_recorder; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX calls_recorder ON public.calls USING btree (status, recorder_lease_until);
 
 
 --
@@ -39596,6 +39804,20 @@ CREATE UNIQUE INDEX storage_volume_incarnations_active_asset_uq ON public.storag
 --
 
 CREATE INDEX storage_volume_incarnations_asset_time_idx ON public.storage_volume_incarnations USING btree (asset_id, first_observed_at, detached_at, id);
+
+
+--
+-- Name: telephony_lines_default; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX telephony_lines_default ON public.telephony_lines USING btree (settings_id) WHERE (enabled AND is_default);
+
+
+--
+-- Name: telephony_lines_number; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX telephony_lines_number ON public.telephony_lines USING btree (number) WHERE (number IS NOT NULL);
 
 
 --
@@ -42478,6 +42700,46 @@ ALTER TABLE ONLY public.bench_runs
 
 
 --
+-- Name: call_events call_events_call_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.call_events
+    ADD CONSTRAINT call_events_call_id_fkey FOREIGN KEY (call_id) REFERENCES public.calls(id) ON DELETE CASCADE;
+
+
+--
+-- Name: calls calls_job_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.calls
+    ADD CONSTRAINT calls_job_id_fkey FOREIGN KEY (job_id) REFERENCES public.jobs(id) ON DELETE SET NULL;
+
+
+--
+-- Name: calls calls_line_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.calls
+    ADD CONSTRAINT calls_line_id_fkey FOREIGN KEY (line_id) REFERENCES public.telephony_lines(id) ON DELETE SET NULL;
+
+
+--
+-- Name: calls calls_project_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.calls
+    ADD CONSTRAINT calls_project_id_fkey FOREIGN KEY (project_id) REFERENCES public.projects(id) ON DELETE SET NULL;
+
+
+--
+-- Name: calls calls_settings_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.calls
+    ADD CONSTRAINT calls_settings_id_fkey FOREIGN KEY (settings_id) REFERENCES public.telephony_settings(id);
+
+
+--
 -- Name: canvas_origin_sessions canvas_origin_sessions_parent_srw_session_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -44059,6 +44321,38 @@ ALTER TABLE ONLY public.sudo_approval_requests
 
 ALTER TABLE ONLY public.sudo_approval_requests
     ADD CONSTRAINT sudo_approval_requests_thread_id_fkey FOREIGN KEY (thread_id) REFERENCES public.threads(id) ON DELETE CASCADE;
+
+
+--
+-- Name: telephony_lines telephony_lines_owner_user_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.telephony_lines
+    ADD CONSTRAINT telephony_lines_owner_user_id_fkey FOREIGN KEY (owner_user_id) REFERENCES public.users(id);
+
+
+--
+-- Name: telephony_lines telephony_lines_project_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.telephony_lines
+    ADD CONSTRAINT telephony_lines_project_id_fkey FOREIGN KEY (project_id) REFERENCES public.projects(id);
+
+
+--
+-- Name: telephony_lines telephony_lines_settings_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.telephony_lines
+    ADD CONSTRAINT telephony_lines_settings_id_fkey FOREIGN KEY (settings_id) REFERENCES public.telephony_settings(id);
+
+
+--
+-- Name: telephony_settings telephony_settings_project_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.telephony_settings
+    ADD CONSTRAINT telephony_settings_project_id_fkey FOREIGN KEY (project_id) REFERENCES public.projects(id) ON DELETE SET NULL;
 
 
 --

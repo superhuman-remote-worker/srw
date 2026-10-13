@@ -244,6 +244,9 @@ POST   /api/internal/ssh-keys/used                                              
 POST   /api/internal/ssh-native-first-use                                               pat=refused         gated:user_can_access_ide_entity
 GET    /api/internal/ssh-targets/{handle}                                               pat=refused         gated:user_can_access_ide_entity
 POST   /api/internal/ssh-vm-access/{action}                                             pat=refused         gated:user_can_access_ide_entity
+POST   /api/internal/telephony/calls/{call_id}/attach                                   pat=refused         internal:require_internal
+GET    /api/internal/telephony/calls/{call_id}/events                                   pat=refused         internal:require_internal
+POST   /api/internal/telephony/calls/{call_id}/events                                   pat=refused         internal:require_internal
 POST   /api/internal/vm-creation-retries/authorize                                      pat=refused         internal:require_vm_cleanup_authority
 POST   /api/internal/vm-creation-retries/authorize-disposition                          pat=refused         internal:require_vm_cleanup_authority
 POST   /api/internal/vm-creation-retries/begin-effect                                   pat=refused         internal:require_vm_cleanup_authority
@@ -276,6 +279,9 @@ GET    /api/jobs/{job_id}/audit                                                 
 GET    /api/jobs/{job_id}/audit/step/{step_id}                                          pat=jobs:read       gated:require_job_access
 GET    /api/jobs/{job_id}/audit/timerange                                               pat=jobs:read       gated:require_job_access
 GET    /api/jobs/{job_id}/brief                                                         pat=refused         internal:require_internal
+GET    /api/jobs/{job_id}/calls                                                         pat=jobs:read       gated:require_job_access
+GET    /api/jobs/{job_id}/calls/{call_id}/events                                        pat=jobs:read       gated:require_job_access
+GET    /api/jobs/{job_id}/calls/{call_id}/stream                                        pat=jobs:read       gated:require_job_access
 PUT    /api/jobs/{job_id}/cancel                                                        pat=jobs:write      gated:require_internal_or_job_access
 GET    /api/jobs/{job_id}/change-record                                                 pat=jobs:read       gated:require_job_access
 GET    /api/jobs/{job_id}/chat                                                          pat=jobs:read       gated:require_job_access
@@ -547,6 +553,15 @@ GET    /api/system/readiness                                                    
 GET    /api/tables                                                                      pat=admin           admin:_require_admin
 GET    /api/tables/{table_name}                                                         pat=admin           admin:_require_admin
 GET    /api/tables/{table_name}/schema                                                  pat=admin           admin:_require_admin
+GET    /api/telephony/lines                                                             pat=refused         admin:_require_admin
+POST   /api/telephony/lines                                                             pat=refused         admin:_require_admin
+DELETE /api/telephony/lines/{line_id}                                                   pat=refused         admin:_require_admin
+PATCH  /api/telephony/lines/{line_id}                                                   pat=refused         admin:_require_admin
+POST   /api/telephony/openai/webhook                                                    pat=refused         public:OpenAI Standard Webhooks signature and timestamp verified inside the handler.
+GET    /api/telephony/settings                                                          pat=refused         admin:_require_admin
+POST   /api/telephony/settings                                                          pat=refused         admin:_require_admin
+DELETE /api/telephony/settings/{settings_id}                                            pat=refused         admin:_require_admin
+PATCH  /api/telephony/settings/{settings_id}                                            pat=refused         admin:_require_admin
 POST   /api/uploads                                                                     pat=jobs:write      internal:is_internal_call
 DELETE /api/uploads/{upload_id}                                                         pat=jobs:write      internal:is_internal_call
 GET    /api/uploads/{upload_id}                                                         pat=jobs:read       internal:is_internal_call

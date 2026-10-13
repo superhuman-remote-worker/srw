@@ -3,9 +3,12 @@ import {DatePipe} from '@angular/common';
 import {TestBed} from '@angular/core/testing';
 import {ActivatedRoute, Router} from '@angular/router';
 import {TranslocoService, TranslocoTestingModule} from '@jsverse/transloco';
-import {BehaviorSubject, of} from 'rxjs';
+import {BehaviorSubject, Subject, of, throwError} from 'rxjs';
+import {callFixture} from '../../core/models/fixtures/call.fixture';
+import {Call} from '../../core/models/call.model';
 import {afterEach, beforeAll, beforeEach, describe, expect, it, vi} from 'vitest';
 import {ApiService} from '../../core/services/api.service';
+import {CallService} from '../../core/services/call.service';
 import {DataService} from '../../core/services/data.service';
 import {UserService} from '../../core/services/user.service';
 import {ViewportService} from '../../core/services/viewport.service';
@@ -40,6 +43,7 @@ class WorkspaceCreationTranslocoPipe implements PipeTransform {
  */
 function mountLogic(overrides: {
   api?: Partial<ApiService>;
+  calls?: Partial<CallService>;
   params?: BehaviorSubject<ReturnType<typeof paramMap>>;
   rendered?: boolean;
 } = {}) {
@@ -61,6 +65,7 @@ function mountLogic(overrides: {
     cancelJob: vi.fn().mockReturnValue(of({status: 'cancelled'})),
     ...overrides.api,
   } as unknown as ApiService;
+  const calls = {getCalls: vi.fn().mockReturnValue(of({calls: []})), ...overrides.calls};
 
   TestBed.configureTestingModule({
     imports: [
@@ -72,6 +77,7 @@ function mountLogic(overrides: {
     ],
     providers: [
       {provide: ApiService, useValue: api},
+      {provide: CallService, useValue: calls},
       {provide: DataService, useValue: {setCurrentJob: vi.fn()}},
       {provide: UserService, useValue: {currentUser: signal({id: 'user-1'})}},
       {provide: ViewportService, useValue: {isMobile: signal(false)}},
@@ -92,7 +98,7 @@ function mountLogic(overrides: {
   transloco.setTranslation(en, 'en');
   transloco.setActiveLang('en');
   const fixture = TestBed.createComponent(JobListComponent);
-  return {fixture, component: fixture.componentInstance, api, navigate};
+  return {fixture, component: fixture.componentInstance, api, calls, navigate};
 }
 
 describe('typed workspace creation on job rows', () => {
@@ -173,6 +179,74 @@ function job(id: string, over: Partial<JobSummary> = {}): Partial<JobSummary> {
     ...over,
   };
 }
+
+describe('phone calls in lazy job detail', () => {
+  beforeEach(() => vi.useFakeTimers());
+  afterEach(() => {
+    TestBed.resetTestingModule();
+    vi.useRealTimers();
+  });
+
+  it('discovers calls for an ordinary job without a telephony origin', () => {
+    const row = job('job-1', {status: 'processing', origin: 'user'});
+    const getCalls = vi.fn().mockReturnValue(of({calls: [callFixture()]}));
+    const {fixture, component} = mountLogic({
+      api: {getJobsPage: vi.fn().mockReturnValue(of(page([row])))}, calls: {getCalls},
+    });
+    fixture.detectChanges();
+    component.toggleExpand('job-1');
+    expect(getCalls).toHaveBeenCalledWith('job-1');
+    expect(component.jobDetails()['job-1'].calls).toEqual([callFixture()]);
+  });
+
+  it('uses the 30s panel poll and preserves calls while the refresh is in flight', async () => {
+    const pending = new Subject<{calls: Call[]}>();
+    const getCalls = vi.fn().mockReturnValueOnce(of({calls: [callFixture()]})).mockReturnValue(pending);
+    const {fixture, component} = mountLogic({
+      api: {getJobsPage: vi.fn().mockReturnValue(of(page([job('job-1', {status: 'processing'})])))},
+      calls: {getCalls},
+    });
+    fixture.detectChanges();
+    component.toggleExpand('job-1');
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(getCalls).toHaveBeenCalledTimes(2);
+    expect(component.jobDetails()['job-1'].loading).toBe(true);
+    expect(component.jobDetails()['job-1'].calls).toEqual([callFixture()]);
+    const ended = callFixture({status: 'ended'});
+    pending.next({calls: [ended]});
+    pending.complete();
+    expect(component.jobDetails()['job-1'].calls).toEqual([ended]);
+    expect(component.jobDetails()['job-1'].loading).toBe(false);
+  });
+
+  it('refreshes calls on completed jobs for post-call follow-ups and retains them on failed reads', async () => {
+    const ended = callFixture({status: 'ended'});
+    const getCalls = vi.fn().mockReturnValueOnce(of({calls: [ended]}))
+      .mockReturnValue(throwError(() => ({status: 503})));
+    const {fixture, component} = mountLogic({
+      api: {getJobsPage: vi.fn().mockReturnValue(of(page([job('job-1', {status: 'completed'})])))},
+      calls: {getCalls},
+    });
+    fixture.detectChanges();
+    component.toggleExpand('job-1');
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(getCalls).toHaveBeenCalledTimes(2);
+    expect(component.jobDetails()['job-1'].calls).toEqual([ended]);
+  });
+
+  it('keeps unrelated panel data usable when the calls endpoint is not available', () => {
+    const roster = {job_id: 'job-1', count: 0, subagents: []};
+    const {fixture, component} = mountLogic({
+      api: {getJobSubagents: vi.fn().mockReturnValue(of(roster))},
+      calls: {getCalls: vi.fn().mockReturnValue(throwError(() => ({status: 404})))},
+    });
+    fixture.detectChanges();
+    component.toggleExpand('job-1');
+    expect(component.jobDetails()['job-1'].calls).toBeNull();
+    expect(component.jobDetails()['job-1'].subagents).toEqual([]);
+    expect(component.jobDetails()['job-1'].error).toBe(false);
+  });
+});
 
 describe('JobListComponent — server-resolved tree', () => {
   beforeAll(async () => {

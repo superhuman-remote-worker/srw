@@ -675,3 +675,9 @@ forbidden_modules = [
   "agent.graph",
   "langgraph",
 ]
+
+[[tool.importlinter.contracts]]
+name = "Phone front and routes do not import application startup or composition"
+type = "forbidden"
+source_modules = ["orchestrator.routers.telephony", "orchestrator.services.telephony"]
+forbidden_modules = ["orchestrator.main", "orchestrator.application"]

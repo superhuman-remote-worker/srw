@@ -2456,6 +2456,10 @@ class PhaseSettings:
 
     min_todos: int = 5  # Minimum todos required for strategic->tactical transition
     max_todos: int = 20  # Maximum todos allowed for strategic->tactical transition
+    #: Tactical-only tools this expert may also call in the strategic phase.
+    #: For an expert whose strategic phase is live work (the phone desk answers
+    #: a caller from its datasources before it ever plans).
+    strategic_tools: List[str] = field(default_factory=list)
 
 
 @dataclass
@@ -3557,6 +3561,7 @@ def load_agent_config(
     phase_config = PhaseSettings(
         min_todos=phase_data.get("min_todos", 5),
         max_todos=phase_data.get("max_todos", 20),
+        strategic_tools=[str(t) for t in (phase_data.get("strategic_tools") or [])],
     )
 
     memory_data = data.get("memory", {})
@@ -3828,6 +3833,7 @@ def load_agent_config_from_dict(
     phase_config = PhaseSettings(
         min_todos=phase_data.get("min_todos", 5),
         max_todos=phase_data.get("max_todos", 20),
+        strategic_tools=[str(t) for t in (phase_data.get("strategic_tools") or [])],
     )
 
     memory_data = data.get("memory", {})

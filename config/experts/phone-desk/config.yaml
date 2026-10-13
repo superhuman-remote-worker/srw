@@ -1,0 +1,121 @@
+apiVersion: srw/v1alpha1
+kind: Expert
+metadata:
+  name: phone-desk
+  scope:
+    kind: Catalog
+    name: shared
+  annotations:
+    srw.io/display-name: Phone Desk
+    srw.io/description: 'Back office for one live phone call. A voice assistant
+      talks to the caller; this worker answers the questions the voice hands it
+      while the call lasts, then carries out the follow-ups. Started by the
+      phone line, not by hand.'
+    srw.io/icon: call
+    srw.io/color: '#94e2d5'
+    srw.io/expert-type: worker
+    srw.io/bundled-selector: phone-desk
+  tags:
+  - phone
+  - worker
+spec:
+  # A call needs no repository and no workspace files: answers come from the
+  # line's fact sheet, the project knowledge base and the attached datasources.
+  workspacePreference: {backend: none}
+  runtime:
+    adapter: srw/v1
+    config:
+      config_name: worker_base
+      asset_name: phone-desk
+      config:
+        # Phone Desk — the job a phone line starts for each call.
+        #
+        # The orchestrator accepts the call (GPT-Live) and creates this job with
+        # config.telephony (the call and its credentials). At job start the
+        # agent attaches the call as the background subagent `phone` and seeds
+        # the history with that delegate_agent call and its receipt; the job
+        # then answers the call's questions through wait_agent/message_agent.
+        # Design: knowledge-base/knowledge/features/phone_calls_as_subagents.md
+        # §4.4.1 and §7.1 P4.
+        $extends: worker_base
+
+        agent_id: phone-desk
+        display_name: Phone Desk
+        description: |
+          Back office for one live phone call. A voice assistant talks to the
+          caller; this worker answers the questions the voice hands it while the
+          call lasts, then carries out the follow-ups. Started by the phone line,
+          not by hand.
+        icon: call
+        color: "#94e2d5"
+        tags:
+          - phone
+          - worker
+
+        verification:
+          enabled: false
+        scholar:
+          enabled: false
+        curator:
+          enabled: false
+
+        delegation:
+          enabled: true
+          max_concurrent: 2
+
+        # The live call is the strategic phase (the first todo), and the
+        # caller cannot wait for a phase switch: the datasource tools answer
+        # "when is my appointment?" and do "cancel it" while the call lasts.
+        phase_settings:
+          strategic_tools:
+            - sql_schema
+            - sql_query
+            - sql_execute
+
+        # No workspace means no read_file: the worker overlay's read-before-tool
+        # gates (todo-guide before next_phase_todos, verify-before-done before
+        # todo_complete/job_complete) could never open, and the job could not
+        # finish. Keep only the phase skills, which arrive as messages.
+        instruction_files:
+          - skill: strategic-phase
+            trigger: phase_start:strategic
+            enforce: false
+          - skill: tactical-phase
+            trigger: phase_start:tactical
+            enforce: false
+
+        subagents:
+          default: phone
+          roster:
+            phone:
+              description: >-
+                The live phone call this job was started for. A voice assistant
+                talks to the caller; wait_agent returns its questions, and
+                message_agent(reply_to=...) speaks your answer. Attached at job
+                start; never start a second one.
+              # Not an LLM child: the subagent runtime drives it with the phone
+              # driver (agent/subagents/phone.py) on the job's call.
+              driver: phone
+              isolation: shared
+              write_policy: none
+              llm:
+                model: inherit
+              limits:
+                return_budget_tokens: 6000
+
+        # A caller is waiting: the back office answers from the knowledge base
+        # and the project's datasources (their SQL tools are added when a
+        # datasource is attached), never from the web or a browser.
+        tools:
+          workspace: []
+          research: []
+          browser_direct: []
+          git: []
+          delegation:
+            - delegate_agent
+            - wait_agent
+            - message_agent
+            - stop_agent
+            - list_agents
+          citation: []
+          graph: []

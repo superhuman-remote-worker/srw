@@ -25,11 +25,12 @@ ORCHESTRATOR = ROOT / "src" / "orchestrator"
 
 
 class TestVocabulary:
-    def test_the_eight_values_are_the_taxonomy(self):
+    def test_the_known_values_are_the_taxonomy(self):
         assert KNOWN_JOB_ORIGINS == {
             "user",
             "session",
             "automation",
+            "telephony",
             "loop",
             "officer",
             "subjob",

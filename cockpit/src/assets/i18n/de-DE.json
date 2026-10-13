@@ -664,6 +664,52 @@
     "legacyHeld": "Eine ältere Arbeitsbereichserstellung wird geprüft; ein Abschlussnachweis fehlt."
   },
   "jobs": {
+    "calls": {
+      "title": "Telefonate",
+      "to": "an",
+      "duration": "Gesprächsdauer",
+      "transcript": "Live-Transkript",
+      "loading": "Transkript wird geladen…",
+      "waiting": "Warten auf das Gespräch…",
+      "empty": "Kein Transkript aufgezeichnet.",
+      "loadError": "Transkript konnte nicht aktualisiert werden.",
+      "jumpLatest": "Zum neuesten Beitrag",
+      "backoffice": "Rückfrage an das Backoffice",
+      "steering": "Steuerung:",
+      "followUps": "Nach dem Telefonat zu erledigen",
+      "direction": {
+        "inbound": "Eingehend",
+        "outbound": "Ausgehend"
+      },
+      "status": {
+        "ringing": "Klingelt",
+        "active": "Live",
+        "ended": "Beendet",
+        "rejected": "Abgelehnt",
+        "failed": "Fehlgeschlagen"
+      },
+      "speaker": {
+        "caller": "Anrufer",
+        "assistant": "Sprachassistent",
+        "job": "Backoffice",
+        "recorder": "Telefonsystem",
+        "unknown": "Sprecher"
+      },
+      "backofficeState": {
+        "pending": "Antwort ausstehend",
+        "answered": "Beantwortet",
+        "noted": "Notiert",
+        "followUp": "Follow-up"
+      },
+      "reason": {
+        "remote_hangup": "Anrufer hat aufgelegt",
+        "close_requested": "Telefonat auf Wunsch beendet",
+        "expired": "Zeitlimit des Telefonats erreicht",
+        "content": "Telefonat nach dem Gespräch beendet",
+        "connection_lost": "Verbindung verloren",
+        "recorder_lost": "Gesprächsaufzeichnung getrennt"
+      }
+    },
     "pagination": {
       "label": "Seitennavigation",
       "current": "Seite {{page}}",
