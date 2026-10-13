@@ -26341,7 +26341,7 @@ class PostgresDB:
                 row = await conn.fetchrow(
                     "SELECT status,execution_lane,runtime_generation,"
                     "runtime_retirement_token,agent_id,runtime_attach_token,metadata,"
-                    "pinned_idle_terminal_intent_at "
+                    "pinned_idle_terminal_intent_at,runtime_attach_abort_receipt "
                     "FROM threads WHERE id=$1::uuid FOR UPDATE",
                     parsed_thread,
                 )
@@ -26435,11 +26435,30 @@ class PostgresDB:
                         "SELECT EXISTS(SELECT 1 FROM vm_creation_retries WHERE thread_id=$1) "
                         "OR EXISTS(SELECT 1 FROM vm_idle_operations WHERE owner_kind='thread' AND owner_id=$1) "
                         "OR EXISTS(SELECT 1 FROM thread_runtime_retirement_outcomes WHERE thread_id=$1) "
-                        "OR EXISTS(SELECT 1 FROM thread_runtime_attach_abort_outcomes WHERE thread_id=$1) "
                         "OR EXISTS(SELECT 1 FROM thread_workspace_provision_intents WHERE thread_id=$1) "
                         "OR EXISTS(SELECT 1 FROM srw_execution_workspace_bindings WHERE execution_id=$2)",
                         parsed_thread,
                         execution["id"],
+                    ):
+                        return False
+                    from orchestrator.services.vm_initial_no_payload_history import (
+                        initial_vm_no_payload_history_allows,
+                    )
+
+                    abort_outcomes = await conn.fetch(
+                        "SELECT thread_id,runtime_generation,runtime_attach_token,"
+                        "agent_id,agent_pod_uid,successor_generation,release_kind,"
+                        "quiescence_protocol,workspace_generation,"
+                        "workspace_runtime_incarnation FROM "
+                        "thread_runtime_attach_abort_outcomes WHERE thread_id=$1 "
+                        "LIMIT 4097",
+                        parsed_thread,
+                    )
+                    if not initial_vm_no_payload_history_allows(
+                        thread_id=parsed_thread,
+                        current_generation=parsed_runtime_generation,
+                        receipt=row["runtime_attach_abort_receipt"],
+                        outcomes=[dict(outcome) for outcome in abort_outcomes],
                     ):
                         return False
                     if not preparation_only:
