@@ -51,9 +51,10 @@ sys.path.insert(0, REPO)
 
 from tests._fake_gpt_live import FakeGptLive  # noqa: E402
 
-PSQL = (
-    "kubectl --context k3d-srw -n srw exec srw-postgres-0 -- "
-    "psql -U srw -d srw -tAc"
+PSQL = "kubectl --context k3d-srw -n srw exec srw-postgres-0 -- psql -U srw -d srw -tAc"
+AUDIT_PSQL = (
+    "kubectl --context k3d-srw -n srw exec srw-auditdb-0 -- "
+    "psql -U srw -d srw_audit -tAc"
 )
 
 
@@ -61,9 +62,9 @@ def _step(message: str) -> None:
     print(f"[{time.strftime('%H:%M:%S')}] {message}", flush=True)
 
 
-def _sql(args: argparse.Namespace, query: str) -> str:
+def _sql(args: argparse.Namespace, query: str, *, audit: bool = False) -> str:
     result = subprocess.run(
-        [*shlex.split(args.psql), query],
+        [*shlex.split(args.audit_psql if audit else args.psql), query],
         capture_output=True,
         text=True,
         timeout=30,
@@ -145,6 +146,7 @@ async def play(args: argparse.Namespace) -> int:
                 f"FAIL: session was {session.status} (reject {session.reject_status})"
             )
             return 1
+        accepted = time.monotonic()
         config = session.accept_config or {}
         _step(
             f"accepted after {time.monotonic() - started:.1f}s; voice="
@@ -168,6 +170,10 @@ async def play(args: argparse.Namespace) -> int:
         if args.scenario == "missed":
             await fake.say(provider_id, "caller", "Never mind, I will call back.")
             await asyncio.sleep(0.5)
+            # The engine bills the seconds the session ran.
+            fake.session(provider_id).usage_seconds = round(
+                time.monotonic() - accepted, 1
+            )
             await fake.remote_hangup(provider_id)
             _step("caller hung up before the job attached")
         else:
@@ -220,6 +226,9 @@ async def play(args: argparse.Namespace) -> int:
             await fake.say(provider_id, "caller", "Thank you, goodbye.")
             await asyncio.sleep(1.0)
             if fake.session(provider_id).status != "closed":
+                fake.session(provider_id).usage_seconds = round(
+                    time.monotonic() - accepted, 1
+                )
                 await fake.remote_hangup(provider_id)
             _step("caller hung up")
 
@@ -253,6 +262,15 @@ async def play(args: argparse.Namespace) -> int:
                 f"WHERE provider_session_id = '{provider_id}'",
             )
             _step(f"usage_seconds: {usage or 'none'}")
+            billed = _sql(
+                args,
+                "SELECT quantity || ' ' || unit || ' $' || coalesce(cost_usd::text, '?') "
+                f"FROM usage_events WHERE source = 'live' AND source_id = '{row[0]}'",
+                audit=True,
+            )
+            _step(f"usage row: {billed or 'none'}")
+            if not billed:
+                failures += 1
         sent = [c["type"] for c in fake.session(provider_id).commands]
         _step(f"commands received: {sent}")
         return 1 if failures else 0
@@ -282,6 +300,9 @@ def main() -> int:
     parser.add_argument("--answer-timeout", type=float, default=120.0)
     parser.add_argument("--finish-timeout", type=float, default=600.0)
     parser.add_argument("--psql", default=PSQL, help="Command prefix running SQL")
+    parser.add_argument(
+        "--audit-psql", default=AUDIT_PSQL, help="Command prefix for the audit DB"
+    )
     parser.add_argument("--insecure", action="store_true")
     return asyncio.run(play(parser.parse_args()))
 

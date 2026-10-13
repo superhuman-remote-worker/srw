@@ -562,6 +562,16 @@ class Transcript:
         if not text:
             return False
         if self.turns and self.turns[-1].speaker == speaker:
+            previous = self.turns[-1].text
+            # Deltas carry their own spacing; a new utterance of the same
+            # speaker after a finished sentence may not ("open?I am ill").
+            if (
+                previous
+                and previous[-1] in ".?!"
+                and not text[:1].isspace()
+                and not previous[-1].isspace()
+            ):
+                text = " " + text
             self.turns[-1].text += text
         else:
             self.turns.append(Turn(speaker=speaker, text=text, start_ms=start_ms))
