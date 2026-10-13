@@ -26594,10 +26594,14 @@ CREATE TABLE public.automations (
     created_at timestamp with time zone DEFAULT now() NOT NULL,
     updated_at timestamp with time zone DEFAULT now() NOT NULL,
     expert_id uuid,
+    trigger_connector_id uuid,
+    job_shape jsonb DEFAULT '{}'::jsonb NOT NULL,
     CONSTRAINT automations_expert_source_check CHECK (((expert_id IS NULL) OR (expert = 'worker_base'::text))),
-    CONSTRAINT automations_trigger_type_check CHECK ((trigger_type = ANY (ARRAY['cron'::text, 'event'::text]))),
+    CONSTRAINT automations_job_shape_object CHECK ((jsonb_typeof(job_shape) = 'object'::text)),
+    CONSTRAINT automations_trigger_type_check CHECK ((trigger_type = ANY (ARRAY['cron'::text, 'event'::text, 'live'::text]))),
     CONSTRAINT cron_trigger_has_expr CHECK (((trigger_type <> 'cron'::text) OR (cron_expr IS NOT NULL))),
-    CONSTRAINT event_trigger_has_filter CHECK (((trigger_type <> 'event'::text) OR (event_filter IS NOT NULL)))
+    CONSTRAINT event_trigger_has_filter CHECK (((trigger_type <> 'event'::text) OR (event_filter IS NOT NULL))),
+    CONSTRAINT live_trigger_has_connector CHECK (((trigger_type <> 'live'::text) OR (trigger_connector_id IS NOT NULL)))
 );
 
 
@@ -26672,77 +26676,6 @@ CREATE TABLE public.bench_runs (
     CONSTRAINT bench_runs_spec_check CHECK ((jsonb_typeof(spec) = 'object'::text)),
     CONSTRAINT bench_runs_state_check CHECK ((jsonb_typeof(state) = 'array'::text)),
     CONSTRAINT bench_runs_status_check CHECK ((status = ANY (ARRAY['running'::text, 'paused'::text, 'done'::text, 'cancelled'::text])))
-);
-
-
---
--- Name: call_events; Type: TABLE; Schema: public; Owner: -
---
-
-CREATE TABLE public.call_events (
-    id bigint NOT NULL,
-    call_id uuid NOT NULL,
-    event_id text,
-    kind text NOT NULL,
-    speaker text,
-    text text,
-    start_ms integer,
-    end_ms integer,
-    delegation_id text,
-    payload jsonb DEFAULT '{}'::jsonb NOT NULL,
-    created_at timestamp with time zone DEFAULT now() NOT NULL,
-    CONSTRAINT call_events_kind_check CHECK ((kind = ANY (ARRAY['transcript'::text, 'delegation'::text, 'answer'::text, 'instruction'::text, 'thinking'::text, 'fallback'::text, 'question'::text, 'follow_up'::text, 'transfer'::text, 'hangup'::text, 'dtmf'::text, 'usage'::text, 'closed'::text, 'error'::text, 'system'::text])))
-);
-
-
---
--- Name: call_events_id_seq; Type: SEQUENCE; Schema: public; Owner: -
---
-
-CREATE SEQUENCE public.call_events_id_seq
-    START WITH 1
-    INCREMENT BY 1
-    NO MINVALUE
-    NO MAXVALUE
-    CACHE 1;
-
-
---
--- Name: call_events_id_seq; Type: SEQUENCE OWNED BY; Schema: public; Owner: -
---
-
-ALTER SEQUENCE public.call_events_id_seq OWNED BY public.call_events.id;
-
-
---
--- Name: calls; Type: TABLE; Schema: public; Owner: -
---
-
-CREATE TABLE public.calls (
-    id uuid DEFAULT gen_random_uuid() NOT NULL,
-    session_id text NOT NULL,
-    webhook_id text,
-    settings_id uuid NOT NULL,
-    line_id uuid,
-    project_id uuid,
-    job_id uuid,
-    direction text NOT NULL,
-    status text NOT NULL,
-    from_number text,
-    to_number text,
-    sip_headers jsonb DEFAULT '[]'::jsonb NOT NULL,
-    created_at timestamp with time zone DEFAULT now() NOT NULL,
-    accepted_at timestamp with time zone,
-    attached_at timestamp with time zone,
-    ended_at timestamp with time zone,
-    close_reason text,
-    usage_seconds numeric,
-    error text,
-    recorder_owner text,
-    recorder_lease_until timestamp with time zone,
-    metadata jsonb DEFAULT '{}'::jsonb NOT NULL,
-    CONSTRAINT calls_direction_check CHECK ((direction = ANY (ARRAY['inbound'::text, 'outbound'::text]))),
-    CONSTRAINT calls_status_check CHECK ((status = ANY (ARRAY['ringing'::text, 'active'::text, 'ended'::text, 'rejected'::text, 'failed'::text])))
 );
 
 
@@ -28915,6 +28848,95 @@ CREATE TABLE public.legacy_workspace_cutover_plans (
 
 
 --
+-- Name: live_session_events; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.live_session_events (
+    id bigint NOT NULL,
+    session_id uuid NOT NULL,
+    event_id text,
+    kind text NOT NULL,
+    speaker text,
+    text text,
+    start_ms integer,
+    end_ms integer,
+    delegation_id text,
+    payload jsonb DEFAULT '{}'::jsonb NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT live_session_events_kind_check CHECK ((kind = ANY (ARRAY['transcript'::text, 'delegation'::text, 'answer'::text, 'instruction'::text, 'thinking'::text, 'fallback'::text, 'question'::text, 'follow_up'::text, 'transfer'::text, 'hangup'::text, 'dtmf'::text, 'closed'::text, 'error'::text, 'system'::text])))
+);
+
+
+--
+-- Name: TABLE live_session_events; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON TABLE public.live_session_events IS 'The journal of a live session: transcript, delegations, the job''s answers and steering, and the pod''s own appends. event_id dedupes replays.';
+
+
+--
+-- Name: live_session_events_id_seq; Type: SEQUENCE; Schema: public; Owner: -
+--
+
+CREATE SEQUENCE public.live_session_events_id_seq
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+
+--
+-- Name: live_session_events_id_seq; Type: SEQUENCE OWNED BY; Schema: public; Owner: -
+--
+
+ALTER SEQUENCE public.live_session_events_id_seq OWNED BY public.live_session_events.id;
+
+
+--
+-- Name: live_sessions; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.live_sessions (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    connector_id uuid,
+    provider_session_id text NOT NULL,
+    webhook_id text,
+    family text DEFAULT 'voice'::text NOT NULL,
+    transport text DEFAULT 'sip'::text NOT NULL,
+    direction text DEFAULT 'inbound'::text NOT NULL,
+    origin text NOT NULL,
+    status text NOT NULL,
+    automation_id uuid,
+    job_id uuid,
+    project_id uuid,
+    model text,
+    handoff jsonb DEFAULT '{}'::jsonb NOT NULL,
+    metadata jsonb DEFAULT '{}'::jsonb NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    accepted_at timestamp with time zone,
+    attached_at timestamp with time zone,
+    ended_at timestamp with time zone,
+    close_reason text,
+    error text,
+    usage_seconds numeric,
+    owner_identity_id uuid,
+    lease_until timestamp with time zone,
+    CONSTRAINT live_sessions_direction_check CHECK ((direction = ANY (ARRAY['inbound'::text, 'outbound'::text]))),
+    CONSTRAINT live_sessions_family_check CHECK ((family = ANY (ARRAY['voice'::text, 'messaging'::text]))),
+    CONSTRAINT live_sessions_origin_check CHECK ((origin = ANY (ARRAY['webhook'::text, 'api'::text, 'manifest'::text]))),
+    CONSTRAINT live_sessions_status_check CHECK ((status = ANY (ARRAY['ringing'::text, 'active'::text, 'ended'::text, 'rejected'::text, 'failed'::text])))
+);
+
+
+--
+-- Name: TABLE live_sessions; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON TABLE public.live_sessions IS 'A live session (a phone call) a live connector received, and the one job it is bound to. Status flow ringing -> active -> ended, or ringing -> rejected | failed; every update is monotonic.';
+
+
+--
 -- Name: llm_endpoints; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -29609,7 +29631,7 @@ CREATE TABLE public.models (
     source text DEFAULT 'ui'::text NOT NULL,
     helm_value_hash text,
     source_updated_at timestamp with time zone DEFAULT CURRENT_TIMESTAMP NOT NULL,
-    CONSTRAINT models_capabilities_check CHECK (((cardinality(capabilities) >= 1) AND (capabilities <@ ARRAY['chat'::text, 'auxiliary'::text, 'embedding'::text, 'vision'::text, 'whisper'::text, 'tts'::text, 'search'::text, 'fetch'::text, 'rerank'::text]))),
+    CONSTRAINT models_capabilities_check CHECK (((cardinality(capabilities) >= 1) AND (capabilities <@ ARRAY['chat'::text, 'auxiliary'::text, 'embedding'::text, 'vision'::text, 'whisper'::text, 'tts'::text, 'search'::text, 'fetch'::text, 'rerank'::text, 'live_voice'::text]))),
     CONSTRAINT models_provider_kind_check CHECK ((provider_kind = ANY (ARRAY['system'::text, 'endpoint'::text]))),
     CONSTRAINT models_source_check CHECK ((source = ANY (ARRAY['default'::text, 'helm'::text, 'ui'::text])))
 );
@@ -32025,60 +32047,6 @@ CREATE TABLE public.system_settings (
     helm_value_hash text,
     source_updated_at timestamp with time zone DEFAULT CURRENT_TIMESTAMP NOT NULL,
     CONSTRAINT system_settings_source_check CHECK ((source = ANY (ARRAY['default'::text, 'helm'::text, 'ui'::text])))
-);
-
-
---
--- Name: telephony_lines; Type: TABLE; Schema: public; Owner: -
---
-
-CREATE TABLE public.telephony_lines (
-    id uuid DEFAULT gen_random_uuid() NOT NULL,
-    settings_id uuid NOT NULL,
-    project_id uuid NOT NULL,
-    owner_user_id uuid NOT NULL,
-    name text NOT NULL,
-    number text,
-    is_default boolean DEFAULT false NOT NULL,
-    enabled boolean DEFAULT true NOT NULL,
-    engine text DEFAULT 'gpt_live'::text NOT NULL,
-    model text DEFAULT 'gpt-live-1'::text NOT NULL,
-    voice text DEFAULT 'marin'::text NOT NULL,
-    expert text DEFAULT 'phone-desk'::text NOT NULL,
-    persona text DEFAULT ''::text NOT NULL,
-    greeting text NOT NULL,
-    fact_sheet text DEFAULT ''::text NOT NULL,
-    transfer_target text,
-    max_duration_s integer DEFAULT 900 NOT NULL,
-    answer_timeout_s integer DEFAULT 25 NOT NULL,
-    no_job_fallback_s integer DEFAULT 8 NOT NULL,
-    goodbye text,
-    created_at timestamp with time zone DEFAULT now() NOT NULL,
-    updated_at timestamp with time zone DEFAULT now() NOT NULL,
-    CONSTRAINT telephony_lines_answer_timeout_s_check CHECK ((answer_timeout_s > 0)),
-    CONSTRAINT telephony_lines_engine_check CHECK ((engine = 'gpt_live'::text)),
-    CONSTRAINT telephony_lines_max_duration_s_check CHECK ((max_duration_s > 0)),
-    CONSTRAINT telephony_lines_no_job_fallback_s_check CHECK ((no_job_fallback_s > 0))
-);
-
-
---
--- Name: telephony_settings; Type: TABLE; Schema: public; Owner: -
---
-
-CREATE TABLE public.telephony_settings (
-    id uuid DEFAULT gen_random_uuid() NOT NULL,
-    name text NOT NULL,
-    project_id uuid,
-    openai_project_id text NOT NULL,
-    api_base text DEFAULT 'https://api.openai.com/v1'::text NOT NULL,
-    ws_base text DEFAULT 'wss://api.openai.com/v1'::text NOT NULL,
-    extra_headers jsonb DEFAULT '{}'::jsonb NOT NULL,
-    webhook_secret_encrypted text NOT NULL,
-    api_key_encrypted text,
-    enabled boolean DEFAULT true NOT NULL,
-    created_at timestamp with time zone DEFAULT now() NOT NULL,
-    updated_at timestamp with time zone DEFAULT now() NOT NULL
 );
 
 
@@ -34562,10 +34530,10 @@ ALTER SEQUENCE public.workspace_intervals_id_seq OWNED BY public.workspace_inter
 
 
 --
--- Name: call_events id; Type: DEFAULT; Schema: public; Owner: -
+-- Name: live_session_events id; Type: DEFAULT; Schema: public; Owner: -
 --
 
-ALTER TABLE ONLY public.call_events ALTER COLUMN id SET DEFAULT nextval('public.call_events_id_seq'::regclass);
+ALTER TABLE ONLY public.live_session_events ALTER COLUMN id SET DEFAULT nextval('public.live_session_events_id_seq'::regclass);
 
 
 --
@@ -34650,38 +34618,6 @@ ALTER TABLE ONLY public.automations
 
 ALTER TABLE ONLY public.bench_runs
     ADD CONSTRAINT bench_runs_pkey PRIMARY KEY (id);
-
-
---
--- Name: call_events call_events_pkey; Type: CONSTRAINT; Schema: public; Owner: -
---
-
-ALTER TABLE ONLY public.call_events
-    ADD CONSTRAINT call_events_pkey PRIMARY KEY (id);
-
-
---
--- Name: calls calls_pkey; Type: CONSTRAINT; Schema: public; Owner: -
---
-
-ALTER TABLE ONLY public.calls
-    ADD CONSTRAINT calls_pkey PRIMARY KEY (id);
-
-
---
--- Name: calls calls_session_id_key; Type: CONSTRAINT; Schema: public; Owner: -
---
-
-ALTER TABLE ONLY public.calls
-    ADD CONSTRAINT calls_session_id_key UNIQUE (session_id);
-
-
---
--- Name: calls calls_webhook_id_key; Type: CONSTRAINT; Schema: public; Owner: -
---
-
-ALTER TABLE ONLY public.calls
-    ADD CONSTRAINT calls_webhook_id_key UNIQUE (webhook_id);
 
 
 --
@@ -35210,6 +35146,38 @@ ALTER TABLE ONLY public.legacy_workspace_cutover_plans
 
 ALTER TABLE ONLY public.legacy_workspace_cutover_plans
     ADD CONSTRAINT legacy_workspace_cutover_plans_workspace_interval_id_key UNIQUE (workspace_interval_id);
+
+
+--
+-- Name: live_session_events live_session_events_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.live_session_events
+    ADD CONSTRAINT live_session_events_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: live_sessions live_sessions_connector_id_provider_session_id_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.live_sessions
+    ADD CONSTRAINT live_sessions_connector_id_provider_session_id_key UNIQUE (connector_id, provider_session_id);
+
+
+--
+-- Name: live_sessions live_sessions_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.live_sessions
+    ADD CONSTRAINT live_sessions_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: live_sessions live_sessions_webhook_id_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.live_sessions
+    ADD CONSTRAINT live_sessions_webhook_id_key UNIQUE (webhook_id);
 
 
 --
@@ -36433,22 +36401,6 @@ ALTER TABLE ONLY public.system_api_keys
 
 ALTER TABLE ONLY public.system_settings
     ADD CONSTRAINT system_settings_pkey PRIMARY KEY (key);
-
-
---
--- Name: telephony_lines telephony_lines_pkey; Type: CONSTRAINT; Schema: public; Owner: -
---
-
-ALTER TABLE ONLY public.telephony_lines
-    ADD CONSTRAINT telephony_lines_pkey PRIMARY KEY (id);
-
-
---
--- Name: telephony_settings telephony_settings_pkey; Type: CONSTRAINT; Schema: public; Owner: -
---
-
-ALTER TABLE ONLY public.telephony_settings
-    ADD CONSTRAINT telephony_settings_pkey PRIMARY KEY (id);
 
 
 --
@@ -37844,34 +37796,6 @@ CREATE INDEX agent_metering_pod_identity_state_owner_idx ON public.agent_meterin
 --
 
 CREATE INDEX agent_metering_pod_identity_state_pod_uid_idx ON public.agent_metering_pod_identity_state USING btree (pod_uid, agent_id) WHERE (agent_present AND (pod_uid IS NOT NULL));
-
-
---
--- Name: call_events_cursor; Type: INDEX; Schema: public; Owner: -
---
-
-CREATE INDEX call_events_cursor ON public.call_events USING btree (call_id, id);
-
-
---
--- Name: call_events_engine_event; Type: INDEX; Schema: public; Owner: -
---
-
-CREATE UNIQUE INDEX call_events_engine_event ON public.call_events USING btree (call_id, event_id) WHERE (event_id IS NOT NULL);
-
-
---
--- Name: calls_job; Type: INDEX; Schema: public; Owner: -
---
-
-CREATE INDEX calls_job ON public.calls USING btree (job_id);
-
-
---
--- Name: calls_recorder; Type: INDEX; Schema: public; Owner: -
---
-
-CREATE INDEX calls_recorder ON public.calls USING btree (status, recorder_lease_until);
 
 
 --
@@ -39415,6 +39339,34 @@ CREATE INDEX legacy_workspace_cutover_plans_pending_idx ON public.legacy_workspa
 
 
 --
+-- Name: live_session_events_cursor; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX live_session_events_cursor ON public.live_session_events USING btree (session_id, id);
+
+
+--
+-- Name: live_session_events_event; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX live_session_events_event ON public.live_session_events USING btree (session_id, event_id) WHERE (event_id IS NOT NULL);
+
+
+--
+-- Name: live_sessions_connector_status; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX live_sessions_connector_status ON public.live_sessions USING btree (connector_id, status);
+
+
+--
+-- Name: live_sessions_job; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX live_sessions_job ON public.live_sessions USING btree (job_id);
+
+
+--
 -- Name: managed_repository_workspace_cleanup_one_active; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -39807,17 +39759,10 @@ CREATE INDEX storage_volume_incarnations_asset_time_idx ON public.storage_volume
 
 
 --
--- Name: telephony_lines_default; Type: INDEX; Schema: public; Owner: -
+-- Name: uq_automations_live_primary; Type: INDEX; Schema: public; Owner: -
 --
 
-CREATE UNIQUE INDEX telephony_lines_default ON public.telephony_lines USING btree (settings_id) WHERE (enabled AND is_default);
-
-
---
--- Name: telephony_lines_number; Type: INDEX; Schema: public; Owner: -
---
-
-CREATE UNIQUE INDEX telephony_lines_number ON public.telephony_lines USING btree (number) WHERE (number IS NOT NULL);
+CREATE UNIQUE INDEX uq_automations_live_primary ON public.automations USING btree (trigger_connector_id) WHERE (enabled AND (trigger_type = 'live'::text));
 
 
 --
@@ -42692,51 +42637,19 @@ ALTER TABLE ONLY public.automations
 
 
 --
+-- Name: automations automations_trigger_connector_fk; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.automations
+    ADD CONSTRAINT automations_trigger_connector_fk FOREIGN KEY (trigger_connector_id) REFERENCES public.datasources(id) ON DELETE RESTRICT;
+
+
+--
 -- Name: bench_runs bench_runs_created_by_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
 ALTER TABLE ONLY public.bench_runs
     ADD CONSTRAINT bench_runs_created_by_fkey FOREIGN KEY (created_by) REFERENCES public.users(id) ON DELETE CASCADE;
-
-
---
--- Name: call_events call_events_call_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
---
-
-ALTER TABLE ONLY public.call_events
-    ADD CONSTRAINT call_events_call_id_fkey FOREIGN KEY (call_id) REFERENCES public.calls(id) ON DELETE CASCADE;
-
-
---
--- Name: calls calls_job_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
---
-
-ALTER TABLE ONLY public.calls
-    ADD CONSTRAINT calls_job_id_fkey FOREIGN KEY (job_id) REFERENCES public.jobs(id) ON DELETE SET NULL;
-
-
---
--- Name: calls calls_line_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
---
-
-ALTER TABLE ONLY public.calls
-    ADD CONSTRAINT calls_line_id_fkey FOREIGN KEY (line_id) REFERENCES public.telephony_lines(id) ON DELETE SET NULL;
-
-
---
--- Name: calls calls_project_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
---
-
-ALTER TABLE ONLY public.calls
-    ADD CONSTRAINT calls_project_id_fkey FOREIGN KEY (project_id) REFERENCES public.projects(id) ON DELETE SET NULL;
-
-
---
--- Name: calls calls_settings_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
---
-
-ALTER TABLE ONLY public.calls
-    ADD CONSTRAINT calls_settings_id_fkey FOREIGN KEY (settings_id) REFERENCES public.telephony_settings(id);
 
 
 --
@@ -43385,6 +43298,46 @@ ALTER TABLE ONLY public.legacy_workspace_cutover_plan_events
 
 ALTER TABLE ONLY public.legacy_workspace_cutover_plans
     ADD CONSTRAINT legacy_workspace_cutover_plans_workspace_interval_id_fkey FOREIGN KEY (workspace_interval_id) REFERENCES public.workspace_intervals(id) ON DELETE RESTRICT;
+
+
+--
+-- Name: live_session_events live_session_events_session_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.live_session_events
+    ADD CONSTRAINT live_session_events_session_id_fkey FOREIGN KEY (session_id) REFERENCES public.live_sessions(id) ON DELETE CASCADE;
+
+
+--
+-- Name: live_sessions live_sessions_automation_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.live_sessions
+    ADD CONSTRAINT live_sessions_automation_id_fkey FOREIGN KEY (automation_id) REFERENCES public.automations(id) ON DELETE SET NULL;
+
+
+--
+-- Name: live_sessions live_sessions_connector_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.live_sessions
+    ADD CONSTRAINT live_sessions_connector_id_fkey FOREIGN KEY (connector_id) REFERENCES public.datasources(id) ON DELETE SET NULL;
+
+
+--
+-- Name: live_sessions live_sessions_job_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.live_sessions
+    ADD CONSTRAINT live_sessions_job_id_fkey FOREIGN KEY (job_id) REFERENCES public.jobs(id) ON DELETE SET NULL;
+
+
+--
+-- Name: live_sessions live_sessions_project_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.live_sessions
+    ADD CONSTRAINT live_sessions_project_id_fkey FOREIGN KEY (project_id) REFERENCES public.projects(id) ON DELETE SET NULL;
 
 
 --
@@ -44321,38 +44274,6 @@ ALTER TABLE ONLY public.sudo_approval_requests
 
 ALTER TABLE ONLY public.sudo_approval_requests
     ADD CONSTRAINT sudo_approval_requests_thread_id_fkey FOREIGN KEY (thread_id) REFERENCES public.threads(id) ON DELETE CASCADE;
-
-
---
--- Name: telephony_lines telephony_lines_owner_user_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
---
-
-ALTER TABLE ONLY public.telephony_lines
-    ADD CONSTRAINT telephony_lines_owner_user_id_fkey FOREIGN KEY (owner_user_id) REFERENCES public.users(id);
-
-
---
--- Name: telephony_lines telephony_lines_project_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
---
-
-ALTER TABLE ONLY public.telephony_lines
-    ADD CONSTRAINT telephony_lines_project_id_fkey FOREIGN KEY (project_id) REFERENCES public.projects(id);
-
-
---
--- Name: telephony_lines telephony_lines_settings_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
---
-
-ALTER TABLE ONLY public.telephony_lines
-    ADD CONSTRAINT telephony_lines_settings_id_fkey FOREIGN KEY (settings_id) REFERENCES public.telephony_settings(id);
-
-
---
--- Name: telephony_settings telephony_settings_project_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
---
-
-ALTER TABLE ONLY public.telephony_settings
-    ADD CONSTRAINT telephony_settings_project_id_fkey FOREIGN KEY (project_id) REFERENCES public.projects(id) ON DELETE SET NULL;
 
 
 --

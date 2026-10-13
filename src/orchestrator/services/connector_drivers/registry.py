@@ -94,6 +94,7 @@ def builtin_connector_drivers(
     echo_service_image: str | None = None,
     managed_mcp_images: Mapping[str, str] | None = None,
     git_swap_image: str | None = None,
+    gpt_live_sip_image: str | None = None,
 ) -> ConnectorDriverRegistry:
     """The drivers SRW ships, in catalogue order.
 
@@ -108,7 +109,8 @@ def builtin_connector_drivers(
     adds each managed MCP server it names, by driver name, running that image
     (``connectors.drivers.managedMcp``, ``mcpTest``, ``mcpStdioTest`` and
     ``mcpStdioProbe``, D5a and D5b). A name that is no managed MCP driver
-    SRW ships is refused.
+    SRW ships is refused. ``gpt_live_sip_image`` adds the phone-line driver
+    (``connectors.drivers.gptLiveSip``, live_session_jobs.md §5.1).
     """
     from orchestrator.services.connector_drivers import builtin
     from orchestrator.services.connector_drivers.registered import (
@@ -128,6 +130,12 @@ def builtin_connector_drivers(
             if driver.spec is REPOSITORY_SPEC
         )
         drivers = drivers[:at] + (GitSwapDriver(git_swap_image),) + drivers[at:]
+    if gpt_live_sip_image:
+        from orchestrator.services.connector_drivers.gpt_live_sip import (
+            GptLiveSipDriver,
+        )
+
+        drivers += (GptLiveSipDriver(gpt_live_sip_image),)
     if lease_probe:
         from orchestrator.services.connector_drivers.lease_probe import (
             LeaseProbeDriver,

@@ -20,10 +20,11 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from typing import Any, Callable
+from typing import Any, Callable, Literal
 
+import asyncpg
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from orchestrator.security.access import PROJECT_ARCHIVED_DETAIL, require_project_member
 from orchestrator.security.auth import require_approved_user
@@ -74,16 +75,61 @@ def get_automations_dependencies(request: Request) -> AutomationsDependencies:
 # ---------------------------------------------------------------------------
 
 
+class AutomationJobShape(BaseModel):
+    """The job shape an automation fires with beyond its expert and prompt:
+    its connectors by alias (``execution.connectors``, as a job request names
+    them) and its workspace. A missing ``workspace`` key is the default; an
+    explicit ``null`` is no workspace (the job request's tri-state)."""
+
+    model_config = {"extra": "forbid"}
+
+    execution: dict[str, Any] | None = None
+    workspace: dict[str, Any] | None = None
+
+    @field_validator("execution")
+    @classmethod
+    def _execution(cls, value: dict[str, Any] | None) -> dict[str, Any] | None:
+        if value is None:
+            return None
+        from orchestrator.schemas.execution_selection import ExecutionSelection
+
+        if set(value) - {"connectors"}:
+            raise ValueError("job_shape.execution holds connectors only")
+        ExecutionSelection(connectors=value.get("connectors") or {})
+        return {"connectors": dict(value.get("connectors") or {})}
+
+    @field_validator("workspace")
+    @classmethod
+    def _workspace(cls, value: dict[str, Any] | None) -> dict[str, Any] | None:
+        from orchestrator.services.manifest_workspace_binding import (
+            validate_workspace_selection,
+        )
+
+        return validate_workspace_selection(value)
+
+    def stored(self, primary_connector: str | None) -> dict[str, Any]:
+        shape: dict[str, Any] = {}
+        if self.execution is not None:
+            shape["execution"] = self.execution
+        if "workspace" in self.model_fields_set:
+            shape["workspace"] = self.workspace
+        if primary_connector:
+            shape["primary_connector"] = primary_connector
+        return shape
+
+
 class AutomationCreate(BaseModel):
     """Request body for ``POST /api/automations``.
 
-    v0 only accepts cron triggers; ``trigger_type`` is omitted from the
-    public surface and forced server-side. Event triggers ship in v0.5.
+    ``trigger_type`` is ``cron`` (a schedule; ``cron_expr`` required) or
+    ``live`` (an incoming live session on the ``primary_connector``, an
+    alias in ``job_shape.execution.connectors``; live_session_jobs §4.4).
     """
 
     name: str = Field(..., min_length=1, max_length=200)
     description: str | None = Field(None, max_length=2000)
-    cron_expr: str = Field(..., min_length=1, max_length=200)
+    trigger_type: Literal["cron", "live"] = "cron"
+    cron_expr: str | None = Field(None, min_length=1, max_length=200)
     timezone: str = Field("UTC", max_length=64)
     catchup_window_seconds: int = Field(86400, ge=0, le=7 * 86400)
 
@@ -99,6 +145,8 @@ class AutomationCreate(BaseModel):
     max_fires_per_day: int = Field(100, ge=1, le=10_000)
 
     project_id: str | None = None
+    primary_connector: str | None = Field(None, max_length=63)
+    job_shape: AutomationJobShape | None = None
 
 
 class AutomationUpdate(BaseModel):
@@ -125,6 +173,8 @@ class AutomationUpdate(BaseModel):
     enabled: bool | None = None
     max_chain_depth: int | None = Field(None, ge=1, le=100)
     max_fires_per_day: int | None = Field(None, ge=1, le=10_000)
+    primary_connector: str | None = Field(None, max_length=63)
+    job_shape: AutomationJobShape | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -164,6 +214,84 @@ async def _resolve_automation_or_404(
     raise HTTPException(status_code=404, detail="Automation not found")
 
 
+LIVE_TAKEN = "live_connector_taken"
+
+
+def _live_taken(holder: dict[str, Any]) -> HTTPException:
+    return HTTPException(
+        status_code=409,
+        detail={
+            "code": LIVE_TAKEN,
+            "message": (
+                "Another enabled live automation already listens on this "
+                f"connector: {holder.get('name') or holder.get('id')}"
+            ),
+            "automation_id": str(holder.get("id")),
+            "automation_name": holder.get("name"),
+        },
+    )
+
+
+async def _live_trigger_connector(
+    db: Any,
+    *,
+    owner_id: str,
+    project_id: str | None,
+    primary_connector: str | None,
+    shape: dict[str, Any],
+) -> str:
+    """The connector id a live automation listens on: its primary alias,
+    resolved in the owner's scope, a live connector (a phone line)."""
+    from orchestrator.schemas.execution_selection import ExecutionSelection
+    from orchestrator.services.connector_refs import resolve_execution_connectors
+    from shared.connectors.builtin import spec_for_type
+
+    connectors = (shape.get("execution") or {}).get("connectors") or {}
+    if not primary_connector:
+        raise HTTPException(
+            422, "A live automation names its primary_connector (the line it answers)"
+        )
+    if primary_connector not in connectors:
+        raise HTTPException(
+            422,
+            f"primary_connector {primary_connector!r} is not a key of "
+            "job_shape.execution.connectors",
+        )
+    selection = ExecutionSelection(
+        connectors={primary_connector: connectors[primary_connector]}
+    )
+    ids = await resolve_execution_connectors(
+        db, selection, owner_id=owner_id, project_id=project_id
+    )
+    connector = await db.get_datasource(ids[0]) if ids else None
+    spec = spec_for_type((connector or {}).get("type"))
+    if connector is None or spec is None or not spec.live:
+        raise HTTPException(
+            422, f"primary_connector {primary_connector!r} is not a live connector"
+        )
+    return str(connector["id"])
+
+
+async def _refuse_second_live(
+    db: Any, connector_id: str, *, exclude_id: str | None = None
+) -> None:
+    holder = await db.live_automation_for_connector(connector_id, exclude_id=exclude_id)
+    if holder is not None:
+        raise _live_taken(holder)
+
+
+async def _write_live(db: Any, write: Any, connector_id: str) -> dict[str, Any]:
+    """A write that may enable a live automation: the unique index is the
+    backstop of the pre-check (two saves racing)."""
+    try:
+        return await write()
+    except asyncpg.UniqueViolationError as exc:
+        if getattr(exc, "constraint_name", None) != "uq_automations_live_primary":
+            raise
+        holder = await db.live_automation_for_connector(connector_id) or {}
+        raise _live_taken(holder) from exc
+
+
 # ---------------------------------------------------------------------------
 # CRUD endpoints
 # ---------------------------------------------------------------------------
@@ -184,10 +312,18 @@ async def create_automation(
     create can fire it without an extra round-trip.
     """
     caller = await require_approved_user(request, dependencies.store)
+    live = body.trigger_type == "live"
+    if live and body.cron_expr is not None:
+        raise HTTPException(
+            422, "A live automation fires on an incoming session; it has no cron_expr"
+        )
+    if not live and body.cron_expr is None:
+        raise HTTPException(422, "A scheduled automation needs a cron_expr")
 
     # Boundary validation — surface bad cron / tz as 400s rather than 500s
     try:
-        validate_cron_expr(body.cron_expr)
+        if not live:
+            validate_cron_expr(body.cron_expr)
         validate_timezone(body.timezone)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -228,18 +364,41 @@ async def create_automation(
     except ExpertSelectionError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
+    shape = (body.job_shape or AutomationJobShape()).stored(
+        body.primary_connector if live else None
+    )
+    trigger_connector_id = None
+    if live:
+        trigger_connector_id = await _live_trigger_connector(
+            dependencies.store,
+            owner_id=str(caller["id"]),
+            project_id=body.project_id,
+            primary_connector=body.primary_connector,
+            shape=shape,
+        )
+        if body.enabled:
+            await _refuse_second_live(dependencies.store, trigger_connector_id)
+    elif body.primary_connector is not None or body.job_shape is not None:
+        # A scheduled fire attaches its owner's connector defaults
+        # (services/automations.py); a shape it would ignore is refused.
+        raise HTTPException(
+            422, "primary_connector and job_shape belong to a live automation"
+        )
+
     next_run = (
         compute_initial_next_run(body.cron_expr, body.timezone)
-        if body.enabled
+        if body.enabled and not live
         else None
     )
 
-    row = await dependencies.store.create_automation(
+    create = dependencies.store.create_automation(
         owner_id=str(caller["id"]),
         project_id=body.project_id,
         name=body.name,
         description=body.description,
-        trigger_type="cron",
+        trigger_type=body.trigger_type,
+        trigger_connector_id=trigger_connector_id,
+        job_shape=shape,
         cron_expr=body.cron_expr,
         timezone=body.timezone,
         catchup_window_seconds=body.catchup_window_seconds,
@@ -254,7 +413,11 @@ async def create_automation(
         max_fires_per_day=body.max_fires_per_day,
         next_run_at=next_run,
     )
-    return row
+    if live:
+        return await _write_live(
+            dependencies.store, lambda: create, trigger_connector_id
+        )
+    return await create
 
 
 @router.get("")
@@ -317,6 +480,38 @@ async def update_automation(
     fields = body.model_dump(exclude_unset=True)
     if not fields:
         return row
+    live = row.get("trigger_type") == "live"
+    if live and {"cron_expr", "timezone", "catchup_window_seconds"} & set(fields):
+        raise HTTPException(
+            422, "A live automation fires on an incoming session; it has no schedule"
+        )
+    if not live and {"primary_connector", "job_shape"} & set(fields):
+        raise HTTPException(
+            422, "primary_connector and job_shape belong to a live automation"
+        )
+    trigger_connector_id = (
+        str(row["trigger_connector_id"]) if row.get("trigger_connector_id") else None
+    )
+    if "job_shape" in fields or "primary_connector" in fields:
+        current = dict(row.get("job_shape") or {})
+        primary = fields.pop(
+            "primary_connector", current.get("primary_connector") if live else None
+        )
+        if "job_shape" in fields:
+            shape = (body.job_shape or AutomationJobShape()).stored(primary)
+            fields["job_shape"] = shape
+        else:
+            shape = {**current, "primary_connector": primary}
+            fields["job_shape"] = shape
+        if live:
+            trigger_connector_id = await _live_trigger_connector(
+                dependencies.store,
+                owner_id=str(row["owner_id"]),
+                project_id=str(row["project_id"]) if row.get("project_id") else None,
+                primary_connector=primary,
+                shape=shape,
+            )
+            fields["trigger_connector_id"] = trigger_connector_id
 
     # Same reason as create: this override is replayed into db.create_job on
     # every fire, bypassing the POST /api/jobs validator entirely.
@@ -363,7 +558,21 @@ async def update_automation(
 
     # Recompute next_run_at when the schedule shape or enable state changes.
     # Pull the effective post-patch values from `fields` falling back to row.
+    # A live automation has no schedule: it fires on its connector's sessions.
     schedule_changed = bool({"cron_expr", "timezone", "enabled"} & set(fields))
+    if live:
+        if fields.get("enabled", row["enabled"]) and trigger_connector_id:
+            await _refuse_second_live(
+                dependencies.store, trigger_connector_id, exclude_id=automation_id
+            )
+        return (
+            await _write_live(
+                dependencies.store,
+                lambda: dependencies.store.update_automation(automation_id, **fields),
+                trigger_connector_id or "",
+            )
+            or row
+        )
     if schedule_changed:
         enabled_after = fields.get("enabled", row["enabled"])
         if enabled_after:
@@ -420,6 +629,10 @@ async def run_now(
     row = await _resolve_automation_or_404(
         dependencies.store, automation_id, caller, request, min_project_role="editor"
     )
+    if row.get("trigger_type") == "live":
+        raise HTTPException(
+            409, "A live automation fires on an incoming session on its connector"
+        )
 
     job = await create_job_from_automation(
         dependencies.store, row, trigger_kind="manual"
@@ -490,6 +703,16 @@ async def resume_automation(
     row = await _resolve_automation_or_404(
         dependencies.store, automation_id, caller, request, min_project_role="editor"
     )
+    if row.get("trigger_type") == "live":
+        connector_id = str(row.get("trigger_connector_id") or "")
+        await _refuse_second_live(
+            dependencies.store, connector_id, exclude_id=automation_id
+        )
+        return await _write_live(
+            dependencies.store,
+            lambda: dependencies.store.update_automation(automation_id, enabled=True),
+            connector_id,
+        )
     next_run = compute_initial_next_run(row["cron_expr"], row["timezone"])
     return await dependencies.store.update_automation(
         automation_id,

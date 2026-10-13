@@ -29,7 +29,7 @@ from orchestrator.application import (
     projects as projects_composition,
     sessions as sessions_composition,
     transport as transport_composition,
-    telephony as telephony_composition,
+    live as live_composition,
     workflows as workflows_composition,
     workspace as workspace_composition,
 )
@@ -113,7 +113,7 @@ from orchestrator.routers import (
     vm_resource_inventory as vm_resource_inventory_routes,
     vm_workspace_cleanup_authority as vm_workspace_cleanup_authority_routes,
     voice as voice_routes,
-    telephony as telephony_routes,
+    live as live_routes,
     wopi_router,
     workspace_access as workspace_access_routes,
 )
@@ -140,8 +140,8 @@ from orchestrator.uploads import router as uploads_router
 
 def bind_router_dependencies(app: FastAPI, resources: ApplicationResources) -> None:
     """Publish every router's per-request dependency factory on ``app.state``."""
-    app.state.telephony_dependencies_factory = (
-        lambda: telephony_composition.telephony_dependencies(resources)
+    app.state.live_dependencies_factory = lambda: live_composition.live_dependencies(
+        resources
     )
     app.state.catalogue_resources = resources.catalogue_resources
     app.state.contacts_dependencies = ContactsDependencies(db=resources.postgres_db)
@@ -438,7 +438,7 @@ def include_routers(app: FastAPI) -> None:
     app.include_router(contacts_project_router)
     app.include_router(tables_router)
     app.include_router(preferences_router)
-    app.include_router(telephony_routes.router)
+    app.include_router(live_routes.router)
     app.include_router(job_reads_routes.router)
     app.include_router(provider_catalog_routes.router)
     app.include_router(model_catalog_routes.router)

@@ -396,6 +396,22 @@ class _Bundle:
                 number,
                 (*path, "execution", "connectors", alias),
             )
+        session = execution.get("session")
+        if bool(spec.get("liveSession")) != (session is not None):
+            fail(
+                "LiveSessionMismatch",
+                "A live-session Job (liveSession: true) names its session in "
+                "execution.session, and only such a Job does.",
+                document=number,
+                path=pointer((*path, "execution", "session")),
+            )
+        if session is not None and session["connector"] not in execution["connectors"]:
+            fail(
+                "LiveSessionConnectorUnknown",
+                "execution.session.connector names no key of execution.connectors.",
+                document=number,
+                path=pointer((*path, "execution", "session", "connector")),
+            )
         spec.setdefault("completion", {"mode": "ProcessExit"})
         spec.setdefault("retry", {"maxAttempts": 1})
 

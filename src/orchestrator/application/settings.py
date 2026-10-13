@@ -385,6 +385,9 @@ class DeploymentSettings:
     #: where SRW's connector driver certificate authority is mounted
     #: (``connectors.drivers.ca``), which signs its pods' certificates.
     connector_git_swap_image: str = ""
+    #: The phone-line driver's image (srw.gpt-live-sip/v1); empty: not
+    #: installed (live_session_jobs.md §5.1).
+    connector_gpt_live_sip_image: str = ""
     connector_git_swap_fallback: str = FALLBACK_TOKEN_IN_URL
     connector_driver_ca_dir: str = ""
     #: Provider-minted credentials (C5, ``connectors.providerMinting``):
@@ -546,6 +549,9 @@ class DeploymentSettings:
             ).strip(),
             connector_echo_driver_image=os.environ.get(
                 "CONNECTOR_ECHO_DRIVER_IMAGE", ""
+            ).strip(),
+            connector_gpt_live_sip_image=os.environ.get(
+                "CONNECTOR_GPT_LIVE_SIP_IMAGE", ""
             ).strip(),
             connector_managed_mcp_images={
                 str(name): str(reference).strip()

@@ -225,6 +225,10 @@ def resolve_submitted_job_origin(
     """
     if context and "bench" in context:
         return "bench"
+    if context and context.get("automation_id"):
+        # An automation's fire (a live automation admits through this funnel
+        # as its owner; public bodies cannot carry the reserved key).
+        return "automation"
     if parent_job_id:
         return "subjob"
     if thread_id:
@@ -627,7 +631,14 @@ def job_admission_dependencies(
         delivery=functools.partial(job_admission_delivery_dependencies, resources),
         creation=functools.partial(job_admission_creation_dependencies, resources),
         redact_result=redact_job_config_override,
+        live=functools.partial(_live_admission_dependencies, resources),
     )
+
+
+def _live_admission_dependencies(resources: ApplicationResources):
+    from orchestrator.application.live import live_admission_dependencies
+
+    return live_admission_dependencies(resources)
 
 
 async def create_bench_job(

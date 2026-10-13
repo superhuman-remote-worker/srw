@@ -53,6 +53,13 @@ from orchestrator.services.job_admission_creation import (
     JobAdmissionCreationInputs,
     create_admitted_job,
 )
+from orchestrator.services.live.admission import (
+    CONTEXT_KEY as LIVE_CONTEXT_KEY,
+    LiveAdmissionDependencies,
+    hand_off,
+    prepare_live_session,
+    refuse_session_contradictions,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -70,6 +77,9 @@ class JobAdmissionDependencies:
     delivery: Callable[[], JobAdmissionDeliveryDependencies]
     creation: Callable[[], JobAdmissionCreationDependencies]
     redact_result: Callable[[dict[str, Any]], dict[str, Any]]
+    # A live-session job's session (live_session_jobs §4.2); None where the
+    # composition offers no live connectors (a live job is then refused).
+    live: Callable[[], LiveAdmissionDependencies] | None = None
 
 
 async def admit_job(
@@ -86,6 +96,8 @@ async def admit_job(
         command.config_override
     )
     refuse_connector_selector_conflict(command)
+    if refuse_session_contradictions(command) is not None and dependencies.live is None:
+        raise HTTPException(422, "Live-session jobs are not available here")
     await dependencies.enforce_readiness()
     try:
         scope = await prepare_job_admission_scope(
@@ -151,9 +163,30 @@ async def admit_job(
             # An officer's ticket is unattended: no outbox among its defaults.
             unattended=officer.preparation is not None,
         )
+        live = None
+        context = officer.context
+        if dependencies.live is not None:
+            live_dependencies = dependencies.live()
+            live = await prepare_live_session(
+                command=command,
+                datasource_ids=datasources.datasource_ids,
+                effective_user_id=scope.user_id,
+                project_id=config.project_id,
+                config_name=config.config_name,
+                expert_id=config.expert_id,
+                expert_row=config.expert_row,
+                config_override=officer.config_override,
+                dependencies=live_dependencies,
+            )
+            if live is not None:
+                if officer.preparation is not None:
+                    raise HTTPException(
+                        422, "A live-session job cannot claim an officer ticket"
+                    )
+                context = {**(context or {}), LIVE_CONTEXT_KEY: live.context_value}
         delivery = await prepare_job_admission_delivery(
             command=command,
-            context=officer.context,
+            context=context,
             datasource_ids=datasources.datasource_ids,
             target_project_ids=datasources.target_project_ids,
             officer_preparation=officer.preparation,
@@ -163,7 +196,7 @@ async def admit_job(
         result = await create_admitted_job(
             command=command,
             inputs=JobAdmissionCreationInputs(
-                context=officer.context,
+                context=context,
                 config_name=config.config_name,
                 expert_id=config.expert_id,
                 expert_row=config.expert_row,
@@ -181,9 +214,16 @@ async def admit_job(
                 delivery_contract=delivery,
                 officer_preparation=officer.preparation,
                 ticket_ready_at=officer.ticket_ready_at,
+                on_created=live.on_created if live is not None else None,
             ),
             dependencies=dependencies.creation(),
         )
+        if live is not None:
+            session = await hand_off(live, result, live_dependencies.pods)
+            result[LIVE_CONTEXT_KEY] = {
+                **live.context_value,
+                "status": session.get("status"),
+            }
         return dependencies.redact_result(result)
     except DatasourceMaterializationAuthorizationError as exc:
         raise HTTPException(

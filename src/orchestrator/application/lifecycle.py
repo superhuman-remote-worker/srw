@@ -691,7 +691,7 @@ async def stop_application(
     The drains run after every background task has stopped and before any
     client or store closes, in this fixed order (R1.B12):
 
-    Phone admission and recorder tasks drain first, before dispatch and stores.
+    Live session admissions drain first, before dispatch and stores.
 
     1. dispatch passes and preemptions (``job_dispatch_state``);
     2. KB datasource reindexes (``kb_datasource_tasks``);
@@ -732,7 +732,7 @@ async def stop_application(
     # cancels: it never writes or clears durable intent, such as the
     # attach-abort outcome row the stale-agent detector re-schedules from.
     drains = (
-        ("phone recorders and admission", lambda: resources.telephony_tasks.drain()),
+        ("live session admissions", lambda: resources.live_tasks.drain()),
         ("dispatch passes", lambda: resources.job_dispatch_state.drain()),
         ("KB datasource reindexes", lambda: resources.kb_datasource_tasks.drain()),
         (

@@ -211,6 +211,7 @@ def build_application_resources(
             echo_service_image=settings.connector_echo_driver_image or None,
             managed_mcp_images=settings.connector_managed_mcp_images,
             git_swap_image=connectors_composition.git_swap_image(settings, driver_ca),
+            gpt_live_sip_image=settings.connector_gpt_live_sip_image or None,
         ),
     )
     # Credential leases (connector drivers C2): the window new leases are
@@ -248,6 +249,11 @@ def build_application_resources(
             "The development echo service driver (srw.echo-service/v1) is "
             "installed with image %s; it is for test clusters only",
             settings.connector_echo_driver_image,
+        )
+    if settings.connector_gpt_live_sip_image:
+        logger.info(
+            "The phone-line driver (srw.gpt-live-sip/v1) is installed with image %s",
+            settings.connector_gpt_live_sip_image,
         )
     for name, reference in sorted(settings.connector_managed_mcp_images.items()):
         logger.info("Managed MCP server %s is installed with image %s", name, reference)
