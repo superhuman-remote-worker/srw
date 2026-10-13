@@ -1,0 +1,38 @@
+# =============================================================================
+# srw-driver-gpt-live-sip — SRW's GPT-Live SIP driver (srw.gpt-live-sip/v1)
+# =============================================================================
+# One standing service pod per phone-line connector holds concurrent call
+# sidebands, journals events to the lease exchange and serves agents over
+# HTTP/SSE. One static Go binary (standard library only) on scratch with the
+# CA bundle, run as an unprivileged user; the pod drops every capability.
+# SRW's driver shim starts the entrypoint and command below.
+#
+#   docker build -f docker/Dockerfile.driver-gpt-live-sip -t srw-driver-gpt-live-sip .
+#
+# The Go toolchain is the shim's (docker/Dockerfile.driver-shim): a supported
+# release pinned by digest (bump both together). It runs on the build
+# platform and cross-compiles for the target platform BuildKit names.
+# =============================================================================
+FROM --platform=$BUILDPLATFORM golang:1.26.8-alpine3.24@sha256:8ac98ca534ac3f51e1f420a1dd2c15e74c75cfa0f23f3ad27eb5d7236c349a0c AS build
+
+ARG SRW_SOURCE_REVISION="dev"
+ARG TARGETOS
+ARG TARGETARCH
+
+WORKDIR /src
+COPY drivers/gpt-live-sip/ ./
+RUN set -eu; \
+    test -s /etc/ssl/certs/ca-certificates.crt; \
+    goarch="${TARGETARCH:-$(go env GOARCH)}"; \
+    CGO_ENABLED=0 GOOS="${TARGETOS:-linux}" GOARCH="$goarch" go build -trimpath \
+        -ldflags "-s -w -X main.version=${SRW_SOURCE_REVISION}" \
+        -o /out/srw-gpt-live-sip .; \
+    if [ "$goarch" = "$(go env GOHOSTARCH)" ]; then /out/srw-gpt-live-sip version; fi
+
+FROM scratch
+# OpenAI HTTPS and WSS use the trusted public CA bundle.
+COPY --from=build /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
+COPY --from=build /out/srw-gpt-live-sip /srw-gpt-live-sip
+USER 65532:65532
+ENTRYPOINT ["/srw-gpt-live-sip"]
+CMD ["serve"]
