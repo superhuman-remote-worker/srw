@@ -43,9 +43,37 @@ class TestCreateInitialState:
         state = create_initial_state(job_id="j1", workspace_path="/ws")
         assert state["is_strategic_phase"] is True
 
-    def test_phase_number_starts_at_one(self):
+    def test_phase_number_starts_at_zero_like_the_init_node(self):
+        """Phases count from 0: the initial state and init_strategic_todos
+        agree, so the first phase's todo list, its skill key ("0:strategic"
+        or "0:tactical") and the autonomy boundary all name the same phase."""
+        from unittest.mock import MagicMock
+
+        from agent.graph import create_init_strategic_todos_node
+
         state = create_initial_state(job_id="j1", workspace_path="/ws")
-        assert state["phase_number"] == 1
+        assert state["phase_number"] == 0
+        workspace = MagicMock()
+        workspace.read_file.side_effect = lambda name: "Do the thing."
+        todo = MagicMock()
+        todo.format_for_injection.return_value = ""
+        config = MagicMock()
+        config.extra = {}
+        node = create_init_strategic_todos_node(workspace, todo, config)
+        import agent.graph as graph_mod
+
+        original = graph_mod.get_initial_strategic_todos
+        graph_mod.get_initial_strategic_todos = lambda *a, **k: []
+        try:
+            result = node(state)
+        finally:
+            graph_mod.get_initial_strategic_todos = original
+        assert result["phase_number"] == state["phase_number"]
+        assert todo.phase_number == state["phase_number"]
+
+    def test_live_session_ended_starts_unset(self):
+        state = create_initial_state(job_id="j1", workspace_path="/ws")
+        assert state["live_session_ended"] is None
 
     def test_is_final_phase_false(self):
         state = create_initial_state(job_id="j1", workspace_path="/ws")

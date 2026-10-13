@@ -548,3 +548,54 @@ class TestResolvedConfigSerialization:
         # Use with load_instructions
         result = load_instructions(restored, model="gpt-4o")
         assert result == "instructions"
+
+
+class TestLiveSessionInstructionKeys:
+    """``live_tactical_todos`` / ``live_post_session_todos``: the live-session
+    job's tactical start and post-session phase (live_session_jobs §6.1)."""
+
+    KEYS = ("live_tactical_todos", "live_post_session_todos")
+
+    def test_the_keys_have_framework_defaults(self):
+        import yaml
+
+        from shared.runtime.core.loader import get_project_root
+
+        matrix = yaml.safe_load(
+            (get_project_root() / "config" / "model_config_matrix.yaml").read_text()
+        )
+        for key in self.KEYS:
+            assert InstructionMatrixResolver.HARDCODED_DEFAULTS[key] == f"{key}.yaml"
+            assert matrix["default"]["instructions"][key] == f"{key}.yaml"
+            assert InstructionMatrixResolver().exists(key)
+
+    def test_the_getters_read_the_framework_templates(self):
+        from agent.core.phase import (
+            get_live_post_session_todos,
+            get_live_tactical_todos,
+        )
+
+        (tactical,) = get_live_tactical_todos(None, tool_names=[])
+        assert tactical.content.startswith(
+            "Handle the live session until it ends: wait for the voice "
+            "subagent's questions and answer them."
+        )
+        (review,) = get_live_post_session_todos(None, tool_names=[])
+        assert review.content.startswith(
+            "Review the session (transcript, questions, promises). Do the "
+            "follow-ups, note knowledge gaps, then `job_complete`, or stage the "
+            "next phase."
+        )
+
+    def test_the_keys_are_frozen_and_the_frozen_text_wins(self):
+        from agent.core.phase import get_live_tactical_todos
+
+        config = AgentConfig(agent_id="test", display_name="Test")
+        resolved = serialize_resolved_config(config, model="gpt-4o")
+        for key in self.KEYS:
+            assert resolved["instructions"][key]
+        config.extra["_resolved_instructions"] = {
+            "live_tactical_todos": "todos:\n  - id: 1\n    content: the frozen desk todo"
+        }
+        (todo,) = get_live_tactical_todos(config, tool_names=[])
+        assert todo.content == "the frozen desk todo"

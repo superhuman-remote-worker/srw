@@ -236,3 +236,166 @@ class TestRegistration:
         from agent.tools.core.todo import TODO_TOOLS_METADATA
 
         assert "todo_rewind" not in TODO_TOOLS_METADATA
+
+
+class TestLiveSessionEnd:
+    """The end of a live-session job's session ends its tactical phase like a
+    replan, and the boundary loads the post-session todos (live_session_jobs
+    §6.1)."""
+
+    def _live_tactical(self):
+        mgr = TodoManager(workspace=MagicMock())
+        mgr.set_todos_from_list(
+            [
+                {
+                    "id": "todo_1",
+                    "content": "Handle the live session until it ends.",
+                    "status": "pending",
+                    "priority": "medium",
+                }
+            ]
+        )
+        return mgr
+
+    def test_the_end_parks_a_replan_and_the_reason_together(self):
+        ctx = make_context(make_todo_manager())
+        ctx.end_live_session("remote_hangup")
+
+        assert ctx._replan_request == "live session ended: remote_hangup"
+        assert ctx.consume_live_session_end() == "remote_hangup"
+        # Taking the end takes its replan with it, never an unrelated one.
+        assert ctx.consume_replan_request() is None
+        ctx.request_replan("the agent's own reason")
+        ctx.end_live_session("expired")
+        ctx.request_replan("the agent's own reason")
+        assert ctx.consume_live_session_end() == "expired"
+        assert ctx.consume_replan_request() == "the agent's own reason"
+
+    def test_check_todos_ends_the_tactical_phase_and_sets_the_flag(self):
+        mgr = self._live_tactical()
+        ctx = make_context(mgr)
+        node = create_check_todos_node(mgr, make_config(), tool_context=ctx)
+        state = {"job_id": "job-1", "is_strategic_phase": False, "phase_number": 0}
+
+        assert node(state)["phase_complete"] is False
+        ctx.end_live_session("remote_hangup")
+        result = node(state)
+
+        assert result["phase_complete"] is True
+        assert result["replan_reason"] == "live session ended: remote_hangup"
+        assert result["live_session_ended"] == {
+            "reason": "remote_hangup",
+            "phase_number": 0,
+        }
+        assert len(result["todos"]) == 1  # the live todo stays as it was
+        assert ctx.consume_replan_request() is None
+
+    def test_a_replan_read_before_the_end_still_carries_the_flag(self):
+        """The runtime parks both at once; check_todos may see the replan
+        first, and must not leave the end behind for a later phase."""
+        mgr = self._live_tactical()
+        ctx = make_context(mgr)
+        node = create_check_todos_node(mgr, make_config(), tool_context=ctx)
+        consume = ctx.consume_live_session_end
+        calls = []
+
+        def late_consume():
+            calls.append(1)
+            if len(calls) == 1:
+                ctx.end_live_session("expired")  # parked between the reads
+                return None
+            return consume()
+
+        ctx.consume_live_session_end = late_consume
+        result = node(
+            {"job_id": "job-1", "is_strategic_phase": False, "phase_number": 0}
+        )
+
+        assert result["phase_complete"] is True
+        assert result["live_session_ended"]["reason"] == "expired"
+
+    def test_a_strategic_phase_only_learns_the_news(self):
+        mgr = make_todo_manager(completed=1, total=5)
+        ctx = make_context(mgr)
+        node = create_check_todos_node(mgr, make_config(), tool_context=ctx)
+        ctx.end_live_session("remote_hangup")
+
+        result = node(
+            {"job_id": "job-1", "is_strategic_phase": True, "phase_number": 2}
+        )
+
+        assert result["phase_complete"] is False
+        assert "replan_reason" not in result
+        assert result["live_session_ended"]["phase_number"] == 2
+        (banner,) = result["messages"]
+        assert banner.content.startswith("[LIVE SESSION ENDED: remote_hangup]")
+        assert banner.additional_kwargs.get("_srw_persist_role") == "event"
+        assert ctx.consume_replan_request() is None
+
+    @pytest.mark.asyncio
+    async def test_the_boundary_loads_the_post_session_todos(self):
+        mgr = TodoManager(workspace=MagicMock())
+        node = create_handle_transition_node(
+            MagicMock(), mgr, make_config(), min_todos=5, max_todos=20
+        )
+        result = await node(
+            {
+                "job_id": "job-1",
+                "is_strategic_phase": False,
+                "phase_number": 0,
+                "iteration": 5,
+                "replan_reason": "live session ended: remote_hangup",
+                "live_session_ended": {"reason": "remote_hangup", "phase_number": 0},
+            }
+        )
+
+        assert result["is_strategic_phase"] is True
+        assert result["phase_number"] == 1
+        bodies = [getattr(m, "content", "") for m in result.get("messages", [])]
+        assert bodies[0].startswith("[LIVE SESSION ENDED: remote_hangup]")
+        assert "Current Tasks — Phase 1 (Strategic)" in bodies[0]
+        assert not any("[REPLAN REQUESTED]" in b for b in bodies)
+        assert result.get("replan_reason") is None
+        (todo,) = mgr.list_all()
+        assert todo.content.startswith(
+            "Review the session (transcript, questions, promises)."
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_later_tactical_phase_transitions_as_usual(self):
+        mgr = TodoManager(workspace=MagicMock())
+        node = create_handle_transition_node(
+            MagicMock(), mgr, make_config(), min_todos=5, max_todos=20
+        )
+        result = await node(
+            {
+                "job_id": "job-1",
+                "is_strategic_phase": False,
+                "phase_number": 2,
+                "iteration": 9,
+                "live_session_ended": {"reason": "remote_hangup", "phase_number": 0},
+            }
+        )
+
+        bodies = [getattr(m, "content", "") for m in result.get("messages", [])]
+        assert bodies[0].startswith("[PHASE_TRANSITION] Tactical phase complete")
+        assert not any("LIVE SESSION ENDED" in b for b in bodies)
+
+    def test_a_lost_post_session_list_is_reloaded(self):
+        """A resume that lost the post-session phase's todos reloads them,
+        not the transition template."""
+        mgr = TodoManager(workspace=MagicMock())
+        node = create_check_todos_node(mgr, make_config(), tool_context=None)
+
+        result = node(
+            {
+                "job_id": "job-1",
+                "is_strategic_phase": True,
+                "phase_number": 1,
+                "live_session_ended": {"reason": "expired", "phase_number": 0},
+            }
+        )
+
+        assert result["phase_complete"] is False
+        (todo,) = mgr.list_all()
+        assert todo.content.startswith("Review the session")

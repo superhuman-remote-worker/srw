@@ -2616,3 +2616,45 @@ class TestSubagentContextProbe:
             workspace=workspace_manager,
             todo_manager=TodoManager(workspace_manager),
         )
+
+
+class TestLiveSessionPhaseNumbers:
+    """A live-session job starts tactical at phase 0 (live_session_jobs §6.1);
+    phases count from 0 for every job, so the autonomy boundary and the
+    phase-start skill key name the phase the job is in."""
+
+    def test_partial_freezes_the_first_strategic_phase_either_way(self):
+        from agent.core.phase import should_freeze_at_boundary
+
+        partial = SimpleNamespace(autonomy="partial")
+        # An ordinary job: strategic 0 -> tactical 1 -> strategic 2.
+        assert should_freeze_at_boundary(partial, is_strategic=True, phase_number=0)
+        assert not should_freeze_at_boundary(partial, is_strategic=True, phase_number=2)
+        # A live job: tactical 0 (the session) -> strategic 1 (after it).
+        assert not should_freeze_at_boundary(
+            partial, is_strategic=False, phase_number=0
+        )
+        assert should_freeze_at_boundary(partial, is_strategic=True, phase_number=1)
+        assert not should_freeze_at_boundary(partial, is_strategic=True, phase_number=3)
+        dependent = SimpleNamespace(autonomy="dependent")
+        assert should_freeze_at_boundary(dependent, is_strategic=False, phase_number=0)
+
+    def test_the_live_start_is_the_tactical_phase_instance_zero(self, managers):
+        from shared.runtime.core.message_markers import phase_key_for
+
+        config = MagicMock()
+        config.extra = {"live_session": {"session_id": "s"}}
+        config._deployment_dir = None
+        config.llm.model = ""
+        managers["workspace"].write_file("task_brief.md", "# Live session\n\nGo.")
+        node = create_init_strategic_todos_node(
+            managers["workspace"], managers["todo"], config
+        )
+
+        result = node(create_initial_state(job_id="j", workspace_path="/ws"))
+
+        assert (result["phase_number"], result["is_strategic_phase"]) == (0, False)
+        assert managers["todo"].phase_number == 0
+        assert managers["todo"].is_strategic_phase is False
+        assert phase_key_for(result["phase_number"], "tactical") == "0:tactical"
+        assert "starting in tactical mode" in result["messages"][0].content

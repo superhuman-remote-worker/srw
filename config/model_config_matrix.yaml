@@ -58,6 +58,8 @@ default:
     strategic_todos_initial: strategic_todos_initial.yaml
     strategic_todos_transition: strategic_todos_transition.yaml
     strategic_todos_resume: strategic_todos_resume.yaml
+    live_tactical_todos: live_tactical_todos.yaml
+    live_post_session_todos: live_post_session_todos.yaml
     workspace_template: workspace_template.md
   guardrails:
     file: default.yaml
