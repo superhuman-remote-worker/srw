@@ -258,6 +258,8 @@ def driver_entry(
         "credential_slots": [_slot(slot) for slot in spec.credential_slots],
         "config_schema": public_schema(spec.config_schema),
         "legacy_connection_url": spec.legacy_connection_url,
+        # A live driver's connector receives live sessions (a phone line).
+        "live": spec.live,
         "egress": {
             "declared": {
                 "rules": [_egress_rule(rule) for rule in spec.egress],

@@ -3,6 +3,7 @@ import {
   ConnectorDriver,
   ConnectorDriverMatrix,
   driverForType,
+  liveConnectorDrivers,
   managedConnectorDrivers,
   offeredAccess,
   publicReadWrite,
@@ -177,6 +178,16 @@ describe('driverForType', () => {
     expect(remoteFirst[0].name).toBe('srw.mcp-remote/v1');
     expect(remoteFirst[0].serves_stored_type).toBe(false);
     expect(driverForType(remoteFirst, 'mcp')?.name).toBe('srw.mcp/v1');
+  });
+});
+
+describe('liveConnectorDrivers', () => {
+  it('lists the installed live drivers (a phone line) and nothing else', () => {
+    const [gitea] = managed.drivers;
+    const line = {...gitea, name: 'srw.gpt-live-sip/v1', legacy_type: 'gpt_live_sip', live: true};
+    expect(liveConnectorDrivers([...matrix.drivers, ...managed.drivers, line])).toEqual([line]);
+    expect(liveConnectorDrivers(matrix.drivers)).toEqual([]);
+    expect(liveConnectorDrivers(null)).toEqual([]);
   });
 });
 

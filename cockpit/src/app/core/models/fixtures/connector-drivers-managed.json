@@ -91,6 +91,7 @@
         }
       },
       "legacy_connection_url": "forbidden",
+      "live": false,
       "egress": {
         "declared": {
           "rules": [

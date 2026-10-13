@@ -2969,6 +2969,7 @@
       "typeGroupManaged": "Managed",
       "typeGroupCredentialFiles": "Credential files",
       "typeGroupMcp": "MCP",
+      "typeGroupLive": "Live sessions",
       "optGeneric": "Generic",
       "optRepository": "Repository",
       "optKb": "OKF Knowledge Base",

@@ -54,6 +54,7 @@
         }
       },
       "legacy_connection_url": "forbidden",
+      "live": false,
       "egress": {
         "declared": {
           "rules": [],
@@ -139,6 +140,7 @@
         }
       },
       "legacy_connection_url": "forbidden",
+      "live": false,
       "egress": {
         "declared": {
           "rules": [],
@@ -243,6 +245,7 @@
         }
       },
       "legacy_connection_url": "optional",
+      "live": false,
       "egress": {
         "declared": {
           "rules": [],
@@ -347,6 +350,7 @@
         }
       },
       "legacy_connection_url": "optional",
+      "live": false,
       "egress": {
         "declared": {
           "rules": [],
@@ -540,6 +544,7 @@
         }
       },
       "legacy_connection_url": "required",
+      "live": false,
       "egress": {
         "declared": {
           "rules": [],
@@ -677,6 +682,7 @@
         }
       },
       "legacy_connection_url": "required",
+      "live": false,
       "egress": {
         "declared": {
           "rules": [],
@@ -763,6 +769,7 @@
         }
       },
       "legacy_connection_url": "optional",
+      "live": false,
       "egress": {
         "declared": {
           "rules": [],
@@ -872,6 +879,7 @@
         }
       },
       "legacy_connection_url": "optional",
+      "live": false,
       "egress": {
         "declared": {
           "rules": [],
@@ -961,6 +969,7 @@
         }
       },
       "legacy_connection_url": "optional",
+      "live": false,
       "egress": {
         "declared": {
           "rules": [],
@@ -1073,6 +1082,7 @@
         }
       },
       "legacy_connection_url": "optional",
+      "live": false,
       "egress": {
         "declared": {
           "rules": [],
@@ -1376,6 +1386,7 @@
         }
       },
       "legacy_connection_url": "optional",
+      "live": false,
       "egress": {
         "declared": {
           "rules": [],
@@ -1484,6 +1495,7 @@
         }
       },
       "legacy_connection_url": "required",
+      "live": false,
       "egress": {
         "declared": {
           "rules": [],
@@ -1604,6 +1616,7 @@
         }
       },
       "legacy_connection_url": "required",
+      "live": false,
       "egress": {
         "declared": {
           "rules": [],
@@ -1784,6 +1797,7 @@
         }
       },
       "legacy_connection_url": "optional",
+      "live": false,
       "egress": {
         "declared": {
           "rules": [],
@@ -1950,6 +1964,7 @@
         }
       },
       "legacy_connection_url": "optional",
+      "live": false,
       "egress": {
         "declared": {
           "rules": [],
@@ -2101,6 +2116,7 @@
         }
       },
       "legacy_connection_url": "optional",
+      "live": false,
       "egress": {
         "declared": {
           "rules": [],
@@ -2229,6 +2245,7 @@
         }
       },
       "legacy_connection_url": "forbidden",
+      "live": false,
       "egress": {
         "declared": {
           "rules": [],
@@ -2299,6 +2316,7 @@
         "properties": {}
       },
       "legacy_connection_url": "forbidden",
+      "live": false,
       "egress": {
         "declared": {
           "rules": [],
@@ -2383,6 +2401,7 @@
         }
       },
       "legacy_connection_url": "forbidden",
+      "live": false,
       "egress": {
         "declared": {
           "rules": [],

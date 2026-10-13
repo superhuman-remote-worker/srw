@@ -173,7 +173,19 @@ export class AutomationsPageComponent implements OnInit {
 
   connectorLabel(row: Automation): string {
     const id = row.trigger_connector_id;
-    return this.connectors().find((c) => c.id === id)?.name ?? id ?? '';
+    return (
+      this.connectors().find((c) => c.id === id)?.name ?? (id ? this.lineNames()[id] : undefined) ?? id ?? ''
+    );
+  }
+
+  /** The caller's phone lines by id, for list rows whose line is scoped to a
+   * project the eligible-connector list was not loaded for. */
+  readonly lineNames = signal<Record<string, string>>({});
+
+  private loadLineNames(): void {
+    this.api.getDatasources(undefined, 'gpt_live_sip').subscribe((rows) =>
+      this.lineNames.set(Object.fromEntries(rows.map((row) => [row.id, row.name]))),
+    );
   }
 
   /** Active project filter (from ?project=<uuid>). null when unscoped. */
@@ -234,6 +246,7 @@ export class AutomationsPageComponent implements OnInit {
     // refresh stays scoped via loadByProject.
     const pending = this.route.snapshot.queryParamMap.get('project');
     this.loadConnectors(pending);
+    this.loadLineNames();
     if (pending) {
       this.projectFilter.set(pending);
       this.service.loadByProject(pending);

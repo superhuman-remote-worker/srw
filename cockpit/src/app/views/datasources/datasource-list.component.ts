@@ -39,7 +39,7 @@ import {ActivatedRoute, RouterLink} from '@angular/router';
 import {ConnectorDriversService} from '../../core/services/connector-drivers.service';
 import {
   ConnectorDriver,
-  managedConnectorDrivers,
+  liveConnectorDrivers, managedConnectorDrivers,
   OfferedAccess,
   offeredAccess,
   publicReadWrite,
@@ -279,6 +279,13 @@ type KeyValueRow = {key: string; value: string};
                       <option [value]="driver.legacy_type">{{ 'datasources.filter.' + driver.legacy_type | transloco }}</option>
                     }
                   </optgroup>
+                  @if (liveDrivers().length) {
+                    <optgroup [label]="'datasources.form.typeGroupLive' | transloco">
+                      @for (driver of liveDrivers(); track driver.name) {
+                        <option [value]="driver.legacy_type">{{ 'datasources.filter.' + driver.legacy_type | transloco }}</option>
+                      }
+                    </optgroup>
+                  }
                 </app-select>
               </app-form-field>
             </div>
@@ -2680,6 +2687,7 @@ export class DatasourceListComponent implements OnInit {
    *  own: none has a bespoke section, so the generic form renders its spec
    *  (its config's `access` choice is the driver's own levels). */
   readonly managedDrivers = computed(() => managedConnectorDrivers(this.connectorDrivers.drivers()));
+  readonly liveDrivers = computed(() => liveConnectorDrivers(this.connectorDrivers.drivers()));
 
   /** The installed driver behind the form's type; null until the matrix loads. */
   formDriver(): ConnectorDriver | null {

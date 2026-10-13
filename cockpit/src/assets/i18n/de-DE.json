@@ -2969,6 +2969,7 @@
       "typeGroupManaged": "Verwaltet",
       "typeGroupCredentialFiles": "Anmeldedaten-Dateien",
       "typeGroupMcp": "MCP",
+      "typeGroupLive": "Live-Sitzungen",
       "optGeneric": "Generisch",
       "optRepository": "Repository",
       "optKb": "OKF Knowledge Base",

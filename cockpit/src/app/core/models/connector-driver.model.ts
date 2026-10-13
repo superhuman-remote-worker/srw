@@ -168,6 +168,8 @@ export interface ConnectorDriver {
   config_schema: JsonSchema;
   /** Built-in drivers only: whether the row's connection URL is used. */
   legacy_connection_url: 'required' | 'optional' | 'forbidden';
+  /** A live driver: its connector receives live sessions (a phone line). */
+  live?: boolean;
   egress: {
     declared: {rules: ConnectorEgressRule[]; needs_dns: string | null};
     enforced: ConnectorEgressStatus;
@@ -328,6 +330,16 @@ export function driverForType(
 /** The managed MCP servers this deployment installs (tier `managed`), each
  *  a connector type of its own, in matrix order. None until the matrix
  *  loads: the chart turns each on by naming its image. */
+/** Drivers whose connectors receive live sessions (a phone line): offered in
+ * the connector form's own group when the installation has them. */
+export function liveConnectorDrivers(
+  drivers: readonly ConnectorDriver[] | null | undefined,
+): ConnectorDriver[] {
+  return (drivers ?? []).filter(
+    (driver) => driver.live === true && driver.legacy_type !== null && driver.serves_stored_type,
+  );
+}
+
 export function managedConnectorDrivers(
   drivers: readonly ConnectorDriver[] | null | undefined,
 ): ConnectorDriver[] {

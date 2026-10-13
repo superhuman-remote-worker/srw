@@ -46,6 +46,7 @@ function createComponent(queryParams: Record<string, string> = {}) {
       of([{id: 'scholar', display_name: 'Scholar'}]),
     ),
     getEligibleDatasources: vi.fn().mockReturnValue(of([])),
+    getDatasources: vi.fn().mockReturnValue(of([])),
     getProject: vi.fn().mockReturnValue(of(null)),
   };
 
@@ -465,5 +466,12 @@ describe('live automation rendering', () => {
     service.automations.set([{id: 'a-2', name: 'Scheduled', trigger_type: 'cron', cron_expr: '0 9 * * *', enabled: true}]);
     fixture.detectChanges();
     expect(host.querySelector('.row-actions')?.textContent).toContain(en.automations.list.runNow);
+  });
+
+  it('labels a live row with its line found among the caller\'s phone lines', () => {
+    const {component, apiServiceMock} = createComponent();
+    apiServiceMock.getDatasources.mockReturnValue(of([{id: 'phone-9', name: 'Hotline', type: 'gpt_live_sip'}]));
+    component.ngOnInit();
+    expect(component.connectorLabel({id: 'a-9', trigger_type: 'live', trigger_connector_id: 'phone-9'} as Automation)).toBe('Hotline');
   });
 });
