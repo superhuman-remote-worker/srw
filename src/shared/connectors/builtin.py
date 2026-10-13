@@ -1441,9 +1441,99 @@ GIT_SWAP_SPEC = DriverSpec(
         idle_seconds=3600,
     ),
 )
+# ---------------------------------------------------------------------------
+# Live connectors (live_session_jobs.md §5)
+#
+# A phone line: OpenAI's GPT-Live answers the SIP call; this driver's
+# standing pod accepts it at OpenAI when SRW hands the session over, holds
+# the session's sideband, journals it, applies the no-job fallback and the
+# maximum duration, and serves the job's voice subagent (the agent process,
+# by lease) the session's events and its controls. The pod gets the engine
+# key from the lease exchange with its own identity; nothing secret reaches
+# the agent.
+# ---------------------------------------------------------------------------
+
+GPT_LIVE_SIP_SPEC = DriverSpec(
+    name="srw.gpt-live-sip/v1",
+    legacy_type="gpt_live_sip",
+    title="Phone line (GPT-Live over SIP)",
+    plane="service",
+    delivery_forms=("lease_token",),
+    config_schema={
+        "type": "object",
+        "additionalProperties": False,
+        "required": ["model"],
+        "properties": {
+            # A catalog model id with the live_voice capability.
+            "model": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 500,
+                "x-srw-model-capability": "live_voice",
+            },
+            "max_duration_s": {
+                "type": "integer",
+                "minimum": 60,
+                "maximum": 14400,
+                "default": 900,
+            },
+            "no_job_fallback_s": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 120,
+                "default": 8,
+            },
+            "transfer_target": {
+                "type": "string",
+                "maxLength": 512,
+                "pattern": "^(sip|tel):",
+            },
+            # Server-derived from the model's endpoint: the pod's egress.
+            "api_host": _MIRROR,
+            "api_port": {"type": "integer", "readOnly": True},
+        },
+    },
+    credential_slots=(
+        # Only the SRW webhook path needs it (an external server that
+        # receives the provider's webhook itself does not).
+        CredentialSlot(
+            "webhook_secret",
+            "secret_string",
+            {"type": "object", "properties": {"webhook_secret": _SECRET}},
+            update="replace",
+        ),
+    ),
+    access_levels=(
+        AccessLevel(
+            "Session",
+            0,
+            "The job's voice subagent reads and steers its own session only.",
+        ),
+    ),
+    default_access="Session",
+    supported_backends=ALL_BACKENDS,
+    workspace_requirements=(
+        "None: the job's agent process reaches the line's pod; no workspace is needed."
+    ),
+    egress=(EgressRule("${config.api_host}", ("${config.api_port}",)),),
+    publishable=False,
+    holds_upstream_credentials=True,
+    credential_delivery="lease",
+    service=ServiceSpec(
+        port=8080,
+        callers=("harness",),
+        resources={"limits": {"cpu": "250m", "memory": "128Mi"}},
+        start_seconds=20,
+        standing=True,
+    ),
+    live=True,
+)
+#: Live drivers SRW ships (each off until the chart names its image).
+LIVE_SPECS: tuple[DriverSpec, ...] = (GPT_LIVE_SIP_SPEC,)
+
 #: Service drivers SRW ships as its own images (each off until the chart
 #: names its image).
-OFFICIAL_SERVICE_SPECS: tuple[DriverSpec, ...] = (GIT_SWAP_SPEC,)
+OFFICIAL_SERVICE_SPECS: tuple[DriverSpec, ...] = (GIT_SWAP_SPEC,) + LIVE_SPECS
 
 # ---------------------------------------------------------------------------
 # The main cloud's folders (main_cloud_as_connectors.md, slice 3)
@@ -1733,6 +1823,7 @@ _BY_TYPE: dict[str, DriverSpec] = {
         + MANAGED_MCP_SPECS
         + DEVELOPMENT_SPECS
         + HOSTED_SPECS
+        + LIVE_SPECS
     )
     if spec.legacy_type
 }
