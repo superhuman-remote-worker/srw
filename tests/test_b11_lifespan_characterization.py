@@ -506,7 +506,6 @@ class _NoCapabilities:
 DEFAULT_CREATION = [
     ("run_as_leader", False, None),
     ("NotificationFeedService.run_lifecycle_bridge", False, None),
-    ("Recorder.sweep_loop", False, None),
     ("run_datasource_project_reconciler", False, None),
     ("stale_agent_detector", True, None),
     ("cleanup_expired_tokens", False, None),
@@ -562,7 +561,6 @@ DEFAULT_CREATION = [
 
 DEFAULT_SHUTDOWN = [
     "run_as_leader",
-    "Recorder.sweep_loop",
     "run_datasource_project_reconciler",
     "stale_agent_detector",
     "cleanup_expired_tokens",
