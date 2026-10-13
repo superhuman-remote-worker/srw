@@ -1155,13 +1155,16 @@ class AgentProvisioner:
         *,
         expected_pod_uid: str,
         namespace: str,
+        require_protected_full_terminal: bool = False,
     ) -> bool:
         """Read-only proof for an exact actor that cannot restart in this Pod.
 
         A 404, offline row or terminal phase alone is insufficient. Require
         every declared regular/init/ephemeral container's termination and the
         production Never restart policy, or a deleting Pod that never started
-        its agent. This says nothing about remote writers.
+        its agent. The stricter bound-actor mode excludes that shortcut and
+        requires the captured authority finalizer in the same terminal read.
+        This says nothing about remote writers.
         """
         try:
             state, pod = await self.observe_agent_pod_exact(
@@ -1171,9 +1174,15 @@ class AgentProvisioner:
             return False
         if state != "exact_terminal" or pod is None:
             return False
-        if _deleting_agent_pod_never_started(pod):
+        if not require_protected_full_terminal and _deleting_agent_pod_never_started(
+            pod
+        ):
             return True
         if getattr(getattr(pod, "spec", None), "restart_policy", None) != "Never":
+            return False
+        if require_protected_full_terminal and PINNED_AUTHORITY_FINALIZER not in (
+            getattr(getattr(pod, "metadata", None), "finalizers", None) or []
+        ):
             return False
         if any(
             getattr(condition, "type", None) == "DisruptionTarget"
