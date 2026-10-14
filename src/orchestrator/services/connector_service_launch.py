@@ -313,6 +313,12 @@ def service_request(
         request["mcp"] = mcp.front_config()
     if spec.service.tls:
         request["tls"] = {"cert_file": TLS_CERT_PATH, "key_file": TLS_KEY_PATH}
+    if spec.live:
+        # The token SRW hands a live session to the pod with; derived per
+        # connector, never stored (live_session_jobs.md §5.3).
+        from orchestrator.security.crypto import live_control_token
+
+        request["control"] = {"token": live_control_token(identity.connector_id)}
     return request
 
 

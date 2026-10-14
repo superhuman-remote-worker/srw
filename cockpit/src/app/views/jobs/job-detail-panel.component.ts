@@ -29,8 +29,8 @@ import {isTerminalJobStatus, jobStatusTone} from '../../core/util/job-status';
 import {workspaceLifecycleReasonKey} from '../../core/util/vm-lifecycle';
 import {subagentStatusTone} from '../../core/util/subagent-status';
 import {workspaceCreationMessageKey} from '../../core/util/workspace-creation';
-import {Call} from '../../core/models/call.model';
-import {JobCallPanelComponent} from './job-call-panel.component';
+import {LiveSession} from '../../core/models/live-session.model';
+import {JobLiveSessionPanelComponent} from './job-live-session-panel.component';
 
 /** Own spend, or the whole subtree beneath the job. */
 export type UsageScope = 'job' | 'subtree';
@@ -66,8 +66,8 @@ export interface JobDetailState {
   subjobs: JobSubjob[] | null;
   /** The job's in-process child threads. Null while loading or on failure. */
   subagents: JobSubagent[] | null;
-  /** Null/absent on failed reads; an empty list means this job has no calls. */
-  calls?: Call[] | null;
+  /** Null/absent on failed reads; an empty list means this job has no sessions. */
+  sessions?: LiveSession[] | null;
 }
 
 /**
@@ -264,7 +264,7 @@ export function failureReason(
   selector: 'app-job-detail-panel',
   standalone: true,
   changeDetection: ChangeDetectionStrategy.OnPush,
-  imports: [RouterLink, DatePipe, TranslocoModule, AppBadgeComponent, AppSpinnerComponent, VMCreationWaitComponent, JobCallPanelComponent],
+  imports: [RouterLink, DatePipe, TranslocoModule, AppBadgeComponent, AppSpinnerComponent, VMCreationWaitComponent, JobLiveSessionPanelComponent],
   template: `
     <div class="detail-panel">
       @if (job().description) {
@@ -529,8 +529,8 @@ export function failureReason(
         </div>
       }
 
-      @if (calls().length > 0) {
-        <app-job-call-panel [jobId]="job().id" [calls]="calls()" />
+      @if (sessions().length > 0) {
+        <app-job-live-session-panel [jobId]="job().id" [sessions]="sessions()" />
       }
 
       @if (subagents().length > 0) {
@@ -1042,7 +1042,7 @@ export class JobDetailPanelComponent {
   /** The tree as the server knows it. Empty while loading or after a failure. */
   readonly subjobs = computed<JobSubjob[]>(() => this.data()?.subjobs ?? []);
   readonly subagents = computed<JobSubagent[]>(() => this.data()?.subagents ?? []);
-  readonly calls = computed<Call[]>(() => this.data()?.calls ?? []);
+  readonly sessions = computed<LiveSession[]>(() => this.data()?.sessions ?? []);
 
   /** Subjobs still able to move on their own. */
   readonly liveCount = computed(() => liveSubjobCount(this.subjobs()));

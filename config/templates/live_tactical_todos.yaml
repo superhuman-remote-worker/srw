@@ -1,0 +1,26 @@
+# Todos of a live-session job's first phase, which is tactical
+# (live_session_jobs §6.1).
+#
+# The job starts with its session already running: the history begins with the
+# delegate_agent call that attached the voice subagent, and its receipt (the
+# handle is in the receipt). The session's end closes this phase whatever the
+# todo's status, and the post-session phase (live_post_session_todos.yaml)
+# follows. An expert may override this file for its own desk.
+todos:
+  - id: 1
+    content: >-
+      Handle the live session until it ends: wait for the voice subagent's
+      questions and answer them.
+
+      Loop: call wait_agent on the voice subagent's handle (see the
+      delegate_agent receipt above).
+      - result "question": answer it at once with message_agent(handle,
+        message=<what the voice should tell the caller>,
+        reply_to=<question.delegation_id>). Look things up or act first if the
+        answer needs it; answer before answer_by, with a short holding message
+        first if you need longer.
+      - result "timeout": the session is still running; wait again.
+      - result "ready": the session has ended; this phase ends with it.
+
+      COMPLETION CRITERIA: the session has ended. Its end closes this phase;
+      do not complete this todo while the session is still running.

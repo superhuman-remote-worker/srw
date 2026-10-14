@@ -48,6 +48,7 @@ const modelService = {
   searchModels: signal(helperModels),
   fetchModels: signal(helperModels.slice(0, 1)),
   rerankModels: signal([]),
+  liveVoiceModels: signal([{id: 'gpt-live-1', label: 'GPT-Live', configured: true}]),
   load: vi.fn(),
 };
 
@@ -79,6 +80,18 @@ describe('AdminDefaultsComponent search providers', () => {
     TestBed.overrideComponent(AdminDefaultsComponent, {
       set: {imports: [TranslocoPipe], schemas: [CUSTOM_ELEMENTS_SCHEMA]},
     });
+  });
+
+  it('offers an optional live voice default from its helper bucket', () => {
+    const fixture = TestBed.createComponent(AdminDefaultsComponent);
+    fixture.detectChanges();
+    const fields = Array.from((fixture.nativeElement as HTMLElement).querySelectorAll('app-form-field'));
+    const live = fields.find((field) => (field as unknown as {label: string}).label === 'Live voice');
+    expect(live).toBeDefined();
+    expect(live?.querySelector('option[value=""]')?.textContent?.trim()).toBe('None');
+    expect(live?.querySelector('option[value="gpt-live-1"]')?.textContent?.trim()).toBe('GPT-Live');
+    fixture.componentInstance.setDefault('live_voice', 'gpt-live-1');
+    expect(setDefault).toHaveBeenCalledWith('live_voice', 'gpt-live-1');
   });
 
   it('offers an explicit None fallback and round-trips clearing it', () => {

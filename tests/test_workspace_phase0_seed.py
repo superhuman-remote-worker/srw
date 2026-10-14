@@ -1096,3 +1096,38 @@ class TestResumeWithoutCheckpointTripwire:
         assert "'paused'" in errors[0].getMessage()
         agent._hydrate_job_brief.assert_awaited_once_with("job-1")
         agent._commit_workspace_seed.assert_called_once_with("job-1")
+
+
+class TestFreshWorkspaceInit:
+    """A job repository is cloned only where there is a shell to clone with.
+
+    Admission gives every root job a job repository, a live-session job with
+    workspace backend ``none`` included; a lite tier must not try to clone it
+    (the clone refuses to fall back to a disconnected ``git init``).
+    """
+
+    REPOS = {"repositories": [{"name": "job-1", "url": "http://gitea/job-1.git"}]}
+
+    def _agent(self, backend):
+        ws = MagicMock()
+        config = SimpleNamespace(workspace=SimpleNamespace(backend=backend))
+        return _bare_agent(ws, config=config), ws
+
+    @pytest.mark.parametrize("backend", ["none", "virtual"])
+    def test_a_lite_tier_never_clones_its_job_repo(self, backend):
+        agent, ws = self._agent(backend)
+        agent._initialize_fresh_workspace(dict(self.REPOS))
+        ws.initialize.assert_called_once_with()
+        ws.initialize_project_workspace.assert_not_called()
+
+    @pytest.mark.parametrize("backend", ["sandbox", "vm"])
+    def test_a_workspace_with_a_shell_clones_it(self, backend):
+        agent, ws = self._agent(backend)
+        agent._initialize_fresh_workspace(dict(self.REPOS))
+        ws.initialize_project_workspace.assert_called_once_with()
+        ws.initialize.assert_not_called()
+
+    def test_no_repositories_means_a_plain_init(self):
+        agent, ws = self._agent("sandbox")
+        agent._initialize_fresh_workspace({})
+        ws.initialize.assert_called_once_with()

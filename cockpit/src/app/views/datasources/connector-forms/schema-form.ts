@@ -60,6 +60,7 @@ export interface FormNode {
   secret: boolean;
   defaultValue: unknown;
   widget: TextWidget;
+  modelCapability: string | null;
   nullable: boolean;
   pattern: string | null;
   integer: boolean;
@@ -163,6 +164,7 @@ function blankNode(fields: Partial<FormNode>): FormNode {
     secret: false,
     defaultValue: undefined,
     widget: 'input',
+    modelCapability: null,
     nullable: false,
     pattern: null,
     integer: false,
@@ -219,6 +221,7 @@ export function parseSchema(
     required,
     secret,
     defaultValue: schema.default,
+    modelCapability: schema['x-srw-model-capability'] ?? null,
   });
   if (schema['x-srw-widget'] === 'json') return base;
   if (schema.const !== undefined) return {...base, kind: 'const', value: schema.const};

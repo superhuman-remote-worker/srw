@@ -2047,6 +2047,20 @@ spec:
             - name: CONNECTOR_MCP_FRONT_IMAGE
               value: {{ include "srw.imageRef" (dict "image" .Values.connectors.drivers.mcpFront.image) | quote }}
             {{- end }}
+            # The phone-line driver (srw.gpt-live-sip/v1, live-session jobs).
+            {{- with .Values.connectors.drivers.gptLiveSip }}
+            {{- if .enabled }}
+            {{- if not $.Values.connectors.servicePods.enabled }}
+            {{- fail "connectors.drivers.gptLiveSip.enabled needs connectors.servicePods.enabled: the phone-line driver is a service-plane driver" }}
+            {{- end }}
+            {{- if not .image.repository }}
+            {{- fail "connectors.drivers.gptLiveSip.enabled needs connectors.drivers.gptLiveSip.image.repository" }}
+            {{- end }}
+            # A digest pins it (tag@digest; CI stamps it), a tag alone follows.
+            - name: CONNECTOR_GPT_LIVE_SIP_IMAGE
+              value: {{ printf "%s:%s%s" .image.repository (.image.tag | default "latest") (ternary (printf "@%s" .image.digest) "" (ne (.image.digest | default "") "")) | quote }}
+            {{- end }}
+            {{- end }}
             # The git swap driver (connector drivers C3): what a token
             # repository it cannot serve gets (always rendered: it applies
             # with the driver off too), and, when it is on, its image and

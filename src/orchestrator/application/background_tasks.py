@@ -21,7 +21,6 @@ from orchestrator.application import (
     jobs as jobs_composition,
     projects as projects_composition,
     transport as transport_composition,
-    telephony as telephony_composition,
     workflows as workflows_composition,
     workspace as workspace_composition,
 )
@@ -94,7 +93,6 @@ logger = logging.getLogger(__name__)
 
 BACKGROUND_TASK_SHUTDOWN_ORDER: tuple[str, ...] = (
     "leader",
-    "telephony_recorder_sweep",
     "infrastructure_inventory_generation",
     "datasource_reconciliation",
     "stale_detector",
@@ -240,11 +238,6 @@ async def start_background_tasks(
         ),
     )
     await asyncio.wait_for(notification_feed.lifecycle_bridge_ready.wait(), timeout=10)
-
-    tasks.start(
-        "telephony_recorder_sweep",
-        telephony_composition.recorder(resources).sweep_loop(resources.shutdown_event),
-    )
 
     async def _inventory_generation_coro(stop: asyncio.Event) -> None:
         generation = get_leader_generation()

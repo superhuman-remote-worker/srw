@@ -444,6 +444,18 @@ class ConnectorLeaseExchange:
                 "connector_id": str(UUID(str(row["connector_id"]))),
                 "access": str(row["access"]),
                 "expires_at": row["expires_at"].isoformat(),
+                # The execution holding the lease: a live connector's pod
+                # serves a job only its own session (live_session_jobs §5.4).
+                "job_id": (
+                    str(row["lease_job_id"])
+                    if row["lease_job_id"] is not None
+                    else None
+                ),
+                "thread_id": (
+                    str(row["lease_thread_id"])
+                    if row["lease_thread_id"] is not None
+                    else None
+                ),
             },
         )
 

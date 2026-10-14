@@ -1899,6 +1899,10 @@ class InstructionMatrixResolver(MatrixResolver):
         "strategic_todos_initial": "strategic_todos_initial.yaml",
         "strategic_todos_transition": "strategic_todos_transition.yaml",
         "strategic_todos_resume": "strategic_todos_resume.yaml",
+        # Live-session jobs: the tactical first phase, and the strategic phase
+        # after the session ended (live_session_jobs §6.1).
+        "live_tactical_todos": "live_tactical_todos.yaml",
+        "live_post_session_todos": "live_post_session_todos.yaml",
         "workspace_template": "workspace_template.md",
     }
 
@@ -2457,8 +2461,9 @@ class PhaseSettings:
     min_todos: int = 5  # Minimum todos required for strategic->tactical transition
     max_todos: int = 20  # Maximum todos allowed for strategic->tactical transition
     #: Tactical-only tools this expert may also call in the strategic phase.
-    #: For an expert whose strategic phase is live work (the phone desk answers
-    #: a caller from its datasources before it ever plans).
+    #: For an expert whose strategic phase acts, not only plans (the voice
+    #: desk does a live session's follow-ups with its datasource tools in the
+    #: strategic phase after the session).
     strategic_tools: List[str] = field(default_factory=list)
 
 
@@ -7283,6 +7288,63 @@ def get_resume_strategic_todos_from_config(
         }
         for t in raw_todos
     ]
+
+
+def _instruction_todos_from_config(
+    instruction_type: str,
+    config: Optional["AgentConfig"],
+    tool_names: Optional[List[str]],
+) -> List[Dict[str, Any]]:
+    """One todo-list instruction (``<type>.yaml``) in TodoManager format.
+
+    Frozen content (``_resolved_instructions``) wins, then the expert's file,
+    then the framework template; ``[]`` when none exists.
+    """
+    deployment_dir = config._deployment_dir if config else None
+    model = config.llm.model if config else ""
+    resolved_content = None
+    if config:
+        resolved = config.extra.get("_resolved_instructions", {}) or {}
+        resolved_content = resolved.get(instruction_type)
+    try:
+        raw_todos = load_strategic_todos_template(
+            f"{instruction_type}.yaml",
+            deployment_dir=deployment_dir,
+            model=model,
+            resolved_content=resolved_content,
+            tool_names=tool_names,
+        )
+    except FileNotFoundError:
+        logger.warning(
+            f"{instruction_type}.yaml not found, using empty list. Create "
+            f"config/templates/{instruction_type}.yaml or an expert override."
+        )
+        return []
+    return [
+        {
+            "id": f"todo_{t['id']}",
+            "content": t["content"],
+            "status": "pending",
+            "priority": "medium",
+        }
+        for t in raw_todos
+    ]
+
+
+def get_live_tactical_todos_from_config(
+    config: Optional["AgentConfig"] = None,
+    tool_names: Optional[List[str]] = None,
+) -> List[Dict[str, Any]]:
+    """Todos of a live-session job's tactical first phase (``live_tactical_todos``)."""
+    return _instruction_todos_from_config("live_tactical_todos", config, tool_names)
+
+
+def get_live_post_session_todos_from_config(
+    config: Optional["AgentConfig"] = None,
+    tool_names: Optional[List[str]] = None,
+) -> List[Dict[str, Any]]:
+    """Todos of the strategic phase after a live session (``live_post_session_todos``)."""
+    return _instruction_todos_from_config("live_post_session_todos", config, tool_names)
 
 
 # =============================================================================

@@ -1390,8 +1390,7 @@ class UniversalAgent:
                     await self._recover_subagent_orphans()
                     if worker_terminal_state is not None:
                         return worker_terminal_state
-                    if graph_input is not None:
-                        await self._attach_job_call()
+                    await self._attach_live_session(graph_input, thread_config)
                     final_state = await self._graph.ainvoke(
                         graph_input,
                         config=thread_config,
@@ -2284,31 +2283,63 @@ class UniversalAgent:
             ) from exc
         self._subagent_recovered_runtime = runtime
 
-    async def _attach_job_call(self) -> None:
-        """A phone-mode job: start its live call as the ``phone`` subagent.
+    async def _attach_live_session(
+        self, graph_input: Optional[Dict[str, Any]], thread_config: Any
+    ) -> None:
+        """A live-session job: attach its session as the voice subagent.
 
-        Fresh starts only (a resumed job's call child was settled by orphan
-        recovery; the orchestrator's recorder covers the call meanwhile). The
-        resulting ``delegate_agent`` exchange is seeded into the history by
-        ``init_strategic_todos``.
+        Runs right after ``_recover_subagent_orphans()``. A fresh start seeds
+        the resulting ``delegate_agent`` exchange into the history through
+        ``init_strategic_todos``. A resume attaches a new run when the
+        checkpoint has not taken in the session's end (``live_session_ended``):
+        orphan recovery superseded the old run, and the new one reads the
+        session's journal from the start — it reconnects to a running
+        session, or settles at once from the journal of an ended one, which
+        turns the job strategic. The runtime tells the agent which handle
+        replaced which (its status block), so the history is not reseeded.
         """
 
         context = getattr(self, "_tool_context", None)
-        if context is None:
+        config = getattr(context, "config", None)
+        if context is None or not isinstance(config, dict):
             return
-        from agent.subagents.phone import attach_job_call
+        from agent.subagents.live import attach_live_session, live_session_block
 
+        if live_session_block(config) is None:
+            return
+        if graph_input is None:
+            try:
+                snapshot = await self._graph.aget_state(thread_config)
+                values = getattr(snapshot, "values", None) or {}
+            except Exception:
+                logger.warning(
+                    "[%s] could not read the checkpoint before the live re-attach",
+                    self._current_job_id,
+                    exc_info=True,
+                )
+                values = {}
+            if values.get("live_session_ended"):
+                return
         try:
-            exchange = await attach_job_call(context)
+            exchange = await attach_live_session(context)
         except asyncio.CancelledError:
             raise
         except Exception:
             logger.exception(
-                "[%s] could not attach the phone call; the recorder covers it",
+                "[%s] could not attach the live session; its connector covers it",
                 self._current_job_id,
             )
+            end = getattr(context, "end_live_session", None)
+            if callable(end):
+                end("the voice subagent could not start")
             return
-        context._initial_tool_exchange = exchange
+        if graph_input is not None:
+            context._initial_tool_exchange = exchange
+        elif exchange is not None:
+            logger.info(
+                "[%s] Reconnected to the live session after a restart",
+                self._current_job_id,
+            )
 
     async def _quiesce_subagent_runtime(self, reason: str) -> None:
         """Settle a claim's children once while parent authority is current."""
@@ -2630,8 +2661,7 @@ class UniversalAgent:
             # resumed checkpoint may enter directly at a provider/tool node and
             # cannot be allowed to race predecessor child generations.
             await self._recover_subagent_orphans()
-            if graph_input is not None:
-                await self._attach_job_call()
+            await self._attach_live_session(graph_input, config)
             # At most one in-process upgrade per run: virtual → sandbox flips the
             # backend to supports_shell=True, after which the request tool drops
             # out and the supports_shell guard below short-circuits anyway.
@@ -3217,6 +3247,24 @@ class UniversalAgent:
                 )
 
         return False
+
+    def _initialize_fresh_workspace(self, metadata: Dict[str, Any]) -> None:
+        """Lay out a fresh workspace: clone the job's repositories, or not.
+
+        A lite tier (virtual/none) has no shell to clone with, and its git
+        versioning is already forced off for the same reason. Admission gives
+        every root job a job repository, a live-session job without a
+        workspace included, so its repositories are left alone here.
+        """
+        from agent.core.backends.factory import LITE_BACKENDS
+
+        if (
+            metadata.get("repositories")
+            and self.config.workspace.backend not in LITE_BACKENDS
+        ):
+            self._workspace_manager.initialize_project_workspace()
+        else:
+            self._workspace_manager.initialize()
 
     async def _setup_job_workspace(
         self,
@@ -4019,10 +4067,7 @@ class UniversalAgent:
                 f"reattached tree, no clonable job repo, and no phase "
                 f"snapshot; starting from an empty workspace"
             )
-        if metadata.get("repositories"):
-            self._workspace_manager.initialize_project_workspace()
-        else:
-            self._workspace_manager.initialize()
+        self._initialize_fresh_workspace(metadata)
 
         # instructions.md / task_brief.md are virtual
         # (knowledge-base/knowledge/features/virtual_directories.md): served live by providers
@@ -4455,6 +4500,16 @@ class UniversalAgent:
             _job_metadata=job_metadata,
         )
         context.project_ids = native_project_ids
+        # A live-session job's voice subagent authenticates to its connector's
+        # pod with the job's lease, read from the payload here, in process: the
+        # lease_token builder delivers nothing for a live driver.
+        live_session = tool_config.get("live_session")
+        if isinstance(live_session, dict):
+            from agent.subagents.live import live_lease_from_payload
+
+            context._live_lease = live_lease_from_payload(
+                ds_configs, str(live_session.get("connector_id") or "")
+            )
 
         # Progress durability. Phase boundaries used to be the only thing that
         # pushed the workspace to its remote, which made every external view of

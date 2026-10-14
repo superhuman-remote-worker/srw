@@ -222,6 +222,33 @@ def test_a_malformed_entry_never_raises(entry):
     assert descriptor.name == "unnamed"
 
 
+def test_a_live_connector_s_lease_never_reaches_the_workspace():
+    """A live driver's lease belongs to the job's voice subagent, which reads
+    it from the payload in process (``agent.subagents.live``): a live job may
+    have no workspace, and the token never belongs in one. An ordinary lease
+    driver still materializes its token."""
+
+    def entry(legacy_type: str) -> dict[str, Any]:
+        return {
+            "datasource_id": "conn-1",
+            "type": legacy_type,
+            "name": "line",
+            "connection_url": "http://srw-ep-line:8080",
+            "credentials": {
+                "lease": {"id": "l-1", "connector_id": "conn-1", "token": "scl_x"}
+            },
+        }
+
+    assert spec_for_type("gpt_live_sip").live
+    live = binding_from_legacy_entry(entry("gpt_live_sip"))
+    assert live is not None and live.entries == ()
+    assert live.connector_id == "conn-1"
+    (delivery,) = deliveries_from_payload([entry("gpt_live_sip")])
+    assert delivery.binding.entries == ()
+    probe = binding_from_legacy_entry(entry("lease_probe"))
+    assert [item.form for item in probe.entries] == ["lease_token"]
+
+
 def test_a_type_no_driver_serves_has_no_descriptor():
     assert binding_from_legacy_entry({"type": "redis", "name": "Cache"}) is None
     (delivery,) = deliveries_from_payload([{"type": "redis", "name": "Cache"}])

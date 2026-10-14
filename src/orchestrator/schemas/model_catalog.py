@@ -1,7 +1,7 @@
 """Curated model catalogue request contracts and capability vocabulary."""
 
 from typing import Any, Literal
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 
 LLM_MODEL_CAPABILITIES = (
@@ -14,6 +14,7 @@ LLM_MODEL_CAPABILITIES = (
     "search",
     "fetch",
     "rerank",
+    "live_voice",
 )
 
 
@@ -24,6 +25,10 @@ LLM_MODEL_CAPABILITIES = (
 # migration 0240). It is wired like ``embedding`` — required by the readiness
 # gate, one default pin, flat ``RERANK_*`` env at dispatch — until embedding
 # and rerank become optional together.
+# ``live_voice`` is a full-duplex voice model (GPT-Live; migration 0536). A
+# phone-line connector names it; it is never bound as a chat model, never
+# required by readiness and never injected at dispatch. It is the row's only
+# capability (see :func:`live_voice_capability_problem`).
 VALID_CATALOG_CAPABILITIES = (
     "chat",
     "auxiliary",
@@ -34,6 +39,7 @@ VALID_CATALOG_CAPABILITIES = (
     "search",
     "fetch",
     "rerank",
+    "live_voice",
 )
 
 
@@ -50,7 +56,21 @@ CatalogCapabilityLiteral = Literal[
     "search",
     "fetch",
     "rerank",
+    "live_voice",
 ]
+
+
+def live_voice_capability_problem(capabilities: list[str] | None) -> str | None:
+    """Why a capability set that claims ``live_voice`` contradicts itself.
+
+    A live voice model speaks to a caller over a transport; it cannot also
+    serve as a chat, embedding or any other slot, so ``live_voice`` is the
+    row's only capability.
+    """
+    caps = list(capabilities or [])
+    if "live_voice" in caps and len(set(caps)) > 1:
+        return "live_voice must be the only capability of a catalog row"
+    return None
 
 
 class CatalogModelCreate(BaseModel):
@@ -111,6 +131,14 @@ class CatalogModelCreate(BaseModel):
     enabled: bool = True
     notes: str | None = None
 
+    @field_validator("capabilities")
+    @classmethod
+    def _live_voice_alone(cls, value: list[str]) -> list[str]:
+        problem = live_voice_capability_problem(value)
+        if problem:
+            raise ValueError(problem)
+        return value
+
 
 class CatalogModelUpdate(BaseModel):
     """Partial update — only fields explicitly set in the request body are
@@ -128,3 +156,11 @@ class CatalogModelUpdate(BaseModel):
     params_json: dict[str, Any] | None = None
     enabled: bool | None = None
     notes: str | None = None
+
+    @field_validator("capabilities")
+    @classmethod
+    def _live_voice_alone(cls, value: list[str] | None) -> list[str] | None:
+        problem = live_voice_capability_problem(value)
+        if problem:
+            raise ValueError(problem)
+        return value

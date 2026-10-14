@@ -344,7 +344,8 @@ export type DatasourceType =
   // creates these for what it provisions; no form creates one.
   | 'cloud_folder'
   | 'cloud_folder_checkout'
-  | 'cloud_outbox';
+  | 'cloud_outbox'
+  | 'gpt_live_sip';
 
 /**
  * Access tier for an ``email`` datasource (see knowledge-base/knowledge/features/email_datasource.md).
@@ -808,7 +809,8 @@ export type LlmModelCapability =
   | 'tts'
   | 'search'
   | 'fetch'
-  | 'rerank';
+  | 'rerank'
+  | 'live_voice';
 
 /**
  * A user-registered OpenAI-compatible LLM endpoint. Models attached to this
@@ -943,14 +945,15 @@ export type CatalogCapability =
   | 'tts'
   | 'search'
   | 'fetch'
-  | 'rerank';
+  | 'rerank'
+  | 'live_voice';
 
 /** Provider anchor for a catalog row. */
 export type CatalogProviderKind = 'system' | 'endpoint';
 
 export const CATALOG_CAPABILITIES: CatalogCapability[] = [
   'chat', 'auxiliary', 'embedding', 'vision', 'whisper', 'tts', 'search', 'fetch',
-  'rerank',
+  'rerank', 'live_voice',
 ];
 
 /**
@@ -2656,6 +2659,8 @@ export interface JobCreateRequest {
   priority?: number;
   /** Deployment-gated execution selection; stateless requires a supported workspace. */
   execution_lane?: 'pinned' | 'stateless';
+  /** Start inside a live session (needs execution.session; set by live automations). */
+  live_session?: boolean;
 }
 
 /**

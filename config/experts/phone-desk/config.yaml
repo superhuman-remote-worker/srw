@@ -6,11 +6,11 @@ metadata:
     kind: Catalog
     name: shared
   annotations:
-    srw.io/display-name: Phone Desk
-    srw.io/description: 'Back office for one live phone call. A voice assistant
-      talks to the caller; this worker answers the questions the voice hands it
-      while the call lasts, then carries out the follow-ups. Started by the
-      phone line, not by hand.'
+    srw.io/display-name: Voice Desk
+    srw.io/description: 'Back office for one live voice session, such as a call
+      on a phone line. A voice assistant talks to the caller; this worker answers
+      the questions the voice hands it while the session lasts, then carries out
+      the follow-ups. Started by its live connector, not by hand.'
     srw.io/icon: call
     srw.io/color: '#94e2d5'
     srw.io/expert-type: worker
@@ -19,8 +19,8 @@ metadata:
   - phone
   - worker
 spec:
-  # A call needs no repository and no workspace files: answers come from the
-  # line's fact sheet, the project knowledge base and the attached datasources.
+  # A voice desk needs no repository and no workspace files: answers come from
+  # the voice's facts, the project knowledge base and the attached datasources.
   workspacePreference: {backend: none}
   runtime:
     adapter: srw/v1
@@ -28,24 +28,28 @@ spec:
       config_name: worker_base
       asset_name: phone-desk
       config:
-        # Phone Desk — the job a phone line starts for each call.
+        # Voice Desk — a generic example of a live-session job's expert.
         #
-        # The orchestrator accepts the call (GPT-Live) and creates this job with
-        # config.telephony (the call and its credentials). At job start the
-        # agent attaches the call as the background subagent `phone` and seeds
-        # the history with that delegate_agent call and its receipt; the job
-        # then answers the call's questions through wait_agent/message_agent.
-        # Design: knowledge-base/knowledge/features/phone_calls_as_subagents.md
-        # §4.4.1 and §7.1 P4.
+        # A live connector (a phone line) receives the session; the
+        # orchestrator admits a job for it with config.live_session and hands
+        # the session to the connector's pod, which speaks with the caller
+        # through the voice engine using the `voice` entry's `live` block. The
+        # job starts tactical with that entry attached as its voice subagent
+        # (the history begins with the delegate_agent call and its receipt),
+        # answers the voice's questions through wait_agent/message_agent until
+        # the session ends, and then turns strategic for the follow-ups.
+        # Design: knowledge-base/knowledge/features/live_session_jobs.md §6.
+        # A real desk (its persona, greeting and facts) is a DB expert built
+        # from this one; customer content never lives in this repository.
         $extends: worker_base
 
         agent_id: phone-desk
-        display_name: Phone Desk
+        display_name: Voice Desk
         description: |
-          Back office for one live phone call. A voice assistant talks to the
-          caller; this worker answers the questions the voice hands it while the
-          call lasts, then carries out the follow-ups. Started by the phone line,
-          not by hand.
+          Back office for one live voice session, such as a call on a phone
+          line. A voice assistant talks to the caller; this worker answers the
+          questions the voice hands it while the session lasts, then carries
+          out the follow-ups. Started by its live connector, not by hand.
         icon: call
         color: "#94e2d5"
         tags:
@@ -63,9 +67,8 @@ spec:
           enabled: true
           max_concurrent: 2
 
-        # The live call is the strategic phase (the first todo), and the
-        # caller cannot wait for a phase switch: the datasource tools answer
-        # "when is my appointment?" and do "cancel it" while the call lasts.
+        # The follow-ups happen in the strategic phase after the session
+        # (live_post_session_todos): open the datasource tools there too.
         phase_settings:
           strategic_tools:
             - sql_schema
@@ -85,23 +88,37 @@ spec:
             enforce: false
 
         subagents:
-          default: phone
           roster:
-            phone:
+            voice:
               description: >-
-                The live phone call this job was started for. A voice assistant
-                talks to the caller; wait_agent returns its questions, and
-                message_agent(reply_to=...) speaks your answer. Attached at job
-                start; never start a second one.
-              # Not an LLM child: the subagent runtime drives it with the phone
-              # driver (agent/subagents/phone.py) on the job's call.
-              driver: phone
+                The live voice session this job was started for. A voice
+                assistant talks to the caller; wait_agent returns its questions,
+                message_agent(reply_to=...) speaks your answer, and stop_agent
+                ends the session. Attached by the session; never delegate it.
+              # Not an LLM child: the subagent runtime drives it with the live
+              # driver (agent/subagents/live.py) on the job's session.
+              driver: live
               isolation: shared
               write_policy: none
               llm:
                 model: inherit
               limits:
                 return_budget_tokens: 6000
+              # The voice itself: the orchestrator turns this block into the
+              # session's instructions and greeting (live_session_jobs §6.4).
+              live:
+                persona: >-
+                  You are the voice assistant of a service desk. You are an AI
+                  assistant and say so when asked. Speak briefly and warmly, one
+                  question at a time, in the caller's language.
+                facts: >-
+                  You can take a message, arrange a call back, or put the caller
+                  through to a person. Hand everything else to the back office:
+                  questions about the caller's own records, requests to change
+                  something, and anything these facts do not answer.
+                greeting: Hello, you are speaking with an AI assistant. How can I help?
+                voice: marin
+                answer_timeout_s: 25
 
         # A caller is waiting: the back office answers from the knowledge base
         # and the project's datasources (their SQL tools are added when a

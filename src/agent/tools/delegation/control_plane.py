@@ -70,23 +70,24 @@ def create_control_plane_tools(context: ToolContext) -> List[Any]:
             description=(
                 "A concise follow-up or correction for the child. Include "
                 "enough context to act without reading the parent transcript. "
-                "For a phone call: what the voice should tell the caller, in "
-                "plain words."
+                "For a live voice subagent: what the voice should tell the "
+                "caller, in plain words."
             ),
         )
         reply_to: Optional[str] = Field(
             default=None,
             description=(
-                "Phone calls only: the delegation_id of the question this "
-                "message answers (from wait_agent). Omit to steer the call "
-                "instead."
+                "Live voice subagents only: the delegation_id of the question "
+                "this message answers (from wait_agent). Omit to steer the "
+                "voice instead."
             ),
         )
         call_action: Optional[Literal["transfer"]] = Field(
             default=None,
             description=(
-                "Phone calls only: 'transfer' hands the caller to the line's "
-                "human contact after the message is spoken."
+                "Live voice subagents only: 'transfer' hands the caller to a "
+                "person (the line's transfer target) after the message is "
+                "spoken."
             ),
         )
 

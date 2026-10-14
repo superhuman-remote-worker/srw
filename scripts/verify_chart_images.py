@@ -30,6 +30,7 @@ COMPONENTS = (
     "driver-shim",
     "driver-mcp-front",
     "driver-git-swap",
+    "driver-gpt-live-sip",
     "fuse-opener",
 )
 # Images that another component's job builds from the same inputs. They share

@@ -113,6 +113,19 @@ def credential_fingerprint(plaintext: str) -> str:
     return f"hmac-sha256:{digest}"
 
 
+def live_control_token(connector_id: str) -> str:
+    """The token SRW calls a live connector's pod with (orchestrator → pod).
+
+    Derived, never stored: a separate HMAC key from APP_ENCRYPTION_KEY, over
+    the connector id, so every pod of the connector (a restart, a superseding
+    generation) accepts it and the orchestrator recomputes it per call. The
+    pod reads it from its request file (live_session_jobs.md §5.3).
+    """
+    key = hmac.digest(_load_key(), b"srw:live-control:v1", "sha256")
+    mac = hmac.digest(key, f"srw-live-control:{connector_id}".encode(), "sha256")
+    return base64.urlsafe_b64encode(mac).rstrip(b"=").decode("ascii")
+
+
 def reset_cipher_cache() -> None:
     """Invalidate the cached cipher. Test-only hook for key-rotation scenarios."""
     get_cipher.cache_clear()

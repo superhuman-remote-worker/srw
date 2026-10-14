@@ -1,0 +1,288 @@
+@use '../../../styles/shape-recipes' as shape;
+
+:host {
+  display: block;
+  min-width: 0;
+}
+
+.session-card {
+  @include shape.surface;
+
+  overflow: hidden;
+  border: 1px solid var(--border-color);
+  background: var(--surface-0);
+  color: var(--text-primary);
+}
+
+.session-header {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 16px 20px;
+  border-bottom: 1px solid var(--border-color);
+  background: var(--surface-1);
+}
+
+.session-identity {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-width: 0;
+}
+
+.session-identity > div {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.session-connector,
+.session-usage {
+  color: var(--text-secondary);
+  font-size: 12px;
+}
+
+.direction-icon {
+  color: var(--text-secondary);
+  font-size: 24px;
+}
+
+h3,
+h4,
+p {
+  margin: 0;
+}
+
+h3 {
+  font-size: 16px;
+  font-weight: 600;
+}
+
+h4 {
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.session-route {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 4px;
+  color: var(--text-secondary);
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+
+.direction-label {
+  margin-right: 6px;
+}
+
+.session-state {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.session-duration {
+  font-size: 15px;
+  font-variant-numeric: tabular-nums;
+}
+
+.close-reason {
+  flex-basis: 100%;
+  color: var(--text-secondary);
+  font-size: 12px;
+}
+
+.live-dot {
+  @include shape.circle;
+
+  display: inline-block;
+  width: 6px;
+  height: 6px;
+  margin-right: 5px;
+  background: var(--success);
+  animation: session-pulse 1.8s ease-in-out infinite;
+}
+
+.transcript-heading {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding: 14px 20px 0;
+}
+
+.read-error {
+  color: var(--warning);
+  font-size: 12px;
+}
+
+.session-transcript {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  max-height: 420px;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  overflow-anchor: none;
+  padding: 20px;
+
+  &:focus-visible {
+    outline: 2px solid var(--accent-color);
+    outline-offset: -3px;
+  }
+}
+
+.transcript-bubble {
+  @include shape.surface;
+
+  align-self: flex-start;
+  max-width: min(85%, 65ch);
+  padding: 10px 14px;
+  background: var(--surface-2);
+
+  p {
+    font-size: 14px;
+    line-height: 1.65;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+  }
+}
+
+.transcript-bubble--assistant {
+  align-self: flex-end;
+  background: var(--user-bubble);
+  color: var(--user-bubble-text);
+}
+
+.speaker-label {
+  display: block;
+  margin-bottom: 4px;
+  font-size: 11px;
+  font-weight: 600;
+}
+
+.backoffice-card {
+  @include shape.surface;
+
+  padding: 12px 14px;
+  border: 1px solid var(--border-color);
+  border-left: 3px solid var(--accent-color);
+  background: var(--surface-1);
+
+  &[data-state='answered'] {
+    border-left-color: var(--success);
+  }
+
+  p {
+    font-size: 13px;
+    line-height: 1.6;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+  }
+}
+
+.backoffice-heading {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 6px;
+  font-size: 12px;
+
+  .material-symbols-outlined {
+    font-size: 18px;
+    color: var(--text-secondary);
+  }
+
+  app-badge {
+    margin-left: auto;
+  }
+}
+
+.backoffice-response {
+  margin-top: 8px;
+  padding-top: 8px;
+  border-top: 1px solid var(--border-color);
+}
+
+.system-line,
+.transcript-empty {
+  color: var(--text-secondary);
+  font-size: 12px;
+  line-height: 1.6;
+  overflow-wrap: anywhere;
+}
+
+.system-line--error {
+  color: var(--danger);
+}
+
+.jump-latest {
+  display: flex;
+  justify-content: center;
+  padding: 0 20px 14px;
+}
+
+.session-follow-ups {
+  padding: 16px 20px;
+  border-top: 1px solid var(--border-color);
+
+  ul {
+    margin: 8px 0 0;
+    padding-left: 20px;
+  }
+
+  li {
+    padding: 3px 0;
+    font-size: 13px;
+    line-height: 1.6;
+    overflow-wrap: anywhere;
+  }
+}
+
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+
+.session-card--mobile {
+  .session-header,
+  .session-follow-ups {
+    padding: 14px 12px;
+  }
+
+  .session-transcript {
+    padding: 14px 12px;
+    max-height: 360px;
+  }
+
+  .transcript-heading {
+    padding: 12px 12px 0;
+  }
+
+  .transcript-bubble {
+    max-width: 92%;
+  }
+
+  .session-state {
+    margin-left: 36px;
+  }
+}
+
+@keyframes session-pulse {
+  50% {
+    opacity: 0.35;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .live-dot {
+    animation: none;
+  }
+}

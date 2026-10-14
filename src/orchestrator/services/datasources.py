@@ -606,7 +606,9 @@ def _validation_context(
         return bool(await dependencies.store.user_can_autonomous_send(user))
 
     return ValidationContext(
-        environment=environment, can_autonomous_send=can_autonomous_send
+        environment=environment,
+        can_autonomous_send=can_autonomous_send,
+        store=dependencies.store,
     )
 
 
@@ -947,6 +949,13 @@ async def delete_datasource(
             detail="Access denied by MCP token scope",
         ) from exc
     except Exception as e:
+        if getattr(e, "constraint_name", None) == "automations_trigger_connector_fk":
+            # A live automation listens on this phone line (live-session
+            # jobs §4.4): delete or repoint the automation first.
+            raise HTTPException(
+                status_code=409,
+                detail="A live automation listens on this connector; delete it first",
+            ) from e
         raise HTTPException(status_code=500, detail=str(e)) from e
 
 

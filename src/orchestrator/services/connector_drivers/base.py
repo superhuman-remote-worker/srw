@@ -136,6 +136,9 @@ class ValidationContext:
     environment: DriverEnvironment
     #: The caller's ``email_autonomous_send`` grant, resolved only when asked.
     can_autonomous_send: Callable[[], Awaitable[bool]]
+    #: The application's database, for a driver whose config names a catalog
+    #: row (a phone line's live voice model); ``None`` in a bare context.
+    store: Any = None
 
 
 @dataclass(frozen=True)

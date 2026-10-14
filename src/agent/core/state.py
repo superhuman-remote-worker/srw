@@ -250,6 +250,12 @@ class UniversalAgentState(TypedDict):
     # Contains: transition_type, trigger_summarization, metadata
     phase_transition: Optional[Dict[str, Any]]
 
+    # A live-session job's session ended: {"reason", "phase_number"}, the
+    # phase number being the phase that took in the end (check_todos). That
+    # phase's boundary loads the post-session todos (live_session_jobs §6.1);
+    # the flag stays, so a resume never re-attaches an ended session.
+    live_session_ended: Optional[Dict[str, Any]]
+
     # Why the tactical phase asked to end early (request_replan tool).
     # Set by check_todos when it consumes the request, read by handle_transition
     # so the incoming strategic phase is told what changed. Cleared at the
@@ -322,9 +328,11 @@ def create_initial_state(
         phase_complete=False,
         goal_achieved=False,
         iteration=0,
-        # Phase alternation (start in strategic mode)
+        # Phase alternation (start in strategic mode; a live-session job's
+        # init node flips to tactical). Phases count from 0, as the init node
+        # numbers them.
         is_strategic_phase=True,
-        phase_number=1,
+        phase_number=0,
         is_final_phase=False,
         completion_decision=None,
         verdict_decision=None,
@@ -360,6 +368,7 @@ def create_initial_state(
         tool_retry_state=None,
         # Legacy
         phase_transition=None,
+        live_session_ended=None,
         # Todo persistence
         todos=None,
         staged_todos=None,

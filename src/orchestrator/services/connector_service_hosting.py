@@ -88,8 +88,12 @@ from orchestrator.services.connector_egress import (
     system_resolver,
 )
 from orchestrator.services.connector_service_images import (
+    ServiceImageRefused,
     ServiceImageUnavailable,
+    check_moved_image,
     ensure_image,
+    image_reference_for,
+    resolve_driver_image,
 )
 from orchestrator.services.connector_service_launch import (
     MANAGER,
@@ -1155,6 +1159,60 @@ class ServiceHostingReconciler:
                 binding.bound_by("thread", str(row["thread_id"]), issued_at)
         return grouped
 
+    async def _standing_bindings(
+        self, bindings: dict, specs: Mapping[str, DriverSpec]
+    ) -> None:
+        """An owner-less binding for every connector of a standing driver
+        (live_session_jobs.md §5.2): its pod starts when the connector is
+        created and never idles, so a phone line answers its first call.
+        Deleting the connector stops it. Such pods count against the
+        installation's cap like any other."""
+        standing = {
+            spec.legacy_type: name
+            for name, spec in specs.items()
+            if spec.service is not None and spec.service.standing and spec.legacy_type
+        }
+        if not standing:
+            return
+        async with self.store.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT id, type FROM datasources WHERE type = ANY($1::text[])",
+                sorted(standing),
+            )
+        for row in rows:
+            driver = standing[str(row["type"])]
+            spec = specs[driver]
+            connector_id = str(row["id"])
+            reference = image_reference_for(driver)
+            if not reference:
+                continue
+            try:
+                image = await resolve_driver_image(
+                    self.store, driver=driver, reference=reference, timeout=10.0
+                )
+                async with self.store.acquire() as conn:
+                    problems = await check_moved_image(
+                        conn, spec=spec, connector_id=connector_id, image=image
+                    )
+            except (ServiceImageUnavailable, ServiceImageRefused) as exc:
+                logger.warning(
+                    "Standing driver pod of connector %s not started: %s",
+                    connector_id,
+                    exc,
+                )
+                continue
+            if problems:
+                logger.warning(
+                    "Standing driver pod of connector %s not started: %s",
+                    connector_id,
+                    "; ".join(problems),
+                )
+                continue
+            bindings.setdefault(
+                (connector_id, image.digest),
+                _Binding(connector_id, driver, image.digest),
+            )
+
     async def _revoke(
         self, row: Mapping[str, Any], reason: str, *, error: str | None = None
     ) -> None:
@@ -1684,6 +1742,7 @@ class ServiceHostingReconciler:
         async with self.store.acquire() as conn:
             bindings = await self._bindings(conn, specs) if specs else {}
             rows = list(await conn.fetch(_POD_ROWS))
+        await self._standing_bindings(bindings, specs)
         # Stopped pods whose objects are not confirmed gone yet.
         for row in rows:
             if row["revoked_at"] is not None:

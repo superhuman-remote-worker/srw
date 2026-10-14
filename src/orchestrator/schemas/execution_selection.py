@@ -109,11 +109,26 @@ class ConnectorSelection(BaseModel):
         return self
 
 
+class LiveSessionSelection(BaseModel):
+    """The live session a live-session job starts in (live_session_jobs §4.2):
+    the alias of one of the job's connectors (a live connector, e.g. a
+    phone line) and the provider's session id."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    connector: ResourceName = Field(
+        ..., description="An alias in execution.connectors: the live connector."
+    )
+    id: Annotated[str, StringConstraints(min_length=1, max_length=200)] = Field(
+        ..., description="The provider's session id (e.g. rtc_… for GPT-Live)."
+    )
+
+
 class ExecutionSelection(BaseModel):
     """The ``execution`` block of a job or session request.
 
-    Only ``connectors`` is accepted here for now; the Expert and the
-    workspace are the request's own ``expert`` and ``workspace`` fields.
+    ``connectors`` and, for a live-session job, ``session``; the Expert and
+    the workspace are the request's own ``expert`` and ``workspace`` fields.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -127,6 +142,14 @@ class ExecutionSelection(BaseModel):
             "datasource_ids: []."
         ),
     )
+    session: LiveSessionSelection | None = Field(
+        None,
+        description=(
+            "The live session a live-session job starts in (live_session: "
+            "true): {connector: <alias in execution.connectors>, id: <the "
+            "provider's session id>}."
+        ),
+    )
 
 
 __all__ = [
@@ -135,4 +158,5 @@ __all__ = [
     "ConnectorScope",
     "ConnectorSelection",
     "ExecutionSelection",
+    "LiveSessionSelection",
 ]

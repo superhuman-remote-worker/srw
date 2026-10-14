@@ -1616,6 +1616,22 @@
                 "fallback": {"type": "string", "enum": ["token-in-url", "refuse"]}
               }
             },
+            "gptLiveSip": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "enabled": {"type": "boolean"},
+                "image": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "properties": {
+                    "repository": {"type": "string"},
+                    "tag": {"type": "string"},
+                    "digest": {"type": "string", "pattern": "^$|^sha256:[0-9a-f]{64}$"}
+                  }
+                }
+              }
+            },
             "ca": {
               "type": "object",
               "additionalProperties": false,

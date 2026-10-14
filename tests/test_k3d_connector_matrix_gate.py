@@ -286,6 +286,7 @@ def _installed_everywhere() -> dict:
         lease_probe=True,
         echo_service_image="r/echo:1",
         git_swap_image="r/git-swap:1",
+        gpt_live_sip_image="r/gpt-live-sip:1",
         managed_mcp_images={
             spec.name: f"r/{spec.legacy_type}:1"
             for spec in MANAGED_MCP_SPECS + DEVELOPMENT_SPECS
@@ -317,6 +318,7 @@ class TestOfficialAndManagedDrivers:
         old = gate.SpecClasses(builtin=tuple(NAMES), development=SPECS.development)
         assert gate.matrix_problems(matrix, old) == [
             "srw.git-swap/v1 is no driver spec of this checkout",
+            "srw.gpt-live-sip/v1 is no driver spec of this checkout",
             "srw.gitea-mcp/v1 is no driver spec of this checkout",
         ]
 

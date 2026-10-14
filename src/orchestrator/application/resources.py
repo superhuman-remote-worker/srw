@@ -60,7 +60,7 @@ if TYPE_CHECKING:
     from orchestrator.services.usage_ledger import UsageLedger
     from orchestrator.services.usage_rollup import UsageRollup
 
-from orchestrator.services.telephony.recorder import TelephonyTaskRegistry
+from orchestrator.services.live.inbound import LiveTaskRegistry
 
 T = TypeVar("T")
 
@@ -128,9 +128,8 @@ class ApplicationResources:
         default_factory=_cloud_root_connect_flows
     )
 
-    telephony_tasks: TelephonyTaskRegistry = field(
-        default_factory=TelephonyTaskRegistry
-    )
+    #: Live sessions' admission tasks (one per session; live_session_jobs).
+    live_tasks: LiveTaskRegistry = field(default_factory=LiveTaskRegistry)
 
     # -- completion: one runtime and one control boundary per application,
     # wired right after construction because their callbacks close over this

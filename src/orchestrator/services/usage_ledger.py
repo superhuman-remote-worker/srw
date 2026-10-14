@@ -948,6 +948,12 @@ class UsageLedger:
             expected=len(events), inserted=inserted, verified=len(verified_rows)
         )
 
+    async def resolve_rate(
+        self, category: str, resource: str, unit: str, ts: datetime
+    ) -> Optional[Decimal]:
+        """The configured rate an event at ``ts`` would be snapshotted with."""
+        return await self._rates.resolve(category, resource, unit, ts)
+
     async def record_events(self, events: Sequence[UsageEvent]) -> int:
         """Idempotently insert a batch; returns the count *actually* inserted.
 

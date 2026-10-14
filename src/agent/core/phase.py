@@ -272,6 +272,89 @@ def get_resume_strategic_todos(
 
 
 # =============================================================================
+# Live-session jobs: the tactical start and the post-session phase
+# =============================================================================
+
+#: The framework fallback of ``live_tactical_todos`` (template missing).
+LIVE_TACTICAL_TODO = (
+    "Handle the live session until it ends: wait for the voice subagent's "
+    "questions and answer them."
+)
+#: The framework fallback of ``live_post_session_todos`` (template missing).
+LIVE_POST_SESSION_TODO = (
+    "Review the session (transcript, questions, promises). Do the follow-ups, "
+    "note knowledge gaps, then `job_complete`, or stage the next phase."
+)
+
+
+def _predefined(todo_list: List[Dict[str, Any]]) -> List[PredefinedTodo]:
+    return [
+        PredefinedTodo(id=int(t["id"].replace("todo_", "")), content=t["content"])
+        for t in todo_list
+    ]
+
+
+def get_live_tactical_todos(
+    config: Optional["AgentConfig"] = None,
+    tool_names: Optional[List[str]] = None,
+) -> List[PredefinedTodo]:
+    """Todos of a live-session job's first phase, which is tactical.
+
+    Loads the ``live_tactical_todos`` instruction (framework default
+    ``config/templates/live_tactical_todos.yaml``; an expert may override it).
+    """
+    from shared.runtime.core.loader import get_live_tactical_todos_from_config
+
+    todo_list = get_live_tactical_todos_from_config(config, tool_names=tool_names)
+    if todo_list:
+        return _predefined(todo_list)
+    logger.warning("Using the hardcoded live tactical todo (template not found)")
+    return [PredefinedTodo(id=1, content=LIVE_TACTICAL_TODO)]
+
+
+def get_live_post_session_todos(
+    config: Optional["AgentConfig"] = None,
+    tool_names: Optional[List[str]] = None,
+) -> List[PredefinedTodo]:
+    """Todos of the strategic phase after a live session ended.
+
+    Loads the ``live_post_session_todos`` instruction (framework default
+    ``config/templates/live_post_session_todos.yaml``; an expert may override
+    it) in place of the transition template.
+    """
+    from shared.runtime.core.loader import get_live_post_session_todos_from_config
+
+    todo_list = get_live_post_session_todos_from_config(config, tool_names=tool_names)
+    if todo_list:
+        return _predefined(todo_list)
+    logger.warning("Using the hardcoded live post-session todo (template not found)")
+    return [PredefinedTodo(id=1, content=LIVE_POST_SESSION_TODO)]
+
+
+def live_session_replan_reason(reason: str) -> str:
+    """The replan a live-session end requests (``ToolContext.end_live_session``)."""
+    return f"live session ended: {reason}"
+
+
+def live_session_end_for_boundary(
+    state: "UniversalAgentState | Dict[str, Any]",
+) -> Optional[str]:
+    """Why the job's live session ended, when that end closes the phase now
+    completing; ``None`` otherwise.
+
+    ``check_todos`` stamps the ``live_session_ended`` flag with the phase in
+    which it took in the end, so only that phase's boundary loads the
+    post-session todos; a later tactical phase transitions as usual.
+    """
+    flag = state.get("live_session_ended")
+    if not isinstance(flag, dict):
+        return None
+    if flag.get("phase_number") != state.get("phase_number", 0):
+        return None
+    return str(flag.get("reason") or "ended")
+
+
+# =============================================================================
 # todos.yaml Schema and Validation
 # =============================================================================
 
@@ -473,10 +556,15 @@ def should_freeze_at_boundary(
     Checks the autonomy level from config and the current phase context
     to decide if the agent should pause for human review.
 
+    Phases count from 0: a job's first phase is phase 0 (strategic, or
+    tactical for a live-session job), and every transition adds one. So under
+    ``partial`` the first strategic phase freezes at its boundary: phase 0,
+    or phase 1 after a live session's tactical start.
+
     Args:
         config: Agent configuration with autonomy level
         is_strategic: True if the completing phase is strategic
-        phase_number: Current phase number (1-based after first strategic)
+        phase_number: Current phase number (0 = the job's first phase)
 
     Returns:
         True if the agent should freeze at this boundary
@@ -1915,8 +2003,13 @@ def on_tactical_phase_complete(
             state, workspace, todo_manager, "tactical", phase_number
         )
 
-    # Load predefined strategic todos (from config template or defaults)
-    strategic_todos = get_transition_strategic_todos(config, tool_names=tool_names)
+    # Load predefined strategic todos (from config template or defaults). A
+    # live session that ended this phase gets the post-session review instead.
+    live_end = live_session_end_for_boundary(state)
+    if live_end is not None:
+        strategic_todos = get_live_post_session_todos(config, tool_names=tool_names)
+    else:
+        strategic_todos = get_transition_strategic_todos(config, tool_names=tool_names)
     todo_list = [todo.to_dict() for todo in strategic_todos]
     todo_manager.set_todos_from_list(todo_list)
 
@@ -1925,19 +2018,31 @@ def on_tactical_phase_complete(
 
     logger.info(
         f"[{job_id}] Transitioning to strategic phase "
-        f"({len(strategic_todos)} predefined todos)"
+        f"({len(strategic_todos)} predefined todos"
+        f"{', live session ended' if live_end is not None else ''})"
     )
 
-    from shared.runtime.services.guardrails import format_nudge
+    if live_end is not None:
+        banner = (
+            f"[LIVE SESSION ENDED: {live_end}] The live session is over and "
+            f"this job enters strategic phase {phase_number + 1}. The voice "
+            "subagent's final report (transcript, questions, follow-ups) "
+            "reaches you as subagent evidence. Review the session, act on "
+            "what is still open, then finish with `job_complete` or stage the "
+            "next phase."
+        )
+    else:
+        from shared.runtime.services.guardrails import format_nudge
 
-    model = config.llm.model if (config and config.llm) else None
+        model = config.llm.model if (config and config.llm) else None
+        banner = format_nudge(
+            "phase_transition_tactical_to_strategic",
+            model=model,
+            phase_number=phase_number + 1,
+        )
     phase_marker = HumanMessage(
         content=_with_todo_list(
-            format_nudge(
-                "phase_transition_tactical_to_strategic",
-                model=model,
-                phase_number=phase_number + 1,
-            ),
+            banner,
             todo_manager,
             is_strategic=True,
             phase_number=phase_number + 1,

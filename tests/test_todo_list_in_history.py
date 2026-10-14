@@ -353,11 +353,11 @@ class TestPhaseStartCarriesTheList:
         mgr = TodoManager(workspace)
         node = create_init_strategic_todos_node(workspace, mgr, mock_config)
 
-        result = node({"job_id": "j", "phase_number": 1})
+        result = node({"job_id": "j", "phase_number": 0})
 
         (first,) = result["messages"]
         assert "Do the thing." in first.content
-        assert "Current Tasks — Phase 1 (Strategic)" in first.content
+        assert "Current Tasks — Phase 0 (Strategic)" in first.content
         _in_history_once(mgr, [first])
 
     @pytest.mark.asyncio

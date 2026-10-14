@@ -74,65 +74,139 @@
             />
           </label>
 
-          <label class="field">
-            <span class="field-label">{{ 'automations.editor.preset' | transloco }}</span>
-            <app-select
-              [value]="ed.preset"
-              (changed)="updateEditor('preset', $any($event))"
-            >
-              @for (opt of presetOptions; track opt.value) {
-                <option [value]="opt.value">{{ opt.label }}</option>
-              }
-            </app-select>
-          </label>
-
-          @if (ed.preset !== 'custom' && ed.preset !== 'every_hour') {
-            <label class="field">
-              <span class="field-label">{{ 'automations.editor.time' | transloco }}</span>
-              <input
-                type="time"
-                class="time-input"
-                [value]="ed.time"
-                (change)="updateEditor('time', $any($event.target).value)"
-              />
-            </label>
-          } @else if (ed.preset === 'every_hour') {
-            <label class="field">
-              <span class="field-label">{{ 'automations.editor.minute' | transloco }}</span>
-              <app-input
-                type="number"
-                [value]="ed.time"
-                (changed)="updateEditor('time', '00:' + (+$event).toString().padStart(2, '0'))"
-                [placeholder]="'0'"
-              />
+          @if (ed.mode === 'create') {
+            <label class="field field--full">
+              <span class="field-label">{{ 'automations.editor.project' | transloco }}</span>
+              <app-select [value]="ed.projectId ?? ''" (changed)="onProjectChange($event || null)">
+                <option value="">{{ 'automations.editor.noProject' | transloco }}</option>
+                @for (project of projectChoices(); track project.id) {
+                  <option [value]="project.id">{{ project.name }}@if (project.is_default) { {{ 'automations.editor.projectPersonal' | transloco }}}</option>
+                }
+                @if (unlistedProjectId(); as id) {
+                  <option [value]="id">{{ projectName(id) ?? ('automations.list.projectFilter.fallbackName' | transloco) }}</option>
+                }
+              </app-select>
             </label>
           } @else {
-            <label class="field field--full">
-              <span class="field-label">{{ 'automations.editor.customCron' | transloco }}</span>
-              <app-input
-                [value]="ed.customCron"
-                (changed)="updateEditor('customCron', $event)"
-                placeholder="0 9 * * *"
-              />
-            </label>
+            <!-- PATCH has no project_id: an automation stays in the project it was created in. -->
+            <div class="field field--full project-readonly">
+              <span class="field-label">{{ 'automations.editor.project' | transloco }}</span>
+              <span>
+                @if (ed.projectId) {
+                  <a class="meta-link" [routerLink]="['/projects', ed.projectId]">
+                    <app-icon size="inherit">folder_shared</app-icon>
+                    {{ projectName(ed.projectId) ?? ('automations.list.openProject' | transloco) }}
+                  </a>
+                } @else {
+                  {{ 'automations.editor.noProject' | transloco }}
+                }
+              </span>
+              <span class="field-note">{{ 'automations.editor.projectFixed' | transloco }}</span>
+            </div>
           }
 
-          <label class="field">
-            <span class="field-label">{{ 'automations.editor.timezone' | transloco }}</span>
-            <app-select
-              [value]="ed.timezone"
-              (changed)="updateEditor('timezone', $any($event))"
-            >
-              @for (tz of timezoneOptions(); track tz.value) {
-                <option [value]="tz.value">{{ tz.label }}</option>
-              }
+          <label class="field field--full">
+            <span class="field-label">{{ 'automations.editor.trigger' | transloco }}</span>
+            <app-select [value]="ed.triggerType" [disabled]="ed.mode === 'edit'"
+              (changed)="updateEditor('triggerType', $any($event))">
+              <option value="cron">{{ 'automations.editor.schedule' | transloco }}</option>
+              <option value="live">{{ 'automations.editor.incomingLive' | transloco }}</option>
             </app-select>
           </label>
+          @if (ed.triggerType === 'live') {
+            <div class="field field--full live-trigger">
+              <span class="field-label">{{ 'automations.editor.liveConnectors' | transloco }}</span>
+              <app-datasources-group #livePicker [datasources]="liveConnectors()"
+                [initialSelectedIds]="ed.connectorIds" [contextKey]="connectorContext()"
+                [loading]="connectorsLoading()" [error]="connectorsError()"
+                [showHeader]="false" [searchable]="true"
+                (change)="onConnectorChange()" (retry)="retryConnectors()" />
+              @if (!connectorsLoading() && !connectorsError() && !liveConnectors().length) {
+                <p>{{ (ed.mode === 'create' && !ed.projectId && projectChoices().length
+                  ? 'automations.editor.noLiveConnectorsChooseProject'
+                  : 'automations.editor.noLiveConnectors') | transloco }}</p>
+              }
+              <label class="field">
+                <span class="field-label">{{ 'automations.editor.primaryConnector' | transloco }}</span>
+                <app-select [value]="ed.primaryConnectorId"
+                  (changed)="updateEditor('primaryConnectorId', $event ?? '')">
+                  <option value="">{{ 'datasources.generic.unset' | transloco }}</option>
+                  @for (connector of selectedLiveConnectors(); track connector.id) {
+                    <option [value]="connector.id">{{ connector.name }}</option>
+                  }
+                </app-select>
+              </label>
+              <span class="field-label">{{ 'automations.editor.additionalConnectors' | transloco }}</span>
+              <app-datasources-group #additionalPicker [datasources]="additionalConnectors()"
+                [initialSelectedIds]="ed.connectorIds" [contextKey]="connectorContext()"
+                [showHeader]="false" [searchable]="true"
+                [loading]="connectorsLoading()" [error]="connectorsError()"
+                (change)="onConnectorChange()" (retry)="retryConnectors()" />
+              <app-workspace-picker role="job" [projectId]="ed.projectId"
+                [choice]="ed.workspaceChoice" (choiceChange)="updateEditor('workspaceChoice', $event)" />
+            </div>
+          } @else {
+            <label class="field">
+              <span class="field-label">{{ 'automations.editor.preset' | transloco }}</span>
+              <app-select
+                [value]="ed.preset"
+                (changed)="updateEditor('preset', $any($event))"
+              >
+                @for (opt of presetOptions; track opt.value) {
+                  <option [value]="opt.value">{{ opt.label }}</option>
+                }
+              </app-select>
+            </label>
 
-          <div class="field field--full">
-            <span class="field-label">{{ 'automations.editor.preview' | transloco }}</span>
-            <app-cron-preview [cronExpr]="cronExpr()" [timezone]="ed.timezone" />
-          </div>
+            @if (ed.preset !== 'custom' && ed.preset !== 'every_hour') {
+              <label class="field">
+                <span class="field-label">{{ 'automations.editor.time' | transloco }}</span>
+                <input
+                  type="time"
+                  class="time-input"
+                  [value]="ed.time"
+                  (change)="updateEditor('time', $any($event.target).value)"
+                />
+              </label>
+            } @else if (ed.preset === 'every_hour') {
+              <label class="field">
+                <span class="field-label">{{ 'automations.editor.minute' | transloco }}</span>
+                <app-input
+                  type="number"
+                  [value]="ed.time"
+                  (changed)="updateEditor('time', '00:' + (+$event).toString().padStart(2, '0'))"
+                  [placeholder]="'0'"
+                />
+              </label>
+            } @else {
+              <label class="field field--full">
+                <span class="field-label">{{ 'automations.editor.customCron' | transloco }}</span>
+                <app-input
+                  [value]="ed.customCron"
+                  (changed)="updateEditor('customCron', $event)"
+                  placeholder="0 9 * * *"
+                />
+              </label>
+            }
+
+            <label class="field">
+              <span class="field-label">{{ 'automations.editor.timezone' | transloco }}</span>
+              <app-select
+                [value]="ed.timezone"
+                (changed)="updateEditor('timezone', $any($event))"
+              >
+                @for (tz of timezoneOptions(); track tz.value) {
+                  <option [value]="tz.value">{{ tz.label }}</option>
+                }
+              </app-select>
+            </label>
+
+            <div class="field field--full">
+              <span class="field-label">{{ 'automations.editor.preview' | transloco }}</span>
+              <app-cron-preview [cronExpr]="cronExpr()" [timezone]="ed.timezone" />
+            </div>
+
+          }
 
           <label class="field">
             <span class="field-label">{{ 'automations.editor.expert' | transloco }}</span>
@@ -209,14 +283,16 @@
               />
             </label>
 
-            <label class="field">
-              <span class="field-label">{{ 'automations.editor.catchupHours' | transloco }}</span>
-              <app-input
-                type="number"
-                [value]="ed.catchupWindowHours.toString()"
-                (changed)="updateEditor('catchupWindowHours', +$event)"
-              />
-            </label>
+            @if (ed.triggerType === 'cron') {
+              <label class="field">
+                <span class="field-label">{{ 'automations.editor.catchupHours' | transloco }}</span>
+                <app-input
+                  type="number"
+                  [value]="ed.catchupWindowHours.toString()"
+                  (changed)="updateEditor('catchupWindowHours', +$event)"
+                />
+              </label>
+            }
           }
         </div>
 
@@ -224,7 +300,8 @@
           <app-button variant="ghost" size="md" (clicked)="closeEditor()">
             {{ 'common.cancel' | transloco }}
           </app-button>
-          <app-button variant="primary" size="md" (clicked)="saveEditor()">
+          <app-button variant="primary" size="md" (clicked)="saveEditor()"
+            [disabled]="ed.triggerType === 'live' && (connectorsLoading() || connectorsError())">
             @if (ed.mode === 'create') {
               {{ 'automations.editor.create' | transloco }}
             } @else {
@@ -255,8 +332,12 @@
                   </app-badge>
                 </div>
                 <div class="row-meta">
-                  <span class="meta-item mono">{{ row.cron_expr }}</span>
-                  <span class="meta-item">{{ row.timezone }}</span>
+                  @if (row.trigger_type === 'live') {
+                    <span class="meta-item">{{ 'automations.list.live' | transloco: {name: connectorLabel(row)} }}</span>
+                  } @else {
+                    <span class="meta-item mono">{{ row.cron_expr }}</span>
+                    <span class="meta-item">{{ row.timezone }}</span>
+                  }
                   <span class="meta-item">{{ 'automations.list.expert' | transloco }}: {{ expertLabel(row) }}</span>
                   @if (row.next_run_at) {
                     <span class="meta-item">
@@ -287,10 +368,12 @@
                   (changed)="toggleEnabled(row)"
                   [ariaLabel]="'automations.list.toggleAria' | transloco"
                 />
-                <app-button variant="ghost" size="sm" (clicked)="runNow(row)">
-                  <app-icon size="inherit">play_arrow</app-icon>
-                  {{ 'automations.list.runNow' | transloco }}
-                </app-button>
+                @if (row.trigger_type !== 'live') {
+                  <app-button variant="ghost" size="sm" (clicked)="runNow(row)">
+                    <app-icon size="inherit">play_arrow</app-icon>
+                    {{ 'automations.list.runNow' | transloco }}
+                  </app-button>
+                }
                 <app-button variant="ghost" size="sm" (clicked)="openEditor(row)">
                   <app-icon size="inherit">edit</app-icon>
                   {{ 'common.edit' | transloco }}

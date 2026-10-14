@@ -40,6 +40,7 @@ import itertools
 import logging
 import posixpath
 import re
+import threading
 from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -796,6 +797,10 @@ def rebase_context(
     ctx._freeze_request = None
     ctx._officer_sleep_request = None
     ctx._replan_request = None
+    # A child has no live session of its own and never holds its parent's lease.
+    ctx._live_session_end = None
+    ctx._live_lease = None
+    ctx._phase_request_lock = threading.Lock()
     ctx._reply_drain_requested = False
     ctx._recent_reads = deque(maxlen=10)
     ctx._pinned_reads = set()

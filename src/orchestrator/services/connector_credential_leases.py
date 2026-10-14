@@ -634,6 +634,11 @@ async def deliver_connector_leases(
             # The agent process connects to the connector's endpoint at this
             # digest with the lease token as its bearer (D5a).
             entry["connection_url"] = _managed_mcp_url(spec, connector_id, image_digest)
+        elif spec.live:
+            # The job's voice subagent (the agent process, never the
+            # workspace: a live job may have none) reaches the line's pod
+            # with the lease token as its bearer (live_session_jobs §5.1).
+            entry["connection_url"] = _service_url(spec, connector_id, image_digest)
         elif git_swap_entry(entry):
             # The workspace's git reaches the driver at this digest (C3).
             try:
@@ -770,11 +775,19 @@ def _git_swap_block(
 
 def _managed_mcp_url(spec: DriverSpec, connector_id: str, digest: str | None) -> str:
     """Where a managed MCP binding's client reaches the server's front."""
+    from shared.connectors.mcp import FRONT_PATH
+
+    return _service_url(spec, connector_id, digest, path=FRONT_PATH)
+
+
+def _service_url(
+    spec: DriverSpec, connector_id: str, digest: str | None, *, path: str = ""
+) -> str:
+    """Where the agent process reaches a connector's pods at one digest."""
     from orchestrator.services.connector_service_images import (
         service_image_settings,
     )
     from orchestrator.services.connector_service_launch import endpoint_url
-    from shared.connectors.mcp import FRONT_PATH
 
     namespace = service_image_settings().service_namespace
     if not namespace or not digest or spec.service is None:
@@ -786,7 +799,7 @@ def _managed_mcp_url(spec: DriverSpec, connector_id: str, digest: str | None) ->
         connector_id=connector_id,
         digest=digest,
         port=spec.service.port,
-        path=FRONT_PATH,
+        path=path,
     )
 
 

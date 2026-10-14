@@ -546,3 +546,51 @@ def test_serialize_freezes_expert_local_phase_skill():
         "phase_start:strategic",
         "phase_start:tactical",
     ]
+
+
+def test_runtime_and_cockpit_schemas_agree_on_the_live_voice_entry():
+    """The roster entry's ``driver: live`` + ``live`` block and
+    ``phase_settings.strategic_tools`` (live_session_jobs §6.3): one definition
+    in both schemas, and the bundled voice desk validates against it."""
+    import json
+
+    import jsonschema
+    import yaml
+
+    runtime = json.loads(_P("config/schema.json").read_text())
+    cockpit = json.loads(_P("cockpit/src/assets/schema.json").read_text())
+    entry = runtime["$defs"]["subagentRosterEntry"]
+    assert entry == cockpit["$defs"]["subagentRosterEntry"]
+    assert entry["properties"]["driver"]["enum"] == ["live"]
+    live = entry["properties"]["live"]["properties"]
+    assert {
+        "persona",
+        "persona_file",
+        "facts",
+        "facts_file",
+        "greeting",
+        "voice",
+        "answer_timeout_s",
+        "texts",
+    } == set(live)
+    assert set(live["texts"]["properties"]) == {"fallback", "follow_up", "goodbye"}
+    strategic_tools = runtime["properties"]["phase_settings"]["properties"][
+        "strategic_tools"
+    ]
+    assert (
+        strategic_tools
+        == cockpit["properties"]["phase_settings"]["properties"]["strategic_tools"]
+    )
+
+    validator = jsonschema.Draft202012Validator(runtime)
+    desk = yaml.safe_load(_P("config/experts/phone-desk/config.yaml").read_text())
+    authored = desk["spec"]["runtime"]["config"]["config"]
+    errors = [e for e in validator.iter_errors(authored) if e.validator != "required"]
+    assert not errors, [e.message for e in errors]
+    bad = json.loads(json.dumps(authored))
+    voice = bad["subagents"]["roster"]["voice"]
+    voice["live"]["persona_file"] = "persona.txt"
+    voice["driver"] = "phone"
+    messages = [e.message for e in validator.iter_errors(bad)]
+    assert any("'phone' is not one of ['live']" in m for m in messages)
+    assert any("should not be valid" in m for m in messages)

@@ -42,6 +42,7 @@ interface ModelsResponse {
   fetch_models: HelperModel[];
   /** Memory reranker rows (`rerank` capability). Optional for older backends. */
   rerank_models?: HelperModel[];
+  live_voice_models?: HelperModel[];
   configured_providers: string[];
   reasoning_by_model?: Record<string, ReasoningCapability>;
 }
@@ -65,6 +66,7 @@ export class ModelService {
   readonly searchModels = signal<HelperModel[]>([]);
   readonly fetchModels = signal<HelperModel[]>([]);
   readonly rerankModels = signal<HelperModel[]>([]);
+  readonly liveVoiceModels = signal<HelperModel[]>([]);
   readonly providers = signal<string[]>([]);
   /** model_id → reasoning capability (family-derived); drives the reasoning UI. */
   readonly reasoningByModel = signal<Record<string, ReasoningCapability>>({});
@@ -94,6 +96,7 @@ export class ModelService {
         this.searchModels.set(resp.search_models ?? []);
         this.fetchModels.set(resp.fetch_models ?? []);
         this.rerankModels.set(resp.rerank_models ?? []);
+        this.liveVoiceModels.set(resp.live_voice_models ?? []);
         this.providers.set(resp.configured_providers);
         this.reasoningByModel.set(resp.reasoning_by_model ?? {});
         this.loading.set(false);
@@ -113,6 +116,7 @@ export class ModelService {
         this.searchModels.set([]);
         this.fetchModels.set([]);
         this.rerankModels.set([]);
+        this.liveVoiceModels.set([]);
         this.providers.set([]);
         this.reasoningByModel.set({});
         this.loading.set(false);

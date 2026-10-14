@@ -2,8 +2,13 @@
 
 import json
 
+import pytest
+
 from shared.runtime.core.loader import deep_merge
 from shared.runtime.core.expert_resolution import (
+    ASSEMBLER_OWNED_PROMPT_TOKENS,
+    validate_expert_persona_placeholders,
+    validate_live_voice_placeholders,
     with_role_tag,
     build_expert_config,
     canonical_key,
@@ -271,3 +276,40 @@ def test_with_role_tag_appends_the_role_once_and_keeps_order():
     ]
     assert with_role_tag(None, ["x"]) == ["x"]
     assert with_role_tag("subagent", ("a", "subagent", "b")) == ["a", "subagent", "b"]
+
+
+# --- live voice prose (live_session_jobs §6.3) ------------------------------
+
+
+def _live_roster(**live):
+    return {"roster": {"voice": {"driver": "live", "live": live}}}
+
+
+@pytest.mark.parametrize("key", ["persona", "facts"])
+@pytest.mark.parametrize("token", ASSEMBLER_OWNED_PROMPT_TOKENS)
+def test_live_voice_prose_rejects_the_assembler_tokens(key, token):
+    with pytest.raises(ValueError, match="reserved prompt placeholders") as exc:
+        validate_live_voice_placeholders(_live_roster(**{key: f"a {token} b"}))
+    assert f"subagents.roster.voice.live.{key}" in str(exc.value)
+    # The persona validator checks an expert's config the same way.
+    with pytest.raises(ValueError, match="reserved prompt placeholders"):
+        validate_expert_persona_placeholders(
+            {"persona": "plain"},
+            config={"subagents": _live_roster(**{key: f"a {token} b"})},
+        )
+
+
+def test_live_voice_prose_keeps_ordinary_braces_and_other_fields():
+    roster = _live_roster(
+        persona='Answer in JSON like {"ok": true}.',
+        facts="Open {weekday} mornings.",
+        greeting="Hello {agent_display_name}",  # not prose the check reads
+    )
+    validate_live_voice_placeholders(roster)
+    validate_live_voice_placeholders(None)
+    validate_live_voice_placeholders({"roster": {"x": "not a mapping"}})
+    prompts = {"persona": "plain"}
+    assert (
+        validate_expert_persona_placeholders(prompts, config={"subagents": roster})
+        is prompts
+    )

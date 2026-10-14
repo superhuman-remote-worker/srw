@@ -1,0 +1,20 @@
+# Todos of the strategic phase after a live session ended
+# (live_session_jobs §6.1). They replace the transition template at the
+# boundary the session's end closed. An expert may override this file.
+todos:
+  - id: 1
+    content: >-
+      Review the session (transcript, questions, promises). Do the follow-ups,
+      note knowledge gaps, then `job_complete`, or stage the next phase.
+
+      The voice subagent's final report holds the transcript, every question
+      it handed over with its outcome, and the follow-ups the caller was
+      promised. Act on each follow-up with your tools and check the result.
+      Note what you could not answer from your knowledge (in the knowledge
+      base when you can write to it). Then call job_complete with a summary of
+      the session: what the caller asked, what you did, and what is still
+      open. Stage a tactical phase with next_phase_todos instead when the
+      follow-ups need one.
+
+      COMPLETION CRITERIA: every follow-up is done and verified, or recorded
+      as open with its reason, and job_complete or next_phase_todos succeeded.

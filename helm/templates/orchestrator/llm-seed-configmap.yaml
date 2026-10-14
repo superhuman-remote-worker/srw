@@ -125,7 +125,7 @@ data:
     provider_catalog.py) and DEFAULT_PIN_CAPABILITY_BY_KIND (seed/llm_config.py);
     a typo fails the render here instead of a warning buried in the Job log.
     */}}
-    {{- $validKinds := list "auxiliary" "browser" "chat" "citation" "embedding" "fetch" "rerank" "search" "search_fallback" "tts" "vision" "whisper" }}
+    {{- $validKinds := list "auxiliary" "browser" "chat" "citation" "embedding" "fetch" "live_voice" "rerank" "search" "search_fallback" "tts" "vision" "whisper" }}
     defaults:
       {{- range $kind, $decl := .Values.llm.seed.defaults }}
       {{- if not (has $kind $validKinds) }}

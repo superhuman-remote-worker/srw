@@ -677,7 +677,7 @@ forbidden_modules = [
 ]
 
 [[tool.importlinter.contracts]]
-name = "Phone front and routes do not import application startup or composition"
+name = "Live session routes and services do not import application startup or composition"
 type = "forbidden"
-source_modules = ["orchestrator.routers.telephony", "orchestrator.services.telephony"]
+source_modules = ["orchestrator.routers.live", "orchestrator.services.live"]
 forbidden_modules = ["orchestrator.main", "orchestrator.application"]

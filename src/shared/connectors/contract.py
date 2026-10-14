@@ -218,6 +218,9 @@ class ServiceSpec:
     ``idle_seconds``: how long a pod without bindings keeps running at
     least, where the installation's idle time is shorter (a driver whose
     first use waits for a cold pod).
+    ``standing``: the pod runs for as long as its connector exists, bindings
+    or not (a phone line's pod must be up before any call arrives); it never
+    idles and counts against the installation's cap like any other pod.
     """
 
     instancing: Literal["shared", "per_execution"] = "shared"
@@ -228,6 +231,7 @@ class ServiceSpec:
     callers: tuple[ServiceCaller, ...] = ("workspace",)
     tls: bool = False
     idle_seconds: int | None = None
+    standing: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -302,6 +306,11 @@ class DriverSpec:
     harness_credentials: tuple[str, ...] = ()
     executions: tuple[ExecutionKind, ...] = EXECUTION_KINDS
     user_creatable: bool = True
+    #: A live driver: its connector receives live sessions (a phone line).
+    #: A live job's session names a connector of such a driver
+    #: (live_session_jobs §2); the cockpit offers its connectors to live
+    #: automations. Its pod is standing and called by the agent process.
+    live: bool = False
 
     def access_level(self, level_id: str) -> AccessLevel | None:
         return next(
@@ -821,8 +830,16 @@ def validate_spec(spec: DriverSpec) -> list[str]:
             or service.idle_seconds < 1
         ):
             problems.append("service idle_seconds is a positive number of seconds")
+        if not isinstance(service.standing, bool):
+            problems.append("service standing is a boolean")
+        elif service.standing and service.idle_seconds is not None:
+            problems.append("a standing service pod never idles: no idle_seconds")
         if service.mcp is not None:
             problems += _managed_mcp_problems(spec)
+    if not isinstance(spec.live, bool):
+        problems.append("live is a boolean")
+    elif spec.live:
+        problems += _live_problems(spec)
     for rule in spec.egress:
         if not rule.host or not rule.ports:
             problems.append("an egress rule needs a host and at least one port")
@@ -839,6 +856,20 @@ def managed_mcp_driver(spec: DriverSpec) -> bool:
         and spec.service.mcp is not None
         and "mcp_client" in spec.delivery_forms
     )
+
+
+def _live_problems(spec: DriverSpec) -> list[str]:
+    """A live driver's pod holds sessions that arrive at any time, and only
+    the job's agent process (its voice subagent) reaches it, by lease."""
+    problems: list[str] = []
+    service = spec.service
+    if service is None or not service.standing:
+        problems.append("a live driver runs a standing service pod")
+    elif tuple(service.callers) != ("harness",):
+        problems.append("a live driver's pod is called by the agent process only")
+    if spec.credential_delivery != "lease":
+        problems.append("a live driver delivers by lease")
+    return problems
 
 
 def _managed_mcp_problems(spec: DriverSpec) -> list[str]:

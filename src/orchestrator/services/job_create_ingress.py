@@ -83,6 +83,11 @@ _SERVER_OWNED_RAW_CREATE_CONTEXT_KEYS = (
         "cloud_checkout",
         "cloud_connectors",
         "job_outbox",
+        # The live session a live job is bound to is written by admission
+        # from execution.session, after it bound the session (live-session
+        # jobs §4.2); a seeded one would point a job at another's call.
+        "live_session",
+        "telephony",
     }
 )
 

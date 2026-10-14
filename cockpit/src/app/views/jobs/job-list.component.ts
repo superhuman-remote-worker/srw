@@ -15,7 +15,7 @@ import {catchError, forkJoin, of} from 'rxjs';
 import {DatePipe} from '@angular/common';
 import {ActivatedRoute, ParamMap, Router} from '@angular/router';
 import {ApiService} from '../../core/services/api.service';
-import {CallService} from '../../core/services/call.service';
+import {LiveSessionService} from '../../core/services/live-session.service';
 import {DataService} from '../../core/services/data.service';
 import {UserService} from '../../core/services/user.service';
 import {environment} from '../../core/environment';
@@ -1218,7 +1218,7 @@ export type {JobCloudAction};
 export class JobListComponent implements OnInit, OnDestroy {
   readonly workspaceCreationMessageKey = workspaceCreationMessageKey;
   private readonly api = inject(ApiService);
-  private readonly callService = inject(CallService);
+  private readonly liveSessionService = inject(LiveSessionService);
   private readonly data = inject(DataService);
   private readonly userService = inject(UserService);
   private readonly transloco = inject(TranslocoService);
@@ -1480,7 +1480,7 @@ export class JobListComponent implements OnInit, OnDestroy {
    *
    * `liveOnly` is what separates the two callers. An explicit Refresh means
    * "show me current numbers", so it reloads every open panel. The 30s poller
-   * reloads non-terminal jobs and jobs with calls (post-call work can arrive).
+   * reloads non-terminal jobs and jobs with sessions (post-call work can arrive).
    * An ordinary finished job's figures cannot change, and
    * refetching three endpoints per open panel every half minute to re-render
    * identical numbers is a poor trade.
@@ -1496,12 +1496,12 @@ export class JobListComponent implements OnInit, OnDestroy {
     for (const jobId of expanded) {
       const state = cache[jobId];
       if (!state || state.loading) continue;
-      // Ended calls can gain post-call answers/follow-ups, including after the
+      // Ended sessions can gain post-call answers/follow-ups, including after the
       // parent job completes. Keep their existing panel refresh alive.
       if (
         opts.liveOnly &&
         isTerminalJobStatus(rows.get(jobId)?.status) &&
-        !state.calls?.length
+        !state.sessions?.length
       ) continue;
       // Whether the reader had asked for the subtree figure; a refresh that
       // silently dropped them back to own-spend would be its own small lie.
@@ -1753,7 +1753,7 @@ export class JobListComponent implements OnInit, OnDestroy {
    */
   private loadJobDetail(jobId: string, refresh = false): void {
     if (this.jobDetails()[jobId] && !refresh) return; // cached, including a failed attempt
-    const previousCalls = this.jobDetails()[jobId]?.calls;
+    const previousSessions = this.jobDetails()[jobId]?.sessions;
     this.jobDetails.update((cache) => ({
       ...cache,
       [jobId]: {
@@ -1768,8 +1768,8 @@ export class JobListComponent implements OnInit, OnDestroy {
         subjobs: null,
         subagents: null,
         // Preserve mounted streams and the reader's scroll position while the
-        // job panel poll is in flight, including a failed calls list read.
-        calls: previousCalls ?? null,
+        // job panel poll is in flight, including a failed sessions list read.
+        sessions: previousSessions ?? null,
       },
     }));
     forkJoin({
@@ -1783,7 +1783,7 @@ export class JobListComponent implements OnInit, OnDestroy {
       // explains the status they opened the panel to understand.
       subjobs: this.api.getJobSubjobs(jobId),
       subagents: this.api.getJobSubagents(jobId),
-      calls: this.callService.getCalls(jobId).pipe(catchError(() => of(null))),
+      sessions: this.liveSessionService.getSessions(jobId).pipe(catchError(() => of(null))),
     })
       .pipe(takeUntilDestroyed(this.destroyRef))
       .subscribe((result) => {
@@ -1803,7 +1803,7 @@ export class JobListComponent implements OnInit, OnDestroy {
             progress: result.progress,
             subjobs: result.subjobs?.subjobs ?? null,
             subagents: result.subagents?.subagents ?? null,
-            calls: result.calls?.calls ?? cache[jobId]?.calls ?? null,
+            sessions: result.sessions?.sessions ?? cache[jobId]?.sessions ?? null,
           },
         }));
       });

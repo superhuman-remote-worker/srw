@@ -56312,6 +56312,9 @@ class PostgresDB:
                 out.append(c)
         if not out:
             raise ValueError("capabilities must be non-empty")
+        if "live_voice" in out and len(out) > 1:
+            # A live voice model is bound by a phone-line connector only.
+            raise ValueError("live_voice must be the only capability of a catalog row")
         return out
 
     async def list_models(
@@ -56805,6 +56808,7 @@ class PostgresDB:
             "search",
             "fetch",
             "rerank",
+            "live_voice",
         }
     )
 
@@ -64773,10 +64777,16 @@ class PostgresDB:
         max_chain_depth: int = 10,
         max_fires_per_day: int = 100,
         next_run_at: datetime | None = None,
+        trigger_connector_id: str | None = None,
+        job_shape: Dict[str, Any] | None = None,
     ) -> Dict[str, Any]:
         """Insert an automation row. Caller pre-computes ``next_run_at`` for
         cron triggers (via croniter against the row's timezone) so the
         dispatcher's first tick can pick it up without a recompute pass.
+
+        A ``live`` trigger fires on a live session arriving at its primary
+        connector ``trigger_connector_id``; ``job_shape`` carries the job's
+        connectors and workspace (live_session_jobs.md §4.4).
 
         v0 only stores cron rows from the API; ``event_filter`` is accepted
         here so the v0.5 event dispatcher can land without a schema change.
@@ -64790,7 +64800,7 @@ class PostgresDB:
                     event_filter, enabled,
                     expert, expert_id, prompt, config_override, autonomy, priority,
                     max_chain_depth, max_fires_per_day,
-                    next_run_at
+                    next_run_at, trigger_connector_id, job_shape
                 )
                 VALUES (
                     $1, $2, $3, $4, $5,
@@ -64798,7 +64808,7 @@ class PostgresDB:
                     $9::jsonb, $10,
                     $11, $12, $13, $14::jsonb, $15, $16,
                     $17, $18,
-                    $19
+                    $19, $20, $21::jsonb
                 )
                 RETURNING *
                 """,
@@ -64821,6 +64831,8 @@ class PostgresDB:
                 max_chain_depth,
                 max_fires_per_day,
                 next_run_at,
+                UUID(trigger_connector_id) if trigger_connector_id else None,
+                json.dumps(job_shape or {}),
             )
         return self._automation_row_to_dict(row)
 
@@ -64881,6 +64893,8 @@ class PostgresDB:
             "max_chain_depth",
             "max_fires_per_day",
             "next_run_at",
+            "job_shape",
+            "trigger_connector_id",
         }
     )
 
@@ -64907,10 +64921,10 @@ class PostgresDB:
         sets: list[str] = []
         params: list[Any] = []
         for key, value in fields.items():
-            if key == "config_override":
+            if key in ("config_override", "job_shape"):
                 params.append(json.dumps(value or {}))
                 sets.append(f"{key} = ${len(params)}::jsonb")
-            elif key == "expert_id":
+            elif key in ("expert_id", "trigger_connector_id"):
                 params.append(UUID(str(value)) if value else None)
                 sets.append(f"{key} = ${len(params)}")
             else:
@@ -65873,6 +65887,70 @@ class PostgresDB:
             UUID(automation_id),
         )
 
+    async def live_automation_for_connector(
+        self, connector_id: str, *, exclude_id: str | None = None
+    ) -> Dict[str, Any] | None:
+        """The enabled live automation listening on a primary connector (at
+        most one: ``uq_automations_live_primary``)."""
+        async with self.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT * FROM automations
+                WHERE enabled AND trigger_type = 'live'
+                  AND trigger_connector_id = $1
+                  AND ($2::uuid IS NULL OR id <> $2)
+                ORDER BY created_at LIMIT 1
+                """,
+                UUID(str(connector_id)),
+                UUID(exclude_id) if exclude_id else None,
+            )
+        return self._automation_row_to_dict(row) if row else None
+
+    async def claim_live_automation_fire(self, automation_id: str) -> bool:
+        """Count one live fire against ``max_fires_per_day``; False when the
+        day's budget is spent (the session is then rejected)."""
+        async with self.acquire() as conn:
+            return bool(
+                await conn.fetchval(
+                    """
+                    UPDATE automations
+                    SET fires_today_count = CASE
+                            WHEN fires_today_date = CURRENT_DATE
+                                THEN fires_today_count + 1
+                            ELSE 1
+                        END,
+                        fires_today_date = CURRENT_DATE,
+                        last_dispatched_at = now(),
+                        updated_at = now()
+                    WHERE id = $1 AND enabled
+                      AND (fires_today_date IS DISTINCT FROM CURRENT_DATE
+                           OR fires_today_count < max_fires_per_day)
+                    RETURNING id
+                    """,
+                    UUID(automation_id),
+                )
+            )
+
+    async def record_live_automation_fire(
+        self, automation_id: str, *, job_id: str | None, status: str | None
+    ) -> None:
+        """A live fire's outcome: the job it created, or why it did not."""
+        async with self.acquire() as conn:
+            await conn.execute(
+                """
+                UPDATE automations
+                SET last_fired_at = now(),
+                    last_job_id = COALESCE($2, last_job_id),
+                    last_status = $3,
+                    run_count = run_count + CASE WHEN $2::uuid IS NULL THEN 0 ELSE 1 END,
+                    updated_at = now()
+                WHERE id = $1
+                """,
+                UUID(automation_id),
+                UUID(job_id) if job_id else None,
+                status,
+            )
+
     async def auto_disable_automation(
         self,
         conn,
@@ -65910,7 +65988,7 @@ class PostgresDB:
         if row is None:
             return None
         out = dict(row)
-        for jsonb_field in ("config_override", "event_filter"):
+        for jsonb_field in ("config_override", "event_filter", "job_shape"):
             value = out.get(jsonb_field)
             if isinstance(value, str):
                 try:

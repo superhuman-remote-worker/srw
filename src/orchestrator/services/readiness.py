@@ -88,7 +88,7 @@ async def compute_readiness(db: Any) -> dict[str, Any]:
         for model in await db.list_models(provider_kind="endpoint"):
             ref = str(model["provider_ref"])
             caps = set(model.get("capabilities") or [])
-            if caps and caps <= {"search", "fetch"}:
+            if caps and caps <= {"search", "fetch", "live_voice"}:
                 research_only.add(ref)
             else:
                 model_endpoints.add(ref)

@@ -309,7 +309,9 @@ def test_gate_error_detail_message_for_no_providers() -> None:
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("capabilities", [["search"], ["search", "fetch"], ["fetch"]])
+@pytest.mark.parametrize(
+    "capabilities", [["search"], ["search", "fetch"], ["fetch"], ["live_voice"]]
+)
 async def test_research_endpoint_does_not_complete_model_provider_setup(capabilities):
     db = _FakeDb(
         endpoints=[{"id": "research-endpoint", "label": "Renamed search service"}],

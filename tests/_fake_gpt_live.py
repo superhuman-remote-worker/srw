@@ -36,7 +36,7 @@ from typing import Any, Callable, Dict, List, Optional
 import aiohttp
 from aiohttp import web
 
-from shared.runtime.telephony.webhook import INCOMING_CALL_EVENT, sign_webhook
+from shared.runtime.live.webhook import INCOMING_CALL_EVENT, sign_webhook
 
 DEFAULT_KEY = "sk-fake-gpt-live"
 

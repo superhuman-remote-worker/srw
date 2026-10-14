@@ -39,7 +39,7 @@ import {ActivatedRoute, RouterLink} from '@angular/router';
 import {ConnectorDriversService} from '../../core/services/connector-drivers.service';
 import {
   ConnectorDriver,
-  managedConnectorDrivers,
+  liveConnectorDrivers, managedConnectorDrivers,
   OfferedAccess,
   offeredAccess,
   publicReadWrite,
@@ -50,6 +50,7 @@ import {
   platformManagedLabelKey,
   platformOwnedKind,
 } from '../../core/models/platform-connector';
+import {LiveConnectorWebhookComponent} from './live-connector-webhook.component';
 import {GenericConnectorFormComponent} from './connector-forms/generic-connector-form.component';
 import {CloudRootCardComponent} from './cloud-root-card.component';
 import {bespokeFormFor} from './connector-forms/connector-form-registry';
@@ -87,6 +88,7 @@ type KeyValueRow = {key: string; value: string};
     AppMenuItemComponent,
     AppMenuTriggerDirective,
     GenericConnectorFormComponent,
+    LiveConnectorWebhookComponent,
     RouterLink,
     CloudRootCardComponent,
   ],
@@ -277,6 +279,13 @@ type KeyValueRow = {key: string; value: string};
                       <option [value]="driver.legacy_type">{{ 'datasources.filter.' + driver.legacy_type | transloco }}</option>
                     }
                   </optgroup>
+                  @if (liveDrivers().length) {
+                    <optgroup [label]="'datasources.form.typeGroupLive' | transloco">
+                      @for (driver of liveDrivers(); track driver.name) {
+                        <option [value]="driver.legacy_type">{{ 'datasources.filter.' + driver.legacy_type | transloco }}</option>
+                      }
+                    </optgroup>
+                  }
                 </app-select>
               </app-form-field>
             </div>
@@ -364,6 +373,9 @@ type KeyValueRow = {key: string; value: string};
               />
             </app-form-field>
 
+            @if (formData.type === 'gpt_live_sip' && editingId()) {
+              <app-live-connector-webhook [connectorId]="editingId()!" />
+            }
             @if (useGenericForm()) {
               <app-generic-connector-form
                 [driver]="formDriver()!"
@@ -2675,6 +2687,7 @@ export class DatasourceListComponent implements OnInit {
    *  own: none has a bespoke section, so the generic form renders its spec
    *  (its config's `access` choice is the driver's own levels). */
   readonly managedDrivers = computed(() => managedConnectorDrivers(this.connectorDrivers.drivers()));
+  readonly liveDrivers = computed(() => liveConnectorDrivers(this.connectorDrivers.drivers()));
 
   /** The installed driver behind the form's type; null until the matrix loads. */
   formDriver(): ConnectorDriver | null {

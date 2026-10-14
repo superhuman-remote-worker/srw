@@ -35,6 +35,8 @@ class JobCreationStore(Protocol):
 
     async def get_job(self, job_id: str) -> dict[str, Any] | None: ...
 
+    def acquire(self) -> Any: ...
+
 
 class AdmitOfficer(Protocol):
     async def __call__(
@@ -133,6 +135,9 @@ class JobAdmissionCreationInputs:
     workspace_selection: dict[str, Any] | None = None
     # A validated inline Expert definition; frozen by the INSERT's snapshot.
     expert_row: dict[str, Any] | None = None
+    # Runs in the INSERT's transaction with the new job's id: a live job's
+    # session is bound with its job or neither is (live_session_jobs §4.2).
+    on_created: Callable[[Any, str], Awaitable[None]] | None = None
 
 
 async def create_admitted_job(
@@ -228,6 +233,10 @@ async def create_admitted_job(
             ) from exc
         except SlotAdmissionError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
+    elif inputs.on_created is not None:
+        async with dependencies.store.acquire() as conn, conn.transaction():
+            result = await dependencies.store.create_job(**create_kwargs, conn=conn)
+            await inputs.on_created(conn, str(result["id"]))
     else:
         result = await dependencies.store.create_job(**create_kwargs)
 

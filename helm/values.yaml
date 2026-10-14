@@ -473,6 +473,19 @@ connectors:
       # its token in the clone URL as before C3 (logged per connector), or
       # "refuse", no clone and the reason in the agent's README.
       fallback: token-in-url
+    # -- The phone-line driver (srw.gpt-live-sip/v1, live-session jobs): one
+    # standing service pod per phone-line connector holds its calls. OpenAI's
+    # GPT-Live answers the SIP call; the pod accepts it when SRW hands the
+    # session over, holds the session's sideband, journals it and serves the
+    # job's voice subagent. Needs servicePods.enabled and a live_voice
+    # catalog model (llm.seed: an OpenAI endpoint plus a gpt-live-1 row with
+    # capabilities [live_voice]). CI stamps tag and digest.
+    gptLiveSip:
+      enabled: false
+      image:
+        repository: ghcr.io/superhuman-remote-worker/srw-driver-gpt-live-sip
+        tag: latest
+        digest: ""
     # -- SRW's connector driver certificate authority (C3): signs each TLS
     # driver pod's certificate; workspaces trust it for the driver's URL
     # only. Generated once at install and kept (resource-policy keep) when
