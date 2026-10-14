@@ -132,8 +132,8 @@ class TestMessages:
         refusal = ma.ModelUnavailable(
             [ma.UnavailableModel("auxiliary", "MiniMax-M3", "disabled")]
         )
-        assert "Admin → Models" in refusal.message(is_admin=True)
-        assert "Admin → Models" not in refusal.message(is_admin=False)
+        assert "Settings → Models → Catalog" in refusal.message(is_admin=True)
+        assert "Settings → Models → Catalog" not in refusal.message(is_admin=False)
 
     def test_unknown_and_roster_slots_read_naturally(self):
         text = ma.render_unavailable_message(
@@ -380,7 +380,7 @@ class TestStatelessAdmission:
             await sia.refuse_unavailable_session_models(
                 {"id": "t", "user_id": "u"}, dependencies=self._deps(store)
             )
-        assert "Admin → Models" in raised.value.detail["message"]
+        assert "Settings → Models → Catalog" in raised.value.detail["message"]
 
     @pytest.mark.asyncio
     async def test_a_runnable_model_and_a_legacy_row_pass(self, snapshot):
@@ -691,7 +691,7 @@ class TestAccountDefaultFallback:
         assert ma.render_fallback_notice(notices[0]) == (
             "Your default model `MiniMax-M3` is no longer available, so this "
             "session uses `gpt-6-astra`. Choose a new default in Settings → "
-            "Preferences."
+            "Defaults."
         )
 
     @pytest.mark.asyncio

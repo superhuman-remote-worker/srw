@@ -225,7 +225,7 @@ def render_unavailable_message(
             f"Choose other models in {place}, or ask your administrator."
         )
     if is_admin and any(e.reason == REASON_DISABLED for e in entries):
-        text += " You can re-enable it in Admin → Models."
+        text += " You can re-enable it in Settings → Models → Catalog."
     return _clip(text)
 
 
