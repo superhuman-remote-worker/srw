@@ -13,6 +13,17 @@
     "latency_ms": 12.3,
     "detail": "status=200"
   },
+  "background_jobs": {
+    "mode": "cron",
+    "last_run_at": "2026-10-14T18:00:00+00:00",
+    "stale": false,
+    "cron_container": true
+  },
+  "retention": {
+    "trashbin": "disabled",
+    "versions": "disabled",
+    "source": "chart"
+  },
   "configuration": {
     "source": "helm",
     "helm": {

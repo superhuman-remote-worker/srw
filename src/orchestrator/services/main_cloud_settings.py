@@ -30,7 +30,11 @@ from typing import Any
 
 from fastapi import HTTPException
 
-from orchestrator.services.cloud import provider_capabilities, provider_matrix
+from orchestrator.services.cloud import (
+    SupportsBackgroundJobsStatus,
+    provider_capabilities,
+    provider_matrix,
+)
 from orchestrator.services.cloud.instance_registry import (
     helm_configuration_status,
     reload_active_main_cloud_instance,
@@ -46,12 +50,17 @@ class MainCloudSettingsDependencies:
     ``store`` is main's ``postgres_db`` and ``cloud_router`` its
     ``main_cloud_router``; both are rebound during ``lifespan``.
     ``replace_installation`` is the deployment's
-    ``cloud.replaceInstallation``, which the page reports.
+    ``cloud.replaceInstallation``, which the page reports. The three
+    ``nextcloud_*`` values are what the chart runs and pins on its bundled
+    Nextcloud (D13); ``None`` and empty for an external one.
     """
 
     store: Any
     cloud_router: Any
     replace_installation: str = ""
+    nextcloud_cron_enabled: bool | None = None
+    nextcloud_trashbin_retention: str = ""
+    nextcloud_versions_retention: str = ""
 
 
 #: How long the page waits for the active provider's health probe.
@@ -75,14 +84,47 @@ async def _health(backend: Any) -> dict[str, Any]:
     }
 
 
+async def _background_jobs(backend: Any) -> dict[str, Any]:
+    """The provider's background-job health; unknown, never an error, when
+    it cannot be read in time."""
+    try:
+        status = await asyncio.wait_for(
+            backend.background_jobs_status(), timeout=_HEALTH_TIMEOUT_SECONDS
+        )
+    except Exception:
+        status = None
+    if not isinstance(status, dict):
+        return {"mode": None, "last_run_at": None, "stale": False}
+    return {
+        "mode": status.get("mode"),
+        "last_run_at": status.get("last_run_at"),
+        "stale": bool(status.get("stale")),
+    }
+
+
+def _retention(dependencies: MainCloudSettingsDependencies) -> dict[str, Any]:
+    """Trash and version retention: what the chart's setup hook pins on its
+    bundled Nextcloud, or ``external`` when the chart did not say."""
+    trashbin = dependencies.nextcloud_trashbin_retention or None
+    versions = dependencies.nextcloud_versions_retention or None
+    if trashbin is None and versions is None:
+        return {"source": "external"}
+    return {"trashbin": trashbin, "versions": versions, "source": "chart"}
+
+
 async def get_main_cloud_page(
     *, dependencies: MainCloudSettingsDependencies
 ) -> dict[str, Any]:
     """The read-only admin Main cloud page: provider, installation, health,
-    where the configuration comes from, and the provider support matrix.
+    background jobs and retention, where the configuration comes from, and
+    the provider support matrix.
 
     Nothing here can change the configuration (Helm owns it). The response
     holds no secret: the routing snapshot's public URL is the only address.
+
+    ``background_jobs`` and ``retention`` are ``None`` for a provider
+    without background jobs (OpenCloud). Trash and version expiry are
+    background jobs, so retention is reported with them (D13).
     """
     active = dependencies.cloud_router.active
     try:
@@ -96,6 +138,17 @@ async def get_main_cloud_page(
         active_row.get("activated_at") if isinstance(active_row, dict) else None
     )
     helm = helm_configuration_status(authority)
+    background_jobs: dict[str, Any] | None = None
+    retention: dict[str, Any] | None = None
+    if isinstance(active, SupportsBackgroundJobsStatus):
+        health, jobs = await asyncio.gather(_health(active), _background_jobs(active))
+        background_jobs = {
+            **jobs,
+            "cron_container": dependencies.nextcloud_cron_enabled,
+        }
+        retention = _retention(dependencies)
+    else:
+        health = await _health(active)
     return {
         "provider": {
             "backend_id": backend_id,
@@ -116,7 +169,9 @@ async def get_main_cloud_page(
             ),
             "initialized": bool(active.is_initialized),
         },
-        "health": await _health(active),
+        "health": health,
+        "background_jobs": background_jobs,
+        "retention": retention,
         "configuration": {
             "source": "helm",
             "helm": {

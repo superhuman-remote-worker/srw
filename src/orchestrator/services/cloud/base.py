@@ -565,3 +565,24 @@ class SupportsFolderGrant(Protocol):
     ) -> None:
         """See :meth:`SupportsRoReader.remove_canary_fixture`."""
         ...
+
+
+@runtime_checkable
+class SupportsBackgroundJobsStatus(Protocol):
+    """Optional capability: the provider's own background-job (cron) health,
+    for the admin Main cloud page (bundled_nextcloud_performance.md, D13).
+
+    Nextcloud's maintenance (trash and version expiry, token cleanup, file
+    scans) runs as background jobs, and an installation whose jobs stopped
+    keeps serving while its database grows. A provider without such jobs
+    (OpenCloud) does not implement this, and the page shows nothing for it.
+    Checked on the adapter with ``isinstance``.
+    """
+
+    async def background_jobs_status(self) -> Optional[dict[str, Any]]:
+        """``{"mode", "last_run_at", "stale"}``: the provider's scheduling
+        mode (``cron``, ``ajax``, ``webcron``, ``none``, or ``None`` when
+        unknown), the last finished run as ISO 8601 (``None`` before the
+        first), and whether a ``cron`` installation has missed its runs.
+        ``None`` when it cannot be read; never raises."""
+        ...

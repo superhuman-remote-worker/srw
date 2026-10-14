@@ -963,6 +963,54 @@ class NextcloudBackend(NextcloudUserRootGrant, NextcloudAgentServiceCredential):
         except Exception as e:
             return HealthStatus(ok=False, latency_ms=0.0, detail=str(e))
 
+    async def background_jobs_status(self) -> Optional[dict[str, Any]]:
+        """Background-job (cron) health for the admin Main cloud page (D13).
+
+        Reads ``core/backgroundjobs_mode`` and ``core/lastcron`` through the
+        provisioning API's app config, as admin. ``cron.php`` stores
+        ``lastcron`` (unix seconds) at the end of every run; it is empty
+        before the first. An unset mode is Nextcloud's own default, ``ajax``.
+        ``stale``: the mode is ``cron`` and no run finished in the last 15
+        minutes (the chart's cron container runs every 5), or none ever did.
+        ``None`` on any failure: the page reports, it never gates.
+        """
+        if not self._initialized or self._client is None:
+            return None
+        try:
+            values: dict[str, str] = {}
+            for key in ("backgroundjobs_mode", "lastcron"):
+                resp = await self._client.get(
+                    "/ocs/v2.php/apps/provisioning_api/api/v1/config/apps/core/" + key,
+                    params={"format": "json"},
+                )
+                if resp.status_code != 200:
+                    return None
+                ocs = resp.json().get("ocs") or {}
+                if (ocs.get("meta") or {}).get("statuscode") != 200:
+                    return None
+                data = ocs.get("data")
+                if not isinstance(data, dict):
+                    return None
+                value = data.get("data")
+                values[key] = str(value if value is not None else "").strip()
+            mode: Optional[str] = values["backgroundjobs_mode"] or "ajax"
+            if mode not in ("cron", "ajax", "webcron", "none"):
+                mode = None
+            lastcron = values["lastcron"]
+            last_run = int(lastcron) if lastcron.isdigit() else 0
+            last_run_at = (
+                datetime.fromtimestamp(last_run, timezone.utc) if last_run > 0 else None
+            )
+            return {
+                "mode": mode,
+                "last_run_at": last_run_at.isoformat() if last_run_at else None,
+                "stale": mode == "cron"
+                and (last_run_at is None or time.time() - last_run > 15 * 60),
+            }
+        except Exception:
+            logger.debug("Nextcloud background job status unreadable", exc_info=True)
+            return None
+
     # ------------------------------------------------------------------ Identity
 
     @instrument_backend_op("resolve_user_identity")

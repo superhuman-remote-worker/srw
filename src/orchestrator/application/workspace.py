@@ -450,6 +450,13 @@ def main_cloud_settings_dependencies(
             store=resources.postgres_db,
             cloud_router=resources.main_cloud_router,
             replace_installation=resources.settings.main_cloud_replace_installation,
+            nextcloud_cron_enabled=resources.settings.nextcloud_cron_enabled,
+            nextcloud_trashbin_retention=(
+                resources.settings.nextcloud_trashbin_retention
+            ),
+            nextcloud_versions_retention=(
+                resources.settings.nextcloud_versions_retention
+            ),
         ),
         require_admin=functools.partial(access_composition.require_admin, resources),
     )
