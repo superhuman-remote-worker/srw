@@ -346,6 +346,55 @@ async def test_depth_infinity_client_never_sends_a_cookie(tmp_path, monkeypatch)
     assert seen == [None, None]
 
 
+_FINITE_DEPTH = (
+    '<?xml version="1.0"?><d:error xmlns:d="DAV:"><d:propfind-finite-depth/></d:error>'
+)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "status, body, refused",
+    [
+        (400, "", True),
+        (405, "", True),
+        (501, "", True),
+        (403, _FINITE_DEPTH, True),
+        (403, "", False),  # a permission answer, not a capability verdict
+        (401, "", False),
+        (404, "", False),  # the folder is created by the first push
+        (423, "", False),
+        (429, "", False),
+        (500, "", False),
+        (503, "", False),
+    ],
+)
+async def test_only_a_refusal_turns_the_depth_infinity_listing_off(
+    tmp_path, monkeypatch, status, body, refused
+):
+    answers = [httpx.Response(status, text=body)]
+    seen: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request.headers["depth"])
+        if answers:
+            return answers.pop(0)
+        return httpx.Response(207, text=_multistatus(f"{_BASE}/a.txt"))
+
+    _mock_http(monkeypatch, handler)
+    sync = _real_sync(tmp_path)
+    try:
+        assert await sync._list_remote_tree_fast() is None  # this pull walks
+        assert sync._depth_infinity_unsupported is refused
+        again = await sync._list_remote_tree_fast()
+    finally:
+        await sync.aclose()
+    if refused:
+        assert again is None and seen == ["infinity"]  # no doomed probe again
+    else:
+        assert [item["path"] for item in again] == ["a.txt"]
+        assert seen == ["infinity", "infinity"]
+
+
 # webdav_disable_check: the HEAD probes are gone, the 404 semantics are not.
 
 
