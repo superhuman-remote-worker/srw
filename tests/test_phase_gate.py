@@ -664,8 +664,8 @@ class TestDelegationBatch:
 
 class TestStrategicTools:
     """``phase_settings.strategic_tools`` opens named tactical tools in the
-    strategic phase for one expert (the voice desk does a live session's
-    follow-ups with its datasource tools in the phase after the session)."""
+    strategic phase for one expert (the receptionist acts on a live session's
+    datasource in the phase after the session)."""
 
     @pytest.mark.asyncio
     async def test_a_listed_tactical_tool_runs_in_the_strategic_phase(self, tool_node):

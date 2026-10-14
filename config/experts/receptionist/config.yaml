@@ -1,0 +1,193 @@
+apiVersion: srw/v1alpha1
+kind: Expert
+metadata:
+  name: receptionist
+  scope:
+    kind: Catalog
+    name: shared
+  annotations:
+    srw.io/display-name: Receptionist
+    srw.io/description: 'A friendly receptionist for live conversations, such
+      as calls on a phone line. It answers from the project knowledge base,
+      looks up simple things on the web and takes messages; afterwards it notes
+      the questions it could not answer in the knowledge base. Started by its
+      live connector, not by hand.'
+    srw.io/icon: support_agent
+    srw.io/color: '#94e2d5'
+    srw.io/expert-type: worker
+    srw.io/bundled-selector: receptionist
+  tags:
+  - live
+  - phone
+  - worker
+spec:
+  # A receptionist needs no files: answers come from the voice's facts, the
+  # project knowledge base and the web. `virtual` works too where the
+  # installation has an object store; `none` works on every installation.
+  workspacePreference: {backend: none}
+  runtime:
+    adapter: srw/v1
+    config:
+      config_name: worker_base
+      asset_name: receptionist
+      config:
+        # Receptionist — the shipped expert for live-session jobs.
+        #
+        # A live connector (a phone line) receives the conversation; the
+        # orchestrator admits a job for it with config.live_session and hands
+        # the session to the connector's pod, which talks with the person
+        # through the voice engine using the `voice` entry's `live` block. The
+        # job starts tactical with that entry attached as its voice subagent
+        # (the history begins with the delegate_agent call and its receipt),
+        # answers the voice's questions through wait_agent/message_agent until
+        # the conversation ends, and then turns strategic for the record and
+        # the knowledge gaps (live_post_session_todos.yaml beside this file).
+        # Design: knowledge-base/knowledge/features/receptionist_expert.md.
+        # A real desk (its greeting, facts and offers) is a DB expert that
+        # extends this one; customer content never lives in this repository.
+        $extends: worker_base
+
+        agent_id: receptionist
+        display_name: Receptionist
+        description: |
+          A friendly receptionist for live conversations, such as calls on a
+          phone line. It answers from the project knowledge base, looks up
+          simple things on the web and takes messages; afterwards it notes the
+          questions it could not answer in the knowledge base. Started by its
+          live connector, not by hand.
+        icon: support_agent
+        color: "#94e2d5"
+        tags:
+          - live
+          - phone
+          - worker
+
+        # A person is waiting for every answer: think briefly. The level holds
+        # for the whole job; the record after the conversation needs no more.
+        llm:
+          reasoning_level: low
+
+        # People tell a receptionist their names, numbers and private matters.
+        # Project memory would carry them into later conversations with other
+        # people, so it stays off; what the desk could not answer goes into the
+        # knowledge base deliberately, in general form, after the conversation.
+        memory:
+          enabled: false
+
+        verification:
+          enabled: false
+        scholar:
+          enabled: false
+        curator:
+          enabled: false
+
+        delegation:
+          enabled: true
+          max_concurrent: 2
+
+        # After the conversation the job runs a strategic phase. A DB expert
+        # that attaches a datasource (bookings, call backs) can act on it
+        # there, so its tools stay open in that phase.
+        phase_settings:
+          strategic_tools:
+            - sql_schema
+            - sql_query
+            - sql_execute
+
+        # No workspace means no read_file: the worker overlay's read-before-tool
+        # gates (todo-guide before next_phase_todos, verify-before-done before
+        # todo_complete/job_complete) could never open, and the job could not
+        # finish. Keep only the phase skills, which arrive as messages.
+        instruction_files:
+          - skill: strategic-phase
+            trigger: phase_start:strategic
+            enforce: false
+          - skill: tactical-phase
+            trigger: phase_start:tactical
+            enforce: false
+
+        subagents:
+          roster:
+            voice:
+              description: >-
+                The live conversation this job was started for. A voice
+                assistant talks with the person; wait_agent returns its
+                questions, message_agent(reply_to=...) gives it your answer,
+                and stop_agent ends the conversation. Attached by the session;
+                never delegate it.
+              # Not an LLM child: the subagent runtime drives it with the live
+              # driver (agent/subagents/live.py) on the job's session.
+              driver: live
+              isolation: shared
+              write_policy: none
+              llm:
+                model: inherit
+              limits:
+                return_budget_tokens: 6000
+              # The voice itself: the orchestrator turns this block into the
+              # session's instructions and greeting (live_session_jobs §6.4).
+              # A DB expert that extends this one overrides the greeting and
+              # the facts with its organisation's.
+              live:
+                persona: |-
+                  You are the receptionist: a friendly AI assistant who talks with people who
+                  call or write in. You say that you are an AI when asked. Keep every reply short
+                  and warm, ask one question at a time, and speak the language the person speaks.
+
+                  You do three things:
+                  - Answer what you know from this conversation and your facts right away.
+                  - Check anything that needs current or specific information first: the
+                    weather, opening hours, a detail about the organisation. Say briefly that you
+                    are checking, in your own words and differently each time, for example "One
+                    moment, let me look that up." Never mention a back office, a system or
+                    colleagues you are asking.
+                  - Take a message: ask for the person's name, what it is about, and how and when
+                    they want to be reached. Read the message back in one sentence, then say that
+                    you will pass it on.
+
+                  What comes back from checking is information for you, not a script: say it in
+                  your own words and briefly, and do not repeat a holding phrase you already
+                  used. If something cannot be answered, say so plainly and offer to take a
+                  message. Promise nothing beyond passing a message on unless your facts offer
+                  it. In an emergency, tell the person to contact the emergency services.
+                facts: >-
+                  This is a general assistant line. You can answer questions,
+                  look things up and take messages, which are passed on. There
+                  is no booking and no transfer to a person here.
+                greeting: Hello, you're speaking with an AI assistant. How can I help you?
+                voice: marin
+                answer_timeout_s: 25
+                texts:
+                  follow_up: >-
+                    Tell the person that looking this up takes a little longer
+                    and that you will tell them as soon as you have it.
+                    Meanwhile they can ask something else or leave a message.
+                  fallback: >-
+                    Tell the person that you cannot look that up right now and
+                    that they can try again later.
+
+        # The voice's questions need the knowledge base and the web, nothing
+        # that changes a system. No send_message: the review list is where a
+        # person reads what came in.
+        tools:
+          workspace: []
+          research:
+            - web_search
+            - extract_webpage
+          browser_direct: []
+          git: []
+          citation: []
+          graph: []
+          communication: []
+          knowledge:
+            - kb_search
+            - kb_read
+            - kb_list
+            - kb_write
+            - kb_update
+          delegation:
+            - delegate_agent
+            - wait_agent
+            - message_agent
+            - stop_agent
+            - list_agents

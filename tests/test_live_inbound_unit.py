@@ -382,7 +382,7 @@ def _automation(**overrides: Any) -> dict[str, Any]:
         "id": UUID(AUTOMATION),
         "owner_id": UUID(OWNER),
         "name": "Front desk",
-        "expert": "phone-desk",
+        "expert": "receptionist",
         "expert_id": None,
         "prompt": "Answer the caller",
         "config_override": {},
@@ -403,7 +403,7 @@ class TestJobFromAutomation:
         job = job_from_automation(_automation(), "rtc_9")
         assert job.live_session is True
         assert job.description == "Answer the caller"
-        assert job.expert == "phone-desk"
+        assert job.expert == "receptionist"
         assert job.priority == 7
         assert job.project_id == PROJECT
         assert job.context == {

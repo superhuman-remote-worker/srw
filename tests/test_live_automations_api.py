@@ -75,7 +75,7 @@ def _live_row(**overrides) -> dict[str, Any]:
             "execution": {"connectors": dict(CONNECTORS)},
             "primary_connector": "telefon",
         },
-        "expert": "phone-desk",
+        "expert": "receptionist",
         "expert_id": None,
         "enabled": False,
         "cron_expr": None,
@@ -114,7 +114,7 @@ def env(monkeypatch):
     monkeypatch.setattr(
         mod,
         "validate_automation_expert_selection",
-        AsyncMock(return_value="phone-desk"),
+        AsyncMock(return_value="receptionist"),
     )
     monkeypatch.setattr(mod, "require_project_member", AsyncMock())
     resolved: list[tuple[Any, dict[str, Any]]] = []
@@ -141,7 +141,7 @@ def _live_body(**overrides) -> mod.AutomationCreate:
     body = {
         "name": "Reception",
         "trigger_type": "live",
-        "expert": "phone-desk",
+        "expert": "receptionist",
         "prompt": "Answer the line",
         "primary_connector": "telefon",
         "job_shape": {"execution": {"connectors": dict(CONNECTORS)}},

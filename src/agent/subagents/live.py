@@ -76,6 +76,7 @@ from shared.runtime.live.contract import (
     clip_append_content,
     event_from_wire,
 )
+from shared.runtime.live.voice_entry import LiveVoiceError, live_entry_text
 
 logger = logging.getLogger(__name__)
 
@@ -99,6 +100,10 @@ DEFAULT_GOODBYE = (
     "conversation is ending."
 )
 _TRANSCRIPT_TAIL_TURNS = 8
+#: A caller stretch this short before a delegation, and not a question, is
+#: read as a confirmation of the exchange before it ("yes, do that";
+#: phone_calls_as_subagents §7.4 B5).
+_CONFIRMATION_MAX_WORDS = 5
 _GOODBYE_GRACE_S = 6.0
 #: How long an append or a stop waits for the first connection to the pod.
 _CONNECT_WAIT_S = 5.0
@@ -1023,9 +1028,34 @@ class LiveVoiceDriver:
         while index >= 0 and turns[index].speaker == "caller":
             block.insert(0, turns[index].text.strip())
             index -= 1
-        request = " ".join(t for t in block if t) or self.transcript.last_caller_text()
+        request = " ".join(t for t in block if t)
+        if (
+            request
+            and len(request.split()) <= _CONFIRMATION_MAX_WORDS
+            and not request.endswith("?")
+        ):
+            # A bare confirmation ("yes, do that") names no topic: carry the
+            # exchange it confirms, even from before the previous delegation.
+            exchange = self._exchange_before(self._last_delegation_turn + index)
+            if exchange:
+                request = f"{exchange}\nCaller: {request}"
         self._last_delegation_turn = end
-        return request
+        return request or self.transcript.last_caller_text()
+
+    def _exchange_before(self, index: int) -> str:
+        """The voice's reply at ``index`` and the caller's stretch before it."""
+
+        turns = self.transcript.turns
+        lines: List[str] = []
+        for speaker in ("assistant", "caller"):
+            stretch: List[str] = []
+            while index >= 0 and turns[index].speaker == speaker:
+                if turns[index].text.strip():
+                    stretch.insert(0, turns[index].text.strip())
+                index -= 1
+            if stretch:
+                lines.insert(0, f"{_SPEAKER_LABEL[speaker]}: {' '.join(stretch)}")
+        return "\n".join(lines)
 
     def _note_follow_up(self, delegation_id: str, *, upto_turn: Optional[int]) -> None:
         if delegation_id in self.questions:
@@ -1414,9 +1444,12 @@ async def attach_live_session(context: Any) -> Optional[List[Any]]:
             live_attach=True,
         )
     )
-    if str(receipt).startswith("Error:"):
+    receipt = str(receipt)
+    if receipt.startswith("Error:"):
         logger.error("live-session job: the voice subagent was refused: %s", receipt)
         _end_unattached(context, "the voice subagent could not start")
+    else:
+        receipt += voice_briefing(runtime.roster.get(name))
     return [
         AIMessage(
             content="",
@@ -1429,7 +1462,30 @@ async def attach_live_session(context: Any) -> Optional[List[Any]]:
                 }
             ],
         ),
-        ToolMessage(
-            content=str(receipt), tool_call_id=tool_call_id, name="delegate_agent"
-        ),
+        ToolMessage(content=receipt, tool_call_id=tool_call_id, name="delegate_agent"),
     ]
+
+
+def voice_briefing(entry: Optional[Mapping[str, Any]]) -> str:
+    """The voice's facts for the back office, appended to the attach receipt.
+
+    The voice answers what its facts cover by itself and hands over the rest;
+    without them the back office would not know what the person was already
+    told (phone_calls_as_subagents §7.4 I1). ``""`` when there are none.
+    """
+
+    live = entry.get("live") if isinstance(entry, Mapping) else None
+    if not isinstance(live, Mapping):
+        return ""
+    try:
+        facts = live_entry_text(live, entry, "facts")
+    except LiveVoiceError as exc:
+        logger.warning("live-session job: the voice's facts are unreadable: %s", exc)
+        return ""
+    if not facts:
+        return ""
+    return (
+        "\n\nThe voice was briefed with these facts. It answers what they "
+        "cover by itself and hands you everything else; rely on them in your "
+        f"answers too.\n<voice_facts>\n{facts}\n</voice_facts>"
+    )

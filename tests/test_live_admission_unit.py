@@ -487,7 +487,7 @@ async def _prepare(
         datasource_ids=list(datasource_ids),
         effective_user_id="user-1",
         project_id=PROJECT,
-        config_name="phone-desk",
+        config_name="receptionist",
         expert_id=None,
         expert_row=None,
         config_override={"autonomy": "full"},
@@ -528,7 +528,7 @@ class TestPrepareLiveSession:
         insert = db.conn.fetchrow.await_args_list[0].args
         assert "INSERT INTO live_sessions" in insert[0]
         assert insert[1:] == (UUID(CONNECTOR), "rtc_1", "manifest")
-        assert voice_resolved.await_args.kwargs["config_name"] == "phone-desk"
+        assert voice_resolved.await_args.kwargs["config_name"] == "receptionist"
         assert voice_resolved.await_args.kwargs["config_override"] == {
             "autonomy": "full"
         }

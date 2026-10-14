@@ -30,6 +30,7 @@ from agent.subagents.live import (
     attach_live_session,
     is_live_entry,
     live_lease_from_payload,
+    voice_briefing,
 )
 from tests._fake_live_pod import INTERNAL_KEY, LEASE, FakeLivePod
 from tests.test_subagent_background_runtime import StrictLedger
@@ -204,6 +205,45 @@ class TestHelpers:
         )
         driver.transcript.add("caller", "And when do I leave?")
         assert driver._request_upto(None) == "And when do I leave?"
+
+    def test_a_bare_confirmation_carries_the_exchange_it_confirms(self):
+        """ "Yes, do that" names no topic (phone_calls_as_subagents §7.4 B5)."""
+        settings = LiveSessionSettings.from_config(
+            {"live_session": {"session_id": "s", "endpoint_url": "http://p"}}
+        )
+        driver = LiveVoiceDriver(
+            settings,
+            handle="voice-1",
+            subagent_type="voice",
+            subagent_id="x",
+            client=MagicMock(),
+        )
+        for speaker, text in [
+            ("assistant", "Hello."),
+            ("caller", "How is the weather "),
+            ("caller", "in Bad Orb?"),
+            ("assistant", "Shall I look that up for you?"),
+            ("caller", "Yes, please do that."),
+            ("assistant", "One moment."),
+        ]:
+            driver.transcript.add(speaker, text)
+        assert driver._request_upto(None) == (
+            "Caller: How is the weather in Bad Orb?\n"
+            "Assistant: Shall I look that up for you?\n"
+            "Caller: Yes, please do that."
+        )
+        # The exchange may lie before the previous delegation's mark.
+        driver.transcript.add("assistant", " It is sunny. Shall I check tomorrow?")
+        driver.transcript.add("caller", "Yes.")
+        assert driver._request_upto(None) == (
+            "Caller: Yes, please do that.\n"
+            "Assistant: One moment. It is sunny. Shall I check tomorrow?\n"
+            "Caller: Yes."
+        )
+        # A short question stands on its own.
+        driver.transcript.add("assistant", "Tomorrow is sunny too.")
+        driver.transcript.add("caller", "Is it raining?")
+        assert driver._request_upto(None) == "Is it raining?"
 
 
 class TestLiveSubagent:
@@ -641,7 +681,38 @@ class TestLiveJob:
         pod.close(sid)
         await runtime.wait_agent(handle, 10)
         assert ctx.consume_live_session_end() == "remote_hangup"
+        assert "<voice_facts>" not in exchange[1].content
         await runtime.close()
+
+    @pytest.mark.asyncio
+    async def test_the_receipt_tells_the_back_office_the_voices_facts(
+        self, tmp_path, pod
+    ):
+        """The voice answers what its facts cover; the job must know them too
+        (phone_calls_as_subagents §7.4 I1)."""
+        sid = pod.open_session()
+        ctx = parent_with_session(
+            tmp_path, pod, sid, facts="We open at nine.", greeting="Hello."
+        )
+        runtime = runtime_for(ctx, ledger=StrictLedger())
+
+        exchange = await attach_live_session(ctx)
+
+        receipt = exchange[1].content
+        assert "queued" in receipt
+        assert receipt.endswith("<voice_facts>\nWe open at nine.\n</voice_facts>")
+        await runtime.close()
+
+    def test_the_briefing_reads_a_facts_file_and_skips_what_it_cannot_read(
+        self, tmp_path
+    ):
+        (tmp_path / "facts.md").write_text("Parking is free.\n")
+        entry = {"_deployment_dir": str(tmp_path), "live": {"facts_file": "facts.md"}}
+        assert "Parking is free." in voice_briefing(entry)
+        missing = {"_deployment_dir": str(tmp_path), "live": {"facts_file": "x.md"}}
+        assert voice_briefing(missing) == ""
+        assert voice_briefing({"live": {"facts": "  "}}) == ""
+        assert voice_briefing(None) == ""
 
     @pytest.mark.asyncio
     async def test_other_jobs_are_untouched(self, tmp_path):
@@ -765,28 +836,52 @@ class TestLiveJob:
         assert todo.is_strategic_phase is False
         assert tool_context._initial_tool_exchange is None
 
-    def test_voice_desk_expert(self):
+    def test_receptionist_expert(self):
+        """The shipped live-session expert (receptionist_expert.md)."""
         import yaml
 
-        from shared.runtime.core.loader import load_agent_config
+        from shared.runtime.core.loader import (
+            get_live_post_session_todos_from_config,
+            load_agent_config,
+        )
 
-        path = Path(__file__).resolve().parents[1] / "config/experts/phone-desk"
-        cfg = load_agent_config(str(path / "config.yaml"))
+        path = Path(__file__).resolve().parents[1] / "config/experts/receptionist"
+        # Dispatch resolves the expert's directory from its asset_name.
+        cfg = load_agent_config(str(path / "config.yaml"), deployment_dir=str(path))
         assert cfg.delegation.enabled is True
         entry = cfg.subagents.roster["voice"]
         assert is_live_entry(entry)
         assert cfg.subagents.default is None  # never delegated by default
         assert entry["live"]["voice"] == "marin"
         assert "AI assistant" in entry["live"]["greeting"]
+        assert "take a message" in entry["live"]["persona"].lower()
         assert {"wait_agent", "message_agent", "delegate_agent", "stop_agent"} <= set(
             cfg.tools.delegation
         )
+        # A person waits for every answer; their details stay out of memory.
+        assert cfg.llm.reasoning_level == "low"
+        assert cfg.memory.enabled is False
         raw = yaml.safe_load((path / "config.yaml").read_text())
         authored = raw["spec"]["runtime"]["config"]["config"]
-        # SRW does not restrict live jobs: no autonomy or memory overrides.
-        assert "autonomy" not in authored and "memory" not in authored
-        # The bundled desk starts tactical from the framework's live todos.
+        assert authored["tools"]["research"] == ["web_search", "extract_webpage"]
+        assert authored["tools"]["knowledge"] == [
+            "kb_search",
+            "kb_read",
+            "kb_list",
+            "kb_write",
+            "kb_update",
+        ]
+        assert authored["tools"]["communication"] == []
+        # The automation sets the autonomy (no per-job-kind rules).
+        assert "autonomy" not in authored
+        assert raw["spec"]["workspacePreference"] == {"backend": "none"}
+        # It starts tactical from the framework's live todos and records the
+        # conversation and its knowledge gaps from its own post-session todos.
         assert not (path / "strategic_todos_initial.yaml").exists()
+        after = get_live_post_session_todos_from_config(cfg, None)
+        assert [t["id"] for t in after] == ["todo_1", "todo_2"]
+        assert 'kb_write(type="question"' in after[0]["content"]
+        assert "job_complete" in after[1]["content"]
 
 
 class TestAgentAttach:

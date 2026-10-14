@@ -739,7 +739,7 @@ async def _automation(db, owner: str, connector: str | None, **overrides) -> dic
         "owner_id": owner,
         "name": f"desk-{uuid4().hex[:6]}",
         "trigger_type": "live",
-        "expert": "phone-desk",
+        "expert": "receptionist",
         "prompt": "Answer the line",
         "trigger_connector_id": connector,
         "job_shape": {

@@ -206,7 +206,7 @@ async def _live_session(db, connector_id=LINE, datasource_ids=(LINE,)):
         EXECUTION,
         connector_id,
         list(datasource_ids),
-        config_name="phone-desk",
+        config_name="receptionist",
         expert_row={"config": {"agent": {}}},
         config_override={"autonomy": "full"},
     )
@@ -229,7 +229,7 @@ class TestLiveSessionOfAManifestJob:
         _sql, connector, provider_id, origin = db.conn.fetchrow.await_args.args
         assert (connector, provider_id, origin) == (UUID(LINE), "rtc_123", "manifest")
         assert voice.await_args.kwargs == {
-            "config_name": "phone-desk",
+            "config_name": "receptionist",
             "expert_id": None,
             "expert_row": {"config": {"agent": {}}},
             "config_override": {"autonomy": "full"},

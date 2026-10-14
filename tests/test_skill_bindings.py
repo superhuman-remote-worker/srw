@@ -551,7 +551,7 @@ def test_serialize_freezes_expert_local_phase_skill():
 def test_runtime_and_cockpit_schemas_agree_on_the_live_voice_entry():
     """The roster entry's ``driver: live`` + ``live`` block and
     ``phase_settings.strategic_tools`` (live_session_jobs §6.3): one definition
-    in both schemas, and the bundled voice desk validates against it."""
+    in both schemas, and the bundled receptionist validates against it."""
     import json
 
     import jsonschema
@@ -583,7 +583,7 @@ def test_runtime_and_cockpit_schemas_agree_on_the_live_voice_entry():
     )
 
     validator = jsonschema.Draft202012Validator(runtime)
-    desk = yaml.safe_load(_P("config/experts/phone-desk/config.yaml").read_text())
+    desk = yaml.safe_load(_P("config/experts/receptionist/config.yaml").read_text())
     authored = desk["spec"]["runtime"]["config"]["config"]
     errors = [e for e in validator.iter_errors(authored) if e.validator != "required"]
     assert not errors, [e.message for e in errors]

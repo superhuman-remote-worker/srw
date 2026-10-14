@@ -15,13 +15,22 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Any, Mapping
 
-from shared.runtime.core.loader import get_project_root
 from shared.runtime.live.contract import MAX_APPEND_CHARS
+from shared.runtime.live.voice_entry import LiveVoiceError, live_entry_text
 
 logger = logging.getLogger(__name__)
+
+__all__ = [
+    "LiveVoice",
+    "LiveVoiceError",
+    "build_live_voice",
+    "find_live_entry",
+    "greeting_instruction",
+    "live_voice_of",
+    "session_instructions",
+]
 
 #: The engine's instruction budget (16k tokens at three characters each).
 MAX_INSTRUCTION_CHARS = 16_000 * 3
@@ -39,10 +48,6 @@ DEFAULT_FALLBACK = (
     "Tell the caller: I have noted your request. A colleague will get back to "
     "you as soon as possible."
 )
-
-
-class LiveVoiceError(ValueError):
-    """The expert's live voice entry cannot be used (a contradiction)."""
 
 
 @dataclass(frozen=True)
@@ -70,41 +75,6 @@ def find_live_entry(agent: Mapping[str, Any]) -> tuple[str, Mapping[str, Any]] |
     if default in live:
         return str(default), live[default]
     return next(iter(live.items()), None)
-
-
-def _read_entry_file(entry: Mapping[str, Any], name: str, key: str) -> str:
-    """A ``persona_file``/``facts_file`` beside the expert that names it."""
-    directory = entry.get("_deployment_dir")
-    if not isinstance(name, str) or not name or not directory:
-        raise LiveVoiceError(
-            f"live.{key} names a file this expert has no directory for"
-        )
-    relative = Path(name)
-    if relative.is_absolute() or ".." in relative.parts:
-        raise LiveVoiceError(
-            f"live.{key} must be a file name in the expert's directory"
-        )
-    base = Path(directory)
-    if not base.is_absolute():
-        base = get_project_root() / base
-    path = (base / relative).resolve()
-    if not path.is_relative_to(base.resolve()) or not path.is_file():
-        raise LiveVoiceError(f"live.{key} names no file in the expert's directory")
-    return path.read_text(encoding="utf-8")
-
-
-def _text(live: Mapping[str, Any], entry: Mapping[str, Any], key: str) -> str:
-    value = live.get(key)
-    file_name = live.get(f"{key}_file")
-    if value is not None and file_name is not None:
-        raise LiveVoiceError(f"live.{key} and live.{key}_file are exclusive")
-    if file_name is not None:
-        return _read_entry_file(entry, file_name, f"{key}_file").strip()
-    if value is None:
-        return ""
-    if not isinstance(value, str):
-        raise LiveVoiceError(f"live.{key} is text")
-    return value.strip()
 
 
 def session_instructions(persona: str, facts: str, *, entry: str = "") -> str:
@@ -148,7 +118,9 @@ def build_live_voice(name: str, entry: Mapping[str, Any]) -> LiveVoice:
     return LiveVoice(
         entry=name,
         instructions=session_instructions(
-            _text(live, entry, "persona"), _text(live, entry, "facts"), entry=name
+            live_entry_text(live, entry, "persona"),
+            live_entry_text(live, entry, "facts"),
+            entry=name,
         ),
         greeting_instruction=greeting_instruction(greeting.strip()),
         voice=voice,

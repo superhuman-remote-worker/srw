@@ -907,11 +907,11 @@ def test_a_live_voice_entry_passes_the_authoring_check():
         )
         == set()
     )
-    # The bundled voice desk's own entry.
+    # The bundled receptionist's own entry.
     raw = yaml.safe_load(
         (
             Path(__file__).resolve().parents[1]
-            / "config/experts/phone-desk/config.yaml"
+            / "config/experts/receptionist/config.yaml"
         ).read_text()
     )
     validate_roster_fragment(raw["spec"]["runtime"]["config"]["config"]["subagents"])
