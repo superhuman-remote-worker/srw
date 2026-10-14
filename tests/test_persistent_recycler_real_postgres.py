@@ -51,13 +51,13 @@ from orchestrator.services.pinned_k8s_effect import (
     PINNED_WARM_PROTECTION_FENCE_ANNOTATION,
 )
 from orchestrator.services.pinned_retirement import PinnedRetirementOperations
-from orchestrator.services.session_attach_binding import find_idle_persistent_agent
 from orchestrator.services.persistent_recycler import (
     PersistentPodObservation,
     PersistentThreadRecycler,
     persistent_recycle_view,
     read_recycle_record,
 )
+from orchestrator.services.session_attach_binding import find_idle_persistent_agent
 from agent.database.postgres_db import PostgresDB as AgentPostgresDB
 from shared.persistent_input_delivery import (
     InputDeliveryAuthorityLost,
@@ -1976,10 +1976,19 @@ async def test_permanent_delete_requires_exact_physical_quiescence(db):
     assert agent_row is not None
     assert agent_row["thread_id"] is None
     assert agent_row["status"] == "offline"
+    # The agent's next heartbeat reporting ready must not resurrect the row.
+    await db.heartbeat(ids["agent"], status="ready")
+    async with db.acquire() as conn:
+        assert (
+            await conn.fetchval(
+                "SELECT status FROM agents WHERE id=$1::uuid", UUID(ids["agent"])
+            )
+            == "offline"
+        )
     idle = await find_idle_persistent_agent(
         dependencies=SimpleNamespace(store=_PoolFetchStore(db))
     )
-    assert idle is None or str(idle["id"]) != ids["agent"]
+    assert idle is None
 
 
 @pytest.mark.asyncio
