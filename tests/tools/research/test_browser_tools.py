@@ -150,31 +150,6 @@ class TestProxyConfigFromConfig:
             assert config.password == "pass"
 
 
-class TestProxyConfigToPlaywright:
-    """Tests for ProxyConfig.to_playwright_proxy method."""
-
-    def test_returns_none_when_unconfigured(self):
-        config = ProxyConfig()
-        assert config.to_playwright_proxy() is None
-
-    def test_returns_proxy_dict(self):
-        config = ProxyConfig(type=ProxyType.SOCKS5, host="localhost", port=1080)
-        result = config.to_playwright_proxy()
-        assert result == {"server": "socks5://localhost:1080"}
-
-    def test_includes_auth(self):
-        config = ProxyConfig(
-            type=ProxyType.HTTP,
-            host="proxy.example.com",
-            port=8080,
-            username="user",
-            password="pass",
-        )
-        result = config.to_playwright_proxy()
-        assert result["username"] == "user"
-        assert result["password"] == "pass"
-
-
 # ── No-local-browser regression guard ──────────────────────────────
 
 

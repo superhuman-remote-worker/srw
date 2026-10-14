@@ -133,22 +133,6 @@ class ProxyConfig:
             password=config.get("password") or os.getenv("RESEARCH_PROXY_PASS"),
         )
 
-    def to_playwright_proxy(self) -> Optional[Dict[str, str]]:
-        """Convert to Playwright proxy format (dict).
-
-        Returns:
-            Dict for Playwright's proxy parameter, or None if no proxy.
-        """
-        if not self.is_configured:
-            return None
-
-        proxy: Dict[str, str] = {"server": self.url}
-        if self.username:
-            proxy["username"] = self.username
-        if self.password:
-            proxy["password"] = self.password
-        return proxy
-
     def to_aiohttp_connector(self) -> Optional[Any]:
         """Create an aiohttp-socks ProxyConnector for this proxy config.
 
