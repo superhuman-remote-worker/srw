@@ -74,23 +74,34 @@ _ACCESS_LINE = re.compile(
 
 _REQUEST_PROBE = r"""
 import asyncio, json, sys, time
+from orchestrator.database import PostgresDB
 from orchestrator.services.cloud import SessionFolderHandle, build_backend
+from orchestrator.services.cloud.service_credentials import (
+    configure_service_credential_store,
+)
 
 instance, folder, email, name = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
 count = int(sys.argv[5])
 
 
 async def main():
+    # agent-service's stored app password, as the orchestrator adopts it.
+    db = PostgresDB(min_connections=1, max_connections=2)
+    await db.connect()
+    configure_service_credential_store(db)
     backend = build_backend("nextcloud")
     backend.bind_backend_instance(instance)
     if not await backend.ensure_initialized():
+        await db.close()
         raise SystemExit("the Nextcloud backend did not initialize")
-    result = {"identity": None, "agent": [], "admin": []}
+    result = {"identity": None, "agent": [], "admin": [], "agent_secret": None}
     try:
         if count == 0:
             result["identity"] = await backend.resolve_user_identity(email, name)
             return result
+        # Untimed: adopts (or mints) the app password, then creates the folder.
         await backend.ensure_session_folder(session_id=folder)
+        result["agent_secret"] = getattr(backend, "_agent_secret_kind", "password")
         for _ in range(count):
             started = time.perf_counter()
             await backend.ensure_session_folder(session_id=folder)
@@ -105,6 +116,7 @@ async def main():
                 SessionFolderHandle(backend="nextcloud", native_id=f"sessions/{folder}")
             )
         await backend.close()
+        await db.close()
     return result
 
 
@@ -349,6 +361,8 @@ class Gate:
             "agent_service": {
                 **summary_ms(result["agent"]),
                 "requests_per_call": round((len(mkcols) - 1) / n, 2),
+                # "app_password" once WP1b adopted one, else "password".
+                "secret": result.get("agent_secret"),
             },
             "admin": {
                 **summary_ms(result["admin"]),
