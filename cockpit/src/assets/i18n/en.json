@@ -1847,6 +1847,12 @@
       "folder": "Folder",
       "cloudAccessHint": "Agents get this folder through its connector, at the level set under Connectors → Cloud folders (or chosen for a session).",
       "cloudUnavailable": "Cloud storage unavailable — not configured.",
+      "cloudFolderFailed": {
+        "nameTaken": "This project has no cloud folder: the cloud already has folders with its name and its fallback name. Rename the project; SRW retries when it is opened, at most once an hour.",
+        "refused": "This project has no cloud folder: the cloud refused SRW's administrator account. SRW retries when the project is opened, at most once an hour.",
+        "unreachable": "This project has no cloud folder: the cloud could not be reached. SRW retries when the project is opened, at most once an hour.",
+        "other": "This project has no cloud folder: creating it failed. SRW retries when the project is opened, at most once an hour."
+      },
       "workspaceNetwork": "Workspace Network",
       "networkTier": "Egress Tier",
       "networkTierInternetOnly": "Internet only (default)",

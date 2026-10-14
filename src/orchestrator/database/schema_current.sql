@@ -30762,6 +30762,7 @@ CREATE TABLE public.projects (
     network_tier text DEFAULT 'internet-only'::text NOT NULL,
     main_cloud_backend_instance_id uuid,
     manifest_resource_id uuid,
+    main_cloud_folder_error text,
     CONSTRAINT projects_network_tier_check CHECK ((network_tier = ANY (ARRAY['internet-only'::text, 'home-allowed'::text]))),
     CONSTRAINT valid_project_status CHECK (((status)::text = ANY ((ARRAY['active'::character varying, 'archived'::character varying])::text[])))
 );
@@ -30779,6 +30780,13 @@ COMMENT ON COLUMN public.projects.status IS 'Project lifecycle: active|archived,
 --
 
 COMMENT ON COLUMN public.projects.network_tier IS 'Workspace pod-network egress tier. Controls which CIDRs the project''s workspace pods can reach. The orchestrator emits this value as the srw.io/network-tier pod label; the matching helm NetworkPolicy (one per tier) enforces the allowlist. See docs/features/workspace_network_isolation.md §3.';
+
+
+--
+-- Name: COLUMN projects.main_cloud_folder_error; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.projects.main_cloud_folder_error IS 'Why the project''s main-cloud folder could not be created: the error kind of the last failed attempt (already_exists, permission_denied, unavailable, ...). NULL when none failed or once one succeeded. Written by project cloud provisioning, shown on the project page.';
 
 
 --

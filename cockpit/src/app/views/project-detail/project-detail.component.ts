@@ -1276,6 +1276,10 @@ type Tab = 'overview' | 'jobs' | 'knowledge' | 'datasources' | 'repos' | 'expert
                   <p class="text-muted setting-desc" data-cloud-access-hint>
                     {{ 'projectDetail.settings.cloudAccessHint' | transloco }}
                   </p>
+                } @else if (proj.main_cloud_folder_error) {
+                  <p class="edit-error" role="alert" data-cloud-folder-error>
+                    {{ cloudFolderFailureKey(proj.main_cloud_folder_error) | transloco }}
+                  </p>
                 } @else {
                   <p class="text-muted setting-desc">
                     {{ 'projectDetail.settings.cloudUnavailable' | transloco }}
@@ -2615,6 +2619,20 @@ export class ProjectDetailPageComponent implements OnInit, OnDestroy {
   linkLevelEnforcedBy(ds: ProjectDatasource): string | null {
     const level = this.linkLevel(ds);
     return this.linkLevels(ds).find((entry) => entry.id === level)?.enforced_by ?? null;
+  }
+
+  /** The text for a failed cloud folder create, by its error kind (a closed
+   *  set the server stores, never the cloud's own words). */
+  cloudFolderFailureKey(kind: string): string {
+    const known: Record<string, string> = {
+      already_exists: 'nameTaken',
+      permission_denied: 'refused',
+      authentication_failed: 'refused',
+      unavailable: 'unreachable',
+      timeout: 'unreachable',
+      throttled: 'unreachable',
+    };
+    return `projectDetail.settings.cloudFolderFailed.${known[kind] ?? 'other'}`;
   }
 
   levelLabel(level: string | null): string {

@@ -1847,6 +1847,12 @@
       "folder": "Ordner",
       "cloudAccessHint": "Agenten erhalten diesen Ordner über seinen Konnektor, mit der Stufe aus Konnektoren → Cloud-Ordner (oder der für eine Session gewählten).",
       "cloudUnavailable": "Cloud-Speicher nicht verfügbar — nicht konfiguriert.",
+      "cloudFolderFailed": {
+        "nameTaken": "Dieses Projekt hat keinen Cloud-Ordner: In der Cloud gibt es schon Ordner mit seinem Namen und seinem Ausweichnamen. Benennen Sie das Projekt um; SRW versucht es erneut, wenn es geöffnet wird, höchstens einmal pro Stunde.",
+        "refused": "Dieses Projekt hat keinen Cloud-Ordner: Die Cloud hat SRWs Administratorkonto abgewiesen. SRW versucht es erneut, wenn das Projekt geöffnet wird, höchstens einmal pro Stunde.",
+        "unreachable": "Dieses Projekt hat keinen Cloud-Ordner: Die Cloud war nicht erreichbar. SRW versucht es erneut, wenn das Projekt geöffnet wird, höchstens einmal pro Stunde.",
+        "other": "Dieses Projekt hat keinen Cloud-Ordner: Das Anlegen ist fehlgeschlagen. SRW versucht es erneut, wenn das Projekt geöffnet wird, höchstens einmal pro Stunde."
+      },
       "workspaceNetwork": "Workspace-Netzwerk",
       "networkTier": "Egress-Stufe",
       "networkTierInternetOnly": "Nur Internet (Standard)",

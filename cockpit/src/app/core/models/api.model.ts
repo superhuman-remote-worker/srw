@@ -1419,6 +1419,9 @@ export interface Project {
   nextcloud_folder_id?: number | null;
   cloud_storage_url?: string | null;
   main_cloud_backend?: string | null;
+  /** Why the project has no cloud folder: the error kind of its last failed
+   *  create (`already_exists`, `permission_denied`, …), or null. */
+  main_cloud_folder_error?: string | null;
   network_tier?: ProjectNetworkTier;
   created_at: string;
   updated_at: string;

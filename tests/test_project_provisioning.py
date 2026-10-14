@@ -513,6 +513,112 @@ class TestHealLock:
 
 
 # =============================================================================
+# A refused folder create reaches the project page
+# =============================================================================
+
+
+class _FolderErrorStore(_HealStore):
+    """``_HealStore`` that records the folder error, as the row column does."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.error_writes: list[str | None] = []
+
+    async def set_project_main_cloud_folder_error(
+        self, _project_id: str, error: str | None
+    ) -> None:
+        self.error_writes.append(error)
+        self.row["main_cloud_folder_error"] = error
+
+
+class TestRefusedFolderReachesTheProjectPage:
+    """Groupfolders 20+ refuses a taken mount point; a refusal is neither
+    swallowed nor fatal: the project stands without a folder and its row says
+    why (a closed error kind), until a create succeeds."""
+
+    @staticmethod
+    def _deps_for(store: _HealStore, backend: SimpleNamespace):
+        return _deps(
+            store=store,
+            main_cloud_router=SimpleNamespace(
+                for_project_optional=MagicMock(return_value=backend),
+                for_owner=MagicMock(return_value=backend),
+                active_instance_id=backend.backend_instance_id,
+            ),
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_refusal_is_recorded_then_cleared_by_a_success(self):
+        from orchestrator.services.cloud import (
+            CloudBackendError,
+            CloudBackendErrorKind,
+        )
+
+        store = _FolderErrorStore()
+        backend = _folder_backend()
+        handle = SimpleNamespace(native_id="drive-1", to_db=lambda: "opencloud:drive-1")
+        backend.ensure_project_folder = AsyncMock(
+            side_effect=[
+                CloudBackendError(
+                    CloudBackendErrorKind.ALREADY_EXISTS,
+                    "Group Folders exist at both names",
+                    backend="nextcloud",
+                ),
+                handle,
+            ]
+        )
+        deps = self._deps_for(store, backend)
+
+        result = await provisioning.ensure_project_cloud_resources(
+            dict(store.row), dependencies=deps
+        )
+
+        assert store.row["main_cloud_folder_error"] == "already_exists"
+        assert result["main_cloud_folder_error"] == "already_exists"
+        assert store.row["main_cloud_folder_handle"] is None
+        assert getattr(store, "connectors", {}) == {}
+        backend.ensure_project_folder.assert_awaited_with(
+            project_name="Locked",
+            group_id=f"project-{PROJECT_ID}",
+            project_id=PROJECT_ID,
+        )
+
+        # The same refusal again is not rewritten; a success clears it.
+        await provisioning.ensure_project_cloud_resources(
+            dict(store.row), dependencies=deps
+        )
+        assert store.row["main_cloud_folder_error"] is None
+        assert store.row["main_cloud_folder_handle"] == "opencloud:drive-1"
+        assert store.error_writes == ["already_exists", None]
+
+    @pytest.mark.asyncio
+    async def test_any_other_failure_is_unknown(self):
+        store = _FolderErrorStore()
+        backend = _folder_backend()
+        backend.ensure_project_folder = AsyncMock(side_effect=AttributeError("x"))
+
+        await provisioning.ensure_project_cloud_resources(
+            dict(store.row), dependencies=self._deps_for(store, backend)
+        )
+
+        assert store.error_writes == ["unknown"]
+
+    @pytest.mark.asyncio
+    async def test_a_failing_record_never_fails_provisioning(self):
+        store = _HealStore()  # no set_project_main_cloud_folder_error
+        backend = _folder_backend()
+        backend.ensure_project_folder = AsyncMock(side_effect=AttributeError("x"))
+        deps = self._deps_for(store, backend)
+
+        result = await provisioning.ensure_project_cloud_resources(
+            dict(store.row), dependencies=deps
+        )
+
+        assert result.get("main_cloud_folder_error") is None
+        deps.logger.warning.assert_called()
+
+
+# =============================================================================
 # A removed member leaves the main cloud's own project group
 # =============================================================================
 

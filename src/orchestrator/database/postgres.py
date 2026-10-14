@@ -58015,7 +58015,7 @@ class PostgresDB:
                        default_config_name, default_config_override,
                        nextcloud_folder_id,
                        main_cloud_backend, main_cloud_backend_instance_id,
-                       main_cloud_folder_handle,
+                       main_cloud_folder_handle, main_cloud_folder_error,
                        network_tier,
                        (SELECT COUNT(*) FROM jobs j WHERE j.project_id = projects.id) AS job_count,
                        created_at, updated_at
@@ -58257,6 +58257,19 @@ class PostgresDB:
                     },
                 )
         return result == "UPDATE 1"
+
+    async def set_project_main_cloud_folder_error(
+        self, project_id: str, error: Optional[str]
+    ) -> None:
+        """Record why the project's main-cloud folder could not be created
+        (an error kind), or clear it with ``None``. ``update_project`` skips
+        ``None`` values, so it cannot clear one."""
+        async with self.acquire() as conn:
+            await conn.execute(
+                "UPDATE projects SET main_cloud_folder_error = $2 WHERE id = $1",
+                UUID(project_id),
+                error,
+            )
 
     async def delete_project(self, project_id: str) -> bool:
         """Delete a project (cascades to members, repos).

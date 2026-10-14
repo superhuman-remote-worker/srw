@@ -289,6 +289,23 @@ async def test_deleting_the_project_removes_it_and_its_creator_only_detaches(dat
 
 
 @pytest.mark.asyncio
+async def test_a_folder_error_is_stored_read_back_and_cleared(database):
+    """Why a project has no folder reaches the project read (0548)."""
+    owner = await _user(database, "Folderless owner")
+    project = await _cloud_project(database, "Marketing", owner, None, handle=None)
+    project_id = str(project["id"])
+    assert project["main_cloud_folder_error"] is None
+
+    await database.set_project_main_cloud_folder_error(project_id, "already_exists")
+    assert (await database.get_project(project_id))[
+        "main_cloud_folder_error"
+    ] == "already_exists"
+
+    await database.set_project_main_cloud_folder_error(project_id, None)
+    assert (await database.get_project(project_id))["main_cloud_folder_error"] is None
+
+
+@pytest.mark.asyncio
 async def test_the_startup_pass_counts_and_a_second_pass_changes_nothing(
     database, caplog
 ):
