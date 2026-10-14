@@ -9,7 +9,9 @@ import {
   untracked,
 } from '@angular/core';
 import { takeUntilDestroyed } from '@angular/core/rxjs-interop';
-import { HttpClient } from '@angular/common/http';
+import { HttpClient, HttpContext } from '@angular/common/http';
+import { VIEW_AS_OVERRIDE } from '../interceptors/view-as.interceptor';
+import { pickOwnDefaultProject } from '../util/own-default-project';
 import { filter, firstValueFrom, map, Observable, Subscription, tap, timeout } from 'rxjs';
 import { environment } from '../environment';
 import { newRequestId } from '../util/request-id';
@@ -2572,10 +2574,13 @@ export class PersistentChatService {
       // other create pickers — a draft can only ever target the account
       // default, which is never archivable anyway.
       const projects = await firstValueFrom(
-        this.http.get<Project[]>(`${environment.apiUrl}/projects?status=active`),
+        this.http.get<Project[]>(`${environment.apiUrl}/projects?status=active`, {
+          // Self-scoped: an admin's fleet list holds every user's default project.
+          context: new HttpContext().set(VIEW_AS_OVERRIDE, 'mine'),
+        }),
       );
       if (generation !== this.draftDefaultsGeneration || !this.isDraftSession()) return;
-      const defaultProject = projects.find((project) => project.is_default);
+      const defaultProject = pickOwnDefaultProject(projects);
       this.draftProjectIds = defaultProject ? [defaultProject.id] : [];
       this.draftProjectId.set(this.draftProjectIds?.[0] ?? null);
       const body = this.draftCreationContext();

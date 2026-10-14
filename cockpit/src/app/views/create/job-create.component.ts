@@ -6,6 +6,7 @@ import {workspaceCreationFields, workspacePreviewConfig} from "../agent-settings
 import {Component, computed, effect, ElementRef, inject, OnInit, signal, ViewChild} from '@angular/core';
 import {ActivatedRoute, Router} from '@angular/router';
 import {ApiService} from '../../core/services/api.service';
+import {pickOwnDefaultProject} from '../../core/util/own-default-project';
 import type {SessionToolGroupsResponse} from '../../core/services/api.service';
 import {CapabilitiesService} from '../../core/services/capabilities.service';
 import {FileHandlingService} from '../../core/services/file-handling.service';
@@ -1446,7 +1447,7 @@ export class JobCreateComponent implements OnInit {
    *  so listing it is offering a guaranteed 409. The one exception is a project
    *  named explicitly by `?project=` — see `resolveDeepLinkedProject`. */
   private loadProjects(userId: string): void {
-    this.api.getProjects(userId, ['active']).subscribe({
+    this.api.getProjects(userId, ['active'], { selfScoped: true }).subscribe({
       next: (projects) => {
         this.projects.set(projects);
         const qp = this.route.snapshot.queryParamMap.get('project');
@@ -1496,7 +1497,7 @@ export class JobCreateComponent implements OnInit {
    *  list because the user named it explicitly. */
   private selectDefaultProject(projects: Project[]): void {
     const selectable = projects.filter((p) => p.status !== 'archived');
-    const defaultProject = selectable.find((p) => p.is_default);
+    const defaultProject = pickOwnDefaultProject(selectable);
     this.selectedProjectId.set(defaultProject?.id ?? selectable[0]?.id ?? null);
   }
 

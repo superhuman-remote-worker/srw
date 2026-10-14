@@ -816,7 +816,7 @@ describe('SessionCreateComponent "Start a new session" prefill (session_config_d
       config_override: {llm: {model: 'gpt-5.6-sol'}},
     },
   };
-  const PROJECTS = [{id: 'proj-1', name: 'Proj One', status: 'active', is_default: true}];
+  const PROJECTS = [{id: 'proj-1', name: 'Proj One', status: 'active', is_default: true, user_role: 'owner'}];
   const EXPERTS = [
     {id: 'expert-1', display_name: 'Default', description: '', icon: 'x', color: '#fff', tags: []},
     {id: 'expert-2', display_name: 'Prefilled', description: '', icon: 'x', color: '#fff', tags: []},
@@ -1106,6 +1106,13 @@ describe('SessionCreateComponent "Start a new session" prefill (session_config_d
     subject.complete();
     drainAll(http, [...PROJECTS, {id: 'proj-2', name: 'Two', status: 'active', is_default: false}]);
     expect(component.selectedProjectIds()).toEqual(new Set(['proj-2']));
+  });
+
+  it("never preselects a default project the caller is only a member of", () => {
+    const {fixture, component, http} = setup(null);
+    fixture.detectChanges();
+    drainAll(http, [{id: 'proj-theirs', name: 'Theirs', status: 'active', is_default: true, user_role: 'editor'}]);
+    expect(component.selectedProjectIds()).toEqual(new Set());
   });
 
   it('a source thread with no project at all falls back to the personal project', () => {
