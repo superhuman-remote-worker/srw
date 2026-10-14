@@ -36,6 +36,45 @@ while preserving the semantic suffix inside the 63-byte label-value ceiling.
 {{- printf "%s-%s-single-origin-tls" (include "srw.fullname" . | trunc 34 | trimSuffix "-") ($identity | sha256sum | trunc 10) -}}
 {{- end }}
 
+{{/*
+The single-origin gateway's self-signed certificate, as JSON {cert, key,
+expires}. An upgrade reuses the stored pair while it was issued for the same
+address and validity and more than 30 days remain, so browsers and clients
+that accepted or pinned it keep working; otherwise a new pair is generated.
+Helm cannot read X.509, so the Secret records what was issued in annotations.
+A Secret without them (rendered by an older chart) is replaced once. The
+caller supplies lookup's result, so the choice is testable offline.
+*/}}
+{{- define "srw.singleOriginCertificate" -}}
+{{- $single := .context.Values.exposure.singleOrigin -}}
+{{- $days := int $single.tls.validityDays -}}
+{{- $existing := .existing | default dict -}}
+{{- $data := get $existing "data" | default dict -}}
+{{- $annotations := (get $existing "metadata" | default dict).annotations | default dict -}}
+{{- $expires := get $annotations "srw.io/single-origin-expires" | default "" | toString -}}
+{{- $reuse := and (get $data "tls.crt") (get $data "tls.key") $expires (eq (get $annotations "srw.io/single-origin-address" | default "" | toString) $single.address) (eq (get $annotations "srw.io/single-origin-validity-days" | default "" | toString) (toString $days)) -}}
+{{- if $reuse -}}
+  {{- $remaining := sub (unixEpoch (toDate "2006-01-02T15:04:05Z07:00" $expires) | int64) (unixEpoch now | int64) -}}
+  {{- if lt $remaining 2592000 -}}
+    {{- $reuse = false -}}
+  {{- end -}}
+{{- end -}}
+{{- if $reuse -}}
+{{- dict "cert" (get $data "tls.crt" | b64dec) "key" (get $data "tls.key" | b64dec) "expires" $expires | toJson -}}
+{{- else -}}
+{{- $dnsNames := list -}}
+{{- $ipAddresses := list -}}
+{{- if eq $single.address "localhost" -}}
+  {{- $dnsNames = list $single.address -}}
+{{- else -}}
+  {{- $ipAddresses = list $single.address -}}
+{{- end -}}
+{{- $generated := genSelfSignedCert $single.address $ipAddresses $dnsNames $days -}}
+{{- $notAfter := dateInZone "2006-01-02T15:04:05Z07:00" (now | dateModify (printf "+%dh" (mul $days 24))) "UTC" -}}
+{{- dict "cert" $generated.Cert "key" $generated.Key "expires" $notAfter | toJson -}}
+{{- end -}}
+{{- end }}
+
 {{- define "srw.singleOriginValidate" -}}
 {{- if include "srw.singleOrigin" . -}}
   {{- $single := .Values.exposure.singleOrigin -}}

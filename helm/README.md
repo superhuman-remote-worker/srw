@@ -307,9 +307,12 @@ and keep `publicPort` equal to the port users actually see.
 
 This preset requires bundled Keycloak, Gitea, and Nextcloud. It disables
 OpenCloud, Neo4j Bolt TLS, the external SSH gateway, Collabora, and the Canvas
-viewer. It creates no cert-manager resources or Traefik CRDs. The chart may
-generate a new certificate during an upgrade; users then accept the replacement
-warning at the same origin.
+viewer. It creates no cert-manager resources or Traefik CRDs. An upgrade keeps the
+certificate while `address` and `tls.validityDays` stay the same and more than
+30 days of its validity remain. A changed address or validity, the last 30
+days, or the first upgrade from a chart that did not record these on the
+Secret generate a new one; users then accept the replacement warning at the
+same origin, and clients that pinned the old certificate need the new one.
 
 The preset also stages Nextcloud's internal signed installation-attestation
 lane. This lets ordinary cloud effects bind the exact persistent Nextcloud
