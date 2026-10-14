@@ -1,0 +1,68 @@
+{
+  "date": "2026-10-14",
+  "tests": "Slice A deferred tests T6 (unattended paths with a broken default, A2b ruling R6) and T10 (a LimitRange 403 fails the Job at once, A1)",
+  "stack": {
+    "context": "k3d-srw",
+    "namespace": "srw (also the workspace namespace)",
+    "orchestratorImage": "srw-registry:5000/srw-orchestrator:tilt-774bfdf5f389a5ca",
+    "code": "Older than develop: the Pod's postgres.py matches develop 6cf956a24 (2026-10-09). Tilt was not run. Checked against develop 55b1ba1e7: the T10 paths (pod_admission_rejection in sandbox_workspace_settings.py, _record_creation_diagnostic and the Job create failure path in container_provisioner.py, the stateless End preflight in thread_retirement.py ~:473-530) are unchanged; the T6 paths differ only by connector plumbing (execution_kind/unattended arguments, the project-folder slug), not the defaults refusal.",
+    "flags": "STATELESS_SESSION_ENABLED=true, CONTAINER_STARTUP_STAGE_AUTHORITY_ENABLED=false, VMs off",
+    "caller": "python in the orchestrator Pod: httpx to localhost:8085 with X-Internal-Key + X-MCP-User-Id (admin@localhost 6ed1b6f4-4931-461f-ba92-1d98f062af10); read-only SQL"
+  },
+  "T10": {
+    "result": "pass for the Job; two findings in clean-up",
+    "setup": "LimitRange t10-cpu-max (type Container, max.cpu 1) in namespace srw, applied 15:42:37Z, deleted 15:46:01Z",
+    "job": {
+      "id": "8af33520-0ef4-4a93-9665-14d80eec95a8",
+      "request": "POST /api/jobs {description, user_id, config_override.scholar.enabled false, workspace: {template: {inline: {backend: sandbox, resources: {cpu: 2}}}}} (installation image, not a custom one)",
+      "podCreate": "403 Forbidden: pods \"workspace-8af33520-0ef\" is forbidden: maximum cpu usage per Container is 1, but limit is 2",
+      "timing": "created 15:42:38.164Z, failed 15:42:39.385Z (1.2 s): at once, not after the pull budget",
+      "jobs.error_message": "Workspace container failed: Workspace pod was rejected by the cluster: pods \"workspace-8af33520-0ef\" is forbidden: maximum cpu usage per Container is 1, but limit is 2",
+      "context.workspace_container.error": "Workspace pod was rejected by the cluster: pods \"workspace-8af33520-0ef\" is forbidden: maximum cpu usage per Container is 1, but limit is 2",
+      "a1SpecQuestion": "A1 spec 'Superseded text' asks whether a quota/LimitRange 403 is recorded for any image or only custom ones: recorded for the installation image (Ruling 11 and the reference page are right, for Jobs)"
+    },
+    "findingJobUndeletable": {
+      "observed": "DELETE /api/jobs/{id} answers 500 'Exact Kubernetes workspace cleanup must settle before owner deletion' on every try (15:48Z to 15:58Z, after the LimitRange was gone). The first try deleted the Gitea repo and the PVC pvc-workspace-8af33520-0ef; the Job row stays.",
+      "reservation": "managed_repository_workspace_creation_reservations row: phase mutating, scope workspace_container, operation create, pod effect issued 15:42:39.360Z and never observed (no Pod exists), runtime_incarnation null, cancel_requested_at 15:42:39.385Z, claimed by creation-reconciler, attempts 6 at 16:00Z with a new claimer and expiry every ~5 min, never settled",
+      "why": "_settle_failed_job_creation (container_provisioner.py ~:18275) settles only WorkspaceImagePullError on an exact Pod; an admission 403 leaves no Pod UID, so nothing settles the reservation (same deadlock family as the pull-failed fix b28d4d2c9 and the d3/(b) container_exited case)"
+    },
+    "session": {
+      "id": "d86370a5-3fad-4ffc-ba7c-c5f8abeb21ea",
+      "request": "POST /api/persistent/threads {title, workspace: {template: {inline: {backend: sandbox, resources: {cpu: 2}}}}}",
+      "lane": "stateless",
+      "observed": "Same 403 logged once at 15:43:34Z. metadata.workspace_container stays status pending with _runtime_creation {mode create, attempted true}; no error recorded; the Session read shows workspace_creation null and status created. No retry after the LimitRange was removed. This matches A1 refinement 1 (Sessions log only), so the deferred note's 'workspace goes to failed' expectation is superseded.",
+      "findingEndRefused": "DELETE /api/persistent/threads/{id} answers 503 'Stateless workspace creation and restore must reach exact Ready authority before retirement' five times and with ?force=true: the Session can't be ended (thread_retirement.py ~:473-530: no initial-creation capture with tracking off, the ensure pass doesn't re-create, then status != ready). Left in place on local k3d with its Pending PVC pvc-ws-thread-d86370a5-3fa."
+    }
+  },
+  "T6": {
+    "result": "pass (backlog pool not run; Settings hint checked through the API, not rendered)",
+    "projects": {
+      "broken": "t6-broken-default fd52960e-b218-4d73-9433-f0be48aa9f61",
+      "healthy": "t6-healthy 7f75088a-0db7-4bbb-8538-8864b3b61555 (defaults jobs: none, so its Jobs need no Pod)"
+    },
+    "steps": [
+      "POST /api/manifests/apply WorkspaceTemplate 'gone' {backend: sandbox} with default_scope {kind: Project, name: <project UUID>} -> 200, uid f0070fd4-6414-4a29-a5f8-00fd6b8a4686 version 1 (the Project's manifest name 'project-<uuid>' answers 404 'Project scope does not exist; use its UUID ...')",
+      "PUT /api/projects/{broken}/workspace-defaults {jobs: container, container: {name: gone, scope: {kind: Project, name: <uuid>}}} -> 200, template_problems {}",
+      "DELETE /api/resources/f0070fd4-...?expected_version=1 -> 200 {deleted: true}: deleting a referenced template is not refused",
+      "GET /api/projects/{broken}/workspace-defaults -> template_problems.container \"This Project's container template 'gone' no longer exists.\"",
+      "POST /api/automations x2 (cron '* * * * *', expert worker_base, max_fires_per_day 2), one per Project, 15:52:24Z"
+    ],
+    "automations": {
+      "broken": "cron_dispatcher logged 'fire refused: This Project's container template 'gone' no longer exists.' at 15:53:44Z and 15:54:44Z (once per tick, so next_run_at advanced); last_status is that text; last_job_id null; fires_today_count 0; no Job in the Project",
+      "healthy": "fired at 15:53:44Z and 15:54:44Z (Jobs 55c5a7b9..., 3371abcd...), fires_today_count 2"
+    },
+    "loop": "POST /api/projects/{broken}/loop {max_iterations: 1} -> 502 'Loop created but first job failed to start: This Project's container template 'gone' no longer exists.'; loop row status failed, stop_reason failures, last_error 'first spawn failed: This Project's container template 'gone' no longer exists.', total_jobs_run 0. Note: a 502 for a configuration problem reads as a server fault.",
+    "backlogPool": "not run: needs a commissioned officer with a working model (the local MiniMax key answers 402)",
+    "settingsHint": "not rendered: the Playwright MCP profile was held by another live browser process (not killed). The cockpit binds [hint]=\"wd.template_problems.container\" directly (cockpit project-detail.component.ts:1206); the API value above is verified.",
+    "cleanup": "both automations DELETE 204; both Projects DELETE 200; the template was already deleted"
+  },
+  "sideFinding": {
+    "issue": "none_backend_jobs_fail_cloning_job_workspace_repo (vault)",
+    "observed": "Both healthy-Project Jobs (backend none) failed 'Failed to clone job workspace repo ... refusing to fall back to a disconnected git init'. A direct none Job in the same Project (13a0e923-f67a-45da-8eb3-6663836393ea) reproduced it with the agent Pod log kept: 'git clone failed for http://srw-gitea:3000/srw-admin/job-13a0e923.git: fatal: destination path '/workspace' already exists and is not an empty directory' (3 attempts). /workspace is an emptyDir on the agent Pod, so the agent writes into it before cloning. A none Job in the default Project (a2381ba7-b617-4f74-ace2-41fdc8c85867) cloned fine and reached the model (402).",
+    "cleanup": "a2381ba7 cancelled; all four of these Jobs deleted (200)"
+  },
+  "leftOnLocalK3d": [
+    "Job 8af33520-0ef4-4a93-9665-14d80eec95a8 (failed; DELETE answers 500; reservation never settles)",
+    "Session d86370a5-3fad-4ffc-ba7c-c5f8abeb21ea (stateless, workspace pending; End answers 503) and its Pending PVC pvc-ws-thread-d86370a5-3fa"
+  ]
+}
