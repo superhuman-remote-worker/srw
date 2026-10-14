@@ -131,6 +131,7 @@ def test_single_origin_presets_render_stable_nextcloud_installation_attestation(
         for container in nextcloud["spec"]["template"]["spec"]["containers"]
     } == {
         "nextcloud",
+        "cron",
         "nextcloud-protected-effect-fpm",
         "nextcloud-protected-effect-nginx",
     }
@@ -237,7 +238,7 @@ def test_cloud_overwrites_and_existing_pvc_reconciliation(manifests):
     assert values["NEXTCLOUD_TRUSTED_DOMAINS"] == "srw-nextcloud 192.0.2.10:30443"
     assert "NEXTCLOUD_TRUSTED_PROXIES" not in values
     assert not values.get("TRUSTED_PROXIES")
-    for name in ["nextcloud", "nextcloud-protected-effect-fpm"]:
+    for name in ["nextcloud", "cron", "nextcloud-protected-effect-fpm"]:
         values = env(container(manifests, "srw-nextcloud", name))
         assert values["OVERWRITEHOST"] == "192.0.2.10:30443"
         assert values["OVERWRITEPROTOCOL"] == "https"

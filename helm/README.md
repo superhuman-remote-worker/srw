@@ -667,6 +667,28 @@ container in the Pod shares one data PVC. Upgrades therefore include a brief,
 deliberate Nextcloud restart instead of risking a cross-node ReadWriteOnce
 multi-attach deadlock.
 
+### Bundled Nextcloud background jobs
+
+A `cron` container in the Nextcloud Pod runs Nextcloud's background jobs
+(`cron.php` every 5 minutes, the image's `/cron.sh`), as the upstream Nextcloud
+chart does. It shares the data volume and the Apache container's proxy and S3
+environment, never the admin, OIDC or agent-service secrets. With
+`nextcloud.cron.enabled=false` the jobs run from browser page loads instead
+(Nextcloud's "ajax" mode), which stalls whenever nobody uses the web UI.
+
+Background jobs expire trash and thin file versions, and those are the only
+recovery history the bundled Nextcloud keeps. The setup hook therefore pins
+`trashbin_retention_obligation` and `versions_retention_obligation` to
+`disabled` and internal share expiry off on every start, in either mode, and
+both containers carry the two retention values as `NC_*` environment, which
+Nextcloud reads ahead of `config.php`. Groupfolders' trash and versions follow
+the same two keys. A deliberate retention policy is a later chart change, not
+an `occ` setting: the hook would reset it.
+
+On shutdown the cron container waits up to 120 s for a running `cron.php` to
+finish, because an interrupted job stays reserved for 12 hours. Apache stops
+at once, so a rollout that lands during a long job run is that much longer.
+
 ### Self-hosted web research
 
 The chart deploys SearXNG by default (`searxng.enabled=true`) and seeds its

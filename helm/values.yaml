@@ -3022,6 +3022,22 @@ nextcloud:
   replicas: 0
   storageClass: ""
   storageSize: "10Gi"
+  # Nextcloud's background jobs (cron.php every 5 minutes) run in a `cron`
+  # container in the Nextcloud Pod, as in the upstream chart. Off, they run
+  # piggybacked on browser page loads ("ajax" mode) and stall whenever nobody
+  # uses the web UI. Either way the setup hook pins trash and version
+  # retention and internal share expiry off.
+  cron:
+    enabled: true
+    # The image sets PHP_MEMORY_LIMIT=512M; the container limit stays above
+    # it so PHP's own limit, not a cgroup OOM kill, ends a runaway job.
+    resources:
+      requests:
+        memory: "128Mi"
+        cpu: "10m"
+      limits:
+        memory: "768Mi"
+        cpu: "500m"
   # Internal-only authority-creating lane for protected read-only grants.
   # It shares the bundled Nextcloud code/data volume but runs in a dedicated
   # Nginx + PHP-FPM pool. The FPM auto-prepend verifier authenticates an exact

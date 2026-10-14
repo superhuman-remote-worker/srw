@@ -850,6 +850,17 @@
         "enabled": {
           "type": "boolean"
         },
+        "cron": {
+          "type": "object",
+          "properties": {
+            "enabled": {
+              "type": "boolean"
+            },
+            "resources": {
+              "type": "object"
+            }
+          }
+        },
         "protectedEffect": {
           "type": "object",
           "properties": {
