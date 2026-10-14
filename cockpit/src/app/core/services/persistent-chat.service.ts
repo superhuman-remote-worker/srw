@@ -12,6 +12,7 @@ import { takeUntilDestroyed } from '@angular/core/rxjs-interop';
 import { HttpClient } from '@angular/common/http';
 import { filter, firstValueFrom, map, Observable, Subscription, tap, timeout } from 'rxjs';
 import { environment } from '../environment';
+import { newRequestId } from '../util/request-id';
 import { Project, ThreadCloudDiffSummary, ThreadMount, ThreadProtectedSource, ThreadStatus, WorkspaceCreationView, WorkspaceLifecycleView } from '../models/api.model';
 // Type + pure derivation only — importing them from the review component
 // would pull it (and Monaco's loader) back into the eager bundle graph and
@@ -4747,7 +4748,7 @@ export class PersistentChatService {
       threadId,
       request: {
         ...control,
-        client_request_id: crypto.randomUUID(),
+        client_request_id: newRequestId(),
         session_runtime_generation: runtimeGeneration,
       },
       attempts: 0,
@@ -6612,7 +6613,7 @@ export class PersistentChatService {
 
     const pending: PendingInterruptRequest = {
       threadId: tid,
-      clientRequestId: crypto.randomUUID(),
+      clientRequestId: newRequestId(),
       targetTurnId,
       attempts: 0,
     };
@@ -6804,7 +6805,7 @@ export class PersistentChatService {
     config: Record<string, unknown>,
     datasourceIds?: string[],
   ): Promise<ConfigUpdateOutcome> {
-    const requestId = crypto.randomUUID();
+    const requestId = newRequestId();
     const threadId = this.threadId();
     const transport = this.controlTransport('config.update');
     if (!threadId || transport === 'unavailable') {
@@ -6942,7 +6943,7 @@ export class PersistentChatService {
     draftSnapshot = '',
     draftRevision = 0,
   ): string {
-    const requestId = crypto.randomUUID();
+    const requestId = newRequestId();
     const transport = this.controlTransport('rewind');
     if (!this.rewindModeAvailable(mode)) {
       this.error.set(this.transloco.translate('chat.rewind.unavailable'));

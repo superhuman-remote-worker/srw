@@ -65,6 +65,7 @@ import {
   setPageSize,
 } from './job-filters';
 import {JobCloudAction, jobCloudAction} from '../../core/util/job-cloud';
+import {newRequestId} from '../../core/util/request-id';
 
 /**
  * Angular's ParamMap keeps repeated keys, which is how multi-value filters
@@ -2139,7 +2140,7 @@ export class JobListComponent implements OnInit, OnDestroy {
     if (!recovery?.retryable) return;
     let pending = this.recoveryRetryRequests.get(recovery.operation_id);
     if (!pending || pending.jobId !== job.id) {
-      pending = {jobId: job.id, requestId: crypto.randomUUID()};
+      pending = {jobId: job.id, requestId: newRequestId()};
       this.recoveryRetryRequests.set(recovery.operation_id, pending);
     }
     this.api

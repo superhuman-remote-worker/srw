@@ -4235,6 +4235,24 @@ describe('PersistentChatService — REST sends', () => {
     expect(ctx.service.isInterrupting()).toBe(true);
   });
 
+  it('interrupt sends a valid UUID when crypto.randomUUID is unavailable (plain-HTTP origin)', async () => {
+    const ctx = await readySession();
+    fireSseMessage(ctx.sseInstances[0], { method: 'turn.started', params: { turn_id: 3 } }, '1:2');
+    vi.stubGlobal('crypto', { getRandomValues: crypto.getRandomValues.bind(crypto) });
+    try {
+      await expect(ctx.service.interrupt()).resolves.toBeUndefined();
+    } finally {
+      vi.unstubAllGlobals();
+    }
+    const intCall = ctx.mockHttp.post.mock.calls.find((c: any) =>
+      String(c[0]).endsWith('/persistent/threads/thread-r/interrupt'),
+    );
+    expect(intCall).toBeDefined();
+    expect(intCall![1].client_request_id).toMatch(
+      /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/,
+    );
+  });
+
   it('does not create an uncorrelated interrupt without a numeric active turn', async () => {
     const ctx = await readySession();
 
