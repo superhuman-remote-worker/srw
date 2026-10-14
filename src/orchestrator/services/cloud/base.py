@@ -223,6 +223,7 @@ class MainCloudBackend(Protocol):
         *,
         project_name: str,
         group_id: GroupId,
+        project_id: Optional[str] = None,
     ) -> ProjectFolderHandle: ...
 
     async def delete_project_folder(

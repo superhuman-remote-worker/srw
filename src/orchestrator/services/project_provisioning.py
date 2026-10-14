@@ -318,6 +318,7 @@ async def ensure_project_cloud_resources(
                     folder_handle = await backend.ensure_project_folder(
                         project_name=project_name,
                         group_id=group_name,
+                        project_id=project_id_str,
                     )
                     legacy_id = backend.legacy_folder_id(folder_handle)
                     await store.update_project(

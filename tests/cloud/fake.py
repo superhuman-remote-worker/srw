@@ -248,7 +248,11 @@ class FakeMainCloudBackend:
     # ------------------------------------------------------------- Project folders
 
     async def ensure_project_folder(
-        self, *, project_name: str, group_id: GroupId
+        self,
+        *,
+        project_name: str,
+        group_id: GroupId,
+        project_id: str | None = None,
     ) -> ProjectFolderHandle:
         self._ensure_ready()
         self._fail_if_configured()

@@ -1095,48 +1095,143 @@ class NextcloudBackend(NextcloudUserRootGrant):
 
     @instrument_backend_op("ensure_project_folder")
     async def ensure_project_folder(
-        self, *, project_name: str, group_id: GroupId
+        self,
+        *,
+        project_name: str,
+        group_id: GroupId,
+        project_id: Optional[str] = None,
     ) -> ProjectFolderHandle:
-        """Create a Group Folder and grant project + srw-agents access."""
+        """Create a Group Folder and grant project + srw-agents access.
+
+        The folder is mounted at the project's name or, when a Group Folder
+        is mounted there already, at the name plus four hex characters of
+        the project's id (``Marketing (a1b2)``), the same on every retry.
+        Groupfolders 20+ (Nextcloud 32) refuses a second folder at one
+        mount point. A folder found at either name is never adopted, whoever
+        made it: only the handle stored on the project row says which folder
+        is the project's. With both names taken the create is refused
+        (``ALREADY_EXISTS``).
+
+        The handle keeps the mount point the server answers with (it trims
+        the name); every DAV path is built from it. A folder whose grants
+        fail is removed again, so a retry gets the name this one had.
+        """
         self._ensure_ready()
+        requested = project_name.strip()
+        suffixed = f"{requested} ({self._mount_point_suffix(project_id or group_id)})"
         try:
-            resp = await self._client.post(
-                "/index.php/apps/groupfolders/folders",
-                params={"format": "json"},
-                data={"mountpoint": project_name},
-            )
-            resp.raise_for_status()
-            self._assert_not_html(resp)
-            data = resp.json()
-            folder_id = data.get("ocs", {}).get("data", {}).get("id")
+            taken = await self._group_folder_mount_points()
+            for mountpoint in (requested, suffixed):
+                if mountpoint.casefold() in taken:
+                    continue
+                resp = await self._client.post(
+                    "/index.php/apps/groupfolders/folders",
+                    params={"format": "json"},
+                    data={"mountpoint": mountpoint},
+                )
+                try:
+                    data = self._groupfolders_data(resp, op="create group folder")
+                except CloudBackendError as e:
+                    # Groupfolders 20+ answers OCS 400 for a mount point
+                    # another create took meanwhile: then try the next name.
+                    if e.kind is not CloudBackendErrorKind.INVALID_REQUEST:
+                        raise
+                    taken = await self._group_folder_mount_points()
+                    if mountpoint.casefold() not in taken:
+                        raise
+                    continue
+                break
+            else:
+                raise CloudBackendError(
+                    CloudBackendErrorKind.ALREADY_EXISTS,
+                    f"Group Folders exist at both {requested!r} and {suffixed!r}",
+                    backend=self.backend_id,
+                    retryable=False,
+                )
+            folder_id = data.get("id") if isinstance(data, dict) else None
             if not folder_id:
                 raise CloudBackendError(
                     CloudBackendErrorKind.UNKNOWN,
                     "Group folder creation returned no id",
                     backend=self.backend_id,
-                    raw=data,
+                    raw={"data": data},
                 )
+            folder_id = int(folder_id)
+            mountpoint = str(data.get("mount_point") or mountpoint)
 
-            await self._grant_group_access(
-                int(folder_id), str(group_id), _ALL_PERMISSIONS
-            )
-            await self._grant_group_access(
-                int(folder_id), "srw-agents", _ALL_PERMISSIONS
-            )
+            try:
+                await self._grant_group_access(
+                    folder_id, str(group_id), _ALL_PERMISSIONS
+                )
+                await self._grant_group_access(
+                    folder_id, "srw-agents", _ALL_PERMISSIONS
+                )
+            except (CloudBackendError, httpx.HTTPError):
+                await self._discard_group_folder(folder_id)
+                raise
 
             logger.info(
-                f"Created Nextcloud Group Folder '{project_name}' "
+                f"Created Nextcloud Group Folder '{mountpoint}' "
                 f"(id={folder_id}) for group '{group_id}'"
             )
             return ProjectFolderHandle(
                 backend=self.backend_id,
                 native_id=str(folder_id),
-                vendor_meta={"mountpoint": project_name},
+                vendor_meta={"mountpoint": mountpoint},
             )
         except CloudBackendError:
             raise
         except httpx.HTTPError as e:
             raise self._map_http_error(e) from e
+
+    @staticmethod
+    def _mount_point_suffix(identity: str) -> str:
+        """Four hex characters naming a project in a colliding mount point:
+        its id's first four (as SRW names its connectors by the first
+        eight), or a hash's for an identity that is no UUID."""
+        hex_id = str(identity).replace("-", "").lower()
+        if re.fullmatch(r"[0-9a-f]{32}", hex_id) is None:
+            hex_id = hashlib.sha256(str(identity).encode()).hexdigest()
+        return hex_id[:4]
+
+    async def _group_folder_mount_points(self) -> set[str]:
+        """Every Group Folder's mount point, casefolded.
+
+        Groupfolders compares mount points as the database does (exactly on
+        Postgres and SQLite, case-blind on MySQL), and a desktop client on a
+        case-blind disk cannot hold two folders that differ only in case,
+        so SRW treats a case variant as taken.
+        """
+        resp = await self._client.get(
+            "/index.php/apps/groupfolders/folders",
+            params={"format": "json"},
+        )
+        data = self._groupfolders_data(resp, op="list group folders")
+        # Keyed by folder id; PHP encodes an installation with none as [].
+        folders = data.values() if isinstance(data, dict) else data or []
+        return {
+            str(folder["mount_point"]).strip().casefold()
+            for folder in folders
+            if isinstance(folder, dict) and folder.get("mount_point")
+        }
+
+    async def _discard_group_folder(self, folder_id: int) -> None:
+        """Remove a Group Folder this call created and could not grant.
+        Best effort: a failure is logged, the grant's error is the one
+        raised."""
+        try:
+            resp = await self._client.delete(
+                f"/index.php/apps/groupfolders/folders/{folder_id}",
+                params={"format": "json"},
+            )
+            self._groupfolders_data(resp, op="remove ungranted group folder")
+        except (CloudBackendError, httpx.HTTPError) as e:
+            logger.warning(
+                "Group Folder id=%s was created but not granted, and could not "
+                "be removed (%s); it needs manual cleanup",
+                folder_id,
+                e,
+            )
 
     @instrument_backend_op("delete_project_folder")
     async def delete_project_folder(
@@ -1156,10 +1251,8 @@ class NextcloudBackend(NextcloudUserRootGrant):
                 f"/index.php/apps/groupfolders/folders/{folder_id}",
                 params={"format": "json"},
             )
-            if resp.status_code == 200:
-                logger.info(f"Deleted Nextcloud Group Folder id={folder_id}")
-                return
-            if resp.status_code == 404:
+            # OCS v1: a folder that is gone is HTTP 200 + OCS 404.
+            if resp.status_code == 404 or self._ocs_statuscode(resp) == 404:
                 if if_exists:
                     logger.debug(f"Group Folder id={folder_id} already gone")
                     return
@@ -1169,7 +1262,8 @@ class NextcloudBackend(NextcloudUserRootGrant):
                     backend=self.backend_id,
                     status_code=404,
                 )
-            resp.raise_for_status()
+            self._groupfolders_data(resp, op=f"delete group folder {folder_id}")
+            logger.info(f"Deleted Nextcloud Group Folder id={folder_id}")
         except CloudBackendError:
             raise
         except httpx.HTTPError as e:
@@ -1874,14 +1968,50 @@ class NextcloudBackend(NextcloudUserRootGrant):
             params={"format": "json"},
             data={"group": group_id},
         )
-        resp.raise_for_status()
+        self._groupfolders_data(resp, op=f"grant group {group_id} on folder")
 
         resp = await self._client.post(
             f"/index.php/apps/groupfolders/folders/{folder_id}/groups/{group_id}",
             params={"format": "json"},
             data={"permissions": str(permissions)},
         )
+        self._groupfolders_data(resp, op=f"set group {group_id} permissions")
+
+    #: A Group Folders refusal's OCS statuscode, by the kind it raises.
+    _GROUPFOLDERS_REFUSAL_KINDS = {
+        400: CloudBackendErrorKind.INVALID_REQUEST,
+        401: CloudBackendErrorKind.AUTHENTICATION_FAILED,
+        403: CloudBackendErrorKind.PERMISSION_DENIED,
+        404: CloudBackendErrorKind.NOT_FOUND,
+    }
+
+    def _groupfolders_data(self, resp: httpx.Response, *, op: str) -> Any:
+        """The ``ocs.data`` of a Group Folders answer, or raise.
+
+        Group Folders is reached through index.php, which speaks OCS v1:
+        a refusal is HTTP 200 too, with ``data: []``, so only
+        ``ocs.meta.statuscode`` tells (100 OK; 200 is v2's OK). Groupfolders
+        20+ (Nextcloud 32) refuses a mount point that is taken with OCS 400,
+        and a call that needs a confirmed password gets OCS 403.
+        """
         resp.raise_for_status()
+        self._assert_not_html(resp)
+        code = self._ocs_statuscode(resp)
+        if code in (100, 200):
+            return resp.json()["ocs"].get("data")
+        try:
+            message = resp.json()["ocs"]["meta"].get("message")
+        except (AttributeError, KeyError, TypeError, ValueError):
+            message = None
+        raise CloudBackendError(
+            self._GROUPFOLDERS_REFUSAL_KINDS.get(code, CloudBackendErrorKind.UNKNOWN),
+            f"{op} refused: HTTP {resp.status_code}, ocs statuscode {code}",
+            backend=self.backend_id,
+            vendor_code=None if code is None else str(code),
+            vendor_message=str(message) if message else None,
+            status_code=resp.status_code,
+            retryable=False,
+        )
 
     # ------------------------------------------------ protected cloud mode: RO reader
 
@@ -2171,9 +2301,7 @@ class NextcloudBackend(NextcloudUserRootGrant):
             f"/index.php/apps/groupfolders/folders/{folder_id}",
             params={"format": "json"},
         )
-        resp.raise_for_status()
-        self._assert_not_html(resp)
-        data = (resp.json().get("ocs") or {}).get("data") or {}
+        data = self._groupfolders_data(resp, op=f"read group folder {folder_id}")
         groups = data.get("groups") if isinstance(data, dict) else None
         if isinstance(groups, dict):
             return {str(key) for key in groups}

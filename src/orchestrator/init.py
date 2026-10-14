@@ -1210,6 +1210,7 @@ async def _backfill_cloud_folders(db) -> None:
             folder_handle = await backend.ensure_project_folder(
                 project_name=project_name,
                 group_id=group_name,
+                project_id=project_id,
             )
             if folder_handle is not None:
                 legacy_folder_id = backend.legacy_folder_id(folder_handle)
