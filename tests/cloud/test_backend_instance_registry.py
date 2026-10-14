@@ -949,3 +949,79 @@ async def test_a_legacy_row_is_not_consulted_once_an_instance_is_active(monkeypa
 
     differences.assert_not_called()
     reload.assert_awaited_once()
+
+
+class TestRetryMainCloudAuthority:
+    """A replica that started before its cloud answered keeps trying to
+    establish the installation authority (the startup-race issue)."""
+
+    @pytest.mark.asyncio
+    async def test_retries_until_the_cloud_answers(self, caplog):
+        import asyncio
+
+        from orchestrator.services.cloud.instance_registry import (
+            retry_main_cloud_authority,
+        )
+
+        calls = 0
+
+        async def establish() -> None:
+            nonlocal calls
+            calls += 1
+            if calls < 3:
+                raise RuntimeError("All connection attempts failed")
+
+        with caplog.at_level("INFO"):
+            await asyncio.wait_for(
+                retry_main_cloud_authority(
+                    establish, asyncio.Event(), delays=(0.0, 0.01)
+                ),
+                timeout=5,
+            )
+
+        assert calls == 3
+        assert "established on retry 3" in caplog.text
+        # The first failure is a warning, the next is quieter.
+        warnings = [r for r in caplog.records if r.levelname == "WARNING"]
+        assert len(warnings) == 1
+
+    @pytest.mark.asyncio
+    async def test_shutdown_stops_the_retries(self):
+        import asyncio
+
+        from orchestrator.services.cloud.instance_registry import (
+            retry_main_cloud_authority,
+        )
+
+        shutdown = asyncio.Event()
+        establish = AsyncMock(side_effect=RuntimeError("down"))
+        task = asyncio.create_task(
+            retry_main_cloud_authority(establish, shutdown, delays=(0.01,))
+        )
+        await asyncio.sleep(0.05)
+        shutdown.set()
+        await asyncio.wait_for(task, timeout=2)
+        assert establish.await_count >= 1
+        calls = establish.await_count
+        await asyncio.sleep(0.05)
+        assert establish.await_count == calls
+
+
+def test_startup_hands_a_failed_authority_to_the_retry_task():
+    """bind_services records the failed setup; start_background_tasks starts
+    ``main_cloud_authority_retry`` with it, and the key is in the shutdown
+    order. Structural, like the startup-order checks in
+    ``test_b10_boundary_isolation``."""
+    import inspect
+
+    from orchestrator.application import background_tasks, lifecycle
+
+    assert (
+        "main_cloud_authority_retry" in background_tasks.BACKGROUND_TASK_SHUTDOWN_ORDER
+    )
+    source = inspect.getsource(lifecycle.bind_services)
+    assert "await establish_main_cloud_authority(resources, _legacy_overlay)" in source
+    assert "resources.main_cloud_authority_retry = _retry_authority" in source
+    started = inspect.getsource(background_tasks.start_background_tasks)
+    assert '"main_cloud_authority_retry"' in started
+    assert "resources.main_cloud_authority_retry" in started

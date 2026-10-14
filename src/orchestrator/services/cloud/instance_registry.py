@@ -35,9 +35,10 @@ the row describes another cloud, and keeps the row.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from dataclasses import dataclass
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Sequence
 from typing import Any, Literal
 from uuid import uuid4
 
@@ -226,6 +227,54 @@ async def preload_retained_main_cloud_instances(
                 type(exc).__name__,
             )
     return failures
+
+
+#: Waits between attempts to establish the main cloud's installation
+#: authority after it failed at startup, the last one repeated: the cloud may
+#: still be starting, since a rollout recreates it together with the
+#: orchestrator.
+AUTHORITY_RETRY_DELAYS_SECONDS: tuple[float, ...] = (5.0, 10.0, 20.0, 40.0, 60.0)
+
+
+async def retry_main_cloud_authority(
+    establish: Callable[[], Awaitable[None]],
+    shutdown_event: asyncio.Event,
+    *,
+    delays: Sequence[float] = AUTHORITY_RETRY_DELAYS_SECONDS,
+) -> None:
+    """Call ``establish`` after each delay until it succeeds or shutdown.
+
+    Without it a replica that started before its cloud answered kept every
+    cloud effect disabled for its whole life (the
+    ``main_cloud_authority_never_retried_after_startup_race`` issue). The
+    first failure and every tenth are logged as warnings, the rest at debug.
+    """
+
+    attempt = 0
+    while not shutdown_event.is_set():
+        delay = delays[min(attempt, len(delays) - 1)]
+        try:
+            await asyncio.wait_for(shutdown_event.wait(), timeout=delay)
+            return
+        except asyncio.TimeoutError:
+            pass
+        attempt += 1
+        try:
+            await establish()
+        except Exception as exc:
+            log = logger.warning if attempt % 10 == 1 else logger.debug
+            log(
+                "Main cloud installation authority still unavailable (attempt %d): %s",
+                attempt,
+                exc,
+            )
+            continue
+        logger.info(
+            "Main cloud installation authority established on retry %d; "
+            "cloud effects are enabled",
+            attempt,
+        )
+        return
 
 
 async def adopt_main_cloud_service_credentials(router: MainCloudRouter) -> None:

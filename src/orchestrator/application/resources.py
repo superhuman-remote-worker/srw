@@ -20,7 +20,7 @@ from __future__ import annotations
 import asyncio
 import functools
 import inspect
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, TypeVar
 
@@ -144,6 +144,9 @@ class ApplicationResources:
     # exactly as the former ``orchestrator.main`` globals were.
     metering: InfrastructureMeteringBootstrap = field(init=False)
     shutdown_event: asyncio.Event | None = None
+    #: Set at startup when the main cloud's installation authority could not
+    #: be established; ``main_cloud_authority_retry`` calls it until it can.
+    main_cloud_authority_retry: Callable[[], Awaitable[None]] | None = None
     persistent_thread_recycler: PersistentThreadRecycler | None = None
     usage_ledger: UsageLedger | None = None
     usage_rollup: UsageRollup | None = None

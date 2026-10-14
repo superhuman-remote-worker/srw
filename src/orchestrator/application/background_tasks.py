@@ -74,7 +74,7 @@ from orchestrator.services import (
     workspace_suspension,
 )
 from orchestrator.services.application_tasks import ApplicationTaskSet
-from orchestrator.services.cloud import folder_grants, reload
+from orchestrator.services.cloud import folder_grants, instance_registry, reload
 from orchestrator.services.infrastructure_metering import bootstrap, ingestion
 from orchestrator.services.lifecycle import (
     AgentInstanceManager,
@@ -140,6 +140,7 @@ BACKGROUND_TASK_SHUTDOWN_ORDER: tuple[str, ...] = (
     "ro_reader_reconciler",
     "cloud_folder_grant_sweep",
     "lifecycle_reconciler",
+    "main_cloud_authority_retry",
     "main_cloud_listen",
     "automation_cron",
     "project_loop_sweeper",
@@ -1062,6 +1063,16 @@ async def start_background_tasks(
     async def _main_cloud_reload_callback() -> None:
         await reload._reload_from_db_and_swap(
             resources.postgres_db, resources.main_cloud_router
+        )
+
+    # The installation authority failed at startup (the cloud wasn't
+    # answering yet): keep trying until cloud effects can be enabled.
+    if resources.main_cloud_authority_retry is not None:
+        tasks.start(
+            "main_cloud_authority_retry",
+            instance_registry.retry_main_cloud_authority(
+                resources.main_cloud_authority_retry, tasks.shutdown_event
+            ),
         )
 
     tasks.start(
