@@ -49114,7 +49114,7 @@ class PostgresDB:
                     if expected_inverse_agent:
                         if warm_release is None:
                             detached = await conn.execute(
-                                "UPDATE agents SET thread_id=NULL "
+                                "UPDATE agents SET thread_id=NULL,status='offline' "
                                 "WHERE id=$1::uuid AND thread_id=$2::uuid",
                                 UUID(expected_inverse_agent),
                                 thread_uuid,

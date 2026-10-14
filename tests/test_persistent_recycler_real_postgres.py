@@ -51,6 +51,7 @@ from orchestrator.services.pinned_k8s_effect import (
     PINNED_WARM_PROTECTION_FENCE_ANNOTATION,
 )
 from orchestrator.services.pinned_retirement import PinnedRetirementOperations
+from orchestrator.services.session_attach_binding import find_idle_persistent_agent
 from orchestrator.services.persistent_recycler import (
     PersistentPodObservation,
     PersistentThreadRecycler,
@@ -1897,6 +1898,15 @@ async def test_permanent_retirement_is_abortable_only_before_authorization(db):
     )
 
 
+class _PoolFetchStore:
+    def __init__(self, db):
+        self._db = db
+
+    async def fetch(self, query, *args):
+        async with self._db.acquire() as conn:
+            return await conn.fetch(query, *args)
+
+
 @pytest.mark.asyncio
 async def test_permanent_delete_requires_exact_physical_quiescence(db):
     """DELETE cannot bypass the soft-settlement UPDATE trigger."""
@@ -1957,6 +1967,19 @@ async def test_permanent_delete_requires_exact_physical_quiescence(db):
     )
     assert outcome is not None
     assert outcome["outcome"] == "deleted"
+    # The dedicated (non-warm) row must not stay bindable as a ready idle agent.
+    async with db.acquire() as conn:
+        agent_row = await conn.fetchrow(
+            "SELECT thread_id, status FROM agents WHERE id=$1::uuid",
+            UUID(ids["agent"]),
+        )
+    assert agent_row is not None
+    assert agent_row["thread_id"] is None
+    assert agent_row["status"] == "offline"
+    idle = await find_idle_persistent_agent(
+        dependencies=SimpleNamespace(store=_PoolFetchStore(db))
+    )
+    assert idle is None or str(idle["id"]) != ids["agent"]
 
 
 @pytest.mark.asyncio
