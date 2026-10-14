@@ -4011,8 +4011,8 @@ sessionRouter:
   # via the standard Ingress API but not exercised by the test suite.
   ingressClass: traefik
 
-  # Hostname used in per-session Ingress rules. Defaults to api.<global.domain>
-  # when empty.
+  # Hostname used in per-session Ingress rules. When empty it follows the API
+  # host: global.hostnames.api if set, otherwise api.<global.domain>.
   ingressHost: ""
 
   # JWT signing key shared by orchestrator + agent pods. REQUIRED to enable
