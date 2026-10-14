@@ -324,6 +324,7 @@ class TestEnsureSessionFolderExclusive:
         be._client = httpx.AsyncClient(
             base_url=NEXTCLOUD_BASE, transport=httpx.MockTransport(handler)
         )
+        be._agent_client = be._build_agent_client(httpx.MockTransport(handler))
         be._initialized = True
         return be, made
 
@@ -381,6 +382,7 @@ class TestSessionFolderLeafFirst:
         be._client = httpx.AsyncClient(
             base_url=NEXTCLOUD_BASE, transport=httpx.MockTransport(handler)
         )
+        be._agent_client = be._build_agent_client(httpx.MockTransport(handler))
         be._initialized = True
         return be, seen
 
@@ -520,7 +522,7 @@ class TestSharedClientSendsNoCookies:
         real_client = httpx.AsyncClient
 
         def client_with_mock(**kwargs):
-            return real_client(transport=httpx.MockTransport(handler), **kwargs)
+            return real_client(**{**kwargs, "transport": httpx.MockTransport(handler)})
 
         monkeypatch.setattr(httpx, "AsyncClient", client_with_mock)
         be = NextcloudBackend(_nc_test_settings())
@@ -566,6 +568,9 @@ def _install_fake(backend: NextcloudBackend, fake: FakeNextcloud) -> None:
     backend._client = httpx.AsyncClient(
         base_url=NEXTCLOUD_BASE,
         transport=httpx.MockTransport(fake.handler),
+    )
+    backend._agent_client = backend._build_agent_client(
+        httpx.MockTransport(fake.handler)
     )
     backend._initialized = True
     backend._agent_user = AGENT_USER

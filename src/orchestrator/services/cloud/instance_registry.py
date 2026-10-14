@@ -228,6 +228,29 @@ async def preload_retained_main_cloud_instances(
     return failures
 
 
+async def adopt_main_cloud_service_credentials(router: MainCloudRouter) -> None:
+    """Adopt the active adapter's service-account app password now.
+
+    A Nextcloud adapter adopts agent-service's app password before its first
+    agent-service request anyway; doing it once the active instance is bound
+    means the first agent payload after a restart (a resumed session's sync
+    config, a mount spec) carries it too, not the login password. An adapter
+    without one has nothing to adopt. Never raises: a failure only leaves
+    the login password in use.
+    """
+
+    ensure = getattr(router.active, "ensure_service_credentials", None)
+    if ensure is None:
+        return
+    try:
+        await ensure()
+    except Exception as exc:
+        logger.warning(
+            "Main-cloud service credentials were not adopted at startup (%s)",
+            type(exc).__name__,
+        )
+
+
 #: The legacy overlay's routing fields that hold a URL (compared without a
 #: trailing slash, as the settings model may add one).
 _URL_FIELDS = frozenset(
@@ -664,6 +687,7 @@ __all__ = [
     "confirms_replacement",
     "unattested_changes",
     "activate_main_cloud_config",
+    "adopt_main_cloud_service_credentials",
     "build_attested_main_cloud_candidate",
     "helm_configuration_status",
     "initialize_main_cloud_instance_authority",

@@ -51,6 +51,9 @@ from orchestrator.services import (
 from orchestrator.services import ssh_access as ssh_access_operations
 from orchestrator.services.catalogue_resources import CatalogueResources
 from orchestrator.services.cloud import MainCloudRouter, build_backend
+from orchestrator.services.cloud.service_credentials import (
+    configure_service_credential_store,
+)
 from orchestrator.services.cloud_task_registry import CloudTaskRegistry
 from orchestrator.services.connector_drivers import builtin_connector_drivers
 from orchestrator.services.expert_catalog_contracts import ExpertCatalogState
@@ -214,6 +217,10 @@ def build_application_resources(
             gpt_live_sip_image=settings.connector_gpt_live_sip_image or None,
         ),
     )
+    # Where main-cloud adapters keep their service accounts' app passwords
+    # (bundled Nextcloud performance WP1b): process-wide, as the adapters
+    # are rebuilt outside any request (the instance registry, a reload).
+    configure_service_credential_store(postgres_db)
     # Credential leases (connector drivers C2): the window new leases are
     # issued with, process-wide like the provisioning backends below.
     connector_credential_leases.configure_lease_window(

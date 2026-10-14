@@ -373,6 +373,12 @@ async def bind_services(resources: ApplicationResources) -> None:
         await instance_registry.preload_retained_main_cloud_instances(
             resources.postgres_db, resources.main_cloud_router
         )
+        # agent-service's app password (bundled Nextcloud performance WP1b),
+        # adopted from the store or minted once per installation, before the
+        # first agent payload hands its credentials out. Never raises.
+        await instance_registry.adopt_main_cloud_service_credentials(
+            resources.main_cloud_router
+        )
         # Every project folder of the now-authoritative active installation
         # has its own connector (main cloud slice 3). Idempotent on every
         # replica (the key is unique); a failure only defers it.

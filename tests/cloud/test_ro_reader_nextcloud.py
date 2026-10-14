@@ -200,6 +200,9 @@ def _backend_with_ocs_fake():
     backend._client = httpx.AsyncClient(
         base_url=NC_BASE, transport=httpx.MockTransport(fake.handler)
     )
+    backend._agent_client = backend._build_agent_client(
+        httpx.MockTransport(fake.handler)
+    )
     backend._initialized = True
     backend._agent_user = AGENT_USER
     backend._agent_password = "pw"

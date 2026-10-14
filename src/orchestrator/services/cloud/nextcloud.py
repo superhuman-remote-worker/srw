@@ -71,6 +71,10 @@ from orchestrator.services.cloud.handles import (
     ShareHandle,
     UserId,
 )
+from orchestrator.services.cloud.nextcloud_agent_credential import (
+    AGENT_CLIENT_USER_AGENT,
+    NextcloudAgentServiceCredential,
+)
 from orchestrator.services.cloud.nextcloud_user_root import NextcloudUserRootGrant
 from orchestrator.services.cloud.retry import LeakyBucket
 from orchestrator.services.cloud.telemetry import instrument_backend_op
@@ -109,6 +113,10 @@ _FOLDER_KIND_FOR_ACCESS = {"read_only": "reader", "read_write": "writer"}
 #: lookup, only the installation-wide sharing settings, which SRW leaves
 #: to the operator.
 _FOLDER_PRINCIPAL_QUOTA = "0 B"
+
+#: The shared clients' (the admin's and agent-service's) timeouts and pool.
+_CLIENT_TIMEOUT = httpx.Timeout(connect=5.0, read=30.0, write=30.0, pool=10.0)
+_CLIENT_LIMITS = httpx.Limits(max_connections=20, max_keepalive_connections=10)
 
 # Nextcloud 30.0.10+ limits new shares per user on
 # /ocs/v2.php/apps/files_sharing/api/v1/shares, by default to 20 per 10
@@ -257,7 +265,7 @@ NEXTCLOUD_CAPABILITIES = ProviderCapabilities(
 )
 
 
-class NextcloudBackend(NextcloudUserRootGrant):
+class NextcloudBackend(NextcloudUserRootGrant, NextcloudAgentServiceCredential):
     """Main-cloud backend for Nextcloud.
 
     Reads configuration from environment variables:
@@ -267,6 +275,10 @@ class NextcloudBackend(NextcloudUserRootGrant):
         NEXTCLOUD_ADMIN_PASSWORD: Admin password (default: admin)
         NEXTCLOUD_AGENT_USER:     Service account username (default: agent-service)
         NEXTCLOUD_AGENT_PASSWORD: Service account password (default: agent-service-dev)
+
+    The admin account signs in with its password on ``_client``;
+    agent-service on ``_agent_client``, with the app password it mints with
+    its password once per installation (``NextcloudAgentServiceCredential``).
     """
 
     backend_id = BACKEND_ID
@@ -319,9 +331,12 @@ class NextcloudBackend(NextcloudUserRootGrant):
             else None
         )
         self._initialized = False
+        # The admin's, with client-level auth: never agent-service's.
         self._client: Optional[httpx.AsyncClient] = None
+        self._agent_client: Optional[httpx.AsyncClient] = None
         self._protected_effect_client: Optional[httpx.AsyncClient] = None
         self._backend_instance_id: Optional[str] = None
+        self._init_agent_secret()
         self._attestation_backend_instance_id: Optional[str] = None
         self._installation_proof_sha256: Optional[str] = None
         share_events, share_window = share_rate_bucket()
@@ -518,8 +533,9 @@ class NextcloudBackend(NextcloudUserRootGrant):
 
     @property
     def webdav_credentials(self) -> dict[str, str]:
-        """Agent credentials for WebDAV access to Nextcloud folders."""
-        return {"username": self._agent_user, "password": self._agent_password}
+        """Agent credentials for WebDAV access to Nextcloud folders: the
+        agent-service app password once adopted, else its login password."""
+        return {"username": self._agent_user, "password": self._agent_secret}
 
     @property
     def service_account_logins(self) -> frozenset[tuple[str, str]]:
@@ -755,9 +771,10 @@ class NextcloudBackend(NextcloudUserRootGrant):
                     "OCS-APIRequest": "true",
                     "User-Agent": "SuperhumanRemoteWorker/0.1 main-cloud-backend",
                 },
-                timeout=httpx.Timeout(connect=5.0, read=30.0, write=30.0, pool=10.0),
-                limits=httpx.Limits(max_connections=20, max_keepalive_connections=10),
+                timeout=_CLIENT_TIMEOUT,
+                limits=_CLIENT_LIMITS,
             )
+            self._agent_client = self._build_agent_client()
             if self._protected_effect_url is not None:
                 self._protected_effect_client = httpx.AsyncClient(
                     base_url=self._protected_effect_url,
@@ -808,11 +825,7 @@ class NextcloudBackend(NextcloudUserRootGrant):
                     "Nextcloud groupfolders app not installed — "
                     "cloud folder provisioning disabled"
                 )
-                await self._client.aclose()
-                self._client = None
-                if self._protected_effect_client is not None:
-                    await self._protected_effect_client.aclose()
-                    self._protected_effect_client = None
+                await self._close_clients()
                 return False
             resp.raise_for_status()
 
@@ -831,11 +844,7 @@ class NextcloudBackend(NextcloudUserRootGrant):
                     "integrity. Error: %s",
                     e,
                 )
-                await self._client.aclose()
-                self._client = None
-                if self._protected_effect_client is not None:
-                    await self._protected_effect_client.aclose()
-                    self._protected_effect_client = None
+                await self._close_clients()
                 return False
 
             installation_proof = legacy_installation_proof
@@ -894,26 +903,50 @@ class NextcloudBackend(NextcloudUserRootGrant):
             return True
         except Exception as e:
             logger.warning(f"Nextcloud backend init failed: {e}")
-            if self._client:
-                await self._client.aclose()
-                self._client = None
-            if self._protected_effect_client is not None:
-                await self._protected_effect_client.aclose()
-                self._protected_effect_client = None
+            await self._close_clients()
             return False
 
+    def _build_agent_client(
+        self, transport: Optional[httpx.AsyncBaseTransport] = None
+    ) -> httpx.AsyncClient:
+        """agent-service's shared client: the admin client's pool and
+        timeouts, no cookie (as ``_client``), and ``agent_service_auth``,
+        which signs every request with agent-service's current secret and
+        re-sends it once after a 401 that brought a newer one."""
+        return httpx.AsyncClient(
+            base_url=self._base_url,
+            auth=self.agent_service_auth(),
+            cookies=NoCookieJar(),
+            headers={
+                "OCS-APIRequest": "true",
+                "User-Agent": AGENT_CLIENT_USER_AGENT,
+            },
+            timeout=_CLIENT_TIMEOUT,
+            limits=_CLIENT_LIMITS,
+            transport=transport,
+        )
+
+    async def _close_clients(self) -> None:
+        """Close the admin, agent-service and protected-effect clients, each
+        whatever the others do; the first failure is raised after."""
+        clients = (self._client, self._agent_client, self._protected_effect_client)
+        self._client = self._agent_client = self._protected_effect_client = None
+        error: Optional[Exception] = None
+        for client in clients:
+            if client is None:
+                continue
+            try:
+                await client.aclose()
+            except Exception as exc:
+                error = error or exc
+        if error is not None:
+            raise error
+
     async def close(self) -> None:
-        if self._client is not None:
-            try:
-                await self._client.aclose()
-            finally:
-                self._client = None
-        if self._protected_effect_client is not None:
-            try:
-                await self._protected_effect_client.aclose()
-            finally:
-                self._protected_effect_client = None
-        self._initialized = False
+        try:
+            await self._close_clients()
+        finally:
+            self._initialized = False
 
     async def health_check(self) -> HealthStatus:
         if not self._initialized or self._client is None:
@@ -1398,11 +1431,10 @@ class NextcloudBackend(NextcloudUserRootGrant):
         ``parse_propfind_entries`` reads.
         """
         try:
-            resp = await self._client.request(
+            resp = await self._agent_client.request(
                 "PROPFIND",
                 url_path,
                 headers={"Depth": "1"},
-                auth=(self._agent_user, self._agent_password),
             )
         except httpx.HTTPError as e:
             raise self._map_http_error(e) from e
@@ -1433,11 +1465,10 @@ class NextcloudBackend(NextcloudUserRootGrant):
         or a transport error raises ``PropfindError`` so the caller falls back
         to a Depth:1 BFS (design §11.5)."""
         try:
-            resp = await self._client.request(
+            resp = await self._agent_client.request(
                 "PROPFIND",
                 url_path,
                 headers={"Depth": depth},
-                auth=(self._agent_user, self._agent_password),
             )
         except httpx.HTTPError as e:
             raise PropfindError(str(e)) from e
@@ -1495,9 +1526,7 @@ class NextcloudBackend(NextcloudUserRootGrant):
             )
         url = f"{base_path}/{quote(rel, safe='/')}"
         try:
-            resp = await self._client.get(
-                url, auth=(self._agent_user, self._agent_password)
-            )
+            resp = await self._agent_client.get(url)
         except httpx.HTTPError as e:
             raise self._map_http_error(e) from e
         if resp.status_code == 404:
@@ -1569,9 +1598,7 @@ class NextcloudBackend(NextcloudUserRootGrant):
             )
         url = f"{base_path}/{quote(rel, safe='/')}"
         try:
-            resp = await self._client.delete(
-                url, auth=(self._agent_user, self._agent_password)
-            )
+            resp = await self._agent_client.delete(url)
         except httpx.HTTPError as e:
             raise self._map_http_error(e) from e
         if resp.status_code in (200, 204):
@@ -1654,9 +1681,7 @@ class NextcloudBackend(NextcloudUserRootGrant):
         folder_path = handle.native_id
         try:
             url = f"/remote.php/dav/files/{self._agent_user}/{folder_path}"
-            resp = await self._client.delete(
-                url, auth=(self._agent_user, self._agent_password)
-            )
+            resp = await self._agent_client.delete(url)
             if resp.status_code == 204:
                 logger.info(f"Deleted session folder: {folder_path}")
                 return
@@ -1689,7 +1714,7 @@ class NextcloudBackend(NextcloudUserRootGrant):
         folder_path = handle.native_id
         await self._share_bucket.acquire()
         try:
-            resp = await self._client.post(
+            resp = await self._agent_client.post(
                 "/ocs/v2.php/apps/files_sharing/api/v1/shares",
                 params={"format": "json"},
                 data={
@@ -1698,7 +1723,6 @@ class NextcloudBackend(NextcloudUserRootGrant):
                     "shareWith": str(user_id),
                     "permissions": str(_SESSION_SHARE_PERMISSIONS),
                 },
-                auth=(self._agent_user, self._agent_password),
             )
             resp.raise_for_status()
             self._assert_not_html(resp)
@@ -1739,10 +1763,9 @@ class NextcloudBackend(NextcloudUserRootGrant):
                 backend=self.backend_id,
             ) from e
         try:
-            resp = await self._client.delete(
+            resp = await self._agent_client.delete(
                 f"/ocs/v2.php/apps/files_sharing/api/v1/shares/{share_id}",
                 params={"format": "json"},
-                auth=(self._agent_user, self._agent_password),
             )
             if resp.status_code == 200:
                 logger.info(f"Revoked session share id={share_id}")
@@ -1810,10 +1833,9 @@ class NextcloudBackend(NextcloudUserRootGrant):
             raise self._map_http_error(e) from e
 
     async def _mkcol(self, dav_prefix: str, segments: list[str]) -> httpx.Response:
-        return await self._client.request(
+        return await self._agent_client.request(
             "MKCOL",
             f"{dav_prefix}/{quote('/'.join(segments), safe='/')}",
-            auth=(self._agent_user, self._agent_password),
         )
 
     async def _mkcol_parents(self, dav_prefix: str, segments: list[str]) -> None:
@@ -1840,19 +1862,17 @@ class NextcloudBackend(NextcloudUserRootGrant):
         headers: dict[str, str] = {}
         if content_type:
             headers["Content-Type"] = content_type
-        put_resp = await self._client.put(
+        put_resp = await self._agent_client.put(
             url,
             headers=headers,
             content=content,
-            auth=(self._agent_user, self._agent_password),
         )
         if put_resp.status_code in (404, 409) and len(segments) > 1:
             await self._mkcol_parents(dav_prefix, segments[:-1])
-            put_resp = await self._client.put(
+            put_resp = await self._agent_client.put(
                 url,
                 headers=headers,
                 content=content,
-                auth=(self._agent_user, self._agent_password),
             )
         if put_resp.status_code not in (200, 201, 204):
             put_resp.raise_for_status()
@@ -2522,10 +2542,9 @@ class NextcloudBackend(NextcloudUserRootGrant):
                     f"{quote(fixture.trash_ref, safe='')}"
                 )
                 try:
-                    await self._client.request(
+                    await self._agent_client.request(
                         "DELETE",
                         purge_url,
-                        auth=(self._agent_user, self._agent_password),
                     )
                 except httpx.HTTPError:
                     pass
@@ -2588,11 +2607,10 @@ class NextcloudBackend(NextcloudUserRootGrant):
             return None
         url = f"/remote.php/dav/versions/{user}/versions/{fileid}"
         try:
-            resp = await self._client.request(
+            resp = await self._agent_client.request(
                 "PROPFIND",
                 url,
                 headers={"Depth": "1"},
-                auth=(self._agent_user, self._agent_password),
             )
         except httpx.HTTPError:
             return None
@@ -2636,11 +2654,10 @@ class NextcloudBackend(NextcloudUserRootGrant):
             return None
         url = f"/remote.php/dav/trashbin/{user}/trash"
         try:
-            resp = await self._client.request(
+            resp = await self._agent_client.request(
                 "PROPFIND",
                 url,
                 headers={"Depth": "1"},
-                auth=(self._agent_user, self._agent_password),
             )
         except httpx.HTTPError:
             return None
