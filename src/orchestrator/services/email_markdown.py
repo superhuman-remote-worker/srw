@@ -106,7 +106,6 @@ _MAX_DEPTH = 12
 # "&" that ends it.
 _ENTITY = r"&(?:[a-zA-Z]+|#\d+);"
 _BARE_URL_RE = re.compile(r"(?<![\w/])(https?://(?:" + _ENTITY + r"|[^\s<>\[\]()&])+)")
-_ENTITY_TAIL_RE = re.compile(r"&(?:[a-zA-Z]+|#\d+)$")
 
 
 def render_markdown(md: str) -> str:
@@ -544,17 +543,36 @@ def _sub_code_spans(text: str, render) -> str:
     return "".join(out)
 
 
+def _ends_with_entity(text: str, end: int) -> bool:
+    """Whether `text[:end]` ends in an unfinished entity: `&name` or `&#digits`.
+
+    Scans backwards over the entity body only, so it costs O(len(entity)) rather
+    than a search from the start of the string."""
+    start = end
+    while start and text[start - 1].isascii() and text[start - 1].isalpha():
+        start -= 1
+    if start < end:
+        return start > 0 and text[start - 1] == "&"
+    while start and text[start - 1].isdecimal():
+        start -= 1
+    return (
+        start < end and start > 1 and text[start - 1] == "#" and text[start - 2] == "&"
+    )
+
+
 def _bare_url(keep):
     def replace(match: re.Match[str]) -> str:
         url = match.group(1)
-        trailing = ""
         # Sentence punctuation belongs to the prose, not the URL -- except when
         # the ";" is the tail of an entity the escape pass wrote (a link with a
         # quote in it would otherwise be cut in half and displayed as "&quot").
-        while url and url[-1] in ".,;:!?" and not _ENTITY_TAIL_RE.search(url[:-1]):
-            url, trailing = url[:-1], url[-1] + trailing
-        if not url:
+        end = len(url)
+        while end and url[end - 1] in ".,;:!?" and not _ends_with_entity(url, end - 1):
+            end -= 1
+        if not end:
             return match.group(0)
+        trailing = url[end:]
+        url = url[:end]
         return keep(_anchor(html.unescape(url), url)) + trailing
 
     return replace

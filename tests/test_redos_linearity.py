@@ -146,6 +146,10 @@ class TestEmailMarkdownInline:
     def test_unclosed_underscore_emphasis_is_linear(self) -> None:
         assert_fast(em._emphasis, " __a" * (HOSTILE // 4))
 
+    def test_bare_url_trailing_punctuation_is_linear(self) -> None:
+        # Each stripped character re-searched the whole shrinking URL.
+        assert_fast(em._inline, "see https://e.example/a" + "." * HOSTILE)
+
 
 class TestTtsMarkdownStripping:
     """Speech normalisation of message content (alerts #488-#490)."""

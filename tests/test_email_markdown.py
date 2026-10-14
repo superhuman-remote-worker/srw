@@ -15,7 +15,7 @@ import re
 import pytest
 
 from orchestrator.services import brand
-from orchestrator.services.email_markdown import render_markdown
+from orchestrator.services.email_markdown import _bare_url, render_markdown
 
 
 class TestFormatting:
@@ -168,6 +168,33 @@ class TestUntrustedInput:
         html = render_markdown("Full diff: https://git.example/a/b. Thanks")
         assert 'href="https://git.example/a/b"' in html
         assert ">https://git.example/a/b</a>." in html
+
+    @pytest.mark.parametrize(
+        ("text", "href", "after"),
+        [
+            ("see https://e.example/a. Next", "https://e.example/a", "."),
+            ("(see https://e.example/a), ok", "https://e.example/a", "),"),
+            ("really https://e.example/a?!", "https://e.example/a", "?!"),
+            ("https://e.example/a...,;:", "https://e.example/a", "...,;:"),
+        ],
+    )
+    def test_bare_url_trailing_punctuation_stays_out_of_the_link(
+        self, text: str, href: str, after: str
+    ) -> None:
+        html = render_markdown(text)
+        assert f'href="{href}"' in html
+        assert f">{href}</a>{after}" in html.replace("&#x27;", "'")
+
+    def test_bare_url_keeps_an_entity_semicolon(self) -> None:
+        # The escape pass writes the quote as "&quot;"; its ";" is not prose.
+        html = render_markdown('see https://e.example/a". Next')
+        assert 'href="https://e.example/a&quot;"' in html
+        assert "</a>. Next" in html
+
+    def test_bare_url_made_only_of_punctuation_falls_through_unchanged(self) -> None:
+        # The URL pattern always matches a scheme, so reach the guard directly.
+        match = re.match(r"(.*)", ".,;:!?")
+        assert _bare_url(lambda anchor: "LINK")(match) == ".,;:!?"
 
     def test_placeholder_sentinels_cannot_be_smuggled_in(self) -> None:
         # The renderer swaps rendered spans out for private-use sentinels; a
