@@ -96,9 +96,10 @@ The current grant catalog covers:
 - `permission_mode` — cap persistent-session permission mode.
 
 An unavailable choice may be greyed out with **Requires a capability grant**.
-Administrators manage scoped values under **Settings → Grants** (Administration group). Changing the UI
-does not replace server enforcement: session creation, attachment,
-provisioning, dispatch, and individual actions recheck the applicable policy.
+Administrators manage scoped values under **Settings → Grants** (Administration
+group). Changing the UI does not replace server enforcement: session creation,
+attachment, provisioning, dispatch, and individual actions recheck the
+applicable policy.
 
 ## Choose the workspace for the work
 

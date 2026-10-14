@@ -45,7 +45,8 @@ online service, explain the setup path if browser tools are missing:
    **Shell** checkbox controls separate command tools; it is not an extra
    requirement for direct browser control. If Browser is unavailable, use its
    shown reason; a grant restriction needs an administrator under
-   **Settings → Grants**, while a workspace restriction needs the compatible tier.
+   **Settings → Grants** (Administration group), while a workspace restriction
+   needs the compatible tier.
 4. Settings apply automatically with the **next response**. After the upgrade
    and setting change, send the agent a follow-up to continue. The agent must
    check that the actual browser tools are loaded and report the outcome of
