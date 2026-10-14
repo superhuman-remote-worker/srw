@@ -212,6 +212,54 @@ class TestCallbackRefusals:
         assert r.json()["detail"] == "State mismatch"
 
 
+class TestCallbackSubjectCheck:
+    """A code exchange whose tokens carry no usable subject opens no session."""
+
+    @pytest.fixture
+    def resolve(self, client, store, monkeypatch):
+        store.pre_auth_row = {"state": "s", "pkce_verifier": "v", "return_to": "/"}
+        client.cookies.set(PRE_AUTH_COOKIE, "pre-auth-id-1")
+        monkeypatch.setattr(
+            bff.kc_bff_client,
+            "exchange_code",
+            AsyncMock(
+                return_value={
+                    "access_token": "at",
+                    "refresh_token": "rt",
+                    "id_token": "it",
+                    "expires_in": 300,
+                }
+            ),
+            raising=False,
+        )
+        resolve = AsyncMock(side_effect=AssertionError("must not provision a user"))
+        monkeypatch.setattr(bff, "_resolve_user_from_claims", resolve)
+        return resolve
+
+    @pytest.mark.parametrize(
+        "bad_sub",
+        ["__absent__", None, "", "   ", 123],
+        ids=["absent", "none", "empty", "blank", "int"],
+    )
+    def test_unusable_subject_is_refused_before_provisioning(
+        self, client, resolve, monkeypatch, bad_sub
+    ):
+        claims = {"realm_access": {"roles": ["user"]}}
+        if bad_sub != "__absent__":
+            claims["sub"] = bad_sub
+        monkeypatch.setattr(
+            bff,
+            "oidc_validator",
+            SimpleNamespace(
+                validate_token=lambda _t: claims, decode_id_token=lambda _t: {}
+            ),
+        )
+        r = client.get("/auth/callback", params={"code": "c", "state": "s"})
+        assert r.status_code == 502
+        assert r.json()["detail"] == "Authentication backend error"
+        resolve.assert_not_awaited()
+
+
 class TestRefreshRefusals:
     def test_no_cookie_is_401(self, client):
         assert client.post("/auth/refresh").status_code == 401

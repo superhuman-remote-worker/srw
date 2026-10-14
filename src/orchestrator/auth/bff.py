@@ -22,6 +22,7 @@ from fastapi.responses import JSONResponse, RedirectResponse
 
 from orchestrator.security.auth import (
     SESSION_COOKIE,
+    _has_usable_subject,
     _merge_identity_claims,
     _refresh_session_in_place,
     _resolve_user_from_claims,
@@ -289,8 +290,10 @@ async def callback(
     # is required by OIDC to carry `sub`, so we lift identity claims from
     # there into the merged dict.
     merged_claims = _merge_identity_claims(claims, id_claims)
-    if "sub" not in merged_claims:
-        logger.warning("KC token response had no sub claim in access_token or id_token")
+    if not _has_usable_subject(merged_claims):
+        logger.warning(
+            "KC token response had no usable sub claim in access_token or id_token"
+        )
         raise HTTPException(status_code=502, detail="Authentication backend error")
     kc_sub = merged_claims["sub"]
     kc_sid = id_claims.get("sid")
