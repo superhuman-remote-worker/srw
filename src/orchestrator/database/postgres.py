@@ -6553,12 +6553,13 @@ class PostgresDB:
     async def quiesce_cancelled_stateless_vm_parent(
         self, job_id: str, *, retention_only: bool = False
     ) -> bool:
-        """Select this cancelled Job's exact VM cleanup ordering dependency.
+        """Select this terminal Job's exact VM cleanup ordering dependency.
 
         Legacy Cancel selects an open parent; typed retention also selects a
         settled parent so response-loss and permanent Delete retries can finish.
         ``retention_only`` restricts Delete's prune deferral to that persistent
-        link. This read grants no effect: archive revalidates the parent,
+        link, including a completed/failed retained continuation with a durable
+        Delete fence. This read grants no effect: archive revalidates the parent,
         resource policy and physical stop before settlement.
         """
         try:
@@ -6597,7 +6598,12 @@ class PostgresDB:
             )
             if (
                 row is None
-                or row["status"] != "cancelled"
+                or (
+                    row["status"] != "cancelled"
+                    and not (
+                        retention_only and row["status"] in {"completed", "failed"}
+                    )
+                )
                 or row["execution_lane"] != "stateless"
             ):
                 return False
@@ -6609,6 +6615,11 @@ class PostgresDB:
                     return False
             if not isinstance(context, dict) or (
                 context.get("_stateless_cancel_cleanup_pending") is not True
+                and context.get("_stateless_delete_pending") is not True
+            ):
+                return False
+            if (
+                row["status"] != "cancelled"
                 and context.get("_stateless_delete_pending") is not True
             ):
                 return False
@@ -6630,6 +6641,10 @@ class PostgresDB:
                         owner_id,
                     )
                 )
+            if row["status"] != "cancelled":
+                # Ordinary terminal Delete may defer only through its exact
+                # linked retained continuation, never a legacy cleanup hint.
+                return False
             vm = context.get("vm")
             if not isinstance(vm, dict) or vm.get("workspace_storage") is not None:
                 # Retained storage needs its durable reservation proof, which
@@ -7092,7 +7107,7 @@ class PostgresDB:
                                updated_at = CURRENT_TIMESTAMP
                          WHERE id = $1
                            AND execution_lane = 'stateless'
-                        RETURNING id
+                        RETURNING id, context
                         """,
                         job_uuid,
                     )
@@ -7110,6 +7125,27 @@ class PostgresDB:
                     )
         except _DeleteCASLostError:
             return False
+
+        context = row.get("context") or {}
+        if isinstance(context, str):
+            context = json.loads(context)
+        if isinstance(context, dict) and "_vm_job_retained_resume" in context:
+            from orchestrator.services.vm_job_retained_resume import (
+                complete_retained_cancel,
+            )
+
+            retained_terminal = await complete_retained_cancel(
+                self, job_id, clear_pending=False
+            )
+            if retained_terminal is False:
+                # The durable Delete fence owns this continuation, but its
+                # exact stop/tail is not settled. Archive records that proof
+                # before the caller's final strict prune; never prune first.
+                return True
+            if retained_terminal is None:
+                # A recognized continuation cannot fall through as a legacy
+                # owner when its current operation cannot be recovered.
+                return False
 
         if await self.quiesce_cancelled_stateless_vm_parent(
             job_id, retention_only=True

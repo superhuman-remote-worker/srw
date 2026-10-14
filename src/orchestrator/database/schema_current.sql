@@ -25557,8 +25557,20 @@ BEGIN
        OR (j.context ? '_job_terminal_vm_cleanup' AND (
            j.context->'_job_terminal_vm_cleanup'->>'version'='1'
            AND j.context->'_job_terminal_vm_cleanup'->>'provision_generation'=generation::text
-           AND j.context->'_job_terminal_vm_cleanup'->>'admission_id'
-               IN (old_parent::text,retaining_parent::text)) IS DISTINCT FROM true) THEN
+           AND (
+               j.context->'_job_terminal_vm_cleanup'->>'admission_id'
+                   IN (old_parent::text,retaining_parent::text)
+               OR (
+                   -- The approved marker precedes first-parent admission. Once
+                   -- bound, replay must match that exact parent above; explicit
+                   -- JSON null is invalid and must not act like a missing key.
+                   NOT (j.context->'_job_terminal_vm_cleanup' ? 'admission_id')
+                   AND j.status='completed' AND j.completed_at IS NOT NULL
+                   AND j.freeze_data IS NULL
+                   AND j.context->'_job_terminal_vm_cleanup'
+                       @> '{"version":1,"source":"approve"}'::jsonb
+               )
+           )) IS DISTINCT FROM true) THEN
         RETURN NULL;
     END IF;
     RETURN jsonb_build_object('creation_request_id',r.request_id,'reservation_id',v.id,
@@ -25576,7 +25588,14 @@ CREATE FUNCTION public.vm_job_retained_terminal_authorized(owner uuid) RETURNS b
     LANGUAGE sql STABLE
     AS $$
     SELECT EXISTS(SELECT 1 FROM public.jobs j WHERE j.id=owner AND (
-        (j.status='cancelled' AND j.context->'_stateless_cancel_cleanup_pending'='true'::jsonb)
+        -- Ordinary Approve commits this marker with completed status. A finished
+        -- review command has no finalizing lease to authorize the later sweep.
+        (j.status='completed' AND j.completed_at IS NOT NULL AND j.freeze_data IS NULL
+          AND j.context->'_job_terminal_vm_cleanup' @> '{"version":1,"source":"approve"}'::jsonb
+          AND j.context->'_job_terminal_vm_cleanup'->>'provision_generation' IS NOT NULL
+          AND j.context->'_job_terminal_vm_cleanup'->>'provision_generation'=
+              j.context->'vm'->>'provision_generation')
+        OR (j.status='cancelled' AND j.context->'_stateless_cancel_cleanup_pending'='true'::jsonb)
         OR (j.status IN ('cancelled','failed','completed') AND j.context->'_stateless_delete_pending'='true'::jsonb)
         OR EXISTS(SELECT 1 FROM public.job_completion_commands command
             JOIN public.completion_effects effect ON effect.producer_id=command.id
