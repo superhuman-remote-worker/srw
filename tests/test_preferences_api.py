@@ -456,7 +456,7 @@ async def test_patch_refuses_a_newly_chosen_unavailable_model(
     detail = response.json()["detail"]
     assert detail["code"] == "model.unavailable"
     assert "`MiniMax-M3` (main model) is no longer available" in detail["message"]
-    assert "Settings → Preferences" in detail["message"]
+    assert "Settings → Defaults" in detail["message"]
     api.db.update_user_settings.assert_not_awaited()
 
 

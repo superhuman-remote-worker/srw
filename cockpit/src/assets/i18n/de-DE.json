@@ -1201,7 +1201,7 @@
         "baseUrlPlaceholder": "Basis-URL (z.B. https://vllm.example/v1)",
         "apiKeyPlaceholder": "API-Key (optional)",
         "allowInsecure": "http:// erlauben (außerhalb lokaler Entwicklung nicht empfohlen)",
-        "confirmDelete": "Diesen System-Endpunkt löschen? Katalogeinträge, die darauf verweisen, schlagen fehl, bis sie in Admin · Models entfernt oder umgestellt sind.",
+        "confirmDelete": "Diesen System-Endpunkt löschen? Katalogeinträge, die darauf verweisen, schlagen fehl, bis sie in Einstellungen → Modelle → Katalog entfernt oder umgestellt sind.",
         "testButton": "Test",
         "testing": "Teste...",
         "testOk": "OK ({{status}})",
@@ -1209,7 +1209,7 @@
         "errorUrlScheme": "Basis-URL muss mit http:// oder https:// beginnen",
         "errorHttpNeedsOptIn": "http://-URLs erfordern die Checkbox 'http:// erlauben'.",
         "catalogHint": "Modelle dieses Endpunkts werden im Katalog verwaltet.",
-        "catalogHintLink": "Admin · Models öffnen →",
+        "catalogHintLink": "Einstellungen → Modelle → Katalog öffnen →",
         "editTitle": "Endpunkt bearbeiten",
         "apiKeyPlaceholderEdit": "API-Key (leer lassen, um bestehenden Key zu behalten)",
         "removeKey": "Bestehenden API-Key beim Speichern entfernen"

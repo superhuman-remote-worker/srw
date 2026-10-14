@@ -1201,7 +1201,7 @@
         "baseUrlPlaceholder": "Base URL (e.g. https://vllm.example/v1)",
         "apiKeyPlaceholder": "API key (optional)",
         "allowInsecure": "Allow http:// (not recommended outside local dev)",
-        "confirmDelete": "Delete this system endpoint? Catalog rows pointing at it will return errors until you remove or re-target them in Admin · Models.",
+        "confirmDelete": "Delete this system endpoint? Catalog rows pointing at it will return errors until you remove or re-target them in Settings → Models → Catalog.",
         "testButton": "Test",
         "testing": "Testing...",
         "testOk": "OK ({{status}})",
@@ -1209,7 +1209,7 @@
         "errorUrlScheme": "Base URL must start with http:// or https://",
         "errorHttpNeedsOptIn": "http:// URLs require the Allow http:// checkbox.",
         "catalogHint": "Models served by this endpoint are managed in the catalog.",
-        "catalogHintLink": "Open Admin · Models →",
+        "catalogHintLink": "Open Settings → Models → Catalog →",
         "editTitle": "Edit Endpoint",
         "apiKeyPlaceholderEdit": "API key (leave blank to keep existing)",
         "removeKey": "Remove existing API key on save"

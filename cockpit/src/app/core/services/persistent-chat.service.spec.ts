@@ -1702,7 +1702,7 @@ describe('PersistentChatService — createAndConnect()', () => {
     // run is replaced by the system default, and the create response says so.
     const { service, mockHttp } = createService();
     const notice =
-      'Your default model `MiniMax-M3` is no longer available, so this session uses `muse-spark-1.3-contributor`. Choose a new default in Settings → Preferences.';
+      'Your default model `MiniMax-M3` is no longer available, so this session uses `muse-spark-1.3-contributor`. Choose a new default in Settings → Defaults.';
     mockHttp.post.mockImplementation((url: string) =>
       url.endsWith('/persistent/threads')
         ? of({ thread_id: 'thread-new', status: 'created', notices: [notice] })

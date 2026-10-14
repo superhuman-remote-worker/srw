@@ -42,7 +42,7 @@ MODEL_UNAVAILABLE_CODE = "model.unavailable"
 # Where the user changes the model, for the refusal text (§ Messages).
 WHERE_SESSION = "this session's settings"
 WHERE_JOB = "the job's configuration"
-WHERE_ACCOUNT = "Settings → Preferences"
+WHERE_ACCOUNT = "Settings → Defaults"
 
 # The cockpit's chat banner cuts a message at 240 characters (sanitizeError).
 _MESSAGE_LIMIT = 240

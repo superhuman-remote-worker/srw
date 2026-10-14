@@ -726,7 +726,7 @@ top-p `0.95`, reasoning `max` (options: `low`, `high`, `max`), a 1M-token contex
 and a 131,072-token output budget. Reasoning cannot be disabled. Older models
 such as GLM-5.2 retain the `glm` family.
 
-In **Admin → Models**, add `z-ai/glm-5.3-flash` using your OpenRouter provider;
+In **Settings → Models → Catalog**, add `z-ai/glm-5.3-flash` using your OpenRouter provider;
 `openrouter/z-ai/glm-5.3-flash` is also recognized. The family is detected
 automatically. For Z.ai's OpenAI-compatible endpoint, use the bare model ID
 `glm-5.3-flash`. Explicit model/expert/user settings override the family defaults.
@@ -749,7 +749,7 @@ Temperature `1.0` and top-p `1.0` follow the conventional defaults listed in
 [OpenRouter's parameter guide](https://openrouter.ai/docs/api/reference/parameters),
 not a verified Meta-specific recommendation. Explicit settings override them.
 
-In **Admin → Models**, add `meta/muse-spark-1.3` using your OpenRouter provider.
+In **Settings → Models → Catalog**, add `meta/muse-spark-1.3` using your OpenRouter provider.
 The family is detected automatically, including with an `openrouter/` prefix.
 The separately selected `meta/muse-spark-1.3-contributor` also uses this family;
 family detection preserves the selected model ID and tier. Adding the family
@@ -778,7 +778,7 @@ Moonshot also asks for each assistant message's `reasoning_content` to be sent
 back on later turns. SRW's OpenAI-compatible transport does not do that, so the
 K3 prompts ask the model for a one-line visible intent before each tool call.
 
-In **Admin → Models**, add `moonshotai/kimi-k3` with your OpenRouter provider, or
+In **Settings → Models → Catalog**, add `moonshotai/kimi-k3` with your OpenRouter provider, or
 `kimi-k3` on an OpenAI-compatible endpoint at `https://api.moonshot.ai/v1`. The
 native API accepts images only as base64 or `ms://` file IDs, not public URLs.
 The family is detected automatically, including `openrouter/` and `moonshotai/`
@@ -802,7 +802,7 @@ Families without the setting are unchanged.
 
 Self-host with vLLM using `--reasoning-parser qwen3 --enable-auto-tool-choice
 --tool-call-parser qwen3_xml` ([recipe](https://recipes.vllm.ai/Qwen/Qwen3.8-27B)),
-then add the served model in **Admin → Models** on an OpenAI-compatible endpoint.
+then add the served model in **Settings → Models → Catalog** on an OpenAI-compatible endpoint.
 Via OpenRouter, add `qwen/qwen3.8-27b`. The family is detected automatically;
 pick it by hand if the served model name does not contain `qwen3.8-27b`.
 
@@ -822,7 +822,7 @@ no rule for later system messages, and the open variant's template rejects them.
 Structured output stays on `json_schema`, because thinking mode cannot force a
 tool call.
 
-In **Admin → Models**, add `qwen3.8-max` on an OpenAI-compatible endpoint at
+In **Settings → Models → Catalog**, add `qwen3.8-max` on an OpenAI-compatible endpoint at
 Alibaba Model Studio, or `qwen/qwen3.8-max-0902` / `qwen/qwen3.8-max-prime` with
 your OpenRouter provider. Expect long outputs: Artificial Analysis measured
 about twice the median token use.
@@ -840,7 +840,7 @@ Only 4.7 is matched; older 4.x rows differ in effort ladder and window and keep
 xAI bills every token in a request at double rate once the prompt reaches
 200,000 tokens. With the full window, compaction starts at 400,000, so long jobs
 pay double for most late turns. To stay under that tier, set the model's
-`context_window` to 250,000 in **Admin → Models**.
+`context_window` to 250,000 in **Settings → Models → Catalog**.
 
 Add `grok-4.7` on an OpenAI-compatible endpoint at `https://api.x.ai/v1`,
 `x-ai/grok-4.7` with your OpenRouter provider, or connect the Grok Build
@@ -885,7 +885,7 @@ Google asks for thought signatures to be sent back on function-calling turns.
 The native client keeps them within a live turn. A resumed history without
 them can be rejected, as with older Gemini 3 models.
 
-In **Admin → Models**, add `gemini-4-argon` or `gemini-3.8-flash` with a Google
+In **Settings → Models → Catalog**, add `gemini-4-argon` or `gemini-3.8-flash` with a Google
 provider, or `google/gemini-4-argon` / `google/gemini-3.8-flash` with your
 OpenRouter provider. The family is detected automatically, including
 `openrouter/`, `google/` and `models/` prefixes. Adding the family does not
