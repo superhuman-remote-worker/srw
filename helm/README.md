@@ -698,6 +698,20 @@ primary storage the setup hook sets the objectstore's `verify_bucket_exists`
 to `false` once Nextcloud is installed, which drops a bucket check from every
 request; install still creates a missing bucket.
 
+### Nextcloud share-create rate limit
+
+Nextcloud lets each user create 20 shares per 600 s. SRW's `agent-service`
+account creates every session and job-export share, so that per-user limit
+caps the whole installation. For the bundled Nextcloud,
+`nextcloud.rateLimits.shareCreate` (default 200 per 600 s) raises it: the setup
+hook writes Nextcloud's `ratelimit_overwrite` for
+`files_sharing.shareapi.createshare` on every start and deletes it when both
+values are `null`. The orchestrator receives the same numbers and the replica
+count (`NEXTCLOUD_SHARE_RATE_LIMIT`, `NEXTCLOUD_SHARE_RATE_PERIOD_SECONDS`,
+`NEXTCLOUD_SHARE_RATE_REPLICAS`) so its replicas together stay under the limit.
+For an external Nextcloud the chart assumes upstream's 20 per 600 s; if that
+server's admin changed it, set `cloud.shareRateLimit` to match.
+
 ### Self-hosted web research
 
 The chart deploys SearXNG by default (`searxng.enabled=true`) and seeds its

@@ -469,6 +469,37 @@ Whether the bundled protected-effect lane is deployed.
 {{- end }}
 
 {{/*
+Nextcloud's share-create rate limit as {"limit", "periodSeconds", "override"}
+JSON. The orchestrator sizes its per-replica client bucket from it, and the
+bundled Nextcloud's setup hook applies it server side.
+
+  bundled (nextcloud.enabled and nextcloud.internal):
+                    nextcloud.rateLimits.shareCreate
+  otherwise:        cloud.shareRateLimit, which mirrors what an external
+                    Nextcloud's own admin configured
+
+A null field means upstream's default (20 shares per 600 s per user).
+"override" is false only when both fields are null; the hook then deletes
+its server override instead of writing upstream's numbers into config.php.
+*/}}
+{{- define "srw.nextcloudShareRateLimitJson" -}}
+{{- $configured := .Values.cloud.shareRateLimit | default dict -}}
+{{- if and .Values.nextcloud.enabled .Values.nextcloud.internal -}}
+  {{- if or (not (kindIs "invalid" (index $configured "limit"))) (not (kindIs "invalid" (index $configured "periodSeconds"))) -}}
+    {{- fail "cloud.shareRateLimit describes an external Nextcloud; set the bundled Nextcloud's share-create limit with nextcloud.rateLimits.shareCreate" -}}
+  {{- end -}}
+  {{- $configured = (.Values.nextcloud.rateLimits | default dict).shareCreate | default dict -}}
+{{- end -}}
+{{- $limit := index $configured "limit" -}}
+{{- $period := index $configured "periodSeconds" -}}
+{{- dict
+      "limit" (ternary 20 $limit (kindIs "invalid" $limit) | int)
+      "periodSeconds" (ternary 600 $period (kindIs "invalid" $period) | int)
+      "override" (not (and (kindIs "invalid" $limit) (kindIs "invalid" $period)))
+    | toJson -}}
+{{- end }}
+
+{{/*
 Domain-derived URLs. Each component host is `global.hostnames.<key>` when
 set, otherwise `<subdomain>.<global.domain>`. Centralised in srw.host so a
 single override propagates to ingress, configmap, OIDC redirects, and the

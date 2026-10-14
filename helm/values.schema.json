@@ -8,6 +8,14 @@
     "global"
   ],
   "definitions": {
+    "nextcloudShareRateLimit": {
+      "type": ["object", "null"],
+      "additionalProperties": false,
+      "properties": {
+        "limit": {"type": ["integer", "null"], "minimum": 1},
+        "periodSeconds": {"type": ["integer", "null"], "minimum": 1}
+      }
+    },
     "connectorDriverResources": {
       "type": "object",
       "additionalProperties": false,
@@ -871,6 +879,14 @@
             }
           }
         },
+        "rateLimits": {
+          "type": "object",
+          "properties": {
+            "shareCreate": {
+              "$ref": "#/definitions/nextcloudShareRateLimit"
+            }
+          }
+        },
         "protectedEffect": {
           "type": "object",
           "properties": {
@@ -925,6 +941,14 @@
               "maximum": 64
             }
           }
+        }
+      }
+    },
+    "cloud": {
+      "type": "object",
+      "properties": {
+        "shareRateLimit": {
+          "$ref": "#/definitions/nextcloudShareRateLimit"
         }
       }
     },

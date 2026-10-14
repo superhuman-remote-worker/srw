@@ -297,3 +297,180 @@ def test_s3_bucket_check_is_skipped_only_once_installed_on_s3() -> None:
         _documents(*BUNDLED, "--set", "nextcloud.objectStore.enabled=false")
     )
     assert "verify_bucket_exists" not in filesystem
+
+
+SHARE_ROUTE = "ratelimit_overwrite files_sharing.shareapi.createshare"
+EXTERNAL = (
+    "--set",
+    "nextcloud.enabled=false",
+    "--set",
+    "opencloud.enabled=false",
+    "--set",
+    "cloud.externalBackend=nextcloud",
+    "--set",
+    "cloud.externalUrl=https://cloud.example.org",
+)
+
+
+def _share_rate_env(documents: list[dict]) -> dict[str, str]:
+    orchestrator = next(
+        container
+        for document in documents
+        if document.get("kind") == "Deployment"
+        for container in document["spec"]["template"]["spec"]["containers"]
+        if container["name"] == "orchestrator"
+    )
+    return {
+        name: entry["value"]
+        for name, entry in _env(orchestrator).items()
+        if name.startswith("NEXTCLOUD_SHARE_RATE_")
+    }
+
+
+def test_hook_raises_the_share_create_limit_and_the_orchestrator_follows() -> None:
+    documents = _documents(*BUNDLED)
+    hook = _hook(documents)
+
+    # RateLimitingMiddleware keys the override by app.controller.method in
+    # lower case (ShareAPIController::createShare), not by the OCS route name.
+    assert (
+        f"occ config:system:set {SHARE_ROUTE} user limit --value=200 --type=integer"
+        in hook
+    )
+    assert (
+        f"occ config:system:set {SHARE_ROUTE} user period --value=600 --type=integer"
+        in hook
+    )
+    assert "config:system:delete ratelimit_overwrite" not in hook
+    assert _share_rate_env(documents) == {
+        "NEXTCLOUD_SHARE_RATE_LIMIT": "200",
+        "NEXTCLOUD_SHARE_RATE_PERIOD_SECONDS": "600",
+        "NEXTCLOUD_SHARE_RATE_REPLICAS": "1",
+    }
+
+    custom = _documents(
+        *BUNDLED,
+        "--set",
+        "nextcloud.rateLimits.shareCreate.limit=500",
+        "--set",
+        "nextcloud.rateLimits.shareCreate.periodSeconds=300",
+        "--set",
+        "orchestrator.replicas=3",
+    )
+    hook = _hook(custom)
+    assert f"{SHARE_ROUTE} user limit --value=500 --type=integer" in hook
+    assert f"{SHARE_ROUTE} user period --value=300 --type=integer" in hook
+    assert _share_rate_env(custom) == {
+        "NEXTCLOUD_SHARE_RATE_LIMIT": "500",
+        "NEXTCLOUD_SHARE_RATE_PERIOD_SECONDS": "300",
+        "NEXTCLOUD_SHARE_RATE_REPLICAS": "3",
+    }
+
+
+@pytest.mark.parametrize(
+    "unset",
+    [
+        ("--set", "nextcloud.rateLimits.shareCreate=null"),
+        (
+            "--set",
+            "nextcloud.rateLimits.shareCreate.limit=null",
+            "--set",
+            "nextcloud.rateLimits.shareCreate.periodSeconds=null",
+        ),
+    ],
+    ids=["object", "fields"],
+)
+def test_unset_share_create_limit_deletes_the_server_override(
+    unset: tuple[str, ...],
+) -> None:
+    """config:system:set persists in config.php: dropping the value alone would
+    keep the last override in force."""
+
+    documents = _documents(*BUNDLED, *unset)
+    hook = _hook(documents)
+
+    assert (
+        "occ config:system:delete ratelimit_overwrite "
+        "files_sharing.shareapi.createshare" in hook
+    )
+    assert f"config:system:set {SHARE_ROUTE}" not in hook
+    assert _share_rate_env(documents) == {
+        "NEXTCLOUD_SHARE_RATE_LIMIT": "20",
+        "NEXTCLOUD_SHARE_RATE_PERIOD_SECONDS": "600",
+        "NEXTCLOUD_SHARE_RATE_REPLICAS": "1",
+    }
+
+
+def test_one_unset_field_falls_back_to_upstream_for_that_field() -> None:
+    documents = _documents(
+        *BUNDLED, "--set", "nextcloud.rateLimits.shareCreate.limit=null"
+    )
+    hook = _hook(documents)
+
+    assert f"{SHARE_ROUTE} user limit --value=20 --type=integer" in hook
+    assert f"{SHARE_ROUTE} user period --value=600 --type=integer" in hook
+    assert _share_rate_env(documents)["NEXTCLOUD_SHARE_RATE_LIMIT"] == "20"
+
+
+def test_a_share_create_limit_change_restarts_nextcloud() -> None:
+    """The hook applies the limit only when Nextcloud starts."""
+
+    def checksum(*extra: str) -> str:
+        template = _named(_documents(*BUNDLED, *extra), "Deployment", "-nextcloud")
+        return template["spec"]["template"]["metadata"]["annotations"][
+            "checksum/share-rate-limit"
+        ]
+
+    assert checksum() != checksum("--set", "nextcloud.rateLimits.shareCreate.limit=300")
+
+
+def test_external_nextcloud_defaults_to_upstream_unless_the_operator_says() -> None:
+    documents = _documents(*EXTERNAL)
+    assert not any(
+        document["metadata"]["name"].endswith("-nextcloud-hooks")
+        for document in documents
+    )
+    assert _share_rate_env(documents) == {
+        "NEXTCLOUD_SHARE_RATE_LIMIT": "20",
+        "NEXTCLOUD_SHARE_RATE_PERIOD_SECONDS": "600",
+        "NEXTCLOUD_SHARE_RATE_REPLICAS": "1",
+    }
+
+    raised = _documents(
+        *EXTERNAL,
+        "--set",
+        "cloud.shareRateLimit.limit=100",
+        "--set",
+        "orchestrator.replicas=2",
+    )
+    assert _share_rate_env(raised) == {
+        "NEXTCLOUD_SHARE_RATE_LIMIT": "100",
+        "NEXTCLOUD_SHARE_RATE_PERIOD_SECONDS": "600",
+        "NEXTCLOUD_SHARE_RATE_REPLICAS": "2",
+    }
+
+
+def test_no_nextcloud_no_share_rate_env() -> None:
+    assert _share_rate_env(_documents()) == {}
+
+
+def test_bundled_nextcloud_refuses_the_external_share_limit() -> None:
+    result = _render(*BUNDLED, "--set", "cloud.shareRateLimit.limit=100", check=False)
+
+    assert result.returncode != 0
+    assert "nextcloud.rateLimits.shareCreate" in result.stderr
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "nextcloud.rateLimits.shareCreate.limit=0",
+        "nextcloud.rateLimits.shareCreate.periodSeconds=0",
+        "cloud.shareRateLimit.limit=0",
+    ],
+)
+def test_schema_requires_positive_share_limits(value: str) -> None:
+    result = _render(*BUNDLED, "--set", value, check=False)
+
+    assert result.returncode != 0
+    assert "minimum" in result.stderr

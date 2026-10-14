@@ -3044,6 +3044,16 @@ nextcloud:
     # than starting more PHP processes than the CPU and memory limits serve.
     # Raise it with the CPU limit; prefork caps it at 256.
     maxRequestWorkers: 32
+  rateLimits:
+    # Nextcloud's per-user share-creation limit. agent-service creates every
+    # session and job-export share, so this is the installation's ceiling.
+    # Upstream default: 20 per 600 s. The setup hook applies it on every
+    # Nextcloud start, and the orchestrator splits it across its replicas.
+    # null restores upstream's value for that field; both null removes the
+    # override.
+    shareCreate:
+      limit: 200
+      periodSeconds: 600
   # Internal-only authority-creating lane for protected read-only grants.
   # It shares the bundled Nextcloud code/data volume but runs in a dedicated
   # Nginx + PHP-FPM pool. The FPM auto-prepend verifier authenticates an exact
@@ -3173,6 +3183,14 @@ cloud:
   externalUrl: ""
   # -- Internal URL the agent calls server-to-server. Defaults to externalUrl when empty.
   externalServiceUrl: ""
+  # -- External Nextcloud only: the per-user share-create limit that server
+  # enforces, when its admin changed Nextcloud's default of 20 per 600 s
+  # (ratelimit_overwrite for files_sharing.shareapi.createshare). The
+  # orchestrator keeps its share requests under it. null = upstream default.
+  # The bundled Nextcloud takes nextcloud.rateLimits.shareCreate instead.
+  shareRateLimit:
+    limit: null
+    periodSeconds: null
   # -- Main-cloud workspace data plane: "rclone_mount" (lazy rclone/FUSE
   # mounts) or "sync" (legacy eager clone).
   workspaceDriver: "rclone_mount"

@@ -86,6 +86,7 @@ apache-mpm-prefork.conf: |
   </IfModule>
 {{- end -}}
 {{- if and .Values.nextcloud.enabled .Values.nextcloud.internal }}
+{{- $shareRateLimit := include "srw.nextcloudShareRateLimitJson" . | fromJson }}
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -205,6 +206,23 @@ data:
     if occ config:system:get objectstore class >/dev/null 2>&1; then
         occ config:system:set objectstore arguments verify_bucket_exists --value=false --type=boolean 2>&1 || true
     fi
+    {{- end }}
+
+    # =========================================================================
+    # 0c. Share-create rate limit (nextcloud.rateLimits.shareCreate).
+    #     Nextcloud allows each user 20 new shares per 600 s. agent-service
+    #     creates every session and job-export share, so that per-user limit
+    #     is the installation's ceiling. The override is keyed by app,
+    #     controller and method in lower case, as RateLimitingMiddleware
+    #     builds it, not by the OCS route name. Settings persist in
+    #     config.php, so unset values delete the override rather than
+    #     leave the last one in place.
+    # =========================================================================
+    {{- if $shareRateLimit.override }}
+    occ config:system:set ratelimit_overwrite files_sharing.shareapi.createshare user limit --value={{ int $shareRateLimit.limit }} --type=integer 2>&1 || true
+    occ config:system:set ratelimit_overwrite files_sharing.shareapi.createshare user period --value={{ int $shareRateLimit.periodSeconds }} --type=integer 2>&1 || true
+    {{- else }}
+    occ config:system:delete ratelimit_overwrite files_sharing.shareapi.createshare 2>&1 || true
     {{- end }}
 
     # Allow OIDC login over plain HTTP (local dev without TLS reverse proxy).
@@ -344,6 +362,8 @@ spec:
         {{- include "srw.componentSelectorLabels" (dict "context" . "component" "nextcloud") | nindent 8 }}
       annotations:
         checksum/server-config: {{ include "srw.nextcloudServerConfigData" . | sha256sum | quote }}
+        # The setup hook applies the limit only when Nextcloud starts.
+        checksum/share-rate-limit: {{ include "srw.nextcloudShareRateLimitJson" . | sha256sum | quote }}
         {{- if (eq (include "srw.nextcloudProtectedEffectEnabled" .) "true") }}
         checksum/protected-effect-config: {{ include "srw.nextcloudProtectedEffectConfigSha256" . | quote }}
         {{- end }}

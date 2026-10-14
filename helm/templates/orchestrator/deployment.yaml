@@ -1003,6 +1003,19 @@ spec:
                   name: {{ include "srw.secretName" . }}
                   key: NEXTCLOUD_AGENT_PASSWORD
                   optional: true
+            # Nextcloud's per-user share-create limit (agent-service creates
+            # every share) and the replica count that shares it: each
+            # replica keeps its client bucket under its part of the limit.
+            # Bundled: nextcloud.rateLimits.shareCreate, which the setup hook
+            # also applies server side. External: cloud.shareRateLimit, else
+            # upstream's 20 per 600 s.
+            {{- $shareRateLimit := include "srw.nextcloudShareRateLimitJson" . | fromJson }}
+            - name: NEXTCLOUD_SHARE_RATE_LIMIT
+              value: {{ int $shareRateLimit.limit | quote }}
+            - name: NEXTCLOUD_SHARE_RATE_PERIOD_SECONDS
+              value: {{ int $shareRateLimit.periodSeconds | quote }}
+            - name: NEXTCLOUD_SHARE_RATE_REPLICAS
+              value: {{ max 1 (int .Values.orchestrator.replicas) | quote }}
             {{- if and .Values.nextcloud.enabled (eq (include "srw.nextcloudProtectedEffectEnabled" .) "true") }}
             - name: NEXTCLOUD_PROTECTED_EFFECT_URL
               valueFrom:
