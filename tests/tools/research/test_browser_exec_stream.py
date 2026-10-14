@@ -1113,3 +1113,57 @@ class TestStreamListener:
                 await server.wait_closed()
 
         asyncio.run(run())
+
+
+class _FakeRuntime:
+    def __init__(self, outcome):
+        self._outcome = outcome
+        self.calls = []
+
+    async def evaluate(self, params=None, session_id=None):
+        self.calls.append((params, session_id))
+        if isinstance(self._outcome, Exception):
+            raise self._outcome
+        return self._outcome
+
+
+class _FakeTitleSession:
+    def __init__(self, outcome, *, cdp_error=None):
+        self.runtime = _FakeRuntime(outcome)
+        self.agent_focus_target_id = "T1"
+        self._cdp_error = cdp_error
+        cdp_client = SimpleNamespace(send=SimpleNamespace(Runtime=self.runtime))
+        self._cdp = SimpleNamespace(cdp_client=cdp_client, session_id="S1")
+
+    async def get_or_create_cdp_session(self, target_id=None, focus=True):
+        if self._cdp_error is not None:
+            raise self._cdp_error
+        return self._cdp
+
+
+class TestDocumentTitle:
+    def _run(self, session, fallback="example.com"):
+        return asyncio.run(BE._document_title(session, fallback))
+
+    def test_document_title_wins_over_cached_hostname(self):
+        s = _FakeTitleSession({"result": {"type": "string", "value": "Example Domain"}})
+        assert self._run(s) == "Example Domain"
+        params, sid = s.runtime.calls[0]
+        assert "document.title" in params["expression"]
+        assert sid == "S1"
+
+    def test_empty_document_title_falls_back(self):
+        s = _FakeTitleSession({"result": {"type": "string", "value": "   "}})
+        assert self._run(s) == "example.com"
+
+    def test_evaluate_error_falls_back(self):
+        s = _FakeTitleSession(RuntimeError("target closed"))
+        assert self._run(s) == "example.com"
+
+    def test_cdp_session_error_falls_back(self):
+        s = _FakeTitleSession({}, cdp_error=RuntimeError("no session"))
+        assert self._run(s) == "example.com"
+
+    def test_exception_details_or_non_string_falls_back(self):
+        s = _FakeTitleSession({"result": {"type": "undefined"}})
+        assert self._run(s) == "example.com"
