@@ -689,6 +689,15 @@ On shutdown the cron container waits up to 120 s for a running `cron.php` to
 finish, because an interrupted job stays reserved for 12 hours. Apache stops
 at once, so a rollout that lands during a long job run is that much longer.
 
+The chart also mounts two server settings into the Nextcloud containers: an
+APCu cache of 128M (`apc.shm_size`, in Apache, cron and the protected-effect
+PHP-FPM pool) and an Apache prefork cap of
+`nextcloud.apache.maxRequestWorkers` workers (default 32, sized for the 2-core
+CPU limit; the image allows 150). A change to either rolls the Pod. With S3
+primary storage the setup hook sets the objectstore's `verify_bucket_exists`
+to `false` once Nextcloud is installed, which drops a bucket check from every
+request; install still creates a missing bucket.
+
 ### Self-hosted web research
 
 The chart deploys SearXNG by default (`searxng.enabled=true`) and seeds its

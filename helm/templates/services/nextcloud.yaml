@@ -66,6 +66,25 @@ can fire before the hook reaches the pins.
 - name: NC_versions_retention_obligation
   value: "disabled"
 {{- end -}}
+{{- /*
+Server settings mounted as files into the image's include directories. They
+are read once at process start (subPath mounts never update in place), so the
+Pod carries their checksum and restarts when they change. Neither file is a
+protected-effect lane file: the lane digest does not cover them.
+*/ -}}
+{{- define "srw.nextcloudServerConfigData" -}}
+php-srw.ini: |
+  ; APCu backs Nextcloud's local memory cache. PHP's 32M default is too
+  ; small for Nextcloud; its all-in-one image uses 128M.
+  apc.shm_size=128M
+apache-mpm-prefork.conf: |
+  # Every Apache prefork worker is one PHP process. The image allows 150,
+  # more than the container's CPU and memory limits can serve; a smaller
+  # pool queues a burst instead (nextcloud.apache.maxRequestWorkers).
+  <IfModule mpm_prefork_module>
+      MaxRequestWorkers {{ int .Values.nextcloud.apache.maxRequestWorkers }}
+  </IfModule>
+{{- end -}}
 {{- if and .Values.nextcloud.enabled .Values.nextcloud.internal }}
 apiVersion: v1
 kind: ConfigMap
@@ -98,7 +117,8 @@ data:
     #
     # What this does:
     #   0. Background jobs: pins trash/version retention and internal share
-    #      expiry off, and sets the background-job mode
+    #      expiry off, and sets the background-job mode; S3 primary storage
+    #      skips its per-connection bucket check
     #   1. OIDC: Registers Keycloak as OpenID Connect provider
     #   2. OIDC: Enables group provisioning with whitelist regex
     #   3. Group Folders: Installs, updates and enables the groupfolders app
@@ -169,6 +189,21 @@ data:
     # earlier cron container left at "cron" would run no jobs at all.
     if [ "$(occ config:app:get core backgroundjobs_mode 2>/dev/null)" = "cron" ]; then
         occ background:ajax 2>&1 || true
+    fi
+    {{- end }}
+    {{- if .Values.nextcloud.objectStore.enabled }}
+
+    # =========================================================================
+    # 0b. S3 primary storage: no bucket-exists check on every connection.
+    #     Nextcloud 31 creates a missing S3 bucket only through that check
+    #     (it does not read OBJECTSTORE_S3_AUTOCREATE for S3), so it stays on
+    #     until install has created the bucket; this hook only runs on an
+    #     installed Nextcloud. Config files are deep-merged, so the key
+    #     survives the image's s3.config.php. Set only on an existing
+    #     objectstore entry, never creating a partial one.
+    # =========================================================================
+    if occ config:system:get objectstore class >/dev/null 2>&1; then
+        occ config:system:set objectstore arguments verify_bucket_exists --value=false --type=boolean 2>&1 || true
     fi
     {{- end }}
 
@@ -261,6 +296,15 @@ data:
     exit 0
 ---
 apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "srw.fullname" . }}-nextcloud-server-config
+  labels:
+    {{- include "srw.componentLabels" (dict "context" . "component" "nextcloud") | nindent 4 }}
+data:
+  {{- include "srw.nextcloudServerConfigData" . | nindent 2 }}
+---
+apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
   name: {{ include "srw.fullname" . }}-nextcloud-data
@@ -298,10 +342,11 @@ spec:
     metadata:
       labels:
         {{- include "srw.componentSelectorLabels" (dict "context" . "component" "nextcloud") | nindent 8 }}
-      {{- if (eq (include "srw.nextcloudProtectedEffectEnabled" .) "true") }}
       annotations:
+        checksum/server-config: {{ include "srw.nextcloudServerConfigData" . | sha256sum | quote }}
+        {{- if (eq (include "srw.nextcloudProtectedEffectEnabled" .) "true") }}
         checksum/protected-effect-config: {{ include "srw.nextcloudProtectedEffectConfigSha256" . | quote }}
-      {{- end }}
+        {{- end }}
     spec:
       {{- with .Values.global.imagePullSecrets }}
       imagePullSecrets:
@@ -357,6 +402,16 @@ spec:
               mountPath: /docker-entrypoint-hooks.d/before-starting/setup-nextcloud.sh
               subPath: setup-nextcloud.sh
               readOnly: true
+            - name: server-config
+              mountPath: /usr/local/etc/php/conf.d/zz-srw.ini
+              subPath: php-srw.ini
+              readOnly: true
+            # conf-enabled/ loads after mods-enabled/mpm_prefork.conf, so
+            # this MaxRequestWorkers is the one Apache keeps.
+            - name: server-config
+              mountPath: /etc/apache2/conf-enabled/zz-srw-mpm-prefork.conf
+              subPath: apache-mpm-prefork.conf
+              readOnly: true
           startupProbe:
             httpGet:
               path: /status.php
@@ -397,6 +452,10 @@ spec:
           volumeMounts:
             - name: data
               mountPath: /var/www/html
+            - name: server-config
+              mountPath: /usr/local/etc/php/conf.d/zz-srw.ini
+              subPath: php-srw.ini
+              readOnly: true
           lifecycle:
             # crond exits on SIGTERM without waiting for a running cron.php,
             # and a job cut off mid-run stays reserved, so skipped, for 12
@@ -456,6 +515,12 @@ spec:
               readOnly: true
             - name: protected-effect-run
               mountPath: /run/srw-nextcloud
+            # PHP ini only (APCu size), from outside the lane files: the
+            # lane digest and its bundle are unchanged.
+            - name: server-config
+              mountPath: /usr/local/etc/php/conf.d/zz-srw.ini
+              subPath: php-srw.ini
+              readOnly: true
           startupProbe:
             exec:
               command:
@@ -524,6 +589,10 @@ spec:
           configMap:
             name: {{ include "srw.fullname" . }}-nextcloud-hooks
             defaultMode: 0755
+        - name: server-config
+          configMap:
+            name: {{ include "srw.fullname" . }}-nextcloud-server-config
+            defaultMode: 0644
         {{- if (eq (include "srw.nextcloudProtectedEffectEnabled" .) "true") }}
         - name: protected-effect-run
           emptyDir:

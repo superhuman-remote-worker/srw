@@ -861,6 +861,16 @@
             }
           }
         },
+        "apache": {
+          "type": "object",
+          "properties": {
+            "maxRequestWorkers": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 256
+            }
+          }
+        },
         "protectedEffect": {
           "type": "object",
           "properties": {

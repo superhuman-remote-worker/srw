@@ -3038,6 +3038,12 @@ nextcloud:
       limits:
         memory: "768Mi"
         cpu: "500m"
+  apache:
+    # Apache prefork workers, one PHP process each (the image's default is
+    # 150). Sized for the 2-core limit below: a burst queues in Apache rather
+    # than starting more PHP processes than the CPU and memory limits serve.
+    # Raise it with the CPU limit; prefork caps it at 256.
+    maxRequestWorkers: 32
   # Internal-only authority-creating lane for protected read-only grants.
   # It shares the bundled Nextcloud code/data volume but runs in a dedicated
   # Nginx + PHP-FPM pool. The FPM auto-prepend verifier authenticates an exact

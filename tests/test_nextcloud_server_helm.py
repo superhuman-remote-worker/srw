@@ -35,6 +35,18 @@ SECRETS_THE_CRON_CONTAINER_NEVER_GETS = {
     "NEXTCLOUD_AGENT_PASSWORD",
     "NEXTCLOUD_OIDC_CLIENT_SECRET",
 }
+PHP_INI_MOUNT = {
+    "name": "server-config",
+    "mountPath": "/usr/local/etc/php/conf.d/zz-srw.ini",
+    "subPath": "php-srw.ini",
+    "readOnly": True,
+}
+MPM_MOUNT = {
+    "name": "server-config",
+    "mountPath": "/etc/apache2/conf-enabled/zz-srw-mpm-prefork.conf",
+    "subPath": "apache-mpm-prefork.conf",
+    "readOnly": True,
+}
 
 
 def _render(*extra: str, check: bool = True) -> subprocess.CompletedProcess[str]:
@@ -99,8 +111,12 @@ def test_cron_container_runs_the_image_cron_on_the_data_volume_by_default() -> N
 
     assert cron["image"] == nextcloud["image"]
     assert cron["command"] == ["/cron.sh"]
-    # Code and data only: the setup hook (and its secrets) stay with Apache.
-    assert cron["volumeMounts"] == [{"name": "data", "mountPath": "/var/www/html"}]
+    # Code and data, and the PHP ini drop-in: the setup hook (and its
+    # secrets) stay with Apache.
+    assert cron["volumeMounts"] == [
+        {"name": "data", "mountPath": "/var/www/html"},
+        PHP_INI_MOUNT,
+    ]
     assert "ports" not in cron
     assert cron["resources"] == {
         "requests": {"memory": "128Mi", "cpu": "10m"},
@@ -191,7 +207,7 @@ def test_cron_waits_for_a_running_cron_php_within_the_grace_period() -> None:
     assert 0 < bound < pod["terminationGracePeriodSeconds"]
 
 
-def test_cron_does_not_touch_the_protected_effect_lane() -> None:
+def test_cron_and_server_settings_leave_the_protected_effect_lane_alone() -> None:
     """Invariant: the lane digest covers only lane values and lane files."""
 
     def digest(*extra: str) -> str:
@@ -199,4 +215,85 @@ def test_cron_does_not_touch_the_protected_effect_lane() -> None:
         fpm = _containers(documents)["nextcloud-protected-effect-fpm"]
         return _env(fpm)["NEXTCLOUD_PROTECTED_EFFECT_CONFIG_SHA256"]["value"]
 
-    assert digest() == digest("--set", "nextcloud.cron.enabled=false")
+    baseline = digest()
+    assert baseline == digest("--set", "nextcloud.cron.enabled=false")
+    assert baseline == digest("--set", "nextcloud.apache.maxRequestWorkers=48")
+
+
+def test_server_config_sizes_apcu_and_caps_apache_workers() -> None:
+    documents = _documents(*BUNDLED)
+    data = _named(documents, "ConfigMap", "-nextcloud-server-config")["data"]
+
+    assert re.search(r"^apc\.shm_size=128M$", data["php-srw.ini"], re.MULTILINE)
+    mpm = data["apache-mpm-prefork.conf"]
+    assert re.search(
+        r"<IfModule mpm_prefork_module>\s+MaxRequestWorkers 32\s+</IfModule>", mpm
+    )
+
+    raised = _named(
+        _documents(*BUNDLED, "--set", "nextcloud.apache.maxRequestWorkers=48"),
+        "ConfigMap",
+        "-nextcloud-server-config",
+    )["data"]["apache-mpm-prefork.conf"]
+    assert "MaxRequestWorkers 48" in raised
+
+
+@pytest.mark.parametrize("workers", ["0", "257"])
+def test_schema_bounds_apache_workers(workers: str) -> None:
+    result = _render(
+        *BUNDLED, "--set", f"nextcloud.apache.maxRequestWorkers={workers}", check=False
+    )
+    assert result.returncode != 0
+    assert "maxRequestWorkers" in result.stderr
+
+
+def test_php_ini_reaches_every_php_container_and_mpm_only_apache() -> None:
+    documents = _documents(*BUNDLED, *PROTECTED)
+    containers = _containers(documents)
+
+    assert PHP_INI_MOUNT in containers["nextcloud"]["volumeMounts"]
+    assert MPM_MOUNT in containers["nextcloud"]["volumeMounts"]
+    for name in ("cron", "nextcloud-protected-effect-fpm"):
+        assert PHP_INI_MOUNT in containers[name]["volumeMounts"]
+        assert MPM_MOUNT not in containers[name]["volumeMounts"]
+    assert not any(
+        mount["name"] == "server-config"
+        for mount in containers["nextcloud-protected-effect-nginx"]["volumeMounts"]
+    )
+    volume = next(
+        volume
+        for volume in _pod(documents)["volumes"]
+        if volume["name"] == "server-config"
+    )
+    assert volume["configMap"]["name"].endswith("-nextcloud-server-config")
+
+
+def test_a_server_config_change_restarts_nextcloud() -> None:
+    """subPath mounts never update in place; the Pod must roll instead."""
+
+    def checksum(*extra: str) -> str:
+        template = _named(_documents(*BUNDLED, *extra), "Deployment", "-nextcloud")
+        return template["spec"]["template"]["metadata"]["annotations"][
+            "checksum/server-config"
+        ]
+
+    assert checksum() != checksum("--set", "nextcloud.apache.maxRequestWorkers=48")
+
+
+def test_s3_bucket_check_is_skipped_only_once_installed_on_s3() -> None:
+    line = (
+        "occ config:system:set objectstore arguments verify_bucket_exists "
+        "--value=false --type=boolean"
+    )
+    hook = _hook(_documents(*BUNDLED))
+    assert line in hook
+    # Never creates a partial objectstore entry on a filesystem install.
+    guard = "if occ config:system:get objectstore class >/dev/null 2>&1; then"
+    assert hook.index(guard) < hook.index(line)
+    # The hook only runs on an installed Nextcloud: install has made the bucket.
+    assert hook.index('"installed":true') < hook.index(line)
+
+    filesystem = _hook(
+        _documents(*BUNDLED, "--set", "nextcloud.objectStore.enabled=false")
+    )
+    assert "verify_bucket_exists" not in filesystem
