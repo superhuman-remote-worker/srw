@@ -9,6 +9,7 @@ import importlib.machinery
 import importlib.util
 import json
 import sys
+import time
 import types
 from pathlib import Path
 from types import SimpleNamespace
@@ -1115,6 +1116,9 @@ class TestStreamListener:
         asyncio.run(run())
 
 
+_HANG = object()
+
+
 class _FakeRuntime:
     def __init__(self, outcome):
         self._outcome = outcome
@@ -1122,13 +1126,17 @@ class _FakeRuntime:
 
     async def evaluate(self, params=None, session_id=None):
         self.calls.append((params, session_id))
+        if self._outcome is _HANG:
+            await asyncio.sleep(30)
         if isinstance(self._outcome, Exception):
             raise self._outcome
         return self._outcome
 
 
 class _FakeTitleSession:
-    def __init__(self, outcome, *, cdp_error=None):
+    def __init__(self, outcome, *, cdp_error=None, hang_lookup=False):
+        self.lookup_calls = []
+        self._hang_lookup = hang_lookup
         self.runtime = _FakeRuntime(outcome)
         self.agent_focus_target_id = "T1"
         self._cdp_error = cdp_error
@@ -1136,6 +1144,9 @@ class _FakeTitleSession:
         self._cdp = SimpleNamespace(cdp_client=cdp_client, session_id="S1")
 
     async def get_or_create_cdp_session(self, target_id=None, focus=True):
+        self.lookup_calls.append({"target_id": target_id, "focus": focus})
+        if self._hang_lookup:
+            await asyncio.sleep(30)
         if self._cdp_error is not None:
             raise self._cdp_error
         return self._cdp
@@ -1167,3 +1178,22 @@ class TestDocumentTitle:
     def test_exception_details_or_non_string_falls_back(self):
         s = _FakeTitleSession({"result": {"type": "undefined"}})
         assert self._run(s) == "example.com"
+
+    def test_lookup_uses_focus_false(self):
+        s = _FakeTitleSession({"result": {"value": "T"}})
+        assert self._run(s) == "T"
+        assert s.lookup_calls == [{"target_id": "T1", "focus": False}]
+
+    def test_hanging_lookup_falls_back_within_timeout(self, monkeypatch):
+        monkeypatch.setattr(BE, "DOCUMENT_TITLE_TIMEOUT", 0.05)
+        s = _FakeTitleSession({}, hang_lookup=True)
+        start = time.monotonic()
+        assert self._run(s) == "example.com"
+        assert time.monotonic() - start < 1.0
+
+    def test_hanging_evaluate_falls_back_within_timeout(self, monkeypatch):
+        monkeypatch.setattr(BE, "DOCUMENT_TITLE_TIMEOUT", 0.05)
+        s = _FakeTitleSession(_HANG)
+        start = time.monotonic()
+        assert self._run(s) == "example.com"
+        assert time.monotonic() - start < 1.0

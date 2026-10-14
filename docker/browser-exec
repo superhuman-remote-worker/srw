@@ -235,6 +235,19 @@ MUTATING_ACTIONS = {"navigate", "click", "type", "select", "scroll", "back"}
 
 
 DOCUMENT_TITLE_TIMEOUT = 2.0
+_document_title_error_logged = False
+
+
+async def _read_document_title(session):
+    # focus=False: reading a title must not change or touch agent focus (and
+    # skips the extra runIfWaitingForDebugger round trip).
+    cdp = await session.get_or_create_cdp_session(
+        target_id=session.agent_focus_target_id, focus=False
+    )
+    return await cdp.cdp_client.send.Runtime.evaluate(
+        params={"expression": "document.title", "returnByValue": True},
+        session_id=cdp.session_id,
+    )
 
 
 async def _document_title(session, fallback):
@@ -245,25 +258,22 @@ async def _document_title(session, fallback):
     formatted URL (the hostname), so a snapshot taken before
     ``targetInfoChanged`` arrives reports "example.com" instead of "Example
     Domain". Reading ``document.title`` from the page avoids the race. Any
-    failure, or an empty title, returns ``fallback``: a title read must never
-    fail a browser action.
+    failure, timeout, or an empty title returns ``fallback``: a title read must
+    never fail or stall a browser action. The whole read (session lookup plus
+    evaluate) shares one DOCUMENT_TITLE_TIMEOUT bound.
     """
+    global _document_title_error_logged
     try:
-        cdp = await session.get_or_create_cdp_session(
-            target_id=session.agent_focus_target_id
-        )
         result = await asyncio.wait_for(
-            cdp.cdp_client.send.Runtime.evaluate(
-                params={"expression": "document.title", "returnByValue": True},
-                session_id=cdp.session_id,
-            ),
-            DOCUMENT_TITLE_TIMEOUT,
+            _read_document_title(session), DOCUMENT_TITLE_TIMEOUT
         )
         value = ((result or {}).get("result") or {}).get("value")
         if isinstance(value, str) and value.strip():
             return value
-    except Exception:
-        pass
+    except (Exception, asyncio.TimeoutError) as exc:
+        if not _document_title_error_logged:
+            _document_title_error_logged = True
+            log(f"document.title read failed ({type(exc).__name__}); using cached title")
     return fallback
 
 
