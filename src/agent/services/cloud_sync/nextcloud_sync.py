@@ -14,6 +14,7 @@ from agent.services.cloud_sync.base import (
     WorkspaceSyncBase,
     _normalize_dav_listing,
 )
+from shared.http_no_cookies import NoCookieJar
 
 if TYPE_CHECKING:
     from shared.runtime.core.workspace_backend import WorkspaceBackend
@@ -143,13 +144,18 @@ class NextcloudWorkspaceSync(WorkspaceSyncBase):
         if self._client is None:
             from webdav3.client import Client
 
-            self._client = Client(
+            client = Client(
                 {
                     "webdav_hostname": self._webdav_url.rstrip("/"),
                     "webdav_login": self._webdav_user,
                     "webdav_password": self._webdav_password,
                 }
             )
+            # Echoing Nextcloud's one non-Secure cookie (``cookie_test``)
+            # makes it mint a session token on every request; sending none
+            # leaves each request at the cost of the login alone.
+            client.session.cookies = NoCookieJar()
+            self._client = client
         return self._client
 
     async def _ensure_ready(self) -> None:
@@ -238,6 +244,7 @@ class NextcloudWorkspaceSync(WorkspaceSyncBase):
             self._http = httpx.AsyncClient(
                 auth=(self._webdav_user, self._webdav_password),
                 timeout=httpx.Timeout(30.0, read=60.0),
+                cookies=NoCookieJar(),
             )
         try:
             resp = await self._http.request(

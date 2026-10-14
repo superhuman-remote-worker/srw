@@ -2,10 +2,20 @@
 
 from __future__ import annotations
 
+import email.message
+import io
 from pathlib import Path
+from types import SimpleNamespace
+from urllib.parse import urlsplit
+
+import httpx
 import pytest
+import requests
+from requests.adapters import BaseAdapter
+from requests.structures import CaseInsensitiveDict
 
 from agent.services.cloud_sync.nextcloud_sync import NextcloudWorkspaceSync
+from shared.http_no_cookies import NoCookieJar
 
 
 class _FakeWebDavClient:
@@ -200,3 +210,136 @@ async def test_generation_delete_is_idempotent_when_resource_already_missing(
 
     assert fake_client_factory.deletes == ["/deleted.txt"]
     assert before_write_calls == 1
+
+
+# ---------------------------------------------------------------------------
+# The real clients: _get_client()'s webdav3 Client and the infinity-PROPFIND
+# httpx client, against a Nextcloud stand-in that sets session cookies on
+# every answer the way Nextcloud does for a Basic-auth request.
+# ---------------------------------------------------------------------------
+
+_BASE = "/remote.php/dav/files/agent/sess"
+_SET_COOKIES = [
+    ("Set-Cookie", "cookie_test=test; path=/"),
+    ("Set-Cookie", "oc_sessionPassphrase=secret; path=/; secure; HttpOnly"),
+]
+
+
+class _RawResponse(io.BytesIO):
+    """Just enough of urllib3's response for requests to read body and cookies."""
+
+    def __init__(self, body: bytes, headers: list[tuple[str, str]]) -> None:
+        super().__init__(body)
+        message = email.message.Message()
+        for name, value in headers:
+            message[name] = value
+        self._original_response = SimpleNamespace(msg=message)
+
+
+class _NextcloudAdapter(BaseAdapter):
+    """Routes ``(method, path)`` to a canned answer; records what was sent.
+
+    Anything unrouted is a 404, as Nextcloud answers for a missing resource.
+    """
+
+    def __init__(self, routes: dict[tuple[str, str], tuple[int, dict, bytes]]):
+        super().__init__()
+        self.routes = routes
+        self.seen: list[tuple[str, str, str | None]] = []
+
+    def send(self, request, **kwargs):  # noqa: ANN001, ANN003
+        path = urlsplit(request.url).path
+        self.seen.append((request.method, path, request.headers.get("Cookie")))
+        status, headers, body = self.routes.get((request.method, path), (404, {}, b""))
+        response = requests.Response()
+        response.status_code = status
+        response.headers = CaseInsensitiveDict(dict(headers))
+        response.raw = _RawResponse(body, list(headers.items()) + _SET_COOKIES)
+        response.url = request.url
+        response.request = request
+        return response
+
+    def close(self) -> None:
+        pass
+
+
+def _real_sync(tmp_path: Path) -> NextcloudWorkspaceSync:
+    return NextcloudWorkspaceSync(
+        tmp_path,
+        webdav_url=f"http://nc{_BASE}/",
+        webdav_user="agent",
+        webdav_password="pw",
+    )
+
+
+def _mount(sync: NextcloudWorkspaceSync, routes) -> _NextcloudAdapter:
+    adapter = _NextcloudAdapter(routes)
+    sync._get_client().session.mount("http://", adapter)
+    return adapter
+
+
+@pytest.mark.asyncio
+async def test_webdav_client_never_sends_a_cookie(tmp_path: Path):
+    sync = _real_sync(tmp_path)
+    adapter = _mount(
+        sync,
+        {
+            ("PUT", f"{_BASE}/a.txt"): (201, {"ETag": '"e1"'}, b""),
+            ("PUT", f"{_BASE}/b.txt"): (201, {"ETag": '"e2"'}, b""),
+        },
+    )
+    local = tmp_path / "local.txt"
+    local.write_bytes(b"payload")
+    assert await sync._upload_file("a.txt", str(local)) == '"e1"'
+    assert await sync._upload_file("b.txt", str(local)) == '"e2"'
+    assert [cookie for _method, _path, cookie in adapter.seen] == [None, None]
+    assert isinstance(sync._get_client().session.cookies, NoCookieJar)
+    assert len(sync._get_client().session.cookies) == 0
+
+
+def _multistatus(*hrefs: str) -> str:
+    responses = "".join(
+        f"<d:response><d:href>{href}</d:href><d:propstat><d:prop>"
+        '<d:getetag>"e"</d:getetag><d:getcontentlength>1</d:getcontentlength>'
+        "<d:resourcetype/></d:prop><d:status>HTTP/1.1 200 OK</d:status>"
+        "</d:propstat></d:response>"
+        for href in hrefs
+    )
+    return f'<?xml version="1.0"?><d:multistatus xmlns:d="DAV:">{responses}</d:multistatus>'
+
+
+def _mock_http(monkeypatch, handler) -> dict:
+    """Route the lazily built infinity-PROPFIND client through ``handler``."""
+
+    built: dict = {}
+    real = httpx.AsyncClient
+
+    def build(**kwargs):
+        built.update(kwargs)
+        return real(transport=httpx.MockTransport(handler), **kwargs)
+
+    monkeypatch.setattr(httpx, "AsyncClient", build)
+    return built
+
+
+@pytest.mark.asyncio
+async def test_depth_infinity_client_never_sends_a_cookie(tmp_path, monkeypatch):
+    seen: list[str | None] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request.headers.get("cookie"))
+        return httpx.Response(
+            207, headers=_SET_COOKIES, text=_multistatus(f"{_BASE}/a.txt")
+        )
+
+    built = _mock_http(monkeypatch, handler)
+    sync = _real_sync(tmp_path)
+    try:
+        for _ in range(2):
+            listing = await sync._list_remote_tree_fast()
+            assert [item["path"] for item in listing] == ["a.txt"]
+        assert isinstance(built["cookies"], NoCookieJar)
+        assert len(sync._http.cookies.jar) == 0
+    finally:
+        await sync.aclose()
+    assert seen == [None, None]
