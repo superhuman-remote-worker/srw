@@ -2044,8 +2044,123 @@ async def test_a_full_share_limit_never_blocks_admission():
     assert record["state"] == "ready" and record["share_retry_at"]
 
 
+class CachedIdentityStore(IdentityStore):
+    """``users.cloud_identity`` with the owner's Nextcloud id cached."""
+
+    def __init__(self, *args, cached="cloud-user"):
+        super().__init__(*args)
+        self.identity = {"nextcloud": {"user_id": cached}}
+        self.identity_merges: list[dict] = []
+
+    async def get_user_cloud_identity(self, user_id):
+        return self.identity
+
+    async def merge_user_cloud_identity(self, user_id, backend_id, entry):
+        self.identity_merges.append(dict(entry))
+        self.identity.setdefault(backend_id, {}).update(entry)
+        return True
+
+
+class CountingBackend(CloudBackend):
+    """Counts identity lookups; refuses shares to unknown accounts."""
+
+    def __init__(self, *, known=("cloud-user",), **kwargs):
+        super().__init__(**kwargs)
+        self.known = set(known)
+        self.lookups = 0
+        self.shared_with: list[str] = []
+
+    async def ensure_user(self, **kwargs):
+        self.lookups += 1
+        return "cloud-user"
+
+    async def resolve_user_identity(self, email, name):
+        self.lookups += 1
+        return "cloud-user"
+
+    async def share_session_folder(self, handle, user_id):
+        from orchestrator.services.cloud import (
+            CloudBackendError,
+            CloudBackendErrorKind,
+        )
+
+        self.shared_with.append(str(user_id))
+        if str(user_id) not in self.known:
+            raise CloudBackendError(
+                CloudBackendErrorKind.NOT_FOUND, "no such user", backend="nextcloud"
+            )
+        return await super().share_session_folder(handle, user_id)
+
+
+@pytest.mark.asyncio
+async def test_admission_shares_with_the_cached_account_without_a_lookup():
+    store = CachedIdentityStore()
+    backend = CountingBackend()
+    assert await prep.create_session_outbox(
+        THREAD, {"id": USER}, connector_id=OUTBOX, backend=backend, store=store
+    )
+    assert backend.lookups == 0
+    assert backend.shared_with == ["cloud-user"]
+    assert store.main_cloud[0]["share_handle"]
+
+
+@pytest.mark.asyncio
+async def test_admission_on_a_cache_miss_ensures_the_account_and_caches_it():
+    store = CachedIdentityStore()
+    store.identity = {}
+    backend = CountingBackend()
+    assert await prep.create_session_outbox(
+        THREAD, {"id": USER}, connector_id=OUTBOX, backend=backend, store=store
+    )
+    assert backend.lookups == 1
+    assert store.identity["nextcloud"]["user_id"] == "cloud-user"
+    assert store.main_cloud[0]["share_handle"]
+
+
+@pytest.mark.asyncio
+async def test_admission_heals_a_stale_cached_account():
+    store = CachedIdentityStore(cached="cloud-user-before-reinstall")
+    backend = CountingBackend()
+    assert await prep.create_session_outbox(
+        THREAD, {"id": USER}, connector_id=OUTBOX, backend=backend, store=store
+    )
+    assert backend.shared_with == ["cloud-user-before-reinstall", "cloud-user"]
+    assert store.identity["nextcloud"]["user_id"] == "cloud-user"
+    assert store.main_cloud[0]["share_handle"]
+    assert store.metadata[-1][1]["cloud_outbox"] == {
+        "connector_id": OUTBOX,
+        "state": "ready",
+    }
+
+
+@pytest.mark.asyncio
+async def test_a_stale_account_the_lookup_cannot_fix_leaves_the_share_for_later():
+    store = CachedIdentityStore()
+    backend = CountingBackend(known=())
+    assert await prep.create_session_outbox(
+        THREAD, {"id": USER}, connector_id=OUTBOX, backend=backend, store=store
+    )
+    assert backend.shared_with == ["cloud-user"]
+    assert store.identity_merges == []
+    assert store.main_cloud[0]["share_handle"] is None
+    assert "share_retry_at" in store.metadata[-1][1]["cloud_outbox"]
+
+
 def _attached(**over):
     return _thread([OUTBOX], **over)
+
+
+@pytest.mark.asyncio
+async def test_the_share_retry_heals_a_stale_cached_account():
+    store = CachedIdentityStore([_outbox_row()], cached="cloud-user-old")
+    backend = CountingBackend()
+    await prep.prepare_session_outbox(
+        _attached(main_cloud_share_handle=None),
+        store=store,
+        cloud_router=_router(backend),
+    )
+    assert backend.shared_with == ["cloud-user-old", "cloud-user"]
+    assert store.main_cloud[0]["share_handle"]
 
 
 @pytest.mark.asyncio

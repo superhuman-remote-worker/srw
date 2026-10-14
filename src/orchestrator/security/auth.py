@@ -397,6 +397,8 @@ async def _resolve_user_from_claims(claims: dict, db) -> dict:
                 email=email,
                 display_name=display_name,
                 preferred_username=preferred_username,
+                db=db,
+                user_id=user.get("id"),
             )
         )
         asyncio.create_task(
@@ -652,8 +654,13 @@ async def _ensure_cloud_user(
     email: str,
     display_name: str,
     preferred_username: str | None,
+    db: Any = None,
+    user_id: Any = None,
 ) -> None:
     """Background call to the active main-cloud backend's ensure_user.
+
+    With ``db`` and ``user_id`` a resolved account seeds the user's cloud
+    identity cache, so their first session shares without a lookup.
 
     The router arrives through ``set_provisioning_backends`` rather than an
     import of the application module (R1.B02 caller-boundary closure).
@@ -670,7 +677,7 @@ async def _ensure_cloud_user(
         backend = main_cloud_router.for_owner({"keycloak_sub": sub, "email": email})
         if not backend.is_initialized:
             return
-        await backend.ensure_user(
+        resolved = await backend.ensure_user(
             sub=sub,
             # No OIDC claims at approval time → fall back to the backend's
             # configured Keycloak issuer.
@@ -679,6 +686,10 @@ async def _ensure_cloud_user(
             display_name=display_name,
             preferred_username=preferred_username,
         )
+        if resolved and db is not None and user_id:
+            from orchestrator.services.cloud.identity import remember_user_identity
+
+            await remember_user_identity(db, str(user_id), backend.backend_id, resolved)
     except Exception as e:
         logger.warning("Main-cloud ensure_user failed for sub=%s: %s", sub, e)
 

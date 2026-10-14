@@ -49,6 +49,7 @@ from orchestrator.services.cloud import (
     CloudBackendErrorKind,
     SessionFolderHandle,
 )
+from orchestrator.services.cloud.identity import with_cached_identity
 from orchestrator.services.cloud.retry import BucketFull, bounded_wait
 from orchestrator.services.cloud_connector_mounts import (
     CLOUD_MOUNT_RULE_KEY,
@@ -350,9 +351,11 @@ async def create_session_outbox(
     The folder is ``sessions/<the session's id>`` and must be new
     (:func:`ensure_new_outbox_folder`; ``recorded_folder`` is the one an
     earlier attempt of this session recorded). The owner's cloud account
-    is ensured first (``ensure_user``), so a user's very first session is
-    shared too. A share that does not land (the rate limit, an account the
-    cloud does not know yet) leaves the share empty for
+    id comes from the identity cache; on a miss it is ensured
+    (``ensure_user``) and cached, so a user's very first session is shared
+    too, and a cached id the cloud refuses is looked up again
+    (``with_cached_identity``). A share that does not land (the rate limit,
+    an account the cloud does not know yet) leaves the share empty for
     :func:`prepare_session_outbox` to retry. A failure to create the folder
     is recorded as ``cloud_outbox.state: "unavailable"`` with its reason
     (``folder_exists`` for a folder that was already there). Never raises.
@@ -382,18 +385,26 @@ async def create_session_outbox(
         return False
     share_handle = None
     rate_limited = False
-    try:
-        resolved_user_id = await backend.ensure_user(
+
+    async def ensure_owner() -> Any:
+        return await backend.ensure_user(
             sub=user.get("keycloak_sub") or "",
             issuer=getattr(backend, "_keycloak_issuer", "") or "",
             email=user.get("email"),
             display_name=user.get("display_name"),
             preferred_username=user.get("preferred_username"),
         )
-        if resolved_user_id:
-            share_handle, rate_limited = await _share(
-                backend, session_handle, resolved_user_id
-            )
+
+    try:
+        shared = await with_cached_identity(
+            store,
+            dict(user),
+            backend,
+            lambda account: _share(backend, session_handle, account),
+            lookup=ensure_owner,
+        )
+        if shared is not None:
+            share_handle, rate_limited = shared
     except Exception as exc:
         logger.warning(
             "Session %s: its outbox folder was not shared yet: %s", thread_id, exc
@@ -551,17 +562,15 @@ async def _retry_share(
     store: Any,
     now: datetime,
 ) -> None:
-    from orchestrator.services.cloud.identity import resolve_user_identity_cached
-
     thread_id = str(thread["id"])
     handle = SessionFolderHandle.from_db(handle_str, backend=backend.backend_id)
     # MKCOL answers 405 for a folder that is there: a folder someone removed
     # comes back where SRW recorded it.
     await backend.ensure_session_folder(session_id=handle.native_id.rsplit("/", 1)[-1])
-    resolved = await resolve_user_identity_cached(store, dict(owner), backend)
-    share_handle = None
-    if resolved:
-        share_handle, _ = await _share(backend, handle, resolved)
+    shared = await with_cached_identity(
+        store, dict(owner), backend, lambda account: _share(backend, handle, account)
+    )
+    share_handle = shared[0] if shared is not None else None
     if share_handle is None:
         # The owner has not signed in to the cloud yet, or the rate limit
         # is full: try again later.

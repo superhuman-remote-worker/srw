@@ -5,7 +5,8 @@ in-memory WebDAV server (``FakeNextcloud``) that speaks the Group Folders
 DAV endpoint (``/remote.php/dav/groupfolders/<user>/<mountpoint>/``). Covers
 the four methods that back Mode-A job cloud export: ``list_project_folder``
 (recursive ``Depth: 1`` walk), ``get_project_folder_file_bytes``,
-``put_project_folder_file_bytes`` (MKCOL parents then PUT), and
+``put_project_folder_file_bytes`` (PUT, MKCOL-ing parents only when the PUT
+finds one missing), and
 ``delete_project_folder_file``.
 
 The fake's PROPFIND bodies mirror the real sabre/dav multistatus shape
@@ -27,8 +28,10 @@ from orchestrator.services.cloud import (
     CloudMountSubject,
     NextcloudBackend,
     ProjectFolderHandle,
+    SessionFolderHandle,
 )
 from orchestrator.services.cloud.config import NextcloudSettings
+from orchestrator.services.cloud.nextcloud import share_rate_bucket
 from orchestrator.services.cloud.folder_grants import principal_ids
 
 NEXTCLOUD_BASE = "https://nc.example.com"
@@ -88,6 +91,9 @@ class FakeNextcloud:
         # sabre/dav with infinity disabled) so the etag baseline falls back to
         # the Depth:1 BFS. Default False: the fake honors infinity.
         self.reject_infinity = False
+        # What a PUT into a missing collection answers: 409 in plain
+        # sabre/dav, 404 from a real Nextcloud 31.
+        self.missing_parent_put_status = 409
 
     # ---- seeding helper
     def add_file(self, relpath: str, content: bytes) -> None:
@@ -168,8 +174,9 @@ class FakeNextcloud:
             return httpx.Response(409, content=self._dav_error())
         parent = "/".join(rel.split("/")[:-1])
         if parent and parent not in self.dirs:
-            # Real WebDAV: PUT into a missing collection → 409 Conflict.
-            return httpx.Response(409, content=self._dav_error())
+            return httpx.Response(
+                self.missing_parent_put_status, content=self._dav_error()
+            )
         self.files[rel] = content
         self.etags[rel] = self._next_etag()
         return httpx.Response(201)
@@ -339,6 +346,219 @@ class TestEnsureSessionFolderExclusive:
 
         assert handle.native_id == "sessions/report-2"
         assert made == ["sessions/report-2"]
+
+
+class TestSessionFolderLeafFirst:
+    """A session folder costs one MKCOL when ``sessions/`` is there; the
+    parent is created only when the leaf's MKCOL says it is missing (409),
+    and a 409 never reads as "the folder exists"."""
+
+    def _backend(
+        self, dirs: set[str], *, leaf_conflicts: int = 0
+    ) -> tuple[NextcloudBackend, list[tuple[str, str]]]:
+        seen: list[tuple[str, str]] = []
+        conflicts = {"left": leaf_conflicts}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            path = unquote(request.url.path).split(f"/files/{AGENT_USER}/", 1)[1]
+            seen.append((request.method, path))
+            if request.method == "PUT":
+                parent = path.rsplit("/", 1)[0]
+                return httpx.Response(201 if parent in dirs else 404)
+            assert request.method == "MKCOL"
+            if path in dirs:
+                return httpx.Response(405)
+            parent = path.rsplit("/", 1)[0] if "/" in path else ""
+            if parent and parent not in dirs:
+                return httpx.Response(409)
+            if parent and conflicts["left"]:
+                conflicts["left"] -= 1
+                return httpx.Response(409)
+            dirs.add(path)
+            return httpx.Response(201)
+
+        be = NextcloudBackend(_nc_test_settings())
+        be._client = httpx.AsyncClient(
+            base_url=NEXTCLOUD_BASE, transport=httpx.MockTransport(handler)
+        )
+        be._initialized = True
+        return be, seen
+
+    @pytest.mark.asyncio
+    async def test_an_existing_parent_costs_exactly_one_mkcol(self):
+        be, seen = self._backend({"sessions"})
+        handle = await be.ensure_session_folder(session_id="s-1", exclusive=True)
+        assert handle.native_id == "sessions/s-1"
+        assert seen == [("MKCOL", "sessions/s-1")]
+
+    @pytest.mark.asyncio
+    async def test_a_missing_parent_is_created_and_the_leaf_retried_once(self):
+        dirs: set[str] = set()
+        be, seen = self._backend(dirs)
+        await be.ensure_session_folder(session_id="s-1", exclusive=True)
+        assert seen == [
+            ("MKCOL", "sessions/s-1"),
+            ("MKCOL", "sessions"),
+            ("MKCOL", "sessions/s-1"),
+        ]
+        assert dirs == {"sessions", "sessions/s-1"}
+
+    @pytest.mark.asyncio
+    async def test_a_second_conflict_is_unavailable_never_already_exists(self):
+        be, seen = self._backend(set(), leaf_conflicts=1)
+        with pytest.raises(CloudBackendError) as ei:
+            await be.ensure_session_folder(session_id="s-1", exclusive=True)
+        assert ei.value.kind is CloudBackendErrorKind.UNAVAILABLE
+        assert ei.value.retryable
+        assert seen == [
+            ("MKCOL", "sessions/s-1"),
+            ("MKCOL", "sessions"),
+            ("MKCOL", "sessions/s-1"),
+        ]
+
+    @pytest.mark.asyncio
+    async def test_an_existing_leaf_is_still_refused_when_exclusive(self):
+        be, seen = self._backend({"sessions", "sessions/s-1"})
+        with pytest.raises(CloudBackendError) as ei:
+            await be.ensure_session_folder(session_id="s-1", exclusive=True)
+        assert ei.value.kind is CloudBackendErrorKind.ALREADY_EXISTS
+        assert seen == [("MKCOL", "sessions/s-1")]
+
+    @pytest.mark.asyncio
+    async def test_a_session_file_whose_folder_exists_costs_one_put(self):
+        be, seen = self._backend({"sessions", "sessions/s-1"})
+        await be.put_session_file(
+            SessionFolderHandle(backend="nextcloud", native_id="sessions/s-1"),
+            path="report.md",
+            content=b"r",
+        )
+        assert seen == [("PUT", "sessions/s-1/report.md")]
+
+    @pytest.mark.asyncio
+    async def test_a_session_file_creates_missing_folders_after_the_put(self):
+        dirs = {"sessions"}
+        be, seen = self._backend(dirs)
+        await be.put_session_file(
+            SessionFolderHandle(backend="nextcloud", native_id="sessions/s-1"),
+            path="out/report.md",
+            content=b"r",
+        )
+        assert seen == [
+            ("PUT", "sessions/s-1/out/report.md"),
+            ("MKCOL", "sessions"),
+            ("MKCOL", "sessions/s-1"),
+            ("MKCOL", "sessions/s-1/out"),
+            ("PUT", "sessions/s-1/out/report.md"),
+        ]
+
+
+class TestResolveUserIdentity:
+    def _backend(self, users: dict) -> tuple[NextcloudBackend, list[str]]:
+        searches: list[str] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            search = request.url.params["search"]
+            searches.append(search)
+            found = {
+                uid: rec
+                for uid, rec in users.items()
+                if search.lower() in (uid + " " + str(rec)).lower()
+            }
+            return httpx.Response(
+                200,
+                json={"ocs": {"data": {"users": found}}},
+                headers={"Content-Type": "application/json"},
+            )
+
+        be = NextcloudBackend(_nc_test_settings())
+        be._client = httpx.AsyncClient(
+            base_url=NEXTCLOUD_BASE, transport=httpx.MockTransport(handler)
+        )
+        be._initialized = True
+        return be, searches
+
+    @pytest.mark.asyncio
+    async def test_an_account_without_an_email_matches_by_display_name(self):
+        # Nextcloud refuses an address like admin@localhost, so the account
+        # user_oidc creates carries "email": null.
+        be, searches = self._backend(
+            {
+                "oidc-1": {"email": None, "displayname": "test"},
+                "other": {"email": None, "displayname": "test runner"},
+            }
+        )
+        assert await be.resolve_user_identity("admin@localhost", "test") == "oidc-1"
+        assert searches == ["admin@localhost", "test"]
+
+    @pytest.mark.asyncio
+    async def test_a_null_display_name_never_raises(self):
+        be, _ = self._backend(
+            {
+                "a": {"email": "a@example.com", "displayname": None},
+                "b": {"email": None, "displayname": None},
+            }
+        )
+        assert await be.resolve_user_identity("a@example.com", "x") == "a"
+
+
+class TestSharedClientSendsNoCookies:
+    @pytest.mark.asyncio
+    async def test_two_requests_carry_no_cookie_header(self, monkeypatch):
+        seen: list[str | None] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            seen.append(request.headers.get("cookie"))
+            return httpx.Response(
+                200 if request.url.path == "/status.php" else 404,
+                json={"instanceid": "oc1234"},
+                headers=[
+                    ("set-cookie", "cookie_test=test; path=/"),
+                    ("set-cookie", "oc_sessionPassphrase=x; path=/; secure"),
+                ],
+            )
+
+        real_client = httpx.AsyncClient
+
+        def client_with_mock(**kwargs):
+            return real_client(transport=httpx.MockTransport(handler), **kwargs)
+
+        monkeypatch.setattr(httpx, "AsyncClient", client_with_mock)
+        be = NextcloudBackend(_nc_test_settings())
+        # status.php then the groupfolders probe; the 404 ends init.
+        assert await be.ensure_initialized() is False
+        assert seen == [None, None]
+
+
+class TestShareRateBucket:
+    def test_unset_env_keeps_fifteen_per_ten_minutes(self):
+        assert share_rate_bucket({}) == (15, 600.0)
+
+    def test_chart_limit_is_split_between_replicas(self):
+        env = {
+            "NEXTCLOUD_SHARE_RATE_LIMIT": "200",
+            "NEXTCLOUD_SHARE_RATE_PERIOD_SECONDS": "600",
+            "NEXTCLOUD_SHARE_RATE_REPLICAS": "2",
+        }
+        assert share_rate_bucket(env) == (75, 600.0)
+
+    def test_upstream_limit_with_two_replicas_stays_under_the_server(self):
+        env = {"NEXTCLOUD_SHARE_RATE_REPLICAS": "2"}
+        events, _ = share_rate_bucket(env)
+        assert events * 2 <= 20
+        assert events == 7
+
+    def test_a_bucket_never_drops_to_zero(self):
+        env = {"NEXTCLOUD_SHARE_RATE_LIMIT": "1", "NEXTCLOUD_SHARE_RATE_REPLICAS": "5"}
+        assert share_rate_bucket(env)[0] == 1
+
+    @pytest.mark.parametrize("bad", ["0", "-3", "lots", ""])
+    def test_invalid_values_fall_back_to_upstream(self, bad):
+        env = {
+            "NEXTCLOUD_SHARE_RATE_LIMIT": bad,
+            "NEXTCLOUD_SHARE_RATE_PERIOD_SECONDS": bad,
+            "NEXTCLOUD_SHARE_RATE_REPLICAS": bad,
+        }
+        assert share_rate_bucket(env) == (15, 600.0)
 
 
 def _install_fake(backend: NextcloudBackend, fake: FakeNextcloud) -> None:
@@ -539,6 +759,57 @@ class TestPutBytes:
             await be.get_project_folder_file_bytes(_handle(), path="x/y/z.txt")
             == b"data"
         )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("missing_status", [404, 409])
+    async def test_a_missing_parent_is_created_after_the_put_is_refused(
+        self, missing_status
+    ):
+        be = NextcloudBackend(_nc_test_settings())
+        fake = FakeNextcloud()
+        fake.missing_parent_put_status = missing_status
+        _install_fake(be, fake)
+        await be.put_project_folder_file_bytes(
+            _handle(), path="x/y/z.txt", content=b"d"
+        )
+        assert [
+            (r.method, unquote(r.url.path)[len(fake.decoded_base) :])
+            for r in fake.requests
+        ] == [
+            ("PUT", "/x/y/z.txt"),
+            ("MKCOL", "/x"),
+            ("MKCOL", "/x/y"),
+            ("PUT", "/x/y/z.txt"),
+        ]
+        assert fake.files["x/y/z.txt"] == b"d"
+
+    @pytest.mark.asyncio
+    async def test_a_file_whose_folders_exist_costs_one_put(self):
+        be = NextcloudBackend(_nc_test_settings())
+        fake = FakeNextcloud()
+        fake.add_file("x/y/old.txt", b"o")
+        _install_fake(be, fake)
+        await be.put_project_folder_file_bytes(
+            _handle(), path="x/y/z.txt", content=b"d"
+        )
+        assert [r.method for r in fake.requests] == ["PUT"]
+
+    @pytest.mark.asyncio
+    async def test_a_put_refused_with_its_parents_there_is_not_retried_twice(self):
+        be = NextcloudBackend(_nc_test_settings())
+        fake = FakeNextcloud()
+        fake.add_file("x/y/old.txt", b"o")
+        fake.files["x/y/z.txt"] = b"locked"
+        _install_fake(be, fake)
+        original_put = fake._put
+        fake._put = lambda rel, content: (
+            httpx.Response(409) if rel == "x/y/z.txt" else original_put(rel, content)
+        )
+        with pytest.raises(CloudBackendError):
+            await be.put_project_folder_file_bytes(
+                _handle(), path="x/y/z.txt", content=b"d"
+            )
+        assert [r.method for r in fake.requests] == ["PUT", "MKCOL", "MKCOL", "PUT"]
 
     @pytest.mark.asyncio
     async def test_root_file_needs_no_parents(self):
