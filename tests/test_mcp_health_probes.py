@@ -14,15 +14,21 @@ from __future__ import annotations
 import json
 import logging
 import os
+import shutil
+import subprocess
+from pathlib import Path
 
 import httpx
 import pytest
+import yaml
 
 # Skip auth setup in the server module, as the other MCP suites do: the module
 # is imported once per process, and HTTP-mode auth would leak into them.
 os.environ.setdefault("MCP_TRANSPORT", "stdio")
 
 from mcp_server import server  # noqa: E402
+
+CHART = Path(__file__).resolve().parents[1] / "helm"
 
 
 class _Clock:
@@ -116,3 +122,37 @@ async def test_readiness_failure_logs_its_cause(orchestrator_down, caplog):
     assert response.status_code == 503
     assert json.loads(response.body)["error"] == "orchestrator restarting"
     assert "ConnectError: orchestrator restarting" in caplog.text
+
+
+@pytest.mark.skipif(shutil.which("helm") is None, reason="Helm is not installed")
+def test_chart_probes_split_liveness_from_readiness():
+    rendered = subprocess.run(
+        [
+            "helm",
+            "template",
+            "srw",
+            str(CHART),
+            "-f",
+            str(CHART / "ci/test-values.yaml"),
+            "--show-only",
+            "templates/mcp/deployment.yaml",
+        ],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    deployment = next(
+        d
+        for d in yaml.safe_load_all(rendered.stdout)
+        if d and d["kind"] == "Deployment"
+    )
+    container = deployment["spec"]["template"]["spec"]["containers"][0]
+    assert container["startupProbe"]["httpGet"]["path"] == "/livez"
+    assert container["livenessProbe"]["httpGet"]["path"] == "/livez"
+    readiness = container["readinessProbe"]
+    assert readiness["httpGet"]["path"] == "/health"
+    # Longer than the client's 1 s + 2 s connect retries.
+    assert readiness["timeoutSeconds"] > 3
+    # The startup window covers the default OIDC discovery budget (240 s).
+    startup = container["startupProbe"]
+    assert startup["failureThreshold"] * startup["periodSeconds"] > 240
