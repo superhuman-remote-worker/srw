@@ -344,6 +344,25 @@ class TestResolveFromCookie:
         db.delete_srw_session.assert_awaited_once_with(SESSION_ID)
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("bad_sub", [None, "", "   ", 123])
+    async def test_unusable_sub_in_claims_deletes(self, bad_sub):
+        """A null, blank or non-string sub is as unusable as an absent one."""
+        now = datetime.now(UTC)
+        sess = _session(
+            last_seen_at=now, access_expires_at=now + timedelta(seconds=600)
+        )
+        db = _make_db(sess)
+
+        with _auth_patches(
+            validate_token={"sub": bad_sub, "realm_access": {"roles": ["user"]}},
+            decode_id_token={},
+        ):
+            result = await _resolve_from_cookie(SESSION_ID, db)
+
+        assert result is None
+        db.delete_srw_session.assert_awaited_once_with(SESSION_ID)
+
+    @pytest.mark.asyncio
     async def test_idle_refresh_updates_in_memory_id_token(self):
         """A2: after refresh, the downstream decode sees the NEW id_token.
 

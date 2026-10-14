@@ -82,6 +82,12 @@ def _merge_identity_claims(access_claims: dict, id_claims: dict | None) -> dict:
     return merged
 
 
+def _has_usable_subject(claims: dict) -> bool:
+    """True when the claims carry a non-blank string ``sub``."""
+    sub = claims.get("sub")
+    return isinstance(sub, str) and bool(sub.strip())
+
+
 async def get_current_user(request: Request, db) -> dict:
     """FastAPI dependency: resolve the current user.
 
@@ -132,6 +138,8 @@ async def get_current_user(request: Request, db) -> dict:
     if token.count(".") == 2:
         claims = oidc_validator.validate_token(token)
         if not claims:
+            raise HTTPException(status_code=401, detail="Invalid or expired token")
+        if not _has_usable_subject(claims):
             raise HTTPException(status_code=401, detail="Invalid or expired token")
         return await _resolve_user_from_claims(claims, db)
     raise HTTPException(status_code=401, detail="Unrecognized token format")
@@ -199,8 +207,10 @@ async def _resolve_from_cookie(session_id: str, db) -> dict | None:
     # resolution works regardless of the client's mapper config.
     id_claims = oidc_validator.decode_id_token(sess["id_token"]) or {}
     claims = _merge_identity_claims(claims, id_claims)
-    if "sub" not in claims:
-        logger.warning("Session %s tokens have no sub claim — killing", session_id)
+    if not _has_usable_subject(claims):
+        logger.warning(
+            "Session %s tokens have no usable sub claim — killing", session_id
+        )
         await db.delete_srw_session(session_id)
         return None
 

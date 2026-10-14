@@ -221,3 +221,89 @@ def test_auth_me_is_the_only_route_on_the_identity_router():
         (route.path, tuple(sorted(route.methods)))
         for route in identity_routes.router.routes
     } == {("/api/auth/me", ("GET",))}
+
+
+# =============================================================================
+# A validated Bearer token without a usable subject
+# =============================================================================
+
+
+def _bearer_app(db):
+    """A bare app whose one route runs the real ``get_current_user``."""
+    from fastapi import FastAPI, Request
+
+    from orchestrator.security.auth import get_current_user
+
+    app = FastAPI()
+
+    @app.get("/whoami")
+    async def whoami(request: Request):
+        user = await get_current_user(request, db)
+        return {"id": str(user["id"])}
+
+    return app
+
+
+async def _get_whoami(db):
+    # raise_app_exceptions=False turns an unhandled error into the 500 a
+    # client would actually see, instead of re-raising it into the test.
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=_bearer_app(db), raise_app_exceptions=False),
+        base_url="http://test",
+    ) as client:
+        return await client.get("/whoami", headers={"Authorization": "Bearer a.b.c"})
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "claims",
+    [
+        {"email": "a@example.com"},
+        {"sub": None},
+        {"sub": ""},
+        {"sub": "   "},
+        {"sub": 123},
+    ],
+    ids=["absent", "null", "empty", "blank", "non-string"],
+)
+async def test_bearer_without_usable_subject_is_401_before_any_lookup(
+    claims, monkeypatch
+):
+    from unittest.mock import AsyncMock, MagicMock
+
+    from orchestrator.security.oidc import oidc_validator
+
+    monkeypatch.setattr(oidc_validator, "validate_token", lambda token: claims)
+    db = MagicMock()
+    db.get_user_by_keycloak_sub = AsyncMock()
+
+    response = await _get_whoami(db)
+
+    assert response.status_code == 401, response.text
+    db.get_user_by_keycloak_sub.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_bearer_with_usable_subject_still_resolves(monkeypatch):
+    from unittest.mock import AsyncMock, MagicMock
+
+    from orchestrator.security.oidc import oidc_validator
+
+    monkeypatch.setattr(
+        oidc_validator,
+        "validate_token",
+        lambda token: {"sub": "kc-sub-1", "email": "alice@example.com"},
+    )
+    db = MagicMock()
+    db.get_user_by_keycloak_sub = AsyncMock(
+        return_value=user_row(
+            keycloak_sub="kc-sub-1", display_name="alice", is_admin=False
+        )
+    )
+    db.acquire = MagicMock()
+
+    response = await _get_whoami(db)
+
+    assert response.status_code == 200, response.text
+    assert response.json() == {"id": str(USER_ID)}
+    db.get_user_by_keycloak_sub.assert_awaited_once_with("kc-sub-1")
