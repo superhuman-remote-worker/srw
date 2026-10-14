@@ -322,13 +322,14 @@ class Gate:
         # Nextcloud refuses ``admin@localhost`` as an email address (no
         # TLD), so on k3d the lookup finds the account by display name, as
         # it would find the one user_oidc creates at the user's first login.
+        # Recorded first: occ can create the account and still fail after.
+        self.created_nc_user = uid
         occ(
             "user:add",
             "--generate-password",
             f"--display-name={self.display_name}",
             uid,
         )
-        self.created_nc_user = uid
         self.report["nc_account"] = {"uid": uid, "created": True}
         print(f"PASS created disposable Nextcloud account {uid}", flush=True)
 
