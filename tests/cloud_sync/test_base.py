@@ -177,6 +177,26 @@ async def test_ensure_remote_dirs_caches(tmp_path: Path):
 
 
 @pytest.mark.asyncio
+async def test_ensure_remote_dirs_never_caches_a_failed_mkdir(tmp_path: Path):
+    sync = FakeSync(tmp_path)
+    unavailable = True
+    create = sync._ensure_remote_dir
+
+    async def mkdir(rel_dir, *, before_write=None):
+        if unavailable:  # "a" answers 503, so "a/b" then answers 409
+            raise RuntimeError("MKCOL failed")
+        await create(rel_dir, before_write=before_write)
+
+    sync._ensure_remote_dir = mkdir
+    await sync._ensure_remote_dirs("a/b")  # swallowed, as before
+    assert sync._remote_dirs == set()
+    unavailable = False
+    await sync._ensure_remote_dirs("a/b")  # the retry asks again
+    assert sync.mkdirs == ["a", "a/b"]
+    assert sync._remote_dirs == {"a", "a/b"}
+
+
+@pytest.mark.asyncio
 async def test_poll_cancels_cleanly(tmp_path: Path):
     sync = FakeSync(tmp_path)
     sync._poll_interval = 1  # any positive value

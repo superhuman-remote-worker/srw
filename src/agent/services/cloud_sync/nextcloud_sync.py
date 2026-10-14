@@ -177,7 +177,11 @@ class NextcloudWorkspaceSync(WorkspaceSyncBase):
         if before_write is not None:
             await before_write()
         client = self._get_client()
-        await asyncio.to_thread(client.mkdir, rel_dir)
+        # webdav3 answers True for 200/201 and for 405 (already exists),
+        # raises for an error status, and returns False for anything else.
+        # Only the first two may be cached as "exists".
+        if not await asyncio.to_thread(client.mkdir, rel_dir):
+            raise RuntimeError(f"MKCOL {rel_dir} did not confirm the directory")
 
     async def _upload_file(
         self,

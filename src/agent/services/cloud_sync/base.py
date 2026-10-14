@@ -998,7 +998,14 @@ class WorkspaceSyncBase(abc.ABC):
         *,
         before_write: Optional[Callable[[], Awaitable[None]]] = None,
     ) -> None:
-        """Recursively create remote directories, caching known dirs."""
+        """Recursively create remote directories, caching the ones that exist.
+
+        A directory is cached only when ``_ensure_remote_dir`` returned, i.e.
+        the MKCOL created it or answered that it already exists (201 / 405
+        for WebDAV). A failed MKCOL is swallowed, since the write below it
+        reports the real error, but never cached: one bad entry used to fail
+        every later upload under that directory, recovery retries included.
+        """
         if not rel_dir or rel_dir == "." or rel_dir in self._remote_dirs:
             return
         parent = str(Path(rel_dir).parent)
@@ -1008,9 +1015,9 @@ class WorkspaceSyncBase(abc.ABC):
             if before_write is not None:
                 await before_write()
             await self._ensure_remote_dir(rel_dir, before_write=before_write)
-        except Exception:
-            # Already exists or created by parent — not worth distinguishing
-            pass
+        except Exception as exc:
+            logger.debug("Remote mkdir %s not confirmed: %s", rel_dir, exc)
+            return
         self._remote_dirs.add(rel_dir)
 
     def _backend_path(self, mount_rel_path: str) -> str:

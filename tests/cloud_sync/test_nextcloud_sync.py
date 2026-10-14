@@ -60,6 +60,7 @@ class _FakeWebDavClient:
 
     def mkdir(self, path):
         self.mkdirs.append(path)
+        return True  # webdav3: True for 201 and for 405 (already exists)
 
     def download_sync(self, **kwargs):
         self.downloads.append(kwargs)
@@ -366,6 +367,23 @@ async def test_mkdir_under_a_missing_parent_is_a_swallowed_409(tmp_path):
     assert getattr(excinfo.value, "code", None) == 409
     await sync._ensure_remote_dirs("a")  # the algorithm swallows it, as before
     assert [m for m, _p, _c in adapter.seen] == ["MKCOL", "MKCOL"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "status, cached", [(201, True), (405, True), (409, False), (503, False)]
+)
+async def test_only_a_created_or_existing_directory_is_cached(tmp_path, status, cached):
+    sync = _real_sync(tmp_path)
+    routes = {("MKCOL", f"{_BASE}/a/"): (status, {}, b"")}
+    adapter = _mount(sync, routes)
+    await sync._ensure_remote_dirs("a")
+    assert ("a" in sync._remote_dirs) is cached
+    routes[("MKCOL", f"{_BASE}/a/")] = (201, {}, b"")
+    await sync._ensure_remote_dirs("a")  # a failure is asked again, once
+    assert "a" in sync._remote_dirs
+    await sync._ensure_remote_dirs("a")
+    assert len(adapter.seen) == (1 if cached else 2)
 
 
 @pytest.mark.asyncio
