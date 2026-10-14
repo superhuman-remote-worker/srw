@@ -38,6 +38,7 @@ from pydantic import (
 )
 
 from orchestrator.schemas.execution_selection import ExecutionSelection
+from orchestrator.schemas.thread_session import PermissionMode
 from orchestrator.schemas.inline_expert import (
     EXPERT_BASED_ON_DESCRIPTION,
     InlineExpertSelection,
@@ -123,7 +124,7 @@ class ThreadCreateRequest(BaseModel):
             "datasource_ids or use_datasource_defaults is refused with 400."
         ),
     )
-    permission_mode: str | None = Field(
+    permission_mode: PermissionMode | None = Field(
         None,
         description=(
             "Per-session permission mode override. Omit to inherit the user's "

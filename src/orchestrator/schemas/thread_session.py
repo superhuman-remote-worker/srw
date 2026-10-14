@@ -10,6 +10,11 @@ from pydantic import BaseModel, Field, model_validator
 from orchestrator.schemas.inline_expert import InlineExpertSelection
 
 
+# The `threads.valid_permission_mode` CHECK values. Request schemas validate
+# against this so a bad value is a 422, not a 500 from the insert.
+PermissionMode = Literal["supervised", "auto_accept", "autonomous"]
+
+
 class ThreadControlRequest(BaseModel):
     """Strict public envelope for the durable control-inbox subset."""
 
