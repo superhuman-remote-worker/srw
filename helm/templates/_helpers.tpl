@@ -469,6 +469,36 @@ Whether the bundled protected-effect lane is deployed.
 {{- end }}
 
 {{/*
+Whether the bundled Nextcloud runs with its Valkey (nextcloud.redis.enabled).
+Only a bundled, internal Nextcloud has one.
+*/}}
+{{- define "srw.nextcloudRedisEnabled" -}}
+{{- if and .Values.nextcloud.enabled .Values.nextcloud.internal ((.Values.nextcloud.redis | default dict).enabled) -}}true{{- end -}}
+{{- end }}
+
+{{- define "srw.nextcloudRedisHost" -}}
+{{- printf "%s-nextcloud-redis" (include "srw.fullname" .) -}}
+{{- end }}
+
+{{/*
+REDIS_* env for every Nextcloud PHP container. The image's
+config/redis.config.php turns REDIS_HOST into memcache.distributed,
+memcache.locking and the redis connection in every PHP process; the Apache
+container's entrypoint also moves PHP sessions into it.
+*/}}
+{{- define "srw.nextcloudRedisEnv" -}}
+- name: REDIS_HOST
+  value: {{ include "srw.nextcloudRedisHost" . | quote }}
+- name: REDIS_HOST_PORT
+  value: "6379"
+- name: REDIS_HOST_PASSWORD
+  valueFrom:
+    secretKeyRef:
+      name: {{ include "srw.secretName" . }}
+      key: NEXTCLOUD_REDIS_PASSWORD
+{{- end }}
+
+{{/*
 Nextcloud's share-create rate limit as {"limit", "periodSeconds", "override"}
 JSON. The orchestrator sizes its per-replica client bucket from it, and the
 bundled Nextcloud's setup hook applies it server side.

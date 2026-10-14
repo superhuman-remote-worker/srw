@@ -549,6 +549,10 @@ nextcloud:
   replicas: 1
   objectStore:
     enabled: false
+  # Valkey cache + file locking (opt-in, see helm/README.md). Turning it off
+  # again later is handled by the setup hook.
+  # redis:
+  #   enabled: true
 
 # -----------------------------------------------------------------------------
 # OpenCloud — REMOVED from the local stack: Nextcloud (above) is the only

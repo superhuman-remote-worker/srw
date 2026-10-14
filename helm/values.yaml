@@ -3124,6 +3124,29 @@ nextcloud:
       limits:
         memory: "768Mi"
         cpu: "500m"
+  # Valkey (BSD-3, Redis protocol) as the bundled Nextcloud's distributed
+  # cache, transactional file locking and PHP session store, shared by Apache,
+  # cron and the protected-effect pool; APCu stays each process's local cache.
+  # Opt-in, and not a free toggle:
+  #   - Nextcloud depends on it once on: Valkey down means Nextcloud down,
+  #     and a Valkey restart drops every web session (it keeps no data).
+  #   - Turning it off again is handled by the setup hook, which deletes the
+  #     Redis settings config.php keeps after any config write.
+  # The password is NEXTCLOUD_REDIS_PASSWORD in the app Secret; generated in
+  # chart-created mode, otherwise add it before enabling this.
+  redis:
+    enabled: false
+    # PINNED to an exact release, like every image this chart controls.
+    image: docker.io/valkey/valkey:8.1.10-alpine
+    # maxmemory is set to 75 % of limits.memory, below the limit so eviction
+    # (allkeys-lru), not the OOM killer, makes room.
+    resources:
+      requests:
+        memory: "64Mi"
+        cpu: "10m"
+      limits:
+        memory: "256Mi"
+        cpu: "500m"
   apache:
     # Apache prefork workers, one PHP process each (the image's default is
     # 150). Sized for the 2-core limit below: a burst queues in Apache rather

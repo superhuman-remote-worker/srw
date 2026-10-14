@@ -635,6 +635,8 @@ deployment. See [Local Kubernetes with k3d](../docs/local-kubernetes.md#4-log-in
   it; with ESO, add it to Vault before upgrading. Do not let a values
   generator write it explicitly: an explicit value overrides the kept one.
   `NEXTCLOUD_DB_USER` too when `databases.nextcloud.internal: false`.
+- `NEXTCLOUD_REDIS_PASSWORD` (when `nextcloud.redis.enabled`) — the bundled
+  Valkey's password; same generation and generator rule as above.
 - `NEXTCLOUD_PROTECTED_EFFECT_HMAC_KEY` when
   `nextcloud.protectedEffect.enabled=true`. Use at least 32 bytes from a
   dedicated random source. Chart-created mode generates and preserves it;
@@ -697,6 +699,24 @@ the whole application Secret. The protected-effect PHP-FPM pool connects with
 `statement_timeout` and `idle_in_transaction_session_timeout` set to the
 smaller of `handlerBoundSeconds` and `safetyMarginSeconds`, so no lane
 statement outlives the lane's cleanup horizon.
+
+### Bundled Nextcloud Valkey (opt-in)
+
+`nextcloud.redis.enabled=true` adds a Valkey Deployment (`srw-nextcloud-redis`,
+a pinned `valkey/valkey` release) that Apache, cron and the protected-effect
+pool share for Nextcloud's distributed cache and transactional file locking;
+Apache's PHP sessions move into it too. It keeps no data (no RDB, no AOF), sets
+`maxmemory` to 75 % of its memory limit with `allkeys-lru` eviction, and a
+NetworkPolicy admits only the Nextcloud Pod. Its password is
+`NEXTCLOUD_REDIS_PASSWORD` in the application Secret: chart-created mode
+generates and keeps it, while with ESO add it to Vault before enabling.
+
+It is not a free toggle. Once on, Nextcloud depends on it: Valkey down means
+Nextcloud down, and a Valkey restart signs every web user out. Nextcloud writes
+the Redis settings into `config.php` on its next configuration change, so
+switching back off is more than removing the environment: with the flag off,
+the setup hook deletes `memcache.distributed`, `memcache.locking` and `redis`
+from `config.php` whenever they still name Redis, returning to APCu.
 
 ### Bundled Nextcloud background jobs
 

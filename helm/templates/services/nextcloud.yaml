@@ -66,6 +66,9 @@ can fire before the hook reaches the pins.
 - name: PGSSLMODE
   value: {{ .Values.databases.nextcloud.sslMode | default "prefer" | quote }}
 {{- end }}
+{{- if (include "srw.nextcloudRedisEnabled" .) }}
+{{ include "srw.nextcloudRedisEnv" . }}
+{{- end }}
 - name: NC_trashbin_retention_obligation
   value: "disabled"
 - name: NC_versions_retention_obligation
@@ -228,6 +231,22 @@ data:
     occ config:system:set ratelimit_overwrite files_sharing.shareapi.createshare user period --value={{ int $shareRateLimit.periodSeconds }} --type=integer 2>&1 || true
     {{- else }}
     occ config:system:delete ratelimit_overwrite files_sharing.shareapi.createshare 2>&1 || true
+    {{- end }}
+    {{- if not (include "srw.nextcloudRedisEnabled" .) }}
+
+    # =========================================================================
+    # 0d. Valkey off (nextcloud.redis.enabled=false): drop any Redis settings
+    #     config.php still holds. Every config write dumps the merged config,
+    #     redis.config.php's values included, into config.php, so removing
+    #     REDIS_HOST alone leaves Nextcloud pointing at a server that is gone.
+    # =========================================================================
+    if occ config:system:get memcache.locking 2>/dev/null | grep -q 'Redis' \
+        || occ config:system:get memcache.distributed 2>/dev/null | grep -q 'Redis'; then
+        echo "[nc-setup] Valkey is off: removing the Redis settings from config.php"
+        occ config:system:delete memcache.distributed 2>&1 || true
+        occ config:system:delete memcache.locking 2>&1 || true
+        occ config:system:delete redis 2>&1 || true
+    fi
     {{- end }}
 
     # Allow OIDC login over plain HTTP (local dev without TLS reverse proxy).
@@ -487,6 +506,13 @@ spec:
               mountPath: /var/www/html
               readOnly: true
         {{- end }}
+        {{- if (include "srw.nextcloudRedisEnabled" .) }}
+        # With Valkey configured every PHP request needs it (locking, sessions),
+        # the setup hook's occ calls included.
+        - name: wait-for-nextcloud-redis
+          image: busybox:1.36
+          command: ["sh", "-c", "until nc -z -w 2 {{ include "srw.nextcloudRedisHost" . }} 6379; do sleep 2; done"]
+        {{- end }}
       containers:
         - name: nextcloud
           image: {{ .Values.nextcloud.image }}
@@ -682,6 +708,11 @@ spec:
             # values the lane digest already covers.
             - name: PGOPTIONS
               value: {{ printf "-c statement_timeout=%d -c idle_in_transaction_session_timeout=%d" $statementBoundMs $statementBoundMs | quote }}
+            {{- end }}
+            {{- if (include "srw.nextcloudRedisEnabled" .) }}
+            # The same file locks and distributed cache as Apache and cron:
+            # a lane write must see a lock an ordinary request holds.
+            {{- include "srw.nextcloudRedisEnv" . | nindent 12 }}
             {{- end }}
           volumeMounts:
             - name: data
