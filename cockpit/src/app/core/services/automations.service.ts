@@ -81,8 +81,9 @@ export interface CreateAutomationRequest {
 }
 
 /** Patchable subset for `PATCH /api/automations/{id}`. Server recomputes
- *  next_run_at when cron_expr / timezone / enabled changes. */
-export type UpdateAutomationRequest = Partial<Omit<CreateAutomationRequest, 'trigger_type'>>;
+ *  next_run_at when cron_expr / timezone / enabled changes. The trigger and
+ *  the project are fixed at create. */
+export type UpdateAutomationRequest = Partial<Omit<CreateAutomationRequest, 'trigger_type' | 'project_id'>>;
 
 /** Minimal job shape returned by the runs list — full job detail lives in
  *  the existing job-detail view we link to. */

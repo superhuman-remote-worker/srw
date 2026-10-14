@@ -74,6 +74,37 @@
             />
           </label>
 
+          @if (ed.mode === 'create') {
+            <label class="field field--full">
+              <span class="field-label">{{ 'automations.editor.project' | transloco }}</span>
+              <app-select [value]="ed.projectId ?? ''" (changed)="onProjectChange($event || null)">
+                <option value="">{{ 'automations.editor.noProject' | transloco }}</option>
+                @for (project of projectChoices(); track project.id) {
+                  <option [value]="project.id">{{ project.name }}@if (project.is_default) { {{ 'automations.editor.projectPersonal' | transloco }}}</option>
+                }
+                @if (unlistedProjectId(); as id) {
+                  <option [value]="id">{{ projectName(id) ?? ('automations.list.projectFilter.fallbackName' | transloco) }}</option>
+                }
+              </app-select>
+            </label>
+          } @else {
+            <!-- PATCH has no project_id: an automation stays in the project it was created in. -->
+            <div class="field field--full project-readonly">
+              <span class="field-label">{{ 'automations.editor.project' | transloco }}</span>
+              <span>
+                @if (ed.projectId) {
+                  <a class="meta-link" [routerLink]="['/projects', ed.projectId]">
+                    <app-icon size="inherit">folder_shared</app-icon>
+                    {{ projectName(ed.projectId) ?? ('automations.list.openProject' | transloco) }}
+                  </a>
+                } @else {
+                  {{ 'automations.editor.noProject' | transloco }}
+                }
+              </span>
+              <span class="field-note">{{ 'automations.editor.projectFixed' | transloco }}</span>
+            </div>
+          }
+
           <label class="field field--full">
             <span class="field-label">{{ 'automations.editor.trigger' | transloco }}</span>
             <app-select [value]="ed.triggerType" [disabled]="ed.mode === 'edit'"
@@ -91,7 +122,9 @@
                 [showHeader]="false" [searchable]="true"
                 (change)="onConnectorChange()" (retry)="retryConnectors()" />
               @if (!connectorsLoading() && !connectorsError() && !liveConnectors().length) {
-                <p>{{ 'automations.editor.noLiveConnectors' | transloco }}</p>
+                <p>{{ (ed.mode === 'create' && !ed.projectId && projectChoices().length
+                  ? 'automations.editor.noLiveConnectorsChooseProject'
+                  : 'automations.editor.noLiveConnectors') | transloco }}</p>
               }
               <label class="field">
                 <span class="field-label">{{ 'automations.editor.primaryConnector' | transloco }}</span>

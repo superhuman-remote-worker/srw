@@ -558,7 +558,12 @@
       "primaryConnector": "Primary connector",
       "additionalConnectors": "Additional connectors (optional)",
       "noLiveConnectors": "No eligible live connectors. Add a phone line under Connectors.",
-      "liveConnectorRequired": "Select a primary live connector."
+      "noLiveConnectorsChooseProject": "No eligible live connectors. Phone lines that belong to a project appear once you choose that project above.",
+      "liveConnectorRequired": "Select a primary live connector.",
+      "project": "Project",
+      "noProject": "No project",
+      "projectPersonal": "(Personal)",
+      "projectFixed": "Set when the automation was created; it can't be changed."
     },
     "preview": {
       "timezoneNote": "Times are shown in {{tz}}. The orchestrator stores schedules in UTC and applies DST automatically.",

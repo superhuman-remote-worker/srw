@@ -558,7 +558,12 @@
       "primaryConnector": "Primärer Connector",
       "additionalConnectors": "Weitere Connectors (optional)",
       "noLiveConnectors": "Keine verfügbaren Live-Connectors. Unter Connectors eine Telefonleitung hinzufügen.",
-      "liveConnectorRequired": "Einen primären Live-Connector auswählen."
+      "noLiveConnectorsChooseProject": "Keine verfügbaren Live-Connectors. Telefonleitungen eines Projekts erscheinen, sobald du oben dieses Projekt auswählst.",
+      "liveConnectorRequired": "Einen primären Live-Connector auswählen.",
+      "project": "Projekt",
+      "noProject": "Kein Projekt",
+      "projectPersonal": "(Persönlich)",
+      "projectFixed": "Beim Anlegen der Automation festgelegt; lässt sich nicht ändern."
     },
     "preview": {
       "timezoneNote": "Zeiten in {{tz}}. Der Orchestrator speichert intern in UTC und beachtet Sommerzeit automatisch.",

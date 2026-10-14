@@ -11,6 +11,7 @@ import {ActivatedRoute, Router, RouterLink} from '@angular/router';
 import {DatePipe} from '@angular/common';
 import {FormsModule} from '@angular/forms';
 import {TranslocoPipe, TranslocoService} from '@jsverse/transloco';
+import {catchError, of} from 'rxjs';
 
 import {AppButtonComponent} from '../../ui/button';
 import {AppIconComponent} from '../../ui/icon';
@@ -28,6 +29,7 @@ interface SelectOption {
 }
 
 import {ApiService} from '../../core/services/api.service';
+import {UserService} from '../../core/services/user.service';
 import {
   Automation,
   AutomationsService,
@@ -108,6 +110,7 @@ export class AutomationsPageComponent implements OnInit {
   private readonly route = inject(ActivatedRoute);
   private readonly router = inject(Router);
   private readonly transloco = inject(TranslocoService);
+  private readonly users = inject(UserService);
 
   readonly automations = this.service.automations;
   readonly isLoading = this.service.isLoading;
@@ -138,6 +141,7 @@ export class AutomationsPageComponent implements OnInit {
         if (request !== this.connectorRequest) return;
         this.connectors.set(rows);
         this.connectorsLoading.set(false);
+        this.dropIneligibleConnectors();
       },
       error: () => {
         if (request !== this.connectorRequest) return;
@@ -149,7 +153,19 @@ export class AutomationsPageComponent implements OnInit {
   }
 
   retryConnectors(): void {
-    this.loadConnectors(this.editor()?.projectId ?? this.projectFilter());
+    const current = this.editor();
+    this.loadConnectors(current ? current.projectId : this.projectFilter());
+  }
+
+  /** A new automation's project can change under its selection: keep only
+   *  the connectors the freshly loaded list still offers. An edit's project
+   *  is fixed, so its stored bindings are left alone. */
+  private dropIneligibleConnectors(): void {
+    const current = this.editor();
+    if (current?.mode !== 'create') return;
+    const eligible = new Set(this.connectors().map((c) => c.id));
+    const kept = current.connectorIds.filter((id) => eligible.has(id));
+    if (kept.length !== current.connectorIds.length) this.setConnectorIds(kept);
   }
 
   onConnectorChange(): void {
@@ -186,6 +202,35 @@ export class AutomationsPageComponent implements OnInit {
     this.api.getDatasources(undefined, 'gpt_live_sip').subscribe((rows) =>
       this.lineNames.set(Object.fromEntries(rows.map((row) => [row.id, row.name]))),
     );
+  }
+
+  /** The caller's active projects: the names the editor shows. */
+  readonly projects = signal<Project[]>([]);
+  /** The projects a new automation can be scoped to — creating one in a
+   *  project needs editor or owner (admins pass any membership check). */
+  readonly projectChoices = computed(() => {
+    const isAdmin = this.users.currentUser()?.is_admin ?? false;
+    return this.projects().filter((p) => isAdmin || p.user_role !== 'viewer');
+  });
+  /** The create editor's project when the choices lack it (a ?project=
+   *  prefill the list does not hold): offered anyway, because a select whose
+   *  value is not among its options renders blank. */
+  readonly unlistedProjectId = computed(() => {
+    const id = this.editor()?.projectId;
+    return id && !this.projectChoices().some((p) => p.id === id) ? id : null;
+  });
+
+  private loadProjects(): void {
+    this.api.getProjects(this.users.currentUserId() ?? undefined, ['active'])
+      .pipe(catchError(() => of([] as Project[])))
+      .subscribe((projects) => this.projects.set(projects));
+  }
+
+  /** A project's name, or null when neither the loaded list nor the
+   *  ?project= filter knows it (an archived project, say). */
+  projectName(id: string): string | null {
+    return this.projects().find((p) => p.id === id)?.name
+      ?? (id === this.projectFilter() ? this.projectFilterName() : null);
   }
 
   /** Active project filter (from ?project=<uuid>). null when unscoped. */
@@ -247,6 +292,7 @@ export class AutomationsPageComponent implements OnInit {
     const pending = this.route.snapshot.queryParamMap.get('project');
     this.loadConnectors(pending);
     this.loadLineNames();
+    this.loadProjects();
     if (pending) {
       this.projectFilter.set(pending);
       this.service.loadByProject(pending);
@@ -295,7 +341,9 @@ export class AutomationsPageComponent implements OnInit {
       replaceUrl: true,
     });
     this.service.loadMine();
-    this.loadConnectors(null);
+    // An open editor keeps the project it shows; the filter only scoped the list.
+    const current = this.editor();
+    this.loadConnectors(current ? current.projectId : null);
   }
 
   /** Open the create editor; honors the active project filter when set. */
@@ -377,6 +425,19 @@ export class AutomationsPageComponent implements OnInit {
     this.errorMessage.set(null);
   }
 
+  /** Create only (PATCH cannot move an automation): the project decides
+   *  which connectors and workspace templates are eligible, so a change
+   *  reloads the connectors and drops selections the new project lacks. */
+  onProjectChange(projectId: string | null): void {
+    const current = this.editor();
+    if (!current || current.mode !== 'create' || current.projectId === projectId) return;
+    // A fresh picker context: choices made against the old project's rows
+    // must not come back checked when those rows do.
+    this.connectorContext.set(`automation:${++this.editorGeneration}`);
+    this.editor.set({...current, projectId});
+    this.loadConnectors(projectId);
+  }
+
   updateEditor<K extends keyof EditorState>(field: K, value: EditorState[K]): void {
     const current = this.editor();
     if (!current) return;
@@ -403,7 +464,6 @@ export class AutomationsPageComponent implements OnInit {
       priority: e.priority,
       enabled: e.enabled,
       max_fires_per_day: e.maxFiresPerDay,
-      project_id: e.projectId,
     };
     if (e.triggerType === 'live') {
       if (this.connectorsLoading() || this.connectorsError() || !this.selectedLiveConnectors().some((c) => c.id === e.primaryConnectorId)) {
@@ -418,7 +478,10 @@ export class AutomationsPageComponent implements OnInit {
       body.timezone = e.timezone;
       body.catchup_window_seconds = Math.max(0, e.catchupWindowHours * 3600);
     }
-    if (e.mode === 'create') body.trigger_type = e.triggerType;
+    if (e.mode === 'create') {
+      body.trigger_type = e.triggerType;
+      body.project_id = e.projectId;
+    }
     this.errorMessage.set(null);
     const op$ =
       e.mode === 'create'
