@@ -474,3 +474,59 @@ def test_schema_requires_positive_share_limits(value: str) -> None:
 
     assert result.returncode != 0
     assert "minimum" in result.stderr
+
+
+ADMIN_VIEW = (
+    "NEXTCLOUD_CRON_ENABLED",
+    "NEXTCLOUD_TRASHBIN_RETENTION",
+    "NEXTCLOUD_VERSIONS_RETENTION",
+)
+
+
+def _orchestrator_env(documents: list[dict]) -> dict[str, dict]:
+    return next(
+        _env(container)
+        for document in documents
+        if document.get("kind") == "Deployment"
+        for container in document["spec"]["template"]["spec"]["containers"]
+        if container["name"] == "orchestrator"
+    )
+
+
+def test_orchestrator_sees_the_bundled_nextclouds_cron_and_retention() -> None:
+    """The admin Main cloud page shows them read-only (decision D13)."""
+    documents = _documents(*BUNDLED)
+    env = _orchestrator_env(documents)
+
+    assert {name: env[name]["value"] for name in ADMIN_VIEW} == {
+        "NEXTCLOUD_CRON_ENABLED": "true",
+        "NEXTCLOUD_TRASHBIN_RETENTION": "disabled",
+        "NEXTCLOUD_VERSIONS_RETENTION": "disabled",
+    }
+    # The same values the hook pins and every job-running process carries.
+    hook = _hook(documents)
+    assert "trashbin_retention_obligation --value=disabled" in hook
+    assert "versions_retention_obligation --value=disabled" in hook
+    for name in ("nextcloud", "cron"):
+        container_env = _env(_containers(documents)[name])
+        assert (
+            container_env["NC_trashbin_retention_obligation"]["value"]
+            == (env["NEXTCLOUD_TRASHBIN_RETENTION"]["value"])
+        )
+        assert (
+            container_env["NC_versions_retention_obligation"]["value"]
+            == (env["NEXTCLOUD_VERSIONS_RETENTION"]["value"])
+        )
+
+    without_cron = _orchestrator_env(
+        _documents(*BUNDLED, "--set", "nextcloud.cron.enabled=false")
+    )
+    assert without_cron["NEXTCLOUD_CRON_ENABLED"]["value"] == "false"
+
+
+def test_an_external_nextcloud_reports_no_cron_or_retention() -> None:
+    """The chart cannot see an external server's settings; unset, not guessed."""
+    env = _orchestrator_env(_documents(*EXTERNAL))
+
+    assert "NEXTCLOUD_URL" in env
+    assert not set(ADMIN_VIEW) & set(env)

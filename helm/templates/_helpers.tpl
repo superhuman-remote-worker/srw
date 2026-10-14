@@ -469,6 +469,16 @@ Whether the bundled protected-effect lane is deployed.
 {{- end }}
 
 {{/*
+Trash and version retention the chart pins on the bundled Nextcloud: both
+`disabled` until a retention policy is chosen on purpose, because versions and
+trash are the only recovery history the bundled cloud keeps. One source for
+the setup hook, the NC_* env of every process that runs background jobs, and
+the orchestrator's read-only admin view.
+*/}}
+{{- define "srw.nextcloudTrashbinRetention" -}}disabled{{- end }}
+{{- define "srw.nextcloudVersionsRetention" -}}disabled{{- end }}
+
+{{/*
 Whether the bundled Nextcloud runs with its Valkey (nextcloud.redis.enabled).
 Only a bundled, internal Nextcloud has one.
 */}}

@@ -70,9 +70,9 @@ can fire before the hook reaches the pins.
 {{ include "srw.nextcloudRedisEnv" . }}
 {{- end }}
 - name: NC_trashbin_retention_obligation
-  value: "disabled"
+  value: {{ include "srw.nextcloudTrashbinRetention" . | quote }}
 - name: NC_versions_retention_obligation
-  value: "disabled"
+  value: {{ include "srw.nextcloudVersionsRetention" . | quote }}
 {{- end -}}
 {{- /*
 Server settings mounted as files into the image's include directories. They
@@ -185,8 +185,8 @@ data:
     #     NC_* env, so the cron container's first run cannot race this hook.
     #     Groupfolders' trash and versions expire through the same two keys.
     # =========================================================================
-    occ config:system:set trashbin_retention_obligation --value=disabled 2>&1 || true
-    occ config:system:set versions_retention_obligation --value=disabled 2>&1 || true
+    occ config:system:set trashbin_retention_obligation --value={{ include "srw.nextcloudTrashbinRetention" . }} 2>&1 || true
+    occ config:system:set versions_retention_obligation --value={{ include "srw.nextcloudVersionsRetention" . }} 2>&1 || true
     occ config:app:set core shareapi_default_internal_expire_date --value=no 2>&1 || true
     occ config:app:set core shareapi_enforce_internal_expire_date --value=no 2>&1 || true
     {{- if .Values.nextcloud.cron.enabled }}

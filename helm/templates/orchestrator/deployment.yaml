@@ -1016,6 +1016,18 @@ spec:
               value: {{ int $shareRateLimit.periodSeconds | quote }}
             - name: NEXTCLOUD_SHARE_RATE_REPLICAS
               value: {{ max 1 (int .Values.orchestrator.replicas) | quote }}
+            {{- if and .Values.nextcloud.enabled .Values.nextcloud.internal }}
+            # Read-only facts about the bundled Nextcloud for the admin Main
+            # cloud page: whether the chart's cron container runs its
+            # background jobs, and the retention its setup hook pins. Unset
+            # for an external Nextcloud, whose settings the chart cannot see.
+            - name: NEXTCLOUD_CRON_ENABLED
+              value: {{ ternary "true" "false" (.Values.nextcloud.cron.enabled | default false) | quote }}
+            - name: NEXTCLOUD_TRASHBIN_RETENTION
+              value: {{ include "srw.nextcloudTrashbinRetention" . | quote }}
+            - name: NEXTCLOUD_VERSIONS_RETENTION
+              value: {{ include "srw.nextcloudVersionsRetention" . | quote }}
+            {{- end }}
             {{- if and .Values.nextcloud.enabled (eq (include "srw.nextcloudProtectedEffectEnabled" .) "true") }}
             - name: NEXTCLOUD_PROTECTED_EFFECT_URL
               valueFrom:
