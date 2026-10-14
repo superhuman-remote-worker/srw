@@ -58,6 +58,7 @@ main green but inert (port contract §P3).
 from __future__ import annotations
 
 import asyncio
+import time
 import copy
 import logging
 from dataclasses import dataclass, field
@@ -1797,6 +1798,28 @@ def schedule_thread_agent(
         )
 
 
+class _CreateTiming:
+    """Step durations of one thread create, logged as one
+    ``thread-create timing:`` line (like ``claim-bundle timing:``)."""
+
+    def __init__(self) -> None:
+        self._start = self._last = time.perf_counter()
+        self._steps: list[tuple[str, float]] = []
+
+    def mark(self, step: str) -> None:
+        now = time.perf_counter()
+        self._steps.append((step, now - self._last))
+        self._last = now
+
+    def log(self, thread_id: str) -> None:
+        logger.info(
+            "thread-create timing: thread=%s %s total=%.3fs",
+            thread_id,
+            " ".join(f"{step}={took:.3f}s" for step, took in self._steps),
+            self._last - self._start,
+        )
+
+
 async def create_thread(
     request_body: ThreadCreateRequest,
     request: Request,
@@ -1812,17 +1835,22 @@ async def create_thread(
     delegates is reported ``unscoped`` — so passing the result down is what
     keeps this from becoming a second identical approval read.
     """
+    marks = _CreateTiming()
     await dependencies.enforce_readiness_gate()
+    marks.mark("gate")
     try:
         if user is None:
             user = await dependencies.require_approved_user(request, dependencies.store)
+        marks.mark("user")
 
         plan = await resolve_thread_creation_plan(
             request_body, user, dependencies=dependencies
         )
+        marks.mark("plan")
         thread_id, created_runtime_authority = await commit_thread_creation(
             plan, request_body, user, dependencies=dependencies
         )
+        marks.mark("commit")
 
         main_cloud_first = sidecar_pod_planned_at_create(
             plan, dependencies.main_cloud_router
@@ -1839,8 +1867,10 @@ async def create_thread(
                 protected=plan.protected,
                 dependencies=dependencies,
             )
+            marks.mark("cloud_first")
 
         await provision_thread_workspace(plan, thread_id, dependencies=dependencies)
+        marks.mark("workspace")
 
         # Run Gitea + Nextcloud setup in parallel, and AWAIT both before
         # assigning an agent. The workspace container is already provisioning
@@ -1874,6 +1904,7 @@ async def create_thread(
             ),
         )
 
+        marks.mark("gitea_cloud")
         schedule_thread_agent(
             plan,
             thread_id,
@@ -1881,6 +1912,8 @@ async def create_thread(
             created_runtime_authority,
             dependencies=dependencies,
         )
+        marks.mark("schedule")
+        marks.log(thread_id)
 
         response: dict[str, Any] = {"thread_id": thread_id, "status": "created"}
         if plan.ignored_override_keys:
