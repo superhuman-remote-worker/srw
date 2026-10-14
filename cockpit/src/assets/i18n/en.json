@@ -1664,6 +1664,24 @@
       "kinds": {
         "project": "project",
         "user_root": "user root"
+      },
+      "jobs": {
+        "title": "Background jobs",
+        "mode": "Mode",
+        "ajaxNote": "In AJAX mode they run only while someone has the Nextcloud web UI open.",
+        "lastRun": "Last run",
+        "never": "never",
+        "stale": "overdue",
+        "cronContainer": "Cron container",
+        "cronOn": "on, runs cron.php every 5 minutes",
+        "cronOff": "off (nextcloud.cron.enabled is false)",
+        "trashbin": "Trash retention",
+        "versions": "Version retention",
+        "retention": "Retention",
+        "retentionExternal": "Managed by this Nextcloud's own administrator.",
+        "retentionChart": "Set by the chart's setup hook on every Nextcloud start.",
+        "retentionDisabled": "disabled: Nextcloud never expires trash or old file versions on its own, so they remain the recovery floor.",
+        "staleNote": "No background job run has finished in the last 15 minutes, so Nextcloud's own cleanup (expired tokens, file locks) is waiting. Check that cron.php runs: in the chart's cron container, or on the server's own schedule."
       }
     },
     "helpers": {

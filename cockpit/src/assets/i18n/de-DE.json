@@ -1664,6 +1664,24 @@
       "kinds": {
         "project": "Projekt",
         "user_root": "Benutzer-Root"
+      },
+      "jobs": {
+        "title": "Hintergrundjobs",
+        "mode": "Modus",
+        "ajaxNote": "Im AJAX-Modus laufen sie nur, solange jemand die Nextcloud-Weboberfläche geöffnet hat.",
+        "lastRun": "Letzter Lauf",
+        "never": "noch nie",
+        "stale": "überfällig",
+        "cronContainer": "Cron-Container",
+        "cronOn": "an, führt cron.php alle 5 Minuten aus",
+        "cronOff": "aus (nextcloud.cron.enabled ist false)",
+        "trashbin": "Papierkorb-Aufbewahrung",
+        "versions": "Versions-Aufbewahrung",
+        "retention": "Aufbewahrung",
+        "retentionExternal": "Wird vom Administrator dieser Nextcloud verwaltet.",
+        "retentionChart": "Vom Setup-Hook des Charts bei jedem Nextcloud-Start gesetzt.",
+        "retentionDisabled": "disabled: Nextcloud löscht Papierkorb und alte Dateiversionen nie von selbst; sie bleiben die Grundlage jeder Wiederherstellung.",
+        "staleNote": "In den letzten 15 Minuten wurde kein Lauf der Hintergrundjobs abgeschlossen, daher wartet die Bereinigung von Nextcloud (abgelaufene Tokens, Dateisperren). Prüfen Sie, ob cron.php läuft: im Cron-Container des Charts oder im Zeitplan des Servers."
       }
     },
     "helpers": {

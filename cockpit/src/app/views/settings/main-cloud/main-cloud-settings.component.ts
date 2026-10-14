@@ -22,6 +22,13 @@ const HELM_TONE: Record<MainCloudHelmState, BadgeTone> = {
   differs: 'warning',
   invalid: 'danger',
 };
+/** Largest unit first: the relative label of a past moment uses the first that fits. */
+const RELATIVE_UNITS: [Intl.RelativeTimeFormatUnit, number][] = [
+  ['day', 86_400],
+  ['hour', 3_600],
+  ['minute', 60],
+  ['second', 1],
+];
 
 /**
  * Admin Settings → Main cloud (main_cloud_as_connectors.md, slice 2).
@@ -31,6 +38,10 @@ const HELM_TONE: Record<MainCloudHelmState, BadgeTone> = {
  * whether Helm's values match the active installation, and the provider
  * support matrix each adapter declares. A combination a provider cannot do
  * is shown as unsupported with the reason, never offered with an asterisk.
+ *
+ * For a provider with background jobs (Nextcloud) it also shows their health
+ * (mode, last run, stale) and the trash and version retention the chart pins
+ * (bundled_nextcloud_performance.md, D13), read-only like the rest.
  */
 @Component({
   selector: 'app-main-cloud-settings',
@@ -111,6 +122,72 @@ const HELM_TONE: Record<MainCloudHelmState, BadgeTone> = {
         <p class="helm-note" [attr.data-helm]="p.configuration.helm.state">
           {{ 'settings.cloud.helmNote.' + p.configuration.helm.state | transloco: {instance: p.provider.backend_instance_id} }}
         </p>
+      }
+
+      @if (p.background_jobs; as jobs) {
+        <h3 class="section-title">{{ 'settings.cloud.jobs.title' | transloco }}</h3>
+        <dl class="facts" data-section="background-jobs" [class.stale]="jobs.stale">
+          <dt>{{ 'settings.cloud.jobs.mode' | transloco }}</dt>
+          <dd data-fact="mode">
+            @if (jobs.mode) {
+              <code>{{ jobs.mode }}</code>
+              @if (jobs.mode === 'ajax') {
+                <span class="sub">{{ 'settings.cloud.jobs.ajaxNote' | transloco }}</span>
+              }
+            } @else {
+              <span class="muted">{{ 'settings.cloud.unknown' | transloco }}</span>
+            }
+          </dd>
+
+          <dt>{{ 'settings.cloud.jobs.lastRun' | transloco }}</dt>
+          <dd data-fact="last-run">
+            @if (jobs.last_run_at) {
+              <time [attr.datetime]="jobs.last_run_at" [attr.title]="absoluteTime(jobs.last_run_at)">
+                {{ relativeTime(jobs.last_run_at) }}
+              </time>
+            } @else if (jobs.mode) {
+              <span class="muted">{{ 'settings.cloud.jobs.never' | transloco }}</span>
+            } @else {
+              <span class="muted">{{ 'settings.cloud.unknown' | transloco }}</span>
+            }
+            @if (jobs.stale) {
+              <app-badge tone="warning" size="xs">{{ 'settings.cloud.jobs.stale' | transloco }}</app-badge>
+            }
+          </dd>
+
+          @if (jobs.cron_container !== null) {
+            <dt>{{ 'settings.cloud.jobs.cronContainer' | transloco }}</dt>
+            <dd data-fact="cron-container">
+              {{ (jobs.cron_container ? 'settings.cloud.jobs.cronOn' : 'settings.cloud.jobs.cronOff') | transloco }}
+            </dd>
+          }
+
+          @if (p.retention; as retention) {
+            @if (retention.source === 'chart') {
+              <dt>{{ 'settings.cloud.jobs.trashbin' | transloco }}</dt>
+              <dd data-fact="trashbin"><code>{{ retention.trashbin ?? '—' }}</code></dd>
+
+              <dt>{{ 'settings.cloud.jobs.versions' | transloco }}</dt>
+              <dd data-fact="versions"><code>{{ retention.versions ?? '—' }}</code></dd>
+            } @else {
+              <dt>{{ 'settings.cloud.jobs.retention' | transloco }}</dt>
+              <dd data-fact="retention" class="muted">{{ 'settings.cloud.jobs.retentionExternal' | transloco }}</dd>
+            }
+          }
+        </dl>
+
+        @if (p.retention?.source === 'chart') {
+          <p class="retention-note" data-note="retention">
+            {{ 'settings.cloud.jobs.retentionChart' | transloco }}
+            @if (retentionDisabled(p)) {
+              {{ 'settings.cloud.jobs.retentionDisabled' | transloco }}
+            }
+          </p>
+        }
+
+        @if (jobs.stale) {
+          <p class="helm-note" data-jobs="stale">{{ 'settings.cloud.jobs.staleNote' | transloco }}</p>
+        }
       }
 
       <h3 class="matrix-title">{{ 'settings.cloud.matrixTitle' | transloco }}</h3>
@@ -269,9 +346,20 @@ const HELM_TONE: Record<MainCloudHelmState, BadgeTone> = {
         color: var(--text-secondary);
       }
 
-      .matrix-title {
+      .matrix-title,
+      .section-title {
         margin: 8px 0 0;
         font-size: 0.95rem;
+      }
+
+      .facts.stale [data-fact='last-run'] time {
+        color: var(--warning);
+      }
+
+      .retention-note {
+        margin: 0;
+        font-size: 0.8rem;
+        color: var(--text-muted);
       }
 
       .matrix-desc {
@@ -355,6 +443,12 @@ export class MainCloudSettingsComponent implements OnInit {
 
   readonly page = signal<MainCloudPage | null>(null);
   readonly loadFailed = signal(false);
+  /**
+   * When the page arrived: relative times are as of then (Refresh renews
+   * them), so a label never changes between dev mode's two
+   * change-detection passes (NG0100).
+   */
+  private readonly loadedAt = signal(Date.now());
 
   ngOnInit(): void {
     this.load();
@@ -363,7 +457,10 @@ export class MainCloudSettingsComponent implements OnInit {
   load(): void {
     this.loadFailed.set(false);
     this.settingsService.getMainCloud().subscribe({
-      next: (page) => this.page.set(page),
+      next: (page) => {
+        this.loadedAt.set(Date.now());
+        this.page.set(page);
+      },
       error: () => this.loadFailed.set(true),
     });
   }
@@ -389,8 +486,32 @@ export class MainCloudSettingsComponent implements OnInit {
 
   protected activatedAt(page: MainCloudPage): string {
     const value = page.provider.activated_at;
-    if (!value) return '';
+    return value ? this.absoluteTime(value) : '';
+  }
+
+  protected absoluteTime(value: string): string {
     const date = new Date(value);
     return Number.isNaN(date.getTime()) ? value : date.toLocaleString();
+  }
+
+  /** "3 minutes ago" in the active language, as of when the page loaded. */
+  protected relativeTime(value: string): string {
+    const time = new Date(value).getTime();
+    if (Number.isNaN(time)) return value;
+    // A moment slightly ahead of this browser's clock is "now", not "in 5 seconds".
+    const seconds = Math.min(0, Math.trunc((time - this.loadedAt()) / 1000));
+    const [unit, size] =
+      RELATIVE_UNITS.find(([, length]) => -seconds >= length) ?? RELATIVE_UNITS[3];
+    const format = new Intl.RelativeTimeFormat(this.transloco.getActiveLang(), {numeric: 'auto'});
+    return format.format(Math.trunc(seconds / size), unit);
+  }
+
+  /** Whether the chart pins either retention to `disabled` (never expire). */
+  protected retentionDisabled(page: MainCloudPage): boolean {
+    const retention = page.retention;
+    return (
+      retention?.source === 'chart' &&
+      (retention.trashbin === 'disabled' || retention.versions === 'disabled')
+    );
   }
 }
