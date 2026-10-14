@@ -465,7 +465,7 @@ def test_permissions_guide_keeps_current_policy_and_workspace_boundaries():
         "automations & loops",
     ):
         assert f"**{group}**" in body
-    assert "admin → grants" in body
+    assert "settings → grants" in body
     assert "do not recommend switching to autonomous" in body
 
 
