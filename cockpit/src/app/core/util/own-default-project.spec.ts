@@ -19,4 +19,22 @@ describe('pickOwnDefaultProject', () => {
       ]),
     ).toBeUndefined();
   });
+
+  it("prefers the caller's own default_project_id over a co-owned colleague default", () => {
+    const projects = [
+      {id: 'colleague', is_default: true, user_role: 'owner' as const},
+      {id: 'mine', is_default: true, user_role: 'owner' as const},
+    ];
+    expect(pickOwnDefaultProject(projects, 'mine')?.id).toBe('mine');
+  });
+
+  it('falls back to the owner rule when the id is absent or not in the list', () => {
+    const projects = [
+      {id: 'colleague', is_default: true, user_role: 'owner' as const},
+      {id: 'mine', is_default: true, user_role: 'owner' as const},
+    ];
+    expect(pickOwnDefaultProject(projects, null)?.id).toBe('colleague');
+    expect(pickOwnDefaultProject(projects, undefined)?.id).toBe('colleague');
+    expect(pickOwnDefaultProject(projects, 'gone')?.id).toBe('colleague');
+  });
 });

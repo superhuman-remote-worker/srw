@@ -273,7 +273,7 @@ describe('JobCreateComponent project picker', () => {
           },
         },
         {provide: Router, useValue: {navigate: vi.fn()}},
-        {provide: UserService, useValue: {currentUserId: signal('user-1')}},
+        {provide: UserService, useValue: {currentUserId: signal('user-1'), currentUser: signal(null)}},
         {provide: ErrorMessageService, useValue: errors},
         {provide: ModelService, useValue: {load: vi.fn()}},
         {

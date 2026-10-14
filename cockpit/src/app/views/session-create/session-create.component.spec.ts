@@ -155,7 +155,7 @@ describe('SessionCreateComponent framework defaults', () => {
         provideHttpClient(),
         provideHttpClientTesting(),
         {provide: Router, useValue: {navigate: vi.fn()}},
-        {provide: UserService, useValue: {currentUserId: signal<string | null>(null)}},
+        {provide: UserService, useValue: {currentUserId: signal<string | null>(null), currentUser: signal(null)}},
         {provide: ModelService, useValue: {load: vi.fn()}},
         {
           provide: ErrorMessageService,
@@ -233,7 +233,7 @@ describe('SessionCreateComponent submit flow', () => {
         provideHttpClient(),
         provideHttpClientTesting(),
         {provide: Router, useValue: {navigate}},
-        {provide: UserService, useValue: {currentUserId: signal<string | null>(null)}},
+        {provide: UserService, useValue: {currentUserId: signal<string | null>(null), currentUser: signal(null)}},
         {provide: ModelService, useValue: {load: vi.fn()}},
         {
           provide: ErrorMessageService,
@@ -463,7 +463,7 @@ describe('SessionCreateComponent — reasoning pick lost to an involuntary prefi
         provideHttpClient(),
         provideHttpClientTesting(),
         {provide: Router, useValue: {navigate: vi.fn()}},
-        {provide: UserService, useValue: {currentUserId: signal<string | null>(null)}},
+        {provide: UserService, useValue: {currentUserId: signal<string | null>(null), currentUser: signal(null)}},
         {provide: ModelService, useValue: modelServiceMock},
         {provide: ErrorMessageService, useValue: {translate: (_e: unknown, fallback: string) => fallback}},
         {
@@ -626,7 +626,7 @@ describe('SessionCreateComponent tool preview', () => {
         provideHttpClient(),
         provideHttpClientTesting(),
         {provide: Router, useValue: {navigate: vi.fn()}},
-        {provide: UserService, useValue: {currentUserId: signal<string | null>(null)}},
+        {provide: UserService, useValue: {currentUserId: signal<string | null>(null), currentUser: signal(null)}},
         {provide: ModelService, useValue: {load: vi.fn()}},
         {provide: ErrorMessageService, useValue: {translate: (_e: unknown, f: string) => f}},
         {
@@ -846,7 +846,7 @@ describe('SessionCreateComponent "Start a new session" prefill (session_config_d
       provideHttpClient(),
       provideHttpClientTesting(),
       {provide: Router, useValue: {navigate}},
-      {provide: UserService, useValue: {currentUserId: signal<string | null>('user-1')}},
+      {provide: UserService, useValue: {currentUserId: signal<string | null>('user-1'), currentUser: signal(null)}},
       {provide: ModelService, useValue: {load: vi.fn()}},
       {provide: ErrorMessageService, useValue: {translate: (_e: unknown, f: string) => f}},
       {

@@ -15,6 +15,7 @@ import {TranslocoService} from '@jsverse/transloco';
 import {draftTitleFrom, PersistentChatService} from './persistent-chat.service';
 import {ApiService} from './api.service';
 import {CapabilitiesService} from './capabilities.service';
+import {UserService} from './user.service';
 import {IndexedDbService} from './indexed-db.service';
 import {NotificationService} from './notification.service';
 import {AppToastService} from '../../ui/toast';
@@ -313,6 +314,25 @@ describe('PersistentChatService — instant-landing draft sessions', () => {
         await only.service.sendMessage('hello');
         await flushTick();
         expect(createPosts(only)[0][1]).not.toHaveProperty('project_ids');
+    });
+
+    it("prefers the caller's own default_project_id over a co-owned colleague default", async () => {
+        const ctx = createService({
+            projects: [
+                {id: 'p-colleague', is_default: true, user_role: 'owner'},
+                {id: 'p-mine', is_default: true, user_role: 'owner'},
+            ],
+        });
+        TestBed.inject(UserService).currentUser.set({
+            id: 'u1', display_name: 'Me', avatar_color: 'x', default_project_id: 'p-mine',
+        });
+        ctx.service.enterDraftSession();
+        await flushTick();
+
+        expect(ctx.mockHttp.post).toHaveBeenCalledWith(
+            expect.stringContaining('/persistent/threads/preview'),
+            {project_ids: ['p-mine'], use_datasource_defaults: true},
+        );
     });
 
     it('omits project_ids when there is no default project', async () => {

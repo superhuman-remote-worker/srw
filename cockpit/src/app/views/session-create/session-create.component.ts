@@ -655,7 +655,7 @@ export class SessionCreateComponent implements OnInit {
       }
       // The source thread had no project at all: fall through to the personal project.
     }
-    const defaultProject = pickOwnDefaultProject(projects);
+    const defaultProject = pickOwnDefaultProject(projects, this.userService.currentUser()?.default_project_id);
     if (defaultProject) {
       this.selectedProjectIds.set(new Set([defaultProject.id]));
       // Refresh eligible datasources now that a project is selected.

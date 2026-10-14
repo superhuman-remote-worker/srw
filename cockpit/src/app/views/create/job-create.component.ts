@@ -1497,7 +1497,7 @@ export class JobCreateComponent implements OnInit {
    *  list because the user named it explicitly. */
   private selectDefaultProject(projects: Project[]): void {
     const selectable = projects.filter((p) => p.status !== 'archived');
-    const defaultProject = pickOwnDefaultProject(selectable);
+    const defaultProject = pickOwnDefaultProject(selectable, this.userService.currentUser()?.default_project_id);
     this.selectedProjectId.set(defaultProject?.id ?? selectable[0]?.id ?? null);
   }
 

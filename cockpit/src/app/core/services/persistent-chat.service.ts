@@ -68,6 +68,7 @@ import {
 } from './persistent-thread-transport-bridge.service';
 import { CanvasService } from './canvas.service';
 import { CapabilitiesService } from './capabilities.service';
+import { UserService } from './user.service';
 import {
   CloudFolderBinding,
   CloudFolderProblem,
@@ -720,6 +721,7 @@ export class PersistentChatService {
   private readonly threadTransport = inject(PersistentThreadTransportBridge);
   private readonly canvas = inject(CanvasService);
   private readonly capabilities = inject(CapabilitiesService);
+  private readonly userService = inject(UserService);
   /** Uploads started when a file was ATTACHED, before the user committed to
    *  sending it (knowledge-base/knowledge/features/session_attachment_send_flow.md §5.4). Owned
    *  by a root service, not this one: an uncommitted upload has a different
@@ -2580,7 +2582,7 @@ export class PersistentChatService {
         }),
       );
       if (generation !== this.draftDefaultsGeneration || !this.isDraftSession()) return;
-      const defaultProject = pickOwnDefaultProject(projects);
+      const defaultProject = pickOwnDefaultProject(projects, this.userService.currentUser()?.default_project_id);
       this.draftProjectIds = defaultProject ? [defaultProject.id] : [];
       this.draftProjectId.set(this.draftProjectIds?.[0] ?? null);
       const body = this.draftCreationContext();
