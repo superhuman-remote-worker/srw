@@ -2481,6 +2481,7 @@ def _pinned_retirement_local_quiescence_matches(
         and context.get("runtime_attach_token") is None
     )
     from shared.pinned_vm_creation_retirement import (
+        bound_vm_without_source,
         initial_vm_creation_retirement_source,
         pre_registration_vm_agent_zero_source,
     )
@@ -2491,12 +2492,14 @@ def _pinned_retirement_local_quiescence_matches(
     # admission. The database independently requires no VM source, retry,
     # waiter, or other VM authority before accepting this receipt.
     pre_registration_vm_without_vm = pre_registration_vm_agent_zero_source(context)
+    bound_vm_no_source = bound_vm_without_source(context)
     workspace_create_pending = bool(workspace_provision_intent)
     if (
         pre_provision_intent_zero
         or workspace_create_pending
         or vm_creation_zero
         or pre_registration_vm_without_vm
+        or bound_vm_no_source
     ):
         expected_protocol = "agent_runtime_zero_v1"
     elif backend == "sandbox":
@@ -2526,6 +2529,7 @@ def _pinned_retirement_local_quiescence_matches(
         or workspace_create_pending
         or vm_creation_zero
         or pre_registration_vm_without_vm
+        or bound_vm_no_source
         else vm.get("provision_generation")
         if backend in {"vm", "remote"}
         else sandbox_generation
@@ -2538,6 +2542,7 @@ def _pinned_retirement_local_quiescence_matches(
         or workspace_create_pending
         or vm_creation_zero
         or pre_registration_vm_without_vm
+        or bound_vm_no_source
         else vm.get("vm_uid")
         if backend in {"vm", "remote"}
         else sandbox_runtime
@@ -2548,6 +2553,7 @@ def _pinned_retirement_local_quiescence_matches(
         not pre_provision_intent_zero
         and not vm_creation_zero
         and not pre_registration_vm_without_vm
+        and not bound_vm_no_source
         and backend in {"vm", "remote"}
         and (not expected_workspace_generation or not expected_workspace_runtime)
     ):
@@ -2579,6 +2585,16 @@ def _pinned_retirement_local_quiescence_matches(
             or (
                 receipt.get("vm_creation_request_id") is None
                 and receipt.get("vm_creation_provision_generation") is None
+            )
+        )
+        and (
+            not bound_vm_no_source
+            or (
+                receipt.get("quiescence_actor") == "orchestrator"
+                and receipt.get("vm_creation_request_id") is None
+                and receipt.get("vm_creation_provision_generation") is None
+                and receipt.get("agent_pod_name") == agent_pod.get("pod_name")
+                and receipt.get("agent_pod_uid") == agent_pod.get("pod_uid")
             )
         )
         and str(receipt.get("settle_status") or "") == final_status
@@ -26342,7 +26358,7 @@ class PostgresDB:
                 row = await conn.fetchrow(
                     "SELECT status,execution_lane,runtime_generation,"
                     "runtime_retirement_token,agent_id,runtime_attach_token,metadata,"
-                    "pinned_idle_terminal_intent_at "
+                    "pinned_idle_terminal_intent_at,runtime_attach_abort_receipt "
                     "FROM threads WHERE id=$1::uuid FOR UPDATE",
                     parsed_thread,
                 )
@@ -26436,11 +26452,30 @@ class PostgresDB:
                         "SELECT EXISTS(SELECT 1 FROM vm_creation_retries WHERE thread_id=$1) "
                         "OR EXISTS(SELECT 1 FROM vm_idle_operations WHERE owner_kind='thread' AND owner_id=$1) "
                         "OR EXISTS(SELECT 1 FROM thread_runtime_retirement_outcomes WHERE thread_id=$1) "
-                        "OR EXISTS(SELECT 1 FROM thread_runtime_attach_abort_outcomes WHERE thread_id=$1) "
                         "OR EXISTS(SELECT 1 FROM thread_workspace_provision_intents WHERE thread_id=$1) "
                         "OR EXISTS(SELECT 1 FROM srw_execution_workspace_bindings WHERE execution_id=$2)",
                         parsed_thread,
                         execution["id"],
+                    ):
+                        return False
+                    from orchestrator.services.vm_initial_no_payload_history import (
+                        initial_vm_no_payload_history_allows,
+                    )
+
+                    abort_outcomes = await conn.fetch(
+                        "SELECT thread_id,runtime_generation,runtime_attach_token,"
+                        "agent_id,agent_pod_uid,successor_generation,release_kind,"
+                        "quiescence_protocol,workspace_generation,"
+                        "workspace_runtime_incarnation FROM "
+                        "thread_runtime_attach_abort_outcomes WHERE thread_id=$1 "
+                        "LIMIT 4097",
+                        parsed_thread,
+                    )
+                    if not initial_vm_no_payload_history_allows(
+                        thread_id=parsed_thread,
+                        current_generation=parsed_runtime_generation,
+                        receipt=row["runtime_attach_abort_receipt"],
+                        outcomes=[dict(outcome) for outcome in abort_outcomes],
                     ):
                         return False
                     if not preparation_only:
@@ -44487,6 +44522,7 @@ class PostgresDB:
                     or ""
                 )
                 from shared.pinned_vm_creation_retirement import (
+                    bound_vm_without_source,
                     initial_vm_creation_retirement_source,
                 )
 
@@ -44499,7 +44535,43 @@ class PostgresDB:
                         parsed_retirement,
                     )
                 )
-                if workspace_provision_intent or vm_creation_zero:
+                bound_vm_no_source = bound_vm_without_source(context)
+                if bound_vm_no_source:
+                    if (
+                        quiescence_actor != "orchestrator"
+                        or not expected_agent_pod_uid
+                        or str(agent_pod.get("pod_uid") or "") != expected_agent_pod_uid
+                    ):
+                        return None
+                    # This is a bound actor, even if the caller omitted the
+                    # optional zero-admission request. No issued input or
+                    # control may be turned into an Agent-only zero proof.
+                    if not require_zero_admission:
+                        if (
+                            str(row["status"] or "") not in {"created", "active"}
+                            or row["runtime_authority_exposed"] is not True
+                        ):
+                            return None
+                        used_input = await conn.fetchval(
+                            "SELECT EXISTS (SELECT 1 FROM thread_input_deliveries "
+                            "WHERE thread_id=$1::uuid AND owner_agent_id=$2::uuid "
+                            "AND owner_pod_uid=$3 "
+                            "AND (state IN ('admitted','settled') "
+                            "OR ($4::boolean AND state='queued')))",
+                            parsed_thread,
+                            parsed_agent,
+                            expected_agent_pod_uid,
+                            str(row["status"] or "") == "active",
+                        )
+                        admitted_control = await conn.fetchval(
+                            "SELECT EXISTS (SELECT 1 FROM thread_control_requests "
+                            "WHERE thread_id=$1::uuid AND runtime_generation=$2::uuid)",
+                            parsed_thread,
+                            parsed_generation,
+                        )
+                        if used_input or admitted_control:
+                            return None
+                if workspace_provision_intent or vm_creation_zero or bound_vm_no_source:
                     expected_protocol = "agent_runtime_zero_v1"
                 elif workspace_backend == "sandbox":
                     if bool(sandbox_generation) != bool(sandbox_runtime):
@@ -44526,7 +44598,7 @@ class PostgresDB:
                     }.get(workspace_backend)
                 if expected_protocol != expected_quiescence_protocol:
                     return None
-                if workspace_provision_intent or vm_creation_zero:
+                if workspace_provision_intent or vm_creation_zero or bound_vm_no_source:
                     captured_workspace_generation = ""
                     captured_workspace_runtime = ""
                 elif workspace_backend == "sandbox":
@@ -44578,6 +44650,11 @@ class PostgresDB:
                             "provision_generation"
                         ],
                     )
+                if bound_vm_no_source:
+                    receipt.update(
+                        agent_pod_name=agent_pod["pod_name"],
+                        agent_pod_uid=agent_pod["pod_uid"],
+                    )
                 if existing is not None:
                     # Agent and orchestrator recovery may race after the exact
                     # agent Pod is stopped. Their physical proof is identical;
@@ -44590,10 +44667,22 @@ class PostgresDB:
                     existing_actor = existing_comparable.pop("quiescence_actor", None)
                     return (
                         existing
-                        if existing_actor in {"agent", "orchestrator"}
+                        if existing_actor
+                        in (
+                            {"orchestrator"}
+                            if bound_vm_no_source
+                            else {"agent", "orchestrator"}
+                        )
                         and existing_comparable == comparable
                         else None
                     )
+                if bound_vm_no_source and not await conn.fetchval(
+                    "SELECT public.pinned_vm_bound_no_vm_source($1,$2,$3)",
+                    parsed_thread,
+                    parsed_generation,
+                    parsed_retirement,
+                ):
+                    return None
                 updated = await conn.execute(
                     "UPDATE threads SET "
                     "runtime_retirement_local_quiescence=$6::jsonb "

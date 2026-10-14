@@ -110,3 +110,105 @@ def pre_registration_vm_agent_zero_source(context):
         and bool(claim.get("pvc_name"))
         and bool(claim.get("pvc_uid"))
     )
+
+
+def bound_vm_without_source(context) -> bool:
+    """Recognize one created, bound VM life with only an exact Agent Pod.
+
+    This frozen shape is necessary but never sufficient to grant process zero:
+    the database separately joins the current reciprocal actor and Pod to its
+    durable protection source and rejects every VM or admission obligation.
+    """
+
+    if not isinstance(context, Mapping) or (
+        type(context.get("version")) is not int
+        or context.get("version") != 1
+        or context.get("workspace_backend") != "vm"
+        or context.get("entry_status") != "created"
+        or context.get("settle_status") != "ended"
+        or context.get("runtime_authority_exposed") is not True
+        or context.get("vm") is not None
+        or context.get("vm_creation_source") is not None
+        or context.get("workspace_binding") not in (None, {})
+        or context.get("workspace_provision_intent") not in (None, {})
+        or context.get("agent_pod_provision_intent") not in (None, {})
+        or context.get("protected_ro") not in (None, {})
+        or context.get("protected_cloud") not in (None, False)
+        or context.get("protected_cloud_state") not in (None, "off")
+        or context.get("retained_soft_workspace") is not None
+    ):
+        return False
+    workspace = context.get("workspace_container")
+    if workspace is not None and (
+        not isinstance(workspace, Mapping)
+        or set(workspace) - {"repo_name", "git_remote_url"}
+    ):
+        return False
+    try:
+        thread_id = str(UUID(context["thread_id"]))
+        generation = str(UUID(context["generation"]))
+        agent_id = str(UUID(context["agent_id"]))
+        attach_token = str(UUID(context["runtime_attach_token"]))
+    except (KeyError, TypeError, ValueError, AttributeError):
+        return False
+    if (
+        thread_id != context["thread_id"]
+        or generation != context["generation"]
+        or agent_id != context["agent_id"]
+        or attach_token != context["runtime_attach_token"]
+        or context.get("control_admission_agent_id") not in (agent_id, None)
+    ):
+        return False
+    agent = context.get("agent")
+    pod = context.get("agent_pod")
+    if not isinstance(agent, Mapping) or not isinstance(pod, Mapping):
+        return False
+    if not (
+        agent.get("id") == agent_id
+        and agent.get("thread_id") == thread_id
+        and isinstance(agent.get("hostname"), str)
+        and bool(agent["hostname"])
+        and isinstance(agent.get("pod_uid"), str)
+        and bool(agent["pod_uid"])
+        and pod.get("pod_name") == agent["hostname"]
+        and pod.get("pod_uid") == agent["pod_uid"]
+        and isinstance(pod.get("namespace"), str)
+        and bool(pod["namespace"])
+        and pod.get("runtime_generation") == generation
+        and pod.get("protection_protocol") == "finalizer_v1"
+    ):
+        return False
+    claim = context.get("agent_workspace_claim")
+    if claim not in (None, {}):
+        if not isinstance(claim, Mapping):
+            return False
+        try:
+            for field in (
+                "claim_id",
+                "thread_id",
+                "created_runtime_generation",
+                "create_attempt",
+            ):
+                if str(UUID(str(claim[field]))) != claim[field]:
+                    return False
+        except (KeyError, TypeError, ValueError, AttributeError):
+            return False
+        if not (
+            claim.get("status") == "ready"
+            and claim.get("provisioner") in {"agent", "persistent"}
+            and claim.get("thread_id") == thread_id
+            and claim.get("created_runtime_generation") == generation
+            and claim.get("namespace") == pod["namespace"]
+            and claim.get("protection_protocol") == "finalizer_v1"
+            and bool(claim.get("pvc_name"))
+            and bool(claim.get("pvc_uid"))
+        ):
+            return False
+    route = context.get("route")
+    if route not in (None, {}):
+        if not isinstance(route, Mapping) or (
+            route.get("owner_pod_uid") != pod["pod_uid"]
+            or route.get("namespace") != pod["namespace"]
+        ):
+            return False
+    return True
