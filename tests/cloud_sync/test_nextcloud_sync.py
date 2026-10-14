@@ -343,3 +343,60 @@ async def test_depth_infinity_client_never_sends_a_cookie(tmp_path, monkeypatch)
     finally:
         await sync.aclose()
     assert seen == [None, None]
+
+
+# webdav_disable_check: the HEAD probes are gone, the 404 semantics are not.
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", [201, 405])
+async def test_mkdir_sends_one_mkcol_and_no_parent_probe(tmp_path, status):
+    sync = _real_sync(tmp_path)
+    adapter = _mount(sync, {("MKCOL", f"{_BASE}/a/b/"): (status, {}, b"")})
+    await sync._ensure_remote_dir("a/b")  # 405 = already there, not an error
+    assert [(m, p) for m, p, _c in adapter.seen] == [("MKCOL", f"{_BASE}/a/b/")]
+
+
+@pytest.mark.asyncio
+async def test_mkdir_under_a_missing_parent_is_a_swallowed_409(tmp_path):
+    sync = _real_sync(tmp_path)
+    adapter = _mount(sync, {("MKCOL", f"{_BASE}/a/"): (409, {}, b"")})
+    with pytest.raises(Exception) as excinfo:
+        await sync._ensure_remote_dir("a")
+    assert getattr(excinfo.value, "code", None) == 409
+    await sync._ensure_remote_dirs("a")  # the algorithm swallows it, as before
+    assert [m for m, _p, _c in adapter.seen] == ["MKCOL", "MKCOL"]
+
+
+@pytest.mark.asyncio
+async def test_a_404_still_reads_as_missing_without_a_head_probe(tmp_path):
+    sync = _real_sync(tmp_path)
+    adapter = _mount(sync, {})
+    assert await sync._remote_etag("gone.txt") is None
+    with pytest.raises(Exception) as listed:
+        await sync._list_remote_files("gone")
+    assert type(listed.value).__name__ == "RemoteResourceNotFound"
+    assert sync._marker_missing(listed.value)
+    marker = await sync.read_sync_generation_marker(
+        thread_id="t", sync_scope_sha256="a" * 64
+    )
+    assert marker is None
+    methods = [m for m, _p, _c in adapter.seen]
+    assert methods == ["PROPFIND", "PROPFIND", "PROPFIND"]
+
+
+@pytest.mark.asyncio
+async def test_download_is_two_propfinds_and_a_get(tmp_path):
+    sync = _real_sync(tmp_path)
+    href = f"{_BASE}/a.txt"
+    adapter = _mount(
+        sync,
+        {
+            ("PROPFIND", href): (207, {}, _multistatus(href).encode()),
+            ("GET", href): (200, {}, b"payload"),
+        },
+    )
+    out = tmp_path / "out.txt"
+    await sync._download_file("a.txt", str(out))
+    assert out.read_bytes() == b"payload"
+    assert [m for m, _p, _c in adapter.seen] == ["PROPFIND", "PROPFIND", "GET"]

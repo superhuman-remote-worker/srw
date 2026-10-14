@@ -149,6 +149,13 @@ class NextcloudWorkspaceSync(WorkspaceSyncBase):
                     "webdav_hostname": self._webdav_url.rstrip("/"),
                     "webdav_login": self._webdav_user,
                     "webdav_password": self._webdav_password,
+                    # No HEAD existence probe before mkdir/info/list/download
+                    # (a download was 6 requests, now 3). A missing resource
+                    # is still a 404 -> RemoteResourceNotFound, which
+                    # _marker_missing relies on; a missing mkdir parent is a
+                    # 409 instead of RemoteParentNotFound, and
+                    # _ensure_remote_dirs treats both alike.
+                    "webdav_disable_check": True,
                 }
             )
             # Echoing Nextcloud's one non-Secure cookie (``cookie_test``)
