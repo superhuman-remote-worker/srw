@@ -202,7 +202,7 @@ const DISCOVERABLE_PROVIDERS: ReadonlySet<string> = new Set([
                   <p class="empty-state">
                     The provider returned no models — your key may lack the
                     necessary scope, or the listing endpoint is unavailable.
-                    Add models manually via Admin → Models.
+                    Add models manually via Settings → Models → Catalog.
                   </p>
                 } @else {
                   <p class="muted">

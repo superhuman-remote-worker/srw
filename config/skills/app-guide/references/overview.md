@@ -55,14 +55,15 @@ The sidebar:
 
 The **Inbox** is where everything that needs *you* collects: job reviews,
 questions from agents, and permission requests — with approve/deny/reply
-right there. Admins additionally get **Admin** pages (LLM providers and
-models, users, configuration, capability grants, usage and cost).
+right there. Admins additionally get an Administration group inside Settings (LLM
+providers and models, users, configuration, capability grants, usage and cost).
 
 ## Your first fifteen minutes
 
 1. **Check Settings first** — agents need language-model access. If your
    deployment doesn't provide it centrally, add a provider key under
-   **Settings → API Keys**, and pick default models under Preferences.
+   **Settings → Provider keys**, and pick default models under
+   **Settings → Defaults**.
 2. **Start a session** (Sessions → New Session). The initial application
    default is Assistant, but project, personal, or operator defaults may
    replace it. Ask for something real—research a question or draft a document.

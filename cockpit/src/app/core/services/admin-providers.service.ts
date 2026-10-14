@@ -76,7 +76,7 @@ export interface HelmManagedOverview {
 
 /**
  * Admins can pin cluster-wide defaults for each of these slots via the
- * Admin → Providers → Defaults section. Keep this in sync with the
+ * Settings → Models → Defaults section. Keep this in sync with the
  * orchestrator's `VALID_DEFAULT_MODEL_KINDS` — unknown kinds are rejected
  * server-side. The `chat` slot is the cluster-wide chat default used by
  * the dispatcher when a job/session has no override; surfacing it here

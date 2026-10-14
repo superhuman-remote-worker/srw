@@ -861,7 +861,7 @@ export interface LlmEndpointUpdateRequest {
 
 /**
  * Response from an endpoint test-connection probe (server-side
- * `GET {base_url}/models`). Used by Admin → Providers.
+ * `GET {base_url}/models`). Used by Settings → Models → Providers.
  */
 export interface LlmEndpointTestResult {
   ok: boolean;
@@ -872,7 +872,7 @@ export interface LlmEndpointTestResult {
 
 /**
  * A single model surfaced by `GET {base_url}/models` via the admin discovery
- * endpoint. Used by Admin → Models as a quick-fill helper when the admin has
+ * endpoint. Used by Settings → Models as a quick-fill helper when the admin has
  * picked a system endpoint as the catalog row's transport.
  *
  * `capability_hints` is the array of suggested capabilities — chat-capable
@@ -895,7 +895,7 @@ export interface LlmEndpointDiscoveryResult {
 }
 
 /**
- * One row in the Admin → Providers post-save discovery dialog. Comes from
+ * One row in the Settings → Models → Providers post-save discovery dialog. Comes from
  * the orchestrator's `discover_models()` per-provider clients (OpenAI,
  * Google, Groq, OpenRouter); Anthropic + the env-bridge `vision` provider
  * never produce these — admins add those models manually.
@@ -932,7 +932,7 @@ export interface DiscoveryResponse {
 }
 
 // =============================================================================
-// Models Catalog (Admin → Models)
+// Models Catalog (Settings → Models)
 // =============================================================================
 
 /** Locked enum for catalog rows. Adding a capability requires schema + resolver work. */
