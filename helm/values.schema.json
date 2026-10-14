@@ -801,6 +801,22 @@
         }
       }
     },
+    "trust": {
+      "type": "object",
+      "properties": {
+        "extraCaCertificates": {
+          "type": "string"
+        },
+        "existingConfigMap": {
+          "type": "string"
+        },
+        "existingConfigMapKey": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "additionalProperties": false
+    },
     "secrets": {
       "type": "object",
       "properties": {

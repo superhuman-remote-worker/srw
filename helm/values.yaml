@@ -1779,6 +1779,24 @@ secrets:
   # -- Separate existing secret for VM SSH key (optional)
   existingVmSshKeySecret: ""
 
+# =============================================================================
+# Trust — extra CA certificates for outbound HTTPS
+# =============================================================================
+# Certificates the platform trusts on top of the public roots, for a service
+# whose certificate comes from a private or self-signed CA: typically an
+# on-premises model API added under Admin → Models. Mounted into the
+# orchestrator, every agent pod and every container workspace (whose
+# entrypoint adds it to the system store). Certificate verification is never
+# switched off; without this, such an endpoint fails its TLS handshake.
+trust:
+  # -- PEM, one or more certificates (-----BEGIN CERTIFICATE----- …). The chart
+  # puts it into the ConfigMap <fullname>-trust-ca.
+  extraCaCertificates: ""
+  # -- Or a ConfigMap you manage (for example one cert-manager's trust-manager
+  # writes). Set one of the two.
+  existingConfigMap: ""
+  existingConfigMapKey: ca.crt
+
 # -- Mode 1: External Secrets Operator (Vault-backed)
 externalSecrets:
   enabled: false

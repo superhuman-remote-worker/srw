@@ -749,6 +749,37 @@ openssl rand -base64 48  # IDE_CREDENTIAL_KEY
 
 ---
 
+## Private CA certificates
+
+An on-premises model API (or any other HTTPS service SRW calls) may use a
+certificate from your own CA. Give the chart that CA; SRW then verifies the
+service against it. Certificate verification is never switched off, and the
+public roots stay trusted.
+
+```yaml
+trust:
+  extraCaCertificates: |
+    -----BEGIN CERTIFICATE-----
+    …your CA, one or more certificates…
+    -----END CERTIFICATE-----
+  # or a ConfigMap you manage, for example one trust-manager writes:
+  # existingConfigMap: university-roots
+  # existingConfigMapKey: ca.crt
+```
+
+```bash
+helm upgrade srw … -f values.yaml --set-file trust.extraCaCertificates=university-ca.pem
+```
+
+The certificates reach the orchestrator (model discovery, the catalog
+**Test** action, the knowledge-base indexer), every agent pod (inference,
+embeddings, rerank, vision) and every container workspace, whose entrypoint
+adds them to the system store for `curl`, `git` and OpenSSL. VM workspaces do
+not receive them. Then add the API under **Admin → Models** with its `https://`
+address.
+
+---
+
 ## Workspace defaults
 
 These values decide what a Job or Session gets when nobody names a workspace.

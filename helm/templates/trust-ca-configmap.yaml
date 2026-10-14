@@ -1,0 +1,23 @@
+{{- /*
+Extra CA certificates for outbound HTTPS (values `trust.*`). Public data, so a
+ConfigMap. Mounted by the orchestrator, the agent pods and the workspaces.
+*/ -}}
+{{- $trust := .Values.trust | default dict }}
+{{- if and $trust.extraCaCertificates $trust.existingConfigMap }}
+{{- fail "trust: set extraCaCertificates or existingConfigMap, not both" }}
+{{- end }}
+{{- if $trust.extraCaCertificates }}
+{{- if not (contains "-----BEGIN CERTIFICATE-----" $trust.extraCaCertificates) }}
+{{- fail "trust.extraCaCertificates must hold PEM certificates (-----BEGIN CERTIFICATE----- …)" }}
+{{- end }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "srw.trustCaConfigMapName" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "srw.componentLabels" (dict "context" . "component" "trust-ca") | nindent 4 }}
+data:
+  ca.crt: |
+    {{- $trust.extraCaCertificates | trim | nindent 4 }}
+{{- end }}

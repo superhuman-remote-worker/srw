@@ -98,6 +98,29 @@ VM SSH key secret name.
 {{- end }}
 
 {{/*
+Extra CA trust (values `trust.*`): the ConfigMap holding the operator's PEM
+bundle, or "" when none is configured. Consumers mount it at
+/etc/srw/trust/ca.crt (src/shared/tls_trust.py).
+*/}}
+{{- define "srw.trustCaConfigMapName" -}}
+{{- $trust := .Values.trust | default dict -}}
+{{- if $trust.existingConfigMap -}}
+{{- $trust.existingConfigMap -}}
+{{- else if $trust.extraCaCertificates -}}
+{{- printf "%s-trust-ca" (include "srw.fullname" . | trunc 54 | trimSuffix "-") -}}
+{{- end -}}
+{{- end }}
+
+{{- define "srw.trustCaConfigMapKey" -}}
+{{- $trust := .Values.trust | default dict -}}
+{{- if $trust.existingConfigMap -}}
+{{- $trust.existingConfigMapKey | default "ca.crt" -}}
+{{- else -}}
+ca.crt
+{{- end -}}
+{{- end }}
+
+{{/*
 ConfigMap name (used by all deployments that read from the shared configmap).
 */}}
 {{- define "srw.configMapName" -}}

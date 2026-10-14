@@ -62,6 +62,9 @@ spec:
         # Native admission reads these values at startup. Operator changes must
         # replace the process even when the optional Reloader is disabled.
         checksum/manifest-hosting: {{ toJson .Values.manifestHosting | sha256sum | quote }}
+        # The CA is read once at startup, by this process and by every pod
+        # the provisioners build afterwards.
+        checksum/trust-ca: {{ toJson (.Values.trust | default dict) | sha256sum | quote }}
         checksum/workspace-cleanup-reconciliation: {{ dict "enabled" $workspaceCleanupProtocol | toJson | sha256sum | quote }}
         # Activation and deactivation must replace every orchestrator even
         # without Reloader. This switch only admits new v1 startup receipts.
@@ -2214,6 +2217,18 @@ spec:
             - name: AGENT_SSH_GATEWAY_HOST_KEY_SECRET
               value: {{ .Values.sshGateway.hostKeySecret | quote }}
             {{- end }}
+            {{- if include "srw.trustCaConfigMapName" . }}
+            # The operator's extra CA (values `trust.*`): this process trusts
+            # it (src/shared/tls_trust.py), and the provisioners mount the same
+            # ConfigMap into every agent and workspace pod. Appended at the end
+            # on purpose; see the note above.
+            - name: SRW_EXTRA_CA_FILE
+              value: /etc/srw/trust/ca.crt
+            - name: TRUST_CA_CONFIGMAP
+              value: {{ include "srw.trustCaConfigMapName" . | quote }}
+            - name: TRUST_CA_CONFIGMAP_KEY
+              value: {{ include "srw.trustCaConfigMapKey" . | quote }}
+            {{- end }}
           volumeMounts:
             - name: workspace
               mountPath: /workspace
@@ -2229,6 +2244,11 @@ spec:
             {{- if .Values.connectors.drivers.gitSwap.enabled }}
             - name: connector-driver-ca
               mountPath: /run/srw/connector-driver-ca
+              readOnly: true
+            {{- end }}
+            {{- if include "srw.trustCaConfigMapName" . }}
+            - name: srw-trust-ca
+              mountPath: /etc/srw/trust
               readOnly: true
             {{- end }}
           lifecycle:
@@ -2323,4 +2343,16 @@ spec:
                 path: tls.crt
               - key: tls.key
                 path: tls.key
+        {{- end }}
+        {{- if include "srw.trustCaConfigMapName" . }}
+        # The operator's extra CA (values `trust.*`). Not optional: a named
+        # ConfigMap that is missing should stop the pod, not leave the private
+        # endpoint failing its handshake later.
+        - name: srw-trust-ca
+          configMap:
+            name: {{ include "srw.trustCaConfigMapName" . }}
+            defaultMode: 0444
+            items:
+              - key: {{ include "srw.trustCaConfigMapKey" . | quote }}
+                path: ca.crt
         {{- end }}

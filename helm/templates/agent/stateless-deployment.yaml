@@ -81,6 +81,8 @@ spec:
         checksum/vm-workspace-recovery: {{ toJson .Values.orchestrator.vmWorkspaceRecovery | sha256sum | quote }}
         checksum/vm-job-cancel-retention: {{ dict "enabled" ((.Values.orchestrator.vmJobCancelRetention | default dict).enabled | default false) | toJson | sha256sum | quote }}
         checksum/vm-idle-release: {{ toJson .Values.orchestrator.vmIdleRelease | sha256sum | quote }}
+        # The extra CA is read once at process start (src/shared/tls_trust.py).
+        checksum/trust-ca: {{ toJson (.Values.trust | default dict) | sha256sum | quote }}
       {{- if .Values.agent.stateless.processZeroFinalizer }}
       # Retention boundary for claimant-loss settlement. A stolen claim's debt
       # settles only on the exact Pod UID observed with every container
@@ -191,6 +193,12 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.uid
+            {{- if include "srw.trustCaConfigMapName" . }}
+            # The operator's extra CA (values `trust.*`), as the provisioned
+            # agent pods receive it.
+            - name: SRW_EXTRA_CA_FILE
+              value: /etc/srw/trust/ca.crt
+            {{- end }}
           securityContext:
             runAsNonRoot: true
             runAsUser: 999
@@ -212,6 +220,11 @@ spec:
               mountPath: /run
             - name: home-srw
               mountPath: /home/srw
+            {{- if include "srw.trustCaConfigMapName" . }}
+            - name: srw-trust-ca
+              mountPath: /etc/srw/trust
+              readOnly: true
+            {{- end }}
           livenessProbe:
             httpGet:
               path: /health
@@ -273,4 +286,13 @@ spec:
         - name: home-srw
           emptyDir:
             sizeLimit: 512Mi
+        {{- if include "srw.trustCaConfigMapName" . }}
+        - name: srw-trust-ca
+          configMap:
+            name: {{ include "srw.trustCaConfigMapName" . }}
+            defaultMode: 0444
+            items:
+              - key: {{ include "srw.trustCaConfigMapKey" . | quote }}
+                path: ca.crt
+        {{- end }}
 {{- end }}
