@@ -2220,6 +2220,7 @@ def test_cloud_sandbox_renders_the_protected_effect_lane(tmp_path: Path) -> None
     ]
     assert containers == [
         "nextcloud",
+        "cron",
         "nextcloud-protected-effect-fpm",
         "nextcloud-protected-effect-nginx",
     ]
