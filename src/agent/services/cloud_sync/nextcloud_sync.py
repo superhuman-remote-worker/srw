@@ -152,9 +152,10 @@ class NextcloudWorkspaceSync(WorkspaceSyncBase):
         # (e.g. /remote.php/dav/files/user/folder/file.txt) — we strip
         # this prefix to normalize to paths relative to the session folder.
         self._webdav_base_path = urlparse(webdav_url).path.rstrip("/") + "/"
-        # One-shot tree listing (Depth: infinity PROPFIND). A server that
-        # refuses it is remembered so the per-dir walk isn't preceded by a
-        # doomed probe on every pull.
+        # One-shot tree listing (Depth: infinity PROPFIND). Nextcloud's DAV
+        # server always allows it (there is no setting); a server that
+        # refuses it anyway is remembered, so the per-dir walk isn't preceded
+        # by a doomed probe on every pull.
         self._http: Optional[Any] = None
         self._depth_infinity_unsupported = False
 
