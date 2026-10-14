@@ -12,12 +12,15 @@ import functools
 import hashlib
 from importlib.metadata import PackageNotFoundError, version
 import json
+import logging
 import os
 from pathlib import Path
 import platform
-from typing import Any, Literal
+import time
+from typing import Any, Callable, Literal, TypeVar
 from uuid import UUID
 
+import httpx
 from fastmcp import FastMCP
 from starlette.responses import JSONResponse
 
@@ -46,6 +49,47 @@ DatasourceAvailability = Literal["all", "projects", "unavailable"]
 
 from mcp_server.capabilities import TOOL_CAPABILITIES  # noqa: E402
 
+logger = logging.getLogger(__name__)
+
+_T = TypeVar("_T")
+
+
+def build_with_discovery_retry(
+    factory: Callable[[], _T],
+    *,
+    budget_s: float,
+    sleep: Callable[[float], None] = time.sleep,
+    clock: Callable[[], float] = time.monotonic,
+) -> _T:
+    """Run ``factory``, which fetches the OIDC discovery document, until it works.
+
+    During an install or upgrade Keycloak is often still starting (connection
+    refused, a 404 before the realm exists, a 503). Exiting on the first
+    failure turned that into a CrashLoopBackOff whose back-off outlasted
+    Keycloak's own start. Transport and HTTP errors are retried with capped
+    back-off for ``budget_s``, which stays inside the startup probe's window;
+    any other error (a configuration mistake) raises at once.
+    """
+    deadline = clock() + budget_s
+    delay = 2.0
+    while True:
+        try:
+            return factory()
+        except httpx.HTTPError as exc:
+            remaining = deadline - clock()
+            if remaining <= 0:
+                raise
+            wait = min(delay, remaining)
+            logger.warning(
+                "OIDC discovery failed (%s: %s); retrying in %.0fs",
+                type(exc).__name__,
+                exc,
+                wait,
+            )
+            sleep(wait)
+            delay = min(delay * 2, 15.0)
+
+
 # Conditional auth: HTTP transport uses token verification, stdio skips it
 _transport = os.environ.get("MCP_TRANSPORT", "http").lower()
 _auth = None
@@ -58,19 +102,22 @@ if _transport == "http":
         from mcp_server.oauth_bridge import SRWOAuthProxy
 
         _base_url = os.environ.get("MCP_BASE_URL", "http://localhost:8055")
-        _auth = SRWOAuthProxy(
-            config_url=os.environ.get(
-                "MCP_OIDC_CONFIG_URL",
-                "http://keycloak:8080/realms/srw/.well-known/openid-configuration",
+        _auth = build_with_discovery_retry(
+            lambda: SRWOAuthProxy(
+                config_url=os.environ.get(
+                    "MCP_OIDC_CONFIG_URL",
+                    "http://keycloak:8080/realms/srw/.well-known/openid-configuration",
+                ),
+                client_id=os.environ["MCP_OIDC_CLIENT_ID"],
+                client_secret=os.environ["MCP_OIDC_CLIENT_SECRET"],
+                base_url=_base_url,
+                # issuer_url = base_url (the proxy IS the authorization server
+                # from the client's perspective; Keycloak is only used
+                # internally via config_url for OIDC discovery)
+                mcp_verifier=_token_verifier,
+                verify_id_token=True,  # Keycloak access tokens may be opaque
             ),
-            client_id=os.environ["MCP_OIDC_CLIENT_ID"],
-            client_secret=os.environ["MCP_OIDC_CLIENT_SECRET"],
-            base_url=_base_url,
-            # issuer_url = base_url (the proxy IS the authorization server
-            # from the client's perspective; Keycloak is only used internally
-            # via config_url for OIDC discovery)
-            mcp_verifier=_token_verifier,
-            verify_id_token=True,  # Keycloak access tokens may be opaque
+            budget_s=float(os.environ.get("MCP_OIDC_DISCOVERY_TIMEOUT_S", "240")),
         )
     else:
         _auth = _token_verifier
@@ -279,11 +326,27 @@ async def _mcp_build_info() -> dict[str, str | int]:
     }
 
 
+@mcp.custom_route("/livez", methods=["GET"])
+async def liveness_check(request):
+    """Liveness and startup probe: answers while this process serves requests.
+
+    Deliberately independent of the orchestrator. When ``/health`` was the
+    liveness probe, an orchestrator restart failed it and Kubernetes killed a
+    healthy MCP pod as well.
+    """
+    return JSONResponse({"status": "alive"})
+
+
 @mcp.custom_route("/health", methods=["GET"])
 async def health_check(request):
-    """Kubernetes health probe endpoint."""
+    """Readiness probe: the image's schema matches and the orchestrator answers."""
     build_info = await _mcp_build_info()
     if build_info["schema_artifact_status"] not in {"match", "not_configured"}:
+        logger.warning(
+            "MCP health degraded: runtime tools/list does not match the image "
+            "schema artifact (%s)",
+            build_info["schema_artifact_status"],
+        )
         return JSONResponse(
             {
                 "status": "degraded",
@@ -297,6 +360,11 @@ async def health_check(request):
         await client.health_check()
         return JSONResponse({"status": "healthy", "backend": "connected", **build_info})
     except Exception as e:
+        logger.warning(
+            "MCP health degraded: orchestrator health check failed (%s: %s)",
+            type(e).__name__,
+            e,
+        )
         return JSONResponse(
             {"status": "degraded", "error": str(e), **build_info},
             status_code=503,
