@@ -629,6 +629,12 @@ deployment. See [Local Kubernetes with k3d](../docs/local-kubernetes.md#4-log-in
 **Git, cloud, admin credentials:**
 - `GITEA_ADMIN_USER`, `GITEA_ADMIN_PASSWORD` (internal Gitea only)
 - `NEXTCLOUD_ADMIN_USER`, `NEXTCLOUD_ADMIN_PASSWORD`, `NEXTCLOUD_AGENT_USER`, `NEXTCLOUD_AGENT_PASSWORD` (internal Nextcloud only)
+- `NEXTCLOUD_DB_PASSWORD` (internal Nextcloud with `nextcloud.database.type:
+  postgres`, the default) — the `srw-nextclouddb` owner's password, which a new
+  Nextcloud install also connects with. Chart-created mode generates and keeps
+  it; with ESO, add it to Vault before upgrading. Do not let a values
+  generator write it explicitly: an explicit value overrides the kept one.
+  `NEXTCLOUD_DB_USER` too when `databases.nextcloud.internal: false`.
 - `NEXTCLOUD_PROTECTED_EFFECT_HMAC_KEY` when
   `nextcloud.protectedEffect.enabled=true`. Use at least 32 bytes from a
   dedicated random source. Chart-created mode generates and preserves it;
@@ -666,6 +672,31 @@ The bundled Nextcloud Deployment uses the `Recreate` strategy because every
 container in the Pod shares one data PVC. Upgrades therefore include a brief,
 deliberate Nextcloud restart instead of risking a cross-node ReadWriteOnce
 multi-attach deadlock.
+
+### Bundled Nextcloud database
+
+A new bundled Nextcloud installs its metadata into a dedicated Postgres,
+`srw-nextclouddb` (`nextcloud.database.type: postgres`, the default;
+`databases.nextcloud` picks the `statefulset` or `cnpg` engine, as for the
+other bundled databases). `nextcloud.database.type: sqlite` keeps the old
+single-file database for tests and minimal installs. A `wait-for-nextclouddb`
+init container holds a new install until the database accepts the install's
+own credentials: Nextcloud's entrypoint gives up on a failed install for good.
+
+The setting applies to new installs only. An installed Nextcloud keeps the
+database its `config.php` names: an existing SQLite install keeps running on
+SQLite next to an empty `srw-nextclouddb`, and its Pod does not wait for
+Postgres, until an operator converts it with `occ db:convert-type`. After
+installation `config.php` holds the database user and password in plain text,
+so rotating `NEXTCLOUD_DB_PASSWORD` also needs
+`occ config:system:set dbpassword --value=...`.
+
+A NetworkPolicy admits only the Nextcloud Pod (and, on `cnpg`, the cluster's
+own instances and the operator) to the database, because agent Pods receive
+the whole application Secret. The protected-effect PHP-FPM pool connects with
+`statement_timeout` and `idle_in_transaction_session_timeout` set to the
+smaller of `handlerBoundSeconds` and `safetyMarginSeconds`, so no lane
+statement outlives the lane's cleanup horizon.
 
 ### Bundled Nextcloud background jobs
 

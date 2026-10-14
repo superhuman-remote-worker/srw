@@ -33,6 +33,7 @@ DATABASES = {
     "audit": "auditdb",
     "gitea": "giteadb",
     "keycloak": "keycloakdb",
+    "nextcloud": "nextclouddb",
 }
 
 OBJECTSTORE = "templates/databases/cnpg-objectstore.yaml"
@@ -58,6 +59,11 @@ def _template_command(*settings: str, show_only: str | None = None) -> list[str]
         str(CHART),
         "-f",
         str(CHART / "ci/test-values.yaml"),
+        # The Nextcloud database renders only beside a bundled Nextcloud.
+        "--set",
+        "nextcloud.enabled=true",
+        "--set",
+        "opencloud.enabled=false",
     ]
     if show_only:
         command.extend(["--show-only", show_only])
@@ -293,7 +299,13 @@ def test_one_per_backing_up_cluster():
     """auditdb opts out by default; every other cluster gets one."""
     assert set(_scheduled(*BACKUP_ON, *_all_cnpg())) == {
         f"{FULLNAME}-{component}-backup"
-        for component in ("postgres", "pgvector", "giteadb", "keycloakdb")
+        for component in (
+            "postgres",
+            "pgvector",
+            "giteadb",
+            "keycloakdb",
+            "nextclouddb",
+        )
     }
 
 

@@ -1,0 +1,104 @@
+{{- if (include "srw.dbRendersStatefulset" (dict "context" . "key" "nextcloud")) }}
+# Dedicated PostgreSQL for the bundled Nextcloud's metadata (file cache,
+# shares, tokens, app config). File contents stay in S3 or on the Nextcloud PVC.
+#
+# Same shape as the Gitea and Keycloak DBs: the Postgres superuser IS the
+# Nextcloud DB user — POSTGRES_USER=nextcloud, POSTGRES_DB=nextcloud — so there
+# is no init script and no separate role provisioning. The Nextcloud installer
+# is told not to create a role of its own (NC_setup_create_db_user=false on the
+# Nextcloud container), so it connects as `nextcloud` on both engines.
+#
+# NOTE: component label is short ("nextclouddb") so the StatefulSet name stays
+# under 52 chars — the controller-revision-hash label adds "-<10char>"
+# (11 chars), and total label value must be <= 63 chars.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "srw.fullname" . }}-nextclouddb-data
+  labels:
+    {{- include "srw.componentLabels" (dict "context" . "component" "nextclouddb") | nindent 4 }}
+  annotations:
+    # Losing this volume loses every share, token and file-cache row while the
+    # file objects survive, keyed by file ids nothing remembers. Keep it across
+    # `helm uninstall`.
+    "helm.sh/resource-policy": keep
+spec:
+  accessModes:
+    - ReadWriteOnce
+  {{- if .Values.databases.nextcloud.storageClass }}
+  storageClassName: {{ .Values.databases.nextcloud.storageClass }}
+  {{- end }}
+  resources:
+    requests:
+      storage: {{ .Values.databases.nextcloud.storageSize }}
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ include "srw.fullname" . }}-nextclouddb
+  labels:
+    {{- include "srw.componentLabels" (dict "context" . "component" "nextclouddb") | nindent 4 }}
+spec:
+  serviceName: {{ include "srw.fullname" . }}-nextclouddb
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "srw.componentSelectorLabels" (dict "context" . "component" "nextclouddb") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "srw.componentSelectorLabels" (dict "context" . "component" "nextclouddb") | nindent 8 }}
+    spec:
+      {{- with .Values.global.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: postgres
+          image: {{ .Values.databases.nextcloud.image }}
+          ports:
+            - containerPort: 5432
+          env:
+            - name: POSTGRES_USER
+              value: "nextcloud"
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "srw.secretName" . }}
+                  key: NEXTCLOUD_DB_PASSWORD
+            - name: POSTGRES_DB
+              value: "nextcloud"
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+          livenessProbe:
+            exec:
+              command: ["pg_isready", "-U", "nextcloud"]
+            initialDelaySeconds: 30
+            periodSeconds: 10
+          readinessProbe:
+            exec:
+              command: ["pg_isready", "-U", "nextcloud"]
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          resources:
+            {{- toYaml .Values.databases.nextcloud.resources | nindent 12 }}
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: {{ include "srw.fullname" . }}-nextclouddb-data
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "srw.fullname" . }}-nextclouddb
+  labels:
+    {{- include "srw.componentLabels" (dict "context" . "component" "nextclouddb") | nindent 4 }}
+spec:
+  type: ClusterIP
+  ports:
+    - port: 5432
+      targetPort: 5432
+  selector:
+    {{- include "srw.componentSelectorLabels" (dict "context" . "component" "nextclouddb") | nindent 4 }}
+{{- end }}

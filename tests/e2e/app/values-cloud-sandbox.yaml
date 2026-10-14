@@ -54,8 +54,14 @@ nextcloud:
 opencloud:
   enabled: false
 
-# Nextcloud stores its own metadata in SQLite on the PVC above (the chart's
-# nextcloud Deployment sets SQLITE_DATABASE), so no extra database renders.
+# Nextcloud installs its metadata into the chart's default dedicated Postgres
+# (`srw-e2e-nextclouddb`, nextcloud.database.type: postgres), so the profile
+# exercises the database every new bundled install gets. Sized for a
+# disposable cluster.
+databases:
+  nextcloud:
+    storageSize: 1Gi
+
 cloud:
   # Leave the external hooks empty: the bundled branch above supplies the URLs.
   externalBackend: ""

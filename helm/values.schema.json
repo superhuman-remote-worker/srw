@@ -858,6 +858,18 @@
         "enabled": {
           "type": "boolean"
         },
+        "database": {
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "enum": [
+                "postgres",
+                "sqlite"
+              ]
+            }
+          }
+        },
         "cron": {
           "type": "object",
           "properties": {
@@ -2206,6 +2218,35 @@
                 "migrating",
                 "cnpg"
               ]
+            }
+          }
+        },
+        "nextcloud": {
+          "type": "object",
+          "properties": {
+            "engine": {
+              "type": "string",
+              "enum": [
+                "statefulset",
+                "migrating",
+                "cnpg"
+              ]
+            },
+            "sslMode": {
+              "type": "string",
+              "enum": [
+                "disable",
+                "allow",
+                "prefer",
+                "require",
+                "verify-ca",
+                "verify-full"
+              ]
+            },
+            "externalPort": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 65535
             }
           }
         },

@@ -2633,6 +2633,79 @@ databases:
       limits:
         memory: "512Mi"
         cpu: "200m"
+  # Dedicated Postgres for the bundled Nextcloud's metadata (file cache, shares,
+  # tokens, app config). Renders only when the bundled Nextcloud is internal and
+  # nextcloud.database.type is "postgres", so an external Nextcloud renders no
+  # database. File contents stay in S3 or on the Nextcloud PVC.
+  nextcloud:
+    enabled: true
+    # -- Which implementation backs this database.
+    #      statefulset — the bundled single-replica StatefulSet (default)
+    #      migrating   — renders BOTH, so a CloudNativePG Cluster can import
+    #                    from the live StatefulSet Service. Transitional only.
+    #      cnpg        — the CloudNativePG Cluster only
+    engine: "statefulset"
+    # -- Override the profile's instance count for this database. null = derive.
+    instances: null
+    # -- max_connections. Apache is capped at nextcloud.apache.maxRequestWorkers
+    #    (32) workers, each holding at most one connection, plus cron and the
+    #    protected-effect pool; 100 leaves the instance manager its headroom.
+    maxConnections: 100
+    # -- pg_restore --jobs for the post-data (index) section during a
+    #    `migrating` import. null = serial.
+    importRestoreJobs: null
+    # -- Extra postgresql.conf settings for the CloudNativePG Cluster, merged
+    #    over max_connections and the memory GUCs derived from
+    #    cnpgResources.limits.memory (shared_buffers 25 %, effective_cache_size
+    #    75 %). Nextcloud's all-in-one image runs work_mem 16MB and
+    #    maintenance_work_mem 256MB at about twice this memory; the latter is
+    #    halved so autovacuum still fits the limit. Values MUST be strings.
+    #    The StatefulSet engine keeps the image defaults.
+    parameters:
+      work_mem: "16MB"
+      maintenance_work_mem: "128MB"
+    # -- Include this database in backups when databases.backup.method is set.
+    backupEnabled: true
+    # -- CloudNativePG operand image, used ONLY when `engine` is not
+    #    `statefulset`; see databases.gitea.cnpgImage. PINNED, and every
+    #    database's pin moves together. PostgreSQL 16 suits Nextcloud 31 to 33
+    #    (31 supports 13-17, 33 supports 14-18).
+    cnpgImage: "ghcr.io/cloudnative-pg/postgresql:16.15"
+    # -- When false, the bundled Nextcloud installs against
+    #    externalHost/Port/Db below (managed Postgres). The user then comes
+    #    from NEXTCLOUD_DB_USER in the Secret; the password is always
+    #    NEXTCLOUD_DB_PASSWORD.
+    internal: true
+    externalHost: ""
+    externalPort: 5432
+    externalDb: "nextcloud"
+    # -- libpq sslmode for every Nextcloud PHP process (PGSSLMODE). "prefer"
+    #    is libpq's own default: TLS where the server offers it (CloudNativePG),
+    #    plain on the bundled StatefulSet.
+    sslMode: "prefer"
+    image: postgres:16
+    storageClass: ""
+    # -- Volume size for the CloudNativePG Cluster, used ONLY when `engine` is
+    #    not `statefulset`. Empty = inherit `storageSize` below.
+    cnpgStorageSize: ""
+    storageSize: "8Gi"
+    # -- Resources for the CloudNativePG Cluster, used ONLY when `engine` is
+    #    not `statefulset`. 1Gi derives shared_buffers 256MB, the all-in-one
+    #    image's value.
+    cnpgResources:
+      requests:
+        memory: "1Gi"
+        cpu: "100m"
+      limits:
+        memory: "1Gi"
+        cpu: "1"
+    resources:
+      requests:
+        memory: "128Mi"
+        cpu: "50m"
+      limits:
+        memory: "512Mi"
+        cpu: "500m"
   neo4j:
     enabled: true
     internal: true
@@ -3022,6 +3095,19 @@ nextcloud:
   replicas: 0
   storageClass: ""
   storageSize: "10Gi"
+  # Which database a NEW install uses for Nextcloud's metadata:
+  #
+  #   postgres (default) — the dedicated `srw-nextclouddb` (databases.nextcloud;
+  #     StatefulSet or CloudNativePG) or an external server. Concurrent writers,
+  #     which SQLite cannot give the shared agent-service account.
+  #   sqlite — one file on the Nextcloud PVC. For tests and minimal installs.
+  #
+  # Only the first install reads this. An installed Nextcloud keeps the
+  # database its config.php names, so an existing SQLite install stays on
+  # SQLite next to an empty Postgres until it is converted with
+  # `occ db:convert-type`; the Pod does not wait for Postgres in that case.
+  database:
+    type: postgres
   # Nextcloud's background jobs (cron.php every 5 minutes) run in a `cron`
   # container in the Nextcloud Pod, as in the upstream chart. Off, they run
   # piggybacked on browser page loads ("ajax" mode) and stall whenever nobody

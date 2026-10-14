@@ -716,6 +716,54 @@ true
 {{- end }}
 
 {{/*
+True when a NEW bundled Nextcloud install should use Postgres. An installed
+Nextcloud keeps whatever its config.php names; see nextcloud.database.type.
+Anything but "postgres" or "sqlite" is rejected rather than read as one of them.
+*/}}
+{{- define "srw.nextcloudUsesPostgres" -}}
+{{- $type := (.Values.nextcloud.database | default dict).type | default "postgres" -}}
+{{- if eq $type "postgres" -}}
+true
+{{- else if eq $type "sqlite" -}}
+{{- else -}}
+{{- fail (printf "nextcloud.database.type must be \"postgres\" or \"sqlite\", got %q" $type) -}}
+{{- end -}}
+{{- end }}
+
+{{/*
+Connection parts for the bundled Nextcloud's Postgres. Internal resolves to the
+`srw-nextclouddb` Service, or CloudNativePG's "-rw" Service on the cnpg engine;
+external to databases.nextcloud.externalHost/Port/Db.
+*/}}
+{{- define "srw.nextcloudDbHost" -}}
+{{- if .Values.databases.nextcloud.internal -}}
+{{- $suffix := "" -}}
+{{- if eq (include "srw.dbEngine" (dict "context" . "db" .Values.databases.nextcloud)) "cnpg" -}}
+{{- $suffix = "-rw" -}}
+{{- end -}}
+{{- printf "%s-nextclouddb%s" (include "srw.fullname" .) $suffix -}}
+{{- else -}}
+{{- required "databases.nextcloud.externalHost is required when databases.nextcloud.internal is false" .Values.databases.nextcloud.externalHost -}}
+{{- end -}}
+{{- end }}
+
+{{- define "srw.nextcloudDbPort" -}}
+{{- if .Values.databases.nextcloud.internal -}}
+5432
+{{- else -}}
+{{- .Values.databases.nextcloud.externalPort | default 5432 -}}
+{{- end -}}
+{{- end }}
+
+{{- define "srw.nextcloudDbName" -}}
+{{- if .Values.databases.nextcloud.internal -}}
+nextcloud
+{{- else -}}
+{{- .Values.databases.nextcloud.externalDb | default "nextcloud" -}}
+{{- end -}}
+{{- end }}
+
+{{/*
 Initial SRW realm administrator for the bundled Keycloak. The realm ConfigMap
 has always put this user first. Keep its identity when the value is omitted on
 an upgrade, and reject explicit changes: realm import skips an existing realm.
@@ -1345,6 +1393,10 @@ Usage: {{ include "srw.dbPrereqs" (dict "context" . "key" "postgres") }}
 {{- $ok = and $ok $ctx.Values.gitea.enabled $ctx.Values.gitea.internal (include "srw.giteaUsesPostgres" $ctx) -}}
 {{- else if eq .key "keycloak" -}}
 {{- $ok = and $ok $ctx.Values.keycloak.enabled $ctx.Values.keycloak.internal -}}
+{{- else if eq .key "nextcloud" -}}
+{{- /* Without all three, an external Nextcloud (prod) or the SQLite opt-out
+       would render an orphan database nothing connects to. */ -}}
+{{- $ok = and $ok $ctx.Values.nextcloud.enabled $ctx.Values.nextcloud.internal (include "srw.nextcloudUsesPostgres" $ctx) -}}
 {{- end -}}
 {{- if $ok -}}true{{- end -}}
 {{- end }}
@@ -1413,7 +1465,7 @@ release as backed up.
 */}}
 {{- define "srw.anyDbBacksUp" -}}
 {{- $any := "" -}}
-{{- range $key := list "postgres" "vector" "audit" "gitea" "keycloak" -}}
+{{- range $key := list "postgres" "vector" "audit" "gitea" "keycloak" "nextcloud" -}}
 {{- if include "srw.dbBacksUp" (dict "context" $ "key" $key) -}}
 {{- $any = "true" -}}
 {{- end -}}
@@ -1427,7 +1479,7 @@ the data tier has actually moved.
 */}}
 {{- define "srw.anyDbRendersCnpg" -}}
 {{- $any := "" -}}
-{{- range $key := list "postgres" "vector" "audit" "gitea" "keycloak" -}}
+{{- range $key := list "postgres" "vector" "audit" "gitea" "keycloak" "nextcloud" -}}
 {{- if include "srw.dbRendersCnpg" (dict "context" $ "key" $key) -}}
 {{- $any = "true" -}}
 {{- end -}}

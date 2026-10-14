@@ -27,7 +27,8 @@ spec:
       (dict "key" "vector" "component" "pgvector")
       (dict "key" "audit" "component" "auditdb")
       (dict "key" "gitea" "component" "giteadb")
-      (dict "key" "keycloak" "component" "keycloakdb") -}}
+      (dict "key" "keycloak" "component" "keycloakdb")
+      (dict "key" "nextcloud" "component" "nextclouddb") -}}
 {{- $rendered := 0 -}}
 {{- range $entry := $clusters }}
 {{- if (include "srw.dbRendersCnpg" (dict "context" $ "key" $entry.key)) }}

@@ -617,6 +617,7 @@ def test_dependency_images_use_host_platform_archives_before_k3d_import(
     assert harness.DEPENDENCY_IMAGES == (
         "busybox:1.36",
         "postgres:15",
+        "postgres:16",
         "pgvector/pgvector:pg15",
         "quay.io/keycloak/keycloak:26.2",
         "rancher/mirrored-library-busybox:1.36.1",
@@ -803,7 +804,7 @@ def test_runtime_image_verifier_matches_cri_config_ids_on_both_nodes(
         ledger
     )
 
-    assert ledger["verified_node_images"] == {"server-0": 9, "agent-0": 9}
+    assert ledger["verified_node_images"] == {"server-0": 10, "agent-0": 10}
     assert all(
         command[-4:] == ["crictl", "images", "-o", "json"]
         for command in runner.commands[1:]
@@ -839,7 +840,7 @@ def test_stateless_runtime_image_verifier_includes_workspace_on_both_nodes(
         ledger
     )
 
-    assert ledger["verified_node_images"] == {"server-0": 10, "agent-0": 10}
+    assert ledger["verified_node_images"] == {"server-0": 11, "agent-0": 11}
 
 
 def test_runtime_image_verifier_rejects_a_wrong_cri_config_id(
@@ -2156,7 +2157,13 @@ def test_cloud_sandbox_renders_exactly_one_bundled_backend(tmp_path: Path) -> No
         for item in backend["spec"]["template"]["spec"]["containers"][0]["env"]
         if "name" in item
     }
-    assert "SQLITE_DATABASE" in environment
+    # The chart default: a new install goes to the bundled Postgres. A stray
+    # SQLITE_DATABASE would win the entrypoint's check and install SQLite.
+    assert "SQLITE_DATABASE" not in environment
+    assert environment["POSTGRES_HOST"] == "srw-e2e-nextclouddb"
+    assert environment["POSTGRES_DB"] == "nextcloud"
+    assert ("StatefulSet", "srw-e2e-nextclouddb") in names
+    assert ("NetworkPolicy", "srw-e2e-nextclouddb") in names
     assert not any(key.startswith("OBJECTSTORE_S3") for key in environment)
 
 

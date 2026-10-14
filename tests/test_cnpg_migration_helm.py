@@ -33,6 +33,7 @@ DATABASES = {
     "audit": "auditdb",
     "gitea": "giteadb",
     "keycloak": "keycloakdb",
+    "nextcloud": "nextclouddb",
 }
 
 CLUSTER = "templates/databases/cnpg-cluster.yaml"
@@ -51,6 +52,11 @@ def _template_command(*settings: str, show_only: str | None = None) -> list[str]
         str(CHART),
         "-f",
         str(CHART / "ci/test-values.yaml"),
+        # The Nextcloud database renders only beside a bundled Nextcloud.
+        "--set",
+        "nextcloud.enabled=true",
+        "--set",
+        "opencloud.enabled=false",
     ]
     if show_only:
         command.extend(["--show-only", show_only])
@@ -217,6 +223,27 @@ def test_audit_ships_only_the_measured_parameter():
     assert set(parameters) == {"max_connections", "work_mem"} | DERIVED_PARAMETERS
 
 
+def test_nextcloud_ships_the_all_in_one_parameters_scaled_to_its_limit():
+    """nextclouddb starts from Nextcloud all-in-one's Postgres settings.
+    maintenance_work_mem is halved from its 256MB: it is also each autovacuum
+    worker's budget, and at 1Gi three of them must fit beside shared_buffers."""
+    parameters = _clusters("databases.nextcloud.engine=cnpg")[
+        f"{FULLNAME}-nextclouddb"
+    ]["spec"]["postgresql"]["parameters"]
+    assert (
+        set(parameters)
+        == {
+            "max_connections",
+            "work_mem",
+            "maintenance_work_mem",
+        }
+        | DERIVED_PARAMETERS
+    )
+    assert parameters["work_mem"] == "16MB"
+    assert parameters["maintenance_work_mem"] == "128MB"
+    assert parameters["shared_buffers"] == "256MB"
+
+
 def test_legacy_statefulset_resources_are_untouched():
     """`resources` sizes the legacy pod too. Raising it there restarts a live
     database to reserve memory it never uses -- hence the separate key."""
@@ -245,6 +272,7 @@ IMPORT_SOURCES = {
     "audit": ("srw_audit", "srw", "AUDIT_POSTGRES_PASSWORD"),
     "gitea": ("gitea", "gitea", "GITEA_DB_PASSWORD"),
     "keycloak": ("keycloak", "keycloak", "KC_DB_PASSWORD"),
+    "nextcloud": ("nextcloud", "nextcloud", "NEXTCLOUD_DB_PASSWORD"),
 }
 
 
@@ -366,6 +394,7 @@ def test_no_template_hardcodes_a_database_service_name():
         "auditdb": "srw.auditPostgresHost",
         "giteadb": "srw.giteaDbHost",
         "keycloakdb": "srw.keycloakDbJdbcUrl",
+        "nextclouddb": "srw.nextcloudDbHost",
     }
     offenders = []
     for template in (CHART / "templates").rglob("*.yaml"):

@@ -409,7 +409,7 @@ connectors:
         tag: dev
 
 databases:
-  # Non-HA local default. All five PostgreSQL engines continue to inherit
+  # Non-HA local default. Every PostgreSQL engine continues to inherit
   # `statefulset`; no CloudNativePG operator is needed for this overlay.
   profile: single
   postgres:
@@ -428,6 +428,11 @@ databases:
     enabled: false
     storageSize: "5Gi"
   keycloak:
+    storageSize: "2Gi"
+  # The bundled Nextcloud's metadata (nextcloud.database.type: postgres). An
+  # existing local install stays on its SQLite file until converted; a new one
+  # installs here.
+  nextcloud:
     storageSize: "2Gi"
 
 # -----------------------------------------------------------------------------

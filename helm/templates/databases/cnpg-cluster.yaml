@@ -204,4 +204,9 @@ spec:
 
 {{- if (include "srw.dbRendersCnpg" (dict "context" . "key" "keycloak")) }}
 {{- include "srw.cnpgCluster" (dict "context" . "component" "keycloakdb" "key" "keycloak" "db" .Values.databases.keycloak "database" "keycloak" "owner" "keycloak" "passwordKey" "KC_DB_PASSWORD") }}
+---
+{{- end }}
+
+{{- if (include "srw.dbRendersCnpg" (dict "context" . "key" "nextcloud")) }}
+{{- include "srw.cnpgCluster" (dict "context" . "component" "nextclouddb" "key" "nextcloud" "db" .Values.databases.nextcloud "database" "nextcloud" "owner" "nextcloud" "passwordKey" "NEXTCLOUD_DB_PASSWORD") }}
 {{- end }}

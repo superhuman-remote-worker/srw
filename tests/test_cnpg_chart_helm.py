@@ -33,6 +33,7 @@ DATABASES = {
     "audit": ("auditdb", "srw_audit", "srw"),
     "gitea": ("giteadb", "gitea", "gitea"),
     "keycloak": ("keycloakdb", "keycloak", "keycloak"),
+    "nextcloud": ("nextclouddb", "nextcloud", "nextcloud"),
 }
 
 pytestmark = pytest.mark.skipif(
@@ -48,6 +49,11 @@ def _template_command(*settings: str, show_only: str | None = None) -> list[str]
         str(CHART),
         "-f",
         str(CHART / "ci/test-values.yaml"),
+        # The Nextcloud database renders only beside a bundled Nextcloud.
+        "--set",
+        "nextcloud.enabled=true",
+        "--set",
+        "opencloud.enabled=false",
     ]
     if show_only:
         command.extend(["--show-only", show_only])
@@ -289,6 +295,7 @@ def test_external_secrets_mode_projects_into_a_basic_auth_shape(key):
         ("audit", "AUDIT_POSTGRES_PASSWORD"),
         ("gitea", "GITEA_DB_PASSWORD"),
         ("keycloak", "KC_DB_PASSWORD"),
+        ("nextcloud", "NEXTCLOUD_DB_PASSWORD"),
     ],
 )
 def test_external_secrets_mode_reads_the_same_vault_property_consumers_do(
@@ -370,6 +377,7 @@ POLICY_COMPONENTS = {
     "vector": "pgvector",
     "audit": "auditdb",
     "keycloak": "keycloakdb",
+    "nextcloud": "nextclouddb",
 }
 
 

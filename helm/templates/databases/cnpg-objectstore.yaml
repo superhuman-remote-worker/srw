@@ -2,8 +2,8 @@
 One ObjectStore per release, shared by every backing-up cluster.
 
 serverName is deliberately UNSET: Barman defaults it to the cluster name, which
-gives each of the five its own folder under destinationPath. Setting it here
-would point all five at one prefix and they would overwrite each other's base
+gives each cluster its own folder under destinationPath. Setting it here would
+point them all at one prefix and they would overwrite each other's base
 backups.
 
 Requires the Barman Cloud plugin, which this chart cannot install -- it is a raw

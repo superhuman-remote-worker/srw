@@ -61,6 +61,11 @@ can fire before the hook reaches the pins.
       name: {{ include "srw.secretName" . }}
       key: NEXTCLOUD_S3_SECRET_KEY
 {{- end }}
+{{- if (include "srw.nextcloudUsesPostgres" .) }}
+# libpq's sslmode for Nextcloud's Postgres connections (databases.nextcloud.sslMode).
+- name: PGSSLMODE
+  value: {{ .Values.databases.nextcloud.sslMode | default "prefer" | quote }}
+{{- end }}
 - name: NC_trashbin_retention_obligation
   value: "disabled"
 - name: NC_versions_retention_obligation
@@ -382,6 +387,106 @@ spec:
         - name: wait-for-keycloak
           image: busybox:1.36
           command: ["sh", "-c", "until nc -z -w 2 {{ include "srw.fullname" . }}-keycloak 8080; do sleep 2; done"]
+        {{- if (include "srw.nextcloudUsesPostgres" .) }}
+        # A new install must find a database it can log into: the image's
+        # entrypoint tries `maintenance:install` 11 times and then gives up for
+        # good, because version.php is already in place and no later start
+        # installs again. An installed Nextcloud uses the database its
+        # config.php names, with config.php's own credentials: on SQLite it
+        # does not wait for Postgres at all (an install that predates Postgres
+        # keeps running until it is converted), on Postgres it waits only for
+        # the server to answer.
+        - name: wait-for-nextclouddb
+          image: {{ .Values.databases.nextcloud.image }}
+          command:
+            - sh
+            - -c
+            - |
+              CONFIG=/var/www/html/config/config.php
+              if [ -f "$CONFIG" ] && grep -q "'installed' => true" "$CONFIG"; then
+                if grep -Eq "'dbtype' => 'sqlite3?'" "$CONFIG"; then
+                  echo "Installed on SQLite: not waiting for Postgres."
+                  exit 0
+                fi
+                until pg_isready -q; do
+                  echo "Installed on Postgres: waiting for $PGHOST:$PGPORT"
+                  sleep 2
+                done
+                exit 0
+              fi
+              if [ -z "$PGPASSWORD" ]; then
+                cat >&2 <<EOF
+              ============================================================
+              REFUSING TO INSTALL: NEXTCLOUD_DB_PASSWORD is not in the Secret.
+
+              Nextcloud is not installed yet and would install against
+              $PGUSER@$PGHOST/$PGDATABASE without a password. On ESO/Vault
+              clusters add NEXTCLOUD_DB_PASSWORD to the Vault bundle first;
+              the chart generates it only when secrets.create=true.
+              ============================================================
+              EOF
+                exit 1
+              fi
+              until pg_isready -q; do
+                echo "New install: waiting for $PGHOST:$PGPORT"
+                sleep 2
+              done
+              # Reachable is not enough: a CloudNativePG owner or StatefulSet
+              # superuser that cannot log in yet would burn the installer's
+              # retries. Wait until the install's own credentials work.
+              tries=0
+              until CONN_ERR=$(psql -tAc 'SELECT 1' 2>&1 >/dev/null); do
+                tries=$((tries + 1))
+                if [ "$tries" -ge 30 ]; then
+                  cat >&2 <<EOF
+              ============================================================
+              REFUSING TO INSTALL: cannot log into the Nextcloud database.
+
+              psql could not connect as $PGUSER@$PGHOST:$PGPORT/$PGDATABASE:
+
+                $CONN_ERR
+
+              This is a connectivity or credential fault. The usual cause is
+              a NEXTCLOUD_DB_PASSWORD that differs from the one the database
+              was initialised with.
+              ============================================================
+              EOF
+                  exit 1
+                fi
+                sleep 2
+              done
+              echo "New install: $PGUSER logs into $PGHOST/$PGDATABASE."
+          env:
+            - name: PGHOST
+              value: {{ include "srw.nextcloudDbHost" . | quote }}
+            - name: PGPORT
+              value: {{ include "srw.nextcloudDbPort" . | quote }}
+            - name: PGDATABASE
+              value: {{ include "srw.nextcloudDbName" . | quote }}
+            - name: PGUSER
+              {{- if .Values.databases.nextcloud.internal }}
+              value: "nextcloud"
+              {{- else }}
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "srw.secretName" . }}
+                  key: NEXTCLOUD_DB_USER
+              {{- end }}
+            - name: PGPASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "srw.secretName" . }}
+                  key: NEXTCLOUD_DB_PASSWORD
+                  optional: true
+            - name: PGSSLMODE
+              value: {{ .Values.databases.nextcloud.sslMode | default "prefer" | quote }}
+            - name: PGCONNECT_TIMEOUT
+              value: "5"
+          volumeMounts:
+            - name: data
+              mountPath: /var/www/html
+              readOnly: true
+        {{- end }}
       containers:
         - name: nextcloud
           image: {{ .Values.nextcloud.image }}
@@ -395,8 +500,43 @@ spec:
                 secretKeyRef:
                   name: {{ include "srw.secretName" . }}
                   key: NEXTCLOUD_ADMIN_PASSWORD
+            {{- if (include "srw.nextcloudUsesPostgres" .) }}
+            # Install-time only: the entrypoint reads these for the first
+            # install, after which config.php holds the connection. Never set
+            # SQLITE_DATABASE alongside them: the entrypoint checks it first
+            # and would install SQLite anyway.
+            - name: POSTGRES_HOST
+              value: {{ include "srw.nextcloudDbHost" . | quote }}
+            - name: POSTGRES_DB
+              value: {{ include "srw.nextcloudDbName" . | quote }}
+            - name: POSTGRES_USER
+              {{- if .Values.databases.nextcloud.internal }}
+              value: "nextcloud"
+              {{- else }}
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "srw.secretName" . }}
+                  key: NEXTCLOUD_DB_USER
+              {{- end }}
+            # Optional so an installed Nextcloud (which keeps its own copy in
+            # config.php) still starts without it; a new install refuses in
+            # wait-for-nextclouddb instead.
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "srw.secretName" . }}
+                  key: NEXTCLOUD_DB_PASSWORD
+                  optional: true
+            # The installer otherwise creates its own oc_admin role with a
+            # password kept only in config.php wherever it may (the StatefulSet
+            # superuser may, a CloudNativePG owner may not). Pinned off, both
+            # engines connect as the database owner with this password.
+            - name: NC_setup_create_db_user
+              value: "false"
+            {{- else }}
             - name: SQLITE_DATABASE
               value: "nextcloud"
+            {{- end }}
             - name: NEXTCLOUD_TRUSTED_DOMAINS
               value: "{{ include "srw.fullname" . }}-nextcloud {{ (urlParse (include "srw.cloudUrl" .)).host }}"
             {{- include "srw.nextcloudRuntimeEnv" . | nindent 12 }}
@@ -527,6 +667,22 @@ spec:
               value: {{ .Values.nextcloud.protectedEffect.capabilityMaxAgeSeconds | quote }}
             - name: NEXTCLOUD_PROTECTED_EFFECT_MAX_CHILDREN
               value: {{ .Values.nextcloud.protectedEffect.maxChildren | quote }}
+            {{- if (include "srw.nextcloudUsesPostgres" .) }}
+            {{- $effect := .Values.nextcloud.protectedEffect }}
+            {{- $statementBoundMs := mul (min (int $effect.handlerBoundSeconds) (int $effect.safetyMarginSeconds)) 1000 }}
+            - name: PGSSLMODE
+              value: {{ .Values.databases.nextcloud.sslMode | default "prefer" | quote }}
+            # The lane's cleanup horizon assumes no write commits after the
+            # handler wall plus the safety margin. FPM's kill ends the PHP
+            # worker, not a statement Postgres is already running, so every
+            # lane statement and open transaction is cut off at
+            # min(handler bound, safety margin). libpq reads PGOPTIONS from the
+            # worker's environment (clear_env = no), and only this pool gets
+            # it: Apache and cron run unbounded. Derived only from lane
+            # values the lane digest already covers.
+            - name: PGOPTIONS
+              value: {{ printf "-c statement_timeout=%d -c idle_in_transaction_session_timeout=%d" $statementBoundMs $statementBoundMs | quote }}
+            {{- end }}
           volumeMounts:
             - name: data
               mountPath: /var/www/html
