@@ -536,8 +536,11 @@ class Gate:
             )
 
     def run(self) -> int:
-        self.preflight()
+        # Log in first: a login refreshes the user's display name from the
+        # token's claims, and the disposable account must carry the name the
+        # orchestrator will search for.
         self.login()
+        self.preflight()
         try:
             self.ensure_nc_account()
             tokens_before = token_rows()
