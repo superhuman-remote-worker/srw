@@ -32,6 +32,12 @@ configure_logging(
     disable_uvicorn_access=True,
 )
 
+# Trust the operator's extra CA (chart value trust.extraCaCertificates) before
+# any HTTP client exists: clients read SSL_CERT_FILE when they are built.
+from shared.tls_trust import install_extra_ca_trust  # noqa: E402
+
+install_extra_ca_trust()
+
 from orchestrator.application import create_app  # noqa: E402
 
 app = create_app()

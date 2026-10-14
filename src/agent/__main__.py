@@ -240,6 +240,12 @@ def main():
 
     logger = logging.getLogger(__name__)
 
+    # Trust the operator's extra CA (chart value trust.extraCaCertificates)
+    # before any HTTP client exists: clients read SSL_CERT_FILE when built.
+    from shared.tls_trust import install_extra_ca_trust
+
+    install_extra_ca_trust()
+
     # Loop mode: return to IDLE after task instead of exiting
     if args.loop:
         os.environ["AGENT_LOOP"] = "1"

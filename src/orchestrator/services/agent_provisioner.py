@@ -24,6 +24,7 @@ from typing import Any, Optional
 from uuid import UUID, uuid4
 
 from shared.runtime.core.loader import canonical_config_name
+from shared.tls_trust import TrustCaSource
 
 from orchestrator.services.agent_pod_entrypoint import (
     agent_exec_command,
@@ -446,6 +447,8 @@ class AgentProvisioner:
             self._gateway_public_host_key_paths,
             self._gateway_public_host_key_names,
         ) = _agent_gateway_public_key_config()
+        # The operator's extra CA (chart trust.*), mounted into every agent pod.
+        self._trust_ca = TrustCaSource.from_env()
         # Durable /workspace for SESSION agent pods. Gated on the SAME flag,
         # size and storage class as workspace PVCs (ContainerProvisioner) so a
         # cluster has one storage switch, not two. Off (the default) → the
@@ -3212,6 +3215,11 @@ class AgentProvisioner:
                 }
             )
 
+        trust_ca = getattr(self, "_trust_ca", None)
+        if trust_ca is not None:
+            containers[0]["env"].append(trust_ca.env())
+            containers[0]["volumeMounts"].append(trust_ca.volume_mount())
+
         if purpose == "session" and thread_id:
             # Kubelet runs preStop before SIGTERM. Fence the next paid turn in
             # the shell, even while Python/HTTP drain startup is delayed. Match
@@ -3277,6 +3285,9 @@ class AgentProvisioner:
                     },
                 }
             )
+
+        if trust_ca is not None:
+            volumes.append(trust_ca.volume())
 
         if self._tailscale_enabled and self._headscale_url:
             tailscale_args = (

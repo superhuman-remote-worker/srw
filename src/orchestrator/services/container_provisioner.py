@@ -38,6 +38,7 @@ from urllib3.exceptions import (
 )
 from shared.container_recovery import ContainerRecoveryCleanup
 from shared.workspace_recovery import WorkspaceRecoveryCode
+from shared.tls_trust import TrustCaSource
 
 from orchestrator.database.container_startup_stage import (
     BoundPodObserved,
@@ -767,6 +768,8 @@ class ContainerProvisioner:
         self._ssh_secret_name: str = os.environ.get(
             "WORKSPACE_SSH_SECRET", "vm-ssh-key"
         )
+        # The operator's extra CA (chart trust.*), mounted into workspace pods.
+        self._trust_ca = TrustCaSource.from_env()
         self._ssh_auth_ready_timeout: float = float(
             os.environ.get("WORKSPACE_SSH_AUTH_READY_TIMEOUT_S", "30")
         )
@@ -16749,6 +16752,15 @@ class ContainerProvisioner:
                     "configMap": {"name": seed_configmap, "defaultMode": 0o644},
                 }
             )
+        trust_ca = getattr(self, "_trust_ca", None)
+        if trust_ca is not None:
+            # The workspace entrypoint adds the operator's CA to the system
+            # store, so the agent's curl, git and OpenSSL calls trust it too.
+            manifest["spec"]["containers"][0]["env"].append(trust_ca.env())
+            manifest["spec"]["containers"][0]["volumeMounts"].append(
+                trust_ca.volume_mount()
+            )
+            manifest["spec"]["volumes"].append(trust_ca.volume())
         workspace_container = manifest["spec"]["containers"][0]
         if profile is not None and profile.pull_policy:
             workspace_container["imagePullPolicy"] = profile.pull_policy
