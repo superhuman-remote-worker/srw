@@ -183,6 +183,7 @@ class AudioHelper:
         """Initialize the Audio Helper with configuration from environment."""
         from shared.runtime.core.transport_resolution import (
             is_openai_default_endpoint,
+            wire_model_id,
         )
 
         # OPENAI_API_KEY is the fallback only when the endpoint IS OpenAI (a
@@ -194,7 +195,9 @@ class AudioHelper:
             else ""
         )
         self.api_key = os.getenv("WHISPER_API_KEY", primary_key)
-        self.model = os.getenv("WHISPER_MODEL", "whisper-1")
+        self.model = wire_model_id(
+            os.getenv("WHISPER_MODEL", "whisper-1"), self.api_base
+        )
         self.timeout = float(os.getenv("WHISPER_TIMEOUT", "300"))
         self.default_language = os.getenv("WHISPER_LANGUAGE")
 
