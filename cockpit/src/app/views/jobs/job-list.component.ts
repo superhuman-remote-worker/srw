@@ -1844,7 +1844,9 @@ export class JobListComponent implements OnInit, OnDestroy {
   getWorkspaceUrl(job: JobSummary): string | null {
     const giteaUrl = environment.giteaUrl;
     if (!giteaUrl) return null;
-    const repoName = job.repo_name || `job-${job.id}`;
+    const repoName = job.repo_name?.trim();
+    // No repository means no workspace page: a guessed name is a dead link.
+    if (!repoName) return null;
     if (job.branch_name) {
       return `${giteaUrl}/${repoName}/src/branch/${job.branch_name}`;
     }

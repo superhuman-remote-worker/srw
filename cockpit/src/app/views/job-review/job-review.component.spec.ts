@@ -312,6 +312,19 @@ describe('JobReviewComponent delivery section', () => {
     expect(fixture.componentInstance.getJobWorkspaceUrl()).toMatch(/\/job-29c28492$/);
   });
 
+  it('has no workspace link when the job has no repository', async () => {
+    for (const repo of [null, '', '   ']) {
+      TestBed.resetTestingModule();
+      await render(undefined, OPEN_STATUS, undefined, {repo_name: repo as unknown as string});
+      expect(fixture.componentInstance.getJobWorkspaceUrl()).toBeNull();
+    }
+  });
+
+  it('links the workspace when the job has a repository', async () => {
+    await render(undefined, OPEN_STATUS, undefined, {repo_name: 'my-repo'});
+    expect(fixture.componentInstance.getJobWorkspaceUrl()).toMatch(/\/my-repo$/);
+  });
+
   it('creates the server-derived session and navigates to it', async () => {
     await render();
 

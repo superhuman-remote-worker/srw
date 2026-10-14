@@ -254,6 +254,23 @@ describe('JobListComponent — server-resolved tree', () => {
   });
   afterEach(() => TestBed.resetTestingModule());
 
+  it('has no workspace URL for a job without a repository', () => {
+    const {component} = mountLogic();
+    for (const repo of [null, undefined, '', '   ']) {
+      expect(component.getWorkspaceUrl(job('j1', {repo_name: repo}) as JobSummary)).toBeNull();
+    }
+  });
+
+  it('builds the workspace URL for a job with a repository', () => {
+    const {component} = mountLogic();
+    expect(component.getWorkspaceUrl(job('j1', {repo_name: 'my-repo'}) as JobSummary)).toMatch(
+      /\/my-repo$/,
+    );
+    expect(
+      component.getWorkspaceUrl(job('j1', {repo_name: 'my-repo', branch_name: 'feat'}) as JobSummary),
+    ).toMatch(/\/my-repo\/src\/branch\/feat$/);
+  });
+
   it('opens a suspended VM IDE from the click and uses the admitted URL', () => {
     const startIdeSession = vi.fn().mockReturnValue(of({
       status: 'active', access_lease_id: 'lease-1',
