@@ -42,14 +42,20 @@ in the checks the migration needs. One phase per run, in this order:
             convert-type turns maintenance OFF itself on success and on a
             failed copy. A failure leaves config.php on SQLite; a retry needs
             a fresh backup (convert-type itself writes the SQLite file, see
-            verify) and ``--clear-schema``.
+            verify) and ``--clear-schema``. After a successful copy, still in
+            maintenance, raises every sequence: convert-type resyncs each to
+            max(id)+1, but SQLite's AUTOINCREMENT never reuses an id, so
+            sqlite_sequence remembers ids of deleted rows that Postgres would
+            otherwise hand out again (share ids SRW still holds, group folder
+            ids with orphan rows, fileids behind /f/ links).
   verify    read-only, while still in maintenance. ``dbtype`` is ``pgsql``;
             the SQLite file as convert-type left it differs from the backup
             only by convert-type's own writes (``--all-apps`` boots the
             disabled apps: the encryption app adds its key ids to appconfig,
             the user mount cache is emptied); every one of its tables is on
             Postgres with the same row count; the max ids match; every
-            sequence is past its column's max; encryption is still off. Then
+            sequence's next value is above both its column's max and SQLite's
+            high-water mark for the table; encryption is still off. Then
             (``--restart``: a rollout restart, which clears opcache) ``occ
             status``; instanceid/secret/passwordsalt unchanged (by digest);
             the sample files resolve to the same fileid and etag and read the
@@ -65,6 +71,13 @@ in the checks the migration needs. One phase per run, in this order:
             pod (``kubectl exec -i``, written beside and renamed), restarts
             and shows ``dbtype`` back on ``sqlite3``. Refuses when maintenance
             is off unless ``--i-know-maintenance-was-off``.
+  fix-sequences  repair for an install converted (and maybe opened) without
+            the raise: takes the high-water marks from inventory.json, the
+            local backup copy and the old SQLite file in the pod, whichever
+            exist, and raises each sequence under a write lock on its table.
+            Only ever raises, so it is safe on a live instance and a second
+            run is a no-op. Ids handed out before the repair may already be
+            reused; it cannot undo that.
 
 After ``open`` the first write lands on Postgres. Going back to SQLite then
 would hand out the same fileids again (overwriting their objects on an object
@@ -115,7 +128,16 @@ DEFAULT_SETTLE_SECONDS = 65
 #: The Deployment uses ``progressDeadlineSeconds: 900``.
 ROLLOUT_TIMEOUT = "900s"
 EMPTY_MD5 = hashlib.md5(b"").hexdigest()
-PHASES = ("precheck", "close", "backup", "convert", "verify", "open", "rollback")
+PHASES = (
+    "precheck",
+    "close",
+    "backup",
+    "convert",
+    "verify",
+    "open",
+    "rollback",
+    "fix-sequences",
+)
 _NAMESPACE_RE = re.compile(r"[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?\Z")
 #: Local environment variables whose values must never reach a command line.
 _SECRET_ENV_NAME = re.compile(r"PASSWORD|PASSWD|SECRET|TOKEN|_KEY\Z|CREDENTIAL", re.I)
@@ -216,6 +238,8 @@ PLANS: dict[str, list[str]] = {
         "db:convert-type -n --all-apps --port <port> pgsql <user> <host> <db>; "
         "php occ maintenance:mode --on",
         "[read] dbtype pgsql, maintenance on",
+        "[WRITE] still in maintenance: raise every Postgres sequence to the higher "
+        "of max(id) and SQLite's high-water mark (sqlite_sequence); never lowers one",
         "[local] write convert.log and convert.json",
     ],
     "verify": [
@@ -243,6 +267,14 @@ PLANS: dict[str, list[str]] = {
         "[WRITE] write the backed-up config.php into the pod (beside, then rename)",
         "[WRITE] kubectl rollout restart + rollout status",
         "[read] dbtype sqlite3; occ status",
+    ],
+    "fix-sequences": [
+        "[read] dbtype pgsql; SQLite high-water marks from inventory.json, the "
+        "local backup copy and the old SQLite file in the pod (whichever exist)",
+        "[WRITE] per table, locked against writes (reads go on): raise its "
+        "sequence to the higher of max(id) and the high-water mark; never lowers "
+        "one, so a second run changes nothing",
+        "[local] write fix-sequences.json",
     ],
 }
 
@@ -403,7 +435,10 @@ GROWTH_TOLERATED = ("appconfig", "mounts")
 
 
 def compare_inventories(
-    sqlite_inventory: dict[str, Any], postgres: dict[str, Any], prefix: str = "oc_"
+    sqlite_inventory: dict[str, Any],
+    postgres: dict[str, Any],
+    prefix: str = "oc_",
+    high_water: dict[str, int] | None = None,
 ) -> list[Finding]:
     """What a converted Postgres must match of the SQLite it was copied from."""
     findings: list[Finding] = []
@@ -480,31 +515,172 @@ def compare_inventories(
             else f"{len(expected_max)} columns equal",
         )
     )
+    findings.extend(
+        sequence_findings(postgres.get("sequences", []), high_water or {}, prefix)
+    )
+    return findings
+
+
+def sequence_findings(
+    sequences: list[dict[str, Any]], high_water: dict[str, int], prefix: str = "oc_"
+) -> list[Finding]:
+    """Every sequence must hand out ids above the table's max id AND above
+    SQLite's AUTOINCREMENT high-water mark, which also counts deleted rows."""
+    findings: list[Finding] = []
     behind = []
-    for sequence in postgres.get("sequences", []):
+    covered = set()
+    for sequence in sequences:
+        table = str(sequence["table"]).lower()
+        covered.add(table)
         if sequence.get("error"):
             behind.append(f"{sequence['sequence']}: {sequence['error']}")
             continue
         top = _int_or_none(sequence.get("max"))
+        high = high_water.get(table)
         upcoming = next_sequence_value(
             int(sequence["last_value"]),
             bool(sequence["is_called"]),
             int(sequence.get("increment") or 1),
         )
+        where = f"{sequence['table']}.{sequence['column']}"
         if top is not None and upcoming <= top:
+            behind.append(f"{where} next {upcoming} <= max id {top}")
+        elif high is not None and upcoming <= high:
             behind.append(
-                f"{sequence['table']}.{sequence['column']} next {upcoming} <= max {top}"
+                f"{where} next {upcoming} <= SQLite high-water {high} "
+                "(would reuse ids of deleted rows)"
             )
     findings.append(
         Finding(
             "FAIL" if behind else "PASS",
-            "sequences past their max",
+            "sequences past max id and SQLite high-water",
             "; ".join(behind[:10])
             if behind
-            else f"{len(postgres.get('sequences', []))} sequences",
+            else f"{len(sequences)} sequences, {len(high_water)} high-water marks",
+        )
+    )
+    unsequenced = sorted(
+        t for t in high_water if t.startswith(prefix.lower()) and t not in covered
+    )
+    if unsequenced:
+        findings.append(
+            Finding(
+                "WARN",
+                "high-water marks without a sequence",
+                ", ".join(unsequenced[:12])
+                + ": no serial column on Postgres, so no sequence can reuse an id",
+            )
+        )
+    return findings
+
+
+def merge_high_water(*inventories: dict[str, Any] | None) -> dict[str, int]:
+    """SQLite's AUTOINCREMENT marks (``sqlite_sequence``), highest per table.
+
+    The mark is the largest id ever handed out, deleted rows included; it
+    only grows, so the highest of several snapshots is the current one.
+    """
+    merged: dict[str, int] = {}
+    for inventory in inventories:
+        for table, seq in ((inventory or {}).get("sqlite_sequence") or {}).items():
+            if seq is None:
+                continue
+            key = str(table).lower()
+            merged[key] = max(merged.get(key, 0), int(seq))
+    return merged
+
+
+def marks_above_max(inventory: dict[str, Any]) -> list[tuple[str, int, int | None]]:
+    """Tables whose SQLite high-water mark is above their largest id: the
+    ones a plain max(id)+1 resync would hand out deleted rows' ids again."""
+    tops: dict[str, int | None] = {}
+    for key, value in max_ids(inventory).items():
+        table = key.split(".", 1)[0].lower()
+        tops[table] = value if tops.get(table) is None else max(tops[table], value or 0)
+    above = []
+    for table, mark in sorted(merge_high_water(inventory).items()):
+        top = tops.get(table)
+        if mark > (top or 0):
+            above.append((table, mark, top))
+    return above
+
+
+def sequence_target(high: int | None, current_max: int | None) -> int:
+    """The last value a sequence must have issued: above both marks."""
+    return max(int(high or 0), int(current_max or 0))
+
+
+def raise_findings(
+    entries: list[dict[str, Any]], marks: dict[str, int], prefix: str = "oc_"
+) -> list[Finding]:
+    """One INFO per sequence the in-pod raise moved, a FAIL per one it could
+    not, and a WARN for marks with no sequence on Postgres.
+
+    A table SQLite tracked in sqlite_sequence but Postgres gives no serial
+    column only warns: ids there are not drawn from a sequence, so none can
+    be reused, and a table that is missing altogether already fails verify's
+    row counts.
+    """
+    findings: list[Finding] = []
+    failed = raised = 0
+    covered = set()
+    for e in entries:
+        where = f"{e['table']}.{e['column']}"
+        covered.add(str(e["table"]).lower())
+        if e.get("error"):
+            failed += 1
+            findings.append(Finding("FAIL", f"sequence {where}", str(e["error"])))
+            continue
+        if int(e["next_after"]) <= int(e["target"]):
+            failed += 1
+            findings.append(
+                Finding(
+                    "FAIL",
+                    f"sequence {where}",
+                    f"next {e['next_after']} still <= {e['target']}",
+                )
+            )
+            continue
+        if e.get("raised"):
+            raised += 1
+            findings.append(
+                Finding(
+                    "INFO",
+                    f"raised {where}",
+                    f"next {e['next_before']} -> {e['next_after']} (SQLite high-water "
+                    f"{e.get('high_water')}, max id {e.get('max')})",
+                )
+            )
+    unsequenced = sorted(
+        t for t in marks if t.startswith(prefix.lower()) and t not in covered
+    )
+    if unsequenced:
+        findings.append(
+            Finding(
+                "WARN",
+                "high-water marks without a sequence",
+                ", ".join(unsequenced[:12])
+                + ": no serial column on Postgres, so no sequence can reuse an id",
+            )
+        )
+    findings.append(
+        Finding(
+            "FAIL" if failed else "PASS",
+            "sequences above max id and SQLite high-water",
+            f"{raised} raised, {len(entries) - raised - failed} already above, "
+            f"{failed} failed; {len(marks)} high-water marks",
         )
     )
     return findings
+
+
+def raised_next_value(
+    last_value: int, is_called: bool, increment: int, target: int
+) -> int:
+    """What ``nextval`` hands out after the raise rule: ``setval(target)``
+    only when the sequence would otherwise issue ``target`` or below."""
+    upcoming = next_sequence_value(last_value, is_called, increment)
+    return target + increment if upcoming <= target else upcoming
 
 
 def source_drift(
@@ -758,14 +934,66 @@ function open_db(array $cfg): array {
             . ($cfg['dbname'] ?? 'owncloud') . '.db');
     }
     if ($type === 'pgsql') {
-        [$host, $port] = split_host((string) ($cfg['dbhost'] ?? ''));
-        $dsn = 'pgsql:host=' . $host . ';port=' . $port . ';dbname='
-            . ($cfg['dbname'] ?? '') . ';connect_timeout=10';
-        $pdo = new PDO($dsn, $cfg['dbuser'] ?? '', $cfg['dbpassword'] ?? '', $opts);
-        $pdo->exec('SET default_transaction_read_only = on');
-        return [$pdo, 'pgsql', null];
+        return [open_pgsql($cfg, true), 'pgsql', null];
     }
     throw new RuntimeException('unsupported dbtype ' . $type);
+}
+
+// The Postgres config.php names (what Nextcloud itself connects with).
+function open_pgsql(array $cfg, bool $readonly): PDO {
+    [$host, $port] = split_host((string) ($cfg['dbhost'] ?? ''));
+    $dsn = 'pgsql:host=' . $host . ';port=' . $port . ';dbname='
+        . ($cfg['dbname'] ?? '') . ';connect_timeout=10';
+    $pdo = new PDO($dsn, $cfg['dbuser'] ?? '', $cfg['dbpassword'] ?? '', [
+        PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION,
+        PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC,
+    ]);
+    if ($readonly) {
+        $pdo->exec('SET default_transaction_read_only = on');
+    }
+    return $pdo;
+}
+
+// SQLite's AUTOINCREMENT marks: the largest id each table ever handed out,
+// deleted rows included (max(id) forgets those).
+function sqlite_high_water(PDO $pdo): array {
+    $has = $pdo->query("SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'sqlite_sequence'")->fetchColumn();
+    $marks = [];
+    if ((int) $has > 0) {
+        foreach ($pdo->query('SELECT name, seq FROM sqlite_sequence') as $r) {
+            $marks[$r['name']] = max($marks[$r['name']] ?? 0, (int) $r['seq']);
+        }
+    }
+    return $marks;
+}
+
+// Every serial (nextval default) or identity column of the prefixed tables,
+// with the sequence behind it.
+function serial_columns(PDO $pdo, string $p): array {
+    $st = $pdo->prepare(
+        "SELECT table_name, column_name, column_default,"
+        . " pg_get_serial_sequence(format('%I.%I', table_schema, table_name), column_name) AS seq"
+        . " FROM information_schema.columns WHERE table_schema = current_schema()"
+        . " AND table_name LIKE :like ESCAPE '\\'"
+        . " AND (column_default LIKE 'nextval(%' OR is_identity = 'YES') ORDER BY table_name, column_name"
+    );
+    $st->execute(['like' => like_prefix($p)]);
+    $out = [];
+    foreach ($st->fetchAll() as $r) {
+        $seq = $r['seq'];
+        if ($seq === null && preg_match("/nextval\\('([^']+)'/", (string) $r['column_default'], $m)) {
+            $seq = $m[1];
+        }
+        $out[] = ['table' => $r['table_name'], 'column' => $r['column_name'], 'sequence' => $seq];
+    }
+    return $out;
+}
+
+function sequence_state(PDO $pdo, string $seq): array {
+    $state = $pdo->query('SELECT last_value, is_called FROM ' . $seq)->fetch();
+    $inc = $pdo->prepare('SELECT seqincrement FROM pg_sequence WHERE seqrelid = CAST(:s AS regclass)');
+    $inc->execute(['s' => $seq]);
+    return [(int) $state['last_value'], (bool) $state['is_called'], (int) $inc->fetchColumn() ?: 1];
 }
 
 // --all-apps boots the disabled encryption app during a conversion, which
@@ -917,8 +1145,61 @@ emit([
         'freelist_count' => (int) $pdo->query('PRAGMA freelist_count')->fetchColumn(),
     ],
     'tables' => $tables,
+    'sqlite_sequence' => sqlite_high_water($pdo),
     'oidc_providers' => array_map(fn ($r) => ['id' => (int) $r['id'], 'identifier' => $r['identifier']], $providers),
 ]);
+"""
+
+_PHP_SQLITE_SEQUENCE = r"""
+[$pdo] = open_sqlite($INPUT['path']);
+emit(['path' => $INPUT['path'], 'sqlite_sequence' => sqlite_high_water($pdo)]);
+"""
+
+# Raises every sequence to the higher of the table's max id and SQLite's
+# high-water mark, never lowers one. Each table is locked against writes
+# (EXCLUSIVE: reads go on) while its sequence is read and set, so a live
+# instance cannot draw an id in between; lock_timeout bounds the wait.
+# Connects with config.php's credentials: the role Nextcloud itself uses,
+# which owns the sequences (POSTGRES_PASSWORD is install-time env only and
+# may be absent or rotated later).
+_PHP_RAISE_SEQUENCES = r"""
+$cfg = nc_config();
+if (($cfg['dbtype'] ?? '') !== 'pgsql') { throw new RuntimeException('the configured database is not Postgres'); }
+$pdo = open_pgsql($cfg, false);
+$pdo->exec("SET lock_timeout = '10s'");
+$high = $INPUT['high_water'];
+$out = [];
+foreach (serial_columns($pdo, prefix($cfg)) as $c) {
+    $entry = $c;
+    try {
+        $pdo->beginTransaction();
+        $pdo->exec('LOCK TABLE ' . qi($c['table']) . ' IN EXCLUSIVE MODE');
+        [$last, $called, $inc] = sequence_state($pdo, $c['sequence']);
+        $max = $pdo->query('SELECT max(' . qi($c['column']) . ') FROM ' . qi($c['table']))->fetchColumn();
+        $mark = $high[strtolower($c['table'])] ?? null;
+        $next = $called ? $last + $inc : $last;
+        $target = max((int) ($mark ?? 0), (int) ($max ?? 0));
+        $entry += [
+            'max' => $max === null ? null : (int) $max, 'high_water' => $mark,
+            'target' => $target, 'next_before' => $next, 'increment' => $inc,
+        ];
+        if ($next <= $target) {
+            $set = $pdo->prepare('SELECT setval(CAST(:s AS regclass), CAST(:t AS bigint), true)');
+            $set->execute(['s' => $c['sequence'], 't' => $target]);
+            $entry['raised'] = true;
+        } else {
+            $entry['raised'] = false;
+        }
+        [$last, $called, $inc] = sequence_state($pdo, $c['sequence']);
+        $entry['next_after'] = $called ? $last + $inc : $last;
+        $pdo->commit();
+    } catch (Throwable $e) {
+        if ($pdo->inTransaction()) { $pdo->rollBack(); }
+        $entry['error'] = scrub($e->getMessage());
+    }
+    $out[] = $entry;
+}
+emit(['sequences' => $out]);
 """
 
 _PHP_OVERRUN_ROWS = r"""
@@ -969,29 +1250,12 @@ foreach ($INPUT['idcols'] as [$table, $column]) {
         $max["$table.$column"] = 'error: ' . scrub($e->getMessage());
     }
 }
-$st = $pdo->prepare(
-    "SELECT table_name, column_name, column_default, is_identity,"
-    . " pg_get_serial_sequence(format('%I.%I', table_schema, table_name), column_name) AS seq"
-    . " FROM information_schema.columns WHERE table_schema = current_schema()"
-    . " AND table_name LIKE :like ESCAPE '\\'"
-    . " AND (column_default LIKE 'nextval(%' OR is_identity = 'YES') ORDER BY table_name, column_name"
-);
-$st->execute(['like' => like_prefix($p)]);
 $sequences = [];
-foreach ($st->fetchAll() as $r) {
-    $seq = $r['seq'];
-    if ($seq === null && preg_match("/nextval\\('([^']+)'/", (string) $r['column_default'], $m)) {
-        $seq = $m[1];
-    }
-    $entry = ['table' => $r['table_name'], 'column' => $r['column_name'], 'sequence' => $seq];
+foreach (serial_columns($pdo, $p) as $entry) {
     try {
-        $state = $pdo->query('SELECT last_value, is_called FROM ' . $seq)->fetch();
-        $inc = $pdo->prepare('SELECT seqincrement FROM pg_sequence WHERE seqrelid = CAST(:s AS regclass)');
-        $inc->execute(['s' => $seq]);
-        $entry['last_value'] = (int) $state['last_value'];
-        $entry['is_called'] = (bool) $state['is_called'];
-        $entry['increment'] = (int) $inc->fetchColumn();
-        $v = $pdo->query('SELECT max(' . qi($r['column_name']) . ') FROM ' . qi($r['table_name']))->fetchColumn();
+        [$last, $called, $inc] = sequence_state($pdo, $entry['sequence']);
+        $entry += ['last_value' => $last, 'is_called' => $called, 'increment' => $inc];
+        $v = $pdo->query('SELECT max(' . qi($entry['column']) . ') FROM ' . qi($entry['table']))->fetchColumn();
         $entry['max'] = $v === null ? null : (int) $v;
     } catch (Throwable $e) {
         $entry['error'] = scrub($e->getMessage());
@@ -1296,6 +1560,43 @@ def read_json(path: Path) -> dict[str, Any] | None:
         return json.loads(path.read_text(encoding="utf-8"))
     except FileNotFoundError:
         return None
+
+
+def local_high_water(files: Path) -> dict[str, Any] | None:
+    """sqlite_sequence of the local backup copy (``None``: no copy there).
+
+    Read from a scratch copy: opening the database with its WAL beside it
+    would fold the WAL in, changing the backed-up file.
+    """
+    databases = sorted(files.glob("*.db")) if files.is_dir() else []
+    if not databases:
+        return None
+    scratch = files.parent / "high-water-read"
+    shutil.rmtree(scratch, ignore_errors=True)
+    scratch.mkdir(mode=0o700)
+    try:
+        for name in (databases[0].name, databases[0].name + "-wal"):
+            if (files / name).is_file():
+                shutil.copy2(files / name, scratch / name)
+        conn = sqlite3.connect(scratch / databases[0].name)
+        try:
+            exists = conn.execute(
+                "SELECT count(*) FROM sqlite_master "
+                "WHERE type = 'table' AND name = 'sqlite_sequence'"
+            ).fetchone()[0]
+            rows = (
+                conn.execute("SELECT name, seq FROM sqlite_sequence").fetchall()
+                if exists
+                else []
+            )
+        finally:
+            conn.close()
+    finally:
+        shutil.rmtree(scratch, ignore_errors=True)
+    marks: dict[str, int] = {}
+    for name, seq in rows:
+        marks[name] = max(marks.get(name, 0), int(seq or 0))
+    return {"sqlite_sequence": marks}
 
 
 def md5_file(path: Path) -> str:
@@ -1619,6 +1920,19 @@ class Migration:
             "user_oidc providers",
             ", ".join(f"{x['id']}={x['identifier']}" for x in providers) or "none",
         )
+        above = marks_above_max(inventory)
+        r.line(
+            "INFO",
+            "AUTOINCREMENT high-water above max id",
+            f"{len(above)} of {len(inventory.get('sqlite_sequence') or {})} tables"
+            + (
+                ": "
+                + ", ".join(f"{t} {hw} > {top}" for t, hw, top in above[:10])
+                + " (convert raises these sequences)"
+                if above
+                else ""
+            ),
+        )
 
     # ------------------------------------------------------------------ close
     def close(self) -> None:
@@ -1783,6 +2097,7 @@ class Migration:
             "digests": facts["digests"],
             "version": status.get("versionstring"),
             "samples": samples,
+            "sqlite_sequence": inventory.get("sqlite_sequence", {}),
             "verified": bool(verified) and not hot,
         }
         write_json(out / "inventory.json", inventory)
@@ -1939,6 +2254,14 @@ class Migration:
                 "again with --clear-schema, or reopen on SQLite with "
                 "occ maintenance:mode --off",
             )
+        raised: list[dict[str, Any]] = []
+        if converted:
+            # convert-type resyncs every sequence to max(id)+1, but SQLite's
+            # AUTOINCREMENT never reuses an id, deleted rows' included. Raise
+            # them now, while maintenance still keeps every client out.
+            inventory = read_json(self.dir / "inventory.json") or {}
+            source = self.pod_high_water(f"{datadir.rstrip('/')}/{dbname}.db")
+            raised = self.raise_sequences(merge_high_water(inventory, source))
         write_json(
             self.dir / "convert.json",
             {
@@ -1948,6 +2271,7 @@ class Migration:
                 "dbtype": after["dbtype"],
                 "clear_schema": self.args.clear_schema,
                 "skipped_tables": skipped,
+                "sequences": raised,
             },
         )
         if converted:
@@ -1956,6 +2280,66 @@ class Migration:
                 "maintenance: the verify phase with --restart.",
                 flush=True,
             )
+
+    # ------------------------------------------------------- sequences
+    def pod_high_water(self, path: str) -> dict[str, Any] | None:
+        """sqlite_sequence of the SQLite file in the pod (``None``: none there)."""
+        try:
+            return self.kube.php(_PHP_SQLITE_SEQUENCE, {"path": path})
+        except MigrationError as exc:
+            if "no SQLite database at" in str(exc):
+                return None
+            raise
+
+    def raise_sequences(self, marks: dict[str, int]) -> list[dict[str, Any]]:
+        entries = self.kube.php(_PHP_RAISE_SEQUENCES, {"high_water": marks})[
+            "sequences"
+        ]
+        for item in raise_findings(entries, marks):
+            self.report.finding(item)
+        return entries
+
+    def fix_sequences(self) -> None:
+        """Repair an install converted without the raise: idempotent, raises only."""
+        r = self.report
+        facts = self.facts()
+        if facts["dbtype"] != "pgsql":
+            raise MigrationError(f"dbtype is {facts['dbtype']}: nothing to repair")
+        manifest = read_json(self.dir / "backup.json") or {}
+        sources: list[dict[str, Any] | None] = []
+        used = []
+        inventory = read_json(self.dir / "inventory.json")
+        if inventory and inventory.get("sqlite_sequence"):
+            sources.append(inventory)
+            used.append("inventory.json")
+        local = local_high_water(self.dir / "files")
+        if local is not None:
+            sources.append(local)
+            used.append("the local backup copy")
+        path = self.args.sqlite_path or (
+            f"{manifest['datadirectory'].rstrip('/')}/{manifest['dbname']}.db"
+            if manifest.get("datadirectory")
+            else f"{str(facts['datadirectory']).rstrip('/')}/nextcloud.db"
+        )
+        pod = self.pod_high_water(path)
+        if pod is not None:
+            sources.append(pod)
+            used.append(f"{path} in the pod")
+        if not used:
+            raise MigrationError(
+                "no SQLite high-water marks: no inventory.json with sqlite_sequence, "
+                f"no local backup copy in {self.dir / 'files'}, no {path} in the pod "
+                "(--sqlite-path)"
+            )
+        marks = merge_high_water(*sources)
+        r.line(
+            "INFO", "high-water marks", f"{len(marks)} tables from {', '.join(used)}"
+        )
+        entries = self.raise_sequences(marks)
+        write_json(
+            self.dir / "fix-sequences.json",
+            {"at": iso(utc_now()), "sources": used, "sequences": entries},
+        )
 
     # ----------------------------------------------------------------- verify
     def restart(self) -> None:
@@ -2051,7 +2435,15 @@ class Migration:
         r.line(
             "INFO", "Postgres", f"{pg['server_version']}, {len(pg['tables'])} tables"
         )
-        for item in compare_inventories(source, pg, prefix):
+        marks = merge_high_water(inventory, source)
+        if not inventory.get("sqlite_sequence"):
+            r.line(
+                "WARN",
+                "high-water marks",
+                "the backup predates recording sqlite_sequence; using the SQLite "
+                "file as convert-type left it",
+            )
+        for item in compare_inventories(source, pg, prefix, high_water=marks):
             r.finding(item)
         r.check(
             pg.get("encryption_enabled") == inventory.get("encryption_enabled"),
@@ -2281,6 +2673,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--chunk-size", type=int, help="convert: rows per query")
     parser.add_argument("--restart", action="store_true", help="verify: restart first")
     parser.add_argument("--settle-seconds", type=int, default=DEFAULT_SETTLE_SECONDS)
+    parser.add_argument(
+        "--sqlite-path",
+        help="fix-sequences: the old SQLite file in the pod (default: from "
+        "backup.json, else <datadirectory>/nextcloud.db)",
+    )
     parser.add_argument("--cron-container", default="cron")
     parser.add_argument(
         "--cron-wait-seconds",
@@ -2339,7 +2736,7 @@ def main(argv: list[str] | None = None) -> int:
         flush=True,
     )
     try:
-        getattr(migration, args.phase)()
+        getattr(migration, args.phase.replace("-", "_"))()
     except MigrationError as exc:
         migration.report.line("FAIL", args.phase, str(exc))
     failures = migration.report.failures

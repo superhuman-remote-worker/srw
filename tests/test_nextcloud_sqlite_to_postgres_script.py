@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import sqlite3
 import subprocess
 import sys
 from datetime import datetime, timedelta, timezone
@@ -188,7 +189,7 @@ class TestCompareInventories:
         levels = _levels(findings)
         assert levels["row counts"] == "PASS"
         assert levels["max ids"] == "PASS"
-        assert levels["sequences past their max"] == "PASS"
+        assert levels["sequences past max id and SQLite high-water"] == "PASS"
         # --all-apps adds migration rows of apps never enabled: not a failure.
         assert levels["table oc_migrations"] == "INFO"
 
@@ -246,7 +247,7 @@ class TestCompareInventories:
         )
         pg = _postgres(sequences=[sequence])
         levels = _levels(mig.compare_inventories(_sqlite_inventory(), pg))
-        assert levels["sequences past their max"] == level
+        assert levels["sequences past max id and SQLite high-water"] == level
 
     def test_an_empty_table_sequence_passes(self):
         sequence = dict(
@@ -257,7 +258,7 @@ class TestCompareInventories:
                 _sqlite_inventory(), _postgres(sequences=[sequence])
             )
         )
-        assert levels["sequences past their max"] == "PASS"
+        assert levels["sequences past max id and SQLite high-water"] == "PASS"
 
     def test_next_sequence_value(self):
         assert mig.next_sequence_value(10, True) == 11
@@ -334,6 +335,124 @@ class TestSourceDrift:
         source["encryption_enabled"] = "yes"
         levels = _levels(mig.source_drift(self._backup(), source))
         assert levels["source encryption_enabled"] == "FAIL"
+
+
+class TestHighWater:
+    """SQLite's AUTOINCREMENT never reuses an id; Postgres must not either."""
+
+    def test_the_target_is_the_higher_of_both_marks(self):
+        assert mig.sequence_target(51, 18) == 51  # deleted top rows
+        assert mig.sequence_target(10, 18) == 18  # mark behind the rows
+        assert mig.sequence_target(None, 18) == 18  # no AUTOINCREMENT
+        assert mig.sequence_target(51, None) == 51  # every row deleted
+        assert mig.sequence_target(None, None) == 0
+
+    @pytest.mark.parametrize("last_value", [1, 17, 18, 19, 50, 51, 52, 300])
+    @pytest.mark.parametrize("is_called", [True, False])
+    @pytest.mark.parametrize("increment", [1, 5])
+    @pytest.mark.parametrize("target", [0, 18, 51])
+    def test_the_raise_only_ever_raises(self, last_value, is_called, increment, target):
+        before = mig.next_sequence_value(last_value, is_called, increment)
+        after = mig.raised_next_value(last_value, is_called, increment, target)
+        assert after >= before
+        assert after > target
+        if before > target:
+            assert after == before  # already above: untouched
+
+    def test_marks_merge_to_the_highest_per_table(self):
+        merged = mig.merge_high_water(
+            {"sqlite_sequence": {"oc_share": 40, "OC_Mounts": 600}},
+            None,
+            {"sqlite_sequence": {"oc_share": 51, "oc_mounts": 669, "oc_x": None}},
+            {},
+        )
+        assert merged == {"oc_share": 51, "oc_mounts": 669}
+
+    def test_tables_whose_mark_is_above_their_max_id(self):
+        inventory = _sqlite_inventory()
+        inventory["tables"]["oc_group_folders"] = _table(
+            4, {"name": "folder_id", "type": "INTEGER", "pk": 1, "max": 295}
+        )
+        inventory["tables"]["oc_emptied"] = _table(
+            0, {"name": "id", "type": "INTEGER", "pk": 1, "max": None}
+        )
+        inventory["sqlite_sequence"] = {
+            "oc_share": 51,  # below max id 400
+            "oc_group_folders": 299,  # folders 296-299 deleted
+            "oc_filecache": 21337,  # equal
+            "oc_emptied": 9,  # every row deleted
+        }
+        assert mig.marks_above_max(inventory) == [
+            ("oc_emptied", 9, None),
+            ("oc_group_folders", 299, 295),
+        ]
+
+    def test_verify_fails_a_sequence_below_the_high_water_mark(self):
+        # The k3d case: convert-type left oc_share at max(id)+1 = 19, but
+        # SQLite had handed out ids up to 51; SRW still holds some of them.
+        sequence = {
+            "table": "oc_share",
+            "column": "id",
+            "sequence": "public.oc_share_id_seq",
+            "last_value": 18,
+            "is_called": True,
+            "increment": 1,
+            "max": 18,
+        }
+        levels = _levels(mig.sequence_findings([sequence], {"oc_share": 51}))
+        assert levels["sequences past max id and SQLite high-water"] == "FAIL"
+        raised = dict(sequence, last_value=51)
+        levels = _levels(mig.sequence_findings([raised], {"oc_share": 51}))
+        assert levels["sequences past max id and SQLite high-water"] == "PASS"
+
+    def test_verify_uses_the_high_water_marks_it_is_given(self):
+        pg = _postgres()
+        levels = _levels(
+            mig.compare_inventories(
+                _sqlite_inventory(), pg, high_water={"oc_filecache": 21400}
+            )
+        )
+        assert levels["sequences past max id and SQLite high-water"] == "FAIL"
+
+    def test_a_mark_without_a_sequence_only_warns(self):
+        levels = _levels(mig.sequence_findings([], {"oc_old_table": 7, "x_other": 3}))
+        assert levels["high-water marks without a sequence"] == "WARN"
+        assert levels["sequences past max id and SQLite high-water"] == "PASS"
+
+    def test_raise_findings(self):
+        entries = [
+            {"table": "oc_share", "column": "id", "max": 18, "high_water": 51,
+             "target": 51, "next_before": 19, "next_after": 52, "raised": True},
+            {"table": "oc_filecache", "column": "fileid", "max": 120,
+             "high_water": 90, "target": 120, "next_before": 121,
+             "next_after": 121, "raised": False},
+            {"table": "oc_jobs", "column": "id", "error": "lock timeout"},
+        ]  # fmt: skip
+        levels = _levels(
+            mig.raise_findings(entries, {"oc_share": 51, "oc_gone": 4, "oc_jobs": 9})
+        )
+        assert levels["raised oc_share.id"] == "INFO"
+        assert "raised oc_filecache.fileid" not in levels
+        assert levels["sequence oc_jobs.id"] == "FAIL"
+        assert levels["high-water marks without a sequence"] == "WARN"
+        assert levels["sequences above max id and SQLite high-water"] == "FAIL"
+
+    def test_the_local_backup_copy_yields_its_marks(self, tmp_path):
+        files = tmp_path / "files"
+        files.mkdir()
+        conn = sqlite3.connect(files / "nextcloud.db")
+        conn.execute("CREATE TABLE oc_share (id INTEGER PRIMARY KEY AUTOINCREMENT, x)")
+        conn.executemany(
+            "INSERT INTO oc_share (x) VALUES (?)", [(i,) for i in range(5)]
+        )
+        conn.execute("DELETE FROM oc_share WHERE id > 3")
+        conn.commit()
+        conn.close()
+        before = (files / "nextcloud.db").read_bytes()
+        assert mig.local_high_water(files) == {"sqlite_sequence": {"oc_share": 5}}
+        assert (files / "nextcloud.db").read_bytes() == before
+        assert not (tmp_path / "high-water-read").exists()
+        assert mig.local_high_water(tmp_path / "missing") is None
 
 
 class TestSmallHelpers:
@@ -504,6 +623,16 @@ class FakeCluster:
         self.calls: list[list[str]] = []
         self.inputs: list[str | bytes | None] = []
         self.cron_runs = 0
+        #: sqlite_sequence of the old SQLite file in the pod (None: gone).
+        self.pod_marks: dict[str, int] | None = {"oc_share": 51, "oc_filecache": 90}
+        #: Postgres sequences as convert-type leaves them: max(id)+1.
+        self.sequences = [
+            {"table": "oc_share", "column": "id", "sequence": "public.oc_share_id_seq",
+             "last_value": 18, "is_called": True, "increment": 1, "max": 18},
+            {"table": "oc_filecache", "column": "fileid",
+             "sequence": "public.oc_filecache_fileid_seq",
+             "last_value": 120, "is_called": True, "increment": 1, "max": 120},
+        ]  # fmt: skip
 
     def __call__(self, argv, input=None, text=True, capture_output=True, timeout=None):
         self.calls.append(list(argv))
@@ -568,6 +697,35 @@ class FakeCluster:
                 "prefixed_tables": 0,
                 "other_tables": 0,
             }
+        payload = json.loads(script.split("<<<'SRWJSON'\n", 1)[1].split("\nSRWJSON")[0])
+        if "emit(['path' => $INPUT['path']" in script:
+            if self.pod_marks is None:
+                return {
+                    "error": f"RuntimeException: no SQLite database at {payload['path']}"
+                }
+            return {"path": payload["path"], "sqlite_sequence": self.pod_marks}
+        if "IN EXCLUSIVE MODE" in script:
+            # The in-pod raise rule, applied to the fake sequences.
+            out = []
+            for seq in self.sequences:
+                mark = payload["high_water"].get(seq["table"])
+                nxt = mig.next_sequence_value(
+                    seq["last_value"], seq["is_called"], seq["increment"]
+                )
+                target = mig.sequence_target(mark, seq["max"])
+                raised = nxt <= target
+                if raised:
+                    seq["last_value"], seq["is_called"] = target, True
+                after = mig.next_sequence_value(
+                    seq["last_value"], seq["is_called"], seq["increment"]
+                )
+                out.append(
+                    {**{k: seq[k] for k in ("table", "column", "sequence", "max")},
+                     "high_water": mark, "target": target, "next_before": nxt,
+                     "increment": seq["increment"], "raised": raised,
+                     "next_after": after}
+                )  # fmt: skip
+            return {"sequences": out}
         raise AssertionError("unexpected PHP script")
 
 
@@ -695,6 +853,103 @@ class TestConvertGating:
         assert convert[:4] == ["kubectl", "--context=k3d-srw", "-n", "srw"]
         assert convert[-6:-1] == ["su", "-s", "/bin/sh", "www-data", "-c"]
         assert json.loads((tmp_path / "convert.json").read_text())["dbtype"] == "pgsql"
+
+    def test_convert_raises_sequences_to_the_high_water_in_maintenance(
+        self, tmp_path, capsys
+    ):
+        cluster = FakeCluster()
+        _settled(tmp_path)
+        _verified_backup(tmp_path)
+        # The backup's marks and the post-convert file's: the higher counts.
+        mig.write_json(
+            tmp_path / "inventory.json", {"sqlite_sequence": {"oc_share": 60}}
+        )
+        migration = _migration("convert", tmp_path, cluster)
+        migration.convert()
+        assert not migration.report.failures
+        share, filecache = cluster.sequences
+        assert mig.next_sequence_value(share["last_value"], True, 1) == 61
+        assert filecache["last_value"] == 120  # above its mark 90: untouched
+        assert cluster.maintenance is True
+        raise_call = next(
+            i
+            for i, data in enumerate(cluster.inputs)
+            if "IN EXCLUSIVE MODE" in (data or "")
+        )
+        convert_call = next(
+            i for i, a in enumerate(cluster.calls) if "db:convert-type" in a[-1]
+        )
+        assert raise_call > convert_call
+        out = capsys.readouterr().out
+        assert "INFO raised oc_share.id: next 19 -> 61" in out
+        recorded = json.loads((tmp_path / "convert.json").read_text())["sequences"]
+        assert [s["raised"] for s in recorded] == [True, False]
+
+    def test_a_failed_convert_raises_nothing(self, tmp_path):
+        cluster = FakeCluster()
+        _settled(tmp_path)
+        _verified_backup(tmp_path)
+        real = cluster.__call__
+
+        def failing(argv, **kwargs):
+            result = real(argv, **kwargs)
+            if "db:convert-type" in argv[-1]:
+                cluster.dbtype = "sqlite3"
+                return subprocess.CompletedProcess(argv, 7, "", "SQLSTATE[22001]")
+            return result
+
+        migration = _migration("convert", tmp_path, cluster)
+        migration.kube.runner = failing
+        migration.convert()
+        assert "convert-type failed" in migration.report.failures
+        assert not any("IN EXCLUSIVE MODE" in (d or "") for d in cluster.inputs)
+
+
+class TestFixSequences:
+    def test_raises_from_the_pod_file_and_is_idempotent(self, tmp_path, capsys):
+        cluster = FakeCluster(dbtype="pgsql")
+        migration = _migration("fix-sequences", tmp_path, cluster)
+        migration.fix_sequences()
+        assert not migration.report.failures
+        assert cluster.sequences[0]["last_value"] == 51
+        first = capsys.readouterr().out
+        assert "INFO raised oc_share.id: next 19 -> 52" in first
+        again = _migration("fix-sequences", tmp_path, cluster)
+        again.fix_sequences()
+        assert not again.report.failures
+        second = capsys.readouterr().out
+        assert "INFO raised" not in second
+        assert "0 raised, 2 already above" in second
+        assert cluster.sequences[0]["last_value"] == 51
+
+    def test_uses_the_local_backup_copy_when_the_pod_file_is_gone(self, tmp_path):
+        cluster = FakeCluster(dbtype="pgsql")
+        cluster.pod_marks = None
+        files = tmp_path / "files"
+        files.mkdir()
+        conn = sqlite3.connect(files / "nextcloud.db")
+        conn.execute("CREATE TABLE oc_share (id INTEGER PRIMARY KEY AUTOINCREMENT, x)")
+        conn.executemany(
+            "INSERT INTO oc_share (x) VALUES (?)", [(i,) for i in range(70)]
+        )
+        conn.execute("DELETE FROM oc_share WHERE id > 18")
+        conn.commit()
+        conn.close()
+        migration = _migration("fix-sequences", tmp_path, cluster)
+        migration.fix_sequences()
+        assert cluster.sequences[0]["last_value"] == 70
+
+    def test_refuses_without_any_high_water_source(self, tmp_path):
+        cluster = FakeCluster(dbtype="pgsql")
+        cluster.pod_marks = None
+        with pytest.raises(mig.MigrationError, match="no SQLite high-water marks"):
+            _migration("fix-sequences", tmp_path, cluster).fix_sequences()
+        assert not any("IN EXCLUSIVE MODE" in (d or "") for d in cluster.inputs)
+
+    def test_refuses_on_sqlite(self, tmp_path):
+        cluster = FakeCluster(dbtype="sqlite3")
+        with pytest.raises(mig.MigrationError, match="nothing to repair"):
+            _migration("fix-sequences", tmp_path, cluster).fix_sequences()
 
 
 class TestOpenAndRollbackGating:
