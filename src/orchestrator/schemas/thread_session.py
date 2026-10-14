@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any, Literal, Optional
+from typing import Any, Literal, Optional, get_args
 from uuid import UUID
 
 from pydantic import BaseModel, Field, model_validator
@@ -13,6 +13,7 @@ from orchestrator.schemas.inline_expert import InlineExpertSelection
 # The `threads.valid_permission_mode` CHECK values. Request schemas validate
 # against this so a bad value is a 422, not a 500 from the insert.
 PermissionMode = Literal["supervised", "auto_accept", "autonomous"]
+PERMISSION_MODES = frozenset(get_args(PermissionMode))
 
 
 class ThreadControlRequest(BaseModel):
@@ -56,9 +57,8 @@ class ThreadControlRequest(BaseModel):
 
     @model_validator(mode="after")
     def validate_method_mode_pair(self) -> "ThreadControlRequest":
-        permission_modes = {"supervised", "auto_accept", "autonomous"}
         narration_modes = {"silent", "verbose", "auto"}
-        if self.method == "mode.set" and self.mode not in permission_modes:
+        if self.method == "mode.set" and self.mode not in PERMISSION_MODES:
             raise ValueError("mode.set requires a permission mode")
         if self.method == "narration.set" and self.mode not in narration_modes:
             raise ValueError("narration.set requires a narration mode")
