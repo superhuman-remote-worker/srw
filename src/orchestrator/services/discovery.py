@@ -66,6 +66,7 @@ _MULTIMODAL_PATTERNS = (
     "gemini-1.5",  # gemini-1.5-pro, -flash, -flash-8b all do vision
     "gemini-2",  # gemini-2.x family is multimodal
     "gemini-3",
+    "gemini-4",
     "claude-opus",
     "claude-sonnet",
     "claude-3.5",

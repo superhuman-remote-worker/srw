@@ -570,6 +570,77 @@ gemini:
     # Vertex (which crop-tiles ~7x higher) — log the endpoint if that changes.
     image_tokens: { mode: flat, flat: 2304 }
 
+# Gemini 4 Argon (GA 2026-10-13, `gemini-4-argon`; OpenRouter `google/...`)
+# and Gemini 3.8 Flash (GA 2026-09-02, `gemini-3.8-flash`). Both were on the
+# generic `gemini` block, with no reasoning control, temperature 0.0 and the
+# top_p/top_k these models ignore. They share one API contract:
+#
+# - Thinking is always on. `thinking_level` takes low|medium|high, default
+#   medium. `minimal` and `thinking_budget` return HTTP 400 on Argon; 3.8 Flash
+#   rejects `minimal` and deprecates the budget. The native factory sends the
+#   level as `thinking_level`; OpenRouter and OpenAI-compatible endpoints get
+#   their own effort field.
+# - temperature, top_p and top_k are ignored ("as recent Gemini 3 models do"),
+#   and Google plans to reject them on later models. top_p/top_k stay unset;
+#   temperature is 1.0 because the factories always send one, and the native
+#   factory raises Gemini 3+ to 1.0 anyway (temperature-0 thinking loop:
+#   knowledge-base/knowledge/issues/gemini3_thinking_temperature_loop.md).
+#   3.8 Flash returns an error for frequency/presence penalties; SRW sends neither.
+# - 1,048,576-token window and 65,536 output tokens per synchronous request,
+#   thinking included. Argon's window is shared by input and output. A
+#   non-streaming direct HTTP request stops at 32,768 output tokens. Argon's
+#   long decode (output past 65,536 through continuation tokens) is not wired.
+# - Function calling, structured output (response_schema) and image input.
+#   Google asks for the full history, thought signatures included, on
+#   function-calling turns; the native langchain client keeps them for a live
+#   turn.
+# Verified 2026-10-14:
+# https://ai.google.dev/gemini-api/docs/models
+# https://ai.google.dev/gemini-api/docs/models/gemini-3.8-flash
+# https://ai.google.dev/gemini-api/docs/generate-content/latest-model
+# https://docs.cloud.google.com/gemini-enterprise-agent-platform/models/gemini/4-argon
+#
+# 3.8 Flash shares Argon's prompts. Gemini CLI sends one system prompt to every
+# Gemini 3.x model, 3.8 Flash included, and has no Argon-specific prompt. The
+# entries expand their shared anchors independently (there is no family
+# inheritance).
+gemini-4-argon:
+  reasoning: &gemini_next_reasoning
+    method: effort_enum
+    delivery: native
+    default: &gemini_next_default_effort medium
+    options: [low, medium, high]
+  prompts: &gemini_next_prompts
+    systemprompt: systemprompt_gemini_4_argon.txt
+    systemprompt_interactive: systemprompt_interactive_gemini_4_argon.txt
+    persona: persona_gemini_4_argon.txt
+  guardrails:
+    file: default.yaml
+  settings: &gemini_next_settings
+    shell_mode: persistent  # capable family -> stateful multi-tab shell (shell_execute); human/session override wins
+    structured_output_method: json_schema  # Google: steer output with thinking_level + response_schema
+    temperature: 1.0  # ignored by the backend; see above
+    # Override inherited expert-base high with the provider default; explicit
+    # expert/user/catalog settings still win.
+    reasoning_level: *gemini_next_default_effort
+    multimodal: true
+    # Same as the generic `gemini` block these models used before. Google
+    # documents parallel function calls, and Gemini CLI issues them.
+    parallel_tool_calls: true
+    model_max_context_tokens: 1048576
+    max_output_tokens: 65536  # per synchronous request, thinking included
+    # Same estimate as the generic `gemini` block: Gemini API (not Vertex)
+    # flat per-image billing, biased high. Calibrate from usage.
+    image_tokens: { mode: flat, flat: 2304 }
+
+gemini-3.8-flash:
+  reasoning: *gemini_next_reasoning
+  prompts: *gemini_next_prompts
+  guardrails:
+    file: default.yaml
+  settings:
+    <<: *gemini_next_settings
+
 claude-opus:
   # Anthropic moved from a raw thinking budget to *adaptive* thinking driven by
   # an effort level, and that is what an OpenAI-shaped client can actually

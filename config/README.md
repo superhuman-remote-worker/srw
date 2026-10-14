@@ -176,7 +176,10 @@ config/
 │   ├── persona_muse_spark_1_3.txt          # Muse Spark 1.3 persona
 │   ├── systemprompt_kimi_k3.txt            # Kimi K3 worker prompt
 │   ├── systemprompt_interactive_kimi_k3.txt # Kimi K3 chat prompt
-│   └── persona_kimi_k3.txt                 # Kimi K3 persona
+│   ├── persona_kimi_k3.txt                 # Kimi K3 persona
+│   ├── systemprompt_gemini_4_argon.txt     # Gemini 4 Argon / 3.8 Flash worker prompt
+│   ├── systemprompt_interactive_gemini_4_argon.txt # Gemini 4 Argon / 3.8 Flash chat prompt
+│   └── persona_gemini_4_argon.txt          # Gemini 4 Argon / 3.8 Flash persona
 └── templates/                   # Instruction templates (non-prompt files)
     ├── instructions.md                  # Default agent instructions
     ├── instructions_minimax.md          # MiniMax M2.7-optimized instructions
@@ -855,6 +858,41 @@ Sonnet 5.5 returns HTTP 400 for forced tool use, for disabling thinking, and for
 any non-default sampling value. SRW sends none of these: structured output uses
 `json_schema`, and 1.0 is Anthropic's default temperature. Do not switch the
 family to `function_calling`.
+
+## Gemini 4 Argon / Gemini 3.8 Flash
+
+The `gemini-4-argon` family covers Argon, including its allowlist-only
+`-cyber-permissive` variant. The `gemini-3.8-flash` family covers 3.8 Flash.
+Flash-Lite, TTS, image and Live ids are not matched, and neither are older
+Gemini rows. Those keep the generic `gemini` family. Both families use
+the same worker/chat/persona prompts. They follow the structure of Google's
+Gemini CLI system prompt, which Google sends to every Gemini 3.x model. Both
+families also have image input, parallel tool calls, a 1,048,576-token window
+and a 65,536-token response budget that includes thinking. Argon's window is
+shared by input and output.
+
+Thinking is always on. Effort is `low`, `medium` (default, as at Google), or
+`high`. `minimal` and `thinking_budget` return HTTP 400 on Argon. SRW clamps
+`minimal` and "off" to `low` and never sends a budget. The native Google
+provider sends the level as `thinking_level`. OpenRouter and OpenAI-compatible
+endpoints send their own effort field. Both models ignore temperature, top_p and
+top_k. The families leave top_p and top_k unset and keep temperature at 1.0,
+because the factories always send one.
+
+Long decode (Argon output past 65,536 tokens through continuation tokens) is
+not wired. A non-streaming direct HTTP request stops at 32,768 output tokens.
+Google asks for thought signatures to be sent back on function-calling turns.
+The native client keeps them within a live turn. A resumed history without
+them can be rejected, as with older Gemini 3 models.
+
+In **Admin → Models**, add `gemini-4-argon` or `gemini-3.8-flash` with a Google
+provider, or `google/gemini-4-argon` / `google/gemini-3.8-flash` with your
+OpenRouter provider. The family is detected automatically, including
+`openrouter/`, `google/` and `models/` prefixes. Adding the family does not
+create a catalog row. Sources: the
+[Gemini models list](https://ai.google.dev/gemini-api/docs/models), the
+[Argon guide](https://ai.google.dev/gemini-api/docs/generate-content/latest-model),
+and the [3.8 Flash model page](https://ai.google.dev/gemini-api/docs/models/gemini-3.8-flash).
 
 ## Schema Validation
 

@@ -431,6 +431,16 @@ def family_of(model_id: str, default: str = "default") -> str:
         return "qwen"
     if "llama" in name:
         return "llama"
+    # Argon (and its -cyber-permissive variant) and 3.8 Flash take the
+    # low|medium|high thinking ladder; older Gemini rows stay on `gemini`.
+    # The 3.8 guard leaves Flash-Lite, TTS, image and Live ids on `gemini`
+    # and accepts google/, models/ and dated or preview suffixes.
+    if re.search(r"(?:^|/)gemini-4-argon(?![\w.])", name):
+        return "gemini-4-argon"
+    if re.search(
+        r"(?:^|/)gemini-3\.8-flash(?![\w.])(?!-(?:lite|image|tts|live))", name
+    ):
+        return "gemini-3.8-flash"
     if name.startswith("gemini"):
         return "gemini"
     if name.startswith("gpt-oss"):

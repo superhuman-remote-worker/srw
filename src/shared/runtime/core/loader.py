@@ -4987,19 +4987,26 @@ def _create_anthropic_llm(
 # do NOT force a thinking level (3.5-flash's own default is "medium"; forcing
 # "high" raises latency and loop risk) and do NOT inflate ``max_output_tokens`` (a
 # loop just fills whatever cap it's given — more tokens wasted before the guard
-# fires, not fewer).
+# fires, not fewer). A family that declares Google's thinking ladder in the
+# matrix (Argon, 3.8 Flash) defaults to the provider's own "medium" and sends
+# the level as ``thinking_level``, so a higher level is the user's explicit pick.
 _GEMINI_THINKING_MIN_TEMPERATURE = 1.0
+
+#: Google's ``ThinkingLevel`` enum. A family ladder value outside it never
+#: reaches the wire.
+_GEMINI_THINKING_LEVELS = frozenset({"minimal", "low", "medium", "high"})
 
 
 def _is_gemini_3_or_later(model: str) -> bool:
-    """Gemini 3.x (incl. 3.5) — the generation with the temp-0 thinking loop."""
-    return "gemini-3" in (model or "").lower().replace("models/", "")
+    """Gemini 3.x and later (incl. 3.5, 3.8 and 4) — the temp-0 loop generation."""
+    match = re.search(r"gemini-(\d+)", (model or "").lower())
+    return match is not None and int(match.group(1)) >= 3
 
 
 def _is_gemini_thinking_model(model: str) -> bool:
-    """Gemini 2.5 and 3.x emit internal reasoning ("thinking" models)."""
+    """Gemini 2.5 and later emit internal reasoning ("thinking" models)."""
     m = (model or "").lower().replace("models/", "")
-    return "gemini-2.5" in m or "gemini-3" in m
+    return "gemini-2.5" in m or _is_gemini_3_or_later(m)
 
 
 def _create_google_llm(
@@ -5055,6 +5062,24 @@ def _create_google_llm(
             ):
                 llm_kwargs["temperature"] = _GEMINI_THINKING_MIN_TEMPERATURE
                 thinking_mode += f" temp={_GEMINI_THINKING_MIN_TEMPERATURE}"
+
+    # Thinking depth rides `thinking_level` only when the model's own matrix
+    # family declares an effort ladder (Argon, 3.8 Flash). The generic `gemini`
+    # block declares none, so older rows keep the model's default (2.5 takes a
+    # token budget instead), and a Gemini id that fell through to `default`
+    # never inherits that block's ladder.
+    _rplan = resolve_reasoning_plan(config)
+    if (
+        family_of(config.model) != "default"
+        and _rplan["method"] == "effort_enum"
+        and _rplan.get("value")
+    ):
+        level = _clamp_reasoning_level(
+            _rplan["value"], _supported_efforts(_rplan["cap"])
+        )
+        if level in _GEMINI_THINKING_LEVELS:
+            llm_kwargs["thinking_level"] = level
+            thinking_mode += f" level={level}"
 
     llm = ChatGoogleGenerativeAI(**llm_kwargs)
 

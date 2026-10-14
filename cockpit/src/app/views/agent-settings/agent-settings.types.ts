@@ -215,6 +215,9 @@ export function detectModelFamily(model: string): string {
   if (/(?:^|\/)qwen3\.8-max(?![\w.])/.test(name)) return 'qwen3.8-max';
   if (name.includes('qwen') || name.includes('qwq')) return 'qwen';
   if (name.includes('llama')) return 'llama';
+  // Argon and 3.8 Flash before the generic gemini rule — mirrors family_of().
+  if (/(?:^|\/)gemini-4-argon(?![\w.])/.test(name)) return 'gemini-4-argon';
+  if (/(?:^|\/)gemini-3\.8-flash(?![\w.])(?!-(?:lite|image|tts|live))/.test(name)) return 'gemini-3.8-flash';
   if (name.startsWith('gemini')) return 'gemini';
   if (name.startsWith('gpt-oss')) return 'gpt-oss';
   if (name.includes('gemma')) return 'gemma';
