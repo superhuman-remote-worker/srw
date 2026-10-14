@@ -675,6 +675,45 @@ container in the Pod shares one data PVC. Upgrades therefore include a brief,
 deliberate Nextcloud restart instead of risking a cross-node ReadWriteOnce
 multi-attach deadlock.
 
+### Nextcloud images and major upgrades
+
+`nextcloud.image` (Apache and cron) and `nextcloud.protectedEffect.fpmImage`
+(the protected-effect pool) pin one exact release plus its multi-arch index
+digest, e.g. `docker.io/library/nextcloud:31.0.14-apache@sha256:…`. Upstream
+re-pushes exact tags and stops serving a major's tags after its end of life;
+the digest keeps every node on the same bytes. The render fails unless both
+images are the same Nextcloud major, read from their tags; a digest-only
+reference needs `nextcloud.majorVersion`.
+
+Every Nextcloud start runs two init containers before Apache:
+`nextcloud-version-guard` refuses a skipped major or a downgrade with an
+explicit message, and `nextcloud-upgrade` runs the image's own install or
+upgrade (`rsync`, `occ upgrade`, app updates from the app store) with no
+probes, so a long upgrade is never killed halfway by the startupProbe. On an
+unchanged version both finish in seconds. Upgrade one major per chart release
+and let each roll out completely before the next. `occ upgrade` reinstalls
+incompatible apps (groupfolders, user_oidc) from the app store; an install
+without app-store access needs them pre-staged in `custom_apps/`.
+
+To serve the images from GitHub's registry instead of Docker Hub, run the
+**mirror-nextcloud-images** workflow (Actions → Run workflow) with the version
+and the two digests the chart pins. It copies them unchanged to
+`ghcr.io/superhuman-remote-worker/nextcloud`. Make that package public (or
+list a pull secret in `global.imagePullSecrets`), then set the same digests on
+the mirror:
+
+```yaml
+nextcloud:
+  image: ghcr.io/superhuman-remote-worker/nextcloud:31.0.14-apache@sha256:07ec73cc816e58d6f45a162cd53ef886462c29271a23fc68d0124cec276e3767
+  protectedEffect:
+    fpmImage: ghcr.io/superhuman-remote-worker/nextcloud:31.0.14-fpm@sha256:236e20aedaef1586e8fc9ca73f8d953695b7beecc55df4a931ada2bf1c82a9e1
+```
+
+The bytes are identical, so a node that already has the image does not pull
+it again. Each PHP container gets its own `NC_serverid` (Apache 1, cron 2,
+the protected pool 3, the upgrade step 4): Nextcloud 33 builds its job and
+preview ids from it, and before 33 nothing reads it.
+
 ### Bundled Nextcloud database
 
 A new bundled Nextcloud installs its metadata into a dedicated Postgres,

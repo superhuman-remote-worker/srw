@@ -858,6 +858,17 @@
         "enabled": {
           "type": "boolean"
         },
+        "image": {
+          "type": "string",
+          "minLength": 1
+        },
+        "majorVersion": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 1
+        },
         "database": {
           "type": "object",
           "properties": {

@@ -3091,7 +3091,19 @@ nextcloud:
   # which has no MinIO. Default true preserves existing prod behaviour.
   objectStore:
     enabled: true
-  image: docker.io/library/nextcloud:31-apache
+  # PINNED to an exact release plus its multi-arch index digest, like
+  # protectedEffect.fpmImage below, which must be the same major. Upstream
+  # re-pushes exact tags when its base images change and stops serving a
+  # major's tags after end of life; the digest keeps every node on the same
+  # bytes. Move one major per chart release: the version guard refuses a skip.
+  # The mirror-nextcloud-images workflow copies these digests to
+  # ghcr.io/superhuman-remote-worker/nextcloud; helm/README.md describes the
+  # switch.
+  image: docker.io/library/nextcloud:31.0.14-apache@sha256:07ec73cc816e58d6f45a162cd53ef886462c29271a23fc68d0124cec276e3767
+  # -- The Nextcloud major both images run. Read from their tags, so leave it
+  # null unless an image reference carries no version tag (digest only, or a
+  # tag like "stable-apache"); a tagged reference must agree with it.
+  majorVersion: null
   replicas: 0
   storageClass: ""
   storageSize: "10Gi"
@@ -3184,7 +3196,10 @@ nextcloud:
     # immutable Secret here. Chart-created mode generates its own Secret.
     hmacSecretName: ""
     hmacVaultPath: ""
-    fpmImage: docker.io/library/nextcloud:31-fpm
+    # Same release and pinning as nextcloud.image. The pool runs the code the
+    # main container installs on the shared volume with its own image's PHP,
+    # so the render fails unless both images are the same Nextcloud major.
+    fpmImage: docker.io/library/nextcloud:31.0.14-fpm@sha256:236e20aedaef1586e8fc9ca73f8d953695b7beecc55df4a931ada2bf1c82a9e1
     nginxImage: docker.io/library/nginx:1.27-alpine-slim
     queueBoundSeconds: 30
     handlerBoundSeconds: 10

@@ -131,6 +131,10 @@ def test_cron_env_is_a_secret_free_subset_of_the_apache_env() -> None:
         cron_env = _env(containers["cron"])
 
         for name, entry in cron_env.items():
+            if name == "NC_serverid":
+                # Distinct per PHP container by design (Nextcloud 33 ids).
+                assert apache_env[name] != entry
+                continue
             assert apache_env[name] == entry, name
         assert not SECRETS_THE_CRON_CONTAINER_NEVER_GETS & set(cron_env)
         secret_refs = {name for name, entry in cron_env.items() if "valueFrom" in entry}

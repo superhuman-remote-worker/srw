@@ -75,6 +75,65 @@ can fire before the hook reaches the pins.
   value: {{ include "srw.nextcloudVersionsRetention" . | quote }}
 {{- end -}}
 {{- /*
+What the image entrypoint needs to INSTALL (first start) and to UPGRADE
+(new image version): the admin account, the database it installs into, and
+the trusted domains it records. Read only by the entrypoint's init block, which
+runs in the nextcloud-upgrade init container; the Apache container keeps the
+same env so that block finds nothing to do there but would still be complete.
+
+Not runtime env: an installed Nextcloud reads its connection from config.php.
+The NC_serverid each PHP container also needs is set per container, because
+33+ requires a distinct one per process family: its Snowflake ids
+(oc_jobs, previews) fall back to a hash of the hostname, which every
+container in the Pod shares.
+*/ -}}
+{{- define "srw.nextcloudInstallEnv" -}}
+- name: NEXTCLOUD_ADMIN_USER
+  value: "admin"
+- name: NEXTCLOUD_ADMIN_PASSWORD
+  valueFrom:
+    secretKeyRef:
+      name: {{ include "srw.secretName" . }}
+      key: NEXTCLOUD_ADMIN_PASSWORD
+{{- if (include "srw.nextcloudUsesPostgres" .) }}
+# Install-time only: the entrypoint reads these for the first install, after
+# which config.php holds the connection. Never set SQLITE_DATABASE alongside
+# them: the entrypoint checks it first and would install SQLite anyway.
+- name: POSTGRES_HOST
+  value: {{ include "srw.nextcloudDbHost" . | quote }}
+- name: POSTGRES_DB
+  value: {{ include "srw.nextcloudDbName" . | quote }}
+- name: POSTGRES_USER
+  {{- if .Values.databases.nextcloud.internal }}
+  value: "nextcloud"
+  {{- else }}
+  valueFrom:
+    secretKeyRef:
+      name: {{ include "srw.secretName" . }}
+      key: NEXTCLOUD_DB_USER
+  {{- end }}
+# Optional so an installed Nextcloud (which keeps its own copy in config.php)
+# still starts without it; a new install refuses in wait-for-nextclouddb.
+- name: POSTGRES_PASSWORD
+  valueFrom:
+    secretKeyRef:
+      name: {{ include "srw.secretName" . }}
+      key: NEXTCLOUD_DB_PASSWORD
+      optional: true
+# The installer otherwise creates its own oc_admin role with a password kept
+# only in config.php wherever it may (the StatefulSet superuser may, a
+# CloudNativePG owner may not). Pinned off, both engines connect as the
+# database owner with this password.
+- name: NC_setup_create_db_user
+  value: "false"
+{{- else }}
+- name: SQLITE_DATABASE
+  value: "nextcloud"
+{{- end }}
+- name: NEXTCLOUD_TRUSTED_DOMAINS
+  value: "{{ include "srw.fullname" . }}-nextcloud {{ (urlParse (include "srw.cloudUrl" .)).host }}"
+{{- end -}}
+{{- /*
 Server settings mounted as files into the image's include directories. They
 are read once at process start (subPath mounts never update in place), so the
 Pod carries their checksum and restarts when they change. Neither file is a
@@ -513,59 +572,108 @@ spec:
           image: busybox:1.36
           command: ["sh", "-c", "until nc -z -w 2 {{ include "srw.nextcloudRedisHost" . }} 6379; do sleep 2; done"]
         {{- end }}
+        # Nextcloud upgrades one major at a time. The entrypoint refuses a
+        # skip too, but only from inside a crash-looping Apache container;
+        # this says so up front, before anything touches the data.
+        - name: nextcloud-version-guard
+          image: {{ .Values.nextcloud.image | quote }}
+          command:
+            - sh
+            - -c
+            - |
+              set -eu
+              DATA=/var/www/html/version.php
+              IMAGE=/usr/src/nextcloud/version.php
+              # The major is the first number of $OC_Version, in either
+              # array syntax.
+              major() {
+                sed -n 's/^[[:space:]]*\$OC_Version[[:space:]]*=[^0-9]*\([0-9][0-9]*\).*/\1/p' "$1" | head -n 1
+              }
+              if [ ! -f "$DATA" ]; then
+                echo "No Nextcloud installed yet: nothing to upgrade from."
+                exit 0
+              fi
+              installed=$(major "$DATA")
+              image=$(major "$IMAGE")
+              for value in "$installed" "$image"; do
+                case "$value" in
+                  ''|*[!0-9]*)
+                    echo "REFUSING TO START: cannot read the Nextcloud major from $DATA or $IMAGE." >&2
+                    exit 1
+                    ;;
+                esac
+              done
+              if [ "$image" -lt "$installed" ]; then
+                cat >&2 <<EOF
+              ============================================================
+              REFUSING TO START: the installed Nextcloud is $installed and
+              this image is $image. Nextcloud cannot be downgraded; deploy a
+              Nextcloud $installed image again.
+              ============================================================
+              EOF
+                exit 1
+              fi
+              if [ "$image" -gt $((installed + 1)) ]; then
+                cat >&2 <<EOF
+              ============================================================
+              REFUSING TO START: the installed Nextcloud is $installed and
+              this image is $image. Nextcloud upgrades one major at a time:
+              upgrade to $((installed + 1)) first, and let that release roll
+              out completely before deploying this one.
+              ============================================================
+              EOF
+                exit 1
+              fi
+              if [ "$image" -eq "$installed" ]; then
+                echo "Nextcloud $installed: no major upgrade."
+              else
+                echo "Nextcloud $installed -> $image: one major, nextcloud-upgrade runs it."
+              fi
+          volumeMounts:
+            - name: data
+              mountPath: /var/www/html
+              readOnly: true
+        # Installs or upgrades Nextcloud before Apache starts: the image
+        # entrypoint's own init block (rsync, maintenance:install or
+        # occ upgrade, with the app store for incompatible apps), run with
+        # NEXTCLOUD_UPDATE=1 and `true` in place of the server. An init
+        # container has no probes, so a long upgrade cannot be killed halfway
+        # by the Apache container's startupProbe; that container's entrypoint
+        # then finds the data at the image's version and skips straight to
+        # the setup hook, which stays there with its secrets. On an unchanged
+        # version this is a no-op. Same image and data volume, the
+        # install-time env, and the runtime env Nextcloud's config files read.
+        - name: nextcloud-upgrade
+          image: {{ .Values.nextcloud.image | quote }}
+          args: ["true"]
+          env:
+            - name: NEXTCLOUD_UPDATE
+              value: "1"
+            {{- include "srw.nextcloudInstallEnv" . | nindent 12 }}
+            {{- include "srw.nextcloudRuntimeEnv" . | nindent 12 }}
+            - name: NC_serverid
+              value: "4"
+          volumeMounts:
+            - name: data
+              mountPath: /var/www/html
+            - name: server-config
+              mountPath: /usr/local/etc/php/conf.d/zz-srw.ini
+              subPath: php-srw.ini
+              readOnly: true
+          resources:
+            {{- toYaml .Values.nextcloud.resources | nindent 12 }}
       containers:
         - name: nextcloud
-          image: {{ .Values.nextcloud.image }}
+          image: {{ .Values.nextcloud.image | quote }}
           ports:
             - containerPort: 80
           env:
-            - name: NEXTCLOUD_ADMIN_USER
-              value: "admin"
-            - name: NEXTCLOUD_ADMIN_PASSWORD
-              valueFrom:
-                secretKeyRef:
-                  name: {{ include "srw.secretName" . }}
-                  key: NEXTCLOUD_ADMIN_PASSWORD
-            {{- if (include "srw.nextcloudUsesPostgres" .) }}
-            # Install-time only: the entrypoint reads these for the first
-            # install, after which config.php holds the connection. Never set
-            # SQLITE_DATABASE alongside them: the entrypoint checks it first
-            # and would install SQLite anyway.
-            - name: POSTGRES_HOST
-              value: {{ include "srw.nextcloudDbHost" . | quote }}
-            - name: POSTGRES_DB
-              value: {{ include "srw.nextcloudDbName" . | quote }}
-            - name: POSTGRES_USER
-              {{- if .Values.databases.nextcloud.internal }}
-              value: "nextcloud"
-              {{- else }}
-              valueFrom:
-                secretKeyRef:
-                  name: {{ include "srw.secretName" . }}
-                  key: NEXTCLOUD_DB_USER
-              {{- end }}
-            # Optional so an installed Nextcloud (which keeps its own copy in
-            # config.php) still starts without it; a new install refuses in
-            # wait-for-nextclouddb instead.
-            - name: POSTGRES_PASSWORD
-              valueFrom:
-                secretKeyRef:
-                  name: {{ include "srw.secretName" . }}
-                  key: NEXTCLOUD_DB_PASSWORD
-                  optional: true
-            # The installer otherwise creates its own oc_admin role with a
-            # password kept only in config.php wherever it may (the StatefulSet
-            # superuser may, a CloudNativePG owner may not). Pinned off, both
-            # engines connect as the database owner with this password.
-            - name: NC_setup_create_db_user
-              value: "false"
-            {{- else }}
-            - name: SQLITE_DATABASE
-              value: "nextcloud"
-            {{- end }}
-            - name: NEXTCLOUD_TRUSTED_DOMAINS
-              value: "{{ include "srw.fullname" . }}-nextcloud {{ (urlParse (include "srw.cloudUrl" .)).host }}"
+            {{- include "srw.nextcloudInstallEnv" . | nindent 12 }}
             {{- include "srw.nextcloudRuntimeEnv" . | nindent 12 }}
+            # Distinct per PHP container (Apache 1, cron 2, protected pool 3,
+            # upgrade 4); see srw.nextcloudInstallEnv. Nothing reads it before 33.
+            - name: NC_serverid
+              value: "1"
             # OIDC auto-configuration (used by before-starting hook)
             - name: NEXTCLOUD_OIDC_CLIENT_SECRET
               valueFrom:
@@ -631,10 +739,12 @@ spec:
         # Nextcloud chart does. Same code and data volume and runtime env as
         # the Apache container; no setup hook and none of its secrets.
         - name: cron
-          image: {{ .Values.nextcloud.image }}
+          image: {{ .Values.nextcloud.image | quote }}
           command: ["/cron.sh"]
           env:
             {{- include "srw.nextcloudRuntimeEnv" . | nindent 12 }}
+            - name: NC_serverid
+              value: "2"
           volumeMounts:
             - name: data
               mountPath: /var/www/html
@@ -693,6 +803,9 @@ spec:
               value: {{ .Values.nextcloud.protectedEffect.capabilityMaxAgeSeconds | quote }}
             - name: NEXTCLOUD_PROTECTED_EFFECT_MAX_CHILDREN
               value: {{ .Values.nextcloud.protectedEffect.maxChildren | quote }}
+            # Distinct per PHP container; see srw.nextcloudInstallEnv.
+            - name: NC_serverid
+              value: "3"
             {{- if (include "srw.nextcloudUsesPostgres" .) }}
             {{- $effect := .Values.nextcloud.protectedEffect }}
             {{- $statementBoundMs := mul (min (int $effect.handlerBoundSeconds) (int $effect.safetyMarginSeconds)) 1000 }}

@@ -424,6 +424,31 @@ Whether the bundled protected-effect lane is deployed.
 {{- else if $effect.enabled -}}true{{- end -}}
 {{- end }}
 
+{{/*
+The Nextcloud major an image reference runs: the leading number of its tag,
+so `nextcloud:31.0.14-apache@sha256:...` and `nextcloud:31-fpm` are both 31. A
+registry port (`host:5000/nextcloud:31-apache`) is not a tag. A reference with
+no numeric tag (digest only, or `stable-apache`) takes nextcloud.majorVersion,
+and a numeric tag that disagrees with a set majorVersion fails the render.
+Usage: include "srw.nextcloudImageMajor" (dict "context" . "image" $ref "name" "nextcloud.image")
+*/}}
+{{- define "srw.nextcloudImageMajor" -}}
+{{- $ref := .image | toString -}}
+{{- $declared := .context.Values.nextcloud.majorVersion -}}
+{{- $tagged := "^(?:.*/)?[^/@:]+:([0-9]+)[^/@:]*(?:@sha256:[0-9a-f]{64})?$" -}}
+{{- if regexMatch $tagged $ref -}}
+  {{- $major := regexReplaceAll $tagged $ref "${1}" | int -}}
+  {{- if and (not (kindIs "invalid" $declared)) (ne (int $declared) $major) -}}
+    {{- fail (printf "%s %q is Nextcloud %d, but nextcloud.majorVersion says %d. Correct or unset nextcloud.majorVersion." .name $ref $major (int $declared)) -}}
+  {{- end -}}
+  {{- $major -}}
+{{- else if not (kindIs "invalid" $declared) -}}
+  {{- int $declared -}}
+{{- else -}}
+  {{- fail (printf "%s %q carries no Nextcloud version tag, so the chart cannot tell its major. Use a tagged reference (repo:31.0.14-apache@sha256:...) or set nextcloud.majorVersion." .name $ref) -}}
+{{- end -}}
+{{- end }}
+
 {{- define "srw.nextcloudProtectedEffectValidate" -}}
 {{- $effect := .Values.nextcloud.protectedEffect -}}
 {{- $effectEnabled := eq (include "srw.nextcloudProtectedEffectEnabled" .) "true" -}}
@@ -464,6 +489,16 @@ Whether the bundled protected-effect lane is deployed.
   {{- end -}}
   {{- if or (le (int $effect.maxChildren) 0) (gt (int $effect.maxChildren) 64) -}}
     {{- fail "nextcloud.protectedEffect.maxChildren must be an integer between 1 and 64" -}}
+  {{- end -}}
+  {{- /* The pool never runs the image entrypoint: it serves whatever code the
+         main container installed on the shared volume, on its own image's
+         PHP. A pool one major behind or ahead runs that code on a PHP it was
+         never released for. Image references are not lane values, so the
+         lane digest does not change with them. */ -}}
+  {{- $mainMajor := include "srw.nextcloudImageMajor" (dict "context" . "image" .Values.nextcloud.image "name" "nextcloud.image") | int -}}
+  {{- $fpmMajor := include "srw.nextcloudImageMajor" (dict "context" . "image" $effect.fpmImage "name" "nextcloud.protectedEffect.fpmImage") | int -}}
+  {{- if ne $mainMajor $fpmMajor -}}
+    {{- fail (printf "nextcloud.image is Nextcloud %d but nextcloud.protectedEffect.fpmImage is Nextcloud %d. The protected-effect pool runs the main container's code and must be the same major; move both images in one release." $mainMajor $fpmMajor) -}}
   {{- end -}}
 {{- end -}}
 {{- end }}

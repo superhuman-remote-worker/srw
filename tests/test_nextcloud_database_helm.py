@@ -176,7 +176,13 @@ def test_wait_for_nextclouddb_gates_only_a_new_install() -> None:
     documents = _documents(*BUNDLED)
     init = _init(documents)
 
-    assert list(init) == ["wait-for-keycloak", "wait-for-nextclouddb"]
+    # Before the version guard and the install/upgrade step that needs it.
+    assert list(init) == [
+        "wait-for-keycloak",
+        "wait-for-nextclouddb",
+        "nextcloud-version-guard",
+        "nextcloud-upgrade",
+    ]
     wait = init["wait-for-nextclouddb"]
     assert wait["image"] == "postgres:16"
     assert wait["volumeMounts"] == [
