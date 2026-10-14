@@ -53,8 +53,10 @@ def _precondition_headers(if_match: Optional[str], if_none_match: bool) -> list[
 
     ``If-Match`` on a known etag and ``If-None-Match: *`` for a believed-absent
     path are the hard fence of commit-then-effects: a stale push owner whose
-    DB token was bumped can still have ONE write in flight; the server refuses
-    it with 412 instead of clobbering the successor's newer bytes.
+    DB token was bumped can still have writes in flight (at most
+    ``CLOUD_PUSH_PARALLEL_UPLOADS``, each carrying its own precondition); the
+    server refuses each with 412 instead of clobbering the successor's newer
+    bytes.
     """
 
     headers: list[str] = []

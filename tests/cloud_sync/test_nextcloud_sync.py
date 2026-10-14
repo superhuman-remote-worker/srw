@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import email.message
+import hashlib
 import io
 from pathlib import Path
+import threading
 from types import SimpleNamespace
 from urllib.parse import urlsplit
 
@@ -14,6 +16,12 @@ import requests
 from requests.adapters import BaseAdapter
 from requests.structures import CaseInsensitiveDict
 
+from agent.services.cloud_sync import base
+from agent.services.cloud_sync.base import (
+    CLOUD_PUSH_PARALLEL_UPLOADS,
+    StagedGenerationDelta,
+    StagedUpload,
+)
 from agent.services.cloud_sync.nextcloud_sync import NextcloudWorkspaceSync
 from shared.http_no_cookies import NoCookieJar
 
@@ -467,3 +475,85 @@ async def test_download_is_two_propfinds_and_a_get(tmp_path):
     await sync._download_file("a.txt", str(out))
     assert out.read_bytes() == b"payload"
     assert [m for m, _p, _c in adapter.seen] == ["PROPFIND", "PROPFIND", "GET"]
+
+
+# Parallel generation uploads through the real client and its real options.
+
+
+async def _ok() -> None:
+    return None
+
+
+def _staged(tmp_path: Path, paths: list[str]) -> StagedGenerationDelta:
+    uploads = []
+    for path in paths:
+        local = tmp_path / f"staged-{path.replace('/', '_')}"
+        local.write_bytes(path.encode())
+        uploads.append(
+            StagedUpload(
+                path=path,
+                tmp_path=str(local),
+                sha256=hashlib.sha256(path.encode()).hexdigest(),
+                size=len(path),
+                if_none_match=True,
+            )
+        )
+    return StagedGenerationDelta(
+        uploads=uploads, deletes=[], manifest={}, planned=len(paths)
+    )
+
+
+@pytest.mark.asyncio
+async def test_parallel_uploads_share_one_real_client(tmp_path):
+    sync = _real_sync(tmp_path)
+    assert sync._get_client().webdav.disable_check is True
+    paths = [f"out/{index}.txt" for index in range(8)]
+    routes = {("MKCOL", f"{_BASE}/out/"): (201, {}, b"")}
+    for path in paths:
+        routes[("PUT", f"{_BASE}/{path}")] = (201, {"ETag": f'"{path}"'}, b"")
+    adapter = _mount(sync, routes)
+    together = threading.Barrier(CLOUD_PUSH_PARALLEL_UPLOADS, timeout=5)
+    preconditions: list[str | None] = []
+    send = adapter.send
+
+    def send_together(request, **kwargs):
+        if request.method == "PUT":
+            preconditions.append(request.headers.get("If-None-Match"))
+            together.wait()  # passes only with K PUTs on the wire at once
+        return send(request, **kwargs)
+
+    adapter.send = send_together
+    commit = await sync.transmit_generation_delta(
+        _staged(tmp_path, paths), before_write=_ok
+    )
+    assert commit.paths == paths
+    assert {path: entry["remote_etag"] for path, entry in commit.manifest.items()} == {
+        path: f'"{path}"' for path in paths
+    }
+    assert adapter.seen[0][:2] == ("MKCOL", f"{_BASE}/out/")
+    assert [method for method, _p, _c in adapter.seen[1:]] == ["PUT"] * len(paths)
+    assert preconditions == ["*"] * len(paths)
+    assert all(cookie is None for _m, _p, cookie in adapter.seen)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", [423, 503])
+async def test_a_real_busy_answer_is_retried(tmp_path, monkeypatch, status):
+    monkeypatch.setattr(base, "_BUSY_WRITE_RETRY_DELAYS", (0.0, 0.0, 0.0))
+    sync = _real_sync(tmp_path)
+    route = ("PUT", f"{_BASE}/a.txt")
+    routes = {route: (status, {}, b"")}
+    adapter = _mount(sync, routes)
+    send = adapter.send
+
+    def busy_then_accept(request, **kwargs):
+        response = send(request, **kwargs)
+        routes[route] = (201, {"ETag": '"e1"'}, b"")
+        return response
+
+    adapter.send = busy_then_accept
+    commit = await sync.transmit_generation_delta(
+        _staged(tmp_path, ["a.txt"]), before_write=_ok
+    )
+    assert commit.manifest["a.txt"]["remote_etag"] == '"e1"'
+    assert [method for method, _p, _c in adapter.seen] == ["PUT", "PUT"]

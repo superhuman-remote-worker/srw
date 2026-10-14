@@ -16,13 +16,15 @@ import hashlib
 import json
 import logging
 import os
+import random
 import tempfile
 import time as _time
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Awaitable, Callable, Optional
+from typing import TYPE_CHECKING, Awaitable, Callable, Iterable, Optional, TypeVar
 
+from agent.api.lease_context import LeaseLostError
 from agent.core.backends.overlay import unwrap_backend
 from shared.cloud_sync_generations import (
     normalize_push_progress,
@@ -53,6 +55,21 @@ SYNC_IGNORE_PATTERNS = [
 ]
 
 SYNC_GENERATION_MARKER_DIR = ".srw/sync-generations"
+
+# Uploads (and directory creates) in flight per generation transmit. Each
+# upload checks the DB fence a few times and the agent's pool tops out at 10;
+# an SQLite-backed Nextcloud answers 423/503 under parallel writes; Nextcloud's
+# desktop client runs 3 transfers at once and rclone defaults to 4.
+CLOUD_PUSH_PARALLEL_UPLOADS = 4
+
+# A write refused because the server is momentarily busy (Nextcloud's
+# "database is locked" surfaces as 423 or 503) is retried after each of these
+# delays, plus up to half again as jitter, so parallel workers do not retry in
+# step. Anything else fails the write at once.
+_BUSY_WRITE_STATUSES = frozenset({423, 503})
+_BUSY_WRITE_RETRY_DELAYS = (0.5, 1.0, 2.0)
+
+_T = TypeVar("_T")
 
 
 class CloudSyncMarkerError(RuntimeError):
@@ -85,8 +102,9 @@ class CloudSyncFenceLost(RuntimeError):
     """A conditional remote write was refused (HTTP 412) by a writer that is
     no longer the owner. Commit-then-effects
     (stateless_turn_resilience.md step 4a): the DB fence stops a stale owner
-    at its next write; this is the hard stop for the one write already in
-    flight when the fence flipped."""
+    at its next write; this is the hard stop for the writes already in
+    flight when the fence flipped (at most ``CLOUD_PUSH_PARALLEL_UPLOADS``,
+    each carrying its own precondition)."""
 
 
 @dataclass
@@ -215,6 +233,97 @@ def _normalize_dav_listing(raw: list, webdav_base_path: str) -> list[dict]:
             }
         )
     return out
+
+
+def _is_fence_loss(exc: BaseException) -> bool:
+    """The writer was fenced off: by the DB (lease/push owner) or by a 412."""
+
+    return isinstance(exc, (CloudSyncFenceLost, LeaseLostError))
+
+
+def _busy_write_refusal(exc: BaseException) -> bool:
+    """A 423 or 503 from the transport: retried briefly, not a failure yet.
+
+    webdav3 raises ``ResponseErrorCode`` (with ``code``) for a 503 and its
+    own ``ResourceLocked`` (without one) for a 423.
+    """
+
+    if getattr(exc, "code", None) in _BUSY_WRITE_STATUSES:
+        return True
+    return type(exc).__name__ == "ResourceLocked"
+
+
+def _parent_dirs_by_level(paths: Iterable[str]) -> list[list[str]]:
+    """Every ancestor directory of ``paths``, grouped by depth, shallowest first."""
+
+    levels: dict[int, set[str]] = {}
+    for path in paths:
+        parent = Path(path).parent
+        while str(parent) not in ("", "."):
+            levels.setdefault(len(parent.parts), set()).add(str(parent))
+            parent = parent.parent
+    return [sorted(levels[depth]) for depth in sorted(levels)]
+
+
+async def _drain_bounded(
+    items: list[_T],
+    work: Callable[[_T, Callable[[], bool]], Awaitable[None]],
+    *,
+    limit: int,
+) -> None:
+    """Run ``work(item, stopping)`` over ``items``, at most ``limit`` at once.
+
+    The staging-reader pattern: workers pull from one shared iterator and
+    take no new item once any call has failed; ``stopping()`` lets a call cut
+    its own retries short. The workers run under ``asyncio.shield``, so a
+    cancelled caller still waits for every call in flight: cancelling
+    ``to_thread`` does not stop its request, and a write must not be able to
+    land after the caller was told the transmit stopped. After the drain a
+    cancellation propagates; otherwise the first fence loss wins over the
+    first other error, so a stale writer reports that it was fenced off
+    rather than a side effect of being fenced off.
+    """
+
+    if not items:
+        return
+    remaining = iter(items)
+    stopping = False
+    errors: list[BaseException] = []
+
+    def should_stop() -> bool:
+        return stopping
+
+    async def worker() -> None:
+        nonlocal stopping
+        while not stopping:
+            item = next(remaining, None)
+            if item is None:
+                return
+            try:
+                await work(item, should_stop)
+            except BaseException as exc:
+                stopping = True
+                errors.append(exc)
+                return
+
+    workers = asyncio.gather(
+        *(worker() for _ in range(min(limit, len(items)))),
+        return_exceptions=True,
+    )
+    try:
+        await asyncio.shield(workers)
+    except BaseException:
+        stopping = True
+        while not workers.done():
+            try:
+                await asyncio.shield(workers)
+            except asyncio.CancelledError:
+                # A second shutdown signal must not abandon a write in
+                # flight either.
+                continue
+        raise
+    if errors:
+        raise next((exc for exc in errors if _is_fence_loss(exc)), errors[0])
 
 
 class WorkspaceSyncBase(abc.ABC):
@@ -809,11 +918,61 @@ class WorkspaceSyncBase(abc.ABC):
             stage_seconds=walked - started,
         )
 
+    async def _put_retrying_busy(
+        self,
+        upload: StagedUpload,
+        *,
+        before_write: Callable[[], Awaitable[None]],
+        if_match: Optional[str],
+        if_none_match: bool,
+        stopping: Optional[Callable[[], bool]] = None,
+    ) -> Optional[str]:
+        """One conditional PUT, retried while the server says it is busy.
+
+        A 423 or 503 is retried after each of ``_BUSY_WRITE_RETRY_DELAYS``;
+        every attempt goes back through the fence and carries the same
+        precondition, so a retry of a PUT that did land comes back as a 412
+        for ``_write_conditionally`` to resolve. Any other error, a busy
+        answer after the last delay, or one while the transmit is stopping,
+        raises.
+        """
+
+        attempt = 0
+        while True:
+            try:
+                return await self._upload_file(
+                    upload.path,
+                    upload.tmp_path,
+                    before_write=before_write,
+                    if_match=if_match,
+                    if_none_match=if_none_match,
+                )
+            except Exception as exc:
+                if (
+                    attempt >= len(_BUSY_WRITE_RETRY_DELAYS)
+                    or not _busy_write_refusal(exc)
+                    or (stopping is not None and stopping())
+                ):
+                    raise
+                delay = _BUSY_WRITE_RETRY_DELAYS[attempt]
+                attempt += 1
+                logger.info(
+                    "cloud push write for %s refused as busy (%s %s); retry %d "
+                    "in %.1fs",
+                    upload.path,
+                    type(exc).__name__,
+                    getattr(exc, "code", 423),
+                    attempt,
+                    delay,
+                )
+            await asyncio.sleep(delay * random.uniform(1.0, 1.5))
+
     async def _write_conditionally(
         self,
         upload: StagedUpload,
         *,
         before_write: Callable[[], Awaitable[None]],
+        stopping: Optional[Callable[[], bool]] = None,
     ) -> Optional[str]:
         """One PUT with its precondition; the 412 policy in one place.
 
@@ -825,12 +984,12 @@ class WorkspaceSyncBase(abc.ABC):
         """
 
         try:
-            return await self._upload_file(
-                upload.path,
-                upload.tmp_path,
+            return await self._put_retrying_busy(
+                upload,
                 before_write=before_write,
                 if_match=upload.if_match,
                 if_none_match=upload.if_none_match,
+                stopping=stopping,
             )
         except CloudSyncFenceLost:
             await before_write()  # raises if the DB says we are stale
@@ -840,12 +999,12 @@ class WorkspaceSyncBase(abc.ABC):
                 "with the current remote etag",
                 upload.path,
             )
-            return await self._upload_file(
-                upload.path,
-                upload.tmp_path,
+            return await self._put_retrying_busy(
+                upload,
                 before_write=before_write,
                 if_match=fresh,
                 if_none_match=fresh is None,
+                stopping=stopping,
             )
 
     async def _delete_conditionally(
@@ -882,47 +1041,83 @@ class WorkspaceSyncBase(abc.ABC):
         its precondition; ``progress_cb`` is told after each write lands so
         the durable progress lets a successor resume. Temp files are removed
         whether or not the transmit completes.
+
+        Order: every parent directory first, one level at a time; then the
+        uploads, at most ``CLOUD_PUSH_PARALLEL_UPLOADS`` in flight; then, only
+        once every upload has landed, the deletes one at a time. A failure
+        or a fence loss stops new writes; the writes already in flight finish
+        (each still guarded by its precondition) before the error is raised.
         """
 
         started = _time.perf_counter()
         committed_manifest = {
             path: dict(entry) for path, entry in staged.manifest.items()
         }
+        # By staged index, so commit.paths keeps the staged (sorted) order
+        # whatever order the parallel uploads land in.
+        landed: list[Optional[str]] = [None] * len(staged.uploads)
         pushed: list[str] = []
+        dirs_missing = 0
+        mkdir_seconds = put_seconds = 0.0
+
+        async def mkdir(rel_dir: str, _stopping: Callable[[], bool]) -> None:
+            await before_write()
+            await self._ensure_remote_dirs(rel_dir, before_write=before_write)
+
+        async def put(
+            item: tuple[int, StagedUpload], stopping: Callable[[], bool]
+        ) -> None:
+            index, upload = item
+            await before_write()
+            # Free when phase 1 made the parent; asks again if it could not.
+            await self._ensure_remote_dirs(
+                str(Path(upload.path).parent), before_write=before_write
+            )
+            etag = await self._write_conditionally(
+                upload, before_write=before_write, stopping=stopping
+            )
+            # Landed: record it on the event loop, whatever happens to the
+            # rest of the batch, so a successor can skip it.
+            self._pushed_sizes[upload.path] = upload.size
+            self._remote_known_paths.add(upload.path)
+            self._remote_content_hashes[upload.path] = upload.sha256
+            if etag:
+                self._remote_state[upload.path] = etag
+            else:
+                self._remote_state.pop(upload.path, None)
+            committed_manifest[upload.path] = {
+                "sha256": upload.sha256,
+                "remote_etag": etag or "",
+            }
+            landed[index] = upload.path
+            if progress_cb is not None:
+                await progress_cb(
+                    upload.path,
+                    {
+                        "sha256": upload.sha256,
+                        "size": upload.size,
+                        "remote_etag": etag or "",
+                        "state": "uploaded",
+                    },
+                )
+
         try:
             await before_write()
             await self._ensure_ready()
-            for upload in staged.uploads:
-                await before_write()
-                await self._ensure_remote_dirs(
-                    str(Path(upload.path).parent), before_write=before_write
-                )
-                await before_write()
-                etag = await self._write_conditionally(
-                    upload, before_write=before_write
-                )
-                self._pushed_sizes[upload.path] = upload.size
-                self._remote_known_paths.add(upload.path)
-                self._remote_content_hashes[upload.path] = upload.sha256
-                if etag:
-                    self._remote_state[upload.path] = etag
-                else:
-                    self._remote_state.pop(upload.path, None)
-                committed_manifest[upload.path] = {
-                    "sha256": upload.sha256,
-                    "remote_etag": etag or "",
-                }
-                pushed.append(upload.path)
-                if progress_cb is not None:
-                    await progress_cb(
-                        upload.path,
-                        {
-                            "sha256": upload.sha256,
-                            "size": upload.size,
-                            "remote_etag": etag or "",
-                            "state": "uploaded",
-                        },
-                    )
+            phase = _time.perf_counter()
+            for level in _parent_dirs_by_level(u.path for u in staged.uploads):
+                missing = [d for d in level if d not in self._remote_dirs]
+                dirs_missing += len(missing)
+                await _drain_bounded(missing, mkdir, limit=CLOUD_PUSH_PARALLEL_UPLOADS)
+            mkdir_seconds = _time.perf_counter() - phase
+            phase = _time.perf_counter()
+            await _drain_bounded(
+                list(enumerate(staged.uploads)),
+                put,
+                limit=CLOUD_PUSH_PARALLEL_UPLOADS,
+            )
+            put_seconds = _time.perf_counter() - phase
+            pushed = [path for path in landed if path is not None]
             for delete in staged.deletes:
                 await before_write()
                 await self._delete_conditionally(delete, before_write=before_write)
@@ -949,7 +1144,8 @@ class WorkspaceSyncBase(abc.ABC):
         )
         logger.info(
             "cloud generation push detail: mount=%s walk=%.2fs files=%d "
-            "uploads=%d deletes=%d resumed=%d total=%.2fs",
+            "uploads=%d deletes=%d resumed=%d total=%.2fs dirs=%d mkdir=%.2fs "
+            "put=%.2fs parallel=%d",
             self._mount_subdir or "<root>",
             staged.stage_seconds,
             staged.files_walked,
@@ -957,6 +1153,10 @@ class WorkspaceSyncBase(abc.ABC):
             len(staged.deletes),
             staged.skipped_by_progress,
             _time.perf_counter() - started + staged.stage_seconds,
+            dirs_missing,
+            mkdir_seconds,
+            put_seconds,
+            CLOUD_PUSH_PARALLEL_UPLOADS,
         )
         return CloudSyncGenerationCommit(
             paths=pushed,

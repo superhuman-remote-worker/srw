@@ -19,7 +19,13 @@ from typing import Any
 
 import pytest
 
-from agent.services.cloud_sync.base import CloudSyncFenceLost, CloudSyncMarker
+from agent.api.lease_context import LeaseLostError
+from agent.services.cloud_sync import base
+from agent.services.cloud_sync.base import (
+    CLOUD_PUSH_PARALLEL_UPLOADS,
+    CloudSyncFenceLost,
+    CloudSyncMarker,
+)
 from agent.services.cloud_sync.coordinator import (
     CloudSyncError,
     MountSync,
@@ -223,14 +229,19 @@ async def test_stage_then_transmit_uses_preconditions_and_cleans_temp_files(
     assert (remote / "a.txt").read_bytes() == b"alpha"
     assert (remote / "sub" / "b.txt").read_bytes() == b"bravo"
     assert not any(os.path.exists(p) for p in tmp_paths)
-    assert sync.conditional_writes == [("a.txt", None, True), ("sub/b.txt", None, True)]
+    # Parallel uploads land in any order; commit.paths keeps the staged one.
+    assert sorted(sync.conditional_writes) == [
+        ("a.txt", None, True),
+        ("sub/b.txt", None, True),
+    ]
+    assert commit.paths == ["a.txt", "sub/b.txt"]
     # the manifest now carries the server's etag for every landed path
     assert commit.manifest["a.txt"] == {
         "sha256": _sha(b"alpha"),
         "remote_etag": _sha(b"alpha"),
     }
-    assert [p for p, _ in landed] == ["a.txt", "sub/b.txt"]
-    assert landed[0][1] == {
+    assert sorted(p for p, _ in landed) == ["a.txt", "sub/b.txt"]
+    assert dict(landed)["a.txt"] == {
         "sha256": _sha(b"alpha"),
         "size": 5,
         "remote_etag": _sha(b"alpha"),
@@ -430,6 +441,266 @@ async def test_deletes_carry_if_match_and_report_progress(tmp_path: Path):
         ("old.txt", {"sha256": "", "size": 0, "remote_etag": "", "state": "deleted"})
     ]
     assert commit.manifest == {}
+
+
+# ------------------------------------------------------- parallel transmit
+
+
+PATHS = [f"{index:02}.txt" for index in range(10)]
+OLD = {"old.txt": {"sha256": _sha(b"old"), "remote_etag": _sha(b"old")}}
+
+
+async def _ten_uploads_and_a_delete(tmp_path: Path):
+    sync, ws, remote = _sync(tmp_path)
+    for path in PATHS:
+        (ws / path).write_bytes(path.encode())
+    (remote / "old.txt").write_bytes(b"old")
+    staged = await sync.stage_generation_delta(OLD)
+    assert [u.path for u in staged.uploads] == PATHS
+    assert [d.path for d in staged.deletes] == ["old.txt"]
+    return sync, remote, staged
+
+
+class _InFlight:
+    """Holds every upload after its last DB check, as if on the wire.
+
+    ``started`` lists the uploads that passed their fence; ``full`` is set
+    once a whole batch is in flight; ``release`` lets them all answer.
+    """
+
+    def __init__(self, sync: LocalFsWorkspaceSync, answers: dict | None = None):
+        self.started: list[str] = []
+        self.full = asyncio.Event()
+        self.release = asyncio.Event()
+        self._answers = answers or {}
+        self._upload = sync._upload_file
+        sync._upload_file = self.upload
+
+    async def upload(self, path, local_path, *, before_write=None, **kwargs):
+        await before_write()  # the request's last DB check passed ...
+        self.started.append(path)
+        if len(self.started) == CLOUD_PUSH_PARALLEL_UPLOADS:
+            self.full.set()
+        await self.release.wait()  # ... and it is on the wire
+        if path in self._answers:
+            raise self._answers[path]
+        return await self._upload(path, local_path, **kwargs)
+
+
+@pytest.mark.asyncio
+async def test_uploads_run_k_at_a_time_and_all_land_before_any_delete(tmp_path):
+    sync, remote, staged = await _ten_uploads_and_a_delete(tmp_path)
+    events: list[tuple[str, str]] = []
+    active = peak = 0
+    upload, delete = sync._upload_file, sync._delete_remote_file
+
+    async def slow_upload(path, local_path, **kwargs):
+        nonlocal active, peak
+        active += 1
+        peak = max(peak, active)
+        try:
+            # Later paths answer sooner, so landing order is not staged order.
+            await asyncio.sleep(0.005 * (len(PATHS) - PATHS.index(path)))
+            return await upload(path, local_path, **kwargs)
+        finally:
+            active -= 1
+            events.append(("put", path))
+
+    async def recorded_delete(path, **kwargs):
+        events.append(("delete", path))
+        await delete(path, **kwargs)
+
+    sync._upload_file = slow_upload
+    sync._delete_remote_file = recorded_delete
+    landed: list[str] = []
+
+    async def progress(path: str, entry: dict[str, Any]) -> None:
+        landed.append(path)
+
+    commit = await sync.transmit_generation_delta(
+        staged, before_write=_ok, progress_cb=progress
+    )
+    assert peak == CLOUD_PUSH_PARALLEL_UPLOADS == 4
+    assert len(events) == 11 and events[-1] == ("delete", "old.txt")
+    assert landed[:-1] != PATHS and sorted(landed) == sorted(PATHS + ["old.txt"])
+    assert commit.paths == PATHS + ["old.txt"]
+    assert sorted(commit.manifest) == PATHS
+    assert sorted(p.name for p in remote.iterdir()) == PATHS
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fenced", [LeaseLostError, CloudSyncFenceLost])
+async def test_fence_loss_mid_batch_lets_in_flight_writes_land_and_starts_no_more(
+    tmp_path, fenced
+):
+    sync, remote, staged = await _ten_uploads_and_a_delete(tmp_path)
+    tmp_paths = [u.tmp_path for u in staged.uploads]
+    lost = False
+
+    async def fence() -> None:
+        if lost:
+            raise fenced("adopted by a successor")
+
+    wire = _InFlight(sync)
+    landed: list[str] = []
+
+    async def progress(path: str, entry: dict[str, Any]) -> None:
+        landed.append(path)
+
+    task = asyncio.create_task(
+        sync.transmit_generation_delta(staged, before_write=fence, progress_cb=progress)
+    )
+    try:
+        await asyncio.wait_for(wire.full.wait(), timeout=2)
+        lost = True
+        wire.release.set()
+        with pytest.raises(fenced):
+            await task
+    finally:
+        wire.release.set()
+        await asyncio.gather(task, return_exceptions=True)
+    in_flight = PATHS[:CLOUD_PUSH_PARALLEL_UPLOADS]
+    assert wire.started == in_flight  # nothing new after the flip
+    assert sorted(landed) == in_flight  # landed writes are still recorded
+    # ... and the delete was never issued
+    assert sorted(p.name for p in remote.iterdir()) == in_flight + ["old.txt"]
+    assert not any(os.path.exists(p) for p in tmp_paths)
+
+
+@pytest.mark.asyncio
+async def test_a_fence_loss_is_raised_over_an_earlier_ordinary_error(tmp_path):
+    sync, remote, staged = await _ten_uploads_and_a_delete(tmp_path)
+    lost = False
+
+    async def fence() -> None:
+        if lost:
+            raise LeaseLostError("push-owner fence")
+
+    # 00 fails on the wire first; 01 gets a 412 and its recheck finds the
+    # fence gone. The stale writer must report the fence, not the reset.
+    wire = _InFlight(
+        sync,
+        {
+            "00.txt": OSError("connection reset"),
+            "01.txt": CloudSyncFenceLost("412"),
+        },
+    )
+    task = asyncio.create_task(
+        sync.transmit_generation_delta(staged, before_write=fence)
+    )
+    try:
+        await asyncio.wait_for(wire.full.wait(), timeout=2)
+        lost = True
+        wire.release.set()
+        with pytest.raises(LeaseLostError):
+            await task
+    finally:
+        wire.release.set()
+        await asyncio.gather(task, return_exceptions=True)
+    assert sorted(p.name for p in remote.iterdir()) == ["02.txt", "03.txt", "old.txt"]
+
+
+@pytest.mark.asyncio
+async def test_cancelled_transmit_waits_for_the_uploads_in_flight(tmp_path):
+    sync, remote, staged = await _ten_uploads_and_a_delete(tmp_path)
+    tmp_paths = [u.tmp_path for u in staged.uploads]
+    wire = _InFlight(sync)
+    landed: list[str] = []
+
+    async def progress(path: str, entry: dict[str, Any]) -> None:
+        landed.append(path)
+
+    task = asyncio.create_task(
+        sync.transmit_generation_delta(staged, before_write=_ok, progress_cb=progress)
+    )
+    try:
+        await asyncio.wait_for(wire.full.wait(), timeout=2)
+        task.cancel()
+        await asyncio.sleep(0)
+        assert not task.done(), "cancellation must wait for writes in flight"
+        task.cancel()
+        await asyncio.sleep(0)
+        assert not task.done(), "repeated cancellation must also wait"
+        assert all(os.path.exists(p) for p in tmp_paths)  # still being read
+        wire.release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    finally:
+        wire.release.set()
+        await asyncio.gather(task, return_exceptions=True)
+    in_flight = PATHS[:CLOUD_PUSH_PARALLEL_UPLOADS]
+    assert wire.started == in_flight
+    assert sorted(landed) == in_flight
+    assert sorted(p.name for p in remote.iterdir()) == in_flight + ["old.txt"]
+    assert not any(os.path.exists(p) for p in tmp_paths)
+
+
+class _Status(Exception):
+    def __init__(self, code: int) -> None:
+        super().__init__(f"HTTP {code}")
+        self.code = code
+
+
+class ResourceLocked(Exception):
+    """webdav3's 423: no ``code`` attribute, recognised by name."""
+
+
+async def _flaky_single_upload(tmp_path, monkeypatch, errors):
+    monkeypatch.setattr(base, "_BUSY_WRITE_RETRY_DELAYS", (0.0, 0.0, 0.0))
+    sync, ws, remote = _sync(tmp_path)
+    (ws / "a.txt").write_bytes(b"alpha")
+    staged = await sync.stage_generation_delta({})
+    upload = sync._upload_file
+    attempts = 0
+    fence_checks = 0
+
+    async def flaky(path, local_path, *, before_write=None, **kwargs):
+        nonlocal attempts
+        attempts += 1
+        await before_write()
+        if errors:
+            raise errors.pop(0)
+        return await upload(path, local_path, **kwargs)
+
+    async def fence() -> None:
+        nonlocal fence_checks
+        fence_checks += 1
+
+    sync._upload_file = flaky
+    try:
+        commit = await sync.transmit_generation_delta(staged, before_write=fence)
+    except Exception as exc:
+        commit = exc
+    return commit, attempts, fence_checks, remote
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("busy", [503, 423])
+async def test_busy_answers_are_retried_and_every_attempt_is_fenced(
+    tmp_path, monkeypatch, busy
+):
+    error = _Status(503) if busy == 503 else ResourceLocked("/a.txt")
+    commit, attempts, fence_checks, remote = await _flaky_single_upload(
+        tmp_path, monkeypatch, [error, error]
+    )
+    assert commit.paths == ["a.txt"] and attempts == 3
+    # transmit start, the upload's own check, then one per attempt
+    assert fence_checks == 2 + 3
+    assert (remote / "a.txt").read_bytes() == b"alpha"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "error, attempts", [(_Status(503), 4), (_Status(500), 1), (_Status(507), 1)]
+)
+async def test_busy_retries_are_bounded_and_other_errors_fail_at_once(
+    tmp_path, monkeypatch, error, attempts
+):
+    outcome, tried, _checks, remote = await _flaky_single_upload(
+        tmp_path, monkeypatch, [error] * 10
+    )
+    assert outcome is error and tried == attempts
+    assert not (remote / "a.txt").exists()
 
 
 # ---------------------------------------------------------------- coordinator
