@@ -406,6 +406,7 @@ describe('Dynamic Canvas rendering trust boundary', () => {
     });
   });
 
+  // Builds ~10k-20k spans; the default 5 s timeout flakes under full-suite load.
   it('accepts the exact sanitized node ceiling and rejects one additional text node', () => {
     const exact = '<span>x</span>'.repeat(CANVAS_RENDER_MAX_NODES / 2);
     const accepted = renderCanvasStaticHtml(exact);
@@ -414,7 +415,7 @@ describe('Dynamic Canvas rendering trust boundary', () => {
 
     const rejected = renderCanvasStaticHtml(`${exact}x`);
     expect(rejected).toEqual({html: '', errorCode: 'canvas_content_too_complex'});
-  });
+  }, 30_000);
 
   it('allows a near-2 MiB text node without multiplying it into DOM nodes', () => {
     const source = 'x'.repeat(2 * 1024 * 1024 - 1);
@@ -424,6 +425,7 @@ describe('Dynamic Canvas rendering trust boundary', () => {
     expect(result.html.length).toBeLessThan(CANVAS_RENDER_MAX_OUTPUT_CHARS);
   });
 
+  // Builds ~10k-20k spans; the default 5 s timeout flakes under full-suite load.
   it('rejects pathological Markdown and HTML with a fixed, source-free result', () => {
     const marker = '<script>do-not-reflect-me</script>';
     const markdown = Array.from(
@@ -439,7 +441,7 @@ describe('Dynamic Canvas rendering trust boundary', () => {
     const rejected = renderCanvasStaticHtml(html);
     expect(rejected).toEqual({html: '', errorCode: 'canvas_content_too_complex'});
     expect(rejected.html).not.toContain('do-not-reflect-me');
-  });
+  }, 30_000);
 });
 
 describe('declared renderer labelling', () => {

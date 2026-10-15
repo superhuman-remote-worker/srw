@@ -97,6 +97,109 @@ def test_native_hosting_defaults_disabled_and_contract_cutover_recreates():
 
 
 @pytest.mark.parametrize(
+    ("settings", "expected_namespace"),
+    [
+        ((), "native-test-native"),
+        (("manifestHosting.namespace=other-native",), "other-native"),
+    ],
+)
+def test_core_receives_the_native_namespace_bound_by_the_chart(
+    settings, expected_namespace
+):
+    docs = render("fullnameOverride=native-test", *settings)
+    config = next(
+        doc
+        for doc in docs
+        if doc["kind"] == "ConfigMap" and "MANIFEST_NAMESPACE" in doc.get("data", {})
+    )
+    deployment = next(
+        doc
+        for doc in docs
+        if doc["kind"] == "Deployment"
+        and doc["metadata"]["name"].endswith("-orchestrator")
+    )
+    namespace_env = [
+        entry
+        for entry in deployment["spec"]["template"]["spec"]["containers"][0]["env"]
+        if entry["name"] == "MANIFEST_NAMESPACE"
+    ]
+    assert namespace_env == [
+        {
+            "name": "MANIFEST_NAMESPACE",
+            "valueFrom": {
+                "configMapKeyRef": {
+                    "name": config["metadata"]["name"],
+                    "key": "MANIFEST_NAMESPACE",
+                }
+            },
+        }
+    ]
+    assert config["data"]["MANIFEST_NAMESPACE"] == expected_namespace
+    assert any(
+        doc["kind"] == "Namespace" and doc["metadata"]["name"] == expected_namespace
+        for doc in docs
+    )
+
+
+@pytest.mark.parametrize("configured", [False, True])
+@pytest.mark.parametrize(
+    ("key", "default", "override"),
+    [
+        ("MANIFEST_NETWORK_ISOLATION_VERIFIED", "false", "true"),
+        ("MANIFEST_MAX_CONCURRENT_JOBS", "10", "2"),
+        (
+            "MANIFEST_HARNESS_EGRESS",
+            [],
+            [
+                {
+                    "to": [{"ipBlock": {"cidr": "192.0.2.5/32"}}],
+                    "ports": [{"port": 443}],
+                }
+            ],
+        ),
+    ],
+)
+def test_core_receives_existing_native_hosting_controls(
+    configured, key, default, override
+):
+    settings = (
+        (
+            "manifestHosting.networkIsolationVerified=true",
+            "manifestHosting.maxConcurrentJobs=2",
+            "manifestHosting.harnessEgress[0].to[0].ipBlock.cidr=192.0.2.5/32",
+            "manifestHosting.harnessEgress[0].ports[0].port=443",
+        )
+        if configured
+        else ()
+    )
+    docs = render(*settings)
+    config = next(
+        doc for doc in docs if doc["kind"] == "ConfigMap" and key in doc.get("data", {})
+    )
+    deployment = next(
+        doc
+        for doc in docs
+        if doc["kind"] == "Deployment"
+        and doc["metadata"]["name"].endswith("-orchestrator")
+    )
+    assert [
+        entry
+        for entry in deployment["spec"]["template"]["spec"]["containers"][0]["env"]
+        if entry["name"] == key
+    ] == [
+        {
+            "name": key,
+            "valueFrom": {
+                "configMapKeyRef": {"name": config["metadata"]["name"], "key": key}
+            },
+        }
+    ]
+    expected = override if configured else default
+    value = config["data"][key]
+    assert (json.loads(value) if isinstance(expected, list) else value) == expected
+
+
+@pytest.mark.parametrize(
     "setting",
     [
         "manifestHosting.networkIsolationVerified=true",

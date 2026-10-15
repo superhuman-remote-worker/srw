@@ -345,7 +345,10 @@ CONTROL_PLANE_METADATA: Dict[str, Dict[str, Any]] = {
             "subagent when handle is omitted. Use this only when its next "
             "update is immediately blocking your work. Completion reports "
             "are pushed into your next turn automatically, so do not poll "
-            "with wait_agent or list_agents. Timeout is 10-3600 seconds.",
+            "with wait_agent or list_agents. Timeout is 10-3600 seconds. "
+            "A live voice subagent also returns result 'question' while its "
+            "session runs: a caller request the voice handed to you, to "
+            "answer with message_agent(reply_to=<delegation_id>).",
             "Wait once for a blocking subagent update; never poll.",
         ),
         "function": "wait_agent",
@@ -357,7 +360,10 @@ CONTROL_PLANE_METADATA: Dict[str, Dict[str, Any]] = {
             "A terminal child is durably revived on its existing transcript "
             "and worktree with a new fenced generation. Consume its prior "
             "report first. The next report is pushed automatically; do not "
-            "poll after messaging.",
+            "poll after messaging. For a live voice subagent, reply_to "
+            "answers one of its questions (the voice says your message to "
+            "the caller), no reply_to steers the voice, and "
+            "call_action='transfer' hands the caller to a person.",
             "Steer a live child or durably revive a terminal one.",
         ),
         "function": "message_agent",
@@ -367,7 +373,7 @@ CONTROL_PLANE_METADATA: Dict[str, Dict[str, Any]] = {
             "Ask a background subagent to stop by handle. It gets a bounded "
             "grace window for a tool-less partial synthesis before a hard "
             "stop. The terminal report is pushed automatically; do not poll "
-            "for it.",
+            "for it. A live voice subagent says goodbye and hangs up.",
             "Stop a background subagent after a bounded synthesis grace.",
         ),
         "function": "stop_agent",

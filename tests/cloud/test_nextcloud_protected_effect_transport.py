@@ -11,6 +11,7 @@ import pytest
 from orchestrator.services.cloud import CloudBackendError
 from orchestrator.services.cloud.config import NextcloudSettings
 from orchestrator.services.cloud.nextcloud import NextcloudBackend
+from orchestrator.services.cloud.nextcloud_agent_credential import AgentServiceAuth
 from orchestrator.services.cloud.protected_effect_contract import (
     NextcloudEffectCapability,
     NextcloudEffectFenceIntent,
@@ -160,9 +161,14 @@ async def test_initialization_builds_a_distinct_json_effect_client(
     assert backend.installation_proof_sha256 == INSTALLATION_PROOF_SHA
     backend.bind_backend_instance(INSTANCE)
     assert backend.backend_instance_id == INSTANCE
-    assert len(clients) == 2
-    ordinary, effect = clients
+    # The admin's, agent-service's and the effect lane's: three clients,
+    # and only the effect lane's speaks to the isolated origin.
+    assert len(clients) == 3
+    ordinary, agent, effect = clients
     assert ordinary.kwargs["base_url"] == "https://cloud.internal.example/nextcloud"
+    assert ordinary.kwargs["auth"] == ("admin", "admin-password")
+    assert agent.kwargs["base_url"] == "https://cloud.internal.example/nextcloud"
+    assert isinstance(agent.kwargs["auth"], AgentServiceAuth)
     assert effect.kwargs["base_url"] == "https://effect.internal.example"
     assert effect.kwargs["headers"]["Accept"] == "application/json"
     assert effect.kwargs["headers"]["OCS-APIRequest"] == "true"
@@ -170,6 +176,7 @@ async def test_initialization_builds_a_distinct_json_effect_client(
 
     await backend.close()
     assert ordinary.closed is True
+    assert agent.closed is True
     assert effect.closed is True
 
 

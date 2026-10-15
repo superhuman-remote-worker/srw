@@ -498,9 +498,19 @@ class TestExchangePort:
         client, _ = exchange_client
         app = client.app
         paths = {route.path for route in mounted_route_objects(app)}
-        # The exchange, introspection, and the result route bind-time driver
-        # pods post to (D6).
-        assert paths == {EXCHANGE_PATH, INTROSPECT_PATH, RESULT_PATH}
+        # The exchange, introspection, the result route bind-time driver
+        # pods post to (D6), and the routes a live connector's pod reports
+        # its sessions on (live-session jobs §5.5).
+        assert paths == {
+            EXCHANGE_PATH,
+            INTROSPECT_PATH,
+            RESULT_PATH,
+            "/v1/live/credential",
+            "/v1/live/sessions/adopt",
+            "/v1/live/sessions/{session_id}/state",
+            "/v1/live/sessions/{session_id}/events",
+            "/v1/live/sessions/{session_id}/lease",
+        }
         for path in ("/docs", "/openapi.json", "/api/health"):
             assert client.get(path).status_code == 404
 
@@ -512,6 +522,7 @@ class TestExchangePort:
         assert EXCHANGE_PATH not in paths and INTROSPECT_PATH not in paths
         assert RESULT_PATH not in paths
         assert not any("connector-lease" in path for path in paths)
+        assert not any(path.startswith("/v1/live/") for path in paths)
 
     def test_max_cache_seconds_is_thirty(self):
         assert MAX_CACHE_SECONDS == 30

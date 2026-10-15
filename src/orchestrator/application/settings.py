@@ -53,6 +53,16 @@ def _enabled(name: str, default: str = "false") -> bool:
     return os.environ.get(name, default).lower() in ("true", "1", "yes")
 
 
+def parse_optional_flag(raw: str | None) -> bool | None:
+    """A flag the chart may leave unset: unset or empty is ``None`` (not
+    said), else the usual truthy spellings are ``True`` and anything else
+    ``False``."""
+    value = (raw or "").strip().lower()
+    if not value:
+        return None
+    return value in ("true", "1", "yes")
+
+
 def parse_exchange_port(
     raw: str | None, *, name: str = CONNECTOR_LEASE_EXCHANGE_PORT_ENV
 ) -> int | None:
@@ -385,6 +395,9 @@ class DeploymentSettings:
     #: where SRW's connector driver certificate authority is mounted
     #: (``connectors.drivers.ca``), which signs its pods' certificates.
     connector_git_swap_image: str = ""
+    #: The phone-line driver's image (srw.gpt-live-sip/v1); empty: not
+    #: installed (live_session_jobs.md §5.1).
+    connector_gpt_live_sip_image: str = ""
     connector_git_swap_fallback: str = FALLBACK_TOKEN_IN_URL
     connector_driver_ca_dir: str = ""
     #: Provider-minted credentials (C5, ``connectors.providerMinting``):
@@ -417,6 +430,14 @@ class DeploymentSettings:
     #: Empty: Helm's description replaces only the same installation; see
     #: ``services.cloud.instance_registry``.
     main_cloud_replace_installation: str = ""
+    #: What the chart runs and pins on its bundled Nextcloud, reported on the
+    #: admin Main cloud page (bundled_nextcloud_performance.md, D13): whether
+    #: its cron container runs (``nextcloud.cron.enabled``) and the trash and
+    #: version retention its setup hook sets. ``None`` and empty: the chart
+    #: did not say, an external Nextcloud whose own administrator manages them.
+    nextcloud_cron_enabled: bool | None = None
+    nextcloud_trashbin_retention: str = ""
+    nextcloud_versions_retention: str = ""
     #: Re-pinning serving pods (D5a): seconds between re-resolutions of a
     #: pod's pinned egress hosts (0 never re-resolves), and how long a pod
     #: replaced after a re-pin runs on once its replacement serves.
@@ -547,6 +568,9 @@ class DeploymentSettings:
             connector_echo_driver_image=os.environ.get(
                 "CONNECTOR_ECHO_DRIVER_IMAGE", ""
             ).strip(),
+            connector_gpt_live_sip_image=os.environ.get(
+                "CONNECTOR_GPT_LIVE_SIP_IMAGE", ""
+            ).strip(),
             connector_managed_mcp_images={
                 str(name): str(reference).strip()
                 for name, reference in parse_json_object(
@@ -626,6 +650,15 @@ class DeploymentSettings:
             main_cloud_replace_installation=os.environ.get(
                 "MAIN_CLOUD_REPLACE_INSTALLATION", ""
             ).strip(),
+            nextcloud_cron_enabled=parse_optional_flag(
+                os.environ.get("NEXTCLOUD_CRON_ENABLED")
+            ),
+            nextcloud_trashbin_retention=os.environ.get(
+                "NEXTCLOUD_TRASHBIN_RETENTION", ""
+            ).strip(),
+            nextcloud_versions_retention=os.environ.get(
+                "NEXTCLOUD_VERSIONS_RETENTION", ""
+            ).strip(),
             connector_service_reresolve_seconds=parse_positive_number(
                 "CONNECTOR_SERVICE_RERESOLVE_SECONDS",
                 os.environ.get("CONNECTOR_SERVICE_RERESOLVE_SECONDS"),
@@ -693,6 +726,7 @@ __all__ = [
     "parse_exchange_port",
     "parse_json_object",
     "parse_name_list",
+    "parse_optional_flag",
     "parse_positive_number",
     "parse_repository_list",
     "parse_session_subagent_fanout_lanes",

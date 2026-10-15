@@ -26,8 +26,19 @@ ASSEMBLER_OWNED_PROMPT_TOKENS = (
 )
 
 
+#: The prose of a live voice roster entry (``driver: live``) that becomes the
+#: voice's instructions: plain text, like a persona (live_session_jobs §6.3).
+LIVE_VOICE_PROSE_FIELDS = ("persona", "facts")
+
+
+def _reserved_tokens(text: str) -> list[str]:
+    return [token for token in ASSEMBLER_OWNED_PROMPT_TOKENS if token in text]
+
+
 def validate_expert_persona_placeholders(
     prompts: dict[str, Any] | None,
+    *,
+    config: Any = None,
 ) -> dict[str, Any] | None:
     """Reject framework-owned placeholders in an expert persona.
 
@@ -36,19 +47,51 @@ def validate_expert_persona_placeholders(
     prompt structure and would require recursively scanning replacement values.
     Reject only the assembler's six exact tokens; other braces remain ordinary
     persona prose and are handled by the existing DB-persona fence at render.
+
+    ``config`` (the expert's config) extends the check to the live voice
+    entries of its subagent roster: their ``live.persona`` and ``live.facts``
+    are persona prose too (:func:`validate_live_voice_placeholders`, which
+    the roster's authoring check also runs).
     """
+    if isinstance(config, dict):
+        validate_live_voice_placeholders(config.get("subagents"))
     if not prompts:
         return prompts
     persona = prompts.get("persona")
     if not isinstance(persona, str):
         return prompts
-    found = [token for token in ASSEMBLER_OWNED_PROMPT_TOKENS if token in persona]
+    found = _reserved_tokens(persona)
     if found:
         raise ValueError(
             "Expert persona must be plain text; reserved prompt placeholders "
             f"are not allowed: {', '.join(found)}"
         )
     return prompts
+
+
+def validate_live_voice_placeholders(subagents: Any) -> None:
+    """Reject the assembler's tokens in a roster's live voice prose.
+
+    ``subagents`` is an expert's raw ``subagents`` block. Every entry's
+    ``live.persona`` and ``live.facts`` (the inline forms; a ``*_file`` is read
+    by the orchestrator) must be plain text, as a persona must.
+    """
+    roster = subagents.get("roster") if isinstance(subagents, dict) else None
+    if not isinstance(roster, dict):
+        return
+    for name, entry in roster.items():
+        live = entry.get("live") if isinstance(entry, dict) else None
+        if not isinstance(live, dict):
+            continue
+        for key in LIVE_VOICE_PROSE_FIELDS:
+            value = live.get(key)
+            found = _reserved_tokens(value) if isinstance(value, str) else []
+            if found:
+                raise ValueError(
+                    f"subagents.roster.{name}.live.{key} must be plain text; "
+                    "reserved prompt placeholders are not allowed: "
+                    f"{', '.join(found)}"
+                )
 
 
 def canonical_key(key: str) -> str:

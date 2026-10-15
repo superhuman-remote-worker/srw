@@ -27,6 +27,7 @@ import logging
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, Protocol
 
+from orchestrator.services.live.dispatch import live_session_config
 from orchestrator.services.model_availability import (
     ModelUnavailable,
     UnavailableModel,
@@ -609,4 +610,9 @@ async def inject_dispatch_credentials(
             job_id,
             [entry.as_dict() for entry in unavailable],
         )
+    # A live-session job's session: ids and the pod's endpoint, no secret
+    # (the pod's lease rides the connector entry; live_session_jobs §4.2).
+    live_session = await live_session_config(postgres_db, job)
+    if live_session is not None:
+        config_override["live_session"] = live_session
     return config_override

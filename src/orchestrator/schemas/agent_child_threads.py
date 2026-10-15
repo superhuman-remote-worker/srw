@@ -26,6 +26,7 @@ from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from orchestrator.schemas.thread_session import PermissionMode
 from shared.session_subagent_authority import (
     SessionParentAuthority as AgentSessionSubagentAuthority,
 )
@@ -41,7 +42,7 @@ class AgentThreadCreateRequest(BaseModel):
     """Request from agent to create its own thread on startup."""
 
     config_name: str = Field("session_base", description="Agent config name")
-    permission_mode: str = Field("supervised", description="Permission mode")
+    permission_mode: PermissionMode = Field("supervised", description="Permission mode")
     title: str = Field("Local Session", description="Session title")
 
 

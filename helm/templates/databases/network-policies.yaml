@@ -416,4 +416,54 @@ spec:
         - port: 8000
           protocol: TCP
     {{- end }}
+---
+{{- end }}
+
+{{- if (include "srw.dbPrereqs" (dict "context" . "key" "nextcloud")) }}
+# Mandatory, not hardening: dynamic agent Pods consume the whole application
+# Secret through envFrom, NEXTCLOUD_DB_PASSWORD included, so the only thing
+# keeping a workspace off this database is that it cannot reach it.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "srw.fullname" . }}-nextclouddb
+  labels:
+    {{- include "srw.componentLabels" (dict "context" . "component" "nextclouddb") | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "srw.componentSelectorLabels" (dict "context" . "component" "nextclouddb") | nindent 6 }}
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        # The whole Nextcloud Pod: Apache, the cron container and the
+        # protected-effect PHP-FPM pool all reach the database from it.
+        - podSelector:
+            matchLabels:
+              {{- include "srw.componentSelectorLabels" (dict "context" . "component" "nextcloud") | nindent 14 }}
+        {{- if (include "srw.dbRendersCnpg" (dict "context" . "key" "nextcloud")) }}
+        # CloudNativePG's own label: the import job reads the legacy database
+        # with it while `migrating`, and instances stream WAL to each other.
+        # See the postgres policy above for why it is not the component label.
+        - podSelector:
+            matchLabels:
+              cnpg.io/cluster: {{ include "srw.fullname" . }}-nextclouddb
+        {{- end }}
+      ports:
+        - port: 5432
+          protocol: TCP
+    {{- if (include "srw.dbRendersCnpg" (dict "context" . "key" "nextcloud")) }}
+    # The operator polls instance health on the status port (8000). Only its
+    # namespace gets it; see the postgres policy above.
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ .Values.databases.operator.namespace | quote }}
+      ports:
+        - port: 5432
+          protocol: TCP
+        - port: 8000
+          protocol: TCP
+    {{- end }}
 {{- end }}

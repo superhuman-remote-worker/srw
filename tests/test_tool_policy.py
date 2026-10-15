@@ -148,7 +148,7 @@ class TestPopulation:
     def test_the_declaration_scan_actually_found_the_configs(self):
         """A scan that silently found nothing would make every test below pass."""
         files = {rel for rel, _, _ in _DECLARATIONS}
-        assert len(files) == 22, f"expected 22 configs declaring tools:, got {files}"
+        assert len(files) == 23, f"expected 23 configs declaring tools:, got {files}"
         assert "config/expert_base.yaml" in files
         assert "config/overlays/worker.yaml" in files
         assert "config/overlays/session.yaml" in files
@@ -177,9 +177,12 @@ class TestPopulation:
         # graph — engineer_expert.md); 201 with the memory group
         # (memory_search, append-only context injection WP5a): expert_base
         # grants it, the subagent overlay and the seven library entries
-        # restate it empty (a child has no memory of its own).
-        assert len(_DECLARATIONS) == 201, (
-            f"expected 201 raw declarations, got {len(_DECLARATIONS)}"
+        # restate it empty (a child has no memory of its own); 210 with the
+        # receptionist expert (workspace, browser_direct, git, citation, graph
+        # and communication restated empty for a desk without a workspace,
+        # plus research, knowledge and delegation).
+        assert len(_DECLARATIONS) == 210, (
+            f"expected 210 raw declarations, got {len(_DECLARATIONS)}"
         )
 
     def test_every_shipped_declaration_is_already_a_list(self):

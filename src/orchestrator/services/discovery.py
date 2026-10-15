@@ -66,6 +66,7 @@ _MULTIMODAL_PATTERNS = (
     "gemini-1.5",  # gemini-1.5-pro, -flash, -flash-8b all do vision
     "gemini-2",  # gemini-2.x family is multimodal
     "gemini-3",
+    "gemini-4",
     "claude-opus",
     "claude-sonnet",
     "claude-3.5",
@@ -93,6 +94,7 @@ def _capability_from_model_id(model_id: str) -> str:
     """Best-effort PRIMARY capability guess from a provider model ID.
 
     Heuristics, evaluated top-down:
+    - ``gpt-live``/``realtime`` substring → ``live_voice``
     - ``embedding`` substring → ``embedding``
     - ``whisper`` substring → ``whisper``
     - ``tts``/``speech`` substring → ``tts``
@@ -107,6 +109,10 @@ def _capability_from_model_id(model_id: str) -> str:
     multimodal chat families.
     """
     lower = model_id.lower()
+    if "gpt-live" in lower or "realtime" in lower:
+        # A live voice model is never a chat row (it is bound by a phone-line
+        # connector, not as an LLM).
+        return "live_voice"
     if "embedding" in lower:
         return "embedding"
     if "whisper" in lower:

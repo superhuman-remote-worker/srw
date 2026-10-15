@@ -15,7 +15,8 @@ FORWARD from a base backup, so without one the archive is unusable.
       (dict "key" "vector" "component" "pgvector")
       (dict "key" "audit" "component" "auditdb")
       (dict "key" "gitea" "component" "giteadb")
-      (dict "key" "keycloak" "component" "keycloakdb") }}
+      (dict "key" "keycloak" "component" "keycloakdb")
+      (dict "key" "nextcloud" "component" "nextclouddb") }}
 {{- if (include "srw.dbBacksUp" (dict "context" $ "key" $entry.key)) }}
 {{- if $rendered }}
 ---

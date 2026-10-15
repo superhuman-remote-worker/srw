@@ -5585,6 +5585,11 @@ BEGIN
             END IF;
         ELSIF workspace_backend IN ('virtual', 'none') THEN
             expected_protocol := 'agent_runtime_zero_v1';
+        ELSIF public.pinned_vm_bound_no_vm_source_terminal(
+            OLD.id,OLD.runtime_generation,OLD.runtime_retirement_token,true) THEN
+            expected_protocol := 'agent_runtime_zero_v1';
+            expected_workspace_generation := '';
+            expected_workspace_runtime := '';
         ELSIF public.pinned_vm_pre_registration_no_vm_source(
             OLD.id,OLD.runtime_generation,OLD.runtime_retirement_token) THEN
             expected_protocol := CASE
@@ -7715,6 +7720,18 @@ BEGIN
                              IS NULL
                          AND NEW.runtime_retirement_local_quiescence->>'workspace_runtime_incarnation'
                              IS NULL
+                    WHEN public.pinned_vm_bound_no_vm_source(
+                        NEW.id,NEW.runtime_generation,NEW.runtime_retirement_token)
+                    THEN NEW.runtime_retirement_local_quiescence->>'quiescence_protocol'='agent_runtime_zero_v1'
+                         AND NEW.runtime_retirement_local_quiescence->>'quiescence_actor'='orchestrator'
+                         AND NEW.runtime_retirement_local_quiescence->>'agent_pod_name'=
+                             NEW.runtime_retirement_context->'agent_pod'->>'pod_name'
+                         AND NEW.runtime_retirement_local_quiescence->>'agent_pod_uid'=
+                             NEW.runtime_retirement_context->'agent_pod'->>'pod_uid'
+                         AND NEW.runtime_retirement_local_quiescence->>'workspace_generation' IS NULL
+                         AND NEW.runtime_retirement_local_quiescence->>'workspace_runtime_incarnation' IS NULL
+                         AND NEW.runtime_retirement_local_quiescence->>'vm_creation_request_id' IS NULL
+                         AND NEW.runtime_retirement_local_quiescence->>'vm_creation_provision_generation' IS NULL
                     WHEN public.pinned_vm_pre_registration_no_vm_source(
                         NEW.id,NEW.runtime_generation,NEW.runtime_retirement_token)
                     THEN NEW.runtime_retirement_local_quiescence->>'quiescence_protocol'='agent_runtime_zero_v1'
@@ -8427,6 +8444,13 @@ BEGIN
             retirement_context->'workspace_provision_intent',
             NEW.permanent
        )
+       OR (NEW.permanent AND thread_row.status='created'
+           AND retirement_context->>'workspace_backend'='vm'
+           AND retirement_context->>'agent_id' IS NOT NULL
+           AND retirement_context->'vm'='null'::jsonb
+           AND retirement_context->'vm_creation_source'='null'::jsonb
+           AND NOT public.pinned_vm_bound_no_vm_source_terminal(
+               NEW.thread_id,NEW.runtime_generation,NEW.retirement_token,false))
        OR (NEW.permanent AND (
             NEW.disposition <> 'ended'
             OR NEW.outcome <> 'deleted'
@@ -15286,6 +15310,368 @@ BEGIN
        AND actor.metadata->>'dispatch_process_generation' IS NOT DISTINCT FROM marker->>'process_generation';
 END;
 $_$;
+
+
+--
+-- Name: pinned_vm_bound_no_vm_obligations_absent(uuid, uuid, uuid, text); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.pinned_vm_bound_no_vm_obligations_absent(p_thread uuid, p_runtime uuid, p_agent uuid, p_pod_uid text) RETURNS boolean
+    LANGUAGE sql STABLE
+    AS $$
+    SELECT NOT EXISTS (SELECT 1 FROM public.vm_creation_retries r
+                        WHERE r.owner_kind='thread' AND r.thread_id=p_thread)
+       AND NOT EXISTS (SELECT 1 FROM public.vm_resource_waiters w
+                        WHERE w.owner_kind='thread' AND w.thread_id=p_thread)
+       AND NOT EXISTS (SELECT 1 FROM public.vm_thread_creation_owners o
+                        WHERE o.thread_id=p_thread)
+       AND NOT EXISTS (SELECT 1 FROM public.vm_thread_retained_resumes r
+                        WHERE r.thread_id=p_thread)
+       AND NOT EXISTS (SELECT 1 FROM public.vm_idle_operations i
+                        WHERE i.owner_kind='thread' AND i.owner_id=p_thread)
+       AND NOT EXISTS (SELECT 1 FROM public.vm_idle_access_leases l
+                        WHERE l.owner_kind='thread' AND l.owner_id=p_thread)
+       AND NOT EXISTS (SELECT 1 FROM public.vm_workspace_recoveries r
+                        WHERE r.owner_kind='thread' AND r.owner_id=p_thread)
+       AND NOT EXISTS (SELECT 1 FROM public.vm_resource_thread_cleanup_authorities a
+                        WHERE a.thread_id=p_thread)
+       AND NOT EXISTS (SELECT 1 FROM public.vm_workspace_cleanup_admissions a
+                        WHERE a.owner_kind='thread' AND a.owner_id=p_thread)
+       AND NOT EXISTS (SELECT 1 FROM public.thread_workspace_provision_intents i
+                        WHERE i.thread_id=p_thread AND
+                              (i.runtime_generation=p_runtime OR i.status IN ('planned','revoking')))
+       AND NOT EXISTS (SELECT 1 FROM public.thread_agent_pod_provision_intents i
+                        WHERE i.thread_id=p_thread AND i.status IN ('planned','revoking'))
+       AND NOT EXISTS (SELECT 1 FROM public.srw_execution_specs e
+                        JOIN public.srw_execution_workspace_bindings b ON b.execution_id=e.id
+                        WHERE e.work_kind='Session' AND e.work_id=p_thread)
+       AND NOT EXISTS (SELECT 1 FROM public.thread_input_deliveries d
+                        WHERE d.thread_id=p_thread AND d.owner_agent_id=p_agent
+                          AND d.owner_pod_uid=p_pod_uid
+                          AND d.state IN ('owned','queued','admitted','settled'))
+       AND NOT EXISTS (SELECT 1 FROM public.thread_control_requests c
+                        WHERE c.thread_id=p_thread AND c.runtime_generation=p_runtime)
+       AND NOT EXISTS (SELECT 1 FROM public.thread_permission_requests p
+                        WHERE p.thread_id=p_thread AND p.status='pending')
+       AND NOT EXISTS (SELECT 1 FROM public.thread_interrupt_requests i
+                        WHERE i.thread_id=p_thread AND
+                              (i.outcome IS NULL OR (i.outcome='applied' AND
+                               NOT (COALESCE(i.result,'{}'::jsonb) ? 'consumed_input_seq'))))
+       AND NOT EXISTS (SELECT 1 FROM public.run_queue q
+                        WHERE q.unit_id=p_thread AND (q.state<>'done' OR q.leased_by IS NOT NULL))
+       AND NOT EXISTS (SELECT 1 FROM public.completion_effects e
+                        WHERE (e.scope_id=p_thread OR e.producer_id=p_thread)
+                          AND (e.state<>'done' OR e.claimed_by IS NOT NULL));
+$$;
+
+
+--
+-- Name: pinned_vm_bound_no_vm_source(uuid, uuid, uuid); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.pinned_vm_bound_no_vm_source(p_thread uuid, p_runtime uuid, p_token uuid) RETURNS boolean
+    LANGUAGE sql STABLE
+    AS $$
+    SELECT EXISTS (
+        SELECT 1 FROM public.threads t
+        JOIN public.agents a ON a.id=t.agent_id AND a.thread_id=t.id
+        WHERE t.id=p_thread AND t.runtime_generation=p_runtime
+          AND t.runtime_retirement_token=p_token
+          AND t.kind='session' AND t.execution_lane='pinned' AND t.status='created'
+          AND t.runtime_authority_exposed IS TRUE
+          AND t.runtime_retirement_authorized_at IS NOT NULL
+          AND t.agent_id IS NOT NULL AND t.runtime_attach_token IS NOT NULL
+          AND (t.control_admission_agent_id IS NULL
+               OR t.control_admission_agent_id=t.agent_id)
+          AND a.current_job_id IS NULL
+          AND jsonb_typeof(t.runtime_retirement_context->'version')='number'
+          AND t.runtime_retirement_context->>'version'='1'
+          AND t.runtime_retirement_context->>'thread_id'=t.id::text
+          AND t.runtime_retirement_context->>'generation'=t.runtime_generation::text
+          AND t.runtime_retirement_context->>'entry_status'='created'
+          AND t.runtime_retirement_context->>'settle_status'='ended'
+          AND t.runtime_retirement_context->>'workspace_backend'='vm'
+          AND t.runtime_retirement_context->'protected_cloud'='false'::jsonb
+          AND t.runtime_retirement_context->>'protected_cloud_state'='off'
+          AND (t.runtime_retirement_context->'retained_soft_workspace' IS NULL
+               OR t.runtime_retirement_context->'retained_soft_workspace'='null'::jsonb)
+          AND t.runtime_retirement_context->'runtime_authority_exposed'='true'::jsonb
+          AND t.runtime_retirement_context->>'agent_id'=t.agent_id::text
+          AND t.runtime_retirement_context->>'runtime_attach_token'=t.runtime_attach_token::text
+          AND t.runtime_retirement_context->>'control_admission_agent_id'
+              IS NOT DISTINCT FROM t.control_admission_agent_id::text
+          AND jsonb_typeof(t.runtime_retirement_context->'agent')='object'
+          AND t.runtime_retirement_context->'agent'->>'id'=a.id::text
+          AND t.runtime_retirement_context->'agent'->>'thread_id'=t.id::text
+          AND t.runtime_retirement_context->'agent'->>'hostname'=a.hostname
+          AND t.runtime_retirement_context->'agent'->>'pod_uid'=a.pod_uid
+          AND jsonb_typeof(t.runtime_retirement_context->'agent_pod')='object'
+          AND t.metadata->'agent_pod'=t.runtime_retirement_context->'agent_pod'
+          AND t.runtime_retirement_context->'agent_pod'->>'runtime_generation'=t.runtime_generation::text
+          AND t.runtime_retirement_context->'agent_pod'->>'pod_name'=a.hostname
+          AND t.runtime_retirement_context->'agent_pod'->>'pod_uid'=a.pod_uid
+          AND NULLIF(t.runtime_retirement_context->'agent_pod'->>'namespace','') IS NOT NULL
+          AND t.runtime_retirement_context->'agent_pod'->>'protection_protocol'='finalizer_v1'
+          AND (t.runtime_retirement_context->'route' IS NULL
+               OR t.runtime_retirement_context->'route' IN ('null'::jsonb,'{}'::jsonb)
+               OR (jsonb_typeof(t.runtime_retirement_context->'route')='object'
+                   AND t.runtime_retirement_context->'route'->>'owner_pod_uid'=a.pod_uid
+                   AND t.runtime_retirement_context->'route'->>'namespace'=
+                       t.runtime_retirement_context->'agent_pod'->>'namespace'))
+          AND t.runtime_retirement_context->'agent_pod_provision_intent'='null'::jsonb
+          AND NOT EXISTS (SELECT 1 FROM public.thread_agent_pod_provision_intents other_intent
+              WHERE other_intent.thread_id=t.id
+                AND other_intent.runtime_generation=t.runtime_generation
+                AND other_intent.status='published'
+                AND other_intent.attempt_id::text IS DISTINCT FROM
+                    t.runtime_retirement_context->'agent_pod'->>'provision_attempt')
+          AND (
+              (t.runtime_retirement_context->'agent_pod'->>'warm_binding_protection' IS NOT NULL
+               AND t.runtime_retirement_context->'agent_pod'->>'provision_attempt' IS NULL
+               AND EXISTS (
+                   SELECT 1 FROM public.thread_agent_warm_binding_protections w
+                   WHERE w.protection_id::text=t.runtime_retirement_context->'agent_pod'->>'warm_binding_protection'
+                     AND w.thread_id=t.id AND w.runtime_generation=t.runtime_generation
+                     AND w.runtime_attach_token=t.runtime_attach_token AND w.agent_id=t.agent_id
+                     AND w.status='bound' AND w.source IN ('attach','legacy_binding')
+                     AND w.evidence_protocol='exact_live_finalizer_v1'
+                     AND w.namespace=t.runtime_retirement_context->'agent_pod'->>'namespace'
+                     AND w.pod_name=a.hostname AND w.pod_uid=a.pod_uid))
+              OR
+              (t.runtime_retirement_context->'agent_pod'->>'provision_attempt' IS NOT NULL
+               AND t.runtime_retirement_context->'agent_pod'->>'warm_binding_protection' IS NULL
+               AND EXISTS (
+                   SELECT 1 FROM public.thread_agent_pod_provision_intents p
+                   WHERE p.attempt_id::text=t.runtime_retirement_context->'agent_pod'->>'provision_attempt'
+                     AND p.thread_id=t.id AND p.runtime_generation=t.runtime_generation
+                     AND p.status='published' AND p.provisioner IN ('agent','persistent')
+                     AND p.namespace=t.runtime_retirement_context->'agent_pod'->>'namespace'
+                     AND p.pod_name=a.hostname AND p.pod_uid=a.pod_uid
+                     AND p.protection_protocol='finalizer_v1')))
+          AND t.runtime_retirement_context->'vm'='null'::jsonb
+          AND t.runtime_retirement_context->'vm_creation_source'='null'::jsonb
+          AND NOT (t.metadata ? 'vm')
+          AND t.runtime_retirement_context->'workspace_binding' IN ('null'::jsonb,'{}'::jsonb)
+          AND COALESCE(t.metadata->'_workspace_binding','null'::jsonb) IN ('null'::jsonb,'{}'::jsonb)
+          AND (t.runtime_retirement_context->'workspace_container'='null'::jsonb
+               OR (jsonb_typeof(t.runtime_retirement_context->'workspace_container')='object'
+                   AND (t.runtime_retirement_context->'workspace_container')
+                       - 'repo_name' - 'git_remote_url'='{}'::jsonb))
+          AND (t.metadata->'workspace_container' IS NULL
+               OR t.metadata->'workspace_container'='null'::jsonb
+               OR (jsonb_typeof(t.metadata->'workspace_container')='object'
+                   AND (t.metadata->'workspace_container')
+                       - 'repo_name' - 'git_remote_url'='{}'::jsonb))
+          AND t.runtime_retirement_context->'workspace_provision_intent'='null'::jsonb
+          AND t.runtime_retirement_context->'protected_ro'='null'::jsonb
+          AND (
+              (t.runtime_retirement_context->'agent_workspace_claim'='null'::jsonb
+               AND NOT EXISTS (SELECT 1 FROM public.thread_agent_workspace_claims c
+                               WHERE c.thread_id=t.id AND c.status IN ('planned','ready','revoking')))
+              OR
+              (jsonb_typeof(t.runtime_retirement_context->'agent_workspace_claim')='object'
+               AND t.runtime_retirement_context->'agent_workspace_claim'->>'status'='ready'
+               AND t.runtime_retirement_context->'agent_workspace_claim'->>'thread_id'=t.id::text
+               AND EXISTS (
+                   SELECT 1 FROM public.thread_agent_workspace_claims c
+                   JOIN public.thread_agent_pod_provision_intents p ON p.workspace_claim_id=c.claim_id
+                   WHERE c.thread_id=t.id
+                     AND c.claim_id::text=t.runtime_retirement_context->'agent_workspace_claim'->>'claim_id'
+                     AND c.created_runtime_generation::text=t.runtime_retirement_context->'agent_workspace_claim'->>'created_runtime_generation'
+                     AND c.create_attempt::text=t.runtime_retirement_context->'agent_workspace_claim'->>'create_attempt'
+                     AND c.provisioner=t.runtime_retirement_context->'agent_workspace_claim'->>'provisioner'
+                     AND c.provisioner IN ('agent','persistent')
+                     AND c.pvc_name=t.runtime_retirement_context->'agent_workspace_claim'->>'pvc_name'
+                     AND c.pvc_uid=t.runtime_retirement_context->'agent_workspace_claim'->>'pvc_uid'
+                     AND NULLIF(c.pvc_uid,'') IS NOT NULL
+                     AND c.status='ready' AND c.fenced_at IS NULL AND c.gc_after IS NULL
+                     AND c.namespace=t.runtime_retirement_context->'agent_workspace_claim'->>'namespace'
+                     AND c.namespace=t.runtime_retirement_context->'agent_pod'->>'namespace'
+                     AND c.protection_protocol='finalizer_v1'
+                     AND c.protection_protocol=t.runtime_retirement_context->'agent_workspace_claim'->>'protection_protocol'
+                     AND p.thread_id=t.id AND p.runtime_generation=t.runtime_generation
+                     AND p.attempt_id::text=t.runtime_retirement_context->'agent_pod'->>'provision_attempt'
+                     AND p.status='published' AND p.pod_name=a.hostname AND p.pod_uid=a.pod_uid
+                     AND p.namespace=c.namespace AND p.provisioner=c.provisioner
+                     AND p.protection_protocol='finalizer_v1')
+               AND NOT EXISTS (SELECT 1 FROM public.thread_agent_workspace_claims other
+                               WHERE other.thread_id=t.id AND other.status IN ('planned','ready','revoking')
+                                 AND other.claim_id::text IS DISTINCT FROM
+                                     t.runtime_retirement_context->'agent_workspace_claim'->>'claim_id')))
+          AND NOT EXISTS (SELECT 1 FROM public.agents other
+                          WHERE other.id<>a.id AND (other.thread_id=t.id
+                              OR other.hostname=a.hostname OR other.pod_uid=a.pod_uid))
+          AND public.pinned_vm_bound_no_vm_obligations_absent(t.id,t.runtime_generation,t.agent_id,a.pod_uid)
+    );
+$$;
+
+
+--
+-- Name: pinned_vm_bound_no_vm_source_terminal(uuid, uuid, uuid, boolean); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.pinned_vm_bound_no_vm_source_terminal(p_thread uuid, p_runtime uuid, p_token uuid, require_outcome boolean) RETURNS boolean
+    LANGUAGE sql STABLE
+    AS $$
+    SELECT EXISTS (
+        SELECT 1 FROM public.threads t
+        JOIN public.agents a ON a.id=t.agent_id AND a.thread_id IS NULL
+        WHERE t.id=p_thread AND t.runtime_generation=p_runtime
+          AND t.runtime_retirement_token=p_token
+          AND t.kind='session' AND t.execution_lane='pinned' AND t.status='created'
+          AND t.runtime_authority_exposed IS TRUE
+          AND t.runtime_retirement_permanent IS TRUE
+          AND t.runtime_retirement_authorized_at IS NOT NULL
+          AND t.agent_id IS NOT NULL AND t.runtime_attach_token IS NOT NULL
+          AND (t.control_admission_agent_id IS NULL
+               OR t.control_admission_agent_id=t.agent_id)
+          AND a.current_job_id IS NULL
+          AND jsonb_typeof(t.runtime_retirement_context->'version')='number'
+          AND t.runtime_retirement_context->>'version'='1'
+          AND t.runtime_retirement_context->>'thread_id'=t.id::text
+          AND t.runtime_retirement_context->>'generation'=t.runtime_generation::text
+          AND t.runtime_retirement_context->>'entry_status'='created'
+          AND t.runtime_retirement_context->>'settle_status'='ended'
+          AND t.runtime_retirement_context->>'workspace_backend'='vm'
+          AND t.runtime_retirement_context->'protected_cloud'='false'::jsonb
+          AND t.runtime_retirement_context->>'protected_cloud_state'='off'
+          AND (t.runtime_retirement_context->'retained_soft_workspace' IS NULL
+               OR t.runtime_retirement_context->'retained_soft_workspace'='null'::jsonb)
+          AND t.runtime_retirement_context->'runtime_authority_exposed'='true'::jsonb
+          AND t.runtime_retirement_context->>'agent_id'=t.agent_id::text
+          AND t.runtime_retirement_context->>'runtime_attach_token'=t.runtime_attach_token::text
+          AND t.runtime_retirement_context->>'control_admission_agent_id'
+              IS NOT DISTINCT FROM t.control_admission_agent_id::text
+          AND jsonb_typeof(t.runtime_retirement_context->'agent')='object'
+          AND t.runtime_retirement_context->'agent'->>'id'=a.id::text
+          AND t.runtime_retirement_context->'agent'->>'thread_id'=t.id::text
+          AND t.runtime_retirement_context->'agent'->>'hostname'=a.hostname
+          AND t.runtime_retirement_context->'agent'->>'pod_uid'=a.pod_uid
+          AND jsonb_typeof(t.runtime_retirement_context->'agent_pod')='object'
+          AND COALESCE(t.metadata->'agent_pod','null'::jsonb) IN ('null'::jsonb,'{}'::jsonb)
+          AND t.runtime_retirement_context->'agent_pod'->>'runtime_generation'=t.runtime_generation::text
+          AND t.runtime_retirement_context->'agent_pod'->>'pod_name'=a.hostname
+          AND t.runtime_retirement_context->'agent_pod'->>'pod_uid'=a.pod_uid
+          AND NULLIF(t.runtime_retirement_context->'agent_pod'->>'namespace','') IS NOT NULL
+          AND t.runtime_retirement_context->'agent_pod'->>'protection_protocol'='finalizer_v1'
+          AND (t.runtime_retirement_context->'route' IS NULL
+               OR t.runtime_retirement_context->'route' IN ('null'::jsonb,'{}'::jsonb)
+               OR (jsonb_typeof(t.runtime_retirement_context->'route')='object'
+                   AND t.runtime_retirement_context->'route'->>'owner_pod_uid'=a.pod_uid
+                   AND t.runtime_retirement_context->'route'->>'namespace'=
+                       t.runtime_retirement_context->'agent_pod'->>'namespace'))
+          AND t.runtime_retirement_context->'agent_pod_provision_intent'='null'::jsonb
+          AND NOT EXISTS (SELECT 1 FROM public.thread_agent_pod_provision_intents other_intent
+              WHERE other_intent.thread_id=t.id
+                AND other_intent.runtime_generation=t.runtime_generation
+                AND other_intent.status='published'
+                AND other_intent.attempt_id::text IS DISTINCT FROM
+                    t.runtime_retirement_context->'agent_pod'->>'provision_attempt')
+          AND (
+              (t.runtime_retirement_context->'agent_pod'->>'warm_binding_protection' IS NOT NULL
+               AND t.runtime_retirement_context->'agent_pod'->>'provision_attempt' IS NULL
+               AND EXISTS (SELECT 1 FROM public.thread_agent_warm_binding_protections w
+                   WHERE w.protection_id::text=t.runtime_retirement_context->'agent_pod'->>'warm_binding_protection'
+                     AND w.thread_id=t.id AND w.runtime_generation=t.runtime_generation
+                     AND w.runtime_attach_token=t.runtime_attach_token AND w.agent_id=t.agent_id
+                     AND w.status IN ('bound','terminal_release')
+                     AND w.source IN ('attach','legacy_binding')
+                     AND w.evidence_protocol='exact_live_finalizer_v1'
+                     AND w.namespace=t.runtime_retirement_context->'agent_pod'->>'namespace'
+                     AND w.pod_name=a.hostname AND w.pod_uid=a.pod_uid))
+              OR
+              (t.runtime_retirement_context->'agent_pod'->>'provision_attempt' IS NOT NULL
+               AND t.runtime_retirement_context->'agent_pod'->>'warm_binding_protection' IS NULL
+               AND EXISTS (SELECT 1 FROM public.thread_agent_pod_provision_intents p
+                   WHERE p.attempt_id::text=t.runtime_retirement_context->'agent_pod'->>'provision_attempt'
+                     AND p.thread_id=t.id AND p.runtime_generation=t.runtime_generation
+                     AND p.status IN ('published','fenced','retired')
+                     AND p.provisioner IN ('agent','persistent')
+                     AND p.namespace=t.runtime_retirement_context->'agent_pod'->>'namespace'
+                     AND p.pod_name=a.hostname AND p.pod_uid=a.pod_uid
+                     AND p.protection_protocol='finalizer_v1')))
+          AND t.runtime_retirement_context->'vm'='null'::jsonb
+          AND t.runtime_retirement_context->'vm_creation_source'='null'::jsonb
+          AND NOT (t.metadata ? 'vm')
+          AND jsonb_typeof(t.metadata->'workspace_container')='object'
+          AND ((t.metadata->'workspace_container') - 'repo_name' - 'git_remote_url'
+                   = '{}'::jsonb
+               OR (t.metadata->'workspace_container') - 'repo_name' - 'git_remote_url'
+                   = jsonb_build_object(
+                       'status','deleted',
+                       'pod_ip',NULL,'pod_name',NULL,'host',NULL,'port',NULL,
+                       'ide_host',NULL,'ide_port',NULL,
+                       '_canvas_workspace_generation',NULL,
+                       '_runtime_incarnation',NULL,
+                       '_docker_workspace_lease_id',NULL))
+          AND t.runtime_retirement_context->'workspace_binding' IN ('null'::jsonb,'{}'::jsonb)
+          AND COALESCE(t.metadata->'_workspace_binding','null'::jsonb) IN ('null'::jsonb,'{}'::jsonb)
+          AND (t.runtime_retirement_context->'workspace_container'='null'::jsonb
+               OR (jsonb_typeof(t.runtime_retirement_context->'workspace_container')='object'
+                   AND (t.runtime_retirement_context->'workspace_container')
+                       - 'repo_name' - 'git_remote_url'='{}'::jsonb))
+          AND t.runtime_retirement_context->'workspace_provision_intent'='null'::jsonb
+          AND t.runtime_retirement_context->'protected_ro'='null'::jsonb
+          AND ((t.runtime_retirement_context->'agent_workspace_claim'='null'::jsonb
+                AND NOT EXISTS (SELECT 1 FROM public.thread_agent_workspace_claims c
+                    WHERE c.thread_id=t.id AND c.status IN ('planned','ready','revoking','fenced')))
+               OR (jsonb_typeof(t.runtime_retirement_context->'agent_workspace_claim')='object'
+                   AND t.runtime_retirement_context->'agent_workspace_claim'->>'status'='ready'
+                   AND EXISTS (SELECT 1 FROM public.thread_agent_workspace_claims c
+                       JOIN public.thread_agent_pod_provision_intents p ON p.workspace_claim_id=c.claim_id
+                       WHERE c.thread_id=t.id
+                         AND c.claim_id::text=t.runtime_retirement_context->'agent_workspace_claim'->>'claim_id'
+                         AND c.created_runtime_generation::text=t.runtime_retirement_context->'agent_workspace_claim'->>'created_runtime_generation'
+                         AND c.create_attempt::text=t.runtime_retirement_context->'agent_workspace_claim'->>'create_attempt'
+                         AND c.provisioner=t.runtime_retirement_context->'agent_workspace_claim'->>'provisioner'
+                         AND c.pvc_name=t.runtime_retirement_context->'agent_workspace_claim'->>'pvc_name'
+                         AND c.namespace=t.runtime_retirement_context->'agent_workspace_claim'->>'namespace'
+                         AND c.protection_protocol='finalizer_v1'
+                         AND c.status IN ('ready','fenced','reclaimed')
+                         AND (c.status<>'ready' OR c.pvc_uid=t.runtime_retirement_context->'agent_workspace_claim'->>'pvc_uid')
+                         AND (c.status='ready' OR c.fenced_at IS NOT NULL)
+                         AND p.thread_id=t.id AND p.runtime_generation=t.runtime_generation
+                         AND p.attempt_id::text=t.runtime_retirement_context->'agent_pod'->>'provision_attempt'
+                         AND p.status IN ('published','fenced','retired')
+                         AND p.namespace=c.namespace AND p.provisioner=c.provisioner
+                         AND p.pod_name=a.hostname AND p.pod_uid=a.pod_uid
+                         AND p.protection_protocol='finalizer_v1')
+                   AND NOT EXISTS (SELECT 1 FROM public.thread_agent_workspace_claims other
+                       WHERE other.thread_id=t.id AND other.status IN ('planned','ready','revoking','fenced')
+                         AND other.claim_id::text IS DISTINCT FROM
+                             t.runtime_retirement_context->'agent_workspace_claim'->>'claim_id')))
+          AND NOT EXISTS (SELECT 1 FROM public.agents other
+              WHERE other.id<>a.id AND (other.thread_id=t.id OR other.hostname=a.hostname
+                                        OR other.pod_uid=a.pod_uid))
+          AND public.pinned_vm_bound_no_vm_obligations_absent(t.id,t.runtime_generation,t.agent_id,a.pod_uid)
+          AND public.pinned_retirement_external_resources_absent(t.id,t.metadata)
+          AND t.runtime_retirement_external_cleanup IS NOT NULL
+          AND t.runtime_retirement_external_cleanup IS NOT DISTINCT FROM
+              public.pinned_retirement_external_cleanup_expected(
+                  t.runtime_retirement_context,t.runtime_generation,t.runtime_retirement_token)
+          AND t.runtime_retirement_local_quiescence IS NOT NULL
+          AND t.runtime_retirement_local_quiescence->>'version'='1'
+          AND t.runtime_retirement_local_quiescence->>'runtime_generation'=t.runtime_generation::text
+          AND t.runtime_retirement_local_quiescence->>'retirement_token'=t.runtime_retirement_token::text
+          AND t.runtime_retirement_local_quiescence->>'agent_id'=t.agent_id::text
+          AND t.runtime_retirement_local_quiescence->>'runtime_attach_token'=t.runtime_attach_token::text
+          AND t.runtime_retirement_local_quiescence->>'settle_status'='ended'
+          AND t.runtime_retirement_local_quiescence->>'quiescence_actor'='orchestrator'
+          AND t.runtime_retirement_local_quiescence->>'quiescence_protocol'='agent_runtime_zero_v1'
+          AND t.runtime_retirement_local_quiescence->>'agent_pod_name'=a.hostname
+          AND t.runtime_retirement_local_quiescence->>'agent_pod_uid'=a.pod_uid
+          AND t.runtime_retirement_local_quiescence->>'workspace_generation' IS NULL
+          AND t.runtime_retirement_local_quiescence->>'workspace_runtime_incarnation' IS NULL
+          AND t.runtime_retirement_local_quiescence->>'vm_creation_request_id' IS NULL
+          AND t.runtime_retirement_local_quiescence->>'vm_creation_provision_generation' IS NULL
+          AND (NOT require_outcome OR EXISTS (
+              SELECT 1 FROM public.thread_runtime_retirement_outcomes o
+              WHERE o.thread_id=t.id AND o.runtime_generation=t.runtime_generation
+                AND o.retirement_token=t.runtime_retirement_token
+                AND o.disposition='ended' AND o.permanent AND o.outcome='deleted'
+                AND o.agent_id=t.agent_id AND o.runtime_attach_token=t.runtime_attach_token))
+    );
+$$;
 
 
 --
@@ -25171,8 +25557,20 @@ BEGIN
        OR (j.context ? '_job_terminal_vm_cleanup' AND (
            j.context->'_job_terminal_vm_cleanup'->>'version'='1'
            AND j.context->'_job_terminal_vm_cleanup'->>'provision_generation'=generation::text
-           AND j.context->'_job_terminal_vm_cleanup'->>'admission_id'
-               IN (old_parent::text,retaining_parent::text)) IS DISTINCT FROM true) THEN
+           AND (
+               j.context->'_job_terminal_vm_cleanup'->>'admission_id'
+                   IN (old_parent::text,retaining_parent::text)
+               OR (
+                   -- The approved marker precedes first-parent admission. Once
+                   -- bound, replay must match that exact parent above; explicit
+                   -- JSON null is invalid and must not act like a missing key.
+                   NOT (j.context->'_job_terminal_vm_cleanup' ? 'admission_id')
+                   AND j.status='completed' AND j.completed_at IS NOT NULL
+                   AND j.freeze_data IS NULL
+                   AND j.context->'_job_terminal_vm_cleanup'
+                       @> '{"version":1,"source":"approve"}'::jsonb
+               )
+           )) IS DISTINCT FROM true) THEN
         RETURN NULL;
     END IF;
     RETURN jsonb_build_object('creation_request_id',r.request_id,'reservation_id',v.id,
@@ -25190,7 +25588,14 @@ CREATE FUNCTION public.vm_job_retained_terminal_authorized(owner uuid) RETURNS b
     LANGUAGE sql STABLE
     AS $$
     SELECT EXISTS(SELECT 1 FROM public.jobs j WHERE j.id=owner AND (
-        (j.status='cancelled' AND j.context->'_stateless_cancel_cleanup_pending'='true'::jsonb)
+        -- Ordinary Approve commits this marker with completed status. A finished
+        -- review command has no finalizing lease to authorize the later sweep.
+        (j.status='completed' AND j.completed_at IS NOT NULL AND j.freeze_data IS NULL
+          AND j.context->'_job_terminal_vm_cleanup' @> '{"version":1,"source":"approve"}'::jsonb
+          AND j.context->'_job_terminal_vm_cleanup'->>'provision_generation' IS NOT NULL
+          AND j.context->'_job_terminal_vm_cleanup'->>'provision_generation'=
+              j.context->'vm'->>'provision_generation')
+        OR (j.status='cancelled' AND j.context->'_stateless_cancel_cleanup_pending'='true'::jsonb)
         OR (j.status IN ('cancelled','failed','completed') AND j.context->'_stateless_delete_pending'='true'::jsonb)
         OR EXISTS(SELECT 1 FROM public.job_completion_commands command
             JOIN public.completion_effects effect ON effect.producer_id=command.id
@@ -26594,10 +26999,14 @@ CREATE TABLE public.automations (
     created_at timestamp with time zone DEFAULT now() NOT NULL,
     updated_at timestamp with time zone DEFAULT now() NOT NULL,
     expert_id uuid,
+    trigger_connector_id uuid,
+    job_shape jsonb DEFAULT '{}'::jsonb NOT NULL,
     CONSTRAINT automations_expert_source_check CHECK (((expert_id IS NULL) OR (expert = 'worker_base'::text))),
-    CONSTRAINT automations_trigger_type_check CHECK ((trigger_type = ANY (ARRAY['cron'::text, 'event'::text]))),
+    CONSTRAINT automations_job_shape_object CHECK ((jsonb_typeof(job_shape) = 'object'::text)),
+    CONSTRAINT automations_trigger_type_check CHECK ((trigger_type = ANY (ARRAY['cron'::text, 'event'::text, 'live'::text]))),
     CONSTRAINT cron_trigger_has_expr CHECK (((trigger_type <> 'cron'::text) OR (cron_expr IS NOT NULL))),
-    CONSTRAINT event_trigger_has_filter CHECK (((trigger_type <> 'event'::text) OR (event_filter IS NOT NULL)))
+    CONSTRAINT event_trigger_has_filter CHECK (((trigger_type <> 'event'::text) OR (event_filter IS NOT NULL))),
+    CONSTRAINT live_trigger_has_connector CHECK (((trigger_type <> 'live'::text) OR (trigger_connector_id IS NOT NULL)))
 );
 
 
@@ -28844,6 +29253,95 @@ CREATE TABLE public.legacy_workspace_cutover_plans (
 
 
 --
+-- Name: live_session_events; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.live_session_events (
+    id bigint NOT NULL,
+    session_id uuid NOT NULL,
+    event_id text,
+    kind text NOT NULL,
+    speaker text,
+    text text,
+    start_ms integer,
+    end_ms integer,
+    delegation_id text,
+    payload jsonb DEFAULT '{}'::jsonb NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT live_session_events_kind_check CHECK ((kind = ANY (ARRAY['transcript'::text, 'delegation'::text, 'answer'::text, 'instruction'::text, 'thinking'::text, 'fallback'::text, 'question'::text, 'follow_up'::text, 'transfer'::text, 'hangup'::text, 'dtmf'::text, 'closed'::text, 'error'::text, 'system'::text])))
+);
+
+
+--
+-- Name: TABLE live_session_events; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON TABLE public.live_session_events IS 'The journal of a live session: transcript, delegations, the job''s answers and steering, and the pod''s own appends. event_id dedupes replays.';
+
+
+--
+-- Name: live_session_events_id_seq; Type: SEQUENCE; Schema: public; Owner: -
+--
+
+CREATE SEQUENCE public.live_session_events_id_seq
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+
+--
+-- Name: live_session_events_id_seq; Type: SEQUENCE OWNED BY; Schema: public; Owner: -
+--
+
+ALTER SEQUENCE public.live_session_events_id_seq OWNED BY public.live_session_events.id;
+
+
+--
+-- Name: live_sessions; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.live_sessions (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    connector_id uuid,
+    provider_session_id text NOT NULL,
+    webhook_id text,
+    family text DEFAULT 'voice'::text NOT NULL,
+    transport text DEFAULT 'sip'::text NOT NULL,
+    direction text DEFAULT 'inbound'::text NOT NULL,
+    origin text NOT NULL,
+    status text NOT NULL,
+    automation_id uuid,
+    job_id uuid,
+    project_id uuid,
+    model text,
+    handoff jsonb DEFAULT '{}'::jsonb NOT NULL,
+    metadata jsonb DEFAULT '{}'::jsonb NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    accepted_at timestamp with time zone,
+    attached_at timestamp with time zone,
+    ended_at timestamp with time zone,
+    close_reason text,
+    error text,
+    usage_seconds numeric,
+    owner_identity_id uuid,
+    lease_until timestamp with time zone,
+    CONSTRAINT live_sessions_direction_check CHECK ((direction = ANY (ARRAY['inbound'::text, 'outbound'::text]))),
+    CONSTRAINT live_sessions_family_check CHECK ((family = ANY (ARRAY['voice'::text, 'messaging'::text]))),
+    CONSTRAINT live_sessions_origin_check CHECK ((origin = ANY (ARRAY['webhook'::text, 'api'::text, 'manifest'::text]))),
+    CONSTRAINT live_sessions_status_check CHECK ((status = ANY (ARRAY['ringing'::text, 'active'::text, 'ended'::text, 'rejected'::text, 'failed'::text])))
+);
+
+
+--
+-- Name: TABLE live_sessions; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON TABLE public.live_sessions IS 'A live session (a phone call) a live connector received, and the one job it is bound to. Status flow ringing -> active -> ended, or ringing -> rejected | failed; every update is monotonic.';
+
+
+--
 -- Name: llm_endpoints; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -28970,6 +29468,31 @@ CREATE TABLE public.main_cloud_backend_instances (
 --
 
 COMMENT ON TABLE public.main_cloud_backend_instances IS 'Immutable non-secret routing and remote-installation authority. Secret values remain external; only exact opaque references may rotate.';
+
+
+--
+-- Name: main_cloud_service_credentials; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.main_cloud_service_credentials (
+    backend_instance_id uuid NOT NULL,
+    login_name text NOT NULL,
+    credential_ciphertext text NOT NULL,
+    token_name text NOT NULL,
+    revision bigint DEFAULT 1 NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT main_cloud_service_credentials_ciphertext_check CHECK ((credential_ciphertext ~~ 'v1:%'::text)),
+    CONSTRAINT main_cloud_service_credentials_login_check CHECK ((login_name <> ''::text)),
+    CONSTRAINT main_cloud_service_credentials_revision_check CHECK ((revision > 0))
+);
+
+
+--
+-- Name: TABLE main_cloud_service_credentials; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON TABLE public.main_cloud_service_credentials IS 'App passwords of SRW''s own main-cloud service accounts (agent-service), one per installation and login name, as APP_ENCRYPTION_KEY ciphertexts. revision is the compare-and-set counter replicas agree on one token with.';
 
 
 --
@@ -29538,7 +30061,7 @@ CREATE TABLE public.models (
     source text DEFAULT 'ui'::text NOT NULL,
     helm_value_hash text,
     source_updated_at timestamp with time zone DEFAULT CURRENT_TIMESTAMP NOT NULL,
-    CONSTRAINT models_capabilities_check CHECK (((cardinality(capabilities) >= 1) AND (capabilities <@ ARRAY['chat'::text, 'auxiliary'::text, 'embedding'::text, 'vision'::text, 'whisper'::text, 'tts'::text, 'search'::text, 'fetch'::text, 'rerank'::text]))),
+    CONSTRAINT models_capabilities_check CHECK (((cardinality(capabilities) >= 1) AND (capabilities <@ ARRAY['chat'::text, 'auxiliary'::text, 'embedding'::text, 'vision'::text, 'whisper'::text, 'tts'::text, 'search'::text, 'fetch'::text, 'rerank'::text, 'live_voice'::text]))),
     CONSTRAINT models_provider_kind_check CHECK ((provider_kind = ANY (ARRAY['system'::text, 'endpoint'::text]))),
     CONSTRAINT models_source_check CHECK ((source = ANY (ARRAY['default'::text, 'helm'::text, 'ui'::text])))
 );
@@ -30264,6 +30787,7 @@ CREATE TABLE public.projects (
     network_tier text DEFAULT 'internet-only'::text NOT NULL,
     main_cloud_backend_instance_id uuid,
     manifest_resource_id uuid,
+    main_cloud_folder_error text,
     CONSTRAINT projects_network_tier_check CHECK ((network_tier = ANY (ARRAY['internet-only'::text, 'home-allowed'::text]))),
     CONSTRAINT valid_project_status CHECK (((status)::text = ANY ((ARRAY['active'::character varying, 'archived'::character varying])::text[])))
 );
@@ -30281,6 +30805,13 @@ COMMENT ON COLUMN public.projects.status IS 'Project lifecycle: active|archived,
 --
 
 COMMENT ON COLUMN public.projects.network_tier IS 'Workspace pod-network egress tier. Controls which CIDRs the project''s workspace pods can reach. The orchestrator emits this value as the srw.io/network-tier pod label; the matching helm NetworkPolicy (one per tier) enforces the allowlist. See docs/features/workspace_network_isolation.md §3.';
+
+
+--
+-- Name: COLUMN projects.main_cloud_folder_error; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.projects.main_cloud_folder_error IS 'Why the project''s main-cloud folder could not be created: the error kind of the last failed attempt (already_exists, permission_denied, unavailable, ...). NULL when none failed or once one succeeded. Written by project cloud provisioning, shown on the project page.';
 
 
 --
@@ -34437,6 +34968,13 @@ ALTER SEQUENCE public.workspace_intervals_id_seq OWNED BY public.workspace_inter
 
 
 --
+-- Name: live_session_events id; Type: DEFAULT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.live_session_events ALTER COLUMN id SET DEFAULT nextval('public.live_session_events_id_seq'::regclass);
+
+
+--
 -- Name: message_delivery_attempts attempt_id; Type: DEFAULT; Schema: public; Owner: -
 --
 
@@ -35049,6 +35587,38 @@ ALTER TABLE ONLY public.legacy_workspace_cutover_plans
 
 
 --
+-- Name: live_session_events live_session_events_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.live_session_events
+    ADD CONSTRAINT live_session_events_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: live_sessions live_sessions_connector_id_provider_session_id_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.live_sessions
+    ADD CONSTRAINT live_sessions_connector_id_provider_session_id_key UNIQUE (connector_id, provider_session_id);
+
+
+--
+-- Name: live_sessions live_sessions_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.live_sessions
+    ADD CONSTRAINT live_sessions_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: live_sessions live_sessions_webhook_id_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.live_sessions
+    ADD CONSTRAINT live_sessions_webhook_id_key UNIQUE (webhook_id);
+
+
+--
 -- Name: llm_endpoints llm_endpoints_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -35102,6 +35672,14 @@ ALTER TABLE ONLY public.main_cloud_backend_instances
 
 ALTER TABLE ONLY public.main_cloud_backend_instances
     ADD CONSTRAINT main_cloud_backend_instances_routing_identity UNIQUE (backend_id, routing_sha256, installation_proof_sha256);
+
+
+--
+-- Name: main_cloud_service_credentials main_cloud_service_credentials_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.main_cloud_service_credentials
+    ADD CONSTRAINT main_cloud_service_credentials_pkey PRIMARY KEY (backend_instance_id, login_name);
 
 
 --
@@ -39207,6 +39785,34 @@ CREATE INDEX legacy_workspace_cutover_plans_pending_idx ON public.legacy_workspa
 
 
 --
+-- Name: live_session_events_cursor; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX live_session_events_cursor ON public.live_session_events USING btree (session_id, id);
+
+
+--
+-- Name: live_session_events_event; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX live_session_events_event ON public.live_session_events USING btree (session_id, event_id) WHERE (event_id IS NOT NULL);
+
+
+--
+-- Name: live_sessions_connector_status; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX live_sessions_connector_status ON public.live_sessions USING btree (connector_id, status);
+
+
+--
+-- Name: live_sessions_job; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX live_sessions_job ON public.live_sessions USING btree (job_id);
+
+
+--
 -- Name: managed_repository_workspace_cleanup_one_active; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -39596,6 +40202,13 @@ CREATE UNIQUE INDEX storage_volume_incarnations_active_asset_uq ON public.storag
 --
 
 CREATE INDEX storage_volume_incarnations_asset_time_idx ON public.storage_volume_incarnations USING btree (asset_id, first_observed_at, detached_at, id);
+
+
+--
+-- Name: uq_automations_live_primary; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX uq_automations_live_primary ON public.automations USING btree (trigger_connector_id) WHERE (enabled AND (trigger_type = 'live'::text));
 
 
 --
@@ -42470,6 +43083,14 @@ ALTER TABLE ONLY public.automations
 
 
 --
+-- Name: automations automations_trigger_connector_fk; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.automations
+    ADD CONSTRAINT automations_trigger_connector_fk FOREIGN KEY (trigger_connector_id) REFERENCES public.datasources(id) ON DELETE RESTRICT;
+
+
+--
 -- Name: bench_runs bench_runs_created_by_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -43126,6 +43747,46 @@ ALTER TABLE ONLY public.legacy_workspace_cutover_plans
 
 
 --
+-- Name: live_session_events live_session_events_session_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.live_session_events
+    ADD CONSTRAINT live_session_events_session_id_fkey FOREIGN KEY (session_id) REFERENCES public.live_sessions(id) ON DELETE CASCADE;
+
+
+--
+-- Name: live_sessions live_sessions_automation_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.live_sessions
+    ADD CONSTRAINT live_sessions_automation_id_fkey FOREIGN KEY (automation_id) REFERENCES public.automations(id) ON DELETE SET NULL;
+
+
+--
+-- Name: live_sessions live_sessions_connector_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.live_sessions
+    ADD CONSTRAINT live_sessions_connector_id_fkey FOREIGN KEY (connector_id) REFERENCES public.datasources(id) ON DELETE SET NULL;
+
+
+--
+-- Name: live_sessions live_sessions_job_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.live_sessions
+    ADD CONSTRAINT live_sessions_job_id_fkey FOREIGN KEY (job_id) REFERENCES public.jobs(id) ON DELETE SET NULL;
+
+
+--
+-- Name: live_sessions live_sessions_project_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.live_sessions
+    ADD CONSTRAINT live_sessions_project_id_fkey FOREIGN KEY (project_id) REFERENCES public.projects(id) ON DELETE SET NULL;
+
+
+--
 -- Name: llm_endpoints llm_endpoints_user_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -43163,6 +43824,14 @@ ALTER TABLE ONLY public.magic_link_tokens
 
 ALTER TABLE ONLY public.main_cloud_active_backend
     ADD CONSTRAINT main_cloud_active_backend_instance_fk FOREIGN KEY (backend_instance_id, backend_id) REFERENCES public.main_cloud_backend_instances(id, backend_id) ON DELETE RESTRICT;
+
+
+--
+-- Name: main_cloud_service_credentials main_cloud_service_credentials_backend_instance_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.main_cloud_service_credentials
+    ADD CONSTRAINT main_cloud_service_credentials_backend_instance_id_fkey FOREIGN KEY (backend_instance_id) REFERENCES public.main_cloud_backend_instances(id);
 
 
 --

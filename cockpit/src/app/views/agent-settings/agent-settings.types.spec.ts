@@ -20,6 +20,31 @@ describe('detectModelFamily — Muse Spark 1.3', () => {
   );
 });
 
+describe('detectModelFamily — Gemini 4 Argon and 3.8 Flash', () => {
+  it.each(['', 'google/', 'models/', 'openrouter/google/'])(
+    'claims Argon and 3.8 Flash with prefix %s', (prefix) => {
+      expect(detectModelFamily(`${prefix}gemini-4-argon`)).toBe('gemini-4-argon');
+      expect(detectModelFamily(`${prefix}Gemini-4-Argon`)).toBe('gemini-4-argon');
+      expect(detectModelFamily(`${prefix}gemini-4-argon-cyber-permissive`)).toBe('gemini-4-argon');
+      expect(detectModelFamily(`${prefix}gemini-3.8-flash`)).toBe('gemini-3.8-flash');
+      expect(detectModelFamily(`${prefix}gemini-3.8-flash-preview-09-2026`)).toBe('gemini-3.8-flash');
+      expect(detectModelFamily(`${prefix}gemini-3.8-flash:batch`)).toBe('gemini-3.8-flash');
+    },
+  );
+
+  it.each(['', 'openrouter/google/'])(
+    'leaves older and sibling Gemini ids on the generic family with prefix %s', (prefix) => {
+      expect(detectModelFamily(`${prefix}gemini-3.7-flash`)).toBe('gemini');
+      expect(detectModelFamily(`${prefix}gemini-3.8-flash-lite-tts`)).toBe('gemini');
+      expect(detectModelFamily(`${prefix}gemini-3.8-flash-tts`)).toBe('gemini');
+      expect(detectModelFamily(`${prefix}gemini-3.8-live`)).toBe('gemini');
+      expect(detectModelFamily(`${prefix}gemini-3.80-flash`)).toBe('gemini');
+      expect(detectModelFamily(`${prefix}gemini-4-argonx`)).toBe('gemini');
+      expect(detectModelFamily(`${prefix}gemini-3.1-pro-preview`)).toBe('gemini');
+    },
+  );
+});
+
 describe('detectModelFamily — Kimi K3', () => {
   it.each(['', 'moonshotai/', 'openrouter/moonshotai/'])(
     'claims K3 but leaves K2.x on default with prefix %s', (prefix) => {

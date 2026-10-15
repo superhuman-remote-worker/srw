@@ -4,7 +4,9 @@ import {WorkspaceChoice} from '../../core/models/workspace-template.model';
 import {choiceBackend, choiceRequestFields} from '../workspaces/workspace-template-utils';
 import {Component, computed, effect, inject, OnInit, signal, untracked, ViewChild} from '@angular/core';
 import {ActivatedRoute, Router} from '@angular/router';
-import {HttpClient, HttpParams} from '@angular/common/http';
+import {HttpClient, HttpContext, HttpParams} from '@angular/common/http';
+import {VIEW_AS_OVERRIDE} from '../../core/interceptors/view-as.interceptor';
+import {pickOwnDefaultProject} from '../../core/util/own-default-project';
 import {firstValueFrom} from 'rxjs';
 import {environment} from '../../core/environment';
 import {UserService} from '../../core/services/user.service';
@@ -23,7 +25,7 @@ import {AppInputComponent} from '../../ui/input';
 import {AppChipComponent} from '../../ui/chip';
 import {AppIconComponent} from '../../ui/icon';
 import {AppFormFieldComponent} from '../../ui/form-field';
-import {EffectiveModels, EligibleDatasource, Expert, ExpertDefaultsResponse, ExpertTemplateSource} from '../../core/models/api.model';
+import {EffectiveModels, EligibleDatasource, Expert, ExpertDefaultsResponse, ExpertTemplateSource, ProjectMemberRole} from '../../core/models/api.model';
 
 interface Project {
   id: string;
@@ -31,6 +33,7 @@ interface Project {
   status: string;
   description?: string;
   is_default?: boolean;
+  user_role?: ProjectMemberRole | null;
   main_cloud_backend?: string | null;
 }
 
@@ -601,7 +604,9 @@ export class SessionCreateComponent implements OnInit {
    *  source thread was on is the one exception — see
    *  `resolveArchivedPrefillProjects`. */
   private loadProjects(userId: string): void {
-    this.http.get<Project[]>(`${environment.apiUrl}/projects?user_id=${userId}&status=active`).subscribe({
+    this.http.get<Project[]>(`${environment.apiUrl}/projects?user_id=${userId}&status=active`, {
+      context: new HttpContext().set(VIEW_AS_OVERRIDE, 'mine'),
+    }).subscribe({
       next: (projects) => {
         this.projects.set(projects);
         this.projectsLoaded = true;
@@ -650,7 +655,7 @@ export class SessionCreateComponent implements OnInit {
       }
       // The source thread had no project at all: fall through to the personal project.
     }
-    const defaultProject = projects.find(p => p.is_default);
+    const defaultProject = pickOwnDefaultProject(projects, this.userService.currentUser()?.default_project_id);
     if (defaultProject) {
       this.selectedProjectIds.set(new Set([defaultProject.id]));
       // Refresh eligible datasources now that a project is selected.

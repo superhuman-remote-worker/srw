@@ -1,5 +1,5 @@
 /**
- * Curated TTS voice catalogs for the Admin → Providers "Add model" voice
+ * Curated TTS voice catalogs for the Settings → Models → Providers "Add model" voice
  * dropdown.
  *
  * There is no standard "list voices" endpoint in the OpenAI-compatible spec,

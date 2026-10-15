@@ -3,9 +3,12 @@ import {DatePipe} from '@angular/common';
 import {TestBed} from '@angular/core/testing';
 import {ActivatedRoute, Router} from '@angular/router';
 import {TranslocoService, TranslocoTestingModule} from '@jsverse/transloco';
-import {BehaviorSubject, of} from 'rxjs';
+import {BehaviorSubject, Subject, of, throwError} from 'rxjs';
+import {liveSessionFixture} from '../../core/models/fixtures/live-session.fixture';
+import {LiveSession} from '../../core/models/live-session.model';
 import {afterEach, beforeAll, beforeEach, describe, expect, it, vi} from 'vitest';
 import {ApiService} from '../../core/services/api.service';
+import {LiveSessionService} from '../../core/services/live-session.service';
 import {DataService} from '../../core/services/data.service';
 import {UserService} from '../../core/services/user.service';
 import {ViewportService} from '../../core/services/viewport.service';
@@ -40,6 +43,7 @@ class WorkspaceCreationTranslocoPipe implements PipeTransform {
  */
 function mountLogic(overrides: {
   api?: Partial<ApiService>;
+  sessions?: Partial<LiveSessionService>;
   params?: BehaviorSubject<ReturnType<typeof paramMap>>;
   rendered?: boolean;
 } = {}) {
@@ -61,6 +65,7 @@ function mountLogic(overrides: {
     cancelJob: vi.fn().mockReturnValue(of({status: 'cancelled'})),
     ...overrides.api,
   } as unknown as ApiService;
+  const sessions = {getSessions: vi.fn().mockReturnValue(of({sessions: []})), ...overrides.sessions};
 
   TestBed.configureTestingModule({
     imports: [
@@ -72,6 +77,7 @@ function mountLogic(overrides: {
     ],
     providers: [
       {provide: ApiService, useValue: api},
+      {provide: LiveSessionService, useValue: sessions},
       {provide: DataService, useValue: {setCurrentJob: vi.fn()}},
       {provide: UserService, useValue: {currentUser: signal({id: 'user-1'})}},
       {provide: ViewportService, useValue: {isMobile: signal(false)}},
@@ -92,7 +98,7 @@ function mountLogic(overrides: {
   transloco.setTranslation(en, 'en');
   transloco.setActiveLang('en');
   const fixture = TestBed.createComponent(JobListComponent);
-  return {fixture, component: fixture.componentInstance, api, navigate};
+  return {fixture, component: fixture.componentInstance, api, sessions, navigate};
 }
 
 describe('typed workspace creation on job rows', () => {
@@ -174,11 +180,96 @@ function job(id: string, over: Partial<JobSummary> = {}): Partial<JobSummary> {
   };
 }
 
+describe('phone sessions in lazy job detail', () => {
+  beforeEach(() => vi.useFakeTimers());
+  afterEach(() => {
+    TestBed.resetTestingModule();
+    vi.useRealTimers();
+  });
+
+  it('discovers sessions for an ordinary job without a telephony origin', () => {
+    const row = job('job-1', {status: 'processing', origin: 'user'});
+    const getSessions = vi.fn().mockReturnValue(of({sessions: [liveSessionFixture()]}));
+    const {fixture, component} = mountLogic({
+      api: {getJobsPage: vi.fn().mockReturnValue(of(page([row])))}, sessions: {getSessions},
+    });
+    fixture.detectChanges();
+    component.toggleExpand('job-1');
+    expect(getSessions).toHaveBeenCalledWith('job-1');
+    expect(component.jobDetails()['job-1'].sessions).toEqual([liveSessionFixture()]);
+  });
+
+  it('uses the 30s panel poll and preserves sessions while the refresh is in flight', async () => {
+    const pending = new Subject<{sessions: LiveSession[]}>();
+    const getSessions = vi.fn().mockReturnValueOnce(of({sessions: [liveSessionFixture()]})).mockReturnValue(pending);
+    const {fixture, component} = mountLogic({
+      api: {getJobsPage: vi.fn().mockReturnValue(of(page([job('job-1', {status: 'processing'})])))},
+      sessions: {getSessions},
+    });
+    fixture.detectChanges();
+    component.toggleExpand('job-1');
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(getSessions).toHaveBeenCalledTimes(2);
+    expect(component.jobDetails()['job-1'].loading).toBe(true);
+    expect(component.jobDetails()['job-1'].sessions).toEqual([liveSessionFixture()]);
+    const ended = liveSessionFixture({status: 'ended'});
+    pending.next({sessions: [ended]});
+    pending.complete();
+    expect(component.jobDetails()['job-1'].sessions).toEqual([ended]);
+    expect(component.jobDetails()['job-1'].loading).toBe(false);
+  });
+
+  it('refreshes sessions on completed jobs for post-call follow-ups and retains them on failed reads', async () => {
+    const ended = liveSessionFixture({status: 'ended'});
+    const getSessions = vi.fn().mockReturnValueOnce(of({sessions: [ended]}))
+      .mockReturnValue(throwError(() => ({status: 503})));
+    const {fixture, component} = mountLogic({
+      api: {getJobsPage: vi.fn().mockReturnValue(of(page([job('job-1', {status: 'completed'})])))},
+      sessions: {getSessions},
+    });
+    fixture.detectChanges();
+    component.toggleExpand('job-1');
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(getSessions).toHaveBeenCalledTimes(2);
+    expect(component.jobDetails()['job-1'].sessions).toEqual([ended]);
+  });
+
+  it('keeps unrelated panel data usable when the sessions endpoint is not available', () => {
+    const roster = {job_id: 'job-1', count: 0, subagents: []};
+    const {fixture, component} = mountLogic({
+      api: {getJobSubagents: vi.fn().mockReturnValue(of(roster))},
+      sessions: {getSessions: vi.fn().mockReturnValue(throwError(() => ({status: 404})))},
+    });
+    fixture.detectChanges();
+    component.toggleExpand('job-1');
+    expect(component.jobDetails()['job-1'].sessions).toBeNull();
+    expect(component.jobDetails()['job-1'].subagents).toEqual([]);
+    expect(component.jobDetails()['job-1'].error).toBe(false);
+  });
+});
+
 describe('JobListComponent — server-resolved tree', () => {
   beforeAll(async () => {
     await ɵresolveComponentResources(() => Promise.resolve(''));
   });
   afterEach(() => TestBed.resetTestingModule());
+
+  it('has no workspace URL for a job without a repository', () => {
+    const {component} = mountLogic();
+    for (const repo of [null, undefined, '', '   ']) {
+      expect(component.getWorkspaceUrl(job('j1', {repo_name: repo}) as JobSummary)).toBeNull();
+    }
+  });
+
+  it('builds the workspace URL for a job with a repository', () => {
+    const {component} = mountLogic();
+    expect(component.getWorkspaceUrl(job('j1', {repo_name: 'my-repo'}) as JobSummary)).toMatch(
+      /\/my-repo$/,
+    );
+    expect(
+      component.getWorkspaceUrl(job('j1', {repo_name: 'my-repo', branch_name: 'feat'}) as JobSummary),
+    ).toMatch(/\/my-repo\/src\/branch\/feat$/);
+  });
 
   it('opens a suspended VM IDE from the click and uses the admitted URL', () => {
     const startIdeSession = vi.fn().mockReturnValue(of({

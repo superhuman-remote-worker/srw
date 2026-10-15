@@ -4,7 +4,7 @@ import {SessionService} from '../services/session.service';
 import {UserService} from '../services/user.service';
 
 /**
- * Route guard for admin-only pages (Admin → Providers, Admin → Cloud).
+ * Route guard for admin-only pages (Settings → Models, Settings → Main cloud).
  *
  * Runs after `authGuard` has ensured a session exists. If the user is not
  * yet loaded (F5 reload before `GET /auth/me` resolves), the guard waits

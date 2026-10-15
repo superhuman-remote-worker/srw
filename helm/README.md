@@ -307,9 +307,12 @@ and keep `publicPort` equal to the port users actually see.
 
 This preset requires bundled Keycloak, Gitea, and Nextcloud. It disables
 OpenCloud, Neo4j Bolt TLS, the external SSH gateway, Collabora, and the Canvas
-viewer. It creates no cert-manager resources or Traefik CRDs. The chart may
-generate a new certificate during an upgrade; users then accept the replacement
-warning at the same origin.
+viewer. It creates no cert-manager resources or Traefik CRDs. An upgrade keeps the
+certificate while `address` and `tls.validityDays` stay the same and more than
+30 days of its validity remain. A changed address or validity, the last 30
+days, or the first upgrade from a chart that did not record these on the
+Secret generate a new one; users then accept the replacement warning at the
+same origin, and clients that pinned the old certificate need the new one.
 
 The preset also stages Nextcloud's internal signed installation-attestation
 lane. This lets ordinary cloud effects bind the exact persistent Nextcloud
@@ -626,6 +629,14 @@ deployment. See [Local Kubernetes with k3d](../docs/local-kubernetes.md#4-log-in
 **Git, cloud, admin credentials:**
 - `GITEA_ADMIN_USER`, `GITEA_ADMIN_PASSWORD` (internal Gitea only)
 - `NEXTCLOUD_ADMIN_USER`, `NEXTCLOUD_ADMIN_PASSWORD`, `NEXTCLOUD_AGENT_USER`, `NEXTCLOUD_AGENT_PASSWORD` (internal Nextcloud only)
+- `NEXTCLOUD_DB_PASSWORD` (internal Nextcloud with `nextcloud.database.type:
+  postgres`, the default) — the `srw-nextclouddb` owner's password, which a new
+  Nextcloud install also connects with. Chart-created mode generates and keeps
+  it; with ESO, add it to Vault before upgrading. Do not let a values
+  generator write it explicitly: an explicit value overrides the kept one.
+  `NEXTCLOUD_DB_USER` too when `databases.nextcloud.internal: false`.
+- `NEXTCLOUD_REDIS_PASSWORD` (when `nextcloud.redis.enabled`) — the bundled
+  Valkey's password; same generation and generator rule as above.
 - `NEXTCLOUD_PROTECTED_EFFECT_HMAC_KEY` when
   `nextcloud.protectedEffect.enabled=true`. Use at least 32 bytes from a
   dedicated random source. Chart-created mode generates and preserves it;
@@ -663,6 +674,140 @@ The bundled Nextcloud Deployment uses the `Recreate` strategy because every
 container in the Pod shares one data PVC. Upgrades therefore include a brief,
 deliberate Nextcloud restart instead of risking a cross-node ReadWriteOnce
 multi-attach deadlock.
+
+### Nextcloud images and major upgrades
+
+`nextcloud.image` (Apache and cron) and `nextcloud.protectedEffect.fpmImage`
+(the protected-effect pool) pin one exact release plus its multi-arch index
+digest, e.g. `docker.io/library/nextcloud:31.0.14-apache@sha256:…`. Upstream
+re-pushes exact tags and stops serving a major's tags after its end of life;
+the digest keeps every node on the same bytes. The render fails unless both
+images are the same Nextcloud major, read from their tags; a digest-only
+reference needs `nextcloud.majorVersion`.
+
+Every Nextcloud start runs two init containers before Apache:
+`nextcloud-version-guard` refuses a skipped major or a downgrade with an
+explicit message, and `nextcloud-upgrade` runs the image's own install or
+upgrade (`rsync`, `occ upgrade`, app updates from the app store) with no
+probes, so a long upgrade is never killed halfway by the startupProbe. On an
+unchanged version both finish in seconds. Upgrade one major per chart release
+and let each roll out completely before the next. `occ upgrade` reinstalls
+incompatible apps (groupfolders, user_oidc) from the app store; an install
+without app-store access needs them pre-staged in `custom_apps/`.
+
+To serve the images from GitHub's registry instead of Docker Hub, run the
+**mirror-nextcloud-images** workflow (Actions → Run workflow) with the version
+and the two digests the chart pins. It copies them unchanged to
+`ghcr.io/superhuman-remote-worker/nextcloud`. Make that package public (or
+list a pull secret in `global.imagePullSecrets`), then set the same digests on
+the mirror:
+
+```yaml
+nextcloud:
+  image: ghcr.io/superhuman-remote-worker/nextcloud:31.0.14-apache@sha256:07ec73cc816e58d6f45a162cd53ef886462c29271a23fc68d0124cec276e3767
+  protectedEffect:
+    fpmImage: ghcr.io/superhuman-remote-worker/nextcloud:31.0.14-fpm@sha256:236e20aedaef1586e8fc9ca73f8d953695b7beecc55df4a931ada2bf1c82a9e1
+```
+
+The bytes are identical, so a node that already has the image does not pull
+it again. Each PHP container gets its own `NC_serverid` (Apache 1, cron 2,
+the protected pool 3, the upgrade step 4): Nextcloud 33 builds its job and
+preview ids from it, and before 33 nothing reads it.
+
+### Bundled Nextcloud database
+
+A new bundled Nextcloud installs its metadata into a dedicated Postgres,
+`srw-nextclouddb` (`nextcloud.database.type: postgres`, the default;
+`databases.nextcloud` picks the `statefulset` or `cnpg` engine, as for the
+other bundled databases). `nextcloud.database.type: sqlite` keeps the old
+single-file database for tests and minimal installs. A `wait-for-nextclouddb`
+init container holds a new install until the database accepts the install's
+own credentials: Nextcloud's entrypoint gives up on a failed install for good.
+
+The setting applies to new installs only. An installed Nextcloud keeps the
+database its `config.php` names: an existing SQLite install keeps running on
+SQLite next to an empty `srw-nextclouddb`, and its Pod does not wait for
+Postgres, until an operator converts it with
+`scripts/nextcloud-sqlite-to-postgres.py` (phases `precheck`, `close`,
+`backup`, `convert`, `verify`, `open`; dry run unless `--run --confirm`). Do
+not run `occ db:convert-type` by hand: it sets each Postgres sequence to the
+table's current maximum, while SQLite never reuses the id of a deleted row, so
+Nextcloud would hand out old share, group folder and file ids again. The
+script raises every sequence to SQLite's high-water mark; `fix-sequences`
+repairs an install that was converted without it. After
+installation `config.php` holds the database user and password in plain text,
+so rotating `NEXTCLOUD_DB_PASSWORD` also needs
+`occ config:system:set dbpassword --value=...`.
+
+A NetworkPolicy admits only the Nextcloud Pod (and, on `cnpg`, the cluster's
+own instances and the operator) to the database, because agent Pods receive
+the whole application Secret. The protected-effect PHP-FPM pool connects with
+`statement_timeout` and `idle_in_transaction_session_timeout` set to the
+smaller of `handlerBoundSeconds` and `safetyMarginSeconds`, so no lane
+statement outlives the lane's cleanup horizon.
+
+### Bundled Nextcloud Valkey (opt-in)
+
+`nextcloud.redis.enabled=true` adds a Valkey Deployment (`srw-nextcloud-redis`,
+a pinned `valkey/valkey` release) that Apache, cron and the protected-effect
+pool share for Nextcloud's distributed cache and transactional file locking;
+Apache's PHP sessions move into it too. It keeps no data (no RDB, no AOF), sets
+`maxmemory` to 75 % of its memory limit with `allkeys-lru` eviction, and a
+NetworkPolicy admits only the Nextcloud Pod. Its password is
+`NEXTCLOUD_REDIS_PASSWORD` in the application Secret: chart-created mode
+generates and keeps it, while with ESO add it to Vault before enabling.
+
+It is not a free toggle. Once on, Nextcloud depends on it: Valkey down means
+Nextcloud down, and a Valkey restart signs every web user out. Nextcloud writes
+the Redis settings into `config.php` on its next configuration change, so
+switching back off is more than removing the environment: with the flag off,
+the setup hook deletes `memcache.distributed`, `memcache.locking` and `redis`
+from `config.php` whenever they still name Redis, returning to APCu.
+
+### Bundled Nextcloud background jobs
+
+A `cron` container in the Nextcloud Pod runs Nextcloud's background jobs
+(`cron.php` every 5 minutes, the image's `/cron.sh`), as the upstream Nextcloud
+chart does. It shares the data volume and the Apache container's proxy and S3
+environment, never the admin, OIDC or agent-service secrets. With
+`nextcloud.cron.enabled=false` the jobs run from browser page loads instead
+(Nextcloud's "ajax" mode), which stalls whenever nobody uses the web UI.
+
+Background jobs expire trash and thin file versions, and those are the only
+recovery history the bundled Nextcloud keeps. The setup hook therefore pins
+`trashbin_retention_obligation` and `versions_retention_obligation` to
+`disabled` and internal share expiry off on every start, in either mode, and
+both containers carry the two retention values as `NC_*` environment, which
+Nextcloud reads ahead of `config.php`. Groupfolders' trash and versions follow
+the same two keys. A deliberate retention policy is a later chart change, not
+an `occ` setting: the hook would reset it.
+
+On shutdown the cron container waits up to 120 s for a running `cron.php` to
+finish, because an interrupted job stays reserved for 12 hours. Apache stops
+at once, so a rollout that lands during a long job run is that much longer.
+
+The chart also mounts two server settings into the Nextcloud containers: an
+APCu cache of 128M (`apc.shm_size`, in Apache, cron and the protected-effect
+PHP-FPM pool) and an Apache prefork cap of
+`nextcloud.apache.maxRequestWorkers` workers (default 32, sized for the 2-core
+CPU limit; the image allows 150). A change to either rolls the Pod. With S3
+primary storage the setup hook sets the objectstore's `verify_bucket_exists`
+to `false` once Nextcloud is installed, which drops a bucket check from every
+request; install still creates a missing bucket.
+
+### Nextcloud share-create rate limit
+
+Nextcloud lets each user create 20 shares per 600 s. SRW's `agent-service`
+account creates every session and job-export share, so that per-user limit
+caps the whole installation. For the bundled Nextcloud,
+`nextcloud.rateLimits.shareCreate` (default 200 per 600 s) raises it: the setup
+hook writes Nextcloud's `ratelimit_overwrite` for
+`files_sharing.shareapi.createshare` on every start and deletes it when both
+values are `null`. The orchestrator receives the same numbers and the replica
+count (`NEXTCLOUD_SHARE_RATE_LIMIT`, `NEXTCLOUD_SHARE_RATE_PERIOD_SECONDS`,
+`NEXTCLOUD_SHARE_RATE_REPLICAS`) so its replicas together stay under the limit.
+For an external Nextcloud the chart assumes upstream's 20 per 600 s; if that
+server's admin changed it, set `cloud.shareRateLimit` to match.
 
 ### Self-hosted web research
 
@@ -746,6 +891,37 @@ openssl rand -base64 32  # APP_ENCRYPTION_KEY
 openssl rand -base64 48  # MCP_INTERNAL_KEY
 openssl rand -base64 48  # IDE_CREDENTIAL_KEY
 ```
+
+---
+
+## Private CA certificates
+
+An on-premises model API (or any other HTTPS service SRW calls) may use a
+certificate from your own CA. Give the chart that CA; SRW then verifies the
+service against it. Certificate verification is never switched off, and the
+public roots stay trusted.
+
+```yaml
+trust:
+  extraCaCertificates: |
+    -----BEGIN CERTIFICATE-----
+    …your CA, one or more certificates…
+    -----END CERTIFICATE-----
+  # or a ConfigMap you manage, for example one trust-manager writes:
+  # existingConfigMap: university-roots
+  # existingConfigMapKey: ca.crt
+```
+
+```bash
+helm upgrade srw … -f values.yaml --set-file trust.extraCaCertificates=university-ca.pem
+```
+
+The certificates reach the orchestrator (model discovery, the catalog
+**Test** action, the knowledge-base indexer), every agent pod (inference,
+embeddings, rerank, vision) and every container workspace, whose entrypoint
+adds them to the system store for `curl`, `git` and OpenSSL. VM workspaces do
+not receive them. Then add the API under **Admin → Models** with its `https://`
+address.
 
 ---
 

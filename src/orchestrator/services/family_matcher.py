@@ -82,6 +82,15 @@ _FAMILY_RULES: list[tuple[re.Pattern, str | Callable[[re.Match], FamilyDetection
     (re.compile(r"^gpt-4", re.IGNORECASE), "default"),
     # Google
     (re.compile(r"gemma", re.IGNORECASE), "gemma"),
+    # Argon and 3.8 Flash before the generic gemini rule — mirrors family_of().
+    (re.compile(r"(?:^|/)gemini-4-argon(?![\w.])", re.IGNORECASE), "gemini-4-argon"),
+    (
+        re.compile(
+            r"(?:^|/)gemini-3\.8-flash(?![\w.])(?!-(?:lite|image|tts|live))",
+            re.IGNORECASE,
+        ),
+        "gemini-3.8-flash",
+    ),
     (re.compile(r"gemini", re.IGNORECASE), "gemini"),
     # Other open-weight families
     (re.compile(r"gpt-oss", re.IGNORECASE), "gpt-oss"),

@@ -63,7 +63,11 @@ from shared.runtime.core.loader import (
     canonical_config_name,
 )
 from shared.runtime.core.model_registry import UnknownModelError
-from shared.runtime.core.transport_resolution import env_endpoint_names
+from shared.runtime.core.transport_resolution import (
+    env_endpoint_names,
+    provider_base_url,
+    same_endpoint,
+)
 from shared.subscription_routing import subscription_request_headers
 
 
@@ -392,8 +396,10 @@ async def inject_env_key_credentials(
     with an endpoint_id) contribute the inline base_url+api_key from the
     endpoint row, which overwrites any pre-set endpoint name; built-ins and
     system-anchored catalog rows resolve the api_key via
-    ``resolved_keys[provider]`` (setdefault), withheld when an endpoint name
-    for the prefix is already set.
+    ``resolved_keys[provider]`` (setdefault) together with the provider's own
+    OpenAI-compatible base URL (``transport_resolution.provider_base_url``).
+    The key is withheld when an endpoint name for the prefix is already set to
+    another host, or when the provider has no such API.
     """
     env_keys.setdefault(f"{prefix}_MODEL", model_id)
 
@@ -455,21 +461,43 @@ async def inject_env_key_credentials(
     provider = meta.api_key_ref if meta is not None else provider_of_model(model_id)
     # Same contract as the model-section injector: a provider-key row has no
     # endpoint of its own, so the resolved key belongs to the provider's
-    # canonical endpoint. If any endpoint name for this prefix is already set
-    # (the endpoint-backed branch above returned for real endpoint rows),
-    # withhold the key so a stored credential is not sent to that host.
+    # canonical endpoint. Unlike a chat section, a flat-env client does not
+    # know that endpoint and defaults to api.openai.com, so the canonical URL
+    # is written next to the key. An endpoint name already set to another host
+    # (the endpoint-backed branch above returned for real endpoint rows)
+    # withholds the key so a stored credential is not sent to that host; one
+    # set to the provider's own API is this branch's own earlier write, kept
+    # through redaction and re-injected on resume.
     if provider and resolved_keys and provider in resolved_keys:
-        pinned = [name for name in env_endpoint_names(prefix) if env_keys.get(name)]
-        if pinned:
+        names = env_endpoint_names(prefix)
+        canonical = provider_base_url(provider)
+        foreign = [
+            name
+            for name in names
+            if env_keys.get(name) and not same_endpoint(env_keys[name], canonical)
+        ]
+        if foreign:
             dependencies.logger.warning(
                 "Dispatch: %s model %r has a pinned endpoint (%s); withholding "
                 "the resolved %s key so it is not sent to that endpoint.",
                 prefix,
                 model_id,
-                ", ".join(pinned),
+                ", ".join(foreign),
+                provider,
+            )
+        elif canonical is None:
+            dependencies.logger.error(
+                "Dispatch: %s model %r routes on the %s provider key, but that "
+                "provider has no OpenAI-compatible API for this capability; "
+                "withholding the key so it is not sent to api.openai.com. Pick "
+                "another model, or add it under an endpoint in Admin → Models.",
+                prefix,
+                model_id,
                 provider,
             )
         else:
+            if not env_keys.get(names[0]):
+                env_keys[names[0]] = canonical
             env_keys.setdefault(f"{prefix}_API_KEY", resolved_keys[provider])
 
 

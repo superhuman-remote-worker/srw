@@ -1003,7 +1003,9 @@ export class JobReviewComponent {
     const currentJob = this.job();
     const giteaUrl = environment.giteaUrl;
     if (!giteaUrl || !currentJob) return null;
-    const repoName = currentJob.repo_name || `job-${currentJob.id}`;
+    const repoName = currentJob.repo_name?.trim();
+    // No repository means no workspace page: a guessed name is a dead link.
+    if (!repoName) return null;
     if (currentJob.branch_name) {
       return `${giteaUrl}/${repoName}/src/branch/${currentJob.branch_name}`;
     }

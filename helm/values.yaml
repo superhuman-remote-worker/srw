@@ -473,6 +473,19 @@ connectors:
       # its token in the clone URL as before C3 (logged per connector), or
       # "refuse", no clone and the reason in the agent's README.
       fallback: token-in-url
+    # -- The phone-line driver (srw.gpt-live-sip/v1, live-session jobs): one
+    # standing service pod per phone-line connector holds its calls. OpenAI's
+    # GPT-Live answers the SIP call; the pod accepts it when SRW hands the
+    # session over, holds the session's sideband, journals it and serves the
+    # job's voice subagent. Needs servicePods.enabled and a live_voice
+    # catalog model (llm.seed: an OpenAI endpoint plus a gpt-live-1 row with
+    # capabilities [live_voice]). CI stamps tag and digest.
+    gptLiveSip:
+      enabled: false
+      image:
+        repository: ghcr.io/superhuman-remote-worker/srw-driver-gpt-live-sip
+        tag: latest
+        digest: ""
     # -- SRW's connector driver certificate authority (C3): signs each TLS
     # driver pod's certificate; workspaces trust it for the driver's URL
     # only. Generated once at install and kept (resource-policy keep) when
@@ -1766,6 +1779,24 @@ secrets:
   # -- Separate existing secret for VM SSH key (optional)
   existingVmSshKeySecret: ""
 
+# =============================================================================
+# Trust — extra CA certificates for outbound HTTPS
+# =============================================================================
+# Certificates the platform trusts on top of the public roots, for a service
+# whose certificate comes from a private or self-signed CA: typically an
+# on-premises model API added under Admin → Models. Mounted into the
+# orchestrator, every agent pod and every container workspace (whose
+# entrypoint adds it to the system store). Certificate verification is never
+# switched off; without this, such an endpoint fails its TLS handshake.
+trust:
+  # -- PEM, one or more certificates (-----BEGIN CERTIFICATE----- …). The chart
+  # puts it into the ConfigMap <fullname>-trust-ca.
+  extraCaCertificates: ""
+  # -- Or a ConfigMap you manage (for example one cert-manager's trust-manager
+  # writes). Set one of the two.
+  existingConfigMap: ""
+  existingConfigMapKey: ca.crt
+
 # -- Mode 1: External Secrets Operator (Vault-backed)
 externalSecrets:
   enabled: false
@@ -2602,6 +2633,79 @@ databases:
       limits:
         memory: "512Mi"
         cpu: "200m"
+  # Dedicated Postgres for the bundled Nextcloud's metadata (file cache, shares,
+  # tokens, app config). Renders only when the bundled Nextcloud is internal and
+  # nextcloud.database.type is "postgres", so an external Nextcloud renders no
+  # database. File contents stay in S3 or on the Nextcloud PVC.
+  nextcloud:
+    enabled: true
+    # -- Which implementation backs this database.
+    #      statefulset — the bundled single-replica StatefulSet (default)
+    #      migrating   — renders BOTH, so a CloudNativePG Cluster can import
+    #                    from the live StatefulSet Service. Transitional only.
+    #      cnpg        — the CloudNativePG Cluster only
+    engine: "statefulset"
+    # -- Override the profile's instance count for this database. null = derive.
+    instances: null
+    # -- max_connections. Apache is capped at nextcloud.apache.maxRequestWorkers
+    #    (32) workers, each holding at most one connection, plus cron and the
+    #    protected-effect pool; 100 leaves the instance manager its headroom.
+    maxConnections: 100
+    # -- pg_restore --jobs for the post-data (index) section during a
+    #    `migrating` import. null = serial.
+    importRestoreJobs: null
+    # -- Extra postgresql.conf settings for the CloudNativePG Cluster, merged
+    #    over max_connections and the memory GUCs derived from
+    #    cnpgResources.limits.memory (shared_buffers 25 %, effective_cache_size
+    #    75 %). Nextcloud's all-in-one image runs work_mem 16MB and
+    #    maintenance_work_mem 256MB at about twice this memory; the latter is
+    #    halved so autovacuum still fits the limit. Values MUST be strings.
+    #    The StatefulSet engine keeps the image defaults.
+    parameters:
+      work_mem: "16MB"
+      maintenance_work_mem: "128MB"
+    # -- Include this database in backups when databases.backup.method is set.
+    backupEnabled: true
+    # -- CloudNativePG operand image, used ONLY when `engine` is not
+    #    `statefulset`; see databases.gitea.cnpgImage. PINNED, and every
+    #    database's pin moves together. PostgreSQL 16 suits Nextcloud 31 to 33
+    #    (31 supports 13-17, 33 supports 14-18).
+    cnpgImage: "ghcr.io/cloudnative-pg/postgresql:16.15"
+    # -- When false, the bundled Nextcloud installs against
+    #    externalHost/Port/Db below (managed Postgres). The user then comes
+    #    from NEXTCLOUD_DB_USER in the Secret; the password is always
+    #    NEXTCLOUD_DB_PASSWORD.
+    internal: true
+    externalHost: ""
+    externalPort: 5432
+    externalDb: "nextcloud"
+    # -- libpq sslmode for every Nextcloud PHP process (PGSSLMODE). "prefer"
+    #    is libpq's own default: TLS where the server offers it (CloudNativePG),
+    #    plain on the bundled StatefulSet.
+    sslMode: "prefer"
+    image: postgres:16
+    storageClass: ""
+    # -- Volume size for the CloudNativePG Cluster, used ONLY when `engine` is
+    #    not `statefulset`. Empty = inherit `storageSize` below.
+    cnpgStorageSize: ""
+    storageSize: "8Gi"
+    # -- Resources for the CloudNativePG Cluster, used ONLY when `engine` is
+    #    not `statefulset`. 1Gi derives shared_buffers 256MB, the all-in-one
+    #    image's value.
+    cnpgResources:
+      requests:
+        memory: "1Gi"
+        cpu: "100m"
+      limits:
+        memory: "1Gi"
+        cpu: "1"
+    resources:
+      requests:
+        memory: "128Mi"
+        cpu: "50m"
+      limits:
+        memory: "512Mi"
+        cpu: "500m"
   neo4j:
     enabled: true
     internal: true
@@ -2987,10 +3091,90 @@ nextcloud:
   # which has no MinIO. Default true preserves existing prod behaviour.
   objectStore:
     enabled: true
-  image: docker.io/library/nextcloud:31-apache
+  # PINNED to an exact release plus its multi-arch index digest, like
+  # protectedEffect.fpmImage below, which must be the same major. Upstream
+  # re-pushes exact tags when its base images change and stops serving a
+  # major's tags after end of life; the digest keeps every node on the same
+  # bytes. Move one major per chart release: the version guard refuses a skip.
+  # The mirror-nextcloud-images workflow copies these digests to
+  # ghcr.io/superhuman-remote-worker/nextcloud; helm/README.md describes the
+  # switch.
+  image: docker.io/library/nextcloud:31.0.14-apache@sha256:07ec73cc816e58d6f45a162cd53ef886462c29271a23fc68d0124cec276e3767
+  # -- The Nextcloud major both images run. Read from their tags, so leave it
+  # null unless an image reference carries no version tag (digest only, or a
+  # tag like "stable-apache"); a tagged reference must agree with it.
+  majorVersion: null
   replicas: 0
   storageClass: ""
   storageSize: "10Gi"
+  # Which database a NEW install uses for Nextcloud's metadata:
+  #
+  #   postgres (default) — the dedicated `srw-nextclouddb` (databases.nextcloud;
+  #     StatefulSet or CloudNativePG) or an external server. Concurrent writers,
+  #     which SQLite cannot give the shared agent-service account.
+  #   sqlite — one file on the Nextcloud PVC. For tests and minimal installs.
+  #
+  # Only the first install reads this. An installed Nextcloud keeps the
+  # database its config.php names, so an existing SQLite install stays on
+  # SQLite next to an empty Postgres until it is converted with
+  # `occ db:convert-type`; the Pod does not wait for Postgres in that case.
+  database:
+    type: postgres
+  # Nextcloud's background jobs (cron.php every 5 minutes) run in a `cron`
+  # container in the Nextcloud Pod, as in the upstream chart. Off, they run
+  # piggybacked on browser page loads ("ajax" mode) and stall whenever nobody
+  # uses the web UI. Either way the setup hook pins trash and version
+  # retention and internal share expiry off.
+  cron:
+    enabled: true
+    # The image sets PHP_MEMORY_LIMIT=512M; the container limit stays above
+    # it so PHP's own limit, not a cgroup OOM kill, ends a runaway job.
+    resources:
+      requests:
+        memory: "128Mi"
+        cpu: "10m"
+      limits:
+        memory: "768Mi"
+        cpu: "500m"
+  # Valkey (BSD-3, Redis protocol) as the bundled Nextcloud's distributed
+  # cache, transactional file locking and PHP session store, shared by Apache,
+  # cron and the protected-effect pool; APCu stays each process's local cache.
+  # Opt-in, and not a free toggle:
+  #   - Nextcloud depends on it once on: Valkey down means Nextcloud down,
+  #     and a Valkey restart drops every web session (it keeps no data).
+  #   - Turning it off again is handled by the setup hook, which deletes the
+  #     Redis settings config.php keeps after any config write.
+  # The password is NEXTCLOUD_REDIS_PASSWORD in the app Secret; generated in
+  # chart-created mode, otherwise add it before enabling this.
+  redis:
+    enabled: false
+    # PINNED to an exact release, like every image this chart controls.
+    image: docker.io/valkey/valkey:8.1.10-alpine
+    # maxmemory is set to 75 % of limits.memory, below the limit so eviction
+    # (allkeys-lru), not the OOM killer, makes room.
+    resources:
+      requests:
+        memory: "64Mi"
+        cpu: "10m"
+      limits:
+        memory: "256Mi"
+        cpu: "500m"
+  apache:
+    # Apache prefork workers, one PHP process each (the image's default is
+    # 150). Sized for the 2-core limit below: a burst queues in Apache rather
+    # than starting more PHP processes than the CPU and memory limits serve.
+    # Raise it with the CPU limit; prefork caps it at 256.
+    maxRequestWorkers: 32
+  rateLimits:
+    # Nextcloud's per-user share-creation limit. agent-service creates every
+    # session and job-export share, so this is the installation's ceiling.
+    # Upstream default: 20 per 600 s. The setup hook applies it on every
+    # Nextcloud start, and the orchestrator splits it across its replicas.
+    # null restores upstream's value for that field; both null removes the
+    # override.
+    shareCreate:
+      limit: 200
+      periodSeconds: 600
   # Internal-only authority-creating lane for protected read-only grants.
   # It shares the bundled Nextcloud code/data volume but runs in a dedicated
   # Nginx + PHP-FPM pool. The FPM auto-prepend verifier authenticates an exact
@@ -3012,7 +3196,10 @@ nextcloud:
     # immutable Secret here. Chart-created mode generates its own Secret.
     hmacSecretName: ""
     hmacVaultPath: ""
-    fpmImage: docker.io/library/nextcloud:31-fpm
+    # Same release and pinning as nextcloud.image. The pool runs the code the
+    # main container installs on the shared volume with its own image's PHP,
+    # so the render fails unless both images are the same Nextcloud major.
+    fpmImage: docker.io/library/nextcloud:31.0.14-fpm@sha256:236e20aedaef1586e8fc9ca73f8d953695b7beecc55df4a931ada2bf1c82a9e1
     nginxImage: docker.io/library/nginx:1.27-alpine-slim
     queueBoundSeconds: 30
     handlerBoundSeconds: 10
@@ -3120,6 +3307,14 @@ cloud:
   externalUrl: ""
   # -- Internal URL the agent calls server-to-server. Defaults to externalUrl when empty.
   externalServiceUrl: ""
+  # -- External Nextcloud only: the per-user share-create limit that server
+  # enforces, when its admin changed Nextcloud's default of 20 per 600 s
+  # (ratelimit_overwrite for files_sharing.shareapi.createshare). The
+  # orchestrator keeps its share requests under it. null = upstream default.
+  # The bundled Nextcloud takes nextcloud.rateLimits.shareCreate instead.
+  shareRateLimit:
+    limit: null
+    periodSeconds: null
   # -- Main-cloud workspace data plane: "rclone_mount" (lazy rclone/FUSE
   # mounts) or "sync" (legacy eager clone).
   workspaceDriver: "rclone_mount"
@@ -3998,8 +4193,8 @@ sessionRouter:
   # via the standard Ingress API but not exercised by the test suite.
   ingressClass: traefik
 
-  # Hostname used in per-session Ingress rules. Defaults to api.<global.domain>
-  # when empty.
+  # Hostname used in per-session Ingress rules. When empty it follows the API
+  # host: global.hostnames.api if set, otherwise api.<global.domain>.
   ingressHost: ""
 
   # JWT signing key shared by orchestrator + agent pods. REQUIRED to enable

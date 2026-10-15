@@ -136,7 +136,14 @@ def _store(**over: Any) -> SimpleNamespace:
     return store
 
 
-def _wire(*, store=None, cloud_router=None, admin_gate=None, replace_installation=""):
+def _wire(
+    *,
+    store=None,
+    cloud_router=None,
+    admin_gate=None,
+    replace_installation="",
+    **chart_nextcloud: Any,
+):
     calls = SimpleNamespace(admin=0)
     backing = store if store is not None else _store()
 
@@ -150,6 +157,7 @@ def _wire(*, store=None, cloud_router=None, admin_gate=None, replace_installatio
         store=backing,
         cloud_router=cloud_router if cloud_router is not None else _router(),
         replace_installation=replace_installation,
+        **chart_nextcloud,
     )
     dependencies = route_module.MainCloudSettingsRouteDependencies(
         operations=operations,
@@ -394,6 +402,182 @@ def test_the_page_never_reads_the_settings_secret(monkeypatch):
     wired = _wire(store=_page_store(), cloud_router=_router(active=backend))
 
     assert wired.client.get(PAGE).status_code == 200
+
+
+# --------------------------------------------------------------------------- #
+# Background jobs and retention (bundled_nextcloud_performance.md, D13)
+# --------------------------------------------------------------------------- #
+
+CRON_OK = {
+    "mode": "cron",
+    "last_run_at": "2026-10-14T18:00:00+00:00",
+    "stale": False,
+}
+#: What the chart passes the orchestrator for its bundled Nextcloud.
+CHART = {
+    "nextcloud_cron_enabled": True,
+    "nextcloud_trashbin_retention": "disabled",
+    "nextcloud_versions_retention": "disabled",
+}
+
+
+def _nextcloud_backend(status: Any = CRON_OK, **over: Any) -> SimpleNamespace:
+    jobs = over.pop("background_jobs_status", None) or AsyncMock(return_value=status)
+    return _page_backend(backend_id="nextcloud", background_jobs_status=jobs, **over)
+
+
+def test_the_bundled_nextcloud_reports_cron_health_and_the_charts_retention(
+    monkeypatch,
+):
+    _helm(monkeypatch)
+    backend = _nextcloud_backend()
+    wired = _wire(store=_page_store(), cloud_router=_router(active=backend), **CHART)
+
+    body = wired.client.get(PAGE).json()
+
+    assert body["background_jobs"] == {**CRON_OK, "cron_container": True}
+    assert body["retention"] == {
+        "trashbin": "disabled",
+        "versions": "disabled",
+        "source": "chart",
+    }
+    backend.background_jobs_status.assert_awaited_once()
+    # The existing fields are unchanged.
+    assert body["health"] == {"ok": True, "latency_ms": 12.3, "detail": "status=200"}
+    assert body["configuration"]["source"] == "helm"
+
+
+def test_a_stale_cron_and_a_chart_without_the_cron_container(monkeypatch):
+    _helm(monkeypatch)
+    stale = {"mode": "cron", "last_run_at": None, "stale": True}
+    wired = _wire(
+        store=_page_store(),
+        cloud_router=_router(active=_nextcloud_backend(stale)),
+        **{**CHART, "nextcloud_cron_enabled": False},
+    )
+
+    jobs = wired.client.get(PAGE).json()["background_jobs"]
+
+    assert jobs == {**stale, "cron_container": False}
+
+
+def test_an_external_nextcloud_has_its_own_administrator(monkeypatch):
+    _helm(monkeypatch)
+    ajax = {"mode": "ajax", "last_run_at": None, "stale": False}
+    wired = _wire(
+        store=_page_store(), cloud_router=_router(active=_nextcloud_backend(ajax))
+    )
+
+    body = wired.client.get(PAGE).json()
+
+    assert body["background_jobs"] == {**ajax, "cron_container": None}
+    assert body["retention"] == {"source": "external"}
+
+
+@pytest.mark.parametrize(
+    "jobs",
+    [
+        AsyncMock(return_value=None),
+        AsyncMock(side_effect=RuntimeError("boom")),
+        AsyncMock(return_value="not a dict"),
+    ],
+    ids=["unreadable", "raises", "garbage"],
+)
+def test_an_unreadable_status_is_unknown_never_an_error(monkeypatch, jobs):
+    _helm(monkeypatch)
+    wired = _wire(
+        store=_page_store(),
+        cloud_router=_router(active=_nextcloud_backend(background_jobs_status=jobs)),
+        **CHART,
+    )
+
+    response = wired.client.get(PAGE)
+
+    assert response.status_code == 200
+    assert response.json()["background_jobs"] == {
+        "mode": None,
+        "last_run_at": None,
+        "stale": False,
+        "cron_container": True,
+    }
+    assert response.json()["retention"]["source"] == "chart"
+
+
+def test_a_hanging_background_job_read_does_not_hold_the_page(monkeypatch):
+    import asyncio
+
+    async def _hang():
+        await asyncio.sleep(60)
+
+    _helm(monkeypatch)
+    monkeypatch.setattr(ops, "_HEALTH_TIMEOUT_SECONDS", 0.01)
+    wired = _wire(
+        store=_page_store(),
+        cloud_router=_router(active=_nextcloud_backend(background_jobs_status=_hang)),
+    )
+
+    body = wired.client.get(PAGE).json()
+
+    assert body["background_jobs"]["mode"] is None
+    assert body["health"]["ok"] is True
+
+
+def test_a_provider_without_background_jobs_reports_neither(monkeypatch):
+    """OpenCloud has no background jobs; the chart's retention values
+    describe the bundled Nextcloud, never another provider."""
+    _helm(monkeypatch)
+    wired = _wire(
+        store=_page_store(), cloud_router=_router(active=_page_backend()), **CHART
+    )
+
+    body = wired.client.get(PAGE).json()
+
+    assert body["background_jobs"] is None
+    assert body["retention"] is None
+
+
+def test_the_orchestrator_reads_the_charts_nextcloud_values(monkeypatch):
+    from orchestrator.application.settings import DeploymentSettings
+
+    monkeypatch.setenv("NEXTCLOUD_CRON_ENABLED", "true")
+    monkeypatch.setenv("NEXTCLOUD_TRASHBIN_RETENTION", " disabled ")
+    monkeypatch.setenv("NEXTCLOUD_VERSIONS_RETENTION", "auto, 30")
+    settings = DeploymentSettings.from_environment()
+    assert settings.nextcloud_cron_enabled is True
+    assert settings.nextcloud_trashbin_retention == "disabled"
+    assert settings.nextcloud_versions_retention == "auto, 30"
+
+    monkeypatch.setenv("NEXTCLOUD_CRON_ENABLED", "false")
+    assert DeploymentSettings.from_environment().nextcloud_cron_enabled is False
+
+    for name in (
+        "NEXTCLOUD_CRON_ENABLED",
+        "NEXTCLOUD_TRASHBIN_RETENTION",
+        "NEXTCLOUD_VERSIONS_RETENTION",
+    ):
+        monkeypatch.delenv(name)
+    settings = DeploymentSettings.from_environment()
+    assert settings.nextcloud_cron_enabled is None
+    assert settings.nextcloud_trashbin_retention == ""
+    assert settings.nextcloud_versions_retention == ""
+
+
+def test_the_composition_passes_the_charts_nextcloud_values():
+    from orchestrator.application import workspace as workspace_composition
+
+    resources = SimpleNamespace(
+        postgres_db=_store(),
+        main_cloud_router=_router(),
+        settings=SimpleNamespace(main_cloud_replace_installation="", **CHART),
+    )
+
+    operations = workspace_composition.main_cloud_settings_dependencies(
+        resources
+    ).operations
+
+    assert operations.nextcloud_cron_enabled is True
+    assert operations.nextcloud_trashbin_retention == "disabled"
+    assert operations.nextcloud_versions_retention == "disabled"
 
 
 # --------------------------------------------------------------------------- #
@@ -643,7 +827,8 @@ def test_the_cockpit_fixture_is_the_page_response(monkeypatch):
     )
     wired = _wire(
         store=_page_store(authority=authority, revision=1),
-        cloud_router=_router(active=_page_backend(backend_id="nextcloud")),
+        cloud_router=_router(active=_nextcloud_backend()),
+        **CHART,
     )
     rendered = json.dumps(wired.client.get(PAGE).json(), indent=2) + "\n"
     if UPDATE:

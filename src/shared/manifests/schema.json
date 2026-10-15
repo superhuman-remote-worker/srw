@@ -693,6 +693,16 @@
         },
         "connectors": {
           "$ref": "#/$defs/ConnectorMap"
+        },
+        "session": {
+          "description": "The live session a live-session Job starts in: an alias of connectors (a live connector) and the provider's session id.",
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["connector", "id"],
+          "properties": {
+            "connector": {"$ref": "#/$defs/Name"},
+            "id": {"$ref": "#/$defs/NonemptyString"}
+          }
         }
       }
     },
@@ -807,6 +817,10 @@
         "timeoutSeconds": {
           "type": "integer",
           "minimum": 1
+        },
+        "liveSession": {
+          "description": "Start inside a live session (a phone call): the Job starts tactical with the session's voice as a subagent. Requires execution.session.",
+          "type": "boolean"
         }
       }
     },

@@ -833,6 +833,93 @@ async def _bind_cancelled_boot_occupancy(conn, store, *, job, identity):
         return
 
 
+async def _failed_initialization_retention_candidate(
+    conn, *, job, generation, vm_uid, pvc, old_parent
+):
+    """Enter terminal cleanup only with exact failed initialization evidence.
+
+    The caller already holds the owner/PVC/queue/job locks. A refused policy-1
+    candidate rolls back this transition; admission and any accepted transition
+    then commit together in the caller's transaction. No stop occurs here.
+    """
+    from shared.workspace_initialization import (
+        initialization_receipt,
+        validate_initialization_request,
+    )
+
+    owner = job["id"]
+    vm = _json(job["context"])["vm"]
+    retry = await conn.fetchrow(
+        "SELECT * FROM vm_creation_retries WHERE owner_kind='job' "
+        "AND job_id=$1 AND provision_generation=$2 FOR UPDATE",
+        owner,
+        generation,
+    )
+    if (
+        retry is None
+        or retry["origin"] != "initial"
+        or retry["job_retained_resume_id"] is not None
+        or retry["ready_at"] is not None
+        or vm.get("status") != "failed"
+        or vm.get("identity_authenticated") is not True
+        or vm.get("identity_provision_generation") != str(generation)
+        or vm.get("provision_generation") != str(generation)
+        or vm.get("vm_uid") != str(vm_uid)
+        or vm.get("rootdisk_pvc_uid") != str(pvc)
+        or vm.get("creation_request_id") != str(retry["request_id"])
+    ):
+        return None
+    try:
+        request = _json(retry["canonical_request"])
+        recipe = validate_initialization_request(request["initialization"])
+        vm_recipe = validate_initialization_request(vm.get("initialization"))
+        receipt = initialization_receipt(
+            vm.get("initialization_receipt"),
+            owner_id=str(owner),
+            revision=recipe["revision"],
+        )
+        if (
+            vm_recipe != recipe
+            or receipt["phase"] != "Failed"
+            or receipt["step"] >= len(recipe["steps"])
+        ):
+            return None
+    except (KeyError, TypeError, ValueError):
+        return None
+    if await conn.fetchval(
+        "SELECT EXISTS(SELECT 1 FROM worker_batch_attempts WHERE job_id=$1) "
+        "OR EXISTS(SELECT 1 FROM vm_job_worker_delivery_bindings WHERE job_id=$1)",
+        owner,
+    ):
+        return None
+    savepoint = conn.transaction()
+    await savepoint.start()
+    try:
+        await conn.execute(
+            "UPDATE jobs SET context=jsonb_set(context,'{vm,status}',"
+            "'\"retiring_process_zero\"'::jsonb) WHERE id=$1",
+            owner,
+        )
+        candidate = _json(
+            await conn.fetchval(
+                "SELECT public.vm_job_cancel_retention_candidate($1,$2,$3,$4,$5)",
+                owner,
+                generation,
+                vm_uid,
+                pvc,
+                old_parent,
+            )
+        )
+    except BaseException:
+        await savepoint.rollback()
+        raise
+    if not isinstance(candidate, dict):
+        await savepoint.rollback()
+        return None
+    await savepoint.commit()
+    return candidate
+
+
 async def acquire_cancel_retention(
     store, *, job_id: str, identity, retention_preflight=None
 ):
@@ -1057,6 +1144,19 @@ async def acquire_cancel_retention(
             old["id"] if old else None,
         )
         candidate = _json(candidate)
+        if (
+            not isinstance(candidate, dict)
+            and candidate_function == "vm_job_cancel_retention_candidate"
+            and _json(job["context"])["vm"].get("status") == "failed"
+        ):
+            candidate = await _failed_initialization_retention_candidate(
+                conn,
+                job=job,
+                generation=generation,
+                vm_uid=vm_uid,
+                pvc=pvc,
+                old_parent=old["id"] if old else None,
+            )
         if not isinstance(candidate, dict):
             return CleanupPermit(
                 allowed=False, reason="cancel_retention_scope_unproven"

@@ -3073,6 +3073,21 @@ async def archive_and_cleanup_workspace(
         if (
             job.get("execution_lane") == "stateless"
             and raw_context.get("_stateless_delete_pending") is True
+            and raw_context.get("_vm_job_retained_resume") is not None
+            and isinstance(terminal_marker, dict)
+        ):
+            # Delete may reach a completed retained continuation before the
+            # ordinary approval reaper. Close only that bound, settled compute
+            # permit before purging its disk and retiring the audit owner.
+            if not await postgres_db.complete_terminal_vm_cleanup_marker(
+                entity_id,
+                expected_generation=terminal_marker.get("provision_generation"),
+            ):
+                raise RuntimeError("retained VM Delete terminal marker remains held")
+
+        if (
+            job.get("execution_lane") == "stateless"
+            and raw_context.get("_stateless_delete_pending") is True
         ) or (
             job.get("execution_lane") == "pinned"
             and raw_context.get("_pinned_retained_delete_pending") is True

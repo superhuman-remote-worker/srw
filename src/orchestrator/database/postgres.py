@@ -213,6 +213,10 @@ class JobVMAuditNotReady(RuntimeError):
     """Final Job deletion lacks an exact terminal VM audit disposition."""
 
 
+class JobCheckpointPruneNotReady(RuntimeError):
+    """Final owner deletion still has durable checkpoint rows."""
+
+
 logger = logging.getLogger(__name__)
 
 
@@ -596,6 +600,7 @@ KNOWN_JOB_ORIGINS: frozenset[str] = frozenset(
         "user",
         "session",
         "automation",
+        "telephony",
         "loop",
         "officer",
         "subjob",
@@ -2476,6 +2481,7 @@ def _pinned_retirement_local_quiescence_matches(
         and context.get("runtime_attach_token") is None
     )
     from shared.pinned_vm_creation_retirement import (
+        bound_vm_without_source,
         initial_vm_creation_retirement_source,
         pre_registration_vm_agent_zero_source,
     )
@@ -2486,12 +2492,14 @@ def _pinned_retirement_local_quiescence_matches(
     # admission. The database independently requires no VM source, retry,
     # waiter, or other VM authority before accepting this receipt.
     pre_registration_vm_without_vm = pre_registration_vm_agent_zero_source(context)
+    bound_vm_no_source = bound_vm_without_source(context)
     workspace_create_pending = bool(workspace_provision_intent)
     if (
         pre_provision_intent_zero
         or workspace_create_pending
         or vm_creation_zero
         or pre_registration_vm_without_vm
+        or bound_vm_no_source
     ):
         expected_protocol = "agent_runtime_zero_v1"
     elif backend == "sandbox":
@@ -2521,6 +2529,7 @@ def _pinned_retirement_local_quiescence_matches(
         or workspace_create_pending
         or vm_creation_zero
         or pre_registration_vm_without_vm
+        or bound_vm_no_source
         else vm.get("provision_generation")
         if backend in {"vm", "remote"}
         else sandbox_generation
@@ -2533,6 +2542,7 @@ def _pinned_retirement_local_quiescence_matches(
         or workspace_create_pending
         or vm_creation_zero
         or pre_registration_vm_without_vm
+        or bound_vm_no_source
         else vm.get("vm_uid")
         if backend in {"vm", "remote"}
         else sandbox_runtime
@@ -2543,6 +2553,7 @@ def _pinned_retirement_local_quiescence_matches(
         not pre_provision_intent_zero
         and not vm_creation_zero
         and not pre_registration_vm_without_vm
+        and not bound_vm_no_source
         and backend in {"vm", "remote"}
         and (not expected_workspace_generation or not expected_workspace_runtime)
     ):
@@ -2574,6 +2585,16 @@ def _pinned_retirement_local_quiescence_matches(
             or (
                 receipt.get("vm_creation_request_id") is None
                 and receipt.get("vm_creation_provision_generation") is None
+            )
+        )
+        and (
+            not bound_vm_no_source
+            or (
+                receipt.get("quiescence_actor") == "orchestrator"
+                and receipt.get("vm_creation_request_id") is None
+                and receipt.get("vm_creation_provision_generation") is None
+                and receipt.get("agent_pod_name") == agent_pod.get("pod_name")
+                and receipt.get("agent_pod_uid") == agent_pod.get("pod_uid")
             )
         )
         and str(receipt.get("settle_status") or "") == final_status
@@ -5325,7 +5346,7 @@ class PostgresDB:
                     uuid_val,
                 )
                 deleting_job = await conn.fetchrow(
-                    "SELECT status, completion_outcome_kind, "
+                    "SELECT status, execution_lane, completion_outcome_kind, "
                     "(SELECT execution.harness_adapter FROM srw_execution_specs execution "
                     " WHERE execution.work_kind='Job' AND execution.work_id=jobs.id) "
                     "AS execution_harness_adapter "
@@ -5338,6 +5359,36 @@ class PostgresDB:
                     )
 
                     require_srw_runtime(deleting_job)
+                    if (
+                        deletion_reason == "authorized_api_delete"
+                        and deleting_job["execution_lane"] == "pinned"
+                    ):
+                        # Strict prune runs before this transaction, keeping
+                        # recovery admission and Job lock order intact. This
+                        # final check catches a write after that prune and
+                        # before this locked deletion. Worker quiescence must
+                        # already have been proved by the owner cleanup; the
+                        # Job lock alone does not fence LangGraph writers.
+                        for table in (
+                            "checkpoint_writes",
+                            "checkpoint_blobs",
+                            "checkpoints",
+                        ):
+                            try:
+                                async with conn.transaction():
+                                    remains = await conn.fetchval(
+                                        f"SELECT EXISTS (SELECT 1 FROM {table} "
+                                        "WHERE thread_id = $1)",
+                                        str(uuid_val),
+                                    )
+                            except Exception as exc:
+                                if type(exc).__name__ == "UndefinedTableError":
+                                    continue
+                                raise
+                            if remains:
+                                raise JobCheckpointPruneNotReady(
+                                    "final pinned Job checkpoint prune is incomplete"
+                                )
                     await self._capture_vm_job_delete_audit(
                         conn,
                         uuid_val,
@@ -6502,12 +6553,13 @@ class PostgresDB:
     async def quiesce_cancelled_stateless_vm_parent(
         self, job_id: str, *, retention_only: bool = False
     ) -> bool:
-        """Select this cancelled Job's exact VM cleanup ordering dependency.
+        """Select this terminal Job's exact VM cleanup ordering dependency.
 
         Legacy Cancel selects an open parent; typed retention also selects a
         settled parent so response-loss and permanent Delete retries can finish.
         ``retention_only`` restricts Delete's prune deferral to that persistent
-        link. This read grants no effect: archive revalidates the parent,
+        link, including a completed/failed retained continuation with a durable
+        Delete fence. This read grants no effect: archive revalidates the parent,
         resource policy and physical stop before settlement.
         """
         try:
@@ -6546,7 +6598,12 @@ class PostgresDB:
             )
             if (
                 row is None
-                or row["status"] != "cancelled"
+                or (
+                    row["status"] != "cancelled"
+                    and not (
+                        retention_only and row["status"] in {"completed", "failed"}
+                    )
+                )
                 or row["execution_lane"] != "stateless"
             ):
                 return False
@@ -6558,6 +6615,11 @@ class PostgresDB:
                     return False
             if not isinstance(context, dict) or (
                 context.get("_stateless_cancel_cleanup_pending") is not True
+                and context.get("_stateless_delete_pending") is not True
+            ):
+                return False
+            if (
+                row["status"] != "cancelled"
                 and context.get("_stateless_delete_pending") is not True
             ):
                 return False
@@ -6579,6 +6641,10 @@ class PostgresDB:
                         owner_id,
                     )
                 )
+            if row["status"] != "cancelled":
+                # Ordinary terminal Delete may defer only through its exact
+                # linked retained continuation, never a legacy cleanup hint.
+                return False
             vm = context.get("vm")
             if not isinstance(vm, dict) or vm.get("workspace_storage") is not None:
                 # Retained storage needs its durable reservation proof, which
@@ -6908,12 +6974,55 @@ class PostgresDB:
                 or vm.get("vm_uid") != str(authority["vm_uid"])
                 or vm.get("rootdisk_pvc_uid") != str(authority["pvc_uid"])
                 or vm.get("compute_released") is not True
-                or vm.get("disk_kept") is not True
                 or not await conn.fetchval(
                     "SELECT public.vm_job_cancel_retention_settled($1)",
                     authority["cleanup_admission_id"],
                 )
             ):
+                return False
+            if vm.get("disk_kept") is False:
+                # A prior owner Delete may have completed the exact typed disk
+                # purge before its terminal audit/tombstone committed. Only
+                # that signed, fully validated parent can resume this preflight.
+                if (
+                    vm.get("status") != "deleted"
+                    or context.get("_pinned_retained_delete_pending") is not True
+                    or not await conn.fetchval(
+                        "SELECT public.vm_job_cancel_retention_discharged($1)",
+                        authority["cleanup_admission_id"],
+                    )
+                ):
+                    return False
+                purges = await conn.fetch(
+                    "SELECT d.cleanup_admission_id FROM "
+                    "vm_job_retained_disk_purge_predecessors link "
+                    "JOIN vm_job_retained_disk_purge_authorities d "
+                    "ON d.cleanup_admission_id=link.cleanup_admission_id "
+                    "JOIN vm_workspace_cleanup_admissions c "
+                    "ON c.id=d.cleanup_admission_id "
+                    "WHERE link.old_cleanup_admission_id=$1 "
+                    "AND link.source_request_id=$2 "
+                    "AND d.final_request_id=$2 AND d.job_id=$3 "
+                    "AND d.provision_generation=$4 AND d.vm_uid=$5 "
+                    "AND d.vmi_uid=$6 AND d.launcher_uid=$7 AND d.pvc_uid=$8 "
+                    "AND c.owner_kind='job' AND c.owner_id=$3 "
+                    "AND c.source='public_vm_delete' AND c.pvc_uid=$8 "
+                    "AND c.completed_at IS NOT NULL AND c.outcome='completed'",
+                    authority["cleanup_admission_id"],
+                    authority["creation_request_id"],
+                    owner,
+                    authority["provision_generation"],
+                    authority["vm_uid"],
+                    authority["vmi_uid"],
+                    authority["launcher_uid"],
+                    authority["pvc_uid"],
+                )
+                if len(purges) != 1 or not await conn.fetchval(
+                    "SELECT public.validate_vm_job_retained_disk_purge($1,true)",
+                    purges[0]["cleanup_admission_id"],
+                ):
+                    return False
+            elif vm.get("disk_kept") is not True:
                 return False
             if await conn.fetchval(
                 "SELECT EXISTS(SELECT 1 FROM vm_idle_access_leases WHERE "
@@ -6998,7 +7107,7 @@ class PostgresDB:
                                updated_at = CURRENT_TIMESTAMP
                          WHERE id = $1
                            AND execution_lane = 'stateless'
-                        RETURNING id
+                        RETURNING id, context
                         """,
                         job_uuid,
                     )
@@ -7016,6 +7125,27 @@ class PostgresDB:
                     )
         except _DeleteCASLostError:
             return False
+
+        context = row.get("context") or {}
+        if isinstance(context, str):
+            context = json.loads(context)
+        if isinstance(context, dict) and "_vm_job_retained_resume" in context:
+            from orchestrator.services.vm_job_retained_resume import (
+                complete_retained_cancel,
+            )
+
+            retained_terminal = await complete_retained_cancel(
+                self, job_id, clear_pending=False
+            )
+            if retained_terminal is False:
+                # The durable Delete fence owns this continuation, but its
+                # exact stop/tail is not settled. Archive records that proof
+                # before the caller's final strict prune; never prune first.
+                return True
+            if retained_terminal is None:
+                # A recognized continuation cannot fall through as a legacy
+                # owner when its current operation cannot be recovered.
+                return False
 
         if await self.quiesce_cancelled_stateless_vm_parent(
             job_id, retention_only=True
@@ -8997,7 +9127,7 @@ class PostgresDB:
         scarce. Correctness never depended on it being one statement.
         knowledge-base/knowledge/issues/transient_db_error_hard_fails_job_and_destroys_vm.md (Defect 6).
 
-        ``strict=True`` is reserved for permanent stateless job deletion. It
+        ``strict=True`` is used by permanent Job deletion. It
         raises on a real deletion failure and verifies that every surviving
         checkpoint table is empty before its jobs-row cleanup anchor may be
         removed. Ordinary terminal transitions retain best-effort behavior.
@@ -9020,6 +9150,8 @@ class PostgresDB:
             strict=strict,
         )
         if not authority.allowed:
+            if strict:
+                raise RuntimeError("strict checkpoint prune authority unavailable")
             return 0
 
         async def _delete(conn: Any) -> _CheckpointPruneResult:
@@ -9115,6 +9247,26 @@ class PostgresDB:
                 type(exc).__name__,
                 exc,
             )
+        if strict:
+            # An earlier best-effort prune may already have completed its
+            # admission. A later owner Delete still has to prove that no
+            # checkpoint rows were written after that completion.
+            async with self.acquire() as conn:
+                for table in ("checkpoint_writes", "checkpoint_blobs", "checkpoints"):
+                    try:
+                        remains = await conn.fetchval(
+                            f"SELECT EXISTS (SELECT 1 FROM {table} WHERE thread_id = $1)",
+                            thread_id,
+                        )
+                    except Exception as exc:
+                        if type(exc).__name__ == "UndefinedTableError":
+                            continue
+                        raise
+                    if remains:
+                        raise RuntimeError(
+                            "strict checkpoint prune left rows behind "
+                            f"(table={table}, thread_id={thread_id})"
+                        )
         return result.deleted
 
     async def _delete_thread_rows_batched(
@@ -26242,7 +26394,7 @@ class PostgresDB:
                 row = await conn.fetchrow(
                     "SELECT status,execution_lane,runtime_generation,"
                     "runtime_retirement_token,agent_id,runtime_attach_token,metadata,"
-                    "pinned_idle_terminal_intent_at "
+                    "pinned_idle_terminal_intent_at,runtime_attach_abort_receipt "
                     "FROM threads WHERE id=$1::uuid FOR UPDATE",
                     parsed_thread,
                 )
@@ -26336,11 +26488,30 @@ class PostgresDB:
                         "SELECT EXISTS(SELECT 1 FROM vm_creation_retries WHERE thread_id=$1) "
                         "OR EXISTS(SELECT 1 FROM vm_idle_operations WHERE owner_kind='thread' AND owner_id=$1) "
                         "OR EXISTS(SELECT 1 FROM thread_runtime_retirement_outcomes WHERE thread_id=$1) "
-                        "OR EXISTS(SELECT 1 FROM thread_runtime_attach_abort_outcomes WHERE thread_id=$1) "
                         "OR EXISTS(SELECT 1 FROM thread_workspace_provision_intents WHERE thread_id=$1) "
                         "OR EXISTS(SELECT 1 FROM srw_execution_workspace_bindings WHERE execution_id=$2)",
                         parsed_thread,
                         execution["id"],
+                    ):
+                        return False
+                    from orchestrator.services.vm_initial_no_payload_history import (
+                        initial_vm_no_payload_history_allows,
+                    )
+
+                    abort_outcomes = await conn.fetch(
+                        "SELECT thread_id,runtime_generation,runtime_attach_token,"
+                        "agent_id,agent_pod_uid,successor_generation,release_kind,"
+                        "quiescence_protocol,workspace_generation,"
+                        "workspace_runtime_incarnation FROM "
+                        "thread_runtime_attach_abort_outcomes WHERE thread_id=$1 "
+                        "LIMIT 4097",
+                        parsed_thread,
+                    )
+                    if not initial_vm_no_payload_history_allows(
+                        thread_id=parsed_thread,
+                        current_generation=parsed_runtime_generation,
+                        receipt=row["runtime_attach_abort_receipt"],
+                        outcomes=[dict(outcome) for outcome in abort_outcomes],
                     ):
                         return False
                     if not preparation_only:
@@ -44387,6 +44558,7 @@ class PostgresDB:
                     or ""
                 )
                 from shared.pinned_vm_creation_retirement import (
+                    bound_vm_without_source,
                     initial_vm_creation_retirement_source,
                 )
 
@@ -44399,7 +44571,43 @@ class PostgresDB:
                         parsed_retirement,
                     )
                 )
-                if workspace_provision_intent or vm_creation_zero:
+                bound_vm_no_source = bound_vm_without_source(context)
+                if bound_vm_no_source:
+                    if (
+                        quiescence_actor != "orchestrator"
+                        or not expected_agent_pod_uid
+                        or str(agent_pod.get("pod_uid") or "") != expected_agent_pod_uid
+                    ):
+                        return None
+                    # This is a bound actor, even if the caller omitted the
+                    # optional zero-admission request. No issued input or
+                    # control may be turned into an Agent-only zero proof.
+                    if not require_zero_admission:
+                        if (
+                            str(row["status"] or "") not in {"created", "active"}
+                            or row["runtime_authority_exposed"] is not True
+                        ):
+                            return None
+                        used_input = await conn.fetchval(
+                            "SELECT EXISTS (SELECT 1 FROM thread_input_deliveries "
+                            "WHERE thread_id=$1::uuid AND owner_agent_id=$2::uuid "
+                            "AND owner_pod_uid=$3 "
+                            "AND (state IN ('admitted','settled') "
+                            "OR ($4::boolean AND state='queued')))",
+                            parsed_thread,
+                            parsed_agent,
+                            expected_agent_pod_uid,
+                            str(row["status"] or "") == "active",
+                        )
+                        admitted_control = await conn.fetchval(
+                            "SELECT EXISTS (SELECT 1 FROM thread_control_requests "
+                            "WHERE thread_id=$1::uuid AND runtime_generation=$2::uuid)",
+                            parsed_thread,
+                            parsed_generation,
+                        )
+                        if used_input or admitted_control:
+                            return None
+                if workspace_provision_intent or vm_creation_zero or bound_vm_no_source:
                     expected_protocol = "agent_runtime_zero_v1"
                 elif workspace_backend == "sandbox":
                     if bool(sandbox_generation) != bool(sandbox_runtime):
@@ -44426,7 +44634,7 @@ class PostgresDB:
                     }.get(workspace_backend)
                 if expected_protocol != expected_quiescence_protocol:
                     return None
-                if workspace_provision_intent or vm_creation_zero:
+                if workspace_provision_intent or vm_creation_zero or bound_vm_no_source:
                     captured_workspace_generation = ""
                     captured_workspace_runtime = ""
                 elif workspace_backend == "sandbox":
@@ -44478,6 +44686,11 @@ class PostgresDB:
                             "provision_generation"
                         ],
                     )
+                if bound_vm_no_source:
+                    receipt.update(
+                        agent_pod_name=agent_pod["pod_name"],
+                        agent_pod_uid=agent_pod["pod_uid"],
+                    )
                 if existing is not None:
                     # Agent and orchestrator recovery may race after the exact
                     # agent Pod is stopped. Their physical proof is identical;
@@ -44490,10 +44703,22 @@ class PostgresDB:
                     existing_actor = existing_comparable.pop("quiescence_actor", None)
                     return (
                         existing
-                        if existing_actor in {"agent", "orchestrator"}
+                        if existing_actor
+                        in (
+                            {"orchestrator"}
+                            if bound_vm_no_source
+                            else {"agent", "orchestrator"}
+                        )
                         and existing_comparable == comparable
                         else None
                     )
+                if bound_vm_no_source and not await conn.fetchval(
+                    "SELECT public.pinned_vm_bound_no_vm_source($1,$2,$3)",
+                    parsed_thread,
+                    parsed_generation,
+                    parsed_retirement,
+                ):
+                    return None
                 updated = await conn.execute(
                     "UPDATE threads SET "
                     "runtime_retirement_local_quiescence=$6::jsonb "
@@ -48889,7 +49114,7 @@ class PostgresDB:
                     if expected_inverse_agent:
                         if warm_release is None:
                             detached = await conn.execute(
-                                "UPDATE agents SET thread_id=NULL "
+                                "UPDATE agents SET thread_id=NULL,status='offline' "
                                 "WHERE id=$1::uuid AND thread_id=$2::uuid",
                                 UUID(expected_inverse_agent),
                                 thread_uuid,
@@ -56212,6 +56437,9 @@ class PostgresDB:
                 out.append(c)
         if not out:
             raise ValueError("capabilities must be non-empty")
+        if "live_voice" in out and len(out) > 1:
+            # A live voice model is bound by a phone-line connector only.
+            raise ValueError("live_voice must be the only capability of a catalog row")
         return out
 
     async def list_models(
@@ -56705,6 +56933,7 @@ class PostgresDB:
             "search",
             "fetch",
             "rerank",
+            "live_voice",
         }
     )
 
@@ -57786,7 +58015,7 @@ class PostgresDB:
                        default_config_name, default_config_override,
                        nextcloud_folder_id,
                        main_cloud_backend, main_cloud_backend_instance_id,
-                       main_cloud_folder_handle,
+                       main_cloud_folder_handle, main_cloud_folder_error,
                        network_tier,
                        (SELECT COUNT(*) FROM jobs j WHERE j.project_id = projects.id) AS job_count,
                        created_at, updated_at
@@ -58028,6 +58257,19 @@ class PostgresDB:
                     },
                 )
         return result == "UPDATE 1"
+
+    async def set_project_main_cloud_folder_error(
+        self, project_id: str, error: Optional[str]
+    ) -> None:
+        """Record why the project's main-cloud folder could not be created
+        (an error kind), or clear it with ``None``. ``update_project`` skips
+        ``None`` values, so it cannot clear one."""
+        async with self.acquire() as conn:
+            await conn.execute(
+                "UPDATE projects SET main_cloud_folder_error = $2 WHERE id = $1",
+                UUID(project_id),
+                error,
+            )
 
     async def delete_project(self, project_id: str) -> bool:
         """Delete a project (cascades to members, repos).
@@ -64528,6 +64770,96 @@ class PostgresDB:
             )
         return self._main_cloud_backend_instance_authority(row)
 
+    async def get_main_cloud_service_credential(
+        self,
+        backend_instance_id: str,
+        login_name: str,
+    ) -> dict[str, Any] | None:
+        """One service account's stored app password on one installation:
+        ``credential_ciphertext`` (``APP_ENCRYPTION_KEY``), ``token_name``
+        and the compare-and-set ``revision``. ``None`` when none is stored."""
+
+        try:
+            parsed_id = UUID(str(backend_instance_id))
+        except (TypeError, ValueError):
+            return None
+        async with self.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT backend_instance_id, login_name, credential_ciphertext,
+                       token_name, revision, created_at, updated_at
+                  FROM main_cloud_service_credentials
+                 WHERE backend_instance_id=$1::uuid
+                   AND login_name=$2
+                """,
+                parsed_id,
+                login_name,
+            )
+        if row is None:
+            return None
+        return {
+            "backend_instance_id": str(row["backend_instance_id"]),
+            "login_name": row["login_name"],
+            "credential_ciphertext": row["credential_ciphertext"],
+            "token_name": row["token_name"],
+            "revision": int(row["revision"]),
+            "created_at": row["created_at"],
+            "updated_at": row["updated_at"],
+        }
+
+    async def put_main_cloud_service_credential(
+        self,
+        backend_instance_id: str,
+        login_name: str,
+        *,
+        ciphertext: str,
+        token_name: str,
+        expected_revision: int | None,
+    ) -> bool:
+        """Store a service account's app password, compare-and-set.
+
+        ``expected_revision=None`` inserts the first one and returns whether
+        this call did (another replica's insert wins). An integer replaces
+        the row only while it is still at that revision, bumping it by one,
+        and returns whether it did.
+        """
+
+        parsed_id = UUID(str(backend_instance_id))
+        async with self.acquire() as conn:
+            if expected_revision is None:
+                result = await conn.execute(
+                    """
+                    INSERT INTO main_cloud_service_credentials (
+                        backend_instance_id, login_name, credential_ciphertext,
+                        token_name
+                    ) VALUES ($1::uuid, $2, $3, $4)
+                    ON CONFLICT (backend_instance_id, login_name) DO NOTHING
+                    """,
+                    parsed_id,
+                    login_name,
+                    ciphertext,
+                    token_name,
+                )
+                return result == "INSERT 0 1"
+            result = await conn.execute(
+                """
+                UPDATE main_cloud_service_credentials
+                   SET credential_ciphertext=$3,
+                       token_name=$4,
+                       revision=revision+1,
+                       updated_at=now()
+                 WHERE backend_instance_id=$1::uuid
+                   AND login_name=$2
+                   AND revision=$5
+                """,
+                parsed_id,
+                login_name,
+                ciphertext,
+                token_name,
+                int(expected_revision),
+            )
+            return result == "UPDATE 1"
+
     # =========================================================================
     # Key/value store for deploy-time configuration that operators can edit
     # via the cockpit admin UI. Secrets never land here — the credentials_ref
@@ -64673,10 +65005,16 @@ class PostgresDB:
         max_chain_depth: int = 10,
         max_fires_per_day: int = 100,
         next_run_at: datetime | None = None,
+        trigger_connector_id: str | None = None,
+        job_shape: Dict[str, Any] | None = None,
     ) -> Dict[str, Any]:
         """Insert an automation row. Caller pre-computes ``next_run_at`` for
         cron triggers (via croniter against the row's timezone) so the
         dispatcher's first tick can pick it up without a recompute pass.
+
+        A ``live`` trigger fires on a live session arriving at its primary
+        connector ``trigger_connector_id``; ``job_shape`` carries the job's
+        connectors and workspace (live_session_jobs.md §4.4).
 
         v0 only stores cron rows from the API; ``event_filter`` is accepted
         here so the v0.5 event dispatcher can land without a schema change.
@@ -64690,7 +65028,7 @@ class PostgresDB:
                     event_filter, enabled,
                     expert, expert_id, prompt, config_override, autonomy, priority,
                     max_chain_depth, max_fires_per_day,
-                    next_run_at
+                    next_run_at, trigger_connector_id, job_shape
                 )
                 VALUES (
                     $1, $2, $3, $4, $5,
@@ -64698,7 +65036,7 @@ class PostgresDB:
                     $9::jsonb, $10,
                     $11, $12, $13, $14::jsonb, $15, $16,
                     $17, $18,
-                    $19
+                    $19, $20, $21::jsonb
                 )
                 RETURNING *
                 """,
@@ -64721,6 +65059,8 @@ class PostgresDB:
                 max_chain_depth,
                 max_fires_per_day,
                 next_run_at,
+                UUID(trigger_connector_id) if trigger_connector_id else None,
+                json.dumps(job_shape or {}),
             )
         return self._automation_row_to_dict(row)
 
@@ -64781,6 +65121,8 @@ class PostgresDB:
             "max_chain_depth",
             "max_fires_per_day",
             "next_run_at",
+            "job_shape",
+            "trigger_connector_id",
         }
     )
 
@@ -64807,10 +65149,10 @@ class PostgresDB:
         sets: list[str] = []
         params: list[Any] = []
         for key, value in fields.items():
-            if key == "config_override":
+            if key in ("config_override", "job_shape"):
                 params.append(json.dumps(value or {}))
                 sets.append(f"{key} = ${len(params)}::jsonb")
-            elif key == "expert_id":
+            elif key in ("expert_id", "trigger_connector_id"):
                 params.append(UUID(str(value)) if value else None)
                 sets.append(f"{key} = ${len(params)}")
             else:
@@ -65773,6 +66115,70 @@ class PostgresDB:
             UUID(automation_id),
         )
 
+    async def live_automation_for_connector(
+        self, connector_id: str, *, exclude_id: str | None = None
+    ) -> Dict[str, Any] | None:
+        """The enabled live automation listening on a primary connector (at
+        most one: ``uq_automations_live_primary``)."""
+        async with self.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT * FROM automations
+                WHERE enabled AND trigger_type = 'live'
+                  AND trigger_connector_id = $1
+                  AND ($2::uuid IS NULL OR id <> $2)
+                ORDER BY created_at LIMIT 1
+                """,
+                UUID(str(connector_id)),
+                UUID(exclude_id) if exclude_id else None,
+            )
+        return self._automation_row_to_dict(row) if row else None
+
+    async def claim_live_automation_fire(self, automation_id: str) -> bool:
+        """Count one live fire against ``max_fires_per_day``; False when the
+        day's budget is spent (the session is then rejected)."""
+        async with self.acquire() as conn:
+            return bool(
+                await conn.fetchval(
+                    """
+                    UPDATE automations
+                    SET fires_today_count = CASE
+                            WHEN fires_today_date = CURRENT_DATE
+                                THEN fires_today_count + 1
+                            ELSE 1
+                        END,
+                        fires_today_date = CURRENT_DATE,
+                        last_dispatched_at = now(),
+                        updated_at = now()
+                    WHERE id = $1 AND enabled
+                      AND (fires_today_date IS DISTINCT FROM CURRENT_DATE
+                           OR fires_today_count < max_fires_per_day)
+                    RETURNING id
+                    """,
+                    UUID(automation_id),
+                )
+            )
+
+    async def record_live_automation_fire(
+        self, automation_id: str, *, job_id: str | None, status: str | None
+    ) -> None:
+        """A live fire's outcome: the job it created, or why it did not."""
+        async with self.acquire() as conn:
+            await conn.execute(
+                """
+                UPDATE automations
+                SET last_fired_at = now(),
+                    last_job_id = COALESCE($2, last_job_id),
+                    last_status = $3,
+                    run_count = run_count + CASE WHEN $2::uuid IS NULL THEN 0 ELSE 1 END,
+                    updated_at = now()
+                WHERE id = $1
+                """,
+                UUID(automation_id),
+                UUID(job_id) if job_id else None,
+                status,
+            )
+
     async def auto_disable_automation(
         self,
         conn,
@@ -65810,7 +66216,7 @@ class PostgresDB:
         if row is None:
             return None
         out = dict(row)
-        for jsonb_field in ("config_override", "event_filter"):
+        for jsonb_field in ("config_override", "event_filter", "job_shape"):
             value = out.get(jsonb_field)
             if isinstance(value, str):
                 try:

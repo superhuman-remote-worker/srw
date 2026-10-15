@@ -98,6 +98,29 @@ VM SSH key secret name.
 {{- end }}
 
 {{/*
+Extra CA trust (values `trust.*`): the ConfigMap holding the operator's PEM
+bundle, or "" when none is configured. Consumers mount it at
+/etc/srw/trust/ca.crt (src/shared/tls_trust.py).
+*/}}
+{{- define "srw.trustCaConfigMapName" -}}
+{{- $trust := .Values.trust | default dict -}}
+{{- if $trust.existingConfigMap -}}
+{{- $trust.existingConfigMap -}}
+{{- else if $trust.extraCaCertificates -}}
+{{- printf "%s-trust-ca" (include "srw.fullname" . | trunc 54 | trimSuffix "-") -}}
+{{- end -}}
+{{- end }}
+
+{{- define "srw.trustCaConfigMapKey" -}}
+{{- $trust := .Values.trust | default dict -}}
+{{- if $trust.existingConfigMap -}}
+{{- $trust.existingConfigMapKey | default "ca.crt" -}}
+{{- else -}}
+ca.crt
+{{- end -}}
+{{- end }}
+
+{{/*
 ConfigMap name (used by all deployments that read from the shared configmap).
 */}}
 {{- define "srw.configMapName" -}}
@@ -401,6 +424,31 @@ Whether the bundled protected-effect lane is deployed.
 {{- else if $effect.enabled -}}true{{- end -}}
 {{- end }}
 
+{{/*
+The Nextcloud major an image reference runs: the leading number of its tag,
+so `nextcloud:31.0.14-apache@sha256:...` and `nextcloud:31-fpm` are both 31. A
+registry port (`host:5000/nextcloud:31-apache`) is not a tag. A reference with
+no numeric tag (digest only, or `stable-apache`) takes nextcloud.majorVersion,
+and a numeric tag that disagrees with a set majorVersion fails the render.
+Usage: include "srw.nextcloudImageMajor" (dict "context" . "image" $ref "name" "nextcloud.image")
+*/}}
+{{- define "srw.nextcloudImageMajor" -}}
+{{- $ref := .image | toString -}}
+{{- $declared := .context.Values.nextcloud.majorVersion -}}
+{{- $tagged := "^(?:.*/)?[^/@:]+:([0-9]+)[^/@:]*(?:@sha256:[0-9a-f]{64})?$" -}}
+{{- if regexMatch $tagged $ref -}}
+  {{- $major := regexReplaceAll $tagged $ref "${1}" | int -}}
+  {{- if and (not (kindIs "invalid" $declared)) (ne (int $declared) $major) -}}
+    {{- fail (printf "%s %q is Nextcloud %d, but nextcloud.majorVersion says %d. Correct or unset nextcloud.majorVersion." .name $ref $major (int $declared)) -}}
+  {{- end -}}
+  {{- $major -}}
+{{- else if not (kindIs "invalid" $declared) -}}
+  {{- int $declared -}}
+{{- else -}}
+  {{- fail (printf "%s %q carries no Nextcloud version tag, so the chart cannot tell its major. Use a tagged reference (repo:31.0.14-apache@sha256:...) or set nextcloud.majorVersion." .name $ref) -}}
+{{- end -}}
+{{- end }}
+
 {{- define "srw.nextcloudProtectedEffectValidate" -}}
 {{- $effect := .Values.nextcloud.protectedEffect -}}
 {{- $effectEnabled := eq (include "srw.nextcloudProtectedEffectEnabled" .) "true" -}}
@@ -442,7 +490,88 @@ Whether the bundled protected-effect lane is deployed.
   {{- if or (le (int $effect.maxChildren) 0) (gt (int $effect.maxChildren) 64) -}}
     {{- fail "nextcloud.protectedEffect.maxChildren must be an integer between 1 and 64" -}}
   {{- end -}}
+  {{- /* The pool never runs the image entrypoint: it serves whatever code the
+         main container installed on the shared volume, on its own image's
+         PHP. A pool one major behind or ahead runs that code on a PHP it was
+         never released for. Image references are not lane values, so the
+         lane digest does not change with them. */ -}}
+  {{- $mainMajor := include "srw.nextcloudImageMajor" (dict "context" . "image" .Values.nextcloud.image "name" "nextcloud.image") | int -}}
+  {{- $fpmMajor := include "srw.nextcloudImageMajor" (dict "context" . "image" $effect.fpmImage "name" "nextcloud.protectedEffect.fpmImage") | int -}}
+  {{- if ne $mainMajor $fpmMajor -}}
+    {{- fail (printf "nextcloud.image is Nextcloud %d but nextcloud.protectedEffect.fpmImage is Nextcloud %d. The protected-effect pool runs the main container's code and must be the same major; move both images in one release." $mainMajor $fpmMajor) -}}
+  {{- end -}}
 {{- end -}}
+{{- end }}
+
+{{/*
+Trash and version retention the chart pins on the bundled Nextcloud: both
+`disabled` until a retention policy is chosen on purpose, because versions and
+trash are the only recovery history the bundled cloud keeps. One source for
+the setup hook, the NC_* env of every process that runs background jobs, and
+the orchestrator's read-only admin view.
+*/}}
+{{- define "srw.nextcloudTrashbinRetention" -}}disabled{{- end }}
+{{- define "srw.nextcloudVersionsRetention" -}}disabled{{- end }}
+
+{{/*
+Whether the bundled Nextcloud runs with its Valkey (nextcloud.redis.enabled).
+Only a bundled, internal Nextcloud has one.
+*/}}
+{{- define "srw.nextcloudRedisEnabled" -}}
+{{- if and .Values.nextcloud.enabled .Values.nextcloud.internal ((.Values.nextcloud.redis | default dict).enabled) -}}true{{- end -}}
+{{- end }}
+
+{{- define "srw.nextcloudRedisHost" -}}
+{{- printf "%s-nextcloud-redis" (include "srw.fullname" .) -}}
+{{- end }}
+
+{{/*
+REDIS_* env for every Nextcloud PHP container. The image's
+config/redis.config.php turns REDIS_HOST into memcache.distributed,
+memcache.locking and the redis connection in every PHP process; the Apache
+container's entrypoint also moves PHP sessions into it.
+*/}}
+{{- define "srw.nextcloudRedisEnv" -}}
+- name: REDIS_HOST
+  value: {{ include "srw.nextcloudRedisHost" . | quote }}
+- name: REDIS_HOST_PORT
+  value: "6379"
+- name: REDIS_HOST_PASSWORD
+  valueFrom:
+    secretKeyRef:
+      name: {{ include "srw.secretName" . }}
+      key: NEXTCLOUD_REDIS_PASSWORD
+{{- end }}
+
+{{/*
+Nextcloud's share-create rate limit as {"limit", "periodSeconds", "override"}
+JSON. The orchestrator sizes its per-replica client bucket from it, and the
+bundled Nextcloud's setup hook applies it server side.
+
+  bundled (nextcloud.enabled and nextcloud.internal):
+                    nextcloud.rateLimits.shareCreate
+  otherwise:        cloud.shareRateLimit, which mirrors what an external
+                    Nextcloud's own admin configured
+
+A null field means upstream's default (20 shares per 600 s per user).
+"override" is false only when both fields are null; the hook then deletes
+its server override instead of writing upstream's numbers into config.php.
+*/}}
+{{- define "srw.nextcloudShareRateLimitJson" -}}
+{{- $configured := .Values.cloud.shareRateLimit | default dict -}}
+{{- if and .Values.nextcloud.enabled .Values.nextcloud.internal -}}
+  {{- if or (not (kindIs "invalid" (index $configured "limit"))) (not (kindIs "invalid" (index $configured "periodSeconds"))) -}}
+    {{- fail "cloud.shareRateLimit describes an external Nextcloud; set the bundled Nextcloud's share-create limit with nextcloud.rateLimits.shareCreate" -}}
+  {{- end -}}
+  {{- $configured = (.Values.nextcloud.rateLimits | default dict).shareCreate | default dict -}}
+{{- end -}}
+{{- $limit := index $configured "limit" -}}
+{{- $period := index $configured "periodSeconds" -}}
+{{- dict
+      "limit" (ternary 20 $limit (kindIs "invalid" $limit) | int)
+      "periodSeconds" (ternary 600 $period (kindIs "invalid" $period) | int)
+      "override" (not (and (kindIs "invalid" $limit) (kindIs "invalid" $period)))
+    | toJson -}}
 {{- end }}
 
 {{/*
@@ -658,6 +787,54 @@ true
 {{- else if eq $type "sqlite3" -}}
 {{- else -}}
 {{- fail (printf "gitea.database.type must be \"postgres\" or \"sqlite3\", got %q" $type) -}}
+{{- end -}}
+{{- end }}
+
+{{/*
+True when a NEW bundled Nextcloud install should use Postgres. An installed
+Nextcloud keeps whatever its config.php names; see nextcloud.database.type.
+Anything but "postgres" or "sqlite" is rejected rather than read as one of them.
+*/}}
+{{- define "srw.nextcloudUsesPostgres" -}}
+{{- $type := (.Values.nextcloud.database | default dict).type | default "postgres" -}}
+{{- if eq $type "postgres" -}}
+true
+{{- else if eq $type "sqlite" -}}
+{{- else -}}
+{{- fail (printf "nextcloud.database.type must be \"postgres\" or \"sqlite\", got %q" $type) -}}
+{{- end -}}
+{{- end }}
+
+{{/*
+Connection parts for the bundled Nextcloud's Postgres. Internal resolves to the
+`srw-nextclouddb` Service, or CloudNativePG's "-rw" Service on the cnpg engine;
+external to databases.nextcloud.externalHost/Port/Db.
+*/}}
+{{- define "srw.nextcloudDbHost" -}}
+{{- if .Values.databases.nextcloud.internal -}}
+{{- $suffix := "" -}}
+{{- if eq (include "srw.dbEngine" (dict "context" . "db" .Values.databases.nextcloud)) "cnpg" -}}
+{{- $suffix = "-rw" -}}
+{{- end -}}
+{{- printf "%s-nextclouddb%s" (include "srw.fullname" .) $suffix -}}
+{{- else -}}
+{{- required "databases.nextcloud.externalHost is required when databases.nextcloud.internal is false" .Values.databases.nextcloud.externalHost -}}
+{{- end -}}
+{{- end }}
+
+{{- define "srw.nextcloudDbPort" -}}
+{{- if .Values.databases.nextcloud.internal -}}
+5432
+{{- else -}}
+{{- .Values.databases.nextcloud.externalPort | default 5432 -}}
+{{- end -}}
+{{- end }}
+
+{{- define "srw.nextcloudDbName" -}}
+{{- if .Values.databases.nextcloud.internal -}}
+nextcloud
+{{- else -}}
+{{- .Values.databases.nextcloud.externalDb | default "nextcloud" -}}
 {{- end -}}
 {{- end }}
 
@@ -1291,6 +1468,10 @@ Usage: {{ include "srw.dbPrereqs" (dict "context" . "key" "postgres") }}
 {{- $ok = and $ok $ctx.Values.gitea.enabled $ctx.Values.gitea.internal (include "srw.giteaUsesPostgres" $ctx) -}}
 {{- else if eq .key "keycloak" -}}
 {{- $ok = and $ok $ctx.Values.keycloak.enabled $ctx.Values.keycloak.internal -}}
+{{- else if eq .key "nextcloud" -}}
+{{- /* Without all three, an external Nextcloud (prod) or the SQLite opt-out
+       would render an orphan database nothing connects to. */ -}}
+{{- $ok = and $ok $ctx.Values.nextcloud.enabled $ctx.Values.nextcloud.internal (include "srw.nextcloudUsesPostgres" $ctx) -}}
 {{- end -}}
 {{- if $ok -}}true{{- end -}}
 {{- end }}
@@ -1359,7 +1540,7 @@ release as backed up.
 */}}
 {{- define "srw.anyDbBacksUp" -}}
 {{- $any := "" -}}
-{{- range $key := list "postgres" "vector" "audit" "gitea" "keycloak" -}}
+{{- range $key := list "postgres" "vector" "audit" "gitea" "keycloak" "nextcloud" -}}
 {{- if include "srw.dbBacksUp" (dict "context" $ "key" $key) -}}
 {{- $any = "true" -}}
 {{- end -}}
@@ -1373,7 +1554,7 @@ the data tier has actually moved.
 */}}
 {{- define "srw.anyDbRendersCnpg" -}}
 {{- $any := "" -}}
-{{- range $key := list "postgres" "vector" "audit" "gitea" "keycloak" -}}
+{{- range $key := list "postgres" "vector" "audit" "gitea" "keycloak" "nextcloud" -}}
 {{- if include "srw.dbRendersCnpg" (dict "context" $ "key" $key) -}}
 {{- $any = "true" -}}
 {{- end -}}

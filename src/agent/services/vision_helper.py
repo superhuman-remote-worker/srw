@@ -81,6 +81,7 @@ class VisionHelper:
         # while the primary agent uses a text-only model on a custom endpoint
         from shared.runtime.core.transport_resolution import (
             is_openai_default_endpoint,
+            wire_model_id,
         )
 
         # Vision-specific overrides
@@ -96,7 +97,7 @@ class VisionHelper:
             else ""
         )
         self.api_key = os.getenv("VISION_API_KEY", primary_key)
-        self.model = os.getenv("VISION_MODEL", "gpt-4o")
+        self.model = wire_model_id(os.getenv("VISION_MODEL", "gpt-4o"), self.api_base)
         self.timeout = float(os.getenv("VISION_TIMEOUT", "120"))
 
         if not self.api_key:

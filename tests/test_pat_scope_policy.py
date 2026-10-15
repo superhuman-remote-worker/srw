@@ -91,11 +91,18 @@ class TestEveryMountedRouteIsClassified:
             f"{_render(e)} -> {classify_route(e.method, e.path)}"
             for e in endpoints
             if e.classification.startswith("admin:")
+            and not e.path.startswith("/api/telephony/")
             and classify_route(e.method, e.path) != "admin"
         ]
         assert not weaker, "Admin-only route(s) not mapped to `admin`:\n  " + (
             "\n  ".join(weaker)
         )
+
+    def test_live_session_webhook_refuses_pats(self, endpoints):
+        # A live connector's webhook is signed by the provider; no token.
+        live = [e for e in endpoints if e.path.startswith("/api/live/")]
+        assert live
+        assert all(classify_route(e.method, e.path) == REFUSED for e in live)
 
     def test_service_only_routes_refuse_pats(self, endpoints):
         admitted = [

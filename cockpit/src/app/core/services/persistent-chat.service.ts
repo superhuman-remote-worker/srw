@@ -9,9 +9,12 @@ import {
   untracked,
 } from '@angular/core';
 import { takeUntilDestroyed } from '@angular/core/rxjs-interop';
-import { HttpClient } from '@angular/common/http';
+import { HttpClient, HttpContext } from '@angular/common/http';
+import { VIEW_AS_OVERRIDE } from '../interceptors/view-as.interceptor';
+import { pickOwnDefaultProject } from '../util/own-default-project';
 import { filter, firstValueFrom, map, Observable, Subscription, tap, timeout } from 'rxjs';
 import { environment } from '../environment';
+import { newRequestId } from '../util/request-id';
 import { Project, ThreadCloudDiffSummary, ThreadMount, ThreadProtectedSource, ThreadStatus, WorkspaceCreationView, WorkspaceLifecycleView } from '../models/api.model';
 // Type + pure derivation only — importing them from the review component
 // would pull it (and Monaco's loader) back into the eager bundle graph and
@@ -65,6 +68,7 @@ import {
 } from './persistent-thread-transport-bridge.service';
 import { CanvasService } from './canvas.service';
 import { CapabilitiesService } from './capabilities.service';
+import { UserService } from './user.service';
 import {
   CloudFolderBinding,
   CloudFolderProblem,
@@ -717,6 +721,7 @@ export class PersistentChatService {
   private readonly threadTransport = inject(PersistentThreadTransportBridge);
   private readonly canvas = inject(CanvasService);
   private readonly capabilities = inject(CapabilitiesService);
+  private readonly userService = inject(UserService);
   /** Uploads started when a file was ATTACHED, before the user committed to
    *  sending it (knowledge-base/knowledge/features/session_attachment_send_flow.md §5.4). Owned
    *  by a root service, not this one: an uncommitted upload has a different
@@ -2571,10 +2576,13 @@ export class PersistentChatService {
       // other create pickers — a draft can only ever target the account
       // default, which is never archivable anyway.
       const projects = await firstValueFrom(
-        this.http.get<Project[]>(`${environment.apiUrl}/projects?status=active`),
+        this.http.get<Project[]>(`${environment.apiUrl}/projects?status=active`, {
+          // Self-scoped: an admin's fleet list holds every user's default project.
+          context: new HttpContext().set(VIEW_AS_OVERRIDE, 'mine'),
+        }),
       );
       if (generation !== this.draftDefaultsGeneration || !this.isDraftSession()) return;
-      const defaultProject = projects.find((project) => project.is_default);
+      const defaultProject = pickOwnDefaultProject(projects, this.userService.currentUser()?.default_project_id);
       this.draftProjectIds = defaultProject ? [defaultProject.id] : [];
       this.draftProjectId.set(this.draftProjectIds?.[0] ?? null);
       const body = this.draftCreationContext();
@@ -4747,7 +4755,7 @@ export class PersistentChatService {
       threadId,
       request: {
         ...control,
-        client_request_id: crypto.randomUUID(),
+        client_request_id: newRequestId(),
         session_runtime_generation: runtimeGeneration,
       },
       attempts: 0,
@@ -6612,7 +6620,7 @@ export class PersistentChatService {
 
     const pending: PendingInterruptRequest = {
       threadId: tid,
-      clientRequestId: crypto.randomUUID(),
+      clientRequestId: newRequestId(),
       targetTurnId,
       attempts: 0,
     };
@@ -6804,7 +6812,7 @@ export class PersistentChatService {
     config: Record<string, unknown>,
     datasourceIds?: string[],
   ): Promise<ConfigUpdateOutcome> {
-    const requestId = crypto.randomUUID();
+    const requestId = newRequestId();
     const threadId = this.threadId();
     const transport = this.controlTransport('config.update');
     if (!threadId || transport === 'unavailable') {
@@ -6942,7 +6950,7 @@ export class PersistentChatService {
     draftSnapshot = '',
     draftRevision = 0,
   ): string {
-    const requestId = crypto.randomUUID();
+    const requestId = newRequestId();
     const transport = this.controlTransport('rewind');
     if (!this.rewindModeAvailable(mode)) {
       this.error.set(this.transloco.translate('chat.rewind.unavailable'));

@@ -675,3 +675,9 @@ forbidden_modules = [
   "agent.graph",
   "langgraph",
 ]
+
+[[tool.importlinter.contracts]]
+name = "Live session routes and services do not import application startup or composition"
+type = "forbidden"
+source_modules = ["orchestrator.routers.live", "orchestrator.services.live"]
+forbidden_modules = ["orchestrator.main", "orchestrator.application"]

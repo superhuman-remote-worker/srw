@@ -29,9 +29,11 @@ from __future__ import annotations
 import itertools
 import hashlib
 import logging
+import math
+import os
 import re
 import time
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
 from datetime import datetime, timezone
 from typing import Any, Optional
 from urllib.parse import quote, unquote, urlencode, urlsplit
@@ -69,6 +71,10 @@ from orchestrator.services.cloud.handles import (
     ShareHandle,
     UserId,
 )
+from orchestrator.services.cloud.nextcloud_agent_credential import (
+    AGENT_CLIENT_USER_AGENT,
+    NextcloudAgentServiceCredential,
+)
 from orchestrator.services.cloud.nextcloud_user_root import NextcloudUserRootGrant
 from orchestrator.services.cloud.retry import LeakyBucket
 from orchestrator.services.cloud.telemetry import instrument_backend_op
@@ -79,6 +85,7 @@ from orchestrator.services.cloud.protected_effect_contract import (
     NextcloudEffectFenceIntent,
     adopt_protected_effect_installation_attestation,
 )
+from shared.http_no_cookies import NoCookieJar
 
 logger = logging.getLogger(__name__)
 
@@ -107,11 +114,53 @@ _FOLDER_KIND_FOR_ACCESS = {"read_only": "reader", "read_write": "writer"}
 #: to the operator.
 _FOLDER_PRINCIPAL_QUOTA = "0 B"
 
-# Nextcloud 30.0.10+ enforces 20 new user shares per 10 minutes per user on
-# /ocs/v2.php/apps/files_sharing/api/v1/shares. The client-side bucket sits
-# at 15/10min to leave headroom for clock skew and concurrent processes.
-_SHARE_RATE_LIMIT_EVENTS = 15
-_SHARE_RATE_LIMIT_WINDOW_SECONDS = 600.0
+#: The shared clients' (the admin's and agent-service's) timeouts and pool.
+_CLIENT_TIMEOUT = httpx.Timeout(connect=5.0, read=30.0, write=30.0, pool=10.0)
+_CLIENT_LIMITS = httpx.Limits(max_connections=20, max_keepalive_connections=10)
+
+# Nextcloud 30.0.10+ limits new shares per user on
+# /ocs/v2.php/apps/files_sharing/api/v1/shares, by default to 20 per 10
+# minutes. agent-service creates every session and job-export share, so that
+# limit is the installation's. The chart raises it on the bundled Nextcloud
+# (``nextcloud.rateLimits.shareCreate``) and tells the orchestrator the limit
+# and its own replica count; each replica's client-side bucket takes its share
+# of 75 % of the limit, leaving headroom for clock skew.
+_SHARE_RATE_LIMIT_ENV = "NEXTCLOUD_SHARE_RATE_LIMIT"
+_SHARE_RATE_PERIOD_ENV = "NEXTCLOUD_SHARE_RATE_PERIOD_SECONDS"
+_SHARE_RATE_REPLICAS_ENV = "NEXTCLOUD_SHARE_RATE_REPLICAS"
+_SHARE_RATE_LIMIT_DEFAULT = 20
+_SHARE_RATE_PERIOD_DEFAULT_SECONDS = 600
+_SHARE_RATE_HEADROOM = 0.75
+
+
+def share_rate_bucket(
+    environ: Optional[Mapping[str, str]] = None,
+) -> tuple[int, float]:
+    """``(events, window_seconds)`` for one replica's share bucket, from the
+    chart's ``NEXTCLOUD_SHARE_RATE_*`` env. Upstream 20 per 600 s and one
+    replica when unset or invalid (15 per 600 s, as before the env)."""
+    env = os.environ if environ is None else environ
+
+    def positive_int(name: str, default: int) -> int:
+        raw = (env.get(name) or "").strip()
+        if not raw:
+            return default
+        try:
+            value = int(raw)
+        except ValueError:
+            value = 0
+        if value < 1:
+            logger.warning(
+                "%s=%r is not a positive integer; using %d", name, raw, default
+            )
+            return default
+        return value
+
+    limit = positive_int(_SHARE_RATE_LIMIT_ENV, _SHARE_RATE_LIMIT_DEFAULT)
+    period = positive_int(_SHARE_RATE_PERIOD_ENV, _SHARE_RATE_PERIOD_DEFAULT_SECONDS)
+    replicas = positive_int(_SHARE_RATE_REPLICAS_ENV, 1)
+    return max(1, math.floor(limit * _SHARE_RATE_HEADROOM / replicas)), float(period)
+
 
 _PROTECTED_EFFECT_CAPABILITY_PATH = (
     "/index.php/apps/srw_protected_effect/api/v1/capability"
@@ -216,7 +265,7 @@ NEXTCLOUD_CAPABILITIES = ProviderCapabilities(
 )
 
 
-class NextcloudBackend(NextcloudUserRootGrant):
+class NextcloudBackend(NextcloudUserRootGrant, NextcloudAgentServiceCredential):
     """Main-cloud backend for Nextcloud.
 
     Reads configuration from environment variables:
@@ -226,6 +275,10 @@ class NextcloudBackend(NextcloudUserRootGrant):
         NEXTCLOUD_ADMIN_PASSWORD: Admin password (default: admin)
         NEXTCLOUD_AGENT_USER:     Service account username (default: agent-service)
         NEXTCLOUD_AGENT_PASSWORD: Service account password (default: agent-service-dev)
+
+    The admin account signs in with its password on ``_client``;
+    agent-service on ``_agent_client``, with the app password it mints with
+    its password once per installation (``NextcloudAgentServiceCredential``).
     """
 
     backend_id = BACKEND_ID
@@ -278,14 +331,18 @@ class NextcloudBackend(NextcloudUserRootGrant):
             else None
         )
         self._initialized = False
+        # The admin's, with client-level auth: never agent-service's.
         self._client: Optional[httpx.AsyncClient] = None
+        self._agent_client: Optional[httpx.AsyncClient] = None
         self._protected_effect_client: Optional[httpx.AsyncClient] = None
         self._backend_instance_id: Optional[str] = None
+        self._init_agent_secret()
         self._attestation_backend_instance_id: Optional[str] = None
         self._installation_proof_sha256: Optional[str] = None
+        share_events, share_window = share_rate_bucket()
         self._share_bucket = LeakyBucket(
-            max_events=_SHARE_RATE_LIMIT_EVENTS,
-            window_seconds=_SHARE_RATE_LIMIT_WINDOW_SECONDS,
+            max_events=share_events,
+            window_seconds=share_window,
         )
 
     # --------------------------------------------------------------- Properties
@@ -476,8 +533,9 @@ class NextcloudBackend(NextcloudUserRootGrant):
 
     @property
     def webdav_credentials(self) -> dict[str, str]:
-        """Agent credentials for WebDAV access to Nextcloud folders."""
-        return {"username": self._agent_user, "password": self._agent_password}
+        """Agent credentials for WebDAV access to Nextcloud folders: the
+        agent-service app password once adopted, else its login password."""
+        return {"username": self._agent_user, "password": self._agent_secret}
 
     @property
     def service_account_logins(self) -> frozenset[tuple[str, str]]:
@@ -703,13 +761,20 @@ class NextcloudBackend(NextcloudUserRootGrant):
             self._client = httpx.AsyncClient(
                 base_url=self._base_url,
                 auth=(self._admin_user, self._admin_password),
+                # No cookie is ever stored or sent: Nextcloud's session
+                # cookies are Secure and this client speaks in-cluster
+                # http, so it would echo only ``cookie_test``, and that
+                # makes Nextcloud mint a session token (an RSA key pair
+                # and an ``oc_authtoken`` row) on every request.
+                cookies=NoCookieJar(),
                 headers={
                     "OCS-APIRequest": "true",
                     "User-Agent": "SuperhumanRemoteWorker/0.1 main-cloud-backend",
                 },
-                timeout=httpx.Timeout(connect=5.0, read=30.0, write=30.0, pool=10.0),
-                limits=httpx.Limits(max_connections=20, max_keepalive_connections=10),
+                timeout=_CLIENT_TIMEOUT,
+                limits=_CLIENT_LIMITS,
             )
+            self._agent_client = self._build_agent_client()
             if self._protected_effect_url is not None:
                 self._protected_effect_client = httpx.AsyncClient(
                     base_url=self._protected_effect_url,
@@ -760,11 +825,7 @@ class NextcloudBackend(NextcloudUserRootGrant):
                     "Nextcloud groupfolders app not installed — "
                     "cloud folder provisioning disabled"
                 )
-                await self._client.aclose()
-                self._client = None
-                if self._protected_effect_client is not None:
-                    await self._protected_effect_client.aclose()
-                    self._protected_effect_client = None
+                await self._close_clients()
                 return False
             resp.raise_for_status()
 
@@ -783,11 +844,7 @@ class NextcloudBackend(NextcloudUserRootGrant):
                     "integrity. Error: %s",
                     e,
                 )
-                await self._client.aclose()
-                self._client = None
-                if self._protected_effect_client is not None:
-                    await self._protected_effect_client.aclose()
-                    self._protected_effect_client = None
+                await self._close_clients()
                 return False
 
             installation_proof = legacy_installation_proof
@@ -846,26 +903,50 @@ class NextcloudBackend(NextcloudUserRootGrant):
             return True
         except Exception as e:
             logger.warning(f"Nextcloud backend init failed: {e}")
-            if self._client:
-                await self._client.aclose()
-                self._client = None
-            if self._protected_effect_client is not None:
-                await self._protected_effect_client.aclose()
-                self._protected_effect_client = None
+            await self._close_clients()
             return False
 
+    def _build_agent_client(
+        self, transport: Optional[httpx.AsyncBaseTransport] = None
+    ) -> httpx.AsyncClient:
+        """agent-service's shared client: the admin client's pool and
+        timeouts, no cookie (as ``_client``), and ``agent_service_auth``,
+        which signs every request with agent-service's current secret and
+        re-sends it once after a 401 that brought a newer one."""
+        return httpx.AsyncClient(
+            base_url=self._base_url,
+            auth=self.agent_service_auth(),
+            cookies=NoCookieJar(),
+            headers={
+                "OCS-APIRequest": "true",
+                "User-Agent": AGENT_CLIENT_USER_AGENT,
+            },
+            timeout=_CLIENT_TIMEOUT,
+            limits=_CLIENT_LIMITS,
+            transport=transport,
+        )
+
+    async def _close_clients(self) -> None:
+        """Close the admin, agent-service and protected-effect clients, each
+        whatever the others do; the first failure is raised after."""
+        clients = (self._client, self._agent_client, self._protected_effect_client)
+        self._client = self._agent_client = self._protected_effect_client = None
+        error: Optional[Exception] = None
+        for client in clients:
+            if client is None:
+                continue
+            try:
+                await client.aclose()
+            except Exception as exc:
+                error = error or exc
+        if error is not None:
+            raise error
+
     async def close(self) -> None:
-        if self._client is not None:
-            try:
-                await self._client.aclose()
-            finally:
-                self._client = None
-        if self._protected_effect_client is not None:
-            try:
-                await self._protected_effect_client.aclose()
-            finally:
-                self._protected_effect_client = None
-        self._initialized = False
+        try:
+            await self._close_clients()
+        finally:
+            self._initialized = False
 
     async def health_check(self) -> HealthStatus:
         if not self._initialized or self._client is None:
@@ -881,6 +962,54 @@ class NextcloudBackend(NextcloudUserRootGrant):
             )
         except Exception as e:
             return HealthStatus(ok=False, latency_ms=0.0, detail=str(e))
+
+    async def background_jobs_status(self) -> Optional[dict[str, Any]]:
+        """Background-job (cron) health for the admin Main cloud page (D13).
+
+        Reads ``core/backgroundjobs_mode`` and ``core/lastcron`` through the
+        provisioning API's app config, as admin. ``cron.php`` stores
+        ``lastcron`` (unix seconds) at the end of every run; it is empty
+        before the first. An unset mode is Nextcloud's own default, ``ajax``.
+        ``stale``: the mode is ``cron`` and no run finished in the last 15
+        minutes (the chart's cron container runs every 5), or none ever did.
+        ``None`` on any failure: the page reports, it never gates.
+        """
+        if not self._initialized or self._client is None:
+            return None
+        try:
+            values: dict[str, str] = {}
+            for key in ("backgroundjobs_mode", "lastcron"):
+                resp = await self._client.get(
+                    "/ocs/v2.php/apps/provisioning_api/api/v1/config/apps/core/" + key,
+                    params={"format": "json"},
+                )
+                if resp.status_code != 200:
+                    return None
+                ocs = resp.json().get("ocs") or {}
+                if (ocs.get("meta") or {}).get("statuscode") != 200:
+                    return None
+                data = ocs.get("data")
+                if not isinstance(data, dict):
+                    return None
+                value = data.get("data")
+                values[key] = str(value if value is not None else "").strip()
+            mode: Optional[str] = values["backgroundjobs_mode"] or "ajax"
+            if mode not in ("cron", "ajax", "webcron", "none"):
+                mode = None
+            lastcron = values["lastcron"]
+            last_run = int(lastcron) if lastcron.isdigit() else 0
+            last_run_at = (
+                datetime.fromtimestamp(last_run, timezone.utc) if last_run > 0 else None
+            )
+            return {
+                "mode": mode,
+                "last_run_at": last_run_at.isoformat() if last_run_at else None,
+                "stale": mode == "cron"
+                and (last_run_at is None or time.time() - last_run > 15 * 60),
+            }
+        except Exception:
+            logger.debug("Nextcloud background job status unreadable", exc_info=True)
+            return None
 
     # ------------------------------------------------------------------ Identity
 
@@ -921,14 +1050,17 @@ class NextcloudBackend(NextcloudUserRootGrant):
                     # Fallback for servers that return the simpler list shape
                     for uid in users_obj:
                         user_records.append((str(uid), {}))
-                # Exact-match pass: prefer email match, then display_name match
+                # Exact-match pass: prefer email match, then display_name match.
+                # An account without an email address carries ``"email": null``.
                 if email:
                     for uid, rec in user_records:
-                        if rec.get("email", "").lower() == email.lower():
+                        if (rec.get("email") or "").lower() == email.lower():
                             return UserId(uid)
                 if display_name:
                     for uid, rec in user_records:
-                        if rec.get("displayname", "").lower() == display_name.lower():
+                        if (
+                            rec.get("displayname") or ""
+                        ).lower() == display_name.lower():
                             return UserId(uid)
                 # Last resort: if the search returned exactly one row, trust it
                 if len(user_records) == 1:
@@ -1044,48 +1176,143 @@ class NextcloudBackend(NextcloudUserRootGrant):
 
     @instrument_backend_op("ensure_project_folder")
     async def ensure_project_folder(
-        self, *, project_name: str, group_id: GroupId
+        self,
+        *,
+        project_name: str,
+        group_id: GroupId,
+        project_id: Optional[str] = None,
     ) -> ProjectFolderHandle:
-        """Create a Group Folder and grant project + srw-agents access."""
+        """Create a Group Folder and grant project + srw-agents access.
+
+        The folder is mounted at the project's name or, when a Group Folder
+        is mounted there already, at the name plus four hex characters of
+        the project's id (``Marketing (a1b2)``), the same on every retry.
+        Groupfolders 20+ (Nextcloud 32) refuses a second folder at one
+        mount point. A folder found at either name is never adopted, whoever
+        made it: only the handle stored on the project row says which folder
+        is the project's. With both names taken the create is refused
+        (``ALREADY_EXISTS``).
+
+        The handle keeps the mount point the server answers with (it trims
+        the name); every DAV path is built from it. A folder whose grants
+        fail is removed again, so a retry gets the name this one had.
+        """
         self._ensure_ready()
+        requested = project_name.strip()
+        suffixed = f"{requested} ({self._mount_point_suffix(project_id or group_id)})"
         try:
-            resp = await self._client.post(
-                "/index.php/apps/groupfolders/folders",
-                params={"format": "json"},
-                data={"mountpoint": project_name},
-            )
-            resp.raise_for_status()
-            self._assert_not_html(resp)
-            data = resp.json()
-            folder_id = data.get("ocs", {}).get("data", {}).get("id")
+            taken = await self._group_folder_mount_points()
+            for mountpoint in (requested, suffixed):
+                if mountpoint.casefold() in taken:
+                    continue
+                resp = await self._client.post(
+                    "/index.php/apps/groupfolders/folders",
+                    params={"format": "json"},
+                    data={"mountpoint": mountpoint},
+                )
+                try:
+                    data = self._groupfolders_data(resp, op="create group folder")
+                except CloudBackendError as e:
+                    # Groupfolders 20+ answers OCS 400 for a mount point
+                    # another create took meanwhile: then try the next name.
+                    if e.kind is not CloudBackendErrorKind.INVALID_REQUEST:
+                        raise
+                    taken = await self._group_folder_mount_points()
+                    if mountpoint.casefold() not in taken:
+                        raise
+                    continue
+                break
+            else:
+                raise CloudBackendError(
+                    CloudBackendErrorKind.ALREADY_EXISTS,
+                    f"Group Folders exist at both {requested!r} and {suffixed!r}",
+                    backend=self.backend_id,
+                    retryable=False,
+                )
+            folder_id = data.get("id") if isinstance(data, dict) else None
             if not folder_id:
                 raise CloudBackendError(
                     CloudBackendErrorKind.UNKNOWN,
                     "Group folder creation returned no id",
                     backend=self.backend_id,
-                    raw=data,
+                    raw={"data": data},
                 )
+            folder_id = int(folder_id)
+            mountpoint = str(data.get("mount_point") or mountpoint)
 
-            await self._grant_group_access(
-                int(folder_id), str(group_id), _ALL_PERMISSIONS
-            )
-            await self._grant_group_access(
-                int(folder_id), "srw-agents", _ALL_PERMISSIONS
-            )
+            try:
+                await self._grant_group_access(
+                    folder_id, str(group_id), _ALL_PERMISSIONS
+                )
+                await self._grant_group_access(
+                    folder_id, "srw-agents", _ALL_PERMISSIONS
+                )
+            except (CloudBackendError, httpx.HTTPError):
+                await self._discard_group_folder(folder_id)
+                raise
 
             logger.info(
-                f"Created Nextcloud Group Folder '{project_name}' "
+                f"Created Nextcloud Group Folder '{mountpoint}' "
                 f"(id={folder_id}) for group '{group_id}'"
             )
             return ProjectFolderHandle(
                 backend=self.backend_id,
                 native_id=str(folder_id),
-                vendor_meta={"mountpoint": project_name},
+                vendor_meta={"mountpoint": mountpoint},
             )
         except CloudBackendError:
             raise
         except httpx.HTTPError as e:
             raise self._map_http_error(e) from e
+
+    @staticmethod
+    def _mount_point_suffix(identity: str) -> str:
+        """Four hex characters naming a project in a colliding mount point:
+        its id's first four (as SRW names its connectors by the first
+        eight), or a hash's for an identity that is no UUID."""
+        hex_id = str(identity).replace("-", "").lower()
+        if re.fullmatch(r"[0-9a-f]{32}", hex_id) is None:
+            hex_id = hashlib.sha256(str(identity).encode()).hexdigest()
+        return hex_id[:4]
+
+    async def _group_folder_mount_points(self) -> set[str]:
+        """Every Group Folder's mount point, casefolded.
+
+        Groupfolders compares mount points as the database does (exactly on
+        Postgres and SQLite, case-blind on MySQL), and a desktop client on a
+        case-blind disk cannot hold two folders that differ only in case,
+        so SRW treats a case variant as taken.
+        """
+        resp = await self._client.get(
+            "/index.php/apps/groupfolders/folders",
+            params={"format": "json"},
+        )
+        data = self._groupfolders_data(resp, op="list group folders")
+        # Keyed by folder id; PHP encodes an installation with none as [].
+        folders = data.values() if isinstance(data, dict) else data or []
+        return {
+            str(folder["mount_point"]).strip().casefold()
+            for folder in folders
+            if isinstance(folder, dict) and folder.get("mount_point")
+        }
+
+    async def _discard_group_folder(self, folder_id: int) -> None:
+        """Remove a Group Folder this call created and could not grant.
+        Best effort: a failure is logged, the grant's error is the one
+        raised."""
+        try:
+            resp = await self._client.delete(
+                f"/index.php/apps/groupfolders/folders/{folder_id}",
+                params={"format": "json"},
+            )
+            self._groupfolders_data(resp, op="remove ungranted group folder")
+        except (CloudBackendError, httpx.HTTPError) as e:
+            logger.warning(
+                "Group Folder id=%s was created but not granted, and could not "
+                "be removed (%s); it needs manual cleanup",
+                folder_id,
+                e,
+            )
 
     @instrument_backend_op("delete_project_folder")
     async def delete_project_folder(
@@ -1105,10 +1332,8 @@ class NextcloudBackend(NextcloudUserRootGrant):
                 f"/index.php/apps/groupfolders/folders/{folder_id}",
                 params={"format": "json"},
             )
-            if resp.status_code == 200:
-                logger.info(f"Deleted Nextcloud Group Folder id={folder_id}")
-                return
-            if resp.status_code == 404:
+            # OCS v1: a folder that is gone is HTTP 200 + OCS 404.
+            if resp.status_code == 404 or self._ocs_statuscode(resp) == 404:
                 if if_exists:
                     logger.debug(f"Group Folder id={folder_id} already gone")
                     return
@@ -1118,7 +1343,8 @@ class NextcloudBackend(NextcloudUserRootGrant):
                     backend=self.backend_id,
                     status_code=404,
                 )
-            resp.raise_for_status()
+            self._groupfolders_data(resp, op=f"delete group folder {folder_id}")
+            logger.info(f"Deleted Nextcloud Group Folder id={folder_id}")
         except CloudBackendError:
             raise
         except httpx.HTTPError as e:
@@ -1253,11 +1479,10 @@ class NextcloudBackend(NextcloudUserRootGrant):
         ``parse_propfind_entries`` reads.
         """
         try:
-            resp = await self._client.request(
+            resp = await self._agent_client.request(
                 "PROPFIND",
                 url_path,
                 headers={"Depth": "1"},
-                auth=(self._agent_user, self._agent_password),
             )
         except httpx.HTTPError as e:
             raise self._map_http_error(e) from e
@@ -1288,11 +1513,10 @@ class NextcloudBackend(NextcloudUserRootGrant):
         or a transport error raises ``PropfindError`` so the caller falls back
         to a Depth:1 BFS (design §11.5)."""
         try:
-            resp = await self._client.request(
+            resp = await self._agent_client.request(
                 "PROPFIND",
                 url_path,
                 headers={"Depth": depth},
-                auth=(self._agent_user, self._agent_password),
             )
         except httpx.HTTPError as e:
             raise PropfindError(str(e)) from e
@@ -1350,9 +1574,7 @@ class NextcloudBackend(NextcloudUserRootGrant):
             )
         url = f"{base_path}/{quote(rel, safe='/')}"
         try:
-            resp = await self._client.get(
-                url, auth=(self._agent_user, self._agent_password)
-            )
+            resp = await self._agent_client.get(url)
         except httpx.HTTPError as e:
             raise self._map_http_error(e) from e
         if resp.status_code == 404:
@@ -1380,11 +1602,11 @@ class NextcloudBackend(NextcloudUserRootGrant):
         content: bytes,
         content_type: Optional[str] = None,
     ) -> None:
-        """PUT one file into a Group Folder, MKCOL-ing parents on the way.
+        """PUT one file into a Group Folder, creating missing parents.
 
-        Same MKCOL-each-segment-then-PUT idiom as ``put_session_file``.
-        Used by the Mode A accept flow to write the agent's accepted edits
-        back to the cloud folder.
+        Same PUT-first idiom as ``put_session_file``. Used by the Mode A
+        accept flow to write the agent's accepted edits back to the cloud
+        folder.
         """
         self._ensure_ready()
         base_path = self._groupfolder_dav_base(handle)
@@ -1396,34 +1618,10 @@ class NextcloudBackend(NextcloudUserRootGrant):
                 backend=self.backend_id,
                 retryable=False,
             )
-        segments = rel.split("/")
-        parents = segments[:-1]
         try:
-            for i in range(len(parents)):
-                partial = "/".join(parents[: i + 1])
-                url = f"{base_path}/{quote(partial, safe='/')}"
-                resp = await self._client.request(
-                    "MKCOL",
-                    url,
-                    auth=(self._agent_user, self._agent_password),
-                )
-                # 201 = created, 405 = already exists — both fine.
-                if resp.status_code in (201, 405):
-                    continue
-                resp.raise_for_status()
-
-            put_url = f"{base_path}/{quote(rel, safe='/')}"
-            headers: dict[str, str] = {}
-            if content_type:
-                headers["Content-Type"] = content_type
-            put_resp = await self._client.put(
-                put_url,
-                headers=headers,
-                content=content,
-                auth=(self._agent_user, self._agent_password),
+            await self._put_creating_parents(
+                base_path, rel.split("/"), content=content, content_type=content_type
             )
-            if put_resp.status_code not in (200, 201, 204):
-                put_resp.raise_for_status()
         except httpx.HTTPError as e:
             raise self._map_http_error(e) from e
 
@@ -1448,9 +1646,7 @@ class NextcloudBackend(NextcloudUserRootGrant):
             )
         url = f"{base_path}/{quote(rel, safe='/')}"
         try:
-            resp = await self._client.delete(
-                url, auth=(self._agent_user, self._agent_password)
-            )
+            resp = await self._agent_client.delete(url)
         except httpx.HTTPError as e:
             raise self._map_http_error(e) from e
         if resp.status_code in (200, 204):
@@ -1484,26 +1680,38 @@ class NextcloudBackend(NextcloudUserRootGrant):
         that the folder is its own."""
         self._ensure_ready()
         folder_path = f"sessions/{session_id}"
+        dav_prefix = f"/remote.php/dav/files/{self._agent_user}"
+        parts = folder_path.strip("/").split("/")
         try:
-            parts = folder_path.strip("/").split("/")
-            for i in range(len(parts)):
-                partial = "/".join(parts[: i + 1])
-                url = f"/remote.php/dav/files/{self._agent_user}/{partial}"
-                resp = await self._client.request(
-                    "MKCOL",
-                    url,
-                    auth=(self._agent_user, self._agent_password),
-                )
-                if resp.status_code == 405 and exclusive and i == len(parts) - 1:
+            # The leaf first: ``sessions/`` is there for every session but
+            # the installation's first, so one MKCOL is the usual cost.
+            # Nextcloud answers 409 when a parent is missing: create the
+            # parents, then the leaf once more.
+            resp = await self._mkcol(dav_prefix, parts)
+            if resp.status_code == 409:
+                await self._mkcol_parents(dav_prefix, parts[:-1])
+                resp = await self._mkcol(dav_prefix, parts)
+                if resp.status_code == 409:
+                    # Never ALREADY_EXISTS (which ``_map_http_error`` makes
+                    # of a 409): that would record the session's folder as
+                    # someone else's and refuse every later attempt.
                     raise CloudBackendError(
-                        CloudBackendErrorKind.ALREADY_EXISTS,
-                        f"Session folder '{folder_path}' already exists",
+                        CloudBackendErrorKind.UNAVAILABLE,
+                        f"Session folder '{folder_path}': its parent is missing "
+                        "after it was created",
                         backend=self.backend_id,
-                        status_code=405,
+                        status_code=409,
+                        retryable=True,
                     )
-                # 201 = created, 405 = already exists — both fine.
-                if resp.status_code in (201, 405):
-                    continue
+            if resp.status_code == 405 and exclusive:
+                raise CloudBackendError(
+                    CloudBackendErrorKind.ALREADY_EXISTS,
+                    f"Session folder '{folder_path}' already exists",
+                    backend=self.backend_id,
+                    status_code=405,
+                )
+            # 201 = created, 405 = already exists — both fine.
+            if resp.status_code not in (201, 405):
                 resp.raise_for_status()
             logger.info(f"Created session folder: {folder_path}")
             return SessionFolderHandle(
@@ -1521,9 +1729,7 @@ class NextcloudBackend(NextcloudUserRootGrant):
         folder_path = handle.native_id
         try:
             url = f"/remote.php/dav/files/{self._agent_user}/{folder_path}"
-            resp = await self._client.delete(
-                url, auth=(self._agent_user, self._agent_password)
-            )
+            resp = await self._agent_client.delete(url)
             if resp.status_code == 204:
                 logger.info(f"Deleted session folder: {folder_path}")
                 return
@@ -1556,7 +1762,7 @@ class NextcloudBackend(NextcloudUserRootGrant):
         folder_path = handle.native_id
         await self._share_bucket.acquire()
         try:
-            resp = await self._client.post(
+            resp = await self._agent_client.post(
                 "/ocs/v2.php/apps/files_sharing/api/v1/shares",
                 params={"format": "json"},
                 data={
@@ -1565,7 +1771,6 @@ class NextcloudBackend(NextcloudUserRootGrant):
                     "shareWith": str(user_id),
                     "permissions": str(_SESSION_SHARE_PERMISSIONS),
                 },
-                auth=(self._agent_user, self._agent_password),
             )
             resp.raise_for_status()
             self._assert_not_html(resp)
@@ -1606,10 +1811,9 @@ class NextcloudBackend(NextcloudUserRootGrant):
                 backend=self.backend_id,
             ) from e
         try:
-            resp = await self._client.delete(
+            resp = await self._agent_client.delete(
                 f"/ocs/v2.php/apps/files_sharing/api/v1/shares/{share_id}",
                 params={"format": "json"},
-                auth=(self._agent_user, self._agent_password),
             )
             if resp.status_code == 200:
                 logger.info(f"Revoked session share id={share_id}")
@@ -1655,7 +1859,7 @@ class NextcloudBackend(NextcloudUserRootGrant):
         content: bytes,
         content_type: Optional[str] = None,
     ) -> None:
-        """PUT one file into a session folder, MKCOL-ing parents on the way."""
+        """PUT one file into a session folder, creating missing parents."""
         self._ensure_ready()
         rel = path.strip("/")
         if not rel:
@@ -1666,41 +1870,61 @@ class NextcloudBackend(NextcloudUserRootGrant):
                 retryable=False,
             )
         folder_path = handle.native_id.strip("/")
-        full_segments = folder_path.split("/") + rel.split("/")
-        parents = full_segments[:-1]
         try:
-            for i in range(len(parents)):
-                partial = "/".join(parents[: i + 1])
-                url = (
-                    f"/remote.php/dav/files/{self._agent_user}/"
-                    f"{quote(partial, safe='/')}"
-                )
-                resp = await self._client.request(
-                    "MKCOL",
-                    url,
-                    auth=(self._agent_user, self._agent_password),
-                )
-                if resp.status_code in (201, 405):
-                    continue
-                resp.raise_for_status()
-
-            put_url = (
-                f"/remote.php/dav/files/{self._agent_user}/"
-                f"{quote('/'.join(full_segments), safe='/')}"
-            )
-            headers: dict[str, str] = {}
-            if content_type:
-                headers["Content-Type"] = content_type
-            put_resp = await self._client.put(
-                put_url,
-                headers=headers,
+            await self._put_creating_parents(
+                f"/remote.php/dav/files/{self._agent_user}",
+                folder_path.split("/") + rel.split("/"),
                 content=content,
-                auth=(self._agent_user, self._agent_password),
+                content_type=content_type,
             )
-            if put_resp.status_code not in (200, 201, 204):
-                put_resp.raise_for_status()
         except httpx.HTTPError as e:
             raise self._map_http_error(e) from e
+
+    async def _mkcol(self, dav_prefix: str, segments: list[str]) -> httpx.Response:
+        return await self._agent_client.request(
+            "MKCOL",
+            f"{dav_prefix}/{quote('/'.join(segments), safe='/')}",
+        )
+
+    async def _mkcol_parents(self, dav_prefix: str, segments: list[str]) -> None:
+        """MKCOL every prefix of ``segments``, top-down. 201 (created) and
+        405 (already there) both pass; anything else raises."""
+        for i in range(len(segments)):
+            resp = await self._mkcol(dav_prefix, segments[: i + 1])
+            if resp.status_code not in (201, 405):
+                resp.raise_for_status()
+
+    async def _put_creating_parents(
+        self,
+        dav_prefix: str,
+        segments: list[str],
+        *,
+        content: bytes,
+        content_type: Optional[str],
+    ) -> httpx.Response:
+        """PUT ``segments`` under ``dav_prefix``; when its parent may be
+        missing (Nextcloud 31 answers a PUT there with 404, plain sabre/dav
+        with 409), MKCOL the parents and PUT once more. A file whose folders
+        are there costs one request, not one MKCOL per parent plus the PUT."""
+        url = f"{dav_prefix}/{quote('/'.join(segments), safe='/')}"
+        headers: dict[str, str] = {}
+        if content_type:
+            headers["Content-Type"] = content_type
+        put_resp = await self._agent_client.put(
+            url,
+            headers=headers,
+            content=content,
+        )
+        if put_resp.status_code in (404, 409) and len(segments) > 1:
+            await self._mkcol_parents(dav_prefix, segments[:-1])
+            put_resp = await self._agent_client.put(
+                url,
+                headers=headers,
+                content=content,
+            )
+        if put_resp.status_code not in (200, 201, 204):
+            put_resp.raise_for_status()
+        return put_resp
 
     # ------------------------------------------------------------ Internal helpers
 
@@ -1812,14 +2036,50 @@ class NextcloudBackend(NextcloudUserRootGrant):
             params={"format": "json"},
             data={"group": group_id},
         )
-        resp.raise_for_status()
+        self._groupfolders_data(resp, op=f"grant group {group_id} on folder")
 
         resp = await self._client.post(
             f"/index.php/apps/groupfolders/folders/{folder_id}/groups/{group_id}",
             params={"format": "json"},
             data={"permissions": str(permissions)},
         )
+        self._groupfolders_data(resp, op=f"set group {group_id} permissions")
+
+    #: A Group Folders refusal's OCS statuscode, by the kind it raises.
+    _GROUPFOLDERS_REFUSAL_KINDS = {
+        400: CloudBackendErrorKind.INVALID_REQUEST,
+        401: CloudBackendErrorKind.AUTHENTICATION_FAILED,
+        403: CloudBackendErrorKind.PERMISSION_DENIED,
+        404: CloudBackendErrorKind.NOT_FOUND,
+    }
+
+    def _groupfolders_data(self, resp: httpx.Response, *, op: str) -> Any:
+        """The ``ocs.data`` of a Group Folders answer, or raise.
+
+        Group Folders is reached through index.php, which speaks OCS v1:
+        a refusal is HTTP 200 too, with ``data: []``, so only
+        ``ocs.meta.statuscode`` tells (100 OK; 200 is v2's OK). Groupfolders
+        20+ (Nextcloud 32) refuses a mount point that is taken with OCS 400,
+        and a call that needs a confirmed password gets OCS 403.
+        """
         resp.raise_for_status()
+        self._assert_not_html(resp)
+        code = self._ocs_statuscode(resp)
+        if code in (100, 200):
+            return resp.json()["ocs"].get("data")
+        try:
+            message = resp.json()["ocs"]["meta"].get("message")
+        except (AttributeError, KeyError, TypeError, ValueError):
+            message = None
+        raise CloudBackendError(
+            self._GROUPFOLDERS_REFUSAL_KINDS.get(code, CloudBackendErrorKind.UNKNOWN),
+            f"{op} refused: HTTP {resp.status_code}, ocs statuscode {code}",
+            backend=self.backend_id,
+            vendor_code=None if code is None else str(code),
+            vendor_message=str(message) if message else None,
+            status_code=resp.status_code,
+            retryable=False,
+        )
 
     # ------------------------------------------------ protected cloud mode: RO reader
 
@@ -2109,9 +2369,7 @@ class NextcloudBackend(NextcloudUserRootGrant):
             f"/index.php/apps/groupfolders/folders/{folder_id}",
             params={"format": "json"},
         )
-        resp.raise_for_status()
-        self._assert_not_html(resp)
-        data = (resp.json().get("ocs") or {}).get("data") or {}
+        data = self._groupfolders_data(resp, op=f"read group folder {folder_id}")
         groups = data.get("groups") if isinstance(data, dict) else None
         if isinstance(groups, dict):
             return {str(key) for key in groups}
@@ -2332,10 +2590,9 @@ class NextcloudBackend(NextcloudUserRootGrant):
                     f"{quote(fixture.trash_ref, safe='')}"
                 )
                 try:
-                    await self._client.request(
+                    await self._agent_client.request(
                         "DELETE",
                         purge_url,
-                        auth=(self._agent_user, self._agent_password),
                     )
                 except httpx.HTTPError:
                     pass
@@ -2367,8 +2624,8 @@ class NextcloudBackend(NextcloudUserRootGrant):
         content: bytes,
         content_type: Optional[str] = None,
     ) -> Optional[httpx.Response]:
-        """Same MKCOL-parents-then-PUT idiom as ``put_project_folder_file_bytes``,
-        but returns the PUT response so the caller can read response headers
+        """Same PUT-first idiom as ``put_project_folder_file_bytes``, but
+        returns the PUT response so the caller can read response headers
         (``OC-FileId``) — the public method discards it and returns ``None``.
         """
         self._ensure_ready()
@@ -2381,37 +2638,12 @@ class NextcloudBackend(NextcloudUserRootGrant):
                 backend=self.backend_id,
                 retryable=False,
             )
-        segments = rel.split("/")
-        parents = segments[:-1]
         try:
-            for i in range(len(parents)):
-                partial = "/".join(parents[: i + 1])
-                url = f"{base_path}/{quote(partial, safe='/')}"
-                resp = await self._client.request(
-                    "MKCOL",
-                    url,
-                    auth=(self._agent_user, self._agent_password),
-                )
-                # 201 = created, 405 = already exists — both fine.
-                if resp.status_code in (201, 405):
-                    continue
-                resp.raise_for_status()
-
-            put_url = f"{base_path}/{quote(rel, safe='/')}"
-            headers: dict[str, str] = {}
-            if content_type:
-                headers["Content-Type"] = content_type
-            put_resp = await self._client.put(
-                put_url,
-                headers=headers,
-                content=content,
-                auth=(self._agent_user, self._agent_password),
+            return await self._put_creating_parents(
+                base_path, rel.split("/"), content=content, content_type=content_type
             )
-            if put_resp.status_code not in (200, 201, 204):
-                put_resp.raise_for_status()
         except httpx.HTTPError as e:
             raise self._map_http_error(e) from e
-        return put_resp
 
     async def _enumerate_version_ref(self, fileid: str) -> Optional[str]:
         """Return ``{fileid}/{versionid}`` for the newest version, or None.
@@ -2423,11 +2655,10 @@ class NextcloudBackend(NextcloudUserRootGrant):
             return None
         url = f"/remote.php/dav/versions/{user}/versions/{fileid}"
         try:
-            resp = await self._client.request(
+            resp = await self._agent_client.request(
                 "PROPFIND",
                 url,
                 headers={"Depth": "1"},
-                auth=(self._agent_user, self._agent_password),
             )
         except httpx.HTTPError:
             return None
@@ -2471,11 +2702,10 @@ class NextcloudBackend(NextcloudUserRootGrant):
             return None
         url = f"/remote.php/dav/trashbin/{user}/trash"
         try:
-            resp = await self._client.request(
+            resp = await self._agent_client.request(
                 "PROPFIND",
                 url,
                 headers={"Depth": "1"},
-                auth=(self._agent_user, self._agent_password),
             )
         except httpx.HTTPError:
             return None

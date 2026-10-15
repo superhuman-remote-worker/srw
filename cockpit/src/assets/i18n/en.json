@@ -503,7 +503,7 @@
   },
   "automations": {
     "title": "Automations",
-    "subtitle": "Run jobs on a schedule. Use the API for everything else.",
+    "subtitle": "Run jobs on a schedule or when a live session arrives.",
     "new": "New automation",
     "list": {
       "empty": "No automations yet",
@@ -523,7 +523,8 @@
         "label": "Scoped to {{name}} · {{count}} automation(s)",
         "fallbackName": "this project",
         "clear": "Show all"
-      }
+      },
+      "live": "Live · {{name}}"
     },
     "editor": {
       "titleCreate": "New automation",
@@ -549,7 +550,20 @@
       "catchupHours": "Catchup window (hours)",
       "create": "Create automation",
       "save": "Save changes",
-      "requiredMissing": "Name, expert, prompt, and a valid cron expression are required."
+      "requiredMissing": "Name, expert, and prompt are required. Scheduled automations also need a valid cron expression.",
+      "trigger": "Trigger",
+      "schedule": "Schedule",
+      "incomingLive": "Incoming live session",
+      "liveConnectors": "Live connectors",
+      "primaryConnector": "Primary connector",
+      "additionalConnectors": "Additional connectors (optional)",
+      "noLiveConnectors": "No eligible live connectors. Add a phone line under Connectors.",
+      "noLiveConnectorsChooseProject": "No eligible live connectors. Phone lines that belong to a project appear once you choose that project above.",
+      "liveConnectorRequired": "Select a primary live connector.",
+      "project": "Project",
+      "noProject": "No project",
+      "projectPersonal": "(Personal)",
+      "projectFixed": "Set when the automation was created; it can't be changed."
     },
     "preview": {
       "timezoneNote": "Times are shown in {{tz}}. The orchestrator stores schedules in UTC and applies DST automatically.",
@@ -563,7 +577,8 @@
       "createKey": "Create API key"
     },
     "errors": {
-      "generic": "Something went wrong. Please try again."
+      "generic": "Something went wrong. Please try again.",
+      "liveConnectorTaken": "Already used by automation {{name}}"
     }
   },
   "sessions": {
@@ -664,6 +679,54 @@
     "legacyHeld": "Checking an older workspace creation; completion evidence is unavailable."
   },
   "jobs": {
+    "liveSessions": {
+      "title": "Live sessions",
+      "to": "to",
+      "duration": "Session duration",
+      "transcript": "Live transcript",
+      "loading": "Loading transcript…",
+      "waiting": "Waiting for the conversation…",
+      "empty": "No transcript recorded.",
+      "loadError": "Transcript could not be refreshed.",
+      "jumpLatest": "Jump to latest",
+      "backoffice": "Question for the back office",
+      "steering": "Steering:",
+      "followUps": "Follow-ups after the session",
+      "direction": {
+        "inbound": "Incoming",
+        "outbound": "Outgoing"
+      },
+      "status": {
+        "ringing": "Ringing",
+        "active": "Live",
+        "ended": "Ended",
+        "rejected": "Rejected",
+        "failed": "Failed"
+      },
+      "speaker": {
+        "caller": "Caller",
+        "assistant": "Voice assistant",
+        "job": "Back office",
+        "recorder": "Session system",
+        "unknown": "Speaker"
+      },
+      "backofficeState": {
+        "pending": "Awaiting answer",
+        "answered": "Answered",
+        "noted": "Noted",
+        "followUp": "Follow-up"
+      },
+      "reason": {
+        "remote_hangup": "Caller hung up",
+        "close_requested": "Call ended by request",
+        "expired": "Call time limit reached",
+        "content": "Call ended after the conversation",
+        "connection_lost": "Connection lost",
+        "recorder_lost": "Call recorder disconnected"
+      },
+      "connector": "Connector",
+      "usage": "Usage: {{seconds}} s"
+    },
     "pagination": {
       "label": "Pagination",
       "current": "Page {{page}}",
@@ -1138,7 +1201,7 @@
         "baseUrlPlaceholder": "Base URL (e.g. https://vllm.example/v1)",
         "apiKeyPlaceholder": "API key (optional)",
         "allowInsecure": "Allow http:// (not recommended outside local dev)",
-        "confirmDelete": "Delete this system endpoint? Catalog rows pointing at it will return errors until you remove or re-target them in Admin · Models.",
+        "confirmDelete": "Delete this system endpoint? Catalog rows pointing at it will return errors until you remove or re-target them in Settings → Models → Catalog.",
         "testButton": "Test",
         "testing": "Testing...",
         "testOk": "OK ({{status}})",
@@ -1146,7 +1209,7 @@
         "errorUrlScheme": "Base URL must start with http:// or https://",
         "errorHttpNeedsOptIn": "http:// URLs require the Allow http:// checkbox.",
         "catalogHint": "Models served by this endpoint are managed in the catalog.",
-        "catalogHintLink": "Open Admin · Models →",
+        "catalogHintLink": "Open Settings → Models → Catalog →",
         "editTitle": "Edit Endpoint",
         "apiKeyPlaceholderEdit": "API key (leave blank to keep existing)",
         "removeKey": "Remove existing API key on save"
@@ -1173,7 +1236,8 @@
           "search": "Search (primary)",
           "fetch": "Web fetch",
           "search_fallback": "Search fallback",
-          "rerank": "Rerank (memory recall ordering)"
+          "rerank": "Rerank (memory recall ordering)",
+          "live_voice": "Live voice"
         }
       },
       "discovery": {
@@ -1185,6 +1249,13 @@
         "text": "You're viewing all users' data.",
         "showMine": "Show only mine",
         "tooltip": "Switch to viewing only your own data"
+      }
+    },
+    "catalog": {
+      "liveVoice": {
+        "adapter": "Live voice adapter",
+        "voice": "Voice (optional)",
+        "onlyCapability": "Live voice must be the only capability."
       }
     }
   },
@@ -1593,6 +1664,24 @@
       "kinds": {
         "project": "project",
         "user_root": "user root"
+      },
+      "jobs": {
+        "title": "Background jobs",
+        "mode": "Mode",
+        "ajaxNote": "In AJAX mode they run only while someone has the Nextcloud web UI open.",
+        "lastRun": "Last run",
+        "never": "never",
+        "stale": "overdue",
+        "cronContainer": "Cron container",
+        "cronOn": "on, runs cron.php every 5 minutes",
+        "cronOff": "off (nextcloud.cron.enabled is false)",
+        "trashbin": "Trash retention",
+        "versions": "Version retention",
+        "retention": "Retention",
+        "retentionExternal": "Managed by this Nextcloud's own administrator.",
+        "retentionChart": "Set by the chart's setup hook on every Nextcloud start.",
+        "retentionDisabled": "disabled: Nextcloud never expires trash or old file versions on its own, so they remain the recovery floor.",
+        "staleNote": "No background job run has finished in the last 15 minutes, so Nextcloud's own cleanup (expired tokens, file locks) is waiting. Check that cron.php runs: in the chart's cron container, or on the server's own schedule."
       }
     },
     "helpers": {
@@ -1776,6 +1865,12 @@
       "folder": "Folder",
       "cloudAccessHint": "Agents get this folder through its connector, at the level set under Connectors → Cloud folders (or chosen for a session).",
       "cloudUnavailable": "Cloud storage unavailable — not configured.",
+      "cloudFolderFailed": {
+        "nameTaken": "This project has no cloud folder: the cloud already has folders with its name and its fallback name. Rename the project; SRW retries when it is opened, at most once an hour.",
+        "refused": "This project has no cloud folder: the cloud refused SRW's administrator account. SRW retries when the project is opened, at most once an hour.",
+        "unreachable": "This project has no cloud folder: the cloud could not be reached. SRW retries when the project is opened, at most once an hour.",
+        "other": "This project has no cloud folder: creating it failed. SRW retries when the project is opened, at most once an hour."
+      },
       "workspaceNetwork": "Workspace Network",
       "networkTier": "Egress Tier",
       "networkTierInternetOnly": "Internet only (default)",
@@ -2848,7 +2943,8 @@
       "gitea_mcp": "Gitea MCP (managed)",
       "cloud_folder": "Cloud folder",
       "cloud_folder_checkout": "Folder checkout",
-      "cloud_outbox": "Outbox"
+      "cloud_outbox": "Outbox",
+      "gpt_live_sip": "Phone line (GPT-Live over SIP)"
     },
     "platform": {
       "kind": {
@@ -2902,6 +2998,7 @@
       "typeGroupManaged": "Managed",
       "typeGroupCredentialFiles": "Credential files",
       "typeGroupMcp": "MCP",
+      "typeGroupLive": "Live sessions",
       "optGeneric": "Generic",
       "optRepository": "Repository",
       "optKb": "OKF Knowledge Base",
@@ -3158,6 +3255,13 @@
       "reindexed": "OKF Knowledge Base \"{{name}}\" reindex finished ({{status}})",
       "reindexFailed": "Failed to reindex the OKF Knowledge Base",
       "fileTooLarge": "File exceeds 64 KB — credential files are capped at 64 KB."
+    },
+    "liveWebhook": {
+      "label": "Webhook URL for OpenAI",
+      "help": "Register this URL as the webhook in your OpenAI project, then paste its signing secret (whsec_…) into the webhook secret field.",
+      "copy": "Copy URL",
+      "copied": "Copied",
+      "copyFailed": "Copy failed. Select and copy the URL manually."
     }
   },
   "connectorDrivers": {

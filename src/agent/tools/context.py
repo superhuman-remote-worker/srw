@@ -9,6 +9,7 @@ import hashlib
 import logging
 import posixpath
 import re
+import threading
 from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -34,6 +35,7 @@ from shared.runtime.core.product_capabilities import (
     ProductComponent,
     ProvenanceStatus,
 )
+from agent.core.phase import live_session_replan_reason
 from agent.core.workspace import WorkspaceManager
 
 logger = logging.getLogger(__name__)
@@ -348,6 +350,21 @@ class ToolContext:
         # todo, so it is also the only in-flight adaptation path once phases
         # get large.
     )
+    _live_session_end: Optional[str] = (
+        None  # Why the job's own live session ended (``end_live_session``,
+        # called by the voice subagent's runtime). Consumed by check_todos,
+        # which writes the ``live_session_ended`` state flag.
+    )
+    _live_lease: Optional[Any] = field(
+        default=None, repr=False
+    )  # LiveLease: the job's lease for its live connector, read from the job
+    # payload in process (agent.py). The voice subagent's pod calls carry it;
+    # it never enters config, state or the workspace.
+    _phase_request_lock: Any = field(
+        default_factory=threading.Lock, repr=False, compare=False
+    )  # Guards the replan request and the live-session end: the runtime sets
+    # them on the event loop while check_todos (a sync node) may run in a
+    # worker thread.
     _reply_drain_requested: bool = (
         False  # A todo just completed — a natural break at which to deliver
         # queued (non-urgent) replies. Set by todo_complete, consumed by
@@ -1068,12 +1085,38 @@ class ToolContext:
 
         Called from ``request_replan``. Sync-safe; consumed by ``check_todos``.
         """
-        self._replan_request = reason
+        with self._phase_request_lock:
+            self._replan_request = reason
 
     def consume_replan_request(self) -> Optional[str]:
         """Return and clear any pending replan request."""
-        reason = self._replan_request
-        self._replan_request = None
+        with self._phase_request_lock:
+            reason = self._replan_request
+            self._replan_request = None
+        return reason
+
+    def end_live_session(self, reason: str) -> None:
+        """The job's own live session ended: ask for the strategic phase.
+
+        Called by the subagent runtime when the primary voice subagent
+        settles because its session ended. Parks the reason for the
+        ``live_session_ended`` state flag and requests the replan (``live
+        session ended: <reason>``) in one step, so ``check_todos`` never sees
+        one without the other.
+        """
+        with self._phase_request_lock:
+            self._live_session_end = str(reason or "ended")
+            self._replan_request = live_session_replan_reason(self._live_session_end)
+
+    def consume_live_session_end(self) -> Optional[str]:
+        """Return and clear a pending live-session end (and its replan)."""
+        with self._phase_request_lock:
+            reason = self._live_session_end
+            self._live_session_end = None
+            if reason is not None and self._replan_request == (
+                live_session_replan_reason(reason)
+            ):
+                self._replan_request = None
         return reason
 
     def request_reply_drain(self) -> None:

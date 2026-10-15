@@ -18,6 +18,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from fastapi import HTTPException
+from pydantic import ValidationError
 
 from orchestrator.database.postgres import (
     DatasourceMaterializationAuthorizationError,
@@ -28,6 +29,7 @@ from orchestrator.schemas.thread_admission import (
     ThreadCreateRequest,
     TrustedThreadSeed,
 )
+from orchestrator.schemas.agent_child_threads import AgentThreadCreateRequest
 from orchestrator.services import thread_admission as ta
 from orchestrator.services.default_experts import ExpertSelection
 
@@ -268,6 +270,28 @@ class TestConfigOverrideRebuild:
             dependencies=_deps(),
         )
         assert override["interactive"]["permission_mode"] == "autonomous"
+
+    @pytest.mark.parametrize("mode", ["supervised", "auto_accept", "autonomous", None])
+    def test_valid_permission_modes_and_none_are_accepted(self, mode):
+        assert ThreadCreateRequest(permission_mode=mode).permission_mode == mode
+
+    def test_unknown_permission_mode_is_rejected_naming_the_allowed_values(self):
+        with pytest.raises(ValidationError) as exc:
+            ThreadCreateRequest(permission_mode="default")
+        text = str(exc.value)
+        for allowed in ("supervised", "auto_accept", "autonomous"):
+            assert allowed in text
+
+    @pytest.mark.parametrize("mode", ["supervised", "auto_accept", "autonomous"])
+    def test_child_thread_schema_accepts_valid_permission_modes(self, mode):
+        assert AgentThreadCreateRequest(permission_mode=mode).permission_mode == mode
+
+    def test_child_thread_schema_rejects_unknown_permission_mode(self):
+        with pytest.raises(ValidationError) as exc:
+            AgentThreadCreateRequest(permission_mode="default")
+        text = str(exc.value)
+        for allowed in ("supervised", "auto_accept", "autonomous"):
+            assert allowed in text
 
     def test_the_workspace_tier_is_honored_at_create(self):
         override, _ = ta.build_session_config_override(

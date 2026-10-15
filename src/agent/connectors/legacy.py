@@ -261,6 +261,11 @@ def _lease_entries(entry: Mapping[str, Any], spec: DriverSpec) -> list[BindingEn
     # be (``credentials``), so every path that strips credentials from a
     # payload (checkpoints, audit) strips the token too. An entry it could
     # not lease carries none and delivers nothing.
+    if spec.live:
+        # A live driver's lease is for the job's voice subagent, which reads
+        # it from the payload in process (agent.subagents.live). A live job
+        # may have no workspace, and its token never belongs in one.
+        return []
     lease = _mapping(_credentials(entry).get("lease"))
     value = {
         key: lease.get(source)

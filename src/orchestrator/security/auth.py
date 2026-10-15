@@ -82,6 +82,12 @@ def _merge_identity_claims(access_claims: dict, id_claims: dict | None) -> dict:
     return merged
 
 
+def _has_usable_subject(claims: dict) -> bool:
+    """True when the claims carry a non-blank string ``sub``."""
+    sub = claims.get("sub")
+    return isinstance(sub, str) and bool(sub.strip())
+
+
 async def get_current_user(request: Request, db) -> dict:
     """FastAPI dependency: resolve the current user.
 
@@ -132,6 +138,8 @@ async def get_current_user(request: Request, db) -> dict:
     if token.count(".") == 2:
         claims = oidc_validator.validate_token(token)
         if not claims:
+            raise HTTPException(status_code=401, detail="Invalid or expired token")
+        if not _has_usable_subject(claims):
             raise HTTPException(status_code=401, detail="Invalid or expired token")
         return await _resolve_user_from_claims(claims, db)
     raise HTTPException(status_code=401, detail="Unrecognized token format")
@@ -199,8 +207,10 @@ async def _resolve_from_cookie(session_id: str, db) -> dict | None:
     # resolution works regardless of the client's mapper config.
     id_claims = oidc_validator.decode_id_token(sess["id_token"]) or {}
     claims = _merge_identity_claims(claims, id_claims)
-    if "sub" not in claims:
-        logger.warning("Session %s tokens have no sub claim — killing", session_id)
+    if not _has_usable_subject(claims):
+        logger.warning(
+            "Session %s tokens have no usable sub claim — killing", session_id
+        )
         await db.delete_srw_session(session_id)
         return None
 
@@ -387,6 +397,8 @@ async def _resolve_user_from_claims(claims: dict, db) -> dict:
                 email=email,
                 display_name=display_name,
                 preferred_username=preferred_username,
+                db=db,
+                user_id=user.get("id"),
             )
         )
         asyncio.create_task(
@@ -642,8 +654,13 @@ async def _ensure_cloud_user(
     email: str,
     display_name: str,
     preferred_username: str | None,
+    db: Any = None,
+    user_id: Any = None,
 ) -> None:
     """Background call to the active main-cloud backend's ensure_user.
+
+    With ``db`` and ``user_id`` a resolved account seeds the user's cloud
+    identity cache, so their first session shares without a lookup.
 
     The router arrives through ``set_provisioning_backends`` rather than an
     import of the application module (R1.B02 caller-boundary closure).
@@ -660,7 +677,7 @@ async def _ensure_cloud_user(
         backend = main_cloud_router.for_owner({"keycloak_sub": sub, "email": email})
         if not backend.is_initialized:
             return
-        await backend.ensure_user(
+        resolved = await backend.ensure_user(
             sub=sub,
             # No OIDC claims at approval time → fall back to the backend's
             # configured Keycloak issuer.
@@ -669,6 +686,10 @@ async def _ensure_cloud_user(
             display_name=display_name,
             preferred_username=preferred_username,
         )
+        if resolved and db is not None and user_id:
+            from orchestrator.services.cloud.identity import remember_user_identity
+
+            await remember_user_identity(db, str(user_id), backend.backend_id, resolved)
     except Exception as e:
         logger.warning("Main-cloud ensure_user failed for sub=%s: %s", sub, e)
 

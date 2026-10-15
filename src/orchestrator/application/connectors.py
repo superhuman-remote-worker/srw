@@ -56,6 +56,11 @@ from orchestrator.services.connector_bind_time import (
 from orchestrator.services.connector_bind_time_launch import RESULT_PATH
 from orchestrator.services.connector_driver_registrations import DriverTrustPolicy
 from orchestrator.services.connector_service_images import ServiceImageSettings
+from orchestrator.services.live.exchange import (
+    LIVE_PREFIX,
+    MAX_LIVE_BODY_BYTES,
+    LiveExchange,
+)
 from shared.oci_registry import DEFAULT_TOKEN_HOSTS, RegistryResolver
 
 logger = logging.getLogger(__name__)
@@ -92,12 +97,24 @@ class BodyLimit:
         *,
         limit: int = MAX_BODY_BYTES,
         path_limits: dict[str, int] | None = None,
+        prefix_limits: dict[str, int] | None = None,
     ) -> None:
         self.app = app
         self.limit = int(limit)
         self.path_limits = {
             path: int(value) for path, value in (path_limits or {}).items()
         }
+        self.prefix_limits = {
+            prefix: int(value) for prefix, value in (prefix_limits or {}).items()
+        }
+
+    def _limit_for(self, path: str) -> int:
+        if path in self.path_limits:
+            return self.path_limits[path]
+        for prefix, value in self.prefix_limits.items():
+            if path.startswith(prefix):
+                return value
+        return self.limit
 
     async def _refuse(self, send: Send) -> None:
         await send(
@@ -118,7 +135,7 @@ class BodyLimit:
         if scope.get("type") != "http":
             await self.app(scope, receive, send)
             return
-        limit = self.path_limits.get(scope.get("path") or "", self.limit)
+        limit = self._limit_for(scope.get("path") or "")
         for name, value in scope.get("headers") or ():
             if name.lower() == b"content-length":
                 try:
@@ -552,6 +569,12 @@ def connector_lease_exchange_app(resources: ApplicationResources) -> FastAPI:
     )
     # Bind-time driver pods post their outcome here (D6).
     app.state.driver_operations_store_factory = lambda: resources.postgres_db
+    # Live connector pods report their sessions here (live_session_jobs §5.5).
+    app.state.live_exchange_factory = lambda: LiveExchange(
+        db=resources.postgres_db,
+        ledger=resources.usage_ledger,
+        service_hosting=hosting,
+    )
     # Its denials are logged coalesced, as the exchange's are recorded.
     app.state.driver_result_limiter = DenialLimiter()
 
@@ -585,7 +608,12 @@ def exchange_server_config(app: Any) -> uvicorn.Config:
     address is always the socket peer, never an ``X-Forwarded-For`` value.
     """
     return uvicorn.Config(
-        BodyLimit(app, path_limits={RESULT_PATH: MAX_RESULT_BYTES}),
+        BodyLimit(
+            app,
+            path_limits={RESULT_PATH: MAX_RESULT_BYTES},
+            # A live pod's journal batches (live_session_jobs.md §5.5).
+            prefix_limits={LIVE_PREFIX: MAX_LIVE_BODY_BYTES},
+        ),
         ws="none",
         lifespan="off",
         proxy_headers=False,

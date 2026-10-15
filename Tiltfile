@@ -470,6 +470,17 @@ docker_build(
     only=['drivers/git-swap/', 'docker/Dockerfile.driver-git-swap'],
 )
 
+# Phone-line driver (live-session jobs): srw.gpt-live-sip/v1, the standing
+# pod of a phone-line connector that holds its calls at GPT-Live. A product
+# driver (CI publishes it); the k3d profile turns it on
+# (connectors.drivers.gptLiveSip) and scripts/live_fake_call.py drives it.
+docker_build(
+    'srw-driver-gpt-live-sip',
+    context='.',
+    dockerfile='docker/Dockerfile.driver-gpt-live-sip',
+    only=['drivers/gpt-live-sip/', 'docker/Dockerfile.driver-gpt-live-sip'],
+)
+
 # The in-pod plane (connector drivers D7): the privileged FUSE opener and the
 # unprivileged cloud mount supervisor every session workspace Pod with cloud
 # folders runs as native sidecars. Product images (CI publishes them); the
@@ -504,6 +515,7 @@ _srw_images = [
     ('srw-driver-mcp-front', 'connectors.drivers.mcpFront.image.repository', 'connectors.drivers.mcpFront.image.tag'),
     ('srw-driver-mcp-test', 'connectors.drivers.mcpTest.image.repository', 'connectors.drivers.mcpTest.image.tag'),
     ('srw-driver-git-swap', 'connectors.drivers.gitSwap.image.repository', 'connectors.drivers.gitSwap.image.tag'),
+    ('srw-driver-gpt-live-sip', 'connectors.drivers.gptLiveSip.image.repository', 'connectors.drivers.gptLiveSip.image.tag'),
     ('srw-fuse-opener', 'connectors.inPodPlane.opener.image.repository', 'connectors.inPodPlane.opener.image.tag'),
     ('srw-cloud-mount', 'connectors.inPodPlane.rclone.image.repository', 'connectors.inPodPlane.rclone.image.tag'),
 ]
@@ -521,7 +533,7 @@ for i in range(len(_srw_images)):
     _srw_helm_env['TILT_IMAGE_KEY_TAG_%s' % i] = _srw_images[i][2]
     # These chart images also accept a digest, which outranks the tag. Tilt
     # owns the local image selection, including a pin saved by an earlier gate.
-    if _srw_images[i][0] in ['srw-mcp', 'srw-vm-preparer', 'srw-driver-shim', 'srw-driver-echo', 'srw-driver-mcp-front', 'srw-driver-mcp-test', 'srw-driver-git-swap', 'srw-fuse-opener', 'srw-cloud-mount']:
+    if _srw_images[i][0] in ['srw-mcp', 'srw-vm-preparer', 'srw-driver-shim', 'srw-driver-echo', 'srw-driver-mcp-front', 'srw-driver-mcp-test', 'srw-driver-git-swap', 'srw-driver-gpt-live-sip', 'srw-fuse-opener', 'srw-cloud-mount']:
         _srw_helm_env['TILT_IMAGE_KEY_DIGEST_%s' % i] = _srw_images[i][2][:-4] + '.digest'
 
 _srw_exposure_mode = os.getenv('SRW_EXPOSURE_MODE') or 'multi-host'

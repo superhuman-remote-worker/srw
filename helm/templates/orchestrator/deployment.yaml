@@ -62,6 +62,9 @@ spec:
         # Native admission reads these values at startup. Operator changes must
         # replace the process even when the optional Reloader is disabled.
         checksum/manifest-hosting: {{ toJson .Values.manifestHosting | sha256sum | quote }}
+        # The CA is read once at startup, by this process and by every pod
+        # the provisioners build afterwards.
+        checksum/trust-ca: {{ toJson (.Values.trust | default dict) | sha256sum | quote }}
         checksum/workspace-cleanup-reconciliation: {{ dict "enabled" $workspaceCleanupProtocol | toJson | sha256sum | quote }}
         # Activation and deactivation must replace every orchestrator even
         # without Reloader. This switch only admits new v1 startup receipts.
@@ -605,6 +608,26 @@ spec:
                 configMapKeyRef:
                   name: {{ include "srw.configMapName" . }}
                   key: WORKSPACE_PATH
+            - name: MANIFEST_NAMESPACE
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: MANIFEST_NAMESPACE
+            - name: MANIFEST_NETWORK_ISOLATION_VERIFIED
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: MANIFEST_NETWORK_ISOLATION_VERIFIED
+            - name: MANIFEST_MAX_CONCURRENT_JOBS
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: MANIFEST_MAX_CONCURRENT_JOBS
+            - name: MANIFEST_HARNESS_EGRESS
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: MANIFEST_HARNESS_EGRESS
             - name: WORKSPACE_STORAGE_CLASS
               valueFrom:
                 configMapKeyRef:
@@ -807,7 +830,7 @@ spec:
             - name: SESSION_PUBLIC_ORIGIN
               value: ""
             - name: SESSION_INGRESS_HOST
-              value: {{ .Values.sessionRouter.ingressHost | default (printf "api.%s" .Values.global.domain) | quote }}
+              value: {{ .Values.sessionRouter.ingressHost | default (include "srw.host" (dict "context" . "key" "api" "default" "api")) | quote }}
             - name: SESSION_INGRESS_CLASS
               value: {{ .Values.sessionRouter.ingressClass | default "traefik" | quote }}
             - name: SESSION_INGRESS_SINGLE_ORIGIN
@@ -980,6 +1003,31 @@ spec:
                   name: {{ include "srw.secretName" . }}
                   key: NEXTCLOUD_AGENT_PASSWORD
                   optional: true
+            # Nextcloud's per-user share-create limit (agent-service creates
+            # every share) and the replica count that shares it: each
+            # replica keeps its client bucket under its part of the limit.
+            # Bundled: nextcloud.rateLimits.shareCreate, which the setup hook
+            # also applies server side. External: cloud.shareRateLimit, else
+            # upstream's 20 per 600 s.
+            {{- $shareRateLimit := include "srw.nextcloudShareRateLimitJson" . | fromJson }}
+            - name: NEXTCLOUD_SHARE_RATE_LIMIT
+              value: {{ int $shareRateLimit.limit | quote }}
+            - name: NEXTCLOUD_SHARE_RATE_PERIOD_SECONDS
+              value: {{ int $shareRateLimit.periodSeconds | quote }}
+            - name: NEXTCLOUD_SHARE_RATE_REPLICAS
+              value: {{ max 1 (int .Values.orchestrator.replicas) | quote }}
+            {{- if and .Values.nextcloud.enabled .Values.nextcloud.internal }}
+            # Read-only facts about the bundled Nextcloud for the admin Main
+            # cloud page: whether the chart's cron container runs its
+            # background jobs, and the retention its setup hook pins. Unset
+            # for an external Nextcloud, whose settings the chart cannot see.
+            - name: NEXTCLOUD_CRON_ENABLED
+              value: {{ ternary "true" "false" (.Values.nextcloud.cron.enabled | default false) | quote }}
+            - name: NEXTCLOUD_TRASHBIN_RETENTION
+              value: {{ include "srw.nextcloudTrashbinRetention" . | quote }}
+            - name: NEXTCLOUD_VERSIONS_RETENTION
+              value: {{ include "srw.nextcloudVersionsRetention" . | quote }}
+            {{- end }}
             {{- if and .Values.nextcloud.enabled (eq (include "srw.nextcloudProtectedEffectEnabled" .) "true") }}
             - name: NEXTCLOUD_PROTECTED_EFFECT_URL
               valueFrom:
@@ -2047,6 +2095,20 @@ spec:
             - name: CONNECTOR_MCP_FRONT_IMAGE
               value: {{ include "srw.imageRef" (dict "image" .Values.connectors.drivers.mcpFront.image) | quote }}
             {{- end }}
+            # The phone-line driver (srw.gpt-live-sip/v1, live-session jobs).
+            {{- with .Values.connectors.drivers.gptLiveSip }}
+            {{- if .enabled }}
+            {{- if not $.Values.connectors.servicePods.enabled }}
+            {{- fail "connectors.drivers.gptLiveSip.enabled needs connectors.servicePods.enabled: the phone-line driver is a service-plane driver" }}
+            {{- end }}
+            {{- if not .image.repository }}
+            {{- fail "connectors.drivers.gptLiveSip.enabled needs connectors.drivers.gptLiveSip.image.repository" }}
+            {{- end }}
+            # A digest pins it (tag@digest; CI stamps it), a tag alone follows.
+            - name: CONNECTOR_GPT_LIVE_SIP_IMAGE
+              value: {{ printf "%s:%s%s" .image.repository (.image.tag | default "latest") (ternary (printf "@%s" .image.digest) "" (ne (.image.digest | default "") "")) | quote }}
+            {{- end }}
+            {{- end }}
             # The git swap driver (connector drivers C3): what a token
             # repository it cannot serve gets (always rendered: it applies
             # with the driver off too), and, when it is on, its image and
@@ -2180,6 +2242,18 @@ spec:
             - name: AGENT_SSH_GATEWAY_HOST_KEY_SECRET
               value: {{ .Values.sshGateway.hostKeySecret | quote }}
             {{- end }}
+            {{- if include "srw.trustCaConfigMapName" . }}
+            # The operator's extra CA (values `trust.*`): this process trusts
+            # it (src/shared/tls_trust.py), and the provisioners mount the same
+            # ConfigMap into every agent and workspace pod. Appended at the end
+            # on purpose; see the note above.
+            - name: SRW_EXTRA_CA_FILE
+              value: /etc/srw/trust/ca.crt
+            - name: TRUST_CA_CONFIGMAP
+              value: {{ include "srw.trustCaConfigMapName" . | quote }}
+            - name: TRUST_CA_CONFIGMAP_KEY
+              value: {{ include "srw.trustCaConfigMapKey" . | quote }}
+            {{- end }}
           volumeMounts:
             - name: workspace
               mountPath: /workspace
@@ -2195,6 +2269,11 @@ spec:
             {{- if .Values.connectors.drivers.gitSwap.enabled }}
             - name: connector-driver-ca
               mountPath: /run/srw/connector-driver-ca
+              readOnly: true
+            {{- end }}
+            {{- if include "srw.trustCaConfigMapName" . }}
+            - name: srw-trust-ca
+              mountPath: /etc/srw/trust
               readOnly: true
             {{- end }}
           lifecycle:
@@ -2289,4 +2368,16 @@ spec:
                 path: tls.crt
               - key: tls.key
                 path: tls.key
+        {{- end }}
+        {{- if include "srw.trustCaConfigMapName" . }}
+        # The operator's extra CA (values `trust.*`). Not optional: a named
+        # ConfigMap that is missing should stop the pod, not leave the private
+        # endpoint failing its handshake later.
+        - name: srw-trust-ca
+          configMap:
+            name: {{ include "srw.trustCaConfigMapName" . }}
+            defaultMode: 0444
+            items:
+              - key: {{ include "srw.trustCaConfigMapKey" . | quote }}
+                path: ca.crt
         {{- end }}

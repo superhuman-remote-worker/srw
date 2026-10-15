@@ -97,6 +97,22 @@
   description: >-
     The todo list (YAML) used when a frozen job is resumed with human feedback:
     process the feedback, adapt the plan, and create corrective tactical todos.
+- kind: instructions
+  name: live_tactical_todos
+  group: "Instructions · worker (jobs)"
+  title: "Live session · tactical start"
+  description: >-
+    The first phase of a live-session job (YAML), which starts tactical with
+    its voice subagent attached: wait for the voice's questions and answer
+    them until the session ends.
+- kind: instructions
+  name: live_post_session_todos
+  group: "Instructions · worker (jobs)"
+  title: "Live session · after the session"
+  description: >-
+    The strategic phase after a live session ended (YAML), in place of the
+    phase-transition list: review the session, do the follow-ups, note
+    knowledge gaps, then complete the job or stage the next phase.
 
 # --- Settings (LLM inference params + execution limits) -----------------------
 # `name` is the matrix leaf; dotted names (limits.*) target LimitsConfig fields.

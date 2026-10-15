@@ -1,5 +1,6 @@
-"""The credential lease exchange routes (slice C2), and the result route
-bind-time driver pods post their outcome to (D6).
+"""The credential lease exchange routes (slice C2), the result route
+bind-time driver pods post their outcome to (D6), and the routes a live
+connector's pod reports its sessions on (live_session_jobs.md §5.5).
 
 These routes are mounted ONLY on the orchestrator's dedicated exchange port
 (``application.connectors.connector_lease_exchange_app``), never on the main
@@ -33,6 +34,13 @@ from orchestrator.services.connector_lease_exchange import (
     NO_STORE,
     ConnectorLeaseExchange,
     ExchangeOutcome,
+)
+from orchestrator.services.live.exchange import (
+    EventsBody,
+    LeaseBody,
+    LiveExchange,
+    LiveOutcome,
+    StateBody,
 )
 
 logger = logging.getLogger(__name__)
@@ -119,3 +127,94 @@ async def record_driver_result(request: Request) -> JSONResponse:
     if status != 200:
         return _result_denied(request, status, str(answer.get("error")))
     return JSONResponse(answer, status_code=status, headers=NO_STORE)
+
+
+# ---------------------------------------------------------------------------
+# Live connector pods (live_session_jobs.md §5.5)
+# ---------------------------------------------------------------------------
+
+
+def get_live_exchange(request: Request) -> LiveExchange:
+    return request.app.state.live_exchange_factory()
+
+
+def _live(outcome: LiveOutcome) -> JSONResponse:
+    return JSONResponse(outcome.body, status_code=outcome.status, headers=NO_STORE)
+
+
+async def _live_pod(request: Request):
+    exchange = get_live_exchange(request)
+    pod = await exchange.pod(_identity(request))
+    if pod is None:
+        return (
+            exchange,
+            None,
+            JSONResponse(
+                {"error": "not_a_live_driver_pod"}, status_code=401, headers=NO_STORE
+            ),
+        )
+    return exchange, pod, None
+
+
+@router.post("/v1/live/credential")
+async def live_credential(request: Request) -> JSONResponse:
+    """The engine credential of the pod's connector (identity only: a
+    standing pod holds no lease)."""
+    exchange, pod, refused = await _live_pod(request)
+    if refused is not None:
+        return refused
+    return _live(await exchange.credential(pod))
+
+
+@router.post("/v1/live/sessions/adopt")
+async def live_adopt(request: Request) -> JSONResponse:
+    exchange, pod, refused = await _live_pod(request)
+    if refused is not None:
+        return refused
+    return _live(await exchange.adopt(pod))
+
+
+async def _live_body(request: Request, model):
+    """The body, parsed only after the pod's identity was checked; 422
+    without echoing it."""
+    from pydantic import ValidationError
+
+    try:
+        return model.model_validate_json(await request.body()), None
+    except ValidationError:
+        return None, JSONResponse(
+            {"error": "invalid_request"}, status_code=422, headers=NO_STORE
+        )
+
+
+@router.post("/v1/live/sessions/{session_id}/state")
+async def live_state(request: Request, session_id: str) -> JSONResponse:
+    exchange, pod, refused = await _live_pod(request)
+    if refused is not None:
+        return refused
+    body, invalid = await _live_body(request, StateBody)
+    if invalid is not None:
+        return invalid
+    return _live(await exchange.state(pod, session_id, body))
+
+
+@router.post("/v1/live/sessions/{session_id}/events")
+async def live_events(request: Request, session_id: str) -> JSONResponse:
+    exchange, pod, refused = await _live_pod(request)
+    if refused is not None:
+        return refused
+    body, invalid = await _live_body(request, EventsBody)
+    if invalid is not None:
+        return invalid
+    return _live(await exchange.events(pod, session_id, body))
+
+
+@router.post("/v1/live/sessions/{session_id}/lease")
+async def live_lease(request: Request, session_id: str) -> JSONResponse:
+    exchange, pod, refused = await _live_pod(request)
+    if refused is not None:
+        return refused
+    body, invalid = await _live_body(request, LeaseBody)
+    if invalid is not None:
+        return invalid
+    return _live(await exchange.lease(pod, session_id, body))

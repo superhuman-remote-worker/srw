@@ -111,7 +111,7 @@ jobs:
           {
             echo
             echo "**A newer patch release is available.** Bump \`databases.*.cnpgImage\`"
-            echo "in \`helm/values.yaml\`; all five must move together."
+            echo "in \`helm/values.yaml\`; every database's pin must move together."
             echo
             echo "Every Postgres cluster performs a rolling restart when this changes,"
             echo "so take it in a window rather than alongside unrelated work."

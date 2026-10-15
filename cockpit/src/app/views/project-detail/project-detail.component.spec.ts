@@ -961,6 +961,23 @@ describe('ProjectDetailPageComponent cloud storage settings', () => {
     expect(de.projectDetail.settings.cloudAccessHint).toBeTruthy();
     expect('readOnlyAgent' in en.projectDetail.settings).toBe(false);
   });
+
+  it('says why a project has no folder, from the stored error kind', () => {
+    const {component} = createComponent();
+    const failed = en.projectDetail.settings.cloudFolderFailed as Record<string, string>;
+    const failedDe = de.projectDetail.settings.cloudFolderFailed as Record<string, string>;
+    const text = (kind: string) =>
+      failed[component.cloudFolderFailureKey(kind).split('.').pop() as string];
+
+    expect(text('already_exists')).toContain('Rename the project');
+    expect(text('permission_denied')).toContain('refused');
+    expect(text('unavailable')).toContain('could not be reached');
+    // Any kind the page has no text of its own for gets the general one.
+    expect(component.cloudFolderFailureKey('invalid_request')).toBe(
+      'projectDetail.settings.cloudFolderFailed.other',
+    );
+    expect(Object.keys(failedDe).sort()).toEqual(Object.keys(failed).sort());
+  });
 });
 
 describe("ProjectDetailPageComponent the project's own connectors", () => {

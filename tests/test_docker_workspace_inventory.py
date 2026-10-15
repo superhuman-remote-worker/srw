@@ -131,16 +131,20 @@ class _InventoryConnection:
             return (
                 None if workspace is None else {"workspace": copy.deepcopy(workspace)}
             )
-        if sql.startswith("SELECT status, completion_outcome_kind,"):
+        if sql.startswith("SELECT status, execution_lane, completion_outcome_kind,"):
             # Job deletion reads the pre-delete status for the Officer claim
-            # audit. This seam models workspace ownership only, so every
-            # represented job reports the same terminal status.
+            # audit and the immutable SRW runtime owner. This seam models
+            # Docker workspace ownership, so every represented Job is pinned.
+            assert "AS execution_harness_adapter" in sql
+            assert sql.endswith("FROM jobs WHERE id = $1 FOR UPDATE")
             return (
                 None
                 if str(args[0]) not in self.jobs
                 else {
                     "status": "completed",
+                    "execution_lane": "pinned",
                     "completion_outcome_kind": None,
+                    "execution_harness_adapter": None,
                 }
             )
         if sql.startswith("SELECT * FROM vm_job_creation_owners"):

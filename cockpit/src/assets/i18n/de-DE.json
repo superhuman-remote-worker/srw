@@ -503,7 +503,7 @@
   },
   "automations": {
     "title": "Automationen",
-    "subtitle": "Lasse Aufträge nach Zeitplan laufen. Alles andere geht über die API.",
+    "subtitle": "Jobs nach Zeitplan oder bei eingehenden Live-Sessions starten.",
     "new": "Neue Automation",
     "list": {
       "empty": "Noch keine Automationen",
@@ -523,7 +523,8 @@
         "label": "Gefiltert auf {{name}} · {{count}} Automation(en)",
         "fallbackName": "dieses Projekt",
         "clear": "Alle anzeigen"
-      }
+      },
+      "live": "Live · {{name}}"
     },
     "editor": {
       "titleCreate": "Neue Automation",
@@ -549,7 +550,20 @@
       "catchupHours": "Nachholfenster (Stunden)",
       "create": "Automation anlegen",
       "save": "Änderungen speichern",
-      "requiredMissing": "Name, Experte, Anweisung und ein gültiger Cron-Ausdruck sind Pflicht."
+      "requiredMissing": "Name, Expert und Prompt sind erforderlich. Für zeitgesteuerte Automations ist außerdem ein gültiger Cron-Ausdruck erforderlich.",
+      "trigger": "Trigger",
+      "schedule": "Zeitplan",
+      "incomingLive": "Eingehende Live-Session",
+      "liveConnectors": "Live-Connectors",
+      "primaryConnector": "Primärer Connector",
+      "additionalConnectors": "Weitere Connectors (optional)",
+      "noLiveConnectors": "Keine verfügbaren Live-Connectors. Unter Connectors eine Telefonleitung hinzufügen.",
+      "noLiveConnectorsChooseProject": "Keine verfügbaren Live-Connectors. Telefonleitungen eines Projekts erscheinen, sobald du oben dieses Projekt auswählst.",
+      "liveConnectorRequired": "Einen primären Live-Connector auswählen.",
+      "project": "Projekt",
+      "noProject": "Kein Projekt",
+      "projectPersonal": "(Persönlich)",
+      "projectFixed": "Beim Anlegen der Automation festgelegt; lässt sich nicht ändern."
     },
     "preview": {
       "timezoneNote": "Zeiten in {{tz}}. Der Orchestrator speichert intern in UTC und beachtet Sommerzeit automatisch.",
@@ -563,7 +577,8 @@
       "createKey": "API-Schlüssel anlegen"
     },
     "errors": {
-      "generic": "Etwas ist schiefgegangen. Bitte erneut versuchen."
+      "generic": "Etwas ist schiefgegangen. Bitte erneut versuchen.",
+      "liveConnectorTaken": "Bereits von Automation {{name}} verwendet"
     }
   },
   "sessions": {
@@ -664,6 +679,54 @@
     "legacyHeld": "Eine ältere Arbeitsbereichserstellung wird geprüft; ein Abschlussnachweis fehlt."
   },
   "jobs": {
+    "liveSessions": {
+      "title": "Live-Sessions",
+      "to": "an",
+      "duration": "Session-Dauer",
+      "transcript": "Live-Transkript",
+      "loading": "Transkript wird geladen…",
+      "waiting": "Warten auf das Gespräch…",
+      "empty": "Kein Transkript aufgezeichnet.",
+      "loadError": "Transkript konnte nicht aktualisiert werden.",
+      "jumpLatest": "Zum neuesten Beitrag",
+      "backoffice": "Rückfrage an das Backoffice",
+      "steering": "Steuerung:",
+      "followUps": "Follow-ups nach der Session",
+      "direction": {
+        "inbound": "Eingehend",
+        "outbound": "Ausgehend"
+      },
+      "status": {
+        "ringing": "Klingelt",
+        "active": "Live",
+        "ended": "Beendet",
+        "rejected": "Abgelehnt",
+        "failed": "Fehlgeschlagen"
+      },
+      "speaker": {
+        "caller": "Anrufer",
+        "assistant": "Sprachassistent",
+        "job": "Backoffice",
+        "recorder": "Session-System",
+        "unknown": "Sprecher"
+      },
+      "backofficeState": {
+        "pending": "Antwort ausstehend",
+        "answered": "Beantwortet",
+        "noted": "Notiert",
+        "followUp": "Follow-up"
+      },
+      "reason": {
+        "remote_hangup": "Anrufer hat aufgelegt",
+        "close_requested": "Telefonat auf Wunsch beendet",
+        "expired": "Zeitlimit des Telefonats erreicht",
+        "content": "Telefonat nach dem Gespräch beendet",
+        "connection_lost": "Verbindung verloren",
+        "recorder_lost": "Gesprächsaufzeichnung getrennt"
+      },
+      "connector": "Connector",
+      "usage": "Nutzung: {{seconds}} s"
+    },
     "pagination": {
       "label": "Seitennavigation",
       "current": "Seite {{page}}",
@@ -1138,7 +1201,7 @@
         "baseUrlPlaceholder": "Basis-URL (z.B. https://vllm.example/v1)",
         "apiKeyPlaceholder": "API-Key (optional)",
         "allowInsecure": "http:// erlauben (außerhalb lokaler Entwicklung nicht empfohlen)",
-        "confirmDelete": "Diesen System-Endpunkt löschen? Katalogeinträge, die darauf verweisen, schlagen fehl, bis sie in Admin · Models entfernt oder umgestellt sind.",
+        "confirmDelete": "Diesen System-Endpunkt löschen? Katalogeinträge, die darauf verweisen, schlagen fehl, bis sie in Einstellungen → Modelle → Katalog entfernt oder umgestellt sind.",
         "testButton": "Test",
         "testing": "Teste...",
         "testOk": "OK ({{status}})",
@@ -1146,7 +1209,7 @@
         "errorUrlScheme": "Basis-URL muss mit http:// oder https:// beginnen",
         "errorHttpNeedsOptIn": "http://-URLs erfordern die Checkbox 'http:// erlauben'.",
         "catalogHint": "Modelle dieses Endpunkts werden im Katalog verwaltet.",
-        "catalogHintLink": "Admin · Models öffnen →",
+        "catalogHintLink": "Einstellungen → Modelle → Katalog öffnen →",
         "editTitle": "Endpunkt bearbeiten",
         "apiKeyPlaceholderEdit": "API-Key (leer lassen, um bestehenden Key zu behalten)",
         "removeKey": "Bestehenden API-Key beim Speichern entfernen"
@@ -1173,7 +1236,8 @@
           "search": "Suche (primär)",
           "fetch": "Web-Abruf",
           "search_fallback": "Such-Fallback",
-          "rerank": "Rerank (Sortierung der Memory-Treffer)"
+          "rerank": "Rerank (Sortierung der Memory-Treffer)",
+          "live_voice": "Live Voice"
         }
       },
       "discovery": {
@@ -1185,6 +1249,13 @@
         "text": "Sie sehen die Daten aller Benutzer.",
         "showMine": "Nur meine anzeigen",
         "tooltip": "Zur Ansicht nur eigener Daten wechseln"
+      }
+    },
+    "catalog": {
+      "liveVoice": {
+        "adapter": "Live-Voice-Adapter",
+        "voice": "Stimme (optional)",
+        "onlyCapability": "Live Voice muss die einzige Capability sein."
       }
     }
   },
@@ -1593,6 +1664,24 @@
       "kinds": {
         "project": "Projekt",
         "user_root": "Benutzer-Root"
+      },
+      "jobs": {
+        "title": "Hintergrundjobs",
+        "mode": "Modus",
+        "ajaxNote": "Im AJAX-Modus laufen sie nur, solange jemand die Nextcloud-Weboberfläche geöffnet hat.",
+        "lastRun": "Letzter Lauf",
+        "never": "noch nie",
+        "stale": "überfällig",
+        "cronContainer": "Cron-Container",
+        "cronOn": "an, führt cron.php alle 5 Minuten aus",
+        "cronOff": "aus (nextcloud.cron.enabled ist false)",
+        "trashbin": "Papierkorb-Aufbewahrung",
+        "versions": "Versions-Aufbewahrung",
+        "retention": "Aufbewahrung",
+        "retentionExternal": "Wird vom Administrator dieser Nextcloud verwaltet.",
+        "retentionChart": "Vom Setup-Hook des Charts bei jedem Nextcloud-Start gesetzt.",
+        "retentionDisabled": "disabled: Nextcloud löscht Papierkorb und alte Dateiversionen nie von selbst; sie bleiben die Grundlage jeder Wiederherstellung.",
+        "staleNote": "In den letzten 15 Minuten wurde kein Lauf der Hintergrundjobs abgeschlossen, daher wartet die Bereinigung von Nextcloud (abgelaufene Tokens, Dateisperren). Prüfen Sie, ob cron.php läuft: im Cron-Container des Charts oder im Zeitplan des Servers."
       }
     },
     "helpers": {
@@ -1776,6 +1865,12 @@
       "folder": "Ordner",
       "cloudAccessHint": "Agenten erhalten diesen Ordner über seinen Konnektor, mit der Stufe aus Konnektoren → Cloud-Ordner (oder der für eine Session gewählten).",
       "cloudUnavailable": "Cloud-Speicher nicht verfügbar — nicht konfiguriert.",
+      "cloudFolderFailed": {
+        "nameTaken": "Dieses Projekt hat keinen Cloud-Ordner: In der Cloud gibt es schon Ordner mit seinem Namen und seinem Ausweichnamen. Benennen Sie das Projekt um; SRW versucht es erneut, wenn es geöffnet wird, höchstens einmal pro Stunde.",
+        "refused": "Dieses Projekt hat keinen Cloud-Ordner: Die Cloud hat SRWs Administratorkonto abgewiesen. SRW versucht es erneut, wenn das Projekt geöffnet wird, höchstens einmal pro Stunde.",
+        "unreachable": "Dieses Projekt hat keinen Cloud-Ordner: Die Cloud war nicht erreichbar. SRW versucht es erneut, wenn das Projekt geöffnet wird, höchstens einmal pro Stunde.",
+        "other": "Dieses Projekt hat keinen Cloud-Ordner: Das Anlegen ist fehlgeschlagen. SRW versucht es erneut, wenn das Projekt geöffnet wird, höchstens einmal pro Stunde."
+      },
       "workspaceNetwork": "Workspace-Netzwerk",
       "networkTier": "Egress-Stufe",
       "networkTierInternetOnly": "Nur Internet (Standard)",
@@ -2848,7 +2943,8 @@
       "gitea_mcp": "Gitea-MCP (verwaltet)",
       "cloud_folder": "Cloud-Ordner",
       "cloud_folder_checkout": "Ordner-Checkout",
-      "cloud_outbox": "Outbox"
+      "cloud_outbox": "Outbox",
+      "gpt_live_sip": "Telefonleitung (GPT-Live über SIP)"
     },
     "platform": {
       "kind": {
@@ -2902,6 +2998,7 @@
       "typeGroupManaged": "Verwaltet",
       "typeGroupCredentialFiles": "Anmeldedaten-Dateien",
       "typeGroupMcp": "MCP",
+      "typeGroupLive": "Live-Sitzungen",
       "optGeneric": "Generisch",
       "optRepository": "Repository",
       "optKb": "OKF Knowledge Base",
@@ -3158,6 +3255,13 @@
       "reindexed": "Neuindizierung der OKF Knowledge Base „{{name}}“ abgeschlossen ({{status}})",
       "reindexFailed": "Neuindizierung der OKF Knowledge Base fehlgeschlagen",
       "fileTooLarge": "Datei überschreitet 64 KB — Anmeldedaten-Dateien sind auf 64 KB begrenzt."
+    },
+    "liveWebhook": {
+      "label": "Webhook-URL für OpenAI",
+      "help": "Diese URL als Webhook im OpenAI-Projekt registrieren und das Signing Secret (whsec_…) in das Feld Webhook Secret einfügen.",
+      "copy": "URL kopieren",
+      "copied": "Kopiert",
+      "copyFailed": "Kopieren fehlgeschlagen. Die URL markieren und manuell kopieren."
     }
   },
   "connectorDrivers": {

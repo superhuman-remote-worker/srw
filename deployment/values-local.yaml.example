@@ -375,6 +375,13 @@ connectors:
         repository: srw-registry:5000/srw-driver-git-swap
         tag: dev
       fallback: token-in-url
+    # The phone-line driver (srw.gpt-live-sip/v1, live-session jobs): Tilt
+    # builds srw-driver-gpt-live-sip and overrides repository, tag and digest.
+    gptLiveSip:
+      enabled: true
+      image:
+        repository: srw-registry:5000/srw-driver-gpt-live-sip
+        tag: dev
     # The development stdio server (srw.mcp-stdio-test/v1, D5b): Docker's
     # stock mcp/memory image behind the front and the stdio bridge the front's
     # image carries, pulled from Docker Hub at the chart's pinned digest. The
@@ -402,7 +409,7 @@ connectors:
         tag: dev
 
 databases:
-  # Non-HA local default. All five PostgreSQL engines continue to inherit
+  # Non-HA local default. Every PostgreSQL engine continues to inherit
   # `statefulset`; no CloudNativePG operator is needed for this overlay.
   profile: single
   postgres:
@@ -421,6 +428,11 @@ databases:
     enabled: false
     storageSize: "5Gi"
   keycloak:
+    storageSize: "2Gi"
+  # The bundled Nextcloud's metadata (nextcloud.database.type: postgres). An
+  # existing local install stays on its SQLite file until converted; a new one
+  # installs here.
+  nextcloud:
     storageSize: "2Gi"
 
 # -----------------------------------------------------------------------------
@@ -537,6 +549,10 @@ nextcloud:
   replicas: 1
   objectStore:
     enabled: false
+  # Valkey cache + file locking (opt-in, see helm/README.md). Turning it off
+  # again later is handled by the setup hook.
+  # redis:
+  #   enabled: true
 
 # -----------------------------------------------------------------------------
 # OpenCloud — REMOVED from the local stack: Nextcloud (above) is the only

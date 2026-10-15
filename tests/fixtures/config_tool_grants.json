@@ -679,6 +679,26 @@
     "web_search",
     "write_file"
   ],
+  "receptionist": [
+    "delegate_agent",
+    "extract_webpage",
+    "job_complete",
+    "kb_list",
+    "kb_read",
+    "kb_search",
+    "kb_update",
+    "kb_write",
+    "list_agents",
+    "mark_complete",
+    "message_agent",
+    "next_phase_todos",
+    "request_replan",
+    "stop_agent",
+    "todo_complete",
+    "todo_list",
+    "wait_agent",
+    "web_search"
+  ],
   "scholar": [
     "annotate_source",
     "browser_back",

@@ -1,0 +1,119 @@
+{{- if (include "srw.nextcloudRedisEnabled" .) }}
+{{- $redis := .Values.nextcloud.redis }}
+{{- $limit := (($redis.resources | default dict).limits | default dict).memory | default "" }}
+{{- if not $limit }}
+{{- fail "nextcloud.redis.resources.limits.memory is required: Valkey's maxmemory is derived from it" }}
+{{- end }}
+{{- $maxMemoryMi := div (mul (include "srw.quantityToMi" $limit | int64) 3) 4 }}
+# Valkey for the bundled Nextcloud: distributed cache, transactional file
+# locking and PHP sessions. A cache, not a store: no RDB snapshots, no AOF.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "srw.nextcloudRedisHost" . }}
+  labels:
+    {{- include "srw.componentLabels" (dict "context" . "component" "nextcloud-redis") | nindent 4 }}
+spec:
+  replicas: 1
+  # Never two at once: file locks taken on the old instance would be invisible
+  # to the new one while the Service balances across both.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      {{- include "srw.componentSelectorLabels" (dict "context" . "component" "nextcloud-redis") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "srw.componentSelectorLabels" (dict "context" . "component" "nextcloud-redis") | nindent 8 }}
+    spec:
+      {{- with .Values.global.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: valkey
+          image: {{ $redis.image | quote }}
+          args:
+            - --save
+            - ""
+            - --appendonly
+            - "no"
+            - --requirepass
+            - $(NEXTCLOUD_REDIS_PASSWORD)
+            # Below the container limit, so allkeys-lru eviction (as in
+            # Nextcloud all-in-one) makes room before the OOM killer does.
+            # File-lock and session keys carry their own TTLs.
+            - --maxmemory
+            - {{ printf "%dmb" $maxMemoryMi | quote }}
+            - --maxmemory-policy
+            - allkeys-lru
+          env:
+            - name: NEXTCLOUD_REDIS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "srw.secretName" . }}
+                  key: NEXTCLOUD_REDIS_PASSWORD
+            # valkey-cli's password for the probes below.
+            - name: REDISCLI_AUTH
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "srw.secretName" . }}
+                  key: NEXTCLOUD_REDIS_PASSWORD
+          ports:
+            - name: valkey
+              containerPort: 6379
+              protocol: TCP
+          # valkey-cli exits 0 on a NOAUTH reply, so match the answer.
+          readinessProbe:
+            exec:
+              command: ["sh", "-c", "valkey-cli ping | grep -q PONG"]
+            periodSeconds: 5
+          livenessProbe:
+            exec:
+              command: ["sh", "-c", "valkey-cli ping | grep -q PONG"]
+            initialDelaySeconds: 10
+            periodSeconds: 15
+          resources:
+            {{- toYaml $redis.resources | nindent 12 }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "srw.nextcloudRedisHost" . }}
+  labels:
+    {{- include "srw.componentLabels" (dict "context" . "component" "nextcloud-redis") | nindent 4 }}
+spec:
+  type: ClusterIP
+  ports:
+    - name: valkey
+      port: 6379
+      targetPort: valkey
+      protocol: TCP
+  selector:
+    {{- include "srw.componentSelectorLabels" (dict "context" . "component" "nextcloud-redis") | nindent 4 }}
+---
+# Mandatory: agent Pods envFrom the whole application Secret,
+# NEXTCLOUD_REDIS_PASSWORD included, so only reachability keeps them out.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "srw.nextcloudRedisHost" . }}
+  labels:
+    {{- include "srw.componentLabels" (dict "context" . "component" "nextcloud-redis") | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "srw.componentSelectorLabels" (dict "context" . "component" "nextcloud-redis") | nindent 6 }}
+  policyTypes:
+    - Ingress
+  ingress:
+    # The Nextcloud Pod only: Apache, cron and the protected-effect pool.
+    - from:
+        - podSelector:
+            matchLabels:
+              {{- include "srw.componentSelectorLabels" (dict "context" . "component" "nextcloud") | nindent 14 }}
+      ports:
+        - port: 6379
+          protocol: TCP
+{{- end }}

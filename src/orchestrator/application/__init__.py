@@ -51,6 +51,9 @@ from orchestrator.services import (
 from orchestrator.services import ssh_access as ssh_access_operations
 from orchestrator.services.catalogue_resources import CatalogueResources
 from orchestrator.services.cloud import MainCloudRouter, build_backend
+from orchestrator.services.cloud.service_credentials import (
+    configure_service_credential_store,
+)
 from orchestrator.services.cloud_task_registry import CloudTaskRegistry
 from orchestrator.services.connector_drivers import builtin_connector_drivers
 from orchestrator.services.expert_catalog_contracts import ExpertCatalogState
@@ -211,8 +214,13 @@ def build_application_resources(
             echo_service_image=settings.connector_echo_driver_image or None,
             managed_mcp_images=settings.connector_managed_mcp_images,
             git_swap_image=connectors_composition.git_swap_image(settings, driver_ca),
+            gpt_live_sip_image=settings.connector_gpt_live_sip_image or None,
         ),
     )
+    # Where main-cloud adapters keep their service accounts' app passwords
+    # (bundled Nextcloud performance WP1b): process-wide, as the adapters
+    # are rebuilt outside any request (the instance registry, a reload).
+    configure_service_credential_store(postgres_db)
     # Credential leases (connector drivers C2): the window new leases are
     # issued with, process-wide like the provisioning backends below.
     connector_credential_leases.configure_lease_window(
@@ -248,6 +256,11 @@ def build_application_resources(
             "The development echo service driver (srw.echo-service/v1) is "
             "installed with image %s; it is for test clusters only",
             settings.connector_echo_driver_image,
+        )
+    if settings.connector_gpt_live_sip_image:
+        logger.info(
+            "The phone-line driver (srw.gpt-live-sip/v1) is installed with image %s",
+            settings.connector_gpt_live_sip_image,
         )
     for name, reference in sorted(settings.connector_managed_mcp_images.items()):
         logger.info("Managed MCP server %s is installed with image %s", name, reference)

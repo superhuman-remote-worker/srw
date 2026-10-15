@@ -141,8 +141,12 @@ from shared.runtime.core.model_registry import family_of
 from agent.core.phase import (
     handle_phase_transition,
     get_initial_strategic_todos,
+    get_live_post_session_todos,
+    get_live_tactical_todos,
     get_transition_strategic_todos,
     get_resume_strategic_todos,
+    live_session_end_for_boundary,
+    live_session_replan_reason,
 )
 from agent.core.phase_snapshot import PhaseSnapshotManager
 from agent.core.response_validator import validate_response
@@ -621,6 +625,7 @@ def create_init_strategic_todos_node(
     todo_manager: TodoManager,
     config: AgentConfig,
     tool_names: Optional[List[str]] = None,
+    tool_context: Optional[ToolContext] = None,
 ) -> Callable[[UniversalAgentState], Dict[str, Any]]:
     """Create the init_strategic_todos node for phase alternation.
 
@@ -628,13 +633,26 @@ def create_init_strategic_todos_node(
     enabling the agent to use tools for planning rather than relying
     on a toolless LLM.
 
+    A live-session job (``config.live_session``) starts tactical instead:
+    its session is already running, so its first phase handles it
+    (``live_tactical_todos``) and the strategic phase follows the session's
+    end (live_session_jobs §6.1).
+
     Used when use_phase_alternation=True.
     """
 
     def init_strategic_todos(state: UniversalAgentState) -> Dict[str, Any]:
         """Load predefined strategic todos and instructions context."""
         job_id = state.get("job_id", "unknown")
-        logger.info(f"[{job_id}] Initializing strategic todos for phase alternation")
+        # agent.subagents.live.live_session_block, read off the config.
+        block = (
+            config.extra.get("live_session") if isinstance(config.extra, dict) else None
+        )
+        live = isinstance(block, dict) and bool(block.get("session_id"))
+        logger.info(
+            f"[{job_id}] Initializing "
+            f"{'live tactical' if live else 'strategic'} todos for phase alternation"
+        )
 
         # Read task brief for context
         try:
@@ -678,17 +696,22 @@ def create_init_strategic_todos_node(
                 "knowledge-base/knowledge/features/virtual_directories.md."
             )
 
-        # Load predefined strategic todos from config template
-        strategic_todos = get_initial_strategic_todos(config, tool_names=tool_names)
+        # Load the first phase's predefined todos from config template
+        if live:
+            strategic_todos = get_live_tactical_todos(config, tool_names=tool_names)
+        else:
+            strategic_todos = get_initial_strategic_todos(config, tool_names=tool_names)
         todo_list = [todo.to_dict() for todo in strategic_todos]
         todo_manager.set_todos_from_list(todo_list)
 
-        # Initialize phase state on TodoManager for tool access
-        todo_manager.is_strategic_phase = True
-        todo_manager.phase_number = state.get("phase_number", 1)
+        # Initialize phase state on TodoManager for tool access. Phases count
+        # from 0 (create_initial_state agrees).
+        todo_manager.is_strategic_phase = not live
+        todo_manager.phase_number = 0
 
         logger.info(
-            f"[{job_id}] Loaded {len(strategic_todos)} predefined strategic todos"
+            f"[{job_id}] Loaded {len(strategic_todos)} predefined "
+            f"{'live tactical' if live else 'strategic'} todos"
         )
 
         # Audit initialization
@@ -703,11 +726,12 @@ def create_init_strategic_todos_node(
                 data={
                     "phase_alternation": True,
                     "strategic_todos": len(strategic_todos),
+                    "live_session": live,
                     "task_brief_length": len(task_brief),
                     "instructions_length": len(instructions),
                 },
                 metadata=state.get("metadata"),
-                phase="strategic",
+                phase="tactical" if live else "strategic",
                 phase_number=0,
             )
 
@@ -717,23 +741,47 @@ def create_init_strategic_todos_node(
             content_parts.append(task_brief)
         if instructions:
             content_parts.append(f"## Task Instructions\n\n{instructions}")
-        content_parts.append(
-            "You are starting in strategic mode. Work through the predefined todos "
-            "to understand the task, create a plan, and prepare todos for execution.\n\n"
-            "Your task brief is saved to `task_brief.md` in your workspace for reference."
-        )
+        if live:
+            content_parts.append(
+                "You are starting in tactical mode: this job's live session is "
+                "already running, and its voice subagent is attached (see the "
+                "delegate_agent call below). Handle the session until it ends; "
+                "the strategic phase follows its end.\n\n"
+                "Your task brief is saved to `task_brief.md` in your workspace "
+                "for reference."
+            )
+        else:
+            content_parts.append(
+                "You are starting in strategic mode. Work through the predefined todos "
+                "to understand the task, create a plan, and prepare todos for execution.\n\n"
+                "Your task brief is saved to `task_brief.md` in your workspace for reference."
+            )
         # The phase's todo list enters the history once, here; it is not
         # re-sent with every request (append-only context injection, D17).
         content_parts.append(todo_manager.format_for_injection())
         message = HumanMessage(content="\n\n".join(content_parts))
+        messages: List[Any] = [message]
+        # A live-session job starts with its voice subagent attached: the
+        # delegate_agent call and receipt that ``attach_live_session``
+        # produced follow the task.
+        exchange = getattr(tool_context, "_initial_tool_exchange", None)
+        if exchange:
+            messages.extend(exchange)
+            tool_context._initial_tool_exchange = None
 
+        # The first phase's todos ride in the first checkpoint, so a restart
+        # before the first check_todos restores them instead of recovering.
+        todo_state = todo_manager.export_state()
         return {
-            "messages": [message],
+            "messages": messages,
             "initialized": True,
-            "is_strategic_phase": True,
+            "is_strategic_phase": not live,
             "phase_number": 0,
             "phase_complete": False,
             "goal_achieved": False,
+            "todos": todo_state["todos"],
+            "staged_todos": todo_state["staged_todos"],
+            "todo_next_id": todo_state["next_id"],
         }
 
     return init_strategic_todos
@@ -3299,6 +3347,23 @@ def create_check_todos_node(
     def check_todos(state: UniversalAgentState) -> Dict[str, Any]:
         """Check if all todos are complete."""
         job_id = state.get("job_id", "unknown")
+        live_updates = _take_live_session_end(state, tool_context)
+        result = _check_todos(state, live_updates)
+        if live_updates:
+            messages = list(live_updates.pop("messages", []))
+            if messages:
+                result["messages"] = messages + list(result.get("messages") or [])
+            result.update(live_updates)
+            logger.info(
+                f"[{job_id}] Live session ended: "
+                f"{live_updates['live_session_ended']['reason']}"
+            )
+        return result
+
+    def _check_todos(
+        state: UniversalAgentState, live_updates: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        job_id = state.get("job_id", "unknown")
 
         # Replan requested: end the phase now, keeping every todo exactly as it
         # is. This is the only way out of a tactical phase without completing
@@ -3307,9 +3372,19 @@ def create_check_todos_node(
         # knows are pointless. Deliberately does NOT clear or archive-as-failed
         # anything — archive_phase records the real statuses at the boundary,
         # which is what the incoming strategic phase needs to decide what to
-        # keep.
+        # keep. The end of the job's live session ends a tactical phase the
+        # same way (its runtime requested the replan).
         if tool_context is not None:
             replan_reason = tool_context.consume_replan_request()
+            if replan_reason and not live_updates:
+                # The runtime parks the end and its replan together: one seen
+                # without the other was parked in between the two reads.
+                live_updates.update(_take_live_session_end(state, tool_context))
+            live_end = live_updates.get("live_session_ended")
+            if live_end and not state.get("is_strategic_phase", True):
+                replan_reason = replan_reason or live_session_replan_reason(
+                    live_end["reason"]
+                )
             if replan_reason:
                 todo_state = todo_manager.export_state()
                 logger.info(f"[{job_id}] Replan requested — ending phase early")
@@ -3365,6 +3440,13 @@ def create_check_todos_node(
             if phase_number == 0:
                 # Initial strategic phase
                 strategic_todos = get_initial_strategic_todos(
+                    config, tool_names=tool_names
+                )
+            elif live_session_end_for_boundary(
+                {**state, "phase_number": phase_number - 1}
+            ):
+                # The phase right after the job's live session ended
+                strategic_todos = get_live_post_session_todos(
                     config, tool_names=tool_names
                 )
             else:
@@ -3437,6 +3519,43 @@ def create_check_todos_node(
         }
 
     return check_todos
+
+
+def _take_live_session_end(
+    state: UniversalAgentState, tool_context: Optional[ToolContext]
+) -> Dict[str, Any]:
+    """The state updates for a live-session end the runtime parked, if any.
+
+    The ``live_session_ended`` flag records the reason and the phase that took
+    in the end: in a tactical phase the end closes that phase, and its
+    boundary loads the post-session todos (``on_tactical_phase_complete``).
+    A strategic phase (the job left the session's phase early) only learns
+    the news; its own todos go on.
+    """
+    consume = getattr(tool_context, "consume_live_session_end", None)
+    if not callable(consume):
+        return {}
+    reason = consume()
+    if not isinstance(reason, str) or not reason:
+        return {}
+    updates: Dict[str, Any] = {
+        "live_session_ended": {
+            "reason": reason,
+            "phase_number": state.get("phase_number", 0),
+        }
+    }
+    if state.get("is_strategic_phase", True):
+        updates["messages"] = [
+            HumanMessage(
+                content=(
+                    f"[LIVE SESSION ENDED: {reason}] The live session is over. "
+                    "The voice subagent's final report reaches you as subagent "
+                    "evidence; take its follow-ups into this phase's work."
+                ),
+                additional_kwargs={PERSIST_ROLE_KEY: PERSIST_ROLE_EVENT},
+            )
+        ]
+    return updates
 
 
 def create_archive_phase_node(
@@ -4411,7 +4530,11 @@ def create_handle_transition_node(
         # deliberate replan or a failure. Cleared in the same breath so a stale
         # reason cannot steer a later phase.
         replan_reason = state.get("replan_reason")
-        if replan_reason:
+        if replan_reason and not is_strategic and live_session_end_for_boundary(state):
+            # The live session's end, not the agent, ended this phase: the
+            # phase marker carries the [LIVE SESSION ENDED] banner instead.
+            updates["replan_reason"] = None
+        elif replan_reason:
             replan_msg = HumanMessage(
                 content=(
                     "[REPLAN REQUESTED] The previous phase ended early and on "
@@ -5443,7 +5566,16 @@ def create_audited_tool_node(
 
     _all_tool_names = [t.name for t in tools]
     _phase_allowed: Dict[str, set] = {
-        "strategic": set(_filter_phase(_all_tool_names, "strategic")),
+        "strategic": set(_filter_phase(_all_tool_names, "strategic"))
+        | (
+            set(
+                getattr(
+                    getattr(config, "phase_settings", None), "strategic_tools", None
+                )
+                or ()
+            )
+            & set(_all_tool_names)
+        ),
         "tactical": set(_filter_phase(_all_tool_names, "tactical")),
     }
     # Only gate tools that have phase metadata in the registry.
@@ -6379,7 +6511,11 @@ def build_phase_alternation_graph(
         memory_manager, workspace_template, config
     )
     init_strategic_todos = create_init_strategic_todos_node(
-        workspace, todo_manager, config, tool_names=_tool_names
+        workspace,
+        todo_manager,
+        config,
+        tool_names=_tool_names,
+        tool_context=tool_context,
     )
     restore_todo_state = create_restore_todo_state_node(todo_manager)
     restore_from_feedback = create_restore_from_feedback_node(

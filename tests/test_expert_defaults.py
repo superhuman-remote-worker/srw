@@ -360,6 +360,7 @@ def test_scan_experts_lists_exactly_the_bundled_experts_with_unchanged_roles():
         "developer": "worker",
         "engineer": "worker",
         "general-worker": "worker",
+        "receptionist": "worker",
         "product-qa": "worker",
         "scholar": "worker",
         "writer": "worker",

@@ -60,6 +60,17 @@ def create_skill_tools(context: ToolContext) -> List[Any]:
             "then do what you can without the scripts."
         )
 
+    def _skill_header(skill_name: str) -> str:
+        """Name the skill and its base directory, as Claude Code's Skill tool
+        does. Portable skills refer to their files relative to the skill dir
+        (``scripts/with_server.py``), while the agent's tools resolve paths
+        against the workspace root."""
+        return (
+            f"[skill: {skill_name}]\n"
+            f"Base directory for this skill: skills/{skill_name}/ — paths in this "
+            "skill such as scripts/, references/ or examples/ are relative to it."
+        )
+
     @tool
     def use_skill(skill_name: str) -> str:
         """Load a skill's guidance (its SKILL.md body) into your context.
@@ -129,7 +140,7 @@ def create_skill_tools(context: ToolContext) -> List[Any]:
                     )
                 body = workspace.read_file(skill_md)
                 context.record_file_read(skill_md, body)
-                return f"[skill: {skill_name}]\n\n{body}{_script_availability_note(skill_name)}"
+                return f"{_skill_header(skill_name)}\n\n{body}{_script_availability_note(skill_name)}"
             except Exception as e:  # never raise to the model
                 logger.warning("use_skill(%s) failed: %s", skill_name, e)
                 return f"Error loading skill '{skill_name}': {e}"
@@ -155,7 +166,7 @@ def create_skill_tools(context: ToolContext) -> List[Any]:
                 )
             body = workspace.read_file(skill_md)
             context.record_file_read(skill_md, body)
-            return f"[skill: {skill_name}]\n\n{body}{_script_availability_note(skill_name)}"
+            return f"{_skill_header(skill_name)}\n\n{body}{_script_availability_note(skill_name)}"
         except Exception as e:  # never raise to the model
             logger.warning("use_skill(%s) failed: %s", skill_name, e)
             return f"Error loading skill '{skill_name}': {e}"

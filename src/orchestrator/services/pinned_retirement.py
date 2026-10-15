@@ -41,6 +41,7 @@ from shared.pinned_workspace_evidence import (
     soft_fenced_workspace,
 )
 from shared.pinned_vm_creation_retirement import (
+    bound_vm_without_source,
     initial_vm_creation_retirement_source,
     pre_registration_vm_agent_zero_source,
 )
@@ -616,12 +617,14 @@ class PinnedRetirementOperations:
         vm_creation_source = initial_vm_creation_retirement_source(context)
         vm_creation_zero = vm_creation_source is not None
         pre_registration_vm_without_vm = pre_registration_vm_agent_zero_source(context)
+        bound_vm_no_source = bound_vm_without_source(context)
         workspace_create_pending = bool(workspace_provision_intent)
         if (
             pre_provision_intent_zero
             or workspace_create_pending
             or vm_creation_zero
             or pre_registration_vm_without_vm
+            or bound_vm_no_source
         ):
             expected_protocol = "agent_runtime_zero_v1"
         elif backend == "sandbox":
@@ -651,6 +654,7 @@ class PinnedRetirementOperations:
             or workspace_create_pending
             or vm_creation_zero
             or pre_registration_vm_without_vm
+            or bound_vm_no_source
             else sandbox_generation
             if backend == "sandbox"
             else vm.get("provision_generation")
@@ -663,6 +667,7 @@ class PinnedRetirementOperations:
             or workspace_create_pending
             or vm_creation_zero
             or pre_registration_vm_without_vm
+            or bound_vm_no_source
             else sandbox_runtime
             if backend == "sandbox"
             else vm.get("vm_uid")
@@ -698,6 +703,16 @@ class PinnedRetirementOperations:
                 or (
                     receipt.get("vm_creation_request_id") is None
                     and receipt.get("vm_creation_provision_generation") is None
+                )
+            )
+            and (
+                not bound_vm_no_source
+                or (
+                    receipt.get("quiescence_actor") == "orchestrator"
+                    and receipt.get("vm_creation_request_id") is None
+                    and receipt.get("vm_creation_provision_generation") is None
+                    and receipt.get("agent_pod_name") == agent_pod.get("pod_name")
+                    and receipt.get("agent_pod_uid") == agent_pod.get("pod_uid")
                 )
             )
             and str(receipt.get("settle_status") or "")
@@ -1063,6 +1078,137 @@ class PinnedRetirementOperations:
             expected_workspace_runtime_incarnation=workspace_runtime or None,
         )
         return receipt is not None
+
+    async def _recover_bound_vm_no_source_agent_zero(
+        self, retirement: Mapping[str, Any], thread: Mapping[str, Any]
+    ) -> bool:
+        """Stop one bound, never-issued VM actor before releasing its Pod.
+
+        The finalizer keeps the exact Pod inspectable until all of its declared
+        containers are proven terminal and the G/T receipt is durable. A 404
+        before that receipt proves no such thing and remains retryable.
+        """
+
+        context = retirement.get("context")
+        if not bound_vm_without_source(context):
+            return False
+        thread_id = context["thread_id"]
+        generation = str(retirement.get("generation") or "")
+        token = str(retirement.get("token") or "")
+        current = await self.dependencies.store.get_thread(thread_id)
+        current_context = (current or {}).get("runtime_retirement_context")
+        metadata = (current or {}).get("metadata")
+        try:
+            if isinstance(current_context, str):
+                current_context = json.loads(current_context)
+            if isinstance(metadata, str):
+                metadata = json.loads(metadata)
+        except (TypeError, ValueError):
+            return False
+        existing = (current or {}).get("runtime_retirement_local_quiescence")
+        if not (
+            current
+            and current_context == context
+            and isinstance(metadata, Mapping)
+            and metadata.get("agent_pod") == context["agent_pod"]
+            and str(current.get("id") or "") == thread_id
+            and str(current.get("status") or "") == "created"
+            and str(current.get("runtime_generation") or "") == generation
+            and str(current.get("runtime_retirement_token") or "") == token
+            and current.get("runtime_retirement_authorized_at") is not None
+            and bool(current.get("runtime_retirement_permanent"))
+            == bool(retirement.get("permanent"))
+            and str(current.get("agent_id") or "") == context["agent_id"]
+            and str(current.get("runtime_attach_token") or "")
+            == context["runtime_attach_token"]
+            and str(current.get("control_admission_agent_id") or "")
+            in {"", context["agent_id"]}
+            and self.dependencies.agent_provisioner.is_available
+            and (
+                existing is not None
+                or await self.dependencies.store.fetchval(
+                    "SELECT public.pinned_vm_bound_no_vm_source($1::uuid,$2::uuid,$3::uuid)",
+                    thread_id,
+                    generation,
+                    token,
+                )
+            )
+        ):
+            return False
+        pod = context["agent_pod"]
+        pod_name = pod["pod_name"]
+        pod_uid = pod["pod_uid"]
+        namespace = pod["namespace"]
+        if existing is not None and not self._retirement_has_exact_local_quiescence(
+            retirement, current
+        ):
+            return False
+        try:
+            if not await self.dependencies.agent_provisioner.delete_agent_pod_exact(
+                pod_name, expected_pod_uid=pod_uid, namespace=namespace
+            ):
+                return False
+            terminal = await self._wait_for_captured_agent_pod_retired(
+                pod_name,
+                pod_uid,
+                namespace=namespace,
+                allowed={"exact_terminal", "exact_absent", "replacement"},
+            )
+            if terminal not in {"exact_terminal", "exact_absent", "replacement"}:
+                return False
+            if existing is None:
+                if (
+                    terminal != "exact_terminal"
+                    or not await self.dependencies.agent_provisioner.agent_pod_terminal_process_zero(
+                        pod_name,
+                        expected_pod_uid=pod_uid,
+                        namespace=namespace,
+                        require_protected_full_terminal=True,
+                    )
+                ):
+                    return False
+                receipt = await self.dependencies.store.acknowledge_pinned_thread_local_quiescence(
+                    thread_id,
+                    expected_runtime_generation=generation,
+                    expected_retirement_token=token,
+                    expected_agent_id=context["agent_id"],
+                    expected_attach_token=context["runtime_attach_token"],
+                    expected_settle_status=context["settle_status"],
+                    expected_quiescence_protocol="agent_runtime_zero_v1",
+                    expected_workspace_generation=None,
+                    expected_workspace_runtime_incarnation=None,
+                    quiescence_actor="orchestrator",
+                    expected_agent_pod_uid=pod_uid,
+                    require_zero_admission=True,
+                )
+                if receipt is None or not self._retirement_has_exact_local_quiescence(
+                    retirement,
+                    {"runtime_retirement_local_quiescence": receipt},
+                ):
+                    return False
+            if (
+                terminal == "exact_terminal"
+                and not await self.dependencies.agent_provisioner.release_agent_pod_finalizer_exact(
+                    pod_name,
+                    expected_pod_uid=pod_uid,
+                    namespace=namespace,
+                    terminal_required=True,
+                )
+            ):
+                return False
+            if terminal in {"exact_absent", "replacement"}:
+                return True
+            return await self._wait_for_captured_agent_pod_retired(
+                pod_name,
+                pod_uid,
+                namespace=namespace,
+                allowed={"exact_absent", "replacement"},
+            ) in {"exact_absent", "replacement"}
+        except Exception:
+            self.dependencies.logger.exception(
+                "Bound VM Agent Pod zero remains retryable for thread %s", thread_id
+            )
+            return False
 
     def _agent_pod_provision_intent_zero_candidate(
         self, retirement: Mapping[str, Any], thread: Mapping[str, Any]
@@ -2089,6 +2235,14 @@ class PinnedRetirementOperations:
                     )
                 )
 
+        # This actor is already bound, so the pre-registration shortcut cannot
+        # apply. The SQL predicate checks every current source/admission ledger
+        # under T; Pod waiting happens outside the lifecycle advisory lock.
+        if bound_vm_without_source(context):
+            return await self._recover_bound_vm_no_source_agent_zero(
+                retirement, current
+            )
+
         captured_workspace = context.get("workspace_container")
         captured_binding = context.get("workspace_binding")
         captured_workspace = {} if captured_workspace is None else captured_workspace
@@ -2912,7 +3066,14 @@ class PinnedRetirementOperations:
         # stopped, so settlement may answer first and the process exits itself.
         stopped_agent_pod_name: str | None = None
         stopped_agent_pod_uid: str | None = None
-        if cleanup_agent_pod:
+        bound_zero_cleanup = False
+        if bound_vm_without_source(context):
+            current = await self.dependencies.store.get_thread(thread_id)
+            bound_zero_cleanup = bool(
+                current
+                and self._retirement_has_exact_local_quiescence(retirement, current)
+            )
+        if cleanup_agent_pod or bound_zero_cleanup:
             captured_agent_pods = self._captured_retirement_agent_pods(retirement)
             if len(captured_agent_pods) > 1:
                 raise RuntimeError("captured retirement agent identities disagree")

@@ -9,7 +9,151 @@
 - name: OVERWRITECLIURL
   value: {{ include "srw.cloudUrl" . | quote }}
 {{- end -}}
+{{- /*
+Env for every container that runs Nextcloud's own PHP from the data volume:
+the Apache container and the cron container. The image's
+config/*.config.php files read it in every PHP process (reverse proxy, S3
+primary storage), so a background job must see what a web request sees. The
+admin, OIDC and agent-service secrets stay with the Apache container, whose
+setup hook is their only reader.
+
+The two retention values repeat the setup hook's pins as NC_* env, which
+Nextcloud reads ahead of config.php. A process that can run background jobs
+then has retention pinned from its first start, before the hook has run: the
+cron container starts alongside the Apache container, and its first cron.php
+can fire before the hook reaches the pins.
+*/ -}}
+{{- define "srw.nextcloudRuntimeEnv" -}}
+{{- if include "srw.singleOrigin" . -}}
+{{ include "srw.nextcloudSingleOriginEnv" . }}
+{{- else -}}
+- name: TRUSTED_PROXIES
+  value: "10.0.0.0/8 172.16.0.0/12 192.168.0.0/16"
+- name: OVERWRITEPROTOCOL
+  value: "https"
+{{- end }}
+{{- if .Values.nextcloud.objectStore.enabled }}
+# S3 primary storage (existing cluster MinIO). Disable via
+# nextcloud.objectStore.enabled=false to store files on the PVC
+# (filesystem) instead — e.g. local k3d, which has no MinIO.
+- name: OBJECTSTORE_S3_BUCKET
+  value: "srw-nextcloud"
+- name: OBJECTSTORE_S3_REGION
+  value: "us-east-1"
+- name: OBJECTSTORE_S3_HOST
+  value: "minio.minio.svc"
+- name: OBJECTSTORE_S3_PORT
+  value: "9000"
+- name: OBJECTSTORE_S3_SSL
+  value: "false"
+- name: OBJECTSTORE_S3_USEPATH_STYLE
+  value: "true"
+- name: OBJECTSTORE_S3_AUTOCREATE
+  value: "true"
+- name: OBJECTSTORE_S3_KEY
+  valueFrom:
+    secretKeyRef:
+      name: {{ include "srw.secretName" . }}
+      key: NEXTCLOUD_S3_ACCESS_KEY
+- name: OBJECTSTORE_S3_SECRET
+  valueFrom:
+    secretKeyRef:
+      name: {{ include "srw.secretName" . }}
+      key: NEXTCLOUD_S3_SECRET_KEY
+{{- end }}
+{{- if (include "srw.nextcloudUsesPostgres" .) }}
+# libpq's sslmode for Nextcloud's Postgres connections (databases.nextcloud.sslMode).
+- name: PGSSLMODE
+  value: {{ .Values.databases.nextcloud.sslMode | default "prefer" | quote }}
+{{- end }}
+{{- if (include "srw.nextcloudRedisEnabled" .) }}
+{{ include "srw.nextcloudRedisEnv" . }}
+{{- end }}
+- name: NC_trashbin_retention_obligation
+  value: {{ include "srw.nextcloudTrashbinRetention" . | quote }}
+- name: NC_versions_retention_obligation
+  value: {{ include "srw.nextcloudVersionsRetention" . | quote }}
+{{- end -}}
+{{- /*
+What the image entrypoint needs to INSTALL (first start) and to UPGRADE
+(new image version): the admin account, the database it installs into, and
+the trusted domains it records. Read only by the entrypoint's init block, which
+runs in the nextcloud-upgrade init container; the Apache container keeps the
+same env so that block finds nothing to do there but would still be complete.
+
+Not runtime env: an installed Nextcloud reads its connection from config.php.
+The NC_serverid each PHP container also needs is set per container, because
+33+ requires a distinct one per process family: its Snowflake ids
+(oc_jobs, previews) fall back to a hash of the hostname, which every
+container in the Pod shares.
+*/ -}}
+{{- define "srw.nextcloudInstallEnv" -}}
+- name: NEXTCLOUD_ADMIN_USER
+  value: "admin"
+- name: NEXTCLOUD_ADMIN_PASSWORD
+  valueFrom:
+    secretKeyRef:
+      name: {{ include "srw.secretName" . }}
+      key: NEXTCLOUD_ADMIN_PASSWORD
+{{- if (include "srw.nextcloudUsesPostgres" .) }}
+# Install-time only: the entrypoint reads these for the first install, after
+# which config.php holds the connection. Never set SQLITE_DATABASE alongside
+# them: the entrypoint checks it first and would install SQLite anyway.
+- name: POSTGRES_HOST
+  value: {{ include "srw.nextcloudDbHost" . | quote }}
+- name: POSTGRES_DB
+  value: {{ include "srw.nextcloudDbName" . | quote }}
+- name: POSTGRES_USER
+  {{- if .Values.databases.nextcloud.internal }}
+  value: "nextcloud"
+  {{- else }}
+  valueFrom:
+    secretKeyRef:
+      name: {{ include "srw.secretName" . }}
+      key: NEXTCLOUD_DB_USER
+  {{- end }}
+# Optional so an installed Nextcloud (which keeps its own copy in config.php)
+# still starts without it; a new install refuses in wait-for-nextclouddb.
+- name: POSTGRES_PASSWORD
+  valueFrom:
+    secretKeyRef:
+      name: {{ include "srw.secretName" . }}
+      key: NEXTCLOUD_DB_PASSWORD
+      optional: true
+# The installer otherwise creates its own oc_admin role with a password kept
+# only in config.php wherever it may (the StatefulSet superuser may, a
+# CloudNativePG owner may not). Pinned off, both engines connect as the
+# database owner with this password.
+- name: NC_setup_create_db_user
+  value: "false"
+{{- else }}
+- name: SQLITE_DATABASE
+  value: "nextcloud"
+{{- end }}
+- name: NEXTCLOUD_TRUSTED_DOMAINS
+  value: "{{ include "srw.fullname" . }}-nextcloud {{ (urlParse (include "srw.cloudUrl" .)).host }}"
+{{- end -}}
+{{- /*
+Server settings mounted as files into the image's include directories. They
+are read once at process start (subPath mounts never update in place), so the
+Pod carries their checksum and restarts when they change. Neither file is a
+protected-effect lane file: the lane digest does not cover them.
+*/ -}}
+{{- define "srw.nextcloudServerConfigData" -}}
+php-srw.ini: |
+  ; APCu backs Nextcloud's local memory cache. PHP's 32M default is too
+  ; small for Nextcloud; its all-in-one image uses 128M.
+  apc.shm_size=128M
+apache-mpm-prefork.conf: |
+  # Every Apache prefork worker is one PHP process. The image allows 150,
+  # more than the container's CPU and memory limits can serve; a smaller
+  # pool queues a burst instead (nextcloud.apache.maxRequestWorkers).
+  <IfModule mpm_prefork_module>
+      MaxRequestWorkers {{ int .Values.nextcloud.apache.maxRequestWorkers }}
+  </IfModule>
+{{- end -}}
 {{- if and .Values.nextcloud.enabled .Values.nextcloud.internal }}
+{{- $shareRateLimit := include "srw.nextcloudShareRateLimitJson" . | fromJson }}
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -40,6 +184,9 @@ data:
     # Fully idempotent — safe to re-run. Non-fatal — failures won't block startup.
     #
     # What this does:
+    #   0. Background jobs: pins trash/version retention and internal share
+    #      expiry off, and sets the background-job mode; S3 primary storage
+    #      skips its per-connection bucket check
     #   1. OIDC: Registers Keycloak as OpenID Connect provider
     #   2. OIDC: Enables group provisioning with whitelist regex
     #   3. Group Folders: Installs, updates and enables the groupfolders app
@@ -85,6 +232,81 @@ data:
     #    Required because Keycloak runs as an internal K8s service.
     # =========================================================================
     occ config:system:set allow_local_remote_servers --value=true --type=boolean 2>&1 || true
+
+    # =========================================================================
+    # 0a. Background jobs: retention and share expiry pinned, then the mode.
+    #     Background jobs expire trash and thin file versions, and new
+    #     internal shares can get a default expiry date. Versions and trash
+    #     are the only recovery floor (the object store keeps no history of
+    #     its own) and SRW's session shares must never expire, so today's
+    #     behaviour is pinned here, whichever mode runs the jobs. The
+    #     Apache and cron containers also carry the two retention values as
+    #     NC_* env, so the cron container's first run cannot race this hook.
+    #     Groupfolders' trash and versions expire through the same two keys.
+    # =========================================================================
+    occ config:system:set trashbin_retention_obligation --value={{ include "srw.nextcloudTrashbinRetention" . }} 2>&1 || true
+    occ config:system:set versions_retention_obligation --value={{ include "srw.nextcloudVersionsRetention" . }} 2>&1 || true
+    occ config:app:set core shareapi_default_internal_expire_date --value=no 2>&1 || true
+    occ config:app:set core shareapi_enforce_internal_expire_date --value=no 2>&1 || true
+    {{- if .Values.nextcloud.cron.enabled }}
+    # The cron container's first cron.php switches the mode itself; setting
+    # it here keeps the admin view right until then.
+    occ background:cron 2>&1 || true
+    {{- else }}
+    # No cron container, so jobs run from web requests (ajax). A mode an
+    # earlier cron container left at "cron" would run no jobs at all.
+    if [ "$(occ config:app:get core backgroundjobs_mode 2>/dev/null)" = "cron" ]; then
+        occ background:ajax 2>&1 || true
+    fi
+    {{- end }}
+    {{- if .Values.nextcloud.objectStore.enabled }}
+
+    # =========================================================================
+    # 0b. S3 primary storage: no bucket-exists check on every connection.
+    #     Nextcloud 31 creates a missing S3 bucket only through that check
+    #     (it does not read OBJECTSTORE_S3_AUTOCREATE for S3), so it stays on
+    #     until install has created the bucket; this hook only runs on an
+    #     installed Nextcloud. Config files are deep-merged, so the key
+    #     survives the image's s3.config.php. Set only on an existing
+    #     objectstore entry, never creating a partial one.
+    # =========================================================================
+    if occ config:system:get objectstore class >/dev/null 2>&1; then
+        occ config:system:set objectstore arguments verify_bucket_exists --value=false --type=boolean 2>&1 || true
+    fi
+    {{- end }}
+
+    # =========================================================================
+    # 0c. Share-create rate limit (nextcloud.rateLimits.shareCreate).
+    #     Nextcloud allows each user 20 new shares per 600 s. agent-service
+    #     creates every session and job-export share, so that per-user limit
+    #     is the installation's ceiling. The override is keyed by app,
+    #     controller and method in lower case, as RateLimitingMiddleware
+    #     builds it, not by the OCS route name. Settings persist in
+    #     config.php, so unset values delete the override rather than
+    #     leave the last one in place.
+    # =========================================================================
+    {{- if $shareRateLimit.override }}
+    occ config:system:set ratelimit_overwrite files_sharing.shareapi.createshare user limit --value={{ int $shareRateLimit.limit }} --type=integer 2>&1 || true
+    occ config:system:set ratelimit_overwrite files_sharing.shareapi.createshare user period --value={{ int $shareRateLimit.periodSeconds }} --type=integer 2>&1 || true
+    {{- else }}
+    occ config:system:delete ratelimit_overwrite files_sharing.shareapi.createshare 2>&1 || true
+    {{- end }}
+    {{- if not (include "srw.nextcloudRedisEnabled" .) }}
+
+    # =========================================================================
+    # 0d. Valkey off (nextcloud.redis.enabled=false): drop any Redis settings
+    #     config.php still holds. Every config write dumps the merged config,
+    #     redis.config.php's values included, into config.php, so removing
+    #     REDIS_HOST alone leaves Nextcloud pointing at a server that is gone.
+    # =========================================================================
+    if occ config:system:get memcache.locking 2>/dev/null | grep -q 'Redis' \
+        || occ config:system:get memcache.distributed 2>/dev/null | grep -q 'Redis'; then
+        echo "[nc-setup] Valkey is off: removing the Redis settings from config.php"
+        occ config:system:delete memcache.distributed 2>&1 || true
+        occ config:system:delete memcache.locking 2>&1 || true
+        occ config:system:delete redis 2>&1 || true
+    fi
+    {{- end }}
 
     # Allow OIDC login over plain HTTP (local dev without TLS reverse proxy).
     # Only effective when OVERWRITEPROTOCOL != https (i.e. dev environments).
@@ -175,6 +397,15 @@ data:
     exit 0
 ---
 apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "srw.fullname" . }}-nextcloud-server-config
+  labels:
+    {{- include "srw.componentLabels" (dict "context" . "component" "nextcloud") | nindent 4 }}
+data:
+  {{- include "srw.nextcloudServerConfigData" . | nindent 2 }}
+---
+apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
   name: {{ include "srw.fullname" . }}-nextcloud-data
@@ -212,73 +443,237 @@ spec:
     metadata:
       labels:
         {{- include "srw.componentSelectorLabels" (dict "context" . "component" "nextcloud") | nindent 8 }}
-      {{- if (eq (include "srw.nextcloudProtectedEffectEnabled" .) "true") }}
       annotations:
+        checksum/server-config: {{ include "srw.nextcloudServerConfigData" . | sha256sum | quote }}
+        # The setup hook applies the limit only when Nextcloud starts.
+        checksum/share-rate-limit: {{ include "srw.nextcloudShareRateLimitJson" . | sha256sum | quote }}
+        {{- if (eq (include "srw.nextcloudProtectedEffectEnabled" .) "true") }}
         checksum/protected-effect-config: {{ include "srw.nextcloudProtectedEffectConfigSha256" . | quote }}
-      {{- end }}
+        {{- end }}
     spec:
       {{- with .Values.global.imagePullSecrets }}
       imagePullSecrets:
         {{- toYaml . | nindent 8 }}
       {{- end }}
+      {{- if .Values.nextcloud.cron.enabled }}
+      # Covers the cron container's bounded wait for a running cron.php (its
+      # preStop). Apache, PHP-FPM and Nginx have no preStop and exit at once
+      # on SIGTERM, so none of their requests or handlers runs any longer.
+      terminationGracePeriodSeconds: 150
+      {{- end }}
       initContainers:
         - name: wait-for-keycloak
           image: busybox:1.36
           command: ["sh", "-c", "until nc -z -w 2 {{ include "srw.fullname" . }}-keycloak 8080; do sleep 2; done"]
+        {{- if (include "srw.nextcloudUsesPostgres" .) }}
+        # A new install must find a database it can log into: the image's
+        # entrypoint tries `maintenance:install` 11 times and then gives up for
+        # good, because version.php is already in place and no later start
+        # installs again. An installed Nextcloud uses the database its
+        # config.php names, with config.php's own credentials: on SQLite it
+        # does not wait for Postgres at all (an install that predates Postgres
+        # keeps running until it is converted), on Postgres it waits only for
+        # the server to answer.
+        - name: wait-for-nextclouddb
+          image: {{ .Values.databases.nextcloud.image }}
+          command:
+            - sh
+            - -c
+            - |
+              CONFIG=/var/www/html/config/config.php
+              if [ -f "$CONFIG" ] && grep -q "'installed' => true" "$CONFIG"; then
+                if grep -Eq "'dbtype' => 'sqlite3?'" "$CONFIG"; then
+                  echo "Installed on SQLite: not waiting for Postgres."
+                  exit 0
+                fi
+                until pg_isready -q; do
+                  echo "Installed on Postgres: waiting for $PGHOST:$PGPORT"
+                  sleep 2
+                done
+                exit 0
+              fi
+              if [ -z "$PGPASSWORD" ]; then
+                cat >&2 <<EOF
+              ============================================================
+              REFUSING TO INSTALL: NEXTCLOUD_DB_PASSWORD is not in the Secret.
+
+              Nextcloud is not installed yet and would install against
+              $PGUSER@$PGHOST/$PGDATABASE without a password. On ESO/Vault
+              clusters add NEXTCLOUD_DB_PASSWORD to the Vault bundle first;
+              the chart generates it only when secrets.create=true.
+              ============================================================
+              EOF
+                exit 1
+              fi
+              until pg_isready -q; do
+                echo "New install: waiting for $PGHOST:$PGPORT"
+                sleep 2
+              done
+              # Reachable is not enough: a CloudNativePG owner or StatefulSet
+              # superuser that cannot log in yet would burn the installer's
+              # retries. Wait until the install's own credentials work.
+              tries=0
+              until CONN_ERR=$(psql -tAc 'SELECT 1' 2>&1 >/dev/null); do
+                tries=$((tries + 1))
+                if [ "$tries" -ge 30 ]; then
+                  cat >&2 <<EOF
+              ============================================================
+              REFUSING TO INSTALL: cannot log into the Nextcloud database.
+
+              psql could not connect as $PGUSER@$PGHOST:$PGPORT/$PGDATABASE:
+
+                $CONN_ERR
+
+              This is a connectivity or credential fault. The usual cause is
+              a NEXTCLOUD_DB_PASSWORD that differs from the one the database
+              was initialised with.
+              ============================================================
+              EOF
+                  exit 1
+                fi
+                sleep 2
+              done
+              echo "New install: $PGUSER logs into $PGHOST/$PGDATABASE."
+          env:
+            - name: PGHOST
+              value: {{ include "srw.nextcloudDbHost" . | quote }}
+            - name: PGPORT
+              value: {{ include "srw.nextcloudDbPort" . | quote }}
+            - name: PGDATABASE
+              value: {{ include "srw.nextcloudDbName" . | quote }}
+            - name: PGUSER
+              {{- if .Values.databases.nextcloud.internal }}
+              value: "nextcloud"
+              {{- else }}
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "srw.secretName" . }}
+                  key: NEXTCLOUD_DB_USER
+              {{- end }}
+            - name: PGPASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "srw.secretName" . }}
+                  key: NEXTCLOUD_DB_PASSWORD
+                  optional: true
+            - name: PGSSLMODE
+              value: {{ .Values.databases.nextcloud.sslMode | default "prefer" | quote }}
+            - name: PGCONNECT_TIMEOUT
+              value: "5"
+          volumeMounts:
+            - name: data
+              mountPath: /var/www/html
+              readOnly: true
+        {{- end }}
+        {{- if (include "srw.nextcloudRedisEnabled" .) }}
+        # With Valkey configured every PHP request needs it (locking, sessions),
+        # the setup hook's occ calls included.
+        - name: wait-for-nextcloud-redis
+          image: busybox:1.36
+          command: ["sh", "-c", "until nc -z -w 2 {{ include "srw.nextcloudRedisHost" . }} 6379; do sleep 2; done"]
+        {{- end }}
+        # Nextcloud upgrades one major at a time. The entrypoint refuses a
+        # skip too, but only from inside a crash-looping Apache container;
+        # this says so up front, before anything touches the data.
+        - name: nextcloud-version-guard
+          image: {{ .Values.nextcloud.image | quote }}
+          command:
+            - sh
+            - -c
+            - |
+              set -eu
+              DATA=/var/www/html/version.php
+              IMAGE=/usr/src/nextcloud/version.php
+              # The major is the first number of $OC_Version, in either
+              # array syntax.
+              major() {
+                sed -n 's/^[[:space:]]*\$OC_Version[[:space:]]*=[^0-9]*\([0-9][0-9]*\).*/\1/p' "$1" | head -n 1
+              }
+              if [ ! -f "$DATA" ]; then
+                echo "No Nextcloud installed yet: nothing to upgrade from."
+                exit 0
+              fi
+              installed=$(major "$DATA")
+              image=$(major "$IMAGE")
+              for value in "$installed" "$image"; do
+                case "$value" in
+                  ''|*[!0-9]*)
+                    echo "REFUSING TO START: cannot read the Nextcloud major from $DATA or $IMAGE." >&2
+                    exit 1
+                    ;;
+                esac
+              done
+              if [ "$image" -lt "$installed" ]; then
+                cat >&2 <<EOF
+              ============================================================
+              REFUSING TO START: the installed Nextcloud is $installed and
+              this image is $image. Nextcloud cannot be downgraded; deploy a
+              Nextcloud $installed image again.
+              ============================================================
+              EOF
+                exit 1
+              fi
+              if [ "$image" -gt $((installed + 1)) ]; then
+                cat >&2 <<EOF
+              ============================================================
+              REFUSING TO START: the installed Nextcloud is $installed and
+              this image is $image. Nextcloud upgrades one major at a time:
+              upgrade to $((installed + 1)) first, and let that release roll
+              out completely before deploying this one.
+              ============================================================
+              EOF
+                exit 1
+              fi
+              if [ "$image" -eq "$installed" ]; then
+                echo "Nextcloud $installed: no major upgrade."
+              else
+                echo "Nextcloud $installed -> $image: one major, nextcloud-upgrade runs it."
+              fi
+          volumeMounts:
+            - name: data
+              mountPath: /var/www/html
+              readOnly: true
+        # Installs or upgrades Nextcloud before Apache starts: the image
+        # entrypoint's own init block (rsync, maintenance:install or
+        # occ upgrade, with the app store for incompatible apps), run with
+        # NEXTCLOUD_UPDATE=1 and `true` in place of the server. An init
+        # container has no probes, so a long upgrade cannot be killed halfway
+        # by the Apache container's startupProbe; that container's entrypoint
+        # then finds the data at the image's version and skips straight to
+        # the setup hook, which stays there with its secrets. On an unchanged
+        # version this is a no-op. Same image and data volume, the
+        # install-time env, and the runtime env Nextcloud's config files read.
+        - name: nextcloud-upgrade
+          image: {{ .Values.nextcloud.image | quote }}
+          args: ["true"]
+          env:
+            - name: NEXTCLOUD_UPDATE
+              value: "1"
+            {{- include "srw.nextcloudInstallEnv" . | nindent 12 }}
+            {{- include "srw.nextcloudRuntimeEnv" . | nindent 12 }}
+            - name: NC_serverid
+              value: "4"
+          volumeMounts:
+            - name: data
+              mountPath: /var/www/html
+            - name: server-config
+              mountPath: /usr/local/etc/php/conf.d/zz-srw.ini
+              subPath: php-srw.ini
+              readOnly: true
+          resources:
+            {{- toYaml .Values.nextcloud.resources | nindent 12 }}
       containers:
         - name: nextcloud
-          image: {{ .Values.nextcloud.image }}
+          image: {{ .Values.nextcloud.image | quote }}
           ports:
             - containerPort: 80
           env:
-            - name: NEXTCLOUD_ADMIN_USER
-              value: "admin"
-            - name: NEXTCLOUD_ADMIN_PASSWORD
-              valueFrom:
-                secretKeyRef:
-                  name: {{ include "srw.secretName" . }}
-                  key: NEXTCLOUD_ADMIN_PASSWORD
-            - name: SQLITE_DATABASE
-              value: "nextcloud"
-            - name: NEXTCLOUD_TRUSTED_DOMAINS
-              value: "{{ include "srw.fullname" . }}-nextcloud {{ (urlParse (include "srw.cloudUrl" .)).host }}"
-            {{- if include "srw.singleOrigin" . }}
-            {{- include "srw.nextcloudSingleOriginEnv" . | nindent 12 }}
-            {{- else }}
-            - name: TRUSTED_PROXIES
-              value: "10.0.0.0/8 172.16.0.0/12 192.168.0.0/16"
-            - name: OVERWRITEPROTOCOL
-              value: "https"
-            {{- end }}
-            {{- if .Values.nextcloud.objectStore.enabled }}
-            # S3 primary storage (existing cluster MinIO). Disable via
-            # nextcloud.objectStore.enabled=false to store files on the PVC
-            # (filesystem) instead — e.g. local k3d, which has no MinIO.
-            - name: OBJECTSTORE_S3_BUCKET
-              value: "srw-nextcloud"
-            - name: OBJECTSTORE_S3_REGION
-              value: "us-east-1"
-            - name: OBJECTSTORE_S3_HOST
-              value: "minio.minio.svc"
-            - name: OBJECTSTORE_S3_PORT
-              value: "9000"
-            - name: OBJECTSTORE_S3_SSL
-              value: "false"
-            - name: OBJECTSTORE_S3_USEPATH_STYLE
-              value: "true"
-            - name: OBJECTSTORE_S3_AUTOCREATE
-              value: "true"
-            - name: OBJECTSTORE_S3_KEY
-              valueFrom:
-                secretKeyRef:
-                  name: {{ include "srw.secretName" . }}
-                  key: NEXTCLOUD_S3_ACCESS_KEY
-            - name: OBJECTSTORE_S3_SECRET
-              valueFrom:
-                secretKeyRef:
-                  name: {{ include "srw.secretName" . }}
-                  key: NEXTCLOUD_S3_SECRET_KEY
-            {{- end }}
+            {{- include "srw.nextcloudInstallEnv" . | nindent 12 }}
+            {{- include "srw.nextcloudRuntimeEnv" . | nindent 12 }}
+            # Distinct per PHP container (Apache 1, cron 2, protected pool 3,
+            # upgrade 4); see srw.nextcloudInstallEnv. Nothing reads it before 33.
+            - name: NC_serverid
+              value: "1"
             # OIDC auto-configuration (used by before-starting hook)
             - name: NEXTCLOUD_OIDC_CLIENT_SECRET
               valueFrom:
@@ -300,6 +695,16 @@ spec:
             - name: setup-hook
               mountPath: /docker-entrypoint-hooks.d/before-starting/setup-nextcloud.sh
               subPath: setup-nextcloud.sh
+              readOnly: true
+            - name: server-config
+              mountPath: /usr/local/etc/php/conf.d/zz-srw.ini
+              subPath: php-srw.ini
+              readOnly: true
+            # conf-enabled/ loads after mods-enabled/mpm_prefork.conf, so
+            # this MaxRequestWorkers is the one Apache keeps.
+            - name: server-config
+              mountPath: /etc/apache2/conf-enabled/zz-srw-mpm-prefork.conf
+              subPath: apache-mpm-prefork.conf
               readOnly: true
           startupProbe:
             httpGet:
@@ -328,6 +733,45 @@ spec:
             periodSeconds: 10
           resources:
             {{- toYaml .Values.nextcloud.resources | nindent 12 }}
+        {{- if .Values.nextcloud.cron.enabled }}
+        # Nextcloud's background jobs: the image's /cron.sh runs busybox crond,
+        # which starts cron.php as www-data every 5 minutes, as the upstream
+        # Nextcloud chart does. Same code and data volume and runtime env as
+        # the Apache container; no setup hook and none of its secrets.
+        - name: cron
+          image: {{ .Values.nextcloud.image | quote }}
+          command: ["/cron.sh"]
+          env:
+            {{- include "srw.nextcloudRuntimeEnv" . | nindent 12 }}
+            - name: NC_serverid
+              value: "2"
+          volumeMounts:
+            - name: data
+              mountPath: /var/www/html
+            - name: server-config
+              mountPath: /usr/local/etc/php/conf.d/zz-srw.ini
+              subPath: php-srw.ini
+              readOnly: true
+          lifecycle:
+            # crond exits on SIGTERM without waiting for a running cron.php,
+            # and a job cut off mid-run stays reserved, so skipped, for 12
+            # hours. Wait for the run to end, bounded well inside the pod's
+            # grace period. "cron[.]php" keeps the pattern from matching this
+            # shell's own command line.
+            preStop:
+              exec:
+                command:
+                  - /bin/sh
+                  - -c
+                  - |
+                    i=0
+                    while [ "$i" -lt 120 ] && pgrep -f '/var/www/html/cron[.]php' >/dev/null; do
+                      sleep 1
+                      i=$((i + 1))
+                    done
+          resources:
+            {{- toYaml .Values.nextcloud.cron.resources | nindent 12 }}
+        {{- end }}
         {{- if (eq (include "srw.nextcloudProtectedEffectEnabled" .) "true") }}
         - name: nextcloud-protected-effect-fpm
           image: {{ .Values.nextcloud.protectedEffect.fpmImage | quote }}
@@ -359,6 +803,30 @@ spec:
               value: {{ .Values.nextcloud.protectedEffect.capabilityMaxAgeSeconds | quote }}
             - name: NEXTCLOUD_PROTECTED_EFFECT_MAX_CHILDREN
               value: {{ .Values.nextcloud.protectedEffect.maxChildren | quote }}
+            # Distinct per PHP container; see srw.nextcloudInstallEnv.
+            - name: NC_serverid
+              value: "3"
+            {{- if (include "srw.nextcloudUsesPostgres" .) }}
+            {{- $effect := .Values.nextcloud.protectedEffect }}
+            {{- $statementBoundMs := mul (min (int $effect.handlerBoundSeconds) (int $effect.safetyMarginSeconds)) 1000 }}
+            - name: PGSSLMODE
+              value: {{ .Values.databases.nextcloud.sslMode | default "prefer" | quote }}
+            # The lane's cleanup horizon assumes no write commits after the
+            # handler wall plus the safety margin. FPM's kill ends the PHP
+            # worker, not a statement Postgres is already running, so every
+            # lane statement and open transaction is cut off at
+            # min(handler bound, safety margin). libpq reads PGOPTIONS from the
+            # worker's environment (clear_env = no), and only this pool gets
+            # it: Apache and cron run unbounded. Derived only from lane
+            # values the lane digest already covers.
+            - name: PGOPTIONS
+              value: {{ printf "-c statement_timeout=%d -c idle_in_transaction_session_timeout=%d" $statementBoundMs $statementBoundMs | quote }}
+            {{- end }}
+            {{- if (include "srw.nextcloudRedisEnabled" .) }}
+            # The same file locks and distributed cache as Apache and cron:
+            # a lane write must see a lock an ordinary request holds.
+            {{- include "srw.nextcloudRedisEnv" . | nindent 12 }}
+            {{- end }}
           volumeMounts:
             - name: data
               mountPath: /var/www/html
@@ -367,6 +835,12 @@ spec:
               readOnly: true
             - name: protected-effect-run
               mountPath: /run/srw-nextcloud
+            # PHP ini only (APCu size), from outside the lane files: the
+            # lane digest and its bundle are unchanged.
+            - name: server-config
+              mountPath: /usr/local/etc/php/conf.d/zz-srw.ini
+              subPath: php-srw.ini
+              readOnly: true
           startupProbe:
             exec:
               command:
@@ -435,6 +909,10 @@ spec:
           configMap:
             name: {{ include "srw.fullname" . }}-nextcloud-hooks
             defaultMode: 0755
+        - name: server-config
+          configMap:
+            name: {{ include "srw.fullname" . }}-nextcloud-server-config
+            defaultMode: 0644
         {{- if (eq (include "srw.nextcloudProtectedEffectEnabled" .) "true") }}
         - name: protected-effect-run
           emptyDir:

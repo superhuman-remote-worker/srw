@@ -306,6 +306,90 @@ async def open_stores(resources: ApplicationResources) -> tuple[bool, Any]:
     return audit_ready, metering_capabilities
 
 
+async def establish_main_cloud_authority(
+    resources: ApplicationResources, legacy_overlay: Any
+) -> None:
+    """Adopt the main cloud's installation authority and run the backfills
+    that need it; raises when the installation can't be proven (the cloud is
+    not answering yet, or Helm describes another one). Safe to run again
+    after a failure: each step is idempotent on every replica."""
+    await instance_registry.initialize_main_cloud_instance_authority(
+        resources.postgres_db,
+        resources.main_cloud_router,
+        replace_installation=(
+            resources.settings.main_cloud_replace_installation or None
+        ),
+        notify=lambda instance_id: fire_reload(resources.postgres_db, instance_id),
+        legacy_overlay=legacy_overlay,
+    )
+    await instance_registry.preload_retained_main_cloud_instances(
+        resources.postgres_db, resources.main_cloud_router
+    )
+    # agent-service's app password (bundled Nextcloud performance WP1b),
+    # adopted from the store or minted once per installation, before the
+    # first agent payload hands its credentials out. Never raises.
+    await instance_registry.adopt_main_cloud_service_credentials(
+        resources.main_cloud_router
+    )
+    # Every project folder of the now-authoritative active installation
+    # has its own connector (main cloud slice 3). Idempotent on every
+    # replica (the key is unique); a failure only defers it.
+    try:
+        await project_cloud_connectors.backfill_project_cloud_connectors(
+            resources.postgres_db,
+            active_instance_id=resources.main_cloud_router.active_instance_id,
+        )
+    except Exception:
+        logger.error(
+            "Project cloud folder connectors backfill failed; it retries "
+            "at the next start",
+            exc_info=True,
+        )
+    # Every approved user has their own session outbox (main cloud slice
+    # 6.1), idempotently on every replica (the key is unique).
+    try:
+        await cloud_outbox_connectors.backfill_cloud_outbox_connectors(
+            resources.postgres_db,
+            active_instance_id=resources.main_cloud_router.active_instance_id,
+        )
+    except Exception:
+        logger.error(
+            "Session outbox connectors backfill failed; it retries at the next start",
+            exc_info=True,
+        )
+    # Every approved user whose main cloud has user roots has their own
+    # "My cloud" (main cloud slice 4), re-pointed when the installation
+    # changed; idempotently on every replica (the key is unique).
+    try:
+        await cloud_user_root.backfill_user_root_connectors(
+            resources.postgres_db, resources.main_cloud_router
+        )
+        # "Connect your cloud" flows a restart interrupted are polled again.
+        await cloud_user_root.resume_pending_connects(
+            resources.postgres_db,
+            resources.main_cloud_router,
+            resources.cloud_root_connect_flows,
+        )
+    except Exception:
+        logger.error(
+            "User cloud root connectors backfill failed; it retries at the next start",
+            exc_info=True,
+        )
+    if legacy_overlay is not None:
+        try:
+            await resources.postgres_db.delete_system_setting("main_cloud")
+            logger.warning(
+                "Removed the legacy main_cloud settings row (backend %s); "
+                "the main cloud is configured by Helm only",
+                instance_registry.legacy_overlay_summary(legacy_overlay)["backend_id"],
+            )
+        except Exception:
+            logger.warning(
+                "Failed to remove inert legacy main_cloud setting",
+                exc_info=True,
+            )
+
+
 async def bind_services(resources: ApplicationResources) -> None:
     """Bind clients, provisioners and notification services to the stores."""
 
@@ -361,88 +445,25 @@ async def bind_services(resources: ApplicationResources) -> None:
         logger.warning("Legacy main cloud overlay read failed at startup: %s", _e)
         _legacy_overlay = None
     try:
-        await instance_registry.initialize_main_cloud_instance_authority(
-            resources.postgres_db,
-            resources.main_cloud_router,
-            replace_installation=(
-                resources.settings.main_cloud_replace_installation or None
-            ),
-            notify=lambda instance_id: fire_reload(resources.postgres_db, instance_id),
-            legacy_overlay=_legacy_overlay,
-        )
-        await instance_registry.preload_retained_main_cloud_instances(
-            resources.postgres_db, resources.main_cloud_router
-        )
-        # Every project folder of the now-authoritative active installation
-        # has its own connector (main cloud slice 3). Idempotent on every
-        # replica (the key is unique); a failure only defers it.
-        try:
-            await project_cloud_connectors.backfill_project_cloud_connectors(
-                resources.postgres_db,
-                active_instance_id=resources.main_cloud_router.active_instance_id,
-            )
-        except Exception:
-            logger.error(
-                "Project cloud folder connectors backfill failed; it retries "
-                "at the next start",
-                exc_info=True,
-            )
-        # Every approved user has their own session outbox (main cloud slice
-        # 6.1), idempotently on every replica (the key is unique).
-        try:
-            await cloud_outbox_connectors.backfill_cloud_outbox_connectors(
-                resources.postgres_db,
-                active_instance_id=resources.main_cloud_router.active_instance_id,
-            )
-        except Exception:
-            logger.error(
-                "Session outbox connectors backfill failed; it retries at the "
-                "next start",
-                exc_info=True,
-            )
-        # Every approved user whose main cloud has user roots has their own
-        # "My cloud" (main cloud slice 4), re-pointed when the installation
-        # changed; idempotently on every replica (the key is unique).
-        try:
-            await cloud_user_root.backfill_user_root_connectors(
-                resources.postgres_db, resources.main_cloud_router
-            )
-            # "Connect your cloud" flows a restart interrupted are polled again.
-            await cloud_user_root.resume_pending_connects(
-                resources.postgres_db,
-                resources.main_cloud_router,
-                resources.cloud_root_connect_flows,
-            )
-        except Exception:
-            logger.error(
-                "User cloud root connectors backfill failed; it retries at the "
-                "next start",
-                exc_info=True,
-            )
-        if _legacy_overlay is not None:
-            try:
-                await resources.postgres_db.delete_system_setting("main_cloud")
-                logger.warning(
-                    "Removed the legacy main_cloud settings row (backend %s); "
-                    "the main cloud is configured by Helm only",
-                    instance_registry.legacy_overlay_summary(_legacy_overlay)[
-                        "backend_id"
-                    ],
-                )
-            except Exception:
-                logger.warning(
-                    "Failed to remove inert legacy main_cloud setting",
-                    exc_info=True,
-                )
+        await establish_main_cloud_authority(resources, _legacy_overlay)
     except Exception as _e:
         # Main cloud is optional for the rest of the orchestrator, but an
         # unbound env adapter must never become a fallback routing authority.
-        # It remains uninitialized and every cloud effect fails closed.
+        # It remains uninitialized and every cloud effect fails closed until
+        # the authority is established: the cloud may still be starting (a
+        # rollout recreates it together with this pod), so a background task
+        # keeps trying (background_tasks, ``main_cloud_authority_retry``).
         logger.error(
             "Main cloud installation authority is unavailable; cloud effects "
-            "remain disabled: %s",
+            "remain disabled until it is established (retried in the "
+            "background): %s",
             _e,
         )
+
+        async def _retry_authority(overlay: Any = _legacy_overlay) -> None:
+            await establish_main_cloud_authority(resources, overlay)
+
+        resources.main_cloud_authority_retry = _retry_authority
 
     # Issue 5: warn loudly if the *active* backend's required secrets are not
     # present in the env — it is silently running on built-in DEV credentials
@@ -691,6 +712,8 @@ async def stop_application(
     The drains run after every background task has stopped and before any
     client or store closes, in this fixed order (R1.B12):
 
+    Live session admissions drain first, before dispatch and stores.
+
     1. dispatch passes and preemptions (``job_dispatch_state``);
     2. KB datasource reindexes (``kb_datasource_tasks``);
     3. attach-abort successor provisioning (``attach_abort_successor_tasks``);
@@ -730,6 +753,7 @@ async def stop_application(
     # cancels: it never writes or clears durable intent, such as the
     # attach-abort outcome row the stale-agent detector re-schedules from.
     drains = (
+        ("live session admissions", lambda: resources.live_tasks.drain()),
         ("dispatch passes", lambda: resources.job_dispatch_state.drain()),
         ("KB datasource reindexes", lambda: resources.kb_datasource_tasks.drain()),
         (

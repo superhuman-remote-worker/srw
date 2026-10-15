@@ -1706,6 +1706,29 @@ describe('DatasourceListComponent bespoke and generic forms', () => {
     legacy_type: 'generic',
   };
 
+  it('uses the installed live SIP driver and submits its generated model/config/secret fields', () => {
+    const driver: ConnectorDriver = {...IMAGE_DRIVER, name: 'srw.gpt-live-sip/v1',
+      legacy_type: 'gpt_live_sip', title: 'Phone line (GPT-Live over SIP)', legacy_connection_url: 'forbidden',
+      config_schema: {type: 'object', required: ['model'], properties: {
+        model: {type: 'string', 'x-srw-model-capability': 'live_voice'},
+      }}};
+    const {component, api} = createComponent(false, null, [...BUILTIN_DRIVERS, driver]);
+    component.openCreateForm();
+    component.onTypeSelect('gpt_live_sip');
+    component.formData.name = 'Empfang';
+    expect(component.useGenericForm()).toBe(true);
+    expect(component.formDriver()?.name).toBe('srw.gpt-live-sip/v1');
+    component.genericFormValue.set({config: {model: 'gpt-live-1', max_duration_s: 900},
+      credentials: {webhook_secret: 'whsec_synthetic'}, problems: []});
+    component.doSave();
+    expect(api.createDatasource).toHaveBeenCalledWith(expect.objectContaining({type: 'gpt_live_sip',
+      config: {model: 'gpt-live-1', max_duration_s: 900}, credentials: {webhook_secret: 'whsec_synthetic'}}));
+    component.openEditForm(emailDatasource({id: 'phone-1', type: 'gpt_live_sip'}));
+    expect(component.formData.type).toBe('gpt_live_sip');
+    expect(component.editingId()).toBe('phone-1');
+    expect(component.useGenericForm()).toBe(true);
+  });
+
   it('uses the bespoke section of every built-in, and the generic form only in the dev preview', () => {
     const {component} = createComponent(false, null, BUILTIN_DRIVERS);
     component.openCreateForm();

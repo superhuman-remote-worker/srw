@@ -234,6 +234,49 @@ def validate_user_nav(url: str, files) -> str:
 MUTATING_ACTIONS = {"navigate", "click", "type", "select", "scroll", "back"}
 
 
+DOCUMENT_TITLE_TIMEOUT = 2.0
+_document_title_error_logged = False
+
+
+async def _read_document_title(session):
+    # focus=False: reading a title must not change or touch agent focus (and
+    # skips the extra runIfWaitingForDebugger round trip).
+    cdp = await session.get_or_create_cdp_session(
+        target_id=session.agent_focus_target_id, focus=False
+    )
+    return await cdp.cdp_client.send.Runtime.evaluate(
+        params={"expression": "document.title", "returnByValue": True},
+        session_id=cdp.session_id,
+    )
+
+
+async def _document_title(session, fallback):
+    """Return the live ``document.title``, or ``fallback``.
+
+    browser_use's ``get_current_page_title()`` returns the CDP target's cached
+    ``TargetInfo.title``. Chrome reports a page that has no title yet under its
+    formatted URL (the hostname), so a snapshot taken before
+    ``targetInfoChanged`` arrives reports "example.com" instead of "Example
+    Domain". Reading ``document.title`` from the page avoids the race. Any
+    failure, timeout, or an empty title returns ``fallback``: a title read must
+    never fail or stall a browser action. The whole read (session lookup plus
+    evaluate) shares one DOCUMENT_TITLE_TIMEOUT bound.
+    """
+    global _document_title_error_logged
+    try:
+        result = await asyncio.wait_for(
+            _read_document_title(session), DOCUMENT_TITLE_TIMEOUT
+        )
+        value = ((result or {}).get("result") or {}).get("value")
+        if isinstance(value, str) and value.strip():
+            return value
+    except (Exception, asyncio.TimeoutError) as exc:
+        if not _document_title_error_logged:
+            _document_title_error_logged = True
+            log(f"document.title read failed ({type(exc).__name__}); using cached title")
+    return fallback
+
+
 def _queue_stream_frame(queue, frame) -> None:
     """Enqueue one outbound frame, dropping the oldest item if necessary."""
     if queue.full():
@@ -525,7 +568,9 @@ class ScreencastCdp:
         try:
             self._hub.update_page_state(
                 url=await self._session.get_current_page_url(),
-                title=await self._session.get_current_page_title(),
+                title=await _document_title(
+                    self._session, await self._session.get_current_page_title()
+                ),
                 loading=False,
             )
         except Exception:
@@ -619,7 +664,9 @@ class ScreencastCdp:
             return
         try:
             url = await self._session.get_current_page_url()
-            title = await self._session.get_current_page_title()
+            title = await _document_title(
+                self._session, await self._session.get_current_page_title()
+            )
         except Exception:
             return
         if not self._is_current_event(expected_session_id):
@@ -1149,7 +1196,7 @@ class BrowserDaemon:
 
         result: dict = {
             "url": summary.url,
-            "title": summary.title,
+            "title": await _document_title(session, summary.title),
             "dom": dom_text,
         }
 
@@ -1347,7 +1394,9 @@ class BrowserDaemon:
             try:
                 self.hub.update_page_state(
                     url=await session.get_current_page_url(),
-                    title=await session.get_current_page_title(),
+                    title=await _document_title(
+                        session, await session.get_current_page_title()
+                    ),
                 )
             except Exception:
                 pass
@@ -1442,7 +1491,9 @@ class BrowserDaemon:
                 if action == "screenshot":
                     shot = await session.take_screenshot()
                     url = await session.get_current_page_url()
-                    title = await session.get_current_page_title()
+                    title = await _document_title(
+                        session, await session.get_current_page_title()
+                    )
                     self.hub.update_page_state(url=url, title=title)
                     return {
                         "url": url,

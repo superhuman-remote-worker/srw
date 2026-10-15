@@ -21,7 +21,7 @@ from orchestrator.services.cloud import (
     CloudBackendErrorKind,
     SessionFolderHandle,
 )
-from orchestrator.services.cloud.identity import resolve_user_identity_cached
+from orchestrator.services.cloud.identity import with_cached_identity
 from orchestrator.services.cloud_connector_mounts import (
     CLOUD_OUTBOX_KEY,
     outbox_attached,
@@ -733,18 +733,20 @@ async def resume_thread(
                         return
                     if not await _resume_runtime_is_current():
                         return
-                share_handle = None
-                resolved_user_id = await resolve_user_identity_cached(
-                    postgres_db, usr, backend
+
+                async def _share_with(account: Any) -> Any:
+                    # The resume may be superseded while the account resolves.
+                    if not await _resume_runtime_is_current():
+                        return None
+                    return await backend.share_session_folder(session_handle, account)
+
+                # Cache-first; a cached account the cloud refuses is looked
+                # up again.
+                share_handle = await with_cached_identity(
+                    postgres_db, usr, backend, _share_with
                 )
                 if not await _resume_runtime_is_current():
                     return
-                if resolved_user_id:
-                    share_handle = await backend.share_session_folder(
-                        session_handle, resolved_user_id
-                    )
-                    if not await _resume_runtime_is_current():
-                        return
                 if not share_handle and existing_handle:
                     # Share still failed (user hasn't signed into cloud yet).
                     # Don't persist — leaving share_handle NULL lets the next

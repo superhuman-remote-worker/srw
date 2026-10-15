@@ -57,6 +57,7 @@ from orchestrator.services.persistent_recycler import (
     persistent_recycle_view,
     read_recycle_record,
 )
+from orchestrator.services.session_attach_binding import find_idle_persistent_agent
 from agent.database.postgres_db import PostgresDB as AgentPostgresDB
 from shared.persistent_input_delivery import (
     InputDeliveryAuthorityLost,
@@ -1897,6 +1898,15 @@ async def test_permanent_retirement_is_abortable_only_before_authorization(db):
     )
 
 
+class _PoolFetchStore:
+    def __init__(self, db):
+        self._db = db
+
+    async def fetch(self, query, *args):
+        async with self._db.acquire() as conn:
+            return await conn.fetch(query, *args)
+
+
 @pytest.mark.asyncio
 async def test_permanent_delete_requires_exact_physical_quiescence(db):
     """DELETE cannot bypass the soft-settlement UPDATE trigger."""
@@ -1957,6 +1967,28 @@ async def test_permanent_delete_requires_exact_physical_quiescence(db):
     )
     assert outcome is not None
     assert outcome["outcome"] == "deleted"
+    # The dedicated (non-warm) row must not stay bindable as a ready idle agent.
+    async with db.acquire() as conn:
+        agent_row = await conn.fetchrow(
+            "SELECT thread_id, status FROM agents WHERE id=$1::uuid",
+            UUID(ids["agent"]),
+        )
+    assert agent_row is not None
+    assert agent_row["thread_id"] is None
+    assert agent_row["status"] == "offline"
+    # The agent's next heartbeat reporting ready must not resurrect the row.
+    await db.heartbeat(ids["agent"], status="ready")
+    async with db.acquire() as conn:
+        assert (
+            await conn.fetchval(
+                "SELECT status FROM agents WHERE id=$1::uuid", UUID(ids["agent"])
+            )
+            == "offline"
+        )
+    idle = await find_idle_persistent_agent(
+        dependencies=SimpleNamespace(store=_PoolFetchStore(db))
+    )
+    assert idle is None
 
 
 @pytest.mark.asyncio

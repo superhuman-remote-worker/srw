@@ -156,6 +156,8 @@ _RULES: tuple[_Rule, ...] = (
     *(_prefix(path, _REFUSED) for path in _INTERNAL_ROUTES),
     _prefix("/api/internal", _REFUSED),
     _prefix("/api/runtime-actors", _REFUSED),
+    # A live connector's public webhook: the provider signs it; no token.
+    _prefix("/api/live", _REFUSED),
     # -- Reads that write -----------------------------------------------------
     *(
         _exact(path, _Family(scope, scope), "GET")

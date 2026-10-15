@@ -28,7 +28,11 @@ from fastapi import HTTPException
 
 from orchestrator.schemas.projects import ExternalKnowledgeBase
 from orchestrator.services import project_cloud_connectors
-from orchestrator.services.cloud import FeatureNotAvailable
+from orchestrator.services.cloud import (
+    CloudBackendError,
+    CloudBackendErrorKind,
+    FeatureNotAvailable,
+)
 from orchestrator.services.cloud.identity import resolve_user_identity_cached
 from orchestrator.services.datasource_config import (
     validate_kb_repository_auth,
@@ -211,6 +215,36 @@ async def remove_project_member_from_backend_group(
     return True
 
 
+async def record_project_folder_error(
+    project: dict[str, Any],
+    error: str | None,
+    *,
+    dependencies: ProjectProvisioningDependencies,
+) -> None:
+    """Store why the project has no main-cloud folder, or clear it (``None``).
+
+    ``error`` is a ``CloudBackendErrorKind`` value, a closed set the project
+    page turns into its own text, never the cloud's words. Unchanged values
+    are not written. Never raises: the record is where a failure surfaces,
+    not a reason to fail provisioning.
+    """
+    if project.get("main_cloud_folder_error") == error:
+        return
+    try:
+        await dependencies.store.set_project_main_cloud_folder_error(
+            str(project["id"]), error
+        )
+    except Exception:
+        dependencies.logger.warning(
+            "Project %s: could not record its cloud folder error %r",
+            project.get("id"),
+            error,
+            exc_info=True,
+        )
+        return
+    project["main_cloud_folder_error"] = error
+
+
 async def ensure_project_cloud_resources(
     project: dict[str, Any],
     *,
@@ -223,7 +257,9 @@ async def ensure_project_cloud_resources(
 
     * **Folder creation** runs only when `main_cloud_folder_handle` is missing
       (protected by a per-project lock because `ensure_project_folder` is not
-      idempotent — each call creates a new Space).
+      idempotent — each call creates a new Space). A failure is recorded as
+      the row's `main_cloud_folder_error` for the project page, and cleared
+      by the create that succeeds.
     * **The cloud folder connector** (``project_cloud_connectors``) is
       created once the project has a folder in the active installation, and
       repointed when its folder handle was repaired.
@@ -318,6 +354,7 @@ async def ensure_project_cloud_resources(
                     folder_handle = await backend.ensure_project_folder(
                         project_name=project_name,
                         group_id=group_name,
+                        project_id=project_id_str,
                     )
                     legacy_id = backend.legacy_folder_id(folder_handle)
                     await store.update_project(
@@ -333,6 +370,9 @@ async def ensure_project_cloud_resources(
                     )
                     project["main_cloud_folder_handle"] = folder_handle.to_db()
                     project["nextcloud_folder_id"] = legacy_id
+                    await record_project_folder_error(
+                        project, None, dependencies=dependencies
+                    )
 
                     # The project working folder is intentionally NOT attached
                     # as a `webdav` datasource: job/session workspaces get the
@@ -346,6 +386,17 @@ async def ensure_project_cloud_resources(
                     logger.warning(
                         f"Failed to create cloud resources for project "
                         f"{project_id_str}: {e}"
+                    )
+                    # The project stands without a folder, and its page says
+                    # why (connector drivers decision 23: a folder that does
+                    # not come up never blocks, and its error reaches the
+                    # user).
+                    await record_project_folder_error(
+                        project,
+                        e.kind.value
+                        if isinstance(e, CloudBackendError)
+                        else CloudBackendErrorKind.UNKNOWN.value,
+                        dependencies=dependencies,
                     )
 
     # The folder's own connector, once the folder exists; repointed when the

@@ -19,7 +19,10 @@ from fastapi import HTTPException
 from typing_extensions import NotRequired, TypedDict
 
 from shared.operator_pause_hold import operator_pause_hold_present
-from orchestrator.database.postgres import JobVMAuditNotReady
+from orchestrator.database.postgres import (
+    JobCheckpointPruneNotReady,
+    JobVMAuditNotReady,
+)
 from orchestrator.services.manifest_runtime_ownership import (
     require_srw_runtime,
     uses_srw_runtime,
@@ -374,6 +377,12 @@ class JobControlOperations:
                     and await select_vm(job_id, retention_only=True) is True
                 ):
                     await store.delete_checkpoint_thread(job_id, strict=True)
+                if job.get("execution_lane") == "pinned":
+                    # Approval writes completed directly, bypassing the
+                    # best-effort prune in update_job_status. The Job remains
+                    # the retry anchor until its terminal checkpoint thread
+                    # is proven empty after workspace retirement.
+                    await store.delete_checkpoint_thread(job_id, strict=True)
             except Exception as exc:
                 d.logger.warning(
                     "Workspace cleanup is incomplete for job %s: %s", job_id, exc
@@ -482,6 +491,11 @@ class JobControlOperations:
                     else "Job deleted. This job had no durable backlog-ticket claim."
                 ),
             }
+        except JobCheckpointPruneNotReady as exc:
+            raise HTTPException(
+                status_code=503,
+                detail="Job checkpoint cleanup is incomplete; retry deletion",
+            ) from exc
         except JobVMAuditNotReady as exc:
             raise HTTPException(
                 status_code=503,

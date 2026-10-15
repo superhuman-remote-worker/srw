@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { Injector, NgZone, PLATFORM_ID, runInInjectionContext, signal } from '@angular/core';
+import { DestroyRef, Injector, NgZone, PLATFORM_ID, runInInjectionContext, signal } from '@angular/core';
 import Dexie from 'dexie';
 import { TestBed } from '@angular/core/testing';
 import { HttpClient } from '@angular/common/http';
@@ -266,6 +266,10 @@ function createService(
     ],
   });
   const service = TestBed.inject(PersistentChatService);
+  // Manual TestBed construction must retire transport timers as well as DOM
+  // listeners. Otherwise an earlier service can open a stream through the
+  // next test's global EventSource mock when its real watchdog clock fires.
+  TestBed.inject(DestroyRef).onDestroy(() => service.disconnect());
   const threadTransport = TestBed.inject(PersistentThreadTransportBridge);
   const canvas = TestBed.inject(CanvasService);
   return {
@@ -1698,7 +1702,7 @@ describe('PersistentChatService — createAndConnect()', () => {
     // run is replaced by the system default, and the create response says so.
     const { service, mockHttp } = createService();
     const notice =
-      'Your default model `MiniMax-M3` is no longer available, so this session uses `muse-spark-1.3-contributor`. Choose a new default in Settings → Preferences.';
+      'Your default model `MiniMax-M3` is no longer available, so this session uses `muse-spark-1.3-contributor`. Choose a new default in Settings → Defaults.';
     mockHttp.post.mockImplementation((url: string) =>
       url.endsWith('/persistent/threads')
         ? of({ thread_id: 'thread-new', status: 'created', notices: [notice] })
@@ -4229,6 +4233,24 @@ describe('PersistentChatService — REST sends', () => {
       /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i,
     );
     expect(ctx.service.isInterrupting()).toBe(true);
+  });
+
+  it('interrupt sends a valid UUID when crypto.randomUUID is unavailable (plain-HTTP origin)', async () => {
+    const ctx = await readySession();
+    fireSseMessage(ctx.sseInstances[0], { method: 'turn.started', params: { turn_id: 3 } }, '1:2');
+    vi.stubGlobal('crypto', { getRandomValues: crypto.getRandomValues.bind(crypto) });
+    try {
+      await expect(ctx.service.interrupt()).resolves.toBeUndefined();
+    } finally {
+      vi.unstubAllGlobals();
+    }
+    const intCall = ctx.mockHttp.post.mock.calls.find((c: any) =>
+      String(c[0]).endsWith('/persistent/threads/thread-r/interrupt'),
+    );
+    expect(intCall).toBeDefined();
+    expect(intCall![1].client_request_id).toMatch(
+      /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/,
+    );
   });
 
   it('does not create an uncorrelated interrupt without a numeric active turn', async () => {

@@ -8,7 +8,16 @@ from typing import Awaitable, Callable, Optional
 
 import pytest
 
-from agent.services.cloud_sync.base import WorkspaceSyncBase, _should_ignore
+from agent.services.cloud_sync.base import (
+    StagedGenerationDelta,
+    StagedUpload,
+    WorkspaceSyncBase,
+    _should_ignore,
+)
+
+
+async def _noop() -> None:
+    return None
 
 
 class FakeSync(WorkspaceSyncBase):
@@ -174,6 +183,64 @@ async def test_ensure_remote_dirs_caches(tmp_path: Path):
     # Second call, same path — cache kicks in
     await sync._ensure_remote_dirs("a/b/c")
     assert sync.mkdirs == []
+
+
+@pytest.mark.asyncio
+async def test_ensure_remote_dirs_never_caches_a_failed_mkdir(tmp_path: Path):
+    sync = FakeSync(tmp_path)
+    unavailable = True
+    create = sync._ensure_remote_dir
+
+    async def mkdir(rel_dir, *, before_write=None):
+        if unavailable:  # "a" answers 503, so "a/b" then answers 409
+            raise RuntimeError("MKCOL failed")
+        await create(rel_dir, before_write=before_write)
+
+    sync._ensure_remote_dir = mkdir
+    await sync._ensure_remote_dirs("a/b")  # swallowed, as before
+    assert sync._remote_dirs == set()
+    unavailable = False
+    await sync._ensure_remote_dirs("a/b")  # the retry asks again
+    assert sync.mkdirs == ["a", "a/b"]
+    assert sync._remote_dirs == {"a", "a/b"}
+
+
+@pytest.mark.asyncio
+async def test_transmit_creates_every_parent_level_by_level_before_any_upload(
+    tmp_path: Path,
+):
+    sync = FakeSync(tmp_path)
+    sync._remote_dirs.add("cached")
+    order: list[str] = []
+    create, upload = sync._ensure_remote_dir, sync._upload_file
+
+    async def mkdir(rel_dir, **kwargs):
+        order.append(f"mkdir {rel_dir}")
+        await create(rel_dir, **kwargs)
+
+    async def put(rel_path, local_path, **kwargs):
+        order.append(f"put {rel_path}")
+        await upload(rel_path, local_path, **kwargs)
+
+    sync._ensure_remote_dir = mkdir
+    sync._upload_file = put
+    paths = ["a/b/c.txt", "a/d.txt", "cached/x.txt", "e/f.txt", "g.txt"]
+    uploads = []
+    for path in paths:
+        local = tmp_path / path.replace("/", "_")
+        local.write_bytes(b"x")
+        uploads.append(
+            StagedUpload(path=path, tmp_path=str(local), sha256="0" * 64, size=1)
+        )
+    staged = StagedGenerationDelta(
+        uploads=uploads, deletes=[], manifest={}, planned=len(paths)
+    )
+    commit = await sync.transmit_generation_delta(staged, before_write=_noop)
+    mkdirs = [step for step in order if step.startswith("mkdir")]
+    assert sorted(mkdirs[:2]) == ["mkdir a", "mkdir e"]  # one level at a time
+    assert mkdirs[2:] == ["mkdir a/b"]  # a cached parent is not asked again
+    assert order[: len(mkdirs)] == mkdirs  # every parent before any upload
+    assert commit.paths == paths
 
 
 @pytest.mark.asyncio

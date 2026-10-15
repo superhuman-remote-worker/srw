@@ -8,7 +8,7 @@ Handles:
 """
 
 import logging
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Iterable, List, Optional
 
 from agent.tools.registry import (
     PHASE_DESCRIPTION_PREFIXES,
@@ -293,7 +293,9 @@ def apply_description_overrides(tools: List[Any]) -> List[Any]:
     return manager.apply_overrides(tools)
 
 
-def apply_phase_description_prefixes(tools: List[Any]) -> List[Any]:
+def apply_phase_description_prefixes(
+    tools: List[Any], both_phases: Optional[Iterable[str]] = None
+) -> List[Any]:
     """Prefix single-phase tools' descriptions with their phase (U2).
 
     With one tool binding for every phase the schema no longer says which
@@ -308,9 +310,13 @@ def apply_phase_description_prefixes(tools: List[Any]) -> List[Any]:
     are never mutated.
     """
     manager = _get_manager()
+    unrestricted = set(both_phases or ())
     out: List[Any] = []
     for tool in tools:
-        phase = single_phase_of(getattr(tool, "name", "") or "")
+        name = getattr(tool, "name", "") or ""
+        # ``both_phases``: tools this expert may call in either phase
+        # (``phase_settings.strategic_tools``) carry no phase prefix.
+        phase = None if name in unrestricted else single_phase_of(name)
         description = getattr(tool, "description", None)
         if phase is None or not isinstance(description, str):
             out.append(tool)

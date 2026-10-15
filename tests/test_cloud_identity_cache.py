@@ -18,10 +18,12 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from orchestrator.services.cloud import CloudBackendError, CloudBackendErrorKind
 from orchestrator.services.cloud.identity import (
     get_home_browser_url_cached,
     peek_home_browser_url,
     resolve_user_identity_cached,
+    with_cached_identity,
 )
 from orchestrator.application import projects as projects_composition
 
@@ -112,6 +114,108 @@ class TestResolveUserIdentityCached:
         backend = _fake_backend(resolved="cloud-a")
 
         assert await resolve_user_identity_cached(db, {}, backend) is None
+        backend.resolve_user_identity.assert_not_awaited()
+
+
+def _not_found():
+    return CloudBackendError(
+        CloudBackendErrorKind.NOT_FOUND, "no such user", backend=BACKEND_ID
+    )
+
+
+class TestWithCachedIdentity:
+    """Session shares: the cached id first, a fresh lookup only on a miss or
+    when the cloud refuses the cached id as unknown."""
+
+    @pytest.mark.asyncio
+    async def test_cache_hit_never_asks_the_backend_who_the_user_is(self):
+        user = _user()
+        db = _FakeIdentityDB({user["id"]: {BACKEND_ID: {"user_id": "cloud-a"}}})
+        backend = _fake_backend(resolved="cloud-b")
+        action = AsyncMock(return_value="shared")
+
+        assert await with_cached_identity(db, user, backend, action) == "shared"
+
+        action.assert_awaited_once_with("cloud-a")
+        backend.resolve_user_identity.assert_not_awaited()
+        assert db.merge_calls == []
+
+    @pytest.mark.asyncio
+    async def test_miss_uses_the_given_lookup_and_caches_it(self):
+        user = _user()
+        db = _FakeIdentityDB()
+        backend = _fake_backend()
+        lookup = AsyncMock(return_value="cloud-a")
+        action = AsyncMock(return_value="shared")
+
+        result = await with_cached_identity(db, user, backend, action, lookup=lookup)
+
+        assert result == "shared"
+        lookup.assert_awaited_once()
+        action.assert_awaited_once_with("cloud-a")
+        assert db.store[user["id"]][BACKEND_ID]["user_id"] == "cloud-a"
+
+    @pytest.mark.asyncio
+    async def test_miss_without_an_account_runs_nothing_and_caches_nothing(self):
+        user = _user()
+        db = _FakeIdentityDB()
+        action = AsyncMock()
+
+        assert await with_cached_identity(db, user, _fake_backend(), action) is None
+
+        action.assert_not_awaited()
+        assert db.merge_calls == []
+
+    @pytest.mark.asyncio
+    async def test_a_stale_cached_id_heals_and_the_action_runs_once_more(self):
+        user = _user()
+        db = _FakeIdentityDB(
+            {
+                user["id"]: {
+                    BACKEND_ID: {"user_id": "cloud-old", "home_browser_url": "x"}
+                }
+            }
+        )
+        backend = _fake_backend(resolved="cloud-new")
+        action = AsyncMock(side_effect=[_not_found(), "shared"])
+
+        assert await with_cached_identity(db, user, backend, action) == "shared"
+
+        assert [c.args[0] for c in action.await_args_list] == [
+            "cloud-old",
+            "cloud-new",
+        ]
+        entry = db.store[user["id"]][BACKEND_ID]
+        assert entry["user_id"] == "cloud-new"
+        assert entry["home_browser_url"] is None
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("fresh", ["cloud-old", None])
+    async def test_a_refusal_the_lookup_cannot_fix_is_raised(self, fresh):
+        user = _user()
+        db = _FakeIdentityDB({user["id"]: {BACKEND_ID: {"user_id": "cloud-old"}}})
+        action = AsyncMock(side_effect=_not_found())
+
+        with pytest.raises(CloudBackendError):
+            await with_cached_identity(db, user, _fake_backend(resolved=fresh), action)
+
+        action.assert_awaited_once_with("cloud-old")
+        assert db.merge_calls == []
+
+    @pytest.mark.asyncio
+    async def test_other_refusals_of_a_cached_id_are_not_looked_up(self):
+        user = _user()
+        db = _FakeIdentityDB({user["id"]: {BACKEND_ID: {"user_id": "cloud-a"}}})
+        backend = _fake_backend(resolved="cloud-b")
+        action = AsyncMock(
+            side_effect=CloudBackendError(
+                CloudBackendErrorKind.THROTTLED, "slow down", backend=BACKEND_ID
+            )
+        )
+
+        with pytest.raises(CloudBackendError):
+            await with_cached_identity(db, user, backend, action)
+
         backend.resolve_user_identity.assert_not_awaited()
 
 

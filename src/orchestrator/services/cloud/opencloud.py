@@ -762,9 +762,16 @@ class OpenCloudBackend:
 
     @instrument_backend_op("ensure_project_folder")
     async def ensure_project_folder(
-        self, *, project_name: str, group_id: GroupId
+        self,
+        *,
+        project_name: str,
+        group_id: GroupId,
+        project_id: Optional[str] = None,
     ) -> ProjectFolderHandle:
         """Create a project Space and grant the group editor access.
+
+        ``project_id`` is Nextcloud's mount-point tiebreak; a Space is
+        addressed by its drive id, so it is unused here.
 
         LibreGraph:
           1. ``POST /graph/v1.0/drives`` creates the Space

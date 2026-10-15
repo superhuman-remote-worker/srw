@@ -15,10 +15,12 @@ import {TranslocoService} from '@jsverse/transloco';
 import {draftTitleFrom, PersistentChatService} from './persistent-chat.service';
 import {ApiService} from './api.service';
 import {CapabilitiesService} from './capabilities.service';
+import {UserService} from './user.service';
 import {IndexedDbService} from './indexed-db.service';
 import {NotificationService} from './notification.service';
 import {AppToastService} from '../../ui/toast';
 import {isUserTurn} from '../models/turn.model';
+import {VIEW_AS_OVERRIDE} from '../interceptors/view-as.interceptor';
 
 // --- Minimal transport mocks (mirrors the outbox spec's scaffolding) ---
 
@@ -208,7 +210,7 @@ describe('PersistentChatService — instant-landing draft sessions', () => {
 
     it('first send creates the thread with a minimal body and carries the message', async () => {
         const ctx = createService({
-            projects: [{id: 'p-def', is_default: true}, {id: 'p2'}],
+            projects: [{id: 'p-def', is_default: true, user_role: 'owner'}, {id: 'p2'}],
             datasourceIds: ['compatible-auto'],
         });
         ctx.service.enterDraftSession();
@@ -249,7 +251,7 @@ describe('PersistentChatService — instant-landing draft sessions', () => {
         // the owner's outbox) and no other default; the server names them.
         const ctx = createService({
             policyAvailable: false,
-            projects: [{id: 'p-def', is_default: true}],
+            projects: [{id: 'p-def', is_default: true, user_role: 'owner'}],
             datasourceIds: ['my-cloud', 'outbox'],
         });
         ctx.service.enterDraftSession();
@@ -274,7 +276,7 @@ describe('PersistentChatService — instant-landing draft sessions', () => {
     it('keeps an explicit empty selection when the user removed every connector', async () => {
         const ctx = createService({
             policyAvailable: false,
-            projects: [{id: 'p-def', is_default: true}],
+            projects: [{id: 'p-def', is_default: true, user_role: 'owner'}],
             datasourceIds: ['my-cloud'],
         });
         ctx.service.enterDraftSession();
@@ -287,6 +289,50 @@ describe('PersistentChatService — instant-landing draft sessions', () => {
             {project_ids: ['p-def'], datasource_ids: []},
         );
         expect(ctx.service.draftDatasourceIds()).toEqual([]);
+    });
+
+    it("reads the project list self-scoped and never attaches another user's default", async () => {
+        const ctx = createService({
+            projects: [
+                {id: 'p-theirs', is_default: true, user_role: 'editor'},
+                {id: 'p-mine', is_default: true, user_role: 'owner'},
+            ],
+        });
+        ctx.service.enterDraftSession();
+        await flushTick();
+
+        const [, options] = ctx.mockHttp.get.mock.calls.find(([u]: [string]) => u.includes('/projects'))!;
+        expect(options.context.get(VIEW_AS_OVERRIDE)).toBe('mine');
+        expect(ctx.mockHttp.post).toHaveBeenCalledWith(
+            expect.stringContaining('/persistent/threads/preview'),
+            {project_ids: ['p-mine'], use_datasource_defaults: true},
+        );
+
+        const only = createService({projects: [{id: 'p-theirs', is_default: true, user_role: 'editor'}]});
+        only.service.enterDraftSession();
+        await flushTick();
+        await only.service.sendMessage('hello');
+        await flushTick();
+        expect(createPosts(only)[0][1]).not.toHaveProperty('project_ids');
+    });
+
+    it("prefers the caller's own default_project_id over a co-owned colleague default", async () => {
+        const ctx = createService({
+            projects: [
+                {id: 'p-colleague', is_default: true, user_role: 'owner'},
+                {id: 'p-mine', is_default: true, user_role: 'owner'},
+            ],
+        });
+        TestBed.inject(UserService).currentUser.set({
+            id: 'u1', display_name: 'Me', avatar_color: 'x', default_project_id: 'p-mine',
+        });
+        ctx.service.enterDraftSession();
+        await flushTick();
+
+        expect(ctx.mockHttp.post).toHaveBeenCalledWith(
+            expect.stringContaining('/persistent/threads/preview'),
+            {project_ids: ['p-mine'], use_datasource_defaults: true},
+        );
     });
 
     it('omits project_ids when there is no default project', async () => {

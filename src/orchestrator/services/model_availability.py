@@ -42,7 +42,7 @@ MODEL_UNAVAILABLE_CODE = "model.unavailable"
 # Where the user changes the model, for the refusal text (§ Messages).
 WHERE_SESSION = "this session's settings"
 WHERE_JOB = "the job's configuration"
-WHERE_ACCOUNT = "Settings → Preferences"
+WHERE_ACCOUNT = "Settings → Defaults"
 
 # The cockpit's chat banner cuts a message at 240 characters (sanitizeError).
 _MESSAGE_LIMIT = 240
@@ -225,7 +225,7 @@ def render_unavailable_message(
             f"Choose other models in {place}, or ask your administrator."
         )
     if is_admin and any(e.reason == REASON_DISABLED for e in entries):
-        text += " You can re-enable it in Admin → Models."
+        text += " You can re-enable it in Settings → Models → Catalog."
     return _clip(text)
 
 

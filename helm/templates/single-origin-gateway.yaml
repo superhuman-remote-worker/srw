@@ -6,24 +6,24 @@
 {{- $ingressClass := include "srw.singleOriginIngressClass" . -}}
 {{- $identity := printf "%s/%s" .Release.Namespace .Release.Name -}}
 {{- $routeBase := printf "%s-%s" (include "srw.fullname" . | trunc 23 | trimSuffix "-") ($identity | sha256sum | trunc 10) -}}
-{{- $dnsNames := list -}}
-{{- $ipAddresses := list -}}
-{{- if eq $single.address "localhost" -}}
-  {{- $dnsNames = list $single.address -}}
-{{- else -}}
-  {{- $ipAddresses = list $single.address -}}
-{{- end -}}
-{{- $cert := genSelfSignedCert $single.address $ipAddresses $dnsNames (int $single.tls.validityDays) -}}
+{{- $existingTls := lookup "v1" "Secret" .Release.Namespace $tlsSecretName -}}
+{{- $cert := include "srw.singleOriginCertificate" (dict "context" . "existing" $existingTls) | fromJson -}}
 apiVersion: v1
 kind: Secret
 metadata:
   name: {{ $tlsSecretName }}
   labels:
     {{- include "srw.componentLabels" (dict "context" . "component" "single-origin-gateway") | nindent 4 }}
+  # What the certificate was issued for: the next upgrade reuses it while
+  # these still match (srw.singleOriginCertificate).
+  annotations:
+    srw.io/single-origin-address: {{ $single.address | quote }}
+    srw.io/single-origin-validity-days: {{ int $single.tls.validityDays | quote }}
+    srw.io/single-origin-expires: {{ $cert.expires | quote }}
 type: kubernetes.io/tls
 data:
-  tls.crt: {{ $cert.Cert | b64enc | quote }}
-  tls.key: {{ $cert.Key | b64enc | quote }}
+  tls.crt: {{ $cert.cert | b64enc | quote }}
+  tls.key: {{ $cert.key | b64enc | quote }}
 ---
 apiVersion: v1
 kind: ConfigMap
@@ -115,7 +115,7 @@ spec:
       labels:
         {{- include "srw.componentSelectorLabels" (dict "context" . "component" "single-origin-gateway") | nindent 8 }}
       annotations:
-        checksum/tls-certificate: {{ $cert.Cert | sha256sum }}
+        checksum/tls-certificate: {{ $cert.cert | sha256sum }}
     spec:
       serviceAccountName: {{ $gatewayName }}
       securityContext:

@@ -12,6 +12,7 @@ from fastapi import HTTPException
 
 from orchestrator.services.session_attach_binding import (
     bind_registered_persistent_agent,
+    release_session_attach_binding,
 )
 
 from orchestrator.services.thread_admission import provision_thread_workspace
@@ -336,6 +337,64 @@ async def _poll(db, provisioner, thread):
             presented_attach_token=str(thread["runtime_attach_token"]),
             dependencies=_delivery(db, provisioner),
         )
+
+
+@pytest.mark.asyncio
+async def test_pre_delivery_detach_rebind_still_admits_first_vm(db, monkeypatch):
+    thread_id, _policy, _override, dependencies = await _initial_vm(
+        db, monkeypatch, native=True
+    )
+    first = await _bind_protected_agent(db, thread_id)
+
+    async def finalizer_released(store, *, protection_id, **_kwargs):
+        assert await store.complete_pinned_warm_binding_release(
+            protection_id,
+            release_outcome="exact_live_unprotected_v1",
+            agent_present=True,
+        )
+
+    assert (
+        await release_session_attach_binding(
+            str(first["agent_id"]),
+            str(thread_id),
+            expected_runtime_generation=str(first["runtime_generation"]),
+            expected_attach_token=str(first["runtime_attach_token"]),
+            pre_delivery=True,
+            dependencies=SimpleNamespace(
+                store=db,
+                release_pinned_warm_binding_protection=finalizer_released,
+                agent_provisioner=None,
+                persistent_provisioner=None,
+            ),
+        )
+        == "released"
+    )
+    detached = await db.get_thread(str(thread_id))
+    assert detached["runtime_generation"] != first["runtime_generation"]
+    outcome = await db.fetchrow(
+        "SELECT * FROM thread_runtime_attach_abort_outcomes "
+        "WHERE thread_id=$1 AND runtime_generation=$2",
+        thread_id,
+        first["runtime_generation"],
+    )
+    assert outcome["release_kind"] == "server_pre_delivery"
+    assert outcome["quiescence_protocol"] == "pre_delivery_no_payload_v1"
+    assert outcome["workspace_generation"] is None
+    assert outcome["workspace_runtime_incarnation"] is None
+
+    rebound = await _bind_protected_agent(db, thread_id)
+    assert rebound["runtime_generation"] == detached["runtime_generation"]
+    assert rebound["agent_id"] != first["agent_id"]
+    payload = await _poll(db, dependencies.vm_provisioner, rebound)
+    assert payload["vm_status"] == "provisioning"
+    assert payload["session_runtime_generation"] == str(rebound["runtime_generation"])
+    source = await db.fetchrow(
+        "SELECT * FROM vm_creation_retries WHERE thread_id=$1", thread_id
+    )
+    assert source is not None
+    assert source["thread_runtime_generation"] == rebound["runtime_generation"]
+    assert source["thread_agent_id"] == rebound["agent_id"]
+    assert source["thread_attach_token"] == rebound["runtime_attach_token"]
 
 
 @pytest.mark.asyncio

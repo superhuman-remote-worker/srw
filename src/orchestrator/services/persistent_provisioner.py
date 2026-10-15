@@ -24,6 +24,7 @@ from enum import StrEnum
 from typing import Any, Dict, Optional
 
 from shared.runtime.core.loader import canonical_config_name
+from shared.tls_trust import TrustCaSource
 
 from orchestrator.services.agent_pod_entrypoint import (
     agent_exec_command,
@@ -156,6 +157,8 @@ class PersistentProvisioner:
         self._ssh_secret_name: str = os.environ.get(
             "WORKSPACE_SSH_SECRET", "vm-ssh-key"
         )
+        # The operator's extra CA (chart trust.*), mounted into every agent pod.
+        self._trust_ca = TrustCaSource.from_env()
         self._storage_class: str = os.environ.get(
             "WORKSPACE_STORAGE_CLASS", "longhorn-ephemeral"
         )
@@ -1893,7 +1896,7 @@ class PersistentProvisioner:
             labels["srw.io/runtime-generation"] = session_runtime_generation
         if provision_attempt:
             labels["srw.io/provision-attempt"] = provision_attempt
-        return {
+        manifest = {
             "apiVersion": "v1",
             "kind": "Pod",
             "metadata": {
@@ -2127,6 +2130,13 @@ class PersistentProvisioner:
                 ],
             },
         }
+        trust_ca = getattr(self, "_trust_ca", None)
+        if trust_ca is not None:
+            container = manifest["spec"]["containers"][0]
+            container["env"].append(trust_ca.env())
+            container["volumeMounts"].append(trust_ca.volume_mount())
+            manifest["spec"]["volumes"].append(trust_ca.volume())
+        return manifest
 
     async def _wait_for_ready(
         self, pod_name: str, timeout: int = 120, *, namespace: str | None = None

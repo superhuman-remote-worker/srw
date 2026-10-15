@@ -313,6 +313,14 @@ claim a worker runtime, and eventually reach a terminal or review state.
   `curl -sk https://localhost:8443/cloud/status.php` for single-origin; it
   should report `"installed": true`.
 
+A cluster installed before the chart moved the bundled Nextcloud to Postgres
+keeps its SQLite database: the new `srw-nextclouddb` stays empty and Nextcloud
+does not wait for it. Move it with `scripts/nextcloud-sqlite-to-postgres.py`
+(`--context k3d-srw --namespace srw`, run each phase with
+`--run --confirm MIGRATE-NEXTCLOUD-srw`), or keep SQLite with
+`nextcloud.database.type: sqlite`. `scripts/k3d-nextcloud-perf-gate.py` times
+Nextcloud requests and session creates before and after.
+
 ## Fast development with Tilt
 
 Tilt is optional for evaluation and recommended while editing the repository.
@@ -478,6 +486,18 @@ configure that mapping explicitly on an operator-managed server or load balancer
 First confirm the requested repository and tag exist and that the installed
 chart matches the intended release. If you deliberately use a private image,
 create a registry Secret and reference it through `global.imagePullSecrets`.
+
+When the pod events say `lookup registry-1.docker.io: Try again`, the k3d node
+cannot resolve the registry, though the host can. Pull the image on the host
+and load it into the node's containerd (`k3d image import` may report success
+without loading it):
+
+```bash
+docker pull docker.io/valkey/valkey:8.1.10-alpine
+docker save docker.io/valkey/valkey:8.1.10-alpine \
+  | docker exec -i k3d-srw-server-0 ctr -n k8s.io images import -
+kubectl --context=k3d-srw -n srw delete pod -l app.kubernetes.io/component=nextcloud-redis
+```
 
 ### A PVC cannot be shrunk
 

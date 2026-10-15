@@ -629,3 +629,36 @@ def test_cockpit_capabilities_follow_exposure_profile(single_origin: bool) -> No
         "adminToolsEnabled",
     ]:
         assert f"window['env']['{capability}'] = {flag};" in env_js
+
+
+def _session_ingress_host(values: dict) -> str:
+    return _orchestrator_environment(render(values))["SESSION_INGRESS_HOST"]
+
+
+def test_session_ingress_host_follows_api_hostname_override() -> None:
+    host = _session_ingress_host(
+        {
+            "global": {
+                "domain": "example.test",
+                "hostnames": {"api": "api-srw.example.com"},
+            }
+        }
+    )
+    assert host == "api-srw.example.com"
+
+
+def test_session_ingress_host_defaults_to_api_subdomain() -> None:
+    assert _session_ingress_host({}) == "api.example.test"
+
+
+def test_session_ingress_host_explicit_value_wins() -> None:
+    host = _session_ingress_host(
+        {
+            "global": {
+                "domain": "example.test",
+                "hostnames": {"api": "api-srw.example.com"},
+            },
+            "sessionRouter": {"ingressHost": "sessions.example.org"},
+        }
+    )
+    assert host == "sessions.example.org"

@@ -1,0 +1,35 @@
+# The receptionist's strategic phase after a live conversation ended
+# (live_session_jobs §6.1; receptionist_expert.md). Replaces the framework's
+# config/templates/live_post_session_todos.yaml for this expert.
+todos:
+  - id: 1
+    content: >-
+      Note the knowledge gaps of the conversation in the knowledge base.
+
+      The voice subagent's final report holds the transcript and every
+      question it handed over with its outcome. A gap is a question about this
+      organisation or its offers that neither the knowledge base nor the
+      voice's facts answered. General-knowledge questions (weather, news,
+      public facts) are never gaps, whether or not you found an answer.
+      For each gap, kb_search for an open question note on the same topic. If
+      one exists, kb_update it with append: today's date and how the question
+      was asked. Otherwise kb_write(type="question", tags=["unanswered"]) with
+      the question in general form, so that someone can answer it later.
+      Never write the person's name, number or other personal details into the
+      knowledge base. Without knowledge-base tools, keep the gaps for the
+      summary instead.
+
+      COMPLETION CRITERIA: every gap is an open question note in the knowledge
+      base (or kept for the summary when there is none), and no note holds
+      personal details.
+  - id: 2
+    content: >-
+      Complete the job with the record of the conversation.
+
+      Call job_complete with a summary for whoever reviews this conversation:
+      what the person wanted, what they were told, every message they left
+      (their name, what it is about, how and when to reach them), the gaps
+      you noted, and what is still open. The summary is the only place for
+      messages and personal details.
+
+      COMPLETION CRITERIA: job_complete succeeded with that summary.

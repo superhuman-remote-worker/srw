@@ -1,6 +1,6 @@
 import {ChangeDetectionStrategy, Component, computed, DestroyRef, effect, ElementRef, inject, OnInit, signal, viewChild} from '@angular/core';
 import {takeUntilDestroyed} from '@angular/core/rxjs-interop';
-import {TranslocoService} from '@jsverse/transloco';
+import {TranslocoPipe, TranslocoService} from '@jsverse/transloco';
 import {AdminModelsService} from '../../../core/services/admin-models.service';
 import {AdminProvidersService} from '../../../core/services/admin-providers.service';
 import {AdminModelsCoordinatorService} from '../models/admin-models-coordinator.service';
@@ -138,6 +138,7 @@ function hintsToCapabilities(
     'search',
     'fetch',
     'rerank',
+    'live_voice',
   ];
   const isKnown = (v: string): v is CatalogCapability =>
     known.includes(v as CatalogCapability);
@@ -235,6 +236,7 @@ export function reasoningStarveWarning(ctx: number | null): string | null {
   changeDetection: ChangeDetectionStrategy.OnPush,
   imports: [
     HelmManagedBadgeComponent,
+    TranslocoPipe,
     AppButtonComponent,
     AppInputComponent,
     AppSelectComponent,
@@ -627,7 +629,7 @@ export function reasoningStarveWarning(ctx: number | null): string | null {
               <app-form-field label="Display label">
                 <app-input
                   [value]="formDisplayLabel()"
-                  placeholder="Auto-suggested from ID"
+                  [placeholder]="formModelId().trim() || 'Defaults to the model ID'"
                   [disabled]="creating()"
                   (changed)="formDisplayLabel.set($event)"
                 />
@@ -668,6 +670,16 @@ export function reasoningStarveWarning(ctx: number | null): string | null {
               @if (researchConfigurationError(); as error) {
                 <p class="field-hint field-hint--warn">{{ error }}</p>
               }
+            } @else if (liveVoiceSelected()) {
+              <div class="form-row live-voice-config">
+                <app-form-field [label]="'admin.catalog.liveVoice.adapter' | transloco">
+                  <app-input value="openai-live" [readonly]="true" />
+                </app-form-field>
+                <app-form-field [label]="'admin.catalog.liveVoice.voice' | transloco">
+                  <app-input [value]="formVoice()" placeholder="marin"
+                    [disabled]="creating()" (changed)="formVoice.set($event)" />
+                </app-form-field>
+              </div>
             } @else {
               <div class="form-row two-col chat-model-config" [class.form-flash]="formFlash()">
                 <app-form-field label="Family">
@@ -1344,6 +1356,9 @@ export class AdminCatalogComponent implements OnInit {
     reasoningStarveWarning(this.formContextWindow()),
   );
 
+  readonly liveVoiceSelected = computed(() => this.formCapabilities().includes('live_voice'));
+  readonly liveVoiceExclusive = computed(() => !this.liveVoiceSelected() || this.formCapabilities().length === 1);
+
   readonly researchCapabilitiesSelected = computed(() =>
     this.formCapabilities().some((capability) =>
       capability === 'search' || capability === 'fetch',
@@ -1555,9 +1570,9 @@ export class AdminCatalogComponent implements OnInit {
     return (
       !!this.formProviderKey() &&
       !!this.formModelId().trim() &&
-      !!this.formDisplayLabel().trim() &&
-      (this.researchCapabilitiesSelected() || !!this.formFamily().trim()) &&
+      (this.researchCapabilitiesSelected() || this.liveVoiceSelected() || !!this.formFamily().trim()) &&
       !this.researchConfigurationError() &&
+      this.liveVoiceExclusive() &&
       this.formCapabilities().length > 0
     );
   }
@@ -1573,6 +1588,8 @@ export class AdminCatalogComponent implements OnInit {
   toggleFormCapability(capability: CatalogCapability, checked: boolean): void {
     const current = new Set(this.formCapabilities());
     if (checked) {
+      if (capability === 'live_voice') current.clear();
+      else current.delete('live_voice');
       current.add(capability);
     } else {
       current.delete(capability);
@@ -1654,6 +1671,10 @@ export class AdminCatalogComponent implements OnInit {
       this.formError.set('Select at least one capability.');
       return;
     }
+    if (!this.liveVoiceExclusive()) {
+      this.formError.set(this.transloco.translate('admin.catalog.liveVoice.onlyCapability'));
+      return;
+    }
     const researchError = this.researchConfigurationError();
     if (researchError) {
       this.formError.set(researchError);
@@ -1664,7 +1685,8 @@ export class AdminCatalogComponent implements OnInit {
     // Both ride in the catalog row's params_json: voice is TTS-only, pricing_id
     // points the OpenRouter rate sync at a specific catalog entry.
     const params: Record<string, unknown> = {};
-    if (capabilities.includes('tts') && voice) params['voice'] = voice;
+    if ((capabilities.includes('tts') || this.liveVoiceSelected()) && voice) params['voice'] = voice;
+    if (this.liveVoiceSelected()) params['adapter'] = 'openai-live';
     if (pricingId) params['pricing_id'] = pricingId;
     if (this.researchCapabilitiesSelected()) {
       params['provider'] = this.formSearchProvider();
@@ -1686,10 +1708,11 @@ export class AdminCatalogComponent implements OnInit {
         provider_kind: kind,
         provider_ref: ref,
         model_id: modelId,
-        display_label: this.formDisplayLabel().trim(),
+        // An empty label falls back to the model ID, cut to the API's 200-char limit.
+        display_label: (this.formDisplayLabel().trim() || modelId).slice(0, 200),
         capabilities,
-        family: this.researchCapabilitiesSelected() ? 'default' : this.formFamily().trim(),
-        context_window: this.researchCapabilitiesSelected()
+        family: this.researchCapabilitiesSelected() || this.liveVoiceSelected() ? 'default' : this.formFamily().trim(),
+        context_window: this.researchCapabilitiesSelected() || this.liveVoiceSelected()
           ? null
           : this.formContextWindow() ?? null,
         params_json: paramsJson,

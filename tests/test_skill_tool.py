@@ -43,6 +43,20 @@ def test_use_skill_returns_body(tmp_path):
     assert "hello-skill" in out
 
 
+def test_use_skill_names_the_base_directory(tmp_path):
+    """Portable skills say ``scripts/x.py``; the agent's tools resolve paths
+    against the workspace root, so the result names the skill's directory."""
+    ws, use_skill = _use_skill(tmp_path)
+    ws.backend.mkdir("skills/hello-skill")
+    ws.write_file(
+        "skills/hello-skill/SKILL.md",
+        "---\nname: hello-skill\n---\nRun scripts/helper.py",
+    )
+    out = use_skill.invoke({"skill_name": "hello-skill"})
+    assert "Base directory for this skill: skills/hello-skill/" in out
+    assert out.index("Base directory") < out.index("Run scripts/helper.py")
+
+
 def test_use_skill_records_the_exact_instruction_version(tmp_path):
     ws, use_skill = _use_skill(tmp_path)
     body = "---\nname: hello-skill\n---\nVERSIONED-BODY"

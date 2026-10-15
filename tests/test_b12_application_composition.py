@@ -42,6 +42,7 @@ _PER_APPLICATION = (
     "job_dispatch_state",
     "kb_datasource_tasks",
     "cloud_task_registry",
+    "live_tasks",
     "project_repair_state",
     "stateless_workspace_ensure_registry",
     "attach_abort_successor_tasks",

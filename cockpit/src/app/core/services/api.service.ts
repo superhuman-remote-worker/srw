@@ -1,6 +1,7 @@
 import {inject, Injectable} from '@angular/core';
 import {
     HttpClient,
+    HttpContext,
     HttpErrorResponse,
     HttpEventType,
     HttpParams,
@@ -10,6 +11,7 @@ import {
 import {catchError, filter, map, Observable, of, tap, throwError, timeout} from 'rxjs';
 import {TranslocoService} from '@jsverse/transloco';
 import {AppToastService} from '../../ui/toast';
+import {VIEW_AS_OVERRIDE} from '../interceptors/view-as.interceptor';
 import {ErrorMessageService} from './error-message.service';
 import {
     Agent,
@@ -2621,11 +2623,13 @@ export class ApiService {
    * "you have no projects", which is the worst possible lie for a list that
    * decides where work goes.
    */
-  getProjects(userId?: string, status?: ProjectStatus[]): Observable<Project[]> {
+  getProjects(userId?: string, status?: ProjectStatus[], opts?: { selfScoped?: boolean }): Observable<Project[]> {
     let params = new HttpParams();
     if (userId) params = params.set('user_id', userId);
     for (const value of status ?? []) params = params.append('status', value);
-    return this.http.get<Project[]>(`${this.baseUrl}/projects`, { params });
+    // Self-scoped: an admin's fleet list would otherwise hold every user's projects.
+    const context = opts?.selfScoped ? new HttpContext().set(VIEW_AS_OVERRIDE, 'mine') : undefined;
+    return this.http.get<Project[]>(`${this.baseUrl}/projects`, { params, context });
   }
 
   getProject(id: string): Observable<Project | null> {

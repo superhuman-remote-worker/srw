@@ -716,8 +716,17 @@ class TestDeleteJobEndsLiveChildren:
             if text.startswith("SELECT * FROM vm_job_creation_owners"):
                 # This ordinary Job has no VM creation history.
                 return None
-            assert text.startswith("SELECT status, completion_outcome_kind,")
-            return {"status": "processing", "completion_outcome_kind": None}
+            assert text.startswith(
+                "SELECT status, execution_lane, completion_outcome_kind,"
+            )
+            assert "AS execution_harness_adapter" in text
+            assert text.endswith("FROM jobs WHERE id = $1 FOR UPDATE")
+            return {
+                "status": "processing",
+                "execution_lane": "pinned",
+                "completion_outcome_kind": None,
+                "execution_harness_adapter": None,
+            }
 
         conn.fetchrow = AsyncMock(side_effect=fetchrow)
         conn.fetchval = AsyncMock(return_value=None)

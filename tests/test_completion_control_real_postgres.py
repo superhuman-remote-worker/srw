@@ -24,7 +24,11 @@ from orchestrator.services.job_completion_commands import (
     CompletionControlInProgress,
     accept_completion_command,
 )
-from orchestrator.services.lifecycle import Instance, VMInstanceManager
+from orchestrator.services.lifecycle import (
+    Instance,
+    InstanceLifecycleReconciler,
+    VMInstanceManager,
+)
 from orchestrator.services.vm_provisioner import VMTeardownIdentity, VMTeardownResult
 from shared.worker_queue import claim_worker_batch
 from tests._previous_release_seed import seed_previous_release_row
@@ -85,6 +89,13 @@ class _PoolDB:
 
     def acquire(self):
         return self.pool.acquire()
+
+
+class _RetentionPoolDB(_PoolDB):
+    pinned_hold = False
+
+    async def pinned_ready_cancel_retention_held(self, _job_id):
+        return self.pinned_hold
 
 
 def _payload() -> dict[str, object]:
@@ -326,7 +337,14 @@ async def test_expired_lifecycle_owner_defers_to_completion_command_route(pg):
         router.enqueue_job.assert_not_awaited()
 
 
-def _real_pg_vm_manager(pg, *, identity: VMTeardownIdentity, outcome: VMTeardownResult):
+def _real_pg_vm_manager(
+    pg,
+    *,
+    identity: VMTeardownIdentity,
+    outcome: VMTeardownResult,
+    db_type=_PoolDB,
+):
+    db = db_type(pg)
     provisioner = MagicMock()
     provisioner.lifecycle_available = True
     provisioner.capture_vm_teardown_identity = AsyncMock(return_value=identity)
@@ -335,12 +353,12 @@ def _real_pg_vm_manager(pg, *, identity: VMTeardownIdentity, outcome: VMTeardown
         provisioner,
         MagicMock(),
         MagicMock(),
-        _PoolDB(pg),
+        db,
         completion_commands_enabled=True,
         completion_router=AsyncMock(),
     )
     manager._completion_lifecycle = CompletionLifecycleOwnership(
-        _PoolDB(pg), AsyncMock(), lease_seconds=5, heartbeat_seconds=0.5
+        db, AsyncMock(), lease_seconds=5, heartbeat_seconds=0.5
     )
     return manager, provisioner
 
@@ -380,6 +398,197 @@ async def test_vm_lifecycle_refuses_same_name_successor_with_real_claim(pg):
             await conn.fetchval("SELECT context FROM jobs WHERE id=$1", job_id)
         )
     assert COMPLETION_CONTROL_CLAIM_KEY not in context
+
+
+@pytest.mark.asyncio
+async def test_vm_lifecycle_releases_own_claim_after_read_only_identity_refusal(pg):
+    async with pg.acquire() as conn:
+        job_id = await _pinned_job(conn, status="completed", agent_id=None)
+
+    identity = VMTeardownIdentity(
+        provision_generation="00000000-0000-4000-8000-000000000001",
+        vm_uid="vm-uid-original",
+        rootdisk_pvc_uid="00000000-0000-4000-8000-000000000003",
+    )
+    manager, provisioner = _real_pg_vm_manager(
+        pg, identity=identity, outcome=VMTeardownResult("completed", True)
+    )
+
+    captured_claim_ids = []
+
+    async def refuse_identity(_job_id):
+        marker, db_now = await _claim_clock_snapshot(pg, job_id)
+        assert marker["source"] == "lifecycle_vm_delete"
+        assert marker["fence_value"] == identity.vm_uid
+        assert float(marker["expires_epoch"]) > db_now
+        captured_claim_ids.append(marker["claim_id"])
+        raise RuntimeError("synthetic read-only identity refusal")
+
+    provisioner.capture_vm_teardown_identity.side_effect = refuse_identity
+    listed = Instance(
+        kind="vm",
+        id="agent-vm-original",
+        bound_to=str(job_id),
+        metadata={
+            "scope": "job",
+            "job_status": "completed",
+            "execution_lane": "pinned",
+            "provision_generation": identity.provision_generation,
+            "vm_uid": identity.vm_uid,
+            "rootdisk_pvc_uid": identity.rootdisk_pvc_uid,
+        },
+    )
+
+    await manager.delete(listed, grace_s=0)
+
+    assert len(captured_claim_ids) == 1
+    provisioner.capture_vm_teardown_identity.assert_awaited_once_with(str(job_id))
+    provisioner.release_vm_captured.assert_not_awaited()
+    async with pg.acquire() as conn:
+        context = _context(
+            await conn.fetchval("SELECT context FROM jobs WHERE id=$1", job_id)
+        )
+    assert COMPLETION_CONTROL_CLAIM_KEY not in context
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("hold_kind", ["pinned_ready", "retained_terminal"])
+async def test_vm_reap_releases_own_claim_after_snapshot_and_retention_hold(
+    pg, hold_kind, monkeypatch
+):
+    generation, vm_uid, pvc_uid = uuid4(), uuid4(), uuid4()
+    async with pg.acquire() as conn:
+        job_id = await _pinned_job(conn, status="completed", agent_id=None)
+        await conn.execute(
+            "UPDATE jobs SET context=jsonb_set(COALESCE(context,'{}'::jsonb),"
+            "'{vm}',$2::jsonb,true) WHERE id=$1",
+            job_id,
+            json.dumps(
+                {
+                    "provision_generation": str(generation),
+                    "vm_uid": str(vm_uid),
+                    "rootdisk_pvc_uid": str(pvc_uid),
+                }
+            ),
+        )
+
+    retained_guard = AsyncMock(return_value=hold_kind == "retained_terminal")
+    monkeypatch.setattr(
+        "orchestrator.services.vm_idle_lifecycle.retained_terminal_rootdisk",
+        retained_guard,
+    )
+
+    identity = VMTeardownIdentity(
+        provision_generation=str(generation),
+        vm_uid=str(vm_uid),
+        rootdisk_pvc_uid=str(pvc_uid),
+    )
+    manager, provisioner = _real_pg_vm_manager(
+        pg,
+        identity=identity,
+        outcome=VMTeardownResult("completed", True),
+        db_type=_RetentionPoolDB,
+    )
+    manager._db.pinned_hold = hold_kind == "pinned_ready"
+    manager.is_reapable = AsyncMock(return_value=True)
+    manager.is_dirty = AsyncMock(return_value=True)
+    manager.is_reachable = AsyncMock(return_value=True)
+    manager.resume_pending_cleanup = AsyncMock(return_value="none")
+    manager.snapshot = AsyncMock(return_value=str(job_id))
+    manager._workspace_recovery_store.acquire_cleanup_permit = AsyncMock()
+    listed = Instance(
+        kind="vm",
+        id=f"agent-vm-{job_id}",
+        bound_to=str(job_id),
+        metadata={
+            "scope": "job",
+            "job_status": "completed",
+            "execution_lane": "pinned",
+            "provision_generation": str(generation),
+            "vm_uid": str(vm_uid),
+            "rootdisk_pvc_uid": str(pvc_uid),
+        },
+    )
+    stats = {"reaped": 0}
+
+    await InstanceLifecycleReconciler()._reap(manager, listed, stats)
+
+    manager.snapshot.assert_awaited_once_with(listed)
+    if hold_kind == "pinned_ready":
+        retained_guard.assert_not_awaited()
+    else:
+        retained_guard.assert_awaited_once_with(
+            manager._db,
+            job_id=str(job_id),
+            generation=str(generation),
+            pvc_uid=str(pvc_uid),
+        )
+    provisioner.release_vm_captured.assert_not_awaited()
+    manager._workspace_recovery_store.acquire_cleanup_permit.assert_not_awaited()
+    async with pg.acquire() as conn:
+        context = _context(
+            await conn.fetchval("SELECT context FROM jobs WHERE id=$1", job_id)
+        )
+        assert (
+            await conn.fetchval(
+                "SELECT count(*) FROM vm_workspace_cleanup_admissions "
+                "WHERE owner_kind='job' AND owner_id=$1",
+                job_id,
+            )
+            == 0
+        )
+        assert context["vm"]["rootdisk_pvc_uid"] == str(pvc_uid)
+    assert COMPLETION_CONTROL_CLAIM_KEY not in context
+    assert stats["reaped"] == 0
+
+
+@pytest.mark.asyncio
+async def test_vm_lifecycle_retains_claim_when_retention_probe_fails(pg, monkeypatch):
+    async with pg.acquire() as conn:
+        job_id = await _pinned_job(conn, status="completed", agent_id=None)
+
+    identity = VMTeardownIdentity(
+        provision_generation=str(uuid4()),
+        vm_uid=str(uuid4()),
+        rootdisk_pvc_uid=str(uuid4()),
+    )
+    manager, provisioner = _real_pg_vm_manager(
+        pg,
+        identity=identity,
+        outcome=VMTeardownResult("completed", True),
+        db_type=_RetentionPoolDB,
+    )
+    retained_guard = AsyncMock(side_effect=RuntimeError("synthetic probe outage"))
+    monkeypatch.setattr(
+        "orchestrator.services.vm_idle_lifecycle.retained_terminal_rootdisk",
+        retained_guard,
+    )
+    listed = Instance(
+        kind="vm",
+        id=f"agent-vm-{job_id}",
+        bound_to=str(job_id),
+        metadata={
+            "scope": "job",
+            "job_status": "completed",
+            "execution_lane": "pinned",
+            "provision_generation": identity.provision_generation,
+            "vm_uid": identity.vm_uid,
+            "rootdisk_pvc_uid": identity.rootdisk_pvc_uid,
+        },
+    )
+
+    await manager.delete(listed, grace_s=0)
+
+    retained_guard.assert_awaited_once_with(
+        manager._db,
+        job_id=str(job_id),
+        generation=identity.provision_generation,
+        pvc_uid=identity.rootdisk_pvc_uid,
+    )
+    provisioner.release_vm_captured.assert_not_awaited()
+    marker, db_now = await _claim_clock_snapshot(pg, job_id)
+    assert marker["source"] == "lifecycle_vm_delete"
+    assert float(marker["expires_epoch"]) > db_now
 
 
 @pytest.mark.asyncio

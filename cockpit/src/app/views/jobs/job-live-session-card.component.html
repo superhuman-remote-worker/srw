@@ -1,0 +1,128 @@
+<article class="session-card" [class.session-card--mobile]="viewport.isMobile()">
+  <header class="session-header">
+    <div class="session-identity">
+      <span class="material-symbols-outlined direction-icon" aria-hidden="true">
+        {{ session().direction === 'inbound' ? 'call_received' : 'call_made' }}
+      </span>
+      <div>
+        <h3>{{ session().from_number || ('jobs.liveSessions.title' | transloco) }}</h3>
+        <p class="session-connector">
+          {{ 'jobs.liveSessions.connector' | transloco }}:
+          {{ connectorName() || session().connector_id }}
+        </p>
+        <p class="session-route">
+          <span class="direction-label">{{
+            'jobs.liveSessions.direction.' + session().direction | transloco
+          }}</span>
+          <span>{{ session().from_number }}</span>
+          <span aria-hidden="true">→</span>
+          <span class="sr-only">{{ 'jobs.liveSessions.to' | transloco }}</span>
+          <span>{{ session().to_number }}</span>
+        </p>
+      </div>
+    </div>
+    <div class="session-state">
+      <app-badge [tone]="tone()" shape="pill">
+        @if (session().status === 'active') {
+          <span class="live-dot" aria-hidden="true"></span>
+        }
+        {{ 'jobs.liveSessions.status.' + session().status | transloco }}
+      </app-badge>
+      @if (duration(); as elapsed) {
+        <span class="session-duration" [attr.aria-label]="'jobs.liveSessions.duration' | transloco">{{
+          elapsed
+        }}</span>
+      }
+    </div>
+    <span class="session-usage">{{ 'jobs.liveSessions.usage' | transloco: {seconds: session().usage_seconds} }}</span>
+    @if (session().error) { <p class="read-error">{{ session().error }}</p> }
+    @if (terminal() && session().close_reason) {
+      <p class="close-reason">{{ closeReason() }}</p>
+    }
+  </header>
+
+  <div class="transcript-heading">
+    <h4>{{ 'jobs.liveSessions.transcript' | transloco }}</h4>
+    @if (watch()?.error()) {
+      <span class="read-error" role="status">{{ 'jobs.liveSessions.loadError' | transloco }}</span>
+    }
+  </div>
+  <div
+    #transcript
+    class="session-transcript"
+    tabindex="0"
+    role="region"
+    [attr.aria-label]="'jobs.liveSessions.transcript' | transloco"
+    (scroll)="onScroll()"
+  >
+    @for (entry of journal().timeline; track entry.id) {
+      @switch (entry.type) {
+        @case ('transcript') {
+          <div
+            class="transcript-bubble"
+            [class.transcript-bubble--assistant]="entry.speaker === 'assistant'"
+          >
+            <span class="speaker-label">{{
+              'jobs.liveSessions.speaker.' + (entry.speaker || 'unknown') | transloco
+            }}</span>
+            <p>{{ entry.text }}</p>
+          </div>
+        }
+        @case ('backoffice') {
+          <div class="backoffice-card" [attr.data-state]="entry.state">
+            <div class="backoffice-heading">
+              <span class="material-symbols-outlined" aria-hidden="true">support_agent</span>
+              <strong>{{ 'jobs.liveSessions.backoffice' | transloco }}</strong>
+              <app-badge [tone]="entry.state === 'answered' ? 'success' : 'neutral'" size="xs">
+                {{ 'jobs.liveSessions.backofficeState.' + entry.state | transloco }}
+              </app-badge>
+            </div>
+            @if (entry.request) {
+              <p class="backoffice-request">{{ entry.request }}</p>
+            }
+            @if (entry.response) {
+              <p class="backoffice-response">{{ entry.response }}</p>
+            }
+          </div>
+        }
+        @case ('system') {
+          <p class="system-line" [class.system-line--error]="entry.kind === 'error'">
+            @if (entry.kind === 'instruction') {
+              <span>{{ 'jobs.liveSessions.steering' | transloco }} </span>
+            }
+            {{ entry.text }}
+          </p>
+        }
+      }
+    } @empty {
+      <p class="transcript-empty">
+        {{
+          (watch()?.loading()
+            ? 'jobs.liveSessions.loading'
+            : terminal()
+              ? 'jobs.liveSessions.empty'
+              : 'jobs.liveSessions.waiting'
+          ) | transloco
+        }}
+      </p>
+    }
+  </div>
+  @if (!following()) {
+    <div class="jump-latest">
+      <app-button variant="secondary" size="sm" (clicked)="jumpToLatest()">
+        <span class="material-symbols-outlined" aria-hidden="true">arrow_downward</span>
+        {{ 'jobs.liveSessions.jumpLatest' | transloco }}
+      </app-button>
+    </div>
+  }
+  @if (terminal() && journal().followUps.length) {
+    <section class="session-follow-ups" [attr.aria-label]="'jobs.liveSessions.followUps' | transloco">
+      <h4>{{ 'jobs.liveSessions.followUps' | transloco }}</h4>
+      <ul>
+        @for (item of journal().followUps; track item.id) {
+          <li>{{ item.text }}</li>
+        }
+      </ul>
+    </section>
+  }
+</article>

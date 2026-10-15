@@ -44,6 +44,265 @@ from tests.test_vm_job_initial_ready_retention_real_postgres import (  # noqa: F
 )
 
 
+async def failed_initialization_state(db, monkeypatch, *, old=False):
+    """Admit the real frozen recipe before publishing its failed guest receipt."""
+    from shared.workspace_initialization import initialization_request
+    from tests import test_vm_creation_retry_real_postgres as fixture_module
+
+    recipe = initialization_request(
+        [{"command": ["/usr/bin/python3", "-c", "raise SystemExit(23)"]}]
+    )
+    original = fixture_module.build_vm_creation_request
+    monkeypatch.setattr(
+        fixture_module,
+        "build_vm_creation_request",
+        lambda **kwargs: original(**kwargs, initialization=recipe),
+    )
+    state = await cancelled(db, old=old, retiring=False)
+    owner = UUID(state["job_id"])
+    context = json.loads(
+        await db.fetchval("SELECT context FROM jobs WHERE id=$1", owner)
+    )
+    context["vm"].update(
+        status="failed",
+        initialization=recipe,
+        initialization_receipt={
+            "version": 1,
+            "ownerId": str(owner),
+            "revision": recipe["revision"],
+            "phase": "Failed",
+            "step": 0,
+            "exitCode": 23,
+        },
+        initialization_started_at=123.0,
+        error="Workspace initialization failed at step 1 (exit 23)",
+        ssh_probe_error="Workspace initialization failed at step 1 (exit 23)",
+    )
+    await db.execute(
+        "UPDATE jobs SET context=$2::jsonb,error_message='initialization failed',"
+        "failed_at=clock_timestamp() WHERE id=$1",
+        owner,
+        json.dumps(context),
+    )
+    return state
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("old", [False, True])
+async def test_failed_initialization_cancel_admits_exact_policy1_retention(
+    db, monkeypatch, old
+):
+    state = await failed_initialization_state(db, monkeypatch, old=old)
+    owner = UUID(state["job_id"])
+    before = await db.fetchrow(
+        "SELECT context,error_message,failed_at FROM jobs WHERE id=$1", owner
+    )
+    permit = await acquire(state)
+    assert permit.allowed, permit.reason
+    assert permit.parent_cleanup["intent"]["purge_disk"] is False
+    after = await db.fetchrow(
+        "SELECT context,error_message,failed_at FROM jobs WHERE id=$1", owner
+    )
+    expected = json.loads(before["context"])
+    expected["vm"]["status"] = "retiring_process_zero"
+    assert json.loads(after["context"]) == expected
+    assert (after["error_message"], after["failed_at"]) == (
+        before["error_message"],
+        before["failed_at"],
+    )
+    authority = await db.fetchrow(
+        "SELECT policy_version,completed_at FROM vm_job_cancel_retention_authorities a "
+        "JOIN vm_workspace_cleanup_admissions c ON c.id=a.cleanup_admission_id "
+        "WHERE a.job_id=$1",
+        owner,
+    )
+    assert authority["policy_version"] == 1 and authority["completed_at"] is None
+    assert (
+        await db.fetchval(
+            "SELECT count(*) FROM vm_pre_ssh_stop_intents WHERE job_id=$1", owner
+        )
+        == 0
+    )
+    assert (
+        await db.fetchval(
+            "SELECT count(*) FROM managed_repository_process_zero_receipts WHERE owner_id=$1",
+            owner,
+        )
+        == 0
+    )
+    assert (
+        await db.fetchval(
+            "SELECT ready_at FROM vm_creation_retries WHERE job_id=$1", owner
+        )
+        is None
+    )
+    assert (
+        await db.fetchval(
+            "SELECT state FROM vm_resource_reservations WHERE id=$1",
+            UUID(state["reservation_id"]),
+        )
+        == "teardown"
+    )
+    assert await acquire(state) == permit
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "fault",
+    [
+        "missing_receipt",
+        "generic_failure",
+        "receipt_owner",
+        "receipt_revision",
+        "receipt_version",
+        "receipt_running",
+        "receipt_exit_zero",
+        "receipt_step",
+        "recipe_changed",
+        "unauthenticated",
+        "ready",
+        "generation",
+        "request_id",
+        "inherited",
+        "leased_queue",
+        "later_retry",
+        "worker_attempt",
+        "foreign_launcher",
+        "receipt_extra",
+        "receipt_exit_range",
+        "vm_recipe_bool",
+        "vm_recipe_float",
+    ],
+)
+async def test_failed_initialization_cancel_refusal_preserves_failed_context(
+    db, monkeypatch, fault
+):
+    state = await failed_initialization_state(db, monkeypatch)
+    owner = UUID(state["job_id"])
+    context = json.loads(
+        await db.fetchval("SELECT context FROM jobs WHERE id=$1", owner)
+    )
+    vm = context["vm"]
+    if fault == "missing_receipt":
+        vm.pop("initialization_receipt")
+    elif fault == "generic_failure":
+        vm.pop("initialization")
+        vm.pop("initialization_receipt")
+    elif fault.startswith("receipt_"):
+        if fault == "receipt_extra":
+            vm["initialization_receipt"]["unexpected"] = True
+        elif fault == "receipt_exit_range":
+            vm["initialization_receipt"]["exitCode"] = 256
+        else:
+            key, value = {
+                "receipt_owner": ("ownerId", str(uuid4())),
+                "receipt_revision": ("revision", "a" * 64),
+                "receipt_version": ("version", True),
+                "receipt_running": ("phase", "Running"),
+                "receipt_exit_zero": ("exitCode", 0),
+                "receipt_step": ("step", 1),
+            }[fault]
+            vm["initialization_receipt"][key] = value
+    elif fault == "recipe_changed":
+        vm["initialization"]["steps"][0]["command"] = ["true"]
+    elif fault in {"vm_recipe_bool", "vm_recipe_float"}:
+        vm["initialization"]["version"] = True if fault == "vm_recipe_bool" else 1.0
+    elif fault == "unauthenticated":
+        vm["identity_authenticated"] = False
+    elif fault == "ready":
+        await db.execute(
+            "UPDATE vm_creation_retries SET ready_at=clock_timestamp() WHERE job_id=$1",
+            owner,
+        )
+    elif fault == "generation":
+        from orchestrator.services.vm_provisioner import VMTeardownIdentity
+
+        state["identity"] = VMTeardownIdentity(
+            str(uuid4()), state["identity"].vm_uid, state["identity"].rootdisk_pvc_uid
+        )
+    elif fault == "request_id":
+        vm["creation_request_id"] = str(uuid4())
+    elif fault == "inherited":
+        context["inherits_parent_workspace"] = True
+    elif fault == "foreign_launcher":
+        vm["active_pod_uid"] = str(uuid4())
+    elif fault == "worker_attempt":
+        await db.execute(
+            "INSERT INTO worker_batch_attempts(job_id,lease_token,claimed_attempt) VALUES($1,1,1)",
+            owner,
+        )
+    elif fault == "later_retry":
+        # An archived later row must retain the original SQL latest-generation
+        # fence. Only this owned test database bypasses its insertion trigger.
+        async with db.acquire() as conn, conn.transaction():
+            await conn.execute("SET LOCAL session_replication_role=replica")
+            await conn.execute(
+                "INSERT INTO vm_creation_retries SELECT (jsonb_populate_record("
+                "NULL::vm_creation_retries,to_jsonb(r)||jsonb_build_object("
+                "'request_id',$2::text,'provision_generation',$3::text,"
+                "'created_at',clock_timestamp()+interval '1 second'))).* "
+                "FROM vm_creation_retries r WHERE r.job_id=$1",
+                owner,
+                str(uuid4()),
+                str(uuid4()),
+            )
+    else:
+        await db.execute(
+            "UPDATE run_queue SET state='leased',lease_token=lease_token+1,"
+            "leased_by='test-old-worker',leased_until=clock_timestamp()+interval '1 minute' WHERE unit_id=$1",
+            owner,
+        )
+    await db.execute(
+        "UPDATE jobs SET context=$2::jsonb WHERE id=$1", owner, json.dumps(context)
+    )
+    before = await db.fetchval("SELECT context FROM jobs WHERE id=$1", owner)
+    permit = await acquire(state)
+    assert permit is not None and not permit.allowed
+    assert await db.fetchval("SELECT context FROM jobs WHERE id=$1", owner) == before
+    assert (
+        await db.fetchval(
+            "SELECT count(*) FROM vm_job_cancel_retention_authorities WHERE job_id=$1",
+            owner,
+        )
+        == 0
+    )
+
+
+@pytest.mark.asyncio
+async def test_failed_initialization_late_admission_refusal_rolls_back_transition(
+    db, monkeypatch
+):
+    from orchestrator.services.vm_workspace_recovery_store import CleanupPermit
+    from shared.vm_resource_admission import ResourceAdmissionError
+
+    state = await failed_initialization_state(db, monkeypatch)
+    owner = UUID(state["job_id"])
+    before = await db.fetchval("SELECT context FROM jobs WHERE id=$1", owner)
+    observed = []
+
+    async def refuse(conn, **_kwargs):
+        context = json.loads(
+            await conn.fetchval("SELECT context FROM jobs WHERE id=$1", owner)
+        )
+        observed.append(context["vm"]["status"])
+        return CleanupPermit(allowed=False, reason="injected_late_admission_refusal")
+
+    monkeypatch.setattr(state["recovery"], "acquire_cleanup_permit_on_conn", refuse)
+    with pytest.raises(
+        ResourceAdmissionError, match="cancel_retention_successor_refused"
+    ):
+        await acquire(state)
+    assert observed == ["retiring_process_zero"]
+    assert await db.fetchval("SELECT context FROM jobs WHERE id=$1", owner) == before
+    assert (
+        await db.fetchval(
+            "SELECT count(*) FROM vm_job_cancel_retention_authorities WHERE job_id=$1",
+            owner,
+        )
+        == 0
+    )
+
+
 @pytest_asyncio.fixture(scope="module")
 async def held_stop_schema(pg_dsn, initial_ready_schema):  # noqa: F811
     root = (
@@ -283,10 +542,11 @@ async def assert_late_adopted_delete_audit(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("creation_source", ["late_adopted", "failed_initialization"])
 async def test_late_adopted_policy1_release_bootstraps_exact_stop_before_retention(
-    db, monkeypatch
+    db, monkeypatch, creation_source
 ):
-    """A settled creation retry must enter the real release path without a stop intent."""
+    """Both never-ready sources enter the real release path before a stop intent."""
     from orchestrator.services import vm_provisioner as module
     from orchestrator.services.vm_provisioner import (
         VMProvisioner,
@@ -301,17 +561,18 @@ async def test_late_adopted_policy1_release_bootstraps_exact_stop_before_retenti
         publish_cancelled_launcher,
     )
 
-    state = await late_adopted_state(db)
+    state = (
+        await failed_initialization_state(db, monkeypatch)
+        if creation_source == "failed_initialization"
+        else await late_adopted_state(db)
+    )
     await publish_cancelled_launcher(state)
     permit = await acquire(state)
     assert permit.allowed, permit.reason
     job_id = UUID(state["job_id"])
-    assert (
-        await db.fetchval(
-            "SELECT state FROM vm_creation_retries WHERE job_id=$1", job_id
-        )
-        == "settled"
-    )
+    assert await db.fetchval(
+        "SELECT state FROM vm_creation_retries WHERE job_id=$1", job_id
+    ) == ("succeeded" if creation_source == "failed_initialization" else "settled")
     assert (
         await db.fetchval(
             "SELECT count(*) FROM vm_pre_ssh_stop_intents WHERE job_id=$1", job_id

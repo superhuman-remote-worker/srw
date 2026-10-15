@@ -2,8 +2,8 @@
 
 The main cloud is configured by Helm only (main_cloud_as_connectors.md,
 slice 2). ``GET /api/admin/main-cloud`` reports the provider, its installation,
-its health, where the configuration comes from and the provider support
-matrix; nothing here changes the configuration.
+its health, its background jobs and retention, where the configuration comes
+from and the provider support matrix; nothing here changes the configuration.
 
 The removed connection-form API answers **410 Gone** rather than 404: a
 cached cockpit or a script still calling it learns that the endpoint was
@@ -68,9 +68,9 @@ async def get_main_cloud_page(
         get_main_cloud_settings_dependencies
     ),
 ) -> dict[str, Any]:
-    """The read-only Main cloud page: provider, installation, health, the
-    configuration's source and the provider support matrix. Admin-only; holds
-    no secret."""
+    """The read-only Main cloud page: provider, installation, health,
+    background jobs and retention, the configuration's source and the
+    provider support matrix. Admin-only; holds no secret."""
     await dependencies.require_admin(request)
     return await main_cloud_settings.get_main_cloud_page(
         dependencies=dependencies.operations

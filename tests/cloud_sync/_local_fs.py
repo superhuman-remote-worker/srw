@@ -156,10 +156,10 @@ class FailingLocalFsWorkspaceSync(LocalFsWorkspaceSync):
         if_match: Optional[str] = None,
         if_none_match: bool = False,
     ) -> Optional[str]:
-        # ``_ensure_remote_dirs`` deliberately swallows mkdir errors (treats
-        # them as "already exists"), so failing on dir creation won't
-        # surface to the strict-mode caller. Failing on the actual upload
-        # is what the algorithm propagates.
+        # ``_ensure_remote_dirs`` deliberately swallows mkdir errors (the
+        # upload below reports the real one), so failing on dir creation
+        # won't surface to the strict-mode caller. Failing on the actual
+        # upload is what the algorithm propagates.
         if self._fail_on == "push":
             raise RuntimeError(self._message)
         await super()._upload_file(rel_path, local_path, before_write=before_write)

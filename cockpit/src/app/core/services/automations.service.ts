@@ -1,14 +1,13 @@
 import {Injectable, inject, signal} from '@angular/core';
 import {HttpClient, HttpParams} from '@angular/common/http';
 import {Observable, catchError, of, tap} from 'rxjs';
+import {WorkspaceBinding} from '../models/workspace-template.model';
 import {environment} from '../environment';
 
 /**
  * An automation row as returned by `GET /api/automations` and friends.
  *
- * Cron-only in v0 — `trigger_type` is always 'cron' and `event_filter` is
- * always null. The v0.5 event-trigger types land here without a breaking
- * change.
+ * Live triggers bind a primary connector; scheduled triggers carry cron fields.
  */
 export interface Automation {
   id: string;
@@ -17,7 +16,9 @@ export interface Automation {
 
   name: string;
   description: string | null;
-  trigger_type: 'cron' | 'event';
+  trigger_type: 'cron' | 'live';
+  trigger_connector_id?: string | null;
+  job_shape?: AutomationJobShape | null;
 
   cron_expr: string | null;
   timezone: string;
@@ -50,11 +51,21 @@ export interface Automation {
   updated_at: string;
 }
 
+export interface AutomationJobShape {
+  primary_connector?: string;
+  execution?: {connectors: Record<string, {ref: {uid: string}}>};
+  /** Omitted = default; null = no workspace. */
+  workspace?: WorkspaceBinding;
+}
+
 /** Request shape for `POST /api/automations`. */
 export interface CreateAutomationRequest {
   name: string;
   description?: string | null;
-  cron_expr: string;
+  trigger_type?: 'cron' | 'live';
+  primary_connector?: string;
+  job_shape?: AutomationJobShape;
+  cron_expr?: string;
   timezone?: string;
   catchup_window_seconds?: number;
   expert: string;
@@ -70,8 +81,9 @@ export interface CreateAutomationRequest {
 }
 
 /** Patchable subset for `PATCH /api/automations/{id}`. Server recomputes
- *  next_run_at when cron_expr / timezone / enabled changes. */
-export type UpdateAutomationRequest = Partial<CreateAutomationRequest>;
+ *  next_run_at when cron_expr / timezone / enabled changes. The trigger and
+ *  the project are fixed at create. */
+export type UpdateAutomationRequest = Partial<Omit<CreateAutomationRequest, 'trigger_type' | 'project_id'>>;
 
 /** Minimal job shape returned by the runs list — full job detail lives in
  *  the existing job-detail view we link to. */

@@ -40,6 +40,26 @@ export interface MainCloudMatrix {
 
 export type MainCloudHelmState = 'matches' | 'differs' | 'invalid';
 
+/** How the provider schedules its background jobs (Nextcloud's `backgroundjobs_mode`). */
+export type MainCloudBackgroundJobsMode = 'cron' | 'ajax' | 'webcron' | 'none';
+
+/** The provider's background-job (cron) health (bundled_nextcloud_performance.md, D13). */
+export interface MainCloudBackgroundJobs {
+  /** null: it could not be read. */
+  mode: MainCloudBackgroundJobsMode | null;
+  /** The last finished run (ISO 8601); null before the first, or unread. */
+  last_run_at: string | null;
+  /** The mode is cron and no run finished in the last 15 minutes, or none ever did. */
+  stale: boolean;
+  /** Whether the chart runs its cron container; null: an external Nextcloud. */
+  cron_container: boolean | null;
+}
+
+/** Trash and version retention: pinned by the chart, or the server's own administrator's. */
+export type MainCloudRetention =
+  | {source: 'chart'; trashbin: string | null; versions: string | null}
+  | {source: 'external'};
+
 export interface MainCloudPage {
   provider: {
     backend_id: string;
@@ -51,6 +71,13 @@ export interface MainCloudPage {
     initialized: boolean;
   };
   health: {ok: boolean; latency_ms: number | null; detail: string};
+  /**
+   * null for a provider without background jobs (OpenCloud); absent from an
+   * orchestrator older than D13. Either way the page shows nothing.
+   */
+  background_jobs?: MainCloudBackgroundJobs | null;
+  /** Reported with `background_jobs`: trash and version expiry are background jobs. */
+  retention?: MainCloudRetention | null;
   configuration: {
     source: 'helm';
     helm: {state: MainCloudHelmState; backend_id: string | null; detail: string};

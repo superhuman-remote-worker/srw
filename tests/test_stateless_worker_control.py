@@ -750,8 +750,17 @@ async def test_final_prepared_delete_removes_queue_and_job_atomically():
         if normalized.startswith("SELECT execution_lane"):
             lock_order.append("job")
             return {"execution_lane": "stateless", "delete_pending": True}
-        if normalized.startswith("SELECT status, completion_outcome_kind,"):
-            return {"status": "created", "completion_outcome_kind": None}
+        if normalized.startswith(
+            "SELECT status, execution_lane, completion_outcome_kind,"
+        ):
+            assert "AS execution_harness_adapter" in normalized
+            assert normalized.endswith("FROM jobs WHERE id = $1 FOR UPDATE")
+            return {
+                "status": "created",
+                "execution_lane": "stateless",
+                "completion_outcome_kind": None,
+                "execution_harness_adapter": None,
+            }
         if normalized.startswith("SELECT * FROM vm_job_creation_owners WHERE job_id="):
             # Ordinary stateless Job: no VM retry has created an audit owner.
             return None

@@ -161,6 +161,11 @@ cloud:
   externalUrl: "https://cloud.internal.example.com"
   externalServiceUrl: "https://cloud.internal.example.com"
   # CLOUD_SERVICE_USER / CLOUD_SERVICE_PASSWORD live in srw-secrets.
+  # Nextcloud only: if its admin changed the share-create rate limit (default
+  # 20 per 600 s per user), mirror it so SRW stays under it.
+  # shareRateLimit:
+  #   limit: 200
+  #   periodSeconds: 600
 
 # -----------------------------------------------------------------------------
 # S3 / object storage — used for snapshot / backup archives.

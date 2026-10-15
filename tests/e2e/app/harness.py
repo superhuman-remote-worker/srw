@@ -57,6 +57,9 @@ K3S_IMAGE: Final = "rancher/k3s:v1.31.5-k3s1"
 DEPENDENCY_IMAGES: Final = (
     "busybox:1.36",
     "postgres:15",
+    # The bundled Nextcloud's database (databases.nextcloud.image), which also
+    # runs its wait-for-nextclouddb init container.
+    "postgres:16",
     "pgvector/pgvector:pg15",
     "quay.io/keycloak/keycloak:26.2",
     # k3s local-path creates one helper pod per PVC from this image. Import it
@@ -456,6 +459,11 @@ class SecretBundle:
     #: value, so both halves must read the same key or the orchestrator
     #: authenticates as an account whose password only Nextcloud knows.
     nextcloud_agent_password: str = dataclasses.field(repr=False)
+    #: The bundled Nextcloud's Postgres password. `srw-nextclouddb` reads it
+    #: with a required `secretKeyRef`, so the profile that bundles Nextcloud
+    #: cannot start its database without it; Nextcloud installs against the
+    #: same key. Minted unconditionally like the other Nextcloud keys.
+    nextcloud_db_password: str = dataclasses.field(repr=False)
     #: Root key for per-workspace code-server credentials. The orchestrator's
     #: `secretKeyRef` for `IDE_CREDENTIAL_KEY` is `optional: true` and
     #: `services/ide_proxy.py` fails *closed* without it: the thread's IDE
@@ -522,6 +530,7 @@ class SecretBundle:
             nextcloud_oidc_secret=token(48),
             nextcloud_admin_password=token(24),
             nextcloud_agent_password=token(24),
+            nextcloud_db_password=token(),
             # `secret.yaml` generates randAlphaNum(48) for this key when the
             # chart owns the Secret; match that length here.
             ide_credential_key=token(36),
@@ -585,6 +594,7 @@ class SecretBundle:
             # mount. Nextcloud's setup hook creates `agent-service` with this
             # exact value, so the two sides must agree.
             "NEXTCLOUD_AGENT_PASSWORD": self.nextcloud_agent_password,
+            "NEXTCLOUD_DB_PASSWORD": self.nextcloud_db_password,
             # Minted unconditionally like the rest: the profile that enables
             # the bundled object store pulls these in, and a key the harness
             # does not mint is a pod that never starts.

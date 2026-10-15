@@ -266,6 +266,51 @@ def env_endpoint_names(prefix: str) -> tuple[str, ...]:
     return ENV_ENDPOINT_ALIASES.get(prefix, (f"{prefix}_BASE_URL",))
 
 
+# ---------------------------------------------------------------------------
+# Provider-key endpoints for the flat capabilities
+# ---------------------------------------------------------------------------
+#
+# A provider-key catalog row (``provider_kind='system'``) has no endpoint of
+# its own: its key belongs to the provider's API. The chat factories know that
+# URL, but the flat-env clients (embedding, rerank, vision, whisper, tts,
+# citation) are plain OpenAI-compatible clients that default to
+# api.openai.com. Dispatch therefore writes the provider's OpenAI-compatible
+# base URL next to the key, so the key can only ever reach its own provider.
+# A provider missing here has no such API; dispatch withholds its key rather
+# than let a client fall back to api.openai.com with it.
+PROVIDER_OPENAI_COMPATIBLE_BASE_URLS: dict[str, str] = {
+    "openai": OPENAI_CANONICAL_BASE_URL,
+    "openrouter": "https://openrouter.ai/api/v1",
+    "groq": "https://api.groq.com/openai/v1",
+    "mistral": "https://api.mistral.ai/v1",
+    "google": "https://generativelanguage.googleapis.com/v1beta/openai",
+}
+
+
+def provider_base_url(provider: Optional[str]) -> Optional[str]:
+    """The OpenAI-compatible base URL of ``provider``'s own API, or ``None``."""
+    return PROVIDER_OPENAI_COMPATIBLE_BASE_URLS.get((provider or "").lower())
+
+
+def wire_model_id(model: str, base_url: Optional[str]) -> str:
+    """The model name to send to ``base_url`` for catalog id ``model``.
+
+    Catalog ids of provider-key rows carry the provider as a routing prefix
+    (``openrouter/qwen/qwen3-reranker-8b``); the provider's own API names the
+    model without it and rejects the prefixed id (OpenRouter answers 400 on
+    ``/rerank`` and ``/embeddings``). The prefix is dropped only when the
+    request goes to that provider's own API, the same rule the chat factories
+    apply; any other host receives the id unchanged.
+    """
+    if not model or "/" not in model:
+        return model
+    prefix, rest = model.split("/", 1)
+    canonical = provider_base_url(prefix)
+    if rest and canonical and base_url and same_endpoint(base_url, canonical):
+        return rest
+    return model
+
+
 # The flat capabilities the orchestrator's dispatch injectors write into a
 # delivered ``env_keys`` block — the only names an agent may export from it
 # into its process environment. Anything else (an arbitrary SDK variable) is

@@ -77,27 +77,36 @@ spec:
             {{- end }}
             - name: MCP_BASE_URL
               value: {{ include "srw.mcpUrl" . | quote }}
-          # Tool registration and OIDC discovery can outlast the liveness
-          # window on a cold VM at the default CPU limit. Gate those checks
-          # on successful startup, as for the orchestrator and agents.
+          # Tool registration and OIDC discovery (retried for up to
+          # MCP_OIDC_DISCOVERY_TIMEOUT_S, 240 s by default) can outlast the
+          # liveness window on a cold VM at the default CPU limit. Gate those
+          # checks on successful startup, as for the orchestrator and agents.
+          # Startup and liveness ask only whether this process serves
+          # (/livez): an orchestrator restart must not get MCP killed too.
           startupProbe:
             httpGet:
-              path: /health
+              path: /livez
               port: 8000
             failureThreshold: 30
             periodSeconds: 10
           livenessProbe:
             httpGet:
-              path: /health
+              path: /livez
               port: 8000
             initialDelaySeconds: 10
             periodSeconds: 10
+          # Readiness checks the orchestrator. Its client retries a connect
+          # failure after 1 s and 2 s, so the probe waits longer than that
+          # and tolerates a brief orchestrator restart before taking MCP out
+          # of the Service.
           readinessProbe:
             httpGet:
               path: /health
               port: 8000
             initialDelaySeconds: 5
             periodSeconds: 5
+            timeoutSeconds: 5
+            failureThreshold: 3
           resources:
             {{- toYaml .Values.mcp.resources | nindent 12 }}
 {{- end }}

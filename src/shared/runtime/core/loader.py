@@ -1899,6 +1899,10 @@ class InstructionMatrixResolver(MatrixResolver):
         "strategic_todos_initial": "strategic_todos_initial.yaml",
         "strategic_todos_transition": "strategic_todos_transition.yaml",
         "strategic_todos_resume": "strategic_todos_resume.yaml",
+        # Live-session jobs: the tactical first phase, and the strategic phase
+        # after the session ended (live_session_jobs §6.1).
+        "live_tactical_todos": "live_tactical_todos.yaml",
+        "live_post_session_todos": "live_post_session_todos.yaml",
         "workspace_template": "workspace_template.md",
     }
 
@@ -2456,6 +2460,11 @@ class PhaseSettings:
 
     min_todos: int = 5  # Minimum todos required for strategic->tactical transition
     max_todos: int = 20  # Maximum todos allowed for strategic->tactical transition
+    #: Tactical-only tools this expert may also call in the strategic phase.
+    #: For an expert whose strategic phase acts, not only plans (the voice
+    #: desk does a live session's follow-ups with its datasource tools in the
+    #: strategic phase after the session).
+    strategic_tools: List[str] = field(default_factory=list)
 
 
 @dataclass
@@ -3557,6 +3566,7 @@ def load_agent_config(
     phase_config = PhaseSettings(
         min_todos=phase_data.get("min_todos", 5),
         max_todos=phase_data.get("max_todos", 20),
+        strategic_tools=[str(t) for t in (phase_data.get("strategic_tools") or [])],
     )
 
     memory_data = data.get("memory", {})
@@ -3828,6 +3838,7 @@ def load_agent_config_from_dict(
     phase_config = PhaseSettings(
         min_todos=phase_data.get("min_todos", 5),
         max_todos=phase_data.get("max_todos", 20),
+        strategic_tools=[str(t) for t in (phase_data.get("strategic_tools") or [])],
     )
 
     memory_data = data.get("memory", {})
@@ -4981,19 +4992,26 @@ def _create_anthropic_llm(
 # do NOT force a thinking level (3.5-flash's own default is "medium"; forcing
 # "high" raises latency and loop risk) and do NOT inflate ``max_output_tokens`` (a
 # loop just fills whatever cap it's given — more tokens wasted before the guard
-# fires, not fewer).
+# fires, not fewer). A family that declares Google's thinking ladder in the
+# matrix (Argon, 3.8 Flash) defaults to the provider's own "medium" and sends
+# the level as ``thinking_level``, so a higher level is the user's explicit pick.
 _GEMINI_THINKING_MIN_TEMPERATURE = 1.0
+
+#: Google's ``ThinkingLevel`` enum. A family ladder value outside it never
+#: reaches the wire.
+_GEMINI_THINKING_LEVELS = frozenset({"minimal", "low", "medium", "high"})
 
 
 def _is_gemini_3_or_later(model: str) -> bool:
-    """Gemini 3.x (incl. 3.5) — the generation with the temp-0 thinking loop."""
-    return "gemini-3" in (model or "").lower().replace("models/", "")
+    """Gemini 3.x and later (incl. 3.5, 3.8 and 4) — the temp-0 loop generation."""
+    match = re.search(r"gemini-(\d+)", (model or "").lower())
+    return match is not None and int(match.group(1)) >= 3
 
 
 def _is_gemini_thinking_model(model: str) -> bool:
-    """Gemini 2.5 and 3.x emit internal reasoning ("thinking" models)."""
+    """Gemini 2.5 and later emit internal reasoning ("thinking" models)."""
     m = (model or "").lower().replace("models/", "")
-    return "gemini-2.5" in m or "gemini-3" in m
+    return "gemini-2.5" in m or _is_gemini_3_or_later(m)
 
 
 def _create_google_llm(
@@ -5049,6 +5067,24 @@ def _create_google_llm(
             ):
                 llm_kwargs["temperature"] = _GEMINI_THINKING_MIN_TEMPERATURE
                 thinking_mode += f" temp={_GEMINI_THINKING_MIN_TEMPERATURE}"
+
+    # Thinking depth rides `thinking_level` only when the model's own matrix
+    # family declares an effort ladder (Argon, 3.8 Flash). The generic `gemini`
+    # block declares none, so older rows keep the model's default (2.5 takes a
+    # token budget instead), and a Gemini id that fell through to `default`
+    # never inherits that block's ladder.
+    _rplan = resolve_reasoning_plan(config)
+    if (
+        family_of(config.model) != "default"
+        and _rplan["method"] == "effort_enum"
+        and _rplan.get("value")
+    ):
+        level = _clamp_reasoning_level(
+            _rplan["value"], _supported_efforts(_rplan["cap"])
+        )
+        if level in _GEMINI_THINKING_LEVELS:
+            llm_kwargs["thinking_level"] = level
+            thinking_mode += f" level={level}"
 
     llm = ChatGoogleGenerativeAI(**llm_kwargs)
 
@@ -7252,6 +7288,63 @@ def get_resume_strategic_todos_from_config(
         }
         for t in raw_todos
     ]
+
+
+def _instruction_todos_from_config(
+    instruction_type: str,
+    config: Optional["AgentConfig"],
+    tool_names: Optional[List[str]],
+) -> List[Dict[str, Any]]:
+    """One todo-list instruction (``<type>.yaml``) in TodoManager format.
+
+    Frozen content (``_resolved_instructions``) wins, then the expert's file,
+    then the framework template; ``[]`` when none exists.
+    """
+    deployment_dir = config._deployment_dir if config else None
+    model = config.llm.model if config else ""
+    resolved_content = None
+    if config:
+        resolved = config.extra.get("_resolved_instructions", {}) or {}
+        resolved_content = resolved.get(instruction_type)
+    try:
+        raw_todos = load_strategic_todos_template(
+            f"{instruction_type}.yaml",
+            deployment_dir=deployment_dir,
+            model=model,
+            resolved_content=resolved_content,
+            tool_names=tool_names,
+        )
+    except FileNotFoundError:
+        logger.warning(
+            f"{instruction_type}.yaml not found, using empty list. Create "
+            f"config/templates/{instruction_type}.yaml or an expert override."
+        )
+        return []
+    return [
+        {
+            "id": f"todo_{t['id']}",
+            "content": t["content"],
+            "status": "pending",
+            "priority": "medium",
+        }
+        for t in raw_todos
+    ]
+
+
+def get_live_tactical_todos_from_config(
+    config: Optional["AgentConfig"] = None,
+    tool_names: Optional[List[str]] = None,
+) -> List[Dict[str, Any]]:
+    """Todos of a live-session job's tactical first phase (``live_tactical_todos``)."""
+    return _instruction_todos_from_config("live_tactical_todos", config, tool_names)
+
+
+def get_live_post_session_todos_from_config(
+    config: Optional["AgentConfig"] = None,
+    tool_names: Optional[List[str]] = None,
+) -> List[Dict[str, Any]]:
+    """Todos of the strategic phase after a live session (``live_post_session_todos``)."""
+    return _instruction_todos_from_config("live_post_session_todos", config, tool_names)
 
 
 # =============================================================================

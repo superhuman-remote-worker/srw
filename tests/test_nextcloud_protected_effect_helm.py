@@ -181,6 +181,8 @@ def test_enabled_lane_binds_one_config_to_server_client_and_bundle() -> None:
         "data": "/var/www/html",
         "setup-hook": "/opt/srw-protected-effect",
         "protected-effect-run": "/run/srw-nextcloud",
+        # The shared PHP ini drop-in (APCu size), not a lane file.
+        "server-config": "/usr/local/etc/php/conf.d/zz-srw.ini",
     }
     for probe_name in ("readinessProbe", "livenessProbe"):
         probe = nginx[probe_name]

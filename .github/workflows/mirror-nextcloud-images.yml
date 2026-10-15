@@ -1,0 +1,125 @@
+name: mirror-nextcloud-images
+
+# Copies the bundled Nextcloud's upstream images (-apache for Nextcloud and
+# cron, -fpm for the protected-effect pool) to GHCR, byte for byte, so the
+# chart can keep referencing the digests it pins after upstream re-pushes a
+# tag or stops serving an end-of-life major (decision U-D2).
+#
+# Manual only. Dispatch it for each Nextcloud version a chart release pins,
+# then switch the chart's values to the mirror; helm/README.md ("Nextcloud
+# images and major upgrades") has the values. Until then the chart keeps
+# pulling from docker.io.
+#
+# `crane copy` keeps the multi-arch index and every manifest unchanged, so the
+# mirror serves the same digests as docker.io. Content is read by digest from
+# mirror.gcr.io (the Docker Hub mirror the image builds use against rate
+# limits), and from docker.io only if the mirror lacks it; a digest reference
+# cannot be served different bytes by either.
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Nextcloud version to mirror, e.g. 31.0.14 (both -apache and -fpm)"
+        required: true
+        type: string
+      apache_digest:
+        description: "Index digest to mirror for <version>-apache (sha256:...), normally the one helm/values.yaml pins. Empty = whatever docker.io's tag points at now."
+        required: false
+        type: string
+      fpm_digest:
+        description: "Index digest to mirror for <version>-fpm (sha256:...). Empty = whatever docker.io's tag points at now."
+        required: false
+        type: string
+
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
+
+env:
+  # go-containerregistry release; bump deliberately, with its checksum.
+  CRANE_VERSION: v0.22.1
+  CRANE_SHA256: 0ab7a1d6932a213aed964ce97666c3077fe691c8606413674a8b3e0b9ec4cda0
+  TARGET: ghcr.io/superhuman-remote-worker/nextcloud
+
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Install crane
+        run: |
+          set -euo pipefail
+          curl -fsSL -o /tmp/crane.tar.gz \
+            "https://github.com/google/go-containerregistry/releases/download/${CRANE_VERSION}/go-containerregistry_Linux_x86_64.tar.gz"
+          echo "${CRANE_SHA256}  /tmp/crane.tar.gz" | sha256sum -c -
+          sudo tar -xzf /tmp/crane.tar.gz -C /usr/local/bin crane
+          crane version
+
+      - name: Log in to GHCR
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GHCR_USER: ${{ github.actor }}
+        run: printf '%s' "$GHCR_TOKEN" | crane auth login ghcr.io -u "$GHCR_USER" --password-stdin
+
+      - name: Copy -apache and -fpm by digest
+        # Inputs reach the script as environment, never as interpolated shell.
+        env:
+          VERSION: ${{ inputs.version }}
+          APACHE_DIGEST: ${{ inputs.apache_digest }}
+          FPM_DIGEST: ${{ inputs.fpm_digest }}
+        run: |
+          set -euo pipefail
+          if ! printf '%s' "$VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "::error::version must look like 31.0.14, got '${VERSION}'"
+            exit 1
+          fi
+          for digest in "$APACHE_DIGEST" "$FPM_DIGEST"; do
+            if [ -n "$digest" ] && ! printf '%s' "$digest" | grep -Eq '^sha256:[0-9a-f]{64}$'; then
+              echo "::error::a digest must look like sha256:<64 hex>, got '${digest}'"
+              exit 1
+            fi
+          done
+
+          {
+            echo "### Nextcloud ${VERSION} mirrored to \`${TARGET}\`"
+            echo
+            echo "| tag | reference to pin |"
+            echo "|---|---|"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          copy() {
+            local variant="$1" digest="$2"
+            local tag="${VERSION}-${variant}"
+            if [ -z "$digest" ]; then
+              digest=$(crane digest "docker.io/library/nextcloud:${tag}")
+              echo "docker.io/library/nextcloud:${tag} is ${digest} now"
+            fi
+            local source="mirror.gcr.io/library/nextcloud@${digest}"
+            if ! crane manifest "$source" >/dev/null 2>&1; then
+              echo "mirror.gcr.io lacks ${digest}; reading docker.io"
+              source="docker.io/library/nextcloud@${digest}"
+            fi
+            crane copy "$source" "${TARGET}:${tag}"
+            local copied
+            copied=$(crane digest "${TARGET}:${tag}")
+            if [ "$copied" != "$digest" ]; then
+              echo "::error::${TARGET}:${tag} is ${copied}, expected ${digest}"
+              exit 1
+            fi
+            echo "| \`${tag}\` | \`${TARGET}:${tag}@${digest}\` |" >> "$GITHUB_STEP_SUMMARY"
+          }
+
+          copy apache "$APACHE_DIGEST"
+          copy fpm "$FPM_DIGEST"
+
+          {
+            echo
+            echo "Set \`nextcloud.image\` and \`nextcloud.protectedEffect.fpmImage\` to the"
+            echo "references above. A new GHCR package is private: make"
+            echo "\`superhuman-remote-worker/nextcloud\` public, or give the cluster an"
+            echo "imagePullSecret for it, before switching."
+          } >> "$GITHUB_STEP_SUMMARY"

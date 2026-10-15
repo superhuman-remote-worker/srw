@@ -1599,17 +1599,42 @@ class VMCreationRetryStore:
                 # definitive API rejection is another attempt at the same
                 # stage and must retain its accumulated retry backoff.
                 advances_stage = latest is None or latest["state"] == "observed"
-                await conn.execute(
-                    "UPDATE vm_creation_retries SET creation_carrier_uid=$2,creation_carrier_namespace=$3,"
+                # The original claim can have little time left after disk and
+                # carrier preparation. Refresh only this still-current claim
+                # while committing a genuinely new effect, never a replay of
+                # an observed or uncertain nonce. One DB clock prevents a claim
+                # that expires between the earlier checks and this CAS from reviving.
+                refreshed = await conn.fetchrow(
+                    "WITH clock AS MATERIALIZED (SELECT clock_timestamp() AS observed_at) "
+                    "UPDATE vm_creation_retries AS retry SET "
+                    "creation_carrier_uid=$2,creation_carrier_namespace=$3,"
                     "backoff_attempt=CASE WHEN $4 THEN 0 ELSE backoff_attempt END,"
-                    "next_probe_at=CASE WHEN $4 THEN LEAST(next_probe_at,clock_timestamp()+$5*interval '1 second') ELSE next_probe_at END,"
-                    "updated_at=clock_timestamp() WHERE request_id=$1",
+                    "next_probe_at=CASE WHEN $4 THEN LEAST(next_probe_at,clock.observed_at+$5*interval '1 second') ELSE next_probe_at END,"
+                    "claim_expires_at=CASE WHEN retry.admission_deadline IS NULL "
+                    "THEN clock.observed_at+interval '60 seconds' "
+                    "ELSE LEAST(clock.observed_at+interval '60 seconds',retry.admission_deadline) END,"
+                    "updated_at=clock.observed_at FROM clock "
+                    "WHERE retry.request_id=$1 AND retry.provision_generation=$6 "
+                    "AND retry.state='reconciling' AND retry.claim_token=$7 "
+                    "AND retry.claim_expires_at>clock.observed_at "
+                    "AND (retry.admission_deadline IS NULL OR retry.admission_deadline>clock.observed_at) "
+                    "RETURNING retry.claim_expires_at",
                     row["request_id"],
                     UUID(carrier["metadata"]["uid"]),
                     carrier["metadata"]["namespace"],
                     advances_stage,
                     retry_delay_seconds(1),
+                    row["provision_generation"],
+                    UUID(claim_token),
                 )
+                if refreshed is None:
+                    database_now = await conn.fetchval("SELECT clock_timestamp()")
+                    if (
+                        row["admission_deadline"]
+                        and row["admission_deadline"] <= database_now
+                    ):
+                        raise VMCreationRetryConflict("job_admission_expired")
+                    raise VMCreationRetryConflict("retry_claim_changed")
                 await conn.execute(
                     "INSERT INTO vm_creation_effects(effect_nonce,request_id,effect_number,effect_kind,carrier_uid,carrier_namespace,carrier_intent,issuer_receipt_sha256) VALUES($1,$2,$3,$4,$5,$6,$7::jsonb,$8)",
                     UUID(values["effect_nonce"]),

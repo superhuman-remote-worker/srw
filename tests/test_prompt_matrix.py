@@ -1016,4 +1016,8 @@ class TestSingleWorkerPrompt:
         blob = serialize_resolved_config(config)
         assert "strategic" not in blob["prompts"]
         assert "tactical" not in blob["prompts"]
-        assert set(blob["agent"]["phase_settings"]) == {"min_todos", "max_todos"}
+        assert set(blob["agent"]["phase_settings"]) == {
+            "min_todos",
+            "max_todos",
+            "strategic_tools",
+        }

@@ -127,6 +127,14 @@ WORKFLOWS: dict[str, Policy] = {
             "has no reason to occupy a homelab runner"
         ),
     ),
+    "mirror-nextcloud-images.yml": Policy(
+        triggers=frozenset({"workflow_dispatch"}),
+        hosted_only=True,
+        why=(
+            "it only copies two upstream images between public registries, on "
+            "the owner's dispatch, so it has no reason to occupy a homelab runner"
+        ),
+    ),
     "ci-policy.yml": Policy(
         triggers=frozenset({"push", "pull_request", "workflow_dispatch"}),
         hosted_only=True,

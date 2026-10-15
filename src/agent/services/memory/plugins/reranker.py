@@ -98,7 +98,11 @@ class RerankerScorer:
                 "(RERANK_BASE_URL), set memory.reranker.base_url, or provide "
                 "EMBEDDING_BASE_URL (the reranker rides the embedding endpoint)"
             )
-        self.model = model
+        from shared.runtime.core.transport_resolution import wire_model_id
+
+        # The rerank catalog id may carry its provider's routing prefix
+        # (``openrouter/qwen/qwen3-reranker-8b``), which that provider rejects.
+        self.model = wire_model_id(model, base_url)
         self.endpoint = base_url.rstrip("/") + "/rerank"
         self.api_key = api_key
         self.top_k = top_k

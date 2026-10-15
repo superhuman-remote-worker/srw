@@ -7,6 +7,7 @@ import logging
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
+from uuid import UUID
 
 from fastapi import FastAPI, HTTPException
 import pytest
@@ -688,10 +689,17 @@ async def test_retained_job_delete_uses_only_its_dedicated_purge(
     provisioner.release_vm_captured = AsyncMock()
     permit = SimpleNamespace(
         allowed=True,
-        admission_id="dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+        admission_id=UUID("dddddddd-dddd-4ddd-8ddd-dddddddddddd"),
         parent_cleanup={"admission_id": "dddddddd-dddd-4ddd-8ddd-dddddddddddd"},
         completed_outcome=None,
     )
+    child_query = SimpleNamespace(fetchval=AsyncMock(return_value=False))
+
+    @asynccontextmanager
+    async def acquire_child_query():
+        yield child_query
+
+    operations.dependencies.recovery_store.db.acquire = acquire_child_query
     with (
         patch(
             "orchestrator.services.vm_job_retained_disk_purge.acquire_job_retained_disk_purge",
@@ -701,7 +709,13 @@ async def test_retained_job_delete_uses_only_its_dedicated_purge(
         patch(
             "orchestrator.services.vm_job_retained_disk_purge.read_job_retained_disk_purge_candidate",
             new_callable=AsyncMock,
-            return_value={"binding_kind": binding_kind},
+            return_value={
+                "owner_kind": "job",
+                "job_id": JOB_ID,
+                "pvc_uid": identity.rootdisk_pvc_uid,
+                "purge_disk": True,
+                "binding_kind": binding_kind,
+            },
         ),
         patch(
             "orchestrator.services.vm_job_retained_disk_purge.complete_job_retained_disk_purge",
@@ -713,6 +727,16 @@ async def test_retained_job_delete_uses_only_its_dedicated_purge(
             "job_id": JOB_ID,
         }
     provisioner.release_vm_captured.assert_not_awaited()
+    child_query.fetchval.assert_awaited_once()
+    child_sql, parent_id, owner_id, pvc_uid = child_query.fetchval.await_args.args
+    assert "parent_admission_id=$1" in child_sql
+    assert "source='controller_rootdisk_delete'" in child_sql
+    assert "completed_at IS NULL" in child_sql
+    assert (parent_id, owner_id, pvc_uid) == (
+        permit.admission_id,
+        UUID(JOB_ID),
+        UUID(identity.rootdisk_pvc_uid),
+    )
     if binding_kind == "bound":
         provisioner.delete_vm_captured.assert_not_awaited()
     else:

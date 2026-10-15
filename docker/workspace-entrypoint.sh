@@ -132,6 +132,31 @@ for key in "$HOST_KEY_DIR"/ssh_host_*_key "$HOST_KEY_DIR"/ssh_host_*_key.pub; do
 done
 
 # ---------------------------------------------------------------------------
+# 2a'. Trust the operator's extra CA (chart value trust.extraCaCertificates).
+#
+# The provisioner mounts it and sets SRW_EXTRA_CA_FILE. Adding it to the
+# system store covers curl, git, wget and OpenSSL; the profile script points
+# Python's requests/httpx (which bundle their own roots) and Node at the same
+# store for login shells. Best-effort: a failure leaves the public roots in
+# place and the private endpoint failing its handshake, never unverified.
+# ---------------------------------------------------------------------------
+if [ -n "${SRW_EXTRA_CA_FILE:-}" ] && [ -s "$SRW_EXTRA_CA_FILE" ]; then
+    if command -v update-ca-certificates >/dev/null 2>&1 \
+        && install -D -o root -g root -m 0644 "$SRW_EXTRA_CA_FILE" \
+            /usr/local/share/ca-certificates/srw-extra-ca.crt \
+        && update-ca-certificates >/dev/null 2>&1; then
+        cat > /etc/profile.d/srw-extra-ca.sh <<EOF
+export SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
+export REQUESTS_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt
+export NODE_EXTRA_CA_CERTS=/usr/local/share/ca-certificates/srw-extra-ca.crt
+EOF
+        chmod 644 /etc/profile.d/srw-extra-ca.sh
+    else
+        echo "extra CA from $SRW_EXTRA_CA_FILE not installed (non-fatal)" >&2
+    fi
+fi
+
+# ---------------------------------------------------------------------------
 # 2b. Seed per-user code-server config (theme / keybindings / snippets)
 #     The orchestrator mounts a ConfigMap carrying a self-contained seed.sh
 #     that writes the user's stored config into /var/lib/code-server/User and

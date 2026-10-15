@@ -76,7 +76,7 @@ export interface HelmManagedOverview {
 
 /**
  * Admins can pin cluster-wide defaults for each of these slots via the
- * Admin → Providers → Defaults section. Keep this in sync with the
+ * Settings → Models → Defaults section. Keep this in sync with the
  * orchestrator's `VALID_DEFAULT_MODEL_KINDS` — unknown kinds are rejected
  * server-side. The `chat` slot is the cluster-wide chat default used by
  * the dispatcher when a job/session has no override; surfacing it here
@@ -94,7 +94,8 @@ export type DefaultModelKind =
   | 'search'
   | 'fetch'
   | 'search_fallback'
-  | 'rerank';
+  | 'rerank'
+  | 'live_voice';
 
 export const DEFAULT_MODEL_KINDS: DefaultModelKind[] = [
   'chat',
@@ -102,6 +103,7 @@ export const DEFAULT_MODEL_KINDS: DefaultModelKind[] = [
   'citation',
   'embedding',
   'rerank',
+  'live_voice',
   'vision',
   'auxiliary',
   'whisper',
@@ -124,6 +126,7 @@ const EMPTY_DEFAULTS: Record<DefaultModelKind, string | null> = {
   fetch: null,
   search_fallback: null,
   rerank: null,
+  live_voice: null,
 };
 
 /**

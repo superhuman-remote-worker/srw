@@ -617,6 +617,7 @@ def test_dependency_images_use_host_platform_archives_before_k3d_import(
     assert harness.DEPENDENCY_IMAGES == (
         "busybox:1.36",
         "postgres:15",
+        "postgres:16",
         "pgvector/pgvector:pg15",
         "quay.io/keycloak/keycloak:26.2",
         "rancher/mirrored-library-busybox:1.36.1",
@@ -803,7 +804,7 @@ def test_runtime_image_verifier_matches_cri_config_ids_on_both_nodes(
         ledger
     )
 
-    assert ledger["verified_node_images"] == {"server-0": 9, "agent-0": 9}
+    assert ledger["verified_node_images"] == {"server-0": 10, "agent-0": 10}
     assert all(
         command[-4:] == ["crictl", "images", "-o", "json"]
         for command in runner.commands[1:]
@@ -839,7 +840,7 @@ def test_stateless_runtime_image_verifier_includes_workspace_on_both_nodes(
         ledger
     )
 
-    assert ledger["verified_node_images"] == {"server-0": 10, "agent-0": 10}
+    assert ledger["verified_node_images"] == {"server-0": 11, "agent-0": 11}
 
 
 def test_runtime_image_verifier_rejects_a_wrong_cri_config_id(
@@ -2156,7 +2157,13 @@ def test_cloud_sandbox_renders_exactly_one_bundled_backend(tmp_path: Path) -> No
         for item in backend["spec"]["template"]["spec"]["containers"][0]["env"]
         if "name" in item
     }
-    assert "SQLITE_DATABASE" in environment
+    # The chart default: a new install goes to the bundled Postgres. A stray
+    # SQLITE_DATABASE would win the entrypoint's check and install SQLite.
+    assert "SQLITE_DATABASE" not in environment
+    assert environment["POSTGRES_HOST"] == "srw-e2e-nextclouddb"
+    assert environment["POSTGRES_DB"] == "nextcloud"
+    assert ("StatefulSet", "srw-e2e-nextclouddb") in names
+    assert ("NetworkPolicy", "srw-e2e-nextclouddb") in names
     assert not any(key.startswith("OBJECTSTORE_S3") for key in environment)
 
 
@@ -2220,6 +2227,7 @@ def test_cloud_sandbox_renders_the_protected_effect_lane(tmp_path: Path) -> None
     ]
     assert containers == [
         "nextcloud",
+        "cron",
         "nextcloud-protected-effect-fpm",
         "nextcloud-protected-effect-nginx",
     ]
@@ -2428,6 +2436,79 @@ def test_forge_sandbox_renders_the_bundled_forge_without_a_second_database(
     assert config["data"]["WORKSPACE_IMAGE"] == images["workspace"]
 
 
+def _rendered_secret_key_refs(documents: list[dict]) -> list[dict]:
+    """Collect every `secretKeyRef` node from rendered workload documents."""
+    refs: list[dict] = []
+
+    def walk(value) -> None:
+        if isinstance(value, dict):
+            if isinstance(value.get("secretKeyRef"), dict):
+                refs.append(value["secretKeyRef"])
+            for child in value.values():
+                walk(child)
+        elif isinstance(value, list):
+            for child in value:
+                walk(child)
+
+    for document in documents:
+        # CRD schemas describe the shape of a `secretKeyRef`; they never
+        # reference a Secret themselves.
+        if document.get("kind") == "CustomResourceDefinition":
+            continue
+        walk(document)
+    return refs
+
+
+def test_secret_ref_walk_ignores_crd_schemas_but_flags_workloads() -> None:
+    crd = {
+        "kind": "CustomResourceDefinition",
+        "spec": {
+            "versions": [
+                {
+                    "schema": {
+                        "openAPIV3Schema": {
+                            "properties": {
+                                "env": {
+                                    "secretKeyRef": {
+                                        "description": "schema node, not a reference",
+                                        "type": "object",
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            ]
+        },
+    }
+    deployment = {
+        "kind": "Deployment",
+        "spec": {
+            "template": {
+                "spec": {
+                    "containers": [
+                        {
+                            "env": [
+                                {
+                                    "name": "X",
+                                    "valueFrom": {
+                                        "secretKeyRef": {
+                                            "name": "srw-e2e-app-secrets",
+                                            "key": "MISSING_KEY",
+                                        }
+                                    },
+                                }
+                            ]
+                        }
+                    ]
+                }
+            }
+        },
+    }
+    refs = _rendered_secret_key_refs([crd, deployment])
+    assert refs == [{"name": "srw-e2e-app-secrets", "key": "MISSING_KEY"}]
+
+
 @pytest.mark.skipif(shutil.which("helm") is None, reason="Helm is not installed")
 @pytest.mark.parametrize("profile_name", sorted(harness.APPLICATION_E2E_PROFILES))
 def test_generated_app_secret_covers_every_required_rendered_key(
@@ -2462,20 +2543,7 @@ def test_generated_app_secret_covers_every_required_rendered_key(
         timeout=120,
     ).stdout
     documents = [document for document in yaml.safe_load_all(rendered) if document]
-    refs: list[dict] = []
-
-    def walk(value) -> None:
-        if isinstance(value, dict):
-            if isinstance(value.get("secretKeyRef"), dict):
-                refs.append(value["secretKeyRef"])
-            for child in value.values():
-                walk(child)
-        elif isinstance(value, list):
-            for child in value:
-                walk(child)
-
-    for document in documents:
-        walk(document)
+    refs = _rendered_secret_key_refs(documents)
     minted = harness.generated_secret_data(
         harness.SecretBundle.generate("20260824-123456-ab12cd34"),
         vm_private_key="unused",

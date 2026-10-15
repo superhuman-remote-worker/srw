@@ -104,7 +104,7 @@ cd srw
 
 # Add at least one OPENAI_API_KEY, ANTHROPIC_API_KEY, or GROQ_API_KEY.
 # Optionally declare providers, models and default pins under `llm.seed`
-# so a rebuilt cluster needs no Admin → Models setup.
+# so a rebuilt cluster needs no Settings → Models setup.
 cp deployment/values-local.yaml.example deployment/values-local.yaml
 $EDITOR deployment/values-local.yaml
 

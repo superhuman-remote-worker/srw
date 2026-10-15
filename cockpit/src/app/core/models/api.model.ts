@@ -344,7 +344,8 @@ export type DatasourceType =
   // creates these for what it provisions; no form creates one.
   | 'cloud_folder'
   | 'cloud_folder_checkout'
-  | 'cloud_outbox';
+  | 'cloud_outbox'
+  | 'gpt_live_sip';
 
 /**
  * Access tier for an ``email`` datasource (see knowledge-base/knowledge/features/email_datasource.md).
@@ -808,7 +809,8 @@ export type LlmModelCapability =
   | 'tts'
   | 'search'
   | 'fetch'
-  | 'rerank';
+  | 'rerank'
+  | 'live_voice';
 
 /**
  * A user-registered OpenAI-compatible LLM endpoint. Models attached to this
@@ -859,7 +861,7 @@ export interface LlmEndpointUpdateRequest {
 
 /**
  * Response from an endpoint test-connection probe (server-side
- * `GET {base_url}/models`). Used by Admin → Providers.
+ * `GET {base_url}/models`). Used by Settings → Models → Providers.
  */
 export interface LlmEndpointTestResult {
   ok: boolean;
@@ -870,7 +872,7 @@ export interface LlmEndpointTestResult {
 
 /**
  * A single model surfaced by `GET {base_url}/models` via the admin discovery
- * endpoint. Used by Admin → Models as a quick-fill helper when the admin has
+ * endpoint. Used by Settings → Models as a quick-fill helper when the admin has
  * picked a system endpoint as the catalog row's transport.
  *
  * `capability_hints` is the array of suggested capabilities — chat-capable
@@ -893,7 +895,7 @@ export interface LlmEndpointDiscoveryResult {
 }
 
 /**
- * One row in the Admin → Providers post-save discovery dialog. Comes from
+ * One row in the Settings → Models → Providers post-save discovery dialog. Comes from
  * the orchestrator's `discover_models()` per-provider clients (OpenAI,
  * Google, Groq, OpenRouter); Anthropic + the env-bridge `vision` provider
  * never produce these — admins add those models manually.
@@ -930,7 +932,7 @@ export interface DiscoveryResponse {
 }
 
 // =============================================================================
-// Models Catalog (Admin → Models)
+// Models Catalog (Settings → Models)
 // =============================================================================
 
 /** Locked enum for catalog rows. Adding a capability requires schema + resolver work. */
@@ -943,14 +945,15 @@ export type CatalogCapability =
   | 'tts'
   | 'search'
   | 'fetch'
-  | 'rerank';
+  | 'rerank'
+  | 'live_voice';
 
 /** Provider anchor for a catalog row. */
 export type CatalogProviderKind = 'system' | 'endpoint';
 
 export const CATALOG_CAPABILITIES: CatalogCapability[] = [
   'chat', 'auxiliary', 'embedding', 'vision', 'whisper', 'tts', 'search', 'fetch',
-  'rerank',
+  'rerank', 'live_voice',
 ];
 
 /**
@@ -1416,6 +1419,9 @@ export interface Project {
   nextcloud_folder_id?: number | null;
   cloud_storage_url?: string | null;
   main_cloud_backend?: string | null;
+  /** Why the project has no cloud folder: the error kind of its last failed
+   *  create (`already_exists`, `permission_denied`, …), or null. */
+  main_cloud_folder_error?: string | null;
   network_tier?: ProjectNetworkTier;
   created_at: string;
   updated_at: string;
@@ -2656,6 +2662,8 @@ export interface JobCreateRequest {
   priority?: number;
   /** Deployment-gated execution selection; stateless requires a supported workspace. */
   execution_lane?: 'pinned' | 'stateless';
+  /** Start inside a live session (needs execution.session; set by live automations). */
+  live_session?: boolean;
 }
 
 /**

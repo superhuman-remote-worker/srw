@@ -3,6 +3,7 @@
 from copy import deepcopy
 from dataclasses import replace
 from datetime import datetime, timezone
+import functools
 import json
 import logging
 import os
@@ -103,7 +104,15 @@ class ManifestExecutionService:
             require_account_approved(owner)
             user = owner
         datasource_ids, policy_revisions = [], {}
-        for connector in execution["connectors"].values():
+        live_alias = (execution.get("session") or {}).get("connector")
+        if spec.get("liveSession") and adapter != "srw/v1":
+            raise HTTPException(
+                422,
+                "A live-session Job runs the SRW harness (its voice subagent is "
+                "SRW's); a generic image cannot take a live session.",
+            )
+        live_connector_id = None
+        for alias, connector in execution["connectors"].items():
             value = connector["inline"]
             if adapter == "srw/v1" and value["driver"] != "srw.datasource/v1":
                 raise HTTPException(
@@ -122,6 +131,8 @@ class ManifestExecutionService:
                     raise HTTPException(
                         422, "Datasource connectors require config.datasourceId."
                     ) from None
+                if alias == live_alias:
+                    live_connector_id = datasource_ids[-1]
         # `null` (no workspace) and a binding are explicit choices. An omitted
         # workspace is decided here, as the executing account: an SRW harness
         # Job resolves the defaults chain; a generic image gets only its
@@ -281,14 +292,27 @@ class ManifestExecutionService:
         snapshot["harness_adapter"] = adapter
         snapshot["revision"] = content_revision(snapshot["resolved"]["spec"])
         snapshot["resource"] = resource
+        context = {"manifest_task_data": deepcopy(spec.get("task", {}).get("data"))}
+        live = None
+        if spec.get("liveSession"):
+            live = await self._live_session(
+                execution,
+                live_connector_id,
+                datasource_ids,
+                config_name=config_name,
+                expert_row=srw_expert_row(private, expert_type="worker"),
+                config_override=config_override,
+            )
+            context["live_session"] = live.context_value
         # Domain authority and datasource locks stay in the common insertion
         # funnel. Private image config never passes through jobs.config_override.
-        job = await self.db.create_job(
+        create = functools.partial(
+            self.db.create_job,
             description=spec.get("task", {}).get("text") or "Manifest assignment",
             origin="user",
             config_name=config_name,
             config_override=config_override,
-            context={"manifest_task_data": deepcopy(spec.get("task", {}).get("data"))},
+            context=context,
             user_id=str(user["id"]),
             project_id=project_id,
             job_id=job_id,
@@ -307,9 +331,79 @@ class ManifestExecutionService:
             # to record which layers supplied the workspace.
             workspace_selection=workspace_receipt,
         )
+        if live is None:
+            job = await create()
+        else:
+            # The session is bound with its job or neither is (§4.2).
+            async with self.db.acquire() as conn, conn.transaction():
+                job = await create(conn=conn)
+                await live.on_created(conn, str(job["id"]))
         if workspace and adapter == "generic":
             await self.workspace.reserve(str(job["id"]), workspace, user)
+        if live is not None:
+            from orchestrator.services.live.admission import hand_off
+            from orchestrator.services.live.pods import LivePodClient
+
+            await hand_off(live, job, LivePodClient(self.db))
         return job["id"]
+
+    async def _live_session(
+        self,
+        execution,
+        connector_id,
+        datasource_ids,
+        *,
+        config_name,
+        expert_row,
+        config_override,
+    ):
+        """A live-session Job's session (live_session_jobs §3.3): the same
+        rules as REST admission, against the manifest's own connectors."""
+        from orchestrator.services.live.admission import (
+            LiveAdmission,
+            resolve_live_voice,
+        )
+        from orchestrator.services.live.instructions import LiveVoiceError
+        from orchestrator.services.live.store import LiveSessionStore
+        from shared.connectors.builtin import spec_for_type
+
+        if connector_id is None or connector_id not in datasource_ids:
+            raise HTTPException(
+                422,
+                "execution.session.connector must name an srw.datasource/v1 "
+                "connector of this Job.",
+            )
+        connector = await self.db.get_datasource(connector_id)
+        spec = spec_for_type((connector or {}).get("type"))
+        if connector is None or spec is None or not spec.live:
+            raise HTTPException(
+                422, "execution.session.connector is not a live connector."
+            )
+        try:
+            voice = await resolve_live_voice(
+                self.db,
+                config_name=config_name,
+                expert_id=None,
+                expert_row=expert_row,
+                config_override=config_override,
+            )
+        except LiveVoiceError as exc:
+            raise HTTPException(422, str(exc)) from None
+        sessions = LiveSessionStore(self.db)
+        async with self.db.acquire() as conn:
+            session = await sessions.ensure_session(
+                conn,
+                connector_id=connector_id,
+                provider_session_id=execution["session"]["id"],
+                origin="manifest",
+            )
+        if session.get("job_id") is not None:
+            raise HTTPException(409, "This live session is already bound to a job.")
+        if session["status"] not in ("ringing", "active"):
+            raise HTTPException(409, f"This live session is {session['status']}.")
+        return LiveAdmission(
+            session=session, connector=connector, voice=voice, sessions=sessions
+        )
 
     async def secret(self, ref, authority, *, materialize):
         await authority.secret(ref["scope"], name=ref["name"])

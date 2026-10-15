@@ -78,6 +78,10 @@ def _roster_lines(roster: Mapping[str, Any], default: Optional[str]) -> List[str
         if description:
             parts.append(description)
         facts: List[str] = []
+        if str(entry.get("driver") or "").strip().lower() == "live":
+            # agent.subagents.live.is_live_entry: the job's session attaches
+            # it; delegate_agent refuses it.
+            facts.append("live voice session: attached by its session, never delegated")
         isolation = entry.get("isolation")
         if isolation:
             facts.append(f"isolation={isolation}")

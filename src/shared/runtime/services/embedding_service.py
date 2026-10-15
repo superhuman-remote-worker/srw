@@ -190,6 +190,12 @@ class EmbeddingService:
                     else ""
                 )
             self.model = base_model
+        # A provider-key catalog id keeps its routing prefix
+        # (``openrouter/qwen/qwen3-embedding-8b``); the provider's own API
+        # rejects it, so drop it when the request goes there.
+        from shared.runtime.core.transport_resolution import wire_model_id
+
+        self.model = wire_model_id(self.model, self.base_url)
 
         # Schema columns are vector(4096); a provider returning any other
         # dimensionality breaks every write/query. Override only together

@@ -40,6 +40,12 @@ class ProbeResult:
     models: list[dict[str, Any]] = field(default_factory=list)
 
 
+def _is_live_voice_id(name: str) -> bool:
+    """A live (full-duplex voice) model: never a chat row, so it is
+    classified before the chat fallback."""
+    return "gpt-live" in name or "realtime" in name
+
+
 def _capability_hint(model_id: str) -> str:
     """Heuristic: map a model_id to the most likely PRIMARY capability slot.
 
@@ -53,6 +59,8 @@ def _capability_hint(model_id: str) -> str:
     and multimodal-vision detection) lives in :func:`_capability_hints`.
     """
     name = model_id.lower()
+    if _is_live_voice_id(name):
+        return "live_voice"
     if "whisper" in name:
         return "whisper"
     if "tts" in name or name.endswith("-speech") or "text-to-speech" in name:

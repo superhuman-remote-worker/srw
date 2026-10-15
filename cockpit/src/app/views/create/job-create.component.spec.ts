@@ -273,7 +273,7 @@ describe('JobCreateComponent project picker', () => {
           },
         },
         {provide: Router, useValue: {navigate: vi.fn()}},
-        {provide: UserService, useValue: {currentUserId: signal('user-1')}},
+        {provide: UserService, useValue: {currentUserId: signal('user-1'), currentUser: signal(null)}},
         {provide: ErrorMessageService, useValue: errors},
         {provide: ModelService, useValue: {load: vi.fn()}},
         {
@@ -296,6 +296,7 @@ describe('JobCreateComponent project picker', () => {
     name: 'Live Project',
     status: 'active',
     is_default: true,
+    user_role: 'owner',
   } as Project;
 
   const ARCHIVED_PROJECT = {
@@ -324,10 +325,18 @@ describe('JobCreateComponent project picker', () => {
   it('offers active projects only', () => {
     const {component, api} = setup(null);
 
-    expect(api.getProjects).toHaveBeenCalledWith('user-1', ['active']);
+    expect(api.getProjects).toHaveBeenCalledWith('user-1', ['active'], {selfScoped: true});
     expect(component.projects().map((p) => p.id)).toEqual(['proj-1']);
     expect(component.selectedProjectId()).toBe('proj-1');
     expect(component.selectedProjectIsArchived()).toBe(false);
+  });
+
+  it("prefers the caller's owned default over a default they are only a member of", () => {
+    const {component, api} = setup(null);
+    const theirs = {id: 'proj-theirs', name: 'Theirs', status: 'active', is_default: true, user_role: 'editor'} as Project;
+    api.getProjects.mockReturnValue(of([theirs, ACTIVE_PROJECT]));
+    component['loadProjects']('user-1');
+    expect(component.selectedProjectId()).toBe('proj-1');
   });
 
   it('keeps a deep-linked archived project selected and flagged', () => {

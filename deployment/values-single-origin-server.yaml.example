@@ -12,7 +12,8 @@ fullnameOverride: srw
 
 secrets:
   # Must contain IDE_CREDENTIAL_KEY (at least 32 random bytes) for the browser
-  # IDE promised by this preset. See helm/README.md.
+  # IDE promised by this preset, and NEXTCLOUD_DB_PASSWORD for the bundled
+  # Nextcloud's database. See helm/README.md.
   existingSecret: srw-secrets
 
 sessionRouter:

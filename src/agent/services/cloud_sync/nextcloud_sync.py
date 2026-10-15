@@ -14,6 +14,7 @@ from agent.services.cloud_sync.base import (
     WorkspaceSyncBase,
     _normalize_dav_listing,
 )
+from shared.http_no_cookies import NoCookieJar
 
 if TYPE_CHECKING:
     from shared.runtime.core.workspace_backend import WorkspaceBackend
@@ -30,14 +31,32 @@ _TREE_PROPFIND_BODY = (
     "</d:propfind>"
 )
 
+# Answers that say this server will never serve the tree in one PROPFIND: it
+# rejects the request outright (400), does not allow or implement the method
+# here (405, 501), or refuses Depth: infinity the RFC 4918 9.1 way (403
+# naming the ``propfind-finite-depth`` precondition, see
+# _refuses_depth_infinity). A 401, a 404 (the folder is created by the first
+# push), 423/429 or any other 5xx is about this moment, not this server.
+_DEPTH_INFINITY_REFUSALS = frozenset({400, 405, 501})
+
+
+def _refuses_depth_infinity(status: int, body: str) -> bool:
+    if status in _DEPTH_INFINITY_REFUSALS:
+        return True
+    # A bare 403 is a permission answer that can change; only the named
+    # precondition is a capability verdict.
+    return status == 403 and "propfind-finite-depth" in body
+
 
 def _precondition_headers(if_match: Optional[str], if_none_match: bool) -> list[str]:
     """RFC 4918 preconditions as webdav3 ``headers_ext`` entries.
 
     ``If-Match`` on a known etag and ``If-None-Match: *`` for a believed-absent
     path are the hard fence of commit-then-effects: a stale push owner whose
-    DB token was bumped can still have ONE write in flight; the server refuses
-    it with 412 instead of clobbering the successor's newer bytes.
+    DB token was bumped can still have writes in flight (at most
+    ``CLOUD_PUSH_PARALLEL_UPLOADS``, each carrying its own precondition); the
+    server refuses each with 412 instead of clobbering the successor's newer
+    bytes.
     """
 
     headers: list[str] = []
@@ -133,9 +152,10 @@ class NextcloudWorkspaceSync(WorkspaceSyncBase):
         # (e.g. /remote.php/dav/files/user/folder/file.txt) — we strip
         # this prefix to normalize to paths relative to the session folder.
         self._webdav_base_path = urlparse(webdav_url).path.rstrip("/") + "/"
-        # One-shot tree listing (Depth: infinity PROPFIND). Nextcloud gates it
-        # behind `dav.propfind.depth_infinity`; a refusal is remembered so the
-        # per-dir walk isn't preceded by a doomed probe on every pull.
+        # One-shot tree listing (Depth: infinity PROPFIND). Nextcloud's DAV
+        # server always allows it (there is no setting); a server that
+        # refuses it anyway is remembered, so the per-dir walk isn't preceded
+        # by a doomed probe on every pull.
         self._http: Optional[Any] = None
         self._depth_infinity_unsupported = False
 
@@ -143,13 +163,25 @@ class NextcloudWorkspaceSync(WorkspaceSyncBase):
         if self._client is None:
             from webdav3.client import Client
 
-            self._client = Client(
+            client = Client(
                 {
                     "webdav_hostname": self._webdav_url.rstrip("/"),
                     "webdav_login": self._webdav_user,
                     "webdav_password": self._webdav_password,
+                    # No HEAD existence probe before mkdir/info/list/download
+                    # (a download was 6 requests, now 3). A missing resource
+                    # is still a 404 -> RemoteResourceNotFound, which
+                    # _marker_missing relies on; a missing mkdir parent is a
+                    # 409 instead of RemoteParentNotFound, and
+                    # _ensure_remote_dirs treats both alike.
+                    "webdav_disable_check": True,
                 }
             )
+            # Echoing Nextcloud's one non-Secure cookie (``cookie_test``)
+            # makes it mint a session token on every request; sending none
+            # leaves each request at the cost of the login alone.
+            client.session.cookies = NoCookieJar()
+            self._client = client
         return self._client
 
     async def _ensure_ready(self) -> None:
@@ -164,7 +196,11 @@ class NextcloudWorkspaceSync(WorkspaceSyncBase):
         if before_write is not None:
             await before_write()
         client = self._get_client()
-        await asyncio.to_thread(client.mkdir, rel_dir)
+        # webdav3 answers True for 200/201 and for 405 (already exists),
+        # raises for an error status, and returns False for anything else.
+        # Only the first two may be cached as "exists".
+        if not await asyncio.to_thread(client.mkdir, rel_dir):
+            raise RuntimeError(f"MKCOL {rel_dir} did not confirm the directory")
 
     async def _upload_file(
         self,
@@ -226,9 +262,10 @@ class NextcloudWorkspaceSync(WorkspaceSyncBase):
         walk costs ~2.5s/dir (its ``list()`` runs a ``check()`` PROPFIND
         before the real one, on a server where each PROPFIND is ~0.6s of
         PHP); the same tree comes back from a single infinity PROPFIND in
-        ~1s. Nextcloud gates the feature behind
-        ``dav.propfind.depth_infinity`` — any non-207 answer flips the
-        per-instance capability flag and the walk takes over for good.
+        ~1s. Nextcloud's DAV server enables Depth: infinity unconditionally
+        (checked on 31). Only a refusal (``_refuses_depth_infinity``) flips
+        the per-instance capability flag so the walk takes over for good;
+        any other non-207 answer costs this pull's fast path only.
         """
         if self._depth_infinity_unsupported:
             return None
@@ -238,6 +275,7 @@ class NextcloudWorkspaceSync(WorkspaceSyncBase):
             self._http = httpx.AsyncClient(
                 auth=(self._webdav_user, self._webdav_password),
                 timeout=httpx.Timeout(30.0, read=60.0),
+                cookies=NoCookieJar(),
             )
         try:
             resp = await self._http.request(
@@ -253,6 +291,14 @@ class NextcloudWorkspaceSync(WorkspaceSyncBase):
             logger.debug("Depth-infinity PROPFIND failed (%s); using walk", e)
             return None
         if resp.status_code != 207:
+            if not _refuses_depth_infinity(resp.status_code, resp.text):
+                # Auth, a missing folder, a busy or restarting server: the
+                # walk handles this pull and the next pull asks again.
+                logger.debug(
+                    "Depth-infinity PROPFIND answered HTTP %d; walking this pull",
+                    resp.status_code,
+                )
+                return None
             self._depth_infinity_unsupported = True
             logger.info(
                 "Depth-infinity PROPFIND unsupported here (HTTP %d) — "

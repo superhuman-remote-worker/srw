@@ -233,6 +233,8 @@ POST   /api/internal/infrastructure-metering/v1/snapshots/items                 
 POST   /api/internal/infrastructure-metering/v1/tickets                                 pat=refused         internal:_dispatch_infrastructure_ingestion
 POST   /api/internal/infrastructure-metering/v1/watch/apply                             pat=refused         internal:_dispatch_infrastructure_ingestion
 POST   /api/internal/infrastructure-metering/v1/watch/finish                            pat=refused         internal:_dispatch_infrastructure_ingestion
+GET    /api/internal/live/sessions/{session_id}/events                                  pat=refused         internal:require_internal
+POST   /api/internal/live/sessions/{session_id}/events                                  pat=refused         internal:require_internal
 POST   /api/internal/mcp-token-create                                                   pat=refused         internal:require_internal
 POST   /api/internal/mcp-token-verify                                                   pat=refused         internal:require_internal
 DELETE /api/internal/persistent/threads/{thread_id}/canvases/main                       pat=refused         gated:require_thread_owner
@@ -298,6 +300,9 @@ POST   /api/jobs/{job_id}/guidance/ack                                          
 DELETE /api/jobs/{job_id}/ide                                                           pat=jobs:write      gated:require_job_access
 GET    /api/jobs/{job_id}/ide                                                           pat=jobs:read       gated:require_job_access
 POST   /api/jobs/{job_id}/ide                                                           pat=jobs:write      gated:require_job_access
+GET    /api/jobs/{job_id}/live-sessions                                                 pat=jobs:read       gated:require_job_access
+GET    /api/jobs/{job_id}/live-sessions/{session_id}/events                             pat=jobs:read       gated:require_job_access
+GET    /api/jobs/{job_id}/live-sessions/{session_id}/stream                             pat=jobs:read       gated:require_job_access
 GET    /api/jobs/{job_id}/llm-requests                                                  pat=jobs:read       gated:require_job_access
 GET    /api/jobs/{job_id}/logs                                                          pat=jobs:read       gated:require_job_access
 POST   /api/jobs/{job_id}/loop-plan                                                     pat=refused         internal:require_internal
@@ -343,6 +348,7 @@ GET    /api/jobs/{job_id}/version                                               
 POST   /api/jobs/{job_id}/workspace-recovery/retry                                      pat=jobs:write      gated:require_job_access
 GET    /api/jobs/{job_id}/workspace-status                                              pat=refused         internal:require_internal
 POST   /api/jobs/{target_job_id}/verification/rounds                                    pat=refused         internal:require_internal
+POST   /api/live/webhooks/{connector_id}                                                pat=refused         public:Standard Webhooks signature and timestamp verified inside the handler against the connector's webhook_secret.
 POST   /api/manifests/apply                                                             pat=admin           gated:require_approved_user
 POST   /api/manifests/export                                                            pat=admin           gated:require_approved_user
 POST   /api/manifests/preview                                                           pat=admin           gated:require_approved_user

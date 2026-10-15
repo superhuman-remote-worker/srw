@@ -210,6 +210,15 @@ class JobCreate(BaseModel):
             "worker admission is deployment-gated and Kubernetes-sandbox only."
         ),
     )
+    live_session: bool = Field(
+        False,
+        description=(
+            "Start this job inside a live session (a phone call): it starts in "
+            "its tactical phase with the session's voice as a subagent, and "
+            "turns strategic when the session ends. Requires "
+            "execution.session; refused without one."
+        ),
+    )
 
     @model_validator(mode="after")
     def reject_null_datasource_selection(self) -> "JobCreate":
@@ -263,6 +272,7 @@ PUBLIC_JOB_CREATE_FIELDS = (
     "priority",
     "workspace",
     "execution_lane",
+    "live_session",
 )
 
 
