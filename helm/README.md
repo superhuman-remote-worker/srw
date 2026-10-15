@@ -727,7 +727,14 @@ own credentials: Nextcloud's entrypoint gives up on a failed install for good.
 The setting applies to new installs only. An installed Nextcloud keeps the
 database its `config.php` names: an existing SQLite install keeps running on
 SQLite next to an empty `srw-nextclouddb`, and its Pod does not wait for
-Postgres, until an operator converts it with `occ db:convert-type`. After
+Postgres, until an operator converts it with
+`scripts/nextcloud-sqlite-to-postgres.py` (phases `precheck`, `close`,
+`backup`, `convert`, `verify`, `open`; dry run unless `--run --confirm`). Do
+not run `occ db:convert-type` by hand: it sets each Postgres sequence to the
+table's current maximum, while SQLite never reuses the id of a deleted row, so
+Nextcloud would hand out old share, group folder and file ids again. The
+script raises every sequence to SQLite's high-water mark; `fix-sequences`
+repairs an install that was converted without it. After
 installation `config.php` holds the database user and password in plain text,
 so rotating `NEXTCLOUD_DB_PASSWORD` also needs
 `occ config:system:set dbpassword --value=...`.
