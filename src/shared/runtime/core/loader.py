@@ -40,6 +40,7 @@ from shared.runtime.core.tool_policy import (
     normalize_tool_policy,
 )
 from shared.runtime.llm.reasoning_chat import ReasoningChatOpenAI
+from shared.tool_catalog.names import SKILL_TOOL_NAME
 
 logger = logging.getLogger(__name__)
 
@@ -2243,6 +2244,11 @@ class ToolsConfig:
     """
 
     workspace: List[str] = field(default_factory=list)
+    # use_skill. Its own category so a rewritten ``workspace`` list cannot drop
+    # it; a ``before_tool`` skill binding puts it back even when this is ``[]``
+    # (ensure_skill_tool_for_bindings).
+    # knowledge-base/knowledge/features/skills_tool_category.md
+    skills: List[str] = field(default_factory=list)
     core: List[str] = field(default_factory=list)
     research: List[str] = field(default_factory=list)
     browser_direct: List[str] = field(default_factory=list)
@@ -3474,6 +3480,7 @@ def load_agent_config(
     assert_tool_policy_canonical(tools_data, where="ToolsConfig")
     tools_config = ToolsConfig(
         workspace=tools_data.get("workspace", []),
+        skills=tools_data.get("skills", []),
         core=tools_data.get("core", []),
         research=tools_data.get("research", []),
         browser_direct=tools_data.get("browser_direct", []),
@@ -3653,6 +3660,8 @@ def load_agent_config(
     # Parse officer config (centurion — shared helper, both loader paths)
     officer_config = _parse_officer_config(data)
 
+    ensure_skill_tool_for_bindings(tools_config, instruction_files)
+
     return AgentConfig(
         agent_id=data["agent_id"],
         display_name=data["display_name"],
@@ -3746,6 +3755,7 @@ def load_agent_config_from_dict(
     assert_tool_policy_canonical(tools_data, where="ToolsConfig")
     tools_config = ToolsConfig(
         workspace=tools_data.get("workspace", []),
+        skills=tools_data.get("skills", []),
         core=tools_data.get("core", []),
         research=tools_data.get("research", []),
         browser_direct=tools_data.get("browser_direct", []),
@@ -3943,6 +3953,8 @@ def load_agent_config_from_dict(
 
     # Parse officer config (centurion — shared helper, both loader paths)
     officer_config = _parse_officer_config(data)
+
+    ensure_skill_tool_for_bindings(tools_config, instruction_files)
 
     return AgentConfig(
         agent_id=data["agent_id"],
@@ -6093,6 +6105,7 @@ def get_phase_system_prompt(
             expert_identity=expert_identity,
             available_skills=available_skills,
         )
+        rendered = _with_unplaced_skills_menu(rendered, template, available_skills)
         # The managed product guide is runtime-owned policy, not an ordinary
         # user skill. Model-specific interactive templates may intentionally
         # omit {available_skills}; inject its trusted reader rule separately so
@@ -6268,6 +6281,7 @@ def _render_worker_prompt(
         available_skills=available_skills,
         prompt_content=rendered_component,
     )
+    rendered = _with_unplaced_skills_menu(rendered, base_template, available_skills)
 
     # Prepend reasoning directive only for OSS models that need it as prompt text
     method = detect_reasoning_method(
@@ -6378,6 +6392,7 @@ def get_subagent_system_prompt(
         subagent_environment=environment,
         available_skills=available_skills,
     )
+    rendered = _with_unplaced_skills_menu(rendered, template, available_skills)
 
     method = detect_reasoning_method(
         model or config.llm.model, config.llm.reasoning_method
@@ -6576,6 +6591,50 @@ def memory_tool_names_bindable(config: Any) -> frozenset[str]:
     if not isinstance(extensions, (list, tuple)):
         return frozenset()
     return frozenset(name for name in extensions if isinstance(name, str))
+
+
+def _with_unplaced_skills_menu(rendered: str, template: str, menu: str) -> str:
+    """Append the fenced skills menu when ``template`` has no slot for it.
+
+    The menu used to reach the model only through an ``{available_skills}``
+    placeholder, and 17 model-family templates (and Design Studio's) have
+    none, so their agents never saw a skill. The assembler owns the menu now,
+    like the product-guide floor: a template that places it keeps its spot,
+    any other gets it after the template body. ``menu`` is empty whenever
+    ``use_skill`` is not bound (``scope_skills_for_tools``).
+    knowledge-base/knowledge/features/skills_tool_category.md D3.
+    """
+    if not menu or "{available_skills}" in template:
+        return rendered
+    return f"{rendered}\n\n{menu}"
+
+
+def ensure_skill_tool_for_bindings(
+    tools: "ToolsConfig", instruction_files: List["InstructionFileEntry"]
+) -> None:
+    """Put ``use_skill`` into ``tools.skills`` when a bound skill needs it.
+
+    A ``before_tool`` skill binding is a read gate the agent has to open, and
+    ``use_skill`` is the skill route to it, so an expert that binds one gets
+    the tool even with ``tools.skills: []`` (owner decision, 2026-10-15).
+    ``phase_start`` bindings do not count: their text arrives as a message.
+    Runs at load, so the frozen resolved config shows the tool. A name already
+    listed under any category (a frozen blob from before the ``skills``
+    category lists it under ``workspace``) is left alone.
+
+    This is one of the implicit grants listed in
+    knowledge-base/knowledge/issues/expert_config_is_not_the_whole_toolset.md.
+    """
+    if not any(
+        entry.skill and entry.trigger_type == "before_tool"
+        for entry in instruction_files
+    ):
+        return
+    for category in _tools_config_field_names():
+        names = getattr(tools, category, None)
+        if isinstance(names, list) and SKILL_TOOL_NAME in names:
+            return
+    tools.skills = [*tools.skills, SKILL_TOOL_NAME]
 
 
 def get_all_tool_names(config: AgentConfig) -> List[str]:

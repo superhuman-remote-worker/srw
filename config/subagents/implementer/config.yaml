@@ -41,7 +41,6 @@ spec:
         tools:
           workspace:
             - read_file
-            - use_skill
             - list_files
             - search_files
             - file_exists
@@ -52,6 +51,8 @@ spec:
             - move_file
             - copy_file
             - delete_file
+          skills:
+            - use_skill
           research:
             - web_search
             - extract_webpage

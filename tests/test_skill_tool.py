@@ -80,7 +80,7 @@ def test_use_skill_metadata_registered():
     from agent.tools.workspace.skills import SKILL_TOOLS_METADATA
 
     assert "use_skill" in SKILL_TOOLS_METADATA
-    assert SKILL_TOOLS_METADATA["use_skill"]["category"] == "workspace"
+    assert SKILL_TOOLS_METADATA["use_skill"]["category"] == "skills"
 
 
 # --- Slice 4: script-availability note on shell-less tiers ---

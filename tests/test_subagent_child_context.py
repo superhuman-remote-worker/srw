@@ -198,7 +198,15 @@ class TestToolSelection:
     def test_entry_tool_names_flattens_every_group_in_order(self):
         entry = _entry()
         names = entry_tool_names(entry)
-        assert names[:3] == ["read_file", "use_skill", "list_files"]
+        # workspace first, then the skills group expert_base declares after it.
+        assert names[:6] == [
+            "read_file",
+            "list_files",
+            "search_files",
+            "file_exists",
+            "get_document_info",
+            "use_skill",
+        ]
         assert "web_search" in names and "git_log" in names
         assert len(names) == len(set(names))
         assert not (set(names) & DELEGATION_TOOL_NAMES)

@@ -484,12 +484,12 @@ class TestRoleParameter:
         assert "$ignore_keys" not in cfg
         assert cfg["tools"]["workspace"] == [
             "read_file",
-            "use_skill",
             "list_files",
             "search_files",
             "file_exists",
             "get_document_info",
         ]
+        assert cfg["tools"]["skills"] == ["use_skill"]
         assert cfg["interactive"]["permission_mode"] == "autonomous"
         assert detail["enumerate_only"] == enumerate_only_members()
         # …and in another role on request.

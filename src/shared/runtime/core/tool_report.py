@@ -209,6 +209,7 @@ def backend_blocked_categories(caps: Optional[Mapping[str, Any]]) -> dict[str, s
             )
     if not caps.get("supports_file_tools", True):
         blocked["workspace"] = "this workspace tier has no file tools"
+        blocked["skills"] = "this workspace tier has no file tools"
         blocked["canvas"] = "this workspace tier has no file tools"
     if not caps.get("supports_canvas_presentation", False):
         blocked.setdefault(

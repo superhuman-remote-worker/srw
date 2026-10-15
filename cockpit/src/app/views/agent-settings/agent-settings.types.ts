@@ -35,6 +35,8 @@ export const JOB_TOOL_CATEGORIES: ToolCategoryMeta[] = [
 export const SESSION_TOOL_CATEGORIES: ToolCategoryMeta[] = [
   ...JOB_TOOL_CATEGORIES,
   { key: 'canvas', label: 'Canvas', icon: 'dashboard_customize', description: 'Ability to present workspace files in the shared session Canvas' },
+  // Not in the job list: a worker that keeps the default read gates binds use_skill regardless.
+  { key: 'skills', label: 'Skills', icon: 'auto_stories', description: 'Ability to load skills from your skill catalog. Off means the agent sees no skill list' },
   ...JOB_TOOL_GROUP_CATEGORIES,
   { key: 'orchestrator', label: 'SRW Projects', icon: 'hub', description: 'Ability to inspect SRW projects, repositories, session context, and workspace upgrades' },
   { key: 'agent_catalog', label: 'Experts & Skills', icon: 'extension', description: 'Ability to look up experts and skills. Read-only — the row below is what creates them' },

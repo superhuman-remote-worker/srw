@@ -110,6 +110,7 @@
     "stop_agent",
     "todo_complete",
     "todo_list",
+    "use_skill",
     "wait_agent",
     "web_search",
     "write_file"
@@ -232,6 +233,7 @@
     "stop_agent",
     "todo_complete",
     "todo_list",
+    "use_skill",
     "wait_agent",
     "write_file"
   ],
@@ -276,6 +278,7 @@
     "send_message",
     "todo_complete",
     "todo_list",
+    "use_skill",
     "write_file"
   ],
   "designer": [
@@ -322,6 +325,7 @@
     "shell_read",
     "todo_complete",
     "todo_list",
+    "use_skill",
     "web_search",
     "write_file"
   ],
@@ -365,6 +369,7 @@
     "search_files",
     "set_canvas",
     "shell_read",
+    "use_skill",
     "web_search",
     "write_file"
   ],
@@ -414,6 +419,7 @@
     "shell_read",
     "stop_agent",
     "todo_complete",
+    "use_skill",
     "wait_agent",
     "web_search",
     "write_file"
@@ -675,6 +681,7 @@
     "stop_agent",
     "todo_complete",
     "todo_list",
+    "use_skill",
     "wait_agent",
     "web_search",
     "write_file"
@@ -763,6 +770,7 @@
     "tag_source",
     "todo_complete",
     "todo_list",
+    "use_skill",
     "wait_agent",
     "web_search",
     "write_file"

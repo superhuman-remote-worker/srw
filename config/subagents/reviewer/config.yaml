@@ -41,11 +41,12 @@ spec:
         tools:
           workspace:
             - read_file
-            - use_skill
             - list_files
             - search_files
             - file_exists
             - get_document_info
+          skills:
+            - use_skill
           research:
             - web_search
             - extract_webpage

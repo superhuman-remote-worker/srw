@@ -96,7 +96,6 @@ tools:
     - read_file
     - write_file
     - edit_file
-    - use_skill
     - list_files
     - delete_file
     - search_files
@@ -107,6 +106,13 @@ tools:
     - get_document_info
     - create_directory
     - delete_directory
+  # Skill tools - use_skill loads a skill from skills/<name>/ (src/agent/tools/workspace/skills.py).
+  # Its own group so that a `workspace` list written by an expert cannot drop it.
+  # The skill list in the prompt follows this tool: `skills: []` means no list and
+  # no skill files. A `before_tool` skill binding in instruction_files brings
+  # use_skill back regardless (knowledge-base/knowledge/features/skills_tool_category.md).
+  skills:
+    - use_skill
   # Research tools - web search, academic papers, browser & workflows (src/agent/tools/research/)
   research:
     - web_search

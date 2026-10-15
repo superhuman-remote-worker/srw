@@ -2559,6 +2559,7 @@
     },
     "toolCategories": {
       "workspace": "Working with files",
+      "skills": "Using skills",
       "git": "Version control",
       "shell": "Running commands",
       "research": "Research & browsing",
@@ -2600,6 +2601,7 @@
       "research": "searches",
       "session_task": "tasks",
       "shell": "commands",
+      "skills": "skills",
       "sql": "queries",
       "thought": "thoughts",
       "workspace": "files"
@@ -2621,6 +2623,7 @@
       "research": "search",
       "session_task": "task",
       "shell": "command",
+      "skills": "skill",
       "sql": "query",
       "thought": "thought",
       "workspace": "file"
@@ -4124,6 +4127,10 @@
       "canvas": {
         "label": "Canvas",
         "description": "Ability to present workspace files in the shared session Canvas"
+      },
+      "skills": {
+        "label": "Skills",
+        "description": "Ability to load skills from your skill catalog. Off means the agent sees no skill list"
       },
       "citation": {
         "label": "Citation",

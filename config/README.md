@@ -469,6 +469,11 @@ tools:
     - create_directory
     - delete_directory
 
+  # Skill loader (src/agent/tools/workspace/skills.py). Its own group, so a
+  # workspace list written above never drops it. See "Skills" below.
+  skills:
+    - use_skill
+
   # Task management + completion (src/agent/tools/core/)
   core:
     - next_phase_todos      # Stage todos for next tactical phase
@@ -611,7 +616,27 @@ Database tool categories (`graph`, `sql`, `mongodb`) are **not** controlled by t
 - If no datasource of a type is attached, the orchestrator **strips** the category (even if the config lists it).
 - The `read_only` flag on the datasource controls whether write tools are included.
 
-This means the agent config controls non-database tools, while the orchestrator controls database tools based on what's actually connected. See `_build_datasource_tool_override()` in `src/orchestrator/main.py`.
+This means the agent config controls non-database tools, while the orchestrator controls database tools based on what's actually connected. See `build_datasource_tool_override()` in `src/orchestrator/services/agent_datasource_payload.py`.
+
+### Skills
+
+`use_skill` is the only tool in the `skills` group, which every expert inherits
+from `expert_base.yaml`. The skill list in the system prompt follows the tool:
+
+- With `use_skill` bound, the agent sees the skill list (bundled skills plus the
+  user's, global and project skills) and the skill files are copied to
+  `skills/<name>/` in the workspace. A model-family prompt template without an
+  `{available_skills}` placeholder gets the list appended after its body.
+- With `skills: []` (or `false`), the agent sees no list and gets no skill files.
+- An `instruction_files` entry with `skill:` and a `before_tool:` trigger makes
+  the agent read that skill before the tool runs, so it brings `use_skill` back
+  even when `skills: []`. `phase_start:` bindings do not: their text arrives as
+  a message. Every worker that keeps the worker overlay's `todo-guide` and
+  `verify-before-done` gates therefore has `use_skill`.
+- Workspace tiers without file tools drop the group, like `workspace`.
+
+A `workspace` list that still names `use_skill` (written before the group
+existed) is converted when the config is loaded.
 
 ### Context Management
 

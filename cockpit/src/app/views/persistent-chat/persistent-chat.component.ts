@@ -241,6 +241,7 @@ const TOOL_LABELS: Record<string, string> = {
  */
 const CATEGORY_NOUNS_ONE: Record<string, string> = {
     workspace: 'file',
+    skills: 'skill',
     git: 'git op',
     shell: 'command',
     research: 'search',
@@ -263,6 +264,7 @@ const CATEGORY_NOUNS_ONE: Record<string, string> = {
 
 const CATEGORY_NOUNS: Record<string, string> = {
     workspace: 'files',
+    skills: 'skills',
     git: 'git ops',
     shell: 'commands',
     research: 'searches',
@@ -290,6 +292,7 @@ const CHIP_CATEGORY_CAP = 4;
 
 const CATEGORY_LABELS: Record<string, string> = {
     workspace: 'Working with files',
+    skills: 'Using skills',
     git: 'Version control',
     shell: 'Running commands',
     research: 'Research & browsing',

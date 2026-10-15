@@ -90,10 +90,15 @@ def test_canvas_skill_requires_use_skill_and_file_set_capability():
         },
     }
 
-    for tools in ([], ["use_skill"], ["set_canvas"]):
+    scoped = scope_skills_for_tools(skills, ["use_skill"])
+    assert [item["name"] for item in scoped["menu"]] == ["ordinary-skill"]
+    assert set(scoped["files"]) == {"ordinary-skill"}
+
+    # Without use_skill nothing is offered at all (skills_tool_category.md D2).
+    for tools in ([], ["set_canvas"]):
         scoped = scope_skills_for_tools(skills, tools)
-        assert [item["name"] for item in scoped["menu"]] == ["ordinary-skill"]
-        assert set(scoped["files"]) == {"ordinary-skill"}
+        assert scoped["menu"] == []
+        assert scoped["files"] == {}
 
     scoped = scope_skills_for_tools(skills, ["use_skill", "set_canvas"])
     assert [item["name"] for item in scoped["menu"]] == [
@@ -281,12 +286,17 @@ def test_app_guide_scope_requires_its_dedicated_reader():
     assert [item["name"] for item in without_reader["menu"]] == ["ordinary-skill"]
     assert set(without_reader["files"]) == {"ordinary-skill"}
 
-    with_reader = scope_skills_for_tools(skills, [APP_GUIDE_LOADER_TOOL])
+    with_reader = scope_skills_for_tools(skills, [APP_GUIDE_LOADER_TOOL, "use_skill"])
     assert [item["name"] for item in with_reader["menu"]] == [
         APP_GUIDE_SKILL,
         "ordinary-skill",
     ]
     assert set(with_reader["files"]) == {APP_GUIDE_SKILL, "ordinary-skill"}
+
+    # The guide has its own reader, so it stays when use_skill does not.
+    reader_only = scope_skills_for_tools(skills, [APP_GUIDE_LOADER_TOOL])
+    assert [item["name"] for item in reader_only["menu"]] == [APP_GUIDE_SKILL]
+    assert set(reader_only["files"]) == {APP_GUIDE_SKILL}
 
 
 def test_app_guide_turn_boundary_requires_trusted_live_reader():

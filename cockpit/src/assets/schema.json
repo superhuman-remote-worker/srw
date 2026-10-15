@@ -1574,6 +1574,60 @@
             }
           ]
         },
+        "skills": {
+          "description": "Skill tools (src/agent/tools/workspace/skills.py): use_skill loads a skill from skills/<name>/. Its own group so that a workspace list cannot drop it. The skill list in the prompt follows this tool: false or [] means no list and no skill files, except that a before_tool skill binding in instruction_files brings use_skill back. Policy, not membership: true / false / {only: [...]} / {except: [...]}, or a bare list.",
+          "examples": [
+            [
+              "use_skill"
+            ]
+          ],
+          "oneOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "uniqueItems": true
+            },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "only": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  },
+                  "uniqueItems": true,
+                  "minItems": 1
+                },
+                "except": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  },
+                  "uniqueItems": true,
+                  "minItems": 1
+                }
+              },
+              "oneOf": [
+                {
+                  "required": [
+                    "only"
+                  ]
+                },
+                {
+                  "required": [
+                    "except"
+                  ]
+                }
+              ]
+            }
+          ]
+        },
         "sql": {
           "description": "PostgreSQL query tools (src/agent/tools/sql/). Injected automatically when a PostgreSQL datasource is attached to the job. Machine-owned: every tool here is code-granted (a postgresql datasource is attached), so `true` resolves to [] and the key is better deleted than declared. Policy, not membership: true / false / {only: [...]} / {except: [...]}, or a bare list.",
           "examples": [

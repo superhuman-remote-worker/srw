@@ -1586,13 +1586,16 @@ FILESYSTEM_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
 }
 
 
-# workspace/skills
+# workspace/skills. Its own category so that an expert writing its own
+# ``tools.workspace`` list (lists replace wholesale) cannot drop it by accident;
+# ``tools.skills: []`` is the deliberate off switch.
+# knowledge-base/knowledge/features/skills_tool_category.md
 SKILL_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
     "use_skill": {
         "module": "workspace.skills",
         "function": "use_skill",
         "description": "Load a skill's SKILL.md guidance into context for the current task",
-        "category": "workspace",
+        "category": "skills",
         "phases": ["strategic", "tactical"],
     },
 }

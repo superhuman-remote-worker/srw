@@ -150,7 +150,7 @@ other categories can still be removed by backend or grant checks.
 
 For an already-running session, open header **Settings → Tools**. The list
 reflects the session's resolved tool categories, including **Browser**,
-**Shell**, **Research**, **Git**, **Canvas**, **Job Control**, **Job Inspection**,
+**Shell**, **Research**, **Git**, **Canvas**, **Skills**, **Job Control**, **Job Inspection**,
 **Experts & Skills**, and **Automations & Loops** where applicable. Live editing
 is not limited to the older four application groups. **Author Experts &
 Automations** is a separate category with its own grant.

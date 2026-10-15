@@ -7,3 +7,6 @@ PRODUCT_CAPABILITIES_TOOL_NAME = "get_product_capabilities"
 #: results count as present memories, so a fetched memory is not pushed again
 #: (``agent.core.context_injection.scan_presence``).
 MEMORY_SEARCH_TOOL_NAME = "memory_search"
+#: The model-invoked skill loader, the one member of the ``skills`` tool
+#: category (knowledge-base/knowledge/features/skills_tool_category.md).
+SKILL_TOOL_NAME = "use_skill"

@@ -2559,6 +2559,7 @@
     },
     "toolCategories": {
       "workspace": "Arbeit mit Dateien",
+      "skills": "Skills verwenden",
       "git": "Versionskontrolle",
       "shell": "Befehle ausführen",
       "research": "Recherche & Browsen",
@@ -2600,6 +2601,7 @@
       "research": "Suchen",
       "session_task": "Aufgaben",
       "shell": "Befehle",
+      "skills": "Skills",
       "sql": "Abfragen",
       "thought": "Gedanken",
       "workspace": "Dateien"
@@ -2621,6 +2623,7 @@
       "research": "Suche",
       "session_task": "Aufgabe",
       "shell": "Befehl",
+      "skills": "Skill",
       "sql": "Abfrage",
       "thought": "Gedanke",
       "workspace": "Datei"
@@ -4115,6 +4118,10 @@
       "canvas": {
         "label": "Canvas",
         "description": "Kann Workspace-Dateien im gemeinsamen Sitzungs-Canvas präsentieren"
+      },
+      "skills": {
+        "label": "Skills",
+        "description": "Kann Skills aus Ihrem Skill-Katalog laden. Aus heißt: Der Agent sieht keine Skill-Liste"
       },
       "citation": {
         "label": "Zitation",

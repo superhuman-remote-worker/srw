@@ -59,7 +59,10 @@ because an earlier capability snapshot said `can_execute`.
   not grant those tools; enable **Job Control** in Settings → Tools, and
   **Job Inspection** for the available status and supervision reads. Check
   the current session's actual tool list.
-- **Use skills** — bundled how-to procedures it loads when relevant.
+- **Use skills** — bundled how-to procedures it loads when relevant. The
+  **Skills** tool category turns this off or on; with it off the agent sees
+  no skill list. An expert that requires a skill before a tool keeps the
+  skill loader even when the category is off.
 
 ## Permission modes — how much it asks first
 

@@ -174,8 +174,9 @@ def filter_tools_by_backend(tool_names: List[str], backend: Any) -> List[str]:
       ``git`` (all need a workspace-backed execution environment). This is what
       ``WorkspaceBackend.supports_shell`` already promises: it "gates
       ShellManager construction *and* shell tool registration".
-    - ``not backend.supports_file_tools`` → drop ``workspace`` (file) tools and
-      the Slice-1 file-only ``canvas`` category — the ``none`` tier, whose
+    - ``not backend.supports_file_tools`` → drop ``workspace`` (file) tools,
+      ``skills`` (``use_skill`` reads skill files from the workspace) and the
+      Slice-1 file-only ``canvas`` category — the ``none`` tier, whose
       ScratchBackend is internal-only (§6).
     - ``not backend.supports_canvas_presentation`` → drop only ``canvas``. The
       process-local virtual-memory transport has file tools, but a separate
@@ -192,6 +193,7 @@ def filter_tools_by_backend(tool_names: List[str], backend: Any) -> List[str]:
         drop_categories.update(_EXECUTION_CATEGORIES)
     if not getattr(backend, "supports_file_tools", True):
         drop_categories.add("workspace")
+        drop_categories.add("skills")
         drop_categories.add("canvas")
     # Canvas is a positive, externally materializable capability. Unknown and
     # custom backends must opt in explicitly; file-tool support alone says
@@ -227,12 +229,13 @@ def filter_tools_by_backend(tool_names: List[str], backend: Any) -> List[str]:
 # override, or request override asked for. This is a runtime CEILING applied
 # after override resolution, not a default the officer (or a config) can edit.
 #
-# Denied whole categories: local file tools, shell, git, direct browser,
-# canvas presentation, repo remote-ops, and WebDAV (a file surface over the
-# project/cloud folders — the object plane in API form).
+# Denied whole categories: local file tools, skills (read from the workspace),
+# shell, git, direct browser, canvas presentation, repo remote-ops, and WebDAV
+# (a file surface over the project/cloud folders — the object plane in API form).
 _OFFICER_DENIED_CATEGORIES = frozenset(
     {
         "workspace",
+        "skills",
         "shell",
         "git",
         "browser_direct",
@@ -471,6 +474,19 @@ def load_tools(tool_names: List[str], context: ToolContext) -> List[Any]:
             if tool.name in requested:
                 all_tools.append(tool)
                 logger.debug(f"Loaded workspace tool: {tool.name}")
+
+    # Skill tools (use_skill): read skills/<name>/ from the workspace, so they
+    # need it like the file tools, but are their own category.
+    if "skills" in tools_by_category:
+        if not context.has_workspace():
+            raise ValueError("Skill tools require workspace_manager in ToolContext")
+        from agent.tools.workspace.skills import create_skill_tools
+
+        requested = set(tools_by_category["skills"])
+        for tool in create_skill_tools(context):
+            if tool.name in requested:
+                all_tools.append(tool)
+                logger.debug(f"Loaded skill tool: {tool.name}")
 
     # Core tools (todo + job + control). Todo/job tools need a workspace (todos
     # persist to workspace files); todo tools additionally need a TodoManager.
