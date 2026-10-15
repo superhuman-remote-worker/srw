@@ -477,7 +477,9 @@ def test_schema_requires_positive_share_limits(value: str) -> None:
     result = _render(*BUNDLED, "--set", value, check=False)
 
     assert result.returncode != 0
-    assert "minimum" in result.stderr
+    # Helm 3.17 (CI's pin) says "Must be greater than or equal to 1"; Helm
+    # 3.18+ says "minimum: got 0, want 1".
+    assert re.search(r"minimum|greater than or equal", result.stderr), result.stderr
 
 
 ADMIN_VIEW = (
