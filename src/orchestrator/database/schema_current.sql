@@ -29471,6 +29471,31 @@ COMMENT ON TABLE public.main_cloud_backend_instances IS 'Immutable non-secret ro
 
 
 --
+-- Name: main_cloud_service_credentials; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.main_cloud_service_credentials (
+    backend_instance_id uuid NOT NULL,
+    login_name text NOT NULL,
+    credential_ciphertext text NOT NULL,
+    token_name text NOT NULL,
+    revision bigint DEFAULT 1 NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT main_cloud_service_credentials_ciphertext_check CHECK ((credential_ciphertext ~~ 'v1:%'::text)),
+    CONSTRAINT main_cloud_service_credentials_login_check CHECK ((login_name <> ''::text)),
+    CONSTRAINT main_cloud_service_credentials_revision_check CHECK ((revision > 0))
+);
+
+
+--
+-- Name: TABLE main_cloud_service_credentials; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON TABLE public.main_cloud_service_credentials IS 'App passwords of SRW''s own main-cloud service accounts (agent-service), one per installation and login name, as APP_ENCRYPTION_KEY ciphertexts. revision is the compare-and-set counter replicas agree on one token with.';
+
+
+--
 -- Name: managed_repository_authorities; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -35647,6 +35672,14 @@ ALTER TABLE ONLY public.main_cloud_backend_instances
 
 ALTER TABLE ONLY public.main_cloud_backend_instances
     ADD CONSTRAINT main_cloud_backend_instances_routing_identity UNIQUE (backend_id, routing_sha256, installation_proof_sha256);
+
+
+--
+-- Name: main_cloud_service_credentials main_cloud_service_credentials_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.main_cloud_service_credentials
+    ADD CONSTRAINT main_cloud_service_credentials_pkey PRIMARY KEY (backend_instance_id, login_name);
 
 
 --
@@ -43791,6 +43824,14 @@ ALTER TABLE ONLY public.magic_link_tokens
 
 ALTER TABLE ONLY public.main_cloud_active_backend
     ADD CONSTRAINT main_cloud_active_backend_instance_fk FOREIGN KEY (backend_instance_id, backend_id) REFERENCES public.main_cloud_backend_instances(id, backend_id) ON DELETE RESTRICT;
+
+
+--
+-- Name: main_cloud_service_credentials main_cloud_service_credentials_backend_instance_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.main_cloud_service_credentials
+    ADD CONSTRAINT main_cloud_service_credentials_backend_instance_id_fkey FOREIGN KEY (backend_instance_id) REFERENCES public.main_cloud_backend_instances(id);
 
 
 --

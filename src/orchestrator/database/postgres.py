@@ -64770,6 +64770,96 @@ class PostgresDB:
             )
         return self._main_cloud_backend_instance_authority(row)
 
+    async def get_main_cloud_service_credential(
+        self,
+        backend_instance_id: str,
+        login_name: str,
+    ) -> dict[str, Any] | None:
+        """One service account's stored app password on one installation:
+        ``credential_ciphertext`` (``APP_ENCRYPTION_KEY``), ``token_name``
+        and the compare-and-set ``revision``. ``None`` when none is stored."""
+
+        try:
+            parsed_id = UUID(str(backend_instance_id))
+        except (TypeError, ValueError):
+            return None
+        async with self.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT backend_instance_id, login_name, credential_ciphertext,
+                       token_name, revision, created_at, updated_at
+                  FROM main_cloud_service_credentials
+                 WHERE backend_instance_id=$1::uuid
+                   AND login_name=$2
+                """,
+                parsed_id,
+                login_name,
+            )
+        if row is None:
+            return None
+        return {
+            "backend_instance_id": str(row["backend_instance_id"]),
+            "login_name": row["login_name"],
+            "credential_ciphertext": row["credential_ciphertext"],
+            "token_name": row["token_name"],
+            "revision": int(row["revision"]),
+            "created_at": row["created_at"],
+            "updated_at": row["updated_at"],
+        }
+
+    async def put_main_cloud_service_credential(
+        self,
+        backend_instance_id: str,
+        login_name: str,
+        *,
+        ciphertext: str,
+        token_name: str,
+        expected_revision: int | None,
+    ) -> bool:
+        """Store a service account's app password, compare-and-set.
+
+        ``expected_revision=None`` inserts the first one and returns whether
+        this call did (another replica's insert wins). An integer replaces
+        the row only while it is still at that revision, bumping it by one,
+        and returns whether it did.
+        """
+
+        parsed_id = UUID(str(backend_instance_id))
+        async with self.acquire() as conn:
+            if expected_revision is None:
+                result = await conn.execute(
+                    """
+                    INSERT INTO main_cloud_service_credentials (
+                        backend_instance_id, login_name, credential_ciphertext,
+                        token_name
+                    ) VALUES ($1::uuid, $2, $3, $4)
+                    ON CONFLICT (backend_instance_id, login_name) DO NOTHING
+                    """,
+                    parsed_id,
+                    login_name,
+                    ciphertext,
+                    token_name,
+                )
+                return result == "INSERT 0 1"
+            result = await conn.execute(
+                """
+                UPDATE main_cloud_service_credentials
+                   SET credential_ciphertext=$3,
+                       token_name=$4,
+                       revision=revision+1,
+                       updated_at=now()
+                 WHERE backend_instance_id=$1::uuid
+                   AND login_name=$2
+                   AND revision=$5
+                """,
+                parsed_id,
+                login_name,
+                ciphertext,
+                token_name,
+                int(expected_revision),
+            )
+            return result == "UPDATE 1"
+
     # =========================================================================
     # Key/value store for deploy-time configuration that operators can edit
     # via the cockpit admin UI. Secrets never land here — the credentials_ref
