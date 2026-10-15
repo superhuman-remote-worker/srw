@@ -90,6 +90,23 @@ describe('AdminCatalogComponent search/fetch form', () => {
     expect(c.formCapabilities()).toEqual(['chat']);
   });
 
+  it('submits without a display label and uses the model ID instead', () => {
+    const fixture = TestBed.createComponent(AdminCatalogComponent);
+    const c = fixture.componentInstance;
+    c.formProviderKey.set('system:openrouter');
+    c.formCapabilities.set(['embedding']);
+    c.formModelId.set('qwen/qwen3-embedding-8b');
+    fixture.detectChanges();
+    const labelInput = fixture.nativeElement.querySelectorAll('app-input')[1];
+    expect(labelInput.placeholder).toBe('qwen/qwen3-embedding-8b');
+    expect(c.canSubmit()).toBe(true);
+    c.submit();
+    expect(createModel).toHaveBeenCalledWith(expect.objectContaining({
+      model_id: 'qwen/qwen3-embedding-8b',
+      display_label: 'qwen/qwen3-embedding-8b',
+    }));
+  });
+
   it('rejects mixed live voice capabilities even if discovery sets them directly', () => {
     const c = TestBed.createComponent(AdminCatalogComponent).componentInstance;
     c.formProviderKey.set('system:openai');

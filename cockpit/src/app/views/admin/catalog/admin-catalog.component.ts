@@ -629,7 +629,7 @@ export function reasoningStarveWarning(ctx: number | null): string | null {
               <app-form-field label="Display label">
                 <app-input
                   [value]="formDisplayLabel()"
-                  placeholder="Auto-suggested from ID"
+                  [placeholder]="formModelId().trim() || 'Defaults to the model ID'"
                   [disabled]="creating()"
                   (changed)="formDisplayLabel.set($event)"
                 />
@@ -1570,7 +1570,6 @@ export class AdminCatalogComponent implements OnInit {
     return (
       !!this.formProviderKey() &&
       !!this.formModelId().trim() &&
-      !!this.formDisplayLabel().trim() &&
       (this.researchCapabilitiesSelected() || this.liveVoiceSelected() || !!this.formFamily().trim()) &&
       !this.researchConfigurationError() &&
       this.liveVoiceExclusive() &&
@@ -1709,7 +1708,8 @@ export class AdminCatalogComponent implements OnInit {
         provider_kind: kind,
         provider_ref: ref,
         model_id: modelId,
-        display_label: this.formDisplayLabel().trim(),
+        // An empty label falls back to the model ID, cut to the API's 200-char limit.
+        display_label: (this.formDisplayLabel().trim() || modelId).slice(0, 200),
         capabilities,
         family: this.researchCapabilitiesSelected() || this.liveVoiceSelected() ? 'default' : this.formFamily().trim(),
         context_window: this.researchCapabilitiesSelected() || this.liveVoiceSelected()
