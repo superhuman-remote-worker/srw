@@ -191,6 +191,7 @@ from orchestrator.services.cloud_staging.source_identity import (
 from shared.container_recovery import (
     ContainerRecoveryCleanup,
     container_recovery_resume_allowed_sql,
+    container_retained_projection_sql,
 )
 from shared.worker_execution_hold import (
     WORKER_EXECUTION_HOLD_KEY,
@@ -6240,6 +6241,62 @@ class PostgresDB:
             "ambiguous_effect_count": ambiguous,
             "safe": unannotated == 0 and ambiguous == 0,
         }
+
+    async def managed_repository_workspace_runtime_is_unannotated(
+        self,
+        owner_id: str,
+        *,
+        owner_kind: str,
+        scope: str,
+    ) -> bool:
+        """Whether one owner's managed K8s runtime lacks its exact creation record.
+
+        The per-owner form of the activation inventory's unannotated count,
+        with the same classification. A runtime projected before migration 0195
+        has no settled creation reservation, so automatic cleanup cannot tell
+        its predecessor from a successor. An absent owner, or a projection that
+        is not a managed K8s runtime, is not unannotated: orphan admission keeps
+        its own process-zero receipt requirement. Malformed input fails closed.
+        """
+
+        if (owner_kind, scope) == ("job", "workspace_container"):
+            table, state = "jobs", "context -> 'workspace_container'"
+        elif (owner_kind, scope) == ("job", "ide"):
+            table, state = "jobs", "context -> 'ide_session'"
+        elif (owner_kind, scope) == ("thread", "workspace_container"):
+            table, state = "threads", "metadata -> 'workspace_container'"
+        else:
+            return True
+        try:
+            owner_uuid = UUID(str(owner_id))
+        except (TypeError, ValueError):
+            return True
+        managed = (
+            "runtime ->> 'restore_type' = 'k8s_container'"
+            if scope == "ide"
+            else "runtime ->> 'provisioner' = 'k8s'"
+        )
+        async with self.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT COALESCE(jsonb_typeof(runtime) = 'object' "
+                f"AND {managed}, false) AS managed, "
+                "EXISTS (SELECT 1 FROM "
+                "managed_repository_workspace_creation_reservations r "
+                "WHERE r.owner_kind = $2 AND r.owner_id = $1 AND r.scope = $3 "
+                "AND r.id::text = runtime ->> '_creation_reservation_id' "
+                "AND r.runtime_incarnation::text = "
+                "    runtime ->> '_runtime_incarnation' "
+                "AND r.claim_token::text = runtime ->> '_creation_claim_token' "
+                "AND r.result_kind = 'settled' AND r.settled_at IS NOT NULL"
+                ") AS exact_reservation "
+                f"FROM (SELECT {state} AS runtime FROM {table} WHERE id = $1) owner",
+                owner_uuid,
+                owner_kind,
+                scope,
+            )
+        if row is None or not row["managed"]:
+            return False
+        return not row["exact_reservation"]
 
     async def stateless_cancel_cleanup_pending(self, job_id: str) -> bool | None:
         """Return marker state for a cleanup-lock owner.
@@ -13579,7 +13636,8 @@ class PostgresDB:
         query = (
             "UPDATE jobs "
             "SET context = CASE "
-            "        WHEN $2::text='workspace_container' AND context->'workspace_container' ? 'recovery_cleanup' THEN context "
+            "        WHEN $2::text='workspace_container' AND (context->'workspace_container' ? 'recovery_cleanup' "
+            f"            OR {container_retained_projection_sql('context')}) THEN context "
             "        WHEN COALESCE(context, '{}'::jsonb) ? $2::text "
             "        THEN (COALESCE(context, '{}'::jsonb) - $2::text) "
             "             || jsonb_build_object('last_' || $2::text, context -> $2::text) "
@@ -36318,7 +36376,8 @@ class PostgresDB:
                         f"""
                         UPDATE jobs
                            SET context = CASE
-                                WHEN $2::text='workspace_container' AND context->'workspace_container' ? 'recovery_cleanup' THEN context
+                                WHEN $2::text='workspace_container' AND (context->'workspace_container' ? 'recovery_cleanup'
+                                    OR {container_retained_projection_sql("context")}) THEN context
                                 WHEN COALESCE(context, '{{}}'::jsonb) ? $2::text
                                 THEN (COALESCE(context, '{{}}'::jsonb) - $2::text)
                                      || jsonb_build_object(
@@ -36412,7 +36471,8 @@ class PostgresDB:
                         f"""
                         UPDATE jobs
                         SET context = CASE
-                                WHEN $2::text='workspace_container' AND context->'workspace_container' ? 'recovery_cleanup' THEN context
+                                WHEN $2::text='workspace_container' AND (context->'workspace_container' ? 'recovery_cleanup'
+                                    OR {container_retained_projection_sql("context")}) THEN context
                             WHEN COALESCE(context, '{{}}'::jsonb) ? $2::text
                             THEN (COALESCE(context, '{{}}'::jsonb) - $2::text)
                                  || jsonb_build_object(

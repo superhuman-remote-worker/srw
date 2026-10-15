@@ -2731,6 +2731,115 @@ async def test_automatic_cleanup_inventory_failure_precedes_cancellation():
     provisioner.request_workspace_creation_cancellation.assert_not_awaited()
 
 
+class _PerOwnerInventoryDB:
+    """Inventory with legacy rows elsewhere plus the per-owner query."""
+
+    def __init__(self, *, ambiguous=0, owner_unannotated=False, safe=False):
+        self.ambiguous = ambiguous
+        self.owner_unannotated = owner_unannotated
+        self.safe = safe
+        self.owner_queries: list[tuple[str, str, str]] = []
+
+    async def managed_repository_workspace_cleanup_activation_inventory(self):
+        return {
+            "managed_runtime_count": 3,
+            "unannotated_runtime_count": 0 if self.safe else 2,
+            "ambiguous_effect_count": self.ambiguous,
+            "safe": self.safe,
+        }
+
+    async def managed_repository_workspace_runtime_is_unannotated(
+        self, owner_id, *, owner_kind, scope
+    ):
+        self.owner_queries.append((owner_id, owner_kind, scope))
+        return self.owner_unannotated
+
+
+def _gated_provisioner(db, *, enabled=True):
+    from orchestrator.services.container_provisioner import ContainerProvisioner
+
+    provisioner = ContainerProvisioner()
+    provisioner._db = db
+    provisioner._k8s_available = True
+    provisioner._workspace_cleanup_reconciliation_enabled = enabled
+    return provisioner
+
+
+@pytest.mark.asyncio
+async def test_annotated_owner_is_admitted_despite_legacy_rows_elsewhere():
+    db = _PerOwnerInventoryDB()
+    provisioner = _gated_provisioner(db)
+    job = WorkspaceOwner.job("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+    session = WorkspaceOwner.session("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb")
+
+    assert await provisioner._workspace_cleanup_automatic_admission_is_safe(job)
+    assert await provisioner._workspace_cleanup_automatic_admission_is_safe(
+        job, scope="ide"
+    )
+    assert await provisioner._workspace_cleanup_automatic_admission_is_safe(session)
+    assert db.owner_queries == [
+        (job.id, "job", "workspace_container"),
+        (job.id, "job", "ide"),
+        (session.id, "thread", "workspace_container"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_unannotated_owner_is_refused_its_own_automatic_cleanup():
+    provisioner = _gated_provisioner(_PerOwnerInventoryDB(owner_unannotated=True))
+    owner = WorkspaceOwner.job("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+    provisioner.request_workspace_creation_cancellation = AsyncMock()
+
+    assert not await provisioner._workspace_cleanup_automatic_admission_is_safe(owner)
+    assert (
+        await provisioner.prepare_workspace_cleanup_intent(
+            owner,
+            expected_runtime_incarnation="11111111-1111-4111-8111-111111111111",
+            target_disposition="deleted",
+            reclaim_shared_resources=False,
+            admission_source="automatic",
+        )
+        is None
+    )
+    provisioner.request_workspace_creation_cancellation.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("ambiguous", [1, None])
+async def test_any_ambiguous_creation_effect_refuses_every_owner(ambiguous):
+    db = _PerOwnerInventoryDB(ambiguous=ambiguous)
+    provisioner = _gated_provisioner(db)
+    owner = WorkspaceOwner.job("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+
+    assert not await provisioner._workspace_cleanup_automatic_admission_is_safe(owner)
+    assert db.owner_queries == []
+
+
+@pytest.mark.asyncio
+async def test_ownerless_admission_keeps_the_whole_inventory():
+    provisioner = _gated_provisioner(_PerOwnerInventoryDB())
+    assert not await provisioner._workspace_cleanup_automatic_admission_is_safe()
+    clean = _gated_provisioner(_PerOwnerInventoryDB(safe=True))
+    assert await clean._workspace_cleanup_automatic_admission_is_safe()
+
+
+@pytest.mark.asyncio
+async def test_clean_inventory_admits_without_the_owner_query():
+    db = _PerOwnerInventoryDB(safe=True, owner_unannotated=True)
+    provisioner = _gated_provisioner(db)
+    owner = WorkspaceOwner.job("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+    assert await provisioner._workspace_cleanup_automatic_admission_is_safe(owner)
+    assert db.owner_queries == []
+
+
+@pytest.mark.asyncio
+async def test_dark_flag_refuses_an_annotated_owner():
+    db = _PerOwnerInventoryDB(safe=True)
+    provisioner = _gated_provisioner(db, enabled=False)
+    owner = WorkspaceOwner.job("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+    assert not await provisioner._workspace_cleanup_automatic_admission_is_safe(owner)
+
+
 @pytest.mark.asyncio
 async def test_dark_reconciler_finishes_every_committed_generation():
     """The rollout flag gates discovery, not crash recovery already committed."""

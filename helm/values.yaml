@@ -3469,6 +3469,13 @@ workspace:
   # today's retain-on-idle behavior. See
   # knowledge-base/knowledge/features/workspace_durability_tiering.md §D3.
   reclaimOnIdle: false
+  # -- Idle Pod release for Kubernetes job workspaces, in seconds. A job left in
+  # pending_review, waiting_for_reply or paused with no agent and no live IDE
+  # for this long gives up its workspace Pod; its PVC keeps the files, and the
+  # next resume or dispatch recreates the Pod on the same claim. 0 disables.
+  # Needs orchestrator.workspaceCleanupReconciliationEnabled, like every
+  # automatic workspace cleanup.
+  idlePodReleaseSeconds: 86400
   # -- Capacity guard for PVC-backed workspaces (Phase 3a). Renders a
   # namespaced ResourceQuota keyed on `ephemeralStorageClass` that caps BOTH the
   # total storage and the count of workspace PVCs of that class. At the cap, new

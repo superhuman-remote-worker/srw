@@ -666,6 +666,12 @@ spec:
                 configMapKeyRef:
                   name: {{ include "srw.configMapName" . }}
                   key: WORKSPACE_RECLAIM_ON_IDLE
+            # The lifecycle reaper releases idle job workspace Pods.
+            - name: WORKSPACE_IDLE_POD_RELEASE_SECONDS
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: WORKSPACE_IDLE_POD_RELEASE_SECONDS
             # Gitea
             - name: GITEA_URL
               valueFrom:

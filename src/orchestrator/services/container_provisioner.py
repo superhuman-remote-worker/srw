@@ -2443,8 +2443,22 @@ class ContainerProvisioner:
         reservation.update(row)
         return True
 
-    async def _workspace_cleanup_automatic_admission_is_safe(self) -> bool:
-        """Require both the rollout flag and a clean server-owned inventory."""
+    async def _workspace_cleanup_automatic_admission_is_safe(
+        self,
+        owner: WorkspaceOwner | None = None,
+        *,
+        scope: Literal["workspace_container", "ide"] = "workspace_container",
+    ) -> bool:
+        """Require the rollout flag and exact creation authority.
+
+        A clean server-owned inventory admits every owner. Otherwise an owner
+        is admitted only when no issued creation effect is ambiguous anywhere
+        and its own runtime carries a settled creation reservation. A legacy
+        unannotated runtime therefore blocks automatic cleanup of itself, not of
+        every annotated workspace; its explicit lifecycle owner settles it.
+        Owner-less callers and a database without the per-owner query keep the
+        all-or-nothing inventory.
+        """
 
         if not self._workspace_cleanup_reconciliation_enabled or self._db is None:
             return False
@@ -2456,7 +2470,30 @@ class ContainerProvisioner:
         if not callable(inventory):
             return False
         observed = await inventory(self._db)
-        return bool(isinstance(observed, dict) and observed.get("safe") is True)
+        if not isinstance(observed, dict):
+            return False
+        if observed.get("safe") is True:
+            return True
+        unannotated = getattr(
+            type(self._db),
+            "managed_repository_workspace_runtime_is_unannotated",
+            None,
+        )
+        if (
+            owner is None
+            or not callable(unannotated)
+            or observed.get("ambiguous_effect_count") != 0
+        ):
+            return False
+        return (
+            await unannotated(
+                self._db,
+                owner.id,
+                owner_kind=("thread" if owner.kind == "session" else "job"),
+                scope=scope,
+            )
+            is False
+        )
 
     @asynccontextmanager
     async def _workspace_creation_effect(
@@ -7551,7 +7588,7 @@ class ContainerProvisioner:
         automatic_admission_enabled = False
         if admission_source == "automatic":
             automatic_admission_enabled = (
-                await self._workspace_cleanup_automatic_admission_is_safe()
+                await self._workspace_cleanup_automatic_admission_is_safe(owner)
             )
             if not automatic_admission_enabled:
                 return None
@@ -8714,7 +8751,9 @@ class ContainerProvisioner:
         automatic_admission_enabled = False
         if not isinstance(existing, dict) and admission_source == "automatic":
             automatic_admission_enabled = (
-                await self._workspace_cleanup_automatic_admission_is_safe()
+                await self._workspace_cleanup_automatic_admission_is_safe(
+                    owner, scope="ide"
+                )
             )
             if not automatic_admission_enabled:
                 return None

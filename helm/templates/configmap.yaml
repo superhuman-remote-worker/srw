@@ -454,6 +454,9 @@ data:
   # keeps today's retain-on-idle behavior. See workspace_suspension.py and
   # knowledge-base/knowledge/features/workspace_durability_tiering.md §D3.
   WORKSPACE_RECLAIM_ON_IDLE: {{ .Values.workspace.reclaimOnIdle | default false | quote }}
+  # Idle job workspaces release their Pod and keep their PVC after this many
+  # seconds; 0 disables. Runs only with workspace cleanup reconciliation on.
+  WORKSPACE_IDLE_POD_RELEASE_SECONDS: {{ .Values.workspace.idlePodReleaseSeconds | default 0 | quote }}
 
   # Agent
   AGENT_CONFIG: {{ .Values.agent.config | quote }}

@@ -25,6 +25,11 @@ async def create_empty_container_recovery_ledger(conn):
             settled_at timestamptz
         );
         TRUNCATE managed_repository_workspace_cleanup_intents;
+        CREATE OR REPLACE FUNCTION
+            public.managed_repository_workspace_cleanup_projection_is_settled(
+                text, uuid, text, text, text, text
+            )
+        RETURNS boolean LANGUAGE sql STABLE AS $$ SELECT false $$;
         """
     )
 

@@ -612,3 +612,96 @@ async def test_job_and_session_adoption_share_one_ledger_contract(db):
     assert reservation["result_kind"] == "settled"
     assert reservation["external_mutation_started_at"] is None
     assert str(reservation["pod_uid"]) == attestation.runtime_incarnation
+
+
+@pytest.mark.asyncio
+async def test_per_owner_annotation_classifies_like_the_activation_inventory(db):
+    """The per-owner cleanup gate agrees with the inventory, row by row."""
+
+    before = await db.managed_repository_workspace_cleanup_activation_inventory()
+    job = await db.create_job(
+        description="pre-0197 Kubernetes job runtime",
+        config_override={"workspace": {"backend": "sandbox"}},
+    )
+    job_id = str(job["id"])
+    async with db.acquire() as conn:
+        await seed_previous_release_row(
+            conn,
+            "jobs",
+            "UPDATE jobs SET context=$2::jsonb WHERE id=$1",
+            job["id"],
+            json.dumps({"workspace_container": dict(HISTORICAL_ENDPOINT)}),
+        )
+
+    assert (
+        await db.managed_repository_workspace_runtime_is_unannotated(
+            job_id, owner_kind="job", scope="workspace_container"
+        )
+        is True
+    )
+    seeded = await db.managed_repository_workspace_cleanup_activation_inventory()
+    assert (
+        seeded["unannotated_runtime_count"] == before["unannotated_runtime_count"] + 1
+    )
+    # The same job has no IDE projection, so that scope has nothing to guard.
+    assert (
+        await db.managed_repository_workspace_runtime_is_unannotated(
+            job_id, owner_kind="job", scope="ide"
+        )
+        is False
+    )
+
+    provisioner = SimpleNamespace(
+        attest_workspace_runtime=AsyncMock(return_value=_attestation())
+    )
+    result = await ensure_legacy_k8s_job_runtime_authority(
+        db, provisioner, await db.get_job(job_id)
+    )
+    assert result.outcome is LegacyK8sAdoptionOutcome.ADOPTED
+
+    assert (
+        await db.managed_repository_workspace_runtime_is_unannotated(
+            job_id, owner_kind="job", scope="workspace_container"
+        )
+        is False
+    )
+    adopted = await db.managed_repository_workspace_cleanup_activation_inventory()
+    assert adopted["unannotated_runtime_count"] == before["unannotated_runtime_count"]
+
+
+@pytest.mark.asyncio
+async def test_per_owner_annotation_without_a_managed_runtime(db):
+    thread = await _seed_previous_release_session(db)
+    thread_id = str(thread["id"])
+    assert (
+        await db.managed_repository_workspace_runtime_is_unannotated(
+            thread_id, owner_kind="thread", scope="workspace_container"
+        )
+        is True
+    )
+    # An absent owner keeps orphan admission's own process-zero requirement.
+    assert (
+        await db.managed_repository_workspace_runtime_is_unannotated(
+            str(uuid4()), owner_kind="job", scope="workspace_container"
+        )
+        is False
+    )
+    plain = await db.create_job(description="no workspace runtime yet")
+    assert (
+        await db.managed_repository_workspace_runtime_is_unannotated(
+            str(plain["id"]), owner_kind="job", scope="workspace_container"
+        )
+        is False
+    )
+    # Unknown shapes fail closed.
+    for owner_id, owner_kind, scope in (
+        (thread_id, "thread", "ide"),
+        (thread_id, "session", "workspace_container"),
+        ("not-a-uuid", "job", "workspace_container"),
+    ):
+        assert (
+            await db.managed_repository_workspace_runtime_is_unannotated(
+                owner_id, owner_kind=owner_kind, scope=scope
+            )
+            is True
+        )
