@@ -605,6 +605,26 @@ spec:
                 configMapKeyRef:
                   name: {{ include "srw.configMapName" . }}
                   key: WORKSPACE_PATH
+            - name: MANIFEST_NAMESPACE
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: MANIFEST_NAMESPACE
+            - name: MANIFEST_NETWORK_ISOLATION_VERIFIED
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: MANIFEST_NETWORK_ISOLATION_VERIFIED
+            - name: MANIFEST_MAX_CONCURRENT_JOBS
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: MANIFEST_MAX_CONCURRENT_JOBS
+            - name: MANIFEST_HARNESS_EGRESS
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: MANIFEST_HARNESS_EGRESS
             - name: WORKSPACE_STORAGE_CLASS
               valueFrom:
                 configMapKeyRef:
