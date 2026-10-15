@@ -254,8 +254,9 @@ def test_remaining_hostile_shapes_have_bounded_growth(case):
     """A subprocess bounds wall time; process CPU measures parser growth.
 
     The worker can be descheduled while CI runs other tests, which must not
-    inflate one growth sample. The 100ms floor absorbs timer noise on fast
-    fixed implementations; ratios still distinguish repeated scans.
+    inflate one growth sample, so each size keeps the best of three runs. The
+    100ms floor absorbs timer noise on fast fixed implementations; ratios
+    still distinguish repeated scans.
     """
     import json
     import subprocess
@@ -281,9 +282,12 @@ def test_remaining_hostile_shapes_have_bounded_growth(case):
             else:
                 text = ''.join('`' * i + 'x' for i in range(1, n)) + 'a' * (n*n)
                 fn = lambda text: em._sub_code_spans(text, lambda inner: inner)
-            start = time.process_time()
-            fn(text)
-            samples.append([len(text), time.process_time() - start])
+            elapsed = []
+            for _ in range(3):
+                start = time.process_time()
+                fn(text)
+                elapsed.append(time.process_time() - start)
+            samples.append([len(text), min(elapsed)])
         print(json.dumps(samples))
     """)
     result = subprocess.run(
