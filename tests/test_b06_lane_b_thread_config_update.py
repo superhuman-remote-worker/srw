@@ -23,6 +23,7 @@ from orchestrator.schemas.thread_config import (
     ThreadConfigPatchRequest,
     ThreadWorkspaceUpgradeRequest,
 )
+from orchestrator.services import stateless_workspace_upgrade as swu
 from orchestrator.services import thread_config_update as tcu
 
 THREAD = "11111111-1111-4111-8111-111111111111"
@@ -933,13 +934,19 @@ class TestUpgradeAvailability:
         result = await tcu.agent_thread_upgrade_availability(
             MagicMock(), THREAD, dependencies=deps
         )
-        assert result == {"vm": {"available": True, "reason": None}}
+        assert result["vm"] == {"available": True, "reason": None}
+        assert result["container"] == {
+            "available": False,
+            "reason": swu.PINNED_CONTAINER_UPGRADE_UNAVAILABLE,
+        }
         deps.require_internal.assert_awaited_once()
         deps.store.merge_thread_vm_context.assert_not_awaited()
         deps.vm_provisioner.create_thread_vm.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_stateless_lane_is_unavailable_before_the_grant_gate(self):
+    async def test_stateless_lane_vm_is_unavailable_until_c2(self, monkeypatch):
+        # Tracking off: the container entry stops before grants too.
+        monkeypatch.delenv("CONTAINER_STARTUP_STAGE_AUTHORITY_ENABLED", raising=False)
         deps = _deps()
         deps.store.get_thread = AsyncMock(
             return_value=_pinned_thread(execution_lane="stateless")
@@ -947,11 +954,13 @@ class TestUpgradeAvailability:
         result = await tcu.agent_thread_upgrade_availability(
             MagicMock(), THREAD, dependencies=deps
         )
-        assert result == {
-            "vm": {
-                "available": False,
-                "reason": "Workspace upgrades are not yet supported on the stateless lane",
-            }
+        assert result["vm"] == {
+            "available": False,
+            "reason": swu.STATELESS_VM_UPGRADE_UNAVAILABLE,
+        }
+        assert result["container"] == {
+            "available": False,
+            "reason": swu.STARTUP_TRACKING_REQUIRED,
         }
         deps.enforce_workspace_upgrade_grants.assert_not_awaited()
 
@@ -979,8 +988,9 @@ class TestUpgradeAvailability:
         result = await tcu.agent_thread_upgrade_availability(
             MagicMock(), THREAD, dependencies=deps
         )
-        assert result == {
-            "vm": {"available": False, "reason": "vm_workspace grant denied"}
+        assert result["vm"] == {
+            "available": False,
+            "reason": "vm_workspace grant denied",
         }
 
     @pytest.mark.asyncio
@@ -990,11 +1000,9 @@ class TestUpgradeAvailability:
         result = await tcu.agent_thread_upgrade_availability(
             MagicMock(), THREAD, dependencies=deps
         )
-        assert result == {
-            "vm": {
-                "available": False,
-                "reason": "VM workspaces aren't available on this installation.",
-            }
+        assert result["vm"] == {
+            "available": False,
+            "reason": "VM workspaces aren't available on this installation.",
         }
 
     @pytest.mark.asyncio
@@ -1006,9 +1014,37 @@ class TestUpgradeAvailability:
         result = await tcu.agent_thread_upgrade_availability(
             MagicMock(), THREAD, dependencies=deps
         )
-        assert result == {
-            "vm": {"available": False, "reason": "A VM upgrade is already in progress."}
+        assert result["vm"] == {
+            "available": False,
+            "reason": "A VM upgrade is already in progress.",
         }
+
+    @pytest.mark.asyncio
+    async def test_a_stateless_virtual_session_can_upgrade_to_a_container(
+        self, monkeypatch
+    ):
+        monkeypatch.setenv("CONTAINER_STARTUP_STAGE_AUTHORITY_ENABLED", "true")
+        monkeypatch.setattr(
+            "orchestrator.services.workspace_defaults_resolution.upgrade_record",
+            AsyncMock(
+                return_value=("container", {"upgrade_config": {}, "upgrade_sources": None})
+            ),
+        )
+        deps = _deps()
+        deps.container_provisioner.is_available = True
+        deps.container_provisioner.in_cluster = True
+        deps.store.get_thread = AsyncMock(
+            return_value=_pinned_thread(
+                execution_lane="stateless",
+                metadata={"config_override": {"workspace": {"backend": "virtual"}}},
+            )
+        )
+        result = await tcu.agent_thread_upgrade_availability(
+            MagicMock(), THREAD, dependencies=deps
+        )
+        assert result["container"] == {"available": True, "reason": None}
+        assert result["vm"]["available"] is False
+        deps.store.merge_thread_vm_context.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_vm_session_is_unavailable_by_the_tier_rule(self):

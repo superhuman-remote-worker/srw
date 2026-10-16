@@ -100,7 +100,7 @@ from orchestrator.services.vm_workspace_recovery_store import (
 )
 from shared.backend_kinds import LITE_BACKENDS, VM_BACKENDS
 from shared.connectors.builtin import IMAGE_DRIVER_SPEC, spec_for_row
-from shared.run_queue import LANE_PINNED
+from shared.run_queue import LANE_PINNED, LANE_STATELESS
 from shared.runtime.core.loader import canonical_config_name
 
 logger = logging.getLogger(__name__)
@@ -1165,6 +1165,13 @@ async def _vm_upgrade_availability(
     def unavailable(reason: str) -> dict[str, Any]:
         return {"available": False, "reason": reason}
 
+    if thread.get("execution_lane") == LANE_STATELESS:
+        from orchestrator.services.stateless_workspace_upgrade import (
+            STATELESS_VM_UPGRADE_UNAVAILABLE,
+        )
+
+        # C2 replaces this with its own pre-checks.
+        return unavailable(STATELESS_VM_UPGRADE_UNAVAILABLE)
     try:
         _refuse_stateless_upgrade(thread)
         metadata = require_unprotected_workspace_upgrade(thread)
@@ -1200,6 +1207,30 @@ async def _vm_upgrade_availability(
     return {"available": True, "reason": None}
 
 
+async def _container_upgrade_availability(
+    thread: dict[str, Any], dependencies: ThreadConfigUpdateDependencies
+) -> dict[str, Any]:
+    """Whether a stateless container upgrade would be admitted now (C1)."""
+    from orchestrator.services.stateless_workspace_upgrade import (
+        PINNED_CONTAINER_UPGRADE_UNAVAILABLE,
+        prepare_stateless_container_upgrade,
+    )
+
+    if thread.get("execution_lane") != LANE_STATELESS:
+        return {"available": False, "reason": PINNED_CONTAINER_UPGRADE_UNAVAILABLE}
+    try:
+        await prepare_stateless_container_upgrade(
+            dependencies.store,
+            thread,
+            container_provisioner=dependencies.container_provisioner,
+            enforce_workspace_upgrade_grants=dependencies.enforce_workspace_upgrade_grants,
+            template_name=None,
+        )
+    except HTTPException as exc:
+        return {"available": False, "reason": _refusal_text(exc)}
+    return {"available": True, "reason": None}
+
+
 async def agent_thread_upgrade_availability(
     request: Request,
     thread_id: str,
@@ -1208,8 +1239,8 @@ async def agent_thread_upgrade_availability(
 ) -> dict[str, Any]:
     """Body of ``GET /api/agents/threads/{thread_id}/upgrade-availability``.
 
-    Whether a VM upgrade would be accepted right now, by the VM upgrade's own
-    pre-effect refusals; nothing is provisioned or written. The pinned agent
+    Whether a VM or a container upgrade would be accepted right now, by each
+    upgrade's own pre-effect refusals; nothing is provisioned or written. The pinned agent
     asks before it offers an upgrade, so the user never gets an offer that
     can only fail (stateless upgrade design, decision 1).
     """
@@ -1217,7 +1248,10 @@ async def agent_thread_upgrade_availability(
     thread = await dependencies.store.get_thread(thread_id)
     if not thread:
         raise HTTPException(status_code=404, detail="Thread not found")
-    return {"vm": await _vm_upgrade_availability(thread, dependencies)}
+    return {
+        "vm": await _vm_upgrade_availability(thread, dependencies),
+        "container": await _container_upgrade_availability(thread, dependencies),
+    }
 
 
 async def agent_abort_thread_vm_upgrade(
