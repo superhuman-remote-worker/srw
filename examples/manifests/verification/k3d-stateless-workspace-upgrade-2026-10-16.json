@@ -1,0 +1,38 @@
+{
+  "date": "2026-10-16",
+  "plan": "C1 stateless Session workspace upgrade (virtual/none -> container), knowledge-base superpowers/plans/2026-10-07-stateless-session-workspace-upgrade-c1-plan.md",
+  "code": "develop e54cb7344..ccd433fea (tasks) + 1d4246772..5ae4850f6 (final fix wave, not live-run); live run on Tilt images built from ccd433fea",
+  "stack": {
+    "context": "k3d-srw",
+    "namespace": "srw",
+    "flags": "STATELESS_SESSION_ENABLED=true; CONTAINER_STARTUP_STAGE_AUTHORITY_ENABLED toggled on via git-ignored values-local.yaml for Steps 2-3 and restored byte for byte (sha256 66d43af5...) for Step 4",
+    "caller": "python in the orchestrator Pod (X-Internal-Key + X-MCP-User-Id admin@localhost 6ed1b6f4-...); cockpit via Playwright as the local test user"
+  },
+  "offlineGate": "backend 27 files 1771 passed; real-PG 11 files 320 passed 0 skipped; cockpit npm test 4331 passed; i18n:check 4027 keys; build OK",
+  "step2SuccessPath": {
+    "session": "904d5a88-... (virtual, stateless)",
+    "result": "PASS",
+    "observed": "upload hello.txt (39 bytes) -> /connection controls upgrade-to-workspace=rest, targets [container] -> POST control template container-minimal 202 -> workspace_upgrade provisioning -> copying -> null; workspace_creation observing -> starting -> null -> thread_events workspace_upgrade.complete seeded_files=1 (no LLM call) -> Pod image srw-workspace-minimal, uploads/hello.txt bytes match -> cockpit palette/Settings offered Container before, Settings Container after -> End 200, Resume brings back same image + file",
+    "note": "the seeding claim was the 4th of 5 allowed (pre-Ready bundle 409s), see F1"
+  },
+  "step3FailurePath": {
+    "session": "d35b9403-b412-4b67-a6af-908058f65ae2",
+    "template": "c1-t10-unpullable (srw-registry:5000/does-not-exist:1), deleted afterwards",
+    "results": {
+      "attention": "PASS (pull_deadline; workspace_upgrade.phase failed)",
+      "cockpitFailureText": "PASS live and after reload",
+      "endFromCockpit": "FAIL (F2: no confirm, but forced End 503 'Stateless retirement authority is malformed or changed' every time)",
+      "oldPrefixKeepsFile": "PASS",
+      "templateDeleted": "PASS"
+    }
+  },
+  "step4TrackingOff": "PASS: /connection omits the verb; direct POST 409 tracking copy; palette hides /upgrade-workspace; End 200",
+  "findings": {
+    "F1": "pre-Ready claims got deterministic bundle 409 (identity pair incomplete until Ready) and parked the unit after 5 attempts (~3.4 min). FIXED in code by 1d4246772 (425 transient before Ready; real-PG test: 6 claims > max_attempts never park). Not re-run live.",
+    "F2": "End during/after an upgrade create answers 503 for any Session with history: initial-creation retirement admission requires run_queue.lease_token == 0 (postgres.py ~:46404, reliability-owned, since 466d5e591). OPEN - owner decision on a scoped End admission change. Repro left on k3d: Session d35b9403 (Pod ws-thread-d35b9403-b41 ImagePullBackOff, PVC, Service)."
+  },
+  "owed": [
+    "F2 decision and fix; then End d35b9403 live (expect 200 + process-zero receipt for runtime_incarnation 5a00caf5-...)",
+    "dev: one Session with a real model turn proving the copied files are visible in the container (owner OK first, P-2b)"
+  ]
+}
