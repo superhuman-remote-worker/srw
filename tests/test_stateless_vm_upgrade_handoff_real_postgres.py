@@ -7,24 +7,34 @@ stay unedited and run as regression neighbours. Fixtures are C1's.
 from __future__ import annotations
 
 import json
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pytest
 from fastapi import HTTPException
 
+from orchestrator.services.agent_thread_status import update_thread_status
 from orchestrator.services.manifest_workspace_selection import (
     select_execution_workspace,
 )
+from orchestrator.services.session_provisioner import ensure_session_workspace
+from orchestrator.services.vm_idle_lifecycle import VMIdleLifecycleStore
 from orchestrator.services.vm_upgrade_seed import (
     PINNED_IDENTITY_MISMATCH,
     agent_vm_upgrade_seed_source,
     mark_vm_upgrade_seeded,
 )
+from shared.thread_controls import (
+    adopt_next_pinned_control_request,
+    fetch_next_control_request,
+    finalize_control_request,
+)
 from tests import test_stateless_workspace_upgrade_real_postgres as c1
 from tests.test_pinned_vm_initial_binding_real_postgres import _bind_cold_agent
+from tests.test_vm_idle_pinned_session_real_postgres import ready_pinned_thread
+from tests.test_vm_session_retained_resume_real_postgres import retained_resume
 
 actor = c1.actor
 database = c1.database
@@ -711,3 +721,197 @@ async def test_the_switch_restarts_a_paused_sessions_attention_timer(database, a
     )
     assert (after["status"], after["execution_lane"]) == ("awaiting_user", "pinned")
     assert timedelta(0) <= after["paused_for"] < timedelta(seconds=10)
+
+
+async def switched(database, actor, *, backend="virtual"):
+    thread_id = await lite_session(database, actor, backend=backend)
+    await quiet_queue(database, thread_id)
+    return thread_id, await switch(database, actor, thread_id)
+
+
+def _owner(thread):
+    return dict(
+        thread_id=str(thread["id"]),
+        agent_id=str(thread["agent_id"]),
+        runtime_generation=str(thread["runtime_generation"]),
+        runtime_attach_token=str(thread["runtime_attach_token"]),
+    )
+
+
+async def add_switch_leftovers(database, thread_id, *, marker_state="seeded"):
+    """What a switch leaves on a Session that later became a VM Session."""
+    generation = await database.fetchval(
+        "SELECT runtime_generation FROM threads WHERE id = $1::uuid", thread_id
+    )
+    request_id = uuid4()
+    async with database.acquire() as conn:
+        async with conn.transaction():
+            await conn.execute(
+                "INSERT INTO run_queue (unit_id, unit_kind, state, lease_token) "
+                "VALUES ($1::uuid, 'session_turn', 'done', 4)",
+                thread_id,
+            )
+            await conn.execute(
+                "INSERT INTO thread_client_presence (thread_id, refreshed_at, expires_at) "
+                "VALUES ($1::uuid, now() - interval '2 minutes', now() - interval '1 minute')",
+                thread_id,
+            )
+            await conn.execute(
+                "INSERT INTO thread_control_requests (thread_id, request_seq, "
+                "client_request_id, verb, payload, requested_by, outcome, result, "
+                "applied_at, applied_lease_token, journal_epoch, journal_seq, "
+                "acknowledged_at, runtime_generation) VALUES ($1::uuid, 900, $2, "
+                "'mode.set', '{\"mode\": \"supervised\"}'::jsonb, 'real-pg', 'applied', "
+                "'{}'::jsonb, now(), 3, 0, 1, now(), $3::uuid)",
+                thread_id,
+                uuid4(),
+                generation,
+            )
+            await conn.execute(
+                "INSERT INTO thread_control_requests (id, thread_id, request_seq, "
+                "client_request_id, verb, payload, requested_by, outcome, result, "
+                "applied_at, applied_agent_id, journal_epoch, journal_seq, "
+                "acknowledged_at, runtime_generation) VALUES ($1, $2::uuid, 901, $3, "
+                "'upgrade-to-workspace', $4::jsonb, 'real-pg', 'applied', '{}'::jsonb, "
+                "now(), $5, 1, 2, now(), $6::uuid)",
+                request_id,
+                thread_id,
+                uuid4(),
+                json.dumps(
+                    {"runtime_generation": str(generation), "target_tier": "vm"}
+                ),
+                uuid4(),
+                generation,
+            )
+            await conn.execute(
+                "UPDATE threads SET metadata = jsonb_set(metadata, '{vm}', "
+                "COALESCE(metadata->'vm', '{}'::jsonb) || "
+                "jsonb_build_object('upgrade_seed', $2::jsonb), true) "
+                "WHERE id = $1::uuid",
+                thread_id,
+                json.dumps(
+                    {
+                        "control_request_id": str(request_id),
+                        "state": marker_state,
+                        "source": None,
+                    }
+                ),
+            )
+    return request_id
+
+
+@pytest.mark.asyncio
+async def test_a_pinned_binding_adopts_the_request_and_finalizes_its_started_receipt(
+    database, actor
+):
+    thread_id, admitted = await switched(database, actor)
+    bound = await _bind_cold_agent(database, thread_id)
+    async with database.acquire() as conn:
+        async with conn.transaction():
+            await adopt_next_pinned_control_request(conn, **_owner(bound))
+            request = await fetch_next_control_request(
+                conn, lease_token=None, **_owner(bound)
+            )
+    assert request is not None and request.id == admitted.id
+    assert request.verb == "upgrade-to-workspace"
+    epoch = await database.fetchval(
+        "SELECT events_epoch FROM threads WHERE id = $1::uuid", thread_id
+    )
+    receipt = {
+        "request_id": str(admitted.id),
+        "client_request_id": str(admitted.client_request_id),
+        "request_seq": admitted.request_seq,
+        "method": "upgrade-to-workspace",
+        "target_tier": "vm",
+        "provision_generation": str(uuid4()),
+    }
+    await database.execute(
+        "INSERT INTO thread_events (thread_id, epoch, seq, kind, payload, "
+        "control_request_id) VALUES ($1::uuid, $2, 10000, "
+        "'workspace_upgrade.started', $3::jsonb, $4)",
+        thread_id,
+        epoch,
+        json.dumps(receipt),
+        admitted.id,
+    )
+    owner = _owner(bound)
+    async with database.acquire() as conn:
+        async with conn.transaction():
+            result = await finalize_control_request(
+                conn,
+                request_id=admitted.id,
+                agent_id=owner["agent_id"],
+                runtime_generation=owner["runtime_generation"],
+                runtime_attach_token=owner["runtime_attach_token"],
+                outcome="applied",
+            )
+    assert result == "applied"
+    row = await database.fetchrow(
+        "SELECT outcome, applied_agent_id FROM thread_control_requests WHERE id = $1",
+        admitted.id,
+    )
+    assert (row["outcome"], row["applied_agent_id"]) == ("applied", bound["agent_id"])
+
+
+@pytest.mark.asyncio
+async def test_vm_idle_release_admits_a_switched_session_with_its_leftovers(
+    database, monkeypatch
+):
+    thread_id, body, identity = await ready_pinned_thread(database, monkeypatch)
+    await add_switch_leftovers(database, thread_id)
+    await update_thread_status(
+        str(thread_id),
+        body,
+        dependencies=SimpleNamespace(
+            db=database, thread_accepts_runtime=lambda _row: True
+        ),
+    )
+    source = await database.fetchrow(
+        "SELECT workspace_idle_revision, workspace_idle_episode FROM threads WHERE id = $1",
+        thread_id,
+    )
+    episode = _json(source["workspace_idle_episode"])
+    episode["episode_id"] = str(uuid4())
+    episode["entered_at"] = (
+        datetime.now(timezone.utc) - timedelta(minutes=16)
+    ).isoformat()
+    await database.execute(
+        "UPDATE threads SET workspace_idle_revision = $2, "
+        "workspace_idle_episode = $3::jsonb WHERE id = $1",
+        thread_id,
+        source["workspace_idle_revision"] + 1,
+        json.dumps(episode),
+    )
+    operation = await VMIdleLifecycleStore(database).admit_thread_release(
+        str(thread_id),
+        episode_id=episode["episode_id"],
+        revision=2,
+        identity=identity,
+        turn_quiescent=True,
+    )
+    assert operation is not None
+    assert operation["release_kind"] == "pinned_thread"
+
+
+@pytest.mark.asyncio
+async def test_retained_resume_admits_its_source_with_the_switch_leftovers(
+    database, monkeypatch
+):
+    case, _physical, current, suspension = await retained_resume(
+        database, monkeypatch, ready=True, marker=False, bind=True
+    )
+    await add_switch_leftovers(database, case["thread_id"])
+    await ensure_session_workspace(
+        str(case["thread_id"]),
+        db=database,
+        provisioner=None,
+        suspension=suspension,
+        expected_runtime_generation=str(current["runtime_generation"]),
+    )
+    resumed = await database.fetchrow(
+        "SELECT * FROM vm_creation_retries WHERE thread_id = $1 AND request_id <> $2",
+        case["thread_id"],
+        case["request_id"],
+    )
+    assert resumed is not None, "the leftovers kept 0297 from admitting its source"
+    assert resumed["expected_pvc_uid"] == UUID(case["pvc_uid"])
