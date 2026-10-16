@@ -607,8 +607,33 @@ def _pod_has_exact_process_zero(pod: Any) -> bool:
     )
 
 
-def _pod_is_terminal_before_first_ready(pod: Any) -> bool:
-    """A scheduled Never Pod ran its workspace container and then stopped."""
+@dataclass(frozen=True, slots=True)
+class _WorkspaceContainerExit:
+    """Exact proof that a scheduled ``restartPolicy: Never`` Pod's workspace
+    container ran and stopped before its first Ready.
+
+    ``reason`` is the container's termination reason, or ``Evicted`` when the
+    Pod itself reports eviction.
+    """
+
+    exit_code: int
+    reason: str
+
+    @property
+    def stopped_by_cluster(self) -> bool:
+        return self.reason in WorkspaceContainerExitedError.INFRASTRUCTURE_REASONS
+
+
+def _workspace_container_exit_before_first_ready(
+    pod: Any,
+) -> _WorkspaceContainerExit | None:
+    """The one exit classifier: the flag-off error and the flag-on observer.
+
+    It requires phase Failed/Succeeded, ``restartPolicy: Never``, a node, every
+    container terminated, no ``Ready=True`` condition, and exactly one
+    terminated ``workspace`` container with an integer exit code,
+    ``restartCount`` 0 and a container ID (the runtime really started it).
+    """
 
     spec = getattr(pod, "spec", None)
     status = getattr(pod, "status", None)
@@ -623,38 +648,58 @@ def _pod_is_terminal_before_first_ready(pod: Any) -> bool:
             for condition in (getattr(status, "conditions", None) or ())
         )
     ):
-        return False
+        return None
     workspaces = [
         item
         for item in (getattr(status, "container_statuses", None) or ())
         if getattr(item, "name", None) == "workspace"
     ]
     if len(workspaces) != 1:
-        return False
+        return None
     workspace = workspaces[0]
     terminated = getattr(getattr(workspace, "state", None), "terminated", None)
-    return bool(
-        terminated is not None
-        and type(getattr(terminated, "exit_code", None)) is int
-        and getattr(workspace, "restart_count", None) == 0
-        and getattr(workspace, "container_id", None)
-    )
+    exit_code = getattr(terminated, "exit_code", None)
+    if (
+        terminated is None
+        or type(exit_code) is not int
+        or getattr(workspace, "restart_count", None) != 0
+        or not getattr(workspace, "container_id", None)
+    ):
+        return None
+    reason = str(getattr(terminated, "reason", None) or "").strip()
+    if getattr(status, "reason", None) == "Evicted":
+        # Eviction is reported on the Pod, not on its terminated container.
+        reason = "Evicted"
+    return _WorkspaceContainerExit(exit_code, reason)
+
+
+def _pod_is_terminal_before_first_ready(pod: Any) -> bool:
+    """A scheduled Never Pod ran its workspace container and then stopped."""
+
+    return _workspace_container_exit_before_first_ready(pod) is not None
 
 
 def _workspace_container_exited_error(pod: Any) -> WorkspaceContainerExitedError:
     """Describe the exit that ``_pod_is_terminal_before_first_ready`` proved."""
 
-    (workspace,) = [
-        item
-        for item in (getattr(pod.status, "container_statuses", None) or ())
-        if getattr(item, "name", None) == "workspace"
-    ]
-    terminated = workspace.state.terminated
-    reason = getattr(terminated, "reason", None)
-    if getattr(pod.status, "reason", None) == "Evicted":
-        # Eviction is reported on the Pod, not on its terminated container.
-        reason = "Evicted"
-    return WorkspaceContainerExitedError(terminated.exit_code, reason)
+    exited = _workspace_container_exit_before_first_ready(pod)
+    if exited is None:
+        raise ValueError("the workspace container exit is not proven")
+    return WorkspaceContainerExitedError(exited.exit_code, exited.reason)
+
+
+def _image_exit_code_before_first_ready(pod: Any) -> int | None:
+    """The exit code when the image's own process stopped before Ready.
+
+    ``None`` without exact proof, or when the cluster stopped the container
+    (``WorkspaceContainerExitedError.INFRASTRUCTURE_REASONS``): that keeps the
+    readiness-deadline path, whose copy names a cluster stop.
+    """
+
+    exited = _workspace_container_exit_before_first_ready(pod)
+    if exited is None or exited.stopped_by_cluster:
+        return None
+    return exited.exit_code
 
 
 def _container_never_started(container: Any) -> bool:
