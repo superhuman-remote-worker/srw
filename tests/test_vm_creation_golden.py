@@ -462,3 +462,76 @@ async def test_missing_pin_after_unknown_issuance_cannot_be_recreated(golden):
             authority.row["effects"][0]["carrier_intent"]["rootdisk_source"],
         )
     assert api.writes.count("DataVolume") == 1
+
+
+@pytest.fixture
+def profiled_golden(golden, monkeypatch):
+    from shared.vm_network_profile import NETWORK_PROFILE
+
+    ctrl, api, authority, payload, old_name = golden
+    image = "registry.example/srw-vm@sha256:" + "a" * 64
+    monkeypatch.setenv("VM_NETWORK_PROFILE_IMAGE_ALLOWLIST", image)
+    request = {
+        **authority.row["request"],
+        "vm_image": image,
+        "network_profile": deepcopy(NETWORK_PROFILE),
+    }
+    resolved = resolve_creation_configuration(ctrl, request)
+    authority.row.update(resolved)
+    payload.update(resolved["request"])
+    payload["creation_retry"]["request_digest"] = resolved["request_digest"]
+    payload["creation_retry"]["controller_configuration_digest"] = resolved[
+        "controller_configuration_digest"
+    ]
+    name = settings._golden_name(image)
+    source = ctrl._golden_dv_manifest(name, image)
+    source["metadata"].update(uid=str(uuid4()), resourceVersion="1")
+    source["status"] = {"phase": "Succeeded"}
+    pvc = deepcopy(api.objects.pop(("PersistentVolumeClaim", old_name)))
+    pvc["metadata"]["name"] = name
+    pvc["metadata"]["ownerReferences"][0]["uid"] = source["metadata"]["uid"]
+    api.objects.pop(("DataVolume", old_name))
+    api.objects["DataVolume", name] = source
+    api.objects["PersistentVolumeClaim", name] = pvc
+    return ctrl, api, authority, payload, name
+
+
+@pytest.mark.asyncio
+async def test_profiled_golden_creation_publishes_rootdisk_with_authenticated_policy(
+    profiled_golden,
+):
+    ctrl, api, authority, payload, name = profiled_golden
+    result = await ctrl._do_create_serialized(payload)
+    assert result["status"] == "creation_pending"
+    effect = authority.row["effects"][0]
+    assert (
+        effect["carrier_intent"]["rootdisk_source"]["dv_uid"]
+        == api.objects["DataVolume", name]["metadata"]["uid"]
+    )
+    assert api.replacements
+
+    assert api.writes.count("DataVolume") == 1
+    assert "VirtualMachine" not in api.writes
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("drift", ["missing_policy", "other_image", "live_storage"])
+async def test_profiled_golden_facts_reject_missing_or_changed_authority(
+    profiled_golden, monkeypatch, drift
+):
+    from vm_controller.creation_sources import GoldenSources
+
+    ctrl, api, authority, payload, name = profiled_golden
+    configuration = authority.row["controller_configuration"]
+    if drift == "missing_policy":
+        configuration.pop("network_profile_policy")
+    elif drift == "other_image":
+        configuration["network_profile_policy"]["image"] = (
+            "registry.example/other@sha256:" + "b" * 64
+        )
+    else:
+        monkeypatch.setattr(settings, "VM_STORAGE_CLASS", "different-storage")
+    with pytest.raises(ValueError):
+        await GoldenSources(ctrl).facts(authority.row, name)
+    assert api.writes == []
+    assert api.replacements == []
