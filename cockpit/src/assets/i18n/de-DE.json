@@ -2356,7 +2356,12 @@
       "undoUnsupported": "Rückgängig machen ist für den Workspace dieser Sitzung nicht verfügbar.",
       "undoRejected": "Der Agent konnte die letzten Dateiänderungen nicht rückgängig machen.",
       "containerUpgradeUnavailable": "Container-Upgrades sind in dieser Sitzung nicht verfügbar. Verwende /upgrade-workspace vm oder starte eine neue Sitzung mit einem Container-Workspace.",
-      "upgradeUnavailable": "Workspace-Upgrades sind in dieser Sitzung nicht verfügbar."
+      "upgradeUnavailable": "Workspace-Upgrades sind in dieser Sitzung nicht verfügbar.",
+      "upgradeDeferred": "Das Workspace-Upgrade startet nach der aktuellen Antwort.",
+      "vmUpgradeUnavailable": "Ein Upgrade dieser Sitzung auf eine VM ist auf dieser Installation noch nicht verfügbar. Starte stattdessen eine neue Sitzung mit einem VM-Workspace."
+    },
+    "workspaceUpgrade": {
+      "failedStartup": "Workspace-Upgrade fehlgeschlagen. {{reason}} Beende diese Sitzung und starte eine neue; deine Dateien bleiben erhalten."
     },
     "workspaceOffer": {
       "title": "Workspace-Upgrade angefordert",

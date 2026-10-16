@@ -2356,7 +2356,12 @@
       "undoUnsupported": "Undo isn't available for this session's workspace.",
       "undoRejected": "The agent could not undo the last file changes.",
       "containerUpgradeUnavailable": "Container upgrades aren't available in this session. Use /upgrade-workspace vm, or start a new session with a container workspace.",
-      "upgradeUnavailable": "Workspace upgrades aren't available in this session."
+      "upgradeUnavailable": "Workspace upgrades aren't available in this session.",
+      "upgradeDeferred": "The workspace upgrade will start after the current response.",
+      "vmUpgradeUnavailable": "Upgrading a session to a VM isn't available on this installation yet. Start a new session with a VM workspace instead."
+    },
+    "workspaceUpgrade": {
+      "failedStartup": "Workspace upgrade failed. {{reason}} End this session and start a new one; your files are kept."
     },
     "workspaceOffer": {
       "title": "Workspace upgrade requested",

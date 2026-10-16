@@ -351,8 +351,8 @@ export class SettingsPaneComponent {
      *
      * The ladder is one-way and partial: `virtual → sandbox|vm`, `sandbox → vm`.
      * Downgrade is an explicit non-goal (workspace_tier_upgrade.md §"Non-goals")
-     * and `none` has no durable anchor to seed from, so a `none` session can
-     * reach nothing at all — the row renders static text in that case.
+     * and `none` reaches a container only where the session declares one
+     * (stateless); otherwise it reaches nothing and the row renders static text.
      *
      * Every refusal carries a reason so it renders in the option itself rather
      * than arriving as a rejected click.
@@ -376,23 +376,25 @@ export class SettingsPaneComponent {
                 map['virtual'] = 'downgrade';
                 map['none'] = 'downgrade';
                 break;
-            // `none`, or a tier this build does not know: nothing reachable,
+            case 'none':
+                // Nothing to seed in place on the pinned lane; a stateless
+                // session's container upgrade starts it fresh (C1).
+                if (this.chat.upgradeTargetAvailable('sandbox')) {
+                    map['sandbox'] = 'ok';
+                    map['vm'] = vm;
+                }
+                break;
+            // A tier this build does not know: nothing reachable,
             // so the row falls back to static text.
         }
-        // A session with no upgrade transport (the stateless lane) can move
-        // nowhere, whatever the ladder allows: say so in the option instead
-        // of refusing after the confirmation dialog.
-        const upgradeTransport = this.chat.controlTransport('upgrade-to-workspace');
-        if (upgradeTransport === 'unavailable') {
-            for (const [tier, state] of Object.entries(map)) {
-                if (state === 'ok' || state === 'needsApproval') map[tier] = 'sessionUnsupported';
+        // Each move must be one this session can carry: the pinned socket
+        // carries VM only (the offer fix); the stateless REST control carries
+        // the targets /connection declares (C1: container; C2 adds VM).
+        for (const tier of ['sandbox', 'vm'] as const) {
+            const state = map[tier];
+            if ((state === 'ok' || state === 'needsApproval') && !this.chat.upgradeTargetAvailable(tier)) {
+                map[tier] = 'sessionUnsupported';
             }
-        }
-        // A pinned session (socket transport) refuses container upgrades
-        // before provisioning (persistent_app.py _handle_workspace_upgrade),
-        // so the option says so instead of failing after the confirmation.
-        if (upgradeTransport === 'websocket' && map['sandbox'] === 'ok') {
-            map['sandbox'] = 'sessionUnsupported';
         }
         return map;
     });

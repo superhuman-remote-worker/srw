@@ -107,6 +107,7 @@ function createPane(options: {
     setNarrationMode: vi.fn(),
     upgradeWorkspace: vi.fn(),
     controlTransport: vi.fn(() => 'websocket'),
+    upgradeTargetAvailable: vi.fn((tier: string) => tier === 'vm'),
   };
   const api = {
     getPersistentThread: vi.fn().mockReturnValue(
@@ -225,6 +226,7 @@ function createPaneWithRealToolsGroup(toolGroups: SessionToolGroupsResponse) {
     setNarrationMode: vi.fn(),
     upgradeWorkspace: vi.fn(),
     controlTransport: vi.fn(() => 'websocket'),
+    upgradeTargetAvailable: vi.fn((tier: string) => tier === 'vm'),
   };
   const api = {
     getPersistentThread: vi.fn().mockReturnValue(
@@ -404,6 +406,7 @@ describe('SettingsPaneComponent locked-on categories, from the DOM', () => {
       setNarrationMode: vi.fn(),
       upgradeWorkspace: vi.fn(),
       controlTransport: vi.fn(() => 'websocket'),
+      upgradeTargetAvailable: vi.fn((tier: string) => tier === 'vm'),
     };
     const api = {
       getPersistentThread: vi.fn().mockReturnValue(
@@ -995,16 +998,30 @@ describe('SettingsPaneComponent workspace tier', () => {
     expect(component.pendingTier()).toBeNull();
   });
 
-  it('a REST upgrade transport keeps the container choice', () => {
+  it('a stateless session follows its declared targets: container yes, VM not yet', () => {
     const {component, chat} = createPane({grants: null});
-    chat.controlTransport.mockReturnValue('rest');
+    chat.upgradeTargetAvailable.mockImplementation((tier: string) => tier === 'sandbox');
     chat.workspaceTier.set('virtual');
     expect(component.tierReachability()['sandbox']).toBe('ok');
+    expect(component.tierReachability()['vm']).toBe('sessionUnsupported');
+  });
+
+  it('a stateless none session can upgrade to a container', () => {
+    const {component, chat} = createPane({
+      override: {workspace: {backend: 'none'}},
+      grants: null,
+    });
+    chat.upgradeTargetAvailable.mockImplementation((tier: string) => tier === 'sandbox');
+    chat.workspaceTier.set('none');
+    expect(component.tierReachability()).toEqual({
+      sandbox: 'ok',
+      vm: 'sessionUnsupported',
+    });
   });
 
   it('a session with no upgrade transport reaches no tier, and says so', () => {
     const {component, chat} = createPane({grants: null});
-    chat.controlTransport.mockReturnValue('unavailable');
+    chat.upgradeTargetAvailable.mockReturnValue(false);
     // Re-read: the reachability computed depends on the tier signal, so
     // nudge it the way a real thread-meta load would.
     chat.workspaceTier.set('virtual');

@@ -11946,7 +11946,10 @@ describe('PersistentChatService — control transport is declared, never inferre
     vi.clearAllMocks();
   });
 
-  function socketlessGet(connection: Record<string, unknown>) {
+  function socketlessGet(
+    connection: Record<string, unknown>,
+    threadMeta: Record<string, unknown> = {},
+  ) {
     return (url: string) => {
       if (url.includes('/api/sessions/') && url.endsWith('/connection')) return of(connection);
       if (url.endsWith('/messages')) return of({ messages: [], total: 0 });
@@ -11967,7 +11970,7 @@ describe('PersistentChatService — control transport is declared, never inferre
           snapshot_source: 'durable_journal',
         });
       }
-      return of({ status: 'active', total_turns: 2, config_name: 'session_base' });
+      return of({ status: 'active', total_turns: 2, config_name: 'session_base', ...threadMeta });
     };
   }
 
@@ -12105,6 +12108,165 @@ describe('PersistentChatService — control transport is declared, never inferre
     expect(ctx.service.controlTransport('upgrade-to-workspace')).toBe('unavailable');
     await ctx.service.sendMessage('/upgrade-workspace container');
     expect(ctx.service.error()).toBe('chat.control.upgradeUnavailable');
+  });
+
+  const upgradeable = {
+    ...declaredSocketless,
+    controls: { ...declaredSocketless.controls, 'upgrade-to-workspace': 'rest' },
+    control_options: {
+      'upgrade-to-workspace': { version: 1, targets: ['container'], requires_idle: true },
+    },
+  };
+  const failedUpgrade = {
+    workspace_upgrade: { target_tier: 'sandbox', phase: 'failed', reason_code: 'invalid_image' },
+    workspace_creation: {
+      stage: 'readiness',
+      state: 'attention',
+      reason_code: 'invalid_image',
+      readiness_deadline_at: null,
+    },
+  };
+
+  it('a declared stateless container upgrade rides the durable control inbox', async () => {
+    const ctx = await socketlessSession(upgradeable);
+    ctx.mockHttp.post.mockReturnValue(of({ state: 'pending' }));
+
+    ctx.service.upgradeWorkspace('sandbox');
+
+    expect(ctx.mockHttp.post).toHaveBeenCalledWith(
+      expect.stringMatching(/\/persistent\/threads\/socketless\/controls$/),
+      expect.objectContaining({
+        method: 'upgrade-to-workspace',
+        target_tier: 'sandbox',
+        session_runtime_generation: '99999999-9999-4999-8999-999999999999',
+      }),
+    );
+    expect(ctx.service.workspaceUpgradeInProgress()).toEqual({ tier: 'sandbox' });
+    expect(ctx.wsInstances).toHaveLength(0);
+  });
+
+  it('a bare /upgrade-workspace on a stateless session asks for the next tier', async () => {
+    const ctx = await socketlessSession(upgradeable);
+    ctx.mockHttp.post.mockReturnValue(of({ state: 'pending' }));
+
+    (ctx.service as any).handleSlashCommand('/upgrade-workspace');
+
+    const body = ctx.mockHttp.post.mock.calls[0][1];
+    expect(body.method).toBe('upgrade-to-workspace');
+    expect(body.target_tier).toBeUndefined();
+  });
+
+  it('/upgrade-workspace vm on a stateless session answers locally until a VM target is declared', async () => {
+    const ctx = await socketlessSession(upgradeable);
+
+    (ctx.service as any).handleSlashCommand('/upgrade-workspace vm');
+
+    expect(ctx.service.error()).toBe('chat.control.vmUpgradeUnavailable');
+    expect(ctx.mockHttp.post).not.toHaveBeenCalled();
+  });
+
+  it('an upgrade asked for mid-response waits for the session to go idle', async () => {
+    const ctx = await socketlessSession(upgradeable);
+    ctx.mockHttp.post.mockReturnValue(of({ state: 'pending' }));
+    const stamps = vi.spyOn(ctx.service as any, '_systemMessage');
+    ctx.service.pendingTurnCount.set(1);
+    TestBed.tick();
+
+    ctx.service.upgradeWorkspace('sandbox', { thenContinue: true });
+    ctx.service.upgradeWorkspace('sandbox', { thenContinue: true });
+
+    expect(ctx.mockHttp.post).not.toHaveBeenCalled();
+    expect(
+      stamps.mock.calls.filter(([line]) => line === 'chat.control.upgradeDeferred'),
+    ).toHaveLength(1);
+    ctx.service.pendingTurnCount.set(0);
+    TestBed.tick();
+    expect(ctx.mockHttp.post).toHaveBeenCalledTimes(1);
+    expect(ctx.service.continueAfterUpgrade()).toBe(true);
+  });
+
+  it('an accepted upgrade re-reads the session for its startup line', async () => {
+    const ctx = await socketlessSession(upgradeable);
+    ctx.mockHttp.post.mockReturnValue(of({ state: 'pending' }));
+    const reads = ctx.mockHttp.get.mock.calls.length;
+
+    ctx.service.upgradeWorkspace('sandbox');
+    await Promise.resolve();
+
+    const later = ctx.mockHttp.get.mock.calls.slice(reads).map((c: any) => String(c[0]));
+    expect(later.some((url: string) => url.endsWith('/persistent/threads/socketless'))).toBe(true);
+  });
+
+  it('the palette offers /upgrade-workspace where the session declares it', async () => {
+    const ctx = await socketlessSession(upgradeable);
+    expect(ctx.service.slashCommandAvailable('/upgrade-workspace')).toBe(true);
+  });
+
+  it('a failed stateless upgrade shows once on load and clears the pending state', async () => {
+    const ctx = createService();
+    ctx.mockHttp.get.mockImplementation(socketlessGet(upgradeable, failedUpgrade));
+    const stamps = vi.spyOn(ctx.service as any, '_systemMessage');
+    ctx.service.continueAfterUpgrade.set(true);
+
+    await ctx.service.connect('socketless');
+    fireSseOpen(ctx.sseInstances[0]);
+    TestBed.tick();
+    await (ctx.service as any).loadThreadMeta('socketless', (ctx.service as any).connectGeneration, {
+      fresh: true,
+      lifecycleOnly: true,
+    });
+    TestBed.tick();
+
+    expect(ctx.service.workspaceUpgradeFailed()).toBe(true);
+    expect(
+      stamps.mock.calls.filter(([line]) => line === 'chat.workspaceUpgrade.failedStartup'),
+    ).toHaveLength(1);
+    expect(ctx.service.continueAfterUpgrade()).toBe(false);
+    expect(ctx.service.workspaceUpgradeInProgress()).toBeNull();
+  });
+
+  it('a failure that appears on a later lifecycle read is announced live', async () => {
+    const ctx = await socketlessSession(upgradeable);
+    const stamps = vi.spyOn(ctx.service as any, '_systemMessage');
+    ctx.mockHttp.get.mockImplementation(socketlessGet(upgradeable, failedUpgrade));
+
+    await (ctx.service as any).loadThreadMeta('socketless', (ctx.service as any).connectGeneration, {
+      fresh: true,
+      lifecycleOnly: true,
+    });
+    TestBed.tick();
+
+    expect(ctx.service.workspaceUpgradeFailed()).toBe(true);
+    expect(stamps).toHaveBeenCalledWith('chat.workspaceUpgrade.failedStartup');
+  });
+
+  it('End after a failed upgrade does not ask about a running turn', async () => {
+    const ctx = createService();
+    ctx.mockHttp.get.mockImplementation(socketlessGet(upgradeable, failedUpgrade));
+    await ctx.service.connect('socketless');
+    fireSseOpen(ctx.sseInstances[0]);
+    TestBed.tick();
+    const ask = vi.spyOn(window, 'confirm');
+    ctx.mockHttp.delete
+      .mockReturnValueOnce(
+        throwError(() => ({ status: 409, error: { detail: { code: 'stateless_end_busy' } } })),
+      )
+      .mockReturnValueOnce(of({ status: 'ended' }));
+
+    await ctx.service.endSession();
+
+    expect(ask).not.toHaveBeenCalled();
+    expect(String(ctx.mockHttp.delete.mock.calls.at(-1)?.[0])).toContain('force=true');
+  });
+
+  it('a container offer on a stateless session with a container target raises the card', async () => {
+    const ctx = await socketlessSession(upgradeable);
+    fireSseMessage(
+      ctx.sseInstances[0],
+      { method: 'workspace_upgrade.needed', params: { target_tier: 'sandbox', reason: 'tests' } },
+      '1:20', // above the /state replay cursor (1:8), so it isn't covered by the snapshot
+    );
+    expect(ctx.service.pendingWorkspaceOffer()).toEqual({ tier: 'sandbox', reason: 'tests' });
   });
 
   it('/done without an archive socket ends through the owner End path', async () => {

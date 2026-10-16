@@ -41,7 +41,7 @@ function sessionState() {
     'workspaceUpgradeInProgress', 'continueAfterUpgrade', 'rewindInFlight', 'rewindOutcomeUnknown',
     'rewindPreviewLoading', 'rewindModeAvailable', 'summarizeAvailable', 'outboxStalled',
     'draftDefaultsLoading', 'reconnectGaveUp', 'endRetryAvailable', 'cloudFoldersAgentOutdated',
-    'cloudFoldersProtected']) state[key] = signal(false);
+    'cloudFoldersProtected', 'workspaceUpgradeFailed']) state[key] = signal(false);
   for (const key of ['turns', 'visibleTurns', 'pendingAttachments', 'pendingPermissions', 'tasks',
     'outbox', 'outboxIds', 'draftDatasourceIds', 'runningTools', 'cloudFolderProblems',
     'cloudFolders']) state[key] = signal([]);
@@ -52,6 +52,7 @@ function sessionState() {
   return {...state, isConnected: signal(true), sessionReady: signal(true), threadId: signal('test-thread'),
     threadStatus: signal('active'), sessionTitle: signal('Test session'), connectionState: signal('connected'),
     modelName: signal('Test model'), permissionMode: signal('supervised'), narrationMode: signal('off'),
+    workspaceUpgradeFailureText: () => '',
     startupPhase: signal('ready'), controlTransport: signal('websocket'), citationsByCid: signal(new Map()),
     awaitingElapsedMs: signal(0), reconnectAttempt: signal(0), agentSilenceSeconds: signal(0), cloudChangesCount: signal(0),
     sshHandle: signal('test-thread'), resetWindow: vi.fn(), refreshPendingRewindReceipt: vi.fn(),

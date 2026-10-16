@@ -1171,7 +1171,9 @@ export function clearDraft(threadId: string | null): void {
           }
         </div>
       }
-      @if (chat.workspaceCreation(); as creation) {
+      @if (chat.workspaceUpgradeFailed()) {
+        <div class="vm-lifecycle" role="status">{{ chat.workspaceUpgradeFailureText() }}</div>
+      } @else if (chat.workspaceCreation(); as creation) {
         <div class="vm-lifecycle" role="status">
           {{ workspaceCreationMessageKey(creation) | transloco: workspaceCreationMessageParams(creation) }}
         </div>

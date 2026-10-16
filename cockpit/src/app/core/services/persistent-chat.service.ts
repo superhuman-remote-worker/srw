@@ -15,7 +15,7 @@ import { pickOwnDefaultProject } from '../util/own-default-project';
 import { filter, firstValueFrom, map, Observable, Subscription, tap, timeout } from 'rxjs';
 import { environment } from '../environment';
 import { newRequestId } from '../util/request-id';
-import { Project, ThreadCloudDiffSummary, ThreadMount, ThreadProtectedSource, ThreadStatus, WorkspaceCreationView, WorkspaceLifecycleView } from '../models/api.model';
+import { Project, ThreadCloudDiffSummary, ThreadMount, ThreadProtectedSource, ThreadStatus, WorkspaceCreationView, WorkspaceLifecycleView, WorkspaceUpgradeView } from '../models/api.model';
 // Type + pure derivation only — importing them from the review component
 // would pull it (and Monaco's loader) back into the eager bundle graph and
 // defeat the @defer that keeps the review surface lazy.
@@ -40,6 +40,7 @@ import {
   parseSubagentRecoveryResult,
 } from '../models/subagent-recovery.model';
 import { TranslocoService } from '@jsverse/transloco';
+import { workspaceCreationMessageKey, workspaceCreationMessageParams } from '../util/workspace-creation';
 import { WorkspaceChoice } from '../models/workspace-template.model';
 import { WorkspacePreview } from '../models/workspace.model';
 import { choiceBackend, choiceRequestFields } from '../../views/workspaces/workspace-template-utils';
@@ -126,8 +127,6 @@ function isCommittedCanvasControl(
   );
 }
 
-/** Session title from a landing draft's first message: first line, collapsed
- *  whitespace, capped at 60 chars (on a word boundary when one is near). */
 /** Reader-facing name for a workspace tier id: `vm` -> "VM", `sandbox` -> "container". */
 export function workspaceTierLabel(tier: string): string {
   if (tier === 'vm') return 'VM';
@@ -135,6 +134,8 @@ export function workspaceTierLabel(tier: string): string {
   return tier;
 }
 
+/** Session title from a landing draft's first message: first line, collapsed
+ *  whitespace, capped at 60 chars (on a word boundary when one is near). */
 export function draftTitleFrom(message: string): string {
   const line = message.split('\n')[0].replace(/\s+/g, ' ').trim();
   if (!line) return 'Untitled Session';
@@ -310,7 +311,8 @@ type DurableControl =
   | { method: 'mode.set'; mode: PermissionMode }
   | { method: 'narration.set'; mode: NarrationMode }
   | { method: 'workspace.undo' }
-  | { method: 'compact'; focus?: string; boundary_message_id?: string };
+  | { method: 'compact'; focus?: string; boundary_message_id?: string }
+  | { method: 'upgrade-to-workspace'; target_tier?: 'sandbox' | 'vm'; template?: string };
 
 type DurableScalarControl = Extract<DurableControl, { method: 'mode.set' | 'narration.set' }>;
 
@@ -484,7 +486,7 @@ export type ControlTransport = 'websocket' | 'rest' | 'unavailable';
 type ControlCapabilityMap = Record<string, 'websocket' | 'rest'>;
 type ControlOptionsMap = Record<
   string,
-  { version: number; modes?: string[]; requires_idle?: boolean }
+  { version: number; modes?: string[]; requires_idle?: boolean; targets?: string[] }
 >;
 
 interface RewindExpected {
@@ -901,11 +903,24 @@ export class PersistentChatService {
     });
 
     // A /compact (or "Summarize up to here") asked for mid-response runs once
-    // the session is idle again — see requestCompaction().
+    // the session is idle again — see requestCompaction(). A workspace
+    // upgrade asked for mid-response waits the same way.
     effect(() => {
       const busy = this.isStreaming() || this.isAwaitingTurn();
       if (busy) return;
-      untracked(() => this._flushDeferredCompaction());
+      untracked(() => {
+        this._flushDeferredCompaction();
+        this._flushDeferredWorkspaceUpgrade();
+      });
+    });
+
+    // A failed stateless upgrade (C1): announce it once per thread, on load or
+    // live, through the same path as workspace_upgrade.failed.
+    effect(() => {
+      const failed = this.workspaceUpgradeFailed();
+      const threadId = this.threadId();
+      if (!failed || !threadId) return;
+      untracked(() => this._announceWorkspaceUpgradeFailure(threadId));
     });
 
     // Stamp the start of an awaiting stretch and tick a 1 s clock while it
@@ -1317,6 +1332,17 @@ export class PersistentChatService {
   );
   readonly workspaceLifecycle = signal<WorkspaceLifecycleView | null>(null);
   readonly workspaceCreation = signal<WorkspaceCreationView | null>(null);
+  /** The Session read's in-place upgrade state (stateless C1; C2 shares it).
+   *  Unknown phases are carried through; only `failed` is acted on here. */
+  readonly workspaceUpgrade = signal<WorkspaceUpgradeView | null>(null);
+  readonly workspaceUpgradeFailed = computed(() => this.workspaceUpgrade()?.phase === 'failed');
+  private workspaceUpgradeFailureAnnounced: string | null = null;
+  /** An upgrade asked for mid-response, sent when the session is idle. */
+  private deferredWorkspaceUpgrade: {
+    threadId: string;
+    tier: 'sandbox' | 'vm' | null;
+    template?: string;
+  } | null = null;
 
   /** Bind an IDE response to this view, including same-thread Resume. A late
    *  ready response cannot restore the idle view of a terminal retirement. */
@@ -2442,6 +2468,8 @@ export class PersistentChatService {
       this.cloudSessionUrl.set(null);
       this.sshHandle.set(null);
       this.workspaceCreation.set(null);
+      this.workspaceUpgrade.set(null);
+      this.workspaceUpgradeFailureAnnounced = null;
       this.tasks.set([]);
       this.undoAvailable.set(false);
       this.rewindInFlight.set(false);
@@ -3086,6 +3114,7 @@ export class PersistentChatService {
       );
       this.workspaceLifecycle.set(thread.workspace_lifecycle ?? null);
       this.workspaceCreation.set(thread.workspace_creation ?? null);
+      this.workspaceUpgrade.set(thread.workspace_upgrade ?? null);
       if (!lifecycleOnly) {
         this.threadMounts.set(Array.isArray(thread.mounts) ? thread.mounts : []);
         this.protectedSource.set(thread.protected_source ?? null);
@@ -4832,6 +4861,13 @@ export class PersistentChatService {
     if (this.durableControlOutbox[0] === item) {
       this.durableControlOutbox.shift();
     }
+    if (item.request.method === 'upgrade-to-workspace' && item.threadId === this.threadId()) {
+      // The create starts now: show its startup line without waiting 5 s.
+      void this.loadThreadMeta(item.threadId, this.connectGeneration, {
+        fresh: true,
+        lifecycleOnly: true,
+      });
+    }
     // Deliberately ignore the response body. Only the owner's durable
     // journal acknowledgement is authoritative client state.
     this._flushDurableControlOutbox();
@@ -4866,6 +4902,10 @@ export class PersistentChatService {
       this.durableControlOutbox.shift();
     }
     this.durableControlAwaitingAck.delete(item.request.client_request_id);
+    if (item.request.method === 'upgrade-to-workspace') {
+      this.workspaceUpgradeInProgress.set(null);
+      this.continueAfterUpgrade.set(false);
+    }
     if (!this.intentionalClose && this.threadId() === item.threadId) {
       const detail = (err as { error?: { detail?: unknown }; message?: unknown })?.error?.detail;
       this._setDurableControlError(
@@ -5170,6 +5210,7 @@ export class PersistentChatService {
     // the composer stuck on "working" after a teardown.
     this.pendingTurnCount.set(0);
     this.deferredCompaction = null;
+    this.deferredWorkspaceUpgrade = null;
     if (this.controlWsReconnectTimer) {
       clearTimeout(this.controlWsReconnectTimer);
       this.controlWsReconnectTimer = null;
@@ -5270,6 +5311,8 @@ export class PersistentChatService {
     this.threadStatus.set(null);
     this.workspaceLifecycle.set(null);
     this.workspaceCreation.set(null);
+    this.workspaceUpgrade.set(null);
+    this.workspaceUpgradeFailureAnnounced = null;
     this.endedAt.set(null);
     this.retirementDisposition.set(null);
     this.retirementPermanent.set(false);
@@ -5475,7 +5518,11 @@ export class PersistentChatService {
       if (this._isStatelessEndBusyError(err) && !force) {
         // The stateless turn/unit is still leased or has pending input or
         // control. `force` stops the unfinished turn; declining ends nothing.
-        const proceed = confirm(this.transloco.translate('sessions.confirmEndStatelessBusy'));
+        // A failed upgrade leaves its control pending, so End is "busy" without
+        // any running turn; the user was told to End — don't ask about a turn.
+        const proceed =
+          this.workspaceUpgradeFailed() ||
+          confirm(this.transloco.translate('sessions.confirmEndStatelessBusy'));
         return proceed ? this.endSession(true) : 'kept';
       }
       if (this.executionLane() === 'stateless' && this._isRetryableEndFence(err)) {
@@ -7255,6 +7302,10 @@ export class PersistentChatService {
     tier: 'sandbox' | 'vm' | null,
     opts: {thenContinue?: boolean; template?: string} = {},
   ): void {
+    if (this.controlTransport('upgrade-to-workspace') === 'rest') {
+      this._requestDurableWorkspaceUpgrade(tier, opts);
+      return;
+    }
     if (this.controlTransport('upgrade-to-workspace') !== 'websocket') {
       // No transport on this session (queue-served sessions have none yet):
       // refuse before arming the in-progress state, and say so.
@@ -7275,6 +7326,93 @@ export class PersistentChatService {
         ? 'Provisioning a VM workspace (requires approval), please wait...'
         : 'Provisioning workspace, please wait...',
     );
+  }
+
+  /** Whether this session can carry an upgrade to `tier` right now.
+   *  Pinned (socket): VM only — container upgrades are refused in-process.
+   *  Stateless (REST): exactly the targets `/connection` declared. */
+  upgradeTargetAvailable(tier: 'sandbox' | 'vm'): boolean {
+    const transport = this.controlTransport('upgrade-to-workspace');
+    if (transport === 'websocket') return tier === 'vm';
+    if (transport !== 'rest') return false;
+    const threadId = this.threadId();
+    const declared = this.controlCapabilities();
+    const targets =
+      declared && declared.threadId === threadId
+        ? declared.options['upgrade-to-workspace']?.targets ?? []
+        : [];
+    return targets.includes(tier === 'vm' ? 'vm' : 'container');
+  }
+
+  workspaceUpgradeFailureText(): string {
+    const creation = this.workspaceCreation();
+    const reasonKey = creation ? workspaceCreationMessageKey(creation) : 'workspaceCreation.unknown';
+    return this.transloco.translate('chat.workspaceUpgrade.failedStartup', {
+      reason: this.transloco.translate(
+        reasonKey,
+        creation ? workspaceCreationMessageParams(creation) : {},
+      ),
+    });
+  }
+
+  private _announceWorkspaceUpgradeFailure(threadId: string): void {
+    if (this.workspaceUpgradeFailureAnnounced === threadId) return;
+    this.workspaceUpgradeFailureAnnounced = threadId;
+    this.workspaceUpgradeInProgress.set(null);
+    this.pendingWorkspaceOffer.set(null);
+    this.continueAfterUpgrade.set(false);
+    this._systemMessage(this.workspaceUpgradeFailureText());
+  }
+
+  private _requestDurableWorkspaceUpgrade(
+    tier: 'sandbox' | 'vm' | null,
+    opts: {thenContinue?: boolean; template?: string},
+  ): void {
+    const threadId = this.threadId();
+    if (!threadId || !this._controlPlaneAllowed(threadId)) return;
+    // A named template's tier is the server's call; anything else must be a
+    // declared target here (C1 declares container; C2 adds vm).
+    const wanted = tier ?? (opts.template ? null : 'sandbox');
+    if (wanted && !this.upgradeTargetAvailable(wanted)) {
+      this.error.set(
+        this.transloco.translate(
+          wanted === 'vm' ? 'chat.control.vmUpgradeUnavailable' : 'chat.control.upgradeUnavailable',
+        ),
+      );
+      return;
+    }
+    this.pendingWorkspaceOffer.set(null);
+    this.continueAfterUpgrade.set(opts.thenContinue === true);
+    if (this.isStreaming() || this.isAwaitingTurn()) {
+      const alreadyDeferred = this.deferredWorkspaceUpgrade?.threadId === threadId;
+      this.deferredWorkspaceUpgrade = {threadId, tier, template: opts.template};
+      if (!alreadyDeferred) {
+        this._systemMessage(this.transloco.translate('chat.control.upgradeDeferred'));
+      }
+      return;
+    }
+    this._dispatchDurableWorkspaceUpgrade(tier, opts.template);
+  }
+
+  private _dispatchDurableWorkspaceUpgrade(tier: 'sandbox' | 'vm' | null, template?: string): void {
+    const control: DurableControl = {method: 'upgrade-to-workspace'};
+    if (tier) control.target_tier = tier;
+    if (template) control.template = template;
+    if (!this._sendDurableControl(control)) return;
+    this.workspaceUpgradeInProgress.set({tier: tier ?? 'sandbox'});
+    this._systemMessage(
+      this.transloco.translate('chat.workspaceOffer.provisioning', {tier: 'container'}),
+    );
+  }
+
+  private _flushDeferredWorkspaceUpgrade(): void {
+    const deferred = this.deferredWorkspaceUpgrade;
+    if (!deferred) return;
+    this.deferredWorkspaceUpgrade = null;
+    if (deferred.threadId !== this.threadId() || !this._controlPlaneAllowed(deferred.threadId)) {
+      return;
+    }
+    this._dispatchDurableWorkspaceUpgrade(deferred.tier, deferred.template);
   }
 
   /** Decline a live upgrade offer. Local only — the agent isn't told anything
@@ -7856,7 +7994,8 @@ export class PersistentChatService {
           params['method'] === 'mode.set' ||
           params['method'] === 'narration.set' ||
           params['method'] === 'workspace.undo' ||
-          params['method'] === 'compact'
+          params['method'] === 'compact' ||
+          params['method'] === 'upgrade-to-workspace'
             ? params['method']
             : null;
         const rejectedMarker = rejectedMethod
@@ -7864,6 +8003,10 @@ export class PersistentChatService {
           : null;
         if (coveredBySnapshot) break;
         const code = typeof params['error_code'] === 'string' ? params['error_code'] : '';
+        if (rejectedMethod === 'upgrade-to-workspace') {
+          this.workspaceUpgradeInProgress.set(null);
+          this.continueAfterUpgrade.set(false);
+        }
         const messageKey =
           CONTROL_REJECTION_KEYS[code] ??
           (rejectedMethod === 'compact'
@@ -8180,12 +8323,12 @@ export class PersistentChatService {
         // live, and they can't accumulate.
         const tier = (params['target_tier'] as string) || 'sandbox';
         const reason = (params['reason'] as string) || 'shell/git tools needed';
-        if (tier === 'sandbox' && this.controlTransport('upgrade-to-workspace') === 'websocket') {
-          // An older agent still offers a container on a pinned session,
-          // where accepting can only fail: keep the ask in scroll-back, but
-          // raise no card.
+        if (!this.upgradeTargetAvailable(tier === 'vm' ? 'vm' : 'sandbox')) {
+          // A target this session can't carry (an older agent's container
+          // offer on a pinned session, where accepting can only fail): keep
+          // the ask in scroll-back, but raise no card.
           this._systemMessage(
-            `The agent requested a container workspace, which isn't available in this session: ${reason}`,
+            `The agent requested a ${workspaceTierLabel(tier)} workspace, which isn't available in this session: ${reason}`,
           );
           break;
         }
@@ -8223,6 +8366,7 @@ export class PersistentChatService {
       }
 
       case 'workspace_upgrade.complete': {
+        this._clearDurableControlErrorAfter(this._takeDurableControlAck(params, 'upgrade-to-workspace'));
         const seeded = params['seeded_files'] as number | undefined;
         const seededNote = typeof seeded === 'number' ? ` ${seeded} file(s) carried over.` : '';
         const tier = (params['target_tier'] as string) || '';

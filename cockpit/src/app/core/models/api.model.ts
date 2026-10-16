@@ -2181,6 +2181,7 @@ export interface Thread {
   /** Bounded progress for this exact pinned VM creation source. */
   vm_creation?: VMCreationView | null;
   workspace_creation?: WorkspaceCreationView | null;
+  workspace_upgrade?: WorkspaceUpgradeView | null;
   total_turns: number;
   total_tokens: number;
   nc_session_folder?: string | null;
@@ -2498,6 +2499,13 @@ export interface WorkspaceCreationView {
   readiness_deadline_at: string | null;
   /** The workspace container's exit code; set only for readiness/attention/container_exited. */
   exit_code: number | null;
+}
+
+/** A Session's in-place workspace upgrade (stateless lane; C1 and C2). */
+export interface WorkspaceUpgradeView {
+  target_tier: 'sandbox' | 'vm';
+  phase: 'requested' | 'provisioning' | 'copying' | 'failed';
+  reason_code?: string | null;
 }
 
 /** VM compute state beside the human wait or Job/session status. */
