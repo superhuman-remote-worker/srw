@@ -12228,6 +12228,9 @@ describe('PersistentChatService — control transport is declared, never inferre
   it('a failure that appears on a later lifecycle read is announced live', async () => {
     const ctx = await socketlessSession(upgradeable);
     const stamps = vi.spyOn(ctx.service as any, '_systemMessage');
+    // Armed after connect() (which resets them), so the clearing is the announcer's.
+    ctx.service.continueAfterUpgrade.set(true);
+    ctx.service.workspaceUpgradeInProgress.set({ tier: 'sandbox' });
     ctx.mockHttp.get.mockImplementation(socketlessGet(upgradeable, failedUpgrade));
 
     await (ctx.service as any).loadThreadMeta('socketless', (ctx.service as any).connectGeneration, {
@@ -12238,6 +12241,8 @@ describe('PersistentChatService — control transport is declared, never inferre
 
     expect(ctx.service.workspaceUpgradeFailed()).toBe(true);
     expect(stamps).toHaveBeenCalledWith('chat.workspaceUpgrade.failedStartup');
+    expect(ctx.service.continueAfterUpgrade()).toBe(false);
+    expect(ctx.service.workspaceUpgradeInProgress()).toBeNull();
   });
 
   it('End after a failed upgrade does not ask about a running turn', async () => {
