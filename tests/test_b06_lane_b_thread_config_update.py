@@ -1025,7 +1025,10 @@ class TestUpgradeAvailability:
         monkeypatch.setattr(
             "orchestrator.services.workspace_defaults_resolution.upgrade_record",
             AsyncMock(
-                return_value=("container", {"upgrade_config": {}, "upgrade_sources": None})
+                return_value=(
+                    "container",
+                    {"upgrade_config": {}, "upgrade_sources": None},
+                )
             ),
         )
         deps = _deps()

@@ -4721,10 +4721,10 @@ async def _execute_turn(
 
             # Check for a freeze request — a sudo intercept asking for a VM
             # (vm_upgrade_required) or a lite agent's request_workspace_upgrade
-            # asking for an upgrade (a VM in a Session, a container in a Job)
-            # (workspace_upgrade_required, §4.2 S5). Both
-            # surface as an upgrade OFFER; the agent only requests, never flips
-            # the tier (§4.4 Sec-4).
+            # asking for an upgrade (the first available of a container or a
+            # VM in a Session, a container in a Job) (workspace_upgrade_required,
+            # §4.2 S5). Both surface as an upgrade OFFER; the agent only
+            # requests, never flips the tier (§4.4 Sec-4).
             if tool_context and callbacks.on_workspace_upgrade_needed:
                 freeze_req = tool_context.consume_freeze_request()
                 if freeze_req and freeze_req.get("freeze_type") in (

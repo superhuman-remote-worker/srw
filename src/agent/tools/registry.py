@@ -244,8 +244,9 @@ _OFFICER_DENIED_CATEGORIES = frozenset(
 
 # Denied individual names:
 # - request_workspace_upgrade: the lite-session escape hatch into a shell
-#   workspace (asks for an upgrade: a VM in a Session, a container in a Job) —
-#   the one workspace-acquisition path a shell-less session has.
+#   workspace (asks for an upgrade: the first available of a container or a
+#   VM in a Session, a container in a Job) — the one workspace-acquisition
+#   path a shell-less session has.
 # - checkout_project_repository: acquires a repo checkout in the workspace.
 # - list_project_repositories / get_default_project_repository: repository
 #   discovery (clone URLs); the officer delegates object inspection instead.

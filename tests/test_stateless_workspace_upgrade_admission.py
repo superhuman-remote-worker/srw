@@ -327,3 +327,46 @@ def test_seed_spec_proves_the_binding_against_the_current_store(monkeypatch, bou
     else:
         with pytest.raises(ValueError, match="another object store"):
             swu.workspace_upgrade_seed_spec(THREAD_ID, seed)
+
+
+@pytest.mark.asyncio
+async def test_a_guard_refusing_the_transition_is_the_typed_refusal(caplog):
+    """R6: a guard trigger's CheckViolationError on the transition CAS becomes
+    the typed "can't be upgraded in place" refusal (a 409), never a 500 the
+    cockpit would retry with the same request id forever."""
+    import asyncpg
+
+    from orchestrator.database.stateless_workspace_upgrade import (
+        UPGRADE_NOT_POSSIBLE,
+        StatelessUpgradeRefused,
+        begin_stateless_session_workspace_upgrade,
+    )
+
+    guard = asyncpg.exceptions.CheckViolationError("guard")
+    guard.constraint_name = "managed_repository_workspace_cleanup_in_progress"
+    statements = []
+
+    async def fetchval(sql, *_args):
+        statements.append(sql)
+        if "UPDATE threads" in sql:
+            raise guard
+        return False  # no earlier container history
+
+    thread = {
+        "id": THREAD_ID,
+        "runtime_generation": "66666666-7777-4888-8999-aaaaaaaaaaaa",
+        "metadata": {"config_override": {"workspace": {"backend": "virtual"}}},
+    }
+
+    with pytest.raises(StatelessUpgradeRefused) as refused:
+        await begin_stateless_session_workspace_upgrade(
+            SimpleNamespace(fetchval=fetchval),
+            thread,
+            upgrade_config=RECORD["upgrade_config"],
+            upgrade_sources=None,
+        )
+
+    assert str(refused.value) == UPGRADE_NOT_POSSIBLE
+    assert refused.value.__cause__ is guard
+    assert len(statements) == 2
+    assert "managed_repository_workspace_cleanup_in_progress" in caplog.text
