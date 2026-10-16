@@ -22,6 +22,7 @@ from orchestrator.services.manifest_execution_snapshot import (
     read_execution,
     srw_snapshot_config,
 )
+from shared.workspace_upgrade import metadata_object
 
 DEFAULT_WORKSPACE_IMAGE = "ghcr.io/superhuman-remote-worker/srw-workspace:latest"
 DEFAULT_PULL_TIMEOUT_SECONDS = 600
@@ -83,10 +84,11 @@ async def resolve_sandbox_settings(
     """Read the owner's frozen settings; historical work has none.
 
     A missing or non-SRW snapshot means the execution predates templates, so
-    the installation defaults apply. A Job that started without a container
-    and upgraded in place reads its upgrade's template instead (Slice A2b);
-    snapshot settings always win. Database errors propagate: callers must
-    fail closed rather than silently fall back to the default image.
+    the installation defaults apply. A Job or Session that started without a
+    container and upgraded in place reads its upgrade's template instead
+    (Slice A2b, C1); snapshot settings always win. Database errors propagate:
+    callers must fail closed rather than silently fall back to the default
+    image.
     """
     try:
         UUID(str(owner_id))
@@ -98,12 +100,22 @@ async def resolve_sandbox_settings(
     if snapshot is not None and snapshot.get("harness_adapter") == SRW_ADAPTER:
         _, policy = srw_snapshot_config(snapshot)
         settings = SandboxSettings.from_policy(policy)
-    if settings.is_empty() and owner_kind != "session":
-        job = await store.get_job(str(owner_id))
-        context = object_value((job or {}).get("context"))
-        upgrade = object_value(
-            object_value(context.get("workspace_container")).get("upgrade_config")
-        )
+    if settings.is_empty():
+        if owner_kind == "session":
+            # A stateless Session upgraded in place (C1) records its template
+            # the way an upgraded Job does; the snapshot still wins.
+            thread = await store.get_thread(str(owner_id))
+            container = object_value(
+                metadata_object((thread or {}).get("metadata")).get(
+                    "workspace_container"
+                )
+            )
+        else:
+            job = await store.get_job(str(owner_id))
+            container = object_value(
+                object_value((job or {}).get("context")).get("workspace_container")
+            )
+        upgrade = object_value(container.get("upgrade_config"))
         if upgrade:
             return SandboxSettings.from_policy({"workspace": {"sandbox": upgrade}})
     return settings

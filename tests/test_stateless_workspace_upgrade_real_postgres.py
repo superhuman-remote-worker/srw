@@ -378,3 +378,217 @@ async def test_end_first_refuses_the_upgrade(database, actor):
     # the transition (no request, no wake).
     with pytest.raises(ControlAdmissionError, match="not currently able"):
         await admit_upgrade(database, actor, thread_id)
+
+
+from datetime import datetime, timezone  # noqa: E402
+from types import SimpleNamespace  # noqa: E402
+from unittest.mock import AsyncMock  # noqa: E402
+
+from orchestrator.database.container_startup_stage import (  # noqa: E402
+    ScheduledAt,
+    StageBudgets,
+    StartupAttention,
+    Unscheduled,
+)
+from orchestrator.services import container_provisioner as provisioner_module  # noqa: E402
+from orchestrator.services.container_provisioner import ContainerProvisioner  # noqa: E402
+from orchestrator.services.session_provisioner import ensure_session_workspace  # noqa: E402
+from orchestrator.services.stateless_workspace_upgrade import (  # noqa: E402
+    workspace_upgrade_view,
+)
+from orchestrator.services.workspace_lifecycle import EnsureOutcome  # noqa: E402
+from tests import test_stateless_failed_start_end_real_postgres as lifecycle  # noqa: E402
+from tests.test_sandbox_workspace_provisioner import stub_plan_inputs  # noqa: E402
+
+
+def upgrade_provisioner(database, monkeypatch):
+    """The continuation suite's provisioner setup (only Kubernetes and SSH fake)."""
+    cluster = continuation.DelayedWorkspaceCluster()
+    provisioner = ContainerProvisioner()
+    provisioner._db = database
+    provisioner._k8s_available = True
+    provisioner._namespace = "agent-workspaces"
+    provisioner._storage_class = "test-storage"
+    provisioner._pvc_enabled = True
+    provisioner._core_api = cluster
+    stub_plan_inputs(monkeypatch, provisioner)
+    for name in ("open_interval", "close_interval"):
+        monkeypatch.setattr(
+            provisioner_module.workspace_metering, name, AsyncMock(return_value=None)
+        )
+    monkeypatch.setattr(
+        provisioner_module,
+        "wait_for_agent_ssh",
+        AsyncMock(return_value=(True, 1, None)),
+    )
+    monkeypatch.setattr(
+        provisioner_module,
+        "workspace_private_key_fingerprint",
+        lambda _: continuation.FINGERPRINT,
+    )
+    monkeypatch.setattr(
+        provisioner_module,
+        "_isolated_pod_exec",
+        lambda *a, **k: f"256 {continuation.FINGERPRINT} workspace (ED25519)",
+    )
+    return provisioner, cluster
+
+
+async def upgraded_create(database, actor, monkeypatch, *, first_wait):
+    thread_id = await lite_session(database, actor)
+    await admit_upgrade(database, actor, thread_id)
+    provisioner, cluster = upgrade_provisioner(database, monkeypatch)
+    suspension = SimpleNamespace()
+    with monkeypatch.context() as waiter:
+        if first_wait == "not_ready":
+            waiter.setattr(provisioner, "_wait_for_ready", AsyncMock(return_value=None))
+        else:
+            wait_for_ready = provisioner._wait_for_ready
+
+            async def ready_on_first_wait(*args, **kwargs):
+                cluster.become_ready()
+                return await wait_for_ready(*args, **kwargs)
+
+            waiter.setattr(provisioner, "_wait_for_ready", ready_on_first_wait)
+        first = await ensure_session_workspace(
+            thread_id, db=database, provisioner=provisioner, suspension=suspension
+        )
+    return SimpleNamespace(
+        thread_id=thread_id,
+        first=first,
+        provisioner=provisioner,
+        cluster=cluster,
+        suspension=suspension,
+        pod_uid=cluster.objects["pod"].metadata.uid,
+        pvc_uid=cluster.objects["pvc"].metadata.uid,
+    )
+
+
+@pytest.mark.asyncio
+async def test_upgrade_create_uses_the_template_and_keeps_the_seed_marker_through_ready(
+    database, actor, monkeypatch
+):
+    case = await upgraded_create(database, actor, monkeypatch, first_wait="ready")
+
+    # Like the continuation suite's ready case: the first ensure reports the
+    # create it started; the row and the receipt show Ready.
+    assert case.first.outcome == EnsureOutcome.PENDING
+    assert case.cluster.objects["pod"].spec.containers[0]["image"] == IMAGE
+    thread = await database.get_thread(case.thread_id)
+    meta = metadata(thread)
+    workspace = meta["workspace_container"]
+    assert workspace["status"] == "ready"
+    assert "_runtime_creation" not in workspace
+    assert meta["_workspace_binding"]["kind"] == "remote"
+    assert workspace["seed_from"]["backend"] == "virtual"
+    assert workspace["upgrade_config"] == UPGRADE_CONFIG
+    receipt = await continuation.reservation(database, case.thread_id)
+    assert receipt["phase"] == "settled"
+    assert workspace_upgrade_view(thread, None) == {
+        "target_tier": "sandbox",
+        "phase": "copying",
+    }
+
+
+@pytest.mark.asyncio
+async def test_continuation_runner_finds_the_upgrade_create_on_the_initial_route(
+    database, actor, monkeypatch
+):
+    """Review Focus 3: a restart mid-create resumes through `initial`; the
+    binding moved under seed_from doesn't hold it."""
+    case = await upgraded_create(database, actor, monkeypatch, first_wait="not_ready")
+    assert case.first.outcome == EnsureOutcome.PENDING
+
+    page = await database.list_current_session_creation_candidates()
+
+    routes = {
+        str(candidate.cursor.thread_id): candidate.route
+        for candidate in page.candidates
+    }
+    assert routes.get(str(case.thread_id)) == "initial"
+
+
+@pytest.mark.asyncio
+async def test_an_upgrade_create_in_startup_attention_projects_a_failed_upgrade(
+    database, actor, monkeypatch
+):
+    monkeypatch.setenv("CONTAINER_STARTUP_STAGE_AUTHORITY_ENABLED", "true")
+    case = await upgraded_create(database, actor, monkeypatch, first_wait="not_ready")
+    receipt = await continuation.reservation(database, case.thread_id)
+    observe = dict(
+        owner_kind="thread",
+        owner_id=case.thread_id,
+        reservation_id=str(receipt["id"]),
+        claim_token=int(receipt["claim_token"]),
+        pod_uid=case.pod_uid,
+    )
+    assert await database.observe_container_startup(
+        **observe, observation=Unscheduled("scheduling_other"), adopt_if_unmarked=True
+    )
+    assert await database.observe_container_startup(
+        **observe,
+        observation=ScheduledAt(datetime.now(timezone.utc)),
+        budgets=StageBudgets(ready_seconds=180, pull_seconds=None, ssh_seconds=30),
+    )
+    assert await database.observe_container_startup(
+        **observe, observation=StartupAttention("invalid_image")
+    )
+
+    receipt = await continuation.reservation(database, case.thread_id)
+    assert receipt["startup_protocol_version"] == 1
+    views = await database.container_workspace_creation_views(
+        "thread", [case.thread_id]
+    )
+    view = next(iter(views.values()))
+    assert (view["state"], view["reason_code"]) == ("attention", "invalid_image")
+    assert workspace_upgrade_view(await database.get_thread(case.thread_id), view) == {
+        "target_tier": "sandbox",
+        "phase": "failed",
+        "reason_code": "invalid_image",
+    }
+
+
+@pytest.mark.asyncio
+async def test_end_during_the_upgrade_create_retires_the_initial_creation(
+    database, actor, monkeypatch
+):
+    """Review Focus 2: the unconsumed upgrade control makes a normal End busy;
+    a forced End retires the exact Pod and keeps the template and the source."""
+    from fastapi import HTTPException
+
+    from orchestrator.services.thread_retirement import end_thread_flow
+
+    case = await upgraded_create(database, actor, monkeypatch, first_wait="not_ready")
+    dependencies = lifecycle.retirement_dependencies(database, case)
+
+    with pytest.raises(HTTPException) as busy:
+        await end_thread_flow(
+            case.thread_id,
+            await database.get_thread(case.thread_id),
+            permanent=False,
+            force=False,
+            dependencies=dependencies,
+        )
+    assert busy.value.status_code == 409
+
+    result = await end_thread_flow(
+        case.thread_id,
+        await database.get_thread(case.thread_id),
+        permanent=False,
+        force=True,
+        dependencies=dependencies,
+    )
+
+    assert result == {"status": "ended"}
+    assert "pod" not in case.cluster.objects
+    assert case.cluster.objects["pvc"].metadata.uid == case.pvc_uid
+    ended = metadata(await database.get_thread(case.thread_id))
+    assert ended["workspace_container"]["upgrade_config"] == UPGRADE_CONFIG
+    assert ended["workspace_container"]["seed_from"]["backend"] == "virtual"
+    receipts = await database.fetch(
+        "SELECT runtime_incarnation FROM managed_repository_process_zero_receipts "
+        "WHERE owner_kind='thread' AND owner_id=$1::uuid "
+        "AND scope='stateless_workspace'",
+        case.thread_id,
+    )
+    assert [str(r["runtime_incarnation"]) for r in receipts] == [case.pod_uid]
