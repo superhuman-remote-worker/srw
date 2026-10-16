@@ -217,6 +217,7 @@ def sessions_dependencies(
                 )
             )
         ),
+        vm_provisioner=vm_provisioner_module.vm_provisioner,
     )
 
 

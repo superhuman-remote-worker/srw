@@ -100,6 +100,7 @@ def stateless_workspace_upgrade_dependencies(
             preparation_composition.stateless_workspace_schedule_dependencies,
             resources,
         ),
+        vm_provisioner=config.vm_provisioner,
     )
 
 

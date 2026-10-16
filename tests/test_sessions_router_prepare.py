@@ -2,6 +2,7 @@
 
 from datetime import datetime, timezone
 import json
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -141,6 +142,7 @@ class _Ports:
         self.session_endpoint_violations = AsyncMock(return_value=[])
         self.find_idle_persistent_agent = AsyncMock(return_value=None)
         self.send_session_attach = AsyncMock(return_value=True)
+        self.vm_provisioner = None
 
     @property
     def dependencies(self):
@@ -173,6 +175,7 @@ class _Ports:
                 lambda *a, **k: holder.find_idle_persistent_agent(*a, **k)
             ),
             send_session_attach=(lambda *a, **k: holder.send_session_attach(*a, **k)),
+            vm_provisioner=holder.vm_provisioner,
         )
 
 
@@ -1977,6 +1980,51 @@ def test_connection_declares_the_container_upgrade_where_it_can_run(
     else:
         assert "upgrade-to-workspace" not in payload["controls"]
         assert "upgrade-to-workspace" not in payload["control_options"]
+
+
+@pytest.mark.parametrize(
+    "vm_available,kind,expected",
+    [(True, "session", ["vm"]), (False, "session", None), (True, "subagent", None)],
+)
+def test_connection_declares_vm_only_where_it_can_run(
+    monkeypatch, vm_available, kind, expected
+):
+    """Review Focus 5: with VMs off, /connection doesn't offer the switch."""
+    from orchestrator.routers import sessions as sessions_mod
+
+    fastapi_app = FastAPI()
+    _install_fake_auth(monkeypatch)
+    # Keep the rewind block (and its database read) out of this response.
+    monkeypatch.delenv("SESSION_REWIND_IDLE_CONVERSATION_ENABLED", raising=False)
+    monkeypatch.delenv("CONTAINER_STARTUP_STAGE_AUTHORITY_ENABLED", raising=False)
+    fake_db = AsyncMock()
+    fake_db.get_thread.return_value = {
+        **_connection_thread(lane="stateless", agent_id=None),
+        "kind": kind,
+        "metadata": {"config_override": {"workspace": {"backend": "virtual"}}},
+    }
+    # No pool: the queue block degrades to None without a warning.
+    fake_db.acquire = None
+    fake_main = _fake_main(fake_db)
+    fake_main.vm_provisioner = SimpleNamespace(is_available=vm_available)
+    fastapi_app.state.sessions_dependencies_factory = lambda: fake_main.dependencies
+    fastapi_app.include_router(sessions_mod.router)
+
+    payload = (
+        TestClient(fastapi_app)
+        .get(f"/api/sessions/{CONNECTION_THREAD_ID}/connection")
+        .json()
+    )
+
+    if expected:
+        assert payload["controls"]["upgrade-to-workspace"] == "rest"
+        assert payload["control_options"]["upgrade-to-workspace"] == {
+            "version": 1,
+            "targets": expected,
+            "requires_idle": True,
+        }
+    else:
+        assert "upgrade-to-workspace" not in payload["controls"]
 
 
 def test_stateless_controls_never_advertise_a_socket_verb():

@@ -138,6 +138,7 @@ class SessionsDependencies:
     session_endpoint_violations: Callable[..., Awaitable[list[str]]]
     find_idle_persistent_agent: Callable[[], Awaitable[dict[str, Any] | None]]
     send_session_attach: Callable[..., Awaitable[bool]]
+    vm_provisioner: Any = None
 
 
 def get_sessions_dependencies(request: Request) -> SessionsDependencies:
@@ -1055,11 +1056,14 @@ async def get_connection(
         controls = dict(STATELESS_CONTROLS)
         control_options: dict[str, Any] = {}
         upgrade_targets = workspace_upgrade_targets(
-            thread, container_provisioner=dependencies.container_provisioner
+            thread,
+            container_provisioner=dependencies.container_provisioner,
+            vm_provisioner=dependencies.vm_provisioner,
         )
         if upgrade_targets:
-            # Declared per request (like rewind): only where startup tracking
-            # can report a failed create (spec decision, 2026-10-07).
+            # Declared per request (like rewind): a container only where
+            # startup tracking can report a failed create (C1); a VM where
+            # the VM provisioner is available (C2).
             controls[WORKSPACE_UPGRADE_VERB] = "rest"
             control_options[WORKSPACE_UPGRADE_VERB] = {
                 "version": 1,

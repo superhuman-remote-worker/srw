@@ -24,10 +24,14 @@ from orchestrator.services.stateless_workspace_gate import (
     stateless_session_workspace_check,
 )
 from shared.backend_kinds import LITE_BACKENDS
-from shared.run_queue import LANE_STATELESS
+from shared.run_queue import LANE_PINNED, LANE_STATELESS
 from shared.workspace_upgrade import (
+    UPGRADE_FAILED,
+    VM_UPGRADE_SEED_PENDING,
+    WORKSPACE_UPGRADE_FAILURE_CODES,
     WORKSPACE_UPGRADE_SEED_VERSION,
     metadata_object,
+    vm_upgrade_seed,
     workspace_upgrade_seed_from,
 )
 
@@ -265,13 +269,81 @@ def workspace_upgrade_container_ready(metadata: Any) -> bool:
     return isinstance(container, Mapping) and container.get("status") == "ready"
 
 
-def workspace_upgrade_view(
-    thread: Mapping[str, Any], creation_view: Mapping[str, Any] | None
+_LATEST_UPGRADE_REQUEST_SQL = """
+SELECT id, outcome, error_code, payload
+FROM thread_control_requests
+WHERE thread_id = $1::uuid AND verb = 'upgrade-to-workspace'
+  AND runtime_generation = $2::uuid
+ORDER BY request_seq DESC
+LIMIT 1
+"""
+
+
+async def latest_workspace_upgrade_request(
+    store: Any, thread: Mapping[str, Any]
 ) -> dict[str, Any] | None:
-    """The Session read's ``workspace_upgrade`` field (shared with C2)."""
+    """The newest upgrade request of this runtime generation (C2's projection).
+
+    Only a pinned row can hold a C2 request; 0185 re-stamps a pending one on
+    Resume, so an End-then-Resume cancellation is still found.
+    """
+    if thread.get("execution_lane") != LANE_PINNED or not thread.get(
+        "runtime_generation"
+    ):
+        return None
+    row = await store.fetchrow(
+        _LATEST_UPGRADE_REQUEST_SQL,
+        str(thread["id"]),
+        str(thread["runtime_generation"]),
+    )
+    return dict(row) if row is not None else None
+
+
+def _vm_upgrade_view(
+    thread: Mapping[str, Any],
+    metadata: Mapping[str, Any],
+    latest_request: Mapping[str, Any] | None,
+) -> dict[str, Any] | None:
+    vm = metadata.get("vm")
+    status = vm.get("status") if isinstance(vm, Mapping) else None
+    marker = vm_upgrade_seed(metadata)
+    if marker is not None:
+        if status in ("failed", "aborted"):
+            return {
+                "target_tier": "vm",
+                "phase": "failed",
+                "reason_code": UPGRADE_FAILED,
+            }
+        if marker["state"] == VM_UPGRADE_SEED_PENDING:
+            phase = "copying" if status == "ready" else "provisioning"
+            return {"target_tier": "vm", "phase": phase}
+    if status in ("ready", "suspended"):
+        # A working VM: whatever an earlier request said is history.
+        return None
+    if latest_request is None or thread.get("execution_lane") != LANE_PINNED:
+        return None
+    if latest_request.get("outcome") is None:
+        return {"target_tier": "vm", "phase": "requested"}
+    code = latest_request.get("error_code")
+    if (
+        latest_request.get("outcome") == "rejected"
+        and code in WORKSPACE_UPGRADE_FAILURE_CODES
+    ):
+        return {"target_tier": "vm", "phase": "failed", "reason_code": code}
+    return None
+
+
+def workspace_upgrade_view(
+    thread: Mapping[str, Any],
+    creation_view: Mapping[str, Any] | None,
+    *,
+    latest_request: Mapping[str, Any] | None = None,
+) -> dict[str, Any] | None:
+    """The Session read's ``workspace_upgrade`` field (C1 container, C2 VM)."""
     metadata = metadata_object(thread.get("metadata"))
     if workspace_upgrade_seed_from(metadata) is None:
-        return None
+        return _vm_upgrade_view(thread, metadata, latest_request)
+    # C1's container phases, unchanged.
     if creation_view is not None and creation_view.get("state") == "attention":
         return {
             "target_tier": "sandbox",

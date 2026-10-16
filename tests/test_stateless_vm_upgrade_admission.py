@@ -182,3 +182,80 @@ def test_workspace_upgrade_targets_declares_vm_where_it_can_run(
         )
         == expected
     )
+
+
+REQUEST = "55555555-5555-4555-8555-555555555555"
+PENDING_MARKER = {"control_request_id": REQUEST, "state": "pending", "source": None}
+SEEDED_MARKER = {**PENDING_MARKER, "state": "seeded"}
+
+
+def _request(outcome=None, error_code=None):
+    return {"id": REQUEST, "outcome": outcome, "error_code": error_code, "payload": {}}
+
+
+@pytest.mark.parametrize(
+    "lane,vm,latest,expected",
+    [
+        ("pinned", None, _request(), {"target_tier": "vm", "phase": "requested"}),
+        (
+            "pinned",
+            {"status": "provisioning", "upgrade_seed": PENDING_MARKER},
+            _request("applied"),
+            {"target_tier": "vm", "phase": "provisioning"},
+        ),
+        (
+            "pinned",
+            {"status": "ready", "upgrade_seed": PENDING_MARKER},
+            _request("applied"),
+            {"target_tier": "vm", "phase": "copying"},
+        ),
+        (
+            "pinned",
+            {"status": "aborted", "upgrade_seed": SEEDED_MARKER},
+            _request("applied"),
+            {"target_tier": "vm", "phase": "failed", "reason_code": "upgrade_failed"},
+        ),
+        (
+            "pinned",
+            {"status": "ready", "upgrade_seed": SEEDED_MARKER},
+            _request("applied"),
+            None,
+        ),
+        (
+            "pinned",
+            None,
+            _request("rejected", "upgrade_cancelled"),
+            {
+                "target_tier": "vm",
+                "phase": "failed",
+                "reason_code": "upgrade_cancelled",
+            },
+        ),
+        ("pinned", None, _request("rejected", "unsupported_control"), None),
+        (
+            "pinned",
+            {"status": "ready", "upgrade_seed": None},
+            _request("rejected", "upgrade_refused"),
+            None,
+        ),
+        ("pinned", {"status": "failed"}, None, None),
+        ("stateless", None, _request(), None),
+    ],
+    ids=[
+        "requested",
+        "provisioning",
+        "copying",
+        "vm-aborted",
+        "done",
+        "cancelled",
+        "old-agent-rejection",
+        "a-later-websocket-retry-succeeded",
+        "websocket-path-failure",
+        "not-pinned",
+    ],
+)
+def test_workspace_upgrade_view_reports_the_vm_phases(lane, vm, latest, expected):
+    thread = _thread(lane=lane)
+    if vm is not None:
+        thread["metadata"]["vm"] = vm
+    assert swu.workspace_upgrade_view(thread, None, latest_request=latest) == expected

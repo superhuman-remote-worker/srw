@@ -31,6 +31,7 @@ PROJECT_ID = "22222222-3333-4444-8555-666666666666"
 
 class _Store:
     def __init__(self) -> None:
+        self.fetchrow = AsyncMock(return_value=None)
         self.container_workspace_creation_views = AsyncMock(return_value={})
         self.ensure_thread_ssh_handle = AsyncMock(return_value="s-minted")
         self.list_thread_mounts = AsyncMock(
@@ -350,3 +351,84 @@ def test_detail_has_no_upgrade_projection_once_the_session_stops(status) -> None
     row = {**_raw_row(), "status": status, "metadata": _upgrading_metadata()}
     body = _client(_Store(), row).get(f"/api/persistent/threads/{THREAD_ID}").json()
     assert body["workspace_upgrade"] is None
+
+
+GENERATION = "33333333-4444-4555-8666-777777777777"
+
+
+def _pinned_row() -> dict:
+    row = _raw_row()
+    row.update(
+        execution_lane="pinned",
+        status="active",
+        runtime_retirement_token=None,
+        runtime_retirement_authorized_at=None,
+        runtime_retirement_context=None,
+        metadata=json.dumps({"config_override": {"workspace": {"backend": "virtual"}}}),
+    )
+    return row
+
+
+def test_detail_projects_a_requested_vm_upgrade() -> None:
+    store = _Store()
+    store.fetchrow = AsyncMock(
+        return_value={"id": "r-1", "outcome": None, "error_code": None, "payload": {}}
+    )
+    body = (
+        _client(store, _pinned_row()).get(f"/api/persistent/threads/{THREAD_ID}").json()
+    )
+    assert body["workspace_upgrade"] == {"target_tier": "vm", "phase": "requested"}
+    assert store.fetchrow.await_args.args[1:] == (THREAD_ID, GENERATION)
+
+
+def test_detail_projects_a_cancelled_vm_upgrade_after_resume() -> None:
+    store = _Store()
+    store.fetchrow = AsyncMock(
+        return_value={
+            "id": "r-1",
+            "outcome": "rejected",
+            "error_code": "upgrade_cancelled",
+            "payload": {},
+        }
+    )
+    body = (
+        _client(store, _pinned_row()).get(f"/api/persistent/threads/{THREAD_ID}").json()
+    )
+    assert body["workspace_upgrade"] == {
+        "target_tier": "vm",
+        "phase": "failed",
+        "reason_code": "upgrade_cancelled",
+    }
+
+
+def test_detail_reads_no_upgrade_request_for_a_stateless_row() -> None:
+    store = _Store()
+    row = _pinned_row()
+    row["execution_lane"] = "stateless"
+    _client(store, row).get(f"/api/persistent/threads/{THREAD_ID}")
+    store.fetchrow.assert_not_awaited()
+
+
+def test_detail_hides_the_vm_upgrade_seed_but_projects_its_phase() -> None:
+    marker = {
+        "control_request_id": "55555555-5555-4555-8555-555555555555",
+        "state": "pending",
+        "source": {
+            "backend": "virtual",
+            "prefix": f"threads/{THREAD_ID}/",
+            "binding": {"kind": "virtual", "backing_id": "rclone:" + "a" * 64},
+        },
+    }
+    row = _pinned_row()
+    row["metadata"] = json.dumps(
+        {
+            "config_override": {"workspace": {"backend": "vm"}},
+            "vm": {"status": "provisioning", "upgrade_seed": marker},
+        }
+    )
+    body = _client(_Store(), row).get(f"/api/persistent/threads/{THREAD_ID}").json()
+    # Built from the raw row: the marker drives the phase.
+    assert body["workspace_upgrade"] == {"target_tier": "vm", "phase": "provisioning"}
+    # The marker's source carries the old workspace binding, like C1's
+    # ``seed_from``; ``workspace_upgrade`` is the public field.
+    assert body["metadata"]["vm"] == {"status": "provisioning"}

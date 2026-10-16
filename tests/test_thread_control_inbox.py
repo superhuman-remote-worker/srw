@@ -8,6 +8,7 @@ lease-owner duties.
 
 from __future__ import annotations
 
+import contextlib
 import json
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
@@ -31,6 +32,7 @@ from orchestrator.database.stateless_workspace_upgrade import (
 from orchestrator.routers import thread_session
 from orchestrator.schemas.thread_session import ThreadControlRequest
 from orchestrator.services import stateless_workspace_upgrade as swu
+from orchestrator.services.thread_config_update import VM_PROVISIONING_UNAVAILABLE
 from orchestrator.services.thread_control_inbox import (
     AdmittedControl,
     ControlAdmissionError,
@@ -1914,6 +1916,11 @@ async def test_upgrade_admission_runs_inside_the_lifecycle_lock():
             AsyncMock(return_value=None),
         ),
         patch.object(thread_session, "require_stateless_workspace", MagicMock()),
+        patch.object(
+            thread_session,
+            "resolve_upgrade_target",
+            AsyncMock(return_value="container"),
+        ),
         patch.object(thread_session, "prepare_stateless_workspace_upgrade", prepare),
         patch.object(thread_session, "admit_thread_control", admit),
         patch.object(thread_session, "log_security_event", AsyncMock()),
@@ -1942,3 +1949,194 @@ async def test_upgrade_admission_runs_inside_the_lifecycle_lock():
         ("unlock",),
         ("ensure", str(THREAD_ID)),
     ]
+
+
+VM_THREAD = {
+    "id": THREAD_ID,
+    "user_id": OWNER_ID,
+    "project_id": None,
+    "kind": "session",
+    "execution_lane": "stateless",
+    "metadata": {"config_override": {"workspace": {"backend": "virtual"}}},
+}
+VM_ADMITTED = AdmittedControl(
+    id=REQUEST_ID,
+    request_seq=8,
+    client_request_id=CLIENT_REQUEST_ID,
+    verb="upgrade-to-workspace",
+    state="pending",
+    duplicate=False,
+    runtime_generation=RUNTIME_GENERATION,
+)
+
+
+def _vm_upgrade_dependencies(order):
+    return swu.StatelessWorkspaceUpgradeDependencies(
+        container_provisioner=MagicMock(),
+        enforce_workspace_upgrade_grants=AsyncMock(),
+        schedule_stateless_workspace_ensure=lambda tid: order.append(("ensure", tid)),
+        vm_provisioner=SimpleNamespace(is_available=True),
+    )
+
+
+async def _submit_vm(order, thread=VM_THREAD, **patches):
+    defaults = dict(
+        find_existing_thread_control=AsyncMock(return_value=None),
+        require_stateless_workspace=MagicMock(),
+        resolve_upgrade_target=AsyncMock(return_value="vm"),
+        check_stateless_vm_upgrade=AsyncMock(),
+        prepare_stateless_workspace_upgrade=AsyncMock(
+            side_effect=AssertionError("C1 path")
+        ),
+        admit_thread_control=AsyncMock(side_effect=AssertionError("C1 admission")),
+        log_security_event=AsyncMock(),
+    )
+    defaults.update(patches)
+    with contextlib.ExitStack() as stack:
+        mocks = {
+            name: stack.enter_context(patch.object(thread_session, name, value))
+            for name, value in defaults.items()
+        }
+        response = await thread_session.submit_thread_control(
+            str(THREAD_ID),
+            ThreadControlRequest(
+                client_request_id=CLIENT_REQUEST_ID,
+                method="upgrade-to-workspace",
+                target_tier="vm",
+                session_runtime_generation=RUNTIME_GENERATION,
+            ),
+            MagicMock(),
+            dependencies=_control_dependencies(
+                owner=AsyncMock(return_value=({"id": OWNER_ID}, thread)),
+                store=_LifecycleStore(order),
+                workspace_upgrade=_vm_upgrade_dependencies(order),
+            ),
+        )
+    return response, mocks
+
+
+@pytest.mark.asyncio
+async def test_vm_upgrade_admission_runs_inside_the_lifecycle_lock():
+    """Review Focus 1: uploads, End and Resume hold the same lock
+    (thread_files.py:596, :797; thread_retirement.py:1402; thread_resume.py:491)."""
+    order: list = []
+
+    async def handoff(*_args, **kwargs):
+        order.append(("handoff", kwargs["payload"]))
+        return VM_ADMITTED
+
+    response, mocks = await _submit_vm(
+        order, begin_stateless_vm_upgrade_handoff=handoff
+    )
+
+    assert response["transport_changed"] is True
+    assert order == [
+        ("lock", True),
+        (
+            "handoff",
+            {"runtime_generation": str(RUNTIME_GENERATION), "target_tier": "vm"},
+        ),
+        ("unlock",),
+    ]
+    assert (
+        mocks["check_stateless_vm_upgrade"]
+        .await_args.kwargs["vm_provisioner"]
+        .is_available
+    )
+    assert [
+        call.kwargs["event_type"]
+        for call in mocks["log_security_event"].await_args_list
+    ] == ["session_control_requested", "session_lane_changed"]
+
+
+@pytest.mark.asyncio
+async def test_vm_provisioning_off_is_a_409_and_switches_nothing():
+    """Review Focus 5."""
+    order: list = []
+    handoff = AsyncMock()
+    with pytest.raises(HTTPException) as refused:
+        await _submit_vm(
+            order,
+            check_stateless_vm_upgrade=AsyncMock(
+                side_effect=HTTPException(409, VM_PROVISIONING_UNAVAILABLE)
+            ),
+            begin_stateless_vm_upgrade_handoff=handoff,
+        )
+    assert (refused.value.status_code, refused.value.detail) == (
+        409,
+        VM_PROVISIONING_UNAVAILABLE,
+    )
+    handoff.assert_not_awaited()
+    assert order == []
+
+
+@pytest.mark.asyncio
+async def test_a_container_target_keeps_c1s_path():
+    order: list = []
+    admitted = AdmittedControl(
+        id=REQUEST_ID,
+        request_seq=8,
+        client_request_id=CLIENT_REQUEST_ID,
+        verb="upgrade-to-workspace",
+        state="pending",
+        duplicate=False,
+        runtime_generation=RUNTIME_GENERATION,
+    )
+    handoff = AsyncMock()
+    response, mocks = await _submit_vm(
+        order,
+        resolve_upgrade_target=AsyncMock(return_value="container"),
+        prepare_stateless_workspace_upgrade=AsyncMock(return_value=UPGRADE_RECORD),
+        admit_thread_control=AsyncMock(return_value=admitted),
+        begin_stateless_vm_upgrade_handoff=handoff,
+    )
+    assert response["transport_changed"] is False
+    handoff.assert_not_awaited()
+    mocks["check_stateless_vm_upgrade"].assert_not_awaited()
+    assert ("ensure", str(THREAD_ID)) in order
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "error,status",
+    [
+        (
+            ControlAdmissionNotReady(
+                "Session has pending input; retry the VM upgrade after that turn "
+                "completes"
+            ),
+            425,
+        ),
+        (ControlAdmissionError("Session has a control awaiting its pinned owner"), 409),
+    ],
+)
+async def test_switch_refusals_map_to_425_and_409(error, status):
+    with pytest.raises(HTTPException) as refused:
+        await _submit_vm(
+            [], begin_stateless_vm_upgrade_handoff=AsyncMock(side_effect=error)
+        )
+    assert (refused.value.status_code, refused.value.detail) == (status, str(error))
+
+
+@pytest.mark.asyncio
+async def test_a_same_uuid_retry_after_the_switch_still_says_the_transport_changed():
+    duplicate = AdmittedControl(
+        id=REQUEST_ID,
+        request_seq=8,
+        client_request_id=CLIENT_REQUEST_ID,
+        verb="upgrade-to-workspace",
+        state="pending",
+        duplicate=True,
+        runtime_generation=RUNTIME_GENERATION,
+    )
+    handoff = AsyncMock()
+    response, mocks = await _submit_vm(
+        [],
+        thread={**VM_THREAD, "execution_lane": "pinned"},
+        find_existing_thread_control=AsyncMock(return_value=duplicate),
+        admit_thread_control=AsyncMock(return_value=duplicate),
+        begin_stateless_vm_upgrade_handoff=handoff,
+    )
+    assert response["transport_changed"] is True and response["duplicate"] is True
+    handoff.assert_not_awaited()
+    mocks["resolve_upgrade_target"].assert_not_awaited()

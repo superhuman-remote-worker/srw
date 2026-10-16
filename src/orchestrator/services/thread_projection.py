@@ -24,7 +24,7 @@ from orchestrator.services.job_projection import redact_nested_workspace_state
 from shared.session_retirement import stateless_settled_retirement_authority
 from shared.session_pending_memory import SESSION_PENDING_MEMORY_KEY
 from shared.tool_catalog import TOOL_REGISTRY
-from shared.workspace_upgrade import SEED_FROM_KEY
+from shared.workspace_upgrade import SEED_FROM_KEY, VM_UPGRADE_SEED_KEY
 
 
 def redact_thread_metadata(thread: dict[str, Any]) -> dict[str, Any]:
@@ -126,6 +126,12 @@ def redact_thread_metadata(thread: dict[str, Any]) -> dict[str, Any]:
             key: value
             for key, value in workspace.items()
             if key not in internal_workspace_keys
+        }
+    # C2's VM upgrade seed marker carries the same old binding in its source.
+    vm = md.get("vm")
+    if isinstance(vm, dict) and VM_UPGRADE_SEED_KEY in vm:
+        md["vm"] = {
+            key: value for key, value in vm.items() if key != VM_UPGRADE_SEED_KEY
         }
     thread["metadata"] = md
     # A stateless End or permanent Delete holds its marker until the exact
