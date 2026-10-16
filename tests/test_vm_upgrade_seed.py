@@ -9,7 +9,10 @@ from unittest.mock import AsyncMock, Mock
 import pytest
 from fastapi import HTTPException
 
-from orchestrator.schemas.thread_config import VmUpgradeSeededRequest
+from orchestrator.schemas.thread_config import (
+    VmUpgradeInterruptedRequest,
+    VmUpgradeSeededRequest,
+)
 from orchestrator.services import vm_upgrade_seed as vus
 from shared.workspace_upgrade import (
     UPGRADE_ALREADY_RUNNING,
@@ -48,7 +51,7 @@ def test_the_failure_codes_are_the_five_typed_reasons():
     assert UPGRADE_INTERRUPTED == "upgrade_interrupted"
 
 
-@pytest.mark.parametrize("state", ["pending", "seeded"])
+@pytest.mark.parametrize("state", ["pending", "seeded", "interrupted"])
 def test_a_well_formed_marker_is_read_back(state):
     marker = {
         "control_request_id": REQUEST_ID.upper(),
@@ -187,7 +190,7 @@ def test_the_exact_runtime_passes_and_names_itself_canonically():
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("route", ["seed-source", "seeded"])
+@pytest.mark.parametrize("route", ["seed-source", "seeded", "interrupted"])
 @pytest.mark.parametrize("refusal", ["not-reciprocal", "no-runtime-authority"])
 async def test_the_routes_also_require_live_authority_and_a_reciprocal_agent(
     monkeypatch, route, refusal
@@ -200,6 +203,7 @@ async def test_the_routes_also_require_live_authority_and_a_reciprocal_agent(
         spec,
     )
     monkeypatch.setattr(vus, "mark_vm_upgrade_seeded", mark)
+    monkeypatch.setattr(vus, "mark_vm_upgrade_interrupted", mark)
     thread = _thread(PENDING)
     if refusal == "no-runtime-authority":
         thread["status"] = "ended"
@@ -209,11 +213,18 @@ async def test_the_routes_also_require_live_authority_and_a_reciprocal_agent(
             await vus.agent_vm_upgrade_seed_source(
                 _request(), THREAD_ID, dependencies=deps
             )
-        else:
+        elif route == "seeded":
             body = VmUpgradeSeededRequest(
                 provision_generation=GENERATION, control_request_id=REQUEST_ID
             )
             await vus.agent_vm_upgrade_seeded(
+                _request(), THREAD_ID, body, dependencies=deps
+            )
+        else:
+            body = VmUpgradeInterruptedRequest(
+                provision_generation=GENERATION, control_request_id=REQUEST_ID
+            )
+            await vus.agent_vm_upgrade_interrupted(
                 _request(), THREAD_ID, body, dependencies=deps
             )
     assert refused.value.status_code == 409
@@ -278,10 +289,17 @@ async def test_seed_source_for_a_none_session_has_nothing_to_mount():
     [
         (None, GENERATION, None),
         ({**PENDING, "state": "seeded"}, GENERATION, None),
+        ({**PENDING, "state": "interrupted"}, GENERATION, None),
         (PENDING, None, None),
         (PENDING, GENERATION, {"verb": "compact", "outcome": None}),
     ],
-    ids=["no-marker", "already-seeded", "no-provision", "not-an-upgrade-request"],
+    ids=[
+        "no-marker",
+        "already-seeded",
+        "interrupted",
+        "no-provision",
+        "not-an-upgrade-request",
+    ],
 )
 async def test_seed_source_answers_only_for_a_pending_c2_marker(
     marker, generation, request_row
@@ -345,3 +363,36 @@ async def test_seeded_is_the_fenced_cas_or_a_409(monkeypatch, marked):
         "provision_generation": GENERATION,
         "control_request_id": REQUEST_ID,
     }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("marked", [True, False])
+async def test_interrupted_is_the_fenced_cas_or_a_409(monkeypatch, marked):
+    """Review: a copy whose source is permanently gone ends the marker, so no
+    later attach retries it (C2 fix wave)."""
+    mark = AsyncMock(return_value=marked)
+    seeded = AsyncMock()
+    monkeypatch.setattr(vus, "mark_vm_upgrade_interrupted", mark)
+    monkeypatch.setattr(vus, "mark_vm_upgrade_seeded", seeded)
+    body = VmUpgradeInterruptedRequest(
+        provision_generation=GENERATION, control_request_id=REQUEST_ID
+    )
+    deps = _deps(_thread(PENDING))
+    if marked:
+        out = await vus.agent_vm_upgrade_interrupted(
+            _request(), THREAD_ID, body, dependencies=deps
+        )
+        assert out == {"state": "interrupted"}
+    else:
+        with pytest.raises(HTTPException) as refused:
+            await vus.agent_vm_upgrade_interrupted(
+                _request(), THREAD_ID, body, dependencies=deps
+            )
+        assert refused.value.detail == {"code": "upgrade_seed_fence_lost"}
+    assert mark.await_args.kwargs == {
+        "agent_id": AGENT_ID,
+        "provision_generation": GENERATION,
+        "control_request_id": REQUEST_ID,
+    }
+    seeded.assert_not_awaited()
+    deps.require_internal.assert_awaited_once()

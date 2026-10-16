@@ -50,6 +50,12 @@ LANE_CHANGED_FRAME = "session.lane_changed"
 VM_UPGRADE_SEED_KEY = "upgrade_seed"
 VM_UPGRADE_SEED_PENDING = "pending"
 VM_UPGRADE_SEED_SEEDED = "seeded"
+#: The copy's source is permanently gone: nothing is owed any more, and the
+#: upgrade reads as ``upgrade_interrupted`` (the files stay in the old storage).
+VM_UPGRADE_SEED_INTERRUPTED = "interrupted"
+_VM_UPGRADE_SEED_STATES = frozenset(
+    {VM_UPGRADE_SEED_PENDING, VM_UPGRADE_SEED_SEEDED, VM_UPGRADE_SEED_INTERRUPTED}
+)
 #: C2: typed ``workspace_upgrade.failed`` codes (receipts and live frames).
 UPGRADE_CANCELLED = "upgrade_cancelled"
 UPGRADE_REFUSED = "upgrade_refused"
@@ -89,7 +95,7 @@ def vm_upgrade_seed(metadata: Any) -> dict[str, Any] | None:
     state = marker.get("state")
     request_id = _canonical_uuid(marker.get("control_request_id"))
     source = marker.get("source")
-    if state not in (VM_UPGRADE_SEED_PENDING, VM_UPGRADE_SEED_SEEDED):
+    if state not in _VM_UPGRADE_SEED_STATES:
         return None
     if request_id is None:
         return None
@@ -120,6 +126,7 @@ __all__ = [
     "UPGRADE_FAILED",
     "UPGRADE_INTERRUPTED",
     "UPGRADE_REFUSED",
+    "VM_UPGRADE_SEED_INTERRUPTED",
     "VM_UPGRADE_SEED_KEY",
     "VM_UPGRADE_SEED_PENDING",
     "VM_UPGRADE_SEED_SEEDED",

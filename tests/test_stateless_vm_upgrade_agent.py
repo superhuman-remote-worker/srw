@@ -16,6 +16,7 @@ from agent.api import vm_upgrade_handoff as handoff
 from agent.api.orchestrator_client import (
     OrchestratorClient,
     WorkspaceUpgradeRouteMissing,
+    WorkspaceUpgradeRouteRefused,
 )
 from agent.api.workspace_upgrade_seed import cloud_synced_path
 from agent.core.backends.virtual import VirtualWorkspaceBackend
@@ -378,6 +379,9 @@ def _seed_client(order, *, spec_overrides=None):
         mark_workspace_upgrade_seeded=AsyncMock(
             side_effect=lambda *_a, **_k: order.append("seeded")
         ),
+        mark_workspace_upgrade_interrupted=AsyncMock(
+            side_effect=lambda *_a, **_k: order.append("interrupted")
+        ),
     )
 
 
@@ -511,6 +515,92 @@ async def test_a_lite_attach_never_marks_a_pending_copy_seeded(tmp_path, copy):
     assert order == []
 
 
+SOURCE_CHANGED = WorkspaceUpgradeRouteRefused(
+    409, "upgrade_seed_source_changed", "workspace upgrade seed route answered 409"
+)
+
+
+@pytest.mark.asyncio
+async def test_a_changed_seed_source_ends_the_copy_as_interrupted(tmp_path, copy):
+    """Review: a permanent refusal must not abort every attach. The marker
+    leaves ``pending`` (no later attach retries) and the request ends as
+    ``upgrade_interrupted``; the files stay in the old storage."""
+    order: list = []
+    client = _seed_client(order)
+    client.get_workspace_upgrade_seed_source = AsyncMock(side_effect=SOURCE_CHANGED)
+
+    out = await handoff.recover_vm_upgrade_seed(
+        session=_vm_session(tmp_path, _marker_metadata()),
+        client=client,
+        thread_id=str(THREAD_ID),
+    )
+
+    assert out == {"control_request_id": str(REQUEST_ID), "interrupted": True}
+    assert order == ["interrupted"] and copy == []
+    client.mark_workspace_upgrade_interrupted.assert_awaited_once_with(
+        str(THREAD_ID),
+        provision_generation=PROVISION,
+        control_request_id=str(REQUEST_ID),
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "error",
+    [
+        WorkspaceUpgradeRouteRefused(409, "no_pending_upgrade_seed", "race"),
+        WorkspaceUpgradeRouteRefused(409, "pinned_runtime_identity_mismatch", "race"),
+        WorkspaceUpgradeRouteRefused(503, None, "unavailable"),
+        WorkspaceUpgradeRouteMissing("404"),
+        httpx.ConnectError("refused"),
+    ],
+    ids=["not-pending", "identity-race", "5xx", "old-replica", "unreachable"],
+)
+async def test_a_transient_seed_route_failure_still_aborts_the_attach(
+    tmp_path, copy, monkeypatch, error
+):
+    monkeypatch.setattr(handoff.asyncio, "sleep", AsyncMock())
+    order: list = []
+    client = _seed_client(order)
+    client.get_workspace_upgrade_seed_source = AsyncMock(side_effect=error)
+    with pytest.raises(type(error)):
+        await handoff.recover_vm_upgrade_seed(
+            session=_vm_session(tmp_path, _marker_metadata()),
+            client=client,
+            thread_id=str(THREAD_ID),
+        )
+    assert order == [] and copy == []
+
+
+@pytest.mark.asyncio
+async def test_an_unrecorded_interruption_aborts_the_attach(tmp_path, copy):
+    """If the marker can't leave ``pending``, the next attach must try again."""
+    order: list = []
+    client = _seed_client(order)
+    client.get_workspace_upgrade_seed_source = AsyncMock(side_effect=SOURCE_CHANGED)
+    client.mark_workspace_upgrade_interrupted = AsyncMock(
+        side_effect=WorkspaceUpgradeRouteRefused(409, "upgrade_seed_fence_lost", "x")
+    )
+    with pytest.raises(WorkspaceUpgradeRouteRefused):
+        await handoff.recover_vm_upgrade_seed(
+            session=_vm_session(tmp_path, _marker_metadata()),
+            client=client,
+            thread_id=str(THREAD_ID),
+        )
+    assert order == [] and copy == []
+
+
+@pytest.mark.asyncio
+async def test_an_interrupted_marker_is_not_owed_a_copy(tmp_path, copy):
+    order: list = []
+    out = await handoff.recover_vm_upgrade_seed(
+        session=_vm_session(tmp_path, _marker_metadata(state="interrupted")),
+        client=_seed_client(order),
+        thread_id=str(THREAD_ID),
+    )
+    assert out is None and order == []
+
+
 # --- the drain on the pinned owner -----------------------------------------
 
 
@@ -554,6 +644,7 @@ def pinned(monkeypatch):
     monkeypatch.setattr(pa._session_identity, "_attach_token", ATTACH)
     monkeypatch.setattr(pa, "_workspace_upgrade_in_flight", False)
     monkeypatch.setattr(pa, "_recovered_vm_upgrade", None)
+    monkeypatch.setattr(pa, "_interrupted_vm_upgrade", None)
     return SimpleNamespace(session=session, client=client, pool=pool)
 
 
@@ -739,6 +830,36 @@ async def test_a_vm_attach_without_a_marker_reports_the_interruption(pinned):
 
 
 @pytest.mark.asyncio
+async def test_a_vm_attach_receipts_the_interruption_its_recovery_recorded(
+    pinned, monkeypatch
+):
+    pinned.session.workspace_backend_tier = "vm"
+    pinned.pool.get_thread.return_value = {
+        "metadata": _marker_metadata(state="interrupted")
+    }
+    monkeypatch.setattr(pa, "_interrupted_vm_upgrade", str(REQUEST_ID))
+    order = await _drain(_request())
+    assert order == [
+        (
+            "journal",
+            "workspace_upgrade.failed",
+            {
+                **ENVELOPE,
+                "target_tier": "vm",
+                "reason": (
+                    "The VM upgrade was interrupted before your files were "
+                    "copied. End this Session and start a new one."
+                ),
+                "error_code": "upgrade_interrupted",
+            },
+        ),
+        ("finalize", "rejected", "upgrade_interrupted"),
+    ]
+    assert pa._interrupted_vm_upgrade is None
+    pinned.client.request_vm_upgrade_for_control.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_a_recovered_started_receipt_restarts_the_swap(pinned):
     receipt = SimpleNamespace(
         kind="workspace_upgrade.started",
@@ -835,6 +956,57 @@ async def test_owner_start_recovers_only_on_a_vm_attach(monkeypatch):
     assert recover.await_args.kwargs["thread_id"] == str(THREAD_ID)
 
 
+@pytest.mark.asyncio
+async def test_owner_start_holds_an_interrupted_copy_for_the_drain(monkeypatch):
+    recover = AsyncMock(
+        return_value={"control_request_id": str(REQUEST_ID), "interrupted": True}
+    )
+    monkeypatch.setattr(handoff, "recover_vm_upgrade_seed", recover)
+    monkeypatch.setattr(
+        pa,
+        "_session",
+        SimpleNamespace(postgres_conn=MagicMock(), workspace_backend_tier="vm"),
+    )
+    monkeypatch.setattr(pa, "_orchestrator_client", SimpleNamespace())
+    monkeypatch.setattr(pa._session_identity, "_thread_id", str(THREAD_ID))
+    monkeypatch.setattr(pa, "_recovered_vm_upgrade", None)
+    monkeypatch.setattr(pa, "_interrupted_vm_upgrade", "stale")
+
+    await pa._recover_pinned_vm_upgrade_seed()
+
+    assert pa._recovered_vm_upgrade is None
+    assert pa._interrupted_vm_upgrade == str(REQUEST_ID)
+
+
+def test_an_interruption_the_drain_did_not_receipt_is_announced_once(monkeypatch):
+    """The request was receipted ``.started`` before the predecessor was lost:
+    no request is left to reject, so every tab is told once."""
+    sent: list = []
+    monkeypatch.setattr(
+        pa, "_broadcast", lambda method, params: sent.append((method, params))
+    )
+    monkeypatch.setattr(pa._session_identity, "_thread_id", str(THREAD_ID))
+    monkeypatch.setattr(pa, "_recovered_vm_upgrade", None)
+    monkeypatch.setattr(pa, "_interrupted_vm_upgrade", str(REQUEST_ID))
+    pa._announce_recovered_vm_upgrade()
+    pa._announce_recovered_vm_upgrade()
+    assert sent == [
+        (
+            "workspace_upgrade.failed",
+            {
+                "thread_id": str(THREAD_ID),
+                "target_tier": "vm",
+                "reason": (
+                    "The VM upgrade was interrupted before your files were "
+                    "copied. End this Session and start a new one."
+                ),
+                "error_code": "upgrade_interrupted",
+                "request_id": str(REQUEST_ID),
+            },
+        )
+    ]
+
+
 def test_a_recovery_the_drain_did_not_receipt_is_announced_once(monkeypatch):
     sent: list = []
     monkeypatch.setattr(
@@ -846,6 +1018,7 @@ def test_a_recovery_the_drain_did_not_receipt_is_announced_once(monkeypatch):
         "_recovered_vm_upgrade",
         {"control_request_id": str(REQUEST_ID), "seeded_files": 5},
     )
+    monkeypatch.setattr(pa, "_interrupted_vm_upgrade", None)
     pa._announce_recovered_vm_upgrade()
     pa._announce_recovered_vm_upgrade()
     assert sent == [
@@ -1007,6 +1180,8 @@ async def test_the_client_sends_the_request_id_and_the_pinned_identity():
             return httpx.Response(200, json={"status": "provisioning"})
         if request.url.path.endswith("/seed-source"):
             return httpx.Response(200, json={"version": 1})
+        if request.url.path.endswith("/interrupted"):
+            return httpx.Response(200, json={"state": "interrupted"})
         return httpx.Response(200, json={"state": "seeded"})
 
     client = OrchestratorClient("http://test", "127.0.0.1", 8000, "worker", "default")
@@ -1025,8 +1200,13 @@ async def test_the_client_sends_the_request_id_and_the_pinned_identity():
             provision_generation=PROVISION,
             control_request_id=str(REQUEST_ID),
         )
+        await client.mark_workspace_upgrade_interrupted(
+            str(THREAD_ID),
+            provision_generation=PROVISION,
+            control_request_id=str(REQUEST_ID),
+        )
 
-    upgrade, source, seeded = seen
+    upgrade, source, seeded, interrupted = seen
     assert upgrade[:2] == (
         "POST",
         f"/api/agents/threads/{THREAD_ID}/upgrade-to-workspace",
@@ -1044,41 +1224,60 @@ async def test_the_client_sends_the_request_id_and_the_pinned_identity():
         "template": "vm-big",
         "control_request_id": str(REQUEST_ID),
     }
-    for _method, _path, headers, _body in (source, seeded):
+    assert interrupted[:2] == (
+        "POST",
+        f"/api/agents/threads/{THREAD_ID}/workspace-upgrade/interrupted",
+    )
+    for _method, _path, headers, _body in (source, seeded, interrupted):
         assert headers["X-Agent-ID"] == AGENT_ID
         assert headers["X-Session-Runtime-Generation"] == G0
         assert headers["X-Session-Runtime-Attach-Token"] == ATTACH
-    assert json.loads(seeded[3]) == {
-        "provision_generation": PROVISION,
-        "control_request_id": str(REQUEST_ID),
-    }
+    for marked in (seeded, interrupted):
+        assert json.loads(marked[3]) == {
+            "provision_generation": PROVISION,
+            "control_request_id": str(REQUEST_ID),
+        }
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "status,body,raised",
+    "status,body,raised,code",
     [
-        (404, {"detail": "Not Found"}, WorkspaceUpgradeRouteMissing),
-        (404, {"detail": "Thread not found"}, RuntimeError),
-        (409, {"detail": {"code": "no_pending_upgrade_seed"}}, RuntimeError),
-        (502, ["not", "an", "object"], RuntimeError),
+        (404, {"detail": "Not Found"}, WorkspaceUpgradeRouteMissing, None),
+        (404, {"detail": "Thread not found"}, WorkspaceUpgradeRouteRefused, None),
+        (
+            409,
+            {"detail": {"code": "upgrade_seed_source_changed"}},
+            WorkspaceUpgradeRouteRefused,
+            "upgrade_seed_source_changed",
+        ),
+        (502, ["not", "an", "object"], WorkspaceUpgradeRouteRefused, None),
     ],
 )
-async def test_an_old_replica_is_told_apart_from_a_refusal(status, body, raised):
+async def test_an_old_replica_is_told_apart_from_a_refusal(status, body, raised, code):
     client = OrchestratorClient("http://test", "127.0.0.1", 8000, "worker", "default")
     transport = httpx.MockTransport(lambda request: httpx.Response(status, json=body))
     async with httpx.AsyncClient(transport=transport) as http:
         client._client = http
-        with pytest.raises(RuntimeError) as caught:
-            await client.get_workspace_upgrade_seed_source(str(THREAD_ID))
-        assert type(caught.value) is raised
-        with pytest.raises(RuntimeError) as caught:
-            await client.mark_workspace_upgrade_seeded(
+        calls = [
+            lambda: client.get_workspace_upgrade_seed_source(str(THREAD_ID)),
+            lambda: client.mark_workspace_upgrade_seeded(
                 str(THREAD_ID),
                 provision_generation=PROVISION,
                 control_request_id=str(REQUEST_ID),
-            )
-        assert type(caught.value) is raised
+            ),
+            lambda: client.mark_workspace_upgrade_interrupted(
+                str(THREAD_ID),
+                provision_generation=PROVISION,
+                control_request_id=str(REQUEST_ID),
+            ),
+        ]
+        for call in calls:
+            with pytest.raises(RuntimeError) as caught:
+                await call()
+            assert type(caught.value) is raised
+            if raised is WorkspaceUpgradeRouteRefused:
+                assert (caught.value.status_code, caught.value.code) == (status, code)
 
 
 @pytest.mark.asyncio

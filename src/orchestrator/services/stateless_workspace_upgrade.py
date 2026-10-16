@@ -28,6 +28,7 @@ from shared.run_queue import LANE_PINNED, LANE_STATELESS
 from shared.workspace_upgrade import (
     UPGRADE_FAILED,
     UPGRADE_INTERRUPTED,
+    VM_UPGRADE_SEED_INTERRUPTED,
     VM_UPGRADE_SEED_PENDING,
     WORKSPACE_UPGRADE_FAILURE_CODES,
     WORKSPACE_UPGRADE_SEED_VERSION,
@@ -322,6 +323,15 @@ def _vm_upgrade_view(
             "reason_code": UPGRADE_INTERRUPTED,
         }
     if marker is not None:
+        if marker["state"] == VM_UPGRADE_SEED_INTERRUPTED:
+            # The agent found the copy's source permanently gone, possibly
+            # after the request was receipted ``.started``: the files stay in
+            # the old storage, whatever the VM's status.
+            return {
+                "target_tier": "vm",
+                "phase": "failed",
+                "reason_code": UPGRADE_INTERRUPTED,
+            }
         # ``aborted`` is written only by the upgrade's abort route. A
         # ``seeded`` marker means the VM reached Ready, so a later provisioning
         # failure (the CAS keeps the marker) isn't the upgrade's.

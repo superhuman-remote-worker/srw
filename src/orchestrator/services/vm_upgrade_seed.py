@@ -7,7 +7,9 @@ lane switch's control request, ``None`` for every other call, so a later
 WebSocket retry overwrites a stale marker. The pinned agent marks it
 ``seeded`` after a verified copy and before the swap; a new agent that
 attaches the VM while it is still ``pending`` copies the old prefix first
-(the internal routes below).
+(the internal routes below). When that copy's source is permanently gone, the
+agent marks it ``interrupted``: nothing is owed any more, and the upgrade
+reads as ``upgrade_interrupted`` (the files stay in the old storage).
 """
 
 from __future__ import annotations
@@ -25,6 +27,7 @@ from orchestrator.services.workspace_tier_policy import (
     thread_workspace_backend,
 )
 from shared.workspace_upgrade import (
+    VM_UPGRADE_SEED_INTERRUPTED,
     VM_UPGRADE_SEED_PENDING,
     VM_UPGRADE_SEED_SEEDED,
     WORKSPACE_UPGRADE_SEED_VERSION,
@@ -66,6 +69,28 @@ UPDATE threads
    AND metadata->'vm'->>'provision_generation' = $2
    AND metadata->'vm'->'upgrade_seed'->>'control_request_id' = $3
    AND metadata->'vm'->'upgrade_seed'->>'state' IN ('pending', 'seeded')
+   AND NOT EXISTS (
+       SELECT 1 FROM vm_workspace_recoveries recovery
+        WHERE recovery.owner_kind = 'thread'
+          AND recovery.owner_id = threads.id
+          AND recovery.resolved_at IS NULL)
+RETURNING 1
+"""
+
+# The same fence for a copy that can't be made: ``pending`` → ``interrupted``,
+# ``interrupted`` → ``interrupted`` is an idempotent retry, and a ``seeded``
+# copy is never taken back.
+_MARK_INTERRUPTED_SQL = """
+UPDATE threads
+   SET metadata = jsonb_set(metadata, '{vm,upgrade_seed,state}', '"interrupted"'::jsonb, false),
+       last_activity = now()
+ WHERE id = $1::uuid
+   AND execution_lane = 'pinned'
+   AND runtime_retirement_token IS NULL
+   AND agent_id = $4::uuid
+   AND metadata->'vm'->>'provision_generation' = $2
+   AND metadata->'vm'->'upgrade_seed'->>'control_request_id' = $3
+   AND metadata->'vm'->'upgrade_seed'->>'state' IN ('pending', 'interrupted')
    AND NOT EXISTS (
        SELECT 1 FROM vm_workspace_recoveries recovery
         WHERE recovery.owner_kind = 'thread'
@@ -201,6 +226,25 @@ async def mark_vm_upgrade_seeded(
     return updated is not None
 
 
+async def mark_vm_upgrade_interrupted(
+    store: Any,
+    thread_id: str,
+    *,
+    agent_id: str,
+    provision_generation: str,
+    control_request_id: str,
+) -> bool:
+    """CAS the marker to ``interrupted`` for the exact provision; False if fenced out."""
+    updated = await store.fetchval(
+        _MARK_INTERRUPTED_SQL,
+        str(UUID(str(thread_id))),
+        str(UUID(str(provision_generation))),
+        str(UUID(str(control_request_id))),
+        str(UUID(str(agent_id))),
+    )
+    return updated is not None
+
+
 async def agent_vm_upgrade_seed_source(
     request: Any, thread_id: str, *, dependencies: Any
 ) -> dict[str, Any]:
@@ -275,6 +319,32 @@ async def agent_vm_upgrade_seeded(
     return {"state": VM_UPGRADE_SEED_SEEDED}
 
 
+async def agent_vm_upgrade_interrupted(
+    request: Any, thread_id: str, body: Any, *, dependencies: Any
+) -> dict[str, str]:
+    """Body of ``POST /api/agents/threads/{thread_id}/workspace-upgrade/interrupted``.
+
+    The bound agent found the copy's source permanently gone (``seed-source``
+    answered ``upgrade_seed_source_changed``): no later attach retries it.
+    """
+    await dependencies.require_internal(request)
+    thread = await dependencies.store.get_thread(thread_id)
+    if not thread:
+        raise HTTPException(status_code=404, detail="Thread not found")
+    agent_id = await _require_bound_pinned_runtime(
+        request, thread, dependencies=dependencies
+    )
+    if not await mark_vm_upgrade_interrupted(
+        dependencies.store,
+        str(thread["id"]),
+        agent_id=agent_id,
+        provision_generation=str(body.provision_generation),
+        control_request_id=str(body.control_request_id),
+    ):
+        raise HTTPException(status_code=409, detail=UPGRADE_SEED_FENCE_LOST)
+    return {"state": VM_UPGRADE_SEED_INTERRUPTED}
+
+
 __all__ = [
     "NO_PENDING_UPGRADE_SEED",
     "PINNED_IDENTITY_MISMATCH",
@@ -282,8 +352,10 @@ __all__ = [
     "SOURCE_UNSUPPORTED",
     "UPGRADE_SEED_FENCE_LOST",
     "UPGRADE_SEED_SOURCE_CHANGED",
+    "agent_vm_upgrade_interrupted",
     "agent_vm_upgrade_seed_source",
     "agent_vm_upgrade_seeded",
+    "mark_vm_upgrade_interrupted",
     "mark_vm_upgrade_seeded",
     "require_pinned_runtime_identity",
     "vm_upgrade_seed_marker",

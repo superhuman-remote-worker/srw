@@ -222,7 +222,7 @@ class TestRouteInventory:
     def test_the_seven_declarations_keep_their_identity(self):
         """Pins the declarations' identity. The eighth, the GET
         upgrade-availability route (added 2026-10-07), is pinned here too.
-        C2 (2026-10-14) added the two workspace-upgrade seed routes."""
+        C2 (2026-10-14) added the workspace-upgrade seed routes."""
         app = FastAPI()
         app.include_router(admission_routes.router)
         app.include_router(config_routes.router)
@@ -279,6 +279,11 @@ class TestRouteInventory:
                 "/api/agents/threads/{thread_id}/workspace-upgrade/seeded",
                 "POST",
                 "agent_vm_upgrade_seeded",
+            ),
+            (
+                "/api/agents/threads/{thread_id}/workspace-upgrade/interrupted",
+                "POST",
+                "agent_vm_upgrade_interrupted",
             ),
         }
         for route in moved:

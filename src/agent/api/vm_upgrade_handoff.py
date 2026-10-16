@@ -9,7 +9,9 @@ inbox drain. What it does depends on how it attached (spec §3 consumer table):
 * lite attach, another generation (End, then Resume): ``upgrade_cancelled``;
 * VM attach: the copy was made before the swap, or at owner start by
   ``recover_vm_upgrade_seed``; receipt ``.complete``. A VM attach that finds no
-  marker naming the request reports ``upgrade_interrupted``.
+  marker naming the request reports ``upgrade_interrupted``, and so does one
+  whose recovery found the copy's source permanently gone (the marker is then
+  ``interrupted``, so no later attach retries the copy).
 
 These helpers take explicit arguments; ``persistent_app`` wires them to its
 session globals. The recovery copy runs C1's copy → commit → record step
@@ -25,7 +27,10 @@ from collections.abc import Awaitable, Callable, Iterable, Mapping
 from typing import Any, Optional, TypeVar
 from uuid import UUID
 
-from agent.api.orchestrator_client import WorkspaceUpgradeRouteMissing
+from agent.api.orchestrator_client import (
+    WorkspaceUpgradeRouteMissing,
+    WorkspaceUpgradeRouteRefused,
+)
 from agent.api.workspace_upgrade_seed import (
     WorkspaceUpgradeSeedError,
     copy_lite_workspace_and_commit,
@@ -49,6 +54,13 @@ ROW_BUSY = "busy"
 ROW_COMPLETE = "complete"
 ROW_INTERRUPTED = "interrupted"
 ROW_REFUSE_TIER = "refuse_tier"
+
+#: Seed-route refusals that no retry can fix: ``seed-source`` can't build the
+#: old workspace's source any more (its object store binding changed, or no
+#: store is configured). Every other refusal (``no_pending_upgrade_seed``, an
+#: identity race, ``upgrade_seed_fence_lost``, a 5xx, an old replica) aborts
+#: the attach and the next attach retries.
+PERMANENT_SEED_REFUSALS = frozenset({"upgrade_seed_source_changed"})
 
 #: Where a cloud mount manager links its mounts into the workspace
 #: (``RcloneMountManager`` / ``SidecarMountWatcher``: ``workspace/cloud``).
@@ -259,8 +271,10 @@ async def recover_vm_upgrade_seed(
     Runs at owner start on a VM attach, before the first drain and before the
     Session is ready, so no turn can have written to the VM yet: the copy
     can't overwrite newer VM files. Returns ``{"control_request_id",
-    "seeded_files"}`` when it ran, None when nothing is owed. Any failure
-    raises before the marker is recorded, so a later attach copies again.
+    "seeded_files"}`` when it ran, ``{"control_request_id", "interrupted":
+    True}`` when a permanent refusal (``PERMANENT_SEED_REFUSALS``) ended it,
+    None when nothing is owed. Any other failure raises before the marker is
+    recorded, so a later attach copies again.
     """
     thread = await session.postgres_conn.get_thread(str(thread_id))
     metadata = (thread or {}).get("metadata")
@@ -278,9 +292,29 @@ async def recover_vm_upgrade_seed(
     control_request_id = marker["control_request_id"]
     files = 0
     if marker["source"] is not None:
-        spec = await call_with_route_retry(
-            lambda: client.get_workspace_upgrade_seed_source(str(thread_id))
-        )
+        try:
+            spec = await call_with_route_retry(
+                lambda: client.get_workspace_upgrade_seed_source(str(thread_id))
+            )
+        except WorkspaceUpgradeRouteRefused as exc:
+            if exc.code not in PERMANENT_SEED_REFUSALS:
+                raise
+            # No attach can ever make this copy: end it, so the Session can
+            # attach (and End) and the upgrade reads as interrupted.
+            await call_with_route_retry(
+                lambda: client.mark_workspace_upgrade_interrupted(
+                    str(thread_id),
+                    provision_generation=provision_generation,
+                    control_request_id=control_request_id,
+                )
+            )
+            logger.warning(
+                "VM upgrade recovery copy interrupted: thread=%s request=%s code=%s",
+                thread_id,
+                control_request_id,
+                exc.code,
+            )
+            return {"control_request_id": control_request_id, "interrupted": True}
         workspace = _matching_seed_workspace(
             spec,
             control_request_id=control_request_id,
@@ -313,6 +347,7 @@ async def recover_vm_upgrade_seed(
 
 
 __all__ = [
+    "PERMANENT_SEED_REFUSALS",
     "ROW_BUSY",
     "ROW_CANCEL",
     "ROW_COMPLETE",

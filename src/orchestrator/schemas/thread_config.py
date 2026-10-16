@@ -53,6 +53,14 @@ class VmUpgradeSeededRequest(BaseModel):
     control_request_id: UUID
 
 
+class VmUpgradeInterruptedRequest(BaseModel):
+    """Body for ``POST /api/agents/threads/{id}/workspace-upgrade/interrupted``
+    (C2): the copy's source is permanently gone."""
+
+    provision_generation: UUID
+    control_request_id: UUID
+
+
 class ThreadConfigPatchRequest(BaseModel):
     config_override: dict[str, Any] = Field(default_factory=dict)
     # Desired FULL datasource selection (create semantics): None = no change,
@@ -66,5 +74,6 @@ __all__ = [
     "AgentThreadConfigUpdateRequest",
     "ThreadConfigPatchRequest",
     "ThreadWorkspaceUpgradeRequest",
+    "VmUpgradeInterruptedRequest",
     "VmUpgradeSeededRequest",
 ]

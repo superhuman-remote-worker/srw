@@ -187,6 +187,7 @@ def test_workspace_upgrade_targets_declares_vm_where_it_can_run(
 REQUEST = "55555555-5555-4555-8555-555555555555"
 PENDING_MARKER = {"control_request_id": REQUEST, "state": "pending", "source": None}
 SEEDED_MARKER = {**PENDING_MARKER, "state": "seeded"}
+INTERRUPTED_MARKER = {**PENDING_MARKER, "state": "interrupted"}
 
 
 def _request(outcome=None, error_code=None):
@@ -288,6 +289,16 @@ def _request(outcome=None, error_code=None):
             _request("applied"),
             None,
         ),
+        (
+            "pinned",
+            {"status": "ready", "upgrade_seed": INTERRUPTED_MARKER},
+            _request("applied"),
+            {
+                "target_tier": "vm",
+                "phase": "failed",
+                "reason_code": "upgrade_interrupted",
+            },
+        ),
     ],
     ids=[
         "requested",
@@ -306,6 +317,7 @@ def _request(outcome=None, error_code=None):
         "interrupted-under-a-pending-marker",
         "interrupted-without-a-marker",
         "a-ready-vm-with-an-applied-request",
+        "copy-ended-as-interrupted-after-the-started-receipt",
     ],
 )
 def test_workspace_upgrade_view_reports_the_vm_phases(lane, vm, latest, expected):

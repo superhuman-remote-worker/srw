@@ -24,6 +24,7 @@ from orchestrator.services.vm_idle_lifecycle import VMIdleLifecycleStore
 from orchestrator.services.vm_upgrade_seed import (
     PINNED_IDENTITY_MISMATCH,
     agent_vm_upgrade_seed_source,
+    mark_vm_upgrade_interrupted,
     mark_vm_upgrade_seeded,
 )
 from shared.thread_controls import (
@@ -120,6 +121,67 @@ async def test_seeded_refuses_a_stale_provision_generation(database, actor, wron
     assert not await mark_vm_upgrade_seeded(database, str(thread_id), **kwargs)
     vm = metadata(await database.get_thread(thread_id))["vm"]
     assert vm["upgrade_seed"]["state"] == "pending"
+
+
+@pytest.mark.asyncio
+async def test_interrupted_ends_the_pending_copy_once_and_for_good(database, actor):
+    """C2 fix wave: a copy whose source is permanently gone leaves ``pending``,
+    so no later attach retries it and it can't be marked seeded afterwards."""
+    thread_id, agent_id, generation, request_id = await bound_with_pending_marker(
+        database, actor
+    )
+    fence = {
+        "agent_id": agent_id,
+        "provision_generation": generation,
+        "control_request_id": request_id,
+    }
+    for _ in range(2):
+        assert await mark_vm_upgrade_interrupted(database, str(thread_id), **fence)
+    assert not await mark_vm_upgrade_seeded(database, str(thread_id), **fence)
+    vm = metadata(await database.get_thread(thread_id))["vm"]
+    assert vm["upgrade_seed"]["state"] == "interrupted"
+    assert vm["upgrade_seed"]["control_request_id"] == request_id
+    assert vm["provision_generation"] == generation
+    assert vm["status"] == "ready"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("wrong", ["generation", "request", "agent"])
+async def test_interrupted_refuses_a_stale_fence(database, actor, wrong):
+    thread_id, agent_id, generation, request_id = await bound_with_pending_marker(
+        database, actor
+    )
+    kwargs = {
+        "agent_id": agent_id,
+        "provision_generation": generation,
+        "control_request_id": request_id,
+    }
+    kwargs[
+        {
+            "generation": "provision_generation",
+            "request": "control_request_id",
+            "agent": "agent_id",
+        }[wrong]
+    ] = str(uuid4())
+    assert not await mark_vm_upgrade_interrupted(database, str(thread_id), **kwargs)
+    vm = metadata(await database.get_thread(thread_id))["vm"]
+    assert vm["upgrade_seed"]["state"] == "pending"
+
+
+@pytest.mark.asyncio
+async def test_a_seeded_copy_is_never_marked_interrupted(database, actor):
+    thread_id, agent_id, generation, request_id = await bound_with_pending_marker(
+        database, actor
+    )
+    fence = {
+        "agent_id": agent_id,
+        "provision_generation": generation,
+        "control_request_id": request_id,
+    }
+    assert await mark_vm_upgrade_seeded(database, str(thread_id), **fence)
+    assert not await mark_vm_upgrade_interrupted(database, str(thread_id), **fence)
+    vm = metadata(await database.get_thread(thread_id))["vm"]
+    assert vm["upgrade_seed"]["state"] == "seeded"
 
 
 async def seed_source(database, thread):

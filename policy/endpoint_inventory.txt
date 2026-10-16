@@ -139,6 +139,7 @@ GET    /api/agents/threads/{thread_id}/upgrade-availability                     
 POST   /api/agents/threads/{thread_id}/upgrade-to-vm                                    pat=refused         internal:require_internal
 POST   /api/agents/threads/{thread_id}/upgrade-to-workspace                             pat=refused         internal:require_internal
 GET    /api/agents/threads/{thread_id}/workspace                                        pat=refused         internal:require_internal
+POST   /api/agents/threads/{thread_id}/workspace-upgrade/interrupted                    pat=refused         internal:require_internal
 GET    /api/agents/threads/{thread_id}/workspace-upgrade/seed-source                    pat=refused         internal:require_internal
 POST   /api/agents/threads/{thread_id}/workspace-upgrade/seeded                         pat=refused         internal:require_internal
 DELETE /api/agents/{agent_id}                                                           pat=admin           internal:is_internal_call

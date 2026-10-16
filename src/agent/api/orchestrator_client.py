@@ -99,12 +99,22 @@ class WorkspaceUpgradeRouteMissing(RuntimeError):
     """An orchestrator replica that predates the C2 seed routes answered 404."""
 
 
+class WorkspaceUpgradeRouteRefused(RuntimeError):
+    """A VM upgrade seed route refused (C2); ``code`` is its typed refusal."""
+
+    def __init__(self, status_code: int, code: str | None, message: str) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+        self.code = code
+
+
 def _raise_workspace_upgrade_route_error(response: Any) -> NoReturn:
     """Raise for a non-200 answer of a VM upgrade seed route (C2).
 
     FastAPI's unknown-route answer (404 ``Not Found``) means this replica
     predates the route (a rolling deploy): ``WorkspaceUpgradeRouteMissing``,
-    which the caller retries. Anything else is a refusal.
+    which the caller retries. Anything else is ``WorkspaceUpgradeRouteRefused``
+    with the typed code (``{"detail": {"code": ...}}``) when there is one.
     """
     try:
         detail = response.json().get("detail")
@@ -112,8 +122,11 @@ def _raise_workspace_upgrade_route_error(response: Any) -> NoReturn:
         detail = None
     if response.status_code == 404 and detail == "Not Found":
         raise WorkspaceUpgradeRouteMissing(str(response.request.url))
-    raise RuntimeError(
-        f"workspace upgrade seed route answered {response.status_code}: {detail}"
+    code = detail.get("code") if isinstance(detail, dict) else None
+    raise WorkspaceUpgradeRouteRefused(
+        response.status_code,
+        str(code) if code else None,
+        f"workspace upgrade seed route answered {response.status_code}: {detail}",
     )
 
 
@@ -1897,6 +1910,29 @@ class OrchestratorClient:
         url = (
             f"{self.orchestrator_url}"
             f"/api/agents/threads/{thread_id}/workspace-upgrade/seeded"
+        )
+        response = await self._client.post(
+            url,
+            json={
+                "provision_generation": provision_generation,
+                "control_request_id": control_request_id,
+            },
+            headers=self._pinned_identity_headers(),
+        )
+        if response.status_code == 200:
+            return
+        _raise_workspace_upgrade_route_error(response)
+
+    async def mark_workspace_upgrade_interrupted(
+        self, thread_id: str, *, provision_generation: str, control_request_id: str
+    ) -> None:
+        """Record that a VM upgrade's copy can't be made (C2): its source is
+        permanently gone, so no later attach retries it."""
+        if not self._client:
+            await self.connect()
+        url = (
+            f"{self.orchestrator_url}"
+            f"/api/agents/threads/{thread_id}/workspace-upgrade/interrupted"
         )
         response = await self._client.post(
             url,

@@ -4,9 +4,9 @@ Extracted from ``orchestrator.main`` (R1.B06 lane B). Five route declarations �
 four internal agent-facing (``X-Internal-Key``; ingress strips those paths) and
 one owner-facing — moved with their handler names, paths, methods, parameter
 order and docstrings intact; a sixth internal one, ``upgrade-availability``,
-was added later (2026-10-07), and two more, ``workspace-upgrade/seed-source``
-and ``workspace-upgrade/seeded``, with the stateless VM upgrade (C2,
-2026-10-14). The docstring is the published OpenAPI description, so it is part
+was added later (2026-10-07), and three more, ``workspace-upgrade/seed-source``,
+``workspace-upgrade/seeded`` and ``workspace-upgrade/interrupted``, with the
+stateless VM upgrade (C2, 2026-10-14). The docstring is the published OpenAPI description, so it is part
 of the route's identity.
 
 None of the five declarations carried ``tags``, ``response_model``,
@@ -25,6 +25,7 @@ from orchestrator.schemas.thread_config import (
     AgentThreadConfigUpdateRequest,
     ThreadConfigPatchRequest,
     ThreadWorkspaceUpgradeRequest,
+    VmUpgradeInterruptedRequest,
     VmUpgradeSeededRequest,
 )
 from orchestrator.services import thread_config_update, vm_upgrade_seed
@@ -228,6 +229,32 @@ async def agent_vm_upgrade_seeded(
     # `policy/endpoint_inventory.txt`.
     await get_thread_config_dependencies(request).require_internal(request)
     return await vm_upgrade_seed.agent_vm_upgrade_seeded(
+        request,
+        thread_id,
+        body,
+        dependencies=get_thread_config_dependencies(request),
+    )
+
+
+@router.post("/api/agents/threads/{thread_id}/workspace-upgrade/interrupted")
+async def agent_vm_upgrade_interrupted(
+    request: Request, thread_id: str, body: VmUpgradeInterruptedRequest
+) -> dict[str, Any]:
+    """Record that a VM upgrade's copy can't be made (C2). **Internal**
+    (P4b) — requires ``X-Internal-Key`` and the exact pinned runtime identity.
+    Ingress strips this path.
+
+    A compare-and-set on the provision generation and the request id: the
+    agent calls it when ``seed-source`` answers that the old workspace's
+    source is permanently gone, so no later attach retries the copy.
+    """
+    # The gate runs here, in the declaration's own body:
+    # `scripts/check_endpoint_auth.py` reads the audited gate from the route
+    # it is declared on and does not follow a call into a service module, so a
+    # handler that only delegates is reported `unscoped` and rewrites
+    # `policy/endpoint_inventory.txt`.
+    await get_thread_config_dependencies(request).require_internal(request)
+    return await vm_upgrade_seed.agent_vm_upgrade_interrupted(
         request,
         thread_id,
         body,

@@ -131,6 +131,7 @@ from shared.thread_presence import (
 from shared.session_retirement import update_stateless_claim_status
 from shared.workspace_upgrade import (
     UPGRADE_FAILED,
+    UPGRADE_INTERRUPTED,
     WORKSPACE_UPGRADE_PAYLOAD_KEYS,
     WORKSPACE_UPGRADE_VERB,
 )
@@ -299,6 +300,9 @@ _workspace_upgrade_in_flight: bool = False
 #: C2: a recovery copy made at owner start, until the first drain receipts it
 #: or ``_announce_recovered_vm_upgrade`` journals it.
 _recovered_vm_upgrade: Optional[Dict[str, Any]] = None
+#: C2: the request whose recovery copy owner start ended as interrupted, until
+#: the first drain receipts it or ``_announce_recovered_vm_upgrade`` journals it.
+_interrupted_vm_upgrade: Optional[str] = None
 _VM_UPGRADE_CANCELLED_REASON = "The VM upgrade was cancelled when this Session ended."
 _VM_UPGRADE_INTERRUPTED_REASON = (
     "The VM upgrade was interrupted before your files were copied. "
@@ -10214,13 +10218,12 @@ async def _apply_vm_workspace_upgrade_control(
     from shared.workspace_upgrade import (
         UPGRADE_ALREADY_RUNNING,
         UPGRADE_CANCELLED,
-        UPGRADE_INTERRUPTED,
         UPGRADE_REFUSED,
         vm_provision_generation,
         vm_upgrade_seed,
     )
 
-    global _recovered_vm_upgrade
+    global _recovered_vm_upgrade, _interrupted_vm_upgrade
     parsed = vm_upgrade_payload(request.payload)
     if (
         parsed is None
@@ -10264,6 +10267,9 @@ async def _apply_vm_workspace_upgrade_control(
     if row == ROW_BUSY:
         return failed(UPGRADE_ALREADY_RUNNING, WORKSPACE_UPGRADE_ALREADY_RUNNING)
     if row == ROW_INTERRUPTED:
+        if _interrupted_vm_upgrade == str(request.id):
+            # This receipt tells every tab; owner start needn't announce it.
+            _interrupted_vm_upgrade = None
         return failed(UPGRADE_INTERRUPTED, _VM_UPGRADE_INTERRUPTED_REASON)
     if row == ROW_COMPLETE:
         recovered = _recovered_vm_upgrade
@@ -10312,8 +10318,9 @@ async def _apply_vm_workspace_upgrade_control(
 
 async def _recover_pinned_vm_upgrade_seed() -> None:
     """C2 (D4 (a)): finish a lost predecessor's VM upgrade copy at owner start."""
-    global _recovered_vm_upgrade
+    global _recovered_vm_upgrade, _interrupted_vm_upgrade
     _recovered_vm_upgrade = None
+    _interrupted_vm_upgrade = None
     if (
         _session is None
         or _session.postgres_conn is None
@@ -10324,18 +10331,35 @@ async def _recover_pinned_vm_upgrade_seed() -> None:
         return
     from agent.api.vm_upgrade_handoff import recover_vm_upgrade_seed
 
-    _recovered_vm_upgrade = await recover_vm_upgrade_seed(
+    result = await recover_vm_upgrade_seed(
         session=_session,
         client=_orchestrator_client,
         thread_id=str(_session_identity.thread_id),
     )
+    if result is not None and result.get("interrupted"):
+        _interrupted_vm_upgrade = str(result["control_request_id"])
+    else:
+        _recovered_vm_upgrade = result
 
 
 def _announce_recovered_vm_upgrade() -> None:
-    """Journal a recovery copy whose request was already receipted (C2)."""
-    global _recovered_vm_upgrade
+    """Journal a recovery outcome whose request was already receipted (C2)."""
+    global _recovered_vm_upgrade, _interrupted_vm_upgrade
     recovered = _recovered_vm_upgrade
+    interrupted = _interrupted_vm_upgrade
     _recovered_vm_upgrade = None
+    _interrupted_vm_upgrade = None
+    if interrupted is not None:
+        _broadcast(
+            "workspace_upgrade.failed",
+            {
+                "thread_id": str(_session_identity.thread_id),
+                "target_tier": "vm",
+                "reason": _VM_UPGRADE_INTERRUPTED_REASON,
+                "error_code": UPGRADE_INTERRUPTED,
+                "request_id": interrupted,
+            },
+        )
     if recovered is None:
         return
     _broadcast(
