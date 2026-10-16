@@ -7,6 +7,7 @@ stay unedited and run as regression neighbours. Fixtures are C1's.
 from __future__ import annotations
 
 import json
+from datetime import timedelta
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 from uuid import uuid4
@@ -687,3 +688,26 @@ async def test_presence_renewal_is_a_no_op_after_the_switch(database, actor):
         database, thread_id=thread_id, establish=True
     )
     assert refreshed.served is False
+
+
+@pytest.mark.asyncio
+async def test_the_switch_restarts_a_paused_sessions_attention_timer(database, actor):
+    """A natural pause's old timer must not reach the pinned attention-sleep
+    sweep (it skips only stateless rows): the switch restarts it."""
+    thread_id = await lite_session(database, actor)
+    await database.execute(
+        "UPDATE threads SET status = 'awaiting_user', "
+        "awaiting_user_since = now() - interval '2 hours' WHERE id = $1::uuid",
+        thread_id,
+    )
+
+    await switch(database, actor, thread_id)
+
+    after = await database.fetchrow(
+        "SELECT status::text AS status, execution_lane, "
+        "now() - awaiting_user_since AS paused_for "
+        "FROM threads WHERE id = $1::uuid",
+        thread_id,
+    )
+    assert (after["status"], after["execution_lane"]) == ("awaiting_user", "pinned")
+    assert timedelta(0) <= after["paused_for"] < timedelta(seconds=10)

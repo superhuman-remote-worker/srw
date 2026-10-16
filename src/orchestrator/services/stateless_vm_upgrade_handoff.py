@@ -141,10 +141,15 @@ UPDATE run_queue
    AND state IN ('queued', 'done') AND leased_by IS NULL
 RETURNING lease_token
 """
+# A natural pause keeps its status, but its timer restarts: the pinned
+# attention-sleep sweep (session_attention.py) skips only stateless rows, so an
+# old stateless timer would suspend the Session before its first subscriber.
 _FLIP_LANE_SQL = """
 UPDATE threads
    SET execution_lane = 'pinned', metadata = metadata - $3::text,
-       last_activity = now()
+       last_activity = now(),
+       awaiting_user_since = CASE WHEN status = 'awaiting_user' THEN now()
+                                  ELSE awaiting_user_since END
  WHERE id = $1 AND execution_lane = 'stateless' AND runtime_generation = $2
    AND agent_id IS NULL
 RETURNING id
