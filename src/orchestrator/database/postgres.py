@@ -18786,6 +18786,7 @@ class PostgresDB:
             "r.cancel_requested_at,r.startup_protocol_version,r.startup_stage,"
             "r.startup_state,r.startup_reason_code,r.scheduled_at,"
             "r.ready_budget_seconds,r.pull_budget_seconds,r.ssh_budget_seconds,"
+            "r.startup_exit_code,"
             f"j.{owner_json} #>> '{{workspace_container,status}}' AS workspace_status "
             f"FROM {owner_table} j JOIN "
             "managed_repository_workspace_creation_reservations r "

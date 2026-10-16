@@ -54,6 +54,9 @@ class WorkspaceCreationView(BaseModel):
     state: str
     reason_code: str
     readiness_deadline_at: datetime | None
+    exit_code: int | None = Field(
+        description="Workspace container exit code; set only for readiness/attention/container_exited."
+    )
 
 
 class PublicJobListItem(BaseModel):

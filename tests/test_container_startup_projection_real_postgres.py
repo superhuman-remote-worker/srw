@@ -55,6 +55,7 @@ async def test_exact_current_receipt_projects_wait_and_frozen_hard_deadline(
             "state": "waiting_capacity",
             "reason_code": "scheduler_unschedulable",
             "readiness_deadline_at": None,
+            "exit_code": None,
         }
     }
     scheduled = datetime.now(timezone.utc)
@@ -71,6 +72,7 @@ async def test_exact_current_receipt_projects_wait_and_frozen_hard_deadline(
         "state": "starting",
         "reason_code": "scheduled",
         "readiness_deadline_at": scheduled + timedelta(seconds=300),
+        "exit_code": None,
     }
 
 
@@ -95,6 +97,7 @@ async def test_attention_is_allowlisted_without_private_authority(db):
         "state",
         "reason_code",
         "readiness_deadline_at",
+        "exit_code",
     }
     assert view["reason_code"] == "invalid_image"
 
@@ -141,6 +144,7 @@ async def test_old_settled_creating_job_projects_only_legacy_hold(db):
             "state": "observing",
             "reason_code": "legacy_receipt_held",
             "readiness_deadline_at": None,
+            "exit_code": None,
         }
     }
 
@@ -169,6 +173,7 @@ async def test_unmarked_open_receipt_is_observing_without_adoption(db):
             "state": "observing",
             "reason_code": "observation_pending",
             "readiness_deadline_at": None,
+            "exit_code": None,
         }
     }
     assert (await fixtures._reservation(db, receipt))[
@@ -237,6 +242,7 @@ async def test_resumed_session_ignores_settled_predecessor_cleanup(
         "state": "observing",
         "reason_code": "observation_pending",
         "readiness_deadline_at": None,
+        "exit_code": None,
     }
     # An unresolved intent for the new generation must still suppress its
     # startup view; the settled predecessor above must not.
@@ -258,3 +264,28 @@ async def test_resumed_session_ignores_settled_predecessor_cleanup(
         await database.container_workspace_creation_views("thread", [case.thread_id])
         == {}
     )
+
+
+@pytest.mark.asyncio
+async def test_container_exited_projects_its_exit_code(db):
+    (
+        owner_id,
+        _receipt,
+        _pod_uid,
+        _gate,
+        kwargs,
+        scheduled,
+    ) = await fixtures._starting_job(db)
+    view = (await db.container_workspace_creation_views("job", [owner_id]))[owner_id]
+    assert view["exit_code"] is None
+    assert await db.observe_container_startup(
+        **kwargs, observation=StartupAttention("container_exited", exit_code=3)
+    )
+    view = (await db.container_workspace_creation_views("job", [owner_id]))[owner_id]
+    assert view == {
+        "stage": "readiness",
+        "state": "attention",
+        "reason_code": "container_exited",
+        "readiness_deadline_at": scheduled + timedelta(seconds=180),
+        "exit_code": 3,
+    }
