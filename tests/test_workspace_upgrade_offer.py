@@ -126,3 +126,25 @@ async def test_nothing_available_names_every_reason(monkeypatch):
     result = await tool.ainvoke({"reason": "need a shell"})
     assert context.consume_freeze_request() is None
     assert "tracking is off." in result and "VMs are off." in result
+
+
+@pytest.mark.asyncio
+async def test_pinned_nothing_available_names_only_the_vm_reason(monkeypatch):
+    # The pinned lane never offers a container, so its entry gives no reason.
+    client = _Client(
+        {
+            "vm": {
+                "available": False,
+                "reason": "VM workspaces aren't available on this installation.",
+            },
+            "container": {"available": False, "reason": None},
+        }
+    )
+    tool, context = _tool(monkeypatch, client)
+    result = await tool.ainvoke({"reason": "need a shell"})
+    assert context.consume_freeze_request() is None
+    assert result.startswith(
+        "No workspace upgrade is available for this Session: VM workspaces "
+        "aren't available on this installation. Nothing was offered"
+    )
+    assert "/upgrade-workspace vm" not in result

@@ -44,11 +44,6 @@ CONTAINER_WORKSPACES_UNAVAILABLE = (
 PINNED_TRANSPORT_REFUSAL = (
     "Workspace upgrades use the live session transport on the pinned execution lane"
 )
-# The offer fix's agent-side copy for the in-process container refusal.
-PINNED_CONTAINER_UPGRADE_UNAVAILABLE = (
-    "Container upgrades aren't available in this session. Use "
-    "/upgrade-workspace vm, or start a new Session with a container workspace."
-)
 WORKSPACE_UPGRADE_UPLOAD_REFUSED = (
     "This Session's workspace is being upgraded. Try the upload again when the "
     "upgrade finishes."

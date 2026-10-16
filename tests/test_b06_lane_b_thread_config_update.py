@@ -935,10 +935,8 @@ class TestUpgradeAvailability:
             MagicMock(), THREAD, dependencies=deps
         )
         assert result["vm"] == {"available": True, "reason": None}
-        assert result["container"] == {
-            "available": False,
-            "reason": swu.PINNED_CONTAINER_UPGRADE_UNAVAILABLE,
-        }
+        # The pinned lane never offers a container, so it gives no reason.
+        assert result["container"] == {"available": False, "reason": None}
         deps.require_internal.assert_awaited_once()
         deps.store.merge_thread_vm_context.assert_not_awaited()
         deps.vm_provisioner.create_thread_vm.assert_not_awaited()

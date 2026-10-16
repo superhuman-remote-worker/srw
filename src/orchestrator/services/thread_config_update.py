@@ -1212,12 +1212,13 @@ async def _container_upgrade_availability(
 ) -> dict[str, Any]:
     """Whether a stateless container upgrade would be admitted now (C1)."""
     from orchestrator.services.stateless_workspace_upgrade import (
-        PINNED_CONTAINER_UPGRADE_UNAVAILABLE,
         prepare_stateless_container_upgrade,
     )
 
     if thread.get("execution_lane") != LANE_STATELESS:
-        return {"available": False, "reason": PINNED_CONTAINER_UPGRADE_UNAVAILABLE}
+        # The pinned lane never offers a container, so it gives no reason: the
+        # agent's nothing-available reply names only the VM's.
+        return {"available": False, "reason": None}
     try:
         await prepare_stateless_container_upgrade(
             dependencies.store,
