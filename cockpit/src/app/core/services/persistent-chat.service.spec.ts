@@ -12185,6 +12185,25 @@ describe('PersistentChatService — control transport is declared, never inferre
     expect(ctx.service.continueAfterUpgrade()).toBe(true);
   });
 
+  it('a second /upgrade-workspace while one is provisioning posts nothing and keeps the first', async () => {
+    const ctx = await socketlessSession(upgradeable);
+    ctx.mockHttp.post
+      .mockReturnValueOnce(of({ state: 'pending' }))
+      .mockReturnValue(throwError(() => ({ status: 409, error: { detail: 'already upgraded' } })));
+    const stamps = vi.spyOn(ctx.service as any, '_systemMessage');
+
+    ctx.service.upgradeWorkspace('sandbox', { thenContinue: true });
+    (ctx.service as any).handleSlashCommand('/upgrade-workspace');
+
+    expect(ctx.mockHttp.post).toHaveBeenCalledTimes(1);
+    expect(ctx.service.workspaceUpgradeInProgress()).toEqual({ tier: 'sandbox' });
+    expect(ctx.service.continueAfterUpgrade()).toBe(true);
+    expect(ctx.service.error()).toBeNull();
+    expect(
+      stamps.mock.calls.filter(([line]) => line === 'chat.workspaceOffer.provisioning'),
+    ).toHaveLength(2);
+  });
+
   it('an accepted upgrade re-reads the session for its startup line', async () => {
     const ctx = await socketlessSession(upgradeable);
     ctx.mockHttp.post.mockReturnValue(of({ state: 'pending' }));

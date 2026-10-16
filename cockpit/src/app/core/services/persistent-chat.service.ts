@@ -7370,6 +7370,12 @@ export class PersistentChatService {
   ): void {
     const threadId = this.threadId();
     if (!threadId || !this._controlPlaneAllowed(threadId)) return;
+    if (this.workspaceUpgradeInProgress()) {
+      // A second control would come back 409, and that failure clears the
+      // first upgrade's progress and auto-continue. Repeat its line instead.
+      this._announceWorkspaceUpgradeProvisioning();
+      return;
+    }
     // A named template's tier is the server's call; anything else must be a
     // declared target here (C1 declares container; C2 adds vm).
     const wanted = tier ?? (opts.template ? null : 'sandbox');
@@ -7400,6 +7406,10 @@ export class PersistentChatService {
     if (template) control.template = template;
     if (!this._sendDurableControl(control)) return;
     this.workspaceUpgradeInProgress.set({tier: tier ?? 'sandbox'});
+    this._announceWorkspaceUpgradeProvisioning();
+  }
+
+  private _announceWorkspaceUpgradeProvisioning(): void {
     this._systemMessage(
       this.transloco.translate('chat.workspaceOffer.provisioning', {tier: 'container'}),
     );
