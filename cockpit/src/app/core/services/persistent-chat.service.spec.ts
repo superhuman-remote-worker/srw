@@ -13204,6 +13204,7 @@ describe('PersistentChatService — pending End visibility reconciliation', () =
     meta = {...meta, workspace_creation: {
       stage: 'scheduling', state: 'waiting_capacity', reason_code: 'scheduler_unschedulable',
       readiness_deadline_at: null,
+      exit_code: null,
     }};
     await connected();
     expect(ctx.service.workspaceCreation()?.state).toBe('waiting_capacity');
@@ -13225,6 +13226,7 @@ describe('PersistentChatService — pending End visibility reconciliation', () =
     late.next({status: 'active', workspace_creation: {
       stage: 'readiness', state: 'attention', reason_code: 'invalid_image',
       readiness_deadline_at: null,
+      exit_code: null,
     }});
     late.complete();
     await flushMicrotasks();

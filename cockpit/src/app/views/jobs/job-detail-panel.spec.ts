@@ -209,9 +209,9 @@ describe('typed workspace creation detail', () => {
   }
 
   const observing = {stage: 'scheduling', state: 'observing',
-    reason_code: 'observation_pending', readiness_deadline_at: null} as const;
+    reason_code: 'observation_pending', readiness_deadline_at: null, exit_code: null} as const;
   const attention = {stage: 'readiness', state: 'attention',
-    reason_code: 'invalid_image', readiness_deadline_at: null} as const;
+    reason_code: 'invalid_image', readiness_deadline_at: null, exit_code: null} as const;
 
   it('replaces the list observation with newer attention from the loaded detail', () => {
     const {fixture, data} = renderPanel({workspace_creation: observing});
@@ -272,7 +272,7 @@ describe('typed workspace creation detail', () => {
       id: 'job-startup', description: 'Start workspace', status: 'created',
       created_at: '2026-09-28T08:00:00Z',
       workspace_creation: {stage: 'scheduling', state: 'waiting_capacity',
-        reason_code: 'scheduler_unschedulable', readiness_deadline_at: null,
+        reason_code: 'scheduler_unschedulable', readiness_deadline_at: null, exit_code: null,
         private_diagnostic: '0/3 nodes had taint secret'},
       vm_creation: {state: 'observing', message: 'VM observation', resumable: true},
     } as unknown as JobSummary)});

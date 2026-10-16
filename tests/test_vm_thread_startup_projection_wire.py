@@ -139,6 +139,7 @@ async def test_session_list_batches_current_container_view_after_approval(monkey
         "state": "waiting_capacity",
         "reason_code": "scheduler_unschedulable",
         "readiness_deadline_at": None,
+        "exit_code": None,
     }
     store.container_workspace_creation_views.return_value = {store.thread_id: view}
     approved = AsyncMock(return_value={"id": str(store.user_id), "is_admin": False})

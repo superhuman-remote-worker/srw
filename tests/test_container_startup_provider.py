@@ -281,7 +281,11 @@ async def test_gate_off_legacy_does_not_adopt_and_existing_v1_continues(monkeypa
 @pytest.mark.asyncio
 @pytest.mark.parametrize("gate", ["true", None], ids=["gate-on", "existing-v1"])
 async def test_v1_observer_never_fails_an_exited_container_at_once(monkeypatch, gate):
-    """A v1 receipt stays accepted-pending; only the legacy wait may raise."""
+    """A v1 receipt stays accepted-pending; only the legacy wait may raise.
+
+    This is the Sessions pin: a Session owner never gets container_exited
+    (Jobs only, owner decision 1). Keep it on the Session fixture.
+    """
 
     if gate is None:
         monkeypatch.delenv("CONTAINER_STARTUP_STAGE_AUTHORITY_ENABLED", raising=False)

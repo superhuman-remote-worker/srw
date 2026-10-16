@@ -91,12 +91,12 @@ describe('SessionListService', () => {
     const second = service.refresh();
     newer.next({threads: [{...thread('a', new Date().toISOString()),
       workspace_creation: {stage: 'readiness', state: 'attention',
-        reason_code: 'invalid_image', readiness_deadline_at: null}}]});
+        reason_code: 'invalid_image', readiness_deadline_at: null, exit_code: null}}]});
     newer.complete();
     await second;
     older.next({threads: [{...thread('a', new Date().toISOString()),
       workspace_creation: {stage: 'scheduling', state: 'observing',
-        reason_code: 'observation_pending', readiness_deadline_at: null}}]});
+        reason_code: 'observation_pending', readiness_deadline_at: null, exit_code: null}}]});
     older.complete();
     await first;
     expect(service.threads()[0].workspace_creation?.state).toBe('attention');

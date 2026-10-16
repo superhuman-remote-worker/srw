@@ -239,6 +239,7 @@ def test_detail_route_reads_one_allowlisted_startup_view_after_owner_gate() -> N
         "state": "observing",
         "reason_code": "observation_pending",
         "readiness_deadline_at": None,
+        "exit_code": None,
     }
     store.container_workspace_creation_views.return_value = {UUID(THREAD_ID): view}
     body = _client(store).get(f"/api/persistent/threads/{THREAD_ID}").json()
