@@ -180,7 +180,10 @@ async def test_a_second_websocket_upgrade_while_one_runs_is_refused():
     assert _frames(ws) == [
         (
             "workspace_upgrade.failed",
-            {"reason": "A workspace upgrade is already running."},
+            {
+                "reason": "A workspace upgrade is already running.",
+                "error_code": "upgrade_already_running",
+            },
         )
     ]
     client.request_thread_workspace_upgrade.assert_not_called()
@@ -228,7 +231,10 @@ async def test_a_websocket_upgrade_holds_the_single_flight_until_it_finishes(
             assert _frames(second_ws) == [
                 (
                     "workspace_upgrade.failed",
-                    {"reason": "A workspace upgrade is already running."},
+                    {
+                        "reason": "A workspace upgrade is already running.",
+                        "error_code": "upgrade_already_running",
+                    },
                 )
             ]
             client.request_thread_workspace_upgrade.assert_awaited_once()

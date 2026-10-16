@@ -11775,11 +11775,15 @@ async def _handle_workspace_upgrade(
         return
     if _workspace_upgrade_in_flight:
         # One upgrade per agent process: the stateless lane switch's durable
-        # upgrade (C2) or another socket's may be running.
+        # upgrade (C2) or another socket's may be running. The typed code
+        # tells the cockpit to leave the running upgrade's progress alone.
         await _ws_send(
             ws,
             "workspace_upgrade.failed",
-            {"reason": WORKSPACE_UPGRADE_ALREADY_RUNNING},
+            {
+                "reason": WORKSPACE_UPGRADE_ALREADY_RUNNING,
+                "error_code": UPGRADE_ALREADY_RUNNING,
+            },
         )
         return
 
