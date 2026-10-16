@@ -92,6 +92,10 @@ from agent.api.session_input import (
     INTERRUPT_CAUSE_LEASE_LOST,
     INTERRUPT_CAUSE_SHUTDOWN,
 )
+from agent.api.workspace_upgrade_seed import (
+    claim_bundle_workspace_upgrade_seed,
+    seed_upgraded_workspace,
+)
 from shared.event_journal import append_system_frame, bump_epoch
 from shared.job_freeze_types import (
     AUTO_CONTINUE_FREEZE_TYPES,
@@ -1007,6 +1011,9 @@ _DETERMINISTIC_RELEASE_REASONS = frozenset(
         # takes the shutdown release. A DB blip can end the loop too, which is
         # why the budget is max_attempts such failures, not one.
         "loop_died",
+        # The upgraded workspace can't receive its files (object store, SFTP
+        # or Git): bounded, so a Session that can never copy parks visibly.
+        "workspace_upgrade_seed_failed",
     }
 )
 _TRANSIENT_RELEASE_REASONS = frozenset(
@@ -4399,6 +4406,29 @@ class StatelessTurnExecutor:
                 consumed_seq,
                 timing["interrupt_recovery"],
             )
+
+        # A stateless workspace upgrade (C1) still owes its file copy: make it
+        # before any control or input runs, on the container just attached.
+        upgrade_seed = claim_bundle_workspace_upgrade_seed(bundle)
+        if upgrade_seed is not None:
+            try:
+                await seed_upgraded_workspace(
+                    pa._session, upgrade_seed, thread_id=unit_id, lease_token=token
+                )
+            except LeaseLostError:
+                self._lease.mark_lost()
+                await self._detach_cached_session("lease_lost_during_upgrade_seed")
+                return
+            except Exception as e:
+                logger.warning(
+                    "workspace upgrade seed failed for unit %s: %s",
+                    unit_id,
+                    e,
+                    exc_info=True,
+                )
+                await self._detach_cached_session("workspace_upgrade_seed_failed")
+                await self._release(claim, reason="workspace_upgrade_seed_failed")
+                return
 
         # Controls are consumed only by the exact serving owner. The initial
         # drain is synchronous so a control-only claim cannot take either

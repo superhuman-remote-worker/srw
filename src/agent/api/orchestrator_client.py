@@ -40,6 +40,7 @@ from shared.session_subagent_authority import (
 )
 from shared.session_subagent_batch import session_subagent_batch_delivery_id
 from shared.session_attach_cleanup_identity import PreSetupWorkspaceIdentity
+from shared.workspace_upgrade import WORKSPACE_UPGRADE_SEED_CAPABILITY
 
 logger = logging.getLogger(__name__)
 
@@ -1907,6 +1908,9 @@ class OrchestratorClient:
                 "pod_name": os.environ.get("POD_NAME")
                 or os.environ.get("HOSTNAME", ""),
                 "pod_uid": os.environ.get("POD_UID", ""),
+                # This executor can make a stateless workspace upgrade's copy;
+                # without it, a Session that owes one answers 425.
+                "capabilities": WORKSPACE_UPGRADE_SEED_CAPABILITY,
             },
         )
         if response.status_code == 200:

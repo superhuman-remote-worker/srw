@@ -366,6 +366,7 @@ class Harness:
         self.restored_turn_count = 0
         self.heartbeat_result: Any = datetime.now(timezone.utc)
         self.bundle_error: Optional[Exception] = None
+        self.bundle_extra: Dict[str, Any] = {}
         self.attach_error: Optional[Exception] = None
         self.stateless_warm_reuse_safe = True
         self.session_postgres_conn = None
@@ -531,6 +532,7 @@ class Harness:
                     "execution_lane": "stateless",
                     "watermarks": {"input_seq": None, "consumed_seq": None},
                     "attach": harness.attach_for(unit_id),
+                    **harness.bundle_extra,
                 }
 
         pa._orchestrator_client = FakeClient()
@@ -4142,3 +4144,57 @@ class TestPendingMemorySet:
         assert not any(
             sql == te._LEASED_INPUT_SEQ_SQL for sql, _ in harness.db.fetch_calls
         )
+
+
+class TestWorkspaceUpgradeSeed:
+    @pytest.mark.asyncio
+    async def test_seed_runs_after_attach_and_before_controls_and_input(
+        self, harness, monkeypatch
+    ):
+        """Review Focus 1: whatever is queued, the copy comes first."""
+        order: List[str] = []
+        spec = {"version": 1}
+
+        async def fake_seed(session, seed_spec, *, thread_id, lease_token):
+            order.append(f"seed:{lease_token}")
+            assert seed_spec == spec
+            assert harness.calls["attach"], "seed must follow attach"
+            assert not harness.calls["control_start"], "seed must precede controls"
+            return 2
+
+        monkeypatch.setattr(te, "seed_upgraded_workspace", fake_seed)
+        harness.bundle_extra = {"workspace_upgrade_seed": spec}
+        unit = uuid4()
+        harness.db.pending_rows = [{"id": str(uuid4()), "seq": 5, "content": "hi"}]
+        claim = make_claim(unit_id=unit, token=7, input_seq=5, consumed_seq=None)
+
+        await harness.executor._serve_claim(claim)
+        await _finish(harness)
+
+        assert order == ["seed:7"]
+        assert harness.calls["control_start"]
+        assert harness.consumed
+
+    @pytest.mark.asyncio
+    async def test_a_failed_seed_releases_before_controls_or_input(
+        self, harness, monkeypatch
+    ):
+        async def failing_seed(*_args, **_kwargs):
+            raise RuntimeError("object store unavailable")
+
+        monkeypatch.setattr(te, "seed_upgraded_workspace", failing_seed)
+        harness.bundle_extra = {"workspace_upgrade_seed": {"version": 1}}
+        harness.db.pending_rows = [{"id": str(uuid4()), "seq": 5, "content": "hi"}]
+        claim = make_claim(token=3, input_seq=5, consumed_seq=None)
+
+        await harness.executor._serve_claim(claim)
+        await _finish(harness)
+
+        assert len(harness.calls["release"]) == 1
+        assert harness.calls["release"][0]["error"] is True
+        assert not harness.calls["control_start"]
+        assert not harness.consumed
+        assert not harness.calls["complete"]
+
+    def test_seed_failure_counts_toward_the_park_budget(self):
+        assert te._release_is_deterministic("workspace_upgrade_seed_failed")

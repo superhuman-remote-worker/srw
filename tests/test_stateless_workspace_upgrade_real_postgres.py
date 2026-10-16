@@ -593,3 +593,80 @@ async def test_end_during_the_upgrade_create_retires_the_initial_creation(
         case.thread_id,
     )
     assert [str(r["runtime_incarnation"]) for r in receipts] == [case.pod_uid]
+
+
+@pytest.mark.asyncio
+async def test_the_fenced_seed_clear_passes_every_guard_and_drops_only_the_marker(
+    database, actor, monkeypatch
+):
+    from agent.database.postgres_db import PostgresDB as AgentDB
+    from shared.run_queue import fence_lease
+
+    case = await upgraded_create(database, actor, monkeypatch, first_wait="ready")
+    before = metadata(await database.get_thread(case.thread_id))
+    async with database.acquire() as conn:
+        claimed = await claim_unit(
+            conn, unit_kind=UNIT_KIND_SESSION_TURN, pod_name="p-1"
+        )
+    assert claimed is not None
+
+    async with database.acquire() as conn:
+        async with conn.transaction():
+            assert await fence_lease(
+                conn, unit_id=case.thread_id, lease_token=claimed.lease_token
+            )
+            cleared = await conn.fetchval(
+                AgentDB._CLEAR_WORKSPACE_UPGRADE_SEED_SQL,
+                case.thread_id,
+                json.dumps(before["workspace_container"]["seed_from"]),
+            )
+
+    assert cleared == 1
+    after = metadata(await database.get_thread(case.thread_id))
+    expected = dict(before["workspace_container"])
+    expected.pop("seed_from")
+    assert after["workspace_container"] == expected
+    assert after["_workspace_binding"] == before["_workspace_binding"]
+
+
+@pytest.mark.asyncio
+async def test_the_claimant_clears_the_marker_only_under_its_exact_lease(
+    database, actor, monkeypatch
+):
+    """The agent's fenced clear and pending read: a stale token writes nothing."""
+    from agent.api.lease_context import LeaseHandle, LeaseLostError, current_lease
+    from agent.database.postgres_db import PostgresDB as AgentDB
+
+    case = await upgraded_create(database, actor, monkeypatch, first_wait="ready")
+    meta = metadata(await database.get_thread(case.thread_id))
+    seed_from = meta["workspace_container"]["seed_from"]
+    async with database.acquire() as conn:
+        claimed = await claim_unit(
+            conn, unit_kind=UNIT_KIND_SESSION_TURN, pod_name="p-1"
+        )
+    assert claimed is not None
+    agent_db = AgentDB.__new__(AgentDB)
+    agent_db._pool = database._pool
+    agent_db._queries = {}
+    assert await agent_db.workspace_upgrade_seed_pending(case.thread_id) is True
+
+    lease = LeaseHandle()
+    reset = current_lease.set(lease)
+    try:
+        lease.update(case.thread_id, claimed.lease_token - 1)
+        with pytest.raises(LeaseLostError):
+            await agent_db.clear_workspace_upgrade_seed(
+                case.thread_id, expected_seed_from=seed_from
+            )
+        assert await agent_db.workspace_upgrade_seed_pending(case.thread_id) is True
+
+        lease.update(case.thread_id, claimed.lease_token)
+        assert await agent_db.clear_workspace_upgrade_seed(
+            case.thread_id, expected_seed_from=seed_from
+        )
+        assert not await agent_db.clear_workspace_upgrade_seed(
+            case.thread_id, expected_seed_from=seed_from
+        )
+    finally:
+        current_lease.reset(reset)
+    assert await agent_db.workspace_upgrade_seed_pending(case.thread_id) is False

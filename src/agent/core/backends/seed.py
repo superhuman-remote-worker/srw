@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import logging
 import posixpath
-from typing import TYPE_CHECKING, Any, Dict, List
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Mapping
 
 from agent.core.backends.overlay import unwrap_backend
 
@@ -139,7 +139,12 @@ def reseed_missing_files(
     return written
 
 
-def seed_workspace(src: "WorkspaceBackend", dst: "WorkspaceBackend") -> int:
+def seed_workspace(
+    src: "WorkspaceBackend",
+    dst: "WorkspaceBackend",
+    *,
+    exclude: "Callable[[str], bool] | None" = None,
+) -> int:
     """Copy every file from ``src`` into ``dst``, preserving relative paths.
 
     Walks the source recursively (``agent.walk()``), reads each file as bytes,
@@ -155,6 +160,9 @@ def seed_workspace(src: "WorkspaceBackend", dst: "WorkspaceBackend") -> int:
     Args:
         src: Source backend (e.g. the live ``VirtualWorkspaceBackend``).
         dst: Destination backend (e.g. the freshly connected ``RemoteBackend``).
+        exclude: Paths for which ``exclude(rel)`` is true are neither copied
+            nor verified — the stateless upgrade leaves cloud-synced roots to
+            the first pull.
 
     Returns:
         The number of files written.
@@ -164,6 +172,8 @@ def seed_workspace(src: "WorkspaceBackend", dst: "WorkspaceBackend") -> int:
             the copy.
     """
     files = src.walk()
+    if exclude is not None:
+        files = [rel for rel in files if not exclude(rel)]
     written = 0
     skipped: list[str] = []
     for rel in files:
@@ -205,3 +215,31 @@ def seed_workspace(src: "WorkspaceBackend", dst: "WorkspaceBackend") -> int:
         type(dst).__name__,
     )
     return written
+
+
+def seed_from_lite_workspace(
+    workspace: Mapping[str, Any],
+    *,
+    owner_id: str,
+    destination: "WorkspaceBackend",
+    exclude: "Callable[[str], bool] | None" = None,
+) -> int:
+    """Copy an old lite workspace (``virtual`` mounts or ``none``) into ``destination``.
+
+    Shared by the stateless container upgrade (C1) and the VM upgrade's
+    recovery copy (C2). ``none`` has nothing durable to copy.
+    """
+    from types import SimpleNamespace
+
+    from agent.core.backends.factory import create_lite_backend
+
+    backend = workspace.get("backend")
+    if backend == "none":
+        return 0
+    if backend != "virtual":
+        raise ValueError(f"cannot seed from a {backend!r} workspace")
+    source = create_lite_backend(
+        SimpleNamespace(backend="virtual", mounts=list(workspace.get("mounts") or [])),
+        job_id=owner_id,
+    )
+    return seed_workspace(source, destination, exclude=exclude)

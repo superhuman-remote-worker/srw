@@ -157,3 +157,15 @@ class TestSeedWorkspace:
 
         with pytest.raises(RuntimeError, match="seed incomplete"):
             seed_workspace(src, dst)
+
+    def test_excluded_paths_are_neither_copied_nor_verified(self, tmp_path):
+        src = _virtual()
+        src.write_file("plan.md", "p")
+        src.write_file("cloud/shared.md", "from the cloud")
+        dst = FilesystemTestBackend(tmp_path)
+
+        n = seed_workspace(src, dst, exclude=lambda rel: rel.startswith("cloud/"))
+
+        assert n == 1
+        assert dst.read_file("plan.md") == "p"
+        assert not dst.exists("cloud/shared.md")
