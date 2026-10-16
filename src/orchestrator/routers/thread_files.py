@@ -32,12 +32,16 @@ from orchestrator.security.access import require_thread_owner
 from orchestrator.services.gitea import GiteaPathError, validate_gitea_name
 from orchestrator.services.ide_proxy import contain_ide_status_for
 from orchestrator.services.stateless_workspace_gate import thread_metadata_object
+from orchestrator.services.stateless_workspace_upgrade import (
+    WORKSPACE_UPGRADE_UPLOAD_REFUSED,
+)
 from orchestrator.services.thread_files import (
     _prepare_pinned_k8s_thread_upload,
     _prepare_pinned_vm_thread_operation,
 )
 from orchestrator.services.workspace_lifecycle import WorkspaceOwner
 from shared.session_retirement import stateless_stop_markers
+from shared.workspace_upgrade import workspace_upgrade_seed_from
 
 logger = logging.getLogger(__name__)
 
@@ -620,6 +624,12 @@ async def upload_files_to_thread(
                             status_code=409,
                             detail="Stateless session is not accepting uploads",
                         )
+                    if workspace_upgrade_seed_from(fresh.get("metadata")) is not None:
+                        # Until the claimant has copied the old prefix in, a
+                        # write to either side could be lost (spec "Uploads").
+                        raise HTTPException(
+                            status_code=409, detail=WORKSPACE_UPGRADE_UPLOAD_REFUSED
+                        )
                     backend = dependencies.require_stateless_workspace(fresh)
                     destination = resolve_thread_upload_destination(fresh)
                     payloads = await _materialize_payloads()
@@ -820,6 +830,12 @@ async def delete_thread_upload(
                         raise HTTPException(
                             status_code=409,
                             detail="Stateless session is not accepting upload deletes",
+                        )
+                    if workspace_upgrade_seed_from(fresh.get("metadata")) is not None:
+                        # Until the claimant has copied the old prefix in, a
+                        # write to either side could be lost (spec "Uploads").
+                        raise HTTPException(
+                            status_code=409, detail=WORKSPACE_UPGRADE_UPLOAD_REFUSED
                         )
                     backend = dependencies.require_stateless_workspace(fresh)
                     destination = resolve_thread_upload_destination(fresh)

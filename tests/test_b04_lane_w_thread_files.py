@@ -652,6 +652,44 @@ class TestStatelessUploadLane:
         assert response.status_code == 409
         assert response.json()["detail"] == "Session workspace is unavailable"
 
+    _UPGRADING = {
+        "config_override": {"workspace": {"backend": "sandbox"}},
+        "workspace_container": {
+            "status": "pending",
+            "provisioner": "k8s",
+            "seed_from": {
+                "backend": "virtual",
+                "prefix": "threads/t/",
+                "binding": None,
+            },
+        },
+    }
+
+    @pytest.mark.asyncio
+    async def test_a_pending_workspace_upgrade_refuses_uploads(self, wire, uploads):
+        wire.state.fresh = dict(wire.state.fresh, metadata=self._UPGRADING)
+
+        response = await call(
+            wire, "POST", UPLOADS, files=[("files", ("a.txt", b"abc", "text/plain"))]
+        )
+
+        assert response.status_code == 409
+        assert response.json()["detail"] == (
+            "This Session's workspace is being upgraded. Try the upload again "
+            "when the upgrade finishes."
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_pending_workspace_upgrade_refuses_upload_deletes(
+        self, wire, uploads
+    ):
+        wire.state.fresh = dict(wire.state.fresh, metadata=self._UPGRADING)
+
+        response = await call(wire, "DELETE", f"{UPLOADS}/a.txt")
+
+        assert response.status_code == 409
+        assert "being upgraded" in response.json()["detail"]
+
 
 # =============================================================================
 # Upload deletes

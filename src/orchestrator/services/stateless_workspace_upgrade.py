@@ -216,13 +216,26 @@ def workspace_upgrade_seed_spec(
 
     Lite Sessions already receive these mounts at every claim
     (``session_attach_payload.py`` ~:148), so exposure doesn't grow.
+
+    A ``virtual`` source bound to another object store is refused: mounting
+    today's store would copy nothing and clear the marker as if it had.
     """
+    from orchestrator.services import virtual_workspace
+    from orchestrator.services.workspace_binding import virtual_thread_backing_id
     from orchestrator.services.workspace_tier_policy import (
         inject_lite_workspace_config,
     )
 
     backend = seed_from.get("backend")
     if backend == "virtual":
+        binding = seed_from.get("binding")
+        store = virtual_workspace.virtual_workspace_rclone_spec()
+        if (
+            isinstance(binding, Mapping)
+            and store is not None
+            and binding.get("backing_id") != virtual_thread_backing_id(thread_id, store)
+        ):
+            raise ValueError("the old workspace is bound to another object store")
         override = inject_lite_workspace_config(
             {"workspace": {"backend": "virtual"}}, prefix=f"threads/{thread_id}/"
         )

@@ -38,6 +38,7 @@ async def internal_unit_claim_bundle(
     lease_token: int,
     pod_name: str,
     pod_uid: str,
+    capabilities: str | None = Query(None),
 ) -> dict[str, Any]:
     """Claim bundle for a leased stateless unit — internal (agent executor).
 
@@ -59,6 +60,10 @@ async def internal_unit_claim_bundle(
     Errors: 401 bad internal key; 403 token mismatch / not leased (single
     generic detail); 404 unit row absent; 409 not a session unit, thread not
     on the stateless lane, or attach assembly refused (generic reason).
+
+    ``capabilities`` lists what the executor can do (comma-separated); a
+    Session that still owes its workspace-upgrade copy answers 425 to a
+    claimant without ``workspace_upgrade_seed.v1``.
     """
     dependencies = get_unit_claim_bundle_dependencies(request)
     await dependencies.require_internal(request)
@@ -68,6 +73,9 @@ async def internal_unit_claim_bundle(
             lease_token=lease_token,
             pod_name=pod_name,
             pod_uid=pod_uid,
+            claimant_capabilities=unit_claim_bundle.parse_claimant_capabilities(
+                capabilities
+            ),
             dependencies=dependencies,
         )
     except HTTPException as exc:

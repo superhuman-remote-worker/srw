@@ -38,6 +38,7 @@ from orchestrator.services.stateless_workspace_gate import thread_metadata_objec
 from orchestrator.services.stateless_workspace_upgrade import (
     StatelessWorkspaceUpgradeDependencies,
     prepare_stateless_workspace_upgrade,
+    workspace_upgrade_view,
 )
 from orchestrator.services.thread_control_inbox import (
     ControlAdmissionError,
@@ -129,6 +130,11 @@ async def get_thread(
         None
         if thread.get("status") in {"ended", "suspended"}
         else creations.get(UUID(thread_id))
+    )
+    result["workspace_upgrade"] = (
+        None
+        if thread.get("status") in {"ended", "suspended"}
+        else workspace_upgrade_view(thread, result["workspace_creation"])
     )
     if not result.get("ssh_handle"):
         try:

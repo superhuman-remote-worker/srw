@@ -300,3 +300,30 @@ def test_seed_spec_for_a_none_source_has_nothing_to_mount():
         {"backend": "none", "prefix": f"threads/{THREAD_ID}/", "binding": None},
     )
     assert out["workspace"] == {"backend": "none"}
+
+
+@pytest.mark.parametrize("bound_to", ["current", "another"])
+def test_seed_spec_proves_the_binding_against_the_current_store(monkeypatch, bound_to):
+    """R10: a binding minted against another object store would copy 0 files
+    and clear the marker silently, so the spec refuses it instead."""
+    from orchestrator.services.workspace_binding import virtual_thread_backing_id
+
+    spec = {"type": "s3", "root": "srw-workspaces", "config": {"endpoint": "e"}}
+    bound_store = spec if bound_to == "current" else {**spec, "root": "old"}
+    seed = {
+        **SEED,
+        "binding": {
+            "kind": "virtual",
+            "backing_id": virtual_thread_backing_id(THREAD_ID, bound_store),
+        },
+    }
+    monkeypatch.setattr(
+        "orchestrator.services.virtual_workspace.virtual_workspace_rclone_spec",
+        lambda: spec,
+    )
+
+    if bound_to == "current":
+        assert swu.workspace_upgrade_seed_spec(THREAD_ID, seed)["seed_from"] == seed
+    else:
+        with pytest.raises(ValueError, match="another object store"):
+            swu.workspace_upgrade_seed_spec(THREAD_ID, seed)

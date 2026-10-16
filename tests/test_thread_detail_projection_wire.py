@@ -288,3 +288,51 @@ def test_detail_preserves_raw_status_but_hides_ready_during_authorized_end(
     assert body["retirement_permanent"] is (authorized and permanent)
     assert body["workspace_lifecycle"] == (None if authorized else {"state": "ready"})
     assert "ended_at" not in body
+
+
+def _upgrading_metadata() -> str:
+    return json.dumps(
+        {
+            "config_override": {"workspace": {"backend": "sandbox"}},
+            "workspace_container": {
+                "status": "pending",
+                "provisioner": "k8s",
+                "seed_from": {
+                    "backend": "virtual",
+                    "prefix": f"threads/{THREAD_ID}/",
+                    "binding": None,
+                },
+            },
+        }
+    )
+
+
+def test_detail_projects_a_failed_stateless_upgrade() -> None:
+    store = _Store()
+    attention = {
+        "stage": "readiness",
+        "state": "attention",
+        "reason_code": "invalid_image",
+        "readiness_deadline_at": None,
+    }
+    store.container_workspace_creation_views.return_value = {UUID(THREAD_ID): attention}
+    row = _raw_row()
+    row["metadata"] = _upgrading_metadata()
+    body = _client(store, row).get(f"/api/persistent/threads/{THREAD_ID}").json()
+    assert body["workspace_upgrade"] == {
+        "target_tier": "sandbox",
+        "phase": "failed",
+        "reason_code": "invalid_image",
+    }
+
+
+def test_detail_has_no_upgrade_projection_without_a_seed_marker() -> None:
+    body = _client(_Store()).get(f"/api/persistent/threads/{THREAD_ID}").json()
+    assert body["workspace_upgrade"] is None
+
+
+@pytest.mark.parametrize("status", ["ended", "suspended"])
+def test_detail_has_no_upgrade_projection_once_the_session_stops(status) -> None:
+    row = {**_raw_row(), "status": status, "metadata": _upgrading_metadata()}
+    body = _client(_Store(), row).get(f"/api/persistent/threads/{THREAD_ID}").json()
+    assert body["workspace_upgrade"] is None
