@@ -2613,11 +2613,10 @@ class TestSetupTools:
         assert "set_skill_bundle" in loaded_names
         assert "set_automation_bundle" in loaded_names
 
-    def test_stateless_lane_never_offers_a_workspace_upgrade(self, monkeypatch):
-        """The upgrade accept is a socket verb the stateless lane cannot carry,
-        so a lite stateless session must not be handed the tool whose offer
-        card could never be accepted (the agent would wait on a human decision
-        that cannot arrive)."""
+    def test_stateless_lane_binds_the_upgrade_offer(self, monkeypatch):
+        """The stateless lane now carries the accept as a durable REST control
+        (C1); whether an offer is shown is the availability route's call, per
+        request."""
         monkeypatch.setenv("STATELESS_EXECUTOR", "1")
         session = _make_session(config=_make_config())
         session.workspace_manager = MagicMock()
@@ -2645,7 +2644,7 @@ class TestSetupTools:
 
         loaded_names = mock_load.call_args_list[0].args[0]
         assert "web_search" in loaded_names
-        assert "request_workspace_upgrade" not in loaded_names
+        assert "request_workspace_upgrade" in loaded_names
 
     def test_workflows_can_be_disabled(self):
         """Automations & Loops opt-out removes workflow tools."""

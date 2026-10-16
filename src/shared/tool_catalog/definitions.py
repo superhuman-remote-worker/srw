@@ -302,10 +302,11 @@ WORKSPACE_UPGRADE_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
         "module": "core.upgrade",
         "function": "request_workspace_upgrade",
         "description": (
-            "Ask to upgrade from the lite workspace to one with a shell (a "
-            "Session gets a VM, a Job a container). A human decides before "
-            "anything is provisioned; you only request, and you may not be "
-            "resumed afterwards."
+            "Ask the user to upgrade from the lite workspace to a workspace "
+            "with a shell (a Session gets a container, or a VM where only that "
+            "is offered, when SRW would accept the upgrade; a Job a "
+            "container). A human decides before anything is provisioned; you "
+            "only request, and you may not be resumed afterwards."
         ),
         "category": "core",
         "short_description": "Ask to upgrade to a workspace with a shell.",

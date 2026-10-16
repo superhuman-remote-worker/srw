@@ -25,6 +25,8 @@ On the pinned lane the in-process container swap is refused
 only after the orchestrator confirms a VM upgrade would be accepted
 (GET /api/agents/threads/{id}/upgrade-availability). Otherwise no offer is
 raised and the model is told why (stateless upgrade design, decision 1).
+On the stateless lane the orchestrator offers a container (C1); the tool
+offers the first available tier in the order container, VM.
 """
 
 import logging
@@ -44,8 +46,17 @@ logger = logging.getLogger(__name__)
 _CHECK_FAILED = "SRW couldn't check whether an upgrade is available right now."
 
 
-async def _vm_upgrade_unavailable_reason(context: ToolContext) -> Optional[str]:
-    """None when a VM upgrade would be accepted now; otherwise why not."""
+# The cheapest tier first: a container where SRW offers one (stateless
+# Sessions, C1), else a VM (pinned Sessions, and stateless once C2 lands).
+_OFFER_ORDER = (("container", "sandbox"), ("vm", "vm"))
+
+
+async def _upgrade_offer(context: ToolContext) -> tuple[Optional[str], Optional[str]]:
+    """``(target_tier, None)`` for the first tier SRW would accept now.
+
+    Otherwise ``(None, why)``: every refusal SRW gave, or ``_CHECK_FAILED``
+    when the check itself failed.
+    """
     # Imported at call time, not module level: the tests patch
     # agent.tools.orchestrator.jobs._get_client, which a module-level
     # `from` import would have already bound. (No import cycle exists.)
@@ -59,13 +70,18 @@ async def _vm_upgrade_unavailable_reason(context: ToolContext) -> Optional[str]:
         async with _get_client(user_id=context.user_id) as client:
             resp = await client.get(url, timeout=10)
             resp.raise_for_status()
-            vm = (resp.json() or {}).get("vm") or {}
+            payload = resp.json() or {}
     except Exception as exc:  # the offer is optional; never raise into the turn
         logger.warning("upgrade availability check failed: %s", exc)
-        return _CHECK_FAILED
-    if vm.get("available") is True:
-        return None
-    return str(vm.get("reason") or "SRW would refuse the upgrade.")
+        return None, _CHECK_FAILED
+    reasons = []
+    for key, tier in _OFFER_ORDER:
+        entry = payload.get(key) or {}
+        if entry.get("available") is True:
+            return tier, None
+        if entry.get("reason"):
+            reasons.append(str(entry["reason"]))
+    return None, " ".join(reasons) or "SRW would refuse the upgrade."
 
 
 def create_workspace_upgrade_tools(context: ToolContext) -> List[Any]:
@@ -77,12 +93,13 @@ def create_workspace_upgrade_tools(context: ToolContext) -> List[Any]:
 
     @tool
     async def request_workspace_upgrade(reason: str) -> str:
-        """Ask to upgrade from this lite workspace to one with a shell.
+        """Ask the user to upgrade this Session or Job to a workspace with a shell (a container or a VM).
 
         Call this when the task needs capabilities this workspace lacks — a
         shell, git, running code or builds, or browser control. In a Session
-        SRW offers a VM, and only when it would accept one; in a Job the
-        workspace is upgraded to a container.
+        SRW offers a container, or a VM where only that is offered, and only
+        when it would accept the upgrade; in a Job the workspace is upgraded
+        to a container.
 
         You are only REQUESTING. A human is shown your request and decides;
         if they approve, the workspace is provisioned and your existing files
@@ -122,7 +139,7 @@ def create_workspace_upgrade_tools(context: ToolContext) -> List[Any]:
                 "follow-up message to continue the task; check the newly available "
                 "tools then. Existing files carry over during the upgrade."
             )
-        unavailable = await _vm_upgrade_unavailable_reason(context)
+        tier, unavailable = await _upgrade_offer(context)
         if unavailable is _CHECK_FAILED:
             logger.info("request_workspace_upgrade not offered: check failed")
             return (
@@ -132,25 +149,28 @@ def create_workspace_upgrade_tools(context: ToolContext) -> List[Any]:
                 "a new Session with a Container workspace. Meanwhile continue "
                 "with the tools you have."
             )
-        if unavailable is not None:
+        if tier is None:
             logger.info("request_workspace_upgrade not offered: %s", unavailable)
             return (
                 f"No workspace upgrade is available for this Session: {unavailable} "
                 "Nothing was offered to the user. Tell them the task needs a "
-                "shell, and that they can start a new Session with a Container "
-                "workspace; meanwhile continue with the tools you have."
+                "shell, and that they can start a new Session with a container "
+                "or VM workspace; meanwhile continue with the tools you have."
             )
+        label = "VM" if tier == "vm" else "container"
         context.request_freeze(
             {
                 "freeze_type": "workspace_upgrade_required",
-                "target_tier": "vm",
+                "target_tier": tier,
                 "reason": reason or "The task needs a real workspace (shell/git).",
                 "timestamp": datetime.now(timezone.utc).isoformat(),
             }
         )
-        logger.info("request_workspace_upgrade requested: reason=%r", reason)
+        logger.info(
+            "request_workspace_upgrade requested: tier=%s reason=%r", tier, reason
+        )
         return (
-            "Recorded your request for a VM workspace — a human will see it "
+            f"Recorded your request for a {label} workspace — a human will see it "
             "and decide. The request has not started a workspace or added "
             "tools. Explain what it enables and continue useful preparation. "
             "After an approved upgrade completes, the user can send a "

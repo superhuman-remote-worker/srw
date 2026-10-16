@@ -97,3 +97,32 @@ async def test_worker_job_keeps_the_sandbox_freeze(monkeypatch):
     assert freeze["target_tier"] == "sandbox"
     assert freeze["reason"] == "need pytest"
     assert result.startswith("Recorded your request for a sandbox workspace")
+
+
+@pytest.mark.asyncio
+async def test_an_available_container_is_offered_first(monkeypatch):
+    client = _Client(
+        {
+            "container": {"available": True, "reason": None},
+            "vm": {"available": True, "reason": None},
+        }
+    )
+    tool, context = _tool(monkeypatch, client)
+    result = await tool.ainvoke({"reason": "need to run pytest"})
+    freeze = context.consume_freeze_request()
+    assert freeze["target_tier"] == "sandbox"
+    assert "container workspace" in result
+
+
+@pytest.mark.asyncio
+async def test_nothing_available_names_every_reason(monkeypatch):
+    client = _Client(
+        {
+            "container": {"available": False, "reason": "tracking is off."},
+            "vm": {"available": False, "reason": "VMs are off."},
+        }
+    )
+    tool, context = _tool(monkeypatch, client)
+    result = await tool.ainvoke({"reason": "need a shell"})
+    assert context.consume_freeze_request() is None
+    assert "tracking is off." in result and "VMs are off." in result

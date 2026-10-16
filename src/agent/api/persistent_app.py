@@ -129,6 +129,10 @@ from shared.thread_presence import (
     mark_stateless_natural_pause,
 )
 from shared.session_retirement import update_stateless_claim_status
+from shared.workspace_upgrade import (
+    WORKSPACE_UPGRADE_PAYLOAD_KEYS,
+    WORKSPACE_UPGRADE_VERB,
+)
 from agent.agent import UniversalAgent
 
 # Re-exported: tests/test_persistent_app.py and tests/test_session_wake_event_role.py
@@ -4096,6 +4100,10 @@ def _describe_control_request(request: Any) -> tuple[str, str, Optional[str]]:
         return "files.restored", "applied", None
     if request.verb == "compact" and _valid_compact_payload(request.payload):
         return "context.compacted", "applied", None
+    if request.verb == WORKSPACE_UPGRADE_VERB and _valid_workspace_upgrade_payload(
+        request.payload
+    ):
+        return "workspace_upgrade.complete", "applied", None
     return "control.rejected", "rejected", "unsupported_control"
 
 
@@ -4106,6 +4114,20 @@ def _valid_compact_payload(payload: Any) -> bool:
         and set(payload) <= {"focus", "boundary_message_id"}
         and all(isinstance(value, str) and value for value in payload.values())
     )
+
+
+# The agent-side name C2 consumes; the key set itself is shared.
+_UPGRADE_PAYLOAD_KEYS = WORKSPACE_UPGRADE_PAYLOAD_KEYS
+
+
+def _valid_workspace_upgrade_payload(payload: Any) -> bool:
+    """C1's container request: no tier (the next one) or ``sandbox``."""
+    if not isinstance(payload, dict) or not set(payload) <= _UPGRADE_PAYLOAD_KEYS:
+        return False
+    if payload.get("target_tier", "sandbox") != "sandbox":
+        return False
+    template = payload.get("template")
+    return template is None or (isinstance(template, str) and bool(template))
 
 
 async def _finalize_durable_control(
@@ -4517,6 +4539,15 @@ async def _drain_thread_controls(
                     error_code,
                     effect_params,
                 ) = await _apply_compact_control(request, lease_token=lease_token)
+            elif outcome == "applied" and request.verb == WORKSPACE_UPGRADE_VERB:
+                (
+                    event_kind,
+                    outcome,
+                    error_code,
+                    effect_params,
+                ) = await _apply_workspace_upgrade_control(
+                    request, lease_token=lease_token
+                )
             params: Dict[str, Any] = {
                 "request_id": str(request.id),
                 "client_request_id": str(request.client_request_id),
@@ -4531,6 +4562,7 @@ async def _drain_thread_controls(
             elif outcome == "applied" and request.verb in {
                 "workspace.undo",
                 "compact",
+                WORKSPACE_UPGRADE_VERB,
             }:
                 # The envelope above wins over any same-named effect key.
                 params = {**effect_params, **params}
@@ -9968,6 +10000,36 @@ async def _handle_compact(
         except Exception as e:
             logger.warning(f"Compaction failed: {e}")
             await _ws_send(ws, "error", {"message": f"Compaction failed: {e}"})
+
+
+async def _apply_workspace_upgrade_control(
+    request: Any, *, lease_token: Optional[int]
+) -> Tuple[str, str, Optional[str], Dict[str, Any]]:
+    """Receipt a stateless container upgrade whose copy this claim already made.
+
+    The executor attaches the new container and copies the old files before
+    this drain (turn_executor ``seed_upgraded_workspace``). A marker still
+    present means the copy didn't finish: leave the request pending.
+    """
+    from agent.api.workspace_upgrade_seed import take_seed_result
+
+    if lease_token is None:
+        # Admission keeps the verb off the pinned inbox (it has a socket verb).
+        return "control.rejected", "rejected", "unsupported_control", {}
+    if (
+        _session is None
+        or _session.postgres_conn is None
+        or _session_identity.thread_id is None
+    ):
+        raise ControlInboxBlocked(f"workspace upgrade lost its session: {request.id}")
+    thread_id = str(_session_identity.thread_id)
+    if await _session.postgres_conn.workspace_upgrade_seed_pending(thread_id):
+        raise ControlInboxBlocked(f"workspace upgrade seed still pending: {request.id}")
+    params: Dict[str, Any] = {"target_tier": "sandbox"}
+    seeded = take_seed_result(thread_id, lease_token)
+    if seeded is not None:
+        params["seeded_files"] = seeded
+    return "workspace_upgrade.complete", "applied", None, params
 
 
 async def _apply_compact_control(
