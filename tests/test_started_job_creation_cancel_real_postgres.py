@@ -25,26 +25,39 @@ pg_dsn = fixtures.pg_dsn
 _schema_applied = fixtures._schema_applied
 
 
-def _failed_exit17_before_ready(pod):
+def _exit_before_first_ready(pod, *, exit_code=17, reason="Error", phase="Failed"):
+    """The exact Pod schedules, runs its own process and stops before Ready."""
+
+    scheduled_at = datetime.now(timezone.utc)
     # Keep the fake's Kubernetes container declaration complete enough for
     # the production all-container proof and storage-binding checks.
     pod.spec.node_name = "test-worker"
+    pod.spec.restart_policy = "Never"
     pod.spec.containers = [SimpleNamespace(**item) for item in pod.spec.containers]
-    pod.status.phase = "Failed"
+    pod.status.phase = phase
+    pod.status.conditions = [
+        SimpleNamespace(
+            type="PodScheduled", status="True", last_transition_time=scheduled_at
+        ),
+        SimpleNamespace(
+            type="Ready", status="False", last_transition_time=scheduled_at
+        ),
+    ]
     (container,) = pod.status.container_statuses
-    container.container_id = "containerd://exit17-workspace"
+    container.container_id = "containerd://exited-workspace"
     container.ready = False
     container.started = False
     container.state = SimpleNamespace(
         waiting=None,
         running=None,
         terminated=SimpleNamespace(
-            exit_code=17,
-            reason="Error",
-            started_at=datetime.now(timezone.utc),
-            finished_at=datetime.now(timezone.utc),
+            exit_code=exit_code,
+            reason=reason,
+            started_at=scheduled_at,
+            finished_at=scheduled_at,
         ),
     )
+    return scheduled_at
 
 
 @pytest.mark.asyncio
@@ -154,7 +167,7 @@ async def test_cancelled_exit17_before_ready_reuses_exact_terminal_intent_and_re
         db, monkeypatch
     )
     pod = cluster.objects["pod"]
-    _failed_exit17_before_ready(pod)
+    _exit_before_first_ready(pod)
     reservation = await db.fetchrow(
         "SELECT id, claim_token, pod_uid, runtime_incarnation, phase FROM "
         "managed_repository_workspace_creation_reservations "
@@ -263,9 +276,7 @@ async def test_cancelled_succeeded_before_ready_reuses_exact_terminal_intent(
         db, monkeypatch
     )
     pod = cluster.objects["pod"]
-    _failed_exit17_before_ready(pod)
-    pod.status.phase = "Succeeded"
-    pod.status.container_statuses[0].state.terminated.exit_code = 0
+    _exit_before_first_ready(pod, exit_code=0, reason="Completed", phase="Succeeded")
 
     assert await db.cancel_job(str(job))
     intent_id = await db.fetchval(
@@ -552,7 +563,7 @@ async def test_cancelled_exit17_reuse_refuses_unsafe_authority(db, monkeypatch, 
         db, monkeypatch, kept_volume=unsafe == "kept-volume"
     )
     pod = cluster.objects["pod"]
-    _failed_exit17_before_ready(pod)
+    _exit_before_first_ready(pod)
     assert await db.cancel_job(str(job))
 
     if unsafe == "missing-status":

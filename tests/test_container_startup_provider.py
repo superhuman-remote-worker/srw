@@ -21,6 +21,7 @@ from orchestrator.services.container_provisioner import (
 from orchestrator.services.container_startup_config import (
     startup_stage_activation_enabled,
 )
+from orchestrator.services.workspace_lifecycle import WorkspaceOwner
 from tests.test_container_provisioner import (
     TestStrictStatelessWorkspaceCreation as Fixture,
     _StrictCreationDB,
@@ -101,13 +102,15 @@ class StageDB(_StrictCreationDB):
                 row["startup_first_ready_at"] = observation.ready_at
         elif isinstance(observation, StartupAttention):
             row.update(
-                startup_state="attention", startup_reason_code=observation.reason_code
+                startup_state="attention",
+                startup_reason_code=observation.reason_code,
+                startup_exit_code=observation.exit_code,
             )
         return True
 
 
-def pod(*, scheduled=None, ready=None, wrong_annotation=False):
-    result = Fixture._pod()
+def pod(*, scheduled=None, ready=None, wrong_annotation=False, owner_fixture=Fixture):
+    result = owner_fixture._pod()
     result.metadata.creation_timestamp = CREATED
     result.spec.node_name = "node8" if scheduled else None
     result.status.phase = "Running" if scheduled else "Pending"
@@ -146,6 +149,42 @@ def pod(*, scheduled=None, ready=None, wrong_annotation=False):
     return result
 
 
+def exited_pod(
+    owner_fixture=Fixture,
+    *,
+    exit_code=3,
+    reason="Error",
+    phase="Failed",
+    scheduled=None,
+    pod_reason=None,
+):
+    """A scheduled restartPolicy Never Pod whose workspace container ran and stopped."""
+
+    scheduled = scheduled or recent_schedule()
+    result = pod(scheduled=scheduled, owner_fixture=owner_fixture)
+    result.spec.restart_policy = "Never"
+    result.status.phase = phase
+    result.status.reason = pod_reason
+    result.status.conditions.append(
+        SimpleNamespace(
+            type="Ready",
+            status="False",
+            last_transition_time=scheduled,
+            reason="PodCompleted",
+        )
+    )
+    (workspace,) = result.status.container_statuses
+    workspace.ready = False
+    workspace.restart_count = 0
+    workspace.container_id = "containerd://exited-workspace"
+    workspace.state = SimpleNamespace(
+        waiting=None,
+        running=None,
+        terminated=SimpleNamespace(exit_code=exit_code, reason=reason),
+    )
+    return result
+
+
 def provider(db, observed_pod):
     provisioner = Fixture._provisioner(db)
     provisioner._core_api.read_namespaced_pod.return_value = observed_pod
@@ -160,13 +199,16 @@ def provider(db, observed_pod):
     return provisioner
 
 
-async def observe(provisioner, db, *, timeout=120):
+async def observe(provisioner, db, owner_fixture=Fixture, *, timeout=120):
+    owner = owner_fixture._owner()
     return await provisioner._wait_for_ready(
-        Fixture._owner().pod_name,
+        owner.pod_name,
         timeout=timeout,
-        expected_owner=Fixture._owner(),
+        expected_owner=owner,
         expected_runtime_incarnation=Fixture.RUNTIME,
-        expected_creation_generation=Fixture.GENERATION,
+        expected_creation_generation=(
+            Fixture.GENERATION if owner.kind == "session" else None
+        ),
         expected_network_tier="internet-only",
         expected_pvc_name=None,
         expected_seed_configmap=None,
@@ -248,18 +290,7 @@ async def test_v1_observer_never_fails_an_exited_container_at_once(monkeypatch, 
     db = StageDB()
     if gate is None:
         db._creation_reservation["startup_protocol_version"] = 1
-    exited = pod(scheduled=recent_schedule())
-    exited.spec.restart_policy = "Never"
-    exited.status.phase = "Succeeded"
-    (workspace,) = exited.status.container_statuses
-    workspace.ready = False
-    workspace.restart_count = 0
-    workspace.container_id = "containerd://exited-workspace"
-    workspace.state = SimpleNamespace(
-        waiting=None,
-        running=None,
-        terminated=SimpleNamespace(exit_code=0, reason="Completed"),
-    )
+    exited = exited_pod(exit_code=0, reason="Completed", phase="Succeeded")
     # The exact evidence the legacy wait would fail on.
     assert _pod_is_terminal_before_first_ready(exited)
     p = provider(db, exited)
@@ -443,3 +474,123 @@ async def test_conflicting_ready_and_pull_failure_cannot_write_attention(monkeyp
     assert not any(
         isinstance(event, StartupAttention) for event, _, _ in db.observations
     )
+
+
+JOB_ID = "77777777-8888-4999-8aaa-bbbbbbbbbbbb"
+
+
+class JobFixture(Fixture):
+    """The same exact-Pod fixture, owned by a Job."""
+
+    @classmethod
+    def _owner(cls):
+        return WorkspaceOwner.job(JOB_ID)
+
+
+class JobStageDB(StageDB):
+    def __init__(self):
+        super().__init__()
+        self._creation_reservation.update(owner_id=JOB_ID, owner_kind="job")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("exit_code", "reason", "phase"),
+    [(3, "Error", "Failed"), (0, "Completed", "Succeeded")],
+    ids=["exit-3", "exit-0"],
+)
+async def test_job_container_exit_records_container_exited_on_first_tick(
+    monkeypatch, exit_code, reason, phase
+):
+    monkeypatch.setenv("CONTAINER_STARTUP_STAGE_AUTHORITY_ENABLED", "true")
+    ssh = AsyncMock(return_value=(True, 1, None))
+    monkeypatch.setattr(
+        "orchestrator.services.container_provisioner.wait_for_agent_ssh", ssh
+    )
+    db = JobStageDB()
+    p = provider(
+        db, exited_pod(JobFixture, exit_code=exit_code, reason=reason, phase=phase)
+    )
+
+    assert await observe(p, db, JobFixture) is None
+
+    assert [type(event) for event, _, _ in db.observations] == [
+        BoundPodObserved,
+        ScheduledAt,
+        StartupAttention,
+    ]
+    assert db.observations[-1][0] == StartupAttention(
+        "container_exited", exit_code=exit_code
+    )
+    assert db._creation_reservation["startup_exit_code"] == exit_code
+    ssh.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_exit_seen_after_the_deadline_still_reports_container_exited(
+    monkeypatch,
+):
+    # An orchestrator that was down past the readiness budget still names the
+    # exit, the more specific positive evidence.
+    monkeypatch.setenv("CONTAINER_STARTUP_STAGE_AUTHORITY_ENABLED", "true")
+    db = JobStageDB()
+    late = datetime.now(timezone.utc) - timedelta(seconds=200)
+    p = provider(db, exited_pod(JobFixture, scheduled=late))
+
+    assert await observe(p, db, JobFixture) is None
+
+    assert db.observations[-1][0] == StartupAttention("container_exited", exit_code=3)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("reason", "pod_reason"),
+    [("OOMKilled", None), ("ContainerStatusUnknown", None), ("Error", "Evicted")],
+    ids=["oom-killed", "status-unknown", "evicted"],
+)
+async def test_cluster_stopped_job_container_keeps_the_deadline_path(
+    monkeypatch, reason, pod_reason
+):
+    monkeypatch.setenv("CONTAINER_STARTUP_STAGE_AUTHORITY_ENABLED", "true")
+    stopped = dict(exit_code=137, reason=reason, pod_reason=pod_reason)
+
+    db = JobStageDB()
+    p = provider(db, exited_pod(JobFixture, **stopped))
+    assert await observe(p, db, JobFixture) is None
+    assert db._creation_reservation["startup_state"] == "starting"
+    assert not any(
+        isinstance(event, StartupAttention) for event, _, _ in db.observations
+    )
+
+    db = JobStageDB()
+    late = datetime.now(timezone.utc) - timedelta(seconds=200)
+    p = provider(db, exited_pod(JobFixture, scheduled=late, **stopped))
+    assert await observe(p, db, JobFixture) is None
+    assert db.observations[-1][0] == StartupAttention("readiness_deadline")
+
+
+@pytest.mark.asyncio
+async def test_job_receipt_with_first_ready_never_records_container_exited(
+    monkeypatch,
+):
+    monkeypatch.setenv("CONTAINER_STARTUP_STAGE_AUTHORITY_ENABLED", "true")
+    db = JobStageDB()
+    exited = exited_pod(JobFixture)
+    scheduled = exited.status.conditions[0].last_transition_time
+    db._creation_reservation.update(
+        startup_protocol_version=1,
+        startup_state="starting",
+        scheduled_at=scheduled,
+        startup_first_ready_at=scheduled + timedelta(seconds=1),
+        ready_budget_seconds=120,
+        pull_budget_seconds=None,
+        ssh_budget_seconds=30,
+    )
+    p = provider(db, exited)
+
+    assert await observe(p, db, JobFixture) is None
+
+    assert not any(
+        isinstance(event, StartupAttention) for event, _, _ in db.observations
+    )
+    assert db._creation_reservation["startup_state"] == "starting"

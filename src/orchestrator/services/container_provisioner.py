@@ -17392,6 +17392,21 @@ class ContainerProvisioner:
                 return None
 
         if (
+            owner.kind == "job"
+            and current.get("startup_first_ready_at") is None
+            and current.get("scheduled_at") is not None
+        ):
+            # Positive physical evidence, like an invalid image: this exact
+            # restartPolicy Never Pod's own process stopped before its first
+            # Ready, so it can never become Ready. A cluster stop keeps the
+            # deadline path, and so do Sessions (Jobs only, owner decision
+            # 2026-10-06).
+            exit_code = _image_exit_code_before_first_ready(pod)
+            if exit_code is not None:
+                await record(StartupAttention("container_exited", exit_code=exit_code))
+                return None
+
+        if (
             ready_condition is not None
             and getattr(ready_condition, "status", None) == "True"
         ):

@@ -26,6 +26,9 @@ from orchestrator.services import container_provisioner as provider_module
 from orchestrator.services.container_provisioner import WorkspaceRuntimeAuthorityError
 from tests import test_container_startup_stage_real_postgres as stage
 from tests import test_workspace_pull_failure_real_postgres as fixtures
+from tests.test_started_job_creation_cancel_real_postgres import (
+    _exit_before_first_ready,
+)
 
 
 db = fixtures.db
@@ -366,3 +369,65 @@ async def test_expired_claim_rotates_without_new_pod_or_new_stage_clock(
     ) == (120, 300, 30)
     assert rotated["settled_at"] is None
     assert len(cluster.objects) == 3
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("exit_code", "reason", "phase"),
+    [(3, "Error", "Failed"), (0, "Completed", "Succeeded")],
+    ids=["exit-3", "exit-0"],
+)
+async def test_exited_job_pod_reaches_container_exited_attention_in_one_pass(
+    db, monkeypatch, exit_code, reason, phase
+):
+    monkeypatch.setenv("CONTAINER_STARTUP_STAGE_AUTHORITY_ENABLED", "true")
+    job_id = await fixtures._job(db)
+    cluster = fixtures.NeverPullingCluster()
+    provisioner = fixtures._provisioner(monkeypatch, db, cluster)
+    owner = WorkspaceOwner.job(str(job_id))
+    assert (
+        await ensure_workspace(
+            owner,
+            provisioner=provisioner,
+            suspension=SimpleNamespace(),
+            current_status=None,
+        )
+    ).outcome is EnsureOutcome.PENDING
+    pod = cluster.objects["pod"]
+    scheduled_at = _exit_before_first_ready(
+        pod, exit_code=exit_code, reason=reason, phase=phase
+    )
+    receipt = await provisioner.get_current_workspace_creation_result(
+        owner, operation_kind="create"
+    )
+    gate = (
+        str(job_id),
+        str(receipt["id"]),
+        int(receipt["claim_token"]),
+        pod.metadata.uid,
+    )
+
+    assert await provisioner.continue_job_workspace_creation(*gate)
+
+    row = await stage._reservation(db, receipt)
+    assert (
+        row["startup_stage"],
+        row["startup_state"],
+        row["startup_reason_code"],
+        row["startup_exit_code"],
+    ) == ("readiness", "attention", "container_exited", exit_code)
+    assert row["scheduled_at"] == scheduled_at
+    assert row["startup_first_ready_at"] is None
+    # Within the tick, long before the frozen readiness boundary.
+    assert row["startup_attention_at"] < scheduled_at + timedelta(
+        seconds=row["ready_budget_seconds"]
+    )
+    assert (row["phase"], row["settled_at"]) == ("runtime_bound", None)
+    assert (await fixtures._workspace(db, job_id))["status"] == "creating"
+    assert str((await db.get_job(str(job_id)))["status"]) == "created"
+    # Sticky: the continuation scan drops it, and a later pass changes nothing.
+    page = await db.list_current_job_creation_candidates(limit=32)
+    assert all(candidate["job_id"] != job_id for candidate in page["candidates"])
+    assert not await provisioner.continue_job_workspace_creation(*gate)
+    assert (await stage._reservation(db, receipt))["startup_exit_code"] == exit_code
+    assert set(cluster.objects) == {"pvc", "service", "pod"}
