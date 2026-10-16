@@ -213,6 +213,30 @@ class TestSeedFromLiteWorkspace:
         assert not dst.exists("big.bin")
         assert "'big.bin'" in caplog.text and "11 bytes" in caplog.text
 
+    def test_the_files_skipped_for_size_are_named(self, tmp_path, monkeypatch):
+        store = InMemoryObjectStore()
+        old = VirtualWorkspaceBackend(store, prefix="threads/t/")
+        old.write_file("plan.md", "p")
+        old.write_file("a/big.bin", b"x" * 11)
+        monkeypatch.setattr(
+            "shared.runtime.core.backends.rclone.object_store_from_spec",
+            lambda _spec: store,
+        )
+        monkeypatch.setattr(seed_module, "VIRTUAL_UPLOAD_MAX_FILE_BYTES", 10)
+        oversized: list[str] = []
+
+        n = seed_from_lite_workspace(
+            {
+                "backend": "virtual",
+                "mounts": [{"rclone_spec": {"type": "memory"}, "prefix": "threads/t/"}],
+            },
+            owner_id="t",
+            destination=FilesystemTestBackend(tmp_path),
+            oversized=oversized,
+        )
+
+        assert (n, oversized) == (1, ["a/big.bin"])
+
     def test_the_ceiling_matches_the_virtual_upload_cap(self):
         assert seed_module.VIRTUAL_UPLOAD_MAX_FILE_BYTES == 100 * 1024 * 1024
 

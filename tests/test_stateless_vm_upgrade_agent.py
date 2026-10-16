@@ -391,7 +391,7 @@ def copy(monkeypatch):
     these two names in its own module."""
     calls = []
 
-    def fake_seed(workspace, *, owner_id, destination, exclude):
+    def fake_seed(workspace, *, owner_id, destination, exclude, oversized=None):
         calls.append(
             (
                 workspace,
@@ -430,6 +430,30 @@ async def test_recovery_copies_commits_records_then_marks_seeded(tmp_path, copy)
     assert client.mark_workspace_upgrade_seeded.await_args.kwargs == {
         "provision_generation": PROVISION,
         "control_request_id": str(REQUEST_ID),
+    }
+
+
+@pytest.mark.asyncio
+async def test_recovery_names_the_files_it_skipped(tmp_path, monkeypatch, copy):
+    """Final review Important 3: a file over the upload ceiling stays in the
+    old prefix, and the recovery's ``.complete`` names it."""
+
+    def fake_seed(workspace, *, owner_id, destination, exclude, oversized=None):
+        oversized.extend(f"big-{n:02d}.bin" for n in range(25))
+        return 4
+
+    monkeypatch.setattr(
+        "agent.api.workspace_upgrade_seed.seed_from_lite_workspace", fake_seed
+    )
+    out = await handoff.recover_vm_upgrade_seed(
+        session=_vm_session(tmp_path, _marker_metadata()),
+        client=_seed_client([]),
+        thread_id=str(THREAD_ID),
+    )
+    assert out == {
+        "control_request_id": str(REQUEST_ID),
+        "seeded_files": 4,
+        "skipped_files": [f"big-{n:02d}.bin" for n in range(20)],
     }
 
 
@@ -900,6 +924,33 @@ async def test_a_vm_attach_completes_the_request_its_recovery_copied(
 
 
 @pytest.mark.asyncio
+async def test_a_vm_attach_completion_names_the_files_its_recovery_skipped(
+    pinned, monkeypatch
+):
+    pinned.session.workspace_backend_tier = "vm"
+    monkeypatch.setattr(
+        pa,
+        "_recovered_vm_upgrade",
+        {
+            "control_request_id": str(REQUEST_ID),
+            "seeded_files": 2,
+            "skipped_files": ["big.bin"],
+        },
+    )
+    order = await _drain(_request())
+    assert order[0] == (
+        "journal",
+        "workspace_upgrade.complete",
+        {
+            **ENVELOPE,
+            "target_tier": "vm",
+            "seeded_files": 2,
+            "skipped_files": ["big.bin"],
+        },
+    )
+
+
+@pytest.mark.asyncio
 async def test_a_vm_attach_without_a_marker_reports_the_interruption(pinned):
     pinned.session.workspace_backend_tier = "vm"
     order = await _drain(_request())
@@ -1084,6 +1135,37 @@ def test_an_interruption_the_drain_did_not_receipt_is_announced_once(monkeypatch
                 ),
                 "error_code": "upgrade_interrupted",
                 "request_id": str(REQUEST_ID),
+            },
+        )
+    ]
+
+
+def test_an_announced_recovery_names_the_files_it_skipped(monkeypatch):
+    sent: list = []
+    monkeypatch.setattr(
+        pa, "_broadcast", lambda method, params: sent.append((method, params))
+    )
+    monkeypatch.setattr(pa._session_identity, "_thread_id", str(THREAD_ID))
+    monkeypatch.setattr(
+        pa,
+        "_recovered_vm_upgrade",
+        {
+            "control_request_id": str(REQUEST_ID),
+            "seeded_files": 5,
+            "skipped_files": ["big.bin"],
+        },
+    )
+    monkeypatch.setattr(pa, "_interrupted_vm_upgrade", None)
+    pa._announce_recovered_vm_upgrade()
+    assert sent == [
+        (
+            "workspace_upgrade.complete",
+            {
+                "thread_id": str(THREAD_ID),
+                "target_tier": "vm",
+                "seeded_files": 5,
+                "request_id": str(REQUEST_ID),
+                "skipped_files": ["big.bin"],
             },
         )
     ]

@@ -30,6 +30,10 @@ logger = logging.getLogger(__name__)
 # with a warning instead of failing every retry; the old prefix keeps it.
 VIRTUAL_UPLOAD_MAX_FILE_BYTES = 100 * 1024 * 1024
 
+# How many skipped file names a workspace upgrade's ``.complete`` names
+# (``skipped_files``); the log names every one.
+SKIPPED_FILES_REPORTED = 20
+
 # --------------------------------------------------------------------------
 # Seeded-content sentinel
 #
@@ -152,6 +156,7 @@ def seed_workspace(
     *,
     exclude: "Callable[[str], bool] | None" = None,
     max_file_bytes: int | None = None,
+    oversized: "List[str] | None" = None,
 ) -> int:
     """Copy every file from ``src`` into ``dst``, preserving relative paths.
 
@@ -174,6 +179,8 @@ def seed_workspace(
         max_file_bytes: When set, a file the source refuses to read because it
             is larger than this is skipped with a warning (and not verified)
             instead of failing the copy. Any other read error still raises.
+        oversized: When given, each file skipped for its size is appended
+            to it (an unreadable entry, such as a mount point, is not).
 
     Returns:
         The number of files written.
@@ -213,6 +220,8 @@ def seed_workspace(
                 max_file_bytes,
             )
             skipped.append(rel)
+            if oversized is not None:
+                oversized.append(rel)
             continue
         parent = posixpath.dirname(rel)
         if parent:
@@ -253,19 +262,42 @@ def _size_over_limit(
     return size if size > limit else None
 
 
+def upgrade_seed_source(backend: Any) -> Any:
+    """The source a workspace upgrade's hot-swap seed reads (C2).
+
+    A live ``virtual`` backend reads at most ``DEFAULT_MAX_READ_BYTES`` (50
+    MiB) a file, while uploads into it allow
+    :data:`VIRTUAL_UPLOAD_MAX_FILE_BYTES`: the seed reads through a sibling
+    over the same store and prefix with the upload ceiling, so every file a
+    user could upload is copied. Any other backend is returned as it is.
+    """
+    from agent.core.backends.virtual import VirtualWorkspaceBackend
+
+    real = unwrap_backend(backend)
+    if isinstance(real, VirtualWorkspaceBackend):
+        return real.with_max_read_bytes(VIRTUAL_UPLOAD_MAX_FILE_BYTES)
+    return backend
+
+
+def reported_skipped_files(names: "List[str]") -> "List[str]":
+    """The skipped file names a ``.complete`` frame or receipt carries."""
+    return list(names[:SKIPPED_FILES_REPORTED])
+
+
 def seed_from_lite_workspace(
     workspace: Mapping[str, Any],
     *,
     owner_id: str,
     destination: "WorkspaceBackend",
     exclude: "Callable[[str], bool] | None" = None,
+    oversized: "List[str] | None" = None,
 ) -> int:
     """Copy an old lite workspace (``virtual`` mounts or ``none``) into ``destination``.
 
     Shared by the stateless container upgrade (C1) and the VM upgrade's
     recovery copy (C2). ``none`` has nothing durable to copy. A file over
-    :data:`VIRTUAL_UPLOAD_MAX_FILE_BYTES` is skipped with a warning; the old
-    prefix keeps it.
+    :data:`VIRTUAL_UPLOAD_MAX_FILE_BYTES` is skipped with a warning (and
+    appended to ``oversized`` when given); the old prefix keeps it.
     """
     from types import SimpleNamespace
 
@@ -286,4 +318,5 @@ def seed_from_lite_workspace(
         destination,
         exclude=exclude,
         max_file_bytes=VIRTUAL_UPLOAD_MAX_FILE_BYTES,
+        oversized=oversized,
     )

@@ -15,7 +15,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from agent.api import persistent_app as pa
-from agent.core.backends.virtual import DEFAULT_MAX_READ_BYTES, VirtualWorkspaceBackend
+from agent.core.backends.virtual import VirtualWorkspaceBackend
 from shared.runtime.core.backends.object_store import InMemoryObjectStore
 from tests._fs_backend import FilesystemTestBackend
 
@@ -274,28 +274,48 @@ async def test_cancelling_a_blocked_websocket_upgrade_releases_the_single_flight
     assert pa._workspace_upgrade_in_flight is False
 
 
-@pytest.mark.asyncio
-async def test_a_virtual_file_over_the_read_ceiling_is_skipped_and_the_upgrade_completes(
-    tmp_path, caplog
-):
-    # The live virtual backend refuses to read an object over its ceiling. The
-    # hot swap skips that one file with a warning (the old prefix keeps it)
-    # instead of failing every VM upgrade after the VM is Ready (C2).
-    src = VirtualWorkspaceBackend(InMemoryObjectStore(), prefix="threads/tid/")
-    src.write_file("plan.md", "p")
-    src.write_file("big.bin", b"x" * (DEFAULT_MAX_READ_BYTES + 1))
+def _upgrade_with_real_seed(tmp_path, src):
+    """A WebSocket VM upgrade whose seed really copies ``src`` (wrapped in the
+    workspace's virtual overlay, like a live session) into ``tmp_path``."""
+    from agent.core.backends.overlay import VirtualOverlayBackend
+
     dst = FilesystemTestBackend(tmp_path)
     remote_module = MagicMock()
     remote_module.RemoteBackend.return_value = dst
-
     ws, sess, client = AsyncMock(), _session(), _client()
-    sess.workspace_manager.backend = src
+    sess.workspace_manager.backend = VirtualOverlayBackend(src)
     p = _patches(
         sess,
         client,
         vm_cfg={"ssh_host": "100.64.0.9", "ssh_port": 22},
         remote_module=remote_module,
     )
+    return ws, sess, client, dst, p
+
+
+@pytest.mark.asyncio
+async def test_the_hot_swap_reads_up_to_the_upload_ceiling_and_reports_what_it_skips(
+    tmp_path, monkeypatch, caplog
+):
+    """Final review Important 3: the live virtual backend reads at most 50 MiB
+    a file while uploads allow 100 MiB. The seed reads through a source built
+    with the upload ceiling, so a file between the two is copied; a file over
+    the upload ceiling is skipped (the old prefix keeps it) and named in the
+    ``.complete`` frame. Both ceilings are shrunk here; the live one is the
+    backend's own ``max_read_bytes``."""
+    monkeypatch.setattr(
+        "agent.core.backends.seed.VIRTUAL_UPLOAD_MAX_FILE_BYTES", 64, raising=True
+    )
+    src = VirtualWorkspaceBackend(
+        InMemoryObjectStore(), prefix="threads/tid/", max_read_bytes=16
+    )
+    src.write_file("plan.md", "p")
+    src.write_file("mid.bin", b"m" * 32)  # over the live ceiling, under uploads
+    src.write_file("big.bin", b"x" * 100)  # over the upload ceiling
+    with pytest.raises(ValueError):
+        src.read_file("mid.bin", binary=True)  # the live backend refuses it
+
+    ws, sess, client, dst, p = _upgrade_with_real_seed(tmp_path, src)
     # p[5] (the seed_workspace stub) is left out: the real copy runs.
     with (
         p[0],
@@ -311,14 +331,38 @@ async def test_a_virtual_file_over_the_read_ceiling_is_skipped_and_the_upgrade_c
         ("workspace_upgrade.started", {"thread_id": "tid", "target_tier": "vm"}),
         (
             "workspace_upgrade.complete",
-            {"thread_id": "tid", "target_tier": "vm", "seeded_files": 1},
+            {
+                "thread_id": "tid",
+                "target_tier": "vm",
+                "seeded_files": 2,
+                "skipped_files": ["big.bin"],
+            },
         ),
     ]
     assert dst.read_file("plan.md") == "p"
+    assert dst.read_file("mid.bin", binary=True) == b"m" * 32
     assert not dst.exists("big.bin")
     assert "'big.bin'" in caplog.text and "copy limit" in caplog.text
     sess.swap_backend.assert_called_once_with(dst)
     client.abort_thread_vm_upgrade.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_the_skipped_files_the_frame_names_are_capped(tmp_path, monkeypatch):
+    monkeypatch.setattr("agent.core.backends.seed.VIRTUAL_UPLOAD_MAX_FILE_BYTES", 4)
+    src = VirtualWorkspaceBackend(InMemoryObjectStore(), prefix="threads/tid/")
+    names = [f"big-{n:02d}.bin" for n in range(25)]
+    for name in names:
+        src.write_file(name, b"x" * 8)
+
+    ws, _sess, _client_, _dst, p = _upgrade_with_real_seed(tmp_path, src)
+    with p[0], p[1], p[2], p[3], p[4]:
+        await pa._handle_workspace_upgrade(ws, target_tier="vm")
+
+    complete = _frames(ws)[-1]
+    assert complete[0] == "workspace_upgrade.complete"
+    assert complete[1]["seeded_files"] == 0
+    assert complete[1]["skipped_files"] == names[:20]
 
 
 # --- a WebSocket VM upgrade over a pending lane-switch marker (final review) --

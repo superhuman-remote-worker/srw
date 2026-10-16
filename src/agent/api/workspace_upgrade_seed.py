@@ -87,13 +87,15 @@ async def copy_lite_workspace_and_commit(
     *,
     thread_id: str,
     exclude: Callable[[str], bool],
+    oversized: Optional[list[str]] = None,
 ) -> int:
     """Copy an old lite workspace into the attached shell workspace; commit it.
 
     Shared by C1's claimant (``seed_upgraded_workspace``) and C2's VM recovery
     copy (``vm_upgrade_handoff.recover_vm_upgrade_seed``); each caller passes
     the paths it leaves out (``exclude``, workspace-relative) and then records
-    its own marker. The copy is committed in the workspace Git, so ``/undo`` of
+    its own marker. ``oversized``, when given, collects the files skipped for
+    their size. The copy is committed in the workspace Git, so ``/undo`` of
     the first turn on the new workspace keeps the carried files, and that
     commit is recorded for the current transcript position. Raises
     ``WorkspaceUpgradeSeedError`` when the workspace isn't a shell one or the
@@ -109,6 +111,7 @@ async def copy_lite_workspace_and_commit(
         owner_id=str(thread_id),
         destination=unwrap_backend(backend),
         exclude=exclude,
+        oversized=oversized,
     )
     git = getattr(manager, "git_manager", None)
     if git is not None and git.is_active:

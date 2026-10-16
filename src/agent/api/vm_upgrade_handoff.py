@@ -35,6 +35,7 @@ from agent.api.workspace_upgrade_seed import (
     WorkspaceUpgradeSeedError,
     copy_lite_workspace_and_commit,
 )
+from agent.core.backends.seed import reported_skipped_files
 from shared.workspace_upgrade import (
     VM_UPGRADE_SEED_PENDING,
     VM_UPGRADE_SEED_SEEDED,
@@ -271,7 +272,8 @@ async def recover_vm_upgrade_seed(
     Runs at owner start on a VM attach, before the first drain and before the
     Session is ready, so no turn can have written to the VM yet: the copy
     can't overwrite newer VM files. Returns ``{"control_request_id",
-    "seeded_files"}`` when it ran, ``{"control_request_id", "interrupted":
+    "seeded_files"}`` (plus ``skipped_files`` when a file was over the upload
+    ceiling) when it ran, ``{"control_request_id", "interrupted":
     True}`` when a permanent refusal (``PERMANENT_SEED_REFUSALS``) ended it,
     None when nothing is owed. Any other failure raises before the marker is
     recorded, so a later attach copies again.
@@ -291,6 +293,7 @@ async def recover_vm_upgrade_seed(
         raise VmUpgradeRecoveryError("the VM workspace is not attached")
     control_request_id = marker["control_request_id"]
     files = 0
+    oversized: list[str] = []
     if marker["source"] is not None:
         try:
             spec = await call_with_route_retry(
@@ -327,6 +330,7 @@ async def recover_vm_upgrade_seed(
                 workspace,
                 thread_id=str(thread_id),
                 exclude=lambda rel: in_cloud_root(rel, targets),
+                oversized=oversized,
             )
         except WorkspaceUpgradeSeedError as exc:
             raise VmUpgradeRecoveryError(str(exc)) from exc
@@ -338,12 +342,20 @@ async def recover_vm_upgrade_seed(
         )
     )
     logger.info(
-        "VM upgrade recovery copy: thread=%s request=%s files=%d",
+        "VM upgrade recovery copy: thread=%s request=%s files=%d skipped=%d",
         thread_id,
         control_request_id,
         files,
+        len(oversized),
     )
-    return {"control_request_id": control_request_id, "seeded_files": int(files)}
+    result: dict[str, Any] = {
+        "control_request_id": control_request_id,
+        "seeded_files": int(files),
+    }
+    if oversized:
+        # Over the upload ceiling: the old prefix keeps them (Important 3).
+        result["skipped_files"] = reported_skipped_files(oversized)
+    return result
 
 
 __all__ = [

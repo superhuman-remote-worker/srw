@@ -533,6 +533,20 @@ class VirtualWorkspaceBackend(WorkspaceBackend):
     # Lifecycle
     # =========================================================================
 
+    def with_max_read_bytes(self, max_read_bytes: int) -> "VirtualWorkspaceBackend":
+        """A reader over the same store and prefix with another read ceiling.
+
+        Shares the (already connected) store: never ``disconnect`` it, that
+        would close the live workspace's transport. The workspace upgrade's
+        seed reads through one with the upload ceiling (C2).
+        """
+        return VirtualWorkspaceBackend(
+            self._store,
+            self._prefix,
+            max_read_bytes=max_read_bytes,
+            search_file_bytes=self._search_file_bytes,
+        )
+
     def connect(self) -> None:
         self._store.connect()
         self._connected = True

@@ -10346,6 +10346,8 @@ async def _apply_vm_workspace_upgrade_control(
             request.id
         ):
             params["seeded_files"] = int(recovered["seeded_files"])
+            if recovered.get("skipped_files"):
+                params["skipped_files"] = list(recovered["skipped_files"])
             _recovered_vm_upgrade = None
         return "workspace_upgrade.complete", "applied", None, params, None
     if row != ROW_REQUEST:
@@ -10449,15 +10451,15 @@ def _announce_recovered_vm_upgrade() -> None:
         )
     if recovered is None:
         return
-    _broadcast(
-        "workspace_upgrade.complete",
-        {
-            "thread_id": str(_session_identity.thread_id),
-            "target_tier": "vm",
-            "seeded_files": int(recovered["seeded_files"]),
-            "request_id": recovered["control_request_id"],
-        },
-    )
+    complete: Dict[str, Any] = {
+        "thread_id": str(_session_identity.thread_id),
+        "target_tier": "vm",
+        "seeded_files": int(recovered["seeded_files"]),
+        "request_id": recovered["control_request_id"],
+    }
+    if recovered.get("skipped_files"):
+        complete["skipped_files"] = list(recovered["skipped_files"])
+    _broadcast("workspace_upgrade.complete", complete)
 
 
 async def _apply_compact_control(
@@ -12068,20 +12070,23 @@ async def _run_workspace_upgrade_swap(
         ):
             # 5. Seed the new workspace from the live virtual prefix (S3a).
             #    Pure in-process copy (the agent holds the object-store creds).
-            #    Run off the event loop — SFTP writes are blocking. A file over
-            #    the live virtual backend's read ceiling is skipped with a
-            #    warning (the old prefix keeps it) instead of failing every
-            #    upgrade after the VM is Ready (C2).
+            #    Run off the event loop — SFTP writes are blocking. A virtual
+            #    source is read with the upload ceiling, not the live 50 MiB
+            #    one, so every file a user could upload is copied; a file over
+            #    it is skipped with a warning (the old prefix keeps it) and
+            #    named in ``.complete`` instead of failing every upgrade after
+            #    the VM is Ready (C2).
             seeded = 0
+            oversized: list[str] = []
             if src_backend is not None:
-                from agent.core.backends.seed import seed_workspace
-                from agent.core.backends.virtual import DEFAULT_MAX_READ_BYTES
+                from agent.core.backends import seed as _seed
 
                 seeded = await asyncio.to_thread(
-                    seed_workspace,
-                    src_backend,
+                    _seed.seed_workspace,
+                    _seed.upgrade_seed_source(src_backend),
                     new_backend,
-                    max_file_bytes=DEFAULT_MAX_READ_BYTES,
+                    max_file_bytes=_seed.VIRTUAL_UPLOAD_MAX_FILE_BYTES,
+                    oversized=oversized,
                 )
                 logger.info(
                     f"Seeded {seeded} file(s) into upgraded workspace for {_session_identity.thread_id}"
@@ -12165,14 +12170,16 @@ async def _run_workspace_upgrade_swap(
         except Exception as e:
             logger.warning(f"Persisting upgraded tier failed (non-fatal): {e}")
 
-        await emit(
-            "workspace_upgrade.complete",
-            {
-                "thread_id": _session_identity.thread_id,
-                "target_tier": backend_tier,
-                "seeded_files": seeded,
-            },
-        )
+        complete: Dict[str, Any] = {
+            "thread_id": _session_identity.thread_id,
+            "target_tier": backend_tier,
+            "seeded_files": seeded,
+        }
+        if oversized:
+            from agent.core.backends.seed import reported_skipped_files
+
+            complete["skipped_files"] = reported_skipped_files(oversized)
+        await emit("workspace_upgrade.complete", complete)
         logger.info(
             f"Workspace upgrade ({backend_tier}) complete for thread {_session_identity.thread_id}"
         )
