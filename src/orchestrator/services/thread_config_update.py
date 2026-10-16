@@ -1030,11 +1030,14 @@ async def agent_upgrade_thread_to_vm(
     *,
     dependencies: ThreadConfigUpdateDependencies,
     template_name: str | None = None,
+    control_request_id: str | None = None,
 ) -> dict[str, Any]:
     """Body of ``POST /api/agents/threads/{thread_id}/upgrade-to-vm``.
 
     The VM provisions ``template_name``, else the defaults chain's VM template,
-    read as the Session's owner (Slice A2b).
+    read as the Session's owner (Slice A2b). ``control_request_id`` names the
+    stateless lane switch's request (C2); the record then carries the durable
+    seed marker, and every other call records ``upgrade_seed: null``.
     """
     await dependencies.require_internal(request)
     vm_provisioner = dependencies.vm_provisioner
@@ -1102,6 +1105,21 @@ async def agent_upgrade_thread_to_vm(
         # A named template edited to another tier since it was looked up.
         if mode != "vm":
             raise HTTPException(409, CONTAINER_UPGRADE_UNAVAILABLE)
+        from orchestrator.services.vm_upgrade_seed import vm_upgrade_seed_marker
+        from shared.workspace_upgrade import VM_UPGRADE_SEED_KEY
+
+        # C2 (D4 (a)): the seed marker rides the same pre-CAS merge as the
+        # template record, so the provision CAS sees it, and a later
+        # WebSocket retry (no request id) overwrites a stale one with null.
+        upgrade = {
+            **upgrade,
+            VM_UPGRADE_SEED_KEY: await vm_upgrade_seed_marker(
+                dependencies.store,
+                thread,
+                metadata,
+                control_request_id=control_request_id,
+            ),
+        }
         # The provision CAS compares metadata.vm exactly: expect the record.
         vm_ctx = {**(vm_ctx or {}), **upgrade}
         thread = {**thread, "metadata": {**metadata, "vm": vm_ctx}}
@@ -1334,6 +1352,9 @@ async def agent_upgrade_thread_to_workspace(
     container_provisioner = dependencies.container_provisioner
     target_tier = body.target_tier if body else None
     template_name = body.template if body else None
+    control_request_id = (
+        str(body.control_request_id) if body and body.control_request_id else None
+    )
     if target_tier == "container":
         target_tier = "sandbox"
     if target_tier not in (None, "sandbox", "vm"):
@@ -1392,12 +1413,18 @@ async def agent_upgrade_thread_to_workspace(
     # is tier-agnostic and sets sudo_action="allow" for a vm backend
     # (workspace_tier_upgrade.md Phase 2). Keeping a single client method +
     # endpoint means the agent stays uniform across tiers.
+    if control_request_id is not None and target_tier != "vm":
+        raise HTTPException(
+            status_code=400,
+            detail="control_request_id is accepted only for a VM upgrade",
+        )
     if target_tier == "vm":
         result = await agent_upgrade_thread_to_vm(
             request,
             thread_id,
             dependencies=dependencies,
             template_name=template_name,
+            control_request_id=control_request_id,
         )
         # The caller may have left the tier to the chain: always name it.
         return {**result, "target_tier": "vm"}

@@ -365,7 +365,11 @@ class TestUpgradeToVm:
     async def test_the_chain_template_is_recorded_before_provisioning(self):
         deps = _deps()
         await tcu.agent_upgrade_thread_to_vm(MagicMock(), THREAD, dependencies=deps)
-        record = {"upgrade_config": {}, "upgrade_sources": CHAIN_SOURCES}
+        record = {
+            "upgrade_config": {},
+            "upgrade_sources": CHAIN_SOURCES,
+            "upgrade_seed": None,
+        }
         deps.store.get_user.assert_awaited_once_with(OWNER)
         deps.store.merge_thread_vm_context.assert_awaited_once_with(THREAD, record)
         call = deps.vm_provisioner.create_thread_vm.await_args
@@ -392,7 +396,7 @@ class TestUpgradeToVm:
             MagicMock(), THREAD, dependencies=deps
         )
         assert result["status"] == "provisioning"
-        record = {"upgrade_config": {}, "upgrade_sources": None}
+        record = {"upgrade_config": {}, "upgrade_sources": None, "upgrade_seed": None}
         deps.store.get_user.assert_not_awaited()
         deps.store.merge_thread_vm_context.assert_awaited_once_with(THREAD, record)
         call = deps.vm_provisioner.create_thread_vm.await_args
@@ -798,7 +802,11 @@ class TestUpgradeToWorkspace:
         ]
         assert render.await_args.args[1] == {"id": OWNER}
         assert render.await_args.kwargs["current_backend"] == "virtual"
-        record = {"upgrade_config": vm, "upgrade_sources": sources}
+        record = {
+            "upgrade_config": vm,
+            "upgrade_sources": sources,
+            "upgrade_seed": None,
+        }
         deps.store.merge_thread_vm_context.assert_awaited_once_with(THREAD, record)
         call = deps.vm_provisioner.create_thread_vm.await_args
         assert (call.kwargs["vm_image"], call.kwargs["cpu_cores"]) == (
@@ -1060,3 +1068,115 @@ class TestUpgradeAvailability:
         )
         assert result["vm"]["available"] is False
         assert result["vm"]["reason"]  # the tier rule's own refusal text
+
+
+class TestVmUpgradeSeedMarker:
+    """C2 (D4 (a)): the lane switch's request id makes the VM request record a
+    durable seed marker in the same pre-CAS merge as the template record."""
+
+    REQUEST = "55555555-5555-4555-8555-555555555555"
+    BINDING = {"kind": "virtual", "backing_id": "rclone:" + "a" * 64}
+
+    def _deps(self, row, *, backend="virtual"):
+        deps = _deps(store={"fetchrow": AsyncMock(return_value=row)})
+        deps.store.get_thread = AsyncMock(
+            return_value=_pinned_thread(
+                metadata={
+                    "config_override": {"workspace": {"backend": backend}},
+                    "_workspace_binding": self.BINDING,
+                }
+            )
+        )
+        return deps
+
+    @pytest.mark.asyncio
+    async def test_a_lane_switch_request_records_a_pending_marker(self):
+        deps = self._deps({"verb": "upgrade-to-workspace", "outcome": None})
+        await tcu.agent_upgrade_thread_to_vm(
+            MagicMock(), THREAD, dependencies=deps, control_request_id=self.REQUEST
+        )
+        record = deps.store.merge_thread_vm_context.await_args.args[1]
+        assert record["upgrade_seed"] == {
+            "control_request_id": self.REQUEST,
+            "state": "pending",
+            "source": {
+                "backend": "virtual",
+                "prefix": f"threads/{THREAD}/",
+                "binding": self.BINDING,
+            },
+        }
+        call = deps.vm_provisioner.create_thread_vm.await_args
+        assert (
+            call.kwargs["expected_vm_context"]["upgrade_seed"] == record["upgrade_seed"]
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_none_session_has_nothing_to_copy(self):
+        deps = self._deps(
+            {"verb": "upgrade-to-workspace", "outcome": None}, backend="none"
+        )
+        await tcu.agent_upgrade_thread_to_vm(
+            MagicMock(), THREAD, dependencies=deps, control_request_id=self.REQUEST
+        )
+        record = deps.store.merge_thread_vm_context.await_args.args[1]
+        assert record["upgrade_seed"]["source"] is None
+
+    @pytest.mark.asyncio
+    async def test_an_ordinary_vm_request_records_a_null_marker(self):
+        deps = self._deps(None)
+        await tcu.agent_upgrade_thread_to_vm(MagicMock(), THREAD, dependencies=deps)
+        record = deps.store.merge_thread_vm_context.await_args.args[1]
+        assert record["upgrade_seed"] is None
+        deps.store.fetchrow.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "row",
+        [
+            None,
+            {"verb": "compact", "outcome": None},
+            {"verb": "upgrade-to-workspace", "outcome": "applied"},
+        ],
+    )
+    async def test_an_unknown_or_finished_request_is_refused_before_any_write(
+        self, row
+    ):
+        deps = self._deps(row)
+        with pytest.raises(HTTPException) as refused:
+            await tcu.agent_upgrade_thread_to_vm(
+                MagicMock(), THREAD, dependencies=deps, control_request_id=self.REQUEST
+            )
+        assert refused.value.status_code == 409
+        assert refused.value.detail == {"code": "workspace_upgrade_request_unknown"}
+        deps.store.merge_thread_vm_context.assert_not_awaited()
+        deps.vm_provisioner.create_thread_vm.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_upgrade_to_workspace_forwards_the_request_id(self):
+        deps = self._deps({"verb": "upgrade-to-workspace", "outcome": None})
+        result = await tcu.agent_upgrade_thread_to_workspace(
+            MagicMock(),
+            THREAD,
+            ThreadWorkspaceUpgradeRequest(
+                target_tier="vm", control_request_id=self.REQUEST
+            ),
+            dependencies=deps,
+        )
+        assert result["target_tier"] == "vm"
+        record = deps.store.merge_thread_vm_context.await_args.args[1]
+        assert record["upgrade_seed"]["control_request_id"] == self.REQUEST
+
+    @pytest.mark.asyncio
+    async def test_a_request_id_is_only_for_a_vm_upgrade(self):
+        deps = self._deps({"verb": "upgrade-to-workspace", "outcome": None})
+        with pytest.raises(HTTPException) as refused:
+            await tcu.agent_upgrade_thread_to_workspace(
+                MagicMock(),
+                THREAD,
+                ThreadWorkspaceUpgradeRequest(
+                    target_tier="sandbox", control_request_id=self.REQUEST
+                ),
+                dependencies=deps,
+            )
+        assert refused.value.status_code == 400
+        deps.store.merge_thread_vm_context.assert_not_awaited()

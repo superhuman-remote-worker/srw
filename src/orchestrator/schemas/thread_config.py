@@ -13,6 +13,7 @@ field stays ``list[str] | None`` rather than defaulting to an empty list.
 from __future__ import annotations
 
 from typing import Any, Literal
+from uuid import UUID
 
 from pydantic import BaseModel, Field
 
@@ -36,10 +37,13 @@ class ThreadWorkspaceUpgradeRequest(BaseModel):
 
     ``target_tier`` None means the next tier up; ``template`` names a template
     the Session's owner can read (Project, Account, then Catalog).
+    ``control_request_id`` names the stateless lane switch's durable request
+    (C2): the VM request then records the upgrade's seed marker.
     """
 
     target_tier: str | None = None
     template: str | None = None
+    control_request_id: UUID | None = None
 
 
 class ThreadConfigPatchRequest(BaseModel):
