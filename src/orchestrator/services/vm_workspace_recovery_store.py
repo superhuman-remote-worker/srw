@@ -4673,7 +4673,11 @@ class VMWorkspaceRecoveryStore:
                         "ssh_host": successor.get("pod_ip"),
                         "ssh_port": 22,
                         "ssh_registration_id": successor.get("ssh_registration_id"),
-                        "ssh_ready_source": "workspace_recovery",
+                        # Both ordinary readiness and recovery qualify this
+                        # endpoint through the provisioner's pinned SSH probe.
+                        # Dispatch requires that authority marker; recovery
+                        # provenance remains in the durable recovery ledger.
+                        "ssh_ready_source": "provisioner_probe",
                         "recovering": False,
                         "provisioning_revision": revision + 1,
                     }

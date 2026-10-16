@@ -3628,8 +3628,9 @@ async def test_store_admits_idempotent_hold_and_releases_exact_queue_token(
     )
     async with app_pg.acquire() as conn:
         await conn.execute(
-            "INSERT INTO jobs (id, description, status, execution_lane) "
-            "VALUES ($1, 'admit recovery', 'processing', 'stateless')",
+            "INSERT INTO jobs (id, description, status, execution_lane, config_override) "
+            "VALUES ($1, 'admit recovery', 'processing', 'stateless', "
+            "'{\"workspace\":{\"backend\":\"vm\"}}'::jsonb)",
             job_id,
         )
         await conn.execute(
@@ -3735,7 +3736,8 @@ async def test_store_admits_idempotent_hold_and_releases_exact_queue_token(
             job_id,
         )
         job = await conn.fetchrow(
-            "SELECT status, freeze_data, context->'vm' AS vm FROM jobs WHERE id=$1",
+            "SELECT status, freeze_data, context, config_override, "
+            "context->'vm' AS vm FROM jobs WHERE id=$1",
             job_id,
         )
         operation = await conn.fetchrow(
@@ -3750,6 +3752,13 @@ async def test_store_admits_idempotent_hold_and_releases_exact_queue_token(
     assert vm["provisioning_revision"] == 7
     assert operation["phase"] == "recovered"
     assert operation["resolved_at"] is not None
+    # Recovery must restore the authority used by real same-cluster dispatch,
+    # not just publish a ready status that the next bundle will reject again.
+    from shared.workspace_contract import resolve_workspace_runtime
+
+    decision = resolve_workspace_runtime(dict(job), vm_mode="same-cluster")
+    assert decision.ready, decision.reason
+    assert decision.effective_backend == "vm"
 
 
 @pytest.mark.asyncio
