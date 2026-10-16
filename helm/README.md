@@ -1170,6 +1170,11 @@ continue. After activation, roll back only to a version-1-capable bridge image.
 Existing settled receipts with an unfinished Job remain held for normal Cancel;
 the new observer does not reopen them or issue a second Pod create.
 
+Stateless Session workspace upgrades (`virtual`/`none` → container) need this
+value on: without it a Pod that never becomes Ready has no terminal state, so
+`/connection` doesn't offer the upgrade and a request answers 409. Turn it on
+together with `agent.stateless.enabled`, after the two-stage activation above.
+
 ### Durable VM workspace recovery rollout
 
 VM startup uses separate clocks for disk preparation, placement and guest boot.

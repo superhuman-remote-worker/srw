@@ -302,27 +302,37 @@ refusal. Those paths retry it.
 ### Upgrades
 
 An upgrade moves to the tier it asks for, or to the next one up: a running
-Session goes to a VM; a Job goes from `none` or `virtual` to a container, and
+pinned Session goes to a VM, and a stateless `virtual` or `none` Session goes
+to a container; a Job goes from `none` or `virtual` to a container, and
 from a container to a VM. It gets that tier's default template from the lookup
 above, unless it names a template.
 
 | Trigger | Result |
 | --- | --- |
-| `/upgrade-workspace vm` in a Session | a VM from the default VM template |
-| `/upgrade-workspace <template name>` in a Session | that template. SRW looks for the name in the Session's Project, then in your Account, then in the shared Catalog. In a running Session it must be a VM template. |
-| `/upgrade-workspace` without an argument | a VM from the default VM template (a running Session can't move to a container) |
+| `/upgrade-workspace vm` in a pinned Session | a VM from the default VM template |
+| `/upgrade-workspace <template name>` in a pinned Session | that template. SRW looks for the name in the Session's Project, then in your Account, then in the shared Catalog. In a pinned Session it must be a VM template. |
+| `/upgrade-workspace` without an argument in a pinned Session | a VM from the default VM template (a pinned Session can't move to a container) |
 | The agent's approval request (it needs `sudo`) | a VM from the default VM template |
 | The agent's upgrade request in a `virtual` or `none` Session | a VM from the default VM template, offered only when SRW would accept it |
 | A Job frozen for a VM (`POST /api/jobs/{id}/upgrade-to-vm`) | a VM from the default VM template |
+| `/upgrade-workspace` or `/upgrade-workspace container` in a stateless `virtual`/`none` Session | a container from the default container template (needs startup tracking) |
+| `/upgrade-workspace <container template>` in a stateless `virtual`/`none` Session | that template |
+| The agent's upgrade request in a stateless `virtual`/`none` Session | a container, offered only when SRW would accept it |
 | A running `virtual` or `none` Job that needs a container | a container from the default container template |
 
-- **Container upgrades of a running Session are unavailable.**
-  `/upgrade-workspace container` answers in the chat without sending anything,
-  the Settings pane marks Container "not available in this session", and a
-  container template name is refused with "Container upgrades of a running
-  Session are unavailable; start a new Session with this template." Start a
-  new Session with the container you need. `/upgrade-workspace` without an
-  argument goes to a VM.
+- **Container upgrades.** A stateless `virtual` or `none` Session moves to a
+  container in place; the template's image and sizes apply. It needs
+  `orchestrator.containerStartupStageAuthority.enabled`, otherwise the
+  request gets 409 "Upgrading this Session needs workspace startup tracking,
+  which this installation doesn't have turned on." A pinned Session can't
+  move to a container ("Container upgrades aren't available in this
+  session…"); start a new Session with the container you need.
+- **VM targets on a stateless Session:** 409 "Upgrading a Session to a VM
+  isn't available on this installation yet. Start a new Session with a VM
+  workspace instead."
+- **If the container never becomes ready**, the Session shows "Workspace
+  upgrade failed" with the startup reason. Nothing switches back: End it and
+  start a new one. The files stay in the old storage.
 - **Refusals.**
   - A template that isn't a higher tier than the current one: 400 "An upgrade
     must move to a higher tier than the current one."
@@ -330,7 +340,7 @@ above, unless it names a template.
     can't use a template that keeps its workspace; start new work with this
     template."
   - An unknown name: 404 "No template named 'x' is available here."
-  - As before: a VM upgrade while VMs are off, a stateless Session (409), and a
+  - As before: a VM upgrade while VMs are off, a VM target on a stateless Session (409), and a
     Session admitted from a manifest are refused, and nothing moves down a tier.
 - **Work without an owner** (internal Jobs, their subjobs, agent child threads)
   upgrades without a template, as before. Naming a template for it answers 409

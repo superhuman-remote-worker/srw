@@ -126,19 +126,30 @@ A running session's header **Settings** panel shows **Workspace** in its main
 the `vm_workspace` grant and VMs are enabled: choose **VM**, then confirm
 **Upgrade**. The session keeps its conversation and carries existing files
 over. Wait for provisioning to complete before checking the newly available
-tools. A running session can't upgrade to a Container; its Container choice
-says **not available in this session**. Start a new Container session for
-that. None currently shows a fixed workspace value in this selector; start a
-new Container session when no upgrade action is offered. Some sessions cannot
+tools. A session that can't upgrade to a Container in place says **not
+available in this session** on that choice. None currently shows a fixed
+workspace value in this selector; start a new Container session when no
+upgrade action is offered. Some sessions cannot
 change workspace in place at all: their Workspace choices say **not available
 in this session** and `/upgrade-workspace` is refused. Start a new session with
 the needed workspace then.
 
+A Virtual or None session served by the shared executors (the default when
+stateless sessions are on) can also upgrade to a **Container** in place, when
+the installation tracks workspace startup: choose **Container**, or send
+`/upgrade-workspace` (or `/upgrade-workspace <container template>`). If a
+response is running, the upgrade starts after it. The session keeps its
+conversation; the next message runs in the container, with the earlier files
+copied in (files under a cloud folder come back from the cloud). A VM upgrade
+isn't available for these sessions yet. If the container never starts, the
+chat says **Workspace upgrade failed** with the reason: End the session and
+start a new one; your files are kept.
+
 Workspace changes are upgrade-only: to move down to Virtual or None, start a
 new session. A workspace upgrade does not automatically enable a missing tool
 category. If `request_workspace_upgrade` is currently visible, the agent can
-use it to present a VM upgrade request for the user's decision; when SRW would
-refuse a VM upgrade, the tool says why and nothing is shown to the user. It
+use it to present a container or VM upgrade request for the user's decision;
+when SRW would refuse the upgrade, the tool says why and nothing is shown to the user. It
 does not provision the workspace or automatically resume work; the user can
 send a follow-up message after the upgrade completes.
 
