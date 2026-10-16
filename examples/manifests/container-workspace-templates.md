@@ -384,6 +384,14 @@ An Expert whose instructions assume Node, a compiler or a database client fails
 on `srw-workspace-minimal` with "command not found". Use `srw-workspace`, or add
 what you need in your own image.
 
+The agent can install more itself, without root. `pip install` puts packages in
+its home directory, on the workspace volume, and pip inside a virtualenv works as
+usual. Where Node.js is installed, `npm install -g` uses `~/.npm-global`, whose
+`bin` is on the agent's `PATH`. A Playwright script uses the image's Chromium without downloading it,
+as long as it uses the image's Playwright version; a project that pins another
+version downloads its own browser into the home directory. VM workspaces behave
+the same way.
+
 **Install system-wide in your own Dockerfile.** The base images let the
 workspace user install packages without root: pip installs into its user
 directory, and `npm_config_prefix` points npm's global installs to a directory

@@ -354,6 +354,69 @@ Then configure the `vm` and `vmController` values described in
 [VM workspaces on your cluster](../helm/README.md#vm-workspaces-on-your-cluster).
 VMs add substantial CPU, memory, and disk requirements.
 
+### Test a VM image change
+
+CI builds the VM image in two stages: a heavy stage1 base, and stage2
+(`docker/agent-vm-base/scripts/provision-stage2.sh` and the shared `docker/`
+scripts it uploads). To try a stage2 change on k3d before pushing, build stage2
+on the published develop base and serve it from the local registry. The disks
+are about 9 GB each; `input/`, `output/` and the sudo gate binaries are
+gitignored.
+
+1. Download the stage1 base into `docker/agent-vm-base/input/`. GHCR often
+   drops long downloads and `docker pull` then starts over; `curl -C -`
+   resumes:
+
+   ```bash
+   cd docker/agent-vm-base
+   REPO=superhuman-remote-worker/srw-agent-vm-base-stage1
+   LAYER=$(docker manifest inspect ghcr.io/$REPO:experimental | jq -c '.layers[0]')
+   DIGEST=$(jq -r .digest <<<"$LAYER"); SIZE=$(jq -r .size <<<"$LAYER")
+   while [ "$(stat -c %s stage1.tar.gz 2>/dev/null || echo 0)" -lt "$SIZE" ]; do
+     TOKEN=$(curl -s "https://ghcr.io/token?scope=repository:$REPO:pull" | jq -r .token)
+     curl -sfL -C - -H "Authorization: Bearer $TOKEN" -o stage1.tar.gz \
+       "https://ghcr.io/v2/$REPO/blobs/$DIGEST" || true
+   done
+   echo "${DIGEST#sha256:}  stage1.tar.gz" | sha256sum -c -
+   tar -xzf stage1.tar.gz && mkdir -p input \
+     && mv disk/agent-vm-base-stage1.qcow2 input/ && rm -r disk stage1.tar.gz
+   ```
+
+2. Build the sudo gate binaries into `files/sudo-gated-bin` and
+   `files/sudo_gate.so` with the commands of the `build-sudo-gate` job in
+   `.github/workflows/develop.yml`. Copies left from an earlier build are stale.
+3. Remove any old `output/`, then run `packer init stage2.pkr.hcl` and
+   `packer build stage2.pkr.hcl`. If the host's QEMU won't start (for example
+   "Failed to initialize io_uring: Cannot allocate memory"), run the build in
+   Ubuntu 24.04 as CI does, with the static `packer` binary and its plugins
+   copied into the directory. Mount all of `docker/`: the template uploads the
+   shared scripts from `../`.
+
+   ```bash
+   cp "$(command -v packer)" . && cp -r ~/.config/packer/plugins packer-plugins
+   docker run --rm --device /dev/kvm --ulimit memlock=-1:-1 -v "$PWD/..":/build:z \
+     ubuntu:24.04 bash -c 'apt-get update -qq \
+       && apt-get install -y -qq qemu-system-x86 qemu-utils genisoimage \
+       && cd /build/agent-vm-base \
+       && PACKER_PLUGIN_PATH=$PWD/packer-plugins ./packer build stage2.pkr.hcl'
+   ```
+
+   The build runs both shared gates inside the VM. Remove the copied `packer`
+   and `packer-plugins` afterwards; the container leaves `output/` owned by root.
+4. Wrap the disk and push it to the cluster's registry:
+
+   ```bash
+   docker build -f Dockerfile.containerDisk -t localhost:5005/srw-agent-vm-base:local-test .
+   docker push localhost:5005/srw-agent-vm-base:local-test
+   ```
+
+5. Set `vmController.defaultVmImage: srw-registry:5000/srw-agent-vm-base:local-test`
+   in `deployment/values-local.yaml`. Tilt re-applies Helm when the file
+   changes. The first VM imports the image into a golden disk, which takes a few
+   minutes. Start a session with `workspace.backend: vm`; until its guest has
+   booted, sending input returns "Session not active". Restore the previous
+   `defaultVmImage` when you're done.
+
 ## Daily lifecycle
 
 Stop and restart the cluster without deleting its volumes or Helm release:
