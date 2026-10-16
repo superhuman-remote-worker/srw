@@ -941,3 +941,215 @@ async def test_populated_pre_startup_upgrade_preserves_legacy_creation(tmp_path)
         finally:
             await store.close()
             await pool.close()
+
+
+APP_MIGRATIONS = (
+    Path(__file__).resolve().parents[1] / "src/orchestrator/database/migrations/app"
+)
+# The container_exited expansion and its validation, whatever numbers they got.
+EXIT_CODE_MIGRATIONS = sorted(
+    APP_MIGRATIONS.glob("*container_exited_startup_attention.sql")
+)
+V2_SHAPE = "managed_workspace_startup_stage_shape_check_v2"
+STAGE_AUTHORITY = "managed_workspace_startup_stage_authority"
+STARTUP_COLUMNS = (
+    "id,startup_protocol_version,startup_stage,startup_state,startup_reason_code,"
+    "scheduled_at,startup_first_ready_at,ready_budget_seconds,pull_budget_seconds,"
+    "ssh_budget_seconds,startup_attention_at,phase,claim_token,settled_at"
+)
+
+
+async def _exited_by_sql(
+    db, reservation, *, reason="container_exited", code=3, first_ready=False
+):
+    """Move a starting receipt into attention by direct SQL, as any writer could."""
+
+    async with db.acquire() as conn:
+        await conn.execute(
+            "UPDATE managed_repository_workspace_creation_reservations "
+            "SET startup_state='attention', startup_reason_code=$2, "
+            "startup_attention_at=clock_timestamp(), startup_exit_code=$3, "
+            "startup_first_ready_at=CASE WHEN $4 THEN scheduled_at ELSE NULL END "
+            "WHERE id=$1",
+            reservation["id"],
+            reason,
+            code,
+            first_ready,
+        )
+
+
+def test_container_exited_migrations_are_one_expansion_and_one_validation():
+    assert [path.name.split("_", 1)[1] for path in EXIT_CODE_MIGRATIONS] == [
+        "container_exited_startup_attention.sql",
+        "validate_container_exited_startup_attention.sql",
+    ]
+    first, second = (int(path.name[:4]) for path in EXIT_CODE_MIGRATIONS)
+    assert second == first + 1
+    expansion, validation = (path.read_text() for path in EXIT_CODE_MIGRATIONS)
+    assert "NOT VALID" in expansion
+    # The reliability stream's receipt function stays exactly as 0309 wrote it.
+    assert "CREATE OR REPLACE" not in expansion
+    assert "enforce_container_startup_stage_receipt" not in expansion
+    assert f"VALIDATE CONSTRAINT {V2_SHAPE}" in validation
+
+
+@pytest.mark.asyncio
+async def test_v2_replaces_the_0309_shape_check_validated(db):
+    rows = await db.fetch(
+        "SELECT conname, convalidated FROM pg_constraint "
+        "WHERE conname LIKE 'managed_workspace_startup_stage_shape_check%'"
+    )
+    assert {row["conname"]: row["convalidated"] for row in rows} == {V2_SHAPE: True}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("code", [3, 0])
+async def test_v2_shape_accepts_container_exited_with_a_code(db, code):
+    _job_id, reservation, *_ = await _starting_job(db)
+    await _exited_by_sql(db, reservation, code=code)
+    row = await _reservation(db, reservation)
+    assert (row["startup_reason_code"], row["startup_exit_code"]) == (
+        "container_exited",
+        code,
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("reason", "code", "first_ready"),
+    [
+        ("container_exited", None, False),
+        ("container_exited", 3, True),
+        ("invalid_image", 3, False),
+    ],
+    ids=["no-code", "after-first-ready", "code-on-another-reason"],
+)
+async def test_v2_shape_refuses_a_malformed_exit(db, reason, code, first_ready):
+    _job_id, reservation, *_ = await _starting_job(db)
+    with pytest.raises(asyncpg.CheckViolationError) as raised:
+        await _exited_by_sql(
+            db, reservation, reason=reason, code=code, first_ready=first_ready
+        )
+    assert raised.value.constraint_name == V2_SHAPE
+    assert (await _reservation(db, reservation))["startup_state"] == "starting"
+
+
+@pytest.mark.asyncio
+async def test_v2_shape_refuses_a_code_outside_container_exited(db):
+    _job_id, starting, *_ = await _starting_job(db)
+    _other_id, unmarked, *_ = await _bound_job(db)
+    async with db.acquire() as conn:
+        for receipt in (starting, unmarked):
+            with pytest.raises(asyncpg.CheckViolationError) as raised:
+                await conn.execute(
+                    "UPDATE managed_repository_workspace_creation_reservations "
+                    "SET startup_exit_code=3 WHERE id=$1",
+                    receipt["id"],
+                )
+            assert raised.value.constraint_name == V2_SHAPE
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("changed", [4, None], ids=["changed", "cleared"])
+async def test_exit_code_is_frozen_once_written(db, changed):
+    _job_id, reservation, *_ = await _starting_job(db)
+    await _exited_by_sql(db, reservation, code=3)
+    async with db.acquire() as conn:
+        with pytest.raises(asyncpg.CheckViolationError) as raised:
+            await conn.execute(
+                "UPDATE managed_repository_workspace_creation_reservations "
+                "SET startup_exit_code=$2 WHERE id=$1",
+                reservation["id"],
+                changed,
+            )
+    assert raised.value.constraint_name == STAGE_AUTHORITY
+    assert (await _reservation(db, reservation))["startup_exit_code"] == 3
+
+
+@pytest.mark.asyncio
+async def test_cancel_keeps_a_frozen_exit_code(db):
+    job_id, reservation, *_ = await _starting_job(db)
+    await _exited_by_sql(db, reservation, code=0)
+    assert await db.cancel_job(str(job_id))
+    row = await _reservation(db, reservation)
+    assert row["cancel_requested_at"] is not None
+    assert row["startup_exit_code"] == 0
+
+
+@pytest.mark.asyncio
+async def test_pre_exit_code_writer_updates_still_pass_v2(db):
+    # The UPDATE an old orchestrator replica sends: it never names the column.
+    job_id, reservation, *_ = await _starting_job(db)
+    async with db.acquire() as conn:
+        await conn.execute(
+            "UPDATE managed_repository_workspace_creation_reservations "
+            "SET startup_protocol_version=1, startup_stage='readiness', "
+            "startup_state='attention', startup_reason_code='invalid_image', "
+            "startup_attention_at=clock_timestamp() WHERE id=$1",
+            reservation["id"],
+        )
+    assert await db.cancel_job(str(job_id))
+    row = await _reservation(db, reservation)
+    assert (row["startup_reason_code"], row["startup_exit_code"]) == (
+        "invalid_image",
+        None,
+    )
+
+
+@pytest.mark.asyncio
+async def test_populated_upgrade_validates_v2_without_changing_receipts(tmp_path):
+    first_new = EXIT_CODE_MIGRATIONS[0].name.split("_", 1)[0]
+    stage = tmp_path / "migrations"
+    stage.mkdir()
+    for path in APP_MIGRATIONS.glob("*.sql"):
+        if path.name.split("_", 1)[0] < first_new:
+            (stage / path.name).write_bytes(path.read_bytes())
+    with PostgresContainer("postgres:15") as container:
+        dsn = container.get_connection_url().replace(
+            "postgresql+psycopg2", "postgresql"
+        )
+        pool = await asyncpg.create_pool(dsn, min_size=1, max_size=4)
+        store = PostgresDB(dsn, min_connections=1, max_connections=4)
+        try:
+            await run_migrations(pool, stage)
+            await store.connect()
+            legacy_job, legacy, legacy_uid, legacy_gate = await _bound_job(store)
+            _a_job, attention, _, _, kwargs, _ = await _starting_job(store)
+            assert await store.observe_container_startup(
+                **kwargs, observation=StartupAttention("invalid_image")
+            )
+            _s_job, starting, *_ = await _starting_job(store)
+            ids = [legacy["id"], attention["id"], starting["id"]]
+            before = await pool.fetch(
+                f"SELECT {STARTUP_COLUMNS} FROM "
+                "managed_repository_workspace_creation_reservations "
+                "WHERE id=ANY($1::uuid[]) ORDER BY id",
+                ids,
+            )
+            for path in EXIT_CODE_MIGRATIONS:
+                (stage / path.name).write_bytes(path.read_bytes())
+            await run_migrations(pool, stage)
+            await run_migrations(pool, stage)
+            after = await pool.fetch(
+                f"SELECT {STARTUP_COLUMNS},startup_exit_code FROM "
+                "managed_repository_workspace_creation_reservations "
+                "WHERE id=ANY($1::uuid[]) ORDER BY id",
+                ids,
+            )
+            assert [tuple(row.values())[:-1] for row in after] == [
+                tuple(row.values()) for row in before
+            ]
+            assert [row["startup_exit_code"] for row in after] == [None, None, None]
+            assert (
+                await pool.fetchval(
+                    "SELECT convalidated FROM pg_constraint WHERE conname=$1",
+                    V2_SHAPE,
+                )
+                is True
+            )
+            assert await store.settle_managed_repository_workspace_creation_reservation(
+                str(legacy_job), **legacy_gate, runtime_incarnation=legacy_uid
+            )
+        finally:
+            await store.close()
+            await pool.close()

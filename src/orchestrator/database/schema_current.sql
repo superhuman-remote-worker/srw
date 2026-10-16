@@ -8825,6 +8825,25 @@ $$;
 
 
 --
+-- Name: freeze_container_startup_exit_code(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.freeze_container_startup_exit_code() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+BEGIN
+    IF OLD.startup_exit_code IS NOT NULL
+       AND NEW.startup_exit_code IS DISTINCT FROM OLD.startup_exit_code THEN
+        RAISE EXCEPTION 'container startup exit code is immutable'
+            USING ERRCODE = '23514',
+                  CONSTRAINT = 'managed_workspace_startup_stage_authority';
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+
+--
 -- Name: grant_pinned_retained_creation_resume(); Type: FUNCTION; Schema: public; Owner: -
 --
 
@@ -29890,6 +29909,7 @@ CREATE TABLE public.managed_repository_workspace_creation_reservations (
     pull_budget_seconds double precision,
     ssh_budget_seconds double precision,
     startup_attention_at timestamp with time zone,
+    startup_exit_code integer,
     CONSTRAINT managed_repository_workspace_creation_cancel_shape_check CHECK ((((cancel_requested_at IS NULL) AND (cancel_claim_projection_transaction_id IS NULL) AND (cancel_target_disposition IS NULL) AND (cancel_resource_policy IS NULL) AND (cancel_suspended_at IS NULL) AND (cancel_snapshot_restore_required IS NULL)) OR ((cancel_requested_at IS NOT NULL) AND (cancel_claim_projection_transaction_id IS NOT NULL) AND (cancel_target_disposition IS NOT NULL) AND (cancel_resource_policy = ANY (ARRAY['preserve'::text, 'terminal_reclaim'::text])) AND (cancel_snapshot_restore_required IS NOT NULL) AND ((cancel_target_disposition = 'suspended'::text) OR (cancel_suspended_at IS NULL))))),
     CONSTRAINT managed_repository_workspace_creation_cleanup_shape_check CHECK ((((cancel_cleanup_completed_at IS NULL) AND (cancel_projection_transaction_id IS NULL)) OR ((cancel_cleanup_completed_at IS NOT NULL) AND (cancel_projection_transaction_id IS NOT NULL) AND (cancel_requested_at IS NOT NULL) AND (settled_at IS NOT NULL) AND (result_kind = 'aborted'::text) AND (phase = 'aborted'::text)))),
     CONSTRAINT managed_repository_workspace_creation_effects_check CHECK ((jsonb_typeof(external_effects) = 'object'::text)),
@@ -29903,7 +29923,7 @@ CREATE TABLE public.managed_repository_workspace_creation_reservations (
     CONSTRAINT managed_repository_workspace_creation_scope_check CHECK ((scope = ANY (ARRAY['workspace_container'::text, 'ide'::text]))),
     CONSTRAINT managed_repository_workspace_creation_thread_generation_shape CHECK ((((owner_kind = 'job'::text) AND (thread_runtime_generation IS NULL)) OR ((owner_kind = 'thread'::text) AND (thread_runtime_generation IS NOT NULL)))),
     CONSTRAINT managed_repository_workspace_restore_work_shape_check CHECK (((restore_work_claim_token >= 0) AND (((restore_work_claimed_by IS NULL) AND (restore_work_claim_expires_at IS NULL)) OR ((restore_work_claimed_by IS NOT NULL) AND (restore_work_claim_expires_at IS NOT NULL) AND (restore_work_claim_token > 0))) AND (((restore_work_result_kind IS NULL) AND (restore_work_projection_transaction_id IS NULL)) OR ((operation_kind = 'restore'::text) AND (result_kind = 'settled'::text) AND (restore_work_completed_at IS NOT NULL) AND (restore_work_projection_transaction_id IS NOT NULL) AND (((scope = 'ide'::text) AND (restore_work_result_kind = ANY (ARRAY['active'::text, 'failed'::text]))) OR ((scope = 'workspace_container'::text) AND (restore_work_result_kind = ANY (ARRAY['ready'::text, 'failed'::text])))))) AND ((restore_work_completed_at IS NULL) OR (restore_work_result_kind IS NOT NULL)))),
-    CONSTRAINT managed_workspace_startup_stage_shape_check CHECK (COALESCE((((startup_protocol_version IS NULL) AND (startup_stage IS NULL) AND (startup_state IS NULL) AND (startup_reason_code IS NULL) AND (scheduled_at IS NULL) AND (startup_first_ready_at IS NULL) AND (ready_budget_seconds IS NULL) AND (pull_budget_seconds IS NULL) AND (ssh_budget_seconds IS NULL) AND (startup_attention_at IS NULL)) OR ((startup_protocol_version = 1) AND (owner_kind = ANY (ARRAY['job'::text, 'thread'::text])) AND (scope = 'workspace_container'::text) AND (operation_kind = 'create'::text) AND (runtime_incarnation IS NOT NULL) AND (pod_uid = runtime_incarnation) AND (((startup_stage = 'scheduling'::text) AND (startup_state = ANY (ARRAY['observing'::text, 'waiting_capacity'::text])) AND (((startup_state = 'observing'::text) AND (startup_reason_code = ANY (ARRAY['observation_pending'::text, 'scheduling_other'::text]))) OR ((startup_state = 'waiting_capacity'::text) AND (startup_reason_code = ANY (ARRAY['scheduler_unschedulable'::text, 'insufficient_capacity'::text])))) AND (scheduled_at IS NULL) AND (startup_first_ready_at IS NULL) AND (ready_budget_seconds IS NULL) AND (pull_budget_seconds IS NULL) AND (ssh_budget_seconds IS NULL) AND (startup_attention_at IS NULL)) OR ((startup_stage = 'readiness'::text) AND (((startup_state = 'starting'::text) AND (startup_reason_code = 'scheduled'::text) AND (startup_attention_at IS NULL)) OR ((startup_state = 'attention'::text) AND (startup_reason_code = ANY (ARRAY['invalid_image'::text, 'invalid_configuration'::text, 'pull_deadline'::text, 'readiness_deadline'::text, 'ssh_deadline'::text])) AND (startup_attention_at IS NOT NULL))) AND (scheduled_at IS NOT NULL) AND (ready_budget_seconds >= (0.000001)::double precision) AND (ready_budget_seconds < (31536000)::double precision) AND ((pull_budget_seconds IS NULL) OR ((pull_budget_seconds >= (0.000001)::double precision) AND (pull_budget_seconds < (31536000)::double precision))) AND (ssh_budget_seconds >= (0.000001)::double precision) AND (ssh_budget_seconds < (31536000)::double precision) AND ((startup_first_ready_at IS NULL) OR ((startup_first_ready_at >= scheduled_at) AND (startup_first_ready_at <= (scheduled_at + make_interval(secs => GREATEST(ready_budget_seconds, COALESCE(pull_budget_seconds, (0)::double precision))))))))))), false))
+    CONSTRAINT managed_workspace_startup_stage_shape_check_v2 CHECK (COALESCE(((((startup_protocol_version IS NULL) AND (startup_stage IS NULL) AND (startup_state IS NULL) AND (startup_reason_code IS NULL) AND (scheduled_at IS NULL) AND (startup_first_ready_at IS NULL) AND (ready_budget_seconds IS NULL) AND (pull_budget_seconds IS NULL) AND (ssh_budget_seconds IS NULL) AND (startup_attention_at IS NULL)) OR ((startup_protocol_version = 1) AND (owner_kind = ANY (ARRAY['job'::text, 'thread'::text])) AND (scope = 'workspace_container'::text) AND (operation_kind = 'create'::text) AND (runtime_incarnation IS NOT NULL) AND (pod_uid = runtime_incarnation) AND (((startup_stage = 'scheduling'::text) AND (startup_state = ANY (ARRAY['observing'::text, 'waiting_capacity'::text])) AND (((startup_state = 'observing'::text) AND (startup_reason_code = ANY (ARRAY['observation_pending'::text, 'scheduling_other'::text]))) OR ((startup_state = 'waiting_capacity'::text) AND (startup_reason_code = ANY (ARRAY['scheduler_unschedulable'::text, 'insufficient_capacity'::text])))) AND (scheduled_at IS NULL) AND (startup_first_ready_at IS NULL) AND (ready_budget_seconds IS NULL) AND (pull_budget_seconds IS NULL) AND (ssh_budget_seconds IS NULL) AND (startup_attention_at IS NULL)) OR ((startup_stage = 'readiness'::text) AND (((startup_state = 'starting'::text) AND (startup_reason_code = 'scheduled'::text) AND (startup_attention_at IS NULL)) OR ((startup_state = 'attention'::text) AND (startup_reason_code = ANY (ARRAY['invalid_image'::text, 'invalid_configuration'::text, 'pull_deadline'::text, 'readiness_deadline'::text, 'ssh_deadline'::text, 'container_exited'::text])) AND (startup_attention_at IS NOT NULL))) AND (scheduled_at IS NOT NULL) AND (ready_budget_seconds >= (0.000001)::double precision) AND (ready_budget_seconds < (31536000)::double precision) AND ((pull_budget_seconds IS NULL) OR ((pull_budget_seconds >= (0.000001)::double precision) AND (pull_budget_seconds < (31536000)::double precision))) AND (ssh_budget_seconds >= (0.000001)::double precision) AND (ssh_budget_seconds < (31536000)::double precision) AND ((startup_first_ready_at IS NULL) OR ((startup_first_ready_at >= scheduled_at) AND (startup_first_ready_at <= (scheduled_at + make_interval(secs => GREATEST(ready_budget_seconds, COALESCE(pull_budget_seconds, (0)::double precision))))))))))) AND ((startup_exit_code IS NULL) OR (NOT (startup_reason_code IS DISTINCT FROM 'container_exited'::text))) AND ((startup_reason_code IS DISTINCT FROM 'container_exited'::text) OR ((startup_first_ready_at IS NULL) AND (startup_exit_code IS NOT NULL)))), false))
 );
 
 
@@ -42057,6 +42077,13 @@ CREATE TRIGGER trg_capture_job_deliverable_contract AFTER INSERT ON public.jobs 
 --
 
 CREATE CONSTRAINT TRIGGER trg_container_startup_current_binding AFTER INSERT OR UPDATE ON public.managed_repository_workspace_creation_reservations DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION public.validate_container_startup_current_binding();
+
+
+--
+-- Name: managed_repository_workspace_creation_reservations trg_container_startup_exit_code_frozen; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER trg_container_startup_exit_code_frozen BEFORE UPDATE ON public.managed_repository_workspace_creation_reservations FOR EACH ROW EXECUTE FUNCTION public.freeze_container_startup_exit_code();
 
 
 --
