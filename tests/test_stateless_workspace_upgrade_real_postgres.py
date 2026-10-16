@@ -570,6 +570,7 @@ async def test_end_during_the_upgrade_create_retires_the_initial_creation(
             dependencies=dependencies,
         )
     assert busy.value.status_code == 409
+    assert busy.value.detail["code"] == "stateless_end_busy"
 
     result = await end_thread_flow(
         case.thread_id,
