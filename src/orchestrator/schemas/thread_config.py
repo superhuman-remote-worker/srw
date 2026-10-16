@@ -46,6 +46,13 @@ class ThreadWorkspaceUpgradeRequest(BaseModel):
     control_request_id: UUID | None = None
 
 
+class VmUpgradeSeededRequest(BaseModel):
+    """Body for ``POST /api/agents/threads/{id}/workspace-upgrade/seeded`` (C2)."""
+
+    provision_generation: UUID
+    control_request_id: UUID
+
+
 class ThreadConfigPatchRequest(BaseModel):
     config_override: dict[str, Any] = Field(default_factory=dict)
     # Desired FULL datasource selection (create semantics): None = no change,
@@ -59,4 +66,5 @@ __all__ = [
     "AgentThreadConfigUpdateRequest",
     "ThreadConfigPatchRequest",
     "ThreadWorkspaceUpgradeRequest",
+    "VmUpgradeSeededRequest",
 ]

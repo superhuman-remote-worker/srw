@@ -221,7 +221,8 @@ def _client(admission=None, config=None) -> TestClient:
 class TestRouteInventory:
     def test_the_seven_declarations_keep_their_identity(self):
         """Pins the declarations' identity. The eighth, the GET
-        upgrade-availability route (added 2026-10-07), is pinned here too."""
+        upgrade-availability route (added 2026-10-07), is pinned here too.
+        C2 (2026-10-14) added the two workspace-upgrade seed routes."""
         app = FastAPI()
         app.include_router(admission_routes.router)
         app.include_router(config_routes.router)
@@ -268,6 +269,16 @@ class TestRouteInventory:
                 "/api/agents/threads/{thread_id}/upgrade-availability",
                 "GET",
                 "agent_thread_upgrade_availability",
+            ),
+            (
+                "/api/agents/threads/{thread_id}/workspace-upgrade/seed-source",
+                "GET",
+                "agent_vm_upgrade_seed_source",
+            ),
+            (
+                "/api/agents/threads/{thread_id}/workspace-upgrade/seeded",
+                "POST",
+                "agent_vm_upgrade_seeded",
             ),
         }
         for route in moved:
