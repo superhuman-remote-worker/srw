@@ -1,0 +1,51 @@
+#!/usr/bin/env bash
+# =============================================================================
+# Write the settings an agent's shell needs into /etc/environment.
+# =============================================================================
+#
+# sshd starts every session with a fresh environment, so a value set only with
+# Dockerfile ENV, or exported while a VM image is provisioned, never reaches the
+# agent's commands. pam_env loads /etc/environment into every SSH session, login
+# shell or not, so that file is how these settings reach the agent.
+#
+# Values come from this script's own environment: the image's ENV in the
+# container build, explicit assignments in the VM build. Lines for other
+# variables are kept. pam_env does not expand variables, so PATH is written in
+# full.
+#
+# Usage: write-agent-environment [NAME ...]
+#   Always writes PATH, PIP_BREAK_SYSTEM_PACKAGES and npm_config_prefix. An
+#   image built FROM an SRW base image passes the names of its own ENV settings,
+#   and runs it again after changing PATH.
+# =============================================================================
+set -euo pipefail
+
+file="${AGENT_ENVIRONMENT_FILE:-/etc/environment}"
+names=(PATH PIP_BREAK_SYSTEM_PACKAGES npm_config_prefix "$@")
+
+for name in "${names[@]}"; do
+    if ! [[ "$name" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
+        echo "write-agent-environment: not a variable name: $name" >&2
+        exit 2
+    fi
+    value="${!name-}"
+    if [ -z "$value" ]; then
+        echo "write-agent-environment: $name is not set" >&2
+        exit 1
+    fi
+    if [[ "$value" == *'"'* || "$value" == *$'\n'* ]]; then
+        echo "write-agent-environment: $name contains a quote or a newline" >&2
+        exit 1
+    fi
+done
+
+written=$(mktemp)
+trap 'rm -f "$written"' EXIT
+if [ -f "$file" ]; then
+    alternatives=$(IFS='|'; echo "${names[*]}")
+    grep -Ev "^[[:space:]]*(export[[:space:]]+)?(${alternatives})=" "$file" > "$written" || true
+fi
+for name in "${names[@]}"; do
+    printf '%s="%s"\n' "$name" "${!name}" >> "$written"
+done
+install -m 0644 "$written" "$file"

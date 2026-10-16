@@ -903,6 +903,7 @@ jobs:
             docker/browser-exec docker/check-browser-stream.py
             docker/assert-browser-stack.sh
             docker/assert-workspace-contract.sh
+            docker/link-playwright-browsers docker/write-agent-environment
             .playwright-version .dockerignore)
 
           VM_PREPARER_PATHS=(src/vm_controller/__init__.py src/vm_controller/preparation_builder.py src/vm_controller/preparation_firewall.py
@@ -1018,6 +1019,7 @@ jobs:
             docker/agent-vm-base/Dockerfile.containerDisk
             docker/agent-vm-base/files/
             docker/browser-exec docker/check-browser-stream.py
+            docker/link-playwright-browsers docker/write-agent-environment
             vm/sudo-daemon/ vm/sudo-plugin/
             "${VM_BASE_STAGE1_PATHS[@]}")
           VM_BASE_SHA=$(last_input_sha "${VM_BASE_PATHS[@]}")

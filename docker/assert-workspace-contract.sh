@@ -65,6 +65,44 @@ _no_sudo() {
     ! command -v sudo
 }
 
+# The environment of an agent's SSH session: sshd starts it fresh, and pam_env
+# adds /etc/environment. `su -l -s /usr/bin/env` builds the same PAM
+# environment and prints it, with no shell startup file in between.
+_agent_environment() {
+    su -l agent-host -s /usr/bin/env
+}
+
+_agent_has_image_value() {
+    # _agent_has_image_value NAME: unset in the image, or the same for the agent
+    local name="$1" want="${!1-}" got
+    [ -n "$want" ] || return 0
+    got=$(_agent_environment | sed -n "s/^$name=//p")
+    if [ "$got" != "$want" ]; then
+        printf 'image: %s=%s\nagent: %s=%s\n' "$name" "$want" "$name" "$got"
+        return 1
+    fi
+}
+
+_agent_has_image_path() {
+    # Every directory the image adds to the standard PATH is on the agent's.
+    local agent_path dir missing=""
+    agent_path=":$(_agent_environment | sed -n 's/^PATH=//p'):"
+    local IFS=:
+    for dir in $PATH; do
+        case "$dir" in
+            /usr/local/sbin | /usr/local/bin | /usr/sbin | /usr/bin | /sbin | /bin) continue ;;
+        esac
+        case "$agent_path" in
+            *":$dir:"*) ;;
+            *) missing="$missing $dir" ;;
+        esac
+    done
+    if [ -n "$missing" ]; then
+        echo "not on the agent's PATH:$missing"
+        return 1
+    fi
+}
+
 echo "Asserting SRW workspace contract:"
 
 # Readiness: the pod is Ready when sshd answers on 30022 and agent-host can
@@ -117,6 +155,12 @@ _check "/cloud owned by agent-host" _owner_is_agent_host /cloud
 # The sudo policy: agent-host must not be able to escalate.
 _check "no sudo binary"            _no_sudo
 
+# The agent's shell gets the image's settings. SSH sessions don't inherit ENV,
+# so an ENV value missing from /etc/environment is invisible to the agent.
+_check "agent shell: PATH"         _agent_has_image_path
+_check "agent shell: PIP_BREAK_SYSTEM_PACKAGES" _agent_has_image_value PIP_BREAK_SYSTEM_PACKAGES
+_check "agent shell: npm_config_prefix" _agent_has_image_value npm_config_prefix
+
 if [ "$fail" -ne 0 ]; then
     cat >&2 <<'EOF'
 
@@ -127,6 +171,11 @@ examples/manifests/container-workspace-templates.md, section "Images".
 The simplest way is to build FROM an SRW base image:
   ghcr.io/superhuman-remote-worker/srw-workspace-minimal
   ghcr.io/superhuman-remote-worker/srw-workspace
+
+An "agent shell" line means an ENV setting does not reach the agent's SSH
+sessions. In an image built FROM an SRW base image, run
+  RUN /usr/local/bin/write-agent-environment
+after your ENV lines; it copies PATH and these settings into /etc/environment.
 EOF
     exit 1
 fi

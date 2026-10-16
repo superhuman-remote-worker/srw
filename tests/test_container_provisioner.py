@@ -2370,9 +2370,10 @@ class TestDockerfileHardening:
                 )
 
     def test_dockerfile_has_user_writable_pip(self):
-        """Dockerfile must set PIP_TARGET for user-space pip installs."""
+        """pip may install for the agent; as a non-root user it uses ~/.local."""
         content = self._read_file("docker/Dockerfile.workspace")
-        assert "PIP_TARGET=" in content
+        assert "PIP_BREAK_SYSTEM_PACKAGES=1" in content
+        assert "PIP_TARGET" not in content
 
     def test_dockerfile_has_user_writable_npm(self):
         """Dockerfile must set npm_config_prefix for user-space npm installs."""

@@ -29,9 +29,9 @@ rm -rf /var/lib/apt/lists/*
 # Clean pip cache
 rm -rf /root/.cache/pip /home/*/.cache/pip
 
-# Clean Playwright tarball cache (browser binary lives in /opt/playwright;
-# the download tarballs in ~/.cache/ms-playwright are no longer needed)
-rm -rf /root/.cache/ms-playwright /home/*/.cache/ms-playwright
+# Clean root's Playwright cache (the browsers live in /opt/playwright). Not
+# agent-host's: its ~/.cache/ms-playwright holds the links to them (stage2).
+rm -rf /root/.cache/ms-playwright
 
 # Clean npm cache
 npm cache clean --force 2>/dev/null || true

@@ -334,6 +334,37 @@ sudo install -o root -g root -m 0755 /tmp/browser-exec /usr/local/bin/browser-ex
 sudo install -o root -g root -m 0755 /tmp/check-browser-stream.py /usr/local/bin/check-browser-stream
 
 # -----------------------------------------------------------------------------
+# 7b. The agent's shell environment and Playwright browsers
+# -----------------------------------------------------------------------------
+#
+# The same settings as docker/Dockerfile.workspace, through the same two shared
+# scripts. pip refuses Ubuntu's Python unless PIP_BREAK_SYSTEM_PACKAGES is set;
+# with it, agent-host's `pip install` goes to its user site (~/.local) and a
+# virtualenv works as usual. npm's global prefix moves out of root-owned /usr.
+# sshd builds each session's environment with pam_env from /etc/environment,
+# which does not expand variables, so PATH is written in full (Ubuntu's default
+# plus the two user directories).
+#
+# Stage1 images built before this section existed append
+# PLAYWRIGHT_BROWSERS_PATH to /etc/environment. It would send every Playwright
+# version to read-only /opt/playwright; the links replace it.
+
+_section "Writing the agent's environment"
+sudo install -o root -g root -m 0755 /tmp/write-agent-environment /usr/local/bin/write-agent-environment
+sudo install -o root -g root -m 0755 /tmp/link-playwright-browsers /usr/local/bin/link-playwright-browsers
+sudo sed -i '/^PLAYWRIGHT_BROWSERS_PATH=/d' /etc/environment
+sudo env \
+    PATH="/home/agent-host/.local/bin:/home/agent-host/.npm-global/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/games:/usr/local/games:/snap/bin" \
+    PIP_BREAK_SYSTEM_PACKAGES=1 \
+    npm_config_prefix=/home/agent-host/.npm-global \
+    /usr/local/bin/write-agent-environment
+sudo install -d -o agent-host -g agent-host \
+    /home/agent-host/.local /home/agent-host/.local/bin /home/agent-host/.npm-global
+# The VM's home is on the image disk, so linking once here is enough. From /,
+# because the Packer user's home is not readable by agent-host.
+(cd / && sudo -u agent-host -H /usr/local/bin/link-playwright-browsers)
+
+# -----------------------------------------------------------------------------
 # 8. Browser stack conformance gate
 # -----------------------------------------------------------------------------
 #
