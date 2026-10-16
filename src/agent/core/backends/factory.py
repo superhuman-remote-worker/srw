@@ -27,7 +27,9 @@ from shared.backend_kinds import (
 )
 
 
-def create_lite_backend(workspace_config: Any, *, job_id: str) -> WorkspaceBackend:
+def create_lite_backend(
+    workspace_config: Any, *, job_id: str, max_read_bytes: int | None = None
+) -> WorkspaceBackend:
     """Construct the lite backend for ``virtual``/``none``.
 
     Args:
@@ -35,6 +37,8 @@ def create_lite_backend(workspace_config: Any, *, job_id: str) -> WorkspaceBacke
             for ``virtual``, ``.mounts``).
         job_id: Job/thread id — names the scratch tmpdir and provides the
             default object-store key prefix.
+        max_read_bytes: A ``virtual`` backend's single-object read ceiling;
+            None keeps the backend's default.
 
     Raises:
         ValueError: If called for a non-lite backend, or ``virtual`` has no
@@ -60,7 +64,11 @@ def create_lite_backend(workspace_config: Any, *, job_id: str) -> WorkspaceBacke
         mount = mounts[0]
         store = object_store_from_spec(mount)
         prefix = mount.get("prefix") or f"jobs/{job_id}/"
-        return VirtualWorkspaceBackend(store, prefix=prefix)
+        if max_read_bytes is None:
+            return VirtualWorkspaceBackend(store, prefix=prefix)
+        return VirtualWorkspaceBackend(
+            store, prefix=prefix, max_read_bytes=max_read_bytes
+        )
 
     raise ValueError(
         f"create_lite_backend called with non-lite backend {backend!r}; "

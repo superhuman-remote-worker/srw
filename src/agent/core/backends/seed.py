@@ -23,6 +23,13 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+# The largest file the lite-workspace copy reads: the per-file cap on uploads
+# into a virtual workspace (``MAX_FILE_SIZE`` in
+# src/orchestrator/services/thread_uploads.py ~:95; the agent package can't
+# import orchestrator code). A bigger object (one the agent wrote) is skipped
+# with a warning instead of failing every retry; the old prefix keeps it.
+VIRTUAL_UPLOAD_MAX_FILE_BYTES = 100 * 1024 * 1024
+
 # --------------------------------------------------------------------------
 # Seeded-content sentinel
 #
@@ -144,6 +151,7 @@ def seed_workspace(
     dst: "WorkspaceBackend",
     *,
     exclude: "Callable[[str], bool] | None" = None,
+    max_file_bytes: int | None = None,
 ) -> int:
     """Copy every file from ``src`` into ``dst``, preserving relative paths.
 
@@ -163,6 +171,9 @@ def seed_workspace(
         exclude: Paths for which ``exclude(rel)`` is true are neither copied
             nor verified — the stateless upgrade leaves cloud-synced roots to
             the first pull.
+        max_file_bytes: When set, a file the source refuses to read because it
+            is larger than this is skipped with a warning (and not verified)
+            instead of failing the copy. Any other read error still raises.
 
     Returns:
         The number of files written.
@@ -191,6 +202,18 @@ def seed_workspace(
             logger.warning("Seed: skipping unreadable entry %r: %s", rel, e)
             skipped.append(rel)
             continue
+        except ValueError:
+            size = _size_over_limit(src, rel, max_file_bytes)
+            if size is None:
+                raise
+            logger.warning(
+                "Seed: skipping %r: %d bytes is over the %d-byte copy limit",
+                rel,
+                size,
+                max_file_bytes,
+            )
+            skipped.append(rel)
+            continue
         parent = posixpath.dirname(rel)
         if parent:
             dst.mkdir(parent)
@@ -208,13 +231,26 @@ def seed_workspace(
         )
 
     logger.info(
-        "Seeded %d file(s) (skipped %d unreadable) from %s to %s",
+        "Seeded %d file(s) (skipped %d unreadable or oversized) from %s to %s",
         written,
         len(skipped),
         type(src).__name__,
         type(dst).__name__,
     )
     return written
+
+
+def _size_over_limit(
+    src: "WorkspaceBackend", rel: str, limit: int | None
+) -> int | None:
+    """``rel``'s size when it is over ``limit``; None otherwise or unknown."""
+    if limit is None:
+        return None
+    try:
+        size = int(src.stat(rel))
+    except Exception:
+        return None
+    return size if size > limit else None
 
 
 def seed_from_lite_workspace(
@@ -227,7 +263,9 @@ def seed_from_lite_workspace(
     """Copy an old lite workspace (``virtual`` mounts or ``none``) into ``destination``.
 
     Shared by the stateless container upgrade (C1) and the VM upgrade's
-    recovery copy (C2). ``none`` has nothing durable to copy.
+    recovery copy (C2). ``none`` has nothing durable to copy. A file over
+    :data:`VIRTUAL_UPLOAD_MAX_FILE_BYTES` is skipped with a warning; the old
+    prefix keeps it.
     """
     from types import SimpleNamespace
 
@@ -241,5 +279,11 @@ def seed_from_lite_workspace(
     source = create_lite_backend(
         SimpleNamespace(backend="virtual", mounts=list(workspace.get("mounts") or [])),
         job_id=owner_id,
+        max_read_bytes=VIRTUAL_UPLOAD_MAX_FILE_BYTES,
     )
-    return seed_workspace(source, destination, exclude=exclude)
+    return seed_workspace(
+        source,
+        destination,
+        exclude=exclude,
+        max_file_bytes=VIRTUAL_UPLOAD_MAX_FILE_BYTES,
+    )

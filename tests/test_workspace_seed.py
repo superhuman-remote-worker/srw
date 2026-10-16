@@ -11,10 +11,16 @@ object-store prefix down into the freshly provisioned backend via
   * ``seed_workspace`` — recursive copy + verify-before-return.
 """
 
+import logging
+
 import pytest
 
 from shared.runtime.core.backends.object_store import InMemoryObjectStore  # noqa: E402
-from agent.core.backends.seed import seed_workspace  # noqa: E402
+from agent.core.backends import seed as seed_module  # noqa: E402
+from agent.core.backends.seed import (  # noqa: E402
+    seed_from_lite_workspace,
+    seed_workspace,
+)
 from agent.core.backends.virtual import VirtualWorkspaceBackend  # noqa: E402
 from tests._fs_backend import FilesystemTestBackend  # noqa: E402
 
@@ -169,3 +175,55 @@ class TestSeedWorkspace:
         assert n == 1
         assert dst.read_file("plan.md") == "p"
         assert not dst.exists("cloud/shared.md")
+
+
+class TestSeedFromLiteWorkspace:
+    """The shared lite-workspace copy (C1 stateless upgrade; C2 reuses it)."""
+
+    def test_a_file_over_the_ceiling_is_skipped_and_the_copy_succeeds(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        # The old prefix keeps the skipped file (decision 4); one oversized
+        # object must not fail every retry and park the Session.
+        store = InMemoryObjectStore()
+        old = VirtualWorkspaceBackend(store, prefix="threads/t/")
+        old.write_file("plan.md", "p")
+        old.write_file("big.bin", b"x" * 11)
+        monkeypatch.setattr(
+            "shared.runtime.core.backends.rclone.object_store_from_spec",
+            lambda _spec: store,
+        )
+        monkeypatch.setattr(seed_module, "VIRTUAL_UPLOAD_MAX_FILE_BYTES", 10)
+        dst = FilesystemTestBackend(tmp_path)
+
+        with caplog.at_level(logging.WARNING, logger="agent.core.backends.seed"):
+            n = seed_from_lite_workspace(
+                {
+                    "backend": "virtual",
+                    "mounts": [
+                        {"rclone_spec": {"type": "memory"}, "prefix": "threads/t/"}
+                    ],
+                },
+                owner_id="t",
+                destination=dst,
+            )
+
+        assert n == 1
+        assert dst.read_file("plan.md") == "p"
+        assert not dst.exists("big.bin")
+        assert "'big.bin'" in caplog.text and "11 bytes" in caplog.text
+
+    def test_the_ceiling_matches_the_virtual_upload_cap(self):
+        assert seed_module.VIRTUAL_UPLOAD_MAX_FILE_BYTES == 100 * 1024 * 1024
+
+    def test_other_read_errors_still_fail_the_copy(self, tmp_path, monkeypatch):
+        src = _virtual()
+        src.write_file("plan.md", "p")
+
+        def refuse(path, binary=False):
+            raise ValueError("Not a file: plan.md")
+
+        monkeypatch.setattr(src, "read_file", refuse)
+
+        with pytest.raises(ValueError, match="Not a file"):
+            seed_workspace(src, FilesystemTestBackend(tmp_path), max_file_bytes=10)
