@@ -290,6 +290,12 @@ _resume_message_limit: int = int(os.environ.get("RESUME_MESSAGE_LIMIT", "1000"))
 # Phase 2 / Q7.)
 _vm_upgrade_poll_timeout: int = int(os.environ.get("VM_UPGRADE_POLL_TIMEOUT", "900"))
 
+#: An upgrade's event sink: the WebSocket that asked, or the journal (C2).
+UpgradeEmitter = Callable[[str, Dict[str, Any]], Awaitable[None]]
+WORKSPACE_UPGRADE_ALREADY_RUNNING = "A workspace upgrade is already running."
+#: One workspace upgrade per agent process (spec §4.4 "single flight").
+_workspace_upgrade_in_flight: bool = False
+
 # Subscriber registry for headless persistent sessions.
 #
 # Loop-driven output (token chunks, tool events, turn lifecycle, etc.) used to
@@ -11329,9 +11335,28 @@ async def _handle_workspace_upgrade(
     (e.g. an unavailable container-tier template, a tier that isn't higher, an
     unknown name) is surfaced verbatim as the ``workspace_upgrade.failed``
     reason.
+
+    The steps after the orchestrator accepts the request live in
+    ``_run_workspace_upgrade_swap``, which the stateless lane switch's durable
+    consumer (C2) also runs, with the journal as its emitter. One upgrade runs
+    per agent process at a time.
     """
+    global _workspace_upgrade_in_flight
+
+    async def emit(method: str, params: Dict[str, Any]) -> None:
+        await _ws_send(ws, method, params)
+
     if not _session or not _orchestrator_client or not _session_identity.thread_id:
         await _ws_send(ws, "workspace_upgrade.failed", {"reason": "Session not ready"})
+        return
+    if _workspace_upgrade_in_flight:
+        # One upgrade per agent process: the stateless lane switch's durable
+        # upgrade (C2) or another socket's may be running.
+        await _ws_send(
+            ws,
+            "workspace_upgrade.failed",
+            {"reason": WORKSPACE_UPGRADE_ALREADY_RUNNING},
+        )
         return
 
     if getattr(_session, "protected_cloud_required", None) is not False:
@@ -11377,41 +11402,85 @@ async def _handle_workspace_upgrade(
             },
         )
         return
-    await _ws_send(
-        ws,
-        "workspace_upgrade.started",
-        {"thread_id": _session_identity.thread_id, "target_tier": target_tier},
-    )
-
+    _workspace_upgrade_in_flight = True
     try:
-        # Already serves the requested tier — nothing to upgrade (idempotent).
-        # Tier-aware: a sandbox source does NOT satisfy a vm target (sandbox is
-        # shell-capable but unprivileged), so sandbox→vm falls through to provision
-        # below instead of short-circuiting here (workspace_tier_upgrade.md Q8).
-        if _upgrade_already_satisfied(src_backend, target_tier):
-            await _ws_send(
-                ws,
-                "workspace_upgrade.complete",
-                {
-                    "thread_id": _session_identity.thread_id,
-                    "target_tier": target_tier,
-                    "message": f"Workspace already provides the {target_tier} tier",
-                },
-            )
-            return
-
-        # 1. Request provisioning via orchestrator (S2).
-        ok, detail = await _orchestrator_client.request_thread_workspace_upgrade(
-            _session_identity.thread_id, target_tier=target_tier, template=template
+        await _ws_send(
+            ws,
+            "workspace_upgrade.started",
+            {"thread_id": _session_identity.thread_id, "target_tier": target_tier},
         )
-        if not ok:
-            await _ws_send(
-                ws,
-                "workspace_upgrade.failed",
-                {"reason": detail or "Orchestrator rejected workspace upgrade request"},
+
+        try:
+            # Already serves the requested tier — nothing to upgrade (idempotent).
+            # Tier-aware: a sandbox source does NOT satisfy a vm target (sandbox is
+            # shell-capable but unprivileged), so sandbox→vm falls through to provision
+            # below instead of short-circuiting here (workspace_tier_upgrade.md Q8).
+            if _upgrade_already_satisfied(src_backend, target_tier):
+                await _ws_send(
+                    ws,
+                    "workspace_upgrade.complete",
+                    {
+                        "thread_id": _session_identity.thread_id,
+                        "target_tier": target_tier,
+                        "message": f"Workspace already provides the {target_tier} tier",
+                    },
+                )
+                return
+
+            # 1. Request provisioning via orchestrator (S2).
+            ok, detail = await _orchestrator_client.request_thread_workspace_upgrade(
+                _session_identity.thread_id, target_tier=target_tier, template=template
             )
+            if not ok:
+                await _ws_send(
+                    ws,
+                    "workspace_upgrade.failed",
+                    {
+                        "reason": detail
+                        or "Orchestrator rejected workspace upgrade request"
+                    },
+                )
+                return
+        except Exception as e:
+            logger.exception(
+                f"Workspace upgrade failed for thread {_session_identity.thread_id}"
+            )
+            if target_tier == "vm" and _orchestrator_client is not None:
+                try:
+                    await _orchestrator_client.abort_thread_vm_upgrade(
+                        _session_identity.thread_id
+                    )
+                except Exception as ee:
+                    logger.warning(
+                        f"VM teardown after upgrade failure ({_session_identity.thread_id}): {ee}"
+                    )
+            await _ws_send(ws, "workspace_upgrade.failed", {"reason": str(e)})
             return
 
+        await _run_workspace_upgrade_swap(
+            emit, target_tier=target_tier, src_backend=src_backend
+        )
+    finally:
+        _workspace_upgrade_in_flight = False
+
+
+async def _run_workspace_upgrade_swap(
+    emit: UpgradeEmitter,
+    *,
+    target_tier: str,
+    src_backend: Any,
+    before_swap: Optional[Callable[[int], Awaitable[None]]] = None,
+) -> None:
+    """Steps 2-7 of a workspace upgrade, after the orchestrator accepted it.
+
+    Poll readiness, connect, seed from the live lite backend, swap, remount
+    the cloud folders, retool, re-open sudo on a VM, persist the tier, and
+    emit ``.complete``; on any failure tear a VM down and emit ``.failed``.
+    The WebSocket verb passes ``_ws_send`` for ``emit`` (frames unchanged);
+    the stateless lane switch's durable consumer passes the journal (C2) and a
+    ``before_swap`` that records the seed marker.
+    """
+    try:
         # 2. Poll for readiness, then normalize to a {"backend", "remote"} block.
         #    A vm provisions through metadata.vm (vm_status), which _poll_vm_ready
         #    tolerates through the async provisioning window and bails promptly on
@@ -11423,8 +11492,7 @@ async def _handle_workspace_upgrade(
             async def _emit_vm_progress(elapsed_s: int) -> None:
                 # Heartbeat the cockpit so a multi-minute cold VM import isn't a
                 # silent black box (workspace_tier_upgrade.md Q7).
-                await _ws_send(
-                    ws,
+                await emit(
                     "workspace_upgrade.progress",
                     {
                         "thread_id": _session_identity.thread_id,
@@ -11477,8 +11545,7 @@ async def _handle_workspace_upgrade(
                     logger.warning(
                         f"VM abort/teardown after failed upgrade ({_session_identity.thread_id}): {e}"
                     )
-            await _ws_send(
-                ws,
+            await emit(
                 "workspace_upgrade.failed",
                 {"reason": f"{target_tier} workspace did not become ready in time"},
             )
@@ -11576,13 +11643,20 @@ async def _handle_workspace_upgrade(
         ):
             # 5. Seed the new workspace from the live virtual prefix (S3a).
             #    Pure in-process copy (the agent holds the object-store creds).
-            #    Run off the event loop — SFTP writes are blocking.
+            #    Run off the event loop — SFTP writes are blocking. A file over
+            #    the live virtual backend's read ceiling is skipped with a
+            #    warning (the old prefix keeps it) instead of failing every
+            #    upgrade after the VM is Ready (C2).
             seeded = 0
             if src_backend is not None:
                 from agent.core.backends.seed import seed_workspace
+                from agent.core.backends.virtual import DEFAULT_MAX_READ_BYTES
 
                 seeded = await asyncio.to_thread(
-                    seed_workspace, src_backend, new_backend
+                    seed_workspace,
+                    src_backend,
+                    new_backend,
+                    max_file_bytes=DEFAULT_MAX_READ_BYTES,
                 )
                 logger.info(
                     f"Seeded {seeded} file(s) into upgraded workspace for {_session_identity.thread_id}"
@@ -11590,6 +11664,11 @@ async def _handle_workspace_upgrade(
 
             # 6. Hot-swap + re-derive the toolset (S1) so shell/git/file tools
             #    appear on the next turn (get_current_tools re-reads per turn).
+            if before_swap is not None:
+                # C2: record the copy durably before any turn can write to
+                # the new workspace; a failure here tears the VM down below.
+                await before_swap(seeded)
+
             _session.swap_backend(new_backend)
 
         # 6a. Re-establish the OpenCloud cloud mount on the NEW backend. The
@@ -11618,8 +11697,7 @@ async def _handle_workspace_upgrade(
                 await _session._setup_cloud_mount(_fresh_cloud_mount)
                 _mgr = _session.cloud_mount_manager
                 if _mgr is None or not getattr(_mgr, "active", False):
-                    await _ws_send(
-                        ws,
+                    await emit(
                         "workspace_upgrade.cloud_mount_degraded",
                         {
                             "thread_id": _session_identity.thread_id,
@@ -11662,8 +11740,7 @@ async def _handle_workspace_upgrade(
         except Exception as e:
             logger.warning(f"Persisting upgraded tier failed (non-fatal): {e}")
 
-        await _ws_send(
-            ws,
+        await emit(
             "workspace_upgrade.complete",
             {
                 "thread_id": _session_identity.thread_id,
@@ -11693,7 +11770,7 @@ async def _handle_workspace_upgrade(
                 logger.warning(
                     f"VM teardown after upgrade failure ({_session_identity.thread_id}): {ee}"
                 )
-        await _ws_send(ws, "workspace_upgrade.failed", {"reason": str(e)})
+        await emit("workspace_upgrade.failed", {"reason": str(e)})
 
 
 async def _poll_vm_ready(

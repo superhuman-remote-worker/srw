@@ -4916,7 +4916,7 @@ class TestHandleWorkspaceUpgradeVm:
             ),
             patch(
                 "agent.core.backends.seed.seed_workspace",
-                side_effect=lambda src, dst: seeded.set() or 0,
+                side_effect=lambda src, dst, **_kw: seeded.set() or 0,
             ),
         ):
             seeded = threading.Event()
