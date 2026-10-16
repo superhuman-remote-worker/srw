@@ -240,6 +240,54 @@ def _request(outcome=None, error_code=None):
         ),
         ("pinned", {"status": "failed"}, None, None),
         ("stateless", None, _request(), None),
+        (
+            "pinned",
+            {"status": "failed", "upgrade_seed": PENDING_MARKER},
+            _request("applied"),
+            {"target_tier": "vm", "phase": "failed", "reason_code": "upgrade_failed"},
+        ),
+        (
+            "pinned",
+            {"status": "failed", "upgrade_seed": SEEDED_MARKER},
+            _request("applied"),
+            None,
+        ),
+        (
+            "pinned",
+            {"status": "ready", "upgrade_seed": SEEDED_MARKER},
+            _request("rejected", "upgrade_interrupted"),
+            {
+                "target_tier": "vm",
+                "phase": "failed",
+                "reason_code": "upgrade_interrupted",
+            },
+        ),
+        (
+            "pinned",
+            {"status": "ready", "upgrade_seed": PENDING_MARKER},
+            _request("rejected", "upgrade_interrupted"),
+            {
+                "target_tier": "vm",
+                "phase": "failed",
+                "reason_code": "upgrade_interrupted",
+            },
+        ),
+        (
+            "pinned",
+            {"status": "ready", "upgrade_seed": None},
+            _request("rejected", "upgrade_interrupted"),
+            {
+                "target_tier": "vm",
+                "phase": "failed",
+                "reason_code": "upgrade_interrupted",
+            },
+        ),
+        (
+            "pinned",
+            {"status": "ready", "upgrade_seed": None},
+            _request("applied"),
+            None,
+        ),
     ],
     ids=[
         "requested",
@@ -252,6 +300,12 @@ def _request(outcome=None, error_code=None):
         "a-later-websocket-retry-succeeded",
         "websocket-path-failure",
         "not-pinned",
+        "vm-failed-before-the-copy",
+        "a-later-vm-failure-after-success",
+        "interrupted-under-a-seeded-marker",
+        "interrupted-under-a-pending-marker",
+        "interrupted-without-a-marker",
+        "a-ready-vm-with-an-applied-request",
     ],
 )
 def test_workspace_upgrade_view_reports_the_vm_phases(lane, vm, latest, expected):

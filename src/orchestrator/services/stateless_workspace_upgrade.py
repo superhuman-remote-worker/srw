@@ -27,6 +27,7 @@ from shared.backend_kinds import LITE_BACKENDS
 from shared.run_queue import LANE_PINNED, LANE_STATELESS
 from shared.workspace_upgrade import (
     UPGRADE_FAILED,
+    UPGRADE_INTERRUPTED,
     VM_UPGRADE_SEED_PENDING,
     WORKSPACE_UPGRADE_FAILURE_CODES,
     WORKSPACE_UPGRADE_SEED_VERSION,
@@ -307,8 +308,26 @@ def _vm_upgrade_view(
     vm = metadata.get("vm")
     status = vm.get("status") if isinstance(vm, Mapping) else None
     marker = vm_upgrade_seed(metadata)
+    if (
+        latest_request is not None
+        and thread.get("execution_lane") == LANE_PINNED
+        and latest_request.get("outcome") == "rejected"
+        and latest_request.get("error_code") == UPGRADE_INTERRUPTED
+    ):
+        # The agent reports this on a VM attach, so the VM is already ready:
+        # the receipt, not the working VM, is what a reload must show.
+        return {
+            "target_tier": "vm",
+            "phase": "failed",
+            "reason_code": UPGRADE_INTERRUPTED,
+        }
     if marker is not None:
-        if status in ("failed", "aborted"):
+        # ``aborted`` is written only by the upgrade's abort route. A
+        # ``seeded`` marker means the VM reached Ready, so a later provisioning
+        # failure (the CAS keeps the marker) isn't the upgrade's.
+        if status == "aborted" or (
+            status == "failed" and marker["state"] == VM_UPGRADE_SEED_PENDING
+        ):
             return {
                 "target_tier": "vm",
                 "phase": "failed",
