@@ -8,7 +8,7 @@ import logging
 import os
 import socket
 from dataclasses import dataclass
-from typing import Any, Awaitable, Callable, Optional
+from typing import Any, Awaitable, Callable, NoReturn, Optional
 from uuid import UUID
 
 import httpx
@@ -93,6 +93,28 @@ class SessionGrantDenied(Exception):
     ) -> None:
         super().__init__(detail)
         self.cleanup_identity = cleanup_identity
+
+
+class WorkspaceUpgradeRouteMissing(RuntimeError):
+    """An orchestrator replica that predates the C2 seed routes answered 404."""
+
+
+def _raise_workspace_upgrade_route_error(response: Any) -> NoReturn:
+    """Raise for a non-200 answer of a VM upgrade seed route (C2).
+
+    FastAPI's unknown-route answer (404 ``Not Found``) means this replica
+    predates the route (a rolling deploy): ``WorkspaceUpgradeRouteMissing``,
+    which the caller retries. Anything else is a refusal.
+    """
+    try:
+        detail = response.json().get("detail")
+    except (ValueError, AttributeError):
+        detail = None
+    if response.status_code == 404 and detail == "Not Found":
+        raise WorkspaceUpgradeRouteMissing(str(response.request.url))
+    raise RuntimeError(
+        f"workspace upgrade seed route answered {response.status_code}: {detail}"
+    )
 
 
 class SessionEnded(Exception):
@@ -1792,6 +1814,101 @@ class OrchestratorClient:
         except Exception as e:
             logger.error(f"Workspace upgrade request error: {e}")
             return False, None
+
+    def _pinned_identity_headers(self) -> dict[str, str]:
+        """The exact pinned runtime identity the credential routes bind to."""
+        headers: dict[str, str] = {}
+        if self.agent_id:
+            headers["X-Agent-ID"] = self.agent_id
+        if self.session_runtime_generation:
+            headers["X-Session-Runtime-Generation"] = self.session_runtime_generation
+        if self.session_runtime_attach_token:
+            headers["X-Session-Runtime-Attach-Token"] = (
+                self.session_runtime_attach_token
+            )
+        return headers
+
+    async def request_vm_upgrade_for_control(
+        self, thread_id: str, *, template: str | None, control_request_id: str
+    ) -> tuple[bool, int | None, str | None]:
+        """Ask for the VM a stateless lane switch's request names (C2).
+
+        ``(accepted, status, detail)``. ``status`` is None when no HTTP answer
+        arrived (the caller leaves the request pending and retries); any HTTP
+        answer other than 200 is a refusal whose ``detail`` is the
+        orchestrator's text, or the message/code of a typed refusal.
+        """
+        if not self._client:
+            await self.connect()
+        url = (
+            f"{self.orchestrator_url}"
+            f"/api/agents/threads/{thread_id}/upgrade-to-workspace"
+        )
+        payload: dict[str, str] = {
+            "target_tier": "vm",
+            "control_request_id": control_request_id,
+        }
+        if template:
+            payload["template"] = template
+        try:
+            response = await self._client.post(url, json=payload)
+        except Exception as exc:
+            logger.warning(
+                "VM upgrade request for control %s failed in transport: %s",
+                control_request_id,
+                exc,
+            )
+            return False, None, None
+        if response.status_code == 200:
+            return True, 200, None
+        try:
+            detail = response.json().get("detail")
+        except (ValueError, AttributeError):
+            detail = None
+        if isinstance(detail, dict):
+            detail = detail.get("message") or detail.get("code")
+        logger.warning(
+            "VM upgrade request for control %s refused: %s %s",
+            control_request_id,
+            response.status_code,
+            detail,
+        )
+        return False, response.status_code, str(detail) if detail else None
+
+    async def get_workspace_upgrade_seed_source(self, thread_id: str) -> dict:
+        """The old lite workspace a pending VM upgrade still owes (C2)."""
+        if not self._client:
+            await self.connect()
+        url = (
+            f"{self.orchestrator_url}"
+            f"/api/agents/threads/{thread_id}/workspace-upgrade/seed-source"
+        )
+        response = await self._client.get(url, headers=self._pinned_identity_headers())
+        if response.status_code == 200:
+            return response.json()
+        _raise_workspace_upgrade_route_error(response)
+
+    async def mark_workspace_upgrade_seeded(
+        self, thread_id: str, *, provision_generation: str, control_request_id: str
+    ) -> None:
+        """Record a verified VM upgrade copy before the swap (C2)."""
+        if not self._client:
+            await self.connect()
+        url = (
+            f"{self.orchestrator_url}"
+            f"/api/agents/threads/{thread_id}/workspace-upgrade/seeded"
+        )
+        response = await self._client.post(
+            url,
+            json={
+                "provision_generation": provision_generation,
+                "control_request_id": control_request_id,
+            },
+            headers=self._pinned_identity_headers(),
+        )
+        if response.status_code == 200:
+            return
+        _raise_workspace_upgrade_route_error(response)
 
     async def get_thread_workspace(
         self,

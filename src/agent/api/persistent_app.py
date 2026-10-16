@@ -130,6 +130,7 @@ from shared.thread_presence import (
 )
 from shared.session_retirement import update_stateless_claim_status
 from shared.workspace_upgrade import (
+    UPGRADE_FAILED,
     WORKSPACE_UPGRADE_PAYLOAD_KEYS,
     WORKSPACE_UPGRADE_VERB,
 )
@@ -295,6 +296,14 @@ UpgradeEmitter = Callable[[str, Dict[str, Any]], Awaitable[None]]
 WORKSPACE_UPGRADE_ALREADY_RUNNING = "A workspace upgrade is already running."
 #: One workspace upgrade per agent process (spec §4.4 "single flight").
 _workspace_upgrade_in_flight: bool = False
+#: C2: a recovery copy made at owner start, until the first drain receipts it
+#: or ``_announce_recovered_vm_upgrade`` journals it.
+_recovered_vm_upgrade: Optional[Dict[str, Any]] = None
+_VM_UPGRADE_CANCELLED_REASON = "The VM upgrade was cancelled when this Session ended."
+_VM_UPGRADE_INTERRUPTED_REASON = (
+    "The VM upgrade was interrupted before your files were copied. "
+    "End this Session and start a new one."
+)
 
 # Subscriber registry for headless persistent sessions.
 #
@@ -439,7 +448,13 @@ async def _open_event_journal() -> None:
     writer.start()
     _event_writer = writer
     if live_lease is None and pinned_agent_id is not None:
+        # C2: a VM upgrade whose agent was lost after the VM request still owes
+        # its copy; make it before the first drain and before /ready. A failure
+        # raises: the attach coordinator aborts the attach and a later one
+        # retries, so no turn runs on an un-copied VM.
+        await _recover_pinned_vm_upgrade_seed()
         await _start_thread_control_watcher(agent_id=pinned_agent_id)
+        _announce_recovered_vm_upgrade()
 
 
 # Session attachment: the attach sequence, failed-attach cleanup and release
@@ -4127,10 +4142,14 @@ _UPGRADE_PAYLOAD_KEYS = WORKSPACE_UPGRADE_PAYLOAD_KEYS
 
 
 def _valid_workspace_upgrade_payload(payload: Any) -> bool:
-    """C1's container request: no tier (the next one) or ``sandbox``."""
+    """An upgrade request: no tier, ``sandbox`` (C1) or ``vm`` (C2).
+
+    The owner's lane picks the slice: a lease owner (stateless) serves
+    container requests; the pinned owner serves the lane switch's requests.
+    """
     if not isinstance(payload, dict) or not set(payload) <= _UPGRADE_PAYLOAD_KEYS:
         return False
-    if payload.get("target_tier", "sandbox") != "sandbox":
+    if payload.get("target_tier", "sandbox") not in ("sandbox", "vm"):
         return False
     template = payload.get("template")
     return template is None or (isinstance(template, str) and bool(template))
@@ -4494,6 +4513,14 @@ async def _drain_thread_controls(
                     )
                 if result == outcome:
                     _apply_control_request(request)
+                    if (
+                        agent_id is not None
+                        and request.verb == WORKSPACE_UPGRADE_VERB
+                        and receipt.kind == "workspace_upgrade.started"
+                    ):
+                        # The receipt landed but its finalization didn't: the
+                        # VM was requested, so run the swap now.
+                        _resume_vm_upgrade_from_receipt(request, receipt.payload)
                 else:
                     await _reconcile_durable_control_scalars(
                         lease_token=lease_token,
@@ -4512,6 +4539,7 @@ async def _drain_thread_controls(
 
             event_kind, outcome, error_code = _describe_control_request(request)
             effect_params: Dict[str, Any] = {}
+            after_receipt: Optional[Callable[[], None]] = None
             if outcome == "applied" and request.verb == "workspace.undo":
                 if _session is None:
                     raise ControlInboxBlocked(
@@ -4545,6 +4573,20 @@ async def _drain_thread_controls(
                     error_code,
                     effect_params,
                 ) = await _apply_compact_control(request, lease_token=lease_token)
+            elif (
+                outcome == "applied"
+                and request.verb == WORKSPACE_UPGRADE_VERB
+                and agent_id is not None
+            ):
+                (
+                    event_kind,
+                    outcome,
+                    error_code,
+                    effect_params,
+                    after_receipt,
+                ) = await _apply_vm_workspace_upgrade_control(
+                    request, agent_id=agent_id
+                )
             elif outcome == "applied" and request.verb == WORKSPACE_UPGRADE_VERB:
                 (
                     event_kind,
@@ -4573,6 +4615,9 @@ async def _drain_thread_controls(
                 # The envelope above wins over any same-named effect key.
                 params = {**effect_params, **params}
             else:
+                if request.verb == WORKSPACE_UPGRADE_VERB:
+                    # A typed upgrade failure keeps its tier and reason (C2).
+                    params = {**effect_params, **params}
                 params["error_code"] = error_code
 
             journal_started = time.perf_counter()
@@ -4607,6 +4652,8 @@ async def _drain_thread_controls(
                 )
             if result == outcome:
                 _apply_control_request(request)
+                if after_receipt is not None:
+                    after_receipt()
             else:
                 await _reconcile_durable_control_scalars(
                     lease_token=lease_token,
@@ -10019,8 +10066,12 @@ async def _apply_workspace_upgrade_control(
     """
     from agent.api.workspace_upgrade_seed import take_seed_result
 
+    if request.payload.get("target_tier") == "vm":
+        # C2's requests are served by the pinned owner after the lane switch;
+        # a stateless claimant never serves one (C1's test_a_vm_target_is_not_c1s).
+        return "control.rejected", "rejected", "unsupported_control", {}
     if lease_token is None:
-        # Admission keeps the verb off the pinned inbox (it has a socket verb).
+        # The pinned owner's drain serves the verb in C2's branch, never here.
         return "control.rejected", "rejected", "unsupported_control", {}
     if (
         _session is None
@@ -10036,6 +10087,266 @@ async def _apply_workspace_upgrade_control(
     if seeded is not None:
         params["seeded_files"] = seeded
     return "workspace_upgrade.complete", "applied", None, params
+
+
+def _journaled_upgrade_emitter(envelope: Dict[str, Any]) -> UpgradeEmitter:
+    """Emit a durable upgrade's events to every tab through the journal (C2)."""
+
+    async def emit(method: str, params: Dict[str, Any]) -> None:
+        payload = dict(params)
+        if method == "workspace_upgrade.failed":
+            payload.setdefault("error_code", UPGRADE_FAILED)
+        payload.update(envelope)
+        _broadcast(method, payload)
+
+    return emit
+
+
+async def _mark_vm_upgrade_seeded(
+    *, control_request_id: str, provision_generation: str
+) -> None:
+    """The durable path's ``before_swap``: record the copy or fail before the swap."""
+    from agent.api.vm_upgrade_handoff import call_with_route_retry
+
+    client = _orchestrator_client
+    thread_id = _session_identity.thread_id
+    if client is None or thread_id is None:
+        raise WorkspaceUnavailableError("the VM upgrade lost its session")
+    await call_with_route_retry(
+        lambda: client.mark_workspace_upgrade_seeded(
+            str(thread_id),
+            provision_generation=provision_generation,
+            control_request_id=control_request_id,
+        )
+    )
+
+
+def _start_durable_vm_upgrade(request: Any, *, provision_generation: str) -> None:
+    """Run the VM hot swap for a receipted C2 request, journaling its events.
+
+    Takes the single flight now, so no other upgrade starts before the task
+    runs. The task's ``finally`` releases it; a task cancelled before its first
+    step never runs that ``finally``, so a done-callback releases it then.
+    """
+    global _workspace_upgrade_in_flight
+    if _workspace_upgrade_in_flight or _session is None:
+        return
+    envelope = {
+        "request_id": str(request.id),
+        "client_request_id": str(request.client_request_id),
+    }
+    src_backend = (
+        _session.workspace_manager.backend if _session.workspace_manager else None
+    )
+    control_request_id = str(request.id)
+    started = False
+
+    async def before_swap(_seeded: int) -> None:
+        await _mark_vm_upgrade_seeded(
+            control_request_id=control_request_id,
+            provision_generation=provision_generation,
+        )
+
+    async def run() -> None:
+        global _workspace_upgrade_in_flight
+        nonlocal started
+        started = True
+        try:
+            await _run_workspace_upgrade_swap(
+                _journaled_upgrade_emitter(envelope),
+                target_tier="vm",
+                src_backend=src_backend,
+                before_swap=before_swap,
+            )
+        finally:
+            _workspace_upgrade_in_flight = False
+
+    def release_if_never_started(_task: "asyncio.Task[None]") -> None:
+        # The flag stayed set from here to the task's end, so no other upgrade
+        # can own it yet; only an unstarted task leaves it to this callback.
+        global _workspace_upgrade_in_flight
+        if not started:
+            _workspace_upgrade_in_flight = False
+
+    _workspace_upgrade_in_flight = True
+    try:
+        task = asyncio.create_task(run(), name=f"vm-upgrade-{control_request_id[:8]}")
+    except BaseException:
+        _workspace_upgrade_in_flight = False
+        raise
+    task.add_done_callback(release_if_never_started)
+    _session_termination.track_session_side_task(task)
+
+
+def _resume_vm_upgrade_from_receipt(request: Any, payload: Any) -> None:
+    """A ``.started`` receipt found without its finalization: start the swap."""
+    if _session is None or _workspace_upgrade_in_flight:
+        return
+    if str(getattr(_session, "workspace_backend_tier", "") or "") not in (
+        "virtual",
+        "none",
+    ):
+        return
+    provision_generation = (payload or {}).get("provision_generation")
+    if isinstance(provision_generation, str) and provision_generation:
+        _start_durable_vm_upgrade(request, provision_generation=provision_generation)
+
+
+async def _apply_vm_workspace_upgrade_control(
+    request: Any, *, agent_id: str
+) -> tuple[str, str, Optional[str], Dict[str, Any], Optional[Callable[[], None]]]:
+    """C2: consume the lane switch's VM upgrade request on the pinned owner.
+
+    Returns the receipt (event kind, outcome, error code, params) and a
+    callable the drain runs once the receipt is final; it starts the hot swap.
+    The receipt is written at ``.started``, after the VM request, so the
+    strictly ordered inbox isn't held for a VM boot (spec §3).
+    """
+    from agent.api.vm_upgrade_handoff import (
+        ROW_BUSY,
+        ROW_CANCEL,
+        ROW_COMPLETE,
+        ROW_INTERRUPTED,
+        ROW_REQUEST,
+        vm_upgrade_consumer_row,
+        vm_upgrade_payload,
+    )
+    from shared.workspace_upgrade import (
+        UPGRADE_ALREADY_RUNNING,
+        UPGRADE_CANCELLED,
+        UPGRADE_INTERRUPTED,
+        UPGRADE_REFUSED,
+        vm_provision_generation,
+        vm_upgrade_seed,
+    )
+
+    global _recovered_vm_upgrade
+    parsed = vm_upgrade_payload(request.payload)
+    if (
+        parsed is None
+        or _session is None
+        or _session.postgres_conn is None
+        or _orchestrator_client is None
+        or _session_identity.thread_id is None
+    ):
+        return "control.rejected", "rejected", "unsupported_control", {}, None
+    generation, template = parsed
+    thread_id = str(_session_identity.thread_id)
+    tier = str(getattr(_session, "workspace_backend_tier", "") or "")
+    marker = None
+    if tier == "vm":
+        thread = await _session.postgres_conn.get_thread(thread_id)
+        marker = vm_upgrade_seed((thread or {}).get("metadata"))
+    row = vm_upgrade_consumer_row(
+        attached_tier=tier,
+        payload_generation=generation,
+        current_generation=str(_session_identity.session_generation or ""),
+        marker=marker,
+        request_id=str(request.id),
+        recovered=_recovered_vm_upgrade,
+        in_flight=_workspace_upgrade_in_flight,
+    )
+    params: Dict[str, Any] = {"target_tier": "vm"}
+
+    def failed(
+        code: str, reason: str
+    ) -> tuple[str, str, Optional[str], Dict[str, Any], None]:
+        return (
+            "workspace_upgrade.failed",
+            "rejected",
+            code,
+            {**params, "reason": reason},
+            None,
+        )
+
+    if row == ROW_CANCEL:
+        return failed(UPGRADE_CANCELLED, _VM_UPGRADE_CANCELLED_REASON)
+    if row == ROW_BUSY:
+        return failed(UPGRADE_ALREADY_RUNNING, WORKSPACE_UPGRADE_ALREADY_RUNNING)
+    if row == ROW_INTERRUPTED:
+        return failed(UPGRADE_INTERRUPTED, _VM_UPGRADE_INTERRUPTED_REASON)
+    if row == ROW_COMPLETE:
+        recovered = _recovered_vm_upgrade
+        if recovered is not None and recovered.get("control_request_id") == str(
+            request.id
+        ):
+            params["seeded_files"] = int(recovered["seeded_files"])
+            _recovered_vm_upgrade = None
+        return "workspace_upgrade.complete", "applied", None, params, None
+    if row != ROW_REQUEST:
+        return failed(
+            UPGRADE_REFUSED, "This Session's workspace can't take a VM upgrade."
+        )
+
+    (
+        accepted,
+        status,
+        detail,
+    ) = await _orchestrator_client.request_vm_upgrade_for_control(
+        thread_id, template=template, control_request_id=str(request.id)
+    )
+    if status is None:
+        # No HTTP answer: leave the request pending; the watcher retries.
+        raise ControlInboxBlocked(
+            f"VM upgrade request did not reach the orchestrator: {request.id}"
+        )
+    if not accepted:
+        return failed(UPGRADE_REFUSED, detail or "SRW refused the VM upgrade.")
+    thread = await _session.postgres_conn.get_thread(thread_id)
+    provision_generation = vm_provision_generation((thread or {}).get("metadata"))
+    if provision_generation is None:
+        raise ControlInboxBlocked(
+            f"VM upgrade accepted without a provision generation: {request.id}"
+        )
+    params["provision_generation"] = provision_generation
+    return (
+        "workspace_upgrade.started",
+        "applied",
+        None,
+        params,
+        lambda: _start_durable_vm_upgrade(
+            request, provision_generation=provision_generation
+        ),
+    )
+
+
+async def _recover_pinned_vm_upgrade_seed() -> None:
+    """C2 (D4 (a)): finish a lost predecessor's VM upgrade copy at owner start."""
+    global _recovered_vm_upgrade
+    _recovered_vm_upgrade = None
+    if (
+        _session is None
+        or _session.postgres_conn is None
+        or _orchestrator_client is None
+        or _session_identity.thread_id is None
+        or str(getattr(_session, "workspace_backend_tier", "") or "") != "vm"
+    ):
+        return
+    from agent.api.vm_upgrade_handoff import recover_vm_upgrade_seed
+
+    _recovered_vm_upgrade = await recover_vm_upgrade_seed(
+        session=_session,
+        client=_orchestrator_client,
+        thread_id=str(_session_identity.thread_id),
+    )
+
+
+def _announce_recovered_vm_upgrade() -> None:
+    """Journal a recovery copy whose request was already receipted (C2)."""
+    global _recovered_vm_upgrade
+    recovered = _recovered_vm_upgrade
+    _recovered_vm_upgrade = None
+    if recovered is None:
+        return
+    _broadcast(
+        "workspace_upgrade.complete",
+        {
+            "thread_id": str(_session_identity.thread_id),
+            "target_tier": "vm",
+            "seeded_files": int(recovered["seeded_files"]),
+            "request_id": recovered["control_request_id"],
+        },
+    )
 
 
 async def _apply_compact_control(
