@@ -24117,9 +24117,21 @@ class PostgresDB:
                     "pull_deadline",
                     "readiness_deadline",
                     "ssh_deadline",
+                    "container_exited",
                 }
                 or budgets is not None
             ):
+                return False
+            if observation.reason_code == "container_exited":
+                # Positive exit evidence for Jobs only (owner decision,
+                # 2026-10-06). The code must fit the integer column.
+                if (
+                    owner_kind != "job"
+                    or type(observation.exit_code) is not int
+                    or not -(2**31) <= observation.exit_code < 2**31
+                ):
+                    return False
+            elif observation.exit_code is not None:
                 return False
         else:
             return False
@@ -24247,6 +24259,7 @@ class PostgresDB:
                 pull_seconds = receipt["pull_budget_seconds"]
                 ssh_seconds = receipt["ssh_budget_seconds"]
                 attention_at = None
+                exit_code = None
 
                 if isinstance(observation, Unscheduled):
                     if scheduled_at is not None:
@@ -24339,15 +24352,26 @@ class PostgresDB:
                             hard_bound + timedelta(seconds=ssh_seconds),
                         ):
                             return False
+                    elif reason == "container_exited":
+                        # Like invalid_image, no elapsed clock is needed; an
+                        # exit after the first Ready is not a startup exit.
+                        if first_ready_at is not None:
+                            return False
+                        exit_code = observation.exit_code
                     stage, state, attention_at = "readiness", "attention", now
 
+                exit_code_args = () if exit_code is None else (exit_code,)
                 result = await conn.execute(
                     "UPDATE managed_repository_workspace_creation_reservations "
                     "SET startup_protocol_version=1, startup_stage=$2, "
                     "startup_state=$3, startup_reason_code=$4, scheduled_at=$5, "
                     "startup_first_ready_at=$6, ready_budget_seconds=$7, "
                     "pull_budget_seconds=$8, ssh_budget_seconds=$9, "
-                    "startup_attention_at=$10 WHERE id=$1 "
+                    "startup_attention_at=$10"
+                    # Named only when present, so the writer still works on a
+                    # schema that predates the column.
+                    + (", startup_exit_code=$12" if exit_code_args else "")
+                    + " WHERE id=$1 "
                     "AND claim_token=$11 AND phase='runtime_bound' "
                     "AND settled_at IS NULL AND cancel_requested_at IS NULL "
                     "AND expires_at > clock_timestamp()",
@@ -24362,6 +24386,7 @@ class PostgresDB:
                     ssh_seconds,
                     attention_at,
                     claim_token,
+                    *exit_code_args,
                 )
                 return result == "UPDATE 1"
 

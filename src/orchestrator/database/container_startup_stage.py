@@ -41,9 +41,14 @@ class ReadyObservedAt:
 
 @dataclass(frozen=True, slots=True)
 class StartupAttention:
-    """An attested invalidity or elapsed frozen startup bound."""
+    """An attested invalidity, exit or elapsed frozen startup bound.
+
+    ``exit_code`` is set only with ``container_exited``: the exact Job Pod's
+    own process stopped before its first Ready.
+    """
 
     reason_code: str
+    exit_code: int | None = None
 
 
 SchedulingObservation: TypeAlias = Unknown | Unscheduled | ScheduledAt

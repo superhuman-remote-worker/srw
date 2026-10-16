@@ -137,8 +137,16 @@ async def test_cancelled_started_job_hands_off_then_cleans_exact_runtime(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "attention",
+    [
+        StartupAttention("readiness_deadline"),
+        StartupAttention("container_exited", exit_code=17),
+    ],
+    ids=["readiness-deadline", "container-exited"],
+)
 async def test_cancelled_exit17_before_ready_reuses_exact_terminal_intent_and_reclaims(
-    db, monkeypatch
+    db, monkeypatch, attention
 ):
     """A failed but fully terminated original Pod must not strand its prepared intent."""
 
@@ -170,22 +178,30 @@ async def test_cancelled_exit17_before_ready_reuses_exact_terminal_intent_and_re
         budgets=StageBudgets(ready_seconds=1, pull_seconds=1, ssh_seconds=1),
         adopt_if_unmarked=True,
     )
-    await asyncio.sleep(1.1)
+    if attention.reason_code == "readiness_deadline":
+        await asyncio.sleep(1.1)
     assert await db.observe_container_startup(
         owner_kind="job",
         owner_id=str(job),
         reservation_id=str(reservation["id"]),
         claim_token=int(reservation["claim_token"]),
         pod_uid=runtime_uid,
-        observation=StartupAttention("readiness_deadline"),
+        observation=attention,
     )
     source = await db.fetchrow(
         "SELECT startup_protocol_version,startup_stage,startup_state,"
-        "startup_reason_code,startup_first_ready_at FROM "
+        "startup_reason_code,startup_first_ready_at,startup_exit_code FROM "
         "managed_repository_workspace_creation_reservations WHERE id=$1",
         reservation["id"],
     )
-    assert tuple(source) == (1, "readiness", "attention", "readiness_deadline", None)
+    assert tuple(source) == (
+        1,
+        "readiness",
+        "attention",
+        attention.reason_code,
+        None,
+        attention.exit_code,
+    )
 
     assert await db.cancel_job(str(job))
     intent_before = await db.fetchrow(

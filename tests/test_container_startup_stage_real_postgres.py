@@ -1153,3 +1153,140 @@ async def test_populated_upgrade_validates_v2_without_changing_receipts(tmp_path
         finally:
             await store.close()
             await pool.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("exit_code", [3, 0])
+async def test_writer_records_container_exited_with_its_code(db, exit_code):
+    _job_id, reservation, _pod_uid, _gate, kwargs, scheduled_at = await _starting_job(
+        db
+    )
+    assert await db.observe_container_startup(
+        **kwargs,
+        observation=StartupAttention("container_exited", exit_code=exit_code),
+    )
+    row = await _reservation(db, reservation)
+    assert (
+        row["startup_stage"],
+        row["startup_state"],
+        row["startup_reason_code"],
+        row["startup_exit_code"],
+    ) == ("readiness", "attention", "container_exited", exit_code)
+    assert row["startup_attention_at"] is not None
+    assert row["startup_first_ready_at"] is None
+    assert row["scheduled_at"] == scheduled_at
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "observation",
+    [
+        StartupAttention("container_exited"),
+        StartupAttention("container_exited", exit_code=True),
+        StartupAttention("container_exited", exit_code=2**31),
+        StartupAttention("invalid_image", exit_code=3),
+        StartupAttention("readiness_deadline", exit_code=3),
+    ],
+    ids=["no-code", "bool-code", "out-of-range", "code-on-invalid", "code-on-deadline"],
+)
+async def test_writer_refuses_a_malformed_exit_code(db, observation):
+    _job_id, reservation, _pod_uid, _gate, kwargs, _ = await _starting_job(db)
+    before = dict(await _reservation(db, reservation))
+    assert not await db.observe_container_startup(**kwargs, observation=observation)
+    assert dict(await _reservation(db, reservation)) == before
+
+
+@pytest.mark.asyncio
+async def test_writer_refuses_container_exited_after_first_ready(db):
+    _job_id, reservation, _pod_uid, _gate, kwargs, scheduled_at = await _starting_job(
+        db
+    )
+    assert await db.observe_container_startup(
+        **kwargs, observation=ReadyObservedAt(scheduled_at)
+    )
+    assert (await _reservation(db, reservation))["startup_first_ready_at"] == (
+        scheduled_at
+    )
+    assert not await db.observe_container_startup(
+        **kwargs, observation=StartupAttention("container_exited", exit_code=3)
+    )
+    row = await _reservation(db, reservation)
+    assert (row["startup_state"], row["startup_exit_code"]) == ("starting", None)
+
+
+@pytest.mark.asyncio
+async def test_writer_refuses_container_exited_before_a_schedule(db):
+    job_id, reservation, pod_uid, _ = await _bound_job(db)
+    kwargs = _observe_kwargs(job_id, reservation, pod_uid)
+    assert await db.observe_container_startup(
+        **kwargs, observation=BoundPodObserved(), adopt_if_unmarked=True
+    )
+    assert not await db.observe_container_startup(
+        **kwargs, observation=StartupAttention("container_exited", exit_code=3)
+    )
+    row = await _reservation(db, reservation)
+    assert (row["startup_stage"], row["startup_state"], row["startup_exit_code"]) == (
+        "scheduling",
+        "observing",
+        None,
+    )
+
+
+@pytest.mark.asyncio
+async def test_writer_refuses_container_exited_for_a_session(db):
+    thread_id, _, receipt, pod_uid = await _bound_thread(db)
+    kwargs = dict(
+        owner_kind="thread",
+        owner_id=str(thread_id),
+        reservation_id=str(receipt["id"]),
+        claim_token=receipt["claim_token"],
+        pod_uid=pod_uid,
+    )
+    assert await db.observe_container_startup(
+        **kwargs,
+        observation=Unscheduled("scheduler_unschedulable"),
+        adopt_if_unmarked=True,
+    )
+    assert await db.observe_container_startup(
+        **kwargs,
+        observation=ScheduledAt(datetime.now(timezone.utc)),
+        budgets=StageBudgets(ready_seconds=180, pull_seconds=None, ssh_seconds=30),
+    )
+    assert not await db.observe_container_startup(
+        **kwargs, observation=StartupAttention("container_exited", exit_code=3)
+    )
+    row = await _reservation(db, receipt)
+    assert (row["startup_state"], row["startup_exit_code"]) == ("starting", None)
+
+
+@pytest.mark.asyncio
+async def test_container_exited_attention_is_sticky_and_never_settles(db):
+    job_id, reservation, pod_uid, gate, kwargs, scheduled_at = await _starting_job(db)
+    assert await db.observe_container_startup(
+        **kwargs, observation=StartupAttention("container_exited", exit_code=3)
+    )
+    for later in (
+        StartupAttention("container_exited", exit_code=4),
+        StartupAttention("invalid_image"),
+        ReadyObservedAt(scheduled_at),
+    ):
+        assert not await db.observe_container_startup(**kwargs, observation=later)
+    assert not await db.settle_managed_repository_workspace_creation_reservation(
+        str(job_id), **gate, runtime_incarnation=pod_uid
+    )
+    assert (
+        await db.complete_job_workspace_creation(
+            **_job_ready_call(job_id, reservation, pod_uid)
+        )
+        is None
+    )
+    row = await _reservation(db, reservation)
+    assert (
+        row["startup_reason_code"],
+        row["startup_exit_code"],
+        row["settled_at"],
+    ) == (
+        "container_exited",
+        3,
+        None,
+    )
