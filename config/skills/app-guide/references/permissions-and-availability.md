@@ -140,10 +140,22 @@ the installation tracks workspace startup: choose **Container**, or send
 `/upgrade-workspace` (or `/upgrade-workspace <container template>`). If a
 response is running, the upgrade starts after it. The session keeps its
 conversation; the next message runs in the container, with the earlier files
-copied in (files under a cloud folder come back from the cloud). A VM upgrade
-isn't available for these sessions yet. If the container never starts, the
-chat says **Workspace upgrade failed** with the reason: End the session and
-start a new one; your files are kept.
+copied in (files under a cloud folder come back from the cloud). If the
+container never starts, the chat says **Workspace upgrade failed** with the
+reason: End the session and start a new one; your files are kept.
+
+These sessions can also upgrade to a **VM**, in place: choose **VM**, or send
+`/upgrade-workspace vm` (or a VM template's name). The upgrade starts only
+while the session is idle. The chat then says "Moving this session to a VM
+workspace (the session reconnects first)…": every open tab reconnects to a
+dedicated agent, the VM starts and the files are copied over; a cold VM can
+take several minutes. Files in a cloud folder are not copied into the VM, and
+a file over the virtual read limit is skipped with a warning. If VMs are off
+the request is refused with "VM workspaces aren't available on this
+installation." If the upgrade fails or is interrupted, the chat says so and
+your files stay in the old storage: the session keeps working until its agent
+restarts, then End it and start a new one. Only one upgrade runs at a time, and
+nothing moves back down.
 
 Workspace changes are upgrade-only: to move down to Virtual or None, start a
 new session. A workspace upgrade does not automatically enable a missing tool

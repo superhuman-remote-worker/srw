@@ -1174,6 +1174,11 @@ Stateless Session workspace upgrades (`virtual`/`none` → container) need this
 value on: without it a Pod that never becomes Ready has no terminal state, so
 `/connection` doesn't offer the upgrade and a request answers 409. Turn it on
 together with `agent.stateless.enabled`, after the two-stage activation above.
+Stateless Sessions upgrade to a VM by moving to a dedicated agent, so keep
+pinned agent provisioning (the warm pool or fresh Pods) available when
+`agent.stateless.enabled` is on. In production, turn stateless Sessions on
+only after both upgrade slices (container and VM) have landed and startup
+tracking is on.
 
 ### Durable VM workspace recovery rollout
 

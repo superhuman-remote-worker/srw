@@ -39,7 +39,8 @@ online service, explain the setup path if browser tools are missing:
    served by the shared executors can upgrade to a **Container** in place
    (choose **Container** and wait for it to finish); a session whose Container
    choice says **not available in this session** can't, so start a new
-   Container session for the direct browser. A Virtual session can upgrade to a **VM** when VMs are allowed;
+   Container session for the direct browser. A Virtual or None session can also upgrade to a **VM** in place
+   when VMs are allowed (including one served by the shared executors);
    confirm **Upgrade** and wait for it to finish. This carries existing files
    over and keeps the conversation. There is no live Advanced tab.
 3. Under **Tools**, enable **Browser** if it is off. The direct-browser tools

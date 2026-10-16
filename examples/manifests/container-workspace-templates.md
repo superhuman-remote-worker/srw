@@ -317,7 +317,8 @@ above, unless it names a template.
 | A Job frozen for a VM (`POST /api/jobs/{id}/upgrade-to-vm`) | a VM from the default VM template |
 | `/upgrade-workspace` or `/upgrade-workspace container` in a stateless `virtual`/`none` Session | a container from the default container template (needs startup tracking) |
 | `/upgrade-workspace <container template>` in a stateless `virtual`/`none` Session | that template |
-| The agent's upgrade request in a stateless `virtual`/`none` Session | a container, offered only when SRW would accept it |
+| `/upgrade-workspace vm` or `/upgrade-workspace <vm template>` in a stateless `virtual`/`none` Session | a VM from the defaults chain's VM template (or that template), after the Session moves to a dedicated agent |
+| The agent's upgrade request in a stateless `virtual`/`none` Session | a container where SRW offers one, else a VM; offered only when SRW would accept it |
 | A running `virtual` or `none` Job that needs a container | a container from the default container template |
 
 - **Container upgrades.** A stateless `virtual` or `none` Session moves to a
@@ -327,9 +328,16 @@ above, unless it names a template.
   which this installation doesn't have turned on." A pinned Session can't
   move to a container ("Container upgrades aren't available in this
   session…"); start a new Session with the container you need.
-- **VM targets on a stateless Session:** 409 "Upgrading a Session to a VM
-  isn't available on this installation yet. Start a new Session with a VM
-  workspace instead."
+- **VM upgrades of a stateless Session.** A stateless `virtual` or `none`
+  Session moves to a VM in place. The request is admitted only while the
+  Session is idle (otherwise it is retried); the Session then moves to a
+  dedicated agent, which provisions the VM and copies the files over. With VM
+  provisioning off the request gets 409 "VM workspaces aren't available on
+  this installation." Nothing switches back if the VM never starts: the
+  Session keeps working until its agent restarts; End it and start a new one.
+  Files in a cloud folder are not copied into the VM, and a file over the
+  virtual read limit is skipped with a warning. The old storage prefix stays.
+  Startup tracking is required for container upgrades, not for VM upgrades.
 - **If the container never becomes ready**, the Session shows "Workspace
   upgrade failed" with the startup reason. Nothing switches back: End it and
   start a new one. The files stay in the old storage.
@@ -340,7 +348,8 @@ above, unless it names a template.
     can't use a template that keeps its workspace; start new work with this
     template."
   - An unknown name: 404 "No template named 'x' is available here."
-  - As before: a VM upgrade while VMs are off, a VM target on a stateless Session (409), and a
+  - As before: a VM upgrade while VMs are off, a VM target on a stateless Session while VM
+    provisioning is off (409), and a
     Session admitted from a manifest are refused, and nothing moves down a tier.
 - **Work without an owner** (internal Jobs, their subjobs, agent child threads)
   upgrades without a template, as before. Naming a template for it answers 409
