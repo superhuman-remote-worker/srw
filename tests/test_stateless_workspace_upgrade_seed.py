@@ -113,6 +113,29 @@ async def test_seed_copies_commits_records_and_clears_in_order(tmp_path, source)
 
 
 @pytest.mark.asyncio
+async def test_the_shared_copy_commits_and_records_but_leaves_the_marker(
+    tmp_path, source
+):
+    """C2's VM recovery copy reuses this step; each caller owns its marker."""
+    session = _session(tmp_path)
+
+    files = await wus.copy_lite_workspace_and_commit(
+        session, SPEC["workspace"], thread_id=THREAD_ID, targets=["cloud"]
+    )
+
+    assert files == 1
+    dst = session.workspace_manager.backend
+    assert dst.read_file("notes/a.md") == "carried"
+    assert not dst.exists("cloud/b.md")
+    session.workspace_manager.git_manager.commit.assert_called_once()
+    session.postgres_conn.record_turn_commit.assert_awaited_once_with(
+        THREAD_ID, "a" * 40
+    )
+    session.postgres_conn.clear_workspace_upgrade_seed.assert_not_awaited()
+    assert wus.take_seed_result(THREAD_ID, 7) is None
+
+
+@pytest.mark.asyncio
 async def test_a_failed_commit_keeps_the_marker(tmp_path, source):
     """/undo after the upgrade must not delete carried files: without a
     recorded post-copy commit the copy is retried, never half-finished."""

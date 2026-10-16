@@ -6,6 +6,10 @@ it into the freshly attached container, commits the copy in the workspace Git
 (so ``/undo`` of the first container turn keeps the carried files), records
 that commit for the current transcript position, and clears ``seed_from``
 under its lease. The control drain then journals ``workspace_upgrade.complete``.
+
+The copy → commit → record step is ``copy_lite_workspace_and_commit``; the
+VM upgrade's recovery copy (C2, ``vm_upgrade_handoff``) runs the same step
+and records its own marker.
 """
 
 from __future__ import annotations
@@ -77,29 +81,35 @@ def _validated(spec: Mapping[str, Any]) -> tuple[dict, dict]:
     return dict(seed_from), dict(workspace)
 
 
-async def seed_upgraded_workspace(
-    session: Any, spec: Mapping[str, Any], *, thread_id: str, lease_token: int
+async def copy_lite_workspace_and_commit(
+    session: Any,
+    workspace: Mapping[str, Any],
+    *,
+    thread_id: str,
+    targets: Iterable[str],
 ) -> int:
-    """Copy the old lite workspace into the attached container; clear the marker.
+    """Copy an old lite workspace into the attached shell workspace; commit it.
 
-    Order matters: copy (verified), commit, record the commit, then clear
-    ``seed_from`` under the lease. Any failure before the clear raises and
-    leaves the marker, so the next claim copies again. A lost lease raises
-    ``LeaseLostError`` from the fenced writes.
+    Shared by C1's claimant (``seed_upgraded_workspace``) and C2's VM recovery
+    copy (``vm_upgrade_handoff.recover_vm_upgrade_seed``); each caller then
+    records its own marker. A path under one of ``targets`` (workspace-relative
+    cloud roots) is left to the first cloud pull. The copy is committed in the
+    workspace Git, so ``/undo`` of the first turn on the new workspace keeps the
+    carried files, and that commit is recorded for the current transcript
+    position. Raises ``WorkspaceUpgradeSeedError`` when the workspace isn't a
+    shell one or the commit can't be made. Returns the number of files copied.
     """
-    seed_from, workspace = _validated(spec)
     manager = getattr(session, "workspace_manager", None)
     backend = getattr(manager, "backend", None)
     if backend is None or not getattr(backend, "supports_shell", False):
         raise WorkspaceUpgradeSeedError("the upgraded workspace is not attached")
-    sync = getattr(session, "workspace_sync", None)
-    targets = [mount.target_path for mount in (sync.mounts if sync else [])]
+    roots = list(targets)
     files = await asyncio.to_thread(
         seed_from_lite_workspace,
         workspace,
         owner_id=str(thread_id),
         destination=unwrap_backend(backend),
-        exclude=lambda rel: cloud_synced_path(rel, targets),
+        exclude=lambda rel: cloud_synced_path(rel, roots),
     )
     git = getattr(manager, "git_manager", None)
     if git is not None and git.is_active:
@@ -111,6 +121,25 @@ async def seed_upgraded_workspace(
         if not head:
             raise WorkspaceUpgradeSeedError("the carried files have no commit")
         await session.postgres_conn.record_turn_commit(str(thread_id), head)
+    return int(files)
+
+
+async def seed_upgraded_workspace(
+    session: Any, spec: Mapping[str, Any], *, thread_id: str, lease_token: int
+) -> int:
+    """Copy the old lite workspace into the attached container; clear the marker.
+
+    Order matters: copy (verified), commit, record the commit, then clear
+    ``seed_from`` under the lease. Any failure before the clear raises and
+    leaves the marker, so the next claim copies again. A lost lease raises
+    ``LeaseLostError`` from the fenced writes.
+    """
+    seed_from, workspace = _validated(spec)
+    sync = getattr(session, "workspace_sync", None)
+    targets = [mount.target_path for mount in (sync.mounts if sync else [])]
+    files = await copy_lite_workspace_and_commit(
+        session, workspace, thread_id=thread_id, targets=targets
+    )
     await session.postgres_conn.clear_workspace_upgrade_seed(
         str(thread_id), expected_seed_from=seed_from
     )
@@ -129,6 +158,7 @@ __all__ = [
     "WorkspaceUpgradeSeedError",
     "claim_bundle_workspace_upgrade_seed",
     "cloud_synced_path",
+    "copy_lite_workspace_and_commit",
     "seed_upgraded_workspace",
     "take_seed_result",
 ]
