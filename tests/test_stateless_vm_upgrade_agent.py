@@ -17,7 +17,11 @@ from agent.api.orchestrator_client import (
     OrchestratorClient,
     WorkspaceUpgradeRouteMissing,
 )
+from agent.api.workspace_upgrade_seed import cloud_synced_path
+from agent.core.backends.virtual import VirtualWorkspaceBackend
+from shared.runtime.core.backends.object_store import InMemoryObjectStore
 from shared.thread_controls import ControlRequest
+from tests._fs_backend import FilesystemTestBackend
 
 THREAD_ID = UUID("11111111-1111-4111-8111-111111111111")
 REQUEST_ID = UUID("22222222-2222-4222-8222-222222222222")
@@ -185,6 +189,124 @@ def test_a_cloud_root_the_copy_cannot_place_fails_closed(sync_target, mount_targ
         handoff.cloud_mount_targets(session)
 
 
+def _sidecar(*, planned=("/cloud/home",), live=(), skip_links=False):
+    """``SidecarMountWatcher``: ``mounts`` lists only live folders, while its
+    ``workspace/cloud`` link covers every planned one."""
+    return SimpleNamespace(
+        workspace_root="/w",
+        planned=[SimpleNamespace(target_path=t) for t in planned],
+        mounts=[SimpleNamespace(target_path=t) for t in live],
+        skip_links=skip_links,
+        cloud_cfg={"skip_workspace_links": skip_links},
+    )
+
+
+def _rclone(cloud_cfg, *, live=()):
+    """``RcloneMountManager``: its plan is ``cloud_cfg["mounts"]``."""
+    return SimpleNamespace(
+        workspace_root="/w",
+        cloud_cfg=cloud_cfg,
+        mounts=[SimpleNamespace(target_path=t) for t in live],
+    )
+
+
+def _with_manager(manager):
+    return SimpleNamespace(
+        workspace_manager=SimpleNamespace(path="/w"),
+        workspace_sync=None,
+        cloud_mount_manager=manager,
+    )
+
+
+@pytest.mark.parametrize(
+    "manager",
+    [_sidecar(), _rclone({"mounts": [{"workspace_name": "home"}]})],
+    ids=["sidecar-planned-not-live", "rclone-planned-not-live"],
+)
+def test_a_planned_mount_that_is_not_live_still_excludes_cloud(manager):
+    """Review: with no live folder at owner start, ``workspace/cloud`` is
+    still the link (a read-only view until the folder mounts)."""
+    assert handoff.cloud_mount_targets(_with_manager(manager)) == ["cloud"]
+
+
+@pytest.mark.parametrize(
+    "manager,expected",
+    [
+        (_sidecar(skip_links=True), []),
+        (
+            _rclone(
+                {"skip_workspace_links": True, "mounts": [{}]}, live=["/cloud/home"]
+            ),
+            [],
+        ),
+        (_rclone({"skip_workspace_links": True}, live=["/w/data"]), ["data"]),
+        (_rclone({}), []),
+    ],
+    ids=[
+        "sidecar-no-links",
+        "rclone-no-links",
+        "inside-the-workspace",
+        "nothing-planned",
+    ],
+)
+def test_without_its_link_an_outside_mount_is_not_in_the_workspace(manager, expected):
+    assert handoff.cloud_mount_targets(_with_manager(manager)) == expected
+
+
+def test_a_cloud_mount_that_failed_to_start_still_excludes_cloud():
+    """No manager, but the attach asked for a cloud mount: a link an earlier
+    attach installed may still point into the cloud."""
+    session = _with_manager(None)
+    assert handoff.cloud_mount_targets(session) == []
+    session.cloud_mount_error = "rclone failed to start"
+    assert handoff.cloud_mount_targets(session) == ["cloud"]
+
+
+SYNC_IGNORED_CLOUD_FILES = [
+    "cloud/plan.md",
+    "cloud/projects/x.txt",
+    "cloud/docs/requirements/r.md",
+    "cloud/repo/.git/config",
+    "cloud/home/archive/old.pdf",
+]
+
+
+class _ShellBackend(FilesystemTestBackend):
+    supports_shell = True
+
+
+@pytest.mark.asyncio
+async def test_the_recovery_copy_never_writes_under_a_cloud_root(tmp_path, monkeypatch):
+    """Review: ``workspace/cloud`` links into the live mount, so a path cloud
+    sync ignores must not be copied there either. C1's claimant predicate
+    keeps those paths (``cloud_synced_path``); the recovery uses a plain
+    prefix."""
+    store = InMemoryObjectStore()
+    src = VirtualWorkspaceBackend(store, prefix=f"threads/{THREAD_ID}/")
+    for path in ["notes/a.md", "cloud/b.md", *SYNC_IGNORED_CLOUD_FILES]:
+        src.write_file(path, "old copy")
+    monkeypatch.setattr(
+        "agent.core.backends.factory.create_lite_backend", lambda *_a, **_k: src
+    )
+    (tmp_path / "ws").mkdir()
+    dst = _ShellBackend(tmp_path / "ws")
+    order: list = []
+    session = _vm_session(tmp_path, _marker_metadata(), order=order)
+    session.workspace_manager.backend = dst
+    session.cloud_mount_manager = _sidecar()
+
+    out = await handoff.recover_vm_upgrade_seed(
+        session=session, client=_seed_client(order), thread_id=str(THREAD_ID)
+    )
+
+    assert out == {"control_request_id": str(REQUEST_ID), "seeded_files": 1}
+    assert dst.read_file("notes/a.md") == "old copy"
+    assert not dst.exists("cloud")
+    assert order == ["source", "commit", "seeded"]
+    # C1's predicate copies them: the first cloud pull won't bring them back.
+    assert not any(cloud_synced_path(p, ["cloud"]) for p in SYNC_IGNORED_CLOUD_FILES)
+
+
 @pytest.mark.asyncio
 async def test_a_missing_route_is_retried_within_a_bounded_window(monkeypatch):
     monkeypatch.setattr(handoff.asyncio, "sleep", AsyncMock())
@@ -267,7 +389,12 @@ def copy(monkeypatch):
 
     def fake_seed(workspace, *, owner_id, destination, exclude):
         calls.append(
-            (workspace, owner_id, exclude("cloud/a.md"), exclude("notes/a.md"))
+            (
+                workspace,
+                owner_id,
+                exclude("cloud/a.md") and exclude("cloud/plan.md"),
+                exclude("notes/a.md"),
+            )
         )
         return 4
 

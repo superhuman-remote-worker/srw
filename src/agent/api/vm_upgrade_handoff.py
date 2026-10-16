@@ -21,7 +21,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Awaitable, Callable, Iterable, Mapping
 from typing import Any, Optional, TypeVar
 from uuid import UUID
 
@@ -121,14 +121,50 @@ def _relative(target: Any, root: str) -> Optional[str]:
     return target.strip("/")
 
 
+def _planned_mount_targets(manager: Any) -> list[Any]:
+    """Every mount a cloud mount manager planned, live or not.
+
+    ``SidecarMountWatcher.mounts`` lists only the folders mounted at its last
+    read (``planned`` is all of them); ``RcloneMountManager`` plans
+    ``cloud_cfg["mounts"]`` (a mount without ``target_path`` lands at
+    ``/cloud/<name>``, outside the workspace).
+    """
+    targets: list[Any] = [
+        getattr(mount, "target_path", None)
+        for mount in [
+            *(getattr(manager, "planned", None) or []),
+            *(getattr(manager, "mounts", None) or []),
+        ]
+    ]
+    cloud_cfg = getattr(manager, "cloud_cfg", None)
+    if isinstance(cloud_cfg, Mapping):
+        targets += [
+            mount.get("target_path") if isinstance(mount, Mapping) else None
+            for mount in cloud_cfg.get("mounts") or []
+        ]
+    return targets
+
+
+def _links_skipped(manager: Any) -> bool:
+    skip = getattr(manager, "skip_links", None)
+    if skip is not None:
+        return bool(skip)
+    cloud_cfg = getattr(manager, "cloud_cfg", None)
+    return isinstance(cloud_cfg, Mapping) and bool(
+        cloud_cfg.get("skip_workspace_links")
+    )
+
+
 def cloud_mount_targets(session: Any) -> list[str]:
     """Workspace-relative roots a cloud mount or sync owns on this attach.
 
-    The recovery copy must not write into them: a live rclone mount would push
-    the old copies to the cloud, and the first pull brings the files back. A
-    mount manager's mount outside the workspace (a VM's ``/cloud/<name>``) is
-    linked in at ``cloud``; a sync root outside the workspace, or any root
-    with a ``..`` segment, can't be placed and fails closed.
+    The recovery copy writes nothing under them (``in_cloud_root``): through
+    ``workspace/cloud`` a write lands in the user's live cloud, or fails on a
+    read-only view. A mount manager links every planned mount, mounted or
+    not, at ``cloud`` unless its links are skipped; a planned mount inside
+    the workspace is a root at its own path. A sync root outside the
+    workspace, or any root with a ``..`` segment, can't be placed and fails
+    closed.
     """
     targets: list[str] = []
 
@@ -149,11 +185,36 @@ def cloud_mount_targets(session: Any) -> list[str]:
             )
         add(relative)
     manager = getattr(session, "cloud_mount_manager", None)
+    if manager is None:
+        if getattr(session, "cloud_mount_error", None):
+            # The attach asked for a mount that didn't start: a link an
+            # earlier attach installed may still point into the cloud.
+            add(_CLOUD_LINK)
+        return targets
     manager_root = str(getattr(manager, "workspace_root", "") or "")
-    for mount in getattr(manager, "mounts", None) or []:
-        relative = _relative(getattr(mount, "target_path", ""), manager_root)
-        add(_CLOUD_LINK if relative is None else relative)
+    planned = _planned_mount_targets(manager)
+    for target in planned:
+        if target:
+            relative = _relative(target, manager_root)
+            if relative is not None:
+                add(relative)
+    if planned and not _links_skipped(manager):
+        add(_CLOUD_LINK)
     return targets
+
+
+def in_cloud_root(rel: str, roots: Iterable[str]) -> bool:
+    """True when ``rel`` is a cloud root or lies under one (plain prefix).
+
+    Unlike C1's ``cloud_synced_path``, nothing under a root is copied, not
+    even a path cloud sync ignores: the recovery copy writes through the
+    workspace's live cloud link.
+    """
+    for root in roots:
+        root = str(root or "").strip("/")
+        if root == "" or rel == root or rel.startswith(f"{root}/"):
+            return True
+    return False
 
 
 async def call_with_route_retry(
@@ -228,7 +289,10 @@ async def recover_vm_upgrade_seed(
         targets = cloud_mount_targets(session)
         try:
             files = await copy_lite_workspace_and_commit(
-                session, workspace, thread_id=str(thread_id), targets=targets
+                session,
+                workspace,
+                thread_id=str(thread_id),
+                exclude=lambda rel: in_cloud_root(rel, targets),
             )
         except WorkspaceUpgradeSeedError as exc:
             raise VmUpgradeRecoveryError(str(exc)) from exc
@@ -258,6 +322,7 @@ __all__ = [
     "VmUpgradeRecoveryError",
     "call_with_route_retry",
     "cloud_mount_targets",
+    "in_cloud_root",
     "recover_vm_upgrade_seed",
     "vm_upgrade_consumer_row",
     "vm_upgrade_payload",

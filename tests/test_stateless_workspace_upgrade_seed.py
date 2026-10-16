@@ -120,7 +120,10 @@ async def test_the_shared_copy_commits_and_records_but_leaves_the_marker(
     session = _session(tmp_path)
 
     files = await wus.copy_lite_workspace_and_commit(
-        session, SPEC["workspace"], thread_id=THREAD_ID, targets=["cloud"]
+        session,
+        SPEC["workspace"],
+        thread_id=THREAD_ID,
+        exclude=lambda rel: wus.cloud_synced_path(rel, ["cloud"]),
     )
 
     assert files == 1

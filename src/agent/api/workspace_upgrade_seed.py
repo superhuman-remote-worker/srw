@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from typing import Any, Optional
 
 from agent.core.backends.overlay import unwrap_backend
@@ -86,30 +86,29 @@ async def copy_lite_workspace_and_commit(
     workspace: Mapping[str, Any],
     *,
     thread_id: str,
-    targets: Iterable[str],
+    exclude: Callable[[str], bool],
 ) -> int:
     """Copy an old lite workspace into the attached shell workspace; commit it.
 
     Shared by C1's claimant (``seed_upgraded_workspace``) and C2's VM recovery
-    copy (``vm_upgrade_handoff.recover_vm_upgrade_seed``); each caller then
-    records its own marker. A path under one of ``targets`` (workspace-relative
-    cloud roots) is left to the first cloud pull. The copy is committed in the
-    workspace Git, so ``/undo`` of the first turn on the new workspace keeps the
-    carried files, and that commit is recorded for the current transcript
-    position. Raises ``WorkspaceUpgradeSeedError`` when the workspace isn't a
-    shell one or the commit can't be made. Returns the number of files copied.
+    copy (``vm_upgrade_handoff.recover_vm_upgrade_seed``); each caller passes
+    the paths it leaves out (``exclude``, workspace-relative) and then records
+    its own marker. The copy is committed in the workspace Git, so ``/undo`` of
+    the first turn on the new workspace keeps the carried files, and that
+    commit is recorded for the current transcript position. Raises
+    ``WorkspaceUpgradeSeedError`` when the workspace isn't a shell one or the
+    commit can't be made. Returns the number of files copied.
     """
     manager = getattr(session, "workspace_manager", None)
     backend = getattr(manager, "backend", None)
     if backend is None or not getattr(backend, "supports_shell", False):
         raise WorkspaceUpgradeSeedError("the upgraded workspace is not attached")
-    roots = list(targets)
     files = await asyncio.to_thread(
         seed_from_lite_workspace,
         workspace,
         owner_id=str(thread_id),
         destination=unwrap_backend(backend),
-        exclude=lambda rel: cloud_synced_path(rel, roots),
+        exclude=exclude,
     )
     git = getattr(manager, "git_manager", None)
     if git is not None and git.is_active:
@@ -138,7 +137,10 @@ async def seed_upgraded_workspace(
     sync = getattr(session, "workspace_sync", None)
     targets = [mount.target_path for mount in (sync.mounts if sync else [])]
     files = await copy_lite_workspace_and_commit(
-        session, workspace, thread_id=thread_id, targets=targets
+        session,
+        workspace,
+        thread_id=thread_id,
+        exclude=lambda rel: cloud_synced_path(rel, targets),
     )
     await session.postgres_conn.clear_workspace_upgrade_seed(
         str(thread_id), expected_seed_from=seed_from
