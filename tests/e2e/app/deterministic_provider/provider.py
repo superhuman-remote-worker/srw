@@ -49,6 +49,7 @@ SUPPORTED_SCENARIOS = frozenset(
         "search-job",
         "fetch-job",
         "worker-job",
+        "workspace-command-worker",
         "retained-sentinel-worker",
         "prepared-workspace-job",
         "delegation-batch",
@@ -84,17 +85,20 @@ class ArmScenarioRequest(BaseModel):
         "search-job",
         "fetch-job",
         "worker-job",
+        "workspace-command-worker",
         "retained-sentinel-worker",
         "prepared-workspace-job",
         "delegation-batch",
     ] = "reply"
-    required_responses: int = Field(default=1, ge=1, le=100)
+    required_responses: int = Field(default=1, ge=0, le=100)
     chunk_delay_ms: int = Field(default=100, ge=0, le=2_000)
     nonstream_delay_ms: int | None = Field(default=None, ge=15_000, le=30_000)
     sentinel_sha256: str | None = Field(default=None, pattern=r"^[a-f0-9]{64}$")
 
     @model_validator(mode="after")
     def require_explicit_nonstream_delay(self) -> "ArmScenarioRequest":
+        if self.required_responses == 0 and self.scenario != "workspace-command-worker":
+            raise ValueError("zero text replies require workspace-command-worker")
         if (self.scenario == "slow-nonstream") != (self.nonstream_delay_ms is not None):
             raise ValueError("slow-nonstream requires an exclusive bounded delay")
         if self.scenario == "slow-nonstream" and self.required_responses != 1:
@@ -405,6 +409,13 @@ class ScenarioStore:
             sequences = [call["sequence"] for call in state.calls]
             if (
                 state.pending
+                or (
+                    state.scenario == "workspace-command-worker"
+                    and (
+                        state.worker_job_tool_steps < 11
+                        or not state.completion_release.is_set()
+                    )
+                )
                 or state.remaining_required_responses > cancelled_required
                 or state.unexpected_calls != request.expected_cancelled
                 or cancelled != request.expected_cancelled
@@ -430,10 +441,10 @@ class ScenarioStore:
         self, run_id: str, request: AdvanceScenarioRequest
     ) -> dict[str, Any]:
         _validate_run_id(run_id)
-        if (
-            request.sentinel_sha256 is not None
-            or request.scenario == "retained-sentinel-worker"
-        ):
+        if request.sentinel_sha256 is not None or request.scenario in {
+            "retained-sentinel-worker",
+            "workspace-command-worker",
+        }:
             raise ScenarioError(
                 422, "advance_unsupported", "Retained worker phases cannot be advanced."
             )
@@ -441,6 +452,12 @@ class ScenarioStore:
             state = self._runs.get(run_id)
             if state is None:
                 raise ScenarioError(404, "scenario_not_found", "No scenario is armed.")
+            if state.scenario == "workspace-command-worker":
+                raise ScenarioError(
+                    422,
+                    "advance_unsupported",
+                    "Workspace command runs are single-life.",
+                )
             cancelled = sum(
                 n
                 for (_, _, _, outcome), n in state.counters.items()
@@ -486,7 +503,8 @@ class ScenarioStore:
             if state is None:
                 raise ScenarioError(404, "scenario_not_found", "No scenario is armed.")
             if (
-                state.scenario != "retained-sentinel-worker"
+                state.scenario
+                not in {"retained-sentinel-worker", "workspace-command-worker"}
                 or not 8 <= state.worker_job_tool_steps <= 10
                 or state.unexpected_calls != 0
                 or state.completion_release.is_set()
@@ -503,7 +521,10 @@ class ScenarioStore:
         _validate_run_id(run_id)
         async with self._lock:
             state = self._runs.get(run_id)
-            if state is None or state.scenario != "retained-sentinel-worker":
+            if state is None or state.scenario not in {
+                "retained-sentinel-worker",
+                "workspace-command-worker",
+            }:
                 raise ScenarioError(409, "scenario_changed", "Retained run changed.")
             event = state.completion_release
         try:
@@ -847,7 +868,12 @@ class ScenarioStore:
             if (
                 outcome == "success"
                 and decision.scenario
-                in {"worker-job", "prepared-workspace-job", "retained-sentinel-worker"}
+                in {
+                    "worker-job",
+                    "prepared-workspace-job",
+                    "retained-sentinel-worker",
+                    "workspace-command-worker",
+                }
                 and decision.tool_phase
             ):
                 state.worker_job_tool_steps += 1
@@ -1051,7 +1077,8 @@ def create_inference_app(
 
             state = await store.state(run_id)
             if (
-                state["scenario"] == "retained-sentinel-worker"
+                state["scenario"]
+                in {"retained-sentinel-worker", "workspace-command-worker"}
                 and state["worker_job_tool_steps"] >= 10
             ):
                 # The worker's next reply would be job_complete. Hold it
@@ -1157,6 +1184,7 @@ def create_inference_app(
                     )
             elif structured_name is None and state["scenario"] in {
                 "worker-job",
+                "workspace-command-worker",
                 "retained-sentinel-worker",
                 "prepared-workspace-job",
             }:
@@ -1170,6 +1198,10 @@ def create_inference_app(
                 }:
                     if state["scenario"] == "prepared-workspace-job":
                         tool_call = _prepared_workspace_tool_call(
+                            state["worker_job_tool_steps"], run_id, messages
+                        )
+                    elif state["scenario"] == "workspace-command-worker":
+                        tool_call = _workspace_command_tool_call(
                             state["worker_job_tool_steps"], run_id, messages
                         )
                     elif state["scenario"] == "retained-sentinel-worker":
@@ -2132,6 +2164,33 @@ def _prepared_workspace_tool_call(
                 "Prepared workspace execution did not return the required proof.",
             )
     return _worker_job_tool_call(step if step < 6 else step - 1, run_id)
+
+
+def _workspace_command_tool_call(
+    step: int, run_id: str, messages: list[dict[str, Any]]
+) -> ToolCallSpec:
+    """Create a run-owned file once through the actual workspace shell."""
+    content = f"SRW_WORKSPACE_SENTINEL:{run_id}\n"
+    digest = hashlib.sha256(content.encode()).hexdigest()
+    call = _retained_sentinel_tool_call(step, run_id, digest, messages)
+    if step != 6:
+        return call
+    arguments = json.loads(call.arguments)
+    path = f".srw-a1-gate/{run_id}/sentinel"
+    program = (
+        "from pathlib import Path; import sys; "
+        "p=Path(sys.argv[1]); p.parent.mkdir(parents=True,exist_ok=True); "
+        "f=p.open('xb'); f.write(sys.argv[2].encode()); f.close()"
+    )
+    create = "python3 -c " + " ".join(
+        shlex.quote(value) for value in (program, path, content)
+    )
+    # Stop immediately on exclusive-create failure. A second invocation must
+    # never reach the existing-file verifier and disguise a command replay.
+    arguments["command"] = "\n".join(("set -eu", create, arguments["command"]))
+    return ToolCallSpec(
+        name=call.name, arguments=json.dumps(arguments, separators=(",", ":"))
+    )
 
 
 def _retained_sentinel_tool_call(
