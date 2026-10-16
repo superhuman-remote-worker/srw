@@ -530,11 +530,19 @@ pulled when it first starts (see below). Startup-stage tracking is Helm
 
   Without startup-stage tracking, its workspace stays `creating` and the Jobs
   list shows "Checking an older workspace creation; completion evidence is
-  unavailable." With it, the Jobs list names the stage: a scheduling wait while
-  no node fits, or "Workspace needs attention: it didn't become ready in time.
-  If it uses your own image, check that the image keeps running: build it FROM
-  an SRW base image and don't override its ENTRYPOINT or USER." once a
-  scheduled pod's readiness budget has passed.
+  unavailable." With it, the Jobs list names the stage:
+  - a scheduling wait while no node fits;
+  - within seconds of the container exiting on its own: "Workspace needs
+    attention: its container exited with code `<code>` before it was ready. A
+    workspace image must keep running SRW's SSH server: build it FROM an SRW
+    base image and don't override its ENTRYPOINT or USER.";
+  - once a scheduled pod's readiness budget has passed: "Workspace needs
+    attention: it didn't become ready in time. If it uses your own image, check
+    that the image keeps running SRW's SSH server: build it FROM an SRW base
+    image and don't override its ENTRYPOINT or USER. The cluster may also have
+    stopped it, for example when it ran out of memory: try a template with more
+    memory." This also covers a container the cluster stopped (`OOMKilled` or
+    an evicted Pod).
 
   Check the pod's status and events with `kubectl describe pod
   workspace-<first 12 characters of the Job ID>` in the workspace namespace.
