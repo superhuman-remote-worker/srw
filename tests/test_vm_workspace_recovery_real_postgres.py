@@ -3630,7 +3630,7 @@ async def test_store_admits_idempotent_hold_and_releases_exact_queue_token(
         await conn.execute(
             "INSERT INTO jobs (id, description, status, execution_lane, config_override) "
             "VALUES ($1, 'admit recovery', 'processing', 'stateless', "
-            "'{\"workspace\":{\"backend\":\"vm\"}}'::jsonb)",
+            '\'{"workspace":{"backend":"vm"}}\'::jsonb)',
             job_id,
         )
         await conn.execute(
