@@ -301,6 +301,18 @@ async def latest_workspace_upgrade_request(
     return dict(row) if row is not None else None
 
 
+def _vm_exists_or_is_coming(status: Any) -> bool:
+    """A VM status under which a pending upgrade copy is still owed (C2)."""
+    from orchestrator.services.thread_config_update import (
+        _VM_UPGRADE_IN_PROGRESS_STATUSES,
+    )
+
+    return status in _VM_UPGRADE_IN_PROGRESS_STATUSES or status in (
+        "suspending",
+        "suspended",
+    )
+
+
 def _vm_upgrade_view(
     thread: Mapping[str, Any],
     metadata: Mapping[str, Any],
@@ -343,9 +355,13 @@ def _vm_upgrade_view(
                 "phase": "failed",
                 "reason_code": UPGRADE_FAILED,
             }
-        if marker["state"] == VM_UPGRADE_SEED_PENDING:
+        if marker["state"] == VM_UPGRADE_SEED_PENDING and _vm_exists_or_is_coming(
+            status
+        ):
             phase = "copying" if status == "ready" else "provisioning"
             return {"target_tier": "vm", "phase": phase}
+        # A pending marker without such a VM was recorded before a provision
+        # CAS that refused it (or a 5xx came first): the receipt decides.
     if status in ("ready", "suspended"):
         # A working VM: whatever an earlier request said is history.
         return None

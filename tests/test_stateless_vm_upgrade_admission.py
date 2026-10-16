@@ -299,6 +299,24 @@ def _request(outcome=None, error_code=None):
                 "reason_code": "upgrade_interrupted",
             },
         ),
+        (
+            "pinned",
+            {"upgrade_seed": PENDING_MARKER},
+            _request("rejected", "upgrade_refused"),
+            {"target_tier": "vm", "phase": "failed", "reason_code": "upgrade_refused"},
+        ),
+        (
+            "pinned",
+            {"upgrade_seed": PENDING_MARKER},
+            _request(),
+            {"target_tier": "vm", "phase": "requested"},
+        ),
+        (
+            "pinned",
+            {"status": "suspended", "upgrade_seed": PENDING_MARKER},
+            _request("applied"),
+            {"target_tier": "vm", "phase": "provisioning"},
+        ),
     ],
     ids=[
         "requested",
@@ -318,6 +336,9 @@ def _request(outcome=None, error_code=None):
         "interrupted-without-a-marker",
         "a-ready-vm-with-an-applied-request",
         "copy-ended-as-interrupted-after-the-started-receipt",
+        "a-pending-marker-the-cas-refused-shows-the-refusal",
+        "a-pending-marker-before-the-cas-is-still-requested",
+        "a-pending-marker-under-a-suspended-vm-is-still-owed",
     ],
 )
 def test_workspace_upgrade_view_reports_the_vm_phases(lane, vm, latest, expected):
