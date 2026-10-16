@@ -736,6 +736,7 @@ class ScenarioStore:
         stream: bool,
         consume_required: bool,
         tool_phase: bool = False,
+        expected_worker_step: int | None = None,
     ) -> CallDecision:
         """Validate and register a call, or raise after accounting a rejection."""
 
@@ -812,6 +813,27 @@ class ScenarioStore:
                     "fixture_retryable_error",
                     "The armed error-once scenario rejected its first response.",
                 )
+
+            if state.scenario == "workspace-command-worker" and tool_phase:
+                # Tool construction uses a snapshot before awaiting the store.
+                # Reserve that exact stage under the accounting lock so two
+                # streams cannot emit one command twice and skip its proof.
+                if expected_worker_step != state.worker_job_tool_steps or any(
+                    call.decision.tool_phase for call in state.pending.values()
+                ):
+                    self._record_immediate(
+                        state,
+                        endpoint=endpoint,
+                        model=model,
+                        stream=stream,
+                        outcome="unexpected_worker_step_conflict",
+                        unexpected=True,
+                    )
+                    raise ScenarioError(
+                        409,
+                        "worker_step_conflict",
+                        "The workspace tool stage is stale or already reserved.",
+                    )
 
             sequence = state.next_sequence
             state.next_sequence += 1
@@ -1280,6 +1302,11 @@ def create_inference_app(
                 stream=stream,
                 consume_required=consume_required,
                 tool_phase=tool_phase,
+                expected_worker_step=(
+                    state["worker_job_tool_steps"]
+                    if state["scenario"] == "workspace-command-worker" and tool_phase
+                    else None
+                ),
             )
 
             if structured_name is not None:
