@@ -290,6 +290,12 @@ def test_detail_preserves_raw_status_but_hides_ready_during_authorized_end(
     assert "ended_at" not in body
 
 
+UPGRADE_RECORD = {
+    "upgrade_config": {"image": "registry.example/c:1"},
+    "upgrade_sources": {"tier": "explicit", "template": "explicit"},
+}
+
+
 def _upgrading_metadata() -> str:
     return json.dumps(
         {
@@ -297,10 +303,11 @@ def _upgrading_metadata() -> str:
             "workspace_container": {
                 "status": "pending",
                 "provisioner": "k8s",
+                **UPGRADE_RECORD,
                 "seed_from": {
                     "backend": "virtual",
                     "prefix": f"threads/{THREAD_ID}/",
-                    "binding": None,
+                    "binding": {"kind": "virtual", "backing_id": "rclone:" + "a" * 64},
                 },
             },
         }
@@ -323,6 +330,13 @@ def test_detail_projects_a_failed_stateless_upgrade() -> None:
         "target_tier": "sandbox",
         "phase": "failed",
         "reason_code": "invalid_image",
+    }
+    # The copy source carries the old binding; ``workspace_upgrade`` is the
+    # public field.
+    assert body["metadata"]["workspace_container"] == {
+        "status": "pending",
+        "provisioner": "k8s",
+        **UPGRADE_RECORD,
     }
 
 
