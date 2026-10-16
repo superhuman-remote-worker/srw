@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 from fastapi import HTTPException
@@ -125,6 +125,8 @@ def _thread(marker=None, *, status="ready", **over):
         vm["upgrade_seed"] = marker
     row = {
         "id": THREAD_ID,
+        "status": "active",
+        "pinned_idle_terminal_intent_at": None,
         "execution_lane": "pinned",
         "agent_id": AGENT_ID,
         "runtime_generation": RUNTIME,
@@ -136,11 +138,12 @@ def _thread(marker=None, *, status="ready", **over):
     return row
 
 
-def _deps(thread, *, request_row=None):
+def _deps(thread, *, request_row=None, reciprocal=True):
     return SimpleNamespace(
         require_internal=AsyncMock(),
         store=SimpleNamespace(
             get_thread=AsyncMock(return_value=thread),
+            pinned_thread_agent_is_reciprocal=AsyncMock(return_value=reciprocal),
             fetchrow=AsyncMock(
                 return_value=request_row
                 if request_row is not None
@@ -174,8 +177,60 @@ def test_the_routes_require_the_exact_pinned_runtime(headers, over):
     assert refused.value.detail == {"code": "pinned_runtime_identity_mismatch"}
 
 
-def test_the_exact_runtime_passes_and_names_its_agent():
-    assert vus.require_pinned_runtime_identity(_thread(), HEADERS) == AGENT_ID
+def test_the_exact_runtime_passes_and_names_itself_canonically():
+    upper = {header: value.upper() for header, value in HEADERS.items()}
+    assert vus.require_pinned_runtime_identity(_thread(), upper) == (
+        AGENT_ID,
+        RUNTIME,
+        ATTACH,
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("route", ["seed-source", "seeded"])
+@pytest.mark.parametrize("refusal", ["not-reciprocal", "no-runtime-authority"])
+async def test_the_routes_also_require_live_authority_and_a_reciprocal_agent(
+    monkeypatch, route, refusal
+):
+    """As strict as ``/workspace``: the row match alone isn't enough."""
+    spec = Mock()
+    mark = AsyncMock()
+    monkeypatch.setattr(
+        "orchestrator.services.stateless_workspace_upgrade.workspace_upgrade_seed_spec",
+        spec,
+    )
+    monkeypatch.setattr(vus, "mark_vm_upgrade_seeded", mark)
+    thread = _thread(PENDING)
+    if refusal == "no-runtime-authority":
+        thread["status"] = "ended"
+    deps = _deps(thread, reciprocal=refusal != "not-reciprocal")
+    with pytest.raises(HTTPException) as refused:
+        if route == "seed-source":
+            await vus.agent_vm_upgrade_seed_source(
+                _request(), THREAD_ID, dependencies=deps
+            )
+        else:
+            body = VmUpgradeSeededRequest(
+                provision_generation=GENERATION, control_request_id=REQUEST_ID
+            )
+            await vus.agent_vm_upgrade_seeded(
+                _request(), THREAD_ID, body, dependencies=deps
+            )
+    assert refused.value.status_code == 409
+    assert refused.value.detail == {"code": "pinned_runtime_identity_mismatch"}
+    reciprocal = deps.store.pinned_thread_agent_is_reciprocal
+    if refusal == "not-reciprocal":
+        reciprocal.assert_awaited_once_with(
+            THREAD_ID,
+            AGENT_ID,
+            expected_runtime_generation=RUNTIME,
+            expected_attach_token=ATTACH,
+        )
+    else:
+        reciprocal.assert_not_awaited()
+    deps.store.fetchrow.assert_not_awaited()
+    spec.assert_not_called()
+    mark.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -199,6 +254,12 @@ async def test_seed_source_returns_the_lite_mount_for_a_pending_marker(monkeypat
         "provision_generation": GENERATION,
     }
     deps.require_internal.assert_awaited_once()
+    deps.store.pinned_thread_agent_is_reciprocal.assert_awaited_once_with(
+        THREAD_ID,
+        AGENT_ID,
+        expected_runtime_generation=RUNTIME,
+        expected_attach_token=ATTACH,
+    )
 
 
 @pytest.mark.asyncio

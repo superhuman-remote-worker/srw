@@ -19,6 +19,7 @@ from uuid import UUID
 from fastapi import HTTPException
 
 from orchestrator.services import stateless_workspace_upgrade
+from orchestrator.services.session_runtime_admission import thread_runtime_authority
 from orchestrator.services.workspace_tier_policy import (
     LiteWorkspaceConfigError,
     thread_workspace_backend,
@@ -123,12 +124,15 @@ async def vm_upgrade_seed_marker(
 
 def require_pinned_runtime_identity(
     thread: Mapping[str, Any], headers: Mapping[str, str]
-) -> str:
-    """The presenting agent's id; 409 unless it is the exact bound runtime.
+) -> tuple[str, str, str]:
+    """The presented ``(agent_id, runtime_generation, attach_token)``, canonical.
 
-    ``seed-source`` hands out object-store credentials, so it binds delivery
-    to the reciprocal identity the way the ``/workspace`` poll does. Values
-    compare as canonical UUIDs; an absent or malformed one never matches.
+    409 unless the three identity headers equal the Session row's
+    ``agent_id``, ``runtime_generation`` and ``runtime_attach_token`` (as
+    canonical UUIDs; an absent or malformed value never matches), the row is
+    on the pinned lane and it has no ``runtime_retirement_token``. This is the
+    row half only: ``_require_bound_pinned_runtime`` adds the live-authority
+    and agent-reciprocity checks the routes need.
     """
     try:
         presented = tuple(
@@ -145,7 +149,37 @@ def require_pinned_runtime_identity(
         or presented != current
     ):
         raise HTTPException(status_code=409, detail=PINNED_IDENTITY_MISMATCH)
-    return presented[0]
+    agent_id, runtime_generation, attach_token = presented
+    return agent_id, runtime_generation, attach_token
+
+
+async def _require_bound_pinned_runtime(
+    request: Any, thread: Mapping[str, Any], *, dependencies: Any
+) -> str:
+    """The presenting agent's id; 409 unless it is the exact bound runtime.
+
+    ``seed-source`` hands out object-store credentials, so both routes run the
+    three identity checks ``/workspace`` runs before it delivers credentials
+    (``require_pinned_workspace_credential_owner``): the row match above; a
+    live runtime authority (``thread_runtime_authority``: a preparable status,
+    no retirement token, no idle-terminal intent); and an agent row that
+    points back at this Session for the same generation and attach token
+    (``pinned_thread_agent_is_reciprocal``). Until all three pass, the routes
+    read no request row, marker or credentials and write nothing.
+    """
+    agent_id, runtime_generation, attach_token = require_pinned_runtime_identity(
+        thread, getattr(request, "headers", {}) or {}
+    )
+    if thread_runtime_authority(thread) is None:
+        raise HTTPException(status_code=409, detail=PINNED_IDENTITY_MISMATCH)
+    if not await dependencies.store.pinned_thread_agent_is_reciprocal(
+        str(thread["id"]),
+        agent_id,
+        expected_runtime_generation=runtime_generation,
+        expected_attach_token=attach_token,
+    ):
+        raise HTTPException(status_code=409, detail=PINNED_IDENTITY_MISMATCH)
+    return agent_id
 
 
 async def mark_vm_upgrade_seeded(
@@ -181,7 +215,7 @@ async def agent_vm_upgrade_seed_source(
     thread = await dependencies.store.get_thread(thread_id)
     if not thread:
         raise HTTPException(status_code=404, detail="Thread not found")
-    require_pinned_runtime_identity(thread, getattr(request, "headers", {}) or {})
+    await _require_bound_pinned_runtime(request, thread, dependencies=dependencies)
     metadata = metadata_object(thread.get("metadata"))
     marker = vm_upgrade_seed(metadata)
     provision_generation = vm_provision_generation(metadata)
@@ -227,8 +261,8 @@ async def agent_vm_upgrade_seeded(
     thread = await dependencies.store.get_thread(thread_id)
     if not thread:
         raise HTTPException(status_code=404, detail="Thread not found")
-    agent_id = require_pinned_runtime_identity(
-        thread, getattr(request, "headers", {}) or {}
+    agent_id = await _require_bound_pinned_runtime(
+        request, thread, dependencies=dependencies
     )
     if not await mark_vm_upgrade_seeded(
         dependencies.store,

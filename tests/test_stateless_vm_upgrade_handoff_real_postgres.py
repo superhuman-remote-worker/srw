@@ -7,14 +7,21 @@ stay unedited and run as regression neighbours. Fixtures are C1's.
 from __future__ import annotations
 
 import json  # noqa: F401 -- later C2 tasks append cases that use it
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
 from uuid import uuid4
 
 import pytest
+from fastapi import HTTPException
 
 from orchestrator.services.manifest_workspace_selection import (
     select_execution_workspace,
 )
-from orchestrator.services.vm_upgrade_seed import mark_vm_upgrade_seeded
+from orchestrator.services.vm_upgrade_seed import (
+    PINNED_IDENTITY_MISMATCH,
+    agent_vm_upgrade_seed_source,
+    mark_vm_upgrade_seeded,
+)
 from tests import test_stateless_workspace_upgrade_real_postgres as c1
 from tests.test_pinned_vm_initial_binding_real_postgres import _bind_cold_agent
 
@@ -102,3 +109,55 @@ async def test_seeded_refuses_a_stale_provision_generation(database, actor, wron
     assert not await mark_vm_upgrade_seeded(database, str(thread_id), **kwargs)
     vm = metadata(await database.get_thread(thread_id))["vm"]
     assert vm["upgrade_seed"]["state"] == "pending"
+
+
+async def seed_source(database, thread):
+    """``seed-source`` as the bound runtime presents itself."""
+    request = SimpleNamespace(
+        headers={
+            "X-Agent-ID": str(thread["agent_id"]),
+            "X-Session-Runtime-Generation": str(thread["runtime_generation"]),
+            "X-Session-Runtime-Attach-Token": str(thread["runtime_attach_token"]),
+        }
+    )
+    return await agent_vm_upgrade_seed_source(
+        request,
+        str(thread["id"]),
+        dependencies=SimpleNamespace(require_internal=AsyncMock(), store=database),
+    )
+
+
+class _RollBack(Exception):
+    """Leaves the half-unbound agent uncommitted: its deferred fence refuses it."""
+
+
+@pytest.mark.asyncio
+async def test_seed_source_refuses_an_agent_that_no_longer_points_at_the_session(
+    database, actor
+):
+    thread_id, agent_id, generation, request_id = await bound_with_pending_marker(
+        database, actor
+    )
+    await database.execute(
+        "INSERT INTO thread_control_requests "
+        "(id,thread_id,request_seq,client_request_id,verb,requested_by) "
+        "VALUES ($1::uuid,$2::uuid,1,$3::uuid,'upgrade-to-workspace','owner')",
+        request_id,
+        str(thread_id),
+        str(uuid4()),
+    )
+    thread = await database.get_thread(thread_id)
+    served = await seed_source(database, thread)
+    assert served["seed_from"] is None
+    assert served["control_request_id"] == request_id
+    assert served["provision_generation"] == generation
+    with pytest.raises(_RollBack):
+        async with database.transaction_scope():
+            await database.execute(
+                "UPDATE agents SET thread_id = NULL WHERE id = $1::uuid", agent_id
+            )
+            with pytest.raises(HTTPException) as refused:
+                await seed_source(database, thread)
+            assert refused.value.status_code == 409
+            assert refused.value.detail == PINNED_IDENTITY_MISMATCH
+            raise _RollBack
