@@ -12414,6 +12414,74 @@ describe('PersistentChatService — control transport is declared, never inferre
     ).toHaveLength(1);
   });
 
+  it('a lane_changed frame covered by the new-epoch snapshot still switches a socketless tab', async () => {
+    const ctx = createService();
+    const routes = switchingRoutes();
+    ctx.mockHttp.get.mockImplementation((url: string) =>
+      url.endsWith('/state')
+        ? of({
+            thread_id: 'socketless',
+            permission_mode: 'autonomous',
+            narration_mode: 'auto',
+            turn_count: 2,
+            turn_in_flight: false,
+            message_count: 4,
+            model: 'gpt-5.6-sol',
+            temperature: 0,
+            running_tool: null,
+            pending_permissions: [],
+            event_cursor: { epoch: 2, seq: 5 },
+            replay_cursor: { epoch: 2, seq: 5 },
+            snapshot_source: 'durable_journal',
+          })
+        : routes.get(url),
+    );
+    ctx.mockHttp.post.mockReturnValue(of({ state: 'preparing' }));
+    await ctx.service.connect('socketless');
+    fireSseOpen(ctx.sseInstances[0]);
+    (ctx.service as any)._ensureControlWs();
+    await Promise.resolve();
+    routes.pin();
+
+    fireSseMessage(
+      ctx.sseInstances[0],
+      {
+        method: 'session.lane_changed',
+        params: { from: 'stateless', to: 'pinned', reason: 'vm_upgrade', control_request_id: 'r-1' },
+      },
+      '2:1',
+    );
+
+    expect(ctx.service.executionLane()).toBe('pinned');
+    expect(ctx.service.sessionReady()).toBe(false);
+    await vi.waitFor(() => expect(ctx.wsInstances).toHaveLength(1));
+  });
+
+  it('a meta read that sees the pinned lane on a socketless tab switches it once', async () => {
+    const ctx = await switchingSession();
+    ctx.mockHttp.post.mockReturnValue(of({ state: 'preparing' }));
+    const stamps = vi.spyOn(ctx.service as any, '_systemMessage');
+    ctx.routes.pin();
+    const base = ctx.mockHttp.get.getMockImplementation()!;
+    ctx.mockHttp.get.mockImplementation((url: string) =>
+      url.includes('/connection') || url.endsWith('/messages') || url.endsWith('/state')
+        ? base(url)
+        : of({ status: 'active', total_turns: 2, config_name: 'session_base', execution_lane: 'pinned' }),
+    );
+
+    for (let i = 0; i < 2; i++) {
+      await (ctx.service as any).loadThreadMeta('socketless', (ctx.service as any).connectGeneration, {
+        fresh: true,
+        lifecycleOnly: true,
+      });
+    }
+
+    await vi.waitFor(() => expect(ctx.wsInstances).toHaveLength(1));
+    expect(
+      stamps.mock.calls.filter(([line]) => line === 'chat.workspaceUpgrade.movingToVm'),
+    ).toHaveLength(1);
+  });
+
   it('the journaled .started is the receipt, and .complete continues once', async () => {
     const ctx = await socketlessSession(upgradeableVm);
     ctx.mockHttp.post.mockReturnValue(of({ state: 'pending' }));

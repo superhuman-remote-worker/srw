@@ -3135,6 +3135,12 @@ export class PersistentChatService {
           ? thread.execution_lane
           : null,
       );
+      if (thread.execution_lane === 'pinned' && this.controlSocket === 'none') {
+        // C2: another tab (or a lost 202) switched this Session to the pinned
+        // lane. The frame may be covered by the snapshot, so the read is the
+        // robust signal. Idempotent via laneSwitchHandled.
+        this._switchToPinnedTransport(threadId, 'lane-read');
+      }
       this.workspaceLifecycle.set(thread.workspace_lifecycle ?? null);
       this.workspaceCreation.set(thread.workspace_creation ?? null);
       this.workspaceUpgrade.set(thread.workspace_upgrade ?? null);
@@ -8414,7 +8420,10 @@ export class PersistentChatService {
         break;
 
       case 'session.lane_changed': {
-        if (coveredBySnapshot) break;
+        // A socketless tab must follow even a snapshot-covered frame: the
+        // switch bumps the journal epoch, so the replayed frame is always
+        // covered by the reloaded /state cursor.
+        if (coveredBySnapshot && this.controlSocket !== 'none') break;
         const tid = this.threadId();
         if (tid && params['to'] === 'pinned') {
           this._switchToPinnedTransport(tid, String(params['control_request_id'] ?? ''));
