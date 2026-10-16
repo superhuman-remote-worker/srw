@@ -38,6 +38,8 @@ notes are intentionally not prerequisites for using the public repository.
   folder is left out.
 - [VM capacity diagnostics](vm-capacity.md) — interpret resource inventory,
   retained reservations and unavailable capacity.
+- [VM workspace networking and recovery](vm-workspace-recovery.md) — qualify an
+  immutable image, enable bounded recovery, and interpret retained holds.
 - [Expert configuration](../config/README.md) — configure agent roles, overlays,
   prompts, models, and tools.
 
