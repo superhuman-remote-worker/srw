@@ -2087,26 +2087,46 @@ SEED_CAPABLE = frozenset({"workspace_upgrade_seed.v1"})
 S3_STORE = {"type": "s3", "root": "srw-workspaces", "config": {"endpoint": "e"}}
 
 
-def _seed_pending_thread(seed_from=SEED_FROM):
-    return _thread(
-        metadata={
-            "config_override": {
-                "llm": {"model": "m"},
-                "workspace": {"backend": "sandbox"},
-            },
-            "workspace_container": {
-                "status": "pending",
-                "provisioner": "k8s",
-                "_runtime_creation": {
-                    "generation": "33333333-3333-4333-8333-333333333333",
-                    "mode": "create",
-                    "attempted": True,
-                    "replaces_uid": None,
-                },
-                "seed_from": seed_from,
+def _seed_pending_thread(seed_from=SEED_FROM, *, status="ready"):
+    """An upgraded Session that still owes its copy: Ready (the binding and
+    endpoint the Ready step writes) unless ``status`` names an earlier step."""
+    metadata = {
+        "config_override": {
+            "llm": {"model": "m"},
+            "workspace": {"backend": "sandbox"},
+        },
+    }
+    if status == "ready":
+        metadata["_workspace_binding"] = {
+            "generation": WORKSPACE_GENERATION,
+            "kind": "remote",
+            "backing_id": "k8s-pvc:agent-workspaces:pvc-uid",
+            "ssh_host_key_fingerprint": WORKSPACE_FINGERPRINT,
+        }
+        container = {
+            "status": "ready",
+            "provisioner": "k8s",
+            "pod_ip": "10.0.0.8",
+            "pod_port": 22,
+            "pod_name": "ws-thread-bbbbbbbb-bbb",
+            "namespace": "agent-workspaces",
+            "_runtime_incarnation": WORKSPACE_RUNTIME,
+            "_canvas_workspace_generation": WORKSPACE_GENERATION,
+        }
+    else:
+        container = {
+            "status": status,
+            "provisioner": "k8s",
+            "_runtime_creation": {
+                "generation": "33333333-3333-4333-8333-333333333333",
+                "mode": "create",
+                "attempted": True,
+                "replaces_uid": None,
             },
         }
-    )
+    container["seed_from"] = seed_from
+    metadata["workspace_container"] = container
+    return _thread(metadata=metadata)
 
 
 @pytest.mark.asyncio
@@ -2131,11 +2151,55 @@ async def test_seed_pending_bundle_refuses_a_claimant_without_the_capability(
             ),
         )
     assert refused.value.status_code == 425
+    assert refused.value.detail == "Claimant cannot seed an upgraded workspace"
     assembly.assert_not_awaited()
 
 
 @pytest.mark.asyncio
-async def test_seed_pending_bundle_carries_the_old_workspace_beside_attach(
+@pytest.mark.parametrize("status", ["pending", "created", "creating"])
+async def test_an_upgrade_whose_container_is_not_ready_is_a_transient_425_before_any_effect(
+    monkeypatch, status
+):
+    """F1: until Ready writes ``_workspace_binding`` the attach assembly
+    refuses the claim with a 409, which the executor counts toward the park
+    budget. A pending upgrade answers 425 instead (a transient release that
+    never parks) before any credential, assembly, lock or stamp."""
+    from orchestrator import main as orch_main
+
+    monkeypatch.setattr(
+        "orchestrator.services.virtual_workspace.virtual_workspace_rclone_spec",
+        lambda: S3_STORE,
+    )
+    db = FakeDB(
+        run_queue_row=dict(LEASED_ROW),
+        thread=_seed_pending_thread(status=status),
+    )
+    inject, assembly = _patch(monkeypatch, orch_main, db)
+
+    with pytest.raises(HTTPException) as refused:
+        await unit_claim_bundle.claim_bundle_for_unit(
+            UNIT_ID,
+            lease_token=7,
+            pod_name=POD_NAME,
+            pod_uid=POD_UID,
+            claimant_capabilities=SEED_CAPABLE,
+            dependencies=sessions_composition.unit_claim_bundle_dependencies(
+                orch_main.app.state.resources
+            ),
+        )
+
+    assert refused.value.status_code == 425
+    assert refused.value.detail == "Workspace upgrade is still creating the container"
+    inject.assert_not_awaited()
+    assembly.assert_not_awaited()
+    thread_mount_rows_module.thread_project_ids.assert_not_awaited()
+    assert db.datasource_lock_calls == []
+    db.conn.fetchval.assert_not_awaited()
+    db.conn.execute.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_a_ready_upgrade_bundle_carries_the_old_workspace_beside_attach(
     monkeypatch,
 ):
     from orchestrator import main as orch_main

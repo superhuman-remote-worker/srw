@@ -186,6 +186,16 @@ def workspace_upgrade_targets(
     return ["container"]
 
 
+def workspace_upgrade_container_ready(metadata: Any) -> bool:
+    """Whether the upgrade's container has passed its Ready step.
+
+    Ready writes the binding and endpoint an attach needs. Before it the
+    Session read says ``provisioning`` and the claim bundle answers 425.
+    """
+    container = metadata_object(metadata).get("workspace_container")
+    return isinstance(container, Mapping) and container.get("status") == "ready"
+
+
 def workspace_upgrade_view(
     thread: Mapping[str, Any], creation_view: Mapping[str, Any] | None
 ) -> dict[str, Any] | None:
@@ -199,9 +209,8 @@ def workspace_upgrade_view(
             "phase": "failed",
             "reason_code": creation_view.get("reason_code"),
         }
-    container = metadata.get("workspace_container") or {}
-    phase = "copying" if container.get("status") == "ready" else "provisioning"
-    return {"target_tier": "sandbox", "phase": phase}
+    ready = workspace_upgrade_container_ready(metadata)
+    return {"target_tier": "sandbox", "phase": "copying" if ready else "provisioning"}
 
 
 def workspace_upgrade_seed_spec(

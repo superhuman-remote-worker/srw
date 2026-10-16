@@ -382,7 +382,7 @@ async def test_end_first_refuses_the_upgrade(database, actor):
 
 from datetime import datetime, timezone  # noqa: E402
 from types import SimpleNamespace  # noqa: E402
-from unittest.mock import AsyncMock  # noqa: E402
+from unittest.mock import AsyncMock, MagicMock  # noqa: E402
 
 from orchestrator.database.container_startup_stage import (  # noqa: E402
     ScheduledAt,
@@ -434,8 +434,8 @@ def upgrade_provisioner(database, monkeypatch):
     return provisioner, cluster
 
 
-async def upgraded_create(database, actor, monkeypatch, *, first_wait):
-    thread_id = await lite_session(database, actor)
+async def upgraded_create(database, actor, monkeypatch, *, first_wait, bind=True):
+    thread_id = await lite_session(database, actor, bind=bind)
     await admit_upgrade(database, actor, thread_id)
     provisioner, cluster = upgrade_provisioner(database, monkeypatch)
     suspension = SimpleNamespace()
@@ -546,6 +546,153 @@ async def test_an_upgrade_create_in_startup_attention_projects_a_failed_upgrade(
         "phase": "failed",
         "reason_code": "invalid_image",
     }
+
+
+from fastapi import HTTPException  # noqa: E402
+
+from agent.api import turn_executor as executor_module  # noqa: E402
+from orchestrator.services import (  # noqa: E402
+    dispatch_credentials,
+    session_attach_payload,
+    unit_claim_bundle,
+)
+from shared.run_queue import transient_release_backoff_seconds  # noqa: E402
+from shared.workspace_upgrade import WORKSPACE_UPGRADE_SEED_CAPABILITY  # noqa: E402
+
+CLAIMANT_POD = "srw-agent-stateless-c1"
+CLAIMANT_POD_UID = "11111111-2222-4333-8444-555555555555"
+OBJECT_STORE = {"type": "s3", "root": "srw-workspaces", "config": {"endpoint": "e"}}
+
+
+class PastTheUpgradeGate(Exception):
+    """The first collaborator after the upgrade gate ran."""
+
+
+async def claim_now(database, thread_id):
+    """The next claim of this Session's unit, as an executor makes it."""
+    async with database.acquire() as conn:
+        await conn.execute(
+            "UPDATE run_queue SET run_after = now() WHERE unit_id = $1::uuid",
+            thread_id,
+        )
+        claim = await claim_unit(
+            conn,
+            unit_kind=UNIT_KIND_SESSION_TURN,
+            pod_name=CLAIMANT_POD,
+            affinity_grace_seconds=0.0,
+        )
+    assert claim is None or str(claim.unit_id) == str(thread_id)
+    return claim
+
+
+@pytest.mark.asyncio
+async def test_claims_before_ready_back_off_without_parking_the_upgrade(
+    database, actor, monkeypatch
+):
+    """F1: the upgrade's control wakes the queue at once, and until Ready
+    writes the binding the attach assembly refuses every claim (409), which
+    executors count toward the park budget (5 in about 3.4 min live). The
+    bundle answers 425 instead; the executor's own release for it re-queues
+    with the capped transient backoff and never parks, and the first claim
+    after Ready goes past the gate."""
+    case = await upgraded_create(
+        database, actor, monkeypatch, first_wait="not_ready", bind=False
+    )
+    monkeypatch.setattr(
+        "orchestrator.services.virtual_workspace.virtual_workspace_rclone_spec",
+        lambda: OBJECT_STORE,
+    )
+    inject = AsyncMock(side_effect=lambda co, **_: co)
+    monkeypatch.setattr(
+        dispatch_credentials, "inject_thread_dispatch_credentials", inject
+    )
+    # The live refusal before Ready: the workspace identity pair is incomplete.
+    assembly = AsyncMock(return_value=None)
+    monkeypatch.setattr(
+        session_attach_payload, "assemble_session_attach_payload", assembly
+    )
+    dependencies = SimpleNamespace(
+        db=database,
+        recovery_store=None,
+        thread_project_ids=AsyncMock(return_value=[]),
+        thread_has_knowledge_scope=AsyncMock(return_value=False),
+        dispatch_credential_dependencies=lambda: None,
+        session_attach_payload_dependencies=lambda: None,
+    )
+    executor = executor_module.StatelessTurnExecutor(
+        pod_name=CLAIMANT_POD, pod_uid=CLAIMANT_POD_UID
+    )
+    monkeypatch.setattr(
+        executor_module.StatelessTurnExecutor, "_db", property(lambda _: database)
+    )
+    monkeypatch.setattr(executor_module, "_pa", lambda: MagicMock())
+    monkeypatch.setattr(executor, "_quiesce_claim_before_transition", AsyncMock())
+    monkeypatch.setattr(executor, "_ack_terminal_claim_loss", AsyncMock())
+    monkeypatch.setattr(executor, "_clear_claim_tool_effect", MagicMock())
+
+    async def bundle(claim):
+        return await unit_claim_bundle.claim_bundle_for_unit(
+            str(case.thread_id),
+            lease_token=claim.lease_token,
+            pod_name=CLAIMANT_POD,
+            pod_uid=CLAIMANT_POD_UID,
+            dependencies=dependencies,
+            claimant_capabilities=frozenset({WORKSPACE_UPGRADE_SEED_CAPABILITY}),
+        )
+
+    max_attempts = await database.fetchval(
+        "SELECT max_attempts FROM run_queue WHERE unit_id = $1::uuid", case.thread_id
+    )
+    for attempt in range(1, max_attempts + 2):
+        claim = await claim_now(database, case.thread_id)
+        assert claim is not None, f"claim {attempt}: the unit parked"
+        with pytest.raises(HTTPException) as refused:
+            await bundle(claim)
+        # turn_executor ~:4240: a bundle refusal releases as bundle_<status>.
+        await executor._release(claim, reason=f"bundle_{refused.value.status_code}")
+        queue = await database.fetchrow(
+            "SELECT state, park_reason, attach_failures, last_error, "
+            "EXTRACT(EPOCH FROM run_after - queued_at) AS backoff "
+            "FROM run_queue WHERE unit_id = $1::uuid",
+            case.thread_id,
+        )
+        assert (
+            queue["state"],
+            queue["park_reason"],
+            queue["attach_failures"],
+            queue["last_error"],
+        ) == ("queued", None, 0, None), (attempt, refused.value.detail)
+        assert (refused.value.status_code, refused.value.detail) == (
+            425,
+            "Workspace upgrade is still creating the container",
+        )
+        assert float(queue["backoff"]) == pytest.approx(
+            transient_release_backoff_seconds(claim.attempts_since_completion),
+            abs=1.0,
+        )
+    inject.assert_not_awaited()
+    assembly.assert_not_awaited()
+    assert not await database.fetchval(
+        "SELECT count(*) FROM thread_events WHERE thread_id = $1::uuid",
+        case.thread_id,
+    )
+    pending = metadata(await database.get_thread(case.thread_id))
+    assert "_stateless_active_claim" not in pending
+    assert pending["workspace_container"]["status"] != "ready"
+
+    case.cluster.become_ready()
+    await ensure_session_workspace(
+        case.thread_id,
+        db=database,
+        provisioner=case.provisioner,
+        suspension=case.suspension,
+    )
+    ready = metadata(await database.get_thread(case.thread_id))
+    assert ready["workspace_container"]["status"] == "ready"
+    assert ready["workspace_container"]["seed_from"]["backend"] == "virtual"
+    inject.side_effect = PastTheUpgradeGate
+    with pytest.raises(PastTheUpgradeGate):
+        await bundle(await claim_now(database, case.thread_id))
 
 
 @pytest.mark.asyncio

@@ -67,6 +67,7 @@ from orchestrator.services.stateless_workspace_gate import (
     stateless_session_workspace_check,
 )
 from orchestrator.services.stateless_workspace_upgrade import (
+    workspace_upgrade_container_ready,
     workspace_upgrade_seed_spec,
 )
 from orchestrator.services.vm_provisioner import vm_provisioner
@@ -524,7 +525,8 @@ async def _assemble_claim_bundle(
     generic detail); 404 unit row absent; 409 not a session unit, thread not
     on the stateless lane, or attach assembly refused (generic reason); 425 a
     Session that still owes its workspace-upgrade copy, to a claimant that
-    didn't declare ``workspace_upgrade_seed.v1``.
+    didn't declare ``workspace_upgrade_seed.v1`` or before the upgrade's
+    container is Ready.
     """
     from shared.run_queue import (
         LANE_STATELESS,
@@ -1080,9 +1082,11 @@ async def _assemble_claim_bundle(
     # performs the same check before writing, but correctness cannot depend on
     # every producer having done so.
     require_stateless_workspace(thread)
-    # C1 rolling deploy: a row that still owes its upgrade copy is claimable
-    # only by an executor that can make it. 425 is a transient release
-    # (turn_executor._TRANSIENT_BUNDLE_STATUSES), so a new executor gets it.
+    # C1: a row that still owes its upgrade copy answers 425 until it can be
+    # served. 425 is a transient release (turn_executor.
+    # _TRANSIENT_BUNDLE_STATUSES): it re-queues with a capped backoff and
+    # never spends the park budget. Rolling deploy: only an executor that can
+    # make the copy gets the row.
     upgrade_seed_from = workspace_upgrade_seed_from(thread.get("metadata"))
     upgrade_seed: dict[str, Any] | None = None
     if upgrade_seed_from is not None:
@@ -1090,6 +1094,14 @@ async def _assemble_claim_bundle(
             raise HTTPException(
                 status_code=425,
                 detail="Claimant cannot seed an upgraded workspace",
+            )
+        # The upgrade's control wakes the queue right after admission, long
+        # before Ready writes the binding; the attach assembly would refuse
+        # each such claim with a 409, which counts toward the park budget.
+        if not workspace_upgrade_container_ready(thread.get("metadata")):
+            raise HTTPException(
+                status_code=425,
+                detail="Workspace upgrade is still creating the container",
             )
         # Built from this pre-lock row, before any credential is assembled or
         # the claim is stamped, so a refusal leaves no effect behind; the
