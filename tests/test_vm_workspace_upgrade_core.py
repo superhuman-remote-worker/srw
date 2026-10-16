@@ -20,12 +20,16 @@ from shared.runtime.core.backends.object_store import InMemoryObjectStore
 from tests._fs_backend import FilesystemTestBackend
 
 
-def _session(order=None):
+def _session(order=None, *, metadata=None):
     sess = MagicMock()
     sess.protected_cloud_required = False
     sess.shell_owner_token = None
     sess.config.extra = {"shell": {}}
     sess.workspace_manager.backend = SimpleNamespace(supports_shell=False)
+    # The WebSocket swap reads the thread for a pending lane-switch marker.
+    sess.postgres_conn.get_thread = AsyncMock(
+        return_value={"metadata": metadata if metadata is not None else {}}
+    )
     sess.cloud_mount_manager = None
     sess.cloud_mount_error = None
     sess._live_connector_lock = None
@@ -315,3 +319,120 @@ async def test_a_virtual_file_over_the_read_ceiling_is_skipped_and_the_upgrade_c
     assert "'big.bin'" in caplog.text and "copy limit" in caplog.text
     sess.swap_backend.assert_called_once_with(dst)
     client.abort_thread_vm_upgrade.assert_not_called()
+
+
+# --- a WebSocket VM upgrade over a pending lane-switch marker (final review) --
+
+LANE_SWITCH_REQUEST = "22222222-2222-4222-8222-222222222222"
+PROVISION = "77777777-7777-4777-8777-777777777777"
+OLD_PREFIX = {"backend": "virtual", "prefix": "threads/tid/", "binding": None}
+
+
+def _marker_metadata(state):
+    return {
+        "vm": {
+            "status": "ready",
+            "provision_generation": PROVISION,
+            "upgrade_seed": {
+                "control_request_id": LANE_SWITCH_REQUEST,
+                "state": state,
+                "source": OLD_PREFIX,
+            },
+        }
+    }
+
+
+@pytest.mark.asyncio
+async def test_a_websocket_upgrade_over_a_pending_marker_records_it_before_the_swap():
+    """Final review Important 2 (data safety): the orchestrator answers a
+    WebSocket retry "already in progress" and keeps a pending C2 marker. This
+    swap seeds the same old prefix, so it records the marker ``seeded`` first;
+    the next VM attach then copies nothing over newer VM files."""
+    from agent.api import vm_upgrade_handoff as handoff
+
+    order: list = []
+    metadata = _marker_metadata("pending")
+
+    async def mark_seeded(_thread_id, *, provision_generation, control_request_id):
+        order.append("seeded")
+        metadata["vm"]["upgrade_seed"]["state"] = "seeded"
+
+    ws, sess, client = AsyncMock(), _session(order, metadata=metadata), _client()
+    client.mark_workspace_upgrade_seeded = AsyncMock(side_effect=mark_seeded)
+
+    def seed(src, dst, **_kw):
+        order.append("seed")
+        return 7
+
+    p = _patches(sess, client, vm_cfg={"ssh_host": "100.64.0.9"}, seed=seed)
+    with p[0], p[1], p[2], p[3], p[4], p[5]:
+        await pa._handle_workspace_upgrade(ws, target_tier="vm")
+
+    assert order == ["seed", "seeded", "swap"]
+    client.mark_workspace_upgrade_seeded.assert_awaited_once_with(
+        "tid",
+        provision_generation=PROVISION,
+        control_request_id=LANE_SWITCH_REQUEST,
+    )
+    assert _frames(ws) == [
+        ("workspace_upgrade.started", {"thread_id": "tid", "target_tier": "vm"}),
+        (
+            "workspace_upgrade.complete",
+            {"thread_id": "tid", "target_tier": "vm", "seeded_files": 7},
+        ),
+    ]
+
+    # A later VM attach finds nothing owed: no source read, no copy.
+    attach = SimpleNamespace(
+        postgres_conn=SimpleNamespace(
+            get_thread=AsyncMock(return_value={"metadata": metadata})
+        ),
+        workspace_manager=SimpleNamespace(backend=SimpleNamespace(supports_shell=True)),
+    )
+    client.get_workspace_upgrade_seed_source = AsyncMock()
+    assert (
+        await handoff.recover_vm_upgrade_seed(
+            session=attach, client=client, thread_id="tid"
+        )
+        is None
+    )
+    client.get_workspace_upgrade_seed_source.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "metadata",
+    [{}, _marker_metadata("seeded"), _marker_metadata("interrupted")],
+    ids=["no-marker", "seeded", "interrupted"],
+)
+async def test_a_websocket_upgrade_without_a_pending_marker_records_nothing(metadata):
+    ws, sess, client = AsyncMock(), _session(metadata=metadata), _client()
+    client.mark_workspace_upgrade_seeded = AsyncMock()
+    p = _patches(sess, client, vm_cfg={"ssh_host": "100.64.0.9", "ssh_port": 22})
+    with p[0], p[1], p[2], p[3], p[4], p[5]:
+        await pa._handle_workspace_upgrade(ws, target_tier="vm")
+    client.mark_workspace_upgrade_seeded.assert_not_awaited()
+    assert _frames(ws) == [
+        ("workspace_upgrade.started", {"thread_id": "tid", "target_tier": "vm"}),
+        (
+            "workspace_upgrade.complete",
+            {"thread_id": "tid", "target_tier": "vm", "seeded_files": 7},
+        ),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_a_websocket_upgrade_that_cannot_record_the_marker_never_swaps():
+    from agent.api.orchestrator_client import WorkspaceUpgradeRouteRefused
+
+    ws = AsyncMock()
+    sess, client = _session(metadata=_marker_metadata("pending")), _client()
+    client.mark_workspace_upgrade_seeded = AsyncMock(
+        side_effect=WorkspaceUpgradeRouteRefused(409, "upgrade_seed_fence_lost", "lost")
+    )
+    p = _patches(sess, client, vm_cfg={"ssh_host": "100.64.0.9"})
+    with p[0], p[1], p[2], p[3], p[4], p[5]:
+        await pa._handle_workspace_upgrade(ws, target_tier="vm")
+    sess.swap_backend.assert_not_called()
+    client.abort_thread_vm_upgrade.assert_awaited_once_with("tid")
+    assert _frames(ws)[-1] == ("workspace_upgrade.failed", {"reason": "lost"})

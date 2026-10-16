@@ -4663,6 +4663,8 @@ class TestHandleWorkspaceUpgradeVm:
         sess.shell_owner_token = None
         sess.config.extra = {"shell": {}}
         sess.workspace_manager.backend = backend
+        # The swap reads the thread for a pending lane-switch marker (C2).
+        sess.postgres_conn.get_thread = AsyncMock(return_value=None)
         return sess
 
     @pytest.mark.asyncio
@@ -4943,6 +4945,7 @@ class TestHandleWorkspaceUpgradeTierOrTemplate:
         sess.shell_owner_token = None
         sess.config.extra = {"shell": {}}
         sess.workspace_manager.backend = backend
+        sess.postgres_conn.get_thread = AsyncMock(return_value=None)
         return sess
 
     @pytest.mark.asyncio
@@ -5147,6 +5150,7 @@ class TestHandleWorkspaceUpgradeSandboxCanvasCapability:
         session.workspace_manager.backend = old_backend
         session.swap_backend = MagicMock()
         session.resetup_tools_for_backend = MagicMock()
+        session.postgres_conn.get_thread = AsyncMock(return_value=None)
         new_backend = MagicMock()
         new_backend.connect = MagicMock()
         remote_module = MagicMock()

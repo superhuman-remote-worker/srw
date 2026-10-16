@@ -130,6 +130,7 @@ from shared.thread_presence import (
 )
 from shared.session_retirement import update_stateless_claim_status
 from shared.workspace_upgrade import (
+    UPGRADE_ALREADY_RUNNING,
     UPGRADE_FAILED,
     UPGRADE_INTERRUPTED,
     WORKSPACE_UPGRADE_PAYLOAD_KEYS,
@@ -10125,20 +10126,85 @@ async def _mark_vm_upgrade_seeded(
     )
 
 
+async def _mark_pending_vm_upgrade_seeded(_seeded: int) -> None:
+    """The WebSocket swap's ``before_swap``: settle a pending lane-switch copy (C2).
+
+    A WebSocket VM upgrade can run while a stateless lane switch's marker is
+    still ``pending`` (its durable swap failed, or never started because this
+    one held the single flight): the orchestrator answers that retry "already
+    in progress" and keeps the marker. This swap seeds the same old prefix, so
+    the marker is recorded ``seeded`` for the current provision generation
+    before the swap; otherwise the next VM attach's recovery copy would write
+    the old files over newer VM ones. No marker, or one that isn't pending:
+    nothing to record. A failed record fails the upgrade before the swap.
+    """
+    from shared.workspace_upgrade import (
+        VM_UPGRADE_SEED_PENDING,
+        vm_provision_generation,
+        vm_upgrade_seed,
+    )
+
+    if (
+        _session is None
+        or _session.postgres_conn is None
+        or _session_identity.thread_id is None
+    ):
+        return
+    thread = await _session.postgres_conn.get_thread(str(_session_identity.thread_id))
+    metadata = (thread or {}).get("metadata")
+    marker = vm_upgrade_seed(metadata)
+    if marker is None or marker["state"] != VM_UPGRADE_SEED_PENDING:
+        return
+    provision_generation = vm_provision_generation(metadata)
+    if provision_generation is None:
+        raise WorkspaceUnavailableError(
+            "the pending VM upgrade copy has no provision generation"
+        )
+    await _mark_vm_upgrade_seeded(
+        control_request_id=marker["control_request_id"],
+        provision_generation=provision_generation,
+    )
+    logger.info(
+        "WebSocket VM upgrade recorded the pending copy of request %s",
+        marker["control_request_id"],
+    )
+
+
 def _start_durable_vm_upgrade(request: Any, *, provision_generation: str) -> None:
     """Run the VM hot swap for a receipted C2 request, journaling its events.
 
     Takes the single flight now, so no other upgrade starts before the task
     runs. The task's ``finally`` releases it; a task cancelled before its first
     step never runs that ``finally``, so a done-callback releases it then.
+    The request is already receipted ``.started``: a start that can't run
+    (another upgrade holds the flight, or the session is gone) journals a
+    typed ``.failed`` instead of leaving every tab waiting.
     """
     global _workspace_upgrade_in_flight
-    if _workspace_upgrade_in_flight or _session is None:
-        return
     envelope = {
         "request_id": str(request.id),
         "client_request_id": str(request.client_request_id),
     }
+    if _session is None or _workspace_upgrade_in_flight:
+        code, reason = (
+            (UPGRADE_FAILED, "Session not ready")
+            if _session is None
+            else (UPGRADE_ALREADY_RUNNING, WORKSPACE_UPGRADE_ALREADY_RUNNING)
+        )
+        logger.warning(
+            "VM upgrade %s did not start its swap: %s (%s)", request.id, reason, code
+        )
+        _broadcast(
+            "workspace_upgrade.failed",
+            {
+                "thread_id": str(_session_identity.thread_id),
+                "target_tier": "vm",
+                "reason": reason,
+                "error_code": code,
+                **envelope,
+            },
+        )
+        return
     src_backend = (
         _session.workspace_manager.backend if _session.workspace_manager else None
     )
@@ -10183,8 +10249,11 @@ def _start_durable_vm_upgrade(request: Any, *, provision_generation: str) -> Non
 
 
 def _resume_vm_upgrade_from_receipt(request: Any, payload: Any) -> None:
-    """A ``.started`` receipt found without its finalization: start the swap."""
-    if _session is None or _workspace_upgrade_in_flight:
+    """A ``.started`` receipt found without its finalization: start the swap.
+
+    A held single flight is ``_start_durable_vm_upgrade``'s to report.
+    """
+    if _session is None:
         return
     if str(getattr(_session, "workspace_backend_tier", "") or "") not in (
         "virtual",
@@ -11811,7 +11880,10 @@ async def _handle_workspace_upgrade(
             return
 
         await _run_workspace_upgrade_swap(
-            emit, target_tier=target_tier, src_backend=src_backend
+            emit,
+            target_tier=target_tier,
+            src_backend=src_backend,
+            before_swap=_mark_pending_vm_upgrade_seeded,
         )
     finally:
         _workspace_upgrade_in_flight = False

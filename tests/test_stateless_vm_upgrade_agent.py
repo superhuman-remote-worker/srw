@@ -1151,6 +1151,7 @@ async def test_the_durable_emitter_journals_with_the_envelope_and_a_typed_failur
 def durable(monkeypatch):
     client = SimpleNamespace(mark_workspace_upgrade_seeded=AsyncMock())
     tasks: list = []
+    sent: list = []
     monkeypatch.setattr(pa, "_orchestrator_client", client)
     monkeypatch.setattr(
         pa,
@@ -1164,7 +1165,10 @@ def durable(monkeypatch):
         "track_session_side_task",
         lambda task: tasks.append(task) or task,
     )
-    return SimpleNamespace(client=client, tasks=tasks)
+    monkeypatch.setattr(
+        pa, "_broadcast", lambda method, params: sent.append((method, params))
+    )
+    return SimpleNamespace(client=client, tasks=tasks, sent=sent)
 
 
 @pytest.mark.asyncio
@@ -1245,6 +1249,68 @@ async def test_a_durable_swap_never_starts_twice(monkeypatch, durable):
 
     assert durable.tasks == []
     assert pa._workspace_upgrade_in_flight is True
+
+
+@pytest.mark.asyncio
+async def test_a_durable_start_while_another_upgrade_runs_is_a_typed_failure(
+    monkeypatch, durable, caplog
+):
+    """Final review Important 2 (b): the request was receipted ``.started``,
+    so a start the single flight blocks must say so to every tab and log."""
+    monkeypatch.setattr(pa, "_run_workspace_upgrade_swap", AsyncMock())
+    monkeypatch.setattr(pa, "_workspace_upgrade_in_flight", True)
+
+    with caplog.at_level("WARNING", logger=pa.logger.name):
+        pa._start_durable_vm_upgrade(_request(), provision_generation=PROVISION)
+
+    assert durable.sent == [
+        (
+            "workspace_upgrade.failed",
+            {
+                "thread_id": str(THREAD_ID),
+                "target_tier": "vm",
+                "reason": "A workspace upgrade is already running.",
+                "error_code": "upgrade_already_running",
+                "request_id": str(REQUEST_ID),
+                "client_request_id": str(CLIENT_REQUEST_ID),
+            },
+        )
+    ]
+    assert str(REQUEST_ID) in caplog.text
+    assert durable.tasks == []
+
+
+def test_a_recovered_started_receipt_under_a_held_flight_says_so(monkeypatch, durable):
+    monkeypatch.setattr(pa, "_workspace_upgrade_in_flight", True)
+    pa._session.workspace_backend_tier = "virtual"
+
+    pa._resume_vm_upgrade_from_receipt(
+        _request(), {**ENVELOPE, "provision_generation": PROVISION}
+    )
+
+    assert [(method, params["error_code"]) for method, params in durable.sent] == [
+        ("workspace_upgrade.failed", "upgrade_already_running")
+    ]
+    assert durable.tasks == []
+
+
+@pytest.mark.asyncio
+async def test_a_durable_start_without_a_session_is_a_typed_failure(
+    monkeypatch, durable, caplog
+):
+    monkeypatch.setattr(pa, "_run_workspace_upgrade_swap", AsyncMock())
+    monkeypatch.setattr(pa, "_session", None)
+
+    with caplog.at_level("WARNING", logger=pa.logger.name):
+        pa._start_durable_vm_upgrade(_request(), provision_generation=PROVISION)
+
+    assert [(method, params["error_code"]) for method, params in durable.sent] == [
+        ("workspace_upgrade.failed", "upgrade_failed")
+    ]
+    assert durable.sent[0][1]["request_id"] == str(REQUEST_ID)
+    assert str(REQUEST_ID) in caplog.text
+    assert durable.tasks == []
+    assert pa._workspace_upgrade_in_flight is False
 
 
 # --- the client -------------------------------------------------------------
