@@ -4,8 +4,8 @@ Pre-admission checks run outside the row locks, in today's order
 (spec "Who may ask, and when"); the database transition re-proves the row
 facts under them (``orchestrator.database.stateless_workspace_upgrade``).
 ``resolve_upgrade_target`` decides which slice serves a request: C1 serves
-container targets; a VM target keeps a clear 409 until C2 replaces that branch
-with its lane-switch admission.
+container targets; a VM target goes through ``check_stateless_vm_upgrade`` and
+the lane switch (``stateless_vm_upgrade_handoff``, C2).
 """
 
 from __future__ import annotations
@@ -21,6 +21,7 @@ from orchestrator.services.container_startup_config import (
 )
 from orchestrator.services.stateless_workspace_gate import (
     declared_thread_workspace_backend,
+    stateless_session_workspace_check,
 )
 from shared.backend_kinds import LITE_BACKENDS
 from shared.run_queue import LANE_STATELESS
@@ -30,9 +31,12 @@ from shared.workspace_upgrade import (
     workspace_upgrade_seed_from,
 )
 
-STATELESS_VM_UPGRADE_UNAVAILABLE = (
-    "Upgrading a Session to a VM isn't available on this installation yet. "
-    "Start a new Session with a VM workspace instead."
+UPGRADE_TARGET_CHANGED = (
+    "The upgrade's target changed while it was being prepared. Try the upgrade again."
+)
+VM_UPGRADE_NOT_POSSIBLE = (
+    "This Session can't move to a VM workspace in place. "
+    "Start a new Session with a VM workspace."
 )
 STARTUP_TRACKING_REQUIRED = (
     "Upgrading this Session needs workspace startup tracking, which this "
@@ -57,6 +61,7 @@ class StatelessWorkspaceUpgradeDependencies:
     container_provisioner: Any
     enforce_workspace_upgrade_grants: Callable[..., Awaitable[Any]]
     schedule_stateless_workspace_ensure: Callable[[str], Any]
+    vm_provisioner: Any = None
 
 
 def container_provisioner_available(container_provisioner: Any) -> bool:
@@ -134,7 +139,8 @@ async def prepare_stateless_container_upgrade(
         template_name=template_name,
     )
     if mode != "container":
-        raise HTTPException(409, STATELESS_VM_UPGRADE_UNAVAILABLE)
+        # A template edited to another tier after the route resolved it.
+        raise HTTPException(409, UPGRADE_TARGET_CHANGED)
     return {
         "upgrade_config": dict(record.get("upgrade_config") or {}),
         "upgrade_sources": record.get("upgrade_sources"),
@@ -156,8 +162,9 @@ async def prepare_stateless_workspace_upgrade(
         store, thread, target_tier=target_tier, template_name=template_name
     )
     if target == "vm":
-        # C2 replaces this branch with its lane-switch admission.
-        raise HTTPException(409, STATELESS_VM_UPGRADE_UNAVAILABLE)
+        # The route sends a VM target to the lane switch (C2) before calling
+        # this; reaching here means the template changed tier in between.
+        raise HTTPException(409, UPGRADE_TARGET_CHANGED)
     return await prepare_stateless_container_upgrade(
         store,
         thread,
@@ -167,23 +174,85 @@ async def prepare_stateless_workspace_upgrade(
     )
 
 
+def is_root_session(thread: Mapping[str, Any]) -> bool:
+    """A Session nobody else owns (``kind = 'session'`` has no parent)."""
+    return str(thread.get("kind") or "") == "session"
+
+
+async def check_stateless_vm_upgrade(
+    store: Any,
+    thread: Mapping[str, Any],
+    *,
+    template_name: str | None,
+    vm_provisioner: Any,
+    enforce_workspace_upgrade_grants: Callable[..., Awaitable[Any]],
+) -> None:
+    """Spec §1 pre-checks 2–7 for a VM target on the stateless lane (C2).
+
+    Advisory, outside the row locks: the switch re-proves the row facts, and
+    the pinned agent's VM request runs every check again under the advisory
+    lock. VM provisioning off is a 409, never a 5xx (the cockpit retries 5xx).
+    """
+    from orchestrator.services.thread_config_update import (
+        VM_PROVISIONING_UNAVAILABLE,
+        _thread_project_id,
+        require_unprotected_workspace_upgrade,
+    )
+    from orchestrator.services.workspace_defaults_resolution import upgrade_record
+    from shared.workspace_defaults import MODE_RANK, UPGRADE_REFUSED, backend_mode
+
+    backend, refusal = stateless_session_workspace_check(dict(thread))
+    if (
+        thread.get("execution_lane") != LANE_STATELESS
+        or not is_root_session(thread)
+        or refusal is not None
+        or backend not in LITE_BACKENDS
+    ):
+        raise HTTPException(409, VM_UPGRADE_NOT_POSSIBLE)
+    require_unprotected_workspace_upgrade(dict(thread))
+    await enforce_workspace_upgrade_grants(thread, target_tier="vm")
+    if vm_provisioner is None or not getattr(vm_provisioner, "is_available", False):
+        raise HTTPException(409, VM_PROVISIONING_UNAVAILABLE)
+    if MODE_RANK[backend_mode("vm")] <= MODE_RANK[backend_mode(backend)]:
+        raise HTTPException(400, UPGRADE_REFUSED)
+    mode, _record = await upgrade_record(
+        store,
+        thread.get("user_id"),
+        role="session",
+        project_id=_thread_project_id(dict(thread)),
+        current_backend=backend,
+        requested_backend="vm",
+        template_name=template_name,
+    )
+    if mode != "vm":
+        raise HTTPException(409, UPGRADE_TARGET_CHANGED)
+
+
 def workspace_upgrade_targets(
-    thread: Mapping[str, Any], *, container_provisioner: Any
+    thread: Mapping[str, Any], *, container_provisioner: Any, vm_provisioner: Any = None
 ) -> list[str]:
     """What ``/connection`` may declare: targets structurally possible now.
 
     Grants stay a client-side hint and an admission check (the ``rewind``
-    precedent); C2 appends ``"vm"``.
+    precedent). ``container`` needs startup tracking and an in-cluster
+    provisioner (C1); ``vm`` needs the VM provisioner and a root Session (C2).
     """
     if thread.get("execution_lane") != LANE_STATELESS:
         return []
     if declared_thread_workspace_backend(thread) not in LITE_BACKENDS:
         return []
-    if not startup_stage_activation_enabled():
-        return []
-    if not container_provisioner_available(container_provisioner):
-        return []
-    return ["container"]
+    targets: list[str] = []
+    if startup_stage_activation_enabled() and container_provisioner_available(
+        container_provisioner
+    ):
+        targets.append("container")
+    if (
+        vm_provisioner is not None
+        and getattr(vm_provisioner, "is_available", False)
+        and is_root_session(thread)
+    ):
+        targets.append("vm")
+    return targets
 
 
 def workspace_upgrade_container_ready(metadata: Any) -> bool:

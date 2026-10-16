@@ -167,7 +167,9 @@ async def agent_thread_upgrade_availability(
 
     Read-only: runs the VM upgrade's pre-effect refusals (lane, protected
     Session, grants and the VM kill switch, the VM provisioner, an upgrade
-    already in progress, the tier rule) and provisions nothing. The pinned
+    already in progress, the tier rule) and provisions nothing. On the
+    stateless lane the ``vm`` entry runs the lane switch's own pre-checks
+    (``check_stateless_vm_upgrade``, C2) and ``container`` runs C1's. The
     agent asks before it offers an upgrade.
     """
     # The gate runs here, in the declaration's own body:

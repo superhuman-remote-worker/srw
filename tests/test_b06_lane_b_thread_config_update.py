@@ -950,25 +950,37 @@ class TestUpgradeAvailability:
         deps.vm_provisioner.create_thread_vm.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_stateless_lane_vm_is_unavailable_until_c2(self, monkeypatch):
-        # Tracking off: the container entry stops before grants too.
+    @pytest.mark.parametrize("vms_on", [False, True])
+    async def test_stateless_lane_vm_follows_c2s_checks(self, monkeypatch, vms_on):
         monkeypatch.delenv("CONTAINER_STARTUP_STAGE_AUTHORITY_ENABLED", raising=False)
+        monkeypatch.setattr(
+            "orchestrator.services.workspace_defaults_resolution.upgrade_record",
+            AsyncMock(
+                return_value=("vm", {"upgrade_config": {}, "upgrade_sources": None})
+            ),
+        )
         deps = _deps()
+        deps.vm_provisioner.is_available = vms_on
         deps.store.get_thread = AsyncMock(
-            return_value=_pinned_thread(execution_lane="stateless")
+            return_value=_pinned_thread(
+                execution_lane="stateless",
+                kind="session",
+                metadata={"config_override": {"workspace": {"backend": "virtual"}}},
+            )
         )
         result = await tcu.agent_thread_upgrade_availability(
             MagicMock(), THREAD, dependencies=deps
         )
-        assert result["vm"] == {
-            "available": False,
-            "reason": swu.STATELESS_VM_UPGRADE_UNAVAILABLE,
-        }
+        assert result["vm"] == (
+            {"available": True, "reason": None}
+            if vms_on
+            else {"available": False, "reason": tcu.VM_PROVISIONING_UNAVAILABLE}
+        )
         assert result["container"] == {
             "available": False,
             "reason": swu.STARTUP_TRACKING_REQUIRED,
         }
-        deps.enforce_workspace_upgrade_grants.assert_not_awaited()
+        deps.store.merge_thread_vm_context.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_protected_session_is_unavailable_with_its_refusal_text(self):

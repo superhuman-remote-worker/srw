@@ -1185,11 +1185,22 @@ async def _vm_upgrade_availability(
 
     if thread.get("execution_lane") == LANE_STATELESS:
         from orchestrator.services.stateless_workspace_upgrade import (
-            STATELESS_VM_UPGRADE_UNAVAILABLE,
+            check_stateless_vm_upgrade,
         )
 
-        # C2 replaces this with its own pre-checks.
-        return unavailable(STATELESS_VM_UPGRADE_UNAVAILABLE)
+        # C2: a stateless Session reaches a VM through the lane switch; the
+        # owner control's own pre-checks decide whether to offer it.
+        try:
+            await check_stateless_vm_upgrade(
+                dependencies.store,
+                thread,
+                template_name=None,
+                vm_provisioner=dependencies.vm_provisioner,
+                enforce_workspace_upgrade_grants=dependencies.enforce_workspace_upgrade_grants,
+            )
+        except HTTPException as exc:
+            return unavailable(_refusal_text(exc))
+        return {"available": True, "reason": None}
     try:
         _refuse_stateless_upgrade(thread)
         metadata = require_unprotected_workspace_upgrade(thread)

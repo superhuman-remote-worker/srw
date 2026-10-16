@@ -128,7 +128,10 @@ async def test_a_container_session_is_refused_by_the_tier_rule(tracking, record)
 
 
 @pytest.mark.asyncio
-async def test_a_record_that_resolves_to_a_vm_gets_the_vm_copy(tracking, monkeypatch):
+async def test_a_record_that_resolves_to_a_vm_is_a_changed_target(
+    tracking, monkeypatch
+):
+    """C2: a container template edited to a VM after the route resolved it."""
     monkeypatch.setattr(
         "orchestrator.services.workspace_defaults_resolution.upgrade_record",
         AsyncMock(return_value=("vm", RECORD)),
@@ -137,7 +140,7 @@ async def test_a_record_that_resolves_to_a_vm_gets_the_vm_copy(tracking, monkeyp
         await _prepare(_thread(), template="vm-full")
     assert (refused.value.status_code, refused.value.detail) == (
         409,
-        swu.STATELESS_VM_UPGRADE_UNAVAILABLE,
+        swu.UPGRADE_TARGET_CHANGED,
     )
 
 
@@ -194,7 +197,8 @@ async def test_prepare_refuses_the_pinned_lane_first(tracking, record):
 
 
 @pytest.mark.asyncio
-async def test_prepare_answers_a_vm_target_with_the_vm_copy(tracking, record):
+async def test_prepare_refuses_a_vm_target_it_is_not_given(tracking, record):
+    """C2: the route sends a VM target to the lane switch before this runs."""
     deps = swu.StatelessWorkspaceUpgradeDependencies(
         container_provisioner=_provisioner(),
         enforce_workspace_upgrade_grants=AsyncMock(),
@@ -204,7 +208,7 @@ async def test_prepare_answers_a_vm_target_with_the_vm_copy(tracking, record):
         await swu.prepare_stateless_workspace_upgrade(
             object(), _thread(), target_tier="vm", template_name=None, dependencies=deps
         )
-    assert refused.value.detail == swu.STATELESS_VM_UPGRADE_UNAVAILABLE
+    assert refused.value.detail == swu.UPGRADE_TARGET_CHANGED
     deps.enforce_workspace_upgrade_grants.assert_not_awaited()
 
 
