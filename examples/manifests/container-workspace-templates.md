@@ -335,8 +335,11 @@ above, unless it names a template.
   provisioning off the request gets 409 "VM workspaces aren't available on
   this installation." Nothing switches back if the VM never starts: the
   Session keeps working until its agent restarts; End it and start a new one.
-  Files in a cloud folder are not copied into the VM, and a file over the
-  virtual read limit is skipped with a warning. The old storage prefix stays.
+  The copy takes every file up to the 100 MB upload limit; a larger file
+  stays in the old storage prefix, and the upgrade's completion message names
+  it. If the dedicated agent is lost before the copy is recorded, the next one
+  copies again before the Session is ready, leaving out files under a cloud
+  folder (they stay in the cloud). The old storage prefix stays.
   Startup tracking is required for container upgrades, not for VM upgrades.
 - **If the container never becomes ready**, the Session shows "Workspace
   upgrade failed" with the startup reason. Nothing switches back: End it and
