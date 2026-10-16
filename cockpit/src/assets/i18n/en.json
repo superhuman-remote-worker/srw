@@ -2367,6 +2367,7 @@
       "failedStartup": "Workspace upgrade failed. {{reason}} End this session and start a new one; your files are kept.",
       "movingToVm": "Moving this session to a VM workspace (the session reconnects first)…",
       "provisioningTemplate": "Provisioning the {{template}} workspace…",
+      "skippedFiles": "These files were over the 100 MB copy limit and weren't copied; they're still in the old storage: {{files}}",
       "failed": {
         "upgradeCancelled": "The VM upgrade was cancelled when this session ended.",
         "upgradeRefused": "The VM upgrade couldn't start: SRW refused it when the session reconnected. The session keeps its current workspace; you can try /upgrade-workspace vm again.",

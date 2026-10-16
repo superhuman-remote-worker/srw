@@ -2367,6 +2367,7 @@
       "failedStartup": "Workspace-Upgrade fehlgeschlagen. {{reason}} Beende diese Sitzung und starte eine neue; deine Dateien bleiben erhalten.",
       "movingToVm": "Diese Sitzung wird auf einen VM-Workspace verschoben (die Sitzung verbindet sich zuerst neu)…",
       "provisioningTemplate": "Der Workspace {{template}} wird bereitgestellt…",
+      "skippedFiles": "Diese Dateien waren größer als das Kopierlimit von 100 MB und wurden nicht kopiert; sie liegen weiter im alten Speicher: {{files}}",
       "failed": {
         "upgradeCancelled": "Das VM-Upgrade wurde abgebrochen, als diese Sitzung beendet wurde.",
         "upgradeRefused": "Das VM-Upgrade konnte nicht starten: SRW hat es beim erneuten Verbinden der Sitzung abgelehnt. Die Sitzung behält ihren aktuellen Workspace; du kannst /upgrade-workspace vm erneut versuchen.",

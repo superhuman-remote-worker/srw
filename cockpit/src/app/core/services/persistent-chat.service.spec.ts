@@ -9866,6 +9866,9 @@ describe('PersistentChatService — inline workspace upgrade offer', () => {
     const ctx = await readySession();
     ctx.service.upgradeWorkspace('sandbox', { thenContinue: true });
     expect(ctx.service.continueAfterUpgrade()).toBe(true);
+    // That upgrade is over (a second one while it runs is refused locally
+    // and keeps its continuation; see the C2 lane-switch tests).
+    ctx.service.workspaceUpgradeInProgress.set(null);
     // The pane and /upgrade-workspace pass no opts — they must reset it,
     // or a stale flag would resume the agent behind the user's back.
     ctx.service.upgradeWorkspace('sandbox');
@@ -12524,7 +12527,6 @@ describe('PersistentChatService — control transport is declared, never inferre
     ['upgrade_refused', 'chat.workspaceUpgrade.failed.upgradeRefused'],
     ['upgrade_failed', 'chat.workspaceUpgrade.failed.upgradeFailed'],
     ['upgrade_interrupted', 'chat.workspaceUpgrade.failed.upgradeInterrupted'],
-    ['upgrade_already_running', 'chat.workspaceUpgrade.failed.upgradeAlreadyRunning'],
   ])('a typed .failed (%s) shows translated copy, never backend text', async (code, key) => {
     const ctx = await socketlessSession(upgradeableVm);
     const stamps = vi.spyOn(ctx.service as any, '_systemMessage');
@@ -12541,6 +12543,82 @@ describe('PersistentChatService — control transport is declared, never inferre
     expect(stamps.mock.calls.some(([line]) => String(line).includes('raw backend text'))).toBe(false);
     expect(ctx.service.workspaceUpgradeInProgress()).toBeNull();
     expect(ctx.service.continueAfterUpgrade()).toBe(false);
+  });
+
+  it('an already-running .failed says so but leaves the running upgrade its progress and continue', async () => {
+    const ctx = await socketlessSession(upgradeableVm);
+    const stamps = vi.spyOn(ctx.service as any, '_systemMessage');
+    ctx.service.workspaceUpgradeInProgress.set({ tier: 'vm' });
+    ctx.service.continueAfterUpgrade.set(true);
+
+    fireSseMessage(
+      ctx.sseInstances[0],
+      {
+        method: 'workspace_upgrade.failed',
+        params: { error_code: 'upgrade_already_running', reason: 'raw backend text' },
+      },
+      '1:20',
+    );
+
+    expect(stamps).toHaveBeenCalledWith('chat.workspaceUpgrade.failed.upgradeAlreadyRunning');
+    expect(stamps.mock.calls.some(([line]) => String(line).includes('raw backend text'))).toBe(false);
+    expect(ctx.service.workspaceUpgradeInProgress()).toEqual({ tier: 'vm' });
+    expect(ctx.service.continueAfterUpgrade()).toBe(true);
+  });
+
+  it('a second /upgrade-workspace vm after the lane switch keeps the running upgrade', async () => {
+    const ctx = await switchingSession();
+    ctx.mockHttp.post.mockImplementation((url: string) =>
+      url.endsWith('/controls')
+        ? of({ state: 'pending', request_id: 'r-1', transport_changed: true })
+        : of({ state: 'preparing' }),
+    );
+    ctx.routes.pin();
+    ctx.service.upgradeWorkspace('vm', { thenContinue: true });
+    await vi.waitFor(() => expect(ctx.wsInstances).toHaveLength(1));
+    expect(ctx.service.controlTransport('upgrade-to-workspace')).toBe('websocket');
+    const sendControl = vi.spyOn(ctx.service as any, '_sendControl');
+    const stamps = vi.spyOn(ctx.service as any, '_systemMessage');
+
+    await ctx.service.sendMessage('/upgrade-workspace vm');
+
+    expect(sendControl).not.toHaveBeenCalled();
+    expect(ctx.service.workspaceUpgradeInProgress()).toEqual({ tier: 'vm' });
+    expect(ctx.service.continueAfterUpgrade()).toBe(true);
+    expect(stamps).toHaveBeenCalledTimes(1);
+  });
+
+  it('a .complete that names skipped files says they stayed in the old storage', async () => {
+    const ctx = await socketlessSession(upgradeableVm);
+    const transloco = (ctx.service as any).transloco;
+    const translate = vi.spyOn(transloco, 'translate');
+    const stamps = vi.spyOn(ctx.service as any, '_systemMessage');
+
+    fireSseMessage(
+      ctx.sseInstances[0],
+      {
+        method: 'workspace_upgrade.complete',
+        params: { target_tier: 'vm', seeded_files: 2, skipped_files: ['big.iso', 'data/huge.bin'] },
+      },
+      '1:20',
+    );
+
+    expect(translate).toHaveBeenCalledWith('chat.workspaceUpgrade.skippedFiles', {
+      files: 'big.iso, data/huge.bin',
+    });
+    expect(stamps).toHaveBeenCalledWith('chat.workspaceUpgrade.skippedFiles');
+  });
+
+  it('a .complete without skipped files adds no line', async () => {
+    const ctx = await socketlessSession(upgradeableVm);
+    const stamps = vi.spyOn(ctx.service as any, '_systemMessage');
+    fireSseMessage(
+      ctx.sseInstances[0],
+      { method: 'workspace_upgrade.complete', params: { target_tier: 'vm', seeded_files: 2 } },
+      '1:20',
+    );
+    expect(stamps).toHaveBeenCalledTimes(1);
+    expect(stamps).not.toHaveBeenCalledWith('chat.workspaceUpgrade.skippedFiles');
   });
 
   it("an untyped .failed (the WebSocket path) keeps today's line", async () => {

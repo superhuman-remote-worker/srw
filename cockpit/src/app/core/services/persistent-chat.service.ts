@@ -7369,6 +7369,24 @@ export class PersistentChatService {
     tier: 'sandbox' | 'vm' | null,
     opts: {thenContinue?: boolean; template?: string} = {},
   ): void {
+    const inFlight = this.workspaceUpgradeInProgress();
+    if (inFlight) {
+      // One upgrade at a time, whatever the transport: a second control is
+      // refused (409, or the agent's "already running"), and on the socket
+      // arming it would cancel the running upgrade's progress and continue —
+      // after a stateless lane switch the running upgrade is a VM one.
+      // Repeat its line instead.
+      if (this.controlTransport('upgrade-to-workspace') === 'websocket') {
+        this._systemMessage(
+          inFlight.tier === 'vm'
+            ? 'Provisioning a VM workspace (requires approval), please wait...'
+            : 'Provisioning workspace, please wait...',
+        );
+      } else {
+        this._announceWorkspaceUpgradeProvisioning();
+      }
+      return;
+    }
     if (this.controlTransport('upgrade-to-workspace') === 'rest') {
       this._requestDurableWorkspaceUpgrade(tier, opts);
       return;
@@ -8502,6 +8520,15 @@ export class PersistentChatService {
           `Workspace ready — shell, git, and file tools are now available.` +
             `${sudoNote}${seededNote}`,
         );
+        const skipped = params['skipped_files'];
+        if (Array.isArray(skipped) && skipped.length > 0) {
+          // Over the upload ceiling: the copy left them in the old storage.
+          this._systemMessage(
+            this.transloco.translate('chat.workspaceUpgrade.skippedFiles', {
+              files: skipped.map(String).join(', '),
+            }),
+          );
+        }
         // Read-and-clear before the send (mirrors consume_freeze_request)
         // so a repeated .complete — the server short-circuits an
         // already-satisfied tier straight to this frame — can't send the
@@ -8522,15 +8549,17 @@ export class PersistentChatService {
 
       case 'workspace_upgrade.failed': {
         this._takeDurableControlAck(params, 'upgrade-to-workspace');
-        this.workspaceUpgradeInProgress.set(null);
+        const errorCode = typeof params['error_code'] === 'string' ? params['error_code'] : '';
+        if (errorCode !== 'upgrade_already_running') {
+          // "Already running" refuses only the second upgrade: the running
+          // one keeps its progress and its auto-continue.
+          this.workspaceUpgradeInProgress.set(null);
+          this.continueAfterUpgrade.set(false);
+        }
         // Don't fall back to re-offering: the reason is stale and the
         // pane still has the button.
         this.pendingWorkspaceOffer.set(null);
-        this.continueAfterUpgrade.set(false);
-        const failureKey =
-          WORKSPACE_UPGRADE_FAILURE_KEYS[
-            typeof params['error_code'] === 'string' ? params['error_code'] : ''
-          ];
+        const failureKey = WORKSPACE_UPGRADE_FAILURE_KEYS[errorCode];
         if (failureKey) {
           // C2's durable path: typed copy, and the load-time projection must
           // not announce the same failure again.
