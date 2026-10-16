@@ -236,14 +236,19 @@ async def test_profiled_retained_handoff_refuses_changed_original_image(db):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("length", [2, 3])
+@pytest.mark.parametrize("profile_enabled", [False, True])
 async def test_inherited_preflight_freezes_exact_previous_job_without_fake_last_vm(
-    db, length
+    db, length, monkeypatch, profile_enabled
 ):
+    monkeypatch.setenv(
+        "VM_NETWORK_PROFILE_ENABLED", "true" if profile_enabled else "false"
+    )
     jobs, request, fresh, history = await inherited(db, length=length)
     store = VMCreationPreflightStore(db)
     first = await store.begin(
         job_id=str(jobs[-1]), request=request, fresh_context=fresh
     )
+    assert "network_profile" not in first["request"]
     proof = first["predecessor_evidence"]
     assert proof["storage_owner_id"] == str(jobs[0])
     assert proof["previous_job_id"] == str(jobs[-2])
