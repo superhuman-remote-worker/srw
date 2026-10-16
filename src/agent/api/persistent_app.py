@@ -10291,15 +10291,33 @@ async def _apply_vm_workspace_upgrade_control(
     ) = await _orchestrator_client.request_vm_upgrade_for_control(
         thread_id, template=template, control_request_id=str(request.id)
     )
-    if status is None:
-        # No HTTP answer: leave the request pending; the watcher retries.
-        raise ControlInboxBlocked(
-            f"VM upgrade request did not reach the orchestrator: {request.id}"
-        )
-    if not accepted:
+    if accepted is False:
+        # A 4xx, or the typed 503: VM provisioning is off.
         return failed(UPGRADE_REFUSED, detail or "SRW refused the VM upgrade.")
     thread = await _session.postgres_conn.get_thread(thread_id)
-    provision_generation = vm_provision_generation((thread or {}).get("metadata"))
+    metadata = (thread or {}).get("metadata")
+    provision_generation = vm_provision_generation(metadata)
+    if accepted is None:
+        # No answer, or a 5xx that may have followed the provision CAS: the
+        # VM request took effect only if a provision generation exists and
+        # the marker the pre-CAS merge records names this request. Otherwise
+        # leave the request pending; the watcher retries it.
+        committed = vm_upgrade_seed(metadata)
+        if (
+            provision_generation is None
+            or committed is None
+            or committed["control_request_id"] != str(request.id)
+        ):
+            raise ControlInboxBlocked(
+                f"VM upgrade request has no answer yet ({status or 'no HTTP answer'}): "
+                f"{request.id}"
+            )
+        logger.warning(
+            "VM upgrade request %s answered %s after its provision committed; "
+            "serving it as accepted",
+            request.id,
+            status or "nothing",
+        )
     if provision_generation is None:
         raise ControlInboxBlocked(
             f"VM upgrade accepted without a provision generation: {request.id}"

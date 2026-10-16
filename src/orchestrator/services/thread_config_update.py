@@ -1057,10 +1057,10 @@ async def agent_upgrade_thread_to_vm(
     await dependencies.enforce_workspace_upgrade_grants(thread, target_tier="vm")
 
     if not vm_provisioner.is_available:
-        raise HTTPException(
-            status_code=503,
-            detail="VM provisioning not available (no NATS or K8s)",
-        )
+        from shared.workspace_upgrade import VM_PROVISIONING_NOT_AVAILABLE
+
+        # The pinned agent reads only this 503 as a refusal (C2).
+        raise HTTPException(status_code=503, detail=VM_PROVISIONING_NOT_AVAILABLE)
 
     # The capability read above is advisory.  Serialize with End/protected
     # lifecycle work, then re-read and install the provision generation under

@@ -781,8 +781,90 @@ async def test_a_refused_vm_request_is_a_typed_rejection(pinned):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "status,detail",
+    [
+        (503, "VM provisioning not available (no NATS or K8s)"),
+        (403, "vm_workspace grant denied"),
+    ],
+    ids=["typed-503", "403"],
+)
+async def test_the_typed_503_and_a_4xx_are_typed_rejections(pinned, status, detail):
+    pinned.client.request_vm_upgrade_for_control.return_value = (False, status, detail)
+    order = await _drain(_request())
+    assert order == [
+        (
+            "journal",
+            "workspace_upgrade.failed",
+            {
+                **ENVELOPE,
+                "target_tier": "vm",
+                "reason": detail,
+                "error_code": "upgrade_refused",
+            },
+        ),
+        ("finalize", "rejected", "upgrade_refused"),
+    ]
+
+
+@pytest.mark.asyncio
 async def test_a_vm_request_that_never_reached_the_orchestrator_stays_pending(pinned):
-    pinned.client.request_vm_upgrade_for_control.return_value = (False, None, None)
+    pinned.client.request_vm_upgrade_for_control.return_value = (None, None, None)
+    with pytest.raises(pa.ControlInboxBlocked):
+        await _drain(_request())
+
+
+def _committed_metadata(*, request_id=REQUEST_ID, provision=PROVISION):
+    """``metadata.vm`` once the request's pre-CAS merge (and maybe the CAS) ran."""
+    vm = {
+        "upgrade_seed": {
+            "control_request_id": str(request_id),
+            "state": "pending",
+            "source": SOURCE,
+        }
+    }
+    if provision is not None:
+        vm.update(status="provisioning", provision_generation=provision)
+    return {"vm": vm}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", [500, 502, 504, None], ids=str)
+async def test_a_5xx_after_the_provision_cas_is_accepted_and_starts_the_swap(
+    pinned, status
+):
+    """Final review Important 1: the CAS committed before the error, so the VM
+    boots for this request; the marker naming it is the proof."""
+    pinned.client.request_vm_upgrade_for_control.return_value = (None, status, None)
+    pinned.pool.get_thread.return_value = {"metadata": _committed_metadata()}
+    order = await _drain(_request())
+    assert order == [
+        (
+            "journal",
+            "workspace_upgrade.started",
+            {**ENVELOPE, "target_tier": "vm", "provision_generation": PROVISION},
+        ),
+        ("finalize", "applied", None),
+        ("start", PROVISION),
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "metadata",
+    [
+        {},
+        {"vm": {"status": "provisioning", "provision_generation": PROVISION}},
+        _committed_metadata(provision=None),
+        _committed_metadata(request_id=UUID(int=9)),
+    ],
+    ids=["nothing-recorded", "no-marker", "marker-before-the-cas", "another-request"],
+)
+async def test_a_5xx_before_the_provision_cas_leaves_the_request_pending(
+    pinned, metadata
+):
+    pinned.client.request_vm_upgrade_for_control.return_value = (None, 502, None)
+    pinned.pool.get_thread.return_value = {"metadata": metadata}
     with pytest.raises(pa.ControlInboxBlocked):
         await _drain(_request())
 
@@ -1302,11 +1384,44 @@ async def test_an_old_replica_is_told_apart_from_a_refusal(status, body, raised,
             ),
             (False, 503, "VM provisioning not available (no NATS or K8s)"),
         ),
-        (httpx.Response(500, text="boom"), (False, 500, None)),
-        (httpx.Response(502, json=["not", "an", "object"]), (False, 502, None)),
+        (
+            httpx.Response(403, json={"detail": "vm_workspace grant denied"}),
+            (False, 403, "vm_workspace grant denied"),
+        ),
     ],
+    ids=["typed-409", "typed-503-provisioning-off", "403"],
 )
-async def test_every_http_refusal_is_a_refusal_with_its_text(response, expected):
+async def test_a_4xx_or_the_typed_503_is_a_refusal_with_its_text(response, expected):
+    client = OrchestratorClient("http://test", "127.0.0.1", 8000, "worker", "default")
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda _r: response)
+    ) as http:
+        client._client = http
+        assert (
+            await client.request_vm_upgrade_for_control(
+                str(THREAD_ID), template=None, control_request_id=str(REQUEST_ID)
+            )
+            == expected
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "response,expected",
+    [
+        (httpx.Response(500, text="boom"), (None, 500, None)),
+        (httpx.Response(502, json=["not", "an", "object"]), (None, 502, None)),
+        (httpx.Response(504, text="gateway timeout"), (None, 504, None)),
+        (
+            httpx.Response(503, json={"detail": "Service Unavailable"}),
+            (None, 503, "Service Unavailable"),
+        ),
+    ],
+    ids=["500", "502", "504", "untyped-503"],
+)
+async def test_a_5xx_is_an_unknown_outcome_not_a_refusal(response, expected):
+    """Final review Important 1: a 5xx can arrive after the provision CAS
+    committed, so it is neither an acceptance nor a refusal."""
     client = OrchestratorClient("http://test", "127.0.0.1", 8000, "worker", "default")
     async with httpx.AsyncClient(
         transport=httpx.MockTransport(lambda _r: response)
@@ -1330,4 +1445,4 @@ async def test_a_transport_failure_is_no_answer():
         client._client = http
         assert await client.request_vm_upgrade_for_control(
             str(THREAD_ID), template=None, control_request_id=str(REQUEST_ID)
-        ) == (False, None, None)
+        ) == (None, None, None)

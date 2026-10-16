@@ -27,6 +27,7 @@ from shared.workspace_recovery import (
     WorkspaceRecoveryCode,
     WorkspaceRecoveryDisposition,
 )
+from shared.workspace_upgrade import VM_PROVISIONING_NOT_AVAILABLE
 from shared.subagent_parent_authority import (
     ParentExecutionAuthority,
     ParentExecutionAuthorityRefused,
@@ -1843,13 +1844,16 @@ class OrchestratorClient:
 
     async def request_vm_upgrade_for_control(
         self, thread_id: str, *, template: str | None, control_request_id: str
-    ) -> tuple[bool, int | None, str | None]:
+    ) -> tuple[bool | None, int | None, str | None]:
         """Ask for the VM a stateless lane switch's request names (C2).
 
-        ``(accepted, status, detail)``. ``status`` is None when no HTTP answer
-        arrived (the caller leaves the request pending and retries); any HTTP
-        answer other than 200 is a refusal whose ``detail`` is the
-        orchestrator's text, or the message/code of a typed refusal.
+        ``(accepted, status, detail)``. ``accepted`` is True on a 200 and
+        False on a refusal: a 4xx, or the typed 503 that says VM provisioning
+        is off (``VM_PROVISIONING_NOT_AVAILABLE``); ``detail`` is then the
+        orchestrator's text, or the message/code of a typed refusal. It is
+        None when the outcome is unknown: no HTTP answer (``status`` None) or
+        any other 5xx, which can arrive after the provision CAS committed. The
+        caller then reads the thread to tell the two apart.
         """
         if not self._client:
             await self.connect()
@@ -1871,7 +1875,7 @@ class OrchestratorClient:
                 control_request_id,
                 exc,
             )
-            return False, None, None
+            return None, None, None
         if response.status_code == 200:
             return True, 200, None
         try:
@@ -1880,13 +1884,22 @@ class OrchestratorClient:
             detail = None
         if isinstance(detail, dict):
             detail = detail.get("message") or detail.get("code")
+        text = str(detail) if detail else None
+        if response.status_code >= 500 and text != VM_PROVISIONING_NOT_AVAILABLE:
+            logger.warning(
+                "VM upgrade request for control %s has no definite answer: %s %s",
+                control_request_id,
+                response.status_code,
+                text,
+            )
+            return None, response.status_code, text
         logger.warning(
             "VM upgrade request for control %s refused: %s %s",
             control_request_id,
             response.status_code,
-            detail,
+            text,
         )
-        return False, response.status_code, str(detail) if detail else None
+        return False, response.status_code, text
 
     async def get_workspace_upgrade_seed_source(self, thread_id: str) -> dict:
         """The old lite workspace a pending VM upgrade still owes (C2)."""

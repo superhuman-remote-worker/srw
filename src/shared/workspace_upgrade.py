@@ -56,6 +56,10 @@ VM_UPGRADE_SEED_INTERRUPTED = "interrupted"
 _VM_UPGRADE_SEED_STATES = frozenset(
     {VM_UPGRADE_SEED_PENDING, VM_UPGRADE_SEED_SEEDED, VM_UPGRADE_SEED_INTERRUPTED}
 )
+#: The VM request's one typed 5xx (``agent_upgrade_thread_to_vm``): VM
+#: provisioning is off, so nothing was recorded. Any other 5xx can follow a
+#: committed provision CAS, so the pinned agent reads it as "no answer" (C2).
+VM_PROVISIONING_NOT_AVAILABLE = "VM provisioning not available (no NATS or K8s)"
 #: C2: typed ``workspace_upgrade.failed`` codes (receipts and live frames).
 UPGRADE_CANCELLED = "upgrade_cancelled"
 UPGRADE_REFUSED = "upgrade_refused"
@@ -126,6 +130,7 @@ __all__ = [
     "UPGRADE_FAILED",
     "UPGRADE_INTERRUPTED",
     "UPGRADE_REFUSED",
+    "VM_PROVISIONING_NOT_AVAILABLE",
     "VM_UPGRADE_SEED_INTERRUPTED",
     "VM_UPGRADE_SEED_KEY",
     "VM_UPGRADE_SEED_PENDING",
