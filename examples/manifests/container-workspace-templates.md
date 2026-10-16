@@ -518,8 +518,9 @@ pulled when it first starts (see below). Startup-stage tracking is Helm
   becomes ready for another reason, the Job stays **Created** with no error
   until you cancel it or its execution deadline passes. Examples:
   - an image without the workspace contract whose container keeps running but
-    never opens sshd;
-  - a container that exits, when startup-stage tracking is on, or the Job was
+    never opens sshd (with startup-stage tracking on, a Job shows specific
+    attention instead; see the paragraph below);
+  - a container that exits, when startup-stage tracking is off, or the Job was
     restored or recreated over a kept volume;
   - resources no node can fit, when no `LimitRange` rejects them.
 
@@ -535,14 +536,19 @@ pulled when it first starts (see below). Startup-stage tracking is Helm
   - within seconds of the container exiting on its own: "Workspace needs
     attention: its container exited with code `<code>` before it was ready. A
     workspace image must keep running SRW's SSH server: build it FROM an SRW
-    base image and don't override its ENTRYPOINT or USER.";
+    base image and don't override its ENTRYPOINT or USER." A container that
+    keeps running but never opens SRW's SSH server gets the same message after
+    a few minutes, once the liveness check stops it (about two minutes, then
+    code 137 or 143; this is not an out-of-memory kill, which is reported as
+    `OOMKilled`). Only Jobs get this message: a Session whose image exits
+    reaches the next message after its budget;
   - once a scheduled pod's readiness budget has passed: "Workspace needs
     attention: it didn't become ready in time. If it uses your own image, check
     that the image keeps running SRW's SSH server: build it FROM an SRW base
     image and don't override its ENTRYPOINT or USER. The cluster may also have
     stopped it, for example when it ran out of memory: try a template with more
-    memory." This also covers a container the cluster stopped (`OOMKilled` or
-    an evicted Pod).
+    memory." This also covers a container the cluster stopped (for example
+    `OOMKilled`, an evicted Pod or `ContainerStatusUnknown`).
 
   Check the pod's status and events with `kubectl describe pod
   workspace-<first 12 characters of the Job ID>` in the workspace namespace.

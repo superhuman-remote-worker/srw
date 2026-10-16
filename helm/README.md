@@ -1154,7 +1154,7 @@ immutable budgets; authenticated Ready settles the receipt. An expired budget
 leaves an attention state with normal Cancel/End controls. A Job whose workspace
 container exits on its own before its first Ready gets that attention at once,
 with the exit code (`container_exited`); a container the cluster stopped
-(`OOMKilled`, an evicted Pod) still waits for the budget. A Job's execution
+(for example `OOMKilled`, an evicted Pod or `ContainerStatusUnknown`) still waits for the budget. A Job's execution
 deadline remains independent and can cancel it while it waits for capacity.
 
 Deploy the capable application and migrations `0309`/`0310` with this value off
