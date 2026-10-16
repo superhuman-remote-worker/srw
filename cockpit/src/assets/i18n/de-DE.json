@@ -674,8 +674,9 @@
     "invalidImage": "Arbeitsbereich benötigt Aufmerksamkeit: Das Image ist ungültig.",
     "invalidConfiguration": "Arbeitsbereich benötigt Aufmerksamkeit: Die Konfiguration ist ungültig.",
     "pullDeadline": "Arbeitsbereich benötigt Aufmerksamkeit: Das Image wurde nicht rechtzeitig fertig geladen. Prüfen Sie die Image-Referenz und ob der Cluster aus der zugehörigen Registry laden kann.",
-    "readinessDeadline": "Arbeitsbereich benötigt Aufmerksamkeit: Er wurde nicht rechtzeitig bereit. Wenn er Ihr eigenes Image verwendet, prüfen Sie, ob das Image weiterläuft: Bauen Sie es auf einem SRW-Basis-Image auf (FROM) und überschreiben Sie weder ENTRYPOINT noch USER.",
+    "readinessDeadline": "Arbeitsbereich benötigt Aufmerksamkeit: Er wurde nicht rechtzeitig bereit. Wenn er Ihr eigenes Image verwendet, prüfen Sie, ob das Image den SSH-Server von SRW weiter ausführt: Bauen Sie es auf einem SRW-Basis-Image auf (FROM) und überschreiben Sie weder ENTRYPOINT noch USER. Möglicherweise hat ihn auch der Cluster gestoppt, etwa weil ihm der Arbeitsspeicher ausging: Versuchen Sie eine Vorlage mit mehr Arbeitsspeicher.",
     "sshDeadline": "Arbeitsbereich benötigt Aufmerksamkeit: Die Frist für die SSH-Authentifizierung ist abgelaufen.",
+    "containerExited": "Arbeitsbereich benötigt Aufmerksamkeit: Sein Container wurde mit Code {{exitCode}} beendet, bevor er bereit war. Ein Arbeitsbereich-Image muss den SSH-Server von SRW weiter ausführen: Bauen Sie es auf einem SRW-Basis-Image auf (FROM) und überschreiben Sie weder ENTRYPOINT noch USER.",
     "legacyHeld": "Eine ältere Arbeitsbereichserstellung wird geprüft; ein Abschlussnachweis fehlt."
   },
   "jobs": {

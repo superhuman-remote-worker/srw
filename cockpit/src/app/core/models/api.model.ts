@@ -2493,9 +2493,11 @@ export interface WorkspaceCreationView {
     | 'observation_pending' | 'scheduler_unschedulable' | 'scheduling_other'
     | 'scheduled' | 'invalid_image' | 'invalid_configuration'
     | 'pull_deadline' | 'readiness_deadline' | 'ssh_deadline'
-    | 'legacy_receipt_held' | 'insufficient_capacity';
+    | 'legacy_receipt_held' | 'insufficient_capacity' | 'container_exited';
   /** Frozen boot/pull hard boundary. SSH authentication has a separate grace. */
   readiness_deadline_at: string | null;
+  /** The workspace container's exit code; set only for readiness/attention/container_exited. */
+  exit_code: number | null;
 }
 
 /** VM compute state beside the human wait or Job/session status. */

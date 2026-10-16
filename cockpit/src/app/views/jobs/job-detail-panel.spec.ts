@@ -192,6 +192,13 @@ describe('typed workspace creation detail', () => {
     return {fixture, data};
   }
 
+  it('names the exit code of an exited Job container', () => {
+    const {fixture} = renderPanel({workspace_creation: {stage: 'readiness', state: 'attention',
+      reason_code: 'container_exited', readiness_deadline_at: null, exit_code: 3}});
+    expect((fixture.nativeElement as HTMLElement).textContent)
+      .toContain('Workspace needs attention: its container exited with code 3 before it was ready.');
+  });
+
   function loadedDetail(workspace_creation?: Job['workspace_creation']): JobDetailState {
     return {
       loading: false, error: false,

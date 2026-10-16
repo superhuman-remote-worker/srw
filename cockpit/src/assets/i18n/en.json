@@ -674,8 +674,9 @@
     "invalidImage": "Workspace needs attention: its image is invalid.",
     "invalidConfiguration": "Workspace needs attention: its configuration is invalid.",
     "pullDeadline": "Workspace needs attention: its image didn't finish pulling in time. Check the image reference and that the cluster can pull from its registry.",
-    "readinessDeadline": "Workspace needs attention: it didn't become ready in time. If it uses your own image, check that the image keeps running: build it FROM an SRW base image and don't override its ENTRYPOINT or USER.",
+    "readinessDeadline": "Workspace needs attention: it didn't become ready in time. If it uses your own image, check that the image keeps running SRW's SSH server: build it FROM an SRW base image and don't override its ENTRYPOINT or USER. The cluster may also have stopped it, for example when it ran out of memory: try a template with more memory.",
     "sshDeadline": "Workspace needs attention: SSH authentication grace expired.",
+    "containerExited": "Workspace needs attention: its container exited with code {{exitCode}} before it was ready. A workspace image must keep running SRW's SSH server: build it FROM an SRW base image and don't override its ENTRYPOINT or USER.",
     "legacyHeld": "Checking an older workspace creation; completion evidence is unavailable."
   },
   "jobs": {

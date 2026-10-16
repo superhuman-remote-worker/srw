@@ -22,9 +22,10 @@ import en from '../../../assets/i18n/en.json';
 
 @Pipe({name: 'transloco', standalone: true})
 class WorkspaceCreationTranslocoPipe implements PipeTransform {
-  transform(key: string): string {
+  transform(key: string, params: Record<string, unknown> = {}): string {
     if (key.startsWith('workspaceCreation.')) {
-      return (en.workspaceCreation as Record<string, string>)[key.split('.')[1]] ?? key;
+      const copy = (en.workspaceCreation as Record<string, string>)[key.split('.')[1]] ?? key;
+      return copy.replace(/{{\s*(\w+)\s*}}/g, (_match, name: string) => String(params[name] ?? ''));
     }
     return key;
   }
@@ -111,7 +112,7 @@ describe('typed workspace creation on job rows', () => {
     const {fixture, component} = mountLogic({rendered: true, api: {
       getJobsPage: vi.fn().mockReturnValue(of(page([job('startup', {
         status: 'created', workspace_creation: {stage: 'scheduling', state: 'waiting_capacity',
-          reason_code: 'scheduler_unschedulable', readiness_deadline_at: null},
+          reason_code: 'scheduler_unschedulable', readiness_deadline_at: null, exit_code: null},
       })]))),
     }});
     fixture.detectChanges();
@@ -131,7 +132,7 @@ describe('typed workspace creation on job rows', () => {
       getJobsPage: vi.fn().mockReturnValue(of(page([job('failed-startup', {
         status: 'failed', error_message: '0/3 nodes had a private taint',
         workspace_creation: {stage: 'readiness', state: 'attention',
-          reason_code: 'invalid_configuration', readiness_deadline_at: null},
+          reason_code: 'invalid_configuration', readiness_deadline_at: null, exit_code: null},
       })]))),
     }});
     fixture.detectChanges();
@@ -140,6 +141,34 @@ describe('typed workspace creation on job rows', () => {
     const text = (fixture.nativeElement as HTMLElement).textContent ?? '';
     expect(text).toContain('Workspace needs attention');
     expect(text).not.toContain('0/3 nodes');
+  });
+  it('names the exit code when a Job container exited before it was ready', async () => {
+    const {fixture} = mountLogic({rendered: true, api: {
+      getJobsPage: vi.fn().mockReturnValue(of(page([job('exited', {
+        status: 'created', workspace_creation: {stage: 'readiness', state: 'attention',
+          reason_code: 'container_exited', readiness_deadline_at: null, exit_code: 3},
+      })]))),
+    }});
+    fixture.detectChanges();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    fixture.detectChanges();
+    const text = (fixture.nativeElement as HTMLElement).textContent ?? '';
+    expect(text).toContain('its container exited with code 3 before it was ready');
+    expect(text).not.toContain('{{exitCode}}');
+  });
+
+  it('shows the reworded readiness deadline copy on a Job', async () => {
+    const {fixture} = mountLogic({rendered: true, api: {
+      getJobsPage: vi.fn().mockReturnValue(of(page([job('deadline', {
+        status: 'created', workspace_creation: {stage: 'readiness', state: 'attention',
+          reason_code: 'readiness_deadline', readiness_deadline_at: null, exit_code: null},
+      })]))),
+    }});
+    fixture.detectChanges();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    fixture.detectChanges();
+    expect((fixture.nativeElement as HTMLElement).textContent)
+      .toContain('The cluster may also have stopped it, for example when it ran out of memory: try a template with more memory.');
   });
 });
 

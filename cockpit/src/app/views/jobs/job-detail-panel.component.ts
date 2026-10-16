@@ -28,7 +28,7 @@ import {AppSpinnerComponent} from '../../ui/spinner';
 import {isTerminalJobStatus, jobStatusTone} from '../../core/util/job-status';
 import {workspaceLifecycleReasonKey} from '../../core/util/vm-lifecycle';
 import {subagentStatusTone} from '../../core/util/subagent-status';
-import {workspaceCreationMessageKey} from '../../core/util/workspace-creation';
+import {workspaceCreationMessageKey, workspaceCreationMessageParams} from '../../core/util/workspace-creation';
 import {LiveSession} from '../../core/models/live-session.model';
 import {JobLiveSessionPanelComponent} from './job-live-session-panel.component';
 
@@ -368,7 +368,7 @@ export function failureReason(
       }
       @if (workspaceCreation(); as creation) {
         <section class="recovery-detail" [class.attention]="creation.state === 'attention'" role="status">
-          <strong>{{ workspaceCreationMessageKey(creation) | transloco }}</strong>
+          <strong>{{ workspaceCreationMessageKey(creation) | transloco: workspaceCreationMessageParams(creation) }}</strong>
         </section>
       }
       @if (!workspaceCreation() && failureReason(job()); as failed) {
@@ -941,6 +941,7 @@ export function failureReason(
 export class JobDetailPanelComponent {
   readonly lifecycleReasonKey = workspaceLifecycleReasonKey;
   readonly workspaceCreationMessageKey = workspaceCreationMessageKey;
+  readonly workspaceCreationMessageParams = workspaceCreationMessageParams;
   readonly job = input.required<JobSummary>();
   /** Null until the lazy load for this job has been kicked off. */
   readonly data = input<JobDetailState | null>(null);

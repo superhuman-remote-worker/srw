@@ -15,7 +15,7 @@ import {ErrorMessageService} from '../../core/services/error-message.service';
 import {UserService} from '../../core/services/user.service';
 import {Thread} from '../../core/models/api.model';
 import {VMCreationWaitComponent} from '../../core/components/vm-creation-wait.component';
-import {workspaceCreationMessageKey} from '../../core/util/workspace-creation';
+import {workspaceCreationMessageKey, workspaceCreationMessageParams} from '../../core/util/workspace-creation';
 import {SidebarToggleComponent} from '../../shell/sidebar-toggle/sidebar-toggle.component';
 import {TranslocoPipe, TranslocoService} from '@jsverse/transloco';
 import {AppButtonComponent} from '../../ui/button';
@@ -215,7 +215,7 @@ const ENDING_POLL_MAX_MS = 15_000;
               }
               @if (thread.workspace_creation; as creation) {
                 <div class="session-workspace-creation" [class.attention]="creation.state === 'attention'" role="status">
-                  {{ workspaceCreationMessageKey(creation) | transloco }}
+                  {{ workspaceCreationMessageKey(creation) | transloco: workspaceCreationMessageParams(creation) }}
                 </div>
               }
               <div class="session-actions">
@@ -585,6 +585,7 @@ const ENDING_POLL_MAX_MS = 15_000;
 })
 export class SessionsPageComponent implements OnInit {
     readonly workspaceCreationMessageKey = workspaceCreationMessageKey;
+    readonly workspaceCreationMessageParams = workspaceCreationMessageParams;
     private readonly http = inject(HttpClient);
     private readonly router = inject(Router);
     private readonly toast = inject(AppToastService);

@@ -1014,9 +1014,10 @@ describe('SessionsPageComponent', () => {
 /** Keys straight through: the card is asserted on its bindings, not its copy. */
 @Pipe({name: 'transloco', standalone: true})
 class TranslocoStubPipe implements PipeTransform {
-    transform(key: string): string {
+    transform(key: string, params: Record<string, unknown> = {}): string {
         if (key.startsWith('workspaceCreation.')) {
-            return (en.workspaceCreation as Record<string, string>)[key.split('.')[1]] ?? key;
+            const copy = (en.workspaceCreation as Record<string, string>)[key.split('.')[1]] ?? key;
+            return copy.replace(/{{\s*(\w+)\s*}}/g, (_match, name: string) => String(params[name] ?? ''));
         }
         return key;
     }
@@ -1084,7 +1085,7 @@ describe('SessionsPageComponent (rendered): a fenced permanent delete', () => {
         serveThreadLists(mocks.mockHttp, [makeThread({
             id: 't-startup', status: 'created',
             workspace_creation: {stage: 'scheduling', state: 'waiting_capacity',
-                reason_code: 'scheduler_unschedulable', readiness_deadline_at: null},
+                reason_code: 'scheduler_unschedulable', readiness_deadline_at: null, exit_code: null},
         })]);
         const fixture = TestBed.createComponent(SessionsPageComponent);
         fixture.detectChanges();
@@ -1093,6 +1094,19 @@ describe('SessionsPageComponent (rendered): a fenced permanent delete', () => {
         expect(sessionCard.textContent).toContain('Waiting for scheduling');
         expect(sessionCard.querySelectorAll('app-icon-button').length).toBeGreaterThanOrEqual(2);
         expect(deleteButton(fixture.nativeElement as HTMLElement, 't-startup').disabled).not.toBe(true);
+    });
+
+    it('shows the reworded readiness deadline copy on a Session', async () => {
+        serveThreadLists(mocks.mockHttp, [makeThread({
+            id: 't-deadline', status: 'created',
+            workspace_creation: {stage: 'readiness', state: 'attention',
+                reason_code: 'readiness_deadline', readiness_deadline_at: null, exit_code: null},
+        })]);
+        const fixture = TestBed.createComponent(SessionsPageComponent);
+        fixture.detectChanges();
+        await settle(fixture);
+        expect(card(fixture.nativeElement as HTMLElement, 't-deadline').textContent)
+            .toContain('The cluster may also have stopped it, for example when it ran out of memory: try a template with more memory.');
     });
 
     it('keeps Delete enabled as a retry on the ending card, re-sends it on click, and drops the retry on a 200', async () => {

@@ -128,10 +128,18 @@ describe('ChatEmptyStateComponent variants', () => {
   it('does not claim the agent is listening while typed creation needs attention', async () => {
     const root = await render({variant: 'ready', suggestions: [], workspaceCreation: {
       stage: 'readiness', state: 'attention', reason_code: 'invalid_image',
-      readiness_deadline_at: null,
+      readiness_deadline_at: null, exit_code: null,
     }});
     expect(text(root)).toContain('Workspace needs attention');
     expect(text(root)).not.toContain('agent is connected and listening');
+  });
+
+  it('passes the exit code to the typed creation subtitle', async () => {
+    const root = await render({variant: 'ready', suggestions: [], workspaceCreation: {
+      stage: 'readiness', state: 'attention', reason_code: 'container_exited',
+      readiness_deadline_at: null, exit_code: 3,
+    }});
+    expect(text(root)).toContain('its container exited with code 3 before it was ready');
   });
 
   it('renders both the connectors control and the advanced link for "draft"', async () => {
