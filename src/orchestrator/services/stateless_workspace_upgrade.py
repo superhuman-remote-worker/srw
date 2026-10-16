@@ -68,6 +68,10 @@ class StatelessWorkspaceUpgradeDependencies:
     enforce_workspace_upgrade_grants: Callable[..., Awaitable[Any]]
     schedule_stateless_workspace_ensure: Callable[[str], Any]
     vm_provisioner: Any = None
+    #: The pinned prepare's pre-flights (``routers/sessions.py`` ``_do_prepare``),
+    #: which a VM lane switch runs at admission (C2).
+    session_grant_violations: Callable[..., Awaitable[list[str]]] | None = None
+    session_endpoint_violations: Callable[..., Awaitable[list[str]]] | None = None
 
 
 def container_provisioner_available(container_provisioner: Any) -> bool:
@@ -192,12 +196,21 @@ async def check_stateless_vm_upgrade(
     template_name: str | None,
     vm_provisioner: Any,
     enforce_workspace_upgrade_grants: Callable[..., Awaitable[Any]],
+    session_grant_violations: Callable[..., Awaitable[list[str]]] | None = None,
+    session_endpoint_violations: Callable[..., Awaitable[list[str]]] | None = None,
 ) -> None:
     """Spec §1 pre-checks 2–7 for a VM target on the stateless lane (C2).
 
     Advisory, outside the row locks: the switch re-proves the row facts, and
     the pinned agent's VM request runs every check again under the advisory
     lock. VM provisioning off is a 409, never a 5xx (the cockpit retries 5xx).
+
+    The switched Session is served by a pinned agent its ``/prepare``
+    provisions, which first refuses a config over the owner's capability
+    grants or with an unusable model transport. When given, those two
+    pre-flights run last (they resolve the whole config) and refuse with the
+    prepare's own wording, so a Session the pinned path would refuse is
+    never switched.
     """
     from orchestrator.services.thread_config_update import (
         VM_PROVISIONING_UNAVAILABLE,
@@ -232,6 +245,20 @@ async def check_stateless_vm_upgrade(
     )
     if mode != "vm":
         raise HTTPException(409, UPGRADE_TARGET_CHANGED)
+    if session_grant_violations is not None:
+        from orchestrator.services.grant_enforcement import grant_violations_detail
+
+        violations = await session_grant_violations(dict(thread))
+        if violations:
+            raise HTTPException(409, grant_violations_detail(violations))
+    if session_endpoint_violations is not None:
+        from orchestrator.services.session_config_resolution import (
+            endpoint_violations_detail,
+        )
+
+        violations = await session_endpoint_violations(dict(thread))
+        if violations:
+            raise HTTPException(409, endpoint_violations_detail(violations))
 
 
 def workspace_upgrade_targets(

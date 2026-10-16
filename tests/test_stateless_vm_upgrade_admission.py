@@ -9,6 +9,10 @@ import pytest
 from fastapi import HTTPException
 
 from orchestrator.services import stateless_workspace_upgrade as swu
+from orchestrator.services.grant_enforcement import grant_violations_detail
+from orchestrator.services.session_config_resolution import (
+    endpoint_violations_detail,
+)
 from orchestrator.services.thread_config_update import VM_PROVISIONING_UNAVAILABLE
 from orchestrator.services.workspace_defaults_resolution import (
     RETAINED_UPGRADE_UNAVAILABLE,
@@ -46,13 +50,14 @@ def record(monkeypatch):
     return upgrade_record
 
 
-async def _check(thread, *, grants=None, vm="default", template=None):
+async def _check(thread, *, grants=None, vm="default", template=None, **prepare):
     return await swu.check_stateless_vm_upgrade(
         object(),
         thread,
         template_name=template,
         vm_provisioner=_vm() if vm == "default" else vm,
         enforce_workspace_upgrade_grants=grants or AsyncMock(),
+        **prepare,
     )
 
 
@@ -153,6 +158,69 @@ async def test_a_kept_template_is_refused_by_the_record(record):
     with pytest.raises(HTTPException) as refused:
         await _check(_thread(), template="vm-kept")
     assert refused.value.detail == RETAINED_UPGRADE_UNAVAILABLE
+
+
+@pytest.mark.asyncio
+async def test_the_pinned_prepare_checks_run_last(record):
+    """S1 mitigation (final review g): the switched Session's first pinned
+    prepare refuses grant and transport violations; run them at admission so
+    such a Session is never switched."""
+    order = []
+    thread = _thread()
+    grants = AsyncMock(side_effect=lambda *_a, **_k: order.append("grants"))
+    record.side_effect = lambda *_a, **_k: order.append("record") or ("vm", RECORD)
+    grant_violations = AsyncMock(
+        side_effect=lambda *_a, **_k: order.append("grant_violations") or []
+    )
+    endpoint_violations = AsyncMock(
+        side_effect=lambda *_a, **_k: order.append("endpoint_violations") or []
+    )
+
+    assert (
+        await _check(
+            thread,
+            grants=grants,
+            session_grant_violations=grant_violations,
+            session_endpoint_violations=endpoint_violations,
+        )
+        is None
+    )
+
+    assert order == ["grants", "record", "grant_violations", "endpoint_violations"]
+    assert grant_violations.await_args.args == (thread,)
+    assert endpoint_violations.await_args.args == (thread,)
+
+
+@pytest.mark.asyncio
+async def test_a_grant_violation_the_pinned_prepare_refuses_is_a_409(record):
+    endpoint_violations = AsyncMock(return_value=[])
+    with pytest.raises(HTTPException) as refused:
+        await _check(
+            _thread(),
+            session_grant_violations=AsyncMock(
+                return_value=["permission_mode autonomous", "shell"]
+            ),
+            session_endpoint_violations=endpoint_violations,
+        )
+    assert (refused.value.status_code, refused.value.detail) == (
+        409,
+        grant_violations_detail(["permission_mode autonomous", "shell"]),
+    )
+    endpoint_violations.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_an_unusable_transport_the_pinned_prepare_refuses_is_a_409(record):
+    with pytest.raises(HTTPException) as refused:
+        await _check(
+            _thread(),
+            session_grant_violations=AsyncMock(return_value=[]),
+            session_endpoint_violations=AsyncMock(return_value=["rerank: no key"]),
+        )
+    assert (refused.value.status_code, refused.value.detail) == (
+        409,
+        endpoint_violations_detail(["rerank: no key"]),
+    )
 
 
 @pytest.mark.parametrize(
@@ -346,3 +414,40 @@ def test_workspace_upgrade_view_reports_the_vm_phases(lane, vm, latest, expected
     if vm is not None:
         thread["metadata"]["vm"] = vm
     assert swu.workspace_upgrade_view(thread, None, latest_request=latest) == expected
+
+
+def test_the_route_composition_binds_the_pinned_prepare_checks(monkeypatch):
+    from orchestrator.application import (
+        preparation as preparation_composition,
+        sessions as sessions_composition,
+        transport,
+    )
+    from orchestrator.services import session_config_resolution
+
+    config = SimpleNamespace(
+        container_provisioner=object(),
+        enforce_workspace_upgrade_grants=AsyncMock(),
+        vm_provisioner=_vm(),
+    )
+    monkeypatch.setattr(
+        sessions_composition, "thread_config_update_dependencies", lambda _r: config
+    )
+    monkeypatch.setattr(
+        preparation_composition, "session_config_dependencies", lambda _r: "DEPS"
+    )
+    grant = AsyncMock(return_value=["g"])
+    endpoint = AsyncMock(return_value=["e"])
+    monkeypatch.setattr(session_config_resolution, "session_grant_violations", grant)
+    monkeypatch.setattr(
+        session_config_resolution, "session_endpoint_violations", endpoint
+    )
+
+    deps = transport.stateless_workspace_upgrade_dependencies(SimpleNamespace())
+
+    import asyncio
+
+    thread = _thread()
+    assert asyncio.run(deps.session_grant_violations(thread)) == ["g"]
+    assert asyncio.run(deps.session_endpoint_violations(thread)) == ["e"]
+    grant.assert_awaited_once_with(thread, dependencies="DEPS")
+    endpoint.assert_awaited_once_with(thread, dependencies="DEPS")

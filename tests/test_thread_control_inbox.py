@@ -1970,12 +1970,18 @@ VM_ADMITTED = AdmittedControl(
 )
 
 
+GRANT_VIOLATIONS = AsyncMock(return_value=[])
+ENDPOINT_VIOLATIONS = AsyncMock(return_value=[])
+
+
 def _vm_upgrade_dependencies(order):
     return swu.StatelessWorkspaceUpgradeDependencies(
         container_provisioner=MagicMock(),
         enforce_workspace_upgrade_grants=AsyncMock(),
         schedule_stateless_workspace_ensure=lambda tid: order.append(("ensure", tid)),
         vm_provisioner=SimpleNamespace(is_available=True),
+        session_grant_violations=GRANT_VIOLATIONS,
+        session_endpoint_violations=ENDPOINT_VIOLATIONS,
     )
 
 
@@ -2038,11 +2044,11 @@ async def test_vm_upgrade_admission_runs_inside_the_lifecycle_lock():
         ),
         ("unlock",),
     ]
-    assert (
-        mocks["check_stateless_vm_upgrade"]
-        .await_args.kwargs["vm_provisioner"]
-        .is_available
-    )
+    checked = mocks["check_stateless_vm_upgrade"].await_args.kwargs
+    assert checked["vm_provisioner"].is_available
+    # The switched Session's pinned prepare checks run at admission (S1).
+    assert checked["session_grant_violations"] is GRANT_VIOLATIONS
+    assert checked["session_endpoint_violations"] is ENDPOINT_VIOLATIONS
     assert [
         call.kwargs["event_type"]
         for call in mocks["log_security_event"].await_args_list

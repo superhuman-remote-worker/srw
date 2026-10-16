@@ -390,6 +390,10 @@ async def submit_thread_control(
                 enforce_workspace_upgrade_grants=(
                     upgrade_dependencies.enforce_workspace_upgrade_grants
                 ),
+                session_grant_violations=upgrade_dependencies.session_grant_violations,
+                session_endpoint_violations=(
+                    upgrade_dependencies.session_endpoint_violations
+                ),
             )
             vm_upgrade = True
         else:

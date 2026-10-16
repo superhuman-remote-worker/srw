@@ -101,6 +101,16 @@ def stateless_workspace_upgrade_dependencies(
             resources,
         ),
         vm_provisioner=config.vm_provisioner,
+        session_grant_violations=bound(
+            session_config_resolution.session_grant_violations,
+            preparation_composition.session_config_dependencies,
+            resources,
+        ),
+        session_endpoint_violations=bound(
+            session_config_resolution.session_endpoint_violations,
+            preparation_composition.session_config_dependencies,
+            resources,
+        ),
     )
 
 
