@@ -108,6 +108,7 @@ function createPane(options: {
     upgradeWorkspace: vi.fn(),
     controlTransport: vi.fn(() => 'websocket'),
     upgradeTargetAvailable: vi.fn((tier: string) => tier === 'vm'),
+    executionLane: signal<'pinned' | 'stateless' | null>('pinned'),
   };
   const api = {
     getPersistentThread: vi.fn().mockReturnValue(
@@ -227,6 +228,7 @@ function createPaneWithRealToolsGroup(toolGroups: SessionToolGroupsResponse) {
     upgradeWorkspace: vi.fn(),
     controlTransport: vi.fn(() => 'websocket'),
     upgradeTargetAvailable: vi.fn((tier: string) => tier === 'vm'),
+    executionLane: signal<'pinned' | 'stateless' | null>('pinned'),
   };
   const api = {
     getPersistentThread: vi.fn().mockReturnValue(
@@ -407,6 +409,7 @@ describe('SettingsPaneComponent locked-on categories, from the DOM', () => {
       upgradeWorkspace: vi.fn(),
       controlTransport: vi.fn(() => 'websocket'),
       upgradeTargetAvailable: vi.fn((tier: string) => tier === 'vm'),
+      executionLane: signal<'pinned' | 'stateless' | null>('pinned'),
     };
     const api = {
       getPersistentThread: vi.fn().mockReturnValue(
@@ -1017,6 +1020,33 @@ describe('SettingsPaneComponent workspace tier', () => {
       sandbox: 'ok',
       vm: 'sessionUnsupported',
     });
+  });
+
+  it('a stateless session with a declared VM target offers the VM and says it reconnects first', () => {
+    const {component, chat} = createPane({grants: null});
+    chat.controlTransport.mockReturnValue('rest');
+    chat.upgradeTargetAvailable.mockImplementation(() => true);
+    chat.executionLane.set('stateless');
+    chat.workspaceTier.set('virtual');
+    expect(component.tierReachability()['vm']).toBe('ok');
+    component.onTierPicked('vm');
+    expect(component.vmReconnectNote()).toBe(true);
+  });
+
+  it('a stateless none session reaches a declared VM without a container target', () => {
+    const {component, chat} = createPane({override: {workspace: {backend: 'none'}}, grants: null});
+    chat.controlTransport.mockReturnValue('rest');
+    chat.upgradeTargetAvailable.mockImplementation((tier: string) => tier === 'vm');
+    chat.workspaceTier.set('none');
+    expect(component.tierReachability()).toEqual({vm: 'ok'});
+  });
+
+  it('a pinned none session still reaches nothing (owner, 2026-10-14)', () => {
+    const {component, chat} = createPane({override: {workspace: {backend: 'none'}}, grants: null});
+    chat.workspaceTier.set('none');
+    expect(component.tierReachability()).toEqual({});
+    component.onTierPicked('vm');
+    expect(component.vmReconnectNote()).toBe(false);
   });
 
   it('a session with no upgrade transport reaches no tier, and says so', () => {

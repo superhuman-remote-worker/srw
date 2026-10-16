@@ -2198,6 +2198,7 @@
           "title": "Auf VM upgraden?",
           "body": "Stellt eine dedizierte virtuelle Maschine mit root und sudo bereit und kopiert deine Dateien darauf. Ein Kaltstart dauert 6–25 Minuten."
         },
+        "vmReconnect": "Die Sitzung verbindet sich zuerst mit einem eigenen Agenten neu.",
         "irreversible": "Das lässt sich nicht rückgängig machen — die Sitzung kann nicht auf eine niedrigere Stufe zurück.",
         "confirm": "Upgraden"
       }
@@ -2358,10 +2359,21 @@
       "containerUpgradeUnavailable": "Container-Upgrades sind in dieser Sitzung nicht verfügbar. Verwende /upgrade-workspace vm oder starte eine neue Sitzung mit einem Container-Workspace.",
       "upgradeUnavailable": "Workspace-Upgrades sind in dieser Sitzung nicht verfügbar.",
       "upgradeDeferred": "Das Workspace-Upgrade startet nach der aktuellen Antwort.",
-      "vmUpgradeUnavailable": "Ein Upgrade dieser Sitzung auf eine VM ist auf dieser Installation noch nicht verfügbar. Starte stattdessen eine neue Sitzung mit einem VM-Workspace."
+      "vmUpgradeUnavailable": "VM-Workspaces sind auf dieser Installation nicht verfügbar.",
+      "vmUpgradeRetry": "Das VM-Upgrade konnte auf dem Agenten dieser Sitzung nicht starten. Sende /upgrade-workspace vm, um es erneut zu versuchen.",
+      "upgradeBusy": "Die Sitzung erledigt noch Hintergrundarbeit (zum Beispiel eine Cloud-Synchronisierung), daher hat das Workspace-Upgrade nicht begonnen. Versuche es in einer Minute erneut."
     },
     "workspaceUpgrade": {
-      "failedStartup": "Workspace-Upgrade fehlgeschlagen. {{reason}} Beende diese Sitzung und starte eine neue; deine Dateien bleiben erhalten."
+      "failedStartup": "Workspace-Upgrade fehlgeschlagen. {{reason}} Beende diese Sitzung und starte eine neue; deine Dateien bleiben erhalten.",
+      "movingToVm": "Diese Sitzung wird auf einen VM-Workspace verschoben (die Sitzung verbindet sich zuerst neu)…",
+      "provisioningTemplate": "Der Workspace {{template}} wird bereitgestellt…",
+      "failed": {
+        "upgradeCancelled": "Das VM-Upgrade wurde abgebrochen, als diese Sitzung beendet wurde.",
+        "upgradeRefused": "Das VM-Upgrade konnte nicht starten: SRW hat es beim erneuten Verbinden der Sitzung abgelehnt. Die Sitzung behält ihren aktuellen Workspace; du kannst /upgrade-workspace vm erneut versuchen.",
+        "upgradeFailed": "Das VM-Upgrade ist fehlgeschlagen. Diese Sitzung funktioniert vorerst weiter, kann aber nicht neu starten: Beende sie und starte eine neue, wenn du fertig bist. Deine Dateien bleiben erhalten.",
+        "upgradeInterrupted": "Das VM-Upgrade wurde unterbrochen, bevor deine Dateien kopiert wurden. Beende diese Sitzung und starte eine neue; deine Dateien bleiben im alten Speicher erhalten.",
+        "upgradeAlreadyRunning": "Ein Workspace-Upgrade läuft bereits."
+      }
     },
     "workspaceOffer": {
       "title": "Workspace-Upgrade angefordert",

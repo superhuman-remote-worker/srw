@@ -12293,6 +12293,261 @@ describe('PersistentChatService — control transport is declared, never inferre
     expect(ctx.service.pendingWorkspaceOffer()).toEqual({ tier: 'sandbox', reason: 'tests' });
   });
 
+  const upgradeableVm = {
+    ...declaredSocketless,
+    controls: { ...declaredSocketless.controls, 'upgrade-to-workspace': 'rest' },
+    control_options: {
+      'upgrade-to-workspace': { version: 1, targets: ['container', 'vm'], requires_idle: true },
+    },
+  };
+  const pinnedConnection = {
+    state: 'ready',
+    control_socket: 'websocket',
+    ws_url: 'ws://test/ws',
+    token: 'tok',
+    expires_at: 4_102_444_800,
+    pinned_runtime_generation_contract: 1,
+    session_runtime_generation: '99999999-9999-4999-8999-999999999999',
+    controls: { 'upgrade-to-workspace': 'websocket', 'mode.set': 'rest', 'narration.set': 'rest' },
+  };
+
+  /** After the switch, /connection answers 425 (pinned, unbound) once, then the socket. */
+  function switchingRoutes() {
+    let pinned = false;
+    let connectionCalls = 0;
+    const base = socketlessGet(upgradeableVm);
+    return {
+      pin: () => {
+        pinned = true;
+      },
+      get: (url: string) => {
+        if (pinned && url.includes('/api/sessions/') && url.endsWith('/connection')) {
+          connectionCalls += 1;
+          return connectionCalls === 1 ? throwError(() => ({ status: 425 })) : of(pinnedConnection);
+        }
+        return base(url);
+      },
+    };
+  }
+
+  async function switchingSession() {
+    const ctx = createService();
+    const routes = switchingRoutes();
+    ctx.mockHttp.get.mockImplementation(routes.get);
+    await ctx.service.connect('socketless');
+    fireSseOpen(ctx.sseInstances[0]);
+    (ctx.service as any)._ensureControlWs();
+    await Promise.resolve();
+    return { ...ctx, routes };
+  }
+
+  it('/upgrade-workspace vm on a stateless session with a VM target sends the durable control', async () => {
+    const ctx = await socketlessSession(upgradeableVm);
+    ctx.mockHttp.post.mockReturnValue(of({ state: 'pending' }));
+
+    await ctx.service.sendMessage('/upgrade-workspace vm');
+
+    expect(ctx.mockHttp.post).toHaveBeenCalledWith(
+      expect.stringMatching(/\/persistent\/threads\/socketless\/controls$/),
+      expect.objectContaining({ method: 'upgrade-to-workspace', target_tier: 'vm' }),
+    );
+    expect(ctx.service.workspaceUpgradeInProgress()).toEqual({ tier: 'vm' });
+    expect(ctx.wsInstances).toHaveLength(0);
+  });
+
+  it('a VM template on a stateless session says which template it provisions', async () => {
+    const ctx = await socketlessSession(upgradeableVm);
+    ctx.mockHttp.post.mockReturnValue(of({ state: 'pending' }));
+    const stamps = vi.spyOn(ctx.service as any, '_systemMessage');
+
+    await ctx.service.sendMessage('/upgrade-workspace vm-big');
+
+    expect(ctx.mockHttp.post.mock.calls[0][1]).toEqual(
+      expect.objectContaining({ method: 'upgrade-to-workspace', template: 'vm-big' }),
+    );
+    expect(stamps).toHaveBeenCalledWith('chat.workspaceUpgrade.provisioningTemplate');
+  });
+
+  it('the 202 transport_changed flag moves the session to the pinned transport and holds the composer', async () => {
+    const ctx = await switchingSession();
+    ctx.mockHttp.post.mockImplementation((url: string) =>
+      url.endsWith('/controls')
+        ? of({ state: 'pending', request_id: 'r-1', transport_changed: true })
+        : of({ state: 'preparing' }),
+    );
+    const stamps = vi.spyOn(ctx.service as any, '_systemMessage');
+    ctx.routes.pin();
+
+    ctx.service.upgradeWorkspace('vm');
+
+    expect(ctx.service.executionLane()).toBe('pinned');
+    expect(ctx.service.sessionReady()).toBe(false);
+    await vi.waitFor(() => expect(ctx.wsInstances).toHaveLength(1));
+    expect(
+      stamps.mock.calls.filter(([line]) => line === 'chat.workspaceUpgrade.movingToVm'),
+    ).toHaveLength(1);
+    expect(ctx.mockHttp.post).toHaveBeenCalledWith(
+      expect.stringMatching(/\/sessions\/socketless\/prepare$/),
+      {},
+    );
+  });
+
+  it('the session.lane_changed frame resets a second tab once', async () => {
+    const ctx = await switchingSession();
+    ctx.mockHttp.post.mockReturnValue(of({ state: 'preparing' }));
+    const stamps = vi.spyOn(ctx.service as any, '_systemMessage');
+    ctx.routes.pin();
+    const frame = {
+      method: 'session.lane_changed',
+      params: { from: 'stateless', to: 'pinned', reason: 'vm_upgrade', control_request_id: 'r-1' },
+    };
+
+    fireSseMessage(ctx.sseInstances[0], frame, '1:20');
+    fireSseMessage(ctx.sseInstances[0], frame, '1:21');
+
+    await vi.waitFor(() => expect(ctx.wsInstances).toHaveLength(1));
+    expect(
+      stamps.mock.calls.filter(([line]) => line === 'chat.workspaceUpgrade.movingToVm'),
+    ).toHaveLength(1);
+    expect(
+      ctx.mockHttp.post.mock.calls.filter(([url]: [string]) => String(url).endsWith('/prepare')),
+    ).toHaveLength(1);
+  });
+
+  it('the journaled .started is the receipt, and .complete continues once', async () => {
+    const ctx = await socketlessSession(upgradeableVm);
+    ctx.mockHttp.post.mockReturnValue(of({ state: 'pending' }));
+    const send = vi.spyOn(ctx.service, 'sendMessage');
+    ctx.service.upgradeWorkspace('vm', { thenContinue: true });
+    const body = ctx.mockHttp.post.mock.calls.find(([url]: [string]) =>
+      String(url).endsWith('/controls'),
+    )[1];
+
+    fireSseMessage(
+      ctx.sseInstances[0],
+      {
+        method: 'workspace_upgrade.started',
+        params: {
+          client_request_id: body.client_request_id,
+          method: 'upgrade-to-workspace',
+          target_tier: 'vm',
+          provision_generation: 'p-1',
+        },
+      },
+      '1:20',
+    );
+    expect((ctx.service as any).durableControlAwaitingAck.has(body.client_request_id)).toBe(false);
+
+    const complete = {
+      method: 'workspace_upgrade.complete',
+      params: { target_tier: 'vm', seeded_files: 2, request_id: 'r-1', client_request_id: body.client_request_id },
+    };
+    fireSseMessage(ctx.sseInstances[0], complete, '1:21');
+    fireSseMessage(ctx.sseInstances[0], complete, '1:22');
+
+    expect(
+      send.mock.calls.filter(([message]) => message === 'chat.workspaceOffer.continueMessage'),
+    ).toHaveLength(1);
+    expect(ctx.service.workspaceTier()).toBe('vm');
+  });
+
+  it.each([
+    ['upgrade_cancelled', 'chat.workspaceUpgrade.failed.upgradeCancelled'],
+    ['upgrade_refused', 'chat.workspaceUpgrade.failed.upgradeRefused'],
+    ['upgrade_failed', 'chat.workspaceUpgrade.failed.upgradeFailed'],
+    ['upgrade_interrupted', 'chat.workspaceUpgrade.failed.upgradeInterrupted'],
+    ['upgrade_already_running', 'chat.workspaceUpgrade.failed.upgradeAlreadyRunning'],
+  ])('a typed .failed (%s) shows translated copy, never backend text', async (code, key) => {
+    const ctx = await socketlessSession(upgradeableVm);
+    const stamps = vi.spyOn(ctx.service as any, '_systemMessage');
+    ctx.service.workspaceUpgradeInProgress.set({ tier: 'vm' });
+    ctx.service.continueAfterUpgrade.set(true);
+
+    fireSseMessage(
+      ctx.sseInstances[0],
+      { method: 'workspace_upgrade.failed', params: { error_code: code, reason: 'raw backend text' } },
+      '1:20',
+    );
+
+    expect(stamps).toHaveBeenCalledWith(key);
+    expect(stamps.mock.calls.some(([line]) => String(line).includes('raw backend text'))).toBe(false);
+    expect(ctx.service.workspaceUpgradeInProgress()).toBeNull();
+    expect(ctx.service.continueAfterUpgrade()).toBe(false);
+  });
+
+  it("an untyped .failed (the WebSocket path) keeps today's line", async () => {
+    const ctx = await socketlessSession(upgradeableVm);
+    const stamps = vi.spyOn(ctx.service as any, '_systemMessage');
+    fireSseMessage(
+      ctx.sseInstances[0],
+      { method: 'workspace_upgrade.failed', params: { reason: 'vm workspace did not become ready in time' } },
+      '1:20',
+    );
+    expect(stamps).toHaveBeenCalledWith(
+      'Workspace upgrade failed: vm workspace did not become ready in time',
+    );
+  });
+
+  it('control.rejected for a VM upgrade on the pinned lane suggests /upgrade-workspace vm again', async () => {
+    const ctx = await socketlessSession(upgradeableVm);
+    ctx.service.executionLane.set('pinned');
+    fireSseMessage(
+      ctx.sseInstances[0],
+      {
+        method: 'control.rejected',
+        params: { method: 'upgrade-to-workspace', error_code: 'unsupported_control', client_request_id: 'x' },
+      },
+      '1:20',
+    );
+    expect(ctx.service.error()).toBe('chat.control.vmUpgradeRetry');
+  });
+
+  it('a reload shows a VM upgrade in progress, and a failed one once', async () => {
+    const ctx = createService();
+    ctx.mockHttp.get.mockImplementation(
+      socketlessGet(declaredSocketless, {
+        workspace_upgrade: { target_tier: 'vm', phase: 'provisioning' },
+      }),
+    );
+    await ctx.service.connect('socketless');
+    fireSseOpen(ctx.sseInstances[0]);
+    TestBed.tick();
+    expect(ctx.service.workspaceUpgradeInProgress()).toEqual({ tier: 'vm' });
+
+    const stamps = vi.spyOn(ctx.service as any, '_systemMessage');
+    ctx.mockHttp.get.mockImplementation(
+      socketlessGet(declaredSocketless, {
+        workspace_upgrade: { target_tier: 'vm', phase: 'failed', reason_code: 'upgrade_failed' },
+      }),
+    );
+    for (let i = 0; i < 2; i++) {
+      await (ctx.service as any).loadThreadMeta('socketless', (ctx.service as any).connectGeneration, {
+        fresh: true,
+        lifecycleOnly: true,
+      });
+      TestBed.tick();
+    }
+    expect(
+      stamps.mock.calls.filter(([line]) => line === 'chat.workspaceUpgrade.failed.upgradeFailed'),
+    ).toHaveLength(1);
+    expect(ctx.service.workspaceUpgradeInProgress()).toBeNull();
+  });
+
+  it('an upgrade refused 425 past the retry cap gives up with the busy copy', async () => {
+    const ctx = await socketlessSession(upgradeableVm);
+    ctx.mockHttp.post.mockReturnValue(throwError(() => ({ status: 425, error: { detail: 'busy' } })));
+    vi.useFakeTimers();
+    try {
+      ctx.service.upgradeWorkspace('vm');
+      for (let i = 0; i < 40; i++) await vi.advanceTimersByTimeAsync(4_000);
+    } finally {
+      vi.useRealTimers();
+    }
+    expect(ctx.mockHttp.post).toHaveBeenCalledTimes(30);
+    expect(ctx.service.error()).toBe('chat.control.upgradeBusy');
+    expect(ctx.service.workspaceUpgradeInProgress()).toBeNull();
+  });
+
   it('/done without an archive socket ends through the owner End path', async () => {
     const ctx = await socketlessSession();
     ctx.mockHttp.delete.mockReturnValue(of({ status: 'ended' }));

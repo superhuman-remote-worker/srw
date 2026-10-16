@@ -334,6 +334,15 @@ const SLASH_COMMAND_VERBS: Record<string, readonly string[]> = {
   '/upgrade-workspace': ['upgrade-to-workspace'],
 };
 
+/** Typed `workspace_upgrade.failed` codes (C2): translated copy, never backend text. */
+const WORKSPACE_UPGRADE_FAILURE_KEYS: Record<string, string> = {
+  upgrade_cancelled: 'chat.workspaceUpgrade.failed.upgradeCancelled',
+  upgrade_refused: 'chat.workspaceUpgrade.failed.upgradeRefused',
+  upgrade_failed: 'chat.workspaceUpgrade.failed.upgradeFailed',
+  upgrade_interrupted: 'chat.workspaceUpgrade.failed.upgradeInterrupted',
+  upgrade_already_running: 'chat.workspaceUpgrade.failed.upgradeAlreadyRunning',
+};
+
 /** Owner rejection codes with a specific explanation (the fallback is the
  *  generic `chat.control.ownerRejected`). */
 const CONTROL_REJECTION_KEYS: Record<string, string> = {
@@ -921,6 +930,15 @@ export class PersistentChatService {
       const threadId = this.threadId();
       if (!failed || !threadId) return;
       untracked(() => this._announceWorkspaceUpgradeFailure(threadId));
+    });
+
+    // A VM upgrade in flight on load (C2): requested, provisioning or copying.
+    effect(() => {
+      const view = this.workspaceUpgrade();
+      if (!view || view.target_tier !== 'vm' || view.phase === 'failed') return;
+      untracked(() => {
+        if (!this.workspaceUpgradeInProgress()) this.workspaceUpgradeInProgress.set({tier: 'vm'});
+      });
     });
 
     // Stamp the start of an awaiting stretch and tick a 1 s clock while it
@@ -1805,6 +1823,10 @@ export class PersistentChatService {
     controls: ControlCapabilityMap;
     options: ControlOptionsMap;
   } | null>(null);
+  /** The lane switch this tab already followed (C2), keyed by request. */
+  private laneSwitchHandled: string | null = null;
+  /** ~2 minutes of 425s (250 ms … 4 s backoff) before an upgrade gives up. */
+  private static readonly WORKSPACE_UPGRADE_MAX_425_ATTEMPTS = 30;
   /** Socket-sent config updates awaiting their `config.changed` ack (or a
    *  matching error frame), keyed by request_id. Settled by the frame
    *  reducer, by the ack timeout, or by disconnect(). */
@@ -2470,6 +2492,7 @@ export class PersistentChatService {
       this.workspaceCreation.set(null);
       this.workspaceUpgrade.set(null);
       this.workspaceUpgradeFailureAnnounced = null;
+      this.laneSwitchHandled = null;
       this.tasks.set([]);
       this.undoAvailable.set(false);
       this.rewindInFlight.set(false);
@@ -4242,6 +4265,27 @@ export class PersistentChatService {
     return true;
   }
 
+  /** C2: the orchestrator moved this session to the pinned lane for a VM
+   *  upgrade (the 202's `transport_changed`, or the journaled
+   *  `session.lane_changed` frame every tab sees). Idempotent per request:
+   *  drop the socketless declaration, hold the composer (`sessionReady`
+   *  false keeps input in the outbox), and reconnect through the normal
+   *  pinned path: /connection 425 → /prepare → WebSocket. */
+  private _switchToPinnedTransport(threadId: string, key: string): void {
+    if (this.threadId() !== threadId || this.laneSwitchHandled === key) return;
+    if (this.executionLane() === 'pinned' && this.controlSocket === 'websocket') return;
+    this.laneSwitchHandled = key;
+    this.controlCapabilities.set(null);
+    this.controlSocket = 'unknown';
+    this.executionLane.set('pinned');
+    this._queueState.set(null);
+    this.sessionReady.set(false);
+    this.startupPhase.set('provisioning');
+    this.workspaceUpgradeInProgress.set({ tier: 'vm' });
+    this._systemMessage(this.transloco.translate('chat.workspaceUpgrade.movingToVm'));
+    void this._openControlWs(threadId);
+  }
+
   private _installControlTransport(threadId: string, connection: ConnectionPayload): void {
     if (!this._controlPlaneAllowed(threadId)) return;
     const exactRuntimeContract = connection?.pinned_runtime_generation_contract === 1;
@@ -4831,9 +4875,9 @@ export class PersistentChatService {
     }
 
     const subscription = response$.subscribe({
-      next: () => {
+      next: (body: unknown) => {
         settledSynchronously = true;
-        this._finishDurableControlAdmission(item);
+        this._finishDurableControlAdmission(item, body);
       },
       error: (err: unknown) => {
         settledSynchronously = true;
@@ -4853,13 +4897,20 @@ export class PersistentChatService {
     }
   }
 
-  private _finishDurableControlAdmission(item: DurableControlOutboxItem): void {
+  private _finishDurableControlAdmission(item: DurableControlOutboxItem, body?: unknown): void {
     if (this.durableControlInFlight !== item) return;
     this.durableControlSubscription?.unsubscribe();
     this.durableControlSubscription = null;
     this.durableControlInFlight = null;
     if (this.durableControlOutbox[0] === item) {
       this.durableControlOutbox.shift();
+    }
+    const admission = body as { transport_changed?: unknown; request_id?: unknown } | null | undefined;
+    if (item.request.method === 'upgrade-to-workspace' && admission?.transport_changed === true) {
+      this._switchToPinnedTransport(
+        item.threadId,
+        String(admission.request_id ?? item.request.client_request_id),
+      );
     }
     if (item.request.method === 'upgrade-to-workspace' && item.threadId === this.threadId()) {
       // The create starts now: show its startup line without waiting 5 s.
@@ -4868,8 +4919,9 @@ export class PersistentChatService {
         lifecycleOnly: true,
       });
     }
-    // Deliberately ignore the response body. Only the owner's durable
-    // journal acknowledgement is authoritative client state.
+    // The response body is read only for `transport_changed` (the lane switch
+    // above). Everything else is the owner's durable journal acknowledgement,
+    // which stays the authoritative client state.
     this._flushDurableControlOutbox();
   }
 
@@ -4879,7 +4931,13 @@ export class PersistentChatService {
     this.durableControlSubscription = null;
     this.durableControlInFlight = null;
 
+    const upgradeRetriesExhausted =
+      item.request.method === 'upgrade-to-workspace' &&
+      (err as { status?: unknown })?.status === 425 &&
+      item.attempts >= PersistentChatService.WORKSPACE_UPGRADE_MAX_425_ATTEMPTS;
+
     if (
+      !upgradeRetriesExhausted &&
       this._isRetryableDurableControlFailure(err) &&
       !this.intentionalClose &&
       this.threadId() === item.threadId &&
@@ -4910,9 +4968,11 @@ export class PersistentChatService {
       const detail = (err as { error?: { detail?: unknown }; message?: unknown })?.error?.detail;
       this._setDurableControlError(
         { method: item.request.method, ordinal: item.ordinal },
-        typeof detail === 'string'
-          ? this.sanitizeError(detail)
-          : this.transloco.translate('chat.control.admissionFailed'),
+        upgradeRetriesExhausted
+          ? this.transloco.translate('chat.control.upgradeBusy')
+          : typeof detail === 'string'
+            ? this.sanitizeError(detail)
+            : this.transloco.translate('chat.control.admissionFailed'),
       );
     }
     this._flushDurableControlOutbox();
@@ -5313,6 +5373,7 @@ export class PersistentChatService {
     this.workspaceCreation.set(null);
     this.workspaceUpgrade.set(null);
     this.workspaceUpgradeFailureAnnounced = null;
+    this.laneSwitchHandled = null;
     this.endedAt.set(null);
     this.retirementDisposition.set(null);
     this.retirementPermanent.set(false);
@@ -7345,6 +7406,13 @@ export class PersistentChatService {
   }
 
   workspaceUpgradeFailureText(): string {
+    const view = this.workspaceUpgrade();
+    if (view?.target_tier === 'vm') {
+      return this.transloco.translate(
+        WORKSPACE_UPGRADE_FAILURE_KEYS[view.reason_code ?? ''] ??
+          'chat.workspaceUpgrade.failed.upgradeFailed',
+      );
+    }
     const creation = this.workspaceCreation();
     const reasonKey = creation ? workspaceCreationMessageKey(creation) : 'workspaceCreation.unknown';
     return this.transloco.translate('chat.workspaceUpgrade.failedStartup', {
@@ -7405,11 +7473,36 @@ export class PersistentChatService {
     if (tier) control.target_tier = tier;
     if (template) control.template = template;
     if (!this._sendDurableControl(control)) return;
-    this.workspaceUpgradeInProgress.set({tier: tier ?? 'sandbox'});
-    this._announceWorkspaceUpgradeProvisioning();
+    if (tier === 'vm') {
+      // The 202 (or the lane_changed frame) says "moving to a VM".
+      this.workspaceUpgradeInProgress.set({tier: 'vm'});
+    } else if (!tier && template) {
+      // A named template's tier is the server's call.
+      this.workspaceUpgradeInProgress.set({tier: 'next'});
+      this._announceWorkspaceUpgradeProvisioning({template});
+    } else {
+      this.workspaceUpgradeInProgress.set({tier: 'sandbox'});
+      this._announceWorkspaceUpgradeProvisioning();
+    }
   }
 
-  private _announceWorkspaceUpgradeProvisioning(): void {
+  /** The provisioning line for the upgrade in flight (or being dispatched):
+   *  a VM says nothing here (the lane switch announces it), a named template
+   *  names itself, anything else is a container. */
+  private _announceWorkspaceUpgradeProvisioning(opts: {template?: string} = {}): void {
+    const inFlight = this.workspaceUpgradeInProgress();
+    if (!opts.template && inFlight?.tier === 'vm') {
+      this._systemMessage(this.transloco.translate('chat.workspaceUpgrade.movingToVm'));
+      return;
+    }
+    if (opts.template) {
+      this._systemMessage(
+        this.transloco.translate('chat.workspaceUpgrade.provisioningTemplate', {
+          template: opts.template,
+        }),
+      );
+      return;
+    }
     this._systemMessage(
       this.transloco.translate('chat.workspaceOffer.provisioning', {tier: 'container'}),
     );
@@ -8019,11 +8112,13 @@ export class PersistentChatService {
         }
         const messageKey =
           CONTROL_REJECTION_KEYS[code] ??
-          (rejectedMethod === 'compact'
-            ? 'chat.control.compactRejected'
-            : rejectedMethod === 'workspace.undo'
-              ? 'chat.control.undoRejected'
-              : 'chat.control.ownerRejected');
+          (rejectedMethod === 'upgrade-to-workspace' && this.executionLane() === 'pinned'
+            ? 'chat.control.vmUpgradeRetry'
+            : rejectedMethod === 'compact'
+              ? 'chat.control.compactRejected'
+              : rejectedMethod === 'workspace.undo'
+                ? 'chat.control.undoRejected'
+                : 'chat.control.ownerRejected');
         this._setDurableControlError(
           rejectedMarker ?? {
             method: rejectedMethod,
@@ -8318,6 +8413,15 @@ export class PersistentChatService {
         );
         break;
 
+      case 'session.lane_changed': {
+        if (coveredBySnapshot) break;
+        const tid = this.threadId();
+        if (tid && params['to'] === 'pinned') {
+          this._switchToPinnedTransport(tid, String(params['control_request_id'] ?? ''));
+        }
+        break;
+      }
+
       case 'workspace_upgrade.needed': {
         // The agent called request_workspace_upgrade — offer the upgrade
         // (HITL: a human accepts before anything provisions). The inline
@@ -8351,6 +8455,7 @@ export class PersistentChatService {
       }
 
       case 'workspace_upgrade.started':
+        this._clearDurableControlErrorAfter(this._takeDurableControlAck(params, 'upgrade-to-workspace'));
         this.workspaceUpgradeInProgress.update(
           (p) =>
             !p || p.tier === 'next'
@@ -8406,16 +8511,29 @@ export class PersistentChatService {
         break;
       }
 
-      case 'workspace_upgrade.failed':
+      case 'workspace_upgrade.failed': {
+        this._takeDurableControlAck(params, 'upgrade-to-workspace');
         this.workspaceUpgradeInProgress.set(null);
         // Don't fall back to re-offering: the reason is stale and the
         // pane still has the button.
         this.pendingWorkspaceOffer.set(null);
         this.continueAfterUpgrade.set(false);
-        this._systemMessage(
-          `Workspace upgrade failed: ${(params['reason'] as string) || 'unknown error'}`,
-        );
+        const failureKey =
+          WORKSPACE_UPGRADE_FAILURE_KEYS[
+            typeof params['error_code'] === 'string' ? params['error_code'] : ''
+          ];
+        if (failureKey) {
+          // C2's durable path: typed copy, and the load-time projection must
+          // not announce the same failure again.
+          this.workspaceUpgradeFailureAnnounced = this.threadId();
+          this._systemMessage(this.transloco.translate(failureKey));
+        } else {
+          this._systemMessage(
+            `Workspace upgrade failed: ${(params['reason'] as string) || 'unknown error'}`,
+          );
+        }
         break;
+      }
 
       case 'tasks.updated':
         if (!coveredBySnapshot) {

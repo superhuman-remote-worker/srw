@@ -157,6 +157,11 @@ const LIVE_ATTACH_REFUSED_TYPES: ReadonlySet<string> = new Set([
         <p class="upgrade-body">
           {{ pendingTierCopy() + '.body' | transloco }}
         </p>
+        @if (vmReconnectNote()) {
+          <p class="upgrade-body">
+            {{ 'chat.settingsPane.upgradeConfirm.vmReconnect' | transloco }}
+          </p>
+        }
         <p class="upgrade-body irreversible">
           {{ 'chat.settingsPane.upgradeConfirm.irreversible' | transloco }}
         </p>
@@ -378,9 +383,16 @@ export class SettingsPaneComponent {
                 break;
             case 'none':
                 // Nothing to seed in place on the pinned lane; a stateless
-                // session's container upgrade starts it fresh (C1).
+                // session's container upgrade starts it fresh (C1), and its VM
+                // upgrade goes through the lane switch (C2). A pinned none
+                // session stays as it is (owner, 2026-10-14).
                 if (this.chat.upgradeTargetAvailable('sandbox')) {
                     map['sandbox'] = 'ok';
+                    map['vm'] = vm;
+                } else if (
+                    this.chat.controlTransport('upgrade-to-workspace') === 'rest' &&
+                    this.chat.upgradeTargetAvailable('vm')
+                ) {
                     map['vm'] = vm;
                 }
                 break;
@@ -405,6 +417,11 @@ export class SettingsPaneComponent {
      *  reachable, so only those two have confirmation copy. */
     readonly pendingTierCopy = computed(() =>
         `chat.settingsPane.upgradeConfirm.${this.pendingTier() ?? 'sandbox'}`,
+    );
+
+    /** A stateless session's VM upgrade reconnects to a dedicated agent first (C2). */
+    readonly vmReconnectNote = computed(
+        () => this.pendingTier() === 'vm' && this.chat.executionLane() === 'stateless',
     );
 
     /** A tier the user picked in the settings row. Re-checked here rather than

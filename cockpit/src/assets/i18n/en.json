@@ -2198,6 +2198,7 @@
           "title": "Upgrade to a VM?",
           "body": "Provisions a dedicated virtual machine with root and sudo, and copies your files onto it. A cold start takes 6–25 minutes."
         },
+        "vmReconnect": "The session reconnects to a dedicated agent first.",
         "irreversible": "This can't be undone — the session can't move back down a tier.",
         "confirm": "Upgrade"
       }
@@ -2358,10 +2359,21 @@
       "containerUpgradeUnavailable": "Container upgrades aren't available in this session. Use /upgrade-workspace vm, or start a new session with a container workspace.",
       "upgradeUnavailable": "Workspace upgrades aren't available in this session.",
       "upgradeDeferred": "The workspace upgrade will start after the current response.",
-      "vmUpgradeUnavailable": "Upgrading a session to a VM isn't available on this installation yet. Start a new session with a VM workspace instead."
+      "vmUpgradeUnavailable": "VM workspaces aren't available on this installation.",
+      "vmUpgradeRetry": "The VM upgrade couldn't start on this session's agent. Send /upgrade-workspace vm to try again.",
+      "upgradeBusy": "The session is still finishing background work (for example a cloud sync), so the workspace upgrade didn't start. Try again in a minute."
     },
     "workspaceUpgrade": {
-      "failedStartup": "Workspace upgrade failed. {{reason}} End this session and start a new one; your files are kept."
+      "failedStartup": "Workspace upgrade failed. {{reason}} End this session and start a new one; your files are kept.",
+      "movingToVm": "Moving this session to a VM workspace (the session reconnects first)…",
+      "provisioningTemplate": "Provisioning the {{template}} workspace…",
+      "failed": {
+        "upgradeCancelled": "The VM upgrade was cancelled when this session ended.",
+        "upgradeRefused": "The VM upgrade couldn't start: SRW refused it when the session reconnected. The session keeps its current workspace; you can try /upgrade-workspace vm again.",
+        "upgradeFailed": "The VM upgrade failed. This session keeps working for now, but it can't restart: End it and start a new one when you're done. Your files are kept.",
+        "upgradeInterrupted": "The VM upgrade was interrupted before your files were copied. End this session and start a new one; your files are kept in the old storage.",
+        "upgradeAlreadyRunning": "A workspace upgrade is already running."
+      }
     },
     "workspaceOffer": {
       "title": "Workspace upgrade requested",
