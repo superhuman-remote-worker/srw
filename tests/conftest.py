@@ -137,6 +137,38 @@ def _isolate_persistent_session_runtime(monkeypatch):
         vars(owner).update(state)
 
 
+#: ``persistent_app``'s workspace-upgrade process state, with its import values:
+#: the one-upgrade-at-a-time flag and the VM recovery outcomes owner start
+#: holds for the first drain (C2).
+_PERSISTENT_APP_UPGRADE_GLOBALS = (
+    ("_workspace_upgrade_in_flight", False),
+    ("_recovered_vm_upgrade", None),
+    ("_interrupted_vm_upgrade", None),
+)
+
+
+@pytest.fixture(autouse=True)
+def _isolate_workspace_upgrade_globals(monkeypatch):
+    """Start and end every test with no workspace upgrade in flight.
+
+    A leaked flag refuses every later upgrade in the same xdist worker as
+    "already running"; a leaked recovery outcome is journaled by a later
+    test's owner start. ``monkeypatch`` is undone before the reset, as in
+    ``_isolate_persistent_session_runtime``.
+    """
+
+    def reset() -> None:
+        module = sys.modules.get("agent.api.persistent_app")
+        if module is not None:
+            for name, value in _PERSISTENT_APP_UPGRADE_GLOBALS:
+                setattr(module, name, value)
+
+    reset()
+    yield
+    monkeypatch.undo()
+    reset()
+
+
 from orchestrator.services import notification_catalog as _notification_catalog  # noqa: E402
 
 _NOTIFICATION_REGISTRIES = (
