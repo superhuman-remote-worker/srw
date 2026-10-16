@@ -1,0 +1,32 @@
+{
+  "date": "2026-10-16",
+  "plan": "C2 stateless Session VM upgrade (virtual/none -> VM through a lane switch), knowledge-base superpowers/plans/2026-10-14-stateless-session-vm-upgrade-c2-plan.md",
+  "code": "develop f2f49db46..91d1145b4 (18 commits, unpushed); live run on the owner's Tilt images built from 91d1145b4 (checksums of key files matched)",
+  "stack": {
+    "context": "k3d-srw",
+    "namespace": "srw",
+    "flags": "STATELESS_SESSION_ENABLED=true; VMs off (no VM provisioner); CONTAINER_STARTUP_STAGE_AUTHORITY_ENABLED off, toggled on via git-ignored values-local.yaml only for item 7' and restored byte for byte (sha256 66d43af5...)",
+    "caller": "python in the orchestrator Pod (X-Internal-Key + X-MCP-User-Id admin@localhost 6ed1b6f4-...); cockpit via Playwright as the local test user"
+  },
+  "offlineGate": "backend 29 files 1732 passed; real-PG 12 files 294 passed 0 skipped; cockpit npm test 4351 passed; i18n:check 4037 keys; build OK; ruff 31 formatted; b12 generic PATCH and pinned container refusal pins unchanged",
+  "step2VmProvisioningOff": {
+    "session": "d97fa761-c73d-4b0a-833c-6fb5bceb8c14 (virtual, stateless)",
+    "items": {
+      "1": "PASS created stateless; hello.txt upload 200",
+      "2": "PASS /connection declares no vm target (tracking off: no upgrade-to-workspace at all)",
+      "3": "PASS upgrade-availability vm = {available:false, reason:\"VM workspaces aren't available on this installation.\"}",
+      "4": "PASS POST controls target_tier vm -> 409 with that exact detail",
+      "5": "PASS DB unchanged: lane stateless, no upgrade-to-workspace row, events_epoch 0, run_queue untouched",
+      "6": "PASS input accepted (route answers 200, not the plan's 202 - pre-existing route), queued -> leased -> done; model 402 locally",
+      "7_trackingOff": "as designed: Settings shows static 'Virtual (cloud files)' and /upgrade-workspace vm answers locally 'Workspace upgrades aren't available in this session.' (no tier reachable); plan text assumed tracking on",
+      "7_trackingOn": "PASS /connection targets [container]; Settings Container enabled, 'VM (QEMU) - not available in this session'; /upgrade-workspace vm answers locally 'VM workspaces aren't available on this installation.'; 0 control rows",
+      "end": "PASS 200 for both Sessions"
+    }
+  },
+  "notRun": {
+    "step3VmProvisionerOnFailing": "needs the owner's OK (vm.mode same-cluster in values-local.yaml changes the shared local stack)",
+    "step4FullSwapLocally": "local stack has no KubeVirt/VM controller",
+    "step5Dev": "one stateless Session + one VM on dev after the owner pushes, with the owner's OK (VM cost)"
+  },
+  "openOwnerDecision": "S1: pinned End answers 409 pending_control_requests while the switch request is unadopted (even with force) - D3 cancel can't happen; Task 6's two End cases omitted pending the decision"
+}
