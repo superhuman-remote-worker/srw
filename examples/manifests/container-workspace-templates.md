@@ -655,8 +655,8 @@ and `rclone mount` fail in its shell. See
 - A Job's separate IDE pod still runs the installation image, so its terminal
   lacks your image's tools. Sessions run code-server inside the workspace, which
   your image must provide.
-- A running Session can't upgrade to a container with `/upgrade-workspace`
-  (see [Upgrades](#upgrades)).
+- A pinned Session can't upgrade to a container with `/upgrade-workspace`; a
+  stateless `virtual` or `none` Session can (see [Upgrades](#upgrades)).
 - A workspace created from a built-in template keeps its image across releases,
   including work that got `container-full` because it named no workspace. Only
   the plain backend, used when the built-ins are turned off, follows the

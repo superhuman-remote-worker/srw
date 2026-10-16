@@ -35,9 +35,11 @@ online service, explain the setup path if browser tools are missing:
 
 1. Open the chat header's **Settings** (sliders icon), or on a narrow screen
    choose **Settings** from the header's three-dot menu.
-2. In the **Settings** tab, check **Workspace**. A running session can't
-   upgrade to a Container: start a new Container session for the direct
-   browser. A Virtual session can upgrade to a **VM** when VMs are allowed;
+2. In the **Settings** tab, check **Workspace**. A Virtual or None session
+   served by the shared executors can upgrade to a **Container** in place
+   (choose **Container** and wait for it to finish); a session whose Container
+   choice says **not available in this session** can't, so start a new
+   Container session for the direct browser. A Virtual session can upgrade to a **VM** when VMs are allowed;
    confirm **Upgrade** and wait for it to finish. This carries existing files
    over and keeps the conversation. There is no live Advanced tab.
 3. Under **Tools**, enable **Browser** if it is off. The direct-browser tools

@@ -127,9 +127,11 @@ deployment authorization.
    complete if requested, then send the agent a follow-up to continue.
 
 For a Virtual session that needs a shell, choose **VM** in **Workspace** when
-VMs are allowed and confirm **Upgrade**; existing files carry over. A running
-session can't upgrade to a Container, so start a new Container session when you
-need one (for example, for the direct or shared browser). Then check
+VMs are allowed and confirm **Upgrade**; existing files carry over. A Virtual or None
+session served by the shared executors can also choose **Container** and
+upgrade in place; a session whose Container choice says **not available in this
+session** can't, so start a new Container session when you need one (for
+example, for the direct or shared browser). Then check
 the needed tool category under **Tools**. If the Workspace choices say **not
 available in this session**, this session cannot change workspace in place:
 start a new session with the needed workspace instead. Use the focused
