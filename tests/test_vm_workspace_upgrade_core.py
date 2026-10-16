@@ -6,6 +6,7 @@ them instead. One upgrade runs per agent process.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import sys
 from types import SimpleNamespace
@@ -50,15 +51,19 @@ def _frames(ws):
     ]
 
 
-def _patches(sess, client, *, vm_cfg, seed=None, remote_module=None):
+def _patches(sess, client, *, vm_cfg, seed=None, remote_module=None, poll=None):
     return (
         patch("agent.api.persistent_app._session", sess),
         patch("agent.api.persistent_app._orchestrator_client", client),
         patch("agent.api.persistent_app._session_identity._thread_id", "tid"),
-        patch(
-            "agent.api.persistent_app._poll_vm_ready",
-            new_callable=AsyncMock,
-            return_value=vm_cfg,
+        (
+            patch("agent.api.persistent_app._poll_vm_ready", new=poll)
+            if poll is not None
+            else patch(
+                "agent.api.persistent_app._poll_vm_ready",
+                new_callable=AsyncMock,
+                return_value=vm_cfg,
+            )
         ),
         patch.dict(
             sys.modules,
@@ -188,6 +193,80 @@ async def test_the_flag_is_released_after_a_refused_request():
     ):
         await pa._handle_workspace_upgrade(ws, target_tier="vm")
     assert _frames(ws)[-1] == ("workspace_upgrade.failed", {"reason": "VMs are off"})
+    assert pa._workspace_upgrade_in_flight is False
+
+
+@pytest.mark.asyncio
+async def test_a_websocket_upgrade_holds_the_single_flight_until_it_finishes(
+    monkeypatch,
+):
+    monkeypatch.setattr(pa, "_workspace_upgrade_in_flight", False)
+    polling, ready = asyncio.Event(), asyncio.Event()
+
+    async def poll(*_args, **_kwargs):
+        polling.set()
+        await ready.wait()
+        return {"ssh_host": "100.64.0.9", "ssh_port": 22}
+
+    first_ws, second_ws = AsyncMock(), AsyncMock()
+    sess, client = _session(), _client()
+    p = _patches(sess, client, vm_cfg=None, poll=poll)
+    with p[0], p[1], p[2], p[3], p[4], p[5]:
+        first = asyncio.create_task(
+            pa._handle_workspace_upgrade(first_ws, target_tier="vm")
+        )
+        try:
+            await asyncio.wait_for(polling.wait(), 5)
+            # The first upgrade is waiting for its VM and holds the flight.
+            assert pa._workspace_upgrade_in_flight is True
+
+            await pa._handle_workspace_upgrade(second_ws, target_tier="vm")
+            assert _frames(second_ws) == [
+                (
+                    "workspace_upgrade.failed",
+                    {"reason": "A workspace upgrade is already running."},
+                )
+            ]
+            client.request_thread_workspace_upgrade.assert_awaited_once()
+
+            ready.set()
+            await asyncio.wait_for(first, 5)
+        finally:
+            if not first.done():
+                first.cancel()
+    assert _frames(first_ws) == [
+        ("workspace_upgrade.started", {"thread_id": "tid", "target_tier": "vm"}),
+        (
+            "workspace_upgrade.complete",
+            {"thread_id": "tid", "target_tier": "vm", "seeded_files": 7},
+        ),
+    ]
+    assert pa._workspace_upgrade_in_flight is False
+
+
+@pytest.mark.asyncio
+async def test_cancelling_a_blocked_websocket_upgrade_releases_the_single_flight(
+    monkeypatch,
+):
+    monkeypatch.setattr(pa, "_workspace_upgrade_in_flight", False)
+    polling = asyncio.Event()
+
+    async def poll(*_args, **_kwargs):
+        polling.set()
+        await asyncio.Event().wait()  # the VM never answers
+
+    ws, sess, client = AsyncMock(), _session(), _client()
+    p = _patches(sess, client, vm_cfg=None, poll=poll)
+    with p[0], p[1], p[2], p[3], p[4], p[5]:
+        upgrade = asyncio.create_task(
+            pa._handle_workspace_upgrade(ws, target_tier="vm")
+        )
+        await asyncio.wait_for(polling.wait(), 5)
+        assert pa._workspace_upgrade_in_flight is True
+
+        upgrade.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await upgrade
     assert pa._workspace_upgrade_in_flight is False
 
 
