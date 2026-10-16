@@ -3116,8 +3116,9 @@ nextcloud:
   #
   # Only the first install reads this. An installed Nextcloud keeps the
   # database its config.php names, so an existing SQLite install stays on
-  # SQLite next to an empty Postgres until it is converted with
-  # `occ db:convert-type`; the Pod does not wait for Postgres in that case.
+  # SQLite next to an empty Postgres until scripts/nextcloud-sqlite-to-postgres.py
+  # converts it (README: never a raw `occ db:convert-type`, which reuses the ids
+  # of deleted rows); the Pod does not wait for Postgres in that case.
   database:
     type: postgres
   # Nextcloud's background jobs (cron.php every 5 minutes) run in a `cron`
