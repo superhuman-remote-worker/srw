@@ -11,11 +11,15 @@ race a live turn, and the claimant records an idempotency marker in Git before
 writing the same owner-fenced journal receipt. Manual ``compact`` follows
 the same idle-only rule: the claimant summarizes the attached conversation
 and its fenced checkpoint row plus journal receipt are the effect.
+``upgrade-to-workspace`` (C1) is idle-only too, and its effect is admission
+itself: the lite Session becomes a pending container Session in the same
+commit as the request and the queue wake.
 """
 
 from __future__ import annotations
 
 import json
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 from uuid import UUID
@@ -30,8 +34,19 @@ from shared.run_queue import (
     UNIT_KIND_SESSION_TURN,
     record_control_seq,
 )
+from shared.workspace_upgrade import (
+    WORKSPACE_UPGRADE_PAYLOAD_KEYS,
+    WORKSPACE_UPGRADE_VERB,
+)
+from orchestrator.database.stateless_workspace_upgrade import (
+    StatelessUpgradeRefused,
+    begin_stateless_session_workspace_upgrade,
+)
 from orchestrator.services.stateless_workspace_gate import (
     stateless_session_workspace_check,
+)
+from orchestrator.services.stateless_workspace_upgrade import (
+    PINNED_TRANSPORT_REFUSAL,
 )
 
 
@@ -59,8 +74,33 @@ COMPACT_VERB = "compact"
 #: Effectful stateless-only controls: they change the workspace tree or the
 #: conversation the next turn runs on, so they are admitted only while no turn
 #: holds the lease and no committed human input is waiting ahead of them.
-IDLE_ONLY_VERBS = frozenset({WORKSPACE_UNDO_VERB, COMPACT_VERB})
+IDLE_ONLY_VERBS = frozenset({WORKSPACE_UNDO_VERB, COMPACT_VERB, WORKSPACE_UPGRADE_VERB})
+_IDLE_EFFECT_LABELS = {
+    WORKSPACE_UNDO_VERB: "workspace undo",
+    COMPACT_VERB: "compaction",
+    WORKSPACE_UPGRADE_VERB: "the workspace upgrade",
+}
 _COMPACT_PAYLOAD_KEYS = frozenset({"focus", "boundary_message_id"})
+
+
+def _valid_upgrade_payload(payload: dict[str, Any]) -> bool:
+    """The canonical ``upgrade-to-workspace`` payload, and nothing else."""
+    if not set(payload) <= WORKSPACE_UPGRADE_PAYLOAD_KEYS:
+        return False
+    if payload.get("target_tier") not in (None, "sandbox", "vm"):
+        return False
+    template = payload.get("template")
+    if template is not None and not (
+        isinstance(template, str) and 0 < len(template) <= 200
+    ):
+        return False
+    generation = payload.get("runtime_generation")
+    if not isinstance(generation, str):
+        return False
+    try:
+        return str(UUID(generation)) == generation
+    except ValueError:
+        return False
 
 
 def _json_object(value: Any) -> dict[str, Any]:
@@ -136,6 +176,7 @@ async def admit_thread_control(
     requested_by: str,
     expected_runtime_generation: UUID | str | None = None,
     require_pinned_runtime_generation: bool = False,
+    workspace_upgrade: Mapping[str, Any] | None = None,
 ) -> AdmittedControl:
     """Admit one already-authorized session-control request.
 
@@ -144,6 +185,9 @@ async def admit_thread_control(
     lifecycle and reciprocal pinned binding under the thread row lock.
     ``workspace.undo`` is deliberately absent from the pinned REST lane: the
     existing live WebSocket behavior remains authoritative there.
+    ``upgrade-to-workspace`` (C1) is stateless-only and idle-only; its
+    prepared ``workspace_upgrade`` record is applied by one transition on this
+    same transaction.
     """
     tid = UUID(str(thread_id))
     uid = UUID(str(owner_user_id)) if owner_user_id is not None else None
@@ -220,6 +264,11 @@ async def admit_thread_control(
                 raise ControlAdmissionError(
                     "compact accepts only a non-empty focus and boundary_message_id"
                 )
+            if verb == WORKSPACE_UPGRADE_VERB and not _valid_upgrade_payload(payload):
+                raise ControlAdmissionError(
+                    "upgrade-to-workspace accepts only target_tier, template and "
+                    "runtime_generation"
+                )
 
             lane = str(thread["execution_lane"] or "")
             current_generation = thread.get("runtime_generation")
@@ -249,6 +298,15 @@ async def admit_thread_control(
                     "Compaction uses the live session transport on the pinned "
                     "execution lane"
                 )
+            if verb == WORKSPACE_UPGRADE_VERB:
+                if lane != LANE_STATELESS:
+                    raise ControlAdmissionError(PINNED_TRANSPORT_REFUSAL)
+                # The generation is part of the canonical payload, so it must
+                # name the runtime this admission is about to change.
+                if payload["runtime_generation"] != str(current_generation):
+                    raise ControlAdmissionError(
+                        "Session runtime changed before control admission"
+                    )
             accepted_agent_id: UUID | None
             if lane == LANE_PINNED:
                 accepted_agent_id = thread["agent_id"]
@@ -303,9 +361,7 @@ async def admit_thread_control(
                     raise ControlAdmissionError(
                         "Session queue is parked; unpark it before sending controls"
                     )
-                effect_label = (
-                    "workspace undo" if verb == WORKSPACE_UNDO_VERB else "compaction"
-                )
+                effect_label = _IDLE_EFFECT_LABELS.get(verb, "compaction")
                 if verb in IDLE_ONLY_VERBS and queue_state == STATE_LEASED:
                     # Unlike scalar controls, undo changes the workspace tree
                     # and compact rewrites the conversation the turn runs on.
@@ -355,9 +411,28 @@ async def admit_thread_control(
                 "narration.set",
                 WORKSPACE_UNDO_VERB,
                 COMPACT_VERB,
+                WORKSPACE_UPGRADE_VERB,
             }:
                 # Caller validation is not an authorization boundary.
                 raise ControlAdmissionError("Unsupported control verb")
+            if verb == WORKSPACE_UPGRADE_VERB:
+                # C1: the idle lite Session becomes a container Session awaiting
+                # its first create, in the same commit as the request and the
+                # queue wake (spec "One transition"). A refusal aborts this
+                # transaction, so nothing below runs after it.
+                if workspace_upgrade is None:
+                    raise ControlAdmissionError(
+                        "This workspace upgrade was not prepared for admission"
+                    )
+                try:
+                    await begin_stateless_session_workspace_upgrade(
+                        conn,
+                        dict(thread),
+                        upgrade_config=workspace_upgrade["upgrade_config"],
+                        upgrade_sources=workspace_upgrade.get("upgrade_sources"),
+                    )
+                except StatelessUpgradeRefused as exc:
+                    raise ControlAdmissionError(str(exc)) from exc
             await conn.execute(
                 "UPDATE threads SET control_seq_hwm = $2, "
                 "last_activity = now() WHERE id = $1 "

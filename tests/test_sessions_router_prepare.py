@@ -1934,6 +1934,51 @@ def test_connection_advertises_idle_conversation_rewind_when_enabled(monkeypatch
     assert payload["conversation_revision"] == 4
 
 
+@pytest.mark.parametrize("tracking", [True, False])
+def test_connection_declares_the_container_upgrade_where_it_can_run(
+    monkeypatch, tracking
+):
+    from orchestrator.routers import sessions as sessions_mod
+
+    fastapi_app = FastAPI()
+    _install_fake_auth(monkeypatch)
+    # Keep the rewind block (and its database read) out of this response.
+    monkeypatch.delenv("SESSION_REWIND_IDLE_CONVERSATION_ENABLED", raising=False)
+    if tracking:
+        monkeypatch.setenv("CONTAINER_STARTUP_STAGE_AUTHORITY_ENABLED", "true")
+    else:
+        monkeypatch.delenv("CONTAINER_STARTUP_STAGE_AUTHORITY_ENABLED", raising=False)
+    fake_db = AsyncMock()
+    fake_db.get_thread.return_value = {
+        **_connection_thread(lane="stateless", agent_id=None),
+        "metadata": {"config_override": {"workspace": {"backend": "virtual"}}},
+    }
+    # No pool: the queue block degrades to None without a warning.
+    fake_db.acquire = None
+    fake_main = _fake_main(fake_db)
+    fake_main.container_provisioner.is_available = True
+    fake_main.container_provisioner.in_cluster = True
+    fastapi_app.state.sessions_dependencies_factory = lambda: fake_main.dependencies
+    fastapi_app.include_router(sessions_mod.router)
+
+    response = TestClient(fastapi_app).get(
+        f"/api/sessions/{CONNECTION_THREAD_ID}/connection"
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    if tracking:
+        assert payload["controls"]["upgrade-to-workspace"] == "rest"
+        assert payload["control_options"]["upgrade-to-workspace"] == {
+            "version": 1,
+            "targets": ["container"],
+            "requires_idle": True,
+        }
+    else:
+        assert "upgrade-to-workspace" not in payload["controls"]
+        assert "upgrade-to-workspace" not in payload["control_options"]
+
+
 def test_stateless_controls_never_advertise_a_socket_verb():
     """The socket-only verbs must not leak into the stateless declaration —
     a Cockpit that trusted such an entry would queue into the void again."""

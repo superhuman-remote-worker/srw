@@ -9,6 +9,7 @@ lease-owner duties.
 from __future__ import annotations
 
 import json
+from contextlib import asynccontextmanager
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -23,8 +24,13 @@ from orchestrator.services import agent_thread_status  # noqa: E402
 from fastapi import HTTPException
 from pydantic import ValidationError
 
+from orchestrator.database.stateless_workspace_upgrade import (
+    UPGRADE_NOT_POSSIBLE,
+    StatelessUpgradeRefused,
+)
 from orchestrator.routers import thread_session
 from orchestrator.schemas.thread_session import ThreadControlRequest
+from orchestrator.services import stateless_workspace_upgrade as swu
 from orchestrator.services.thread_control_inbox import (
     AdmittedControl,
     ControlAdmissionError,
@@ -189,7 +195,11 @@ def _unused(name: str):
 
 
 def _control_dependencies(
-    *, owner: Any, enforce: Any = None, store: Any = None
+    *,
+    owner: Any,
+    enforce: Any = None,
+    store: Any = None,
+    workspace_upgrade: Any = None,
 ) -> thread_session.ThreadSessionDependencies:
     """The control route's application collaborators: the owner gate and PDP.
 
@@ -206,6 +216,7 @@ def _control_dependencies(
             enforce if enforce is not None else _unused("enforce_session_create_grants")
         ),
         tool_view=SimpleNamespace(),
+        workspace_upgrade=workspace_upgrade,
     )
 
 
@@ -370,6 +381,7 @@ async def test_control_endpoint_admits_owner_request_without_exposing_lane():
         requested_by=str(OWNER_ID),
         expected_runtime_generation=None,
         require_pinned_runtime_generation=False,
+        workspace_upgrade=None,
     )
     audit.assert_awaited_once()
 
@@ -1678,3 +1690,255 @@ async def test_compact_payload_is_rechecked_inside_locked_admission(payload):
 
     assert not _calls(conn, "fetchrow", "FROM run_queue")
     assert not [call for call in conn.calls if call[0] == "execute"]
+
+
+UPGRADE_RECORD = {"upgrade_config": {"image": "r.example/c:1"}, "upgrade_sources": None}
+UPGRADE_PAYLOAD = {
+    "runtime_generation": str(RUNTIME_GENERATION),
+    "target_tier": "sandbox",
+}
+
+
+def test_public_upgrade_envelope_requires_the_session_generation():
+    with pytest.raises(ValidationError):
+        ThreadControlRequest(
+            client_request_id=CLIENT_REQUEST_ID, method="upgrade-to-workspace"
+        )
+    request = ThreadControlRequest(
+        client_request_id=CLIENT_REQUEST_ID,
+        method="upgrade-to-workspace",
+        target_tier="container",
+        template="container-minimal",
+        session_runtime_generation=RUNTIME_GENERATION,
+    )
+    assert request.control_payload() == {
+        "runtime_generation": str(RUNTIME_GENERATION),
+        "target_tier": "sandbox",
+        "template": "container-minimal",
+    }
+    bare = ThreadControlRequest(
+        client_request_id=CLIENT_REQUEST_ID,
+        method="upgrade-to-workspace",
+        session_runtime_generation=RUNTIME_GENERATION,
+    )
+    assert bare.control_payload() == {"runtime_generation": str(RUNTIME_GENERATION)}
+
+
+@pytest.mark.parametrize(
+    "fields",
+    [
+        {"method": "compact", "target_tier": "vm"},
+        {"method": "mode.set", "mode": "supervised", "template": "x"},
+        {"method": "upgrade-to-workspace", "mode": "supervised"},
+        {"method": "upgrade-to-workspace", "target_tier": "gpu"},
+        # Task 2's target resolver reads any other tier as a container
+        # request, so the envelope must refuse it before the route runs.
+        {"method": "upgrade-to-workspace", "target_tier": "virtual"},
+    ],
+)
+def test_upgrade_fields_belong_to_the_upgrade_verb_only(fields):
+    with pytest.raises(ValidationError):
+        ThreadControlRequest(
+            client_request_id=CLIENT_REQUEST_ID,
+            session_runtime_generation=RUNTIME_GENERATION,
+            **fields,
+        )
+
+
+def _upgrade_patch(**kwargs):
+    return patch(
+        "orchestrator.services.thread_control_inbox."
+        "begin_stateless_session_workspace_upgrade",
+        AsyncMock(**kwargs),
+    )
+
+
+async def _admit_upgrade(conn, *, payload=None, workspace_upgrade=UPGRADE_RECORD):
+    with patch(
+        "orchestrator.services.thread_control_inbox.stateless_session_workspace_check",
+        return_value=("virtual", None),
+    ):
+        return await admit_thread_control(
+            _ControlDB(conn),
+            thread_id=THREAD_ID,
+            owner_user_id=OWNER_ID,
+            client_request_id=CLIENT_REQUEST_ID,
+            verb="upgrade-to-workspace",
+            payload=UPGRADE_PAYLOAD if payload is None else payload,
+            requested_by=str(OWNER_ID),
+            expected_runtime_generation=RUNTIME_GENERATION,
+            workspace_upgrade=workspace_upgrade,
+        )
+
+
+@pytest.mark.asyncio
+async def test_workspace_upgrade_transitions_inside_the_admission_transaction():
+    conn = _ControlConn(thread=_thread(), queue_state="done", baseline_input_seq=3)
+    with _upgrade_patch(return_value={}) as begin:
+        result = await _admit_upgrade(conn)
+
+    assert result.verb == "upgrade-to-workspace"
+    begin.assert_awaited_once()
+    assert begin.await_args.args[0] is conn
+    assert begin.await_args.kwargs == {
+        "upgrade_config": UPGRADE_RECORD["upgrade_config"],
+        "upgrade_sources": None,
+    }
+    assert len(_calls(conn, "fetchval", "INSERT INTO thread_control_requests")) == 1
+    assert _calls(conn, "fetchval", "control_input_seq = GREATEST")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "queue,match",
+    [
+        ({"queue_state": "leased"}, "completing a turn"),
+        (
+            {"queue_state": "queued", "input_seq": 22, "consumed_seq": 21},
+            "pending input",
+        ),
+    ],
+)
+async def test_workspace_upgrade_is_idle_only_and_writes_nothing_early(queue, match):
+    conn = _ControlConn(thread=_thread(), **queue)
+    with (
+        _upgrade_patch() as begin,
+        pytest.raises(ControlAdmissionNotReady, match=match),
+    ):
+        await _admit_upgrade(conn)
+    begin.assert_not_awaited()
+    assert not _calls(conn, "fetchval", "INSERT INTO thread_control_requests")
+    assert not [call for call in conn.calls if call[0] == "execute"]
+
+
+@pytest.mark.asyncio
+async def test_workspace_upgrade_uses_the_socket_on_the_pinned_lane():
+    conn = _ControlConn(thread=_thread(execution_lane="pinned", agent_id=AGENT_ID))
+    with (
+        _upgrade_patch() as begin,
+        pytest.raises(ControlAdmissionError, match="live session transport"),
+    ):
+        await _admit_upgrade(conn)
+    begin.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_workspace_upgrade_needs_a_prepared_record():
+    conn = _ControlConn(thread=_thread(), queue_state="done")
+    with (
+        _upgrade_patch() as begin,
+        pytest.raises(ControlAdmissionError, match="not prepared"),
+    ):
+        await _admit_upgrade(conn, workspace_upgrade=None)
+    begin.assert_not_awaited()
+    assert not _calls(conn, "fetchval", "INSERT INTO thread_control_requests")
+
+
+@pytest.mark.asyncio
+async def test_a_refused_transition_is_a_conflict_and_inserts_nothing():
+    conn = _ControlConn(thread=_thread(), queue_state="done")
+    with _upgrade_patch(side_effect=StatelessUpgradeRefused(UPGRADE_NOT_POSSIBLE)):
+        with pytest.raises(ControlAdmissionError, match="can't be upgraded in place"):
+            await _admit_upgrade(conn)
+    assert not _calls(conn, "fetchval", "INSERT INTO thread_control_requests")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"runtime_generation": str(RUNTIME_GENERATION), "focus": "x"},
+        {"runtime_generation": "not-a-uuid"},
+        {"runtime_generation": str(RUNTIME_GENERATION), "template": ""},
+        {"runtime_generation": str(RUNTIME_GENERATION), "target_tier": "virtual"},
+        {"runtime_generation": str(UUID(int=5))},
+    ],
+)
+async def test_workspace_upgrade_payload_is_rechecked_inside_admission(payload):
+    conn = _ControlConn(thread=_thread(), queue_state="done")
+    with _upgrade_patch() as begin, pytest.raises(ControlAdmissionError):
+        await _admit_upgrade(conn, payload=payload)
+    begin.assert_not_awaited()
+
+
+class _LifecycleStore:
+    def __init__(self, order: list) -> None:
+        self.order = order
+
+    @asynccontextmanager
+    async def stateless_session_workspace_ensure_lock(
+        self, thread_id, *, wait=False, wait_timeout_s=30.0
+    ):
+        self.order.append(("lock", wait))
+        yield True
+        self.order.append(("unlock",))
+
+
+@pytest.mark.asyncio
+async def test_upgrade_admission_runs_inside_the_lifecycle_lock():
+    """Review Focus 4: uploads hold the same lock across resolve and write
+    (routers/thread_files.py:596), so an upload lands before the transition
+    or resolves to the container after it."""
+    order: list = []
+    thread = {
+        "id": THREAD_ID,
+        "user_id": OWNER_ID,
+        "project_id": None,
+        "execution_lane": "stateless",
+        "metadata": {"config_override": {"workspace": {"backend": "virtual"}}},
+    }
+    admitted = AdmittedControl(
+        id=REQUEST_ID,
+        request_seq=8,
+        client_request_id=CLIENT_REQUEST_ID,
+        verb="upgrade-to-workspace",
+        state="pending",
+        duplicate=False,
+        runtime_generation=RUNTIME_GENERATION,
+    )
+
+    async def admit(*_args, **kwargs):
+        order.append(("admit", kwargs["workspace_upgrade"]))
+        return admitted
+
+    prepare = AsyncMock(return_value=UPGRADE_RECORD)
+    upgrade_dependencies = swu.StatelessWorkspaceUpgradeDependencies(
+        container_provisioner=MagicMock(),
+        enforce_workspace_upgrade_grants=AsyncMock(),
+        schedule_stateless_workspace_ensure=lambda tid: order.append(("ensure", tid)),
+    )
+    with (
+        patch.object(
+            thread_session,
+            "find_existing_thread_control",
+            AsyncMock(return_value=None),
+        ),
+        patch.object(thread_session, "require_stateless_workspace", MagicMock()),
+        patch.object(thread_session, "prepare_stateless_workspace_upgrade", prepare),
+        patch.object(thread_session, "admit_thread_control", admit),
+        patch.object(thread_session, "log_security_event", AsyncMock()),
+    ):
+        response = await thread_session.submit_thread_control(
+            str(THREAD_ID),
+            ThreadControlRequest(
+                client_request_id=CLIENT_REQUEST_ID,
+                method="upgrade-to-workspace",
+                template="container-minimal",
+                session_runtime_generation=RUNTIME_GENERATION,
+            ),
+            MagicMock(),
+            dependencies=_control_dependencies(
+                owner=AsyncMock(return_value=({"id": OWNER_ID}, thread)),
+                store=_LifecycleStore(order),
+                workspace_upgrade=upgrade_dependencies,
+            ),
+        )
+
+    assert response["method"] == "upgrade-to-workspace"
+    assert prepare.await_args.kwargs["template_name"] == "container-minimal"
+    assert order == [
+        ("lock", True),
+        ("admit", UPGRADE_RECORD),
+        ("unlock",),
+        ("ensure", str(THREAD_ID)),
+    ]

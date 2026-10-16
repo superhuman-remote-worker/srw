@@ -251,3 +251,130 @@ async def test_transition_refuses_rows_it_cannot_upgrade(database, actor, change
 
     assert str(refused.value) == UPGRADE_NOT_POSSIBLE
     assert await database.get_thread(thread_id) == before
+
+
+from orchestrator.services.thread_control_inbox import (  # noqa: E402
+    ControlAdmissionError,
+    ControlAdmissionNotReady,
+    admit_thread_control,
+)
+from shared.run_queue import (  # noqa: E402
+    UNIT_KIND_SESSION_TURN,
+    claim_unit,
+    record_input_seq,
+)
+
+UPGRADE_RECORD = {"upgrade_config": UPGRADE_CONFIG, "upgrade_sources": UPGRADE_SOURCES}
+
+
+async def admit_upgrade(database, actor, thread_id, *, client_request_id=None):
+    thread = await database.get_thread(thread_id)
+    generation = str(thread["runtime_generation"])
+    return await admit_thread_control(
+        database,
+        thread_id=thread_id,
+        owner_user_id=actor["id"],
+        client_request_id=client_request_id or uuid4(),
+        verb="upgrade-to-workspace",
+        payload={"runtime_generation": generation, "target_tier": "sandbox"},
+        requested_by="real-pg",
+        expected_runtime_generation=generation,
+        workspace_upgrade=UPGRADE_RECORD,
+    )
+
+
+@pytest.mark.asyncio
+async def test_admission_commits_the_transition_the_request_and_the_wake(
+    database, actor
+):
+    thread_id = await lite_session(database, actor)
+    request_id = uuid4()
+
+    admitted = await admit_upgrade(
+        database, actor, thread_id, client_request_id=request_id
+    )
+
+    meta = metadata(await database.get_thread(thread_id))
+    assert meta["workspace_container"]["status"] == "pending"
+    assert "seed_from" in meta["workspace_container"]
+    request = await database.fetchrow(
+        "SELECT verb, payload, outcome FROM thread_control_requests WHERE id = $1",
+        admitted.id,
+    )
+    assert request["verb"] == "upgrade-to-workspace" and request["outcome"] is None
+    queue = await database.fetchrow(
+        "SELECT state, control_input_seq FROM run_queue WHERE unit_id = $1::uuid",
+        thread_id,
+    )
+    assert queue["state"] == "queued"
+    assert int(queue["control_input_seq"]) == admitted.request_seq
+
+    replay = await admit_upgrade(
+        database, actor, thread_id, client_request_id=request_id
+    )
+    assert replay.duplicate is True
+    assert metadata(await database.get_thread(thread_id)) == meta
+
+
+@pytest.mark.asyncio
+async def test_input_committed_first_defers_the_upgrade(database, actor):
+    """Review Focus 1."""
+    thread_id = await lite_session(database, actor)
+    async with database.acquire() as conn:
+        await record_input_seq(
+            conn, unit_id=thread_id, unit_kind=UNIT_KIND_SESSION_TURN, input_seq=5
+        )
+    before = await database.get_thread(thread_id)
+
+    with pytest.raises(ControlAdmissionNotReady, match="pending input"):
+        await admit_upgrade(database, actor, thread_id)
+
+    assert await database.get_thread(thread_id) == before
+    assert not await database.fetchval(
+        "SELECT count(*) FROM thread_control_requests WHERE thread_id = $1::uuid",
+        thread_id,
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_leased_turn_defers_the_upgrade(database, actor):
+    thread_id = await lite_session(database, actor)
+    async with database.acquire() as conn:
+        await record_input_seq(
+            conn, unit_id=thread_id, unit_kind=UNIT_KIND_SESSION_TURN, input_seq=5
+        )
+        assert await claim_unit(conn, unit_kind=UNIT_KIND_SESSION_TURN, pod_name="p-1")
+
+    with pytest.raises(ControlAdmissionNotReady, match="completing a turn"):
+        await admit_upgrade(database, actor, thread_id)
+
+
+@pytest.mark.asyncio
+async def test_input_after_the_transition_keeps_a_valid_container_row(database, actor):
+    """Review Focus 1: a message after the upgrade waits for the claim that
+    attaches the container; the row stays admissible at every boundary."""
+    thread_id = await lite_session(database, actor)
+    await admit_upgrade(database, actor, thread_id)
+    async with database.acquire() as conn:
+        state = await record_input_seq(
+            conn, unit_id=thread_id, unit_kind=UNIT_KIND_SESSION_TURN, input_seq=9
+        )
+    assert state == "queued"
+    assert stateless_workspace_check(await database.get_thread(thread_id)) == (
+        "sandbox",
+        None,
+    )
+
+
+@pytest.mark.asyncio
+async def test_end_first_refuses_the_upgrade(database, actor):
+    thread_id = await lite_session(database, actor)
+    begun = await database.begin_stateless_thread_workspace_retirement(
+        thread_id, force=False, permanent=False
+    )
+    assert begun["state"] != "busy"
+
+    # End committed first: the row is ended, so admission refuses before
+    # the transition (no request, no wake).
+    with pytest.raises(ControlAdmissionError, match="not currently able"):
+        await admit_upgrade(database, actor, thread_id)

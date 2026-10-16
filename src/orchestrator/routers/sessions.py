@@ -78,10 +78,14 @@ from orchestrator.services.session_runtime_admission import (
     thread_runtime_is_preparable,
     thread_runtime_refusal_detail,
 )
+from orchestrator.services.stateless_workspace_upgrade import (
+    workspace_upgrade_targets,
+)
 from shared.pinned_session_identity import (
     PinnedSessionBinding,
 )
 from shared.run_queue import LANE_PINNED, LANE_STATELESS
+from shared.workspace_upgrade import WORKSPACE_UPGRADE_VERB
 
 logger = logging.getLogger(__name__)
 
@@ -929,10 +933,10 @@ PINNED_CONTROLS: dict[str, ControlTransport] = {
 #: next claim's attach — the same turn-boundary semantics the pane already
 #: documents); the scalar verbs, workspace undo and manual compaction ride the
 #: control inbox (compact: session_slash_commands_and_stateless_compact.md §3).
-#: ``archive`` / ``upgrade-to-workspace`` have no stateless transport (End is
-#: the owner DELETE; there is no stateless tier upgrade) and ``rewind`` is added
-#: per request below; absent verbs are deliberately ABSENT rather than mapped to
-#: something that drops them.
+#: ``upgrade-to-workspace`` is declared per request on lite Sessions where
+#: startup tracking is on (C1), like ``rewind``; ``archive`` has no stateless
+#: transport (End is the owner DELETE). Absent verbs are deliberately ABSENT
+#: rather than mapped to something that drops them.
 STATELESS_CONTROLS: dict[str, ControlTransport] = {
     "config.update": "rest",
     "workspace.undo": "rest",
@@ -1050,6 +1054,18 @@ async def get_connection(
             )
         controls = dict(STATELESS_CONTROLS)
         control_options: dict[str, Any] = {}
+        upgrade_targets = workspace_upgrade_targets(
+            thread, container_provisioner=dependencies.container_provisioner
+        )
+        if upgrade_targets:
+            # Declared per request (like rewind): only where startup tracking
+            # can report a failed create (spec decision, 2026-10-07).
+            controls[WORKSPACE_UPGRADE_VERB] = "rest"
+            control_options[WORKSPACE_UPGRADE_VERB] = {
+                "version": 1,
+                "targets": upgrade_targets,
+                "requires_idle": True,
+            }
         officer = False
         if stateless_idle_conversation_rewind_enabled() and (
             str(thread.get("kind") or "") == "session"

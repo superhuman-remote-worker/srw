@@ -41,6 +41,7 @@ from orchestrator.services import (
     session_tool_view as session_tool_view_operations,
     stateless_input_admission as stateless_input_operations,
     stateless_workspace_scheduler,
+    stateless_workspace_upgrade as stateless_workspace_upgrade_service,
     workspace_suspension,
 )
 from shared.runtime.core import model_registry
@@ -87,6 +88,21 @@ def session_tool_view_dependencies(
     )
 
 
+def stateless_workspace_upgrade_dependencies(
+    resources: ApplicationResources,
+) -> stateless_workspace_upgrade_service.StatelessWorkspaceUpgradeDependencies:
+    config = sessions_composition.thread_config_update_dependencies(resources)
+    return stateless_workspace_upgrade_service.StatelessWorkspaceUpgradeDependencies(
+        container_provisioner=config.container_provisioner,
+        enforce_workspace_upgrade_grants=config.enforce_workspace_upgrade_grants,
+        schedule_stateless_workspace_ensure=bound(
+            stateless_workspace_scheduler.schedule_stateless_workspace_ensure,
+            preparation_composition.stateless_workspace_schedule_dependencies,
+            resources,
+        ),
+    )
+
+
 def thread_session_dependencies(
     resources: ApplicationResources,
 ) -> thread_session_routes.ThreadSessionDependencies:
@@ -110,6 +126,7 @@ def thread_session_dependencies(
             resources,
         ),
         tool_view=session_tool_view_dependencies(resources),
+        workspace_upgrade=stateless_workspace_upgrade_dependencies(resources),
     )
 
 

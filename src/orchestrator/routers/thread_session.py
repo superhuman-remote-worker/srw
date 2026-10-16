@@ -35,6 +35,10 @@ from orchestrator.services.session_runtime_admission import (
 )
 from orchestrator.services.session_state_snapshot import build_session_state_snapshot
 from orchestrator.services.stateless_workspace_gate import thread_metadata_object
+from orchestrator.services.stateless_workspace_upgrade import (
+    StatelessWorkspaceUpgradeDependencies,
+    prepare_stateless_workspace_upgrade,
+)
 from orchestrator.services.thread_control_inbox import (
     ControlAdmissionError,
     ControlAdmissionNotReady,
@@ -44,6 +48,7 @@ from orchestrator.services.thread_control_inbox import (
 from orchestrator.services.thread_mount_rows import durable_project_ids
 from orchestrator.services.thread_projection import redact_thread_metadata
 from orchestrator.services.vm_idle_public import read_vm_idle_states
+from shared.workspace_upgrade import WORKSPACE_UPGRADE_VERB
 
 logger = logging.getLogger(__name__)
 
@@ -63,6 +68,7 @@ class ThreadSessionDependencies:
     resolve_session_config: Callable[..., Awaitable[dict[str, Any] | None]]
     enforce_session_create_grants: Callable[..., Awaitable[Any]]
     tool_view: session_tool_view.SessionToolViewDependencies
+    workspace_upgrade: StatelessWorkspaceUpgradeDependencies | None = None
 
 
 def get_thread_session_dependencies(request: Request) -> ThreadSessionDependencies:
@@ -338,9 +344,30 @@ async def submit_thread_control(
             if existing is None:
                 raise
 
+    workspace_upgrade: dict[str, Any] | None = None
+    upgrade_dependencies = dependencies.workspace_upgrade
+    if body.method == WORKSPACE_UPGRADE_VERB and existing is None:
+        # Pre-admission checks outside the row locks (lane, target, startup
+        # tracking, protection, grants, provisioner, template); admission
+        # re-proves the row facts under them. A committed UUID skips them,
+        # like mode.set's grant check above.
+        if upgrade_dependencies is None:
+            raise HTTPException(
+                status_code=409,
+                detail="Workspace upgrades aren't available in this session.",
+            )
+        workspace_upgrade = await prepare_stateless_workspace_upgrade(
+            store,
+            thread,
+            target_tier=body.target_tier,
+            template_name=body.template,
+            dependencies=upgrade_dependencies,
+        )
+
     actor_id = str(user.get("id") or user.get("sub") or "rest_client")
-    try:
-        admitted = await admit_thread_control(
+
+    async def _admit() -> Any:
+        return await admit_thread_control(
             store,
             thread_id=thread_id,
             owner_user_id=thread_owner_id,
@@ -350,7 +377,32 @@ async def submit_thread_control(
             requested_by=actor_id,
             expected_runtime_generation=body.session_runtime_generation,
             require_pinned_runtime_generation=require_control_generation,
+            workspace_upgrade=workspace_upgrade,
         )
+
+    try:
+        if workspace_upgrade is not None:
+            # The upgrade takes the stateless lifecycle lock that End, Resume,
+            # uploads and the ensure scheduler hold (lock order: lifecycle ->
+            # threads -> run_queue), so an upload resolved to the old prefix
+            # finishes first and a racing End is serialized.
+            try:
+                async with store.stateless_session_workspace_ensure_lock(
+                    thread_id, wait=True
+                ) as lifecycle_owner:
+                    if not lifecycle_owner:
+                        raise HTTPException(
+                            status_code=503,
+                            detail="Stateless workspace lifecycle lock unavailable",
+                        )
+                    admitted = await _admit()
+            except TimeoutError as exc:
+                raise HTTPException(
+                    status_code=503,
+                    detail="Stateless workspace lifecycle lock timed out",
+                ) from exc
+        else:
+            admitted = await _admit()
     except ControlAdmissionNotReady as exc:
         # Registration intentionally keeps the exact pinned-owner capability
         # closed until its writer and first inbox drain are ready.  A control
@@ -359,6 +411,14 @@ async def submit_thread_control(
         raise HTTPException(status_code=425, detail=str(exc)) from exc
     except ControlAdmissionError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    if (
+        workspace_upgrade is not None
+        and upgrade_dependencies is not None
+        and not admitted.duplicate
+    ):
+        # After the lock is released: the ensure task takes it itself.
+        upgrade_dependencies.schedule_stateless_workspace_ensure(thread_id)
 
     await log_security_event(
         store,
