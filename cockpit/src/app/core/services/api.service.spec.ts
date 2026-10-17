@@ -220,6 +220,18 @@ describe('ApiService.transcribeVoice', () => {
     expect(await pending).toEqual({text: 'hello world'});
   });
 
+  it('transcribes on the landing draft through the account route', async () => {
+    const file = new File([new Uint8Array([1, 2, 3])], 'voice.webm', {type: 'audio/webm'});
+    const pending = firstValueFrom(api.transcribeVoice(null, file));
+
+    const req = httpMock.expectOne((r) => r.url.endsWith('/voice/transcribe'));
+    expect(req.request.method).toBe('POST');
+    expect((req.request.body as FormData).get('audio')).toBeInstanceOf(File);
+
+    req.flush({text: 'draft words'});
+    expect(await pending).toEqual({text: 'draft words'});
+  });
+
   it('maps a 204 response to "unavailable"', async () => {
     const blob = new Blob([new Uint8Array([1])], {type: 'audio/webm'});
     const pending = firstValueFrom(api.transcribeVoice('t', blob));

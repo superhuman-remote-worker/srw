@@ -284,8 +284,35 @@ async def transcribe_thread_audio_endpoint(
     )
 
     data = await audio.read()
-    return await voice.transcribe_thread_audio(
+    return await voice.transcribe_audio(
         thread_id=thread_id,
+        user_id=str(user["id"]),
+        data=data,
+        filename=audio.filename or "voice.webm",
+        dependencies=dependencies.operations,
+    )
+
+
+@router.post("/api/voice/transcribe")
+async def transcribe_audio_endpoint(
+    request: Request,
+    audio: UploadFile = File(...),
+    *,
+    dependencies: VoiceDependencies = Depends(get_voice_dependencies),
+) -> Response:
+    """Transcribe a recording made before any session exists.
+
+    The landing draft (New chat) creates its session on first send, so the
+    composer has no thread to transcribe through. Nothing here needs one: the
+    STT model and key are the user's own. Same body and responses as
+    ``POST /api/persistent/threads/{thread_id}/transcribe``; the usage event
+    simply carries no thread. A session keeps using its own route.
+    """
+    user = await dependencies.require_approved_user(request, dependencies.store)
+
+    data = await audio.read()
+    return await voice.transcribe_audio(
+        thread_id=None,
         user_id=str(user["id"]),
         data=data,
         filename=audio.filename or "voice.webm",

@@ -1,7 +1,8 @@
 """Tests for the persistent-session speech-to-text path.
 
 Covers the transcribe service (``orchestrator/services/transcribe.py``) and the
-``POST /api/persistent/threads/{id}/transcribe`` endpoint wiring in main.py.
+``POST /api/persistent/threads/{id}/transcribe`` and ``POST /api/voice/transcribe``
+endpoint wiring.
 
 The service is tested in isolation by patching the shared credential resolver
 and the ``AsyncOpenAI`` client (mirrors ``tests/test_audio_helper.py``). The
@@ -284,7 +285,7 @@ class TestTranscribeService:
 # ---------------------------------------------------------------------------
 
 
-def _voice_route_deps(*, db=None, ledger=None):
+def _voice_route_deps(*, db=None, ledger=None, approved=None):
     """Route dependencies for the extracted voice router.
 
     The transcribe endpoint moved out of ``main`` into
@@ -300,9 +301,13 @@ def _voice_route_deps(*, db=None, ledger=None):
     async def _owner(_request, _store, _thread_id):
         return {"id": "u1"}, {"id": "t1"}
 
+    async def _approved(_request, _store):
+        return {"id": "u1"}
+
     return _RouteDeps(
         store=store,
         operations=_OpDeps(store=store, logger=MagicMock(), ledger=ledger),
+        require_approved_user=approved or _approved,
         require_thread_owner=_owner,
     )
 
@@ -411,6 +416,89 @@ class TestTranscribeEndpoint:
 
 
 # ---------------------------------------------------------------------------
+# Endpoint: POST /api/voice/transcribe (landing draft, no session yet)
+# ---------------------------------------------------------------------------
+
+
+class TestAccountTranscribeEndpoint:
+    def test_route_is_registered(self):
+        from orchestrator.main import app
+        from tests._route_inventory import mounted_routes
+
+        assert ("POST", "/api/voice/transcribe") in mounted_routes(app)
+
+    @pytest.mark.asyncio
+    async def test_returns_text_and_attributes_no_thread(self):
+        from orchestrator.routers import voice as voice_routes
+
+        service = AsyncMock(return_value="draft words")
+        with patch("orchestrator.services.transcribe.transcribe_thread_audio", service):
+            resp = await voice_routes.transcribe_audio_endpoint(
+                request=MagicMock(),
+                audio=_upload(b"\x00\x01\x02"),
+                dependencies=_voice_route_deps(),
+            )
+        assert resp.status_code == 200
+        assert json.loads(resp.body) == {"text": "draft words"}
+        assert service.await_args.kwargs["user_id"] == "u1"
+        assert service.await_args.kwargs["ref_id"] is None
+
+    @pytest.mark.asyncio
+    async def test_204_when_unavailable(self):
+        from orchestrator.routers import voice as voice_routes
+
+        with patch(
+            "orchestrator.services.transcribe.transcribe_thread_audio",
+            AsyncMock(return_value=None),
+        ):
+            resp = await voice_routes.transcribe_audio_endpoint(
+                request=MagicMock(),
+                audio=_upload(b"\x00\x01"),
+                dependencies=_voice_route_deps(),
+            )
+        assert resp.status_code == 204
+
+    @pytest.mark.asyncio
+    async def test_502_on_transcription_error(self):
+        from fastapi import HTTPException
+
+        from orchestrator.routers import voice as voice_routes
+        from orchestrator.services.transcribe import TranscriptionError
+
+        with patch(
+            "orchestrator.services.transcribe.transcribe_thread_audio",
+            AsyncMock(side_effect=TranscriptionError("down")),
+        ):
+            with pytest.raises(HTTPException) as exc:
+                await voice_routes.transcribe_audio_endpoint(
+                    request=MagicMock(),
+                    audio=_upload(b"\x00\x01"),
+                    dependencies=_voice_route_deps(),
+                )
+        assert exc.value.status_code == 502
+
+    @pytest.mark.asyncio
+    async def test_unapproved_user_is_refused_before_transcribing(self):
+        from fastapi import HTTPException
+
+        from orchestrator.routers import voice as voice_routes
+
+        async def _refuse(_request, _store):
+            raise HTTPException(status_code=403, detail="Account pending approval")
+
+        service = AsyncMock(return_value="never")
+        with patch("orchestrator.services.transcribe.transcribe_thread_audio", service):
+            with pytest.raises(HTTPException) as exc:
+                await voice_routes.transcribe_audio_endpoint(
+                    request=MagicMock(),
+                    audio=_upload(b"\x00\x01"),
+                    dependencies=_voice_route_deps(approved=_refuse),
+                )
+        assert exc.value.status_code == 403
+        service.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
 # Usage metering (rate-limiting v2): STT is metered per request, non-fatally.
 # ---------------------------------------------------------------------------
 
@@ -452,8 +540,34 @@ class TestTranscribeMetering:
         assert ev.unit == "stt-request"
         assert ev.quantity == 1
         assert ev.resource == "whisper-1"
+        assert ev.ref_kind == "thread"
         assert ev.ref_id == "t1"
         assert ev.details["bytes"] == 3
+
+    @pytest.mark.asyncio
+    async def test_draft_dictation_records_an_unreferenced_event(self):
+        from orchestrator.services.transcribe import transcribe_thread_audio
+
+        cls, _ = _mock_openai("hi")
+        led = _mock_ledger()
+        with (
+            patch("orchestrator.services.transcribe.AsyncOpenAI", cls),
+            patch(
+                "orchestrator.services.transcribe.resolve_capability_credentials",
+                AsyncMock(return_value=_credentials("whisper-1", None, "sk-key")),
+            ),
+        ):
+            await transcribe_thread_audio(
+                audio_bytes=b"\x00",
+                filename="voice.webm",
+                user_id="u1",
+                postgres_db=_mock_db(),
+                ledger=led,
+                ref_id=None,
+            )
+        (events,), _ = led.record_events.call_args
+        assert (events[0].ref_kind, events[0].ref_id) == (None, None)
+        assert events[0].user_id == "u1"
 
     @pytest.mark.asyncio
     async def test_metering_failure_does_not_drop_transcript(self):
