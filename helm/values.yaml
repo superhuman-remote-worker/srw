@@ -237,10 +237,11 @@ connectors:
     # allowed: the cluster's nodes (kube-apiserver, kubelet, etcd) and its
     # load balancers. Empty uses the `except` lists of the workspace tiers
     # named in privateTiers (workspace.networkPolicy.tiers), so a driver pod
-    # reaches no more than that tier's workspaces do. Those defaults are one
-    # installation's ranges: the orchestrator refuses to host unless its own
-    # node's address is refused to driver pods, so set the cluster's node
-    # ranges here (k3d: the docker network) when they differ.
+    # reaches no more than that tier's workspaces do. The default home-allowed
+    # tier names only the k3s pod/service ranges, not the nodes: the
+    # orchestrator refuses to host unless its own node's address is refused
+    # to driver pods, so set the cluster's node and load-balancer ranges here
+    # (k3d: the docker network) or add them to that tier's `except`.
     refusedCidrs: []
     # -- Pin AAAA answers too (dual-stack clusters only).
     ipv6: false
@@ -1039,21 +1040,26 @@ agent:
   networkPolicy:
     # -- DEFAULT OFF (opt-in). External LLM/Keycloak/Tavily work over the 443
     # wildcard out of the box, but a deployment whose LLM, Keycloak, or cloud
-    # lives on an RFC1918 address (in-cluster other-namespace, or the home LAN)
+    # lives on a private address (in-cluster other-namespace, or the LAN)
     # MUST add an `extraEgress` carve-out before enabling, or agents lose model
-    # access. See knowledge-base/knowledge/issues/agent_egress_networkpolicy_enablement.md.
+    # access. The policy has no rule for the bundled Gitea yet, whose API the
+    # agent's repository tools (pull requests) call, so add one there too.
+    # See knowledge-base/knowledge/issues/agent_egress_networkpolicy_enablement.md.
     enabled: false
-    # -- CIDRs subtracted from the 0.0.0.0/0 internet egress allow. Cluster
-    # CIDRs + home LAN + link-local/metadata denied by default (prod-safe,
-    # matches the workspace `internet-only` tier); in-cluster services stay
-    # reachable only via the explicit podSelector rules in the template.
+    # -- CIDRs subtracted from the 0.0.0.0/0 internet egress allow: every
+    # private, shared (CGNAT), loopback and link-local/metadata range, so the
+    # cluster's pods, services, nodes and load balancers and the LAN are all
+    # denied whatever ranges this cluster uses (matches the workspace
+    # `internet-only` tier). In-cluster services stay reachable only via the
+    # explicit podSelector rules in the template.
     except:
-      - 10.0.50.0/24       # K3s nodes
-      - 10.0.51.0/24       # MetalLB IPs (use podSelector for in-cluster services)
-      - 10.42.0.0/16       # pod CIDR
-      - 10.43.0.0/16       # service CIDR
-      - 192.168.178.0/24   # home LAN
-      - 169.254.0.0/16     # link-local / cloud-metadata
+      - 0.0.0.0/8          # "this" network
+      - 10.0.0.0/8         # RFC 1918 (k3s pod/service CIDRs 10.42/10.43 included)
+      - 100.64.0.0/10      # shared address space (CGNAT)
+      - 127.0.0.0/8        # loopback
+      - 169.254.0.0/16     # link-local / cloud metadata
+      - 172.16.0.0/12      # RFC 1918 (docker and k3d networks included)
+      - 192.168.0.0/16     # RFC 1918
     # -- Extra egress rules appended verbatim to the policy (raw NetworkPolicy
     # egress entries). Use for an in-cluster LLM in another namespace
     # (namespaceSelector) or a LAN LLM/Keycloak/cloud endpoint (ipBlock) that
@@ -3558,36 +3564,46 @@ workspace:
     # If set, the orchestrator init seeder bumps this user's default
     # project to `network_tier='home-allowed'` on first boot (idempotent,
     # one-way: never moves a project off home-allowed). Intended for
-    # operator/homelab installs where the cluster admin needs their own
-    # workspaces to reach the home LAN. Leave empty in SaaS deployments.
+    # self-hosted installs where the cluster admin needs their own
+    # workspaces to reach the LAN. Leave empty in multi-tenant deployments.
     operatorHomeAllowedEmail: ""
     # The closed set of named tiers. Order is irrelevant; the orchestrator
     # references each tier by name. The set must stay in sync with the
     # CHECK constraint in 0016_project_network_tier.sql — widening here
     # without a migration leaves stranded label values.
+    #
+    # Helm replaces a list as a whole: an overlay that changes one tier's
+    # `except` redeclares both tiers.
     tiers:
       - name: internet-only
-        # Default tier. Public internet TCP 80/443/22 (ipBlock-bounded),
-        # cluster CIDRs + home LAN + link-local denied. The orchestrator
-        # treats this as the implicit fallback for pods lacking the
-        # network-tier label (legacy/pre-migration).
+        # Default tier. Public internet TCP 80/443/22 (ipBlock-bounded):
+        # every private, shared (CGNAT), loopback and link-local/metadata
+        # range is denied, so the cluster's pods, services, nodes and load
+        # balancers and the LAN are unreachable whatever ranges this cluster
+        # uses. The orchestrator treats this as the implicit fallback for
+        # pods lacking the network-tier label (legacy/pre-migration).
         except:
-          - 10.0.50.0/24       # K3s nodes
-          - 10.0.51.0/24       # MetalLB IPs (use podSelector for in-cluster services)
-          - 10.42.0.0/16       # pod CIDR
-          - 10.43.0.0/16       # service CIDR
-          - 192.168.178.0/24   # home LAN
-          - 169.254.0.0/16     # link-local / cloud-metadata
+          - 0.0.0.0/8          # "this" network
+          - 10.0.0.0/8         # RFC 1918 (k3s pod/service CIDRs 10.42/10.43 included)
+          - 100.64.0.0/10      # shared address space (CGNAT)
+          - 127.0.0.0/8        # loopback
+          - 169.254.0.0/16     # link-local / cloud metadata
+          - 172.16.0.0/12      # RFC 1918 (docker and k3d networks included)
+          - 192.168.0.0/16     # RFC 1918
       - name: home-allowed
-        # Operator/homelab tier: home LAN added back to the allowlist.
-        # Cluster CIDRs + link-local stay denied (in-cluster services
-        # remain reachable only via the explicit podSelector rules below).
+        # Self-hosted tier: private and LAN addresses are reachable, the
+        # cluster's own pod and service ranges and link-local/metadata stay
+        # denied (in-cluster services remain reachable only via the explicit
+        # podSelector rules). The defaults are the k3s pod/service CIDRs.
+        # On another distribution, replace them with the cluster's ranges.
+        # Add the node and load-balancer ranges too, or a home-allowed
+        # workspace reaches the nodes' SSH and HTTP(S) ports.
         except:
-          - 10.0.50.0/24       # K3s nodes
-          - 10.0.51.0/24       # MetalLB IPs
-          - 10.42.0.0/16       # pod CIDR
-          - 10.43.0.0/16       # service CIDR
-          - 169.254.0.0/16     # link-local / cloud-metadata
+          - 0.0.0.0/8          # "this" network
+          - 10.42.0.0/16       # k3s pod CIDR
+          - 10.43.0.0/16       # k3s service CIDR
+          - 127.0.0.0/8        # loopback
+          - 169.254.0.0/16     # link-local / cloud metadata
     # -- Extra egress rules appended verbatim to EVERY tier policy (raw
     # NetworkPolicy egress entries). Intended for deployment-specific holes
     # the cluster-CIDR hardening would otherwise close — e.g. local k3d adds
