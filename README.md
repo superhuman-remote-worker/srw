@@ -94,17 +94,18 @@ runs the same chart on a single-node [k3d](https://k3d.io) cluster.
 You need a Linux host with at least **8 vCPU and 16 GiB RAM**, plus Docker,
 `kubectl`, Helm 3.12+, k3d, OpenSSL, and an SSH client. The default multi-host
 local profile also needs `mkcert`; the single-origin profile does not. You need
-an API key for at least one configured LLM provider. See the
-[complete local prerequisites](docs/local-kubernetes.md#prerequisites) before
-starting.
+an [OpenRouter](https://openrouter.ai/keys) API key: that one key covers the
+chat, embedding and rerank models SRW requires (see [Models](docs/models.md)).
+See the [complete local prerequisites](docs/local-kubernetes.md#prerequisites)
+before starting.
 
 ```bash
 git clone https://github.com/superhuman-remote-worker/srw.git
 cd srw
 
-# Add at least one OPENAI_API_KEY, ANTHROPIC_API_KEY, or GROQ_API_KEY.
-# Optionally declare providers, models and default pins under `llm.seed`
-# so a rebuilt cluster needs no Settings → Models setup.
+# Paste your OpenRouter key into llm.seed.systemApiKeys.openrouter.value.
+# The file already seeds a chat model, the Qwen embedding and reranker, and
+# their defaults from that key (docs/models.md covers other providers).
 cp deployment/values-local.yaml.example deployment/values-local.yaml
 $EDITOR deployment/values-local.yaml
 

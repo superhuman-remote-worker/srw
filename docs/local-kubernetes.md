@@ -79,9 +79,14 @@ cp deployment/values-local.yaml.example deployment/values-local.yaml
 $EDITOR deployment/values-local.yaml
 ```
 
-Add at least one of `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, or `GROQ_API_KEY`
-under `secrets.values`. A Tavily key is optional and enables the corresponding
-web-search tools.
+Paste an [OpenRouter](https://openrouter.ai/keys) API key into
+`llm.seed.systemApiKeys.openrouter.value` near the end of the file. The file
+already declares a chat model, the Qwen3 embedding and reranker models, and
+their defaults on that key, which is everything SRW needs before it accepts
+sessions and jobs. [Models](models.md) explains the roles and how to use other
+providers. A key left empty is skipped: paste it later and run the upgrade
+command from [Daily lifecycle](#daily-lifecycle). A Tavily key under `secrets.values` is optional and enables the
+corresponding web-search tools.
 
 The copied file is gitignored because it may contain real provider keys. Its
 remaining credentials are fixed development values. Never reuse it for a
@@ -285,9 +290,12 @@ session. The UI should advance through thread creation, agent provisioning,
 runtime startup, and WebSocket connection. Send a short prompt and confirm a
 streamed reply.
 
-The platform path can be healthy even if the reply reports an invalid provider
-key. Correct the key in `deployment/values-local.yaml`, then run the upgrade
-command below.
+If session creation reports that the system is not ready, the model setup is
+incomplete: usually the OpenRouter key was empty at install. The platform path
+can also be healthy while the reply reports an invalid provider key. In both
+cases, correct the key in `deployment/values-local.yaml` and run the upgrade
+command below. The local file marks the key `reconcile: true`, so the upgrade
+replaces the stored key.
 
 Confirm that agent and workspace pods were created when the selected workspace
 requires them:
