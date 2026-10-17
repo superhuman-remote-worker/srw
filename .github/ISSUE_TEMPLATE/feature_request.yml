@@ -1,0 +1,33 @@
+name: Feature request
+description: Suggest a change or a new capability.
+title: "[feature] "
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        For open-ended questions and ideas that are not yet a concrete request, start a [discussion](https://github.com/superhuman-remote-worker/srw/discussions) instead.
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What you are trying to do, and what gets in the way today.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed behavior
+      description: What you would like SRW to do. Acceptance criteria help.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives and workarounds
+      description: Other approaches you considered, and what you do now.
+  - type: textarea
+    id: context
+    attributes:
+      label: Context
+      description: Your setup, scale, or anything else that shapes the request.

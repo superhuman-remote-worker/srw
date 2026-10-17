@@ -1,34 +1,20 @@
-# Pull Request Template
+## What and why
 
-## Description
+<!-- The problem this solves and the behavior you chose. Link the issue: Fixes #123 -->
 
-Please include a summary of the change and which issue is fixed. Please also include relevant motivation and context. List any dependencies that are required for this change.
+## How it was verified
 
-Fixes # (issue)
+<!-- The exact commands you ran (pytest files, npx vitest specs, helm lint)
+and anything you exercised in a running installation. -->
 
-## Type of change
+## Operator impact
 
-Please delete options that are not relevant.
+<!-- Delete this section when nothing changes for an existing installation.
+Otherwise name the migration, the changed default or values key, or the new
+Secret key, and what an operator must do before upgrading. Mark the commit
+with `!` (for example `fix(helm)!:`) and put the instruction in a
+`BREAKING CHANGE:` footer; the release notes copy it (docs/versioning.md). -->
 
-- [ ] Bug fix (non-breaking change which fixes an issue)
-- [ ] New feature (non-breaking change which adds functionality)
-- [ ] Breaking change (fix or feature that would cause existing functionality to not work as expected)
-- [ ] This change requires a documentation update
-
-## How Has This Been Tested?
-
-Please describe the tests that you ran to verify your changes. Provide instructions so we can reproduce. Please also list any relevant details for your test configuration
-
-- [ ] Test A
-- [ ] Test B
-
-## Checklist:
-
-- [ ] My code follows the style guidelines of this project
-- [ ] I have performed a self-review of my own code
-- [ ] I have commented my code, particularly in hard-to-understand areas
-- [ ] I have made corresponding changes to the documentation
-- [ ] My changes generate no new warnings
-- [ ] I have added tests that prove my fix is effective or that my feature works
-- [ ] New and existing unit tests pass locally with my changes
-- [ ] Any dependent changes have been merged and published in downstream modules
+- [ ] Tests cover the changed behavior.
+- [ ] User-visible Cockpit text is in both `en.json` and `de-DE.json`.
+- [ ] No keys, tokens, private hostnames or customer data in the diff.

@@ -1,0 +1,63 @@
+name: Bug report
+description: Something in a running installation does not work as documented.
+title: "[bug] "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        For a chart that does not install or upgrade, use **Install or upgrade problem** instead. Report a suspected vulnerability privately, as [SECURITY.md](https://github.com/superhuman-remote-worker/srw/blob/main/SECURITY.md) describes, not here.
+
+        **Remove API keys, passwords, tokens and private hostnames from everything you paste.**
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: The chart version, or the commit for a source checkout.
+      placeholder: 0.1.0
+    validations:
+      required: true
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - Cockpit (web UI)
+        - Sessions
+        - Jobs
+        - Workspaces (container or VM)
+        - Connectors, cloud folders or knowledge base
+        - Models and providers
+        - Helm chart
+        - MCP server
+        - Other
+    validations:
+      required: true
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What you saw, and what you expected instead.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. Start a session with the developer expert on a sandbox workspace
+        2. Ask it to ...
+        3. ...
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: Kubernetes distribution and version, the models involved, the workspace backend, and the browser for a Cockpit problem.
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant logs
+      description: Orchestrator or agent logs, or the browser console, around the time it happened.
+      render: shell
