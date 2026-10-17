@@ -2,10 +2,11 @@
 # Local development overlay — TEMPLATE
 # =============================================================================
 # This file is committed to git. Copy it to `values-local.yaml` (gitignored)
-# and fill in your LLM provider keys before installing.
+# and paste your OpenRouter API key into `llm.seed` (end of file) before
+# installing. That one key covers every model SRW needs; see docs/models.md.
 #
 #   cp deployment/values-local.yaml.example deployment/values-local.yaml
-#   $EDITOR deployment/values-local.yaml   # paste at least one LLM key
+#   $EDITOR deployment/values-local.yaml   # llm.seed.systemApiKeys.openrouter.value
 #   helm dependency build ./helm
 #   helm install srw ./helm -n srw --create-namespace -f deployment/values-local.yaml
 #
@@ -75,10 +76,10 @@ secrets:
     # openssl rand -base64 32
     APP_ENCRYPTION_KEY: "B9THPyad3JGXoycrYu4vn90FUogTP+URXFQxPQLB3CU="
 
-    # LLM provider keys — paste at least one for the agent to actually work
-    OPENAI_API_KEY: ""
-    ANTHROPIC_API_KEY: ""
-    GROQ_API_KEY: ""
+    # Model provider keys do NOT go here. This Secret only puts a key into the
+    # pods' environment; it registers no model, so jobs and sessions stay
+    # blocked. Paste the key under `llm.seed` at the end of this file instead
+    # (docs/models.md).
 
     # Web search key for the agent's web_search / extract / crawl / map tools.
     # Tavily is a search engine, not an LLM — it is NOT DB-seeded; this value
@@ -611,33 +612,71 @@ keycloak:
 llm:
   seed:
     researchProviderWaitSeconds: 900
-    # Everything Admin → Models can do, declared once, so a rebuilt cluster
-    # comes up configured. Dev mode (secrets.create: true above) lets the
-    # keys sit inline — they are rendered into a dedicated Secret only the
-    # seed Job reads, then encrypted into Postgres. Insert-only: rows and
-    # pins an admin changed in the Cockpit are never overwritten. Full
-    # reference in helm/values.yaml under llm.seed.
-    # enabled: true
+
+    # -------------------------------------------------------------------------
+    # Models: one OpenRouter key (https://openrouter.ai/keys). Jobs and
+    # sessions are refused until four capabilities each have a model and a
+    # default: chat, auxiliary, embedding (must return 4096-dim vectors) and
+    # rerank. This block seeds all four through the one key. docs/models.md
+    # explains the roles and the alternatives.
+    #
+    # The key sits inline (dev mode, secrets.create: true above): it is
+    # rendered into a dedicated Secret only the seed Job reads, then encrypted
+    # into Postgres. While it is empty the seed Job skips the key and the
+    # models that need it; paste it and `helm upgrade` to seed them.
+    # `reconcile: true` makes this file the source of truth for the key, so
+    # a corrected key replaces the stored one on the next upgrade (a key
+    # changed in the Cockpit is reverted). Models and default pins are
+    # insert-only: changes made in Settings → Administration → Models survive.
+    # -------------------------------------------------------------------------
+    enabled: true
+    systemApiKeys:
+      openrouter:
+        value: ""            # paste your OpenRouter key (sk-or-v1-...)
+        reconcile: true
+    systemModels:
+      # Chat + auxiliary: any OpenRouter chat model with tool calling works.
+      # Provider-key OpenRouter ids carry the `openrouter/` routing prefix.
+      - provider: openrouter
+        id: "openrouter/anthropic/claude-sonnet-5.5"
+        displayName: "Claude Sonnet 5.5 (OpenRouter)"
+        capabilities: [chat, auxiliary]
+      # Embedding: Qwen3 Embedding 8B returns the 4096 dimensions SRW stores.
+      - provider: openrouter
+        id: "openrouter/qwen/qwen3-embedding-8b"
+        displayName: "Qwen3 Embedding 8B (OpenRouter)"
+        capability: embedding
+      # Rerank: OpenRouter serves the Cohere-shaped POST /api/v1/rerank.
+      - provider: openrouter
+        id: "openrouter/qwen/qwen3-reranker-8b"
+        displayName: "Qwen3 Reranker 8B (OpenRouter)"
+        capability: rerank
+    defaults:
+      chat: "openrouter/anthropic/claude-sonnet-5.5"
+      auxiliary: "openrouter/anthropic/claude-sonnet-5.5"
+      embedding: "openrouter/qwen/qwen3-embedding-8b"
+      rerank: "openrouter/qwen/qwen3-reranker-8b"
+
+    # Alternatives (full reference in helm/values.yaml under llm.seed). Other
+    # providers can serve chat and auxiliary next to OpenRouter, but none of
+    # OpenAI, Anthropic or Groq offers a 4096-dim embedding or a rerank model,
+    # so keep the two Qwen rows above (or a self-hosted endpoint) either way.
+    #
     # systemApiKeys:
-    #   openai:
-    #     value: "sk-..."
+    #   anthropic:
+    #     value: "sk-ant-..."
     # systemModels:
-    #   - provider: openai
-    #     id: "gpt-5-mini"
+    #   - provider: anthropic
+    #     id: "claude-sonnet-5-5"
     #     capabilities: [chat, auxiliary]
-    #     family: gpt-5
-    #     reasoningLevel: low
+    #
+    # A self-hosted OpenAI-compatible server instead of OpenRouter, e.g. vLLM
+    # serving Qwen3 Embedding 8B and Qwen3 Reranker 8B:
     # systemEndpoints:
-    #   - label: "OpenRouter embedding"
-    #     baseUrl: "https://openrouter.ai/api/v1"
-    #     apiKey: "sk-or-..."
+    #   - label: "Local Qwen"
+    #     baseUrl: "http://vllm.ai.svc.cluster.local:8000/v1"
     #     models:
-    #       - id: "qwen/qwen3-embedding-8b"
+    #       - id: "Qwen/Qwen3-Embedding-8B"
     #         capability: embedding
-    #       - id: "qwen/qwen3-reranker-8b"
+    #       - id: "Qwen/Qwen3-Reranker-8B"
     #         capability: rerank
-    # defaults:
-    #   chat: "gpt-5-mini"
-    #   auxiliary: "gpt-5-mini"
-    #   embedding: "qwen/qwen3-embedding-8b"
-    #   rerank: "qwen/qwen3-reranker-8b"
