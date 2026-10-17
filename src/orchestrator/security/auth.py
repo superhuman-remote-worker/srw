@@ -5,6 +5,8 @@ Four auth paths, tried in this order:
    transparent. See knowledge-base/knowledge/features/auth_bff_and_api_tokens.md.
 2. Bearer token (OIDC) — Keycloak access token. Transitional during the
    cockpit cutover; will remain for direct API consumers and for tests.
+   Only access tokens issued to an allowed client (``azp``) or for an
+   allowed audience are accepted; see ``security/oidc.py``.
 3. X-MCP-Token — API tokens for Claude Code / CLI clients (unchanged).
 4. X-MCP-User-Id + X-Internal-Key — forwarded by the MCP server after
    it has already authenticated the caller via OAuth or API token.

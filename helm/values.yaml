@@ -1529,6 +1529,28 @@ auth:
     # token before its `exp` claim. 60s avoids the rare clock-skew window
     # where the validator reuses a token KC has already rejected.
     accessTokenRefreshSkewSeconds: 60
+  # -- Which Keycloak tokens the orchestrator accepts as `Authorization: Bearer`
+  # credentials (and as the access token behind a cookie session). Every
+  # client of the realm gets tokens with the same signature and issuer, so a
+  # token must also be an access token (`typ: Bearer`, never an ID token) and
+  # either name an allowed client in `azp` or carry an allowed audience in
+  # `aud`; anything else is refused with a logged reason. The BFF client
+  # (auth.bff.clientId) and the cockpit SPA client (keycloak.cockpitClientId,
+  # or keycloak.bootstrap.cockpitClientId when set) are always allowed.
+  oidc:
+    # -- More client ids whose access tokens are accepted (`azp`), e.g. a
+    # first-party CLI client of your own. Never list a client whose tokens are
+    # held elsewhere (Gitea, Nextcloud, OpenCloud, admin-cli): its holder could
+    # then call this API as the user.
+    extraAllowedClients: []
+    # -- Audiences whose access tokens are accepted (`aud`). `orchestrator-api`
+    # is the bundled realm's bearer-only client for this API: a client given a
+    # hardcoded audience mapper for it gets in without being listed above. Do
+    # not give `orchestrator-api` client roles, or Keycloak's audience-resolve
+    # mapper adds it to every full-scope client's tokens. `account` and `*` are
+    # ignored: nearly every token carries `account`.
+    allowedAudiences:
+      - orchestrator-api
 
 # =============================================================================
 # SSH Gateway — user-facing SSH into session workspaces

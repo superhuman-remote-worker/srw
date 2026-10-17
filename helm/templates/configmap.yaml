@@ -572,6 +572,19 @@ data:
   # The cockpit SPA still uses .Values.keycloak.cockpitClientId for its
   # PKCE-only Bearer flow.
   KEYCLOAK_CLIENT_ID: {{ .Values.auth.bff.clientId | quote }}
+  # Bearer token binding (auth.oidc): the clients (`azp`) and audiences
+  # (`aud`) whose access tokens the orchestrator accepts. The BFF client is
+  # also always accepted from KEYCLOAK_CLIENT_ID.
+  {{- $oidc := .Values.auth.oidc | default dict }}
+  {{- /* The SPA client the realm actually has: the external-Keycloak
+       bootstrap Job registers keycloak.bootstrap.cockpitClientId when set. */}}
+  {{- $cockpitClient := .Values.keycloak.cockpitClientId }}
+  {{- if and (not .Values.keycloak.internal) (.Values.keycloak.bootstrap | default dict).cockpitClientId }}
+  {{- $cockpitClient = .Values.keycloak.bootstrap.cockpitClientId }}
+  {{- end }}
+  {{- $oidcClients := concat (list .Values.auth.bff.clientId $cockpitClient) ($oidc.extraAllowedClients | default list) | compact | uniq }}
+  OIDC_ALLOWED_CLIENTS: {{ join "," $oidcClients | quote }}
+  OIDC_ALLOWED_AUDIENCES: {{ join "," ($oidc.allowedAudiences | default list | compact | uniq) | quote }}
   {{- if .Values.keycloak.adminApiDisabled }}
   KEYCLOAK_ADMIN_API_DISABLED: {{ "true" | quote }}
   {{- end }}

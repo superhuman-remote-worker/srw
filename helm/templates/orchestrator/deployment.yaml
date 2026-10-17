@@ -767,6 +767,17 @@ spec:
                 configMapKeyRef:
                   name: {{ include "srw.configMapName" . }}
                   key: KEYCLOAK_CLIENT_ID
+            # Bearer token binding (auth.oidc, security/oidc.py).
+            - name: OIDC_ALLOWED_CLIENTS
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: OIDC_ALLOWED_CLIENTS
+            - name: OIDC_ALLOWED_AUDIENCES
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: OIDC_ALLOWED_AUDIENCES
             - name: KC_CLIENT_SECRET
               valueFrom:
                 secretKeyRef:
