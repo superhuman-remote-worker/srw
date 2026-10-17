@@ -189,7 +189,7 @@ class _FakeKube:
     def python(self, target, container, script, *, operation):
         self.calls.append((["python", target, container], script))
         if operation == "keycloak login":
-            return {"id_token": "header.payload.signature"}
+            return {"access_token": "header.payload.signature"}
         assert operation == "Gitea SSH endpoint"
         return {"host": "srw-gitea", "port": 2222}
 
@@ -238,14 +238,14 @@ def test_secrets_and_bearer_never_appear_in_an_argument() -> None:
 
 
 def test_test_logs_in_through_the_gate_client_never_admin_cli() -> None:
-    # admin-cli's ID token carries no roles: a login through it demotes the
-    # administrator the gate runs as.
+    # The API refuses ID tokens and admin-cli's access token (no sub, no
+    # roles): ``test`` sends the gate client's access token.
     kube = _FakeKube()
     gate.Api(kube, "pw")
     [(arguments, login)] = [call for call in kube.calls if call[0][0] == "python"]
     assert arguments == ["python", gate.ORCHESTRATOR, "orchestrator"]
     compile(login, "login", "exec")
-    assert "gate_id_token(opener" in login and "'test'" in login
+    assert "gate_access_token(opener" in login and "'test'" in login
     assert repr(gate.gate_oauth.GATE_CLIENT) in login
     assert '"client_id": "admin-cli", "scope"' not in login
 

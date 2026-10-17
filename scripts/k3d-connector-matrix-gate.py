@@ -89,9 +89,10 @@ from typing import Any
 
 ROOT = Path(__file__).resolve().parents[1]
 
-# Every account logs in through the gates' Keycloak client, whose ID token
-# carries the e-mail and the realm roles; admin-cli's carries neither, and a
-# login through it demotes an administrator (scripts/k3d_gate_oauth.py).
+# Every account logs in through the gates' Keycloak client, whose access
+# token carries the e-mail, the realm roles, `sub` and the audience the
+# API's Bearer check accepts; admin-cli's carries none of them, and a login
+# through it would demote an administrator (scripts/k3d_gate_oauth.py).
 _OAUTH_SPEC = importlib.util.spec_from_file_location(
     "_k3d_gate_oauth", ROOT / "scripts" / "k3d_gate_oauth.py"
 )
@@ -205,7 +206,7 @@ _API_PROGRAM = (
 import json, sys, urllib.error, urllib.parse, urllib.request
 envelope = json.loads(sys.stdin.readline())
 opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-token = gate_id_token(
+token = gate_access_token(
     opener, envelope["token_url"], envelope["username"], envelope["password"]
 )
 request = urllib.request.Request(
