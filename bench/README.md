@@ -169,8 +169,9 @@ absent from v1 — they change as the repo changes, which breaks pinning.
   skills/filtered arms to isolate phase prose from schema shape. WP6 removed
   those live configuration switches after the MiniMax verdict; use the recorded
   run IDs in the design note for historical comparisons.
-- **Running on k3d:** mint the test id_token per the auth memo (admin-cli
-  password grant, use `id_token` not `access_token`); `POST /api/projects`
+- **Running on k3d:** get a Bearer token for the test user with
+  `python3 scripts/k3d_gate_oauth.py` (an access token the orchestrator
+  accepts; ID tokens and other clients' tokens are refused); `POST /api/projects`
   requires `user_id` in the body. Give memory-sensitive experiments a
   `project_id` in the spec — without a shared project the pool stays empty
   and memory-related treatments measure nothing.
