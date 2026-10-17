@@ -5,6 +5,7 @@
 [![Main CI](https://github.com/superhuman-remote-worker/srw/actions/workflows/main.yml/badge.svg)](https://github.com/superhuman-remote-worker/srw/actions/workflows/main.yml)
 [![Latest tag](https://img.shields.io/github/v/tag/superhuman-remote-worker/srw?label=release)](https://github.com/superhuman-remote-worker/srw/tags)
 [![License: FSL-1.1-ALv2](https://img.shields.io/badge/license-FSL--1.1--ALv2-9c2832)](LICENSE)
+[![Status: public beta](https://img.shields.io/badge/status-public%20beta-5b4a8b)](docs/versioning.md)
 
 [Website](https://superhuman-remote-worker.com/) ·
 [Documentation](docs/README.md) ·
