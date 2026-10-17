@@ -4058,11 +4058,11 @@
       },
       "partial": {
         "label": "Partiell",
-        "description": "Stoppt an Phasengrenzen und beim Job-Abschluss"
+        "description": "Stoppt nach der ersten strategischen Phase und beim Job-Abschluss"
       },
       "guided": {
         "label": "Geführt",
-        "description": "Stoppt nach jeder taktischen Phase"
+        "description": "Stoppt nach jeder strategischen Phase und beim Job-Abschluss"
       },
       "dependent": {
         "label": "Abhängig",

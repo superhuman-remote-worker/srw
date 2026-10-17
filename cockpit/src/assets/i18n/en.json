@@ -4067,11 +4067,11 @@
       },
       "partial": {
         "label": "Partial",
-        "description": "Freezes at phase boundaries and job completion"
+        "description": "Freezes after the first strategic phase and at job completion"
       },
       "guided": {
         "label": "Guided",
-        "description": "Freezes after every tactical phase"
+        "description": "Freezes after every strategic phase and at job completion"
       },
       "dependent": {
         "label": "Dependent",

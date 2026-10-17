@@ -84,8 +84,8 @@ export const ALL_TOOL_CATEGORIES: ToolCategoryMeta[] = [
 export const AUTONOMY_LEVELS = [
   { value: 'full', label: 'Full', description: 'Never freezes, runs to completion autonomously' },
   { value: 'review', label: 'Review', description: 'Freezes at job completion for human review' },
-  { value: 'partial', label: 'Partial', description: 'Freezes at phase boundaries and job completion' },
-  { value: 'guided', label: 'Guided', description: 'Freezes after every tactical phase' },
+  { value: 'partial', label: 'Partial', description: 'Freezes after the first strategic phase and at job completion' },
+  { value: 'guided', label: 'Guided', description: 'Freezes after every strategic phase and at job completion' },
   { value: 'dependent', label: 'Dependent', description: 'Freezes after every phase (strategic and tactical)' },
 ] as const;
 
