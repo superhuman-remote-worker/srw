@@ -76,10 +76,10 @@ async def test_deleted_connector_named_from_tombstone():
         project_ids=[],
         datasource_ids=[ItemVerdict(DS_GONE, True, "deleted")],
         grant_violations=[],
-        tombstones={DS_GONE: "KurortEngine"},
+        tombstones={DS_GONE: "WidgetShop"},
     )
     assert items == [
-        DriftItem(f"connector:{DS_GONE}", "connector", "deleted", "KurortEngine")
+        DriftItem(f"connector:{DS_GONE}", "connector", "deleted", "WidgetShop")
     ]
 
 

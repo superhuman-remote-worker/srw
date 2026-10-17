@@ -106,7 +106,7 @@ class TestUserCanCompleteUnmergedPr:
 
 # --- The live pull-request predicate ----------------------------------------
 
-REPO = "Knaeckebrothero/KurortEngine"
+REPO = "Acme/WidgetShop"
 PR_URL = f"https://github.com/{REPO}/pull/1"
 
 
@@ -445,7 +445,7 @@ class TestApproveJobGate:
 
     async def test_explicit_pr_contract_must_be_proven_before_merge_policy(self):
         job = _pending_job()
-        job["context"]["required_deliverables"] = ["pr:knaeckebrothero/kurortengine"]
+        job["context"]["required_deliverables"] = ["pr:acme/widgetshop"]
         db = _fake_db(can_complete=True)
         with ExitStack() as stack:
             self._patch(stack, job, db)
@@ -471,7 +471,7 @@ class TestApproveJobGate:
 
     async def test_proven_pr_still_obeys_existing_open_pr_policy(self):
         job = _pending_job()
-        job["context"]["required_deliverables"] = ["pr:knaeckebrothero/kurortengine"]
+        job["context"]["required_deliverables"] = ["pr:acme/widgetshop"]
         db = _fake_db(can_complete=False)
         with ExitStack() as stack:
             self._patch(stack, job, db)

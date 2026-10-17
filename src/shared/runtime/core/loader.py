@@ -2312,7 +2312,7 @@ class ToolsConfig:
         # answering one question is how job c4849fa1 (2026-08-16) ended up
         # reading `fatal: bad object` from git_show — then the job's own repo
         # only — as proof that its attached repository was unusable, while the
-        # files it wanted sat in repos/KurortEngine/.
+        # files it wanted sat in repos/WidgetShop/.
         #
         # Shell wins: it is strictly more capable. Suppressing here rather
         # than in src/tools/registry keeps

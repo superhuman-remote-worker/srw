@@ -9,7 +9,7 @@ describe('classifyResumeError', () => {
                 detail: {
                     code: 'config_drift',
                     drift: [{id: 'connector:abc', kind: 'connector',
-                             reason: 'deleted', label: 'KurortEngine'}],
+                             reason: 'deleted', label: 'WidgetShop'}],
                 },
             },
         });
@@ -17,7 +17,7 @@ describe('classifyResumeError', () => {
         expect(result).toEqual({
             kind: 'drift',
             items: [{id: 'connector:abc', kind: 'connector',
-                     reason: 'deleted', label: 'KurortEngine'}],
+                     reason: 'deleted', label: 'WidgetShop'}],
         });
     });
 

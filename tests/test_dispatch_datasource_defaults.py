@@ -18,7 +18,7 @@ looked at it.
 What that cost, live on Better Resavio 2026-08-15: the officer's own thread was
 created without a selection, which persists as ``datasource_ids: []`` (origin
 ``omitted_compat``). Every job he commissioned inherited the empty list, so his
-workers came up with no ``repos/KurortEngine/`` checkout and no clone/commit/push
+workers came up with no ``repos/WidgetShop/`` checkout and no clone/commit/push
 capability. He then — correctly — de-armed the only actionable ticket and idled
 all night rather than dispatch a tester against a candidate that could not exist.
 One absent field, a whole watch spent asleep.

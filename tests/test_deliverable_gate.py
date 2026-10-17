@@ -1179,8 +1179,7 @@ class TestClonedRepoPredicate:
 
     def test_a_path_inside_a_cloned_repo_is_recognised(self) -> None:
         assert (
-            is_cloned_repo_deliverable("repos/KurortEngine/docs/design/theme.md")
-            is True
+            is_cloned_repo_deliverable("repos/WidgetShop/docs/design/theme.md") is True
         )
 
     def test_the_singular_prefix_is_a_different_thing(self) -> None:
@@ -1208,11 +1207,11 @@ class TestClonedRepoPredicate:
 class TestGateFailsClosedOnHistoricalClonedRepoPaths:
     @pytest.mark.asyncio
     async def test_unverifiable_external_publication_is_strictly_missing(self):
-        job = make_job(manifest=["repos/KurortEngine/docs/design/theme.md"])
+        job = make_job(manifest=["repos/WidgetShop/docs/design/theme.md"])
         report = await evaluate_deliverable_gate(
             job, db=make_db(), gitea=make_gitea([])
         )
-        assert report["missing"] == ["repos/KurortEngine/docs/design/theme.md"]
+        assert report["missing"] == ["repos/WidgetShop/docs/design/theme.md"]
         assert report["unverified"] == []
         assert report["passed"] is False
         assert report["strict"] is True

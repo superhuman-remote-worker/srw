@@ -517,7 +517,7 @@ describe('SessionsPageComponent', () => {
                     detail: {
                         code: 'config_drift',
                         drift: [{id: 'connector:abc', kind: 'connector',
-                                 reason: 'deleted', label: 'KurortEngine'}],
+                                 reason: 'deleted', label: 'WidgetShop'}],
                     },
                 },
             })));

@@ -757,7 +757,7 @@ describe('ChatPageComponent onStartNewSession', () => {
     // to reproduce an actually-connected session.
     chat.threadId.set('thread-1');
     chat.pendingDrift.set([
-      {id: 'connector:abc', kind: 'connector', reason: 'deleted', label: 'KurortEngine'},
+      {id: 'connector:abc', kind: 'connector', reason: 'deleted', label: 'WidgetShop'},
     ]);
 
     component.onStartNewSession();
