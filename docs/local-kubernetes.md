@@ -1,3 +1,8 @@
+---
+title: Local Kubernetes with k3d
+description: Run the SRW Helm chart on a single-node k3d cluster for evaluation and development, with smoke tests, lifecycle and troubleshooting.
+---
+
 # Local Kubernetes with k3d
 
 This guide runs the SRW Helm chart on a single-node k3d cluster. It exercises

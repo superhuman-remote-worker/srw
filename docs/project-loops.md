@@ -1,3 +1,8 @@
+---
+title: Project loops
+description: Launch a bounded, repeated sequence of autonomous jobs against one project goal, and what "self-improving" means in SRW.
+---
+
 # Project loops
 
 Project loops let SRW launch a repeated sequence of autonomous jobs against one

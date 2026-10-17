@@ -1,3 +1,8 @@
+---
+title: Build your own workspace image
+description: Add your own tools to a workspace image and run jobs and sessions on it.
+---
+
 # Build your own workspace image
 
 A Job or Session on the Container tier runs in a container whose image comes

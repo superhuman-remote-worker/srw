@@ -1,3 +1,8 @@
+---
+title: Security model
+description: SRW's intended trust boundary, its isolation choices and limitations, and guidance for deploying it safely.
+---
+
 # Security model
 
 This document describes SRW's intended trust boundary and its limitations. It

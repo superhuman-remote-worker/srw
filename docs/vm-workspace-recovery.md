@@ -1,3 +1,8 @@
+---
+title: VM workspace networking and recovery
+description: Qualify an immutable VM image, enable bounded recovery for held VM jobs, and interpret retained holds.
+---
+
 # VM workspace networking and recovery
 
 Ordinary workspace recovery can reconnect a held stateless VM Job to its existing
