@@ -2,6 +2,7 @@ import {describe, it, expect} from 'vitest';
 import {
   defaultModelOptionLabel,
   detectModelFamily,
+  liveUpgradeState,
   resolveEffectiveModels,
   resolveMatrixForModel,
 } from './agent-settings.types';
@@ -296,5 +297,35 @@ describe('defaultModelOptionLabel', () => {
     expect(defaultModelOptionLabel('Base default', null)).toBe('Base default');
     expect(defaultModelOptionLabel('Base default', undefined)).toBe('Base default');
     expect(defaultModelOptionLabel('Project default', '')).toBe('Project default');
+  });
+});
+
+describe('liveUpgradeState', () => {
+  it('is available when any other tier is ok', () => {
+    expect(liveUpgradeState('virtual', {sandbox: 'ok', vm: 'needsApproval', none: 'downgrade'})).toBe('available');
+  });
+
+  it('names the stateless lane, where every upgrade is refused for this session', () => {
+    // The settings pane's map for a stateless `virtual` session today.
+    expect(liveUpgradeState('virtual', {
+      sandbox: 'sessionUnsupported',
+      vm: 'sessionUnsupported',
+      none: 'downgrade',
+    })).toBe('sessionUnsupported');
+  });
+
+  it('prefers approval over a session refusal: approval is the one the user can act on', () => {
+    // A pinned `virtual` session without the VM grant.
+    expect(liveUpgradeState('virtual', {sandbox: 'sessionUnsupported', vm: 'needsApproval', none: 'downgrade'}))
+      .toBe('needsApproval');
+  });
+
+  it('calls a VM the highest tier', () => {
+    expect(liveUpgradeState('vm', {sandbox: 'downgrade', virtual: 'downgrade', none: 'downgrade'})).toBe('highest');
+  });
+
+  it('reads absent entries as refused, like the tier row', () => {
+    expect(liveUpgradeState('none', {})).toBe('unsupported');
+    expect(liveUpgradeState(null, {})).toBe('unsupported');
   });
 });

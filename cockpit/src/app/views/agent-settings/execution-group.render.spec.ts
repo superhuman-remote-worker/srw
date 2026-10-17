@@ -210,6 +210,45 @@ describe('ExecutionGroupComponent — live tier row', () => {
     expect(row.textContent).toContain('None (no workspace)');
   });
 
+  it('says what an upgrade does only while one is open', () => {
+    const text = (rowFor(mount(LIVE), 'Workspace').textContent ?? '');
+    expect(text).toContain('Upgrades carry your files over');
+  });
+
+  it('on a session that cannot move, says why instead of promising an upgrade', () => {
+    // A stateless `virtual` session: the lane carries no upgrade verb.
+    const fixture = mount({
+      mode: 'live',
+      liveTier: 'virtual',
+      tierReachability: {sandbox: 'sessionUnsupported', vm: 'sessionUnsupported', none: 'downgrade'},
+    });
+    const row = rowFor(fixture, 'Workspace');
+    expect(row.querySelector('select')).toBeNull();
+    expect(row.textContent).toContain('Virtual (cloud files)');
+    expect(row.textContent).toContain("This session can't change its workspace");
+    expect(row.textContent).not.toContain('Upgrades carry your files over');
+  });
+
+  it('keeps the approval reason when the only way up needs one', () => {
+    const fixture = mount({
+      mode: 'live',
+      liveTier: 'virtual',
+      tierReachability: {sandbox: 'sessionUnsupported', vm: 'needsApproval', none: 'downgrade'},
+    });
+    expect(rowFor(fixture, 'Workspace').textContent).toContain("needs an admin's approval");
+  });
+
+  it('tells a VM session it is already on the highest tier', () => {
+    const fixture = mount({
+      mode: 'live',
+      liveTier: 'vm',
+      tierReachability: {sandbox: 'downgrade', virtual: 'downgrade', none: 'downgrade'},
+    });
+    const text = rowFor(fixture, 'Workspace').textContent ?? '';
+    expect(text).toContain('already runs on the highest tier');
+    expect(text).not.toContain('Upgrades carry your files over');
+  });
+
   it('keeps an unrecognised running tier visible rather than mislabelling it', () => {
     const fixture = mount({mode: 'live', liveTier: 'remote', tierReachability: {sandbox: 'ok'}});
     const opt = options(fixture, 'Workspace').find((o) => o.value === 'remote');

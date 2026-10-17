@@ -130,10 +130,24 @@ describe('AgentSettingsComponent — three sections', () => {
   });
 
   it('live: the workspace section holds the tier row and names the tier', () => {
-    const {el, host} = mount(LIVE);
-    expect(section(el, WORKSPACE).querySelector('app-execution-group')).not.toBeNull();
+    const {el, host} = mount({...LIVE, tierReachability: {sandbox: 'ok', vm: 'ok', none: 'downgrade'}});
+    const workspace = section(el, WORKSPACE);
+    expect(workspace.querySelector('app-execution-group')).not.toBeNull();
     expect(host.workspaceSummary()).toBe('Virtual (cloud files)');
     expect(host.workspaceChip().label).toBe('Upgrade only');
+    expect(workspace.querySelector('.locked-field')?.textContent).toContain('The tier above can be upgraded');
+  });
+
+  it('live: a session that cannot move tier is not told it can upgrade', () => {
+    // A stateless `virtual` session: every upgrade is refused for the session.
+    const {el, host} = mount({
+      ...LIVE,
+      tierReachability: {sandbox: 'sessionUnsupported', vm: 'sessionUnsupported', none: 'downgrade'},
+    });
+    expect(host.workspaceChip().label).toBe('Fixed');
+    const locked = section(el, WORKSPACE).querySelector('.locked-field')?.textContent ?? '';
+    expect(locked).toContain('Image and resources stay as created.');
+    expect(locked).not.toContain('can be upgraded');
   });
 
   it('live without the frozen config says so instead of showing fallback values', () => {

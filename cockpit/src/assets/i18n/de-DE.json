@@ -3906,6 +3906,7 @@
           "changes": "{{n}} geändert",
           "template": "Vorlage",
           "upgradeOnly": "Nur Upgrade",
+          "fixed": "Festgelegt",
           "default": "Standard",
           "custom": "Angepasst",
           "none": "Keiner",
@@ -3919,6 +3920,7 @@
         "project": "Projekt",
         "templateAndResources": "Vorlage und Ressourcen",
         "templateAndResourcesHint": "Die Stufe oben lässt sich upgraden. Image und Ressourcen bleiben wie erstellt.",
+        "resourcesFixedHint": "Image und Ressourcen bleiben wie erstellt.",
         "moreLive": "Diese wurden beim Start der Session festgelegt.",
         "moreUnavailable": "Die Werte, mit denen diese Session gestartet wurde, konnten nicht geladen werden."
       },
@@ -4012,6 +4014,12 @@
       "tierCurrent": "aktuell",
       "tierNext": "die nächste Stufe",
       "tierHint": "Beim Upgrade werden deine Dateien übernommen; innerhalb der Sitzung ist es nicht umkehrbar.",
+      "tierFixed": {
+        "needsApproval": "Für ein Upgrade dieser Sitzung brauchst du die Freigabe eines Admins.",
+        "sessionUnsupported": "Diese Sitzung kann ihren Workspace nicht wechseln. Starte eine neue Sitzung, um auf einer anderen Stufe zu arbeiten.",
+        "highest": "Diese Sitzung läuft bereits auf der höchsten Stufe.",
+        "unsupported": "Diese Stufe lässt sich nicht upgraden."
+      },
       "tierUpgrading": "{{tier}} wird bereitgestellt…",
       "tierUnreachable": {
         "downgrade": "Herunterstufen nicht möglich",
