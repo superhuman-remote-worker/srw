@@ -393,6 +393,8 @@ def model_catalog_service():
     # Provenance lookups are awaited on every list/create/update response.
     store.get_system_setting = AsyncMock(return_value=None)
     store.list_system_llm_endpoints = AsyncMock(return_value=[])
+    # No catalog row holds the id unless a test says so.
+    store.find_model_by_model_id = AsyncMock(return_value=None)
     return ModelCatalogService(
         store=store,
         probe=AsyncMock(),
@@ -656,13 +658,16 @@ class TestResolveCatalogModelTransportJoin:
         assert await db.resolve_catalog_model("nope") is None
 
     @pytest.mark.asyncio
-    async def test_query_orders_system_first(self):
+    async def test_query_reads_the_served_model_id_without_a_tie_break(self):
+        # A model id names one row (uq_models_model_id): nothing is left for
+        # the old "system row wins" ordering to choose between.
         conn = _conn()
         conn.fetchrow = AsyncMock(return_value=None)
         db = _make_db(conn)
         await db.resolve_catalog_model("x")
         sql = conn.fetchrow.await_args.args[0]
-        assert "ORDER BY (m.provider_kind = 'system') DESC" in sql
+        assert "m.served_model_id" in sql
+        assert "ORDER BY" not in sql
 
 
 class TestListByCapabilityAlphabetical:
@@ -847,3 +852,277 @@ class TestNormalizeCatalogModelId:
             )
             == "minimax/minimax-m3"
         )
+
+
+class TestOneRowPerModelId:
+    """A model id names one catalog row across every provider, and a row
+    may send a different name upstream through ``served_model_id``."""
+
+    @staticmethod
+    def _arm(store, *, holder=None, existing=None):
+        store.get_system_api_key = AsyncMock(return_value="sk-test")
+        store.get_system_llm_endpoint = AsyncMock(
+            return_value={"id": "ep-1", "label": "Claude subscription proxy"}
+        )
+        store.find_model_by_model_id = AsyncMock(return_value=holder)
+        store.get_model = AsyncMock(return_value=existing)
+        store.create_model = AsyncMock(side_effect=lambda **kw: _row(**kw))
+        store.update_model = AsyncMock(
+            side_effect=lambda catalog_id, **kw: _row(**{**(existing or {}), **kw})
+        )
+        store.list_default_pin_capabilities = AsyncMock(return_value=["chat"])
+        store.list_models_by_capability_alphabetical = AsyncMock(return_value=[])
+        store.pin_default_llm_model_if_unset = AsyncMock(return_value=False)
+
+    @staticmethod
+    def _create(**overrides):
+        body = {
+            "provider_kind": "system",
+            "provider_ref": "anthropic",
+            "model_id": "claude-opus-5-5",
+            "display_label": "Claude Opus 5.5",
+            "capabilities": ["chat", "auxiliary"],
+            "family": "claude-opus-5-5",
+        }
+        body.update(overrides)
+        return CatalogModelCreate(**body)
+
+    @pytest.mark.asyncio
+    async def test_create_refuses_an_id_held_by_another_provider(
+        self, model_catalog_service
+    ):
+        from fastapi import HTTPException
+
+        store = model_catalog_service.store
+        self._arm(store)
+        holder = _row(
+            model_id="claude-opus-5-5", provider_kind="endpoint", provider_ref="ep-1"
+        )
+        store.find_model_by_model_id = AsyncMock(
+            side_effect=lambda model_id: holder
+            if model_id == "claude-opus-5-5"
+            else None
+        )
+        with pytest.raises(HTTPException) as exc:
+            await model_catalog_service.create_catalog_model(self._create())
+        assert exc.value.status_code == 409
+        detail = exc.value.detail
+        assert "endpoint 'Claude subscription proxy'" in detail
+        assert "'claude-opus-5-5-anthropic'" in detail
+        assert "served model id 'claude-opus-5-5'" in detail
+        store.create_model.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_the_suggested_id_is_one_nobody_holds(self, model_catalog_service):
+        from fastapi import HTTPException
+
+        store = model_catalog_service.store
+        holder = _row(model_id="m", provider_kind="endpoint", provider_ref="ep-1")
+        taken = {"m": holder, "m-anthropic": _row(model_id="m-anthropic")}
+        self._arm(store)
+        store.find_model_by_model_id = AsyncMock(side_effect=taken.get)
+        with pytest.raises(HTTPException) as exc:
+            await model_catalog_service.create_catalog_model(
+                self._create(model_id="m", family="default")
+            )
+        assert "model id 'm-anthropic-2'" in exc.value.detail
+
+    @pytest.mark.asyncio
+    async def test_create_stores_the_served_model_id(self, model_catalog_service):
+        store = model_catalog_service.store
+        self._arm(store)
+        out = await model_catalog_service.create_catalog_model(
+            self._create(
+                model_id="claude-opus-5-5-api", served_model_id=" claude-opus-5-5 "
+            )
+        )
+        kwargs = store.create_model.await_args.kwargs
+        assert kwargs["model_id"] == "claude-opus-5-5-api"
+        assert kwargs["served_model_id"] == "claude-opus-5-5"
+        assert out["served_model_id"] == "claude-opus-5-5"
+
+    @pytest.mark.asyncio
+    async def test_a_served_id_equal_to_the_model_id_is_stored_as_null(
+        self, model_catalog_service
+    ):
+        store = model_catalog_service.store
+        self._arm(store)
+        await model_catalog_service.create_catalog_model(
+            self._create(served_model_id="claude-opus-5-5")
+        )
+        assert store.create_model.await_args.kwargs["served_model_id"] is None
+
+    @pytest.mark.asyncio
+    async def test_system_openrouter_served_id_gets_the_routing_prefix(
+        self, model_catalog_service
+    ):
+        store = model_catalog_service.store
+        self._arm(store)
+        await model_catalog_service.create_catalog_model(
+            self._create(
+                provider_ref="openrouter",
+                model_id="z-ai/glm-5.3-flash-cheap",
+                served_model_id="z-ai/glm-5.3-flash",
+                family="default",
+            )
+        )
+        kwargs = store.create_model.await_args.kwargs
+        assert kwargs["model_id"] == "openrouter/z-ai/glm-5.3-flash-cheap"
+        assert kwargs["served_model_id"] == "openrouter/z-ai/glm-5.3-flash"
+
+    @pytest.mark.parametrize(
+        "model_id,served",
+        [
+            ("opus-api", "claude-opus-5-5"),  # not the served name plus a suffix
+            ("sol-direct", "gpt-6.1-sol"),
+            ("gemini-3.8-flash-lite", "gemini-3.8-flash"),  # suffix changes family
+        ],
+    )
+    @pytest.mark.asyncio
+    async def test_create_refuses_a_served_id_that_breaks_the_naming_rule(
+        self, model_catalog_service, model_id, served
+    ):
+        from fastapi import HTTPException
+
+        store = model_catalog_service.store
+        self._arm(store)
+        with pytest.raises(HTTPException) as exc:
+            await model_catalog_service.create_catalog_model(
+                self._create(model_id=model_id, served_model_id=served)
+            )
+        assert exc.value.status_code == 422
+        store.create_model.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_a_live_voice_row_cannot_have_a_served_id(
+        self, model_catalog_service
+    ):
+        from fastapi import HTTPException
+
+        store = model_catalog_service.store
+        self._arm(store)
+        with pytest.raises(HTTPException) as exc:
+            await model_catalog_service.create_catalog_model(
+                self._create(
+                    provider_ref="openai",
+                    model_id="gpt-live-1-direct",
+                    served_model_id="gpt-live-1",
+                    capabilities=["live_voice"],
+                    family="default",
+                )
+            )
+        assert exc.value.status_code == 422
+
+    @pytest.mark.asyncio
+    async def test_a_rename_onto_a_held_id_is_refused(self, model_catalog_service):
+        from fastapi import HTTPException
+
+        store = model_catalog_service.store
+        existing = _row(model_id="claude-opus-5-5-api", served_model_id=None)
+        self._arm(
+            store,
+            existing=existing,
+            holder=_row(
+                id=UUID("22222222-2222-2222-2222-222222222222"),
+                model_id="claude-opus-5-5",
+                provider_kind="endpoint",
+                provider_ref="ep-1",
+            ),
+        )
+        with pytest.raises(HTTPException) as exc:
+            await model_catalog_service.update_catalog_model(
+                str(existing["id"]),
+                CatalogModelUpdate(model_id="claude-opus-5-5"),
+            )
+        assert exc.value.status_code == 409
+        store.update_model.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_a_row_keeping_its_own_id_is_not_refused(self, model_catalog_service):
+        store = model_catalog_service.store
+        existing = _row(model_id="claude-opus-5-5-api")
+        self._arm(store, existing=existing, holder=existing)
+        await model_catalog_service.update_catalog_model(
+            str(existing["id"]),
+            CatalogModelUpdate(
+                model_id="claude-opus-5-5-api", served_model_id="claude-opus-5-5"
+            ),
+        )
+        assert (
+            store.update_model.await_args.kwargs["served_model_id"] == "claude-opus-5-5"
+        )
+
+    @pytest.mark.asyncio
+    async def test_an_update_checks_the_served_id_against_the_stored_model_id(
+        self, model_catalog_service
+    ):
+        from fastapi import HTTPException
+
+        store = model_catalog_service.store
+        existing = _row(model_id="opus-api")
+        self._arm(store, existing=existing)
+        with pytest.raises(HTTPException) as exc:
+            await model_catalog_service.update_catalog_model(
+                str(existing["id"]),
+                CatalogModelUpdate(served_model_id="claude-opus-5-5"),
+            )
+        assert exc.value.status_code == 422
+
+    @pytest.mark.asyncio
+    async def test_chat_groups_carry_each_ids_display_label(
+        self, model_catalog_service
+    ):
+        store = model_catalog_service.store
+        store.list_models = AsyncMock(
+            return_value=[
+                _row(model_id="claude-opus-5-5", display_label="Claude Opus 5.5"),
+                _row(
+                    model_id="claude-opus-5-5-api",
+                    display_label="Claude Opus 5.5 (API key)",
+                    served_model_id="claude-opus-5-5",
+                ),
+            ]
+        )
+        out = await model_catalog_service.list_available_models()
+        (group,) = out["groups"]
+        assert group["models"] == ["claude-opus-5-5", "claude-opus-5-5-api"]
+        assert group["labels"] == {
+            "claude-opus-5-5": "Claude Opus 5.5",
+            "claude-opus-5-5-api": "Claude Opus 5.5 (API key)",
+        }
+
+
+class TestFindModelByModelId:
+    @pytest.mark.asyncio
+    async def test_looks_the_id_up_across_every_provider(self):
+        conn = _conn()
+        conn.fetchrow = AsyncMock(return_value=_row())
+        db = _make_db(conn)
+        row = await db.find_model_by_model_id("claude-opus-4-7")
+        sql = conn.fetchrow.await_args.args[0]
+        assert "WHERE model_id = $1" in sql
+        assert "provider_kind =" not in sql
+        assert row["model_id"] == "claude-opus-4-7"
+
+    @pytest.mark.asyncio
+    async def test_create_conflicts_on_any_unique_index(self):
+        # ON CONFLICT without a target: an id held under another provider
+        # (uq_models_model_id) is a skip for the seeders, not a crash.
+        conn = _conn()
+        conn.fetchrow = AsyncMock(return_value=None)
+        db = _make_db(conn)
+        out = await db.create_model(
+            provider_kind="system",
+            provider_ref="anthropic",
+            model_id="claude-opus-5-5-api",
+            display_label="x",
+            capabilities=["chat"],
+            family="claude-opus-5-5",
+            served_model_id="claude-opus-5-5",
+            on_conflict_do_nothing=True,
+        )
+        sql, *args = conn.fetchrow.await_args.args
+        assert out is None
+        assert "ON CONFLICT DO NOTHING" in sql
+        assert "served_model_id" in sql
+        assert "claude-opus-5-5" in args

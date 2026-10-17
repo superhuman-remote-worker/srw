@@ -4005,6 +4005,17 @@ llm:
     # (`openrouter/<vendor>/<model>`); SRW strips it before calling
     # OpenRouter. Admin → Models adds the prefix for you, the seed does not.
     #
+    # A model id names ONE catalog row across every provider (and every
+    # endpoint above): the seed skips an entry whose id another provider
+    # already holds and logs why. To offer the same model through a second
+    # provider, give the row its own id and set `servedModelId` to the name
+    # that provider expects. The id must be that name plus a suffix of the
+    # same family:
+    #
+    #   - provider: "anthropic"
+    #     id: "claude-opus-5-5-api"                # what pins and experts name
+    #     servedModelId: "claude-opus-5-5"         # what Anthropic is sent
+    #
     # The one-key setup (docs/models.md): one OpenRouter key serves all four
     # required capabilities. Any chat model with tool calling works for chat +
     # auxiliary; the embedding model must return 4096-dim vectors (Qwen3

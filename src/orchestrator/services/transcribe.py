@@ -89,7 +89,7 @@ async def transcribe_thread_audio(
     if creds is None:
         logger.info("No STT (whisper) model configured for user %s", user_id)
         return None
-    model = creds.model
+    model = creds.wire_model
     base_url = creds.base_url
     api_key = creds.api_key
 

@@ -56505,8 +56505,8 @@ class PostgresDB:
     # =========================================================================
 
     _MODEL_FIELDS = (
-        "id, provider_kind, provider_ref, model_id, display_label, "
-        "capabilities, family, context_window, reasoning_level, "
+        "id, provider_kind, provider_ref, model_id, served_model_id, "
+        "display_label, capabilities, family, context_window, reasoning_level, "
         "params_json, enabled, seeded_from, notes, "
         "source, helm_value_hash, source_updated_at, created_at, updated_at"
     )
@@ -56621,6 +56621,19 @@ class PostgresDB:
             )
         return self._row_to_model(row) if row else None
 
+    async def find_model_by_model_id(self, model_id: str) -> Dict[str, Any] | None:
+        """The catalog row that holds ``model_id``, enabled or not.
+
+        A model id names one row across every provider (``uq_models_model_id``),
+        so this is the holder a create or rename must not collide with.
+        """
+        async with self.acquire() as conn:
+            row = await conn.fetchrow(
+                f"SELECT {self._MODEL_FIELDS} FROM models WHERE model_id = $1",
+                model_id,
+            )
+        return self._row_to_model(row) if row else None
+
     async def create_model(
         self,
         *,
@@ -56640,8 +56653,12 @@ class PostgresDB:
         on_conflict_do_nothing: bool = False,
         source: str | None = None,
         helm_value_hash: str | None = None,
+        served_model_id: str | None = None,
     ) -> Dict[str, Any] | None:
         """Insert a catalog row.
+
+        ``served_model_id`` is the name sent to the provider when it differs
+        from ``model_id``; ``None`` sends ``model_id``.
 
         ``source`` (``shared.helm_provenance``) defaults to a derivation from
         ``seeded_from``; ``helm_value_hash`` is set by the seed Job only.
@@ -56654,19 +56671,17 @@ class PostgresDB:
         is translated into the canonical ``capabilities[]`` array internally
         — the table only stores the array form.
 
-        When ``on_conflict_do_nothing`` is True and a row already exists for
-        ``(provider_kind, provider_ref, model_id)``, returns None so the seed
-        pipeline can count "newly inserted" cleanly.
+        When ``on_conflict_do_nothing`` is True and ``model_id`` is already in
+        the catalog, returns None so the seed pipeline can count "newly
+        inserted" cleanly. That covers a row under another provider too
+        (``uq_models_model_id``); :meth:`find_model_by_model_id` tells the two
+        apart.
         """
         canonical = self._canonicalize_capabilities(
             capability=capability, capabilities=capabilities
         )
         source = source or provenance_from_breadcrumb(seeded_from)
-        on_conflict = (
-            "ON CONFLICT (provider_kind, provider_ref, model_id) DO NOTHING"
-            if on_conflict_do_nothing
-            else ""
-        )
+        on_conflict = "ON CONFLICT DO NOTHING" if on_conflict_do_nothing else ""
         async with self.acquire() as conn:
             row = await conn.fetchrow(
                 f"""
@@ -56674,9 +56689,9 @@ class PostgresDB:
                     (provider_kind, provider_ref, model_id, display_label,
                      capabilities, family, context_window,
                      reasoning_level, params_json, enabled, seeded_from, notes,
-                     source, helm_value_hash, source_updated_at)
+                     source, helm_value_hash, served_model_id, source_updated_at)
                 VALUES ($1, $2, $3, $4, $5::TEXT[], $6, $7, $8, $9, $10, $11, $12,
-                        $13, $14, CURRENT_TIMESTAMP)
+                        $13, $14, $15, CURRENT_TIMESTAMP)
                 {on_conflict}
                 RETURNING {self._MODEL_FIELDS}
                 """,
@@ -56694,6 +56709,7 @@ class PostgresDB:
                 notes,
                 source,
                 helm_value_hash,
+                served_model_id,
             )
         return self._row_to_model(row) if row else None
 
@@ -56713,6 +56729,7 @@ class PostgresDB:
             "provider_kind",
             "provider_ref",
             "model_id",
+            "served_model_id",
             "display_label",
             "capabilities",
             "family",
@@ -56783,8 +56800,9 @@ class PostgresDB:
           ``api_key`` (decrypted inline); ``base_url`` is left None so the
           dispatcher falls through to the provider's hardcoded base URL.
 
-        When multiple rows match (same ``model_id`` under both a system
-        provider and an endpoint), the system row wins — direct beats gateway.
+        A model id names one row across every provider (``uq_models_model_id``),
+        so there is nothing to choose between. ``served_model_id`` is the name
+        the row sends upstream when it differs from ``model_id``.
         """
         async with self.acquire() as conn:
             row = await conn.fetchrow(
@@ -56794,6 +56812,7 @@ class PostgresDB:
                     m.provider_kind,
                     m.provider_ref,
                     m.model_id,
+                    m.served_model_id,
                     m.display_label,
                     m.capabilities,
                     m.family,
@@ -56817,8 +56836,6 @@ class PostgresDB:
                 WHERE m.model_id = $1
                   AND $2 = ANY(m.capabilities)
                   AND m.enabled = TRUE
-                ORDER BY (m.provider_kind = 'system') DESC, m.created_at ASC
-                LIMIT 1
                 """,
                 model_id,
                 capability,

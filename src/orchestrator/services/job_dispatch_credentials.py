@@ -281,6 +281,10 @@ async def inject_dispatch_credentials(
         )
         _llm_headers.update(llm_over.get("extra_headers") or {})
         llm_over["extra_headers"] = _llm_headers or None
+    # The name the provider is sent — same contract as the nested slots
+    # (`inject_model_credentials`): always the catalog row's, `None` when it
+    # has none, so a caller cannot pick it and a re-dispatch cannot keep it.
+    llm_over["served_model"] = meta.served_model_id if meta is not None else None
 
     if resolved_keys:
         # The stored vision key belongs to the vision provider's own endpoint:

@@ -94,6 +94,16 @@ class CatalogModelCreate(BaseModel):
         ),
     )
     model_id: str = Field(..., min_length=1, max_length=500)
+    served_model_id: str | None = Field(
+        None,
+        max_length=500,
+        description=(
+            "The name sent to the provider when it differs from model_id "
+            "(e.g. model_id 'claude-opus-5-5-api' serving 'claude-opus-5-5'). "
+            "model_id must then be this name plus a suffix of the same "
+            "family. Null or empty sends model_id."
+        ),
+    )
     display_label: str = Field(..., min_length=1, max_length=200)
     capabilities: list[CatalogCapabilityLiteral] = Field(
         ...,
@@ -148,6 +158,7 @@ class CatalogModelUpdate(BaseModel):
     provider_kind: Literal["system", "endpoint"] | None = None
     provider_ref: str | None = Field(None, min_length=1)
     model_id: str | None = Field(None, min_length=1, max_length=500)
+    served_model_id: str | None = Field(None, max_length=500)
     display_label: str | None = Field(None, min_length=1, max_length=200)
     capabilities: list[CatalogCapabilityLiteral] | None = Field(None, min_length=1)
     family: str | None = Field(None, min_length=1)

@@ -9,6 +9,7 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
+import re
 from typing import Any, TYPE_CHECKING
 
 from fastapi import HTTPException
@@ -32,6 +33,7 @@ from orchestrator.schemas.provider_catalog import (
 )
 from orchestrator.services.provider_catalog import EndpointProbe
 from orchestrator.services.readiness import try_auto_pin_required_defaults
+from shared.runtime.core.model_registry import served_model_problem
 from typing import Protocol
 
 if TYPE_CHECKING:
@@ -55,6 +57,7 @@ class ModelCatalogStore(Protocol):
         enabled_only: bool = False,
     ) -> list[dict[str, Any]]: ...
     async def get_model(self, model_id: str) -> dict[str, Any] | None: ...
+    async def find_model_by_model_id(self, model_id: str) -> dict[str, Any] | None: ...
     async def create_model(
         self,
         *,
@@ -69,6 +72,7 @@ class ModelCatalogStore(Protocol):
         params_json: dict[str, Any] | None = None,
         enabled: bool = True,
         notes: str | None = None,
+        served_model_id: str | None = None,
     ) -> dict[str, Any] | None: ...
     async def update_model(
         self, model_id: str, **fields: Any
@@ -112,6 +116,15 @@ def _normalize_catalog_model_id(
     ):
         return f"openrouter/{model_id}"
     return model_id
+
+
+def _provider_slug(label: str | None) -> str:
+    """A model-id-safe slug of a provider name or endpoint label.
+
+    The same shape migration 0552 used for the rows it renamed.
+    """
+    slug = re.sub(r"[^A-Za-z0-9]+", "-", label or "").strip("-").lower()
+    return slug or "endpoint"
 
 
 @dataclass(frozen=True)
@@ -180,6 +193,7 @@ class ModelCatalogService:
             "provider_kind": row["provider_kind"],
             "provider_ref": row["provider_ref"],
             "model_id": row["model_id"],
+            "served_model_id": row.get("served_model_id"),
             "display_label": row["display_label"],
             "capabilities": list(row.get("capabilities") or []),
             "family": row["family"],
@@ -253,6 +267,89 @@ class ModelCatalogService:
                 ),
             )
 
+    async def _provider_description(
+        self, provider_kind: str, provider_ref: str
+    ) -> tuple[str, str]:
+        """``(how the refusal names it, slug for a suggested id)``."""
+        if provider_kind == "endpoint":
+            endpoint = await self.store.get_system_llm_endpoint(provider_ref)
+            label = (endpoint or {}).get("label") or provider_ref
+            return f"endpoint '{label}'", _provider_slug(label)
+        return f"system provider '{provider_ref}'", _provider_slug(provider_ref)
+
+    async def _refuse_held_model_id(
+        self,
+        model_id: str,
+        *,
+        provider_kind: str,
+        provider_ref: str,
+        catalog_id: str | None = None,
+    ) -> None:
+        """409 when another catalog row already holds ``model_id``.
+
+        A model id names one row across every provider: every reference
+        (a pin, an expert's ``llm.model``, a job override) stores only the
+        id, so a second row could never be reached and would silently take
+        the first one's traffic. The detail names the holder and suggests a
+        suffixed id that serves the same name.
+        """
+        holder = await self.store.find_model_by_model_id(model_id)
+        if holder is None or str(holder.get("id")) == str(catalog_id):
+            return
+        held_by, _ = await self._provider_description(
+            str(holder["provider_kind"]), str(holder["provider_ref"])
+        )
+        wanted, slug = await self._provider_description(provider_kind, provider_ref)
+        served = holder.get("served_model_id") or model_id
+        # Suggest a free id, numbered like migration 0552's renames.
+        suggestion = f"{model_id}-{slug}"
+        for number in range(2, 10):
+            if await self.store.find_model_by_model_id(suggestion) is None:
+                break
+            suggestion = f"{model_id}-{slug}-{number}"
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"Model id '{model_id}' is already in the catalog under "
+                f"{held_by}. A model id names one row. To add it under "
+                f"{wanted} as well, give it its own id with the same served "
+                f"model id, e.g. model id '{suggestion}' and served model "
+                f"id '{served}'."
+            ),
+        )
+
+    @staticmethod
+    def _normalized_served_model_id(
+        provider_kind: str,
+        provider_ref: str,
+        model_id: str,
+        served_model_id: str | None,
+    ) -> str | None:
+        """The served model id to store: stripped, with the row's routing
+        prefix, and ``None`` when it is the model id itself."""
+        served = (served_model_id or "").strip()
+        if not served:
+            return None
+        served = _normalize_catalog_model_id(provider_kind, provider_ref, served)
+        return None if served == model_id else served
+
+    @staticmethod
+    def _check_served_model(
+        model_id: str, served_model_id: str | None, capabilities: list[str]
+    ) -> None:
+        """422 for a served model id the catalog cannot honour."""
+        if not served_model_id:
+            return
+        if "live_voice" in capabilities:
+            # The live voice pod reads its model from the connector config.
+            raise HTTPException(
+                status_code=422,
+                detail="A live_voice row cannot have a served model id yet.",
+            )
+        problem = served_model_problem(model_id, served_model_id)
+        if problem:
+            raise HTTPException(status_code=422, detail=problem)
+
     async def list_catalog_models(
         self,
         capability: str | None = None,
@@ -291,12 +388,20 @@ class ModelCatalogService:
         """Insert a new catalog row.
 
         Validates that ``provider_ref`` resolves to an existing transport before
-        insert. Returns the created row; raises 409 on
-        ``(provider_kind, provider_ref, model_id, capability)`` collision.
+        insert. Returns the created row; raises 409 when the model id is
+        already in the catalog under any provider, 422 for a served model id
+        that breaks the naming rule (``served_model_problem``).
         """
         await self._validate_catalog_provider_ref(body.provider_kind, body.provider_ref)
         model_id = _normalize_catalog_model_id(
             body.provider_kind, body.provider_ref, body.model_id
+        )
+        served_model_id = self._normalized_served_model_id(
+            body.provider_kind, body.provider_ref, model_id, body.served_model_id
+        )
+        self._check_served_model(model_id, served_model_id, list(body.capabilities))
+        await self._refuse_held_model_id(
+            model_id, provider_kind=body.provider_kind, provider_ref=body.provider_ref
         )
         try:
             row = await self.store.create_model(
@@ -312,17 +417,21 @@ class ModelCatalogService:
                 enabled=body.enabled,
                 notes=body.notes,
                 source=SOURCE_UI,
+                served_model_id=served_model_id,
             )
         except ValueError as e:
             raise HTTPException(status_code=400, detail=str(e))
         except Exception as e:
-            if "uq_model_provider" in str(e):
+            if "uq_model_provider" in str(e) or "uq_models_model_id" in str(e):
+                # A concurrent create took the id after the check above.
+                await self._refuse_held_model_id(
+                    model_id,
+                    provider_kind=body.provider_kind,
+                    provider_ref=body.provider_ref,
+                )
                 raise HTTPException(
                     status_code=409,
-                    detail=(
-                        f"Catalog row for ({body.provider_kind}/{body.provider_ref}, "
-                        f"{model_id}) already exists."
-                    ),
+                    detail=f"Model id '{model_id}' is already in the catalog.",
                 )
             raise
         if row is None:
@@ -347,8 +456,13 @@ class ModelCatalogService:
         """
         fields = body.model_dump(exclude_unset=True)
         existing = None
-        if "provider_kind" in fields or "provider_ref" in fields:
+        if {"model_id", "served_model_id", "capabilities"} & fields.keys():
             existing = await self.store.get_model(catalog_id)
+            if existing is None:
+                raise HTTPException(status_code=404, detail="Catalog row not found")
+        if "provider_kind" in fields or "provider_ref" in fields:
+            if existing is None:
+                existing = await self.store.get_model(catalog_id)
             if existing is None:
                 raise HTTPException(status_code=404, detail="Catalog row not found")
             new_kind = fields.get("provider_kind", existing["provider_kind"])
@@ -367,6 +481,31 @@ class ModelCatalogService:
                 fields.get("provider_ref", existing["provider_ref"]),
                 fields["model_id"],
             )
+        if {"model_id", "served_model_id", "capabilities"} & fields.keys():
+            assert existing is not None
+            kind = fields.get("provider_kind", existing["provider_kind"])
+            ref = fields.get("provider_ref", existing["provider_ref"])
+            model_id = fields.get("model_id", existing["model_id"])
+            served_model_id = self._normalized_served_model_id(
+                kind,
+                ref,
+                model_id,
+                fields.get("served_model_id", existing.get("served_model_id")),
+            )
+            if "served_model_id" in fields:
+                fields["served_model_id"] = served_model_id
+            self._check_served_model(
+                model_id,
+                served_model_id,
+                list(fields.get("capabilities") or existing.get("capabilities") or []),
+            )
+            if model_id != existing["model_id"]:
+                await self._refuse_held_model_id(
+                    model_id,
+                    provider_kind=kind,
+                    provider_ref=ref,
+                    catalog_id=catalog_id,
+                )
         # An admin write is recorded as such; a Helm-reconciled row then shows
         # as overridden until the next `helm upgrade` re-applies it.
         fields["source"] = SOURCE_UI
@@ -375,7 +514,7 @@ class ModelCatalogService:
         except ValueError as e:
             raise HTTPException(status_code=400, detail=str(e))
         except Exception as e:
-            if "uq_model_provider" in str(e):
+            if "uq_model_provider" in str(e) or "uq_models_model_id" in str(e):
                 raise HTTPException(
                     status_code=409,
                     detail="Update would collide with an existing catalog row.",
@@ -595,6 +734,7 @@ class ModelCatalogService:
                         "provider": provider_tag,
                         "configured": True,
                         "models": [],
+                        "labels": {},
                     }
                 else:  # endpoint
                     label = endpoint_label_by_id.get(ref, f"endpoint:{ref[:8]}")
@@ -604,9 +744,13 @@ class ModelCatalogService:
                         "endpoint_id": ref,
                         "configured": True,
                         "models": [],
+                        "labels": {},
                     }
                 groups_by_key[key] = group
             group["models"].append(row["model_id"])
+            # The picker's option text; `models` stays a list of ids for the
+            # API and MCP callers that read it.
+            group["labels"][row["model_id"]] = row["display_label"]
 
         groups = list(groups_by_key.values())
 

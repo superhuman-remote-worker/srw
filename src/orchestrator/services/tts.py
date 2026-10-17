@@ -856,7 +856,7 @@ async def _resolve_elevenlabs_context(
     )
     if tts_creds is None:
         return None, None
-    backend = _resolve_tts_provider(tts_creds.model, tts_creds.provider)
+    backend = _resolve_tts_provider(tts_creds.wire_model, tts_creds.provider)
     if backend != "elevenlabs":
         return backend, None
     key = (tts_creds.api_key or os.environ.get("ELEVENLABS_API_KEY") or "").strip()
@@ -1203,7 +1203,7 @@ async def generate_message_tts(
     if tts_creds is None:
         logger.info("No TTS model configured for user %s", user_id)
         return None
-    tts_model = tts_creds.model
+    tts_model = tts_creds.wire_model
     # Voice picked from the *content's* language (not the UI language) with the
     # user's explicit choice and admin per-language map layered on; ``language``
     # from the request is a fallback hint only. ``instructions`` is the style
@@ -1227,7 +1227,7 @@ async def generate_message_tts(
             custom_prompt, reasoning_level = _read_aloud_prefs(user_settings)
             speech_input = await _formulate_for_speech(
                 content,
-                model=aux_creds.model,
+                model=aux_creds.wire_model,
                 base_url=aux_creds.base_url,
                 api_key=aux_creds.api_key,
                 ledger=ledger,
@@ -1349,7 +1349,7 @@ async def synthesize_voice_preview(
     if tts_creds is None:
         logger.info("No TTS model configured for user %s (voice preview)", user_id)
         return None
-    tts_model = tts_creds.model
+    tts_model = tts_creds.wire_model
 
     tts_params = tts_creds.params
     lang = "de" if (language or "").lower().startswith("de") else "en"
@@ -1830,7 +1830,7 @@ async def plan_tts_chunks(
         if aux_creds is not None:
             chunks = await _llm_clean_and_chunk(
                 content,
-                model=aux_creds.model,
+                model=aux_creds.wire_model,
                 base_url=aux_creds.base_url,
                 api_key=aux_creds.api_key,
                 ledger=ledger,
@@ -1956,7 +1956,7 @@ async def stream_tts_chunks(
         yield {"type": "done", "total": index, "rewritten": False}
         return
 
-    aux_model = aux_creds.model
+    aux_model = aux_creds.wire_model
     aux_base_url = aux_creds.base_url
     client = AsyncOpenAI(
         api_key=aux_creds.api_key,

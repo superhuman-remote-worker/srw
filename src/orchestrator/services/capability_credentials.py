@@ -21,6 +21,14 @@ class CapabilityCredentials:
     provider: str | None = None
     params: dict[str, Any] = field(default_factory=dict)
     catalog_id: str | None = None
+    # The row's ``served_model_id``: the name the provider is sent when it
+    # differs from the catalog id in ``model``.
+    served_model: str | None = None
+
+    @property
+    def wire_model(self) -> str:
+        """The model name to send to the provider."""
+        return self.served_model or self.model
 
 
 async def resolve_capability_credentials(
@@ -77,6 +85,7 @@ async def resolve_capability_credentials(
             provider=provider,
             params=params,
             catalog_id=str(row["catalog_id"]) if row.get("catalog_id") else None,
+            served_model=row.get("served_model_id") or None,
         )
 
     # Compatibility for a model resolved outside the DB catalog. The default
@@ -109,4 +118,5 @@ async def resolve_capability_credentials(
         base_url=str(base_url) if base_url else None,
         api_key=str(api_key) if api_key else None,
         provider=provider,
+        served_model=meta.served_model_id if meta is not None else None,
     )

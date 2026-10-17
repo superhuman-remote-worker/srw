@@ -49,6 +49,9 @@ data:
           {{- range $ep.models }}
           - id: {{ required "model.id is required" .id | quote }}
             displayName: {{ default .id .displayName | quote }}
+            {{- with .servedModelId }}
+            servedModelId: {{ . | quote }}
+            {{- end }}
             {{- with .capabilities }}
             capabilities:
               {{- range . }}
@@ -87,6 +90,9 @@ data:
       - provider: {{ required "llm.seed.systemModels[].provider is required" .provider | quote }}
         id: {{ required "llm.seed.systemModels[].id is required" .id | quote }}
         displayName: {{ default .id .displayName | quote }}
+        {{- with .servedModelId }}
+        servedModelId: {{ . | quote }}
+        {{- end }}
         {{- with .capabilities }}
         capabilities:
           {{- range . }}

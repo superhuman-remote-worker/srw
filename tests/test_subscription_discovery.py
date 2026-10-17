@@ -324,6 +324,7 @@ class TestImport:
     def _db(self):
         db = AsyncMock()
         db.create_model = AsyncMock(return_value={"id": "new-row"})
+        db.find_model_by_model_id = AsyncMock(return_value=None)
         return db
 
     def _candidate(self, **overrides):
@@ -516,6 +517,54 @@ class TestImport:
         )
         assert outcome.skipped == ["kimi-k2.6"]
         assert outcome.created == []
+
+    @pytest.mark.asyncio
+    async def test_an_id_another_provider_holds_is_rejected_with_the_holder(self):
+        # A model id names one catalog row; the proxy row could never be
+        # reached while another provider holds the id.
+        db = self._db()
+        db.create_model = AsyncMock(return_value=None)
+        db.find_model_by_model_id = AsyncMock(
+            return_value={
+                "model_id": "kimi-k2.6",
+                "provider_kind": "system",
+                "provider_ref": "openrouter",
+            }
+        )
+        outcome = await discovery.import_candidates(
+            db=db,
+            endpoint_id=ENDPOINT_ID,
+            candidates=[self._candidate()],
+            requested_ids=None,
+            include_review=False,
+        )
+        assert outcome.skipped == []
+        assert outcome.rejected == [
+            {
+                "id": "kimi-k2.6",
+                "reason": "already in the catalog under system openrouter",
+            }
+        ]
+
+    @pytest.mark.asyncio
+    async def test_this_endpoints_own_row_still_counts_as_skipped(self):
+        db = self._db()
+        db.create_model = AsyncMock(return_value=None)
+        db.find_model_by_model_id = AsyncMock(
+            return_value={
+                "model_id": "kimi-k2.6",
+                "provider_kind": "endpoint",
+                "provider_ref": ENDPOINT_ID,
+            }
+        )
+        outcome = await discovery.import_candidates(
+            db=db,
+            endpoint_id=ENDPOINT_ID,
+            candidates=[self._candidate()],
+            requested_ids=None,
+            include_review=False,
+        )
+        assert outcome.skipped == ["kimi-k2.6"]
 
 
 class TestAdvertisedModelIds:
