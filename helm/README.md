@@ -411,7 +411,11 @@ Edit at minimum:
 - `image.{orchestrator,agent,cockpit,mcp,workspace}.tag` → the matching
   `vX.Y.Z` release tag, or set each component's verified `digest`
 - `secrets.existingSecret` → name of a Secret you create yourself (see below)
-- `databases.*.externalUrl` → connection strings for managed Postgres, vector
+- `databases.{postgres,vector}.externalHost` / `externalDb` → your managed
+  Postgres and pgvector (user and password come from the Secret);
+  `databases.keycloak.externalUrl` only with the bundled Keycloak
+- `llm.seed` → the Secret holding your OpenRouter key (or set
+  `llm.seed.enabled: false` and add models in Admin → Models)
 - `keycloak.externalIssuerUrl` → your IdP issuer URL
 - `gitea.internal: false` + `*.externalUrl` → your git server URLs
 - `cloud.externalBackend` + `cloud.externalUrl` → your cloud storage endpoint
