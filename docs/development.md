@@ -1,3 +1,8 @@
+---
+title: Development guide
+description: Set up a development environment, iterate against a local k3d cluster, and run the same tests and linters as CI.
+---
+
 # Development guide
 
 SRW deploys to Kubernetes in every environment. Local Python and frontend
@@ -19,6 +24,7 @@ For contribution scope and pull-request expectations, read
 | `cockpit/` | Angular web application |
 | `config/` | Expert, role, prompt, tool, and skill configuration |
 | `helm/` | Kubernetes deployment artifact and values schema |
+| `docs/`, `docs-site/` | Public documentation and the Astro Starlight site that publishes it |
 | `deployment/`, `scripts/` | Local overlays and operational helpers |
 | `tests/` | Python unit, integration, chart-contract, and end-to-end tests |
 
@@ -397,6 +403,37 @@ do not treat a manual cluster patch as the completed fix.
 For changes crossing orchestrator, agent, and workspace boundaries, repeat the
 [local smoke test](local-kubernetes.md#smoke-test): sign in, create a session,
 send a message, create a job, and inspect the resulting pod and job states.
+
+## Documentation site
+
+The Markdown under `docs/` is the single source of the public documentation
+site. `docs-site/` is an [Astro Starlight](https://starlight.astro.build)
+project that loads those files directly; nothing is copied. Build it with
+Node.js 22:
+
+```bash
+cd docs-site
+npm ci
+npm run build     # writes dist/, fails on broken links
+npm run preview   # serves dist/ on http://localhost:4321
+npm run dev       # live preview while editing docs/
+```
+
+The build:
+
+- generates the Helm values reference from `helm/values.yaml` and
+  `helm/values.schema.json` (`scripts/generate-helm-reference.mjs`, written
+  to the gitignored `src/generated/`);
+- drops each page's leading `# Title`, because the site renders the
+  frontmatter `title`;
+- turns links between pages (`models.md#anchor`) into site links and links to
+  other repository files (`../helm/README.md`) into GitHub links; and
+- fails on a link to a missing page, heading or repository file.
+
+A new page needs frontmatter with `title` and `description`, the same title as
+its H1, and an entry in the `sidebar` of `docs-site/astro.config.mjs`. The
+`docs` workflow builds the site on pushes to `develop` and `main` that touch
+these files, and deploys it to GitHub Pages from `main`.
 
 ## Debugging state
 
