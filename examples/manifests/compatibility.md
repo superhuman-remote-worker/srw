@@ -3,7 +3,7 @@
 The authored API is **`srw/v1alpha1`**. These are the supported boundaries for
 the first-release candidate. They do not declare a stable `srw/v1` API or promise
 that every runtime implements every field accepted by the resource schema.
-See [first-release readiness](v1-readiness.md) for deployment and acceptance evidence.
+See [first-release readiness](v1-readiness.md) for the supported core and acceptance evidence.
 
 ## Versions and resource identity
 

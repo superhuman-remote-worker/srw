@@ -905,5 +905,4 @@ also passed after the cleanup-capture lock correction. It exercised sandbox and
 virtual Jobs, existing Job API selection, Session configuration updates and
 End/Resume, and sandbox/virtual/no-workspace Sessions, including exact cleanup.
 
-The [readiness page](v1-readiness.md) records the subsequent integration fixes,
-complete regression runs and MCP/harness acceptance state.
+The [readiness page](v1-readiness.md) lists the later local acceptance records.

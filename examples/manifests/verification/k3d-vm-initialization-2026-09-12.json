@@ -110,7 +110,7 @@
     "No LLM execution or full nested SRW/Tilt deployment in this gate.",
     "Live execution lifecycle covered Jobs; Session snapshot/patch and readiness parity covered by PostgreSQL and regression tests.",
     "No cached environment.prepare builds, cross-Job retention/instanceRef, or execution-connector-dependent VM initialization.",
-    "No main-dev deployment or timeout change."
+    "No shared-cluster deployment or timeout change."
   ],
   "sourceSHA256": {
     ".github/workflows/develop.yml": "1a08681da5a6628fca1508a48621cce906b5a44a5bbd7531d676365314085a87",
