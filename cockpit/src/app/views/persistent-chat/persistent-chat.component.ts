@@ -2358,12 +2358,15 @@ export function clearDraft(threadId: string | null): void {
 
           @if (!isRecording()) {
           <div class="composer-row">
-            <!-- Attach button + popover menu -->
+            <!-- Attach button + popover menu. Open whenever the composer is:
+                 a chip rides the outbox with the text, so on the landing
+                 draft or a starting/ended session it uploads once the thread
+                 it creates or resumes is ready. -->
             <div class="attach-wrap">
               <button
                 type="button"
                 class="ctrl"
-                [disabled]="!chat.isConnected() || chat.isParked()"
+                [disabled]="!canCompose()"
                 [title]="'chat.composer.attach' | transloco"
                 [class.active]="attachmentMenuOpen()"
                 (click)="attachmentMenuOpen() ? closeAttachmentMenu() : openAttachmentMenu()"
@@ -2393,7 +2396,7 @@ export function clearDraft(threadId: string | null): void {
               <button
                 type="button"
                 class="ctrl"
-                [disabled]="!chat.isConnected() || chat.isParked()"
+                [disabled]="!canCompose()"
                 [title]="'chat.composer.takePhoto' | transloco"
                 (click)="pickCamera()"
               >
@@ -3832,10 +3835,11 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
 
         const files = event.dataTransfer?.files;
         if (!files || files.length === 0) return;
-        // Honour the same gating as the file picker — if the session is
-        // disconnected, the upload would fail anyway; if its unit is parked,
-        // the chip could never be sent.
-        if (!this.chat.isConnected() || this.chat.isParked()) return;
+        // Same gate as the Attach button: wherever the composer is open the
+        // chip rides the outbox with the text (the landing draft included,
+        // where no session exists yet). A mid-session reconnect or a parked
+        // unit closes both.
+        if (!this.canCompose()) return;
 
         this.applyFilePreviews(await this.fileHandling.createFilePreviews(Array.from(files)));
     }

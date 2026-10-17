@@ -304,6 +304,77 @@ describe('parked unit composer', () => {
   });
 });
 
+// New chat lands on a draft with no session behind it. A chip rides the first
+// send's outbox item into the thread that send creates, exactly like the text,
+// so Attach and drop follow the composer rather than the connection.
+describe('attachments follow the composer', () => {
+  beforeAll(async () => {
+    HTMLElement.prototype.scrollTo = vi.fn();
+    await ɵresolveComponentResources(() => Promise.resolve(''));
+  });
+
+  const api = {
+    getThreadIdeStatus: () => of(null),
+    getMyCapabilities: () => of(null),
+    getSshHostKeys: () => of({hostname: 'ssh.example.test', host_keys: []}),
+  };
+
+  function dropEvent(file: File): DragEvent {
+    return {dataTransfer: {types: ['Files'], files: [file]}, preventDefault: vi.fn()} as unknown as DragEvent;
+  }
+
+  async function mountWithPreviews(chat: any) {
+    chat.addAttachments = vi.fn();
+    const fixture = await mountChat(chat, api, false);
+    const preview = {id: 'p1', name: 'notes.pdf', size: 3, mimeType: 'application/pdf'};
+    Object.assign(TestBed.inject(FileHandlingService), {
+      createFilePreviews: vi.fn(async () => ({previews: [preview], rejected: []})),
+    });
+    return {fixture, preview};
+  }
+
+  it('attaches on the landing draft before any session exists', async () => {
+    const chat = sessionState() as any;
+    chat.isDraftSession.set(true);
+    chat.isConnected.set(false);
+    chat.sessionReady.set(false);
+    chat.threadId.set(null);
+    chat.threadStatus.set(null);
+    chat.connectionState.set('disconnected');
+    chat.startupPhase.set(null);
+    chat.draftDatasourceIds.set([]);
+    chat.draftConnectorsEnabled = signal(true);
+    const {fixture, preview} = await mountWithPreviews(chat);
+    try {
+      const el = fixture.nativeElement as HTMLElement;
+      expect(el.querySelector<HTMLButtonElement>('.attach-wrap button')!.disabled).toBe(false);
+
+      await fixture.componentInstance.onDrop(dropEvent(new File(['pdf'], 'notes.pdf')));
+      expect(chat.addAttachments).toHaveBeenCalledExactlyOnceWith([preview]);
+    } finally {
+      fixture.destroy();
+      TestBed.resetTestingModule();
+    }
+  });
+
+  it('refuses Attach and drop during a mid-session reconnect', async () => {
+    const chat = sessionState() as any;
+    chat.isConnected.set(false);
+    chat.connectionState.set('connecting');
+    const {fixture} = await mountWithPreviews(chat);
+    try {
+      const el = fixture.nativeElement as HTMLElement;
+      expect(el.querySelector<HTMLButtonElement>('.attach-wrap button')!.disabled).toBe(true);
+
+      await fixture.componentInstance.onDrop(dropEvent(new File(['pdf'], 'notes.pdf')));
+      expect(chat.addAttachments).not.toHaveBeenCalled();
+    } finally {
+      fixture.destroy();
+      TestBed.resetTestingModule();
+    }
+  });
+});
+
 // R1 follow-up: a stateless End fenced by a retryable 503 stays `ending` until
 // End is pressed again — nothing on the server finishes it — so the header
 // keeps End (`chat.header.disconnect`) there. A pinned `ending` session, which

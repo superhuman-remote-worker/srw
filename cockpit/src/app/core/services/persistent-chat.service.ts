@@ -5883,9 +5883,17 @@ export class PersistentChatService {
         // Upload may outlive a CLOSED stream, End, navigation or a successor
         // connect. Keep the unaccepted item queued; no G1 send may slip into
         // G2 while owner/stream/binding recovery is still unresolved.
+        //
+        // A flush that began with no generation installed is not a G1 send.
+        // /connection marks the session ready before it installs the runtime
+        // it names, so the first flush of a connect starts with none; an
+        // upload then spans that install (a new session's first message with
+        // a file). Within the same connect, the first generation to arrive is
+        // the runtime this item was waiting for.
+        const runtimeSwitched =
+          runtimeAtPost !== null && this.sessionRuntimeGeneration !== runtimeAtPost;
         if (!this.sessionReady() || !this._controlPlaneAllowed(tidAtPost) ||
-            this.connectGeneration !== connectAtPost ||
-            this.sessionRuntimeGeneration !== runtimeAtPost) {
+            this.connectGeneration !== connectAtPost || runtimeSwitched) {
           if (this.threadId() === tidAtPost && this.outboxIds().has(item.localId)) {
             this.outboxStalled.set(true);
           }
