@@ -208,9 +208,11 @@ def apply_datasource_enrichment_to_resolved(
 MEMORY_EMBEDDING_ENV_KEYS = (
     "EMBEDDING_PROVIDER",
     "EMBEDDING_MODEL",
+    "EMBEDDING_SERVED_MODEL",
     "EMBEDDING_BASE_URL",
     "EMBEDDING_API_KEY",
     "RERANK_MODEL",
+    "RERANK_SERVED_MODEL",
     "RERANK_BASE_URL",
     "RERANK_API_KEY",
 )
@@ -233,8 +235,13 @@ def apply_session_embedding_env(env_keys: Optional[Dict[str, Any]]) -> None:
     with tenant-A env_keys followed by an attach with tenant-B env_keys
     absent, ``os.environ`` carries no A values and the singleton is None.
     """
+    from shared.runtime.core.transport_resolution import clear_served_model_env
+
     for k in MEMORY_EMBEDDING_ENV_KEYS:
         os.environ.pop(k, None)
+    # Every served model string, not only the memory ones: each belongs to
+    # the dispatch block that named it, and this pod may have run another.
+    clear_served_model_env()
     from shared.runtime.services import embedding_service as _embedding_module
 
     _embedding_module._embedding_service = None

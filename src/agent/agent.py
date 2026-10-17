@@ -735,6 +735,7 @@ class UniversalAgent:
         from shared.runtime.core.transport_resolution import (
             CitationTransportError,
             resolve_citation_transport,
+            served_model_from_env,
         )
         from shared.runtime.services.auxiliary import AuxiliaryLLM
 
@@ -763,6 +764,7 @@ class UniversalAgent:
                 transport = resolve_citation_transport()
                 verify_cfg = LLMConfig(
                     model=citation_model,
+                    served_model=served_model_from_env("CITATION_LLM"),
                     base_url=transport.base_url,
                     api_key=transport.api_key,
                     temperature=0.0,
@@ -3536,11 +3538,16 @@ class UniversalAgent:
         # in-flight block. Otherwise an omitted BASE_URL/API_KEY can survive and
         # pair a new model with the previous endpoint/credential.
         import os as _os
+        from shared.runtime.core.transport_resolution import clear_served_model_env
         from shared.runtime.services.embedding_service import (
             KB_EMBEDDING_ENV_KEYS,
             apply_kb_embedding_env,
         )
 
+        # A served model string belongs to the block that named it: a later
+        # job that pins its own {PREFIX}_MODEL must not inherit the previous
+        # job's upstream name (this pod is reused).
+        clear_served_model_env()
         apply_kb_embedding_env(env_keys)
         if env_keys:
             from shared.runtime.core.transport_resolution import exportable_env_keys

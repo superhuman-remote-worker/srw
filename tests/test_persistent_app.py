@@ -7805,6 +7805,19 @@ class TestHandleConfigUpdateEnrichmentGate:
                 "credential-bearing-keys tuple."
             )
 
+    def test_hot_swap_replaces_the_served_model_of_each_touched_slot(self):
+        """A served model string belongs to the model it came with: the swap
+        clears the old one of every slot the block touches before applying."""
+        from inspect import getsource
+        from agent.api.persistent_app import _handle_config_update
+
+        src = getsource(_handle_config_update)
+        assert "EMBEDDING_SERVED_MODEL" in src
+        assert "RERANK_SERVED_MODEL" in src
+        assert src.index("clear_served_model_env(") < src.index(
+            "os.environ[k] = str(new_env_block[k])"
+        )
+
     def test_gate_checks_tool_updates_before_local_reload(self):
         from inspect import getsource
 
@@ -7969,6 +7982,50 @@ class TestHandleConfigUpdateEnrichmentGate:
 
         src = getsource(_handle_config_update)
         assert "_embedding_module._embedding_service = None" in src
+
+
+class TestSessionArchiveModelName:
+    """llm_requests names the catalog row of a served-model call (rule 9)."""
+
+    async def _archive(self, monkeypatch, llm_config, echoed):
+        import agent.api.persistent_app as mod
+
+        recorded = []
+        monkeypatch.setattr(
+            "agent.core.archiver.archive_llm_request",
+            lambda **kw: recorded.append(kw),
+        )
+        session = SimpleNamespace(turn_count=4, config=SimpleNamespace(llm=llm_config))
+        monkeypatch.setattr(mod, "_session", session)
+        monkeypatch.setattr(mod._session_identity, "_thread_id", "thread-1")
+        mod._loop_archive_llm_call(
+            [HumanMessage(content="hi")],
+            AIMessage(content="x"),
+            {"model": echoed, "latency_ms": 5},
+        )
+        for _ in range(100):
+            if recorded:
+                break
+            await asyncio.sleep(0.01)
+        return recorded[0]["model"]
+
+    @pytest.mark.asyncio
+    async def test_served_model_row_is_archived_under_its_catalog_id(self, monkeypatch):
+        from shared.runtime.core.loader import LLMConfig
+
+        cfg = LLMConfig(model="claude-opus-5-5-api", served_model="claude-opus-5-5")
+        assert await self._archive(monkeypatch, cfg, "claude-opus-5-5") == (
+            "claude-opus-5-5-api"
+        )
+
+    @pytest.mark.asyncio
+    async def test_without_a_served_model_the_echo_is_kept(self, monkeypatch):
+        from shared.runtime.core.loader import LLMConfig
+
+        cfg = LLMConfig(model="gpt-4o")
+        assert await self._archive(monkeypatch, cfg, "gpt-4o-2024-08-06") == (
+            "gpt-4o-2024-08-06"
+        )
 
 
 class TestHandleConfigUpdateAckProtocol:
@@ -8268,9 +8325,11 @@ class TestAttachSessionRebinds:
         assert set(MEMORY_EMBEDDING_ENV_KEYS) == {
             "EMBEDDING_PROVIDER",
             "EMBEDDING_MODEL",
+            "EMBEDDING_SERVED_MODEL",
             "EMBEDDING_BASE_URL",
             "EMBEDDING_API_KEY",
             "RERANK_MODEL",
+            "RERANK_SERVED_MODEL",
             "RERANK_BASE_URL",
             "RERANK_API_KEY",
         }

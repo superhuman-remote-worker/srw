@@ -880,7 +880,16 @@ _TASK_CALL_TYPES = {
 
 
 def _get_model_name(llm: BaseChatModel) -> str:
-    """Extract model name from a LangChain chat model."""
+    """Extract model name from a LangChain chat model.
+
+    A client built for a catalog row with a served model names the catalog
+    id, not the string it sends (``loader.recorded_model_name``).
+    """
+    from shared.runtime.core.transport_resolution import catalog_model_of
+
+    catalog_model = catalog_model_of(llm)
+    if catalog_model:
+        return catalog_model
     for attr in ("model_name", "model"):
         if hasattr(llm, attr):
             return getattr(llm, attr)

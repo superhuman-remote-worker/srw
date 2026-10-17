@@ -57,7 +57,7 @@ from shared.runtime.core.context_entries import (
     last_user_text,
 )
 from shared.runtime.core.llm_retry import _classify_llm_error, _extract_rate_limit_delay
-from shared.runtime.core.loader import with_current_date
+from shared.runtime.core.loader import recorded_model_name, with_current_date
 from shared.runtime.core.message_markers import PERSIST_ROLE_KEY as _PERSIST_ROLE_KEY
 from shared.runtime.core.message_markers import (
     pin_turn_input,
@@ -3294,6 +3294,13 @@ async def _execute_turn(
                         or ""
                     ),
                 )
+                # Usage and the llm_requests row name the catalog row, not the
+                # served string the provider echoes back (rule 9).
+                usage_model = recorded_model_name(
+                    getattr(config, "llm", None), attempt_metrics.get("model")
+                )
+                if usage_model:
+                    attempt_metrics["model"] = usage_model
                 last_provider_metrics = attempt_metrics
             completed_provider_attempts.append(
                 (

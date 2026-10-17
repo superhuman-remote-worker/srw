@@ -33,6 +33,7 @@ from shared.runtime.core.loader import (
     resolve_model_settings,
 )
 from shared.runtime.core.message_markers import PERSIST_ROLE_CONTEXT
+from shared.runtime.core.transport_resolution import served_model_from_env
 from shared.runtime.services.memory_prompts import resolve_memory_extraction_prompt
 from shared.runtime.services.auxiliary import AuxiliaryLLM, ExtractMemoriesTask
 from shared.runtime.services.embedding_service import EmbeddingService
@@ -428,6 +429,9 @@ def _build_embedding_service(config: Any) -> EmbeddingService:
         raise RuntimeError("resolved session embedding dimensions are invalid") from exc
     return EmbeddingService(
         model=model,
+        served_model=served_model_from_env("EMBEDDING", env)
+        if env.get("EMBEDDING_MODEL")
+        else None,
         base_url=str(base_url),
         api_key=str(api_key),
         provider=provider,

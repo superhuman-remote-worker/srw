@@ -183,6 +183,7 @@ class AudioHelper:
         """Initialize the Audio Helper with configuration from environment."""
         from shared.runtime.core.transport_resolution import (
             is_openai_default_endpoint,
+            served_model_from_env,
             wire_model_id,
         )
 
@@ -195,8 +196,12 @@ class AudioHelper:
             else ""
         )
         self.api_key = os.getenv("WHISPER_API_KEY", primary_key)
+        # WHISPER_MODEL is the catalog id; the request carries the upstream
+        # string its catalog row names (WHISPER_SERVED_MODEL), when it names one.
+        catalog_model = os.getenv("WHISPER_MODEL")
+        served_model = served_model_from_env("WHISPER") if catalog_model else None
         self.model = wire_model_id(
-            os.getenv("WHISPER_MODEL", "whisper-1"), self.api_base
+            served_model or catalog_model or "whisper-1", self.api_base
         )
         self.timeout = float(os.getenv("WHISPER_TIMEOUT", "300"))
         self.default_language = os.getenv("WHISPER_LANGUAGE")

@@ -91,6 +91,7 @@ class RerankerScorer:
         retries: int = 2,
         retry_backoff: float = 1.0,
         client: Optional[Any] = None,
+        served_model: Optional[str] = None,
     ) -> None:
         if not base_url:
             raise ValueError(
@@ -102,7 +103,9 @@ class RerankerScorer:
 
         # The rerank catalog id may carry its provider's routing prefix
         # (``openrouter/qwen/qwen3-reranker-8b``), which that provider rejects.
-        self.model = wire_model_id(model, base_url)
+        # A catalog row that names its upstream string (``served_model``)
+        # sends that instead.
+        self.model = wire_model_id(served_model or model, base_url)
         self.endpoint = base_url.rstrip("/") + "/rerank"
         self.api_key = api_key
         self.top_k = top_k
@@ -258,6 +261,23 @@ def resolve_reranker_transport(
     return model, base_url, api_key
 
 
+def resolve_reranker_served_model(
+    cfg: Any, env: Optional[Mapping[str, str]] = None
+) -> Optional[str]:
+    """The upstream string dispatched with ``RERANK_MODEL``, or ``None``.
+
+    Only when the scorer's model IS that env model: an explicit
+    ``memory.reranker.model`` is sent as written.
+    """
+    from shared.runtime.core.transport_resolution import served_model_from_env
+
+    if env is None:
+        env = os.environ
+    if cfg.model or not env.get("RERANK_MODEL"):
+        return None
+    return served_model_from_env("RERANK", env)
+
+
 @register_memory_plugin(
     "scorer",
     "reranker",
@@ -276,6 +296,7 @@ def _build_reranker(runtime: Any) -> RerankerScorer:
     model, base_url, api_key = resolve_reranker_transport(cfg)
     return RerankerScorer(
         model=model,
+        served_model=resolve_reranker_served_model(cfg),
         base_url=base_url,
         api_key=api_key,
         top_k=cfg.top_k,

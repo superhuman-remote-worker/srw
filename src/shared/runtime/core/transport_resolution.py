@@ -26,8 +26,9 @@ Per-provider base_url / api_key behaviour, from the loader factories:
 - ``codex``: default base_url (CODEX proxy), keyless. Never flagged.
 """
 
+import os
 from dataclasses import dataclass
-from typing import Mapping, Optional
+from typing import Iterable, Mapping, Optional
 from urllib.parse import urlsplit
 
 # Providers whose create_llm factory RAISES when no api_key resolves.
@@ -326,6 +327,7 @@ _DISPATCH_ENV_PREFIXES = (
 )
 _DISPATCH_ENV_SUFFIXES = (
     "MODEL",
+    "SERVED_MODEL",
     "BASE_URL",
     "API_KEY",
     "PROVIDER",
@@ -352,6 +354,57 @@ DISPATCH_ENV_KEY_NAMES = frozenset(
     | {"OPENROUTER_API_KEY"}
     | _TUNING_ENV_KEY_NAMES
 )
+
+
+# The upstream model string a catalog row names (``models.served_model_id``)
+# rides next to its catalog id as ``{PREFIX}_SERVED_MODEL``; ``{PREFIX}_MODEL``
+# stays the catalog id (sessions persist and re-resolve it). The dispatch
+# leaves it out when the row names none; ``""`` reads as none too.
+SERVED_MODEL_ENV_KEY_NAMES = tuple(f"{p}_SERVED_MODEL" for p in _DISPATCH_ENV_PREFIXES)
+
+
+def served_model_from_env(
+    prefix: str, env: Optional[Mapping[str, str]] = None
+) -> Optional[str]:
+    """The upstream model string dispatched for ``prefix``, or ``None``."""
+    source = os.environ if env is None else env
+    value = source.get(f"{prefix}_SERVED_MODEL")
+    if not isinstance(value, str):
+        return None
+    return value.strip() or None
+
+
+def clear_served_model_env(prefixes: Optional[Iterable[str]] = None) -> None:
+    """Drop ``{PREFIX}_SERVED_MODEL`` from the process environment.
+
+    A served string belongs to the dispatch block that named it. Agent pods
+    are reused, and a later block that pins its own ``{PREFIX}_MODEL`` may
+    carry no served string, so every export seam clears these before
+    applying a block — the previous model's upstream name must never pair
+    with the next model.
+    """
+    for prefix in _DISPATCH_ENV_PREFIXES if prefixes is None else prefixes:
+        os.environ.pop(f"{prefix}_SERVED_MODEL", None)
+
+
+# Set on a chat client built for a catalog row with a served model, so a
+# recorder that holds only the client (the auxiliary archive) records the
+# catalog id rather than the string the client sends.
+_CATALOG_MODEL_ATTR = "_srw_catalog_model"
+
+
+def stamp_catalog_model(llm: object, model: str) -> None:
+    """Remember on ``llm`` the catalog id it was built for."""
+    try:
+        object.__setattr__(llm, _CATALOG_MODEL_ATTR, model)
+    except (AttributeError, TypeError):  # pragma: no cover - slotted doubles
+        pass
+
+
+def catalog_model_of(llm: object) -> Optional[str]:
+    """The catalog id stamped on ``llm``, or ``None`` when none was."""
+    value = getattr(llm, _CATALOG_MODEL_ATTR, None)
+    return value if isinstance(value, str) and value else None
 
 
 def exportable_env_keys(

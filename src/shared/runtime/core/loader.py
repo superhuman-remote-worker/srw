@@ -523,6 +523,7 @@ LLM_INHERITED_KEYS = (
     "base_url",
     "api_key",
     "model_max_context_tokens",
+    "served_model",
 )
 
 
@@ -2022,6 +2023,8 @@ class PhaseLLMOverride:
     extra_body: Optional[Dict[str, Any]] = None
     # Transport headers for this phase's route (see LLMConfig.extra_headers).
     extra_headers: Optional[Dict[str, str]] = None
+    # The string this phase's catalog row sends upstream (LLMConfig.served_model).
+    served_model: Optional[str] = None
 
 
 @dataclass
@@ -2081,6 +2084,13 @@ class LLMConfig:
     # back as empty thinking blocks (shared.subscription_routing). Honoured by
     # the OpenAI-compatible factories; other providers ignore it.
     extra_headers: Optional[Dict[str, str]] = None
+    # The model string sent upstream when the catalog row names one
+    # (``models.served_model_id``), injected at DISPATCH from that row — never
+    # set from YAML. ``model`` stays the catalog id: family, settings matrix,
+    # reasoning checks and usage all read it; only the request carries this.
+    # None = send ``model`` (minus a routing prefix), and a dispatch writes
+    # None to clear it on a session model switch. See ``wire_model_name``.
+    served_model: Optional[str] = None
     # OpenAI cache-routing hint, injected at RUNTIME by callers that own a
     # stable conversation identity (the session paths pass a per-thread key so
     # the provider-side prefix cache survives pod rotation on the stateless
@@ -2139,6 +2149,15 @@ class LLMConfig:
         else:
             api_key = self.api_key
 
+        # The served string belongs to its model: an overlay that names a
+        # different model brings its own (or none), never the parent's.
+        if override.model is not None and override.model != self.model:
+            served_model = override.served_model
+        elif override.served_model is not None:
+            served_model = override.served_model
+        else:
+            served_model = self.served_model
+
         # Create new config with overrides applied (don't copy phase fields)
         return LLMConfig(
             model=override.model if override.model is not None else self.model,
@@ -2182,6 +2201,7 @@ class LLMConfig:
             extra_headers=override.extra_headers
             if override.extra_headers is not None
             else self.extra_headers,
+            served_model=served_model,
             compaction=self.compaction,
             # Phase overrides not inherited to resolved config
             summarization=None,
@@ -2722,6 +2742,9 @@ class AuxiliaryConfig:
     # list, and rebuilding the LLMConfig without it silently drops the route's
     # header.
     extra_headers: Optional[Dict[str, str]] = None
+    # The aux row's upstream model string (LLMConfig.served_model), injected
+    # at dispatch; threaded for the same reason as ``extra_headers``.
+    served_model: Optional[str] = None
     temperature: float = 0.0
     max_iterations: int = 15  # Cap for agent mode loops
     timeout: float = 120.0  # Seconds per LLM call (quick interactive tasks)
@@ -2970,6 +2993,7 @@ def _parse_phase_override(data: Optional[Dict[str, Any]]) -> Optional[PhaseLLMOv
         model_max_context_tokens=data.get("model_max_context_tokens"),
         extra_body=data.get("extra_body"),
         extra_headers=data.get("extra_headers"),
+        served_model=data.get("served_model"),
     )
 
 
@@ -3009,6 +3033,7 @@ def _parse_llm_config(llm_data: Dict[str, Any]) -> LLMConfig:
         model_max_context_tokens=llm_data.get("model_max_context_tokens"),
         extra_body=llm_data.get("extra_body"),
         extra_headers=llm_data.get("extra_headers"),
+        served_model=llm_data.get("served_model"),
         compaction=llm_data.get("compaction"),
         summarization=_parse_phase_override(llm_data.get("summarization")),
     )
@@ -3312,6 +3337,7 @@ def _parse_auxiliary_config(data: Dict[str, Any]) -> AuxiliaryConfig:
         api_key=data.get("api_key"),
         provider=data.get("provider"),
         extra_headers=data.get("extra_headers"),
+        served_model=data.get("served_model"),
         temperature=data.get("temperature", 0.0),
         max_iterations=data.get("max_iterations", 15),
         timeout=data.get("timeout", 120.0),
@@ -4307,6 +4333,38 @@ def supports_parallel_tool_calls(provider: Optional[str], model: Optional[str]) 
     return True
 
 
+def served_model_of(config: Any) -> Optional[str]:
+    """``config.served_model`` when it is a non-empty string, else ``None``."""
+    served = getattr(config, "served_model", None)
+    return served if isinstance(served, str) and served else None
+
+
+def wire_model_name(config: LLMConfig) -> str:
+    """The model string a factory sends upstream for ``config``.
+
+    The catalog row's served id when it names one, else the catalog id
+    itself. A factory still strips its routing prefix (``openrouter/`` …)
+    from whichever string this returns.
+    """
+    return served_model_of(config) or config.model
+
+
+def recorded_model_name(
+    config: Optional[LLMConfig], echoed: Optional[str]
+) -> Optional[str]:
+    """The model name usage records for a call made with ``config``.
+
+    ``echoed`` is the name the provider returned, i.e. the string it was
+    sent. When the catalog row names a served string, that string can belong
+    to another row too (the same model behind another transport), so usage
+    and price would land on the wrong row: the catalog id is recorded then.
+    """
+    model = getattr(config, "model", None)
+    if served_model_of(config) and isinstance(model, str) and model:
+        return model
+    return echoed
+
+
 def create_llm(
     config: LLMConfig,
     limits: Optional[LimitsConfig] = None,
@@ -4352,19 +4410,24 @@ def create_llm(
         provider = "openai"
 
     if provider == "anthropic" or _claude_native_via_proxy(config, provider):
-        return _create_anthropic_llm(config, limits)
+        llm = _create_anthropic_llm(config, limits)
     elif provider == "google":
-        return _create_google_llm(config, limits)
+        llm = _create_google_llm(config, limits)
     elif provider == "groq":
-        return _create_groq_llm(config, limits)
+        llm = _create_groq_llm(config, limits)
     elif provider == "openrouter":
-        return _create_openrouter_llm(config, limits)
+        llm = _create_openrouter_llm(config, limits)
     elif provider == "mistral":
-        return _create_mistral_llm(config, limits)
+        llm = _create_mistral_llm(config, limits)
     elif provider == "codex":
-        return _create_codex_llm(config, limits)
+        llm = _create_codex_llm(config, limits)
     else:
-        return _create_openai_llm(config, limits)
+        llm = _create_openai_llm(config, limits)
+    if served_model_of(config):
+        from shared.runtime.core.transport_resolution import stamp_catalog_model
+
+        stamp_catalog_model(llm, config.model)
+    return llm
 
 
 def build_auxiliary_llm_config(
@@ -4383,6 +4446,7 @@ def build_auxiliary_llm_config(
         api_key=aux.api_key,
         provider=aux.provider,
         extra_headers=aux.extra_headers,
+        served_model=aux.served_model,
         temperature=aux.temperature,
         top_p=model_settings.get("top_p"),
         top_k=model_settings.get("top_k"),
@@ -4675,7 +4739,7 @@ def _create_openai_llm(
     # gpt-5.*/o3/o4 models, but its streaming is broken for tool calls
     # (https://github.com/langchain-ai/langchain/issues/34660, still open).
     llm_kwargs = {
-        "model": config.model,
+        "model": wire_model_name(config),
         "temperature": None if sol_6_1 else config.temperature,
         "api_key": api_key,
         "max_retries": config.max_retries,
@@ -4825,7 +4889,8 @@ def _create_openai_llm(
 
     key_info = f"{len(keys)} key(s)" if len(keys) > 1 else "1 key"
     logger.info(
-        f"Created OpenAI LLM: model={config.model}, temp={config.temperature}, "
+        f"Created OpenAI LLM: model={config.model}, "
+        f"served={served_model_of(config) or 'none'}, temp={config.temperature}, "
         f"base_url={base_url or 'default'}, timeout={llm_kwargs.get('timeout')}s, "
         f"max_retries={config.max_retries}, max_context_tokens={max_context_tokens or 'default'}, "
         f"max_tokens={max_tokens}, reasoning={reasoning_mode}, keys={key_info}, "
@@ -4916,7 +4981,7 @@ def _create_anthropic_llm(
         )
 
     llm_kwargs: Dict[str, Any] = {
-        "model": config.model,
+        "model": wire_model_name(config),
         "api_key": keys[0],
         "max_retries": config.max_retries,
         # Anthropic requires max_tokens. Route through the shared resolver so
@@ -4982,6 +5047,7 @@ def _create_anthropic_llm(
 
     logger.info(
         f"Created Anthropic LLM: model={config.model}, "
+        f"served={served_model_of(config) or 'none'}, "
         f"base_url={llm_kwargs.get('base_url', 'default')}, "
         f"timeout={llm_kwargs.get('timeout')}s, max_retries={config.max_retries}, "
         f"max_tokens={llm_kwargs['max_tokens']}, reasoning={reasoning_mode}, "
@@ -5045,7 +5111,7 @@ def _create_google_llm(
         )
 
     llm_kwargs = {
-        "model": config.model,
+        "model": wire_model_name(config),
         "temperature": config.temperature,
         "google_api_key": api_key,
     }
@@ -5102,6 +5168,7 @@ def _create_google_llm(
 
     logger.info(
         f"Created Google LLM: model={config.model}, "
+        f"served={served_model_of(config) or 'none'}, "
         f"temp={llm_kwargs.get('temperature')}, "
         f"timeout={llm_kwargs.get('timeout')}s, max_output_tokens={max_tokens}, "
         f"thinking={thinking_mode}"
@@ -5132,7 +5199,7 @@ def _create_groq_llm(
         )
 
     # Strip groq/ prefix — Groq API expects bare model names
-    model = config.model
+    model = wire_model_name(config)
     if model.lower().startswith("groq/"):
         model = model[len("groq/") :]
 
@@ -5164,7 +5231,8 @@ def _create_groq_llm(
     llm = ChatGroq(**llm_kwargs)
 
     logger.info(
-        f"Created Groq LLM: model={model}, temp={config.temperature}, "
+        f"Created Groq LLM: model={config.model}, "
+        f"served={served_model_of(config) or 'none'}, temp={config.temperature}, "
         f"timeout={llm_kwargs.get('timeout')}s, max_retries={config.max_retries}, "
         f"max_tokens={max_tokens}"
     )
@@ -5221,7 +5289,7 @@ def _create_openrouter_llm(
     api_key = keys[0]
 
     # Strip openrouter/ prefix — OpenRouter expects provider/model format
-    model = config.model
+    model = wire_model_name(config)
     if model.lower().startswith("openrouter/"):
         model = model[len("openrouter/") :]
 
@@ -5335,7 +5403,8 @@ def _create_openrouter_llm(
         else "none"
     )
     logger.info(
-        f"Created OpenRouter LLM: model={model}, temp={config.temperature}, "
+        f"Created OpenRouter LLM: model={config.model}, "
+        f"served={served_model_of(config) or 'none'}, temp={config.temperature}, "
         f"base_url={base_url}, timeout={llm_kwargs.get('timeout')}s, "
         f"max_retries={config.max_retries}, max_context_tokens={max_context_tokens or 'default'}, "
         f"max_tokens={max_tokens}, reasoning={reasoning_mode}, keys={key_info}"
@@ -5370,7 +5439,7 @@ def _create_mistral_llm(
         )
 
     # Strip a defensive mistral/ prefix — the native API expects bare ids.
-    model = config.model
+    model = wire_model_name(config)
     if model.lower().startswith("mistral/"):
         model = model[len("mistral/") :]
 
@@ -5416,7 +5485,8 @@ def _create_mistral_llm(
     llm = ReasoningChatOpenAI(**llm_kwargs)
 
     logger.info(
-        f"Created Mistral LLM: model={model}, temp={config.temperature}, "
+        f"Created Mistral LLM: model={config.model}, "
+        f"served={served_model_of(config) or 'none'}, temp={config.temperature}, "
         f"base_url={base_url}, timeout={llm_kwargs.get('timeout')}s, "
         f"max_retries={config.max_retries}, "
         f"max_context_tokens={max_context_tokens or 'default'}, max_tokens={max_tokens}"
@@ -5467,7 +5537,7 @@ def _create_codex_llm(
     api_key = keys[0]
 
     # Strip codex/ prefix — the proxy expects bare model names
-    model = config.model
+    model = wire_model_name(config)
     if model.lower().startswith("codex/"):
         model = model[len("codex/") :]
 
@@ -5559,7 +5629,8 @@ def _create_codex_llm(
 
     key_info = f"{len(keys)} key(s)" if len(keys) > 1 else "1 key"
     logger.info(
-        f"Created Codex LLM: model={model}, temp={config.temperature}, "
+        f"Created Codex LLM: model={config.model}, "
+        f"served={served_model_of(config) or 'none'}, temp={config.temperature}, "
         f"base_url={base_url}, timeout={llm_kwargs.get('timeout')}s, "
         f"max_retries={config.max_retries}, max_context_tokens={max_context_tokens or 'default'}, "
         f"max_tokens={max_tokens}, reasoning={reasoning_mode}, keys={key_info}"

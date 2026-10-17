@@ -838,8 +838,13 @@ class SubagentDriver:
         metrics = dict(metrics or {})
         turn = self.turn_number
         call_index = self.provider_calls
-        model = metrics.get("model") or getattr(
-            getattr(self.build.config, "llm", None), "model", "unknown"
+        from shared.runtime.core.loader import recorded_model_name
+
+        llm_config = getattr(self.build.config, "llm", None)
+        model = (
+            recorded_model_name(llm_config, metrics.get("model"))
+            or getattr(llm_config, "model", None)
+            or "unknown"
         )
         archive = self._archive_fn
         history_messages = kwargs.get("history_messages")

@@ -31,11 +31,12 @@ logger = logging.getLogger(__name__)
 _embedding_service: Optional["EmbeddingService"] = None
 _kb_embedding_service: Optional["EmbeddingService"] = None
 _kb_embedding_profile: Optional[
-    tuple[str, str, Optional[str], str, int, Optional[str]]
+    tuple[str, str, Optional[str], Optional[str], str, int, Optional[str]]
 ] = None
 KB_EMBEDDING_ENV_KEYS = (
     "KB_EMBEDDING_PROVIDER",
     "KB_EMBEDDING_MODEL",
+    "KB_EMBEDDING_SERVED_MODEL",
     "KB_EMBEDDING_BASE_URL",
     "KB_EMBEDDING_API_KEY",
     "KB_EMBEDDING_DIMENSIONS",
@@ -143,6 +144,7 @@ class EmbeddingService:
         provider: Optional[str] = None,
         expected_dimensions: Optional[int] = None,
         profile_identity: Optional[str] = None,
+        served_model: Optional[str] = None,
     ):
         """Initialize the Embedding Service.
 
@@ -151,9 +153,21 @@ class EmbeddingService:
         KB reindexer constructs an instance from catalog-resolved credentials,
         since the orchestrator pod carries no EMBEDDING_* env post
         models_yaml_removal).
+
+        ``model`` is the catalog id; ``served_model`` is the upstream string
+        its catalog row names, when it names one. ``EMBEDDING_SERVED_MODEL``
+        is read only together with ``EMBEDDING_MODEL``: a served string
+        belongs to the model it was dispatched with.
         """
+        from shared.runtime.core.transport_resolution import served_model_from_env
+
         self.provider = (provider or os.getenv("EMBEDDING_PROVIDER", "local")).lower()
-        base_model = model or os.getenv("EMBEDDING_MODEL", "qwen3-embedding-8b")
+        if model is None:
+            served_model = served_model or served_model_from_env("EMBEDDING")
+        self.catalog_model = model or os.getenv("EMBEDDING_MODEL", "qwen3-embedding-8b")
+        self.served_model = served_model or None
+        # The request (and the vector stamp) carries the upstream string.
+        base_model = self.served_model or self.catalog_model
 
         # Provider batch ceiling. TEI-compatible backends 422 above 64 inputs;
         # embed_batch splits transparently so no caller ever needs to know.
@@ -229,7 +243,8 @@ class EmbeddingService:
 
         logger.info(
             f"EmbeddingService initialized (provider={self.provider}, "
-            f"model={self.model}, base_url={self.base_url})"
+            f"model={self.catalog_model}, served={self.served_model or 'none'}, "
+            f"wire={self.model}, base_url={self.base_url})"
         )
 
     def _check_dimensions(self, vector: List[float]) -> None:
@@ -430,12 +445,23 @@ def get_kb_embedding_service() -> EmbeddingService:
     if not model:
         return get_embedding_service()
 
+    from shared.runtime.core.transport_resolution import served_model_from_env
+
     provider = os.getenv("KB_EMBEDDING_PROVIDER", "local").lower()
+    served_model = served_model_from_env("KB_EMBEDDING")
     base_url = os.getenv("KB_EMBEDDING_BASE_URL")
     api_key = os.getenv("KB_EMBEDDING_API_KEY", "")
     dimensions = int(os.getenv("KB_EMBEDDING_DIMENSIONS", "4096"))
     profile_identity = os.getenv("KB_EMBEDDING_PROFILE_ID")
-    profile = (provider, model, base_url, api_key, dimensions, profile_identity)
+    profile = (
+        provider,
+        model,
+        served_model,
+        base_url,
+        api_key,
+        dimensions,
+        profile_identity,
+    )
 
     # Compare the effective profile on every access. Worker pods can process a
     # later dispatch after an administrator changes the system embedding pin;
@@ -443,6 +469,7 @@ def get_kb_embedding_service() -> EmbeddingService:
     if _kb_embedding_service is None or _kb_embedding_profile != profile:
         _kb_embedding_service = EmbeddingService(
             model=model,
+            served_model=served_model,
             base_url=base_url,
             api_key=api_key,
             provider=provider,

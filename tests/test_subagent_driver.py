@@ -14,6 +14,7 @@ staying unarmed.
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import subprocess
 import time
 from typing import Any, Dict, List
@@ -303,6 +304,35 @@ class TestScenarioABF:
             1,
             2,
         ]
+
+    @pytest.mark.asyncio
+    async def test_a_served_model_row_is_metered_under_its_catalog_id(self, parent):
+        # The provider echoes the served string ("fake-model"); the catalog
+        # row it was dispatched for is what usage and llm_requests name.
+        parent_ctx, _ = parent
+        driver, _, build = await make_driver(parent_ctx, [text_turn(SECRET)])
+        build.config.llm = dataclasses.replace(
+            build.config.llm, model="fake-model-proxy", served_model="fake-model"
+        )
+        loop_metrics: List[Dict[str, Any]] = []
+        archive = driver.archive_llm_call
+
+        def spy(prepared, response, metrics, *args, **kwargs):
+            loop_metrics.append(dict(metrics or {}))
+            return archive(prepared, response, metrics, *args, **kwargs)
+
+        driver.archive_llm_call = spy  # type: ignore[method-assign]
+        try:
+            await driver.run("say it")
+            for _ in range(20):
+                if driver.archived:
+                    break
+                await asyncio.sleep(0.02)
+        finally:
+            await driver.close()
+        assert [row["model"] for row in driver.archived] == ["fake-model-proxy"]
+        # The loop's own usage metrics already name the row (persistent_graph).
+        assert [m.get("model") for m in loop_metrics] == ["fake-model-proxy"]
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("mode", ["legacy", "append_only"])

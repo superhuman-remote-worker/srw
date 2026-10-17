@@ -309,6 +309,27 @@ async def test_build_kb_embedding_service_uses_the_injected_profile():
     assert factory.call_args.kwargs["api_key"] == "sk-test"
     assert factory.call_args.kwargs["expected_dimensions"] == 1024
     assert factory.call_args.kwargs["profile_identity"] == "profile-9"
+    assert factory.call_args.kwargs["served_model"] is None
+
+
+@pytest.mark.asyncio
+async def test_build_kb_embedding_service_sends_the_rows_served_model():
+    async def inject(env: dict) -> None:
+        env.update(
+            {
+                "KB_EMBEDDING_API_KEY": "sk-test",
+                "KB_EMBEDDING_MODEL": "embed-1-eu",
+                "KB_EMBEDDING_SERVED_MODEL": "embed-1",
+                "KB_EMBEDDING_BASE_URL": "https://embed.example",
+                "KB_EMBEDDING_PROVIDER": "openai",
+            }
+        )
+
+    service = await knowledge_index.build_kb_embedding_service(
+        dependencies=_dependencies(inject=inject)
+    )
+    assert service.catalog_model == "embed-1-eu"
+    assert service.model == "embed-1"
 
 
 @pytest.mark.asyncio

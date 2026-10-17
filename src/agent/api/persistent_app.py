@@ -8473,8 +8473,13 @@ def _loop_archive_llm_call(
         return
     thread_id = _session_identity.thread_id
     turn = _session.turn_count
-    model = metrics.get("model") or getattr(
-        getattr(_session.config, "llm", None), "model", "unknown"
+    from shared.runtime.core.loader import recorded_model_name
+
+    llm_config = getattr(_session.config, "llm", None)
+    model = (
+        recorded_model_name(llm_config, metrics.get("model"))
+        or getattr(llm_config, "model", None)
+        or "unknown"
     )
 
     def _do() -> None:
@@ -10848,12 +10853,14 @@ async def _handle_config_update(
         embedding_env_keys = (
             "EMBEDDING_PROVIDER",
             "EMBEDDING_MODEL",
+            "EMBEDDING_SERVED_MODEL",
             "EMBEDDING_BASE_URL",
             "EMBEDDING_API_KEY",
             # The rerank slot is credential-bearing too; a change must round-
             # trip through the orchestrator for base_url/api_key enrichment.
             # The bound scorer keeps its attach-time transport until re-attach.
             "RERANK_MODEL",
+            "RERANK_SERVED_MODEL",
             "RERANK_BASE_URL",
             "RERANK_API_KEY",
         )
@@ -11124,6 +11131,21 @@ async def _handle_config_update(
         # Reset embedding singleton if embedding env keys changed.
         new_env_block = effective_override.get("env_keys") or {}
         if any(k in new_env_block for k in embedding_env_keys):
+            from shared.runtime.core.transport_resolution import (
+                clear_served_model_env,
+            )
+
+            # A served string belongs to the model it came with: drop the old
+            # one of every slot this block touches before applying it.
+            clear_served_model_env(
+                sorted(
+                    {
+                        k.split("_", 1)[0]
+                        for k in embedding_env_keys
+                        if k in new_env_block
+                    }
+                )
+            )
             for k in embedding_env_keys:
                 if k in new_env_block and new_env_block[k] is not None:
                     os.environ[k] = str(new_env_block[k])

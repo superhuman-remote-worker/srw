@@ -25,6 +25,7 @@ from shared.runtime.core.loader import LimitsConfig, load_agent_config
 
 CITATION_ENV = (
     "CITATION_LLM_MODEL",
+    "CITATION_LLM_SERVED_MODEL",
     "CITATION_LLM_BASE_URL",
     "CITATION_LLM_URL",
     "CITATION_LLM_API_KEY",
@@ -98,6 +99,42 @@ class TestDedicatedKeyPrecedence:
         client = agent._citation_verify_aux.llm
         assert client.openai_api_base == CUSTOM_URL
         assert client.openai_api_key.get_secret_value() == "sk-cit"
+
+
+class TestServedModel:
+    """The catalog row's upstream string rides with CITATION_LLM_MODEL."""
+
+    def test_served_model_is_threaded_into_the_citation_config(self, monkeypatch):
+        monkeypatch.setenv("CITATION_LLM_MODEL", "cite-model-eu")
+        monkeypatch.setenv("CITATION_LLM_SERVED_MODEL", "cite-model")
+        monkeypatch.setenv("CITATION_LLM_URL", CUSTOM_URL)
+        monkeypatch.setenv("CITATION_LLM_API_KEY", "sk-cit")
+
+        created = _init_with_captured_create_llm(_agent())
+
+        assert created[0].model == "cite-model-eu"
+        assert created[0].served_model == "cite-model"
+
+    def test_real_client_sends_the_served_string(self, monkeypatch):
+        monkeypatch.setenv("CITATION_LLM_MODEL", "cite-model-eu")
+        monkeypatch.setenv("CITATION_LLM_SERVED_MODEL", "cite-model")
+        monkeypatch.setenv("CITATION_LLM_BASE_URL", CUSTOM_URL)
+        monkeypatch.setenv("CITATION_LLM_API_KEY", "sk-cit")
+        agent = _agent()
+
+        agent._initialize_citation_verifier(LimitsConfig())
+
+        assert agent._citation_verify_aux.llm.model_name == "cite-model"
+
+    def test_empty_served_model_sends_the_catalog_id(self, monkeypatch):
+        monkeypatch.setenv("CITATION_LLM_MODEL", "cite-model")
+        monkeypatch.setenv("CITATION_LLM_SERVED_MODEL", "")
+        monkeypatch.setenv("CITATION_LLM_URL", CUSTOM_URL)
+        monkeypatch.setenv("CITATION_LLM_API_KEY", "sk-cit")
+
+        created = _init_with_captured_create_llm(_agent())
+
+        assert created[0].served_model is None
 
 
 class TestNoLeakToCustomEndpoint:
