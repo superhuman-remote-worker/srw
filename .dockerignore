@@ -68,6 +68,7 @@ cockpit/.angular/
 cockpit/dist/
 
 # Documentation (not needed in images)
+docs-site/
 policy/
 knowledge-base/
 knowledge-history/
