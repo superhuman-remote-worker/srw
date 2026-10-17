@@ -135,6 +135,14 @@ WORKFLOWS: dict[str, Policy] = {
             "the owner's dispatch, so it has no reason to occupy a homelab runner"
         ),
     ),
+    "docs.yml": Policy(
+        triggers=frozenset({"push", "workflow_dispatch"}),
+        hosted_only=True,
+        why=(
+            "it builds a static site and deploys it to GitHub Pages, so it has "
+            "no reason to occupy a homelab runner"
+        ),
+    ),
     "ci-policy.yml": Policy(
         triggers=frozenset({"push", "pull_request", "workflow_dispatch"}),
         hosted_only=True,
