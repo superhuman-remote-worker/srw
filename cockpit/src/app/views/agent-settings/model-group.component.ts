@@ -2,7 +2,7 @@ import {Component, computed, inject, input, output, signal} from '@angular/core'
 import {FormsModule} from '@angular/forms';
 import {TranslocoPipe, TranslocoService} from '@jsverse/transloco';
 import {AppIconComponent} from '../../ui/icon';
-import {ModelService} from '../../core/services/model.service';
+import {chatModelLabel, ModelService} from '../../core/services/model.service';
 import {EffectiveModels, EffectiveModelSlot, SUBAGENT_INHERIT_MODEL} from '../../core/models/api.model';
 import {pinResolvedValue, readConfigPath, SettingsMode} from './agent-settings.types';
 import {PinOnInteractDirective} from './pin-on-interact.directive';
@@ -57,7 +57,7 @@ type StorageKey = keyof typeof STORAGE_KEYS;
             @for (group of availableModels(); track group.group) {
               <optgroup [label]="providerLabel(group)">
                 @for (model of group.models; track model) {
-                  <option [value]="model">{{ model }}</option>
+                  <option [value]="model">{{ modelLabel(group, model) }}</option>
                 }
               </optgroup>
             }
@@ -86,7 +86,7 @@ type StorageKey = keyof typeof STORAGE_KEYS;
               @for (group of availableModels(); track group.group) {
                 <optgroup [label]="providerLabel(group)">
                   @for (model of group.models; track model) {
-                    <option [value]="model">{{ model }}</option>
+                    <option [value]="model">{{ modelLabel(group, model) }}</option>
                   }
                 </optgroup>
               }
@@ -294,6 +294,8 @@ export class ModelGroupComponent {
   change = output<void>();
 
   readonly availableModels = this.modelService.models;
+  /** Option text: the catalog label; the value stays the model id. */
+  readonly modelLabel = chatModelLabel;
 
   // The one model override (llm.model) — job and session alike.
   readonly model = signal<string | null>(null);

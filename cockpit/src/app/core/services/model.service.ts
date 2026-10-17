@@ -6,7 +6,28 @@ export interface ModelGroup {
   group: string;
   provider: string;
   configured: boolean;
+  /** Catalog model ids: the value a picker stores and dispatch resolves. */
   models: string[];
+  /** model id → the row's display label. Optional for older backends. */
+  labels?: Record<string, string>;
+}
+
+/**
+ * The text a chat picker shows for catalog id `id` in `group`: the row's
+ * display label, else the id. The option value stays the id, so two rows
+ * serving the same upstream model stay apart by their ids.
+ */
+export function chatModelLabel(group: Pick<ModelGroup, 'labels'>, id: string): string {
+  return group.labels?.[id] || id;
+}
+
+/** model id → picker text across every chat group (see {@link chatModelLabel}). */
+export function chatModelLabels(groups: readonly ModelGroup[]): Record<string, string> {
+  const labels: Record<string, string> = {};
+  for (const group of groups) {
+    for (const id of group.models) labels[id] = chatModelLabel(group, id);
+  }
+  return labels;
 }
 
 export interface HelperModel {

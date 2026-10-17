@@ -4,7 +4,7 @@ import {ActivatedRoute, Router} from '@angular/router';
 import {TranslocoPipe, TranslocoService} from '@jsverse/transloco';
 import {ApiService} from '../../core/services/api.service';
 import type {SessionToolGroupsResponse} from '../../core/services/api.service';
-import {ModelService} from '../../core/services/model.service';
+import {chatModelLabel, ModelService} from '../../core/services/model.service';
 import type {
   EffectiveModels,
   ExpertCreateRequest,
@@ -425,7 +425,7 @@ interface EditorForm {
             <option [ngValue]="''">{{ baseDefaultLabel('model') }}</option>
             @for (g of models(); track g.group) {
               <optgroup [label]="g.group">
-                @for (m of g.models; track m) { <option [ngValue]="m" [disabled]="!modelAllowed(m)">{{ m }}</option> }
+                @for (m of g.models; track m) { <option [ngValue]="m" [disabled]="!modelAllowed(m)">{{ modelLabel(g, m) }}</option> }
               </optgroup>
             }
           </select>
@@ -436,7 +436,7 @@ interface EditorForm {
               <option [ngValue]="''">{{ baseDefaultLabel('subagent') }}</option>
               @for (g of models(); track g.group) {
                 <optgroup [label]="g.group">
-                  @for (m of g.models; track m) { <option [ngValue]="m" [disabled]="!modelAllowed(m)">{{ m }}</option> }
+                  @for (m of g.models; track m) { <option [ngValue]="m" [disabled]="!modelAllowed(m)">{{ modelLabel(g, m) }}</option> }
                 </optgroup>
               }
             </select>
@@ -672,6 +672,8 @@ export class ExpertEditorComponent implements OnInit {
   private resolvedAnchorApplied = false;
 
   readonly models = this.modelService.models;
+  /** Option text: the catalog label; the value stays the model id. */
+  readonly modelLabel = chatModelLabel;
   readonly expertRoles = EXPERT_ROLES;
 
   /** Role tags (`worker` / `session` / `subagent`); the expert's own type is

@@ -969,6 +969,8 @@ export interface CatalogModel {
   provider_kind: CatalogProviderKind;
   provider_ref: string;
   model_id: string;
+  /** The name sent to the provider when it differs from `model_id`; null = the id itself. */
+  served_model_id?: string | null;
   display_label: string;
   capabilities: CatalogCapability[];
   family: string;
@@ -993,6 +995,9 @@ export interface CatalogModelCreateRequest {
   provider_kind: CatalogProviderKind;
   provider_ref: string;
   model_id: string;
+  /** Upstream model name when it differs from `model_id` (which must then be
+   * this name plus a `-suffix`). Omit for the id itself. */
+  served_model_id?: string | null;
   display_label: string;
   /** Capabilities the row claims. Required, non-empty. */
   capabilities: CatalogCapability[];
@@ -1008,6 +1013,7 @@ export interface CatalogModelUpdateRequest {
   provider_kind?: CatalogProviderKind;
   provider_ref?: string;
   model_id?: string;
+  served_model_id?: string | null;
   display_label?: string;
   capabilities?: CatalogCapability[];
   family?: string;

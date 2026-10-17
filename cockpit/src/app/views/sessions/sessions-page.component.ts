@@ -8,7 +8,7 @@ import {environment} from '../../core/environment';
 import {conferenceLauncherCommands} from '../../core/officer/conference';
 import {PersistentChatService} from '../../core/services/persistent-chat.service';
 import {classifyResumeError} from '../../core/services/resume-error';
-import {ModelService} from '../../core/services/model.service';
+import {chatModelLabel, ModelService} from '../../core/services/model.service';
 import {SessionListService} from '../../core/services/session-list.service';
 import {AppToastService} from '../../ui/toast';
 import {ErrorMessageService} from '../../core/services/error-message.service';
@@ -109,7 +109,7 @@ const ENDING_POLL_MAX_MS = 15_000;
               @for (group of modelService.models(); track group.group) {
                 <optgroup [label]="group.group">
                   @for (model of group.models; track model) {
-                    <option [value]="model">{{ model }}</option>
+                    <option [value]="model">{{ modelLabel(group, model) }}</option>
                   }
                 </optgroup>
               }
@@ -592,6 +592,8 @@ export class SessionsPageComponent implements OnInit {
     private readonly errors = inject(ErrorMessageService);
     private readonly userService = inject(UserService);
     readonly modelService = inject(ModelService);
+    /** Option text: the catalog label; the value stays the model id. */
+    readonly modelLabel = chatModelLabel;
     readonly chat = inject(PersistentChatService);
     private readonly transloco = inject(TranslocoService);
     private readonly sessionList = inject(SessionListService);

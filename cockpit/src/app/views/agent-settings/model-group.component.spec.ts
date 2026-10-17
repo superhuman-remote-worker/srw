@@ -6,7 +6,7 @@ import {of} from 'rxjs';
 import {TranslocoService, TranslocoTestingModule} from '@jsverse/transloco';
 import en from '../../../assets/i18n/en.json';
 import {ModelGroupComponent} from './model-group.component';
-import {ModelService} from '../../core/services/model.service';
+import {chatModelLabel, chatModelLabels, ModelGroup, ModelService} from '../../core/services/model.service';
 import {SettingsService} from '../../core/services/settings.service';
 
 /**
@@ -628,9 +628,9 @@ describe('ModelGroupComponent — rendering', () => {
     localStorage.clear();
   });
 
-  function mount(mode: 'job' | 'session') {
+  function mount(mode: 'job' | 'session', groups: ModelGroup[] = []) {
     const modelServiceMock = {
-      models: signal([]),
+      models: signal(groups),
       auxiliaryModels: signal([]),
       visionModels: signal([]),
       whisperModels: signal([]),
@@ -682,6 +682,41 @@ describe('ModelGroupComponent — rendering', () => {
     const hint = root.querySelector('.field-hint');
     expect(hint).not.toBeNull();
     expect((hint!.textContent ?? '').trim()).toBe(en.agentSettings.model.subagentRoster);
+  });
+
+  it('shows each catalog label as the option text and keeps the id as the value', () => {
+    // Two rows serving the same upstream model on two transports: the label
+    // tells them apart, the id is what the config stores.
+    const fixture = mount('job', [
+      {
+        group: 'System: Claude subscription proxy',
+        provider: 'system',
+        configured: true,
+        models: ['claude-opus-5-5'],
+        labels: {'claude-opus-5-5': 'Claude Opus 5.5 (subscription)'},
+      },
+      {
+        group: 'Anthropic',
+        provider: 'anthropic',
+        configured: true,
+        models: ['claude-opus-5-5-anthropic', 'claude-haiku-4-5'],
+        labels: {'claude-opus-5-5-anthropic': 'Claude Opus 5.5 (API key)'},
+      },
+    ]);
+    const root = fixture.nativeElement as HTMLElement;
+    for (const select of Array.from(root.querySelectorAll('select'))) {
+      const options = Array.from(select.querySelectorAll('optgroup option')).map((o) => [
+        (o as HTMLOptionElement).value,
+        (o.textContent ?? '').trim(),
+      ]);
+      expect(options).toEqual([
+        ['claude-opus-5-5', 'Claude Opus 5.5 (subscription)'],
+        ['claude-opus-5-5-anthropic', 'Claude Opus 5.5 (API key)'],
+        // No label from an older backend (or none for this id): the id.
+        ['claude-haiku-4-5', 'claude-haiku-4-5'],
+      ]);
+    }
+    expect(root.querySelectorAll('select')).toHaveLength(2);
   });
 
   it('session mode renders the same single model row and no subagent row', () => {
@@ -748,5 +783,22 @@ describe('ModelGroupComponent — rendering', () => {
     component.onSessionReasoningChange('high');
     fixture.detectChanges();
     expect((fixture.nativeElement as HTMLElement).querySelector('.reasoning-reset-notice')).toBeNull();
+  });
+});
+
+describe('chatModelLabel / chatModelLabels', () => {
+  const groups: ModelGroup[] = [
+    {group: 'A', provider: 'a', configured: true, models: ['x', 'y'], labels: {x: 'X model', y: ''}},
+    {group: 'B', provider: 'b', configured: true, models: ['z']},
+  ];
+
+  it('returns the label, else the id (also for an empty label)', () => {
+    expect(chatModelLabel(groups[0], 'x')).toBe('X model');
+    expect(chatModelLabel(groups[0], 'y')).toBe('y');
+    expect(chatModelLabel(groups[1], 'z')).toBe('z');
+  });
+
+  it('maps every chat id across groups', () => {
+    expect(chatModelLabels(groups)).toEqual({x: 'X model', y: 'y', z: 'z'});
   });
 });

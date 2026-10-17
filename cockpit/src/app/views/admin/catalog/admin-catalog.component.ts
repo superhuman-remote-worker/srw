@@ -1,7 +1,7 @@
 import {ChangeDetectionStrategy, Component, computed, DestroyRef, effect, ElementRef, inject, OnInit, signal, viewChild} from '@angular/core';
 import {takeUntilDestroyed} from '@angular/core/rxjs-interop';
 import {TranslocoPipe, TranslocoService} from '@jsverse/transloco';
-import {AdminModelsService} from '../../../core/services/admin-models.service';
+import {AdminModelsService, catalogErrorDetail} from '../../../core/services/admin-models.service';
 import {AdminProvidersService} from '../../../core/services/admin-providers.service';
 import {AdminModelsCoordinatorService} from '../models/admin-models-coordinator.service';
 import {
@@ -285,7 +285,10 @@ export function reasoningStarveWarning(ctx: number | null): string | null {
                         {{ m.display_label }}
                         <app-helm-managed-badge [managed]="m.managed_by_helm" [drift]="m.helm_drift" />
                       </span>
-                      <span class="col-id mono">{{ m.model_id }}</span>
+                      <span
+                        class="col-id mono"
+                        [title]="m.served_model_id ? 'Sent to the provider as ' + m.served_model_id : ''"
+                      >{{ m.model_id }}@if (m.served_model_id) { → {{ m.served_model_id }}}</span>
                       <span class="col-capability">
                         <span class="cap-badges">
                           @for (cap of rowCapabilities(m); track cap) {
@@ -623,6 +626,7 @@ export function reasoningStarveWarning(ctx: number | null): string | null {
                   [value]="formModelId()"
                   placeholder="e.g. claude-opus-4-7"
                   [disabled]="creating()"
+                  (valueChange)="formModelId.set($event)"
                   (changed)="onModelIdChange($event)"
                 />
               </app-form-field>
@@ -632,6 +636,27 @@ export function reasoningStarveWarning(ctx: number | null): string | null {
                   [placeholder]="formModelId().trim() || 'Defaults to the model ID'"
                   [disabled]="creating()"
                   (changed)="formDisplayLabel.set($event)"
+                />
+              </app-form-field>
+            </div>
+            @if (modelIdHeldElsewhere(); as holder) {
+              <p class="form-hint-warning" data-testid="model-id-taken">
+                {{ formModelId().trim() }} is already in the catalog under {{ holder }}.
+                A model ID can only be registered once: give this row its own ID (e.g.
+                {{ suggestedModelId() }}) and set the served model id below to
+                {{ formModelId().trim() }}.
+              </p>
+            }
+            <div class="form-row two-col">
+              <app-form-field
+                label="Served model id"
+                hint="The name sent to the provider, when it differs from the model id. The model id must then be this name plus a suffix, e.g. claude-opus-5-5-api."
+              >
+                <app-input
+                  [value]="formServedModelId()"
+                  placeholder="Leave empty to send the model ID"
+                  [disabled]="creating()"
+                  (valueChange)="formServedModelId.set($event)"
                 />
               </app-form-field>
             </div>
@@ -1009,6 +1034,11 @@ export function reasoningStarveWarning(ctx: number | null): string | null {
       font-size: 12px;
       margin: 4px 0 8px 0;
     }
+    .form-hint-warning {
+      color: var(--warning, #b45309);
+      font-size: 12px;
+      margin: 0 0 8px 0;
+    }
     .discover-pane {
       margin-bottom: 12px;
       padding: 10px 12px;
@@ -1285,6 +1315,8 @@ export class AdminCatalogComponent implements OnInit {
   // auxiliary unless the operator explicitly unchecks it.
   readonly formCapabilities = signal<CatalogCapability[]>(['chat', 'auxiliary']);
   readonly formModelId = signal('');
+  /** Upstream name when it differs from the model ID; empty = send the ID. */
+  readonly formServedModelId = signal('');
   readonly formDisplayLabel = signal('');
   readonly formFamily = signal('default');
   readonly formContextWindow = signal<number | null>(null);
@@ -1494,6 +1526,35 @@ export class AdminCatalogComponent implements OnInit {
     ),
   );
 
+  /**
+   * The provider that already holds the typed model ID, when it is another
+   * provider than the form's. A model ID names one row across the catalog, so
+   * the server refuses the add (409); this only says so before the click.
+   */
+  readonly modelIdHeldElsewhere = computed<string | null>(() => {
+    const modelId = this.formModelId().trim();
+    if (!modelId) return null;
+    const holder = this.models.models().find((m) => m.model_id === modelId);
+    if (!holder || `${holder.provider_kind}:${holder.provider_ref}` === this.formProviderKey()) {
+      return null;
+    }
+    return this.providerName(holder.provider_kind, holder.provider_ref);
+  });
+
+  /** `<id>-<provider>` for the hint: the shape the served-model-id rule accepts. */
+  readonly suggestedModelId = computed(() => {
+    const [kind, ref] = this.formProviderKey().split(':') as [CatalogProviderKind, string];
+    const name = kind === 'endpoint'
+      ? (this.providers.systemEndpoints().find((e) => e.id === ref)?.label ?? 'endpoint')
+      : ref || 'provider';
+    const slug = name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '') || 'endpoint';
+    return `${this.formModelId().trim()}-${slug}`;
+  });
+
+  private providerName(kind: CatalogProviderKind, ref: string): string {
+    return kind === 'endpoint' ? this.endpointLabel(ref) : ref;
+  }
+
   readonly groupedModels = computed(() => {
     const groups = new Map<string, {key: string; label: string; rows: CatalogModel[]}>();
     for (const m of this.models.models()) {
@@ -1544,6 +1605,7 @@ export class AdminCatalogComponent implements OnInit {
   private preselectAndDiscover(endpointId: string): void {
     this.formProviderKey.set(`endpoint:${endpointId}`);
     this.formModelId.set('');
+    this.formServedModelId.set('');
     this.formDisplayLabel.set('');
     this.formFamily.set('default');
     this.formContextWindow.set(null);
@@ -1632,6 +1694,7 @@ export class AdminCatalogComponent implements OnInit {
     // the form fields prevents a stale model_id from being submitted under a
     // different provider.
     this.formModelId.set('');
+    this.formServedModelId.set('');
     this.formDisplayLabel.set('');
     this.formFamily.set('default');
     this.formContextWindow.set(null);
@@ -1702,12 +1765,14 @@ export class AdminCatalogComponent implements OnInit {
       : null;
     if (candidate) Object.assign(params, subscriptionRoutingParams(candidate));
     const paramsJson = Object.keys(params).length ? params : undefined;
+    const servedModelId = this.formServedModelId().trim();
     this.creating.set(true);
     this.models
       .createModel({
         provider_kind: kind,
         provider_ref: ref,
         model_id: modelId,
+        ...(servedModelId ? {served_model_id: servedModelId} : {}),
         // An empty label falls back to the model ID, cut to the API's 200-char limit.
         display_label: (this.formDisplayLabel().trim() || modelId).slice(0, 200),
         capabilities,
@@ -1720,6 +1785,7 @@ export class AdminCatalogComponent implements OnInit {
       .subscribe({
         next: () => {
           this.formModelId.set('');
+          this.formServedModelId.set('');
           this.formDisplayLabel.set('');
           this.formContextWindow.set(null);
           this.formVoice.set('');
@@ -1731,7 +1797,7 @@ export class AdminCatalogComponent implements OnInit {
           if (candidate) this.markRegistered(candidate.id);
         },
         error: (err) => {
-          this.formError.set(err?.error?.detail ?? 'Failed to add model.');
+          this.formError.set(catalogErrorDetail(err, 'Failed to add model.'));
           this.creating.set(false);
         },
       });
@@ -1933,6 +1999,7 @@ export class AdminCatalogComponent implements OnInit {
   /** Pre-fill the single-model form from a subscription candidate. */
   applySubscriptionModel(m: SubscriptionDiscoveredModel): void {
     this.formModelId.set(m.id);
+    this.formServedModelId.set('');
     this.formDisplayLabel.set(m.display_label || m.id);
     this.formCapabilities.set(hintsToCapabilities(m.capability_hints));
     if (m.family) {
@@ -1967,6 +2034,7 @@ export class AdminCatalogComponent implements OnInit {
 
   applyDiscoveredModel(m: LlmEndpointDiscoveredModel): void {
     this.formModelId.set(m.id);
+    this.formServedModelId.set('');
     this.formDisplayLabel.set(m.id);
     this.formCapabilities.set(hintsToCapabilities(m.capability_hints));
     // Endpoint discovery doesn't always know the family — fall back to the

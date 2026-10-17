@@ -15,7 +15,7 @@ import { UserService } from '../../core/services/user.service';
 import { ViewModeService } from '../../core/services/view-mode.service';
 import { ApiService } from '../../core/services/api.service';
 import { SettingsService } from '../../core/services/settings.service';
-import { ModelService } from '../../core/services/model.service';
+import { chatModelLabel, ModelService } from '../../core/services/model.service';
 import { CapabilitiesService } from '../../core/services/capabilities.service';
 import { I18nService, SupportedLang } from '../../core/services/i18n.service';
 import type { ExpertEditorNavigationState } from '../experts/expert-editor.component';
@@ -549,7 +549,7 @@ const EXPIRY_OPTIONS = [
                         >
                           @for (model of group.models; track model) {
                             <option [value]="model">
-                              {{ model
+                              {{ modelLabel(group, model)
                               }}{{
                                 !prefModel() && model === resolved().default_model
                                   ? ' (' + ('common.default' | transloco) + ')'
@@ -2451,6 +2451,8 @@ export class SettingsComponent implements OnInit, OnDestroy {
   readonly userService = inject(UserService);
   readonly settingsService = inject(SettingsService);
   readonly modelService = inject(ModelService);
+  /** Option text: the catalog label; the value stays the model id. */
+  readonly modelLabel = chatModelLabel;
   readonly capabilities = inject(CapabilitiesService);
   readonly i18n = inject(I18nService);
   readonly viewMode = inject(ViewModeService);

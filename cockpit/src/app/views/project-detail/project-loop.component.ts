@@ -10,7 +10,7 @@ import {
 import {DatePipe} from '@angular/common';
 
 import {ApiService} from '../../core/services/api.service';
-import {ModelService} from '../../core/services/model.service';
+import {chatModelLabels, ModelService} from '../../core/services/model.service';
 import {
   Expert,
   Job,
@@ -350,7 +350,7 @@ export function buildRoleSequence(
               <app-select [value]="fModel()" (changed)="fModel.set($event ?? '')">
                 <option value="">Don't overwrite expert defaults</option>
                 @for (m of modelOptions(); track m) {
-                  <option [value]="m">{{ m }}</option>
+                  <option [value]="m">{{ modelLabels()[m] }}</option>
                 }
               </app-select>
             </app-form-field>
@@ -682,6 +682,8 @@ export class ProjectLoopComponent implements OnInit, OnDestroy {
   readonly modelOptions = computed(() =>
     this.modelService.models().flatMap((g) => g.models),
   );
+  /** Option text per model id: the catalog label; the value stays the id. */
+  readonly modelLabels = computed(() => chatModelLabels(this.modelService.models()));
   // Effective rotation sent to the API: the preset list, or the custom stages
   // with blanks trimmed (so an unfilled custom slot can never ship).
   readonly roleSequence = computed(() =>
