@@ -12,6 +12,26 @@ than a moving development branch. Operators remain responsible for Kubernetes,
 container-runtime, hypervisor, identity-provider, database, and bundled-service
 updates.
 
+## Supported deployment model (public beta)
+
+SRW is a public beta. The deployment model it supports is:
+
+- **One organisation per deployment.** SRW is single-tenant. Every person with
+  an approved account is a member of the same organisation, and an
+  administrator approves each account before it can use SRW.
+- **Users who trust one another.** SRW keeps users' sessions, jobs and
+  projects apart. That separation has not yet been hardened or verified
+  against a hostile user of the same deployment. Don't rely on it to protect
+  one user's data or credentials from another.
+- **Administrators are fully trusted.** An administrator manages every user,
+  project and setting of the deployment.
+- **Disposable data first.** SRW runs model-generated code. Begin with data,
+  repositories and credentials you could afford to lose, under supervised or
+  review-gated workflows.
+
+Do not offer one deployment to several customers or to users who don't trust
+one another. If you need that, run a separate deployment for each.
+
 ## Report a vulnerability
 
 Do not open a public issue for a suspected vulnerability.
@@ -49,8 +69,27 @@ actions already and intentionally authorized for that user are generally
 product-safety issues rather than security-boundary vulnerabilities. Reports
 that demonstrate a bypass of an enforced boundary are in scope.
 
+During the beta, the boundaries SRW is expected to hold are:
+
+- between the internet and the deployment: without an approved account or
+  an SRW workload credential, nothing beyond signing in and the endpoints
+  meant to be public, such as health checks;
+- between other applications on the same identity provider and the API: a
+  token Keycloak issues to another client (Gitea, Nextcloud, OpenCloud, or
+  any client the operator has not listed in `auth.oidc`), and any ID token,
+  is not an SRW credential; and
+- between a workspace, including the model-generated code running in it, and
+  the orchestrator, the agent harness and their credentials.
+
+A report that an approved user can reach another user's or project's data is
+still welcome, and is fixed as a bug. Under the beta's supported model,
+though, it is not a breach of a guarantee SRW makes.
+
 The following are normally out of scope:
 
+- deployments outside the supported model above, such as one deployment
+  shared by customers or users who don't trust one another;
+- anything an administrator can do;
 - vulnerabilities wholly inside an unmodified third-party service that should
   be reported to its upstream project;
 - denial of service against a disposable local development deployment;

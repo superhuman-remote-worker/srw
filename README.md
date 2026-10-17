@@ -40,10 +40,12 @@ The model is replaceable. The execution, memory, permissions, observability,
 and recovery layers around it are the product.
 
 > [!IMPORTANT]
-> SRW is under active development and can execute model-generated code. Start
-> with disposable data and supervised or review-gated workflows. Read the
-> [security model](docs/security-model.md) before connecting valuable systems or
-> enabling unattended work.
+> SRW is a public beta. Run one deployment per organisation, for users you
+> trust: it is single-tenant, and the separation between users and projects
+> on one deployment is not yet a hardened security boundary. SRW executes
+> model-generated code. Start with disposable data and supervised or
+> review-gated workflows, and read the [security model](docs/security-model.md)
+> before connecting valuable systems or enabling unattended work.
 
 ## The mental model
 
