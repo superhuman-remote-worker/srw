@@ -271,6 +271,11 @@ see [Secret schema](#secret-schema). No test accounts are created.
 
 After install, follow the printed `NOTES.txt` to back up the encryption key.
 
+Jobs and sessions are refused until chat, auxiliary, embedding (4096-dim) and
+rerank models are configured. One OpenRouter API key covers all four: seed it
+with `llm.seed` or add it under **Settings → Models** after login. See
+[Models](../docs/models.md).
+
 ---
 
 ## Single-origin self-signed HTTPS
@@ -505,9 +510,12 @@ in `helm get values` output.
 secrets:
   create: true
   values:
-    OPENAI_API_KEY: "sk-..."
     POSTGRES_PASSWORD: "..."
 ```
+
+Model provider keys do not go into `secrets.values`. In this mode
+`llm.seed.systemApiKeys.<provider>.value` accepts them inline; see
+[Models](../docs/models.md) for the complete OpenRouter seed.
 
 ### Secret schema
 
@@ -840,8 +848,15 @@ reach public HTTP(S), but RFC1918, cluster/service, link-local/metadata, and
 loopback ranges are excluded. There is no value that deploys either workload
 without this policy.
 
-**LLM provider keys** (any combination, depending on which providers you use):
-- `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `GROQ_API_KEY`, `GOOGLE_API_KEY`, `OPENROUTER_API_KEY`, `TAVILY_API_KEY`, `SEMANTIC_SCHOLAR_API_KEY`, `UNPAYWALL_EMAIL`
+**Model provider keys** are not read from this Secret by the chart. A key
+here only reaches the pods' environment and registers no model. Seed it with
+`llm.seed.systemApiKeys` (which can reference any Secret, this one included)
+or add it under **Settings → Models**; see [Models](../docs/models.md). A
+dedicated Secret such as `srw-llm-seed` keeps the key out of the application
+Secret that agent pods load.
+
+**Research keys** (optional):
+- `TAVILY_API_KEY` (registered as a search and fetch provider at startup), `SEMANTIC_SCHOLAR_API_KEY`, `UNPAYWALL_EMAIL`
 
 **Optional integrations:**
 - `SMTP_HOST`, `SMTP_PORT`, `SMTP_USER`, `SMTP_PASSWORD`, `SMTP_FROM` (when `email.enabled`)
@@ -879,7 +894,6 @@ POSTGRES_PASSWORD=changeme
 VECTOR_POSTGRES_USER=srw
 VECTOR_POSTGRES_PASSWORD=changeme
 KC_REALM_ADMIN_PASSWORD=changeme
-OPENAI_API_KEY=sk-...
 CLOUD_SERVICE_USER=agent
 CLOUD_SERVICE_PASSWORD=changeme
 ```

@@ -3827,7 +3827,14 @@ llm:
   # by a post-install / post-upgrade Job. Insert-only: existing rows in
   # system_api_keys and llm_endpoints (user_id IS NULL) are NEVER
   # overwritten, so admin-UI edits survive `helm upgrade`. Leave enabled:false
-  # to bring the stack up empty and configure providers via Admin → Providers.
+  # to bring the stack up empty and configure models in the Cockpit
+  # (Settings → Administration → Models).
+  #
+  # Jobs and sessions are refused (503) until the chat, auxiliary, embedding
+  # and rerank capabilities each have an enabled model and a default pin, and
+  # the embedding model must return 4096-dimensional vectors. The smallest
+  # seed that satisfies that is one OpenRouter key plus three catalog rows —
+  # see the systemModels and defaults examples below and docs/models.md.
   #
   # The Job is a post-upgrade hook that waits on the orchestrator's health
   # endpoint, so it also renders only while `orchestrator.replicas` is above
@@ -3855,10 +3862,10 @@ llm:
     # is populated by Vault; in non-ESO mode the operator creates it by hand.
     #
     # systemApiKeys:
-    #   openai:
+    #   openrouter:                       # the one-key setup, see docs/models.md
     #     secretName: "srw-llm-seed"
-    #     key: "openai_api_key"
-    #   anthropic:
+    #     key: "openrouter_api_key"
+    #   anthropic:                        # optional extra chat provider
     #     secretName: "srw-llm-seed"
     #     key: "anthropic_api_key"
     #
@@ -3867,10 +3874,12 @@ llm:
     # inline as `value:` instead of secretName/key. Inline values are
     # gathered into one dedicated Secret that only the seed Job reads —
     # never the shared application Secret that agent pods inherit — and the
-    # seeder encrypts them at rest. The render fails in any other mode.
+    # seeder encrypts them at rest. The render fails in any other mode. An
+    # empty value is skipped (together with the systemModels that need it),
+    # so a template can ship the entry and the key can follow on an upgrade.
     #
-    #   openai:
-    #     value: "sk-..."
+    #   openrouter:
+    #     value: "sk-or-v1-..."
     systemApiKeys: {}
 
     # -- Optional: system-scoped OpenAI-compatible endpoints (vLLM, Ollama,
@@ -3885,11 +3894,16 @@ llm:
     #
     # `capability` on each model is optional and defaults to `chat`. Set it
     # to `embedding`, `rerank`, `vision`, `auxiliary`, or `whisper` to route
-    # the row to the matching slot in Admin → Providers → Defaults. A single endpoint
-    # can back multiple capabilities (e.g., Groq serving chat + whisper, or
-    # OpenRouter serving chat + embedding) by listing the same `apiKeyRef`
-    # once and adding one model row per physical model — a single row can
-    # claim multiple capabilities via `capabilities: [...]` (see below).
+    # the row to the matching slot in Admin → Models → Defaults. A single
+    # endpoint can back multiple capabilities (e.g., a vLLM host serving chat,
+    # a 4096-dim embedding model and a reranker) by listing the same
+    # `apiKeyRef` once and adding one model row per physical model — a single
+    # row can claim multiple capabilities via `capabilities: [...]` (see
+    # below). An embedding row must return 4096-dimensional vectors; a rerank
+    # row needs the Cohere-shaped `POST <baseUrl>/rerank` route. OpenRouter
+    # itself is better seeded as a provider key (systemApiKeys +
+    # systemModels below): chat then uses SRW's OpenRouter client, which
+    # sends OpenRouter's reasoning settings and rotates comma-separated keys.
     #
     # systemEndpoints:
     #   - label: "Local Gemma"
@@ -3947,13 +3961,38 @@ llm:
     #   chat-capable row. Use it for known multimodal models so the same
     #   physical row also surfaces in the vision dropdown.
     #
+    # OpenRouter model ids carry the `openrouter/` routing prefix
+    # (`openrouter/<vendor>/<model>`); SRW strips it before calling
+    # OpenRouter. Admin → Models adds the prefix for you, the seed does not.
+    #
+    # The one-key setup (docs/models.md): one OpenRouter key serves all four
+    # required capabilities. Any chat model with tool calling works for chat +
+    # auxiliary; the embedding model must return 4096-dim vectors (Qwen3
+    # Embedding 8B does; OpenAI's text-embedding-3-large returns 3072 and
+    # cannot be used). OpenAI, Anthropic and Groq keys can serve chat, but
+    # none of them offers a 4096-dim embedding or a /rerank route.
+    #
     # systemModels:
+    #   - provider: "openrouter"
+    #     id: "openrouter/anthropic/claude-sonnet-5.5"
+    #     displayName: "Claude Sonnet 5.5 (OpenRouter)"
+    #     capabilities: [chat, auxiliary]
+    #   - provider: "openrouter"
+    #     id: "openrouter/qwen/qwen3-embedding-8b"
+    #     displayName: "Qwen3 Embedding 8B (OpenRouter)"
+    #     capability: embedding                     # singleton: [embedding]
+    #   - provider: "openrouter"
+    #     id: "openrouter/qwen/qwen3-reranker-8b"
+    #     displayName: "Qwen3 Reranker 8B (OpenRouter)"
+    #     capability: rerank                        # POST /api/v1/rerank
+    #
+    # Further chat rows from other provider keys:
+    #
     #   - provider: "anthropic"
-    #     id: "claude-opus-4-7"
-    #     displayName: "Claude Opus 4.7"
+    #     id: "claude-opus-5-5"
+    #     displayName: "Claude Opus 5.5"
     #     capabilities: [chat, auxiliary, vision]   # multimodal → all three
-    #     family: "claude-opus"
-    #     contextWindow: 200000
+    #     contextWindow: 1000000
     #     reasoningLevel: null
     #   - provider: "openai"
     #     id: "gpt-4o"
@@ -3961,10 +4000,6 @@ llm:
     #     capability: chat                          # auto-expands to [chat, aux]
     #     multimodal: true                          # +vision
     #     family: "gpt-4o"
-    #   - provider: "openai"
-    #     id: "text-embedding-3-large"
-    #     displayName: "OpenAI Embedding (Large)"
-    #     capability: embedding                     # singleton: [embedding]
     #   - provider: "openai"
     #     id: "gpt-5-mini"
     #     capabilities: [chat, auxiliary]
@@ -4003,12 +4038,12 @@ llm:
     # display label, i.e. the only one when you seed one model per
     # capability. Declare a kind here to choose among several.
     #
-    # defaults:
-    #   chat: "claude-opus-4-7"
-    #   auxiliary: "gpt-4o"
-    #   vision: "claude-opus-4-7"
-    #   embedding: "text-embedding-3-large"
-    #   rerank: "qwen3-reranker-8b"
+    # defaults:                         # the one-key OpenRouter setup above
+    #   chat: "openrouter/anthropic/claude-sonnet-5.5"
+    #   auxiliary: "openrouter/anthropic/claude-sonnet-5.5"
+    #   embedding: "openrouter/qwen/qwen3-embedding-8b"
+    #   rerank: "openrouter/qwen/qwen3-reranker-8b"
+    #   vision: "claude-opus-5-5"       # optional; by default unset uses chat
     defaults: {}
 
     # -- Reconcile: Helm as the source of truth, opted into PER ENTRY. Every
