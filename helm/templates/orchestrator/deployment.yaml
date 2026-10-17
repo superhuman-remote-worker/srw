@@ -1928,7 +1928,7 @@ spec:
                   name: {{ .Values.infrastructureMetering.vmStorageIngestionSecretName | default "unused-vm-storage-metering-secret" }}
                   key: {{ .Values.infrastructureMetering.vmStorageIngestionSecretKey | default "INFRASTRUCTURE_METERING_VM_STORAGE_INGESTION_KEY" }}
                   optional: {{ not (or (.Values.infrastructureMetering.vmPvcInventoryEnabled | default false) (.Values.infrastructureMetering.vmPvInventoryEnabled | default false)) }}
-            {{- with .Values.orchestrator.kbGitAllowedHosts }}
+            {{- with include "srw.kbGitAllowedHosts" . }}
             - name: KB_GIT_ALLOWED_HOSTS
               value: {{ . | quote }}
             {{- end }}
