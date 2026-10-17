@@ -236,9 +236,9 @@ async def init_postgres(force_reset: bool = False) -> bool:
         await _migrate_endpoint_models_to_catalog(db)
 
         # When OpenRouter is the seeded gateway, insert convenience catalog
-        # rows for the auxiliary + embedding routes that would otherwise be
-        # empty (idempotent; resolver picks first-enabled-alphabetical at
-        # call time)
+        # rows for the auxiliary, embedding and rerank routes that would
+        # otherwise be empty (idempotent; resolver picks
+        # first-enabled-alphabetical at call time)
         await _apply_openrouter_defaults(db)
 
         # Backfill Nextcloud cloud folders for existing projects
@@ -1120,13 +1120,17 @@ async def _migrate_endpoint_models_to_catalog(db) -> None:
 
 async def _apply_openrouter_defaults(db) -> None:
     """When OpenRouter is the seeded gateway, insert convenience catalog rows
-    for the OpenRouter-routed auxiliary and embedding models.
+    for the OpenRouter-routed auxiliary, embedding and rerank models.
 
     Rationale: OpenRouter is a single-key gateway for many provider stacks.
-    When an admin only seeds an OpenRouter key, the auxiliary and embedding
-    slots would otherwise be empty and dependent features (memory
-    extraction, recall search) would fail at first use. Inserting these
-    rows ensures the catalog has at least one entry per dependent capability.
+    When an admin only seeds an OpenRouter key, the auxiliary, embedding and
+    rerank slots would otherwise be empty and dependent features (memory
+    extraction, recall search, reranked retrieval) would fail at first use.
+    Inserting these rows ensures the catalog has at least one entry per
+    dependent capability. The embedding and rerank rows are the chart's
+    one-key OpenRouter seed (docs/models.md): Qwen3 Embedding 8B returns the
+    4096 dimensions SRW stores, and OpenRouter serves Qwen3 Reranker 8B on
+    its rerank route.
 
     The default-model resolver's "first-enabled-alphabetical" fallback then
     handles which one gets used. Admin edits/disables survive subsequent
@@ -1149,10 +1153,19 @@ async def _apply_openrouter_defaults(db) -> None:
         {
             "provider_kind": "system",
             "provider_ref": "openrouter",
-            "model_id": "openrouter/openai/text-embedding-3-large",
-            "display_label": "text-embedding-3-large (OpenRouter)",
+            "model_id": "openrouter/qwen/qwen3-embedding-8b",
+            "display_label": "Qwen3 Embedding 8B (OpenRouter)",
             "capabilities": ["embedding"],
-            "family": "default",
+            "family": "qwen",
+            "seeded_from": "helm:openrouter-defaults",
+        },
+        {
+            "provider_kind": "system",
+            "provider_ref": "openrouter",
+            "model_id": "openrouter/qwen/qwen3-reranker-8b",
+            "display_label": "Qwen3 Reranker 8B (OpenRouter)",
+            "capabilities": ["rerank"],
+            "family": "qwen",
             "seeded_from": "helm:openrouter-defaults",
         },
     ]

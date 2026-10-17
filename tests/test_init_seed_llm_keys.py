@@ -9,11 +9,14 @@ no-ops when rows already exist.
 
 from __future__ import annotations
 
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
 from orchestrator import init as init_mod
+
+ROOT = Path(__file__).resolve().parents[1]
 
 
 def _fake_db(*, existing_providers: list[str] | None = None):
@@ -132,7 +135,7 @@ async def test_multiple_providers_seeded(monkeypatch):
 
 class TestApplyOpenrouterDefaults:
     """Post-catalog migration: this step inserts catalog rows for the
-    OpenRouter-routed auxiliary + embedding convenience models instead of
+    OpenRouter-routed auxiliary, embedding and rerank convenience models instead of
     pinning ``default_llm_models`` entries. The default-resolver's
     "first-enabled-alphabetical" fallback handles which one gets used.
     """
@@ -144,10 +147,10 @@ class TestApplyOpenrouterDefaults:
         db.create_model.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_inserts_auxiliary_and_embedding_when_catalog_empty(self):
+    async def test_inserts_auxiliary_embedding_and_rerank_when_catalog_empty(self):
         db = _fake_db_with_catalog(openrouter_key="sk-or-v1-xxx")
         await init_mod._apply_openrouter_defaults(db)
-        assert db.create_model.await_count == 2
+        assert db.create_model.await_count == 3
         # Each convenience row is registered as a singleton-array (the
         # auxiliary openrouter row is purposefully aux-only, NOT
         # auxiliary+chat — it's a small/cheap model the operator routes to
@@ -156,17 +159,35 @@ class TestApplyOpenrouterDefaults:
             tuple(call.kwargs["capabilities"])
             for call in db.create_model.await_args_list
         }
-        assert capabilities_inserted == {("auxiliary",), ("embedding",)}
+        assert capabilities_inserted == {("auxiliary",), ("embedding",), ("rerank",)}
+
+    @pytest.mark.asyncio
+    async def test_embedding_and_rerank_match_the_one_key_chart_seed(self):
+        """SRW stores 4096-dim vectors, so the embedding row is Qwen3
+        Embedding 8B: the pair the local overlay and docs/models.md seed from
+        one OpenRouter key."""
+        db = _fake_db_with_catalog(openrouter_key="sk-or-v1-xxx")
+        await init_mod._apply_openrouter_defaults(db)
+        by_capability = {
+            call.kwargs["capabilities"][0]: call.kwargs["model_id"]
+            for call in db.create_model.await_args_list
+        }
+        assert by_capability["embedding"] == "openrouter/qwen/qwen3-embedding-8b"
+        assert by_capability["rerank"] == "openrouter/qwen/qwen3-reranker-8b"
+        for path in ("deployment/values-local.yaml.example", "docs/models.md"):
+            text = (ROOT / path).read_text()
+            assert by_capability["embedding"] in text
+            assert by_capability["rerank"] in text
 
     @pytest.mark.asyncio
     async def test_idempotent_when_rows_already_exist(self):
-        """When ON CONFLICT DO NOTHING skips both rows (create_model
-        returns None), the step still runs both inserts and exits clean."""
+        """When ON CONFLICT DO NOTHING skips every row (create_model
+        returns None), the step still runs every insert and exits clean."""
         db = _fake_db_with_catalog(
             openrouter_key="sk-or-v1-xxx", create_model_returns=None
         )
         await init_mod._apply_openrouter_defaults(db)
-        assert db.create_model.await_count == 2  # both attempted, both skipped
+        assert db.create_model.await_count == 3  # all attempted, all skipped
 
     @pytest.mark.asyncio
     async def test_inserted_rows_route_through_openrouter(self):
