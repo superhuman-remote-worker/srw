@@ -1,0 +1,21 @@
+---
+// A text link to the website next to Starlight's social icons (GitHub).
+import Default from '@astrojs/starlight/components/SocialIcons.astro';
+
+import { WEBSITE_URL } from '../site.mjs';
+---
+
+<a class="srw-website" href={WEBSITE_URL}>Website</a>
+<Default><slot /></Default>
+
+<style>
+	.srw-website {
+		font-size: var(--sl-text-sm);
+		color: var(--sl-color-text-accent);
+		text-decoration: none;
+		white-space: nowrap;
+	}
+	.srw-website:hover {
+		color: var(--sl-color-white);
+	}
+</style>
