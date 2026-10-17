@@ -30081,10 +30081,18 @@ CREATE TABLE public.models (
     source text DEFAULT 'ui'::text NOT NULL,
     helm_value_hash text,
     source_updated_at timestamp with time zone DEFAULT CURRENT_TIMESTAMP NOT NULL,
+    served_model_id text,
     CONSTRAINT models_capabilities_check CHECK (((cardinality(capabilities) >= 1) AND (capabilities <@ ARRAY['chat'::text, 'auxiliary'::text, 'embedding'::text, 'vision'::text, 'whisper'::text, 'tts'::text, 'search'::text, 'fetch'::text, 'rerank'::text, 'live_voice'::text]))),
     CONSTRAINT models_provider_kind_check CHECK ((provider_kind = ANY (ARRAY['system'::text, 'endpoint'::text]))),
     CONSTRAINT models_source_check CHECK ((source = ANY (ARRAY['default'::text, 'helm'::text, 'ui'::text])))
 );
+
+
+--
+-- Name: COLUMN models.served_model_id; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.models.served_model_id IS 'The model name sent to the provider when it differs from model_id. NULL sends model_id (minus a routing prefix such as openrouter/). When set, model_id is this name plus a -suffix of the same family, e.g. claude-opus-5-5-api serving claude-opus-5-5.';
 
 
 --
@@ -40425,6 +40433,13 @@ CREATE UNIQUE INDEX uq_managed_repository_creation_live_repo ON public.managed_r
 --
 
 CREATE UNIQUE INDEX uq_managed_repository_creation_live_scope ON public.managed_repository_creation_intents USING btree (authority_kind, authority_id, repository_owner, repo_name) WHERE (status = ANY (ARRAY['pending'::text, 'created'::text, 'deleting'::text]));
+
+
+--
+-- Name: uq_models_model_id; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX uq_models_model_id ON public.models USING btree (model_id);
 
 
 --
