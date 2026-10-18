@@ -324,7 +324,7 @@ def test_vector_idempotency_ledgers_are_current_and_in_generated_snapshot():
             REPO_ROOT / "src" / "orchestrator" / "database" / "migrations" / "vector"
         ).glob("*.sql")
     )
-    assert migrations[-1].name == "0026_job_vector_retirement.sql"
+    assert migrations[-1].name == "0027_memory_search_includes_pinned_rows.sql"
     snapshot = (
         REPO_ROOT / "src/orchestrator/database/vector_schema_current.sql"
     ).read_text()
@@ -342,3 +342,5 @@ def test_vector_idempotency_ledgers_are_current_and_in_generated_snapshot():
     assert "idx_knowledge_content_trgm" in snapshot
     # 0025: the multi-angle ranking function search_chunks dispatches to.
     assert "knowledge_chunk_multi_angle_search" in snapshot
+    # 0027: the memory search functions no longer skip TTL-pinned rows.
+    assert "remaining_turns <= 0" not in snapshot

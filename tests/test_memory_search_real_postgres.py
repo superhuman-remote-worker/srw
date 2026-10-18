@@ -4,7 +4,8 @@
 (``m:`` + sha256(row id)[:6], ``context_entries.memory_handle``) in SQL, so
 only a real server proves the two agree. The search half proves the tool
 reads through the project-scoped hybrid search like the push path: another
-project's memories never come back, and neither does a superseded row.
+project's memories never come back, and neither does a superseded row. A row
+an older pod still pins (``remaining_turns > 0``) does come back (vector 0027).
 """
 
 from __future__ import annotations
@@ -104,19 +105,22 @@ async def env(migrated_dsn):
         await db.close()
 
 
-async def _seed(db, project_id, content, *, superseded=False):
+async def _seed(
+    db, project_id, content, *, superseded=False, job_id=None, remaining_turns=None
+):
     return await db.fetchval(
         """
         INSERT INTO memories (
             job_id, project_id, content, summary, keywords,
-            embedding, sparse_keywords, importance, token_count, valid_to
+            embedding, sparse_keywords, importance, token_count, valid_to,
+            remaining_turns
         ) VALUES (
             $1, $2, $3, $4, $5, $6, to_tsvector('english', $3), $7, $8,
-            CASE WHEN $9 THEN CURRENT_TIMESTAMP ELSE NULL END
+            CASE WHEN $9 THEN CURRENT_TIMESTAMP ELSE NULL END, $10
         )
         RETURNING id
         """,
-        uuid.uuid4(),
+        job_id or uuid.uuid4(),
         project_id,
         content,
         content[:20],
@@ -125,6 +129,7 @@ async def _seed(db, project_id, content, *, superseded=False):
         0.8,
         10,
         superseded,
+        remaining_turns,
     )
 
 
@@ -181,3 +186,33 @@ async def test_search_and_fetch_stay_in_the_project(env):
     assert "eu-central" in fetched
     missing = await ext.run(handle=memory_handle(theirs))
     assert missing.startswith("No current memory has the handle")
+
+
+@pytest.mark.asyncio
+async def test_a_pinned_row_is_found_by_every_search_function(env):
+    # The TTL tier is retired (vault D36): a row an older pod still pins must
+    # come back from search like any other, or nothing would ever find it.
+    job = uuid.uuid4()
+    pinned = await _seed(
+        env.db,
+        env.project,
+        "The staging deploy region is eu-west.",
+        job_id=job,
+        remaining_turns=5,
+    )
+    embedding = [1.0] + [0.0] * (DIMS - 1)
+    for function, scope in (
+        ("memory_hybrid_search", job),
+        ("memory_project_hybrid_search", env.project),
+        ("memory_multi_project_hybrid_search", [env.project]),
+    ):
+        rows = await env.db.fetch(
+            f"SELECT id FROM {function}($1, $2, $3)",
+            "staging deploy region",
+            embedding,
+            scope,
+        )
+        assert pinned in {row["id"] for row in rows}, function
+
+    out = await _extension(env.store).run(query="staging deploy region")
+    assert f"[{memory_handle(pinned)}]" in out

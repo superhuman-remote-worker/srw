@@ -556,7 +556,6 @@ WITH dense AS (
             -- Content embedding matches
             (SELECT id, subvector(embedding, 1, 4000)::halfvec(4000) <=> subvector($2, 1, 4000)::halfvec(4000) AS dist
             FROM memories WHERE job_id = $3 AND embedding IS NOT NULL AND importance >= $9
-                AND (remaining_turns IS NULL OR remaining_turns <= 0)
                 AND valid_to IS NULL
             ORDER BY dist LIMIT $4 * 3)
 
@@ -567,7 +566,6 @@ WITH dense AS (
             FROM memory_retrieval_messages rm
             INNER JOIN memories m ON rm.memory_id = m.id
             WHERE m.job_id = $3 AND rm.embedding IS NOT NULL AND m.importance >= $9
-                AND (m.remaining_turns IS NULL OR m.remaining_turns <= 0)
                 AND m.valid_to IS NULL
             ORDER BY dist LIMIT $4 * 5)
         ) all_matches
@@ -578,14 +576,12 @@ WITH dense AS (
 sparse AS (
     SELECT id, ROW_NUMBER() OVER (ORDER BY ts_rank_cd(sparse_keywords, websearch_to_tsquery('english', $1)) DESC) AS rank_ix
     FROM memories WHERE job_id = $3 AND sparse_keywords @@ websearch_to_tsquery('english', $1) AND importance >= $9
-        AND (remaining_turns IS NULL OR remaining_turns <= 0)
         AND valid_to IS NULL
     ORDER BY rank_ix LIMIT $4 * 2
 ),
 recent AS (
     SELECT id, ROW_NUMBER() OVER (ORDER BY created_at DESC) AS rank_ix
     FROM memories WHERE job_id = $3 AND importance >= $9
-        AND (remaining_turns IS NULL OR remaining_turns <= 0)
         AND valid_to IS NULL
     ORDER BY rank_ix LIMIT $4
 )
@@ -624,7 +620,6 @@ WITH dense AS (
             -- Content embedding matches
             (SELECT id, subvector(embedding, 1, 4000)::halfvec(4000) <=> subvector($2, 1, 4000)::halfvec(4000) AS dist
             FROM memories WHERE project_id = ANY($3) AND embedding IS NOT NULL AND importance >= $9
-                AND (remaining_turns IS NULL OR remaining_turns <= 0)
                 AND valid_to IS NULL
             ORDER BY dist LIMIT $4 * 3)
 
@@ -635,7 +630,6 @@ WITH dense AS (
             FROM memory_retrieval_messages rm
             INNER JOIN memories m ON rm.memory_id = m.id
             WHERE m.project_id = ANY($3) AND rm.embedding IS NOT NULL AND m.importance >= $9
-                AND (m.remaining_turns IS NULL OR m.remaining_turns <= 0)
                 AND m.valid_to IS NULL
             ORDER BY dist LIMIT $4 * 5)
         ) all_matches
@@ -646,14 +640,12 @@ WITH dense AS (
 sparse AS (
     SELECT id, ROW_NUMBER() OVER (ORDER BY ts_rank_cd(sparse_keywords, websearch_to_tsquery('english', $1)) DESC) AS rank_ix
     FROM memories WHERE project_id = ANY($3) AND sparse_keywords @@ websearch_to_tsquery('english', $1) AND importance >= $9
-        AND (remaining_turns IS NULL OR remaining_turns <= 0)
         AND valid_to IS NULL
     ORDER BY rank_ix LIMIT $4 * 2
 ),
 recent AS (
     SELECT id, ROW_NUMBER() OVER (ORDER BY created_at DESC) AS rank_ix
     FROM memories WHERE project_id = ANY($3) AND importance >= $9
-        AND (remaining_turns IS NULL OR remaining_turns <= 0)
         AND valid_to IS NULL
     ORDER BY rank_ix LIMIT $4
 )
@@ -691,7 +683,6 @@ WITH dense AS (
             -- Content embedding matches
             (SELECT id, subvector(embedding, 1, 4000)::halfvec(4000) <=> subvector($2, 1, 4000)::halfvec(4000) AS dist
             FROM memories WHERE project_id = $3 AND embedding IS NOT NULL AND importance >= $9
-                AND (remaining_turns IS NULL OR remaining_turns <= 0)
                 AND valid_to IS NULL
             ORDER BY dist LIMIT $4 * 3)
 
@@ -702,7 +693,6 @@ WITH dense AS (
             FROM memory_retrieval_messages rm
             INNER JOIN memories m ON rm.memory_id = m.id
             WHERE m.project_id = $3 AND rm.embedding IS NOT NULL AND m.importance >= $9
-                AND (m.remaining_turns IS NULL OR m.remaining_turns <= 0)
                 AND m.valid_to IS NULL
             ORDER BY dist LIMIT $4 * 5)
         ) all_matches
@@ -713,14 +703,12 @@ WITH dense AS (
 sparse AS (
     SELECT id, ROW_NUMBER() OVER (ORDER BY ts_rank_cd(sparse_keywords, websearch_to_tsquery('english', $1)) DESC) AS rank_ix
     FROM memories WHERE project_id = $3 AND sparse_keywords @@ websearch_to_tsquery('english', $1) AND importance >= $9
-        AND (remaining_turns IS NULL OR remaining_turns <= 0)
         AND valid_to IS NULL
     ORDER BY rank_ix LIMIT $4 * 2
 ),
 recent AS (
     SELECT id, ROW_NUMBER() OVER (ORDER BY created_at DESC) AS rank_ix
     FROM memories WHERE project_id = $3 AND importance >= $9
-        AND (remaining_turns IS NULL OR remaining_turns <= 0)
         AND valid_to IS NULL
     ORDER BY rank_ix LIMIT $4
 )
