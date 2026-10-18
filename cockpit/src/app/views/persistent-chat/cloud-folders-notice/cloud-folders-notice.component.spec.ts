@@ -211,7 +211,10 @@ describe('CloudFoldersNoticeComponent', () => {
   beforeAll(async () => {
     await ɵresolveComponentResources(() => Promise.resolve(''));
   });
-  afterEach(() => TestBed.resetTestingModule());
+  afterEach(() => {
+    TestBed.resetTestingModule();
+    window.localStorage.clear();
+  });
 
   async function render(inputs: Record<string, unknown>): Promise<HTMLElement> {
     TestBed.configureTestingModule({
@@ -340,5 +343,52 @@ describe('CloudFoldersNoticeComponent', () => {
     expect(reviewed).toBe(1);
     expect(text(rows[1])).toContain('not mounted beside a protected folder');
     expect(rows[1].querySelector('[data-review]')).toBeNull();
+  });
+
+  it('folds to its title line, keeps its tone, and stays folded on this device', async () => {
+    const state = cloudFolderStateFromStatus({
+      mounts: { acme: { mount_kind: 'project', access: 'read_write', state: 'mounted' } },
+      excluded: [{ source_ref: 'ds-root', mount_kind: 'user_root', reason: 'cloud_not_connected' }],
+    });
+    const inputs = { problems: state.problems, folders: state.folders, agentOutdated: true };
+    let root = await render(inputs);
+    const toggle = root.querySelector<HTMLButtonElement>('[data-cloud-folders-toggle]')!;
+    expect(toggle.getAttribute('aria-expanded')).toBe('true');
+    expect(root.querySelectorAll('[data-cloud-folder]').length).toBe(2);
+
+    toggle.click();
+    fixture.detectChanges();
+    expect(toggle.getAttribute('aria-expanded')).toBe('false');
+    expect(root.querySelector('[data-cloud-folder]')).toBeNull();
+    expect(text(root)).not.toContain('older than its workspace');
+    // Folded, a folder that is not available still shows.
+    expect(text(root.querySelector('.cfn__title') as HTMLElement)).toBe(
+      'Some cloud folders of this session are not available',
+    );
+    expect(root.querySelector('.cfn')?.classList).not.toContain('cfn--ok');
+
+    // The next session on this device opens folded.
+    TestBed.resetTestingModule();
+    root = await render(inputs);
+    expect(root.querySelector('[data-cloud-folders-toggle]')?.getAttribute('aria-expanded')).toBe('false');
+    expect(root.querySelector('[data-cloud-folder]')).toBeNull();
+
+    root.querySelector<HTMLButtonElement>('[data-cloud-folders-toggle]')!.click();
+    fixture.detectChanges();
+    expect(root.querySelectorAll('[data-cloud-folder]').length).toBe(2);
+    expect(text(root)).toContain('older than its workspace');
+  });
+
+  it('folds a protected session to its title, which still says why', async () => {
+    window.localStorage.setItem('cockpit:chat:cloudFoldersFolded', 'true');
+    const root = await render({
+      problems: [{ name: 'lower', path: 'workspace/cloud', kind: '', reason: 'credential_rejected' }],
+      protectedCloud: true,
+      agentOutdated: false,
+    });
+    const title = root.querySelector('[data-testid="cloud-folders-protected"]') as HTMLElement;
+    expect(text(title)).toContain('Protected cloud unavailable');
+    expect(text(title)).toContain('the cloud refused its credential');
+    expect(text(root)).not.toContain('nothing it writes reaches the cloud');
   });
 });

@@ -7,6 +7,7 @@ const READING_WIDTH_KEY = 'cockpit:chat:readingWidth';
 const TEXT_SIZE_KEY = 'cockpit:chat:textSize';
 const PLAYBACK_SPEED_KEY = 'cockpit:chat:playbackSpeed';
 const OFFICER_LENS_FOLDED_KEY = 'cockpit:chat:officerLensFolded';
+const CLOUD_FOLDERS_FOLDED_KEY = 'cockpit:chat:cloudFoldersFolded';
 
 /** Reading-column width preset for the chat transcript. */
 export type ReadingWidth = 'comfortable' | 'wide' | 'full';
@@ -74,6 +75,19 @@ export class ChatPreferencesService {
   setOfficerLensFolded(folded: boolean): void {
     this.officerLensFolded.set(folded);
     this.writeBool(OFFICER_LENS_FOLDED_KEY, folded);
+  }
+
+  /**
+   * Cloud folders notice above the transcript, folded to its title line.
+   * Defaults to open. A fold holds in every session on this device: a cloud
+   * the user has not connected reports itself in each one. A folded notice
+   * still takes the warning tone when a folder is not available.
+   */
+  readonly cloudFoldersFolded = signal<boolean>(this.readBool(CLOUD_FOLDERS_FOLDED_KEY, false));
+
+  setCloudFoldersFolded(folded: boolean): void {
+    this.cloudFoldersFolded.set(folded);
+    this.writeBool(CLOUD_FOLDERS_FOLDED_KEY, folded);
   }
 
   /**

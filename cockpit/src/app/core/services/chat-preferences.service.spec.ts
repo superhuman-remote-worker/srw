@@ -6,6 +6,7 @@ const KEY = 'cockpit:chat:reasoningExpanded';
 const TOOL_KEY = 'cockpit:chat:toolCallsExpanded';
 const WIDTH_KEY = 'cockpit:chat:readingWidth';
 const SIZE_KEY = 'cockpit:chat:textSize';
+const CLOUD_KEY = 'cockpit:chat:cloudFoldersFolded';
 
 describe('ChatPreferencesService', () => {
   beforeEach(() => {
@@ -126,5 +127,16 @@ describe('ChatPreferencesService', () => {
     // width untouched (still its default)
     expect(svc.readingWidth()).toBe('comfortable');
     expect(window.localStorage.getItem(WIDTH_KEY)).toBeNull();
+  });
+
+  // --- cloudFoldersFolded (the notice above the transcript) ---
+
+  it('defaults cloudFoldersFolded to false (open) and round-trips a fold', () => {
+    const svc = TestBed.inject(ChatPreferencesService);
+    expect(svc.cloudFoldersFolded()).toBe(false);
+    svc.setCloudFoldersFolded(true);
+    expect(window.localStorage.getItem(CLOUD_KEY)).toBe('true');
+    TestBed.resetTestingModule(); // new injector → new service, same localStorage
+    expect(TestBed.inject(ChatPreferencesService).cloudFoldersFolded()).toBe(true);
   });
 });
