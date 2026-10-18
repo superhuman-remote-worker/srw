@@ -7,6 +7,7 @@ that it happens BEFORE the effect it guards.
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 from types import SimpleNamespace
 from typing import Any
@@ -60,7 +61,7 @@ def _transaction(conn: Any):
 
 def _lock():
     @contextlib.asynccontextmanager
-    async def _scope(_thread_id: str):
+    async def _scope(_thread_id: str, **_options: Any):
         yield None
 
     return _scope
@@ -1240,7 +1241,7 @@ class TestVmUpgradeFailureBeforeItIsRecorded:
         locked = False
 
         @contextlib.asynccontextmanager
-        async def lock(_thread_id):
+        async def lock(_thread_id, **_options):
             nonlocal locked
             locked = True
             try:
@@ -1366,6 +1367,79 @@ class TestVmUpgradeFailureBeforeItIsRecorded:
                 MagicMock(), THREAD, dependencies=deps, control_request_id=self.REQUEST
             )
         assert raised.value is boom
+
+    def _preparing(self, status):
+        """What the re-read finds once the VM template's preparation stage
+        committed before the provision CAS (``_prepare_thread_workspace``)."""
+        session = self._session(self._marker())
+        session["metadata"]["workspace_preparation"] = {
+            "status": status,
+            "provision_generation": self.PROVISION,
+            "preparation_only": True,
+        }
+        return session
+
+    @pytest.mark.asyncio
+    async def test_a_live_preparation_stage_keeps_the_original_error(self):
+        """The readiness poller provisions the VM once the stage completes:
+        a refusal would leave that VM booting for nobody."""
+        boom = ValueError("Preparation response authentication failed.")
+        deps = self._deps(self._preparing("waiting_preparation"))
+        deps.vm_provisioner.create_thread_vm.side_effect = boom
+        with pytest.raises(ValueError) as raised:
+            await tcu.agent_upgrade_thread_to_vm(
+                MagicMock(), THREAD, dependencies=deps, control_request_id=self.REQUEST
+            )
+        assert raised.value is boom
+
+    @pytest.mark.asyncio
+    async def test_a_failed_preparation_stage_is_a_typed_refusal(self):
+        """The poller skips a failed stage and a retry of it is refused, so no
+        VM can come of it."""
+        boom = ValueError("Invalid preparation progress response")
+        deps = self._deps(self._preparing("failed"))
+        deps.vm_provisioner.create_thread_vm.side_effect = boom
+        with pytest.raises(HTTPException) as refused:
+            await tcu.agent_upgrade_thread_to_vm(
+                MagicMock(), THREAD, dependencies=deps, control_request_id=self.REQUEST
+            )
+        assert (refused.value.status_code, refused.value.detail) == (
+            503,
+            self.NOT_RECORDED,
+        )
+
+    @pytest.mark.asyncio
+    async def test_the_re_read_waits_briefly_and_a_timeout_keeps_the_error(self):
+        errors: list[TimeoutError] = []
+        waits: list[Any] = []
+
+        @contextlib.asynccontextmanager
+        async def lock(_thread_id, **options):
+            waits.append(options.get("wait_timeout_s"))
+            errors.append(TimeoutError("advisory lock wait timed out"))
+            raise errors[-1]
+            yield  # pragma: no cover
+
+        deps = self._deps()
+        deps.store.thread_advisory_lock = lock
+        with pytest.raises(TimeoutError) as raised:
+            await tcu.agent_upgrade_thread_to_vm(
+                MagicMock(), THREAD, dependencies=deps, control_request_id=self.REQUEST
+            )
+        # The body's own lock timed out; the re-read's short wait did too.
+        assert raised.value is errors[0]
+        assert waits[0] is None
+        assert waits[1] is not None and 0 < waits[1] <= 10
+
+    @pytest.mark.asyncio
+    async def test_a_cancellation_propagates_without_a_re_read(self):
+        deps = self._deps()
+        deps.vm_provisioner.create_thread_vm.side_effect = asyncio.CancelledError
+        with pytest.raises(asyncio.CancelledError):
+            await tcu.agent_upgrade_thread_to_vm(
+                MagicMock(), THREAD, dependencies=deps, control_request_id=self.REQUEST
+            )
+        assert deps.store.get_thread.await_count == 2
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("step", ["grants", "provision"])

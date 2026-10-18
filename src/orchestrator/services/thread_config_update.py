@@ -103,7 +103,11 @@ from shared.backend_kinds import LITE_BACKENDS, VM_BACKENDS
 from shared.connectors.builtin import IMAGE_DRIVER_SPEC, spec_for_row
 from shared.run_queue import LANE_PINNED, LANE_STATELESS
 from shared.runtime.core.loader import canonical_config_name
-from shared.workspace_upgrade import VM_UPGRADE_NOT_RECORDED, vm_upgrade_recorded
+from shared.workspace_upgrade import (
+    VM_UPGRADE_NOT_RECORDED,
+    metadata_object,
+    vm_upgrade_recorded,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -214,7 +218,9 @@ class ThreadConfigStore(Protocol):
 
     def thread_configuration_transaction(self, thread_id: str) -> Any: ...
 
-    def thread_advisory_lock(self, thread_id: str) -> Any: ...
+    def thread_advisory_lock(
+        self, thread_id: str, *, wait_timeout_s: float | None = ...
+    ) -> Any: ...
 
     async def refresh_session_execution(
         self, thread_id: str, *, conn: Any, config_override: dict[str, Any]
@@ -1026,6 +1032,22 @@ async def agent_update_thread_config(
         raise HTTPException(status_code=500, detail=str(e)) from e
 
 
+# The re-read waits only briefly: the original failure may be the body's own
+# lock wait, and the agent stops waiting for an answer long before 300 s.
+_VM_UPGRADE_REREAD_LOCK_TIMEOUT_S = 5.0
+
+
+def _vm_preparation_in_progress(metadata: Any) -> bool:
+    """A VM preparation stage the readiness poller still drives.
+
+    A VM template that declares a preparation commits this stage before the
+    provision CAS (``_prepare_thread_workspace``); the poller provisions the
+    VM once the stage completes. Only a ``failed`` stage is skipped for good.
+    """
+    stage = metadata_object(metadata).get("workspace_preparation")
+    return isinstance(stage, Mapping) and stage.get("status") != "failed"
+
+
 async def _vm_upgrade_unrecorded(
     thread_id: str,
     control_request_id: str,
@@ -1033,9 +1055,16 @@ async def _vm_upgrade_unrecorded(
     dependencies: ThreadConfigUpdateDependencies,
 ) -> bool:
     """Whether the Session, re-read under its lifecycle lock, shows nothing
-    recorded for the request; False when it does or the re-read fails."""
+    recorded for the request; False when it does or the re-read fails.
+
+    A live preparation stage counts as recorded: its VM comes later, without
+    another request. The agent's check doesn't see it, so the request stays
+    pending until a later drain finds that VM in progress.
+    """
     try:
-        async with dependencies.store.thread_advisory_lock(thread_id):
+        async with dependencies.store.thread_advisory_lock(
+            thread_id, wait_timeout_s=_VM_UPGRADE_REREAD_LOCK_TIMEOUT_S
+        ):
             thread = await dependencies.store.get_thread(thread_id)
     except Exception:
         logger.warning(
@@ -1044,7 +1073,11 @@ async def _vm_upgrade_unrecorded(
             exc_info=True,
         )
         return False
-    return not vm_upgrade_recorded((thread or {}).get("metadata"), control_request_id)
+    metadata = (thread or {}).get("metadata")
+    return not (
+        vm_upgrade_recorded(metadata, control_request_id)
+        or _vm_preparation_in_progress(metadata)
+    )
 
 
 @asynccontextmanager
@@ -1059,11 +1092,13 @@ async def _refuse_unrecorded_vm_upgrade(
     The pinned agent leaves its request pending on an untyped 5xx and asks
     again at every drain, so a persistent error (a bug, a bad row) would keep
     the Session from ever settling. When nothing was recorded for the request
-    (``vm_upgrade_recorded``, the agent's own check), the error answers the
-    typed 503 the agent reads as a refusal. A recorded request, or a failed
-    re-read, keeps the original error: the agent's check then finds the
-    request accepted, or the error stays transient. ``HTTPException`` and
-    calls without a request id pass through unchanged.
+    (``vm_upgrade_recorded``, the agent's own check, and no live preparation
+    stage), the error answers the typed 503 the agent reads as a refusal. A
+    recorded request, or a failed re-read, keeps the original error: the
+    agent's check then finds the request accepted (or, for a stage, its VM
+    in progress at a later drain), or the error stays transient.
+    ``HTTPException``, cancellation and calls without a request id pass
+    through unchanged.
     """
     if control_request_id is None:
         yield
