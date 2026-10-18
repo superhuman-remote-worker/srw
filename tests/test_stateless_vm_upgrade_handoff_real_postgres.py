@@ -968,6 +968,7 @@ async def test_a_permanently_deleted_switched_session_leaves_only_an_inert_done_
     database, actor, monkeypatch
 ):
     thread_id, _ = await switched(database, actor)
+    g0 = str((await database.get_thread(thread_id))["runtime_generation"])
     # The virtual backing is an external store the fixture doesn't run
     # (as tests/test_pinned_retirement_retry_parity_real_postgres.py stubs it).
     purge = AsyncMock(return_value=True)
@@ -977,7 +978,12 @@ async def test_a_permanently_deleted_switched_session_leaves_only_an_inert_done_
     result = await end_session(database, monkeypatch, thread_id, permanent=True)
     assert result["status"] == "deleted"
     purge.assert_awaited_once()
-    assert str(purge.await_args.args[0]["id"]) == str(thread_id)
+    [purged], fence = purge.await_args.args, purge.await_args.kwargs
+    assert str(purged["id"]) == str(thread_id)
+    # What the real guard compares: this life's generation and its End token.
+    assert fence["expected_runtime_generation"] == g0
+    assert fence["expected_retirement_token"]
+    assert fence["expected_retirement_token"] == str(purged["runtime_retirement_token"])
     assert await database.get_thread(thread_id) is None
     assert not await upgrade_requests(database, thread_id)
     queue = await database.fetchrow(
