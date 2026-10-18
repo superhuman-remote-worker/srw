@@ -455,11 +455,12 @@ async def complete_a_lite_turn(database, thread_id):
 
 
 async def upgraded_create(
-    database, actor, monkeypatch, *, first_wait, bind=True, earlier_turn=False
+    database, actor, monkeypatch, *, first_wait, bind=True, earlier_turn=None
 ):
+    """``earlier_turn(thread_id)`` runs on the lite Session before the upgrade."""
     thread_id = await lite_session(database, actor, bind=bind)
-    if earlier_turn:
-        await complete_a_lite_turn(database, thread_id)
+    if earlier_turn is not None:
+        await earlier_turn(thread_id)
     await admit_upgrade(database, actor, thread_id)
     provisioner, cluster = upgrade_provisioner(database, monkeypatch)
     suspension = SimpleNamespace()
@@ -584,6 +585,7 @@ from shared.run_queue import (  # noqa: E402
     PARK_REASON_RETRY_EXHAUSTED,
     transient_release_backoff_seconds,
 )
+from shared.session_retirement import update_stateless_claim_status  # noqa: E402
 from shared.workspace_upgrade import WORKSPACE_UPGRADE_SEED_CAPABILITY  # noqa: E402
 
 CLAIMANT_POD = "srw-agent-stateless-c1"
@@ -612,9 +614,14 @@ async def claim_now(database, thread_id):
     return claim
 
 
-def upgrade_claimant(database, monkeypatch, thread_id):
+#: An attach the assembly can serve a lite Session with.
+LITE_ATTACH = {"datasources": []}
+
+
+def upgrade_claimant(database, monkeypatch, *, attach=None):
     """A claimant that can seed an upgrade: the real executor release and claim
-    bundle, with only the credential injection and the attach assembly faked."""
+    bundle, with only the credential injection and the attach assembly faked.
+    ``attach`` is what the assembly returns."""
     monkeypatch.setattr(
         "orchestrator.services.virtual_workspace.virtual_workspace_rclone_spec",
         lambda: OBJECT_STORE,
@@ -624,7 +631,7 @@ def upgrade_claimant(database, monkeypatch, thread_id):
         dispatch_credentials, "inject_thread_dispatch_credentials", inject
     )
     # The live refusal before Ready: the workspace identity pair is incomplete.
-    assembly = AsyncMock(return_value=None)
+    assembly = AsyncMock(return_value=attach)
     monkeypatch.setattr(
         session_attach_payload, "assemble_session_attach_payload", assembly
     )
@@ -635,6 +642,7 @@ def upgrade_claimant(database, monkeypatch, thread_id):
         thread_has_knowledge_scope=AsyncMock(return_value=False),
         dispatch_credential_dependencies=lambda: None,
         session_attach_payload_dependencies=lambda: None,
+        session_subagent_fanout=lambda _lane: False,
     )
     executor = executor_module.StatelessTurnExecutor(
         pod_name=CLAIMANT_POD, pod_uid=CLAIMANT_POD_UID
@@ -649,7 +657,7 @@ def upgrade_claimant(database, monkeypatch, thread_id):
 
     async def bundle(claim):
         return await unit_claim_bundle.claim_bundle_for_unit(
-            str(thread_id),
+            str(claim.unit_id),
             lease_token=claim.lease_token,
             pod_name=CLAIMANT_POD,
             pod_uid=CLAIMANT_POD_UID,
@@ -676,6 +684,32 @@ async def back_off_before_ready(database, claimant, thread_id, *, claims):
         )
 
 
+async def serve_a_lite_turn(database, claimant, thread_id):
+    """One served lite turn: the bundle stamps its claim, attach and the turn's
+    end publish the Session's presence, and the turn completes."""
+    async with database.acquire() as conn:
+        await record_input_seq(
+            conn, unit_id=thread_id, unit_kind=UNIT_KIND_SESSION_TURN, input_seq=1
+        )
+    claim = await claim_now(database, thread_id)
+    assert claim is not None
+    await claimant.bundle(claim)
+    for status in ("active", "awaiting_user"):
+        assert await update_stateless_claim_status(
+            database, thread_id=thread_id, lease_token=claim.lease_token, status=status
+        )
+    async with database.acquire() as conn:
+        assert (
+            await complete_unit(
+                conn,
+                unit_id=thread_id,
+                lease_token=claim.lease_token,
+                consumed_seq=claim.input_seq,
+            )
+            == "done"
+        )
+
+
 @pytest.mark.asyncio
 async def test_claims_before_ready_back_off_without_parking_the_upgrade(
     database, actor, monkeypatch
@@ -689,7 +723,7 @@ async def test_claims_before_ready_back_off_without_parking_the_upgrade(
     case = await upgraded_create(
         database, actor, monkeypatch, first_wait="not_ready", bind=False
     )
-    claimant = upgrade_claimant(database, monkeypatch, case.thread_id)
+    claimant = upgrade_claimant(database, monkeypatch)
 
     max_attempts = await database.fetchval(
         "SELECT max_attempts FROM run_queue WHERE unit_id = $1::uuid", case.thread_id
@@ -801,6 +835,7 @@ async def assert_forced_end_retires_the_create(database, case):
     assert "_runtime_creation" not in workspace
     assert workspace["upgrade_config"] == UPGRADE_CONFIG
     assert workspace["seed_from"] == before["seed_from"]
+    assert "_stateless_active_claim" not in metadata(ended)
     settled = metadata(ended)["_stateless_workspace_retirement_settled"]
     assert settled["runtime_incarnation"] == case.pod_uid
     assert settled["terminal_token"] == prior_token + 1
@@ -812,11 +847,15 @@ async def assert_forced_end_retires_the_create(database, case):
     }
 
 
-async def assert_nothing_was_retired(database, case, queue):
-    assert {"pod", "pvc", "service"} <= set(case.cluster.objects)
-    assert (await database.get_thread(case.thread_id))["status"] == "created"
-    assert await queue_row(database, case.thread_id) == queue
-    assert await stateless_receipts(database, case.thread_id) == []
+async def retirement_state(database, case):
+    """What an End changes: the Kubernetes objects, the thread status, the
+    queue row and the process-zero receipts."""
+    return {
+        "objects": sorted(case.cluster.objects),
+        "status": (await database.get_thread(case.thread_id))["status"],
+        "queue": await queue_row(database, case.thread_id),
+        "receipts": await stateless_receipts(database, case.thread_id),
+    }
 
 
 @pytest.mark.asyncio
@@ -843,7 +882,7 @@ async def test_forced_end_after_pre_ready_claims_retires_the_upgrade_create(
     """F2: each pre-Ready claim takes a lease token before its 425 release, so
     the create's End admission sees a nonzero token on an unleased queue."""
     case = await upgraded_create(database, actor, monkeypatch, first_wait="not_ready")
-    claimant = upgrade_claimant(database, monkeypatch, case.thread_id)
+    claimant = upgrade_claimant(database, monkeypatch)
     await back_off_before_ready(database, claimant, case.thread_id, claims=claims)
     assert await queue_row(database, case.thread_id) == {
         "state": "queued",
@@ -860,11 +899,101 @@ async def test_forced_end_retires_the_upgrade_create_after_an_earlier_lite_turn(
 ):
     """The lite turn before the upgrade leaves lease token 1 on the queue."""
     case = await upgraded_create(
-        database, actor, monkeypatch, first_wait="not_ready", earlier_turn=True
+        database,
+        actor,
+        monkeypatch,
+        first_wait="not_ready",
+        earlier_turn=lambda thread_id: complete_a_lite_turn(database, thread_id),
     )
     assert (await queue_row(database, case.thread_id))["lease_token"] == 1
 
     await assert_forced_end_retires_the_create(database, case)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("claims", [0, 2])
+async def test_forced_end_retires_the_upgrade_create_of_a_session_that_served_a_lite_turn(
+    database, actor, monkeypatch, claims
+):
+    """A served lite turn leaves its claim record and the Session's presence
+    (awaiting_user); with no lease on the queue that claim can't still run."""
+    claimant = upgrade_claimant(database, monkeypatch, attach=LITE_ATTACH)
+    case = await upgraded_create(
+        database,
+        actor,
+        monkeypatch,
+        first_wait="not_ready",
+        earlier_turn=lambda thread_id: serve_a_lite_turn(database, claimant, thread_id),
+    )
+    await back_off_before_ready(database, claimant, case.thread_id, claims=claims)
+    served = await database.get_thread(case.thread_id)
+    assert served["status"] == "awaiting_user"
+    assert metadata(served)["_stateless_active_claim"]["lease_token"] == 1
+    assert await queue_row(database, case.thread_id) == {
+        "state": "queued",
+        "lease_token": 1 + claims,
+        "leased_by": None,
+    }
+
+    await assert_forced_end_retires_the_create(database, case)
+
+
+@pytest.mark.asyncio
+async def test_resume_after_the_forced_end_restarts_the_upgrade_create(
+    database, actor, monkeypatch
+):
+    """Resume of the ended upgrade keeps the template and the copy source: the
+    next create uses the template on the kept volume, and its claims wait for
+    Ready again."""
+    claimant = upgrade_claimant(database, monkeypatch, attach=LITE_ATTACH)
+    case = await upgraded_create(
+        database,
+        actor,
+        monkeypatch,
+        first_wait="not_ready",
+        earlier_turn=lambda thread_id: serve_a_lite_turn(database, claimant, thread_id),
+    )
+    await back_off_before_ready(database, claimant, case.thread_id, claims=2)
+    await assert_forced_end_retires_the_create(database, case)
+    ended = await database.get_thread(case.thread_id)
+
+    assert await lifecycle.resume_case(database, case, actor) == {
+        "status": "created",
+        "thread_id": case.thread_id,
+    }
+
+    resumed = await database.get_thread(case.thread_id)
+    workspace = metadata(resumed)["workspace_container"]
+    assert resumed["runtime_generation"] != ended["runtime_generation"]
+    assert workspace["_runtime_creation"] == {
+        "generation": str(resumed["runtime_generation"]),
+        "mode": "create",
+        "attempted": False,
+        "replaces_uid": None,
+    }
+    assert workspace["upgrade_config"] == UPGRADE_CONFIG
+    assert workspace["seed_from"] == metadata(ended)["workspace_container"]["seed_from"]
+    # The upgrade's control is still unconsumed, so Resume re-queues the unit.
+    assert (await queue_row(database, case.thread_id))["state"] == "queued"
+    with monkeypatch.context() as waiter:
+        waiter.setattr(
+            case.provisioner, "_wait_for_ready", AsyncMock(return_value=None)
+        )
+        await ensure_session_workspace(
+            case.thread_id,
+            db=database,
+            provisioner=case.provisioner,
+            suspension=case.suspension,
+        )
+    assert case.cluster.pod_create_calls == 2
+    assert case.cluster.objects["pod"].spec.containers[0]["image"] == IMAGE
+    assert case.cluster.objects["pvc"].metadata.uid == case.pvc_uid
+    with pytest.raises(HTTPException) as refused:
+        await claimant.bundle(await claim_now(database, case.thread_id))
+    assert (refused.value.status_code, refused.value.detail) == (
+        425,
+        "Workspace upgrade is still creating the container",
+    )
 
 
 @pytest.mark.asyncio
@@ -877,7 +1006,7 @@ async def test_forced_end_retires_the_upgrade_create_of_a_parked_queue(
     answers 425 before Ready, so the releases name the 409 themselves; the
     release, the park and its turn.parked frame are the executor's own."""
     case = await upgraded_create(database, actor, monkeypatch, first_wait="not_ready")
-    claimant = upgrade_claimant(database, monkeypatch, case.thread_id)
+    claimant = upgrade_claimant(database, monkeypatch)
     max_attempts = await database.fetchval(
         "SELECT max_attempts FROM run_queue WHERE unit_id = $1::uuid", case.thread_id
     )
@@ -907,14 +1036,14 @@ async def test_forced_end_still_refuses_a_claimed_create_without_the_upgrade_mar
     """Without seed_from a claimed create is a native container create with
     queue history, which End still refuses before any effect."""
     case = await upgraded_create(database, actor, monkeypatch, first_wait="not_ready")
-    claimant = upgrade_claimant(database, monkeypatch, case.thread_id)
+    claimant = upgrade_claimant(database, monkeypatch)
     await back_off_before_ready(database, claimant, case.thread_id, claims=1)
     await database.execute(
         "UPDATE threads SET metadata = metadata #- '{workspace_container,seed_from}' "
         "WHERE id = $1::uuid",
         case.thread_id,
     )
-    queue = await queue_row(database, case.thread_id)
+    before = await retirement_state(database, case)
 
     with pytest.raises(HTTPException) as refused:
         await end(database, case, force=True)
@@ -923,22 +1052,36 @@ async def test_forced_end_still_refuses_a_claimed_create_without_the_upgrade_mar
         503,
         END_AUTHORITY_CHANGED,
     )
-    await assert_nothing_was_retired(database, case, queue)
+    assert await retirement_state(database, case) == before
+    assert before["status"] == "created" and before["receipts"] == []
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("served_turn", [False, True])
 async def test_end_refuses_while_a_pre_ready_claim_holds_the_lease(
-    database, actor, monkeypatch
+    database, actor, monkeypatch, served_turn
 ):
-    case = await upgraded_create(database, actor, monkeypatch, first_wait="not_ready")
+    claimant = upgrade_claimant(database, monkeypatch, attach=LITE_ATTACH)
+    case = await upgraded_create(
+        database,
+        actor,
+        monkeypatch,
+        first_wait="not_ready",
+        earlier_turn=(
+            (lambda thread_id: serve_a_lite_turn(database, claimant, thread_id))
+            if served_turn
+            else None
+        ),
+    )
     claim = await claim_now(database, case.thread_id)
     assert claim is not None
-    queue = await queue_row(database, case.thread_id)
-    assert queue == {
+    before = await retirement_state(database, case)
+    assert before["queue"] == {
         "state": "leased",
         "lease_token": claim.lease_token,
         "leased_by": CLAIMANT_POD,
     }
+    assert {"pod", "pvc", "service"} <= set(before["objects"])
 
     with pytest.raises(HTTPException) as busy:
         await end(database, case, force=False)
@@ -952,7 +1095,8 @@ async def test_end_refuses_while_a_pre_ready_claim_holds_the_lease(
         END_AUTHORITY_CHANGED,
     )
 
-    await assert_nothing_was_retired(database, case, queue)
+    assert await retirement_state(database, case) == before
+    assert before["receipts"] == []
 
 
 @pytest.mark.asyncio

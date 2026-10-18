@@ -46369,6 +46369,7 @@ class PostgresDB:
     ) -> bool:
         """Validate initial End provenance under owner -> queue -> ledger locks."""
         from shared.session_retirement import (
+            active_claim_authority,
             initial_creation_retirement_authority,
             stateless_retirement_authority,
             stateless_settled_retirement_authority,
@@ -46397,20 +46398,29 @@ class PostgresDB:
             "SELECT * FROM run_queue WHERE unit_id=$1::uuid FOR UPDATE", thread["id"]
         )
         if admission:
-            # A container upgrade's create (C1) keeps its lite queue: an earlier
-            # lite turn and every pre-Ready claim (released on its 425) took a
-            # token. Its seed marker admits that history on an unleased queue;
-            # any other create still needs a never-claimed one.
-            upgrade_create = workspace_upgrade_seed_from(metadata) is not None
-            if thread["status"] != "created" or (
+            # A container upgrade's create (C1) keeps its lite Session's queue
+            # and presence: a served lite turn and every pre-Ready claim
+            # (released on its 425) took a token, and a served turn left its
+            # claim record and an active/awaiting_user status. Every claim runs
+            # under the queue lease, so on an unleased queue none of them can
+            # still run: the seed marker admits that history there. Any other
+            # create still needs a never-claimed queue.
+            upgrade_history = bool(
+                workspace_upgrade_seed_from(metadata) is not None
+                and queue is not None
+                and queue["state"] != "leased"
+                and queue["leased_by"] is None
+            )
+            if thread["status"] not in (
+                ("created", "active", "awaiting_user")
+                if upgrade_history
+                else ("created",)
+            ) or (
                 queue is not None
                 and (
                     queue["unit_kind"] != "session_turn"
                     or queue["state"] == "leased"
-                    or (
-                        queue["lease_token"] != 0
-                        and not (upgrade_create and queue["leased_by"] is None)
-                    )
+                    or (queue["lease_token"] != 0 and not upgrade_history)
                 )
             ):
                 return False
@@ -46419,12 +46429,25 @@ class PostgresDB:
                 for key in (
                     "_stateless_claim_retirement",
                     "_stateless_workspace_retirement_settled",
-                    "_stateless_active_claim",
                     "_stateless_claim_losses",
                     "_stateless_claim_loss_hold",
                 )
             ):
                 return False
+            if "_stateless_active_claim" in metadata:
+                # The record outlives its claim's completion: at the queue's
+                # token it names the last finished claim. No claim stamps one
+                # above the token it holds.
+                try:
+                    active = active_claim_authority(metadata)
+                except RuntimeError:
+                    return False
+                if (
+                    not upgrade_history
+                    or active is None
+                    or active[0] > queue["lease_token"]
+                ):
+                    return False
         else:
             try:
                 marker = stateless_retirement_authority(
