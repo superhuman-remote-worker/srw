@@ -35,6 +35,8 @@ export const JOB_TOOL_CATEGORIES: ToolCategoryMeta[] = [
 export const SESSION_TOOL_CATEGORIES: ToolCategoryMeta[] = [
   ...JOB_TOOL_CATEGORIES,
   { key: 'canvas', label: 'Canvas', icon: 'dashboard_customize', description: 'Ability to present workspace files in the shared session Canvas' },
+  // Not in the job list: a worker that keeps the default read gates binds use_skill regardless.
+  { key: 'skills', label: 'Skills', icon: 'auto_stories', description: 'Ability to load skills from your skill catalog. Off means the agent sees no skill list' },
   ...JOB_TOOL_GROUP_CATEGORIES,
   { key: 'orchestrator', label: 'SRW Projects', icon: 'hub', description: 'Ability to inspect SRW projects, repositories, session context, and workspace upgrades' },
   { key: 'agent_catalog', label: 'Experts & Skills', icon: 'extension', description: 'Ability to look up experts and skills. Read-only — the row below is what creates them' },
@@ -147,6 +149,41 @@ export type TierReachability =
   | 'needsApproval'
   | 'unsupported'
   | 'sessionUnsupported';
+
+/**
+ * Whether a running session can move tier at all, and the reason when it
+ * can't. `available` means at least one tier is `ok`; otherwise the most
+ * actionable refusal wins, and a session whose every other tier is a
+ * downgrade is on the `highest` tier.
+ *
+ * The live pane's upgrade copy follows this rather than assuming the ladder
+ * is open: a session that can move nowhere (the stateless lane today, a VM, a
+ * `none` session) must not be told it can upgrade. It reads the same
+ * reachability the tier row renders, so when a lane gains the verb the copy
+ * comes back on its own.
+ */
+export type LiveUpgradeState =
+  | 'available'
+  | 'needsApproval'
+  | 'sessionUnsupported'
+  | 'highest'
+  | 'unsupported';
+
+export function liveUpgradeState(
+  liveTier: string | null,
+  reachability: Record<string, TierReachability>,
+): LiveUpgradeState {
+  // Same fail-closed reading as the tier row: an absent entry is refused.
+  const others = WORKSPACE_BACKENDS
+    .map((b) => b.value as string)
+    .filter((tier) => tier !== liveTier)
+    .map((tier) => reachability[tier] ?? 'unsupported');
+  if (others.includes('ok')) return 'available';
+  if (others.includes('needsApproval')) return 'needsApproval';
+  if (others.includes('sessionUnsupported')) return 'sessionUnsupported';
+  if (others.every((s) => s === 'downgrade')) return 'highest';
+  return 'unsupported';
+}
 
 /** Deep-read a nested path from a config object. */
 export function readConfigPath(config: Record<string, unknown>, path: string): unknown {

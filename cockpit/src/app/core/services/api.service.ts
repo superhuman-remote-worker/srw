@@ -1872,6 +1872,10 @@ export class ApiService {
   /**
    * Transcribe a recorded voice message to text (speech-to-text).
    *
+   * `threadId` null is the landing draft, before its session exists: the
+   * account route transcribes with the same user model, unattributed to a
+   * session. A session always uses its own route.
+   *
    * Returns:
    *   - `{text}` on success,
    *   - `'unavailable'` when the server returns 204 (no STT model configured) —
@@ -1879,18 +1883,17 @@ export class ApiService {
    *   - `null` on transport error (caller surfaces a notice, still attaches audio).
    */
   transcribeVoice(
-    threadId: string,
+    threadId: string | null,
     file: Blob,
   ): Observable<{text: string} | 'unavailable' | null> {
     const formData = new FormData();
     const filename = file instanceof File ? file.name : 'voice.webm';
     formData.append('audio', file, filename);
+    const url = threadId
+      ? `${this.baseUrl}/persistent/threads/${threadId}/transcribe`
+      : `${this.baseUrl}/voice/transcribe`;
     return this.http
-      .post<{text: string}>(
-        `${this.baseUrl}/persistent/threads/${threadId}/transcribe`,
-        formData,
-        {observe: 'response'},
-      )
+      .post<{text: string}>(url, formData, {observe: 'response'})
       .pipe(
         map((resp) =>
           resp.status === 204
@@ -1898,7 +1901,7 @@ export class ApiService {
             : (resp.body as {text: string}),
         ),
         catchError((error) => {
-          console.error(`Failed to transcribe audio for thread ${threadId}:`, error);
+          console.error(`Failed to transcribe audio for thread ${threadId ?? '(draft)'}:`, error);
           return of(null);
         }),
       );

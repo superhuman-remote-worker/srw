@@ -414,6 +414,98 @@ describe('PersistentChatService — instant-landing draft sessions', () => {
         expect(ctx.service.outbox().length).toBe(0);
     });
 
+    it('sends the first message once its upload lands, though the runtime installed meanwhile', async () => {
+        // /connection reports ready and names the runtime in one response.
+        // Readiness starts the flush before that generation is installed, so
+        // the flush begins with none; a file then keeps it awaiting while the
+        // generation lands. That is this connect's first runtime, not a switch.
+        const ctx = createService();
+        const getDefault = ctx.mockHttp.get.getMockImplementation();
+        ctx.mockHttp.get.mockImplementation((url: string) => url.endsWith('/connection')
+            ? of({
+                state: 'ready', control_socket: 'none', ws_url: null, token: null, expires_at: null,
+                pinned_runtime_generation_contract: 1,
+                session_runtime_generation: '7f1d2c3b-4a5e-4f60-8a7b-9c0d1e2f3a4b',
+                controls: {}, queue: null,
+            })
+            : getDefault(url));
+        const upload = new Subject<any>();
+        ctx.mockApi.uploadOneToThread.mockReturnValue(upload);
+        ctx.service.enterDraftSession();
+        await flushTick();
+
+        const doc = new File(['pdf'], 'notes.pdf', {type: 'application/pdf'});
+        ctx.service.addAttachments([{
+            id: 'p1', file: doc, name: 'notes.pdf', size: doc.size,
+            mimeType: 'application/pdf', uploadStatus: 'pending',
+        } as any]);
+        await ctx.service.sendMessage('summarize this');
+        await flushTick();
+        fireSseOpen(ctx.sseInstances[0]);
+        await flushTick();
+
+        expect(ctx.service.sessionReady()).toBe(true);
+        expect(ctx.mockApi.uploadOneToThread).toHaveBeenCalledWith('t-new', doc);
+        expect(inputPosts(ctx).length).toBe(0);
+
+        upload.next({
+            kind: 'done',
+            files: [{name: 'notes.pdf', size: doc.size, mime_type: 'application/pdf', path: 'uploads/notes.pdf'}],
+        });
+        upload.complete();
+        await flushTick();
+
+        expect(ctx.service.outboxStalled()).toBe(false);
+        expect(inputPosts(ctx).map((c: any) => c[1].content)).toEqual([
+            'summarize this\n\n[Attached files in uploads/: notes.pdf]',
+        ]);
+        expect(ctx.service.outbox().length).toBe(0);
+    });
+
+    it('still holds a send whose upload outlives the runtime it began under', async () => {
+        const ctx = createService();
+        const getDefault = ctx.mockHttp.get.getMockImplementation();
+        ctx.mockHttp.get.mockImplementation((url: string) => url.endsWith('/connection')
+            ? of({
+                state: 'ready', control_socket: 'none', ws_url: null, token: null, expires_at: null,
+                pinned_runtime_generation_contract: 1,
+                session_runtime_generation: '7f1d2c3b-4a5e-4f60-8a7b-9c0d1e2f3a4b',
+                controls: {}, queue: null,
+            })
+            : getDefault(url));
+        ctx.service.enterDraftSession();
+        await flushTick();
+        await ctx.service.sendMessage('hello');
+        await flushTick();
+        fireSseOpen(ctx.sseInstances[0]);
+        await flushTick();
+        expect(inputPosts(ctx).length).toBe(1);
+
+        // The second send starts its flush under the installed G1…
+        const upload = new Subject<any>();
+        ctx.mockApi.uploadOneToThread.mockReturnValue(upload);
+        const doc = new File(['pdf'], 'notes.pdf', {type: 'application/pdf'});
+        ctx.service.addAttachments([{
+            id: 'p2', file: doc, name: 'notes.pdf', size: doc.size,
+            mimeType: 'application/pdf', uploadStatus: 'pending',
+        } as any]);
+        await ctx.service.sendMessage('and this');
+        await flushTick();
+
+        // …and a successor runtime replaces it before the bytes land.
+        (ctx.service as any).sessionRuntimeGeneration = '0a1b2c3d-4e5f-4a6b-8c7d-8e9f0a1b2c3d';
+        upload.next({
+            kind: 'done',
+            files: [{name: 'notes.pdf', size: doc.size, mime_type: 'application/pdf', path: 'uploads/notes.pdf'}],
+        });
+        upload.complete();
+        await flushTick();
+
+        expect(inputPosts(ctx).length).toBe(1);
+        expect(ctx.service.outboxStalled()).toBe(true);
+        expect(ctx.service.outbox().map((i) => i.displayContent)).toEqual(['and this']);
+    });
+
     it('a second send while the create is in flight queues without a second create', async () => {
         const ctx = createService();
         ctx.service.enterDraftSession();

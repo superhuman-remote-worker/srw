@@ -5,6 +5,7 @@
 [![Main CI](https://github.com/superhuman-remote-worker/srw/actions/workflows/main.yml/badge.svg)](https://github.com/superhuman-remote-worker/srw/actions/workflows/main.yml)
 [![Latest tag](https://img.shields.io/github/v/tag/superhuman-remote-worker/srw?label=release)](https://github.com/superhuman-remote-worker/srw/tags)
 [![License: FSL-1.1-ALv2](https://img.shields.io/badge/license-FSL--1.1--ALv2-9c2832)](LICENSE)
+[![Status: public beta](https://img.shields.io/badge/status-public%20beta-5b4a8b)](docs/versioning.md)
 
 [Website](https://superhuman-remote-worker.com/) ·
 [Documentation](docs/README.md) ·
@@ -39,10 +40,12 @@ The model is replaceable. The execution, memory, permissions, observability,
 and recovery layers around it are the product.
 
 > [!IMPORTANT]
-> SRW is under active development and can execute model-generated code. Start
-> with disposable data and supervised or review-gated workflows. Read the
-> [security model](docs/security-model.md) before connecting valuable systems or
-> enabling unattended work.
+> SRW is a public beta. Run one deployment per organisation, for users you
+> trust: it is single-tenant, and the separation between users and projects
+> on one deployment is not yet a hardened security boundary. SRW executes
+> model-generated code. Start with disposable data and supervised or
+> review-gated workflows, and read the [security model](docs/security-model.md)
+> before connecting valuable systems or enabling unattended work.
 
 ## The mental model
 
@@ -94,17 +97,18 @@ runs the same chart on a single-node [k3d](https://k3d.io) cluster.
 You need a Linux host with at least **8 vCPU and 16 GiB RAM**, plus Docker,
 `kubectl`, Helm 3.12+, k3d, OpenSSL, and an SSH client. The default multi-host
 local profile also needs `mkcert`; the single-origin profile does not. You need
-an API key for at least one configured LLM provider. See the
-[complete local prerequisites](docs/local-kubernetes.md#prerequisites) before
-starting.
+an [OpenRouter](https://openrouter.ai/keys) API key: that one key covers the
+chat, embedding and rerank models SRW requires (see [Models](docs/models.md)).
+See the [complete local prerequisites](docs/local-kubernetes.md#prerequisites)
+before starting.
 
 ```bash
 git clone https://github.com/superhuman-remote-worker/srw.git
 cd srw
 
-# Add at least one OPENAI_API_KEY, ANTHROPIC_API_KEY, or GROQ_API_KEY.
-# Optionally declare providers, models and default pins under `llm.seed`
-# so a rebuilt cluster needs no Settings → Models setup.
+# Paste your OpenRouter key into llm.seed.systemApiKeys.openrouter.value.
+# The file already seeds a chat model, the Qwen embedding and reranker, and
+# their defaults from that key (docs/models.md covers other providers).
 cp deployment/values-local.yaml.example deployment/values-local.yaml
 $EDITOR deployment/values-local.yaml
 

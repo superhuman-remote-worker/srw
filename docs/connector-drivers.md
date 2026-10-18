@@ -1,3 +1,8 @@
+---
+title: Build your own connector driver
+description: Write, test, register and use a bind-time driver image that gives agents a credential SRW has no built-in connector for.
+---
+
 # Build your own connector driver
 
 A connector gives an agent access to something outside SRW: a database, a

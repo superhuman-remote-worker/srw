@@ -1,3 +1,8 @@
+---
+title: Cloud folders
+description: The main cloud's project folders, My cloud, outboxes and job copies, with their access levels, provider support and the reasons a folder is left out.
+---
+
 # Cloud folders
 
 SRW can give agents folders of your installation's *main cloud*: the Nextcloud

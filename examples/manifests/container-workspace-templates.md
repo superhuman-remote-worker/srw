@@ -384,6 +384,7 @@ step by step.
 | code-server on port 38080 with `auth: password` and the `HASHED_PASSWORD` value SRW injects; without that value it must not start | the Session IDE, and recovery after an aborted attach |
 | `rclone` 1.70.0 or later, `fusermount3`, `mountpoint`, `fuse-overlayfs` 1.13 or later, `/cloud` owned by `agent-host` | the cloud mount (trusted images only) |
 | No `sudo` | the sudo policy |
+| `/etc/environment` with the directories the image adds to `PATH`, and its `PIP_BREAK_SYSTEM_PACKAGES` and `npm_config_prefix` if it sets them | the agent's shell: SSH sessions start with a fresh environment, without the image's `ENV` |
 
 SRW base images contain `/usr/local/bin/assert-workspace-contract`. Run it as the
 last step of your own build to check your image:
@@ -405,16 +406,30 @@ An Expert whose instructions assume Node, a compiler or a database client fails
 on `srw-workspace-minimal` with "command not found". Use `srw-workspace`, or add
 what you need in your own image.
 
-**Install system-wide in your own Dockerfile.** The base images set `PIP_TARGET`
-and `npm_config_prefix` to directories under `/home/agent-host`, so that the
-workspace user can install packages without root. The workspace volume is
-mounted over that directory, so anything your build installs there is hidden.
-Unset the variable for build-time installs:
+The agent can install more itself, without root. `pip install` puts packages in
+its home directory, on the workspace volume, and pip inside a virtualenv works as
+usual. Where Node.js is installed, `npm install -g` uses `~/.npm-global`, whose
+`bin` is on the agent's `PATH`. A Playwright script uses the image's Chromium without downloading it,
+as long as it uses the image's Playwright version; a project that pins another
+version downloads its own browser into the home directory. VM workspaces behave
+the same way.
+
+**Install system-wide in your own Dockerfile.** The base images let the
+workspace user install packages without root: pip installs into its user
+directory, and `npm_config_prefix` points npm's global installs to a directory
+under `/home/agent-host`. The workspace volume is mounted over that directory,
+so anything your build installs there is hidden. pip run as root installs
+system-wide; for npm, unset the variable:
 
 ```dockerfile
-RUN env -u PIP_TARGET pip install --break-system-packages <package>
+RUN pip install --break-system-packages <package>
 RUN env -u npm_config_prefix npm install -g <package>
 ```
+
+**Pass your `ENV` settings on to the agent.** Its SSH sessions don't inherit the
+image's environment. After your `ENV` lines, run
+`RUN /usr/local/bin/write-agent-environment NAME ...` with the names you set; it
+copies them and `PATH` into `/etc/environment`.
 
 - **Use images only from authors you trust.** The image runs with the workspace
   owner's secrets: the credential connectors attached to the work and its

@@ -129,6 +129,11 @@ RUN fuse-overlayfs --version \
 #     Noble is a snap shim — see docker/agent-vm-base/scripts/provision-stage1.sh).
 #     PLAYWRIGHT_VERSION must match .playwright-version (also consumed by
 #     provision.sh). The agent image has no Playwright/Chromium at all.
+#     The browsers stay in /opt/playwright, read-only for the agent. Its own
+#     Playwright looks in ~/.cache/ms-playwright and finds them through the
+#     links the entrypoint makes there (link-playwright-browsers), so no
+#     PLAYWRIGHT_BROWSERS_PATH is set: it would send every Playwright version,
+#     including a project's own, to this read-only folder.
 # ---------------------------------------------------------------------------
 ARG PLAYWRIGHT_VERSION=1.59.0
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
@@ -152,7 +157,7 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     && test -n "$CHROMIUM_BIN" || (echo "chromium binary not found under /opt/playwright" && find /opt/playwright -maxdepth 4 -type d && exit 1) \
     && ln -sf "$CHROMIUM_BIN" /usr/local/bin/agent-chromium \
     && rm -rf /root/.cache/ms-playwright
-ENV PLAYWRIGHT_BROWSERS_PATH=/opt/playwright
+COPY --chmod=0755 docker/link-playwright-browsers /usr/local/bin/link-playwright-browsers
 
 # ---------------------------------------------------------------------------
 # 2c. browser-exec — workspace-side browser executor. The agent drives it over
@@ -198,15 +203,26 @@ RUN mkdir -p /etc/ssh/authorized_keys \
 
 # User-writable package directories (pip/npm without sudo)
 RUN mkdir -p /home/agent-host/.local/bin \
-             /home/agent-host/.local/lib/python3/site-packages \
              /home/agent-host/.npm-global \
              /home/agent-host/.cache \
              /cloud \
     && chown -R agent-host:agent-host /home/agent-host /cloud
 
-ENV PIP_TARGET=/home/agent-host/.local/lib/python3/site-packages \
+# The agent's own installs. pip refuses Ubuntu's Python unless
+# PIP_BREAK_SYSTEM_PACKAGES is set; with it, agent-host's `pip install` goes to
+# its user site (~/.local), because the system one isn't writable, and a
+# virtualenv works as usual. A root build step still installs system-wide. npm's
+# global prefix moves out of root-owned /usr.
+#
+# The agent's SSH sessions don't inherit ENV: sshd starts each one with a fresh
+# environment. write-agent-environment copies these values and PATH into
+# /etc/environment, which pam_env loads into every session. Run it again after
+# changing any of them; assert-workspace-contract checks the agent's shell.
+ENV PIP_BREAK_SYSTEM_PACKAGES=1 \
     PATH="/home/agent-host/.local/bin:/home/agent-host/.npm-global/bin:${PATH}" \
     npm_config_prefix=/home/agent-host/.npm-global
+COPY --chmod=0755 docker/write-agent-environment /usr/local/bin/write-agent-environment
+RUN /usr/local/bin/write-agent-environment
 
 # ---------------------------------------------------------------------------
 # 5. SSH server config (mirrors provision.sh lines 141-155)

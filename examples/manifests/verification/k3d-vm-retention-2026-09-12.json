@@ -106,7 +106,7 @@
     "Headscale was disabled in the local fixture.",
     "Retained VM instances are available to SRW Jobs; cross-execution Session instance selection is rejected.",
     "General environment.prepare builds and preparation cache publication remain unsupported.",
-    "The earlier main-dev large-image timeout report is not diagnosed by this gate."
+    "The earlier shared-cluster large-image timeout report is not diagnosed by this gate."
   ],
   "cleanup": {
     "ownedNamespaceRemoved": true,
@@ -114,5 +114,5 @@
     "originalSharedGoldenPreserved": true,
     "privateCredentialsAndKubeconfigCopyRemoved": true
   },
-  "deployment": "No feature push, main-dev rollout, or primary Tilt changes performed."
+  "deployment": "No feature push, shared-cluster rollout, or primary Tilt changes performed."
 }

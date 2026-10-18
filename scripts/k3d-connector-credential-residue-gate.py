@@ -77,9 +77,10 @@ ORCHESTRATOR = "deploy/srw-orchestrator"
 STATELESS_AGENT = "deploy/srw-agent-stateless"
 POSTGRES_POD = "srw-postgres-0"
 ROOT = Path(__file__).resolve().parents[1]
-# ``test`` logs in through the gates' Keycloak client, whose ID token carries
-# the e-mail and the realm roles; admin-cli's carries neither, and a login
-# through it demotes the administrator (scripts/k3d_gate_oauth.py).
+# ``test`` logs in through the gates' Keycloak client, whose access token
+# carries the e-mail, the realm roles, `sub` and the audience the API's
+# Bearer check accepts; admin-cli's carries none of them, and a login
+# through it would demote the administrator (scripts/k3d_gate_oauth.py).
 _OAUTH_SPEC = importlib.util.spec_from_file_location(
     "_k3d_gate_oauth", ROOT / "scripts" / "k3d_gate_oauth.py"
 )
@@ -835,15 +836,15 @@ class Api:
         login = gate_oauth.LOGIN_SOURCE + (
             "import json, urllib.request\n"
             "opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))\n"
-            f"token = gate_id_token(opener, {KEYCLOAK_TOKEN_URL!r}, 'test', "
+            f"token = gate_access_token(opener, {KEYCLOAK_TOKEN_URL!r}, 'test', "
             f"{json.dumps(password)})\n"
-            "print(json.dumps({'id_token': token}))\n"
+            "print(json.dumps({'access_token': token}))\n"
         )
         report = kube.python(
             ORCHESTRATOR, "orchestrator", login, operation="keycloak login"
         )
         try:
-            self._token = report["id_token"]
+            self._token = report["access_token"]
         except (KeyError, TypeError):
             raise GateFailure("keycloak login returned no token") from None
 

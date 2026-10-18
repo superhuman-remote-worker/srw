@@ -217,9 +217,9 @@ async def test_old_writer_is_stripped_and_contract_cannot_mutate_or_complete_unp
 @pytest.mark.parametrize(
     "declared",
     [
-        "repos/KurortEngine/docs/demo.html",
-        "./repos/KurortEngine/docs/demo.html",
-        "/repos/KurortEngine/docs/demo.html",
+        "repos/WidgetShop/docs/demo.html",
+        "./repos/WidgetShop/docs/demo.html",
+        "/repos/WidgetShop/docs/demo.html",
     ],
 )
 async def test_old_replica_cannot_complete_historical_cloned_repo_contract(

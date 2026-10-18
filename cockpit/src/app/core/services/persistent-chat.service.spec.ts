@@ -1840,7 +1840,7 @@ describe('PersistentChatService — resume navigation safety', () => {
         detail: {
           code: 'config_drift',
           drift: [
-            { id: 'connector:abc', kind: 'connector', reason: 'deleted', label: 'KurortEngine' },
+            { id: 'connector:abc', kind: 'connector', reason: 'deleted', label: 'WidgetShop' },
           ],
         },
       },
@@ -1924,7 +1924,7 @@ describe('PersistentChatService — resume config drift', () => {
                     id: 'connector:abc',
                     kind: 'connector',
                     reason: 'deleted',
-                    label: 'KurortEngine',
+                    label: 'WidgetShop',
                   },
                 ],
               },
@@ -1936,7 +1936,7 @@ describe('PersistentChatService — resume config drift', () => {
     await service.resumeSession();
 
     expect(service.pendingDrift()).toEqual([
-      { id: 'connector:abc', kind: 'connector', reason: 'deleted', label: 'KurortEngine' },
+      { id: 'connector:abc', kind: 'connector', reason: 'deleted', label: 'WidgetShop' },
     ]);
     expect(service.error()).toBeNull();
     // connect() must not run against a still-ended thread when drift blocks it.
@@ -2119,7 +2119,7 @@ describe('PersistentChatService — resume config drift', () => {
   it('disconnect() clears a pending drift', () => {
     const { service } = createService();
     service.pendingDrift.set([
-      { id: 'connector:abc', kind: 'connector', reason: 'deleted', label: 'KurortEngine' },
+      { id: 'connector:abc', kind: 'connector', reason: 'deleted', label: 'WidgetShop' },
     ]);
 
     service.disconnect();

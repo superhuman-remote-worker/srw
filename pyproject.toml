@@ -1,11 +1,15 @@
 [build-system]
-requires = ["setuptools>=68"]
+# 77 is the first setuptools with PEP 639 license expressions.
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "superhuman-remote-worker"
 version = "0.0.0"
 description = "Superhuman Remote Worker application packages"
+# Functional Source License 1.1, Apache 2.0 future license (see LICENSE).
+license = "FSL-1.1-ALv2"
+license-files = ["LICENSE"]
 requires-python = ">=3.11"
 # Images install their existing, separate requirements before --no-deps -e .
 dependencies = []

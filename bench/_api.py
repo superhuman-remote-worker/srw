@@ -1,7 +1,8 @@
 """Minimal orchestrator REST client for the bench suite (stdlib only).
 
 Auth: SRW_TOKEN is sent both as X-MCP-Token and Bearer so either auth path
-matches. Base URL: SRW_API_URL (default: the dev cluster).
+matches. Base URL: SRW_API_URL (default: a local orchestrator on
+http://localhost:8085, e.g. through a kubectl port-forward).
 """
 
 from __future__ import annotations
@@ -12,7 +13,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-DEFAULT_API = "https://api.srw.works"
+DEFAULT_API = "http://localhost:8085"
 
 
 class ApiError(RuntimeError):
@@ -31,9 +32,9 @@ def _headers() -> dict:
         "Authorization": f"Bearer {token}",
         "Content-Type": "application/json",
         "Accept": "application/json",
-        # Cloudflare's bot filter 1010-blocks the default Python-urllib
-        # signature; a client UA passes. If the WAF still blocks, point
-        # SRW_API_URL at a kubectl port-forward instead.
+        # Some CDN bot filters (Cloudflare's 1010) block the default
+        # Python-urllib signature; a client UA passes. If a WAF still blocks,
+        # point SRW_API_URL at a kubectl port-forward instead.
         "User-Agent": "srw-bench/1.0 (+bench/README.md)",
     }
 

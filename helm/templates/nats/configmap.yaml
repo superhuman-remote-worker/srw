@@ -22,7 +22,7 @@ data:
     jetstream {
       store_dir: /data/jetstream
       max_memory_store: 256MB
-      max_file_store: {{ .Values.nats.storageSize | replace "Gi" "GB" | replace "Mi" "MB" | quote }}
+      max_file_store: {{ .Values.nats.storageSize | replace "Gi" "GB" | replace "Mi" "MB" }}
     }
 
     leafnodes {

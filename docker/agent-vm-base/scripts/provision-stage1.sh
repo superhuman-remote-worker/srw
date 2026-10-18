@@ -400,7 +400,9 @@ sudo PLAYWRIGHT_BROWSERS_PATH=/opt/playwright eatmydata playwright install --wit
 CHROMIUM_BIN=$(sudo find /opt/playwright -maxdepth 4 -type f \( -path '*/chrome-linux/chrome' -o -path '*/chrome-linux64/chrome' \) ! -path '*headless_shell*' | head -1)
 test -n "$CHROMIUM_BIN" || { echo "ERROR: chromium binary not found under /opt/playwright"; sudo find /opt/playwright -maxdepth 4 -type d; exit 1; }
 sudo ln -sf "$CHROMIUM_BIN" /usr/local/bin/agent-chromium
-echo "PLAYWRIGHT_BROWSERS_PATH=/opt/playwright" | sudo tee -a /etc/environment
+# No PLAYWRIGHT_BROWSERS_PATH: it would send every Playwright version, including
+# a project's own, to this read-only folder. The agent's Playwright finds these
+# browsers through links in ~/.cache/ms-playwright, made in stage2.
 echo "Chromium installed at $CHROMIUM_BIN (symlinked /usr/local/bin/agent-chromium)"
 
 # Assert stage1's half of the browser contract here rather than deferring it all

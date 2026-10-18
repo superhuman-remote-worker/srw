@@ -20,6 +20,11 @@ the public repository must not require access to it. Put the context needed to
 review a public change in its issue, pull request, committed public
 documentation, tests, or code comments.
 
+Many code comments, chart values and notes refer to `knowledge-base/…` or
+`knowledge-history/…` paths. Those point into the maintainers' private design
+vault, which is not published, so the references lead nowhere for outside
+readers. That is expected, and you do not need them to work on the code.
+
 ## Set up the repository
 
 SRW runs on Kubernetes. Follow the

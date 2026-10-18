@@ -2012,9 +2012,10 @@ class PersistentSession:
         the workspace so the agent can read them via workspace tools.
         """
         # Workspace creation precedes ToolContext identity resolution and tool
-        # instantiation. Fail closed here: deploy ordinary catalog skills now,
-        # but admit present-with-canvas only after the actual loaded tool list is
-        # known in _load_tools_for_backend().
+        # instantiation. Fail closed here: no catalog skill is admitted until
+        # the actual loaded tool list is known in _load_tools_for_backend(),
+        # because ordinary skills follow use_skill and present-with-canvas
+        # also needs set_canvas (skills_tool_category.md D2).
         self._scope_skills_for_tool_names([])
 
         # Skill directories (Slice 2) — mirror of the agent.py worker path. Runs
@@ -3256,10 +3257,11 @@ class PersistentSession:
         # adapter or persistent identity was unavailable during registration.
         loaded_tool_names = [tool.name for tool in self.tools]
         self._scope_skills_for_tool_names(loaded_tool_names)
-        # This is the first point at which present-with-canvas may touch the
-        # workspace. Re-running after a none→workspace upgrade is idempotent and
-        # admits it only when both use_skill and set_canvas actually loaded.
-        self._deploy_catalog_skill_files({"present-with-canvas"})
+        # This is the first point at which catalog skills may touch the
+        # workspace: ordinary ones only when use_skill loaded, present-with-canvas
+        # only when use_skill and set_canvas did. Re-running after a
+        # none→workspace upgrade is idempotent (ordinary files are add-only).
+        self._deploy_catalog_skill_files()
 
         # Tool docs are virtual (knowledge-base/knowledge/features/virtual_directories.md).
         from agent.core.virtual_dirs import ToolsProvider, sweep_legacy_tools_dir

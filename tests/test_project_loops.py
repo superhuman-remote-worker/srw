@@ -669,10 +669,10 @@ class TestHistoryNamesTheDelivery:
         }
 
     _PR_CHANGE = {
-        "datasource": "Knaeckebrothero/KurortEngine",
+        "datasource": "Acme/WidgetShop",
         "kind": "pull_request",
         "action": "open",
-        "ref": "https://github.com/Knaeckebrothero/KurortEngine/pull/1",
+        "ref": "https://github.com/Acme/WidgetShop/pull/1",
         "summary": "github PR #1: design/hotel-rheinland-theme → main",
         "verified": True,
     }

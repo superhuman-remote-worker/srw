@@ -335,6 +335,9 @@ class GoldenSources(CreationSourcePins):
             source,
             request=row["request"],
             configuration={
+                # Preserve authenticated source policy while rechecking the
+                # actual controller storage settings against the observed DV.
+                **row["controller_configuration"],
                 "namespace": self.namespace,
                 "storage_class": self.settings.VM_STORAGE_CLASS,
                 "golden_disk_size": self.settings.VM_GOLDEN_DISK_SIZE,

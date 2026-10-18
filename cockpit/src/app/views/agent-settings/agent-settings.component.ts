@@ -6,7 +6,7 @@ import type {
     SessionToolCategory,
     SessionToolGroupsResponse,
 } from '../../core/services/api.service';
-import {readConfigPath, SettingsMode, TierReachability, WORKSPACE_BACKENDS} from './agent-settings.types';
+import {liveUpgradeState, readConfigPath, SettingsMode, TierReachability, WORKSPACE_BACKENDS} from './agent-settings.types';
 import {deepMergeConfig} from './config-merge';
 import {ExecutionGroupComponent} from './execution-group.component';
 import {ModelGroupComponent} from './model-group.component';
@@ -245,7 +245,7 @@ import type {BadgeTone} from '../../ui/badge';
                 {{ 'agentSettings.locked.templateAndResources' | transloco }}
                 <span class="locked-reason"><app-icon size="xs">lock</app-icon>{{ 'agentSettings.locked.atCreation' | transloco }}</span>
               </span>
-              <span class="locked-value">{{ 'agentSettings.locked.templateAndResourcesHint' | transloco }}</span>
+              <span class="locked-value">{{ (liveUpgrade() === 'available' ? 'agentSettings.locked.templateAndResourcesHint' : 'agentSettings.locked.resourcesFixedHint') | transloco }}</span>
             </div>
           } @else {
             <ng-content select="[workspacePicker]" />
@@ -655,10 +655,15 @@ export class AgentSettingsComponent {
     return this.pickerQuery()?.summary() ?? '';
   });
 
+  /** Live mode: whether this session can move tier at all. The upgrade copy
+   *  (chip, template line) shows only when it can. */
+  protected readonly liveUpgrade = computed(() => liveUpgradeState(this.liveTier(), this.tierReachability()));
+
   readonly workspaceChip = computed<{label: string; tone: BadgeTone}>(() => {
     this.activeLang();
     if (this.mode() === 'live') {
-      return {label: this.transloco.translate('agentSettings.sections.chip.upgradeOnly'), tone: 'neutral'};
+      const key = this.liveUpgrade() === 'available' ? 'upgradeOnly' : 'fixed';
+      return {label: this.transloco.translate(`agentSettings.sections.chip.${key}`), tone: 'neutral'};
     }
     const kind = this.pickerQuery()?.choice().kind ?? 'default';
     const key = kind === 'default' ? 'default' : kind === 'inline' ? 'custom' : kind === 'none' ? 'none' : 'template';

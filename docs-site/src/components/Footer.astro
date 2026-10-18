@@ -1,0 +1,23 @@
+---
+// Starlight's footer (edit link, pagination) plus the licence line.
+import Default from '@astrojs/starlight/components/Footer.astro';
+
+import { REPO_URL } from '../site.mjs';
+---
+
+<Default><slot /></Default>
+<p class="srw-licence">
+	Source-available under <a href={`${REPO_URL}/blob/main/LICENSE`}>FSL-1.1-ALv2</a>.
+</p>
+
+<style>
+	.srw-licence {
+		margin-top: 1.5rem;
+		text-align: center;
+		font-size: var(--sl-text-xs);
+		color: var(--sl-color-gray-3);
+	}
+	.srw-licence a {
+		color: inherit;
+	}
+</style>

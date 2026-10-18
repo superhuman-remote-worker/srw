@@ -171,6 +171,9 @@ spec:
         # person reads what came in.
         tools:
           workspace: []
+          # No skill list on a phone line; its bindings are phase skills only,
+          # which arrive as messages and do not bring use_skill back.
+          skills: []
           research:
             - web_search
             - extract_webpage

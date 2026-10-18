@@ -39,7 +39,7 @@ tool_examples:
         <|tool_call>call:git_show{stat_only:true}<tool_call|>                                         # latest commit, file list only
         <|tool_call>call:git_show{commit_ref:<|"|>HEAD~3<|"|>}<tool_call|>                            # commit from 3 commits ago
         <|tool_call>call:git_show{commit_ref:<|"|>phase-1-tactical-complete<|"|>}<tool_call|>         # tagged commit
-        <|tool_call>call:git_show{commit_ref:<|"|>5e08d4fa<|"|>,repo:<|"|>KurortEngine<|"|>}<tool_call|>  # commit in an ATTACHED repository
+        <|tool_call>call:git_show{commit_ref:<|"|>5e08d4fa<|"|>,repo:<|"|>WidgetShop<|"|>}<tool_call|>    # commit in an ATTACHED repository
 
   git_diff: |-
     Examples:

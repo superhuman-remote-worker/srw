@@ -151,9 +151,9 @@ SSH access configured). The panel renders a block like:
 
 ```
 Host srw-s-7f3a91c2
-    HostName            ssh.srw.works
+    HostName            ssh.srw.example.com
     User                s-7f3a91c2
-    ProxyCommand        srw-ssh-proxy --stdio api.srw.works --origin https://cockpit.srw.works
+    ProxyCommand        srw-ssh-proxy --stdio api.srw.example.com --origin https://srw.example.com
     IdentityFile        ~/.ssh/id_ed25519
     IdentitiesOnly      yes
     PreferredAuthentications publickey
@@ -175,7 +175,7 @@ A few things worth knowing about this block:
 - **`HostName` is never dialled.** `ProxyCommand` short-circuits DNS entirely — the
   proxy connects over `wss://` to `apiHost`, not `sshHost`. `HostName` exists purely
   as the `known_hosts` key, so the gateway's host key lands under one stable name.
-  Don't expect `ssh.srw.works` to resolve or be pingable.
+  Don't expect `ssh.srw.example.com` to resolve or be pingable.
 - **`--origin` is always present**, and it's the exact origin your browser was
   serving cockpit from when the panel rendered. The gateway checks it. See
   [Troubleshooting](#7-troubleshooting) if this 403s.
@@ -220,7 +220,7 @@ Instead, run the helper as a **local listener** — the connect panel's copy but
 renders the exact command for your deployment, `--origin` included (see below):
 
 ```bash
-srw-ssh-proxy --listen 127.0.0.1:2222 api.srw.works --origin https://cockpit.srw.works
+srw-ssh-proxy --listen 127.0.0.1:2222 api.srw.example.com --origin https://srw.example.com
 ```
 
 Then in JetBrains Gateway: connect via SSH to `127.0.0.1:2222`, authentication type
@@ -337,7 +337,7 @@ prints the Origin it sent on this error, which is the fastest way to compare it
 against what the operator configured:
 
 ```
-srw-ssh-proxy: upgrade refused: HTTP/1.1 403 Forbidden (sent Origin: 'https://cockpit.srw.works'; a
+srw-ssh-proxy: upgrade refused: HTTP/1.1 403 Forbidden (sent Origin: 'https://srw.example.com'; a
 bare 403 here means the attach token was expired/invalid, the Origin was rejected, or the
 handshake rate limit was hit -- retry for a fresh token, or pass --origin if the Origin is wrong)
 ```

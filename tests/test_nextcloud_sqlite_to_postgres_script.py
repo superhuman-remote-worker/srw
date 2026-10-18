@@ -9,12 +9,15 @@ command line the script builds carries a credential.
 from __future__ import annotations
 
 import importlib.util
+import io
 import json
 import sqlite3
 import subprocess
 import sys
+import tarfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -772,6 +775,68 @@ def _migration(phase, backup_dir, cluster, *extra):
 
 def _ran_convert(cluster):
     return any("db:convert-type" in part for argv in cluster.calls for part in argv)
+
+
+class _StreamingPopen:
+    """Popen stand-in for ``kubectl exec``: writes ``payload`` and exits 0."""
+
+    def __init__(self, payload: bytes):
+        self.payload = payload
+        self.argvs: list[list[str]] = []
+
+    def __call__(self, argv, stdout, stderr):
+        self.argvs.append(list(argv))
+        stdout.write(self.payload)
+        return SimpleNamespace(communicate=lambda: (None, b""), returncode=0)
+
+
+def _gzip_tar(members: dict[str, bytes]) -> bytes:
+    buffer = io.BytesIO()
+    with tarfile.open(fileobj=buffer, mode="w:gz") as archive:
+        for name, data in members.items():
+            info = tarfile.TarInfo(name)
+            info.size = len(data)
+            archive.addfile(info, io.BytesIO(data))
+    return buffer.getvalue()
+
+
+class TestBackupStream:
+    def _backup(self, tmp_path, payload):
+        cluster = FakeCluster()
+        _settled(tmp_path)
+        popen = _StreamingPopen(payload)
+        args = _args("backup", tmp_path, "--run", "--confirm", "MIGRATE-NEXTCLOUD-srw")
+        kube = mig.Kube(
+            "k3d-srw",
+            "srw",
+            "srw-nextcloud",
+            "nextcloud",
+            runner=cluster,
+            popen=popen,
+            environ=SENTINELS,
+        )
+        migration = mig.Migration(args, kube, sleep=lambda seconds: None)
+        return migration, popen
+
+    def test_the_pod_compresses_the_stream(self, tmp_path):
+        # Dev, 2026-10-17: a 306 MB plain stream stalled at 120 MB; the file
+        # was mostly free pages and came across as 2 MB of gzip.
+        migration, popen = self._backup(tmp_path, b"")
+        with pytest.raises(mig.MigrationError):
+            migration.backup()
+        assert any("tar -czf - " in part for part in popen.argvs[0])
+        assert not (tmp_path / "backup.tar").exists()
+
+    def test_a_stream_that_ends_early_fails_the_phase(self, tmp_path):
+        # Dev, 2026-10-17: kubectl over SPDY ended a long stream short and
+        # still exited 0. The cut archive must fail the phase by name, not
+        # with a tarfile traceback.
+        archive = _gzip_tar(
+            {"nextcloud.db": bytes(range(256)) * 4096, "config.php": b"<?php"}
+        )
+        migration, _ = self._backup(tmp_path, archive[: len(archive) // 2])
+        with pytest.raises(mig.MigrationError, match="incomplete or damaged"):
+            migration.backup()
 
 
 class TestConvertGating:

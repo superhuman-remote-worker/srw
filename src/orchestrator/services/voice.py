@@ -370,15 +370,19 @@ async def stream_thread_message_tts_plan(
     )
 
 
-async def transcribe_thread_audio(
+async def transcribe_audio(
     *,
-    thread_id: str,
+    thread_id: str | None,
     user_id: str,
     data: bytes,
     filename: str,
     dependencies: VoiceDependencies,
 ) -> Response:
     """Transcribe a recorded voice message to text (speech-to-text).
+
+    ``thread_id`` only attributes the usage event; the model and key are the
+    user's. ``None`` is a dictation on the landing draft, before any session
+    exists.
 
     ``{"text": "..."}`` on success (``text`` may be ``""`` for silence).
     ``204`` **only** when no STT model is configured (the cockpit attaches the

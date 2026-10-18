@@ -498,7 +498,7 @@ class TestCapabilityScopedCanvasSkillDeployment:
         session.workspace_manager = workspace
         session.tool_context = SimpleNamespace(config={})
 
-        session._scope_skills_for_tool_names(["read_product_guide"])
+        session._scope_skills_for_tool_names(["read_product_guide", "use_skill"])
         session._deploy_catalog_skill_files()
 
         scoped = session.config.extra["_resolved_skills"]
@@ -508,6 +508,34 @@ class TestCapabilityScopedCanvasSkillDeployment:
         assert "STALE-OR-USER-GUIDE" not in scoped["files"]["app-guide"]["SKILL.md"]
         assert written == {"skills/ordinary-skill/SKILL.md": "ordinary"}
         assert session.tool_context.config["_resolved_skills"] == scoped
+
+    def test_catalog_skills_follow_use_skill(self):
+        """No use_skill, no ordinary skill in the menu or the workspace; the
+        managed guide keeps its own reader (skills_tool_category.md D2)."""
+        cfg = _make_config(
+            extra={
+                "_resolved_skills": {
+                    "menu": [{"name": "ordinary-skill"}],
+                    "files": {"ordinary-skill": {"SKILL.md": "ordinary"}},
+                }
+            }
+        )
+        session = _make_session(config=cfg)
+        written: dict[str, str] = {}
+        workspace = MagicMock()
+        workspace.exists.side_effect = lambda path: path in written
+        workspace.write_file.side_effect = lambda path, content: written.__setitem__(
+            path, content
+        )
+        session.workspace_manager = workspace
+        session.tool_context = SimpleNamespace(config={})
+
+        session._scope_skills_for_tool_names(["read_product_guide", "read_file"])
+        session._deploy_catalog_skill_files()
+
+        menu = session.config.extra["_resolved_skills"]["menu"]
+        assert [item["name"] for item in menu] == ["app-guide"]
+        assert written == {}
 
     def test_app_guide_is_withheld_if_reader_failed_to_instantiate(self):
         cfg = _make_config(extra={"_resolved_skills": {}})
@@ -702,18 +730,19 @@ class TestCapabilityScopedCanvasSkillDeployment:
         session.workspace_manager = workspace
         session.tool_context = SimpleNamespace(config={})
 
-        # Workspace setup can deploy ordinary skills, but Canvas has not yet
-        # instantiated and must be absent from both the menu and workspace.
+        # Workspace setup precedes tool instantiation, so no catalog skill is
+        # admitted yet: ordinary skills follow use_skill, Canvas also needs
+        # set_canvas (skills_tool_category.md D2).
         session._deploy_instruction_files()
-        assert [
-            item["name"] for item in session.config.extra["_resolved_skills"]["menu"]
-        ] == ["ordinary-skill"]
-        assert written == {"skills/ordinary-skill/SKILL.md": "ordinary"}
+        assert session.config.extra["_resolved_skills"]["menu"] == []
+        assert written == {}
 
         # Missing identity, an explicit disable, and backend=none all result in
-        # an actual loaded set without set_canvas; none may add the skill.
+        # an actual loaded set without set_canvas; none may add the skill. The
+        # loaded use_skill admits the ordinary skill.
         session._scope_skills_for_tool_names(["use_skill"])
-        session._deploy_catalog_skill_files({"present-with-canvas"})
+        session._deploy_catalog_skill_files()
+        assert written == {"skills/ordinary-skill/SKILL.md": "ordinary"}
         assert "skills/present-with-canvas/SKILL.md" not in written
 
         # A later none→workspace rebind can admit both tools and add the skill.

@@ -93,6 +93,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import importlib.util
 import json
 import re
 import secrets
@@ -105,6 +106,16 @@ from pathlib import Path
 from typing import Any, Callable
 
 ROOT = Path(__file__).resolve().parents[1]
+
+# The run's OAuth client gets the gate clients' protocol mappers: `sub` and
+# the audience the API's Bearer check accepts (scripts/k3d_gate_oauth.py),
+# so its logins send an access token, never an ID token.
+_OAUTH_SPEC = importlib.util.spec_from_file_location(
+    "_k3d_gate_oauth", ROOT / "scripts" / "k3d_gate_oauth.py"
+)
+assert _OAUTH_SPEC is not None and _OAUTH_SPEC.loader is not None
+gate_oauth = importlib.util.module_from_spec(_OAUTH_SPEC)
+_OAUTH_SPEC.loader.exec_module(gate_oauth)
 LOCAL_CONTEXT = "k3d-srw"
 LOCAL_NAMESPACE = "srw"
 LOCAL_CONFIRMATION = "LOCAL-K3D-DISPOSABLE"
@@ -341,7 +352,7 @@ form = urllib.parse.urlencode({
     "username": envelope["username"], "password": envelope["password"],
 }).encode()
 with opener.open(envelope["token_url"], data=form, timeout=30) as response:
-    token = json.load(response)["id_token"]
+    token = json.load(response)["access_token"]
 body = envelope.get("body")
 request = urllib.request.Request(
     "http://localhost:8085" + envelope["path"],
@@ -461,6 +472,7 @@ asyncio.run(main())
 # marker or email (and its recorded id, once known). The D3c gate's program.
 _KEYCLOAK_PROGRAM = (
     _POD_MEMORY_CAP
+    + gate_oauth.MAPPERS_SOURCE
     + r"""
 import json, os, sys, urllib.error, urllib.parse, urllib.request
 cap_memory()
@@ -545,6 +557,7 @@ if action == "create-client":
         "serviceAccountsEnabled": False,
         "fullScopeAllowed": True,
         "defaultClientScopes": ["profile", "email", "roles"],
+        "protocolMappers": _SRW_GATE_MAPPERS,
         "optionalClientScopes": [],
         "attributes": {"srw-gate": request["marker"]},
     }, clients, client_owned)))

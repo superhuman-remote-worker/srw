@@ -1,0 +1,18 @@
+---
+// The Helm values reference. Its Markdown is generated before every build by
+// scripts/generate-helm-reference.mjs (`npm run generate`) and is not committed.
+import StarlightPage from '@astrojs/starlight/components/StarlightPage.astro';
+
+import { Content, frontmatter, getHeadings } from '../../generated/helm-values.md';
+---
+
+<StarlightPage
+	frontmatter={{
+		title: frontmatter.title,
+		description: frontmatter.description,
+		tableOfContents: frontmatter.tableOfContents,
+	}}
+	headings={getHeadings()}
+>
+	<div class="srw-helm-reference"><Content /></div>
+</StarlightPage>

@@ -3,6 +3,7 @@
 from copy import deepcopy
 from types import SimpleNamespace
 from uuid import UUID, uuid4
+from unittest.mock import AsyncMock
 
 import pytest
 import yaml
@@ -14,6 +15,73 @@ from tests.test_vm_resource_manifest import final_case  # noqa: F401
 
 
 IMAGE = "registry.example/srw-vm@sha256:" + "a" * 64
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "change",
+    [
+        "missing_original",
+        "retained_without_initial_source",
+        "unfinished_original",
+        "wrong_pvc",
+        "bad_digest",
+        "caller_profile",
+        "mixed_history",
+    ],
+)
+async def test_enabled_enrollment_never_upgrades_unproven_legacy_history(
+    monkeypatch, change
+):
+    from orchestrator.services.vm_creation_preflight import VMCreationPreflightStore
+    from orchestrator.services.vm_creation_retry_store import VMCreationRetryConflict
+    from shared.vm_creation_retry import canonical_request_digest
+    from shared.vm_network_profile import NETWORK_PROFILE
+
+    monkeypatch.setenv("VM_NETWORK_PROFILE_ENABLED", "true")
+    request = _request()
+    original = {**request, "provision_generation": str(uuid4())}
+    pvc = str(uuid4())
+    row = {
+        "canonical_request": original,
+        "request_digest": canonical_request_digest(original),
+        "expected_pvc_uid": None,
+        "observed_pvc_uid": UUID(pvc),
+        "state": "succeeded",
+    }
+    rows = [row]
+    if change == "missing_original":
+        rows = []
+    elif change == "retained_without_initial_source":
+        row["expected_pvc_uid"] = UUID(pvc)
+    elif change == "unfinished_original":
+        row["state"] = "queued"
+    elif change == "wrong_pvc":
+        row["observed_pvc_uid"] = uuid4()
+    elif change == "bad_digest":
+        row["request_digest"] = "sha256:" + "f" * 64
+    elif change == "caller_profile":
+        request["network_profile"] = NETWORK_PROFILE
+    elif change == "mixed_history":
+        profiled = {**original, "network_profile": NETWORK_PROFILE}
+        rows.append(
+            {
+                **row,
+                "canonical_request": profiled,
+                "request_digest": canonical_request_digest(profiled),
+            }
+        )
+    conn = SimpleNamespace(fetch=AsyncMock(return_value=rows))
+    with pytest.raises(
+        VMCreationRetryConflict, match="retained_network_profile_unproven"
+    ):
+        await VMCreationPreflightStore(object())._network_profile_request(
+            conn,
+            {"id": UUID(request["job_id"])},
+            request,
+            {"expected_pvc_uid": pvc},
+            {},
+        )
 
 
 def _controller(monkeypatch):

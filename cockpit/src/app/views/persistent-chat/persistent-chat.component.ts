@@ -241,6 +241,7 @@ const TOOL_LABELS: Record<string, string> = {
  */
 const CATEGORY_NOUNS_ONE: Record<string, string> = {
     workspace: 'file',
+    skills: 'skill',
     git: 'git op',
     shell: 'command',
     research: 'search',
@@ -263,6 +264,7 @@ const CATEGORY_NOUNS_ONE: Record<string, string> = {
 
 const CATEGORY_NOUNS: Record<string, string> = {
     workspace: 'files',
+    skills: 'skills',
     git: 'git ops',
     shell: 'commands',
     research: 'searches',
@@ -290,6 +292,7 @@ const CHIP_CATEGORY_CAP = 4;
 
 const CATEGORY_LABELS: Record<string, string> = {
     workspace: 'Working with files',
+    skills: 'Using skills',
     git: 'Version control',
     shell: 'Running commands',
     research: 'Research & browsing',
@@ -2357,12 +2360,15 @@ export function clearDraft(threadId: string | null): void {
 
           @if (!isRecording()) {
           <div class="composer-row">
-            <!-- Attach button + popover menu -->
+            <!-- Attach button + popover menu. Open whenever the composer is:
+                 a chip rides the outbox with the text, so on the landing
+                 draft or a starting/ended session it uploads once the thread
+                 it creates or resumes is ready. -->
             <div class="attach-wrap">
               <button
                 type="button"
                 class="ctrl"
-                [disabled]="!chat.isConnected() || chat.isParked()"
+                [disabled]="!canCompose()"
                 [title]="'chat.composer.attach' | transloco"
                 [class.active]="attachmentMenuOpen()"
                 (click)="attachmentMenuOpen() ? closeAttachmentMenu() : openAttachmentMenu()"
@@ -2392,7 +2398,7 @@ export function clearDraft(threadId: string | null): void {
               <button
                 type="button"
                 class="ctrl"
-                [disabled]="!chat.isConnected() || chat.isParked()"
+                [disabled]="!canCompose()"
                 [title]="'chat.composer.takePhoto' | transloco"
                 (click)="pickCamera()"
               >
@@ -2412,7 +2418,7 @@ export function clearDraft(threadId: string | null): void {
               <button
                 type="button"
                 class="send mic"
-                [disabled]="!chat.isConnected() || chat.isParked() || isTranscribing() || sttUnavailable()"
+                [disabled]="!canCompose() || isTranscribing() || sttUnavailable()"
                 [title]="(sttUnavailable() ? 'chat.composer.sttNotConfigured' : 'chat.composer.recordVoice') | transloco"
                 (pointerdown)="$event.preventDefault()"
                 (click)="startRecording()"
@@ -2820,7 +2826,17 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
     readonly attachmentMenuOpen = signal(false);
     readonly isRecording = signal(false);
     readonly recordingDuration = signal(0);
-    readonly isTranscribing = signal(false);
+    /** The transcription in flight and the composer it belongs to: a thread
+     *  id, or null for the landing draft. */
+    private readonly transcription = signal<{owner: string | null} | null>(null);
+    /** Scoped to its composer. This component is reused across sessions, and
+     *  another session's transcription must neither show here nor hold Send. */
+    readonly isTranscribing = computed(() => {
+        const run = this.transcription();
+        return run !== null && run.owner === this.chat.threadId();
+    });
+    /** Set on destroy: a transcription that resolves later has no composer. */
+    private composerDestroyed = false;
     // Hard cap on a single dictation (20 min). Generous enough for the "10+ min
     // voice message" case, while bounding memory + staying well under the 25 MB
     // backend cap (opus ≈ 0.3 MB/min ⇒ ~6 MB). The recording service is handed
@@ -3395,6 +3411,10 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
             (this.chat.draftDefaultsLoading() || this.chat.draftDefaultsError() ||
                 this.chat.draftDatasourceIds() === null)
         ) return false;
+        // The transcript is still on its way into this composer. A send now
+        // would go out without it — and on the landing draft would create the
+        // session and leave the composer the transcript was meant for.
+        if (this.isTranscribing()) return false;
         return canSendMessage(
             this.canCompose(),
             this.inputText,
@@ -3460,6 +3480,7 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
         }
         this.capabilitiesSub?.unsubscribe();
         this.recordingStateSub?.unsubscribe();
+        this.composerDestroyed = true;
         if (this.isRecording()) {
             this.voiceRecording.cancelRecording();
         }
@@ -3665,34 +3686,39 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
      */
     async stopRecording(): Promise<void> {
         if (!this.isRecording()) return;
+        // The composer this clip belongs to: a session, or the landing draft
+        // (null), which transcribes through the account route.
+        const threadId = this.chat.threadId();
         const result = await this.voiceRecording.stopRecording();
         if (!result || result.duration < 1) return;
         const preview = await this.fileHandling.createAudioFilePreview(result);
 
-        const threadId = this.chat.threadId();
-        if (threadId) {
-            this.isTranscribing.set(true);
-            try {
-                const res = await firstValueFrom(
-                    this.api.transcribeVoice(threadId, preview.file),
-                );
-                if (res && res !== 'unavailable' && res.text.trim()) {
-                    const transcript = res.text.trim();
-                    this.inputText = this.inputText.trim()
-                        ? `${this.inputText.trim()}\n\n${transcript}`
-                        : transcript;
-                    queueMicrotask(() => this.autoResizeInput());
-                } else if (res === null) {
-                    // Transport/server error — keep the audio, surface a notice.
-                    this.chat.attachmentError.set(
-                        this.transloco.translate('chat.composer.transcribeError'),
-                    );
-                }
-                // 'unavailable' (no STT model configured) → attach audio silently.
-            } finally {
-                this.isTranscribing.set(false);
-            }
+        const run = {owner: threadId};
+        this.transcription.set(run);
+        const res = await firstValueFrom(this.api.transcribeVoice(threadId, preview.file))
+            // Only clear our own: the user may have started another one since.
+            .finally(() => {
+                if (this.transcription() === run) this.transcription.set(null);
+            });
+        // A long clip can outlive its composer: the user switched sessions
+        // (this component is reused) or left the draft (it is destroyed).
+        // Drop the text AND the audio — composer chips never follow the user
+        // to another thread, and a late chip would upload into the wrong one.
+        if (this.composerDestroyed || this.chat.threadId() !== threadId) return;
+
+        if (res && res !== 'unavailable' && res.text.trim()) {
+            const transcript = res.text.trim();
+            this.inputText = this.inputText.trim()
+                ? `${this.inputText.trim()}\n\n${transcript}`
+                : transcript;
+            queueMicrotask(() => this.autoResizeInput());
+        } else if (res === null) {
+            // Transport/server error — keep the audio, surface a notice.
+            this.chat.attachmentError.set(
+                this.transloco.translate('chat.composer.transcribeError'),
+            );
         }
+        // 'unavailable' (no STT model configured) → attach audio silently.
 
         this.chat.addAttachments([preview]);
     }
@@ -3832,10 +3858,11 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
 
         const files = event.dataTransfer?.files;
         if (!files || files.length === 0) return;
-        // Honour the same gating as the file picker — if the session is
-        // disconnected, the upload would fail anyway; if its unit is parked,
-        // the chip could never be sent.
-        if (!this.chat.isConnected() || this.chat.isParked()) return;
+        // Same gate as the Attach button: wherever the composer is open the
+        // chip rides the outbox with the text (the landing draft included,
+        // where no session exists yet). A mid-session reconnect or a parked
+        // unit closes both.
+        if (!this.canCompose()) return;
 
         this.applyFilePreviews(await this.fileHandling.createFilePreviews(Array.from(files)));
     }

@@ -577,6 +577,7 @@ POST   /api/vms                                                                 
 DELETE /api/vms/{job_id}                                                                pat=jobs:write      gated:require_job_access
 GET    /api/vms/{job_id}                                                                pat=jobs:write      gated:require_job_access
 GET    /api/voice/capabilities                                                          pat=chat:read       gated:require_approved_user
+POST   /api/voice/transcribe                                                            pat=chat:write      gated:require_approved_user
 GET    /api/workspace-cache                                                             pat=jobs:read       gated:require_approved_user
 DELETE /api/workspace-cache/{artifact_id}                                               pat=admin           gated:require_approved_user
 DELETE /api/workspace-instances/{instance_id}                                           pat=admin           gated:require_approved_user

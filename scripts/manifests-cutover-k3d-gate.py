@@ -15,6 +15,7 @@ import argparse
 from copy import deepcopy
 from datetime import datetime, timezone
 import hashlib
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -31,7 +32,17 @@ from shared.manifests import parse_documents, validate_documents
 ROOT = Path(__file__).resolve().parents[1]
 KUBECTL = ["kubectl", "--context", "k3d-srw", "--namespace", "srw"]
 API = "https://api.localhost"
-AUTH = "https://auth.localhost/realms/srw/protocol/openid-connect/token"
+
+# Logins go through the gates' Keycloak client (scripts/k3d_gate_oauth.py), in
+# the orchestrator pod: its access token carries `sub`, the realm roles and
+# the audience the API's Bearer check accepts. admin-cli's ID token is no
+# Bearer credential.
+_OAUTH_SPEC = importlib.util.spec_from_file_location(
+    "_k3d_gate_oauth", ROOT / "scripts" / "k3d_gate_oauth.py"
+)
+assert _OAUTH_SPEC is not None and _OAUTH_SPEC.loader is not None
+gate_oauth = importlib.util.module_from_spec(_OAUTH_SPEC)
+_OAUTH_SPEC.loader.exec_module(gate_oauth)
 OWNER_LABEL = "srw.io/cutover-gate"
 
 
@@ -380,27 +391,20 @@ class CutoverGate:
 
     def login(self):
         try:
-            response = self.client.post(
-                AUTH,
-                data={
-                    "grant_type": "password",
-                    "client_id": "admin-cli",
-                    "scope": "openid",
-                    "username": os.getenv("SRW_K3D_TEST_USER", "test"),
-                    "password": os.getenv("SRW_K3D_TEST_PASSWORD", "srw-k3d-dev-test"),
-                },
+            token = gate_oauth.access_token(
+                os.getenv("SRW_K3D_TEST_USER", "test"),
+                os.getenv("SRW_K3D_TEST_PASSWORD", "srw-k3d-dev-test"),
+                kubectl=KUBECTL,
             )
-            require(response.status_code == 200, "Local Keycloak login failed.")
-            token = response.json().get("id_token")
-        except (httpx.HTTPError, ValueError):
+        except (RuntimeError, subprocess.TimeoutExpired):
             raise GateFailure("Local Keycloak login did not complete.") from None
         require(
             isinstance(token, str) and bool(token),
-            "Local Keycloak returned no identity token.",
+            "Local Keycloak returned no access token.",
         )
         require(
             not any(char.isspace() for char in token),
-            "Local Keycloak returned an invalid identity token.",
+            "Local Keycloak returned an invalid access token.",
         )
         self.headers = {"Authorization": "Bearer " + token}
 

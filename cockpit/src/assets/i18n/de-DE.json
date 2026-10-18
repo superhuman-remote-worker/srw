@@ -2578,6 +2578,7 @@
     },
     "toolCategories": {
       "workspace": "Arbeit mit Dateien",
+      "skills": "Skills verwenden",
       "git": "Versionskontrolle",
       "shell": "Befehle ausführen",
       "research": "Recherche & Browsen",
@@ -2619,6 +2620,7 @@
       "research": "Suchen",
       "session_task": "Aufgaben",
       "shell": "Befehle",
+      "skills": "Skills",
       "sql": "Abfragen",
       "thought": "Gedanken",
       "workspace": "Dateien"
@@ -2640,6 +2642,7 @@
       "research": "Suche",
       "session_task": "Aufgabe",
       "shell": "Befehl",
+      "skills": "Skill",
       "sql": "Abfrage",
       "thought": "Gedanke",
       "workspace": "Datei"
@@ -3922,6 +3925,7 @@
           "changes": "{{n}} geändert",
           "template": "Vorlage",
           "upgradeOnly": "Nur Upgrade",
+          "fixed": "Festgelegt",
           "default": "Standard",
           "custom": "Angepasst",
           "none": "Keiner",
@@ -3935,6 +3939,7 @@
         "project": "Projekt",
         "templateAndResources": "Vorlage und Ressourcen",
         "templateAndResourcesHint": "Die Stufe oben lässt sich upgraden. Image und Ressourcen bleiben wie erstellt.",
+        "resourcesFixedHint": "Image und Ressourcen bleiben wie erstellt.",
         "moreLive": "Diese wurden beim Start der Session festgelegt.",
         "moreUnavailable": "Die Werte, mit denen diese Session gestartet wurde, konnten nicht geladen werden."
       },
@@ -4028,6 +4033,12 @@
       "tierCurrent": "aktuell",
       "tierNext": "die nächste Stufe",
       "tierHint": "Beim Upgrade werden deine Dateien übernommen; innerhalb der Sitzung ist es nicht umkehrbar.",
+      "tierFixed": {
+        "needsApproval": "Für ein Upgrade dieser Sitzung brauchst du die Freigabe eines Admins.",
+        "sessionUnsupported": "Diese Sitzung kann ihren Workspace nicht wechseln. Starte eine neue Sitzung, um auf einer anderen Stufe zu arbeiten.",
+        "highest": "Diese Sitzung läuft bereits auf der höchsten Stufe.",
+        "unsupported": "Diese Stufe lässt sich nicht upgraden."
+      },
       "tierUpgrading": "{{tier}} wird bereitgestellt…",
       "tierUnreachable": {
         "downgrade": "Herunterstufen nicht möglich",
@@ -4134,6 +4145,10 @@
       "canvas": {
         "label": "Canvas",
         "description": "Kann Workspace-Dateien im gemeinsamen Sitzungs-Canvas präsentieren"
+      },
+      "skills": {
+        "label": "Skills",
+        "description": "Kann Skills aus Ihrem Skill-Katalog laden. Aus heißt: Der Agent sieht keine Skill-Liste"
       },
       "citation": {
         "label": "Zitation",

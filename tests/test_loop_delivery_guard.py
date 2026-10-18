@@ -33,9 +33,9 @@ LOOP_ID = "105a6f98-134c-4077-b7e1-6d08916650d7"
 
 PR_RECORD = {
     "forge": "github",
-    "repo": "Knaeckebrothero/KurortEngine",
+    "repo": "Acme/WidgetShop",
     "number": 1,
-    "url": "https://github.com/Knaeckebrothero/KurortEngine/pull/1",
+    "url": "https://github.com/Acme/WidgetShop/pull/1",
     "head": "design/hotel-rheinland-theme",
     "base": "main",
 }
@@ -115,7 +115,7 @@ async def test_a_pull_request_is_not_flagged_as_empty() -> None:
 async def test_a_pull_request_is_reported_as_delivery() -> None:
     actions = await _run(_job(context={"pull_request": PR_RECORD}))
     line = next(iter(_delivery_lines(actions)), "")
-    assert "Knaeckebrothero/KurortEngine" in line
+    assert "Acme/WidgetShop" in line
     assert "#1" in line
     assert "design/hotel-rheinland-theme" in line
 

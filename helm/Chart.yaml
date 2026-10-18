@@ -2,8 +2,15 @@ apiVersion: v2
 name: superhuman-remote-worker
 description: AI agent orchestration system — Orchestrator, Agents, Cockpit UI
 type: application
-version: 0.1.0
-appVersion: "1.0.0"
+# Placeholders: a published chart never carries these. CI sets both at
+# package time: main.yml releases superhuman-remote-worker with the release
+# version as version and appVersion, and develop.yml publishes srw-dev as
+# 0.0.<run number> with the commit SHA as appVersion. A local `./helm` install
+# keeps them, and no image is tagged v0.0.0-local, so pin
+# vmController.defaultVmImage (its default is srw-agent-vm-base:v<appVersion>)
+# and the image tags explicitly. See docs/versioning.md.
+version: 0.0.0-local
+appVersion: "0.0.0-local"
 home: https://github.com/superhuman-remote-worker/srw
 maintainers:
   - name: superhuman-remote-worker

@@ -404,17 +404,10 @@ class TemporaryAdmin:
                 "defaultClientScopes": ["profile", "email", "roles"],
                 "optionalClientScopes": [],
                 "attributes": {OWNER_LABEL: self.name},
-                # The imported local realm has no basic scope. Use Keycloak's
-                # standard subject mapper, which derives sub from the real user.
-                # https://www.keycloak.org/admin-api/protocol-mappers#subject-sub
-                "protocolMappers": [
-                    {
-                        "name": "subject",
-                        "protocol": "openid-connect",
-                        "protocolMapper": "oidc-sub-mapper",
-                        "config": {"access.token.claim": "true"},
-                    }
-                ],
+                # The gate clients' mappers (scripts/k3d_gate_oauth.py): `sub`
+                # (the imported local realm has no basic scope) and the
+                # audience the API's Bearer check accepts.
+                "protocolMappers": list(cutover.gate_oauth.GATE_CLIENT_MAPPERS),
             },
         )
         path = urlparse(location or "").path

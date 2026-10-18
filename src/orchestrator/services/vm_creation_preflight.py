@@ -458,12 +458,10 @@ class VMCreationPreflightStore:
                         raise VMCreationRetryConflict(
                             "retained_network_profile_source_changed"
                         )
-            if (
-                pvc_uid is not None
-                and expected is None
-                and os.getenv("VM_NETWORK_PROFILE_ENABLED", "false").lower() == "true"
-            ):
-                raise VMCreationRetryConflict("retained_network_profile_unproven")
+            # An instance's immutable absent profile is its existing contract,
+            # not permission to enroll its disk into today's clean-image
+            # profile. Ordinary Resume preserves that contract; recovery/idle
+            # qualification still requires its own positive profile evidence.
         elif lineage:
             raise VMCreationRetryConflict("creation_attachment_lineage_unproven")
         elif pvc_uid is None:
@@ -498,14 +496,19 @@ class VMCreationPreflightStore:
             expected = original.get("network_profile")
             if expected is None:
                 if (
-                    os.getenv("VM_NETWORK_PROFILE_ENABLED", "false").lower() == "true"
-                    or "network_profile" in request
+                    "network_profile" in request
+                    or rows[0]["state"] != "succeeded"
+                    or str(rows[0]["observed_pvc_uid"]) != pvc_uid
                     or any(
                         "network_profile" in _object(row["canonical_request"])
+                        or canonical_request_digest(_object(row["canonical_request"]))
+                        != row["request_digest"]
                         for row in rows
                     )
                 ):
                     raise VMCreationRetryConflict("retained_network_profile_unproven")
+                # Fresh enrollment settings cannot retroactively change a
+                # proven unprofiled predecessor. Keep the request unprofiled.
                 return request
             validate_network_profile(expected)
             if (

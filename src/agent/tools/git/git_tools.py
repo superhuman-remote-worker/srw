@@ -93,7 +93,7 @@ def create_git_tools(context: ToolContext) -> List[Any]:
         A bare `fatal: bad object` is a true answer to a question the agent did
         not mean to ask. Job c4849fa1 read one as proof that its attached
         repository was unusable and paged its operator, while the commit sat in
-        repos/KurortEngine/ the whole time.
+        repos/WidgetShop/ the whole time.
         """
         if repo or not isinstance(result, str):
             return result
@@ -127,7 +127,7 @@ def create_git_tools(context: ToolContext) -> List[Any]:
             oneline: Show compact one-line format (default: True).
                      Set to False for full commit details.
             repo: Attached repository to read (clone-directory name, e.g.
-                  "KurortEngine"). Omit for this job's own workspace repo.
+                  "WidgetShop"). Omit for this job's own workspace repo.
 
         Returns:
             Formatted commit history
@@ -159,7 +159,7 @@ def create_git_tools(context: ToolContext) -> List[Any]:
                        (default: False). Use this for a quick overview.
             max_lines: Maximum output lines before truncation (default: 500)
             repo: Attached repository to read (clone-directory name, e.g.
-                  "KurortEngine"). Omit for this job's own workspace repo.
+                  "WidgetShop"). Omit for this job's own workspace repo.
 
         Returns:
             Commit details including message and diff (or stats)
@@ -200,7 +200,7 @@ def create_git_tools(context: ToolContext) -> List[Any]:
             file_path: Limit diff to a specific file (optional)
             max_lines: Maximum output lines before truncation (default: 500)
             repo: Attached repository to read (clone-directory name, e.g.
-                  "KurortEngine"). Omit for this job's own workspace repo.
+                  "WidgetShop"). Omit for this job's own workspace repo.
 
         Returns:
             Diff output showing changes
@@ -230,7 +230,7 @@ def create_git_tools(context: ToolContext) -> List[Any]:
 
         Args:
             repo: Attached repository to read (clone-directory name, e.g.
-                  "KurortEngine"). Omit for this job's own workspace repo.
+                  "WidgetShop"). Omit for this job's own workspace repo.
 
         Returns:
             Status output showing modified/untracked files
@@ -265,7 +265,7 @@ def create_git_tools(context: ToolContext) -> List[Any]:
             all_jobs: If True, show every matching tag in this repository.
                      If False (default), only show this job's prefixed tags.
             repo: Attached repository to read (clone-directory name, e.g.
-                  "KurortEngine"). Omit for this job's own workspace repo.
+                  "WidgetShop"). Omit for this job's own workspace repo.
                   The job-id prefix is never applied to an attached repo —
                   the phase-tag convention is this platform's, not theirs.
 

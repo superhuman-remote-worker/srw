@@ -2016,6 +2016,21 @@ def run_client(action: str, args: dict, timeout: float) -> int:
 # ─────────────────────────────────────────────────────────────────────
 
 
+def _ignore_user_site_packages() -> None:
+    """Run on the image's Python packages, never the workspace user's own.
+
+    The agent's ``pip install`` lands in its user site (~/.local), which comes
+    before the system packages on sys.path, so installing another version of a
+    library browser-use needs would otherwise change this program. The variable
+    carries the rule into the daemon that ``_spawn_daemon`` starts.
+    """
+    import site
+
+    os.environ["PYTHONNOUSERSITE"] = "1"
+    user_site = site.getusersitepackages()
+    sys.path[:] = [p for p in sys.path if not p.startswith(user_site)]
+
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(prog="browser-exec")
     parser.add_argument("action", help="serve | " + " | ".join(sorted(VALID_ACTIONS)))
@@ -2043,4 +2058,5 @@ def main(argv=None) -> int:
 
 
 if __name__ == "__main__":
+    _ignore_user_site_packages()
     sys.exit(main())

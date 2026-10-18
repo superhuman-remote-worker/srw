@@ -1,3 +1,8 @@
+---
+title: VM capacity diagnostics
+description: 'Read the VM resource accounting of the admin capacity endpoint: inventory, retained reservations and unavailable capacity.'
+---
+
 # VM capacity diagnostics
 
 Administrators can read VM resource accounting in the `vm` block of

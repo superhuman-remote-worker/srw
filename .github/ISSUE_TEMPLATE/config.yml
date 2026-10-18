@@ -1,0 +1,11 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Questions and help (GitHub Discussions)
+    url: https://github.com/superhuman-remote-worker/srw/discussions
+    about: Ask how to install, configure or use SRW, and share what you built.
+  - name: Documentation
+    url: https://docs.superhuman-remote-worker.com
+    about: Installation, concepts, models, troubleshooting and the Helm values reference.
+  - name: Report a security vulnerability
+    url: https://github.com/superhuman-remote-worker/srw/security/advisories/new
+    about: Report privately through GitHub Private Vulnerability Reporting, as SECURITY.md describes. Never in a public issue.

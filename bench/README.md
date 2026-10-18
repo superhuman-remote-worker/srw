@@ -2,7 +2,7 @@
 
 The instrument behind the guardrail-loosening loop: a fixed set of job
 templates with machine-checkable outcomes, a submitter that pins inputs and
-fires replicates against the dev cluster, and a reporter that computes the
+fires replicates against an SRW installation, and a reporter that computes the
 phase/ceremony metrics from `knowledge-base/knowledge/issues/phase_model_overhead_amnesia_loop.md`
 §10. Protocol and rationale: `knowledge-base/knowledge/features/worker_runtime_strategy.md` §9.
 
@@ -26,7 +26,10 @@ The core rules the tooling encodes:
 ## Quickstart
 
 ```bash
-export SRW_API_URL=https://api.srw.works       # dev-cluster orchestrator
+# The orchestrator's API base URL. Unset, the scripts use a local
+# orchestrator on http://localhost:8085, for example:
+#   kubectl -n srw port-forward svc/srw-orchestrator 8085:8085
+export SRW_API_URL=https://api.example.com
 export SRW_TOKEN=<mcp token>                    # X-MCP-Token value
 
 # Baseline: every task × 3 replicates, ≤2 jobs in flight, pinned model
@@ -166,8 +169,9 @@ absent from v1 — they change as the repo changes, which breaks pinning.
   skills/filtered arms to isolate phase prose from schema shape. WP6 removed
   those live configuration switches after the MiniMax verdict; use the recorded
   run IDs in the design note for historical comparisons.
-- **Running on k3d:** mint the test id_token per the auth memo (admin-cli
-  password grant, use `id_token` not `access_token`); `POST /api/projects`
+- **Running on k3d:** get a Bearer token for the test user with
+  `python3 scripts/k3d_gate_oauth.py` (an access token the orchestrator
+  accepts; ID tokens and other clients' tokens are refused); `POST /api/projects`
   requires `user_id` in the body. Give memory-sensitive experiments a
   `project_id` in the spec — without a shared project the pool stays empty
   and memory-related treatments measure nothing.

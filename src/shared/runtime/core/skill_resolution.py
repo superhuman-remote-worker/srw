@@ -23,6 +23,7 @@ from typing import Any
 from shared.runtime.core.expert_resolution import expert_precedence_key
 
 from shared.tool_catalog.names import APP_GUIDE_LOADER_TOOL as APP_GUIDE_LOADER_TOOL
+from shared.tool_catalog.names import SKILL_TOOL_NAME
 
 logger = logging.getLogger(__name__)
 
@@ -476,6 +477,12 @@ def scope_skills_for_tools(
     - ``present-with-canvas`` requires both the ordinary skill reader and a
       working file Canvas.
 
+    And the list follows the tool: without ``use_skill`` no ordinary skill is
+    offered or materialized, because nothing could load it
+    (knowledge-base/knowledge/features/skills_tool_category.md D2). Bound skills
+    never reach this catalog (:func:`filter_bound_skills`), and the managed
+    app-guide has its own reader.
+
     Keeping this pure lets runtimes apply the rule after their backend gate.
     """
     scoped = copy.deepcopy(skills or {})
@@ -483,6 +490,16 @@ def scope_skills_for_tools(
 
     if APP_GUIDE_LOADER_TOOL not in available:
         _remove_skill(scoped, APP_GUIDE_SKILL)
-    if not {"use_skill", "set_canvas"}.issubset(available):
+    if SKILL_TOOL_NAME not in available:
+        menu = scoped.get("menu")
+        files = scoped.get("files")
+        names = {
+            str(item.get("name"))
+            for item in (menu if isinstance(menu, list) else [])
+            if isinstance(item, dict)
+        } | set(files if isinstance(files, dict) else ())
+        for name in names - {APP_GUIDE_SKILL}:
+            _remove_skill(scoped, name)
+    if not {SKILL_TOOL_NAME, "set_canvas"}.issubset(available):
         _remove_skill(scoped, PRESENT_WITH_CANVAS_SKILL)
     return scoped

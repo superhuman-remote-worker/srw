@@ -31,6 +31,119 @@ CONTROL_HEADERS = {"Authorization": f"Bearer {CONTROL_TOKEN}"}
 INFERENCE_HEADERS = {"Authorization": f"Bearer {INFERENCE_KEY}"}
 
 
+@pytest.mark.parametrize("proof", ["valid", "wrong-run", "failed-command", "absent"])
+async def test_workspace_command_worker_writes_once_and_requires_real_result(
+    control, inference, tmp_path, proof
+):
+    run_id = "workspace-command-proof"
+    await arm(
+        control, run_id, scenario="workspace-command-worker", required_responses=0
+    )
+    assert (
+        await control.post(f"/control/scenarios/{run_id}/close", json={})
+    ).status_code == 409
+    assert (
+        await control.post(
+            f"/control/scenarios/{run_id}/advance", json={"scenario": "reply"}
+        )
+    ).status_code == 422
+    assert (
+        await control.post(f"/control/scenarios/{run_id}/release-completion")
+    ).status_code == 409
+    tools = [
+        {
+            "type": "function",
+            "function": {"name": name, "parameters": {"type": "object"}},
+        }
+        for name in (
+            "read_file",
+            "todo_complete",
+            "next_phase_todos",
+            "job_complete",
+            "run_command",
+        )
+    ]
+    payload = chat_request(run_id, extra={"tools": tools})
+    for _ in range(7):
+        response = await inference.post("/v1/chat/completions", json=payload)
+        assert response.status_code == 200
+    call = response.json()["choices"][0]["message"]["tool_calls"][0]["function"]
+    assert call["name"] == "run_command"
+    command = json.loads(call["arguments"])["command"]
+    result = subprocess.run(
+        ["sh", "-c", command], cwd=tmp_path, capture_output=True, text=True
+    )
+    assert result.returncode == 0, result.stderr
+    marker = tmp_path / ".srw-a1-gate" / run_id / "sentinel"
+    expected = f"SRW_WORKSPACE_SENTINEL:{run_id}\n".encode()
+    assert marker.read_bytes() == expected
+    duplicate = subprocess.run(
+        ["sh", "-c", command], cwd=tmp_path, capture_output=True, text=True
+    )
+    assert duplicate.returncode != 0
+    assert "SRW_A1_SENTINEL_PASS:" not in duplicate.stdout
+    assert marker.read_bytes() == expected
+    output = "Exit code: 0\n--- stdout ---\n" + result.stdout
+    if proof == "wrong-run":
+        output = output.replace(run_id, run_id + "-other")
+    elif proof == "failed-command":
+        output = output.replace("Exit code: 0", "Exit code: 1")
+    elif proof == "absent":
+        output = "Exit code: 0\n--- stdout ---\n"
+    payload["messages"].append(
+        {"role": "tool", "tool_call_id": "workspace-command", "content": output}
+    )
+    response = await inference.post("/v1/chat/completions", json=payload)
+    if proof != "valid":
+        assert response.status_code == 422
+        assert response.json()["error"]["type"] == "workspace_proof_missing"
+        return
+    assert response.status_code == 200
+    for _ in range(2):
+        assert (
+            await inference.post("/v1/chat/completions", json=payload)
+        ).status_code == 200
+    completion = asyncio.create_task(
+        inference.post("/v1/chat/completions", json=payload)
+    )
+    await asyncio.sleep(0.05)
+    assert not completion.done()
+    assert (await control.get(f"/control/scenarios/{run_id}")).json()[
+        "worker_job_tool_steps"
+    ] == 10
+    assert (
+        await control.post(f"/control/scenarios/{run_id}/release-completion")
+    ).status_code == 200
+    completed = await asyncio.wait_for(completion, timeout=5)
+    assert completed.status_code == 200
+    assert (
+        completed.json()["choices"][0]["message"]["tool_calls"][0]["function"]["name"]
+        == "job_complete"
+    )
+    state = (await control.get(f"/control/scenarios/{run_id}")).json()
+    assert state["worker_job_tool_steps"] == 11
+    assert state["unexpected_count"] == 0
+    assert (
+        await control.post(f"/control/scenarios/{run_id}/close", json={})
+    ).status_code == 200
+
+
+@pytest.mark.parametrize(
+    "scenario", ["reply", "worker-job", "retained-sentinel-worker"]
+)
+async def test_zero_reply_budget_is_reserved_for_workspace_command_worker(
+    control, scenario
+):
+    body = {"scenario": scenario, "required_responses": 0}
+    if scenario == "retained-sentinel-worker":
+        body["sentinel_sha256"] = "a" * 64
+    response = await control.post(
+        "/control/scenarios/zero-reply-budget/arm",
+        json=body,
+    )
+    assert response.status_code == 422
+
+
 @pytest.fixture
 def store() -> ScenarioStore:
     return ScenarioStore()
@@ -1833,3 +1946,81 @@ async def test_probe_window_validation_is_fail_closed(
     assert invalid.status_code in {400, 404, 422}
     missing = await control.get("/control/probe-windows/attach-none-001")
     assert missing.status_code == 404
+
+
+async def test_workspace_command_concurrent_streams_cannot_skip_command_proof(
+    control, inference
+):
+    run_id = "workspace-concurrent-proof"
+    await arm(
+        control,
+        run_id,
+        scenario="workspace-command-worker",
+        required_responses=0,
+        chunk_delay_ms=10,
+    )
+    tools = [
+        {
+            "type": "function",
+            "function": {"name": name, "parameters": {"type": "object"}},
+        }
+        for name in (
+            "read_file",
+            "todo_complete",
+            "next_phase_todos",
+            "job_complete",
+            "run_command",
+        )
+    ]
+    payload = chat_request(run_id, extra={"tools": tools})
+    for _ in range(6):
+        assert (
+            await inference.post("/v1/chat/completions", json=payload)
+        ).status_code == 200
+    responses = await asyncio.gather(
+        *[
+            inference.post("/v1/chat/completions", json={**payload, "stream": True})
+            for _ in range(2)
+        ]
+    )
+    assert sorted(r.status_code for r in responses) == [200, 409]
+    state = (await control.get(f"/control/scenarios/{run_id}")).json()
+    assert state["worker_job_tool_steps"] == 7
+    assert state["unexpected_count"] == 1
+    # Neither command was executed, so the next stage must still demand proof.
+    response = await inference.post("/v1/chat/completions", json=payload)
+    assert response.status_code == 422
+    assert response.json()["error"]["type"] == "workspace_proof_missing"
+    assert (
+        await control.post(f"/control/scenarios/{run_id}/release-completion")
+    ).status_code == 409
+    assert (
+        await control.post(f"/control/scenarios/{run_id}/close", json={})
+    ).status_code == 409
+
+
+async def test_workspace_command_stale_stage_cannot_reserve_after_prior_call_finishes(
+    control, store
+):
+    from tests.e2e.app.deterministic_provider.provider import ScenarioError
+
+    run_id = "workspace-stale-stage"
+    await arm(
+        control, run_id, scenario="workspace-command-worker", required_responses=0
+    )
+    options = dict(
+        run_id=run_id,
+        endpoint="chat.completions",
+        model=CHAT_MODEL_ID,
+        stream=False,
+        consume_required=False,
+        tool_phase=True,
+    )
+    first = await store.begin_call(**options, expected_worker_step=0)
+    await store.finish_call(first, "success")
+    with pytest.raises(ScenarioError) as caught:
+        await store.begin_call(**options, expected_worker_step=0)
+    assert caught.value.error_type == "worker_step_conflict"
+    state = (await control.get(f"/control/scenarios/{run_id}")).json()
+    assert state["worker_job_tool_steps"] == 1
+    assert state["pending_calls"] == 0

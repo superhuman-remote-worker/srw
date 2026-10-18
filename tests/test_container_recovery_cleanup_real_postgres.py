@@ -637,3 +637,51 @@ async def test_cancel_supersedes_pending_recovery_completion_without_reentering_
     assert (await current_job(db, original["id"]))["status"] == "cancelled"
     provider._core_api.delete_namespaced_persistent_volume_claim.assert_not_called()
     assert resources["checkpoint_bytes"] == b"retained source data"
+
+
+@pytest.mark.asyncio
+async def test_resume_keeps_a_settled_preserve_teardown_for_the_dispatcher(db):
+    """An idle Pod release leaves no recovery receipt, yet resume keeps it.
+
+    Shedding the settled envelope would be refused by the authority trigger;
+    the dispatcher instead reads ``deleted`` as needs-create and replaces the
+    runtime under a new creation reservation on the retained claim.
+    """
+
+    original, owner, runtime = await cleanup_job(db)
+    await db.execute(
+        "UPDATE jobs SET status='pending_review', assigned_agent_id=NULL WHERE id=$1",
+        original["id"],
+    )
+    p, resources = terminal_pod_api(db, owner, runtime)
+    pvc = resources["pvc"]
+    intent = await p.prepare_workspace_cleanup_intent(
+        owner,
+        expected_runtime_incarnation=runtime,
+        target_disposition="deleted",
+        reclaim_shared_resources=False,
+    )
+    assert isinstance(intent, dict)
+    outcome = await p.reconcile_workspace_cleanup_intent(
+        owner,
+        expected_runtime_incarnation=runtime,
+        intent_generation=int(intent["intent_generation"]),
+    )
+    assert outcome.settled
+    assert "pod" not in resources and "service" not in resources
+    assert resources["pvc"] is pvc
+    p._core_api.delete_namespaced_persistent_volume_claim.assert_not_called()
+    released = await current_job(db, original["id"])
+    workspace = released["context"]["workspace_container"]
+    assert workspace["status"] == "deleted"
+    assert workspace["_runtime_incarnation"] == runtime
+    assert "recovery_cleanup" not in workspace
+
+    assert await db.shed_workspace_context(owner.id, "workspace_container")
+    kept = await current_job(db, original["id"])
+    assert kept["context"]["workspace_container"] == workspace
+    assert "last_workspace_container" not in kept["context"]
+    assert await db.queue_job_for_resume(owner.id, expected_status="pending_review")
+    queued = await current_job(db, original["id"])
+    assert queued["status"] == "paused"
+    assert queued["context"]["workspace_container"] == workspace

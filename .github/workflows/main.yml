@@ -2,16 +2,31 @@ name: main
 
 # Full CI/CD pipeline for the main branch.
 #
-# Every push to main runs ALL lint, tests, and builds (not change-based).
+# Every RELEASE RUN runs ALL lint, tests, and builds (not change-based). A
+# release run is a push to main or a workflow_dispatch on main; nothing else.
 # Lint and test failures block builds. On success: all images are rebuilt
 # with :sha, :latest, and :vX.Y.Z tags, the Helm chart is published to
-# OCI under its real name (superhuman-remote-worker), and a git tag is pushed.
+# OCI under its real name (superhuman-remote-worker), the annotated git tag
+# is pushed, and a GitHub Release with generated notes is created.
+#
+# Versioning (docs/versioning.md): resolve-version runs
+# scripts/release/next_version.py. Before 1.0 a release bumps MINOR when it
+# contains an operator-action commit (`type(scope)!:` or a `BREAKING CHANGE:`
+# footer) and PATCH otherwise. The dispatch input `release_as`, or a
+# `Release-As: X.Y.Z` commit footer, sets the version explicitly.
+#
+# One gate decides publication: resolve-version runs only on a release run,
+# and every login, push, :latest/:vX.Y.Z tag, chart release and GitHub Release
+# below keys off `needs.resolve-version.result == 'success'`. Anything else
+# (a PR to main, a dispatch on another ref) is a validation run.
 #
 # PRs to main run the full pipeline INCLUDING image builds, but skip the
 # registry push (no login, no version tagging, no chart release). This
 # catches Dockerfile / Packer breakages before they reach main and block
 # the release process. Trade-off: PR feedback is slower, but a broken
 # build post-merge is far more expensive than waiting for the build pre-merge.
+# release-preview shows the version and notes that merging the PR would
+# release, and fails the PR if they cannot be computed.
 
 on:
   push:
@@ -19,6 +34,15 @@ on:
   pull_request:
     branches: [main]
   workflow_dispatch:
+    inputs:
+      release_as:
+        description: >-
+          Exact version to release, X.Y.Z without a leading v (for example
+          0.1.0). Leave empty to derive it from the commits. Only a run on
+          main releases; on any other ref this is a validation run.
+        required: false
+        type: string
+        default: ""
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -684,45 +708,102 @@ jobs:
           test "$BUILD_RESULT" = success
           test "$BROWSER_RESULT" = success
 
+  # ---------------------------------------------------------------------------
+  # The release gate. Runs only on a release run (push to main, or a dispatch
+  # on main); a PR or a dispatch on any other ref skips it, and a skipped
+  # resolve-version is what makes every build below a no-push validation.
+  # The notes are rendered here, before any image is pushed, so a broken
+  # highlights file or commit footer fails the run while nothing is public.
+  # ---------------------------------------------------------------------------
   resolve-version:
     needs: [lint, dependency-audit, test-python, test-cockpit]
     if: >-
       always() && !cancelled() &&
-      github.event_name == 'push' &&
+      (github.event_name == 'push' || github.event_name == 'workflow_dispatch') &&
+      github.ref == 'refs/heads/main' &&
       needs.lint.result == 'success' &&
       needs.dependency-audit.result == 'success' &&
       needs.test-python.result == 'success' &&
       needs.test-cockpit.result == 'success'
     runs-on: ubuntu-latest
     timeout-minutes: 5
+    permissions:
+      contents: read
     outputs:
       version: ${{ steps.bump.outputs.version }}
       tag: ${{ steps.bump.outputs.tag }}
+      previous_tag: ${{ steps.bump.outputs.previous_tag }}
+      title: ${{ steps.bump.outputs.title }}
     steps:
       - uses: actions/checkout@v4
         with:
           ref: ${{ github.sha }}
           fetch-depth: 0
-      - name: Compute next patch version
+      - name: Compute the next version
         id: bump
+        env:
+          # Passed through the environment, never interpolated into the script.
+          RELEASE_AS: ${{ inputs.release_as }}
         run: |
           git fetch --tags --force
-          LAST=$(git tag -l 'v*' --sort=-v:refname | head -n1)
-          if [ -z "$LAST" ]; then
-            LAST="v0.0.0"
-          fi
-          MAJOR=$(echo "${LAST#v}" | cut -d. -f1)
-          MINOR=$(echo "${LAST#v}" | cut -d. -f2)
-          PATCH=$(echo "${LAST#v}" | cut -d. -f3)
-          NEW="${MAJOR}.${MINOR}.$((PATCH + 1))"
-          echo "version=$NEW" >> "$GITHUB_OUTPUT"
-          echo "tag=v$NEW" >> "$GITHUB_OUTPUT"
-          echo "Last tag: $LAST -> next: v$NEW"
+          python3 scripts/release/next_version.py --release-as "$RELEASE_AS" >> "$GITHUB_OUTPUT"
+      - name: Render the release notes
+        env:
+          TAG: ${{ steps.bump.outputs.tag }}
+          PREVIOUS_TAG: ${{ steps.bump.outputs.previous_tag }}
+        run: |
+          python3 scripts/release/release_notes.py \
+            --tag "$TAG" --previous-tag "$PREVIOUS_TAG" \
+            --repo-url "$SRW_SOURCE_URL" --output release-notes.md
+          cat release-notes.md >> "$GITHUB_STEP_SUMMARY"
+      - name: Keep the notes for the GitHub Release
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-notes
+          path: release-notes.md
+          if-no-files-found: error
+          overwrite: true
+          retention-days: 30
+
+  # PR validation of the release gate: the version and notes that merging this
+  # PR would release, in the job summary. Read-only; publishes nothing.
+  release-preview:
+    name: Release preview
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+      - name: Preview the release this merge would cut
+        run: |
+          git fetch --tags --force
+          python3 scripts/release/next_version.py > release.env
+          TAG=$(sed -n 's/^tag=//p' release.env)
+          PREVIOUS_TAG=$(sed -n 's/^previous_tag=//p' release.env)
+          TITLE=$(sed -n 's/^title=//p' release.env)
+          python3 scripts/release/release_notes.py \
+            --tag "$TAG" --previous-tag "$PREVIOUS_TAG" \
+            --repo-url "$SRW_SOURCE_URL" --output release-notes.md
+          {
+            echo "# Merging this releases ${TITLE}"
+            echo
+            echo "Release notes preview (the merge commit itself can still carry a \`Release-As:\` footer):"
+            echo
+            cat release-notes.md
+          } >> "$GITHUB_STEP_SUMMARY"
 
   # ---------------------------------------------------------------------------
-  # Image builds — run on main pushes AND on PRs to main.
-  # On push: build + push (sha + latest + version tags), full release flow.
-  # On PR: build only — no docker login, no version tag, no registry push.
+  # Image builds — run on release runs AND on validation runs (PRs to main,
+  # a dispatch off main).
+  # Release run (resolve-version succeeded): build + push (sha + latest +
+  # version tags), full release flow.
+  # Validation run (resolve-version skipped): build only — no docker login,
+  # no version tag, no registry push.
   # The Packer / Dockerfile invocations themselves still execute, which is
   # the whole point: we catch broken builds before merge instead of after.
   # All require lint + dep-audit + tests to pass.
@@ -761,7 +842,7 @@ jobs:
             [registry."docker.io"]
               mirrors = ["mirror.gcr.io"]
       - uses: docker/login-action@v3
-        if: github.event_name != 'pull_request'
+        if: needs.resolve-version.result == 'success'
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
@@ -773,16 +854,16 @@ jobs:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-agent
           tags: |
             type=sha,format=short,prefix=sha-
-            type=raw,value=latest,enable=${{ github.event_name != 'pull_request' }}
-            type=raw,value=${{ needs.resolve-version.outputs.tag }},enable=${{ github.event_name != 'pull_request' }}
+            type=raw,value=latest,enable=${{ needs.resolve-version.result == 'success' }}
+            type=raw,value=${{ needs.resolve-version.outputs.tag }},enable=${{ needs.resolve-version.result == 'success' }}
       - id: short_sha
         run: echo "sha=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
-      - name: Build${{ github.event_name == 'pull_request' && ' (PR validation, no push)' || ' and push' }}
+      - name: Build${{ needs.resolve-version.result == 'success' && ' and push' || ' (validation, no push)' }}
         uses: docker/build-push-action@v5
         with:
           context: .
           file: ./docker/Dockerfile.agent
-          push: ${{ github.event_name != 'pull_request' }}
+          push: ${{ needs.resolve-version.result == 'success' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: |
             ${{ steps.meta.outputs.labels }}
@@ -826,7 +907,7 @@ jobs:
             [registry."docker.io"]
               mirrors = ["mirror.gcr.io"]
       - uses: docker/login-action@v3
-        if: github.event_name != 'pull_request'
+        if: needs.resolve-version.result == 'success'
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
@@ -838,14 +919,14 @@ jobs:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-orchestrator
           tags: |
             type=sha,format=short,prefix=sha-
-            type=raw,value=latest,enable=${{ github.event_name != 'pull_request' }}
-            type=raw,value=${{ needs.resolve-version.outputs.tag }},enable=${{ github.event_name != 'pull_request' }}
-      - name: Build${{ github.event_name == 'pull_request' && ' (PR validation, no push)' || ' and push' }}
+            type=raw,value=latest,enable=${{ needs.resolve-version.result == 'success' }}
+            type=raw,value=${{ needs.resolve-version.outputs.tag }},enable=${{ needs.resolve-version.result == 'success' }}
+      - name: Build${{ needs.resolve-version.result == 'success' && ' and push' || ' (validation, no push)' }}
         uses: docker/build-push-action@v5
         with:
           context: .
           file: ./docker/Dockerfile.orchestrator
-          push: ${{ github.event_name != 'pull_request' }}
+          push: ${{ needs.resolve-version.result == 'success' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: |
             ${{ steps.meta.outputs.labels }}
@@ -888,7 +969,7 @@ jobs:
             [registry."docker.io"]
               mirrors = ["mirror.gcr.io"]
       - uses: docker/login-action@v3
-        if: github.event_name != 'pull_request'
+        if: needs.resolve-version.result == 'success'
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
@@ -900,14 +981,14 @@ jobs:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-cockpit
           tags: |
             type=sha,format=short,prefix=sha-
-            type=raw,value=latest,enable=${{ github.event_name != 'pull_request' }}
-            type=raw,value=${{ needs.resolve-version.outputs.tag }},enable=${{ github.event_name != 'pull_request' }}
-      - name: Build${{ github.event_name == 'pull_request' && ' (PR validation, no push)' || ' and push' }}
+            type=raw,value=latest,enable=${{ needs.resolve-version.result == 'success' }}
+            type=raw,value=${{ needs.resolve-version.outputs.tag }},enable=${{ needs.resolve-version.result == 'success' }}
+      - name: Build${{ needs.resolve-version.result == 'success' && ' and push' || ' (validation, no push)' }}
         uses: docker/build-push-action@v5
         with:
           context: .
           file: ./docker/Dockerfile.cockpit
-          push: ${{ github.event_name != 'pull_request' }}
+          push: ${{ needs.resolve-version.result == 'success' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: |
             ${{ steps.meta.outputs.labels }}
@@ -950,7 +1031,7 @@ jobs:
             [registry."docker.io"]
               mirrors = ["mirror.gcr.io"]
       - uses: docker/login-action@v3
-        if: github.event_name != 'pull_request'
+        if: needs.resolve-version.result == 'success'
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
@@ -962,14 +1043,14 @@ jobs:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-mcp
           tags: |
             type=sha,format=short,prefix=sha-
-            type=raw,value=latest,enable=${{ github.event_name != 'pull_request' }}
-            type=raw,value=${{ needs.resolve-version.outputs.tag }},enable=${{ github.event_name != 'pull_request' }}
-      - name: Build${{ github.event_name == 'pull_request' && ' (PR validation, no push)' || ' and push' }}
+            type=raw,value=latest,enable=${{ needs.resolve-version.result == 'success' }}
+            type=raw,value=${{ needs.resolve-version.outputs.tag }},enable=${{ needs.resolve-version.result == 'success' }}
+      - name: Build${{ needs.resolve-version.result == 'success' && ' and push' || ' (validation, no push)' }}
         uses: docker/build-push-action@v5
         with:
           context: .
           file: ./docker/Dockerfile.mcp
-          push: ${{ github.event_name != 'pull_request' }}
+          push: ${{ needs.resolve-version.result == 'success' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: |
             ${{ steps.meta.outputs.labels }}
@@ -1012,7 +1093,7 @@ jobs:
             [registry."docker.io"]
               mirrors = ["mirror.gcr.io"]
       - uses: docker/login-action@v3
-        if: github.event_name != 'pull_request'
+        if: needs.resolve-version.result == 'success'
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
@@ -1024,8 +1105,8 @@ jobs:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-workspace
           tags: |
             type=sha,format=short,prefix=sha-
-            type=raw,value=latest,enable=${{ github.event_name != 'pull_request' }}
-            type=raw,value=${{ needs.resolve-version.outputs.tag }},enable=${{ github.event_name != 'pull_request' }}
+            type=raw,value=latest,enable=${{ needs.resolve-version.result == 'success' }}
+            type=raw,value=${{ needs.resolve-version.outputs.tag }},enable=${{ needs.resolve-version.result == 'success' }}
       - name: Extract metadata (minimal)
         id: meta-minimal
         uses: docker/metadata-action@v5
@@ -1033,12 +1114,12 @@ jobs:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-workspace-minimal
           tags: |
             type=sha,format=short,prefix=sha-
-            type=raw,value=latest,enable=${{ github.event_name != 'pull_request' }}
-            type=raw,value=${{ needs.resolve-version.outputs.tag }},enable=${{ github.event_name != 'pull_request' }}
+            type=raw,value=latest,enable=${{ needs.resolve-version.result == 'success' }}
+            type=raw,value=${{ needs.resolve-version.outputs.tag }},enable=${{ needs.resolve-version.result == 'success' }}
       - name: Read Playwright version
         id: pw
         run: echo "version=$(tr -d '[:space:]' < .playwright-version)" >> "$GITHUB_OUTPUT"
-      - name: Build minimal${{ github.event_name == 'pull_request' && ' (PR validation, no push)' || ' and push' }}
+      - name: Build minimal${{ needs.resolve-version.result == 'success' && ' and push' || ' (validation, no push)' }}
         uses: docker/build-push-action@v5
         with:
           context: .
@@ -1050,7 +1131,7 @@ jobs:
             SRW_SOURCE_URL=${{ env.SRW_SOURCE_URL }}
             SRW_RELEASE_VERSION=${{ needs.resolve-version.outputs.version }}
             SRW_DOCUMENTATION_URL=${{ env.SRW_DOCUMENTATION_URL }}
-          push: ${{ github.event_name != 'pull_request' }}
+          push: ${{ needs.resolve-version.result == 'success' }}
           tags: ${{ steps.meta-minimal.outputs.tags }}
           labels: |
             ${{ steps.meta-minimal.outputs.labels }}
@@ -1063,7 +1144,7 @@ jobs:
           provenance: false
           cache-from: type=registry,ref=${{ env.REGISTRY }}/${{ env.REPO_LOWER }}-workspace:buildcache-main
       # Same builder, so every minimal layer above is reused here.
-      - name: Build full${{ github.event_name == 'pull_request' && ' (PR validation, no push)' || ' and push' }}
+      - name: Build full${{ needs.resolve-version.result == 'success' && ' and push' || ' (validation, no push)' }}
         uses: docker/build-push-action@v5
         with:
           context: .
@@ -1075,7 +1156,7 @@ jobs:
             SRW_SOURCE_URL=${{ env.SRW_SOURCE_URL }}
             SRW_RELEASE_VERSION=${{ needs.resolve-version.outputs.version }}
             SRW_DOCUMENTATION_URL=${{ env.SRW_DOCUMENTATION_URL }}
-          push: ${{ github.event_name != 'pull_request' }}
+          push: ${{ needs.resolve-version.result == 'success' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: |
             ${{ steps.meta.outputs.labels }}
@@ -1134,12 +1215,13 @@ jobs:
           retention-days: 7
 
   # ---------------------------------------------------------------------------
-  # Stage 1: on main pushes, reuse a recent base with identical recorded inputs;
-  # otherwise run heavy provisioning. Stage2 consumes the verified digest. PR
-  # validation re-uses a published stage1 image, which makes PRs to main much
-  # faster (only stage2 rebuilds). Direct develop promotions use develop's
-  # :experimental image below; other PRs use :latest. Cron refresh runs in
-  # stage1-rebuild.yml so the baseline never drifts more than a week.
+  # Stage 1: on release runs, reuse a recent base with identical recorded inputs;
+  # otherwise run heavy provisioning. Stage2 consumes the verified digest.
+  # Validation runs (PRs, a dispatch off main) re-use a published stage1 image,
+  # which makes PRs to main much faster (only stage2 rebuilds). Direct develop
+  # promotions use develop's :experimental image below; other PRs use :latest.
+  # Cron refresh runs in stage1-rebuild.yml so the baseline never drifts more
+  # than a week.
   # ---------------------------------------------------------------------------
   build-agent-vm-base-stage1:
     needs:
@@ -1149,9 +1231,15 @@ jobs:
       - test-python
       - test-cockpit
       - resolve-version
-    if: needs.architecture.result == 'success' && always() && !cancelled() && github.event_name == 'push' && needs.lint.result
-      == 'success' && needs.dependency-audit.result == 'success' && needs.test-python.result == 'success' && needs.test-cockpit.result
-      == 'success' && needs.resolve-version.result == 'success'
+    if: >-
+      needs.architecture.result == 'success' &&
+      always() && !cancelled() &&
+      github.ref == 'refs/heads/main' &&
+      needs.lint.result == 'success' &&
+      needs.dependency-audit.result == 'success' &&
+      needs.test-python.result == 'success' &&
+      needs.test-cockpit.result == 'success' &&
+      needs.resolve-version.result == 'success'
     runs-on: ubuntu-latest
     timeout-minutes: 90
     permissions:
@@ -1277,8 +1365,9 @@ jobs:
     outputs:
       image: ${{ steps.resolved.outputs.image }}
 
-  # Stage2 layers per-commit configuration onto stage1. Main releases use the
-  # verified digest above; PRs retain the published latest/experimental choice.
+  # Stage2 layers per-commit configuration onto stage1. Releases use the
+  # verified digest above; validation runs retain the published
+  # latest/experimental choice.
   build-agent-vm-base:
     needs: [architecture, lint, dependency-audit, test-python, test-cockpit, build-sudo-gate, resolve-version, build-agent-vm-base-stage1]
     if: >-
@@ -1370,8 +1459,8 @@ jobs:
         with:
           version: latest
       # Login is unconditional here — needed to PULL the stage1 containerDisk
-      # from GHCR even on PR validation runs. Push of the final image still
-      # gates on push events below.
+      # from GHCR even on validation runs. Push of the final image still
+      # gates on a resolved release version below.
       - uses: docker/login-action@v3
         with:
           registry: ${{ env.REGISTRY }}
@@ -1382,12 +1471,15 @@ jobs:
         env:
           STAGE1_TAG: ${{ github.event_name == 'pull_request' && github.base_ref == 'main' && github.head_ref == 'develop' && 'experimental' || 'latest' }}
           VERIFIED_STAGE1_IMAGE: ${{ needs.build-agent-vm-base-stage1.outputs.image }}
+          PUBLISH: ${{ needs.resolve-version.result == 'success' }}
         run: |
-          # Push releases consume the exact verified digest; concurrent weekly
+          # Releases consume the exact verified digest; concurrent weekly
           # refreshes cannot change this run's base between verification and use.
           STAGE1_IMAGE="$VERIFIED_STAGE1_IMAGE"
           if [ -z "$STAGE1_IMAGE" ]; then
-            test "${{ github.event_name }}" = pull_request
+            # Only a validation run (a PR, or a dispatch off main) may fall
+            # back to a published channel image; a release never does.
+            test "${{ github.event_name }}" = pull_request || test "$PUBLISH" = false
             STAGE1_IMAGE=$(echo "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-agent-vm-base-stage1:${STAGE1_TAG}" | tr '[:upper:]' '[:lower:]')
           fi
           echo "Using stage1 image: ${STAGE1_IMAGE}"
@@ -1414,12 +1506,14 @@ jobs:
           done
           echo "::error::Stage2 packer build failed after 2 attempts"
           exit 1
-      - name: Build${{ github.event_name == 'pull_request' && ' (PR validation, no push)' || ' and push' }} containerDisk image
+      - name: Build${{ needs.resolve-version.result == 'success' && ' and push' || ' (validation, no push)' }} containerDisk image
         working-directory: docker/agent-vm-base
+        env:
+          PUBLISH: ${{ needs.resolve-version.result == 'success' }}
         run: |
           IMAGE=$(echo "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-agent-vm-base" | tr '[:upper:]' '[:lower:]')
-          if [ "${{ github.event_name }}" = "pull_request" ]; then
-            # PR validation: build with a single throwaway tag, no push.
+          if [ "$PUBLISH" != true ]; then
+            # Validation: build with a single throwaway tag, no push.
             TAGS=("${IMAGE}:pr-validate-${GITHUB_SHA::7}")
           else
             TAGS=("${IMAGE}:sha-${GITHUB_SHA::7}" "${IMAGE}:latest" "${IMAGE}:${{ needs.resolve-version.outputs.tag }}")
@@ -1432,11 +1526,11 @@ jobs:
           )
           for T in "${TAGS[@]}"; do BUILD_ARGS+=(-t "$T"); done
           docker build "${BUILD_ARGS[@]}" -f Dockerfile.containerDisk .
-          if [ "${{ github.event_name }}" != "pull_request" ]; then
+          if [ "$PUBLISH" = true ]; then
             for T in "${TAGS[@]}"; do docker push "$T"; done
             printf 'Pushed:\n'; printf '  %s\n' "${TAGS[@]}"
           else
-            printf 'Built (PR validation, not pushed):\n'; printf '  %s\n' "${TAGS[@]}"
+            printf 'Built (validation, not pushed):\n'; printf '  %s\n' "${TAGS[@]}"
           fi
 
   build-vm-controller:
@@ -1464,7 +1558,7 @@ jobs:
             [registry."docker.io"]
               mirrors = ["mirror.gcr.io"]
       - uses: docker/login-action@v3
-        if: github.event_name != 'pull_request'
+        if: needs.resolve-version.result == 'success'
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
@@ -1476,14 +1570,14 @@ jobs:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-vm-controller
           tags: |
             type=sha,format=short,prefix=sha-
-            type=raw,value=latest,enable=${{ github.event_name != 'pull_request' }}
-            type=raw,value=${{ needs.resolve-version.outputs.tag }},enable=${{ github.event_name != 'pull_request' }}
-      - name: Build${{ github.event_name == 'pull_request' && ' (PR validation, no push)' || ' and push' }}
+            type=raw,value=latest,enable=${{ needs.resolve-version.result == 'success' }}
+            type=raw,value=${{ needs.resolve-version.outputs.tag }},enable=${{ needs.resolve-version.result == 'success' }}
+      - name: Build${{ needs.resolve-version.result == 'success' && ' and push' || ' (validation, no push)' }}
         uses: docker/build-push-action@v5
         with:
           context: .
           file: ./docker/Dockerfile.vm-controller
-          push: ${{ github.event_name != 'pull_request' }}
+          push: ${{ needs.resolve-version.result == 'success' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: |
             ${{ steps.meta.outputs.labels }}
@@ -1526,7 +1620,7 @@ jobs:
             [registry."docker.io"]
               mirrors = ["mirror.gcr.io"]
       - uses: docker/login-action@v3
-        if: github.event_name != 'pull_request'
+        if: needs.resolve-version.result == 'success'
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
@@ -1538,14 +1632,14 @@ jobs:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-vm-preparer
           tags: |
             type=sha,format=short,prefix=sha-
-            type=raw,value=latest,enable=${{ github.event_name != 'pull_request' }}
-            type=raw,value=${{ needs.resolve-version.outputs.tag }},enable=${{ github.event_name != 'pull_request' }}
-      - name: Build${{ github.event_name == 'pull_request' && ' (PR validation, no push)' || ' and push' }}
+            type=raw,value=latest,enable=${{ needs.resolve-version.result == 'success' }}
+            type=raw,value=${{ needs.resolve-version.outputs.tag }},enable=${{ needs.resolve-version.result == 'success' }}
+      - name: Build${{ needs.resolve-version.result == 'success' && ' and push' || ' (validation, no push)' }}
         uses: docker/build-push-action@v5
         with:
           context: .
           file: ./docker/Dockerfile.vm-preparer
-          push: ${{ github.event_name != 'pull_request' }}
+          push: ${{ needs.resolve-version.result == 'success' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: |
             ${{ steps.meta.outputs.labels }}
@@ -1600,7 +1694,7 @@ jobs:
             [registry."docker.io"]
               mirrors = ["mirror.gcr.io"]
       - uses: docker/login-action@v3
-        if: github.event_name != 'pull_request'
+        if: needs.resolve-version.result == 'success'
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
@@ -1612,15 +1706,15 @@ jobs:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-driver-shim
           tags: |
             type=sha,format=short,prefix=sha-
-            type=raw,value=latest,enable=${{ github.event_name != 'pull_request' }}
-            type=raw,value=${{ needs.resolve-version.outputs.tag }},enable=${{ github.event_name != 'pull_request' }}
-      - name: Build${{ github.event_name == 'pull_request' && ' (PR validation, no push)' || ' and push' }}
+            type=raw,value=latest,enable=${{ needs.resolve-version.result == 'success' }}
+            type=raw,value=${{ needs.resolve-version.outputs.tag }},enable=${{ needs.resolve-version.result == 'success' }}
+      - name: Build${{ needs.resolve-version.result == 'success' && ' and push' || ' (validation, no push)' }}
         uses: docker/build-push-action@v5
         with:
           context: .
           file: ./docker/Dockerfile.driver-shim
           platforms: linux/amd64
-          push: ${{ github.event_name != 'pull_request' }}
+          push: ${{ needs.resolve-version.result == 'success' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: |
             ${{ steps.meta.outputs.labels }}
@@ -1695,7 +1789,7 @@ jobs:
             [registry."docker.io"]
               mirrors = ["mirror.gcr.io"]
       - uses: docker/login-action@v3
-        if: github.event_name != 'pull_request'
+        if: needs.resolve-version.result == 'success'
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
@@ -1707,15 +1801,15 @@ jobs:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-driver-mcp-front
           tags: |
             type=sha,format=short,prefix=sha-
-            type=raw,value=latest,enable=${{ github.event_name != 'pull_request' }}
-            type=raw,value=${{ needs.resolve-version.outputs.tag }},enable=${{ github.event_name != 'pull_request' }}
-      - name: Build${{ github.event_name == 'pull_request' && ' (PR validation, no push)' || ' and push' }}
+            type=raw,value=latest,enable=${{ needs.resolve-version.result == 'success' }}
+            type=raw,value=${{ needs.resolve-version.outputs.tag }},enable=${{ needs.resolve-version.result == 'success' }}
+      - name: Build${{ needs.resolve-version.result == 'success' && ' and push' || ' (validation, no push)' }}
         uses: docker/build-push-action@v5
         with:
           context: .
           file: ./docker/Dockerfile.driver-mcp-front
           platforms: linux/amd64
-          push: ${{ github.event_name != 'pull_request' }}
+          push: ${{ needs.resolve-version.result == 'success' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: |
             ${{ steps.meta.outputs.labels }}
@@ -1768,7 +1862,7 @@ jobs:
             [registry."docker.io"]
               mirrors = ["mirror.gcr.io"]
       - uses: docker/login-action@v3
-        if: github.event_name != 'pull_request'
+        if: needs.resolve-version.result == 'success'
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
@@ -1780,15 +1874,15 @@ jobs:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-driver-git-swap
           tags: |
             type=sha,format=short,prefix=sha-
-            type=raw,value=latest,enable=${{ github.event_name != 'pull_request' }}
-            type=raw,value=${{ needs.resolve-version.outputs.tag }},enable=${{ github.event_name != 'pull_request' }}
-      - name: Build${{ github.event_name == 'pull_request' && ' (PR validation, no push)' || ' and push' }}
+            type=raw,value=latest,enable=${{ needs.resolve-version.result == 'success' }}
+            type=raw,value=${{ needs.resolve-version.outputs.tag }},enable=${{ needs.resolve-version.result == 'success' }}
+      - name: Build${{ needs.resolve-version.result == 'success' && ' and push' || ' (validation, no push)' }}
         uses: docker/build-push-action@v5
         with:
           context: .
           file: ./docker/Dockerfile.driver-git-swap
           platforms: linux/amd64
-          push: ${{ github.event_name != 'pull_request' }}
+          push: ${{ needs.resolve-version.result == 'success' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: |
             ${{ steps.meta.outputs.labels }}
@@ -1842,7 +1936,7 @@ jobs:
             [registry."docker.io"]
               mirrors = ["mirror.gcr.io"]
       - uses: docker/login-action@v3
-        if: github.event_name != 'pull_request'
+        if: needs.resolve-version.result == 'success'
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
@@ -1854,15 +1948,15 @@ jobs:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-driver-gpt-live-sip
           tags: |
             type=sha,format=short,prefix=sha-
-            type=raw,value=latest,enable=${{ github.event_name != 'pull_request' }}
-            type=raw,value=${{ needs.resolve-version.outputs.tag }},enable=${{ github.event_name != 'pull_request' }}
-      - name: Build${{ github.event_name == 'pull_request' && ' (PR validation, no push)' || ' and push' }}
+            type=raw,value=latest,enable=${{ needs.resolve-version.result == 'success' }}
+            type=raw,value=${{ needs.resolve-version.outputs.tag }},enable=${{ needs.resolve-version.result == 'success' }}
+      - name: Build${{ needs.resolve-version.result == 'success' && ' and push' || ' (validation, no push)' }}
         uses: docker/build-push-action@v5
         with:
           context: .
           file: ./docker/Dockerfile.driver-gpt-live-sip
           platforms: linux/amd64
-          push: ${{ github.event_name != 'pull_request' }}
+          push: ${{ needs.resolve-version.result == 'success' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: |
             ${{ steps.meta.outputs.labels }}
@@ -1924,7 +2018,7 @@ jobs:
             [registry."docker.io"]
               mirrors = ["mirror.gcr.io"]
       - uses: docker/login-action@v3
-        if: github.event_name != 'pull_request'
+        if: needs.resolve-version.result == 'success'
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
@@ -1936,8 +2030,8 @@ jobs:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-fuse-opener
           tags: |
             type=sha,format=short,prefix=sha-
-            type=raw,value=latest,enable=${{ github.event_name != 'pull_request' }}
-            type=raw,value=${{ needs.resolve-version.outputs.tag }},enable=${{ github.event_name != 'pull_request' }}
+            type=raw,value=latest,enable=${{ needs.resolve-version.result == 'success' }}
+            type=raw,value=${{ needs.resolve-version.outputs.tag }},enable=${{ needs.resolve-version.result == 'success' }}
       - name: Extract metadata (cloud mount)
         id: meta-cloud-mount
         uses: docker/metadata-action@v5
@@ -1945,16 +2039,16 @@ jobs:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-cloud-mount
           tags: |
             type=sha,format=short,prefix=sha-
-            type=raw,value=latest,enable=${{ github.event_name != 'pull_request' }}
-            type=raw,value=${{ needs.resolve-version.outputs.tag }},enable=${{ github.event_name != 'pull_request' }}
-      - name: Build the opener${{ github.event_name == 'pull_request' && ' (PR validation, no push)' || ' and push' }}
+            type=raw,value=latest,enable=${{ needs.resolve-version.result == 'success' }}
+            type=raw,value=${{ needs.resolve-version.outputs.tag }},enable=${{ needs.resolve-version.result == 'success' }}
+      - name: Build the opener${{ needs.resolve-version.result == 'success' && ' and push' || ' (validation, no push)' }}
         uses: docker/build-push-action@v5
         with:
           context: .
           file: ./docker/Dockerfile.in-pod-mount
           target: opener
           platforms: linux/amd64
-          push: ${{ github.event_name != 'pull_request' }}
+          push: ${{ needs.resolve-version.result == 'success' }}
           tags: ${{ steps.meta-opener.outputs.tags }}
           labels: |
             ${{ steps.meta-opener.outputs.labels }}
@@ -1967,14 +2061,14 @@ jobs:
           build-args: |
             SRW_SOURCE_REVISION=${{ github.sha }}
           cache-from: type=registry,ref=${{ env.REGISTRY }}/${{ env.REPO_LOWER }}-fuse-opener:buildcache-main
-      - name: Build the cloud mount supervisor${{ github.event_name == 'pull_request' && ' (PR validation, no push)' || ' and push' }}
+      - name: Build the cloud mount supervisor${{ needs.resolve-version.result == 'success' && ' and push' || ' (validation, no push)' }}
         uses: docker/build-push-action@v5
         with:
           context: .
           file: ./docker/Dockerfile.in-pod-mount
           target: rclone
           platforms: linux/amd64
-          push: ${{ github.event_name != 'pull_request' }}
+          push: ${{ needs.resolve-version.result == 'success' }}
           tags: ${{ steps.meta-cloud-mount.outputs.tags }}
           labels: |
             ${{ steps.meta-cloud-mount.outputs.labels }}
@@ -1990,7 +2084,7 @@ jobs:
           cache-to: type=registry,ref=${{ env.REGISTRY }}/${{ env.REPO_LOWER }}-fuse-opener:buildcache-main,mode=max,image-manifest=true,oci-mediatypes=true,compression=zstd,ignore-error=true
 
   # ---------------------------------------------------------------------------
-  # Package and publish Helm chart at the auto-bumped version.
+  # Package and publish Helm chart at the resolved release version.
   # Git tag goes LAST so a failed chart push doesn't leave dangling tags.
   # ---------------------------------------------------------------------------
   release-chart:
@@ -1998,7 +2092,7 @@ jobs:
     needs: [architecture, resolve-version, build-agent, build-orchestrator, build-cockpit, build-mcp, build-workspace, build-vm-controller, build-vm-preparer, build-driver-shim, build-driver-mcp-front, build-driver-git-swap, build-driver-gpt-live-sip, build-fuse-opener, build-agent-vm-base, chart-test, chart-schema-negative]
     if: >-
       always() && !cancelled() &&
-      github.event_name == 'push' &&
+      github.ref == 'refs/heads/main' &&
       needs.architecture.result == 'success' &&
       needs.resolve-version.result == 'success' &&
       needs.build-agent.result == 'success' &&
@@ -2097,9 +2191,46 @@ jobs:
           helm push "./dist/superhuman-remote-worker-${{ needs.resolve-version.outputs.version }}.tgz" \
             oci://ghcr.io/superhuman-remote-worker/charts
       - name: Push git tag
+        # scripts/release/next_version.py counts only annotated tags whose
+        # message is exactly "Release <tag>"; keep the two in step.
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git tag -a "${{ needs.resolve-version.outputs.tag }}" \
             -m "Release ${{ needs.resolve-version.outputs.tag }}"
           git push origin "${{ needs.resolve-version.outputs.tag }}"
+
+  # ---------------------------------------------------------------------------
+  # GitHub Release for the tag release-chart just pushed, with the notes
+  # resolve-version rendered. Its own job so a failure here re-runs alone,
+  # without re-pushing the chart or the tag.
+  # ---------------------------------------------------------------------------
+  github-release:
+    name: Publish GitHub Release
+    needs: [resolve-version, release-chart]
+    if: >-
+      always() && !cancelled() &&
+      github.ref == 'refs/heads/main' &&
+      needs.resolve-version.result == 'success' &&
+      needs.release-chart.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-notes
+      - name: Create the GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ needs.resolve-version.outputs.tag }}
+          TITLE: ${{ needs.resolve-version.outputs.title }}
+        run: |
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "::notice::GitHub Release $TAG already exists; leaving it untouched"
+            exit 0
+          fi
+          gh release create "$TAG" --verify-tag --latest \
+            --title "$TITLE" --notes-file release-notes.md

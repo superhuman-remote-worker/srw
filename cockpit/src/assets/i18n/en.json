@@ -2578,6 +2578,7 @@
     },
     "toolCategories": {
       "workspace": "Working with files",
+      "skills": "Using skills",
       "git": "Version control",
       "shell": "Running commands",
       "research": "Research & browsing",
@@ -2619,6 +2620,7 @@
       "research": "searches",
       "session_task": "tasks",
       "shell": "commands",
+      "skills": "skills",
       "sql": "queries",
       "thought": "thoughts",
       "workspace": "files"
@@ -2640,6 +2642,7 @@
       "research": "search",
       "session_task": "task",
       "shell": "command",
+      "skills": "skill",
       "sql": "query",
       "thought": "thought",
       "workspace": "file"
@@ -3922,6 +3925,7 @@
           "changes": "{{n}} changed",
           "template": "Template",
           "upgradeOnly": "Upgrade only",
+          "fixed": "Fixed",
           "default": "Default",
           "custom": "Custom",
           "none": "None",
@@ -3935,6 +3939,7 @@
         "project": "Project",
         "templateAndResources": "Template and resources",
         "templateAndResourcesHint": "The tier above can be upgraded. Image and resources stay as created.",
+        "resourcesFixedHint": "Image and resources stay as created.",
         "moreLive": "These were fixed when the session started.",
         "moreUnavailable": "The values this session was started with could not be loaded."
       },
@@ -4028,6 +4033,12 @@
       "tierCurrent": "current",
       "tierNext": "the next tier",
       "tierHint": "Upgrades carry your files over and cannot be reversed within the session.",
+      "tierFixed": {
+        "needsApproval": "Upgrading this session needs an admin's approval.",
+        "sessionUnsupported": "This session can't change its workspace. Start a new session to work on another tier.",
+        "highest": "This session already runs on the highest tier.",
+        "unsupported": "This tier can't be upgraded."
+      },
       "tierUpgrading": "Provisioning {{tier}}…",
       "tierUnreachable": {
         "downgrade": "can't move down a tier",
@@ -4143,6 +4154,10 @@
       "canvas": {
         "label": "Canvas",
         "description": "Ability to present workspace files in the shared session Canvas"
+      },
+      "skills": {
+        "label": "Skills",
+        "description": "Ability to load skills from your skill catalog. Off means the agent sees no skill list"
       },
       "citation": {
         "label": "Citation",

@@ -442,7 +442,7 @@ def attached_head(attached_repo):
 
 @pytest.fixture
 def context_with_attached(context, attached_repo):
-    context.workspace_manager.source_repos = {"KurortEngine": attached_repo}
+    context.workspace_manager.source_repos = {"WidgetShop": attached_repo}
     return context
 
 
@@ -456,12 +456,12 @@ class TestAttachedRepositoryReads:
 
     Job c4849fa1 (2026-08-16) failed because git_show answered for the job's own
     repo, returning `fatal: bad object` for a commit that was sitting in
-    repos/KurortEngine/ the whole time.
+    repos/WidgetShop/ the whole time.
     """
 
     def test_git_show_reads_attached_repo(self, tools_with_attached, attached_head):
         git_show = get_tool_by_name(tools_with_attached, "git_show")
-        result = git_show.invoke({"commit_ref": attached_head, "repo": "KurortEngine"})
+        result = git_show.invoke({"commit_ref": attached_head, "repo": "WidgetShop"})
         assert "bad object" not in result
         assert "add theme" in result
 
@@ -472,35 +472,35 @@ class TestAttachedRepositoryReads:
         it cannot have must name the repos that might have it."""
         git_show = get_tool_by_name(tools_with_attached, "git_show")
         result = git_show.invoke({"commit_ref": attached_head})
-        assert "KurortEngine" in result
-        assert 'repo="KurortEngine"' in result
+        assert "WidgetShop" in result
+        assert 'repo="WidgetShop"' in result
 
     def test_unknown_repo_name_lists_the_valid_ones(self, tools_with_attached):
         git_show = get_tool_by_name(tools_with_attached, "git_show")
         result = git_show.invoke({"commit_ref": "HEAD", "repo": "nope"})
-        assert "KurortEngine" in result
+        assert "WidgetShop" in result
 
     def test_git_log_reads_attached_repo(self, tools_with_attached):
         git_log = get_tool_by_name(tools_with_attached, "git_log")
-        result = git_log.invoke({"repo": "KurortEngine"})
+        result = git_log.invoke({"repo": "WidgetShop"})
         assert "add theme" in result
 
     def test_git_diff_reads_attached_repo(self, tools_with_attached, attached_repo):
         (attached_repo.workspace_path / "theme.md").write_text("changed")
         git_diff = get_tool_by_name(tools_with_attached, "git_diff")
-        result = git_diff.invoke({"repo": "KurortEngine"})
+        result = git_diff.invoke({"repo": "WidgetShop"})
         assert "changed" in result or "theme.md" in result
 
     def test_git_status_reads_attached_repo(self, tools_with_attached, attached_repo):
         (attached_repo.workspace_path / "new.txt").write_text("x")
         git_status = get_tool_by_name(tools_with_attached, "git_status")
-        result = git_status.invoke({"repo": "KurortEngine"})
+        result = git_status.invoke({"repo": "WidgetShop"})
         assert "new.txt" in result
 
     def test_git_tags_does_not_job_scope_an_attached_repo(self, tools_with_attached):
         """The {job_id}-phase-* convention is meaningless in someone else's repo."""
         git_tags = get_tool_by_name(tools_with_attached, "git_tags")
-        result = git_tags.invoke({"pattern": "*", "repo": "KurortEngine"})
+        result = git_tags.invoke({"pattern": "*", "repo": "WidgetShop"})
         assert "test-job" not in result
 
     def test_job_repo_still_the_default(

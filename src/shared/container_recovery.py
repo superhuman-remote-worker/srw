@@ -140,3 +140,28 @@ def container_recovery_resume_allowed_sql(
             )
         ) ELSE false END
     )"""
+
+
+def container_retained_projection_sql(context: str, owner_id: str = "jobs.id") -> str:
+    """Whether resume keeps a settled exact Kubernetes teardown in place.
+
+    An idle Pod release (or any exact cleanup) leaves ``status: deleted`` with
+    the retired runtime's authority envelope and, for a non-terminal job, the
+    PVC. The dispatcher treats that status as needs-create and
+    ``create_workspace`` replaces the runtime under a new creation reservation,
+    reattaching a retained claim by name. Moving the envelope aside instead is
+    refused by the 0198 authority trigger, so the settled projection stays.
+    """
+
+    workspace = f"{context}->'workspace_container'"
+    return f"""(
+        {workspace}->>'provisioner' = 'k8s'
+        AND {workspace}->>'status' = 'deleted'
+        AND jsonb_typeof({workspace}->'_runtime_incarnation') = 'string'
+        AND public.managed_repository_workspace_cleanup_projection_is_settled(
+            'job', {owner_id}, 'workspace_container',
+            {workspace}->>'_runtime_incarnation',
+            {workspace}->>'_runtime_incarnation',
+            'deleted'
+        )
+    )"""

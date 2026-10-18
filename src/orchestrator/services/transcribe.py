@@ -152,7 +152,9 @@ async def transcribe_thread_audio(
                         ts=datetime.now(timezone.utc),
                         user_id=user_id,
                         project_id=project_id,
-                        ref_kind="thread",
+                        # No thread on the landing draft: an unreferenced
+                        # event, like the TTS voice preview's.
+                        ref_kind="thread" if ref_id else None,
                         ref_id=ref_id,
                         details={"bytes": len(audio_bytes)},
                     )

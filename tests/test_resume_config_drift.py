@@ -169,7 +169,7 @@ class TestResumeConfigDrift:
 
         thread = _ended_thread(thread_a)
         drift = [
-            DriftItem(f"connector:{DS_GONE}", "connector", "deleted", "KurortEngine")
+            DriftItem(f"connector:{DS_GONE}", "connector", "deleted", "WidgetShop")
         ]
 
         with _patch_caller_and_db(user_a, fake_db):
@@ -191,7 +191,7 @@ class TestResumeConfigDrift:
                 "id": f"connector:{DS_GONE}",
                 "kind": "connector",
                 "reason": "deleted",
-                "label": "KurortEngine",
+                "label": "WidgetShop",
             }
         ]
         # Nothing was mutated: no write ever reached the thread.
@@ -208,7 +208,7 @@ class TestResumeConfigDrift:
         thread = _ended_thread(thread_a)
         thread_id = str(thread["id"])
         drift = [
-            DriftItem(f"connector:{DS_GONE}", "connector", "deleted", "KurortEngine")
+            DriftItem(f"connector:{DS_GONE}", "connector", "deleted", "WidgetShop")
         ]
 
         with _patch_caller_and_db(user_a, fake_db):
@@ -237,7 +237,7 @@ class TestResumeConfigDrift:
 
         thread = _ended_thread(thread_a)
         drift = [
-            DriftItem(f"connector:{DS_GONE}", "connector", "deleted", "KurortEngine"),
+            DriftItem(f"connector:{DS_GONE}", "connector", "deleted", "WidgetShop"),
             DriftItem("grant:shell_tools", "grant", "revoked", "shell tools"),
         ]
 
@@ -260,7 +260,7 @@ class TestResumeConfigDrift:
                 "id": f"connector:{DS_GONE}",
                 "kind": "connector",
                 "reason": "deleted",
-                "label": "KurortEngine",
+                "label": "WidgetShop",
             },
             {
                 "id": "grant:shell_tools",
@@ -325,7 +325,7 @@ class TestResumeConfigDrift:
         thread_id = str(thread["id"])
         thread["metadata"] = {"config_drift_ack": {f"connector:{DS_GONE}": "deleted"}}
         drift = [
-            DriftItem(f"connector:{DS_GONE}", "connector", "deleted", "KurortEngine")
+            DriftItem(f"connector:{DS_GONE}", "connector", "deleted", "WidgetShop")
         ]
 
         with _patch_caller_and_db(user_a, fake_db):
@@ -353,7 +353,7 @@ class TestResumeConfigDrift:
         acked_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
         thread["metadata"] = {"config_drift_ack": {f"connector:{acked_id}": "deleted"}}
         drift = [
-            DriftItem(f"connector:{DS_GONE}", "connector", "deleted", "KurortEngine")
+            DriftItem(f"connector:{DS_GONE}", "connector", "deleted", "WidgetShop")
         ]
 
         with _patch_caller_and_db(user_a, fake_db):
@@ -370,7 +370,7 @@ class TestResumeConfigDrift:
                 "id": f"connector:{DS_GONE}",
                 "kind": "connector",
                 "reason": "deleted",
-                "label": "KurortEngine",
+                "label": "WidgetShop",
             }
         ]
         fake_db.resume_thread.assert_not_awaited()

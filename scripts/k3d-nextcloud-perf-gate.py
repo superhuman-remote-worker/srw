@@ -43,6 +43,7 @@ status is 0 only if every requested expectation passes.
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
 import os
 import re
@@ -54,8 +55,19 @@ import sys
 import time
 from collections import Counter
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any
 
+ROOT = Path(__file__).resolve().parents[1]
+# `test` logs in through the gates' Keycloak client (scripts/k3d_gate_oauth.py):
+# its access token carries `sub`, the realm roles and the audience the API's
+# Bearer check accepts. admin-cli's ID token is no Bearer credential.
+_OAUTH_SPEC = importlib.util.spec_from_file_location(
+    "_k3d_gate_oauth", ROOT / "scripts" / "k3d_gate_oauth.py"
+)
+assert _OAUTH_SPEC is not None and _OAUTH_SPEC.loader is not None
+gate_oauth = importlib.util.module_from_spec(_OAUTH_SPEC)
+_OAUTH_SPEC.loader.exec_module(gate_oauth)
 LOCAL_CONTEXT = "k3d-srw"
 LOCAL_NAMESPACE = "srw"
 LOCAL_CONFIRMATION = "LOCAL-K3D-DISPOSABLE"
@@ -254,17 +266,10 @@ class Gate:
     # ------------------------------------------------------------ plumbing
     def login(self) -> None:
         password = os.environ.get("SRW_K3D_TEST_PASSWORD", "srw-k3d-dev-test")
-        out = command(
-            K
-            + ["exec", "-i", ORCHESTRATOR, "-c", "orchestrator", "--"]
-            + ["curl", "-fsS", "-X", "POST"]
-            + ["http://srw-keycloak:8080/realms/srw/protocol/openid-connect/token"]
-            + ["-d", "grant_type=password", "-d", "client_id=admin-cli"]
-            + ["-d", f"username={TEST_USERNAME}", "-d", "scope=openid"]
-            + ["--data-urlencode", "password@-"],
-            data=password,
-        )
-        self.token = json.loads(out)["id_token"]
+        try:
+            self.token = gate_oauth.access_token(TEST_USERNAME, password, kubectl=K)
+        except (RuntimeError, subprocess.TimeoutExpired) as error:
+            raise GateError(f"login: {error}") from None
 
     def api(
         self, method: str, path: str, body: dict[str, Any] | None = None
