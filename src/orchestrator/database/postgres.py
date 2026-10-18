@@ -46373,6 +46373,7 @@ class PostgresDB:
             stateless_retirement_authority,
             stateless_settled_retirement_authority,
         )
+        from shared.workspace_upgrade import workspace_upgrade_seed_from
 
         try:
             initial = initial_creation_retirement_authority(initial)
@@ -46396,12 +46397,20 @@ class PostgresDB:
             "SELECT * FROM run_queue WHERE unit_id=$1::uuid FOR UPDATE", thread["id"]
         )
         if admission:
+            # A container upgrade's create (C1) keeps its lite queue: an earlier
+            # lite turn and every pre-Ready claim (released on its 425) took a
+            # token. Its seed marker admits that history on an unleased queue;
+            # any other create still needs a never-claimed one.
+            upgrade_create = workspace_upgrade_seed_from(metadata) is not None
             if thread["status"] != "created" or (
                 queue is not None
                 and (
                     queue["unit_kind"] != "session_turn"
                     or queue["state"] == "leased"
-                    or queue["lease_token"] != 0
+                    or (
+                        queue["lease_token"] != 0
+                        and not (upgrade_create and queue["leased_by"] is None)
+                    )
                 )
             ):
                 return False
