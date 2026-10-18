@@ -159,6 +159,31 @@ class SessionEnding(SessionEnded):
         self.retirement_disposition = retirement_disposition
 
 
+class WorkspaceSnapshotChanged(Exception):
+    """The workspace row changed while the orchestrator built its answer (409).
+
+    Raised only to callers that opt in (the readiness poll). The orchestrator
+    never splices two workspace snapshots into one response; it refuses and
+    the caller reads again. ``code`` is the refusal's code or detail.
+    """
+
+    def __init__(self, message: str, *, code: str) -> None:
+        super().__init__(message)
+        self.code = code
+
+
+# The 409s the workspace endpoint answers when the workspace changed under one
+# read; the next read starts from a single snapshot. Dict details carry a code,
+# the attestation refusals a plain detail string.
+_WORKSPACE_SNAPSHOT_CHANGED_CODES = frozenset({"workspace_runtime_identity_changed"})
+_WORKSPACE_SNAPSHOT_CHANGED_DETAILS = frozenset(
+    {
+        "Workspace authority changed during attach",
+        "VM workspace authority changed during attach",
+    }
+)
+
+
 class ThreadConfigUpdateDenied(Exception):
     """The orchestrator rejected a live thread config update (4xx).
 
@@ -1973,6 +1998,7 @@ class OrchestratorClient:
         *,
         raise_on_denied: bool = False,
         raise_on_ending: bool = False,
+        raise_on_snapshot_change: bool = False,
     ) -> dict | None:
         """Poll workspace container status for a thread.
 
@@ -1990,7 +2016,9 @@ class OrchestratorClient:
         A 409 ``session_ended`` always raises :class:`SessionEnded`. With
         ``raise_on_ending=True``, a 409 ``session_ending`` (the life's
         retirement has begun) raises :class:`SessionEnding` instead of
-        collapsing to ``None``.
+        collapsing to ``None``. With ``raise_on_snapshot_change=True``, a 409
+        saying the workspace changed during this read raises
+        :class:`WorkspaceSnapshotChanged`, so the caller reads again.
         """
         if not self._client:
             await self.connect()
@@ -2049,8 +2077,28 @@ class OrchestratorClient:
                         runtime_generation=detail.get("session_runtime_generation"),
                         retirement_disposition=detail.get("retirement_disposition"),
                     )
+                code = (
+                    detail.get("code")
+                    if isinstance(detail, dict)
+                    else detail
+                    if isinstance(detail, str)
+                    else None
+                )
+                if raise_on_snapshot_change and (
+                    code in _WORKSPACE_SNAPSHOT_CHANGED_CODES
+                    or code in _WORKSPACE_SNAPSHOT_CHANGED_DETAILS
+                ):
+                    raise WorkspaceSnapshotChanged(
+                        "workspace changed during the read", code=str(code)
+                    )
+                # Only the refusal's code: a 409 detail is never a payload.
+                logger.info(
+                    "Workspace read for thread %s refused: 409 %s",
+                    thread_id,
+                    code if isinstance(code, str) else "(no code)",
+                )
             return None
-        except (SessionGrantDenied, SessionEnded):
+        except (SessionGrantDenied, SessionEnded, WorkspaceSnapshotChanged):
             raise
         except Exception as e:
             logger.debug(f"Failed to get thread workspace: {e}")

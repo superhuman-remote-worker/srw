@@ -2677,7 +2677,59 @@ class TestPollWorkspaceReady:
                 raise_on_denied=True,
                 session_runtime_generation=None,
             )
-        client.get_thread_workspace.assert_called_once_with("tid", raise_on_denied=True)
+        client.get_thread_workspace.assert_called_once_with(
+            "tid", raise_on_denied=True, raise_on_snapshot_change=True
+        )
+
+    @pytest.mark.asyncio
+    async def test_reads_again_when_the_workspace_changed_during_a_read(self):
+        """A read the workspace changed under is refused with a 409 and the next
+        read answers from one snapshot; the poll must not treat it as "no
+        workspace" (knowledge-base/knowledge/issues/
+        protected_session_attach_races_its_workspace_create.md)."""
+        from agent.api.orchestrator_client import WorkspaceSnapshotChanged
+
+        client = AsyncMock()
+        client.get_thread_workspace = AsyncMock(
+            side_effect=[
+                WorkspaceSnapshotChanged(
+                    "changed", code="workspace_runtime_identity_changed"
+                ),
+                {"status": "creating"},
+                {"status": "ready", "pod_ip": "1.2.3.4"},
+            ]
+        )
+
+        with patch("agent.api.session_workspace.asyncio.sleep", new_callable=AsyncMock):
+            result = await poll_workspace_ready(
+                client, "tid", timeout=30, session_runtime_generation=None
+            )
+
+        assert result is not None
+        assert result["pod_ip"] == "1.2.3.4"
+        assert client.get_thread_workspace.await_count == 3
+        for call in client.get_thread_workspace.await_args_list:
+            assert call.kwargs["raise_on_snapshot_change"] is True
+
+    @pytest.mark.asyncio
+    async def test_waits_on_pending_until_the_workspace_is_ready(self):
+        """A "pending" workspace (a create on its way) is waited on, unlike "none"."""
+        client = AsyncMock()
+        client.get_thread_workspace = AsyncMock(
+            side_effect=[
+                {"status": "pending"},
+                {"status": "creating"},
+                {"status": "ready", "pod_ip": "1.2.3.4"},
+            ]
+        )
+
+        with patch("agent.api.session_workspace.asyncio.sleep", new_callable=AsyncMock):
+            result = await poll_workspace_ready(
+                client, "tid", timeout=30, session_runtime_generation=None
+            )
+
+        assert result is not None
+        assert client.get_thread_workspace.await_count == 3
 
     @pytest.mark.asyncio
     async def test_returns_vm_config_when_ready(self):

@@ -20,6 +20,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, Optional, Tuple
 from uuid import UUID
 
+from agent.api.orchestrator_client import WorkspaceSnapshotChanged
 from agent.api.session_contract import ProtectedCloudUnavailable, WorkspaceNotReady
 from agent.api.session_identity import (
     canonical_runtime_generation,
@@ -606,11 +607,25 @@ async def poll_workspace_ready(
     admission_deadline = None
 
     while time.monotonic() < deadline:
-        fetch_options: Dict[str, Any] = {"raise_on_denied": raise_on_denied}
+        fetch_options: Dict[str, Any] = {
+            "raise_on_denied": raise_on_denied,
+            # The orchestrator refuses a read the workspace changed under, and
+            # the next read answers from one snapshot; that is not "none".
+            "raise_on_snapshot_change": True,
+        }
         if raise_on_ending:
             # An attach must stop once its life's retirement has begun.
             fetch_options["raise_on_ending"] = True
-        ws = await client.get_thread_workspace(thread_id, **fetch_options)
+        try:
+            ws = await client.get_thread_workspace(thread_id, **fetch_options)
+        except WorkspaceSnapshotChanged as changed:
+            logger.info(
+                "Thread %s: workspace changed during the read (%s); reading again",
+                thread_id,
+                changed.code,
+            )
+            await asyncio.sleep(poll_interval)
+            continue
         if not ws:
             # The client collapses every non-200 to None. For a vm-tier
             # session that includes a transient 5xx from the orchestrator
