@@ -149,17 +149,17 @@ These sessions can also upgrade to a **VM**, in place: choose **VM**, or send
 while the session is idle. The chat then says "Moving this session to a VM
 workspace (the session reconnects first)…": every open tab reconnects to a
 dedicated agent, the VM starts and the files are copied over; a cold VM can
-take several minutes. A file over 100 MB isn't copied: it stays in the old
-storage, and the chat names it when the upgrade finishes. If the agent is lost
-before the copy is recorded, the next one copies again before the session is
-ready, leaving out files under a cloud folder (they stay in the cloud and in
-the old storage). If VMs are off
+take several minutes. Ending the session before its VM is requested cancels
+the upgrade; after Resume, ask for it again. A file over 100 MB isn't copied:
+it stays in the old storage, and the chat names it when the upgrade finishes.
+If the agent is lost before the copy is recorded, the next one copies again
+before the session is ready, leaving out files under a cloud folder (they stay
+in the cloud and in the old storage). If VMs are off
 the request is refused with "VM workspaces aren't available on this
 installation." If the upgrade fails or is interrupted, the chat says so and
 your files stay in the old storage: the session keeps working until its agent
-restarts, then End it and start a new one. Ending the session before its VM is
-requested cancels the upgrade; after Resume, ask for it again. Only one upgrade
-runs at a time, and nothing moves back down.
+restarts, then End it and start a new one. Only one upgrade runs at a time, and
+nothing moves back down.
 
 Workspace changes are upgrade-only: to move down to Virtual or None, start a
 new session. A workspace upgrade does not automatically enable a missing tool
