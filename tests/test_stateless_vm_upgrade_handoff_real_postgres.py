@@ -15,6 +15,14 @@ from uuid import UUID, uuid4
 import pytest
 from fastapi import HTTPException
 
+from agent.api.vm_upgrade_handoff import (
+    ROW_CANCEL,
+    vm_upgrade_consumer_row,
+    vm_upgrade_payload,
+)
+from orchestrator import main
+from orchestrator.application import controls
+from orchestrator.services import thread_uploads
 from orchestrator.services.agent_thread_status import update_thread_status
 from orchestrator.services.manifest_workspace_selection import (
     select_execution_workspace,
@@ -32,6 +40,7 @@ from shared.thread_controls import (
     fetch_next_control_request,
     finalize_control_request,
 )
+from shared.workspace_upgrade import UPGRADE_CANCELLED
 from tests import test_stateless_workspace_upgrade_real_postgres as c1
 from tests.test_pinned_vm_initial_binding_real_postgres import _bind_cold_agent
 from tests.test_vm_idle_pinned_session_real_postgres import ready_pinned_thread
@@ -331,6 +340,8 @@ from orchestrator.services.stateless_vm_upgrade_handoff import (  # noqa: E402
 )
 from orchestrator.services.stateless_workspace_upgrade import (  # noqa: E402
     VM_UPGRADE_NOT_POSSIBLE,
+    latest_workspace_upgrade_request,
+    workspace_upgrade_view,
 )
 from orchestrator.services.thread_control_inbox import (  # noqa: E402
     ControlAdmissionError,
@@ -913,6 +924,213 @@ async def test_a_pinned_binding_adopts_the_request_and_finalizes_its_started_rec
         admitted.id,
     )
     assert (row["outcome"], row["applied_agent_id"]) == ("applied", bound["agent_id"])
+
+
+async def end_session(
+    database, monkeypatch, thread_id, *, permanent=False, force=False, **options
+):
+    """The owner End flow, as tests/test_pinned_failed_start_end_real_postgres.py
+    drives it."""
+    monkeypatch.setattr(main.app.state.resources, "postgres_db", database)
+    return await controls.thread_retirement_operations(
+        main.app.state.resources
+    ).end_thread_flow(
+        thread_id,
+        dict(await database.get_thread(thread_id)),
+        permanent=permanent,
+        force=force,
+        **options,
+    )
+
+
+@pytest.mark.asyncio
+async def test_end_and_resume_restamp_the_request_but_keep_its_payload_generation(
+    database, actor, monkeypatch
+):
+    """Review Focus 2 (D3's database fact)."""
+    thread_id, _ = await switched(database, actor)
+    g0 = (await database.get_thread(thread_id))["runtime_generation"]
+    result = await end_session(database, monkeypatch, thread_id)
+    assert result["status"] == "ended"
+    assert await database.resume_thread(str(thread_id))
+
+    after = await database.get_thread(thread_id)
+    assert after["execution_lane"] == "pinned"
+    assert after["runtime_generation"] != g0
+    [request] = await upgrade_requests(database, thread_id)
+    assert request["outcome"] is None
+    assert request["runtime_generation"] == after["runtime_generation"]
+    assert _json(request["payload"])["runtime_generation"] == str(g0)
+
+
+@pytest.mark.asyncio
+async def test_a_permanently_deleted_switched_session_leaves_only_an_inert_done_row(
+    database, actor, monkeypatch
+):
+    thread_id, _ = await switched(database, actor)
+    # The virtual backing is an external store the fixture doesn't run
+    # (as tests/test_pinned_retirement_retry_parity_real_postgres.py stubs it).
+    purge = AsyncMock(return_value=True)
+    monkeypatch.setattr(
+        thread_uploads, "purge_attested_pinned_virtual_workspace", purge
+    )
+    result = await end_session(database, monkeypatch, thread_id, permanent=True)
+    assert result["status"] == "deleted"
+    purge.assert_awaited_once()
+    assert str(purge.await_args.args[0]["id"]) == str(thread_id)
+    assert await database.get_thread(thread_id) is None
+    assert not await upgrade_requests(database, thread_id)
+    queue = await database.fetchrow(
+        "SELECT state, leased_by FROM run_queue WHERE unit_id = $1::uuid", thread_id
+    )
+    assert queue is None or (queue["state"], queue["leased_by"]) == ("done", None)
+    async with database.acquire() as conn:
+        claimed = await claim_unit(
+            conn, unit_kind=UNIT_KIND_SESSION_TURN, pod_name="p-9"
+        )
+    assert claimed is None or str(claimed.unit_id) != str(thread_id)
+
+
+@pytest.mark.asyncio
+async def test_the_next_pinned_owner_cancels_an_upgrade_ended_before_its_vm_request(
+    database, actor, monkeypatch
+):
+    """D3 end to end: End, Resume, the cold owner's adoption, its cancel
+    receipt, and the Session read's ``workspace_upgrade``."""
+    thread_id, admitted = await switched(database, actor)
+    g0 = str((await database.get_thread(thread_id))["runtime_generation"])
+    assert (await end_session(database, monkeypatch, thread_id))["status"] == "ended"
+    assert await database.resume_thread(str(thread_id))
+    bound = await _bind_cold_agent(database, thread_id)
+    owner = _owner(bound)
+    async with database.acquire() as conn:
+        async with conn.transaction():
+            await adopt_next_pinned_control_request(conn, **owner)
+            request = await fetch_next_control_request(conn, lease_token=None, **owner)
+    assert request is not None and request.id == admitted.id
+    payload_generation, _template = vm_upgrade_payload(request.payload)
+    assert payload_generation == g0 != owner["runtime_generation"]
+    row = vm_upgrade_consumer_row(
+        attached_tier="virtual",
+        payload_generation=payload_generation,
+        current_generation=owner["runtime_generation"],
+        marker=None,
+        request_id=str(request.id),
+        recovered=None,
+        in_flight=False,
+    )
+    assert row == ROW_CANCEL
+
+    # The agent's ROW_CANCEL receipt (persistent_app's drain): journal first,
+    # then finalize as rejected under the same owner fence.
+    epoch = await database.fetchval(
+        "SELECT events_epoch FROM threads WHERE id = $1::uuid", thread_id
+    )
+    receipt = {
+        "target_tier": "vm",
+        "reason": "The VM upgrade was cancelled when this Session ended.",
+        "request_id": str(request.id),
+        "client_request_id": str(request.client_request_id),
+        "request_seq": request.request_seq,
+        "method": "upgrade-to-workspace",
+        "error_code": UPGRADE_CANCELLED,
+    }
+    await database.execute(
+        "INSERT INTO thread_events (thread_id, epoch, seq, kind, payload, "
+        "control_request_id) VALUES ($1::uuid, $2, 10000, "
+        "'workspace_upgrade.failed', $3::jsonb, $4)",
+        thread_id,
+        epoch,
+        json.dumps(receipt),
+        request.id,
+    )
+    async with database.acquire() as conn:
+        async with conn.transaction():
+            result = await finalize_control_request(
+                conn,
+                request_id=request.id,
+                agent_id=owner["agent_id"],
+                runtime_generation=owner["runtime_generation"],
+                runtime_attach_token=owner["runtime_attach_token"],
+                outcome="rejected",
+                error_code=UPGRADE_CANCELLED,
+            )
+    assert result == "rejected"
+
+    thread = await database.get_thread(thread_id)
+    assert thread["status"] not in {"ended", "suspended"}
+    view = workspace_upgrade_view(
+        thread,
+        None,
+        latest_request=await latest_workspace_upgrade_request(database, thread),
+    )
+    assert view == {
+        "target_tier": "vm",
+        "phase": "failed",
+        "reason_code": UPGRADE_CANCELLED,
+    }
+
+
+async def assert_end_refused(database, monkeypatch, thread_id, **options):
+    """Begin answers ``pending_control_requests`` and leaves everything as it was."""
+    before = await database.get_thread(thread_id)
+    with pytest.raises(HTTPException) as refused:
+        await end_session(database, monkeypatch, thread_id, **options)
+    assert refused.value.status_code == 409
+    assert refused.value.detail == {
+        "code": "pinned_retirement_conflict",
+        "reason": "pending_control_requests",
+    }
+    after = await database.get_thread(thread_id)
+    assert after["runtime_retirement_token"] is None
+    for key in ("status", "runtime_generation", "agent_id"):
+        assert after[key] == before[key]
+    [request] = await upgrade_requests(database, thread_id)
+    assert request["outcome"] is None
+
+
+@pytest.mark.asyncio
+async def test_end_still_waits_for_a_bound_agent_to_take_the_upgrade_request(
+    database, actor, monkeypatch
+):
+    thread_id, _ = await switched(database, actor)
+    await _bind_cold_agent(database, thread_id)
+    await assert_end_refused(database, monkeypatch, thread_id, force=True)
+
+
+@pytest.mark.asyncio
+async def test_end_still_waits_for_a_pending_control_of_another_verb(
+    database, actor, monkeypatch
+):
+    thread_id, _ = await switched(database, actor)
+    await database.execute(
+        "INSERT INTO thread_control_requests (thread_id, request_seq, "
+        "client_request_id, verb, payload, requested_by) VALUES ($1::uuid, 1000, "
+        "$2, 'mode.set', '{\"mode\": \"supervised\"}'::jsonb, 'real-pg')",
+        thread_id,
+        uuid4(),
+    )
+    await assert_end_refused(database, monkeypatch, thread_id, force=True)
+
+
+@pytest.mark.asyncio
+async def test_attention_sleep_still_cannot_suspend_an_unbound_switched_session(
+    database, actor, monkeypatch
+):
+    """Only End skips the request: a skipped suspend would cancel the upgrade
+    on Resume, and an unbound Session costs nothing while it waits."""
+    thread_id, _ = await switched(database, actor)
+    thread = await database.get_thread(thread_id)
+    # The attention-sleep sweep's call (session_attention.py).
+    await assert_end_refused(
+        database,
+        monkeypatch,
+        thread_id,
+        expected_runtime_generation=str(thread["runtime_generation"]),
+        expected_agent_id=None,
+        expected_attach_token=None,
+        settle_status="suspended",
+    )
 
 
 @pytest.mark.asyncio

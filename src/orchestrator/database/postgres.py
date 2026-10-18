@@ -43165,12 +43165,24 @@ class PostgresDB:
                 # strand an already-admitted request under a token that its
                 # old consumer is then forbidden to use.  The locked thread
                 # row serializes this proof with public control admission.
+                # One exception (C2, spec D3): a stateless -> VM lane switch
+                # leaves its upgrade request pending for the first pinned
+                # owner.  With no owner bound there is no consumer to strand,
+                # so End settles past it; Resume (0185) re-stamps it and the
+                # next owner rejects its older payload generation as
+                # ``upgrade_cancelled``.  Suspend still waits: skipping there
+                # would cancel the upgrade on Resume.
+                from shared.workspace_upgrade import WORKSPACE_UPGRADE_VERB
+
                 if await conn.fetchval(
                     "SELECT EXISTS (SELECT 1 FROM thread_control_requests "
                     "WHERE thread_id=$1::uuid AND outcome IS NULL "
-                    "AND runtime_generation=$2::uuid)",
+                    "AND runtime_generation=$2::uuid "
+                    "AND NOT ($3::boolean AND verb=$4))",
                     parsed_thread_id,
                     UUID(generation),
+                    settle_status == "ended" and thread.get("agent_id") is None,
+                    WORKSPACE_UPGRADE_VERB,
                 ):
                     return {
                         "state": "conflict",
