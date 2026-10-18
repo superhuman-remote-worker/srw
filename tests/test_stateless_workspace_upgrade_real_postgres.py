@@ -397,7 +397,10 @@ from orchestrator.services.session_provisioner import ensure_session_workspace  
 from orchestrator.services.stateless_workspace_upgrade import (  # noqa: E402
     workspace_upgrade_view,
 )
-from orchestrator.services.workspace_lifecycle import EnsureOutcome  # noqa: E402
+from orchestrator.services.workspace_lifecycle import (  # noqa: E402
+    EnsureOutcome,
+    WorkspaceOwner,
+)
 from tests import test_stateless_failed_start_end_real_postgres as lifecycle  # noqa: E402
 from tests.test_sandbox_workspace_provisioner import stub_plan_inputs  # noqa: E402
 
@@ -433,25 +436,6 @@ def upgrade_provisioner(database, monkeypatch):
         lambda *a, **k: f"256 {continuation.FINGERPRINT} workspace (ED25519)",
     )
     return provisioner, cluster
-
-
-async def complete_a_lite_turn(database, thread_id):
-    """One lite turn through the queue: its input, claim and completion."""
-    async with database.acquire() as conn:
-        await record_input_seq(
-            conn, unit_id=thread_id, unit_kind=UNIT_KIND_SESSION_TURN, input_seq=1
-        )
-        claim = await claim_unit(conn, unit_kind=UNIT_KIND_SESSION_TURN, pod_name="p-1")
-        assert claim is not None and str(claim.unit_id) == str(thread_id)
-        assert (
-            await complete_unit(
-                conn,
-                unit_id=thread_id,
-                lease_token=claim.lease_token,
-                consumed_seq=claim.input_seq,
-            )
-            == "done"
-        )
 
 
 async def upgraded_create(
@@ -684,20 +668,25 @@ async def back_off_before_ready(database, claimant, thread_id, *, claims):
         )
 
 
-async def serve_a_lite_turn(database, claimant, thread_id):
-    """One served lite turn: the bundle stamps its claim, attach and the turn's
-    end publish the Session's presence, and the turn completes."""
+async def run_a_lite_turn(database, thread_id, *, claimant=None):
+    """One lite turn: its input, claim and completion. With ``claimant`` the
+    turn is served: the bundle stamps its claim, and attach and the turn's end
+    publish the Session's presence."""
     async with database.acquire() as conn:
         await record_input_seq(
             conn, unit_id=thread_id, unit_kind=UNIT_KIND_SESSION_TURN, input_seq=1
         )
     claim = await claim_now(database, thread_id)
     assert claim is not None
-    await claimant.bundle(claim)
-    for status in ("active", "awaiting_user"):
-        assert await update_stateless_claim_status(
-            database, thread_id=thread_id, lease_token=claim.lease_token, status=status
-        )
+    if claimant is not None:
+        await claimant.bundle(claim)
+        for status in ("active", "awaiting_user"):
+            assert await update_stateless_claim_status(
+                database,
+                thread_id=thread_id,
+                lease_token=claim.lease_token,
+                status=status,
+            )
     async with database.acquire() as conn:
         assert (
             await complete_unit(
@@ -787,11 +776,11 @@ from orchestrator.services.thread_retirement import end_thread_flow  # noqa: E40
 END_AUTHORITY_CHANGED = "Stateless retirement authority is malformed or changed"
 
 
-async def end(database, case, *, force):
+async def end(database, case, *, force, permanent=False):
     return await end_thread_flow(
         case.thread_id,
         await database.get_thread(case.thread_id),
-        permanent=False,
+        permanent=permanent,
         force=force,
         dependencies=lifecycle.retirement_dependencies(database, case),
     )
@@ -817,17 +806,24 @@ async def stateless_receipts(database, thread_id):
     return [str(row["runtime_incarnation"]) for row in rows]
 
 
-async def assert_forced_end_retires_the_create(database, case):
+async def assert_forced_end_retires_the_create(database, case, *, permanent=False):
     """The precedent's End checks (test_stateless_failed_start_end_real_postgres
     ::test_normal_end_retires_exact_initial_pull_failed_workspace), the
     upgrade's record, and the queue the settle path leaves."""
     before = metadata(await database.get_thread(case.thread_id))["workspace_container"]
     prior_token = (await queue_row(database, case.thread_id))["lease_token"]
 
-    assert await end(database, case, force=True) == {"status": "ended"}
+    assert await end(database, case, force=True, permanent=permanent) == {
+        "status": "deleted" if permanent else "ended"
+    }
 
     assert "pod" not in case.cluster.objects
     assert "service" not in case.cluster.objects
+    assert await stateless_receipts(database, case.thread_id) == [case.pod_uid]
+    if permanent:
+        assert "pvc" not in case.cluster.objects
+        assert await database.get_thread(case.thread_id) is None
+        return
     assert case.cluster.objects["pvc"].metadata.uid == case.pvc_uid
     ended = await database.get_thread(case.thread_id)
     assert ended["status"] == "ended"
@@ -839,7 +835,6 @@ async def assert_forced_end_retires_the_create(database, case):
     settled = metadata(ended)["_stateless_workspace_retirement_settled"]
     assert settled["runtime_incarnation"] == case.pod_uid
     assert settled["terminal_token"] == prior_token + 1
-    assert await stateless_receipts(database, case.thread_id) == [case.pod_uid]
     assert await queue_row(database, case.thread_id) == {
         "state": "done",
         "lease_token": prior_token + 1,
@@ -856,6 +851,26 @@ async def retirement_state(database, case):
         "queue": await queue_row(database, case.thread_id),
         "receipts": await stateless_receipts(database, case.thread_id),
     }
+
+
+async def admits_the_initial_end(database, case):
+    """Begin's admission check on the create's exact capture, under Begin's
+    owner -> queue lock order."""
+    initial = await case.provisioner.capture_initial_stateless_creation_retirement(
+        WorkspaceOwner.session(case.thread_id)
+    )
+    assert initial is not None
+    async with database.acquire() as conn:
+        async with conn.transaction():
+            thread = await conn.fetchrow(
+                "SELECT id, status::text AS status, execution_lane, "
+                "runtime_generation, metadata FROM threads "
+                "WHERE id = $1::uuid FOR UPDATE",
+                case.thread_id,
+            )
+            return await database._initial_creation_retirement_is_current_on_conn(
+                conn, thread, initial, admission=True
+            )
 
 
 @pytest.mark.asyncio
@@ -903,7 +918,7 @@ async def test_forced_end_retires_the_upgrade_create_after_an_earlier_lite_turn(
         actor,
         monkeypatch,
         first_wait="not_ready",
-        earlier_turn=lambda thread_id: complete_a_lite_turn(database, thread_id),
+        earlier_turn=lambda thread_id: run_a_lite_turn(database, thread_id),
     )
     assert (await queue_row(database, case.thread_id))["lease_token"] == 1
 
@@ -911,9 +926,10 @@ async def test_forced_end_retires_the_upgrade_create_after_an_earlier_lite_turn(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("permanent", [False, True])
 @pytest.mark.parametrize("claims", [0, 2])
 async def test_forced_end_retires_the_upgrade_create_of_a_session_that_served_a_lite_turn(
-    database, actor, monkeypatch, claims
+    database, actor, monkeypatch, claims, permanent
 ):
     """A served lite turn leaves its claim record and the Session's presence
     (awaiting_user); with no lease on the queue that claim can't still run."""
@@ -923,7 +939,9 @@ async def test_forced_end_retires_the_upgrade_create_of_a_session_that_served_a_
         actor,
         monkeypatch,
         first_wait="not_ready",
-        earlier_turn=lambda thread_id: serve_a_lite_turn(database, claimant, thread_id),
+        earlier_turn=lambda thread_id: run_a_lite_turn(
+            database, thread_id, claimant=claimant
+        ),
     )
     await back_off_before_ready(database, claimant, case.thread_id, claims=claims)
     served = await database.get_thread(case.thread_id)
@@ -935,7 +953,48 @@ async def test_forced_end_retires_the_upgrade_create_of_a_session_that_served_a_
         "leased_by": None,
     }
 
-    await assert_forced_end_retires_the_create(database, case)
+    await assert_forced_end_retires_the_create(database, case, permanent=permanent)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("record", ["malformed", "above_the_queue_token"])
+async def test_forced_end_refuses_a_claim_record_no_claim_could_have_left(
+    database, actor, monkeypatch, record
+):
+    """No real path writes either record: the bundle stamps a well-formed
+    token, and only under the lease that holds it. Built with SQL on a served
+    Session's unleased queue, each is refused before any effect."""
+    claimant = upgrade_claimant(database, monkeypatch, attach=LITE_ATTACH)
+    case = await upgraded_create(
+        database,
+        actor,
+        monkeypatch,
+        first_wait="not_ready",
+        earlier_turn=lambda thread_id: run_a_lite_turn(
+            database, thread_id, claimant=claimant
+        ),
+    )
+    assert await admits_the_initial_end(database, case) is True
+    queue = await queue_row(database, case.thread_id)
+    assert queue == {"state": "queued", "lease_token": 1, "leased_by": None}
+    token = "1" if record == "malformed" else queue["lease_token"] + 1
+    await database.execute(
+        "UPDATE threads SET metadata = jsonb_set(metadata, "
+        "'{_stateless_active_claim,lease_token}', $2::jsonb) WHERE id = $1::uuid",
+        case.thread_id,
+        json.dumps(token),
+    )
+    before = await retirement_state(database, case)
+
+    assert await admits_the_initial_end(database, case) is False
+    with pytest.raises(HTTPException) as refused:
+        await end(database, case, force=True)
+
+    assert (refused.value.status_code, refused.value.detail) == (
+        503,
+        END_AUTHORITY_CHANGED,
+    )
+    assert await retirement_state(database, case) == before
 
 
 @pytest.mark.asyncio
@@ -951,7 +1010,9 @@ async def test_resume_after_the_forced_end_restarts_the_upgrade_create(
         actor,
         monkeypatch,
         first_wait="not_ready",
-        earlier_turn=lambda thread_id: serve_a_lite_turn(database, claimant, thread_id),
+        earlier_turn=lambda thread_id: run_a_lite_turn(
+            database, thread_id, claimant=claimant
+        ),
     )
     await back_off_before_ready(database, claimant, case.thread_id, claims=2)
     await assert_forced_end_retires_the_create(database, case)
@@ -1061,6 +1122,7 @@ async def test_forced_end_still_refuses_a_claimed_create_without_the_upgrade_mar
 async def test_end_refuses_while_a_pre_ready_claim_holds_the_lease(
     database, actor, monkeypatch, served_turn
 ):
+    """A leased claim can still run: normal End is busy, forced End refused."""
     claimant = upgrade_claimant(database, monkeypatch, attach=LITE_ATTACH)
     case = await upgraded_create(
         database,
@@ -1068,7 +1130,7 @@ async def test_end_refuses_while_a_pre_ready_claim_holds_the_lease(
         monkeypatch,
         first_wait="not_ready",
         earlier_turn=(
-            (lambda thread_id: serve_a_lite_turn(database, claimant, thread_id))
+            (lambda thread_id: run_a_lite_turn(database, thread_id, claimant=claimant))
             if served_turn
             else None
         ),
