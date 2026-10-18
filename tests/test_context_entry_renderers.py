@@ -205,6 +205,18 @@ def _minimal(**overrides):
     return {"agent_id": "test_agent", "display_name": "Test Agent", **overrides}
 
 
+class TestRetiredInjectionModeKey:
+    @pytest.mark.parametrize("value", ["legacy", "append_only", "anything"])
+    def test_a_stored_key_is_ignored(self, value):
+        # WP6 removed the rollback flag: a stored or frozen config that still
+        # carries it loads unchanged, and nothing reads the key.
+        config = load_agent_config_from_dict(
+            _minimal(context_management={"injection_mode": value})
+        )
+        assert not hasattr(config.context_management, "injection_mode")
+        assert "injection_mode" not in config.extra
+
+
 class TestMaxMemoriesPerEntry:
     def test_dataclass_default(self):
         assert MemoryConfig().max_memories_per_entry == 5
