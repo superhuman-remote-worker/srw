@@ -10289,6 +10289,7 @@ async def _apply_vm_workspace_upgrade_control(
         UPGRADE_CANCELLED,
         UPGRADE_REFUSED,
         vm_provision_generation,
+        vm_upgrade_recorded,
         vm_upgrade_seed,
     )
 
@@ -10363,22 +10364,18 @@ async def _apply_vm_workspace_upgrade_control(
         thread_id, template=template, control_request_id=str(request.id)
     )
     if accepted is False:
-        # A 4xx, or the typed 503: VM provisioning is off.
+        # A 4xx, or a typed 503: VM provisioning is off, or the request
+        # failed before anything was recorded for it.
         return failed(UPGRADE_REFUSED, detail or "SRW refused the VM upgrade.")
     thread = await _session.postgres_conn.get_thread(thread_id)
     metadata = (thread or {}).get("metadata")
     provision_generation = vm_provision_generation(metadata)
     if accepted is None:
         # No answer, or a 5xx that may have followed the provision CAS: the
-        # VM request took effect only if a provision generation exists and
-        # the marker the pre-CAS merge records names this request. Otherwise
-        # leave the request pending; the watcher retries it.
-        committed = vm_upgrade_seed(metadata)
-        if (
-            provision_generation is None
-            or committed is None
-            or committed["control_request_id"] != str(request.id)
-        ):
+        # VM request took effect only if the CAS committed for this request
+        # (``vm_upgrade_recorded``, which the orchestrator asks too).
+        # Otherwise leave the request pending; the watcher retries it.
+        if not vm_upgrade_recorded(metadata, request.id):
             raise ControlInboxBlocked(
                 f"VM upgrade request has no answer yet ({status or 'no HTTP answer'}): "
                 f"{request.id}"

@@ -894,6 +894,36 @@ async def test_a_5xx_before_the_provision_cas_leaves_the_request_pending(
 
 
 @pytest.mark.asyncio
+async def test_a_request_that_failed_before_it_was_recorded_is_refused_not_retried(
+    pinned, monkeypatch
+):
+    """Prod gate: the orchestrator's typed 503 settles the request now; an
+    untyped 5xx would leave it pending to fail again at every drain."""
+    reason = "SRW couldn't start the VM upgrade. Try again."
+    client = OrchestratorClient("http://test", "127.0.0.1", 8000, "worker", "default")
+    transport = httpx.MockTransport(
+        lambda _request: httpx.Response(503, json={"detail": reason})
+    )
+    async with httpx.AsyncClient(transport=transport) as http:
+        client._client = http
+        monkeypatch.setattr(pa, "_orchestrator_client", client)
+        order = await _drain(_request())
+    assert order == [
+        (
+            "journal",
+            "workspace_upgrade.failed",
+            {
+                **ENVELOPE,
+                "target_tier": "vm",
+                "reason": reason,
+                "error_code": "upgrade_refused",
+            },
+        ),
+        ("finalize", "rejected", "upgrade_refused"),
+    ]
+
+
+@pytest.mark.asyncio
 async def test_an_invalid_pinned_payload_is_not_served(pinned):
     order = await _drain(_request({"runtime_generation": G0, "target_tier": "sandbox"}))
     assert order[0][1] == "control.rejected"
@@ -1533,11 +1563,17 @@ async def test_an_old_replica_is_told_apart_from_a_refusal(status, body, raised,
             (False, 503, "VM provisioning not available (no NATS or K8s)"),
         ),
         (
+            httpx.Response(
+                503, json={"detail": "SRW couldn't start the VM upgrade. Try again."}
+            ),
+            (False, 503, "SRW couldn't start the VM upgrade. Try again."),
+        ),
+        (
             httpx.Response(403, json={"detail": "vm_workspace grant denied"}),
             (False, 403, "vm_workspace grant denied"),
         ),
     ],
-    ids=["typed-409", "typed-503-provisioning-off", "403"],
+    ids=["typed-409", "typed-503-provisioning-off", "typed-503-not-recorded", "403"],
 )
 async def test_a_4xx_or_the_typed_503_is_a_refusal_with_its_text(response, expected):
     client = OrchestratorClient("http://test", "127.0.0.1", 8000, "worker", "default")

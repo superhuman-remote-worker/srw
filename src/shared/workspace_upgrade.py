@@ -56,10 +56,16 @@ VM_UPGRADE_SEED_INTERRUPTED = "interrupted"
 _VM_UPGRADE_SEED_STATES = frozenset(
     {VM_UPGRADE_SEED_PENDING, VM_UPGRADE_SEED_SEEDED, VM_UPGRADE_SEED_INTERRUPTED}
 )
-#: The VM request's one typed 5xx (``agent_upgrade_thread_to_vm``): VM
-#: provisioning is off, so nothing was recorded. Any other 5xx can follow a
-#: committed provision CAS, so the pinned agent reads it as "no answer" (C2).
+#: A typed 5xx of the VM request (``agent_upgrade_thread_to_vm``): VM
+#: provisioning is off, so nothing was recorded. Any 5xx but the two typed
+#: ones can follow a committed provision CAS, so the pinned agent reads it as
+#: "no answer" (C2).
 VM_PROVISIONING_NOT_AVAILABLE = "VM provisioning not available (no NATS or K8s)"
+#: C2's other typed 503: an unexpected error stopped the lane switch's VM
+#: request before anything was recorded for it (``vm_upgrade_recorded``), so
+#: a retry would likely fail the same way. The pinned agent reads it as a
+#: refusal; the text becomes the ``workspace_upgrade.failed`` reason.
+VM_UPGRADE_NOT_RECORDED = "SRW couldn't start the VM upgrade. Try again."
 #: C2: typed ``workspace_upgrade.failed`` codes (receipts and live frames).
 UPGRADE_CANCELLED = "upgrade_cancelled"
 UPGRADE_REFUSED = "upgrade_refused"
@@ -122,6 +128,22 @@ def vm_provision_generation(metadata: Any) -> str | None:
     return _canonical_uuid(vm.get("provision_generation"))
 
 
+def vm_upgrade_recorded(metadata: Any, control_request_id: Any) -> bool:
+    """Whether the VM request a lane switch's request names took effect (C2).
+
+    It did once the provision CAS committed a generation and the marker the
+    pre-CAS merge records names the request. Both sides ask it when the VM
+    request's outcome is unknown: the pinned agent after a 5xx or no answer,
+    the orchestrator after an unexpected error.
+    """
+    marker = vm_upgrade_seed(metadata)
+    return (
+        vm_provision_generation(metadata) is not None
+        and marker is not None
+        and marker["control_request_id"] == _canonical_uuid(control_request_id)
+    )
+
+
 __all__ = [
     "LANE_CHANGED_FRAME",
     "SEED_FROM_KEY",
@@ -131,6 +153,7 @@ __all__ = [
     "UPGRADE_INTERRUPTED",
     "UPGRADE_REFUSED",
     "VM_PROVISIONING_NOT_AVAILABLE",
+    "VM_UPGRADE_NOT_RECORDED",
     "VM_UPGRADE_SEED_INTERRUPTED",
     "VM_UPGRADE_SEED_KEY",
     "VM_UPGRADE_SEED_PENDING",
@@ -143,6 +166,7 @@ __all__ = [
     "WORKSPACE_UPGRADE_VERB",
     "metadata_object",
     "vm_provision_generation",
+    "vm_upgrade_recorded",
     "vm_upgrade_seed",
     "workspace_upgrade_seed_from",
 ]

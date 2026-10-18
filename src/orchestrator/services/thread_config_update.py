@@ -48,7 +48,8 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from collections.abc import Mapping
+from collections.abc import AsyncIterator, Mapping
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, Literal, Protocol
 from uuid import UUID
@@ -102,6 +103,7 @@ from shared.backend_kinds import LITE_BACKENDS, VM_BACKENDS
 from shared.connectors.builtin import IMAGE_DRIVER_SPEC, spec_for_row
 from shared.run_queue import LANE_PINNED, LANE_STATELESS
 from shared.runtime.core.loader import canonical_config_name
+from shared.workspace_upgrade import VM_UPGRADE_NOT_RECORDED, vm_upgrade_recorded
 
 logger = logging.getLogger(__name__)
 
@@ -1024,6 +1026,66 @@ async def agent_update_thread_config(
         raise HTTPException(status_code=500, detail=str(e)) from e
 
 
+async def _vm_upgrade_unrecorded(
+    thread_id: str,
+    control_request_id: str,
+    *,
+    dependencies: ThreadConfigUpdateDependencies,
+) -> bool:
+    """Whether the Session, re-read under its lifecycle lock, shows nothing
+    recorded for the request; False when it does or the re-read fails."""
+    try:
+        async with dependencies.store.thread_advisory_lock(thread_id):
+            thread = await dependencies.store.get_thread(thread_id)
+    except Exception:
+        logger.warning(
+            "VM upgrade request %s failed and its Session can't be re-read",
+            control_request_id,
+            exc_info=True,
+        )
+        return False
+    return not vm_upgrade_recorded((thread or {}).get("metadata"), control_request_id)
+
+
+@asynccontextmanager
+async def _refuse_unrecorded_vm_upgrade(
+    thread_id: str,
+    control_request_id: str | None,
+    *,
+    dependencies: ThreadConfigUpdateDependencies,
+) -> AsyncIterator[None]:
+    """C2: an unexpected error before the provision CAS refuses the request.
+
+    The pinned agent leaves its request pending on an untyped 5xx and asks
+    again at every drain, so a persistent error (a bug, a bad row) would keep
+    the Session from ever settling. When nothing was recorded for the request
+    (``vm_upgrade_recorded``, the agent's own check), the error answers the
+    typed 503 the agent reads as a refusal. A recorded request, or a failed
+    re-read, keeps the original error: the agent's check then finds the
+    request accepted, or the error stays transient. ``HTTPException`` and
+    calls without a request id pass through unchanged.
+    """
+    if control_request_id is None:
+        yield
+        return
+    try:
+        yield
+    except HTTPException:
+        raise
+    except Exception as exc:
+        if not await _vm_upgrade_unrecorded(
+            thread_id, control_request_id, dependencies=dependencies
+        ):
+            raise
+        logger.error(
+            "VM upgrade request %s failed before anything was recorded for it; "
+            "refusing it",
+            control_request_id,
+            exc_info=exc,
+        )
+        raise HTTPException(status_code=503, detail=VM_UPGRADE_NOT_RECORDED) from exc
+
+
 async def agent_upgrade_thread_to_vm(
     request: Request,
     thread_id: str,
@@ -1037,9 +1099,29 @@ async def agent_upgrade_thread_to_vm(
     The VM provisions ``template_name``, else the defaults chain's VM template,
     read as the Session's owner (Slice A2b). ``control_request_id`` names the
     stateless lane switch's request (C2); the record then carries the durable
-    seed marker, and every other call records ``upgrade_seed: null``.
+    seed marker, and every other call records ``upgrade_seed: null``. An
+    unexpected error before that request is recorded refuses it
+    (``_refuse_unrecorded_vm_upgrade``).
     """
     await dependencies.require_internal(request)
+    async with _refuse_unrecorded_vm_upgrade(
+        thread_id, control_request_id, dependencies=dependencies
+    ):
+        return await _upgrade_thread_to_vm(
+            thread_id,
+            dependencies=dependencies,
+            template_name=template_name,
+            control_request_id=control_request_id,
+        )
+
+
+async def _upgrade_thread_to_vm(
+    thread_id: str,
+    *,
+    dependencies: ThreadConfigUpdateDependencies,
+    template_name: str | None,
+    control_request_id: str | None,
+) -> dict[str, Any]:
     vm_provisioner = dependencies.vm_provisioner
     thread = await dependencies.store.get_thread(thread_id)
     if not thread:
@@ -1377,45 +1459,49 @@ async def agent_upgrade_thread_to_workspace(
             ),
         )
     if template_name or target_tier is None:
-        thread = await dependencies.store.get_thread(thread_id)
-        if not thread:
-            raise HTTPException(status_code=404, detail="Thread not found")
-        if template_name:
-            # A running Session takes a template only as a VM: container
-            # upgrades are refused inside the agent (Kubernetes hot workspace
-            # upgrades need exact runtime authority). A read-only lookup of
-            # the template's tier follows the lane and protection checks, so
-            # a container template gets its own refusal; the VM path's guards
-            # then run before the template is rendered or anything written.
-            _refuse_stateless_upgrade(thread)
-            metadata = require_unprotected_workspace_upgrade(thread)
-            from orchestrator.services.workspace_defaults_resolution import (
-                CONTAINER_UPGRADE_UNAVAILABLE,
-                find_readable_template,
-                work_owner,
-            )
-            from shared.workspace_defaults import (
-                MODE_RANK,
-                UPGRADE_REFUSED,
-                backend_mode,
-            )
+        # Reads a C2 request makes before the VM request's own guard.
+        async with _refuse_unrecorded_vm_upgrade(
+            thread_id, control_request_id, dependencies=dependencies
+        ):
+            thread = await dependencies.store.get_thread(thread_id)
+            if not thread:
+                raise HTTPException(status_code=404, detail="Thread not found")
+            if template_name:
+                # A running Session takes a template only as a VM: container
+                # upgrades are refused inside the agent (Kubernetes hot workspace
+                # upgrades need exact runtime authority). A read-only lookup of
+                # the template's tier follows the lane and protection checks, so
+                # a container template gets its own refusal; the VM path's guards
+                # then run before the template is rendered or anything written.
+                _refuse_stateless_upgrade(thread)
+                metadata = require_unprotected_workspace_upgrade(thread)
+                from orchestrator.services.workspace_defaults_resolution import (
+                    CONTAINER_UPGRADE_UNAVAILABLE,
+                    find_readable_template,
+                    work_owner,
+                )
+                from shared.workspace_defaults import (
+                    MODE_RANK,
+                    UPGRADE_REFUSED,
+                    backend_mode,
+                )
 
-            owner = await work_owner(dependencies.store, thread.get("user_id"))
-            _, mode = await find_readable_template(
-                dependencies.store,
-                owner,
-                project_id=_thread_project_id(thread),
-                name=template_name,
-            )
-            if mode != "vm":
-                raise HTTPException(409, CONTAINER_UPGRADE_UNAVAILABLE)
-            current = backend_mode(_upgrade_current_backend(thread, metadata))
-            if MODE_RANK[mode] <= MODE_RANK[current]:
-                raise HTTPException(400, UPGRADE_REFUSED)
-            target_tier = "vm"
-        else:
-            current = thread_workspace_backend(thread) or "virtual"
-            target_tier = "sandbox" if current in LITE_BACKENDS else "vm"
+                owner = await work_owner(dependencies.store, thread.get("user_id"))
+                _, mode = await find_readable_template(
+                    dependencies.store,
+                    owner,
+                    project_id=_thread_project_id(thread),
+                    name=template_name,
+                )
+                if mode != "vm":
+                    raise HTTPException(409, CONTAINER_UPGRADE_UNAVAILABLE)
+                current = backend_mode(_upgrade_current_backend(thread, metadata))
+                if MODE_RANK[mode] <= MODE_RANK[current]:
+                    raise HTTPException(400, UPGRADE_REFUSED)
+                target_tier = "vm"
+            else:
+                current = thread_workspace_backend(thread) or "virtual"
+                target_tier = "sandbox" if current in LITE_BACKENDS else "vm"
 
     # vm targets reuse the operator-gated VM provisioning path: it runs the same
     # enforce_workspace_upgrade_grants gate, provisions the VM, and records

@@ -1192,3 +1192,192 @@ class TestVmUpgradeSeedMarker:
             )
         assert refused.value.status_code == 400
         deps.store.merge_thread_vm_context.assert_not_awaited()
+
+
+class TestVmUpgradeFailureBeforeItIsRecorded:
+    """C2 prod gate: an untyped failure of the lane switch's VM request before
+    its provision CAS committed answers the typed 503 the agent reads as a
+    refusal; otherwise the request stays pending and fails again at every
+    drain. Anything recorded, and every other call, keeps its error."""
+
+    REQUEST = TestVmUpgradeSeedMarker.REQUEST
+    PROVISION = "66666666-6666-4666-8666-666666666666"
+    NOT_RECORDED = "SRW couldn't start the VM upgrade. Try again."
+
+    def _session(self, vm=None):
+        metadata: dict[str, Any] = {
+            "config_override": {"workspace": {"backend": "virtual"}}
+        }
+        if vm is not None:
+            metadata["vm"] = vm
+        return _pinned_thread(metadata=metadata)
+
+    def _marker(self, **vm):
+        seed = {"control_request_id": self.REQUEST, "state": "pending", "source": None}
+        return {"upgrade_seed": seed, **vm}
+
+    def _deps(self, *rereads):
+        """The route reads the Session twice; the guard's re-read gets ``rereads``."""
+        deps = _deps(
+            store={
+                "fetchrow": AsyncMock(
+                    return_value={"verb": "upgrade-to-workspace", "outcome": None}
+                )
+            }
+        )
+        session = self._session()
+        deps.store.get_thread = AsyncMock(
+            side_effect=[session, session, *(rereads or (session,))]
+        )
+        return deps
+
+    def _assert_logged(self, caplog, error):
+        [record] = [r for r in caplog.records if r.name == tcu.__name__]
+        assert record.exc_info[1] is error
+
+    def _lock_held_at_each_read(self, deps):
+        held: list[bool] = []
+        locked = False
+
+        @contextlib.asynccontextmanager
+        async def lock(_thread_id):
+            nonlocal locked
+            locked = True
+            try:
+                yield None
+            finally:
+                locked = False
+
+        read = deps.store.get_thread
+
+        async def get_thread(thread_id):
+            held.append(locked)
+            return await read(thread_id)
+
+        deps.store.thread_advisory_lock = lock
+        deps.store.get_thread = get_thread
+        return held
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("step", ["grants", "options"])
+    async def test_an_untyped_failure_before_anything_is_written_is_a_typed_refusal(
+        self, step, monkeypatch, caplog
+    ):
+        boom = RuntimeError("bad row")
+        deps = self._deps()
+        if step == "grants":
+            # A read before the lifecycle lock.
+            deps.enforce_workspace_upgrade_grants.side_effect = boom
+        else:
+            monkeypatch.setattr(
+                tcu, "vm_provisioning_options", AsyncMock(side_effect=boom)
+            )
+        held = self._lock_held_at_each_read(deps)
+        with caplog.at_level("ERROR", logger=tcu.__name__):
+            with pytest.raises(HTTPException) as refused:
+                await tcu.agent_upgrade_thread_to_vm(
+                    MagicMock(),
+                    THREAD,
+                    dependencies=deps,
+                    control_request_id=self.REQUEST,
+                )
+        assert (refused.value.status_code, refused.value.detail) == (
+            503,
+            self.NOT_RECORDED,
+        )
+        assert refused.value.__cause__ is boom
+        self._assert_logged(caplog, boom)
+        # The route's own reads, then the re-read under the lifecycle lock.
+        assert held == ([False, True] if step == "grants" else [False, True, True])
+        deps.store.merge_thread_vm_context.assert_not_awaited()
+        deps.vm_provisioner.create_thread_vm.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_a_marker_whose_provision_cas_never_committed_is_not_recorded(
+        self, caplog
+    ):
+        boom = RuntimeError("provisioner bug")
+        # The pre-CAS merge wrote the marker; the CAS never ran.
+        deps = self._deps(self._session(self._marker()))
+        deps.vm_provisioner.create_thread_vm.side_effect = boom
+        with caplog.at_level("ERROR", logger=tcu.__name__):
+            with pytest.raises(HTTPException) as refused:
+                await tcu.agent_upgrade_thread_to_vm(
+                    MagicMock(),
+                    THREAD,
+                    dependencies=deps,
+                    control_request_id=self.REQUEST,
+                )
+        assert (refused.value.status_code, refused.value.detail) == (
+            503,
+            self.NOT_RECORDED,
+        )
+        self._assert_logged(caplog, boom)
+
+    @pytest.mark.asyncio
+    async def test_a_template_lookup_failure_is_a_typed_refusal(self, monkeypatch):
+        from orchestrator.services import workspace_defaults_resolution
+
+        boom = RuntimeError("bad template row")
+        monkeypatch.setattr(
+            workspace_defaults_resolution,
+            "find_readable_template",
+            AsyncMock(side_effect=boom),
+        )
+        deps = self._deps()
+        with pytest.raises(HTTPException) as refused:
+            await tcu.agent_upgrade_thread_to_workspace(
+                MagicMock(),
+                THREAD,
+                ThreadWorkspaceUpgradeRequest(
+                    target_tier="vm", template="vm-big", control_request_id=self.REQUEST
+                ),
+                dependencies=deps,
+            )
+        assert (refused.value.status_code, refused.value.detail) == (
+            503,
+            self.NOT_RECORDED,
+        )
+        assert refused.value.__cause__ is boom
+        deps.vm_provisioner.create_thread_vm.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_a_failure_after_the_provision_cas_keeps_its_error(self):
+        boom = RuntimeError("NATS publish failed")
+        recorded = self._session(
+            self._marker(status="provisioning", provision_generation=self.PROVISION)
+        )
+        deps = self._deps(recorded)
+        deps.vm_provisioner.create_thread_vm.side_effect = boom
+        with pytest.raises(RuntimeError) as raised:
+            await tcu.agent_upgrade_thread_to_vm(
+                MagicMock(), THREAD, dependencies=deps, control_request_id=self.REQUEST
+            )
+        assert raised.value is boom
+        assert deps.store.get_thread.await_count == 3
+
+    @pytest.mark.asyncio
+    async def test_a_failed_re_read_keeps_the_original_error(self):
+        boom = RuntimeError("provisioner bug")
+        deps = self._deps(OSError("database gone"))
+        deps.vm_provisioner.create_thread_vm.side_effect = boom
+        with pytest.raises(RuntimeError) as raised:
+            await tcu.agent_upgrade_thread_to_vm(
+                MagicMock(), THREAD, dependencies=deps, control_request_id=self.REQUEST
+            )
+        assert raised.value is boom
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("step", ["grants", "provision"])
+    async def test_a_call_without_a_request_id_keeps_its_error(self, step):
+        boom = RuntimeError("bad row")
+        deps = self._deps()
+        if step == "grants":
+            deps.enforce_workspace_upgrade_grants.side_effect = boom
+        else:
+            deps.vm_provisioner.create_thread_vm.side_effect = boom
+        with pytest.raises(RuntimeError) as raised:
+            await tcu.agent_upgrade_thread_to_vm(MagicMock(), THREAD, dependencies=deps)
+        assert raised.value is boom
+        # No re-read: the route's own reads only.
+        assert deps.store.get_thread.await_count == (1 if step == "grants" else 2)

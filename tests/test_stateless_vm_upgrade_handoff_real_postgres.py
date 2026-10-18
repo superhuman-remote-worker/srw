@@ -9,7 +9,7 @@ from __future__ import annotations
 import json
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 from uuid import UUID, uuid4
 
 import pytest
@@ -22,6 +22,8 @@ from agent.api.vm_upgrade_handoff import (
 )
 from orchestrator import main
 from orchestrator.application import controls
+from orchestrator.schemas.thread_config import ThreadWorkspaceUpgradeRequest
+from orchestrator.services import thread_config_update as tcu
 from orchestrator.services import thread_uploads
 from orchestrator.services.agent_thread_status import update_thread_status
 from orchestrator.services.manifest_workspace_selection import (
@@ -45,6 +47,7 @@ from tests import test_stateless_workspace_upgrade_real_postgres as c1
 from tests.test_pinned_vm_initial_binding_real_postgres import _bind_cold_agent
 from tests.test_vm_idle_pinned_session_real_postgres import ready_pinned_thread
 from tests.test_vm_session_retained_resume_real_postgres import retained_resume
+from tests.test_workspace_upgrade_templates_real_postgres import _session_dependencies
 
 actor = c1.actor
 database = c1.database
@@ -924,6 +927,45 @@ async def test_a_pinned_binding_adopts_the_request_and_finalizes_its_started_rec
         admitted.id,
     )
     assert (row["outcome"], row["applied_agent_id"]) == ("applied", bound["agent_id"])
+
+
+@pytest.mark.asyncio
+async def test_a_vm_request_that_fails_before_it_is_recorded_is_a_typed_refusal(
+    database, actor, monkeypatch
+):
+    """Prod gate: a persistent untyped failure before the provision CAS answers
+    the typed 503 the agent finalizes as ``upgrade_refused``. The route records
+    nothing and leaves the request for the agent to finalize."""
+    thread_id, admitted = await switched(database, actor)
+    bound = await _bind_cold_agent(database, thread_id)
+    async with database.acquire() as conn:
+        async with conn.transaction():
+            await adopt_next_pinned_control_request(conn, **_owner(bound))
+    boom = RuntimeError("bad row")
+    monkeypatch.setattr(tcu, "vm_provisioning_options", AsyncMock(side_effect=boom))
+
+    with pytest.raises(HTTPException) as refused:
+        await tcu.agent_upgrade_thread_to_workspace(
+            MagicMock(),
+            str(thread_id),
+            ThreadWorkspaceUpgradeRequest(
+                target_tier="vm", control_request_id=admitted.id
+            ),
+            dependencies=_session_dependencies(database),
+        )
+
+    assert (refused.value.status_code, refused.value.detail) == (
+        503,
+        "SRW couldn't start the VM upgrade. Try again.",
+    )
+    assert refused.value.__cause__ is boom
+    after = await database.get_thread(thread_id)
+    assert after["execution_lane"] == "pinned"
+    assert "vm" not in metadata(after)
+    [request] = await upgrade_requests(database, thread_id)
+    assert request["id"] == admitted.id
+    assert request["outcome"] is None
+    assert request["accepted_agent_id"] == bound["agent_id"]
 
 
 async def end_session(

@@ -27,7 +27,10 @@ from shared.workspace_recovery import (
     WorkspaceRecoveryCode,
     WorkspaceRecoveryDisposition,
 )
-from shared.workspace_upgrade import VM_PROVISIONING_NOT_AVAILABLE
+from shared.workspace_upgrade import (
+    VM_PROVISIONING_NOT_AVAILABLE,
+    VM_UPGRADE_NOT_RECORDED,
+)
 from shared.subagent_parent_authority import (
     ParentExecutionAuthority,
     ParentExecutionAuthorityRefused,
@@ -1848,8 +1851,10 @@ class OrchestratorClient:
         """Ask for the VM a stateless lane switch's request names (C2).
 
         ``(accepted, status, detail)``. ``accepted`` is True on a 200 and
-        False on a refusal: a 4xx, or the typed 503 that says VM provisioning
-        is off (``VM_PROVISIONING_NOT_AVAILABLE``); ``detail`` is then the
+        False on a refusal: a 4xx, or one of the two typed 503s, which say
+        VM provisioning is off (``VM_PROVISIONING_NOT_AVAILABLE``) or that an
+        unexpected error stopped the request before anything was recorded for
+        it (``VM_UPGRADE_NOT_RECORDED``); ``detail`` is then the
         orchestrator's text, or the message/code of a typed refusal. It is
         None when the outcome is unknown: no HTTP answer (``status`` None) or
         any other 5xx, which can arrive after the provision CAS committed. The
@@ -1885,7 +1890,10 @@ class OrchestratorClient:
         if isinstance(detail, dict):
             detail = detail.get("message") or detail.get("code")
         text = str(detail) if detail else None
-        if response.status_code >= 500 and text != VM_PROVISIONING_NOT_AVAILABLE:
+        if response.status_code >= 500 and text not in (
+            VM_PROVISIONING_NOT_AVAILABLE,
+            VM_UPGRADE_NOT_RECORDED,
+        ):
             logger.warning(
                 "VM upgrade request for control %s has no definite answer: %s %s",
                 control_request_id,
