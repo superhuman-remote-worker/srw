@@ -92,7 +92,16 @@ export default defineConfig({
 				},
 				{
 					label: 'Operations',
-					items: ['versioning', 'security-model', 'troubleshooting'],
+					items: [
+						'versioning',
+						{
+							label: 'Release notes',
+							link: `${REPO_URL}/releases`,
+							attrs: { target: '_blank', rel: 'noopener' },
+						},
+						'security-model',
+						'troubleshooting',
+					],
 				},
 				{
 					label: 'Reference',
