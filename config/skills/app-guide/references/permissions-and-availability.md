@@ -157,8 +157,9 @@ the old storage). If VMs are off
 the request is refused with "VM workspaces aren't available on this
 installation." If the upgrade fails or is interrupted, the chat says so and
 your files stay in the old storage: the session keeps working until its agent
-restarts, then End it and start a new one. Only one upgrade runs at a time, and
-nothing moves back down.
+restarts, then End it and start a new one. Ending the session before its VM is
+requested cancels the upgrade; after Resume, ask for it again. Only one upgrade
+runs at a time, and nothing moves back down.
 
 Workspace changes are upgrade-only: to move down to Virtual or None, start a
 new session. A workspace upgrade does not automatically enable a missing tool
