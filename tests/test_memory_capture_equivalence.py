@@ -2,10 +2,9 @@
 
 Each legacy extraction/curation call site is reproduced verbatim below
 (gates + kwarg shapes + state-advance semantics) and run against the same
-spied `extract_and_store_memories` / `assemble_memories` /
-`recall_store.store` as the writer driven by CaptureEvents — the await
-lists must be identical. Gates use the REAL `_should_extract_memories` /
-`_should_assemble_memories` and REAL loader configs (the B1 lesson:
+spied `extract_and_store_memories` / `recall_store.store` as the writer
+driven by CaptureEvents — the await lists must be identical. Gates use the
+REAL `_should_extract_memories` and REAL loader configs (the B1 lesson:
 MagicMock-fabricated config attrs are how the persistent extraction bug
 hid for months).
 
@@ -29,10 +28,7 @@ from shared.runtime.core.loader import (
     MemoryConfig,
     MemoryPipelineConfig,
 )
-from shared.runtime.services.auxiliary import (
-    _should_assemble_memories,
-    _should_extract_memories,
-)
+from shared.runtime.services.auxiliary import _should_extract_memories
 from agent.services.memory import (
     CaptureEvent,
     MemoryManager,
@@ -41,7 +37,6 @@ from agent.services.memory import (
 )
 from agent.services.memory.plugins.legacy_writers import (
     CompactionMemoryWriter,
-    MemoryAssembler,
     PersistentIntervalExtractor,
     PhaseBoundaryExtractor,
     PreCompactionExtractor,
@@ -51,7 +46,6 @@ from agent.services.memory.plugins.legacy_writers import (
 )
 
 EXTRACTION_PROMPT = "EXTRACTION PROMPT"
-ASSEMBLER_PROMPT = "ASSEMBLER PROMPT"
 
 
 @pytest.fixture
@@ -61,19 +55,11 @@ def extract_spy(monkeypatch):
     return spy
 
 
-@pytest.fixture
-def assemble_spy(monkeypatch):
-    spy = AsyncMock(return_value=None)
-    monkeypatch.setattr(auxiliary_module, "assemble_memories", spy)
-    return spy
-
-
-def make_aux_config(enabled=True, extract=True, assemble=True):
+def make_aux_config(enabled=True, extract=True):
     return AuxiliaryConfig(
         enabled=enabled,
         tasks={
             "extract_memories": AuxiliaryTaskConfig(enabled=extract),
-            "assemble_memories": AuxiliaryTaskConfig(enabled=assemble),
             "curate_knowledge": AuxiliaryTaskConfig(enabled=True),
         },
     )
@@ -83,12 +69,9 @@ def make_runtime(
     recall_store="store",
     auxiliary_llm="aux-llm",
     observer_interval=5,
-    assembler_interval=7,
     aux_enabled=True,
     extract_enabled=True,
-    assemble_enabled=True,
     extraction_prompt=EXTRACTION_PROMPT,
-    assembler_prompt=ASSEMBLER_PROMPT,
 ):
     return MemoryRuntime(
         recall_store=recall_store,
@@ -96,13 +79,9 @@ def make_runtime(
         memory_config=MemoryConfig(
             enabled=True,
             observer_interval=observer_interval,
-            assembler_interval=assembler_interval,
         ),
-        auxiliary_config=make_aux_config(
-            enabled=aux_enabled, extract=extract_enabled, assemble=assemble_enabled
-        ),
+        auxiliary_config=make_aux_config(enabled=aux_enabled, extract=extract_enabled),
         extraction_prompt=extraction_prompt,
-        assembler_prompt=assembler_prompt,
     )
 
 
@@ -110,13 +89,12 @@ def make_messages():
     return [HumanMessage(content="do the thing"), AIMessage(content="done")]
 
 
-def turn_event(turn, messages, phase=2, injection_text=""):
+def turn_event(turn, messages, phase=2):
     return CaptureEvent(
         kind="turn_end",
         messages=messages,
         phase=phase,
         turn_count=turn,
-        extra={"current_injection_text": injection_text},
     )
 
 
@@ -134,12 +112,10 @@ async def run_legacy_worker_turn(
     memory_config,
     messages,
     phase,
-    memory_block_text="",
 ):
-    """graph.py:1528-1606 — one execute-node turn's extraction + assembly."""
+    """graph.py:1528-1606 — one execute-node turn's extraction."""
     new_turn_count = state.get("turn_count", 0) + 1
     extraction_triggered = False
-    assembly_triggered = False
 
     if (
         recall_store
@@ -162,31 +138,9 @@ async def run_legacy_worker_turn(
                 source_turn_end=new_turn_count,
             )
 
-    if (
-        recall_store
-        and config_auxiliary.enabled
-        and config_auxiliary.tasks.get("assemble_memories", None)
-        and config_auxiliary.tasks["assemble_memories"].enabled
-        and ASSEMBLER_PROMPT
-    ):
-        last_assembled = state.get("last_assembled_turn", 0)
-        if _should_assemble_memories(
-            new_turn_count, memory_config.assembler_interval, last_assembled
-        ):
-            assembly_triggered = True
-            await auxiliary_module.assemble_memories(
-                auxiliary_llm=auxiliary_llm,
-                recall_store=recall_store,
-                messages=messages,
-                current_injection_text=memory_block_text,
-                memory_assembler_prompt=ASSEMBLER_PROMPT,
-            )
-
     state["turn_count"] = new_turn_count
     if extraction_triggered:
         state["last_observed_turn"] = new_turn_count
-    if assembly_triggered:
-        state["last_assembled_turn"] = new_turn_count
 
 
 async def run_legacy_persistent_turn(
@@ -253,9 +207,7 @@ async def run_legacy_teardown(*, recall_store, auxiliary_llm, messages):
 
 class TestWorkerIntervalParity:
     @pytest.mark.asyncio
-    async def test_call_sequence_matches_legacy_over_twelve_turns(
-        self, extract_spy, assemble_spy
-    ):
+    async def test_call_sequence_matches_legacy_over_twelve_turns(self, extract_spy):
         messages = make_messages()
         runtime = make_runtime()
 
@@ -452,60 +404,6 @@ class TestTeardownParity:
 
 
 # ---------------------------------------------------------------------------
-# Assembler parity (combined worker turn loop)
-# ---------------------------------------------------------------------------
-
-
-class TestAssemblerParity:
-    @pytest.mark.asyncio
-    async def test_combined_worker_loop_matches_legacy(self, extract_spy, assemble_spy):
-        messages = make_messages()
-        runtime = make_runtime()
-
-        state = {"turn_count": 0}
-        for turn in range(1, 15):
-            await run_legacy_worker_turn(
-                state,
-                recall_store=runtime.recall_store,
-                auxiliary_llm=runtime.auxiliary_llm,
-                config_auxiliary=runtime.auxiliary_config,
-                memory_config=runtime.memory_config,
-                messages=messages,
-                phase=2,
-                memory_block_text=f"block@{turn}",
-            )
-        legacy_extracts = list(extract_spy.await_args_list)
-        legacy_assembles = list(assemble_spy.await_args_list)
-        extract_spy.reset_mock()
-        assemble_spy.reset_mock()
-
-        shared_runtime = make_runtime()
-        extractor = WorkerIntervalExtractor(shared_runtime)
-        assembler = MemoryAssembler(shared_runtime)
-        for turn in range(1, 15):
-            event = turn_event(turn, messages, injection_text=f"block@{turn}")
-            await extractor.on_event(event)
-            await assembler.on_event(event)
-
-        assert extract_spy.await_args_list == legacy_extracts
-        assert assemble_spy.await_args_list == legacy_assembles
-
-        # assembler fires at 7 and 14 with the per-turn injection text
-        assert len(legacy_assembles) == 2
-        assert legacy_assembles[0].kwargs["current_injection_text"] == "block@7"
-        assert legacy_assembles[1].kwargs["current_injection_text"] == "block@14"
-        assert legacy_assembles[0].kwargs["memory_assembler_prompt"] == ASSEMBLER_PROMPT
-
-    @pytest.mark.asyncio
-    async def test_no_prompt_or_disabled_task_never_fires(self, assemble_spy):
-        writer = MemoryAssembler(make_runtime(assembler_prompt=""))
-        await writer.on_event(turn_event(7, make_messages()))
-        writer_disabled = MemoryAssembler(make_runtime(assemble_enabled=False))
-        await writer_disabled.on_event(turn_event(7, make_messages()))
-        assemble_spy.assert_not_awaited()
-
-
-# ---------------------------------------------------------------------------
 # Compaction + queued-memory writers (direct store sites)
 # ---------------------------------------------------------------------------
 
@@ -588,21 +486,17 @@ class TestRegistrationAndDispatch:
             "phase_boundary_extractor",
             "pre_compaction_extractor",
             "teardown_extractor",
-            "memory_assembler",
             "compaction_memory",
             "queued_memory",
         ):
             assert name in writers
 
     @pytest.mark.asyncio
-    async def test_manager_capture_routes_by_kind(self, extract_spy, assemble_spy):
+    async def test_manager_capture_routes_by_kind(self, extract_spy):
         cfg = MemoryConfig(
             enabled=True,
             observer_interval=5,
-            assembler_interval=7,
-            pipeline=MemoryPipelineConfig(
-                writers=["interval_extractor", "memory_assembler"]
-            ),
+            pipeline=MemoryPipelineConfig(writers=["interval_extractor"]),
         )
         runtime = make_runtime()
         runtime.memory_config = cfg
@@ -610,14 +504,34 @@ class TestRegistrationAndDispatch:
 
         await manager.capture(turn_event(5, make_messages()))
         extract_spy.assert_awaited_once()
-        assemble_spy.assert_not_awaited()
 
-        # phase_boundary reaches neither of these two writers
+        # phase_boundary does not reach the interval writer
         extract_spy.reset_mock()
         await manager.capture(
             CaptureEvent(kind="phase_boundary", messages=make_messages(), phase=1)
         )
         extract_spy.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_a_retired_writer_name_is_skipped(self, extract_spy, caplog):
+        # A frozen config (a resumed job's resolved_config) still lists the
+        # removed memory assembler; binding skips it instead of failing.
+        cfg = MemoryConfig(
+            enabled=True,
+            observer_interval=5,
+            pipeline=MemoryPipelineConfig(
+                writers=["interval_extractor", "memory_assembler"]
+            ),
+        )
+        runtime = make_runtime()
+        runtime.memory_config = cfg
+        with caplog.at_level("WARNING"):
+            manager = MemoryManager.from_config(cfg, runtime)
+
+        assert manager.pipeline_summary()["writers"] == ["interval_extractor"]
+        assert "memory_assembler" in caplog.text
+        await manager.capture(turn_event(5, make_messages()))
+        extract_spy.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_writer_failure_contained_by_manager(self, extract_spy):

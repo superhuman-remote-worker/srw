@@ -44,7 +44,10 @@ import time
 import uuid
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Set, Tuple
 
-from agent.services.memory.registry import resolve_memory_plugin
+from agent.services.memory.registry import (
+    RETIRED_MEMORY_PLUGINS,
+    resolve_memory_plugin,
+)
 from agent.services.memory.types import (
     PREFETCH_CANCELLED,
     PREFETCH_DEGRADED,
@@ -262,7 +265,8 @@ class MemoryManager:
 
         Raises:
             UnknownMemoryPluginError: a configured name isn't registered —
-                misconfiguration fails at bind time, not mid-turn.
+                misconfiguration fails at bind time, not mid-turn. A name in
+                ``RETIRED_MEMORY_PLUGINS`` is skipped with a warning instead.
         """
         pipeline = getattr(cfg, "pipeline", None)
         if runtime.memory_config is None:
@@ -271,6 +275,15 @@ class MemoryManager:
         def _bind(kind: str, names: List[str]) -> List[NamedPlugin]:
             bound: List[NamedPlugin] = []
             for name in names:
+                retired = RETIRED_MEMORY_PLUGINS.get((kind, name))
+                if retired is not None:
+                    logger.warning(
+                        "memory.pipeline %s '%s' is retired and skipped: %s",
+                        kind,
+                        name,
+                        retired,
+                    )
+                    continue
                 spec = resolve_memory_plugin(kind, name)
                 bound.append((name, spec.factory(runtime)))
             return bound

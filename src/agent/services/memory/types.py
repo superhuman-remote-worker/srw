@@ -113,8 +113,7 @@ class CaptureEvent:
     turn_start: Optional[int] = None
     turn_end: Optional[int] = None
     #: Call-site extras that don't warrant a field yet (compaction passes
-    #: {"summary": ...}, todo_complete {"queued_memories": [...]},
-    #: turn_end {"current_injection_text": ...} for the assembler).
+    #: {"summary": ...}, todo_complete {"queued_memories": [...]}).
     extra: Dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
@@ -386,12 +385,11 @@ class MemoryRuntime:
     auxiliary_llm: Any = None
     memory_config: Any = None  # src.core.loader.MemoryConfig
     #: src.core.loader.AuxiliaryConfig — the legacy worker call sites gate
-    #: extraction/assembly on auxiliary.enabled + tasks[...].enabled.
+    #: extraction on auxiliary.enabled + tasks[...].enabled.
     auxiliary_config: Any = None
     #: Read at event time, not bind time — persistent sessions re-resolve
     #: the extraction prompt on config.update (B1 fix) by mutating this.
     extraction_prompt: Optional[str] = None
-    assembler_prompt: Optional[str] = None
     job_id: Optional[str] = None
     #: The expert's agent id; the manager's own audit rows carry it (the
     #: append_only retrieval reports a degraded pipeline itself, D13).

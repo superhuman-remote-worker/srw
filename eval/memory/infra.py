@@ -221,7 +221,6 @@ def build_manager(
     job_id: uuid.UUID,
     project_id: uuid.UUID,
     knowledge_store: Optional[Any] = None,
-    assembler_prompt: Optional[str] = None,
 ) -> Any:
     """Bind the arm's memory.pipeline exactly like a persistent session.
 
@@ -245,7 +244,6 @@ def build_manager(
             memory_config=config.memory,
             auxiliary_config=config.auxiliary,
             extraction_prompt=extraction_prompt,
-            assembler_prompt=assembler_prompt,
             job_id=str(job_id),
             project_id=str(project_id),
             project_ids=[str(project_id)],

@@ -153,8 +153,6 @@ auxiliary:
       enabled: false
     curate_knowledge:
       enabled: false
-    assemble_memories:
-      enabled: false
     verify_citations:
       enabled: false
 

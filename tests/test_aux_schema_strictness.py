@@ -43,7 +43,6 @@ def _dummy_for(name: str, annotation: Any) -> Any:
         "existing_notes",
         "stale_notes",
         "related_notes",
-        "assembler_tools",
         "kb_tools",
     }:
         return []

@@ -202,7 +202,6 @@ class TestPipelineDefaults:
             "interval_extractor",
             "phase_boundary_extractor",
             "pre_compaction_extractor",
-            "memory_assembler",
             "compaction_memory",
             "queued_memory",
         ]
@@ -319,8 +318,6 @@ class TestWorkerConstruction:
         # Matrix-resolved prompts threaded from the graph factory
         assert isinstance(runtime.extraction_prompt, str)
         assert runtime.extraction_prompt
-        assert isinstance(runtime.assembler_prompt, str)
-        assert runtime.assembler_prompt
         assert runtime.job_id == workspace_manager.job_id
         # GATE B: ingestion is on in the defaults, so the verdict service
         # attaches to the store during construction.
@@ -393,7 +390,6 @@ class TestPersistentConstruction:
         assert runtime.knowledge_store is session.knowledge_store
         assert runtime.auxiliary_llm is aux_marker
         assert runtime.extraction_prompt == "EXTRACT-PROMPT"
-        assert runtime.assembler_prompt is None  # persistent: no assembler
         assert runtime.retrieval_timeout == 5.0  # legacy per-call guard
         assert runtime.job_id == session.thread_id
         assert runtime.project_ids == []
@@ -436,7 +432,6 @@ def _make_execute_node(config, workspace_manager, todo_manager, ctx, service, mg
         auxiliary_llm=MagicMock(),
         summarization_prompt="summarize",
         memory_extraction_prompt="extract",
-        memory_assembler_prompt="assemble",
         tool_context=ctx,
         tool_names=None,
         memory_service=service,
@@ -892,11 +887,10 @@ class TestWorkerExecuteWiring:
         event = service.captures[0]
         assert event.turn_count == 1
         assert event.phase == 2
-        assert event.extra["current_injection_text"] == "MEMBLOCK"
+        assert event.extra == {}
 
         # -- interval state stays writer-internal (no checkpointed keys)
         assert "last_observed_turn" not in result
-        assert "last_assembled_turn" not in result
         assert result["turn_count"] == 1
 
     @pytest.mark.asyncio

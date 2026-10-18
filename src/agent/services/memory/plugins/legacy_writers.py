@@ -9,7 +9,6 @@ verbatim reproduction of its legacy call site.
 
 Site → writer map (line refs as of 2026-06-11):
 - graph.py:1528-1563 worker in-loop extraction      → interval_extractor
-- graph.py:1565-1595 worker TTL assembler           → memory_assembler
 - graph.py:2037-2054 worker phase-boundary          → phase_boundary_extractor
 - graph.py:842-860   worker compaction-summary      → compaction_memory
 - graph.py:3438-3444 worker queued-memory drain     → queued_memory
@@ -254,53 +253,6 @@ class TeardownExtractor:
             logger.info("Final memory extraction complete")
 
 
-class MemoryAssembler:
-    """TTL curation — the assembler (graph.py:1565-1595), worker-only via
-    the per-mode pipeline YAML (persistent config honesty-fixed to
-    enabled:false 2026-06-10; wire-vs-retire is Phase 5's ablation).
-
-    Reads the currently-injected memory block from
-    event.extra["current_injection_text"].
-    """
-
-    event_kinds: FrozenSet[str] = frozenset({"turn_end"})
-
-    def __init__(self, runtime: MemoryRuntime) -> None:
-        self.runtime = runtime
-        self._last_assembled_turn = 0
-
-    async def on_event(self, event: CaptureEvent) -> None:
-        runtime = self.runtime
-        if runtime.recall_store is None or runtime.memory_config is None:
-            return
-        if not _aux_task_enabled(runtime, "assemble_memories"):
-            return
-        if not runtime.assembler_prompt:
-            return
-
-        from shared.runtime.services.auxiliary import (
-            _should_assemble_memories,
-            assemble_memories,
-        )
-
-        if not _should_assemble_memories(
-            event.turn_count,
-            runtime.memory_config.assembler_interval,
-            self._last_assembled_turn,
-        ):
-            return
-
-        self._last_assembled_turn = event.turn_count
-
-        await assemble_memories(
-            auxiliary_llm=runtime.auxiliary_llm,
-            recall_store=runtime.recall_store,
-            messages=event.messages,
-            current_injection_text=event.extra.get("current_injection_text", ""),
-            memory_assembler_prompt=runtime.assembler_prompt,
-        )
-
-
 class CompactionMemoryWriter:
     """Store the compaction summary as a free-source memory
     (graph.py:842-860). Expects event.extra["summary"].
@@ -397,15 +349,6 @@ def _build_pre_compaction_extractor(runtime: MemoryRuntime) -> PreCompactionExtr
 )
 def _build_teardown_extractor(runtime: MemoryRuntime) -> TeardownExtractor:
     return TeardownExtractor(runtime)
-
-
-@register_memory_plugin(
-    "writer",
-    "memory_assembler",
-    description="TTL curation assembler (worker-only today; Phase-5 ablation candidate)",
-)
-def _build_memory_assembler(runtime: MemoryRuntime) -> MemoryAssembler:
-    return MemoryAssembler(runtime)
 
 
 @register_memory_plugin(

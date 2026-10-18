@@ -138,16 +138,23 @@ _POST_SPLIT_OVERLAY_REMOVALS: dict[str, tuple[str, ...]] = {
     # dispatch and the loader default is None, so the key left both overlays.
     # Per-turn tool-result clearing was retired (it broke the prompt cache
     # every turn), so its window key left the shared root.
+    # Append-only context injection WP6 (D37): the memory assembler was
+    # removed, so its interval and its auxiliary task left the shared root
+    # (and the worker overlay's enable).
     "worker": (
         "limits.tool_category_timeouts.delegation",
         "workspace.backend",
         "memory.reranker.model",
         "context_management.keep_recent_tool_results",
+        "memory.assembler_interval",
+        "auxiliary.tasks.assemble_memories",
     ),
     "session": (
         "workspace.backend",
         "memory.reranker.model",
         "context_management.keep_recent_tool_results",
+        "memory.assembler_interval",
+        "auxiliary.tasks.assemble_memories",
     ),
 }
 #: Keys whose overlay VALUE changed after the baseline was frozen (role ->
@@ -158,7 +165,9 @@ _POST_SPLIT_OVERLAY_CHANGES: dict[str, tuple[str, ...]] = {
     # Website demo findings F10 (2026-10-11): a session's browser runs in its
     # own workspace container, so the session overlay opens localhost as the
     # worker overlay does (only cloud metadata stays blocked).
-    "worker": (),
+    # Append-only context injection WP6 (D37): the worker's writer list lost
+    # memory_assembler.
+    "worker": ("memory.pipeline.writers",),
     "session": ("browser.security.blocked_domains",),
 }
 #: Tool names later work packages added to a tool CATEGORY on top of the

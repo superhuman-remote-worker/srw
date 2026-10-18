@@ -72,8 +72,8 @@ class TestAuxHealth:
 
     def test_snapshot_records_last_error(self):
         h = AuxHealth()
-        h.record_failure("memory_assembly", ValueError("bad json"))
-        t = h.snapshot()["tasks"]["memory_assembly"]
+        h.record_failure("knowledge_curation", ValueError("bad json"))
+        t = h.snapshot()["tasks"]["knowledge_curation"]
         assert t["failures"] == 1
         assert t["consecutive_failures"] == 1
         assert t["last_error_type"] == "ValueError"

@@ -17,7 +17,7 @@
 #
 # Where the two old bases disagreed on a shared key, this file holds the
 # conservative value and the overlay that wants the other value restates it
-# (llm.max_retries, memory budgets, browser blocklist, assemble_memories).
+# (llm.max_retries, memory budgets, browser blocklist).
 # Role-only keys (instruction_files, phase_settings, delegation, autonomy,
 # verification, scholar, curator, communication, canvas grants, ...) live in
 # the overlays, never here.
@@ -265,7 +265,6 @@ memory:
   max_memories_per_injection: 50   # Cap on number of memories injected; the session overlay raises it
   max_memories_per_entry: 5        # context_management.injection_mode append_only: new/changed memories per appended entry; the rest drip in on later requests (D29)
   observer_interval: 5             # Run observer every N turns
-  assembler_interval: 7            # Run assembler every N turns (TTL curation)
   default_ttl: 10                  # Default TTL in turns for new memories (guaranteed injection)
   importance_threshold: 0.3        # Minimum importance to store
   dedup_threshold: 0.85            # Cosine similarity threshold for dedup
@@ -292,8 +291,8 @@ memory:
       - bounded                      # cap the survivors at max_items
     extensions:
       - memory_search                # the memory_search tool (tools.memory): hybrid search + the scorers/policies above, or one memory by handle
-    # `writers` is role-owned: the worker's in-loop / phase-boundary / assembler
-    # set versus the session's elapsed-gate / teardown set. Each overlay
+    # `writers` is role-owned: the worker's in-loop / phase-boundary set
+    # versus the session's elapsed-gate / teardown set. Each overlay
     # declares its own.
   # Phase-3+4 production-candidate stack, flipped on for the dev rollout
   # (GATE B — knowledge-base/knowledge/features/agent_memory_overhaul.md). Harness-measured:
@@ -360,11 +359,6 @@ auxiliary:
       enabled: true
       # The worker overlay turns on `verdict` (adjudicate each curator write
       # against existing notes) — it fires only where the curator runs.
-    assemble_memories:
-      # Worker-only: no persistent code path calls assemble_memories
-      # (knowledge-base/knowledge/issues/memory_bugs.md B3). The worker overlay
-      # enables it; everything else keeps it off.
-      enabled: false
     # Citation verification (citation engine Phase 2): cite_* returns 'pending'
     # and the verifier writes the verdict back async on the citation model
     # (CITATION_LLM_*, dispatched per job) or the auxiliary model fallback.

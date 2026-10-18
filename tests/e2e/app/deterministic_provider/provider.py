@@ -1730,7 +1730,6 @@ _MODELLED_SCHEMAS: Final = frozenset(
         None,
         "ConversationTitle",
         "ExtractedMemories",
-        "AssemblyResult",
         "ConversationCheckpoint",
         "CurationResult",
         "KnowledgeAssemblyResult",
@@ -1788,22 +1787,6 @@ def _structured_content(schema_name: str, run_id: str) -> str:
         )
     if schema_name == "ExtractedMemories":
         return '{"memories":[]}'
-    if schema_name == "AssemblyResult":
-        # Memory Light's assembler (`AssembleMemoriesTask`) runs as a
-        # non-blocking auxiliary task during any sufficiently long worker job.
-        # It is not part of any scenario's assertion, but leaving its schema
-        # unmodelled made every worker run record two `unexpected_schema`
-        # rejections that the agent then logged as "Memory assembly failed
-        # (non-fatal)" — real degradation, and noise that hides a genuine
-        # unexpected call. A no-op review is the honest deterministic answer.
-        return json.dumps(
-            {
-                "actions_taken": [],
-                "gaps_identified": [],
-                "summary": f"E2E-{run_id} deterministic no-op assembly review.",
-            },
-            separators=(",", ":"),
-        )
     if schema_name == "ConversationCheckpoint":
         # Context compaction (`SummarizeTask`) folds a long worker conversation
         # into a Markdown checkpoint. Answering it with a scenario reply would

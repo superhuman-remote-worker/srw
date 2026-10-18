@@ -344,7 +344,6 @@ def _make_node(env, llm, **overrides):
         auxiliary_llm=MagicMock(),
         summarization_prompt="summarize",
         memory_extraction_prompt="extract",
-        memory_assembler_prompt="assemble",
         tool_context=env["ctx"],
         tool_names=None,
         memory_service=env["service"],
@@ -1427,11 +1426,10 @@ class TestAppendOnlyLayout:
         assert ctx.thresholds_seen == [(original - system, original - system)]
 
     @pytest.mark.asyncio
-    async def test_archive_audit_and_assembler_text(self, append_env):
+    async def test_archive_and_memory_inject_audit(self, append_env):
         """The archiver gets the folded request (llm_requests) and the
         unfolded history (the chat delta, §D 7c); memory_inject carries the
-        appended / already-present counts; the assembler's
-        current_injection_text is the memory entries the history holds."""
+        appended / already-present counts."""
         import asyncio
 
         env = append_env
@@ -1484,11 +1482,6 @@ class TestAppendOnlyLayout:
             (1, 2, 0),
             (1, 0, 2),
         ]
-
-        turn_ends = [e for e in env["service"].captures if e.kind == "turn_end"]
-        assert [e.extra["current_injection_text"] for e in turn_ends] == [
-            first_entries[0].content
-        ] * 2
 
 
 # ---------------------------------------------------------------------------

@@ -317,7 +317,7 @@ class LLMArchiver:
             tool_schemas: Tool definition schemas sent to the LLM (OpenAI format)
             model_kwargs: Model parameters (temperature, tool_choice, etc.)
             call_type: Type of call ("main", "summarization", "memory_extraction",
-                       "memory_assembly", "knowledge_curation", "vision")
+                       "knowledge_curation", "vision")
             auxiliary_metadata: Optional call-type-specific context (task class,
                                trigger, iteration count, etc.)
             history_messages: The request before the carrier fold

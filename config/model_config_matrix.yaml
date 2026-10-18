@@ -49,7 +49,6 @@ default:
     persona: persona.txt
     summarization: summarization_prompt.txt
     memory_extraction: memory_extraction_prompt.txt
-    memory_assembler: memory_assembler_prompt.txt
     curation: curation_prompt.txt
     knowledge_assembler: knowledge_assembler_prompt.txt
     citation_verification: citation_verification_prompt.txt
@@ -202,7 +201,7 @@ o-series:
 #
 # Prompts: forks the every-call scaffold (`systemprompt` + `systemprompt_interactive`),
 # the identity (`persona`), and the auxiliary-path prompts (`memory_extraction`,
-# `memory_assembler`, `curation`). The aux trio is forked because V4 Flash is wired
+# `curation`). The aux pair is forked because V4 Flash is wired
 # as the auxiliary model, so those background tasks actually run on DeepSeek and want
 # terse, structured-only output (the `<deepseek_output_contract>` block). The shared
 # behavioral tuning — output-length discipline (V4's signature verbosity) and
@@ -222,7 +221,6 @@ deepseek:
     systemprompt_interactive: systemprompt_interactive_deepseek.txt
     # Auxiliary-path (memory + knowledge), loaded when V4 Flash is the aux model
     memory_extraction: memory_extraction_prompt_deepseek.txt
-    memory_assembler: memory_assembler_prompt_deepseek.txt
     curation: curation_prompt_deepseek.txt
   guardrails:
     file: deepseek.yaml
@@ -847,7 +845,6 @@ gpt-5:
     # (XML-tagged, structured-output aware). Loaded when an aux model in this
     # family runs background tasks (e.g. gpt-5.4-mini as the auxiliary model).
     memory_extraction: memory_extraction_prompt_gpt_5.txt
-    memory_assembler: memory_assembler_prompt_gpt_5.txt
     curation: curation_prompt_gpt_5.txt
   guardrails:
     file: gpt_5.yaml
@@ -886,7 +883,6 @@ gpt-5.6:
     persona: persona_gpt_5.txt
     summarization: summarization_prompt_gpt_5.txt
     memory_extraction: memory_extraction_prompt_gpt_5.txt
-    memory_assembler: memory_assembler_prompt_gpt_5.txt
     curation: curation_prompt_gpt_5.txt
   guardrails:
     file: gpt_5_6.yaml
@@ -940,7 +936,6 @@ gpt-6:
     persona: persona_gpt_5.txt
     summarization: summarization_prompt_gpt_5.txt
     memory_extraction: memory_extraction_prompt_gpt_5.txt
-    memory_assembler: memory_assembler_prompt_gpt_5.txt
     curation: curation_prompt_gpt_5.txt
   guardrails:
     file: gpt_6.yaml
@@ -974,7 +969,6 @@ gpt-6.1-sol:
     persona: persona_gpt_6_1_sol.txt
     summarization: summarization_prompt_gpt_5.txt
     memory_extraction: memory_extraction_prompt_gpt_5.txt
-    memory_assembler: memory_assembler_prompt_gpt_5.txt
     curation: curation_prompt_gpt_5.txt
   guardrails:
     file: gpt_6.yaml
@@ -999,7 +993,6 @@ codex:
     summarization: summarization_prompt_gpt_5.txt
     # Shared with the gpt-5 family — codex aliases gpt-5 for prompts.
     memory_extraction: memory_extraction_prompt_gpt_5.txt
-    memory_assembler: memory_assembler_prompt_gpt_5.txt
     curation: curation_prompt_gpt_5.txt
   guardrails:
     file: codex.yaml
@@ -1044,7 +1037,6 @@ gpt-oss:
     persona: persona_gpt_oss.txt
     summarization: summarization_prompt_gpt_oss.txt
     memory_extraction: memory_extraction_prompt_gpt_oss.txt
-    memory_assembler: memory_assembler_prompt_gpt_oss.txt
     curation: curation_prompt_gpt_oss.txt
   instructions:
     instructions: instructions_gpt_oss.md
@@ -1098,7 +1090,6 @@ gemma:
     summarization: summarization_prompt_gemma.txt
     # Auxiliary-path variants (anti-repetition; mitigate vllm#40080)
     memory_extraction: memory_extraction_prompt_gemma.txt
-    memory_assembler: memory_assembler_prompt_gemma.txt
     curation: curation_prompt_gemma.txt
   instructions:
     # instructions.md is loaded into agent context every turn — its tool-call

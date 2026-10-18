@@ -61,7 +61,6 @@ DEFAULT_WRITERS = [
     "interval_extractor",
     "phase_boundary_extractor",
     "pre_compaction_extractor",
-    "memory_assembler",
     "compaction_memory",
     "queued_memory",
 ]

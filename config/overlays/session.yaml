@@ -67,7 +67,7 @@ memory:
   max_memories_per_injection: 150
   # Persistent mode has its own writer set: the elapsed-gate interval
   # extractor and the session_end/idle_archive teardown extractor (no
-  # assembler, no phases).
+  # phases).
   pipeline:
     writers:
       - persistent_interval_extractor  # In-loop observer (elapsed gate)

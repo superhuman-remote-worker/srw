@@ -200,7 +200,6 @@ class UniversalAgentState(TypedDict):
     turn_count: int  # LLM call counter (for memory extraction interval)
     phase_instruction_injections: List[str]  # Once-per-phase delivery ledger
     last_observed_turn: int  # Last turn when memory extraction ran
-    last_assembled_turn: int  # Last turn when memory assembler ran
     delivered_reply_keys: List[str]  # Checkpoint-coupled queued-reply dedup
     delivered_guidance_ids: List[str]  # Checkpoint-coupled urgent guidance
     delivered_feedback_keys: List[str]  # Checkpoint-coupled resume feedback
@@ -340,7 +339,6 @@ def create_initial_state(
         turn_count=0,
         phase_instruction_injections=[],
         last_observed_turn=0,
-        last_assembled_turn=0,
         delivered_reply_keys=[],
         delivered_guidance_ids=[],
         delivered_feedback_keys=[],

@@ -879,7 +879,6 @@ async def materialize_loop_advance_atomic(
             loop_for_spawn["remaining_iterations"] = mutation.remaining_iterations
             if mutation.campaign_changed:
                 loop_for_spawn["campaign"] = copy.deepcopy(mutation.campaign)
-            fan_out = len(roles) > 1
             for role in roles:
                 job = await create_job_fn(
                     db,
@@ -888,7 +887,6 @@ async def materialize_loop_advance_atomic(
                     iteration=new_total,
                     seq_index=int(mutation.seq_index),
                     remaining_iterations=mutation.remaining_iterations,
-                    disable_memory_assembler=fan_out,
                     extra_context=dict(mutation.extra_context),
                     backlog_block=backlog_block,
                     history_block=history_block,

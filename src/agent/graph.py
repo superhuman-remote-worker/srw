@@ -804,7 +804,6 @@ def create_execute_node(
     auxiliary_llm,
     summarization_prompt: str,
     memory_extraction_prompt: str = "",
-    memory_assembler_prompt: str = "",
     tool_context: Optional[ToolContext] = None,
     tool_names: Optional[List[str]] = None,
     memory_service: Optional[Any] = None,
@@ -827,7 +826,6 @@ def create_execute_node(
         auxiliary_llm: AuxiliaryLLM instance for summarization
         summarization_prompt: Prompt template for summarization
         memory_extraction_prompt: Prompt for memory extraction task
-        memory_assembler_prompt: Prompt for memory assembler task
         tool_names: List of loaded tool names for system prompt conditionals
         memory_service: MemoryManager seam (agent.services.memory) — when
             bound, replaces the direct-store memory read/write paths in
@@ -1255,7 +1253,6 @@ def create_execute_node(
         # skipped via the `memory_service is None` guard terms.
         _manager_payload = None
         _manager_injection_messages = []
-        _manager_memory_text = ""  # assembler's current_injection_text
         # append_only: the store records behind each kind (the planner's
         # input), in rank order.
         _memory_records: List[Any] = []
@@ -1373,8 +1370,8 @@ def create_execute_node(
                 _retrieval_started = memory_service.start_retrieval(_mm_request)
             else:
                 _manager_payload = await memory_service.assemble(_mm_request)
-                _manager_injection_messages, _manager_memory_text = (
-                    _take_in_manager_payload(_manager_payload)
+                _manager_injection_messages, _ = _take_in_manager_payload(
+                    _manager_payload
                 )
 
         # Memory Light: decrement TTLs then retrieve relevant memories for injection
@@ -2534,31 +2531,17 @@ def create_execute_node(
                             )
                         )
 
-                # Memory Light: extract + assemble memories via AuxiliaryLLM (async, non-blocking)
+                # Memory Light: extract memories via AuxiliaryLLM (async, non-blocking)
                 new_turn_count = state.get("turn_count", 0) + 1
                 extraction_triggered = False
-                assembly_triggered = False
                 recall_store_exec = tool_context.recall_store if tool_context else None
-                # What the model has in front of it as memory, for the
-                # assembler (spec §D row 23): legacy mode re-renders one block
-                # per request; append_only has the memory entries the history
-                # holds, the ones appended this request included.
-                current_memory_text = (
-                    "\n\n".join(
-                        str(m.content)
-                        for m in [*messages, *appended_entries]
-                        if entry_kind(m) == "memory"
-                    )
-                    if append_only
-                    else None
-                )
 
                 # Manager path (memory overhaul Phase 1): one fire-and-forget
-                # turn_end capture replaces the two create_tasks below. The
-                # interval_extractor/memory_assembler writers reproduce the
-                # gates and calls; interval state lives in the writers, so
-                # the last_observed_turn/last_assembled_turn state keys stop
-                # advancing (documented resume-window delta).
+                # turn_end capture replaces the create_task below. The
+                # interval_extractor writer reproduces the gate and call;
+                # interval state lives in the writer, so the
+                # last_observed_turn state key stops advancing (documented
+                # resume-window delta).
                 if memory_service is not None:
                     import asyncio
 
@@ -2571,13 +2554,6 @@ def create_execute_node(
                                 messages=messages,
                                 phase=phase_number,
                                 turn_count=new_turn_count,
-                                extra={
-                                    "current_injection_text": (
-                                        current_memory_text
-                                        if current_memory_text is not None
-                                        else _manager_memory_text
-                                    )
-                                },
                             )
                         )
                     )
@@ -2613,44 +2589,6 @@ def create_execute_node(
                             )
                         )
 
-                # Memory assembler: review conversation and adjust memory TTLs
-                # (manager path: rides the turn_end capture above)
-                if (
-                    memory_service is None
-                    and recall_store_exec
-                    and config.auxiliary.enabled
-                    and config.auxiliary.tasks.get("assemble_memories", None)
-                    and config.auxiliary.tasks["assemble_memories"].enabled
-                    and memory_assembler_prompt
-                ):
-                    from shared.runtime.services.auxiliary import (
-                        _should_assemble_memories,
-                        assemble_memories,
-                    )
-
-                    last_assembled = state.get("last_assembled_turn", 0)
-                    if _should_assemble_memories(
-                        new_turn_count,
-                        config.memory.assembler_interval,
-                        last_assembled,
-                    ):
-                        import asyncio
-
-                        assembly_triggered = True
-                        asyncio.create_task(
-                            assemble_memories(
-                                auxiliary_llm=auxiliary_llm,
-                                recall_store=recall_store_exec,
-                                messages=messages,
-                                current_injection_text=(
-                                    current_memory_text
-                                    if current_memory_text is not None
-                                    else _memory_block[0]
-                                ),
-                                memory_assembler_prompt=memory_assembler_prompt,
-                            )
-                        )
-
                 # Build result dict
                 result_update = {
                     "iteration": iteration + 1,
@@ -2660,8 +2598,6 @@ def create_execute_node(
                 result_update.update(phase_ledger_update)
                 if extraction_triggered:
                     result_update["last_observed_turn"] = new_turn_count
-                if assembly_triggered:
-                    result_update["last_assembled_turn"] = new_turn_count
                 if _absorbed_guidance_ids or append_only:
                     # append_only writes the set on every turn (spec §C).
                     result_update["delivered_guidance_ids"] = sorted(
@@ -3792,7 +3728,7 @@ def create_archive_phase_node(
         # non-empty stale queue, so this is a cheap no-op (one indexed query) when
         # nothing has expired (e.g. every non-loop job). Same enablement as the
         # curation/populate pass above; the two are the KB's extractor/assembler
-        # pair, mirroring memory's ExtractMemoriesTask/AssembleMemoriesTask.
+        # pair.
         if (
             tool_context
             and tool_context.has_knowledge()
@@ -6422,9 +6358,6 @@ def build_phase_alternation_graph(
     memory_extraction_prompt = load_auxiliary_prompt(
         config, "memory_extraction", model=aux_model
     )
-    memory_assembler_prompt = load_auxiliary_prompt(
-        config, "memory_assembler", model=aux_model
-    )
     curation_prompt = load_auxiliary_prompt(config, "curation", model=aux_model)
     knowledge_assembler_prompt = load_auxiliary_prompt(
         config, "knowledge_assembler", model=aux_model
@@ -6484,7 +6417,6 @@ def build_phase_alternation_graph(
                 memory_config=config.memory,
                 auxiliary_config=config.auxiliary,
                 extraction_prompt=memory_extraction_prompt,
-                assembler_prompt=memory_assembler_prompt,
                 job_id=tool_context.job_id if tool_context else None,
                 agent_type=config.agent_id,
                 project_id=tool_context.project_id if tool_context else None,
@@ -6539,7 +6471,6 @@ def build_phase_alternation_graph(
         auxiliary_llm=auxiliary_llm,
         summarization_prompt=summarization_prompt,
         memory_extraction_prompt=memory_extraction_prompt,
-        memory_assembler_prompt=memory_assembler_prompt,
         tool_context=tool_context,
         tool_names=_tool_names,
         memory_service=memory_service,

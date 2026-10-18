@@ -2679,7 +2679,6 @@ class MemoryConfig:
     # the prefetch off.
     prefetch_budget_s: float = 3.0
     observer_interval: int = 5
-    assembler_interval: int = 7
     default_ttl: int = 10
     importance_threshold: float = 0.3
     dedup_threshold: float = 0.85
@@ -2765,7 +2764,6 @@ class AuxiliaryConfig:
         default_factory=lambda: {
             "extract_memories": AuxiliaryTaskConfig(enabled=True),
             "curate_knowledge": AuxiliaryTaskConfig(enabled=True),
-            "assemble_memories": AuxiliaryTaskConfig(enabled=True),
             "verify_citations": AuxiliaryTaskConfig(enabled=True),
         }
     )
@@ -3273,7 +3271,6 @@ def _parse_memory_config(data: Dict[str, Any]) -> MemoryConfig:
         ),
         prefetch_budget_s=_parse_prefetch_budget(data.get("prefetch_budget_s", 3.0)),
         observer_interval=data.get("observer_interval", 5),
-        assembler_interval=data.get("assembler_interval", 7),
         default_ttl=data.get("default_ttl", 10),
         importance_threshold=data.get("importance_threshold", 0.3),
         dedup_threshold=data.get("dedup_threshold", 0.85),
@@ -3324,7 +3321,6 @@ def _parse_auxiliary_config(data: Dict[str, Any]) -> AuxiliaryConfig:
     for default_task in (
         "extract_memories",
         "curate_knowledge",
-        "assemble_memories",
         "verify_citations",
     ):
         if default_task not in tasks:

@@ -3940,7 +3940,6 @@ class PersistentSession:
                         memory_config=self.config.memory,
                         auxiliary_config=self.config.auxiliary,
                         extraction_prompt=self.memory_extraction_prompt,
-                        assembler_prompt=None,  # persistent mode has no assembler
                         job_id=self.thread_id,
                         agent_type=self.config.agent_id,
                         project_id=self.project_id,

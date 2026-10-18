@@ -153,7 +153,6 @@ async def test_fanout_jobs_and_campaign_handoff_share_pointer_transaction():
     assert update["campaign"] == campaign
     assert create.await_count == 2
     for call in create.await_args_list:
-        assert call.kwargs["disable_memory_assembler"] is True
         assert call.kwargs["backlog_block"] == "prepared backlog"
         assert call.kwargs["history_block"] == "prepared history"
         assert call.kwargs["extra_context"] == {"loop_campaign_id": "campaign-a"}
