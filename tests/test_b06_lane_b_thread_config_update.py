@@ -1368,15 +1368,25 @@ class TestVmUpgradeFailureBeforeItIsRecorded:
             )
         assert raised.value is boom
 
-    def _preparing(self, status):
+    def _preparing(self, status, *, generation=GENERATION, cancelled=False):
         """What the re-read finds once the VM template's preparation stage
         committed before the provision CAS (``_prepare_thread_workspace``)."""
         session = self._session(self._marker())
-        session["metadata"]["workspace_preparation"] = {
+        stage = {
             "status": status,
             "provision_generation": self.PROVISION,
             "preparation_only": True,
+            "preparation_request": {
+                "allocationId": THREAD,
+                "ownerKind": "session",
+                "runtimeGeneration": generation,
+                "revision": "r1",
+            },
         }
+        if cancelled:
+            # The End sweep cancelled its allocation and left the status.
+            stage["preparation_cancelled_revision"] = "r1"
+        session["metadata"]["workspace_preparation"] = stage
         return session
 
     @pytest.mark.asyncio
@@ -1398,6 +1408,30 @@ class TestVmUpgradeFailureBeforeItIsRecorded:
         VM can come of it."""
         boom = ValueError("Invalid preparation progress response")
         deps = self._deps(self._preparing("failed"))
+        deps.vm_provisioner.create_thread_vm.side_effect = boom
+        with pytest.raises(HTTPException) as refused:
+            await tcu.agent_upgrade_thread_to_vm(
+                MagicMock(), THREAD, dependencies=deps, control_request_id=self.REQUEST
+            )
+        assert (refused.value.status_code, refused.value.detail) == (
+            503,
+            self.NOT_RECORDED,
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "stale",
+        [
+            {"cancelled": True},
+            {"generation": "77777777-7777-4777-8777-777777777777"},
+        ],
+        ids=["cancelled-at-end", "an-earlier-life"],
+    )
+    async def test_a_stale_preparation_stage_is_a_typed_refusal(self, stale):
+        """Only the provision CAS removes a stage, so one left by an End still
+        reads ``waiting_preparation``; nothing drives it for this life."""
+        boom = ValueError("bad template row")
+        deps = self._deps(self._preparing("waiting_preparation", **stale))
         deps.vm_provisioner.create_thread_vm.side_effect = boom
         with pytest.raises(HTTPException) as refused:
             await tcu.agent_upgrade_thread_to_vm(

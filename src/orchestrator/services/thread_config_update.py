@@ -1037,15 +1037,29 @@ async def agent_update_thread_config(
 _VM_UPGRADE_REREAD_LOCK_TIMEOUT_S = 5.0
 
 
-def _vm_preparation_in_progress(metadata: Any) -> bool:
-    """A VM preparation stage the readiness poller still drives.
+def _vm_preparation_in_progress(thread: Mapping[str, Any]) -> bool:
+    """A VM preparation stage of this Session's life that is still waiting.
 
     A VM template that declares a preparation commits this stage before the
-    provision CAS (``_prepare_thread_workspace``); the poller provisions the
-    VM once the stage completes. Only a ``failed`` stage is skipped for good.
+    provision CAS (``_prepare_thread_workspace``); the readiness poller
+    provisions the VM once the stage completes. Only that CAS removes a
+    stage, so one the End sweep cancelled, or one an earlier life admitted,
+    still reads ``waiting_preparation``, and nothing completes it for now.
     """
-    stage = metadata_object(metadata).get("workspace_preparation")
-    return isinstance(stage, Mapping) and stage.get("status") != "failed"
+    stage = metadata_object(thread.get("metadata")).get("workspace_preparation")
+    if not isinstance(stage, Mapping) or stage.get("status") != "waiting_preparation":
+        return False
+    request = stage.get("preparation_request")
+    if not isinstance(request, Mapping):
+        return False
+    if stage.get("preparation_cancelled_revision") == request.get("revision"):
+        return False
+    try:
+        return UUID(str(request.get("runtimeGeneration"))) == UUID(
+            str(thread.get("runtime_generation"))
+        )
+    except ValueError:
+        return False
 
 
 async def _vm_upgrade_unrecorded(
@@ -1057,9 +1071,9 @@ async def _vm_upgrade_unrecorded(
     """Whether the Session, re-read under its lifecycle lock, shows nothing
     recorded for the request; False when it does or the re-read fails.
 
-    A live preparation stage counts as recorded: its VM comes later, without
-    another request. The agent's check doesn't see it, so the request stays
-    pending until a later drain finds that VM in progress.
+    A waiting preparation stage of this life counts as recorded: its VM comes
+    later, without another request. The agent's check doesn't see it, so the
+    request stays pending until a later drain finds that VM in progress.
     """
     try:
         async with dependencies.store.thread_advisory_lock(
@@ -1073,10 +1087,10 @@ async def _vm_upgrade_unrecorded(
             exc_info=True,
         )
         return False
-    metadata = (thread or {}).get("metadata")
+    thread = thread or {}
     return not (
-        vm_upgrade_recorded(metadata, control_request_id)
-        or _vm_preparation_in_progress(metadata)
+        vm_upgrade_recorded(thread.get("metadata"), control_request_id)
+        or _vm_preparation_in_progress(thread)
     )
 
 
@@ -1092,13 +1106,13 @@ async def _refuse_unrecorded_vm_upgrade(
     The pinned agent leaves its request pending on an untyped 5xx and asks
     again at every drain, so a persistent error (a bug, a bad row) would keep
     the Session from ever settling. When nothing was recorded for the request
-    (``vm_upgrade_recorded``, the agent's own check, and no live preparation
-    stage), the error answers the typed 503 the agent reads as a refusal. A
-    recorded request, or a failed re-read, keeps the original error: the
-    agent's check then finds the request accepted (or, for a stage, its VM
-    in progress at a later drain), or the error stays transient.
-    ``HTTPException``, cancellation and calls without a request id pass
-    through unchanged.
+    (``vm_upgrade_recorded``, the agent's own check, and no waiting
+    preparation stage of this life), the error answers the typed 503 the
+    agent reads as a refusal. A recorded request, or a failed re-read, keeps
+    the original error: the agent's check then finds the request accepted
+    (or, for a stage, its VM in progress at a later drain), or the error
+    stays transient. ``HTTPException``, cancellation and calls without a
+    request id pass through unchanged.
     """
     if control_request_id is None:
         yield
