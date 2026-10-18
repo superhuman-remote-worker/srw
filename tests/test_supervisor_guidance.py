@@ -878,7 +878,7 @@ class TestExecuteRendersGuidance:
 
 
 class TestExecuteAppendsGuidanceOnce:
-    """append_only (WP2 spec §C, B7): guidance is a typed context entry,
+    """WP2 spec §C, B7: guidance is a typed context entry,
     appended to the history once and folded into the newest carrier. Both
     lanes filter and record ``delivered_guidance_ids``; the pinned lane acks
     after the answered request, the stateless lane leaves the ack to the
@@ -894,7 +894,7 @@ class TestExecuteAppendsGuidanceOnce:
         dual_app._guidance_inbox.clear()
         dual_app._guidance_inbox.update(saved)
 
-    def _append_only_execute(
+    def _make_node(
         self, workspace_manager, todo_manager, captured, *, tool_context=None
     ):
         from agent.graph import create_execute_node
@@ -917,7 +917,6 @@ class TestExecuteAppendsGuidanceOnce:
         config.limits.model_max_context_tokens = 100000
         config.limits.response_validation.enabled = False
         config.context_management.max_summary_length = 500
-        config.context_management.injection_mode = "append_only"
         config.memory.max_memories_per_entry = 5
 
         context_mgr = MagicMock()
@@ -966,7 +965,7 @@ class TestExecuteAppendsGuidanceOnce:
             {"id": "g2", "text": "read file Z", "source": "officer"},
         ]
         captured = []
-        execute = self._append_only_execute(workspace_manager, todo_manager, captured)
+        execute = self._make_node(workspace_manager, todo_manager, captured)
         ack = MagicMock()
 
         result = await self._execute(execute, self._state(), ack)
@@ -996,7 +995,7 @@ class TestExecuteAppendsGuidanceOnce:
             {"id": "g1", "text": "already delivered", "source": "officer"}
         ]
         captured = []
-        execute = self._append_only_execute(workspace_manager, todo_manager, captured)
+        execute = self._make_node(workspace_manager, todo_manager, captured)
         state = self._state()
         state["delivered_guidance_ids"] = ["g1"]
         ack = MagicMock()
@@ -1022,7 +1021,7 @@ class TestExecuteAppendsGuidanceOnce:
         context = ToolContext(workspace_manager=workspace_manager)
         context._stateless_worker = True
         captured = []
-        execute = self._append_only_execute(
+        execute = self._make_node(
             workspace_manager, todo_manager, captured, tool_context=context
         )
         ack = MagicMock()
@@ -1039,7 +1038,7 @@ class TestExecuteAppendsGuidanceOnce:
         self, workspace_manager, todo_manager
     ):
         captured = []
-        execute = self._append_only_execute(workspace_manager, todo_manager, captured)
+        execute = self._make_node(workspace_manager, todo_manager, captured)
         ack = MagicMock()
 
         result = await self._execute(execute, self._state(), ack)

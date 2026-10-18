@@ -20,7 +20,7 @@ from langchain_core.messages import (
 )
 
 from agent.core.archiver import LLMArchiver
-from agent.core.knowledge_injection import KNOWLEDGE_TOOL_CALL_ID_PREFIX
+from shared.runtime.core.injection_markers import KNOWLEDGE_TOOL_CALL_ID_PREFIX
 from shared.runtime.core.workspace_injection import (
     create_instruction_tool_messages,
     create_todos_human_message,

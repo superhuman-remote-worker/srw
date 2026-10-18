@@ -56,9 +56,6 @@ KNOWN_NUDGES: Dict[str, Set[str]] = {
     # src/managers/todo.py
     "todo_list_footer": set(),
     # src/services/recall_store.py
-    "memory_block_header_pinned": set(),
-    "memory_block_header_retrieved": set(),
-    "memory_block_footer": {"count", "tokens"},
     "memory_entry_header": set(),
     "memory_summary_header": {"count"},
     "memory_summary_hint": set(),

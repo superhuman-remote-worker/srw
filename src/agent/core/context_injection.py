@@ -5,8 +5,8 @@ Design: knowledge-base/knowledge/features/append_only_context_injection.md
 (knowledge-base/knowledge/plans/append_only_context_injection_wp2_spec.md
 §C, §G).
 
-In ``append_only`` mode harness context (memory, knowledge, guidance, ...)
-is not rebuilt at the request tail on every call. It is appended to the
+Harness context (memory, knowledge, guidance, ...) is not rebuilt at the
+request tail on every call. It is appended to the
 history once, as typed entries (``shared.runtime.core.context_entries``),
 and appended again only when it changes. :func:`plan_context_entries` decides
 what to append: it reads what the history already holds
@@ -35,7 +35,7 @@ compaction evicted is absent and becomes eligible again (D4, D21).
 Pure: no I/O, no clock, no counters. The same history and sources always
 give byte-identical entries, and an entry's text carries no per-turn data
 (D11). The worker execute node (``graph.py``) and the session loop
-(``persistent_graph.py``) call it in ``append_only`` mode.
+(``persistent_graph.py``) call it.
 """
 
 from __future__ import annotations
@@ -62,7 +62,6 @@ from shared.runtime.core.context_entries import (
     MEMORY_SUMMARY_KIND,
     digest,
     entry_meta,
-    is_append_only,
     is_context_entry,
     knowledge_item_key,
     make_context_entry,
@@ -419,9 +418,7 @@ def _plan_guidance(
         new.append(item)
     if not new:
         return None
-    body = format_supervisor_guidance(
-        [dict(item.record) for item in new], repeat_notice=False
-    ).strip()
+    body = format_supervisor_guidance([dict(item.record) for item in new]).strip()
     if not body:
         return None
     entry = make_context_entry(
@@ -632,7 +629,6 @@ __all__ = [
     "format_active_subagents_none",
     "guidance_item",
     "guidance_text",
-    "is_append_only",
     "knowledge_item",
     "max_memories_per_entry",
     "memory_item",

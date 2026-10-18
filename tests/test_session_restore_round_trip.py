@@ -531,9 +531,7 @@ async def _restore_rows(rows: _ThreadRows, config: Any):
 
 
 def _round_trip_config(family: Any) -> Any:
-    return harness._session_config(
-        injections=True, model=family.model, injection_mode="append_only"
-    )
+    return harness._session_config(injections=True, model=family.model)
 
 
 async def _run_session(

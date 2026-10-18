@@ -1,19 +1,18 @@
 """Unit tests for citation-verification feedback injection (Phase 2b / D4).
 
-Pure-function coverage (no DB/LLM): the formatter, the synthetic tool-call pair,
-and the exclusion checkers. The DB-driven retrieval + end-to-end write-back are
-covered by the gated Postgres round-trip (tests/citation_engine/).
+Pure-function coverage (no DB/LLM): the formatter, and the exclusion checker
+still recognising the legacy synthetic pair that restored histories carry. The
+DB-driven retrieval + end-to-end write-back are covered by the gated Postgres
+round-trip (tests/citation_engine/).
 """
 
 from types import SimpleNamespace
 
 from langchain_core.messages import HumanMessage
 
-from agent.core.citation_feedback_injection import (
-    CITATION_FEEDBACK_TOOL_CALL_ID_PREFIX,
+from agent.core.citation_feedback_injection import format_failed_citations
+from tests._legacy_injection_rows import (
     create_citation_feedback_injection_messages,
-    format_failed_citations,
-    is_citation_feedback_injection_message,
 )
 from shared.runtime.core.workspace_injection import is_workspace_injection_message
 
@@ -53,26 +52,10 @@ class TestFormatFailedCitations:
         assert "similarity" not in block
 
 
-class TestInjectionPair:
-    def test_pair_has_tool_call_and_prefix(self):
-        ai, tool = create_citation_feedback_injection_messages("failed: [1]")
-        assert (
-            ai.tool_calls and ai.tool_calls[0]["name"] == "check_citation_verification"
-        )
-        tid = ai.tool_calls[0]["id"]
-        assert tid.startswith(CITATION_FEEDBACK_TOOL_CALL_ID_PREFIX)
-        assert tool.tool_call_id == tid
-        assert tool.content == "failed: [1]"
-
-    def test_is_citation_feedback_recognizes_pair(self):
-        ai, tool = create_citation_feedback_injection_messages("x")
-        assert is_citation_feedback_injection_message(ai)
-        assert is_citation_feedback_injection_message(tool)
-        assert not is_citation_feedback_injection_message(HumanMessage(content="hi"))
-
+class TestLegacyPair:
     def test_unified_checker_excludes_feedback_pair(self):
-        # is_workspace_injection_message must exclude citation feedback so it's
-        # dropped from summarization/extraction like other transient injections.
+        # is_workspace_injection_message must still exclude a legacy citation
+        # feedback pair (restored histories) from summarization/extraction.
         ai, tool = create_citation_feedback_injection_messages("x")
         assert is_workspace_injection_message(ai)
         assert is_workspace_injection_message(tool)

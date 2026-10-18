@@ -3,7 +3,7 @@
 Covers: sentinel constants, TurnResult dataclass, run_persistent_loop (system
 prompt insertion, input handling, cancellation, error handling, config extraction,
 memory extraction trigger, auto-commit git), and _execute_turn (interrupt handling,
-memory/knowledge retrieval, transient injection, context compaction, LLM streaming
+memory/knowledge retrieval, context entries, context compaction, LLM streaming
 with fallback, timeout, tool execution loop, VM upgrade detection).
 """
 
@@ -23,6 +23,13 @@ from langchain_core.messages import (
     ToolMessage,
 )
 
+from shared.runtime.core.context_entries import (
+    FOLDED_KEY,
+    entry_body,
+    entry_kind,
+    is_context_entry,
+)
+from shared.runtime.core.message_markers import PERSIST_ROLE_KEY
 from shared.runtime.core.workspace_backend import WorkspaceUnavailableError
 
 from agent.persistent_graph import (
@@ -33,8 +40,6 @@ from agent.persistent_graph import (
     PersistentLoopCallbacks,
     TurnResult,
     _execute_turn,
-    _inject_context_pairs,
-    _injection_anchor_index,
     _maybe_estimate_reasoning_tokens,
     run_persistent_loop,
 )
@@ -1888,13 +1893,17 @@ class TestExecuteTurnMemoryRetrieval:
 
         Regression for a resumed, compacted session whose recalled workspace
         memory followed the current product question and caused the model to
-        reuse an earlier answer without calling the current guide.
+        reuse an earlier answer without calling the current guide. The memory
+        and the turn boundary are context entries appended (and persisted)
+        after the question; the request folds both into it, the boundary
+        last, so it is the newest text the model reads.
         """
         from shared.runtime.core.skill_resolution import (
             APP_GUIDE_LOADER_TOOL,
             APP_GUIDE_SKILL,
             add_persistent_system_skills,
         )
+        from shared.runtime.services.recall_store import MemoryRecord
 
         catalog = add_persistent_system_skills({})
         digest = next(
@@ -1904,50 +1913,67 @@ class TestExecuteTurnMemoryRetrieval:
         )
         config = _make_config()
         config.extra = {"_resolved_skills": catalog}
+        config.llm.model = None
 
         recall = MagicMock()
-        recall.retrieve = AsyncMock(return_value=[MagicMock()])
-        captured = []
-
-        with patch(
-            "shared.runtime.services.recall_store.RecallStore.assemble_memory_block",
-            return_value="HISTORICAL WORKSPACE MEMORY",
-        ):
-            await _execute_turn(
-                llm_with_tools=_capturing_llm(
-                    captured,
-                    _make_llm_response("done"),
-                ),
-                tool_map={APP_GUIDE_LOADER_TOOL: MagicMock()},
-                context_manager=AsyncMock(
-                    ensure_within_limits=AsyncMock(
-                        side_effect=lambda messages, *args, **kwargs: messages
-                    )
-                ),
-                messages=[
-                    SystemMessage(content="current system prompt"),
-                    HumanMessage(content="What can this SRW session do?"),
-                ],
-                callbacks=_make_callbacks(),
-                llm_timeout=600,
-                auxiliary_llm=None,
-                config=config,
-                recall_store=recall,
-            )
-
-        memory_result = next(
-            message
-            for message in captured[0]
-            if isinstance(message, ToolMessage)
-            and str(message.tool_call_id).startswith("memory_inject_")
+        recall.retrieve = AsyncMock(
+            return_value=[MemoryRecord(content="HISTORICAL WORKSPACE MEMORY")]
         )
-        assert "HISTORICAL WORKSPACE MEMORY" in memory_result.content
-        assert "<managed_product_guide_turn_boundary" not in memory_result.content
-        boundary = captured[0][-1]
-        assert isinstance(boundary, HumanMessage)
-        assert "<managed_product_guide_turn_boundary" in boundary.content
-        assert digest in boundary.content
-        assert "must call `read_product_guide` now" in boundary.content
+        captured = []
+        persisted: List[BaseMessage] = []
+
+        async def _persist(msg):
+            persisted.append(msg)
+            return True
+
+        messages = [
+            SystemMessage(content="current system prompt"),
+            HumanMessage(content="What can this SRW session do?"),
+        ]
+        await _execute_turn(
+            llm_with_tools=_capturing_llm(
+                captured,
+                _make_llm_response("done"),
+            ),
+            tool_map={APP_GUIDE_LOADER_TOOL: MagicMock()},
+            context_manager=AsyncMock(
+                ensure_within_limits=AsyncMock(
+                    side_effect=lambda messages, *args, **kwargs: messages
+                )
+            ),
+            messages=messages,
+            callbacks=_make_callbacks(persist_message=_persist),
+            llm_timeout=600,
+            auxiliary_llm=None,
+            config=config,
+            recall_store=recall,
+            turn_id=4,
+        )
+
+        entries = [m for m in messages if is_context_entry(m)]
+        assert [entry_kind(m) for m in entries] == ["memory", "turn_boundary"]
+        memory_entry, boundary_entry = entries
+        assert "HISTORICAL WORKSPACE MEMORY" in entry_body(memory_entry)
+        assert "<managed_product_guide_turn_boundary" not in entry_body(memory_entry)
+        boundary = entry_body(boundary_entry)
+        assert "<managed_product_guide_turn_boundary" in boundary
+        assert digest in boundary
+        assert "must call `read_product_guide` now" in boundary
+        # Both persisted as context rows, written before the response.
+        assert persisted[:2] == entries
+        assert all(
+            m.additional_kwargs[PERSIST_ROLE_KEY] == "context" for m in persisted[:2]
+        )
+
+        # The request: the question carries the memory, then the boundary.
+        assert [type(m) for m in captured[0]] == [SystemMessage, HumanMessage]
+        carrier = captured[0][-1]
+        assert carrier.additional_kwargs[FOLDED_KEY] == ["memory", "turn_boundary"]
+        assert carrier.content.startswith("What can this SRW session do?")
+        assert carrier.content.index("HISTORICAL WORKSPACE MEMORY") < (
+            carrier.content.index("<managed_product_guide_turn_boundary")
+        )
+        assert carrier.content.endswith(str(boundary_entry.content))
 
 
 # ---------------------------------------------------------------------------
@@ -2017,18 +2043,25 @@ class TestExecuteTurnKnowledgeRetrieval:
         context = MagicMock()
         context.knowledge_bindings = [native, docs]
         context.citation_engine = None
+        context.subagent_runtime = None
         context.consume_freeze_request.return_value = None
         config = _make_config()
         config.llm.model = None
+        persisted: List[BaseMessage] = []
 
+        async def _persist(msg):
+            persisted.append(msg)
+            return True
+
+        messages = [SystemMessage(content="sys"), HumanMessage(content="question")]
         await _execute_turn(
             llm_with_tools=llm,
             tool_map={},
             context_manager=AsyncMock(
                 ensure_within_limits=AsyncMock(side_effect=lambda m, *a, **kw: m)
             ),
-            messages=[SystemMessage(content="sys"), HumanMessage(content="question")],
-            callbacks=_make_callbacks(),
+            messages=messages,
+            callbacks=_make_callbacks(persist_message=_persist),
             llm_timeout=600,
             auxiliary_llm=None,
             config=config,
@@ -2038,14 +2071,21 @@ class TestExecuteTurnKnowledgeRetrieval:
 
         assert ks.search_chunks.await_count == 2
         ks.hybrid_search.assert_not_awaited()
-        injected = "\n".join(
-            str(message.content)
-            for message in captured[0]
-            if isinstance(message, ToolMessage)
-        )
+        # One source-aware knowledge entry, appended and persisted.
+        entries = [m for m in messages if is_context_entry(m)]
+        assert [entry_kind(m) for m in entries] == ["knowledge"]
+        injected = entry_body(entries[0])
         assert "[project] project:native-0" in injected
         assert "[docs] docs:external-0" in injected
         assert "External snapshots (as of): [docs] indexed-head" in injected
+        assert persisted[0] is entries[0]
+        assert persisted[0].additional_kwargs[PERSIST_ROLE_KEY] == "context"
+        # The request folds it into the question.
+        assert [type(m) for m in captured[0]] == [SystemMessage, HumanMessage]
+        carrier = captured[0][-1]
+        assert carrier.additional_kwargs[FOLDED_KEY] == ["knowledge"]
+        assert carrier.content.startswith("question")
+        assert "[docs] docs:external-0" in carrier.content
 
     @pytest.mark.asyncio
     async def test_knowledge_search_called_with_project_ids(self):
@@ -2185,42 +2225,52 @@ class TestExecuteTurnKnowledgeRetrieval:
 
 
 # ---------------------------------------------------------------------------
-# 1.6 _execute_turn — transient injection
+# 1.6 _execute_turn — context entries
 # ---------------------------------------------------------------------------
 
 
-class TestTransientInjection:
+class TestContextEntries:
     @pytest.mark.asyncio
-    async def test_prepared_is_copy_not_original(self):
-        """Transient injections go into a copy, not the original messages list."""
+    async def test_no_context_source_appends_no_entry(self):
+        """A MagicMock config with no store, tool context or guide plans
+        nothing: the history gains the response only and the request is the
+        history unchanged (no folded carrier)."""
+        captured: List[List[BaseMessage]] = []
         messages = [SystemMessage(content="sys"), HumanMessage(content="hi")]
-        callbacks = _make_callbacks()
+        persisted: List[BaseMessage] = []
 
-        await _execute_turn(
-            llm_with_tools=_make_streaming_llm(_make_llm_response("ok")),
+        async def _persist(msg):
+            persisted.append(msg)
+            return True
+
+        result = await _execute_turn(
+            llm_with_tools=_capturing_llm(captured, _make_llm_response("ok")),
             tool_map={},
             context_manager=AsyncMock(
                 ensure_within_limits=AsyncMock(side_effect=lambda m, *a, **kw: m)
             ),
             messages=messages,
-            callbacks=callbacks,
+            callbacks=_make_callbacks(persist_message=_persist),
             llm_timeout=600,
             auxiliary_llm=None,
             config=_make_config(),
+            turn_id=2,
         )
 
-        # Original messages should have gained the AI response but NOT workspace injection
-        ws_messages = [
-            m
-            for m in messages
-            if isinstance(m, SystemMessage) and "<workspace_memory>" in m.content
+        assert result.error is None
+        assert [type(m) for m in messages] == [SystemMessage, HumanMessage, AIMessage]
+        assert not any(is_context_entry(m) for m in messages)
+        assert [type(m) for m in persisted] == [AIMessage]
+        assert [(type(m), m.content) for m in captured[0]] == [
+            (SystemMessage, "sys"),
+            (HumanMessage, "hi"),
         ]
-        assert len(ws_messages) == 0
+        assert all(FOLDED_KEY not in m.additional_kwargs for m in captured[0])
 
 
 # ---------------------------------------------------------------------------
-# 1.5b _execute_turn — citation-verification feedback (Phase 2b / D4, persistent
-# parity with the worker's _inject_transient_messages)
+# 1.5b _execute_turn — citation-verification feedback (Phase 2b / D4, parity
+# with the worker's citation entry)
 # ---------------------------------------------------------------------------
 
 
@@ -2247,50 +2297,40 @@ def _capturing_llm(captured, response):
     return llm
 
 
-class TestCitationFeedbackInjectionUnit:
-    """Pure _inject_context_pairs coverage for the citation-feedback block."""
+def _citation_tool_context(engine):
+    """A tool context with a citation engine and no subagent runtime.
 
-    def test_injects_citation_feedback_pair_after_other_context(self):
-        from agent.core.citation_feedback_injection import (
-            is_citation_feedback_injection_message,
-        )
-
-        prepared = [SystemMessage(content="sys"), HumanMessage(content="hi")]
-        added = _inject_context_pairs(
-            prepared, [], "", "", "Automatic verification FAILED for [1]"
-        )
-
-        assert added == 2
-        pair = [m for m in prepared if is_citation_feedback_injection_message(m)]
-        assert len(pair) == 2  # synthetic AI tool-call + ToolMessage report
-        tool_msgs = [m for m in prepared if isinstance(m, ToolMessage)]
-        assert any("verification FAILED" in m.content for m in tool_msgs)
-        # Anchored after the first user turn (provider turn-ordering safety).
-        assert isinstance(prepared[0], SystemMessage)
-        assert isinstance(prepared[1], HumanMessage)
-
-    def test_empty_citation_block_is_noop(self):
-        prepared = [SystemMessage(content="sys"), HumanMessage(content="hi")]
-        added = _inject_context_pairs(prepared, [], "", "", "")
-        assert added == 0
-        assert len(prepared) == 2
+    A bare MagicMock would hand the planner a callable
+    ``subagent_runtime.active_subagents_block`` and add a subagents entry.
+    """
+    tool_ctx = MagicMock()
+    tool_ctx.citation_engine = engine
+    tool_ctx.subagent_runtime = None
+    return tool_ctx
 
 
 class TestExecuteTurnCitationFeedback:
     @pytest.mark.asyncio
     async def test_failed_citations_surfaced_to_llm(self):
-        """A still-failed citation is queried once per turn and injected into the
-        LLM input as a synthetic check_citation_verification pair."""
-        from agent.core.citation_feedback_injection import (
-            is_citation_feedback_injection_message,
-        )
+        """A still-failed citation is queried once per turn, appended to the
+        history as a ``citation`` context entry, persisted before the provider
+        call and folded into the user message the LLM receives.
 
+        Design change (append-only injection): the entry is durable history,
+        persisted as a ``role='context'`` row, not an ephemeral pair kept out
+        of the session list.
+        """
         engine = MagicMock()
         engine.list_citations = AsyncMock(return_value=[_failed_cit()])
-        tool_ctx = MagicMock()
-        tool_ctx.citation_engine = engine
+        tool_ctx = _citation_tool_context(engine)
 
         captured: List[List[BaseMessage]] = []
+        persisted: List[BaseMessage] = []
+
+        async def _persist(msg):
+            persisted.append(msg)
+            return True
+
         messages = [SystemMessage(content="sys"), HumanMessage(content="cite this")]
 
         await _execute_turn(
@@ -2300,7 +2340,7 @@ class TestExecuteTurnCitationFeedback:
                 ensure_within_limits=AsyncMock(side_effect=lambda m, *a, **kw: m)
             ),
             messages=messages,
-            callbacks=_make_callbacks(),
+            callbacks=_make_callbacks(persist_message=_persist),
             llm_timeout=600,
             auxiliary_llm=None,
             config=_make_config(),
@@ -2309,20 +2349,26 @@ class TestExecuteTurnCitationFeedback:
 
         engine.list_citations.assert_called_once_with(verification_status="failed")
         assert captured, "LLM was never called"
-        pair = [m for m in captured[0] if is_citation_feedback_injection_message(m)]
-        assert len(pair) == 2
-        # Durable history must NOT carry the ephemeral injection.
-        assert not any(is_citation_feedback_injection_message(m) for m in messages)
+        entries = [m for m in messages if is_context_entry(m)]
+        assert [entry_kind(m) for m in entries] == ["citation"]
+        assert "Automatic verification FAILED" in entry_body(entries[0])
+        assert "The sky is green" in entry_body(entries[0])
+        # Durable: persisted as a context row, before the response.
+        assert persisted[0] is entries[0]
+        assert persisted[0].additional_kwargs[PERSIST_ROLE_KEY] == "context"
+        assert isinstance(persisted[-1], AIMessage)
+        # The request folds the entry into the user's message; no extra turn.
+        request = captured[0]
+        assert [type(m) for m in request] == [SystemMessage, HumanMessage]
+        carrier = request[-1]
+        assert carrier.additional_kwargs[FOLDED_KEY] == ["citation"]
+        assert carrier.content.startswith("cite this")
+        assert carrier.content.endswith(str(entries[0].content))
 
     @pytest.mark.asyncio
     async def test_no_engine_skips_query_and_injection(self):
-        """No citation engine on the context → no query, no injection, no error."""
-        from agent.core.citation_feedback_injection import (
-            is_citation_feedback_injection_message,
-        )
-
-        tool_ctx = MagicMock()
-        tool_ctx.citation_engine = None  # not yet created (no citation activity)
+        """No citation engine on the context → no query, no entry, no error."""
+        tool_ctx = _citation_tool_context(None)  # no citation activity yet
 
         captured: List[List[BaseMessage]] = []
         messages = [SystemMessage(content="sys"), HumanMessage(content="hi")]
@@ -2343,19 +2389,18 @@ class TestExecuteTurnCitationFeedback:
 
         assert result.error is None
         assert captured
-        assert not any(is_citation_feedback_injection_message(m) for m in captured[0])
+        assert not any(is_context_entry(m) for m in messages)
+        assert captured[0][-1].content == "hi"
+        assert FOLDED_KEY not in captured[0][-1].additional_kwargs
 
     @pytest.mark.asyncio
     async def test_no_failed_citations_no_injection(self):
-        """Engine present but nothing failed → no feedback pair."""
-        from agent.core.citation_feedback_injection import (
-            is_citation_feedback_injection_message,
-        )
-
+        """Engine present but nothing failed and no earlier failure in the
+        history → no citation entry (the cleared rendering only replaces an
+        older failure the history still shows)."""
         engine = MagicMock()
         engine.list_citations = AsyncMock(return_value=[])
-        tool_ctx = MagicMock()
-        tool_ctx.citation_engine = engine
+        tool_ctx = _citation_tool_context(engine)
 
         captured: List[List[BaseMessage]] = []
         messages = [SystemMessage(content="sys"), HumanMessage(content="hi")]
@@ -2375,15 +2420,16 @@ class TestExecuteTurnCitationFeedback:
         )
 
         engine.list_citations.assert_called_once_with(verification_status="failed")
-        assert not any(is_citation_feedback_injection_message(m) for m in captured[0])
+        assert not any(is_context_entry(m) for m in messages)
+        assert captured[0][-1].content == "hi"
+        assert FOLDED_KEY not in captured[0][-1].additional_kwargs
 
     @pytest.mark.asyncio
     async def test_retrieval_timeout_is_non_fatal(self):
         """A timeout/error fetching failed citations must not kill the turn."""
         engine = MagicMock()
         engine.list_citations = AsyncMock(side_effect=asyncio.TimeoutError)
-        tool_ctx = MagicMock()
-        tool_ctx.citation_engine = engine
+        tool_ctx = _citation_tool_context(engine)
 
         captured: List[List[BaseMessage]] = []
         messages = [SystemMessage(content="sys"), HumanMessage(content="hi")]
@@ -4912,224 +4958,6 @@ class TestExecuteTurnReasoning:
             ("token", "Answer."),
         ]
         assert messages[-1].id.startswith("msg_")
-
-
-# ---------------------------------------------------------------------------
-# Transient context injection placement (Gemini function-call turn ordering)
-# ---------------------------------------------------------------------------
-
-
-def _first_index(messages, predicate):
-    return next((i for i, m in enumerate(messages) if predicate(m)), None)
-
-
-def _is_tool_call_ai(m) -> bool:
-    return isinstance(m, AIMessage) and bool(getattr(m, "tool_calls", None))
-
-
-def _memory_pair(content: str):
-    """A real (AIMessage(tool_call), ToolMessage) pair, as the seam produces."""
-    from agent.core.memory_injection import create_memory_injection_messages
-
-    return list(create_memory_injection_messages(content))
-
-
-class TestInjectionAnchorIndex:
-    """`_injection_anchor_index` anchors injected pairs at the tail.
-
-    Tail placement is the prompt-cache optimization: the injected block
-    changes every turn, so it must sit AFTER the stable conversation prefix
-    or it invalidates the provider cache for the whole history each request.
-    The anchor is the position after the LAST Human/Tool message (normally
-    the very end), which also keeps the synthetic function-call pairs valid
-    for Gemini's turn-ordering rule.
-    """
-
-    def test_tail_after_newest_human(self):
-        msgs = [SystemMessage(content="sys"), HumanMessage(content="hi")]
-        assert _injection_anchor_index(msgs) == 2
-
-    def test_tail_after_last_human_of_many(self):
-        msgs = [
-            SystemMessage(content="sys"),
-            HumanMessage(content="h1"),
-            AIMessage(content="a1"),
-            HumanMessage(content="h2"),
-        ]
-        assert _injection_anchor_index(msgs) == 4
-
-    def test_tail_after_trailing_tool_message(self):
-        msgs = [
-            HumanMessage(content="hi"),
-            AIMessage(
-                content="",
-                tool_calls=[{"name": "t", "args": {}, "id": "call_1"}],
-            ),
-            ToolMessage(content="result", tool_call_id="call_1"),
-        ]
-        assert _injection_anchor_index(msgs) == 3
-
-    def test_walks_back_past_trailing_bare_model_turn(self):
-        # Degenerate/restored history ending in a plain assistant message:
-        # the pairs must not follow a model turn (Gemini 400), so the anchor
-        # steps back to just after the last Human/Tool message.
-        msgs = [HumanMessage(content="hi"), AIMessage(content="yo")]
-        assert _injection_anchor_index(msgs) == 1
-
-    def test_no_human_or_tool_falls_back_to_end(self):
-        assert _injection_anchor_index([]) == 0
-        assert _injection_anchor_index([SystemMessage(content="sys")]) == 1
-        assert _injection_anchor_index([AIMessage(content="a")]) == 1
-
-
-class TestInjectContextPairs:
-    """Injected memory/knowledge pairs must never precede the first user turn.
-
-    Regression for the Gemini 400 "Please ensure that function call turn comes
-    immediately after a user turn or after a function response turn": the
-    injected pairs are synthetic AIMessage(tool_call)+ToolMessage, and placing
-    them right after the SystemMessage (before the first HumanMessage) made the
-    function call the first entry of Gemini's `contents` array — failing the
-    very first turn of a session. The pairs now anchor at the TAIL (after the
-    last Human/Tool message) — prompt-cache-friendly AND trivially after the
-    first user turn, so the Gemini invariant holds by construction.
-    """
-
-    def _assert_gemini_ordering(self, messages):
-        """No tool-call AIMessage or ToolMessage may precede the first user turn."""
-        first_human = _first_index(messages, lambda m: isinstance(m, HumanMessage))
-        first_tool = _first_index(
-            messages, lambda m: _is_tool_call_ai(m) or isinstance(m, ToolMessage)
-        )
-        assert first_human is not None, "expected a user turn in the history"
-        assert first_tool is None or first_human < first_tool, (
-            f"tool turn at {first_tool} precedes first user turn at {first_human}"
-        )
-
-    def _assert_pairing(self, messages):
-        call_ids = [
-            tc["id"] for m in messages if _is_tool_call_ai(m) for tc in m.tool_calls
-        ]
-        result_ids = [m.tool_call_id for m in messages if isinstance(m, ToolMessage)]
-        assert sorted(call_ids) == sorted(result_ids)
-        # Each injected result immediately follows its call (AI then Tool).
-        for i, m in enumerate(messages):
-            if _is_tool_call_ai(m):
-                nxt = messages[i + 1]
-                assert isinstance(nxt, ToolMessage)
-                assert nxt.tool_call_id in {tc["id"] for tc in m.tool_calls}
-
-    def test_memory_injected_after_first_human(self):
-        prepared = [SystemMessage(content="sys"), HumanMessage(content="hi")]
-        count = _inject_context_pairs(prepared, [], "MEMORIES", "")
-        assert count == 2
-        self._assert_gemini_ordering(prepared)
-        # The fixed shape: System, Human, AI(tool_call), Tool — NOT the old
-        # System, AI(tool_call), Tool, Human that Gemini rejects.
-        assert isinstance(prepared[0], SystemMessage)
-        assert isinstance(prepared[1], HumanMessage)
-        assert _is_tool_call_ai(prepared[2])
-        assert isinstance(prepared[3], ToolMessage)
-
-    def test_product_guide_boundary_is_tail_user_after_legacy_memory(self):
-        prepared = [SystemMessage(content="sys"), HumanMessage(content="product?")]
-        boundary = "<managed_product_guide_turn_boundary>fresh</managed>"
-
-        count = _inject_context_pairs(
-            prepared,
-            [],
-            "HISTORICAL MEMORY",
-            "",
-            product_guide_turn_boundary=boundary,
-        )
-
-        assert count == 3
-        assert isinstance(prepared[-2], ToolMessage)
-        assert prepared[-2].content == "HISTORICAL MEMORY"
-        assert isinstance(prepared[-1], HumanMessage)
-        assert prepared[-1].content == boundary
-
-    def test_product_guide_boundary_is_tail_user_after_manager_memory(self):
-        manager = _memory_pair("MANAGER MEMORY")
-        original_content = manager[1].content
-        prepared = [SystemMessage(content="sys"), HumanMessage(content="product?")]
-        boundary = "<managed_product_guide_turn_boundary>fresh</managed>"
-
-        count = _inject_context_pairs(
-            prepared,
-            manager,
-            "",
-            "",
-            product_guide_turn_boundary=boundary,
-        )
-
-        assert count == 3
-        assert manager[1].content == original_content
-        injected = next(
-            message for message in prepared if isinstance(message, ToolMessage)
-        )
-        assert injected.content == original_content
-        assert isinstance(prepared[-1], HumanMessage)
-        assert prepared[-1].content == boundary
-
-    def test_product_guide_boundary_follows_tail_knowledge_too(self):
-        prepared = [SystemMessage(content="sys"), HumanMessage(content="product?")]
-        boundary = "<managed_product_guide_turn_boundary>fresh</managed>"
-
-        count = _inject_context_pairs(
-            prepared,
-            [],
-            "",
-            "KNOWLEDGE",
-            product_guide_turn_boundary=boundary,
-        )
-
-        assert count == 3
-        assert isinstance(prepared[-2], ToolMessage)
-        assert isinstance(prepared[-1], HumanMessage)
-        assert prepared[-1].content == boundary
-
-    def test_product_guide_boundary_is_added_without_transient_context(self):
-        prepared = [SystemMessage(content="sys"), HumanMessage(content="product?")]
-        boundary = "<managed_product_guide_turn_boundary>fresh</managed>"
-
-        count = _inject_context_pairs(
-            prepared,
-            [],
-            "",
-            "",
-            product_guide_turn_boundary=boundary,
-        )
-
-        assert count == 1
-        assert isinstance(prepared[-1], HumanMessage)
-        assert prepared[-1].content == boundary
-
-    def test_knowledge_injected_after_first_human(self):
-        prepared = [SystemMessage(content="sys"), HumanMessage(content="hi")]
-        count = _inject_context_pairs(prepared, [], "", "KNOWLEDGE")
-        assert count == 2
-        self._assert_gemini_ordering(prepared)
-
-    def test_all_three_sources_ordering_and_pairing(self):
-        manager = _memory_pair("MANAGER")  # seam payload is itself tool-call pairs
-        prepared = [
-            SystemMessage(content="sys"),
-            HumanMessage(content="h1"),
-            AIMessage(content="a1"),
-            HumanMessage(content="h2"),
-        ]
-        count = _inject_context_pairs(prepared, manager, "MEM", "KB")
-        assert count == len(manager) + 4
-        self._assert_gemini_ordering(prepared)
-        self._assert_pairing(prepared)
-
-    def test_no_injection_when_all_empty(self):
-        prepared = [SystemMessage(content="sys"), HumanMessage(content="hi")]
-        before = list(prepared)
-        count = _inject_context_pairs(prepared, [], "", "")
-        assert count == 0
-        assert prepared == before
 
 
 class TestMaybeEstimateReasoningTokens:

@@ -2,25 +2,17 @@
 
 Citation verification runs asynchronously on the auxiliary model: ``cite_*``
 returns ``pending`` and a background task writes ``verification_status`` back.
-This module surfaces still-**failed** citations to the agent so it can correct
-them — injected as a synthetic ``check_citation_verification`` tool-call result,
-mirroring ``memory_injection.py``.
+This module renders still-**failed** citations so the agent can correct them.
 
-It is **DB-driven and transient**: the execute node re-computes the failed set
-from ``verification_status`` every turn and re-injects it (excluded from
-summarization via ``is_workspace_injection_message``). So it self-resolves — when
-the agent edits a citation (which resets it to ``pending`` → re-verifies) or
-removes it, it drops out of the injected block on the next turn.
+It is **DB-driven**: the execute node re-computes the failed set from
+``verification_status`` every turn, and the set is appended as a context
+entry when it changes (append-only context injection, D21). So it
+self-resolves — when the agent edits a citation (which resets it to
+``pending`` → re-verifies) or removes it, the next entry no longer lists it,
+and an emptied set appends the resolved notice (O6).
 """
 
-from typing import Any, List, Optional, Tuple
-
-from langchain_core.messages import AIMessage, BaseMessage, ToolMessage
-
-from shared.runtime.core.injection_markers import (
-    CITATION_FEEDBACK_TOOL_CALL_ID_PREFIX as CITATION_FEEDBACK_TOOL_CALL_ID_PREFIX,
-)
-from shared.runtime.core.workspace_injection import content_hash_id
+from typing import Any, List, Optional
 
 #: Cap how many failed citations are listed in one injection (the rest are
 #: summarized as a count) to bound the injected token cost.
@@ -75,47 +67,3 @@ def format_citation_feedback_resolved(model: Optional[str] = None) -> str:
     from shared.runtime.services.guardrails import format_nudge
 
     return format_nudge("citation_feedback_resolved", model=model)
-
-
-def create_citation_feedback_injection_messages(
-    content: str,
-) -> Tuple[AIMessage, ToolMessage]:
-    """Create a synthetic AIMessage + ToolMessage pair for citation feedback.
-
-    Makes it appear as if the agent called ``check_citation_verification`` and
-    received the failed-citation report. The ai+tool pairing keeps providers
-    that require a function-call to precede its response (Gemini) happy.
-
-    Args:
-        content: Formatted failed-citation block from ``format_failed_citations``.
-
-    Returns:
-        Tuple of (AIMessage with tool_call, ToolMessage with the report).
-    """
-    tool_call_id = f"{CITATION_FEEDBACK_TOOL_CALL_ID_PREFIX}{content_hash_id(content)}"
-
-    ai_message = AIMessage(
-        content="",
-        tool_calls=[
-            {
-                "name": "check_citation_verification",
-                "args": {},
-                "id": tool_call_id,
-            }
-        ],
-    )
-    tool_message = ToolMessage(content=content, tool_call_id=tool_call_id)
-    return ai_message, tool_message
-
-
-def is_citation_feedback_injection_message(message: BaseMessage) -> bool:
-    """Check if a message is part of a citation-feedback injection pair."""
-    if isinstance(message, ToolMessage):
-        tool_call_id = getattr(message, "tool_call_id", "")
-        return tool_call_id.startswith(CITATION_FEEDBACK_TOOL_CALL_ID_PREFIX)
-    if isinstance(message, AIMessage):
-        if hasattr(message, "tool_calls") and message.tool_calls:
-            for tc in message.tool_calls:
-                if tc.get("id", "").startswith(CITATION_FEEDBACK_TOOL_CALL_ID_PREFIX):
-                    return True
-    return False

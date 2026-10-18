@@ -94,24 +94,6 @@ ITEM_KINDS = ("memory", "knowledge", "guidance")
 # The up-front memory summary (D35): its kind and its presence section.
 MEMORY_SUMMARY_KIND = "memory_summary"
 
-# --- The rollback flag (spec §I) ----------------------------------------------
-
-INJECTION_MODE_LEGACY = "legacy"
-INJECTION_MODE_APPEND_ONLY = "append_only"
-INJECTION_MODES = (INJECTION_MODE_LEGACY, INJECTION_MODE_APPEND_ONLY)
-
-
-def is_append_only(config: Any) -> bool:
-    """Whether ``config.context_management.injection_mode`` is ``append_only``.
-
-    Strict on purpose: anything but the exact string (a missing section, a
-    ``MagicMock`` config in a test) reads as ``legacy``.
-    """
-    context_management = getattr(config, "context_management", None)
-    mode = getattr(context_management, "injection_mode", None)
-    return isinstance(mode, str) and mode == INJECTION_MODE_APPEND_ONLY
-
-
 # --- Text helpers (spec §A.3-§A.5) --------------------------------------------
 
 _WRAP_CLOSE = "\n</srw_context>"
@@ -489,9 +471,6 @@ __all__ = [
     "ENTRY_SEPARATOR",
     "FOLDED_KEY",
     "INJECTION_KINDS",
-    "INJECTION_MODES",
-    "INJECTION_MODE_APPEND_ONLY",
-    "INJECTION_MODE_LEGACY",
     "ITEM_KINDS",
     "MEMORY_SUMMARY_KIND",
     "PERSIST_ROLE_CONTEXT",
@@ -505,7 +484,6 @@ __all__ = [
     "entry_meta",
     "fold_context_entries",
     "has_folded_carrier",
-    "is_append_only",
     "is_context_entry",
     "is_context_injection",
     "is_legacy_injection",

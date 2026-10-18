@@ -348,26 +348,21 @@ class TestSessionSeams:
     persistent_app callbacks the loop's prefetch uses."""
 
     @staticmethod
-    def _session(*, mode="append_only", manager=None, shell_owner_token=None):
+    def _session(*, manager=None, shell_owner_token=None):
         from agent.api.persistent_session import PersistentSession
 
         session = object.__new__(PersistentSession)
         session.thread_id = "thread-1"
         session.config = MagicMock()
-        session.config.context_management.injection_mode = mode
         session.memory_service = manager
         session.postgres_conn = None
         session.shell_owner_token = shell_owner_token
         return session
 
-    def test_apply_takes_a_stored_set_in_append_only_only(self):
+    def test_apply_takes_a_stored_set_in(self):
         stored = serialize_pending_set(_result(make_memories(), pending_id="set-1"))
         manager = make_async_manager(GatedRetriever(auto=True))
 
-        assert (
-            self._session(mode="legacy", manager=manager).apply_pending_memory(stored)
-            is False
-        )
         assert self._session(manager=None).apply_pending_memory(stored) is False
         session = self._session(manager=manager)
         assert session.apply_pending_memory({"v": 1}) is False

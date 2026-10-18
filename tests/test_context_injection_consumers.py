@@ -20,9 +20,9 @@ from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, Tool
 
 from agent.core.archiver import LLMArchiver
 from agent.core.context import ContextConfig, ContextManager
-from agent.core.guidance_injection import create_guidance_injection_messages
-from agent.core.knowledge_injection import create_charter_injection_messages
-from agent.core.memory_injection import create_memory_injection_messages
+from tests._legacy_injection_rows import create_guidance_injection_messages
+from tests._legacy_injection_rows import create_charter_injection_messages
+from tests._legacy_injection_rows import create_memory_injection_messages
 from agent.services.memory.extraction_engine import MemoryExtractionEngine
 from agent.services.memory.plugins.legacy import build_persistent_query_text
 from agent.services.memory.query import build_digest_query_text

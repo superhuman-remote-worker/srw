@@ -1,22 +1,18 @@
-"""The session loop in ``append_only`` mode (append-only context injection).
+"""The session loop's append-only context injection.
 
 Design: knowledge-base/knowledge/features/append_only_context_injection.md
 (D1, D3, D4, D21, D22, D27, D28); spec:
 knowledge-base/knowledge/plans/append_only_context_injection_wp2_spec.md
 §C, §E.5, §F.5, §F.6 and §K row 2.5.
 
-The session loop (``persistent_graph``) reads
-``context_management.injection_mode`` per turn. In ``append_only`` mode the
-charter, memory, knowledge, citation feedback, the subagent status and the
-App Guide turn boundary are not rebuilt at the tail of every provider call.
-Each provider call plans what is new or changed against the compacted
-history (turn-start retrieval, unchanged), and every planned entry is
-stamped with the turn, appended to the durable list and persisted before
-the provider call, after the input was admitted. The request is the history
-with its entries folded into their carrier. These tests drive the real loop
-with a scripted chat model; the legacy pins live in test_persistent_graph.py,
-test_memory_persistent_equivalence.py, test_officer_charter.py,
-test_app_guide_compaction.py and test_persistent_subagent_prompt_state.py.
+In the session loop (``persistent_graph``) the charter, memory, knowledge,
+citation feedback, the subagent status and the App Guide turn boundary are
+never rebuilt at the tail of a provider call. Each provider call plans what
+is new or changed against the compacted history, and every planned entry is
+stamped with the turn, appended to the durable list and persisted before the
+provider call, after the input was admitted. The request is the history with
+its entries folded into their carrier. These tests drive the real loop with a
+scripted chat model.
 """
 
 from __future__ import annotations
@@ -122,7 +118,7 @@ def _context_manager(
 
 
 class Session:
-    """One session loop with every append_only source live.
+    """One session loop with every context source live.
 
     Charter (officer conference), memory and knowledge (the recording
     MemoryManager), the subagent status (``subagents`` returns the block per
@@ -134,15 +130,12 @@ class Session:
         self,
         script: List[Any],
         *,
-        mode: str = "append_only",
         subagents: Optional[Callable[[], str]] = lambda: SUBAGENTS_A,
         compact: Optional[Callable[[int, List[BaseMessage]], Any]] = None,
     ) -> None:
         self.events: List[tuple] = []
         self.llm = _LoggingModel(script, self.events)
-        self.config = harness._session_config(
-            injections=True, model=MODEL, injection_mode=mode
-        )
+        self.config = harness._session_config(injections=True, model=MODEL)
         self.context_manager = _context_manager(compact)
         self.tools = [
             harness._session_tool(t["function"]["name"]) for t in harness.SESSION_TOOLS
@@ -187,9 +180,7 @@ class Session:
             archive_llm_call=self._archive,
         )
 
-    async def run(
-        self, *inputs: str, get_current_context: Optional[Callable] = None
-    ) -> None:
+    async def run(self, *inputs: str) -> None:
         await run_persistent_loop(
             llm_with_tools=self.llm,
             tools=self.tools,
@@ -202,7 +193,6 @@ class Session:
             project_ids=[harness.PROJECT_ID],
             tool_context=self.tool_context,
             memory_service=self.memory_service,
-            get_current_context=get_current_context,
         )
         assert self.errors == []
 
@@ -459,6 +449,8 @@ class TestAppendOnChange:
 
 
 def _legacy_pieces(provider_input: List[BaseMessage]) -> Dict[str, int]:
+    """Count the shapes the removed per-call injection produced: synthetic
+    tool-call/result pairs and the per-call subagent / App Guide tail."""
     pairs = sum(
         1
         for m in provider_input
@@ -478,7 +470,7 @@ def _legacy_pieces(provider_input: List[BaseMessage]) -> Dict[str, int]:
 
 class TestProviderInput:
     @pytest.mark.asyncio
-    async def test_append_only_skips_the_legacy_pairs_and_tail(self):
+    async def test_no_legacy_pairs_and_no_per_call_tail(self):
         session = Session(
             [tool_turn("read_file", {"path": "a"}, "c1"), text_turn("done")]
         )
@@ -489,23 +481,6 @@ class TestProviderInput:
             assert _legacy_pieces(call) == {"pairs": 0, "tails": 0}
             assert not any(is_context_entry(m) for m in call)
             assert any(FOLDED_KEY in m.additional_kwargs for m in call)
-
-    @pytest.mark.asyncio
-    async def test_legacy_keeps_the_per_call_tail(self):
-        """The same session in legacy mode: the tail is rebuilt per call and
-        never enters the history (the discriminating control)."""
-        session = Session(
-            [tool_turn("read_file", {"path": "a"}, "c1"), text_turn("done")],
-            mode="legacy",
-        )
-
-        await session.run("Go.")
-
-        assert session.entries() == []
-        for call in session.llm.calls:
-            # charter + memory + knowledge pairs; subagents + boundary tails
-            assert _legacy_pieces(call) == {"pairs": 3, "tails": 2}
-            assert not any(FOLDED_KEY in m.additional_kwargs for m in call)
 
     @pytest.mark.asyncio
     async def test_the_archive_gets_the_unfolded_history(self):
@@ -527,43 +502,6 @@ class TestProviderInput:
             )
             assert not any(is_context_entry(m) for m in prepared)
             assert len(history) == len(prepared) + len(TURN_START_KINDS)
-
-    @pytest.mark.asyncio
-    async def test_legacy_archive_call_is_unchanged(self):
-        session = Session([text_turn("done")], mode="legacy")
-
-        await session.run("Go.")
-
-        assert [(args, kwargs) for _p, args, kwargs in session.archived] == [((), {})]
-
-
-# ---------------------------------------------------------------------------
-# The mode is read per turn (sessions hot-swap their config)
-# ---------------------------------------------------------------------------
-
-
-class TestModeIsReadPerTurn:
-    @pytest.mark.asyncio
-    async def test_a_swap_to_append_only_takes_effect_at_the_next_turn(self):
-        session = Session([text_turn("Answer one."), text_turn("Answer two.")])
-        legacy = harness._session_config(
-            injections=True, model=MODEL, injection_mode="legacy"
-        )
-        configs = iter([legacy, session.config])
-
-        await session.run(
-            "Turn one?",
-            "Turn two?",
-            get_current_context=lambda: (session.context_manager, next(configs), None),
-        )
-
-        first, second = session.llm.calls
-        assert _legacy_pieces(first) == {"pairs": 3, "tails": 2}
-        assert _legacy_pieces(second) == {"pairs": 0, "tails": 0}
-        entries = session.entries()
-        assert [entry_kind(e) for e in entries] == TURN_START_KINDS
-        assert {turn_membership(e) for e in entries} == {2}
-        assert entry_meta(entries[-1])["section"] == "turn_boundary:2"
 
 
 # ---------------------------------------------------------------------------
@@ -703,21 +641,6 @@ class TestAsyncRetrieval:
         assert session.memory_service.retrieval_stats()["degraded"] == 2
         steps = [c.kwargs["step_type"] for c in archiver.audit_step.call_args_list]
         assert steps == ["memory_pipeline_degraded"]
-
-    @pytest.mark.asyncio
-    async def test_legacy_mode_still_fails_the_turn(self):
-        session = Session([text_turn("One.")], mode="legacy")
-        session.memory_service = make_async_manager(
-            GatedRetriever(auto=True),
-            scorer=BrokenScorer(ValueError("rerank route returned HTML")),
-        )
-
-        with pytest.raises(AssertionError):
-            await session.run("Turn one?")
-
-        assert session.errors
-        assert session.llm.calls == []
-        assert session.memory_service.retrieval_stats()["started"] == 0
 
 
 # ---------------------------------------------------------------------------
@@ -1039,19 +962,6 @@ class TestIdlePrefetch:
             ("save", "write")
         )
         assert SESSION_PENDING_MEMORY_KEY in session.metadata
-
-    @pytest.mark.asyncio
-    async def test_legacy_mode_neither_prefetches_nor_stores(self):
-        session = PrefetchSession(
-            [text_turn("One.")], retriever=ExchangeRetriever(), mode="legacy"
-        )
-
-        await session.run("Turn one?")
-
-        assert session.retriever.prefetch_queries == []
-        assert session.metadata == {}
-        assert session.input_checks == 0
-        assert not any(event == "save" for event, *_ in session.events)
 
     @pytest.mark.asyncio
     async def test_a_stopped_turn_ends_without_a_prefetch(self):

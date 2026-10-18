@@ -31,7 +31,6 @@ from agent.services.memory import (
     CaptureEvent,
     InjectionBlock,
     MemoryManager,
-    MemoryPayload,
     MemoryRuntime,
     Scored,
     UnknownMemoryPluginError,
@@ -262,7 +261,6 @@ class TestFromConfig:
         payload = await manager.assemble(AssembleRequest(query_text="anything"))
         assert payload.blocks == []
         assert payload.stats.errors == []
-        assert payload.messages() == []
         # capture is a no-op too — must not raise
         await manager.capture(CaptureEvent(kind="turn_end"))
         assert manager.extension_tools() == []
@@ -331,7 +329,7 @@ class TestAssemble:
     @pytest.mark.asyncio
     async def test_blocks_carry_their_store_records_in_rank_order(self):
         # Append-only context injection renders its own entries from the
-        # records; the legacy content/messages stay as they were.
+        # records; the manager renders nothing itself.
         mem = make_candidate(kind="memory", text="m-fact", record_id="m1")
         kb1 = make_candidate(kind="knowledge", text="k-one", record_id="k1")
         kb2 = make_candidate(kind="knowledge", text="k-two", record_id="k2")
@@ -347,8 +345,6 @@ class TestAssemble:
         by_kind = {b.kind: b for b in payload.blocks}
         assert by_kind["memory"].records == [mem.record]
         assert by_kind["knowledge"].records == [kb1.record, kb2.record]
-        assert by_kind["memory"].content
-        assert len(by_kind["memory"].messages) == 2
 
     def test_injection_block_records_default_empty(self):
         assert InjectionBlock(kind="memory").records == []
@@ -432,7 +428,6 @@ class TestAssemble:
         payload = await manager.assemble(AssembleRequest(query_text="q"))
         assert payload.stats.blocks == 1
         assert payload.blocks[0].kind == "exotic"
-        assert payload.blocks[0].messages == []
         assert payload.blocks[0].items[0]["record_id"] == "x1"
 
     @pytest.mark.asyncio
@@ -441,10 +436,10 @@ class TestAssemble:
             MemoryRuntime(), retrievers=[("r", FakeRetriever([make_candidate()]))]
         )
 
-        def _explode(req, items):
+        def _explode(items):
             raise RuntimeError("kernel bug")
 
-        monkeypatch.setattr(manager, "_render_blocks", _explode)
+        monkeypatch.setattr(manager, "_blocks_by_kind", _explode)
         payload = await manager.assemble(AssembleRequest(query_text="q"))
         assert payload.blocks == []
         assert payload.stats.errors == ["assemble:kernel: RuntimeError: kernel bug"]
@@ -454,17 +449,6 @@ class TestAssemble:
         manager = MemoryManager(MemoryRuntime())
         payload = await manager.assemble(AssembleRequest(query_text="q"))
         assert payload.stats.latency_ms >= 0.0
-
-    def test_payload_messages_flatten_in_block_order(self):
-        ai = AIMessage(content="", tool_calls=[{"name": "x", "args": {}, "id": "1"}])
-        tool = ToolMessage(content="block", tool_call_id="1")
-        payload = MemoryPayload(
-            blocks=[
-                InjectionBlock(kind="memory", messages=[ai, tool]),
-                InjectionBlock(kind="knowledge", messages=[]),
-            ]
-        )
-        assert payload.messages() == [ai, tool]
 
     def test_stats_to_dict_round_trip(self):
         stats = AssembleStats(

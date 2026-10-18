@@ -326,12 +326,6 @@ nudges:
 
   # ----- src/shared/runtime/services/recall_store.py -----
 
-  memory_block_header_pinned: "--- Pinned Memories (TTL-active) ---"
-  memory_block_header_retrieved: "--- Retrieved Memories (relevance-ranked) ---"
-  # Placeholders: {count} (full summary string e.g. "2 items: 0 pinned + 2 retrieved"),
-  # {tokens} (already-formatted, e.g. "150")
-  memory_block_footer: "--- End Memories ({count}, ~{tokens} tokens) ---"
-
   # Sites: RecallStore.render_memory_entry (append-only context injection).
   # Heads one appended memory entry. The entry stays in the history as is, so
   # this text must carry no per-turn data (no counts, TTLs or token totals).

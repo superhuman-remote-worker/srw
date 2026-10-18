@@ -377,7 +377,6 @@ class TestSeamIngest:
         await ingest_question(question, arm, handles)
         first = managers[0].assembles[0]
         assert first.query_text == question.sessions[0].turns[0].content
-        assert first.model == "test-model"
 
     @pytest.mark.asyncio
     async def test_read_path_digest_flag_switches_query_formation(self, question):

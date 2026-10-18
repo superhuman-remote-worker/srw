@@ -2181,7 +2181,7 @@ class TestGenerateTitle:
     async def test_injected_context_is_not_sampled(self):
         """Injected context (memory, charter, App Guide boundary) is filtered
         before the 10-message sample: it is not what the session is about."""
-        from agent.core.knowledge_injection import create_charter_injection_messages
+        from tests._legacy_injection_rows import create_charter_injection_messages
         from shared.runtime.core.context_entries import make_context_entry
 
         charter_ai, charter_tool = create_charter_injection_messages("CHARTER_TEXT")

@@ -24,7 +24,6 @@ from shared.runtime.core.workspace_injection import (
     create_phase_instruction_message,
     create_todos_human_message,
     create_instruction_tool_messages,
-    find_tail_injection_anchor,
     is_workspace_injection_message,
 )
 
@@ -164,62 +163,27 @@ class TestContentHashId:
         assert tool1.tool_call_id != tool2.tool_call_id
 
     def test_memory_pair_deterministic(self):
-        from agent.core.memory_injection import create_memory_injection_messages
+        from tests._legacy_injection_rows import create_memory_injection_messages
 
         _, tool1 = create_memory_injection_messages("memories")
         _, tool2 = create_memory_injection_messages("memories")
         assert tool1.tool_call_id == tool2.tool_call_id
 
     def test_knowledge_pair_deterministic(self):
-        from agent.core.knowledge_injection import create_knowledge_injection_messages
+        from tests._legacy_injection_rows import create_knowledge_injection_messages
 
         _, tool1 = create_knowledge_injection_messages("notes")
         _, tool2 = create_knowledge_injection_messages("notes")
         assert tool1.tool_call_id == tool2.tool_call_id
 
     def test_citation_pair_deterministic(self):
-        from agent.core.citation_feedback_injection import (
+        from tests._legacy_injection_rows import (
             create_citation_feedback_injection_messages,
         )
 
         _, tool1 = create_citation_feedback_injection_messages("failed")
         _, tool2 = create_citation_feedback_injection_messages("failed")
         assert tool1.tool_call_id == tool2.tool_call_id
-
-
-# =============================================================================
-# find_tail_injection_anchor — transient block goes after the conversation
-# =============================================================================
-
-
-class TestFindTailInjectionAnchor:
-    """The transient injection block anchors at the tail of the payload.
-
-    Placed after the stable conversation prefix so provider prompt caches
-    reuse the history between turns; anchored after the last Human/Tool
-    message so the synthetic function-call pairs always follow a user or
-    function-response turn (Gemini's ordering rule).
-    """
-
-    def test_end_after_human(self):
-        msgs = [SystemMessage(content="s"), HumanMessage(content="h")]
-        assert find_tail_injection_anchor(msgs) == 2
-
-    def test_end_after_tool_message(self):
-        msgs = [
-            HumanMessage(content="h"),
-            AIMessage(content="", tool_calls=[{"name": "t", "args": {}, "id": "c1"}]),
-            ToolMessage(content="r", tool_call_id="c1"),
-        ]
-        assert find_tail_injection_anchor(msgs) == 3
-
-    def test_steps_back_past_trailing_bare_ai(self):
-        msgs = [HumanMessage(content="h"), AIMessage(content="text")]
-        assert find_tail_injection_anchor(msgs) == 1
-
-    def test_no_human_or_tool_returns_len(self):
-        assert find_tail_injection_anchor([]) == 0
-        assert find_tail_injection_anchor([SystemMessage(content="s")]) == 1
 
 
 # =============================================================================

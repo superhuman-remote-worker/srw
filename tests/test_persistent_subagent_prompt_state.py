@@ -7,12 +7,18 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 
-from shared.runtime.core.message_markers import PERSIST_ROLE_EVENT, PERSIST_ROLE_KEY
+from agent.core.context_injection import format_active_subagents_none
+from shared.runtime.core.context_entries import (
+    FOLDED_KEY,
+    entry_body,
+    entry_kind,
+    is_context_entry,
+)
+from shared.runtime.core.message_markers import PERSIST_ROLE_CONTEXT, PERSIST_ROLE_KEY
 from agent.persistent_graph import (
     PersistentLoopCallbacks,
     TurnResult,
     _execute_turn,
-    _inject_context_pairs,
     run_persistent_loop,
 )
 
@@ -116,28 +122,67 @@ async def test_persistent_loop_stamps_parent_turn_before_execution(monkeypatch):
     assert tool_context._current_turn_count == 7
 
 
-def test_active_child_state_precedes_the_final_product_boundary():
-    prepared = [SystemMessage(content="sys"), HumanMessage(content="question")]
-
-    added = _inject_context_pairs(
-        prepared,
-        [],
-        "",
-        "",
-        active_subagents_block="<active_subagents>one child</active_subagents>",
-        product_guide_turn_boundary="<current_request>question</current_request>",
-    )
-
-    assert added == 2
-    assert isinstance(prepared[-2], HumanMessage)
-    assert prepared[-2].content == "<active_subagents>one child</active_subagents>"
-    assert prepared[-2].additional_kwargs[PERSIST_ROLE_KEY] == PERSIST_ROLE_EVENT
-    assert isinstance(prepared[-1], HumanMessage)
-    assert prepared[-1].content == "<current_request>question</current_request>"
+def _persisted(callbacks: PersistentLoopCallbacks) -> list:
+    return [call.args[0] for call in callbacks.persist_message.await_args_list]
 
 
 @pytest.mark.asyncio
-async def test_active_child_state_is_refreshed_per_call_and_never_persisted():
+async def test_active_child_state_precedes_the_final_product_boundary():
+    from shared.runtime.core.skill_resolution import (
+        APP_GUIDE_LOADER_TOOL,
+        add_persistent_system_skills,
+    )
+
+    active_block = "<active_subagents>one child</active_subagents>"
+    tool_context = SimpleNamespace(
+        knowledge_bindings=[],
+        citation_engine=None,
+        subagent_runtime=SimpleNamespace(active_subagents_block=lambda: active_block),
+    )
+    config = _config()
+    config.extra = {"_resolved_skills": add_persistent_system_skills({})}
+    captured: list[list] = []
+    callbacks = _callbacks()
+    durable_messages = [SystemMessage(content="sys"), HumanMessage(content="question")]
+
+    await _execute_turn(
+        llm_with_tools=_streaming_llm([AIMessage(content="done")], captured),
+        tool_map={APP_GUIDE_LOADER_TOOL: _tool(APP_GUIDE_LOADER_TOOL)},
+        context_manager=_context_manager(),
+        messages=durable_messages,
+        callbacks=callbacks,
+        llm_timeout=600,
+        auxiliary_llm=None,
+        config=config,
+        tool_context=tool_context,
+        turn_id=5,
+    )
+
+    entries = [m for m in durable_messages if is_context_entry(m)]
+    assert [entry_kind(m) for m in entries] == ["subagents", "turn_boundary"]
+    assert entry_body(entries[0]) == active_block
+    assert "<managed_product_guide_turn_boundary" in entry_body(entries[1])
+    assert all(
+        m.additional_kwargs[PERSIST_ROLE_KEY] == PERSIST_ROLE_CONTEXT for m in entries
+    )
+    assert _persisted(callbacks)[:2] == entries
+    # The question carries the child state, then the boundary as the last text.
+    carrier = captured[0][-1]
+    assert isinstance(carrier, HumanMessage)
+    assert carrier.additional_kwargs[FOLDED_KEY] == ["subagents", "turn_boundary"]
+    assert carrier.content.index(active_block) < carrier.content.index(
+        "<managed_product_guide_turn_boundary"
+    )
+    assert carrier.content.endswith(str(entries[1].content))
+
+
+@pytest.mark.asyncio
+async def test_active_child_state_is_read_per_call_and_appended_when_it_changes():
+    """The status is read before every provider call and appended as a
+    ``subagents`` entry only when it changed; each entry is durable history
+    (persisted as a context row) and the next request starts with the
+    previous one. Design change from the per-call tail, which rebuilt the
+    block for every call and never persisted it."""
     active_block = "<active_subagents>reviewer is running</active_subagents>"
     runtime = MagicMock()
     runtime.active_subagents_block = MagicMock(side_effect=[active_block, ""])
@@ -173,15 +218,39 @@ async def test_active_child_state_is_refreshed_per_call_and_never_persisted():
     )
 
     assert runtime.active_subagents_block.call_count == 2
-    assert any(message.content == active_block for message in captured[0])
-    assert all(message.content != active_block for message in captured[1])
-    assert all(message.content != active_block for message in durable_messages)
-    persisted = [call.args[0] for call in callbacks.persist_message.await_args_list]
-    assert all(message.content != active_block for message in persisted)
+    cleared = format_active_subagents_none("test-model")
+    entries = [m for m in durable_messages if is_context_entry(m)]
+    assert [entry_kind(m) for m in entries] == ["subagents", "subagents"]
+    assert [entry_body(m) for m in entries] == [active_block, cleared.strip()]
+    persisted_entries = [m for m in _persisted(callbacks) if is_context_entry(m)]
+    assert persisted_entries == entries
+    assert all(
+        m.additional_kwargs[PERSIST_ROLE_KEY] == PERSIST_ROLE_CONTEXT for m in entries
+    )
+
+    # Call 1: the running child rides the user's message.
+    assert len(captured) == 2
+    first_carrier = captured[0][-1]
+    assert first_carrier.additional_kwargs[FOLDED_KEY] == ["subagents"]
+    assert active_block in first_carrier.content
+    # Call 2 starts with request 1 unchanged; the cleared status rides the
+    # tool result, the old status is never re-sent.
+    assert captured[1][: len(captured[0])] == captured[0]
+    second_carrier = captured[1][-1]
+    assert second_carrier.type == "tool"
+    assert second_carrier.additional_kwargs[FOLDED_KEY] == ["subagents"]
+    assert second_carrier.content.endswith(str(entries[1].content))
+    assert active_block not in second_carrier.content
 
 
 @pytest.mark.asyncio
-async def test_empty_retry_archives_each_response_with_its_fresh_provider_input():
+async def test_empty_retry_archives_each_response_with_its_provider_input():
+    """An empty-response retry is archived and billed as its own attempt.
+
+    The retry re-sends the request the planner built for this provider call:
+    the status is read once, before the first attempt (there is no per-call
+    tail to rebuild for the retry).
+    """
     first_block = "<active_subagents>reviewer is running</active_subagents>"
     retry_block = "<active_subagents>reviewer completed</active_subagents>"
     runtime = MagicMock()
@@ -237,7 +306,7 @@ async def test_empty_retry_archives_each_response_with_its_fresh_provider_input(
         tool_context=tool_context,
     )
 
-    assert runtime.active_subagents_block.call_count == 2
+    assert runtime.active_subagents_block.call_count == 1
     assert len(provider_inputs) == 2
     assert archive.call_count == 2
     first_input, first_response, first_metrics = archive.call_args_list[0].args
@@ -256,10 +325,10 @@ async def test_empty_retry_archives_each_response_with_its_fresh_provider_input(
         "retry-attempt",
     ]
     assert result.metrics["model"] == "retry-attempt"
-    assert any(message.content == first_block for message in first_input)
-    assert all(message.content != retry_block for message in first_input)
-    assert any(message.content == retry_block for message in retry_input)
-    assert all(message.content != first_block for message in retry_input)
+    assert retry_input == first_input
+    assert first_input[-1].additional_kwargs[FOLDED_KEY] == ["subagents"]
+    assert first_block in first_input[-1].content
+    assert all(retry_block not in str(message.content) for message in retry_input)
 
 
 @pytest.mark.asyncio

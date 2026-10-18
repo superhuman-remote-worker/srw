@@ -2465,12 +2465,6 @@ class ContextManagementConfig:
     summarization_template: str = "summarization_prompt.txt"
     reasoning_level: str = "high"
     max_summary_length: int = 10000
-    # Append-only context injection rollback flag (WP2 spec §I): "legacy"
-    # rebuilds the per-request transient tail; "append_only" appends typed
-    # context entries to the history only when their content changes. The
-    # carrier fold, the injection predicate, persistence and restore work the
-    # same in both modes.
-    injection_mode: str = "legacy"
 
 
 @dataclass
@@ -3337,23 +3331,6 @@ def _parse_auxiliary_config(data: Dict[str, Any]) -> AuxiliaryConfig:
     )
 
 
-def _parse_injection_mode(value: Any) -> str:
-    """``context_management.injection_mode``: ``legacy`` (default) or ``append_only``."""
-    from shared.runtime.core.context_entries import (
-        INJECTION_MODE_LEGACY,
-        INJECTION_MODES,
-    )
-
-    if value is None:
-        return INJECTION_MODE_LEGACY
-    if value not in INJECTION_MODES:
-        raise ValueError(
-            f"context_management.injection_mode must be one of "
-            f"{', '.join(INJECTION_MODES)}; got {value!r}"
-        )
-    return value
-
-
 def _parse_reasoning_level_value(value: Any) -> Optional[str]:
     """A reasoning level from YAML; an unquoted ``off`` arrives as ``False``."""
     if value is None:
@@ -3580,7 +3557,6 @@ def load_agent_config(
         ),
         reasoning_level=context_data.get("reasoning_level", "high"),
         max_summary_length=context_data.get("max_summary_length", 10000),
-        injection_mode=_parse_injection_mode(context_data.get("injection_mode")),
     )
 
     phase_data = data.get("phase_settings", {})
@@ -3855,7 +3831,6 @@ def load_agent_config_from_dict(
         ),
         reasoning_level=context_data.get("reasoning_level", "high"),
         max_summary_length=context_data.get("max_summary_length", 10000),
-        injection_mode=_parse_injection_mode(context_data.get("injection_mode")),
     )
 
     phase_data = data.get("phase_settings", {})

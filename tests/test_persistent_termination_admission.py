@@ -1548,7 +1548,6 @@ async def test_direct_human_stop_before_provider_cancels_and_leaves_model_contex
     llm = MagicMock(reasoning=None)
     llm.astream = _stream
     memory_service = MagicMock()
-    memory_service.assemble = AsyncMock()
     memory_service.capture = AsyncMock()
     git_manager = MagicMock()
     git_manager.is_active = True
@@ -1589,7 +1588,7 @@ async def test_direct_human_stop_before_provider_cancels_and_leaves_model_contex
     )
 
     assert provider_calls == 0
-    memory_service.assemble.assert_not_awaited()
+    memory_service.start_retrieval.assert_not_called()
     memory_service.capture.assert_not_awaited()
     git_manager.has_uncommitted_changes.assert_not_called()
     git_manager.has_unpushed_commits.assert_not_called()
@@ -2203,7 +2202,9 @@ async def test_task_cancellation_before_admission_quarantines_delivery(
     llm = MagicMock(reasoning=None)
     llm.astream = _stream
     memory_service = MagicMock()
-    memory_service.assemble = AsyncMock(side_effect=asyncio.CancelledError)
+    # The task is cancelled while the turn starts its memory retrieval,
+    # before the provider is admitted.
+    memory_service.start_retrieval = MagicMock(side_effect=asyncio.CancelledError)
     memory_service.capture = AsyncMock()
     messages = []
     callbacks = _callbacks(

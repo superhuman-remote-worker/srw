@@ -741,7 +741,7 @@ class TestObservationWindowFiltersBeforeCap:
 
     @staticmethod
     def _history():
-        from agent.core.memory_injection import create_memory_injection_messages
+        from tests._legacy_injection_rows import create_memory_injection_messages
         from shared.runtime.core.context_entries import make_context_entry
 
         real = [

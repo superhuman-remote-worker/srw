@@ -93,9 +93,10 @@ _POST_SPLIT_OVERLAY_ADDITIONS: dict[str, tuple[str, ...]] = {
     # auxiliary.summarization_reasoning_level (both roles; same value as the
     # dataclass default, so the effective compare needs no exclusion).
     # Append-only context injection WP2: the shared root states
-    # context_management.injection_mode and memory.max_memories_per_entry
-    # (both roles; same values as the dataclass defaults, so the effective
-    # compare needs no exclusion).
+    # memory.max_memories_per_entry (both roles; same value as the dataclass
+    # default, so the effective compare needs no exclusion). Its rollback
+    # flag, context_management.injection_mode, was added then and removed in
+    # WP6, so it is in neither the baseline nor the overlays.
     # Append-only context injection WP5a: the shared root binds memory_search
     # (a new category, tools.memory) and its memory.pipeline.extensions entry,
     # both roles (D34). Both differ from the dataclass defaults ([]), so the
@@ -104,7 +105,6 @@ _POST_SPLIT_OVERLAY_ADDITIONS: dict[str, tuple[str, ...]] = {
         "delegation.max_concurrent",
         "delegation.run_in_background_default",
         "auxiliary.summarization_reasoning_level",
-        "context_management.injection_mode",
         "memory.max_memories_per_entry",
         "tools.memory",
         "memory.pipeline.extensions",
@@ -116,7 +116,6 @@ _POST_SPLIT_OVERLAY_ADDITIONS: dict[str, tuple[str, ...]] = {
     "session": (
         "limits.llm_inproc_retries",
         "auxiliary.summarization_reasoning_level",
-        "context_management.injection_mode",
         "memory.max_memories_per_entry",
         "tools.memory",
         "memory.pipeline.extensions",

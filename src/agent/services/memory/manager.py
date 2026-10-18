@@ -12,7 +12,7 @@ not kill a turn — but every contained failure is logged with the
 exception type and recorded in AssembleStats.errors. Loud degradation,
 never silent.
 
-Asynchronous retrieval (``context_management.injection_mode: append_only``,
+Asynchronous retrieval (append-only context injection,
 WP3 of knowledge-base/knowledge/plans/append_only_context_injection_plan_2026_10_05.md;
 D6-D8, D10, D13, D32 of features/append_only_context_injection.md). The
 manager owns one retrieval task per conversation: ``start_retrieval`` runs
@@ -150,8 +150,7 @@ def merge_retrieval_results(
     The newer retrieval's records come first, in its rank order (its query
     is the current request); the prefetch's records it does not hold follow
     in theirs. Only ``records`` are merged: the planner renders its entries
-    from them, the legacy ``content``/``messages`` are not used in
-    append_only mode. The result keeps the newer retrieval's seq and stats.
+    from them. The result keeps the newer retrieval's seq and stats.
     """
     blocks: List[InjectionBlock] = []
     kinds: List[str] = []
@@ -178,8 +177,6 @@ def merge_retrieval_results(
         blocks.append(
             InjectionBlock(
                 kind=kind,
-                content=first.content if first is not None else "",
-                messages=list(first.messages) if first is not None else [],
                 token_count=sum(getattr(r, "token_count", 0) or 0 for r in records),
                 items=list(first.items) if first is not None else [],
                 records=records,
@@ -230,7 +227,7 @@ class MemoryManager:
         # Once a persistent-session claimant begins teardown, no detached
         # memory writer may be admitted behind its quiescence barrier.
         self._background_closed = False
-        # Asynchronous retrieval (append_only, WP3): at most one task in
+        # Asynchronous retrieval (WP3): at most one task in
         # flight, and the latest finished result waiting to be taken in.
         self._retrieval_task: Optional[asyncio.Task] = None
         self._pending_retrieval: Optional[RetrievalResult] = None
@@ -335,8 +332,8 @@ class MemoryManager:
         ⇒ required" — the caller fails the turn loud). See
         knowledge-base/knowledge/issues/openrouter_auxiliary_crashes_session_via_memory_reranker.md
         and knowledge-base/knowledge/issues/reranker_transient_fault_hard_fails_job.md.
-        In append_only mode ``start_retrieval`` runs this off the request
-        path and reports that error instead of raising it (D13).
+        ``start_retrieval`` runs this off the request path and reports that
+        error instead of raising it (D13).
         """
         watch = _StopWatch()
         stats = AssembleStats()
@@ -388,7 +385,7 @@ class MemoryManager:
                 except Exception as e:
                     self._record_failure(stats, "policy", name, e)
 
-            blocks = self._render_blocks(req, items)
+            blocks = self._blocks_by_kind(items)
 
             stats.injected_total = sum(len(b.items) for b in blocks)
             stats.tokens_injected = sum(b.token_count for b in blocks)
@@ -406,20 +403,12 @@ class MemoryManager:
             stats.latency_ms = watch.elapsed_ms()
             return MemoryPayload(blocks=[], stats=stats)
 
-    def _render_blocks(
-        self, req: AssembleRequest, items: List[Scored]
-    ) -> List[InjectionBlock]:
-        """Turn the final selection into ready-to-inject blocks.
+    def _blocks_by_kind(self, items: List[Scored]) -> List[InjectionBlock]:
+        """Group the final selection into one block per kind, in rank order.
 
-        Injection message mechanics live here (manager-internal, not a
-        plugin stage), transplanted unchanged from the legacy worker
-        execute path: memory → RecallStore.assemble_memory_block + the
-        synthetic ``recall_memories`` pair; knowledge → KnowledgeStore.
-        assemble_knowledge_block + the synthetic ``kb_search`` pair. The
-        exact call shapes matter for byte-equivalence: ``model=`` only —
-        the legacy calls never pass a budget (the memory list is already
-        budget-fit by the store; the KB block is uncapped, B5/Phase 3).
-        Lazy imports match the legacy call-site style.
+        A block carries the store records (the planner renders its entries
+        from them, append-only context injection) and the provenance of each
+        item.
         """
         blocks: List[InjectionBlock] = []
         by_kind: dict = {}
@@ -430,28 +419,7 @@ class MemoryManager:
             records = [
                 s.candidate.record for s in group if s.candidate.record is not None
             ]
-            content = ""
-            messages: List[Any] = []
-
-            if kind == "memory" and records:
-                from agent.core.memory_injection import create_memory_injection_messages
-                from shared.runtime.services.recall_store import RecallStore
-
-                content = RecallStore.assemble_memory_block(records, model=req.model)
-                if content:
-                    messages = list(create_memory_injection_messages(content))
-            elif kind == "knowledge" and records:
-                from agent.core.knowledge_injection import (
-                    create_knowledge_injection_messages,
-                )
-                from shared.runtime.services.knowledge_store import KnowledgeStore
-
-                content = KnowledgeStore.assemble_knowledge_block(
-                    records, model=req.model
-                )
-                if content:
-                    messages = list(create_knowledge_injection_messages(content))
-            elif kind not in ("memory", "knowledge"):
+            if kind not in ("memory", "knowledge"):
                 logger.warning(
                     "No renderer for injection kind '%s' — "
                     "block carries provenance only",
@@ -461,8 +429,6 @@ class MemoryManager:
             blocks.append(
                 InjectionBlock(
                     kind=kind,
-                    content=content,
-                    messages=messages,
                     token_count=sum(s.candidate.token_count for s in group),
                     items=[
                         {
@@ -480,7 +446,7 @@ class MemoryManager:
         return blocks
 
     # ------------------------------------------------------------------
-    # Asynchronous retrieval (append_only, WP3)
+    # Asynchronous retrieval (WP3)
     # ------------------------------------------------------------------
 
     @property
@@ -1013,7 +979,7 @@ class MemoryManager:
         timeout the still-running tasks stay detached (best-effort) and the job
         proceeds. ``capture()`` never raises, so gathering is always clean.
 
-        A running retrieval (append_only) is cancelled first: no later request
+        A running retrieval is cancelled first: no later request
         takes its result in. It is not counted in the return value.
         """
         try:
@@ -1052,7 +1018,7 @@ class MemoryManager:
         suppresses cancellation is surfaced to the caller so the physical
         lease remains held for the reaper rather than exposing a successor.
 
-        The retrieval task (append_only) is cancelled at once, not drained:
+        The retrieval task is cancelled at once, not drained:
         it mostly reads, but a hybrid search updates the access stats of the
         rows it returns, so it is joined like the captures and a retrieval
         that ignores cancellation fails the barrier too. It is not counted in

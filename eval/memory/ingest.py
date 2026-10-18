@@ -227,7 +227,6 @@ async def _replay_session_seam(
 
     from agent.services.memory import AssembleRequest, CaptureEvent
 
-    model = getattr(handles.config.llm, "model", None)
     messages: List[Any] = []
     turn_count = 0
     prefix = _first_user_prefix(session, arm)
@@ -238,10 +237,7 @@ async def _replay_session_seam(
 
         if arm.ingestion.read_path_per_turn:
             payload = await manager.assemble(
-                AssembleRequest(
-                    query_text=_form_query_text(handles, messages),
-                    model=model,
-                )
+                AssembleRequest(query_text=_form_query_text(handles, messages))
             )
             result.assembles += 1
             result.errors.extend(payload.stats.errors)

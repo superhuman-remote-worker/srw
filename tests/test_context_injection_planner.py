@@ -25,7 +25,6 @@ from langchain_core.messages import (
     ToolMessage,
 )
 
-import agent.core.context_injection as planner_module
 from agent.core.context_injection import (
     ContextSources,
     Item,
@@ -42,7 +41,7 @@ from agent.core.citation_feedback_injection import (
     format_citation_feedback_resolved,
     format_failed_citations,
 )
-from agent.core.memory_injection import create_memory_injection_messages
+from tests._legacy_injection_rows import create_memory_injection_messages
 from shared.runtime.core.context_entries import (
     INJECTION_KINDS,
     PERSIST_ROLE_CONTEXT,
@@ -52,7 +51,6 @@ from shared.runtime.core.context_entries import (
     entry_body,
     entry_meta,
     fold_context_entries,
-    is_append_only,
     is_context_entry,
     knowledge_item_key,
     make_context_entry,
@@ -847,13 +845,6 @@ class TestWholePlan:
         assert "memory" not in kinds(planned)
         assert "charter" in kinds(planned) and "knowledge" in kinds(planned)
         assert planned.memory_appended == 0
-
-    def test_is_append_only_is_re_exported(self):
-        assert planner_module.is_append_only is is_append_only
-        config = SimpleNamespace(
-            context_management=SimpleNamespace(injection_mode="append_only")
-        )
-        assert planner_module.is_append_only(config)
 
 
 @pytest.mark.parametrize("kind", ["memory", "knowledge", "guidance"])

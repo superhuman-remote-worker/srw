@@ -2400,13 +2400,9 @@ class PersistentSession:
         becomes the memory manager's pending set, which the first provider
         call of the next turn takes in. A set the manager already holds or
         has taken in is not taken again (a warm session at its next claim).
-        append_only only; returns True when the set was taken in.
+        Returns True when the set was taken in.
         """
         if stored is None or self.memory_service is None:
-            return False
-        from shared.runtime.core.context_entries import is_append_only
-
-        if not is_append_only(self.config):
             return False
         seed = getattr(self.memory_service, "seed_prefetch", None)
         if seed is None:
@@ -2439,10 +2435,6 @@ class PersistentSession:
             or self.memory_service is None
             or self.postgres_conn is None
         ):
-            return
-        from shared.runtime.core.context_entries import is_append_only
-
-        if not is_append_only(self.config):
             return
         reader = getattr(self.postgres_conn, "get_thread_pending_memory", None)
         if reader is None:

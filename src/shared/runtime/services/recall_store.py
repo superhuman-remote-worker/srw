@@ -1294,8 +1294,7 @@ class RecallStore:
     ) -> str:
         """Body of one append-only memory entry (append-only injection, D2).
 
-        Unlike :meth:`assemble_memory_block` there is no pinned/retrieved
-        split and no token footer: an appended entry stays in the history
+        There is no token footer: an appended entry stays in the history
         unchanged, so it carries nothing that varies per turn (D11).
 
         Args:
@@ -1369,67 +1368,6 @@ class RecallStore:
         if stats.topics:
             lines.append("Frequent topics: " + ", ".join(stats.topics) + ".")
         lines.append(format_nudge("memory_summary_hint", model=model))
-        return "\n".join(lines)
-
-    @classmethod
-    def assemble_memory_block(
-        cls,
-        memories: List[MemoryRecord],
-        budget_tokens: int = 10000,
-        model: Optional[str] = None,
-    ) -> str:
-        """Assemble formatted memory block for injection.
-
-        Separates TTL-active (pinned) memories from retrieval-based memories
-        for clear visual distinction.
-
-        Args:
-            memories: List of MemoryRecord objects (pinned first, then retrieved)
-            budget_tokens: Token budget (for display in footer)
-            model: Model id used to resolve family-specific block headers
-                / footer. Falls through to the default family if None.
-
-        Returns:
-            Formatted memory block string
-        """
-        if not memories:
-            return ""
-
-        pinned = [m for m in memories if m.remaining_turns and m.remaining_turns > 0]
-        retrieved = [
-            m for m in memories if not (m.remaining_turns and m.remaining_turns > 0)
-        ]
-        tokens_used = sum(m.token_count for m in memories)
-
-        from shared.runtime.services.guardrails import format_nudge
-
-        lines = []
-        idx = 1
-
-        if pinned:
-            lines.append(format_nudge("memory_block_header_pinned", model=model))
-            lines.append("")
-            for memory in pinned:
-                lines.append(cls.format_memory(memory, idx))
-                lines.append("")
-                idx += 1
-
-        if retrieved:
-            lines.append(format_nudge("memory_block_header_retrieved", model=model))
-            lines.append("")
-            for memory in retrieved:
-                lines.append(cls.format_memory(memory, idx))
-                lines.append("")
-                idx += 1
-
-        lines.append(
-            format_nudge(
-                "memory_block_footer",
-                model=model,
-                count=f"{len(memories)} items: {len(pinned)} pinned + {len(retrieved)} retrieved",
-                tokens=f"{tokens_used:,}",
-            )
-        )
         return "\n".join(lines)
 
     # =========================================================================
