@@ -733,6 +733,16 @@ async def agent_get_thread_workspace_locked(
     workspace_backend = _thread_workspace_backend(thread)
     if workspace_backend == "vm" and not isinstance(vm, dict):
         raise HTTPException(409, "VM workspace authority is malformed")
+    if (
+        entry_protected_marker == "on"
+        and workspace_backend == "sandbox"
+        and str(ws.get("status") or "") not in {"ready", "failed"}
+    ):
+        # A protected attach takes a ready workspace with its protected mount,
+        # or a credential-free wait; anything else ends it. A workspace still
+        # on its way once the engage is done (a warm agent is bound in that
+        # instant, before the Pod exists) is a wait, never "ready" + creating.
+        return _protected_workspace_wait_payload(state="engaging")
     if thread.get("execution_lane") == "stateless" and workspace_backend == "sandbox":
         workspace_status = str(ws.get("status") or "")
         restore_marker_present = WORKSPACE_SNAPSHOT_RESTORE_REQUIRED_KEY in ws
@@ -903,6 +913,20 @@ async def agent_get_thread_workspace_locked(
                 "_canvas_workspace_generation": None,
                 WORKSPACE_RUNTIME_INCARNATION_KEY: None,
             }
+    elif (
+        thread.get("execution_lane") == "pinned"
+        and workspace_backend == "sandbox"
+        and str(ws.get("status") or "none") == "none"
+        and getattr(container_provisioner, "is_available", False) is True
+        and getattr(container_provisioner, "in_cluster", False) is True
+    ):
+        # A pinned Kubernetes workspace has no row until its create task writes
+        # one, and that task runs beside the agent's binding: a warm agent can
+        # read here first. "none" tells the agent this session has no
+        # workspace, and it fails the attach; the create is on its way, so
+        # answer "pending" (response-local), which it waits on. The durable row
+        # is untouched for the final read below.
+        ws = {**ws, "status": "pending"}
     pinned_k8s_attestation = await _attest_pinned_thread_k8s_workspace(
         thread_id,
         thread,
