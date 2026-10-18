@@ -197,7 +197,7 @@ class TestPipelineDefaults:
     def test_worker_defaults(self, worker_config):
         m = worker_config.memory
         assert m.manager_enabled is True  # cutover flag on (Phase-1 closure)
-        assert m.pipeline.retrievers == ["recall_two_tier", "kb_notes"]
+        assert m.pipeline.retrievers == ["recall_hybrid", "kb_notes"]
         assert m.pipeline.writers == [
             "interval_extractor",
             "phase_boundary_extractor",
@@ -209,7 +209,7 @@ class TestPipelineDefaults:
     def test_persistent_defaults(self, persistent_config):
         m = persistent_config.memory
         assert m.manager_enabled is True
-        assert m.pipeline.retrievers == ["recall_two_tier", "kb_notes"]
+        assert m.pipeline.retrievers == ["recall_hybrid", "kb_notes"]
         assert m.pipeline.writers == [
             "persistent_interval_extractor",
             "pre_compaction_extractor",
@@ -867,7 +867,6 @@ class TestWorkerExecuteWiring:
         )
 
         # -- legacy direct-store path skipped entirely
-        env["ctx"].recall_store.decrement_ttl.assert_not_called()
         env["ctx"].recall_store.retrieve.assert_not_called()
 
         # -- audit fed from the payload's memory block (+ stats tap)
@@ -1167,7 +1166,6 @@ class TestPersistentTurnWiring:
         assert prepared[2 : 2 + len(payload_msgs)] == payload_msgs
 
         # -- legacy direct-store blocks skipped
-        recall_spy.decrement_ttl.assert_not_called()
         recall_spy.retrieve.assert_not_called()
         kb_spy.hybrid_search.assert_not_called()
 
@@ -1426,7 +1424,7 @@ class TestStripRecognitionB10:
         manager = MemoryManager(
             runtime,
             retrievers=[
-                ("recall_two_tier", _make_recall_retriever(runtime)),
+                ("recall_hybrid", _make_recall_retriever(runtime)),
                 ("kb_notes", _make_kb_retriever(runtime)),
             ],
         )
@@ -1458,9 +1456,9 @@ class TestStripRecognitionB10:
 
 
 def _make_recall_retriever(runtime):
-    from agent.services.memory.plugins.legacy import RecallTwoTierRetriever
+    from agent.services.memory.plugins.legacy import RecallHybridRetriever
 
-    return RecallTwoTierRetriever(runtime.recall_store)
+    return RecallHybridRetriever(runtime.recall_store)
 
 
 def _make_kb_retriever(runtime):

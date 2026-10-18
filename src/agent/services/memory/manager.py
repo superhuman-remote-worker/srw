@@ -546,8 +546,8 @@ class MemoryManager:
         """Cancel and join the running retrieval; True if one was running.
 
         Raises ``RuntimeError`` when the task ignores cancellation: it may
-        still write (the TTL tick of ``recall_two_tier``), so a teardown
-        barrier must not report quiescence.
+        still write (the access-stats update of a hybrid search), so a
+        teardown barrier must not report quiescence.
         """
         task = self._retrieval_task
         if task is None or task.done():
@@ -1053,9 +1053,10 @@ class MemoryManager:
         lease remains held for the reaper rather than exposing a successor.
 
         The retrieval task (append_only) is cancelled at once, not drained:
-        it only reads, but its ``recall_two_tier`` TTL tick writes, so it is
-        joined like the captures and a retrieval that ignores cancellation
-        fails the barrier too. It is not counted in the return value.
+        it mostly reads, but a hybrid search updates the access stats of the
+        rows it returns, so it is joined like the captures and a retrieval
+        that ignores cancellation fails the barrier too. It is not counted in
+        the return value.
         """
 
         self._background_closed = True

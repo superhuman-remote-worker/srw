@@ -102,9 +102,6 @@ class FakeStore:
         self.embedding_service = SimpleNamespace(embed=AsyncMock(return_value=[0.1]))
         self.searches: List[str] = []
         self.fetches: List[str] = []
-        # The push path's TTL machinery: a search must never touch it.
-        self.decrement_ttl = AsyncMock()
-        self.get_ttl_active = AsyncMock(return_value=[])
 
     async def hybrid_search(self, query_text, query_embedding, **kwargs):
         self.searches.append(query_text)
@@ -193,8 +190,6 @@ class TestSearch:
             assert volatile not in out
         assert "<srw_context" not in out
         assert store.searches == ["where does prod run"]
-        store.decrement_ttl.assert_not_awaited()
-        store.get_ttl_active.assert_not_awaited()
 
     def test_the_same_rows_render_the_same_bytes(self):
         records = [mem(1), mem(2)]

@@ -39,7 +39,7 @@ from agent.services.memory.pending_set import (
     deserialize_pending_set,
     serialize_pending_set,
 )
-from agent.services.memory.plugins.legacy import RecallTwoTierRetriever
+from agent.services.memory.plugins.legacy import RecallHybridRetriever
 from agent.services.memory.plugins.reranker import RerankerScorer
 from agent.services.memory.query import build_exchange_query_text
 from agent.services.memory.types import InjectionBlock, MemoryPayload, Scored
@@ -62,7 +62,7 @@ from tests._memory_fixtures import (
 
 
 def _prefetch_req(text: str = "q?\n\nanswer.") -> AssembleRequest:
-    return AssembleRequest(query_text=text, retries=False, ttl_tick=False)
+    return AssembleRequest(query_text=text, retries=False)
 
 
 def _never() -> AsyncMock:
@@ -567,18 +567,16 @@ class TestPluginFlags:
         assert client.posts == posts
 
     @pytest.mark.asyncio
-    @pytest.mark.parametrize(("tick", "decrements"), [(True, 1), (False, 0)])
-    async def test_a_read_only_retrieval_leaves_the_ttl_tier_alone(
-        self, tick, decrements
-    ):
+    async def test_the_hybrid_retriever_only_reads(self):
+        # The TTL tier is retired (D36): no decrement rides a retrieval.
         store = AsyncMock()
         store.retrieve.return_value = make_memories()
-        retriever = RecallTwoTierRetriever(store)
+        retriever = RecallHybridRetriever(store)
 
-        found = await retriever.retrieve(AssembleRequest(query_text="q", ttl_tick=tick))
+        found = await retriever.retrieve(AssembleRequest(query_text="q"))
 
         assert len(found) == 2
-        assert store.decrement_ttl.await_count == decrements
+        assert [name for name, _, _ in store.method_calls] == ["retrieve"]
 
 
 # ---------------------------------------------------------------------------

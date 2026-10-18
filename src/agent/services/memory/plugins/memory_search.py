@@ -9,8 +9,7 @@ bind it alike through ``memory.pipeline.extensions`` and ``tools.memory``.
 What it runs is the push path's read pipeline, scoped the same way:
 - the candidates come from the job's or session's own ``RecallStore``
   (project-scoped like the push), through its hybrid search with the query
-  the model wrote. Unlike ``recall_two_tier`` there is no TTL-pinned tier
-  and no TTL tick: a search is relevance only and writes nothing but the
+  the model wrote. A search is relevance only and writes nothing but the
   access stats every search hit records;
 - the same configured scorers and policies (``memory.pipeline.scorers`` and
   ``.policies``: reranker, gate, bounded), resolved from the registry with

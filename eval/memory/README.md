@@ -24,12 +24,11 @@ accrue through `capture()`), not batch-loaded. Two ingestion modes:
 
 - **seam** (`arms/persistent_current.yaml`) — production-faithful replay:
   per round `HumanMessage` → `assemble()` (the live per-turn read path, so
-  TTL decrement/access-resets accrue) → `AIMessage` → `capture(turn_end)`;
+  access stats accrue) → `AIMessage` → `capture(turn_end)`;
   then `capture(session_end)` → teardown extraction. Costs real
   auxiliary-LLM calls.
 - **verbatim** (`arms/flat_verbatim.yaml`) — no extraction LLM: every
-  user-assistant round stored directly with `remaining_turns=0` (never
-  TTL-pinned) and dedup disabled (`dedup_threshold: 1.01`), so question-time
+  user-assistant round stored directly and dedup disabled (`dedup_threshold: 1.01`), so question-time
   retrieval is pure hybrid RRF over a flat round-granularity index. This is
   the cheap smoke arm and the published-baseline reproduction arm.
 
@@ -79,14 +78,10 @@ python -m eval.memory.report eval/memory/runs/<runA> eval/memory/runs/<runB>
 python -m eval.memory.run --dataset ... --arm <ingest-arm> --out runs/<base>      # no --cleanup
 python -m eval.memory.run --dataset ... --arm <readpath-arm> \
   --requery-from eval/memory/runs/<base> --out runs/<base>_rerank --limit 20
-#     COMPARABILITY: every assemble mutates corpus state (TTL decrement on
-#     the whole scope + retrieve-path re-pinning/access bumps), so snapshot
-#     remaining_turns/access_count/last_accessed into a side table once
-#     after ingest and restore it between requery arms — otherwise later
-#     arms see drifted tier membership. On multi-session corpora expect
-#     ~95% of rows TTL-pinned (cross-session scopes stop ticking): reranker
-#     arms need keep_pinned_first: false + top_k >= store size, and
-#     reranker.timeout: 60 (full-store batches trip the 10s default when
+#     COMPARABILITY: every assemble mutates corpus state (access bumps), so
+#     snapshot access_count/last_accessed into a side table once after
+#     ingest and restore it between requery arms. Reranker arms need
+#     top_k >= store size, and reranker.timeout: 60 (full-store batches trip the 10s default when
 #     the endpoint is cold/contended — failures are contained passthroughs,
 #     visible as "scorer 'reranker' failed (contained)" in run.log, which
 #     silently turns the arm into a legacy-order measurement).

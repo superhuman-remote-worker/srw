@@ -181,11 +181,6 @@ class AssembleRequest:
     #: prefetch runs under a hard budget of a few seconds (D33); a transient
     #: fault then degrades that retrieval instead of retrying past it.
     retries: bool = True
-    #: False: the retrieval is read-only and does not advance the TTL tier
-    #: (``recall_two_tier``'s decrement). The idle-time prefetch is an extra
-    #: retrieval per session turn; the turn's own retrieval keeps the one
-    #: tick per turn.
-    ttl_tick: bool = True
 
 
 @dataclass

@@ -78,7 +78,7 @@ def build_persistent_manager(
 ):
     cfg = MemoryConfig(
         enabled=True,
-        pipeline=MemoryPipelineConfig(retrievers=["recall_two_tier", "kb_notes"]),
+        pipeline=MemoryPipelineConfig(retrievers=["recall_hybrid", "kb_notes"]),
     )
     runtime = MemoryRuntime(
         recall_store=recall_store,
@@ -119,13 +119,6 @@ async def run_legacy_persistent_sequence(
     knowledge_block = ""
 
     if recall_store:
-        try:
-            await asyncio.wait_for(
-                recall_store.decrement_ttl(), timeout=retrieval_timeout
-            )
-        except (asyncio.TimeoutError, Exception):
-            pass
-
         try:
             context_text = ""
             for msg in reversed(messages):
@@ -314,7 +307,7 @@ class TestTimeoutParity:
 
         assert normalize(payload.messages()) == normalize(legacy_messages)
         assert [b.kind for b in payload.blocks] == ["knowledge"]
-        assert payload.stats.errors == ["retriever:recall_two_tier: TimeoutError: "]
+        assert payload.stats.errors == ["retriever:recall_hybrid: TimeoutError: "]
 
     @pytest.mark.asyncio
     async def test_kb_timeout_skips_kb_memory_proceeds(self):
@@ -343,16 +336,6 @@ class TestTimeoutParity:
         assert normalize(payload.messages()) == normalize(legacy_messages)
         assert [b.kind for b in payload.blocks] == ["memory"]
         assert payload.stats.errors == ["retriever:kb_notes: TimeoutError: "]
-
-    @pytest.mark.asyncio
-    async def test_decrement_timeout_does_not_block_retrieval(self):
-        recall = make_recall_mock(make_memories())
-        recall.decrement_ttl.side_effect = slow(1)
-        manager = build_persistent_manager(recall_store=recall, timeout=SHORT_TIMEOUT)
-        payload = await manager.assemble(persistent_request(make_conversation()))
-        recall.retrieve.assert_awaited_once()
-        assert [b.kind for b in payload.blocks] == ["memory"]
-        assert payload.stats.errors == []
 
     @pytest.mark.asyncio
     async def test_bounded_none_applies_no_timeout(self, monkeypatch):

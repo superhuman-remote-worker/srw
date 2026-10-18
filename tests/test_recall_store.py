@@ -344,6 +344,9 @@ class TestRetrieval:
 
         # Should fit 2 memories (4000 tokens), not 3 (6000 would exceed 5000)
         assert len(results) == 2
+        # One read: the hybrid search. There is no pinned tier any more (D36).
+        assert mock_db.fetch.await_count == 1
+        assert "hybrid_search" in mock_db.fetch.call_args[0][0]
 
 
 # =============================================================================
@@ -366,29 +369,12 @@ class TestBitemporalRetrievalFilter:
         assert "valid_to IS NULL" in sql
 
     @pytest.mark.asyncio
-    async def test_get_ttl_active_filters_valid(self, store, mock_db):
-        """A retired pinned memory is not 'active' — get_ttl_active excludes it."""
-        mock_db.fetch.return_value = []
-        await store.get_ttl_active()
-        sql = mock_db.fetch.call_args[0][0]
-        assert "valid_to IS NULL" in sql
-
-    @pytest.mark.asyncio
-    async def test_decrement_ttl_filters_valid(self, store, mock_db):
-        """decrement_ttl does not tick TTL on retired rows."""
-        mock_db.fetchval.return_value = 0
-        await store.decrement_ttl()
-        sql = mock_db.fetchval.call_args[0][0]
-        assert "valid_to IS NULL" in sql
-
-    @pytest.mark.asyncio
     async def test_get_stats_reports_current_and_superseded(self, store, mock_db):
         """get_stats surfaces the live vs retired split."""
         mock_db.fetchrow.return_value = {
             "total": 5,
             "current": 4,
             "superseded": 1,
-            "ttl_active": 2,
         }
         stats = await store.get_stats()
         sql = mock_db.fetchrow.call_args[0][0]
@@ -730,7 +716,6 @@ class TestWriteGate:
             budget_tokens=5000,
             max_memories_per_injection=10,
             retrieval_importance_floor=0.4,
-            default_ttl=10,
             extraction=SimpleNamespace(write_gate=False),
         )
         s = RecallStore(
@@ -937,25 +922,6 @@ class TestDeadlockContainment:
         memory_health.reset()
         yield
         memory_health.reset()
-
-    @pytest.mark.asyncio
-    async def test_decrement_ttl_locks_in_id_order(self, store, mock_db):
-        """decrement_ttl acquires row locks via an id-ordered FOR UPDATE CTE."""
-        mock_db.fetchval.return_value = 4
-        count = await store.decrement_ttl()
-        sql = mock_db.fetchval.call_args[0][0]
-        assert "ORDER BY id" in sql
-        assert "FOR UPDATE" in sql
-        assert "valid_to IS NULL" in sql
-        assert count == 4
-
-    @pytest.mark.asyncio
-    async def test_decrement_ttl_counts_deadlock_and_reraises(self, store, mock_db):
-        """A TTL-decrement deadlock is counted, then re-raised (callers contain)."""
-        mock_db.fetchval.side_effect = DeadlockDetectedError("deadlock detected")
-        with pytest.raises(DeadlockDetectedError):
-            await store.decrement_ttl()
-        assert memory_health.snapshot() == {"ttl_decrement_deadlock": 1}
 
     @pytest.mark.asyncio
     async def test_access_stats_sorts_ids_and_locks_in_order(self, store, mock_db):

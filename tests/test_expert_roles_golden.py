@@ -140,7 +140,8 @@ _POST_SPLIT_OVERLAY_REMOVALS: dict[str, tuple[str, ...]] = {
     # every turn), so its window key left the shared root.
     # Append-only context injection WP6 (D37): the memory assembler was
     # removed, so its interval and its auxiliary task left the shared root
-    # (and the worker overlay's enable).
+    # (and the worker overlay's enable). WP6 (D36): the TTL-pinned tier was
+    # retired, so default_ttl and the reranker's keep_pinned_first left too.
     "worker": (
         "limits.tool_category_timeouts.delegation",
         "workspace.backend",
@@ -148,6 +149,8 @@ _POST_SPLIT_OVERLAY_REMOVALS: dict[str, tuple[str, ...]] = {
         "context_management.keep_recent_tool_results",
         "memory.assembler_interval",
         "auxiliary.tasks.assemble_memories",
+        "memory.default_ttl",
+        "memory.reranker.keep_pinned_first",
     ),
     "session": (
         "workspace.backend",
@@ -155,6 +158,8 @@ _POST_SPLIT_OVERLAY_REMOVALS: dict[str, tuple[str, ...]] = {
         "context_management.keep_recent_tool_results",
         "memory.assembler_interval",
         "auxiliary.tasks.assemble_memories",
+        "memory.default_ttl",
+        "memory.reranker.keep_pinned_first",
     ),
 }
 #: Keys whose overlay VALUE changed after the baseline was frozen (role ->
@@ -166,9 +171,13 @@ _POST_SPLIT_OVERLAY_CHANGES: dict[str, tuple[str, ...]] = {
     # own workspace container, so the session overlay opens localhost as the
     # worker overlay does (only cloud metadata stays blocked).
     # Append-only context injection WP6 (D37): the worker's writer list lost
-    # memory_assembler.
-    "worker": ("memory.pipeline.writers",),
-    "session": ("browser.security.blocked_domains",),
+    # memory_assembler. WP6 (D36): the retriever recall_two_tier became
+    # recall_hybrid (both roles).
+    "worker": ("memory.pipeline.writers", "memory.pipeline.retrievers"),
+    "session": (
+        "browser.security.blocked_domains",
+        "memory.pipeline.retrievers",
+    ),
 }
 #: Tool names later work packages added to a tool CATEGORY on top of the
 #: frozen baseline (role -> category -> names, with the work that added them).

@@ -760,7 +760,6 @@ class ExchangeRetriever:
 
         self.requests.append(req)
         is_prefetch = req.retries is False
-        assert req.ttl_tick is not is_prefetch
         if self.gate_prefetch if is_prefetch else self.gate_turn:
             try:
                 await asyncio.Event().wait()

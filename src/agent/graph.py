@@ -1374,14 +1374,9 @@ def create_execute_node(
                     _manager_payload
                 )
 
-        # Memory Light: decrement TTLs then retrieve relevant memories for injection
+        # Memory Light: retrieve relevant memories for injection
         _memory_block = [""]  # mutable container for closure access
         if memory_service is None and recall_store:
-            try:
-                await recall_store.decrement_ttl()
-            except Exception as e:
-                logger.warning(f"[{job_id}] TTL decrement failed (non-fatal): {e}")
-
             try:
                 # Build retrieval context from current todo + phase info
                 pending_todos = todo_manager.list_pending()

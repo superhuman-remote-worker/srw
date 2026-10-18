@@ -96,7 +96,7 @@ ARMS: dict[str, dict] = {
     "memory-only": {
         "memory": {
             "pipeline": {
-                "retrievers": ["recall_two_tier"],
+                "retrievers": ["recall_hybrid"],
                 "scorers": ["reranker"],
                 "policies": ["gate", "bounded"],
                 "writers": list(DEFAULT_WRITERS),

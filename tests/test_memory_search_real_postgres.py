@@ -52,7 +52,6 @@ class _ProjectMemoryConfig:
     max_memories_per_injection: int = 50
     importance_threshold: float = 0.3
     dedup_threshold: float = 0.92
-    default_ttl: int = 10
 
 
 class _StubEmbedding:

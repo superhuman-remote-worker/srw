@@ -2391,7 +2391,6 @@ async def _idle_memory_prefetch(
                     query_text=query,
                     model=getattr(getattr(config, "llm", None), "model", None),
                     retries=False,
-                    ttl_tick=False,
                 ),
                 budget_s=budget,
                 should_cancel=_should_cancel,
@@ -2745,13 +2744,6 @@ async def _execute_turn(
                     )
 
     if memory_service is None and recall_store:
-        try:
-            await asyncio.wait_for(
-                recall_store.decrement_ttl(), timeout=_RETRIEVAL_TIMEOUT
-            )
-        except (asyncio.TimeoutError, Exception) as e:
-            logger.warning(f"TTL decrement failed (non-fatal): {e}")
-
         try:
             if _provider_admission_closed():
                 return _closed_result()

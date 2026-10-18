@@ -161,7 +161,6 @@ def _config():
             project_scoped=True,
             importance_threshold=0.3,
             dedup_threshold=0.92,
-            default_ttl=10,
             ingestion=SimpleNamespace(enabled=False),
             extraction=SimpleNamespace(write_gate=True),
         ),

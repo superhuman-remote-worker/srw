@@ -97,16 +97,12 @@ def make_notes():
     ]
 
 
-def make_recall_mock(memories=None, retrieve_error=None, decrement_error=None):
+def make_recall_mock(memories=None, retrieve_error=None):
     recall = AsyncMock()
     if retrieve_error:
         recall.retrieve.side_effect = retrieve_error
     else:
         recall.retrieve.return_value = list(memories or [])
-    if decrement_error:
-        recall.decrement_ttl.side_effect = decrement_error
-    else:
-        recall.decrement_ttl.return_value = 1
     return recall
 
 

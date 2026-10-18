@@ -9,10 +9,10 @@ is a binder, the registry is the driver catalog).
 Usage:
     from agent.services.memory.registry import register_memory_plugin
 
-    @register_memory_plugin("retriever", "recall_two_tier",
-                            description="Legacy two-tier RecallStore.retrieve")
+    @register_memory_plugin("retriever", "recall_hybrid",
+                            description="RecallStore.retrieve, budget-fit")
     def _build(runtime: MemoryRuntime) -> Retriever:
-        return RecallTwoTierRetriever(runtime.recall_store, ...)
+        return RecallHybridRetriever(runtime.recall_store, ...)
 
 Resolution failures are loud by design: an unknown name in config is a
 misconfiguration, not a degradation — it must fail at bind time with the

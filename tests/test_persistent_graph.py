@@ -892,7 +892,6 @@ class TestMemoryExtractionTrigger:
         llm = _make_streaming_llm(_make_llm_response("ok"))
 
         mock_recall = MagicMock()
-        mock_recall.decrement_ttl = AsyncMock()
         mock_recall.retrieve = AsyncMock(return_value=[])
         mock_aux = MagicMock()
 
@@ -1113,7 +1112,6 @@ class TestMemoryExtractionTrigger:
         llm = _make_streaming_llm(_make_llm_response("ok"))
 
         mock_recall = MagicMock()
-        mock_recall.decrement_ttl = AsyncMock()
         mock_recall.retrieve = AsyncMock(return_value=[])
 
         with patch(
@@ -1783,7 +1781,6 @@ class TestExecuteTurnMemoryRetrieval:
     async def test_memory_retrieval_uses_last_human_message(self):
         """Context text is extracted from the last HumanMessage."""
         recall = MagicMock()
-        recall.decrement_ttl = AsyncMock()
         recall.retrieve = AsyncMock(return_value=[])
 
         messages = [
@@ -1814,7 +1811,6 @@ class TestExecuteTurnMemoryRetrieval:
     async def test_memory_retrieval_timeout_is_non_fatal(self):
         """Timeout on recall_store.retrieve doesn't crash the turn."""
         recall = MagicMock()
-        recall.decrement_ttl = AsyncMock()
         recall.retrieve = AsyncMock(side_effect=asyncio.TimeoutError)
 
         messages = [SystemMessage(content="sys"), HumanMessage(content="hi")]
@@ -1840,7 +1836,6 @@ class TestExecuteTurnMemoryRetrieval:
     async def test_memory_retrieval_exception_is_non_fatal(self):
         """Exception on recall_store.retrieve doesn't crash the turn."""
         recall = MagicMock()
-        recall.decrement_ttl = AsyncMock()
         recall.retrieve = AsyncMock(side_effect=RuntimeError("db down"))
 
         messages = [SystemMessage(content="sys"), HumanMessage(content="hi")]
@@ -1863,37 +1858,9 @@ class TestExecuteTurnMemoryRetrieval:
         assert result.error is None
 
     @pytest.mark.asyncio
-    async def test_decrement_ttl_timeout_does_not_block_retrieval(self):
-        """TTL decrement timeout doesn't prevent retrieval from running."""
-        recall = MagicMock()
-        recall.decrement_ttl = AsyncMock(side_effect=asyncio.TimeoutError)
-        recall.retrieve = AsyncMock(return_value=[])
-
-        messages = [SystemMessage(content="sys"), HumanMessage(content="hi")]
-        callbacks = _make_callbacks()
-
-        await _execute_turn(
-            llm_with_tools=_make_streaming_llm(_make_llm_response("ok")),
-            tool_map={},
-            context_manager=AsyncMock(
-                ensure_within_limits=AsyncMock(side_effect=lambda m, *a, **kw: m)
-            ),
-            messages=messages,
-            callbacks=callbacks,
-            llm_timeout=600,
-            auxiliary_llm=None,
-            config=_make_config(),
-            recall_store=recall,
-        )
-
-        # retrieve should still be called even after TTL timeout
-        recall.retrieve.assert_called_once()
-
-    @pytest.mark.asyncio
     async def test_empty_context_when_no_human_message(self):
         """Empty string used as context if no HumanMessage found."""
         recall = MagicMock()
-        recall.decrement_ttl = AsyncMock()
         recall.retrieve = AsyncMock(return_value=[])
 
         messages = [SystemMessage(content="sys")]
@@ -1939,7 +1906,6 @@ class TestExecuteTurnMemoryRetrieval:
         config.extra = {"_resolved_skills": catalog}
 
         recall = MagicMock()
-        recall.decrement_ttl = AsyncMock()
         recall.retrieve = AsyncMock(return_value=[MagicMock()])
         captured = []
 

@@ -24,8 +24,8 @@ Two modes, because the slice-4 measurement falsified the naive design:
 
 Fail-open on absence, fail-closed only on evidence: an item the channel
 never scored — scorer outage (manager containment passes items through
-unscored), candidates past the reranker's ``top_k``, a pinned head kept
-by ``keep_pinned_first`` — passes the gate untouched. A reranker outage
+unscored), candidates past the reranker's ``top_k`` — passes the gate
+untouched. A reranker outage
 therefore degrades to the legacy full dump, never to an empty injection.
 Corollary (measured, affe2881 s20): when the reranker's ``top_k`` does
 not cover the candidate set, the unscored tail leaks through the gate —

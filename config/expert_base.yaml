@@ -265,7 +265,6 @@ memory:
   max_memories_per_injection: 50   # Cap on number of memories injected; the session overlay raises it
   max_memories_per_entry: 5        # context_management.injection_mode append_only: new/changed memories per appended entry; the rest drip in on later requests (D29)
   observer_interval: 5             # Run observer every N turns
-  default_ttl: 10                  # Default TTL in turns for new memories (guaranteed injection)
   importance_threshold: 0.3        # Minimum importance to store
   dedup_threshold: 0.85            # Cosine similarity threshold for dedup
   retrieval_importance_floor: 0.4  # Minimum importance for retrieval (memories below this are stored but not recalled)
@@ -282,7 +281,7 @@ memory:
     enabled: true
   pipeline:
     retrievers:
-      - recall_two_tier              # TTL-pinned tier + hybrid search (RecallStore)
+      - recall_hybrid                # Hybrid search over the project's memories (RecallStore)
       - kb_notes                     # Top-5 project knowledge notes
     scorers:
       - reranker                     # GATE B (overhaul Phase 3): cross-encoder rerank over the fused candidates
@@ -299,14 +298,13 @@ memory:
   # R@5 0.20->1.0 at ~111 tok/q (80x cheaper than the full dump) and
   # knowledge-update end-task 0/4->3/4 once stale facts are retired.
   # ROLLBACK: set scorers/policies back to [] and ingestion.enabled false —
-  # the legacy two-tier read + cosine-dedup write stay in place behind these
+  # the plain hybrid read + cosine-dedup write stay in place behind these
   # flags, so this is a one-edit revert.
   reranker:
     # model / base_url / api_key: deliberately unset — the `rerank` catalog pin
     # (Admin → Models) arrives as RERANK_MODEL/_BASE_URL/_API_KEY at dispatch;
     # with no pin the scorer runs qwen3-reranker-8b on the embedding endpoint.
     top_k: 512                       # cover the candidate set; any tail past this fails the gate open, bounded backstops it
-    keep_pinned_first: false         # ~95% of project corpora freeze TTL-pinned — let the reranker rank them too
     timeout: 10                      # live-latency cap per attempt (eval used 60 for cold-batch throughput)
     # Transient faults (timeout/connection drop/5xx) retry in-call, then
     # degrade THAT TURN to hybrid order instead of failing the job; structural

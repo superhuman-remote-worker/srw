@@ -1,10 +1,11 @@
 """Real-Postgres concurrency tests for RecallStore's deadlock containment.
 
 Guards knowledge-base/knowledge/issues/project_scoped_memory_deadlocks_under_parallel_jobs.md: five
-same-project jobs racing ``decrement_ttl`` (scope-wide UPDATE) against the
-access-stat write (``id = ANY(...)`` UPDATE in RRF-score order) produced 138
-contained retrieval deadlocks — PostgreSQL acquired the overlapping tuple locks
-in divergent orders. The containment fix locks in deterministic id order.
+same-project jobs racing the TTL decrement (a scope-wide UPDATE, retired since
+with the TTL tier) against the access-stat write (``id = ANY(...)`` UPDATE in
+RRF-score order) produced 138 contained retrieval deadlocks — PostgreSQL
+acquired the overlapping tuple locks in divergent orders. The containment fix
+locks in deterministic id order; the access-stat write still races itself.
 
 **A mock cannot fail this way.** Lock-order cycles exist only inside a real
 lock manager, so these run two RecallStores over separate connection pools
@@ -57,7 +58,6 @@ class _ProjectMemoryConfig:
     max_memories_per_injection: int = 50
     importance_threshold: float = 0.3
     dedup_threshold: float = 0.92
-    default_ttl: int = 10
 
 
 class _StubEmbedding:
@@ -128,7 +128,8 @@ async def env(migrated_dsn):
 
 
 async def _seed_project_memories(db, project_id, n=30):
-    """Seed n project memories; every other row TTL-pinned (remaining_turns=5)."""
+    """Seed n project memories; every other row pinned by an older pod
+    (remaining_turns=5)."""
     ids = []
     for i in range(n):
         mem_id = await db.fetchval(
@@ -159,33 +160,36 @@ async def _seed_project_memories(db, project_id, n=30):
 
 @pytest.mark.asyncio
 async def test_concurrent_same_project_turns_stay_clean(env):
-    """Two consumers looping decrement_ttl + retrieve over one project corpus:
-    no unhandled errors, every turn yields results, TTLs tick to exhaustion,
-    and nothing was contained (no deadlocks on any of the three write shapes).
+    """Two consumers looping retrieve over one project corpus: no unhandled
+    errors, every turn yields results, pinned rows are found like the rest
+    (D36), and nothing was contained (no deadlocks on the access-stat write).
     """
-    await _seed_project_memories(env.db, env.project_id, n=30)
+    ids = await _seed_project_memories(env.db, env.project_id, n=30)
+    pinned = set(ids[::2])
 
     async def consumer(store):
         per_turn = []
+        seen = set()
         for _ in range(TURNS):
-            await store.decrement_ttl()
             memories = await store.retrieve("parser pipeline")
             assert isinstance(memories, list)
             per_turn.append(len(memories))
-        return per_turn
+            seen.update(m.id for m in memories)
+        return per_turn, seen
 
     results = await asyncio.gather(*(consumer(s) for s in env.stores))
 
-    assert all(len(per_turn) == TURNS for per_turn in results)
-    # The hybrid tier keeps producing rows even after the pinned pool expires.
-    assert all(count > 0 for per_turn in results for count in per_turn)
-    # 2 x 15 scope-wide ticks exhaust the seeded remaining_turns=5 (floor 0).
+    assert all(len(per_turn) == TURNS for per_turn, _ in results)
+    assert all(count > 0 for per_turn, _ in results for count in per_turn)
+    # Nothing ticks a pin any more, and search returns the pinned rows.
+    assert all(pinned <= seen for _, seen in results)
     remaining = await env.db.fetch(
         "SELECT remaining_turns FROM memories WHERE project_id = $1",
         env.project_id,
     )
-    assert len(remaining) == 30
-    assert all((row["remaining_turns"] or 0) == 0 for row in remaining)
+    assert (
+        sorted(row["remaining_turns"] or 0 for row in remaining) == [0] * 15 + [5] * 15
+    )
     # The crux: zero contained deadlocks/errors across both consumers.
     assert memory_health.snapshot() is None
 

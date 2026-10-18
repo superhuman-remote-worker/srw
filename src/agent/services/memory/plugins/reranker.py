@@ -21,10 +21,6 @@ the model reads, so ordering IS retrieval quality.
 Scope discipline:
 - Only ``kind == "memory"`` items are reranked; knowledge items render
   to their own block and pass through in original order.
-- TTL-pinned items (``record.remaining_turns > 0``) stay ahead of the
-  reranked tail by default (``memory.reranker.keep_pinned_first``) —
-  the pinned tier is the recency working set; replacing it is the
-  bounded-core policy's job, not the scorer's.
 - At most ``memory.reranker.top_k`` candidates go to the endpoint; the
   remainder keeps its original (hybrid) order behind the reranked head.
 - Failure semantics split by cause (mirrors the main-LLM retry
@@ -72,11 +68,6 @@ def _is_transient(exc: Exception) -> bool:
     )
 
 
-def _is_pinned(item: Scored) -> bool:
-    record = item.candidate.record
-    return bool(getattr(record, "remaining_turns", 0) or 0)
-
-
 class RerankerScorer:
     """Scorer protocol implementation over a Cohere-shaped /rerank route."""
 
@@ -87,7 +78,6 @@ class RerankerScorer:
         api_key: Optional[str],
         top_k: int = 64,
         timeout: float = 10.0,
-        keep_pinned_first: bool = True,
         retries: int = 2,
         retry_backoff: float = 1.0,
         client: Optional[Any] = None,
@@ -110,7 +100,6 @@ class RerankerScorer:
         self.api_key = api_key
         self.top_k = top_k
         self.timeout = timeout
-        self.keep_pinned_first = keep_pinned_first
         self.retries = max(0, retries)  # extra attempts after the first
         self.retry_backoff = retry_backoff  # base delay, doubles per retry
         self._client = client  # injectable for tests; lazily built otherwise
@@ -178,14 +167,11 @@ class RerankerScorer:
         if not req.query_text:
             return items
 
-        head: List[Scored] = []  # pinned memory items, original order
         eligible: List[Scored] = []  # memory items to rerank
         others: List[Scored] = []  # knowledge/other kinds, original order
         for item in items:
             if item.candidate.kind != "memory":
                 others.append(item)
-            elif self.keep_pinned_first and _is_pinned(item):
-                head.append(item)
             else:
                 eligible.append(item)
 
@@ -212,7 +198,7 @@ class RerankerScorer:
             item.candidate.channel_scores["rerank"] = relevance
             reordered.append(item)
 
-        return [*head, *reordered, *tail, *others]
+        return [*reordered, *tail, *others]
 
 
 DEFAULT_RERANK_MODEL = "qwen3-reranker-8b"
@@ -301,7 +287,6 @@ def _build_reranker(runtime: Any) -> RerankerScorer:
         api_key=api_key,
         top_k=cfg.top_k,
         timeout=cfg.timeout,
-        keep_pinned_first=cfg.keep_pinned_first,
         retries=getattr(cfg, "retries", 2),
         retry_backoff=getattr(cfg, "retry_backoff", 1.0),
     )

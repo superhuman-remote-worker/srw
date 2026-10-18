@@ -2,7 +2,7 @@
 
 The legacy memory/KB injection sequence stays live in graph.py's execute
 node until the Phase-1 cutover; these fixtures pin the transplanted
-pipeline (`recall_two_tier` + `kb_notes` retrievers + the manager's
+pipeline (`recall_hybrid` + `kb_notes` retrievers + the manager's
 render mechanics) against it byte-for-byte. `run_legacy_worker_sequence`
 below reproduces graph.py:888-1037 — if that block changes, this file
 must change with it (it shouldn't: the old code is frozen until cutover,
@@ -55,7 +55,7 @@ def build_manager(
 ):
     cfg = MemoryConfig(
         enabled=True,
-        pipeline=MemoryPipelineConfig(retrievers=["recall_two_tier", "kb_notes"]),
+        pipeline=MemoryPipelineConfig(retrievers=["recall_hybrid", "kb_notes"]),
     )
     runtime = MemoryRuntime(
         recall_store=recall_store,
@@ -100,10 +100,6 @@ async def run_legacy_worker_sequence(
     """
     memory_block = ""
     if recall_store:
-        try:
-            await recall_store.decrement_ttl()
-        except Exception:
-            pass
         try:
             context_parts = []
             if top_todo:
@@ -173,7 +169,8 @@ class TestQueryFormation:
 class TestRegistration:
     def test_legacy_retrievers_registered_on_package_import(self):
         retrievers = available_memory_plugins("retriever")["retriever"]
-        assert "recall_two_tier" in retrievers
+        assert "recall_hybrid" in retrievers
+        assert "recall_two_tier" in retrievers  # the retired name, an alias
         assert "kb_notes" in retrievers
 
 
@@ -241,9 +238,8 @@ class TestWorkerEquivalence:
         req = worker_request()
         await manager.assemble(req)
 
-        # decrement-then-retrieve, retrieve positional with no budget kwarg
+        # retrieve only (no TTL tick, D36), positional with no budget kwarg
         assert recall.mock_calls == [
-            call.decrement_ttl(),
             call.retrieve("Implement the config parser phase 3 tactical"),
         ]
         # hybrid_search normalizes project_ids=[single] to the same SQL
@@ -344,28 +340,8 @@ class TestConditionalParity:
         assert normalize(payload.messages()) == normalize(legacy_messages)
         assert [b.kind for b in payload.blocks] == ["knowledge"]
         assert payload.stats.errors == [
-            "retriever:recall_two_tier: RuntimeError: embedding down"
+            "retriever:recall_hybrid: RuntimeError: embedding down"
         ]
-
-    @pytest.mark.asyncio
-    async def test_ttl_decrement_failure_does_not_block_retrieval(self):
-        recall = make_recall_mock(
-            make_memories(), decrement_error=RuntimeError("db hiccup")
-        )
-        legacy_messages = await run_legacy_worker_sequence(
-            make_recall_mock(
-                make_memories(), decrement_error=RuntimeError("db hiccup")
-            ),
-            None,
-            None,
-        )
-        manager = build_manager(recall_store=recall)
-        payload = await manager.assemble(worker_request())
-        recall.retrieve.assert_awaited_once()
-        assert normalize(payload.messages()) == normalize(legacy_messages)
-        assert [b.kind for b in payload.blocks] == ["memory"]
-        # the decrement failure is logged, not a pipeline error
-        assert payload.stats.errors == []
 
 
 class TestStats:
@@ -379,7 +355,7 @@ class TestStats:
         payload = await manager.assemble(worker_request())
         stats = payload.stats
         assert stats.candidates_total == 4
-        assert stats.per_retriever == {"recall_two_tier": 2, "kb_notes": 2}
+        assert stats.per_retriever == {"recall_hybrid": 2, "kb_notes": 2}
         assert stats.blocks == 2
         assert stats.injected_total == 4
         # KB candidates carry token_count=0 (the legacy KB block is

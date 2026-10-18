@@ -2541,10 +2541,6 @@ class RerankerConfig:
     # knowledge-base/knowledge/issues/reranker_transient_fault_hard_fails_job.md.
     retries: int = 2
     retry_backoff: float = 1.0
-    # Keep TTL-pinned items (the recency working set) ahead of the
-    # reranked tail — Phase 3's bounded-core policy revisits pinning
-    # itself; the scorer doesn't change tier semantics.
-    keep_pinned_first: bool = True
 
 
 @dataclass
@@ -2580,8 +2576,7 @@ class GateConfig:
     magnitude per query while evidence/distractor separation stays
     strong, so absolute cutoffs delete weakly-phrased evidence). Items
     the channel never scored (scorer outage, candidates past the
-    reranker's top_k, a pinned head under keep_pinned_first) pass
-    through ungated, so a failed scorer degrades to the legacy full dump
+    reranker's top_k) pass through ungated, so a failed scorer degrades to the legacy full dump
     rather than an empty injection. ``threshold`` must be set for the
     policy to bind.
     """
@@ -2679,7 +2674,6 @@ class MemoryConfig:
     # the prefetch off.
     prefetch_budget_s: float = 3.0
     observer_interval: int = 5
-    default_ttl: int = 10
     importance_threshold: float = 0.3
     dedup_threshold: float = 0.85
     retrieval_importance_floor: float = 0.4
@@ -3214,7 +3208,6 @@ def _parse_memory_config(data: Dict[str, Any]) -> MemoryConfig:
         api_key=reranker_data.get("api_key"),
         top_k=int(reranker_data.get("top_k", 64)),
         timeout=float(reranker_data.get("timeout", 10.0)),
-        keep_pinned_first=bool(reranker_data.get("keep_pinned_first", True)),
     )
     bounded_data = data.get("bounded", {}) or {}
     bounded = BoundedConfig(
@@ -3271,7 +3264,6 @@ def _parse_memory_config(data: Dict[str, Any]) -> MemoryConfig:
         ),
         prefetch_budget_s=_parse_prefetch_budget(data.get("prefetch_budget_s", 3.0)),
         observer_interval=data.get("observer_interval", 5),
-        default_ttl=data.get("default_ttl", 10),
         importance_threshold=data.get("importance_threshold", 0.3),
         dedup_threshold=data.get("dedup_threshold", 0.85),
         retrieval_importance_floor=data.get("retrieval_importance_floor", 0.4),

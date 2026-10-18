@@ -463,7 +463,7 @@ class TestVerbatimIngest:
         assert result.stored_memories == 5  # FakeDB count
 
         first = stores[0].stored[0]
-        assert first["remaining_turns"] == 0
+        assert "remaining_turns" not in first
         assert first["importance"] == 0.7
         assert first["source"] == "observer"
         assert "User: Can you help me plan" in first["content"]
@@ -659,7 +659,7 @@ class TestArms:
         assert config.memory.enabled
         assert config.memory.manager_enabled
         assert config.memory.dedup_threshold == 1.01
-        assert "recall_two_tier" in config.memory.pipeline.retrievers
+        assert "recall_hybrid" in config.memory.pipeline.retrievers
 
     def test_build_agent_config_persistent_writers(self):
         from eval.memory.arms import build_agent_config

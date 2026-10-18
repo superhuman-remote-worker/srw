@@ -314,7 +314,6 @@ class MemoryHealth:
     """
 
     _KINDS = (
-        "ttl_decrement_deadlock",
         "access_stats_deadlock",
         "access_stats_error",
         "retrieval_deadlock",
@@ -404,7 +403,6 @@ class RecallStore:
         self.budget_tokens = 10000
         self.max_memories_per_injection = 150
         self.retrieval_importance_floor = 0.4
-        self.default_ttl = 10
         # Write-time importance gate (overhaul Phase 4). True = legacy floor;
         # memory.extraction.write_gate: false drops it (completeness over
         # precision — relevance is gated at retrieval instead).
@@ -428,7 +426,6 @@ class RecallStore:
             self.retrieval_importance_floor = getattr(
                 config, "retrieval_importance_floor", 0.4
             )
-            self.default_ttl = getattr(config, "default_ttl", 10)
             self.recheck_threshold = getattr(config, "recheck_threshold", 0.9)
             _ext = getattr(config, "extraction", None)
             if _ext is not None:
@@ -471,13 +468,13 @@ class RecallStore:
         source_turn_end: Optional[int] = None,
         source_phase: Optional[int] = None,
         token_count: Optional[int] = None,
-        remaining_turns: Optional[int] = None,
         retrieval_messages: Optional[List[str]] = None,
     ) -> Optional[uuid.UUID]:
         """Store a memory with automatic embedding and dedup.
 
         If a semantically similar memory already exists (cosine > dedup_threshold),
-        updates the existing memory's access_count, last_accessed, and TTL instead.
+        updates the existing memory's access_count, last_accessed and importance
+        instead.
 
         Args:
             content: Memory content text
@@ -490,7 +487,6 @@ class RecallStore:
             source_turn_end: End turn of source conversation
             source_phase: Phase number when extracted
             token_count: Pre-counted tokens (estimated if None)
-            remaining_turns: TTL in turns (default: self.default_ttl)
 
         Returns:
             UUID of stored/updated memory, or None if below importance threshold
@@ -522,7 +518,6 @@ class RecallStore:
                 source_turn_end=source_turn_end,
                 source_phase=source_phase,
                 token_count=token_count,
-                remaining_turns=remaining_turns,
                 retrieval_messages=retrieval_messages,
             )
 
@@ -536,7 +531,6 @@ class RecallStore:
             return await self._bump_existing(
                 existing.id,
                 importance,
-                remaining_turns,
                 source,
                 similarity=existing.similarity,
             )
@@ -553,7 +547,6 @@ class RecallStore:
             source_turn_end=source_turn_end,
             source_phase=source_phase,
             token_count=token_count,
-            remaining_turns=remaining_turns,
             retrieval_messages=retrieval_messages,
         )
 
@@ -571,15 +564,17 @@ class RecallStore:
         source_turn_end: Optional[int] = None,
         source_phase: Optional[int] = None,
         token_count: Optional[int] = None,
-        remaining_turns: Optional[int] = None,
         retrieval_messages: Optional[List[str]] = None,
     ) -> Optional[uuid.UUID]:
-        """INSERT a new memory row — the shared tail of every ADD path."""
+        """INSERT a new memory row — the shared tail of every ADD path.
+
+        ``remaining_turns`` stays NULL: the TTL-pinned tier is retired
+        (append-only context injection D36), so a new memory is searchable
+        at once like any other row.
+        """
         # Estimate token count if not provided (~4 chars per token)
         if token_count is None:
             token_count = len(content) // 4
-
-        ttl = remaining_turns if remaining_turns is not None else self.default_ttl
 
         # Single funnel for all three store paths — coerce here so no caller can
         # bypass the CHECK constraint guard. (Defect 7)
@@ -594,12 +589,12 @@ class RecallStore:
                 job_id, project_id, agent_id, content, summary, memory_type, source,
                 keywords, embedding, sparse_keywords,
                 importance, source_turn_start, source_turn_end, source_phase,
-                token_count, remaining_turns
+                token_count
             ) VALUES (
                 $1, $2, $3, $4, $5, $6, $7,
                 $8, $9, to_tsvector('english', $10),
                 $11, $12, $13, $14,
-                $15, $16
+                $15
             )
             RETURNING id
             """,
@@ -618,7 +613,6 @@ class RecallStore:
             source_turn_end,
             source_phase,
             token_count,
-            ttl,
         )
 
         # Store retrieval messages (trigger phrases) if provided
@@ -660,24 +654,20 @@ class RecallStore:
         self,
         existing_id: uuid.UUID,
         importance: float,
-        remaining_turns: Optional[int],
         source: str,
         similarity: Optional[float] = None,
     ) -> uuid.UUID:
         """Bump an existing memory in place (legacy dedup hit / verdict NOOP)."""
-        ttl = remaining_turns if remaining_turns is not None else self.default_ttl
         await self.db.execute(
             """
             UPDATE memories
             SET access_count = access_count + 1,
                 last_accessed = CURRENT_TIMESTAMP,
-                importance = GREATEST(importance, $1),
-                remaining_turns = GREATEST(COALESCE(remaining_turns, 0), $3)
+                importance = GREATEST(importance, $1)
             WHERE id = $2
             """,
             importance,
             existing_id,
-            ttl,
         )
         if self._archiver:
             self._archiver.audit_step(
@@ -710,7 +700,6 @@ class RecallStore:
         source_turn_end: Optional[int],
         source_phase: Optional[int],
         token_count: Optional[int],
-        remaining_turns: Optional[int],
         retrieval_messages: Optional[List[str]],
     ) -> Optional[uuid.UUID]:
         """Adjudicate a candidate against neighbours, then ADD/NOOP/UPDATE/MERGE.
@@ -734,7 +723,6 @@ class RecallStore:
                 source_turn_end=source_turn_end,
                 source_phase=source_phase,
                 token_count=token_count,
-                remaining_turns=remaining_turns,
                 retrieval_messages=retrieval_messages,
             )
 
@@ -756,7 +744,7 @@ class RecallStore:
             if twin is not None:
                 self._audit_verdict("NOOP", [twin.id], None, "recheck-twin")
                 return await self._bump_existing(
-                    twin.id, importance, remaining_turns, source, twin.similarity
+                    twin.id, importance, source, twin.similarity
                 )
             return await _add()
 
@@ -799,7 +787,7 @@ class RecallStore:
             target = targets[0] if targets else similar[0]
             self._audit_verdict("NOOP", [target.id], None, reason)
             return await self._bump_existing(
-                target.id, importance, remaining_turns, source, target.similarity
+                target.id, importance, source, target.similarity
             )
 
         if action in ("UPDATE", "MERGE"):
@@ -827,7 +815,6 @@ class RecallStore:
                         source_turn_end=source_turn_end,
                         source_phase=source_phase,
                         token_count=None,  # re-estimate from merged content
-                        remaining_turns=remaining_turns,
                         retrieval_messages=retrieval_messages,
                     )
                 else:
@@ -1023,8 +1010,7 @@ class RecallStore:
         """Retire memories ``old_ids``, pointing them at their replacement.
 
         Sets the bi-temporal markers (``valid_to``/``superseded_at`` = now,
-        ``superseded_by`` = ``new_id``) and zeroes any TTL so a retired pinned
-        memory stops being injected. Idempotent: already-retired rows
+        ``superseded_by`` = ``new_id``). Idempotent: already-retired rows
         (``valid_to IS NOT NULL``) are skipped. Returns the number retired.
         """
         if not old_ids:
@@ -1034,8 +1020,7 @@ class RecallStore:
             UPDATE memories
             SET valid_to = CURRENT_TIMESTAMP,
                 superseded_at = CURRENT_TIMESTAMP,
-                superseded_by = $2,
-                remaining_turns = 0
+                superseded_by = $2
             WHERE id = ANY($1) AND valid_to IS NULL
             """,
             old_ids,
@@ -1047,116 +1032,6 @@ class RecallStore:
             count = 0
         logger.debug(f"Superseded {count} memory(ies) → {new_id}")
         return count
-
-    # =========================================================================
-    # TTL Management
-    # =========================================================================
-
-    async def get_ttl_active(self) -> List[MemoryRecord]:
-        """Fetch all memories with remaining_turns > 0 (guaranteed injection).
-
-        These memories bypass hybrid search relevance and are always included
-        in the injection block until their TTL expires.
-
-        Returns:
-            List of TTL-active MemoryRecord objects ordered by importance
-        """
-        scope_clause, scope_val = self._scope_where(1)
-        rows = await self.db.fetch(
-            f"""
-            SELECT *
-            FROM memories
-            WHERE {scope_clause} AND remaining_turns > 0 AND valid_to IS NULL
-            ORDER BY importance DESC
-            """,
-            scope_val,
-        )
-        return [MemoryRecord.from_row(dict(row)) for row in rows]
-
-    async def decrement_ttl(self) -> int:
-        """Decrement remaining_turns for all TTL-active memories in scope.
-
-        Called once per turn in the execute node, before memory retrieval.
-
-        Locks the target rows in id order before updating: concurrent
-        same-project consumers otherwise acquire the overlapping tuple locks
-        in divergent orders and deadlock. A residual DeadlockDetectedError is
-        counted for telemetry and re-raised — callers already contain it.
-
-        Returns:
-            Number of memories whose TTL was decremented
-        """
-        scope_clause, scope_val = self._scope_where(1)
-        try:
-            result = await self.db.fetchval(
-                f"""
-                WITH target AS (
-                    SELECT id FROM memories
-                    WHERE {scope_clause} AND remaining_turns > 0 AND valid_to IS NULL
-                    ORDER BY id
-                    FOR UPDATE
-                ), updated AS (
-                    UPDATE memories m
-                    SET remaining_turns = m.remaining_turns - 1
-                    FROM target t
-                    WHERE m.id = t.id
-                    RETURNING m.id
-                )
-                SELECT COUNT(*) FROM updated
-                """,
-                scope_val,
-            )
-        except Exception as e:
-            if _is_deadlock(e):
-                memory_health.increment("ttl_decrement_deadlock")
-            raise
-        return result or 0
-
-    async def boost_ttl(self, memory_id: uuid.UUID, turns: int) -> bool:
-        """Increase remaining_turns for a specific memory.
-
-        Used by the assembler to pin/extend memories that are currently relevant.
-
-        Args:
-            memory_id: UUID of the memory to boost
-            turns: Number of turns to add
-
-        Returns:
-            True if the memory was found and updated
-        """
-        result = await self.db.execute(
-            """
-            UPDATE memories
-            SET remaining_turns = COALESCE(remaining_turns, 0) + $1
-            WHERE id = $2
-            """,
-            turns,
-            memory_id,
-        )
-        return result != "UPDATE 0"
-
-    async def deprecate_ttl(self, memory_id: uuid.UUID, turns: int) -> bool:
-        """Decrease remaining_turns for a specific memory (floor at 0).
-
-        Used by the assembler to fade memories that are no longer relevant.
-
-        Args:
-            memory_id: UUID of the memory to deprecate
-            turns: Number of turns to subtract
-
-        Returns:
-            True if the memory was found and updated
-        """
-        result = await self.db.execute(
-            """
-            UPDATE memories
-            SET remaining_turns = GREATEST(COALESCE(remaining_turns, 0) - $1, 0)
-            WHERE id = $2
-            """,
-            turns,
-            memory_id,
-        )
-        return result != "UPDATE 0"
 
     async def hybrid_search(
         self,
@@ -1226,31 +1101,8 @@ class RecallStore:
                 memory_health.increment("retrieval_deadlock")
             raise
 
-        # Update access tracking. This deliberately does NOT re-arm
-        # remaining_turns any more.
-        #
-        # It used to also set `remaining_turns = GREATEST(COALESCE(
-        # remaining_turns, 0), default_ttl)`, which re-pinned every row this
-        # search FETCHED — up to match_count (= max_memories_per_injection,
-        # 150) rows per turn — while decrement_ttl only ticks -1 per turn. A
-        # memory therefore expired only if it stayed out of the top-150 for 10
-        # consecutive turns, so one retrieval stream sustained ~150 x 10 =
-        # ~1,500 permanently-pinned rows, and concurrent jobs sharing a
-        # project scope stacked on top (one project reached ~2,400).
-        #
-        # Worse, the re-arm fired on rows FETCHED, not rows INJECTED: retrieve()
-        # fills the budget from the pinned tier first, then still runs this
-        # search and re-pins all 150 candidates before the budget loop discards
-        # most of them. Rows the model never saw came back pinned, growing the
-        # pinned tier, which ate more budget, which discarded more
-        # freshly-pinned candidates — a self-sustaining ratchet that starved
-        # relevance retrieval entirely (get_ttl_active is injected first, so
-        # once it fills the budget, hybrid search results never reach the LLM).
-        #
-        # All three runtimes (worker, session, MemoryManager) funnel through
-        # this one seam, so this covers every path. Pinning is now what its
-        # docstring claims: set at write, or by an explicit boost_ttl, decayed
-        # once per turn.
+        # Update access tracking. All three runtimes (worker, session,
+        # MemoryManager) funnel through this one seam.
         if rows:
             await self._record_access_stats([row["id"] for row in rows])
 
@@ -1357,64 +1209,38 @@ class RecallStore:
         context_text: str,
         budget_tokens: Optional[int] = None,
     ) -> List[MemoryRecord]:
-        """High-level retrieval: two-tier (TTL-guaranteed + hybrid search), fit to budget.
+        """High-level retrieval: hybrid search, fit to the token budget.
 
-        This is the main entry point for memory retrieval. It:
-        1. Fetches TTL-active memories (guaranteed injection, remaining_turns > 0)
-        2. Embeds context and runs hybrid search for the remaining budget
-        3. Deduplicates and trims to fit within the token budget
+        This is the main entry point for memory retrieval. It embeds the
+        context, runs hybrid search, and keeps results in rank order until the
+        next one would exceed the budget.
 
         Args:
             context_text: Current context (e.g., current todo + recent messages)
             budget_tokens: Token budget for memory injection
 
         Returns:
-            List of MemoryRecord objects that fit within budget.
-            TTL-active (pinned) memories come first, then hybrid search results.
+            List of MemoryRecord objects that fit within budget, in rank order.
         """
         budget = budget_tokens or self.budget_tokens
 
-        # Tier 1: TTL-active memories (guaranteed injection)
-        pinned = await self.get_ttl_active()
+        context_embedding = await self.embedding_service.embed(context_text)
+        candidates = await self.hybrid_search(
+            query_text=context_text,
+            query_embedding=context_embedding,
+        )
+
         result = []
         tokens_used = 0
-        pinned_ids = set()
-
-        for memory in pinned:
+        for memory in candidates:
             if tokens_used + memory.token_count > budget:
-                logger.warning(
-                    f"TTL-active memories exceed budget ({tokens_used} + "
-                    f"{memory.token_count} > {budget}), truncating"
-                )
                 break
             result.append(memory)
             tokens_used += memory.token_count
-            pinned_ids.add(memory.id)
 
-        # Tier 2: Hybrid search with remaining budget
-        remaining_budget = budget - tokens_used
-        if remaining_budget > 0:
-            context_embedding = await self.embedding_service.embed(context_text)
-            candidates = await self.hybrid_search(
-                query_text=context_text,
-                query_embedding=context_embedding,
-            )
-
-            for memory in candidates:
-                # Deduplicate against pinned memories
-                if memory.id in pinned_ids:
-                    continue
-                if tokens_used + memory.token_count > budget:
-                    break
-                result.append(memory)
-                tokens_used += memory.token_count
-
-        pinned_count = len(pinned_ids & {m.id for m in result})
-        retrieved_count = len(result) - pinned_count
         logger.debug(
-            f"Retrieved {len(result)} memories ({tokens_used} tokens): "
-            f"{pinned_count} pinned + {retrieved_count} from hybrid search "
-            f"(budget={budget})"
+            f"Retrieved {len(result)} memories ({tokens_used} tokens) from "
+            f"hybrid search (budget={budget})"
         )
         return result
 
@@ -1634,7 +1460,6 @@ class RecallStore:
                 COUNT(*) FILTER (WHERE source = 'phase_archive') AS from_phase_archive,
                 COUNT(*) FILTER (WHERE source = 'tool_error') AS from_tool_error,
                 AVG(importance) AS avg_importance,
-                COUNT(*) FILTER (WHERE remaining_turns > 0 AND valid_to IS NULL) AS ttl_active,
                 COUNT(*) FILTER (WHERE valid_to IS NULL) AS current,
                 COUNT(*) FILTER (WHERE valid_to IS NOT NULL) AS superseded
             FROM memories

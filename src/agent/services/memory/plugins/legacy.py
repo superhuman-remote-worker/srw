@@ -9,7 +9,7 @@ assembled payload against the legacy sequence byte-for-byte.
 
 Honest composite names by design: the §6 sketch names (dense, sparse,
 rrf, …) describe the Phase-3+ decomposition, but today RRF fusion lives
-*inside* the SQL functions — `recall_two_tier` and `kb_notes` are the
+*inside* the SQL functions — `recall_hybrid` and `kb_notes` are the
 real units of current behaviour.
 """
 
@@ -69,15 +69,9 @@ def build_persistent_query_text(messages: List[BaseMessage]) -> str:
     return last_user_text(messages)
 
 
-class RecallTwoTierRetriever:
-    """Wraps RecallStore.retrieve() unchanged: TTL-pinned tier first, then
-    hybrid search, budget-fit to the store's configured budget.
-
-    Also transplants the decrement-then-retrieve TTL tick the legacy
-    execute path performs (a write-on-read; Phase 3's always-inject core
-    replaces TTL-pinning, until then the tick must keep happening exactly
-    once per assemble). The decrement has its own containment — a failed
-    tick never blocks retrieval, matching the legacy split try/excepts.
+class RecallHybridRetriever:
+    """Wraps RecallStore.retrieve() unchanged: hybrid search, budget-fit to
+    the store's configured budget. Read-only.
 
     ``timeout`` reproduces the persistent path's per-call 5 s guard
     (None for the worker path, which runs unbounded): a timed-out
@@ -94,17 +88,6 @@ class RecallTwoTierRetriever:
         store = self.recall_store
         if store is None:
             return []
-
-        # A read-only retrieval (the session's idle-time prefetch,
-        # ``AssembleRequest.ttl_tick=False``) leaves the TTL tier alone: the
-        # turn's own retrieval keeps the one tick per turn.
-        if getattr(req, "ttl_tick", True) is not False:
-            try:
-                await _bounded(store.decrement_ttl(), self.timeout)
-            except Exception as e:
-                logger.warning(
-                    "TTL decrement failed (non-fatal): %s: %s", type(e).__name__, e
-                )
 
         # No budget kwarg — the legacy call relies on the store's
         # constructed budget; passing req.budget_tokens here would change
@@ -172,17 +155,21 @@ class KbNotesRetriever:
 
 @register_memory_plugin(
     "retriever",
-    "recall_two_tier",
-    description="Legacy two-tier RecallStore.retrieve (TTL-pinned + hybrid, budget-fit)",
+    "recall_hybrid",
+    description="RecallStore.retrieve: hybrid search, budget-fit",
 )
-def _build_recall_two_tier(runtime: MemoryRuntime) -> RecallTwoTierRetriever:
+@register_memory_plugin(
+    "retriever",
+    "recall_two_tier",
+    description="Alias of recall_hybrid: the name before the TTL-pinned tier "
+    "was retired, kept for stored and frozen configs",
+)
+def _build_recall_hybrid(runtime: MemoryRuntime) -> RecallHybridRetriever:
     if runtime.recall_store is None:
         # Legacy semantics: no store (memory disabled) = quietly no
         # memories — but say so once at bind time instead of never.
-        logger.info(
-            "recall_two_tier bound without a recall_store — contributes nothing"
-        )
-    return RecallTwoTierRetriever(
+        logger.info("recall_hybrid bound without a recall_store — contributes nothing")
+    return RecallHybridRetriever(
         runtime.recall_store, timeout=runtime.retrieval_timeout
     )
 

@@ -244,6 +244,18 @@ class TestFromConfig:
         with pytest.raises(UnknownMemoryPluginError, match="missing"):
             MemoryManager.from_config(cfg, MemoryRuntime())
 
+    def test_the_old_two_tier_name_binds_the_hybrid_retriever(self):
+        # Stored and frozen configs still name recall_two_tier (D36).
+        from agent.services.memory.plugins.legacy import RecallHybridRetriever
+
+        cfg = MemoryConfig(
+            pipeline=MemoryPipelineConfig(retrievers=["recall_two_tier"])
+        )
+        manager = MemoryManager.from_config(cfg, MemoryRuntime())
+        [(name, retriever)] = manager._retrievers
+        assert name == "recall_two_tier"
+        assert isinstance(retriever, RecallHybridRetriever)
+
     @pytest.mark.asyncio
     async def test_empty_pipeline_binds_noop_manager(self):
         manager = MemoryManager.from_config(MemoryConfig(), MemoryRuntime())
@@ -682,23 +694,19 @@ class TestRerankerScorer:
         assert client.calls[0]["json"]["model"] == "qwen3-reranker-8b"
 
     @pytest.mark.asyncio
-    async def test_pinned_stay_first_and_knowledge_passes_through(self):
-        client = FakeRerankClient(scores={"a": 0.2, "b": 0.8})
+    async def test_a_once_pinned_row_is_ranked_and_knowledge_passes_through(self):
+        # The TTL tier is retired (D36): a row an older pod still pins is
+        # ranked like any other memory.
+        client = FakeRerankClient(scores={"a": 0.2, "b": 0.8, "old pin": 0.5})
         scorer = self._scorer(client)
-        pinned = make_scored("working-set note", pinned=True)
+        pinned = make_scored("old pin", pinned=True)
         kb = make_scored("kb note", kind="knowledge")
         items = [pinned, make_scored("a"), kb, make_scored("b")]
 
         out = await scorer.score(AssembleRequest(query_text="q"), items)
 
-        assert [i.candidate.text for i in out] == [
-            "working-set note",
-            "b",
-            "a",
-            "kb note",
-        ]
-        # pinned item was not sent to the endpoint
-        assert client.calls[0]["json"]["documents"] == ["a", "b"]
+        assert [i.candidate.text for i in out] == ["b", "old pin", "a", "kb note"]
+        assert client.calls[0]["json"]["documents"] == ["old pin", "a", "b"]
 
     @pytest.mark.asyncio
     async def test_top_k_tail_keeps_original_order(self):
@@ -995,14 +1003,12 @@ class TestRerankerScorer:
                     "model": "rerank-1",
                     "top_k": 32,
                     "timeout": 5,
-                    "keep_pinned_first": False,
                 }
             }
         )
         assert cfg.reranker.model == "rerank-1"
         assert cfg.reranker.top_k == 32
         assert cfg.reranker.timeout == 5.0
-        assert cfg.reranker.keep_pinned_first is False
         assert cfg.reranker.base_url is None
         # defaults when section absent
         # null = the `rerank` catalog pin (RERANK_MODEL) resolves at bind time
