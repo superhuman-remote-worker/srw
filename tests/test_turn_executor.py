@@ -3155,7 +3155,7 @@ class TestAffinity:
                 "resolved_at": "first",
                 "agent": {
                     "interactive": {
-                        "permission_mode": "supervised",
+                        "permission_mode": "read_only",
                         "narration_mode": "auto",
                         "idle_timeout_minutes": 30,
                     },
@@ -3201,7 +3201,7 @@ class TestAffinity:
             "thread_id": "t1",
             "config_override": {
                 "interactive": {
-                    "permission_mode": "supervised",
+                    "permission_mode": "read_only",
                     "narration_mode": "auto",
                 }
             },
@@ -3423,7 +3423,7 @@ class TestAffinity:
                 "agent": {
                     **base["resolved_config"]["agent"],
                     "interactive": {
-                        "permission_mode": "supervised",
+                        "permission_mode": "read_only",
                         "narration_mode": "auto",
                     },
                 },

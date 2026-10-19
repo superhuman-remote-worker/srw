@@ -125,7 +125,7 @@ class FakeRuntime:
                 track_side_task=lambda task: task,
             ),
             welcome=SessionWelcomePorts(
-                durable_control_modes=AsyncMock(return_value=("supervised", "auto")),
+                durable_control_modes=AsyncMock(return_value=("read_only", "auto")),
                 pending_permissions=AsyncMock(return_value=[]),
                 running_tool=lambda _session: None,
             ),

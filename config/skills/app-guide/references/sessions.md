@@ -66,14 +66,16 @@ because an earlier capability snapshot said `can_execute`.
 
 ## Permission modes — how much it asks first
 
-- **Supervised** — every tool call waits for your approval. An inline card
-  shows what the agent wants to do, with **Approve**, **Auto-accept**
-  (approve and switch modes), or **Stop**.
-- **Auto-accept** — non-shell tools run without asking; shell tools still wait
-  for approval.
+- **Read-only** — reads, search, web research and browsing run without
+  asking; changes, outbound actions and shell commands wait for your approval.
+  An inline card shows what the agent wants to do, with **Approve**,
+  **Auto-accept** (approve and switch modes), or **Stop**.
+- **Auto-accept** — workspace edits run without asking too; irreversible or
+  outbound actions (deletes, mail, pushes, database writes, jobs, delegation)
+  and shell commands still wait for approval.
 - **Autonomous** — everything runs unattended.
 
-Switch modes anytime in the chat's settings panel or with `/supervised`,
+Switch modes anytime in the chat's settings panel or with `/readonly`,
 `/auto`, `/autonomous`. Higher modes may be restricted by your account's
 grants — options you can't use appear disabled. Permission mode controls
 approval prompts; it does not add tools or bypass connector, project, or
@@ -86,7 +88,7 @@ deployment authorization.
   Typing `/` opens a menu that lists only the commands this session supports:
   `/compact` (condense the conversation), `/done` (end the session), `/undo`
   (revert the last turn's file changes; needs a workspace with file history),
-  `/auto`, `/supervised`, `/autonomous`, `/silent`, `/verbose`, and `/rewind`
+  `/auto`, `/readonly`, `/autonomous`, `/silent`, `/verbose`, and `/rewind`
   where the session offers it.
   `/compact` takes optional focus text (`/compact keep the pricing decisions`).
   Sent while the agent is still replying, it waits and runs after that reply.

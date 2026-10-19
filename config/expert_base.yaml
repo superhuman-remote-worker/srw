@@ -392,6 +392,6 @@ shell:
 # Interactive persistent agent settings
 # Only used when agent is started with --mode persistent
 interactive:
-  permission_mode: supervised   # supervised | auto_accept | autonomous
+  permission_mode: read_only   # read_only | auto_accept | autonomous
   narration_mode: auto          # silent | verbose | auto
   idle_timeout_minutes: 30      # Auto-pause session after idle period (0 = disabled)

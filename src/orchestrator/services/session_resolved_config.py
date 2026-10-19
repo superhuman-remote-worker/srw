@@ -19,6 +19,7 @@ from typing import Any, Literal
 
 from fastapi import HTTPException
 
+from shared.permission_modes import DEFAULT_PERMISSION_MODE, normalize_permission_mode
 from orchestrator.security.config_redaction import (
     redact_config_override,
     redact_public_config_override,
@@ -91,7 +92,9 @@ async def read_session_resolved_config(
     # Ordered controls are materialized on the thread row and win at attach
     # (resolve_session_config); show the values the next attach delivers.
     interactive = {
-        "permission_mode": str(thread.get("permission_mode") or "supervised")
+        "permission_mode": normalize_permission_mode(
+            str(thread.get("permission_mode") or DEFAULT_PERMISSION_MODE)
+        )
     }
     if thread.get("narration_mode") is not None:
         interactive["narration_mode"] = str(thread["narration_mode"])

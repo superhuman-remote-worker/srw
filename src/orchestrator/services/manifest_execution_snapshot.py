@@ -17,6 +17,7 @@ from uuid import UUID
 
 from fastapi import HTTPException
 
+from shared.permission_modes import DEFAULT_PERMISSION_MODE
 from orchestrator.services.manifest_store import ManifestStore, decoded
 from shared.manifests.resolution import content_revision
 
@@ -554,7 +555,9 @@ async def prepare_srw_session_patch(
     )
     # Ordered controls are an independent authority; the saved policy must
     # check the same current values that the next attach will deliver.
-    interactive = {"permission_mode": thread.get("permission_mode") or "supervised"}
+    interactive = {
+        "permission_mode": thread.get("permission_mode") or DEFAULT_PERMISSION_MODE
+    }
     if thread.get("narration_mode") is not None:
         interactive["narration_mode"] = thread["narration_mode"]
     for fragment in (updated["agent"], policy):

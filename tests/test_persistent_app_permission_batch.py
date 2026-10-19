@@ -48,7 +48,7 @@ def _isolate_announced_rows():
     pa._announced_permission_rows.update(saved)
 
 
-def _mock_session(permission_mode: str = "supervised"):
+def _mock_session(permission_mode: str = "read_only"):
     session = MagicMock()
     session.permission_mode = permission_mode
     session.tool_decisions = {}
@@ -434,7 +434,7 @@ class _FakeRowStore:
         return None
 
 
-def _session_with_store(store: _FakeRowStore, mode: str = "supervised"):
+def _session_with_store(store: _FakeRowStore, mode: str = "read_only"):
     acquire_ctx = MagicMock()
     acquire_ctx.__aenter__ = AsyncMock(return_value=store)
     acquire_ctx.__aexit__ = AsyncMock(return_value=False)

@@ -531,7 +531,7 @@ async def test_a_pending_stateless_control_defers_the_switch(database, actor):
         owner_user_id=actor["id"],
         client_request_id=uuid4(),
         verb="mode.set",
-        payload={"mode": "supervised"},
+        payload={"mode": "read_only"},
         requested_by="real-pg",
         expected_runtime_generation=generation,
     )
@@ -721,7 +721,7 @@ async def test_control_admission_after_the_switch_waits_for_the_pinned_owner(
             owner_user_id=actor["id"],
             client_request_id=uuid4(),
             verb="mode.set",
-            payload={"mode": "supervised"},
+            payload={"mode": "read_only"},
             requested_by="real-pg",
             expected_runtime_generation=generation,
         )

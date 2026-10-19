@@ -30,7 +30,7 @@ def frozen(workspace=None):
         "llm": {"model": "gpt-4o", "temperature": 0.3, "top_p": 0.73},
         "limits": {"context_threshold_tokens": 54321},
         "workspace": workspace or {"backend": "none"},
-        "interactive": {"permission_mode": "supervised"},
+        "interactive": {"permission_mode": "read_only"},
         "autonomy": "review",
         "tools": {"shell": []},
     }

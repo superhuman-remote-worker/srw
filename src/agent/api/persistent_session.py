@@ -27,6 +27,7 @@ from langchain_core.messages import BaseMessage
 
 from agent.core.context import ContextConfig, ContextManager
 from agent.core.summarizer import load_summarizer_prompt
+from shared.permission_modes import DEFAULT_PERMISSION_MODE
 from shared.runtime.core.loader import (
     AgentConfig,
     FileResolver,
@@ -295,7 +296,7 @@ class PersistentSession:
     subagent_fanout: bool = False
 
     # Permission mode (switchable at runtime)
-    permission_mode: str = "supervised"
+    permission_mode: str = DEFAULT_PERMISSION_MODE
     # Narration mode (switchable at runtime)
     narration_mode: str = "auto"
 

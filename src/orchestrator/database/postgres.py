@@ -37291,7 +37291,7 @@ class PostgresDB:
         user_id: str | None = None,
         project_id: str | None = None,
         config_name: str = "session_base",
-        permission_mode: str = "supervised",
+        permission_mode: str = "read_only",
         narration_mode: str = "auto",
         title: str = "Untitled Session",
         datasource_ids: list[str] | None = None,

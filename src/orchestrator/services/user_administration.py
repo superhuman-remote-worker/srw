@@ -31,6 +31,10 @@ from orchestrator.services.cloud_user_root import (
     ensure_user_root_if_cloud,
     retirement_revoke,
 )
+from shared.permission_modes import (
+    legacy_wire_permission_mode,
+    normalize_permission_mode,
+)
 from shared.runtime.core import capability_grants
 
 from orchestrator.schemas.users import (
@@ -164,6 +168,8 @@ def validate_grant_value(key: str, value: Any) -> None:
     enum can't later crash meet()/resolve_grants at dispatch time."""
     spec = capability_grants.CATALOG[key]
     t = spec["type"]
+    if key == "permission_mode":
+        value = normalize_permission_mode(value)
     if t == "bool" and not isinstance(value, bool):
         raise HTTPException(
             status_code=400, detail=f"{key}: value_json must be a boolean"
@@ -210,6 +216,11 @@ async def set_grant(
     if key not in capability_grants.CATALOG or scope_kind not in GRANT_SCOPE_KINDS:
         raise HTTPException(status_code=400, detail="unknown key or scope_kind")
     validate_grant_value(key, value_json)
+    if key == "permission_mode":
+        # Grant rows must stay readable by an orchestrator from before the
+        # read_only rename until rollback below it is ruled out; the contract
+        # step of the rename rewrites them.
+        value_json = legacy_wire_permission_mode(value_json)
     return {
         "grant": await dependencies.store.set_grant(
             scope_kind=scope_kind,

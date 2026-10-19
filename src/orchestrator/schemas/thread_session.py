@@ -2,18 +2,27 @@
 
 from __future__ import annotations
 
-from typing import Any, Literal, Optional, get_args
+from typing import Annotated, Any, Literal, Optional, get_args
 from uuid import UUID
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, BeforeValidator, Field, model_validator
 
 from orchestrator.schemas.inline_expert import InlineExpertSelection
+from shared.permission_modes import (
+    legacy_wire_permission_mode,
+    normalize_permission_mode,
+)
 
 
-# The `threads.valid_permission_mode` CHECK values. Request schemas validate
-# against this so a bad value is a 422, not a 500 from the insert.
-PermissionMode = Literal["supervised", "auto_accept", "autonomous"]
-PERMISSION_MODES = frozenset(get_args(PermissionMode))
+# The canonical `threads.valid_permission_mode_v2` CHECK values. Request
+# schemas validate against this so a bad value is a 422, not a 500 from the
+# insert. The legacy `supervised` spelling is accepted and normalised before
+# validation, so OpenAPI lists only the canonical names.
+PermissionMode = Annotated[
+    Literal["read_only", "auto_accept", "autonomous"],
+    BeforeValidator(normalize_permission_mode),
+]
+PERMISSION_MODES = frozenset(get_args(get_args(PermissionMode)[0]))
 
 
 class ThreadControlRequest(BaseModel):
@@ -30,17 +39,18 @@ class ThreadControlRequest(BaseModel):
             "admission compares it under the thread-row lock."
         ),
     )
-    mode: (
+    mode: Annotated[
         Literal[
-            "supervised",
+            "read_only",
             "auto_accept",
             "autonomous",
             "silent",
             "verbose",
             "auto",
         ]
-        | None
-    ) = None
+        | None,
+        BeforeValidator(normalize_permission_mode),
+    ] = None
     focus: str | None = Field(
         None,
         max_length=4000,
@@ -127,6 +137,10 @@ class ThreadControlRequest(BaseModel):
             if self.template:
                 payload["template"] = self.template
             return payload
+        if self.method == "mode.set" and self.mode is not None:
+            # Agent images from before the read_only rename reject it on
+            # mode.set; the contract step of the rename drops this.
+            return {"mode": legacy_wire_permission_mode(self.mode)}
         return {"mode": self.mode}
 
 

@@ -21,6 +21,10 @@ from typing import Any, Dict, List, Optional, Set, Tuple, Union
 import yaml
 from langchain_core.language_models import BaseChatModel
 
+from shared.permission_modes import (
+    DEFAULT_PERMISSION_MODE,
+    normalize_permission_mode,
+)
 from shared.runtime.core.delegation_settings import (
     FAMILY_SESSION_MAX_CONCURRENT_KEY,
     MATRIX_SESSION_MAX_CONCURRENT_KEY,
@@ -498,6 +502,41 @@ def normalize_delegation_block(fragment: Any, *, source: str) -> Any:
     return out
 
 
+_PERMISSION_MODE_LOG_SEEN: set = set()
+
+
+def normalize_interactive_permission_mode(fragment: Any, *, source: str) -> Any:
+    """Map a legacy ``interactive.permission_mode`` spelling of ONE config layer.
+
+    ``supervised`` was renamed ``read_only`` (tool_permission_tiers.md, D2).
+    Never mutates the input; a layer without the legacy value is returned by
+    identity. Logs one deprecation warning per source.
+    """
+    if not isinstance(fragment, dict):
+        return fragment
+    interactive = fragment.get("interactive")
+    if not isinstance(interactive, dict):
+        return fragment
+    mode = interactive.get("permission_mode")
+    canonical = normalize_permission_mode(mode)
+    if canonical == mode:
+        return fragment
+    out = dict(fragment)
+    out["interactive"] = {**interactive, "permission_mode": canonical}
+    if source not in _PERMISSION_MODE_LOG_SEEN:
+        if len(_PERMISSION_MODE_LOG_SEEN) >= _DELEGATION_LOG_SEEN_MAX:
+            _PERMISSION_MODE_LOG_SEEN.clear()
+        _PERMISSION_MODE_LOG_SEEN.add(source)
+        logger.warning(
+            "config: interactive.permission_mode %r in %s read as %r (renamed; "
+            "see tool_permission_tiers.md)",
+            mode,
+            source,
+            canonical,
+        )
+    return out
+
+
 # =============================================================================
 # Subagent roster: the ``inherit`` model sentinel (U1 — universal experts)
 # =============================================================================
@@ -755,6 +794,10 @@ def load_and_merge_config(
     config_data = normalize_llm_tiers(config_data, source=str(config_path))
     # And for the pre-U3 delegation keys (dropped, never merged).
     config_data = normalize_delegation_block(config_data, source=str(config_path))
+    # And for the renamed permission mode (supervised -> read_only).
+    config_data = normalize_interactive_permission_mode(
+        config_data, source=str(config_path)
+    )
 
     # Handle $extends inheritance
     if "$extends" in config_data:
@@ -2765,7 +2808,9 @@ class InteractiveConfig:
     Controls permission defaults and idle behavior.
     """
 
-    permission_mode: str = "supervised"  # supervised | auto_accept | autonomous
+    permission_mode: str = (
+        DEFAULT_PERMISSION_MODE  # read_only | auto_accept | autonomous
+    )
     narration_mode: str = "auto"  # silent | verbose | auto
     idle_timeout_minutes: int = 30  # 0 = disabled
 
@@ -3636,7 +3681,9 @@ def load_agent_config(
     # Parse interactive config
     interactive_data = data.get("interactive", {})
     interactive_config = InteractiveConfig(
-        permission_mode=interactive_data.get("permission_mode", "supervised"),
+        permission_mode=normalize_permission_mode(
+            interactive_data.get("permission_mode", DEFAULT_PERMISSION_MODE)
+        ),
         idle_timeout_minutes=interactive_data.get("idle_timeout_minutes", 30),
     )
 
@@ -3929,7 +3976,9 @@ def load_agent_config_from_dict(
     # Parse interactive config
     interactive_data = data.get("interactive", {})
     interactive_config = InteractiveConfig(
-        permission_mode=interactive_data.get("permission_mode", "supervised"),
+        permission_mode=normalize_permission_mode(
+            interactive_data.get("permission_mode", DEFAULT_PERMISSION_MODE)
+        ),
         idle_timeout_minutes=interactive_data.get("idle_timeout_minutes", 30),
     )
 

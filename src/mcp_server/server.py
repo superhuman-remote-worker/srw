@@ -2519,7 +2519,7 @@ async def send_officer_note(project_id: str, message: str) -> str:
 async def create_persistent_thread(
     title: str = "Untitled Session",
     config_name: str = "session_base",
-    permission_mode: Literal["supervised", "auto_accept", "autonomous"] = "supervised",
+    permission_mode: Literal["read_only", "auto_accept", "autonomous"] | None = None,
     project_id: str | None = None,
     project_ids: list[str] | None = None,
     datasource_ids: list[str] = None,  # type: ignore[assignment]
@@ -2548,7 +2548,10 @@ async def create_persistent_thread(
     Args:
         title: Human-readable session title
         config_name: Agent config to use (default: "session_base")
-        permission_mode: Tool approval mode (supervised, auto_accept, autonomous)
+        permission_mode: Tool approval mode. "read_only" runs reads and
+            research freely and asks before changes, outbound actions and
+            commands; "auto_accept" also runs workspace edits freely;
+            "autonomous" asks for nothing. Omit for the user's saved default.
         project_id: The session's project UUID. A session has one project or
             none; omit for none (a project-scoped MCP token uses its own
             project).

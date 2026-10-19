@@ -3273,7 +3273,7 @@ class AsyncCockpitClient:
         self,
         config_name: str = "session_base",
         title: str = "Untitled Session",
-        permission_mode: str = "supervised",
+        permission_mode: str | None = None,
         project_id: str | None = None,
         project_ids: list[str] | None = None,
         datasource_ids: list[str] | None = None,
@@ -3305,8 +3305,10 @@ class AsyncCockpitClient:
         body: dict[str, Any] = {
             "config_name": config_name,
             "title": title,
-            "permission_mode": permission_mode,
         }
+        # Omitted means the user's saved default, then the config default.
+        if permission_mode is not None:
+            body["permission_mode"] = permission_mode
         if project_id:
             body["project_id"] = project_id
         if project_ids:

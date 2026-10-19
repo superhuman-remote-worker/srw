@@ -40,9 +40,9 @@ def _minimal_config_data(**overrides):
 class TestInteractiveConfigDefaults:
     """Tests for InteractiveConfig default values."""
 
-    def test_permission_mode_defaults_to_supervised(self):
+    def test_permission_mode_defaults_to_read_only(self):
         ic = InteractiveConfig()
-        assert ic.permission_mode == "supervised"
+        assert ic.permission_mode == "read_only"
 
     def test_idle_timeout_defaults_to_30(self):
         ic = InteractiveConfig()
@@ -73,7 +73,7 @@ class TestInteractiveConfigParsing:
         """When no 'interactive' key in data, defaults are used."""
         data = _minimal_config_data()
         config = load_agent_config_from_dict(data)
-        assert config.interactive.permission_mode == "supervised"
+        assert config.interactive.permission_mode == "read_only"
         assert config.interactive.idle_timeout_minutes == 30
 
     def test_explicit_permission_mode_overrides_default(self):
@@ -97,11 +97,11 @@ class TestInteractiveConfigParsing:
         """Empty interactive dict is the same as missing."""
         data = _minimal_config_data(interactive={})
         config = load_agent_config_from_dict(data)
-        assert config.interactive.permission_mode == "supervised"
+        assert config.interactive.permission_mode == "read_only"
         assert config.interactive.idle_timeout_minutes == 30
 
     def test_interactive_config_is_correct_type(self):
-        data = _minimal_config_data(interactive={"permission_mode": "supervised"})
+        data = _minimal_config_data(interactive={"permission_mode": "read_only"})
         config = load_agent_config_from_dict(data)
         assert isinstance(config.interactive, InteractiveConfig)
 

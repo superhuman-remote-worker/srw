@@ -67,6 +67,7 @@ from uuid import uuid4
 
 from fastapi import HTTPException, Request
 
+from shared.permission_modes import DEFAULT_PERMISSION_MODE, normalize_permission_mode
 from orchestrator.database.postgres import (
     DatasourceMaterializationAuthorizationError,
     DatasourcePolicyConflictError,
@@ -1127,9 +1128,10 @@ async def resolve_thread_creation_plan(
 
     # Keep the threads.permission_mode column in sync with the mode the
     # fully resolved config will load (request > expert > account > base).
-    effective_permission_mode = (effective_create_config.get("interactive") or {}).get(
-        "permission_mode"
-    ) or "supervised"
+    effective_permission_mode = normalize_permission_mode(
+        (effective_create_config.get("interactive") or {}).get("permission_mode")
+        or DEFAULT_PERMISSION_MODE
+    )
     effective_narration_mode = (effective_create_config.get("interactive") or {}).get(
         "narration_mode"
     ) or "auto"

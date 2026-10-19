@@ -441,10 +441,11 @@ def test_permissions_guide_keeps_current_policy_and_workspace_boundaries():
     assert "does not itself inspect current flags" in body
     assert "uses `get_product_capabilities`" in body
     assert "advisory, time-stamped observation, not authorization" in body
-    assert "supervised" in body and "before every tool call" in body
-    assert "auto-accept" in body
-    for tool_name in ("run_command", "shell_execute", "shell_read"):
-        assert tool_name in body
+    assert "**read-only** runs reads freely" in body
+    assert "asks before anything that changes files or data" in body
+    assert "**auto-accept** also runs workspace edits freely" in body
+    assert "irreversible or outbound actions" in body
+    assert "not the same as a connector's read-only access level" in body
     assert "autonomous" in body and "without per-call approval" in body
     assert "permission mode does not add tools" in body
     assert "built-in non-admin ceiling allows auto-accept" in body

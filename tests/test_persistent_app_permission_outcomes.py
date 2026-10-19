@@ -34,7 +34,7 @@ from shared.thread_presence import PermissionExpiryResult
 # =============================================================================
 
 
-def _mock_session(permission_mode: str = "supervised"):
+def _mock_session(permission_mode: str = "read_only"):
     session = MagicMock()
     session.permission_mode = permission_mode
     session.tool_decisions = {}

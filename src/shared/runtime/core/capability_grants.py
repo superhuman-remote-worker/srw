@@ -14,9 +14,10 @@ import copy
 from typing import Any
 
 from shared.connectors.builtin import tool_categories
+from shared.permission_modes import PERMISSION_MODES, normalize_permission_mode
 
 _AUTONOMY_ORDER = ["dependent", "guided", "partial", "review", "full"]
-_PERMISSION_ORDER = ["supervised", "auto_accept", "autonomous"]
+_PERMISSION_ORDER = list(PERMISSION_MODES)
 #: Every tool category the `datasource_tools` grant gates, shared by `evaluate`
 #: (the check) and `strip_to_grants` (the fix) so the two cannot drift apart.
 #: The connector drivers' specs say which categories they bind.
@@ -96,18 +97,24 @@ CATALOG: dict[str, dict[str, Any]] = {
     },
     "permission_mode": {
         "type": "enum",
-        # Default ceiling is auto_accept (raised from supervised, 2026-06-26 policy):
+        # Default ceiling is auto_accept (raised from supervised — now read_only —
+        # 2026-06-26 policy):
         # every approved user may pick up to auto_accept without a grant — safe
         # because agents run in isolated sandbox workspaces and shell execution is
         # separately gated by `shell_tools`. autonomous (fully unattended) still
         # requires an explicit permission_mode grant. A global-scope grant can
-        # restrict back to supervised if ever needed.
+        # restrict back to read_only if ever needed. Stored rows may still say
+        # `supervised`; _VALUE_NORMALIZERS maps them before any comparison.
         # knowledge-base/knowledge/issues/session_permission_mode_grant_denied_ready_timeout.md (Phase 5).
         "default": "auto_accept",
         "restrict_only": True,
         "order": _PERMISSION_ORDER,
     },
 }
+
+#: Stored values that predate a rename, mapped before any comparison. Kept out
+#: of CATALOG, which the grants API returns as JSON.
+_VALUE_NORMALIZERS = {"permission_mode": normalize_permission_mode}
 
 
 def meet(spec: dict, a: Any, b: Any) -> Any:
@@ -132,7 +139,8 @@ def meet(spec: dict, a: Any, b: Any) -> Any:
 def _scope_value(rows: list[dict], key: str, spec: dict) -> Any:
     """The value one scope asserts for key, meeting duplicates (multi-project ->
     most restrictive). None => scope does not set the key."""
-    vals = [r["value_json"] for r in rows if r.get("key") == key]
+    normalize = _VALUE_NORMALIZERS.get(key, lambda value: value)
+    vals = [normalize(r["value_json"]) for r in rows if r.get("key") == key]
     if not vals:
         return None
     acc = vals[0]
@@ -328,8 +336,8 @@ def evaluate(fragment: dict, grants: dict, *, is_admin: bool = False) -> list[st
             f"autonomy_ceiling: autonomy '{fragment.get('autonomy')}' exceeds the ceiling"
         )
     if _enum_exceeds(
-        inter.get("permission_mode"),
-        grants.get("permission_mode", "auto_accept"),
+        normalize_permission_mode(inter.get("permission_mode")),
+        normalize_permission_mode(grants.get("permission_mode", "auto_accept")),
         _PERMISSION_ORDER,
     ):
         v.append(

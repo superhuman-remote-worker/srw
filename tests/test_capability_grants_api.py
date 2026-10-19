@@ -208,7 +208,7 @@ async def test_lifecycle_runner_keeps_owner_capability_limits(monkeypatch):
 @pytest.mark.asyncio
 async def test_enforce_session_create_grants_raises_422_for_denied_mode(monkeypatch):
     # Session create/update PEP (Layer 2): a permission_mode above the owner's
-    # ceiling (default 'supervised', no grant) → 422 with the violation, so a
+    # ceiling (default 'read_only', no grant) → 422 with the violation, so a
     # never-startable session is rejected at the API instead of timing out at
     # provisioning. knowledge-base/knowledge/issues/session_permission_mode_grant_denied_ready_timeout.md
     fake = AsyncMock()
@@ -255,9 +255,9 @@ async def test_enforce_session_create_grants_allows_within_ceiling(monkeypatch):
         return_value={"user": [], "project": [], "global": []}
     )
     monkeypatch.setattr(m.app.state.resources, "postgres_db", fake)
-    # 'supervised' is the default ceiling → within grants → no raise.
+    # 'read_only' is the default ceiling → within grants → no raise.
     await grant_enforcement_module.enforce_session_create_grants(
-        {"interactive": {"permission_mode": "supervised"}},
+        {"interactive": {"permission_mode": "read_only"}},
         user_id=_UID,
         project_ids=[],
         dependencies=preparation_composition.grant_enforcement_dependencies(

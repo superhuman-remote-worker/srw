@@ -1161,7 +1161,7 @@ class TestSendSessionAttachPayload:
         resolved = {
             "agent": {
                 "interactive": {
-                    "permission_mode": "supervised",
+                    "permission_mode": "read_only",
                     "narration_mode": "silent",
                 }
             }

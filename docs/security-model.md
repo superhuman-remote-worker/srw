@@ -397,7 +397,7 @@ Before exposing a deployment or connecting valuable systems:
 6. Prefer VM workspaces for adversarial repositories or privileged commands.
 7. Restrict connector permissions, network destinations, and data scopes to the
    minimum needed by one project.
-8. Begin with supervised sessions and review-gated jobs before enabling full
+8. Begin with read-only sessions and review-gated jobs before enabling full
    autonomy, schedules, or project loops.
 9. Configure backups outside the failure domain of the SRW cluster and test
    restoration.

@@ -110,7 +110,7 @@ spec:
           communication: []
 
         interactive:
-          permission_mode: supervised
+          permission_mode: read_only
           idle_timeout_minutes: 30
 
         memory:

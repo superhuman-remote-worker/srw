@@ -35,7 +35,7 @@ EXPECTED_DEFAULTS = {
     "admin_view_mode": "all",
     "persistent_agent": {
         "model": "registry-chat",
-        "permission_mode": "supervised",
+        "permission_mode": "read_only",
         "idle_timeout_minutes": 30,
     },
 }

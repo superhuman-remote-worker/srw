@@ -196,7 +196,7 @@ async def _apply_schema() -> None:
             "CREATE TABLE threads ("
             "id UUID PRIMARY KEY, user_id UUID, agent_id UUID, title TEXT, "
             "status TEXT NOT NULL DEFAULT 'active', "
-            "permission_mode TEXT NOT NULL DEFAULT 'supervised', "
+            "permission_mode TEXT NOT NULL DEFAULT 'read_only', "
             "metadata JSONB NOT NULL DEFAULT '{}'::jsonb, "
             "total_turns INTEGER NOT NULL DEFAULT 0, "
             "awaiting_user_since TIMESTAMPTZ, "
@@ -1480,7 +1480,7 @@ class TestControlFinalization:
             await conn.fetchval(
                 "SELECT permission_mode FROM threads WHERE id = $1", thread_id
             )
-            == "supervised"
+            == "read_only"
         )
         row = await _row(conn, thread_id)
         assert (row["control_input_seq"], row["control_consumed_seq"]) == (1, 1)
@@ -1581,7 +1581,7 @@ class TestControlFinalization:
             await conn.fetchval(
                 "SELECT permission_mode FROM threads WHERE id = $1", thread_id
             )
-            == "supervised"
+            == "read_only"
         )
         assert (
             await conn.fetchval(
@@ -1779,7 +1779,7 @@ class TestControlFinalization:
             request_id,
             request_thread,
             uuid4(),
-            '{"mode":"supervised"}',
+            '{"mode":"read_only"}',
         )
 
         with pytest.raises(asyncpg.ForeignKeyViolationError):
@@ -1793,7 +1793,7 @@ class TestControlFinalization:
                         "request_id": str(request_id),
                         "request_seq": 1,
                         "method": "mode.set",
-                        "mode": "supervised",
+                        "mode": "read_only",
                     }
                 ),
                 request_id,

@@ -62,7 +62,7 @@ def _frozen_blob() -> dict:
                 "mounts": [{"source": "workspace-host.internal"}],
             },
             "tools": {"research": ["web_search"], "shell": []},
-            "interactive": {"permission_mode": "supervised"},
+            "interactive": {"permission_mode": "read_only"},
         },
         "prompts": {"persona": "A terse helper."},
         "instructions": {},

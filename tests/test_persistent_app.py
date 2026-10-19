@@ -4643,13 +4643,13 @@ class TestWSMessageRouting:
 
     def test_valid_modes(self):
         """Valid mode set values."""
-        valid_modes = ("supervised", "auto_accept", "autonomous")
+        valid_modes = ("read_only", "auto_accept", "autonomous")
         for mode in valid_modes:
             assert mode in valid_modes
 
     def test_invalid_mode_rejected(self):
         """Invalid mode not in valid set."""
-        assert "invalid" not in ("supervised", "auto_accept", "autonomous")
+        assert "invalid" not in ("read_only", "auto_accept", "autonomous")
 
 
 # ---------------------------------------------------------------------------
@@ -6886,7 +6886,7 @@ class TestHandlePersistentWebsocketReadiness:
         session = MagicMock()
         session.llm_with_tools = MagicMock()
         session.protected_cloud_ready.return_value = True
-        session.permission_mode = "supervised"
+        session.permission_mode = "read_only"
         session.narration_mode = "auto"
         session.turn_count = 7
         session.messages = []
@@ -6959,7 +6959,7 @@ class TestHandlePersistentWebsocketReadiness:
         ]
         session = MagicMock()
         session.llm_with_tools = MagicMock()
-        session.permission_mode = "supervised"
+        session.permission_mode = "read_only"
         session.narration_mode = "auto"
         session.turn_count = 7
         session.messages = []
@@ -8165,7 +8165,7 @@ class TestHandleConfigUpdateAckProtocol:
 
         src = getsource(_handle_config_update)
         assert src.index("update_thread_config(") < src.index(
-            "_session.permission_mode = pm"
+            "_session.permission_mode = normalize_permission_mode(pm)"
         )
 
     def test_scrub_secret_values_drops_api_keys_recursively(self):

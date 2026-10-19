@@ -2298,12 +2298,12 @@
         "permission_mode": {
           "type": "string",
           "enum": [
-            "supervised",
+            "read_only",
             "auto_accept",
             "autonomous"
           ],
-          "default": "supervised",
-          "description": "Default permission mode for tool execution in interactive sessions"
+          "default": "read_only",
+          "description": "Default permission mode for tool execution in interactive sessions. read_only runs reads freely and asks before changes, outbound actions and commands; auto_accept also runs workspace edits; autonomous asks for nothing. The legacy value supervised is read as read_only."
         },
         "idle_timeout_minutes": {
           "type": "integer",

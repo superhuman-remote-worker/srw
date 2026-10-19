@@ -35,6 +35,8 @@ from pydantic import (
     model_validator,
 )
 
+from shared.permission_modes import PERMISSION_MODES
+
 SCHEMA_VERSION = "1.1"
 SCHEMA_MAJOR = 1
 
@@ -310,7 +312,7 @@ PUBLIC_QUALIFIER_KEYS = frozenset(
 )
 
 _EMAIL_ACCESS_TIERS = frozenset({"read", "read_write", "draft", "send"})
-_PERMISSION_MODE_CEILINGS = frozenset({"supervised", "auto_accept", "autonomous"})
+_PERMISSION_MODE_CEILINGS = frozenset(PERMISSION_MODES)
 _WORKSPACE_BACKENDS = frozenset({"sandbox", "vm", "virtual", "none"})
 
 

@@ -7,7 +7,7 @@ Template: scripts/stateless-resilience-k3d-gate.py.
 
 Scenarios (each selectable by flag, run one at a time, in this order):
 
-  --k1  Supervised session; the parent issues N delegate_agent calls; the
+  --k1  Read-only session; the parent issues N delegate_agent calls; the
         executor holding the lease is killed while the approval cards are
         pending. The successor's replayed cards are declined by the script.
         Pass: one final answer, zero child rows and zero child provider calls,
@@ -3750,7 +3750,7 @@ class Gate(PinnedScenarios):
     # -- K1 --------------------------------------------------------------------
     def scenario_k1(self, run):
         n = self.args.k1_calls
-        run.create_session(permission_mode="supervised")
+        run.create_session(permission_mode="read_only")
         run.warm_up(cap=None)
         seq = run.send(
             batch_prompt(

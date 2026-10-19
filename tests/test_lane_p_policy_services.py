@@ -1881,7 +1881,7 @@ class TestAccountDefaults:
                 "default_model": "m",
                 "persistent_agent": {
                     "model": "p",
-                    "permission_mode": "supervised",
+                    "permission_mode": "read_only",
                     "headless_mode": "attentive",
                     "headless_attention_sleep_minutes": "7",
                     "workspace_backend": "sandbox",
@@ -1897,7 +1897,7 @@ class TestAccountDefaults:
         assert layer["llm"]["model"] == "p", (
             "persistent_agent.model wins over default_model"
         )
-        assert layer["interactive"] == {"permission_mode": "supervised"}
+        assert layer["interactive"] == {"permission_mode": "read_only"}
         assert layer["headless"] == {"mode": "attentive", "attention_sleep_minutes": 7}
 
     @pytest.mark.asyncio

@@ -71,7 +71,7 @@ def stateless_owner(monkeypatch):
     )
     session = SimpleNamespace(
         postgres_conn=pool,
-        permission_mode="supervised",
+        permission_mode="read_only",
         narration_mode="auto",
         turn_count=12,
         context_manager=SimpleNamespace(_last_summarization_stats=None),
@@ -392,7 +392,7 @@ def test_ram_convergence_is_a_no_op_for_compact(stateless_owner):
         "applied",
         None,
     )
-    assert stateless_owner.permission_mode == "supervised"
+    assert stateless_owner.permission_mode == "read_only"
 
 
 @pytest.mark.asyncio

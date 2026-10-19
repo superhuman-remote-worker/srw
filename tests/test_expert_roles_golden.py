@@ -544,7 +544,7 @@ def test_every_bundled_expert_resolves_in_the_subagent_role(name, subagent_ignor
         assert not _dotted_present(data, dotted), f"{name}: {dotted} survived"
     assert data["tools"] and data["llm"]["model"]
     # The subagent overlay's own values sit under the expert
-    assert data["interactive"]["permission_mode"] in {"autonomous", "supervised"}
+    assert data["interactive"]["permission_mode"] in {"autonomous", "read_only"}
     # and the whole thing parses — with the matrix applied — like any config.
     cfg = load_agent_config(str(leaf), deployment_dir, role="subagent")
     assert cfg.agent_id == data["agent_id"]

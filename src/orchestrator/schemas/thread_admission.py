@@ -128,7 +128,7 @@ class ThreadCreateRequest(BaseModel):
         None,
         description=(
             "Per-session permission mode override. Omit to inherit the user's "
-            "saved default, then the config default ('supervised')."
+            "saved default, then the config default ('read_only')."
         ),
     )
     title: str = Field("Untitled Session", description="Session title")

@@ -271,7 +271,7 @@ class TestConfigOverrideRebuild:
         )
         assert override["interactive"]["permission_mode"] == "autonomous"
 
-    @pytest.mark.parametrize("mode", ["supervised", "auto_accept", "autonomous", None])
+    @pytest.mark.parametrize("mode", ["read_only", "auto_accept", "autonomous", None])
     def test_valid_permission_modes_and_none_are_accepted(self, mode):
         assert ThreadCreateRequest(permission_mode=mode).permission_mode == mode
 
@@ -279,10 +279,10 @@ class TestConfigOverrideRebuild:
         with pytest.raises(ValidationError) as exc:
             ThreadCreateRequest(permission_mode="default")
         text = str(exc.value)
-        for allowed in ("supervised", "auto_accept", "autonomous"):
+        for allowed in ("read_only", "auto_accept", "autonomous"):
             assert allowed in text
 
-    @pytest.mark.parametrize("mode", ["supervised", "auto_accept", "autonomous"])
+    @pytest.mark.parametrize("mode", ["read_only", "auto_accept", "autonomous"])
     def test_child_thread_schema_accepts_valid_permission_modes(self, mode):
         assert AgentThreadCreateRequest(permission_mode=mode).permission_mode == mode
 
@@ -290,7 +290,7 @@ class TestConfigOverrideRebuild:
         with pytest.raises(ValidationError) as exc:
             AgentThreadCreateRequest(permission_mode="default")
         text = str(exc.value)
-        for allowed in ("supervised", "auto_accept", "autonomous"):
+        for allowed in ("read_only", "auto_accept", "autonomous"):
             assert allowed in text
 
     def test_the_workspace_tier_is_honored_at_create(self):
@@ -648,7 +648,7 @@ class TestCreationPlan:
         assert plan.execution_lane == "pinned"
         assert plan.lite_session is False and plan.vm_session is False
         assert plan.create_kwargs["config_name"] == "session_base"
-        assert plan.create_kwargs["permission_mode"] == "supervised"
+        assert plan.create_kwargs["permission_mode"] == "read_only"
 
     @pytest.mark.asyncio
     async def test_a_new_session_follows_the_connector_rule_from_birth(self):

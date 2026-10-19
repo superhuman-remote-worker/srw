@@ -260,7 +260,7 @@ def _review_session_opening_event(
             "connector; the scratch job workspace is not reused."
         ),
         (
-            "Permission mode: supervised for review; the worker's automation "
+            "Permission mode: read-only for review; the worker's automation "
             "mode is not inherited."
         ),
     ]
@@ -379,7 +379,7 @@ async def create_job_review_session(
         datasource_ids=session_datasource_ids,
         model=model,
         temperature=temperature,
-        permission_mode="supervised",
+        permission_mode="read_only",
         # A clone-based repository requires a shell workspace. This is a fixed
         # property of the review workflow, not a copied or caller-supplied job
         # override (the job's vm/virtual choice is deliberately ignored).

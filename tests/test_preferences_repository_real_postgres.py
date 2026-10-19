@@ -69,7 +69,7 @@ async def test_explicit_null_and_whole_subobject_replacement_keep_sql_semantics(
         {
             "language": "en",
             "unrelated": {"retained": True, "null": None},
-            "persistent_agent": {"model": "old", "permission_mode": "supervised"},
+            "persistent_agent": {"model": "old", "permission_mode": "read_only"},
         },
     )
     assert (
@@ -99,7 +99,7 @@ async def test_concurrent_null_reset_and_subobject_patch_do_not_lose_sibling_upd
         {
             "language": "en",
             "retained": True,
-            "persistent_agent": {"model": "old", "permission_mode": "supervised"},
+            "persistent_agent": {"model": "old", "permission_mode": "read_only"},
         },
     )
     observer = await asyncpg.connect(migrated_dsn)

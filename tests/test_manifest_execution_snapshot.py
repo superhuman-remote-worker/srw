@@ -279,7 +279,7 @@ async def test_thread_snapshot_captures_complete_initial_metadata_in_insert_tran
         assert kwargs["expert_id"] == WORK
         assert kwargs["config_override"]["llm"] == {"model": "chosen"}
         assert (
-            kwargs["config_override"]["interactive"]["permission_mode"] == "supervised"
+            kwargs["config_override"]["interactive"]["permission_mode"] == "read_only"
         )
         return {}
 

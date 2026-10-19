@@ -124,6 +124,11 @@ from agent.api.lease_context import current_lease as _current_lease_var
 from agent.api.pinned_write_fence import PROCESS_PINNED_WRITE_FENCE
 from shared import event_journal as _event_journal
 from shared.pinned_session_identity import PINNED_SESSION_READY_IDENTITY_CONTRACT
+from shared.permission_modes import (
+    DEFAULT_PERMISSION_MODE,
+    is_permission_mode,
+    normalize_permission_mode,
+)
 from shared.thread_presence import (
     expire_permission_if_untethered,
     mark_stateless_natural_pause,
@@ -3917,7 +3922,7 @@ async def _durable_session_control_modes() -> tuple[str, str]:
     """
 
     if _session is None:
-        return "supervised", "auto"
+        return DEFAULT_PERMISSION_MODE, "auto"
     fallback = (_session.permission_mode, _session.narration_mode)
     if _session.postgres_conn is None or _session_identity.thread_id is None:
         return fallback
@@ -3934,7 +3939,9 @@ async def _durable_session_control_modes() -> tuple[str, str]:
                 )
                 if row is None:
                     return fallback
-                permission_mode = str(row["permission_mode"] or "supervised")
+                permission_mode = normalize_permission_mode(
+                    str(row["permission_mode"] or DEFAULT_PERMISSION_MODE)
+                )
                 narration_mode = (
                     str(row["narration_mode"])
                     if row["narration_mode"] is not None
@@ -4114,11 +4121,7 @@ def _describe_control_request(request: Any) -> tuple[str, str, Optional[str]]:
     """Validate one request without mutating RAM or any durable state."""
 
     mode = str(request.payload.get("mode") or "")
-    if request.verb == "mode.set" and mode in {
-        "supervised",
-        "auto_accept",
-        "autonomous",
-    }:
+    if request.verb == "mode.set" and is_permission_mode(mode):
         return "mode.changed", "applied", None
     if request.verb == "narration.set" and mode in {"silent", "verbose", "auto"}:
         return "narration.changed", "applied", None
@@ -4245,7 +4248,9 @@ async def _reconcile_durable_control_scalars(
             )
     if row is None or _session is None:
         raise ControlInboxBlocked("control scalar reconciliation lost thread")
-    _session.permission_mode = str(row["permission_mode"] or "supervised")
+    _session.permission_mode = normalize_permission_mode(
+        str(row["permission_mode"] or DEFAULT_PERMISSION_MODE)
+    )
     # NULL is the migration sentinel for a legacy inherited narration value;
     # retain the mode already loaded from resolved config until a control (or
     # creation-time materialization) writes a first-class value.
@@ -4369,7 +4374,7 @@ def _apply_control_request(request: Any) -> tuple[str, str, Optional[str]]:
 
     mode = str(request.payload.get("mode") or "")
     if request.verb == "mode.set":
-        _session.permission_mode = mode
+        _session.permission_mode = normalize_permission_mode(mode)
         # Permission-card retirement stays owned by the existing gate/turn
         # cleanup path. It is not part of this control acknowledgement:
         # rows have no lease identity yet, so sweeping them here cannot be
@@ -11171,8 +11176,8 @@ async def _handle_config_update(
             await _send_error("Session no longer active")
             return
         pm = (config_override.get("interactive") or {}).get("permission_mode")
-        if pm and pm in ("supervised", "auto_accept", "autonomous"):
-            _session.permission_mode = pm
+        if pm and is_permission_mode(pm):
+            _session.permission_mode = normalize_permission_mode(pm)
         nm = (config_override.get("interactive") or {}).get("narration_mode")
         if nm and nm in ("silent", "verbose", "auto"):
             _session.narration_mode = nm

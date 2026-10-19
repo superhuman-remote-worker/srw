@@ -32,7 +32,7 @@ from shared.runtime.core.workspace_backend import WorkspaceUnavailableError
 def _make_config(**overrides):
     """Build a minimal AgentConfig mock for PersistentSession."""
     cfg = MagicMock()
-    cfg.interactive.permission_mode = overrides.get("permission_mode", "supervised")
+    cfg.interactive.permission_mode = overrides.get("permission_mode", "read_only")
     cfg.interactive.greeting = overrides.get("greeting", "Hello")
     cfg.interactive.idle_timeout_minutes = overrides.get("idle_timeout", 30)
     cfg.workspace.backend = overrides.get("ws_backend", None)
@@ -825,7 +825,7 @@ class TestExcludedTools:
 class TestPersistentSessionDefaults:
     def test_permission_mode_default(self):
         session = _make_session()
-        assert session.permission_mode == "supervised"
+        assert session.permission_mode == "read_only"
 
     def test_messages_default_new_list_per_instance(self):
         s1 = _make_session()

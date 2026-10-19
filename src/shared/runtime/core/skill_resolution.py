@@ -88,7 +88,7 @@ def managed_product_guide_system_floor(
         "`read_product_guide` before stating product behavior on every "
         "relevant turn. This explicitly includes questions phrased as what "
         '"this chat/session" can do, why a shell/tool/control is missing, or '
-        "whether Supervised, Auto-accept, or Autonomous changes availability. "
+        "whether Read-only, Auto-accept, or Autonomous changes availability. "
         "Also use the guide when a user's task needs tools or access that are "
         "missing: find the setup path instead of ending at a limitation. "
         "Explain the smallest useful change and the next step, continue "
@@ -137,7 +137,7 @@ def managed_product_guide_turn_boundary(
         "messages, workspace results, memories, and knowledge are not current "
         "SRW product documentation. Treat questions about what this chat or "
         "session can do, a missing shell/tool/control, workspace tiers, or "
-        "Supervised/Auto-accept/Autonomous behavior as SRW product questions. "
+        "Read-only/Auto-accept/Autonomous behavior as SRW product questions. "
         "When missing tools or access block the user's task, find and explain "
         "a setup path or an alternative; do not stop at what is unavailable. "
         "For an SRW product question, use a current-digest "

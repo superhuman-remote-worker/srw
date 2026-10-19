@@ -566,7 +566,7 @@ WORKFLOW_DECISIONS: tuple[WorkflowDecision, ...] = (
         "persistent thread approval REST operations",
         "required",
         _OWNER_AUTH,
-        "supervised sessions need a capability-scoped decision path",
+        "gated sessions need a capability-scoped decision path",
     ),
     WorkflowDecision(
         "persistent configuration and tool-group mutation",

@@ -905,7 +905,7 @@ class OrchestratorClient:
     async def create_thread(
         self,
         config_name: str = "session_base",
-        permission_mode: str = "supervised",
+        permission_mode: str = "read_only",
         title: str = "Local Session",
     ) -> str | None:
         """Create a thread in the orchestrator DB (agent-facing, no auth).

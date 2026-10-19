@@ -42,7 +42,7 @@ async def agent_create_thread(
     provisioner,
     *,
     config_name="persistent_defaults",
-    permission_mode="supervised",
+    permission_mode="read_only",
     title="Local Session",
     inject_credentials=None,
     inject_env_credentials=None,
@@ -589,7 +589,7 @@ class TestAgentCreateThread:
         db.create_thread.assert_awaited_once_with(
             user_id=None,
             config_name="persistent_defaults",
-            permission_mode="supervised",
+            permission_mode="read_only",
             title="Local Session",
         )
         assert result == {
@@ -1338,11 +1338,11 @@ class TestUserCreateThread:
         the threads.permission_mode column (which the agent never reads) and
         never bridged into config_override.interactive — so a non-default pick
         in the New Session form was dropped and every session booted
-        "supervised". The agent reads config.interactive.permission_mode, so the
+        "read_only". The agent reads config.interactive.permission_mode, so the
         per-session choice must land there, exactly like the model bridge above.
         """
         # User default already applied to config_override (main.py:12146).
-        config_override = {"interactive": {"permission_mode": "supervised"}}
+        config_override = {"interactive": {"permission_mode": "read_only"}}
         request_permission_mode = "autonomous"
         if request_permission_mode:
             config_override.setdefault("interactive", {})["permission_mode"] = (
@@ -1352,7 +1352,7 @@ class TestUserCreateThread:
         # Column stays in sync with the resolved config_override value.
         effective = (config_override.get("interactive") or {}).get(
             "permission_mode"
-        ) or "supervised"
+        ) or "read_only"
         assert effective == "autonomous"
 
     def test_omitted_permission_mode_keeps_user_default(self):

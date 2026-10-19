@@ -34,6 +34,7 @@ from uuid import UUID
 
 from fastapi import HTTPException
 
+from shared.permission_modes import DEFAULT_PERMISSION_MODE, normalize_permission_mode
 from orchestrator.services.config_overrides import deep_merge_dicts as _deep_merge_dicts
 from orchestrator.services.model_availability import ModelUnavailable
 from orchestrator.services.container_provisioner import (
@@ -307,7 +308,9 @@ async def assemble_session_attach_payload(
     # layer that migration SQL cannot resolve; those rows keep the resolved
     # value until creation/control materializes one.
     interactive_scalars = {
-        "permission_mode": str(_thread.get("permission_mode") or "supervised"),
+        "permission_mode": normalize_permission_mode(
+            str(_thread.get("permission_mode") or DEFAULT_PERMISSION_MODE)
+        ),
     }
     if _thread.get("narration_mode") is not None:
         interactive_scalars["narration_mode"] = str(_thread["narration_mode"])

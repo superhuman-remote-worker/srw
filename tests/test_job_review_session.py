@@ -130,11 +130,11 @@ class TestReviewSessionEndpoint:
         assert body.title.startswith("Review job 29c28492")
         # Worker and session profiles are structurally different. Model and
         # temperature are copied onto the safe session base, while a review
-        # always starts supervised even if the worker ran with auto-accept.
+        # always starts read-only even if the worker ran with auto-accept.
         assert body.config_name == "session_base"
         assert body.model == "gpt-5.6-sol"
         assert body.temperature == 0.2
-        assert body.permission_mode == "supervised"
+        assert body.permission_mode == "read_only"
         assert body.project_ids == [str(job_a["project_id"])]
         assert body.datasource_ids == [DB_ID, REPO_ID]
         # The source checkout needs a real workspace, but this value is fixed
@@ -162,7 +162,7 @@ class TestReviewSessionEndpoint:
         assert f"Job: {JOB_ID}" in seed.opening_event
         assert "design/hotel-rheinland-theme" in seed.opening_event
         assert "design_spec/hotel-rheinland-theme.md" in seed.opening_event
-        assert "Permission mode: supervised" in seed.opening_event
+        assert "Permission mode: read-only" in seed.opening_event
         assert "workspace, tools" in seed.opening_event
         assert "server-only" not in seed.opening_event
         assert result == {

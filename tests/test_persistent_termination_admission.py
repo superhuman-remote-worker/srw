@@ -231,7 +231,7 @@ async def _run_websocket_input(monkeypatch, content: str, *, before_receive=None
     session = persistent_app._session
     session.llm_with_tools = MagicMock()
     session.messages = []
-    session.permission_mode = "supervised"
+    session.permission_mode = "read_only"
     session.narration_mode = "auto"
     session.config = SimpleNamespace(
         llm=SimpleNamespace(model="test-model", temperature=0.0)
@@ -263,7 +263,7 @@ async def _run_websocket_input(monkeypatch, content: str, *, before_receive=None
     monkeypatch.setattr(
         persistent_app,
         "_durable_session_control_modes",
-        AsyncMock(return_value=("supervised", "auto")),
+        AsyncMock(return_value=("read_only", "auto")),
     )
     monkeypatch.setattr(
         persistent_app,

@@ -70,7 +70,7 @@ def test_catalog_keys_and_defaults():
 def test_meet_bool_enum_list():
     assert meet(CATALOG["vm_workspace"], True, False) is False
     assert meet(CATALOG["autonomy_ceiling"], "full", "review") == "review"
-    assert meet(CATALOG["permission_mode"], "autonomous", "supervised") == "supervised"
+    assert meet(CATALOG["permission_mode"], "autonomous", "read_only") == "read_only"
     assert meet(CATALOG["model_selection"], None, ["a", "b"]) == ["a", "b"]
     assert meet(CATALOG["model_selection"], ["a", "b"], ["b", "c"]) == ["b"]
 
@@ -195,7 +195,7 @@ def test_session_permission_mode_gated():
     # autonomous (fully unattended) is gated.
     v = evaluate({"interactive": {"permission_mode": "autonomous"}}, DEFAULTS)
     assert len(v) == 1 and "permission_mode" in v[0]
-    assert evaluate({"interactive": {"permission_mode": "supervised"}}, DEFAULTS) == []
+    assert evaluate({"interactive": {"permission_mode": "read_only"}}, DEFAULTS) == []
     assert evaluate({"interactive": {"permission_mode": "auto_accept"}}, DEFAULTS) == []
 
 

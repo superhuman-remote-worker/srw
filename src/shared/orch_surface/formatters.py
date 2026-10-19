@@ -12,6 +12,8 @@ import json
 import re
 from typing import Any
 
+from shared.permission_modes import normalize_permission_mode
+
 
 def _mask_url(url: str) -> str:
     """Mask password in a connection URL for safe display."""
@@ -3196,7 +3198,7 @@ def format_persistent_threads(threads: list[dict[str, Any]]) -> str:
         title = t.get("title", "Untitled")
         status = t.get("status", "unknown")
         config = t.get("config_name", "N/A")
-        mode = t.get("permission_mode", "N/A")
+        mode = normalize_permission_mode(t.get("permission_mode", "N/A"))
         created = t.get("created_at", "")
         last_activity = t.get("last_activity", "")
         turns = t.get("total_turns", 0)

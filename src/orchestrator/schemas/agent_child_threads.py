@@ -42,7 +42,7 @@ class AgentThreadCreateRequest(BaseModel):
     """Request from agent to create its own thread on startup."""
 
     config_name: str = Field("session_base", description="Agent config name")
-    permission_mode: PermissionMode = Field("supervised", description="Permission mode")
+    permission_mode: PermissionMode = Field("read_only", description="Permission mode")
     title: str = Field("Local Session", description="Session title")
 
 

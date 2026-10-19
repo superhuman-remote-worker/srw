@@ -238,7 +238,7 @@ def _control_dependencies(
         {
             "client_request_id": "not-a-uuid",
             "method": "mode.set",
-            "mode": "supervised",
+            "mode": "read_only",
         },
     ],
 )
@@ -335,7 +335,7 @@ async def test_control_endpoint_admits_owner_request_without_exposing_lane():
     body = ThreadControlRequest(
         client_request_id=CLIENT_REQUEST_ID,
         method="mode.set",
-        mode="supervised",
+        mode="read_only",
     )
 
     with (
@@ -369,7 +369,7 @@ async def test_control_endpoint_admits_owner_request_without_exposing_lane():
     assert "execution_lane" not in result
     owner.assert_awaited_once_with(request, store, str(THREAD_ID))
     enforce.assert_awaited_once_with(
-        {"interactive": {"permission_mode": "supervised"}},
+        {"interactive": {"permission_mode": "read_only"}},
         user_id=str(OWNER_ID),
         project_ids=[str(PROJECT_ID)],
     )
@@ -379,6 +379,8 @@ async def test_control_endpoint_admits_owner_request_without_exposing_lane():
         owner_user_id=OWNER_ID,
         client_request_id=CLIENT_REQUEST_ID,
         verb="mode.set",
+        # Written in the spelling agent images from before the read_only
+        # rename accept, until the rename's contract step.
         payload={"mode": "supervised"},
         requested_by=str(OWNER_ID),
         expected_runtime_generation=None,
@@ -512,7 +514,7 @@ async def test_admin_can_control_ownerless_legacy_thread_without_fake_uuid():
             ThreadControlRequest(
                 client_request_id=CLIENT_REQUEST_ID,
                 method="mode.set",
-                mode="supervised",
+                mode="read_only",
             ),
             MagicMock(),
             dependencies=_control_dependencies(
@@ -525,7 +527,7 @@ async def test_admin_can_control_ownerless_legacy_thread_without_fake_uuid():
 
     assert response["accepted"] is True
     enforce.assert_awaited_once_with(
-        {"interactive": {"permission_mode": "supervised"}},
+        {"interactive": {"permission_mode": "read_only"}},
         user_id=str(admin_id),
         project_ids=[],
     )
@@ -892,7 +894,7 @@ async def test_reused_client_request_id_with_different_payload_is_rejected():
             "request_seq": 5,
             "client_request_id": CLIENT_REQUEST_ID,
             "verb": "mode.set",
-            "payload": {"mode": "supervised"},
+            "payload": {"mode": "read_only"},
             "outcome": None,
         },
     )
@@ -922,7 +924,7 @@ async def test_admission_rechecks_owner_under_thread_lock_before_idempotency_loo
             "request_seq": 5,
             "client_request_id": CLIENT_REQUEST_ID,
             "verb": "mode.set",
-            "payload": {"mode": "supervised"},
+            "payload": {"mode": "read_only"},
             "outcome": None,
         },
     )
@@ -934,7 +936,7 @@ async def test_admission_rechecks_owner_under_thread_lock_before_idempotency_loo
             owner_user_id=OWNER_ID,
             client_request_id=CLIENT_REQUEST_ID,
             verb="mode.set",
-            payload={"mode": "supervised"},
+            payload={"mode": "read_only"},
             requested_by=str(OWNER_ID),
         )
 
@@ -1196,7 +1198,7 @@ async def test_pinned_admission_requires_exact_capable_owner_generation(capabili
             owner_user_id=OWNER_ID,
             client_request_id=CLIENT_REQUEST_ID,
             verb="mode.set",
-            payload={"mode": "supervised"},
+            payload={"mode": "read_only"},
             requested_by=str(OWNER_ID),
         )
 
@@ -1274,7 +1276,7 @@ async def test_stateless_parked_queue_refuses_control_before_persisting_it():
             owner_user_id=OWNER_ID,
             client_request_id=CLIENT_REQUEST_ID,
             verb="mode.set",
-            payload={"mode": "supervised"},
+            payload={"mode": "read_only"},
             requested_by=str(OWNER_ID),
         )
 
@@ -1305,7 +1307,7 @@ async def test_stateless_admission_rejects_incompatible_queue_rows(
             owner_user_id=OWNER_ID,
             client_request_id=CLIENT_REQUEST_ID,
             verb="mode.set",
-            payload={"mode": "supervised"},
+            payload={"mode": "read_only"},
             requested_by=str(OWNER_ID),
         )
 
@@ -1536,7 +1538,7 @@ def test_public_compact_envelope_canonicalizes_only_present_keys():
         ThreadControlRequest(
             client_request_id=CLIENT_REQUEST_ID,
             method="mode.set",
-            mode="supervised",
+            mode="read_only",
             focus="x",
         )
     with pytest.raises(ValidationError):
@@ -1730,8 +1732,8 @@ def test_public_upgrade_envelope_requires_the_session_generation():
     "fields",
     [
         {"method": "compact", "target_tier": "vm"},
-        {"method": "mode.set", "mode": "supervised", "template": "x"},
-        {"method": "upgrade-to-workspace", "mode": "supervised"},
+        {"method": "mode.set", "mode": "read_only", "template": "x"},
+        {"method": "upgrade-to-workspace", "mode": "read_only"},
         {"method": "upgrade-to-workspace", "target_tier": "gpu"},
         # Task 2's target resolver reads any other tier as a container
         # request, so the envelope must refuse it before the route runs.

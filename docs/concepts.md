@@ -70,9 +70,11 @@ SRW runs work in two shapes.
 
 - A **session** is a live conversation. You type, the agent answers and acts,
   and you can steer it while it works or come back to it later. Its
-  **Permission Mode** controls approvals: **Supervised** asks before every
-  tool call, **Auto-accept** asks only before shell commands, and
-  **Autonomous** never asks.
+  **Permission Mode** controls approvals: **Read-only** runs reads and
+  research freely and asks before changes, outbound actions and shell
+  commands; **Auto-accept** also runs workspace edits and asks only before
+  irreversible or outbound actions and shell commands; **Autonomous** never
+  asks.
 - A **job** is a goal the agent works on without you: you describe it, SRW
   queues it, an agent picks it up and works through it in phases, and you
   review the result. Jobs are the shape for long, unattended work.

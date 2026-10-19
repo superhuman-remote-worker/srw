@@ -453,7 +453,7 @@ async def commission_project_officer(
         temperature=row_llm.get("temperature"),
         # A background officer is HEADLESS: there is no session for a human to
         # answer a permission prompt in. Falling to the create default
-        # (``supervised``) gates every tool call on an approval that can never
+        # (``read_only``) gates every write on an approval that can never
         # arrive — the officer issues his calls, the first one parks the turn
         # ("Permission gate unanswered … parking turn; N call(s) left
         # ungated"), and the rest are stripped as orphans on the next pass. He

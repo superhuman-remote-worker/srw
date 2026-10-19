@@ -66,7 +66,7 @@ OFFICER_KB_TOOLS = [
 
 def _make_config(**overrides):
     cfg = MagicMock()
-    cfg.interactive.permission_mode = "supervised"
+    cfg.interactive.permission_mode = "read_only"
     cfg.workspace.backend = None
     cfg.workspace.structure = {}
     cfg.workspace.git_versioning = False

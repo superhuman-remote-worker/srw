@@ -418,7 +418,7 @@ class TestCreateThread:
 
         call_args = conn.fetchrow.call_args
         assert call_args[0][3] == "session_base"  # config_name
-        assert call_args[0][4] == "supervised"  # permission_mode
+        assert call_args[0][4] == "read_only"  # permission_mode
         assert call_args[0][5] == "auto"  # narration_mode
         assert call_args[0][6] == "Untitled Session"  # title
         assert call_args[0][8] == "pinned"  # execution_lane

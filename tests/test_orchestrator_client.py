@@ -1214,15 +1214,13 @@ class TestCreateThread:
 
         with patch.object(client, "_client", AsyncMock()) as mock_http:
             mock_http.post = AsyncMock(return_value=mock_response)
-            await client.create_thread(
-                "persistent_defaults", "supervised", "My Session"
-            )
+            await client.create_thread("persistent_defaults", "read_only", "My Session")
 
             mock_http.post.assert_called_once_with(
                 "http://localhost:8085/api/agents/threads",
                 json={
                     "config_name": "persistent_defaults",
-                    "permission_mode": "supervised",
+                    "permission_mode": "read_only",
                     "title": "My Session",
                 },
             )
@@ -1292,7 +1290,7 @@ class TestCreateThread:
 
             call_payload = mock_http.post.call_args[1]["json"]
             assert call_payload["config_name"] == "session_base"
-            assert call_payload["permission_mode"] == "supervised"
+            assert call_payload["permission_mode"] == "read_only"
             assert call_payload["title"] == "Local Session"
 
 

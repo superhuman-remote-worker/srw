@@ -53,7 +53,7 @@ OFFICER_CONFIG_NAME = "centurion"
 
 # A commissioned officer runs headless — no session exists in which a human
 # could answer a permission prompt — so he must not inherit the create
-# endpoint's ``supervised`` default. A post may still pin a stricter mode
+# endpoint's ``read_only`` default. A post may still pin a stricter mode
 # explicitly; this only fills the absent case.
 OFFICER_PERMISSION_MODE = "autonomous"
 

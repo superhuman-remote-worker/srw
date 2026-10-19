@@ -27,6 +27,7 @@ import json
 from decimal import Decimal
 from typing import Any, Awaitable, Callable
 
+from shared.permission_modes import DEFAULT_PERMISSION_MODE, normalize_permission_mode
 from shared.thread_controls import applied_control_scalar
 
 
@@ -443,11 +444,11 @@ async def build_session_state_snapshot(
             }
         )
 
-    permission_mode = (
+    permission_mode = normalize_permission_mode(
         thread_source.get("permission_mode")
         or resolved_interactive.get("permission_mode")
         or stored_interactive.get("permission_mode")
-        or "supervised"
+        or DEFAULT_PERMISSION_MODE
     )
     narration_mode = (
         thread_source.get("narration_mode")

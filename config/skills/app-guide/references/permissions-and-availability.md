@@ -34,14 +34,25 @@ alone into a diagnosis.
 
 ## Permission mode is the approval policy
 
-Persistent sessions currently have three modes:
+Persistent sessions have three modes, from most to least careful. Each tool
+declares what kind of effect it has, and the mode decides which kinds ask:
 
-- **Supervised** asks for approval before every tool call.
-- **Auto-accept** runs non-shell tools without asking, but still asks for
-  `run_command`, `shell_execute`, and `shell_read`.
-- **Autonomous** runs tool calls without per-call approval.
+- **Read-only** runs reads freely — files, search, git history, the knowledge
+  base, web search, fetching pages, browser navigation — and the agent's own
+  task and canvas bookkeeping. It asks before anything that changes files or
+  data, acts outside the workspace, or runs a shell command.
+- **Auto-accept** also runs workspace edits freely (writing, editing, moving
+  files, commits). It still asks before irreversible or outbound actions —
+  deleting files, sending or drafting mail, pushing, database writes, starting
+  or controlling jobs, delegating to a subagent, tools of an MCP server that
+  do not declare themselves read-only — and before shell commands.
+- **Autonomous** runs every tool without per-call approval.
 
-New session experts default to Supervised unless an account, expert, or
+Read-only asks rather than refuses: approve a change and it runs. It is not the
+same as a connector's read-only access level, which binds no write tools at
+all. A delegated subagent runs unattended once its delegation is approved.
+
+New session experts default to Read-only unless an account, expert, or
 per-session setting overrides it. Change the current session from its header
 **Settings** panel; change the account fallback under
 **Settings → Persistent Agent → Permission Mode**.
