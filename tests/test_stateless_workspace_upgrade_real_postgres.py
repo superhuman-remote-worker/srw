@@ -6,9 +6,10 @@ stays enabled. The create path is the real one, with only Kubernetes faked.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pytest
 
@@ -515,6 +516,134 @@ async def test_continuation_runner_finds_the_upgrade_create_on_the_initial_route
         for candidate in page.candidates
     }
     assert routes.get(str(case.thread_id)) == "initial"
+
+
+async def chatted_upgrade_create(database, actor, monkeypatch):
+    """An upgrade create on a Session that served a lite turn: it waits for its
+    user (awaiting_user) while the Pod is not Ready yet (dev, 2026-10-18)."""
+    claimant = upgrade_claimant(database, monkeypatch, attach=LITE_ATTACH)
+    case = await upgraded_create(
+        database,
+        actor,
+        monkeypatch,
+        first_wait="not_ready",
+        earlier_turn=lambda thread_id: run_a_lite_turn(
+            database, thread_id, claimant=claimant
+        ),
+    )
+    assert (await database.get_thread(case.thread_id))["status"] == "awaiting_user"
+    return case
+
+
+@pytest.mark.asyncio
+async def test_continuation_runner_carries_the_upgrade_of_a_session_that_chatted_to_ready(
+    database, actor, monkeypatch
+):
+    """With startup tracking on, nothing but the creation observer moves a
+    pre-Ready upgrade to Ready; a Session waiting for its user must not hide
+    it (dev, 2026-10-18)."""
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+    from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
+
+    from orchestrator.services import ssh_helpers
+    from orchestrator.services.session_creation_continuation import (
+        SessionCreationContinuationRunner,
+    )
+
+    monkeypatch.setenv("CONTAINER_STARTUP_STAGE_AUTHORITY_ENABLED", "true")
+    case = await chatted_upgrade_create(database, actor, monkeypatch)
+    (candidate,) = [
+        candidate
+        for candidate in (
+            await database.list_current_session_creation_candidates()
+        ).candidates
+        if str(candidate.thread_id) == str(case.thread_id)
+    ]
+    assert candidate.route == "initial"
+
+    # The Pod becomes Ready and its host key is the one SRW pinned (the
+    # observer suite's Ready case).
+    case.cluster.become_ready()
+    pod = case.cluster.objects["pod"]
+    ready_at = datetime.now(timezone.utc)
+    pod.spec.node_name = "node8"
+    pod.status.conditions = [
+        SimpleNamespace(
+            type="PodScheduled", status="True", last_transition_time=ready_at
+        ),
+        SimpleNamespace(type="Ready", status="True", last_transition_time=ready_at),
+    ]
+    public_key = (
+        Ed25519PrivateKey.from_private_bytes(bytes(range(32)))
+        .public_key()
+        .public_bytes(Encoding.OpenSSH, PublicFormat.OpenSSH)
+        .decode("ascii")
+    )
+    fingerprint = ssh_helpers._fingerprint_host_key(public_key.split()[1])
+    monkeypatch.setattr(
+        provisioner_module, "workspace_private_key_fingerprint", lambda _: fingerprint
+    )
+    monkeypatch.setattr(
+        provisioner_module,
+        "_isolated_pod_exec",
+        lambda *args, **kwargs: f"256 {fingerprint} workspace (ED25519)",
+    )
+    monkeypatch.setattr(
+        ssh_helpers,
+        "_scan_pinned_host_key",
+        AsyncMock(return_value=(f"{pod.status.pod_ip} {public_key}", b"")),
+    )
+    runner = SessionCreationContinuationRunner(
+        db=database, provisioner=case.provisioner, shutdown_event=asyncio.Event()
+    )
+
+    assert await runner._continue(candidate)
+
+    receipt = await continuation.reservation(database, case.thread_id)
+    assert receipt["startup_first_ready_at"] == ready_at
+    assert receipt["settled_at"] is not None
+    thread = await database.get_thread(case.thread_id)
+    assert thread["status"] == "awaiting_user"
+    assert metadata(thread)["workspace_container"]["status"] == "ready"
+    assert workspace_upgrade_view(thread, None) == {
+        "target_tier": "sandbox",
+        "phase": "copying",
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("change", ["no_seed_marker", "suspended"])
+async def test_a_waiting_session_is_observed_only_for_an_upgrade_owed_its_copy(
+    database, actor, monkeypatch, change
+):
+    """The observer's widening is C1's alone: a waiting Session without the
+    seed marker, and a suspended one, stay outside it."""
+    from orchestrator.database.session_creation_candidates import (
+        SESSION_CREATION_SCAN_SQL,
+        candidate_from_record,
+    )
+
+    case = await chatted_upgrade_create(database, actor, monkeypatch)
+    (row,) = await database.fetch(
+        SESSION_CREATION_SCAN_SQL, UUID(str(case.thread_id)), None, None, None, 2
+    )
+    assert candidate_from_record(row) is not None
+
+    owner = (
+        json.loads(row["owner"])
+        if isinstance(row["owner"], str)
+        else dict(row["owner"])
+    )
+    owner_metadata = metadata(owner)
+    if change == "no_seed_marker":
+        workspace = dict(owner_metadata["workspace_container"])
+        del workspace["seed_from"]
+        owner_metadata = {**owner_metadata, "workspace_container": workspace}
+        owner = {**owner, "metadata": owner_metadata}
+    else:
+        owner = {**owner, "status": "suspended"}
+
+    assert candidate_from_record({**dict(row), "owner": owner}) is None
 
 
 @pytest.mark.asyncio
