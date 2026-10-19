@@ -3061,6 +3061,28 @@ class TestPollVmReady:
         assert result == {"ssh_host": "10.0.0.5", "ssh_port": 2222}
 
     @pytest.mark.asyncio
+    async def test_returns_the_attested_vm_identity_when_ready(self):
+        """A pinned owner's ready payload names the VM End must later prove."""
+        client = AsyncMock()
+        client.get_thread_workspace.return_value = {
+            "vm_status": "ready",
+            "vm_ssh_host": "10.0.0.5",
+            "vm_ssh_port": 22,
+            "workspace_generation": "generation-1",
+            "workspace_runtime_incarnation": "launcher-pod-1",
+            "workspace_ssh_host_key_fingerprint": "SHA256:abc",
+        }
+
+        result = await _poll_vm_ready(client, "tid", timeout=5)
+        assert result == {
+            "ssh_host": "10.0.0.5",
+            "ssh_port": 22,
+            "workspace_generation": "generation-1",
+            "workspace_runtime_incarnation": "launcher-pod-1",
+            "workspace_ssh_host_key_fingerprint": "SHA256:abc",
+        }
+
+    @pytest.mark.asyncio
     async def test_returns_none_on_failed(self):
         """Returns None immediately when vm_status='failed'."""
         client = AsyncMock()
@@ -5184,7 +5206,8 @@ class TestHandleWorkspaceUpgradeSandboxCanvasCapability:
         assert new_backend.supports_canvas_presentation is False
         assert new_backend.supports_canvas_live_apps is False
         assert new_backend.supports_canvas_shared_browser is False
-        session.swap_backend.assert_called_once_with(new_backend)
+        session.swap_backend.assert_called_once()
+        assert session.swap_backend.call_args.args == (new_backend,)
         session.resetup_tools_for_backend.assert_called_once()
 
     @pytest.mark.asyncio

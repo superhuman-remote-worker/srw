@@ -3629,6 +3629,46 @@ class TestSwapBackend:
                 session.swap_backend(new_backend)
                 assert events == ["install", "retire"]
 
+    def test_records_the_new_tier_and_workspace_identity(self):
+        """A live upgrade leaves the session as a Session created on that tier."""
+        session = _make_session()
+        session.workspace_backend_tier = "virtual"
+        session.workspace_manager = MagicMock(backend=MagicMock(spec=[]))
+        new_backend = MagicMock()
+        new_backend.is_connected.return_value = True
+
+        with patch.object(session, "_setup_shell_manager"):
+            session.swap_backend(
+                new_backend,
+                workspace_tier="vm",
+                workspace_generation="generation-1",
+                workspace_runtime_incarnation="launcher-pod-1",
+            )
+
+        assert session.workspace_backend_tier == "vm"
+        assert session.workspace_generation == "generation-1"
+        assert session.workspace_runtime_incarnation == "launcher-pod-1"
+
+    def test_a_failed_swap_keeps_the_old_tier_and_identity(self):
+        session = _make_session()
+        session.workspace_backend_tier = "virtual"
+        session.workspace_manager = MagicMock(backend=MagicMock(spec=[]))
+        new_backend = MagicMock()
+        new_backend.is_connected.return_value = False
+        new_backend.connect.side_effect = OSError("ssh refused")
+
+        with pytest.raises(OSError, match="ssh refused"):
+            session.swap_backend(
+                new_backend,
+                workspace_tier="vm",
+                workspace_generation="generation-1",
+                workspace_runtime_incarnation="launcher-pod-1",
+            )
+
+        assert session.workspace_backend_tier == "virtual"
+        assert session.workspace_generation == ""
+        assert session.workspace_runtime_incarnation == ""
+
     def test_raises_when_workspace_manager_none(self):
         """RuntimeError raised when workspace_manager is None."""
         session = _make_session()

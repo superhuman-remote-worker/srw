@@ -11974,6 +11974,15 @@ async def _run_workspace_upgrade_swap(
                         "key_path": ssh_key,
                         "workspace_path": "/home/agent-host/workspace",
                     },
+                    **{
+                        key: vm_cfg[key]
+                        for key in (
+                            "workspace_generation",
+                            "workspace_runtime_incarnation",
+                            "workspace_ssh_host_key_fingerprint",
+                        )
+                        if key in vm_cfg
+                    },
                 }
                 if vm_cfg
                 else None
@@ -12127,7 +12136,22 @@ async def _run_workspace_upgrade_swap(
                 # the new workspace; a failure here tears the VM down below.
                 await before_swap(seeded)
 
-            _session.swap_backend(new_backend)
+            # The new tier and its identity go with the backend: End picks
+            # its drain by the tier and names this workspace (E4).
+            _session.swap_backend(
+                new_backend,
+                workspace_tier=backend_tier,
+                workspace_generation=(
+                    str(workspace_generation)
+                    if workspace_generation and workspace_runtime_incarnation
+                    else ""
+                ),
+                workspace_runtime_incarnation=(
+                    str(workspace_runtime_incarnation)
+                    if workspace_generation and workspace_runtime_incarnation
+                    else ""
+                ),
+            )
 
         # 6a. Re-establish the OpenCloud cloud mount on the NEW backend. The
         #     mount is a per-host rclone process, so it does NOT follow the
@@ -12277,9 +12301,21 @@ async def _poll_vm_ready(
                 deadline = max(deadline, start + timeout + preparation_budget)
             vm_status = ws.get("vm_status")
             if vm_status == "ready" and ws.get("vm_ssh_host"):
+                # A pinned owner's ready payload also attests the VM (provision
+                # generation, launcher Pod UID, host key); its End must name
+                # that VM, as a Session created on it does.
                 return {
                     "ssh_host": ws["vm_ssh_host"],
                     "ssh_port": ws.get("vm_ssh_port", 22),
+                    **{
+                        key: ws[key]
+                        for key in (
+                            "workspace_generation",
+                            "workspace_runtime_incarnation",
+                            "workspace_ssh_host_key_fingerprint",
+                        )
+                        if ws.get(key)
+                    },
                 }
             if vm_status == "failed":
                 logger.warning(f"VM provisioning failed for thread {thread_id}")

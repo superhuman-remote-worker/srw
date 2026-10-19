@@ -36,7 +36,9 @@ def _session(order=None, *, metadata=None):
     sess._setup_cloud_mount = AsyncMock()
     sess.resetup_tools_for_backend = MagicMock()
     sess.swap_backend = MagicMock(
-        side_effect=lambda backend: order.append("swap") if order is not None else None
+        side_effect=lambda backend, **_kw: (
+            order.append("swap") if order is not None else None
+        )
     )
     return sess
 
@@ -140,6 +142,39 @@ async def test_the_core_emits_through_the_injected_emitter_and_records_the_seed_
     assert emitted[-1] == (
         "workspace_upgrade.complete",
         {"thread_id": "tid", "target_tier": "vm", "seeded_files": 3},
+    )
+
+
+@pytest.mark.asyncio
+async def test_the_swap_hands_the_session_the_vm_tier_and_identity():
+    """End picks its drain by the tier and proves this VM (E4 part 0)."""
+
+    async def emit(_method, _params):
+        return None
+
+    remote_module = MagicMock()
+    sess, client = _session(), _client()
+    p = _patches(
+        sess,
+        client,
+        vm_cfg={
+            "ssh_host": "100.64.0.9",
+            "ssh_port": 22,
+            "workspace_generation": "generation-1",
+            "workspace_runtime_incarnation": "launcher-pod-1",
+            "workspace_ssh_host_key_fingerprint": "SHA256:abc",
+        },
+        remote_module=remote_module,
+    )
+    with p[0], p[1], p[2], p[3], p[4], p[5]:
+        await pa._run_workspace_upgrade_swap(
+            emit, target_tier="vm", src_backend=SimpleNamespace()
+        )
+    sess.swap_backend.assert_called_once_with(
+        remote_module.RemoteBackend.return_value,
+        workspace_tier="vm",
+        workspace_generation="generation-1",
+        workspace_runtime_incarnation="launcher-pod-1",
     )
 
 
@@ -349,7 +384,8 @@ async def test_the_hot_swap_reads_up_to_the_upload_ceiling_and_reports_what_it_s
     assert dst.read_file("mid.bin", binary=True) == b"m" * 32
     assert not dst.exists("big.bin")
     assert "'big.bin'" in caplog.text and "copy limit" in caplog.text
-    sess.swap_backend.assert_called_once_with(dst)
+    sess.swap_backend.assert_called_once()
+    assert sess.swap_backend.call_args.args == (dst,)
     client.abort_thread_vm_upgrade.assert_not_called()
 
 

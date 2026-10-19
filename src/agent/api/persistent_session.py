@@ -3997,7 +3997,14 @@ class PersistentSession:
             self.config.memory,
         )
 
-    def swap_backend(self, new_backend: Any) -> None:
+    def swap_backend(
+        self,
+        new_backend: Any,
+        *,
+        workspace_tier: Optional[str] = None,
+        workspace_generation: str = "",
+        workspace_runtime_incarnation: str = "",
+    ) -> None:
         """Hot-swap workspace backend at runtime (e.g. container → VM).
 
         Connects the new backend, disconnects the old one, replaces
@@ -4005,6 +4012,11 @@ class PersistentSession:
 
         Args:
             new_backend: A connected (or connectable) WorkspaceBackend instance.
+            workspace_tier: The new backend's tier. When given, it replaces
+                the tier and workspace identity setup recorded, so End drains
+                and names the new workspace as a Session created on it does.
+            workspace_generation: The new workspace's attested generation.
+            workspace_runtime_incarnation: Its attested runtime incarnation.
         """
         if not self.workspace_manager:
             raise RuntimeError("No workspace manager to swap backend on")
@@ -4066,6 +4078,12 @@ class PersistentSession:
         # `_backend` directly unwraps the overlay and 404s every virtual path
         # (knowledge-base/knowledge/features/virtual_directories.md).
         self.workspace_manager.swap_backend(new_backend)
+        if workspace_tier is not None:
+            self.workspace_backend_tier = str(workspace_tier)
+            self.workspace_generation = str(workspace_generation or "")
+            self.workspace_runtime_incarnation = str(
+                workspace_runtime_incarnation or ""
+            )
 
         # Rebuild ShellManager with new backend
         self._setup_shell_manager()

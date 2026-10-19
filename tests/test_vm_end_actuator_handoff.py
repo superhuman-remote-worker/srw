@@ -204,6 +204,58 @@ async def test_native_terminal_vm_handoff_keeps_end_pending(
 
 
 @pytest.mark.asyncio
+async def test_a_session_upgraded_live_to_a_vm_hands_its_end_to_the_vm_actuator(
+    monkeypatch,
+):
+    """E4 part 0: the swap, not setup, tells End which workspace to prove."""
+    session, backend, events = native_vm_session(monkeypatch)
+    vm_generation = session.workspace_generation
+    vm_incarnation = session.workspace_runtime_incarnation
+    # The Session was created virtual: setup recorded that tier, no VM identity.
+    session.workspace_backend_tier = "virtual"
+    session.workspace_generation = session.workspace_runtime_incarnation = ""
+    session.shell_manager = None
+    lite = SimpleNamespace(supports_shell=False, retired=False)
+    lite.retire = lambda: setattr(lite, "retired", True)
+
+    class Workspace:
+        path = Path("/workspace")
+        git_manager = GitManager(Path("/workspace"), backend=backend)
+
+        def __init__(self):
+            self.backend = lite
+
+        def swap_backend(self, new_backend):
+            self.backend = new_backend
+
+    session.workspace_manager = Workspace()
+    monkeypatch.setattr(backend, "is_connected", lambda: True)
+    session.swap_backend(
+        backend,
+        workspace_tier="vm",
+        workspace_generation=vm_generation,
+        workspace_runtime_incarnation=vm_incarnation,
+    )
+    accepted = attach_native_session(monkeypatch, session, events)
+    # Drained as virtual, End loops on its refused settle (dev, 4a899fee); a
+    # nonzero retry delay lets the timeout below end that loop.
+    monkeypatch.setattr(
+        session_termination, "_EXACT_RETIREMENT_SETTLEMENT_RETRY_DELAYS", (0.01,)
+    )
+
+    result = await asyncio.wait_for(
+        app._session_termination._terminate_inner("shutdown"), timeout=10
+    )
+
+    assert lite.retired
+    assert result == "actuator_requested"
+    assert len(accepted) == 1
+    assert accepted[0][1]["workspace_generation"] == vm_generation
+    assert accepted[0][1]["workspace_runtime_incarnation"] == vm_incarnation
+    assert backend._retired and backend._shell_retired
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "failure", ["shell", "browser", "mount", "backend", "writer", "background"]
 )
