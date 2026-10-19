@@ -9,6 +9,7 @@ execution layer. Registration and tool construction remain agent-owned.
 from typing import Any, Dict, List
 
 from shared.connectors.builtin import tool_map
+from shared.permission_modes import TOOL_EFFECTS, UNDECLARED_EFFECT
 from shared.tool_catalog import definitions as _definitions
 
 
@@ -207,6 +208,13 @@ def get_tools_by_category(category: str) -> List[str]:
     return [
         name for name, meta in TOOL_REGISTRY.items() if meta.get("category") == category
     ]
+
+
+def tool_effect(name: str) -> str:
+    """The declared permission effect of a tool; undeclared or unknown tools
+    count as :data:`shared.permission_modes.UNDECLARED_EFFECT` (fail closed)."""
+    effect = TOOL_REGISTRY.get(name, {}).get("effect")
+    return effect if effect in TOOL_EFFECTS else UNDECLARED_EFFECT
 
 
 def get_categories() -> set[str]:

@@ -51,6 +51,7 @@ from agent.tools.sql import create_sql_tools
 # Import workspace tools from new package
 from agent.tools.workspace import create_workspace_tools
 
+from shared.permission_modes import UNDECLARED_EFFECT
 from shared.tool_catalog import (
     CODE_GRANTED_CATEGORIES as CODE_GRANTED_CATEGORIES,
     TOOL_REGISTRY as TOOL_REGISTRY,
@@ -88,6 +89,7 @@ def register_mcp_tools(manager: Any | None) -> None:
             "mcp_server": tool_metadata.get("mcp_server"),
             "mcp_server_slug": tool_metadata.get("mcp_server_slug"),
             "mcp_tool_name": tool_metadata.get("mcp_tool_name", tool.name),
+            "effect": tool_metadata.get("effect", UNDECLARED_EFFECT),
         }
 
     logger.info(

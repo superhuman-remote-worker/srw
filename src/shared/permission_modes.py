@@ -41,6 +41,39 @@ def is_permission_mode(value: Any) -> bool:
     return normalize_permission_mode(value) in PERMISSION_MODES
 
 
+# What a tool call does, declared per tool next to its definition (the tool
+# catalog's ``effect`` key). The mode decides which effects ask first.
+READ = "read"  # observes only; may save what it fetched into the workspace
+BOOKKEEPING = "bookkeeping"  # the session's own tasks, canvas, pauses
+WRITE = "write"  # changes workspace files or project state
+EXTERNAL = "external"  # irreversible, or acts outside the workspace
+SHELL = "shell"  # runs a command
+
+TOOL_EFFECTS = (READ, BOOKKEEPING, WRITE, EXTERNAL, SHELL)
+
+# A tool that declares nothing (an MCP tool without hints, a tool someone
+# forgot to tag) asks in every mode below autonomous.
+UNDECLARED_EFFECT = EXTERNAL
+
+# Effects each mode runs without asking. An unknown mode runs nothing freely.
+_RUNS_FREELY = {
+    READ_ONLY: frozenset({READ, BOOKKEEPING}),
+    AUTO_ACCEPT: frozenset({READ, BOOKKEEPING, WRITE}),
+    AUTONOMOUS: frozenset(TOOL_EFFECTS),
+}
+
+
+def effect_asks(mode: Any, effect: Any) -> bool:
+    """Whether a call with ``effect`` waits for approval under ``mode``.
+
+    Fails closed: an unknown mode asks for everything, and an unknown effect
+    is treated as :data:`UNDECLARED_EFFECT`.
+    """
+    if effect not in TOOL_EFFECTS:
+        effect = UNDECLARED_EFFECT
+    return effect not in _RUNS_FREELY.get(normalize_permission_mode(mode), frozenset())
+
+
 def legacy_wire_permission_mode(mode: str) -> str:
     """The spelling an agent image from before the rename accepts on ``mode.set``.
 

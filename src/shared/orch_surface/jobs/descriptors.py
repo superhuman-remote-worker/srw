@@ -9,6 +9,7 @@ import inspect
 from typing import Any, Awaitable, Callable, Literal
 
 from shared.orch_surface.client import AsyncCockpitClient
+from shared.permission_modes import TOOL_EFFECTS
 from shared.runtime_actor import RuntimeActorContext
 
 JobGroup = Literal["job_control", "job_inspection"]
@@ -104,6 +105,7 @@ class JobDescriptor:
     phases: tuple[str, ...]
     grant: GrantKind | None
     gate: str | None
+    effect: str
     short_description: str
     description: str
     public_signature: inspect.Signature
@@ -115,6 +117,7 @@ class JobDescriptor:
             "description": self.description,
             "short_description": self.short_description,
             "category": self.group,
+            "effect": self.effect,
             "group": self.group,
             "plane": self.plane,
             "caller_defaults": sorted(self.caller_defaults),
@@ -135,6 +138,7 @@ def descriptor(
     group: JobGroup,
     plane: JobPlane,
     caller_defaults: frozenset[CallerKind],
+    effect: str,
     grant: GrantKind | None = None,
     gate: str | None = None,
     phases: tuple[str, ...] = ("strategic", "tactical"),
@@ -158,6 +162,8 @@ def descriptor(
         short_description = description.splitlines()[0].strip()
         if grant and not gate:
             raise TypeError(f"{name}: grant metadata requires a gate explanation")
+        if effect not in TOOL_EFFECTS:
+            raise TypeError(f"{name}: effect must be one of {TOOL_EFFECTS}")
         public_signature = signature.replace(parameters=parameters[2:])
         _DESCRIPTORS[name] = JobDescriptor(
             name=name,
@@ -168,6 +174,7 @@ def descriptor(
             phases=phases,
             grant=grant,
             gate=gate,
+            effect=effect,
             short_description=short_description,
             description=description,
             public_signature=public_signature,
