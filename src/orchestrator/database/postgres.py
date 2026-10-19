@@ -26827,9 +26827,7 @@ class PostgresDB:
                         upgrade_source = {
                             "backend": "virtual",
                             "workspace": copy.deepcopy(
-                                (metadata.get("config_override") or {}).get(
-                                    "workspace"
-                                )
+                                (metadata.get("config_override") or {}).get("workspace")
                             ),
                             "workspace_contract": copy.deepcopy(
                                 metadata.get(WORKSPACE_CONTRACT_CONTEXT_KEY)
