@@ -44738,11 +44738,14 @@ class PostgresDB:
                             expected_agent_pod_uid,
                             str(row["status"] or "") == "active",
                         )
+                        # Strict: a bound-VM no-source proof refuses every
+                        # control of the life anyway (0529's obligations check),
+                        # and a C2 switch adopts its request before any VM.
                         admitted_control = await self._admitted_control_on_conn(
                             conn,
                             parsed_thread,
                             parsed_generation,
-                            settles_ended=expected_settle_status == "ended",
+                            settles_ended=False,
                         )
                         if used_input or admitted_control:
                             return None
