@@ -53,13 +53,10 @@ async def release_aborted_upgrade_vm(
         )
         disposition = outcome.disposition
         if disposition in {"completed", "identity_superseded"}:
-            # A quota-charged (v3) VM's permit completes only with the
-            # provisioner's stop attestation.
+            # Completes the admission only: a Session VM's resource charge is
+            # released by End's own VM cleanup (see undo_thread_vm_upgrade).
             await complete_vm_cleanup_permit(
-                recovery_store,
-                cleanup,
-                outcome=disposition,
-                provisioner=vm_provisioner,
+                recovery_store, cleanup, outcome=disposition
             )
     return disposition
 

@@ -543,7 +543,7 @@ def _never_ready_upgrade(sess, client):
 
 
 @pytest.mark.asyncio
-async def test_an_abort_not_finished_yet_is_asked_again_before_the_failure_frame(
+async def test_an_abort_not_finished_yet_is_asked_again_after_the_failure_frame(
     monkeypatch,
 ):
     """E4 part 2: one 503 used to leave the VM up and its permit open."""
@@ -565,7 +565,8 @@ async def test_an_abort_not_finished_yet_is_asked_again_before_the_failure_frame
     emitted = await _never_ready_upgrade(sess, client)
 
     assert client.abort_thread_vm_upgrade.await_count == 3
-    assert emitted == [("workspace_upgrade.failed", 3)]
+    # The failure is told at once; the abort goes on after it (E4 review).
+    assert emitted == [("workspace_upgrade.failed", 0)]
     assert all(isinstance(task, asyncio.Task) for task in seen_by_end)
     assert len(set(seen_by_end)) == 1 and seen_by_end[0].done()
 
@@ -579,7 +580,7 @@ async def test_a_refused_abort_is_not_asked_again(monkeypatch):
     emitted = await _never_ready_upgrade(sess, client)
 
     assert client.abort_thread_vm_upgrade.await_count == 1
-    assert emitted == [("workspace_upgrade.failed", 1)]
+    assert emitted == [("workspace_upgrade.failed", 0)]
 
 
 @pytest.mark.asyncio
@@ -597,5 +598,26 @@ async def test_an_abort_still_pending_after_its_window_is_left_to_crash_recovery
         emitted = await _never_ready_upgrade(sess, client)
 
     assert client.abort_thread_vm_upgrade.await_count == 1
-    assert emitted == [("workspace_upgrade.failed", 1)]
+    assert emitted == [("workspace_upgrade.failed", 0)]
     assert "VM upgrade abort still pending" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_a_failure_after_the_swap_keeps_the_vm_the_session_runs_on():
+    """E4 review: tearing it down would leave the agent on a deleted VM."""
+    emitted: list = []
+
+    async def emit(method, params):
+        emitted.append((method, params))
+
+    sess, client = _session(), _client()
+    sess.resetup_tools_for_backend.side_effect = RuntimeError("retool failed")
+    p = _patches(sess, client, vm_cfg={"ssh_host": "100.64.0.9"})
+    with p[0], p[1], p[2], p[3], p[4], p[5]:
+        await pa._run_workspace_upgrade_swap(
+            emit, target_tier="vm", src_backend=SimpleNamespace()
+        )
+
+    sess.swap_backend.assert_called_once()
+    client.abort_thread_vm_upgrade.assert_not_called()
+    assert emitted == [("workspace_upgrade.failed", {"reason": "retool failed"})]

@@ -11905,9 +11905,11 @@ async def _handle_workspace_upgrade(
             logger.exception(
                 f"Workspace upgrade failed for thread {_session_identity.thread_id}"
             )
-            if target_tier == "vm" and _orchestrator_client is not None:
-                await _abort_vm_upgrade(_session_identity.thread_id)
-            await _ws_send(ws, "workspace_upgrade.failed", {"reason": str(e)})
+            try:
+                await _ws_send(ws, "workspace_upgrade.failed", {"reason": str(e)})
+            finally:
+                if target_tier == "vm" and _orchestrator_client is not None:
+                    await _abort_vm_upgrade(_session_identity.thread_id)
             return
 
         await _run_workspace_upgrade_swap(
@@ -11931,11 +11933,13 @@ async def _run_workspace_upgrade_swap(
 
     Poll readiness, connect, seed from the live lite backend, swap, remount
     the cloud folders, retool, re-open sudo on a VM, persist the tier, and
-    emit ``.complete``; on any failure tear a VM down and emit ``.failed``.
+    emit ``.complete``; on a failure emit ``.failed``, then tear a VM down
+    unless the Session already runs on it.
     The WebSocket verb passes ``_ws_send`` for ``emit`` (frames unchanged);
     the stateless lane switch's durable consumer passes the journal (C2) and a
     ``before_swap`` that records the seed marker.
     """
+    swapped = False
     try:
         # 2. Poll for readiness, then normalize to a {"backend", "remote"} block.
         #    A vm provisions through metadata.vm (vm_status), which _poll_vm_ready
@@ -12001,12 +12005,14 @@ async def _run_workspace_upgrade_swap(
             # DataVolume + importer pod running with nobody attached. Tear it down
             # so it doesn't leak — the orphan that previously needed a manual
             # `kubectl delete` (workspace_tier_upgrade.md Q7). Best-effort.
-            if target_tier == "vm":
-                await _abort_vm_upgrade(_session_identity.thread_id)
-            await emit(
-                "workspace_upgrade.failed",
-                {"reason": f"{target_tier} workspace did not become ready in time"},
-            )
+            try:
+                await emit(
+                    "workspace_upgrade.failed",
+                    {"reason": f"{target_tier} workspace did not become ready in time"},
+                )
+            finally:
+                if target_tier == "vm":
+                    await _abort_vm_upgrade(_session_identity.thread_id)
             return
 
         # 3. Build a RemoteBackend from the ready connection block. The sandbox
@@ -12146,6 +12152,7 @@ async def _run_workspace_upgrade_swap(
                     else ""
                 ),
             )
+            swapped = True
 
         # 6a. Re-establish the OpenCloud cloud mount on the NEW backend. The
         #     mount is a per-host rclone process, so it does NOT follow the
@@ -12238,10 +12245,19 @@ async def _run_workspace_upgrade_swap(
         # once vm_status was already ready) would otherwise leak the running VM —
         # only the poll-timeout path tore it down before. Tear it down here too
         # (idempotent; a no-op if no vm was created) so no failure path leaks a
-        # ready VM (workspace_tier_upgrade.md Q7).
-        if target_tier == "vm" and _orchestrator_client is not None:
-            await _abort_vm_upgrade(_session_identity.thread_id)
-        await emit("workspace_upgrade.failed", {"reason": str(e)})
+        # ready VM (workspace_tier_upgrade.md Q7). E4: the failure is told first,
+        # as the abort may retry for minutes; and once swapped, the Session runs
+        # on that VM, so tearing it down would leave the agent on a deleted VM.
+        try:
+            await emit("workspace_upgrade.failed", {"reason": str(e)})
+        finally:
+            if swapped:
+                logger.warning(
+                    f"Upgrade step after the swap failed; keeping the VM the "
+                    f"Session runs on ({_session_identity.thread_id}): {e}"
+                )
+            elif target_tier == "vm" and _orchestrator_client is not None:
+                await _abort_vm_upgrade(_session_identity.thread_id)
 
 
 async def _abort_vm_upgrade(thread_id: Optional[str]) -> None:

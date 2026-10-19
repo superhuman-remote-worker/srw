@@ -791,3 +791,50 @@ async def test_reconciliation_deadline_also_bounds_blocked_nomination(db, monkey
         )
         == "reserved"
     )
+
+
+@pytest.mark.asyncio
+async def test_an_aborted_upgrade_keeps_its_vm_record_while_its_charge_is_open(
+    db, monkeypatch
+):
+    """E4 review: only End's own VM cleanup releases a Session VM's charge.
+
+    An undo that dropped the VM record would make End virtual, and nothing
+    would release the charge again.
+    """
+    case = await _ready_charged_thread(db, monkeypatch)
+    thread_id, generation = str(case["thread_id"]), str(case["generation"])
+    await db.execute(
+        "UPDATE threads SET metadata=jsonb_set(jsonb_set(metadata,'{config_override}',"
+        '\'{"workspace":{"backend":"vm"}}\'),\'{vm,upgrade_source}\',$2::jsonb) '
+        "WHERE id=$1",
+        case["thread_id"],
+        json.dumps(
+            {
+                "backend": "virtual",
+                "workspace": {"backend": "virtual"},
+                "workspace_contract": None,
+                "binding": None,
+            }
+        ),
+    )
+    # The abort's release proved process zero; the charge is still open.
+    await db.execute(
+        "INSERT INTO managed_repository_process_zero_receipts "
+        "(owner_kind,owner_id,scope,provisioner,runtime_incarnation) "
+        "VALUES('thread',$1,'vm','vm',$2) ON CONFLICT DO NOTHING",
+        case["thread_id"],
+        generation,
+    )
+    before = await db.fetchval(
+        "SELECT metadata FROM threads WHERE id=$1", case["thread_id"]
+    )
+
+    assert not await db.undo_thread_vm_upgrade(
+        thread_id, provision_generation=generation
+    )
+
+    assert (
+        await db.fetchval("SELECT metadata FROM threads WHERE id=$1", case["thread_id"])
+        == before
+    )

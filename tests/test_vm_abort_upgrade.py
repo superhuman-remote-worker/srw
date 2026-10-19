@@ -25,7 +25,6 @@ import pytest
 # (``orchestrator.application.sessions``) reads the provisioner singleton from
 # its owning module and the store from ``app.state.resources`` at call time.
 from orchestrator.services import thread_config_update  # noqa: E402
-from orchestrator.services import vm_upgrade_abort_cleanup  # noqa: E402
 
 import orchestrator.main as orch_main
 from orchestrator.application import sessions as sessions_composition
@@ -182,25 +181,6 @@ class TestAbortThreadVmUpgrade:
         db.merge_thread_vm_context_if_provision_generation.assert_not_awaited()
         db.merge_thread_vm_context.assert_not_awaited()
         assert out == {"status": "aborted", "thread_id": "tid", "vm_deleted": True}
-
-    @pytest.mark.asyncio
-    async def test_the_released_vm_is_completed_with_the_provisioner(self):
-        """E4 part 2: a quota-charged VM's permit completes only with it.
-
-        Without the provisioner a v3 VM's completion raised, so every retry
-        of the abort answered 503 and its permit stayed open (dev 06f21b14).
-        """
-        db = _db(_installed())
-        prov = _provisioner(available=True, delete_result=True)
-        complete = AsyncMock()
-        with patch.object(
-            vm_upgrade_abort_cleanup, "complete_vm_cleanup_permit", complete
-        ):
-            await _abort(db, prov)
-
-        complete.assert_awaited_once()
-        assert complete.await_args.kwargs["provisioner"] is prov
-        assert complete.await_args.kwargs["outcome"] == "completed"
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(

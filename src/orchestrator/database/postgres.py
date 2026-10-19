@@ -27077,7 +27077,8 @@ class PostgresDB:
         the workspace config, contract and binding and drop ``metadata.vm`` in
         one owner-locked UPDATE, so End and a new attach see the Session the
         live agent still serves. False, changing nothing, unless the row is
-        open (not retiring) and its VM record is exactly that install's.
+        open (not retiring), its VM record is exactly that install's, and that
+        VM holds no open resource charge (only End's VM cleanup releases it).
         """
 
         try:
@@ -27122,6 +27123,24 @@ class PostgresDB:
                 if binding is not None and (
                     not canonical_virtual_binding(binding)
                     or metadata.get("_workspace_binding") is not None
+                ):
+                    return False
+                # A Session VM's resource charge is released only by End's own
+                # VM cleanup. Without the VM record End would be virtual and the
+                # charge would stay open for good, so keep the record until the
+                # charge (or a wait for one) is gone.
+                if await conn.fetchval(
+                    "SELECT EXISTS (SELECT 1 FROM vm_creation_retries c "
+                    "WHERE c.owner_kind='thread' AND c.thread_id=$1 "
+                    "AND c.provision_generation=$2::uuid AND ("
+                    "EXISTS (SELECT 1 FROM vm_resource_waiters w "
+                    "WHERE w.request_id=c.request_id "
+                    "AND w.state IN ('waiting','nonfit')) "
+                    "OR (SELECT r.state FROM vm_resource_reservations r "
+                    "WHERE r.request_id=c.request_id "
+                    "ORDER BY r.revision DESC LIMIT 1) <> 'released'))",
+                    parsed_thread,
+                    generation,
                 ):
                     return False
 
