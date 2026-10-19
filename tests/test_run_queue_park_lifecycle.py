@@ -652,6 +652,35 @@ async def test_model_unavailable_parks_at_once_with_the_message(executor, monkey
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("handle_token", [6, 7])
+async def test_model_unavailable_park_skips_only_for_this_claims_own_loss(
+    executor, monkeypatch, handle_token
+):
+    """The refusal comes from the claim bundle, before attach: on a warm
+    replica the shared handle still names the previous claim, which its old
+    fence marked lost. That loss is not this claim's (token 7)."""
+    monkeypatch.setattr(
+        executor,
+        "_exact_claim_handle_lost",
+        te.StatelessTurnExecutor._exact_claim_handle_lost.__get__(executor),
+    )
+    park = AsyncMock(return_value="parked")
+    monkeypatch.setattr(te, "park_unit", park)
+    monkeypatch.setattr(te, "append_system_frame", AsyncMock(return_value=(0, 1)))
+    executor._lease.update(UNIT, handle_token)
+    executor._lease.mark_lost()
+
+    await executor._park_model_unavailable(_claim(attempts=1), "model gone")
+
+    if handle_token == 6:
+        assert park.await_args.kwargs["lease_token"] == 7
+        executor._ack_terminal_claim_loss.assert_not_awaited()
+    else:
+        park.assert_not_awaited()
+        executor._ack_terminal_claim_loss.assert_awaited_once()
+
+
+@pytest.mark.asyncio
 async def test_transient_error_release_never_asks_to_park(executor, monkeypatch):
     release = AsyncMock(return_value="queued")
     monkeypatch.setattr(te, "release_unit", release)

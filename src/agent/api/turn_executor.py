@@ -6155,15 +6155,17 @@ class StatelessTurnExecutor:
             reason="release_model_unavailable",
             claim=claim,
         )
-        if self._lease.lost.is_set():
+        # As in _release: the refusal comes before attach, while the shared
+        # handle may still name the previous warm claim. Only this claim's own
+        # loss skips the park; a gone claim makes the token-guarded park a no-op.
+        if self._exact_claim_handle_lost(claim):
             logger.info(
                 "run_queue release: unit=%s token=%d reason=model_unavailable "
                 "skipped after local ownership loss",
                 claim.unit_id,
                 claim.lease_token,
             )
-            if self._exact_claim_handle_lost(claim):
-                await self._ack_terminal_claim_loss(claim)
+            await self._ack_terminal_claim_loss(claim)
             return
         error_text = message[:_LAST_ERROR_CHARS]
 
