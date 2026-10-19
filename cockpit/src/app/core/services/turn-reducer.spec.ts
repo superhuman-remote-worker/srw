@@ -832,7 +832,7 @@ describe('turn-reducer — message key (which response issued a call)', () => {
         expect(k1).not.toBe(k2);
     });
 
-    it('keeps the key of a supervised batch through approval and start', () => {
+    it('keeps the key of a gated batch through approval and start', () => {
         // permission.request_batch announces all calls as pending first; the
         // key is set there and survives the promotion to running.
         const state = play([

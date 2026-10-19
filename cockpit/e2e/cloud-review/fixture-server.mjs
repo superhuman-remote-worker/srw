@@ -290,7 +290,7 @@ const server = createServer(async (req, res) => {
         title: 'PS Protected Cloud review fixture',
         status: 'ended',
         config_name: 'session_base',
-        permission_mode: 'supervised',
+        permission_mode: 'read_only',
         user_id: USER_ID,
         total_turns: 8,
         total_tokens: 22000,

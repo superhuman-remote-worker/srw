@@ -9,9 +9,9 @@ import type {GrantCatalog, SshGatewayHostKeysResponse, UserCapabilities} from '.
 const CATALOG: GrantCatalog = {
   permission_mode: {
     type: 'enum',
-    default: 'supervised',
+    default: 'read_only',
     restrict_only: true,
-    order: ['supervised', 'auto_accept', 'autonomous'],
+    order: ['read_only', 'auto_accept', 'autonomous'],
   },
 };
 
@@ -42,30 +42,38 @@ function make(
 }
 
 describe('CapabilitiesService', () => {
-  it('non-admin, supervised ceiling ⇒ only supervised is selectable', () => {
-    const svc = make({is_admin: false, grants: {permission_mode: 'supervised'}, catalog: CATALOG});
-    expect(svc.permissionModes()).toEqual(['supervised']);
+  it('non-admin, read_only ceiling ⇒ only read_only is selectable', () => {
+    const svc = make({is_admin: false, grants: {permission_mode: 'read_only'}, catalog: CATALOG});
+    expect(svc.permissionModes()).toEqual(['read_only']);
     expect(svc.allowsPermissionMode('auto_accept')).toBe(false);
     expect(svc.allowsPermissionMode('autonomous')).toBe(false);
     expect(svc.permissionRestricted()).toBe(true);
   });
 
-  it('non-admin, auto_accept ceiling ⇒ supervised + auto_accept (autonomous gated)', () => {
+  it('a grant row still spelling the ceiling `supervised` means read_only', () => {
+    const svc = make({is_admin: false, grants: {permission_mode: 'supervised'}, catalog: CATALOG});
+    expect(svc.permissionModes()).toEqual(['read_only']);
+    expect(svc.allowsPermissionMode('read_only')).toBe(true);
+    expect(svc.allowsPermissionMode('auto_accept')).toBe(false);
+    expect(svc.permissionRestricted()).toBe(true);
+  });
+
+  it('non-admin, auto_accept ceiling ⇒ read_only + auto_accept (autonomous gated)', () => {
     const svc = make({is_admin: false, grants: {permission_mode: 'auto_accept'}, catalog: CATALOG});
-    expect(svc.permissionModes()).toEqual(['supervised', 'auto_accept']);
+    expect(svc.permissionModes()).toEqual(['read_only', 'auto_accept']);
     expect(svc.allowsPermissionMode('autonomous')).toBe(false);
     expect(svc.permissionRestricted()).toBe(true);
   });
 
   it('admin (grants null) ⇒ all modes, not restricted', () => {
     const svc = make({is_admin: true, grants: null, catalog: CATALOG});
-    expect(svc.permissionModes()).toEqual(['supervised', 'auto_accept', 'autonomous']);
+    expect(svc.permissionModes()).toEqual(['read_only', 'auto_accept', 'autonomous']);
     expect(svc.permissionRestricted()).toBe(false);
   });
 
   it('API unavailable (null) ⇒ fails open to all modes (Phase 1 backstops)', () => {
     const svc = make(null);
-    expect(svc.permissionModes()).toEqual(['supervised', 'auto_accept', 'autonomous']);
+    expect(svc.permissionModes()).toEqual(['read_only', 'auto_accept', 'autonomous']);
     expect(svc.permissionRestricted()).toBe(false);
   });
 });

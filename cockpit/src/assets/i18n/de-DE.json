@@ -628,7 +628,7 @@
       "projectArchivedWarning": "Ein archiviertes Projekt ist weiterhin ausgewählt — eine Sitzung darauf wird abgelehnt. Wählen Sie es ab oder heben Sie die Archivierung auf.",
       "projectsHint": "Wählen Sie das Projekt, in dem diese Sitzung arbeitet.",
       "permissionLabel": "Berechtigungsmodus",
-      "permissionSupervised": "Beaufsichtigt",
+      "permissionReadOnly": "Nur lesen",
       "permissionAutoAccept": "Auto-akzeptieren",
       "permissionAutonomous": "Autonom",
       "creating": "Wird erstellt...",
@@ -1481,7 +1481,7 @@
       "defaultPrefix": "Standard:",
       "permissionMode": "Berechtigungsmodus",
       "idleTimeout": "Leerlauf-Timeout (Minuten)",
-      "permissionSupervised": "Beaufsichtigt",
+      "permissionReadOnly": "Nur lesen",
       "permissionAutoAccept": "Auto-akzeptieren",
       "permissionAutonomous": "Autonom",
       "workspaceMoved": "Den Arbeitsbereich für neue Sitzungen legen die Einstellungen deines persönlichen Projekts fest.",
@@ -2210,7 +2210,7 @@
       "toolCalls": "Werkzeugaufrufe",
       "model": "Modell",
       "temperature": "Temperatur: {{value}}",
-      "modeSupervised": "Beaufsichtigt",
+      "modeReadOnly": "Nur lesen",
       "modeAutoAccept": "Auto-akzeptieren",
       "modeAutonomous": "Autonom",
       "narrationAuto": "Automatisch",
@@ -2338,6 +2338,7 @@
       "batchTitle": "Der Agent möchte {{count}} Werkzeugaufruf(e) ausführen",
       "approveAll": "Alle genehmigen",
       "autoAccept": "Auto-akzeptieren",
+      "autoAcceptHint": "Genehmigt diese Aufrufe und wechselt zu Auto-akzeptieren. Änderungen an Workspace-Dateien laufen danach ohne Rückfrage; Befehle sowie unumkehrbare oder nach außen gerichtete Aktionen fragen weiterhin nach.",
       "stop": "Stoppen"
     },
     "control": {
@@ -2500,9 +2501,9 @@
       "done": "Sitzung beenden — Erinnerungen extrahieren und archivieren",
       "undo": "Dateiänderungen des letzten Zugs rückgängig machen",
       "rewind": "Zu einer früheren Nachricht zurückspulen",
-      "auto": "Zu Auto-Akzeptieren wechseln (alles außer Shell genehmigen)",
-      "supervised": "Zu Beaufsichtigt wechseln (alle Schreibvorgänge genehmigen)",
-      "autonomous": "Zu Autonom wechseln (nichts genehmigen)",
+      "auto": "Zu Auto-akzeptieren wechseln — ändert Workspace-Dateien frei, fragt vor unumkehrbaren oder nach außen gerichteten Aktionen und Befehlen",
+      "readonly": "Zu Nur lesen wechseln — liest, sucht und browst frei, fragt vor Änderungen, Aktionen außerhalb des Workspace und Befehlen",
+      "autonomous": "Zu Autonom wechseln — führt jedes Tool ohne Rückfrage aus",
       "silent": "Reasoning ausblenden und Werkzeug-Details minimieren",
       "verbose": "Vollständiges Reasoning und Werkzeug-Details anzeigen",
       "upgradeWorkspace": "Arbeitsbereich aufwerten: ohne Angabe die nächste Stufe, \"vm\" oder ein Vorlagenname"
@@ -3627,7 +3628,7 @@
       "noBaseline": "Der Projektordner wurde für diesen Job nicht kopiert, es gibt also keine Änderungen zu prüfen.",
       "headUnreadable": "Die Änderungen des Jobs an seiner Kopie des Projektordners konnten nicht gelesen werden, es gibt also nichts zu prüfen."
     },
-    "reviewSessionHint": "Startet eine beaufsichtigte Sitzung in einem frischen Sandbox-Checkout des bereitgestellten Branches mit Modell, Projekt und Konnektoren dieses Jobs. Job-spezifische Arbeitsbereichs- und Tool-Einstellungen werden nicht kopiert.",
+    "reviewSessionHint": "Startet eine Sitzung im Modus „Nur lesen“ in einem frischen Sandbox-Checkout des bereitgestellten Branches mit Modell, Projekt und Konnektoren dieses Jobs. Job-spezifische Arbeitsbereichs- und Tool-Einstellungen werden nicht kopiert.",
     "vmUpgrade": {
       "title": "Sudo erforderlich",
       "reason": "Der Agent hat einen privilegierten Befehl in einem gehärteten Container versucht:",
@@ -4070,17 +4071,17 @@
       }
     },
     "permissionModes": {
-      "supervised": {
-        "label": "Beaufsichtigt",
-        "description": "Agent fragt vor jedem Befehl um Freigabe"
+      "read_only": {
+        "label": "Nur lesen",
+        "description": "Liest, sucht und browst frei. Fragt vor Änderungen, Aktionen außerhalb des Workspace und Befehlen."
       },
       "auto_accept": {
         "label": "Automatisch",
-        "description": "Die meisten Aktionen werden automatisch freigegeben, riskante markiert"
+        "description": "Ändert Workspace-Dateien frei. Fragt vor unumkehrbaren oder nach außen gerichteten Aktionen und Befehlen."
       },
       "autonomous": {
         "label": "Autonom",
-        "description": "Agent führt Aktionen ohne Rückfrage aus"
+        "description": "Führt jedes Tool ohne Rückfrage aus."
       }
     },
     "imageQuality": {

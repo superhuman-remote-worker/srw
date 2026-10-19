@@ -43,6 +43,11 @@ import { TranslocoService } from '@jsverse/transloco';
 import { workspaceCreationMessageKey, workspaceCreationMessageParams } from '../util/workspace-creation';
 import { WorkspaceChoice } from '../models/workspace-template.model';
 import { WorkspacePreview } from '../models/workspace.model';
+import {
+  DEFAULT_PERMISSION_MODE,
+  normalizePermissionMode,
+  type PermissionMode,
+} from '../models/permission-mode';
 import { choiceBackend, choiceRequestFields } from '../../views/workspaces/workspace-template-utils';
 import { ApiService } from './api.service';
 import type { SessionQueueState } from '../models/api.model';
@@ -263,7 +268,7 @@ export interface ToolCallInfo {
   /** Tool category from the registry (e.g. workspace, git, research). */
   category?: string;
   /**
-   * Supervised approval outcome, if this call passed through a permission
+   * Approval outcome, if this call passed through a permission
    * gate. Persisted on the backend so it survives history reload.
    * Absent for autonomous / auto-accepted calls.
    */
@@ -304,7 +309,7 @@ export interface SessionTask {
 }
 
 type ConnectionState = 'disconnected' | 'connecting' | 'connected' | 'error';
-export type PermissionMode = 'supervised' | 'auto_accept' | 'autonomous';
+export type { PermissionMode };
 export type NarrationMode = 'silent' | 'verbose' | 'auto';
 
 type DurableControl =
@@ -327,6 +332,9 @@ const SLASH_COMMAND_VERBS: Record<string, readonly string[]> = {
   '/compact': ['compact'],
   '/undo': ['undo', 'workspace.undo'],
   '/auto': ['mode.set'],
+  '/readonly': ['mode.set'],
+  // Hidden alias of /readonly (the mode was called `supervised` until
+  // 2026-10): it still works, the palette never lists it.
   '/supervised': ['mode.set'],
   '/autonomous': ['mode.set'],
   '/silent': ['narration.set'],
@@ -412,7 +420,10 @@ export function describeAppliedConfig(
     parts.push(`${label} tools ${enabled ? 'enabled' : 'disabled'}`);
   }
   const interactive = applied['interactive'] as Record<string, unknown> | undefined;
-  if (interactive?.['permission_mode']) parts.push(`mode → ${interactive['permission_mode']}`);
+  if (interactive?.['permission_mode']) {
+    const mode = interactive['permission_mode'];
+    parts.push(`mode → ${normalizePermissionMode(mode) ?? mode}`);
+  }
   if (interactive?.['narration_mode']) parts.push(`narration → ${interactive['narration_mode']}`);
   for (const name of datasources?.added ?? []) {
     parts.push(`connector "${name}" attached`);
@@ -1184,7 +1195,7 @@ export class PersistentChatService {
   }
 
   // --- Permission state ---
-  readonly permissionMode = signal<PermissionMode>('supervised');
+  readonly permissionMode = signal<PermissionMode>(DEFAULT_PERMISSION_MODE);
   /** Every gate currently awaiting a decision. A parallel tool batch puts
    *  all of its calls here at once so one card can list them —
    *  knowledge-base/knowledge/superpowers/specs/2026-08-01-batch-tool-approval-design.md. */
@@ -1755,7 +1766,7 @@ export class PersistentChatService {
   private sseOpenedWithCursor = false;
   // The DB-authoritative REST snapshot was applied for this connection.
   // A socketless /connection response may unblock the composer only after
-  // this is true; otherwise a supervised gate could be live but invisible.
+  // this is true; otherwise an approval gate could be live but invisible.
   private sessionSnapshotLoaded = false;
   private sessionSnapshotFailed = false;
   // Journal high-water covered by the durable snapshot. Replay starts from
@@ -6522,8 +6533,9 @@ export class PersistentChatService {
       case '/auto':
         this.setMode('auto_accept');
         return true;
-      case '/supervised':
-        this.setMode('supervised');
+      case '/readonly':
+      case '/supervised': // hidden legacy alias, never listed in the palette
+        this.setMode('read_only');
         return true;
       case '/autonomous':
         this.setMode('autonomous');
@@ -7623,8 +7635,10 @@ export class PersistentChatService {
             this.error.set(null);
           }
         }
-        if (params['permission_mode']) {
-          this.permissionMode.set(params['permission_mode'] as PermissionMode);
+        // Stored rows and old agents may still say `supervised`.
+        const snapshotMode = normalizePermissionMode(params['permission_mode']);
+        if (snapshotMode) {
+          this.permissionMode.set(snapshotMode);
         }
         if (params['narration_mode']) {
           this.narrationMode.set(params['narration_mode'] as NarrationMode);
@@ -7673,7 +7687,7 @@ export class PersistentChatService {
         if ('running_tools' in params || 'running_tool' in params) {
           this.runningTools.set(parseRunningTools(params));
         }
-        // Pending supervised gates: re-render the approval card a
+        // Pending approval gates: re-render the approval card a
         // dropped stream (or a reload) would otherwise strand, leaving
         // the gate unanswerable. Same presence-check discipline as
         // running_tool. See the backend welcome frame.
@@ -8115,7 +8129,8 @@ export class PersistentChatService {
       case 'mode.changed':
         this._clearDurableControlErrorAfter(this._takeDurableControlAck(params, 'mode.set'));
         if (coveredBySnapshot) break;
-        this.permissionMode.set((params['mode'] as PermissionMode) || 'supervised');
+        // Journaled frames from before the rename say `supervised`.
+        this.permissionMode.set(normalizePermissionMode(params['mode']) ?? DEFAULT_PERMISSION_MODE);
         break;
 
       case 'narration.changed':
@@ -8168,8 +8183,9 @@ export class PersistentChatService {
         if (!coveredBySnapshot && params['temperature'] != null) {
           this.temperature.set(params['temperature'] as number);
         }
-        if (!coveredBySnapshot && params['permission_mode']) {
-          this.permissionMode.set(params['permission_mode'] as PermissionMode);
+        const changedMode = coveredBySnapshot ? null : normalizePermissionMode(params['permission_mode']);
+        if (changedMode) {
+          this.permissionMode.set(changedMode);
         }
         // Transcript stamp (live_session_settings.md, principle 5):
         // the ack is broadcast + journaled, so every viewer — live or

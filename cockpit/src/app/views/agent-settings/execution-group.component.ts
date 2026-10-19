@@ -19,6 +19,7 @@ import {
 import {PinOnInteractDirective} from './pin-on-interact.directive';
 import {allowedEnumOptions} from './capability-gates';
 import type {GrantCatalog} from '../../core/models/api.model';
+import {DEFAULT_PERMISSION_MODE, normalizePermissionMode} from '../../core/models/permission-mode';
 
 /** See ExecutionGroupComponent.section. */
 export type ExecutionSection = 'all' | 'task' | 'taskMore' | 'expert' | 'workspace';
@@ -602,9 +603,11 @@ export class ExecutionGroupComponent {
   readonly resolvedAutonomy = computed(() =>
     (readConfigPath(this.config(), 'autonomy') as string) ?? 'review'
   );
-  readonly resolvedPermissionMode = computed(() =>
-    (readConfigPath(this.config(), 'interactive.permission_mode') as string) ?? 'supervised'
-  );
+  readonly resolvedPermissionMode = computed<string>(() => {
+    // A stored config may still spell read_only `supervised`.
+    const raw = readConfigPath(this.config(), 'interactive.permission_mode');
+    return normalizePermissionMode(raw) ?? (raw as string | undefined) ?? DEFAULT_PERMISSION_MODE;
+  });
   readonly resolvedNarrationMode = computed(() =>
     (readConfigPath(this.config(), 'interactive.narration_mode') as string) ?? 'auto'
   );

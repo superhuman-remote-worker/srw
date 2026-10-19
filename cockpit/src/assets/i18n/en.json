@@ -628,7 +628,7 @@
       "projectArchivedWarning": "An archived project is still selected — creating a session against it will be refused. Deselect it, or unarchive the project.",
       "projectsHint": "Choose the project this session works in.",
       "permissionLabel": "Permission Mode",
-      "permissionSupervised": "Supervised",
+      "permissionReadOnly": "Read-only",
       "permissionAutoAccept": "Auto-accept",
       "permissionAutonomous": "Autonomous",
       "creating": "Creating...",
@@ -1481,7 +1481,7 @@
       "defaultPrefix": "Default:",
       "permissionMode": "Permission Mode",
       "idleTimeout": "Idle Timeout (minutes)",
-      "permissionSupervised": "Supervised",
+      "permissionReadOnly": "Read-only",
       "permissionAutoAccept": "Auto-accept",
       "permissionAutonomous": "Autonomous",
       "workspaceMoved": "The workspace for new Sessions is set in your personal project's settings.",
@@ -2210,7 +2210,7 @@
       "toolCalls": "Tool calls",
       "model": "Model",
       "temperature": "Temperature: {{value}}",
-      "modeSupervised": "Supervised",
+      "modeReadOnly": "Read-only",
       "modeAutoAccept": "Auto-accept",
       "modeAutonomous": "Autonomous",
       "narrationAuto": "Auto",
@@ -2338,6 +2338,7 @@
       "batchTitle": "The agent wants to run {{count}} tool(s)",
       "approveAll": "Approve all",
       "autoAccept": "Auto-accept",
+      "autoAcceptHint": "Approves these calls and switches to Auto-accept. Workspace file changes then run without asking; commands and irreversible or outbound actions still ask.",
       "stop": "Stop"
     },
     "control": {
@@ -2500,9 +2501,9 @@
       "done": "End session — extract memories and archive",
       "undo": "Undo file changes from the last turn",
       "rewind": "Rewind to an earlier message",
-      "auto": "Switch to auto-accept mode (approve all except shell)",
-      "supervised": "Switch to supervised mode (approve all writes)",
-      "autonomous": "Switch to autonomous mode (approve nothing)",
+      "auto": "Switch to Auto-accept — changes workspace files freely, asks before irreversible or outbound actions and commands",
+      "readonly": "Switch to Read-only — reads, searches and browses freely, asks before changes, outside actions and commands",
+      "autonomous": "Switch to Autonomous — runs every tool without asking",
       "silent": "Hide reasoning and minimize tool detail",
       "verbose": "Show full reasoning and tool detail",
       "upgradeWorkspace": "Upgrade the workspace: no argument for the next tier, \"vm\", or a template name"
@@ -3627,7 +3628,7 @@
       "noBaseline": "The project folder was not copied for this job, so there are no changes to review.",
       "headUnreadable": "The job's changes to its copy of the project folder could not be read, so there is nothing to review."
     },
-    "reviewSessionHint": "Starts a supervised session in a fresh sandbox checkout of the delivered branch with this job's model, project, and connectors. Job-only workspace and tool settings are not copied.",
+    "reviewSessionHint": "Starts a read-only session in a fresh sandbox checkout of the delivered branch with this job's model, project, and connectors. Job-only workspace and tool settings are not copied.",
     "vmUpgrade": {
       "title": "Sudo Required",
       "reason": "The agent attempted a privileged command in a hardened container:",
@@ -4079,17 +4080,17 @@
       }
     },
     "permissionModes": {
-      "supervised": {
-        "label": "Supervised",
-        "description": "Agent asks for approval before executing commands"
+      "read_only": {
+        "label": "Read-only",
+        "description": "Reads, searches and browses freely. Asks before changing anything, acting outside the workspace, or running commands."
       },
       "auto_accept": {
         "label": "Auto-accept",
-        "description": "Auto-approve most actions, flag risky ones"
+        "description": "Changes workspace files freely. Asks before irreversible or outbound actions and commands."
       },
       "autonomous": {
         "label": "Autonomous",
-        "description": "Agent runs without asking for approval"
+        "description": "Runs every tool without asking."
       }
     },
     "imageQuality": {

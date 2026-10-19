@@ -5,6 +5,7 @@ import {AdminGrantsService, ScopeKind} from '../../../core/services/admin-grants
 import {AdminUsersService} from '../../../core/services/admin-users.service';
 import {ApiService} from '../../../core/services/api.service';
 import {Expert, GrantCatalogEntry} from '../../../core/models/api.model';
+import {normalizePermissionMode} from '../../../core/models/permission-mode';
 import {TranslocoPipe} from '@jsverse/transloco';
 import {RouterLink} from '@angular/router';
 
@@ -296,7 +297,11 @@ export class AdminGrantsComponent implements OnInit {
   /** The explicitly-set value as a select-bindable string, or the INHERIT sentinel. */
   currentValue(key: string): string {
     const row = this.svc.grants().find((g) => g.key === key);
-    return row ? String(row.value_json) : INHERIT;
+    if (!row) return INHERIT;
+    // A row written before the rename still says `supervised`; show the
+    // option it means rather than a blank select.
+    if (key === 'permission_mode') return normalizePermissionMode(row.value_json) ?? String(row.value_json);
+    return String(row.value_json);
   }
 
   listText(key: string): string {

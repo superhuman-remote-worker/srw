@@ -51,7 +51,7 @@ function sessionState() {
     'workspaceCreation']) state[key] = signal(null);
   return {...state, isConnected: signal(true), sessionReady: signal(true), threadId: signal('test-thread'),
     threadStatus: signal('active'), sessionTitle: signal('Test session'), connectionState: signal('connected'),
-    modelName: signal('Test model'), permissionMode: signal('supervised'), narrationMode: signal('off'),
+    modelName: signal('Test model'), permissionMode: signal('read_only'), narrationMode: signal('off'),
     workspaceUpgradeFailureText: () => '',
     startupPhase: signal('ready'), controlTransport: signal('websocket'), citationsByCid: signal(new Map()),
     awaitingElapsedMs: signal(0), reconnectAttempt: signal(0), agentSilenceSeconds: signal(0), cloudChangesCount: signal(0),
@@ -676,6 +676,56 @@ describe('the slash menu completes the command word, never its argument', () => 
       view.onKeydown(enter());
       expect(view.inputText).toBe('/compact ');
       expect(chat.sendMessage).not.toHaveBeenCalled();
+    } finally {
+      fixture.destroy();
+      TestBed.resetTestingModule();
+    }
+  });
+});
+
+describe('permission mode surfaces', () => {
+  beforeAll(async () => {
+    HTMLElement.prototype.scrollTo = vi.fn();
+    await ɵresolveComponentResources(() => Promise.resolve(''));
+  });
+
+  const api = {
+    getThreadIdeStatus: () => of(null),
+    getMyCapabilities: () => of(null),
+    getSshHostKeys: () => of({hostname: 'ssh.example.test', host_keys: []}),
+  };
+
+  it('offers /readonly but never lists the hidden /supervised alias', async () => {
+    const fixture = await mountChat(sessionState() as any, api, false);
+    try {
+      const view = fixture.componentInstance;
+      view.onInputChange('/');
+      const offered = view.filteredCommands().map((c) => c.command);
+      expect(offered).toContain('/readonly');
+      expect(offered).toContain('/auto');
+      expect(offered).toContain('/autonomous');
+      expect(offered).not.toContain('/supervised');
+      view.onInputChange('/sup');
+      expect(view.filteredCommands()).toEqual([]);
+    } finally {
+      fixture.destroy();
+      TestBed.resetTestingModule();
+    }
+  });
+
+  it('labels the header badge from i18n, never the raw value', async () => {
+    const chat = sessionState() as any;
+    const fixture = await mountChat(chat, api, false);
+    try {
+      const view = fixture.componentInstance;
+      expect(view.permissionModeLabelKey()).toBe('chat.settings.modeReadOnly');
+      fixture.detectChanges();
+      const text = (fixture.nativeElement as HTMLElement).textContent ?? '';
+      expect(text).toContain('chat.settings.modeReadOnly');
+      expect(text).not.toMatch(/read_only/i);
+
+      chat.permissionMode.set('auto_accept');
+      expect(view.permissionModeLabelKey()).toBe('chat.settings.modeAutoAccept');
     } finally {
       fixture.destroy();
       TestBed.resetTestingModule();

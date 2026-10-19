@@ -32,6 +32,22 @@ describe('capability-gates', () => {
     ).toEqual(['dependent', 'guided', 'partial', 'review']); // 'full' dropped
   });
 
+  it('allowedEnumOptions: a legacy `supervised` permission ceiling or order means read_only', () => {
+    const all = ['read_only', 'auto_accept', 'autonomous'];
+    const legacy: GrantCatalog = {
+      permission_mode: {
+        type: 'enum',
+        default: 'supervised',
+        restrict_only: true,
+        order: ['supervised', 'auto_accept', 'autonomous'],
+      },
+    };
+    expect(allowedEnumOptions({permission_mode: 'supervised'}, 'permission_mode', all, legacy))
+      .toEqual(['read_only']);
+    expect(allowedEnumOptions({permission_mode: 'auto_accept'}, 'permission_mode', all, legacy))
+      .toEqual(['read_only', 'auto_accept']);
+  });
+
   it('isModelAllowed: null/admin ⇒ all; list restricts', () => {
     expect(isModelAllowed(null, 'gpt-x')).toBe(true);
     expect(isModelAllowed({model_selection: null}, 'gpt-x')).toBe(true);

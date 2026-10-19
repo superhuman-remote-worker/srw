@@ -12,7 +12,7 @@ import {UserService} from '../../core/services/user.service';
  * still emitted `autonomy` or `image_quality` would duplicate a field in the
  * merged config_override, and the last writer would silently win.
  */
-function mount(section: ExecutionSection, mode = 'job') {
+function mount(section: ExecutionSection, mode = 'job', config?: Record<string, unknown>) {
   TestBed.configureTestingModule({
     imports: [
       ExecutionGroupComponent,
@@ -29,6 +29,7 @@ function mount(section: ExecutionSection, mode = 'job') {
   stub('mode', mode);
   stub('section', section);
   stub('showProjectMemory', true);
+  if (config) stub('config', config);
   fixture.detectChanges();
   return fixture;
 }
@@ -77,6 +78,21 @@ describe('ExecutionGroupComponent sections', () => {
     expect(fixture.componentInstance.getOverrides()).toEqual({
       interactive: {permission_mode: 'autonomous', narration_mode: 'verbose'},
     });
+  });
+
+  it('task (session): a config still saying `supervised` resolves to read_only', () => {
+    const legacy = mount('task', 'session', {interactive: {permission_mode: 'supervised'}});
+    expect(legacy.componentInstance.resolvedPermissionMode()).toBe('read_only');
+    expect(legacy.componentInstance.effectivePermissionDesc()).toBe(
+      en.agentSettings.permissionModes.read_only.description,
+    );
+    expect(legacy.componentInstance.permissionOptions().map((o) => o.value)).toEqual([
+      'read_only', 'auto_accept', 'autonomous',
+    ]);
+
+    TestBed.resetTestingModule();
+    const unset = mount('task', 'session');
+    expect(unset.componentInstance.resolvedPermissionMode()).toBe('read_only');
   });
 
   it('expert: image quality only, and only outside live mode', () => {

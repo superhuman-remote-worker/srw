@@ -123,7 +123,7 @@ function makeThread(overrides: Partial<any> = {}) {
         title: 'Test Session',
         status: 'active',
         config_name: 'persistent_defaults',
-        permission_mode: 'supervised',
+        permission_mode: 'read_only',
         created_at: '2026-01-01T00:00:00Z',
         last_activity: '2026-01-01T01:00:00Z',
         ended_at: null,
@@ -222,7 +222,7 @@ describe('SessionsPageComponent', () => {
 
         it('should have default form values', () => {
             expect(component.newConfig).toBe('session_base');
-            expect(component.newPermission).toBe('supervised');
+            expect(component.newPermission).toBe('read_only');
             expect(component.newModel).toBe('');
             expect(component.newTitle).toBe('');
         });

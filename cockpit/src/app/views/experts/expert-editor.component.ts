@@ -29,6 +29,7 @@ import {deepMergeConfig} from '../agent-settings/config-merge';
 import {assembleExpertConfig, liftLegacyTiers, splitExpertConfig} from './expert-config';
 import {SubagentsEditorComponent} from './subagents-editor.component';
 import {isModelAllowed} from '../agent-settings/capability-gates';
+import {normalizePermissionMode} from '../../core/models/permission-mode';
 import {defaultModelOptionLabel} from '../agent-settings/agent-settings.types';
 
 /** Derive a valid expert slug (^[a-z][a-z0-9_-]*$) from a display name. */
@@ -851,7 +852,8 @@ export class ExpertEditorComponent implements OnInit {
     }
     const interactive = frag['interactive'] as Record<string, unknown> | undefined;
     const pm = interactive?.['permission_mode'] as string | undefined;
-    if (pm) exec?.permissionMode.set(pm);
+    // A config saved before the rename says `supervised`; saving writes read_only.
+    if (pm) exec?.permissionMode.set(normalizePermissionMode(pm) ?? pm);
   }
 
   onDisplayName(v: string): void {

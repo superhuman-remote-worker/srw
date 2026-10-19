@@ -1061,8 +1061,8 @@ export class SessionCreateComponent implements OnInit {
 
     // Only send permission_mode when the user actually picked a per-session
     // override; omitting it lets the backend fall back to the user's saved
-    // default, then the config default. Sending a hardcoded 'supervised' here
-    // would clobber that saved default and forced every session to Supervised.
+    // default, then the config default. Sending a hardcoded 'read_only' here
+    // would clobber that saved default and force every session to Read-only.
     const permissionMode = (configOverride['interactive'] as any)?.['permission_mode'] ?? null;
     if (permissionMode) body['permission_mode'] = permissionMode;
 

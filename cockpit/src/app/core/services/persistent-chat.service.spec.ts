@@ -296,7 +296,7 @@ function activeSessionGet(url: string) {
     total: 0,
     citations: [],
     thread_id: threadId,
-    permission_mode: 'supervised',
+    permission_mode: 'read_only',
     narration_mode: 'auto',
     turn_count: 0,
     turn_in_flight: false,
@@ -519,7 +519,7 @@ describe('PersistentChatService — initial state', () => {
     expect(service.currentStreamingTurn()).toBeNull();
     expect(service.isStreaming()).toBe(false);
     expect(service.historyLoaded()).toBe(false);
-    expect(service.permissionMode()).toBe('supervised');
+    expect(service.permissionMode()).toBe('read_only');
     expect(service.narrationMode()).toBe('auto');
     expect(service.reconnectAttempt()).toBe(0);
     expect(service.reconnectGaveUp()).toBe(false);
@@ -2298,7 +2298,7 @@ describe('PersistentChatService — SSE event dispatch', () => {
       es,
       {
         method: 'session.state',
-        params: { permission_mode: 'supervised' },
+        params: { permission_mode: 'read_only' },
       },
       '1:1',
     );
@@ -4925,7 +4925,7 @@ describe('PersistentChatService — control commands', () => {
 
     ctx.service.setMode('auto_accept');
     // Neither the optimistic click nor the HTTP response is authority.
-    expect(ctx.service.permissionMode()).toBe('supervised');
+    expect(ctx.service.permissionMode()).toBe('read_only');
     const requestId = ctx.mockHttp.post.mock.calls[0][1].client_request_id;
 
     fireSseMessage(
@@ -4937,6 +4937,57 @@ describe('PersistentChatService — control commands', () => {
       '1:2',
     );
     expect(ctx.service.permissionMode()).toBe('autonomous');
+  });
+
+  it('reads a legacy `supervised` from the server as read_only at every ingest point', async () => {
+    const ctx = createService();
+    // The durable REST snapshot (a thread row stored before the rename).
+    ctx.mockHttp.get.mockImplementation((url: string) =>
+      activeSessionGet(url).pipe(map((body) => ({ ...body, permission_mode: 'supervised' }))),
+    );
+    await ctx.service.connect('thread-legacy-mode');
+    fireSseOpen(ctx.sseInstances[0]);
+    fireSseMessage(ctx.sseInstances[0], { method: 'ready', params: {} }, '1:1');
+    expect(ctx.service.permissionMode()).toBe('read_only');
+
+    const ingest = [
+      // A journaled mode.changed frame from before the rename.
+      (mode: string) => ({ method: 'mode.changed', params: { mode } }),
+      (mode: string) => ({ method: 'config.changed', params: { permission_mode: mode } }),
+      // A pinned agent's live welcome frame.
+      (mode: string) => ({ method: 'session.state', params: { permission_mode: mode } }),
+    ];
+    let seq = 2;
+    for (const frame of ingest) {
+      fireSseMessage(ctx.sseInstances[0], frame('autonomous'), `1:${seq++}`);
+      expect(ctx.service.permissionMode()).toBe('autonomous');
+      fireSseMessage(ctx.sseInstances[0], frame('supervised'), `1:${seq++}`);
+      expect(ctx.service.permissionMode()).toBe('read_only');
+    }
+
+    // An unknown value never lands in the signal.
+    fireSseMessage(
+      ctx.sseInstances[0],
+      { method: 'session.state', params: { permission_mode: 'bogus' } },
+      `1:${seq++}`,
+    );
+    expect(ctx.service.permissionMode()).toBe('read_only');
+  });
+
+  it('/readonly and the hidden /supervised alias both send mode.set read_only', async () => {
+    const ctx = await readySession();
+    ctx.mockHttp.post.mockClear();
+    ctx.mockHttp.post.mockReturnValue(of({ accepted: true }));
+
+    expect(ctx.service.slashCommandAvailable('/readonly')).toBe(true);
+    expect((ctx.service as any).handleSlashCommand('/readonly')).toBe(true);
+    ctx.service.setMode('autonomous');
+    expect((ctx.service as any).handleSlashCommand('/supervised')).toBe(true);
+
+    const modes = ctx.mockHttp.post.mock.calls
+      .filter((call: any[]) => call[1]?.method === 'mode.set')
+      .map((call: any[]) => call[1].mode);
+    expect(modes).toEqual(['read_only', 'autonomous', 'read_only']);
   });
 
   it('correlates an owner acknowledgement that beats the HTTP 202', async () => {
@@ -4998,7 +5049,7 @@ describe('PersistentChatService — control commands', () => {
     ctx.service.setMode('auto_accept');
     ctx.service.setNarrationMode('silent');
     ctx.service.setMode('autonomous');
-    ctx.service.setMode('supervised');
+    ctx.service.setMode('read_only');
 
     expect(ctx.mockHttp.post).toHaveBeenCalledTimes(1);
     const queued = (ctx.service as any).durableControlOutbox.map((item: any) => item.request);
@@ -5010,7 +5061,7 @@ describe('PersistentChatService — control commands', () => {
     expect(queued.map((request: any) => request.mode)).toEqual([
       'auto_accept',
       'silent',
-      'supervised',
+      'read_only',
     ]);
 
     firstAdmission.next({ accepted: true });
@@ -5019,7 +5070,7 @@ describe('PersistentChatService — control commands', () => {
     expect(ctx.mockHttp.post.mock.calls.map((call: any[]) => call[1].mode)).toEqual([
       'auto_accept',
       'silent',
-      'supervised',
+      'read_only',
     ]);
   });
 
@@ -5030,7 +5081,7 @@ describe('PersistentChatService — control commands', () => {
       threadId: `other-thread-${index}`,
       request: {
         method: 'mode.set',
-        mode: 'supervised',
+        mode: 'read_only',
         client_request_id: `existing-${index}`,
       },
       attempts: 0,
@@ -5206,17 +5257,17 @@ describe('PersistentChatService — control commands', () => {
     expect(ctx.service.permissionMode()).toBe('auto_accept');
     expect(ctx.service.error()).toBe('chat.control.admissionFailed');
 
-    ctx.service.setMode('supervised');
+    ctx.service.setMode('read_only');
     const newerRequestId = ctx.mockHttp.post.mock.calls[2][1].client_request_id;
     fireSseMessage(
       ctx.sseInstances[0],
       {
         method: 'mode.changed',
-        params: { mode: 'supervised', client_request_id: newerRequestId },
+        params: { mode: 'read_only', client_request_id: newerRequestId },
       },
       '1:3',
     );
-    expect(ctx.service.permissionMode()).toBe('supervised');
+    expect(ctx.service.permissionMode()).toBe('read_only');
     expect(ctx.service.error()).toBeNull();
   });
 
@@ -5364,7 +5415,7 @@ describe('PersistentChatService — control WS frame filtering', () => {
       method: 'session.state',
       params: {
         thread_id: 'thread-status',
-        permission_mode: 'manual',
+        permission_mode: 'autonomous',
         narration_mode: 'verbose',
         turn_count: 1,
         model: 'claude-opus-4-7',
@@ -5384,7 +5435,7 @@ describe('PersistentChatService — control WS frame filtering', () => {
     });
 
     expect(service.sessionReady()).toBe(true);
-    expect(service.permissionMode()).toBe('manual');
+    expect(service.permissionMode()).toBe('autonomous');
     expect(service.modelName()).toBe('claude-opus-4-7');
     expect(service.tasks().map((task) => task.id)).toEqual(['task_9']);
 
@@ -5482,7 +5533,7 @@ describe('PersistentChatService — direct session WS (prepare + connection)', (
         return of(
           opts.sessionState ?? {
             thread_id: threadId,
-            permission_mode: 'supervised',
+            permission_mode: 'read_only',
             narration_mode: 'auto',
             turn_count: 0,
             turn_in_flight: false,
@@ -5581,7 +5632,7 @@ describe('PersistentChatService — direct session WS (prepare + connection)', (
         },
         sessionState: {
           thread_id: 'socketless',
-          permission_mode: 'supervised',
+          permission_mode: 'read_only',
           narration_mode: 'verbose',
           turn_count: 3,
           turn_in_flight: false,
@@ -5603,7 +5654,7 @@ describe('PersistentChatService — direct session WS (prepare + connection)', (
     (ctx.service as any)._revalidateConnection();
 
     expect(ctx.service.sessionReady()).toBe(true);
-    expect(ctx.service.permissionMode()).toBe('supervised');
+    expect(ctx.service.permissionMode()).toBe('read_only');
     expect(ctx.service.narrationMode()).toBe('verbose');
     // An expert profile is not a model name; an unresolved model stays
     // unknown instead of rendering `session_base` as though it were one.
@@ -5632,7 +5683,7 @@ describe('PersistentChatService — direct session WS (prepare + connection)', (
         ],
         sessionState: {
           thread_id: 'socketless-tasks',
-          permission_mode: 'supervised',
+          permission_mode: 'read_only',
           narration_mode: 'auto',
           turn_count: 8,
           turn_in_flight: false,
@@ -5700,7 +5751,7 @@ describe('PersistentChatService — direct session WS (prepare + connection)', (
         ],
         sessionState: {
           thread_id: 'socketless-task-fence',
-          permission_mode: 'supervised',
+          permission_mode: 'read_only',
           narration_mode: 'auto',
           turn_count: 10,
           turn_in_flight: false,
@@ -5916,7 +5967,7 @@ describe('PersistentChatService — direct session WS (prepare + connection)', (
         ],
         sessionState: {
           thread_id: 'stateful',
-          permission_mode: 'supervised',
+          permission_mode: 'read_only',
           narration_mode: 'auto',
           turn_count: 8,
           turn_in_flight: true,
@@ -6016,7 +6067,7 @@ describe('PersistentChatService — direct session WS (prepare + connection)', (
         ],
         sessionState: {
           thread_id: 'approval-retry',
-          permission_mode: 'supervised',
+          permission_mode: 'read_only',
           narration_mode: 'auto',
           turn_count: 3,
           turn_in_flight: true,
@@ -6129,7 +6180,7 @@ describe('PersistentChatService — direct session WS (prepare + connection)', (
         ],
         sessionState: {
           thread_id: 'midturn-rest',
-          permission_mode: 'supervised',
+          permission_mode: 'read_only',
           narration_mode: 'auto',
           turn_count: 7,
           turn_in_flight: true,
@@ -6178,7 +6229,7 @@ describe('PersistentChatService — direct session WS (prepare + connection)', (
       if (url.endsWith('/state')) {
         return of({
           thread_id: 'same-thread-live',
-          permission_mode: 'supervised',
+          permission_mode: 'read_only',
           narration_mode: 'auto',
           turn_count: 7,
           turn_in_flight: true,
@@ -6239,7 +6290,7 @@ describe('PersistentChatService — direct session WS (prepare + connection)', (
         const epoch = stateRead === 1 ? 1 : 2;
         return of({
           thread_id: 'same-thread-new-epoch',
-          permission_mode: 'supervised',
+          permission_mode: 'read_only',
           narration_mode: 'auto',
           turn_count: 1,
           turn_in_flight: true,
@@ -6322,7 +6373,7 @@ describe('PersistentChatService — direct session WS (prepare + connection)', (
         const advanced = stateRead > 1;
         return of({
           thread_id: 'same-epoch-gap',
-          permission_mode: 'supervised',
+          permission_mode: 'read_only',
           narration_mode: 'auto',
           turn_count: advanced ? 10 : 1,
           turn_in_flight: true,
@@ -6405,7 +6456,7 @@ describe('PersistentChatService — direct session WS (prepare + connection)', (
         ],
         sessionState: {
           thread_id: 'covered-terminal',
-          permission_mode: 'supervised',
+          permission_mode: 'read_only',
           narration_mode: 'auto',
           turn_count: 7,
           turn_in_flight: false,
@@ -6503,7 +6554,7 @@ describe('PersistentChatService — direct session WS (prepare + connection)', (
         if (url.endsWith('/state')) {
           return of({
             thread_id: 'terminal-425',
-            permission_mode: 'supervised',
+            permission_mode: 'read_only',
             narration_mode: 'auto',
             turn_count: 0,
             turn_in_flight: false,
@@ -8278,7 +8329,7 @@ describe('PersistentChatService — direct session WS (prepare + connection)', (
         if (url.endsWith('/state')) {
           return of({
             thread_id: 'rest-ended',
-            permission_mode: 'supervised',
+            permission_mode: 'read_only',
             narration_mode: 'auto',
             turn_count: 0,
             turn_in_flight: false,
@@ -8616,7 +8667,7 @@ describe('PersistentChatService — endSession()', () => {
         messages: [],
         total: 0,
         thread_id: 'thread-reload-ending',
-        permission_mode: 'supervised',
+        permission_mode: 'read_only',
         narration_mode: 'auto',
         turn_count: 0,
         turn_in_flight: false,
@@ -10032,7 +10083,7 @@ describe('PersistentChatService — usage.updated telemetry', () => {
       if (url.endsWith('/state')) {
         const snapshot: Record<string, unknown> = {
           thread_id: threadId,
-          permission_mode: 'supervised',
+          permission_mode: 'read_only',
           narration_mode: 'auto',
           turn_count: 1,
           turn_in_flight: false,
@@ -13039,7 +13090,7 @@ describe('PersistentChatService — queue state (parked / poll / retry)', () => 
       if (url.endsWith(`/threads/${threadId}/state`)) {
         return of({
           thread_id: threadId,
-          permission_mode: 'supervised',
+          permission_mode: 'read_only',
           narration_mode: 'auto',
           turn_count: 2,
           turn_in_flight: false,

@@ -18,7 +18,7 @@ import {
     ViewChild,
     ViewChildren,
 } from '@angular/core';
-import {DatePipe, NgTemplateOutlet, TitleCasePipe} from '@angular/common';
+import {DatePipe, NgTemplateOutlet} from '@angular/common';
 import {HttpClient} from '@angular/common/http';
 import {FormsModule} from '@angular/forms';
 import {Router} from '@angular/router';
@@ -27,6 +27,7 @@ import {MarkdownComponent} from 'ngx-markdown';
 import {CitationRefDirective} from '../../core/markdown/citation-ref.directive';
 import {WorkspaceFileLinkDirective} from '../../core/markdown/workspace-file-link.directive';
 import {KatexDirective} from '../../core/markdown/katex.directive';
+import {PERMISSION_MODE_LABEL_KEYS} from '../../core/models/permission-mode';
 import {TranslocoPipe, TranslocoService} from '@jsverse/transloco';
 import {ChatAttachment, EndSessionOutcome, PermissionRequest, PersistentChatService, RewindPrefill, RunningToolInfo, ToolCallInfo, workspaceTierLabel,} from '../../core/services/persistent-chat.service';
 import {uploadSummary} from '../../core/services/upload-stage';
@@ -131,7 +132,8 @@ const SLASH_COMMANDS: SlashCommand[] = [
     {command: '/undo', descriptionKey: 'chat.slash.undo'},
     {command: '/rewind', descriptionKey: 'chat.slash.rewind'},
     {command: '/auto', descriptionKey: 'chat.slash.auto'},
-    {command: '/supervised', descriptionKey: 'chat.slash.supervised'},
+    // `/supervised` still works as a hidden alias of /readonly; it is not listed.
+    {command: '/readonly', descriptionKey: 'chat.slash.readonly'},
     {command: '/autonomous', descriptionKey: 'chat.slash.autonomous'},
     {command: '/silent', descriptionKey: 'chat.slash.silent'},
     {command: '/verbose', descriptionKey: 'chat.slash.verbose'},
@@ -937,7 +939,6 @@ export function clearDraft(threadId: string | null): void {
     imports: [
         FormsModule,
         NgTemplateOutlet,
-        TitleCasePipe,
         DatePipe,
         MarkdownComponent,
         ExternalImageDirective,
@@ -1021,7 +1022,7 @@ export function clearDraft(threadId: string | null): void {
             <app-badge tone="accent" size="sm" role="button" tabindex="0"
                        [title]="'chat.header.settingsTooltip' | transloco"
                        (click)="settingsRequested.emit(undefined)"
-                       (keydown.enter)="settingsRequested.emit(undefined)">{{ chat.permissionMode() | titlecase }}</app-badge>
+                       (keydown.enter)="settingsRequested.emit(undefined)">{{ permissionModeLabelKey() | transloco }}</app-badge>
 
             <!-- Transient conditions: conditional and usually absent, so they cost
                  nothing when nothing is wrong. -->
@@ -1964,7 +1965,8 @@ export function clearDraft(threadId: string | null): void {
             </ul>
             <div class="mile-actions">
               <app-button variant="success" size="sm" (clicked)="chat.approveAll()">{{ permissionApproveKey(chat.pendingPermissions().length) | transloco }}</app-button>
-              <app-button variant="info" size="sm" (clicked)="approveAndAutoAccept()">{{ 'chat.permission.autoAccept' | transloco }}</app-button>
+              <app-button variant="info" size="sm" [title]="'chat.permission.autoAcceptHint' | transloco"
+                          (clicked)="approveAndAutoAccept()">{{ 'chat.permission.autoAccept' | transloco }}</app-button>
               <app-button variant="danger" size="sm" (clicked)="chat.stop()">{{ 'chat.permission.stop' | transloco }}</app-button>
             </div>
           </div>
@@ -2870,6 +2872,9 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
     // unavailability disables it (fail-open: null/true ⇒ leave it enabled).
     // Read-aloud availability + playback now live in <app-read-aloud>.
     readonly sttUnavailable = computed(() => this.voiceCaps.stt() === false);
+
+    /** The header badge's mode label (the raw value would title-case to "Read_only"). */
+    readonly permissionModeLabelKey = computed(() => PERMISSION_MODE_LABEL_KEYS[this.chat.permissionMode()]);
 
     // Slash command autocomplete
     readonly showSlashMenu = signal(false);
@@ -4178,6 +4183,9 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
         }
     }
 
+    /** Approve every pending card, then stay in Auto-accept. Auto-accept still
+     *  asks before commands and irreversible or outbound actions, so the
+     *  button's copy never promises that nothing will ask again. */
     approveAndAutoAccept(): void {
         this.chat.setMode('auto_accept');
         this.chat.approveAll();

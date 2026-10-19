@@ -14,6 +14,7 @@ import {AppToastService} from '../../ui/toast';
 import {ErrorMessageService} from '../../core/services/error-message.service';
 import {UserService} from '../../core/services/user.service';
 import {Thread} from '../../core/models/api.model';
+import {DEFAULT_PERMISSION_MODE} from '../../core/models/permission-mode';
 import {VMCreationWaitComponent} from '../../core/components/vm-creation-wait.component';
 import {workspaceCreationMessageKey, workspaceCreationMessageParams} from '../../core/util/workspace-creation';
 import {SidebarToggleComponent} from '../../shell/sidebar-toggle/sidebar-toggle.component';
@@ -132,7 +133,7 @@ const ENDING_POLL_MAX_MS = 15_000;
           </app-form-field>
           <app-form-field [label]="'sessions.create.permissionLabel' | transloco">
             <app-select [(value)]="newPermission">
-              <option value="supervised">{{ 'sessions.create.permissionSupervised' | transloco }}</option>
+              <option value="read_only">{{ 'sessions.create.permissionReadOnly' | transloco }}</option>
               <option value="auto_accept">{{ 'sessions.create.permissionAutoAccept' | transloco }}</option>
               <option value="autonomous">{{ 'sessions.create.permissionAutonomous' | transloco }}</option>
             </app-select>
@@ -628,7 +629,7 @@ export class SessionsPageComponent implements OnInit {
     newTitle = '';
     newConfig = 'session_base';
     newModel = this.loadSavedSessionModel();
-    newPermission = 'supervised';
+    newPermission: string = DEFAULT_PERMISSION_MODE;
 
     filteredThreads = () => {
         const filter = this.statusFilter();

@@ -298,7 +298,7 @@ describe('JobReviewComponent delivery section', () => {
     expect(text).toContain('Pull request #1 · Open');
     expect(text).toContain('Review in session');
     expect(text).toContain('fresh sandbox');
-    expect(text).toContain('supervised');
+    expect(text).toContain('read-only session');
     expect(text).toContain('Job workspace');
     expect(text).not.toContain('Browse workspace in Gitea');
 

@@ -3,6 +3,7 @@
  */
 
 import type {EffectiveModels} from '../../core/models/api.model';
+import type {PermissionMode} from '../../core/models/permission-mode';
 import {JOB_TOOL_GROUP_CATEGORIES} from '../../core/tools/job-surface.generated';
 
 /**
@@ -105,12 +106,23 @@ export const CRITIC_ROUND_OPTIONS = [
   { value: 0, label: 'Unlimited' },
 ] as const;
 
-/** Permission mode options for sessions. */
+/** Permission mode options for sessions, most to least restrictive. The values
+ *  are `core/models/permission-mode.ts`'s; the UI renders the i18n copy under
+ *  `agentSettings.permissionModes.<value>`, these strings are its English twin. */
 export const PERMISSION_MODES = [
-  { value: 'supervised', label: 'Supervised', description: 'Agent asks for approval before executing commands' },
-  { value: 'auto_accept', label: 'Auto-accept', description: 'Auto-approve most actions, flag risky ones' },
-  { value: 'autonomous', label: 'Autonomous', description: 'Agent runs without asking for approval' },
-] as const;
+  {
+    value: 'read_only',
+    label: 'Read-only',
+    description:
+      'Reads, searches and browses freely. Asks before changing anything, acting outside the workspace, or running commands.',
+  },
+  {
+    value: 'auto_accept',
+    label: 'Auto-accept',
+    description: 'Changes workspace files freely. Asks before irreversible or outbound actions and commands.',
+  },
+  { value: 'autonomous', label: 'Autonomous', description: 'Runs every tool without asking.' },
+] as const satisfies readonly { value: PermissionMode; label: string; description: string }[];
 
 /** Image-quality tiers: resolution of images delivered to the model. Higher =
  *  more visual detail + more image tokens. Mirrors backend
