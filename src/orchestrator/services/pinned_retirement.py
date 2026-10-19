@@ -92,6 +92,12 @@ class PinnedRetirementOperations:
                 token=retirement["token"],
             )
             if retained is not None:
+                if not retained.allowed:
+                    self.dependencies.logger.warning(
+                        "Pinned retirement VM disk purge of thread %s refused: %s",
+                        thread_id,
+                        retained.reason,
+                    )
                 return retained if retained.allowed else None
         permit = await acquire_pinned_thread_retirement_cleanup_permit(
             self.dependencies.recovery_store,
@@ -99,6 +105,25 @@ class PinnedRetirementOperations:
             identity=identity,
             purge_disk=purge_disk,
         )
+        if (
+            not permit.allowed
+            and permit.reason == "workspace_cleanup_already_admitted"
+            and await self._finish_open_upgrade_abort(
+                thread_id, identity, getattr(permit, "admission_id", None)
+            )
+        ):
+            permit = await acquire_pinned_thread_retirement_cleanup_permit(
+                self.dependencies.recovery_store,
+                thread_id=thread_id,
+                identity=identity,
+                purge_disk=purge_disk,
+            )
+        if not permit.allowed:
+            self.dependencies.logger.warning(
+                "Pinned retirement VM cleanup of thread %s refused: %s",
+                thread_id,
+                permit.reason,
+            )
         if (
             permit.allowed
             and completed_cleanup_outcome(permit) == "identity_superseded"
@@ -115,6 +140,45 @@ class PinnedRetirementOperations:
                 retirement,
             )
         return permit if permit.allowed else None
+
+    async def _finish_open_upgrade_abort(
+        self, thread_id: str, identity: Any, admission_id: Any
+    ) -> bool:
+        """Finish the abort a failed VM upgrade left open on this VM (E4).
+
+        True when ``admission_id`` was the abort's own admission for exactly
+        this VM and its release is now complete, so the retirement's cleanup
+        can be admitted. Any other open admission still refuses it.
+        """
+        from orchestrator.services.vm_upgrade_abort_cleanup import (
+            is_open_upgrade_abort_admission,
+            release_aborted_upgrade_vm,
+        )
+
+        recovery_store = self.dependencies.recovery_store
+        try:
+            if not await is_open_upgrade_abort_admission(
+                recovery_store, thread_id, identity, admission_id
+            ):
+                return False
+            disposition = await release_aborted_upgrade_vm(
+                recovery_store, self.dependencies.vm_provisioner, thread_id, identity
+            )
+        except Exception as exc:
+            self.dependencies.logger.warning(
+                "Open VM upgrade abort of thread %s is not finished: %s",
+                thread_id,
+                exc,
+            )
+            return False
+        if disposition not in {"completed", "identity_superseded"}:
+            self.dependencies.logger.warning(
+                "Open VM upgrade abort of thread %s is not finished: %s",
+                thread_id,
+                disposition,
+            )
+            return False
+        return True
 
     async def _complete_vm_cleanup(self, permit: Any, outcome: str) -> None:
         if outcome in {"completed", "identity_superseded"}:

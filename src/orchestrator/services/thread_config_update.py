@@ -93,12 +93,7 @@ from orchestrator.services.session_runtime_admission import (
     thread_runtime_authority,
 )
 from orchestrator.services.workspace_tier_policy import thread_workspace_backend
-from orchestrator.services.vm_workspace_recovery_store import (
-    acquire_vm_cleanup_permit,
-    vm_cleanup_kwargs,
-    completed_cleanup_outcome,
-    complete_vm_cleanup_permit,
-)
+from orchestrator.services.vm_upgrade_abort_cleanup import release_aborted_upgrade_vm
 from shared.backend_kinds import LITE_BACKENDS, VM_BACKENDS
 from shared.connectors.builtin import IMAGE_DRIVER_SPEC, spec_for_row
 from shared.run_queue import LANE_PINNED, LANE_STATELESS
@@ -1447,36 +1442,9 @@ async def agent_abort_thread_vm_upgrade(
             identity = await vm_provisioner.capture_vm_teardown_identity(
                 thread_id, entity_type="thread"
             )
-            cleanup = await acquire_vm_cleanup_permit(
-                dependencies.recovery_store,
-                owner_kind="thread",
-                owner_id=thread_id,
-                identity=identity,
-                source="abort_thread_vm_upgrade",
-                purge_disk=True,
+            disposition = await release_aborted_upgrade_vm(
+                dependencies.recovery_store, vm_provisioner, thread_id, identity
             )
-            if not cleanup.allowed:
-                raise RuntimeError("VM cleanup held for workspace recovery")
-            disposition = completed_cleanup_outcome(cleanup)
-            if disposition is None:
-                outcome = await vm_provisioner.release_vm_captured(
-                    thread_id,
-                    identity,
-                    entity_type="thread",
-                    purge_disk=True,
-                    capture_snapshot=False,
-                    **vm_cleanup_kwargs(cleanup),
-                )
-                disposition = outcome.disposition
-                if disposition in {"completed", "identity_superseded"}:
-                    # A quota-charged (v3) VM's permit completes only with the
-                    # provisioner's stop attestation (E4).
-                    await complete_vm_cleanup_permit(
-                        dependencies.recovery_store,
-                        cleanup,
-                        outcome=disposition,
-                        provisioner=vm_provisioner,
-                    )
             deleted = disposition == "completed"
         except Exception as e:
             logger.warning(

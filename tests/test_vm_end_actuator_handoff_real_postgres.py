@@ -462,6 +462,121 @@ async def test_upgraded_vm_crash_recovery_ends_past_the_virtual_binding_it_kept(
     assert (await db.get_thread(ids["thread"]))["status"] == "ended"
 
 
+async def _crash_recovery_behind_an_open_admission(
+    db, monkeypatch, source, *, release_fails=False
+):
+    """The dev shape of 06f21b14: End captured the VM, the agent is gone, and
+    an admission of ``source`` for that VM was left open. Returns the sources
+    the VM was released under, the admission and whether recovery settled."""
+    from orchestrator.services.vm_provisioner import VMTeardownIdentity
+    from orchestrator.services.vm_workspace_recovery_store import (
+        VMWorkspaceRecoveryStore,
+        acquire_vm_cleanup_permit,
+    )
+
+    ids, retirement, _, events, _, vm_provider = await scenario(
+        db, monkeypatch, binding=_virtual_binding()
+    )
+    vm = retirement["context"]["vm"]
+    open_admission = await acquire_vm_cleanup_permit(
+        VMWorkspaceRecoveryStore(db),
+        owner_kind="thread",
+        owner_id=ids["thread"],
+        identity=VMTeardownIdentity(
+            provision_generation=vm["provision_generation"],
+            vm_uid=vm["vm_uid"],
+            rootdisk_pvc_uid=vm["rootdisk_pvc_uid"],
+        ),
+        source=source,
+        purge_disk=True,
+    )
+    assert open_admission.allowed
+    released = []
+
+    async def release_vm(thread_id, identity, **kwargs):
+        released.append(kwargs["parent_cleanup"]["intent"]["source"])
+        if release_fails:
+            raise RuntimeError("captured rootdisk cleanup is still reconciling")
+        await db.record_managed_repository_workspace_process_zero(
+            thread_id,
+            owner_kind="thread",
+            scope="vm",
+            provisioner="vm",
+            runtime_incarnation=identity.provision_generation,
+        )
+        await db.merge_thread_vm_context_if_provision_generation(
+            thread_id,
+            identity.provision_generation,
+            {"status": "retiring_process_zero"},
+        )
+        return VMTeardownResult("completed", True)
+
+    vm_provider.release_vm_captured = release_vm
+    await db.execute(
+        "UPDATE agents SET status='offline' WHERE id=$1::uuid", ids["agent"]
+    )
+    candidates = await db.list_retryable_pinned_retirements(grace_seconds=0)
+    assert len(candidates) == 1
+    settled = await detector.retry_pending_pinned_retirement(
+        candidates[0],
+        dependencies=composition.stale_agent_detector_dependencies(
+            main.app.state.resources
+        ),
+    )
+    admission = await db.fetchrow(
+        "SELECT completed_at, outcome FROM vm_workspace_cleanup_admissions WHERE id=$1",
+        open_admission.admission_id,
+    )
+    thread = await db.get_thread(ids["thread"])
+    return released, admission, settled and thread["status"] == "ended"
+
+
+@pytest.mark.asyncio
+async def test_crash_recovery_finishes_the_abort_a_failed_upgrade_left_open(
+    db, monkeypatch
+):
+    """E4 part 3: the abort's open permit no longer blocks crash recovery."""
+    released, admission, ended = await _crash_recovery_behind_an_open_admission(
+        db, monkeypatch, "abort_thread_vm_upgrade"
+    )
+
+    assert released == ["abort_thread_vm_upgrade", "pinned_thread_retirement"]
+    assert admission["completed_at"] is not None
+    assert admission["outcome"] == "completed"
+    assert ended
+
+
+@pytest.mark.asyncio
+async def test_an_abort_recovery_cannot_finish_yet_keeps_it_open_and_says_why(
+    db, monkeypatch, caplog
+):
+    with caplog.at_level("WARNING"):
+        released, admission, ended = await _crash_recovery_behind_an_open_admission(
+            db, monkeypatch, "abort_thread_vm_upgrade", release_fails=True
+        )
+
+    assert released == ["abort_thread_vm_upgrade"]
+    assert admission["completed_at"] is None
+    assert not ended
+    assert "still reconciling" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_crash_recovery_says_why_another_open_admission_blocks_it(
+    db, monkeypatch, caplog
+):
+    """Only the abort's own admission is finished; any other blocks, logged."""
+    with caplog.at_level("WARNING"):
+        released, admission, ended = await _crash_recovery_behind_an_open_admission(
+            db, monkeypatch, "controller_vm_create"
+        )
+
+    assert released == []
+    assert admission["completed_at"] is None
+    assert not ended
+    assert "workspace_cleanup_already_admitted" in caplog.text
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "binding",

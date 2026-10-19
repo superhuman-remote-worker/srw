@@ -25,6 +25,7 @@ import pytest
 # (``orchestrator.application.sessions``) reads the provisioner singleton from
 # its owning module and the store from ``app.state.resources`` at call time.
 from orchestrator.services import thread_config_update  # noqa: E402
+from orchestrator.services import vm_upgrade_abort_cleanup  # noqa: E402
 
 import orchestrator.main as orch_main
 from orchestrator.application import sessions as sessions_composition
@@ -192,7 +193,9 @@ class TestAbortThreadVmUpgrade:
         db = _db(_installed())
         prov = _provisioner(available=True, delete_result=True)
         complete = AsyncMock()
-        with patch.object(thread_config_update, "complete_vm_cleanup_permit", complete):
+        with patch.object(
+            vm_upgrade_abort_cleanup, "complete_vm_cleanup_permit", complete
+        ):
             await _abort(db, prov)
 
         complete.assert_awaited_once()
