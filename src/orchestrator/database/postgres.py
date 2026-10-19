@@ -276,6 +276,17 @@ _DOCKER_WORKSPACE_TRANSITION_PRESERVED_FIELDS = _DOCKER_WORKSPACE_PRESERVED_FIEL
 # Terminal checkpoint prune batch size. An unbounded single-statement DELETE is
 # what got cancelled under bloat on 2026-07-27 (Defect 6); batching makes the
 # prune insensitive to row count. The max-batches value is a runaway guard.
+# C2 (spec D3): a stateless -> VM lane switch leaves its upgrade request for
+# the first pinned owner. While no agent has taken it (no adoption, no receipt)
+# it has no consumer to strand, so ending that life passes it: Begin, and the
+# zero-admission receipt the retirement then needs. It stays pending; Resume
+# (0185) re-stamps it and the next owner rejects it as ``upgrade_cancelled``.
+# ``r`` is the thread_control_requests row; callers bind the verb.
+_UNTAKEN_REQUEST_SQL = (
+    "(r.outcome IS NULL AND r.accepted_agent_id IS NULL AND NOT EXISTS ("
+    "SELECT 1 FROM thread_events receipt WHERE receipt.thread_id=r.thread_id "
+    "AND receipt.control_request_id=r.id))"
+)
 _CHECKPOINT_DELETE_BATCH = 1000
 _CHECKPOINT_DELETE_MAX_BATCHES = 1000
 _CHECKPOINT_RETENTION_SOURCE_PREFIX = "checkpoint_retention_prune:v1:"
@@ -43227,22 +43238,28 @@ class PostgresDB:
                 # row serializes this proof with public control admission.
                 # One exception (C2, spec D3): a stateless -> VM lane switch
                 # leaves its upgrade request pending for the first pinned
-                # owner.  With no owner bound there is no consumer to strand,
-                # so End settles past it; Resume (0185) re-stamps it and the
-                # next owner rejects its older payload generation as
-                # ``upgrade_cancelled``.  Suspend still waits: skipping there
-                # would cancel the upgrade on Resume.
+                # owner.  With no owner bound, or a bound one that never took
+                # it (its attach can fail first), there is no consumer to
+                # strand, so End settles past it (_UNTAKEN_REQUEST_SQL);
+                # Resume (0185) re-stamps it and the next owner rejects its
+                # older payload generation as ``upgrade_cancelled``.  An agent
+                # can't take it after this token: its fence and adoption both
+                # require no retirement token.  Suspend still waits: skipping
+                # there would cancel the upgrade on Resume.
                 from shared.workspace_upgrade import WORKSPACE_UPGRADE_VERB
 
                 if await conn.fetchval(
-                    "SELECT EXISTS (SELECT 1 FROM thread_control_requests "
-                    "WHERE thread_id=$1::uuid AND outcome IS NULL "
-                    "AND runtime_generation=$2::uuid "
-                    "AND NOT ($3::boolean AND verb=$4))",
+                    "SELECT EXISTS (SELECT 1 FROM thread_control_requests r "
+                    "WHERE r.thread_id=$1::uuid AND r.outcome IS NULL "
+                    "AND r.runtime_generation=$2::uuid "
+                    "AND NOT ($3::boolean AND r.verb=$4 AND ($5::boolean OR "
+                    + _UNTAKEN_REQUEST_SQL
+                    + ")))",
                     parsed_thread_id,
                     UUID(generation),
-                    settle_status == "ended" and thread.get("agent_id") is None,
+                    settle_status == "ended",
                     WORKSPACE_UPGRADE_VERB,
+                    thread.get("agent_id") is None,
                 ):
                     return {
                         "state": "conflict",
@@ -44472,6 +44489,30 @@ class PostgresDB:
             )
         )
 
+    @staticmethod
+    async def _admitted_control_on_conn(
+        conn: Any, thread_id: UUID, generation: UUID, *, settles_ended: bool
+    ) -> bool:
+        """Whether this life admitted control work its zero receipt must wait for.
+
+        Every request of the generation counts, applied or not, except, when
+        the life is ending, the upgrade request Begin passed because no agent
+        took it (_UNTAKEN_REQUEST_SQL).
+        """
+        from shared.workspace_upgrade import WORKSPACE_UPGRADE_VERB
+
+        return bool(
+            await conn.fetchval(
+                "SELECT EXISTS (SELECT 1 FROM thread_control_requests r "
+                "WHERE r.thread_id=$1::uuid AND r.runtime_generation=$2::uuid "
+                "AND NOT ($3::boolean AND r.verb=$4 AND " + _UNTAKEN_REQUEST_SQL + "))",
+                thread_id,
+                generation,
+                settles_ended,
+                WORKSPACE_UPGRADE_VERB,
+            )
+        )
+
     async def acknowledge_pinned_thread_local_quiescence(
         self,
         thread_id: str,
@@ -44577,11 +44618,11 @@ class PostgresDB:
                         expected_agent_pod_uid,
                         str(row["status"] or "") == "active",
                     )
-                    admitted_control = await conn.fetchval(
-                        "SELECT EXISTS (SELECT 1 FROM thread_control_requests "
-                        "WHERE thread_id=$1::uuid AND runtime_generation=$2::uuid)",
+                    admitted_control = await self._admitted_control_on_conn(
+                        conn,
                         parsed_thread,
                         parsed_generation,
+                        settles_ended=expected_settle_status == "ended",
                     )
                     if used_input or admitted_control:
                         return None
@@ -44697,11 +44738,11 @@ class PostgresDB:
                             expected_agent_pod_uid,
                             str(row["status"] or "") == "active",
                         )
-                        admitted_control = await conn.fetchval(
-                            "SELECT EXISTS (SELECT 1 FROM thread_control_requests "
-                            "WHERE thread_id=$1::uuid AND runtime_generation=$2::uuid)",
+                        admitted_control = await self._admitted_control_on_conn(
+                            conn,
                             parsed_thread,
                             parsed_generation,
+                            settles_ended=expected_settle_status == "ended",
                         )
                         if used_input or admitted_control:
                             return None

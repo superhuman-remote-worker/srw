@@ -1138,12 +1138,95 @@ async def assert_end_refused(database, monkeypatch, thread_id, **options):
 
 
 @pytest.mark.asyncio
-async def test_end_still_waits_for_a_bound_agent_to_take_the_upgrade_request(
+async def test_end_passes_an_upgrade_request_the_bound_agent_never_took(
+    database, actor
+):
+    """Dev 2026-10-18 (E2): the warm agent's attach failed before it adopted
+    the request, and End refused while that agent stayed bound. A request no
+    agent took has no consumer to strand: End passes it and leaves it pending
+    for the next owner to cancel, as with no agent bound. (That the retirement
+    then finishes is pinned in tests/test_lite_pinned_actor_exit_real_postgres.py.)"""
+    thread_id, admitted = await switched(database, actor)
+    await _bind_cold_agent(database, thread_id)
+
+    begun = await database.begin_pinned_thread_retirement(
+        str(thread_id), permanent=False
+    )
+
+    assert begun["state"] == "pending"
+    [request] = await upgrade_requests(database, thread_id)
+    assert (request["id"], request["outcome"], request["accepted_agent_id"]) == (
+        admitted.id,
+        None,
+        None,
+    )
+
+
+@pytest.mark.asyncio
+async def test_end_still_waits_for_an_upgrade_request_the_bound_agent_took(
     database, actor, monkeypatch
 ):
     thread_id, _ = await switched(database, actor)
-    await _bind_cold_agent(database, thread_id)
+    bound = await _bind_cold_agent(database, thread_id)
+    async with database.acquire() as conn:
+        async with conn.transaction():
+            assert await adopt_next_pinned_control_request(conn, **_owner(bound))
     await assert_end_refused(database, monkeypatch, thread_id, force=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "case, counts",
+    [
+        ("untaken_ending", False),
+        ("untaken_suspending", True),
+        ("taken_ending", True),
+        ("other_verb_ending", True),
+    ],
+)
+async def test_zero_admission_ignores_only_an_untaken_upgrade_of_an_ending_life(
+    database, actor, case, counts
+):
+    """The receipt End's retirement needs passes exactly what Begin passed."""
+    thread_id, _ = await switched(database, actor)
+    bound = await _bind_cold_agent(database, thread_id)
+    if case == "taken_ending":
+        async with database.acquire() as conn:
+            async with conn.transaction():
+                assert await adopt_next_pinned_control_request(conn, **_owner(bound))
+    if case == "other_verb_ending":
+        await database.execute(
+            "INSERT INTO thread_control_requests (thread_id, request_seq, "
+            "client_request_id, verb, payload, requested_by) VALUES ($1::uuid, "
+            "1000, $2, 'mode.set', '{\"mode\": \"supervised\"}'::jsonb, 'real-pg')",
+            thread_id,
+            uuid4(),
+        )
+
+    async with database.acquire() as conn:
+        admitted = await database._admitted_control_on_conn(
+            conn,
+            UUID(str(thread_id)),
+            UUID(str(bound["runtime_generation"])),
+            settles_ended=case != "untaken_suspending",
+        )
+
+    assert admitted is counts
+
+
+@pytest.mark.asyncio
+async def test_suspend_still_waits_for_an_upgrade_request_no_agent_took(
+    database, actor
+):
+    """Skipping on Suspend would cancel the upgrade on Resume (spec D3)."""
+    thread_id, _ = await switched(database, actor)
+    await _bind_cold_agent(database, thread_id)
+
+    begun = await database.begin_pinned_thread_retirement(
+        str(thread_id), permanent=False, settle_status="suspended"
+    )
+
+    assert begun == {"state": "conflict", "reason": "pending_control_requests"}
 
 
 @pytest.mark.asyncio
