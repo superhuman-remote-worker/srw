@@ -179,6 +179,20 @@ def _active_subagents_state(tool_context: Optional[Any]) -> Optional[str]:
     return str(value or "").strip()
 
 
+def _current_permission_mode(callbacks: Any) -> Optional[str]:
+    """The session's permission mode for the planner; None leaves the section
+    alone (no callback, or it failed — the mode is prompt context only)."""
+    read = getattr(callbacks, "current_permission_mode", None)
+    if not callable(read):
+        return None
+    try:
+        value = read()
+    except Exception:
+        logger.debug("Failed to read the permission mode", exc_info=True)
+        return None
+    return str(value) if value else None
+
+
 def _sanitize_ai_response(response: AIMessage) -> AIMessage:
     """Normalize AI message for Responses API compatibility.
 
@@ -557,6 +571,12 @@ class PersistentLoopCallbacks:
     # size, which drives the cockpit's CTX gauge
     # (knowledge-base/knowledge/features/context_summarization_rework.md S5). Optional.
     on_usage: Optional[Callable[[Dict[str, Any]], Awaitable[None]]] = None
+
+    # The session's current permission mode, read before every provider call
+    # so the model is told when the user changes it (an appended context
+    # entry; tool_permission_tiers.md, D13). None for loops without one
+    # (subagents).
+    current_permission_mode: Optional[Callable[[], Optional[str]]] = None
 
     # Set by the transport alongside a "hard" interrupt so the loop can cancel
     # a blocked LLM / auxiliary await immediately — the cooperative
@@ -2936,6 +2956,7 @@ async def _execute_turn(
             replace(
                 context_sources,
                 subagents=_active_subagents_state(tool_context),
+                permission_mode=_current_permission_mode(callbacks),
             ),
             model=getattr(config.llm, "model", None),
             max_memories=max_memories_per_entry(config),

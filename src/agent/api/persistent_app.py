@@ -1271,6 +1271,7 @@ def _ensure_persistent_loop_started(
             on_tool_result=_loop_on_tool_result,
             permission_check=_loop_permission_check,
             announce_permission_batch=_loop_announce_permission_batch,
+            current_permission_mode=_loop_current_permission_mode,
             on_turn_start=_loop_on_turn_start,
             on_turn_complete=_loop_on_turn_complete,
             on_error=_loop_on_error,
@@ -6904,6 +6905,11 @@ async def _resolve_pending_permission(
     except Exception as e:
         logger.warning("Resolve pending permission failed: %s", e)
         return None
+
+
+def _loop_current_permission_mode() -> Optional[str]:
+    """The live session's permission mode, which the model is told about."""
+    return _session.permission_mode if _session is not None else None
 
 
 async def _loop_permission_check(

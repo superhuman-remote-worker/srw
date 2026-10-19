@@ -691,6 +691,46 @@ class TestGuidance:
         assert planned.entries == []
 
 
+# --- Permission mode (tool_permission_tiers.md, D13) --------------------------------
+
+
+class TestPermissionMode:
+    def test_no_source_appends_nothing(self):
+        assert plan(base_history(), ContextSources()).entries == []
+
+    def test_told_once_at_session_start(self):
+        planned = plan(base_history(), ContextSources(permission_mode="read_only"))
+
+        assert kinds(planned) == ["permission_mode"]
+        assert "Permission mode: Read-only." in planned.entries[0].content
+
+    def test_not_repeated_while_unchanged(self):
+        history = base_history()
+        history += plan(history, ContextSources(permission_mode="read_only")).entries
+
+        assert plan(history, ContextSources(permission_mode="read_only")).entries == []
+
+    def test_the_legacy_spelling_is_the_same_state(self):
+        history = base_history()
+        history += plan(history, ContextSources(permission_mode="supervised")).entries
+
+        assert plan(history, ContextSources(permission_mode="read_only")).entries == []
+
+    def test_a_change_is_told(self):
+        history = base_history()
+        history += plan(history, ContextSources(permission_mode="read_only")).entries
+
+        changed = plan(history, ContextSources(permission_mode="auto_accept"))
+
+        assert kinds(changed) == ["permission_mode"]
+        assert "Permission mode: Auto-accept." in changed.entries[0].content
+
+    def test_an_unknown_mode_appends_nothing(self):
+        assert (
+            plan(base_history(), ContextSources(permission_mode="bogus")).entries == []
+        )
+
+
 # --- Whole plans ----------------------------------------------------------------------
 
 
@@ -703,6 +743,7 @@ def _all_sources(turn: int = 4) -> ContextSources:
         failed_citations=[citation("c1")],
         guidance=[guidance("g1", "Steer.")],
         subagents=SUBAGENTS,
+        permission_mode="read_only",
         turn_boundary=BOUNDARY,
         turn=turn,
     )
@@ -862,3 +903,46 @@ def test_item_kinds_never_list_an_item_twice_in_one_entry(kind):
         i["key"] for i in entry_meta(only(plan(base_history(), sources), kind))["items"]
     ]
     assert len(keys) == len(set(keys)) == 2
+
+
+class TestSessionLoopReadsTheMode:
+    def test_reads_the_callback(self):
+        from types import SimpleNamespace
+
+        from agent.persistent_graph import _current_permission_mode
+
+        assert _current_permission_mode(
+            SimpleNamespace(current_permission_mode=lambda: "auto_accept")
+        ) == ("auto_accept")
+
+    def test_no_callback_or_a_failing_one_leaves_the_section_alone(self):
+        from types import SimpleNamespace
+
+        from agent.persistent_graph import _current_permission_mode
+
+        def boom():
+            raise RuntimeError("gone")
+
+        assert _current_permission_mode(SimpleNamespace()) is None
+        assert (
+            _current_permission_mode(SimpleNamespace(current_permission_mode=boom))
+            is None
+        )
+        assert (
+            _current_permission_mode(
+                SimpleNamespace(current_permission_mode=lambda: None)
+            )
+            is None
+        )
+
+    def test_the_session_app_wires_its_live_mode(self):
+        from unittest.mock import patch
+
+        import agent.api.persistent_app as pa
+
+        with patch.object(pa, "_session", None):
+            assert pa._loop_current_permission_mode() is None
+        with patch.object(
+            pa, "_session", type("S", (), {"permission_mode": "read_only"})()
+        ):
+            assert pa._loop_current_permission_mode() == "read_only"

@@ -258,6 +258,8 @@ class ContextSources:
       the ids already delivered (spec §C, D21).
     - ``subagents``: the rendered active-subagents block; None when there is
       no subagent runtime, "" when none is running.
+    - ``permission_mode``: the session's permission mode (D13 of
+      tool_permission_tiers.md); None on workers and subagents.
     - ``turn_boundary``: the rendered App Guide turn boundary ("" when off);
       ``turn`` the session turn id (None on workers).
     """
@@ -272,6 +274,7 @@ class ContextSources:
     guidance: Sequence[Mapping[str, Any]] = ()
     delivered_guidance_ids: Collection[str] = ()
     subagents: Optional[str] = None
+    permission_mode: Optional[str] = None
     turn_boundary: str = ""
     turn: Optional[int] = None
 
@@ -532,6 +535,33 @@ def _plan_subagents(
     )
 
 
+def format_permission_mode(mode: Optional[str], model: Optional[str] = None) -> str:
+    """What the model is told about a permission mode; "" for an unknown one."""
+    from shared.permission_modes import PERMISSION_MODES, normalize_permission_mode
+    from shared.runtime.services.guardrails import format_nudge
+
+    mode = normalize_permission_mode(mode)
+    if mode not in PERMISSION_MODES:
+        return ""
+    return format_nudge(f"permission_mode_{mode}", model=model)
+
+
+def _plan_permission_mode(
+    sources: ContextSources,
+    presence: Presence,
+    *,
+    model: Optional[str],
+) -> Optional[HumanMessage]:
+    """State mode: told at session start, after a compaction removed it, and
+    whenever the user changes the mode."""
+    if sources.permission_mode is None:
+        return None
+    body = format_permission_mode(sources.permission_mode, model)
+    return _plan_state(
+        "permission_mode", body, presence, has_state=bool(body), turn=sources.turn
+    )
+
+
 def _plan_turn_boundary(
     sources: ContextSources, presence: Presence
 ) -> Optional[HumanMessage]:
@@ -603,6 +633,9 @@ def plan_context_entries(
         "citation": lambda: _plan_citation(sources, presence, model=model),
         "guidance": lambda: _plan_guidance(sources, presence, planned),
         "subagents": lambda: _plan_subagents(sources, presence, model=model),
+        "permission_mode": lambda: _plan_permission_mode(
+            sources, presence, model=model
+        ),
         "turn_boundary": lambda: _plan_turn_boundary(sources, presence),
     }
     for kind in INJECTION_KINDS:
@@ -627,6 +660,7 @@ __all__ = [
     "Planned",
     "Presence",
     "format_active_subagents_none",
+    "format_permission_mode",
     "guidance_item",
     "guidance_text",
     "knowledge_item",

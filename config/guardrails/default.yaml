@@ -358,6 +358,13 @@ nudges:
   # all finished.
   active_subagents_none: "No background subagents are active any more. The earlier subagent status list no longer applies."
 
+  # Sites: src/agent/core/context_injection.py format_permission_mode. The
+  # session's permission mode, appended at session start and whenever the
+  # user changes it (tool_permission_tiers.md, D13).
+  permission_mode_read_only: "Permission mode: Read-only. Reads, searches, web research and browsing run without asking. Changing files or data, actions outside the workspace (deleting, sending or drafting mail, pushing, database writes, jobs, delegating to a subagent) and shell commands wait for the user's approval; a call the user declines returns \"User declined this tool call.\" The user can change the mode at any time."
+  permission_mode_auto_accept: "Permission mode: Auto-accept. Reads and workspace file changes run without asking. Irreversible or outbound actions (deleting, sending or drafting mail, pushing, database writes, jobs, delegating to a subagent) and shell commands wait for the user's approval. The user can change the mode at any time."
+  permission_mode_autonomous: "Permission mode: Autonomous. Every tool runs without waiting for the user's approval. The user can change the mode at any time."
+
   # ----- src/agent/persistent_graph.py -----
 
   empty_response_recovery: "⚠ The model returned an empty response. Please try again or switch models."

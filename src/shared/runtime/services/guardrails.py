@@ -66,6 +66,10 @@ KNOWN_NUDGES: Dict[str, Set[str]] = {
     # context_injection.py (append-only cleared renderings)
     "citation_feedback_resolved": set(),
     "active_subagents_none": set(),
+    # src/agent/core/context_injection.py (the session's permission mode)
+    "permission_mode_read_only": set(),
+    "permission_mode_auto_accept": set(),
+    "permission_mode_autonomous": set(),
     # src/persistent_graph.py
     "empty_response_recovery": set(),
     # src/tools/context.py, src/tools/registry.py, src/tools/workspace/files.py

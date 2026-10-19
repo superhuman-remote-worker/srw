@@ -86,6 +86,7 @@ INJECTION_KINDS = (
     "citation",
     "guidance",
     "subagents",
+    "permission_mode",
     "turn_boundary",
 )
 # Kinds whose entries list per-item keys and hashes (presence by item); the

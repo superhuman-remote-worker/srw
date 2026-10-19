@@ -152,6 +152,7 @@ class TestSchema:
             "citation",
             "guidance",
             "subagents",
+            "permission_mode",
             "turn_boundary",
         )
 
