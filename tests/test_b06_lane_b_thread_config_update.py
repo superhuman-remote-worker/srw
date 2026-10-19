@@ -468,6 +468,24 @@ class TestUpgradeToVm:
         }
 
 
+VM_GENERATION = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+
+
+def _installed_deps(**over: Any) -> tcu.ThreadConfigUpdateDependencies:
+    """A Session with an installed VM (``metadata.vm`` names its generation)."""
+    store = {
+        "get_thread": AsyncMock(
+            return_value=_pinned_thread(
+                metadata={"vm": {"provision_generation": VM_GENERATION}}
+            )
+        ),
+        "undo_thread_vm_upgrade": AsyncMock(return_value=False),
+        "merge_thread_vm_context_if_provision_generation": AsyncMock(return_value=True),
+        **over.pop("store", {}),
+    }
+    return _deps(store=store, **over)
+
+
 class TestAbortVmUpgrade:
     @pytest.mark.asyncio
     async def test_workspace_recovery_blocks_abort_vm_external_delete(self):
@@ -478,7 +496,7 @@ class TestAbortVmUpgrade:
                 reason="workspace_recovery_unresolved",
             )
         )
-        deps = _deps(recovery_store=recovery_store)
+        deps = _installed_deps(recovery_store=recovery_store)
         deps.vm_provisioner.capture_vm_teardown_identity = AsyncMock(
             return_value=SimpleNamespace(
                 provision_generation="aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
@@ -499,7 +517,7 @@ class TestAbortVmUpgrade:
 
     @pytest.mark.asyncio
     async def test_unproven_teardown_is_503_and_never_stamps_aborted(self):
-        deps = _deps()
+        deps = _installed_deps()
         deps.vm_provisioner.release_vm_captured = AsyncMock(
             return_value=SimpleNamespace(disposition="process_zero_unproven")
         )
@@ -512,11 +530,12 @@ class TestAbortVmUpgrade:
             "code": "vm_process_zero_unproven",
             "retryable": True,
         }
-        deps.store.merge_thread_vm_context.assert_not_awaited()
+        deps.store.undo_thread_vm_upgrade.assert_not_awaited()
+        deps.store.merge_thread_vm_context_if_provision_generation.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_a_raising_delete_is_also_unproven(self):
-        deps = _deps()
+        deps = _installed_deps()
         deps.vm_provisioner.release_vm_captured = AsyncMock(
             side_effect=RuntimeError("x")
         )
@@ -528,7 +547,7 @@ class TestAbortVmUpgrade:
 
     @pytest.mark.asyncio
     async def test_proven_teardown_stamps_aborted(self):
-        deps = _deps()
+        deps = _installed_deps()
         result = await tcu.agent_abort_thread_vm_upgrade(
             MagicMock(), THREAD, dependencies=deps
         )
@@ -537,8 +556,11 @@ class TestAbortVmUpgrade:
             "thread_id": THREAD,
             "vm_deleted": True,
         }
-        deps.store.merge_thread_vm_context.assert_awaited_once_with(
-            THREAD, {"status": "aborted"}
+        deps.store.undo_thread_vm_upgrade.assert_awaited_once_with(
+            THREAD, provision_generation=VM_GENERATION
+        )
+        deps.store.merge_thread_vm_context_if_provision_generation.assert_awaited_once_with(
+            THREAD, VM_GENERATION, {"status": "aborted"}
         )
 
 

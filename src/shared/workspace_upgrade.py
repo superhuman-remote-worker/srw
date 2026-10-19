@@ -53,6 +53,9 @@ VM_UPGRADE_SEED_SEEDED = "seeded"
 #: The copy's source is permanently gone: nothing is owed any more, and the
 #: upgrade reads as ``upgrade_interrupted`` (the files stay in the old storage).
 VM_UPGRADE_SEED_INTERRUPTED = "interrupted"
+#: E4: what the VM install of an upgrade from the virtual tier replaced, inside
+#: ``metadata.vm``; a completed abort restores it.
+VM_UPGRADE_SOURCE_KEY = "upgrade_source"
 _VM_UPGRADE_SEED_STATES = frozenset(
     {VM_UPGRADE_SEED_PENDING, VM_UPGRADE_SEED_SEEDED, VM_UPGRADE_SEED_INTERRUPTED}
 )
@@ -158,6 +161,7 @@ __all__ = [
     "VM_UPGRADE_SEED_KEY",
     "VM_UPGRADE_SEED_PENDING",
     "VM_UPGRADE_SEED_SEEDED",
+    "VM_UPGRADE_SOURCE_KEY",
     "WORKSPACE_UPGRADE_FAILURE_CODES",
     "WORKSPACE_UPGRADE_PAYLOAD_KEYS",
     "WORKSPACE_UPGRADE_SEED_CAPABILITY",

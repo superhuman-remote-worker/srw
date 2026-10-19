@@ -700,7 +700,12 @@ class TestInternalConfigRoutes:
         assert response.json()["detail"] == {"code": "vm_provision_authority_changed"}
 
     def test_an_unproven_vm_teardown_is_a_retryable_503(self):
-        deps = _config_deps()
+        installed = {
+            "vm": {"provision_generation": "33333333-3333-4333-8333-333333333333"}
+        }
+        deps = _config_deps(
+            store={"get_thread": AsyncMock(return_value=_thread(metadata=installed))}
+        )
         deps.vm_provisioner.delete_thread_vm = AsyncMock(return_value=False)
         response = _client(config=deps).post(
             f"/api/agents/threads/{THREAD}/abort-vm-upgrade"

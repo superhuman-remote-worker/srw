@@ -12,6 +12,7 @@ This is the canonical database layer for the orchestrator.
 
 import asyncio
 import base64
+import copy
 import functools
 import hashlib
 import inspect
@@ -169,6 +170,7 @@ from shared.workspace_contract import (
     workspace_contract_authority_identity,
     workspace_contract_projection,
 )
+from shared.workspace_upgrade import VM_UPGRADE_SOURCE_KEY
 from shared.pinned_job_delivery import (
     pinned_resume_consumed_keys,
     pinned_resume_input_digests,
@@ -26815,7 +26817,29 @@ class PostgresDB:
                     "vm",
                 }:
                     return False
+                upgrade_source = None
                 if contract.assigned_backend != "vm":
+                    if contract.assigned_backend == "virtual":
+                        # E4: what this UPDATE replaces, for a completed abort
+                        # to restore (undo_thread_vm_upgrade). Copied before
+                        # any of it changes below.
+                        binding = metadata.get("_workspace_binding")
+                        upgrade_source = {
+                            "backend": "virtual",
+                            "workspace": copy.deepcopy(
+                                (metadata.get("config_override") or {}).get(
+                                    "workspace"
+                                )
+                            ),
+                            "workspace_contract": copy.deepcopy(
+                                metadata.get(WORKSPACE_CONTRACT_CONTEXT_KEY)
+                            ),
+                            "binding": (
+                                copy.deepcopy(binding)
+                                if canonical_virtual_binding(binding)
+                                else None
+                            ),
+                        }
                     metadata[WORKSPACE_CONTRACT_CONTEXT_KEY] = {
                         "version": 1,
                         "requested_backend": "vm",
@@ -26843,6 +26867,8 @@ class PostgresDB:
                         metadata.pop("_workspace_binding")
 
                 next_vm = {**(current_vm or {}), **proposed}
+                if upgrade_source is not None:
+                    next_vm[VM_UPGRADE_SOURCE_KEY] = upgrade_source
                 metadata["vm"] = next_vm
                 result = await conn.execute(
                     "UPDATE threads SET metadata=$2::jsonb,"
@@ -27042,6 +27068,93 @@ class PostgresDB:
             )
 
         return result == "UPDATE 1"
+
+    async def undo_thread_vm_upgrade(
+        self, thread_id: str, *, provision_generation: str
+    ) -> bool:
+        """Make a Session whose VM upgrade was aborted a virtual Session again.
+
+        E4: the caller has released that VM generation. When its install
+        recorded what it replaced (an upgrade from the virtual tier), restore
+        the workspace config, contract and binding and drop ``metadata.vm`` in
+        one owner-locked UPDATE, so End and a new attach see the Session the
+        live agent still serves. False, changing nothing, unless the row is
+        open (not retiring) and its VM record is exactly that install's.
+        """
+
+        try:
+            parsed_thread = UUID(str(thread_id))
+            generation = _canonical_uuid_text(
+                provision_generation, label="thread VM provision generation"
+            )
+        except (TypeError, ValueError, RuntimeError):
+            return False
+
+        async with self.acquire() as conn:
+            async with conn.transaction():
+                from orchestrator.services.vm_thread_retained_resume import (
+                    lock_owner_on_conn,
+                )
+
+                await lock_owner_on_conn(conn, parsed_thread)
+                row = await conn.fetchrow(
+                    "SELECT metadata FROM threads WHERE id=$1::uuid "
+                    "AND runtime_retirement_token IS NULL FOR UPDATE",
+                    parsed_thread,
+                )
+                if row is None:
+                    return False
+                metadata = row["metadata"]
+                if isinstance(metadata, str):
+                    try:
+                        metadata = json.loads(metadata)
+                    except (TypeError, ValueError):
+                        return False
+                if not isinstance(metadata, dict):
+                    return False
+                vm = metadata.get("vm")
+                if not isinstance(vm, dict) or (
+                    vm.get("provision_generation") != generation
+                ):
+                    return False
+                source = vm.get(VM_UPGRADE_SOURCE_KEY)
+                if not isinstance(source, dict) or source.get("backend") != "virtual":
+                    return False
+                binding = source.get("binding")
+                if binding is not None and (
+                    not canonical_virtual_binding(binding)
+                    or metadata.get("_workspace_binding") is not None
+                ):
+                    return False
+
+                config_override = dict(metadata.get("config_override") or {})
+                if source.get("workspace") is None:
+                    config_override.pop("workspace", None)
+                else:
+                    config_override["workspace"] = source["workspace"]
+                metadata["config_override"] = config_override
+                if source.get("workspace_contract") is None:
+                    metadata.pop(WORKSPACE_CONTRACT_CONTEXT_KEY, None)
+                else:
+                    metadata[WORKSPACE_CONTRACT_CONTEXT_KEY] = source[
+                        "workspace_contract"
+                    ]
+                if binding is not None:
+                    metadata["_workspace_binding"] = binding
+                metadata.pop("vm")
+                result = await conn.execute(
+                    "UPDATE threads SET metadata=$2::jsonb,"
+                    "last_activity=CURRENT_TIMESTAMP "
+                    "WHERE id=$1::uuid AND runtime_retirement_token IS NULL "
+                    "AND NOT EXISTS ("
+                    "    SELECT 1 FROM vm_workspace_recoveries recovery "
+                    "    WHERE recovery.owner_kind='thread' "
+                    "      AND recovery.owner_id=threads.id "
+                    "      AND recovery.resolved_at IS NULL)",
+                    parsed_thread,
+                    json.dumps(metadata),
+                )
+                return result == "UPDATE 1"
 
     async def list_thread_vm_readiness_candidates(self, *, ready: bool = False) -> list:
         status_clause = (

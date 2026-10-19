@@ -230,6 +230,14 @@ class ThreadConfigStore(Protocol):
         self, thread_id: str, patch: dict[str, Any]
     ) -> Any: ...
 
+    async def merge_thread_vm_context_if_provision_generation(
+        self, thread_id: str, expected_generation: str, vm_updates: dict[str, Any]
+    ) -> bool: ...
+
+    async def undo_thread_vm_upgrade(
+        self, thread_id: str, *, provision_generation: str
+    ) -> bool: ...
+
     async def get_project_officer(self, project_id: str) -> dict[str, Any] | None: ...
 
     async def get_datasource_policy_rows(
@@ -1427,8 +1435,13 @@ async def agent_abort_thread_vm_upgrade(
     thread = await dependencies.store.get_thread(thread_id)
     if not thread:
         raise HTTPException(status_code=404, detail="Thread not found")
+    if _no_vm_installed(thread):
+        # Nothing to release: no install happened, or a completed abort
+        # already undid it. The agent retries an abort until it gets a 200.
+        return {"status": "aborted", "thread_id": thread_id, "vm_deleted": False}
 
     deleted = False
+    identity = None
     if vm_provisioner.lifecycle_available:
         try:
             identity = await vm_provisioner.capture_vm_teardown_identity(
@@ -1478,8 +1491,40 @@ async def agent_abort_thread_vm_upgrade(
                 "retryable": True,
             },
         )
-    await dependencies.store.merge_thread_vm_context(thread_id, {"status": "aborted"})
+    # E4: an upgrade from the virtual tier is undone, so the Session is the
+    # virtual Session its agent still serves. Any other install keeps its
+    # record, marked aborted while it still names the released VM.
+    if not await dependencies.store.undo_thread_vm_upgrade(
+        thread_id, provision_generation=identity.provision_generation
+    ):
+        await dependencies.store.merge_thread_vm_context_if_provision_generation(
+            thread_id, identity.provision_generation, {"status": "aborted"}
+        )
     return {"status": "aborted", "thread_id": thread_id, "vm_deleted": deleted}
+
+
+def _no_vm_installed(thread: Mapping[str, Any]) -> bool:
+    """Whether the row provably holds no VM install (E4).
+
+    A VM install writes ``metadata.vm.provision_generation`` before any
+    controller effect, and a completed abort of an upgrade from the virtual
+    tier drops ``metadata.vm``. Metadata that doesn't parse is never read as
+    "nothing installed".
+    """
+    metadata = thread.get("metadata")
+    if metadata is None:
+        return True
+    if isinstance(metadata, str):
+        try:
+            metadata = json.loads(metadata)
+        except (TypeError, ValueError):
+            return False
+    if not isinstance(metadata, Mapping):
+        return False
+    vm = metadata.get("vm")
+    if vm is None:
+        return True
+    return isinstance(vm, Mapping) and not vm.get("provision_generation")
 
 
 async def agent_upgrade_thread_to_workspace(

@@ -432,3 +432,24 @@ def test_detail_hides_the_vm_upgrade_seed_but_projects_its_phase() -> None:
     # The marker's source carries the old workspace binding, like C1's
     # ``seed_from``; ``workspace_upgrade`` is the public field.
     assert body["metadata"]["vm"] == {"status": "provisioning"}
+
+
+def test_detail_hides_the_upgrade_source_the_vm_install_keeps() -> None:
+    """E4: the copy an abort restores names the old storage, like the seed."""
+    row = _pinned_row()
+    row["metadata"] = json.dumps(
+        {
+            "config_override": {"workspace": {"backend": "vm"}},
+            "vm": {
+                "status": "provisioning",
+                "upgrade_source": {
+                    "backend": "virtual",
+                    "workspace": {"backend": "virtual"},
+                    "workspace_contract": None,
+                    "binding": {"kind": "virtual", "backing_id": "rclone:" + "a" * 64},
+                },
+            },
+        }
+    )
+    body = _client(_Store(), row).get(f"/api/persistent/threads/{THREAD_ID}").json()
+    assert body["metadata"]["vm"] == {"status": "provisioning"}
