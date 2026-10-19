@@ -14391,7 +14391,7 @@ CREATE TABLE public.threads (
     project_id uuid,
     agent_id uuid,
     status character varying(20) DEFAULT 'created'::character varying NOT NULL,
-    permission_mode character varying(20) DEFAULT 'supervised'::character varying NOT NULL,
+    permission_mode character varying(20) DEFAULT 'read_only'::character varying NOT NULL,
     config_name character varying(100),
     created_at timestamp with time zone DEFAULT CURRENT_TIMESTAMP,
     last_activity timestamp with time zone DEFAULT CURRENT_TIMESTAMP,
@@ -14449,7 +14449,7 @@ CREATE TABLE public.threads (
     CONSTRAINT threads_runtime_retirement_shape CHECK ((((runtime_retirement_token IS NULL) AND (runtime_retirement_permanent IS NULL) AND (runtime_retirement_started_at IS NULL) AND (runtime_retirement_authorized_at IS NULL) AND (runtime_retirement_context IS NULL)) OR ((runtime_retirement_token IS NOT NULL) AND (runtime_retirement_permanent IS NOT NULL) AND (runtime_retirement_started_at IS NOT NULL) AND (jsonb_typeof(runtime_retirement_context) = 'object'::text)))),
     CONSTRAINT threads_runtime_retirement_stage_receipt_shape CHECK (((runtime_retirement_stage_receipt IS NULL) OR ((runtime_retirement_token IS NOT NULL) AND (jsonb_typeof(runtime_retirement_stage_receipt) = 'object'::text)))),
     CONSTRAINT valid_narration_mode CHECK ((narration_mode = ANY (ARRAY['silent'::text, 'verbose'::text, 'auto'::text]))),
-    CONSTRAINT valid_permission_mode CHECK (((permission_mode)::text = ANY ((ARRAY['supervised'::character varying, 'auto_accept'::character varying, 'autonomous'::character varying])::text[]))),
+    CONSTRAINT valid_permission_mode_v2 CHECK (((permission_mode)::text = ANY ((ARRAY['read_only'::character varying, 'supervised'::character varying, 'auto_accept'::character varying, 'autonomous'::character varying])::text[]))),
     CONSTRAINT valid_thread_status CHECK (((status)::text = ANY ((ARRAY['created'::character varying, 'active'::character varying, 'idle'::character varying, 'awaiting_user'::character varying, 'suspended'::character varying, 'ended'::character varying])::text[])))
 );
 
