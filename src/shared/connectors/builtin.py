@@ -500,7 +500,7 @@ MONGODB_SPEC = _managed(
     ("mongo_query", "mongo_aggregate", "mongo_schema", "mongo_insert", "mongo_update"),
     read_only_enforced_by=(
         "Only the find, aggregate and schema tools are bound; an aggregate "
-        "pipeline is not checked for $out or $merge."
+        "pipeline with $out or $merge is refused."
     ),
 )
 WEBDAV_SPEC = _managed(

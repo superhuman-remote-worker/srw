@@ -937,7 +937,7 @@
             "mongo_aggregate",
             "mongo_schema"
           ],
-          "enforced_by": "Only the find, aggregate and schema tools are bound; an aggregate pipeline is not checked for $out or $merge.",
+          "enforced_by": "Only the find, aggregate and schema tools are bound; an aggregate pipeline with $out or $merge is refused.",
           "advisory": false
         },
         {
