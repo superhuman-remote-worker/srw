@@ -1469,10 +1469,13 @@ async def agent_abort_thread_vm_upgrade(
                 )
                 disposition = outcome.disposition
                 if disposition in {"completed", "identity_superseded"}:
+                    # A quota-charged (v3) VM's permit completes only with the
+                    # provisioner's stop attestation (E4).
                     await complete_vm_cleanup_permit(
                         dependencies.recovery_store,
                         cleanup,
                         outcome=disposition,
+                        provisioner=vm_provisioner,
                     )
             deleted = disposition == "completed"
         except Exception as e:

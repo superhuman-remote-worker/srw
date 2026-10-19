@@ -89,6 +89,7 @@ from agent.api.orchestrator_client import (
     SessionEnded,
     SessionGrantDenied as SessionGrantDenied,
     ThreadConfigUpdateDenied,
+    VmUpgradeAbortPending,
     create_orchestrator_client_from_env,
 )
 from agent.api.persistent_session import (
@@ -305,6 +306,12 @@ UpgradeEmitter = Callable[[str, Dict[str, Any]], Awaitable[None]]
 WORKSPACE_UPGRADE_ALREADY_RUNNING = "A workspace upgrade is already running."
 #: One workspace upgrade per agent process (spec §4.4 "single flight").
 _workspace_upgrade_in_flight: bool = False
+#: E4: a failed VM upgrade's abort, asked again while the orchestrator answers
+#: "not yet" (capped delays, for a bounded window). End waits for it before
+#: it begins; past the window the abort's cleanup is crash recovery's.
+_VM_UPGRADE_ABORT_RETRY_DELAYS: tuple[float, ...] = (1.0, 3.0, 10.0)
+_VM_UPGRADE_ABORT_WINDOW_S: float = 300.0
+_vm_upgrade_abort: Optional[asyncio.Task] = None
 #: C2: a recovery copy made at owner start, until the first drain receipts it
 #: or ``_announce_recovered_vm_upgrade`` journals it.
 _recovered_vm_upgrade: Optional[Dict[str, Any]] = None
@@ -690,6 +697,7 @@ _session_termination = SessionTerminationCoordinator(
         update_thread_status=lambda *args, **kwargs: _update_thread_status(
             *args, **kwargs
         ),
+        vm_upgrade_abort=lambda: _vm_upgrade_abort,
     ),
     logger=logger,
     termination_queue_sentinel=INTERRUPT_SENTINEL,
@@ -11898,14 +11906,7 @@ async def _handle_workspace_upgrade(
                 f"Workspace upgrade failed for thread {_session_identity.thread_id}"
             )
             if target_tier == "vm" and _orchestrator_client is not None:
-                try:
-                    await _orchestrator_client.abort_thread_vm_upgrade(
-                        _session_identity.thread_id
-                    )
-                except Exception as ee:
-                    logger.warning(
-                        f"VM teardown after upgrade failure ({_session_identity.thread_id}): {ee}"
-                    )
+                await _abort_vm_upgrade(_session_identity.thread_id)
             await _ws_send(ws, "workspace_upgrade.failed", {"reason": str(e)})
             return
 
@@ -12001,14 +12002,7 @@ async def _run_workspace_upgrade_swap(
             # so it doesn't leak — the orphan that previously needed a manual
             # `kubectl delete` (workspace_tier_upgrade.md Q7). Best-effort.
             if target_tier == "vm":
-                try:
-                    await _orchestrator_client.abort_thread_vm_upgrade(
-                        _session_identity.thread_id
-                    )
-                except Exception as e:
-                    logger.warning(
-                        f"VM abort/teardown after failed upgrade ({_session_identity.thread_id}): {e}"
-                    )
+                await _abort_vm_upgrade(_session_identity.thread_id)
             await emit(
                 "workspace_upgrade.failed",
                 {"reason": f"{target_tier} workspace did not become ready in time"},
@@ -12246,15 +12240,50 @@ async def _run_workspace_upgrade_swap(
         # (idempotent; a no-op if no vm was created) so no failure path leaks a
         # ready VM (workspace_tier_upgrade.md Q7).
         if target_tier == "vm" and _orchestrator_client is not None:
-            try:
-                await _orchestrator_client.abort_thread_vm_upgrade(
-                    _session_identity.thread_id
-                )
-            except Exception as ee:
-                logger.warning(
-                    f"VM teardown after upgrade failure ({_session_identity.thread_id}): {ee}"
-                )
+            await _abort_vm_upgrade(_session_identity.thread_id)
         await emit("workspace_upgrade.failed", {"reason": str(e)})
+
+
+async def _abort_vm_upgrade(thread_id: Optional[str]) -> None:
+    """Tear a failed upgrade's VM down, asking again while it isn't done (E4).
+
+    One abort runs at a time, as its own tracked task: End waits for it
+    before it begins (``vm_upgrade_abort`` port), and a cancelled upgrade
+    leaves it running. Never raises: a failed teardown is logged, and what is
+    left is crash recovery's.
+    """
+    global _vm_upgrade_abort
+    task = _vm_upgrade_abort
+    if task is None or task.done():
+        task = _session_termination.track_session_side_task(
+            asyncio.create_task(_retry_vm_upgrade_abort(str(thread_id)))
+        )
+        _vm_upgrade_abort = task
+    try:
+        await asyncio.shield(task)
+    except Exception as e:
+        logger.warning(f"VM teardown after upgrade failure ({thread_id}): {e}")
+
+
+async def _retry_vm_upgrade_abort(thread_id: str) -> None:
+    deadline = time.monotonic() + _VM_UPGRADE_ABORT_WINDOW_S
+    attempt = 0
+    while True:
+        try:
+            await _orchestrator_client.abort_thread_vm_upgrade(thread_id)
+            return
+        except VmUpgradeAbortPending as e:
+            if time.monotonic() >= deadline:
+                logger.warning(
+                    f"VM upgrade abort still pending after "
+                    f"{_VM_UPGRADE_ABORT_WINDOW_S:.0f}s ({thread_id}): {e}"
+                )
+                return
+        delay = _VM_UPGRADE_ABORT_RETRY_DELAYS[
+            min(attempt, len(_VM_UPGRADE_ABORT_RETRY_DELAYS) - 1)
+        ]
+        attempt += 1
+        await asyncio.sleep(delay)
 
 
 async def _poll_vm_ready(

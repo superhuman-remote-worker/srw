@@ -522,3 +522,80 @@ async def test_a_websocket_upgrade_that_cannot_record_the_marker_never_swaps():
     sess.swap_backend.assert_not_called()
     client.abort_thread_vm_upgrade.assert_awaited_once_with("tid")
     assert _frames(ws)[-1] == ("workspace_upgrade.failed", {"reason": "lost"})
+
+
+def _never_ready_upgrade(sess, client):
+    """Run the hot swap for a VM that never comes ready; return the frames."""
+    emitted: list = []
+
+    async def emit(method, params):
+        emitted.append((method, client.abort_thread_vm_upgrade.await_count))
+
+    async def run():
+        p = _patches(sess, client, vm_cfg=None)
+        with p[0], p[1], p[2], p[3], p[4], p[5]:
+            await pa._run_workspace_upgrade_swap(
+                emit, target_tier="vm", src_backend=SimpleNamespace()
+            )
+        return emitted
+
+    return run()
+
+
+@pytest.mark.asyncio
+async def test_an_abort_not_finished_yet_is_asked_again_before_the_failure_frame(
+    monkeypatch,
+):
+    """E4 part 2: one 503 used to leave the VM up and its permit open."""
+    from agent.api.orchestrator_client import VmUpgradeAbortPending
+
+    monkeypatch.setattr(pa, "_VM_UPGRADE_ABORT_RETRY_DELAYS", (0.0,), raising=False)
+    sess, client = _session(), _client()
+    seen_by_end: list = []
+
+    async def abort(_thread_id):
+        # End sees the abort while it runs (it waits for it before Begin).
+        seen_by_end.append(pa._session_termination._ports.vm_upgrade_abort())
+        if client.abort_thread_vm_upgrade.await_count < 3:
+            raise VmUpgradeAbortPending("vm_process_zero_unproven")
+        return True
+
+    client.abort_thread_vm_upgrade.side_effect = abort
+
+    emitted = await _never_ready_upgrade(sess, client)
+
+    assert client.abort_thread_vm_upgrade.await_count == 3
+    assert emitted == [("workspace_upgrade.failed", 3)]
+    assert all(isinstance(task, asyncio.Task) for task in seen_by_end)
+    assert len(set(seen_by_end)) == 1 and seen_by_end[0].done()
+
+
+@pytest.mark.asyncio
+async def test_a_refused_abort_is_not_asked_again(monkeypatch):
+    monkeypatch.setattr(pa, "_VM_UPGRADE_ABORT_RETRY_DELAYS", (0.0,), raising=False)
+    sess, client = _session(), _client()
+    client.abort_thread_vm_upgrade.return_value = False
+
+    emitted = await _never_ready_upgrade(sess, client)
+
+    assert client.abort_thread_vm_upgrade.await_count == 1
+    assert emitted == [("workspace_upgrade.failed", 1)]
+
+
+@pytest.mark.asyncio
+async def test_an_abort_still_pending_after_its_window_is_left_to_crash_recovery(
+    monkeypatch, caplog
+):
+    from agent.api.orchestrator_client import VmUpgradeAbortPending
+
+    monkeypatch.setattr(pa, "_VM_UPGRADE_ABORT_RETRY_DELAYS", (0.0,), raising=False)
+    monkeypatch.setattr(pa, "_VM_UPGRADE_ABORT_WINDOW_S", 0.0, raising=False)
+    sess, client = _session(), _client()
+    client.abort_thread_vm_upgrade.side_effect = VmUpgradeAbortPending("unproven")
+
+    with caplog.at_level(logging.WARNING, logger=pa.logger.name):
+        emitted = await _never_ready_upgrade(sess, client)
+
+    assert client.abort_thread_vm_upgrade.await_count == 1
+    assert emitted == [("workspace_upgrade.failed", 1)]
+    assert "VM upgrade abort still pending" in caplog.text

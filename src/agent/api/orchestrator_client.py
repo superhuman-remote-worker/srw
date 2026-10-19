@@ -112,6 +112,14 @@ class WorkspaceUpgradeRouteRefused(RuntimeError):
         self.code = code
 
 
+class VmUpgradeAbortPending(RuntimeError):
+    """The VM upgrade's abort hasn't finished yet: ask again (E4).
+
+    A 5xx answer (the orchestrator's ``vm_process_zero_unproven`` 503 among
+    them) or no answer at all.
+    """
+
+
 def _raise_workspace_upgrade_route_error(response: Any) -> NoReturn:
     """Raise for a non-200 answer of a VM upgrade seed route (C2).
 
@@ -1778,12 +1786,16 @@ class OrchestratorClient:
 
         Called by the live upgrade handler when ``_poll_vm_ready`` gives up, so a
         half-provisioned VM (+ its DataVolume + CDI importer pod) doesn't leak
-        with nobody attached. Idempotent server-side; clears ``metadata.vm`` so a
-        later retry isn't blocked by the provisioning-in-progress guard
-        (workspace_tier_upgrade.md Q7).
+        with nobody attached (workspace_tier_upgrade.md Q7). Idempotent
+        server-side: an upgrade from the virtual tier is undone (backend,
+        binding, no ``metadata.vm``); any other install is marked aborted.
 
         Returns:
-            True if the teardown request was accepted, False otherwise.
+            True once the orchestrator has finished the abort, False when it
+            refuses (a 4xx; asking again won't change it).
+
+        Raises:
+            VmUpgradeAbortPending: not finished yet (a 5xx or no answer).
         """
         if not self._client:
             await self.connect()
@@ -1791,16 +1803,19 @@ class OrchestratorClient:
         url = f"{self.orchestrator_url}/api/agents/threads/{thread_id}/abort-vm-upgrade"
         try:
             response = await self._client.post(url)
-            if response.status_code == 200:
-                logger.info(f"VM upgrade aborted/torn down for thread {thread_id}")
-                return True
-            logger.error(
-                f"VM upgrade abort failed: {response.status_code} - {response.text}"
-            )
-            return False
         except Exception as e:
-            logger.error(f"VM upgrade abort error: {e}")
-            return False
+            raise VmUpgradeAbortPending(f"VM upgrade abort unanswered: {e}") from e
+        if response.status_code == 200:
+            logger.info(f"VM upgrade aborted/torn down for thread {thread_id}")
+            return True
+        if response.status_code >= 500:
+            raise VmUpgradeAbortPending(
+                f"VM upgrade abort not finished: {response.status_code} - {response.text}"
+            )
+        logger.error(
+            f"VM upgrade abort refused: {response.status_code} - {response.text}"
+        )
+        return False
 
     async def request_thread_workspace_upgrade(
         self,
